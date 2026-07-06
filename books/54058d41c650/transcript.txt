@@ -1,0 +1,5 @@
+source: URecorder_20260627_132757.txt
+offset: 14:51 - 15:11
+absolute: 2026-06-27T13:42:48 - 2026-06-27T13:43:08
+
+(14:51 - 15:11) Book. An Introduction to Botany. Alternate title, Lindley's Introduction to Botany. End book.

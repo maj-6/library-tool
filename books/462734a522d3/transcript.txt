@@ -1,0 +1,14 @@
+source: URecorder_20260627_132757.txt
+offset: 31:49 - 32:55
+absolute: 2026-06-27T13:59:46 - 2026-06-27T14:00:52
+
+(31:49 - 31:51) Book.
+(31:51 - 31:55) [BLANK_AUDIO]
+(31:55 - 32:00) The Practice of Nature Cure by Henry Lindlar.
+(32:00 - 32:03) [BLANK_AUDIO]
+(32:03 - 32:05) 27th edition.
+(32:05 - 32:15) [BLANK_AUDIO]
+(32:15 - 32:25) [BLANK_AUDIO]
+(32:25 - 32:35) $1.50. Published 1931.
+(32:35 - 32:47) [BLANK_AUDIO]
+(32:47 - 32:55) Page count, 226. End book.

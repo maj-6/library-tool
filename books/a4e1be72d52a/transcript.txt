@@ -1,0 +1,12 @@
+source: URecorder_20260627_132757.txt
+offset: 28:51 - 29:49
+absolute: 2026-06-27T13:56:48 - 2026-06-27T13:57:46
+
+(28:51 - 28:58) Book.
+(28:58 - 29:03) A Treatise of the Materia Medica and Therapeutics.
+(29:03 - 29:07) Volume one.
+(29:07 - 29:17) [BLANK_AUDIO]
+(29:17 - 29:25) [BLANK_AUDIO]
+(29:25 - 29:37) Paid $145. Note. Price for two volume set. End note.
+(29:37 - 29:45) [BLANK_AUDIO]
+(29:45 - 29:49) Page count, 450. End book.

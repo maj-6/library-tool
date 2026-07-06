@@ -1,0 +1,12 @@
+source: URecorder_20260627_132757.txt
+offset: 7:49 - 10:33
+absolute: 2026-06-27T13:35:46 - 2026-06-27T13:38:30
+
+(7:49 - 8:18) Book. Elements of Botany, by R. J. Thornton.
+(8:18 - 8:29) An introduction to botany, by R. J. Thornton.
+(8:29 - 8:52) Page count, 594 plus 32.
+(8:52 - 9:11) An introduction to botany, by R. J. Thornton.
+(9:11 - 9:32) Page count, 594 plus 32.
+(9:32 - 9:48) An introduction to botany, by R. J. Thornton.
+(9:48 - 10:08) An introduction to botany, by R. J. Thornton.
+(10:08 - 10:33) An introduction to botany, by R. J. Thornton.

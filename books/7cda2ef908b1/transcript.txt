@@ -1,0 +1,9 @@
+source: URecorder_20260627_142643 (1).txt
+offset: 14:23 - 15:38
+absolute: 2026-06-27T14:41:06 - 2026-06-27T14:42:21
+
+(14:23 - 14:46) the book.
+(14:46 - 15:11) Paid 100 pounds.
+(15:11 - 15:17) System Plantarum by Carolus Linnaeus.
+(15:17 - 15:33) Part one.
+(15:33 - 15:38) Page count, 778.

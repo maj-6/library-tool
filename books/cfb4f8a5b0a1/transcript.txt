@@ -1,0 +1,12 @@
+source: URecorder_20260627_154733.txt
+offset: 3:58 - 5:12
+absolute: 2026-06-27T15:51:31 - 2026-06-27T15:52:45
+
+(3:58 - 4:00) Book.
+(4:00 - 4:07) Florographia Britannica, Volume 1.
+(4:07 - 4:19) Paid £475.
+(4:19 - 4:25) By Richard Deacon.
+(4:25 - 4:28) Published.
+(4:28 - 4:42) Groombridge, MDCCCXLL.
+(4:42 - 5:02) Page Count 904.
+(5:02 - 5:12) End book.

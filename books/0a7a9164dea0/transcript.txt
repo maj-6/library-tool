@@ -1,0 +1,11 @@
+source: URecorder_20260627_142643 (1).txt
+offset: 8:01 - 9:38
+absolute: 2026-06-27T14:34:44 - 2026-06-27T14:36:21
+
+(8:01 - 8:14) Book.
+(8:14 - 8:34) Pharmacopeia Austriica.
+(8:34 - 8:36) Published 1869.
+(8:36 - 8:58) Price, 16 pounds.
+(9:06 - 9:17) I, Physic by John Wesley.
+(9:17 - 9:27) Page count, 293.
+(9:27 - 9:38) Plus 14.

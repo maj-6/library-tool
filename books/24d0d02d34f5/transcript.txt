@@ -1,0 +1,11 @@
+source: URecorder_20260627_132757.txt
+offset: 3:23 - 5:30
+absolute: 2026-06-27T13:31:20 - 2026-06-27T13:33:27
+
+(3:23 - 3:33) Book. The modern practice of physic. Author, R. Thomas.
+(3:33 - 3:56) Published, 1824.
+(3:56 - 4:25) Author, William Salmon.
+(4:25 - 4:54) Page count, 1053.
+(4:54 - 5:03) Published, S.B. Collins and Collins and Company, New York.
+(5:03 - 5:07) 1824.
+(5:07 - 5:30) End book.

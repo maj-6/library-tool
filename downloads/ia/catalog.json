@@ -1,0 +1,36 @@
+{
+  "2544065R.nlm.nih.gov": {
+    "identifier": "2544065R.nlm.nih.gov",
+    "source_url": "https://archive.org/details/2544065R.nlm.nih.gov",
+    "pdf_file": "2544065R.pdf",
+    "saved_as": "downloads\\ia\\2544065R.nlm.nih.gov.pdf",
+    "size_bytes": 37737986,
+    "downloaded_at": "2026-07-03T23:47:40+00:00",
+    "ia_title": "Every man his own doctor, or, A treatise on the prevention and cure of diseases, by regimen and simple medicines",
+    "ia_creator": [
+      "Buchan, William, 1729-1805",
+      "Bracken, Henry, 1697-1764. Complete treatise on the art of farriery",
+      "Whiting, Nathan, 1772-1848, publisher"
+    ],
+    "ia_date": "1816",
+    "book": {
+      "volume": "",
+      "language": "",
+      "acquired": "1994-11-28",
+      "author": "Buchan, W.",
+      "categories": "Pharmacy, Materia Medica",
+      "city": "New Haven",
+      "condition": "Fair",
+      "edition": "1st American",
+      "idx": 656,
+      "illustrations": "",
+      "notes": "Bound with A Treatise on the Materia Medica; in which the medicinal qualities of indigenous plants are given and adapted to common practice, and the art of farriery; first time a Buchan edition includes American medicinal plants",
+      "pages": "144",
+      "price": "165",
+      "publisher": "Nathan Whiting",
+      "subtitle": "",
+      "title": "Every Man His Own Doctor or a Treatise on the Prevention and Cure of Diseases",
+      "year": "1816"
+    }
+  }
+}

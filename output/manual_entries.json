@@ -1,0 +1,1379 @@
+{
+  "47c4b5ffd396": {
+    "title": "Elements of Therapeutics and Materia Medica",
+    "author": "Chapman, N.",
+    "publisher": "M. Cary & Sons",
+    "year": "1821",
+    "edition": "2nd",
+    "volume": "1",
+    "language": "",
+    "notes": "Vol 2 missing?",
+    "id": "47c4b5ffd396",
+    "created_at": "2026-07-03T21:33:07+00:00",
+    "checks": {
+      "copyright_status": "Public domain (published 1821)",
+      "checked_at": "2026-07-03T21:33:07+00:00",
+      "in_whl": "yes",
+      "whl_match": {
+        "title": "Elements of Therapeutics and Materia Medica v 2",
+        "author": "Chapman, N.",
+        "year": "1904",
+        "status": "publish",
+        "permalink": "https://worldherblibrary.org/catalog/elements-of-therapeutics-and-materia-medica-v-2/"
+      }
+    },
+    "scans": {
+      "query_title": "Elements of Therapeutics and Materia Medica",
+      "query_author": "Chapman, N.",
+      "query_year": "1821",
+      "internet_archive": {
+        "available": true,
+        "best_match": {
+          "identifier": "elementsoftherap00chap",
+          "title": "Elements of therapeutics and materia medica, to which are prefixed two discourses on the history and improvement of the materia medica, originally delivered as introductory lectures",
+          "author": "Chapman, Nathaniel, 1780-1853",
+          "year": "1821",
+          "url": "https://archive.org/details/elementsoftherap00chap",
+          "accuracy": 1.0
+        },
+        "matches": [
+          {
+            "identifier": "elementsoftherap00chap",
+            "title": "Elements of therapeutics and materia medica, to which are prefixed two discourses on the history and improvement of the materia medica, originally delivered as introductory lectures",
+            "author": "Chapman, Nathaniel, 1780-1853",
+            "year": "1821",
+            "url": "https://archive.org/details/elementsoftherap00chap",
+            "accuracy": 1.0
+          },
+          {
+            "identifier": "elementsoftherap02chap",
+            "title": "Elements of therapeutics and materia medica : to which are prefixed two discourses on the history and improvement of the materia medica, originally delivered as introductory lectures",
+            "author": "Chapman, Nathaniel, 1780-1853",
+            "year": "1823",
+            "url": "https://archive.org/details/elementsoftherap02chap",
+            "accuracy": 0.8
+          },
+          {
+            "identifier": "101548671X2.nlm.nih.gov",
+            "title": "Elements of therapeutics and materia medica: to which are prefixed two discourses on the history and improvement of the materia medica, originally delivered as introductory lectures (Volume 2)",
+            "author": "Chapman, Nathaniel, 1780-1853",
+            "year": "1827",
+            "url": "https://archive.org/details/101548671X2.nlm.nih.gov",
+            "accuracy": 0.8
+          },
+          {
+            "identifier": "101548664X2.nlm.nih.gov",
+            "title": "Elements of therapeutics and materia medica: to which are prefixed two discourses on the history and improvement of the materia medica, originally delivered as introductory lectures (Volume 2)",
+            "author": "Chapman, Nathaniel, 1780-1853",
+            "year": "1825",
+            "url": "https://archive.org/details/101548664X2.nlm.nih.gov",
+            "accuracy": 0.8
+          },
+          {
+            "identifier": "101548671X1.nlm.nih.gov",
+            "title": "Elements of therapeutics and materia medica: to which are prefixed two discourses on the history and improvement of the materia medica, originally delivered as introductory lectures (Volume 1)",
+            "author": "Chapman, Nathaniel, 1780-1853",
+            "year": "1827",
+            "url": "https://archive.org/details/101548671X1.nlm.nih.gov",
+            "accuracy": 0.8
+          }
+        ],
+        "search_url": "https://archive.org/search?query=Elements+of+Therapeutics+and+Materia+Medica+Chapman%2C+N."
+      },
+      "hathitrust": {
+        "available": true,
+        "full_view": true,
+        "best_match": {
+          "title": "Elements of therapeutics and materia medica. To which are prefixed two discourses on the history and improvement of the materia medica ...",
+          "year": "1823",
+          "record_url": "https://catalog.hathitrust.org/Record/011714116",
+          "items": [
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.b5298658",
+              "rights": "Full view",
+              "volume": "v.1"
+            }
+          ],
+          "full_view": true,
+          "accuracy": 0.714
+        },
+        "matches": [
+          {
+            "title": "Elements of therapeutics and materia medica. To which are prefixed two discourses on the history and improvement of the materia medica ...",
+            "year": "1823",
+            "record_url": "https://catalog.hathitrust.org/Record/011714116",
+            "items": [
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.b5298658",
+                "rights": "Full view",
+                "volume": "v.1"
+              }
+            ],
+            "full_view": true,
+            "accuracy": 0.714
+          },
+          {
+            "title": "Elements of therapeutics and materia medica : to which are prefixed two discourses on the history and improvement of the materia medica, originally delivered as introductory lectures",
+            "year": "1827",
+            "record_url": "https://catalog.hathitrust.org/Record/001581998",
+            "items": [
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.b5295249",
+                "rights": "Full view",
+                "volume": "v.1"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.b5295250",
+                "rights": "Full view",
+                "volume": "v.2"
+              }
+            ],
+            "full_view": true,
+            "accuracy": 0.714
+          }
+        ],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=Elements+of+Therapeutics+and+Materia+Medica&type=title",
+        "oclcs_tried": [
+          "9706714",
+          "2139885",
+          "14842568",
+          "4185385",
+          "501513603"
+        ]
+      },
+      "checked_at": "2026-07-03T23:48:43+00:00"
+    }
+  },
+  "a377d4d2b810": {
+    "title": "Flora Rustica",
+    "author": "Martyn, Thomas",
+    "publisher": "F.P. Nodder",
+    "city": "London",
+    "year": "1792",
+    "edition": "",
+    "volume": "3",
+    "language": "",
+    "pages": "n.p.",
+    "condition": "fair; worn & stained cover",
+    "price": "",
+    "illustrations": "many colored plates, lithograph",
+    "categories": "botany, flowering plants",
+    "notes": "",
+    "id": "a377d4d2b810",
+    "created_at": "2026-07-03T23:54:25+00:00",
+    "checks": {
+      "copyright_status": "Public domain (published 1792)",
+      "checked_at": "2026-07-04T19:27:19+00:00",
+      "in_whl": "yes",
+      "whl_match": {
+        "title": "Flora Rustica Vol. 1",
+        "author": "Thomas Martyn",
+        "year": "1792",
+        "status": "publish",
+        "permalink": "https://worldherblibrary.org/catalog/flora-rustica-vol-1/"
+      }
+    },
+    "scans": {
+      "query_title": "Flora Rustica",
+      "query_author": "Martyn, Thomas",
+      "query_year": "1792",
+      "internet_archive": {
+        "available": true,
+        "best_match": {
+          "identifier": "bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_2",
+          "title": "Flora rustica: exhibiting accurate figures of such plants as are either useful or injurious in husbandry. Drawn and engraved by Frederick P. Nodder, ... and coloured under his inspection. With scientific characters, popular descriptions, and useful observations, by Thomas Martyn, ... 1792: Vol 2",
+          "author": "Martyn, Thomas, B. D., F. R. S.",
+          "year": "1792",
+          "url": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_2",
+          "accuracy": 0.948
+        },
+        "matches": [
+          {
+            "identifier": "bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_2",
+            "title": "Flora rustica: exhibiting accurate figures of such plants as are either useful or injurious in husbandry. Drawn and engraved by Frederick P. Nodder, ... and coloured under his inspection. With scientific characters, popular descriptions, and useful observations, by Thomas Martyn, ... 1792: Vol 2",
+            "author": "Martyn, Thomas, B. D., F. R. S.",
+            "year": "1792",
+            "url": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_2",
+            "accuracy": 0.948
+          },
+          {
+            "identifier": "bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_1",
+            "title": "Flora rustica: exhibiting accurate figures of such plants as are either useful or injurious in husbandry. Drawn and engraved by Frederick P. Nodder, ... and coloured under his inspection. With scientific characters, popular descriptions, and useful observations, by Thomas Martyn, ... 1792: Vol 1",
+            "author": "Martyn, Thomas, B. D., F. R. S.",
+            "year": "1792",
+            "url": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_1",
+            "accuracy": 0.948
+          },
+          {
+            "identifier": "bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_3",
+            "title": "Flora rustica: exhibiting accurate figures of such plants as are either useful or injurious in husbandry. Drawn and engraved by Frederick P. Nodder, ... and coloured under his inspection. With scientific characters, popular descriptions, and useful observations, by Thomas Martyn, ... 1792: Vol 3",
+            "author": "Martyn, Thomas, B. D., F. R. S.",
+            "year": "1792",
+            "url": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_3",
+            "accuracy": 0.948
+          },
+          {
+            "identifier": "bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1794_4",
+            "title": "Flora rustica: exhibiting accurate figures of such plants as are either useful or injurious in husbandry. Drawn and engraved by Frederick P. Nodder, ... and coloured under his inspection. With scientific characters, popular descriptions, and useful observations, by Thomas Martyn, ... 1794: Vol 4",
+            "author": "Martyn, Thomas, B. D., F. R. S.",
+            "year": "1794",
+            "url": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1794_4",
+            "accuracy": 0.748
+          },
+          {
+            "identifier": "b28774528_0001",
+            "title": "Flora rustica: exhibiting ... figures of such plants as are either useful or injurious in husbandry",
+            "author": "Martyn, Thomas, 1735-1825. n 85089625; Nodder, Frederick Polydore, illustrator. nr 93028470",
+            "year": "1791",
+            "url": "https://archive.org/details/b28774528_0001",
+            "accuracy": 0.748
+          }
+        ],
+        "search_url": "https://archive.org/search?query=Flora+Rustica+Martyn%2C+Thomas"
+      },
+      "hathitrust": {
+        "available": true,
+        "full_view": true,
+        "best_match": {
+          "title": "Flora rustica : exhibiting accurate figures of such plants as are either useful or injurious in husbandry",
+          "year": "1792",
+          "record_url": "https://catalog.hathitrust.org/Record/001824841",
+          "items": [
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=mdp.39015015340725",
+              "rights": "Full view",
+              "volume": ""
+            }
+          ],
+          "full_view": true,
+          "accuracy": 0.926
+        },
+        "matches": [
+          {
+            "title": "Flora rustica : exhibiting accurate figures of such plants as are either useful or injurious in husbandry",
+            "year": "1792",
+            "record_url": "https://catalog.hathitrust.org/Record/001824841",
+            "items": [
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=mdp.39015015340725",
+                "rights": "Full view",
+                "volume": ""
+              }
+            ],
+            "full_view": true,
+            "accuracy": 0.926
+          }
+        ],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=Flora+Rustica&type=title",
+        "oclcs_tried": [
+          "6858984",
+          "903996423"
+        ]
+      },
+      "checked_at": "2026-07-04T19:27:21+00:00"
+    },
+    "verify": {
+      "internet_archive": "approved"
+    }
+  },
+  "59f4063794c5": {
+    "title": "Flora Medica",
+    "author": "Spratt, G.",
+    "publisher": "Callow  & Wilson",
+    "city": "",
+    "year": "1829",
+    "edition": "",
+    "volume": "1",
+    "language": "",
+    "pages": "230",
+    "condition": "Poor; cover missing, some pages torn",
+    "price": "400 GBP",
+    "illustrations": "",
+    "categories": "",
+    "notes": "Sticky note says \"cut for plates\". Printed without title page.",
+    "id": "59f4063794c5",
+    "created_at": "2026-07-04T00:10:48+00:00",
+    "checks": {
+      "copyright_status": "Public domain (published 1829)",
+      "checked_at": "2026-07-04T00:10:48+00:00",
+      "in_whl": "no",
+      "whl_match": null
+    },
+    "scans": {
+      "query_title": "Flora Medica",
+      "query_author": "Spratt, G.",
+      "query_year": "1829",
+      "internet_archive": {
+        "available": true,
+        "best_match": {
+          "identifier": "floramedicacont01spragoog",
+          "title": "Flora medica : containing coloured delineations of the various medicinal plants, admitted into the London, Edinburgh, and Dublin pharmacopœias : with their natural history, botanical descriptions, medical and chemical properties, &c. &c. : together with a concise introduction to botany : a copious glossary of botanical terms and a list of poisonous plants, &c. &c.",
+          "author": "George Spratt",
+          "year": "1829",
+          "url": "https://archive.org/details/floramedicacont01spragoog",
+          "accuracy": 0.929
+        },
+        "matches": [
+          {
+            "identifier": "floramedicacont01spragoog",
+            "title": "Flora medica : containing coloured delineations of the various medicinal plants, admitted into the London, Edinburgh, and Dublin pharmacopœias : with their natural history, botanical descriptions, medical and chemical properties, &c. &c. : together with a concise introduction to botany : a copious glossary of botanical terms and a list of poisonous plants, &c. &c.",
+            "author": "George Spratt",
+            "year": "1829",
+            "url": "https://archive.org/details/floramedicacont01spragoog",
+            "accuracy": 0.929
+          },
+          {
+            "identifier": "b29330014_0002",
+            "title": "Flora medica: containing coloured delineations of the various medicinal plants admitted into the London, Edinburgh, and Dublin pharmacopoeias with their natural history, botanical descriptions, etc. Together with a concise introduction to botany; a copious glossary of botanical terms, and a list of poisonous plants",
+            "author": "Spratt, G. (George) n 86871701",
+            "year": "1829",
+            "url": "https://archive.org/details/b29330014_0002",
+            "accuracy": 0.929
+          },
+          {
+            "identifier": "gri_33125012920878",
+            "title": "Flora medica : containing coloured delineations of the various medicinal plants, admitted into the London, Edinburgh, and Dublin pharmacopœias : with their natural history, botanical descriptions, medical and chemical properties, &c. &c. : together with a concise introduction to botany : a copious glossary of botanical terms and a list of poisonous plants, &c. &c.",
+            "author": "Spratt, G. (George); Royal College of Physicians of London; Callow and Wilson, publisher",
+            "year": "1829",
+            "url": "https://archive.org/details/gri_33125012920878",
+            "accuracy": 0.929
+          },
+          {
+            "identifier": "b29330014_0001",
+            "title": "Flora medica: containing coloured delineations of the various medicinal plants admitted into the London, Edinburgh, and Dublin pharmacopoeias with their natural history, botanical descriptions, etc. Together with a concise introduction to botany; a copious glossary of botanical terms, and a list of poisonous plants",
+            "author": "Spratt, G. (George) n 86871701",
+            "year": "1829",
+            "url": "https://archive.org/details/b29330014_0001",
+            "accuracy": 0.929
+          },
+          {
+            "identifier": "floramedicacont00spragoog",
+            "title": "Flora medica : containing coloured delineations of the various medicinal plants, admitted into the London, Edinburgh, and Dublin pharmacopœias : with their natural history, botanical descriptions, medical and chemical properties, &c. &c. : together with a concise introduction to botany : a copious glossary of botanical terms and a list of poisonous plants, &c. &c.",
+            "author": "George Spratt",
+            "year": "1829",
+            "url": "https://archive.org/details/floramedicacont00spragoog",
+            "accuracy": 0.929
+          }
+        ],
+        "search_url": "https://archive.org/search?query=Flora+Medica+Spratt%2C+G."
+      },
+      "hathitrust": {
+        "available": true,
+        "full_view": true,
+        "best_match": {
+          "title": "Flora medica : containing coloured delineations of the various medicinal plants, admitted into the London, Edinburgh, and Dublin pharmacopœias  : with their natural history, botanical descriptions, medical and chemical properties, &c. &c. : together with a concise introduction to botany : a copious glossary of botanical terms  and a list of poisonous plants, &c. &c.",
+          "year": "1829",
+          "record_url": "https://catalog.hathitrust.org/Record/100682956",
+          "items": [
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=gri.ark:/13960/t7bs26p4w",
+              "rights": "Full view",
+              "volume": "1"
+            },
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=gri.ark:/13960/t15m9n19w",
+              "rights": "Full view",
+              "volume": "2"
+            }
+          ],
+          "full_view": true,
+          "accuracy": 0.898
+        },
+        "matches": [
+          {
+            "title": "Flora medica : containing coloured delineations of the various medicinal plants, admitted into the London, Edinburgh, and Dublin pharmacopœias  : with their natural history, botanical descriptions, medical and chemical properties, &c. &c. : together with a concise introduction to botany : a copious glossary of botanical terms  and a list of poisonous plants, &c. &c.",
+            "year": "1829",
+            "record_url": "https://catalog.hathitrust.org/Record/100682956",
+            "items": [
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=gri.ark:/13960/t7bs26p4w",
+                "rights": "Full view",
+                "volume": "1"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=gri.ark:/13960/t15m9n19w",
+                "rights": "Full view",
+                "volume": "2"
+              }
+            ],
+            "full_view": true,
+            "accuracy": 0.898
+          }
+        ],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=Flora+Medica&type=title",
+        "oclcs_tried": [
+          "6027325"
+        ]
+      },
+      "checked_at": "2026-07-04T00:20:39+00:00"
+    },
+    "verify": {
+      "internet_archive": "approved"
+    }
+  },
+  "2b3983d6f061": {
+    "title": "The Monthly Flora",
+    "author": "",
+    "publisher": "Lewis & Brown",
+    "city": "New York",
+    "year": "1846",
+    "edition": "",
+    "volume": "1",
+    "language": "",
+    "pages": "",
+    "condition": "",
+    "price": "",
+    "illustrations": "",
+    "categories": "",
+    "notes": "",
+    "id": "2b3983d6f061",
+    "created_at": "2026-07-04T00:26:39+00:00",
+    "checks": {
+      "copyright_status": "Public domain (published 1846)",
+      "checked_at": "2026-07-04T00:28:07+00:00",
+      "in_whl": "no",
+      "whl_match": null
+    },
+    "approved": "2026-07-04T00:27:46+00:00",
+    "scans": {
+      "query_title": "The Monthly Flora",
+      "query_author": "",
+      "query_year": "1846",
+      "internet_archive": {
+        "available": true,
+        "best_match": {
+          "identifier": "monthlyfloraorb00unkngoog",
+          "title": "The Monthly flora, or Botanical magazine",
+          "author": "",
+          "year": "1846",
+          "url": "https://archive.org/details/monthlyfloraorb00unkngoog",
+          "accuracy": 1.0
+        },
+        "matches": [
+          {
+            "identifier": "monthlyfloraorb00unkngoog",
+            "title": "The Monthly flora, or Botanical magazine",
+            "author": "",
+            "year": "1846",
+            "url": "https://archive.org/details/monthlyfloraorb00unkngoog",
+            "accuracy": 1.0
+          },
+          {
+            "identifier": "florasylvamonthl21903robi",
+            "title": "Flora and sylva. A monthly review for lovers of garden, woodland, tree or flower; new and rare plants, trees, shrubs, and fruits; the garden beautiful, home woods, and home landscape",
+            "author": "Robinson, William H., 1955-",
+            "year": "1903",
+            "url": "https://archive.org/details/florasylvamonthl21903robi",
+            "accuracy": 0.179
+          },
+          {
+            "identifier": "florasylvamonthl11903robi",
+            "title": "Flora and sylva. A monthly review for lovers of garden, woodland, tree or flower; new and rare plants, trees, shrubs, and fruits; the garden beautiful, home woods, and home landscape",
+            "author": "Robinson, William H., 1955-",
+            "year": "1903",
+            "url": "https://archive.org/details/florasylvamonthl11903robi",
+            "accuracy": 0.179
+          },
+          {
+            "identifier": "florasylvamonthl31903robi",
+            "title": "Flora and sylva. A monthly review for lovers of garden, woodland, tree or flower; new and rare plants, trees, shrubs, and fruits; the garden beautiful, home woods, and home landscape",
+            "author": "Robinson, William H., 1955-",
+            "year": "1903",
+            "url": "https://archive.org/details/florasylvamonthl31903robi",
+            "accuracy": 0.179
+          }
+        ],
+        "search_url": "https://archive.org/search?query=The+Monthly+Flora"
+      },
+      "hathitrust": {
+        "available": null,
+        "full_view": false,
+        "best_match": null,
+        "matches": [],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=The+Monthly+Flora&type=title",
+        "note": "no OCLC identifier found via Open Library; use the search link to check by hand"
+      },
+      "checked_at": "2026-07-04T00:28:08+00:00"
+    }
+  },
+  "fbc5ba4ca3b7": {
+    "title": "Libellus de Materia Medica",
+    "author": "Boerhaave, Herman",
+    "publisher": "Lugduni Batavorum : Apud Isaacum Severinum",
+    "city": "",
+    "year": "1727",
+    "edition": "",
+    "volume": "",
+    "language": "Latin",
+    "pages": "259 + 21",
+    "condition": "good (rebound)",
+    "price": "420",
+    "illustrations": "",
+    "categories": "",
+    "notes": "",
+    "id": "fbc5ba4ca3b7",
+    "created_at": "2026-07-04T00:39:45+00:00",
+    "checks": {
+      "copyright_status": "Public domain (published 1727)",
+      "checked_at": "2026-07-04T00:39:45+00:00",
+      "in_whl": "no",
+      "whl_match": null
+    },
+    "scans": {
+      "query_title": "Libellus de Materia Medica",
+      "query_author": "Boerhaave, Herman",
+      "query_year": "1727",
+      "internet_archive": {
+        "available": true,
+        "best_match": {
+          "identifier": "bim_eighteenth-century_libellus-de-materie-med_boerhaave-herman_1755",
+          "title": "[Libellus de materie medica. English]. Boerhaave's Materia medica, or the druggist's guide, and the physician and apothecary's table-book. Being a compleat account of all drugs, ... 1755",
+          "author": "Boerhaave, Herman.",
+          "year": "1755",
+          "url": "https://archive.org/details/bim_eighteenth-century_libellus-de-materie-med_boerhaave-herman_1755",
+          "accuracy": 0.8
+        },
+        "matches": [
+          {
+            "identifier": "bim_eighteenth-century_libellus-de-materie-med_boerhaave-herman_1755",
+            "title": "[Libellus de materie medica. English]. Boerhaave's Materia medica, or the druggist's guide, and the physician and apothecary's table-book. Being a compleat account of all drugs, ... 1755",
+            "author": "Boerhaave, Herman.",
+            "year": "1755",
+            "url": "https://archive.org/details/bim_eighteenth-century_libellus-de-materie-med_boerhaave-herman_1755",
+            "accuracy": 0.8
+          },
+          {
+            "identifier": "bim_eighteenth-century_libellus-de-materie-med_boerhaave-herman_1718",
+            "title": "[Libellus de materie medica] Materia medica. D. Hermanni Boerhaave, ... Aphorismis, authore ipso, optime concinnata. Editio altera: priore auctior longe que emendatior & duplici indice, una rerum, altera morborum locupletata. 1718",
+            "author": "Boerhaave, Herman.",
+            "year": "1718",
+            "url": "https://archive.org/details/bim_eighteenth-century_libellus-de-materie-med_boerhaave-herman_1718",
+            "accuracy": 0.8
+          },
+          {
+            "identifier": "bim_eighteenth-century_libellus-de-materie-med_boerhaave-herman_1739",
+            "title": "[Libellus de materie medica. English]. Boerhaave's treatise of the materia medica, and forms of medicines, adapted to his aphorisms, on the knowledge and cure of diseases. Translated from the last genuine edition of the ... 1739",
+            "author": "Boerhaave, Herman.",
+            "year": "1739",
+            "url": "https://archive.org/details/bim_eighteenth-century_libellus-de-materie-med_boerhaave-herman_1739",
+            "accuracy": 0.8
+          }
+        ],
+        "search_url": "https://archive.org/search?query=Libellus+de+Materia+Medica+Boerhaave%2C+Herman"
+      },
+      "hathitrust": {
+        "available": false,
+        "full_view": false,
+        "best_match": null,
+        "matches": [],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=Libellus+de+Materia+Medica&type=title",
+        "oclcs_tried": [
+          "64267547"
+        ]
+      },
+      "checked_at": "2026-07-04T00:39:47+00:00"
+    },
+    "approved": "2026-07-04T00:39:55+00:00"
+  },
+  "363e30583910": {
+    "title": "A Greene Forest",
+    "author": "Maplet",
+    "publisher": "",
+    "city": "",
+    "year": "1930",
+    "edition": "",
+    "volume": "",
+    "language": "",
+    "pages": "",
+    "condition": "",
+    "price": "",
+    "illustrations": "",
+    "categories": "",
+    "notes": "",
+    "id": "363e30583910",
+    "created_at": "2026-07-04T20:22:09+00:00",
+    "checks": {
+      "copyright_status": "Public domain (published 1930)",
+      "checked_at": "2026-07-04T20:22:09+00:00",
+      "in_whl": "no",
+      "whl_match": null
+    },
+    "scans": {
+      "query_title": "A Greene Forest",
+      "query_author": "Maplet",
+      "query_year": "1930",
+      "internet_archive": {
+        "available": true,
+        "best_match": {
+          "identifier": "bim_early-english-books-1475-1640_a-greene-forest-or-a-_maplet-john_1567",
+          "title": "A greene forest , or, a natural historie, ... 1567",
+          "author": "Maplet, John.",
+          "year": "1567",
+          "url": "https://archive.org/details/bim_early-english-books-1475-1640_a-greene-forest-or-a-_maplet-john_1567",
+          "accuracy": 0.784
+        },
+        "matches": [
+          {
+            "identifier": "bim_early-english-books-1475-1640_a-greene-forest-or-a-_maplet-john_1567",
+            "title": "A greene forest , or, a natural historie, ... 1567",
+            "author": "Maplet, John.",
+            "year": "1567",
+            "url": "https://archive.org/details/bim_early-english-books-1475-1640_a-greene-forest-or-a-_maplet-john_1567",
+            "accuracy": 0.784
+          },
+          {
+            "identifier": "b30328081",
+            "title": "A greene forest, or a naturall historie, wherein may bee seene first the most sufferaigne vertues in all the whole kinde of stones and mettals: next of plants, as of herbes, trees, and shrubs, lastly of brute beastes, foules, fishes, creeping wormes, and serpents",
+            "author": "Maplet, John, -1592",
+            "year": "1567",
+            "url": "https://archive.org/details/b30328081",
+            "accuracy": 0.784
+          }
+        ],
+        "search_url": "https://archive.org/search?query=A+Greene+Forest+Maplet"
+      },
+      "hathitrust": {
+        "available": true,
+        "full_view": true,
+        "best_match": {
+          "title": "A greene forest : or, A naturall historie, wherein may bee seene first the most sufferaigne vertues in all the whole kinde of stones & mettals : next of plants, as of herbes, trees and shrubs : lastly of brute beastes, foules, fishes, creeping wormes, and serpents, and that alphabetically : so that a table shall not neede",
+          "year": "1930",
+          "record_url": "https://catalog.hathitrust.org/Record/001490086",
+          "items": [
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=mdp.39015031083978",
+              "rights": "Full view",
+              "volume": ""
+            }
+          ],
+          "full_view": true,
+          "accuracy": 0.977
+        },
+        "matches": [
+          {
+            "title": "A greene forest : or, A naturall historie, wherein may bee seene first the most sufferaigne vertues in all the whole kinde of stones & mettals : next of plants, as of herbes, trees and shrubs : lastly of brute beastes, foules, fishes, creeping wormes, and serpents, and that alphabetically : so that a table shall not neede",
+            "year": "1930",
+            "record_url": "https://catalog.hathitrust.org/Record/001490086",
+            "items": [
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=mdp.39015031083978",
+                "rights": "Full view",
+                "volume": ""
+              }
+            ],
+            "full_view": true,
+            "accuracy": 0.977
+          }
+        ],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=A+Greene+Forest&type=title",
+        "oclcs_tried": [
+          "187442162",
+          "18340467",
+          "1025077"
+        ]
+      },
+      "checked_at": "2026-07-04T20:22:13+00:00"
+    },
+    "verify": {
+      "hathitrust": "approved"
+    }
+  },
+  "520391858e01": {
+    "title": "Effects of ginkgo biloba extract on organic cerebral impairment",
+    "author": "",
+    "publisher": "Libbey",
+    "city": "London",
+    "year": "1985",
+    "edition": "",
+    "volume": "",
+    "language": "",
+    "pages": "",
+    "condition": "",
+    "price": "",
+    "illustrations": "",
+    "categories": "",
+    "notes": "",
+    "id": "520391858e01",
+    "created_at": "2026-07-05T20:54:49+00:00",
+    "checks": {
+      "copyright_status": "In copyright",
+      "checked_at": "2026-07-05T20:54:49+00:00",
+      "in_whl": "no",
+      "whl_match": null
+    },
+    "scans": {
+      "query_title": "Effects of ginkgo biloba extract on organic cerebral impairment",
+      "query_author": "",
+      "query_year": "1985",
+      "internet_archive": {
+        "available": false,
+        "best_match": null,
+        "matches": [],
+        "search_url": "https://archive.org/search?query=Effects+of+ginkgo+biloba+extract+on+organic+cerebral+impairment"
+      },
+      "hathitrust": {
+        "available": null,
+        "full_view": false,
+        "best_match": null,
+        "matches": [],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=Effects+of+ginkgo+biloba+extract+on+organic+cerebral+impairment&type=title",
+        "note": "no OCLC identifier found via Open Library; use the search link to check by hand"
+      },
+      "checked_at": "2026-07-05T20:54:55+00:00"
+    }
+  },
+  "d223cde24717": {
+    "title": "Handbook of the Bach flower remedies",
+    "author": "Philip M. Chancellor",
+    "publisher": "Daniel",
+    "city": "Rochford",
+    "year": "1971",
+    "edition": "",
+    "volume": "",
+    "language": "",
+    "pages": "",
+    "condition": "",
+    "price": "",
+    "illustrations": "",
+    "categories": "",
+    "notes": "",
+    "id": "d223cde24717",
+    "created_at": "2026-07-05T20:55:06+00:00",
+    "checks": {
+      "copyright_status": "In copyright (auto-renewed)",
+      "checked_at": "2026-07-05T20:55:06+00:00",
+      "in_whl": "no",
+      "whl_match": null
+    },
+    "scans": {
+      "query_title": "Handbook of the Bach flower remedies",
+      "query_author": "Philip M. Chancellor",
+      "query_year": "1971",
+      "internet_archive": {
+        "available": true,
+        "best_match": {
+          "identifier": "handbookofbachfl0000chan",
+          "title": "Handbook of the Bach flower remedies;",
+          "author": "Chancellor, Philip M",
+          "year": "1971",
+          "url": "https://archive.org/details/handbookofbachfl0000chan",
+          "accuracy": 1.0
+        },
+        "matches": [
+          {
+            "identifier": "handbookofbachfl0000chan",
+            "title": "Handbook of the Bach flower remedies;",
+            "author": "Chancellor, Philip M",
+            "year": "1971",
+            "url": "https://archive.org/details/handbookofbachfl0000chan",
+            "accuracy": 1.0
+          },
+          {
+            "identifier": "drphilipmchancel0000chan",
+            "title": "Dr. Philip M. Chancellor's Handbook of the Bach flower remedies",
+            "author": "Chancellor, Philip M",
+            "year": "1980",
+            "url": "https://archive.org/details/drphilipmchancel0000chan",
+            "accuracy": 0.394
+          }
+        ],
+        "search_url": "https://archive.org/search?query=Handbook+of+the+Bach+flower+remedies+Philip+M.+Chancellor"
+      },
+      "hathitrust": {
+        "available": null,
+        "full_view": false,
+        "best_match": null,
+        "matches": [],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=Handbook+of+the+Bach+flower+remedies&type=title",
+        "note": "no OCLC identifier found via Open Library; use the search link to check by hand"
+      },
+      "checked_at": "2026-07-05T20:55:10+00:00"
+    }
+  },
+  "22f97ebd2dbb": {
+    "title": "Shakespeare's son-in-law, John Hall, man and physician",
+    "author": "Harriet Bloomfield Joseph",
+    "publisher": "Archon Books",
+    "city": "Hamden, Conn",
+    "year": "1964",
+    "edition": "",
+    "volume": "",
+    "language": "",
+    "pages": "",
+    "condition": "",
+    "price": "",
+    "illustrations": "",
+    "categories": "",
+    "notes": "",
+    "id": "22f97ebd2dbb",
+    "created_at": "2026-07-05T20:56:13+00:00",
+    "checks": {
+      "copyright_status": "In copyright (auto-renewed)",
+      "checked_at": "2026-07-05T20:56:13+00:00",
+      "in_whl": "no",
+      "whl_match": null
+    },
+    "scans": {
+      "query_title": "Shakespeare's son-in-law, John Hall, man and physician",
+      "query_author": "Harriet Bloomfield Joseph",
+      "query_year": "1964",
+      "internet_archive": {
+        "available": false,
+        "best_match": null,
+        "matches": [],
+        "search_url": "https://archive.org/search?query=Shakespeare%27s+son-in-law%2C+John+Hall%2C+man+and+physician+Harriet+Bloomfield+Joseph"
+      },
+      "hathitrust": {
+        "available": true,
+        "full_view": false,
+        "best_match": {
+          "title": "Shakespeare's son-in-law: John Hall, man and physician",
+          "year": "1964",
+          "record_url": "https://catalog.hathitrust.org/Record/001557428",
+          "items": [
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.b3614050",
+              "rights": "Limited (search-only)",
+              "volume": ""
+            },
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.l0071311880",
+              "rights": "Limited (search-only)",
+              "volume": ""
+            }
+          ],
+          "full_view": false,
+          "accuracy": 1.0
+        },
+        "matches": [
+          {
+            "title": "Shakespeare's son-in-law: John Hall, man and physician",
+            "year": "1964",
+            "record_url": "https://catalog.hathitrust.org/Record/001557428",
+            "items": [
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.b3614050",
+                "rights": "Limited (search-only)",
+                "volume": ""
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.l0071311880",
+                "rights": "Limited (search-only)",
+                "volume": ""
+              }
+            ],
+            "full_view": false,
+            "accuracy": 1.0
+          }
+        ],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=Shakespeare%27s+son-in-law%2C+John+Hall%2C+man+and+physician&type=title",
+        "oclcs_tried": [
+          "14626468"
+        ]
+      },
+      "checked_at": "2026-07-05T20:56:16+00:00"
+    }
+  },
+  "de6a8416400f": {
+    "title": "A History of Medicine",
+    "author": "Henry E. Sigerist",
+    "publisher": "Oxford University Press, Incorporated",
+    "city": "",
+    "year": "1951",
+    "edition": "",
+    "volume": "",
+    "language": "",
+    "pages": "",
+    "condition": "",
+    "price": "",
+    "illustrations": "",
+    "categories": "",
+    "notes": "",
+    "id": "de6a8416400f",
+    "created_at": "2026-07-05T20:57:44+00:00",
+    "checks": {
+      "copyright_status": "In copyright (renewal R592943)",
+      "checked_at": "2026-07-05T20:58:01+00:00",
+      "in_whl": "draft",
+      "whl_match": {
+        "title": "A History of Eclectic Medicine",
+        "author": "",
+        "year": "",
+        "status": "draft",
+        "permalink": "https://worldherblibrary.org/?post_type=whl_catalog&p=6795"
+      }
+    },
+    "scans": {
+      "query_title": "A History of Medicine",
+      "query_author": "Henry E. Sigerist",
+      "query_year": "1951",
+      "internet_archive": {
+        "available": true,
+        "best_match": {
+          "identifier": "bwb_S0-EDS-886",
+          "title": "A History of Medicine",
+          "author": "Henry E. Sigerist",
+          "year": "1951",
+          "url": "https://archive.org/details/bwb_S0-EDS-886",
+          "accuracy": 1.0
+        },
+        "matches": [
+          {
+            "identifier": "bwb_S0-EDS-886",
+            "title": "A History of Medicine",
+            "author": "Henry E. Sigerist",
+            "year": "1951",
+            "url": "https://archive.org/details/bwb_S0-EDS-886",
+            "accuracy": 1.0
+          },
+          {
+            "identifier": "historyofmedicin0000unse",
+            "title": "A history of medicine",
+            "author": "Sigerist, Henry E. (Henry Ernest), 1891-1957",
+            "year": "1951",
+            "url": "https://archive.org/details/historyofmedicin0000unse",
+            "accuracy": 1.0
+          },
+          {
+            "identifier": "historyofmedicin0001henr_j0a3",
+            "title": "A history of medicine",
+            "author": "Henry E. Sigerist",
+            "year": "1951",
+            "url": "https://archive.org/details/historyofmedicin0001henr_j0a3",
+            "accuracy": 1.0
+          },
+          {
+            "identifier": "historyofmedicin0001henr",
+            "title": "A History Of Medicine",
+            "author": "Henry E. Sigerist",
+            "year": "1951",
+            "url": "https://archive.org/details/historyofmedicin0001henr",
+            "accuracy": 1.0
+          },
+          {
+            "identifier": "historyofmedicin0000sige",
+            "title": "A history of medicine",
+            "author": "Sigerist, Henry E. (Henry Ernest), 1891-1957",
+            "year": "1961",
+            "url": "https://archive.org/details/historyofmedicin0000sige",
+            "accuracy": 0.8
+          }
+        ],
+        "search_url": "https://archive.org/search?query=A+History+of+Medicine+Henry+E.+Sigerist"
+      },
+      "hathitrust": {
+        "available": true,
+        "full_view": false,
+        "best_match": {
+          "title": "A history of medicine",
+          "year": "1951",
+          "record_url": "https://catalog.hathitrust.org/Record/001557040",
+          "items": [
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=ucbk.ark:/28722/h27h1f39x",
+              "rights": "Limited (search-only)",
+              "volume": "v. 1"
+            },
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=mdp.39015007147351",
+              "rights": "Limited (search-only)",
+              "volume": "v.1"
+            },
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.32106006410861",
+              "rights": "Limited (search-only)",
+              "volume": "v.1"
+            },
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=ucbk.ark:/28722/h25t3gh6h",
+              "rights": "Limited (search-only)",
+              "volume": "v. 2"
+            },
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=mdp.49015002188358",
+              "rights": "Limited (search-only)",
+              "volume": "v.2"
+            },
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.32106006008087",
+              "rights": "Limited (search-only)",
+              "volume": "v.2"
+            }
+          ],
+          "full_view": false,
+          "accuracy": 1.0
+        },
+        "matches": [
+          {
+            "title": "A history of medicine",
+            "year": "1951",
+            "record_url": "https://catalog.hathitrust.org/Record/001557040",
+            "items": [
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=ucbk.ark:/28722/h27h1f39x",
+                "rights": "Limited (search-only)",
+                "volume": "v. 1"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=mdp.39015007147351",
+                "rights": "Limited (search-only)",
+                "volume": "v.1"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.32106006410861",
+                "rights": "Limited (search-only)",
+                "volume": "v.1"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=ucbk.ark:/28722/h25t3gh6h",
+                "rights": "Limited (search-only)",
+                "volume": "v. 2"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=mdp.49015002188358",
+                "rights": "Limited (search-only)",
+                "volume": "v.2"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.32106006008087",
+                "rights": "Limited (search-only)",
+                "volume": "v.2"
+              }
+            ],
+            "full_view": false,
+            "accuracy": 1.0
+          },
+          {
+            "title": "A history of medicine",
+            "year": "1951",
+            "record_url": "https://catalog.hathitrust.org/Record/001557040",
+            "items": [
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=ucbk.ark:/28722/h27h1f39x",
+                "rights": "Limited (search-only)",
+                "volume": "v. 1"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=mdp.39015007147351",
+                "rights": "Limited (search-only)",
+                "volume": "v.1"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.32106006410861",
+                "rights": "Limited (search-only)",
+                "volume": "v.1"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=ucbk.ark:/28722/h25t3gh6h",
+                "rights": "Limited (search-only)",
+                "volume": "v. 2"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=mdp.49015002188358",
+                "rights": "Limited (search-only)",
+                "volume": "v.2"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.32106006008087",
+                "rights": "Limited (search-only)",
+                "volume": "v.2"
+              }
+            ],
+            "full_view": false,
+            "accuracy": 1.0
+          }
+        ],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=A+History+of+Medicine&type=title",
+        "oclcs_tried": [
+          "34739683",
+          "666044",
+          "17740683",
+          "395158810",
+          "234221538"
+        ]
+      },
+      "checked_at": "2026-07-05T20:58:02+00:00"
+    }
+  },
+  "0d6d3d54d0f6": {
+    "title": "Wild edible mushrooms in the Blue Mountains",
+    "author": "Catherine G Parks",
+    "publisher": "U.S. Dept. of Agriculture, Forest Service, Pacific Northwest Research Station",
+    "city": "Portland, OR (333 S.W. First Ave., Portland 97208-3890)",
+    "year": "1997",
+    "edition": "",
+    "volume": "",
+    "language": "",
+    "pages": "",
+    "condition": "",
+    "price": "",
+    "illustrations": "",
+    "categories": "",
+    "notes": "",
+    "id": "0d6d3d54d0f6",
+    "created_at": "2026-07-05T21:27:05+00:00",
+    "checks": {
+      "copyright_status": "In copyright",
+      "checked_at": "2026-07-05T21:27:05+00:00",
+      "in_whl": "no",
+      "whl_match": null
+    },
+    "scans": {
+      "query_title": "Wild edible mushrooms in the Blue Mountains",
+      "query_author": "Catherine G Parks",
+      "query_year": "1997",
+      "internet_archive": {
+        "available": true,
+        "best_match": {
+          "identifier": "wildediblemushro00parkrich",
+          "title": "Wild edible mushrooms in the Blue Mountains : resource and issues",
+          "author": "Parks, Catherine G; Schmitt, Craig L; Pacific Northwest Research Station (Portland, Or.)",
+          "year": "1997",
+          "url": "https://archive.org/details/wildediblemushro00parkrich",
+          "accuracy": 1.0
+        },
+        "matches": [
+          {
+            "identifier": "wildediblemushro00parkrich",
+            "title": "Wild edible mushrooms in the Blue Mountains : resource and issues",
+            "author": "Parks, Catherine G; Schmitt, Craig L; Pacific Northwest Research Station (Portland, Or.)",
+            "year": "1997",
+            "url": "https://archive.org/details/wildediblemushro00parkrich",
+            "accuracy": 1.0
+          }
+        ],
+        "search_url": "https://archive.org/search?query=Wild+edible+mushrooms+in+the+Blue+Mountains+Catherine+G+Parks"
+      },
+      "hathitrust": {
+        "available": true,
+        "full_view": true,
+        "best_match": {
+          "title": "Wild edible mushrooms in the Blue Mountains : resource and issues",
+          "year": "1997",
+          "record_url": "https://catalog.hathitrust.org/Record/003529898",
+          "items": [
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=uva.x005012256",
+              "rights": "Full view",
+              "volume": ""
+            },
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=umn.31951d01809169e",
+              "rights": "Full view",
+              "volume": ""
+            }
+          ],
+          "full_view": true,
+          "accuracy": 1.0
+        },
+        "matches": [
+          {
+            "title": "Wild edible mushrooms in the Blue Mountains : resource and issues",
+            "year": "1997",
+            "record_url": "https://catalog.hathitrust.org/Record/003529898",
+            "items": [
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uva.x005012256",
+                "rights": "Full view",
+                "volume": ""
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=umn.31951d01809169e",
+                "rights": "Full view",
+                "volume": ""
+              }
+            ],
+            "full_view": true,
+            "accuracy": 1.0
+          }
+        ],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=Wild+edible+mushrooms+in+the+Blue+Mountains&type=title",
+        "oclcs_tried": [
+          "36707482"
+        ]
+      },
+      "checked_at": "2026-07-05T21:27:07+00:00"
+    }
+  },
+  "f5bd4fd79e31": {
+    "title": "Mushrooms of the Northeastern United States and Eastern Canada",
+    "author": "Timothy J. Baroni",
+    "publisher": "Timber Press, Incorporated",
+    "city": "",
+    "year": "2017",
+    "edition": "",
+    "volume": "",
+    "language": "",
+    "pages": "",
+    "condition": "",
+    "price": "",
+    "illustrations": "",
+    "categories": "",
+    "notes": "",
+    "id": "f5bd4fd79e31",
+    "created_at": "2026-07-05T21:29:21+00:00",
+    "checks": {
+      "copyright_status": "In copyright",
+      "checked_at": "2026-07-05T21:29:21+00:00",
+      "in_whl": "no",
+      "whl_match": null
+    },
+    "scans": {
+      "query_title": "Mushrooms of the Northeastern United States and Eastern Canada",
+      "query_author": "Timothy J. Baroni",
+      "query_year": "2017",
+      "internet_archive": {
+        "available": true,
+        "best_match": {
+          "identifier": "mushroomsofnorth0000baro",
+          "title": "Mushrooms of the northeastern United States and eastern Canada",
+          "author": "Baroni, Timothy J., author",
+          "year": "2017",
+          "url": "https://archive.org/details/mushroomsofnorth0000baro",
+          "accuracy": 1.0
+        },
+        "matches": [
+          {
+            "identifier": "mushroomsofnorth0000baro",
+            "title": "Mushrooms of the northeastern United States and eastern Canada",
+            "author": "Baroni, Timothy J., author",
+            "year": "2017",
+            "url": "https://archive.org/details/mushroomsofnorth0000baro",
+            "accuracy": 1.0
+          }
+        ],
+        "search_url": "https://archive.org/search?query=Mushrooms+of+the+Northeastern+United+States+and+Eastern+Canada+Timothy+J.+Baroni"
+      },
+      "hathitrust": {
+        "available": false,
+        "full_view": false,
+        "best_match": null,
+        "matches": [],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=Mushrooms+of+the+Northeastern+United+States+and+Eastern+Canada&type=title",
+        "oclcs_tried": [
+          "960906173"
+        ]
+      },
+      "checked_at": "2026-07-05T21:29:23+00:00"
+    }
+  },
+  "837b4210273c": {
+    "title": "The observer's book of mosses and liverworts",
+    "author": "Arthur L. Jewell",
+    "publisher": "Frederick Warne",
+    "city": "London; New York",
+    "year": "1964",
+    "edition": "",
+    "volume": "",
+    "language": "",
+    "pages": "",
+    "condition": "",
+    "price": "",
+    "illustrations": "",
+    "categories": "",
+    "notes": "",
+    "id": "837b4210273c",
+    "created_at": "2026-07-05T21:38:08+00:00",
+    "checks": {
+      "copyright_status": "In copyright (auto-renewed)",
+      "checked_at": "2026-07-05T21:38:08+00:00",
+      "in_whl": "no",
+      "whl_match": null
+    },
+    "scans": {
+      "query_title": "The observer's book of mosses and liverworts",
+      "query_author": "Arthur L. Jewell",
+      "query_year": "1964",
+      "internet_archive": {
+        "available": false,
+        "best_match": null,
+        "matches": [],
+        "search_url": "https://archive.org/search?query=The+observer%27s+book+of+mosses+and+liverworts+Arthur+L.+Jewell"
+      },
+      "hathitrust": {
+        "available": true,
+        "full_view": false,
+        "best_match": {
+          "title": "The observer's book of mosses and liverworts",
+          "year": "1955",
+          "record_url": "https://catalog.hathitrust.org/Record/003570734",
+          "items": [
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=mdp.39015053131291",
+              "rights": "Limited (search-only)",
+              "volume": ""
+            }
+          ],
+          "full_view": false,
+          "accuracy": 0.714
+        },
+        "matches": [
+          {
+            "title": "The observer's book of mosses and liverworts",
+            "year": "1955",
+            "record_url": "https://catalog.hathitrust.org/Record/003570734",
+            "items": [
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=mdp.39015053131291",
+                "rights": "Limited (search-only)",
+                "volume": ""
+              }
+            ],
+            "full_view": false,
+            "accuracy": 0.714
+          }
+        ],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=The+observer%27s+book+of+mosses+and+liverworts&type=title",
+        "oclcs_tried": [
+          "4322089"
+        ]
+      },
+      "checked_at": "2026-07-05T21:38:22+00:00"
+    }
+  },
+  "d1095076972a": {
+    "title": "The Biology and cultivation of edible mushrooms",
+    "author": "S. T. Chang",
+    "publisher": "Academic Press",
+    "city": "New York",
+    "year": "1978",
+    "edition": "",
+    "volume": "",
+    "language": "",
+    "pages": "",
+    "condition": "",
+    "price": "",
+    "illustrations": "",
+    "categories": "",
+    "notes": "",
+    "id": "d1095076972a",
+    "created_at": "2026-07-05T21:40:21+00:00",
+    "checks": {
+      "copyright_status": "In copyright",
+      "checked_at": "2026-07-05T21:40:21+00:00",
+      "in_whl": "no",
+      "whl_match": null
+    },
+    "scans": {
+      "query_title": "The Biology and cultivation of edible mushrooms",
+      "query_author": "S. T. Chang",
+      "query_year": "1978",
+      "internet_archive": {
+        "available": null,
+        "best_match": null,
+        "matches": [],
+        "search_url": "https://archive.org/search?query=The+Biology+and+cultivation+of+edible+mushrooms+S.+T.+Chang",
+        "error": "TimeoutError: The read operation timed out"
+      },
+      "hathitrust": {
+        "available": null,
+        "full_view": false,
+        "best_match": null,
+        "matches": [],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=The+Biology+and+cultivation+of+edible+mushrooms&type=title",
+        "error": "Open Library lookup failed: URLError: <urlopen error [Errno 11001] getaddrinfo failed>"
+      },
+      "checked_at": "2026-07-05T21:41:03+00:00"
+    }
+  }
+}

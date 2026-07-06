@@ -1,0 +1,12 @@
+source: URecorder_20260627_132757.txt
+offset: 19:26 - 21:20
+absolute: 2026-06-27T13:47:23 - 2026-06-27T13:49:17
+
+(19:26 - 19:48) Book. A Synopsis of Lectures on Medical Science.
+(19:48 - 19:56) By Alva Curtis.
+(19:56 - 20:03) Alternate title, Curtis Theory and Practice.
+(20:03 - 20:17) Paid, $175.
+(20:17 - 20:23) End note.
+(20:23 - 20:44) $125, also marked. End note.
+(20:44 - 20:51) Page count, 481.
+(20:51 - 21:20) End book.

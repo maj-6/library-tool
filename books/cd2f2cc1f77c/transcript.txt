@@ -1,0 +1,9 @@
+source: URecorder_20260627_132757.txt
+offset: 10:33 - 11:23
+absolute: 2026-06-27T13:38:30 - 2026-06-27T13:39:20
+
+(10:33 - 10:40) Book. Bilder or Nordens Flora.
+(10:40 - 10:52) C.A.M. Lindemann.
+(10:52 - 11:01) Published, 1905.
+(11:01 - 11:06) Page count, 419.
+(11:06 - 11:23) End book.

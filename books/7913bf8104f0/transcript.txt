@@ -1,0 +1,8 @@
+source: URecorder_20260627_132757.txt
+offset: 11:23 - 12:52
+absolute: 2026-06-27T13:39:20 - 2026-06-27T13:40:49
+
+(11:23 - 11:48) Book. Drugs and Medicines of North America.
+(11:53 - 12:05) Published, 1884.
+(12:23 - 12:35) Page count, 304.
+(12:35 - 12:52) End book.

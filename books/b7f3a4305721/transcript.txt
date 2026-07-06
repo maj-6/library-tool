@@ -1,0 +1,8 @@
+source: URecorder_20260627_154733.txt
+offset: 8:06 - 8:33
+absolute: 2026-06-27T15:55:39 - 2026-06-27T15:56:06
+
+(8:06 - 8:08) Book.
+(8:08 - 8:24) Medical Botany, Volume 2.
+(8:24 - 8:27) Page count not marked.
+(8:27 - 8:33) End book.

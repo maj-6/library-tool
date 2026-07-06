@@ -1,0 +1,8 @@
+source: URecorder_20260627_132757.txt
+offset: 15:26 - 16:28
+absolute: 2026-06-27T13:43:23 - 2026-06-27T13:44:25
+
+(15:26 - 15:44) Book.
+(15:44 - 16:13) The British Flora Medica or History of the Medicinal Plants.
+(16:13 - 16:21) Page count, 511.
+(16:21 - 16:28) End book.

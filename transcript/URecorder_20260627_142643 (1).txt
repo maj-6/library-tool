@@ -1,0 +1,116 @@
+(0:00 - 0:29)
+Book.
+(0:29 - 0:42)
+I, Physic by John Wesley.
+(0:42 - 0:53)
+Paid 10 pounds.
+(0:53 - 0:57)
+Page count, 144.
+(0:57 - 1:04)
+End book.
+
+(1:27 - 1:39)
+Book.
+(1:39 - 2:03)
+I, Physic by John Wesley.
+(2:03 - 2:20)
+Systema Plantarum by Carolus Linnaeus.
+(2:20 - 2:44)
+Volume 3.
+(2:44 - 3:00)
+Page count, 972.
+(3:00 - 3:20)
+End book.
+(3:20 - 3:37)
+Book.
+
+(3:50 - 4:12)
+I, Physic by John Wesley.
+(4:12 - 4:33)
+Miscellaneous tracts relating to natural history, husbandry, and physic by Linnaeus.
+(4:33 - 4:54)
+I, Physic by John Wesley.
+(4:54 - 5:22)
+I, Physic by John Wesley.
+(5:22 - 5:33)
+Page count, 389.
+(5:33 - 5:38)
+Plus 13.
+(5:38 - 6:02)
+End book.
+(6:02 - 6:23)
+A
+(6:23 - 6:27)
+Guide to Health by Benjamin Colby.
+(6:27 - 6:50)
+Published 1846.
+(6:50 - 7:06)
+Page count, 181.
+(7:06 - 7:24)
+I, Physic by John Wesley.
+(7:24 - 7:40)
+I, Physic by John Wesley.
+(7:40 - 8:01)
+Page count, 128.
+(8:01 - 8:14)
+Book.
+
+(8:14 - 8:34)
+Pharmacopeia Austriica.
+(8:34 - 8:36)
+Published 1869.
+(8:36 - 8:58)
+Price, 16 pounds.
+
+(9:06 - 9:17)
+I, Physic by John Wesley.
+(9:17 - 9:27)
+Page count, 293.
+(9:27 - 9:38)
+Plus 14.
+(9:38 - 9:47)
+Book.
+(9:47 - 10:04)
+A Green Forest by John Mapelet.
+(10:04 - 10:21)
+Published 1930.
+(10:21 - 10:37)
+I, Physic by John Wesley.
+(10:37 - 11:00)
+Page count, 184.
+(11:00 - 11:09)
+End book.
+(11:09 - 11:18)
+Book.
+(11:18 - 11:42)
+Paid $25.
+(11:42 - 12:01)
+Published 1825.
+(12:01 - 12:16)
+Page count, 376.
+(12:16 - 12:38)
+End book.
+(12:38 - 13:00)
+Book.
+
+(13:08 - 13:30)
+I, Physic by John Wesley.
+(13:30 - 13:34)
+Linnaeus Maturia Medica.
+(13:34 - 13:53)
+Page count, 252.
+(13:53 - 14:09)
+Note, check price, end book.
+
+(14:23 - 14:46)
+the book.
+(14:46 - 15:11)
+Paid 100 pounds.
+(15:11 - 15:17)
+System Plantarum by Carolus Linnaeus.
+(15:17 - 15:33)
+Part one.
+(15:33 - 15:38)
+Page count, 778.
+(15:38 - 15:40)
+book.

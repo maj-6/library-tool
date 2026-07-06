@@ -1,0 +1,13 @@
+source: URecorder_20260627_140744.txt
+offset: 3:43 - 5:51
+absolute: 2026-06-27T14:11:27 - 2026-06-27T14:13:35
+
+(3:43 - 3:57) Book.
+(3:57 - 4:01) "The New Family Herbal."
+(4:01 - 4:29) by Matthew Robinson.
+(4:29 - 4:47) Page count, 481.
+(4:47 - 5:15) [no audio]
+(5:15 - 5:30) [no audio]
+(5:30 - 5:33) Note.
+(5:33 - 5:35) No publishing date printed.
+(5:35 - 5:51) End book.

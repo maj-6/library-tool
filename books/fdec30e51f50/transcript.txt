@@ -1,0 +1,12 @@
+source: URecorder_20260627_142643 (1).txt
+offset: 3:20 - 6:02
+absolute: 2026-06-27T14:30:03 - 2026-06-27T14:32:45
+
+(3:20 - 3:37) Book.
+(3:50 - 4:12) I, Physic by John Wesley.
+(4:12 - 4:33) Miscellaneous tracts relating to natural history, husbandry, and physic by Linnaeus.
+(4:33 - 4:54) I, Physic by John Wesley.
+(4:54 - 5:22) I, Physic by John Wesley.
+(5:22 - 5:33) Page count, 389.
+(5:33 - 5:38) Plus 13.
+(5:38 - 6:02) End book.

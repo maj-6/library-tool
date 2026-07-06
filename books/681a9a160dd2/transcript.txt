@@ -1,0 +1,7 @@
+source: URecorder_20260627_132757.txt
+offset: 21:20 - 22:09
+absolute: 2026-06-27T13:49:17 - 2026-06-27T13:50:06
+
+(21:20 - 21:31) Book. A Compendium of Botanic Materia Medica.
+(21:31 - 21:53) For the Use of Students in Medicine and Pharmacy, by Samuel Wagman. Published, 1891. Paid, $75.
+(21:53 - 22:09) Page count, 325. End book.

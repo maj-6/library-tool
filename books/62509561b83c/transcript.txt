@@ -1,0 +1,10 @@
+source: URecorder_20260627_142643 (1).txt
+offset: 1:27 - 3:20
+absolute: 2026-06-27T14:28:10 - 2026-06-27T14:30:03
+
+(1:27 - 1:39) Book.
+(1:39 - 2:03) I, Physic by John Wesley.
+(2:03 - 2:20) Systema Plantarum by Carolus Linnaeus.
+(2:20 - 2:44) Volume 3.
+(2:44 - 3:00) Page count, 972.
+(3:00 - 3:20) End book.

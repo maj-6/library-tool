@@ -1,0 +1,18 @@
+# Open Library dumps + built indexes (huge, rebuildable via tools/build_ol_*.py)
+ol_dump_*
+output/ol_works.db*
+output/ol_search.db*
+output/ol_build*.log
+output/ol_build.err.log
+
+# API caches (rebuild themselves)
+output/.ol_api_cache.json*
+output/.online_cache.json
+
+# downloaded scans (large binaries; downloads/ia/catalog.json IS tracked)
+downloads/ia/*.pdf
+downloads/ia/*.part
+
+# python
+__pycache__/
+*.pyc

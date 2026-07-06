@@ -1,0 +1,1789 @@
+"use strict";
+
+// Cap rows rendered at once; large catalogues rely on the search filter.
+const MAX_RENDER = 500;
+const CHPANE_RENDER = 300;
+const LS_KEY = "whl_cad_checked_v1";
+const SETTINGS_KEY = "whl_cad_settings_v1";
+
+const MANUAL_FIELDS = [
+  "title", "author", "publisher", "city", "year", "edition", "volume",
+  "language", "pages", "condition", "price", "illustrations", "categories",
+  "notes",
+];
+
+// Metadata columns of the combined table, in cell order; these are the
+// click-to-edit fields.
+const BOOK_COLS = [
+  "title", "author", "year", "edition", "volume", "publisher", "city",
+  "language", "pages", "condition", "illustrations", "price", "acquired",
+  "categories", "notes",
+];
+
+// Column keys must match the data-col attributes on each table's <th>s.
+const CHECKED_COLS = [
+  ["src", "SRC"], ["title", "TITLE"], ["author", "AUTHOR"], ["year", "YEAR"],
+  ["edition", "EDITION"], ["volume", "VOLUME"], ["publisher", "PUBLISHER"],
+  ["city", "CITY"], ["language", "LANGUAGE"], ["pages", "PAGES"],
+  ["condition", "CONDITION"], ["illustrations", "ILLUSTRATIONS"],
+  ["price", "PRICE"], ["acquired", "ACQUIRED"], ["categories", "CATEGORIES"],
+  ["notes", "NOTES"], ["copyright", "COPYRIGHT"], ["whl", "WHL"],
+  ["ia", "IA"], ["ht", "HT"], ["mark", "MARK"], ["action", "ACTION"],
+];
+const CATALOG_COLS = [
+  ["chk", "CHK"], ["title", "TITLE"], ["author", "AUTHOR"], ["year", "YEAR"],
+  ["edition", "EDITION"], ["publisher", "PUBLISHER"], ["city", "CITY"],
+  ["pages", "PAGES"], ["condition", "CONDITION"],
+  ["illustrations", "ILLUSTRATIONS"], ["price", "PRICE"],
+  ["acquired", "ACQUIRED"], ["categories", "CATEGORIES"], ["notes", "NOTES"],
+  ["whl", "WHL"], ["action", "ACTION"],
+];
+
+const state = {
+  dataset: "",
+  books: [],
+  filter: "",
+  // key `${dataset}:${idx}` -> { book, whl, checks, scans, approved }
+  checked: new Map(),
+  suggestItems: [],
+  suggestActive: -1,
+  manual: [],
+  // live WHL results for manual entries (session-only, keyed by entry id)
+  manualWhl: new Map(),
+  // combined-table row lookup, rebuilt on each renderChecked()
+  rowsById: new Map(),
+  checkedFilter: "",
+  chBooks: null,          // CH catalog rows for the lower pane (lazy)
+  downloads: new Map(),   // ia identifier -> job state
+  dlTimers: new Map(),
+  downloadedIds: new Set(),
+  settings: { checkedCols: {}, catalogCols: {}, showCatalog: false, markFilter: "ALL" },
+};
+
+const el = (id) => document.getElementById(id);
+const esc = (s) =>
+  String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+function status(msg) { el("status-msg").textContent = msg; }
+function ckey(dataset, idx) { return `${dataset}:${idx}`; }
+
+// --- persistence -----------------------------------------------------------
+
+function saveChecked() {
+  const arr = [...state.checked.entries()].map(([k, v]) => [k, v]);
+  try { localStorage.setItem(LS_KEY, JSON.stringify(arr)); } catch (e) {}
+}
+function loadChecked() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(LS_KEY) || "[]");
+    state.checked = new Map(arr);
+  } catch (e) { state.checked = new Map(); }
+}
+
+function saveSettings() {
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings)); } catch (e) {}
+}
+function loadSettings() {
+  try {
+    const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
+    state.settings = Object.assign(state.settings, s);
+  } catch (e) { /* keep defaults */ }
+  state.settings.checkedCols = state.settings.checkedCols || {};
+  state.settings.catalogCols = state.settings.catalogCols || {};
+}
+
+// --- tabs ------------------------------------------------------------------
+
+const TAB_TITLES = {
+  catalog: "CATALOG",
+  checked: "CHECKED BOOKS / MANUAL ENTRY",
+  upload: "UPLOAD LIST",
+};
+
+function setHeader(tabId) {
+  const name = `${TAB_TITLES[tabId] || ""} :: CATALOG EXPLORER`;
+  el("tb-name").textContent = name;
+  document.title = name;
+}
+
+function initTabs() {
+  for (const tab of document.querySelectorAll(".tab")) {
+    tab.addEventListener("click", () => {
+      document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+      document.querySelectorAll(".panel-view").forEach((p) => p.classList.remove("active"));
+      tab.classList.add("active");
+      el(tab.dataset.tab).classList.add("active");
+      setHeader(tab.dataset.tab);
+      if (tab.dataset.tab === "checked") renderChecked();
+      if (tab.dataset.tab === "upload") renderUpload();
+    });
+  }
+  setHeader("catalog");
+}
+
+// --- tooltip (match info + overflowed cells) ---------------------------------
+
+function showTip(text, x, y) {
+  const tip = el("cad-tooltip");
+  if (!text) { tip.hidden = true; return; }
+  tip.textContent = text;
+  tip.hidden = false;
+  const pad = 14;
+  const r = tip.getBoundingClientRect();
+  let left = x + pad, top = y + pad;
+  if (left + r.width > innerWidth - 8) left = Math.max(8, innerWidth - r.width - 8);
+  if (top + r.height > innerHeight - 8) top = Math.max(8, y - r.height - pad);
+  tip.style.left = left + "px";
+  tip.style.top = top + "px";
+}
+function hideTip() { el("cad-tooltip").hidden = true; }
+
+function initTooltips() {
+  document.addEventListener("mouseover", (ev) => {
+    const tagged = ev.target.closest("[data-tip]");
+    if (tagged) { showTip(tagged.dataset.tip, ev.clientX, ev.clientY); return; }
+    // Cells never wrap; an overflowed cell reveals its full text on hover.
+    const td = ev.target.closest("td, th");
+    if (td && !td.querySelector("input") && td.scrollWidth > td.clientWidth + 1) {
+      showTip(td.textContent.trim(), ev.clientX, ev.clientY);
+      return;
+    }
+    hideTip();
+  });
+  document.addEventListener("scroll", hideTip, true);
+  document.addEventListener("mouseleave", hideTip);
+}
+
+// --- settings (column visibility) ---------------------------------------------
+
+function applyColumnVisibility(tableId, colSettings) {
+  const table = el(tableId);
+  if (!table) return;
+  const ths = [...table.querySelectorAll("thead th")];
+  const hide = ths.map((th) => colSettings[th.dataset.col] === false);
+  ths.forEach((th, i) => { th.style.display = hide[i] ? "none" : ""; });
+  for (const tr of table.querySelectorAll("tbody tr")) {
+    [...tr.children].forEach((td, i) => { td.style.display = hide[i] ? "none" : ""; });
+  }
+}
+
+function renderSettings() {
+  const build = (containerId, cols, obj, reapply) => {
+    const wrap = el(containerId);
+    wrap.innerHTML = "";
+    for (const [key, label] of cols) {
+      const lab = document.createElement("label");
+      lab.className = "settings-col";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = obj[key] !== false;
+      cb.addEventListener("change", () => {
+        if (cb.checked) delete obj[key];
+        else obj[key] = false;
+        saveSettings();
+        reapply();
+      });
+      lab.appendChild(cb);
+      lab.appendChild(document.createTextNode(" " + label));
+      wrap.appendChild(lab);
+    }
+  };
+  build("cols-checked", CHECKED_COLS, state.settings.checkedCols,
+    () => applyColumnVisibility("checked-table", state.settings.checkedCols));
+  build("cols-catalog", CATALOG_COLS, state.settings.catalogCols,
+    () => applyColumnVisibility("catalog-table", state.settings.catalogCols));
+}
+
+function openSettings() { renderSettings(); el("settings-overlay").hidden = false; }
+function closeSettings() { el("settings-overlay").hidden = true; }
+
+// --- datasets + books ------------------------------------------------------
+
+async function initDatasets() {
+  const res = await fetch("/api/datasets");
+  const data = await res.json();
+  const sel = el("dataset");
+  sel.innerHTML = "";
+  for (const d of data.datasets) {
+    const opt = document.createElement("option");
+    opt.value = d.id;
+    opt.textContent = d.label;
+    sel.appendChild(opt);
+  }
+  state.dataset = data.default;
+  sel.value = data.default;
+  sel.addEventListener("change", () => { state.dataset = sel.value; loadBooks(); });
+  await loadBooks();
+}
+
+async function loadBooks() {
+  status(`LOADING ${state.dataset} ...`);
+  const res = await fetch(`/api/books?dataset=${encodeURIComponent(state.dataset)}`);
+  const data = await res.json();
+  state.books = data.books || [];
+  el("catalog-count").textContent = `${state.books.length} RECORDS`;
+  renderCatalog();
+  status(`LOADED ${state.books.length} RECORDS FROM ${state.dataset.toUpperCase()}`);
+}
+
+// --- catalog table ---------------------------------------------------------
+
+const FILTER_FIELDS = ["title", "author", "publisher", "city", "categories", "notes", "edition"];
+
+function filteredBooks() {
+  if (!state.filter) return state.books;
+  const q = state.filter.toLowerCase();
+  return state.books.filter((b) =>
+    FILTER_FIELDS.some((f) => (b[f] || "").toLowerCase().includes(q))
+  );
+}
+
+function renderCatalog() {
+  const rows = filteredBooks();
+  const tbody = el("catalog-rows");
+  tbody.innerHTML = "";
+  const shown = rows.slice(0, MAX_RENDER);
+
+  for (const b of shown) {
+    const key = ckey(state.dataset, b.idx);
+    const entry = state.checked.get(key);
+    const tr = document.createElement("tr");
+    if (entry) tr.classList.add("is-checked");
+    tr.innerHTML = `
+      <td class="col-chk"><input type="checkbox" data-idx="${b.idx}" ${entry ? "checked" : ""} /></td>
+      <td class="col-title">${esc(b.title) || "<em>(untitled)</em>"}${b.subtitle ? ` <span class="muted-cell">${esc(b.subtitle)}</span>` : ""}</td>
+      <td class="col-author">${esc(b.author)}</td>
+      <td class="col-year">${esc(b.year)}</td>
+      <td class="col-year">${esc(b.edition)}</td>
+      <td class="col-pub">${esc(b.publisher)}</td>
+      <td class="col-pub">${esc(b.city)}</td>
+      <td class="col-year">${esc(b.pages)}</td>
+      <td class="col-pub">${esc(b.condition)}</td>
+      <td class="col-pub">${esc(b.illustrations)}</td>
+      <td class="col-year">${esc(b.price)}</td>
+      <td class="col-year">${esc(b.acquired)}</td>
+      <td class="col-trunc">${esc(b.categories)}</td>
+      <td class="col-trunc">${esc(b.notes)}</td>
+      <td class="col-whl">${whlLiveBadge(entry && entry.whl)}</td>
+      <td class="col-act"><button class="cad-btn" data-find="${b.idx}">FIND</button></td>`;
+    tbody.appendChild(tr);
+  }
+
+  el("catalog-empty").hidden = rows.length !== 0;
+  const note = rows.length > MAX_RENDER ? ` (SHOWING ${MAX_RENDER})` : "";
+  el("catalog-count").textContent = `${rows.length} RECORDS${note}`;
+
+  tbody.querySelectorAll('input[type="checkbox"]').forEach((cb) =>
+    cb.addEventListener("change", () => toggleCheck(parseInt(cb.dataset.idx, 10), cb.checked)));
+  tbody.querySelectorAll("button[data-find]").forEach((btn) =>
+    btn.addEventListener("click", () => findOnWhl(parseInt(btn.dataset.find, 10), btn)));
+
+  applyColumnVisibility("catalog-table", state.settings.catalogCols);
+}
+
+function bookByIdx(idx) { return state.books.find((b) => b.idx === idx); }
+
+function toggleCheck(idx, on) {
+  const b = bookByIdx(idx);
+  if (!b) return;
+  const key = ckey(state.dataset, idx);
+  if (on) {
+    const prev = state.checked.get(key) || {};
+    state.checked.set(key, {
+      book: b,
+      whl: prev.whl || null,
+      checks: prev.checks || null,
+      scans: prev.scans || null,
+      approved: prev.approved || null,
+    });
+    if (!prev.scans) queueScan(key);
+  } else {
+    state.checked.delete(key);
+  }
+  saveChecked();
+  renderCatalog();
+  updateCheckedCount();
+}
+
+function updateCheckedCount() {
+  el("checked-count").textContent =
+    `${state.checked.size} CHECKED / ${state.manual.length} MANUAL`;
+}
+
+// --- WHL lookups (live site check) -------------------------------------------
+
+async function findOnWhl(idx, btn) {
+  const b = bookByIdx(idx);
+  if (!b) return;
+  const key = ckey(state.dataset, idx);
+  if (btn) { btn.disabled = true; btn.textContent = "..."; }
+  status(`QUERYING WHL :: ${b.title}`);
+
+  const whl = await queryWhl(b.title, b.author, b.year);
+  // Auto-check the book so it lands in the Checked Books tab.
+  const prev = state.checked.get(key) || {};
+  state.checked.set(key, {
+    book: b, whl,
+    checks: prev.checks || null, scans: prev.scans || null,
+    approved: prev.approved || null,
+  });
+  if (!prev.scans) queueScan(key);
+  saveChecked();
+  renderCatalog();
+  updateCheckedCount();
+  if (btn) { btn.disabled = false; btn.textContent = "FIND"; }
+  status(whlStatusLine(b.title, whl));
+}
+
+function whlStatusLine(title, whl) {
+  if (whl.available === true)
+    return `AVAILABLE :: ${title} -> ${whl.best_match.whl_title} (acc ${whl.best_match.accuracy})`;
+  if (whl.available === false) return `NOT FOUND ON WHL :: ${title}`;
+  return `WHL ERROR :: ${whl.error || "unknown"}`;
+}
+
+async function queryWhl(title, author, date) {
+  const url = `/api/whl?title=${encodeURIComponent(title)}` +
+    `&author=${encodeURIComponent(author || "")}` +
+    `&date=${encodeURIComponent(date || "")}`;
+  try {
+    const res = await fetch(url);
+    return await res.json();
+  } catch (e) {
+    return { available: null, error: String(e), best_match: null };
+  }
+}
+
+// --- autocomplete (abbreviated table; click = add to checked books) ----------
+
+let suggestTimer = null;
+function onSearchInput() {
+  state.filter = el("search").value.trim();
+  renderCatalog();
+  clearTimeout(suggestTimer);
+  suggestTimer = setTimeout(fetchSuggest, 140);
+}
+
+async function fetchSuggest() {
+  const q = el("search").value.trim();
+  if (q.length < 2) { hideSuggest(); return; }
+  const url = `/api/suggest?dataset=${encodeURIComponent(state.dataset)}&q=${encodeURIComponent(q)}`;
+  const res = await fetch(url);
+  state.suggestItems = await res.json();
+  state.suggestActive = -1;
+  renderSuggest();
+}
+
+function renderSuggest() {
+  const wrap = el("suggest");
+  if (!state.suggestItems.length) { hideSuggest(); return; }
+  let html = `<table class="s-table">
+    <thead><tr><th>TITLE</th><th>AUTHOR</th><th>YEAR</th><th>PUBLISHER</th><th>CATEGORIES</th><th></th></tr></thead><tbody>`;
+  state.suggestItems.forEach((b, i) => {
+    const added = state.checked.has(ckey(state.dataset, b.idx));
+    html += `<tr data-i="${i}" class="${i === state.suggestActive ? "active" : ""}">
+      <td>${esc(b.title) || "(untitled)"}</td>
+      <td>${esc(b.author)}</td>
+      <td>${esc(b.year)}</td>
+      <td>${esc(b.publisher)}</td>
+      <td>${esc(b.categories)}</td>
+      <td class="s-add">${added ? "ADDED" : "+ADD"}</td>
+    </tr>`;
+  });
+  html += "</tbody></table>";
+  wrap.innerHTML = html;
+  // mousedown (not click) so the pick lands before the input's blur hides us;
+  // keep the list open so several results can be added in a row.
+  wrap.querySelectorAll("tbody tr").forEach((tr) =>
+    tr.addEventListener("mousedown", (ev) => {
+      ev.preventDefault();
+      chooseSuggest(state.suggestItems[parseInt(tr.dataset.i, 10)]);
+    }));
+  wrap.hidden = false;
+}
+
+function hideSuggest() { el("suggest").hidden = true; state.suggestActive = -1; }
+
+function chooseSuggest(b) {
+  if (!b) return;
+  const key = ckey(state.dataset, b.idx);
+  const prev = state.checked.get(key) || {};
+  state.checked.set(key, {
+    book: b,
+    whl: prev.whl || null, checks: prev.checks || null,
+    scans: prev.scans || null, approved: prev.approved || null,
+  });
+  if (!prev.scans) queueScan(key);
+  saveChecked();
+  renderCatalog();
+  renderSuggest();
+  updateCheckedCount();
+  status(`ADDED TO CHECKED BOOKS :: ${b.title}`);
+}
+
+function onSearchKey(ev) {
+  const items = state.suggestItems;
+  if (el("suggest").hidden || !items.length) return;
+  if (ev.key === "ArrowDown") {
+    ev.preventDefault();
+    state.suggestActive = (state.suggestActive + 1) % items.length;
+    renderSuggest();
+  } else if (ev.key === "ArrowUp") {
+    ev.preventDefault();
+    state.suggestActive = (state.suggestActive - 1 + items.length) % items.length;
+    renderSuggest();
+  } else if (ev.key === "Enter") {
+    if (state.suggestActive >= 0) { ev.preventDefault(); chooseSuggest(items[state.suggestActive]); }
+  } else if (ev.key === "Escape") {
+    hideSuggest();
+  }
+}
+
+// --- badges ---------------------------------------------------------------
+// Uniform width; abbreviated labels (>= 4 chars are truncated to YES / NO /
+// VIEW / DRFT / ERR / ? / ---); the tag itself links to the matched record,
+// and the tooltip carries the full match details.
+
+function badge(cls, label, opts = {}) {
+  const tip = opts.tip ? ` data-tip="${esc(opts.tip)}"` : "";
+  const attrs = opts.attrs || "";
+  if (opts.href)
+    return `<a class="badge ${cls}" href="${esc(opts.href)}" target="_blank" rel="noopener"${tip}${attrs}>${esc(label)}</a>`;
+  return `<span class="badge ${cls}"${tip}${attrs}>${esc(label)}</span>`;
+}
+
+function tipForLiveWhl(whl) {
+  if (!whl) return "";
+  if (whl.error) return "WHL SITE ERROR: " + whl.error;
+  const m = whl.best_match;
+  if (!m) return "WHL SITE: no match found";
+  const lines = ["WHL SITE MATCH: " + m.whl_title];
+  if (m.author) lines.push("AUTHOR: " + m.author);
+  if (m.pub_date) lines.push("DATE: " + m.pub_date);
+  lines.push("ACCURACY: " + m.accuracy +
+    (m.title_score != null ? ` (title ${m.title_score}` +
+      (m.author_score != null ? `, author ${m.author_score}` : "") + ")" : ""));
+  return lines.join("\n");
+}
+
+function whlLiveBadge(whl) {
+  if (!whl) return badge("unknown", "---", { tip: "Not checked on the WHL site" });
+  const tip = tipForLiveWhl(whl);
+  if (whl.available === true) {
+    const m = whl.best_match || {};
+    return badge("available", "YES", { tip, href: m.wp_url || "" });
+  }
+  if (whl.available === false) return badge("missing", "NO", { tip });
+  return badge("error", "ERR", { tip });
+}
+
+function tipForLocalWhl(checks) {
+  if (!checks) return "";
+  const m = checks.whl_match;
+  if (!m) return "LOCAL WHL CATALOG: " + (checks.in_whl || "not checked");
+  const lines = ["LOCAL WHL CATALOG MATCH: " + m.title];
+  if (m.author) lines.push("AUTHOR: " + m.author);
+  if (m.year) lines.push("YEAR: " + m.year);
+  lines.push("STATUS: " + (m.status || "?"));
+  return lines.join("\n");
+}
+
+function whlCombinedBadge(row) {
+  const rejected = getVerify(row, "whl") === "rejected";
+  const murl = getManualUrl(row, "whl");
+  const wrap = (tagHtml) => verifyUnit(row, "whl", tagHtml);
+  const rejectedTag = (tip, href) => {
+    if (murl)
+      return wrap(badge("available", "YES", {
+        tip: "MANUALLY LOCATED SOURCE:\n" + murl +
+          "\n(automatic match was rejected as a false positive)",
+        href: murl,
+      }));
+    return wrap(badge("missing", "NO", {
+      tip: "REJECTED AS FALSE POSITIVE.\n" + tip +
+        "\nCLICK TAG: paste the URL of a manually located source",
+      href,
+    }));
+  };
+  // Prefer the live site result; fall back to the offline catalogue check.
+  if (row.whl) {
+    const tip = [tipForLiveWhl(row.whl), row.checks ? tipForLocalWhl(row.checks) : ""]
+      .filter(Boolean).join("\n");
+    if (row.whl.available === true) {
+      const m = row.whl.best_match || {};
+      if (rejected) return rejectedTag(tip, m.wp_url || "");
+      return wrap(badge("available", "YES", { tip, href: m.wp_url || "" }));
+    }
+    if (row.whl.available === false) return badge("missing", "NO", { tip });
+    return badge("error", "ERR", { tip });
+  }
+  const c = row.checks;
+  if (!c || c.error) return badge("unknown", "---", { tip: "Not checked yet" });
+  const tip = tipForLocalWhl(c);
+  const m = c.whl_match || {};
+  switch (c.in_whl) {
+    case "yes":
+    case "draft": {
+      if (rejected) return rejectedTag(tip, m.permalink || "");
+      return wrap(badge(c.in_whl === "yes" ? "available" : "missing",
+        c.in_whl === "yes" ? "YES" : "DRFT", { tip, href: m.permalink || "" }));
+    }
+    case "no": return badge("missing", "NO", { tip });
+    default: return badge("unknown", "?", { tip: "whl_catalog.csv not found" });
+  }
+}
+
+function copyrightBadge(checks) {
+  if (!checks) return badge("unknown", "---", { tip: "Not checked yet" });
+  if (checks.error) return badge("error", "ERR", { tip: checks.error });
+  const s = checks.copyright_status || "";
+  if (s.startsWith("Public domain")) return badge("available", "YES", { tip: s });
+  if (s.startsWith("In copyright")) return badge("error", "NO", { tip: s });
+  return badge("unknown", "?", { tip: s });
+}
+
+function tipForScan(s, isHt) {
+  if (!s) return "Not checked";
+  if (s.error) return "ERROR: " + s.error;
+  const b = s.best_match;
+  if (!b) return s.note || (s.available === false ? "No match found" : "Could not determine");
+  // On a NO tag the best match is the closest result that stayed below the
+  // acceptance threshold — show it so near-misses can be judged by eye.
+  const lines = [(s.available === false ? "NO CONFIDENT MATCH — CLOSEST: " : "MATCH: ") + b.title];
+  if (b.author) lines.push("AUTHOR: " + b.author);
+  if (b.year) lines.push("YEAR: " + b.year);
+  if (b.accuracy != null) lines.push("ACCURACY: " + b.accuracy);
+  if (isHt && b.items && b.items.length)
+    lines.push("ITEMS: " + b.items.map((i) => `${i.volume || "copy"} [${i.rights}]`).join(", "));
+  return lines.join("\n");
+}
+
+// --- per-source match verification ---------------------------------------------
+// Every positive catalog match (WHL / IA / HT) carries a marker on the tag's
+// right edge: yellow = pending, green = approved, red = rejected as a false
+// positive. Clicking the MARKER cycles pending -> approved -> rejected ->
+// pending; the tag itself stays a plain link. A rejected match renders as NO
+// and no longer counts as found; clicking a rejected tag opens a box to paste
+// the URL of a manually located source instead.
+
+function getVerify(row, source) {
+  return (row.verify || {})[source] || "pending";
+}
+
+function getManualUrl(row, source) {
+  return (row.manualUrls || {})[source] || "";
+}
+
+const VERIFY_TIPS = {
+  pending: "PENDING — CLICK MARKER TO APPROVE",
+  approved: "APPROVED — CLICK MARKER TO REJECT (false positive)",
+  rejected: "REJECTED (FALSE POSITIVE) — CLICK MARKER TO RESET.\nClick the tag to paste a manually located source.",
+};
+
+function verifyUnit(row, source, tagHtml) {
+  const st = getVerify(row, source);
+  const manual = st === "rejected" && getManualUrl(row, source);
+  const cls = manual ? "approved" : st;
+  const tip = manual
+    ? "MANUALLY LOCATED SOURCE — CLICK MARKER TO RESET"
+    : VERIFY_TIPS[st];
+  return `<span class="tag-unit" data-vsrc="${source}">${tagHtml}` +
+    `<span class="vmark ${cls}" data-tip="${esc(tip)}"></span></span>`;
+}
+
+function scanBadge(row, source) {
+  const scans = row.scans;
+  if (!scans || !scans[source]) return badge("unknown", "---", { tip: "Not scanned yet" });
+  const s = scans[source];
+  const isHt = source === "hathitrust";
+  const tip = tipForScan(s, isHt);
+  if (s.error) return badge("error", "ERR", { tip });
+  if (s.available === true) {
+    const best = s.best_match || {};
+    const href = best.url || best.record_url || "";
+    if (getVerify(row, source) === "rejected") {
+      const murl = getManualUrl(row, source);
+      if (murl) {
+        return verifyUnit(row, source, badge("available", "YES", {
+          tip: "MANUALLY LOCATED SOURCE:\n" + murl +
+            "\n(automatic match was rejected as a false positive)",
+          href: murl,
+        }));
+      }
+      return verifyUnit(row, source, badge("missing", "NO", {
+        tip: "REJECTED AS FALSE POSITIVE.\n" + tip +
+          "\nCLICK TAG: paste the URL of a manually located source",
+        href,
+      }));
+    }
+    return verifyUnit(row, source,
+      badge("available", isHt && s.full_view ? "VIEW" : "YES", { tip, href }));
+  }
+  if (s.available === false) return badge("missing", "NO", { tip });
+  return badge("unknown", "?", { tip, href: s.search_url || "" });
+}
+
+// --- SCAN / UPLOAD marks -------------------------------------------------------
+
+// Effective availability of a scan source: a match rejected as a false
+// positive no longer counts as found — unless a manually located source has
+// been pasted for it.
+function effScan(row, source) {
+  const s = row.scans && row.scans[source];
+  if (!s) return null;
+  if (s.available === true && getVerify(row, source) === "rejected")
+    return getManualUrl(row, source) ? true : false;
+  return s.available;
+}
+
+function computeMark(row) {
+  const c = row.checks, live = row.whl;
+  const liveAvail = live ? live.available : null;
+  const localWhl = c && !c.error ? c.in_whl : null;
+  const whlMatched = liveAvail === true || localWhl === "yes" || localWhl === "draft";
+  const whlRejected = whlMatched && getVerify(row, "whl") === "rejected" &&
+    !getManualUrl(row, "whl");
+  if (whlMatched && !whlRejected)
+    return { mark: null, reason: "Already in WHL — nothing to do" };
+  const whlAbsent = whlRejected || localWhl === "no" || liveAvail === false;
+  if (!whlAbsent)
+    return { mark: null, reason: "WHL status unknown — scan pending" };
+  if (!row.scans)
+    return { mark: null, reason: "Not in WHL — scan pending" };
+  const ia = effScan(row, "internet_archive"), ht = effScan(row, "hathitrust");
+  if (ia === true || ht === true)
+    return {
+      mark: "UPLOAD",
+      reason: "Not in WHL; a scan exists in an online archive.\nVerify each found source (click its marker); approved sources land in the UPLOAD LIST tab.",
+    };
+  const pd = c && (c.copyright_status || "").startsWith("Public domain");
+  if (!pd)
+    return { mark: null, reason: "Not public domain: " + ((c && c.copyright_status) || "copyright unknown") };
+  if (ia === false && ht !== true)
+    return {
+      mark: "SCAN",
+      reason: "Not in WHL; public domain; no scan found online (or only false positives).\nThis book should be scanned.",
+    };
+  return { mark: null, reason: "Online-archive status inconclusive — rerun scans" };
+}
+
+function anyApprovedSource(row) {
+  return ["internet_archive", "hathitrust"].some((src) =>
+    (getVerify(row, src) === "approved" &&
+      row.scans && row.scans[src] && row.scans[src].available === true) ||
+    (getVerify(row, src) === "rejected" && getManualUrl(row, src)));
+}
+
+function rowMarkState(row) {
+  const m = computeMark(row).mark;
+  if (m === "UPLOAD") return anyApprovedSource(row) ? "APPROVED" : "UPLOAD";
+  return m || "NONE";
+}
+
+function markCell(row) {
+  const { mark, reason } = computeMark(row);
+  if (mark === "SCAN") return badge("scan", "SCAN", { tip: reason });
+  if (mark === "UPLOAD") {
+    if (anyApprovedSource(row))
+      return badge("approved", "UPLD", { tip: "Approved source(s) ready — see the UPLOAD LIST tab" });
+    return badge("upload", "UPLD", { tip: reason });
+  }
+  return badge("unknown", "—", { tip: reason });
+}
+
+// --- combined checked-books + manual-entries table -----------------------------
+
+function manualToBook(e) {
+  return {
+    title: e.title || "", subtitle: "", author: e.author || "",
+    year: e.year || "", edition: e.edition || "", volume: e.volume || "",
+    publisher: e.publisher || "", city: e.city || "", language: e.language || "",
+    pages: e.pages || "", condition: e.condition || "",
+    illustrations: e.illustrations || "", price: e.price || "",
+    acquired: "", categories: e.categories || "", notes: e.notes || "",
+  };
+}
+
+// Legacy rows carried a single row-level `approved` flag; map it onto the
+// per-source verification of whichever online source was found.
+function migrateVerify(v) {
+  if (v.verify) return v.verify;
+  if (!v.approved || !v.scans) return null;
+  const ia = v.scans.internet_archive, ht = v.scans.hathitrust;
+  if (ia && ia.available === true) return { internet_archive: "approved" };
+  if (ht && ht.available === true) return { hathitrust: "approved" };
+  return null;
+}
+
+function combinedRows() {
+  const rows = [];
+  for (const e of state.manual) {
+    rows.push({
+      kind: "manual", id: e.id, dataset: "manual", book: manualToBook(e),
+      whl: state.manualWhl.get(e.id) || null,
+      checks: e.checks || null, scans: e.scans || null,
+      verify: migrateVerify(e) || {},
+      manualUrls: e.manual_urls || {},
+    });
+  }
+  for (const [k, v] of state.checked.entries()) {
+    // Manual entries are always shown natively above.
+    if (k.startsWith("manual_entries:")) continue;
+    rows.push({
+      kind: "catalog", id: k, dataset: k.split(":")[0],
+      book: Object.assign({ volume: "", language: "" }, v.book),
+      whl: v.whl || null, checks: v.checks || null, scans: v.scans || null,
+      verify: migrateVerify(v) || {},
+      manualUrls: v.manual_urls || {},
+    });
+  }
+  return rows;
+}
+
+function rowById(id) {
+  const m = state.manual.find((x) => x.id === id);
+  if (m) return { kind: "manual", id, book: manualToBook(m) };
+  const e = state.checked.get(id);
+  if (e) return { kind: "catalog", id, book: e.book };
+  return null;
+}
+
+const CHECKED_FILTER_FIELDS = [
+  "title", "author", "publisher", "city", "categories", "notes",
+  "year", "edition", "language",
+];
+
+function iaIdentifier(scans) {
+  const s = scans && scans.internet_archive;
+  if (!s || s.available !== true || !s.best_match) return "";
+  return s.best_match.identifier ||
+    ((s.best_match.url || "").split("/details/")[1] || "");
+}
+
+// The row's effective IA identifier: a manually located archive.org URL
+// replaces a rejected automatic match.
+function iaIdentifierForRow(row) {
+  if (getVerify(row, "internet_archive") === "rejected") {
+    const murl = getManualUrl(row, "internet_archive");
+    if (murl && murl.includes("/details/"))
+      return murl.split("/details/")[1].split(/[/?#]/)[0];
+    return "";
+  }
+  return iaIdentifier(row.scans);
+}
+
+function dlPct(dl) {
+  if (!dl || !dl.total) return "...";
+  return Math.round((dl.bytes / dl.total) * 100) + "%";
+}
+
+function iaCell(row) {
+  let html = scanBadge(row, "internet_archive");
+  const ident = iaIdentifierForRow(row);
+  if (ident) {
+    const dl = state.downloads.get(ident);
+    if ((dl && dl.status === "done") || state.downloadedIds.has(ident)) {
+      html += ` <span class="dl-done" data-tip="PDF saved under downloads/ia/ with a catalog entry">SAVED</span>`;
+    } else if (dl && dl.status === "downloading") {
+      html += ` <span class="dl-prog">${dlPct(dl)}</span>`;
+    } else if (dl && dl.status === "error") {
+      html += ` <span class="dl-err" data-tip="${esc(dl.error || "download failed")}">DL ERR</span>`;
+    }
+  }
+  return html;
+}
+
+function renderChecked() {
+  // Background re-renders (download polling, the auto-scan queue) must not
+  // destroy an in-progress cell edit; the table re-renders on commit anyway.
+  const active = document.activeElement;
+  if (active && active.classList && active.classList.contains("cell-edit")) return;
+  updateCheckedCount();
+  const tbody = el("checked-rows");
+  tbody.innerHTML = "";
+  let rows = combinedRows();
+  state.rowsById = new Map(rows.map((r) => [String(r.id), r]));
+
+  const q = (state.checkedFilter || "").toLowerCase();
+  if (q)
+    rows = rows.filter((r) =>
+      CHECKED_FILTER_FIELDS.some((f) => ((r.book[f] || "") + "").toLowerCase().includes(q)));
+  const mf = state.settings.markFilter || "ALL";
+  if (mf !== "ALL") rows = rows.filter((r) => rowMarkState(r) === mf);
+
+  el("checked-empty").hidden = rows.length !== 0;
+
+  for (const row of rows) {
+    const b = row.book;
+    const tr = document.createElement("tr");
+    tr.dataset.rowId = row.id;
+    if (row.kind === "manual") tr.classList.add("is-manual");
+    // acquired only exists on catalog rows; manual entries have no such field.
+    const editable = (f) =>
+      row.kind === "manual" && f === "acquired" ? "" : ` class="editable" data-edit="${f}"`;
+    const cell = (f) => `<td${editable(f)}>${esc(b[f])}</td>`;
+    tr.innerHTML = `
+      <td>${row.kind === "manual" ? "MANUAL" : esc(row.dataset.toUpperCase())}</td>
+      ${BOOK_COLS.map(cell).join("\n      ")}
+      <td class="col-whl">${copyrightBadge(row.checks)}</td>
+      <td class="col-whl">${whlCombinedBadge(row)}</td>
+      <td class="col-whl">${iaCell(row)}</td>
+      <td class="col-whl">${scanBadge(row, "hathitrust")}</td>
+      <td class="col-whl">${markCell(row)}</td>
+      <td class="col-act">
+        ${row.kind === "manual"
+          ? `<button class="cad-btn tiny danger" data-mdel="${esc(row.id)}">DEL</button>`
+          : `<button class="cad-btn tiny" data-unchk="${esc(row.id)}" data-tip="Remove from checked books">UNCHK</button>`}
+      </td>`;
+    tbody.appendChild(tr);
+  }
+
+  applyColumnVisibility("checked-table", state.settings.checkedCols);
+  renderChPane();
+}
+
+// One delegated handler covers verify markers / delete / uncheck / edit clicks.
+function onCheckedClick(ev) {
+  // The marker cycles the verification state; the tag itself stays a link.
+  const mark = ev.target.closest(".vmark");
+  if (mark) {
+    const unit = mark.closest("[data-vsrc]");
+    const tr = mark.closest("tr");
+    if (unit && tr) cycleVerify(tr.dataset.rowId, unit.dataset.vsrc);
+    return;
+  }
+  // A rejected tag without a manual source opens the paste-URL box instead
+  // of navigating to the (wrong) record.
+  const tag = ev.target.closest(".tag-unit a.badge");
+  if (tag) {
+    const unit = tag.closest("[data-vsrc]");
+    const tr = tag.closest("tr");
+    const row = tr && state.rowsById.get(String(tr.dataset.rowId));
+    if (row && unit && getVerify(row, unit.dataset.vsrc) === "rejected" &&
+        !getManualUrl(row, unit.dataset.vsrc)) {
+      ev.preventDefault();
+      openManualSource(tr.dataset.rowId, unit.dataset.vsrc);
+    }
+    return;
+  }
+  const t = ev.target.closest("[data-mdel],[data-unchk]");
+  if (t) {
+    if (t.dataset.mdel !== undefined) deleteManual(t.dataset.mdel);
+    else if (t.dataset.unchk !== undefined) uncheckRow(t.dataset.unchk);
+    return;
+  }
+  const td = ev.target.closest("td[data-edit]");
+  if (td) startEdit(td);
+}
+
+function uncheckRow(key) {
+  state.checked.delete(key);
+  saveChecked();
+  renderChecked();
+  renderCatalog();
+  updateCheckedCount();
+  status("REMOVED FROM CHECKED BOOKS");
+}
+
+// --- click-to-edit cells --------------------------------------------------------
+
+function startEdit(td) {
+  if (td.querySelector("input")) return;
+  const tr = td.closest("tr");
+  const row = state.rowsById.get(String(tr.dataset.rowId));
+  if (!row) return;
+  const field = td.dataset.edit;
+  const original = String(row.book[field] || "");
+  hideTip();
+  td.classList.add("editing");
+  td.innerHTML = `<input class="cell-edit" value="${esc(original)}" />`;
+  const input = td.querySelector("input");
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = (commit) => {
+    if (done) return;
+    done = true;
+    // Release focus first: renderChecked() skips rebuilds while a .cell-edit
+    // input is focused, and the commit path re-renders right after.
+    input.blur();
+    const val = input.value.trim();
+    if (commit && val !== original.trim()) commitEdit(row, field, val);
+    else renderChecked();
+  };
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); finish(true); }
+    else if (ev.key === "Escape") { ev.stopPropagation(); finish(false); }
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+
+async function commitEdit(row, field, value) {
+  if (row.kind === "manual") {
+    const res = await fetch(`/api/manual/${encodeURIComponent(row.id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ [field]: value }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.ok) {
+      const i = state.manual.findIndex((x) => x.id === row.id);
+      if (i >= 0) state.manual[i] = data.entry;
+      status(`UPDATED ${field.toUpperCase()} :: RESCANNING`);
+      queueScan(row.id);
+    } else {
+      status(data.error || "UPDATE FAILED");
+    }
+  } else {
+    const entry = state.checked.get(row.id);
+    if (!entry) return;
+    entry.book = Object.assign({}, entry.book, { [field]: value });
+    // Metadata changed: every stored result (and its verification) is stale
+    // until the auto-rescan.
+    entry.checks = null;
+    entry.scans = null;
+    entry.whl = null;
+    entry.verify = null;
+    saveChecked();
+    status(`UPDATED ${field.toUpperCase()} :: RESCANNING`);
+    queueScan(row.id);
+  }
+  renderChecked();
+  renderCatalog();
+}
+
+// --- CH catalog pane below the checked list ------------------------------------
+
+async function loadChBooks() {
+  if (state.chBooks) return;
+  try {
+    const res = await fetch("/api/books?dataset=ch_library");
+    state.chBooks = res.ok ? (await res.json()).books || [] : [];
+  } catch (e) { state.chBooks = []; }
+}
+
+function renderChPane() {
+  const pane = el("catalog-pane");
+  pane.hidden = !state.settings.showCatalog;
+  if (pane.hidden) return;
+  const q = (state.checkedFilter || "").toLowerCase();
+  const books = (state.chBooks || []).filter((b) =>
+    !q || CHECKED_FILTER_FIELDS.some((f) => (b[f] || "").toLowerCase().includes(q)));
+  const shown = books.slice(0, CHPANE_RENDER);
+  const tbody = el("chpane-rows");
+  tbody.innerHTML = "";
+  for (const b of shown) {
+    const added = state.checked.has(ckey("ch_library", b.idx));
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${esc(b.title) || "<em>(untitled)</em>"}</td>
+      <td>${esc(b.author)}</td>
+      <td>${esc(b.year)}</td>
+      <td>${esc(b.publisher)}</td>
+      <td>${esc(b.city)}</td>
+      <td>${esc(b.categories)}</td>
+      <td class="col-act">${added
+        ? '<span class="muted-cell">ADDED</span>'
+        : `<button class="cad-btn tiny" data-chadd="${b.idx}">+ADD</button>`}</td>`;
+    tbody.appendChild(tr);
+  }
+  el("chpane-empty").hidden = shown.length !== 0;
+}
+
+function addChBook(idx) {
+  const book = (state.chBooks || []).find((x) => x.idx === idx);
+  if (!book) return;
+  const key = ckey("ch_library", idx);
+  const prev = state.checked.get(key) || {};
+  state.checked.set(key, {
+    book,
+    whl: prev.whl || null, checks: prev.checks || null,
+    scans: prev.scans || null, approved: prev.approved || null,
+  });
+  if (!prev.scans) queueScan(key);
+  saveChecked();
+  renderChecked();
+  if (state.dataset === "ch_library") renderCatalog();
+  updateCheckedCount();
+  status(`ADDED TO CHECKED BOOKS :: ${book.title}`);
+}
+
+// --- Internet Archive PDF downloads ---------------------------------------------
+
+async function loadDownloads() {
+  try {
+    const catalog = await (await fetch("/api/ia/downloads")).json();
+    state.downloadedIds = new Set(Object.keys(catalog));
+  } catch (e) { state.downloadedIds = new Set(); }
+}
+
+async function startDownload(identifier, book) {
+  if (!identifier) return;
+  try {
+    const res = await fetch("/api/ia/download", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ identifier, book: book || {} }),
+    });
+    const data = await res.json();
+    state.downloads.set(identifier, data);
+    if (data.status === "done") state.downloadedIds.add(identifier);
+    else if (data.status === "downloading") pollDownload(identifier);
+  } catch (e) {
+    status("IA DOWNLOAD FAILED TO START");
+  }
+  renderChecked();
+}
+
+function pollDownload(identifier) {
+  if (state.dlTimers.has(identifier)) return;
+  let failures = 0;
+  const t = setInterval(async () => {
+    try {
+      const data = await (await fetch(`/api/ia/download/${encodeURIComponent(identifier)}`)).json();
+      failures = 0;
+      state.downloads.set(identifier, data);
+      if (data.status === "downloading") {
+        status(`IA DOWNLOAD ${dlPct(data)} :: ${identifier}`);
+      } else {
+        clearInterval(t);
+        state.dlTimers.delete(identifier);
+        if (data.status === "done") {
+          state.downloadedIds.add(identifier);
+          status(`IA PDF SAVED :: ${data.path || identifier}`);
+        } else if (data.status === "error") {
+          status(`IA DOWNLOAD ERROR :: ${data.error || "unknown"}`);
+        }
+      }
+      renderChecked();
+    } catch (e) {
+      // Transient errors are fine, but stop once the server is clearly gone.
+      failures += 1;
+      if (failures >= 8) {
+        clearInterval(t);
+        state.dlTimers.delete(identifier);
+        status(`IA DOWNLOAD POLLING STOPPED (SERVER UNREACHABLE) :: ${identifier}`);
+      }
+    }
+  }, 1500);
+  state.dlTimers.set(identifier, t);
+}
+
+async function downloadApproved() {
+  // Every book whose IA source is verified: an approved automatic match or a
+  // manually located archive.org record.
+  const approved = combinedRows().filter((r) =>
+    (getVerify(r, "internet_archive") === "approved" &&
+      r.scans && r.scans.internet_archive && r.scans.internet_archive.available === true) ||
+    (getVerify(r, "internet_archive") === "rejected" && getManualUrl(r, "internet_archive")));
+  if (!approved.length) { status("NO APPROVED IA SOURCES"); return; }
+  let started = 0, saved = 0, noIa = 0;
+  for (const row of approved) {
+    const ident = iaIdentifierForRow(row);
+    if (!ident) { noIa += 1; continue; }
+    if (state.downloadedIds.has(ident)) { saved += 1; continue; }
+    const dl = state.downloads.get(ident);
+    if (dl && dl.status === "downloading") continue;
+    started += 1;
+    await startDownload(ident, row.book);
+  }
+  status(`IA DOWNLOADS :: ${started} STARTED / ${saved} ALREADY SAVED` +
+    (noIa ? ` / ${noIa} WITHOUT IA MATCH` : ""));
+}
+
+// --- automatic checks + scans -----------------------------------------------
+
+const scanQueue = [];
+let scanQueueRunning = false;
+
+// New rows and edited rows are scanned automatically; the queue serializes
+// the lookups so a burst of adds doesn't hammer the archives.
+function queueScan(id) {
+  if (scanQueue.includes(id)) return;
+  scanQueue.push(id);
+  processScanQueue();
+}
+
+async function processScanQueue() {
+  if (scanQueueRunning) return;
+  scanQueueRunning = true;
+  while (scanQueue.length) {
+    const id = scanQueue.shift();
+    const row = rowById(id);
+    if (!row || !(row.book.title || "").trim()) continue;
+    status(`AUTO SCAN :: ${row.book.title}`);
+    try {
+      const scans = await runRowScans(row);
+      status(`AUTO SCAN DONE :: ${row.book.title} :: ${scanStatusLine(scans)}`);
+    } catch (e) {
+      status(`AUTO SCAN FAILED :: ${row.book.title}`);
+    }
+    renderChecked();
+  }
+  scanQueueRunning = false;
+}
+
+async function fetchChecks(book) {
+  const url = `/api/check?title=${encodeURIComponent(book.title)}` +
+    `&author=${encodeURIComponent(book.author || "")}` +
+    `&year=${encodeURIComponent(book.year || "")}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`check failed (${res.status})`);
+  return await res.json();
+}
+
+async function fetchScans(book) {
+  const url = `/api/scans?title=${encodeURIComponent(book.title)}` +
+    `&author=${encodeURIComponent(book.author || "")}` +
+    `&year=${encodeURIComponent(book.year || "")}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`scan search failed (${res.status})`);
+  return await res.json();
+}
+
+// Run scans (and, for catalog rows, the offline checks) for one row.
+async function runRowScans(row) {
+  if (row.kind === "manual") {
+    const res = await fetch(`/api/manual/${encodeURIComponent(row.id)}/scans`, { method: "POST" });
+    const data = await res.json();
+    if (!data.ok) throw new Error("scan search failed");
+    const i = state.manual.findIndex((x) => x.id === row.id);
+    if (i >= 0) state.manual[i] = data.entry;
+    return data.entry.scans;
+  }
+  const entry = state.checked.get(row.id);
+  if (!entry) return null;
+  if (!entry.checks || entry.checks.error) {
+    try { entry.checks = await fetchChecks(entry.book); } catch (e) { /* keep going */ }
+  }
+  entry.scans = await fetchScans(entry.book);
+  saveChecked();
+  return entry.scans;
+}
+
+async function runScansBatch() {
+  const rows = combinedRows().filter((r) => !r.scans);
+  if (!rows.length) { status("ALL ROWS ALREADY SCANNED"); return; }
+  for (const row of rows) queueScan(row.id);
+  status(`QUEUED ${rows.length} BOOKS FOR SCANNING`);
+}
+
+function scanStatusLine(scans) {
+  if (!scans) return "no result";
+  const flag = (s) =>
+    s.error ? "ERR" : s.available === true ? "YES" : s.available === false ? "NO" : "?";
+  return `IA ${flag(scans.internet_archive)} / HT ${flag(scans.hathitrust)}`;
+}
+
+// --- per-source verification (approve / reject false positives) ------------------
+
+async function setVerify(id, source, verdict) {
+  const row = state.rowsById.get(String(id));
+  if (!row) return;
+  if (row.kind === "manual") {
+    const res = await fetch(`/api/manual/${encodeURIComponent(id)}/verify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source, state: verdict }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (data.ok) {
+      const i = state.manual.findIndex((x) => x.id === id);
+      if (i >= 0) state.manual[i] = data.entry;
+    }
+  } else {
+    const entry = state.checked.get(id);
+    if (!entry) return;
+    entry.verify = Object.assign({}, migrateVerify(entry) || {});
+    if (verdict === "pending") delete entry.verify[source];
+    else entry.verify[source] = verdict;
+    if (verdict !== "rejected" && entry.manual_urls) delete entry.manual_urls[source];
+    entry.approved = null; // superseded by per-source verification
+    saveChecked();
+  }
+  renderChecked();
+  const names = { whl: "WHL", internet_archive: "IA", hathitrust: "HT" };
+  status(`${names[source] || source} MATCH ${verdict.toUpperCase()} :: ${row.book.title}`);
+}
+
+function cycleVerify(id, source) {
+  const row = state.rowsById.get(String(id));
+  if (!row) return;
+  const cur = getVerify(row, source);
+  const next = cur === "pending" ? "approved" : cur === "approved" ? "rejected" : "pending";
+  setVerify(id, source, next);
+}
+
+// --- manually located sources (for rejected matches) ------------------------------
+
+async function setManualUrl(id, source, url) {
+  const row = state.rowsById.get(String(id));
+  if (!row) return;
+  if (row.kind === "manual") {
+    const res = await fetch(`/api/manual/${encodeURIComponent(id)}/source`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source, url }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (data.ok) {
+      const i = state.manual.findIndex((x) => x.id === id);
+      if (i >= 0) state.manual[i] = data.entry;
+    }
+  } else {
+    const entry = state.checked.get(id);
+    if (!entry) return;
+    entry.manual_urls = Object.assign({}, entry.manual_urls || {});
+    if (url) entry.manual_urls[source] = url;
+    else delete entry.manual_urls[source];
+    saveChecked();
+  }
+  renderChecked();
+  status(url ? `MANUAL SOURCE SAVED :: ${row.book.title}` : "MANUAL SOURCE CLEARED");
+}
+
+function openManualSource(id, source) {
+  state.msrcTarget = { id: String(id), source };
+  const row = state.rowsById.get(String(id));
+  const names = { whl: "WHL", internet_archive: "INTERNET ARCHIVE", hathitrust: "HATHITRUST" };
+  el("msrc-label").textContent =
+    `${names[source] || source} :: ${row ? row.book.title : id} — the automatic match was ` +
+    `rejected; paste the URL of the correct record.`;
+  el("msrc-url").value = row ? getManualUrl(row, source) : "";
+  el("msrc-msg").textContent = "";
+  el("msrc-overlay").hidden = false;
+  el("msrc-url").focus();
+}
+
+function closeManualSource() { el("msrc-overlay").hidden = true; }
+
+async function saveManualSource(clear) {
+  const t = state.msrcTarget;
+  if (!t) return;
+  const url = clear ? "" : el("msrc-url").value.trim();
+  if (url && !/^https?:\/\//i.test(url)) {
+    el("msrc-msg").textContent = "URL MUST START WITH http(s)://";
+    return;
+  }
+  await setManualUrl(t.id, t.source, url);
+  closeManualSource();
+}
+
+// --- manual entry form -----------------------------------------------------------
+
+function manualStatusLine(entry) {
+  const c = entry.checks || {};
+  const cp = c.copyright_status || "?";
+  const whl = { yes: "IN WHL", draft: "WHL DRAFT", no: "NOT IN WHL" }[c.in_whl] || "WHL ?";
+  return `SUBMITTED :: ${entry.title} :: ${cp.toUpperCase()} / ${whl}`;
+}
+
+// --- open library search + autocomplete --------------------------------------
+// The SEARCH sub-tab runs a constrained query against the local works index
+// (output/ol_works.db); the manual-entry title field autocompletes from the
+// same index. Fields filled from a pick are shaded yellow, hand-typed fields
+// green, and green fields constrain the search without being overwritten.
+
+const PROV_FIELDS = ["title", "author", "publisher", "city", "year", "edition", "volume"];
+const EDITION_CONSTRAINT_FIELDS = ["publisher", "city", "year", "edition", "volume"];
+state.prov = {};  // field -> "manual" | "auto"
+
+function setProv(field, kind) {
+  if (kind) state.prov[field] = kind;
+  else delete state.prov[field];
+  const input = el("m-" + field);
+  input.classList.toggle("prov-manual", state.prov[field] === "manual");
+  input.classList.toggle("prov-auto", state.prov[field] === "auto");
+}
+
+function clearProv() {
+  for (const f of PROV_FIELDS) setProv(f, null);
+}
+
+function initPaneTabs() {
+  for (const t of document.querySelectorAll(".pane-tab")) {
+    t.addEventListener("click", () => switchPaneTab(t.dataset.ptab));
+  }
+}
+
+function switchPaneTab(id) {
+  document.querySelectorAll(".pane-tab").forEach((t) =>
+    t.classList.toggle("active", t.dataset.ptab === id));
+  document.querySelectorAll(".pane-sub").forEach((p) =>
+    p.classList.toggle("active", p.id === id));
+}
+
+async function loadOlStatus() {
+  try {
+    const st = await (await fetch("/api/ol/status")).json();
+    if (st.available) {
+      el("ol-db-note").textContent =
+        `CONSTRAINED SEARCH OF THE OPEN LIBRARY WORKS INDEX (${(st.works / 1e6).toFixed(1)}M WORKS). ` +
+        `FILL ANY FIELDS; USE A RESULT TO POPULATE THE MANUAL ENTRY.`;
+    } else {
+      el("ol-db-note").textContent =
+        "OPEN LIBRARY INDEX NOT BUILT — RUN tools/build_ol_index.py FIRST.";
+    }
+  } catch (e) { /* leave the default note */ }
+}
+
+// --- manual-entry title autocomplete --
+
+let olTimer = null;
+function onTitleInput() {
+  clearTimeout(olTimer);
+  const q = el("m-title").value.trim();
+  if (q.length < 3) { hideOlSuggest(); return; }
+  olTimer = setTimeout(fetchOlSuggest, 350);
+}
+
+function manualConstraints(prefix) {
+  const params = {};
+  for (const f of EDITION_CONSTRAINT_FIELDS.concat(["author"])) {
+    if (prefix === "m-" && state.prov[f] !== "manual") continue;
+    const v = el(prefix + f).value.trim();
+    if (v) params[f] = v;
+  }
+  return params;
+}
+
+async function fetchOlSuggest() {
+  const q = el("m-title").value.trim();
+  if (q.length < 3) { hideOlSuggest(); return; }
+  const params = new URLSearchParams(
+    Object.assign({ title: q, limit: "8" }, manualConstraints("m-")));
+  let data;
+  try {
+    data = await (await fetch("/api/ol/search?" + params)).json();
+  } catch (e) { hideOlSuggest(); return; }
+  if (el("m-title").value.trim() !== q) return;  // stale response
+  renderOlSuggest(data);
+}
+
+function renderOlSuggest(data) {
+  const wrap = el("ol-suggest");
+  const results = data.results || [];
+  if (data.error || data.note) {
+    wrap.innerHTML = `<div class="ol-note">${esc(data.error || data.note)}</div>`;
+    wrap.hidden = false;
+    return;
+  }
+  if (!results.length) { hideOlSuggest(); return; }
+  wrap.innerHTML = results.map((r, i) => `
+    <div class="ol-item" data-i="${i}">
+      <span class="t">${esc(r.title)}${r.subtitle ? `: ${esc(r.subtitle)}` : ""}</span>
+      <span class="m">${esc((r.authors || []).filter((a) => a && a !== "?").join("; ")) || "&mdash;"}${r.first_year ? ` [${r.first_year}]` : ""}</span>
+    </div>`).join("");
+  wrap.querySelectorAll(".ol-item").forEach((item) =>
+    item.addEventListener("mousedown", (ev) => {
+      ev.preventDefault();
+      pickOlWork(results[parseInt(item.dataset.i, 10)]);
+    }));
+  wrap.hidden = false;
+}
+
+function hideOlSuggest() { el("ol-suggest").hidden = true; }
+
+function fillAuto(field, value) {
+  if (!value) return;
+  // Hand-typed (green) fields constrain the search and are never overwritten
+  // — except the title, where picking a suggestion completes what was typed.
+  if (field !== "title" && state.prov[field] === "manual") return;
+  el("m-" + field).value = value;
+  setProv(field, "auto");
+}
+
+function populateFromWork(r, best) {
+  fillAuto("title", r.title + (r.subtitle ? ": " + r.subtitle : ""));
+  fillAuto("author", (r.authors || []).filter((a) => a && a !== "?").join("; "));
+  if (best) {
+    for (const f of EDITION_CONSTRAINT_FIELDS) fillAuto(f, best[f]);
+  }
+}
+
+async function pickOlWork(r) {
+  hideOlSuggest();
+  status(`OPEN LIBRARY :: FETCHING EDITIONS :: ${r.title}`);
+  let best = null, count = 0;
+  try {
+    const params = new URLSearchParams(
+      Object.assign({ work: r.key }, manualConstraints("m-")));
+    params.delete("author");
+    const data = await (await fetch("/api/ol/editions?" + params)).json();
+    if (data.ok) { best = data.best; count = data.editions_count; }
+  } catch (e) { /* populate what the work record has */ }
+  populateFromWork(r, best);
+  status(`OPEN LIBRARY :: POPULATED FROM ${r.key}` +
+    (count ? ` (BEST OF ${count} EDITIONS)` : " (NO EDITION DETAILS)"));
+}
+
+// --- constrained search sub-tab --
+
+async function olSearch(ev) {
+  ev.preventDefault();
+  const constraints = {};
+  for (const f of PROV_FIELDS) {
+    const v = el("s-" + f).value.trim();
+    if (v) constraints[f] = v;
+  }
+  if (!constraints.title && !constraints.author) {
+    el("ol-msg").textContent = "ENTER AT LEAST A TITLE OR AUTHOR";
+    return;
+  }
+  const btn = el("ol-search-btn");
+  btn.disabled = true;
+  el("ol-msg").textContent = "SEARCHING ...";
+  el("ol-results").innerHTML = "";
+  try {
+    const params = new URLSearchParams(
+      Object.assign({ deep: "1", limit: "10" }, constraints));
+    const data = await (await fetch("/api/ol/search?" + params)).json();
+    renderOlResults(data);
+  } catch (e) {
+    el("ol-msg").textContent = "SEARCH FAILED";
+  }
+  btn.disabled = false;
+}
+
+function renderOlResults(data) {
+  const wrap = el("ol-results");
+  const results = data.results || [];
+  el("ol-msg").textContent = data.error || data.note ||
+    (results.length ? `${results.length} RESULTS` : "NO MATCHES");
+  wrap.innerHTML = "";
+  results.forEach((r, i) => {
+    const ed = (r.edition || {}).best;
+    const edLine = ed
+      ? [ed.year, ed.publisher, ed.city, ed.edition ? "ed. " + ed.edition : "",
+         ed.volume ? "vol. " + ed.volume : ""].filter(Boolean).join(" / ")
+      : "";
+    const card = document.createElement("div");
+    card.className = "ol-card";
+    card.innerHTML = `
+      <div class="t"><a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.title)}${r.subtitle ? `: ${esc(r.subtitle)}` : ""}</a></div>
+      <div class="m">${esc((r.authors || []).filter((a) => a && a !== "?").join("; ")) || "&mdash;"}${r.first_year ? ` [${r.first_year}]` : ""}</div>
+      ${edLine ? `<div class="e">${(r.edition || {}).satisfies ? "&#10003; " : ""}${esc(edLine)}${(r.edition || {}).editions_count ? ` (${r.edition.editions_count} ed.)` : ""}</div>` : ""}
+      <button class="cad-btn tiny" data-use="${i}">USE</button>`;
+    wrap.appendChild(card);
+  });
+  wrap.querySelectorAll("button[data-use]").forEach((btn) =>
+    btn.addEventListener("click", () => useOlResult(results[parseInt(btn.dataset.use, 10)])));
+}
+
+async function useOlResult(r) {
+  switchPaneTab("pane-entry");
+  // The constraints the user typed into the search form are hand-entered
+  // metadata: carry them over as manual (green) so they are kept.
+  clearProv();
+  el("manual-form").reset();
+  for (const f of PROV_FIELDS) {
+    const v = el("s-" + f).value.trim();
+    if (v) { el("m-" + f).value = v; setProv(f, "manual"); }
+  }
+  if (r.edition && r.edition.best) {
+    populateFromWork(r, r.edition.best);
+    status(`OPEN LIBRARY :: POPULATED FROM ${r.key}`);
+  } else {
+    await pickOlWork(r);
+  }
+  el("m-title").focus();
+}
+
+// Old title pages carry Roman-numeral dates; converting them by eye is
+// error-prone, so the footer shows the Arabic year while one is typed.
+function romanToArabic(s) {
+  const t = String(s || "").trim().toUpperCase().replace(/\.$/, "").replace(/\s+/g, "");
+  if (!t || !/^[MDCLXVI]+$/.test(t)) return null;
+  const vals = { M: 1000, D: 500, C: 100, L: 50, X: 10, V: 5, I: 1 };
+  let total = 0;
+  for (let i = 0; i < t.length; i++) {
+    const v = vals[t[i]];
+    total += v < (vals[t[i + 1]] || 0) ? -v : v;
+  }
+  return total >= 1 && total <= 3999 ? total : null;
+}
+
+function onYearInput() {
+  const raw = el("m-year").value;
+  const n = romanToArabic(raw);
+  el("status-right").textContent =
+    n ? `ROMAN YEAR :: ${raw.trim().toUpperCase()} = ${n}` : "";
+}
+
+async function submitManual(ev) {
+  ev.preventDefault();
+  const body = {};
+  for (const f of MANUAL_FIELDS) body[f] = el("m-" + f).value;
+  if (!body.title.trim()) { el("manual-msg").textContent = "TITLE IS REQUIRED"; return; }
+
+  const btn = el("manual-submit");
+  btn.disabled = true;
+  el("manual-msg").textContent = "CHECKING ...";
+  status(`CHECKING :: ${body.title}`);
+  try {
+    const res = await fetch("/api/manual", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.ok) {
+      state.manual.unshift(data.entry);
+      renderChecked();
+      el("manual-form").reset();
+      clearProv();
+      hideOlSuggest();
+      el("m-title").focus();
+      el("manual-msg").textContent = "SAVED";
+      status(manualStatusLine(data.entry));
+      queueScan(data.entry.id);
+    } else {
+      el("manual-msg").textContent = data.error || "SAVE FAILED";
+    }
+  } catch (e) {
+    el("manual-msg").textContent = "SAVE FAILED";
+  }
+  btn.disabled = false;
+}
+
+async function loadManual() {
+  try {
+    const res = await fetch("/api/manual");
+    state.manual = res.ok ? await res.json() : [];
+  } catch (e) { state.manual = []; }
+  updateCheckedCount();
+  renderChecked();
+}
+
+async function deleteManual(id) {
+  const e = state.manual.find((x) => x.id === id);
+  if (!window.confirm(`Delete manual entry "${e ? e.title : id}"?`)) return;
+  const res = await fetch(`/api/manual/${encodeURIComponent(id)}`, { method: "DELETE" });
+  if (res.ok) {
+    state.manual = state.manual.filter((x) => x.id !== id);
+    renderChecked();
+    status("MANUAL ENTRY DELETED");
+  } else {
+    status("DELETE FAILED");
+  }
+}
+
+// --- checked books batch actions ------------------------------------------------
+
+async function checkSelectedOnWhl() {
+  const rows = combinedRows();
+  if (!rows.length) { status("NOTHING CHECKED"); return; }
+  const btn = el("check-whl");
+  btn.disabled = true;
+  let done = 0;
+  for (const row of rows) {
+    done += 1;
+    status(`WHL ${done}/${rows.length} :: ${row.book.title}`);
+    const whl = await queryWhl(row.book.title, row.book.author, row.book.year);
+    if (row.kind === "manual") {
+      state.manualWhl.set(row.id, whl);
+    } else {
+      const entry = state.checked.get(row.id);
+      if (entry) entry.whl = whl;
+    }
+    renderChecked();
+  }
+  saveChecked();
+  renderCatalog();
+  btn.disabled = false;
+  const avail = combinedRows().filter((r) => r.whl && r.whl.available === true).length;
+  status(`WHL CHECK COMPLETE :: ${avail}/${rows.length} AVAILABLE`);
+}
+
+function exportJson() {
+  const payload = combinedRows().map((r) => ({
+    source: r.kind === "manual" ? "manual_entries" : r.dataset,
+    metadata: r.book,
+    whl: r.whl || null,
+    checks: r.checks || null,
+    scans: r.scans || null,
+    mark: rowMarkState(r),
+    verify: r.verify || {},
+  }));
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "whl_checked_books.json";
+  a.click();
+  URL.revokeObjectURL(a.href);
+  status(`EXPORTED ${payload.length} RECORDS`);
+}
+
+function clearChecked() {
+  if (!window.confirm("Remove ALL checked catalog books? (Manual entries are kept.)")) return;
+  state.checked.clear();
+  saveChecked();
+  renderChecked();
+  renderCatalog();
+  status("CLEARED CHECKED BOOKS");
+}
+
+// --- upload list (approved sources) ----------------------------------------------
+
+const ARCHIVE_NAMES = { internet_archive: "Internet Archive", hathitrust: "HathiTrust" };
+
+function approvedSources() {
+  const out = [];
+  for (const row of combinedRows()) {
+    for (const source of ["internet_archive", "hathitrust"]) {
+      const meta = {
+        title: row.book.title || "",
+        subtitle: row.book.subtitle || "",
+        author: row.book.author || "",
+        publisher: row.book.publisher || "",
+        year: row.book.year || "",
+        archive: ARCHIVE_NAMES[source],
+      };
+      const st = getVerify(row, source);
+      if (st === "approved") {
+        const s = row.scans && row.scans[source];
+        const b = s && s.available === true ? s.best_match : null;
+        if (!b) continue;
+        out.push(Object.assign(meta, {
+          url: b.url || b.record_url || "",
+          matched_title: b.title || "",
+          identifier: b.identifier || "",
+        }));
+      } else if (st === "rejected" && getManualUrl(row, source)) {
+        const murl = getManualUrl(row, source);
+        out.push(Object.assign(meta, {
+          url: murl,
+          matched_title: "(manually located source)",
+          identifier: murl.includes("/details/")
+            ? murl.split("/details/")[1].split(/[/?#]/)[0] : "",
+        }));
+      }
+    }
+  }
+  return out;
+}
+
+function renderUpload() {
+  const sources = approvedSources();
+  const tbody = el("upload-rows");
+  tbody.innerHTML = "";
+  el("upload-count").textContent = `${sources.length} APPROVED SOURCES`;
+  el("upload-empty").hidden = sources.length !== 0;
+  for (const s of sources) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${esc(s.title)}</td>
+      <td>${esc(s.subtitle)}</td>
+      <td>${esc(s.author)}</td>
+      <td>${esc(s.publisher)}</td>
+      <td>${esc(s.year)}</td>
+      <td>${esc(s.archive)}</td>
+      <td>${s.url
+        ? `<a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.matched_title) || "(record)"}</a>`
+        : esc(s.matched_title)}</td>`;
+    tbody.appendChild(tr);
+  }
+}
+
+function downloadUploadList() {
+  const sources = approvedSources();
+  if (!sources.length) { status("NO APPROVED SOURCES"); return; }
+  const blob = new Blob([JSON.stringify(sources, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "whl_upload_list.json";
+  a.click();
+  URL.revokeObjectURL(a.href);
+  status(`DOWNLOADED UPLOAD LIST :: ${sources.length} SOURCES`);
+}
+
+// --- wire up ---------------------------------------------------------------
+
+function init() {
+  loadSettings();
+  loadChecked();
+  initTabs();
+  initTooltips();
+  el("search").addEventListener("input", onSearchInput);
+  el("search").addEventListener("keydown", onSearchKey);
+  el("search").addEventListener("blur", () => setTimeout(hideSuggest, 150));
+  el("reload").addEventListener("click", loadBooks);
+  el("check-whl").addEventListener("click", checkSelectedOnWhl);
+  el("run-scans").addEventListener("click", runScansBatch);
+  el("dl-approved").addEventListener("click", downloadApproved);
+  el("export-json").addEventListener("click", exportJson);
+  el("clear-checked").addEventListener("click", clearChecked);
+  el("download-upload-list").addEventListener("click", downloadUploadList);
+  el("checked-rows").addEventListener("click", onCheckedClick);
+  el("manual-form").addEventListener("submit", submitManual);
+  el("m-year").addEventListener("input", onYearInput);
+
+  // open library: pane sub-tabs, constrained search, title autocomplete,
+  // manual/auto provenance shading
+  initPaneTabs();
+  loadOlStatus();
+  el("ol-form").addEventListener("submit", olSearch);
+  for (const f of PROV_FIELDS) {
+    el("m-" + f).addEventListener("input", () =>
+      setProv(f, el("m-" + f).value.trim() ? "manual" : null));
+  }
+  el("m-title").addEventListener("input", onTitleInput);
+  el("m-title").addEventListener("blur", () => setTimeout(hideOlSuggest, 150));
+  el("m-title").addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") { ev.stopPropagation(); hideOlSuggest(); }
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Escape") return;
+    if (!el("msrc-overlay").hidden) closeManualSource();
+    else if (!el("settings-overlay").hidden) closeSettings();
+  });
+
+  // manually located source window
+  el("msrc-close").addEventListener("click", closeManualSource);
+  el("msrc-save").addEventListener("click", () => saveManualSource(false));
+  el("msrc-clear").addEventListener("click", () => saveManualSource(true));
+  el("msrc-url").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); saveManualSource(false); }
+  });
+  el("msrc-overlay").addEventListener("mousedown", (ev) => {
+    if (ev.target === el("msrc-overlay")) closeManualSource();
+  });
+
+  // checked tab: search, mark filter, CH catalog pane
+  el("checked-search").addEventListener("input", () => {
+    state.checkedFilter = el("checked-search").value.trim();
+    renderChecked();
+  });
+  el("mark-filter").value = state.settings.markFilter || "ALL";
+  el("mark-filter").addEventListener("change", () => {
+    state.settings.markFilter = el("mark-filter").value;
+    saveSettings();
+    renderChecked();
+  });
+  el("show-catalog").checked = !!state.settings.showCatalog;
+  el("show-catalog").addEventListener("change", async () => {
+    state.settings.showCatalog = el("show-catalog").checked;
+    saveSettings();
+    if (state.settings.showCatalog) await loadChBooks();
+    renderChPane();
+  });
+  el("chpane-rows").addEventListener("click", (ev) => {
+    const b = ev.target.closest("[data-chadd]");
+    if (b) addChBook(parseInt(b.dataset.chadd, 10));
+  });
+  if (state.settings.showCatalog) loadChBooks().then(renderChPane);
+
+  // settings window
+  el("open-settings").addEventListener("click", openSettings);
+  el("settings-close").addEventListener("click", closeSettings);
+  el("settings-overlay").addEventListener("mousedown", (ev) => {
+    if (ev.target === el("settings-overlay")) closeSettings();
+  });
+
+  loadDownloads();
+  loadManual();
+  initDatasets().then(updateCheckedCount);
+}
+
+init();

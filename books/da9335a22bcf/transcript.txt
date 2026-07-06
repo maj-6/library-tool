@@ -1,0 +1,19 @@
+source: URecorder_20260627_132757.txt
+offset: 34:19 - 35:58
+absolute: 2026-06-27T14:02:16 - 2026-06-27T14:03:55
+
+(34:19 - 34:29) Book.
+(34:29 - 34:37) [BLANK_AUDIO]
+(34:37 - 34:39) The Medical Guide.
+(34:39 - 34:49) [BLANK_AUDIO]
+(34:49 - 35:02) By Richard Ries. 11th edition. Published London 1814. Alternative title, Ries' Medical Guide.
+(35:02 - 35:12) [BLANK_AUDIO]
+(35:12 - 35:20) [BLANK_AUDIO]
+(35:20 - 35:23) Paid $40.
+(35:23 - 35:33) [BLANK_AUDIO]
+(35:33 - 35:39) [BLANK_AUDIO]
+(35:39 - 35:43) Page count, 484.
+(35:43 - 35:53) [BLANK_AUDIO]
+(35:53 - 35:54) Plus five.
+(35:54 - 35:57) [BLANK_AUDIO]
+(35:57 - 35:58) End book.

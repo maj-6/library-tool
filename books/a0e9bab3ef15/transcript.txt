@@ -1,0 +1,9 @@
+source: URecorder_20260627_154733.txt
+offset: 3:04 - 3:58
+absolute: 2026-06-27T15:50:37 - 2026-06-27T15:51:31
+
+(3:04 - 3:08) Book.
+(3:08 - 3:17) Paid $1.25.
+(3:17 - 3:46) Culpeper's Complete Herbal, published by Richard Evans, 1814.
+(3:46 - 3:55) Page Count 398.
+(3:55 - 3:58) End book.

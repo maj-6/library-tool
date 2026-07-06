@@ -1,0 +1,10 @@
+source: URecorder_20260627_132757.txt
+offset: 16:28 - 17:59
+absolute: 2026-06-27T13:44:25 - 2026-06-27T13:45:56
+
+(16:28 - 16:45) Book.
+(16:45 - 16:55) The Thompsonian Materia Medica or Botanic Family Physician.
+(16:55 - 16:59) By Samuel Thompson.
+(16:59 - 17:20) Paid, $135.
+(17:20 - 17:33) Page count, 833 plus 7.
+(17:33 - 17:59) End book.

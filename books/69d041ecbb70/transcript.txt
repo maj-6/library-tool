@@ -1,0 +1,10 @@
+source: URecorder_20260627_132757.txt
+offset: 13:05 - 14:51
+absolute: 2026-06-27T13:41:02 - 2026-06-27T13:42:48
+
+(13:05 - 13:30) Book.
+(13:30 - 13:39) A History of the Vegetable Kingdom, by William Rind.
+(13:39 - 14:04) Paid, $100.
+(14:04 - 14:24) Page count, 744 plus 6.
+(14:24 - 14:32) Alternate title, Rind's Vegetable Kingdom.
+(14:32 - 14:51) End book.

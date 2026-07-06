@@ -1,0 +1,7 @@
+source: URecorder_20260627_132757.txt
+offset: 22:23 - 23:36
+absolute: 2026-06-27T13:50:20 - 2026-06-27T13:51:33
+
+(22:23 - 22:38) Book.
+(22:38 - 23:07) The Code of Health and Longevity, or A Concise View of the Principles Calculated for the Preservation of Health and the Attainment of Long Life, by John Sinclair. Published, 1807.
+(23:07 - 23:36) Paid, 10 pounds.

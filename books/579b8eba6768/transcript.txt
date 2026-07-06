@@ -1,0 +1,9 @@
+source: URecorder_20260627_142643 (1).txt
+offset: 0:00 - 1:04
+absolute: 2026-06-27T14:26:43 - 2026-06-27T14:27:47
+
+(0:00 - 0:29) Book.
+(0:29 - 0:42) I, Physic by John Wesley.
+(0:42 - 0:53) Paid 10 pounds.
+(0:53 - 0:57) Page count, 144.
+(0:57 - 1:04) End book.

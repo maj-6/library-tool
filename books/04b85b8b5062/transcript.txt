@@ -1,0 +1,9 @@
+source: URecorder_20260627_154733.txt
+offset: 5:51 - 7:14
+absolute: 2026-06-27T15:53:24 - 2026-06-27T15:54:47
+
+(5:51 - 5:59) Book.
+(5:59 - 6:03) Florographia Britannica, Volume 2.
+(6:03 - 6:32) Paid £475.
+(6:32 - 6:47) Page Count 935.
+(6:47 - 7:14) End book.

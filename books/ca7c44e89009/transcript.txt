@@ -1,0 +1,8 @@
+source: URecorder_20260627_154733.txt
+offset: 10:32 - 11:48
+absolute: 2026-06-27T15:58:05 - 2026-06-27T15:59:21
+
+(10:32 - 10:58) Book.
+(10:58 - 11:25) Introduction to the Science of Botany, by James Lee, 4th edition, published 1810.
+(11:25 - 11:31) Page count 580.
+(11:31 - 11:48) End book.

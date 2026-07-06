@@ -1,0 +1,8 @@
+source: URecorder_20260627_154733.txt
+offset: 11:48 - 12:46
+absolute: 2026-06-27T15:59:21 - 2026-06-27T16:00:19
+
+(11:48 - 12:13) Book. The Families of Plants, Volume 1.
+(12:13 - 12:30) Published, MDCCLXXXVIII.
+(12:30 - 12:36) Page count 386.
+(12:36 - 12:46) End book.

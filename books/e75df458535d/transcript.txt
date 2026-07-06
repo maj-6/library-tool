@@ -1,0 +1,10 @@
+source: URecorder_20260627_142643 (1).txt
+offset: 9:38 - 11:09
+absolute: 2026-06-27T14:36:21 - 2026-06-27T14:37:52
+
+(9:38 - 9:47) Book.
+(9:47 - 10:04) A Green Forest by John Mapelet.
+(10:04 - 10:21) Published 1930.
+(10:21 - 10:37) I, Physic by John Wesley.
+(10:37 - 11:00) Page count, 184.
+(11:00 - 11:09) End book.

@@ -1,0 +1,9 @@
+source: URecorder_20260627_154733.txt
+offset: 8:33 - 9:35
+absolute: 2026-06-27T15:56:06 - 2026-06-27T15:57:08
+
+(8:33 - 8:47) Book.
+(8:47 - 9:05) Essays on some of the most important articles of the Materia Medica by G.W. Carpenter, 2nd edition, published 1834.
+(9:05 - 9:20) G.W. Carpenter's Chemical Warehouse.
+(9:20 - 9:26) Page count 300.
+(9:26 - 9:35) End book.
