@@ -580,6 +580,10 @@ a.badge:hover { text-decoration: underline; }
 #pane-splitter:hover { background: var(--face-active); }
 body.resizing { cursor: col-resize; user-select: none; }
 
+.whl-cons { display: flex; align-items: center; gap: 6px; }
+.whl-cons label { display: flex; align-items: center; gap: 2px; cursor: pointer; }
+.whl-cons input { accent-color: var(--green); }
+
 /* WHL search-mode selection */
 tr.whl-selected {
   outline: 1px solid var(--cyan);

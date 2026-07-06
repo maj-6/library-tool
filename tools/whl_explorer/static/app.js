@@ -57,7 +57,7 @@ const state = {
   whlRows: null,          // WHL catalogue rows + corrections overlay (lazy)
   whlSelected: null,      // search-mode repopulation target (row idx)
   whlEditIdx: null,       // row loaded in the left-panel WHL EDIT tab
-  olOverrideTitle: "",    // search-mode title override for the OL table
+  olOverride: null,       // search-mode query override {title, verbatim, author, year}
   olRows: null,           // realtime Open Library results
   olNote: "",
   bottomRecords: [],      // records behind the visible bottom-pane rows
@@ -68,6 +68,7 @@ const state = {
     checkedCols: {}, catalogCols: {}, showCatalog: false, markFilter: "ALL",
     topTable: "checked", bottomTabs: ["ol", "ch"], bottomActive: 0,
     whlMode: "edit", paneWidth: null, theme: "",
+    whlCons: { title: false, authors: false, year: true },
   },
 };
 
@@ -92,6 +93,79 @@ const esc = (s) =>
 
 function status(msg) { el("status-msg").textContent = msg; }
 function ckey(dataset, idx) { return `${dataset}:${idx}`; }
+
+// --- undo / redo -------------------------------------------------------------
+// Every mutating action pushes an operation with its inverse. Client-side
+// state (the checked map) is snapshot-restored; server-backed changes
+// (manual entries, WHL corrections, verifications) run their inverse call.
+
+const history = { stack: [], ptr: 0 };
+
+function pushOp(label, undoFn, redoFn) {
+  history.stack.length = history.ptr; // a new action clears the redo tail
+  history.stack.push({ label, undoFn, redoFn });
+  if (history.stack.length > 100) history.stack.shift();
+  history.ptr = history.stack.length;
+  updateHistoryButtons();
+}
+
+function updateHistoryButtons() {
+  const u = el("undo-btn"), r = el("redo-btn");
+  u.disabled = history.ptr === 0;
+  r.disabled = history.ptr >= history.stack.length;
+  u.dataset.tip = history.ptr
+    ? `Undo (Ctrl+Z): ${history.stack[history.ptr - 1].label}` : "Undo (Ctrl+Z)";
+  r.dataset.tip = history.ptr < history.stack.length
+    ? `Redo (Ctrl+Y): ${history.stack[history.ptr].label}` : "Redo (Ctrl+Y)";
+}
+
+let historyBusy = false;
+async function undo() {
+  if (historyBusy || !history.ptr) { if (!history.ptr) status("NOTHING TO UNDO"); return; }
+  historyBusy = true;
+  const op = history.stack[--history.ptr];
+  try { await op.undoFn(); status(`UNDO :: ${op.label}`); }
+  catch (e) { status(`UNDO FAILED :: ${op.label}`); }
+  historyBusy = false;
+  updateHistoryButtons();
+}
+
+async function redo() {
+  if (historyBusy || history.ptr >= history.stack.length) {
+    if (history.ptr >= history.stack.length) status("NOTHING TO REDO");
+    return;
+  }
+  historyBusy = true;
+  const op = history.stack[history.ptr++];
+  try { await op.redoFn(); status(`REDO :: ${op.label}`); }
+  catch (e) { status(`REDO FAILED :: ${op.label}`); }
+  historyBusy = false;
+  updateHistoryButtons();
+}
+
+// Snapshot-based tracking for the client-side checked map.
+function snapshotChecked(key) {
+  const v = state.checked.get(key);
+  return v ? JSON.parse(JSON.stringify(v)) : null;
+}
+
+function restoreChecked(key, snap) {
+  if (snap) state.checked.set(key, JSON.parse(JSON.stringify(snap)));
+  else state.checked.delete(key);
+  saveChecked();
+  renderChecked();
+  renderCatalog();
+  updateCheckedCount();
+}
+
+function trackChecked(label, key, mutate) {
+  const before = snapshotChecked(key);
+  mutate();
+  const after = snapshotChecked(key);
+  pushOp(label,
+    () => restoreChecked(key, before),
+    () => restoreChecked(key, after));
+}
 
 // --- persistence -----------------------------------------------------------
 
@@ -332,19 +406,21 @@ function toggleCheck(idx, on) {
   const b = bookByIdx(idx);
   if (!b) return;
   const key = ckey(state.dataset, idx);
-  if (on) {
-    const prev = state.checked.get(key) || {};
-    state.checked.set(key, {
-      book: b,
-      whl: prev.whl || null,
-      checks: prev.checks || null,
-      scans: prev.scans || null,
-      approved: prev.approved || null,
-    });
-    if (!prev.scans) queueScan(key);
-  } else {
-    state.checked.delete(key);
-  }
+  trackChecked(`${on ? "check" : "uncheck"} ${b.title.slice(0, 40)}`, key, () => {
+    if (on) {
+      const prev = state.checked.get(key) || {};
+      state.checked.set(key, {
+        book: b,
+        whl: prev.whl || null,
+        checks: prev.checks || null,
+        scans: prev.scans || null,
+        approved: prev.approved || null,
+      });
+      if (!prev.scans) queueScan(key);
+    } else {
+      state.checked.delete(key);
+    }
+  });
   saveChecked();
   renderCatalog();
   updateCheckedCount();
@@ -452,13 +528,15 @@ function hideSuggest() { el("suggest").hidden = true; state.suggestActive = -1; 
 function chooseSuggest(b) {
   if (!b) return;
   const key = ckey(state.dataset, b.idx);
-  const prev = state.checked.get(key) || {};
-  state.checked.set(key, {
-    book: b,
-    whl: prev.whl || null, checks: prev.checks || null,
-    scans: prev.scans || null, approved: prev.approved || null,
+  trackChecked(`add ${b.title.slice(0, 40)}`, key, () => {
+    const prev = state.checked.get(key) || {};
+    state.checked.set(key, {
+      book: b,
+      whl: prev.whl || null, checks: prev.checks || null,
+      scans: prev.scans || null, approved: prev.approved || null,
+    });
+    if (!prev.scans) queueScan(key);
   });
-  if (!prev.scans) queueScan(key);
   saveChecked();
   renderCatalog();
   renderSuggest();
@@ -966,7 +1044,10 @@ function onCheckedClick(ev) {
 }
 
 function uncheckRow(key) {
-  state.checked.delete(key);
+  const title = ((state.checked.get(key) || {}).book || {}).title || key;
+  trackChecked(`uncheck ${String(title).slice(0, 40)}`, key, () => {
+    state.checked.delete(key);
+  });
   saveChecked();
   renderChecked();
   renderCatalog();
@@ -1007,35 +1088,49 @@ function startEdit(td) {
   input.addEventListener("blur", () => finish(true));
 }
 
+async function patchManualField(id, field, value) {
+  const res = await fetch(`/api/manual/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ [field]: value }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.ok && data.ok) {
+    const i = state.manual.findIndex((x) => x.id === id);
+    if (i >= 0) state.manual[i] = data.entry;
+    renderChecked();
+    queueScan(id);
+    return true;
+  }
+  return false;
+}
+
 async function commitEdit(row, field, value) {
   if (row.kind === "manual") {
-    const res = await fetch(`/api/manual/${encodeURIComponent(row.id)}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ [field]: value }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok && data.ok) {
-      const i = state.manual.findIndex((x) => x.id === row.id);
-      if (i >= 0) state.manual[i] = data.entry;
+    const oldValue = String(row.book[field] || "");
+    if (await patchManualField(row.id, field, value)) {
+      pushOp(`edit ${field} of ${row.book.title.slice(0, 32)}`,
+        () => patchManualField(row.id, field, oldValue),
+        () => patchManualField(row.id, field, value));
       status(`UPDATED ${field.toUpperCase()} :: RESCANNING`);
-      queueScan(row.id);
     } else {
-      status(data.error || "UPDATE FAILED");
+      status("UPDATE FAILED");
     }
   } else {
     const entry = state.checked.get(row.id);
     if (!entry) return;
-    entry.book = Object.assign({}, entry.book, { [field]: value });
-    // Metadata changed: every stored result (and its verification) is stale
-    // until the auto-rescan.
-    entry.checks = null;
-    entry.scans = null;
-    entry.whl = null;
-    entry.verify = null;
+    trackChecked(`edit ${field} of ${row.book.title.slice(0, 32)}`, row.id, () => {
+      entry.book = Object.assign({}, entry.book, { [field]: value });
+      // Metadata changed: every stored result (and its verification) is
+      // stale until the auto-rescan.
+      entry.checks = null;
+      entry.scans = null;
+      entry.whl = null;
+      entry.verify = null;
+      queueScan(row.id);
+    });
     saveChecked();
     status(`UPDATED ${field.toUpperCase()} :: RESCANNING`);
-    queueScan(row.id);
   }
   renderChecked();
   renderCatalog();
@@ -1271,13 +1366,15 @@ async function olRealtime() {
   if (activeBottomTable() !== "ol" || !state.settings.showCatalog) return;
   const params = new URLSearchParams({ limit: "60" });
   // FIND syntax: @author, #year, plain text = title. A search-mode WHL row
-  // selection overrides the title; the SEARCH form fills whatever is left.
-  const q = state.olOverrideTitle
-    ? { title: state.olOverrideTitle, author: "", year: "", empty: false }
+  // selection overrides the query; the SEARCH form fills whatever is left.
+  const ov = state.olOverride;
+  const q = ov
+    ? { title: ov.title, author: ov.author || "", year: ov.year || "", empty: false }
     : findQuery();
   const sTitle = el("s-title").value.trim();
   if (q.title) params.set("title", q.title);
   else if (sTitle) params.set("title", sTitle);
+  if (ov && ov.verbatim) params.set("title_verbatim", "1");
   if (q.author) params.set("author", q.author);
   if (q.year) params.set("year", q.year);
   for (const f of ["author", "publisher", "city", "year", "edition", "volume"]) {
@@ -1314,21 +1411,22 @@ async function addToTop(rec) {
       await repopulateWhlRow(rec);
       return;
     }
-    const res = await fetch("/api/whl_catalog", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ add: {
-        title: rec.title + (rec.subtitle ? ": " + rec.subtitle : ""),
-        authors: rec.author, year: rec.year,
-      } }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok && data.ok) {
-      await loadWhlRows(true);
-      renderWhlTop();
+    const addBody = { add: {
+      title: rec.title + (rec.subtitle ? ": " + rec.subtitle : ""),
+      authors: rec.author, year: rec.year,
+    } };
+    const data = await whlPost(addBody);
+    if (data) {
+      let curIdx = data.idx; // re-adding on redo gets a fresh idx
+      pushOp(`add WHL row ${rec.title.slice(0, 34)}`,
+        () => whlPost({ remove_added: curIdx }),
+        async () => {
+          const d = await whlPost(addBody);
+          if (d) curIdx = d.idx;
+        });
       status(`ADDED TO WHL CATALOG (CORRECTIONS) :: ${rec.title}`);
     } else {
-      status(data.error || "WHL ADD FAILED");
+      status("WHL ADD FAILED");
     }
     return;
   }
@@ -1351,6 +1449,7 @@ async function addToTop(rec) {
     const data = await res.json().catch(() => ({}));
     if (res.ok && data.ok) {
       state.manual.unshift(data.entry);
+      pushManualCreateOp(data.entry);
       renderChecked();
       queueScan(data.entry.id);
       status(`ADDED TO CHECKED BOOKS :: ${rec.title}`);
@@ -1366,13 +1465,15 @@ function addChBook(idx) {
   const book = (state.chBooks || []).find((x) => x.idx === idx);
   if (!book) return;
   const key = ckey("ch_library", idx);
-  const prev = state.checked.get(key) || {};
-  state.checked.set(key, {
-    book,
-    whl: prev.whl || null, checks: prev.checks || null,
-    scans: prev.scans || null, approved: prev.approved || null,
+  trackChecked(`add ${book.title.slice(0, 40)}`, key, () => {
+    const prev = state.checked.get(key) || {};
+    state.checked.set(key, {
+      book,
+      whl: prev.whl || null, checks: prev.checks || null,
+      scans: prev.scans || null, approved: prev.approved || null,
+    });
+    if (!prev.scans) queueScan(key);
   });
-  if (!prev.scans) queueScan(key);
   saveChecked();
   renderChecked();
   if (state.dataset === "ch_library") renderCatalog();
@@ -1414,7 +1515,7 @@ function setWhlMode(m) {
   saveSettings();
   if (m !== "search") {
     state.whlSelected = null;
-    state.olOverrideTitle = "";
+    state.olOverride = null;
   }
   renderWhlTop();
   status(m === "search"
@@ -1427,6 +1528,7 @@ function renderWhlTop() {
   const btn = el("whl-mode");
   btn.hidden = state.settings.topTable !== "whl";
   btn.textContent = `MODE: ${mode.toUpperCase()} (CTRL+E)`;
+  el("whl-cons").hidden = state.settings.topTable !== "whl" || mode !== "search";
   const q = findQuery();
   const rows = (state.whlRows || [])
     .filter((r) => matchesFind(q, `${r.title} ${r.subtitle || ""}`, r.authors, r.year));
@@ -1470,13 +1572,64 @@ function whlRowByIdx(idx) {
   return (state.whlRows || []).find((r) => r.idx === idx);
 }
 
+// --- WHL corrections with undo support --
+// A snapshot notes, per field, whether a correction already existed: undoing
+// then either restores the previous correction or clears back to the CSV.
+
+async function whlPost(body) {
+  const res = await fetch("/api/whl_catalog", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.ok === false) return null;
+  await loadWhlRows(true);
+  renderWhlTop();
+  renderBottomRows();
+  return data;
+}
+
+function whlFieldSnaps(row, fields) {
+  return fields.map((f) => ({
+    f, val: String(row[f] || ""),
+    corrected: !!row.added || (row.edited_fields || []).includes(f),
+  }));
+}
+
+async function whlApplySnaps(idx, snaps) {
+  const fields = {}, clear = [];
+  for (const s of snaps) {
+    if (s.corrected) fields[s.f] = s.val;
+    else clear.push(s.f);
+  }
+  const body = { idx };
+  if (Object.keys(fields).length) body.fields = fields;
+  if (clear.length) body.clear_fields = clear;
+  return whlPost(body);
+}
+
+function pushWhlFieldsOp(label, idx, beforeSnaps, afterFields) {
+  pushOp(label,
+    () => whlApplySnaps(idx, beforeSnaps),
+    () => whlPost({ idx, fields: afterFields }));
+}
+
 // Search mode: a title click queries Open Library; the clicked row becomes
 // the repopulation target for the next Open Library result click.
 function selectWhlSearchRow(idx) {
   const row = whlRowByIdx(idx);
   if (!row) return;
   state.whlSelected = idx;
-  state.olOverrideTitle = row.title;
+  // The selected columns become constraints: TITLE= demands a verbatim
+  // (phrase) title match; AUTHOR/YEAR narrow by the row's values.
+  const cons = state.settings.whlCons || {};
+  state.olOverride = {
+    title: row.title,
+    verbatim: !!cons.title,
+    author: cons.authors ? row.authors : "",
+    year: cons.year ? row.year : "",
+  };
   if (!state.settings.showCatalog) {
     state.settings.showCatalog = true;
     el("show-catalog").checked = true;
@@ -1500,15 +1653,9 @@ async function repopulateWhlRow(rec) {
     title: rec.title, subtitle: rec.subtitle || "",
     authors: rec.author, year: rec.year,
   };
-  const res = await fetch("/api/whl_catalog", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ idx, fields }),
-  });
-  if (res.ok) {
-    Object.assign(row, fields);
-    if (!row.added) row.corrected = true;
-    renderWhlTop();
+  const before = whlFieldSnaps(row, Object.keys(fields));
+  if (await whlPost({ idx, fields })) {
+    pushWhlFieldsOp(`repopulate WHL row ${rec.title.slice(0, 30)}`, idx, before, fields);
     status(`WHL ROW REPOPULATED FROM OPEN LIBRARY :: ${rec.title}`);
   } else {
     status("WHL REPOPULATE FAILED");
@@ -1539,15 +1686,9 @@ async function saveWhlEditTab(ev) {
   const fields = {};
   for (const f of WHL_ROW_FIELDS) fields[f] = el("w-" + f).value.trim();
   if (!fields.title) { el("whledit-msg").textContent = "TITLE IS REQUIRED"; return; }
-  const res = await fetch("/api/whl_catalog", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ idx, fields }),
-  });
-  if (res.ok) {
-    Object.assign(row, fields);
-    if (!row.added) row.corrected = true;
-    renderWhlTop();
+  const before = whlFieldSnaps(row, WHL_ROW_FIELDS);
+  if (await whlPost({ idx, fields })) {
+    pushWhlFieldsOp(`edit WHL record ${fields.title.slice(0, 30)}`, idx, before, fields);
     el("whledit-msg").textContent = "SAVED";
     status(`WHL CORRECTIONS SAVED :: ${fields.title}`);
   } else {
@@ -1576,18 +1717,14 @@ function startWhlEdit(td) {
     input.blur();
     const val = input.value.trim();
     if (commit && val !== original.trim()) {
-      const res = await fetch("/api/whl_catalog", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ idx, field, value: val }),
-      });
-      if (res.ok) {
-        row[field] = val;
-        if (!row.added) row.corrected = true;
+      const before = whlFieldSnaps(row, [field]);
+      if (await whlPost({ idx, fields: { [field]: val } })) {
+        pushWhlFieldsOp(`correct WHL ${field} of ${row.title.slice(0, 28)}`,
+          idx, before, { [field]: val });
         status(`WHL ${field.toUpperCase()} CORRECTED :: ${row.title}`);
-      } else {
-        status("WHL EDIT FAILED");
+        return; // whlPost already re-rendered
       }
+      status("WHL EDIT FAILED");
     }
     renderWhlTop();
   };
@@ -1767,10 +1904,12 @@ function scanStatusLine(scans) {
 
 // --- per-source verification (approve / reject false positives) ------------------
 
-async function setVerify(id, source, verdict) {
+async function setVerify(id, source, verdict, track = true) {
   const row = state.rowsById.get(String(id));
   if (!row) return;
   if (row.kind === "manual") {
+    const prior = getVerify(row, source);
+    const priorUrl = getManualUrl(row, source);
     const res = await fetch(`/api/manual/${encodeURIComponent(id)}/verify`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1780,15 +1919,31 @@ async function setVerify(id, source, verdict) {
     if (data.ok) {
       const i = state.manual.findIndex((x) => x.id === id);
       if (i >= 0) state.manual[i] = data.entry;
+      if (track) {
+        pushOp(`verify ${source} ${verdict} on ${row.book.title.slice(0, 30)}`,
+          async () => {
+            await setVerify(id, source, prior, false);
+            if (priorUrl) await setManualUrl(id, source, priorUrl, false);
+          },
+          () => setVerify(id, source, verdict, false));
+      }
     }
   } else {
     const entry = state.checked.get(id);
     if (!entry) return;
-    entry.verify = Object.assign({}, migrateVerify(entry) || {});
-    if (verdict === "pending") delete entry.verify[source];
-    else entry.verify[source] = verdict;
-    if (verdict !== "rejected" && entry.manual_urls) delete entry.manual_urls[source];
-    entry.approved = null; // superseded by per-source verification
+    const mutate = () => {
+      entry.verify = Object.assign({}, migrateVerify(entry) || {});
+      if (verdict === "pending") delete entry.verify[source];
+      else entry.verify[source] = verdict;
+      if (verdict !== "rejected" && entry.manual_urls) delete entry.manual_urls[source];
+      entry.approved = null; // superseded by per-source verification
+    };
+    if (track) {
+      trackChecked(`verify ${source} ${verdict} on ${row.book.title.slice(0, 30)}`,
+        id, mutate);
+    } else {
+      mutate();
+    }
     saveChecked();
   }
   renderChecked();
@@ -1806,10 +1961,11 @@ function cycleVerify(id, source) {
 
 // --- manually located sources (for rejected matches) ------------------------------
 
-async function setManualUrl(id, source, url) {
+async function setManualUrl(id, source, url, track = true) {
   const row = state.rowsById.get(String(id));
   if (!row) return;
   if (row.kind === "manual") {
+    const prior = getManualUrl(row, source);
     const res = await fetch(`/api/manual/${encodeURIComponent(id)}/source`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1819,13 +1975,25 @@ async function setManualUrl(id, source, url) {
     if (data.ok) {
       const i = state.manual.findIndex((x) => x.id === id);
       if (i >= 0) state.manual[i] = data.entry;
+      if (track) {
+        pushOp(`manual source on ${row.book.title.slice(0, 32)}`,
+          () => setManualUrl(id, source, prior, false),
+          () => setManualUrl(id, source, url, false));
+      }
     }
   } else {
     const entry = state.checked.get(id);
     if (!entry) return;
-    entry.manual_urls = Object.assign({}, entry.manual_urls || {});
-    if (url) entry.manual_urls[source] = url;
-    else delete entry.manual_urls[source];
+    const mutate = () => {
+      entry.manual_urls = Object.assign({}, entry.manual_urls || {});
+      if (url) entry.manual_urls[source] = url;
+      else delete entry.manual_urls[source];
+    };
+    if (track) {
+      trackChecked(`manual source on ${row.book.title.slice(0, 32)}`, id, mutate);
+    } else {
+      mutate();
+    }
     saveChecked();
   }
   renderChecked();
@@ -2084,6 +2252,7 @@ async function submitManual(ev) {
     const data = await res.json().catch(() => ({}));
     if (res.ok && data.ok) {
       state.manual.unshift(data.entry);
+      pushManualCreateOp(data.entry);
       renderChecked();
       el("manual-form").reset();
       clearProv();
@@ -2110,13 +2279,45 @@ async function loadManual() {
   renderChecked();
 }
 
+async function deleteManualById(id) {
+  const res = await fetch(`/api/manual/${encodeURIComponent(id)}`, { method: "DELETE" });
+  if (!res.ok) return false;
+  state.manual = state.manual.filter((x) => x.id !== id);
+  renderChecked();
+  return true;
+}
+
+async function restoreManualEntry(snap) {
+  const res = await fetch("/api/manual/restore", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ entry: snap }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) return false;
+  state.manual = state.manual.filter((x) => x.id !== snap.id);
+  state.manual.unshift(data.entry);
+  renderChecked();
+  return true;
+}
+
+function pushManualCreateOp(entry) {
+  const snap = JSON.parse(JSON.stringify(entry));
+  pushOp(`create entry ${String(entry.title || "").slice(0, 36)}`,
+    () => deleteManualById(snap.id),
+    () => restoreManualEntry(snap));
+}
+
 async function deleteManual(id) {
   const e = state.manual.find((x) => x.id === id);
   if (!window.confirm(`Delete manual entry "${e ? e.title : id}"?`)) return;
-  const res = await fetch(`/api/manual/${encodeURIComponent(id)}`, { method: "DELETE" });
-  if (res.ok) {
-    state.manual = state.manual.filter((x) => x.id !== id);
-    renderChecked();
+  const snap = e ? JSON.parse(JSON.stringify(e)) : null;
+  if (await deleteManualById(id)) {
+    if (snap) {
+      pushOp(`delete entry ${String(snap.title || "").slice(0, 36)}`,
+        () => restoreManualEntry(snap),
+        () => deleteManualById(snap.id));
+    }
     status("MANUAL ENTRY DELETED");
   } else {
     status("DELETE FAILED");
@@ -2171,7 +2372,18 @@ function exportJson() {
 
 function clearChecked() {
   if (!window.confirm("Remove ALL checked catalog books? (Manual entries are kept.)")) return;
+  const before = JSON.parse(JSON.stringify([...state.checked.entries()]));
+  const applyMap = (entries) => {
+    state.checked = new Map(JSON.parse(JSON.stringify(entries)));
+    saveChecked();
+    renderChecked();
+    renderCatalog();
+    updateCheckedCount();
+  };
   state.checked.clear();
+  pushOp(`clear ${before.length} checked books`,
+    () => applyMap(before),
+    () => applyMap([]));
   saveChecked();
   renderChecked();
   renderCatalog();
@@ -2309,7 +2521,7 @@ function init() {
   // realtime Open Library query
   el("checked-search").addEventListener("input", () => {
     state.checkedFilter = el("checked-search").value.trim();
-    state.olOverrideTitle = ""; // typing takes over from a search-mode pick
+    state.olOverride = null; // typing takes over from a search-mode pick
     renderTop();
     renderBottomRows();
     scheduleOlRealtime();
@@ -2327,10 +2539,37 @@ function init() {
     renderBottomPane();
   });
 
+  // undo / redo (keyboard shortcuts leave native text-field undo alone)
+  el("undo-btn").addEventListener("click", undo);
+  el("redo-btn").addEventListener("click", redo);
+  document.addEventListener("keydown", (ev) => {
+    if (!(ev.ctrlKey || ev.metaKey)) return;
+    const t = ev.target;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+    const k = ev.key.toLowerCase();
+    if (k === "z" && !ev.shiftKey) { ev.preventDefault(); undo(); }
+    else if (k === "y" || (k === "z" && ev.shiftKey)) { ev.preventDefault(); redo(); }
+  });
+
   // top pane table selector + WHL mode / edit / search interactions
   el("top-table").addEventListener("change", () => switchTopTable(el("top-table").value));
   el("whl-mode").addEventListener("click", () =>
     setWhlMode(whlMode() === "edit" ? "search" : "edit"));
+
+  // which columns constrain the search-mode Open Library lookup
+  const cons = state.settings.whlCons = state.settings.whlCons ||
+    { title: false, authors: false, year: true };
+  for (const [box, key] of [["wc-title", "title"], ["wc-authors", "authors"], ["wc-year", "year"]]) {
+    el(box).checked = !!cons[key];
+    el(box).addEventListener("change", () => {
+      cons[key] = el(box).checked;
+      saveSettings();
+      // refresh an active selection with the new constraints
+      if (whlMode() === "search" && state.whlSelected != null) {
+        selectWhlSearchRow(state.whlSelected);
+      }
+    });
+  }
   document.addEventListener("keydown", (ev) => {
     if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "e" &&
         state.settings.topTable === "whl") {

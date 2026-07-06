@@ -141,7 +141,14 @@ is decided by a tolerant composite rather than exact strings:
   box; row hover shows an all-fields tooltip; row click adds the record to
   the top-pane table with column mapping.
 - FIND syntax: `@token` = author (last name), `#token` = publication year,
-  plain text = title words. COPYRIGHT tag semantics: NO = public domain,
+  plain text = title words.
+- Undo/Redo (Ctrl+Z / Ctrl+Y + titlebar buttons; 100-step session history):
+  inverse operations for client state (snapshot restore of the checked map)
+  and server-backed changes (manual entry create/delete/edit via a restore
+  endpoint; WHL corrections restore the prior correction or clear back to
+  the CSV; verifications/manual sources revert). WHL SEARCH mode has
+  CONSTRAIN checkboxes (TITLE= verbatim phrase match via FTS,
+  AUTHOR, YEAR) applied to the row-click Open Library lookup. COPYRIGHT tag semantics: NO = public domain,
   YES = under copyright. All tags are one uniform width with verification
   markers fused inside the tag. Themes (Classic 95/CAD, CDE/Solaris,
   AutoCAD dark, XP/Office 2003) restyle colors only.

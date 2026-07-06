@@ -302,6 +302,24 @@ def api_manual_update(entry_id: str):
     return jsonify({"ok": True, "entry": e})
 
 
+@app.route("/api/manual/restore", methods=["POST"])
+def api_manual_restore():
+    """Reinsert a previously deleted entry verbatim (undo of a delete).
+
+    The client sends back the full entry object it received from this server
+    before the deletion, so checks/scans/verifications survive the round trip.
+    """
+    payload = request.get_json(silent=True) or {}
+    entry = payload.get("entry") or {}
+    eid = str(entry.get("id") or "")
+    if not eid or not str(entry.get("title", "") or "").strip():
+        abort(400)
+    entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+    entries[eid] = entry
+    lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+    return jsonify({"ok": True, "entry": entry})
+
+
 @app.route("/api/manual/<entry_id>", methods=["DELETE"])
 def api_manual_delete(entry_id: str):
     entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
@@ -547,7 +565,8 @@ def api_ol_realtime():
     """Search-as-you-type endpoint for the bottom-pane Open Library table."""
     params = _ol_params()
     if ol_client.editions_index_available():
-        return jsonify(ol_client.search_editions(**params))
+        verbatim = (request.args.get("title_verbatim") or "") in ("1", "true")
+        return jsonify(ol_client.search_editions(**params, title_verbatim=verbatim))
     out = ol_client.search_works(
         title=params["title"], author=params["author"], year=params["year"],
         edition=params["edition"], volume=params["volume"],
@@ -611,6 +630,9 @@ def _merged_whl_rows() -> list[dict]:
                 if f in edits:
                     base[i][f] = edits[f]
             base[i]["corrected"] = True
+            # Which fields carry corrections — undo needs to know whether to
+            # restore a previous correction or clear back to the CSV value.
+            base[i]["edited_fields"] = [f for f in _WHL_EDIT_FIELDS if f in edits]
     added = []
     for j, a in enumerate(corr.get("added") or []):
         row = {f: a.get(f, "") for f in _WHL_EDIT_FIELDS}
@@ -646,16 +668,28 @@ def api_whl_catalog_edit():
         lib.save_json(WHL_CORRECTIONS_PATH, corr)
         return jsonify({"ok": True, "idx": -len(corr["added"])})
 
-    if "fields" in payload:
-        fields = {f: str(v or "").strip() for f, v in (payload.get("fields") or {}).items()
-                  if f in _WHL_EDIT_FIELDS}
-        if not fields:
+    if "remove_added" in payload:  # undo of an add
+        try:
+            j = -int(payload["remove_added"]) - 1
+        except (TypeError, ValueError):
             abort(400)
-    else:
+        added = corr.get("added") or []
+        if not (0 <= j < len(added)):
+            abort(404)
+        added.pop(j)
+        lib.save_json(WHL_CORRECTIONS_PATH, corr)
+        return jsonify({"ok": True})
+
+    fields = {f: str(v or "").strip() for f, v in (payload.get("fields") or {}).items()
+              if f in _WHL_EDIT_FIELDS}
+    if "field" in payload:
         field = str(payload.get("field", "") or "")
         if field not in _WHL_EDIT_FIELDS:
             abort(400)
-        fields = {field: str(payload.get("value", "") or "").strip()}
+        fields[field] = str(payload.get("value", "") or "").strip()
+    clear = [f for f in (payload.get("clear_fields") or []) if f in _WHL_EDIT_FIELDS]
+    if not fields and not clear:
+        abort(400)
     try:
         idx = int(payload.get("idx"))
     except (TypeError, ValueError):
@@ -663,13 +697,20 @@ def api_whl_catalog_edit():
     if idx >= 0:
         if idx >= len(_load_whl_base()):
             abort(404)
-        corr.setdefault("edits", {}).setdefault(str(idx), {}).update(fields)
+        edits = corr.setdefault("edits", {}).setdefault(str(idx), {})
+        edits.update(fields)
+        for f in clear:  # drop the correction entirely -> CSV value shows again
+            edits.pop(f, None)
+        if not edits:
+            corr["edits"].pop(str(idx), None)
     else:
         added = corr.get("added") or []
         j = -idx - 1
         if j >= len(added):
             abort(404)
         added[j].update(fields)
+        for f in clear:
+            added[j][f] = ""
     lib.save_json(WHL_CORRECTIONS_PATH, corr)
     return jsonify({"ok": True})
 

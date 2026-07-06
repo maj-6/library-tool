@@ -179,6 +179,7 @@ def search_editions(
     edition: str = "",
     volume: str = "",
     limit: int = 30,
+    title_verbatim: bool = False,
 ) -> dict:
     """Realtime constrained search of the consolidated editions index.
 
@@ -195,7 +196,13 @@ def search_editions(
         return out
 
     match_parts = []
-    tq = _fts_col_terms(title)
+    if title_verbatim:
+        # A single quoted multi-word string is an FTS phrase: the whole title
+        # must appear verbatim (in order, adjacent) within the edition title.
+        words = re.findall(r"\w+", title or "", re.UNICODE)
+        tq = f'"{" ".join(words)}"' if words else ""
+    else:
+        tq = _fts_col_terms(title)
     if tq:
         match_parts.append(f"title:({tq})")
     if (author or "").strip():

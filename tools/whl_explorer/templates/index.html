@@ -10,8 +10,12 @@
   <div id="titlebar">
     <span class="tb-name" id="tb-name">CATALOG :: CATALOG EXPLORER</span>
     <span class="tb-right">
+      <button id="undo-btn" class="cad-btn" type="button" disabled
+              data-tip="Undo (Ctrl+Z)">UNDO</button>
+      <button id="redo-btn" class="cad-btn" type="button" disabled
+              data-tip="Redo (Ctrl+Y)">REDO</button>
       <button id="open-settings" class="cad-btn" type="button">SETTINGS</button>
-      <span class="tb-meta" id="tb-meta">v1.2</span>
+      <span class="tb-meta" id="tb-meta">v1.3</span>
     </span>
   </div>
 
@@ -265,6 +269,13 @@
             </select>
             <button id="whl-mode" class="cad-btn tiny" type="button" hidden
                     data-tip="Ctrl+E toggles between EDIT (click cells to correct; Ctrl+click a row for the full metadata tab) and SEARCH (click a title to look it up on Open Library; click a result to repopulate the row)"></button>
+            <span id="whl-cons" class="tool-label whl-cons" hidden
+                  data-tip="Which of the clicked row's columns constrain the Open Library search. TITLE= requires the title to appear verbatim (as a phrase).">
+              CONSTRAIN:
+              <label><input type="checkbox" id="wc-title" /> TITLE=</label>
+              <label><input type="checkbox" id="wc-authors" /> AUTHOR</label>
+              <label><input type="checkbox" id="wc-year" /> YEAR</label>
+            </span>
             <span class="tool-count" id="top-count"></span>
           </div>
 

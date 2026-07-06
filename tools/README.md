@@ -174,6 +174,15 @@ The right side of the checked tab is two panes:
 - The FIND box understands `@token` (author, last name), `#token`
   (publication year), and plain text (title words); the syntax drives the
   top-table filters, the bottom tabs, and the realtime Open Library query.
+- **Undo/Redo** (titlebar buttons, Ctrl+Z / Ctrl+Y outside text fields)
+  covers checking/unchecking and clearing books, cell edits, verification
+  markers and manual sources, manual-entry creation/deletion/edits, and WHL
+  corrections — undoing a WHL edit restores the previous correction or
+  clears back to the CSV value. The last 100 actions are kept per session.
+- In WHL SEARCH mode, `CONSTRAIN:` checkboxes choose which of the clicked
+  row's columns narrow the Open Library lookup — `TITLE=` requires the
+  title to appear verbatim (as a phrase), AUTHOR and YEAR filter by the
+  row's values.
   The left panel is resizable by dragging the splitter. SETTINGS offers
   themes (Classic 95/CAD, CDE/Solaris, AutoCAD dark, XP/Office 2003) that
   restyle the palette without changing sizes. Note the COPYRIGHT tag reads
