@@ -121,16 +121,24 @@ is decided by a tolerant composite rather than exact strings:
   URL of a manually located source, which then acts as the verified record
   (link, upload list, IA download). Roman-numeral years typed into the
   manual-entry year field show their Arabic value in the footer.
-- Open Library integration: `tools/build_ol_index.py` converts the
-  `ol_dump_works_*.txt.gz` dump (~30M works) into `output/ol_works.db`
-  (SQLite + contentless FTS5 on title/subtitle, work_authors index). The
-  manual pane is split into SEARCH (constrained search: title/author via the
-  local index + cached OL author lookup; publisher/city/year/edition/volume
-  verified against live-fetched editions) and MANUAL ENTRY (title
-  autocomplete constrained by hand-typed fields). Provenance shading:
-  auto-populated fields light yellow, hand-typed light green; green fields
-  constrain and are never overwritten. Author names + edition details come
-  from the OL API, cached in `output/.ol_api_cache.json`. MARK column: `SCAN` = not in
+- Open Library integration: `tools/build_ol_index.py` (works dump ->
+  `output/ol_works.db`, fallback) and `tools/build_ol_search.py`
+  (editions + authors + works dumps -> `output/ol_search.db`: ~7.7M editions
+  published <= 1950, denormalized with author names/publisher/place/year/
+  edition/volume, column-filtered FTS5 with prefix indexes — all searches
+  local, no API). The manual pane is split into SEARCH (constraint fields
+  driving the realtime OPEN LIBRARY table) and MANUAL ENTRY (title
+  autocomplete constrained by hand-typed fields; picks populate from the
+  local edition record). Provenance shading: auto light yellow, hand-typed
+  light green; green fields constrain and are never overwritten.
+- Generalized panes: top pane dropdown = CHECKED BOOKS (full logic) or WHL
+  CATALOG (in-place corrections stored in `output/whl_corrections.json`,
+  never in the CSV). Bottom pane = tabbed viewer (+ adds tabs; per-tab table
+  dropdown: OL / CH / WHL), all filtered live from the FIND box; row hover
+  shows an all-fields tooltip; row click adds the record to the top-pane
+  table with column mapping.
+- The project is a git repository; dumps, built indexes, API caches and
+  downloaded PDFs are gitignored. MARK column: `SCAN` = not in
   WHL + public domain + no surviving scan online; `UPLD` = not in WHL + scan
   exists (amber unverified, green once a source is approved). The UPLOAD
   LIST tab lists every approved source with title/subtitle/author/publisher/

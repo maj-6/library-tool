@@ -53,11 +53,18 @@ const state = {
   // combined-table row lookup, rebuilt on each renderChecked()
   rowsById: new Map(),
   checkedFilter: "",
-  chBooks: null,          // CH catalog rows for the lower pane (lazy)
+  chBooks: null,          // CH catalog rows (lazy)
+  whlRows: null,          // WHL catalogue rows + corrections overlay (lazy)
+  olRows: null,           // realtime Open Library results
+  olNote: "",
+  bottomRecords: [],      // records behind the visible bottom-pane rows
   downloads: new Map(),   // ia identifier -> job state
   dlTimers: new Map(),
   downloadedIds: new Set(),
-  settings: { checkedCols: {}, catalogCols: {}, showCatalog: false, markFilter: "ALL" },
+  settings: {
+    checkedCols: {}, catalogCols: {}, showCatalog: false, markFilter: "ALL",
+    topTable: "checked", bottomTabs: ["ol", "ch"], bottomActive: 0,
+  },
 };
 
 const el = (id) => document.getElementById(id);
@@ -840,7 +847,7 @@ function renderChecked() {
   }
 
   applyColumnVisibility("checked-table", state.settings.checkedCols);
-  renderChPane();
+  renderBottomPane();
 }
 
 // One delegated handler covers verify markers / delete / uncheck / edit clicks.
@@ -953,7 +960,10 @@ async function commitEdit(row, field, value) {
   renderCatalog();
 }
 
-// --- CH catalog pane below the checked list ------------------------------------
+// --- generalized top / bottom panes ----------------------------------------------
+// Top pane: the working table (dedicated logic per table). Bottom pane: a
+// tabbed, general-purpose viewer whose rows update live with the FIND box;
+// clicking a row generates an entry in whichever table the top pane shows.
 
 async function loadChBooks() {
   if (state.chBooks) return;
@@ -963,32 +973,301 @@ async function loadChBooks() {
   } catch (e) { state.chBooks = []; }
 }
 
-function renderChPane() {
-  const pane = el("catalog-pane");
+async function loadWhlRows(force) {
+  if (state.whlRows && !force) return;
+  try {
+    const res = await fetch("/api/whl_catalog");
+    state.whlRows = res.ok ? (await res.json()).rows || [] : [];
+  } catch (e) { state.whlRows = []; }
+}
+
+// One normalized record shape crosses table boundaries (columns differ per
+// table; the mapping happens here and in addToTop).
+function chToRecord(b) {
+  return {
+    _src: "ch", _idx: b.idx,
+    title: b.title, subtitle: b.subtitle || "", author: b.author,
+    publisher: b.publisher, city: b.city, year: b.year, edition: b.edition,
+    volume: "", language: "", pages: b.pages, condition: b.condition,
+    price: b.price, illustrations: b.illustrations, categories: b.categories,
+    notes: b.notes, acquired: b.acquired, url: "",
+  };
+}
+
+function whlToRecord(r) {
+  return {
+    _src: "whl", _idx: r.idx,
+    title: r.title, subtitle: "", author: r.authors, publisher: "", city: "",
+    year: r.year, edition: "", volume: "", language: "", pages: "",
+    categories: "", notes: "", status: r.status, url: r.permalink || "",
+  };
+}
+
+function olToRecord(r) {
+  return {
+    _src: "ol", _idx: r.key,
+    title: r.title, subtitle: r.subtitle || "",
+    author: (r.authors || []).join("; "),
+    publisher: r.publisher || "", city: r.city || "",
+    year: r.year || (r.first_year ? String(r.first_year) : ""),
+    edition: r.edition || "", volume: r.volume || "",
+    language: r.language || "", pages: r.pages || "",
+    categories: "", notes: "", url: r.url || "",
+  };
+}
+
+const TIP_FIELDS = [
+  ["title", "TITLE"], ["subtitle", "SUBTITLE"], ["author", "AUTHOR"],
+  ["publisher", "PUBLISHER"], ["city", "CITY"], ["year", "YEAR"],
+  ["edition", "EDITION"], ["volume", "VOLUME"], ["language", "LANGUAGE"],
+  ["pages", "PAGES"], ["condition", "CONDITION"], ["price", "PRICE"],
+  ["illustrations", "ILLUSTRATIONS"], ["categories", "CATEGORIES"],
+  ["notes", "NOTES"], ["status", "STATUS"], ["acquired", "ACQUIRED"],
+  ["url", "URL"],
+];
+
+function recordTip(rec, header) {
+  const lines = header ? [header] : [];
+  for (const [k, label] of TIP_FIELDS) {
+    const v = (rec[k] || "").toString().trim();
+    if (v) lines.push(`${label}: ${v}`);
+  }
+  lines.push("CLICK ROW: add to the top-pane table");
+  return lines.join("\n");
+}
+
+const BOTTOM_TABLES = {
+  ol: {
+    label: "OPEN LIBRARY",
+    cols: ["TITLE", "AUTHOR", "YEAR", "PUBLISHER", "CITY", "ED", "VOL", "LANG"],
+    cells: (r) => [linkCell(r.title, r.url), r.author, r.year, r.publisher,
+                   r.city, r.edition, r.volume, r.language],
+  },
+  ch: {
+    label: "CH CATALOG",
+    cols: ["TITLE", "AUTHOR", "YEAR", "PUBLISHER", "CITY", "CATEGORIES"],
+    cells: (r) => [esc(r.title), esc(r.author), esc(r.year), esc(r.publisher),
+                   esc(r.city), esc(r.categories)],
+  },
+  whl: {
+    label: "WHL CATALOG",
+    cols: ["TITLE", "AUTHORS", "YEAR", "STATUS"],
+    cells: (r) => [linkCell(r.title, r.url), esc(r.author), esc(r.year),
+                   esc(r.status)],
+  },
+};
+
+function linkCell(text, url) {
+  const t = esc(text) || "<em>(untitled)</em>";
+  return url
+    ? `<a href="${esc(url)}" target="_blank" rel="noopener" data-nostop="0">${t}</a>`
+    : t;
+}
+
+function bottomTabs() {
+  let tabs = state.settings.bottomTabs;
+  if (!Array.isArray(tabs) || !tabs.length) tabs = ["ol", "ch"];
+  state.settings.bottomTabs = tabs.filter((t) => BOTTOM_TABLES[t]);
+  if (!state.settings.bottomTabs.length) state.settings.bottomTabs = ["ol"];
+  if (state.settings.bottomActive == null ||
+      state.settings.bottomActive >= state.settings.bottomTabs.length) {
+    state.settings.bottomActive = 0;
+  }
+  return state.settings.bottomTabs;
+}
+
+function renderBottomTabs() {
+  const tabs = bottomTabs();
+  const wrap = el("bottom-tabs");
+  wrap.innerHTML = "";
+  tabs.forEach((t, i) => {
+    if (i === state.settings.bottomActive) {
+      const sel = document.createElement("select");
+      sel.className = "cad-input bottom-tabsel";
+      for (const [id, def] of Object.entries(BOTTOM_TABLES)) {
+        const o = document.createElement("option");
+        o.value = id;
+        o.textContent = def.label;
+        sel.appendChild(o);
+      }
+      sel.value = t;
+      sel.addEventListener("change", () => {
+        state.settings.bottomTabs[i] = sel.value;
+        saveSettings();
+        renderBottomPane();
+      });
+      wrap.appendChild(sel);
+      if (tabs.length > 1) {
+        const x = document.createElement("button");
+        x.className = "cad-btn tiny";
+        x.textContent = "✕";
+        x.dataset.tip = "Close this tab";
+        x.addEventListener("click", () => {
+          state.settings.bottomTabs.splice(i, 1);
+          state.settings.bottomActive = Math.max(0, i - 1);
+          saveSettings();
+          renderBottomPane();
+        });
+        wrap.appendChild(x);
+      }
+    } else {
+      const b = document.createElement("button");
+      b.className = "cad-btn tiny bottom-tabbtn";
+      b.textContent = BOTTOM_TABLES[t].label;
+      b.addEventListener("click", () => {
+        state.settings.bottomActive = i;
+        saveSettings();
+        renderBottomPane();
+      });
+      wrap.appendChild(b);
+    }
+  });
+}
+
+function activeBottomTable() {
+  return bottomTabs()[state.settings.bottomActive];
+}
+
+async function renderBottomPane() {
+  const pane = el("bottom-pane");
   pane.hidden = !state.settings.showCatalog;
   if (pane.hidden) return;
-  const q = (state.checkedFilter || "").toLowerCase();
-  const books = (state.chBooks || []).filter((b) =>
-    !q || CHECKED_FILTER_FIELDS.some((f) => (b[f] || "").toLowerCase().includes(q)));
-  const shown = books.slice(0, CHPANE_RENDER);
-  const tbody = el("chpane-rows");
+  renderBottomTabs();
+  const t = activeBottomTable();
+  if (t === "ch") await loadChBooks();
+  if (t === "whl") await loadWhlRows();
+  if (t === "ol" && state.olRows === null) { olRealtime(); }
+  renderBottomRows();
+}
+
+function renderBottomRows() {
+  const t = activeBottomTable();
+  const def = BOTTOM_TABLES[t];
+  el("bottom-head").innerHTML =
+    "<tr>" + def.cols.map((c) => `<th>${c}</th>`).join("") + "</tr>";
+  const tbody = el("bottom-rows");
   tbody.innerHTML = "";
-  for (const b of shown) {
-    const added = state.checked.has(ckey("ch_library", b.idx));
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td>${esc(b.title) || "<em>(untitled)</em>"}</td>
-      <td>${esc(b.author)}</td>
-      <td>${esc(b.year)}</td>
-      <td>${esc(b.publisher)}</td>
-      <td>${esc(b.city)}</td>
-      <td>${esc(b.categories)}</td>
-      <td class="col-act">${added
-        ? '<span class="muted-cell">ADDED</span>'
-        : `<button class="cad-btn tiny" data-chadd="${b.idx}">+ADD</button>`}</td>`;
-    tbody.appendChild(tr);
+
+  const q = (state.checkedFilter || "").toLowerCase();
+  let records;
+  if (t === "ol") {
+    records = (state.olRows || []).map(olToRecord);
+  } else if (t === "ch") {
+    records = (state.chBooks || [])
+      .filter((b) => !q || CHECKED_FILTER_FIELDS.some(
+        (f) => (b[f] || "").toLowerCase().includes(q)))
+      .slice(0, CHPANE_RENDER).map(chToRecord);
+  } else {
+    records = (state.whlRows || [])
+      .filter((r) => !q || `${r.title} ${r.authors} ${r.year}`.toLowerCase().includes(q))
+      .slice(0, CHPANE_RENDER).map(whlToRecord);
   }
-  el("chpane-empty").hidden = shown.length !== 0;
+
+  state.bottomRecords = records;
+  records.forEach((rec, i) => {
+    const tr = document.createElement("tr");
+    tr.className = "bottom-row";
+    tr.dataset.bi = i;
+    tr.dataset.tip = recordTip(rec,
+      `${def.label}${rec._src === "ol" ? "" : " ROW"}`);
+    tr.innerHTML = def.cells(rec).map((c) => `<td>${c == null ? "" : c}</td>`).join("");
+    tbody.appendChild(tr);
+  });
+  el("bottom-empty").hidden = records.length !== 0;
+  el("bottom-count").textContent =
+    `${records.length} ROWS` + (t === "ol" && state.olNote ? ` — ${state.olNote}` : "");
+}
+
+// --- realtime Open Library table (special-cased for performance) --
+
+let olRtTimer = null;
+let olRtSeq = 0;
+function scheduleOlRealtime() {
+  clearTimeout(olRtTimer);
+  olRtTimer = setTimeout(olRealtime, 220);
+}
+
+async function olRealtime() {
+  if (activeBottomTable() !== "ol" || !state.settings.showCatalog) return;
+  const params = new URLSearchParams({ limit: "60" });
+  const text = (state.checkedFilter || "").trim();
+  const sTitle = el("s-title").value.trim();
+  if (text) params.set("title", text);
+  else if (sTitle) params.set("title", sTitle);
+  for (const f of ["author", "publisher", "city", "year", "edition", "volume"]) {
+    const v = el("s-" + f).value.trim();
+    if (v) params.set(f, v);
+  }
+  if (![...params.keys()].some((k) => k !== "limit")) {
+    state.olRows = [];
+    state.olNote = "TYPE IN FIND OR THE SEARCH FORM";
+    renderBottomRows();
+    return;
+  }
+  const seq = ++olRtSeq;
+  try {
+    const data = await (await fetch("/api/ol/realtime?" + params)).json();
+    if (seq !== olRtSeq) return; // stale response
+    state.olRows = data.results || [];
+    state.olNote = data.error || data.note || "";
+  } catch (e) {
+    if (seq !== olRtSeq) return;
+    state.olRows = [];
+    state.olNote = "SEARCH FAILED";
+  }
+  renderBottomRows();
+}
+
+// --- adding a bottom-pane record to the top-pane table --
+
+async function addToTop(rec) {
+  if (state.settings.topTable === "whl") {
+    const res = await fetch("/api/whl_catalog", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ add: {
+        title: rec.title + (rec.subtitle ? ": " + rec.subtitle : ""),
+        authors: rec.author, year: rec.year,
+      } }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.ok) {
+      await loadWhlRows(true);
+      renderWhlTop();
+      status(`ADDED TO WHL CATALOG (CORRECTIONS) :: ${rec.title}`);
+    } else {
+      status(data.error || "WHL ADD FAILED");
+    }
+    return;
+  }
+  // top = checked books
+  if (rec._src === "ch") { addChBook(rec._idx); return; }
+  const body = {
+    title: rec.title + (rec.subtitle ? ": " + rec.subtitle : ""),
+    author: rec.author, publisher: rec.publisher, city: rec.city,
+    year: rec.year, edition: rec.edition, volume: rec.volume,
+    language: rec.language, pages: rec.pages || "",
+    condition: "", price: "", illustrations: "", categories: rec.categories || "",
+    notes: rec.url ? `From ${rec._src === "ol" ? "Open Library" : "WHL catalog"}: ${rec.url}` : "",
+  };
+  try {
+    const res = await fetch("/api/manual", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.ok) {
+      state.manual.unshift(data.entry);
+      renderChecked();
+      queueScan(data.entry.id);
+      status(`ADDED TO CHECKED BOOKS :: ${rec.title}`);
+    } else {
+      status(data.error || "ADD FAILED");
+    }
+  } catch (e) {
+    status("ADD FAILED");
+  }
 }
 
 function addChBook(idx) {
@@ -1007,6 +1286,103 @@ function addChBook(idx) {
   if (state.dataset === "ch_library") renderCatalog();
   updateCheckedCount();
   status(`ADDED TO CHECKED BOOKS :: ${book.title}`);
+}
+
+// --- top pane: WHL catalog view (editable via the corrections overlay) --
+
+function switchTopTable(t) {
+  state.settings.topTable = t;
+  saveSettings();
+  el("top-table").value = t;
+  el("checked-pane").hidden = t !== "checked";
+  el("whltop-pane").hidden = t !== "whl";
+  // Batch actions below operate on the checked table only.
+  for (const id of ["check-whl", "run-scans", "dl-approved", "export-json", "clear-checked"]) {
+    el(id).disabled = t !== "checked";
+  }
+  renderTop();
+}
+
+async function renderTop() {
+  if (state.settings.topTable === "whl") {
+    await loadWhlRows();
+    renderWhlTop();
+  } else {
+    renderChecked();
+    el("top-count").textContent = "";
+  }
+}
+
+function renderWhlTop() {
+  const q = (state.checkedFilter || "").toLowerCase();
+  const rows = (state.whlRows || [])
+    .filter((r) => !q || `${r.title} ${r.authors} ${r.year}`.toLowerCase().includes(q));
+  const shown = rows.slice(0, 400);
+  const tbody = el("whltop-rows");
+  tbody.innerHTML = "";
+  for (const r of shown) {
+    const tr = document.createElement("tr");
+    tr.dataset.widx = r.idx;
+    tr.dataset.tip = recordTip(whlToRecord(r), "WHL CATALOG ROW — click a cell to edit");
+    const src = r.added ? "ADDED" : r.corrected ? "EDITED" : "CSV";
+    tr.innerHTML = `
+      <td>${src}</td>
+      <td class="editable${r.corrected || r.added ? " prov-manual" : ""}" data-wedit="title">${esc(r.title)}</td>
+      <td class="editable${r.corrected || r.added ? " prov-manual" : ""}" data-wedit="authors">${esc(r.authors)}</td>
+      <td class="editable${r.corrected || r.added ? " prov-manual" : ""}" data-wedit="year">${esc(r.year)}</td>
+      <td class="col-whl">${r.permalink
+        ? badge(r.status === "publish" ? "available" : "missing",
+                r.status === "publish" ? "PUB" : (r.status || "?").slice(0, 4).toUpperCase(),
+                { href: r.permalink, tip: "Open the WHL catalogue page" })
+        : badge("unknown", (r.status || "—").slice(0, 5).toUpperCase())}</td>`;
+    tbody.appendChild(tr);
+  }
+  el("whltop-empty").hidden = shown.length !== 0;
+  el("top-count").textContent =
+    `${rows.length} WHL ROWS` + (rows.length > 400 ? " (SHOWING 400)" : "");
+}
+
+function startWhlEdit(td) {
+  if (td.querySelector("input")) return;
+  const tr = td.closest("tr");
+  const idx = parseInt(tr.dataset.widx, 10);
+  const row = (state.whlRows || []).find((r) => r.idx === idx);
+  if (!row) return;
+  const field = td.dataset.wedit;
+  const original = String(row[field] || "");
+  hideTip();
+  td.classList.add("editing");
+  td.innerHTML = `<input class="cell-edit" value="${esc(original)}" />`;
+  const input = td.querySelector("input");
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = async (commit) => {
+    if (done) return;
+    done = true;
+    input.blur();
+    const val = input.value.trim();
+    if (commit && val !== original.trim()) {
+      const res = await fetch("/api/whl_catalog", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ idx, field, value: val }),
+      });
+      if (res.ok) {
+        row[field] = val;
+        if (!row.added) row.corrected = true;
+        status(`WHL ${field.toUpperCase()} CORRECTED :: ${row.title}`);
+      } else {
+        status("WHL EDIT FAILED");
+      }
+    }
+    renderWhlTop();
+  };
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); finish(true); }
+    else if (ev.key === "Escape") { ev.stopPropagation(); finish(false); }
+  });
+  input.addEventListener("blur", () => finish(true));
 }
 
 // --- Internet Archive PDF downloads ---------------------------------------------
@@ -1317,13 +1693,19 @@ function switchPaneTab(id) {
 async function loadOlStatus() {
   try {
     const st = await (await fetch("/api/ol/status")).json();
-    if (st.available) {
+    const ed = st.editions || {};
+    if (ed.available) {
       el("ol-db-note").textContent =
-        `CONSTRAINED SEARCH OF THE OPEN LIBRARY WORKS INDEX (${(st.works / 1e6).toFixed(1)}M WORKS). ` +
-        `FILL ANY FIELDS; USE A RESULT TO POPULATE THE MANUAL ENTRY.`;
+        `CONSTRAINED SEARCH OF THE CONSOLIDATED OPEN LIBRARY EDITIONS INDEX ` +
+        `(${(ed.editions / 1e6).toFixed(1)}M OLD EDITIONS, FULLY LOCAL). RESULTS ` +
+        `APPEAR LIVE IN THE OPEN LIBRARY TABLE OF THE SEARCH PANE BELOW.`;
+    } else if (st.available) {
+      el("ol-db-note").textContent =
+        `SEARCHING THE WORKS INDEX (${(st.works / 1e6).toFixed(1)}M WORKS). BUILD ` +
+        `THE FASTER EDITIONS INDEX WITH tools/build_ol_search.py.`;
     } else {
       el("ol-db-note").textContent =
-        "OPEN LIBRARY INDEX NOT BUILT — RUN tools/build_ol_index.py FIRST.";
+        "NO OPEN LIBRARY INDEX BUILT — RUN tools/build_ol_search.py FIRST.";
     }
   } catch (e) { /* leave the default note */ }
 }
@@ -1404,6 +1786,15 @@ function populateFromWork(r, best) {
 
 async function pickOlWork(r) {
   hideOlSuggest();
+  if (r.kind === "edition") {
+    // Consolidated index rows carry every field locally — no API round-trip.
+    populateFromWork(r, {
+      publisher: r.publisher, city: r.city, year: r.year,
+      edition: r.edition, volume: r.volume,
+    });
+    status(`OPEN LIBRARY :: POPULATED FROM EDITION ${r.key}`);
+    return;
+  }
   status(`OPEN LIBRARY :: FETCHING EDITIONS :: ${r.title}`);
   let best = null, count = 0;
   try {
@@ -1422,72 +1813,22 @@ async function pickOlWork(r) {
 
 async function olSearch(ev) {
   ev.preventDefault();
-  const constraints = {};
-  for (const f of PROV_FIELDS) {
-    const v = el("s-" + f).value.trim();
-    if (v) constraints[f] = v;
+  // Results live in the bottom pane's OPEN LIBRARY table; the form fields act
+  // as live constraints for it (and for the title autocomplete).
+  if (!state.settings.showCatalog) {
+    state.settings.showCatalog = true;
+    el("show-catalog").checked = true;
+    saveSettings();
   }
-  if (!constraints.title && !constraints.author) {
-    el("ol-msg").textContent = "ENTER AT LEAST A TITLE OR AUTHOR";
-    return;
-  }
-  const btn = el("ol-search-btn");
-  btn.disabled = true;
-  el("ol-msg").textContent = "SEARCHING ...";
-  el("ol-results").innerHTML = "";
-  try {
-    const params = new URLSearchParams(
-      Object.assign({ deep: "1", limit: "10" }, constraints));
-    const data = await (await fetch("/api/ol/search?" + params)).json();
-    renderOlResults(data);
-  } catch (e) {
-    el("ol-msg").textContent = "SEARCH FAILED";
-  }
-  btn.disabled = false;
-}
-
-function renderOlResults(data) {
-  const wrap = el("ol-results");
-  const results = data.results || [];
-  el("ol-msg").textContent = data.error || data.note ||
-    (results.length ? `${results.length} RESULTS` : "NO MATCHES");
-  wrap.innerHTML = "";
-  results.forEach((r, i) => {
-    const ed = (r.edition || {}).best;
-    const edLine = ed
-      ? [ed.year, ed.publisher, ed.city, ed.edition ? "ed. " + ed.edition : "",
-         ed.volume ? "vol. " + ed.volume : ""].filter(Boolean).join(" / ")
-      : "";
-    const card = document.createElement("div");
-    card.className = "ol-card";
-    card.innerHTML = `
-      <div class="t"><a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.title)}${r.subtitle ? `: ${esc(r.subtitle)}` : ""}</a></div>
-      <div class="m">${esc((r.authors || []).filter((a) => a && a !== "?").join("; ")) || "&mdash;"}${r.first_year ? ` [${r.first_year}]` : ""}</div>
-      ${edLine ? `<div class="e">${(r.edition || {}).satisfies ? "&#10003; " : ""}${esc(edLine)}${(r.edition || {}).editions_count ? ` (${r.edition.editions_count} ed.)` : ""}</div>` : ""}
-      <button class="cad-btn tiny" data-use="${i}">USE</button>`;
-    wrap.appendChild(card);
-  });
-  wrap.querySelectorAll("button[data-use]").forEach((btn) =>
-    btn.addEventListener("click", () => useOlResult(results[parseInt(btn.dataset.use, 10)])));
-}
-
-async function useOlResult(r) {
-  switchPaneTab("pane-entry");
-  // The constraints the user typed into the search form are hand-entered
-  // metadata: carry them over as manual (green) so they are kept.
-  clearProv();
-  el("manual-form").reset();
-  for (const f of PROV_FIELDS) {
-    const v = el("s-" + f).value.trim();
-    if (v) { el("m-" + f).value = v; setProv(f, "manual"); }
-  }
-  if (r.edition && r.edition.best) {
-    populateFromWork(r, r.edition.best);
-    status(`OPEN LIBRARY :: POPULATED FROM ${r.key}`);
-  } else {
-    await pickOlWork(r);
-  }
-  el("m-title").focus();
+  const tabs = bottomTabs();
+  let i = tabs.indexOf("ol");
+  if (i < 0) { tabs.push("ol"); i = tabs.length - 1; }
+  state.settings.bottomActive = i;
+  saveSettings();
+  await renderBottomPane();
+  await olRealtime();
+  el("ol-msg").textContent =
+    `${(state.olRows || []).length} RESULTS IN THE OPEN LIBRARY TABLE BELOW`;
 }
 
 // Old title pages carry Roman-numeral dates; converting them by eye is
@@ -1750,10 +2091,13 @@ function init() {
     if (ev.target === el("msrc-overlay")) closeManualSource();
   });
 
-  // checked tab: search, mark filter, CH catalog pane
+  // checked tab: search drives the top table, the bottom tabs, and the
+  // realtime Open Library query
   el("checked-search").addEventListener("input", () => {
     state.checkedFilter = el("checked-search").value.trim();
-    renderChecked();
+    renderTop();
+    renderBottomRows();
+    scheduleOlRealtime();
   });
   el("mark-filter").value = state.settings.markFilter || "ALL";
   el("mark-filter").addEventListener("change", () => {
@@ -1762,17 +2106,42 @@ function init() {
     renderChecked();
   });
   el("show-catalog").checked = !!state.settings.showCatalog;
-  el("show-catalog").addEventListener("change", async () => {
+  el("show-catalog").addEventListener("change", () => {
     state.settings.showCatalog = el("show-catalog").checked;
     saveSettings();
-    if (state.settings.showCatalog) await loadChBooks();
-    renderChPane();
+    renderBottomPane();
   });
-  el("chpane-rows").addEventListener("click", (ev) => {
-    const b = ev.target.closest("[data-chadd]");
-    if (b) addChBook(parseInt(b.dataset.chadd, 10));
+
+  // top pane table selector + WHL edit cells
+  el("top-table").addEventListener("change", () => switchTopTable(el("top-table").value));
+  el("whltop-rows").addEventListener("click", (ev) => {
+    if (ev.target.closest("a")) return;
+    const td = ev.target.closest("td[data-wedit]");
+    if (td) startWhlEdit(td);
   });
-  if (state.settings.showCatalog) loadChBooks().then(renderChPane);
+
+  // bottom pane: add-tab button + row clicks add to the top table
+  el("bottom-addtab").addEventListener("click", () => {
+    bottomTabs().push("ol");
+    state.settings.bottomActive = state.settings.bottomTabs.length - 1;
+    saveSettings();
+    renderBottomPane();
+  });
+  el("bottom-rows").addEventListener("click", (ev) => {
+    if (ev.target.closest("a")) return; // links open the source record
+    const tr = ev.target.closest("tr.bottom-row");
+    if (!tr) return;
+    const rec = state.bottomRecords[parseInt(tr.dataset.bi, 10)];
+    if (rec) addToTop(rec);
+  });
+
+  // the SEARCH form's constraint fields drive the realtime OL table too
+  for (const f of PROV_FIELDS) {
+    el("s-" + f).addEventListener("input", scheduleOlRealtime);
+  }
+
+  switchTopTable(state.settings.topTable === "whl" ? "whl" : "checked");
+  renderBottomPane();
 
   // settings window
   el("open-settings").addEventListener("click", openSettings);

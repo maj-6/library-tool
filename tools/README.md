@@ -15,10 +15,15 @@ local web app to review and finalize each book's metadata.
 - `catalog_checks.py` - offline copyright + WHL-catalogue checks (loaders,
   indexes, and the shared cross-database identity test).
 - `scan_search.py` - Internet Archive + HathiTrust scan search + JSON CLI.
-- `build_ol_index.py` - converts the Open Library works dump into the local
-  SQLite/FTS5 search index (`output/ol_works.db`).
-- `ol_client.py` - constrained search over that index + cached OL API lookups
-  (author names, edition details).
+- `build_ol_index.py` - converts the Open Library works dump into
+  `output/ol_works.db` (fallback index; also feeds author keys to the build
+  below).
+- `build_ol_search.py` - consolidates the editions + authors + works dumps
+  into `output/ol_search.db`: only editions published up to --max-year
+  (default 1950), with author names, publisher, place, year, edition and
+  volume all local and FTS5-indexed (prefix indexes for search-as-you-type).
+- `ol_client.py` - constrained search over those indexes; the consolidated
+  editions index needs no Open Library API calls at all.
 - `whl_client.py` - World Herb Library search client + JSON CLI.
 - `whl_explorer/` - CAD-styled catalog explorer with WHL cross-reference,
   manual entry, and scan search.
@@ -123,33 +128,50 @@ Open http://127.0.0.1:5001 (separate port from the review app).
 
 ### Open Library search + autocomplete
 
-Build the local works index once (the dump is ~4 GB compressed; the build
-streams it into `output/ol_works.db` with an FTS5 title index in ~15-25 min):
+Build the consolidated index once (streams the ~62 GB editions dump plus the
+authors dump; the works index from `build_ol_index.py` fills in author keys):
 
 ```
-python3 tools/build_ol_index.py
+python3 tools/build_ol_index.py     # once, works index (fallback + author keys)
+python3 tools/build_ol_search.py    # consolidated editions index (~10-15 min)
 ```
 
-- `SEARCH` sub-tab: fill any of title / author / publisher / city / year /
-  edition / volume number and press `SEARCH`. Title matches come from the
-  local index instantly; an author constraint is resolved to Open Library
-  author keys (cached) and filters the works; year and volume re-rank; and
-  publisher/city/edition/volume are verified against each candidate's actual
-  editions (live OL editions API, cached), with fully-satisfying candidates
-  marked ✓ and floated to the top. `USE` on a result carries your typed
-  constraints into the manual entry form (green) and auto-fills the rest
-  (yellow).
+The result is `output/ol_search.db` (~4.6 GB, ~7.7M editions published up to
+1950) where title, author, publisher and place are one prefix-indexed FTS
+table and year/volume are SQL columns — every query is local and answers in
+milliseconds, including search-as-you-type.
+
+- The `SEARCH` sub-tab's fields (title / author / publisher / city / year /
+  edition / volume number) act as live constraints; results appear in the
+  bottom pane's OPEN LIBRARY table as you type, in the FIND box or the form.
 - `MANUAL ENTRY` autocomplete: from 3 characters the title field suggests
-  works from the index, constrained by whatever fields you typed by hand.
-  Picking one completes the title and fills author, publisher, city, year,
-  edition, and volume from the best-matching edition. Auto-filled fields are
-  shaded light yellow, hand-typed fields light green; green fields constrain
-  the search and are never overwritten (except the title itself, which the
-  pick completes).
+  editions, constrained by hand-typed fields. Picking one fills author,
+  publisher, city, year, edition, and volume directly from the local record.
+  Auto-filled fields are shaded light yellow, hand-typed fields light green;
+  green fields constrain the search and are never overwritten (except the
+  title itself, which the pick completes).
 
-Works records only carry titles and author keys, so author names and edition
-details are fetched from the Open Library API on demand and cached in
-`output/.ol_api_cache.json`.
+While `ol_search.db` is absent the app falls back to the works index + live
+OL API (cached in `output/.ol_api_cache.json`).
+
+### Generalized top/bottom tables
+
+The right side of the checked tab is two panes:
+
+- **Top pane** (dropdown): the working table with dedicated logic —
+  `CHECKED BOOKS + MANUAL` (checks, scans, marks, verification, editing) or
+  `WHL CATALOG (EDITABLE)`, where title/authors/year cells are corrected in
+  place; corrections never touch `whl_catalog.csv` — they live in
+  `output/whl_corrections.json` (corrected/added rows are shaded and tagged).
+- **Bottom pane** (`SHOW SEARCH PANE`): a tabbed general-purpose viewer.
+  `+` adds a tab; the active tab's dropdown selects its table (OPEN LIBRARY /
+  CH CATALOG / WHL CATALOG). All tabs filter live from the FIND box (the
+  Open Library tab queries the consolidated index server-side). Hovering a
+  row shows a tooltip with every available field; clicking a row generates
+  an entry in whatever table the top pane shows, with columns mapped (into
+  CHECKED it becomes a manual entry — auto-checked and auto-scanned — or a
+  checked catalog row for CH sources; into WHL it becomes an added
+  correction row).
 
 ### Automatic checks + scans
 

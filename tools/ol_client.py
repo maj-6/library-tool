@@ -34,6 +34,7 @@ import libcommon as lib  # noqa: E402
 import whl_client as whl  # noqa: E402
 
 DB_PATH = lib.OUTPUT_DIR / "ol_works.db"
+SEARCH_DB_PATH = lib.OUTPUT_DIR / "ol_search.db"
 CACHE_PATH = lib.OUTPUT_DIR / ".ol_api_cache.json"
 OL_API = "https://openlibrary.org"
 USER_AGENT = "world-herb-library-tools/1.0"
@@ -127,6 +128,147 @@ def _fts_expr(title: str) -> str:
     terms = [f'"{w}"' for w in words[:-1]]
     terms.append(f'"{words[-1]}"*')  # last word may still be being typed
     return " ".join(terms)
+
+
+# --- consolidated editions index (ol_search.db, built by build_ol_search.py) ---
+
+def editions_index_available() -> bool:
+    return SEARCH_DB_PATH.exists()
+
+
+def editions_index_stats() -> dict:
+    if not editions_index_available():
+        return {"available": False, "editions": 0}
+    try:
+        con = sqlite3.connect(f"file:{SEARCH_DB_PATH.as_posix()}?mode=ro", uri=True)
+        n = con.execute("SELECT max(id) FROM ed").fetchone()[0] or 0
+        con.close()
+        return {"available": True, "editions": n}
+    except Exception as exc:
+        return {"available": False, "editions": 0, "error": str(exc)}
+
+
+def _fts_col_terms(text: str, prefix_all: bool = False, min_len: int = 1) -> str:
+    """Quoted FTS terms for one column filter; optionally all prefix-starred."""
+    words = [w for w in re.findall(r"\w+", text or "", re.UNICODE) if len(w) >= min_len]
+    if not words:
+        return ""
+    if prefix_all:
+        return " ".join(f'"{w}"*' for w in words)
+    terms = [f'"{w}"' for w in words[:-1]]
+    terms.append(f'"{words[-1]}"*')
+    return " ".join(terms)
+
+
+def _author_terms(author: str) -> str:
+    """Author constraint terms: surname-ish tokens (initials match nothing
+    against the full names stored in the index)."""
+    import catalog_checks as checks
+    toks = sorted(checks.author_tokens(author or ""))
+    if not toks:
+        toks = [w for w in re.findall(r"\w+", author or "") if len(w) >= 3]
+    return " ".join(f'"{t}"' for t in toks)
+
+
+def search_editions(
+    title: str = "",
+    author: str = "",
+    publisher: str = "",
+    city: str = "",
+    year: str = "",
+    edition: str = "",
+    volume: str = "",
+    limit: int = 30,
+) -> dict:
+    """Realtime constrained search of the consolidated editions index.
+
+    Everything is local: title/author/publisher/place hit the column-filtered
+    FTS index (prefix-indexed, so search-as-you-type is fast); year and
+    volume filter exactly in SQL; the edition-name constraint is a substring
+    match. No Open Library API calls.
+    """
+    out: dict = {"results": [], "kind": "edition",
+                 "db": editions_index_stats()}
+    if not out["db"]["available"]:
+        out["error"] = ("editions index not built — run tools/build_ol_search.py "
+                        "(falling back to the works index)")
+        return out
+
+    match_parts = []
+    tq = _fts_col_terms(title)
+    if tq:
+        match_parts.append(f"title:({tq})")
+    if (author or "").strip():
+        aq = _author_terms(author)
+        if aq:
+            match_parts.append(f"authors:({aq})")
+    pq = _fts_col_terms(publisher, prefix_all=True, min_len=3)
+    if pq:
+        match_parts.append(f"publisher:({pq})")
+    cq = _fts_col_terms(city, prefix_all=True, min_len=3)
+    if cq:
+        match_parts.append(f"place:({cq})")
+
+    want_year = whl._year(year)
+    want_vol = re.sub(r"\D", "", str(volume or ""))
+    ed_like = f"%{(edition or '').strip().lower()}%" if (edition or "").strip() else ""
+
+    filters, args = [], []
+    if want_year:
+        filters.append("e.year = ?")
+        args.append(int(want_year))
+    if want_vol:
+        filters.append("e.volume = ?")
+        args.append(want_vol)
+    if ed_like:
+        filters.append("lower(coalesce(e.edition, '')) LIKE ?")
+        args.append(ed_like)
+
+    con = sqlite3.connect(f"file:{SEARCH_DB_PATH.as_posix()}?mode=ro", uri=True)
+    try:
+        if match_parts:
+            sql = ("SELECT e.ekey, e.wkey, e.title, e.subtitle, e.authors, e.year,"
+                   " e.publisher, e.city, e.edition, e.volume, e.language, e.pages"
+                   " FROM ed_fts f JOIN ed e ON e.id = f.rowid"
+                   " WHERE ed_fts MATCH ?")
+            qargs = [" AND ".join(match_parts)]
+            if filters:
+                sql += " AND " + " AND ".join(filters)
+                qargs += args
+            sql += " ORDER BY rank LIMIT ?"
+            qargs.append(limit)
+            rows = con.execute(sql, qargs).fetchall()
+        elif filters:
+            sql = ("SELECT e.ekey, e.wkey, e.title, e.subtitle, e.authors, e.year,"
+                   " e.publisher, e.city, e.edition, e.volume, e.language, e.pages"
+                   " FROM ed e WHERE " + " AND ".join(filters) + " LIMIT ?")
+            rows = con.execute(sql, args + [limit]).fetchall()
+        else:
+            out["error"] = "enter something to search for"
+            return out
+    finally:
+        con.close()
+
+    for (ekey, wkey, rtitle, rsub, rauthors, ryear, rpub, rcity, red, rvol,
+         rlang, rpages) in rows:
+        out["results"].append({
+            "kind": "edition",
+            "key": ekey,
+            "work_key": wkey or "",
+            "title": rtitle,
+            "subtitle": rsub or "",
+            "authors": [a.strip() for a in (rauthors or "").split(";") if a.strip()],
+            "year": str(ryear) if ryear else "",
+            "first_year": ryear,
+            "publisher": rpub or "",
+            "city": rcity or "",
+            "edition": red or "",
+            "volume": rvol or "",
+            "language": rlang or "",
+            "pages": rpages or "",
+            "url": f"{OL_API}/books/{ekey}",
+        })
+    return out
 
 
 # --- author resolution ----------------------------------------------------------

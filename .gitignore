@@ -1,9 +1,8 @@
 # Open Library dumps + built indexes (huge, rebuildable via tools/build_ol_*.py)
 ol_dump_*
-output/ol_works.db*
-output/ol_search.db*
-output/ol_build*.log
-output/ol_build.err.log
+output/ol_works*
+output/ol_search*
+output/ol_build*
 
 # API caches (rebuild themselves)
 output/.ol_api_cache.json*

@@ -80,7 +80,7 @@
           <option value="NONE">UNMARKED</option>
         </select>
         <label class="tool-label chk-label">
-          <input id="show-catalog" type="checkbox" /> SHOW CH CATALOG
+          <input id="show-catalog" type="checkbox" /> SHOW SEARCH PANE
         </label>
         <button id="check-whl" class="cad-btn">CHECK SELECTED ON WHL</button>
         <button id="run-scans" class="cad-btn">RUN SCANS</button>
@@ -138,7 +138,6 @@
                 <span class="tool-label" id="ol-msg"></span>
               </div>
             </form>
-            <div id="ol-results"></div>
           </div>
 
           <!-- manual entry form -->
@@ -215,6 +214,32 @@
         </div>
 
         <div id="checked-right">
+          <!-- TOP PANE: working table with dedicated per-table logic -->
+          <div class="pane-bar">
+            <label class="tool-label" for="top-table">TABLE</label>
+            <select id="top-table" class="cad-input">
+              <option value="checked">CHECKED BOOKS + MANUAL</option>
+              <option value="whl">WHL CATALOG (EDITABLE)</option>
+            </select>
+            <span class="tool-count" id="top-count"></span>
+          </div>
+
+          <div class="drafting" id="whltop-pane" hidden>
+            <table class="grid" id="whltop-table">
+              <thead>
+                <tr>
+                  <th>SRC</th>
+                  <th>TITLE</th>
+                  <th>AUTHORS</th>
+                  <th>YEAR</th>
+                  <th>STATUS</th>
+                </tr>
+              </thead>
+              <tbody id="whltop-rows"></tbody>
+            </table>
+            <p id="whltop-empty" class="empty" hidden>NO WHL ROWS</p>
+          </div>
+
           <div class="drafting" id="checked-pane">
             <table class="grid" id="checked-table">
               <thead>
@@ -248,22 +273,21 @@
             <p id="checked-empty" class="empty">NO BOOKS CHECKED</p>
           </div>
 
-          <div class="drafting" id="catalog-pane" hidden>
-            <table class="grid" id="chpane-table">
-              <thead>
-                <tr>
-                  <th>CH CATALOG :: TITLE</th>
-                  <th>AUTHOR</th>
-                  <th>YEAR</th>
-                  <th>PUBLISHER</th>
-                  <th>CITY</th>
-                  <th>CATEGORIES</th>
-                  <th class="col-act">ACTION</th>
-                </tr>
-              </thead>
-              <tbody id="chpane-rows"></tbody>
-            </table>
-            <p id="chpane-empty" class="empty" hidden>NO CATALOG MATCHES</p>
+          <!-- BOTTOM PANE: general-purpose tabbed viewer/adder -->
+          <div id="bottom-pane" hidden>
+            <div class="pane-bar" id="bottom-tabbar">
+              <div id="bottom-tabs"></div>
+              <button id="bottom-addtab" class="cad-btn tiny"
+                      data-tip="Add a viewer tab">+</button>
+              <span class="tool-count" id="bottom-count"></span>
+            </div>
+            <div class="drafting" id="bottom-body">
+              <table class="grid" id="bottom-table">
+                <thead id="bottom-head"></thead>
+                <tbody id="bottom-rows"></tbody>
+              </table>
+              <p id="bottom-empty" class="empty" hidden>NO MATCHES</p>
+            </div>
           </div>
         </div>
       </div>

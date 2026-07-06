@@ -504,31 +504,161 @@ def api_ia_downloads():
     return jsonify(lib.load_json(lib.IA_CATALOG_PATH, {}))
 
 
-# --- Open Library works index (constrained search + autocomplete) ---------------
+# --- Open Library indexes (constrained search + realtime + autocomplete) --------
 
 @app.route("/api/ol/status")
 def api_ol_status():
-    return jsonify(ol_client.db_stats())
+    st = ol_client.db_stats()
+    st["editions"] = ol_client.editions_index_stats()
+    return jsonify(st)
+
+
+def _ol_params():
+    p = request.args
+    try:
+        limit = min(int(p.get("limit", 12) or 12), 100)
+    except ValueError:
+        limit = 12
+    return {
+        "title": (p.get("title") or "").strip(),
+        "author": (p.get("author") or "").strip(),
+        "year": (p.get("year") or "").strip(),
+        "edition": (p.get("edition") or "").strip(),
+        "volume": (p.get("volume") or "").strip(),
+        "publisher": (p.get("publisher") or "").strip(),
+        "city": (p.get("city") or "").strip(),
+        "limit": limit,
+    }
 
 
 @app.route("/api/ol/search")
 def api_ol_search():
-    p = request.args
-    try:
-        limit = min(int(p.get("limit", 12) or 12), 30)
-    except ValueError:
-        limit = 12
+    params = _ol_params()
+    # The consolidated editions index answers everything locally; the works
+    # index (+ live API) is only the fallback while it hasn't been built.
+    if ol_client.editions_index_available():
+        return jsonify(ol_client.search_editions(**params))
     return jsonify(ol_client.search_works(
-        title=(p.get("title") or "").strip(),
-        author=(p.get("author") or "").strip(),
-        year=(p.get("year") or "").strip(),
-        edition=(p.get("edition") or "").strip(),
-        volume=(p.get("volume") or "").strip(),
-        publisher=(p.get("publisher") or "").strip(),
-        city=(p.get("city") or "").strip(),
-        limit=limit,
-        deep=(p.get("deep") or "") in ("1", "true"),
-    ))
+        **params, deep=(request.args.get("deep") or "") in ("1", "true")))
+
+
+@app.route("/api/ol/realtime")
+def api_ol_realtime():
+    """Search-as-you-type endpoint for the bottom-pane Open Library table."""
+    params = _ol_params()
+    if ol_client.editions_index_available():
+        return jsonify(ol_client.search_editions(**params))
+    out = ol_client.search_works(
+        title=params["title"], author=params["author"], year=params["year"],
+        edition=params["edition"], volume=params["volume"],
+        publisher=params["publisher"], city=params["city"],
+        limit=params["limit"], deep=False)
+    out["kind"] = "work"
+    return jsonify(out)
+
+
+# --- WHL catalogue view (editable via a corrections overlay) --------------------
+
+WHL_CORRECTIONS_PATH = lib.OUTPUT_DIR / "whl_corrections.json"
+_whl_rows_cache: list | None = None
+_whl_rows_lock = threading.Lock()
+
+_WHL_EDIT_FIELDS = ("title", "authors", "year")
+
+
+def _load_whl_base() -> list[dict]:
+    """whl_catalog.csv rows with stable indexes (cached; the CSV is static)."""
+    global _whl_rows_cache
+    with _whl_rows_lock:
+        if _whl_rows_cache is None:
+            rows = []
+            path = checks.WHL_CATALOG_CSV
+            if path.exists():
+                import csv
+                with open(path, "r", encoding="utf-8-sig", errors="replace",
+                          newline="") as fh:
+                    for i, raw in enumerate(csv.DictReader(fh)):
+                        rows.append({
+                            "idx": i,
+                            "title": (raw.get("Title") or "").strip(),
+                            "authors": (raw.get("Authors") or "").strip(),
+                            "year": whl_client._year(raw.get("Year Published")) or "",
+                            "status": (raw.get("Status") or "").strip().lower(),
+                            "permalink": (raw.get("Permalink") or "").strip(),
+                        })
+            _whl_rows_cache = rows
+        return _whl_rows_cache
+
+
+def _merged_whl_rows() -> list[dict]:
+    """Base CSV rows with the corrections overlay applied; added rows first."""
+    base = [dict(r) for r in _load_whl_base()]
+    corr = lib.load_json(WHL_CORRECTIONS_PATH, {})
+    for sidx, edits in (corr.get("edits") or {}).items():
+        try:
+            i = int(sidx)
+        except ValueError:
+            continue
+        if 0 <= i < len(base):
+            for f in _WHL_EDIT_FIELDS:
+                if f in edits:
+                    base[i][f] = edits[f]
+            base[i]["corrected"] = True
+    added = []
+    for j, a in enumerate(corr.get("added") or []):
+        added.append({
+            "idx": -(j + 1),
+            "title": a.get("title", ""), "authors": a.get("authors", ""),
+            "year": a.get("year", ""), "status": "added",
+            "permalink": "", "added": True,
+        })
+    added.reverse()  # newest first
+    return added + base
+
+
+@app.route("/api/whl_catalog")
+def api_whl_catalog():
+    return jsonify({"rows": _merged_whl_rows(),
+                    "corrections": str(WHL_CORRECTIONS_PATH.name)})
+
+
+@app.route("/api/whl_catalog", methods=["POST"])
+def api_whl_catalog_edit():
+    """Record a correction ({idx, field, value}) or a new row ({add: {...}}).
+
+    The CSV export itself is never modified; changes live in
+    output/whl_corrections.json so they are reviewable and revertible.
+    """
+    payload = request.get_json(silent=True) or {}
+    corr = lib.load_json(WHL_CORRECTIONS_PATH, {})
+    if "add" in payload:
+        a = payload.get("add") or {}
+        row = {f: str(a.get(f, "") or "").strip() for f in _WHL_EDIT_FIELDS}
+        if not row["title"]:
+            return jsonify({"ok": False, "error": "TITLE IS REQUIRED"}), 400
+        corr.setdefault("added", []).append(row)
+        lib.save_json(WHL_CORRECTIONS_PATH, corr)
+        return jsonify({"ok": True, "idx": -len(corr["added"])})
+    field = str(payload.get("field", "") or "")
+    if field not in _WHL_EDIT_FIELDS:
+        abort(400)
+    try:
+        idx = int(payload.get("idx"))
+    except (TypeError, ValueError):
+        abort(400)
+    value = str(payload.get("value", "") or "").strip()
+    if idx >= 0:
+        if idx >= len(_load_whl_base()):
+            abort(404)
+        corr.setdefault("edits", {}).setdefault(str(idx), {})[field] = value
+    else:
+        added = corr.get("added") or []
+        j = -idx - 1
+        if j >= len(added):
+            abort(404)
+        added[j][field] = value
+    lib.save_json(WHL_CORRECTIONS_PATH, corr)
+    return jsonify({"ok": True})
 
 
 @app.route("/api/ol/editions")
