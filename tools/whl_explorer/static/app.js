@@ -55,6 +55,9 @@ const state = {
   checkedFilter: "",
   chBooks: null,          // CH catalog rows (lazy)
   whlRows: null,          // WHL catalogue rows + corrections overlay (lazy)
+  whlSelected: null,      // search-mode repopulation target (row idx)
+  whlEditIdx: null,       // row loaded in the left-panel WHL EDIT tab
+  olOverrideTitle: "",    // search-mode title override for the OL table
   olRows: null,           // realtime Open Library results
   olNote: "",
   bottomRecords: [],      // records behind the visible bottom-pane rows
@@ -64,8 +67,23 @@ const state = {
   settings: {
     checkedCols: {}, catalogCols: {}, showCatalog: false, markFilter: "ALL",
     topTable: "checked", bottomTabs: ["ol", "ch"], bottomActive: 0,
+    whlMode: "edit", paneWidth: null, theme: "",
   },
 };
+
+// Themes: same geometry, era-appropriate palettes (1995-2008 enterprise/CAD).
+const THEMES = [
+  ["", "CLASSIC 95 / CAD"],
+  ["cde", "CDE / SOLARIS"],
+  ["acad", "AUTOCAD DARK"],
+  ["xp2003", "XP / OFFICE 2003"],
+];
+
+function applyTheme() {
+  const t = state.settings.theme || "";
+  if (t) document.body.dataset.theme = t;
+  else delete document.body.dataset.theme;
+}
 
 const el = (id) => document.getElementById(id);
 const esc = (s) =>
@@ -200,6 +218,25 @@ function renderSettings() {
     () => applyColumnVisibility("checked-table", state.settings.checkedCols));
   build("cols-catalog", CATALOG_COLS, state.settings.catalogCols,
     () => applyColumnVisibility("catalog-table", state.settings.catalogCols));
+
+  const themes = el("theme-options");
+  themes.innerHTML = "";
+  for (const [id, label] of THEMES) {
+    const lab = document.createElement("label");
+    lab.className = "settings-col";
+    const rb = document.createElement("input");
+    rb.type = "radio";
+    rb.name = "theme";
+    rb.checked = (state.settings.theme || "") === id;
+    rb.addEventListener("change", () => {
+      state.settings.theme = id;
+      saveSettings();
+      applyTheme();
+    });
+    lab.appendChild(rb);
+    lab.appendChild(document.createTextNode(" " + label));
+    themes.appendChild(lab);
+  }
 }
 
 function openSettings() { renderSettings(); el("settings-overlay").hidden = false; }
@@ -542,11 +579,13 @@ function whlCombinedBadge(row) {
 }
 
 function copyrightBadge(checks) {
+  // The column asks "is it under copyright?": NO = public domain (green),
+  // YES = in copyright (red).
   if (!checks) return badge("unknown", "---", { tip: "Not checked yet" });
   if (checks.error) return badge("error", "ERR", { tip: checks.error });
   const s = checks.copyright_status || "";
-  if (s.startsWith("Public domain")) return badge("available", "YES", { tip: s });
-  if (s.startsWith("In copyright")) return badge("error", "NO", { tip: s });
+  if (s.startsWith("Public domain")) return badge("available", "NO", { tip: s });
+  if (s.startsWith("In copyright")) return badge("error", "YES", { tip: s });
   return badge("unknown", "?", { tip: s });
 }
 
@@ -761,6 +800,48 @@ const CHECKED_FILTER_FIELDS = [
   "year", "edition", "language",
 ];
 
+// FIND box syntax: @token constrains by author (last name), #token by
+// publication year, everything else is title text.
+function parseFind(text) {
+  const out = { title: [], author: [], year: "" };
+  for (const tok of (text || "").trim().split(/\s+/)) {
+    if (!tok) continue;
+    if (tok.startsWith("@") && tok.length > 1) out.author.push(tok.slice(1));
+    else if (tok.startsWith("#") && tok.length > 1) {
+      const y = tok.slice(1).replace(/\D/g, "");
+      if (y) out.year = y;
+    } else out.title.push(tok);
+  }
+  return {
+    title: out.title.join(" "),
+    author: out.author.join(" "),
+    year: out.year,
+    empty: !out.title.length && !out.author.length && !out.year,
+  };
+}
+
+function findQuery() { return parseFind(state.checkedFilter); }
+
+// Structured local match: title tokens against title+subtitle, @tokens
+// against the author field, #year against the year field.
+function matchesFind(q, title, author, year) {
+  if (q.empty) return true;
+  if (q.title) {
+    const hay = (title || "").toLowerCase();
+    for (const w of q.title.toLowerCase().split(/\s+/)) {
+      if (w && !hay.includes(w)) return false;
+    }
+  }
+  if (q.author) {
+    const hay = (author || "").toLowerCase();
+    for (const w of q.author.toLowerCase().split(/\s+/)) {
+      if (w && !hay.includes(w)) return false;
+    }
+  }
+  if (q.year && !(String(year || "").includes(q.year))) return false;
+  return true;
+}
+
 function iaIdentifier(scans) {
   const s = scans && scans.internet_archive;
   if (!s || s.available !== true || !s.best_match) return "";
@@ -812,10 +893,10 @@ function renderChecked() {
   let rows = combinedRows();
   state.rowsById = new Map(rows.map((r) => [String(r.id), r]));
 
-  const q = (state.checkedFilter || "").toLowerCase();
-  if (q)
-    rows = rows.filter((r) =>
-      CHECKED_FILTER_FIELDS.some((f) => ((r.book[f] || "") + "").toLowerCase().includes(q)));
+  const q = findQuery();
+  if (!q.empty)
+    rows = rows.filter((r) => matchesFind(
+      q, `${r.book.title} ${r.book.subtitle || ""}`, r.book.author, r.book.year));
   const mf = state.settings.markFilter || "ALL";
   if (mf !== "ALL") rows = rows.filter((r) => rowMarkState(r) === mf);
 
@@ -1148,18 +1229,17 @@ function renderBottomRows() {
   const tbody = el("bottom-rows");
   tbody.innerHTML = "";
 
-  const q = (state.checkedFilter || "").toLowerCase();
+  const q = findQuery();
   let records;
   if (t === "ol") {
     records = (state.olRows || []).map(olToRecord);
   } else if (t === "ch") {
     records = (state.chBooks || [])
-      .filter((b) => !q || CHECKED_FILTER_FIELDS.some(
-        (f) => (b[f] || "").toLowerCase().includes(q)))
+      .filter((b) => matchesFind(q, `${b.title} ${b.subtitle || ""}`, b.author, b.year))
       .slice(0, CHPANE_RENDER).map(chToRecord);
   } else {
     records = (state.whlRows || [])
-      .filter((r) => !q || `${r.title} ${r.authors} ${r.year}`.toLowerCase().includes(q))
+      .filter((r) => matchesFind(q, `${r.title} ${r.subtitle || ""}`, r.authors, r.year))
       .slice(0, CHPANE_RENDER).map(whlToRecord);
   }
 
@@ -1190,13 +1270,19 @@ function scheduleOlRealtime() {
 async function olRealtime() {
   if (activeBottomTable() !== "ol" || !state.settings.showCatalog) return;
   const params = new URLSearchParams({ limit: "60" });
-  const text = (state.checkedFilter || "").trim();
+  // FIND syntax: @author, #year, plain text = title. A search-mode WHL row
+  // selection overrides the title; the SEARCH form fills whatever is left.
+  const q = state.olOverrideTitle
+    ? { title: state.olOverrideTitle, author: "", year: "", empty: false }
+    : findQuery();
   const sTitle = el("s-title").value.trim();
-  if (text) params.set("title", text);
+  if (q.title) params.set("title", q.title);
   else if (sTitle) params.set("title", sTitle);
+  if (q.author) params.set("author", q.author);
+  if (q.year) params.set("year", q.year);
   for (const f of ["author", "publisher", "city", "year", "edition", "volume"]) {
     const v = el("s-" + f).value.trim();
-    if (v) params.set(f, v);
+    if (v && !params.has(f)) params.set(f, v);
   }
   if (![...params.keys()].some((k) => k !== "limit")) {
     state.olRows = [];
@@ -1222,6 +1308,12 @@ async function olRealtime() {
 
 async function addToTop(rec) {
   if (state.settings.topTable === "whl") {
+    // Search mode with a selected row: results REPOPULATE that row's
+    // metadata instead of creating a new one.
+    if (whlMode() === "search" && state.whlSelected != null) {
+      await repopulateWhlRow(rec);
+      return;
+    }
     const res = await fetch("/api/whl_catalog", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1313,23 +1405,55 @@ async function renderTop() {
   }
 }
 
+const WHL_ROW_FIELDS = ["title", "subtitle", "authors", "year", "categories", "description"];
+
+function whlMode() { return state.settings.whlMode === "search" ? "search" : "edit"; }
+
+function setWhlMode(m) {
+  state.settings.whlMode = m;
+  saveSettings();
+  if (m !== "search") {
+    state.whlSelected = null;
+    state.olOverrideTitle = "";
+  }
+  renderWhlTop();
+  status(m === "search"
+    ? "WHL SEARCH MODE :: click a title to look it up on Open Library; click a result to repopulate the row"
+    : "WHL EDIT MODE :: click a cell to correct it; Ctrl+click a row for the full metadata tab");
+}
+
 function renderWhlTop() {
-  const q = (state.checkedFilter || "").toLowerCase();
+  const mode = whlMode();
+  const btn = el("whl-mode");
+  btn.hidden = state.settings.topTable !== "whl";
+  btn.textContent = `MODE: ${mode.toUpperCase()} (CTRL+E)`;
+  const q = findQuery();
   const rows = (state.whlRows || [])
-    .filter((r) => !q || `${r.title} ${r.authors} ${r.year}`.toLowerCase().includes(q));
+    .filter((r) => matchesFind(q, `${r.title} ${r.subtitle || ""}`, r.authors, r.year));
   const shown = rows.slice(0, 400);
   const tbody = el("whltop-rows");
   tbody.innerHTML = "";
+  const editable = (r, f) => mode === "edit"
+    ? ` class="editable${r.corrected || r.added ? " prov-manual" : ""}" data-wedit="${f}"`
+    : `${r.corrected || r.added ? ' class="prov-manual"' : ""}`;
   for (const r of shown) {
     const tr = document.createElement("tr");
     tr.dataset.widx = r.idx;
-    tr.dataset.tip = recordTip(whlToRecord(r), "WHL CATALOG ROW — click a cell to edit");
-    const src = r.added ? "ADDED" : r.corrected ? "EDITED" : "CSV";
+    if (state.whlSelected === r.idx) tr.classList.add("whl-selected");
+    tr.dataset.tip = recordTip(
+      Object.assign(whlToRecord(r), { subtitle: r.subtitle || "",
+        categories: r.categories || "", notes: r.description || "" }),
+      mode === "edit"
+        ? "WHL ROW — click a cell to edit; Ctrl+click for the full editor"
+        : "WHL ROW — click the title to search Open Library for it");
     tr.innerHTML = `
-      <td>${src}</td>
-      <td class="editable${r.corrected || r.added ? " prov-manual" : ""}" data-wedit="title">${esc(r.title)}</td>
-      <td class="editable${r.corrected || r.added ? " prov-manual" : ""}" data-wedit="authors">${esc(r.authors)}</td>
-      <td class="editable${r.corrected || r.added ? " prov-manual" : ""}" data-wedit="year">${esc(r.year)}</td>
+      <td>${r.added ? "ADDED" : r.corrected ? "EDITED" : "CSV"}</td>
+      <td${editable(r, "title")}${mode === "search" ? ' data-wsearch="1"' : ""}>${esc(r.title)}</td>
+      <td${editable(r, "subtitle")}>${esc(r.subtitle || "")}</td>
+      <td${editable(r, "authors")}>${esc(r.authors)}</td>
+      <td${editable(r, "year")}>${esc(r.year)}</td>
+      <td${editable(r, "categories")}>${esc(r.categories || "")}</td>
+      <td${editable(r, "description")}>${esc(r.description || "")}</td>
       <td class="col-whl">${r.permalink
         ? badge(r.status === "publish" ? "available" : "missing",
                 r.status === "publish" ? "PUB" : (r.status || "?").slice(0, 4).toUpperCase(),
@@ -1340,6 +1464,95 @@ function renderWhlTop() {
   el("whltop-empty").hidden = shown.length !== 0;
   el("top-count").textContent =
     `${rows.length} WHL ROWS` + (rows.length > 400 ? " (SHOWING 400)" : "");
+}
+
+function whlRowByIdx(idx) {
+  return (state.whlRows || []).find((r) => r.idx === idx);
+}
+
+// Search mode: a title click queries Open Library; the clicked row becomes
+// the repopulation target for the next Open Library result click.
+function selectWhlSearchRow(idx) {
+  const row = whlRowByIdx(idx);
+  if (!row) return;
+  state.whlSelected = idx;
+  state.olOverrideTitle = row.title;
+  if (!state.settings.showCatalog) {
+    state.settings.showCatalog = true;
+    el("show-catalog").checked = true;
+    saveSettings();
+  }
+  const tabs = bottomTabs();
+  let i = tabs.indexOf("ol");
+  if (i < 0) { tabs.push("ol"); i = tabs.length - 1; }
+  state.settings.bottomActive = i;
+  saveSettings();
+  renderWhlTop();
+  renderBottomPane().then(olRealtime);
+  status(`SEARCHING OPEN LIBRARY :: ${row.title} — click a result to repopulate this row`);
+}
+
+async function repopulateWhlRow(rec) {
+  const idx = state.whlSelected;
+  const row = whlRowByIdx(idx);
+  if (row == null) return;
+  const fields = {
+    title: rec.title, subtitle: rec.subtitle || "",
+    authors: rec.author, year: rec.year,
+  };
+  const res = await fetch("/api/whl_catalog", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ idx, fields }),
+  });
+  if (res.ok) {
+    Object.assign(row, fields);
+    if (!row.added) row.corrected = true;
+    renderWhlTop();
+    status(`WHL ROW REPOPULATED FROM OPEN LIBRARY :: ${rec.title}`);
+  } else {
+    status("WHL REPOPULATE FAILED");
+  }
+}
+
+// Edit mode, Ctrl+click: the full-record editor in the left panel — the
+// comfortable place for long fields like the description.
+function openWhlEditTab(idx) {
+  const row = whlRowByIdx(idx);
+  if (!row) return;
+  state.whlEditIdx = idx;
+  el("whledit-tab").hidden = false;
+  el("whledit-note").textContent =
+    `EDITING WHL ROW ${idx >= 0 ? "#" + idx : "(ADDED)"} :: CHANGES GO TO THE ` +
+    `CORRECTIONS OVERLAY, NOT THE CSV.`;
+  for (const f of WHL_ROW_FIELDS) el("w-" + f).value = row[f] || "";
+  el("whledit-msg").textContent = "";
+  switchPaneTab("pane-whledit");
+  el("w-title").focus();
+}
+
+async function saveWhlEditTab(ev) {
+  ev.preventDefault();
+  const idx = state.whlEditIdx;
+  const row = whlRowByIdx(idx);
+  if (row == null) { el("whledit-msg").textContent = "NO ROW LOADED"; return; }
+  const fields = {};
+  for (const f of WHL_ROW_FIELDS) fields[f] = el("w-" + f).value.trim();
+  if (!fields.title) { el("whledit-msg").textContent = "TITLE IS REQUIRED"; return; }
+  const res = await fetch("/api/whl_catalog", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ idx, fields }),
+  });
+  if (res.ok) {
+    Object.assign(row, fields);
+    if (!row.added) row.corrected = true;
+    renderWhlTop();
+    el("whledit-msg").textContent = "SAVED";
+    status(`WHL CORRECTIONS SAVED :: ${fields.title}`);
+  } else {
+    el("whledit-msg").textContent = "SAVE FAILED";
+  }
 }
 
 function startWhlEdit(td) {
@@ -2043,6 +2256,7 @@ function downloadUploadList() {
 
 function init() {
   loadSettings();
+  applyTheme();
   loadChecked();
   initTabs();
   initTooltips();
@@ -2095,6 +2309,7 @@ function init() {
   // realtime Open Library query
   el("checked-search").addEventListener("input", () => {
     state.checkedFilter = el("checked-search").value.trim();
+    state.olOverrideTitle = ""; // typing takes over from a search-mode pick
     renderTop();
     renderBottomRows();
     scheduleOlRealtime();
@@ -2112,13 +2327,56 @@ function init() {
     renderBottomPane();
   });
 
-  // top pane table selector + WHL edit cells
+  // top pane table selector + WHL mode / edit / search interactions
   el("top-table").addEventListener("change", () => switchTopTable(el("top-table").value));
+  el("whl-mode").addEventListener("click", () =>
+    setWhlMode(whlMode() === "edit" ? "search" : "edit"));
+  document.addEventListener("keydown", (ev) => {
+    if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "e" &&
+        state.settings.topTable === "whl") {
+      ev.preventDefault();
+      setWhlMode(whlMode() === "edit" ? "search" : "edit");
+    }
+  });
   el("whltop-rows").addEventListener("click", (ev) => {
     if (ev.target.closest("a")) return;
+    const tr = ev.target.closest("tr");
+    if (!tr) return;
+    const idx = parseInt(tr.dataset.widx, 10);
+    if (whlMode() === "search") {
+      if (ev.target.closest("td[data-wsearch]")) selectWhlSearchRow(idx);
+      return;
+    }
+    if (ev.ctrlKey || ev.metaKey) { openWhlEditTab(idx); return; }
     const td = ev.target.closest("td[data-wedit]");
     if (td) startWhlEdit(td);
   });
+  el("whledit-form").addEventListener("submit", saveWhlEditTab);
+
+  // resizable left panel
+  (() => {
+    const sp = el("pane-splitter");
+    const pane = el("manual-pane");
+    if (state.settings.paneWidth) pane.style.width = state.settings.paneWidth + "px";
+    let dragging = false;
+    sp.addEventListener("mousedown", (ev) => {
+      dragging = true;
+      ev.preventDefault();
+      document.body.classList.add("resizing");
+    });
+    document.addEventListener("mousemove", (ev) => {
+      if (!dragging) return;
+      const left = pane.getBoundingClientRect().left;
+      pane.style.width = Math.min(760, Math.max(260, ev.clientX - left)) + "px";
+    });
+    document.addEventListener("mouseup", () => {
+      if (!dragging) return;
+      dragging = false;
+      document.body.classList.remove("resizing");
+      state.settings.paneWidth = parseInt(pane.style.width, 10) || null;
+      saveSettings();
+    });
+  })();
 
   // bottom pane: add-tab button + row clicks add to the top table
   el("bottom-addtab").addEventListener("click", () => {

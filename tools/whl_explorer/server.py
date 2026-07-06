@@ -563,7 +563,10 @@ WHL_CORRECTIONS_PATH = lib.OUTPUT_DIR / "whl_corrections.json"
 _whl_rows_cache: list | None = None
 _whl_rows_lock = threading.Lock()
 
-_WHL_EDIT_FIELDS = ("title", "authors", "year")
+# The catalogue export lacks subtitle/description (they exist on the WHL
+# website); those columns start empty here and are filled via corrections.
+_WHL_EDIT_FIELDS = ("title", "subtitle", "authors", "year", "categories",
+                    "description")
 
 
 def _load_whl_base() -> list[dict]:
@@ -581,10 +584,14 @@ def _load_whl_base() -> list[dict]:
                         rows.append({
                             "idx": i,
                             "title": (raw.get("Title") or "").strip(),
+                            "subtitle": "",
                             "authors": (raw.get("Authors") or "").strip(),
                             "year": whl_client._year(raw.get("Year Published")) or "",
+                            "categories": (raw.get("Library Categories") or "").strip(),
+                            "description": "",
                             "status": (raw.get("Status") or "").strip().lower(),
                             "permalink": (raw.get("Permalink") or "").strip(),
+                            "file": (raw.get("Publication File") or "").strip(),
                         })
             _whl_rows_cache = rows
         return _whl_rows_cache
@@ -606,12 +613,10 @@ def _merged_whl_rows() -> list[dict]:
             base[i]["corrected"] = True
     added = []
     for j, a in enumerate(corr.get("added") or []):
-        added.append({
-            "idx": -(j + 1),
-            "title": a.get("title", ""), "authors": a.get("authors", ""),
-            "year": a.get("year", ""), "status": "added",
-            "permalink": "", "added": True,
-        })
+        row = {f: a.get(f, "") for f in _WHL_EDIT_FIELDS}
+        row.update({"idx": -(j + 1), "status": "added", "permalink": "",
+                    "file": "", "added": True})
+        added.append(row)
     added.reverse()  # newest first
     return added + base
 
@@ -624,7 +629,8 @@ def api_whl_catalog():
 
 @app.route("/api/whl_catalog", methods=["POST"])
 def api_whl_catalog_edit():
-    """Record a correction ({idx, field, value}) or a new row ({add: {...}}).
+    """Record corrections: {idx, field, value}, {idx, fields: {..}} for a
+    multi-field repopulation, or {add: {...}} for a new row.
 
     The CSV export itself is never modified; changes live in
     output/whl_corrections.json so they are reviewable and revertible.
@@ -639,24 +645,31 @@ def api_whl_catalog_edit():
         corr.setdefault("added", []).append(row)
         lib.save_json(WHL_CORRECTIONS_PATH, corr)
         return jsonify({"ok": True, "idx": -len(corr["added"])})
-    field = str(payload.get("field", "") or "")
-    if field not in _WHL_EDIT_FIELDS:
-        abort(400)
+
+    if "fields" in payload:
+        fields = {f: str(v or "").strip() for f, v in (payload.get("fields") or {}).items()
+                  if f in _WHL_EDIT_FIELDS}
+        if not fields:
+            abort(400)
+    else:
+        field = str(payload.get("field", "") or "")
+        if field not in _WHL_EDIT_FIELDS:
+            abort(400)
+        fields = {field: str(payload.get("value", "") or "").strip()}
     try:
         idx = int(payload.get("idx"))
     except (TypeError, ValueError):
         abort(400)
-    value = str(payload.get("value", "") or "").strip()
     if idx >= 0:
         if idx >= len(_load_whl_base()):
             abort(404)
-        corr.setdefault("edits", {}).setdefault(str(idx), {})[field] = value
+        corr.setdefault("edits", {}).setdefault(str(idx), {}).update(fields)
     else:
         added = corr.get("added") or []
         j = -idx - 1
         if j >= len(added):
             abort(404)
-        added[j][field] = value
+        added[j].update(fields)
     lib.save_json(WHL_CORRECTIONS_PATH, corr)
     return jsonify({"ok": True})
 

@@ -160,9 +160,24 @@ The right side of the checked tab is two panes:
 
 - **Top pane** (dropdown): the working table with dedicated logic —
   `CHECKED BOOKS + MANUAL` (checks, scans, marks, verification, editing) or
-  `WHL CATALOG (EDITABLE)`, where title/authors/year cells are corrected in
-  place; corrections never touch `whl_catalog.csv` — they live in
+  `WHL CATALOG (EDITABLE)` with the full column set (title, subtitle,
+  authors, year, categories, description, status; subtitle/description start
+  empty — the export lacks them — and are filled via corrections).
+  Corrections never touch `whl_catalog.csv`; they live in
   `output/whl_corrections.json` (corrected/added rows are shaded and tagged).
+  The WHL view has two modes, toggled with **Ctrl+E**: in EDIT mode click a
+  cell to correct it, or Ctrl+click a row to load the whole record into the
+  left panel's `WHL EDIT` tab (the comfortable place for descriptions); in
+  SEARCH mode click a title to look it up on Open Library, then click a
+  result to repopulate the row's metadata — the cleanup workflow for
+  incomplete or mis-entered entries.
+- The FIND box understands `@token` (author, last name), `#token`
+  (publication year), and plain text (title words); the syntax drives the
+  top-table filters, the bottom tabs, and the realtime Open Library query.
+  The left panel is resizable by dragging the splitter. SETTINGS offers
+  themes (Classic 95/CAD, CDE/Solaris, AutoCAD dark, XP/Office 2003) that
+  restyle the palette without changing sizes. Note the COPYRIGHT tag reads
+  `NO` for public-domain works and `YES` for works under copyright.
 - **Bottom pane** (`SHOW SEARCH PANE`): a tabbed general-purpose viewer.
   `+` adds a tab; the active tab's dropdown selects its table (OPEN LIBRARY /
   CH CATALOG / WHL CATALOG). All tabs filter live from the FIND box (the

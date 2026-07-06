@@ -132,11 +132,19 @@ is decided by a tolerant composite rather than exact strings:
   local edition record). Provenance shading: auto light yellow, hand-typed
   light green; green fields constrain and are never overwritten.
 - Generalized panes: top pane dropdown = CHECKED BOOKS (full logic) or WHL
-  CATALOG (in-place corrections stored in `output/whl_corrections.json`,
-  never in the CSV). Bottom pane = tabbed viewer (+ adds tabs; per-tab table
-  dropdown: OL / CH / WHL), all filtered live from the FIND box; row hover
-  shows an all-fields tooltip; row click adds the record to the top-pane
-  table with column mapping.
+  CATALOG (full columns incl. subtitle/description; in-place corrections
+  stored in `output/whl_corrections.json`, never in the CSV). WHL modes via
+  Ctrl+E: EDIT (cell edits; Ctrl+click opens the full-record WHL EDIT tab in
+  the resizable left panel) and SEARCH (title click -> OL query; result
+  click repopulates the row). Bottom pane = tabbed viewer (+ adds tabs;
+  per-tab table dropdown: OL / CH / WHL), all filtered live from the FIND
+  box; row hover shows an all-fields tooltip; row click adds the record to
+  the top-pane table with column mapping.
+- FIND syntax: `@token` = author (last name), `#token` = publication year,
+  plain text = title words. COPYRIGHT tag semantics: NO = public domain,
+  YES = under copyright. All tags are one uniform width with verification
+  markers fused inside the tag. Themes (Classic 95/CAD, CDE/Solaris,
+  AutoCAD dark, XP/Office 2003) restyle colors only.
 - The project is a git repository; dumps, built indexes, API caches and
   downloaded PDFs are gitignored. MARK column: `SCAN` = not in
   WHL + public domain + no surviving scan online; `UPLD` = not in WHL + scan

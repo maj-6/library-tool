@@ -70,7 +70,7 @@
       <div id="checked-toolbar">
         <label class="tool-label" for="checked-search">FIND</label>
         <input id="checked-search" class="cad-input" type="text"
-               placeholder="filter checked books + catalog..." autocomplete="off" />
+               placeholder="title words... @author #year" autocomplete="off" />
         <label class="tool-label" for="mark-filter">MARK</label>
         <select id="mark-filter" class="cad-input">
           <option value="ALL">ALL</option>
@@ -96,6 +96,7 @@
           <div class="pane-tabs">
             <button class="pane-tab active" data-ptab="pane-search" type="button">[ SEARCH ]</button>
             <button class="pane-tab" data-ptab="pane-entry" type="button">[ MANUAL ENTRY ]</button>
+            <button class="pane-tab" data-ptab="pane-whledit" type="button" id="whledit-tab" hidden>[ WHL EDIT ]</button>
           </div>
 
           <!-- constrained search of the local Open Library works index -->
@@ -211,7 +212,48 @@
             </div>
           </form>
           </div>
+
+          <!-- full-record editor for one WHL catalogue row (Ctrl+click in edit mode) -->
+          <div id="pane-whledit" class="pane-sub">
+            <p class="pane-note" id="whledit-note">CTRL+CLICK A WHL ROW (EDIT MODE)
+              TO LOAD IT HERE.</p>
+            <form id="whledit-form" autocomplete="off">
+              <div class="mf-grid">
+                <div class="mf-field mf-full">
+                  <label class="tool-label" for="w-title">TITLE</label>
+                  <input id="w-title" class="cad-input" />
+                </div>
+                <div class="mf-field mf-full">
+                  <label class="tool-label" for="w-subtitle">SUBTITLE</label>
+                  <input id="w-subtitle" class="cad-input" />
+                </div>
+                <div class="mf-field">
+                  <label class="tool-label" for="w-authors">AUTHORS</label>
+                  <input id="w-authors" class="cad-input" />
+                </div>
+                <div class="mf-field">
+                  <label class="tool-label" for="w-year">YEAR</label>
+                  <input id="w-year" class="cad-input" />
+                </div>
+                <div class="mf-field mf-full">
+                  <label class="tool-label" for="w-categories">CATEGORIES</label>
+                  <input id="w-categories" class="cad-input" />
+                </div>
+                <div class="mf-field mf-full">
+                  <label class="tool-label" for="w-description">DESCRIPTION</label>
+                  <textarea id="w-description" class="cad-input" rows="8"></textarea>
+                </div>
+              </div>
+              <div class="mf-actions">
+                <button id="whledit-save" class="cad-btn" type="submit">SAVE CORRECTIONS</button>
+                <span class="tool-label" id="whledit-msg"></span>
+              </div>
+            </form>
+          </div>
         </div>
+
+        <!-- drag to resize the left panel -->
+        <div id="pane-splitter" data-tip="Drag to resize the left panel"></div>
 
         <div id="checked-right">
           <!-- TOP PANE: working table with dedicated per-table logic -->
@@ -221,6 +263,8 @@
               <option value="checked">CHECKED BOOKS + MANUAL</option>
               <option value="whl">WHL CATALOG (EDITABLE)</option>
             </select>
+            <button id="whl-mode" class="cad-btn tiny" type="button" hidden
+                    data-tip="Ctrl+E toggles between EDIT (click cells to correct; Ctrl+click a row for the full metadata tab) and SEARCH (click a title to look it up on Open Library; click a result to repopulate the row)"></button>
             <span class="tool-count" id="top-count"></span>
           </div>
 
@@ -230,8 +274,11 @@
                 <tr>
                   <th>SRC</th>
                   <th>TITLE</th>
+                  <th>SUBTITLE</th>
                   <th>AUTHORS</th>
                   <th>YEAR</th>
+                  <th>CATEGORIES</th>
+                  <th>DESCRIPTION</th>
                   <th>STATUS</th>
                 </tr>
               </thead>
@@ -348,6 +395,10 @@
         <button id="settings-close" type="button" aria-label="Close">&#10005;</button>
       </div>
       <div id="settings-body">
+        <div class="settings-section">
+          <div class="settings-head">THEME</div>
+          <div id="theme-options" class="settings-cols"></div>
+        </div>
         <div class="settings-section">
           <div class="settings-head">CHECKED BOOKS TABLE :: VISIBLE COLUMNS</div>
           <div id="cols-checked" class="settings-cols"></div>
