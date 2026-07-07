@@ -10,11 +10,11 @@
   <div id="titlebar">
     <span class="tb-name" id="tb-name">CATALOGS :: CATALOG EXPLORER</span>
     <span class="tb-right">
-      <span class="tb-meta" id="tb-meta">v2.2</span>
+      <span class="tb-meta" id="tb-meta">v2.3</span>
     </span>
   </div>
 
-  <!-- menu bar: common functions -->
+  <!-- menu bar -->
   <div id="menubar">
     <div class="menu">
       <button class="menu-btn" type="button">FILE</button>
@@ -52,50 +52,38 @@
     </div>
   </div>
 
-  <!-- application toolbar: undo/redo + the active tab's commands -->
-  <div id="apptoolbar">
+  <!-- tab strip with the action icons inline, right side -->
+  <div id="tabs">
+    <button class="tab active" data-tab="checked">CATALOGS</button>
+    <button class="tab" data-tab="upload">EDITOR</button>
+    <span class="tb-spacer"></span>
     <div class="tb-group">
       <button id="undo-btn" class="tool-btn icon-btn" type="button" disabled
               data-icon="undo" data-tip="Undo (Ctrl+Z)"></button>
       <button id="redo-btn" class="tool-btn icon-btn" type="button" disabled
               data-icon="redo" data-tip="Redo (Ctrl+Y)"></button>
     </div>
-    <span class="tb-sep"></span>
-    <div class="tb-group" id="tg-checked">
-      <button id="run-scans" class="tool-btn" type="button"
-              data-tip="Queue checks + scans for every row that has none yet">RUN SCANS</button>
-      <button id="whl-scrape" class="tool-btn" type="button"
-              data-tip="Fetch complete metadata (publisher, print length, subtitle, description, language, subject) from the WHL website for every published entry. Drafts have no public page and are skipped.">SCRAPE WHL</button>
-      <span class="tb-sep"></span>
-      <button id="show-catalog" class="tool-btn toggle" type="button"
-              data-tip="Toggle the bottom search pane (Open Library / CH / WHL tables)">SEARCH PANE</button>
-    </div>
     <div class="tb-group" id="tg-upload" hidden>
-      <button id="build-new" class="tool-btn" type="button"
-              data-tip="Start a blank catalog entry">NEW ENTRY</button>
-      <button id="export-builds" class="tool-btn" type="button"
-              data-tip="Download all prepared entries as JSON (the submission package)">EXPORT BUILDS</button>
-      <button id="download-upload-list" class="tool-btn" type="button"
-              data-tip="Download the approved-sources list as JSON">DOWNLOAD SOURCES</button>
+      <span class="tb-sep"></span>
+      <button id="build-new" class="tool-btn icon-btn" type="button"
+              data-icon="plus" data-tip="New entry"></button>
+      <button id="export-builds" class="tool-btn icon-btn" type="button"
+              data-icon="export" data-tip="Export builds (JSON)"></button>
+      <button id="download-upload-list" class="tool-btn icon-btn" type="button"
+              data-icon="download" data-tip="Download sources list (JSON)"></button>
     </div>
-    <span class="tb-spacer"></span>
+    <span class="tb-sep"></span>
     <div class="tb-group">
       <button id="open-settings" class="tool-btn icon-btn" type="button"
               data-icon="gear" data-tip="Settings"></button>
     </div>
   </div>
 
-  <div id="tabs">
-    <button class="tab active" data-tab="checked">CATALOGS</button>
-    <button class="tab" data-tab="upload">EDITOR</button>
-  </div>
-
   <main>
-    <!-- CATALOGS: working tables + manual entry + search panes -->
+    <!-- CATALOGS -->
     <section id="checked" class="panel-view active">
       <div id="checked-toolbar">
-        <span class="icon-label" id="find-icon" data-icon="search"
-              data-tip="FIND: [title] words, @author, #year"></span>
+        <span class="icon-label" id="find-icon" data-icon="search"></span>
         <input id="checked-search" class="cad-input" type="text"
                placeholder="[title] @author #year" autocomplete="off" />
         <span class="tool-count" id="checked-count"></span>
@@ -109,7 +97,6 @@
             <button class="pane-tab" data-ptab="pane-edit" type="button" id="whledit-tab" hidden>EDIT</button>
           </div>
 
-          <!-- constrained search of the local Open Library index -->
           <div id="pane-search" class="pane-sub active">
             <form id="ol-form" autocomplete="off">
               <div class="mf-grid">
@@ -149,7 +136,6 @@
             </form>
           </div>
 
-          <!-- manual entry form -->
           <div id="pane-entry" class="pane-sub">
           <form id="manual-form" autocomplete="off">
             <div class="mf-grid">
@@ -208,7 +194,7 @@
               </div>
               <div class="mf-field mf-full">
                 <label class="tool-label" for="m-notes">NOTES</label>
-                <textarea id="m-notes" class="cad-input" name="notes" rows="2"></textarea>
+                <textarea id="m-notes" class="cad-input" name="notes" rows="4"></textarea>
               </div>
             </div>
             <div class="mf-actions">
@@ -218,9 +204,7 @@
           </form>
           </div>
 
-          <!-- record editor: opened with Ctrl+click from any table. It shows
-               the WHL field set for WHL rows and the book field set for
-               checked / manual / CH-catalog records. -->
+          <!-- record editor (Ctrl+click a row in any table) -->
           <div id="pane-edit" class="pane-sub">
             <p class="pane-note" id="whledit-note"></p>
 
@@ -265,9 +249,9 @@
                 <div class="mf-field mf-full">
                   <label class="tool-label" for="w-description">DESCRIPTION
                     <button id="w-desc-md" class="cad-btn tiny md-btn" type="button"
-                            data-tip="Open the Markdown editor">&#9998;</button>
+                            data-tip="Markdown editor">&#9998;</button>
                   </label>
-                  <textarea id="w-description" class="cad-input" rows="8"></textarea>
+                  <textarea id="w-description" class="cad-input" rows="12"></textarea>
                 </div>
               </div>
               <div class="mf-actions">
@@ -336,7 +320,7 @@
                 </div>
                 <div class="mf-field mf-full">
                   <label class="tool-label" for="e-notes">NOTES</label>
-                  <textarea id="e-notes" class="cad-input" rows="2"></textarea>
+                  <textarea id="e-notes" class="cad-input" rows="5"></textarea>
                 </div>
               </div>
               <div class="mf-actions">
@@ -347,11 +331,9 @@
           </div>
         </div>
 
-        <!-- drag to resize the left panel -->
-        <div id="pane-splitter" data-tip="Drag to resize the left panel"></div>
+        <div id="pane-splitter"></div>
 
         <div id="checked-right">
-          <!-- TOP PANE: working table with dedicated per-table logic -->
           <div class="pane-bar">
             <label class="tool-label" for="top-table">TABLE</label>
             <select id="top-table" class="cad-input">
@@ -359,13 +341,15 @@
               <option value="whl">WHL</option>
             </select>
             <button id="whl-mode" class="cad-btn tiny" type="button" hidden
-                    data-tip="Ctrl+E toggles between EDIT (click cells to correct; Ctrl+click a row for the full metadata tab) and SEARCH (click a title to look it up on Open Library; click a result to repopulate the row)"></button>
-            <span id="whl-cons" class="tool-label whl-cons" hidden
-                  data-tip="Which of the clicked row's columns constrain the Open Library search. TITLE= requires the title to appear verbatim (as a phrase).">
-              CONSTRAIN:
-              <label><input type="checkbox" id="wc-title" /> TITLE=</label>
-              <label><input type="checkbox" id="wc-authors" /> AUTHOR</label>
-              <label><input type="checkbox" id="wc-year" /> YEAR</label>
+                    data-tip="Ctrl+E toggles EDIT / SEARCH mode"></button>
+            <span id="whl-cons" class="whl-cons" hidden
+                  data-tip="Columns constraining the Open Library search (TITLE = verbatim phrase)">
+              <span class="icon-label" data-icon="target"></span>
+              <span class="cons-group">
+                <label><input type="checkbox" id="wc-title" /> TITLE</label>
+                <label><input type="checkbox" id="wc-authors" /> AUTHOR</label>
+                <label><input type="checkbox" id="wc-year" /> YEAR</label>
+              </span>
             </span>
             <span class="bar-spacer"></span>
             <button id="export-json" class="cad-btn tiny" type="button"
@@ -375,7 +359,7 @@
             <button id="filter-btn" class="cad-btn tiny icon-btn" type="button"
                     data-icon="filter" data-tip="Filter rows"></button>
             <button id="colvis-top" class="cad-btn tiny icon-btn" type="button"
-                    data-icon="columns" data-tip="Choose visible columns"></button>
+                    data-icon="columns" data-tip="Visible columns"></button>
             <span class="tool-count" id="top-count"></span>
           </div>
 
@@ -434,15 +418,13 @@
             <p id="checked-empty" class="empty">NO BOOKS CHECKED</p>
           </div>
 
-          <!-- BOTTOM PANE: general-purpose tabbed viewer/adder -->
           <div id="bottom-pane" hidden>
             <div class="pane-bar" id="bottom-tabbar">
               <div id="bottom-tabs"></div>
-              <button id="bottom-addtab" class="cad-btn tiny"
-                      data-tip="Add a viewer tab">+</button>
+              <button id="bottom-addtab" class="cad-btn tiny" data-tip="Add a viewer tab">+</button>
               <span class="bar-spacer"></span>
               <button id="colvis-bottom" class="cad-btn tiny icon-btn" type="button"
-                      data-icon="columns" data-tip="Choose visible columns"></button>
+                      data-icon="columns" data-tip="Visible columns"></button>
               <span class="tool-count" id="bottom-count"></span>
             </div>
             <div class="drafting" id="bottom-body">
@@ -457,12 +439,11 @@
       </div>
     </section>
 
-    <!-- EDITOR: the book builder + approved sources feeding it -->
+    <!-- EDITOR -->
     <section id="upload" class="panel-view">
       <div id="upload-split">
-        <!-- entries being prepared for submission -->
         <div id="builds-pane">
-          <div class="pane-bar"><span class="tool-label">ENTRIES IN PREPARATION</span>
+          <div class="pane-bar"><span class="tool-label">PENDING</span>
             <span class="tool-count" id="upload-count"></span></div>
           <div class="drafting" id="builds-list-wrap">
             <ul id="builds-list"></ul>
@@ -470,16 +451,16 @@
           </div>
         </div>
 
-        <!-- editor for the selected build -->
         <div id="build-editor" hidden>
           <div class="mf-actions build-actions">
             <button id="build-save" class="cad-btn icon-btn" type="button"
-                    data-icon="save" data-tip="Save this entry"></button>
-            <label class="tool-label chk-label">
-              <input id="b-ready" type="checkbox" /> VERIFIED
-            </label>
+                    data-icon="save" data-tip="Save"></button>
             <button id="build-delete" class="cad-btn icon-btn danger" type="button"
-                    data-icon="trash" data-tip="Delete this entry"></button>
+                    data-icon="trash" data-tip="Delete"></button>
+            <span class="act-sep"></span>
+            <button id="b-ready" class="cad-btn icon-btn toggle" type="button"
+                    data-icon="check" data-tip="Mark verified"></button>
+            <span id="b-verified-tag" class="foot-tag tag-verified" hidden>VERIFIED</span>
             <span class="tool-label" id="build-msg"></span>
           </div>
           <div class="pane-tabs" id="build-tabs">
@@ -487,7 +468,6 @@
             <button class="pane-tab" data-btab="btab-source" type="button">SOURCE (PDF)</button>
           </div>
 
-          <!-- fields on the left, live Markdown description on the right -->
           <div id="btab-entry" class="pane-sub active">
             <div id="build-entry-split">
               <form id="build-form" autocomplete="off">
@@ -546,27 +526,25 @@
                   </div>
                   <div class="mf-field mf-full">
                     <label class="tool-label" for="b-notes">NOTES (INTERNAL)</label>
-                    <textarea id="b-notes" class="cad-input" rows="6"></textarea>
+                    <textarea id="b-notes" class="cad-input" rows="8"></textarea>
                   </div>
                 </div>
               </form>
               <div id="build-desc-col">
-                <label class="tool-label">DESCRIPTION (MARKDOWN &mdash; rendered as you type)</label>
+                <label class="tool-label">DESCRIPTION</label>
                 <div id="b-desc-editor"></div>
               </div>
             </div>
           </div>
 
-          <!-- PDF source verification + local file attachment -->
           <div id="btab-source" class="pane-sub">
             <div class="src-row">
-              <label class="tool-label" for="b-pdf_file">LOCAL PDF FILE</label>
-              <input id="b-pdf_file" class="cad-input"
-                     placeholder="downloads/ia/&lt;identifier&gt;.pdf or an absolute path" />
+              <label class="tool-label" for="b-pdf_file">PATH TO PDF</label>
+              <input id="b-pdf_file" class="cad-input" spellcheck="false" />
               <button id="b-pdf-browse" class="cad-btn icon-btn" type="button"
-                      data-icon="folder" data-tip="Pick a PDF from a local directory"></button>
+                      data-icon="folder" data-tip="Browse"></button>
               <button id="b-pdf-attach" class="cad-btn icon-btn" type="button"
-                      data-icon="attach" data-tip="Save this local PDF path on the entry"></button>
+                      data-icon="attach" data-tip="Attach"></button>
               <span class="tool-label" id="b-src-msg"></span>
             </div>
             <div id="b-pdf-viewer"></div>
@@ -574,15 +552,13 @@
         </div>
       </div>
 
-      <!-- drag to resize the approved-sources pane -->
-      <div id="upload-splitter" data-tip="Drag to resize the approved-sources pane"></div>
+      <div id="upload-splitter"></div>
 
-      <!-- verified sources feeding the builder -->
       <div id="upload-sources-pane">
-        <div class="pane-bar"><span class="tool-label">APPROVED SOURCES</span>
+        <div class="pane-bar"><span class="tool-label">VERIFIED SOURCES</span>
           <span class="bar-spacer"></span>
           <button id="colvis-upload" class="cad-btn tiny icon-btn" type="button"
-                  data-icon="columns" data-tip="Choose visible columns"></button>
+                  data-icon="columns" data-tip="Visible columns"></button>
           <span class="tool-count" id="sources-count"></span></div>
         <div class="drafting" id="upload-sources">
           <table class="grid" id="upload-table">
@@ -600,7 +576,7 @@
             </thead>
             <tbody id="upload-rows"></tbody>
           </table>
-          <p id="upload-empty" class="empty">NO APPROVED SOURCES</p>
+          <p id="upload-empty" class="empty">NO VERIFIED SOURCES</p>
         </div>
       </div>
     </section>
@@ -609,30 +585,40 @@
   <div id="cad-tooltip" hidden></div>
   <div id="popup-menu" hidden></div>
 
-  <!-- MARKDOWN EDITOR WINDOW (for the WHL description pencil) -->
-  <div id="md-overlay" hidden>
-    <div id="md-window">
-      <div id="md-titlebar">
+  <!-- MARKDOWN EDITOR WINDOW -->
+  <div id="md-overlay" class="overlay" hidden>
+    <div id="md-window" class="win">
+      <div id="md-titlebar" class="win-titlebar">
         <span id="md-title">MARKDOWN EDITOR</span>
-        <button id="md-close" type="button" aria-label="Close">&#10005;</button>
+        <button id="md-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
       </div>
       <div id="md-body">
         <div id="md-live-overlay"></div>
         <div class="mf-actions">
           <button id="md-apply" class="cad-btn" type="button">APPLY</button>
           <button id="md-cancel" class="cad-btn" type="button">CANCEL</button>
-          <span class="tool-label">Markdown renders in place as you type; the line under the caret shows its source.</span>
         </div>
       </div>
     </div>
   </div>
 
-  <!-- FILE BROWSER WINDOW (pick a local PDF) -->
-  <div id="fb-overlay" hidden>
-    <div id="fb-window">
-      <div id="fb-titlebar">
+  <!-- PDF VIEWER WINDOW (WHL publications) -->
+  <div id="pdfm-overlay" class="overlay" hidden>
+    <div id="pdfm-window" class="win">
+      <div id="pdfm-titlebar" class="win-titlebar">
+        <span id="pdfm-title">PUBLICATION</span>
+        <button id="pdfm-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
+      </div>
+      <div id="pdfm-body"></div>
+    </div>
+  </div>
+
+  <!-- FILE BROWSER WINDOW -->
+  <div id="fb-overlay" class="overlay" hidden>
+    <div id="fb-window" class="win">
+      <div id="fb-titlebar" class="win-titlebar">
         <span>SELECT A PDF FILE</span>
-        <button id="fb-close" type="button" aria-label="Close">&#10005;</button>
+        <button id="fb-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
       </div>
       <div id="fb-body">
         <div class="fb-path-row">
@@ -646,16 +632,16 @@
   </div>
 
   <!-- MANUALLY LOCATED SOURCE WINDOW -->
-  <div id="msrc-overlay" hidden>
-    <div id="msrc-window">
-      <div id="msrc-titlebar">
+  <div id="msrc-overlay" class="overlay" hidden>
+    <div id="msrc-window" class="win">
+      <div id="msrc-titlebar" class="win-titlebar">
         <span>MANUALLY LOCATED SOURCE</span>
-        <button id="msrc-close" type="button" aria-label="Close">&#10005;</button>
+        <button id="msrc-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
       </div>
       <div id="msrc-body">
         <p class="pane-note" id="msrc-label"></p>
         <input id="msrc-url" class="cad-input" type="text"
-               placeholder="paste the URL of the correct record (https://...)" />
+               placeholder="https://..." />
         <div class="mf-actions">
           <button id="msrc-save" class="cad-btn" type="button">SAVE</button>
           <button id="msrc-clear" class="cad-btn danger" type="button">CLEAR</button>
@@ -665,12 +651,12 @@
     </div>
   </div>
 
-  <!-- SETTINGS WINDOW: category sidebar + content -->
-  <div id="settings-overlay" hidden>
-    <div id="settings-window">
-      <div id="settings-titlebar">
+  <!-- SETTINGS WINDOW -->
+  <div id="settings-overlay" class="overlay" hidden>
+    <div id="settings-window" class="win">
+      <div id="settings-titlebar" class="win-titlebar">
         <span>SETTINGS</span>
-        <button id="settings-close" type="button" aria-label="Close">&#10005;</button>
+        <button id="settings-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
       </div>
       <div id="settings-body">
         <div id="settings-nav">
@@ -683,9 +669,12 @@
           <div id="sec-general" class="settings-sec active">
             <div class="settings-head">GENERAL</div>
             <p class="settings-note" id="gen-info"></p>
+            <div class="settings-rows">
+              <label class="tool-label" for="set-whl-ocr">OCR PANEL IN WHL PDF VIEWER</label>
+              <input id="set-whl-ocr" type="checkbox" />
+            </div>
             <div class="mf-actions">
-              <button id="reset-settings" class="cad-btn danger" type="button"
-                      data-tip="Reset every interface setting (theme, fonts, filters, column layout). Catalog data is not touched.">RESTORE DEFAULT SETTINGS</button>
+              <button id="reset-settings" class="cad-btn danger" type="button">RESTORE DEFAULT SETTINGS</button>
             </div>
           </div>
           <div id="sec-appearance" class="settings-sec">
@@ -701,9 +690,10 @@
           </div>
           <div id="sec-tables" class="settings-sec">
             <div class="settings-head">TABLE VIEW</div>
-            <p class="settings-note">Column visibility can also be changed from the
-              column icon above each table. Drag a column header's right edge to
-              resize it.</p>
+            <div class="settings-rows">
+              <label class="tool-label" for="set-max-rows">MAX DISPLAYED ROWS</label>
+              <input id="set-max-rows" class="cad-input" type="number" min="50" max="5000" step="50" />
+            </div>
             <div class="settings-subhead">CHECKED BOOKS TABLE :: VISIBLE COLUMNS</div>
             <div id="cols-checked" class="settings-cols"></div>
             <div class="mf-actions">
@@ -716,13 +706,6 @@
               <label class="tool-label" for="set-browse-dir">PDF BROWSER START FOLDER</label>
               <input id="set-browse-dir" class="cad-input" spellcheck="false" />
             </div>
-            <p class="settings-note">
-              IA downloads are saved to <code>downloads/ia/</code> with their catalog
-              in <code>downloads/ia/catalog.json</code>. Manual entries live in
-              <code>output/manual_entries.json</code>, WHL corrections in
-              <code>output/whl_corrections.json</code>, and submission entries in
-              <code>output/whl_builds.json</code>.
-            </p>
           </div>
         </div>
       </div>

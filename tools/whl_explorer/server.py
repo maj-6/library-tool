@@ -192,6 +192,68 @@ def api_pdf():
     return send_file(p, mimetype="application/pdf", conditional=True)
 
 
+_PDF_TEXT_CACHE: dict = {}
+
+
+@app.route("/api/pdf/text")
+def api_pdf_text():
+    """Extract the text (OCR) layer of a PDF — a local path, or a remote URL
+    that is fetched once into downloads/cache/."""
+    raw_path = (request.args.get("path") or "").strip()
+    url = (request.args.get("url") or "").strip()
+    try:
+        max_pages = max(1, min(500, int(request.args.get("pages") or 100)))
+    except ValueError:
+        max_pages = 100
+    if raw_path:
+        p = _resolve_local(raw_path)
+        if p is None or not p.is_file():
+            abort(404)
+    elif url:
+        if not url.lower().startswith(("http://", "https://")):
+            abort(400)
+        import hashlib
+        cache_dir = lib.ROOT / "downloads" / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        p = cache_dir / (hashlib.sha1(url.encode("utf-8")).hexdigest()[:16] + ".pdf")
+        if not p.exists():
+            try:
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": whl_client.USER_AGENT})
+                with urllib.request.urlopen(req, timeout=90) as resp, \
+                        open(p, "wb") as fh:
+                    import shutil
+                    shutil.copyfileobj(resp, fh)
+            except Exception as exc:
+                p.unlink(missing_ok=True)
+                return jsonify({"ok": False,
+                                "error": f"fetch failed: {exc}"})
+    else:
+        abort(400)
+    key = (str(p), p.stat().st_mtime, max_pages)
+    if key in _PDF_TEXT_CACHE:
+        return jsonify(_PDF_TEXT_CACHE[key])
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return jsonify({"ok": False,
+                        "error": "pypdf is not installed "
+                                 "(python3 -m pip install pypdf)"})
+    try:
+        reader = PdfReader(str(p))
+        total = len(reader.pages)
+        parts = []
+        for i in range(min(total, max_pages)):
+            text = (reader.pages[i].extract_text() or "").strip()
+            parts.append(f"--- page {i + 1} ---\n{text}")
+        out = {"ok": True, "pages": total, "shown": min(total, max_pages),
+               "text": "\n\n".join(parts)}
+    except Exception as exc:
+        out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    _PDF_TEXT_CACHE[key] = out
+    return jsonify(out)
+
+
 @app.route("/api/pdf/browse")
 def api_pdf_browse():
     """List a directory's subdirectories and PDF files (the file picker)."""
@@ -644,10 +706,15 @@ def _merged_whl_rows() -> list[dict]:
         except ValueError:
             continue
         if 0 <= i < len(base):
+            # Keep the pre-correction values: the client shows the original
+            # record while Alt is held over an edited row.
+            orig = {}
             for f in _WHL_EDIT_FIELDS:
                 if f in edits:
+                    orig[f] = base[i].get(f, "")
                     base[i][f] = edits[f]
             base[i]["corrected"] = True
+            base[i]["orig"] = orig
             # Which fields carry corrections — undo needs to know whether to
             # restore a previous correction or clear back to the CSV value.
             base[i]["edited_fields"] = [f for f in _WHL_EDIT_FIELDS if f in edits]

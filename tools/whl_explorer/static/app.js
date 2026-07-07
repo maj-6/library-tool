@@ -23,7 +23,6 @@
  * All mutating actions are undoable (see the history section).
  */
 
-const CHPANE_RENDER = 300;
 const LS_KEY = "whl_cad_checked_v1";
 const SETTINGS_KEY = "whl_cad_settings_v1";
 
@@ -86,11 +85,15 @@ const state = {
     topTable: "checked", bottomTabs: ["ol", "ch"], bottomActive: 0,
     whlMode: "edit", paneWidth: null, theme: "", font: "", fontUi: "",
     uploadSplitH: null, pdfBrowseDir: "",
+    maxRows: 400,               // row cap for the big table views
+    whlModalOcr: false,         // OCR panel in the WHL publication viewer
     colVis: {},                 // per-table column visibility
     colWidths: {},              // per-table column widths (px)
     whlCons: { title: false, authors: false, year: true },
   },
   editTarget: null,             // record open in the EDIT tab
+  sort: { checked: null, whl: null },  // {key, dir} per top table
+  olColMarks: {},               // OL column -> "copy" | "exclude" (repopulation)
 };
 
 // --- appearance: themes are full chrome redesigns; fonts are user-selectable --
@@ -98,19 +101,29 @@ const state = {
 const THEMES = [
   ["", "CLASSIC CAD"],
   ["ledger", "ARCHIVE LEDGER"],
-  ["workstation", "WORKSTATION 2000"],
-  ["slate", "SLATE STUDIO"],
   ["platinum", "PLATINUM"],
   ["blueprint", "BLUEPRINT"],
-  ["mainframe", "MAINFRAME TERMINAL"],
   ["modern", "MODERN LIGHT"],
-  ["graphite", "GRAPHITE DARK"],
+  ["dark", "MODERN DARK"],
+  ["stone", "STONE"],
 ];
-const LEGACY_THEMES = { cde: "ledger", xp2003: "workstation", acad: "slate" };
+const LEGACY_THEMES = {
+  cde: "ledger", xp2003: "", acad: "dark",
+  workstation: "", slate: "dark", mainframe: "dark", graphite: "dark",
+};
 
-// Data/table font (--mono): tables, inputs, the markdown editor, tooltips.
-const FONTS = [
-  ["", "CONSOLAS (DEFAULT)"],
+// One shared font list; the interface (--ui) and data/table (--mono) fonts
+// are chosen independently from it.
+const FONT_CHOICES = [
+  ["", "DEFAULT"],
+  ['"Segoe UI", Tahoma, sans-serif', "SEGOE UI"],
+  ['Tahoma, "Segoe UI", sans-serif', "TAHOMA"],
+  ['Verdana, Geneva, sans-serif', "VERDANA"],
+  ['Arial, Helvetica, sans-serif', "ARIAL"],
+  ['"Trebuchet MS", Tahoma, sans-serif', "TREBUCHET MS"],
+  ['Calibri, "Segoe UI", sans-serif', "CALIBRI"],
+  ['Georgia, "Times New Roman", serif', "GEORGIA"],
+  ['"Consolas", "Courier New", monospace', "CONSOLAS"],
   ['"Courier New", Courier, monospace', "COURIER NEW"],
   ['"Lucida Console", Monaco, monospace', "LUCIDA CONSOLE"],
   ['"Cascadia Mono", Consolas, monospace', "CASCADIA MONO"],
@@ -119,26 +132,48 @@ const FONTS = [
   ['"JetBrains Mono", Consolas, monospace', "JETBRAINS MONO"],
   ['"Source Code Pro", Consolas, monospace', "SOURCE CODE PRO"],
   ['"Fira Code", Consolas, monospace', "FIRA CODE"],
-  ['Georgia, "Times New Roman", serif', "GEORGIA (SERIF)"],
 ];
 
-// Interface font (--ui): labels, buttons, menus, tabs, window chrome.
-// A monospace face is a legitimate choice here too.
-const UI_FONTS = [
-  ["", "SEGOE UI (DEFAULT)"],
-  ['Tahoma, "Segoe UI", sans-serif', "TAHOMA"],
-  ['Verdana, Geneva, sans-serif', "VERDANA"],
-  ['Arial, Helvetica, sans-serif', "ARIAL"],
-  ['"Trebuchet MS", Tahoma, sans-serif', "TREBUCHET MS"],
-  ['Calibri, "Segoe UI", sans-serif', "CALIBRI"],
-  ['"Consolas", "Courier New", monospace', "CONSOLAS (MONO)"],
-  ['"Cascadia Mono", Consolas, monospace', "CASCADIA MONO"],
-  ['"IBM Plex Mono", Consolas, monospace', "IBM PLEX MONO"],
-];
+// --- text normalization for Open Library fills ----------------------------------
+
+const TC_SMALL = new Set(["a", "an", "and", "as", "at", "but", "by", "for",
+  "from", "in", "into", "nor", "of", "on", "or", "the", "to", "with", "upon",
+  "de", "la", "le", "du", "des", "et", "von", "van", "der"]);
+
+// conventional title case; words that already carry interior capitals
+// (acronyms, McNames, Roman numerals) and digit-leading words (2nd, 4to)
+// are left alone
+function titleCase(s) {
+  s = String(s || "").trim();
+  if (!s) return s;
+  const words = s.split(/\s+/);
+  return words.map((w, i) => {
+    if (/[A-Z]/.test(w.slice(1))) return w;
+    if (/^["'([]*[0-9]/.test(w)) return w;
+    const core = w.toLowerCase().replace(/[^a-z']/g, "");
+    if (i !== 0 && i !== words.length - 1 && TC_SMALL.has(core))
+      return w.toLowerCase();
+    return w.toLowerCase().replace(/^([^a-z]*)([a-z])/,
+      (m, pre, c) => pre + c.toUpperCase());
+  }).join(" ");
+}
+
+// "Last, First" -> "First Last" (per author; credential tails left alone)
+function flipName(name) {
+  return String(name || "").split(";").map((part) => {
+    const p = part.trim();
+    if (!p) return "";
+    const m = p.match(/^([^,]+),\s*([^,]+)$/);
+    if (!m) return p;
+    const tail = m[2].trim();
+    if (/^(jr|sr|esq|md|m\.\s?d|phd|ph\.\s?d|[ivx]+)\.?$/i.test(tail)) return p;
+    return `${tail} ${m[1].trim()}`;
+  }).filter(Boolean).join("; ");
+}
 
 function applyTheme() {
   let t = state.settings.theme || "";
-  if (LEGACY_THEMES[t]) {
+  if (t in LEGACY_THEMES) {
     t = LEGACY_THEMES[t];
     state.settings.theme = t;
     saveSettings();
@@ -185,6 +220,11 @@ const ICONS = {
   folder: _SVG('<path d="M2 4 h4.4 l1.4 1.8 H14 v7 H2 Z"/>'),
   attach: _SVG('<path d="M11.5 4.6 L6.4 9.7 a1.8 1.8 0 0 0 2.6 2.6 L13.4 7.9 a3.3 3.3 0 0 0-4.6-4.6 L4.2 7.8"/>'),
   docplus: _SVG('<path d="M3.5 2 h6 l3 3 v9 h-9 Z"/><path d="M9.5 2 v3 h3"/><path d="M8 7.5 v4 M6 9.5 h4"/>'),
+  plus: _SVG('<path d="M8 2.5 v11 M2.5 8 h11"/>'),
+  export: _SVG('<path d="M8 10 V2.5 M4.8 5.5 L8 2.3 L11.2 5.5"/><path d="M3 9.5 v4 h10 v-4"/>'),
+  check: _SVG('<path d="M2.8 8.6 L6.4 12 L13.2 4"/>'),
+  target: _SVG('<circle cx="8" cy="8" r="4.4"/><path d="M8 1.5 v3 M8 11.5 v3 M1.5 8 h3 M11.5 8 h3"/>'),
+  text: _SVG('<path d="M2.5 3.5 h11 M2.5 6.5 h11 M2.5 9.5 h8 M2.5 12.5 h10"/>'),
 };
 
 function injectIcons() {
@@ -298,14 +338,18 @@ function loadSettings() {
   }
   state.settings.srcFilter = state.settings.srcFilter || "ALL";
   state.settings.dlFilter = state.settings.dlFilter || "ALL";
-  // v2.1 had a single font applied to the whole UI; the sans faces moved to
-  // the interface-font list, so migrate a saved sans value there
+  // v2.1 had a single font applied to the whole UI; migrate a saved sans
+  // value to the interface font
   const f = state.settings.font || "";
   if (/^(Tahoma|Verdana)/.test(f) && !state.settings.fontUi) {
     state.settings.fontUi = f;
     state.settings.font = "";
   }
+  state.settings.maxRows =
+    Math.max(50, Math.min(5000, parseInt(state.settings.maxRows, 10) || 400));
 }
+
+function maxRows() { return state.settings.maxRows || 400; }
 
 // --- tabs + header -----------------------------------------------------------
 
@@ -315,8 +359,7 @@ function setHeader(tabId) {
   const name = `${TAB_TITLES[tabId] || ""} :: CATALOG EXPLORER`;
   el("tb-name").textContent = name;
   document.title = name;
-  // the application toolbar shows the active tab's command group
-  el("tg-checked").hidden = tabId !== "checked";
+  // the tab strip shows the active tab's command icons
   el("tg-upload").hidden = tabId !== "upload";
 }
 
@@ -460,10 +503,90 @@ function initColResize() {
         state.settings.colWidths[drag.key] || {};
       state.settings.colWidths[drag.key][colKey] = w;
       saveSettings();
+      // the browser will still synthesize a click on the header — don't
+      // let a resize end as a sort
+      sortSuppress = true;
+      setTimeout(() => { sortSuppress = false; }, 0);
     }
     document.body.classList.remove("resizing");
     drag = null;
   });
+}
+
+let sortSuppress = false;
+
+// --- column sorting (checked + WHL top tables) -----------------------------------
+
+function sortRowsBy(rows, getVal, dir) {
+  return rows.slice().sort((x, y) => {
+    const a = String(getVal(x) == null ? "" : getVal(x)).trim();
+    const b = String(getVal(y) == null ? "" : getVal(y)).trim();
+    if (!a && !b) return 0;
+    if (!a) return 1;   // empties last regardless of direction
+    if (!b) return -1;
+    // numbers sort together (before text) so the comparator stays transitive
+    const aNum = !isNaN(Number(a)), bNum = !isNaN(Number(b));
+    if (aNum && bNum) return (Number(a) - Number(b)) * dir;
+    if (aNum !== bNum) return (aNum ? -1 : 1) * dir;
+    return a.localeCompare(b, undefined, { sensitivity: "base" }) * dir;
+  });
+}
+
+function scanSortVal(row, src) {
+  const v = effScan(row, src);
+  return v === true ? "yes" : v === false ? "no" : "";
+}
+
+function checkedSortVal(row, key) {
+  switch (key) {
+    case "src": return row.kind === "manual" ? "manual" : row.source;
+    case "copyright": return (row.checks && row.checks.copyright_status) || "";
+    case "whl": return (row.checks && row.checks.in_whl) || "";
+    case "ia": return scanSortVal(row, "internet_archive");
+    case "ht": return scanSortVal(row, "hathitrust");
+    case "mark": return rowMarkState(row);
+    default: return row.book[key];
+  }
+}
+
+function whlSortVal(r, key) {
+  switch (key) {
+    case "src": return r.added ? "added" : r.corrected ? "edited" : r.scraped ? "web" : "csv";
+    case "lang": return r.language || "";
+    default: return r[key] || "";
+  }
+}
+
+function markSortHeaders(tkey) {
+  const def = tableDef(tkey);
+  const so = state.sort[tkey];
+  [...el(def.tableId).querySelectorAll("thead th")].forEach((th, i) => {
+    const key = def.cols[i] ? def.cols[i][0] : null;
+    if (so && key === so.key) th.dataset.sorted = so.dir > 0 ? "asc" : "desc";
+    else delete th.dataset.sorted;
+  });
+}
+
+function initSortHeaders() {
+  const wire = (tkey) => {
+    const def = tableDef(tkey);
+    el(def.tableId).querySelector("thead").addEventListener("click", (ev) => {
+      if (sortSuppress || ev.target.closest(".col-rz")) return;
+      const th = ev.target.closest("th");
+      if (!th) return;
+      const i = [...th.parentElement.children].indexOf(th);
+      const key = def.cols[i] ? def.cols[i][0] : null;
+      if (!key || key === "action") return;
+      const cur = state.sort[tkey];
+      state.sort[tkey] = cur && cur.key === key
+        ? { key, dir: -cur.dir }
+        : { key, dir: 1 };
+      if (tkey === "checked") renderChecked();
+      else renderWhlTop();
+    });
+  };
+  wire("checked");
+  wire("whl");
 }
 
 // --- popup menus (filter + column visibility) ------------------------------------
@@ -576,6 +699,12 @@ function renderSettings() {
     try { localStorage.removeItem(SETTINGS_KEY); } catch (e) {}
     location.reload();
   };
+  const ocr = el("set-whl-ocr");
+  ocr.checked = !!state.settings.whlModalOcr;
+  ocr.onchange = () => {
+    state.settings.whlModalOcr = ocr.checked;
+    saveSettings();
+  };
 
   // APPEARANCE
   const themeSel = el("theme-select");
@@ -586,16 +715,27 @@ function renderSettings() {
     o.textContent = label;
     themeSel.appendChild(o);
   }
-  themeSel.value = LEGACY_THEMES[state.settings.theme] || state.settings.theme || "";
+  const curTheme = state.settings.theme || "";
+  themeSel.value = curTheme in LEGACY_THEMES ? LEGACY_THEMES[curTheme] : curTheme;
   themeSel.onchange = () => {
     state.settings.theme = themeSel.value;
     saveSettings();
     applyTheme();
   };
-  fillFontSelect("font-ui-select", UI_FONTS, "fontUi", applyFont);
-  fillFontSelect("font-select", FONTS, "font", applyFont);
+  fillFontSelect("font-ui-select", FONT_CHOICES, "fontUi", applyFont);
+  fillFontSelect("font-select", FONT_CHOICES, "font", applyFont);
 
   // TABLE VIEW
+  const mr = el("set-max-rows");
+  mr.value = maxRows();
+  mr.onchange = () => {
+    state.settings.maxRows =
+      Math.max(50, Math.min(5000, parseInt(mr.value, 10) || 400));
+    mr.value = state.settings.maxRows;
+    saveSettings();
+    renderTop();
+    renderBottomRows();
+  };
   const wrap = el("cols-checked");
   wrap.innerHTML = "";
   const vis = state.settings.colVis.checked || {};
@@ -699,9 +839,14 @@ function matchesFind(q, title, author, year) {
 function badge(cls, label, opts = {}) {
   const tip = opts.tip ? ` data-tip="${esc(opts.tip)}"` : "";
   const attrs = opts.attrs || "";
+  // a small status dot inside the tag's right edge; the label stays centered
+  const dot = opts.dot
+    ? `<span class="dl-dot ${opts.dot.cls}"` +
+      (opts.dot.tip ? ` data-tip="${esc(opts.dot.tip)}"` : "") + `></span>`
+    : "";
   if (opts.href)
-    return `<a class="badge ${cls}" href="${esc(opts.href)}" target="_blank" rel="noopener"${tip}${attrs}>${esc(label)}</a>`;
-  return `<span class="badge ${cls}"${tip}${attrs}>${esc(label)}</span>`;
+    return `<a class="badge ${cls}" href="${esc(opts.href)}" target="_blank" rel="noopener"${tip}${attrs}>${esc(label)}${dot}</a>`;
+  return `<span class="badge ${cls}"${tip}${attrs}>${esc(label)}${dot}</span>`;
 }
 
 function tipForLocalWhl(checks) {
@@ -805,13 +950,13 @@ function verifyUnit(row, source, tagHtml) {
     `<span class="vmark ${cls}" data-tip="${esc(tip)}"></span></span>`;
 }
 
-function scanBadge(row, source) {
+function scanBadge(row, source, dot) {
   const scans = row.scans;
-  if (!scans || !scans[source]) return badge("unknown", "---", { tip: "Not scanned yet" });
+  if (!scans || !scans[source]) return badge("unknown", "---", { tip: "Not scanned yet", dot });
   const s = scans[source];
   const isHt = source === "hathitrust";
   const tip = tipForScan(s, isHt);
-  if (s.error) return badge("error", "ERR", { tip });
+  if (s.error) return badge("error", "ERR", { tip, dot });
   if (s.available === true) {
     const best = s.best_match || {};
     const href = best.url || best.record_url || "";
@@ -821,20 +966,20 @@ function scanBadge(row, source) {
         return verifyUnit(row, source, badge("available", "YES", {
           tip: "MANUALLY LOCATED SOURCE:\n" + murl +
             "\n(automatic match was rejected as a false positive)",
-          href: murl,
+          href: murl, dot,
         }));
       }
       return verifyUnit(row, source, badge("missing", "NO", {
         tip: "REJECTED AS FALSE POSITIVE.\n" + tip +
           "\nCLICK TAG: paste the URL of a manually located source",
-        href,
+        href, dot,
       }));
     }
     return verifyUnit(row, source,
-      badge("available", isHt && s.full_view ? "VIEW" : "YES", { tip, href }));
+      badge("available", isHt && s.full_view ? "VIEW" : "YES", { tip, href, dot }));
   }
-  if (s.available === false) return badge("missing", "NO", { tip });
-  return badge("unknown", "?", { tip, href: s.search_url || "" });
+  if (s.available === false) return badge("missing", "NO", { tip, dot });
+  return badge("unknown", "?", { tip, href: s.search_url || "", dot });
 }
 
 // --- SCAN / UPLOAD marks -------------------------------------------------------
@@ -895,7 +1040,7 @@ function markCell(row) {
   if (mark === "SCAN") return badge("scan", "SCAN", { tip: reason });
   if (mark === "UPLOAD") {
     if (anyApprovedSource(row))
-      return badge("approved", "UPLD", { tip: "Approved source(s) ready — see the EDITOR tab" });
+      return badge("approved", "UPLD", { tip: "Verified source(s) ready — see the EDITOR tab" });
     return badge("upload", "UPLD", { tip: reason });
   }
   return badge("unknown", "—", { tip: reason });
@@ -987,22 +1132,21 @@ function dlState(row) {
 }
 
 function iaCell(row) {
-  // the tag stays centered; the download marker sits to its right without
-  // displacing it: * (black) = saved, ** (red) = failed
-  const tag = scanBadge(row, "internet_archive");
+  // download state rides inside the tag as a dot on its right edge — the
+  // label stays centered: green = downloaded, red = failed
   const ident = iaIdentifierForRow(row);
   const st = dlState(row);
-  let mark = "";
+  let dot = null;
   if (st === "done") {
-    mark = `<span class="dl-mark ok" data-tip="${esc("Saved: downloads/ia/" + ident + ".pdf")}">*</span>`;
+    dot = { cls: "ok", tip: "Saved: downloads/ia/" + ident + ".pdf" };
   } else if (st === "failed") {
-    const dl = state.downloads.get(ident);
-    mark = `<span class="dl-mark err" data-tip="${esc((dl && dl.error) || "Download failed")}">**</span>`;
+    dot = { cls: "err",
+            tip: (state.downloads.get(ident) || {}).error || "Download failed" };
   } else if (st === "downloading") {
-    const dl = state.downloads.get(ident);
-    mark = `<span class="dl-mark prog" data-tip="Downloading from the Internet Archive">${dlPct(dl)}</span>`;
+    dot = { cls: "prog",
+            tip: "Downloading — " + dlPct(state.downloads.get(ident)) };
   }
-  return tag + mark;
+  return scanBadge(row, "internet_archive", dot);
 }
 
 const TIP_FIELDS = [
@@ -1026,7 +1170,6 @@ function recordTip(rec, header) {
     if (v.length > cap) v = v.slice(0, cap).trimEnd() + " …";
     lines.push(`${label}: ${v}`);
   }
-  lines.push("CLICK ROW: add to the top table  |  CTRL+CLICK: open in EDIT");
   return lines.join("\n");
 }
 
@@ -1062,7 +1205,9 @@ function renderChecked() {
   const tbody = el("checked-rows");
   tbody.innerHTML = "";
   state.rowsById = new Map(combinedRows().map((r) => [String(r.id), r]));
-  const rows = filteredCheckedRows();
+  let rows = filteredCheckedRows();
+  const so = state.sort.checked;
+  if (so) rows = sortRowsBy(rows, (r) => checkedSortVal(r, so.key), so.dir);
 
   el("checked-empty").hidden = rows.length !== 0;
 
@@ -1091,6 +1236,7 @@ function renderChecked() {
   }
 
   applyTableChrome("checked");
+  markSortHeaders("checked");
   renderBottomPane();
 }
 
@@ -1383,6 +1529,17 @@ function renderBottomRows() {
   const def = BOTTOM_TABLES[t];
   el("bottom-head").innerHTML =
     "<tr>" + def.cols.map((c) => `<th>${c}</th>`).join("") + "</tr>";
+  if (t === "ol") {
+    // repopulation marks: green = copy to the selected WHL row, red = exclude
+    [...el("bottom-head").querySelectorAll("th")].forEach((th, i) => {
+      const fkey = OL_MARK_FIELDS["c" + i];
+      if (!fkey) return;
+      const m = state.olColMarks[fkey];
+      th.classList.toggle("mark-copy", m === "copy");
+      th.classList.toggle("mark-exclude", m === "exclude");
+      th.dataset.tip = "Ctrl+click: copy to the selected WHL row\nShift+click: exclude";
+    });
+  }
   const tbody = el("bottom-rows");
   tbody.innerHTML = "";
 
@@ -1393,11 +1550,11 @@ function renderBottomRows() {
   } else if (t === "ch") {
     records = (state.chBooks || [])
       .filter((b) => matchesFind(q, `${b.title} ${b.subtitle || ""}`, b.author, b.year))
-      .slice(0, CHPANE_RENDER).map(chToRecord);
+      .slice(0, maxRows()).map(chToRecord);
   } else {
     records = (state.whlRows || [])
       .filter((r) => matchesFind(q, `${r.title} ${r.subtitle || ""}`, r.authors, r.year))
-      .slice(0, CHPANE_RENDER).map(whlToRecord);
+      .slice(0, maxRows()).map(whlToRecord);
   }
 
   state.bottomRecords = records;
@@ -1469,9 +1626,12 @@ async function addToTop(rec) {
       await repopulateWhlRow(rec);
       return;
     }
+    const olSrc = rec._src === "ol";
     const addBody = { add: {
-      title: rec.title + (rec.subtitle ? ": " + rec.subtitle : ""),
-      authors: rec.author, year: rec.year,
+      title: (olSrc ? titleCase(rec.title) : rec.title) +
+        (rec.subtitle ? ": " + (olSrc ? titleCase(rec.subtitle) : rec.subtitle) : ""),
+      authors: olSrc ? flipName(rec.author) : rec.author,
+      year: rec.year,
     } };
     const data = await whlPost(addBody);
     if (data) {
@@ -1490,8 +1650,9 @@ async function addToTop(rec) {
   }
   // top = checked books
   if (rec._src === "ch") { addChBook(rec._idx); return; }
+  const cased = (t) => rec._src === "ol" ? titleCase(t) : t;
   const body = {
-    title: rec.title + (rec.subtitle ? ": " + rec.subtitle : ""),
+    title: cased(rec.title) + (rec.subtitle ? ": " + cased(rec.subtitle) : ""),
     author: rec.author, publisher: rec.publisher, city: rec.city,
     year: rec.year, edition: rec.edition, volume: rec.volume,
     language: rec.language, pages: rec.pages || "",
@@ -1564,9 +1725,7 @@ function setWhlMode(m) {
     state.olOverride = null;
   }
   renderWhlTop();
-  status(m === "search"
-    ? "WHL SEARCH MODE :: click a title to look it up on Open Library; click a result to repopulate the row"
-    : "WHL EDIT MODE :: click a cell to correct it; Ctrl+click a row for the full metadata tab");
+  status(m === "search" ? "WHL SEARCH MODE" : "WHL EDIT MODE");
 }
 
 function switchTopTable(t) {
@@ -1575,7 +1734,7 @@ function switchTopTable(t) {
   el("top-table").value = t;
   el("checked-pane").hidden = t !== "checked";
   el("whltop-pane").hidden = t !== "whl";
-  for (const id of ["run-scans", "dl-approved", "export-json", "filter-btn"]) {
+  for (const id of ["dl-approved", "export-json", "filter-btn"]) {
     el(id).disabled = t !== "checked";
   }
   updateModeTag();
@@ -1610,14 +1769,15 @@ function renderWhlTop() {
   el("whl-cons").hidden = state.settings.topTable !== "whl" || mode !== "search";
   updateModeTag();
   const q = findQuery();
-  const rows = (state.whlRows || [])
+  let rows = (state.whlRows || [])
     .filter((r) => matchesFind(q, `${r.title} ${r.subtitle || ""}`, r.authors, r.year));
-  const shown = rows.slice(0, 400);
+  const so = state.sort.whl;
+  if (so) rows = sortRowsBy(rows, (r) => whlSortVal(r, so.key), so.dir);
+  const cap = maxRows();
+  const shown = rows.slice(0, cap);
   const tbody = el("whltop-rows");
   tbody.innerHTML = "";
-  const editable = (r, f) => mode === "edit"
-    ? ` class="editable" data-wedit="${f}"`
-    : "";
+  origRowShown = null;
   for (const r of shown) {
     const tr = document.createElement("tr");
     tr.dataset.widx = r.idx;
@@ -1628,33 +1788,121 @@ function renderWhlTop() {
     if (state.whlSelected === r.idx) tr.classList.add("whl-selected");
     tr.dataset.tip = recordTip(
       Object.assign(whlToRecord(r), { subtitle: r.subtitle || "",
-        categories: r.categories || "", notes: r.description || "" }),
-      mode === "edit"
-        ? "WHL ROW — click a cell to edit; Ctrl+click for the full editor"
-        : "WHL ROW — click the title to search Open Library for it");
-    tr.innerHTML = `
-      <td>${r.added ? "ADDED" : r.corrected ? "EDITED" : r.scraped ? "WEB" : "CSV"}</td>
-      <td${editable(r, "title")}${mode === "search" ? ' data-wsearch="1"' : ""}>${esc(r.title)}</td>
-      <td${editable(r, "subtitle")}>${esc(r.subtitle || "")}</td>
-      <td${editable(r, "authors")}>${esc(r.authors)}</td>
-      <td${editable(r, "year")}>${esc(r.year)}</td>
-      <td${editable(r, "publisher")}>${esc(r.publisher || "")}</td>
-      <td${editable(r, "pages")}>${esc(r.pages || "")}</td>
-      <td${editable(r, "language")}>${esc(r.language || "")}</td>
-      <td${editable(r, "subject")}>${esc(r.subject || "")}</td>
-      <td${editable(r, "description")}>${esc(r.description || "")}</td>
-      <td class="col-whl">${r.permalink
-        ? badge(r.status === "publish" ? "available" : "missing",
-                r.status === "publish" ? "PUB" : (r.status || "?").slice(0, 4).toUpperCase(),
-                { href: r.permalink,
-                  tip: "Open the WHL catalogue page\n" + r.permalink })
-        : badge("unknown", (r.status || "—").slice(0, 5).toUpperCase())}</td>`;
+        categories: r.categories || "", notes: r.description || "" }), "WHL");
+    tr.innerHTML = whlRowCells(r, mode);
     tbody.appendChild(tr);
   }
   el("whltop-empty").hidden = shown.length !== 0;
   el("top-count").textContent =
-    `${rows.length} WHL ROWS` + (rows.length > 400 ? " (SHOWING 400)" : "");
+    `${rows.length} WHL ROWS` + (rows.length > cap ? ` (SHOWING ${cap})` : "");
   applyTableChrome("whl");
+  markSortHeaders("whl");
+}
+
+function whlRowCells(r, mode) {
+  const editable = (f) => mode === "edit"
+    ? ` class="editable" data-wedit="${f}"`
+    : "";
+  let statusCell;
+  if (r.permalink) {
+    const isPub = r.status === "publish";
+    // published entries with a publication file open in the PDF viewer
+    // window instead of a browser tab
+    const modal = mode !== "orig" && isPub && r.file;
+    statusCell = badge(isPub ? "available" : "missing",
+      isPub ? "PUB" : (r.status || "?").slice(0, 4).toUpperCase(),
+      {
+        href: modal ? r.file : r.permalink,
+        tip: modal ? "View the publication PDF\n" + r.file
+                   : "Open the WHL catalogue page\n" + r.permalink,
+        attrs: modal ? ` data-pdfm="${r.idx}"` : "",
+      });
+  } else {
+    statusCell = badge("unknown", (r.status || "—").slice(0, 5).toUpperCase());
+  }
+  return `
+      <td>${r.added ? "ADDED" : r.corrected ? "EDITED" : r.scraped ? "WEB" : "CSV"}</td>
+      <td${editable("title")}${mode === "search" ? ' data-wsearch="1"' : ""}>${esc(r.title)}</td>
+      <td${editable("subtitle")}>${esc(r.subtitle || "")}</td>
+      <td${editable("authors")}>${esc(r.authors)}</td>
+      <td${editable("year")}>${esc(r.year)}</td>
+      <td${editable("publisher")}>${esc(r.publisher || "")}</td>
+      <td${editable("pages")}>${esc(r.pages || "")}</td>
+      <td${editable("language")}>${esc(r.language || "")}</td>
+      <td${editable("subject")}>${esc(r.subject || "")}</td>
+      <td${editable("description")}>${esc(r.description || "")}</td>
+      <td class="col-whl">${statusCell}</td>`;
+}
+
+// --- ALT: view the original (pre-correction) record ------------------------------
+// Holding Alt over an edited WHL row swaps it to the original values;
+// in the EDIT panel, holding Alt swaps the fields the same way. Both views
+// are grayed and highlighted to read as "original record".
+
+let origRowShown = null;
+let curHoverTr = null;
+
+function origMerged(r) {
+  return Object.assign({}, r, r.orig || {});
+}
+
+function showOrigRow(tr, r) {
+  if (origRowShown === tr || !r || !r.orig) return;
+  // never swap out a row holding an in-progress cell edit
+  if (tr.querySelector(".cell-edit")) return;
+  clearOrigRow();
+  tr.dataset.editedHtml = tr.innerHTML;
+  tr.innerHTML = whlRowCells(origMerged(r), "orig");
+  // keep the hidden-column layout of the rest of the table
+  const vis = state.settings.colVis.whl || {};
+  [...tr.children].forEach((td, i) => {
+    const key = WHL_COLS[i] ? WHL_COLS[i][0] : null;
+    td.style.display = key && vis[key] === false ? "none" : "";
+  });
+  tr.classList.add("orig-view");
+  origRowShown = tr;
+}
+
+function clearOrigRow() {
+  if (!origRowShown) return;
+  if (origRowShown.dataset.editedHtml != null) {
+    origRowShown.innerHTML = origRowShown.dataset.editedHtml;
+    delete origRowShown.dataset.editedHtml;
+  }
+  origRowShown.classList.remove("orig-view");
+  origRowShown = null;
+}
+
+let editOrigShown = false;
+let editOrigSaved = null;
+
+function showEditOrig() {
+  const t = state.editTarget;
+  if (editOrigShown || !t || t.kind !== "whl") return;
+  if (!el("pane-edit").classList.contains("active") || el("whledit-form").hidden) return;
+  const row = whlRowByIdx(t.idx);
+  if (!row || !row.orig) return;
+  const merged = origMerged(row);
+  editOrigSaved = {};
+  for (const f of WHL_ROW_FIELDS) {
+    const inp = el("w-" + f);
+    editOrigSaved[f] = inp.value;
+    inp.value = merged[f] || "";
+    inp.readOnly = true;
+  }
+  el("whledit-form").classList.add("orig-view");
+  editOrigShown = true;
+}
+
+function clearEditOrig() {
+  if (!editOrigShown) return;
+  for (const f of WHL_ROW_FIELDS) {
+    const inp = el("w-" + f);
+    inp.value = editOrigSaved[f];
+    inp.readOnly = false;
+  }
+  el("whledit-form").classList.remove("orig-view");
+  editOrigShown = false;
 }
 
 function whlRowByIdx(idx) {
@@ -1721,21 +1969,43 @@ function selectWhlSearchRow(idx) {
   saveSettings();
   renderWhlTop();
   renderBottomPane().then(olRealtime);
-  status(`SEARCHING OPEN LIBRARY :: ${row.title} — click a result to repopulate this row`);
+  status(`OPEN LIBRARY SEARCH :: ${row.title}`);
+}
+
+// Which OL columns copy into the selected WHL row. Title/author/year copy
+// by default; Ctrl+click a column header to force-include it (green),
+// Shift+click to exclude it (red).
+const OL_MARK_FIELDS = { c0: "title", c1: "author", c2: "year",
+                         c3: "publisher", c7: "language" };
+
+function repopFields(rec) {
+  const marks = state.olColMarks;
+  const on = (k, dflt) =>
+    marks[k] === "exclude" ? false : marks[k] === "copy" ? true : dflt;
+  const fields = {};
+  if (on("title", true)) {
+    // OL titles are sentence case; catalog entries use conventional caps
+    fields.title = titleCase(rec.title);
+    fields.subtitle = titleCase(rec.subtitle || "");
+  }
+  if (on("author", true)) fields.authors = flipName(rec.author);
+  if (on("year", true)) fields.year = rec.year;
+  if (on("publisher", false) && rec.publisher) fields.publisher = rec.publisher;
+  if (on("language", false) && rec.language) fields.language = rec.language;
+  return fields;
 }
 
 async function repopulateWhlRow(rec) {
   const idx = state.whlSelected;
   const row = whlRowByIdx(idx);
   if (row == null) return;
-  const fields = {
-    title: rec.title, subtitle: rec.subtitle || "",
-    authors: rec.author, year: rec.year,
-  };
+  const fields = repopFields(rec);
+  if (!Object.keys(fields).length) { status("ALL COLUMNS EXCLUDED"); return; }
   const before = whlFieldSnaps(row, Object.keys(fields));
   if (await whlPost({ idx, fields })) {
-    pushWhlFieldsOp(`repopulate WHL row ${rec.title.slice(0, 30)}`, idx, before, fields);
-    status(`WHL ROW REPOPULATED FROM OPEN LIBRARY :: ${rec.title}`);
+    pushWhlFieldsOp(`repopulate WHL row ${(fields.title || row.title).slice(0, 30)}`,
+      idx, before, fields);
+    status(`WHL ROW REPOPULATED :: ${fields.title || row.title}`);
   } else {
     status("WHL REPOPULATE FAILED");
   }
@@ -1785,6 +2055,14 @@ function startWhlEdit(td) {
 // checked / manual / CH-catalog records.
 
 function showEditForms(kind) {
+  // a pending Alt original-view snapshot belongs to the previous record:
+  // discard it WITHOUT restoring (the caller just filled the new values)
+  if (editOrigShown) {
+    for (const f of WHL_ROW_FIELDS) el("w-" + f).readOnly = false;
+    el("whledit-form").classList.remove("orig-view");
+    editOrigShown = false;
+    editOrigSaved = null;
+  }
   el("whledit-tab").hidden = false;
   el("whledit-form").hidden = kind !== "whl";
   el("bookedit-form").hidden = kind === "whl";
@@ -1834,7 +2112,7 @@ function openChEditTab(idx) {
   if (!book) return;
   state.editTarget = { kind: "ch", idx };
   el("whledit-note").textContent =
-    `CH CATALOG #${idx} :: ${(book.title || "").slice(0, 55)} — SAVE adds it to CHECKED BOOKS`;
+    `CH CATALOG #${idx} :: ${(book.title || "").slice(0, 60)}`;
   const existing = state.checked.get(ckey("ch_library", idx));
   fillBookEditForm(existing ? existing.book : book, true);
   showEditForms("book");
@@ -1924,6 +2202,9 @@ async function saveBookEditTab(ev) {
 
 async function saveWhlEditTab(ev) {
   ev.preventDefault();
+  // the form is showing the ORIGINAL record while Alt is held — saving
+  // that would write the pre-correction values back as corrections
+  if (editOrigShown) return;
   const idx = state.whlEditIdx;
   const row = whlRowByIdx(idx);
   if (row == null) { el("whledit-msg").textContent = "NO ROW LOADED"; return; }
@@ -1943,13 +2224,15 @@ async function saveWhlEditTab(ev) {
 // --- WHL website metadata scrape --
 
 let scrapePoll = null;
+let scrapeRunning = false;
+
 async function startWhlScrape() {
-  const btn = el("whl-scrape");
-  btn.disabled = true;
+  if (scrapeRunning) return;
+  scrapeRunning = true;
   try {
     await fetch("/api/whl_scrape", { method: "POST" });
   } catch (e) {
-    btn.disabled = false;
+    scrapeRunning = false;
     status("SCRAPE FAILED TO START");
     return;
   }
@@ -1966,7 +2249,7 @@ async function startWhlScrape() {
     }
     clearInterval(scrapePoll);
     scrapePoll = null;
-    btn.disabled = false;
+    scrapeRunning = false;
     if (s.status === "error") {
       status(`SCRAPE ERROR :: ${s.error || "unknown"}`);
       return;
@@ -2485,21 +2768,58 @@ function createPdfViewer() {
     <div class="pdf-bar">
       <span class="pdf-path tool-label"></span>
       <span class="pdf-size tool-label"></span>
+      <button class="cad-btn tiny icon-btn pdf-ocr" type="button"
+              data-tip="OCR text" hidden>${ICONS.text}</button>
       <a class="cad-btn tiny pdf-open" target="_blank" rel="noopener" hidden>OPEN IN TAB</a>
     </div>
     <div class="pdf-body">
       <iframe class="pdf-frame" title="PDF preview" hidden></iframe>
-      <div class="pdf-note empty">NO PDF SELECTED</div>
+      <pre class="pdf-ocrpane" hidden></pre>
+      <div class="pdf-note empty">NO PDF</div>
     </div>`;
   const frame = root.querySelector(".pdf-frame");
   const note = root.querySelector(".pdf-note");
   const path = root.querySelector(".pdf-path");
   const size = root.querySelector(".pdf-size");
   const open = root.querySelector(".pdf-open");
+  const ocrBtn = root.querySelector(".pdf-ocr");
+  const ocrPane = root.querySelector(".pdf-ocrpane");
   let sizeSeq = 0;
+  let textSrc = "";
+  let ocrOn = false;
+  let ocrLoadedFor = "";
+
+  async function loadOcr() {
+    if (!textSrc || ocrLoadedFor === textSrc) return;
+    const want = textSrc;
+    ocrPane.textContent = "EXTRACTING TEXT ...";
+    let data;
+    try {
+      data = await (await fetch(want)).json();
+    } catch (e) { data = { ok: false, error: "extraction failed" }; }
+    if (want !== textSrc) return;
+    if (data.ok) {
+      ocrLoadedFor = want;
+      ocrPane.textContent =
+        (data.shown < data.pages ? `[${data.shown} of ${data.pages} pages]\n\n` : "") +
+        (data.text || "(no text layer)");
+    } else {
+      ocrPane.textContent = data.error || "extraction failed";
+    }
+  }
+
+  function setOcr(on) {
+    ocrOn = !!on && !!textSrc;
+    ocrBtn.classList.toggle("active", ocrOn);
+    ocrPane.hidden = !ocrOn;
+    if (ocrOn) loadOcr();
+  }
+  ocrBtn.addEventListener("click", () => setOcr(!ocrOn));
+
   return {
     el: root,
-    show(src, label) {
+    setOcr,
+    show(src, label, opts = {}) {
       // undecorated: suppress the browser PDF viewer's toolbar/side panes
       const framed = src.startsWith("/api/pdf")
         ? src + "#toolbar=0&navpanes=0" : src;
@@ -2511,6 +2831,10 @@ function createPdfViewer() {
       open.href = src;
       open.hidden = false;
       size.textContent = "";
+      textSrc = opts.textSrc || "";
+      ocrBtn.hidden = !textSrc;
+      if (ocrLoadedFor && ocrLoadedFor !== textSrc) ocrLoadedFor = "";
+      setOcr(opts.ocr != null ? opts.ocr : ocrOn);
       const seq = ++sizeSeq;
       if (src.startsWith("/api/pdf")) {
         fetch(src, { method: "HEAD" }).then((r) => {
@@ -2524,14 +2848,37 @@ function createPdfViewer() {
       sizeSeq++;
       frame.removeAttribute("src");
       frame.hidden = true;
-      note.textContent = msg || "NO PDF SELECTED";
+      note.textContent = msg || "NO PDF";
       note.hidden = false;
       path.textContent = "";
       size.textContent = "";
       delete path.dataset.tip;
       open.hidden = true;
+      textSrc = "";
+      ocrBtn.hidden = true;
+      ocrPane.hidden = true;
     },
   };
+}
+
+// --- WHL publication viewer window ------------------------------------------------
+
+let pdfmViewer = null;
+
+function openPdfModal(idx) {
+  const r = whlRowByIdx(idx);
+  if (!r || !r.file) return;
+  el("pdfm-title").textContent = (r.title || "PUBLICATION").slice(0, 90);
+  el("pdfm-overlay").hidden = false;
+  pdfmViewer.show(r.file, r.file, {
+    textSrc: "/api/pdf/text?url=" + encodeURIComponent(r.file),
+    ocr: !!state.settings.whlModalOcr,
+  });
+}
+
+function closePdfModal() {
+  el("pdfm-overlay").hidden = true;
+  pdfmViewer.clear();
 }
 
 // --- local file browser (pick a PDF) ---------------------------------------------
@@ -2665,7 +3012,7 @@ async function downloadApproved() {
     (getVerify(r, "internet_archive") === "approved" &&
       r.scans && r.scans.internet_archive && r.scans.internet_archive.available === true) ||
     (getVerify(r, "internet_archive") === "rejected" && getManualUrl(r, "internet_archive")));
-  if (!approved.length) { status("NO APPROVED IA SOURCES"); return; }
+  if (!approved.length) { status("NO VERIFIED IA SOURCES"); return; }
   let started = 0, saved = 0, noIa = 0;
   for (const row of approved) {
     const ident = iaIdentifierForRow(row);
@@ -2864,8 +3211,7 @@ function openManualSource(id, source) {
   const row = state.rowsById.get(String(id));
   const names = { whl: "WHL", internet_archive: "INTERNET ARCHIVE", hathitrust: "HATHITRUST" };
   el("msrc-label").textContent =
-    `${names[source] || source} :: ${row ? row.book.title : id} — the automatic match was ` +
-    `rejected; paste the URL of the correct record.`;
+    `${names[source] || source} :: ${row ? row.book.title : id}`;
   el("msrc-url").value = row ? getManualUrl(row, source) : "";
   el("msrc-msg").textContent = "";
   el("msrc-overlay").hidden = false;
@@ -2989,7 +3335,8 @@ function fillAuto(field, value) {
 }
 
 function populateFromWork(r, best) {
-  fillAuto("title", r.title + (r.subtitle ? ": " + r.subtitle : ""));
+  fillAuto("title", titleCase(r.title) +
+    (r.subtitle ? ": " + titleCase(r.subtitle) : ""));
   fillAuto("author", (r.authors || []).filter((a) => a && a !== "?").join("; "));
   if (best) {
     for (const f of EDITION_CONSTRAINT_FIELDS) fillAuto(f, best[f]);
@@ -3138,8 +3485,8 @@ function pushManualCreateOp(entry) {
 }
 
 async function deleteManual(id) {
+  // no confirmation: deletion is undoable
   const e = state.manual.find((x) => x.id === id);
-  if (!window.confirm(`Delete manual entry "${e ? e.title : id}"?`)) return;
   const snap = e ? JSON.parse(JSON.stringify(e)) : null;
   if (await deleteManualById(id)) {
     if (snap) {
@@ -3181,7 +3528,6 @@ function exportJson() {
 function setSearchPane(on) {
   state.settings.showCatalog = !!on;
   saveSettings();
-  el("show-catalog").classList.toggle("active", state.settings.showCatalog);
   renderBottomPane();
 }
 
@@ -3236,7 +3582,7 @@ function renderUpload() {
   state.uploadSources = sources;
   const tbody = el("upload-rows");
   tbody.innerHTML = "";
-  el("sources-count").textContent = `${sources.length} APPROVED SOURCES`;
+  el("sources-count").textContent = `${sources.length} ROWS`;
   el("upload-empty").hidden = sources.length !== 0;
   sources.forEach((s, i) => {
     const tr = document.createElement("tr");
@@ -3262,7 +3608,7 @@ function renderUpload() {
 
 function downloadUploadList() {
   const sources = approvedSources().map(({ _rowId, ...s }) => s);
-  if (!sources.length) { status("NO APPROVED SOURCES"); return; }
+  if (!sources.length) { status("NO VERIFIED SOURCES"); return; }
   const blob = new Blob([JSON.stringify(sources, null, 2)], { type: "application/json" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
@@ -3329,7 +3675,8 @@ function renderBuildEditor() {
     const input = el("b-" + f);
     if (input) input.value = b[f] || "";
   }
-  el("b-ready").checked = b.status === "ready";
+  el("b-ready").classList.toggle("active", b.status === "ready");
+  el("b-verified-tag").hidden = b.status !== "ready";
   // only reset the description editor when its saved content changed —
   // background renders must not wipe an in-progress edit
   if (descState.id !== b.id || descState.val !== (b.description || "")) {
@@ -3404,7 +3751,7 @@ function buildSeedFromSource(s) {
   };
 }
 
-async function patchBuildRaw(id, fields) {
+async function patchBuildRaw(id, fields, quiet) {
   const res = await fetch(`/api/builds/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
@@ -3413,7 +3760,9 @@ async function patchBuildRaw(id, fields) {
   const data = await res.json().catch(() => ({}));
   if (res.ok && data.ok) {
     state.builds[id] = data.build;
-    renderUpload();
+    // quiet: background patches (auto-attach) must not re-render the form
+    // and wipe unsaved field edits
+    if (!quiet) renderUpload();
     return true;
   }
   return false;
@@ -3443,7 +3792,7 @@ async function saveBuildFields(ev) {
     if (input) fields[f] = input.value.trim();
   }
   fields.description = buildDescMd.get();
-  fields.status = el("b-ready").checked ? "ready" : "draft";
+  fields.status = el("b-ready").classList.contains("active") ? "ready" : "draft";
   if (!fields.title) { el("build-msg").textContent = "TITLE IS REQUIRED"; return; }
   if (await patchBuild(id, fields, `edit build ${fields.title.slice(0, 30)}`)) {
     descState.id = id;
@@ -3456,10 +3805,10 @@ async function saveBuildFields(ev) {
 }
 
 async function deleteBuild() {
+  // no confirmation: deletion is undoable
   const id = state.buildSel;
   const b = state.builds[id];
   if (!b) return;
-  if (!window.confirm(`Delete entry "${b.title || id}"?`)) return;
   const snap = JSON.parse(JSON.stringify(b));
   const res = await fetch(`/api/builds/${encodeURIComponent(id)}`, { method: "DELETE" });
   if (res.ok) {
@@ -3531,18 +3880,22 @@ async function refreshSourceTab() {
     const ident = iaIdentFromBuild(b);
     if (ident && state.downloadedIds.has(ident)) {
       localPath = `downloads/ia/${ident}.pdf`;
-      await patchBuildRaw(b.id, { pdf_file: localPath });
+      await patchBuildRaw(b.id, { pdf_file: localPath }, true);
       el("b-src-msg").textContent = "LOCAL PDF ATTACHED AUTOMATICALLY";
     }
   }
   el("b-pdf_file").value = localPath;
   if (localPath) {
-    buildPdfViewer.show(pdfLocalSrc(localPath), localPath);
+    buildPdfViewer.show(pdfLocalSrc(localPath), localPath, {
+      textSrc: "/api/pdf/text?path=" + encodeURIComponent(localPath),
+    });
   } else if (/^https?:\/\//i.test((b.pdf_source || "").trim())) {
-    buildPdfViewer.show(b.pdf_source.trim(), b.pdf_source.trim() + "  (remote)");
+    const url = b.pdf_source.trim();
+    buildPdfViewer.show(url, url + "  (remote)", {
+      textSrc: "/api/pdf/text?url=" + encodeURIComponent(url),
+    });
   } else {
-    buildPdfViewer.clear(
-      "NO PDF SOURCE — paste a URL in the ENTRY tab or attach a local file above");
+    buildPdfViewer.clear("NO PDF");
   }
 }
 
@@ -3599,6 +3952,7 @@ function updateMenuState() {
   dis("export", !onChecked);
   dis("run-scans", !onChecked);
   dis("dl-approved", !onChecked);
+  dis("scrape", scrapeRunning);
   dis("undo", history.ptr === 0);
   dis("redo", history.ptr >= history.stack.length);
   check("search-pane", state.settings.showCatalog);
@@ -3679,14 +4033,10 @@ function init() {
     else if (k === "y" || (k === "z" && ev.shiftKey)) { ev.preventDefault(); redo(); }
   });
 
-  // checked-tab toolbar commands
-  el("run-scans").addEventListener("click", runScansBatch);
-  el("whl-scrape").addEventListener("click", startWhlScrape);
+  // table-bar commands (run-scans / scrape / search-pane are menu items)
   el("dl-approved").addEventListener("click", downloadApproved);
   el("export-json").addEventListener("click", exportJson);
-  el("show-catalog").classList.toggle("active", !!state.settings.showCatalog);
-  el("show-catalog").addEventListener("click", () =>
-    setSearchPane(!state.settings.showCatalog));
+  initSortHeaders();
 
   // filter + column-visibility popups
   el("filter-btn").addEventListener("click", () =>
@@ -3731,7 +4081,15 @@ function init() {
     }
   });
   el("whltop-rows").addEventListener("click", (ev) => {
-    if (ev.target.closest("a")) return;
+    const a = ev.target.closest("a");
+    if (a) {
+      // published entries with a publication file open in the PDF window
+      if (a.dataset.pdfm !== undefined) {
+        ev.preventDefault();
+        openPdfModal(parseInt(a.dataset.pdfm, 10));
+      }
+      return;
+    }
     const tr = ev.target.closest("tr");
     if (!tr) return;
     const idx = parseInt(tr.dataset.widx, 10);
@@ -3743,6 +4101,39 @@ function init() {
     }
     const td = ev.target.closest("td[data-wedit]");
     if (td) startWhlEdit(td);
+  });
+
+  // Alt shows the original (pre-correction) record: over an edited WHL row,
+  // and in the EDIT panel
+  el("whltop-rows").addEventListener("mouseover", (ev) => {
+    const tr = ev.target.closest("tr");
+    curHoverTr = tr;
+    if (tr && ev.altKey && tr.classList.contains("whl-row-corrected")) {
+      showOrigRow(tr, whlRowByIdx(parseInt(tr.dataset.widx, 10)));
+    } else if (origRowShown && origRowShown !== tr) {
+      clearOrigRow();
+    }
+  });
+  el("whltop-rows").addEventListener("mouseleave", () => {
+    curHoverTr = null;
+    clearOrigRow();
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Alt" || ev.repeat) return;
+    if (curHoverTr && curHoverTr.classList.contains("whl-row-corrected")) {
+      showOrigRow(curHoverTr, whlRowByIdx(parseInt(curHoverTr.dataset.widx, 10)));
+    }
+    showEditOrig();
+  });
+  document.addEventListener("keyup", (ev) => {
+    if (ev.key !== "Alt") return;
+    if (origRowShown || editOrigShown) ev.preventDefault();
+    clearOrigRow();
+    clearEditOrig();
+  });
+  window.addEventListener("blur", () => {
+    clearOrigRow();
+    clearEditOrig();
   });
   el("whledit-form").addEventListener("submit", saveWhlEditTab);
   el("bookedit-form").addEventListener("submit", saveBookEditTab);
@@ -3764,6 +4155,21 @@ function init() {
     state.settings.bottomActive = state.settings.bottomTabs.length - 1;
     saveSettings();
     renderBottomPane();
+  });
+  // OL column marks: choose which columns repopulate the selected WHL row
+  el("bottom-head").addEventListener("click", (ev) => {
+    if (activeBottomTable() !== "ol") return;
+    if (!ev.ctrlKey && !ev.metaKey && !ev.shiftKey) return;
+    const th = ev.target.closest("th");
+    if (!th) return;
+    const i = [...th.parentElement.children].indexOf(th);
+    const fkey = OL_MARK_FIELDS["c" + i];
+    if (!fkey) return;
+    ev.preventDefault();
+    const want = ev.shiftKey ? "exclude" : "copy";
+    if (state.olColMarks[fkey] === want) delete state.olColMarks[fkey];
+    else state.olColMarks[fkey] = want;
+    renderBottomRows();
   });
   el("bottom-rows").addEventListener("click", (ev) => {
     if (ev.target.closest("a")) return;
@@ -3867,6 +4273,16 @@ function init() {
   // upload list / book builder
   buildPdfViewer = createPdfViewer();
   el("b-pdf-viewer").appendChild(buildPdfViewer.el);
+  pdfmViewer = createPdfViewer();
+  el("pdfm-body").appendChild(pdfmViewer.el);
+  el("pdfm-close").addEventListener("click", closePdfModal);
+  el("pdfm-overlay").addEventListener("mousedown", (ev) => {
+    if (ev.target === el("pdfm-overlay")) closePdfModal();
+  });
+  el("b-ready").addEventListener("click", () => {
+    const on = el("b-ready").classList.toggle("active");
+    el("b-verified-tag").hidden = !on;
+  });
   el("build-new").addEventListener("click", () => createBuild({}, "(blank)"));
   el("export-builds").addEventListener("click", exportBuilds);
   el("download-upload-list").addEventListener("click", downloadUploadList);
@@ -3925,6 +4341,7 @@ function init() {
   document.addEventListener("keydown", (ev) => {
     if (ev.key !== "Escape") return;
     if (!el("fb-overlay").hidden) closeFileBrowser();
+    else if (!el("pdfm-overlay").hidden) closePdfModal();
     else if (!el("md-overlay").hidden) closeMarkdownEditor(false);
     else if (!el("msrc-overlay").hidden) closeManualSource();
     else if (!el("settings-overlay").hidden) closeSettings();

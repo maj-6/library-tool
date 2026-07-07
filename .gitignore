@@ -15,3 +15,4 @@ downloads/ia/*.part
 # python
 __pycache__/
 *.pyc
+downloads/cache/
