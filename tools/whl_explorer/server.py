@@ -29,7 +29,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from flask import Flask, abort, jsonify, render_template, request
+from flask import Flask, abort, jsonify, render_template, request, send_file
 
 # Make tools/ importable for the shared helpers.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -96,11 +96,12 @@ def api_books():
 
 BUILDS_PATH = lib.OUTPUT_DIR / "whl_builds.json"
 
-# The field set mirrors what a WHL catalog entry needs.
+# The field set mirrors what a WHL catalog entry needs. pdf_source is the
+# source URL; pdf_file is the local PDF attached for the actual submission.
 _BUILD_FIELDS = ("title", "subtitle", "authors", "year", "publisher",
                  "publisher_city", "edition", "language", "pages",
-                 "categories", "description", "pdf_source", "source_url",
-                 "notes", "status")
+                 "categories", "description", "pdf_source", "pdf_file",
+                 "source_url", "notes", "status")
 
 
 @app.route("/api/builds")
@@ -163,6 +164,71 @@ def api_builds_restore():
     builds[bid] = build
     lib.save_json(BUILDS_PATH, builds)
     return jsonify({"ok": True, "build": build})
+
+
+# --- local PDF serving + browsing (for the builder's SOURCE tab) ------------------
+# Single-user localhost tool: the user picks PDFs from anywhere on disk, so
+# these endpoints intentionally serve any local *.pdf path.
+
+def _resolve_local(raw: str) -> Path | None:
+    p = Path(raw)
+    if not p.is_absolute():
+        p = lib.ROOT / p
+    try:
+        return p.resolve()
+    except OSError:
+        return None
+
+
+@app.route("/api/pdf")
+def api_pdf():
+    """Stream a local PDF (absolute path, or relative to the repo root)."""
+    raw = (request.args.get("path") or "").strip()
+    if not raw:
+        abort(400)
+    p = _resolve_local(raw)
+    if p is None or p.suffix.lower() != ".pdf" or not p.is_file():
+        abort(404)
+    return send_file(p, mimetype="application/pdf", conditional=True)
+
+
+@app.route("/api/pdf/browse")
+def api_pdf_browse():
+    """List a directory's subdirectories and PDF files (the file picker)."""
+    raw = (request.args.get("dir") or "").strip()
+    d = _resolve_local(raw) if raw else lib.IA_DOWNLOADS_DIR
+    if d is None or not d.is_dir():
+        d = lib.ROOT
+    dirs: list[dict] = []
+    pdfs: list[dict] = []
+    try:
+        for entry in sorted(d.iterdir(), key=lambda p: p.name.lower()):
+            try:
+                if entry.is_dir():
+                    if not entry.name.startswith("."):
+                        dirs.append({"name": entry.name, "path": str(entry)})
+                elif entry.suffix.lower() == ".pdf":
+                    pdfs.append({"name": entry.name, "path": str(entry),
+                                 "size": entry.stat().st_size})
+            except OSError:
+                continue
+    except OSError:
+        pass
+    parent = str(d.parent) if d.parent != d else None
+    return jsonify({"dir": str(d), "parent": parent, "dirs": dirs,
+                    "pdfs": pdfs, "drives": _drives()})
+
+
+_DRIVES_CACHE: list[str] | None = None
+
+
+def _drives() -> list[str]:
+    """Available drive roots; probed once (floppy-era letters are slow)."""
+    global _DRIVES_CACHE
+    if _DRIVES_CACHE is None:
+        _DRIVES_CACHE = [f"{c}:\\" for c in "CDEFGHIJKLMNOPQRSTUVWXYZ"
+                         if Path(f"{c}:\\").exists()]
+    return _DRIVES_CACHE
 
 
 # --- manual entries (checked offline on submit) ------------------------------
@@ -740,9 +806,11 @@ def api_scans():
 
 if __name__ == "__main__":
     # Warm the offline check indexes (the renewals CSV is ~40 MB) so the first
-    # manual-entry submission doesn't stall while they load.
+    # manual-entry submission doesn't stall while they load, and the drive
+    # list so the first file-browser open is instant.
     threading.Thread(
-        target=lambda: (checks.get_renewals(), checks.get_whl_catalog()),
+        target=lambda: (checks.get_renewals(), checks.get_whl_catalog(),
+                        _drives()),
         daemon=True,
     ).start()
     app.run(host="127.0.0.1", port=5001, debug=False)

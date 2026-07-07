@@ -2,13 +2,23 @@
 
 /* Catalog Explorer front-end.
  *
- * Two top-level tabs:
+ * Chrome: a titlebar, an application toolbar (undo/redo, the active tab's
+ * commands, settings), two top-level tabs, and a status bar (footer) that
+ * carries the WHL mode tag.
+ *
  *   CHECKED BOOKS — the working area: a top table (checked books + manual
  *     entries, or the editable WHL catalog), a left panel (Open Library
  *     search / manual entry / WHL record editor), and a tabbed bottom pane
  *     of live-filtered source tables (Open Library / CH catalog / WHL).
- *   UPLOAD LIST — approved scan sources plus the book builder: catalog
- *     entries being prepared for submission to World Herb Library.
+ *   UPLOAD LIST — the book builder (catalog entries being prepared for WHL
+ *     submission, with a live Markdown description editor and a PDF source
+ *     tab) over a resizable approved-sources table.
+ *
+ * Reusable components (built for reuse elsewhere in the interface):
+ *   createMdEditor(container)  — Obsidian-style live Markdown editor
+ *   createPdfViewer()          — embedded PDF viewer (local via /api/pdf,
+ *                                or a remote URL)
+ *   openFileBrowser(start, cb) — local-directory PDF picker window
  *
  * All mutating actions are undoable (see the history section).
  */
@@ -45,7 +55,7 @@ const WHL_ROW_FIELDS = ["title", "subtitle", "authors", "year", "publisher",
 
 const BUILD_FIELDS = ["title", "subtitle", "authors", "year", "publisher",
   "publisher_city", "edition", "language", "pages", "categories",
-  "pdf_source", "source_url", "notes"];
+  "pdf_source", "pdf_file", "source_url", "notes"];
 
 const state = {
   // key `${source}:${idx}` -> { book, checks, scans, verify, manual_urls }
@@ -61,6 +71,7 @@ const state = {
   olRows: null,               // realtime Open Library results
   olNote: "",
   bottomRecords: [],
+  uploadSources: [],          // approved sources as last rendered
   builds: {},                 // book builder entries (id -> build)
   buildSel: null,             // selected build id
   downloads: new Map(),
@@ -73,6 +84,7 @@ const state = {
     checkedCols: {}, showCatalog: false, markFilter: "ALL",
     topTable: "checked", bottomTabs: ["ol", "ch"], bottomActive: 0,
     whlMode: "edit", paneWidth: null, theme: "", font: "",
+    uploadSplitH: null, pdfBrowseDir: "",
     whlCons: { title: false, authors: false, year: true },
   },
 };
@@ -231,6 +243,9 @@ function setHeader(tabId) {
   const name = `${TAB_TITLES[tabId] || ""} :: CATALOG EXPLORER`;
   el("tb-name").textContent = name;
   document.title = name;
+  // the application toolbar shows the active tab's command group
+  el("tg-checked").hidden = tabId !== "checked";
+  el("tg-upload").hidden = tabId !== "upload";
 }
 
 function initTabs() {
@@ -409,6 +424,7 @@ function tipForLocalWhl(checks) {
   if (m.author) lines.push("AUTHOR: " + m.author);
   if (m.year) lines.push("YEAR: " + m.year);
   lines.push("STATUS: " + (m.status || "?"));
+  if (m.permalink) lines.push("URL: " + m.permalink);
   return lines.join("\n");
 }
 
@@ -464,6 +480,8 @@ function tipForScan(s, isHt) {
   if (b.author) lines.push("AUTHOR: " + b.author);
   if (b.year) lines.push("YEAR: " + b.year);
   if (b.accuracy != null) lines.push("ACCURACY: " + b.accuracy);
+  const url = b.url || b.record_url;
+  if (url) lines.push("URL: " + url);
   if (isHt && b.items && b.items.length)
     lines.push("ITEMS: " + b.items.map((i) => `${i.volume || "copy"} [${i.rights}]`).join(", "));
   return lines.join("\n");
@@ -953,7 +971,7 @@ const BOTTOM_TABLES = {
 function linkCell(text, url) {
   const t = esc(text) || "<em>(untitled)</em>";
   return url
-    ? `<a href="${esc(url)}" target="_blank" rel="noopener">${t}</a>`
+    ? `<a href="${esc(url)}" target="_blank" rel="noopener" data-tip="${esc(url)}">${t}</a>`
     : t;
 }
 
@@ -1198,6 +1216,18 @@ function addChBook(idx) {
 
 function whlMode() { return state.settings.whlMode === "search" ? "search" : "edit"; }
 
+// the current WHL mode is shown as a tag in the footer
+function updateModeTag() {
+  const tag = el("mode-tag");
+  const isWhl = state.settings.topTable === "whl";
+  tag.hidden = !isWhl;
+  if (isWhl) {
+    const m = whlMode();
+    tag.textContent = `WHL MODE: ${m.toUpperCase()}`;
+    tag.className = "foot-tag " + (m === "edit" ? "tag-edit" : "tag-search");
+  }
+}
+
 function setWhlMode(m) {
   state.settings.whlMode = m;
   saveSettings();
@@ -1220,6 +1250,7 @@ function switchTopTable(t) {
   for (const id of ["run-scans", "dl-approved", "export-json", "clear-checked"]) {
     el(id).disabled = t !== "checked";
   }
+  updateModeTag();
   renderTop();
 }
 
@@ -1239,8 +1270,9 @@ function renderWhlTop() {
   const mode = whlMode();
   const btn = el("whl-mode");
   btn.hidden = state.settings.topTable !== "whl";
-  btn.textContent = `MODE: ${mode.toUpperCase()} (CTRL+E)`;
+  btn.textContent = `MODE: ${mode.toUpperCase()}`;
   el("whl-cons").hidden = state.settings.topTable !== "whl" || mode !== "search";
+  updateModeTag();
   const q = findQuery();
   const rows = (state.whlRows || [])
     .filter((r) => matchesFind(q, `${r.title} ${r.subtitle || ""}`, r.authors, r.year));
@@ -1278,7 +1310,8 @@ function renderWhlTop() {
       <td class="col-whl">${r.permalink
         ? badge(r.status === "publish" ? "available" : "missing",
                 r.status === "publish" ? "PUB" : (r.status || "?").slice(0, 4).toUpperCase(),
-                { href: r.permalink, tip: "Open the WHL catalogue page" })
+                { href: r.permalink,
+                  tip: "Open the WHL catalogue page\n" + r.permalink })
         : badge("unknown", (r.status || "—").slice(0, 5).toUpperCase())}</td>`;
     tbody.appendChild(tr);
   }
@@ -1343,11 +1376,7 @@ function selectWhlSearchRow(idx) {
     author: cons.authors ? row.authors : "",
     year: cons.year ? row.year : "",
   };
-  if (!state.settings.showCatalog) {
-    state.settings.showCatalog = true;
-    el("show-catalog").checked = true;
-    saveSettings();
-  }
+  setSearchPane(true);
   const tabs = bottomTabs();
   let i = tabs.indexOf("ol");
   if (i < 0) { tabs.push("ol"); i = tabs.length - 1; }
@@ -1485,84 +1514,602 @@ async function startWhlScrape() {
   }, 1500);
 }
 
-// --- markdown ---------------------------------------------------------------
-// A small renderer covering what catalog descriptions need: headings, bold,
-// italic, inline code, links, bullet/numbered lists, paragraphs, rules.
+// --- markdown: line grammar shared by the live editor ------------------------
+// Per-line rendering only (headings, list items, quotes, rules, and inline
+// bold / italic / code / links). Marker characters are tracked as hidden
+// tokens so a rendered-text caret offset can be mapped back to the source.
 
-function mdInline(t) {
-  return esc(t)
-    .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
-    .replace(/\*([^*]+)\*/g, "<i>$1</i>")
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,
-      '<a href="$2" target="_blank" rel="noopener">$1</a>');
+function mdLineBlock(src) {
+  let m;
+  if ((m = src.match(/^(#{1,4})\s+/)))
+    return { cls: "md-h" + m[1].length, skip: m[0].length, bullet: "" };
+  if ((m = src.match(/^[-*]\s+/)))
+    return { cls: "md-li", skip: m[0].length, bullet: "• " };
+  if (/^\d+[.)]\s+/.test(src))
+    return { cls: "md-oli", skip: 0, bullet: "" };
+  if (/^(-{3,}|\*{3,})\s*$/.test(src) && src.trim())
+    return { cls: "md-hr", skip: src.length, bullet: "" };
+  if ((m = src.match(/^>\s?/)))
+    return { cls: "md-q", skip: m[0].length, bullet: "" };
+  return { cls: "", skip: 0, bullet: "" };
 }
 
-function mdRender(src) {
-  const lines = String(src || "").replace(/\r/g, "").split("\n");
-  let html = "", list = null, para = [];
-  const flushP = () => {
-    if (para.length) { html += `<p>${mdInline(para.join(" "))}</p>`; para = []; }
-  };
-  const closeList = () => {
-    if (list) { html += `</${list}>`; list = null; }
-  };
-  for (const raw of lines) {
-    const line = raw.trim();
-    if (!line) { flushP(); closeList(); continue; }
-    const h = line.match(/^(#{1,4})\s+(.*)/);
-    if (h) {
-      flushP(); closeList();
-      const lvl = Math.min(h[1].length + 2, 6);
-      html += `<h${lvl}>${mdInline(h[2])}</h${lvl}>`;
-      continue;
+function mdTokenizeInline(src) {
+  // tokens with s/e over src; marker tokens are hidden in rendered mode
+  const toks = [];
+  const push = (s, e, text, cls, marker, href) =>
+    toks.push({ s, e, text, cls: cls || "", marker: !!marker, href: href || "" });
+  let i = 0;
+  while (i < src.length) {
+    const rest = src.slice(i);
+    let m;
+    if ((m = rest.match(/^\*\*([^*]+)\*\*/))) {
+      push(i, i + 2, "**", "", true);
+      push(i + 2, i + 2 + m[1].length, m[1], "md-b");
+      push(i + m[0].length - 2, i + m[0].length, "**", "", true);
+      i += m[0].length;
+    } else if ((m = rest.match(/^\*([^*]+)\*/))) {
+      push(i, i + 1, "*", "", true);
+      push(i + 1, i + 1 + m[1].length, m[1], "md-i");
+      push(i + m[0].length - 1, i + m[0].length, "*", "", true);
+      i += m[0].length;
+    } else if ((m = rest.match(/^`([^`]+)`/))) {
+      push(i, i + 1, "`", "", true);
+      push(i + 1, i + 1 + m[1].length, m[1], "md-code");
+      push(i + m[0].length - 1, i + m[0].length, "`", "", true);
+      i += m[0].length;
+    } else if ((m = rest.match(/^\[([^\]]+)\]\((https?:[^)\s]+)\)/))) {
+      push(i, i + 1, "[", "", true);
+      push(i + 1, i + 1 + m[1].length, m[1], "md-link", false, m[2]);
+      push(i + 1 + m[1].length, i + m[0].length, "](" + m[2] + ")", "", true);
+      i += m[0].length;
+    } else {
+      const nx = rest.slice(1).search(/[*`[]/);
+      const len = nx === -1 ? rest.length : nx + 1;
+      push(i, i + len, rest.slice(0, len), "");
+      i += len;
     }
-    if (/^(-{3,}|\*{3,})$/.test(line)) { flushP(); closeList(); html += "<hr>"; continue; }
-    const ul = line.match(/^[-*]\s+(.*)/);
-    if (ul) {
-      flushP();
-      if (list !== "ul") { closeList(); html += "<ul>"; list = "ul"; }
-      html += `<li>${mdInline(ul[1])}</li>`;
-      continue;
-    }
-    const ol = line.match(/^\d+[.)]\s+(.*)/);
-    if (ol) {
-      flushP();
-      if (list !== "ol") { closeList(); html += "<ol>"; list = "ol"; }
-      html += `<li>${mdInline(ol[1])}</li>`;
-      continue;
-    }
-    para.push(line);
   }
-  flushP();
-  closeList();
-  return html;
+  return toks;
 }
 
-function bindMdPreview(textareaId, previewId) {
-  const ta = el(textareaId), pv = el(previewId);
-  const update = () => { pv.innerHTML = mdRender(ta.value); };
-  ta.addEventListener("input", update);
-  return update;
+function mdTokenHtml(t) {
+  const tip = t.href ? ` data-tip="${esc(t.href)}"` : "";
+  return t.cls
+    ? `<span class="${t.cls}"${tip}>${esc(t.text)}</span>`
+    : esc(t.text);
 }
 
-// The overlay editor targets one textarea at a time (the WHL description).
-let mdOverlayUpdate = null;
+// rendered view of one line: markers hidden
+function mdLineHtml(src) {
+  const blk = mdLineBlock(src);
+  if (blk.cls === "md-hr")
+    return { cls: "md-hr", html: `<span class="md-hrline"></span>` };
+  let html = blk.bullet ? `<span class="md-bullet">${blk.bullet}</span>` : "";
+  for (const t of mdTokenizeInline(src.slice(blk.skip))) {
+    if (!t.marker) html += mdTokenHtml(t);
+  }
+  return { cls: blk.cls, html: html || "<br>" };
+}
+
+// source view of one line: every character present, markers dimmed
+function mdLineSrcHtml(src) {
+  let blk = mdLineBlock(src);
+  if (blk.cls === "md-hr") blk = { cls: "", skip: 0, bullet: "" };
+  let html = blk.skip
+    ? `<span class="mtok">${esc(src.slice(0, blk.skip))}</span>` : "";
+  for (const t of mdTokenizeInline(src.slice(blk.skip))) {
+    html += t.marker ? `<span class="mtok">${esc(t.text)}</span>` : mdTokenHtml(t);
+  }
+  return { cls: (blk.cls + " src").trim(), html: html || "<br>" };
+}
+
+// plain text of a line as displayed in rendered mode (markers hidden)
+function mdRenderedText(src) {
+  const blk = mdLineBlock(src);
+  if (blk.cls === "md-hr") return "";
+  let out = blk.bullet || "";
+  for (const t of mdTokenizeInline(src.slice(blk.skip))) {
+    if (!t.marker) out += t.text;
+  }
+  return out;
+}
+
+// map an offset in the RENDERED text of a line back to its source offset
+function mdSrcOffset(src, renderedOffset) {
+  const blk = mdLineBlock(src);
+  if (blk.cls === "md-hr") return src.length;
+  let ro = renderedOffset;
+  if (blk.bullet) {
+    if (ro <= blk.bullet.length) return Math.min(blk.skip, src.length);
+    ro -= blk.bullet.length;
+  }
+  for (const t of mdTokenizeInline(src.slice(blk.skip))) {
+    if (t.marker) continue;
+    if (ro <= t.text.length) return blk.skip + t.s + ro;
+    ro -= t.text.length;
+  }
+  return src.length;
+}
+
+// --- live markdown editor (reusable component) --------------------------------
+// Obsidian-style: the editing surface IS the rendered document. Lines away
+// from the caret display fully rendered (markers hidden); the line(s) under
+// the caret/selection show their raw source with the markers dimmed.
+
+function createMdEditor(container, opts = {}) {
+  container.classList.add("md-live");
+  container.contentEditable = "true";
+  container.spellcheck = false;
+  let activeRange = null;   // [firstLine, lastLine] shown as source
+  let internal = false;     // guards our own DOM writes
+  let composing = false;    // IME composition in progress: hands off the DOM
+
+  function lineDivs() {
+    return [...container.children].filter((n) => n.nodeType === 1);
+  }
+
+  function renderLineDiv(div, raw, asSource) {
+    div.dataset.src = raw;
+    const view = asSource ? mdLineSrcHtml(raw) : mdLineHtml(raw);
+    div.dataset.mode = asSource ? "src" : "html";
+    div.className = ("md-line " + view.cls).trim();
+    div.innerHTML = view.html;
+  }
+
+  function lineSource(div) {
+    return div.dataset.mode === "html" ? (div.dataset.src || "") : div.textContent;
+  }
+
+  function normalizeDom() {
+    for (const n of [...container.childNodes]) {
+      if (n.nodeType === 3 || (n.nodeType === 1 && n.tagName === "BR")) {
+        const div = document.createElement("div");
+        div.className = "md-line";
+        div.dataset.mode = "src";
+        div.textContent = n.nodeType === 3 ? n.textContent : "";
+        if (!div.textContent) div.innerHTML = "<br>";
+        container.replaceChild(div, n);
+      }
+    }
+    if (!container.children.length) {
+      const div = document.createElement("div");
+      renderLineDiv(div, "", false);
+      container.appendChild(div);
+    }
+  }
+
+  // (line index, plain-text offset) of a DOM point inside the container
+  function pointOf(node, off) {
+    if (node === container) {
+      // a container-level offset of N children means "after the last line"
+      // (this is what Ctrl+A produces) — map it to the END of that line
+      const divs = lineDivs();
+      if (off >= divs.length) {
+        const last = divs.length - 1;
+        return { line: Math.max(0, last),
+                 offset: divs[last] ? divs[last].textContent.length : 0 };
+      }
+      return { line: Math.max(0, off), offset: 0 };
+    }
+    let div = node.nodeType === 1 ? node : node.parentNode;
+    while (div && div.parentNode !== container) div = div.parentNode;
+    if (!div) return null;
+    const idx = lineDivs().indexOf(div);
+    if (idx < 0) return null;
+    const r = document.createRange();
+    r.selectNodeContents(div);
+    try { r.setEnd(node, off); } catch (e) { return { line: idx, offset: 0 }; }
+    return { line: idx, offset: r.toString().length };
+  }
+
+  function caretRange() {
+    const sel = document.getSelection();
+    if (!sel.rangeCount || !container.contains(sel.anchorNode)) return null;
+    const a = pointOf(sel.anchorNode, sel.anchorOffset);
+    const f = pointOf(sel.focusNode, sel.focusOffset);
+    if (!a || !f) return null;
+    if (a.line < f.line || (a.line === f.line && a.offset <= f.offset))
+      return { a, f, backward: false };
+    return { a: f, f: a, backward: true };
+  }
+
+  // DOM point at a plain-text offset within a line div
+  function placePoint(div, offset) {
+    const walker = document.createTreeWalker(div, NodeFilter.SHOW_TEXT);
+    let node, remaining = offset;
+    while ((node = walker.nextNode())) {
+      if (remaining <= node.textContent.length) return { node, off: remaining };
+      remaining -= node.textContent.length;
+    }
+    return { node: div, off: 0 };
+  }
+
+  // render every line back to html (no line is "active" any more)
+  function deactivate() {
+    if (!activeRange) return;
+    internal = true;
+    for (const d of lineDivs()) {
+      if (d.dataset.mode !== "html") renderLineDiv(d, d.textContent, false);
+    }
+    activeRange = null;
+    internal = false;
+  }
+
+  // show the lines under the selection as source (with caret mapping)
+  function activateRange(cr) {
+    const ns = cr.a.line, ne = cr.f.line;
+    const divs = lineDivs();
+    if (activeRange && activeRange[0] === ns && activeRange[1] === ne) {
+      let allSrc = true;
+      for (let i = ns; i <= ne; i++) {
+        if (divs[i] && divs[i].dataset.mode === "html") { allSrc = false; break; }
+      }
+      if (allSrc) return;
+    }
+    // map endpoint offsets (rendered -> source) before any re-render
+    const mapOff = (p) => {
+      const d = divs[p.line];
+      return d && d.dataset.mode === "html"
+        ? mdSrcOffset(d.dataset.src || "", p.offset)
+        : p.offset;
+    };
+    const aOff = mapOff(cr.a), fOff = mapOff(cr.f);
+    internal = true;
+    let changed = false;
+    if (activeRange) {
+      for (let i = activeRange[0]; i <= activeRange[1]; i++) {
+        const d = divs[i];
+        if (d && (i < ns || i > ne) && d.dataset.mode !== "html") {
+          renderLineDiv(d, d.textContent, false);
+          changed = true;
+        }
+      }
+    }
+    for (let i = ns; i <= ne; i++) {
+      const d = divs[i];
+      if (d && d.dataset.mode === "html") {
+        renderLineDiv(d, d.dataset.src || "", true);
+        changed = true;
+      }
+    }
+    activeRange = [ns, ne];
+    if (changed && divs[ns] && divs[ne]) {
+      const sel = document.getSelection();
+      const p1 = placePoint(divs[ns], Math.min(aOff, lineSource(divs[ns]).length));
+      const p2 = placePoint(divs[ne], Math.min(fOff, lineSource(divs[ne]).length));
+      try {
+        // setBaseAndExtent keeps the selection's direction (anchor->focus),
+        // so shift+arrow extension keeps working across the re-render
+        if (cr.backward) sel.setBaseAndExtent(p2.node, p2.off, p1.node, p1.off);
+        else sel.setBaseAndExtent(p1.node, p1.off, p2.node, p2.off);
+      } catch (e) { /* leave the browser selection */ }
+    }
+    internal = false;
+  }
+
+  function onSelectionChange() {
+    if (internal || composing) return;
+    if (document.activeElement !== container) {
+      // fallback for environments where focusout is unreliable
+      deactivate();
+      return;
+    }
+    const cr = caretRange();
+    if (!cr) return;
+    activateRange(cr);
+  }
+
+  // join line i with line i+1 in SOURCE space (a cross-line Backspace or
+  // Delete must not concatenate rendered text — that would silently drop
+  // the hidden markdown markers)
+  function mergeLines(i) {
+    const divs = lineDivs();
+    const a = divs[i], b = divs[i + 1];
+    if (!a || !b) return;
+    const left = lineSource(a), right = lineSource(b);
+    internal = true;
+    renderLineDiv(a, left + right, true);
+    b.remove();
+    activeRange = [i, i];
+    const p = placePoint(a, Math.min(left.length, a.textContent.length));
+    const sel = document.getSelection();
+    const r = document.createRange();
+    try {
+      r.setStart(p.node, p.off);
+      r.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(r);
+    } catch (e) { /* ignore */ }
+    internal = false;
+    if (opts.onChange) opts.onChange();
+  }
+
+  // beforeinput fires synchronously before the DOM changes: convert every
+  // line the edit touches to source view first, so the browser's edit
+  // always lands on 1:1 source text (typing can otherwise hit a rendered
+  // line before the async selectionchange has converted it). Cross-line
+  // deletes are taken over entirely (see mergeLines).
+  function onBeforeInput(ev) {
+    if (internal || composing || ev.isComposing) return;
+    const cr = caretRange();
+    if (!cr) return;
+    const type = ev.inputType || "";
+    const collapsed = cr.a.line === cr.f.line && cr.a.offset === cr.f.offset;
+    if (collapsed &&
+        (type === "deleteContentBackward" || type === "deleteContentForward")) {
+      const divs = lineDivs();
+      const d = divs[cr.a.line];
+      const srcOff = d && d.dataset.mode === "html"
+        ? mdSrcOffset(d.dataset.src || "", cr.a.offset)
+        : cr.a.offset;
+      if (type === "deleteContentBackward" && srcOff === 0 && cr.a.line > 0) {
+        ev.preventDefault();
+        mergeLines(cr.a.line - 1);
+        return;
+      }
+      if (type === "deleteContentForward" && d &&
+          srcOff >= lineSource(d).length && cr.a.line < divs.length - 1) {
+        ev.preventDefault();
+        mergeLines(cr.a.line);
+        return;
+      }
+    }
+    activateRange(cr);
+  }
+
+  function onInput() {
+    if (internal || composing) return;
+    internal = true;
+    normalizeDom();
+    // restyle the source lines (their text may hold new markdown now),
+    // keeping the caret at the same plain-text offset (source view is 1:1)
+    const sel = document.getSelection();
+    let saved = null;
+    if (sel.rangeCount && container.contains(sel.focusNode)) {
+      saved = pointOf(sel.focusNode, sel.focusOffset);
+    }
+    for (const d of lineDivs()) {
+      if (d.dataset.mode !== "html") {
+        renderLineDiv(d, d.textContent, true);
+      } else if (d.dataset.src == null ||
+                 d.textContent !== mdRenderedText(d.dataset.src)) {
+        // safety net: an edit landed on a rendered line anyway (e.g. a
+        // drop) — adopt its visible text as the new source
+        renderLineDiv(d, d.textContent, false);
+      }
+    }
+    if (saved) {
+      const divs = lineDivs();
+      const d = divs[Math.min(saved.line, divs.length - 1)];
+      if (d) {
+        const p = placePoint(d, Math.min(saved.offset, d.textContent.length));
+        try {
+          const r = document.createRange();
+          r.setStart(p.node, p.off);
+          r.collapse(true);
+          sel.removeAllRanges();
+          sel.addRange(r);
+        } catch (e) { /* ignore */ }
+      }
+    }
+    internal = false;
+    onSelectionChange();
+    if (opts.onChange) opts.onChange();
+  }
+
+  function onPaste(ev) {
+    ev.preventDefault();
+    const text = (ev.clipboardData || window.clipboardData).getData("text/plain");
+    const cr = caretRange();
+    if (!cr) return;
+    const divs = lineDivs();
+    const srcOff = (p) => {
+      const d = divs[p.line];
+      return d.dataset.mode === "html"
+        ? mdSrcOffset(d.dataset.src || "", p.offset)
+        : p.offset;
+    };
+    const lines = divs.map(lineSource);
+    const aO = srcOff(cr.a), fO = srcOff(cr.f);
+    const before = lines[cr.a.line].slice(0, aO);
+    const after = lines[cr.f.line].slice(fO);
+    const ins = String(text || "").replace(/\r/g, "").split("\n");
+    ins[0] = before + ins[0];
+    const caretOff = ins[ins.length - 1].length;
+    ins[ins.length - 1] += after;
+    lines.splice(cr.a.line, cr.f.line - cr.a.line + 1, ...ins);
+    setValue(lines.join("\n"));
+    // place the caret at the end of the pasted text
+    const lineIdx = cr.a.line + ins.length - 1;
+    internal = true;
+    const d = lineDivs()[lineIdx];
+    if (d) {
+      renderLineDiv(d, lines[lineIdx], true);
+      activeRange = [lineIdx, lineIdx];
+      const p = placePoint(d, Math.min(caretOff, d.textContent.length));
+      const sel = document.getSelection();
+      const r = document.createRange();
+      try {
+        r.setStart(p.node, p.off);
+        r.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(r);
+      } catch (e) { /* ignore */ }
+    }
+    internal = false;
+    if (opts.onChange) opts.onChange();
+  }
+
+  function onFocusOut() {
+    setTimeout(() => {
+      if (document.activeElement !== container) deactivate();
+    }, 0);
+  }
+
+  function setValue(text) {
+    internal = true;
+    container.innerHTML = "";
+    const lines = String(text || "").replace(/\r/g, "").split("\n");
+    for (const raw of lines) {
+      const div = document.createElement("div");
+      renderLineDiv(div, raw, false);
+      container.appendChild(div);
+    }
+    activeRange = null;
+    internal = false;
+  }
+
+  function getValue() {
+    return lineDivs().map(lineSource).join("\n");
+  }
+
+  container.addEventListener("beforeinput", onBeforeInput);
+  container.addEventListener("input", onInput);
+  container.addEventListener("paste", onPaste);
+  container.addEventListener("focusout", onFocusOut);
+  container.addEventListener("compositionstart", () => { composing = true; });
+  container.addEventListener("compositionend", () => {
+    composing = false;
+    onInput();
+  });
+  document.addEventListener("selectionchange", onSelectionChange);
+
+  setValue(opts.value || "");
+  return { el: container, get: getValue, set: setValue,
+           focus: () => container.focus() };
+}
+
+// --- markdown overlay window (WHL description pencil) --
+
+let overlayMd = null;
 function openMarkdownEditor(targetTextareaId, title) {
   state.mdTarget = targetTextareaId;
   el("md-title").textContent = title || "MARKDOWN EDITOR";
-  el("md-input").value = el(targetTextareaId).value;
+  overlayMd.set(el(targetTextareaId).value);
   el("md-overlay").hidden = false;
-  mdOverlayUpdate();
-  el("md-input").focus();
+  overlayMd.focus();
 }
 
 function closeMarkdownEditor(apply) {
   if (apply && state.mdTarget) {
-    el(state.mdTarget).value = el("md-input").value;
+    el(state.mdTarget).value = overlayMd.get();
   }
   state.mdTarget = null;
   el("md-overlay").hidden = true;
+}
+
+// --- PDF viewer (reusable component) -------------------------------------------
+// Renders a PDF inline via the browser's viewer. Local files stream through
+// /api/pdf; remote URLs load directly (with an open-in-tab fallback).
+
+function pdfLocalSrc(path) {
+  return "/api/pdf?path=" + encodeURIComponent(path);
+}
+
+function createPdfViewer() {
+  const root = document.createElement("div");
+  root.className = "pdf-viewer";
+  root.innerHTML = `
+    <div class="pdf-bar">
+      <span class="pdf-path tool-label"></span>
+      <a class="cad-btn tiny pdf-open" target="_blank" rel="noopener" hidden>OPEN IN TAB</a>
+    </div>
+    <div class="pdf-body">
+      <iframe class="pdf-frame" title="PDF preview" hidden></iframe>
+      <div class="pdf-note empty">NO PDF SELECTED</div>
+    </div>`;
+  const frame = root.querySelector(".pdf-frame");
+  const note = root.querySelector(".pdf-note");
+  const path = root.querySelector(".pdf-path");
+  const open = root.querySelector(".pdf-open");
+  return {
+    el: root,
+    show(src, label) {
+      if (frame.getAttribute("src") !== src) frame.src = src;
+      frame.hidden = false;
+      note.hidden = true;
+      path.textContent = label || src;
+      path.dataset.tip = src;
+      open.href = src;
+      open.hidden = false;
+    },
+    clear(msg) {
+      frame.removeAttribute("src");
+      frame.hidden = true;
+      note.textContent = msg || "NO PDF SELECTED";
+      note.hidden = false;
+      path.textContent = "";
+      delete path.dataset.tip;
+      open.hidden = true;
+    },
+  };
+}
+
+// --- local file browser (pick a PDF) ---------------------------------------------
+
+let fbOnPick = null;
+
+function fmtSize(n) {
+  if (!n && n !== 0) return "";
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + " GB";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + " MB";
+  return Math.max(1, Math.round(n / 1e3)) + " KB";
+}
+
+async function fbLoad(dir) {
+  let data;
+  try {
+    data = await (await fetch("/api/pdf/browse?dir=" + encodeURIComponent(dir || ""))).json();
+  } catch (e) {
+    el("fb-list").innerHTML = `<p class="empty">CANNOT LIST DIRECTORY</p>`;
+    return;
+  }
+  el("fb-path").value = data.dir;
+  state.settings.pdfBrowseDir = data.dir;
+  saveSettings();
+
+  const drives = el("fb-drives");
+  drives.innerHTML = "";
+  for (const d of data.drives || []) {
+    const b = document.createElement("button");
+    b.className = "cad-btn tiny";
+    b.type = "button";
+    b.textContent = d;
+    b.addEventListener("click", () => fbLoad(d));
+    drives.appendChild(b);
+  }
+
+  const list = el("fb-list");
+  list.innerHTML = "";
+  const row = (label, cls, cb, tip) => {
+    const div = document.createElement("div");
+    div.className = "fb-row " + cls;
+    div.textContent = label;
+    if (tip) div.dataset.tip = tip;
+    div.addEventListener("click", cb);
+    list.appendChild(div);
+  };
+  if (data.parent) row("↑ ..", "dir", () => fbLoad(data.parent));
+  for (const d of data.dirs) row("▸ " + d.name, "dir", () => fbLoad(d.path));
+  for (const f of data.pdfs)
+    row(`▤ ${f.name}  (${fmtSize(f.size)})`, "pdf", () => {
+      if (fbOnPick) fbOnPick(f.path);
+      closeFileBrowser();
+    }, f.path);
+  if (!data.dirs.length && !data.pdfs.length)
+    list.innerHTML = `<p class="empty">NO SUBFOLDERS OR PDF FILES</p>`;
+}
+
+function openFileBrowser(startDir, onPick) {
+  fbOnPick = onPick;
+  el("fb-overlay").hidden = false;
+  fbLoad(startDir || state.settings.pdfBrowseDir || "downloads/ia");
+}
+
+function closeFileBrowser() {
+  fbOnPick = null;
+  el("fb-overlay").hidden = true;
 }
 
 // --- Internet Archive PDF downloads ---------------------------------------------
@@ -1869,13 +2416,13 @@ function clearProv() {
 }
 
 function initPaneTabs() {
-  for (const t of document.querySelectorAll(".pane-tab[data-ptab]")) {
+  for (const t of document.querySelectorAll("#manual-pane .pane-tab[data-ptab]")) {
     t.addEventListener("click", () => switchPaneTab(t.dataset.ptab));
   }
 }
 
 function switchPaneTab(id) {
-  document.querySelectorAll(".pane-tab[data-ptab]").forEach((t) =>
+  document.querySelectorAll("#manual-pane .pane-tab[data-ptab]").forEach((t) =>
     t.classList.toggle("active", t.dataset.ptab === id));
   document.querySelectorAll("#manual-pane .pane-sub").forEach((p) =>
     p.classList.toggle("active", p.id === id));
@@ -1987,11 +2534,7 @@ async function pickOlWork(r) {
 
 async function olSearch(ev) {
   ev.preventDefault();
-  if (!state.settings.showCatalog) {
-    state.settings.showCatalog = true;
-    el("show-catalog").checked = true;
-    saveSettings();
-  }
+  setSearchPane(true);
   const tabs = bottomTabs();
   let i = tabs.indexOf("ol");
   if (i < 0) { tabs.push("ol"); i = tabs.length - 1; }
@@ -2160,6 +2703,13 @@ function clearChecked() {
   status("CLEARED CHECKED BOOKS");
 }
 
+function setSearchPane(on) {
+  state.settings.showCatalog = !!on;
+  saveSettings();
+  el("show-catalog").classList.toggle("active", state.settings.showCatalog);
+  renderBottomPane();
+}
+
 // --- upload list: approved sources + the book builder ------------------------------
 
 const ARCHIVE_NAMES = { internet_archive: "Internet Archive", hathitrust: "HathiTrust" };
@@ -2205,7 +2755,10 @@ function approvedSources() {
 function renderUpload() {
   renderBuildsList();
   renderBuildEditor();
+  // snapshot: the BUILD buttons index into the list as rendered, so a
+  // background state change can't misdirect a click
   const sources = approvedSources();
+  state.uploadSources = sources;
   const tbody = el("upload-rows");
   tbody.innerHTML = "";
   el("sources-count").textContent = `${sources.length} APPROVED SOURCES`;
@@ -2220,7 +2773,7 @@ function renderUpload() {
       <td>${esc(s.year)}</td>
       <td>${esc(s.archive)}</td>
       <td>${s.url
-        ? `<a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.matched_title) || "(record)"}</a>`
+        ? `<a href="${esc(s.url)}" target="_blank" rel="noopener" data-tip="${esc(s.url)}">${esc(s.matched_title) || "(record)"}</a>`
         : esc(s.matched_title)}</td>
       <td class="col-act"><button class="cad-btn tiny" data-build-src="${i}"
         data-tip="Start a catalog entry prefilled from this source">BUILD</button></td>`;
@@ -2245,6 +2798,10 @@ function downloadUploadList() {
 
 // --- the book builder --
 
+let buildDescMd = null;      // live markdown editor in the ENTRY tab
+let buildPdfViewer = null;   // PDF viewer in the SOURCE tab
+const descState = { id: null, val: null };  // last value set into the editor
+
 async function loadBuilds() {
   try {
     const res = await fetch("/api/builds");
@@ -2255,6 +2812,10 @@ async function loadBuilds() {
 function buildsSorted() {
   return Object.values(state.builds)
     .sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
+}
+
+function currentBuild() {
+  return state.buildSel ? state.builds[state.buildSel] || null : null;
 }
 
 function renderBuildsList() {
@@ -2278,9 +2839,14 @@ function renderBuildsList() {
   }
 }
 
+function activeBuildTab() {
+  const t = document.querySelector("#build-tabs .pane-tab.active");
+  return t ? t.dataset.btab : "btab-entry";
+}
+
 function renderBuildEditor() {
   const ed = el("build-editor");
-  const b = state.buildSel ? state.builds[state.buildSel] : null;
+  const b = currentBuild();
   ed.hidden = !b;
   if (!b) return;
   for (const f of BUILD_FIELDS) {
@@ -2288,8 +2854,13 @@ function renderBuildEditor() {
     if (input) input.value = b[f] || "";
   }
   el("b-ready").checked = b.status === "ready";
-  el("b-description").value = b.description || "";
-  el("b-desc-preview").innerHTML = mdRender(b.description || "");
+  // only reset the description editor when its saved content changed —
+  // background renders must not wipe an in-progress edit
+  if (descState.id !== b.id || descState.val !== (b.description || "")) {
+    buildDescMd.set(b.description || "");
+    descState.id = b.id;
+    descState.val = b.description || "";
+  }
   const pdf = (b.pdf_source || "").trim();
   el("b-pdf-open").hidden = !/^https?:\/\//i.test(pdf);
   el("b-pdf-open").href = pdf;
@@ -2297,7 +2868,7 @@ function renderBuildEditor() {
   el("b-src-open").hidden = !/^https?:\/\//i.test(src);
   el("b-src-open").href = src;
   el("build-msg").textContent = "";
-  el("build-desc-msg").textContent = "";
+  if (activeBuildTab() === "btab-source") refreshSourceTab();
 }
 
 function selectBuild(id) {
@@ -2338,19 +2909,38 @@ async function createBuild(seed, label) {
 }
 
 function buildSeedFromSource(s) {
-  // If the PDF was already downloaded from IA, point at the local file.
-  let pdf = "";
-  if (s.identifier && state.downloadedIds.has(s.identifier)) {
-    pdf = `downloads/ia/${s.identifier}.pdf`;
-  } else if (s.identifier) {
-    pdf = `https://archive.org/download/${s.identifier}/${s.identifier}.pdf`;
+  // pdf_source records where the scan lives online; pdf_file is filled with
+  // the already-downloaded local copy when one exists.
+  let pdfUrl = "", pdfFile = "";
+  if (s.identifier) {
+    pdfUrl = `https://archive.org/download/${s.identifier}/${s.identifier}.pdf`;
+    if (state.downloadedIds.has(s.identifier)) {
+      pdfFile = `downloads/ia/${s.identifier}.pdf`;
+    }
+  } else if (/^https?:\/\/.*\.pdf(\?|$)/i.test(s.url || "")) {
+    pdfUrl = s.url;
   }
   return {
     title: s.title, subtitle: s.subtitle, authors: s.author,
     year: s.year, publisher: s.publisher,
-    pdf_source: pdf, source_url: s.url,
+    pdf_source: pdfUrl, pdf_file: pdfFile, source_url: s.url,
     notes: `Source: ${s.archive}${s.matched_title ? " — " + s.matched_title : ""}`,
   };
+}
+
+async function patchBuildRaw(id, fields) {
+  const res = await fetch(`/api/builds/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(fields),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.ok && data.ok) {
+    state.builds[id] = data.build;
+    renderUpload();
+    return true;
+  }
+  return false;
 }
 
 async function patchBuild(id, fields, label) {
@@ -2358,31 +2948,17 @@ async function patchBuild(id, fields, label) {
   if (!b) return false;
   const before = {};
   for (const f of Object.keys(fields)) before[f] = b[f] || "";
-  const doPatch = async (vals) => {
-    const res = await fetch(`/api/builds/${encodeURIComponent(id)}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(vals),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok && data.ok) {
-      state.builds[id] = data.build;
-      renderUpload();
-      return true;
-    }
-    return false;
-  };
-  if (await doPatch(fields)) {
+  if (await patchBuildRaw(id, fields)) {
     pushOp(label || `edit build ${b.title || id}`,
-      () => doPatch(before),
-      () => doPatch(fields));
+      () => patchBuildRaw(id, before),
+      () => patchBuildRaw(id, fields));
     return true;
   }
   return false;
 }
 
 async function saveBuildFields(ev) {
-  ev.preventDefault();
+  if (ev) ev.preventDefault();
   const id = state.buildSel;
   if (!id) return;
   const fields = {};
@@ -2390,25 +2966,16 @@ async function saveBuildFields(ev) {
     const input = el("b-" + f);
     if (input) fields[f] = input.value.trim();
   }
+  fields.description = buildDescMd.get();
   fields.status = el("b-ready").checked ? "ready" : "draft";
   if (!fields.title) { el("build-msg").textContent = "TITLE IS REQUIRED"; return; }
   if (await patchBuild(id, fields, `edit build ${fields.title.slice(0, 30)}`)) {
+    descState.id = id;
+    descState.val = fields.description;
     el("build-msg").textContent = "SAVED";
     status(`BUILD SAVED :: ${fields.title}`);
   } else {
     el("build-msg").textContent = "SAVE FAILED";
-  }
-}
-
-async function saveBuildDescription() {
-  const id = state.buildSel;
-  if (!id) return;
-  if (await patchBuild(id, { description: el("b-description").value },
-      "edit build description")) {
-    el("build-desc-msg").textContent = "SAVED";
-    status("BUILD DESCRIPTION SAVED");
-  } else {
-    el("build-desc-msg").textContent = "SAVE FAILED";
   }
 }
 
@@ -2458,10 +3025,72 @@ function exportBuilds() {
 }
 
 function switchBuildTab(id) {
-  document.querySelectorAll("#build-editor .pane-tab").forEach((t) =>
+  document.querySelectorAll("#build-tabs .pane-tab").forEach((t) =>
     t.classList.toggle("active", t.dataset.btab === id));
   document.querySelectorAll("#build-editor .pane-sub").forEach((p) =>
     p.classList.toggle("active", p.id === id));
+  if (id === "btab-source") refreshSourceTab();
+}
+
+// --- the builder's SOURCE tab: verify the PDF before marking READY --
+
+function iaIdentFromBuild(b) {
+  for (const u of [b.pdf_source, b.source_url]) {
+    if (!u) continue;
+    if (u.includes("/details/"))
+      return u.split("/details/")[1].split(/[/?#]/)[0];
+    if (u.includes("archive.org/download/"))
+      return u.split("/download/")[1].split(/[/?#]/)[0].split("/")[0];
+  }
+  return "";
+}
+
+async function refreshSourceTab() {
+  const b = currentBuild();
+  if (!b) return;
+  let localPath = (b.pdf_file || "").trim();
+  // auto-populate: a PDF that was auto-sourced from a URL and already
+  // downloaded gets its local path attached without asking
+  if (!localPath) {
+    const ident = iaIdentFromBuild(b);
+    if (ident && state.downloadedIds.has(ident)) {
+      localPath = `downloads/ia/${ident}.pdf`;
+      await patchBuildRaw(b.id, { pdf_file: localPath });
+      el("b-src-msg").textContent = "LOCAL PDF ATTACHED AUTOMATICALLY";
+    }
+  }
+  el("b-pdf_file").value = localPath;
+  if (localPath) {
+    buildPdfViewer.show(pdfLocalSrc(localPath), localPath);
+  } else if (/^https?:\/\//i.test((b.pdf_source || "").trim())) {
+    buildPdfViewer.show(b.pdf_source.trim(), b.pdf_source.trim() + "  (remote)");
+  } else {
+    buildPdfViewer.clear(
+      "NO PDF SOURCE — paste a URL in the ENTRY tab or attach a local file above");
+  }
+}
+
+async function attachPdfFile(path) {
+  const b = currentBuild();
+  if (!b) return;
+  const p = (path != null ? path : el("b-pdf_file").value).trim();
+  el("b-pdf_file").value = p;
+  if (p) {
+    // confirm the file is actually readable before saving the path
+    let ok = false;
+    try { ok = (await fetch(pdfLocalSrc(p), { method: "HEAD" })).ok; } catch (e) {}
+    if (!ok) {
+      el("b-src-msg").textContent = "FILE NOT FOUND (or not a PDF)";
+      return;
+    }
+  }
+  if (await patchBuild(b.id, { pdf_file: p },
+      p ? `attach PDF to ${b.title || b.id}` : `detach PDF from ${b.title || b.id}`)) {
+    el("b-src-msg").textContent = p ? "ATTACHED" : "DETACHED";
+    refreshSourceTab();
+  } else {
+    el("b-src-msg").textContent = "SAVE FAILED";
+  }
 }
 
 // --- wire up ---------------------------------------------------------------
@@ -2476,19 +3105,29 @@ function init() {
   initPaneTabs();
   loadOlStatus();
 
-  // undo / redo
+  // undo / redo (toolbar)
   el("undo-btn").addEventListener("click", undo);
   el("redo-btn").addEventListener("click", redo);
   document.addEventListener("keydown", (ev) => {
     if (!(ev.ctrlKey || ev.metaKey)) return;
     const t = ev.target;
-    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
     const k = ev.key.toLowerCase();
     if (k === "z" && !ev.shiftKey) { ev.preventDefault(); undo(); }
     else if (k === "y" || (k === "z" && ev.shiftKey)) { ev.preventDefault(); redo(); }
   });
 
-  // checked tab toolbar
+  // checked-tab toolbar commands
+  el("run-scans").addEventListener("click", runScansBatch);
+  el("whl-scrape").addEventListener("click", startWhlScrape);
+  el("dl-approved").addEventListener("click", downloadApproved);
+  el("export-json").addEventListener("click", exportJson);
+  el("clear-checked").addEventListener("click", clearChecked);
+  el("show-catalog").classList.toggle("active", !!state.settings.showCatalog);
+  el("show-catalog").addEventListener("click", () =>
+    setSearchPane(!state.settings.showCatalog));
+
+  // checked-tab filter bar
   el("checked-search").addEventListener("input", () => {
     state.checkedFilter = el("checked-search").value.trim();
     state.olOverride = null;
@@ -2502,17 +3141,6 @@ function init() {
     saveSettings();
     renderChecked();
   });
-  el("show-catalog").checked = !!state.settings.showCatalog;
-  el("show-catalog").addEventListener("change", () => {
-    state.settings.showCatalog = el("show-catalog").checked;
-    saveSettings();
-    renderBottomPane();
-  });
-  el("run-scans").addEventListener("click", runScansBatch);
-  el("whl-scrape").addEventListener("click", startWhlScrape);
-  el("dl-approved").addEventListener("click", downloadApproved);
-  el("export-json").addEventListener("click", exportJson);
-  el("clear-checked").addEventListener("click", clearChecked);
   el("checked-rows").addEventListener("click", onCheckedClick);
 
   // top pane: table selector + WHL interactions
@@ -2607,8 +3235,40 @@ function init() {
     });
   })();
 
-  // markdown editor (overlay for the WHL description, inline for builds)
-  mdOverlayUpdate = bindMdPreview("md-input", "md-preview");
+  // resizable approved-sources pane (vertical splitter in the upload tab)
+  (() => {
+    const sp = el("upload-splitter");
+    const top = el("upload-split");
+    if (state.settings.uploadSplitH) {
+      top.style.height = state.settings.uploadSplitH + "px";
+      top.style.flex = "none";
+    }
+    let dragging = false;
+    sp.addEventListener("mousedown", (ev) => {
+      dragging = true;
+      ev.preventDefault();
+      document.body.classList.add("resizing-v");
+    });
+    document.addEventListener("mousemove", (ev) => {
+      if (!dragging) return;
+      const min = 160;
+      const max = Math.max(min, el("upload").clientHeight - 180);
+      const h = Math.min(max, Math.max(min, ev.clientY - top.getBoundingClientRect().top));
+      top.style.height = h + "px";
+      top.style.flex = "none";
+    });
+    document.addEventListener("mouseup", () => {
+      if (!dragging) return;
+      dragging = false;
+      document.body.classList.remove("resizing-v");
+      state.settings.uploadSplitH = parseInt(top.style.height, 10) || null;
+      saveSettings();
+    });
+  })();
+
+  // markdown: the builder's live editor + the overlay window (WHL pencil)
+  buildDescMd = createMdEditor(el("b-desc-editor"));
+  overlayMd = createMdEditor(el("md-live-overlay"));
   el("w-desc-md").addEventListener("click", () =>
     openMarkdownEditor("w-description", "MARKDOWN :: WHL DESCRIPTION"));
   el("md-apply").addEventListener("click", () => closeMarkdownEditor(true));
@@ -2617,9 +3277,10 @@ function init() {
   el("md-overlay").addEventListener("mousedown", (ev) => {
     if (ev.target === el("md-overlay")) closeMarkdownEditor(false);
   });
-  bindMdPreview("b-description", "b-desc-preview");
 
   // upload list / book builder
+  buildPdfViewer = createPdfViewer();
+  el("b-pdf-viewer").appendChild(buildPdfViewer.el);
   el("build-new").addEventListener("click", () => createBuild({}, "(blank)"));
   el("export-builds").addEventListener("click", exportBuilds);
   el("download-upload-list").addEventListener("click", downloadUploadList);
@@ -2628,17 +3289,37 @@ function init() {
     if (li) selectBuild(li.dataset.bid);
   });
   el("build-form").addEventListener("submit", saveBuildFields);
+  el("build-save").addEventListener("click", saveBuildFields);
   el("build-delete").addEventListener("click", deleteBuild);
-  el("build-desc-save").addEventListener("click", saveBuildDescription);
   el("upload-rows").addEventListener("click", (ev) => {
     const b = ev.target.closest("[data-build-src]");
     if (!b) return;
-    const s = approvedSources()[parseInt(b.dataset.buildSrc, 10)];
+    const s = (state.uploadSources || [])[parseInt(b.dataset.buildSrc, 10)];
     if (s) createBuild(buildSeedFromSource(s), s.title.slice(0, 30));
   });
-  for (const t of document.querySelectorAll("#build-editor .pane-tab")) {
+  for (const t of document.querySelectorAll("#build-tabs .pane-tab")) {
     t.addEventListener("click", () => switchBuildTab(t.dataset.btab));
   }
+  el("b-pdf-attach").addEventListener("click", () => attachPdfFile());
+  el("b-pdf_file").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); attachPdfFile(); }
+  });
+  el("b-pdf-browse").addEventListener("click", () => {
+    const cur = el("b-pdf_file").value.trim();
+    const dir = cur.includes("/") || cur.includes("\\")
+      ? cur.replace(/[/\\][^/\\]*$/, "") : "";
+    openFileBrowser(dir, (path) => attachPdfFile(path));
+  });
+
+  // file browser window
+  el("fb-close").addEventListener("click", closeFileBrowser);
+  el("fb-go").addEventListener("click", () => fbLoad(el("fb-path").value.trim()));
+  el("fb-path").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); fbLoad(el("fb-path").value.trim()); }
+  });
+  el("fb-overlay").addEventListener("mousedown", (ev) => {
+    if (ev.target === el("fb-overlay")) closeFileBrowser();
+  });
 
   // manual source + settings windows
   el("msrc-close").addEventListener("click", closeManualSource);
@@ -2657,7 +3338,8 @@ function init() {
   });
   document.addEventListener("keydown", (ev) => {
     if (ev.key !== "Escape") return;
-    if (!el("md-overlay").hidden) closeMarkdownEditor(false);
+    if (!el("fb-overlay").hidden) closeFileBrowser();
+    else if (!el("md-overlay").hidden) closeMarkdownEditor(false);
     else if (!el("msrc-overlay").hidden) closeManualSource();
     else if (!el("settings-overlay").hidden) closeSettings();
   });
