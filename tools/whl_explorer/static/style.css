@@ -24,73 +24,367 @@
   --mono: "Consolas", "DejaVu Sans Mono", "Courier New", monospace;
 }
 
-/* --- themes: same geometry, era palettes (~1995-2008) --- */
-body[data-theme="cde"] {
-  --face: #aeb2c3;
-  --face-hi: #dde0ea;
-  --face-sh: #7a7d92;
-  --face-sh2: #45475a;
-  --face-active: #c8ccdb;
-  --canvas: #1e3236;
-  --canvas-line: #2e4a50;
-  --ink: #1c1c28;
-  --ink-light: #d8e4e2;
-  --input-bg: #eef0f6;
-  --input-ink: #1c1c28;
-  --row-hover: #2b4650;
-  --row-checked: #1d4a44;
-  --row-manual: #2c4433;
-  --cyan: #63d3cf;
-  --green: #43c98a;
-  --amber: #d9a441;
-  --red: #d05a5a;
-  --blue: #3c4a75;
-  --blue2: #5a6a9e;
+/* =====================================================================
+   THEMES - each is a full rework of the interface chrome, not a recolor.
+   Geometry (text sizes, paddings, element sizes) is preserved.
+
+   ARCHIVE LEDGER   - institutional card-catalog: warm paper, ruled tables,
+                      double rules, letterpress buttons, folder tabs.
+   WORKSTATION 2000 - turn-of-the-millennium business software: thin 1px
+                      chrome, listview tables on white, caption gradient,
+                      sunken status wells, info-yellow tooltips.
+   SLATE STUDIO     - mid-2000s professional studio suite: steel gradients,
+                      soft corners, pill tags, charcoal work canvas.
+   ==================================================================== */
+
+/* ---------- ARCHIVE LEDGER ---------- */
+body[data-theme="ledger"] {
+  --face: #e9e3d3;
+  --face-hi: #f7f3e7;
+  --face-sh: #c2b593;
+  --face-sh2: #8b7e60;
+  --face-active: #fbf8ee;
+  --canvas: #fbf8ee;
+  --canvas-line: #e7ddc2;
+  --ink: #2c2517;
+  --ink-light: #33291a;
+  --input-bg: #fffdf6;
+  --input-ink: #2c2517;
+  --row-hover: #f1e9d0;
+  --row-checked: #dfe9d4;
+  --row-manual: #e9e0ef;
+  --cyan: #1d6b5e;
+  --green: #2e6b34;
+  --amber: #8a6414;
+  --red: #8c2e21;
+  --blue: #2f4636;
+  --blue2: #48664f;
 }
-body[data-theme="acad"] {
-  --face: #3f4046;
-  --face-hi: #6e7078;
-  --face-sh: #26272c;
-  --face-sh2: #101114;
-  --face-active: #55575f;
-  --canvas: #000000;
-  --canvas-line: #1e2028;
-  --ink: #e0e0e4;
-  --ink-light: #d6d6da;
-  --input-bg: #0e0e12;
-  --input-ink: #e6e6ea;
-  --row-hover: #121a28;
-  --row-checked: #0c2a33;
-  --row-manual: #12240f;
-  --cyan: #00e5e5;
-  --green: #2ce02c;
-  --amber: #e6b400;
-  --red: #ff5252;
-  --blue: #16324f;
-  --blue2: #285a86;
+body[data-theme="ledger"] .cad-btn,
+body[data-theme="ledger"] #settings-close,
+body[data-theme="ledger"] #msrc-close {
+  border: 1px solid #a2946f;
+  border-bottom-width: 2px;
+  border-radius: 2px;
+  background: linear-gradient(#f8f3e4, #ece4cd);
+  color: var(--ink);
 }
-body[data-theme="xp2003"] {
-  --face: #ece9d8;
+body[data-theme="ledger"] .cad-btn:hover { background: linear-gradient(#fbf7ec, #f0e9d5); }
+body[data-theme="ledger"] .cad-btn:active {
+  border: 1px solid #a2946f;
+  transform: translateY(1px);
+  background: #e6ddc4;
+}
+body[data-theme="ledger"] .cad-btn:disabled { color: #a99c7e; background: #ece6d5; }
+body[data-theme="ledger"] .cad-btn.danger { color: var(--red); }
+body[data-theme="ledger"] .cad-input,
+body[data-theme="ledger"] .cell-edit {
+  border: 1px solid #a2946f;
+  border-radius: 2px;
+  box-shadow: inset 0 1px 2px rgba(0,0,0,0.08);
+}
+body[data-theme="ledger"] .tab,
+body[data-theme="ledger"] .pane-tab {
+  border: 1px solid #a2946f;
+  border-bottom: none;
+  border-radius: 5px 5px 0 0;
+  background: #e0d7bd;
+}
+body[data-theme="ledger"] .tab.active,
+body[data-theme="ledger"] .pane-tab.active {
+  background: var(--canvas);
+  box-shadow: inset 0 3px 0 var(--blue);
+  transform: none;
+}
+body[data-theme="ledger"] #titlebar,
+body[data-theme="ledger"] #settings-titlebar,
+body[data-theme="ledger"] #msrc-titlebar {
+  background: var(--blue);
+  border-bottom: 3px double #1d2c22;
+}
+body[data-theme="ledger"] #toolbar,
+body[data-theme="ledger"] #checked-toolbar,
+body[data-theme="ledger"] #upload-toolbar,
+body[data-theme="ledger"] .pane-bar,
+body[data-theme="ledger"] #manual-pane,
+body[data-theme="ledger"] #manual-form {
+  border: 1px solid #c2b593;
+}
+body[data-theme="ledger"] .drafting {
+  background: var(--canvas); /* plain paper, no drafting grid */
+  border: 1px solid #c2b593;
+}
+body[data-theme="ledger"] .grid thead th {
+  background: #efe8d3;
+  border-right: none;
+  border-bottom: 3px double #8b7e60;
+  box-shadow: none;
+}
+body[data-theme="ledger"] .grid tbody td {
+  border-right: none;
+  border-bottom: 1px solid #eadfc4;
+}
+body[data-theme="ledger"] .badge {
+  border-radius: 2px;
+  background: rgba(139, 126, 96, 0.09);
+}
+body[data-theme="ledger"] #cad-tooltip {
+  background: #fffdf0;
+  color: var(--ink);
+  border: 1px solid #8b7e60;
+  box-shadow: 2px 3px 8px rgba(0,0,0,0.25);
+}
+body[data-theme="ledger"] .suggest,
+body[data-theme="ledger"] .ol-suggest {
+  border: 1px solid #8b7e60;
+  box-shadow: 2px 3px 10px rgba(0,0,0,0.15);
+}
+body[data-theme="ledger"] #settings-window,
+body[data-theme="ledger"] #msrc-window {
+  border: 1px solid #8b7e60;
+  border-radius: 3px;
+  box-shadow: 4px 6px 20px rgba(0,0,0,0.35);
+}
+body[data-theme="ledger"] #statusbar { border-top: 3px double #8b7e60; }
+body[data-theme="ledger"] ::-webkit-scrollbar { width: 12px; height: 12px; }
+body[data-theme="ledger"] ::-webkit-scrollbar-track { background: #efe8d3; }
+body[data-theme="ledger"] ::-webkit-scrollbar-thumb {
+  background: #c2b593; border: 2px solid #efe8d3; border-radius: 6px;
+}
+
+/* ---------- WORKSTATION 2000 ---------- */
+body[data-theme="workstation"] {
+  --face: #d6d3ce;
   --face-hi: #ffffff;
-  --face-sh: #aca899;
-  --face-sh2: #716f64;
-  --face-active: #fdfaf1;
-  --canvas: #f6f8fc;
-  --canvas-line: #d8deea;
-  --ink: #1c1c1c;
-  --ink-light: #24344e;
+  --face-sh: #9a9891;
+  --face-sh2: #6b6961;
+  --face-active: #f4f3f0;
+  --canvas: #ffffff;
+  --canvas-line: #eceae6;
+  --ink: #1a1a1a;
+  --ink-light: #1a1a1a;
   --input-bg: #ffffff;
-  --input-ink: #1c1c1c;
-  --row-hover: #dce9fb;
-  --row-checked: #d3e8d3;
-  --row-manual: #e4f1d8;
-  --cyan: #0b6bc2;
-  --green: #2c9e4b;
-  --amber: #c07b00;
-  --red: #c23b22;
-  --blue: #2a5fc1;
-  --blue2: #5f96e8;
+  --input-ink: #1a1a1a;
+  --row-hover: #e5edf8;
+  --row-checked: #cfe0f5;
+  --row-manual: #ddefdb;
+  --cyan: #0a55a6;
+  --green: #1e7a29;
+  --amber: #90650a;
+  --red: #b02b1f;
+  --blue: #0a246a;
+  --blue2: #a6caf0;
 }
+body[data-theme="workstation"] .cad-btn,
+body[data-theme="workstation"] #settings-close,
+body[data-theme="workstation"] #msrc-close {
+  border: 1px solid;
+  border-color: #ffffff #6b6961 #6b6961 #ffffff;
+  background: var(--face);
+}
+body[data-theme="workstation"] .cad-btn:active {
+  border: 1px solid;
+  border-color: #6b6961 #ffffff #ffffff #6b6961;
+}
+body[data-theme="workstation"] .cad-input,
+body[data-theme="workstation"] .cell-edit {
+  border: 1px solid;
+  border-color: #6b6961 #ffffff #ffffff #6b6961;
+  box-shadow: inset 1px 1px 0 #9a9891;
+}
+body[data-theme="workstation"] .tab,
+body[data-theme="workstation"] .pane-tab {
+  border: 1px solid;
+  border-color: #ffffff #6b6961 transparent #ffffff;
+  border-radius: 3px 3px 0 0;
+}
+body[data-theme="workstation"] .tab.active,
+body[data-theme="workstation"] .pane-tab.active {
+  background: var(--face);
+  color: var(--ink);
+}
+body[data-theme="workstation"] #titlebar,
+body[data-theme="workstation"] #settings-titlebar,
+body[data-theme="workstation"] #msrc-titlebar {
+  background: linear-gradient(90deg, #0a246a, #a6caf0);
+}
+body[data-theme="workstation"] #toolbar,
+body[data-theme="workstation"] #checked-toolbar,
+body[data-theme="workstation"] #upload-toolbar,
+body[data-theme="workstation"] .pane-bar,
+body[data-theme="workstation"] #manual-pane,
+body[data-theme="workstation"] #manual-form {
+  border: 1px solid;
+  border-color: #ffffff #9a9891 #9a9891 #ffffff;
+}
+body[data-theme="workstation"] .drafting {
+  background: #ffffff; /* listview, not a drafting canvas */
+  border: 1px solid;
+  border-color: #6b6961 #ffffff #ffffff #6b6961;
+}
+body[data-theme="workstation"] .grid thead th {
+  background: var(--face);
+  border: 1px solid;
+  border-color: #ffffff #6b6961 #6b6961 #ffffff;
+  box-shadow: none;
+}
+body[data-theme="workstation"] .grid tbody td {
+  border-right: none;
+  border-bottom: 1px solid #f0efec;
+}
+body[data-theme="workstation"] .badge { background: #fbfbfa; }
+body[data-theme="workstation"] #cad-tooltip {
+  background: #ffffe1; /* the classic info tip */
+  color: #000000;
+  border: 1px solid #000000;
+  box-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+}
+body[data-theme="workstation"] .suggest,
+body[data-theme="workstation"] .ol-suggest {
+  border: 1px solid #6b6961;
+  box-shadow: 2px 2px 6px rgba(0,0,0,0.25);
+}
+body[data-theme="workstation"] #settings-window,
+body[data-theme="workstation"] #msrc-window {
+  border: 1px solid #6b6961;
+  box-shadow: 3px 3px 10px rgba(0,0,0,0.4);
+}
+body[data-theme="workstation"] #statusbar { border-top: 1px solid #ffffff; }
+body[data-theme="workstation"] #status-msg,
+body[data-theme="workstation"] #status-right {
+  border: 1px solid;
+  border-color: #9a9891 #ffffff #ffffff #9a9891;
+  padding: 1px 8px;
+}
+body[data-theme="workstation"] ::-webkit-scrollbar { width: 14px; height: 14px; }
+body[data-theme="workstation"] ::-webkit-scrollbar-track { background: #efedea; }
+body[data-theme="workstation"] ::-webkit-scrollbar-thumb {
+  background: var(--face);
+  border: 1px solid;
+  border-color: #ffffff #6b6961 #6b6961 #ffffff;
+}
+
+/* ---------- SLATE STUDIO ---------- */
+body[data-theme="slate"] {
+  --face: #aeb9c6;
+  --face-hi: #d9e1ea;
+  --face-sh: #7c8899;
+  --face-sh2: #4a5568;
+  --face-active: #e8eef5;
+  --canvas: #242b34;
+  --canvas-line: #2f3844;
+  --ink: #17202e;
+  --ink-light: #d4dbe4;
+  --input-bg: #ffffff;
+  --input-ink: #17202e;
+  --row-hover: #33414f;
+  --row-checked: #2a4a52;
+  --row-manual: #2e4433;
+  --cyan: #6cc7e0;
+  --green: #59c26e;
+  --amber: #e0aa3e;
+  --red: #e06555;
+  --blue: #31435e;
+  --blue2: #5c7899;
+}
+body[data-theme="slate"] .cad-btn,
+body[data-theme="slate"] #settings-close,
+body[data-theme="slate"] #msrc-close {
+  border: 1px solid #5a687d;
+  border-radius: 3px;
+  background: linear-gradient(#ccd6e2, #a5b2c2);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.55);
+}
+body[data-theme="slate"] .cad-btn:hover { background: linear-gradient(#d9e2ec, #b3c0cf); }
+body[data-theme="slate"] .cad-btn:active {
+  border: 1px solid #4a5568;
+  background: #9caaba;
+  box-shadow: inset 0 1px 3px rgba(0,0,0,0.3);
+}
+body[data-theme="slate"] .cad-input,
+body[data-theme="slate"] .cell-edit {
+  border: 1px solid #5a687d;
+  border-radius: 3px;
+  box-shadow: inset 0 1px 3px rgba(0,0,0,0.22);
+}
+body[data-theme="slate"] .tab,
+body[data-theme="slate"] .pane-tab {
+  border: 1px solid #5a687d;
+  border-bottom: none;
+  border-radius: 4px 4px 0 0;
+  background: rgba(255,255,255,0.16);
+}
+body[data-theme="slate"] .tab.active,
+body[data-theme="slate"] .pane-tab.active {
+  background: linear-gradient(#f2f6fa, #dde5ee);
+  transform: none;
+}
+body[data-theme="slate"] #titlebar,
+body[data-theme="slate"] #settings-titlebar,
+body[data-theme="slate"] #msrc-titlebar {
+  background: linear-gradient(#5d7795, #31435e);
+  border-bottom: 1px solid #1f2b3d;
+  text-shadow: 0 1px 1px rgba(0,0,0,0.45);
+}
+body[data-theme="slate"] #toolbar,
+body[data-theme="slate"] #checked-toolbar,
+body[data-theme="slate"] #upload-toolbar,
+body[data-theme="slate"] .pane-bar,
+body[data-theme="slate"] #manual-pane,
+body[data-theme="slate"] #manual-form {
+  border: 1px solid #7c8899;
+  border-radius: 3px;
+  background: linear-gradient(#bac4d0, #a6b1bf);
+}
+body[data-theme="slate"] .drafting {
+  background: var(--canvas); /* smooth charcoal, no grid */
+  border: 1px solid #4a5568;
+  border-radius: 3px;
+}
+body[data-theme="slate"] .grid thead th {
+  background: linear-gradient(#c3cedb, #9fadbf);
+  color: #1c2635;
+  border-right: 1px solid #8794a5;
+  border-bottom: 1px solid #4a5568;
+  box-shadow: none;
+}
+body[data-theme="slate"] .grid tbody td {
+  border-right: none;
+  border-bottom: 1px solid #2d3641;
+}
+body[data-theme="slate"] .badge { border-radius: 9px; background: rgba(255,255,255,0.07); }
+body[data-theme="slate"] .tag-unit .badge { border-radius: 9px 0 0 9px; }
+body[data-theme="slate"] .vmark { border-radius: 0 9px 9px 0; }
+body[data-theme="slate"] #cad-tooltip {
+  background: rgba(23, 29, 38, 0.95);
+  border: 1px solid #5c7899;
+  border-radius: 4px;
+  box-shadow: 0 5px 16px rgba(0,0,0,0.45);
+}
+body[data-theme="slate"] .suggest,
+body[data-theme="slate"] .ol-suggest {
+  border: 1px solid #5a687d;
+  border-radius: 4px;
+  box-shadow: 0 6px 18px rgba(0,0,0,0.35);
+}
+body[data-theme="slate"] #settings-window,
+body[data-theme="slate"] #msrc-window {
+  border: 1px solid #4a5568;
+  border-radius: 5px;
+  overflow: hidden;
+  box-shadow: 0 12px 34px rgba(0,0,0,0.5);
+}
+body[data-theme="slate"] #statusbar {
+  background: linear-gradient(#c0cad6, #aeb9c6);
+  border-top: 1px solid #7c8899;
+}
+body[data-theme="slate"] #pane-splitter { border-radius: 3px; }
+body[data-theme="slate"] ::-webkit-scrollbar { width: 11px; height: 11px; }
+body[data-theme="slate"] ::-webkit-scrollbar-track { background: #2b3340; }
+body[data-theme="slate"] ::-webkit-scrollbar-thumb {
+  background: #55637a; border-radius: 6px; border: 2px solid #2b3340;
+}
+body[data-theme="slate"] ::-webkit-scrollbar-thumb:hover { background: #6b7c96; }
 
 * { box-sizing: border-box; }
 

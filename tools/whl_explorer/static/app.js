@@ -72,16 +72,24 @@ const state = {
   },
 };
 
-// Themes: same geometry, era-appropriate palettes (1995-2008 enterprise/CAD).
+// Themes: same geometry, but each fully reworks the interface chrome —
+// borders, tab shapes, table rulings, tag geometry, tooltips, scrollbars.
 const THEMES = [
-  ["", "CLASSIC 95 / CAD"],
-  ["cde", "CDE / SOLARIS"],
-  ["acad", "AUTOCAD DARK"],
-  ["xp2003", "XP / OFFICE 2003"],
+  ["", "CLASSIC CAD"],
+  ["ledger", "ARCHIVE LEDGER"],
+  ["workstation", "WORKSTATION 2000"],
+  ["slate", "SLATE STUDIO"],
 ];
+// ids from the earlier palette-only themes
+const LEGACY_THEMES = { cde: "ledger", xp2003: "workstation", acad: "slate" };
 
 function applyTheme() {
-  const t = state.settings.theme || "";
+  let t = state.settings.theme || "";
+  if (LEGACY_THEMES[t]) {
+    t = LEGACY_THEMES[t];
+    state.settings.theme = t;
+    saveSettings();
+  }
   if (t) document.body.dataset.theme = t;
   else delete document.body.dataset.theme;
 }

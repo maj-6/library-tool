@@ -191,8 +191,14 @@ The right side of the checked tab is two panes:
   title to appear verbatim (as a phrase), AUTHOR and YEAR filter by the
   row's values.
   The left panel is resizable by dragging the splitter. SETTINGS offers
-  themes (Classic 95/CAD, CDE/Solaris, AutoCAD dark, XP/Office 2003) that
-  restyle the palette without changing sizes. Note the COPYRIGHT tag reads
+  four themes that rework the whole interface chrome (borders, tab shapes,
+  table rulings, tag geometry, tooltips, scrollbars) while preserving
+  element and text sizes: CLASSIC CAD (beveled chrome over a dark drafting
+  grid), ARCHIVE LEDGER (institutional card-catalog paper: double rules,
+  letterpress buttons, folder tabs), WORKSTATION 2000 (thin-bevel business
+  chrome, white listview tables, caption-bar gradient, info-yellow
+  tooltips), and SLATE STUDIO (mid-2000s studio suite: steel gradients,
+  soft corners, pill tags, charcoal canvas). Note the COPYRIGHT tag reads
   `NO` for public-domain works and `YES` for works under copyright.
 - **Bottom pane** (`SHOW SEARCH PANE`): a tabbed general-purpose viewer.
   `+` adds a tab; the active tab's dropdown selects its table (OPEN LIBRARY /
