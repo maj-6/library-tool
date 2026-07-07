@@ -60,7 +60,7 @@ def copyright_status(row: dict, ren: dict, this_year: int) -> str:
 # --- local library ----------------------------------------------------------
 
 def load_local_library() -> list[dict]:
-    """Local book set: dictated metadata + reviewed db + optional partial."""
+    """Local book set: the hand-entered manual entries + optional partial."""
     books: list[dict] = []
 
     def add(title, author):
@@ -69,10 +69,8 @@ def load_local_library() -> list[dict]:
         if title or author:
             books.append({"title": title, "author": author})
 
-    for entry in lib.load_json(lib.BOOKS_METADATA_PATH, []):
-        add(entry.get("title"), entry.get("author"))
-    db = lib.load_json(lib.LIBRARY_DB_PATH, {})
-    for entry in (db.values() if isinstance(db, dict) else db):
+    manual = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+    for entry in (manual.values() if isinstance(manual, dict) else manual):
         add(entry.get("title"), entry.get("author"))
     partial = lib.load_json(LOCAL_PARTIAL_PATH, [])
     for entry in (partial if isinstance(partial, list) else []):
