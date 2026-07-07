@@ -21,9 +21,11 @@ MANUAL_ENTRIES_PATH = OUTPUT_DIR / "manual_entries.json"
 IA_DOWNLOADS_DIR = ROOT / "downloads" / "ia"
 IA_CATALOG_PATH = IA_DOWNLOADS_DIR / "catalog.json"
 
-# Ordered fields for manually added books.
+# Ordered fields for manually added books. local_pdf holds a locally
+# attached scan (a verified source for books marked SCAN).
 MANUAL_ENTRY_FIELDS = [
     "title",
+    "subtitle",
     "author",
     "publisher",
     "city",
@@ -37,6 +39,7 @@ MANUAL_ENTRY_FIELDS = [
     "illustrations",
     "categories",
     "notes",
+    "local_pdf",
 ]
 
 

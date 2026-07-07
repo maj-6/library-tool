@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>CATALOG EXPLORER</title>
+  <title>Catalog Explorer</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
 </head>
 <body>
   <div id="titlebar">
-    <span class="tb-name" id="tb-name">CATALOGS :: CATALOG EXPLORER</span>
+    <span class="tb-name" id="tb-name">Catalogs :: Catalog Explorer</span>
     <span class="tb-right">
-      <span class="tb-meta" id="tb-meta">v2.3</span>
+      <span class="tb-meta" id="tb-meta">v2.6</span>
     </span>
   </div>
 
@@ -102,36 +102,37 @@
             <form id="ol-form" autocomplete="off">
               <div class="mf-grid">
                 <div class="mf-field mf-full">
-                  <label class="tool-label" for="s-title">TITLE</label>
+                  <label class="tool-label" for="s-title">Title</label>
                   <input id="s-title" class="cad-input" />
                 </div>
                 <div class="mf-field mf-full">
-                  <label class="tool-label" for="s-author">AUTHOR</label>
+                  <label class="tool-label" for="s-author">Author</label>
                   <input id="s-author" class="cad-input" />
                 </div>
                 <div class="mf-field">
-                  <label class="tool-label" for="s-publisher">PUBLISHER</label>
+                  <label class="tool-label" for="s-publisher">Publisher</label>
                   <input id="s-publisher" class="cad-input" />
                 </div>
                 <div class="mf-field">
-                  <label class="tool-label" for="s-city">CITY</label>
+                  <label class="tool-label" for="s-city">City</label>
                   <input id="s-city" class="cad-input" />
                 </div>
                 <div class="mf-field mf-third">
-                  <label class="tool-label" for="s-year">YEAR</label>
+                  <label class="tool-label" for="s-year">Year</label>
                   <input id="s-year" class="cad-input" />
                 </div>
                 <div class="mf-field mf-third">
-                  <label class="tool-label" for="s-edition">EDITION</label>
+                  <label class="tool-label" for="s-edition">Edition</label>
                   <input id="s-edition" class="cad-input" />
                 </div>
                 <div class="mf-field mf-third">
-                  <label class="tool-label" for="s-volume">VOLUME NO</label>
+                  <label class="tool-label" for="s-volume">Volume</label>
                   <input id="s-volume" class="cad-input" />
                 </div>
               </div>
               <div class="mf-actions">
-                <button id="ol-search-btn" class="cad-btn" type="submit">SEARCH</button>
+                <button id="ol-search-btn" class="cad-btn icon-btn" type="submit"
+                        data-icon="search" data-tip="Search Open Library"></button>
                 <span class="tool-label" id="ol-msg"></span>
               </div>
             </form>
@@ -141,65 +142,70 @@
           <form id="manual-form" autocomplete="off">
             <div class="mf-grid">
               <div class="mf-field mf-full">
-                <label class="tool-label" for="m-title">TITLE *</label>
+                <label class="tool-label" for="m-title">Title *</label>
                 <input id="m-title" class="cad-input" name="title" />
                 <div id="ol-suggest" class="ol-suggest" hidden></div>
               </div>
               <div class="mf-field mf-full">
-                <label class="tool-label" for="m-author">AUTHOR</label>
+                <label class="tool-label" for="m-subtitle">Subtitle</label>
+                <input id="m-subtitle" class="cad-input" name="subtitle" />
+              </div>
+              <div class="mf-field mf-full">
+                <label class="tool-label" for="m-author">Author</label>
                 <input id="m-author" class="cad-input" name="author" />
               </div>
               <div class="mf-field">
-                <label class="tool-label" for="m-publisher">PUBLISHER</label>
+                <label class="tool-label" for="m-publisher">Publisher</label>
                 <input id="m-publisher" class="cad-input" name="publisher" />
               </div>
               <div class="mf-field">
-                <label class="tool-label" for="m-city">CITY</label>
+                <label class="tool-label" for="m-city">City</label>
                 <input id="m-city" class="cad-input" name="city" />
               </div>
               <div class="mf-field mf-third">
-                <label class="tool-label" for="m-year">YEAR</label>
+                <label class="tool-label" for="m-year">Year</label>
                 <input id="m-year" class="cad-input" name="year" />
               </div>
               <div class="mf-field mf-third">
-                <label class="tool-label" for="m-edition">EDITION</label>
+                <label class="tool-label" for="m-edition">Edition</label>
                 <input id="m-edition" class="cad-input" name="edition" />
               </div>
               <div class="mf-field mf-third">
-                <label class="tool-label" for="m-volume">VOLUME NO</label>
+                <label class="tool-label" for="m-volume">Volume</label>
                 <input id="m-volume" class="cad-input" name="volume" />
               </div>
               <div class="mf-field">
-                <label class="tool-label" for="m-language">LANGUAGE</label>
+                <label class="tool-label" for="m-language">Language</label>
                 <input id="m-language" class="cad-input" name="language" />
               </div>
               <div class="mf-field">
-                <label class="tool-label" for="m-pages">PAGES</label>
+                <label class="tool-label" for="m-pages">Pages</label>
                 <input id="m-pages" class="cad-input" name="pages" />
               </div>
               <div class="mf-field">
-                <label class="tool-label" for="m-condition">CONDITION</label>
+                <label class="tool-label" for="m-condition">Condition</label>
                 <input id="m-condition" class="cad-input" name="condition" />
               </div>
               <div class="mf-field">
-                <label class="tool-label" for="m-price">PRICE</label>
+                <label class="tool-label" for="m-price">Price</label>
                 <input id="m-price" class="cad-input" name="price" />
               </div>
               <div class="mf-field mf-full">
-                <label class="tool-label" for="m-illustrations">ILLUSTRATIONS</label>
+                <label class="tool-label" for="m-illustrations">Illustrations</label>
                 <input id="m-illustrations" class="cad-input" name="illustrations" />
               </div>
               <div class="mf-field mf-full">
-                <label class="tool-label" for="m-categories">CATEGORIES</label>
+                <label class="tool-label" for="m-categories">Categories</label>
                 <input id="m-categories" class="cad-input" name="categories" />
               </div>
               <div class="mf-field mf-full">
-                <label class="tool-label" for="m-notes">NOTES</label>
+                <label class="tool-label" for="m-notes">Notes</label>
                 <textarea id="m-notes" class="cad-input" name="notes" rows="4"></textarea>
               </div>
             </div>
             <div class="mf-actions">
-              <button id="manual-submit" class="cad-btn" type="submit">SUBMIT ENTRY</button>
+              <button id="manual-submit" class="cad-btn icon-btn" type="submit"
+                      data-icon="plus" data-tip="Submit the entry"></button>
               <span class="tool-label" id="manual-msg"></span>
             </div>
           </form>
@@ -212,43 +218,43 @@
             <form id="whledit-form" autocomplete="off">
               <div class="mf-grid">
                 <div class="mf-field mf-full">
-                  <label class="tool-label" for="w-title">TITLE</label>
+                  <label class="tool-label" for="w-title">Title</label>
                   <input id="w-title" class="cad-input" />
                 </div>
                 <div class="mf-field mf-full">
-                  <label class="tool-label" for="w-subtitle">SUBTITLE</label>
+                  <label class="tool-label" for="w-subtitle">Subtitle</label>
                   <input id="w-subtitle" class="cad-input" />
                 </div>
                 <div class="mf-field">
-                  <label class="tool-label" for="w-authors">AUTHORS</label>
+                  <label class="tool-label" for="w-authors">Authors</label>
                   <input id="w-authors" class="cad-input" />
                 </div>
                 <div class="mf-field">
-                  <label class="tool-label" for="w-year">YEAR</label>
+                  <label class="tool-label" for="w-year">Year</label>
                   <input id="w-year" class="cad-input" />
                 </div>
                 <div class="mf-field">
-                  <label class="tool-label" for="w-publisher">PUBLISHER</label>
+                  <label class="tool-label" for="w-publisher">Publisher</label>
                   <input id="w-publisher" class="cad-input" />
                 </div>
                 <div class="mf-field">
-                  <label class="tool-label" for="w-pages">PRINT LENGTH</label>
+                  <label class="tool-label" for="w-pages">Print length</label>
                   <input id="w-pages" class="cad-input" />
                 </div>
                 <div class="mf-field">
-                  <label class="tool-label" for="w-language">LANGUAGE</label>
+                  <label class="tool-label" for="w-language">Language</label>
                   <input id="w-language" class="cad-input" />
                 </div>
                 <div class="mf-field">
-                  <label class="tool-label" for="w-subject">SUBJECT</label>
+                  <label class="tool-label" for="w-subject">Subject</label>
                   <input id="w-subject" class="cad-input" />
                 </div>
                 <div class="mf-field mf-full">
-                  <label class="tool-label" for="w-categories">CATEGORIES</label>
+                  <label class="tool-label" for="w-categories">Categories</label>
                   <input id="w-categories" class="cad-input" />
                 </div>
                 <div class="mf-field mf-full">
-                  <label class="tool-label" for="w-description">DESCRIPTION
+                  <label class="tool-label" for="w-description">Description
                     <button id="w-desc-md" class="cad-btn tiny md-btn" type="button"
                             data-tip="Markdown editor">&#9998;</button>
                   </label>
@@ -256,7 +262,8 @@
                 </div>
               </div>
               <div class="mf-actions">
-                <button id="whledit-save" class="cad-btn" type="submit">SAVE</button>
+                <button id="whledit-save" class="cad-btn icon-btn" type="submit"
+                        data-icon="save" data-tip="Save"></button>
                 <span class="tool-label" id="whledit-msg"></span>
               </div>
             </form>
@@ -264,68 +271,73 @@
             <form id="bookedit-form" autocomplete="off" hidden>
               <div class="mf-grid">
                 <div class="mf-field mf-full">
-                  <label class="tool-label" for="e-title">TITLE *</label>
+                  <label class="tool-label" for="e-title">Title *</label>
                   <input id="e-title" class="cad-input" />
                 </div>
                 <div class="mf-field mf-full">
-                  <label class="tool-label" for="e-author">AUTHOR</label>
+                  <label class="tool-label" for="e-subtitle">Subtitle</label>
+                  <input id="e-subtitle" class="cad-input" />
+                </div>
+                <div class="mf-field mf-full">
+                  <label class="tool-label" for="e-author">Author</label>
                   <input id="e-author" class="cad-input" />
                 </div>
                 <div class="mf-field">
-                  <label class="tool-label" for="e-publisher">PUBLISHER</label>
+                  <label class="tool-label" for="e-publisher">Publisher</label>
                   <input id="e-publisher" class="cad-input" />
                 </div>
                 <div class="mf-field">
-                  <label class="tool-label" for="e-city">CITY</label>
+                  <label class="tool-label" for="e-city">City</label>
                   <input id="e-city" class="cad-input" />
                 </div>
                 <div class="mf-field mf-third">
-                  <label class="tool-label" for="e-year">YEAR</label>
+                  <label class="tool-label" for="e-year">Year</label>
                   <input id="e-year" class="cad-input" />
                 </div>
                 <div class="mf-field mf-third">
-                  <label class="tool-label" for="e-edition">EDITION</label>
+                  <label class="tool-label" for="e-edition">Edition</label>
                   <input id="e-edition" class="cad-input" />
                 </div>
                 <div class="mf-field mf-third">
-                  <label class="tool-label" for="e-volume">VOLUME NO</label>
+                  <label class="tool-label" for="e-volume">Volume</label>
                   <input id="e-volume" class="cad-input" />
                 </div>
                 <div class="mf-field">
-                  <label class="tool-label" for="e-language">LANGUAGE</label>
+                  <label class="tool-label" for="e-language">Language</label>
                   <input id="e-language" class="cad-input" />
                 </div>
                 <div class="mf-field">
-                  <label class="tool-label" for="e-pages">PAGES</label>
+                  <label class="tool-label" for="e-pages">Pages</label>
                   <input id="e-pages" class="cad-input" />
                 </div>
                 <div class="mf-field">
-                  <label class="tool-label" for="e-condition">CONDITION</label>
+                  <label class="tool-label" for="e-condition">Condition</label>
                   <input id="e-condition" class="cad-input" />
                 </div>
                 <div class="mf-field">
-                  <label class="tool-label" for="e-price">PRICE</label>
+                  <label class="tool-label" for="e-price">Price</label>
                   <input id="e-price" class="cad-input" />
                 </div>
                 <div class="mf-field">
-                  <label class="tool-label" for="e-illustrations">ILLUSTRATIONS</label>
+                  <label class="tool-label" for="e-illustrations">Illustrations</label>
                   <input id="e-illustrations" class="cad-input" />
                 </div>
                 <div class="mf-field">
-                  <label class="tool-label" for="e-acquired">ACQUIRED</label>
+                  <label class="tool-label" for="e-acquired">Acquired</label>
                   <input id="e-acquired" class="cad-input" />
                 </div>
                 <div class="mf-field mf-full">
-                  <label class="tool-label" for="e-categories">CATEGORIES</label>
+                  <label class="tool-label" for="e-categories">Categories</label>
                   <input id="e-categories" class="cad-input" />
                 </div>
                 <div class="mf-field mf-full">
-                  <label class="tool-label" for="e-notes">NOTES</label>
+                  <label class="tool-label" for="e-notes">Notes</label>
                   <textarea id="e-notes" class="cad-input" rows="5"></textarea>
                 </div>
               </div>
               <div class="mf-actions">
-                <button id="bookedit-save" class="cad-btn" type="submit">SAVE</button>
+                <button id="bookedit-save" class="cad-btn icon-btn" type="submit"
+                        data-icon="save" data-tip="Save"></button>
                 <span class="tool-label" id="bookedit-msg"></span>
               </div>
             </form>
@@ -336,9 +348,9 @@
 
         <div id="checked-right">
           <div class="pane-bar">
-            <label class="tool-label" for="top-table">TABLE</label>
+            <label class="tool-label" for="top-table">Table</label>
             <select id="top-table" class="cad-input">
-              <option value="checked">CHECKED BOOKS + MANUAL</option>
+              <option value="checked">Checked books + manual</option>
               <option value="whl">WHL</option>
             </select>
             <button id="whl-mode" class="cad-btn tiny" type="button" hidden
@@ -347,14 +359,14 @@
                   data-tip="Columns constraining the Open Library search (TITLE = verbatim phrase)">
               <span class="icon-label" data-icon="target"></span>
               <span class="cons-group">
-                <label><input type="checkbox" id="wc-title" /> TITLE</label>
-                <label><input type="checkbox" id="wc-authors" /> AUTHOR</label>
-                <label><input type="checkbox" id="wc-year" /> YEAR</label>
+                <label><input type="checkbox" id="wc-title" /> Title</label>
+                <label><input type="checkbox" id="wc-authors" /> Author</label>
+                <label><input type="checkbox" id="wc-year" /> Year</label>
               </span>
             </span>
             <span class="bar-spacer"></span>
-            <button id="export-json" class="cad-btn tiny" type="button"
-                    data-tip="Export the table as JSON (respects the active filters)">EXPORT</button>
+            <button id="export-json" class="cad-btn tiny icon-btn" type="button"
+                    data-icon="export" data-tip="Export the table as JSON (respects the active filters)"></button>
             <button id="dl-approved" class="cad-btn tiny icon-btn" type="button"
                     data-icon="download" data-tip="Download all verified sources"></button>
             <button id="filter-btn" class="cad-btn tiny icon-btn" type="button"
@@ -368,55 +380,56 @@
             <table class="grid" id="whltop-table">
               <thead>
                 <tr>
-                  <th>SRC</th>
-                  <th>TITLE</th>
-                  <th>SUBTITLE</th>
-                  <th>AUTHORS</th>
-                  <th>YEAR</th>
-                  <th>PUBLISHER</th>
-                  <th>PAGES</th>
-                  <th>LANG</th>
-                  <th>SUBJECT</th>
-                  <th>DESCRIPTION</th>
-                  <th class="col-whl">STATUS</th>
+                  <th>Src</th>
+                  <th>Title</th>
+                  <th>Subtitle</th>
+                  <th>Authors</th>
+                  <th>Year</th>
+                  <th>Publisher</th>
+                  <th>Pages</th>
+                  <th>Lang</th>
+                  <th>Subject</th>
+                  <th>Description</th>
+                  <th class="col-whl">Status</th>
                 </tr>
               </thead>
               <tbody id="whltop-rows"></tbody>
             </table>
-            <p id="whltop-empty" class="empty" hidden>NO WHL ROWS</p>
+            <p id="whltop-empty" class="empty" hidden>No WHL rows</p>
           </div>
 
           <div class="drafting" id="checked-pane">
             <table class="grid" id="checked-table">
               <thead>
                 <tr>
-                  <th data-col="src">SRC</th>
-                  <th data-col="title">TITLE</th>
-                  <th data-col="author">AUTHOR</th>
-                  <th data-col="year">YEAR</th>
-                  <th data-col="edition">ED</th>
-                  <th data-col="volume">VOL</th>
-                  <th data-col="publisher">PUBLISHER</th>
-                  <th data-col="city">CITY</th>
-                  <th data-col="language">LANG</th>
-                  <th data-col="pages">PAGES</th>
-                  <th data-col="condition">COND</th>
-                  <th data-col="illustrations">ILLUS</th>
-                  <th data-col="price">PRICE</th>
-                  <th data-col="acquired">ACQ</th>
-                  <th data-col="categories">CATEGORIES</th>
-                  <th data-col="notes">NOTES</th>
-                  <th class="col-whl" data-col="copyright" data-tip="COPYRIGHT">(C)</th>
+                  <th data-col="src">Src</th>
+                  <th data-col="title">Title</th>
+                  <th data-col="subtitle">Subtitle</th>
+                  <th data-col="author">Author</th>
+                  <th data-col="year">Year</th>
+                  <th data-col="edition">Ed</th>
+                  <th data-col="volume">Vol</th>
+                  <th data-col="publisher">Publisher</th>
+                  <th data-col="city">City</th>
+                  <th data-col="language">Lang</th>
+                  <th data-col="pages">Pages</th>
+                  <th data-col="condition">Cond</th>
+                  <th data-col="illustrations">Illus</th>
+                  <th data-col="price">Price</th>
+                  <th data-col="acquired">Acq</th>
+                  <th data-col="categories">Categories</th>
+                  <th data-col="notes">Notes</th>
+                  <th class="col-whl" data-col="copyright" data-tip="Copyright">(C)</th>
                   <th class="col-whl" data-col="whl">WHL</th>
                   <th class="col-whl" data-col="ia">IA</th>
                   <th class="col-whl" data-col="ht">HT</th>
-                  <th class="col-whl" data-col="mark">MARK</th>
-                  <th class="col-act" data-col="action" data-tip="ACTIONS"></th>
+                  <th class="col-whl" data-col="mark">Mark</th>
+                  <th class="col-act" data-col="action" data-tip="Actions"></th>
                 </tr>
               </thead>
               <tbody id="checked-rows"></tbody>
             </table>
-            <p id="checked-empty" class="empty">NO BOOKS CHECKED</p>
+            <p id="checked-empty" class="empty">No books checked</p>
           </div>
 
           <div id="bottom-pane" hidden>
@@ -433,7 +446,7 @@
                 <thead id="bottom-head"></thead>
                 <tbody id="bottom-rows"></tbody>
               </table>
-              <p id="bottom-empty" class="empty" hidden>NO MATCHES</p>
+              <p id="bottom-empty" class="empty" hidden>No matches</p>
             </div>
           </div>
         </div>
@@ -444,11 +457,11 @@
     <section id="upload" class="panel-view">
       <div id="upload-split">
         <div id="builds-pane">
-          <div class="pane-bar"><span class="tool-label">PENDING</span>
+          <div class="pane-bar"><span class="tool-label">Pending</span>
             <span class="tool-count" id="upload-count"></span></div>
           <div class="drafting" id="builds-list-wrap">
             <ul id="builds-list"></ul>
-            <p id="builds-empty" class="empty">NO ENTRIES YET</p>
+            <p id="builds-empty" class="empty">No entries yet</p>
           </div>
         </div>
 
@@ -461,7 +474,7 @@
             <span class="act-sep"></span>
             <button id="b-ready" class="cad-btn icon-btn toggle" type="button"
                     data-icon="check" data-tip="Mark verified"></button>
-            <span id="b-verified-tag" class="foot-tag tag-verified" hidden>VERIFIED</span>
+            <span id="b-verified-tag" class="foot-tag tag-verified" hidden>Verified</span>
             <span class="tool-label" id="build-msg"></span>
           </div>
           <div class="pane-tabs" id="build-tabs">
@@ -474,66 +487,66 @@
               <form id="build-form" autocomplete="off">
                 <div class="mf-grid">
                   <div class="mf-field mf-full">
-                    <label class="tool-label" for="b-title">TITLE *</label>
+                    <label class="tool-label" for="b-title">Title *</label>
                     <input id="b-title" class="cad-input" />
                   </div>
                   <div class="mf-field mf-full">
-                    <label class="tool-label" for="b-subtitle">SUBTITLE</label>
+                    <label class="tool-label" for="b-subtitle">Subtitle</label>
                     <input id="b-subtitle" class="cad-input" />
                   </div>
                   <div class="mf-field mf-third">
-                    <label class="tool-label" for="b-authors">AUTHORS</label>
+                    <label class="tool-label" for="b-authors">Authors</label>
                     <input id="b-authors" class="cad-input" />
                   </div>
                   <div class="mf-field mf-third">
-                    <label class="tool-label" for="b-year">YEAR</label>
+                    <label class="tool-label" for="b-year">Year</label>
                     <input id="b-year" class="cad-input" />
                   </div>
                   <div class="mf-field mf-third">
-                    <label class="tool-label" for="b-edition">EDITION</label>
+                    <label class="tool-label" for="b-edition">Edition</label>
                     <input id="b-edition" class="cad-input" />
                   </div>
                   <div class="mf-field">
-                    <label class="tool-label" for="b-publisher">PUBLISHER</label>
+                    <label class="tool-label" for="b-publisher">Publisher</label>
                     <input id="b-publisher" class="cad-input" />
                   </div>
                   <div class="mf-field">
-                    <label class="tool-label" for="b-publisher_city">PUBLISHER CITY</label>
+                    <label class="tool-label" for="b-publisher_city">Publisher city</label>
                     <input id="b-publisher_city" class="cad-input" />
                   </div>
                   <div class="mf-field mf-third">
-                    <label class="tool-label" for="b-language">LANGUAGE</label>
+                    <label class="tool-label" for="b-language">Language</label>
                     <input id="b-language" class="cad-input" />
                   </div>
                   <div class="mf-field mf-third">
-                    <label class="tool-label" for="b-pages">PAGES</label>
+                    <label class="tool-label" for="b-pages">Pages</label>
                     <input id="b-pages" class="cad-input" />
                   </div>
                   <div class="mf-field mf-third">
-                    <label class="tool-label" for="b-categories">CATEGORIES</label>
+                    <label class="tool-label" for="b-categories">Categories</label>
                     <input id="b-categories" class="cad-input" />
                   </div>
                   <div class="mf-field mf-full">
-                    <label class="tool-label" for="b-pdf_source">PDF SOURCE (URL)
-                      <a id="b-pdf-open" class="mini-link" href="#" target="_blank" rel="noopener" hidden>OPEN</a>
+                    <label class="tool-label" for="b-pdf_source">PDF source (URL)
+                      <a id="b-pdf-open" class="mini-link" href="#" target="_blank" rel="noopener" hidden>Open</a>
                     </label>
                     <input id="b-pdf_source" class="cad-input" />
                   </div>
                   <div class="mf-field mf-full">
-                    <label class="tool-label" for="b-source_url">PROVENANCE (RECORD URL)
-                      <a id="b-src-open" class="mini-link" href="#" target="_blank" rel="noopener" hidden>OPEN</a>
+                    <label class="tool-label" for="b-source_url">Provenance (record URL)
+                      <a id="b-src-open" class="mini-link" href="#" target="_blank" rel="noopener" hidden>Open</a>
                     </label>
                     <input id="b-source_url" class="cad-input" />
                   </div>
                   <div class="mf-field mf-full">
-                    <label class="tool-label" for="b-notes">NOTES (INTERNAL)</label>
+                    <label class="tool-label" for="b-notes">Notes (internal)</label>
                     <textarea id="b-notes" class="cad-input" rows="8"></textarea>
                   </div>
                 </div>
               </form>
               <div id="build-desc-col">
                 <div class="desc-label-row">
-                  <label class="tool-label">DESCRIPTION</label>
+                  <label class="tool-label">Description</label>
                   <button id="b-ai" class="cad-btn tiny icon-btn" type="button"
                           data-icon="sparkle" data-tip="Generate a summary from the OCR text"></button>
                   <button id="b-desc-load" class="cad-btn tiny icon-btn" type="button"
@@ -548,7 +561,7 @@
 
           <div id="btab-source" class="pane-sub">
             <div class="src-row">
-              <label class="tool-label" for="b-pdf_file">PATH TO PDF</label>
+              <label class="tool-label" for="b-pdf_file">Path to PDF</label>
               <input id="b-pdf_file" class="cad-input" spellcheck="false" />
               <button id="b-pdf-browse" class="cad-btn icon-btn" type="button"
                       data-icon="folder" data-tip="Browse"></button>
@@ -574,7 +587,7 @@
       <div id="upload-splitter"></div>
 
       <div id="upload-sources-pane">
-        <div class="pane-bar"><span class="tool-label">VERIFIED SOURCES</span>
+        <div class="pane-bar"><span class="tool-label">Verified sources</span>
           <span class="bar-spacer"></span>
           <button id="colvis-upload" class="cad-btn tiny icon-btn" type="button"
                   data-icon="columns" data-tip="Visible columns"></button>
@@ -583,86 +596,102 @@
           <table class="grid" id="upload-table">
             <thead>
               <tr>
-                <th>TITLE</th>
-                <th>SUBTITLE</th>
-                <th>AUTHOR</th>
-                <th>PUBLISHER</th>
-                <th>YEAR</th>
-                <th>ARCHIVE</th>
-                <th>MATCHED RECORD</th>
-                <th class="col-act" data-tip="ACTIONS"></th>
+                <th>Title</th>
+                <th>Subtitle</th>
+                <th>Author</th>
+                <th>Publisher</th>
+                <th>Year</th>
+                <th>Archive</th>
+                <th>Matched record</th>
+                <th class="col-act" data-tip="Actions"></th>
               </tr>
             </thead>
             <tbody id="upload-rows"></tbody>
           </table>
-          <p id="upload-empty" class="empty">NO VERIFIED SOURCES</p>
+          <p id="upload-empty" class="empty">No verified sources</p>
         </div>
       </div>
     </section>
-    <!-- OCR: processing, reviewing, and editing OCR data -->
+    <!-- OCR: processing, reviewing, and editing OCR data. Targets are the
+         books' PDFs; the sidebar lists every entry folder. -->
     <section id="ocr" class="panel-view">
       <div id="ocr-split">
         <div id="ocr-side">
-          <div class="pane-bar"><span class="tool-label">DOCUMENTS</span>
+          <div class="pane-bar"><span class="tool-label">Books</span>
+            <span class="bar-spacer"></span>
+            <button id="ocr-filter-verified" class="cad-btn tiny icon-btn toggle" type="button"
+                    data-icon="check" data-tip="Show verified books only"></button>
+          </div>
+          <div class="drafting" id="ocr-books-wrap">
+            <ul id="ocr-books"></ul>
+            <p id="ocr-books-empty" class="empty">No book folders (build them in the Editor tab)</p>
+          </div>
+          <div class="pane-bar"><span class="tool-label">Documents</span>
             <span class="bar-spacer"></span>
             <button id="ocr-load-file" class="cad-btn tiny icon-btn" type="button"
                     data-icon="fileup" data-tip="Load OCR text files"></button>
-            <button id="ocr-load-folder" class="cad-btn tiny icon-btn" type="button"
-                    data-icon="folder" data-tip="Load a book folder"></button>
             <input id="ocr-file-input" type="file" accept=".txt,.text,.md" multiple hidden />
           </div>
           <div class="drafting" id="ocr-doc-wrap">
             <ul id="ocr-docs"></ul>
-            <p id="ocr-docs-empty" class="empty">NO DOCUMENTS</p>
+            <p id="ocr-docs-empty" class="empty">No documents</p>
           </div>
         </div>
         <div id="ocr-mainpane">
           <div class="pane-bar">
-            <button id="ocr-view-edit" class="cad-btn tiny active" type="button">EDIT</button>
-            <button id="ocr-view-diff" class="cad-btn tiny" type="button">DIFF</button>
+            <button id="ocr-view-edit" class="cad-btn tiny icon-btn active" type="button"
+                    data-icon="pencil" data-tip="Edit the OCR text"></button>
+            <button id="ocr-view-diff" class="cad-btn tiny icon-btn" type="button"
+                    data-icon="diff" data-tip="Compare against another document"></button>
+            <button id="ocr-view-pdf" class="cad-btn tiny icon-btn" type="button"
+                    data-icon="pdfpage" data-tip="Show the PDF beside the text, page by page"></button>
             <select id="ocr-diff-with" class="cad-input" data-tip="Compare against"></select>
             <span class="tb-sep"></span>
             <input id="ocr-find" class="cad-input" placeholder="find" />
             <input id="ocr-replace" class="cad-input" placeholder="replace" />
-            <button id="ocr-find-next" class="cad-btn tiny" type="button">FIND</button>
-            <button id="ocr-replace-all" class="cad-btn tiny" type="button">REPLACE ALL</button>
+            <button id="ocr-find-next" class="cad-btn tiny icon-btn" type="button"
+                    data-icon="search" data-tip="Find next"></button>
+            <button id="ocr-replace-all" class="cad-btn tiny icon-btn" type="button"
+                    data-icon="replace" data-tip="Replace all"></button>
             <span class="tb-sep"></span>
-            <label class="tool-label" for="ocr-quality">QUALITY</label>
+            <label class="tool-label" for="ocr-quality">Quality</label>
             <select id="ocr-quality" class="cad-input">
               <option value="">&mdash;</option>
-              <option value="excellent">EXCELLENT</option>
-              <option value="good">GOOD</option>
-              <option value="fair">FAIR</option>
-              <option value="poor">POOR</option>
+              <option value="excellent">Excellent</option>
+              <option value="good">Good</option>
+              <option value="fair">Fair</option>
+              <option value="poor">Poor</option>
             </select>
             <span class="bar-spacer"></span>
-            <button id="ocr-set-active" class="cad-btn tiny" type="button"
-                    data-tip="Mark this file as the entry's active OCR">SET ACTIVE</button>
+            <button id="ocr-set-active" class="cad-btn tiny icon-btn" type="button"
+                    data-icon="star" data-tip="Set as the entry's active OCR"></button>
             <button id="ocr-save" class="cad-btn tiny icon-btn" type="button"
                     data-icon="save" data-tip="Save to the entry folder"></button>
             <span class="tool-label" id="ocr-msg"></span>
           </div>
           <textarea id="ocr-editor" class="cad-input" spellcheck="false"></textarea>
           <div class="drafting" id="ocr-diff" hidden></div>
+          <div class="drafting" id="ocr-pages" hidden></div>
         </div>
       </div>
       <div class="pane-bar">
-        <span class="tool-label">OCR QUEUE</span>
+        <span class="tool-label">OCR queue</span>
         <span class="tb-sep"></span>
         <select id="ocr-service" class="cad-input">
-          <option value="azure">AZURE DOCUMENT INTELLIGENCE</option>
-          <option value="openai">OPENAI VISION</option>
-          <option value="tesseract">TESSERACT (LOCAL)</option>
+          <option value="azure">Azure Document Intelligence</option>
+          <option value="openai">OpenAI vision</option>
+          <option value="tesseract">Tesseract (local)</option>
         </select>
-        <button id="ocr-queue-add" class="cad-btn tiny" type="button">QUEUE</button>
+        <button id="ocr-queue-add" class="cad-btn tiny icon-btn" type="button"
+                data-icon="plus" data-tip="Queue the selected book's PDF for OCR"></button>
         <span class="tool-count" id="ocr-queue-count"></span>
       </div>
       <div class="drafting" id="ocr-queue-wrap">
         <table class="grid" id="ocr-queue-table">
-          <thead><tr><th>DOCUMENT</th><th>SERVICE</th><th>STATUS</th><th>SUBMITTED</th></tr></thead>
+          <thead><tr><th>Book</th><th>PDF</th><th>Service</th><th>Status</th><th>Submitted</th></tr></thead>
           <tbody id="ocr-queue-rows"></tbody>
         </table>
-        <p id="ocr-queue-empty" class="empty">NO OCR JOBS</p>
+        <p id="ocr-queue-empty" class="empty">No OCR jobs</p>
       </div>
     </section>
   </main>
@@ -674,14 +703,14 @@
   <div id="md-overlay" class="overlay" hidden>
     <div id="md-window" class="win">
       <div id="md-titlebar" class="win-titlebar">
-        <span id="md-title">MARKDOWN EDITOR</span>
+        <span id="md-title">Markdown editor</span>
         <button id="md-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
       </div>
       <div id="md-body">
         <div id="md-live-overlay"></div>
         <div class="mf-actions">
-          <button id="md-apply" class="cad-btn" type="button">APPLY</button>
-          <button id="md-cancel" class="cad-btn" type="button">CANCEL</button>
+          <button id="md-apply" class="cad-btn" type="button">Apply</button>
+          <button id="md-cancel" class="cad-btn" type="button">Cancel</button>
         </div>
       </div>
     </div>
@@ -691,7 +720,7 @@
   <div id="pdfm-overlay" class="overlay" hidden>
     <div id="pdfm-window" class="win">
       <div id="pdfm-titlebar" class="win-titlebar">
-        <span id="pdfm-title">PUBLICATION</span>
+        <span id="pdfm-title">Publication</span>
         <button id="pdfm-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
       </div>
       <div id="pdfm-body"></div>
@@ -702,13 +731,14 @@
   <div id="fb-overlay" class="overlay" hidden>
     <div id="fb-window" class="win">
       <div id="fb-titlebar" class="win-titlebar">
-        <span>SELECT A PDF FILE</span>
+        <span>Select a PDF file</span>
         <button id="fb-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
       </div>
       <div id="fb-body">
         <div class="fb-path-row">
           <input id="fb-path" class="cad-input" spellcheck="false" />
-          <button id="fb-go" class="cad-btn" type="button">GO</button>
+          <button id="fb-go" class="cad-btn icon-btn" type="button"
+                  data-icon="go" data-tip="Open this folder"></button>
         </div>
         <div id="fb-drives"></div>
         <div id="fb-list"></div>
@@ -720,7 +750,7 @@
   <div id="msrc-overlay" class="overlay" hidden>
     <div id="msrc-window" class="win">
       <div id="msrc-titlebar" class="win-titlebar">
-        <span>MANUALLY LOCATED SOURCE</span>
+        <span>Manually located source</span>
         <button id="msrc-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
       </div>
       <div id="msrc-body">
@@ -728,8 +758,10 @@
         <input id="msrc-url" class="cad-input" type="text"
                placeholder="https://..." />
         <div class="mf-actions">
-          <button id="msrc-save" class="cad-btn" type="button">SAVE</button>
-          <button id="msrc-clear" class="cad-btn danger" type="button">CLEAR</button>
+          <button id="msrc-save" class="cad-btn icon-btn" type="button"
+                  data-icon="save" data-tip="Save"></button>
+          <button id="msrc-clear" class="cad-btn icon-btn danger" type="button"
+                  data-icon="trash" data-tip="Clear the manual source"></button>
           <span class="tool-label" id="msrc-msg"></span>
         </div>
       </div>
@@ -740,77 +772,100 @@
   <div id="settings-overlay" class="overlay" hidden>
     <div id="settings-window" class="win">
       <div id="settings-titlebar" class="win-titlebar">
-        <span>SETTINGS</span>
+        <span>Settings</span>
         <button id="settings-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
       </div>
       <div id="settings-body">
         <div id="settings-nav">
-          <button class="snav active" data-sec="sec-general" type="button">GENERAL</button>
-          <button class="snav" data-sec="sec-appearance" type="button">APPEARANCE</button>
-          <button class="snav" data-sec="sec-tables" type="button">TABLE VIEW</button>
+          <button class="snav active" data-sec="sec-general" type="button">General</button>
+          <button class="snav" data-sec="sec-appearance" type="button">Appearance</button>
+          <button class="snav" data-sec="sec-tables" type="button">Table view</button>
           <button class="snav" data-sec="sec-ai" type="button">AI</button>
-          <button class="snav" data-sec="sec-paths" type="button">FILE PATHS</button>
+          <button class="snav" data-sec="sec-ocr" type="button">OCR</button>
+          <button class="snav" data-sec="sec-paths" type="button">File paths</button>
         </div>
         <div id="settings-content">
           <div id="sec-general" class="settings-sec active">
-            <div class="settings-head">GENERAL</div>
+            <div class="settings-head">General</div>
             <p class="settings-note" id="gen-info"></p>
             <div class="settings-rows">
-              <label class="tool-label" for="set-whl-ocr">OCR PANEL IN WHL PDF VIEWER</label>
+              <label class="tool-label" for="set-whl-ocr">OCR panel in the WHL PDF viewer</label>
               <input id="set-whl-ocr" type="checkbox" />
-              <label class="tool-label" for="set-preview-pages">PDF PREVIEW PAGE LIMIT</label>
+              <label class="tool-label" for="set-preview-pages">PDF preview page limit</label>
               <input id="set-preview-pages" class="cad-input" type="number" min="1" max="500" step="5" />
-              <label class="tool-label" for="set-preview-original">PREVIEW ORIGINAL (UNMODIFIED) PDF</label>
+              <label class="tool-label" for="set-preview-original">Preview the original (unmodified) PDF</label>
               <input id="set-preview-original" type="checkbox" />
-              <label class="tool-label" for="set-keep-originals">KEEP IA ORIGINALS AFTER FOLDER BUILD</label>
+              <label class="tool-label" for="set-keep-originals">Keep IA originals after a folder build</label>
               <input id="set-keep-originals" type="checkbox" />
             </div>
             <div class="mf-actions">
-              <button id="reset-settings" class="cad-btn danger" type="button">RESTORE DEFAULT SETTINGS</button>
+              <button id="reset-settings" class="cad-btn danger" type="button">Restore default settings</button>
             </div>
           </div>
           <div id="sec-appearance" class="settings-sec">
-            <div class="settings-head">APPEARANCE</div>
+            <div class="settings-head">Appearance</div>
             <div class="settings-rows">
-              <label class="tool-label" for="theme-select">THEME</label>
+              <label class="tool-label" for="theme-select">Theme</label>
               <select id="theme-select" class="cad-input"></select>
-              <label class="tool-label" for="font-ui-select">INTERFACE FONT</label>
+              <label class="tool-label" for="font-ui-select">Interface font</label>
               <select id="font-ui-select" class="cad-input"></select>
-              <label class="tool-label" for="font-select">DATA / TABLE FONT</label>
+              <label class="tool-label" for="font-select">Data / table font</label>
               <select id="font-select" class="cad-input"></select>
             </div>
           </div>
           <div id="sec-tables" class="settings-sec">
-            <div class="settings-head">TABLE VIEW</div>
+            <div class="settings-head">Table view</div>
             <div class="settings-rows">
-              <label class="tool-label" for="set-max-rows">MAX DISPLAYED ROWS</label>
+              <label class="tool-label" for="set-max-rows">Max displayed rows</label>
               <input id="set-max-rows" class="cad-input" type="number" min="50" max="5000" step="50" />
             </div>
-            <div class="settings-subhead">CHECKED BOOKS TABLE :: VISIBLE COLUMNS</div>
+            <div class="settings-subhead">Checked books table :: visible columns</div>
             <div id="cols-checked" class="settings-cols"></div>
             <div class="mf-actions">
-              <button id="reset-widths" class="cad-btn" type="button">RESET COLUMN WIDTHS</button>
+              <button id="reset-widths" class="cad-btn" type="button">Reset column widths</button>
             </div>
           </div>
           <div id="sec-ai" class="settings-sec">
             <div class="settings-head">AI</div>
             <div class="settings-rows">
-              <label class="tool-label" for="set-ai-base">API BASE URL</label>
+              <label class="tool-label" for="set-ai-base">API base URL</label>
               <input id="set-ai-base" class="cad-input" spellcheck="false"
                      placeholder="https://api.openai.com/v1" />
-              <label class="tool-label" for="set-ai-model">MODEL</label>
+              <label class="tool-label" for="set-ai-model">Model</label>
               <input id="set-ai-model" class="cad-input" spellcheck="false"
                      placeholder="gpt-5.2" />
-              <label class="tool-label" for="set-ai-key">API KEY</label>
+              <label class="tool-label" for="set-ai-key">API key</label>
               <input id="set-ai-key" class="cad-input" type="password" spellcheck="false" />
-              <label class="tool-label" for="set-ai-instructions">CUSTOM INSTRUCTIONS</label>
+              <label class="tool-label" for="set-ai-instructions">Custom instructions</label>
               <textarea id="set-ai-instructions" class="cad-input" rows="6"></textarea>
             </div>
           </div>
-          <div id="sec-paths" class="settings-sec">
-            <div class="settings-head">FILE PATHS</div>
+          <div id="sec-ocr" class="settings-sec">
+            <div class="settings-head">OCR services</div>
+            <p class="settings-note">Credentials for cloud OCR processing. No API key is
+              configured yet — queued jobs wait until a service is set up here.
+              OpenAI vision reuses the AI section's API settings.</p>
             <div class="settings-rows">
-              <label class="tool-label" for="set-browse-dir">PDF BROWSER START FOLDER</label>
+              <label class="tool-label" for="set-ocr-service">Default service</label>
+              <select id="set-ocr-service" class="cad-input">
+                <option value="azure">Azure Document Intelligence</option>
+                <option value="openai">OpenAI vision</option>
+                <option value="tesseract">Tesseract (local)</option>
+              </select>
+              <label class="tool-label" for="set-ocr-azure-endpoint">Azure endpoint</label>
+              <input id="set-ocr-azure-endpoint" class="cad-input" spellcheck="false"
+                     placeholder="https://&lt;resource&gt;.cognitiveservices.azure.com/" />
+              <label class="tool-label" for="set-ocr-azure-key">Azure API key</label>
+              <input id="set-ocr-azure-key" class="cad-input" type="password" spellcheck="false" />
+              <label class="tool-label" for="set-ocr-tesseract">Tesseract executable</label>
+              <input id="set-ocr-tesseract" class="cad-input" spellcheck="false"
+                     placeholder="C:\Program Files\Tesseract-OCR\tesseract.exe" />
+            </div>
+          </div>
+          <div id="sec-paths" class="settings-sec">
+            <div class="settings-head">File paths</div>
+            <div class="settings-rows">
+              <label class="tool-label" for="set-browse-dir">PDF browser start folder</label>
               <input id="set-browse-dir" class="cad-input" spellcheck="false" />
             </div>
           </div>

@@ -9,7 +9,7 @@
  *   CHECKED BOOKS — the working area: a top table (checked books + manual
  *     entries, or the editable WHL catalog), a left panel (Open Library
  *     search / manual entry / WHL record editor), and a tabbed bottom pane
- *     of live-filtered source tables (Open Library / CH catalog / WHL).
+ *     of live-filtered source tables (Open Library / master list / WHL).
  *   UPLOAD LIST — the book builder (catalog entries being prepared for WHL
  *     submission, with a live Markdown description editor and a PDF source
  *     tab) over a resizable approved-sources table.
@@ -27,26 +27,27 @@ const LS_KEY = "whl_cad_checked_v1";
 const SETTINGS_KEY = "whl_cad_settings_v1";
 
 const MANUAL_FIELDS = [
-  "title", "author", "publisher", "city", "year", "edition", "volume",
-  "language", "pages", "condition", "price", "illustrations", "categories",
-  "notes",
+  "title", "subtitle", "author", "publisher", "city", "year", "edition",
+  "volume", "language", "pages", "condition", "price", "illustrations",
+  "categories", "notes",
 ];
 
 // Metadata columns of the combined table, in cell order; click-to-edit.
 const BOOK_COLS = [
-  "title", "author", "year", "edition", "volume", "publisher", "city",
-  "language", "pages", "condition", "illustrations", "price", "acquired",
-  "categories", "notes",
+  "title", "subtitle", "author", "year", "edition", "volume", "publisher",
+  "city", "language", "pages", "condition", "illustrations", "price",
+  "acquired", "categories", "notes",
 ];
 
 const CHECKED_COLS = [
-  ["src", "SRC"], ["title", "TITLE"], ["author", "AUTHOR"], ["year", "YEAR"],
-  ["edition", "EDITION"], ["volume", "VOLUME"], ["publisher", "PUBLISHER"],
-  ["city", "CITY"], ["language", "LANGUAGE"], ["pages", "PAGES"],
-  ["condition", "CONDITION"], ["illustrations", "ILLUSTRATIONS"],
-  ["price", "PRICE"], ["acquired", "ACQUIRED"], ["categories", "CATEGORIES"],
-  ["notes", "NOTES"], ["copyright", "COPYRIGHT"], ["whl", "WHL"],
-  ["ia", "IA"], ["ht", "HT"], ["mark", "MARK"], ["action", "ACTION"],
+  ["src", "Src"], ["title", "Title"], ["subtitle", "Subtitle"],
+  ["author", "Author"], ["year", "Year"],
+  ["edition", "Edition"], ["volume", "Volume"], ["publisher", "Publisher"],
+  ["city", "City"], ["language", "Language"], ["pages", "Pages"],
+  ["condition", "Condition"], ["illustrations", "Illustrations"],
+  ["price", "Price"], ["acquired", "Acquired"], ["categories", "Categories"],
+  ["notes", "Notes"], ["copyright", "Copyright"], ["whl", "WHL"],
+  ["ia", "IA"], ["ht", "HT"], ["mark", "Mark"], ["action", "Action"],
 ];
 
 const WHL_ROW_FIELDS = ["title", "subtitle", "authors", "year", "publisher",
@@ -88,6 +89,9 @@ const state = {
     whlMode: "edit", checkedMode: "edit",
     paneWidth: null, theme: "", font: "", fontUi: "",
     aiBase: "", aiModel: "", aiKey: "", aiInstructions: "",
+    // OCR cloud services (Settings > OCR) — credentials pending; TODO:
+    // verify processing once the user has an API key
+    ocrService: "azure", ocrAzureEndpoint: "", ocrAzureKey: "", ocrTesseract: "",
     uploadSplitH: null, pdfBrowseDir: "",
     maxRows: 400,               // row cap for the big table views
     whlModalOcr: false,         // OCR panel in the WHL publication viewer
@@ -106,15 +110,15 @@ const state = {
 // --- appearance: themes are full chrome redesigns; fonts are user-selectable --
 
 const THEMES = [
-  ["", "CLASSIC CAD"],
-  ["ledger", "ARCHIVE LEDGER"],
-  ["platinum", "PLATINUM"],
-  ["blueprint", "BLUEPRINT"],
-  ["modern", "MODERN LIGHT"],
-  ["dark", "MODERN DARK"],
-  ["stone", "STONE"],
-  ["midnight", "MIDNIGHT"],
-  ["sage", "SAGE"],
+  ["", "Classic CAD"],
+  ["ledger", "Archive Ledger"],
+  ["platinum", "Platinum"],
+  ["blueprint", "Blueprint"],
+  ["modern", "Modern light"],
+  ["dark", "Modern dark"],
+  ["stone", "Stone"],
+  ["midnight", "Midnight"],
+  ["sage", "Sage"],
 ];
 const LEGACY_THEMES = {
   cde: "ledger", xp2003: "", acad: "dark",
@@ -124,23 +128,23 @@ const LEGACY_THEMES = {
 // One shared font list; the interface (--ui) and data/table (--mono) fonts
 // are chosen independently from it.
 const FONT_CHOICES = [
-  ["", "DEFAULT"],
-  ['"Segoe UI", Tahoma, sans-serif', "SEGOE UI"],
-  ['Tahoma, "Segoe UI", sans-serif', "TAHOMA"],
-  ['Verdana, Geneva, sans-serif', "VERDANA"],
-  ['Arial, Helvetica, sans-serif', "ARIAL"],
-  ['"Trebuchet MS", Tahoma, sans-serif', "TREBUCHET MS"],
-  ['Calibri, "Segoe UI", sans-serif', "CALIBRI"],
-  ['Georgia, "Times New Roman", serif', "GEORGIA"],
-  ['"Consolas", "Courier New", monospace', "CONSOLAS"],
-  ['"Courier New", Courier, monospace', "COURIER NEW"],
-  ['"Lucida Console", Monaco, monospace', "LUCIDA CONSOLE"],
-  ['"Cascadia Mono", Consolas, monospace', "CASCADIA MONO"],
-  ['"Cascadia Code", Consolas, monospace', "CASCADIA CODE"],
-  ['"IBM Plex Mono", Consolas, monospace', "IBM PLEX MONO"],
-  ['"JetBrains Mono", Consolas, monospace', "JETBRAINS MONO"],
-  ['"Source Code Pro", Consolas, monospace', "SOURCE CODE PRO"],
-  ['"Fira Code", Consolas, monospace', "FIRA CODE"],
+  ["", "Default"],
+  ['"Segoe UI", Tahoma, sans-serif', "Segoe UI"],
+  ['Tahoma, "Segoe UI", sans-serif', "Tahoma"],
+  ['Verdana, Geneva, sans-serif', "Verdana"],
+  ['Arial, Helvetica, sans-serif', "Arial"],
+  ['"Trebuchet MS", Tahoma, sans-serif', "Trebuchet MS"],
+  ['Calibri, "Segoe UI", sans-serif', "Calibri"],
+  ['Georgia, "Times New Roman", serif', "Georgia"],
+  ['"Consolas", "Courier New", monospace', "Consolas"],
+  ['"Courier New", Courier, monospace', "Courier New"],
+  ['"Lucida Console", Monaco, monospace', "Lucida Console"],
+  ['"Cascadia Mono", Consolas, monospace', "Cascadia Mono"],
+  ['"Cascadia Code", Consolas, monospace', "Cascadia Code"],
+  ['"IBM Plex Mono", Consolas, monospace', "IBM Plex Mono"],
+  ['"JetBrains Mono", Consolas, monospace', "JetBrains Mono"],
+  ['"Source Code Pro", Consolas, monospace', "Source Code Pro"],
+  ['"Fira Code", Consolas, monospace', "Fira Code"],
 ];
 
 // --- text normalization for Open Library fills ----------------------------------
@@ -178,6 +182,148 @@ function flipName(name) {
     if (/^(jr|sr|esq|md|m\.\s?d|phd|ph\.\s?d|[ivx]+)\.?$/i.test(tail)) return p;
     return `${tail} ${m[1].trim()}`;
   }).filter(Boolean).join("; ");
+}
+
+// --- bibliographic title parsing --------------------------------------------------
+// "Title: Subtitle" splits at the first colon; volume indicators (vol. 1,
+// v2, v. iii) and edition indicators (2nd ed., Third Edition) are removed
+// from the title text and land in their own fields. parseBook() only fills
+// EMPTY fields (existing subtitle/volume/edition values are never clobbered,
+// and the title keeps its indicator when the target field is occupied), so
+// the parse is idempotent and safe to run over existing entries.
+
+// roman numerals reuse romanToArabic (declared later; hoisted), capped to
+// plausible volume/edition numbers
+function romanToInt(s) {
+  const n = romanToArabic(s);
+  return n && n < 200 ? n : 0;
+}
+
+// tidy a string after a token was cut out of it
+function tidyTitleText(s) {
+  return String(s || "")
+    .replace(/\(\s*\)|\[\s*\]/g, " ")        // emptied brackets
+    .replace(/\s{2,}/g, " ")
+    .replace(/\s+([,;.)\]])/g, "$1")
+    .replace(/^[\s,;:.\-]+|[\s,;:\-]+$/g, "")
+    .replace(/,\s*\./g, ".")
+    .trim();
+}
+
+// Editor/author initials masquerade as roman numerals ("ed. C. F. Leyel",
+// "by V. L. Komarov"). A single-letter "numeral" is rejected when it can
+// only plausibly be an initial: L/C/D/M alone (50/100/500/1000 are never
+// written as one letter), or I/V/X followed by a capitalized word — the
+// start of a name.
+function romanTokenPlausible(tok, after) {
+  if (/^[0-9]+$/.test(tok)) return true;
+  if (tok.length === 1) {
+    if (/[lcdm]/i.test(tok)) return false;
+    if (/^\s*[A-Z]/.test(after)) return false;
+  }
+  return true;
+}
+
+// volume indicators: "volume 2", "vol. 1", "vols. 3", "v. iii", "v2"
+const VOL_RES = [
+  /(^|[\s,;:.([])(?:volumes?|vols?\.?)\s*(?:no\.?\s*)?([0-9]{1,4}|[ivxlcdm]{1,8})(?![a-z0-9])\.?/i,
+  /(^|[\s,;:.([])v\.\s*([0-9]{1,4}|[ivxlcdm]{1,8})(?![a-z0-9])\.?/i,
+  /(^|[\s,;:.([])v([0-9]{1,4})(?![a-z0-9])/i,
+];
+
+function extractVolume(text) {
+  for (const re of VOL_RES) {
+    const m = re.exec(text);
+    if (!m) continue;
+    let num = m[2];
+    if (!romanTokenPlausible(num, text.slice(m.index + m[0].length))) continue;
+    if (!/^[0-9]+$/.test(num)) {
+      const r = romanToInt(num);
+      if (!r) continue;
+      num = String(r);
+    }
+    return {
+      clean: tidyTitleText(text.slice(0, m.index) + m[1] + text.slice(m.index + m[0].length)),
+      volume: num,
+    };
+  }
+  return null;
+}
+
+const ORD_WORDS = {
+  first: 1, second: 2, third: 3, fourth: 4, fifth: 5, sixth: 6, seventh: 7,
+  eighth: 8, ninth: 9, tenth: 10, eleventh: 11, twelfth: 12,
+};
+
+function ordinal(n) {
+  const rem = n % 100;
+  if (rem >= 11 && rem <= 13) return n + "th";
+  return n + (["th", "st", "nd", "rd"][n % 10] || "th");
+}
+
+// edition indicators: "2nd edition", "3d ed.", "Third Edition", "ed. 2",
+// "edition iv". Bare "ed." accepts only digits — "ed. <letter>" is an
+// editor credit ("ed. C. F. Leyel"), not an edition.
+const ED_RES = [
+  [/(^|[\s,;:.([])([0-9]{1,2})(?:st|nd|rd|th|d)?\s+(?:rev(?:ised)?\.?\s+)?ed(?:ition|n)?\b\.?/i,
+   (m) => parseInt(m[2], 10)],
+  [/(^|[\s,;:.([])(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|eleventh|twelfth)\s+(?:rev(?:ised)?\.?\s+)?ed(?:ition|n)?\b\.?/i,
+   (m) => ORD_WORDS[m[2].toLowerCase()]],
+  [/(^|[\s,;:.([])edition\s*([0-9]{1,2}|[ivxlcdm]{1,6})(?![a-z0-9])\.?/i,
+   (m) => /^[0-9]+$/.test(m[2]) ? parseInt(m[2], 10) : romanToInt(m[2])],
+  [/(^|[\s,;:.([])ed\.\s*([0-9]{1,2})(?![a-z0-9])\.?/i,
+   (m) => parseInt(m[2], 10)],
+];
+
+function extractEdition(text) {
+  for (const [re, toNum] of ED_RES) {
+    const m = re.exec(text);
+    if (!m) continue;
+    if (!romanTokenPlausible(m[2], text.slice(m.index + m[0].length))) continue;
+    const n = toNum(m);
+    if (!n) continue;
+    return {
+      clean: tidyTitleText(text.slice(0, m.index) + m[1] + text.slice(m.index + m[0].length)),
+      edition: ordinal(n),
+    };
+  }
+  return null;
+}
+
+// fill a book's empty subtitle/volume/edition fields from its title text
+function parseBook(b) {
+  const out = Object.assign({}, b);
+  let title = String(out.title || "").trim();
+  if (!String(out.subtitle || "").trim()) {
+    const m = title.match(/^(.+?):\s+(.+)$/);
+    if (m) { title = m[1].trim(); out.subtitle = m[2].trim(); }
+  }
+  let subtitle = String(out.subtitle || "");
+  const fields = [
+    ["volume", extractVolume],
+    ["edition", extractEdition],
+  ];
+  for (const [field, extract] of fields) {
+    if (String(out[field] || "").trim()) continue;
+    // an extraction must never leave the title empty ("Vol. 2" stays a title)
+    let r = extract(title);
+    if (r && r.clean) {
+      title = r.clean;
+    } else {
+      r = extract(subtitle);
+      if (r) subtitle = r.clean;
+      else r = null;
+    }
+    if (r) out[field] = r.volume || r.edition;
+  }
+  out.title = title;
+  out.subtitle = subtitle;
+  return out;
+}
+
+function bookParseChanged(a, b) {
+  return ["title", "subtitle", "volume", "edition"].some(
+    (f) => String(a[f] || "") !== String(b[f] || ""));
 }
 
 function applyTheme() {
@@ -237,6 +383,12 @@ const ICONS = {
   sparkle: _SVG('<path d="M8 1.8 L9.5 6.5 L14.2 8 L9.5 9.5 L8 14.2 L6.5 9.5 L1.8 8 L6.5 6.5 Z"/><path d="M12.8 2 v2.6 M11.5 3.3 h2.6"/>'),
   fileup: _SVG('<path d="M3.5 2 h6 l3 3 v9 h-9 Z"/><path d="M9.5 2 v3 h3"/><path d="M8 11.5 V7.5 M6.2 9.2 L8 7.4 L9.8 9.2"/>'),
   foldersync: _SVG('<path d="M2 4 h4.4 l1.4 1.8 H14 v7 H2 Z"/><path d="M6 9.4 a2.2 2.2 0 0 1 4.2-.8 M10.4 9.6 a2.2 2.2 0 0 1-4.2.8"/><path d="M10.6 7.4 v1.4 h-1.4 M5.8 11.6 v-1.4 h1.4"/>'),
+  pencil: _SVG('<path d="M3 13 l0.8-3 L11 2.8 a1.3 1.3 0 0 1 2.2 2.2 L6 12.2 Z"/><path d="M10.2 3.6 l2.2 2.2"/>'),
+  diff: _SVG('<rect x="2" y="2.5" width="5.2" height="11"/><rect x="8.8" y="2.5" width="5.2" height="11"/><path d="M3.4 5.5 h2.4 M3.4 8 h2.4 M10.2 8 h2.4 M10.2 10.5 h2.4"/>'),
+  pdfpage: _SVG('<rect x="2" y="2.5" width="5.6" height="11"/><path d="M3.2 5 h3.2 M3.2 7.5 h3.2 M3.2 10 h2.2"/><path d="M9.6 2.5 h4.4 v11 h-4.4 Z" stroke-dasharray="1.6 1.3"/>'),
+  replace: _SVG('<path d="M2.5 5.5 h8 M8.2 3.2 L10.5 5.5 L8.2 7.8"/><path d="M13.5 10.5 h-8 M7.8 8.2 L5.5 10.5 L7.8 12.8"/>'),
+  star: _SVG('<path d="M8 2 L9.8 6 L14 6.4 L10.8 9.2 L11.8 13.4 L8 11.2 L4.2 13.4 L5.2 9.2 L2 6.4 L6.2 6 Z"/>'),
+  go: _SVG('<path d="M2.5 8 h9 M8.2 4.5 L11.8 8 L8.2 11.5"/>'),
 };
 
 function injectIcons() {
@@ -359,6 +511,24 @@ function loadSettings() {
   }
   state.settings.maxRows =
     Math.max(50, Math.min(5000, parseInt(state.settings.maxRows, 10) || 400));
+  // v2.6 inserted Subtitle/Vol/Ed into the master-list bottom table; its
+  // saved column settings are keyed by index (c0..cN), so pre-v2.6 keys
+  // must shift to keep pointing at the same columns
+  // (old: Title,Author,Year,Publisher,City,Categories
+  //  new: Title,Subtitle,Author,Year,Vol,Ed,Publisher,City,Categories)
+  if (!state.settings.bchColsV26) {
+    const remap = { c1: "c2", c2: "c3", c3: "c6", c4: "c7", c5: "c8" };
+    for (const store of [state.settings.colVis, state.settings.colWidths]) {
+      const old = store["b-ch"];
+      if (old && Object.keys(old).length) {
+        const out = {};
+        for (const [k, v] of Object.entries(old)) out[remap[k] || k] = v;
+        store["b-ch"] = out;
+      }
+    }
+    state.settings.bchColsV26 = true;
+    saveSettings();
+  }
 }
 
 function maxRows() { return state.settings.maxRows || 400; }
@@ -385,7 +555,9 @@ function initTabs() {
       setHeader(tab.dataset.tab);
       if (tab.dataset.tab === "checked") renderChecked();
       if (tab.dataset.tab === "upload") renderUpload();
-      if (tab.dataset.tab === "ocr") renderOcrTab();
+      // refresh the folder list on every visit — builds/folders may have
+      // changed in the Editor tab meanwhile
+      if (tab.dataset.tab === "ocr") loadOcrBooks().then(renderOcrTab);
     });
   }
   setHeader("checked");
@@ -436,26 +608,26 @@ function initTooltips() {
 // Both persist (settings.colVis / settings.colWidths, keyed per table).
 
 const WHL_COLS = [
-  ["src", "SRC"], ["title", "TITLE"], ["subtitle", "SUBTITLE"],
-  ["authors", "AUTHORS"], ["year", "YEAR"], ["publisher", "PUBLISHER"],
-  ["pages", "PAGES"], ["lang", "LANG"], ["subject", "SUBJECT"],
-  ["description", "DESCRIPTION"], ["status", "STATUS"],
+  ["src", "Src"], ["title", "Title"], ["subtitle", "Subtitle"],
+  ["authors", "Authors"], ["year", "Year"], ["publisher", "Publisher"],
+  ["pages", "Pages"], ["lang", "Lang"], ["subject", "Subject"],
+  ["description", "Description"], ["status", "Status"],
 ];
 const UPLOAD_COLS = [
-  ["title", "TITLE"], ["subtitle", "SUBTITLE"], ["author", "AUTHOR"],
-  ["publisher", "PUBLISHER"], ["year", "YEAR"], ["archive", "ARCHIVE"],
-  ["record", "MATCHED RECORD"], ["action", "ACTION"],
+  ["title", "Title"], ["subtitle", "Subtitle"], ["author", "Author"],
+  ["publisher", "Publisher"], ["year", "Year"], ["archive", "Archive"],
+  ["record", "Matched record"], ["action", "Action"],
 ];
 
 // tag/action columns have LOCKED widths (compact, not resizable); one
 // column per table stretches to absorb leftover width so the table never
-// leaves empty space on its right.
+// leaves empty space on its right — the Title column by default.
 const LOCKED_COLS = {
   checked: { copyright: 58, whl: 58, ia: 58, ht: 58, mark: 58, action: 40 },
   whl: { status: 58 },
   upload: { action: 40 },
 };
-const STRETCH_COL = { checked: "notes", whl: "description", upload: "record" };
+const STRETCH_COL = { checked: "title", whl: "title", upload: "title" };
 
 function tableDef(key) {
   switch (key) {
@@ -473,7 +645,7 @@ function tableDef(key) {
         tableId: "bottom-table",
         cols: def.cols.map((label, i) => ["c" + i, label]),
         locked: {},
-        stretch: "c" + (def.cols.length - 1),
+        stretch: "c0",   // Title is the first column in every bottom table
       } : null;
     }
   }
@@ -861,6 +1033,25 @@ function renderSettings() {
     };
   }
 
+  // OCR services (credentials pending — processing is verified once the
+  // user has an API key)
+  const svc = el("set-ocr-service");
+  svc.value = state.settings.ocrService || "azure";
+  svc.onchange = () => {
+    state.settings.ocrService = svc.value;
+    saveSettings();
+  };
+  for (const [id, k] of [["set-ocr-azure-endpoint", "ocrAzureEndpoint"],
+                         ["set-ocr-azure-key", "ocrAzureKey"],
+                         ["set-ocr-tesseract", "ocrTesseract"]]) {
+    const n = el(id);
+    n.value = state.settings[k] || "";
+    n.onchange = () => {
+      state.settings[k] = n.value.trim();
+      saveSettings();
+    };
+  }
+
   // TABLE VIEW
   const mr = el("set-max-rows");
   mr.value = maxRows();
@@ -989,11 +1180,11 @@ function badge(cls, label, opts = {}) {
 function tipForLocalWhl(checks) {
   if (!checks) return "";
   const m = checks.whl_match;
-  if (!m) return "WHL CATALOG: " + (checks.in_whl || "not checked");
-  const lines = ["WHL CATALOG MATCH: " + m.title];
-  if (m.author) lines.push("AUTHOR: " + m.author);
-  if (m.year) lines.push("YEAR: " + m.year);
-  lines.push("STATUS: " + (m.status || "?"));
+  if (!m) return "WHL catalog: " + (checks.in_whl || "not checked");
+  const lines = ["WHL catalog match: " + m.title];
+  if (m.author) lines.push("Author: " + m.author);
+  if (m.year) lines.push("Year: " + m.year);
+  lines.push("Status: " + (m.status || "?"));
   if (m.permalink) lines.push("URL: " + m.permalink);
   return lines.join("\n");
 }
@@ -1012,7 +1203,7 @@ function whlBadge(row) {
       if (rejected) {
         if (murl)
           return wrap(badge("available", "YES", {
-            tip: "MANUALLY LOCATED SOURCE:\n" + murl +
+            tip: "Manually located source:\n" + murl +
               "\n(automatic match was rejected as a false positive)",
             href: murl,
           }));
@@ -1043,17 +1234,17 @@ function copyrightBadge(checks) {
 
 function tipForScan(s, isHt) {
   if (!s) return "Not checked";
-  if (s.error) return "ERROR: " + s.error;
+  if (s.error) return "Error: " + s.error;
   const b = s.best_match;
   if (!b) return s.note || (s.available === false ? "No match found" : "Could not determine");
-  const lines = [(s.available === false ? "NO CONFIDENT MATCH — CLOSEST: " : "MATCH: ") + b.title];
-  if (b.author) lines.push("AUTHOR: " + b.author);
-  if (b.year) lines.push("YEAR: " + b.year);
-  if (b.accuracy != null) lines.push("ACCURACY: " + b.accuracy);
+  const lines = [(s.available === false ? "No confident match — closest: " : "Match: ") + b.title];
+  if (b.author) lines.push("Author: " + b.author);
+  if (b.year) lines.push("Year: " + b.year);
+  if (b.accuracy != null) lines.push("Accuracy: " + b.accuracy);
   const url = b.url || b.record_url;
   if (url) lines.push("URL: " + url);
   if (isHt && b.items && b.items.length)
-    lines.push("ITEMS: " + b.items.map((i) => `${i.volume || "copy"} [${i.rights}]`).join(", "));
+    lines.push("Items: " + b.items.map((i) => `${i.volume || "copy"} [${i.rights}]`).join(", "));
   return lines.join("\n");
 }
 
@@ -1071,9 +1262,9 @@ function getManualUrl(row, source) {
 }
 
 const VERIFY_TIPS = {
-  pending: "PENDING — CLICK MARKER TO APPROVE",
-  approved: "APPROVED — CLICK MARKER TO REJECT (false positive)",
-  rejected: "REJECTED (FALSE POSITIVE) — CLICK MARKER TO RESET.\nClick the tag to paste a manually located source.",
+  pending: "Pending — click the marker to approve",
+  approved: "Approved — click the marker to reject (false positive)",
+  rejected: "Rejected (false positive) — click the marker to reset.\nClick the tag to paste a manually located source.",
 };
 
 function verifyUnit(row, source, tagHtml) {
@@ -1081,7 +1272,7 @@ function verifyUnit(row, source, tagHtml) {
   const manual = st === "rejected" && getManualUrl(row, source);
   const cls = manual ? "approved" : st;
   const tip = manual
-    ? "MANUALLY LOCATED SOURCE — CLICK MARKER TO RESET"
+    ? "Manually located source — click the marker to reset"
     : VERIFY_TIPS[st];
   return `<span class="tag-unit" data-vsrc="${source}">${tagHtml}` +
     `<span class="vmark ${cls}" data-tip="${esc(tip)}"></span></span>`;
@@ -1101,14 +1292,14 @@ function scanBadge(row, source, dot) {
       const murl = getManualUrl(row, source);
       if (murl) {
         return verifyUnit(row, source, badge("available", "YES", {
-          tip: "MANUALLY LOCATED SOURCE:\n" + murl +
+          tip: "Manually located source:\n" + murl +
             "\n(automatic match was rejected as a false positive)",
           href: murl, dot,
         }));
       }
       return verifyUnit(row, source, badge("missing", "NO", {
-        tip: "REJECTED AS FALSE POSITIVE.\n" + tip +
-          "\nCLICK TAG: paste the URL of a manually located source",
+        tip: "Rejected as false positive.\n" + tip +
+          "\nClick the tag to paste the URL of a manually located source",
         href, dot,
       }));
     }
@@ -1167,6 +1358,9 @@ function anyApprovedSource(row) {
 }
 
 function rowMarkState(row) {
+  // a locally attached scan makes the book a verified source, whatever the
+  // computed mark says
+  if (row.localPdf) return "APPROVED";
   const m = computeMark(row).mark;
   if (m === "UPLOAD") return anyApprovedSource(row) ? "APPROVED" : "UPLOAD";
   return m || "NONE";
@@ -1174,20 +1368,84 @@ function rowMarkState(row) {
 
 function markCell(row) {
   const { mark, reason } = computeMark(row);
-  if (mark === "SCAN") return badge("scan", "SCAN", { tip: reason });
+  // an attached scan stays visible (and replaceable/detachable) even when
+  // the computed mark has moved on — the row is still a verified source
+  if (row.localPdf) {
+    return `<span data-scanattach="1">${badge("approved", "SCAN", {
+      tip: `Verified source — attached scan:\n${row.localPdf}\n` +
+        "Click to replace the PDF · Shift+click to detach",
+    })}</span>`;
+  }
+  if (mark === "SCAN") {
+    return `<span data-scanattach="1">${badge("scan", "SCAN", {
+      tip: reason + "\nClick to attach a scanned PDF (marks it as a verified source)",
+    })}</span>`;
+  }
   if (mark === "UPLOAD") {
     if (anyApprovedSource(row))
-      return badge("approved", "UPLD", { tip: "Verified source(s) ready — see the EDITOR tab" });
+      return badge("approved", "UPLD", { tip: "Verified source(s) ready — see the Editor tab" });
     return badge("upload", "UPLD", { tip: reason });
   }
   return badge("unknown", "—", { tip: reason });
+}
+
+// attach a local PDF scan to a SCAN-marked row: it becomes a verified
+// source, ready to seed a new WHL entry in the Editor tab
+function attachRowScan(id) {
+  const row = state.rowsById.get(String(id));
+  if (!row) return;
+  const start = row.localPdf
+    ? row.localPdf.replace(/[\\/][^\\/]*$/, "")
+    : (state.settings.pdfBrowseDir || "");
+  openFileBrowser(start, (path) => setRowLocalPdf(id, path));
+}
+
+// PATCH a manual entry's local_pdf without touching its scans
+async function patchManualLocalPdf(id, path) {
+  const res = await fetch(`/api/manual/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    // attaching a scan doesn't change the book's identity: keep scans
+    body: JSON.stringify({ local_pdf: path, _preserve: true }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) return false;
+  const i = state.manual.findIndex((x) => x.id === id);
+  if (i >= 0) state.manual[i] = data.entry;
+  renderChecked();
+  renderUpload();
+  return true;
+}
+
+async function setRowLocalPdf(id, path) {
+  const row = state.rowsById.get(String(id));
+  if (!row) return;
+  const verb = path ? "attach scan" : "detach scan";
+  if (row.kind === "manual") {
+    const entry = state.manual.find((x) => x.id === id) || {};
+    const prior = entry.local_pdf || "";
+    if (!await patchManualLocalPdf(id, path)) { status("Attach failed"); return; }
+    pushOp(`${verb} ${(row.book.title || "").slice(0, 36)}`,
+      () => patchManualLocalPdf(id, prior),
+      () => patchManualLocalPdf(id, path));
+  } else {
+    const entry = state.checked.get(id);
+    if (!entry) return;
+    trackChecked(`${verb} ${(row.book.title || "").slice(0, 36)}`, id, () => {
+      entry.local_pdf = path;
+    });
+    saveChecked();
+  }
+  renderChecked();
+  renderUpload();
+  status(path ? `Scan attached — verified source :: ${path}` : "Scan detached");
 }
 
 // --- combined checked-books + manual-entries table -----------------------------
 
 function manualToBook(e) {
   return {
-    title: e.title || "", subtitle: "", author: e.author || "",
+    title: e.title || "", subtitle: e.subtitle || "", author: e.author || "",
     year: e.year || "", edition: e.edition || "", volume: e.volume || "",
     publisher: e.publisher || "", city: e.city || "", language: e.language || "",
     pages: e.pages || "", condition: e.condition || "",
@@ -1213,18 +1471,73 @@ function combinedRows() {
       checks: e.checks || null, scans: e.scans || null,
       verify: migrateVerify(e) || {},
       manualUrls: e.manual_urls || {},
+      localPdf: e.local_pdf || "",
     });
   }
   for (const [k, v] of state.checked.entries()) {
     rows.push({
       kind: "catalog", id: k, source: k.split(":")[0],
-      book: Object.assign({ volume: "", language: "" }, v.book),
+      book: Object.assign({ subtitle: "", volume: "", language: "" }, v.book),
       checks: v.checks || null, scans: v.scans || null,
       verify: migrateVerify(v) || {},
       manualUrls: v.manual_urls || {},
+      localPdf: v.local_pdf || "",
     });
   }
   return rows;
+}
+
+// one-time (idempotent) migration: volume / edition / subtitle indicators in
+// stored titles move into their own fields. Checked entries live in
+// localStorage; manual entries persist via a scan-preserving PATCH.
+function migrateParsedChecked() {
+  let changed = 0;
+  for (const v of state.checked.values()) {
+    const before = Object.assign({ subtitle: "", volume: "", edition: "" }, v.book);
+    const after = parseBook(before);
+    if (bookParseChanged(before, after)) {
+      v.book = Object.assign({}, v.book, {
+        title: after.title, subtitle: after.subtitle,
+        volume: after.volume, edition: after.edition,
+      });
+      changed++;
+    }
+  }
+  if (changed) saveChecked();
+  return changed;
+}
+
+async function migrateParsedManual() {
+  let changed = 0;
+  for (const e of state.manual.slice()) {
+    const before = manualToBook(e);
+    const after = parseBook(before);
+    if (!bookParseChanged(before, after)) continue;
+    const res = await fetch(`/api/manual/${encodeURIComponent(e.id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        title: after.title, subtitle: after.subtitle,
+        volume: after.volume, edition: after.edition,
+        _preserve: true,   // identity unchanged — keep checks/scans/verify
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.ok) {
+      const i = state.manual.findIndex((x) => x.id === e.id);
+      if (i >= 0) state.manual[i] = data.entry;
+      changed++;
+    }
+  }
+  return changed;
+}
+
+async function migrateParsedEntries() {
+  const n = migrateParsedChecked() + (await migrateParsedManual());
+  if (n) {
+    renderChecked();
+    status(`Parsed volume/edition/subtitle out of ${n} stored titles`);
+  }
 }
 
 function rowById(id) {
@@ -1287,13 +1600,13 @@ function iaCell(row) {
 }
 
 const TIP_FIELDS = [
-  ["title", "TITLE"], ["subtitle", "SUBTITLE"], ["author", "AUTHOR"],
-  ["publisher", "PUBLISHER"], ["city", "CITY"], ["year", "YEAR"],
-  ["edition", "EDITION"], ["volume", "VOLUME"], ["language", "LANGUAGE"],
-  ["pages", "PAGES"], ["subject", "SUBJECT"], ["condition", "CONDITION"],
-  ["price", "PRICE"], ["illustrations", "ILLUSTRATIONS"],
-  ["categories", "CATEGORIES"], ["notes", "NOTES"], ["status", "STATUS"],
-  ["acquired", "ACQUIRED"], ["url", "URL"],
+  ["title", "Title"], ["subtitle", "Subtitle"], ["author", "Author"],
+  ["publisher", "Publisher"], ["city", "City"], ["year", "Year"],
+  ["edition", "Edition"], ["volume", "Volume"], ["language", "Language"],
+  ["pages", "Pages"], ["subject", "Subject"], ["condition", "Condition"],
+  ["price", "Price"], ["illustrations", "Illustrations"],
+  ["categories", "Categories"], ["notes", "Notes"], ["status", "Status"],
+  ["acquired", "Acquired"], ["url", "URL"],
 ];
 
 function recordTip(rec, header) {
@@ -1312,7 +1625,7 @@ function recordTip(rec, header) {
 
 function updateCheckedCount() {
   el("checked-count").textContent =
-    `${state.checked.size} CHECKED / ${state.manual.length} MANUAL`;
+    `${state.checked.size} checked / ${state.manual.length} manual`;
 }
 
 // the FIND box + the filter menu, applied identically for display and export
@@ -1368,7 +1681,8 @@ function renderChecked() {
       ? `<td data-csearch="1">${esc(b[f])}</td>`
       : `<td${editable(f)}>${esc(b[f])}</td>`;
     tr.innerHTML = `
-      <td>${row.kind === "manual" ? "MANUAL" : esc(row.source.toUpperCase())}</td>
+      <td>${row.kind === "manual" ? "MANUAL"
+        : row.source === "ch_library" ? "MASTER" : esc(row.source.toUpperCase())}</td>
       ${BOOK_COLS.map(cell).join("\n      ")}
       <td class="col-whl">${copyrightBadge(row.checks)}</td>
       <td class="col-whl">${whlBadge(row)}</td>
@@ -1403,6 +1717,18 @@ function onCheckedClick(ev) {
     const unit = mark.closest("[data-vsrc]");
     const tr = mark.closest("tr");
     if (unit && tr) cycleVerify(tr.dataset.rowId, unit.dataset.vsrc);
+    return;
+  }
+  // SCAN mark: attach a local scan PDF (the row becomes a verified source);
+  // Shift+click detaches an attached scan
+  const scanTag = ev.target.closest("[data-scanattach]");
+  if (scanTag) {
+    const tr = scanTag.closest("tr");
+    if (tr) {
+      const row = state.rowsById.get(String(tr.dataset.rowId));
+      if (ev.shiftKey && row && row.localPdf) setRowLocalPdf(tr.dataset.rowId, "");
+      else attachRowScan(tr.dataset.rowId);
+    }
     return;
   }
   const tag = ev.target.closest(".tag-unit a.badge");
@@ -1561,14 +1887,16 @@ async function loadWhlRows(force) {
 }
 
 function chToRecord(b) {
-  return {
+  // the master list source is read-only, so the title parse (subtitle /
+  // volume / edition) applies at display time
+  return parseBook({
     _src: "ch", _idx: b.idx,
     title: b.title, subtitle: b.subtitle || "", author: b.author,
     publisher: b.publisher, city: b.city, year: b.year, edition: b.edition,
     volume: "", language: "", pages: b.pages, condition: b.condition,
     price: b.price, illustrations: b.illustrations, categories: b.categories,
     notes: b.notes, acquired: b.acquired, url: "",
-  };
+  });
 }
 
 function whlToRecord(r) {
@@ -1584,7 +1912,7 @@ function whlToRecord(r) {
 }
 
 function olToRecord(r) {
-  return {
+  return parseBook({
     _src: "ol", _idx: r.key,
     title: r.title, subtitle: r.subtitle || "",
     author: (r.authors || []).join("; "),
@@ -1593,26 +1921,30 @@ function olToRecord(r) {
     edition: r.edition || "", volume: r.volume || "",
     language: r.language || "", pages: r.pages || "",
     categories: "", notes: "", url: r.url || "",
-  };
+  });
 }
 
 const BOTTOM_TABLES = {
   ol: {
     label: "Open Library",
-    cols: ["TITLE", "AUTHOR", "YEAR", "PUBLISHER", "CITY", "ED", "VOL", "LANG"],
+    cols: ["Title", "Author", "Year", "Publisher", "City", "Ed", "Vol", "Lang"],
     cells: (r) => [linkCell(r.title, r.url), esc(r.author), esc(r.year),
                    esc(r.publisher), esc(r.city), esc(r.edition),
                    esc(r.volume), esc(r.language)],
   },
   ch: {
-    label: "CH catalog",
-    cols: ["TITLE", "AUTHOR", "YEAR", "PUBLISHER", "CITY", "CATEGORIES"],
-    cells: (r) => [esc(r.title), esc(r.author), esc(r.year), esc(r.publisher),
+    label: "Master list",
+    // Vol/Ed hold the values the display parse lifts out of raw titles —
+    // multi-volume sets stay distinguishable in the table
+    cols: ["Title", "Subtitle", "Author", "Year", "Vol", "Ed", "Publisher",
+           "City", "Categories"],
+    cells: (r) => [esc(r.title), esc(r.subtitle), esc(r.author), esc(r.year),
+                   esc(r.volume), esc(r.edition), esc(r.publisher),
                    esc(r.city), esc(r.categories)],
   },
   whl: {
     label: "WHL catalog",
-    cols: ["TITLE", "AUTHORS", "YEAR", "STATUS"],
+    cols: ["Title", "Authors", "Year", "Status"],
     cells: (r) => [linkCell(r.title, r.url), esc(r.author), esc(r.year),
                    esc(r.status)],
   },
@@ -1745,7 +2077,7 @@ function renderBottomRows() {
   });
   el("bottom-empty").hidden = records.length !== 0;
   el("bottom-count").textContent =
-    `${records.length} ROWS` + (t === "ol" && state.olNote ? ` — ${state.olNote}` : "");
+    `${records.length} rows` + (t === "ol" && state.olNote ? ` — ${state.olNote}` : "");
   applyTableChrome("b-" + t);
 }
 
@@ -1777,7 +2109,7 @@ async function olRealtime() {
   }
   if (![...params.keys()].some((k) => k !== "limit")) {
     state.olRows = [];
-    state.olNote = "TYPE IN FIND OR THE SEARCH FORM";
+    state.olNote = "Type in Find or the search form";
     renderBottomRows();
     return;
   }
@@ -1790,7 +2122,7 @@ async function olRealtime() {
   } catch (e) {
     if (seq !== olRtSeq) return;
     state.olRows = [];
-    state.olNote = "SEARCH FAILED";
+    state.olNote = "Search failed";
   }
   renderBottomRows();
 }
@@ -1832,14 +2164,15 @@ async function addToTop(rec) {
   }
   if (rec._src === "ch") { addChBook(rec._idx); return; }
   const cased = (t) => rec._src === "ol" ? titleCase(t) : t;
-  const body = {
-    title: cased(rec.title) + (rec.subtitle ? ": " + cased(rec.subtitle) : ""),
+  // volume / edition / subtitle indicators split out of the title on add
+  const body = parseBook({
+    title: cased(rec.title), subtitle: cased(rec.subtitle || ""),
     author: rec.author, publisher: rec.publisher, city: rec.city,
     year: rec.year, edition: rec.edition, volume: rec.volume,
     language: rec.language, pages: rec.pages || "",
     condition: "", price: "", illustrations: "", categories: rec.categories || "",
     notes: rec.url ? `From ${rec._src === "ol" ? "Open Library" : "WHL catalog"}: ${rec.url}` : "",
-  };
+  });
   try {
     const res = await fetch("/api/manual", {
       method: "POST",
@@ -1862,8 +2195,9 @@ async function addToTop(rec) {
 }
 
 function addChBook(idx) {
-  const book = (state.chBooks || []).find((x) => x.idx === idx);
-  if (!book) return;
+  const raw = (state.chBooks || []).find((x) => x.idx === idx);
+  if (!raw) return;
+  const book = parseBook(raw);   // subtitle / volume / edition split
   const key = ckey("ch_library", idx);
   trackChecked(`add ${book.title.slice(0, 40)}`, key, () => {
     const prev = state.checked.get(key) || {};
@@ -1897,8 +2231,8 @@ function updateModeTag() {
   const tag = el("mode-tag");
   tag.hidden = false;
   const m = topMode();
-  const name = state.settings.topTable === "whl" ? "WHL" : "CHECKED";
-  tag.textContent = `${name} MODE: ${m.toUpperCase()}`;
+  const name = state.settings.topTable === "whl" ? "WHL" : "Checked";
+  tag.textContent = `${name} mode: ${m}`;
   tag.className = "foot-tag " + (m === "edit" ? "tag-edit" : "tag-search");
 }
 
@@ -1918,7 +2252,7 @@ function setTopMode(m) {
 function renderModeBar() {
   const btn = el("whl-mode");
   btn.hidden = false;
-  btn.textContent = `MODE: ${topMode().toUpperCase()}`;
+  btn.textContent = `Mode: ${topMode()}`;
   el("whl-cons").hidden = topMode() !== "search";
 }
 
@@ -1985,7 +2319,7 @@ function renderWhlTop() {
   }
   el("whltop-empty").hidden = shown.length !== 0;
   el("top-count").textContent =
-    `${rows.length} WHL ROWS` + (rows.length > cap ? ` (SHOWING ${cap})` : "");
+    `${rows.length} WHL rows` + (rows.length > cap ? ` (showing ${cap})` : "");
   applyTableChrome("whl");
   markSortHeaders("whl");
 }
@@ -2350,22 +2684,23 @@ function openBookEditTab(rowId) {
   if (!row) return;
   state.editTarget = { kind: "row", id: String(rowId) };
   el("whledit-note").textContent =
-    `${row.kind === "manual" ? "MANUAL ENTRY" : "CHECKED BOOK"} :: ` +
+    `${row.kind === "manual" ? "Manual entry" : "Checked book"} :: ` +
     `${(row.book.title || "").slice(0, 60)}`;
   fillBookEditForm(row.book, row.kind !== "manual");
   showEditForms("book");
   el("e-title").focus();
 }
 
-// a CH catalog record (bottom pane); SAVE checks it with the edited metadata
+// a master-list record (bottom pane); SAVE checks it with the edited metadata
 function openChEditTab(idx) {
   const book = (state.chBooks || []).find((x) => x.idx === idx);
   if (!book) return;
   state.editTarget = { kind: "ch", idx };
   el("whledit-note").textContent =
-    `CH CATALOG #${idx} :: ${(book.title || "").slice(0, 60)}`;
+    `Master list #${idx} :: ${(book.title || "").slice(0, 60)}`;
   const existing = state.checked.get(ckey("ch_library", idx));
-  fillBookEditForm(existing ? existing.book : book, true);
+  // prefill matches what the table shows: the parsed title/subtitle/vol/ed
+  fillBookEditForm(existing ? existing.book : parseBook(book), true);
   showEditForms("book");
   el("e-title").focus();
 }
@@ -2393,11 +2728,11 @@ async function saveBookEditTab(ev) {
   if (!t || t.kind === "whl") return;
   const vals = {};
   for (const f of BOOK_EDIT_FIELDS) vals[f] = el("e-" + f).value.trim();
-  if (!vals.title) { el("bookedit-msg").textContent = "TITLE IS REQUIRED"; return; }
+  if (!vals.title) { el("bookedit-msg").textContent = "Title is required"; return; }
 
   if (t.kind === "row") {
     const row = state.rowsById.get(t.id);
-    if (!row) { el("bookedit-msg").textContent = "ROW IS GONE"; return; }
+    if (!row) { el("bookedit-msg").textContent = "Row is gone"; return; }
     if (row.kind === "manual") {
       const fields = {};
       const before = {};
@@ -2409,16 +2744,16 @@ async function saveBookEditTab(ev) {
         pushOp(`edit entry ${vals.title.slice(0, 32)}`,
           () => patchManualFields(t.id, before),
           () => patchManualFields(t.id, fields));
-        el("bookedit-msg").textContent = "SAVED";
+        el("bookedit-msg").textContent = "Saved";
         status(`ENTRY SAVED :: ${vals.title} :: RESCANNING`);
       } else {
-        el("bookedit-msg").textContent = "SAVE FAILED";
+        el("bookedit-msg").textContent = "Save failed";
       }
       return;
     }
     // checked catalog row: client-side metadata + fresh checks/scans
     const entry = state.checked.get(t.id);
-    if (!entry) { el("bookedit-msg").textContent = "ROW IS GONE"; return; }
+    if (!entry) { el("bookedit-msg").textContent = "Row is gone"; return; }
     trackChecked(`edit ${vals.title.slice(0, 36)}`, t.id, () => {
       entry.book = Object.assign({}, entry.book, vals);
       entry.checks = null;
@@ -2428,18 +2763,19 @@ async function saveBookEditTab(ev) {
     });
     saveChecked();
     renderChecked();
-    el("bookedit-msg").textContent = "SAVED";
+    el("bookedit-msg").textContent = "Saved";
     status(`BOOK SAVED :: ${vals.title} :: RESCANNING`);
     return;
   }
 
-  // CH catalog record: check it (or update the checked copy) with the edits
+  // Master-list record: check it (or update the checked copy) with the
+  // edits — parse-on-add applies here as on every other add path
   const key = ckey("ch_library", t.idx);
   trackChecked(`check ${vals.title.slice(0, 38)}`, key, () => {
     const prev = state.checked.get(key) || {};
     const base = (state.chBooks || []).find((x) => x.idx === t.idx) || {};
     state.checked.set(key, {
-      book: Object.assign({ idx: t.idx }, base, prev.book || {}, vals),
+      book: parseBook(Object.assign({ idx: t.idx }, base, prev.book || {}, vals)),
       checks: null, scans: null, verify: null, manual_urls: null,
     });
     queueScan(key);
@@ -2447,7 +2783,7 @@ async function saveBookEditTab(ev) {
   saveChecked();
   renderChecked();
   updateCheckedCount();
-  el("bookedit-msg").textContent = "SAVED — ADDED TO CHECKED BOOKS";
+  el("bookedit-msg").textContent = "Saved — added to checked books";
   status(`CH BOOK CHECKED WITH EDITS :: ${vals.title}`);
 }
 
@@ -2458,17 +2794,17 @@ async function saveWhlEditTab(ev) {
   if (editOrigShown) return;
   const idx = state.whlEditIdx;
   const row = whlRowByIdx(idx);
-  if (row == null) { el("whledit-msg").textContent = "NO ROW LOADED"; return; }
+  if (row == null) { el("whledit-msg").textContent = "No row loaded"; return; }
   const fields = {};
   for (const f of WHL_ROW_FIELDS) fields[f] = el("w-" + f).value.trim();
-  if (!fields.title) { el("whledit-msg").textContent = "TITLE IS REQUIRED"; return; }
+  if (!fields.title) { el("whledit-msg").textContent = "Title is required"; return; }
   const before = whlFieldSnaps(row, WHL_ROW_FIELDS);
   if (await whlPost({ idx, fields })) {
     pushWhlFieldsOp(`edit WHL record ${fields.title.slice(0, 30)}`, idx, before, fields);
-    el("whledit-msg").textContent = "SAVED";
+    el("whledit-msg").textContent = "Saved";
     status(`WHL CORRECTIONS SAVED :: ${fields.title}`);
   } else {
-    el("whledit-msg").textContent = "SAVE FAILED";
+    el("whledit-msg").textContent = "Save failed";
   }
 }
 
@@ -2983,7 +3319,7 @@ function createMdEditor(container, opts = {}) {
 let overlayMd = null;
 function openMarkdownEditor(targetTextareaId, title) {
   state.mdTarget = targetTextareaId;
-  el("md-title").textContent = title || "MARKDOWN EDITOR";
+  el("md-title").textContent = title || "Markdown editor";
   overlayMd.set(el(targetTextareaId).value);
   el("md-overlay").hidden = false;
   overlayMd.focus();
@@ -3026,7 +3362,7 @@ function createPdfViewer() {
     <div class="pdf-body">
       <div class="pdf-framewrap" hidden><iframe class="pdf-frame" title="PDF preview"></iframe></div>
       <pre class="pdf-ocrpane" hidden></pre>
-      <div class="pdf-note empty">NO PDF</div>
+      <div class="pdf-note empty">No PDF</div>
     </div>`;
   const frame = root.querySelector(".pdf-frame");
   const frameWrap = root.querySelector(".pdf-framewrap");
@@ -3044,7 +3380,7 @@ function createPdfViewer() {
   async function loadOcr() {
     if (!textSrc || ocrLoadedFor === textSrc) return;
     const want = textSrc;
-    ocrPane.textContent = "EXTRACTING TEXT ...";
+    ocrPane.textContent = "Extracting text ...";
     let data;
     try {
       data = await (await fetch(want)).json();
@@ -3104,7 +3440,7 @@ function createPdfViewer() {
       sizeSeq++;
       frame.removeAttribute("src");
       frameWrap.hidden = true;
-      note.textContent = msg || "NO PDF";
+      note.textContent = msg || "No PDF";
       note.hidden = false;
       path.textContent = "";
       size.textContent = "";
@@ -3124,7 +3460,7 @@ let pdfmViewer = null;
 function openPdfModal(idx) {
   const r = whlRowByIdx(idx);
   if (!r || !r.file) return;
-  el("pdfm-title").textContent = (r.title || "PUBLICATION").slice(0, 90);
+  el("pdfm-title").textContent = (r.title || "Publication").slice(0, 90);
   el("pdfm-overlay").hidden = false;
   pdfmViewer.show(r.file, r.file, {
     textSrc: "/api/pdf/text?url=" + encodeURIComponent(r.file),
@@ -3153,7 +3489,7 @@ async function fbLoad(dir) {
   try {
     data = await (await fetch("/api/pdf/browse?dir=" + encodeURIComponent(dir || ""))).json();
   } catch (e) {
-    el("fb-list").innerHTML = `<p class="empty">CANNOT LIST DIRECTORY</p>`;
+    el("fb-list").innerHTML = `<p class="empty">Cannot list this folder</p>`;
     return;
   }
   el("fb-path").value = data.dir;
@@ -3189,7 +3525,7 @@ async function fbLoad(dir) {
       closeFileBrowser();
     }, f.path);
   if (!data.dirs.length && !data.pdfs.length)
-    list.innerHTML = `<p class="empty">NO SUBFOLDERS OR PDF FILES</p>`;
+    list.innerHTML = `<p class="empty">No subfolders or PDF files</p>`;
 }
 
 function openFileBrowser(startDir, onPick) {
@@ -3481,7 +3817,7 @@ async function saveManualSource(clear) {
   if (!t) return;
   const url = clear ? "" : el("msrc-url").value.trim();
   if (url && !/^https?:\/\//i.test(url)) {
-    el("msrc-msg").textContent = "URL MUST START WITH http(s)://";
+    el("msrc-msg").textContent = "URL must start with http(s)://";
     return;
   }
   await setManualUrl(t.id, t.source, url);
@@ -3524,7 +3860,7 @@ async function loadOlStatus() {
     const ed = st.editions || {};
     el("status-right").textContent = ed.available
       ? `OL INDEX: ${(ed.editions / 1e6).toFixed(1)}M EDITIONS`
-      : (st.available ? `OL WORKS INDEX: ${(st.works / 1e6).toFixed(1)}M` : "NO OL INDEX");
+      : (st.available ? `OL WORKS INDEX: ${(st.works / 1e6).toFixed(1)}M` : "No OL index");
   } catch (e) { /* leave empty */ }
 }
 
@@ -3634,7 +3970,7 @@ async function olSearch(ev) {
   await renderBottomPane();
   await olRealtime();
   el("ol-msg").textContent =
-    `${(state.olRows || []).length} RESULTS IN THE OPEN LIBRARY TABLE BELOW`;
+    `${(state.olRows || []).length} results in the Open Library table below`;
 }
 
 function manualStatusLine(entry) {
@@ -3667,13 +4003,14 @@ function onYearInput() {
 
 async function submitManual(ev) {
   ev.preventDefault();
-  const body = {};
+  let body = {};
   for (const f of MANUAL_FIELDS) body[f] = el("m-" + f).value;
-  if (!body.title.trim()) { el("manual-msg").textContent = "TITLE IS REQUIRED"; return; }
+  if (!body.title.trim()) { el("manual-msg").textContent = "Title is required"; return; }
+  body = parseBook(body);   // colon subtitle + volume / edition indicators
 
   const btn = el("manual-submit");
   btn.disabled = true;
-  el("manual-msg").textContent = "CHECKING ...";
+  el("manual-msg").textContent = "Checking ...";
   status(`CHECKING :: ${body.title}`);
   try {
     const res = await fetch("/api/manual", {
@@ -3690,14 +4027,14 @@ async function submitManual(ev) {
       clearProv();
       hideOlSuggest();
       el("m-title").focus();
-      el("manual-msg").textContent = "SAVED";
+      el("manual-msg").textContent = "Saved";
       status(manualStatusLine(data.entry));
       queueScan(data.entry.id);
     } else {
-      el("manual-msg").textContent = data.error || "SAVE FAILED";
+      el("manual-msg").textContent = data.error || "Save failed";
     }
   } catch (e) {
-    el("manual-msg").textContent = "SAVE FAILED";
+    el("manual-msg").textContent = "Save failed";
   }
   btn.disabled = false;
 }
@@ -3794,6 +4131,22 @@ const ARCHIVE_NAMES = { internet_archive: "Internet Archive", hathitrust: "Hathi
 function approvedSources() {
   const out = [];
   for (const row of combinedRows()) {
+    // a locally attached scan is a verified source in its own right
+    if (row.localPdf) {
+      out.push({
+        title: row.book.title || "",
+        subtitle: row.book.subtitle || "",
+        author: row.book.author || "",
+        publisher: row.book.publisher || "",
+        year: row.book.year || "",
+        archive: "Local scan",
+        url: "",
+        matched_title: row.localPdf.split(/[\\/]/).pop() || row.localPdf,
+        identifier: "",
+        local_pdf: row.localPdf,
+        _rowId: row.id,
+      });
+    }
     for (const source of ["internet_archive", "hathitrust"]) {
       const meta = {
         title: row.book.title || "",
@@ -3838,7 +4191,7 @@ function renderUpload() {
   state.uploadSources = sources;
   const tbody = el("upload-rows");
   tbody.innerHTML = "";
-  el("sources-count").textContent = `${sources.length} ROWS`;
+  el("sources-count").textContent = `${sources.length} rows`;
   el("upload-empty").hidden = sources.length !== 0;
   sources.forEach((s, i) => {
     const tr = document.createElement("tr");
@@ -3857,8 +4210,8 @@ function renderUpload() {
     tbody.appendChild(tr);
   });
   el("upload-count").textContent =
-    `${Object.keys(state.builds).length} ENTRIES / ` +
-    `${Object.values(state.builds).filter((b) => b.status === "ready").length} VERIFIED`;
+    `${Object.keys(state.builds).length} entries / ` +
+    `${Object.values(state.builds).filter((b) => b.status === "ready").length} verified`;
   applyTableChrome("upload");
 }
 
@@ -3902,17 +4255,24 @@ function renderBuildsList() {
   const builds = buildsSorted();
   el("builds-empty").hidden = builds.length !== 0;
   for (const b of builds) {
+    const ready = b.status === "ready";
     const li = document.createElement("li");
     li.className = "build-item" + (b.id === state.buildSel ? " active" : "") +
-      (b.status === "ready" ? " ready" : "");
+      (ready ? " ready" : "");
     li.dataset.bid = b.id;
     li.dataset.tip = `${b.title || "(untitled)"}\n` +
-      `${b.authors ? "AUTHORS: " + b.authors + "\n" : ""}` +
-      `${b.year ? "YEAR: " + b.year + "\n" : ""}` +
-      `STATUS: ${(b.status || "draft").toUpperCase()}\nUPDATED: ${b.updated_at || ""}`;
+      `${b.authors ? "Authors: " + b.authors + "\n" : ""}` +
+      `${b.year ? "Year: " + b.year + "\n" : ""}` +
+      `Status: ${ready ? "verified" : "draft"}\nUpdated: ${b.updated_at || ""}`;
+    // compact: title with the status icon inline on the right, then a
+    // single author · year meta line
     li.innerHTML = `
-      <span class="bi-title">${esc(b.title) || "<em>(untitled)</em>"}</span>
-      <span class="bi-meta">${esc(b.year || "")} ${b.status === "ready" ? "&#10003; VERIFIED" : "DRAFT"}</span>`;
+      <span class="bi-row">
+        <span class="bi-title">${esc(b.title) || "<em>(untitled)</em>"}</span>
+        <span class="bi-status ${ready ? "ok" : ""}"
+              data-tip="${ready ? "Verified" : "Draft"}">${ready ? ICONS.check : ICONS.pencil}</span>
+      </span>
+      <span class="bi-meta">${esc(b.authors || "")}${b.authors && b.year ? " &middot; " : ""}${esc(b.year || "")}</span>`;
     list.appendChild(li);
   }
 }
@@ -3989,9 +4349,12 @@ async function createBuild(seed, label) {
 
 function buildSeedFromSource(s) {
   // pdf_source records where the scan lives online; pdf_file is filled with
-  // the already-downloaded local copy when one exists.
+  // the already-downloaded local copy when one exists. Locally attached
+  // scans have no online source — the local file IS the source.
   let pdfUrl = "", pdfFile = "";
-  if (s.identifier) {
+  if (s.local_pdf) {
+    pdfFile = s.local_pdf;
+  } else if (s.identifier) {
     pdfUrl = `https://archive.org/download/${s.identifier}/${s.identifier}.pdf`;
     if (state.downloadedIds.has(s.identifier)) {
       pdfFile = `downloads/ia/${s.identifier}.pdf`;
@@ -4052,14 +4415,14 @@ async function saveBuildFields(ev) {
   // saving verifies the currently active OCR file for this book
   const cur = currentBuild();
   if (cur && cur.ocr_active) fields.ocr_verified = cur.ocr_active;
-  if (!fields.title) { el("build-msg").textContent = "TITLE IS REQUIRED"; return; }
+  if (!fields.title) { el("build-msg").textContent = "Title is required"; return; }
   if (await patchBuild(id, fields, `edit build ${fields.title.slice(0, 30)}`)) {
     descState.id = id;
     descState.val = fields.description;
-    el("build-msg").textContent = "SAVED";
+    el("build-msg").textContent = "Saved";
     status(`BUILD SAVED :: ${fields.title}`);
   } else {
-    el("build-msg").textContent = "SAVE FAILED";
+    el("build-msg").textContent = "Save failed";
   }
 }
 
@@ -4124,7 +4487,7 @@ async function generateAiSummary() {
   const s = state.settings;
   const msg = el("b-ai-msg");
   if (!(s.aiKey || "").trim() || !(s.aiModel || "").trim()) {
-    msg.textContent = "CONFIGURE MODEL + API KEY (SETTINGS > AI)";
+    msg.textContent = "Configure the model + API key (Settings > AI)";
     return;
   }
   const localPath = (b.pdf_file || "").trim();
@@ -4133,16 +4496,16 @@ async function generateAiSummary() {
     ? "/api/pdf/text?path=" + encodeURIComponent(localPath)
     : (/^https?:\/\//i.test(url)
         ? "/api/pdf/text?url=" + encodeURIComponent(url) : null);
-  if (!textSrc) { msg.textContent = "NO PDF SOURCE"; return; }
+  if (!textSrc) { msg.textContent = "No PDF source"; return; }
   el("b-ai").disabled = true;
   try {
-    msg.textContent = "EXTRACTING TEXT ...";
+    msg.textContent = "Extracting text ...";
     const ocr = await (await fetch(textSrc)).json();
     if (!ocr.ok || !(ocr.text || "").trim()) {
-      msg.textContent = (ocr.error || "NO TEXT LAYER").slice(0, 80);
+      msg.textContent = (ocr.error || "No text layer").slice(0, 80);
       return;
     }
-    msg.textContent = "GENERATING ...";
+    msg.textContent = "Generating ...";
     const res = await fetch("/api/ai/summarize", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -4162,13 +4525,13 @@ async function generateAiSummary() {
         return;
       }
       buildDescMd.set(data.summary || "");
-      msg.textContent = "GENERATED (UNSAVED)";
+      msg.textContent = "Generated (unsaved)";
       status(`AI SUMMARY GENERATED :: ${b.title || b.id}`);
     } else {
-      msg.textContent = (data.error || "FAILED").slice(0, 80);
+      msg.textContent = (data.error || "Failed").slice(0, 80);
     }
   } catch (e) {
-    msg.textContent = "REQUEST FAILED";
+    msg.textContent = "Request failed";
   } finally {
     el("b-ai").disabled = false;
   }
@@ -4181,7 +4544,7 @@ function loadDescriptionFile(file) {
   reader.onload = () => {
     if (state.buildSel !== forBuild) return;
     buildDescMd.set(String(reader.result || ""));
-    el("b-ai-msg").textContent = "LOADED (UNSAVED)";
+    el("b-ai-msg").textContent = "Loaded (unsaved)";
   };
   reader.readAsText(file);
 }
@@ -4239,8 +4602,8 @@ function renderOcrChips(b) {
     chip.textContent = f.name.replace(/\.txt$/i, "") +
       (b.ocr_verified === f.name ? " ✓" : "");
     chip.dataset.tip = `${f.name} (${fmtSize(f.size)})` +
-      (b.ocr_active === f.name ? "\nACTIVE" : "\nClick to make active") +
-      (b.ocr_verified === f.name ? "\nVERIFIED" : "");
+      (b.ocr_active === f.name ? "\nActive" : "\nClick to make active") +
+      (b.ocr_verified === f.name ? "\nVerified" : "");
     chip.dataset.ocr = f.name;
     wrap.appendChild(chip);
   }
@@ -4269,7 +4632,7 @@ async function refreshSourceTab() {
       localPath = `downloads/ia/${ident}.pdf`;
       await patchBuildRaw(b.id, { pdf_file: localPath }, true);
       if (stale()) return;
-      el("b-src-msg").textContent = "LOCAL PDF ATTACHED AUTOMATICALLY";
+      el("b-src-msg").textContent = "Local PDF attached automatically";
     }
   }
   el("b-pdf_file").value = localPath;
@@ -4288,7 +4651,7 @@ async function refreshSourceTab() {
     const url = b.pdf_source.trim();
     buildPdfViewer.show(url, url + "  (remote)", { textSrc });
   } else {
-    buildPdfViewer.clear("NO PDF");
+    buildPdfViewer.clear("No PDF");
   }
 }
 
@@ -4296,7 +4659,7 @@ async function refreshSourceTab() {
 async function syncBuildFolder() {
   const b = currentBuild();
   if (!b) return;
-  el("b-src-msg").textContent = "BUILDING FOLDER ...";
+  el("b-src-msg").textContent = "Building folder ...";
   el("b-folder").disabled = true;
   try {
     const res = await fetch(`/api/builds/${encodeURIComponent(b.id)}/folder`, {
@@ -4314,7 +4677,7 @@ async function syncBuildFolder() {
       // at the folder's preview.pdf
       if (data.build) state.builds[b.id] = data.build;
       el("b-src-msg").textContent =
-        "FOLDER READY" + (data.notes && data.notes.length
+        "Folder ready" + (data.notes && data.notes.length
           ? " — " + data.notes.join("; ") : "");
       status(`ENTRY FOLDER :: ${data.path}`);
       if (state.buildSel === b.id) {
@@ -4322,10 +4685,10 @@ async function syncBuildFolder() {
         loadDownloads();  // the original may have been removed
       }
     } else {
-      el("b-src-msg").textContent = "FOLDER BUILD FAILED";
+      el("b-src-msg").textContent = "Folder build failed";
     }
   } catch (e) {
-    el("b-src-msg").textContent = "FOLDER BUILD FAILED";
+    el("b-src-msg").textContent = "Folder build failed";
   } finally {
     el("b-folder").disabled = false;
   }
@@ -4346,7 +4709,7 @@ async function uploadOcrFile(file) {
     if (data.ok && state.buildSel === forBuild) {
       state.buildFolder = data.folder;
       renderOcrChips(currentBuild());
-      el("b-src-msg").textContent = `OCR LOADED :: ${data.name}`;
+      el("b-src-msg").textContent = `OCR loaded :: ${data.name}`;
     }
   };
   reader.readAsText(file);
@@ -4373,30 +4736,43 @@ async function attachPdfFile(path) {
     let ok = false;
     try { ok = (await fetch(pdfLocalSrc(p), { method: "HEAD" })).ok; } catch (e) {}
     if (!ok) {
-      el("b-src-msg").textContent = "FILE NOT FOUND (or not a PDF)";
+      el("b-src-msg").textContent = "File not found (or not a PDF)";
       return;
     }
   }
   if (await patchBuild(b.id, { pdf_file: p },
       p ? `attach PDF to ${b.title || b.id}` : `detach PDF from ${b.title || b.id}`)) {
-    el("b-src-msg").textContent = p ? "ATTACHED" : "DETACHED";
+    el("b-src-msg").textContent = p ? "Attached" : "Detached";
     refreshSourceTab();
   } else {
-    el("b-src-msg").textContent = "SAVE FAILED";
+    el("b-src-msg").textContent = "Save failed";
   }
 }
 
 // --- OCR tab: load, review, compare, and correct OCR text -------------------------
-// Cloud/local OCR processing (Azure Document Intelligence, OpenAI vision,
-// Tesseract) plugs into the queue later; the review/edit tooling is live.
+// OCR targets are the books' PDFs. The sidebar lists every book folder;
+// selecting one loads its OCR text files as documents. Cloud/local OCR
+// processing (Azure Document Intelligence, OpenAI vision, Tesseract) plugs
+// into the queue once service credentials exist (Settings > OCR) — TODO:
+// verify against a live service when the user has an API key.
 
-const ocrState = { docs: [], sel: null, view: "edit", jobs: [], seq: 0 };
+const ocrState = {
+  docs: [], sel: null, view: "edit", jobs: [], seq: 0,
+  books: null,             // build id -> {ocr, preview} (entry folders)
+  book: null,              // selected book (build id)
+  bookLoading: null,       // build id currently loading (re-entrancy guard)
+  verifiedOnly: false,     // sidebar filter
+  pages: null,             // {pre, map} sections for the side-by-side view
+};
 
 function ocrSelDoc() {
   return ocrState.docs.find((d) => d.id === ocrState.sel) || null;
 }
 
 function ocrSyncEditor() {
+  // a pending page-view edit must land in ITS document before anything
+  // switches docs/views or saves
+  flushOcrPageSync();
   const d = ocrSelDoc();
   if (d && ocrState.view === "edit") d.text = el("ocr-editor").value;
 }
@@ -4408,6 +4784,102 @@ function ocrAddDoc(name, text, buildId, fileName) {
                        buildId: buildId || null, fileName: fileName || null });
   ocrState.sel = id;
   renderOcrTab();
+}
+
+// --- the book-folder sidebar --
+
+async function loadOcrBooks() {
+  try {
+    const data = await (await fetch("/api/entries")).json();
+    ocrState.books = data.entries || {};
+  } catch (e) { ocrState.books = {}; }
+}
+
+function ocrBookList() {
+  const out = [];
+  for (const b of buildsSorted()) {
+    const folder = (ocrState.books || {})[b.id];
+    if (!folder) continue;
+    if (ocrState.verifiedOnly && b.status !== "ready") continue;
+    out.push({ build: b, folder });
+  }
+  return out;
+}
+
+// the book's OCR target: its PDF (the attached file, or the folder preview)
+function ocrBookPdf(bid) {
+  const b = state.builds[bid];
+  const pf = b && (b.pdf_file || "").trim();
+  if (pf) return pf;
+  const folder = (ocrState.books || {})[bid];
+  if (folder && folder.preview) return `output/entries/${bid}/preview.pdf`;
+  return "";
+}
+
+function renderOcrBooks() {
+  const list = el("ocr-books");
+  list.innerHTML = "";
+  const books = ocrBookList();
+  el("ocr-books-empty").hidden = books.length !== 0;
+  el("ocr-filter-verified").classList.toggle("active", ocrState.verifiedOnly);
+  for (const { build: b, folder } of books) {
+    const ready = b.status === "ready";
+    const li = document.createElement("li");
+    li.className = "ocr-book" + (b.id === ocrState.book ? " active" : "");
+    li.dataset.bid = b.id;
+    li.dataset.tip = `${b.title || "(untitled)"}\n` +
+      `${folder.ocr.length} OCR file(s)` +
+      (ready ? "\nVerified" : "\nDraft") +
+      (ocrBookPdf(b.id) ? `\nPDF: ${ocrBookPdf(b.id)}` : "\nNo PDF");
+    li.innerHTML = `
+      <span class="bi-row">
+        <span class="bi-title">${esc(b.title) || "<em>(untitled)</em>"}</span>
+        <span class="bi-status ${ready ? "ok" : ""}">${ready ? ICONS.check : ICONS.pencil}</span>
+      </span>
+      <span class="bi-meta">${esc(b.authors || "")}${b.authors && b.year ? " &middot; " : ""}${esc(b.year || "")}
+        &middot; ${folder.ocr.length} OCR</span>`;
+    list.appendChild(li);
+  }
+}
+
+// load a book folder's OCR files as documents (replacing its previous docs)
+async function selectOcrBook(bid) {
+  // double-clicks / rapid re-clicks must not run two loads of the same book
+  if (ocrState.bookLoading === bid) return;
+  ocrSyncEditor();
+  ocrState.book = bid;
+  const folder = (ocrState.books || {})[bid];
+  if (!folder) { renderOcrTab(); return; }
+  ocrState.bookLoading = bid;
+  try {
+    // fetch everything first, then commit atomically — an interleaved load
+    // of another book can't leave duplicates behind
+    const loaded = [];
+    for (const f of folder.ocr) {
+      try {
+        const data = await (await fetch(
+          `/api/builds/${encodeURIComponent(bid)}/ocr/` +
+          encodeURIComponent(f.name))).json();
+        if (data.ok) loaded.push({ name: f.name, text: String(data.text || "") });
+      } catch (e) { /* skip unreadable files */ }
+      if (ocrState.book !== bid) return;   // switched away mid-load
+    }
+    ocrState.docs = ocrState.docs.filter((d) => d.buildId !== bid);
+    let firstId = null;
+    for (const l of loaded) {
+      const id = "d" + (++ocrState.seq);
+      ocrState.docs.push({ id, name: l.name, text: l.text,
+                           buildId: bid, fileName: l.name });
+      if (!firstId) firstId = id;
+    }
+    if (firstId) ocrState.sel = firstId;
+    renderOcrTab();
+    status(folder.ocr.length
+      ? `Loaded ${folder.ocr.length} OCR file(s)`
+      : "No OCR files in this folder (build it from the Editor tab)");
+  } finally {
+    if (ocrState.bookLoading === bid) ocrState.bookLoading = null;
+  }
 }
 
 function renderOcrDocs() {
@@ -4462,7 +4934,7 @@ function renderOcrDiff() {
   const b = ocrState.docs.find((d) => d.id === bid);
   const box = el("ocr-diff");
   if (!a || !b || a.id === b.id) {
-    box.innerHTML = `<p class="empty">PICK TWO DIFFERENT DOCUMENTS</p>`;
+    box.innerHTML = `<p class="empty">Pick two different documents</p>`;
     return;
   }
   const ops = diffLines(a.text, b.text);
@@ -4495,7 +4967,7 @@ function renderOcrDiff() {
   }
   if (same > 3)
     parts.push(`<div class="d-skip">&middot; &middot; &middot; ${same - 3} more unchanged lines</div>`);
-  box.innerHTML = parts.join("") || `<p class="empty">NO DIFFERENCES</p>`;
+  box.innerHTML = parts.join("") || `<p class="empty">No differences</p>`;
 }
 
 function setOcrView(v) {
@@ -4503,29 +4975,156 @@ function setOcrView(v) {
   ocrState.view = v;
   el("ocr-view-edit").classList.toggle("active", v === "edit");
   el("ocr-view-diff").classList.toggle("active", v === "diff");
+  el("ocr-view-pdf").classList.toggle("active", v === "pdf");
   el("ocr-editor").hidden = v !== "edit";
   el("ocr-diff").hidden = v !== "diff";
+  el("ocr-pages").hidden = v !== "pdf";
   if (v === "diff") renderOcrDiff();
+  else if (v === "pdf") renderOcrPages();
   else {
     const d = ocrSelDoc();
     el("ocr-editor").value = d ? d.text : "";
   }
 }
 
+// --- side-by-side page view: PDF page images next to that page's OCR text --
+// One scroll container holds a row per page (image | text), so the PDF and
+// the OCR text scroll together and each page's text box is stretched to the
+// height of its page image.
+
+const PAGE_MARK_RE = /^--- page (\d+) ---$/gm;
+
+// Split OCR text into per-page sections by the "--- page N ---" markers
+// that live extraction writes; null when the text has no markers. The
+// structure is LOSSLESS: any preamble before the first marker and the
+// original page numbers are preserved, so reassembly never drops pages
+// beyond what the view shows, never renumbers, and never loses the head.
+function ocrPageSections(text) {
+  PAGE_MARK_RE.lastIndex = 0;
+  text = String(text || "");
+  const marks = [...text.matchAll(PAGE_MARK_RE)];
+  if (!marks.length) return null;
+  const map = new Map();
+  for (let i = 0; i < marks.length; i++) {
+    const m = marks[i];
+    const from = m.index + m[0].length;
+    const to = i + 1 < marks.length ? marks[i + 1].index : text.length;
+    map.set(parseInt(m[1], 10), text.slice(from, to).replace(/^\n/, "").replace(/\n+$/, ""));
+  }
+  return { pre: text.slice(0, marks[0].index).replace(/\n+$/, ""), map };
+}
+
+function ocrPagesToText(sec) {
+  const parts = [];
+  if (sec.pre) parts.push(sec.pre);
+  for (const n of [...sec.map.keys()].sort((a, b) => a - b)) {
+    parts.push(`--- page ${n} ---\n${sec.map.get(n)}`);
+  }
+  return parts.join("\n\n");
+}
+
+// pending debounced page-view sync — bound to ITS doc and section
+// structure, flushable before any doc/view switch or save
+let ocrPageSync = null;
+
+function flushOcrPageSync() {
+  if (!ocrPageSync) return;
+  clearTimeout(ocrPageSync.t);
+  const run = ocrPageSync.run;
+  ocrPageSync = null;
+  run();
+}
+
+async function renderOcrPages() {
+  const box = el("ocr-pages");
+  const d = ocrSelDoc();
+  if (!d) { box.innerHTML = `<p class="empty">No document selected</p>`; return; }
+  const pdf = d.buildId ? ocrBookPdf(d.buildId) : "";
+  if (!pdf) {
+    box.innerHTML = `<p class="empty">No PDF for this document — attach one in the Editor tab</p>`;
+    return;
+  }
+  box.innerHTML = `<p class="empty">Loading pages &hellip;</p>`;
+  let count = 0;
+  try {
+    const info = await (await fetch("/api/pdf/info?path=" + encodeURIComponent(pdf))).json();
+    if (info.ok) count = info.pages;
+  } catch (e) { /* handled below */ }
+  if (ocrSelDoc() !== d || ocrState.view !== "pdf") return;   // switched away
+  if (!count) {
+    box.innerHTML = `<p class="empty">Could not read the PDF (${esc(pdf)})</p>`;
+    return;
+  }
+  const sections = ocrPageSections(d.text);
+  const cap = 400;   // matches the extraction cap
+  const shown = Math.min(count, cap);
+  ocrState.pages = null;
+  const img = (n) => `<img loading="lazy" alt="page ${n}"
+      src="/api/pdf/pageimg?path=${encodeURIComponent(pdf)}&page=${n}&w=700" />`;
+  if (!sections) {
+    // no page markers: the whole text sits beside the first page
+    box.innerHTML = `
+      <div class="ocr-pgnote empty">This OCR file has no page markers — showing the full text beside page 1</div>
+      <div class="ocr-pgrow" data-page="1">
+        <div class="ocr-pgimg">${img(1)}</div>
+        <textarea class="ocr-pgtext cad-input" data-whole="1" spellcheck="false"></textarea>
+      </div>` +
+      Array.from({ length: Math.min(shown, 30) - 1 }, (_, i) => `
+      <div class="ocr-pgrow" data-page="${i + 2}">
+        <div class="ocr-pgimg">${img(i + 2)}</div>
+        <textarea class="ocr-pgtext cad-input" spellcheck="false" disabled></textarea>
+      </div>`).join("");
+    box.querySelector("[data-whole]").value = d.text;
+    return;
+  }
+  ocrState.pages = sections;
+  const beyond = [...sections.map.keys()].filter((n) => n > shown).length;
+  box.innerHTML =
+    (count > shown
+      ? `<div class="ocr-pgnote empty">Showing the first ${shown} of ${count} pages` +
+        (beyond ? ` — the ${beyond} section(s) beyond stay untouched` : "") + `</div>` : "") +
+    Array.from({ length: shown }, (_, i) => `
+      <div class="ocr-pgrow" data-page="${i + 1}">
+        <div class="ocr-pgimg">${img(i + 1)}</div>
+        <textarea class="ocr-pgtext cad-input" data-pn="${i + 1}" spellcheck="false"></textarea>
+      </div>`).join("");
+  box.querySelectorAll("textarea[data-pn]").forEach((ta) => {
+    ta.value = sections.map.get(+ta.dataset.pn) || "";
+  });
+}
+
+// edits in the page view flow back into the document text (debounced; the
+// pending write is bound to this doc + section structure, so a late fire
+// after switching documents can never touch the wrong one)
+function onOcrPageInput(ev) {
+  const ta = ev.target.closest("textarea.ocr-pgtext");
+  if (!ta) return;
+  const d = ocrSelDoc();
+  if (!d) return;
+  if (ta.dataset.whole) { d.text = ta.value; return; }
+  const sec = ocrState.pages;
+  if (!sec) return;
+  sec.map.set(+ta.dataset.pn, ta.value);
+  if (ocrPageSync) clearTimeout(ocrPageSync.t);
+  const run = () => { d.text = ocrPagesToText(sec); };
+  ocrPageSync = { t: setTimeout(() => { ocrPageSync = null; run(); }, 250), run };
+}
+
 function renderOcrQueue() {
   const tbody = el("ocr-queue-rows");
   tbody.innerHTML = "";
   el("ocr-queue-empty").hidden = ocrState.jobs.length !== 0;
-  el("ocr-queue-count").textContent = `${ocrState.jobs.length} JOBS`;
+  el("ocr-queue-count").textContent = `${ocrState.jobs.length} jobs`;
   for (const j of ocrState.jobs) {
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td>${esc(j.doc)}</td><td>${esc(j.service)}</td>
-      <td>${esc(j.status)}</td><td>${esc(j.at)}</td>`;
+    tr.innerHTML = `<td>${esc(j.book)}</td><td data-tip="${esc(j.pdf)}">${esc(j.pdf)}</td>
+      <td>${esc(j.service)}</td><td>${esc(j.status)}</td><td>${esc(j.at)}</td>`;
     tbody.appendChild(tr);
   }
 }
 
 function renderOcrTab() {
+  renderOcrBooks();
   renderOcrDocs();
   const sel = el("ocr-diff-with");
   const prevWith = sel.value;   // keep the chosen compare target
@@ -4542,7 +5141,8 @@ function renderOcrTab() {
   }
   const d = ocrSelDoc();
   if (ocrState.view === "edit") el("ocr-editor").value = d ? d.text : "";
-  else renderOcrDiff();
+  else if (ocrState.view === "diff") renderOcrDiff();
+  else renderOcrPages();
   // quality reflects the doc's book (when folder-sourced)
   const build = d && d.buildId ? state.builds[d.buildId] : null;
   el("ocr-quality").value = (build && build.ocr_quality) || "";
@@ -4558,7 +5158,7 @@ function ocrFindNext() {
   const from = ta.selectionEnd || 0;
   let i = ta.value.indexOf(needle, from);
   if (i < 0) i = ta.value.indexOf(needle);   // wrap around
-  if (i < 0) { el("ocr-msg").textContent = "NOT FOUND"; return; }
+  if (i < 0) { el("ocr-msg").textContent = "Not found"; return; }
   ta.focus();
   ta.setSelectionRange(i, i + needle.length);
   el("ocr-msg").textContent = "";
@@ -4571,11 +5171,12 @@ function ocrReplaceAll() {
   ocrSyncEditor();
   const repl = el("ocr-replace").value;
   const count = d.text.split(needle).length - 1;
-  if (!count) { el("ocr-msg").textContent = "NOT FOUND"; return; }
+  if (!count) { el("ocr-msg").textContent = "Not found"; return; }
   d.text = d.text.split(needle).join(repl);
   el("ocr-editor").value = d.text;
-  if (ocrState.view === "diff") renderOcrDiff();  // keep the diff current
-  el("ocr-msg").textContent = `${count} REPLACED (UNSAVED)`;
+  if (ocrState.view === "diff") renderOcrDiff();       // keep the view current
+  else if (ocrState.view === "pdf") renderOcrPages();
+  el("ocr-msg").textContent = `${count} replaced (unsaved)`;
 }
 
 async function ocrSaveDoc() {
@@ -4589,7 +5190,7 @@ async function ocrSaveDoc() {
       body: JSON.stringify({ name: d.fileName || d.name, text: d.text }),
     });
     const data = await res.json().catch(() => ({}));
-    el("ocr-msg").textContent = data.ok ? "SAVED" : "SAVE FAILED";
+    el("ocr-msg").textContent = data.ok ? "Saved" : "Save failed";
     if (data.ok) status(`OCR SAVED :: ${data.name}`);
   } else {
     // local documents save back to disk as a download
@@ -4599,7 +5200,7 @@ async function ocrSaveDoc() {
     a.download = d.name.endsWith(".txt") ? d.name : d.name + ".txt";
     a.click();
     URL.revokeObjectURL(a.href);
-    el("ocr-msg").textContent = "DOWNLOADED";
+    el("ocr-msg").textContent = "Downloaded";
   }
 }
 
@@ -4607,58 +5208,50 @@ async function ocrSetActive() {
   const d = ocrSelDoc();
   if (!d || !d.buildId) return;
   if (await patchBuildRaw(d.buildId, { ocr_active: d.fileName || d.name }, true)) {
-    el("ocr-msg").textContent = `ACTIVE :: ${d.fileName || d.name}`;
+    el("ocr-msg").textContent = `Active :: ${d.fileName || d.name}`;
     status(`ACTIVE OCR :: ${d.fileName || d.name}`);
   }
 }
 
 async function ocrSetQuality(v) {
   const d = ocrSelDoc();
-  if (!d || !d.buildId) { el("ocr-msg").textContent = "NO BOOK FOLDER"; return; }
+  if (!d || !d.buildId) { el("ocr-msg").textContent = "No book folder"; return; }
   if (await patchBuildRaw(d.buildId, { ocr_quality: v }, true)) {
-    el("ocr-msg").textContent = v ? `QUALITY :: ${v.toUpperCase()}` : "QUALITY CLEARED";
+    el("ocr-msg").textContent = v ? `Quality :: ${v}` : "Quality cleared";
   }
 }
 
-// pick a pending entry with a folder and load its OCR files as documents
-function ocrLoadFolderMenu(anchor) {
-  const builds = buildsSorted();
-  if (!builds.length) { status("NO PENDING ENTRIES"); return; }
-  const html = `<div class="pm-head">Book folders</div>` +
-    builds.map((b) => `
-      <div class="pm-item" data-bid="${esc(b.id)}">${esc(b.title || b.id)}</div>`).join("");
-  openPopup(anchor, html, (pop) => {
-    pop.querySelectorAll("[data-bid]").forEach((item) => {
-      item.addEventListener("click", async () => {
-        closePopup();
-        const bid = item.dataset.bid;
-        const info = await (await fetch(
-          `/api/builds/${encodeURIComponent(bid)}/folder`)).json();
-        if (!info.exists || !info.ocr.length) {
-          status("NO OCR FILES IN THIS FOLDER (build it from the Editor tab)");
-          return;
-        }
-        for (const f of info.ocr) {
-          const data = await (await fetch(
-            `/api/builds/${encodeURIComponent(bid)}/ocr/` +
-            encodeURIComponent(f.name))).json();
-          if (data.ok) ocrAddDoc(f.name, data.text, bid, f.name);
-        }
-        status(`LOADED ${info.ocr.length} OCR FILE(S)`);
-      });
-    });
-  });
+// is the chosen OCR service configured? (Settings > OCR)
+function ocrServiceReady(svc) {
+  const s = state.settings;
+  if (svc === "azure") return !!(s.ocrAzureEndpoint && s.ocrAzureKey);
+  if (svc === "openai") return !!s.aiKey;         // reuses the AI credentials
+  if (svc === "tesseract") return !!s.ocrTesseract;
+  return false;
 }
 
+// queue the selected book's PDF for OCR processing.
+// TODO: actual processing needs service credentials (Settings > OCR) — the
+// user has no API key yet, so jobs stay queued; verify against a live
+// service later.
 function ocrQueueJob() {
-  const d = ocrSelDoc();
+  const bid = ocrState.book;
+  const b = bid ? state.builds[bid] : null;
+  if (!b) { el("ocr-msg").textContent = "Pick a book first"; return; }
+  const pdf = ocrBookPdf(bid);
+  if (!pdf) { el("ocr-msg").textContent = "This book has no PDF"; return; }
   const service = el("ocr-service");
+  const svc = service.value;
   ocrState.jobs.push({
-    doc: d ? d.name : "(no document)",
+    book: b.title || bid,
+    pdf,
     service: service.options[service.selectedIndex].textContent,
-    status: "QUEUED — service not configured (Settings > AI)",
+    status: ocrServiceReady(svc)
+      ? "Queued — processing not implemented yet"
+      : "Queued — service not configured (Settings > OCR)",
     at: new Date().toLocaleTimeString(),
   });
+  el("ocr-msg").textContent = "";
   renderOcrQueue();
 }
 
@@ -4672,8 +5265,14 @@ function initOcrTab() {
     }
     el("ocr-file-input").value = "";
   });
-  el("ocr-load-folder").addEventListener("click", () =>
-    ocrLoadFolderMenu(el("ocr-load-folder")));
+  el("ocr-filter-verified").addEventListener("click", () => {
+    ocrState.verifiedOnly = !ocrState.verifiedOnly;
+    renderOcrBooks();
+  });
+  el("ocr-books").addEventListener("click", (ev) => {
+    const li = ev.target.closest("li.ocr-book");
+    if (li) selectOcrBook(li.dataset.bid);
+  });
   el("ocr-docs").addEventListener("click", (ev) => {
     const li = ev.target.closest("li.ocr-doc");
     if (!li) return;
@@ -4683,6 +5282,21 @@ function initOcrTab() {
   });
   el("ocr-view-edit").addEventListener("click", () => setOcrView("edit"));
   el("ocr-view-diff").addEventListener("click", () => setOcrView("diff"));
+  el("ocr-view-pdf").addEventListener("click", () =>
+    setOcrView(ocrState.view === "pdf" ? "edit" : "pdf"));
+  el("ocr-pages").addEventListener("input", onOcrPageInput);
+  // page-image failures (e.g. PyMuPDF not installed — 501) must be visible,
+  // not a wall of broken-image icons; error events don't bubble, so capture
+  el("ocr-pages").addEventListener("error", (ev) => {
+    if (ev.target.tagName !== "IMG") return;
+    const box = el("ocr-pages");
+    if (box.querySelector(".ocr-pgerr")) return;
+    const n = document.createElement("div");
+    n.className = "ocr-pgnote ocr-pgerr empty";
+    n.textContent = "Page images unavailable — check the server log " +
+      "(PyMuPDF must be installed: pip install -r tools/requirements.txt)";
+    box.prepend(n);
+  }, true);
   el("ocr-diff-with").addEventListener("change", () => {
     if (ocrState.view === "diff") renderOcrDiff();
   });
@@ -4695,6 +5309,13 @@ function initOcrTab() {
     ocrSetQuality(el("ocr-quality").value));
   el("ocr-save").addEventListener("click", ocrSaveDoc);
   el("ocr-set-active").addEventListener("click", ocrSetActive);
+  // the queue's service select starts on the configured default and keeps
+  // the setting in sync when changed here
+  el("ocr-service").value = state.settings.ocrService || "azure";
+  el("ocr-service").addEventListener("change", () => {
+    state.settings.ocrService = el("ocr-service").value;
+    saveSettings();
+  });
   el("ocr-queue-add").addEventListener("click", ocrQueueJob);
   el("ocr-editor").addEventListener("input", () => {
     const d = ocrSelDoc();
@@ -5047,7 +5668,7 @@ function init() {
   buildDescMd = createMdEditor(el("b-desc-editor"));
   overlayMd = createMdEditor(el("md-live-overlay"));
   el("w-desc-md").addEventListener("click", () =>
-    openMarkdownEditor("w-description", "MARKDOWN :: WHL DESCRIPTION"));
+    openMarkdownEditor("w-description", "Markdown :: WHL description"));
   el("md-apply").addEventListener("click", () => closeMarkdownEditor(true));
   el("md-cancel").addEventListener("click", () => closeMarkdownEditor(false));
   el("md-close").addEventListener("click", () => closeMarkdownEditor(false));
@@ -5161,7 +5782,7 @@ function init() {
   });
 
   loadDownloads();
-  loadManual();
+  loadManual().then(migrateParsedEntries);
   loadBuilds().then(renderUpload);
   switchTopTable(state.settings.topTable === "whl" ? "whl" : "checked");
   renderBottomPane();

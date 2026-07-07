@@ -403,6 +403,19 @@ def api_build_folder_sync(build_id: str):
     return jsonify(out)
 
 
+@app.route("/api/entries")
+def api_entries():
+    """Folder info for every build that has an entry folder — one pass, so
+    the OCR tab's book list doesn't need a request per build."""
+    builds = lib.load_json(BUILDS_PATH, {})
+    out = {}
+    for bid in builds:
+        info = _entry_folder_info(bid)
+        if info["exists"]:
+            out[bid] = {"ocr": info["ocr"], "preview": info["preview"]}
+    return jsonify({"entries": out})
+
+
 @app.route("/api/builds/<build_id>/ocr/<name>")
 def api_build_ocr_get(build_id: str, name: str):
     # membership check doubles as path validation for the build_id segment
@@ -428,6 +441,67 @@ def api_build_ocr_put(build_id: str):
                           encoding="utf-8", errors="replace")
     return jsonify({"ok": True, "name": name,
                     "folder": _entry_folder_info(build_id)})
+
+
+# --- PDF page rasterization (the OCR tab's side-by-side page view) ---------------
+
+def _pageimg_pdf(raw: str) -> Path:
+    p = _resolve_local(raw or "")
+    if p is None or p.suffix.lower() != ".pdf" or not p.is_file():
+        abort(404)
+    return p
+
+
+@app.route("/api/pdf/info")
+def api_pdf_info():
+    """Page count of a local PDF."""
+    p = _pageimg_pdf(request.args.get("path"))
+    try:
+        from pypdf import PdfReader
+        return jsonify({"ok": True, "pages": len(PdfReader(str(p)).pages)})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+
+@app.route("/api/pdf/pageimg")
+def api_pdf_pageimg():
+    """One page of a local PDF rendered as a PNG (?path=&page=N&w=W).
+    Rendered via PyMuPDF and cached on disk by path+mtime+page+width."""
+    p = _pageimg_pdf(request.args.get("path"))
+    try:
+        page = max(1, int(request.args.get("page") or 1))
+    except ValueError:
+        page = 1
+    try:
+        w = max(200, min(1600, int(request.args.get("w") or 700)))
+    except ValueError:
+        w = 700
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        return jsonify({"ok": False, "error": "PyMuPDF is not installed"}), 501
+    import hashlib
+    cache = lib.ROOT / "downloads" / "cache" / "pages"
+    cache.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha1(
+        f"{p}|{p.stat().st_mtime}|{page}|{w}".encode("utf-8")).hexdigest()[:16]
+    out = cache / f"{key}.png"
+    if not out.is_file():
+        doc = fitz.open(str(p))
+        try:
+            if page > doc.page_count:
+                abort(404)
+            pg = doc[page - 1]
+            zoom = w / max(1.0, pg.rect.width)
+            pix = pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+            # pymupdf infers the format from the extension — the tmp name
+            # must end in .png
+            tmp = out.with_suffix(f".{page}.tmp.png")
+            pix.save(str(tmp))
+            tmp.replace(out)
+        finally:
+            doc.close()
+    return send_file(out, mimetype="image/png", conditional=True)
 
 
 _PDF_TEXT_CACHE: dict = {}
@@ -563,7 +637,11 @@ def api_manual_add():
 @app.route("/api/manual/<entry_id>", methods=["PATCH"])
 def api_manual_update(entry_id: str):
     """Update fields of a manual entry; metadata changed, so re-run the
-    offline checks and drop the stale scan results (the client re-scans)."""
+    offline checks and drop the stale scan results (the client re-scans).
+
+    "_preserve": true keeps checks/scans/verifications — used for changes
+    that don't alter the book's identity (title parsing migration, attaching
+    a local scan PDF)."""
     entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
     if entry_id not in entries:
         abort(404)
@@ -574,11 +652,12 @@ def api_manual_update(entry_id: str):
             e[f] = str(payload[f] or "").strip()
     if not e.get("title"):
         return jsonify({"ok": False, "error": "TITLE IS REQUIRED"}), 400
-    e["checks"] = _entry_checks(e)
-    # Metadata changed: stored matches and their verifications are stale.
-    e.pop("scans", None)
-    e.pop("verify", None)
-    e.pop("manual_urls", None)
+    if not payload.get("_preserve"):
+        e["checks"] = _entry_checks(e)
+        # Metadata changed: stored matches and their verifications are stale.
+        e.pop("scans", None)
+        e.pop("verify", None)
+        e.pop("manual_urls", None)
     lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
     return jsonify({"ok": True, "entry": e})
 
