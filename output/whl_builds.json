@@ -19,5 +19,26 @@
     "created_at": "2026-07-07T02:38:28+00:00",
     "updated_at": "2026-07-07T05:00:25+00:00",
     "pdf_file": "C:\\Users\\amill\\Documents\\world-herb-library\\downloads\\ia\\2544065R.nlm.nih.gov.pdf"
+  },
+  "b73ee4baac9d": {
+    "title": "Libellus de Materia Medica",
+    "subtitle": "",
+    "authors": "Boerhaave, Herman",
+    "year": "1727",
+    "publisher": "Lugduni Batavorum : Apud Isaacum Severinum",
+    "publisher_city": "",
+    "edition": "",
+    "language": "",
+    "pages": "",
+    "categories": "",
+    "description": "",
+    "pdf_source": "https://archive.org/download/bim_eighteenth-century_libellus-de-materie-med_boerhaave-herman_1755/bim_eighteenth-century_libellus-de-materie-med_boerhaave-herman_1755.pdf",
+    "pdf_file": "downloads/ia/bim_eighteenth-century_libellus-de-materie-med_boerhaave-herman_1755.pdf",
+    "source_url": "https://archive.org/details/bim_eighteenth-century_libellus-de-materie-med_boerhaave-herman_1755",
+    "notes": "Source: Internet Archive — [Libellus de materie medica. English]. Boerhaave's Materia medica, or the druggist's guide, and the physician and apothecary's table-book. Being a compleat account of all drugs, ... 1755",
+    "status": "draft",
+    "id": "b73ee4baac9d",
+    "created_at": "2026-07-07T17:39:37+00:00",
+    "updated_at": "2026-07-07T17:39:37+00:00"
   }
 }
