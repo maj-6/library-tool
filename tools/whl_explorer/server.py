@@ -24,6 +24,7 @@ import json
 import re
 import sys
 import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -190,6 +191,53 @@ def api_pdf():
     if p is None or p.suffix.lower() != ".pdf" or not p.is_file():
         abort(404)
     return send_file(p, mimetype="application/pdf", conditional=True)
+
+
+@app.route("/api/ai/summarize", methods=["POST"])
+def api_ai_summarize():
+    """Proxy a summarization request to an OpenAI-compatible chat API.
+    The browser cannot call those APIs directly (no CORS), so the client
+    sends its configured endpoint/model/key here."""
+    p = request.get_json(silent=True) or {}
+    base = (p.get("base_url") or "https://api.openai.com/v1").rstrip("/")
+    key = (p.get("api_key") or "").strip()
+    model = (p.get("model") or "").strip()
+    instructions = (p.get("instructions") or "").strip()
+    text = (p.get("text") or "").strip()
+    if not key or not model:
+        return jsonify({"ok": False,
+                        "error": "AI model / API key not configured (Settings > AI)"})
+    if not text:
+        return jsonify({"ok": False, "error": "no source text"})
+    system = instructions or (
+        "You summarize the OCR text of old books for a library catalog. "
+        "Write a concise, factual catalog description in Markdown.")
+    body = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": "Summarize this book from its OCR text:\n\n"
+                                        + text[:60000]},
+        ],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        base + "/chat/completions", data=body, method="POST",
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer " + key})
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        summary = data["choices"][0]["message"]["content"]
+        return jsonify({"ok": True, "summary": summary})
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            pass
+        return jsonify({"ok": False, "error": f"HTTP {exc.code}: {detail}"})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
 
 _PDF_TEXT_CACHE: dict = {}
@@ -386,9 +434,17 @@ def api_manual_scans(entry_id: str):
     if entry_id not in entries:
         abort(404)
     e = entries[entry_id]
-    e["scans"] = scan_search.search_scans(
+    scans = scan_search.search_scans(
         e.get("title", ""), e.get("author") or None, e.get("year") or None
     )
+    # The scan search is slow (network): the entry may have been edited in
+    # the meantime. Re-read and merge only the scans, so this request can't
+    # resurrect a stale snapshot of the other fields.
+    entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+    if entry_id not in entries:
+        abort(404)
+    e = entries[entry_id]
+    e["scans"] = scans
     lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
     return jsonify({"ok": True, "entry": e})
 

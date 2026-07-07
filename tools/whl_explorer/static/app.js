@@ -64,7 +64,8 @@ const state = {
   checkedFilter: "",
   chBooks: null,              // CH catalogue rows (lazy)
   whlRows: null,              // WHL catalogue + scrape + corrections (lazy)
-  whlSelected: null,          // search-mode repopulation target (row idx)
+  whlSelected: null,          // search-mode repopulation target (WHL row idx)
+  checkedSelected: null,      // search-mode repopulation target (checked row id)
   whlEditIdx: null,           // row loaded in the WHL EDIT tab
   olOverride: null,           // search-mode query override
   olRows: null,               // realtime Open Library results
@@ -83,7 +84,9 @@ const state = {
     checkedCols: {}, showCatalog: false,
     markFilter: "ALL", srcFilter: "ALL", dlFilter: "ALL",
     topTable: "checked", bottomTabs: ["ol", "ch"], bottomActive: 0,
-    whlMode: "edit", paneWidth: null, theme: "", font: "", fontUi: "",
+    whlMode: "edit", checkedMode: "edit",
+    paneWidth: null, theme: "", font: "", fontUi: "",
+    aiBase: "", aiModel: "", aiKey: "", aiInstructions: "",
     uploadSplitH: null, pdfBrowseDir: "",
     maxRows: 400,               // row cap for the big table views
     whlModalOcr: false,         // OCR panel in the WHL publication viewer
@@ -106,6 +109,8 @@ const THEMES = [
   ["modern", "MODERN LIGHT"],
   ["dark", "MODERN DARK"],
   ["stone", "STONE"],
+  ["midnight", "MIDNIGHT"],
+  ["sage", "SAGE"],
 ];
 const LEGACY_THEMES = {
   cde: "ledger", xp2003: "", acad: "dark",
@@ -225,6 +230,8 @@ const ICONS = {
   check: _SVG('<path d="M2.8 8.6 L6.4 12 L13.2 4"/>'),
   target: _SVG('<circle cx="8" cy="8" r="4.4"/><path d="M8 1.5 v3 M8 11.5 v3 M1.5 8 h3 M11.5 8 h3"/>'),
   text: _SVG('<path d="M2.5 3.5 h11 M2.5 6.5 h11 M2.5 9.5 h8 M2.5 12.5 h10"/>'),
+  sparkle: _SVG('<path d="M8 1.8 L9.5 6.5 L14.2 8 L9.5 9.5 L8 14.2 L6.5 9.5 L1.8 8 L6.5 6.5 Z"/><path d="M12.8 2 v2.6 M11.5 3.3 h2.6"/>'),
+  fileup: _SVG('<path d="M3.5 2 h6 l3 3 v9 h-9 Z"/><path d="M9.5 2 v3 h3"/><path d="M8 11.5 V7.5 M6.2 9.2 L8 7.4 L9.8 9.2"/>'),
 };
 
 function injectIcons() {
@@ -353,10 +360,10 @@ function maxRows() { return state.settings.maxRows || 400; }
 
 // --- tabs + header -----------------------------------------------------------
 
-const TAB_TITLES = { checked: "CATALOGS", upload: "EDITOR" };
+const TAB_TITLES = { checked: "Catalogs", upload: "Editor" };
 
 function setHeader(tabId) {
-  const name = `${TAB_TITLES[tabId] || ""} :: CATALOG EXPLORER`;
+  const name = `${TAB_TITLES[tabId] || ""} :: Catalog Explorer`;
   el("tb-name").textContent = name;
   document.title = name;
   // the tab strip shows the active tab's command icons
@@ -444,6 +451,10 @@ function tableDef(key) {
   }
 }
 
+function colKeyAt(def, i) {
+  return def.cols[i] ? def.cols[i][0] : "c" + i;
+}
+
 function applyTableChrome(key) {
   const def = tableDef(key);
   if (!def) return;
@@ -451,12 +462,16 @@ function applyTableChrome(key) {
   if (!table) return;
   const vis = state.settings.colVis[key] || {};
   const widths = state.settings.colWidths[key] || {};
+  const sized = Object.keys(widths).length > 0;
   const ths = [...table.querySelectorAll("thead th")];
   const hide = def.cols.map(([k]) => vis[k] === false);
+  let total = 0;
   ths.forEach((th, i) => {
     th.style.display = hide[i] ? "none" : "";
-    const w = widths[def.cols[i] ? def.cols[i][0] : "c" + i];
-    th.style.width = w ? w + "px" : "";
+    let w = widths[colKeyAt(def, i)];
+    if (sized && !w && !hide[i]) w = 110;  // column re-shown after sizing
+    th.style.width = sized && w ? w + "px" : "";
+    if (!hide[i] && w) total += w;
     if (!th.querySelector(".col-rz")) {
       const rz = document.createElement("span");
       rz.className = "col-rz";
@@ -464,7 +479,13 @@ function applyTableChrome(key) {
       th.appendChild(rz);
     }
   });
-  table.style.tableLayout = Object.keys(widths).length ? "fixed" : "";
+  // Once any column has been resized, EVERY visible column carries an
+  // explicit width and the table is sized to their sum — with fixed layout
+  // and a partial width set, the browser would redistribute the remaining
+  // space and every other column would jump around.
+  table.style.tableLayout = sized ? "fixed" : "";
+  table.style.width = sized ? total + "px" : "";
+  table.style.minWidth = sized ? "" : "";
   table.dataset.ck = key;
   for (const tr of table.querySelectorAll("tbody tr")) {
     [...tr.children].forEach((td, i) => {
@@ -482,31 +503,53 @@ function initColResize() {
     ev.preventDefault();
     const th = rz.parentElement;
     const table = th.closest("table");
-    drag = { th, table, key: table.dataset.ck, ci: +rz.dataset.ci,
-             x: ev.clientX, w: th.offsetWidth, moved: false };
+    const key = table.dataset.ck;
+    const def = tableDef(key);
+    if (!def) return;
+    // first drag on this table: freeze every visible column at its
+    // current width so only the dragged column moves
+    let widths = state.settings.colWidths[key];
+    let captured = false;
+    if (!widths || !Object.keys(widths).length) {
+      widths = {};
+      [...table.querySelectorAll("thead th")].forEach((h, i) => {
+        if (h.style.display === "none") return;
+        widths[colKeyAt(def, i)] = h.offsetWidth;
+      });
+      state.settings.colWidths[key] = widths;
+      applyTableChrome(key);
+      captured = true;
+    }
+    drag = { th, table, key, def, ci: +rz.dataset.ci,
+             x: ev.clientX, w: th.offsetWidth, moved: false, captured };
     document.body.classList.add("resizing");
   });
   document.addEventListener("mousemove", (ev) => {
     if (!drag) return;
     drag.moved = true;
     const w = Math.max(36, drag.w + ev.clientX - drag.x);
+    const colKey = colKeyAt(drag.def, drag.ci);
+    state.settings.colWidths[drag.key][colKey] = w;
     drag.th.style.width = w + "px";
-    drag.table.style.tableLayout = "fixed";
+    // keep the table at the exact sum of its column widths
+    let total = 0;
+    [...drag.table.querySelectorAll("thead th")].forEach((h) => {
+      if (h.style.display !== "none") total += parseInt(h.style.width, 10) || h.offsetWidth;
+    });
+    drag.table.style.width = total + "px";
   });
   document.addEventListener("mouseup", () => {
     if (!drag) return;
-    const def = drag.moved ? tableDef(drag.key) : null;
-    if (def) {
-      const colKey = def.cols[drag.ci] ? def.cols[drag.ci][0] : "c" + drag.ci;
-      const w = parseInt(drag.th.style.width, 10) || drag.w;
-      state.settings.colWidths[drag.key] =
-        state.settings.colWidths[drag.key] || {};
-      state.settings.colWidths[drag.key][colKey] = w;
+    if (drag.moved) {
       saveSettings();
       // the browser will still synthesize a click on the header — don't
       // let a resize end as a sort
       sortSuppress = true;
       setTimeout(() => { sortSuppress = false; }, 0);
+    } else if (drag.captured) {
+      // a click that never dragged: undo the width freeze
+      delete state.settings.colWidths[drag.key];
+      applyTableChrome(drag.key);
     }
     document.body.classList.remove("resizing");
     drag = null;
@@ -615,7 +658,7 @@ function openColumnMenu(anchor, key, rerender) {
   const def = tableDef(key);
   if (!def) return;
   const vis = state.settings.colVis[key] || {};
-  const html = `<div class="pm-head">VISIBLE COLUMNS</div>` +
+  const html = `<div class="pm-head">Visible columns</div>` +
     def.cols.map(([k, label]) => `
       <label class="pm-item"><input type="checkbox" data-k="${esc(k)}"
         ${vis[k] === false ? "" : "checked"} /> ${esc(label)}</label>`).join("");
@@ -633,12 +676,12 @@ function openColumnMenu(anchor, key, rerender) {
 }
 
 const FILTER_GROUPS = [
-  ["markFilter", "MARK", [["ALL", "ALL"], ["SCAN", "SCAN"], ["UPLOAD", "UPLOAD"],
-    ["APPROVED", "APPROVED"], ["NONE", "UNMARKED"]]],
-  ["srcFilter", "SOURCE", [["ALL", "ALL"], ["MANUAL", "MANUAL ENTRIES"],
-    ["CATALOG", "CATALOG BOOKS"]]],
-  ["dlFilter", "DOWNLOAD", [["ALL", "ALL"], ["DONE", "DOWNLOADED"],
-    ["NOT", "NOT DOWNLOADED"], ["FAILED", "DOWNLOAD FAILED"]]],
+  ["markFilter", "Mark", [["ALL", "All"], ["SCAN", "Scan"], ["UPLOAD", "Upload"],
+    ["APPROVED", "Approved"], ["NONE", "Unmarked"]]],
+  ["srcFilter", "Source", [["ALL", "All"], ["MANUAL", "Manual entries"],
+    ["CATALOG", "Catalog books"]]],
+  ["dlFilter", "Download", [["ALL", "All"], ["DONE", "Downloaded"],
+    ["NOT", "Not downloaded"], ["FAILED", "Download failed"]]],
 ];
 
 function filtersActive() {
@@ -725,6 +768,18 @@ function renderSettings() {
   fillFontSelect("font-ui-select", FONT_CHOICES, "fontUi", applyFont);
   fillFontSelect("font-select", FONT_CHOICES, "font", applyFont);
 
+  // AI
+  for (const [id, k] of [["set-ai-base", "aiBase"], ["set-ai-model", "aiModel"],
+                         ["set-ai-key", "aiKey"],
+                         ["set-ai-instructions", "aiInstructions"]]) {
+    const n = el(id);
+    n.value = state.settings[k] || "";
+    n.onchange = () => {
+      state.settings[k] = n.value.trim();
+      saveSettings();
+    };
+  }
+
   // TABLE VIEW
   const mr = el("set-max-rows");
   mr.value = maxRows();
@@ -762,6 +817,7 @@ function renderSettings() {
     for (const id of ["checked-table", "whltop-table", "upload-table", "bottom-table"]) {
       const t = el(id);
       t.style.tableLayout = "";
+      t.style.width = "";
       t.querySelectorAll("thead th").forEach((th) => { th.style.width = ""; });
     }
     status("COLUMN WIDTHS RESET");
@@ -1205,6 +1261,12 @@ function renderChecked() {
   const tbody = el("checked-rows");
   tbody.innerHTML = "";
   state.rowsById = new Map(combinedRows().map((r) => [String(r.id), r]));
+  // a deleted/unchecked row can no longer be the repopulation target
+  if (state.checkedSelected != null &&
+      !state.rowsById.has(String(state.checkedSelected))) {
+    state.checkedSelected = null;
+  }
+  const cmode = checkedMode();
   let rows = filteredCheckedRows();
   const so = state.sort.checked;
   if (so) rows = sortRowsBy(rows, (r) => checkedSortVal(r, so.key), so.dir);
@@ -1216,9 +1278,14 @@ function renderChecked() {
     const tr = document.createElement("tr");
     tr.dataset.rowId = row.id;
     if (row.kind === "manual") tr.classList.add("is-manual");
+    if (cmode === "search" && state.checkedSelected === String(row.id))
+      tr.classList.add("whl-selected");
     const editable = (f) =>
-      row.kind === "manual" && f === "acquired" ? "" : ` class="editable" data-edit="${f}"`;
-    const cell = (f) => `<td${editable(f)}>${esc(b[f])}</td>`;
+      cmode === "search" || (row.kind === "manual" && f === "acquired")
+        ? "" : ` class="editable" data-edit="${f}"`;
+    const cell = (f) => f === "title" && cmode === "search"
+      ? `<td data-csearch="1">${esc(b[f])}</td>`
+      : `<td${editable(f)}>${esc(b[f])}</td>`;
     tr.innerHTML = `
       <td>${row.kind === "manual" ? "MANUAL" : esc(row.source.toUpperCase())}</td>
       ${BOOK_COLS.map(cell).join("\n      ")}
@@ -1275,8 +1342,37 @@ function onCheckedClick(ev) {
     else if (t.dataset.unchk !== undefined) uncheckRow(t.dataset.unchk);
     return;
   }
+  // search mode: clicking a title looks it up on Open Library
+  const cs = ev.target.closest("td[data-csearch]");
+  if (cs) {
+    const tr = cs.closest("tr");
+    if (tr) selectCheckedSearchRow(tr.dataset.rowId);
+    return;
+  }
   const td = ev.target.closest("td[data-edit]");
   if (td) startEdit(td);
+}
+
+function selectCheckedSearchRow(id) {
+  const row = state.rowsById.get(String(id));
+  if (!row) return;
+  state.checkedSelected = String(id);
+  const cons = state.settings.whlCons || {};
+  state.olOverride = {
+    title: row.book.title,
+    verbatim: !!cons.title,
+    author: cons.authors ? row.book.author : "",
+    year: cons.year ? row.book.year : "",
+  };
+  setSearchPane(true);
+  const tabs = bottomTabs();
+  let i = tabs.indexOf("ol");
+  if (i < 0) { tabs.push("ol"); i = tabs.length - 1; }
+  state.settings.bottomActive = i;
+  saveSettings();
+  renderChecked();
+  renderBottomPane().then(olRealtime);
+  status(`OPEN LIBRARY SEARCH :: ${row.book.title}`);
 }
 
 function uncheckRow(key) {
@@ -1421,20 +1517,20 @@ function olToRecord(r) {
 
 const BOTTOM_TABLES = {
   ol: {
-    label: "OPEN LIBRARY",
+    label: "Open Library",
     cols: ["TITLE", "AUTHOR", "YEAR", "PUBLISHER", "CITY", "ED", "VOL", "LANG"],
     cells: (r) => [linkCell(r.title, r.url), esc(r.author), esc(r.year),
                    esc(r.publisher), esc(r.city), esc(r.edition),
                    esc(r.volume), esc(r.language)],
   },
   ch: {
-    label: "CH CATALOG",
+    label: "CH catalog",
     cols: ["TITLE", "AUTHOR", "YEAR", "PUBLISHER", "CITY", "CATEGORIES"],
     cells: (r) => [esc(r.title), esc(r.author), esc(r.year), esc(r.publisher),
                    esc(r.city), esc(r.categories)],
   },
   whl: {
-    label: "WHL CATALOG",
+    label: "WHL catalog",
     cols: ["TITLE", "AUTHORS", "YEAR", "STATUS"],
     cells: (r) => [linkCell(r.title, r.url), esc(r.author), esc(r.year),
                    esc(r.status)],
@@ -1537,7 +1633,7 @@ function renderBottomRows() {
       const m = state.olColMarks[fkey];
       th.classList.toggle("mark-copy", m === "copy");
       th.classList.toggle("mark-exclude", m === "exclude");
-      th.dataset.tip = "Ctrl+click: copy to the selected WHL row\nShift+click: exclude";
+      th.dataset.tip = "Ctrl+click: copy to the selected row\nShift+click: exclude";
     });
   }
   const tbody = el("bottom-rows");
@@ -1649,6 +1745,10 @@ async function addToTop(rec) {
     return;
   }
   // top = checked books
+  if (checkedMode() === "search" && state.checkedSelected != null) {
+    await repopulateCheckedRow(rec);
+    return;
+  }
   if (rec._src === "ch") { addChBook(rec._idx); return; }
   const cased = (t) => rec._src === "ol" ? titleCase(t) : t;
   const body = {
@@ -1704,28 +1804,41 @@ function addChBook(idx) {
 // --- top pane: WHL catalog view (modes, corrections, scrape) ---------------------
 
 function whlMode() { return state.settings.whlMode === "search" ? "search" : "edit"; }
+function checkedMode() { return state.settings.checkedMode === "search" ? "search" : "edit"; }
 
-// the current WHL mode is shown as a tag in the footer
-function updateModeTag() {
-  const tag = el("mode-tag");
-  const isWhl = state.settings.topTable === "whl";
-  tag.hidden = !isWhl;
-  if (isWhl) {
-    const m = whlMode();
-    tag.textContent = `WHL MODE: ${m.toUpperCase()}`;
-    tag.className = "foot-tag " + (m === "edit" ? "tag-edit" : "tag-search");
-  }
+// the active top table's EDIT / SEARCH mode
+function topMode() {
+  return state.settings.topTable === "whl" ? whlMode() : checkedMode();
 }
 
-function setWhlMode(m) {
-  state.settings.whlMode = m;
+// the current mode is shown as a tag in the footer
+function updateModeTag() {
+  const tag = el("mode-tag");
+  tag.hidden = false;
+  const m = topMode();
+  const name = state.settings.topTable === "whl" ? "WHL" : "CHECKED";
+  tag.textContent = `${name} MODE: ${m.toUpperCase()}`;
+  tag.className = "foot-tag " + (m === "edit" ? "tag-edit" : "tag-search");
+}
+
+function setTopMode(m) {
+  if (state.settings.topTable === "whl") state.settings.whlMode = m;
+  else state.settings.checkedMode = m;
   saveSettings();
   if (m !== "search") {
     state.whlSelected = null;
+    state.checkedSelected = null;
     state.olOverride = null;
   }
-  renderWhlTop();
-  status(m === "search" ? "WHL SEARCH MODE" : "WHL EDIT MODE");
+  renderTop();
+  status(m === "search" ? "SEARCH MODE" : "EDIT MODE");
+}
+
+function renderModeBar() {
+  const btn = el("whl-mode");
+  btn.hidden = false;
+  btn.textContent = `MODE: ${topMode().toUpperCase()}`;
+  el("whl-cons").hidden = topMode() !== "search";
 }
 
 function switchTopTable(t) {
@@ -1742,12 +1855,12 @@ function switchTopTable(t) {
 }
 
 async function renderTop() {
+  renderModeBar();
+  updateModeTag();
   if (state.settings.topTable === "whl") {
     await loadWhlRows();
     renderWhlTop();
   } else {
-    el("whl-mode").hidden = true;
-    el("whl-cons").hidden = true;
     renderChecked();
     el("top-count").textContent = "";
   }
@@ -1763,10 +1876,7 @@ function renderWhlTop() {
   const active = document.activeElement;
   if (active && active.classList && active.classList.contains("cell-edit")) return;
   const mode = whlMode();
-  const btn = el("whl-mode");
-  btn.hidden = state.settings.topTable !== "whl";
-  btn.textContent = `MODE: ${mode.toUpperCase()}`;
-  el("whl-cons").hidden = state.settings.topTable !== "whl" || mode !== "search";
+  renderModeBar();
   updateModeTag();
   const q = findQuery();
   let rows = (state.whlRows || [])
@@ -1972,23 +2082,83 @@ function selectWhlSearchRow(idx) {
   status(`OPEN LIBRARY SEARCH :: ${row.title}`);
 }
 
-// Which OL columns copy into the selected WHL row. Title/author/year copy
-// by default; Ctrl+click a column header to force-include it (green),
-// Shift+click to exclude it (red).
+// Which OL columns copy into the selected row. Title/author/year copy by
+// default; Ctrl+click a column header to force-include it (green),
+// Shift+click to exclude it (red). WHL rows only use the fields they have.
 const OL_MARK_FIELDS = { c0: "title", c1: "author", c2: "year",
-                         c3: "publisher", c7: "language" };
+                         c3: "publisher", c4: "city", c5: "edition",
+                         c6: "volume", c7: "language" };
+
+// checked/manual rows can take every Open Library column.
+// titleCase/flipName only normalize Open Library records — CH and WHL
+// records copy verbatim, matching every other copy path.
+function repopBookFields(rec) {
+  const ol = rec._src === "ol";
+  const cased = (t) => ol ? titleCase(t) : t;
+  const marks = state.olColMarks;
+  const on = (k, dflt) =>
+    marks[k] === "exclude" ? false : marks[k] === "copy" ? true : dflt;
+  const f = {};
+  if (on("title", true))
+    f.title = cased(rec.title) +
+      (rec.subtitle ? ": " + cased(rec.subtitle) : "");
+  if (on("author", true)) f.author = ol ? flipName(rec.author) : rec.author;
+  if (on("year", true)) f.year = rec.year;
+  if (on("publisher", false) && rec.publisher) f.publisher = rec.publisher;
+  if (on("city", false) && rec.city) f.city = rec.city;
+  if (on("edition", false) && rec.edition) f.edition = rec.edition;
+  if (on("volume", false) && rec.volume) f.volume = rec.volume;
+  if (on("language", false) && rec.language) f.language = rec.language;
+  return f;
+}
+
+async function repopulateCheckedRow(rec) {
+  const row = state.rowsById.get(String(state.checkedSelected));
+  if (!row) return;
+  const vals = repopBookFields(rec);
+  if (!Object.keys(vals).length) { status("ALL COLUMNS EXCLUDED"); return; }
+  const label = `repopulate ${(vals.title || row.book.title).slice(0, 30)}`;
+  if (row.kind === "manual") {
+    const before = {};
+    for (const k of Object.keys(vals)) before[k] = row.book[k] || "";
+    if (await patchManualFields(row.id, vals)) {
+      pushOp(label,
+        () => patchManualFields(row.id, before),
+        () => patchManualFields(row.id, vals));
+      status(`ROW REPOPULATED :: ${vals.title || row.book.title}`);
+    } else {
+      status("REPOPULATE FAILED");
+    }
+    return;
+  }
+  const entry = state.checked.get(row.id);
+  if (!entry) return;
+  trackChecked(label, row.id, () => {
+    entry.book = Object.assign({}, entry.book, vals);
+    entry.checks = null;
+    entry.scans = null;
+    entry.verify = null;
+    queueScan(row.id);
+  });
+  saveChecked();
+  renderChecked();
+  status(`ROW REPOPULATED :: ${vals.title || row.book.title}`);
+}
 
 function repopFields(rec) {
+  const ol = rec._src === "ol";
+  const cased = (t) => ol ? titleCase(t) : t;
   const marks = state.olColMarks;
   const on = (k, dflt) =>
     marks[k] === "exclude" ? false : marks[k] === "copy" ? true : dflt;
   const fields = {};
   if (on("title", true)) {
     // OL titles are sentence case; catalog entries use conventional caps
-    fields.title = titleCase(rec.title);
-    fields.subtitle = titleCase(rec.subtitle || "");
+    fields.title = cased(rec.title);
+    fields.subtitle = cased(rec.subtitle || "");
   }
-  if (on("author", true)) fields.authors = flipName(rec.author);
+  if (on("author", true))
+    fields.authors = ol ? flipName(rec.author) : rec.author;
   if (on("year", true)) fields.year = rec.year;
   if (on("publisher", false) && rec.publisher) fields.publisher = rec.publisher;
   if (on("language", false) && rec.language) fields.language = rec.language;
@@ -2773,11 +2943,12 @@ function createPdfViewer() {
       <a class="cad-btn tiny pdf-open" target="_blank" rel="noopener" hidden>OPEN IN TAB</a>
     </div>
     <div class="pdf-body">
-      <iframe class="pdf-frame" title="PDF preview" hidden></iframe>
+      <div class="pdf-framewrap" hidden><iframe class="pdf-frame" title="PDF preview"></iframe></div>
       <pre class="pdf-ocrpane" hidden></pre>
       <div class="pdf-note empty">NO PDF</div>
     </div>`;
   const frame = root.querySelector(".pdf-frame");
+  const frameWrap = root.querySelector(".pdf-framewrap");
   const note = root.querySelector(".pdf-note");
   const path = root.querySelector(".pdf-path");
   const size = root.querySelector(".pdf-size");
@@ -2821,10 +2992,12 @@ function createPdfViewer() {
     setOcr,
     show(src, label, opts = {}) {
       // undecorated: suppress the browser PDF viewer's toolbar/side panes
+      // (scrollbar=0 for viewers that honor it; the frame is also
+      // oversized so remaining scrollbars are clipped away)
       const framed = src.startsWith("/api/pdf")
-        ? src + "#toolbar=0&navpanes=0" : src;
+        ? src + "#toolbar=0&navpanes=0&scrollbar=0" : src;
       if (frame.getAttribute("src") !== framed) frame.src = framed;
-      frame.hidden = false;
+      frameWrap.hidden = false;
       note.hidden = true;
       path.textContent = label || src;
       path.dataset.tip = src;
@@ -2847,7 +3020,7 @@ function createPdfViewer() {
     clear(msg) {
       sizeSeq++;
       frame.removeAttribute("src");
-      frame.hidden = true;
+      frameWrap.hidden = true;
       note.textContent = msg || "NO PDF";
       note.hidden = false;
       path.textContent = "";
@@ -3857,6 +4030,76 @@ function switchBuildTab(id) {
   if (id === "btab-source") refreshSourceTab();
 }
 
+// --- AI summary from the OCR text (OpenAI-compatible API via the server) --
+
+async function generateAiSummary() {
+  const b = currentBuild();
+  if (!b) return;
+  const s = state.settings;
+  const msg = el("b-ai-msg");
+  if (!(s.aiKey || "").trim() || !(s.aiModel || "").trim()) {
+    msg.textContent = "CONFIGURE MODEL + API KEY (SETTINGS > AI)";
+    return;
+  }
+  const localPath = (b.pdf_file || "").trim();
+  const url = (b.pdf_source || "").trim();
+  const textSrc = localPath
+    ? "/api/pdf/text?path=" + encodeURIComponent(localPath)
+    : (/^https?:\/\//i.test(url)
+        ? "/api/pdf/text?url=" + encodeURIComponent(url) : null);
+  if (!textSrc) { msg.textContent = "NO PDF SOURCE"; return; }
+  el("b-ai").disabled = true;
+  try {
+    msg.textContent = "EXTRACTING TEXT ...";
+    const ocr = await (await fetch(textSrc)).json();
+    if (!ocr.ok || !(ocr.text || "").trim()) {
+      msg.textContent = (ocr.error || "NO TEXT LAYER").slice(0, 80);
+      return;
+    }
+    msg.textContent = "GENERATING ...";
+    const res = await fetch("/api/ai/summarize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        base_url: s.aiBase || "",
+        api_key: s.aiKey || "",
+        model: s.aiModel || "",
+        instructions: s.aiInstructions || "",
+        text: ocr.text,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (data.ok) {
+      // the request is slow: the user may have switched builds meanwhile
+      if (state.buildSel !== b.id) {
+        status(`AI SUMMARY DISCARDED (BUILD CHANGED) :: ${b.title || b.id}`);
+        return;
+      }
+      buildDescMd.set(data.summary || "");
+      msg.textContent = "GENERATED (UNSAVED)";
+      status(`AI SUMMARY GENERATED :: ${b.title || b.id}`);
+    } else {
+      msg.textContent = (data.error || "FAILED").slice(0, 80);
+    }
+  } catch (e) {
+    msg.textContent = "REQUEST FAILED";
+  } finally {
+    el("b-ai").disabled = false;
+  }
+}
+
+function loadDescriptionFile(file) {
+  if (!file) return;
+  const forBuild = state.buildSel;
+  const reader = new FileReader();
+  reader.onload = () => {
+    if (state.buildSel !== forBuild) return;
+    buildDescMd.set(String(reader.result || ""));
+    el("b-ai-msg").textContent = "LOADED (UNSAVED)";
+  };
+  reader.readAsText(file);
+}
+
 // --- the builder's SOURCE tab: verify the PDF before marking READY --
 
 function iaIdentFromBuild(b) {
@@ -4072,13 +4315,13 @@ function init() {
   // top pane: table selector + WHL interactions
   el("top-table").addEventListener("change", () => switchTopTable(el("top-table").value));
   el("whl-mode").addEventListener("click", () =>
-    setWhlMode(whlMode() === "edit" ? "search" : "edit"));
+    setTopMode(topMode() === "edit" ? "search" : "edit"));
   document.addEventListener("keydown", (ev) => {
-    if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "e" &&
-        state.settings.topTable === "whl") {
-      ev.preventDefault();
-      setWhlMode(whlMode() === "edit" ? "search" : "edit");
-    }
+    if (!(ev.ctrlKey || ev.metaKey) || ev.key.toLowerCase() !== "e") return;
+    const t = ev.target;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+    ev.preventDefault();
+    setTopMode(topMode() === "edit" ? "search" : "edit");
   });
   el("whltop-rows").addEventListener("click", (ev) => {
     const a = ev.target.closest("a");
@@ -4143,8 +4386,12 @@ function init() {
     el(box).addEventListener("change", () => {
       cons[key] = el(box).checked;
       saveSettings();
-      if (whlMode() === "search" && state.whlSelected != null) {
+      if (topMode() !== "search") return;
+      if (state.settings.topTable === "whl" && state.whlSelected != null) {
         selectWhlSearchRow(state.whlSelected);
+      } else if (state.settings.topTable === "checked" &&
+                 state.checkedSelected != null) {
+        selectCheckedSearchRow(state.checkedSelected);
       }
     });
   }
@@ -4160,6 +4407,7 @@ function init() {
   el("bottom-head").addEventListener("click", (ev) => {
     if (activeBottomTable() !== "ol") return;
     if (!ev.ctrlKey && !ev.metaKey && !ev.shiftKey) return;
+    if (sortSuppress || ev.target.closest(".col-rz")) return;
     const th = ev.target.closest("th");
     if (!th) return;
     const i = [...th.parentElement.children].indexOf(th);
@@ -4302,6 +4550,12 @@ function init() {
   for (const t of document.querySelectorAll("#build-tabs .pane-tab")) {
     t.addEventListener("click", () => switchBuildTab(t.dataset.btab));
   }
+  el("b-ai").addEventListener("click", generateAiSummary);
+  el("b-desc-load").addEventListener("click", () => el("b-desc-file").click());
+  el("b-desc-file").addEventListener("change", () => {
+    loadDescriptionFile(el("b-desc-file").files[0]);
+    el("b-desc-file").value = "";
+  });
   el("b-pdf-attach").addEventListener("click", () => attachPdfFile());
   el("b-pdf_file").addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") { ev.preventDefault(); attachPdfFile(); }
