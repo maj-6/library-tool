@@ -297,3 +297,27 @@ is decided by a tolerant composite rather than exact strings:
   collapsed unchanged runs, quality assessment (ocr_quality), save-back /
   set-active, and an OCR queue table (Azure/OpenAI/Tesseract processing
   to be implemented later — queueing records a pending stub).
+- v2.6 title parsing + scan attach + OCR rebuild + regular case: a shared
+  bibliographic parser splits "Title: Subtitle" at the first colon and
+  extracts volume (vol. 1 / v2 / v. iii — roman numerals normalized) and
+  edition (2nd ed. / Third Edition — normalized ordinals) out of titles
+  into their own fields; it applies when books are added, at display time
+  for read-only sources (master list, Open Library), and retroactively to
+  stored entries via a scan-preserving migration (the manual-entry PATCH
+  gained a _preserve flag). The private catalogue is now called "Master
+  list" and shows a Subtitle column (the checked table gained one too, and
+  manual entries a subtitle field). Clicking a SCAN mark attaches a local
+  scan PDF (file browser); the row becomes a verified source ("Local
+  scan") whose build icon seeds an entry with the PDF attached. The Editor
+  sidebar is compact (author · year, status as an inline right-hand icon).
+  The OCR tab targets PDFs: a book-folder sidebar (verified filter)
+  replaces the folder dropdown, and a third view renders PDF pages
+  (server-side PyMuPDF page images, /api/pdf/pageimg + /api/pdf/info +
+  /api/entries) beside per-page OCR text in one scroll container —
+  page-aligned, stretched to the page image, editable. Settings gained an
+  OCR section (Azure Document Intelligence endpoint/key, Tesseract path;
+  OpenAI reuses the AI settings) — processing remains TODO until the user
+  has an API key. Labels dropped to regular case app-wide (status-bar
+  ticker and tag badges deliberately stay caps); labeled buttons became
+  icon buttons with tooltips wherever an icon reads clearly; the Title
+  column is now every table's stretch column, absorbing leftover width.

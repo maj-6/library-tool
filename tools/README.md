@@ -137,9 +137,15 @@ drives the realtime Open Library query — `[title]` words, `@author`
   city / year / edition / volume fields act as live constraints; results
   appear in the bottom pane's OPEN LIBRARY table as you type.
 - `MANUAL ENTRY` — the entry form (title, author, publisher, city, year,
-  edition, volume number, language, pages, condition, price, illustrations,
-  categories, notes; title required). Entries are saved to
-  `output/manual_entries.json` and checked automatically on submit. Typing
+  subtitle, edition, volume number, language, pages, condition, price,
+  illustrations, categories, notes; title required). Entries are saved to
+  `output/manual_entries.json` and checked automatically on submit.
+  **Titles are parsed on submit**: text after a colon becomes the
+  subtitle, and volume/edition indicators (`vol. 1`, `v2`, `v. iii`,
+  `2nd ed.`, `Third Edition`) are removed from the title and land in
+  their own fields — existing entries were migrated the same way (their
+  scans and verifications were preserved), and the same parse applies to
+  master-list and Open Library rows at display time and on add. Typing
   a Roman-numeral date into the year field (common on old title pages)
   shows the Arabic year live in the footer's right corner.
   **Autocomplete:** from 3 characters the title field suggests editions
@@ -154,9 +160,9 @@ drives the realtime Open Library query — `[title]` words, `@author`
   language, subject, categories, description — the description's pencil
   opens the live Markdown editor window; SAVE writes to the corrections
   overlay); a checked/manual row gets the book fields (SAVE patches the
-  manual entry or updates the checked copy and re-queues its checks); a CH
-  catalog row from the bottom pane gets the book fields plus ACQUIRED, and
-  SAVE checks the record into CHECKED BOOKS with the edits applied.
+  manual entry or updates the checked copy and re-queues its checks); a
+  master-list row from the bottom pane gets the book fields plus ACQUIRED,
+  and SAVE checks the record into CHECKED BOOKS with the edits applied.
 
 ### Top pane (dropdown selects the working table)
 
@@ -195,7 +201,9 @@ the `EDIT` tab from either mode.
 ### Bottom pane (`SEARCH PANE` toolbar toggle)
 
 A tabbed general-purpose viewer. `+` adds a tab; the active tab's dropdown
-selects its table (OPEN LIBRARY / CH CATALOG / WHL CATALOG). All tabs
+selects its table (Open Library / **Master list** — the private-library
+catalogue, with Subtitle, Vol, and Ed columns fed by the title parse /
+WHL catalog). All tabs
 filter live from the find box (the Open Library tab queries the
 consolidated index server-side). Hovering a row shows a tooltip with every
 available field; clicking a row adds it to whatever table the top pane
@@ -251,7 +259,13 @@ when the row's metadata is edited.
 The `MARK` column classifies each book from the verified picture:
 
 - `SCAN` — not in WHL, not under copyright, and no (surviving) scan found
-  online: the physical book should be scanned.
+  online: the physical book should be scanned. **Clicking the SCAN tag
+  opens the file browser to attach the scanned PDF** — the tag turns
+  green, the row counts as a **verified source** (a "Local scan" row in
+  the Editor's verified-sources table), and its build icon seeds a new
+  WHL entry with the local PDF attached. Clicking again replaces the
+  file; **Shift+click detaches it**. The attached-scan tag stays visible
+  (and clickable) even when the row's computed mark changes later.
 - `UPLD` — not in WHL but a scan exists in another online archive; amber
   while its sources are unverified, green once at least one is approved.
 - otherwise no mark; the tooltip on the dash explains why.
@@ -275,11 +289,15 @@ FILE menu.
 
 Two parts, separated by a **drag-to-resize splitter**:
 
-- **PENDING** (the book builder) — catalog entries being prepared for WHL
-  submission, persisted in `output/whl_builds.json`. The build icon on a
+- **Pending** (the book builder) — catalog entries being prepared for WHL
+  submission, persisted in `output/whl_builds.json`. The sidebar is
+  compact: each entry shows its title with the **status icon inline on
+  the right** (pencil = draft, green check = verified) over an
+  author · year line. The build icon on a
   verified source starts an entry prefilled from the book's metadata, the
   provenance URL, and the PDF source; when the PDF was already downloaded
-  the local `downloads/ia/<id>.pdf` path is attached automatically.
+  the local `downloads/ia/<id>.pdf` path is attached automatically
+  (locally attached scans arrive with the local path as the PDF).
   The editor puts the save and delete icons side by side at the top with
   the VERIFIED toggle (a check icon; pressing it reveals a VERIFIED tag),
   over two sub-tabs (their content scrolls):
@@ -317,17 +335,37 @@ Two parts, separated by a **drag-to-resize splitter**:
 
 ## OCR tab
 
-The OCR workbench: load OCR text files directly or **load a book
-folder** (a pending entry's `ocr/` files) into the documents list, then
-review and correct them — an EDIT view for manual corrections with
-find/replace-all, a **DIFF view** comparing any two loaded documents
-(line-level, unchanged runs collapsed), and a QUALITY assessment stored
-on the entry (`ocr_quality`). SAVE writes a folder document back (local
-documents download instead); SET ACTIVE marks the document as its
-entry's active OCR. The **OCR queue** table tracks processing jobs;
-cloud services (Azure Document Intelligence, OpenAI vision) and local
-Tesseract runs plug in here later — queueing currently records the
-request as pending.
+The OCR workbench. OCR **targets are the books' PDFs**; the sidebar
+lists every **book folder** (entries with `output/entries/<id>/`,
+author · year · OCR file count, status icon; the check icon in the pane
+bar filters to verified books only — built for working through a large
+queue of entries). Selecting a book loads its `ocr/*.txt` files into
+the **documents** list below; loose text files can still be loaded with
+the file icon.
+
+Three views, toggled by the icon buttons (all controls are icons with
+tooltips):
+
+- **Edit** (pencil) — plain-text corrections with find / replace-all.
+- **Diff** (columns) — line-level comparison against any other loaded
+  document, unchanged runs collapsed.
+- **PDF pages** (page icon) — the PDF displayed **in parallel with the
+  OCR text**: one row per page, the page image (rendered server-side via
+  PyMuPDF, cached) beside that page's OCR text, the text box stretched
+  to the page's height. Both live in one scroll container, so they
+  scroll together. Page texts are editable; edits flow back into the
+  document. Files without `--- page N ---` markers show their full text
+  beside page 1.
+
+Quality assessment persists on the entry (`ocr_quality`); the star icon
+sets the document as its entry's **active OCR**; save writes folder
+documents back (local documents download). The **OCR queue** targets
+the selected book's PDF with the chosen service (Azure Document
+Intelligence / OpenAI vision / Tesseract). Service credentials live in
+**Settings > OCR** (Azure endpoint + key, Tesseract path; OpenAI reuses
+the AI settings) — **no API key is configured yet, so processing is
+still to be verified against a live service**; queued jobs record the
+request and wait.
 
 # Standalone CLIs
 
