@@ -157,8 +157,10 @@ is decided by a tolerant composite rather than exact strings:
   CONSTRAIN checkboxes (TITLE= verbatim phrase match via FTS,
   AUTHOR, YEAR) applied to the row-click Open Library lookup. COPYRIGHT tag semantics: NO = public domain,
   YES = under copyright. All tags are one uniform width with verification
-  markers fused inside the tag. Themes (Classic 95/CAD, CDE/Solaris,
-  AutoCAD dark, XP/Office 2003) restyle colors only.
+  markers fused inside the tag. Themes are full chrome redesigns with
+  preserved geometry: CLASSIC CAD, ARCHIVE LEDGER (card-catalog paper),
+  WORKSTATION 2000 (thin-bevel listview era), SLATE STUDIO (mid-2000s
+  steel/pill styling); legacy theme ids migrate.
 - The project is a git repository; dumps, built indexes, API caches and
   downloaded PDFs are gitignored. MARK column: `SCAN` = not in
   WHL + public domain + no surviving scan online; `UPLD` = not in WHL + scan
