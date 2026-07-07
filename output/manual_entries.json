@@ -1856,7 +1856,7 @@
     }
   },
   "e36a88930020": {
-    "title": "A Treatise of the Fossil, Vegetable and Animal Substances That Are Made Use of in Physick: Containing the History and Description of Them, with an Account of Their Several Virtues and Preparations. to Which Is Prefixed, an Enquiry into the Constituent Principles of Mixed Bodies and the Proper Methods of Discovering the Nature of Medicines.",
+    "title": "A Treatise of the Fossil, Vegetable and Animal Substances That Are Made Use of in Physick",
     "author": "Étienne François Geoffroy",
     "publisher": "W. Innys and R. Manby [etc.]",
     "city": "London",
@@ -1874,12 +1874,13 @@
     "created_at": "2026-07-07T19:43:03+00:00",
     "checks": {
       "copyright_status": "Public domain (published 1736)",
-      "checked_at": "2026-07-07T19:45:48+00:00",
+      "checked_at": "2026-07-07T20:59:25+00:00",
       "in_whl": "no",
       "whl_match": null
     },
+    "subtitle": "Containing the History and Description of Them, with an Account of Their Several Virtues and Preparations. to Which Is Prefixed, an Enquiry into the Constituent Principles of Mixed Bodies and the Proper Methods of Discovering the Nature of Medicines.",
     "scans": {
-      "query_title": "A Treatise of the Fossil, Vegetable and Animal Substances That Are Made Use of in Physick: Containing the History and Description of Them, with an Account of Their Several Virtues and Preparations. to Which Is Prefixed, an Enquiry into the Constituent Principles of Mixed Bodies and the Proper Methods of Discovering the Nature of Medicines.",
+      "query_title": "A Treatise of the Fossil, Vegetable and Animal Substances That Are Made Use of in Physick",
       "query_author": "Étienne François Geoffroy",
       "query_year": "1736",
       "internet_archive": {
@@ -1926,17 +1927,372 @@
             "accuracy": 1.0
           }
         ],
-        "search_url": "https://archive.org/search?query=A+Treatise+of+the+Fossil%2C+Vegetable+and+Animal+Substances+That+Are+Made+Use+of+in+Physick%3A+Containing+the+History+and+Description+of+Them%2C+with+an+Account+of+Their+Several+Virtues+and+Preparations.+to+Which+Is+Prefixed%2C+an+Enquiry+into+the+Constituent+Principles+of+Mixed+Bodies+and+the+Proper+Methods+of+Discovering+the+Nature+of+Medicines.+%C3%89tienne+Fran%C3%A7ois+Geoffroy"
+        "search_url": "https://archive.org/search?query=A+Treatise+of+the+Fossil%2C+Vegetable+and+Animal+Substances+That+Are+Made+Use+of+in+Physick+%C3%89tienne+Fran%C3%A7ois+Geoffroy"
+      },
+      "hathitrust": {
+        "available": true,
+        "full_view": true,
+        "best_match": {
+          "title": "A treatise of the fossil, vegetable, and animal substances, that are made use of in physick. Containing the history and description of them; with an account of their several virtues and preparations. To which is prefixed, an enquiry into the constituent principles of mixed bodies, and the proper methods of discovering the nature of medicines",
+          "year": "1736",
+          "record_url": "https://catalog.hathitrust.org/Record/103248684",
+          "items": [
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=mcg.ark:/13960/s2zmv4f4xms",
+              "rights": "Full view",
+              "volume": ""
+            }
+          ],
+          "full_view": true,
+          "accuracy": 1.0
+        },
+        "matches": [
+          {
+            "title": "A treatise of the fossil, vegetable, and animal substances, that are made use of in physick. Containing the history and description of them; with an account of their several virtues and preparations. To which is prefixed, an enquiry into the constituent principles of mixed bodies, and the proper methods of discovering the nature of medicines",
+            "year": "1736",
+            "record_url": "https://catalog.hathitrust.org/Record/103248684",
+            "items": [
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=mcg.ark:/13960/s2zmv4f4xms",
+                "rights": "Full view",
+                "volume": ""
+              }
+            ],
+            "full_view": true,
+            "accuracy": 1.0
+          }
+        ],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=A+Treatise+of+the+Fossil%2C+Vegetable+and+Animal+Substances+That+Are+Made+Use+of+in+Physick&type=title",
+        "oclcs_tried": [
+          "7827609"
+        ]
+      },
+      "checked_at": "2026-07-07T21:56:26+00:00"
+    }
+  },
+  "fed00fb44251": {
+    "title": "The Universal Herbal",
+    "subtitle": "Or, Botanical, Medical, and Agricultural Dictionary",
+    "author": "T. Green",
+    "publisher": "Printed at the Caxton Press by Henry Fisher",
+    "city": "London",
+    "year": "1820",
+    "edition": "2nd ed. rev. and improved.",
+    "volume": "1",
+    "language": "eng",
+    "pages": "795",
+    "condition": "fair - cover detached",
+    "price": "",
+    "illustrations": "Hand-colored plates",
+    "categories": "",
+    "notes": "",
+    "local_pdf": "",
+    "id": "fed00fb44251",
+    "created_at": "2026-07-07T21:26:17+00:00",
+    "checks": {
+      "copyright_status": "Public domain (published 1820)",
+      "checked_at": "2026-07-07T21:44:00+00:00",
+      "in_whl": "no",
+      "whl_match": null
+    },
+    "scans": {
+      "query_title": "The Universal Herbal",
+      "query_author": "T. Green",
+      "query_year": "1820",
+      "internet_archive": {
+        "available": true,
+        "best_match": {
+          "identifier": "theuniversalherbalorbotanicalmedicalandagriculturaldictionarythomasgreen1820",
+          "title": "The Universal Herbal; Or, Botanical, Medical, and Agricultural Dictionary, 1820",
+          "author": "Green, Thomas",
+          "year": "1820",
+          "url": "https://archive.org/details/theuniversalherbalorbotanicalmedicalandagriculturaldictionarythomasgreen1820",
+          "accuracy": 1.0
+        },
+        "matches": [
+          {
+            "identifier": "theuniversalherbalorbotanicalmedicalandagriculturaldictionarythomasgreen1820",
+            "title": "The Universal Herbal; Or, Botanical, Medical, and Agricultural Dictionary, 1820",
+            "author": "Green, Thomas",
+            "year": "1820",
+            "url": "https://archive.org/details/theuniversalherbalorbotanicalmedicalandagriculturaldictionarythomasgreen1820",
+            "accuracy": 1.0
+          },
+          {
+            "identifier": "b22012990_0001",
+            "title": "The universal herbal; or, botanical, medical, and agricultural dictionary",
+            "author": "Green, Thomas",
+            "year": "1820",
+            "url": "https://archive.org/details/b22012990_0001",
+            "accuracy": 1.0
+          },
+          {
+            "identifier": "universalherbalo02greerich",
+            "title": "The Universal herbal; or, Botanical, medical, and agricultural dictionary; containing an account of all the known plants in the world, arranged according to the Linnean system. Specifying the uses to which they are or may be applied, whether as food, as medicine, or in the arts and manufactures, with the best methods of propagation, and the most recent agricultural improvements ..",
+            "author": "Green, Thomas",
+            "year": "1824",
+            "url": "https://archive.org/details/universalherbalo02greerich",
+            "accuracy": 0.8
+          },
+          {
+            "identifier": "b22006783_0003",
+            "title": "The universal herbal; or, botanical, medical, and agricultural dictionary. Containing an account of all the known plants in the world, arranged according to the Linnean system ... With the best methods of propagation, and the most recent agricultural improvements",
+            "author": "Green, Thomas, active 1816-1820",
+            "year": "1824",
+            "url": "https://archive.org/details/b22006783_0003",
+            "accuracy": 0.8
+          },
+          {
+            "identifier": "b22006783_0001",
+            "title": "The universal herbal; or, botanical, medical, and agricultural dictionary. Containing an account of all the known plants in the world, arranged according to the Linnean system ... With the best methods of propagation, and the most recent agricultural improvements",
+            "author": "Green, Thomas, active 1816-1820. no 96033900",
+            "year": "1824",
+            "url": "https://archive.org/details/b22006783_0001",
+            "accuracy": 0.8
+          }
+        ],
+        "search_url": "https://archive.org/search?query=The+Universal+Herbal+T.+Green"
+      },
+      "hathitrust": {
+        "available": true,
+        "full_view": true,
+        "best_match": {
+          "title": "The universal herbal, or, Botanical, medical, and agricultural dictionary : containing an account of all the known plants in the world, arranged according to the Linnean system ... : with the best methods of propogation, and the most recent agricultural improvements ...",
+          "year": "1820",
+          "record_url": "https://catalog.hathitrust.org/Record/100142491",
+          "items": [
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.31175035579054",
+              "rights": "Full view",
+              "volume": "v.1"
+            },
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.31175035579062",
+              "rights": "Full view",
+              "volume": "v.2"
+            }
+          ],
+          "full_view": true,
+          "accuracy": 1.0
+        },
+        "matches": [
+          {
+            "title": "The universal herbal, or, Botanical, medical, and agricultural dictionary : containing an account of all the known plants in the world, arranged according to the Linnean system ... : with the best methods of propogation, and the most recent agricultural improvements ...",
+            "year": "1820",
+            "record_url": "https://catalog.hathitrust.org/Record/100142491",
+            "items": [
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.31175035579054",
+                "rights": "Full view",
+                "volume": "v.1"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.31175035579062",
+                "rights": "Full view",
+                "volume": "v.2"
+              }
+            ],
+            "full_view": true,
+            "accuracy": 1.0
+          }
+        ],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=The+Universal+Herbal&type=title",
+        "oclcs_tried": [
+          "1037525370",
+          "8159040"
+        ]
+      },
+      "checked_at": "2026-07-07T21:44:01+00:00"
+    }
+  },
+  "5db40a804db4": {
+    "title": "The Practice of Curing Diseases",
+    "subtitle": "Being a Medicinal History of Above Three Thousand Famous Observations in the Cure of Diseases, Performed by the Author Hereof : Together with Several of the Choicest Observations of Other Famous Men ... : Wherein for the Most Part You Will Find 1. the Constitution of the Body of the Sick, 2. the Symptoms Predominant, 3. the Cause of the Disease, What? 4. the Exact Method Which Was Taken in the Cure, 5. an Exact Account of the Medicines Exhibited, with the Order of Their Exhibition, Various Doses and Success Thereupon ...",
+    "author": "Salmon, William",
+    "publisher": "Printed for Th. Dawks and Langley Curtiss ...",
+    "city": "London",
+    "year": "1694",
+    "edition": "",
+    "volume": "",
+    "language": "eng",
+    "pages": "762",
+    "condition": "good - rebound",
+    "price": "220 GBP",
+    "illustrations": "",
+    "categories": "",
+    "notes": "Seu Praxis Medendi",
+    "local_pdf": "",
+    "id": "5db40a804db4",
+    "created_at": "2026-07-07T21:30:51+00:00",
+    "checks": {
+      "copyright_status": "Public domain (published 1694)",
+      "checked_at": "2026-07-07T21:34:57+00:00",
+      "in_whl": "no",
+      "whl_match": null
+    },
+    "scans": {
+      "query_title": "The Practice of Curing Diseases",
+      "query_author": "Salmon, William",
+      "query_year": "1694",
+      "internet_archive": {
+        "available": true,
+        "best_match": {
+          "identifier": "b30342028",
+          "title": "Iatrica; seu, Praxis medendi. : The practice of curing diseases. Being a medicinal history of near two hundred famous observations in the cure of diseases ... Whereunto is added ... a compleat theory, or method of precepts, wherein the names, definitions ... and various ways of cure are methodically instituted ... to vulgar practice. To which is newly added, as an appendix, Observations upon the lethargy, carus, frenzy, madness, defects of the internal senses, and hurts of the external senses",
+          "author": "Salmon, William, 1644-1713",
+          "year": "1694",
+          "url": "https://archive.org/details/b30342028",
+          "accuracy": 0.688
+        },
+        "matches": [
+          {
+            "identifier": "b30342028",
+            "title": "Iatrica; seu, Praxis medendi. : The practice of curing diseases. Being a medicinal history of near two hundred famous observations in the cure of diseases ... Whereunto is added ... a compleat theory, or method of precepts, wherein the names, definitions ... and various ways of cure are methodically instituted ... to vulgar practice. To which is newly added, as an appendix, Observations upon the lethargy, carus, frenzy, madness, defects of the internal senses, and hurts of the external senses",
+            "author": "Salmon, William, 1644-1713",
+            "year": "1694",
+            "url": "https://archive.org/details/b30342028",
+            "accuracy": 0.688
+          },
+          {
+            "identifier": "b30342028_0002",
+            "title": "Iatrica; seu, Praxis medendi. : The practice of curing diseases. Being a medicinal history of near two hundred famous observations in the cure of diseases ... Whereunto is added ... a compleat theory, or method of precepts, wherein the names, definitions ... and various ways of cure are methodically instituted ... to vulgar practice. To which is newly added, as an appendix, Observations upon the lethargy, carus, frenzy, madness, defects of the internal senses, and hurts of the external senses",
+            "author": "Salmon, William, 1644-1713",
+            "year": "1694",
+            "url": "https://archive.org/details/b30342028_0002",
+            "accuracy": 0.688
+          },
+          {
+            "identifier": "b30342016",
+            "title": "Iatrica; seu, Praxis medendi. : The practice of curing, being a medicinal history of many famous observations in the cure of diseases ... Whereunto is added ... a complete theory ... wherein the names, definitions ... and various waies of cure are methodically instituted ... to vulgar practice. Together with several of the choisest observations of other famous men; as, Forestus, Horstius, Hildanus, Rulandus, Thonerus, Valeriola, Zacutus, Platerus, Riverius, Willis; and some others, which are fall'n into the author's hand in manuscript",
+            "author": "Salmon, William, 1644-1713",
+            "year": "1684",
+            "url": "https://archive.org/details/b30342016",
+            "accuracy": 0.487
+          },
+          {
+            "identifier": "b30333623",
+            "title": "Markham's master-piece revived. Contayning all knowledge belonging to the smith, farrier, or horse-leech, touching the curing of all diseases in horses. Drawn ... from approved experience, and the publick practice of the best horse-marshals in Christendom. Divided into two books. The I. containing cures physical; the II. all cures chirurgical: together with the nature, use and quality of every simple mentioned through the whole work",
+            "author": "Markham, Gervase, 1568?-1637",
+            "year": "1694",
+            "url": "https://archive.org/details/b30333623",
+            "accuracy": 0.294
+          },
+          {
+            "identifier": "b30329759",
+            "title": "The store-house of physical practice: being a general treatise of the causes and signs of all diseases afflicting human bodies. Together with the shortest, plainest and safest way of curing them ... To which is added ... several choice forms of medicines used by the London physicians ...",
+            "author": "Pechey, John, 1655-1716",
+            "year": "1695",
+            "url": "https://archive.org/details/b30329759",
+            "accuracy": 0.281
+          }
+        ],
+        "search_url": "https://archive.org/search?query=The+Practice+of+Curing+Diseases+Salmon%2C+William"
       },
       "hathitrust": {
         "available": null,
         "full_view": false,
         "best_match": null,
         "matches": [],
-        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=A+Treatise+of+the+Fossil%2C+Vegetable+and+Animal+Substances+That+Are+Made+Use+of+in+Physick%3A+Containing+the+History+and+Description+of+Them%2C+with+an+Account+of+Their+Several+Virtues+and+Preparations.+to+Which+Is+Prefixed%2C+an+Enquiry+into+the+Constituent+Principles+of+Mixed+Bodies+and+the+Proper+Methods+of+Discovering+the+Nature+of+Medicines.&type=title",
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=The+Practice+of+Curing+Diseases&type=title",
         "note": "no OCLC identifier found via Open Library; use the search link to check by hand"
       },
-      "checked_at": "2026-07-07T19:45:55+00:00"
+      "checked_at": "2026-07-07T21:35:00+00:00"
+    }
+  },
+  "48fa8d49c640": {
+    "title": "Merck's 1907 Index.",
+    "subtitle": "An encyclopedia for the chemist, pharmacist and physician.",
+    "author": "Merck & Co",
+    "publisher": "Merck & Co.",
+    "city": "New York; St. Louis, Mo. [etc.]",
+    "year": "1907",
+    "edition": "<3d ed.>",
+    "volume": "",
+    "language": "eng",
+    "pages": "472",
+    "condition": "good",
+    "price": "",
+    "illustrations": "",
+    "categories": "",
+    "notes": "",
+    "local_pdf": "",
+    "id": "48fa8d49c640",
+    "created_at": "2026-07-07T21:37:28+00:00",
+    "checks": {
+      "copyright_status": "Public domain (published 1907)",
+      "checked_at": "2026-07-07T21:38:43+00:00",
+      "in_whl": "no",
+      "whl_match": null
+    },
+    "scans": {
+      "query_title": "Merck's 1907 Index.",
+      "query_author": "Merck & Co",
+      "query_year": "1907",
+      "internet_archive": {
+        "available": false,
+        "best_match": null,
+        "matches": [],
+        "search_url": "https://archive.org/search?query=Merck%27s+1907+Index.+Merck+%26+Co"
+      },
+      "hathitrust": {
+        "available": true,
+        "full_view": true,
+        "best_match": {
+          "title": "Merck's 1907 index",
+          "year": "1907",
+          "record_url": "https://catalog.hathitrust.org/Record/001573941",
+          "items": [
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=mdp.39015024228176",
+              "rights": "Full view",
+              "volume": ""
+            },
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044107264863",
+              "rights": "Full view",
+              "volume": ""
+            },
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=coo1.ark:/13960/t6m04ns4n",
+              "rights": "Full view",
+              "volume": ""
+            }
+          ],
+          "full_view": true,
+          "accuracy": 1.0
+        },
+        "matches": [
+          {
+            "title": "Merck's 1907 index",
+            "year": "1907",
+            "record_url": "https://catalog.hathitrust.org/Record/001573941",
+            "items": [
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=mdp.39015024228176",
+                "rights": "Full view",
+                "volume": ""
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044107264863",
+                "rights": "Full view",
+                "volume": ""
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=coo1.ark:/13960/t6m04ns4n",
+                "rights": "Full view",
+                "volume": ""
+              }
+            ],
+            "full_view": true,
+            "accuracy": 1.0
+          }
+        ],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=Merck%27s+1907+Index.&type=title",
+        "oclcs_tried": [
+          "3570792"
+        ]
+      },
+      "checked_at": "2026-07-07T21:38:45+00:00"
     }
   }
 }
