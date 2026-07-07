@@ -1810,5 +1810,133 @@
       },
       "checked_at": "2026-07-06T22:35:52+00:00"
     }
+  },
+  "71a2e74e00cc": {
+    "title": "A Complete List of Shakespeare's Plants",
+    "author": "G. Johnson",
+    "publisher": "Hudson & Son",
+    "city": "Birmingham",
+    "year": "1915",
+    "edition": "",
+    "volume": "",
+    "language": "eng",
+    "pages": "",
+    "condition": "",
+    "price": "",
+    "illustrations": "",
+    "categories": "",
+    "notes": "for Use in the Shakespeare Garden at Lightwoods Park, Birmingham.",
+    "id": "71a2e74e00cc",
+    "created_at": "2026-07-07T19:39:06+00:00",
+    "checks": {
+      "copyright_status": "Public domain (published 1915)",
+      "checked_at": "2026-07-07T19:40:05+00:00",
+      "in_whl": "no",
+      "whl_match": null
+    },
+    "scans": {
+      "query_title": "A Complete List of Shakespeare's Plants",
+      "query_author": "G. Johnson",
+      "query_year": "1915",
+      "internet_archive": {
+        "available": false,
+        "best_match": null,
+        "matches": [],
+        "search_url": "https://archive.org/search?query=A+Complete+List+of+Shakespeare%27s+Plants+G.+Johnson"
+      },
+      "hathitrust": {
+        "available": null,
+        "full_view": false,
+        "best_match": null,
+        "matches": [],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=A+Complete+List+of+Shakespeare%27s+Plants&type=title",
+        "note": "no OCLC identifier found via Open Library; use the search link to check by hand"
+      },
+      "checked_at": "2026-07-07T19:40:10+00:00"
+    }
+  },
+  "e36a88930020": {
+    "title": "A Treatise of the Fossil, Vegetable and Animal Substances That Are Made Use of in Physick: Containing the History and Description of Them, with an Account of Their Several Virtues and Preparations. to Which Is Prefixed, an Enquiry into the Constituent Principles of Mixed Bodies and the Proper Methods of Discovering the Nature of Medicines.",
+    "author": "Étienne François Geoffroy",
+    "publisher": "W. Innys and R. Manby [etc.]",
+    "city": "London",
+    "year": "1736",
+    "edition": "",
+    "volume": "",
+    "language": "eng",
+    "pages": "387",
+    "condition": "Good - pp. 357/8 torn",
+    "price": "145 EUR",
+    "illustrations": "",
+    "categories": "",
+    "notes": "",
+    "id": "e36a88930020",
+    "created_at": "2026-07-07T19:43:03+00:00",
+    "checks": {
+      "copyright_status": "Public domain (published 1736)",
+      "checked_at": "2026-07-07T19:45:48+00:00",
+      "in_whl": "no",
+      "whl_match": null
+    },
+    "scans": {
+      "query_title": "A Treatise of the Fossil, Vegetable and Animal Substances That Are Made Use of in Physick: Containing the History and Description of Them, with an Account of Their Several Virtues and Preparations. to Which Is Prefixed, an Enquiry into the Constituent Principles of Mixed Bodies and the Proper Methods of Discovering the Nature of Medicines.",
+      "query_author": "Étienne François Geoffroy",
+      "query_year": "1736",
+      "internet_archive": {
+        "available": true,
+        "best_match": {
+          "identifier": "b30501921_0003",
+          "title": "A treatise of the fossil, vegetable, and animal substances, that are made use of in physick ... To which is prefixed an enquiry into the constituent principles of mixed bodies, and the proper methods of discovering the nature of medicines ...",
+          "author": "Geoffroy, Etienne-François, 1672-1731",
+          "year": "1736",
+          "url": "https://archive.org/details/b30501921_0003",
+          "accuracy": 1.0
+        },
+        "matches": [
+          {
+            "identifier": "b30501921_0003",
+            "title": "A treatise of the fossil, vegetable, and animal substances, that are made use of in physick ... To which is prefixed an enquiry into the constituent principles of mixed bodies, and the proper methods of discovering the nature of medicines ...",
+            "author": "Geoffroy, Etienne-François, 1672-1731",
+            "year": "1736",
+            "url": "https://archive.org/details/b30501921_0003",
+            "accuracy": 1.0
+          },
+          {
+            "identifier": "treatiseoffossil00geof",
+            "title": "A treatise of the fossil, vegetable, and animal substances, that are made use of in physick. Containing the history and description of them; with an account of their several virtues and preparations. To which is prefixed, an enquiry into the c|onstituent principles of mixed bodies, and the proper methods of discovering the nature of medicines",
+            "author": "Geoffroy, Etienne-François, 1672-1731",
+            "year": "1736",
+            "url": "https://archive.org/details/treatiseoffossil00geof",
+            "accuracy": 1.0
+          },
+          {
+            "identifier": "b30501921_0004",
+            "title": "A treatise of the fossil, vegetable, and animal substances, that are made use of in physick ... To which is prefixed an enquiry into the constituent principles of mixed bodies, and the proper methods of discovering the nature of medicines ...",
+            "author": "Geoffroy, Etienne-François, 1672-1731",
+            "year": "1736",
+            "url": "https://archive.org/details/b30501921_0004",
+            "accuracy": 1.0
+          },
+          {
+            "identifier": "McGillLibrary-osl_treatise-fossil_G3452tE1736-22193",
+            "title": "A treatise of the fossil, vegetable, and animal substances, that are made use of in physick. Containing the history and description of them; with an account of their several virtues and preparations. To which is prefixed, an enquiry into the constituent principles of mixed bodies, and the proper methods of discovering the nature of medicines",
+            "author": "Geoffroy, Etienne-François, 1672-1731",
+            "year": "",
+            "url": "https://archive.org/details/McGillLibrary-osl_treatise-fossil_G3452tE1736-22193",
+            "accuracy": 1.0
+          }
+        ],
+        "search_url": "https://archive.org/search?query=A+Treatise+of+the+Fossil%2C+Vegetable+and+Animal+Substances+That+Are+Made+Use+of+in+Physick%3A+Containing+the+History+and+Description+of+Them%2C+with+an+Account+of+Their+Several+Virtues+and+Preparations.+to+Which+Is+Prefixed%2C+an+Enquiry+into+the+Constituent+Principles+of+Mixed+Bodies+and+the+Proper+Methods+of+Discovering+the+Nature+of+Medicines.+%C3%89tienne+Fran%C3%A7ois+Geoffroy"
+      },
+      "hathitrust": {
+        "available": null,
+        "full_view": false,
+        "best_match": null,
+        "matches": [],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=A+Treatise+of+the+Fossil%2C+Vegetable+and+Animal+Substances+That+Are+Made+Use+of+in+Physick%3A+Containing+the+History+and+Description+of+Them%2C+with+an+Account+of+Their+Several+Virtues+and+Preparations.+to+Which+Is+Prefixed%2C+an+Enquiry+into+the+Constituent+Principles+of+Mixed+Bodies+and+the+Proper+Methods+of+Discovering+the+Nature+of+Medicines.&type=title",
+        "note": "no OCLC identifier found via Open Library; use the search link to check by hand"
+      },
+      "checked_at": "2026-07-07T19:45:55+00:00"
+    }
   }
 }
