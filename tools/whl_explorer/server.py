@@ -1,18 +1,20 @@
-"""CAD-styled catalog explorer with World Herb Library cross-reference.
+"""World Herb Library cataloging workbench (Flask, localhost, single user).
 
-Loads a local library JSON (the converted Excel catalogue by default, or the
-dictated book metadata), provides live title/author autocomplete, and looks up
-the closest match on worldherblibrary.org to report availability.
+The tool supports one core workflow: reconciling a private herbal library
+against the World Herb Library (WHL), locating existing scans, and preparing
+new catalog entries for submission to WHL.
 
-The MANUAL ENTRY tab adds books by hand (title, author, publisher, year,
-edition, volume, language, notes), stored in output/manual_entries.json.
-Every submitted entry is checked offline against the copyright renewals
-database (copyright_renewals.csv) and the local WHL catalogue copy
-(whl_catalog.csv) — no queries to the WHL website. A scan search
-(Internet Archive + HathiTrust, see scan_search.py) is available for both
-manual entries and catalog rows.
+Data sources (all local):
+  - whl_catalog.csv          WHL catalogue export (+ output/whl_scraped.json
+                             from the website API, + output/whl_corrections.json
+                             overlay for the user's edits)
+  - output/ch_library.json   the CH private-library spreadsheet, converted
+  - output/manual_entries.json  hand-entered books
+  - copyright_renewals.csv   offline copyright-renewal check
+  - output/ol_search.db      consolidated Open Library editions index
+  - output/whl_builds.json   catalog entries being prepared for submission
 
-Run with python3 (separate port from the review app):
+Run with python3:
     python3 tools/whl_explorer/server.py
 then open http://127.0.0.1:5001
 """
@@ -25,12 +27,11 @@ import threading
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from difflib import SequenceMatcher
 from pathlib import Path
 
 from flask import Flask, abort, jsonify, render_template, request
 
-# Make tools/ importable for the shared helpers and the WHL client.
+# Make tools/ importable for the shared helpers.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import catalog_checks as checks  # noqa: E402
 import libcommon as lib  # noqa: E402
@@ -42,18 +43,7 @@ import whl_scrape  # noqa: E402
 app = Flask(__name__)
 
 
-# --- datasets --------------------------------------------------------------
-
-def _dataset_defs() -> dict[str, dict]:
-    """Available datasets: id -> {label, path}. Only existing files are shown."""
-    defs = {
-        "ch_library": {"label": "CH Library (catalogue)", "path": lib.CH_LIBRARY_JSON_PATH},
-        "books_metadata": {"label": "Dictated books", "path": lib.BOOKS_METADATA_PATH},
-        "library_db": {"label": "Reviewed library", "path": lib.LIBRARY_DB_PATH},
-        "manual_entries": {"label": "Manual entries", "path": lib.MANUAL_ENTRIES_PATH},
-    }
-    return {k: v for k, v in defs.items() if Path(v["path"]).exists()}
-
+# --- the CH private-library catalogue -------------------------------------------
 
 def _categories(row: dict) -> str:
     """Combine the CH Library KEY/KEY_2/KEY_3 category fields, de-duplicated."""
@@ -67,102 +57,24 @@ def _categories(row: dict) -> str:
     return ", ".join(cats)
 
 
-# Common book schema surfaced by the UI. CH Library rows populate every field;
-# other datasets only have a subset, so the rest are left blank.
-BOOK_FIELDS = [
-    "idx", "title", "subtitle", "author", "year", "edition", "publisher",
-    "city", "pages", "condition", "illustrations", "price", "acquired",
-    "categories", "notes",
-]
-
-
-def _normalize_row(dataset: str, idx: int, row: dict) -> dict:
-    """Map a dataset row onto the common BOOK_FIELDS schema used by the UI."""
-    if dataset == "ch_library":
-        title = str(row.get("publication", "") or "").replace("_", " ").strip()
-        return {
-            "idx": idx,
-            "title": title,
-            "subtitle": "",
-            "author": str(row.get("authors", "") or "").strip(),
-            "year": str(row.get("year_of_publication", "") or "").strip(),
-            "edition": str(row.get("edition", "") or "").strip(),
-            "publisher": str(row.get("publisher", "") or "").strip(),
-            "city": str(row.get("city_published", "") or "").strip(),
-            "pages": str(row.get("page_reference", "") or "").strip(),
-            "condition": str(row.get("condition", "") or "").strip(),
-            "illustrations": str(row.get("illustrations", "") or "").strip(),
-            "price": str(row.get("price", "") or "").strip(),
-            "acquired": str(row.get("date", "") or "").strip(),
-            "categories": _categories(row),
-            "notes": str(row.get("notes", "") or "").strip(),
-        }
-    if dataset == "manual_entries":
-        # Manual-entry schema; volume and language have no BOOK_FIELDS column,
-        # so they are folded into the notes for the catalog view (the manual
-        # pane of the checked-books tab shows every field natively).
-        notes_parts = []
-        if str(row.get("volume", "") or "").strip():
-            notes_parts.append(f"Vol. {str(row['volume']).strip()}")
-        if str(row.get("language", "") or "").strip():
-            notes_parts.append(str(row["language"]).strip())
-        if str(row.get("notes", "") or "").strip():
-            notes_parts.append(str(row["notes"]).strip())
-        return {
-            "idx": idx,
-            "title": str(row.get("title", "") or "").strip(),
-            "subtitle": "",
-            "author": str(row.get("author", "") or "").strip(),
-            "year": str(row.get("year", "") or "").strip(),
-            "edition": str(row.get("edition", "") or "").strip(),
-            "publisher": str(row.get("publisher", "") or "").strip(),
-            "city": str(row.get("city", "") or "").strip(),
-            "pages": str(row.get("pages", "") or "").strip(),
-            "condition": str(row.get("condition", "") or "").strip(),
-            "illustrations": str(row.get("illustrations", "") or "").strip(),
-            "price": str(row.get("price", "") or "").strip(),
-            "acquired": "",
-            "categories": str(row.get("categories", "") or "").strip(),
-            "notes": "; ".join(notes_parts),
-        }
-    # Dictated-book schema (books_metadata.json / library_db.json): only a
-    # subset of BOOK_FIELDS is available; the rest are left blank.
+def _ch_row(idx: int, row: dict) -> dict:
     return {
         "idx": idx,
-        "title": str(row.get("title", "") or "").strip(),
-        "subtitle": str(row.get("subtitle", "") or "").strip(),
-        "author": str(row.get("author", "") or "").strip(),
-        "year": str(row.get("published_date", "") or "").strip(),
+        "title": str(row.get("publication", "") or "").replace("_", " ").strip(),
+        "subtitle": "",
+        "author": str(row.get("authors", "") or "").strip(),
+        "year": str(row.get("year_of_publication", "") or "").strip(),
         "edition": str(row.get("edition", "") or "").strip(),
         "publisher": str(row.get("publisher", "") or "").strip(),
-        "city": "",
-        "pages": str(row.get("page_count", "") or "").strip(),
-        "condition": "",
-        "illustrations": "",
-        "price": "",
-        "acquired": "",
-        "categories": "",
+        "city": str(row.get("city_published", "") or "").strip(),
+        "pages": str(row.get("page_reference", "") or "").strip(),
+        "condition": str(row.get("condition", "") or "").strip(),
+        "illustrations": str(row.get("illustrations", "") or "").strip(),
+        "price": str(row.get("price", "") or "").strip(),
+        "acquired": str(row.get("date", "") or "").strip(),
+        "categories": _categories(row),
         "notes": str(row.get("notes", "") or "").strip(),
     }
-
-
-def _load_dataset(dataset: str) -> list[dict]:
-    defs = _dataset_defs()
-    if dataset not in defs:
-        abort(404)
-    raw = lib.load_json(defs[dataset]["path"], [])
-    # library_db.json is an object keyed by id; the others are arrays.
-    rows = list(raw.values()) if isinstance(raw, dict) else raw
-    books = [_normalize_row(dataset, i, r) for i, r in enumerate(rows)]
-    return [b for b in books if b["title"] or b["author"]]
-
-
-def _default_dataset() -> str:
-    defs = _dataset_defs()
-    for preferred in ("ch_library", "books_metadata", "library_db"):
-        if preferred in defs:
-            return preferred
-    return next(iter(defs), "")
 
 
 # --- routes ----------------------------------------------------------------
@@ -172,77 +84,85 @@ def home():
     return render_template("index.html")
 
 
-@app.route("/api/datasets")
-def api_datasets():
-    defs = _dataset_defs()
-    return jsonify(
-        {
-            "default": _default_dataset(),
-            "datasets": [{"id": k, "label": v["label"]} for k, v in defs.items()],
-        }
-    )
-
-
 @app.route("/api/books")
 def api_books():
-    dataset = request.args.get("dataset") or _default_dataset()
-    return jsonify({"dataset": dataset, "books": _load_dataset(dataset)})
+    """The CH private-library catalogue (output/ch_library.json)."""
+    raw = lib.load_json(lib.CH_LIBRARY_JSON_PATH, [])
+    books = [_ch_row(i, r) for i, r in enumerate(raw)]
+    return jsonify({"books": [b for b in books if b["title"] or b["author"]]})
 
 
-@app.route("/api/suggest")
-def api_suggest():
-    dataset = request.args.get("dataset") or _default_dataset()
-    q = (request.args.get("q") or "").strip().lower()
-    limit = min(int(request.args.get("limit", 12)), 50)
-    if len(q) < 2:
-        return jsonify([])
+# --- book builder: catalog entries being prepared for WHL submission -------------
 
-    books = _load_dataset(dataset)
-    scored = []
-    for b in books:
-        hay_title = b["title"].lower()
-        hay_author = b["author"].lower()
-        hay_extra = " ".join(
-            b.get(f, "").lower()
-            for f in ("publisher", "city", "categories", "edition", "notes")
-        )
-        if q in hay_title or q in hay_author:
-            # Prefix hits on title/author rank highest; substring hits next;
-            # a hit only in publisher/city/category/notes ranks lowest.
-            rank = 0 if hay_title.startswith(q) or hay_author.startswith(q) else 1
-        elif q in hay_extra:
-            rank = 2
-        else:
-            continue
-        ratio = SequenceMatcher(None, q, hay_title).ratio()
-        scored.append((rank, -ratio, b))
-    scored.sort(key=lambda t: (t[0], t[1]))
-    return jsonify([b for _, _, b in scored[:limit]])
+BUILDS_PATH = lib.OUTPUT_DIR / "whl_builds.json"
+
+# The field set mirrors what a WHL catalog entry needs.
+_BUILD_FIELDS = ("title", "subtitle", "authors", "year", "publisher",
+                 "publisher_city", "edition", "language", "pages",
+                 "categories", "description", "pdf_source", "source_url",
+                 "notes", "status")
 
 
-@app.route("/api/whl")
-def api_whl():
-    title = (request.args.get("title") or "").strip()
-    author = (request.args.get("author") or "").strip()
-    date = (request.args.get("date") or "").strip()
-    if not title and not author:
-        abort(400)
-    return jsonify(whl_client.find_book(title, author or None, date or None))
+@app.route("/api/builds")
+def api_builds():
+    return jsonify({"builds": lib.load_json(BUILDS_PATH, {})})
 
 
-@app.route("/api/whl/batch", methods=["POST"])
-def api_whl_batch():
+@app.route("/api/builds", methods=["POST"])
+def api_builds_create():
     payload = request.get_json(silent=True) or {}
-    items = payload.get("items", [])
-    results = []
-    for item in items:
-        title = (item.get("title") or "").strip()
-        author = (item.get("author") or "").strip()
-        date = (item.get("date") or item.get("year") or "").strip()
-        res = whl_client.find_book(title, author or None, date or None)
-        res["idx"] = item.get("idx")
-        results.append(res)
-    return jsonify({"results": results})
+    seed = payload.get("build") or {}
+    builds = lib.load_json(BUILDS_PATH, {})
+    build = {f: str(seed.get(f, "") or "").strip() for f in _BUILD_FIELDS}
+    if build["status"] not in ("draft", "ready"):
+        build["status"] = "draft"
+    build["id"] = lib.gen_id(set(builds))
+    build["created_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    build["updated_at"] = build["created_at"]
+    builds[build["id"]] = build
+    lib.save_json(BUILDS_PATH, builds)
+    return jsonify({"ok": True, "build": build})
+
+
+@app.route("/api/builds/<build_id>", methods=["PATCH"])
+def api_builds_update(build_id: str):
+    builds = lib.load_json(BUILDS_PATH, {})
+    if build_id not in builds:
+        abort(404)
+    payload = request.get_json(silent=True) or {}
+    b = builds[build_id]
+    for f in _BUILD_FIELDS:
+        if f in payload:
+            b[f] = str(payload[f] or "").strip()
+    if b.get("status") not in ("draft", "ready"):
+        b["status"] = "draft"
+    b["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    lib.save_json(BUILDS_PATH, builds)
+    return jsonify({"ok": True, "build": b})
+
+
+@app.route("/api/builds/<build_id>", methods=["DELETE"])
+def api_builds_delete(build_id: str):
+    builds = lib.load_json(BUILDS_PATH, {})
+    if build_id not in builds:
+        abort(404)
+    del builds[build_id]
+    lib.save_json(BUILDS_PATH, builds)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/builds/restore", methods=["POST"])
+def api_builds_restore():
+    """Reinsert a deleted build verbatim (undo support)."""
+    payload = request.get_json(silent=True) or {}
+    build = payload.get("build") or {}
+    bid = str(build.get("id") or "")
+    if not bid:
+        abort(400)
+    builds = lib.load_json(BUILDS_PATH, {})
+    builds[bid] = build
+    lib.save_json(BUILDS_PATH, builds)
+    return jsonify({"ok": True, "build": build})
 
 
 # --- manual entries (checked offline on submit) ------------------------------
