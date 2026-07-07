@@ -203,7 +203,14 @@ the `EDIT` tab from either mode.
 A tabbed general-purpose viewer. `+` adds a tab; the active tab's dropdown
 selects its table (Open Library / **Master list** — the private-library
 catalogue, with Subtitle, Vol, and Ed columns fed by the title parse /
-WHL catalog). All tabs
+WHL catalog). The Master list doubles as the **Google Sheets publish
+preview**: manual entries appear as **light-yellow** rows (they would be
+appended to the sheet) and already-checked catalogue rows are **light
+blue**. **Tools > Sync master list to Google Sheets** publishes it —
+always a manual action; Settings > Sync holds the spreadsheet ID,
+service-account key file, and sheet name (no credentials yet, so the
+sync is TODO-verify). The search pane has a **clear button** and empties
+itself when you switch to another pane tab. All tabs
 filter live from the find box (the Open Library tab queries the
 consolidated index server-side). Hovering a row shows a tooltip with every
 available field; clicking a row adds it to whatever table the top pane
@@ -260,12 +267,17 @@ The `MARK` column classifies each book from the verified picture:
 
 - `SCAN` — not in WHL, not under copyright, and no (surviving) scan found
   online: the physical book should be scanned. **Clicking the SCAN tag
-  opens the file browser to attach the scanned PDF** — the tag turns
-  green, the row counts as a **verified source** (a "Local scan" row in
-  the Editor's verified-sources table), and its build icon seeds a new
-  WHL entry with the local PDF attached. Clicking again replaces the
-  file; **Shift+click detaches it**. The attached-scan tag stays visible
-  (and clickable) even when the row's computed mark changes later.
+  opens the file picker to attach the scanned PDF** — the tag turns
+  green with a **green dot marking it as an approved source**, the row
+  counts as a **verified source** (a "Local scan" row in the Editor's
+  verified-sources table), and its build icon seeds a new WHL entry with
+  the local PDF attached. Clicking again replaces the file;
+  **Shift+click detaches it**. The attached-scan tag stays visible (and
+  clickable) even when the row's computed mark changes later.
+  Download/approval dots inside tags that carry a verification marker
+  sit on the tag's **left** edge so the two indicators stay distinct.
+  **Shift+click anywhere else on a row marks it purple ("needs
+  attention")**; Shift+click again clears it.
 - `UPLD` — not in WHL but a scan exists in another online archive; amber
   while its sources are unverified, green once at least one is approved.
 - otherwise no mark; the tooltip on the dash explains why.
@@ -289,11 +301,17 @@ FILE menu.
 
 Two parts, separated by a **drag-to-resize splitter**:
 
-- **Pending** (the book builder) — catalog entries being prepared for WHL
-  submission, persisted in `output/whl_builds.json`. The sidebar is
-  compact: each entry shows its title with the **status icon inline on
-  the right** (pencil = draft, green check = verified) over an
-  author · year line. The build icon on a
+- **Pending / Uploaded** (the book builder) — catalog entries being
+  prepared for WHL submission, persisted in `output/whl_builds.json`.
+  **Pending means awaiting upload to WHL**; the upload icon in the entry
+  actions moves a verified entry to the **Uploaded** sidebar tab and out
+  of the queue (the actual WHL upload API call is a later feature — the
+  button currently just performs the queue transition, undoably). The
+  sidebar is compact: each entry shows its title with the **status icon
+  inline on the right** (pencil = draft, green check = verified, export
+  arrow = uploaded) over an author · year line; verified entries are
+  tinted green; **Shift+click marks an entry purple ("needs
+  attention")**. The build icon on a
   verified source starts an entry prefilled from the book's metadata, the
   provenance URL, and the PDF source; when the PDF was already downloaded
   the local `downloads/ia/<id>.pdf` path is attached automatically
@@ -329,9 +347,12 @@ Two parts, separated by a **drag-to-resize splitter**:
     only happens when the sync just produced a fresh preview). **Saving
     the entry marks the active OCR file as verified** (`ocr_verified`).
 - **VERIFIED SOURCES** (bottom table) — every verified source across all
-  rows: title, subtitle, author, publisher, year, the archive, and the
-  matched record (linked, with the URL in the tooltip). Each row's build
-  icon starts a prefilled entry.
+  rows: title, subtitle, author, publisher, year, the archive, the
+  matched record (linked, with the URL in the tooltip), and a **Status**
+  column: a source whose entry is in the editor is **yellow / DRAFT**;
+  once that entry is verified it turns **green / DONE**. The **filter
+  icon** hides statuses (e.g. hide done sources). Each row's build icon
+  starts a prefilled entry.
 
 ## OCR tab
 
@@ -340,8 +361,9 @@ lists every **book folder** (entries with `output/entries/<id>/`,
 author · year · OCR file count, status icon; the check icon in the pane
 bar filters to verified books only — built for working through a large
 queue of entries). Selecting a book loads its `ocr/*.txt` files into
-the **documents** list below; loose text files can still be loaded with
-the file icon.
+the **documents** list below (**a book without OCR files gets its PDF
+text layer extracted and saved automatically** as `ocr/extracted.txt`);
+loose text files can still be loaded with the file icon.
 
 Three views, toggled by the icon buttons (all controls are icons with
 tooltips):
@@ -357,15 +379,33 @@ tooltips):
   document. Files without `--- page N ---` markers show their full text
   beside page 1.
 
+In the page view, **pages are queued for OCR individually**: hover a
+page and press a digit — the digit → service mapping is customizable
+(Settings > OCR, keys 1–5; key 1 defaults to Tesseract). **Ctrl+digit
+arms a service for a range**: Ctrl+click marks the range start (dashed
+outline), Ctrl+click on another page queues everything between them.
+Queued pages carry a cyan outline and a service chip. **Pressing T over
+a page marks it as a title page** (purple T chip; stored on the entry
+as `title_pages` — intelligent metadata extraction will use these
+later). Escape clears the armed service / pending range.
+
+**OCR processing is live**: jobs rasterize each page server-side
+(PyMuPDF, width configurable in Settings > OCR — the knob for
+experimenting with how compression/shrinking affects OCR quality) and
+run it through the chosen service — **Tesseract (local, tested and
+working)**, **Claude**, or **Amazon Textract** (both TODO-verify: no
+API keys yet; Azure/OpenAI remain queue stubs). Every finished page is
+merged into **one compiled OCR document** (`ocr/compiled.txt`) and
+saved immediately — results from different services land in the same
+single file, which appears in the documents list when the job ends.
+The queue table shows live progress (`Running — n/total`).
+
 Quality assessment persists on the entry (`ocr_quality`); the star icon
 sets the document as its entry's **active OCR**; save writes folder
-documents back (local documents download). The **OCR queue** targets
-the selected book's PDF with the chosen service (Azure Document
-Intelligence / OpenAI vision / Tesseract). Service credentials live in
-**Settings > OCR** (Azure endpoint + key, Tesseract path; OpenAI reuses
-the AI settings) — **no API key is configured yet, so processing is
-still to be verified against a live service**; queued jobs record the
-request and wait.
+documents back (local documents download). Service credentials live in
+**Settings > OCR** (Tesseract path override, Anthropic key + model,
+AWS key/secret/region, Azure endpoint + key; OpenAI reuses the AI
+settings).
 
 # Standalone CLIs
 

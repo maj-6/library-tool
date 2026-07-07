@@ -321,3 +321,27 @@ is decided by a tolerant composite rather than exact strings:
   ticker and tag badges deliberately stay caps); labeled buttons became
   icon buttons with tooltips wherever an icon reads clearly; the Title
   column is now every table's stretch column, absorbing leftover width.
+- v2.7 OCR pipeline + upload queue + sheets sync + PDF proxy: OCR
+  processing is live — /api/ocr/run rasterizes pages (PyMuPDF, width
+  configurable for compression-vs-quality experiments) and runs
+  Tesseract (installed and tested), Claude, or Amazon Textract (both
+  pending API keys; Azure/OpenAI stay stubs), merging every finished
+  page into one compiled OCR file saved page-by-page. Page-view
+  interactions: hover+digit queues a page (digit->service mapping
+  customizable in Settings > OCR), Ctrl+digit + Ctrl+click queues a
+  range, T marks title pages (title_pages on the build, for later
+  intelligent metadata extraction); text extraction auto-saves per PDF
+  (save_build). Editor: Pending means awaiting WHL upload — the upload
+  action (the API call itself is a later feature) moves verified
+  entries to an Uploaded tab; verified sources show Draft (yellow) /
+  Done (green) status with a visibility filter; ready entries tinted
+  green in the sidebar (inferred from a truncated request bullet).
+  Catalogs: attached scans carry an approved-source dot; tag-unit dots
+  moved to the left edge (the truncated dot-positioning bullet was read
+  as the dot/marker collision); Shift+click = purple needs-attention
+  marks on rows and builder entries; search pane clear button +
+  auto-clear on tab switch; the master list doubles as the Google
+  Sheets publish preview (manual rows yellow, checked rows blue) with
+  a manual Tools-menu sync (service-account credentials in Settings >
+  Sync, TODO-verify). Remote PDFs (WHL publications, remote sources)
+  are proxied through /api/pdf?url= — fixes "refused to connect".
