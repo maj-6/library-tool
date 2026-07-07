@@ -218,3 +218,23 @@ is decided by a tolerant composite rather than exact strings:
   downloaded IA PDFs (`pdf_file` build field). The approved-sources pane
   is resizable via a splitter. createMdEditor / createPdfViewer /
   openFileBrowser are reusable components for future integration points.
+- v2.2 menu bar + icons + generalized editor: tabs renamed CATALOGS and
+  EDITOR; a FILE/EDIT/VIEW/TOOLS menu bar carries the common functions;
+  undo/redo are toolbar icons; SETTINGS is a gear opening a categorized
+  window (GENERAL / APPEARANCE / TABLE VIEW / FILE PATHS sidebar) with
+  separate interface (--ui, sans by default) and data (--mono) font
+  dropdowns and two modern neutral themes (MODERN LIGHT, GRAPHITE DARK).
+  The find label is a magnifier icon ("[title] @author #year"). EXPORT
+  (filter-aware) and the download-verified icon sit above the top table
+  with a filter icon (MARK / SOURCE / DOWNLOAD-status popup) and per-table
+  column-visibility icons; CLEAR CHECKED is removed; all grid columns are
+  drag-resizable and persisted. IA download state renders as a black `*`
+  (saved; tooltip = path) or red `**` (failed; tooltip = error) beside the
+  still-centered tag. Action buttons are icons. The EDIT tab (renamed from
+  WHL EDIT, save button = SAVE, PRINT LENGTH label) opens via Ctrl+click
+  from every table — WHL rows in both modes, checked/manual rows (book
+  field set; manual entries hide ACQUIRED), and CH-catalog rows (SAVE
+  checks the record with the edits). Builder: save/delete/browse/attach/
+  build are icons, READY FOR SUBMISSION is now VERIFIED, and the PDF
+  viewer is undecorated (#toolbar=0) with the file size displayed.
+  Tooltips abbreviate long notes/description values.

@@ -62,61 +62,72 @@ the app falls back to the works index + live OL API (cached in
 python3 tools/whl_explorer/server.py
 ```
 
-Open http://127.0.0.1:5001. Classic-CAD styled UI; the title bar reads
-`<ACTIVE TAB> :: CATALOG EXPLORER`. Below it sits the **application
-toolbar**: `UNDO` / `REDO`, the active tab's commands, and `SETTINGS`.
-Two tabs: **CHECKED BOOKS** (the working area) and **UPLOAD LIST** (the
-book builder + approved sources).
+Open http://127.0.0.1:5001. The chrome, top to bottom: title bar, **menu
+bar** (FILE / EDIT / VIEW / TOOLS — every common function lives here too),
+**application toolbar** (icon undo/redo, the active tab's commands, the
+settings gear), and two tabs: **CATALOGS** (the working area) and
+**EDITOR** (the book builder + approved sources).
 
 UI conventions used everywhere:
 
+- The interface font (labels, buttons, menus) and the data font (tables,
+  inputs, the Markdown editor) are separate and both selectable in
+  settings; by default chrome is sans-serif and data is monospace.
 - Table cells never wrap: overflowing text is ellipsized and the full text
-  appears in a hover tooltip. Table views hide their scrollbars (scrolling
-  still works). Links show their target URL in the hover tooltip.
+  appears in a hover tooltip (long notes/description values are
+  abbreviated so tooltips stay a manageable size). Links show their target
+  URL in the tooltip. Table views hide their scrollbars.
+- Every table's **columns are resizable** (drag a header's right edge;
+  widths persist) and every table has a **column-visibility icon** in the
+  bar above it that opens a checkbox menu of its columns.
+- **Ctrl+click a row in any table to open it in the EDIT tab** (the left
+  panel's record editor).
 - Status tags are fixed-width and abbreviated; a tag that matched a record
   is itself the link to that record.
-- **Undo/Redo** (toolbar buttons, Ctrl+Z / Ctrl+Y outside text fields)
-  covers checking/unchecking and clearing books, cell edits, verification
-  markers and manual sources, manual-entry creation/deletion/edits, WHL
+- **Undo/Redo** (toolbar icons, EDIT menu, Ctrl+Z / Ctrl+Y outside text
+  fields) covers checking/unchecking, cell and record edits, verification
+  markers and manual sources, manual-entry creation/deletion, WHL
   corrections, and builder create/edit/delete/attach. The last 100 actions
   are kept per session.
-- `SETTINGS` (toolbar): **theme** and **font** dropdowns plus per-column
-  visibility for the checked table; everything persists in the browser.
-  Seven themes, each a full rework of the interface chrome (borders, tab
-  shapes, table rulings, tag geometry, tooltips, scrollbars) with element
-  and text sizes preserved: CLASSIC CAD, ARCHIVE LEDGER (neutral archival
-  paper), WORKSTATION 2000, SLATE STUDIO, PLATINUM, BLUEPRINT, MAINFRAME
-  TERMINAL. Work canvases are flat colors (no background gridlines).
+- The settings gear opens a categorized window (sidebar: GENERAL /
+  APPEARANCE / TABLE VIEW / FILE PATHS): theme + both font dropdowns,
+  checked-table columns, column-width reset, the PDF browser start folder,
+  and a restore-defaults button. Nine themes, each a full rework of the
+  interface chrome with element and text sizes preserved: CLASSIC CAD,
+  ARCHIVE LEDGER (neutral archival paper), WORKSTATION 2000, SLATE STUDIO,
+  PLATINUM, BLUEPRINT, MAINFRAME TERMINAL, and two modern neutral designs —
+  MODERN LIGHT and GRAPHITE DARK. Work canvases are flat colors (no
+  background gridlines).
 - Reusable components in `static/app.js`: `createMdEditor(container)` (the
   Obsidian-style live Markdown editor), `createPdfViewer()` (embedded PDF
   viewer), and `openFileBrowser(start, onPick)` (local PDF picker) — built
   to be mounted anywhere else in the interface.
 
-## CHECKED BOOKS tab
+## CATALOGS tab
 
 A split layout: a left panel (resizable via the splitter), a top working
 table, and an optional bottom search pane.
 
-### Toolbar commands (application toolbar) + filter bar
+### Commands + find bar
 
-Toolbar, when this tab is active:
+Application toolbar, when this tab is active: `RUN SCANS` (queues every
+row that has no scan results yet), `SCRAPE WHL` (fetches complete metadata
+for every published book from the WHL website's REST API — incremental and
+resumable; rows gain SRC `WEB`; drafts have no public page so their extra
+fields stay empty; scraped values sit under your corrections), and the
+`SEARCH PANE` toggle for the bottom pane. The same commands are in the
+TOOLS and VIEW menus.
 
-- `RUN SCANS` — queues every row that has no scan results yet.
-- `SCRAPE WHL` — fetches the complete metadata for every published book
-  from the WHL website's REST API (~2 min for the whole catalogue,
-  incremental and resumable; rows gain SRC `WEB`). Draft entries have no
-  public page, so their extra fields stay empty. Scraped values sit under
-  your corrections in precedence.
-- `DOWNLOAD APPROVED` — IA PDFs for every approved book (below).
-- `EXPORT JSON`, `CLEAR CHECKED`.
-- `SEARCH PANE` — toggle button for the bottom pane (pressed = shown).
+The bar above the table carries `EXPORT` (JSON of the table **as
+filtered**), a download icon ("Download all verified sources" — the IA
+PDFs for every approved book), the **filter icon** (a popup with MARK /
+SOURCE / DOWNLOAD-status filters — e.g. show only manual entries, or only
+failed downloads; the icon stays highlighted while any filter is active),
+and the column-visibility icon.
 
-The tab's own filter bar:
-
-- `FIND` — live filter, understood by every table on the tab and by the
-  realtime Open Library query: `@token` = author (last name), `#token` =
-  publication year, plain text = title words.
-- `MARK` — filter by mark state (ALL / SCAN / UPLOAD / APPROVED / UNMARKED).
+The find bar: the magnifier field filters every table on the tab live and
+drives the realtime Open Library query — `[title]` words, `@author`
+(last name), `#year`.
 
 ### Left panel (three sub-tabs)
 
@@ -135,47 +146,55 @@ The tab's own filter bar:
   are shaded light yellow, hand-typed fields light green; green fields
   constrain the search and are never overwritten (except the title itself,
   which the pick completes).
-- `WHL EDIT` — appears when a WHL row is Ctrl+clicked (below): the full
-  record editor. The DESCRIPTION field has a pencil button that opens a
-  **Markdown editor window** (the live Obsidian-style editor: the text
-  renders in place; the line under the caret shows its source. APPLY
-  writes back to the field, SAVE CORRECTIONS persists).
+- `EDIT` — the record editor, opened by **Ctrl+clicking a row in any
+  table**. It adapts its field set to the source: a WHL row gets the WHL
+  fields (title, subtitle, authors, year, publisher, print length,
+  language, subject, categories, description — the description's pencil
+  opens the live Markdown editor window; SAVE writes to the corrections
+  overlay); a checked/manual row gets the book fields (SAVE patches the
+  manual entry or updates the checked copy and re-queues its checks); a CH
+  catalog row from the bottom pane gets the book fields plus ACQUIRED, and
+  SAVE checks the record into CHECKED BOOKS with the edits applied.
 
 ### Top pane (dropdown selects the working table)
 
 - `CHECKED BOOKS + MANUAL` — one combined table of manual entries and
-  checked catalog books (`SRC` column) with `DEL` (manual) / `UNCHK`
-  (catalog) actions. Metadata cells are edited in place: click a cell,
-  type, Enter/blur commits (Escape cancels); manual-entry edits persist
-  server-side, and any edit re-queues the row's checks and scans.
-- `WHL CATALOG (EDITABLE)` — the whole WHL catalog with the full column
-  set (title, subtitle, authors, year, publisher, pages, language, subject,
-  description, status). Corrections never touch `whl_catalog.csv`; they
-  live in `output/whl_corrections.json`. Rows are visually distinct:
-  **edited** rows carry a cyan left bar and tint, **added** rows a green
-  one, **draft** rows an amber one (SRC column: `CSV` / `WEB` / `EDITED` /
+  checked catalog books (`SRC` column) with icon actions (trash = delete a
+  manual entry, minus-circle = uncheck a catalog book). Metadata cells are
+  edited in place: click a cell, type, Enter/blur commits (Escape
+  cancels); manual-entry edits persist server-side, and any edit re-queues
+  the row's checks and scans. A saved IA download shows a black `*` to the
+  right of the IA tag (tooltip: the file path); a failed one shows a red
+  `**` (tooltip: the error) — the tag itself stays centered.
+- `WHL` — the whole WHL catalog with the full column set (title, subtitle,
+  authors, year, publisher, pages, language, subject, description,
+  status). Corrections never touch `whl_catalog.csv`; they live in
+  `output/whl_corrections.json`. Rows are visually distinct: **edited**
+  rows carry a cyan left bar and tint, **added** rows a green one,
+  **draft** rows an amber one (SRC column: `CSV` / `WEB` / `EDITED` /
   `ADDED`).
   Two modes, toggled with the `MODE:` button or **Ctrl+E** (the current
   mode also shows as a tag in the footer): in EDIT mode click a cell to
-  correct it, or Ctrl+click a row to load the whole record into the left
-  panel's `WHL EDIT` tab; in SEARCH mode click a title to look it up on
-  Open Library, then click a result to repopulate the row's metadata — the
-  cleanup workflow for incomplete or mis-entered entries. `CONSTRAIN:`
-  checkboxes choose which of the clicked row's columns narrow the lookup —
-  `TITLE=` requires the title to appear verbatim (as a phrase), AUTHOR and
-  YEAR filter by the row's values. The STATUS tag links to the catalogue
-  page; its tooltip shows the target URL.
+  correct it; in SEARCH mode click a title to look it up on Open Library,
+  then click a result to repopulate the row's metadata — the cleanup
+  workflow for incomplete or mis-entered entries. Ctrl+click opens the
+  record in the `EDIT` tab from either mode. `CONSTRAIN:` checkboxes
+  choose which of the clicked row's columns narrow the lookup — `TITLE=`
+  requires the title to appear verbatim (as a phrase), AUTHOR and YEAR
+  filter by the row's values. The STATUS tag links to the catalogue page;
+  its tooltip shows the target URL.
 
 ### Bottom pane (`SEARCH PANE` toolbar toggle)
 
 A tabbed general-purpose viewer. `+` adds a tab; the active tab's dropdown
 selects its table (OPEN LIBRARY / CH CATALOG / WHL CATALOG). All tabs
-filter live from the FIND box (the Open Library tab queries the
+filter live from the find box (the Open Library tab queries the
 consolidated index server-side). Hovering a row shows a tooltip with every
 available field; clicking a row adds it to whatever table the top pane
 shows, with columns mapped — into CHECKED it becomes a manual entry
 (auto-checked and auto-scanned) or a checked catalog row for CH sources;
-into WHL it becomes an added correction row.
+into WHL it becomes an added correction row. Ctrl+click opens CH and WHL
+records in the `EDIT` tab instead.
 
 ### Automatic checks + scans
 
@@ -236,25 +255,26 @@ approved IA source: the item's PDF derivative is saved to
 `downloads/ia/<identifier>.pdf` and a cataloging entry is written to
 `downloads/ia/catalog.json` combining the IA record with the book's own
 catalogue metadata. Progress shows in the IA tag cell and the status bar;
-already-downloaded volumes show `SAVED` and are skipped on later runs.
+already-downloaded volumes show the `*` marker and are skipped on later
+runs.
 
-## UPLOAD LIST tab
+## EDITOR tab
 
 The submission-preparation area. Toolbar commands when this tab is active:
 `NEW ENTRY` (start a blank catalog entry), `EXPORT BUILDS` (download all
 prepared entries as `whl_submission_entries.json` — the submission
 package), `DOWNLOAD SOURCES` (save the approved-sources list as
-`whl_upload_list.json`).
+`whl_upload_list.json`). The first two are also in the FILE menu.
 
 Two parts, separated by a **drag-to-resize splitter**:
 
 - **The book builder** (top) — catalog entries being prepared for WHL
-  submission, persisted in `output/whl_builds.json`. `BUILD` on an
+  submission, persisted in `output/whl_builds.json`. The build icon on an
   approved source starts an entry prefilled from the book's metadata, the
   provenance URL, and the PDF source; when the PDF was already downloaded
   the local `downloads/ia/<id>.pdf` path is attached automatically.
-  The editor puts `SAVE`, the `READY FOR SUBMISSION` flag, and `DELETE` at
-  the top, over two sub-tabs (their content scrolls):
+  The editor puts the save icon, the `VERIFIED` flag, and the delete icon
+  at the top, over two sub-tabs (their content scrolls):
   - `ENTRY` — the metadata fields (title, subtitle, authors, year,
     edition, publisher + city, language, pages, categories, PDF source
     URL, provenance URL, internal notes) with the **live Markdown
@@ -262,17 +282,19 @@ Two parts, separated by a **drag-to-resize splitter**:
     description renders in the same box it is typed in (Obsidian-style —
     markers hide on rendered lines; the line under the caret shows its
     dimmed source).
-  - `SOURCE (PDF)` — an embedded **PDF viewer** for verifying the actual
-    PDF before marking the entry ready, plus the local-file interface: a
-    path field, `BROWSE...` (a local-directory picker that lists drives,
-    folders, and PDFs), and `ATTACH` (validates the file exists, then
-    saves the path on the entry). A PDF auto-sourced from a URL that has
-    already been downloaded gets its local path populated automatically;
-    with no local file the viewer falls back to the remote URL.
+  - `SOURCE (PDF)` — an embedded, **undecorated PDF viewer** (no browser
+    toolbar; the file size shows in the bar) for verifying the actual PDF
+    before marking the entry VERIFIED, plus the local-file interface: a
+    path field, a folder icon (local-directory picker listing drives,
+    folders, and PDFs), and an attach icon (validates the file exists,
+    then saves the path on the entry). A PDF auto-sourced from a URL that
+    has already been downloaded gets its local path populated
+    automatically; with no local file the viewer falls back to the remote
+    URL.
 - **APPROVED SOURCES** (bottom table) — every approved source across all
   rows: title, subtitle, author, publisher, year, the archive, and the
-  matched record (linked, with the URL in the tooltip). Each row has a
-  `BUILD` button.
+  matched record (linked, with the URL in the tooltip). Each row's build
+  icon starts a prefilled entry.
 
 # Standalone CLIs
 
