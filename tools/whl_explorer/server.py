@@ -99,12 +99,18 @@ BUILDS_PATH = lib.OUTPUT_DIR / "whl_builds.json"
 
 # The field set mirrors what a WHL catalog entry needs. pdf_source is the
 # source URL; pdf_file is the local PDF attached for the actual submission;
-# ocr_active/ocr_verified/ocr_quality track the entry folder's OCR files.
+# ocr_active/ocr_verified/ocr_quality track the entry folder's OCR files;
+# title_pages lists PDF pages marked as title pages (metadata extraction
+# uses them later); attention flags an entry as needing attention.
 _BUILD_FIELDS = ("title", "subtitle", "authors", "year", "publisher",
                  "publisher_city", "edition", "language", "pages",
                  "categories", "description", "pdf_source", "pdf_file",
                  "source_url", "notes", "status",
-                 "ocr_active", "ocr_verified", "ocr_quality")
+                 "ocr_active", "ocr_verified", "ocr_quality",
+                 "title_pages", "attention")
+
+# draft -> ready (verified) -> uploaded (sent to WHL, cleared from Pending)
+_BUILD_STATUSES = ("draft", "ready", "uploaded")
 
 
 @app.route("/api/builds")
@@ -118,7 +124,7 @@ def api_builds_create():
     seed = payload.get("build") or {}
     builds = lib.load_json(BUILDS_PATH, {})
     build = {f: str(seed.get(f, "") or "").strip() for f in _BUILD_FIELDS}
-    if build["status"] not in ("draft", "ready"):
+    if build["status"] not in _BUILD_STATUSES:
         build["status"] = "draft"
     build["id"] = lib.gen_id(set(builds))
     build["created_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -138,7 +144,7 @@ def api_builds_update(build_id: str):
     for f in _BUILD_FIELDS:
         if f in payload:
             b[f] = str(payload[f] or "").strip()
-    if b.get("status") not in ("draft", "ready"):
+    if b.get("status") not in _BUILD_STATUSES:
         b["status"] = "draft"
     b["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     lib.save_json(BUILDS_PATH, builds)
@@ -183,17 +189,67 @@ def _resolve_local(raw: str) -> Path | None:
         return None
 
 
+_remote_pdf_lock = threading.Lock()
+
+
+def _remote_pdf_cache(url: str) -> Path:
+    """Fetch a remote PDF once into downloads/cache/ and return the path.
+    Browsers can't iframe third-party PDFs (X-Frame-Options), so remote
+    sources are proxied through here. Raises ValueError on fetch failure.
+
+    Downloads land in a temp file and are renamed into place under a lock:
+    the viewer fires several concurrent requests for the same URL (iframe
+    GET + HEAD size probe + OCR text fetch), and none of them may see a
+    half-written file. A response that isn't a PDF is rejected instead of
+    being cached forever."""
+    if not url.lower().startswith(("http://", "https://")):
+        raise ValueError("not an http(s) URL")
+    import hashlib
+    cache_dir = lib.ROOT / "downloads" / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    p = cache_dir / (hashlib.sha1(url.encode("utf-8")).hexdigest()[:16] + ".pdf")
+    with _remote_pdf_lock:
+        if p.exists():
+            return p
+        tmp = p.with_suffix(".fetch.tmp")
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": whl_client.USER_AGENT})
+            with urllib.request.urlopen(req, timeout=90) as resp, \
+                    open(tmp, "wb") as fh:
+                import shutil
+                shutil.copyfileobj(resp, fh)
+            with open(tmp, "rb") as fh:
+                if fh.read(5) != b"%PDF-":
+                    raise ValueError("response is not a PDF")
+            tmp.replace(p)
+        except ValueError:
+            tmp.unlink(missing_ok=True)
+            raise
+        except Exception as exc:
+            tmp.unlink(missing_ok=True)
+            raise ValueError(f"fetch failed: {exc}")
+    return p
+
+
 @app.route("/api/pdf")
 def api_pdf():
-    """Stream a local PDF (absolute path, or relative to the repo root).
-    ?preview=1&pages=N serves a compressed, truncated derivative instead —
-    much faster to load for large scans."""
+    """Stream a PDF — a local path, or a remote ?url= proxied through the
+    download cache. ?preview=1&pages=N serves a compressed, truncated
+    derivative instead — much faster to load for large scans."""
     raw = (request.args.get("path") or "").strip()
-    if not raw:
+    url = (request.args.get("url") or "").strip()
+    if url:
+        try:
+            p = _remote_pdf_cache(url)
+        except ValueError:
+            abort(502)
+    elif raw:
+        p = _resolve_local(raw)
+        if p is None or p.suffix.lower() != ".pdf" or not p.is_file():
+            abort(404)
+    else:
         abort(400)
-    p = _resolve_local(raw)
-    if p is None or p.suffix.lower() != ".pdf" or not p.is_file():
-        abort(404)
     if request.args.get("preview"):
         try:
             pages = max(1, min(500, int(request.args.get("pages") or 20)))
@@ -504,13 +560,252 @@ def api_pdf_pageimg():
     return send_file(out, mimetype="image/png", conditional=True)
 
 
+# --- OCR processing jobs -----------------------------------------------------------
+# Pages are rasterized (PyMuPDF) and run through the chosen OCR service;
+# every finished page is merged into ONE compiled OCR file in the entry
+# folder (ocr/compiled.txt) and saved immediately, so results from
+# different services land in a single document and nothing is lost if a
+# job dies part-way.
+
+_ocr_jobs: dict[str, dict] = {}
+_ocr_jobs_lock = threading.Lock()
+# serializes every compiled-file merge: concurrent jobs (one POST per digit
+# shortcut) must not lose each other's pages in the read-modify-write
+_ocr_merge_lock = threading.Lock()
+
+_TESSERACT_DEFAULT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+
+def _ocr_page_png(pdf: Path, page: int, width: int) -> bytes:
+    import fitz
+    doc = fitz.open(str(pdf))
+    try:
+        pg = doc[page - 1]
+        zoom = width / max(1.0, pg.rect.width)
+        pix = pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+        return pix.tobytes("png")
+    finally:
+        doc.close()
+
+
+def _ocr_tesseract(png: bytes, cfg: dict) -> str:
+    import pytesseract
+    from PIL import Image
+    import io as _io
+    exe = (cfg.get("tesseract") or "").strip() or _TESSERACT_DEFAULT
+    if Path(exe).is_file():
+        pytesseract.pytesseract.tesseract_cmd = exe
+    return pytesseract.image_to_string(Image.open(_io.BytesIO(png)))
+
+
+def _ocr_claude(png: bytes, cfg: dict) -> str:
+    key = (cfg.get("claude_key") or "").strip()
+    if not key:
+        raise RuntimeError("Anthropic API key not configured (Settings > OCR)")
+    import base64
+    model = (cfg.get("claude_model") or "").strip() or "claude-haiku-4-5-20251001"
+    body = json.dumps({
+        "model": model,
+        "max_tokens": 8192,
+        "messages": [{"role": "user", "content": [
+            {"type": "image", "source": {
+                "type": "base64", "media_type": "image/png",
+                "data": base64.b64encode(png).decode("ascii")}},
+            {"type": "text", "text":
+                "Transcribe ALL text on this scanned book page exactly as "
+                "printed, preserving line breaks. Output only the "
+                "transcription, no commentary. If the page is blank, "
+                "output nothing."},
+        ]}],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages", data=body, method="POST",
+        headers={"Content-Type": "application/json",
+                 "x-api-key": key,
+                 "anthropic-version": "2023-06-01"})
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return "".join(blk.get("text", "") for blk in data.get("content", []))
+
+
+def _ocr_textract(png: bytes, cfg: dict) -> str:
+    key = (cfg.get("aws_key") or "").strip()
+    secret = (cfg.get("aws_secret") or "").strip()
+    if not (key and secret):
+        raise RuntimeError("AWS credentials not configured (Settings > OCR)")
+    try:
+        import boto3
+    except ImportError:
+        raise RuntimeError("boto3 is not installed (python3 -m pip install boto3)")
+    client = boto3.client(
+        "textract", region_name=(cfg.get("aws_region") or "us-east-1").strip(),
+        aws_access_key_id=key, aws_secret_access_key=secret)
+    resp = client.detect_document_text(Document={"Bytes": png})
+    return "\n".join(b["Text"] for b in resp.get("Blocks", [])
+                     if b.get("BlockType") == "LINE")
+
+
+_OCR_SERVICES = {
+    "tesseract": _ocr_tesseract,
+    "claude": _ocr_claude,
+    "textract": _ocr_textract,
+}
+
+
+def _ocr_merge_page(build_id: str, target: str, page: int, text: str) -> None:
+    """Merge one page's OCR into the compiled document (page-marker format)
+    and save immediately. Serialized: concurrent jobs merge into the same
+    file without losing each other's pages."""
+    with _ocr_merge_lock:
+        f = _entry_dir(build_id) / "ocr" / _ocr_name(target)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        sections: dict[int, str] = {}
+        pre = ""
+        if f.is_file():
+            raw = f.read_text(encoding="utf-8", errors="replace")
+            marks = list(re.finditer(r"^--- page (\d+) ---$", raw, re.M))
+            pre = raw[:marks[0].start()].rstrip("\n") if marks else raw.rstrip("\n")
+            for i, m in enumerate(marks):
+                to = marks[i + 1].start() if i + 1 < len(marks) else len(raw)
+                sections[int(m.group(1))] = raw[m.end():to].strip("\n")
+        sections[page] = text.strip("\n")
+        parts = ([pre] if pre else []) + [
+            f"--- page {n} ---\n{sections[n]}" for n in sorted(sections)]
+        f.write_text("\n\n".join(parts), encoding="utf-8", errors="replace")
+
+
+def _ocr_job_run(job_id: str) -> None:
+    job = _ocr_jobs[job_id]
+    cfg = job["cfg"]
+    pdf = Path(job["pdf"])
+    for item in job["pages"]:
+        n, svc = item["page"], item["service"]
+        try:
+            png = _ocr_page_png(pdf, n, job["width"])
+            runner = _OCR_SERVICES.get(svc)
+            if runner is None:
+                raise RuntimeError(f"unsupported service: {svc}")
+            text = runner(png, cfg)
+            _ocr_merge_page(job["build_id"], job["target"], n, text)
+            item["status"] = "ok"
+        except Exception as exc:
+            item["status"] = f"error: {exc}"
+            job["errors"] += 1
+        job["done"] += 1
+    job["status"] = "done" if not job["errors"] else "done (with errors)"
+
+
+@app.route("/api/ocr/run", methods=["POST"])
+def api_ocr_run():
+    """Queue pages of a build's PDF for OCR.
+    Body: {build_id, pdf, pages: [{page, service}], target?, width?,
+           tesseract?, claude_key?, claude_model?, aws_key?, aws_secret?,
+           aws_region?}."""
+    p = request.get_json(silent=True) or {}
+    build_id = str(p.get("build_id") or "")
+    if build_id not in lib.load_json(BUILDS_PATH, {}):
+        abort(404)
+    pdf = _resolve_local(str(p.get("pdf") or ""))
+    if pdf is None or not pdf.is_file():
+        return jsonify({"ok": False, "error": "PDF not found"})
+    pages = [{"page": int(x.get("page")), "service": str(x.get("service") or ""),
+              "status": "queued"}
+             for x in (p.get("pages") or []) if int(x.get("page", 0)) > 0]
+    if not pages:
+        return jsonify({"ok": False, "error": "no pages"})
+    try:
+        width = max(600, min(3000, int(p.get("width") or 1400)))
+    except (TypeError, ValueError):
+        width = 1400
+    job_id = lib.gen_id(set(_ocr_jobs))
+    job = {
+        "id": job_id, "build_id": build_id, "pdf": str(pdf),
+        "target": str(p.get("target") or "compiled.txt"),
+        "pages": pages, "done": 0, "errors": 0, "width": width,
+        "status": "running",
+        "cfg": {k: p.get(k) for k in ("tesseract", "claude_key", "claude_model",
+                                      "aws_key", "aws_secret", "aws_region")},
+    }
+    with _ocr_jobs_lock:
+        _ocr_jobs[job_id] = job
+    threading.Thread(target=_ocr_job_run, args=(job_id,), daemon=True).start()
+    return jsonify({"ok": True, "job": _ocr_job_state(job)})
+
+
+def _ocr_job_state(job: dict) -> dict:
+    return {k: v for k, v in job.items() if k != "cfg"}
+
+
+@app.route("/api/ocr/job/<job_id>")
+def api_ocr_job(job_id: str):
+    job = _ocr_jobs.get(job_id)
+    if not job:
+        abort(404)
+    return jsonify({"ok": True, "job": _ocr_job_state(job)})
+
+
+# --- master list -> Google Sheets sync ----------------------------------------------
+
+@app.route("/api/master/sync", methods=["POST"])
+def api_master_sync():
+    """Publish the master list (plus manual entries) to a Google Sheet.
+    Body: {spreadsheet_id, service_account_file, sheet_name?}. Requires a
+    Google service-account JSON key — TODO: verify once the user has one."""
+    p = request.get_json(silent=True) or {}
+    sheet_id = str(p.get("spreadsheet_id") or "").strip()
+    keyfile = str(p.get("service_account_file") or "").strip()
+    sheet_name = str(p.get("sheet_name") or "Master list").strip()
+    if not sheet_id or not keyfile:
+        return jsonify({"ok": False,
+                        "error": "Spreadsheet ID and service-account key file "
+                                 "are required (Settings > Sync)"})
+    kf = _resolve_local(keyfile)
+    if kf is None or not kf.is_file():
+        return jsonify({"ok": False, "error": f"key file not found: {keyfile}"})
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build as gbuild
+    except ImportError:
+        return jsonify({"ok": False,
+                        "error": "Google API client not installed (python3 -m "
+                                 "pip install google-api-python-client google-auth)"})
+    header = ["Title", "Subtitle", "Author", "Year", "Volume", "Edition",
+              "Publisher", "City", "Categories", "Notes", "Source"]
+    rows = [header]
+    for r in lib.load_json(lib.CH_LIBRARY_JSON_PATH, []):
+        row = _ch_row(0, r)
+        rows.append([row["title"], "", row["author"], row["year"], "",
+                     row["edition"], row["publisher"], row["city"],
+                     row["categories"], row["notes"], "master"])
+    for e in lib.load_json(lib.MANUAL_ENTRIES_PATH, {}).values():
+        rows.append([e.get("title", ""), e.get("subtitle", ""),
+                     e.get("author", ""), e.get("year", ""),
+                     e.get("volume", ""), e.get("edition", ""),
+                     e.get("publisher", ""), e.get("city", ""),
+                     e.get("categories", ""), e.get("notes", ""), "manual"])
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            str(kf), scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        svc = gbuild("sheets", "v4", credentials=creds)
+        svc.spreadsheets().values().update(
+            spreadsheetId=sheet_id, range=f"{sheet_name}!A1",
+            valueInputOption="RAW", body={"values": rows}).execute()
+        return jsonify({"ok": True, "rows": len(rows) - 1})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+
 _PDF_TEXT_CACHE: dict = {}
 
 
 @app.route("/api/pdf/text")
 def api_pdf_text():
     """Extract the text (OCR) layer of a PDF — a local path, or a remote URL
-    that is fetched once into downloads/cache/."""
+    that is fetched once into downloads/cache/.
+
+    ?save_build=<id> also writes the extraction into that build's entry
+    folder as ocr/extracted.txt when it doesn't exist yet — extracted OCR
+    is saved automatically the first time a book's PDF is read."""
     raw_path = (request.args.get("path") or "").strip()
     url = (request.args.get("url") or "").strip()
     try:
@@ -522,41 +817,36 @@ def api_pdf_text():
         if p is None or not p.is_file():
             abort(404)
     elif url:
-        if not url.lower().startswith(("http://", "https://")):
-            abort(400)
-        import hashlib
-        cache_dir = lib.ROOT / "downloads" / "cache"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        p = cache_dir / (hashlib.sha1(url.encode("utf-8")).hexdigest()[:16] + ".pdf")
-        if not p.exists():
-            try:
-                req = urllib.request.Request(
-                    url, headers={"User-Agent": whl_client.USER_AGENT})
-                with urllib.request.urlopen(req, timeout=90) as resp, \
-                        open(p, "wb") as fh:
-                    import shutil
-                    shutil.copyfileobj(resp, fh)
-            except Exception as exc:
-                p.unlink(missing_ok=True)
-                return jsonify({"ok": False,
-                                "error": f"fetch failed: {exc}"})
+        try:
+            p = _remote_pdf_cache(url)
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)})
     else:
         abort(400)
     key = (str(p), p.stat().st_mtime, max_pages)
-    if key in _PDF_TEXT_CACHE:
-        return jsonify(_PDF_TEXT_CACHE[key])
-    try:
-        from pypdf import PdfReader  # noqa: F401
-    except ImportError:
-        return jsonify({"ok": False,
-                        "error": "pypdf is not installed "
-                                 "(python3 -m pip install pypdf)"})
-    try:
-        total, shown, text = _pdf_extract_text(p, max_pages)
-        out = {"ok": True, "pages": total, "shown": shown, "text": text}
-    except Exception as exc:
-        out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    _PDF_TEXT_CACHE[key] = out
+    out = _PDF_TEXT_CACHE.get(key)
+    if out is None:
+        try:
+            from pypdf import PdfReader  # noqa: F401
+        except ImportError:
+            return jsonify({"ok": False,
+                            "error": "pypdf is not installed "
+                                     "(python3 -m pip install pypdf)"})
+        try:
+            total, shown, text = _pdf_extract_text(p, max_pages)
+            out = {"ok": True, "pages": total, "shown": shown, "text": text}
+        except Exception as exc:
+            out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        _PDF_TEXT_CACHE[key] = out
+    # auto-save into the entry folder (never clobbers an existing file)
+    bid = (request.args.get("save_build") or "").strip()
+    if bid and out.get("ok") and out.get("text", "").strip():
+        if bid in lib.load_json(BUILDS_PATH, {}):
+            f = _entry_dir(bid) / "ocr" / "extracted.txt"
+            if not f.is_file():
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text(out["text"], encoding="utf-8", errors="replace")
+                out = dict(out, saved="extracted.txt")
     return jsonify(out)
 
 

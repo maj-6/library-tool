@@ -40,6 +40,7 @@ MANUAL_ENTRY_FIELDS = [
     "categories",
     "notes",
     "local_pdf",
+    "attention",
 ]
 
 

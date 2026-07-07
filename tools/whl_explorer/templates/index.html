@@ -10,7 +10,7 @@
   <div id="titlebar">
     <span class="tb-name" id="tb-name">Catalogs :: Catalog Explorer</span>
     <span class="tb-right">
-      <span class="tb-meta" id="tb-meta">v2.6</span>
+      <span class="tb-meta" id="tb-meta">v2.7</span>
     </span>
   </div>
 
@@ -48,6 +48,8 @@
         <button class="menu-item" data-cmd="run-scans" type="button">Run scans</button>
         <button class="menu-item" data-cmd="scrape" type="button">Scrape WHL</button>
         <button class="menu-item" data-cmd="dl-approved" type="button">Download verified sources</button>
+        <div class="menu-sep"></div>
+        <button class="menu-item" data-cmd="master-sync" type="button">Sync master list to Google Sheets&hellip;</button>
       </div>
     </div>
   </div>
@@ -133,6 +135,8 @@
               <div class="mf-actions">
                 <button id="ol-search-btn" class="cad-btn icon-btn" type="submit"
                         data-icon="search" data-tip="Search Open Library"></button>
+                <button id="ol-clear" class="cad-btn icon-btn" type="button"
+                        data-icon="remove" data-tip="Clear the search fields"></button>
                 <span class="tool-label" id="ol-msg"></span>
               </div>
             </form>
@@ -457,7 +461,11 @@
     <section id="upload" class="panel-view">
       <div id="upload-split">
         <div id="builds-pane">
-          <div class="pane-bar"><span class="tool-label">Pending</span>
+          <div class="pane-bar" id="builds-tabs">
+            <button class="pane-tab active" data-bstab="pending" type="button"
+                    data-tip="Awaiting upload to WHL">Pending</button>
+            <button class="pane-tab" data-bstab="uploaded" type="button"
+                    data-tip="Already uploaded to WHL">Uploaded</button>
             <span class="tool-count" id="upload-count"></span></div>
           <div class="drafting" id="builds-list-wrap">
             <ul id="builds-list"></ul>
@@ -474,6 +482,8 @@
             <span class="act-sep"></span>
             <button id="b-ready" class="cad-btn icon-btn toggle" type="button"
                     data-icon="check" data-tip="Mark verified"></button>
+            <button id="build-upload" class="cad-btn icon-btn" type="button"
+                    data-icon="export" data-tip="Upload to WHL — moves the verified entry to the Uploaded tab (the WHL upload API call is a later feature)"></button>
             <span id="b-verified-tag" class="foot-tag tag-verified" hidden>Verified</span>
             <span class="tool-label" id="build-msg"></span>
           </div>
@@ -589,6 +599,8 @@
       <div id="upload-sources-pane">
         <div class="pane-bar"><span class="tool-label">Verified sources</span>
           <span class="bar-spacer"></span>
+          <button id="src-filter" class="cad-btn tiny icon-btn" type="button"
+                  data-icon="filter" data-tip="Filter by status (hide done, etc.)"></button>
           <button id="colvis-upload" class="cad-btn tiny icon-btn" type="button"
                   data-icon="columns" data-tip="Visible columns"></button>
           <span class="tool-count" id="sources-count"></span></div>
@@ -603,6 +615,7 @@
                 <th>Year</th>
                 <th>Archive</th>
                 <th>Matched record</th>
+                <th class="col-whl">Status</th>
                 <th class="col-act" data-tip="Actions"></th>
               </tr>
             </thead>
@@ -678,9 +691,11 @@
         <span class="tool-label">OCR queue</span>
         <span class="tb-sep"></span>
         <select id="ocr-service" class="cad-input">
+          <option value="tesseract">Tesseract (local)</option>
+          <option value="claude">Claude</option>
+          <option value="textract">Amazon Textract</option>
           <option value="azure">Azure Document Intelligence</option>
           <option value="openai">OpenAI vision</option>
-          <option value="tesseract">Tesseract (local)</option>
         </select>
         <button id="ocr-queue-add" class="cad-btn tiny icon-btn" type="button"
                 data-icon="plus" data-tip="Queue the selected book's PDF for OCR"></button>
@@ -782,6 +797,7 @@
           <button class="snav" data-sec="sec-tables" type="button">Table view</button>
           <button class="snav" data-sec="sec-ai" type="button">AI</button>
           <button class="snav" data-sec="sec-ocr" type="button">OCR</button>
+          <button class="snav" data-sec="sec-sync" type="button">Sync</button>
           <button class="snav" data-sec="sec-paths" type="button">File paths</button>
         </div>
         <div id="settings-content">
@@ -848,9 +864,11 @@
             <div class="settings-rows">
               <label class="tool-label" for="set-ocr-service">Default service</label>
               <select id="set-ocr-service" class="cad-input">
+                <option value="tesseract">Tesseract (local)</option>
+                <option value="claude">Claude</option>
+                <option value="textract">Amazon Textract</option>
                 <option value="azure">Azure Document Intelligence</option>
                 <option value="openai">OpenAI vision</option>
-                <option value="tesseract">Tesseract (local)</option>
               </select>
               <label class="tool-label" for="set-ocr-azure-endpoint">Azure endpoint</label>
               <input id="set-ocr-azure-endpoint" class="cad-input" spellcheck="false"
@@ -860,6 +878,84 @@
               <label class="tool-label" for="set-ocr-tesseract">Tesseract executable</label>
               <input id="set-ocr-tesseract" class="cad-input" spellcheck="false"
                      placeholder="C:\Program Files\Tesseract-OCR\tesseract.exe" />
+              <label class="tool-label" for="set-ocr-claude-key">Anthropic API key</label>
+              <input id="set-ocr-claude-key" class="cad-input" type="password" spellcheck="false" />
+              <label class="tool-label" for="set-ocr-claude-model">Claude model</label>
+              <input id="set-ocr-claude-model" class="cad-input" spellcheck="false"
+                     placeholder="claude-haiku-4-5-20251001" />
+              <label class="tool-label" for="set-ocr-aws-key">AWS access key (Textract)</label>
+              <input id="set-ocr-aws-key" class="cad-input" spellcheck="false" />
+              <label class="tool-label" for="set-ocr-aws-secret">AWS secret key</label>
+              <input id="set-ocr-aws-secret" class="cad-input" type="password" spellcheck="false" />
+              <label class="tool-label" for="set-ocr-aws-region">AWS region</label>
+              <input id="set-ocr-aws-region" class="cad-input" spellcheck="false"
+                     placeholder="us-east-1" />
+              <label class="tool-label" for="set-ocr-width">OCR image width (px)</label>
+              <input id="set-ocr-width" class="cad-input" type="number" min="600" max="3000" step="100"
+                     data-tip="Rasterization width for OCR input — experiment to see how compression/shrinking affects quality" />
+              <label class="tool-label" for="set-ocr-key1">Page-view key 1</label>
+              <select id="set-ocr-key1" class="cad-input">
+                <option value="">&mdash;</option>
+                <option value="tesseract">Tesseract (local)</option>
+                <option value="claude">Claude</option>
+                <option value="textract">Amazon Textract</option>
+                <option value="azure">Azure Document Intelligence</option>
+                <option value="openai">OpenAI vision</option>
+              </select>
+              <label class="tool-label" for="set-ocr-key2">Page-view key 2</label>
+              <select id="set-ocr-key2" class="cad-input">
+                <option value="">&mdash;</option>
+                <option value="tesseract">Tesseract (local)</option>
+                <option value="claude">Claude</option>
+                <option value="textract">Amazon Textract</option>
+                <option value="azure">Azure Document Intelligence</option>
+                <option value="openai">OpenAI vision</option>
+              </select>
+              <label class="tool-label" for="set-ocr-key3">Page-view key 3</label>
+              <select id="set-ocr-key3" class="cad-input">
+                <option value="">&mdash;</option>
+                <option value="tesseract">Tesseract (local)</option>
+                <option value="claude">Claude</option>
+                <option value="textract">Amazon Textract</option>
+                <option value="azure">Azure Document Intelligence</option>
+                <option value="openai">OpenAI vision</option>
+              </select>
+              <label class="tool-label" for="set-ocr-key4">Page-view key 4</label>
+              <select id="set-ocr-key4" class="cad-input">
+                <option value="">&mdash;</option>
+                <option value="tesseract">Tesseract (local)</option>
+                <option value="claude">Claude</option>
+                <option value="textract">Amazon Textract</option>
+                <option value="azure">Azure Document Intelligence</option>
+                <option value="openai">OpenAI vision</option>
+              </select>
+              <label class="tool-label" for="set-ocr-key5">Page-view key 5</label>
+              <select id="set-ocr-key5" class="cad-input">
+                <option value="">&mdash;</option>
+                <option value="tesseract">Tesseract (local)</option>
+                <option value="claude">Claude</option>
+                <option value="textract">Amazon Textract</option>
+                <option value="azure">Azure Document Intelligence</option>
+                <option value="openai">OpenAI vision</option>
+              </select>
+            </div>
+            <p class="settings-note">Page-view keys: hover a PDF page and press the digit to queue
+              it with that service; Ctrl+digit arms it for a Ctrl+click range.</p>
+          </div>
+          <div id="sec-sync" class="settings-sec">
+            <div class="settings-head">Sync</div>
+            <p class="settings-note">Publishes the master list (plus manual entries) to a Google
+              Sheet — always triggered manually (Tools &gt; Sync master list). Requires a Google
+              service-account JSON key; not verified yet (no credentials).</p>
+            <div class="settings-rows">
+              <label class="tool-label" for="set-gs-sheet-id">Spreadsheet ID</label>
+              <input id="set-gs-sheet-id" class="cad-input" spellcheck="false" />
+              <label class="tool-label" for="set-gs-keyfile">Service-account key file</label>
+              <input id="set-gs-keyfile" class="cad-input" spellcheck="false"
+                     placeholder="path\to\service-account.json" />
+              <label class="tool-label" for="set-gs-sheet-name">Sheet name</label>
+              <input id="set-gs-sheet-name" class="cad-input" spellcheck="false"
+                     placeholder="Master list" />
             </div>
           </div>
           <div id="sec-paths" class="settings-sec">

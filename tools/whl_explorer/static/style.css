@@ -1085,6 +1085,7 @@ a.badge:hover { text-decoration: underline; }
   border-radius: 50%;
   pointer-events: auto;
 }
+.tag-unit .badge .dl-dot { right: auto; left: 2px; }
 .dl-dot.ok { background: var(--green); }
 .dl-dot.err { background: var(--red); }
 .dl-dot.prog { background: var(--amber); }
@@ -1109,6 +1110,24 @@ a.badge:hover { text-decoration: underline; }
 .vmark.approved { border-color: var(--green); background: #23b03955; }
 .vmark.rejected { border-color: var(--red); background: #c0392b55; }
 .vmark:hover { filter: brightness(1.35); }
+
+/* Shift+click: "needs attention" — outranks per-kind row tints like
+   .grid tbody tr.is-manual */
+.grid tbody tr.attention { background: rgba(155, 89, 182, 0.16); }
+.grid tbody tr.attention td:first-child { box-shadow: inset 3px 0 0 #9b59b6; }
+.build-item.attention { background: rgba(155, 89, 182, 0.16); }
+.build-item.attention.active {
+  background: rgba(155, 89, 182, 0.26);
+  box-shadow: inset 3px 0 0 #9b59b6;
+}
+
+/* verified-source status: yellow = draft entry in the editor, green = done */
+tr.src-draft { background: rgba(216, 160, 0, 0.12); }
+tr.src-done { background: rgba(35, 176, 57, 0.12); }
+
+/* master-list publish preview: manual additions / already-checked rows */
+tr.ml-manual { background: rgba(216, 160, 0, 0.13); }
+tr.ml-checked { background: rgba(0, 140, 200, 0.12); }
 
 /* WHL row states */
 tr.whl-row-corrected { background: rgba(0, 183, 195, 0.09); }
@@ -1535,6 +1554,11 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   background: var(--row-checked);
   box-shadow: inset 3px 0 0 var(--cyan);
 }
+.build-item.ready { background: rgba(35, 176, 57, 0.08); }
+.build-item.ready.active {
+  background: rgba(35, 176, 57, 0.16);
+  box-shadow: inset 3px 0 0 var(--green);
+}
 .bi-row { display: flex; align-items: center; gap: 5px; min-width: 0; }
 .bi-title {
   display: block;
@@ -1944,6 +1968,27 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 .d-add { background: rgba(35, 176, 57, 0.16); color: var(--green); }
 .d-skip { opacity: 0.5; font-style: italic; padding: 2px 0; }
 #ocr-queue-wrap { flex: 0 0 140px; min-height: 90px; }
+.pane-bar select.cad-input { height: 22px; padding: 1px 4px; }
+
+/* page-view marks: title pages, queued-for-OCR pages, range start */
+.ocr-pgimg { position: relative; }
+.pg-chips { position: absolute; top: 4px; right: 4px; display: flex; gap: 3px; }
+.pg-chip {
+  font-family: var(--ui);
+  font-size: 10px;
+  font-weight: bold;
+  padding: 1px 5px;
+  border-radius: var(--radius);
+  color: #fff;
+}
+.pg-chip.title { background: #9b59b6; }
+.pg-chip.svc { background: var(--cyan); color: #06282d; }
+.ocr-pgrow.pg-title .ocr-pgimg img { outline: 2px solid #9b59b6; outline-offset: -2px; }
+.ocr-pgrow.pg-queued .ocr-pgimg img { outline: 2px solid var(--cyan); outline-offset: -2px; }
+.ocr-pgrow.pg-range .ocr-pgimg img { outline: 2px dashed var(--amber); outline-offset: -2px; }
+
+/* builds sidebar tabs (Pending / Uploaded) */
+#builds-tabs .pane-tab { padding: 2px 8px; }
 
 #ocr-pages {
   flex: 1;
