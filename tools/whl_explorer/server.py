@@ -37,6 +37,7 @@ import libcommon as lib  # noqa: E402
 import ol_client  # noqa: E402
 import scan_search  # noqa: E402
 import whl_client  # noqa: E402
+import whl_scrape  # noqa: E402
 
 app = Flask(__name__)
 
@@ -582,10 +583,11 @@ WHL_CORRECTIONS_PATH = lib.OUTPUT_DIR / "whl_corrections.json"
 _whl_rows_cache: list | None = None
 _whl_rows_lock = threading.Lock()
 
-# The catalogue export lacks subtitle/description (they exist on the WHL
-# website); those columns start empty here and are filled via corrections.
+# The catalogue export lacks subtitle/description/publisher/pages/language/
+# subject (they exist on the WHL website); those columns are filled by the
+# scraper (tools/whl_scrape.py) and refined via corrections.
 _WHL_EDIT_FIELDS = ("title", "subtitle", "authors", "year", "categories",
-                    "description")
+                    "description", "publisher", "pages", "language", "subject")
 
 
 def _load_whl_base() -> list[dict]:
@@ -608,6 +610,10 @@ def _load_whl_base() -> list[dict]:
                             "year": whl_client._year(raw.get("Year Published")) or "",
                             "categories": (raw.get("Library Categories") or "").strip(),
                             "description": "",
+                            "publisher": "",
+                            "pages": "",
+                            "language": "",
+                            "subject": "",
                             "status": (raw.get("Status") or "").strip().lower(),
                             "permalink": (raw.get("Permalink") or "").strip(),
                             "file": (raw.get("Publication File") or "").strip(),
@@ -616,9 +622,35 @@ def _load_whl_base() -> list[dict]:
         return _whl_rows_cache
 
 
+# Fields the scraper fills in when the CSV has nothing better.
+_WHL_SCRAPED_FIELDS = ("subtitle", "description", "publisher", "pages",
+                       "language", "subject")
+
+
+def _permalink_slug(permalink: str) -> str:
+    if "/catalog/" not in (permalink or ""):
+        return ""  # drafts only have ?post_type=...&p= permalinks
+    return permalink.rstrip("/").rsplit("/", 1)[-1]
+
+
 def _merged_whl_rows() -> list[dict]:
-    """Base CSV rows with the corrections overlay applied; added rows first."""
+    """Base CSV rows + scraped website metadata + the corrections overlay
+    (in that precedence order); added rows first."""
     base = [dict(r) for r in _load_whl_base()]
+    scraped = whl_scrape.load_scraped()
+    if scraped:
+        for r in base:
+            s = scraped.get(_permalink_slug(r.get("permalink", "")))
+            if not s:
+                continue
+            r["scraped"] = True
+            for f in _WHL_SCRAPED_FIELDS:
+                if s.get(f):
+                    r[f] = s[f]
+            # Scraped authors/year are authoritative where the CSV is blank.
+            for f in ("authors", "year"):
+                if not r.get(f) and s.get(f):
+                    r[f] = s[f]
     corr = lib.load_json(WHL_CORRECTIONS_PATH, {})
     for sidx, edits in (corr.get("edits") or {}).items():
         try:
@@ -647,6 +679,39 @@ def _merged_whl_rows() -> list[dict]:
 def api_whl_catalog():
     return jsonify({"rows": _merged_whl_rows(),
                     "corrections": str(WHL_CORRECTIONS_PATH.name)})
+
+
+# --- WHL website metadata scrape (background job) --------------------------------
+
+_scrape_job: dict = {"status": "idle"}
+_scrape_lock = threading.Lock()
+
+
+def _run_scrape() -> None:
+    try:
+        whl_scrape.scrape_all(_scrape_job)
+        _scrape_job["status"] = "done"
+    except Exception as exc:
+        _scrape_job["status"] = "error"
+        _scrape_job["error"] = f"{type(exc).__name__}: {exc}"
+
+
+@app.route("/api/whl_scrape", methods=["POST"])
+def api_whl_scrape_start():
+    with _scrape_lock:
+        if _scrape_job.get("status") == "running":
+            return jsonify(_scrape_job)
+        _scrape_job.clear()
+        _scrape_job.update({"status": "running", "page": 0, "pages": 0, "records": 0})
+        threading.Thread(target=_run_scrape, daemon=True).start()
+    return jsonify(_scrape_job)
+
+
+@app.route("/api/whl_scrape/status")
+def api_whl_scrape_status():
+    out = dict(_scrape_job)
+    out["scraped_total"] = len(whl_scrape.load_scraped())
+    return jsonify(out)
 
 
 @app.route("/api/whl_catalog", methods=["POST"])

@@ -1173,9 +1173,12 @@ function chToRecord(b) {
 function whlToRecord(r) {
   return {
     _src: "whl", _idx: r.idx,
-    title: r.title, subtitle: "", author: r.authors, publisher: "", city: "",
-    year: r.year, edition: "", volume: "", language: "", pages: "",
-    categories: "", notes: "", status: r.status, url: r.permalink || "",
+    title: r.title, subtitle: r.subtitle || "", author: r.authors,
+    publisher: r.publisher || "", city: "",
+    year: r.year, edition: "", volume: "", language: r.language || "",
+    pages: r.pages || "", subject: r.subject || "",
+    categories: r.categories || "", notes: r.description || "",
+    status: r.status, url: r.permalink || "",
   };
 }
 
@@ -1196,10 +1199,10 @@ const TIP_FIELDS = [
   ["title", "TITLE"], ["subtitle", "SUBTITLE"], ["author", "AUTHOR"],
   ["publisher", "PUBLISHER"], ["city", "CITY"], ["year", "YEAR"],
   ["edition", "EDITION"], ["volume", "VOLUME"], ["language", "LANGUAGE"],
-  ["pages", "PAGES"], ["condition", "CONDITION"], ["price", "PRICE"],
-  ["illustrations", "ILLUSTRATIONS"], ["categories", "CATEGORIES"],
-  ["notes", "NOTES"], ["status", "STATUS"], ["acquired", "ACQUIRED"],
-  ["url", "URL"],
+  ["pages", "PAGES"], ["subject", "SUBJECT"], ["condition", "CONDITION"],
+  ["price", "PRICE"], ["illustrations", "ILLUSTRATIONS"],
+  ["categories", "CATEGORIES"], ["notes", "NOTES"], ["status", "STATUS"],
+  ["acquired", "ACQUIRED"], ["url", "URL"],
 ];
 
 function recordTip(rec, header) {
@@ -1506,7 +1509,8 @@ async function renderTop() {
   }
 }
 
-const WHL_ROW_FIELDS = ["title", "subtitle", "authors", "year", "categories", "description"];
+const WHL_ROW_FIELDS = ["title", "subtitle", "authors", "year", "publisher",
+  "pages", "language", "subject", "categories", "description"];
 
 function whlMode() { return state.settings.whlMode === "search" ? "search" : "edit"; }
 
@@ -1529,6 +1533,7 @@ function renderWhlTop() {
   btn.hidden = state.settings.topTable !== "whl";
   btn.textContent = `MODE: ${mode.toUpperCase()} (CTRL+E)`;
   el("whl-cons").hidden = state.settings.topTable !== "whl" || mode !== "search";
+  el("whl-scrape").hidden = state.settings.topTable !== "whl";
   const q = findQuery();
   const rows = (state.whlRows || [])
     .filter((r) => matchesFind(q, `${r.title} ${r.subtitle || ""}`, r.authors, r.year));
@@ -1549,12 +1554,15 @@ function renderWhlTop() {
         ? "WHL ROW — click a cell to edit; Ctrl+click for the full editor"
         : "WHL ROW — click the title to search Open Library for it");
     tr.innerHTML = `
-      <td>${r.added ? "ADDED" : r.corrected ? "EDITED" : "CSV"}</td>
+      <td>${r.added ? "ADDED" : r.corrected ? "EDITED" : r.scraped ? "WEB" : "CSV"}</td>
       <td${editable(r, "title")}${mode === "search" ? ' data-wsearch="1"' : ""}>${esc(r.title)}</td>
       <td${editable(r, "subtitle")}>${esc(r.subtitle || "")}</td>
       <td${editable(r, "authors")}>${esc(r.authors)}</td>
       <td${editable(r, "year")}>${esc(r.year)}</td>
-      <td${editable(r, "categories")}>${esc(r.categories || "")}</td>
+      <td${editable(r, "publisher")}>${esc(r.publisher || "")}</td>
+      <td${editable(r, "pages")}>${esc(r.pages || "")}</td>
+      <td${editable(r, "language")}>${esc(r.language || "")}</td>
+      <td${editable(r, "subject")}>${esc(r.subject || "")}</td>
       <td${editable(r, "description")}>${esc(r.description || "")}</td>
       <td class="col-whl">${r.permalink
         ? badge(r.status === "publish" ? "available" : "missing",
@@ -1676,6 +1684,44 @@ function openWhlEditTab(idx) {
   el("whledit-msg").textContent = "";
   switchPaneTab("pane-whledit");
   el("w-title").focus();
+}
+
+// --- WHL website metadata scrape --
+
+let scrapePoll = null;
+async function startWhlScrape() {
+  const btn = el("whl-scrape");
+  btn.disabled = true;
+  try {
+    await fetch("/api/whl_scrape", { method: "POST" });
+  } catch (e) {
+    btn.disabled = false;
+    status("SCRAPE FAILED TO START");
+    return;
+  }
+  status("SCRAPING WHL WEBSITE METADATA ...");
+  if (scrapePoll) clearInterval(scrapePoll);
+  scrapePoll = setInterval(async () => {
+    let s;
+    try {
+      s = await (await fetch("/api/whl_scrape/status")).json();
+    } catch (e) { return; }
+    if (s.status === "running") {
+      status(`SCRAPING WHL :: PAGE ${s.page}/${s.pages || "?"} — ${s.records || 0} BOOKS`);
+      return;
+    }
+    clearInterval(scrapePoll);
+    scrapePoll = null;
+    btn.disabled = false;
+    if (s.status === "error") {
+      status(`SCRAPE ERROR :: ${s.error || "unknown"}`);
+      return;
+    }
+    await loadWhlRows(true);
+    renderWhlTop();
+    renderBottomRows();
+    status(`SCRAPE COMPLETE :: ${s.scraped_total || 0} PUBLISHED BOOKS HAVE FULL METADATA`);
+  }, 1500);
 }
 
 async function saveWhlEditTab(ev) {
@@ -2555,6 +2601,7 @@ function init() {
   el("top-table").addEventListener("change", () => switchTopTable(el("top-table").value));
   el("whl-mode").addEventListener("click", () =>
     setWhlMode(whlMode() === "edit" ? "search" : "edit"));
+  el("whl-scrape").addEventListener("click", startWhlScrape);
 
   // which columns constrain the search-mode Open Library lookup
   const cons = state.settings.whlCons = state.settings.whlCons ||

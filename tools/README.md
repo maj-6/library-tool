@@ -15,6 +15,9 @@ local web app to review and finalize each book's metadata.
 - `catalog_checks.py` - offline copyright + WHL-catalogue checks (loaders,
   indexes, and the shared cross-database identity test).
 - `scan_search.py` - Internet Archive + HathiTrust scan search + JSON CLI.
+- `whl_scrape.py` - scrapes complete metadata for every published WHL book
+  (publisher, print length, subtitle, description, language, subject) via
+  the site's WordPress REST API into `output/whl_scraped.json`.
 - `build_ol_index.py` - converts the Open Library works dump into
   `output/ol_works.db` (fallback index; also feeds author keys to the build
   below).
@@ -161,8 +164,12 @@ The right side of the checked tab is two panes:
 - **Top pane** (dropdown): the working table with dedicated logic —
   `CHECKED BOOKS + MANUAL` (checks, scans, marks, verification, editing) or
   `WHL CATALOG (EDITABLE)` with the full column set (title, subtitle,
-  authors, year, categories, description, status; subtitle/description start
-  empty — the export lacks them — and are filled via corrections).
+  authors, year, publisher, pages, language, subject, description, status).
+  `SCRAPE WHL` fetches the complete metadata for every published book from
+  the website's REST API (~2 min for the whole catalogue, incremental and
+  resumable; rows gain SRC `WEB`); draft entries have no public page, so
+  their extra fields stay empty. Scraped values sit under your corrections
+  in precedence and everything remains editable.
   Corrections never touch `whl_catalog.csv`; they live in
   `output/whl_corrections.json` (corrected/added rows are shaded and tagged).
   The WHL view has two modes, toggled with **Ctrl+E**: in EDIT mode click a

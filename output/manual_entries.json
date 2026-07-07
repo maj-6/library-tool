@@ -1375,5 +1375,440 @@
       },
       "checked_at": "2026-07-05T21:41:03+00:00"
     }
+  },
+  "3f3afadd9182": {
+    "title": "A Dictionary Of The Economic Products Of India",
+    "author": "George Watt",
+    "publisher": "W H Allen & Co",
+    "city": "",
+    "year": "1890",
+    "edition": "",
+    "volume": "",
+    "language": "eng",
+    "pages": "548",
+    "condition": "",
+    "price": "",
+    "illustrations": "",
+    "categories": "",
+    "notes": "From Open Library: https://openlibrary.org/books/OL58913836M",
+    "id": "3f3afadd9182",
+    "created_at": "2026-07-06T22:35:50+00:00",
+    "checks": {
+      "copyright_status": "Public domain (published 1890)",
+      "checked_at": "2026-07-06T22:35:50+00:00",
+      "in_whl": "yes",
+      "whl_match": {
+        "title": "Dictionary of the Economic Products of India",
+        "author": "George Watt",
+        "year": "2014",
+        "status": "publish",
+        "permalink": "https://worldherblibrary.org/catalog/"
+      }
+    },
+    "scans": {
+      "query_title": "A Dictionary Of The Economic Products Of India",
+      "query_author": "George Watt",
+      "query_year": "1890",
+      "internet_archive": {
+        "available": true,
+        "best_match": {
+          "identifier": "lbg.660.wat.4726",
+          "title": "A Dictionary Of The Economic Products Of India",
+          "author": "George Watt",
+          "year": "1890",
+          "url": "https://archive.org/details/lbg.660.wat.4726",
+          "accuracy": 1.0
+        },
+        "matches": [
+          {
+            "identifier": "lbg.660.wat.4726",
+            "title": "A Dictionary Of The Economic Products Of India",
+            "author": "George Watt",
+            "year": "1890",
+            "url": "https://archive.org/details/lbg.660.wat.4726",
+            "accuracy": 1.0
+          },
+          {
+            "identifier": "in.ernet.dli.2015.83717",
+            "title": "A Dictionary Of The Economic Products Of India Vol 4",
+            "author": "George Watt",
+            "year": "1890",
+            "url": "https://archive.org/details/in.ernet.dli.2015.83717",
+            "accuracy": 1.0
+          },
+          {
+            "identifier": "in.ernet.dli.2015.206831",
+            "title": "A Dictionary Of The Economic Products Of India Vol-VI Part-I",
+            "author": "George Watt",
+            "year": "1892",
+            "url": "https://archive.org/details/in.ernet.dli.2015.206831",
+            "accuracy": 0.8
+          },
+          {
+            "identifier": "in.ernet.dli.2015.31091",
+            "title": "A Dictionary Of The Economic Products Of India Vol 1",
+            "author": "Watt, George",
+            "year": "1889",
+            "url": "https://archive.org/details/in.ernet.dli.2015.31091",
+            "accuracy": 0.8
+          },
+          {
+            "identifier": "in.ernet.dli.2015.36102",
+            "title": "A Dictionary Of The Economic Products Of India",
+            "author": "George Watt,",
+            "year": "1893",
+            "url": "https://archive.org/details/in.ernet.dli.2015.36102",
+            "accuracy": 0.8
+          }
+        ],
+        "search_url": "https://archive.org/search?query=A+Dictionary+Of+The+Economic+Products+Of+India+George+Watt"
+      },
+      "hathitrust": {
+        "available": true,
+        "full_view": true,
+        "best_match": {
+          "title": "A dictionary of the economic products of India",
+          "year": "1889",
+          "record_url": "https://catalog.hathitrust.org/Record/100389723",
+          "items": [
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044082002510",
+              "rights": "Full view",
+              "volume": "v.1"
+            },
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044105533574",
+              "rights": "Full view",
+              "volume": "v.2"
+            },
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044105533582",
+              "rights": "Full view",
+              "volume": "v.3"
+            },
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044105533590",
+              "rights": "Full view",
+              "volume": "v.4"
+            },
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044105533608",
+              "rights": "Full view",
+              "volume": "v.5"
+            },
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044105533616",
+              "rights": "Full view",
+              "volume": "v.6:pt.1"
+            },
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044093614972",
+              "rights": "Full view",
+              "volume": "v.6:pt.2"
+            },
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044105533624",
+              "rights": "Full view",
+              "volume": "v.6:pt.3"
+            },
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044105533632",
+              "rights": "Full view",
+              "volume": "v.6:pt.4"
+            }
+          ],
+          "full_view": true,
+          "accuracy": 0.714
+        },
+        "matches": [
+          {
+            "title": "A dictionary of the economic products of India",
+            "year": "1889",
+            "record_url": "https://catalog.hathitrust.org/Record/100389723",
+            "items": [
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044082002510",
+                "rights": "Full view",
+                "volume": "v.1"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044105533574",
+                "rights": "Full view",
+                "volume": "v.2"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044105533582",
+                "rights": "Full view",
+                "volume": "v.3"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044105533590",
+                "rights": "Full view",
+                "volume": "v.4"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044105533608",
+                "rights": "Full view",
+                "volume": "v.5"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044105533616",
+                "rights": "Full view",
+                "volume": "v.6:pt.1"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044093614972",
+                "rights": "Full view",
+                "volume": "v.6:pt.2"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044105533624",
+                "rights": "Full view",
+                "volume": "v.6:pt.3"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044105533632",
+                "rights": "Full view",
+                "volume": "v.6:pt.4"
+              }
+            ],
+            "full_view": true,
+            "accuracy": 0.714
+          },
+          {
+            "title": "A dictionary of the economic products of India",
+            "year": "1889",
+            "record_url": "https://catalog.hathitrust.org/Record/100389723",
+            "items": [
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044082002510",
+                "rights": "Full view",
+                "volume": "v.1"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044105533574",
+                "rights": "Full view",
+                "volume": "v.2"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044105533582",
+                "rights": "Full view",
+                "volume": "v.3"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044105533590",
+                "rights": "Full view",
+                "volume": "v.4"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044105533608",
+                "rights": "Full view",
+                "volume": "v.5"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044105533616",
+                "rights": "Full view",
+                "volume": "v.6:pt.1"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044093614972",
+                "rights": "Full view",
+                "volume": "v.6:pt.2"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044105533624",
+                "rights": "Full view",
+                "volume": "v.6:pt.3"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=hvd.32044105533632",
+                "rights": "Full view",
+                "volume": "v.6:pt.4"
+              }
+            ],
+            "full_view": true,
+            "accuracy": 0.714
+          },
+          {
+            "title": "A dictionary of the economic products of India",
+            "year": "1889",
+            "record_url": "https://catalog.hathitrust.org/Record/006089422",
+            "items": [
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=wu.89090750647",
+                "rights": "Full view",
+                "volume": "v.1"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.$b548440",
+                "rights": "Full view",
+                "volume": "v.1"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.$b548441",
+                "rights": "Full view",
+                "volume": "v.2"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=nyp.33433023187606",
+                "rights": "Full view",
+                "volume": "v. 2 (1889)"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=wu.89096246905",
+                "rights": "Full view",
+                "volume": "v.3"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.$b548442",
+                "rights": "Full view",
+                "volume": "v.3"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=nyp.33433023187614",
+                "rights": "Full view",
+                "volume": "v. 3 (1890)"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=wu.89090750613",
+                "rights": "Full view",
+                "volume": "v.4"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.$b548443",
+                "rights": "Full view",
+                "volume": "v.4"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=nyp.33433023187622",
+                "rights": "Full view",
+                "volume": "v. 4 (1890)"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=wu.89096246913",
+                "rights": "Full view",
+                "volume": "v.5"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.$b548444",
+                "rights": "Full view",
+                "volume": "v.5"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=wu.89096246921",
+                "rights": "Full view",
+                "volume": "v.6:1"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.$b548445",
+                "rights": "Full view",
+                "volume": "v.6:1"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=nyp.33433023187648",
+                "rights": "Full view",
+                "volume": "v. 6, pt. 1 (1892)"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=wu.89083868661",
+                "rights": "Full view",
+                "volume": "v.6:2"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.$b548446",
+                "rights": "Full view",
+                "volume": "v.6:2"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=nyp.33433023187655",
+                "rights": "Full view",
+                "volume": "v. 6, pt. 2 (1893)"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=wu.89090750589",
+                "rights": "Full view",
+                "volume": "v.6:3"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.$b548447",
+                "rights": "Full view",
+                "volume": "v.6:3"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=nyp.33433023187663",
+                "rights": "Full view",
+                "volume": "v. 6,  pt. 3 (1893)"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=wu.89096246939",
+                "rights": "Full view",
+                "volume": "v.6:4"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.$b548448",
+                "rights": "Full view",
+                "volume": "v.6:4"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=wu.89096246947",
+                "rights": "Full view",
+                "volume": "v.7"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.$b555512",
+                "rights": "Full view",
+                "volume": "v.7"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.31158012426291",
+                "rights": "Full view",
+                "volume": "v.02"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uc1.l0084028919",
+                "rights": "Full view",
+                "volume": "v.06 pt.03"
+              }
+            ],
+            "full_view": true,
+            "accuracy": 0.714
+          },
+          {
+            "title": "A dictionary of the economic products of India",
+            "year": "1972",
+            "record_url": "https://catalog.hathitrust.org/Record/012155610",
+            "items": [
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uiug.30112045048631",
+                "rights": "Limited (search-only)",
+                "volume": "INDEX"
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=umn.31951002433468m",
+                "rights": "Limited (search-only)",
+                "volume": ""
+              },
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=uiug.30112100068219",
+                "rights": "Limited (search-only)",
+                "volume": "v.5"
+              }
+            ],
+            "full_view": false,
+            "accuracy": 0.714
+          }
+        ],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=A+Dictionary+Of+The+Economic+Products+Of+India&type=title",
+        "oclcs_tried": [
+          "693648",
+          "1198245544",
+          "78454366",
+          "221075889",
+          "660015591",
+          "6353794"
+        ]
+      },
+      "checked_at": "2026-07-06T22:35:52+00:00"
+    }
   }
 }

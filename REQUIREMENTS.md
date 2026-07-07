@@ -142,6 +142,13 @@ is decided by a tolerant composite rather than exact strings:
   the top-pane table with column mapping.
 - FIND syntax: `@token` = author (last name), `#token` = publication year,
   plain text = title words.
+- WHL metadata scrape: `tools/whl_scrape.py` pages through the site's open
+  WordPress REST API (whl_catalog post type, ACF fields + embedded taxonomy
+  terms) and stores publisher / print length / subtitle / description /
+  language / subject per published book in `output/whl_scraped.json`, keyed
+  by permalink slug. Drafts are not exposed by the API and stay empty. The
+  explorer merges: CSV < scraped < corrections; SCRAPE WHL button runs it
+  as a background job with progress.
 - Undo/Redo (Ctrl+Z / Ctrl+Y + titlebar buttons; 100-step session history):
   inverse operations for client state (snapshot restore of the checked map)
   and server-backed changes (manual entry create/delete/edit via a restore
