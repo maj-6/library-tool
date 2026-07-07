@@ -56,6 +56,7 @@
   <div id="tabs">
     <button class="tab active" data-tab="checked">Catalogs</button>
     <button class="tab" data-tab="upload">Editor</button>
+    <button class="tab" data-tab="ocr">OCR</button>
     <span class="tb-spacer"></span>
     <div class="tb-group">
       <button id="undo-btn" class="tool-btn icon-btn" type="button" disabled
@@ -377,7 +378,7 @@
                   <th>LANG</th>
                   <th>SUBJECT</th>
                   <th>DESCRIPTION</th>
-                  <th>STATUS</th>
+                  <th class="col-whl">STATUS</th>
                 </tr>
               </thead>
               <tbody id="whltop-rows"></tbody>
@@ -405,12 +406,12 @@
                   <th data-col="acquired">ACQ</th>
                   <th data-col="categories">CATEGORIES</th>
                   <th data-col="notes">NOTES</th>
-                  <th data-col="copyright">COPYRIGHT</th>
-                  <th data-col="whl">WHL</th>
-                  <th data-col="ia">IA</th>
-                  <th data-col="ht">HT</th>
-                  <th data-col="mark">MARK</th>
-                  <th class="col-act" data-col="action">ACTION</th>
+                  <th class="col-whl" data-col="copyright" data-tip="COPYRIGHT">(C)</th>
+                  <th class="col-whl" data-col="whl">WHL</th>
+                  <th class="col-whl" data-col="ia">IA</th>
+                  <th class="col-whl" data-col="ht">HT</th>
+                  <th class="col-whl" data-col="mark">MARK</th>
+                  <th class="col-act" data-col="action" data-tip="ACTIONS"></th>
                 </tr>
               </thead>
               <tbody id="checked-rows"></tbody>
@@ -480,7 +481,7 @@
                     <label class="tool-label" for="b-subtitle">SUBTITLE</label>
                     <input id="b-subtitle" class="cad-input" />
                   </div>
-                  <div class="mf-field">
+                  <div class="mf-field mf-third">
                     <label class="tool-label" for="b-authors">AUTHORS</label>
                     <input id="b-authors" class="cad-input" />
                   </div>
@@ -508,8 +509,8 @@
                     <label class="tool-label" for="b-pages">PAGES</label>
                     <input id="b-pages" class="cad-input" />
                   </div>
-                  <div class="mf-field">
-                    <label class="tool-label" for="b-categories">CATEGORIES / SUBJECT</label>
+                  <div class="mf-field mf-third">
+                    <label class="tool-label" for="b-categories">CATEGORIES</label>
                     <input id="b-categories" class="cad-input" />
                   </div>
                   <div class="mf-field mf-full">
@@ -555,6 +556,16 @@
                       data-icon="attach" data-tip="Attach"></button>
               <span class="tool-label" id="b-src-msg"></span>
             </div>
+            <div class="src-row">
+              <label class="tool-label">OCR</label>
+              <span id="b-ocr-list" class="ocr-chiplist"></span>
+              <span class="bar-spacer"></span>
+              <button id="b-ocr-load" class="cad-btn tiny icon-btn" type="button"
+                      data-icon="fileup" data-tip="Load an OCR text file"></button>
+              <button id="b-folder" class="cad-btn tiny icon-btn" type="button"
+                      data-icon="foldersync" data-tip="Create/refresh the entry folder (metadata, PDF preview, extracted OCR)"></button>
+              <input id="b-ocr-file" type="file" accept=".txt,.text,.md" hidden />
+            </div>
             <div id="b-pdf-viewer"></div>
           </div>
         </div>
@@ -579,13 +590,79 @@
                 <th>YEAR</th>
                 <th>ARCHIVE</th>
                 <th>MATCHED RECORD</th>
-                <th class="col-act">ACTION</th>
+                <th class="col-act" data-tip="ACTIONS"></th>
               </tr>
             </thead>
             <tbody id="upload-rows"></tbody>
           </table>
           <p id="upload-empty" class="empty">NO VERIFIED SOURCES</p>
         </div>
+      </div>
+    </section>
+    <!-- OCR: processing, reviewing, and editing OCR data -->
+    <section id="ocr" class="panel-view">
+      <div id="ocr-split">
+        <div id="ocr-side">
+          <div class="pane-bar"><span class="tool-label">DOCUMENTS</span>
+            <span class="bar-spacer"></span>
+            <button id="ocr-load-file" class="cad-btn tiny icon-btn" type="button"
+                    data-icon="fileup" data-tip="Load OCR text files"></button>
+            <button id="ocr-load-folder" class="cad-btn tiny icon-btn" type="button"
+                    data-icon="folder" data-tip="Load a book folder"></button>
+            <input id="ocr-file-input" type="file" accept=".txt,.text,.md" multiple hidden />
+          </div>
+          <div class="drafting" id="ocr-doc-wrap">
+            <ul id="ocr-docs"></ul>
+            <p id="ocr-docs-empty" class="empty">NO DOCUMENTS</p>
+          </div>
+        </div>
+        <div id="ocr-mainpane">
+          <div class="pane-bar">
+            <button id="ocr-view-edit" class="cad-btn tiny active" type="button">EDIT</button>
+            <button id="ocr-view-diff" class="cad-btn tiny" type="button">DIFF</button>
+            <select id="ocr-diff-with" class="cad-input" data-tip="Compare against"></select>
+            <span class="tb-sep"></span>
+            <input id="ocr-find" class="cad-input" placeholder="find" />
+            <input id="ocr-replace" class="cad-input" placeholder="replace" />
+            <button id="ocr-find-next" class="cad-btn tiny" type="button">FIND</button>
+            <button id="ocr-replace-all" class="cad-btn tiny" type="button">REPLACE ALL</button>
+            <span class="tb-sep"></span>
+            <label class="tool-label" for="ocr-quality">QUALITY</label>
+            <select id="ocr-quality" class="cad-input">
+              <option value="">&mdash;</option>
+              <option value="excellent">EXCELLENT</option>
+              <option value="good">GOOD</option>
+              <option value="fair">FAIR</option>
+              <option value="poor">POOR</option>
+            </select>
+            <span class="bar-spacer"></span>
+            <button id="ocr-set-active" class="cad-btn tiny" type="button"
+                    data-tip="Mark this file as the entry's active OCR">SET ACTIVE</button>
+            <button id="ocr-save" class="cad-btn tiny icon-btn" type="button"
+                    data-icon="save" data-tip="Save to the entry folder"></button>
+            <span class="tool-label" id="ocr-msg"></span>
+          </div>
+          <textarea id="ocr-editor" class="cad-input" spellcheck="false"></textarea>
+          <div class="drafting" id="ocr-diff" hidden></div>
+        </div>
+      </div>
+      <div class="pane-bar">
+        <span class="tool-label">OCR QUEUE</span>
+        <span class="tb-sep"></span>
+        <select id="ocr-service" class="cad-input">
+          <option value="azure">AZURE DOCUMENT INTELLIGENCE</option>
+          <option value="openai">OPENAI VISION</option>
+          <option value="tesseract">TESSERACT (LOCAL)</option>
+        </select>
+        <button id="ocr-queue-add" class="cad-btn tiny" type="button">QUEUE</button>
+        <span class="tool-count" id="ocr-queue-count"></span>
+      </div>
+      <div class="drafting" id="ocr-queue-wrap">
+        <table class="grid" id="ocr-queue-table">
+          <thead><tr><th>DOCUMENT</th><th>SERVICE</th><th>STATUS</th><th>SUBMITTED</th></tr></thead>
+          <tbody id="ocr-queue-rows"></tbody>
+        </table>
+        <p id="ocr-queue-empty" class="empty">NO OCR JOBS</p>
       </div>
     </section>
   </main>
@@ -681,6 +758,12 @@
             <div class="settings-rows">
               <label class="tool-label" for="set-whl-ocr">OCR PANEL IN WHL PDF VIEWER</label>
               <input id="set-whl-ocr" type="checkbox" />
+              <label class="tool-label" for="set-preview-pages">PDF PREVIEW PAGE LIMIT</label>
+              <input id="set-preview-pages" class="cad-input" type="number" min="1" max="500" step="5" />
+              <label class="tool-label" for="set-preview-original">PREVIEW ORIGINAL (UNMODIFIED) PDF</label>
+              <input id="set-preview-original" type="checkbox" />
+              <label class="tool-label" for="set-keep-originals">KEEP IA ORIGINALS AFTER FOLDER BUILD</label>
+              <input id="set-keep-originals" type="checkbox" />
             </div>
             <div class="mf-actions">
               <button id="reset-settings" class="cad-btn danger" type="button">RESTORE DEFAULT SETTINGS</button>

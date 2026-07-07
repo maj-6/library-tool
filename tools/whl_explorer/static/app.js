@@ -74,6 +74,7 @@ const state = {
   uploadSources: [],          // approved sources as last rendered
   builds: {},                 // book builder entries (id -> build)
   buildSel: null,             // selected build id
+  buildFolder: null,          // entry-folder info for the selected build
   downloads: new Map(),
   dlTimers: new Map(),
   downloadedIds: new Set(),
@@ -90,6 +91,9 @@ const state = {
     uploadSplitH: null, pdfBrowseDir: "",
     maxRows: 400,               // row cap for the big table views
     whlModalOcr: false,         // OCR panel in the WHL publication viewer
+    previewPages: 20,           // page cap for PDF preview derivatives
+    previewOriginal: false,     // view the original PDF instead of a preview
+    keepOriginals: true,        // keep IA originals after a folder build
     colVis: {},                 // per-table column visibility
     colWidths: {},              // per-table column widths (px)
     whlCons: { title: false, authors: false, year: true },
@@ -232,6 +236,7 @@ const ICONS = {
   text: _SVG('<path d="M2.5 3.5 h11 M2.5 6.5 h11 M2.5 9.5 h8 M2.5 12.5 h10"/>'),
   sparkle: _SVG('<path d="M8 1.8 L9.5 6.5 L14.2 8 L9.5 9.5 L8 14.2 L6.5 9.5 L1.8 8 L6.5 6.5 Z"/><path d="M12.8 2 v2.6 M11.5 3.3 h2.6"/>'),
   fileup: _SVG('<path d="M3.5 2 h6 l3 3 v9 h-9 Z"/><path d="M9.5 2 v3 h3"/><path d="M8 11.5 V7.5 M6.2 9.2 L8 7.4 L9.8 9.2"/>'),
+  foldersync: _SVG('<path d="M2 4 h4.4 l1.4 1.8 H14 v7 H2 Z"/><path d="M6 9.4 a2.2 2.2 0 0 1 4.2-.8 M10.4 9.6 a2.2 2.2 0 0 1-4.2.8"/><path d="M10.6 7.4 v1.4 h-1.4 M5.8 11.6 v-1.4 h1.4"/>'),
 };
 
 function injectIcons() {
@@ -360,7 +365,7 @@ function maxRows() { return state.settings.maxRows || 400; }
 
 // --- tabs + header -----------------------------------------------------------
 
-const TAB_TITLES = { checked: "Catalogs", upload: "Editor" };
+const TAB_TITLES = { checked: "Catalogs", upload: "Editor", ocr: "OCR" };
 
 function setHeader(tabId) {
   const name = `${TAB_TITLES[tabId] || ""} :: Catalog Explorer`;
@@ -380,6 +385,7 @@ function initTabs() {
       setHeader(tab.dataset.tab);
       if (tab.dataset.tab === "checked") renderChecked();
       if (tab.dataset.tab === "upload") renderUpload();
+      if (tab.dataset.tab === "ocr") renderOcrTab();
     });
   }
   setHeader("checked");
@@ -406,6 +412,13 @@ function initTooltips() {
   document.addEventListener("mouseover", (ev) => {
     const tagged = ev.target.closest("[data-tip]");
     if (tagged) { showTip(tagged.dataset.tip, ev.clientX, ev.clientY); return; }
+    // an overflowing form field shows its full value
+    if (ev.target.tagName === "INPUT" && ev.target.classList.contains("cad-input") &&
+        ev.target.type !== "password" &&
+        ev.target.scrollWidth > ev.target.clientWidth + 1 && ev.target.value) {
+      showTip(ev.target.value, ev.clientX, ev.clientY);
+      return;
+    }
     const td = ev.target.closest("td, th");
     if (td && !td.querySelector("input") && td.scrollWidth > td.clientWidth + 1) {
       showTip(td.textContent.trim(), ev.clientX, ev.clientY);
@@ -434,11 +447,24 @@ const UPLOAD_COLS = [
   ["record", "MATCHED RECORD"], ["action", "ACTION"],
 ];
 
+// tag/action columns have LOCKED widths (compact, not resizable); one
+// column per table stretches to absorb leftover width so the table never
+// leaves empty space on its right.
+const LOCKED_COLS = {
+  checked: { copyright: 58, whl: 58, ia: 58, ht: 58, mark: 58, action: 40 },
+  whl: { status: 58 },
+  upload: { action: 40 },
+};
+const STRETCH_COL = { checked: "notes", whl: "description", upload: "record" };
+
 function tableDef(key) {
   switch (key) {
-    case "checked": return { tableId: "checked-table", cols: CHECKED_COLS };
-    case "whl": return { tableId: "whltop-table", cols: WHL_COLS };
-    case "upload": return { tableId: "upload-table", cols: UPLOAD_COLS };
+    case "checked": return { tableId: "checked-table", cols: CHECKED_COLS,
+                             locked: LOCKED_COLS.checked, stretch: STRETCH_COL.checked };
+    case "whl": return { tableId: "whltop-table", cols: WHL_COLS,
+                         locked: LOCKED_COLS.whl, stretch: STRETCH_COL.whl };
+    case "upload": return { tableId: "upload-table", cols: UPLOAD_COLS,
+                            locked: LOCKED_COLS.upload, stretch: STRETCH_COL.upload };
     default: {
       // bottom pane tables: b-ol / b-ch / b-whl
       const t = key.slice(2);
@@ -446,6 +472,8 @@ function tableDef(key) {
       return def ? {
         tableId: "bottom-table",
         cols: def.cols.map((label, i) => ["c" + i, label]),
+        locked: {},
+        stretch: "c" + (def.cols.length - 1),
       } : null;
     }
   }
@@ -462,30 +490,61 @@ function applyTableChrome(key) {
   if (!table) return;
   const vis = state.settings.colVis[key] || {};
   const widths = state.settings.colWidths[key] || {};
+  const locked = def.locked || {};
   const sized = Object.keys(widths).length > 0;
   const ths = [...table.querySelectorAll("thead th")];
   const hide = def.cols.map(([k]) => vis[k] === false);
   let total = 0;
+  let stretchTh = null;
   ths.forEach((th, i) => {
+    const ck = colKeyAt(def, i);
     th.style.display = hide[i] ? "none" : "";
-    let w = widths[colKeyAt(def, i)];
-    if (sized && !w && !hide[i]) w = 110;  // column re-shown after sizing
+    th.classList.toggle("col-locked", ck in locked);
+    let w;
+    if (ck in locked) {
+      w = locked[ck];             // locked columns never change width
+    } else {
+      w = widths[ck];
+      if (sized && !w && !hide[i]) w = 110;  // column re-shown after sizing
+    }
     th.style.width = sized && w ? w + "px" : "";
     if (!hide[i] && w) total += w;
-    if (!th.querySelector(".col-rz")) {
+    if (!hide[i] && ck === def.stretch) stretchTh = th;
+    const grip = th.querySelector(".col-rz");
+    if (ck in locked) {
+      if (grip) grip.remove();
+    } else if (!grip) {
       const rz = document.createElement("span");
       rz.className = "col-rz";
       rz.dataset.ci = i;
       th.appendChild(rz);
     }
   });
+  // stretch column hidden: the last visible unlocked column absorbs instead
+  if (!stretchTh) {
+    for (let i = ths.length - 1; i >= 0; i--) {
+      if (!hide[i] && !(colKeyAt(def, i) in locked)) { stretchTh = ths[i]; break; }
+    }
+  }
   // Once any column has been resized, EVERY visible column carries an
   // explicit width and the table is sized to their sum — with fixed layout
-  // and a partial width set, the browser would redistribute the remaining
-  // space and every other column would jump around.
+  // and a partial width set the browser would redistribute the remaining
+  // space and every other column would jump around. Leftover container
+  // width goes to the stretch column so no empty space is left on the
+  // table's right.
   table.style.tableLayout = sized ? "fixed" : "";
-  table.style.width = sized ? total + "px" : "";
-  table.style.minWidth = sized ? "" : "";
+  if (sized) {
+    const wrap = table.closest(".drafting");
+    const avail = wrap ? wrap.clientWidth : 0;
+    if (stretchTh && avail > total + 2) {
+      const w = (parseInt(stretchTh.style.width, 10) || 110) + (avail - total);
+      stretchTh.style.width = w + "px";
+      total = avail;
+    }
+    table.style.width = total + "px";
+  } else {
+    table.style.width = "";
+  }
   table.dataset.ck = key;
   for (const tr of table.querySelectorAll("tbody tr")) {
     [...tr.children].forEach((td, i) => {
@@ -514,7 +573,9 @@ function initColResize() {
       widths = {};
       [...table.querySelectorAll("thead th")].forEach((h, i) => {
         if (h.style.display === "none") return;
-        widths[colKeyAt(def, i)] = h.offsetWidth;
+        const ck = colKeyAt(def, i);
+        if (def.locked && ck in def.locked) return;  // locked widths are constant
+        widths[ck] = h.offsetWidth;
       });
       state.settings.colWidths[key] = widths;
       applyTableChrome(key);
@@ -542,6 +603,9 @@ function initColResize() {
     if (!drag) return;
     if (drag.moved) {
       saveSettings();
+      // re-apply chrome so the stretch column reabsorbs leftover width —
+      // narrowing a column must not leave empty space on the table's right
+      applyTableChrome(drag.key);
       // the browser will still synthesize a click on the header — don't
       // let a resize end as a sort
       sortSuppress = true;
@@ -748,6 +812,23 @@ function renderSettings() {
     state.settings.whlModalOcr = ocr.checked;
     saveSettings();
   };
+  const pp = el("set-preview-pages");
+  pp.value = state.settings.previewPages || 20;
+  pp.onchange = () => {
+    state.settings.previewPages =
+      Math.max(1, Math.min(500, parseInt(pp.value, 10) || 20));
+    pp.value = state.settings.previewPages;
+    saveSettings();
+  };
+  for (const [id, k] of [["set-preview-original", "previewOriginal"],
+                         ["set-keep-originals", "keepOriginals"]]) {
+    const n = el(id);
+    n.checked = !!state.settings[k];
+    n.onchange = () => {
+      state.settings[k] = n.checked;
+      saveSettings();
+    };
+  }
 
   // APPEARANCE
   const themeSel = el("theme-select");
@@ -3006,7 +3087,9 @@ function createPdfViewer() {
       size.textContent = "";
       textSrc = opts.textSrc || "";
       ocrBtn.hidden = !textSrc;
-      if (ocrLoadedFor && ocrLoadedFor !== textSrc) ocrLoadedFor = "";
+      // OCR files are editable (OCR tab / re-upload), so a same-URL show()
+      // must refetch — only pane toggles within one view use the cache
+      ocrLoadedFor = "";
       setOcr(opts.ocr != null ? opts.ocr : ocrOn);
       const seq = ++sizeSeq;
       if (src.startsWith("/api/pdf")) {
@@ -3966,6 +4049,9 @@ async function saveBuildFields(ev) {
   }
   fields.description = buildDescMd.get();
   fields.status = el("b-ready").classList.contains("active") ? "ready" : "draft";
+  // saving verifies the currently active OCR file for this book
+  const cur = currentBuild();
+  if (cur && cur.ocr_active) fields.ocr_verified = cur.ocr_active;
   if (!fields.title) { el("build-msg").textContent = "TITLE IS REQUIRED"; return; }
   if (await patchBuild(id, fields, `edit build ${fields.title.slice(0, 30)}`)) {
     descState.id = id;
@@ -4113,9 +4199,67 @@ function iaIdentFromBuild(b) {
   return "";
 }
 
+// preview derivative (compressed + truncated) unless the user opted to
+// view the original unmodified PDF
+function pdfViewSrc(path) {
+  const base = pdfLocalSrc(path);
+  return state.settings.previewOriginal
+    ? base
+    : base + "&preview=1&pages=" + (state.settings.previewPages || 20);
+}
+
+// the active OCR file's text feeds the viewer's OCR pane; without one, the
+// folder's extracted.txt, then live extraction from the PDF itself
+function buildTextSrc(b) {
+  const files = (state.buildFolder && state.buildFolder.ocr) || [];
+  const name = (b.ocr_active && files.some((f) => f.name === b.ocr_active))
+    ? b.ocr_active
+    : (files.some((f) => f.name === "extracted.txt") ? "extracted.txt" : "");
+  if (name) {
+    return `/api/builds/${encodeURIComponent(b.id)}/ocr/` +
+      encodeURIComponent(name);
+  }
+  const localPath = (b.pdf_file || "").trim();
+  if (localPath) return "/api/pdf/text?path=" + encodeURIComponent(localPath);
+  const url = (b.pdf_source || "").trim();
+  if (/^https?:\/\//i.test(url)) return "/api/pdf/text?url=" + encodeURIComponent(url);
+  return "";
+}
+
+function renderOcrChips(b) {
+  const wrap = el("b-ocr-list");
+  wrap.innerHTML = "";
+  const folder = state.buildFolder;
+  const files = (folder && folder.ocr) || [];
+  for (const f of files) {
+    const chip = document.createElement("span");
+    chip.className = "ocr-chip" +
+      (b.ocr_active === f.name ? " active" : "") +
+      (b.ocr_verified === f.name ? " verified" : "");
+    chip.textContent = f.name.replace(/\.txt$/i, "") +
+      (b.ocr_verified === f.name ? " ✓" : "");
+    chip.dataset.tip = `${f.name} (${fmtSize(f.size)})` +
+      (b.ocr_active === f.name ? "\nACTIVE" : "\nClick to make active") +
+      (b.ocr_verified === f.name ? "\nVERIFIED" : "");
+    chip.dataset.ocr = f.name;
+    wrap.appendChild(chip);
+  }
+}
+
+async function loadBuildFolder(b) {
+  try {
+    state.buildFolder =
+      await (await fetch(`/api/builds/${encodeURIComponent(b.id)}/folder`)).json();
+  } catch (e) {
+    state.buildFolder = null;
+  }
+}
+
 async function refreshSourceTab() {
   const b = currentBuild();
   if (!b) return;
+  // the awaits below can outlive a build switch — never render stale data
+  const stale = () => state.buildSel !== b.id;
   let localPath = (b.pdf_file || "").trim();
   // auto-populate: a PDF that was auto-sourced from a URL and already
   // downloaded gets its local path attached without asking
@@ -4124,21 +4268,98 @@ async function refreshSourceTab() {
     if (ident && state.downloadedIds.has(ident)) {
       localPath = `downloads/ia/${ident}.pdf`;
       await patchBuildRaw(b.id, { pdf_file: localPath }, true);
+      if (stale()) return;
       el("b-src-msg").textContent = "LOCAL PDF ATTACHED AUTOMATICALLY";
     }
   }
   el("b-pdf_file").value = localPath;
+  await loadBuildFolder(b);
+  if (stale()) return;
+  renderOcrChips(b);
+  const textSrc = buildTextSrc(b);
   if (localPath) {
-    buildPdfViewer.show(pdfLocalSrc(localPath), localPath, {
-      textSrc: "/api/pdf/text?path=" + encodeURIComponent(localPath),
-    });
+    // an entry folder's preview.pdf is already a derivative — serve it as-is
+    const entryPrev = /^output[\/\\]entries[\/\\]/i.test(localPath);
+    const derived = !state.settings.previewOriginal && !entryPrev;
+    buildPdfViewer.show(
+      derived ? pdfViewSrc(localPath) : pdfLocalSrc(localPath),
+      localPath + (derived || entryPrev ? "  (preview)" : ""), { textSrc });
   } else if (/^https?:\/\//i.test((b.pdf_source || "").trim())) {
     const url = b.pdf_source.trim();
-    buildPdfViewer.show(url, url + "  (remote)", {
-      textSrc: "/api/pdf/text?url=" + encodeURIComponent(url),
-    });
+    buildPdfViewer.show(url, url + "  (remote)", { textSrc });
   } else {
     buildPdfViewer.clear("NO PDF");
+  }
+}
+
+// create/refresh the entry folder: metadata + PDF preview + extracted OCR
+async function syncBuildFolder() {
+  const b = currentBuild();
+  if (!b) return;
+  el("b-src-msg").textContent = "BUILDING FOLDER ...";
+  el("b-folder").disabled = true;
+  try {
+    const res = await fetch(`/api/builds/${encodeURIComponent(b.id)}/folder`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        pages: state.settings.previewPages || 20,
+        keep_original: state.settings.keepOriginals !== false,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (data.ok) {
+      state.buildFolder = data;
+      // the sync may have retired the IA original and repointed pdf_file
+      // at the folder's preview.pdf
+      if (data.build) state.builds[b.id] = data.build;
+      el("b-src-msg").textContent =
+        "FOLDER READY" + (data.notes && data.notes.length
+          ? " — " + data.notes.join("; ") : "");
+      status(`ENTRY FOLDER :: ${data.path}`);
+      if (state.buildSel === b.id) {
+        refreshSourceTab();
+        loadDownloads();  // the original may have been removed
+      }
+    } else {
+      el("b-src-msg").textContent = "FOLDER BUILD FAILED";
+    }
+  } catch (e) {
+    el("b-src-msg").textContent = "FOLDER BUILD FAILED";
+  } finally {
+    el("b-folder").disabled = false;
+  }
+}
+
+async function uploadOcrFile(file) {
+  const b = currentBuild();
+  if (!b || !file) return;
+  const forBuild = b.id;
+  const reader = new FileReader();
+  reader.onload = async () => {
+    const res = await fetch(`/api/builds/${encodeURIComponent(forBuild)}/ocr`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: file.name, text: String(reader.result || "") }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (data.ok && state.buildSel === forBuild) {
+      state.buildFolder = data.folder;
+      renderOcrChips(currentBuild());
+      el("b-src-msg").textContent = `OCR LOADED :: ${data.name}`;
+    }
+  };
+  reader.readAsText(file);
+}
+
+async function setActiveOcr(name) {
+  const b = currentBuild();
+  if (!b) return;
+  if (await patchBuildRaw(b.id, { ocr_active: name }, true)) {
+    renderOcrChips(currentBuild());
+    // point the viewer's OCR pane at the newly active file
+    refreshSourceTab();
+    status(`ACTIVE OCR :: ${name}`);
   }
 }
 
@@ -4163,6 +4384,322 @@ async function attachPdfFile(path) {
   } else {
     el("b-src-msg").textContent = "SAVE FAILED";
   }
+}
+
+// --- OCR tab: load, review, compare, and correct OCR text -------------------------
+// Cloud/local OCR processing (Azure Document Intelligence, OpenAI vision,
+// Tesseract) plugs into the queue later; the review/edit tooling is live.
+
+const ocrState = { docs: [], sel: null, view: "edit", jobs: [], seq: 0 };
+
+function ocrSelDoc() {
+  return ocrState.docs.find((d) => d.id === ocrState.sel) || null;
+}
+
+function ocrSyncEditor() {
+  const d = ocrSelDoc();
+  if (d && ocrState.view === "edit") d.text = el("ocr-editor").value;
+}
+
+function ocrAddDoc(name, text, buildId, fileName) {
+  ocrSyncEditor();
+  const id = "d" + (++ocrState.seq);
+  ocrState.docs.push({ id, name, text: String(text || ""),
+                       buildId: buildId || null, fileName: fileName || null });
+  ocrState.sel = id;
+  renderOcrTab();
+}
+
+function renderOcrDocs() {
+  const list = el("ocr-docs");
+  list.innerHTML = "";
+  el("ocr-docs-empty").hidden = ocrState.docs.length !== 0;
+  for (const d of ocrState.docs) {
+    const li = document.createElement("li");
+    li.className = "ocr-doc" + (d.id === ocrState.sel ? " active" : "");
+    li.dataset.did = d.id;
+    const build = d.buildId ? state.builds[d.buildId] : null;
+    li.innerHTML = `
+      <span class="bi-title">${esc(d.name)}</span>
+      <span class="bi-meta">${build ? esc((build.title || d.buildId).slice(0, 30)) : "local file"}
+        &middot; ${Math.max(1, Math.round(d.text.length / 1000))}k chars</span>`;
+    list.appendChild(li);
+  }
+}
+
+// a small line diff (LCS) — capped so huge scans stay responsive
+function diffLines(aText, bText) {
+  const CAP = 2500;
+  const A = aText.split("\n"), B = bText.split("\n");
+  const at = A.slice(0, CAP), bt = B.slice(0, CAP);
+  const n = at.length, m = bt.length;
+  const W = m + 1;
+  const dp = new Uint16Array((n + 1) * W);
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i * W + j] = at[i] === bt[j]
+        ? dp[(i + 1) * W + j + 1] + 1
+        : Math.max(dp[(i + 1) * W + j], dp[i * W + j + 1]);
+    }
+  }
+  const out = [];
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (at[i] === bt[j]) { out.push(["=", at[i]]); i++; j++; }
+    else if (dp[(i + 1) * W + j] >= dp[i * W + j + 1]) out.push(["-", at[i++]]);
+    else out.push(["+", bt[j++]]);
+  }
+  while (i < n) out.push(["-", at[i++]]);
+  while (j < m) out.push(["+", bt[j++]]);
+  if (A.length > CAP || B.length > CAP)
+    out.push(["~", `[diff truncated at ${CAP} lines]`]);
+  return out;
+}
+
+function renderOcrDiff() {
+  const a = ocrSelDoc();
+  const bid = el("ocr-diff-with").value;
+  const b = ocrState.docs.find((d) => d.id === bid);
+  const box = el("ocr-diff");
+  if (!a || !b || a.id === b.id) {
+    box.innerHTML = `<p class="empty">PICK TWO DIFFERENT DOCUMENTS</p>`;
+    return;
+  }
+  const ops = diffLines(a.text, b.text);
+  const parts = [];
+  let same = 0;
+  const flushSame = () => {
+    if (same > 6) {
+      parts.push(`<div class="d-skip">&middot; &middot; &middot; ${same} unchanged lines</div>`);
+    } else if (same > 0) {
+      // short runs were buffered below; nothing extra to do
+    }
+    same = 0;
+  };
+  let buffer = [];
+  for (const [op, line] of ops) {
+    if (op === "=") {
+      same++;
+      buffer.push(line);
+      if (same <= 3) parts.push(`<div class="d-same">${esc(line) || "&nbsp;"}</div>`);
+      continue;
+    }
+    if (same > 3) {
+      parts.push(`<div class="d-skip">&middot; &middot; &middot; ${same - 3} more unchanged lines</div>`);
+    }
+    same = 0;
+    buffer = [];
+    if (op === "-") parts.push(`<div class="d-del">- ${esc(line)}</div>`);
+    else if (op === "+") parts.push(`<div class="d-add">+ ${esc(line)}</div>`);
+    else parts.push(`<div class="d-skip">${esc(line)}</div>`);
+  }
+  if (same > 3)
+    parts.push(`<div class="d-skip">&middot; &middot; &middot; ${same - 3} more unchanged lines</div>`);
+  box.innerHTML = parts.join("") || `<p class="empty">NO DIFFERENCES</p>`;
+}
+
+function setOcrView(v) {
+  ocrSyncEditor();
+  ocrState.view = v;
+  el("ocr-view-edit").classList.toggle("active", v === "edit");
+  el("ocr-view-diff").classList.toggle("active", v === "diff");
+  el("ocr-editor").hidden = v !== "edit";
+  el("ocr-diff").hidden = v !== "diff";
+  if (v === "diff") renderOcrDiff();
+  else {
+    const d = ocrSelDoc();
+    el("ocr-editor").value = d ? d.text : "";
+  }
+}
+
+function renderOcrQueue() {
+  const tbody = el("ocr-queue-rows");
+  tbody.innerHTML = "";
+  el("ocr-queue-empty").hidden = ocrState.jobs.length !== 0;
+  el("ocr-queue-count").textContent = `${ocrState.jobs.length} JOBS`;
+  for (const j of ocrState.jobs) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${esc(j.doc)}</td><td>${esc(j.service)}</td>
+      <td>${esc(j.status)}</td><td>${esc(j.at)}</td>`;
+    tbody.appendChild(tr);
+  }
+}
+
+function renderOcrTab() {
+  renderOcrDocs();
+  const sel = el("ocr-diff-with");
+  const prevWith = sel.value;   // keep the chosen compare target
+  sel.innerHTML = "";
+  for (const d of ocrState.docs) {
+    if (d.id === ocrState.sel) continue;
+    const o = document.createElement("option");
+    o.value = d.id;
+    o.textContent = d.name.slice(0, 30);
+    sel.appendChild(o);
+  }
+  if (prevWith && [...sel.options].some((o) => o.value === prevWith)) {
+    sel.value = prevWith;
+  }
+  const d = ocrSelDoc();
+  if (ocrState.view === "edit") el("ocr-editor").value = d ? d.text : "";
+  else renderOcrDiff();
+  // quality reflects the doc's book (when folder-sourced)
+  const build = d && d.buildId ? state.builds[d.buildId] : null;
+  el("ocr-quality").value = (build && build.ocr_quality) || "";
+  el("ocr-set-active").disabled = !(d && d.buildId);
+  el("ocr-save").disabled = !d;
+  renderOcrQueue();
+}
+
+function ocrFindNext() {
+  const ta = el("ocr-editor");
+  const needle = el("ocr-find").value;
+  if (!needle || ta.hidden) return;
+  const from = ta.selectionEnd || 0;
+  let i = ta.value.indexOf(needle, from);
+  if (i < 0) i = ta.value.indexOf(needle);   // wrap around
+  if (i < 0) { el("ocr-msg").textContent = "NOT FOUND"; return; }
+  ta.focus();
+  ta.setSelectionRange(i, i + needle.length);
+  el("ocr-msg").textContent = "";
+}
+
+function ocrReplaceAll() {
+  const d = ocrSelDoc();
+  const needle = el("ocr-find").value;
+  if (!d || !needle) return;
+  ocrSyncEditor();
+  const repl = el("ocr-replace").value;
+  const count = d.text.split(needle).length - 1;
+  if (!count) { el("ocr-msg").textContent = "NOT FOUND"; return; }
+  d.text = d.text.split(needle).join(repl);
+  el("ocr-editor").value = d.text;
+  if (ocrState.view === "diff") renderOcrDiff();  // keep the diff current
+  el("ocr-msg").textContent = `${count} REPLACED (UNSAVED)`;
+}
+
+async function ocrSaveDoc() {
+  const d = ocrSelDoc();
+  if (!d) return;
+  ocrSyncEditor();
+  if (d.buildId) {
+    const res = await fetch(`/api/builds/${encodeURIComponent(d.buildId)}/ocr`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: d.fileName || d.name, text: d.text }),
+    });
+    const data = await res.json().catch(() => ({}));
+    el("ocr-msg").textContent = data.ok ? "SAVED" : "SAVE FAILED";
+    if (data.ok) status(`OCR SAVED :: ${data.name}`);
+  } else {
+    // local documents save back to disk as a download
+    const blob = new Blob([d.text], { type: "text/plain" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = d.name.endsWith(".txt") ? d.name : d.name + ".txt";
+    a.click();
+    URL.revokeObjectURL(a.href);
+    el("ocr-msg").textContent = "DOWNLOADED";
+  }
+}
+
+async function ocrSetActive() {
+  const d = ocrSelDoc();
+  if (!d || !d.buildId) return;
+  if (await patchBuildRaw(d.buildId, { ocr_active: d.fileName || d.name }, true)) {
+    el("ocr-msg").textContent = `ACTIVE :: ${d.fileName || d.name}`;
+    status(`ACTIVE OCR :: ${d.fileName || d.name}`);
+  }
+}
+
+async function ocrSetQuality(v) {
+  const d = ocrSelDoc();
+  if (!d || !d.buildId) { el("ocr-msg").textContent = "NO BOOK FOLDER"; return; }
+  if (await patchBuildRaw(d.buildId, { ocr_quality: v }, true)) {
+    el("ocr-msg").textContent = v ? `QUALITY :: ${v.toUpperCase()}` : "QUALITY CLEARED";
+  }
+}
+
+// pick a pending entry with a folder and load its OCR files as documents
+function ocrLoadFolderMenu(anchor) {
+  const builds = buildsSorted();
+  if (!builds.length) { status("NO PENDING ENTRIES"); return; }
+  const html = `<div class="pm-head">Book folders</div>` +
+    builds.map((b) => `
+      <div class="pm-item" data-bid="${esc(b.id)}">${esc(b.title || b.id)}</div>`).join("");
+  openPopup(anchor, html, (pop) => {
+    pop.querySelectorAll("[data-bid]").forEach((item) => {
+      item.addEventListener("click", async () => {
+        closePopup();
+        const bid = item.dataset.bid;
+        const info = await (await fetch(
+          `/api/builds/${encodeURIComponent(bid)}/folder`)).json();
+        if (!info.exists || !info.ocr.length) {
+          status("NO OCR FILES IN THIS FOLDER (build it from the Editor tab)");
+          return;
+        }
+        for (const f of info.ocr) {
+          const data = await (await fetch(
+            `/api/builds/${encodeURIComponent(bid)}/ocr/` +
+            encodeURIComponent(f.name))).json();
+          if (data.ok) ocrAddDoc(f.name, data.text, bid, f.name);
+        }
+        status(`LOADED ${info.ocr.length} OCR FILE(S)`);
+      });
+    });
+  });
+}
+
+function ocrQueueJob() {
+  const d = ocrSelDoc();
+  const service = el("ocr-service");
+  ocrState.jobs.push({
+    doc: d ? d.name : "(no document)",
+    service: service.options[service.selectedIndex].textContent,
+    status: "QUEUED — service not configured (Settings > AI)",
+    at: new Date().toLocaleTimeString(),
+  });
+  renderOcrQueue();
+}
+
+function initOcrTab() {
+  el("ocr-load-file").addEventListener("click", () => el("ocr-file-input").click());
+  el("ocr-file-input").addEventListener("change", () => {
+    for (const f of el("ocr-file-input").files) {
+      const reader = new FileReader();
+      reader.onload = () => ocrAddDoc(f.name, reader.result, null, null);
+      reader.readAsText(f);
+    }
+    el("ocr-file-input").value = "";
+  });
+  el("ocr-load-folder").addEventListener("click", () =>
+    ocrLoadFolderMenu(el("ocr-load-folder")));
+  el("ocr-docs").addEventListener("click", (ev) => {
+    const li = ev.target.closest("li.ocr-doc");
+    if (!li) return;
+    ocrSyncEditor();
+    ocrState.sel = li.dataset.did;
+    renderOcrTab();
+  });
+  el("ocr-view-edit").addEventListener("click", () => setOcrView("edit"));
+  el("ocr-view-diff").addEventListener("click", () => setOcrView("diff"));
+  el("ocr-diff-with").addEventListener("change", () => {
+    if (ocrState.view === "diff") renderOcrDiff();
+  });
+  el("ocr-find-next").addEventListener("click", ocrFindNext);
+  el("ocr-find").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); ocrFindNext(); }
+  });
+  el("ocr-replace-all").addEventListener("click", ocrReplaceAll);
+  el("ocr-quality").addEventListener("change", () =>
+    ocrSetQuality(el("ocr-quality").value));
+  el("ocr-save").addEventListener("click", ocrSaveDoc);
+  el("ocr-set-active").addEventListener("click", ocrSetActive);
+  el("ocr-queue-add").addEventListener("click", ocrQueueJob);
+  el("ocr-editor").addEventListener("input", () => {
+    const d = ocrSelDoc();
+    if (d) d.text = el("ocr-editor").value;
+  });
 }
 
 // --- menu bar ---------------------------------------------------------------
@@ -4556,6 +5093,17 @@ function init() {
     loadDescriptionFile(el("b-desc-file").files[0]);
     el("b-desc-file").value = "";
   });
+  el("b-folder").addEventListener("click", syncBuildFolder);
+  el("b-ocr-load").addEventListener("click", () => el("b-ocr-file").click());
+  el("b-ocr-file").addEventListener("change", () => {
+    uploadOcrFile(el("b-ocr-file").files[0]);
+    el("b-ocr-file").value = "";
+  });
+  el("b-ocr-list").addEventListener("click", (ev) => {
+    const chip = ev.target.closest("[data-ocr]");
+    if (chip) setActiveOcr(chip.dataset.ocr);
+  });
+  initOcrTab();
   el("b-pdf-attach").addEventListener("click", () => attachPdfFile());
   el("b-pdf_file").addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") { ev.preventDefault(); attachPdfFile(); }
@@ -4599,6 +5147,17 @@ function init() {
     else if (!el("md-overlay").hidden) closeMarkdownEditor(false);
     else if (!el("msrc-overlay").hidden) closeManualSource();
     else if (!el("settings-overlay").hidden) closeSettings();
+  });
+
+  // keep sized tables filling their panes when the window or panes resize
+  let rzTimer = null;
+  window.addEventListener("resize", () => {
+    clearTimeout(rzTimer);
+    rzTimer = setTimeout(() => {
+      applyTableChrome(state.settings.topTable === "whl" ? "whl" : "checked");
+      applyTableChrome("upload");
+      applyTableChrome("b-" + activeBottomTable());
+    }, 120);
   });
 
   loadDownloads();

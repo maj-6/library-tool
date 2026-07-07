@@ -98,11 +98,13 @@ def api_books():
 BUILDS_PATH = lib.OUTPUT_DIR / "whl_builds.json"
 
 # The field set mirrors what a WHL catalog entry needs. pdf_source is the
-# source URL; pdf_file is the local PDF attached for the actual submission.
+# source URL; pdf_file is the local PDF attached for the actual submission;
+# ocr_active/ocr_verified/ocr_quality track the entry folder's OCR files.
 _BUILD_FIELDS = ("title", "subtitle", "authors", "year", "publisher",
                  "publisher_city", "edition", "language", "pages",
                  "categories", "description", "pdf_source", "pdf_file",
-                 "source_url", "notes", "status")
+                 "source_url", "notes", "status",
+                 "ocr_active", "ocr_verified", "ocr_quality")
 
 
 @app.route("/api/builds")
@@ -183,13 +185,24 @@ def _resolve_local(raw: str) -> Path | None:
 
 @app.route("/api/pdf")
 def api_pdf():
-    """Stream a local PDF (absolute path, or relative to the repo root)."""
+    """Stream a local PDF (absolute path, or relative to the repo root).
+    ?preview=1&pages=N serves a compressed, truncated derivative instead —
+    much faster to load for large scans."""
     raw = (request.args.get("path") or "").strip()
     if not raw:
         abort(400)
     p = _resolve_local(raw)
     if p is None or p.suffix.lower() != ".pdf" or not p.is_file():
         abort(404)
+    if request.args.get("preview"):
+        try:
+            pages = max(1, min(500, int(request.args.get("pages") or 20)))
+        except ValueError:
+            pages = 20
+        try:
+            p = _preview_pdf(p, pages)
+        except Exception:
+            pass  # fall back to the original
     return send_file(p, mimetype="application/pdf", conditional=True)
 
 
@@ -240,6 +253,183 @@ def api_ai_summarize():
         return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
 
+# --- entry folders: one directory per pending entry -------------------------------
+# output/entries/<build-id>/ holds metadata.json, a compressed + truncated
+# preview.pdf, and ocr/*.txt files (extracted plus any loaded for comparison).
+
+ENTRIES_DIR = lib.OUTPUT_DIR / "entries"
+
+
+def _entry_dir(build_id: str) -> Path:
+    return ENTRIES_DIR / build_id
+
+
+def _ocr_name(raw: str) -> str:
+    name = re.sub(r"[^\w.\- ]", "_", (raw or "").strip()) or "ocr"
+    if not name.lower().endswith(".txt"):
+        name += ".txt"
+    return name
+
+
+def _entry_folder_info(build_id: str) -> dict:
+    d = _entry_dir(build_id)
+    ocr = []
+    if (d / "ocr").is_dir():
+        for f in sorted((d / "ocr").glob("*.txt")):
+            ocr.append({"name": f.name, "size": f.stat().st_size})
+    return {"exists": d.is_dir(), "path": str(d), "ocr": ocr,
+            "preview": (d / "preview.pdf").is_file(),
+            "metadata": (d / "metadata.json").is_file()}
+
+
+def _pdf_extract_text(p: Path, max_pages: int) -> tuple[int, int, str]:
+    """(total_pages, shown_pages, text) of a PDF's text/OCR layer."""
+    from pypdf import PdfReader
+    reader = PdfReader(str(p))
+    total = len(reader.pages)
+    shown = min(total, max_pages)
+    parts = []
+    for i in range(shown):
+        text = (reader.pages[i].extract_text() or "").strip()
+        parts.append(f"--- page {i + 1} ---\n{text}")
+    return total, shown, "\n\n".join(parts)
+
+
+def _preview_pdf(src: Path, pages: int) -> Path:
+    """A compressed, truncated preview derivative, cached by mtime."""
+    import hashlib
+    cache = lib.ROOT / "downloads" / "cache" / "previews"
+    cache.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha1(
+        f"{src}|{src.stat().st_mtime}|{pages}".encode("utf-8")).hexdigest()[:16]
+    out = cache / f"{key}.pdf"
+    if out.is_file():
+        return out
+    from pypdf import PdfReader, PdfWriter
+    reader = PdfReader(str(src))
+    writer = PdfWriter()
+    for i in range(min(len(reader.pages), pages)):
+        page = reader.pages[i]
+        try:
+            page.compress_content_streams()
+        except Exception:
+            pass
+        writer.add_page(page)
+    tmp = out.with_suffix(".tmp")
+    with open(tmp, "wb") as fh:
+        writer.write(fh)
+    tmp.replace(out)
+    return out
+
+
+@app.route("/api/builds/<build_id>/folder")
+def api_build_folder_info(build_id: str):
+    return jsonify(_entry_folder_info(build_id))
+
+
+@app.route("/api/builds/<build_id>/folder", methods=["POST"])
+def api_build_folder_sync(build_id: str):
+    """Create/refresh the entry folder: metadata, PDF preview, extracted OCR.
+    Body: {pages: N, keep_original: bool}."""
+    builds = lib.load_json(BUILDS_PATH, {})
+    if build_id not in builds:
+        abort(404)
+    b = builds[build_id]
+    p = request.get_json(silent=True) or {}
+    try:
+        pages = max(1, min(500, int(p.get("pages") or 20)))
+    except (TypeError, ValueError):
+        pages = 20
+    keep_original = bool(p.get("keep_original", True))
+    d = _entry_dir(build_id)
+    (d / "ocr").mkdir(parents=True, exist_ok=True)
+    lib.save_json(d / "metadata.json", b)
+    notes = []
+    src = None
+    preview_ok = False  # THIS sync produced a fresh preview.pdf
+    pf = (b.get("pdf_file") or "").strip()
+    if pf:
+        sp = _resolve_local(pf)
+        if sp is not None and sp.is_file():
+            src = sp
+        else:
+            notes.append("pdf_file not found")
+    if src is not None:
+        try:
+            prev = _preview_pdf(src, pages)
+            import shutil
+            shutil.copyfile(prev, d / "preview.pdf")
+            preview_ok = True
+        except Exception as exc:
+            notes.append(f"preview failed: {exc}")
+        try:
+            total, shown, text = _pdf_extract_text(src, 400)
+            if text.strip():
+                (d / "ocr" / "extracted.txt").write_text(
+                    text, encoding="utf-8", errors="replace")
+            else:
+                notes.append("no text layer (supply OCR separately)")
+        except Exception as exc:
+            notes.append(f"text extraction failed: {exc}")
+        # IA originals are temporary artifacts unless configured otherwise.
+        # Only a preview produced by THIS sync may cost the original — a
+        # leftover preview.pdf from an earlier run does not count.
+        if not keep_original and preview_ok:
+            try:
+                srcr = src.resolve()
+                if srcr.is_relative_to(lib.IA_DOWNLOADS_DIR.resolve()):
+                    src.unlink()
+                    notes.append("original removed (temporary artifact)")
+                    # nothing may keep pointing at the deleted file: the
+                    # entry folder's preview becomes the build's PDF, and
+                    # the IA download catalog entry is retired
+                    b["pdf_file"] = (d / "preview.pdf").resolve().relative_to(
+                        lib.ROOT.resolve()).as_posix()
+                    b["updated_at"] = datetime.now(timezone.utc).isoformat(
+                        timespec="seconds")
+                    lib.save_json(BUILDS_PATH, builds)
+                    catalog = lib.load_json(lib.IA_CATALOG_PATH, {})
+                    stale = [k for k, v in catalog.items()
+                             if (lib.ROOT / str(v.get("saved_as") or "?")).resolve()
+                             == srcr]
+                    for k in stale:
+                        del catalog[k]
+                    if stale:
+                        lib.save_json(lib.IA_CATALOG_PATH, catalog)
+            except Exception as exc:
+                notes.append(f"original cleanup failed: {exc}")
+    out = _entry_folder_info(build_id)
+    out.update({"ok": True, "notes": notes, "build": b})
+    return jsonify(out)
+
+
+@app.route("/api/builds/<build_id>/ocr/<name>")
+def api_build_ocr_get(build_id: str, name: str):
+    # membership check doubles as path validation for the build_id segment
+    if build_id not in lib.load_json(BUILDS_PATH, {}):
+        abort(404)
+    f = _entry_dir(build_id) / "ocr" / _ocr_name(name)
+    if not f.is_file():
+        abort(404)
+    return jsonify({"ok": True, "name": f.name,
+                    "text": f.read_text(encoding="utf-8", errors="replace")})
+
+
+@app.route("/api/builds/<build_id>/ocr", methods=["POST"])
+def api_build_ocr_put(build_id: str):
+    """Store an OCR text file on the entry folder. Body: {name, text}."""
+    if build_id not in lib.load_json(BUILDS_PATH, {}):
+        abort(404)
+    p = request.get_json(silent=True) or {}
+    name = _ocr_name(p.get("name") or "")
+    d = _entry_dir(build_id) / "ocr"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / name).write_text(str(p.get("text") or ""),
+                          encoding="utf-8", errors="replace")
+    return jsonify({"ok": True, "name": name,
+                    "folder": _entry_folder_info(build_id)})
+
+
 _PDF_TEXT_CACHE: dict = {}
 
 
@@ -282,20 +472,14 @@ def api_pdf_text():
     if key in _PDF_TEXT_CACHE:
         return jsonify(_PDF_TEXT_CACHE[key])
     try:
-        from pypdf import PdfReader
+        from pypdf import PdfReader  # noqa: F401
     except ImportError:
         return jsonify({"ok": False,
                         "error": "pypdf is not installed "
                                  "(python3 -m pip install pypdf)"})
     try:
-        reader = PdfReader(str(p))
-        total = len(reader.pages)
-        parts = []
-        for i in range(min(total, max_pages)):
-            text = (reader.pages[i].extract_text() or "").strip()
-            parts.append(f"--- page {i + 1} ---\n{text}")
-        out = {"ok": True, "pages": total, "shown": min(total, max_pages),
-               "text": "\n\n".join(parts)}
+        total, shown, text = _pdf_extract_text(p, max_pages)
+        out = {"ok": True, "pages": total, "shown": shown, "text": text}
     except Exception as exc:
         out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     _PDF_TEXT_CACHE[key] = out

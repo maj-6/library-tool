@@ -16,3 +16,4 @@ downloads/ia/*.part
 __pycache__/
 *.pyc
 downloads/cache/
+output/entries/**/*.pdf
