@@ -63,40 +63,44 @@ python3 tools/whl_explorer/server.py
 ```
 
 Open http://127.0.0.1:5001. Classic-CAD styled UI; the title bar reads
-`<ACTIVE TAB> :: CATALOG EXPLORER`. Two tabs: **CHECKED BOOKS** (the working
-area) and **UPLOAD LIST** (approved sources + the book builder).
+`<ACTIVE TAB> :: CATALOG EXPLORER`. Below it sits the **application
+toolbar**: `UNDO` / `REDO`, the active tab's commands, and `SETTINGS`.
+Two tabs: **CHECKED BOOKS** (the working area) and **UPLOAD LIST** (the
+book builder + approved sources).
 
 UI conventions used everywhere:
 
 - Table cells never wrap: overflowing text is ellipsized and the full text
   appears in a hover tooltip. Table views hide their scrollbars (scrolling
-  still works).
+  still works). Links show their target URL in the hover tooltip.
 - Status tags are fixed-width and abbreviated; a tag that matched a record
   is itself the link to that record.
-- **Undo/Redo** (titlebar buttons, Ctrl+Z / Ctrl+Y outside text fields)
+- **Undo/Redo** (toolbar buttons, Ctrl+Z / Ctrl+Y outside text fields)
   covers checking/unchecking and clearing books, cell edits, verification
   markers and manual sources, manual-entry creation/deletion/edits, WHL
-  corrections, and builder create/edit/delete. The last 100 actions are
-  kept per session.
-- `SETTINGS` (title bar): **theme** and **font** dropdowns plus per-column
+  corrections, and builder create/edit/delete/attach. The last 100 actions
+  are kept per session.
+- `SETTINGS` (toolbar): **theme** and **font** dropdowns plus per-column
   visibility for the checked table; everything persists in the browser.
   Seven themes, each a full rework of the interface chrome (borders, tab
   shapes, table rulings, tag geometry, tooltips, scrollbars) with element
-  and text sizes preserved: CLASSIC CAD, ARCHIVE LEDGER, WORKSTATION 2000,
-  SLATE STUDIO, PLATINUM, BLUEPRINT, MAINFRAME TERMINAL.
+  and text sizes preserved: CLASSIC CAD, ARCHIVE LEDGER (neutral archival
+  paper), WORKSTATION 2000, SLATE STUDIO, PLATINUM, BLUEPRINT, MAINFRAME
+  TERMINAL. Work canvases are flat colors (no background gridlines).
+- Reusable components in `static/app.js`: `createMdEditor(container)` (the
+  Obsidian-style live Markdown editor), `createPdfViewer()` (embedded PDF
+  viewer), and `openFileBrowser(start, onPick)` (local PDF picker) — built
+  to be mounted anywhere else in the interface.
 
 ## CHECKED BOOKS tab
 
 A split layout: a left panel (resizable via the splitter), a top working
 table, and an optional bottom search pane.
 
-### Toolbar
+### Toolbar commands (application toolbar) + filter bar
 
-- `FIND` — live filter, understood by every table on the tab and by the
-  realtime Open Library query: `@token` = author (last name), `#token` =
-  publication year, plain text = title words.
-- `MARK` — filter by mark state (ALL / SCAN / UPLOAD / APPROVED / UNMARKED).
-- `SHOW SEARCH PANE` — toggles the bottom pane.
+Toolbar, when this tab is active:
+
 - `RUN SCANS` — queues every row that has no scan results yet.
 - `SCRAPE WHL` — fetches the complete metadata for every published book
   from the WHL website's REST API (~2 min for the whole catalogue,
@@ -105,6 +109,14 @@ table, and an optional bottom search pane.
   your corrections in precedence.
 - `DOWNLOAD APPROVED` — IA PDFs for every approved book (below).
 - `EXPORT JSON`, `CLEAR CHECKED`.
+- `SEARCH PANE` — toggle button for the bottom pane (pressed = shown).
+
+The tab's own filter bar:
+
+- `FIND` — live filter, understood by every table on the tab and by the
+  realtime Open Library query: `@token` = author (last name), `#token` =
+  publication year, plain text = title words.
+- `MARK` — filter by mark state (ALL / SCAN / UPLOAD / APPROVED / UNMARKED).
 
 ### Left panel (three sub-tabs)
 
@@ -125,8 +137,9 @@ table, and an optional bottom search pane.
   which the pick completes).
 - `WHL EDIT` — appears when a WHL row is Ctrl+clicked (below): the full
   record editor. The DESCRIPTION field has a pencil button that opens a
-  **Markdown editor window** (side-by-side source and live preview;
-  APPLY writes back to the field, SAVE CORRECTIONS persists).
+  **Markdown editor window** (the live Obsidian-style editor: the text
+  renders in place; the line under the caret shows its source. APPLY
+  writes back to the field, SAVE CORRECTIONS persists).
 
 ### Top pane (dropdown selects the working table)
 
@@ -142,16 +155,18 @@ table, and an optional bottom search pane.
   **edited** rows carry a cyan left bar and tint, **added** rows a green
   one, **draft** rows an amber one (SRC column: `CSV` / `WEB` / `EDITED` /
   `ADDED`).
-  Two modes, toggled with **Ctrl+E**: in EDIT mode click a cell to correct
-  it, or Ctrl+click a row to load the whole record into the left panel's
-  `WHL EDIT` tab; in SEARCH mode click a title to look it up on Open
-  Library, then click a result to repopulate the row's metadata — the
+  Two modes, toggled with the `MODE:` button or **Ctrl+E** (the current
+  mode also shows as a tag in the footer): in EDIT mode click a cell to
+  correct it, or Ctrl+click a row to load the whole record into the left
+  panel's `WHL EDIT` tab; in SEARCH mode click a title to look it up on
+  Open Library, then click a result to repopulate the row's metadata — the
   cleanup workflow for incomplete or mis-entered entries. `CONSTRAIN:`
   checkboxes choose which of the clicked row's columns narrow the lookup —
   `TITLE=` requires the title to appear verbatim (as a phrase), AUTHOR and
-  YEAR filter by the row's values.
+  YEAR filter by the row's values. The STATUS tag links to the catalogue
+  page; its tooltip shows the target URL.
 
-### Bottom pane (`SHOW SEARCH PANE`)
+### Bottom pane (`SEARCH PANE` toolbar toggle)
 
 A tabbed general-purpose viewer. `+` adds a tab; the active tab's dropdown
 selects its table (OPEN LIBRARY / CH CATALOG / WHL CATALOG). All tabs
@@ -225,23 +240,39 @@ already-downloaded volumes show `SAVED` and are skipped on later runs.
 
 ## UPLOAD LIST tab
 
-The submission-preparation area. Two parts:
+The submission-preparation area. Toolbar commands when this tab is active:
+`NEW ENTRY` (start a blank catalog entry), `EXPORT BUILDS` (download all
+prepared entries as `whl_submission_entries.json` — the submission
+package), `DOWNLOAD SOURCES` (save the approved-sources list as
+`whl_upload_list.json`).
 
+Two parts, separated by a **drag-to-resize splitter**:
+
+- **The book builder** (top) — catalog entries being prepared for WHL
+  submission, persisted in `output/whl_builds.json`. `BUILD` on an
+  approved source starts an entry prefilled from the book's metadata, the
+  provenance URL, and the PDF source; when the PDF was already downloaded
+  the local `downloads/ia/<id>.pdf` path is attached automatically.
+  The editor puts `SAVE`, the `READY FOR SUBMISSION` flag, and `DELETE` at
+  the top, over two sub-tabs (their content scrolls):
+  - `ENTRY` — the metadata fields (title, subtitle, authors, year,
+    edition, publisher + city, language, pages, categories, PDF source
+    URL, provenance URL, internal notes) with the **live Markdown
+    description editor** occupying the space to their right: the
+    description renders in the same box it is typed in (Obsidian-style —
+    markers hide on rendered lines; the line under the caret shows its
+    dimmed source).
+  - `SOURCE (PDF)` — an embedded **PDF viewer** for verifying the actual
+    PDF before marking the entry ready, plus the local-file interface: a
+    path field, `BROWSE...` (a local-directory picker that lists drives,
+    folders, and PDFs), and `ATTACH` (validates the file exists, then
+    saves the path on the entry). A PDF auto-sourced from a URL that has
+    already been downloaded gets its local path populated automatically;
+    with no local file the viewer falls back to the remote URL.
 - **APPROVED SOURCES** (bottom table) — every approved source across all
   rows: title, subtitle, author, publisher, year, the archive, and the
-  matched record (linked). `DOWNLOAD SOURCES` saves the list as
-  `whl_upload_list.json`. Each row has a `BUILD` button.
-- **The book builder** (top) — catalog entries being prepared for WHL
-  submission, persisted in `output/whl_builds.json`. `NEW ENTRY` starts a
-  blank one; `BUILD` on an approved source starts one prefilled from the
-  book's metadata, with the provenance URL and the PDF source filled in
-  (the local `downloads/ia/<id>.pdf` when the PDF was already downloaded,
-  otherwise the archive.org download URL). The editor has two sub-tabs:
-  `FIELDS` (title, subtitle, authors, year, edition, publisher + city,
-  language, pages, categories, PDF source, provenance URL, internal notes,
-  and a READY FOR SUBMISSION checkbox) and `DESCRIPTION (MARKDOWN)` (source
-  + live preview side by side). `EXPORT BUILDS` downloads all entries as
-  `whl_submission_entries.json` — the submission package.
+  matched record (linked, with the URL in the tooltip). Each row has a
+  `BUILD` button.
 
 # Standalone CLIs
 

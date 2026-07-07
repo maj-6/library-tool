@@ -201,3 +201,20 @@ is decided by a tolerant composite rather than exact strings:
   DESCRIPTION (MARKDOWN) tab with live preview, and a READY FOR SUBMISSION
   flag; EXPORT BUILDS emits `whl_submission_entries.json`. The WHL EDIT
   description field opens the same Markdown editor via a pencil button.
+- v2.1 toolbar + live editing + PDF sources: an application toolbar under
+  the titlebar carries UNDO/REDO, SETTINGS, and the active tab's commands
+  (checked: RUN SCANS / SCRAPE WHL / DOWNLOAD APPROVED / EXPORT JSON /
+  CLEAR CHECKED / SEARCH PANE toggle; upload: NEW ENTRY / EXPORT BUILDS /
+  DOWNLOAD SOURCES). The WHL mode button drops its Ctrl+E hint; the mode
+  shows as a footer tag. STATUS-column links show their URL in the
+  tooltip. Background gridlines are removed from every theme, and ARCHIVE
+  LEDGER is desaturated to neutral archival paper. The builder merges the
+  description into the ENTRY tab as a live Obsidian-style Markdown editor
+  (rendered in the box it is typed in; caret line shows source) to the
+  right of the fields, with SAVE/READY/DELETE at the top, a taller notes
+  field, and a new SOURCE (PDF) tab: embedded PDF viewer (streams local
+  files via /api/pdf), BROWSE local-directory picker (/api/pdf/browse),
+  ATTACH with existence validation, and auto-attachment of already
+  downloaded IA PDFs (`pdf_file` build field). The approved-sources pane
+  is resizable via a splitter. createMdEditor / createPdfViewer /
+  openFileBrowser are reusable components for future integration points.
