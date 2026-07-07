@@ -29,7 +29,7 @@ the current build focuses on the copyright/report utility.
   - `Available online` — searched against a public online library
     (Internet Archive).
   - `In local library` — cross-referenced against `in_local_library`
-    (currently the dictated books / partial set until scanning is wired up).
+    (currently the manual entries / partial set until scanning is wired up).
   - `Copyright status` — determined via `copyright_renewals.csv`.
 
 ## Data sources
@@ -49,9 +49,10 @@ the current build focuses on the copyright/report utility.
   Authors, Year Published, Library Categories, Permalink, Status, Publication
   File`. `Status` is `publish` or `draft`; the file has many near-duplicate
   rows per book. Used offline for the `In WHL` column (no scraping).
-- `output/books_metadata.json`, `output/library_db.json` — the dictated /
-  reviewed local books; stand in for the local library until scanning + the
-  `local_library_partial` source are available.
+- `output/manual_entries.json` — the hand-entered local books; stand in for
+  the local library until scanning + the `local_library_partial` source are
+  available. (The earlier dictation/photo pipeline and its
+  `books_metadata.json` / `library_db.json` outputs are retired.)
 - `local_library_partial` — not yet present; sparse (author-last + title).
 
 ## Copyright status logic (US-centric heuristic)
@@ -110,8 +111,8 @@ is decided by a tolerant composite rather than exact strings:
 - `tools/scan_search.py` searches for existing scans: Internet Archive via
   its public advancedsearch API; HathiTrust via its official Bib API keyed on
   OCLC numbers discovered through Open Library (HathiTrust catalog search is
-  robots-disallowed for programs). Wired to `SCANS` buttons on catalog rows
-  and the combined table, plus a `RUN SCANS` batch.
+  robots-disallowed for programs). Runs automatically through the scan queue
+  when a row is added or edited, plus a `RUN SCANS` batch.
 - Per-source verification: each positive WHL/IA/HT match carries a marker on
   the tag's right edge (shaded fill + 1px border; yellow pending, green
   approved, red rejected as a false positive). Clicking the MARKER cycles the
@@ -158,9 +159,12 @@ is decided by a tolerant composite rather than exact strings:
   AUTHOR, YEAR) applied to the row-click Open Library lookup. COPYRIGHT tag semantics: NO = public domain,
   YES = under copyright. All tags are one uniform width with verification
   markers fused inside the tag. Themes are full chrome redesigns with
-  preserved geometry: CLASSIC CAD, ARCHIVE LEDGER (card-catalog paper),
-  WORKSTATION 2000 (thin-bevel listview era), SLATE STUDIO (mid-2000s
-  steel/pill styling); legacy theme ids migrate.
+  preserved geometry, chosen from a SETTINGS dropdown: CLASSIC CAD, ARCHIVE
+  LEDGER (card-catalog paper), WORKSTATION 2000 (thin-bevel listview era),
+  SLATE STUDIO (mid-2000s steel/pill styling), PLATINUM (pinstriped late-90s
+  Mac), BLUEPRINT (blue graph-paper drafting), MAINFRAME TERMINAL (green
+  phosphor); legacy theme ids migrate. A FONT dropdown swaps the UI typeface
+  (monospace, proportional, and serif options).
 - The project is a git repository; dumps, built indexes, API caches and
   downloaded PDFs are gitignored. MARK column: `SCAN` = not in
   WHL + public domain + no surviving scan online; `UPLD` = not in WHL + scan
@@ -183,3 +187,17 @@ is decided by a tolerant composite rather than exact strings:
   <=4 chars (YES / NO / ? / DRFT / VIEW / ERR / ---), uniform width, with
   full details in the hover tooltip; APPROVE/APPROVED remain as the
   clickable mark tag.
+- v2.0 legacy trim + submission builder: the Catalog tab, dataset switching,
+  the live CHECK SELECTED ON WHL action, and all dictated-entry logic are
+  removed — two tabs remain (CHECKED BOOKS, UPLOAD LIST; titles debracketed,
+  never wrapped) and per-tab instruction blurbs are gone. SCRAPE WHL lives
+  in the main toolbar. Table views hide their scrollbars. In the WHL table,
+  corrected rows (cyan), added rows (green), and drafts (amber) are
+  highlighted with a left bar + tint. The UPLOAD LIST tab hosts the book
+  builder (`output/whl_builds.json`, CRUD with undo): NEW ENTRY starts a
+  blank record; BUILD on an approved source prefills metadata, provenance
+  URL, and PDF source (local `downloads/ia/<id>.pdf` when already
+  downloaded, else the archive URL); each entry has a FIELDS tab, a
+  DESCRIPTION (MARKDOWN) tab with live preview, and a READY FOR SUBMISSION
+  flag; EXPORT BUILDS emits `whl_submission_entries.json`. The WHL EDIT
+  description field opens the same Markdown editor via a pencil button.
