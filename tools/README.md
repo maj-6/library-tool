@@ -65,10 +65,11 @@ python3 tools/whl_explorer/server.py
 Open http://127.0.0.1:5001. The chrome, top to bottom: title bar, **menu
 bar** (File / Edit / View / Tools — every common function lives here;
 Run scans, Scrape WHL, and the Search pane toggle live *only* here), and
-the **tab strip** — **Catalogs** (the working area) and **Editor** (the
-book builder + verified sources) on the left, with the action icons
-inline on the right: undo/redo, the active tab's commands (Editor: new
-entry, export builds, download sources), and the settings gear.
+the **tab strip** — **Catalogs** (the working area), **Editor** (the
+book builder + verified sources), and **OCR** (OCR review tooling) on
+the left, with the action icons inline on the right: undo/redo, the
+active tab's commands (Editor: new entry, export builds, download
+sources), and the settings gear.
 
 UI conventions used everywhere:
 
@@ -81,9 +82,12 @@ UI conventions used everywhere:
   hide their scrollbars.
 - **Click a column header to sort** by it (again to reverse; arrow shows
   the direction) in the checked and WHL tables. Every table's **columns
-  are resizable** (drag a header's right edge; widths persist) and every
-  table has a **column-visibility icon** in the bar above it. The maximum
-  number of displayed rows is a setting (TABLE VIEW).
+  are resizable** (drag a header's right edge; widths persist) — except
+  the tag/action columns, whose compact widths are locked — and a
+  designated column stretches so the table never leaves empty space on
+  its right. Every table has a **column-visibility icon** in the bar
+  above it. The maximum number of displayed rows is a setting (TABLE
+  VIEW).
 - **Ctrl+click a row in any table to open it in the EDIT tab**.
 - Status tags are fixed-width and abbreviated; a tag that matched a record
   is itself the link to that record.
@@ -288,17 +292,42 @@ Two parts, separated by a **drag-to-resize splitter**:
     URL, model, API key, custom instructions), and a **file icon** loads
     the description from a local text file. Both leave the result unsaved
     until SAVE.
-  - `SOURCE (PDF)` — an embedded, **undecorated PDF viewer** (no browser
-    toolbar; the file size shows in the bar) with an **OCR icon** that
-    opens the extracted text layer in a parallel pane, for verifying the
-    actual PDF before marking the entry VERIFIED. The PATH TO PDF field
-    has folder (browse) and attach icons; attach validates the file
-    exists before saving the path. With no local file the viewer falls
-    back to the remote URL.
+  - `Source (PDF)` — an embedded, **undecorated PDF viewer** (no browser
+    toolbar or scrollbars; the file size shows in the bar) with an **OCR
+    icon** that opens the text layer in a parallel pane. Large scans load
+    fast because the viewer shows a **compressed, truncated preview
+    derivative** (page limit and a preview-the-original toggle live in
+    GENERAL settings). The PATH TO PDF field has folder (browse) and
+    attach icons. The **OCR row** lists the entry folder's OCR files as
+    chips — click one to make it the ACTIVE OCR (it feeds the OCR pane);
+    load additional OCR files for comparison with the file icon (PDFs
+    without a text layer get their OCR supplied this way). The
+    **folder-sync icon builds the entry folder**
+    (`output/entries/<id>/`): `metadata.json`, `preview.pdf`, and
+    `ocr/extracted.txt`; when KEEP IA ORIGINALS is off, the downloaded
+    original is treated as a temporary artifact and removed after the
+    preview is built — the entry's PDF is repointed at the folder's
+    `preview.pdf` and the IA download catalog entry is retired (removal
+    only happens when the sync just produced a fresh preview). **Saving
+    the entry marks the active OCR file as verified** (`ocr_verified`).
 - **VERIFIED SOURCES** (bottom table) — every verified source across all
   rows: title, subtitle, author, publisher, year, the archive, and the
   matched record (linked, with the URL in the tooltip). Each row's build
   icon starts a prefilled entry.
+
+## OCR tab
+
+The OCR workbench: load OCR text files directly or **load a book
+folder** (a pending entry's `ocr/` files) into the documents list, then
+review and correct them — an EDIT view for manual corrections with
+find/replace-all, a **DIFF view** comparing any two loaded documents
+(line-level, unchanged runs collapsed), and a QUALITY assessment stored
+on the entry (`ocr_quality`). SAVE writes a folder document back (local
+documents download instead); SET ACTIVE marks the document as its
+entry's active OCR. The **OCR queue** table tracks processing jobs;
+cloud services (Azure Document Intelligence, OpenAI vision) and local
+Tesseract runs plug in here later — queueing currently records the
+request as pending.
 
 # Standalone CLIs
 

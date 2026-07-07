@@ -278,3 +278,22 @@ is decided by a tolerant composite rather than exact strings:
   clicks are no-ops. The manual-entry scans endpoint re-reads and merges
   only its scans so a slow scan can no longer resurrect stale metadata
   over a concurrent edit/undo.
+- v2.5 compact tables + entry folders + OCR tab: tag/action columns are
+  locked at compact widths (48px square tags, no grips, excluded from
+  persistence) and a designated stretch column absorbs leftover width so
+  sized tables never leave empty space on the right. PDF loading is
+  optimized with compressed, truncated preview derivatives
+  (/api/pdf?preview=1&pages=N, cached under downloads/cache/previews;
+  GENERAL settings: page limit, preview-original toggle, keep-IA-originals
+  toggle). Each pending entry gets a folder (output/entries/<id>/:
+  metadata.json, preview.pdf, ocr/*.txt) built from the Source tab's
+  folder-sync icon — when originals are configured as temporary, the
+  downloads/ia file is removed after the preview exists. Multiple OCR
+  files load as chips; the active one feeds the viewer's OCR pane and is
+  marked ocr_verified when the entry is saved. The ENTRY grid rows fill
+  all six columns and overflowing fields show full-value tooltips. A new
+  OCR top tab hosts the OCR workbench: document list (files or book
+  folders), edit view with find/replace-all, two-document line diff with
+  collapsed unchanged runs, quality assessment (ocr_quality), save-back /
+  set-active, and an OCR queue table (Azure/OpenAI/Tesseract processing
+  to be implemented later — queueing records a pending stub).
