@@ -238,3 +238,27 @@ is decided by a tolerant composite rather than exact strings:
   build are icons, READY FOR SUBMISSION is now VERIFIED, and the PDF
   viewer is undecorated (#toolbar=0) with the file size displayed.
   Tooltips abbreviate long notes/description values.
+- v2.3 conventional utility chrome: the action icons move inline with the
+  tab strip (undo/redo, EDITOR commands, settings gear); RUN SCANS /
+  SCRAPE WHL / SEARCH PANE are menu-only. Column-header clicks sort the
+  checked and WHL tables (arrow indicator); the max displayed rows is a
+  setting; one shared font list feeds both the interface and data font
+  dropdowns. Theme set rebuilt: CLASSIC CAD modernized (flat 1px, radius,
+  dark canvas kept), ARCHIVE LEDGER neutralized, PLATINUM kept, BLUEPRINT
+  now warm paper over a warm neutral-dark board, MODERN LIGHT contrast
+  raised, plus new MODERN DARK and STONE; Workstation 2000 / Slate Studio /
+  Mainframe Terminal / Graphite Dark removed with id migration. Open
+  Library fills title-case titles/subtitles and flip "Last, First"
+  authors; Ctrl/Shift+click on OL column headers mark them green
+  (copy to the selected WHL row) or red (exclude) for repopulation.
+  Alt over an edited WHL row (or in the EDIT panel) shows the original
+  record grayed/yellow (server now ships pre-correction values in
+  row.orig). PUB tags with a publication file open a PDF viewer window
+  (optional parallel OCR pane via settings; /api/pdf/text extracts the
+  text layer with pypdf, fetching remote PDFs into downloads/cache).
+  Download state became a green/red dot inside the still-centered tag;
+  thead z-index fixed (tags no longer paint over headers); deletes skip
+  confirmation (undoable). EDITOR tab: PENDING list, save+delete adjacent,
+  VERIFIED icon toggle with tag, VERIFIED SOURCES with an N ROWS count,
+  PATH TO PDF label, browse/attach icons, instructional text stripped
+  throughout, taller description/notes fields.

@@ -63,67 +63,63 @@ python3 tools/whl_explorer/server.py
 ```
 
 Open http://127.0.0.1:5001. The chrome, top to bottom: title bar, **menu
-bar** (FILE / EDIT / VIEW / TOOLS — every common function lives here too),
-**application toolbar** (icon undo/redo, the active tab's commands, the
-settings gear), and two tabs: **CATALOGS** (the working area) and
-**EDITOR** (the book builder + approved sources).
+bar** (FILE / EDIT / VIEW / TOOLS — every common function lives here;
+RUN SCANS, SCRAPE WHL, and the SEARCH PANE toggle live *only* here), and
+the **tab strip** — **CATALOGS** (the working area) and **EDITOR** (the
+book builder + verified sources) on the left, with the action icons
+inline on the right: undo/redo, the active tab's commands (EDITOR: new
+entry, export builds, download sources), and the settings gear.
 
 UI conventions used everywhere:
 
-- The interface font (labels, buttons, menus) and the data font (tables,
-  inputs, the Markdown editor) are separate and both selectable in
-  settings; by default chrome is sans-serif and data is monospace.
+- The interface font (labels, buttons, menus) and the data/table font are
+  independent settings drawing from the same font list (sans, serif, and
+  monospace faces for either role).
 - Table cells never wrap: overflowing text is ellipsized and the full text
   appears in a hover tooltip (long notes/description values are
-  abbreviated so tooltips stay a manageable size). Links show their target
-  URL in the tooltip. Table views hide their scrollbars.
-- Every table's **columns are resizable** (drag a header's right edge;
-  widths persist) and every table has a **column-visibility icon** in the
-  bar above it that opens a checkbox menu of its columns.
-- **Ctrl+click a row in any table to open it in the EDIT tab** (the left
-  panel's record editor).
+  abbreviated). Links show their target URL in the tooltip. Table views
+  hide their scrollbars.
+- **Click a column header to sort** by it (again to reverse; arrow shows
+  the direction) in the checked and WHL tables. Every table's **columns
+  are resizable** (drag a header's right edge; widths persist) and every
+  table has a **column-visibility icon** in the bar above it. The maximum
+  number of displayed rows is a setting (TABLE VIEW).
+- **Ctrl+click a row in any table to open it in the EDIT tab**.
 - Status tags are fixed-width and abbreviated; a tag that matched a record
   is itself the link to that record.
-- **Undo/Redo** (toolbar icons, EDIT menu, Ctrl+Z / Ctrl+Y outside text
-  fields) covers checking/unchecking, cell and record edits, verification
-  markers and manual sources, manual-entry creation/deletion, WHL
-  corrections, and builder create/edit/delete/attach. The last 100 actions
-  are kept per session.
+- **Undo/Redo** (tab-strip icons, EDIT menu, Ctrl+Z / Ctrl+Y) covers
+  checking/unchecking, cell and record edits, verification markers and
+  manual sources, manual-entry creation/deletion, WHL corrections, and
+  builder create/edit/delete/attach. Deletes never ask for confirmation —
+  they are undoable. The last 100 actions are kept per session.
 - The settings gear opens a categorized window (sidebar: GENERAL /
-  APPEARANCE / TABLE VIEW / FILE PATHS): theme + both font dropdowns,
-  checked-table columns, column-width reset, the PDF browser start folder,
-  and a restore-defaults button. Nine themes, each a full rework of the
-  interface chrome with element and text sizes preserved: CLASSIC CAD,
-  ARCHIVE LEDGER (neutral archival paper), WORKSTATION 2000, SLATE STUDIO,
-  PLATINUM, BLUEPRINT, MAINFRAME TERMINAL, and two modern neutral designs —
-  MODERN LIGHT and GRAPHITE DARK. Work canvases are flat colors (no
-  background gridlines).
+  APPEARANCE / TABLE VIEW / FILE PATHS). Seven themes, each a full rework
+  of the interface chrome with element and text sizes preserved: CLASSIC
+  CAD (modernized flat chrome over the dark drafting canvas), ARCHIVE
+  LEDGER (neutral archival paper), PLATINUM, BLUEPRINT (warm paper over a
+  warm neutral-dark board), MODERN LIGHT, MODERN DARK, and STONE
+  (warm-gray light). Retired theme ids migrate automatically.
+- Titles and subtitles filled from Open Library are converted to
+  conventional title case; "Last, First" author names are flipped to
+  "First Last" when repopulating WHL rows.
 - Reusable components in `static/app.js`: `createMdEditor(container)` (the
   Obsidian-style live Markdown editor), `createPdfViewer()` (embedded PDF
-  viewer), and `openFileBrowser(start, onPick)` (local PDF picker) — built
-  to be mounted anywhere else in the interface.
+  viewer with an optional parallel OCR-text pane, fed by `/api/pdf/text`),
+  and `openFileBrowser(start, onPick)` (local PDF picker).
 
 ## CATALOGS tab
 
 A split layout: a left panel (resizable via the splitter), a top working
-table, and an optional bottom search pane.
-
-### Commands + find bar
-
-Application toolbar, when this tab is active: `RUN SCANS` (queues every
-row that has no scan results yet), `SCRAPE WHL` (fetches complete metadata
+table, and an optional bottom search pane. `RUN SCANS` (queue checks +
+scans for rows that have none) and `SCRAPE WHL` (fetch complete metadata
 for every published book from the WHL website's REST API — incremental and
-resumable; rows gain SRC `WEB`; drafts have no public page so their extra
-fields stay empty; scraped values sit under your corrections), and the
-`SEARCH PANE` toggle for the bottom pane. The same commands are in the
-TOOLS and VIEW menus.
+resumable; rows gain SRC `WEB`; scraped values sit under your corrections)
+are in the TOOLS menu; the SEARCH PANE toggle is in the VIEW menu.
 
 The bar above the table carries `EXPORT` (JSON of the table **as
-filtered**), a download icon ("Download all verified sources" — the IA
-PDFs for every approved book), the **filter icon** (a popup with MARK /
-SOURCE / DOWNLOAD-status filters — e.g. show only manual entries, or only
-failed downloads; the icon stays highlighted while any filter is active),
-and the column-visibility icon.
+filtered**), a download icon ("Download all verified sources"), the
+**filter icon** (MARK / SOURCE / DOWNLOAD-status popup; highlighted while
+any filter is active), and the column-visibility icon.
 
 The find bar: the magnifier field filters every table on the tab live and
 drives the realtime Open Library query — `[title]` words, `@author`
@@ -163,26 +159,32 @@ drives the realtime Open Library query — `[title]` words, `@author`
   manual entry, minus-circle = uncheck a catalog book). Metadata cells are
   edited in place: click a cell, type, Enter/blur commits (Escape
   cancels); manual-entry edits persist server-side, and any edit re-queues
-  the row's checks and scans. A saved IA download shows a black `*` to the
-  right of the IA tag (tooltip: the file path); a failed one shows a red
-  `**` (tooltip: the error) — the tag itself stays centered.
+  the row's checks and scans. IA download state shows as a dot inside the
+  tag's right edge (the label stays centered): **green** = saved (tooltip:
+  the file path), **red** = failed (tooltip: the error).
 - `WHL` — the whole WHL catalog with the full column set (title, subtitle,
   authors, year, publisher, pages, language, subject, description,
   status). Corrections never touch `whl_catalog.csv`; they live in
   `output/whl_corrections.json`. Rows are visually distinct: **edited**
   rows carry a cyan left bar and tint, **added** rows a green one,
   **draft** rows an amber one (SRC column: `CSV` / `WEB` / `EDITED` /
-  `ADDED`).
+  `ADDED`). **Holding Alt over an edited row shows the original record**
+  (grayed, yellow-tinted); the same works in the `EDIT` panel while a WHL
+  record is loaded.
   Two modes, toggled with the `MODE:` button or **Ctrl+E** (the current
   mode also shows as a tag in the footer): in EDIT mode click a cell to
   correct it; in SEARCH mode click a title to look it up on Open Library,
-  then click a result to repopulate the row's metadata — the cleanup
-  workflow for incomplete or mis-entered entries. Ctrl+click opens the
-  record in the `EDIT` tab from either mode. `CONSTRAIN:` checkboxes
-  choose which of the clicked row's columns narrow the lookup — `TITLE=`
-  requires the title to appear verbatim (as a phrase), AUTHOR and YEAR
-  filter by the row's values. The STATUS tag links to the catalogue page;
-  its tooltip shows the target URL.
+  then click a result to repopulate the row's metadata — titles/subtitles
+  are title-cased and "Last, First" authors flipped on the way in. Title,
+  author, and year copy by default; **Ctrl+click an Open Library column
+  header** (green) to force-copy it — publisher and language become
+  available this way — and **Shift+click** (red) to exclude one.
+  Ctrl+click opens the record in the `EDIT` tab from either mode. The
+  constraint group (target icon) chooses which of the clicked row's
+  columns narrow the lookup — TITLE requires the title to appear verbatim.
+  A published entry's `PUB` tag opens its publication PDF in a viewer
+  window (with an optional parallel OCR pane — GENERAL settings) instead
+  of a browser tab.
 
 ### Bottom pane (`SEARCH PANE` toolbar toggle)
 
@@ -260,38 +262,33 @@ runs.
 
 ## EDITOR tab
 
-The submission-preparation area. Toolbar commands when this tab is active:
-`NEW ENTRY` (start a blank catalog entry), `EXPORT BUILDS` (download all
-prepared entries as `whl_submission_entries.json` — the submission
-package), `DOWNLOAD SOURCES` (save the approved-sources list as
-`whl_upload_list.json`). The first two are also in the FILE menu.
+The submission-preparation area. Its tab-strip icons: new entry, export
+builds (`whl_submission_entries.json` — the submission package), and
+download sources (`whl_upload_list.json`); the same commands are in the
+FILE menu.
 
 Two parts, separated by a **drag-to-resize splitter**:
 
-- **The book builder** (top) — catalog entries being prepared for WHL
-  submission, persisted in `output/whl_builds.json`. The build icon on an
-  approved source starts an entry prefilled from the book's metadata, the
+- **PENDING** (the book builder) — catalog entries being prepared for WHL
+  submission, persisted in `output/whl_builds.json`. The build icon on a
+  verified source starts an entry prefilled from the book's metadata, the
   provenance URL, and the PDF source; when the PDF was already downloaded
   the local `downloads/ia/<id>.pdf` path is attached automatically.
-  The editor puts the save icon, the `VERIFIED` flag, and the delete icon
-  at the top, over two sub-tabs (their content scrolls):
-  - `ENTRY` — the metadata fields (title, subtitle, authors, year,
-    edition, publisher + city, language, pages, categories, PDF source
-    URL, provenance URL, internal notes) with the **live Markdown
-    description editor** occupying the space to their right: the
-    description renders in the same box it is typed in (Obsidian-style —
-    markers hide on rendered lines; the line under the caret shows its
-    dimmed source).
+  The editor puts the save and delete icons side by side at the top with
+  the VERIFIED toggle (a check icon; pressing it reveals a VERIFIED tag),
+  over two sub-tabs (their content scrolls):
+  - `ENTRY` — the metadata fields with the **live Markdown description
+    editor** occupying the space to their right (Obsidian-style — markers
+    hide on rendered lines; the line under the caret shows its dimmed
+    source).
   - `SOURCE (PDF)` — an embedded, **undecorated PDF viewer** (no browser
-    toolbar; the file size shows in the bar) for verifying the actual PDF
-    before marking the entry VERIFIED, plus the local-file interface: a
-    path field, a folder icon (local-directory picker listing drives,
-    folders, and PDFs), and an attach icon (validates the file exists,
-    then saves the path on the entry). A PDF auto-sourced from a URL that
-    has already been downloaded gets its local path populated
-    automatically; with no local file the viewer falls back to the remote
-    URL.
-- **APPROVED SOURCES** (bottom table) — every approved source across all
+    toolbar; the file size shows in the bar) with an **OCR icon** that
+    opens the extracted text layer in a parallel pane, for verifying the
+    actual PDF before marking the entry VERIFIED. The PATH TO PDF field
+    has folder (browse) and attach icons; attach validates the file
+    exists before saving the path. With no local file the viewer falls
+    back to the remote URL.
+- **VERIFIED SOURCES** (bottom table) — every verified source across all
   rows: title, subtitle, author, publisher, year, the archive, and the
   matched record (linked, with the URL in the tooltip). Each row's build
   icon starts a prefilled entry.
