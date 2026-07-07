@@ -81,12 +81,16 @@ const state = {
   msrcTarget: null,
   mdTarget: null,             // markdown overlay target textarea
   settings: {
-    checkedCols: {}, showCatalog: false, markFilter: "ALL",
+    checkedCols: {}, showCatalog: false,
+    markFilter: "ALL", srcFilter: "ALL", dlFilter: "ALL",
     topTable: "checked", bottomTabs: ["ol", "ch"], bottomActive: 0,
-    whlMode: "edit", paneWidth: null, theme: "", font: "",
+    whlMode: "edit", paneWidth: null, theme: "", font: "", fontUi: "",
     uploadSplitH: null, pdfBrowseDir: "",
+    colVis: {},                 // per-table column visibility
+    colWidths: {},              // per-table column widths (px)
     whlCons: { title: false, authors: false, year: true },
   },
+  editTarget: null,             // record open in the EDIT tab
 };
 
 // --- appearance: themes are full chrome redesigns; fonts are user-selectable --
@@ -99,18 +103,37 @@ const THEMES = [
   ["platinum", "PLATINUM"],
   ["blueprint", "BLUEPRINT"],
   ["mainframe", "MAINFRAME TERMINAL"],
+  ["modern", "MODERN LIGHT"],
+  ["graphite", "GRAPHITE DARK"],
 ];
 const LEGACY_THEMES = { cde: "ledger", xp2003: "workstation", acad: "slate" };
 
+// Data/table font (--mono): tables, inputs, the markdown editor, tooltips.
 const FONTS = [
   ["", "CONSOLAS (DEFAULT)"],
   ['"Courier New", Courier, monospace', "COURIER NEW"],
   ['"Lucida Console", Monaco, monospace', "LUCIDA CONSOLE"],
   ['"Cascadia Mono", Consolas, monospace', "CASCADIA MONO"],
+  ['"Cascadia Code", Consolas, monospace', "CASCADIA CODE"],
   ['"IBM Plex Mono", Consolas, monospace', "IBM PLEX MONO"],
+  ['"JetBrains Mono", Consolas, monospace', "JETBRAINS MONO"],
+  ['"Source Code Pro", Consolas, monospace', "SOURCE CODE PRO"],
+  ['"Fira Code", Consolas, monospace', "FIRA CODE"],
+  ['Georgia, "Times New Roman", serif', "GEORGIA (SERIF)"],
+];
+
+// Interface font (--ui): labels, buttons, menus, tabs, window chrome.
+// A monospace face is a legitimate choice here too.
+const UI_FONTS = [
+  ["", "SEGOE UI (DEFAULT)"],
   ['Tahoma, "Segoe UI", sans-serif', "TAHOMA"],
   ['Verdana, Geneva, sans-serif', "VERDANA"],
-  ['Georgia, "Times New Roman", serif', "GEORGIA"],
+  ['Arial, Helvetica, sans-serif', "ARIAL"],
+  ['"Trebuchet MS", Tahoma, sans-serif', "TREBUCHET MS"],
+  ['Calibri, "Segoe UI", sans-serif', "CALIBRI"],
+  ['"Consolas", "Courier New", monospace', "CONSOLAS (MONO)"],
+  ['"Cascadia Mono", Consolas, monospace', "CASCADIA MONO"],
+  ['"IBM Plex Mono", Consolas, monospace', "IBM PLEX MONO"],
 ];
 
 function applyTheme() {
@@ -128,6 +151,9 @@ function applyFont() {
   const f = state.settings.font || "";
   if (f) document.body.style.setProperty("--mono", f);
   else document.body.style.removeProperty("--mono");
+  const u = state.settings.fontUi || "";
+  if (u) document.body.style.setProperty("--ui", u);
+  else document.body.style.removeProperty("--ui");
 }
 
 const el = (id) => document.getElementById(id);
@@ -137,6 +163,36 @@ const esc = (s) =>
 
 function status(msg) { el("status-msg").textContent = msg; }
 function ckey(source, idx) { return `${source}:${idx}`; }
+
+// --- icon set (inline SVG, stroke = currentColor) ------------------------------
+
+const _SVG = (body) =>
+  `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" ` +
+  `stroke="currentColor" stroke-width="1.6" stroke-linecap="round" ` +
+  `stroke-linejoin="round" aria-hidden="true">${body}</svg>`;
+
+const ICONS = {
+  search: _SVG('<circle cx="7" cy="7" r="4.2"/><path d="M10.2 10.2 L14 14"/>'),
+  undo: _SVG('<path d="M3.5 6.5 h6.5 a3.5 3.5 0 0 1 0 7 h-3"/><path d="M6.5 3.5 L3.5 6.5 L6.5 9.5"/>'),
+  redo: _SVG('<path d="M12.5 6.5 h-6.5 a3.5 3.5 0 0 0 0 7 h3"/><path d="M9.5 3.5 L12.5 6.5 L9.5 9.5"/>'),
+  gear: _SVG('<circle cx="8" cy="8" r="2.6"/><path d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M12.4 3.6L11 5M5 11l-1.4 1.4"/>'),
+  download: _SVG('<path d="M8 2.5 v7.5 M4.8 7 L8 10.2 L11.2 7"/><path d="M3 13.2 h10"/>'),
+  filter: _SVG('<path d="M2.5 3.5 h11 L9.6 8.4 v4.2 l-3.2 1.4 v-5.6 Z"/>'),
+  columns: _SVG('<rect x="2" y="3" width="12" height="10"/><path d="M6.3 3 v10 M10.6 3 v10"/>'),
+  save: _SVG('<path d="M3 3 h8 l2 2 v8 h-10 Z"/><path d="M5.5 3 v3.4 h4.4 V3"/><rect x="5" y="9" width="6" height="4"/>'),
+  trash: _SVG('<path d="M3 4.5 h10 M6.3 4.5 V3 h3.4 v1.5"/><path d="M4.4 4.5 l0.7 9 h5.8 l0.7-9"/><path d="M6.6 7 v4.4 M9.4 7 v4.4"/>'),
+  remove: _SVG('<circle cx="8" cy="8" r="5.6"/><path d="M5.4 8 h5.2"/>'),
+  folder: _SVG('<path d="M2 4 h4.4 l1.4 1.8 H14 v7 H2 Z"/>'),
+  attach: _SVG('<path d="M11.5 4.6 L6.4 9.7 a1.8 1.8 0 0 0 2.6 2.6 L13.4 7.9 a3.3 3.3 0 0 0-4.6-4.6 L4.2 7.8"/>'),
+  docplus: _SVG('<path d="M3.5 2 h6 l3 3 v9 h-9 Z"/><path d="M9.5 2 v3 h3"/><path d="M8 7.5 v4 M6 9.5 h4"/>'),
+};
+
+function injectIcons() {
+  for (const node of document.querySelectorAll("[data-icon]")) {
+    const svg = ICONS[node.dataset.icon];
+    if (svg) node.innerHTML = svg;
+  }
+}
 
 // --- undo / redo -------------------------------------------------------------
 // Every mutating action pushes an operation with its inverse. Client-side
@@ -233,11 +289,27 @@ function loadSettings() {
   state.settings.checkedCols = state.settings.checkedCols || {};
   state.settings.whlCons = state.settings.whlCons ||
     { title: false, authors: false, year: true };
+  state.settings.colVis = state.settings.colVis || {};
+  state.settings.colWidths = state.settings.colWidths || {};
+  // migrate the old single-table column setting
+  if (Object.keys(state.settings.checkedCols).length &&
+      !state.settings.colVis.checked) {
+    state.settings.colVis.checked = state.settings.checkedCols;
+  }
+  state.settings.srcFilter = state.settings.srcFilter || "ALL";
+  state.settings.dlFilter = state.settings.dlFilter || "ALL";
+  // v2.1 had a single font applied to the whole UI; the sans faces moved to
+  // the interface-font list, so migrate a saved sans value there
+  const f = state.settings.font || "";
+  if (/^(Tahoma|Verdana)/.test(f) && !state.settings.fontUi) {
+    state.settings.fontUi = f;
+    state.settings.font = "";
+  }
 }
 
 // --- tabs + header -----------------------------------------------------------
 
-const TAB_TITLES = { checked: "CHECKED BOOKS", upload: "UPLOAD LIST" };
+const TAB_TITLES = { checked: "CATALOGS", upload: "EDITOR" };
 
 function setHeader(tabId) {
   const name = `${TAB_TITLES[tabId] || ""} :: CATALOG EXPLORER`;
@@ -295,20 +367,217 @@ function initTooltips() {
   document.addEventListener("mouseleave", hideTip);
 }
 
-// --- settings window -----------------------------------------------------------
+// --- table chrome: per-table column visibility + resizable columns --------------
+// Every .grid table is registered here; the column icon above each table
+// opens a visibility menu, and dragging a header's right edge resizes it.
+// Both persist (settings.colVis / settings.colWidths, keyed per table).
 
-function applyColumnVisibility(tableId, colSettings) {
-  const table = el(tableId);
-  if (!table) return;
-  const ths = [...table.querySelectorAll("thead th")];
-  const hide = ths.map((th) => colSettings[th.dataset.col] === false);
-  ths.forEach((th, i) => { th.style.display = hide[i] ? "none" : ""; });
-  for (const tr of table.querySelectorAll("tbody tr")) {
-    [...tr.children].forEach((td, i) => { td.style.display = hide[i] ? "none" : ""; });
+const WHL_COLS = [
+  ["src", "SRC"], ["title", "TITLE"], ["subtitle", "SUBTITLE"],
+  ["authors", "AUTHORS"], ["year", "YEAR"], ["publisher", "PUBLISHER"],
+  ["pages", "PAGES"], ["lang", "LANG"], ["subject", "SUBJECT"],
+  ["description", "DESCRIPTION"], ["status", "STATUS"],
+];
+const UPLOAD_COLS = [
+  ["title", "TITLE"], ["subtitle", "SUBTITLE"], ["author", "AUTHOR"],
+  ["publisher", "PUBLISHER"], ["year", "YEAR"], ["archive", "ARCHIVE"],
+  ["record", "MATCHED RECORD"], ["action", "ACTION"],
+];
+
+function tableDef(key) {
+  switch (key) {
+    case "checked": return { tableId: "checked-table", cols: CHECKED_COLS };
+    case "whl": return { tableId: "whltop-table", cols: WHL_COLS };
+    case "upload": return { tableId: "upload-table", cols: UPLOAD_COLS };
+    default: {
+      // bottom pane tables: b-ol / b-ch / b-whl
+      const t = key.slice(2);
+      const def = BOTTOM_TABLES[t];
+      return def ? {
+        tableId: "bottom-table",
+        cols: def.cols.map((label, i) => ["c" + i, label]),
+      } : null;
+    }
   }
 }
 
+function applyTableChrome(key) {
+  const def = tableDef(key);
+  if (!def) return;
+  const table = el(def.tableId);
+  if (!table) return;
+  const vis = state.settings.colVis[key] || {};
+  const widths = state.settings.colWidths[key] || {};
+  const ths = [...table.querySelectorAll("thead th")];
+  const hide = def.cols.map(([k]) => vis[k] === false);
+  ths.forEach((th, i) => {
+    th.style.display = hide[i] ? "none" : "";
+    const w = widths[def.cols[i] ? def.cols[i][0] : "c" + i];
+    th.style.width = w ? w + "px" : "";
+    if (!th.querySelector(".col-rz")) {
+      const rz = document.createElement("span");
+      rz.className = "col-rz";
+      rz.dataset.ci = i;
+      th.appendChild(rz);
+    }
+  });
+  table.style.tableLayout = Object.keys(widths).length ? "fixed" : "";
+  table.dataset.ck = key;
+  for (const tr of table.querySelectorAll("tbody tr")) {
+    [...tr.children].forEach((td, i) => {
+      td.style.display = hide[i] ? "none" : "";
+    });
+  }
+}
+
+// one delegated drag handler covers every table's resize grips
+function initColResize() {
+  let drag = null;
+  document.addEventListener("mousedown", (ev) => {
+    const rz = ev.target.closest(".col-rz");
+    if (!rz) return;
+    ev.preventDefault();
+    const th = rz.parentElement;
+    const table = th.closest("table");
+    drag = { th, table, key: table.dataset.ck, ci: +rz.dataset.ci,
+             x: ev.clientX, w: th.offsetWidth, moved: false };
+    document.body.classList.add("resizing");
+  });
+  document.addEventListener("mousemove", (ev) => {
+    if (!drag) return;
+    drag.moved = true;
+    const w = Math.max(36, drag.w + ev.clientX - drag.x);
+    drag.th.style.width = w + "px";
+    drag.table.style.tableLayout = "fixed";
+  });
+  document.addEventListener("mouseup", () => {
+    if (!drag) return;
+    const def = drag.moved ? tableDef(drag.key) : null;
+    if (def) {
+      const colKey = def.cols[drag.ci] ? def.cols[drag.ci][0] : "c" + drag.ci;
+      const w = parseInt(drag.th.style.width, 10) || drag.w;
+      state.settings.colWidths[drag.key] =
+        state.settings.colWidths[drag.key] || {};
+      state.settings.colWidths[drag.key][colKey] = w;
+      saveSettings();
+    }
+    document.body.classList.remove("resizing");
+    drag = null;
+  });
+}
+
+// --- popup menus (filter + column visibility) ------------------------------------
+
+let popupAnchor = null;
+
+function closePopup() {
+  el("popup-menu").hidden = true;
+  popupAnchor = null;
+}
+
+function openPopup(anchor, html, wire) {
+  const pop = el("popup-menu");
+  if (!pop.hidden && popupAnchor === anchor) { closePopup(); return; }
+  popupAnchor = anchor;
+  pop.innerHTML = html;
+  pop.hidden = false;
+  const r = anchor.getBoundingClientRect();
+  pop.style.top = Math.min(r.bottom + 4, innerHeight - pop.offsetHeight - 8) + "px";
+  pop.style.left = Math.max(8, Math.min(r.right - pop.offsetWidth,
+    innerWidth - pop.offsetWidth - 8)) + "px";
+  if (wire) wire(pop);
+}
+
+function openColumnMenu(anchor, key, rerender) {
+  const def = tableDef(key);
+  if (!def) return;
+  const vis = state.settings.colVis[key] || {};
+  const html = `<div class="pm-head">VISIBLE COLUMNS</div>` +
+    def.cols.map(([k, label]) => `
+      <label class="pm-item"><input type="checkbox" data-k="${esc(k)}"
+        ${vis[k] === false ? "" : "checked"} /> ${esc(label)}</label>`).join("");
+  openPopup(anchor, html, (pop) => {
+    pop.querySelectorAll("input[data-k]").forEach((cb) => {
+      cb.addEventListener("change", () => {
+        state.settings.colVis[key] = state.settings.colVis[key] || {};
+        if (cb.checked) delete state.settings.colVis[key][cb.dataset.k];
+        else state.settings.colVis[key][cb.dataset.k] = false;
+        saveSettings();
+        rerender();
+      });
+    });
+  });
+}
+
+const FILTER_GROUPS = [
+  ["markFilter", "MARK", [["ALL", "ALL"], ["SCAN", "SCAN"], ["UPLOAD", "UPLOAD"],
+    ["APPROVED", "APPROVED"], ["NONE", "UNMARKED"]]],
+  ["srcFilter", "SOURCE", [["ALL", "ALL"], ["MANUAL", "MANUAL ENTRIES"],
+    ["CATALOG", "CATALOG BOOKS"]]],
+  ["dlFilter", "DOWNLOAD", [["ALL", "ALL"], ["DONE", "DOWNLOADED"],
+    ["NOT", "NOT DOWNLOADED"], ["FAILED", "DOWNLOAD FAILED"]]],
+];
+
+function filtersActive() {
+  return FILTER_GROUPS.some(([k]) => (state.settings[k] || "ALL") !== "ALL");
+}
+
+function syncFilterBtn() {
+  el("filter-btn").classList.toggle("active", filtersActive());
+}
+
+function openFilterMenu(anchor) {
+  const html = FILTER_GROUPS.map(([k, head, opts]) =>
+    `<div class="pm-head">${head}</div>` +
+    opts.map(([v, label]) => `
+      <label class="pm-item"><input type="radio" name="pm-${k}" value="${v}"
+        ${(state.settings[k] || "ALL") === v ? "checked" : ""} /> ${label}</label>`).join("")
+  ).join("");
+  openPopup(anchor, html, (pop) => {
+    pop.querySelectorAll("input[type=radio]").forEach((rb) => {
+      rb.addEventListener("change", () => {
+        state.settings[rb.name.slice(3)] = rb.value;
+        saveSettings();
+        syncFilterBtn();
+        renderChecked();
+      });
+    });
+  });
+}
+
+// --- settings window -----------------------------------------------------------
+
+function fillFontSelect(id, list, settingKey, apply) {
+  const sel = el(id);
+  sel.innerHTML = "";
+  for (const [val, label] of list) {
+    const o = document.createElement("option");
+    o.value = val;
+    o.textContent = label;
+    sel.appendChild(o);
+  }
+  sel.value = state.settings[settingKey] || "";
+  if (sel.value !== (state.settings[settingKey] || "")) sel.value = "";
+  sel.onchange = () => {
+    state.settings[settingKey] = sel.value;
+    saveSettings();
+    apply();
+  };
+}
+
 function renderSettings() {
+  // GENERAL
+  el("gen-info").textContent =
+    `Catalog Explorer ${el("tb-meta").textContent} — ` +
+    `${state.manual.length} manual entries / ${state.checked.size} checked books. ` +
+    (el("status-right").textContent || "");
+  el("reset-settings").onclick = () => {
+    if (!window.confirm("Reset every interface setting? (Catalog data is kept.)")) return;
+    try { localStorage.removeItem(SETTINGS_KEY); } catch (e) {}
+    location.reload();
+  };
+
+  // APPEARANCE
   const themeSel = el("theme-select");
   themeSel.innerHTML = "";
   for (const [id, label] of THEMES) {
@@ -323,39 +592,58 @@ function renderSettings() {
     saveSettings();
     applyTheme();
   };
+  fillFontSelect("font-ui-select", UI_FONTS, "fontUi", applyFont);
+  fillFontSelect("font-select", FONTS, "font", applyFont);
 
-  const fontSel = el("font-select");
-  fontSel.innerHTML = "";
-  for (const [val, label] of FONTS) {
-    const o = document.createElement("option");
-    o.value = val;
-    o.textContent = label;
-    fontSel.appendChild(o);
-  }
-  fontSel.value = state.settings.font || "";
-  fontSel.onchange = () => {
-    state.settings.font = fontSel.value;
-    saveSettings();
-    applyFont();
-  };
-
+  // TABLE VIEW
   const wrap = el("cols-checked");
   wrap.innerHTML = "";
+  const vis = state.settings.colVis.checked || {};
   for (const [key, label] of CHECKED_COLS) {
     const lab = document.createElement("label");
     lab.className = "settings-col";
     const cb = document.createElement("input");
     cb.type = "checkbox";
-    cb.checked = state.settings.checkedCols[key] !== false;
+    cb.checked = vis[key] !== false;
     cb.addEventListener("change", () => {
-      if (cb.checked) delete state.settings.checkedCols[key];
-      else state.settings.checkedCols[key] = false;
+      state.settings.colVis.checked = state.settings.colVis.checked || {};
+      if (cb.checked) delete state.settings.colVis.checked[key];
+      else state.settings.colVis.checked[key] = false;
       saveSettings();
-      applyColumnVisibility("checked-table", state.settings.checkedCols);
+      applyTableChrome("checked");
     });
     lab.appendChild(cb);
     lab.appendChild(document.createTextNode(" " + label));
     wrap.appendChild(lab);
+  }
+  el("reset-widths").onclick = () => {
+    state.settings.colWidths = {};
+    saveSettings();
+    for (const id of ["checked-table", "whltop-table", "upload-table", "bottom-table"]) {
+      const t = el(id);
+      t.style.tableLayout = "";
+      t.querySelectorAll("thead th").forEach((th) => { th.style.width = ""; });
+    }
+    status("COLUMN WIDTHS RESET");
+  };
+
+  // FILE PATHS
+  const bd = el("set-browse-dir");
+  bd.value = state.settings.pdfBrowseDir || "";
+  bd.onchange = () => {
+    state.settings.pdfBrowseDir = bd.value.trim();
+    saveSettings();
+  };
+}
+
+function initSettingsNav() {
+  for (const b of document.querySelectorAll("#settings-nav .snav")) {
+    b.addEventListener("click", () => {
+      document.querySelectorAll("#settings-nav .snav").forEach((x) =>
+        x.classList.toggle("active", x === b));
+      document.querySelectorAll("#settings-content .settings-sec").forEach((s) =>
+        s.classList.toggle("active", s.id === b.dataset.sec));
+    });
   }
 }
 
@@ -576,7 +864,7 @@ function computeMark(row) {
   if (ia === true || ht === true)
     return {
       mark: "UPLOAD",
-      reason: "Not in WHL; a scan exists in an online archive.\nVerify each found source (click its marker); approved sources land in the UPLOAD LIST tab.",
+      reason: "Not in WHL; a scan exists in an online archive.\nVerify each found source (click its marker); approved sources land in the EDITOR tab.",
     };
   const pd = c && (c.copyright_status || "").startsWith("Public domain");
   if (!pd)
@@ -607,7 +895,7 @@ function markCell(row) {
   if (mark === "SCAN") return badge("scan", "SCAN", { tip: reason });
   if (mark === "UPLOAD") {
     if (anyApprovedSource(row))
-      return badge("approved", "UPLD", { tip: "Approved source(s) ready — see the UPLOAD LIST tab" });
+      return badge("approved", "UPLD", { tip: "Approved source(s) ready — see the EDITOR tab" });
     return badge("upload", "UPLD", { tip: reason });
   }
   return badge("unknown", "—", { tip: reason });
@@ -687,20 +975,34 @@ function dlPct(dl) {
   return Math.round((dl.bytes / dl.total) * 100) + "%";
 }
 
-function iaCell(row) {
-  let html = scanBadge(row, "internet_archive");
+// download state of a row's IA source: "done" | "failed" | "downloading" | ""
+function dlState(row) {
   const ident = iaIdentifierForRow(row);
-  if (ident) {
+  if (!ident) return "";
+  const dl = state.downloads.get(ident);
+  if ((dl && dl.status === "done") || state.downloadedIds.has(ident)) return "done";
+  if (dl && dl.status === "error") return "failed";
+  if (dl && dl.status === "downloading") return "downloading";
+  return "";
+}
+
+function iaCell(row) {
+  // the tag stays centered; the download marker sits to its right without
+  // displacing it: * (black) = saved, ** (red) = failed
+  const tag = scanBadge(row, "internet_archive");
+  const ident = iaIdentifierForRow(row);
+  const st = dlState(row);
+  let mark = "";
+  if (st === "done") {
+    mark = `<span class="dl-mark ok" data-tip="${esc("Saved: downloads/ia/" + ident + ".pdf")}">*</span>`;
+  } else if (st === "failed") {
     const dl = state.downloads.get(ident);
-    if ((dl && dl.status === "done") || state.downloadedIds.has(ident)) {
-      html += ` <span class="dl-done" data-tip="PDF saved under downloads/ia/ with a catalog entry">SAVED</span>`;
-    } else if (dl && dl.status === "downloading") {
-      html += ` <span class="dl-prog">${dlPct(dl)}</span>`;
-    } else if (dl && dl.status === "error") {
-      html += ` <span class="dl-err" data-tip="${esc(dl.error || "download failed")}">DL ERR</span>`;
-    }
+    mark = `<span class="dl-mark err" data-tip="${esc((dl && dl.error) || "Download failed")}">**</span>`;
+  } else if (st === "downloading") {
+    const dl = state.downloads.get(ident);
+    mark = `<span class="dl-mark prog" data-tip="Downloading from the Internet Archive">${dlPct(dl)}</span>`;
   }
-  return html;
+  return tag + mark;
 }
 
 const TIP_FIELDS = [
@@ -716,16 +1018,40 @@ const TIP_FIELDS = [
 function recordTip(rec, header) {
   const lines = header ? [header] : [];
   for (const [k, label] of TIP_FIELDS) {
-    const v = (rec[k] || "").toString().trim();
-    if (v) lines.push(`${label}: ${v}`);
+    let v = (rec[k] || "").toString().trim();
+    if (!v) continue;
+    // keep the tooltip a manageable size: long fields (notes, descriptions)
+    // are abbreviated
+    const cap = (k === "notes" || k === "description") ? 90 : 140;
+    if (v.length > cap) v = v.slice(0, cap).trimEnd() + " …";
+    lines.push(`${label}: ${v}`);
   }
-  lines.push("CLICK ROW: add to the top-pane table");
+  lines.push("CLICK ROW: add to the top table  |  CTRL+CLICK: open in EDIT");
   return lines.join("\n");
 }
 
 function updateCheckedCount() {
   el("checked-count").textContent =
     `${state.checked.size} CHECKED / ${state.manual.length} MANUAL`;
+}
+
+// the FIND box + the filter menu, applied identically for display and export
+function filteredCheckedRows() {
+  let rows = combinedRows();
+  const q = findQuery();
+  if (!q.empty)
+    rows = rows.filter((r) => matchesFind(
+      q, `${r.book.title} ${r.book.subtitle || ""}`, r.book.author, r.book.year));
+  const mf = state.settings.markFilter || "ALL";
+  if (mf !== "ALL") rows = rows.filter((r) => rowMarkState(r) === mf);
+  const sf = state.settings.srcFilter || "ALL";
+  if (sf === "MANUAL") rows = rows.filter((r) => r.kind === "manual");
+  else if (sf === "CATALOG") rows = rows.filter((r) => r.kind !== "manual");
+  const df = state.settings.dlFilter || "ALL";
+  if (df === "DONE") rows = rows.filter((r) => dlState(r) === "done");
+  else if (df === "FAILED") rows = rows.filter((r) => dlState(r) === "failed");
+  else if (df === "NOT") rows = rows.filter((r) => dlState(r) !== "done");
+  return rows;
 }
 
 function renderChecked() {
@@ -735,15 +1061,8 @@ function renderChecked() {
   updateCheckedCount();
   const tbody = el("checked-rows");
   tbody.innerHTML = "";
-  let rows = combinedRows();
-  state.rowsById = new Map(rows.map((r) => [String(r.id), r]));
-
-  const q = findQuery();
-  if (!q.empty)
-    rows = rows.filter((r) => matchesFind(
-      q, `${r.book.title} ${r.book.subtitle || ""}`, r.book.author, r.book.year));
-  const mf = state.settings.markFilter || "ALL";
-  if (mf !== "ALL") rows = rows.filter((r) => rowMarkState(r) === mf);
+  state.rowsById = new Map(combinedRows().map((r) => [String(r.id), r]));
+  const rows = filteredCheckedRows();
 
   el("checked-empty").hidden = rows.length !== 0;
 
@@ -765,18 +1084,26 @@ function renderChecked() {
       <td class="col-whl">${markCell(row)}</td>
       <td class="col-act">
         ${row.kind === "manual"
-          ? `<button class="cad-btn tiny danger" data-mdel="${esc(row.id)}">DEL</button>`
-          : `<button class="cad-btn tiny" data-unchk="${esc(row.id)}" data-tip="Remove from checked books">UNCHK</button>`}
+          ? `<button class="cad-btn tiny icon-btn danger" data-mdel="${esc(row.id)}" data-tip="Delete this manual entry">${ICONS.trash}</button>`
+          : `<button class="cad-btn tiny icon-btn" data-unchk="${esc(row.id)}" data-tip="Remove from checked books">${ICONS.remove}</button>`}
       </td>`;
     tbody.appendChild(tr);
   }
 
-  applyColumnVisibility("checked-table", state.settings.checkedCols);
+  applyTableChrome("checked");
   renderBottomPane();
 }
 
 // One delegated handler covers verify markers / delete / uncheck / edit clicks.
 function onCheckedClick(ev) {
+  if (ev.ctrlKey || ev.metaKey) {
+    const tr = ev.target.closest("tr");
+    if (tr && tr.dataset.rowId) {
+      ev.preventDefault();
+      openBookEditTab(tr.dataset.rowId);
+    }
+    return;
+  }
   const mark = ev.target.closest(".vmark");
   if (mark) {
     const unit = mark.closest("[data-vsrc]");
@@ -1085,6 +1412,7 @@ function renderBottomRows() {
   el("bottom-empty").hidden = records.length !== 0;
   el("bottom-count").textContent =
     `${records.length} ROWS` + (t === "ol" && state.olNote ? ` — ${state.olNote}` : "");
+  applyTableChrome("b-" + t);
 }
 
 // --- realtime Open Library table --
@@ -1247,7 +1575,7 @@ function switchTopTable(t) {
   el("top-table").value = t;
   el("checked-pane").hidden = t !== "checked";
   el("whltop-pane").hidden = t !== "whl";
-  for (const id of ["run-scans", "dl-approved", "export-json", "clear-checked"]) {
+  for (const id of ["run-scans", "dl-approved", "export-json", "filter-btn"]) {
     el(id).disabled = t !== "checked";
   }
   updateModeTag();
@@ -1267,6 +1595,14 @@ async function renderTop() {
 }
 
 function renderWhlTop() {
+  // the WHL table owns the top pane only when selected there — a save from
+  // the EDIT tab (reachable from the bottom pane) must not repaint it or
+  // clobber the shared count label
+  if (state.settings.topTable !== "whl") return;
+  // background re-renders (e.g. scrape completion) must not destroy an
+  // in-progress cell edit
+  const active = document.activeElement;
+  if (active && active.classList && active.classList.contains("cell-edit")) return;
   const mode = whlMode();
   const btn = el("whl-mode");
   btn.hidden = state.settings.topTable !== "whl";
@@ -1318,6 +1654,7 @@ function renderWhlTop() {
   el("whltop-empty").hidden = shown.length !== 0;
   el("top-count").textContent =
     `${rows.length} WHL ROWS` + (rows.length > 400 ? " (SHOWING 400)" : "");
+  applyTableChrome("whl");
 }
 
 function whlRowByIdx(idx) {
@@ -1443,19 +1780,146 @@ function startWhlEdit(td) {
   input.addEventListener("blur", () => finish(true));
 }
 
-// --- full-record editor tab (Ctrl+click in edit mode) --
+// --- the EDIT tab: a record editor opened with Ctrl+click from any table.
+// It shows the WHL field set for WHL rows and the book field set for
+// checked / manual / CH-catalog records.
+
+function showEditForms(kind) {
+  el("whledit-tab").hidden = false;
+  el("whledit-form").hidden = kind !== "whl";
+  el("bookedit-form").hidden = kind === "whl";
+  switchPaneTab("pane-edit");
+}
 
 function openWhlEditTab(idx) {
   const row = whlRowByIdx(idx);
   if (!row) return;
   state.whlEditIdx = idx;
-  el("whledit-tab").hidden = false;
+  state.editTarget = { kind: "whl", idx };
   el("whledit-note").textContent =
-    `ROW ${idx >= 0 ? "#" + idx : "(ADDED)"} :: ${row.title.slice(0, 60)}`;
+    `WHL ROW ${idx >= 0 ? "#" + idx : "(ADDED)"} :: ${row.title.slice(0, 60)}`;
   for (const f of WHL_ROW_FIELDS) el("w-" + f).value = row[f] || "";
   el("whledit-msg").textContent = "";
-  switchPaneTab("pane-whledit");
+  showEditForms("whl");
   el("w-title").focus();
+}
+
+const BOOK_EDIT_FIELDS = MANUAL_FIELDS.concat(["acquired"]);
+
+function fillBookEditForm(book, showAcquired) {
+  for (const f of BOOK_EDIT_FIELDS) {
+    el("e-" + f).value = book[f] || "";
+  }
+  // manual entries have no ACQUIRED field — the form adapts to the source
+  el("e-acquired").closest(".mf-field").hidden = !showAcquired;
+  el("bookedit-msg").textContent = "";
+}
+
+// a checked-books / manual row
+function openBookEditTab(rowId) {
+  const row = state.rowsById.get(String(rowId));
+  if (!row) return;
+  state.editTarget = { kind: "row", id: String(rowId) };
+  el("whledit-note").textContent =
+    `${row.kind === "manual" ? "MANUAL ENTRY" : "CHECKED BOOK"} :: ` +
+    `${(row.book.title || "").slice(0, 60)}`;
+  fillBookEditForm(row.book, row.kind !== "manual");
+  showEditForms("book");
+  el("e-title").focus();
+}
+
+// a CH catalog record (bottom pane); SAVE checks it with the edited metadata
+function openChEditTab(idx) {
+  const book = (state.chBooks || []).find((x) => x.idx === idx);
+  if (!book) return;
+  state.editTarget = { kind: "ch", idx };
+  el("whledit-note").textContent =
+    `CH CATALOG #${idx} :: ${(book.title || "").slice(0, 55)} — SAVE adds it to CHECKED BOOKS`;
+  const existing = state.checked.get(ckey("ch_library", idx));
+  fillBookEditForm(existing ? existing.book : book, true);
+  showEditForms("book");
+  el("e-title").focus();
+}
+
+async function patchManualFields(id, fields) {
+  const res = await fetch(`/api/manual/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(fields),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.ok && data.ok) {
+    const i = state.manual.findIndex((x) => x.id === id);
+    if (i >= 0) state.manual[i] = data.entry;
+    renderChecked();
+    queueScan(id);
+    return true;
+  }
+  return false;
+}
+
+async function saveBookEditTab(ev) {
+  ev.preventDefault();
+  const t = state.editTarget;
+  if (!t || t.kind === "whl") return;
+  const vals = {};
+  for (const f of BOOK_EDIT_FIELDS) vals[f] = el("e-" + f).value.trim();
+  if (!vals.title) { el("bookedit-msg").textContent = "TITLE IS REQUIRED"; return; }
+
+  if (t.kind === "row") {
+    const row = state.rowsById.get(t.id);
+    if (!row) { el("bookedit-msg").textContent = "ROW IS GONE"; return; }
+    if (row.kind === "manual") {
+      const fields = {};
+      const before = {};
+      for (const f of MANUAL_FIELDS) {
+        fields[f] = vals[f];
+        before[f] = row.book[f] || "";
+      }
+      if (await patchManualFields(t.id, fields)) {
+        pushOp(`edit entry ${vals.title.slice(0, 32)}`,
+          () => patchManualFields(t.id, before),
+          () => patchManualFields(t.id, fields));
+        el("bookedit-msg").textContent = "SAVED";
+        status(`ENTRY SAVED :: ${vals.title} :: RESCANNING`);
+      } else {
+        el("bookedit-msg").textContent = "SAVE FAILED";
+      }
+      return;
+    }
+    // checked catalog row: client-side metadata + fresh checks/scans
+    const entry = state.checked.get(t.id);
+    if (!entry) { el("bookedit-msg").textContent = "ROW IS GONE"; return; }
+    trackChecked(`edit ${vals.title.slice(0, 36)}`, t.id, () => {
+      entry.book = Object.assign({}, entry.book, vals);
+      entry.checks = null;
+      entry.scans = null;
+      entry.verify = null;
+      queueScan(t.id);
+    });
+    saveChecked();
+    renderChecked();
+    el("bookedit-msg").textContent = "SAVED";
+    status(`BOOK SAVED :: ${vals.title} :: RESCANNING`);
+    return;
+  }
+
+  // CH catalog record: check it (or update the checked copy) with the edits
+  const key = ckey("ch_library", t.idx);
+  trackChecked(`check ${vals.title.slice(0, 38)}`, key, () => {
+    const prev = state.checked.get(key) || {};
+    const base = (state.chBooks || []).find((x) => x.idx === t.idx) || {};
+    state.checked.set(key, {
+      book: Object.assign({ idx: t.idx }, base, prev.book || {}, vals),
+      checks: null, scans: null, verify: null, manual_urls: null,
+    });
+    queueScan(key);
+  });
+  saveChecked();
+  renderChecked();
+  updateCheckedCount();
+  el("bookedit-msg").textContent = "SAVED — ADDED TO CHECKED BOOKS";
+  status(`CH BOOK CHECKED WITH EDITS :: ${vals.title}`);
 }
 
 async function saveWhlEditTab(ev) {
@@ -2007,12 +2471,20 @@ function pdfLocalSrc(path) {
   return "/api/pdf?path=" + encodeURIComponent(path);
 }
 
+function fmtBytes(n) {
+  if (!n && n !== 0) return "";
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + " GB";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + " MB";
+  return Math.max(1, Math.round(n / 1e3)) + " KB";
+}
+
 function createPdfViewer() {
   const root = document.createElement("div");
   root.className = "pdf-viewer";
   root.innerHTML = `
     <div class="pdf-bar">
       <span class="pdf-path tool-label"></span>
+      <span class="pdf-size tool-label"></span>
       <a class="cad-btn tiny pdf-open" target="_blank" rel="noopener" hidden>OPEN IN TAB</a>
     </div>
     <div class="pdf-body">
@@ -2022,24 +2494,40 @@ function createPdfViewer() {
   const frame = root.querySelector(".pdf-frame");
   const note = root.querySelector(".pdf-note");
   const path = root.querySelector(".pdf-path");
+  const size = root.querySelector(".pdf-size");
   const open = root.querySelector(".pdf-open");
+  let sizeSeq = 0;
   return {
     el: root,
     show(src, label) {
-      if (frame.getAttribute("src") !== src) frame.src = src;
+      // undecorated: suppress the browser PDF viewer's toolbar/side panes
+      const framed = src.startsWith("/api/pdf")
+        ? src + "#toolbar=0&navpanes=0" : src;
+      if (frame.getAttribute("src") !== framed) frame.src = framed;
       frame.hidden = false;
       note.hidden = true;
       path.textContent = label || src;
       path.dataset.tip = src;
       open.href = src;
       open.hidden = false;
+      size.textContent = "";
+      const seq = ++sizeSeq;
+      if (src.startsWith("/api/pdf")) {
+        fetch(src, { method: "HEAD" }).then((r) => {
+          if (seq !== sizeSeq || !r.ok) return;
+          const n = parseInt(r.headers.get("content-length") || "", 10);
+          if (n) size.textContent = fmtBytes(n);
+        }).catch(() => {});
+      }
     },
     clear(msg) {
+      sizeSeq++;
       frame.removeAttribute("src");
       frame.hidden = true;
       note.textContent = msg || "NO PDF SELECTED";
       note.hidden = false;
       path.textContent = "";
+      size.textContent = "";
       delete path.dataset.tip;
       open.hidden = true;
     },
@@ -2668,7 +3156,10 @@ async function deleteManual(id) {
 // --- checked-tab batch actions ----------------------------------------------------
 
 function exportJson() {
-  const payload = combinedRows().map((r) => ({
+  // the export contains exactly what the table shows: the FIND box and the
+  // filter menu both apply
+  const rows = filteredCheckedRows();
+  const payload = rows.map((r) => ({
     source: r.kind === "manual" ? "manual_entries" : r.source,
     metadata: r.book,
     checks: r.checks || null,
@@ -2676,31 +3167,15 @@ function exportJson() {
     mark: rowMarkState(r),
     verify: r.verify || {},
   }));
+  if (!payload.length) { status("NOTHING TO EXPORT (check the filters)"); return; }
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "whl_checked_books.json";
   a.click();
   URL.revokeObjectURL(a.href);
-  status(`EXPORTED ${payload.length} RECORDS`);
-}
-
-function clearChecked() {
-  if (!window.confirm("Remove ALL checked catalog books? (Manual entries are kept.)")) return;
-  const before = JSON.parse(JSON.stringify([...state.checked.entries()]));
-  const applyMap = (entries) => {
-    state.checked = new Map(JSON.parse(JSON.stringify(entries)));
-    saveChecked();
-    renderChecked();
-    updateCheckedCount();
-  };
-  state.checked.clear();
-  pushOp(`clear ${before.length} checked books`,
-    () => applyMap(before),
-    () => applyMap([]));
-  saveChecked();
-  renderChecked();
-  status("CLEARED CHECKED BOOKS");
+  status(`EXPORTED ${payload.length} RECORDS` +
+    (filtersActive() || state.checkedFilter ? " (FILTERED)" : ""));
 }
 
 function setSearchPane(on) {
@@ -2775,13 +3250,14 @@ function renderUpload() {
       <td>${s.url
         ? `<a href="${esc(s.url)}" target="_blank" rel="noopener" data-tip="${esc(s.url)}">${esc(s.matched_title) || "(record)"}</a>`
         : esc(s.matched_title)}</td>
-      <td class="col-act"><button class="cad-btn tiny" data-build-src="${i}"
-        data-tip="Start a catalog entry prefilled from this source">BUILD</button></td>`;
+      <td class="col-act"><button class="cad-btn tiny icon-btn" data-build-src="${i}"
+        data-tip="Build a catalog entry prefilled from this source">${ICONS.docplus}</button></td>`;
     tbody.appendChild(tr);
   });
   el("upload-count").textContent =
     `${Object.keys(state.builds).length} ENTRIES / ` +
-    `${Object.values(state.builds).filter((b) => b.status === "ready").length} READY`;
+    `${Object.values(state.builds).filter((b) => b.status === "ready").length} VERIFIED`;
+  applyTableChrome("upload");
 }
 
 function downloadUploadList() {
@@ -2834,7 +3310,7 @@ function renderBuildsList() {
       `STATUS: ${(b.status || "draft").toUpperCase()}\nUPDATED: ${b.updated_at || ""}`;
     li.innerHTML = `
       <span class="bi-title">${esc(b.title) || "<em>(untitled)</em>"}</span>
-      <span class="bi-meta">${esc(b.year || "")} ${b.status === "ready" ? "&#10003; READY" : "DRAFT"}</span>`;
+      <span class="bi-meta">${esc(b.year || "")} ${b.status === "ready" ? "&#10003; VERIFIED" : "DRAFT"}</span>`;
     list.appendChild(li);
   }
 }
@@ -3093,6 +3569,88 @@ async function attachPdfFile(path) {
   }
 }
 
+// --- menu bar ---------------------------------------------------------------
+
+const MENU_CMDS = {
+  "export": () => exportJson(),
+  "export-builds": () => exportBuilds(),
+  "dl-sources": () => downloadUploadList(),
+  "settings": () => openSettings(),
+  "undo": () => undo(),
+  "redo": () => redo(),
+  "search-pane": () => setSearchPane(!state.settings.showCatalog),
+  "table-checked": () => switchTopTable("checked"),
+  "table-whl": () => switchTopTable("whl"),
+  "run-scans": () => runScansBatch(),
+  "scrape": () => startWhlScrape(),
+  "dl-approved": () => downloadApproved(),
+};
+
+function updateMenuState() {
+  const onChecked = state.settings.topTable === "checked";
+  const dis = (cmd, v) => {
+    const b = document.querySelector(`.menu-item[data-cmd="${cmd}"]`);
+    if (b) b.disabled = !!v;
+  };
+  const check = (cmd, v) => {
+    const b = document.querySelector(`.menu-item[data-cmd="${cmd}"] .menu-check`);
+    if (b) b.classList.toggle("on", !!v);
+  };
+  dis("export", !onChecked);
+  dis("run-scans", !onChecked);
+  dis("dl-approved", !onChecked);
+  dis("undo", history.ptr === 0);
+  dis("redo", history.ptr >= history.stack.length);
+  check("search-pane", state.settings.showCatalog);
+  check("table-checked", onChecked);
+  check("table-whl", !onChecked);
+}
+
+function initMenubar() {
+  const menus = [...document.querySelectorAll("#menubar .menu")];
+  let openMenu = null;
+  const closeAll = () => {
+    for (const m of menus) {
+      m.querySelector(".menu-drop").hidden = true;
+      m.querySelector(".menu-btn").classList.remove("active");
+    }
+    openMenu = null;
+  };
+  const openOne = (m) => {
+    closeAll();
+    updateMenuState();
+    m.querySelector(".menu-drop").hidden = false;
+    m.querySelector(".menu-btn").classList.add("active");
+    openMenu = m;
+  };
+  for (const m of menus) {
+    const btn = m.querySelector(".menu-btn");
+    btn.addEventListener("mousedown", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      closePopup();  // stopPropagation would keep the filter/columns popup open
+      if (openMenu === m) closeAll();
+      else openOne(m);
+    });
+    btn.addEventListener("mouseenter", () => {
+      if (openMenu && openMenu !== m) openOne(m);
+    });
+  }
+  document.addEventListener("mousedown", (ev) => {
+    if (openMenu && !ev.target.closest("#menubar")) closeAll();
+  });
+  document.addEventListener("click", (ev) => {
+    const item = ev.target.closest("#menubar .menu-item");
+    if (!item || item.disabled) return;
+    closeAll();
+    const cmd = MENU_CMDS[item.dataset.cmd];
+    if (cmd) cmd();
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && openMenu) closeAll();
+  });
+}
+
 // --- wire up ---------------------------------------------------------------
 
 function init() {
@@ -3100,9 +3658,13 @@ function init() {
   applyTheme();
   applyFont();
   loadChecked();
+  injectIcons();
   initTabs();
   initTooltips();
   initPaneTabs();
+  initMenubar();
+  initSettingsNav();
+  initColResize();
   loadOlStatus();
 
   // undo / redo (toolbar)
@@ -3122,24 +3684,38 @@ function init() {
   el("whl-scrape").addEventListener("click", startWhlScrape);
   el("dl-approved").addEventListener("click", downloadApproved);
   el("export-json").addEventListener("click", exportJson);
-  el("clear-checked").addEventListener("click", clearChecked);
   el("show-catalog").classList.toggle("active", !!state.settings.showCatalog);
   el("show-catalog").addEventListener("click", () =>
     setSearchPane(!state.settings.showCatalog));
 
-  // checked-tab filter bar
+  // filter + column-visibility popups
+  el("filter-btn").addEventListener("click", () =>
+    openFilterMenu(el("filter-btn")));
+  el("colvis-top").addEventListener("click", () => {
+    if (state.settings.topTable === "whl")
+      openColumnMenu(el("colvis-top"), "whl", renderWhlTop);
+    else openColumnMenu(el("colvis-top"), "checked", renderChecked);
+  });
+  el("colvis-bottom").addEventListener("click", () =>
+    openColumnMenu(el("colvis-bottom"), "b-" + activeBottomTable(), renderBottomRows));
+  el("colvis-upload").addEventListener("click", () =>
+    openColumnMenu(el("colvis-upload"), "upload", renderUpload));
+  document.addEventListener("mousedown", (ev) => {
+    if (!el("popup-menu").hidden &&
+        !ev.target.closest("#popup-menu") &&
+        !(popupAnchor && popupAnchor.contains(ev.target))) {
+      closePopup();
+    }
+  });
+  syncFilterBtn();
+
+  // checked-tab find bar
   el("checked-search").addEventListener("input", () => {
     state.checkedFilter = el("checked-search").value.trim();
     state.olOverride = null;
     renderTop();
     renderBottomRows();
     scheduleOlRealtime();
-  });
-  el("mark-filter").value = state.settings.markFilter || "ALL";
-  el("mark-filter").addEventListener("change", () => {
-    state.settings.markFilter = el("mark-filter").value;
-    saveSettings();
-    renderChecked();
   });
   el("checked-rows").addEventListener("click", onCheckedClick);
 
@@ -3159,15 +3735,17 @@ function init() {
     const tr = ev.target.closest("tr");
     if (!tr) return;
     const idx = parseInt(tr.dataset.widx, 10);
+    // Ctrl+click opens the record in the EDIT tab from either mode
+    if (ev.ctrlKey || ev.metaKey) { openWhlEditTab(idx); return; }
     if (whlMode() === "search") {
       if (ev.target.closest("td[data-wsearch]")) selectWhlSearchRow(idx);
       return;
     }
-    if (ev.ctrlKey || ev.metaKey) { openWhlEditTab(idx); return; }
     const td = ev.target.closest("td[data-wedit]");
     if (td) startWhlEdit(td);
   });
   el("whledit-form").addEventListener("submit", saveWhlEditTab);
+  el("bookedit-form").addEventListener("submit", saveBookEditTab);
   const cons = state.settings.whlCons;
   for (const [box, key] of [["wc-title", "title"], ["wc-authors", "authors"], ["wc-year", "year"]]) {
     el(box).checked = !!cons[key];
@@ -3192,7 +3770,15 @@ function init() {
     const tr = ev.target.closest("tr.bottom-row");
     if (!tr) return;
     const rec = state.bottomRecords[parseInt(tr.dataset.bi, 10)];
-    if (rec) addToTop(rec);
+    if (!rec) return;
+    if (ev.ctrlKey || ev.metaKey) {
+      // Ctrl+click: open the record in the EDIT tab instead of adding it
+      if (rec._src === "ch") openChEditTab(rec._idx);
+      else if (rec._src === "whl") openWhlEditTab(rec._idx);
+      else status("OPEN LIBRARY ROWS HAVE NO EDITOR — click to add instead");
+      return;
+    }
+    addToTop(rec);
   });
 
   // left panel: search form, manual entry, provenance, autocomplete
