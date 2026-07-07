@@ -63,11 +63,11 @@ python3 tools/whl_explorer/server.py
 ```
 
 Open http://127.0.0.1:5001. The chrome, top to bottom: title bar, **menu
-bar** (FILE / EDIT / VIEW / TOOLS — every common function lives here;
-RUN SCANS, SCRAPE WHL, and the SEARCH PANE toggle live *only* here), and
-the **tab strip** — **CATALOGS** (the working area) and **EDITOR** (the
+bar** (File / Edit / View / Tools — every common function lives here;
+Run scans, Scrape WHL, and the Search pane toggle live *only* here), and
+the **tab strip** — **Catalogs** (the working area) and **Editor** (the
 book builder + verified sources) on the left, with the action icons
-inline on the right: undo/redo, the active tab's commands (EDITOR: new
+inline on the right: undo/redo, the active tab's commands (Editor: new
 entry, export builds, download sources), and the settings gear.
 
 UI conventions used everywhere:
@@ -93,12 +93,14 @@ UI conventions used everywhere:
   builder create/edit/delete/attach. Deletes never ask for confirmation —
   they are undoable. The last 100 actions are kept per session.
 - The settings gear opens a categorized window (sidebar: GENERAL /
-  APPEARANCE / TABLE VIEW / FILE PATHS). Seven themes, each a full rework
-  of the interface chrome with element and text sizes preserved: CLASSIC
-  CAD (modernized flat chrome over the dark drafting canvas), ARCHIVE
-  LEDGER (neutral archival paper), PLATINUM, BLUEPRINT (warm paper over a
-  warm neutral-dark board), MODERN LIGHT, MODERN DARK, and STONE
-  (warm-gray light). Retired theme ids migrate automatically.
+  APPEARANCE / TABLE VIEW / AI / FILE PATHS). Nine themes, each a full
+  rework of the interface chrome with element and text sizes preserved:
+  CLASSIC CAD (modernized flat chrome over the dark drafting canvas),
+  ARCHIVE LEDGER (neutral archival paper), PLATINUM, BLUEPRINT (warm
+  paper over a warm neutral-dark board), MODERN LIGHT, MODERN DARK,
+  STONE (warm-gray light), MIDNIGHT (deep blue-black), and SAGE (muted
+  green-gray). Status tags are square in every theme. Retired theme ids
+  migrate automatically.
 - Titles and subtitles filled from Open Library are converted to
   conventional title case; "Last, First" author names are flipped to
   "First Last" when repopulating WHL rows.
@@ -154,14 +156,25 @@ drives the realtime Open Library query — `[title]` words, `@author`
 
 ### Top pane (dropdown selects the working table)
 
+**Both tables have EDIT and SEARCH modes**, toggled with the `MODE:`
+button or **Ctrl+E** (the current mode shows as a footer tag). In EDIT
+mode cells are edited in place; in SEARCH mode click a row's title to
+look it up on Open Library (constrained by the target-icon group — TITLE
+requires the title verbatim), then click a result in the bottom pane to
+repopulate the row: titles/subtitles are title-cased and "Last, First"
+authors flipped on the way in. Title, author, and year copy by default;
+**Ctrl+click an Open Library column header** (green) to force-copy it
+(publisher/language for WHL rows; also city/edition/volume for books)
+and **Shift+click** (red) to exclude one. Ctrl+click a row opens it in
+the `EDIT` tab from either mode.
+
 - `CHECKED BOOKS + MANUAL` — one combined table of manual entries and
   checked catalog books (`SRC` column) with icon actions (trash = delete a
-  manual entry, minus-circle = uncheck a catalog book). Metadata cells are
-  edited in place: click a cell, type, Enter/blur commits (Escape
-  cancels); manual-entry edits persist server-side, and any edit re-queues
-  the row's checks and scans. IA download state shows as a dot inside the
-  tag's right edge (the label stays centered): **green** = saved (tooltip:
-  the file path), **red** = failed (tooltip: the error).
+  manual entry, minus-circle = uncheck a catalog book). Any edit or
+  repopulation re-queues the row's checks and scans. IA download state
+  shows as a dot inside the tag's right edge (the label stays centered):
+  **green** = saved (tooltip: the file path), **red** = failed (tooltip:
+  the error).
 - `WHL` — the whole WHL catalog with the full column set (title, subtitle,
   authors, year, publisher, pages, language, subject, description,
   status). Corrections never touch `whl_catalog.csv`; they live in
@@ -171,17 +184,6 @@ drives the realtime Open Library query — `[title]` words, `@author`
   `ADDED`). **Holding Alt over an edited row shows the original record**
   (grayed, yellow-tinted); the same works in the `EDIT` panel while a WHL
   record is loaded.
-  Two modes, toggled with the `MODE:` button or **Ctrl+E** (the current
-  mode also shows as a tag in the footer): in EDIT mode click a cell to
-  correct it; in SEARCH mode click a title to look it up on Open Library,
-  then click a result to repopulate the row's metadata — titles/subtitles
-  are title-cased and "Last, First" authors flipped on the way in. Title,
-  author, and year copy by default; **Ctrl+click an Open Library column
-  header** (green) to force-copy it — publisher and language become
-  available this way — and **Shift+click** (red) to exclude one.
-  Ctrl+click opens the record in the `EDIT` tab from either mode. The
-  constraint group (target icon) chooses which of the clicked row's
-  columns narrow the lookup — TITLE requires the title to appear verbatim.
   A published entry's `PUB` tag opens its publication PDF in a viewer
   window (with an optional parallel OCR pane — GENERAL settings) instead
   of a browser tab.
@@ -277,10 +279,15 @@ Two parts, separated by a **drag-to-resize splitter**:
   The editor puts the save and delete icons side by side at the top with
   the VERIFIED toggle (a check icon; pressing it reveals a VERIFIED tag),
   over two sub-tabs (their content scrolls):
-  - `ENTRY` — the metadata fields with the **live Markdown description
-    editor** occupying the space to their right (Obsidian-style — markers
-    hide on rendered lines; the line under the caret shows its dimmed
-    source).
+  - `ENTRY` — the metadata fields (their scrollbar is hidden) with the
+    **live Markdown description editor** occupying the space to their
+    right (Obsidian-style — markers hide on rendered lines; the line under
+    the caret shows its dimmed source). Next to the DESCRIPTION label: a
+    **sparkle icon** generates an AI summary from the PDF's OCR text via
+    the OpenAI-compatible endpoint configured under SETTINGS > AI (base
+    URL, model, API key, custom instructions), and a **file icon** loads
+    the description from a local text file. Both leave the result unsaved
+    until SAVE.
   - `SOURCE (PDF)` — an embedded, **undecorated PDF viewer** (no browser
     toolbar; the file size shows in the bar) with an **OCR icon** that
     opens the extracted text layer in a parallel pane, for verifying the

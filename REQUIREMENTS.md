@@ -262,3 +262,19 @@ is decided by a tolerant composite rather than exact strings:
   VERIFIED icon toggle with tag, VERIFIED SOURCES with an N ROWS count,
   PATH TO PDF label, browse/attach icons, instructional text stripped
   throughout, taller description/notes fields.
+- v2.4: the checked-books table gains the same Open Library SEARCH mode
+  the WHL table has (per-table mode, shared MODE button/Ctrl+E, footer
+  tag CHECKED/WHL MODE, column marks extended to city/edition/volume for
+  books). Tabs and menus use regular case. Two more themes (MIDNIGHT,
+  SAGE) and square tags across all nine. PDF viewer scrollbars are
+  clipped (oversized frame in an overflow-hidden wrap); the ENTRY form's
+  scrollbar is hidden. AI summary plumbing: a sparkle button by the
+  DESCRIPTION label extracts the PDF's OCR text and calls
+  /api/ai/summarize (server-side proxy to an OpenAI-compatible chat API;
+  SETTINGS > AI holds base URL / model / API key / custom instructions),
+  plus a load-description-from-file button. Column resizing was fixed
+  properly: the first drag freezes every visible column's width so only
+  the dragged column changes, the table is sized to the sum, no-drag
+  clicks are no-ops. The manual-entry scans endpoint re-reads and merges
+  only its scans so a slow scan can no longer resurrect stale metadata
+  over a concurrent edit/undo.
