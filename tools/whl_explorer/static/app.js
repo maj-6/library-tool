@@ -597,6 +597,33 @@ async function flushClientState() {
   } catch (e) { /* offline: the localStorage cache still holds it */ }
 }
 
+// The search-constraint checkboxes (Title/Author/Year) are the one always-on
+// control initialized from settings at bind time. Keep their DISPLAY in sync
+// with the live settings object: adopting server state on load replaces
+// state.settings (and .whlCons) with a fresh object, so anything holding a
+// stale reference — or a checkbox set once at init — silently desyncs.
+const CONS_BOXES = [["wc-title", "title"], ["wc-authors", "authors"], ["wc-year", "year"]];
+function syncConsCheckboxes() {
+  const cons = state.settings.whlCons || {};
+  for (const [box, key] of CONS_BOXES) {
+    const e = el(box);
+    if (e) e.checked = !!cons[key];
+  }
+}
+
+// When the same book is checked in both the local cache and the server copy,
+// keep whichever entry carries more work (scan results, verify state, checks).
+function richerEntry(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  const score = (e) => (e && typeof e === "object")
+    ? (e.scans ? 4 : 0) + (e.verify ? 2 : 0) + (e.checks ? 1 : 0) : 0;
+  const sa = score(a), sb = score(b);
+  if (sa !== sb) return sa > sb ? a : b;
+  try { return JSON.stringify(b).length >= JSON.stringify(a).length ? b : a; }
+  catch (e) { return b; }
+}
+
 // On load the SERVER copy is authoritative. If the server has nothing yet
 // (first run of this build), seed it from whatever localStorage held so no
 // existing work is lost. Returns true if server state was adopted (the
@@ -608,20 +635,38 @@ async function syncClientStateOnLoad() {
   const hasServer = server &&
     (server.checked || server.settings || server.attention);
   if (hasServer) {
+    // Adopt-by-MERGE, not replace: union the server copy with the local cache
+    // so a near-empty client can never wipe a fuller set (and vice versa). If
+    // the local cache turns out to be fuller (the server was clobbered), heal
+    // the server by pushing the merged result back.
+    let healChecked = false;
     if (Array.isArray(server.checked)) {
-      state.checked = new Map(server.checked);
-      try { localStorage.setItem(LS_KEY, JSON.stringify(server.checked)); } catch (e) {}
+      const merged = new Map(state.checked);       // local cache (may be fuller)
+      for (const [k, v] of server.checked) {
+        merged.set(k, richerEntry(merged.get(k), v));
+      }
+      // heal vs the count of DISTINCT server keys, so a duplicate-laden server
+      // array (only reachable via external corruption) is repaired, not ignored
+      const serverDistinct = new Set(server.checked.map((p) => p[0])).size;
+      healChecked = merged.size > serverDistinct;
+      state.checked = merged;
+      try { localStorage.setItem(LS_KEY, JSON.stringify(checkedArray())); } catch (e) {}
     }
     if (server.settings && typeof server.settings === "object") {
       state.settings = Object.assign(state.settings, server.settings);
       normalizeSettings();
+      syncConsCheckboxes();   // refresh persistent settings-bound controls
       try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings)); } catch (e) {}
     }
     if (server.attention && typeof server.attention === "object") {
+      // Attention marks (unlike checked books) are a low-stakes set that
+      // supports removal, so the server copy is authoritative on load — a
+      // union would resurrect marks the user deliberately cleared.
       state.attn = server.attention;
       try { localStorage.setItem(ATTN_KEY, JSON.stringify(state.attn)); } catch (e) {}
     }
     clientStateReady = true;
+    if (healChecked) pushClientState("checked");
     return true;
   }
   // seed the server from local, then allow write-through
@@ -6703,10 +6748,11 @@ function init() {
   });
   el("whledit-form").addEventListener("submit", saveWhlEditTab);
   el("bookedit-form").addEventListener("submit", saveBookEditTab);
-  const cons = state.settings.whlCons;
-  for (const [box, key] of [["wc-title", "title"], ["wc-authors", "authors"], ["wc-year", "year"]]) {
-    el(box).checked = !!cons[key];
+  for (const [box, key] of CONS_BOXES) {
     el(box).addEventListener("change", () => {
+      // read/write the LIVE settings object — a captured reference would
+      // detach from state.settings.whlCons once server state is adopted
+      const cons = state.settings.whlCons || (state.settings.whlCons = {});
       cons[key] = el(box).checked;
       saveSettings();
       if (topMode() !== "search") return;
@@ -6718,6 +6764,7 @@ function init() {
       }
     });
   }
+  syncConsCheckboxes();
 
   // bottom pane
   el("bottom-addtab").addEventListener("click", () => {

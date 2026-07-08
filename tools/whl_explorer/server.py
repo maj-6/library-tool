@@ -1104,6 +1104,26 @@ def _entry_checks(entry: dict) -> dict:
 
 _CLIENT_STATE_KEYS = ("checked", "settings", "attention")
 _client_state_lock = threading.Lock()
+_CS_BACKUP_KEEP = 40
+
+
+def _backup_client_state(state, old_n, new_n):
+    """Snapshot the current client_state before a write that shrinks the checked
+    list, so a bad sync (e.g. a near-empty client clobbering a full set) is
+    always instantly reversible. Best-effort: never let a backup failure break
+    the write."""
+    try:
+        bdir = lib.OUTPUT_DIR / "backups"
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%f")
+        lib.save_json(bdir / f"client_state.autobak.{ts}.{old_n}to{new_n}.json", state)
+        baks = sorted(bdir.glob("client_state.autobak.*.json"))
+        for p in baks[:-_CS_BACKUP_KEEP]:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+    except Exception:
+        pass
 
 
 @app.route("/api/client_state")
@@ -1116,6 +1136,18 @@ def api_client_state_put():
     payload = request.get_json(silent=True) or {}
     with _client_state_lock:
         state = lib.load_json(lib.CLIENT_STATE_PATH, {})
+        # Safety net: if this write would REDUCE the checked count, back up the
+        # current file first. Clients adopt-by-merge on load, so a legitimate
+        # shrink is a real uncheck; but this makes even that reversible and
+        # catches any client that tries to overwrite a fuller set with less.
+        # Guarded with isinstance so a malformed (non-list) payload can never
+        # raise here — a bad request degrades, it does not 500.
+        new_checked = payload.get("checked")
+        if isinstance(new_checked, list):
+            old = state.get("checked")
+            old_n = len(old) if isinstance(old, list) else 0
+            if len(new_checked) < old_n:
+                _backup_client_state(state, old_n, len(new_checked))
         for k in _CLIENT_STATE_KEYS:
             if k in payload:
                 state[k] = payload[k]

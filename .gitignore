@@ -11,6 +11,9 @@ output/.online_cache.json
 # device-local UI/session state (checked books, settings incl. API keys,
 # attention marks) — per-user, not version-controlled
 output/client_state.json
+# automatic pre-shrink snapshots of client_state + ad-hoc recovery artifacts
+# (also device-local, and can hold the same checked-book data)
+output/backups/
 
 # downloaded scans (large binaries; downloads/ia/catalog.json IS tracked)
 downloads/ia/*.pdf
