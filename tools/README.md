@@ -56,6 +56,31 @@ milliseconds, including search-as-you-type. While `ol_search.db` is absent
 the app falls back to the works index + live OL API (cached in
 `output/.ol_api_cache.json`).
 
+### App root vs data root (relocatable / packaging)
+
+Paths split into two roots (`tools/libcommon.py`) so the app can be packaged
+or moved without pinning user data to a read-only install location:
+
+- **`APP_ROOT`** — read-only assets shipped with the app: `ch_library.xlsx`,
+  the generated `output/ch_library.json`, and the reference CSVs
+  (`copyright_renewals.csv`, `whl_catalog.csv`). When frozen this is the
+  bundle dir (`sys._MEIPASS`).
+- **`DATA_ROOT`** — writable per-user state: the JSON document store
+  (`output/*.json`), entry folders, IA downloads + caches, the downloaded
+  search indexes, and `output/client_state.json`. When frozen this is a
+  per-user app-data dir; `WHL_DATA_ROOT` overrides it explicitly.
+
+In a normal dev checkout both resolve to the repo root, so the on-disk
+layout is unchanged. Stored `pdf_file` / `local_pdf` paths under the data
+root are migrated to relative form on startup so existing data stays
+portable; scans attached from elsewhere on disk keep their absolute paths.
+
+Checked books, UI settings, and attention marks are cached in the browser
+(localStorage) but written through to the server (`output/client_state.json`,
+`/api/client_state`), which is authoritative on load — so they survive a
+port change and are ready to sync. (`client_state.json` is gitignored: it
+is device-local and holds any configured API keys.)
+
 # The catalog explorer
 
 ```

@@ -368,3 +368,24 @@ is decided by a tolerant composite rather than exact strings:
   Ctrl+Q over any markable row/entry opens a modal to record the reason
   for the attention mark; reasons ride with the mark ("" / "1" /
   reason text) and surface in tooltips.
+- Packaging groundwork (toward a desktop/Electron client with a cloud
+  sync backend): paths split into APP_ROOT (read-only shipped assets:
+  ch_library.xlsx/json, the reference CSVs) vs DATA_ROOT (writable
+  per-user state: doc store, entry folders, IA downloads + caches, the
+  downloaded ol_*.db, client_state.json). Both default to the repo root
+  in dev; DATA_ROOT honors WHL_DATA_ROOT and, when frozen, a per-user
+  app-data dir — so a relocated/packaged build reads assets from the
+  bundle and writes state to a writable dir. Stored pdf_file/local_pdf
+  paths under the data root migrate to relative on startup (external
+  scans keep absolute) so existing data is portable. Checked books,
+  settings, and attention marks were lifted out of browser localStorage
+  into the server doc store (output/client_state.json, /api/client_state;
+  localStorage kept as an offline cache, server authoritative on load,
+  seeded from localStorage on first run) — making them port-independent
+  and cloud-sync-ready. A future cloud sync layer must exclude the
+  credential fields in settings before pushing off-device; client_state
+  is gitignored. Fixes: the Editor Source-tab PDF/OCR viewer no longer
+  collapses (a stored split could pin it to ~63px; #upload-split now has
+  a 440px floor so the OCR display is a usable scrollable panel), and
+  verified sources list in the order the books were added (manual
+  oldest-first by created_at, then checked in check order).
