@@ -389,3 +389,27 @@ is decided by a tolerant composite rather than exact strings:
   a 440px floor so the OCR display is a usable scrollable panel), and
   verified sources list in the order the books were added (manual
   oldest-first by created_at, then checked in check order).
+- Client-state sync hardened after a near-miss (a near-empty test client
+  seeded the authoritative server copy and a browser adopted it, appearing
+  to wipe a 253-book checked set; recovered from a Windows VSS snapshot).
+  Load-time sync is now **adopt-by-merge**: the server copy is unioned with
+  the local cache (keeping whichever entry has more work — scans/verify),
+  so neither side can wipe the other; if the local cache is the fuller one
+  the client heals the server by pushing the merge back. Server-side, any
+  PUT that would shrink the checked list first snapshots the current file to
+  output/backups/client_state.autobak.* (last 40 kept) — a bad sync is
+  always reversible. Attention marks keep authoritative replace (they support
+  deletion and carry no work, so a union would resurrect cleared marks).
+  Known limitation (multi-device/cloud only): the checked union cannot express
+  a delete across a stale client — durable multi-device unchecks will need
+  version/tombstone metadata. Testing must run against a separate
+  WHL_DATA_ROOT so it can never touch live state. (Adversarially reviewed; the
+  confirmed findings — a malformed-payload 500, an attention-merge regression,
+  and a duplicate-key heal gap — are fixed.)
+- Fixed the search constraints (Title/Author/Year toggles) doing nothing:
+  the checkboxes were bound once at init from localStorage settings, but
+  adopting the server settings on load swapped state.settings for a new
+  object — leaving the checkbox display stale and the change handler mutating
+  a detached whlCons copy the search never read. The handler now reads/writes
+  the live state.settings.whlCons, and the boxes are re-synced after adoption
+  (syncConsCheckboxes).

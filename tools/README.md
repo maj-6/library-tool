@@ -81,6 +81,23 @@ Checked books, UI settings, and attention marks are cached in the browser
 port change and are ready to sync. (`client_state.json` is gitignored: it
 is device-local and holds any configured API keys.)
 
+For the **checked books** the load-time sync is **adopt-by-merge**, not
+replace: the server copy is unioned with the local cache (keeping whichever
+entry carries more work — scan results, verify state), so a near-empty
+client can never wipe a fuller set. If the local cache turns out to be the
+fuller one (the server was clobbered), the client heals the server by
+pushing the merged result back. As a second net, any PUT that would *shrink*
+the checked list first snapshots the current file to
+`output/backups/client_state.autobak.*.json` (last 40 kept), so even a bad
+sync is instantly reversible. **Attention marks** instead use authoritative
+replace (the server copy wins on load): they support deletion and carry no
+work, so a union would resurrect marks the user deliberately cleared.
+Known limitation (matters only for the future multi-device/cloud case, not
+single-device use): because the checked merge is a pure union it cannot
+express a *deletion* across a stale client — an uncheck on one device can be
+re-added by another device's stale cache. Durable multi-device deletes will
+need per-key version/tombstone metadata in the cloud sync layer.
+
 # The catalog explorer
 
 ```
