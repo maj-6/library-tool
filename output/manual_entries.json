@@ -163,7 +163,7 @@
     "created_at": "2026-07-03T23:54:25+00:00",
     "checks": {
       "copyright_status": "Public domain (published 1792)",
-      "checked_at": "2026-07-04T19:27:19+00:00",
+      "checked_at": "2026-07-08T02:59:44+00:00",
       "in_whl": "yes",
       "whl_match": {
         "title": "Flora Rustica Vol. 1",
@@ -173,6 +173,7 @@
         "permalink": "https://worldherblibrary.org/catalog/flora-rustica-vol-1/"
       }
     },
+    "attention": "1",
     "scans": {
       "query_title": "Flora Rustica",
       "query_author": "Martyn, Thomas",
@@ -270,12 +271,14 @@
           "903996423"
         ]
       },
-      "checked_at": "2026-07-04T19:27:21+00:00"
+      "checked_at": "2026-07-08T02:59:45+00:00"
     },
     "verify": {
-      "internet_archive": "approved"
+      "internet_archive": "rejected"
     },
-    "attention": "1"
+    "manual_urls": {
+      "internet_archive": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_3"
+    }
   },
   "59f4063794c5": {
     "title": "Flora Medica",
@@ -675,10 +678,7 @@
       },
       "checked_at": "2026-07-04T20:22:13+00:00"
     },
-    "verify": {
-      "hathitrust": "approved",
-      "internet_archive": "rejected"
-    },
+    "verify": {},
     "attention": "1"
   },
   "520391858e01": {
@@ -1989,7 +1989,7 @@
     "pages": "795",
     "condition": "fair - cover detached",
     "price": "",
-    "illustrations": "Hand-colored plates",
+    "illustrations": "Excellent hand-colored plates",
     "categories": "",
     "notes": "",
     "local_pdf": "",
@@ -1997,7 +1997,7 @@
     "created_at": "2026-07-07T21:26:17+00:00",
     "checks": {
       "copyright_status": "Public domain (published 1820)",
-      "checked_at": "2026-07-07T21:44:00+00:00",
+      "checked_at": "2026-07-08T01:52:29+00:00",
       "in_whl": "no",
       "whl_match": null
     },
@@ -2008,22 +2008,14 @@
       "internet_archive": {
         "available": true,
         "best_match": {
-          "identifier": "theuniversalherbalorbotanicalmedicalandagriculturaldictionarythomasgreen1820",
-          "title": "The Universal Herbal; Or, Botanical, Medical, and Agricultural Dictionary, 1820",
+          "identifier": "b22012990_0001",
+          "title": "The universal herbal; or, botanical, medical, and agricultural dictionary",
           "author": "Green, Thomas",
           "year": "1820",
-          "url": "https://archive.org/details/theuniversalherbalorbotanicalmedicalandagriculturaldictionarythomasgreen1820",
+          "url": "https://archive.org/details/b22012990_0001",
           "accuracy": 1.0
         },
         "matches": [
-          {
-            "identifier": "theuniversalherbalorbotanicalmedicalandagriculturaldictionarythomasgreen1820",
-            "title": "The Universal Herbal; Or, Botanical, Medical, and Agricultural Dictionary, 1820",
-            "author": "Green, Thomas",
-            "year": "1820",
-            "url": "https://archive.org/details/theuniversalherbalorbotanicalmedicalandagriculturaldictionarythomasgreen1820",
-            "accuracy": 1.0
-          },
           {
             "identifier": "b22012990_0001",
             "title": "The universal herbal; or, botanical, medical, and agricultural dictionary",
@@ -2033,11 +2025,27 @@
             "accuracy": 1.0
           },
           {
-            "identifier": "universalherbalo02greerich",
-            "title": "The Universal herbal; or, Botanical, medical, and agricultural dictionary; containing an account of all the known plants in the world, arranged according to the Linnean system. Specifying the uses to which they are or may be applied, whether as food, as medicine, or in the arts and manufactures, with the best methods of propagation, and the most recent agricultural improvements ..",
+            "identifier": "theuniversalherbalorbotanicalmedicalandagriculturaldictionarythomasgreen1820",
+            "title": "The Universal Herbal; Or, Botanical, Medical, and Agricultural Dictionary, 1820",
             "author": "Green, Thomas",
+            "year": "1820",
+            "url": "https://archive.org/details/theuniversalherbalorbotanicalmedicalandagriculturaldictionarythomasgreen1820",
+            "accuracy": 1.0
+          },
+          {
+            "identifier": "b24923515_0002",
+            "title": "The universal herbal : or botanical, medical and agricultural dictionary : containing an account of all known plants in the world, arranged according to the Linnean system. Specifying the uses to which they are or may be applied .",
+            "author": "Green, Thomas; University of Glasgow. Library",
+            "year": "1816",
+            "url": "https://archive.org/details/b24923515_0002",
+            "accuracy": 0.8
+          },
+          {
+            "identifier": "b22006783_0004",
+            "title": "The universal herbal; or, botanical, medical, and agricultural dictionary. Containing an account of all the known plants in the world, arranged according to the Linnean system ... With the best methods of propagation, and the most recent agricultural improvements",
+            "author": "Green, Thomas, active 1816-1820",
             "year": "1824",
-            "url": "https://archive.org/details/universalherbalo02greerich",
+            "url": "https://archive.org/details/b22006783_0004",
             "accuracy": 0.8
           },
           {
@@ -2046,14 +2054,6 @@
             "author": "Green, Thomas, active 1816-1820",
             "year": "1824",
             "url": "https://archive.org/details/b22006783_0003",
-            "accuracy": 0.8
-          },
-          {
-            "identifier": "b22006783_0001",
-            "title": "The universal herbal; or, botanical, medical, and agricultural dictionary. Containing an account of all the known plants in the world, arranged according to the Linnean system ... With the best methods of propagation, and the most recent agricultural improvements",
-            "author": "Green, Thomas, active 1816-1820. no 96033900",
-            "year": "1824",
-            "url": "https://archive.org/details/b22006783_0001",
             "accuracy": 0.8
           }
         ],
@@ -2108,7 +2108,7 @@
           "8159040"
         ]
       },
-      "checked_at": "2026-07-07T21:44:01+00:00"
+      "checked_at": "2026-07-08T01:52:30+00:00"
     }
   },
   "5db40a804db4": {
@@ -2301,5 +2301,268 @@
       "checked_at": "2026-07-07T21:38:45+00:00"
     },
     "attention": ""
+  },
+  "b149a1c09a8c": {
+    "title": "Chewa Medical Botany",
+    "subtitle": "A Study of Herbalism in Southern Malawi",
+    "author": "Brian Morris",
+    "publisher": "Verlag",
+    "city": "Hamburg",
+    "year": "1996",
+    "edition": "",
+    "volume": "",
+    "language": "English",
+    "pages": "557",
+    "condition": "Excellent",
+    "price": "",
+    "illustrations": "",
+    "categories": "",
+    "notes": "",
+    "local_pdf": "",
+    "attention": "",
+    "id": "b149a1c09a8c",
+    "created_at": "2026-07-08T04:43:30+00:00",
+    "checks": {
+      "copyright_status": "In copyright",
+      "checked_at": "2026-07-08T04:43:30+00:00",
+      "in_whl": "no",
+      "whl_match": null
+    },
+    "scans": {
+      "query_title": "Chewa Medical Botany",
+      "query_author": "Brian Morris",
+      "query_year": "1996",
+      "internet_archive": {
+        "available": false,
+        "best_match": null,
+        "matches": [],
+        "search_url": "https://archive.org/search?query=Chewa+Medical+Botany+Brian+Morris"
+      },
+      "hathitrust": {
+        "available": false,
+        "full_view": false,
+        "best_match": null,
+        "matches": [],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=Chewa+Medical+Botany&type=title",
+        "oclcs_tried": [
+          "36557033",
+          "36474750"
+        ]
+      },
+      "checked_at": "2026-07-08T04:43:32+00:00"
+    }
+  },
+  "73141aab6496": {
+    "title": "The New-England Farrier, and Family Physician ...",
+    "subtitle": "",
+    "author": "Jewett, Paul",
+    "publisher": "J. Richardson",
+    "city": "Exeter [NH]",
+    "year": "1828",
+    "edition": "",
+    "volume": "",
+    "language": "eng",
+    "pages": "444",
+    "condition": "",
+    "price": "",
+    "illustrations": "",
+    "categories": "",
+    "notes": "From Open Library: https://openlibrary.org/books/OL17862469M",
+    "local_pdf": "",
+    "attention": "",
+    "id": "73141aab6496",
+    "created_at": "2026-07-08T04:44:20+00:00",
+    "checks": {
+      "copyright_status": "Public domain (published 1828)",
+      "checked_at": "2026-07-08T04:44:30+00:00",
+      "in_whl": "yes",
+      "whl_match": {
+        "title": "The New England farrier and Family physician",
+        "author": "",
+        "year": "",
+        "status": "publish",
+        "permalink": "https://worldherblibrary.org/catalog/the-new-england-farrier-and-family-physician-4/"
+      }
+    },
+    "scans": {
+      "query_title": "The New-England Farrier, and Family Physician ...",
+      "query_author": "Jewett, Paul",
+      "query_year": "1828",
+      "internet_archive": {
+        "available": true,
+        "best_match": {
+          "identifier": "63611240R.nlm.nih.gov",
+          "title": "The New England farrier, and Family physician",
+          "author": "Richardson, Josiah, 1778-1857; Williams, John, Dr. Dr. John Williams' Last legacy, and useful family guide",
+          "year": "1828",
+          "url": "https://archive.org/details/63611240R.nlm.nih.gov",
+          "accuracy": 0.7
+        },
+        "matches": [
+          {
+            "identifier": "63611240R.nlm.nih.gov",
+            "title": "The New England farrier, and Family physician",
+            "author": "Richardson, Josiah, 1778-1857; Williams, John, Dr. Dr. John Williams' Last legacy, and useful family guide",
+            "year": "1828",
+            "url": "https://archive.org/details/63611240R.nlm.nih.gov",
+            "accuracy": 0.7
+          }
+        ],
+        "search_url": "https://archive.org/search?query=The+New-England+Farrier%2C+and+Family+Physician+...+Jewett%2C+Paul"
+      },
+      "hathitrust": {
+        "available": false,
+        "full_view": false,
+        "best_match": null,
+        "matches": [],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=The+New-England+Farrier%2C+and+Family+Physician+...&type=title",
+        "oclcs_tried": [
+          "13630371"
+        ]
+      },
+      "checked_at": "2026-07-08T04:44:33+00:00"
+    },
+    "verify": {
+      "whl": "approved",
+      "internet_archive": "approved"
+    }
+  },
+  "397b67846366": {
+    "title": "Flora Rustica",
+    "subtitle": "Exhibiting Accurate Figures of Such Plants as Are Either Useful or Injurious in Husbandry",
+    "author": "Thomas Martyn",
+    "publisher": "F.P. Nodder",
+    "city": "London",
+    "year": "1792",
+    "edition": "",
+    "volume": "1",
+    "language": "eng",
+    "pages": "",
+    "condition": "",
+    "price": "",
+    "illustrations": "",
+    "categories": "",
+    "notes": "From Open Library: https://openlibrary.org/books/OL44674105M",
+    "local_pdf": "",
+    "attention": "",
+    "id": "397b67846366",
+    "created_at": "2026-07-08T04:47:02+00:00",
+    "checks": {
+      "copyright_status": "Public domain (published 1792)",
+      "checked_at": "2026-07-08T04:49:02+00:00",
+      "in_whl": "yes",
+      "whl_match": {
+        "title": "Flora Rustica Vol. 1",
+        "author": "Thomas Martyn",
+        "year": "1792",
+        "status": "publish",
+        "permalink": "https://worldherblibrary.org/catalog/flora-rustica-vol-1/"
+      }
+    },
+    "scans": {
+      "query_title": "Flora Rustica",
+      "query_author": "Thomas Martyn",
+      "query_year": "1792",
+      "internet_archive": {
+        "available": true,
+        "best_match": {
+          "identifier": "bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_3",
+          "title": "Flora rustica: exhibiting accurate figures of such plants as are either useful or injurious in husbandry. Drawn and engraved by Frederick P. Nodder, ... and coloured under his inspection. With scientific characters, popular descriptions, and useful observations, by Thomas Martyn, ... 1792: Vol 3",
+          "author": "Martyn, Thomas, B. D., F. R. S.",
+          "year": "1792",
+          "url": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_3",
+          "accuracy": 0.948
+        },
+        "matches": [
+          {
+            "identifier": "bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_3",
+            "title": "Flora rustica: exhibiting accurate figures of such plants as are either useful or injurious in husbandry. Drawn and engraved by Frederick P. Nodder, ... and coloured under his inspection. With scientific characters, popular descriptions, and useful observations, by Thomas Martyn, ... 1792: Vol 3",
+            "author": "Martyn, Thomas, B. D., F. R. S.",
+            "year": "1792",
+            "url": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_3",
+            "accuracy": 0.948
+          },
+          {
+            "identifier": "bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_2",
+            "title": "Flora rustica: exhibiting accurate figures of such plants as are either useful or injurious in husbandry. Drawn and engraved by Frederick P. Nodder, ... and coloured under his inspection. With scientific characters, popular descriptions, and useful observations, by Thomas Martyn, ... 1792: Vol 2",
+            "author": "Martyn, Thomas, B. D., F. R. S.",
+            "year": "1792",
+            "url": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_2",
+            "accuracy": 0.948
+          },
+          {
+            "identifier": "bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_1",
+            "title": "Flora rustica: exhibiting accurate figures of such plants as are either useful or injurious in husbandry. Drawn and engraved by Frederick P. Nodder, ... and coloured under his inspection. With scientific characters, popular descriptions, and useful observations, by Thomas Martyn, ... 1792: Vol 1",
+            "author": "Martyn, Thomas, B. D., F. R. S.",
+            "year": "1792",
+            "url": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_1",
+            "accuracy": 0.948
+          },
+          {
+            "identifier": "b28774528_0002",
+            "title": "Flora rustica: exhibiting ... figures of such plants as are either useful or injurious in husbandry",
+            "author": "Martyn, Thomas, 1735-1825. n 85089625; Nodder, Frederick Polydore, illustrator. nr 93028470",
+            "year": "1791",
+            "url": "https://archive.org/details/b28774528_0002",
+            "accuracy": 0.748
+          },
+          {
+            "identifier": "b28774528_0001",
+            "title": "Flora rustica: exhibiting ... figures of such plants as are either useful or injurious in husbandry",
+            "author": "Martyn, Thomas, 1735-1825. n 85089625; Nodder, Frederick Polydore, illustrator. nr 93028470",
+            "year": "1791",
+            "url": "https://archive.org/details/b28774528_0001",
+            "accuracy": 0.748
+          }
+        ],
+        "search_url": "https://archive.org/search?query=Flora+Rustica+Thomas+Martyn"
+      },
+      "hathitrust": {
+        "available": true,
+        "full_view": true,
+        "best_match": {
+          "title": "Flora rustica : exhibiting accurate figures of such plants as are either useful or injurious in husbandry",
+          "year": "1792",
+          "record_url": "https://catalog.hathitrust.org/Record/001824841",
+          "items": [
+            {
+              "url": "https://babel.hathitrust.org/cgi/pt?id=mdp.39015015340725",
+              "rights": "Full view",
+              "volume": ""
+            }
+          ],
+          "full_view": true,
+          "accuracy": 0.926
+        },
+        "matches": [
+          {
+            "title": "Flora rustica : exhibiting accurate figures of such plants as are either useful or injurious in husbandry",
+            "year": "1792",
+            "record_url": "https://catalog.hathitrust.org/Record/001824841",
+            "items": [
+              {
+                "url": "https://babel.hathitrust.org/cgi/pt?id=mdp.39015015340725",
+                "rights": "Full view",
+                "volume": ""
+              }
+            ],
+            "full_view": true,
+            "accuracy": 0.926
+          }
+        ],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=Flora+Rustica&type=title",
+        "oclcs_tried": [
+          "6858984",
+          "903996423"
+        ]
+      },
+      "checked_at": "2026-07-08T04:49:03+00:00"
+    },
+    "verify": {
+      "internet_archive": "rejected"
+    },
+    "manual_urls": {
+      "internet_archive": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_1"
+    }
   }
 }
