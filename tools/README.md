@@ -277,9 +277,11 @@ The `MARK` column classifies each book from the verified picture:
   Download/approval dots inside tags that carry a verification marker
   sit on the tag's **left** edge so the two indicators stay distinct.
   **Pressing Q while hovering a row marks it purple ("needs
-  attention")**; Q again clears it. This works in every table — checked
-  books, WHL, verified sources, and the bottom pane — without stealing
-  Shift+click from text selection.
+  attention")**; Q again clears it; **Ctrl+Q opens a small window to
+  record WHY** — the reason is stored with the mark and shows in the
+  row's tooltip. This works in every table — checked books, WHL,
+  verified sources, and the bottom pane — and on builder entries,
+  without stealing Shift+click from text selection.
 - `UPLD` — not in WHL but a scan exists in another online archive; amber
   while its sources are unverified, green once at least one is approved.
 - otherwise no mark; the tooltip on the dash explains why.
@@ -332,7 +334,11 @@ Two parts, separated by a **drag-to-resize splitter**:
     until SAVE.
   - `Source (PDF)` — an embedded, **undecorated PDF viewer** (no browser
     toolbar or scrollbars; the file size shows in the bar) with an **OCR
-    icon** that opens the text layer in a parallel pane. Large scans load
+    icon** that opens the text layer in a parallel pane, and a **pages
+    icon** that switches to the OCR tab's side-by-side idiom: one row per
+    page, the page image beside that page's OCR text, scrolling together;
+    the text boxes are editable and the save icon writes them back to the
+    entry's active OCR file. Large scans load
     fast because the viewer shows a **compressed, truncated preview
     derivative** (page limit and a preview-the-original toggle live in
     GENERAL settings). The PATH TO PDF field has folder (browse) and
@@ -342,7 +348,10 @@ Two parts, separated by a **drag-to-resize splitter**:
     without a text layer get their OCR supplied this way). The
     **folder-sync icon builds the entry folder**
     (`output/entries/<id>/`): `metadata.json`, `preview.pdf`, and
-    `ocr/extracted.txt`; when KEEP IA ORIGINALS is off, the downloaded
+    `ocr/extracted.txt`. With **Trim blank pages automatically** on
+    (General settings), visually blank pages are removed from the actual
+    PDF first — backup kept as `.bak.pdf`, OCR files renumbered — before
+    the preview and extraction are built. When KEEP IA ORIGINALS is off, the downloaded
     original is treated as a temporary artifact and removed after the
     preview is built — the entry's PDF is repointed at the folder's
     `preview.pdf` and the IA download catalog entry is retired (removal

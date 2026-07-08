@@ -358,3 +358,13 @@ is decided by a tolerant composite rather than exact strings:
   hovering, and now cover every table (checked, WHL, verified sources,
   bottom pane) plus the Editor sidebar; non-checked tables persist
   marks browser-side.
+- v2.9 viewer pages mode + blank trim + Ctrl+Q reasons: the Editor's
+  Source-tab viewer gained the OCR tab's page-aligned idiom (page image
+  beside editable per-page OCR text, one scroll container; save writes
+  to the active OCR file). A General setting trims visually blank pages
+  automatically during folder builds — from the actual PDF (rasterized
+  ink-fraction detection; backup + OCR renumbering via the shared
+  deletion core; skipped for preview derivatives and during OCR jobs).
+  Ctrl+Q over any markable row/entry opens a modal to record the reason
+  for the attention mark; reasons ride with the mark ("" / "1" /
+  reason text) and surface in tooltips.
