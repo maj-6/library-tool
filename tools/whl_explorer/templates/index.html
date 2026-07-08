@@ -10,7 +10,7 @@
   <div id="titlebar">
     <span class="tb-name" id="tb-name">Catalogs :: Catalog Explorer</span>
     <span class="tb-right">
-      <span class="tb-meta" id="tb-meta">v2.8</span>
+      <span class="tb-meta" id="tb-meta">v2.9</span>
     </span>
   </div>
 
@@ -765,6 +765,28 @@
     </div>
   </div>
 
+  <!-- NEEDS-ATTENTION REASON WINDOW (Ctrl+Q) -->
+  <div id="attn-overlay" class="overlay" hidden>
+    <div id="attn-window" class="win">
+      <div id="attn-titlebar" class="win-titlebar">
+        <span>Needs attention</span>
+        <button id="attn-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
+      </div>
+      <div id="attn-body">
+        <p class="pane-note" id="attn-label"></p>
+        <textarea id="attn-reason" class="cad-input" rows="4"
+                  placeholder="Why does this need attention?"></textarea>
+        <div class="mf-actions">
+          <button id="attn-save" class="cad-btn icon-btn" type="button"
+                  data-icon="save" data-tip="Mark with this reason"></button>
+          <button id="attn-clear" class="cad-btn icon-btn danger" type="button"
+                  data-icon="remove" data-tip="Clear the mark"></button>
+          <span class="tool-label" id="attn-msg"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- MANUALLY LOCATED SOURCE WINDOW -->
   <div id="msrc-overlay" class="overlay" hidden>
     <div id="msrc-window" class="win">
@@ -817,6 +839,9 @@
               <input id="set-preview-original" type="checkbox" />
               <label class="tool-label" for="set-keep-originals">Keep IA originals after a folder build</label>
               <input id="set-keep-originals" type="checkbox" />
+              <label class="tool-label" for="set-trim-blank">Trim blank pages automatically (folder build)</label>
+              <input id="set-trim-blank" type="checkbox"
+                     data-tip="Blank pages are removed from the actual PDF during a folder build (backup kept, OCR renumbered)" />
             </div>
             <div class="mf-actions">
               <button id="reset-settings" class="cad-btn danger" type="button">Restore default settings</button>

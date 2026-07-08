@@ -397,6 +397,7 @@ def api_build_folder_sync(build_id: str):
     except (TypeError, ValueError):
         pages = 20
     keep_original = bool(p.get("keep_original", True))
+    trim_blank = bool(p.get("trim_blank", False))
     d = _entry_dir(build_id)
     (d / "ocr").mkdir(parents=True, exist_ok=True)
     lib.save_json(d / "metadata.json", b)
@@ -410,6 +411,35 @@ def api_build_folder_sync(build_id: str):
             src = sp
         else:
             notes.append("pdf_file not found")
+    # blank pages are trimmed from the REAL PDF before the preview and
+    # extraction are built (backup kept, OCR files renumbered) — skipped
+    # for the truncated preview derivative and while an OCR job runs
+    if trim_blank and src is not None:
+        running = [j for j in _ocr_jobs.values()
+                   if j.get("build_id") == build_id
+                   and j.get("status") == "running"]
+        is_deriv = False
+        try:
+            is_deriv = src.resolve().is_relative_to(ENTRIES_DIR.resolve())
+        except OSError:
+            pass
+        if running:
+            notes.append("blank-page trim skipped (OCR job running)")
+        elif is_deriv:
+            notes.append("blank-page trim skipped (preview derivative)")
+        else:
+            try:
+                blanks = _blank_pages(src)
+                if blanks:
+                    _apply_page_deletion(build_id, builds, src, blanks)
+                    b = builds[build_id]
+                    # the folder metadata must reflect the remapped
+                    # title_pages, not the pre-trim snapshot
+                    lib.save_json(d / "metadata.json", b)
+                    notes.append(f"trimmed {len(blanks)} blank page(s): "
+                                 + ",".join(str(n) for n in blanks))
+            except Exception as exc:
+                notes.append(f"blank-page trim failed: {exc}")
     if src is not None:
         try:
             prev = _preview_pdf(src, pages)
@@ -435,6 +465,10 @@ def api_build_folder_sync(build_id: str):
                 srcr = src.resolve()
                 if srcr.is_relative_to(lib.IA_DOWNLOADS_DIR.resolve()):
                     src.unlink()
+                    # a trim in this same sync left a full-size backup of
+                    # the original — pointless once the original itself is
+                    # a disposed temporary artifact
+                    src.with_suffix(".bak.pdf").unlink(missing_ok=True)
                     notes.append("original removed (temporary artifact)")
                     # nothing may keep pointing at the deleted file: the
                     # entry folder's preview becomes the build's PDF, and
@@ -806,27 +840,39 @@ def api_pdf_pages_delete():
         pages = []
     if not pages:
         return jsonify({"ok": False, "error": "no pages selected"})
-    from pypdf import PdfReader, PdfWriter
-    import shutil
     try:
-        reader = PdfReader(str(pdf))
-        total = len(reader.pages)
-        keep = [i for i in range(total) if (i + 1) not in set(pages)]
-        if not keep:
-            return jsonify({"ok": False, "error": "cannot delete every page"})
-        if len(keep) == total:
-            return jsonify({"ok": False, "error": "pages out of range"})
-        # safety net: the previous version stays recoverable
-        shutil.copy2(pdf, pdf.with_suffix(".bak.pdf"))
-        writer = PdfWriter()
-        for i in keep:
-            writer.add_page(reader.pages[i])
-        tmp = pdf.with_suffix(".del.tmp")
-        with open(tmp, "wb") as fh:
-            writer.write(fh)
-        tmp.replace(pdf)
+        result = _apply_page_deletion(build_id, builds, pdf, pages)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)})
     except Exception as exc:
         return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+    result["ok"] = True
+    return jsonify(result)
+
+
+def _apply_page_deletion(build_id: str, builds: dict, pdf: Path,
+                         pages: list[int]) -> dict:
+    """Rewrite the PDF without the given pages (backup kept), renumber the
+    build's OCR files, and remap title_pages. Shared by the deletion
+    endpoint and blank-page trimming. Raises ValueError on refusal."""
+    from pypdf import PdfReader, PdfWriter
+    import shutil
+    reader = PdfReader(str(pdf))
+    total = len(reader.pages)
+    keep = [i for i in range(total) if (i + 1) not in set(pages)]
+    if not keep:
+        raise ValueError("cannot delete every page")
+    if len(keep) == total:
+        raise ValueError("pages out of range")
+    # safety net: the previous version stays recoverable
+    shutil.copy2(pdf, pdf.with_suffix(".bak.pdf"))
+    writer = PdfWriter()
+    for i in keep:
+        writer.add_page(reader.pages[i])
+    tmp = pdf.with_suffix(".del.tmp")
+    with open(tmp, "wb") as fh:
+        writer.write(fh)
+    tmp.replace(pdf)
     # keep the build's OCR files and title pages aligned with the new
     # numbering (under the merge lock: a job finishing this instant must
     # not interleave with the renumber writes)
@@ -837,8 +883,12 @@ def api_pdf_pages_delete():
         if ocr_dir.is_dir():
             for f in ocr_dir.glob("*.txt"):
                 try:
-                    out = _renumber_marked_text(
-                        f.read_text(encoding="utf-8", errors="replace"), pages)
+                    raw = f.read_text(encoding="utf-8", errors="replace")
+                    # the renumbering is destructive too — a misfired trim
+                    # must be recoverable for the text, not just the PDF
+                    f.with_name(f.name + ".bak").write_text(
+                        raw, encoding="utf-8", errors="replace")
+                    out = _renumber_marked_text(raw, pages)
                     f.write_text(out, encoding="utf-8", errors="replace")
                     renumbered.append(f.name)
                 except OSError:
@@ -853,10 +903,38 @@ def api_pdf_pages_delete():
             remapped.append(t - sum(1 for r in pages if r < t))
         b["title_pages"] = ",".join(str(t) for t in remapped)
         lib.save_json(BUILDS_PATH, builds)
-    return jsonify({"ok": True, "deleted": pages, "pages": len(keep),
-                    "renumbered": renumbered,
-                    "backup": pdf.with_suffix(".bak.pdf").name,
-                    "build": b})
+    return {"deleted": pages, "pages": len(keep),
+            "renumbered": renumbered,
+            "backup": pdf.with_suffix(".bak.pdf").name,
+            "build": b}
+
+
+def _blank_pages(pdf: Path, ink_threshold: float = 0.003) -> list[int]:
+    """1-based numbers of visually blank pages. Conservative on purpose —
+    a false positive deletes a real page: a page is blank only when BOTH
+    (a) the fraction of even-faint ink pixels (gray < 200 at a small
+    render) stays under the threshold, and (b) its text layer is empty.
+    Faint scans and folio-numbered pages fail one of the two and stay."""
+    import fitz
+    blank = []
+    doc = fitz.open(str(pdf))
+    try:
+        for i in range(doc.page_count):
+            pg = doc[i]
+            zoom = 160 / max(1.0, pg.rect.width)
+            pix = pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace="gray")
+            samples = pix.samples
+            inked = sum(1 for v in samples if v < 200)
+            if inked / max(1, len(samples)) >= ink_threshold:
+                continue
+            # ANY text layer keeps the page — folio-only pages ("47") and
+            # faint scans usually carry one; true blanks carry none
+            if (pg.get_text() or "").strip():
+                continue
+            blank.append(i + 1)
+    finally:
+        doc.close()
+    return blank
 
 
 # --- master list -> Google Sheets sync ----------------------------------------------

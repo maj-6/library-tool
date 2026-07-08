@@ -107,6 +107,7 @@ const state = {
     previewPages: 20,           // page cap for PDF preview derivatives
     previewOriginal: false,     // view the original PDF instead of a preview
     keepOriginals: true,        // keep IA originals after a folder build
+    trimBlank: false,           // auto-trim blank pages during folder sync
     colVis: {},                 // per-table column visibility
     colWidths: {},              // per-table column widths (px)
     whlCons: { title: false, authors: false, year: true },
@@ -1002,7 +1003,8 @@ function renderSettings() {
     saveSettings();
   };
   for (const [id, k] of [["set-preview-original", "previewOriginal"],
-                         ["set-keep-originals", "keepOriginals"]]) {
+                         ["set-keep-originals", "keepOriginals"],
+                         ["set-trim-blank", "trimBlank"]]) {
     const n = el(id);
     n.checked = !!state.settings[k];
     n.onchange = () => {
@@ -1513,7 +1515,7 @@ function combinedRows() {
       verify: migrateVerify(e) || {},
       manualUrls: e.manual_urls || {},
       localPdf: e.local_pdf || "",
-      attention: !!e.attention,
+      attention: e.attention || "",   // "" / "1" / the reason text
     });
   }
   for (const [k, v] of state.checked.entries()) {
@@ -1524,7 +1526,7 @@ function combinedRows() {
       verify: migrateVerify(v) || {},
       manualUrls: v.manual_urls || {},
       localPdf: v.local_pdf || "",
-      attention: !!v.attention,
+      attention: v.attention || "",   // "" / "1" / the reason text
     });
   }
   return rows;
@@ -1543,69 +1545,146 @@ function loadAttn() {
 
 function attnHas(k) { return !!(state.attn || {})[k]; }
 
-function toggleAttnKey(k) {
-  state.attn = state.attn || {};
-  if (state.attn[k]) delete state.attn[k];
-  else state.attn[k] = 1;
-  try { localStorage.setItem(ATTN_KEY, JSON.stringify(state.attn)); } catch (e) {}
-  status(state.attn[k] ? "Marked: needs attention" : "Attention mark cleared");
+// a mark's value is "" (unmarked), "1" (plain mark), or the reason text
+function attnReason(v) {
+  return typeof v === "string" && v && v !== "1" ? v : "";
 }
 
-// Q toggles the purple mark on whatever row (any table) or builder entry
-// the mouse is over — clicking is left to each table's own actions
-function onAttentionKey(ev) {
-  if (ev.key !== "q" && ev.key !== "Q") return;
-  if (/^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName) ||
-      ev.target.isContentEditable) return;
+function setAttnKey(k, val) {
+  state.attn = state.attn || {};
+  if (val) state.attn[k] = val;
+  else delete state.attn[k];
+  try { localStorage.setItem(ATTN_KEY, JSON.stringify(state.attn)); } catch (e) {}
+  status(val ? "Marked: needs attention" : "Attention mark cleared");
+}
+
+// Resolve whatever row (any table) or builder entry the mouse is over into
+// an attention target: {label, current, apply(value)}. Q toggles it,
+// Ctrl+Q opens the reason modal on it.
+function attnTargetAtHover() {
   const bi = document.querySelector("#builds-list .build-item:hover");
   if (bi) {
     const b = state.builds[bi.dataset.bid];
-    if (b) {
-      const marking = !b.attention;
-      patchBuildRaw(bi.dataset.bid, { attention: marking ? "1" : "" })
-        .then(() => status(marking ? "Marked: needs attention"
-                                   : "Attention mark cleared"));
-    }
-    return;
+    if (!b) return null;
+    return {
+      label: b.title || bi.dataset.bid,
+      current: String(b.attention || ""),
+      apply: (v) => patchBuildRaw(bi.dataset.bid, { attention: v })
+        .then(() => status(v ? "Marked: needs attention" : "Attention mark cleared")),
+    };
   }
   const tr = document.querySelector(
     "#checked-rows tr:hover, #whltop-rows tr:hover, " +
     "#upload-rows tr:hover, #bottom-rows tr:hover");
-  if (!tr) return;
+  if (!tr) return null;
   const host = tr.parentElement.id;
   if (host === "checked-rows" && tr.dataset.rowId) {
-    toggleRowAttention(tr.dataset.rowId);
-  } else if (host === "whltop-rows" && tr.dataset.widx != null) {
-    toggleAttnKey("whl:" + tr.dataset.widx);
-    renderWhlTop();
-  } else if (host === "upload-rows" && tr.dataset.si != null) {
+    const row = state.rowsById.get(String(tr.dataset.rowId));
+    if (!row) return null;
+    return {
+      label: row.book.title || tr.dataset.rowId,
+      current: String(row.attention || ""),
+      apply: (v) => setRowAttention(tr.dataset.rowId, v),
+    };
+  }
+  const keyTarget = (k, label, rerender) => ({
+    label,
+    current: String((state.attn || {})[k] || ""),
+    apply: (v) => { setAttnKey(k, v); rerender(); },
+  });
+  if (host === "whltop-rows" && tr.dataset.widx != null) {
+    return keyTarget("whl:" + tr.dataset.widx,
+      tr.children[1] ? tr.children[1].textContent : "WHL row", renderWhlTop);
+  }
+  if (host === "upload-rows" && tr.dataset.si != null) {
     const s = (state.uploadSources || [])[+tr.dataset.si];
-    if (s) {
-      toggleAttnKey("src:" + (s.url || s.local_pdf || s.title));
-      renderUpload();
-    }
-  } else if (host === "bottom-rows" && tr.dataset.bi != null) {
+    if (!s) return null;
+    return keyTarget("src:" + (s.url || s.local_pdf || s.title),
+      s.title || "source", renderUpload);
+  }
+  if (host === "bottom-rows" && tr.dataset.bi != null) {
     const rec = (state.bottomRecords || [])[+tr.dataset.bi];
-    if (!rec) return;
+    if (!rec) return null;
     if (rec._src === "manual" && rec._mid) {
       // master-list manual rows share the manual entry's persistent flag
-      toggleRowAttention(rec._mid).then(renderBottomRows);
-    } else {
-      toggleAttnKey(`${rec._src}:${rec._idx}`);
-      renderBottomRows();
+      const e = state.manual.find((x) => x.id === rec._mid);
+      return {
+        label: rec.title || "manual entry",
+        current: String((e && e.attention) || ""),
+        apply: (v) => setRowAttention(rec._mid, v).then(renderBottomRows),
+      };
     }
+    return keyTarget(`${rec._src}:${rec._idx}`, rec.title || "row", renderBottomRows);
+  }
+  return null;
+}
+
+// Q toggles the purple mark on whatever the mouse is over; Ctrl+Q opens a
+// modal to record WHY it needs attention
+function onAttentionKey(ev) {
+  if (ev.key !== "q" && ev.key !== "Q") return;
+  if (/^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName) ||
+      ev.target.isContentEditable) return;
+  const target = attnTargetAtHover();
+  if (!target) return;
+  ev.preventDefault();
+  if (ev.ctrlKey) {
+    openAttnModal(target);
+  } else {
+    target.apply(target.current ? "" : "1");
   }
 }
 
-async function toggleRowAttention(id) {
+// --- the Ctrl+Q reason modal --
+
+let attnModalTarget = null;
+
+function openAttnModal(target) {
+  attnModalTarget = target;
+  el("attn-label").textContent = (target.label || "").slice(0, 80);
+  el("attn-reason").value = attnReason(target.current);
+  el("attn-msg").textContent = "";
+  el("attn-overlay").hidden = false;
+  el("attn-reason").focus();
+}
+
+function closeAttnModal() {
+  el("attn-overlay").hidden = true;
+  attnModalTarget = null;
+}
+
+function initAttnModal() {
+  el("attn-save").addEventListener("click", () => {
+    if (!attnModalTarget) return;
+    const reason = el("attn-reason").value.trim();
+    attnModalTarget.apply(reason || "1");   // empty reason = plain mark
+    closeAttnModal();
+  });
+  el("attn-clear").addEventListener("click", () => {
+    if (!attnModalTarget) return;
+    attnModalTarget.apply("");
+    closeAttnModal();
+  });
+  el("attn-close").addEventListener("click", closeAttnModal);
+  el("attn-reason").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && !ev.shiftKey) {
+      ev.preventDefault();
+      el("attn-save").click();
+    } else if (ev.key === "Escape") {
+      ev.stopPropagation();
+      closeAttnModal();
+    }
+  });
+}
+
+async function setRowAttention(id, value) {
   const row = state.rowsById.get(String(id));
   if (!row) return;
-  const next = row.attention ? "" : "1";
   if (row.kind === "manual") {
     const res = await fetch(`/api/manual/${encodeURIComponent(id)}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ attention: next, _preserve: true }),
+      body: JSON.stringify({ attention: value, _preserve: true }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.ok) return;
@@ -1614,11 +1693,11 @@ async function toggleRowAttention(id) {
   } else {
     const entry = state.checked.get(id);
     if (!entry) return;
-    entry.attention = next;
+    entry.attention = value;
     saveChecked();
   }
   renderChecked();
-  status(next ? "Marked: needs attention" : "Attention mark cleared");
+  status(value ? "Marked: needs attention" : "Attention mark cleared");
 }
 
 // one-time (idempotent) migration: volume / edition / subtitle indicators in
@@ -1806,7 +1885,11 @@ function renderChecked() {
     const tr = document.createElement("tr");
     tr.dataset.rowId = row.id;
     if (row.kind === "manual") tr.classList.add("is-manual");
-    if (row.attention) tr.classList.add("attention");
+    if (row.attention) {
+      tr.classList.add("attention");
+      const why = attnReason(row.attention);
+      if (why) tr.dataset.tip = "Needs attention: " + why;
+    }
     if (cmode === "search" && state.checkedSelected === String(row.id))
       tr.classList.add("whl-selected");
     const editable = (f) =>
@@ -2222,14 +2305,20 @@ function renderBottomRows() {
       else if (state.checked.has(ckey("ch_library", rec._idx))) tr.classList.add("ml-checked");
     }
     // needs-attention marks (Q while hovering) apply here too
+    let bWhy = "";
     if (rec._src === "manual" && rec._mid) {
       const e = state.manual.find((x) => x.id === rec._mid);
-      if (e && e.attention) tr.classList.add("attention");
+      if (e && e.attention) {
+        tr.classList.add("attention");
+        bWhy = attnReason(e.attention);
+      }
     } else if (attnHas(`${rec._src}:${rec._idx}`)) {
       tr.classList.add("attention");
+      bWhy = attnReason((state.attn || {})[`${rec._src}:${rec._idx}`]);
     }
     tr.dataset.bi = i;
-    tr.dataset.tip = recordTip(rec, def.label);
+    tr.dataset.tip = recordTip(rec, def.label) +
+      (bWhy ? "\nNeeds attention: " + bWhy : "");
     tr.innerHTML = def.cells(rec).map((c) => `<td>${c == null ? "" : c}</td>`).join("");
     tbody.appendChild(tr);
   });
@@ -2473,6 +2562,8 @@ function renderWhlTop() {
     tr.dataset.tip = recordTip(
       Object.assign(whlToRecord(r), { subtitle: r.subtitle || "",
         categories: r.categories || "", notes: r.description || "" }), "WHL");
+    const whlWhy = attnReason((state.attn || {})["whl:" + r.idx]);
+    if (whlWhy) tr.dataset.tip += "\nNeeds attention: " + whlWhy;
     tr.innerHTML = whlRowCells(r, mode);
     tbody.appendChild(tr);
   }
@@ -3520,6 +3611,10 @@ function createPdfViewer() {
     <div class="pdf-bar">
       <span class="pdf-path tool-label"></span>
       <span class="pdf-size tool-label"></span>
+      <button class="cad-btn tiny icon-btn pdf-pagesbtn" type="button"
+              data-tip="PDF pages beside the OCR text (like the OCR tab)" hidden>${ICONS.pdfpage}</button>
+      <button class="cad-btn tiny icon-btn pdf-pagesave" type="button"
+              data-tip="Save the page-view edits to the OCR file" hidden>${ICONS.save}</button>
       <button class="cad-btn tiny icon-btn pdf-ocr" type="button"
               data-tip="OCR text" hidden>${ICONS.text}</button>
       <a class="cad-btn tiny pdf-open" target="_blank" rel="noopener" hidden>OPEN IN TAB</a>
@@ -3527,6 +3622,7 @@ function createPdfViewer() {
     <div class="pdf-body">
       <div class="pdf-framewrap" hidden><iframe class="pdf-frame" title="PDF preview"></iframe></div>
       <pre class="pdf-ocrpane" hidden></pre>
+      <div class="pdf-pagesbox" hidden></div>
       <div class="pdf-note empty">No PDF</div>
     </div>`;
   const frame = root.querySelector(".pdf-frame");
@@ -3537,10 +3633,146 @@ function createPdfViewer() {
   const open = root.querySelector(".pdf-open");
   const ocrBtn = root.querySelector(".pdf-ocr");
   const ocrPane = root.querySelector(".pdf-ocrpane");
+  const pagesBtn = root.querySelector(".pdf-pagesbtn");
+  const pagesSave = root.querySelector(".pdf-pagesave");
+  const pagesBox = root.querySelector(".pdf-pagesbox");
   let sizeSeq = 0;
   let textSrc = "";
   let ocrOn = false;
   let ocrLoadedFor = "";
+  let pagesOn = false;
+  let pagesPdf = "";        // local path for /api/pdf/pageimg
+  let pagesSaveTo = null;   // {buildId, name} — where page edits save
+  let pagesSec = null;      // {pre, map} sections while the page view is up
+  let pagesWhole = false;   // marker-less file: one whole-text box, verbatim
+  let pagesDirty = false;   // unsaved page-view edits
+  let pagesSeq = 0;
+
+  // side-by-side page view: one row per page (image | that page's OCR
+  // text), scrolling together — the same idiom as the OCR tab
+  async function renderPages() {
+    const seq = ++pagesSeq;
+    // no stale sections may survive into the next render: a Save clicked
+    // mid-load must be a no-op, never a cross-build overwrite
+    pagesSec = null;
+    pagesWhole = false;
+    pagesDirty = false;
+    pagesSave.hidden = true;
+    pagesBox.innerHTML = `<p class="empty">Loading pages &hellip;</p>`;
+    let count = 0;
+    try {
+      const info = await (await fetch(
+        "/api/pdf/info?path=" + encodeURIComponent(pagesPdf))).json();
+      if (info.ok) count = info.pages;
+    } catch (e) { /* handled below */ }
+    let text = "";
+    let textOk = !textSrc;   // no OCR source at all = legitimately empty
+    if (textSrc) {
+      try {
+        const data = await (await fetch(textSrc)).json();
+        if (data.ok) { text = data.text || ""; textOk = true; }
+      } catch (e) { /* textOk stays false */ }
+    }
+    if (seq !== pagesSeq || !pagesOn) return;
+    if (!count) {
+      pagesBox.innerHTML = `<p class="empty">Could not read the PDF</p>`;
+      return;
+    }
+    const sections = ocrPageSections(text);
+    pagesWhole = textOk && !sections && !!text.trim();
+    if (textOk) {
+      pagesSec = sections ||
+        { pre: "", map: new Map(text.trim() ? [[1, text]] : []) };
+    }
+    // a failed OCR fetch renders read-only with saving disabled — one
+    // stray Save must not overwrite the real file with emptiness
+    const editable = !!pagesSaveTo && textOk;
+    const shown = Math.min(count, 400);
+    const img = (n) => `<img loading="lazy" alt="page ${n}"
+        src="/api/pdf/pageimg?path=${encodeURIComponent(pagesPdf)}&page=${n}&w=700" />`;
+    pagesBox.innerHTML =
+      (!textOk ? `<div class="ocr-pgnote empty">OCR text unavailable — saving disabled</div>` : "") +
+      (pagesWhole ? `<div class="ocr-pgnote empty">This OCR file has no page markers — the full text sits beside page 1 and saves verbatim</div>` : "") +
+      (count > shown ? `<div class="ocr-pgnote empty">Showing the first ${shown} of ${count} pages</div>` : "") +
+      Array.from({ length: shown }, (_, i) => `
+        <div class="ocr-pgrow" data-page="${i + 1}">
+          <div class="ocr-pgimg">${img(i + 1)}</div>
+          <textarea class="ocr-pgtext cad-input" spellcheck="false"
+            ${pagesWhole
+              ? (i === 0 ? 'data-whole="1"' : "readonly")
+              : `data-pn="${i + 1}"`}
+            ${editable ? "" : "readonly"}></textarea>
+        </div>`).join("");
+    if (pagesSec) {
+      if (pagesWhole) {
+        const wta = pagesBox.querySelector("[data-whole]");
+        if (wta) wta.value = text;
+      } else {
+        pagesBox.querySelectorAll("textarea[data-pn]").forEach((ta) => {
+          ta.value = pagesSec.map.get(+ta.dataset.pn) || "";
+        });
+      }
+    }
+    pagesSave.hidden = !editable;
+  }
+
+  pagesBox.addEventListener("input", (ev) => {
+    const ta = ev.target.closest("textarea.ocr-pgtext");
+    if (!ta || !pagesSec) return;
+    if (ta.dataset.whole) {
+      pagesSec.map.set(1, ta.value);
+    } else if (ta.dataset.pn) {
+      pagesSec.map.set(+ta.dataset.pn, ta.value);
+    }
+    pagesDirty = true;
+  });
+
+  async function savePages(saveTo) {
+    const target = saveTo || pagesSaveTo;
+    if (!target || !pagesSec) return;
+    // a marker-less file saves verbatim — no page markers are injected
+    const body = pagesWhole
+      ? (pagesSec.map.get(1) || "")
+      : ocrPagesToText(pagesSec);
+    try {
+      const res = await fetch(
+        `/api/builds/${encodeURIComponent(target.buildId)}/ocr`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: target.name, text: body }),
+        });
+      const data = await res.json().catch(() => ({}));
+      if (data.ok) pagesDirty = false;
+      status(data.ok ? `OCR SAVED :: ${target.name}` : "OCR SAVE FAILED");
+    } catch (e) {
+      status("OCR SAVE FAILED");
+    }
+  }
+
+  function setPages(on) {
+    pagesOn = !!on && !!pagesPdf;
+    pagesBtn.classList.toggle("active", pagesOn);
+    pagesBox.hidden = !pagesOn;
+    pagesSave.hidden = true;   // renderPages re-shows it when editable
+    frameWrap.hidden = pagesOn || !frame.getAttribute("src");
+    if (pagesOn) {
+      ocrPane.hidden = true;
+      ocrBtn.classList.remove("active");   // the OCR pane isn't showing
+      renderPages();
+    } else {
+      pagesSec = null;
+      pagesWhole = false;
+      pagesDirty = false;
+      pagesBox.innerHTML = "";
+      setOcr(ocrOn);
+    }
+  }
+  pagesBtn.addEventListener("click", () => {
+    if (pagesOn && pagesDirty &&
+        !window.confirm("Discard unsaved page edits?")) return;
+    setPages(!pagesOn);
+  });
+  pagesSave.addEventListener("click", () => savePages());
 
   async function loadOcr() {
     if (!textSrc || ocrLoadedFor === textSrc) return;
@@ -3564,10 +3796,19 @@ function createPdfViewer() {
   function setOcr(on) {
     ocrOn = !!on && !!textSrc;
     ocrBtn.classList.toggle("active", ocrOn);
-    ocrPane.hidden = !ocrOn;
-    if (ocrOn) loadOcr();
+    ocrPane.hidden = !ocrOn || pagesOn;
+    if (ocrOn && !pagesOn) loadOcr();
   }
-  ocrBtn.addEventListener("click", () => setOcr(!ocrOn));
+  ocrBtn.addEventListener("click", () => {
+    if (pagesOn) {
+      if (pagesDirty && !window.confirm("Discard unsaved page edits?")) return;
+      // intent: leave the page view and SHOW the OCR pane
+      setPages(false);
+      setOcr(true);
+      return;
+    }
+    setOcr(!ocrOn);
+  });
 
   return {
     el: root,
@@ -3579,7 +3820,6 @@ function createPdfViewer() {
       const framed = src.startsWith("/api/pdf")
         ? src + "#toolbar=0&navpanes=0&scrollbar=0" : src;
       if (frame.getAttribute("src") !== framed) frame.src = framed;
-      frameWrap.hidden = false;
       note.hidden = true;
       path.textContent = label || src;
       path.dataset.tip = src;
@@ -3588,9 +3828,22 @@ function createPdfViewer() {
       size.textContent = "";
       textSrc = opts.textSrc || "";
       ocrBtn.hidden = !textSrc;
+      // a re-show (build switch, OCR-chip click, folder sync) with unsaved
+      // page edits: preserve them by saving to the file they belong to —
+      // the body is snapshotted synchronously, before any reassignment
+      if (pagesOn && pagesDirty && pagesSaveTo) {
+        savePages(pagesSaveTo);
+      }
+      // the page-aligned view needs a LOCAL pdf path for page images
+      pagesPdf = opts.pagesPdf || "";
+      pagesSaveTo = opts.pagesSaveTo || null;
+      pagesBtn.hidden = !pagesPdf;
       // OCR files are editable (OCR tab / re-upload), so a same-URL show()
       // must refetch — only pane toggles within one view use the cache
       ocrLoadedFor = "";
+      // re-showing (build switch) re-renders or leaves the page view
+      setPages(pagesOn && !!pagesPdf);
+      frameWrap.hidden = pagesOn;
       setOcr(opts.ocr != null ? opts.ocr : ocrOn);
       const seq = ++sizeSeq;
       if (src.startsWith("/api/pdf")) {
@@ -3614,6 +3867,15 @@ function createPdfViewer() {
       textSrc = "";
       ocrBtn.hidden = true;
       ocrPane.hidden = true;
+      pagesPdf = "";
+      pagesSaveTo = null;
+      pagesSec = null;
+      pagesOn = false;
+      pagesBtn.hidden = true;
+      pagesBtn.classList.remove("active");
+      pagesSave.hidden = true;
+      pagesBox.hidden = true;
+      pagesBox.innerHTML = "";
     },
   };
 }
@@ -4383,7 +4645,11 @@ function renderUpload() {
     // yellow = a draft entry exists in the editor; green = its entry is done
     if (st === "draft") tr.classList.add("src-draft");
     else if (st === "done") tr.classList.add("src-done");
-    if (attnHas("src:" + (s.url || s.local_pdf || s.title))) tr.classList.add("attention");
+    const srcAttn = (state.attn || {})["src:" + (s.url || s.local_pdf || s.title)];
+    if (srcAttn) {
+      tr.classList.add("attention");
+      if (attnReason(srcAttn)) tr.dataset.tip = "Needs attention: " + attnReason(srcAttn);
+    }
     tr.innerHTML = `
       <td>${esc(s.title)}</td>
       <td>${esc(s.subtitle)}</td>
@@ -4516,7 +4782,9 @@ function renderBuildsList() {
       `${b.authors ? "Authors: " + b.authors + "\n" : ""}` +
       `${b.year ? "Year: " + b.year + "\n" : ""}` +
       `Status: ${uploaded ? "uploaded" : ready ? "verified" : "draft"}\n` +
-      `Updated: ${b.updated_at || ""}\nPress Q while hovering: mark as needing attention`;
+      `Updated: ${b.updated_at || ""}` +
+      (attnReason(b.attention) ? `\nNeeds attention: ${attnReason(b.attention)}` : "") +
+      "\nQ while hovering: mark as needing attention (Ctrl+Q: with a reason)";
     // compact: title with the status icon inline on the right, then a
     // single author · year meta line
     li.innerHTML = `
@@ -4848,6 +5116,13 @@ function pdfViewSrc(path) {
     : base + "&preview=1&pages=" + (state.settings.previewPages || 20);
 }
 
+// the OCR file page-view edits save into: the active file, else extracted
+function buildActiveOcrName(b) {
+  const files = (state.buildFolder && state.buildFolder.ocr) || [];
+  if (b.ocr_active && files.some((f) => f.name === b.ocr_active)) return b.ocr_active;
+  return "extracted.txt";
+}
+
 // the active OCR file's text feeds the viewer's OCR pane; without one, the
 // folder's extracted.txt, then live extraction from the PDF itself
 function buildTextSrc(b) {
@@ -4932,7 +5207,12 @@ async function refreshSourceTab() {
     const derived = !state.settings.previewOriginal && !entryPrev;
     buildPdfViewer.show(
       derived ? pdfViewSrc(localPath) : pdfLocalSrc(localPath),
-      localPath + (derived || entryPrev ? "  (preview)" : ""), { textSrc });
+      localPath + (derived || entryPrev ? "  (preview)" : ""), {
+        textSrc,
+        // page-aligned OCR view (like the OCR tab), editable + savable
+        pagesPdf: localPath,
+        pagesSaveTo: { buildId: b.id, name: buildActiveOcrName(b) },
+      });
   } else if (/^https?:\/\//i.test((b.pdf_source || "").trim())) {
     const url = b.pdf_source.trim();
     // proxied through the server: direct iframes of third-party PDFs are
@@ -4960,6 +5240,7 @@ async function syncBuildFolder() {
       body: JSON.stringify({
         pages: state.settings.previewPages || 20,
         keep_original: state.settings.keepOriginals !== false,
+        trim_blank: !!state.settings.trimBlank,
       }),
     });
     const data = await res.json().catch(() => ({}));
@@ -6506,9 +6787,11 @@ function init() {
     if (chip) setActiveOcr(chip.dataset.ocr);
   });
   initOcrTab();
-  // Q while hovering a row (any table) or a builder entry: needs-attention
+  // Q while hovering a row (any table) or a builder entry: needs-attention;
+  // Ctrl+Q records a reason
   loadAttn();
   document.addEventListener("keydown", onAttentionKey);
+  initAttnModal();
   el("b-pdf-attach").addEventListener("click", () => attachPdfFile());
   el("b-pdf_file").addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") { ev.preventDefault(); attachPdfFile(); }
@@ -6545,9 +6828,13 @@ function init() {
   el("settings-overlay").addEventListener("mousedown", (ev) => {
     if (ev.target === el("settings-overlay")) closeSettings();
   });
+  el("attn-overlay").addEventListener("mousedown", (ev) => {
+    if (ev.target === el("attn-overlay")) closeAttnModal();
+  });
   document.addEventListener("keydown", (ev) => {
     if (ev.key !== "Escape") return;
-    if (!el("fb-overlay").hidden) closeFileBrowser();
+    if (!el("attn-overlay").hidden) closeAttnModal();
+    else if (!el("fb-overlay").hidden) closeFileBrowser();
     else if (!el("pdfm-overlay").hidden) closePdfModal();
     else if (!el("md-overlay").hidden) closeMarkdownEditor(false);
     else if (!el("msrc-overlay").hidden) closeManualSource();
