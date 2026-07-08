@@ -276,8 +276,10 @@ The `MARK` column classifies each book from the verified picture:
   clickable) even when the row's computed mark changes later.
   Download/approval dots inside tags that carry a verification marker
   sit on the tag's **left** edge so the two indicators stay distinct.
-  **Shift+click anywhere else on a row marks it purple ("needs
-  attention")**; Shift+click again clears it.
+  **Pressing Q while hovering a row marks it purple ("needs
+  attention")**; Q again clears it. This works in every table — checked
+  books, WHL, verified sources, and the bottom pane — without stealing
+  Shift+click from text selection.
 - `UPLD` — not in WHL but a scan exists in another online archive; amber
   while its sources are unverified, green once at least one is approved.
 - otherwise no mark; the tooltip on the dash explains why.
@@ -310,8 +312,8 @@ Two parts, separated by a **drag-to-resize splitter**:
   sidebar is compact: each entry shows its title with the **status icon
   inline on the right** (pencil = draft, green check = verified, export
   arrow = uploaded) over an author · year line; verified entries are
-  tinted green; **Shift+click marks an entry purple ("needs
-  attention")**. The build icon on a
+  tinted green; **pressing Q while hovering marks an entry purple
+  ("needs attention")**. The build icon on a
   verified source starts an entry prefilled from the book's metadata, the
   provenance URL, and the PDF source; when the PDF was already downloaded
   the local `downloads/ia/<id>.pdf` path is attached automatically
@@ -379,15 +381,23 @@ tooltips):
   document. Files without `--- page N ---` markers show their full text
   beside page 1.
 
-In the page view, **pages are queued for OCR individually**: hover a
-page and press a digit — the digit → service mapping is customizable
-(Settings > OCR, keys 1–5; key 1 defaults to Tesseract). **Ctrl+digit
-arms a service for a range**: Ctrl+click marks the range start (dashed
-outline), Ctrl+click on another page queues everything between them.
-Queued pages carry a cyan outline and a service chip. **Pressing T over
-a page marks it as a title page** (purple T chip; stored on the entry
-as `title_pages` — intelligent metadata extraction will use these
-later). Escape clears the armed service / pending range.
+In the page view, **pages are staged for OCR individually and processing
+is always prompted manually**: hover a page (or select several) and
+press a digit — the digit → service mapping is customizable (Settings >
+OCR, keys 1–5; key 1 defaults to Tesseract). Different digits build a
+**mixed batch across services** (amber chips = staged; the same digit
+untags); the queue-bar **plus** stages the whole book and nothing runs
+until the **submit** button sends the staged pages. **Clicking a page
+image selects it; Ctrl+click selects the range** from the last click
+(3px amber outline); a digit stages the whole selection, and the
+**trash button (or Delete) removes the selected pages from the actual
+PDF** — not just the preview: the file is rewritten (the previous
+version stays next to it as `.bak.pdf`) and the entry's OCR files and
+title pages are **renumbered to match**. **Pressing T over a page marks
+it as a title page** (purple T chip; stored on the entry as
+`title_pages` — intelligent metadata extraction will use these later).
+Escape clears the selection. The **documents list shows only the
+current book's OCR files** (plus any loose local files).
 
 **OCR processing is live**: jobs rasterize each page server-side
 (PyMuPDF, width configurable in Settings > OCR — the knob for

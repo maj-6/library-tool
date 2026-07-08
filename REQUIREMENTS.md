@@ -345,3 +345,16 @@ is decided by a tolerant composite rather than exact strings:
   a manual Tools-menu sync (service-account credentials in Settings >
   Sync, TODO-verify). Remote PDFs (WHL publications, remote sources)
   are proxied through /api/pdf?url= — fixes "refused to connect".
+- v2.8 manual OCR submission + page deletion + Q marks: digit shortcuts
+  now STAGE pages (mixed services per batch; amber chips) and nothing
+  processes until the submit button sends them — processing is always
+  prompted manually. Clicking a page image selects it, Ctrl+click
+  selects a range; a digit stages the selection; the trash button (or
+  Delete) removes selected pages from the actual PDF (pypdf rewrite
+  with a .bak.pdf backup) and renumbers the entry's OCR files and
+  title pages to match. The OCR documents list is scoped to the
+  current book (loose local files stay visible). Attention marks moved
+  from Shift+click (which fought text selection) to pressing Q while
+  hovering, and now cover every table (checked, WHL, verified sources,
+  bottom pane) plus the Editor sidebar; non-checked tables persist
+  marks browser-side.
