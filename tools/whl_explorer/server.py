@@ -80,9 +80,22 @@ def _ch_row(idx: int, row: dict) -> dict:
 
 # --- routes ----------------------------------------------------------------
 
+def _asset_v(filename):
+    """Cache-busting token = the static file's mtime, so a changed asset always
+    forces a fresh fetch (a plain /static/app.js otherwise serves stale)."""
+    try:
+        return str(int((Path(app.static_folder) / filename).stat().st_mtime))
+    except OSError:
+        return "0"
+
+
 @app.route("/")
 def home():
-    return render_template("index.html")
+    return render_template(
+        "index.html",
+        app_v=_asset_v("app.js"),
+        css_v=_asset_v("style.css"),
+    )
 
 
 @app.route("/api/books")
