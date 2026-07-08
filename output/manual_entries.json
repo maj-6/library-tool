@@ -274,7 +274,8 @@
     },
     "verify": {
       "internet_archive": "approved"
-    }
+    },
+    "attention": "1"
   },
   "59f4063794c5": {
     "title": "Flora Medica",
@@ -675,8 +676,10 @@
       "checked_at": "2026-07-04T20:22:13+00:00"
     },
     "verify": {
-      "hathitrust": "approved"
-    }
+      "hathitrust": "approved",
+      "internet_archive": "rejected"
+    },
+    "attention": "1"
   },
   "520391858e01": {
     "title": "Effects of ginkgo biloba extract on organic cerebral impairment",
@@ -788,6 +791,9 @@
         "note": "no OCLC identifier found via Open Library; use the search link to check by hand"
       },
       "checked_at": "2026-07-05T20:55:10+00:00"
+    },
+    "verify": {
+      "internet_archive": "approved"
     }
   },
   "22f97ebd2dbb": {

@@ -421,5 +421,29 @@
       "title": "The Haven of Health",
       "year": "1605"
     }
+  },
+  "61560600R.nlm.nih.gov": {
+    "identifier": "61560600R.nlm.nih.gov",
+    "source_url": "https://archive.org/details/61560600R.nlm.nih.gov",
+    "pdf_file": "61560600R.pdf",
+    "saved_as": "downloads\\ia\\61560600R.nlm.nih.gov.pdf",
+    "size_bytes": 13450012,
+    "downloaded_at": "2026-07-08T01:25:23+00:00",
+    "ia_title": "Essays on some of the most important articles of the materia medica : comprising a full account of all the new proximate principles, and the popular medicines lately introduced in practice, detailing the formulas for their preparation, their habitudes and peculiarities, doses and modes of administration : with remarks on the most eligible form of their exhibition : to which is added a catalogue of medicines, surgical instruments, &c, &c : adapted for a physician at the outset of his practice, with the doses and effects attached to each medicine, &c, &c",
+    "ia_creator": "Carpenter, George W. (George Washington), 1802-1860",
+    "ia_date": "1834",
+    "book": {
+      "subtitle": "",
+      "volume": "",
+      "language": "",
+      "author": "Carpenter, G.W.",
+      "edition": "2nd",
+      "idx": 743,
+      "notes": "Browned throughout; back cover damaged; rare",
+      "pages": "320",
+      "publisher": "George W. Carpenter's Chemical Warehouse",
+      "title": "Essays on some of the most important articles of the Materia Medica",
+      "year": "1834"
+    }
   }
 }

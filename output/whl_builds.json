@@ -17,7 +17,7 @@
     "status": "draft",
     "id": "7d4b2b0760d9",
     "created_at": "2026-07-07T02:38:28+00:00",
-    "updated_at": "2026-07-07T23:31:04+00:00",
+    "updated_at": "2026-07-08T01:46:00+00:00",
     "pdf_file": "C:\\Users\\amill\\Documents\\world-herb-library\\downloads\\ia\\2544065R.nlm.nih.gov.pdf",
     "ocr_active": "",
     "ocr_verified": "",
@@ -114,10 +114,10 @@
     "ocr_verified": "",
     "ocr_quality": "",
     "title_pages": "",
-    "attention": "1",
+    "attention": "",
     "id": "f14325429dbe",
     "created_at": "2026-07-07T23:45:26+00:00",
-    "updated_at": "2026-07-08T00:40:15+00:00"
+    "updated_at": "2026-07-08T01:31:01+00:00"
   },
   "3f2e07a83af0": {
     "title": "The Haven of Health",
@@ -170,5 +170,31 @@
     "id": "137684a86ace",
     "created_at": "2026-07-07T23:45:38+00:00",
     "updated_at": "2026-07-07T23:45:38+00:00"
+  },
+  "86f7f393b214": {
+    "title": "Essays on some of the most important articles of the Materia Medica",
+    "subtitle": "",
+    "authors": "Carpenter, G.W.",
+    "year": "1834",
+    "publisher": "George W. Carpenter's Chemical Warehouse",
+    "publisher_city": "",
+    "edition": "",
+    "language": "",
+    "pages": "",
+    "categories": "",
+    "description": "",
+    "pdf_source": "",
+    "pdf_file": "downloads/ia/61560600R.nlm.nih.gov.pdf",
+    "source_url": "https://archive.org/details/61560600R.nlm.nih.gov",
+    "notes": "Source: Internet Archive — Essays on some of the most important articles of the materia medica : comprising a full account of all the new proximate principles, and the popular medicines lately introduced in practice, detailing the formulas for their preparation, their habitudes and peculiarities, doses and modes of administration : with remarks on the most eligible form of their exhibition : to which is added a catalogue of medicines, surgical instruments, &c, &c : adapted for a physician at the outset of his practice, with the doses and effects attached to each medicine, &c, &c",
+    "status": "draft",
+    "ocr_active": "",
+    "ocr_verified": "",
+    "ocr_quality": "",
+    "title_pages": "",
+    "attention": "",
+    "id": "86f7f393b214",
+    "created_at": "2026-07-08T01:25:37+00:00",
+    "updated_at": "2026-07-08T01:25:40+00:00"
   }
 }
