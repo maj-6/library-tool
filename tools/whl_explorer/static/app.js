@@ -1530,7 +1530,73 @@ function combinedRows() {
   return rows;
 }
 
-// Shift+click marks a row purple: "needs attention"
+// --- "needs attention" marks (press Q while hovering a row) ---------------------
+// Checked/manual rows and builder entries persist their flag on the data;
+// every other table keeps a lightweight browser-side mark keyed per row.
+
+const ATTN_KEY = "whl_cad_attention_v1";
+
+function loadAttn() {
+  try { state.attn = JSON.parse(localStorage.getItem(ATTN_KEY) || "{}"); }
+  catch (e) { state.attn = {}; }
+}
+
+function attnHas(k) { return !!(state.attn || {})[k]; }
+
+function toggleAttnKey(k) {
+  state.attn = state.attn || {};
+  if (state.attn[k]) delete state.attn[k];
+  else state.attn[k] = 1;
+  try { localStorage.setItem(ATTN_KEY, JSON.stringify(state.attn)); } catch (e) {}
+  status(state.attn[k] ? "Marked: needs attention" : "Attention mark cleared");
+}
+
+// Q toggles the purple mark on whatever row (any table) or builder entry
+// the mouse is over — clicking is left to each table's own actions
+function onAttentionKey(ev) {
+  if (ev.key !== "q" && ev.key !== "Q") return;
+  if (/^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName) ||
+      ev.target.isContentEditable) return;
+  const bi = document.querySelector("#builds-list .build-item:hover");
+  if (bi) {
+    const b = state.builds[bi.dataset.bid];
+    if (b) {
+      const marking = !b.attention;
+      patchBuildRaw(bi.dataset.bid, { attention: marking ? "1" : "" })
+        .then(() => status(marking ? "Marked: needs attention"
+                                   : "Attention mark cleared"));
+    }
+    return;
+  }
+  const tr = document.querySelector(
+    "#checked-rows tr:hover, #whltop-rows tr:hover, " +
+    "#upload-rows tr:hover, #bottom-rows tr:hover");
+  if (!tr) return;
+  const host = tr.parentElement.id;
+  if (host === "checked-rows" && tr.dataset.rowId) {
+    toggleRowAttention(tr.dataset.rowId);
+  } else if (host === "whltop-rows" && tr.dataset.widx != null) {
+    toggleAttnKey("whl:" + tr.dataset.widx);
+    renderWhlTop();
+  } else if (host === "upload-rows" && tr.dataset.si != null) {
+    const s = (state.uploadSources || [])[+tr.dataset.si];
+    if (s) {
+      toggleAttnKey("src:" + (s.url || s.local_pdf || s.title));
+      renderUpload();
+    }
+  } else if (host === "bottom-rows" && tr.dataset.bi != null) {
+    const rec = (state.bottomRecords || [])[+tr.dataset.bi];
+    if (!rec) return;
+    if (rec._src === "manual" && rec._mid) {
+      // master-list manual rows share the manual entry's persistent flag
+      toggleRowAttention(rec._mid).then(renderBottomRows);
+    } else {
+      toggleAttnKey(`${rec._src}:${rec._idx}`);
+      renderBottomRows();
+    }
+  }
+}
+
 async function toggleRowAttention(id) {
   const row = state.rowsById.get(String(id));
   if (!row) return;
@@ -1799,17 +1865,6 @@ function onCheckedClick(ev) {
       else attachRowScan(tr.dataset.rowId);
     }
     return;
-  }
-  // Shift+click on the row itself (not on tags/markers/actions, and not
-  // inside an open cell editor where Shift+click extends the selection):
-  // toggle the purple "needs attention" mark
-  if (ev.shiftKey && !ev.target.closest("a,button,input,textarea,.vmark,.badge")) {
-    const tr = ev.target.closest("tr");
-    if (tr && tr.dataset.rowId) {
-      ev.preventDefault();
-      toggleRowAttention(tr.dataset.rowId);
-      return;
-    }
   }
   const tag = ev.target.closest(".tag-unit a.badge");
   if (tag) {
@@ -2166,6 +2221,13 @@ function renderBottomRows() {
       if (rec._src === "manual") tr.classList.add("ml-manual");
       else if (state.checked.has(ckey("ch_library", rec._idx))) tr.classList.add("ml-checked");
     }
+    // needs-attention marks (Q while hovering) apply here too
+    if (rec._src === "manual" && rec._mid) {
+      const e = state.manual.find((x) => x.id === rec._mid);
+      if (e && e.attention) tr.classList.add("attention");
+    } else if (attnHas(`${rec._src}:${rec._idx}`)) {
+      tr.classList.add("attention");
+    }
     tr.dataset.bi = i;
     tr.dataset.tip = recordTip(rec, def.label);
     tr.innerHTML = def.cells(rec).map((c) => `<td>${c == null ? "" : c}</td>`).join("");
@@ -2406,6 +2468,7 @@ function renderWhlTop() {
     if (r.added) tr.classList.add("whl-row-added");
     else if (r.corrected) tr.classList.add("whl-row-corrected");
     if (r.status === "draft") tr.classList.add("whl-row-draft");
+    if (attnHas("whl:" + r.idx)) tr.classList.add("attention");
     if (state.whlSelected === r.idx) tr.classList.add("whl-selected");
     tr.dataset.tip = recordTip(
       Object.assign(whlToRecord(r), { subtitle: r.subtitle || "",
@@ -4316,9 +4379,11 @@ function renderUpload() {
     const flt = state.settings.srcStatusFilter || {};
     if (flt[st] === false) return;   // hidden by the status filter
     const tr = document.createElement("tr");
+    tr.dataset.si = i;
     // yellow = a draft entry exists in the editor; green = its entry is done
     if (st === "draft") tr.classList.add("src-draft");
     else if (st === "done") tr.classList.add("src-done");
+    if (attnHas("src:" + (s.url || s.local_pdf || s.title))) tr.classList.add("attention");
     tr.innerHTML = `
       <td>${esc(s.title)}</td>
       <td>${esc(s.subtitle)}</td>
@@ -4451,7 +4516,7 @@ function renderBuildsList() {
       `${b.authors ? "Authors: " + b.authors + "\n" : ""}` +
       `${b.year ? "Year: " + b.year + "\n" : ""}` +
       `Status: ${uploaded ? "uploaded" : ready ? "verified" : "draft"}\n` +
-      `Updated: ${b.updated_at || ""}\nShift+click: mark as needing attention`;
+      `Updated: ${b.updated_at || ""}\nPress Q while hovering: mark as needing attention`;
     // compact: title with the status icon inline on the right, then a
     // single author · year meta line
     li.innerHTML = `
@@ -4990,7 +5055,10 @@ const ocrState = {
   bookLoading: null,       // build id currently loading (re-entrancy guard)
   verifiedOnly: false,     // sidebar filter
   pages: null,             // {pre, map} sections for the side-by-side view
-  pageJobs: new Map(),     // page number -> service (queued for OCR)
+  pageTags: new Map(),     // "bid:page" -> service, STAGED (submit is manual)
+  pageRunning: new Map(),  // "bid:page" -> service, submitted and processing
+  pageSel: new Set(),      // selected page numbers (current book's view)
+  selAnchor: 0,            // last plain-clicked page (Ctrl+click ranges)
 };
 
 function ocrSelDoc() {
@@ -5076,6 +5144,7 @@ async function selectOcrBook(bid) {
   if (ocrState.bookLoading === bid) return;
   ocrSyncEditor();
   ocrState.book = bid;
+  clearOcrPageSel();   // selections don't carry across books
   let folder = (ocrState.books || {})[bid];
   if (!folder) { renderOcrTab(); return; }
   // the guard must cover the auto-extraction await too, or a double-click
@@ -5124,11 +5193,17 @@ async function selectOcrBook(bid) {
   }
 }
 
+// only the current book's documents (plus loose local files) are listed
+function ocrVisibleDocs() {
+  return ocrState.docs.filter((d) => !d.buildId || d.buildId === ocrState.book);
+}
+
 function renderOcrDocs() {
   const list = el("ocr-docs");
   list.innerHTML = "";
-  el("ocr-docs-empty").hidden = ocrState.docs.length !== 0;
-  for (const d of ocrState.docs) {
+  const docs = ocrVisibleDocs();
+  el("ocr-docs-empty").hidden = docs.length !== 0;
+  for (const d of docs) {
     const li = document.createElement("li");
     li.className = "ocr-doc" + (d.id === ocrState.sel ? " active" : "");
     li.dataset.did = d.id;
@@ -5369,11 +5444,17 @@ function renderOcrQueue() {
 
 function renderOcrTab() {
   renderOcrBooks();
+  // a selected doc that fell out of view (book switch) yields to the first
+  // visible one — BEFORE the list renders its active highlight
+  const visible = ocrVisibleDocs();
+  if (ocrState.sel && !visible.some((d) => d.id === ocrState.sel)) {
+    ocrState.sel = visible.length ? visible[0].id : null;
+  }
   renderOcrDocs();
   const sel = el("ocr-diff-with");
   const prevWith = sel.value;   // keep the chosen compare target
   sel.innerHTML = "";
-  for (const d of ocrState.docs) {
+  for (const d of visible) {
     if (d.id === ocrState.sel) continue;
     const o = document.createElement("option");
     o.value = d.id;
@@ -5537,14 +5618,65 @@ async function ocrQueuePages(bid, pages) {
       at: new Date().toLocaleTimeString(),
     });
     // keyed by build AND page: markers must not leak across books
-    for (const x of pages) ocrState.pageJobs.set(`${bid}:${x.page}`, x.service);
+    for (const x of pages) ocrState.pageRunning.set(`${bid}:${x.page}`, x.service);
     decorateOcrPages();
     renderOcrQueue();
     pollOcrJobs();
     el("ocr-msg").textContent = "";
+    return true;
   } catch (e) {
     el("ocr-msg").textContent = "OCR queue failed";
   }
+  return false;
+}
+
+// staged tags for one book, grouped for a single mixed-service job
+function stagedPagesFor(bid) {
+  const out = [];
+  for (const [k, svc] of ocrState.pageTags) {
+    const [kb, kn] = k.split(":");
+    if (kb === bid) out.push({ page: +kn, service: svc });
+  }
+  return out.sort((a, b) => a.page - b.page);
+}
+
+function updateOcrStagedMsg() {
+  const bid = ocrState.book;
+  const n = bid ? stagedPagesFor(bid).length : 0;
+  const sel = ocrState.pageSel.size;
+  el("ocr-msg").textContent =
+    (sel ? `${sel} page(s) selected` : "") +
+    (sel && n ? " · " : "") +
+    (n ? `${n} staged — press submit to process` : "");
+}
+
+// SUBMIT: processing is prompted manually — the staged mix (possibly
+// several services) goes out as one job
+async function ocrSubmitStaged() {
+  const bid = ocrState.book;
+  if (!bid) { el("ocr-msg").textContent = "Pick a book first"; return; }
+  const staged = stagedPagesFor(bid);
+  if (!staged.length) {
+    el("ocr-msg").textContent = "Nothing staged — hover a page and press a digit";
+    return;
+  }
+  // stub services can't run: one honest queue row PER service
+  const stubs = staged.filter((x) => !OCR_RUNNABLE[x.service]);
+  const runnable = staged.filter((x) => OCR_RUNNABLE[x.service]);
+  for (const svc of new Set(stubs.map((x) => x.service))) {
+    ocrQueuePages(bid, [stubs.find((x) => x.service === svc)]);
+  }
+  for (const x of stubs) ocrState.pageTags.delete(`${bid}:${x.page}`);
+  let failed = false;
+  if (runnable.length) {
+    if (await ocrQueuePages(bid, runnable)) {
+      for (const x of runnable) ocrState.pageTags.delete(`${bid}:${x.page}`);
+    } else {
+      failed = true;   // ocrQueuePages already explained why in ocr-msg
+    }
+  }
+  decorateOcrPages();
+  if (!failed) updateOcrStagedMsg();
 }
 
 let ocrPollTimer = null;
@@ -5575,9 +5707,9 @@ function pollOcrJobs() {
           : job.status + (job.errors ? ` (${job.errors} failed)` : "");
         if (job.status !== "running") {
           j.finished = true;
-          // finished pages (ok or errored) are no longer "queued"
+          // finished pages (ok or errored) are no longer running
           for (const x of job.pages) {
-            ocrState.pageJobs.delete(`${j.buildId}:${x.page}`);
+            ocrState.pageRunning.delete(`${j.buildId}:${x.page}`);
           }
           refreshCompiledDoc(j.buildId,
             job.pages.filter((x) => x.status === "ok").map((x) => x.page));
@@ -5629,7 +5761,7 @@ async function refreshCompiledDoc(bid, donePages) {
   } catch (e) { /* folder list already refreshed */ }
 }
 
-// queue the whole book with the selected service
+// stage the whole book with the selected service (submit stays manual)
 async function ocrQueueJob() {
   const bid = ocrState.book;
   const b = bid ? state.builds[bid] : null;
@@ -5637,89 +5769,172 @@ async function ocrQueueJob() {
   const pdf = ocrBookPdf(bid);
   if (!pdf) { el("ocr-msg").textContent = "This book has no PDF"; return; }
   const svc = el("ocr-service").value;
-  if (!OCR_RUNNABLE[svc]) {
-    ocrQueuePages(bid, [{ page: 1, service: svc }]);   // stub row path
-    return;
-  }
   let count = 0;
   try {
     const info = await (await fetch("/api/pdf/info?path=" + encodeURIComponent(pdf))).json();
     if (info.ok) count = Math.min(info.pages, 400);
   } catch (e) { /* handled below */ }
   if (!count) { el("ocr-msg").textContent = "Could not read the PDF"; return; }
-  ocrQueuePages(bid, Array.from({ length: count }, (_, i) =>
-    ({ page: i + 1, service: svc })));
+  for (let n = 1; n <= count; n++) ocrState.pageTags.set(`${bid}:${n}`, svc);
+  decorateOcrPages();
+  updateOcrStagedMsg();
 }
 
-// --- page-view interactions: digit shortcuts, ranges, title pages --
-// Hover a page and press a digit (mapping in Settings > OCR) to queue that
-// page. Ctrl+digit arms a service for a range: Ctrl+click marks the range
-// start, Ctrl+click on another page queues the whole range. T marks the
-// hovered page as a title page (metadata extraction uses these later).
+// --- page-view interactions: selection, digit staging, title pages --
+// Click a page image to select it, Ctrl+click to extend the selection as a
+// range from the last click. Pressing a digit (mapping in Settings > OCR)
+// STAGES the selected pages — or just the hovered page — for that service;
+// different digits build a mixed batch, and nothing is processed until the
+// submit button sends it. T marks the hovered page as a title page.
+// Selected pages can be deleted from the FULL PDF (trash button / Delete).
 
 let ocrHoverPage = 0;
-let ocrArmed = "";        // service armed via Ctrl+digit
-let ocrRangeStart = null; // {page, service}
 
 function ocrPagesActive() {
   return document.querySelector('#tabs .tab.active[data-tab="ocr"]') &&
     ocrState.view === "pdf";
 }
 
+function clearOcrPageSel() {
+  ocrState.pageSel.clear();
+  ocrState.selAnchor = 0;
+}
+
 function onOcrPagesKey(ev) {
-  if (!ocrPagesActive() || !ocrHoverPage) return;
-  if (/^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName)) return;
+  if (!ocrPagesActive()) return;
+  if (/^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName) ||
+      ev.target.isContentEditable) return;
   const d = ocrSelDoc();
   const bid = d && d.buildId;
   if (!bid) return;
   if (ev.key === "Escape") {
-    ocrArmed = "";
-    ocrRangeStart = null;
+    clearOcrPageSel();
     decorateOcrPages();
+    updateOcrStagedMsg();
+    return;
+  }
+  if (ev.key === "Delete" || ev.key === "Backspace") {
+    if (ocrState.pageSel.size) {
+      ev.preventDefault();
+      deleteSelectedPages();
+    }
     return;
   }
   if (/^[1-9]$/.test(ev.key)) {
     const svc = (state.settings.ocrKeyMap || {})[ev.key];
     if (!svc) return;
     ev.preventDefault();
-    if (ev.ctrlKey) {
-      // arm the service for a Ctrl+click range selection
-      ocrArmed = svc;
-      status(`ARMED :: ${OCR_SERVICE_LABELS[svc]} — Ctrl+click the range start, then its end`);
-    } else {
-      ocrQueuePages(bid, [{ page: ocrHoverPage, service: svc }]);
+    // stage the selection (or the hovered page); the same digit untags
+    const targets = ocrState.pageSel.size
+      ? [...ocrState.pageSel]
+      : (ocrHoverPage ? [ocrHoverPage] : []);
+    for (const n of targets) {
+      const k = `${bid}:${n}`;
+      if (ocrState.pageTags.get(k) === svc) ocrState.pageTags.delete(k);
+      else ocrState.pageTags.set(k, svc);
     }
+    decorateOcrPages();
+    updateOcrStagedMsg();
     return;
   }
-  if (ev.key === "t" || ev.key === "T") {
+  if ((ev.key === "t" || ev.key === "T") && ocrHoverPage) {
     ev.preventDefault();
     toggleTitlePage(bid, ocrHoverPage);
   }
 }
 
 function onOcrPagesClick(ev) {
-  if (!ev.ctrlKey) return;
-  const row = ev.target.closest(".ocr-pgrow");
+  // clicks on the page IMAGE select; clicks in the text boxes edit
+  const img = ev.target.closest(".ocr-pgimg");
+  if (!img) return;
+  const row = img.closest(".ocr-pgrow");
   if (!row) return;
-  const d = ocrSelDoc();
-  const bid = d && d.buildId;
-  if (!bid) return;
   ev.preventDefault();
   const page = +row.dataset.page;
-  const svc = ocrArmed || el("ocr-service").value;
-  if (!ocrRangeStart) {
-    ocrRangeStart = { page, service: svc };
-    decorateOcrPages();
-    status(`RANGE START :: page ${page} (${OCR_SERVICE_LABELS[svc]}) — Ctrl+click the end page`);
+  if (ev.ctrlKey && ocrState.selAnchor) {
+    const from = Math.min(ocrState.selAnchor, page);
+    const to = Math.max(ocrState.selAnchor, page);
+    for (let n = from; n <= to; n++) ocrState.pageSel.add(n);
+  } else if (ocrState.pageSel.has(page)) {
+    ocrState.pageSel.delete(page);
+    ocrState.selAnchor = page;
+  } else {
+    ocrState.pageSel.add(page);
+    ocrState.selAnchor = page;
+  }
+  decorateOcrPages();
+  updateOcrStagedMsg();
+}
+
+// delete the selected pages from the build's ACTUAL PDF (never the
+// truncated preview derivative); the server keeps a .bak.pdf and renumbers
+// the OCR files + title pages
+async function deleteSelectedPages() {
+  const d = ocrSelDoc();
+  const bid = d && d.buildId;
+  if (!bid || !ocrState.pageSel.size) return;
+  const b = state.builds[bid];
+  const pdf = (b && (b.pdf_file || "").trim());
+  if (!pdf) { el("ocr-msg").textContent = "This book has no attached PDF"; return; }
+  if (/^output[\/\\]entries[\/\\]/i.test(pdf)) {
+    el("ocr-msg").textContent =
+      "This book only has the truncated preview — re-attach the original scan first";
     return;
   }
-  const from = Math.min(ocrRangeStart.page, page);
-  const to = Math.max(ocrRangeStart.page, page);
-  const service = ocrRangeStart.service;
-  ocrRangeStart = null;
-  ocrArmed = "";
-  ocrQueuePages(bid, Array.from({ length: to - from + 1 }, (_, i) =>
-    ({ page: from + i, service })));
+  // deleting shifts page numbers under a running job's feet
+  if ([...ocrState.pageRunning.keys()].some((k) => k.startsWith(bid + ":"))) {
+    el("ocr-msg").textContent = "An OCR job is running for this book — wait for it";
+    return;
+  }
+  const pages = [...ocrState.pageSel].sort((a, z) => a - z);
+  if (!window.confirm(
+      `Delete ${pages.length} page(s) [${pages.join(", ")}] from the PDF?\n` +
+      `${pdf}\n\nThe previous version is kept as a .bak.pdf next to it; ` +
+      "OCR files and title pages are renumbered to match.")) {
+    return;
+  }
+  el("ocr-msg").textContent = "Deleting pages ...";
+  // unsaved edits must survive: flush and save the book's folder docs so
+  // the server renumbers the CURRENT text, not a stale file
+  ocrSyncEditor();
+  for (const doc of ocrState.docs) {
+    if (doc.buildId !== bid || !(doc.fileName || doc.name)) continue;
+    try {
+      await fetch(`/api/builds/${encodeURIComponent(bid)}/ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: doc.fileName || doc.name, text: doc.text }),
+      });
+    } catch (e) { /* the renumber then works from the last saved version */ }
+  }
+  try {
+    const res = await fetch("/api/pdf/pages/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ build_id: bid, pdf, pages }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!data.ok) {
+      el("ocr-msg").textContent = data.error || "Page deletion failed";
+      return;
+    }
+    if (data.build) state.builds[bid] = data.build;
+    clearOcrPageSel();
+    // staged/running markers no longer match the new numbering
+    for (const k of [...ocrState.pageTags.keys()]) {
+      if (k.startsWith(bid + ":")) ocrState.pageTags.delete(k);
+    }
+    status(`PAGES DELETED :: ${pages.length} (backup: ${data.backup})`);
+    el("ocr-msg").textContent = "";
+    // reload the renumbered OCR docs and the shrunken PDF
+    await loadOcrBooks();
+    ocrState.bookLoading = null;
+    ocrState.docs = ocrState.docs.filter((x) => x.buildId !== bid);
+    await selectOcrBook(bid);
+    setOcrView("pdf");
+  } catch (e) {
+    el("ocr-msg").textContent = "Page deletion failed";
+  }
 }
 
 // title pages persist on the build (comma-separated page numbers)
@@ -5742,28 +5957,30 @@ async function toggleTitlePage(bid, page) {
   }
 }
 
-// corner chips + outlines on the page rows: T = title page, service chip =
-// queued for OCR, dashed outline = pending range start
+// corner chips + outlines on the page rows: T = title page, amber chip =
+// staged (awaiting submit), cyan chip = processing, amber outline = selected
 function decorateOcrPages() {
   const d = ocrSelDoc();
   const b = d && d.buildId ? state.builds[d.buildId] : null;
   const titles = titlePageSet(b);
   document.querySelectorAll("#ocr-pages .ocr-pgrow").forEach((row) => {
     const n = +row.dataset.page;
+    const staged = b ? ocrState.pageTags.get(`${d.buildId}:${n}`) : undefined;
+    const running = b ? ocrState.pageRunning.get(`${d.buildId}:${n}`) : undefined;
     row.classList.toggle("pg-title", titles.has(n));
-    row.classList.toggle("pg-queued",
-      !!b && ocrState.pageJobs.has(`${d.buildId}:${n}`));
-    row.classList.toggle("pg-range", !!(ocrRangeStart && ocrRangeStart.page === n));
+    row.classList.toggle("pg-staged", !!staged);
+    row.classList.toggle("pg-queued", !!running);
+    row.classList.toggle("pg-sel", ocrState.pageSel.has(n));
     let chip = row.querySelector(".pg-chips");
     if (!chip) {
       chip = document.createElement("span");
       chip.className = "pg-chips";
       row.querySelector(".ocr-pgimg").appendChild(chip);
     }
-    const svc = b ? ocrState.pageJobs.get(`${d.buildId}:${n}`) : undefined;
     chip.innerHTML =
       (titles.has(n) ? `<span class="pg-chip title" data-tip="Title page">T</span>` : "") +
-      (svc ? `<span class="pg-chip svc" data-tip="Queued: ${esc(OCR_SERVICE_LABELS[svc])}">${esc(svc.slice(0, 2).toUpperCase())}</span>` : "");
+      (staged ? `<span class="pg-chip staged" data-tip="Staged: ${esc(OCR_SERVICE_LABELS[staged])} — press submit">${esc(staged.slice(0, 2).toUpperCase())}</span>` : "") +
+      (running ? `<span class="pg-chip svc" data-tip="Processing: ${esc(OCR_SERVICE_LABELS[running])}">${esc(running.slice(0, 2).toUpperCase())}</span>` : "");
   });
 }
 
@@ -5797,8 +6014,9 @@ function initOcrTab() {
   el("ocr-view-pdf").addEventListener("click", () =>
     setOcrView(ocrState.view === "pdf" ? "edit" : "pdf"));
   el("ocr-pages").addEventListener("input", onOcrPageInput);
-  // page-view shortcuts: hover + digit queues a page; Ctrl+digit arms a
-  // service; Ctrl+click sets/finishes a range; T marks a title page
+  // page-view shortcuts: click selects, Ctrl+click extends the range,
+  // digits STAGE the selection/hovered page, T marks a title page,
+  // Delete removes selected pages from the PDF
   el("ocr-pages").addEventListener("mouseover", (ev) => {
     const row = ev.target.closest(".ocr-pgrow");
     if (row) ocrHoverPage = +row.dataset.page;
@@ -5832,12 +6050,14 @@ function initOcrTab() {
   el("ocr-set-active").addEventListener("click", ocrSetActive);
   // the queue's service select starts on the configured default and keeps
   // the setting in sync when changed here
-  el("ocr-service").value = state.settings.ocrService || "azure";
+  el("ocr-service").value = state.settings.ocrService || "tesseract";
   el("ocr-service").addEventListener("change", () => {
     state.settings.ocrService = el("ocr-service").value;
     saveSettings();
   });
   el("ocr-queue-add").addEventListener("click", ocrQueueJob);
+  el("ocr-submit").addEventListener("click", ocrSubmitStaged);
+  el("ocr-del-pages").addEventListener("click", deleteSelectedPages);
   el("ocr-editor").addEventListener("input", () => {
     const d = ocrSelDoc();
     if (d) d.text = el("ocr-editor").value;
@@ -6244,18 +6464,7 @@ function init() {
   el("download-upload-list").addEventListener("click", downloadUploadList);
   el("builds-list").addEventListener("click", (ev) => {
     const li = ev.target.closest("li.build-item");
-    if (!li) return;
-    // Shift+click: toggle the purple "needs attention" mark
-    if (ev.shiftKey) {
-      const b = state.builds[li.dataset.bid];
-      if (b) {
-        patchBuildRaw(li.dataset.bid, { attention: b.attention ? "" : "1" })
-          .then(() => status(b.attention ? "Attention mark cleared"
-                                         : "Marked: needs attention"));
-      }
-      return;
-    }
-    selectBuild(li.dataset.bid);
+    if (li) selectBuild(li.dataset.bid);
   });
   for (const t of document.querySelectorAll("#builds-tabs .pane-tab")) {
     t.addEventListener("click", () => {
@@ -6297,6 +6506,9 @@ function init() {
     if (chip) setActiveOcr(chip.dataset.ocr);
   });
   initOcrTab();
+  // Q while hovering a row (any table) or a builder entry: needs-attention
+  loadAttn();
+  document.addEventListener("keydown", onAttentionKey);
   el("b-pdf-attach").addEventListener("click", () => attachPdfFile());
   el("b-pdf_file").addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") { ev.preventDefault(); attachPdfFile(); }

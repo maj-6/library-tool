@@ -744,6 +744,121 @@ def api_ocr_job(job_id: str):
     return jsonify({"ok": True, "job": _ocr_job_state(job)})
 
 
+# --- PDF page deletion ---------------------------------------------------------------
+
+def _renumber_marked_text(text: str, removed: list[int]) -> str:
+    """Remap "--- page N ---" markers after pages were deleted: sections for
+    removed pages are dropped, higher page numbers shift down."""
+    marks = list(re.finditer(r"^--- page (\d+) ---$", text, re.M))
+    if not marks:
+        return text
+    removed_set = set(removed)
+    pre = text[:marks[0].start()].rstrip("\n")
+    parts = [pre] if pre else []
+    for i, m in enumerate(marks):
+        n = int(m.group(1))
+        if n in removed_set:
+            continue
+        to = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        shift = sum(1 for r in removed if r < n)
+        parts.append(f"--- page {n - shift} ---\n" + text[m.end():to].strip("\n"))
+    return "\n\n".join(parts)
+
+
+@app.route("/api/pdf/pages/delete", methods=["POST"])
+def api_pdf_pages_delete():
+    """Delete pages from a build's PDF — the real file, not a preview.
+    Body: {build_id, pdf, pages: [1-based numbers]}.
+
+    The pre-deletion file is kept next to the PDF as <name>.bak.pdf
+    (overwritten by the next deletion), the build's OCR files get their
+    page markers renumbered, and title_pages is remapped, so everything
+    stays aligned with the new page numbering."""
+    p = request.get_json(silent=True) or {}
+    build_id = str(p.get("build_id") or "")
+    builds = lib.load_json(BUILDS_PATH, {})
+    if build_id not in builds:
+        abort(404)
+    # a running OCR job reads page numbers that deletion would shift under
+    # its feet — refuse until it finishes
+    running = [j for j in _ocr_jobs.values()
+               if j.get("build_id") == build_id and j.get("status") == "running"]
+    if running:
+        return jsonify({"ok": False,
+                        "error": "an OCR job is running for this book — "
+                                 "wait for it to finish"})
+    pdf = _resolve_local(str(p.get("pdf") or ""))
+    if pdf is None or pdf.suffix.lower() != ".pdf" or not pdf.is_file():
+        return jsonify({"ok": False, "error": "PDF not found"})
+    # the entry-folder preview is a TRUNCATED derivative: deleting pages
+    # there would desync the (full-length) OCR renumbering
+    try:
+        if pdf.resolve().is_relative_to(ENTRIES_DIR.resolve()):
+            return jsonify({"ok": False,
+                            "error": "this book only has the truncated preview "
+                                     "derivative — re-attach the original scan "
+                                     "before deleting pages"})
+    except OSError:
+        pass
+    try:
+        pages = sorted({int(n) for n in (p.get("pages") or []) if int(n) > 0})
+    except (TypeError, ValueError):
+        pages = []
+    if not pages:
+        return jsonify({"ok": False, "error": "no pages selected"})
+    from pypdf import PdfReader, PdfWriter
+    import shutil
+    try:
+        reader = PdfReader(str(pdf))
+        total = len(reader.pages)
+        keep = [i for i in range(total) if (i + 1) not in set(pages)]
+        if not keep:
+            return jsonify({"ok": False, "error": "cannot delete every page"})
+        if len(keep) == total:
+            return jsonify({"ok": False, "error": "pages out of range"})
+        # safety net: the previous version stays recoverable
+        shutil.copy2(pdf, pdf.with_suffix(".bak.pdf"))
+        writer = PdfWriter()
+        for i in keep:
+            writer.add_page(reader.pages[i])
+        tmp = pdf.with_suffix(".del.tmp")
+        with open(tmp, "wb") as fh:
+            writer.write(fh)
+        tmp.replace(pdf)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+    # keep the build's OCR files and title pages aligned with the new
+    # numbering (under the merge lock: a job finishing this instant must
+    # not interleave with the renumber writes)
+    b = builds[build_id]
+    ocr_dir = _entry_dir(build_id) / "ocr"
+    renumbered = []
+    with _ocr_merge_lock:
+        if ocr_dir.is_dir():
+            for f in ocr_dir.glob("*.txt"):
+                try:
+                    out = _renumber_marked_text(
+                        f.read_text(encoding="utf-8", errors="replace"), pages)
+                    f.write_text(out, encoding="utf-8", errors="replace")
+                    renumbered.append(f.name)
+                except OSError:
+                    continue
+    titles = [int(x) for x in str(b.get("title_pages") or "").split(",")
+              if x.strip().isdigit()]
+    if titles:
+        remapped = []
+        for t in titles:
+            if t in set(pages):
+                continue
+            remapped.append(t - sum(1 for r in pages if r < t))
+        b["title_pages"] = ",".join(str(t) for t in remapped)
+        lib.save_json(BUILDS_PATH, builds)
+    return jsonify({"ok": True, "deleted": pages, "pages": len(keep),
+                    "renumbered": renumbered,
+                    "backup": pdf.with_suffix(".bak.pdf").name,
+                    "build": b})
+
+
 # --- master list -> Google Sheets sync ----------------------------------------------
 
 @app.route("/api/master/sync", methods=["POST"])

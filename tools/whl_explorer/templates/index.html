@@ -10,7 +10,7 @@
   <div id="titlebar">
     <span class="tb-name" id="tb-name">Catalogs :: Catalog Explorer</span>
     <span class="tb-right">
-      <span class="tb-meta" id="tb-meta">v2.7</span>
+      <span class="tb-meta" id="tb-meta">v2.8</span>
     </span>
   </div>
 
@@ -658,6 +658,8 @@
                     data-icon="diff" data-tip="Compare against another document"></button>
             <button id="ocr-view-pdf" class="cad-btn tiny icon-btn" type="button"
                     data-icon="pdfpage" data-tip="Show the PDF beside the text, page by page"></button>
+            <button id="ocr-del-pages" class="cad-btn tiny icon-btn danger" type="button"
+                    data-icon="trash" data-tip="Delete the selected pages from the PDF itself (a .bak.pdf backup is kept; OCR files are renumbered)"></button>
             <select id="ocr-diff-with" class="cad-input" data-tip="Compare against"></select>
             <span class="tb-sep"></span>
             <input id="ocr-find" class="cad-input" placeholder="find" />
@@ -698,7 +700,9 @@
           <option value="openai">OpenAI vision</option>
         </select>
         <button id="ocr-queue-add" class="cad-btn tiny icon-btn" type="button"
-                data-icon="plus" data-tip="Queue the selected book's PDF for OCR"></button>
+                data-icon="plus" data-tip="Stage every page of the book with this service (nothing runs until submit)"></button>
+        <button id="ocr-submit" class="cad-btn tiny icon-btn" type="button"
+                data-icon="go" data-tip="Submit the staged pages for processing"></button>
         <span class="tool-count" id="ocr-queue-count"></span>
       </div>
       <div class="drafting" id="ocr-queue-wrap">
@@ -939,8 +943,10 @@
                 <option value="openai">OpenAI vision</option>
               </select>
             </div>
-            <p class="settings-note">Page-view keys: hover a PDF page and press the digit to queue
-              it with that service; Ctrl+digit arms it for a Ctrl+click range.</p>
+            <p class="settings-note">Page-view keys: hover a PDF page (or select pages by
+              clicking their images; Ctrl+click selects a range) and press the digit to STAGE
+              them with that service — mixed batches are fine; nothing runs until the submit
+              button. The same digit untags.</p>
           </div>
           <div id="sec-sync" class="settings-sec">
             <div class="settings-head">Sync</div>
