@@ -182,7 +182,9 @@ def api_builds_restore():
 def _resolve_local(raw: str) -> Path | None:
     p = Path(raw)
     if not p.is_absolute():
-        p = lib.ROOT / p
+        # relative stored paths (downloads/ia/..., output/entries/...) live
+        # under the writable data root
+        p = lib.DATA_ROOT / p
     try:
         return p.resolve()
     except OSError:
@@ -205,7 +207,7 @@ def _remote_pdf_cache(url: str) -> Path:
     if not url.lower().startswith(("http://", "https://")):
         raise ValueError("not an http(s) URL")
     import hashlib
-    cache_dir = lib.ROOT / "downloads" / "cache"
+    cache_dir = lib.DATA_ROOT / "downloads" / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     p = cache_dir / (hashlib.sha1(url.encode("utf-8")).hexdigest()[:16] + ".pdf")
     with _remote_pdf_lock:
@@ -354,7 +356,7 @@ def _pdf_extract_text(p: Path, max_pages: int) -> tuple[int, int, str]:
 def _preview_pdf(src: Path, pages: int) -> Path:
     """A compressed, truncated preview derivative, cached by mtime."""
     import hashlib
-    cache = lib.ROOT / "downloads" / "cache" / "previews"
+    cache = lib.DATA_ROOT / "downloads" / "cache" / "previews"
     cache.mkdir(parents=True, exist_ok=True)
     key = hashlib.sha1(
         f"{src}|{src.stat().st_mtime}|{pages}".encode("utf-8")).hexdigest()[:16]
@@ -474,13 +476,13 @@ def api_build_folder_sync(build_id: str):
                     # entry folder's preview becomes the build's PDF, and
                     # the IA download catalog entry is retired
                     b["pdf_file"] = (d / "preview.pdf").resolve().relative_to(
-                        lib.ROOT.resolve()).as_posix()
+                        lib.DATA_ROOT.resolve()).as_posix()
                     b["updated_at"] = datetime.now(timezone.utc).isoformat(
                         timespec="seconds")
                     lib.save_json(BUILDS_PATH, builds)
                     catalog = lib.load_json(lib.IA_CATALOG_PATH, {})
                     stale = [k for k, v in catalog.items()
-                             if (lib.ROOT / str(v.get("saved_as") or "?")).resolve()
+                             if (lib.DATA_ROOT / str(v.get("saved_as") or "?")).resolve()
                              == srcr]
                     for k in stale:
                         del catalog[k]
@@ -571,7 +573,7 @@ def api_pdf_pageimg():
     except ImportError:
         return jsonify({"ok": False, "error": "PyMuPDF is not installed"}), 501
     import hashlib
-    cache = lib.ROOT / "downloads" / "cache" / "pages"
+    cache = lib.DATA_ROOT / "downloads" / "cache" / "pages"
     cache.mkdir(parents=True, exist_ok=True)
     key = hashlib.sha1(
         f"{p}|{p.stat().st_mtime}|{page}|{w}".encode("utf-8")).hexdigest()[:16]
@@ -1049,7 +1051,7 @@ def api_pdf_browse():
     raw = (request.args.get("dir") or "").strip()
     d = _resolve_local(raw) if raw else lib.IA_DOWNLOADS_DIR
     if d is None or not d.is_dir():
-        d = lib.ROOT
+        d = lib.DATA_ROOT
     dirs: list[dict] = []
     pdfs: list[dict] = []
     try:
@@ -1092,6 +1094,34 @@ def _entry_checks(entry: dict) -> dict:
         )
     except Exception as exc:  # unexpected CSV/parse trouble
         return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+# --- client/session state (lifted out of browser localStorage) -------------------
+# checked books, UI settings, and attention marks used to live only in the
+# browser (keyed to the http://127.0.0.1:5001 origin, so a port change would
+# orphan them and they never synced). They now round-trip through the server
+# doc store, making them port-independent and ready to sync to the cloud.
+
+_CLIENT_STATE_KEYS = ("checked", "settings", "attention")
+_client_state_lock = threading.Lock()
+
+
+@app.route("/api/client_state")
+def api_client_state_get():
+    return jsonify(lib.load_json(lib.CLIENT_STATE_PATH, {}))
+
+
+@app.route("/api/client_state", methods=["PUT"])
+def api_client_state_put():
+    payload = request.get_json(silent=True) or {}
+    with _client_state_lock:
+        state = lib.load_json(lib.CLIENT_STATE_PATH, {})
+        for k in _CLIENT_STATE_KEYS:
+            if k in payload:
+                state[k] = payload[k]
+        state["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        lib.save_json(lib.CLIENT_STATE_PATH, state)
+    return jsonify({"ok": True})
 
 
 @app.route("/api/manual")
@@ -1318,7 +1348,7 @@ def _ia_download_job(identifier: str, book: dict) -> None:
             "identifier": identifier,
             "source_url": f"https://archive.org/details/{identifier}",
             "pdf_file": name,
-            "saved_as": str(dest.relative_to(lib.ROOT)),
+            "saved_as": str(dest.relative_to(lib.DATA_ROOT)),
             "size_bytes": got,
             "downloaded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "ia_title": meta.get("title", ""),
@@ -1328,7 +1358,7 @@ def _ia_download_job(identifier: str, book: dict) -> None:
         }
         lib.save_json(lib.IA_CATALOG_PATH, catalog)
         job["status"] = "done"
-        job["path"] = str(dest.relative_to(lib.ROOT))
+        job["path"] = str(dest.relative_to(lib.DATA_ROOT))
     except Exception as exc:
         job["status"] = "error"
         job["error"] = f"{type(exc).__name__}: {exc}"
@@ -1673,7 +1703,52 @@ def api_scans():
     return jsonify(scan_search.search_scans(title, author or None, year or None))
 
 
+def _relativize_data_path(raw: str) -> str:
+    """An absolute path that lives under the writable data root is rewritten
+    to a DATA_ROOT-relative posix path so it survives the app being moved
+    (packaging, a new machine). Paths outside the data root — scans the user
+    attached from elsewhere on disk — are left untouched."""
+    raw = (raw or "").strip()
+    if not raw:
+        return raw
+    p = Path(raw)
+    if not p.is_absolute():
+        return raw
+    try:
+        rel = p.resolve().relative_to(lib.DATA_ROOT.resolve())
+    except (ValueError, OSError):
+        return raw
+    return rel.as_posix()
+
+
+def _migrate_stored_paths() -> None:
+    """One-time (idempotent) migration: absolute pdf_file / local_pdf paths
+    stored under the data root become relative, making existing user data
+    portable across relocations."""
+    builds = lib.load_json(BUILDS_PATH, {})
+    changed = False
+    for b in builds.values():
+        rel = _relativize_data_path(b.get("pdf_file", ""))
+        if rel != (b.get("pdf_file") or ""):
+            b["pdf_file"] = rel
+            changed = True
+    if changed:
+        lib.save_json(BUILDS_PATH, builds)
+
+    entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+    changed = False
+    for e in entries.values():
+        rel = _relativize_data_path(e.get("local_pdf", ""))
+        if rel != (e.get("local_pdf") or ""):
+            e["local_pdf"] = rel
+            changed = True
+    if changed:
+        lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+
+
 if __name__ == "__main__":
+    # Make existing user data portable (absolute -> data-root-relative paths).
+    _migrate_stored_paths()
     # Warm the offline check indexes (the renewals CSV is ~40 MB) so the first
     # manual-entry submission doesn't stall while they load, and the drive
     # list so the first file-browser open is instant.

@@ -480,10 +480,17 @@ function trackChecked(label, key, mutate) {
 }
 
 // --- persistence -----------------------------------------------------------
+// Checked books, settings, and attention marks are cached in localStorage
+// (fast, offline) AND written through to the server doc store, which is
+// authoritative on load — so they are port-independent and sync-ready.
+
+function checkedArray() {
+  return [...state.checked.entries()].map(([k, v]) => [k, v]);
+}
 
 function saveChecked() {
-  const arr = [...state.checked.entries()].map(([k, v]) => [k, v]);
-  try { localStorage.setItem(LS_KEY, JSON.stringify(arr)); } catch (e) {}
+  try { localStorage.setItem(LS_KEY, JSON.stringify(checkedArray())); } catch (e) {}
+  pushClientState("checked");
 }
 function loadChecked() {
   try {
@@ -494,12 +501,19 @@ function loadChecked() {
 
 function saveSettings() {
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings)); } catch (e) {}
+  pushClientState("settings");
 }
 function loadSettings() {
   try {
     const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
     state.settings = Object.assign(state.settings, s);
   } catch (e) { /* keep defaults */ }
+  normalizeSettings();
+}
+
+// defaults + version migrations for the settings object, applied whether it
+// came from localStorage or the server
+function normalizeSettings() {
   state.settings.checkedCols = state.settings.checkedCols || {};
   state.settings.whlCons = state.settings.whlCons ||
     { title: false, authors: false, year: true };
@@ -542,6 +556,89 @@ function loadSettings() {
 }
 
 function maxRows() { return state.settings.maxRows || 400; }
+
+// --- client-state sync (localStorage cache + authoritative server copy) ----------
+// The three blobs (checked books / settings / attention marks) write through
+// to /api/client_state so they survive a port change and can sync to the
+// cloud later. NOTE: settings currently include API keys — a future cloud
+// sync layer must exclude credential fields before pushing off-device.
+
+let clientStateReady = false;   // gates write-through until the load-sync ran
+const _csPending = {};          // kind -> true, coalesced
+let _csTimer = null;
+
+function clientStateBlob(kind) {
+  if (kind === "checked") return checkedArray();
+  if (kind === "settings") return state.settings;
+  if (kind === "attention") return state.attn || {};
+  return null;
+}
+
+// debounced write-through of one or more changed blobs
+function pushClientState(kind) {
+  if (!clientStateReady) return;   // never clobber the server before load-sync
+  _csPending[kind] = true;
+  clearTimeout(_csTimer);
+  _csTimer = setTimeout(flushClientState, 700);
+}
+
+async function flushClientState() {
+  const kinds = Object.keys(_csPending);
+  if (!kinds.length) return;
+  for (const k of kinds) delete _csPending[k];
+  const body = {};
+  for (const k of kinds) body[k] = clientStateBlob(k);
+  try {
+    await fetch("/api/client_state", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (e) { /* offline: the localStorage cache still holds it */ }
+}
+
+// On load the SERVER copy is authoritative. If the server has nothing yet
+// (first run of this build), seed it from whatever localStorage held so no
+// existing work is lost. Returns true if server state was adopted (the
+// caller re-applies theme/fonts and re-renders).
+async function syncClientStateOnLoad() {
+  let server = null;
+  try { server = await (await fetch("/api/client_state")).json(); }
+  catch (e) { clientStateReady = true; return false; }   // offline: keep local
+  const hasServer = server &&
+    (server.checked || server.settings || server.attention);
+  if (hasServer) {
+    if (Array.isArray(server.checked)) {
+      state.checked = new Map(server.checked);
+      try { localStorage.setItem(LS_KEY, JSON.stringify(server.checked)); } catch (e) {}
+    }
+    if (server.settings && typeof server.settings === "object") {
+      state.settings = Object.assign(state.settings, server.settings);
+      normalizeSettings();
+      try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings)); } catch (e) {}
+    }
+    if (server.attention && typeof server.attention === "object") {
+      state.attn = server.attention;
+      try { localStorage.setItem(ATTN_KEY, JSON.stringify(state.attn)); } catch (e) {}
+    }
+    clientStateReady = true;
+    return true;
+  }
+  // seed the server from local, then allow write-through
+  try {
+    await fetch("/api/client_state", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        checked: checkedArray(),
+        settings: state.settings,
+        attention: state.attn || {},
+      }),
+    });
+  } catch (e) { /* will retry on the next change */ }
+  clientStateReady = true;
+  return false;
+}
 
 // --- tabs + header -----------------------------------------------------------
 
@@ -1555,6 +1652,7 @@ function setAttnKey(k, val) {
   if (val) state.attn[k] = val;
   else delete state.attn[k];
   try { localStorage.setItem(ATTN_KEY, JSON.stringify(state.attn)); } catch (e) {}
+  pushClientState("attention");
   status(val ? "Marked: needs attention" : "Attention mark cleared");
 }
 
@@ -4622,7 +4720,27 @@ function approvedSources() {
       }
     }
   }
+  // list in the order the underlying books were added: manual entries
+  // oldest-first (combinedRows yields them newest-first), then checked
+  // catalog books in the order they were checked. Sources from one book
+  // stay adjacent (stable sort preserves local-scan / IA / HT emission order).
+  const rank = addedRankByRowId();
+  out.sort((a, b) =>
+    (rank.has(a._rowId) ? rank.get(a._rowId) : Infinity) -
+    (rank.has(b._rowId) ? rank.get(b._rowId) : Infinity));
   return out;
+}
+
+// per-row "added" ordering: manual entries by created_at ascending, then
+// checked catalog books in check (Map insertion) order
+function addedRankByRowId() {
+  const rank = new Map();
+  let i = 0;
+  const manualAsc = state.manual.slice().sort((a, b) =>
+    (a.created_at || "").localeCompare(b.created_at || ""));
+  for (const e of manualAsc) rank.set(e.id, i++);
+  for (const k of state.checked.keys()) rank.set(k, i++);
+  return rank;
 }
 
 function renderUpload() {
@@ -6688,6 +6806,9 @@ function init() {
   (() => {
     const sp = el("upload-splitter");
     const top = el("upload-split");
+    // The stored height is applied as-is; #upload-split's responsive CSS
+    // min-height raises a too-small split to a usable floor on tall windows
+    // and relaxes it on short ones (so the sources pane never overflows).
     if (state.settings.uploadSplitH) {
       top.style.height = state.settings.uploadSplitH + "px";
       top.style.flex = "none";
@@ -6700,7 +6821,7 @@ function init() {
     });
     document.addEventListener("mousemove", (ev) => {
       if (!dragging) return;
-      const min = 160;
+      const min = 160;   // the CSS min-height enforces the usable floor
       const max = Math.max(min, el("upload").clientHeight - 180);
       const h = Math.min(max, Math.max(min, ev.clientY - top.getBoundingClientRect().top));
       top.style.height = h + "px";
@@ -6852,11 +6973,17 @@ function init() {
     }, 120);
   });
 
-  loadDownloads();
-  loadManual().then(migrateParsedEntries);
-  loadBuilds().then(renderUpload);
-  switchTopTable(state.settings.topTable === "whl" ? "whl" : "checked");
-  renderBottomPane();
+  // Adopt the authoritative server copy of checked / settings / attention
+  // (or seed it from localStorage on first run), THEN boot the views so the
+  // first render reflects whatever the server holds.
+  syncClientStateOnLoad().then((adopted) => {
+    if (adopted) { applyTheme(); applyFont(); }
+    loadDownloads();
+    loadManual().then(migrateParsedEntries);
+    loadBuilds().then(renderUpload);
+    switchTopTable(state.settings.topTable === "whl" ? "whl" : "checked");
+    renderBottomPane();
+  });
 }
 
 init();

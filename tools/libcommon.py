@@ -6,19 +6,65 @@ explorer, the Open Library index builders, and the catalog checks.
 from __future__ import annotations
 
 import json
+import os
+import sys
 import uuid
 from pathlib import Path
 
 # Repo layout: this file lives at <root>/tools/libcommon.py
 ROOT = Path(__file__).resolve().parent.parent
-OUTPUT_DIR = ROOT / "output"
-XLSX_PATH = ROOT / "ch_library.xlsx"
 
-CH_LIBRARY_JSON_PATH = OUTPUT_DIR / "ch_library.json"
+# --- app vs data roots -----------------------------------------------------
+# Two roots, so the app can be packaged/relocated without pinning user data
+# to the (possibly read-only) install location:
+#   APP_ROOT  — read-only assets shipped WITH the app (the source
+#               spreadsheet + the reference CSVs + the generated catalogue
+#               JSON). When frozen this is the bundle dir (sys._MEIPASS).
+#   DATA_ROOT — writable per-user state (the JSON document store, entry
+#               folders, IA downloads + caches, and the downloaded search
+#               indexes). When frozen this is a per-user app-data dir.
+# In a normal dev checkout both resolve to the repo root, so the on-disk
+# layout is exactly as before. WHL_DATA_ROOT overrides the data root
+# explicitly (used by tests and by the packaged launcher).
+
+
+def _app_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+    return ROOT
+
+
+def _data_root() -> Path:
+    override = os.environ.get("WHL_DATA_ROOT")
+    if override:
+        return Path(override).expanduser().resolve()
+    if getattr(sys, "frozen", False):
+        if sys.platform == "win32":
+            base = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming"))
+        elif sys.platform == "darwin":
+            base = Path.home() / "Library" / "Application Support"
+        else:
+            base = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
+        return base / "whl-explorer"
+    return ROOT
+
+
+APP_ROOT = _app_root()
+DATA_ROOT = _data_root()
+
+# writable per-user state
+OUTPUT_DIR = DATA_ROOT / "output"
 MANUAL_ENTRIES_PATH = OUTPUT_DIR / "manual_entries.json"
+# UI/session state lifted out of browser localStorage so it is
+# port-independent and syncable (checked books, settings, attention marks).
+CLIENT_STATE_PATH = OUTPUT_DIR / "client_state.json"
 
-# Internet Archive PDF downloads + their cataloging metadata.
-IA_DOWNLOADS_DIR = ROOT / "downloads" / "ia"
+# read-only shipped assets
+XLSX_PATH = APP_ROOT / "ch_library.xlsx"
+CH_LIBRARY_JSON_PATH = APP_ROOT / "output" / "ch_library.json"
+
+# Internet Archive PDF downloads + their cataloging metadata (writable).
+IA_DOWNLOADS_DIR = DATA_ROOT / "downloads" / "ia"
 IA_CATALOG_PATH = IA_DOWNLOADS_DIR / "catalog.json"
 
 # Ordered fields for manually added books. local_pdf holds a locally

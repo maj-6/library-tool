@@ -1530,7 +1530,10 @@ tr.bottom-row:hover { background: var(--row-hover) !important; }
 /* --- editor (upload) tab --- */
 #upload-split {
   flex: 1.3;
-  min-height: 0;
+  /* keep the build editor (and its PDF/OCR viewer) tall enough to read and
+     scroll — a 440px floor on roomy windows that relaxes on short ones so
+     the verified-sources pane below never overflows off-screen */
+  min-height: min(440px, calc(100vh - 300px));
   display: flex;
   gap: 6px;
 }

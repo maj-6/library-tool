@@ -21,8 +21,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import libcommon as lib  # noqa: E402
 import whl_client as whl  # noqa: E402
 
-RENEWALS_CSV = lib.ROOT / "copyright_renewals.csv"
-WHL_CATALOG_CSV = lib.ROOT / "whl_catalog.csv"
+# reference data shipped read-only with the app
+RENEWALS_CSV = lib.APP_ROOT / "copyright_renewals.csv"
+WHL_CATALOG_CSV = lib.APP_ROOT / "whl_catalog.csv"
 
 # Renewal era: works published in this inclusive window needed a renewal to
 # keep copyright. Older works are public domain by age; newer were auto-renewed.
