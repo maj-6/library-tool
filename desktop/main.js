@@ -1,4 +1,4 @@
-// Electron main process for Catalog Explorer.
+// Electron main process for Library Tool.
 //
 // The whole app is the existing Flask backend ("the sidecar") plus a thin
 // Electron shell that (1) spawns the sidecar bound to loopback on a free port
@@ -87,7 +87,7 @@ function waitForServer(port, timeoutMs) {
 }
 
 async function startSidecar() {
-  const dataRoot = app.getPath("userData");   // %APPDATA%\Catalog Explorer
+  const dataRoot = app.getPath("userData");   // %APPDATA%\Library Tool
   fs.mkdirSync(dataRoot, { recursive: true });
   sidecarPort = await freePort();
   const { cmd, args, opts } = sidecarCommand(sidecarPort, dataRoot);
@@ -95,13 +95,13 @@ async function startSidecar() {
   sidecar.stdout.on("data", (d) => process.stdout.write(`[sidecar] ${d}`));
   sidecar.stderr.on("data", (d) => process.stderr.write(`[sidecar] ${d}`));
   sidecar.on("error", (err) => {
-    dialog.showErrorBox("Catalog Explorer",
+    dialog.showErrorBox("Library Tool",
       "Could not launch the backend:\n" + err.message +
       (isDev ? "\n\n(Dev mode expects Python on PATH — set WHL_PYTHON to override.)" : ""));
   });
   sidecar.on("exit", (code) => {
     if (code && !app.isQuitting) {
-      dialog.showErrorBox("Catalog Explorer", `The backend exited unexpectedly (code ${code}).`);
+      dialog.showErrorBox("Library Tool", `The backend exited unexpectedly (code ${code}).`);
       app.quit();
     }
   });
@@ -111,7 +111,7 @@ async function startSidecar() {
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1440, height: 920, minWidth: 900, minHeight: 600,
-    title: "Catalog Explorer",
+    title: "Library Tool",
     backgroundColor: "#1d1f21",
     frame: false,           // no OS chrome — the web UI's title bar is the frame
     webPreferences: {
@@ -137,7 +137,7 @@ app.whenReady().then(async () => {
   try {
     await startSidecar();
   } catch (e) {
-    dialog.showErrorBox("Catalog Explorer", "The local backend failed to start.\n" + e.message);
+    dialog.showErrorBox("Library Tool", "The local backend failed to start.\n" + e.message);
     app.quit();
     return;
   }

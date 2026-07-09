@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller spec that freezes the Catalog Explorer Flask backend into a
+# PyInstaller spec that freezes the Library Tool Flask backend into a
 # self-contained "sidecar" the Electron app spawns.
 #
 #   build (from desktop/):  npm run build:sidecar

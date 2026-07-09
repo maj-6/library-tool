@@ -3,63 +3,59 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Catalog Explorer</title>
+  <title>Library Tool</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v={{ css_v }}" />
 </head>
 <body>
   <div id="titlebar">
-    <span class="tb-name" id="tb-name">Catalogs :: Catalog Explorer</span>
-    <span class="tb-right">
-      <span class="tb-meta" id="tb-meta">v2.9</span>
-      <span id="win-controls" class="win-controls">
-        <button class="win-btn" id="win-min" type="button" title="Minimize" aria-label="Minimize">
-          <svg viewBox="0 0 10 10"><rect x="0" y="4.5" width="10" height="1"/></svg></button>
-        <button class="win-btn" id="win-max" type="button" title="Maximize" aria-label="Maximize">
-          <svg viewBox="0 0 10 10"><rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="currentColor"/></svg></button>
-        <button class="win-btn win-close" id="win-close" type="button" title="Close" aria-label="Close">
-          <svg viewBox="0 0 10 10"><path d="M0.7 0.7 L9.3 9.3 M9.3 0.7 L0.7 9.3" stroke="currentColor" stroke-width="1.1"/></svg></button>
-      </span>
+    <!-- menu bar, merged into the title bar (left) -->
+    <div id="menubar">
+      <div class="menu">
+        <button class="menu-btn" type="button">File</button>
+        <div class="menu-drop" hidden>
+          <button class="menu-item" data-cmd="export" type="button">Export table (JSON)</button>
+          <button class="menu-item" data-cmd="export-builds" type="button">Export builds</button>
+          <button class="menu-item" data-cmd="dl-sources" type="button">Download sources list</button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" data-cmd="settings" type="button">Settings&hellip;</button>
+        </div>
+      </div>
+      <div class="menu">
+        <button class="menu-btn" type="button">Edit</button>
+        <div class="menu-drop" hidden>
+          <button class="menu-item" data-cmd="undo" type="button">Undo<span class="menu-key">Ctrl+Z</span></button>
+          <button class="menu-item" data-cmd="redo" type="button">Redo<span class="menu-key">Ctrl+Y</span></button>
+        </div>
+      </div>
+      <div class="menu">
+        <button class="menu-btn" type="button">View</button>
+        <div class="menu-drop" hidden>
+          <button class="menu-item" data-cmd="search-pane" type="button"><span class="menu-check"></span>Search pane</button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" data-cmd="table-checked" type="button"><span class="menu-check"></span>Checked books table</button>
+          <button class="menu-item" data-cmd="table-whl" type="button"><span class="menu-check"></span>WHL table</button>
+        </div>
+      </div>
+      <div class="menu">
+        <button class="menu-btn" type="button">Tools</button>
+        <div class="menu-drop" hidden>
+          <button class="menu-item" data-cmd="run-scans" type="button">Run scans</button>
+          <button class="menu-item" data-cmd="scrape" type="button">Scrape WHL</button>
+          <button class="menu-item" data-cmd="dl-approved" type="button">Download verified sources</button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" data-cmd="master-sync" type="button">Sync master list to Google Sheets&hellip;</button>
+        </div>
+      </div>
+    </div>
+    <span class="tb-title" id="tb-title">Library Tool <span class="tb-meta" id="tb-meta">v2.9</span></span>
+    <span id="win-controls" class="win-controls">
+      <button class="win-btn" id="win-min" type="button" title="Minimize" aria-label="Minimize">
+        <svg viewBox="0 0 10 10"><rect x="0" y="4.5" width="10" height="1"/></svg></button>
+      <button class="win-btn" id="win-max" type="button" title="Maximize" aria-label="Maximize">
+        <svg viewBox="0 0 10 10"><rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="currentColor"/></svg></button>
+      <button class="win-btn win-close" id="win-close" type="button" title="Close" aria-label="Close">
+        <svg viewBox="0 0 10 10"><path d="M0.7 0.7 L9.3 9.3 M9.3 0.7 L0.7 9.3" stroke="currentColor" stroke-width="1.1"/></svg></button>
     </span>
-  </div>
-
-  <!-- menu bar -->
-  <div id="menubar">
-    <div class="menu">
-      <button class="menu-btn" type="button">File</button>
-      <div class="menu-drop" hidden>
-        <button class="menu-item" data-cmd="export" type="button">Export table (JSON)</button>
-        <button class="menu-item" data-cmd="export-builds" type="button">Export builds</button>
-        <button class="menu-item" data-cmd="dl-sources" type="button">Download sources list</button>
-        <div class="menu-sep"></div>
-        <button class="menu-item" data-cmd="settings" type="button">Settings&hellip;</button>
-      </div>
-    </div>
-    <div class="menu">
-      <button class="menu-btn" type="button">Edit</button>
-      <div class="menu-drop" hidden>
-        <button class="menu-item" data-cmd="undo" type="button">Undo<span class="menu-key">Ctrl+Z</span></button>
-        <button class="menu-item" data-cmd="redo" type="button">Redo<span class="menu-key">Ctrl+Y</span></button>
-      </div>
-    </div>
-    <div class="menu">
-      <button class="menu-btn" type="button">View</button>
-      <div class="menu-drop" hidden>
-        <button class="menu-item" data-cmd="search-pane" type="button"><span class="menu-check"></span>Search pane</button>
-        <div class="menu-sep"></div>
-        <button class="menu-item" data-cmd="table-checked" type="button"><span class="menu-check"></span>Checked books table</button>
-        <button class="menu-item" data-cmd="table-whl" type="button"><span class="menu-check"></span>WHL table</button>
-      </div>
-    </div>
-    <div class="menu">
-      <button class="menu-btn" type="button">Tools</button>
-      <div class="menu-drop" hidden>
-        <button class="menu-item" data-cmd="run-scans" type="button">Run scans</button>
-        <button class="menu-item" data-cmd="scrape" type="button">Scrape WHL</button>
-        <button class="menu-item" data-cmd="dl-approved" type="button">Download verified sources</button>
-        <div class="menu-sep"></div>
-        <button class="menu-item" data-cmd="master-sync" type="button">Sync master list to Google Sheets&hellip;</button>
-      </div>
-    </div>
   </div>
 
   <!-- tab strip with the action icons inline, right side -->

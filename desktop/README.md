@@ -1,4 +1,4 @@
-# Catalog Explorer — desktop app
+# Library Tool — desktop app
 
 An Electron shell around the existing Flask backend ("the sidecar"). The shell
 spawns the backend on a free loopback port with a per-user writable data root
@@ -8,7 +8,7 @@ and loads it in a window. Nothing about the web app changes — this is packagin
 Electron (main.js)
   └─ spawns sidecar  ──  dev:      python ../tools/whl_explorer/server.py
                           packaged: resources/sidecar/whl-explorer-sidecar.exe
-     with  WHL_PORT=<free port>   WHL_DATA_ROOT=%APPDATA%\Catalog Explorer
+     with  WHL_PORT=<free port>   WHL_DATA_ROOT=%APPDATA%\Library Tool
   └─ BrowserWindow → http://127.0.0.1:<port>/
 ```
 

@@ -1,8 +1,8 @@
 {
-  "name": "whl-catalog-explorer",
-  "productName": "Catalog Explorer",
+  "name": "whl-library-tool",
+  "productName": "Library Tool",
   "version": "3.0.0",
-  "description": "Desktop shell for the World Herb Library Catalog Explorer (Flask sidecar + Electron)",
+  "description": "Desktop shell for Library Tool — a World Herb Library companion (Flask sidecar + Electron)",
   "author": "Andrew James Miller",
   "license": "UNLICENSED",
   "private": true,
@@ -18,8 +18,8 @@
     "electron-builder": "^24.13.3"
   },
   "build": {
-    "appId": "org.worldherblibrary.catalogexplorer",
-    "productName": "Catalog Explorer",
+    "appId": "org.worldherblibrary.librarytool",
+    "productName": "Library Tool",
     "directories": {
       "output": "release",
       "buildResources": "build"
@@ -41,7 +41,7 @@
         { "target": "msi", "arch": ["x64"] }
       ],
       "icon": "build/icon.ico",
-      "artifactName": "CatalogExplorer-${version}.${ext}"
+      "artifactName": "LibraryTool-${version}.${ext}"
     },
     "msi": {
       "oneClick": false,

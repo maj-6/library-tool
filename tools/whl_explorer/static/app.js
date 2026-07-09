@@ -1,6 +1,6 @@
 "use strict";
 
-/* Catalog Explorer front-end.
+/* Library Tool front-end.
  *
  * Chrome: a titlebar, an application toolbar (undo/redo, the active tab's
  * commands, settings), two top-level tabs, and a status bar (footer) that
@@ -707,9 +707,9 @@ async function syncClientStateOnLoad() {
 const TAB_TITLES = { checked: "Catalogs", upload: "Editor", ocr: "OCR" };
 
 function setHeader(tabId) {
-  const name = `${TAB_TITLES[tabId] || ""} :: Catalog Explorer`;
-  el("tb-name").textContent = name;
-  document.title = name;
+  // The visible title bar shows the static "Library Tool vN" (centered); the
+  // per-tab context only feeds the browser/OS window title.
+  document.title = `${TAB_TITLES[tabId] || ""} :: Library Tool`;
   // the tab strip shows the active tab's command icons
   el("tg-upload").hidden = tabId !== "upload";
 }
@@ -1242,7 +1242,7 @@ function pollDbStatus() {
 function renderSettings() {
   // GENERAL
   el("gen-info").textContent =
-    `Catalog Explorer ${el("tb-meta").textContent} — ` +
+    `Library Tool ${el("tb-meta").textContent} — ` +
     `${state.manual.length} manual entries / ${state.checked.size} checked books. ` +
     (el("status-right").textContent || "");
   el("reset-settings").onclick = () => {

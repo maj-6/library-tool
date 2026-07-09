@@ -1,4 +1,4 @@
-/* Catalog Explorer chrome.
+/* Library Tool chrome.
    The base look is CLASSIC CAD, modernized: flat 1px chrome and soft
    corners over the dark drafting canvas, monospace data on sans chrome.
    Themes below rework the chrome; geometry (text sizes, paddings, element
@@ -768,22 +768,31 @@ body {
 #titlebar {
   background: linear-gradient(90deg, var(--blue), var(--blue2));
   color: #fff;
-  padding: 4px 8px;
+  padding: 0;
   display: flex;
-  justify-content: space-between;
-  align-items: center;
+  align-items: stretch;
+  border-bottom: 1px solid var(--face-sh2);
+  position: relative;
+  z-index: 50;                 /* keep menu dropdowns above the content */
+}
+/* centered app title + version, e.g. "Library Tool v2.9" */
+.tb-title {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
   letter-spacing: 1px;
   font-weight: bold;
-  border-bottom: 1px solid var(--face-sh2);
+  white-space: nowrap;
+  pointer-events: none;        /* clicks pass through to the drag region */
 }
-.tb-meta { font-weight: normal; opacity: 0.85; }
-.tb-right { display: flex; align-items: center; gap: 10px; }
+.tb-meta { font-weight: normal; opacity: 0.85; margin-left: 5px; }
 
 /* --- frameless desktop window: the title bar drags; controls don't --- */
 #titlebar { -webkit-app-region: drag; }
 #titlebar button, #titlebar input { -webkit-app-region: no-drag; }
 /* custom min/max/close — shown only inside the Electron shell (body.desktop) */
-.win-controls { display: none; align-self: stretch; margin: -4px -8px -4px 8px; }
+.win-controls { display: none; align-self: stretch; margin-left: auto; }
 body.desktop .win-controls { display: inline-flex; }
 .win-btn {
   -webkit-app-region: no-drag;
@@ -805,29 +814,33 @@ body.desktop .win-controls { display: inline-flex; }
 .win-close:hover { background: #e81123; }
 .win-close:active { background: #c50e1f; }
 
-/* --- menu bar --- */
+/* --- menu bar (merged into the title bar) --- */
 #menubar {
   display: flex;
   align-items: stretch;
-  padding: 0 2px;
-  background: var(--face);
-  border-bottom: 1px solid var(--face-sh);
+  padding: 0;
+  background: transparent;
+  border-bottom: none;
   position: relative;
   z-index: 45;
 }
-.menu { position: relative; }
+.menu { position: relative; display: flex; }
 .menu-btn {
   font-family: var(--ui);
   font-size: 12px;
   letter-spacing: 0.3px;
-  padding: 3px 10px;
+  padding: 6px 12px;
   background: transparent;
-  color: var(--ink);
+  color: #fff;
   border: none;
-  border-radius: var(--radius);
+  border-radius: 0;
   cursor: pointer;
 }
-.menu-btn:hover, .menu-btn.active { background: var(--face-active); color: var(--blue); }
+/* on the blue title bar the menu is always light-on-blue, regardless of theme;
+   the #titlebar id beats the per-theme `.menu-btn` accent-colour overrides */
+#titlebar .menu-btn { color: #fff; }
+#titlebar .menu-btn:hover,
+#titlebar .menu-btn.active { background: rgba(255, 255, 255, 0.18); color: #fff; }
 .menu-drop {
   position: absolute;
   top: 100%;
