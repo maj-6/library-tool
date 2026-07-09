@@ -400,13 +400,9 @@
             <button id="whl-mode" class="cad-btn tiny" type="button" hidden
                     data-tip="Ctrl+E toggles EDIT / SEARCH mode"></button>
             <span id="whl-cons" class="whl-cons" hidden
-                  data-tip="Columns constraining the Open Library search (TITLE = verbatim phrase)">
+                  data-tip="Ctrl+click a column header to add it as a search term (Title = verbatim phrase). Title is always included; with no marks the search uses Title + Author + Year.">
               <span class="icon-label" data-icon="target"></span>
-              <span class="cons-group">
-                <label><input type="checkbox" id="wc-title" /> Title</label>
-                <label><input type="checkbox" id="wc-authors" /> Author</label>
-                <label><input type="checkbox" id="wc-year" /> Year</label>
-              </span>
+              <span class="cons-hint">Ctrl+click a column = search term</span>
             </span>
             <span class="bar-spacer"></span>
             <button id="export-json" class="cad-btn tiny icon-btn" type="button"

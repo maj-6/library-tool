@@ -114,7 +114,6 @@ const state = {
     trimBlank: false,           // auto-trim blank pages during folder sync
     colVis: {},                 // per-table column visibility
     colWidths: {},              // per-table column widths (px)
-    whlCons: { title: false, authors: false, year: true },
     sets: {},                   // multi-volume sets: baseKey -> {count, exp}
     expandSets: false,          // expand multi-volume sets by default
     hideVolTitles: false,       // hide the titles of individual volumes
@@ -122,6 +121,7 @@ const state = {
   editTarget: null,             // record open in the EDIT tab
   sort: { checked: null, whl: null },  // {key, dir} per top table
   olColMarks: {},               // OL column -> "copy" | "exclude" (repopulation)
+  searchMarks: {},              // top-table field -> true (search terms to include)
 };
 
 // --- appearance: themes are full chrome redesigns; fonts are user-selectable --
@@ -638,8 +638,6 @@ function loadSettings() {
 // came from localStorage or the server
 function normalizeSettings() {
   state.settings.checkedCols = state.settings.checkedCols || {};
-  state.settings.whlCons = state.settings.whlCons ||
-    { title: false, authors: false, year: true };
   if (!state.settings.sets || typeof state.settings.sets !== "object")
     state.settings.sets = {};
   state.settings.expandSets = !!state.settings.expandSets;
@@ -733,20 +731,6 @@ async function flushClientState() {
   } catch (e) { /* offline: the localStorage cache still holds it */ }
 }
 
-// The search-constraint checkboxes (Title/Author/Year) are the one always-on
-// control initialized from settings at bind time. Keep their DISPLAY in sync
-// with the live settings object: adopting server state on load replaces
-// state.settings (and .whlCons) with a fresh object, so anything holding a
-// stale reference — or a checkbox set once at init — silently desyncs.
-const CONS_BOXES = [["wc-title", "title"], ["wc-authors", "authors"], ["wc-year", "year"]];
-function syncConsCheckboxes() {
-  const cons = state.settings.whlCons || {};
-  for (const [box, key] of CONS_BOXES) {
-    const e = el(box);
-    if (e) e.checked = !!cons[key];
-  }
-}
-
 // When the same book is checked in both the local cache and the server copy,
 // keep whichever entry carries more work (scan results, verify state, checks).
 function richerEntry(a, b) {
@@ -791,7 +775,6 @@ async function syncClientStateOnLoad() {
     if (server.settings && typeof server.settings === "object") {
       state.settings = Object.assign(state.settings, server.settings);
       normalizeSettings();
-      syncConsCheckboxes();   // refresh persistent settings-bound controls
       try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings)); } catch (e) {}
     }
     if (server.attention && typeof server.attention === "object") {
@@ -1127,10 +1110,16 @@ function whlSortVal(r, key) {
 function markSortHeaders(tkey) {
   const def = tableDef(tkey);
   const so = state.sort[tkey];
+  const searching = topMode() === "search";
+  const marks = state.searchMarks || {};
   [...el(def.tableId).querySelectorAll("thead th")].forEach((th, i) => {
     const key = def.cols[i] ? def.cols[i][0] : null;
     if (so && key === so.key) th.dataset.sorted = so.dir > 0 ? "asc" : "desc";
     else delete th.dataset.sorted;
+    // search-term marks (Ctrl+click) — only meaningful while searching
+    const fkey = key ? searchMarkKey(key) : null;
+    const marked = searching && fkey && SEARCH_MARK_FIELDS.has(fkey) && !!marks[fkey];
+    th.classList.toggle("mark-search", marked);
   });
 }
 
@@ -1144,6 +1133,18 @@ function initSortHeaders() {
       const i = [...th.parentElement.children].indexOf(th);
       const key = def.cols[i] ? def.cols[i][0] : null;
       if (!key || key === "action") return;
+      // Ctrl/Cmd+click on a markable column in search mode toggles a search-term
+      // mark (mirrors the OL copy-marks, kept separate). Any other Ctrl+click —
+      // edit mode, or a non-search column — falls through to the normal sort.
+      const fkey = searchMarkKey(key);
+      if ((ev.ctrlKey || ev.metaKey) && topMode() === "search" &&
+          SEARCH_MARK_FIELDS.has(fkey)) {
+        ev.preventDefault();
+        if (state.searchMarks[fkey]) delete state.searchMarks[fkey];
+        else state.searchMarks[fkey] = true;
+        rebuildSearchFromMarks();
+        return;
+      }
       const cur = state.sort[tkey];
       state.sort[tkey] = cur && cur.key === key
         ? { key, dir: -cur.dir }
@@ -1605,6 +1606,16 @@ function parseFind(text) {
 }
 
 function findQuery() { return parseFind(state.checkedFilter); }
+
+// The query the embedded bottom catalogs (Master list, WHL) filter by: a
+// search-mode row selection overrides the Find box so those tabs search for the
+// selected row + its marks, matching what the Open Library tab is querying.
+function bottomFilterQuery() {
+  const ov = state.olOverride;
+  if (ov) return { title: ov.title || "", author: ov.author || "",
+                   year: ov.year || "", empty: false };
+  return findQuery();
+}
 
 function matchesFind(q, title, author, year) {
   if (q.empty) return true;
@@ -2340,7 +2351,8 @@ function bookAtHover() {
   const bi = document.querySelector("#builds-list .build-item:hover");
   if (bi) {
     const b = state.builds[bi.dataset.bid];
-    if (b) return { title: b.title, author: b.authors, year: b.year };
+    if (b) return { title: b.title, author: b.authors, year: b.year,
+      publisher: b.publisher, city: b.publisher_city, edition: b.edition };
   }
   const tr = document.querySelector(
     "#checked-rows tr:hover, #whltop-rows tr:hover, " +
@@ -2351,31 +2363,57 @@ function bookAtHover() {
     if (tr.classList.contains("set-header") && tr.dataset.setKey) {
       const vols = setMembers(tr.dataset.setKey);
       if (vols.length) return { title: setBaseTitle(vols[0].book),
-        author: firstVal(vols, "author"), year: firstVal(vols, "year") };
+        author: firstVal(vols, "author"), year: firstVal(vols, "year"),
+        publisher: firstVal(vols, "publisher") };
     }
     if (tr.dataset.rowId) {
       const row = state.rowsById.get(String(tr.dataset.rowId));
-      if (row) return { title: row.book.title, author: row.book.author, year: row.book.year };
+      if (row) return { title: row.book.title, author: row.book.author,
+        year: row.book.year, publisher: row.book.publisher, city: row.book.city,
+        edition: row.book.edition, volume: row.book.volume };
     }
     return null;
   }
   if (host === "whltop-rows" && tr.dataset.widx != null) {
     const r = whlRowByIdx(parseInt(tr.dataset.widx, 10));
-    if (r) return { title: r.title, author: r.authors, year: r.year };
+    if (r) return { title: r.title, author: r.authors, year: r.year,
+      publisher: r.publisher, volume: r.volume };
   }
   if (host === "upload-rows" && tr.dataset.si != null) {
     const s = (state.uploadSources || [])[+tr.dataset.si];
-    if (s) return { title: s.title, author: s.authors || s.author, year: s.year };
+    if (s) return { title: s.title, author: s.authors || s.author, year: s.year,
+      publisher: s.publisher, edition: s.edition, volume: s.volume };
   }
   if (host === "bottom-rows" && tr.dataset.bi != null) {
     const rec = (state.bottomRecords || [])[+tr.dataset.bi];
     if (rec) return { title: rec.title, author: rec.author || rec.authors,
-      year: rec.year || rec.first_year };
+      year: rec.year || rec.first_year, publisher: rec.publisher,
+      city: rec.city, edition: rec.edition, volume: rec.volume };
   }
   return null;
 }
 
 // S over any entry: Google the title + author + year, in the embedded web view
+// Quote a value as a phrase for an Internet Archive field query.
+function iaPhrase(s) { return '"' + String(s).replace(/["\\]+/g, " ").trim() + '"'; }
+
+// Build an Internet Archive Advanced-Search URL from a book + the active search
+// marks: title:(...) AND creator:(...) AND year:... AND volume:(...). Title is
+// always included; the volume is matched whenever the book carries one.
+function iaAdvancedUrl(b) {
+  const on = searchGate();
+  const author = b.author || b.authors || "";
+  const ym = String(b.year || "").match(/\d{4}/);   // first 4-digit year of a range/prefix
+  const year = ym ? ym[0] : "";
+  const parts = [];
+  if (b.title) parts.push("title:(" + iaPhrase(b.title) + ")");
+  if (on("author", true) && author) parts.push("creator:(" + iaPhrase(author) + ")");
+  if (on("year", true) && year) parts.push("year:" + year);
+  if (on("publisher", false) && b.publisher) parts.push("publisher:(" + iaPhrase(b.publisher) + ")");
+  if (b.volume) parts.push("volume:(" + iaPhrase(b.volume) + ")");
+  return "https://archive.org/search?query=" + encodeURIComponent(parts.join(" AND "));
+}
+
 function onSearchKey(ev) {
   if (ev.key !== "s" && ev.key !== "S") return;
   if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
@@ -2383,11 +2421,10 @@ function onSearchKey(ev) {
   const b = bookAtHover();
   if (!b || !b.title) return;
   ev.preventDefault();
-  // over an Internet Archive tag -> IA search (title + author) in a new tab
+  // over an Internet Archive tag -> IA Advanced Search (marked terms + volume)
   if (document.querySelector('.tag-unit[data-vsrc="internet_archive"]:hover')) {
-    const q = [b.title, b.author].map((x) => String(x || "").trim()).filter(Boolean).join(" ");
-    window.open("https://archive.org/search?query=" + encodeURIComponent(q), "_blank", "noopener");
-    status("IA SEARCH :: " + q.slice(0, 55));
+    window.open(iaAdvancedUrl(b), "_blank", "noopener");
+    status("IA SEARCH :: " + String(b.title || "").slice(0, 55));
     return;
   }
   // otherwise Google title + author + year in a new browser tab (the embedded
@@ -2832,18 +2869,58 @@ function onCheckedClick(ev) {
   if (td) startEdit(td);
 }
 
+// The selected row's fields that can become search terms. Ctrl+click a top
+// column to add/drop it (see initSortHeaders). Title is always the base term;
+// marking Title makes it a verbatim phrase. With no marks the classic
+// title + author + year search applies. "authors" (WHL) folds to "author".
+// Markable fields whose value the OL / WHL / IA searches can actually use.
+// (Language is intentionally excluded — no search path honors it.)
+const SEARCH_MARK_FIELDS = new Set(
+  ["title", "author", "year", "publisher", "city", "edition", "volume"]);
+function searchMarkKey(colKey) { return colKey === "authors" ? "author" : colKey; }
+
+// Mirrors olMarkGate: a marked field is included; if ANY field is marked the
+// marks act as an allow-list (only marked fields, Title always the base term);
+// with no marks the classic title + author + year defaults apply.
+function searchGate() {
+  const marks = state.searchMarks || {};
+  const anyMark = Object.values(marks).some(Boolean);
+  return (k, dflt) => (marks[k] ? true : anyMark ? false : dflt);
+}
+
+// Build the OL/WHL search override from a selected row's fields + search marks.
+function searchOverrideFrom(f) {
+  const on = searchGate();
+  const marks = state.searchMarks || {};
+  const ov = { title: f.title || "", verbatim: !!marks.title };
+  if (on("author", true) && f.author) ov.author = f.author;
+  if (on("year", true) && f.year) ov.year = f.year;
+  if (on("publisher", false) && f.publisher) ov.publisher = f.publisher;
+  if (on("city", false) && f.city) ov.city = f.city;
+  if (on("edition", false) && f.edition) ov.edition = f.edition;
+  // a volume always narrows the match to its volume number when present
+  if (f.volume) ov.volume = f.volume;
+  return ov;
+}
+
+// Re-derive the active search from the selected row after the marks change.
+function rebuildSearchFromMarks() {
+  if (state.settings.topTable === "whl" && state.whlSelected != null)
+    selectWhlSearchRow(state.whlSelected);
+  else if (state.settings.topTable === "checked" && state.checkedSelected != null)
+    selectCheckedSearchRow(state.checkedSelected);
+  else { markSortHeaders("checked"); markSortHeaders("whl"); }
+}
+
 function selectCheckedSearchRow(id) {
   const row = state.rowsById.get(String(id));
   if (!row) return;
   state.checkedSelected = String(id);
-  const cons = state.settings.whlCons || {};
-  state.olOverride = {
-    title: row.book.title,
-    verbatim: !!cons.title,
-    author: cons.authors ? row.book.author : "",
-    year: cons.year ? row.book.year : "",
-    volume: row.book.volume || "",
-  };
+  const b = row.book;
+  state.olOverride = searchOverrideFrom({
+    title: b.title, author: b.author, year: b.year, publisher: b.publisher,
+    city: b.city, edition: b.edition, volume: b.volume,
+  });
   setSearchPane(true);
   const tabs = bottomTabs();
   let i = tabs.indexOf("ol");
@@ -3136,7 +3213,9 @@ function renderBottomRows() {
   const tbody = el("bottom-rows");
   tbody.innerHTML = "";
 
-  const q = findQuery();
+  // When a row is selected in search mode, the embedded catalogs (Master list,
+  // WHL) search for THAT row + its marks; otherwise they follow the Find box.
+  const q = bottomFilterQuery();
   let records;
   if (t === "ol") {
     records = (state.olRows || []).map(olToRecord);
@@ -3341,6 +3420,10 @@ async function olRealtime() {
   if (q.year) params.set("year", q.year);
   // a selected volume narrows the match to its volume number
   if (ov && ov.volume) params.set("volume", ov.volume);
+  // extra fields carried by the search-term marks
+  if (ov) for (const f of ["publisher", "city", "edition"]) {
+    if (ov[f]) params.set(f, ov[f]);
+  }
   for (const f of ["author", "publisher", "city", "year", "edition", "volume"]) {
     const v = el("s-" + f).value.trim();
     if (v && !params.has(f)) params.set(f, v);
@@ -3482,6 +3565,7 @@ function setTopMode(m) {
     state.whlSelected = null;
     state.checkedSelected = null;
     state.olOverride = null;
+    state.searchMarks = {};
   }
   renderTop();
   status(m === "search" ? "SEARCH MODE" : "EDIT MODE");
@@ -3497,6 +3581,13 @@ function renderModeBar() {
 function switchTopTable(t) {
   state.settings.topTable = t;
   saveSettings();
+  // a table switch abandons the previous table's search selection — clear it
+  // (and its marks) so the bottom catalogs follow the new table / Find box
+  // rather than staying filtered by a now-hidden row.
+  state.whlSelected = null;
+  state.checkedSelected = null;
+  state.olOverride = null;
+  state.searchMarks = {};
   el("top-table").value = t;
   el("checked-pane").hidden = t !== "checked";
   el("whltop-pane").hidden = t !== "whl";
@@ -3722,14 +3813,11 @@ function selectWhlSearchRow(idx) {
   const row = whlRowByIdx(idx);
   if (!row) return;
   state.whlSelected = idx;
-  const cons = state.settings.whlCons || {};
-  state.olOverride = {
-    title: row.title,
-    verbatim: !!cons.title,
-    author: cons.authors ? row.authors : "",
-    year: cons.year ? row.year : "",
-    volume: row.volume || "",
-  };
+  state.olOverride = searchOverrideFrom({
+    title: row.title, author: row.authors, year: row.year,
+    publisher: row.publisher, city: row.city, edition: row.edition,
+    volume: row.volume,
+  });
   setSearchPane(true);
   const tabs = bottomTabs();
   let i = tabs.indexOf("ol");
@@ -3787,9 +3875,17 @@ function repopBookFields(rec) {
 // A copy/repopulate consumes the OL column marks; clear them afterwards so the
 // next book starts unconstrained (the marks persist only for the pending copy).
 function clearOlColMarks() {
-  if (!state.olColMarks || !Object.keys(state.olColMarks).length) return;
-  state.olColMarks = {};
-  renderBottomRows();
+  let changed = false;
+  if (state.olColMarks && Object.keys(state.olColMarks).length) {
+    state.olColMarks = {}; changed = true;
+  }
+  // the search-term marks are consumed by the same copy action
+  if (state.searchMarks && Object.keys(state.searchMarks).length) {
+    state.searchMarks = {};
+    markSortHeaders("checked"); markSortHeaders("whl");
+    changed = true;
+  }
+  if (changed) renderBottomRows();
 }
 
 async function repopulateCheckedRow(rec) {
@@ -7966,23 +8062,7 @@ function init() {
   el("whledit-form").addEventListener("submit", saveWhlEditTab);
   el("bookedit-form").addEventListener("submit", saveBookEditTab);
   el("setedit-form").addEventListener("submit", saveSetEditTab);
-  for (const [box, key] of CONS_BOXES) {
-    el(box).addEventListener("change", () => {
-      // read/write the LIVE settings object — a captured reference would
-      // detach from state.settings.whlCons once server state is adopted
-      const cons = state.settings.whlCons || (state.settings.whlCons = {});
-      cons[key] = el(box).checked;
-      saveSettings();
-      if (topMode() !== "search") return;
-      if (state.settings.topTable === "whl" && state.whlSelected != null) {
-        selectWhlSearchRow(state.whlSelected);
-      } else if (state.settings.topTable === "checked" &&
-                 state.checkedSelected != null) {
-        selectCheckedSearchRow(state.checkedSelected);
-      }
-    });
-  }
-  syncConsCheckboxes();
+  // (search constraints are now Ctrl+click column marks — see initSortHeaders)
 
   // OL column marks: choose which columns repopulate the selected WHL row
   el("bottom-head").addEventListener("click", (ev) => {
