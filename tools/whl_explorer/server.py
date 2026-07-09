@@ -36,6 +36,7 @@ from flask import Flask, Response, abort, jsonify, render_template, request, sen
 # Make tools/ importable for the shared helpers.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import catalog_checks as checks  # noqa: E402
+import copyright_registration as copyreg  # noqa: E402
 import libcommon as lib  # noqa: E402
 import ol_client  # noqa: E402
 import scan_search  # noqa: E402
@@ -1725,6 +1726,57 @@ def api_ia_meta():
         "id": ident, "metadata": md, "downloads": dloads, "pdf": pdf,
         "details": "https://archive.org/details/" + ident,
     })
+
+
+# --- copyright registration lookup (network; cached per book) ------------------
+_REG_CACHE_PATH = lib.DATA_ROOT / "downloads" / "cache" / "copyright_reg.json"
+_reg_cache: dict | None = None
+_reg_cache_lock = threading.Lock()
+
+
+def _reg_cache_load() -> dict:
+    global _reg_cache
+    if _reg_cache is None:
+        try:
+            _reg_cache = json.loads(_REG_CACHE_PATH.read_text("utf-8"))
+        except Exception:
+            _reg_cache = {}
+    return _reg_cache
+
+
+def _reg_cache_key(title: str, author: str, sources) -> str:
+    def n(s):
+        return " ".join(str(s or "").lower().split())
+    return n(title) + "|" + n(author) + "|" + ",".join(sources)
+
+
+@app.route("/api/copyright/registration")
+def api_copyright_registration():
+    """Look up an original copyright REGISTRATION for a book (the left half of
+    the split copyright tag). Network + cached; the client passes the enabled
+    sources (from settings) as a comma list."""
+    title = (request.args.get("title") or "").strip()
+    author = (request.args.get("author") or "").strip()
+    year = (request.args.get("year") or "").strip()
+    sources = tuple(s for s in (request.args.get("sources") or "cprs").split(",")
+                    if s in copyreg.SOURCES)
+    if not title or not sources:
+        return jsonify({"found": False, "sources": [], "match": None})
+    key = _reg_cache_key(title, author, sources)
+    with _reg_cache_lock:
+        cache = _reg_cache_load()
+        if key in cache:
+            return jsonify(cache[key])
+    result = copyreg.registration_lookup(title, author, year, sources)  # network
+    with _reg_cache_lock:
+        cache = _reg_cache_load()
+        cache[key] = result
+        try:
+            _REG_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _REG_CACHE_PATH.write_text(json.dumps(cache), "utf-8")
+        except Exception:
+            pass
+    return jsonify(result)
 
 
 # --- WHL catalogue view (editable via a corrections overlay) --------------------
