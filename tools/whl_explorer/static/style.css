@@ -1569,9 +1569,22 @@ form.orig-view .cad-input {
   border: 1px solid var(--face-sh);
   border-radius: var(--radius);
 }
-#bottom-tabs { display: flex; align-items: center; gap: 4px; }
-.bottom-tabsel { font-size: 11px; padding: 1px 4px; }
-.bottom-tabbtn { opacity: 0.75; }
+#bottom-tabs { display: flex; align-items: flex-end; gap: 3px; }
+.bottom-tab {
+  font-family: var(--ui);
+  font-size: 11.5px;
+  padding: 3px 12px;
+  background: var(--face-hi);
+  color: var(--ink);
+  cursor: pointer;
+  white-space: nowrap;
+  border: 1px solid var(--face-sh);
+  border-bottom: none;
+  border-radius: 5px 5px 0 0;
+  opacity: 0.72;
+}
+.bottom-tab:hover { opacity: 0.9; }
+.bottom-tab.active { background: var(--face-active); color: var(--blue); font-weight: bold; opacity: 1; }
 tr.bottom-row { cursor: pointer; }
 tr.bottom-row:hover { background: var(--row-hover) !important; }
 #checked-search { width: 260px; }

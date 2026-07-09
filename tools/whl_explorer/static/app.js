@@ -85,7 +85,7 @@ const state = {
   settings: {
     checkedCols: {}, showCatalog: false,
     markFilter: "ALL", srcFilter: "ALL", dlFilter: "ALL",
-    topTable: "checked", bottomTabs: ["ol", "ch"], bottomActive: 0,
+    topTable: "checked", bottomActive: 0,
     whlMode: "edit", checkedMode: "edit",
     paneWidth: null, theme: "", font: "", fontUi: "",
     aiBase: "", aiModel: "", aiKey: "", aiInstructions: "",
@@ -2796,16 +2796,13 @@ function linkCell(text, url) {
     : t;
 }
 
+// A fixed strip of regular tabs — one per defined bottom table (Open Library,
+// Master list, WHL, …) — in place of the old add/remove + dropdown mechanism.
 function bottomTabs() {
-  let tabs = state.settings.bottomTabs;
-  if (!Array.isArray(tabs) || !tabs.length) tabs = ["ol", "ch"];
-  state.settings.bottomTabs = tabs.filter((t) => BOTTOM_TABLES[t]);
-  if (!state.settings.bottomTabs.length) state.settings.bottomTabs = ["ol"];
-  if (state.settings.bottomActive == null ||
-      state.settings.bottomActive >= state.settings.bottomTabs.length) {
-    state.settings.bottomActive = 0;
-  }
-  return state.settings.bottomTabs;
+  const tabs = Object.keys(BOTTOM_TABLES);
+  const a = state.settings.bottomActive;
+  if (a == null || a < 0 || a >= tabs.length) state.settings.bottomActive = 0;
+  return tabs;
 }
 
 function renderBottomTabs() {
@@ -2813,46 +2810,17 @@ function renderBottomTabs() {
   const wrap = el("bottom-tabs");
   wrap.innerHTML = "";
   tabs.forEach((t, i) => {
-    if (i === state.settings.bottomActive) {
-      const sel = document.createElement("select");
-      sel.className = "cad-input bottom-tabsel";
-      for (const [id, def] of Object.entries(BOTTOM_TABLES)) {
-        const o = document.createElement("option");
-        o.value = id;
-        o.textContent = def.label;
-        sel.appendChild(o);
-      }
-      sel.value = t;
-      sel.addEventListener("change", () => {
-        state.settings.bottomTabs[i] = sel.value;
-        saveSettings();
-        renderBottomPane();
-      });
-      wrap.appendChild(sel);
-      if (tabs.length > 1) {
-        const x = document.createElement("button");
-        x.className = "cad-btn tiny";
-        x.textContent = "✕";
-        x.dataset.tip = "Close this tab";
-        x.addEventListener("click", () => {
-          state.settings.bottomTabs.splice(i, 1);
-          state.settings.bottomActive = Math.max(0, i - 1);
-          saveSettings();
-          renderBottomPane();
-        });
-        wrap.appendChild(x);
-      }
-    } else {
-      const b = document.createElement("button");
-      b.className = "cad-btn tiny bottom-tabbtn";
-      b.textContent = BOTTOM_TABLES[t].label;
-      b.addEventListener("click", () => {
-        state.settings.bottomActive = i;
-        saveSettings();
-        renderBottomPane();
-      });
-      wrap.appendChild(b);
-    }
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "bottom-tab" + (i === state.settings.bottomActive ? " active" : "");
+    b.textContent = BOTTOM_TABLES[t].label;
+    b.addEventListener("click", () => {
+      if (state.settings.bottomActive === i) return;
+      state.settings.bottomActive = i;
+      saveSettings();
+      renderBottomPane();
+    });
+    wrap.appendChild(b);
   });
 }
 
@@ -7573,13 +7541,6 @@ function init() {
   }
   syncConsCheckboxes();
 
-  // bottom pane
-  el("bottom-addtab").addEventListener("click", () => {
-    bottomTabs().push("ol");
-    state.settings.bottomActive = state.settings.bottomTabs.length - 1;
-    saveSettings();
-    renderBottomPane();
-  });
   // OL column marks: choose which columns repopulate the selected WHL row
   el("bottom-head").addEventListener("click", (ev) => {
     if (activeBottomTable() !== "ol") return;
