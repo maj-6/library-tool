@@ -1024,7 +1024,7 @@ main {
   background: var(--face);
   color: var(--ink);
   text-align: left;
-  padding: 5px 8px;
+  padding: 4px 6px;
   letter-spacing: 1px;
   border-right: 1px solid var(--face-sh);
   border-bottom: 1px solid var(--face-sh2);
@@ -1038,7 +1038,7 @@ main {
 /* search-term marks (Ctrl+click a top-table column in search mode) */
 .grid thead th.mark-search { box-shadow: inset 0 -3px 0 var(--amber); color: var(--amber); }
 .grid tbody td {
-  padding: 4px 8px;
+  padding: 3px 6px;
   border-right: 1px solid var(--canvas-line);
   border-bottom: 1px solid var(--canvas-line);
   vertical-align: top;
@@ -1672,10 +1672,12 @@ form.orig-view .cad-input {
 }
 #pane-splitter:hover { background: var(--face-active); }
 
-/* search-term hint (shown in search mode where the constraints used to be) */
-.whl-cons { display: flex; align-items: center; gap: 5px; font-size: 11px; }
+/* Open Library search constraint checkboxes (shown in search mode) */
+.whl-cons { display: flex; align-items: center; gap: 6px; font-size: 11px; }
 .whl-cons[hidden] { display: none; }
-.cons-hint { color: var(--face-sh2); font-size: 10.5px; letter-spacing: 0.3px; }
+.cons-group { display: flex; align-items: center; gap: 8px; }
+.cons-group label { display: flex; align-items: center; gap: 3px; cursor: pointer; white-space: nowrap; }
+.cons-group input { accent-color: var(--green); width: 13px; height: 13px; }
 
 /* year-range filter in the table toolbar */
 .year-filter { display: flex; align-items: center; gap: 3px; }

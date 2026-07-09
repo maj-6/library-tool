@@ -47,7 +47,7 @@ const CHECKED_COLS = [
   ["condition", "Condition"], ["illustrations", "Illustrations"],
   ["price", "Price"], ["acquired", "Acquired"], ["categories", "Categories"],
   ["notes", "Notes"], ["copyright", "Copyright"], ["whl", "WHL"],
-  ["ia", "IA"], ["ht", "HT"], ["mark", "Mark"], ["action", "Action"],
+  ["ia", "IA"], ["ht", "HT"], ["mark", "Mark"],
 ];
 
 const WHL_ROW_FIELDS = ["title", "subtitle", "authors", "year", "publisher",
@@ -88,6 +88,9 @@ const state = {
     checkedCols: {}, showCatalog: false,
     markFilter: "ALL", srcFilter: "ALL", dlFilter: "ALL",
     yearFrom: null, yearTo: null,   // inclusive year-range filter (both tables)
+    // Open Library search constraints (title=verbatim; also toggled by Ctrl+click
+    // a column header). Persistent; extra fields (publisher/city/…) via Ctrl+click.
+    searchCons: { author: true, year: true },
     autoIaDownload: true,           // background-download an IA PDF when a source is found
     topTable: "checked", bottomActive: 0,
     whlMode: "edit", checkedMode: "edit",
@@ -125,7 +128,6 @@ const state = {
   editTarget: null,             // record open in the EDIT tab
   sort: { checked: null, whl: null },  // {key, dir} per top table
   olColMarks: {},               // OL column -> "copy" | "exclude" (repopulation)
-  searchMarks: {},              // top-table field -> true (search terms to include)
 };
 
 // --- appearance: themes are full chrome redesigns; fonts are user-selectable --
@@ -642,6 +644,8 @@ function loadSettings() {
 // came from localStorage or the server
 function normalizeSettings() {
   state.settings.checkedCols = state.settings.checkedCols || {};
+  if (!state.settings.searchCons || typeof state.settings.searchCons !== "object")
+    state.settings.searchCons = { author: true, year: true };
   if (!state.settings.sets || typeof state.settings.sets !== "object")
     state.settings.sets = {};
   state.settings.expandSets = !!state.settings.expandSets;
@@ -780,6 +784,7 @@ async function syncClientStateOnLoad() {
       state.settings = Object.assign(state.settings, server.settings);
       normalizeSettings();
       syncYearFilterInputs();   // reflect adopted year-range into the toolbar
+      syncSearchConsCheckboxes();
       try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings)); } catch (e) {}
     }
     if (server.attention && typeof server.attention === "object") {
@@ -899,7 +904,7 @@ const UPLOAD_COLS = [
 // column per table stretches to absorb leftover width so the table never
 // leaves empty space on its right — the Title column by default.
 const LOCKED_COLS = {
-  checked: { copyright: 30, whl: 38, ia: 38, ht: 38, mark: 40, action: 40 },
+  checked: { copyright: 30, whl: 38, ia: 38, ht: 38, mark: 40 },
   whl: { status: 38, copyright: 30 },
   upload: { status: 38, action: 40 },
 };
@@ -1116,14 +1121,14 @@ function markSortHeaders(tkey) {
   const def = tableDef(tkey);
   const so = state.sort[tkey];
   const searching = topMode() === "search";
-  const marks = state.searchMarks || {};
+  const cons = state.settings.searchCons || {};
   [...el(def.tableId).querySelectorAll("thead th")].forEach((th, i) => {
     const key = def.cols[i] ? def.cols[i][0] : null;
     if (so && key === so.key) th.dataset.sorted = so.dir > 0 ? "asc" : "desc";
     else delete th.dataset.sorted;
-    // search-term marks (Ctrl+click) — only meaningful while searching
+    // active search constraints (checkbox or Ctrl+click) — only shown while searching
     const fkey = key ? searchMarkKey(key) : null;
-    const marked = searching && fkey && SEARCH_MARK_FIELDS.has(fkey) && !!marks[fkey];
+    const marked = searching && fkey && SEARCH_MARK_FIELDS.has(fkey) && !!cons[fkey];
     th.classList.toggle("mark-search", marked);
   });
 }
@@ -1138,15 +1143,16 @@ function initSortHeaders() {
       const i = [...th.parentElement.children].indexOf(th);
       const key = def.cols[i] ? def.cols[i][0] : null;
       if (!key || key === "action") return;
-      // Ctrl/Cmd+click on a markable column in search mode toggles a search-term
-      // mark (mirrors the OL copy-marks, kept separate). Any other Ctrl+click —
-      // edit mode, or a non-search column — falls through to the normal sort.
+      // Ctrl/Cmd+click on a markable column in search mode toggles that search
+      // constraint (same persistent set as the Title/Author/Year checkboxes).
+      // Any other Ctrl+click — edit mode, or a non-search column — sorts.
       const fkey = searchMarkKey(key);
       if ((ev.ctrlKey || ev.metaKey) && topMode() === "search" &&
           SEARCH_MARK_FIELDS.has(fkey)) {
         ev.preventDefault();
-        if (state.searchMarks[fkey]) delete state.searchMarks[fkey];
-        else state.searchMarks[fkey] = true;
+        const cons = state.settings.searchCons || (state.settings.searchCons = {});
+        if (cons[fkey]) delete cons[fkey]; else cons[fkey] = true;
+        saveSettings();
         rebuildSearchFromMarks();
         return;
       }
@@ -2769,12 +2775,7 @@ function checkedRowTr(row, cmode, opts) {
     <td class="col-whl">${whlBadge(row)}</td>
     <td class="col-whl">${iaCell(row)}</td>
     <td class="col-whl">${scanBadge(row, "hathitrust")}</td>
-    <td class="col-whl">${markCell(row)}</td>
-    <td class="col-act">
-      ${row.kind === "manual"
-        ? `<button class="cad-btn tiny icon-btn danger" data-mdel="${esc(row.id)}" data-tip="Delete this manual entry">${ICONS.trash}</button>`
-        : `<button class="cad-btn tiny icon-btn" data-unchk="${esc(row.id)}" data-tip="Remove from checked books">${ICONS.remove}</button>`}
-    </td>`;
+    <td class="col-whl">${markCell(row)}</td>`;
   return tr;
 }
 
@@ -2801,8 +2802,7 @@ function checkedSetHeaderTr(item, cmode) {
     <td class="col-whl"></td>
     <td class="col-whl"></td>
     <td class="col-whl"></td>
-    <td class="col-whl"></td>
-    <td class="col-act"></td>`;
+    <td class="col-whl"></td>`;
   return tr;
 }
 
@@ -2911,40 +2911,47 @@ function onCheckedClick(ev) {
 
 // The selected row's fields that can become search terms. Ctrl+click a top
 // column to add/drop it (see initSortHeaders). Title is always the base term;
-// marking Title makes it a verbatim phrase. With no marks the classic
-// title + author + year search applies. "authors" (WHL) folds to "author".
-// Markable fields whose value the OL / WHL / IA searches can actually use.
+// The Open Library / WHL / IA search is constrained to the fields turned on in
+// state.settings.searchCons (persistent). Title is always the base term; a
+// "title" constraint makes it a verbatim phrase. The Title/Author/Year
+// checkboxes and Ctrl+click on any column header both toggle searchCons.
 // (Language is intentionally excluded — no search path honors it.)
 const SEARCH_MARK_FIELDS = new Set(
   ["title", "author", "year", "publisher", "city", "edition", "volume"]);
+const SEARCH_CONS_BOXES = [["wc-title", "title"], ["wc-author", "author"], ["wc-year", "year"]];
 function searchMarkKey(colKey) { return colKey === "authors" ? "author" : colKey; }
 
-// Mirrors olMarkGate: a marked field is included; if ANY field is marked the
-// marks act as an allow-list (only marked fields, Title always the base term);
-// with no marks the classic title + author + year defaults apply.
 function searchGate() {
-  const marks = state.searchMarks || {};
-  const anyMark = Object.values(marks).some(Boolean);
-  return (k, dflt) => (marks[k] ? true : anyMark ? false : dflt);
+  const cons = state.settings.searchCons || {};
+  return (k) => !!cons[k];
 }
 
-// Build the OL/WHL search override from a selected row's fields + search marks.
+// reflect searchCons into the toolbar checkboxes (init / after Ctrl+click / adopt)
+function syncSearchConsCheckboxes() {
+  const cons = state.settings.searchCons || {};
+  for (const [id, k] of SEARCH_CONS_BOXES) {
+    const e = el(id);
+    if (e) e.checked = !!cons[k];
+  }
+}
+
+// Build the OL/WHL search override from a selected row's fields + the constraints.
 function searchOverrideFrom(f) {
   const on = searchGate();
-  const marks = state.searchMarks || {};
-  const ov = { title: f.title || "", verbatim: !!marks.title };
-  if (on("author", true) && f.author) ov.author = f.author;
-  if (on("year", true) && f.year) ov.year = f.year;
-  if (on("publisher", false) && f.publisher) ov.publisher = f.publisher;
-  if (on("city", false) && f.city) ov.city = f.city;
-  if (on("edition", false) && f.edition) ov.edition = f.edition;
+  const ov = { title: f.title || "", verbatim: on("title") };
+  if (on("author") && f.author) ov.author = f.author;
+  if (on("year") && f.year) ov.year = f.year;
+  if (on("publisher") && f.publisher) ov.publisher = f.publisher;
+  if (on("city") && f.city) ov.city = f.city;
+  if (on("edition") && f.edition) ov.edition = f.edition;
   // a volume always narrows the match to its volume number when present
   if (f.volume) ov.volume = f.volume;
   return ov;
 }
 
-// Re-derive the active search from the selected row after the marks change.
+// Re-derive the active search from the selected row after the constraints change.
 function rebuildSearchFromMarks() {
+  syncSearchConsCheckboxes();
   if (state.settings.topTable === "whl" && state.whlSelected != null)
     selectWhlSearchRow(state.whlSelected);
   else if (state.settings.topTable === "checked" && state.checkedSelected != null)
@@ -2982,6 +2989,20 @@ function uncheckRow(key) {
   renderChecked();
   updateCheckedCount();
   status("REMOVED FROM CHECKED BOOKS");
+}
+
+// Delete key while hovering a checked-table row trashes that entry — the
+// reversible replacement for the removed Actions column (undo restores it).
+function onRowDeleteKey(ev) {
+  if (ev.key !== "Delete") return;
+  if (/^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName) || ev.target.isContentEditable) return;
+  const tr = document.querySelector("#checked-rows tr:hover");
+  if (!tr || !tr.dataset.rowId) return;   // real/volume rows only (not set headers)
+  const row = state.rowsById.get(String(tr.dataset.rowId));
+  if (!row) return;
+  ev.preventDefault();
+  if (row.kind === "manual") deleteManual(row.id);   // both are undoable
+  else uncheckRow(row.id);
 }
 
 // --- click-to-edit cells --------------------------------------------------------
@@ -3606,7 +3627,6 @@ function setTopMode(m) {
     state.whlSelected = null;
     state.checkedSelected = null;
     state.olOverride = null;
-    state.searchMarks = {};
   }
   renderTop();
   status(m === "search" ? "SEARCH MODE" : "EDIT MODE");
@@ -3622,13 +3642,12 @@ function renderModeBar() {
 function switchTopTable(t) {
   state.settings.topTable = t;
   saveSettings();
-  // a table switch abandons the previous table's search selection — clear it
-  // (and its marks) so the bottom catalogs follow the new table / Find box
-  // rather than staying filtered by a now-hidden row.
+  // a table switch abandons the previous table's search selection so the bottom
+  // catalogs follow the new table / Find box rather than a now-hidden row (the
+  // search constraints in searchCons are a persistent preference — kept)
   state.whlSelected = null;
   state.checkedSelected = null;
   state.olOverride = null;
-  state.searchMarks = {};
   el("top-table").value = t;
   el("checked-pane").hidden = t !== "checked";
   el("whltop-pane").hidden = t !== "whl";
@@ -3919,17 +3938,10 @@ function repopBookFields(rec) {
 // A copy/repopulate consumes the OL column marks; clear them afterwards so the
 // next book starts unconstrained (the marks persist only for the pending copy).
 function clearOlColMarks() {
-  let changed = false;
-  if (state.olColMarks && Object.keys(state.olColMarks).length) {
-    state.olColMarks = {}; changed = true;
-  }
-  // the search-term marks are consumed by the same copy action
-  if (state.searchMarks && Object.keys(state.searchMarks).length) {
-    state.searchMarks = {};
-    markSortHeaders("checked"); markSortHeaders("whl");
-    changed = true;
-  }
-  if (changed) renderBottomRows();
+  // the search constraints (searchCons) are a persistent preference, not consumed
+  if (!state.olColMarks || !Object.keys(state.olColMarks).length) return;
+  state.olColMarks = {};
+  renderBottomRows();
 }
 
 async function repopulateCheckedRow(rec) {
@@ -8385,6 +8397,20 @@ function init() {
   });
   syncYearFilterInputs();
 
+  // Open Library search constraint checkboxes (Title/Author/Year) — the same
+  // persistent searchCons set toggled by Ctrl+click on a column header
+  for (const [id, k] of SEARCH_CONS_BOXES) {
+    el(id).addEventListener("change", () => {
+      const cons = state.settings.searchCons || (state.settings.searchCons = {});
+      if (el(id).checked) cons[k] = true; else delete cons[k];
+      saveSettings();
+      markSortHeaders("checked");
+      markSortHeaders("whl");
+      rebuildSearchFromMarks();
+    });
+  }
+  syncSearchConsCheckboxes();
+
   // top pane: table selector + WHL interactions
   el("top-table").addEventListener("change", () => switchTopTable(el("top-table").value));
   el("whl-mode").addEventListener("click", () =>
@@ -8651,6 +8677,7 @@ function init() {
   loadAttn();
   document.addEventListener("keydown", onAttentionKey);
   document.addEventListener("keydown", onSearchKey);
+  document.addEventListener("keydown", onRowDeleteKey);
   initAttnModal();
   el("b-pdf-attach").addEventListener("click", () => attachPdfFile());
   el("b-pdf_file").addEventListener("keydown", (ev) => {

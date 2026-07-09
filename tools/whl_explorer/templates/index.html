@@ -414,10 +414,15 @@
             <button id="whl-mode" class="cad-btn tiny" type="button" hidden
                     data-tip="Ctrl+E toggles EDIT / SEARCH mode"></button>
             <span id="whl-cons" class="whl-cons" hidden
-                  data-tip="Ctrl+click a column header to add it as a search term (Title = verbatim phrase). Title is always included; with no marks the search uses Title + Author + Year.">
+                  data-tip="Constrain the Open Library search to these fields (Title = verbatim phrase). Ctrl+click any column header toggles a field too.">
               <span class="icon-label" data-icon="target"></span>
-              <span class="cons-hint">Ctrl+click a column = search term</span>
+              <span class="cons-group">
+                <label><input type="checkbox" id="wc-title" /> Title</label>
+                <label><input type="checkbox" id="wc-author" /> Author</label>
+                <label><input type="checkbox" id="wc-year" /> Year</label>
+              </span>
             </span>
+            <span class="bar-spacer"></span>
             <span class="year-filter" data-tip="Show only rows within this year range (inclusive)">
               <span class="tool-label">Year</span>
               <input id="year-from" class="cad-input yr-input" type="number"
@@ -428,7 +433,6 @@
               <button id="year-clear" class="cad-btn tiny icon-btn" type="button"
                       data-icon="remove" data-tip="Clear the year range"></button>
             </span>
-            <span class="bar-spacer"></span>
             <button id="export-json" class="cad-btn tiny icon-btn" type="button"
                     data-icon="export" data-tip="Export the table as JSON (respects the active filters)"></button>
             <button id="dl-approved" class="cad-btn tiny icon-btn" type="button"
@@ -489,7 +493,6 @@
                   <th class="col-whl" data-col="ia">IA</th>
                   <th class="col-whl" data-col="ht">HT</th>
                   <th class="col-whl" data-col="mark">Mark</th>
-                  <th class="col-act" data-col="action" data-tip="Actions"></th>
                 </tr>
               </thead>
               <tbody id="checked-rows"></tbody>
