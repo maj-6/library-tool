@@ -7481,6 +7481,7 @@ function init() {
   el("ol-clear").addEventListener("click", clearSearchForm);
 
   // checked-tab find bar
+  el("sync-master-btn").addEventListener("click", syncMasterList);
   el("checked-search").addEventListener("input", () => {
     state.checkedFilter = el("checked-search").value.trim();
     state.olOverride = null;
