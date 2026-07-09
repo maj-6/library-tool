@@ -1345,6 +1345,18 @@ function renderSettings() {
       renderChecked();
     };
   }
+  // copyright registration sources (left half of the copyright tag)
+  for (const [id, k] of [["set-cr-cprs", "cprs"], ["set-cr-nypl", "nypl"]]) {
+    const n = el(id);
+    if (!n) continue;
+    n.checked = !!(state.settings.copyrightSources || {})[k];
+    n.onchange = () => {
+      state.settings.copyrightSources =
+        Object.assign({}, state.settings.copyrightSources, { [k]: n.checked });
+      saveSettings();
+      renderChecked();   // reg cache is keyed by source set -> re-fetch under the new key
+    };
+  }
 
   // APPEARANCE
   const themeSel = el("theme-select");
@@ -1701,7 +1713,9 @@ function copyrightTag(row) {
   let left, leftTip, fixed = false;
   if (tooOld) { left = "blue"; leftTip = "Public domain by age (too old for copyright)"; fixed = true; }
   else if (wholeRed) { left = "red"; leftTip = "Under copyright"; fixed = true; }
-  else {
+  else if (!copyrightSources().length) {
+    left = "gray"; leftTip = "Registration lookup disabled — enable a source in Settings"; fixed = true;
+  } else {
     const reg = regCache().get(regKey(row.book));
     if (reg === undefined) {
       left = "pending"; leftTip = "Checking copyright registration …";
