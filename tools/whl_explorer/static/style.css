@@ -26,6 +26,7 @@
   --blue2: #4a7099;
   --radius: 4px;
   --mono: "Consolas", "DejaVu Sans Mono", "Courier New", monospace;
+  --mono2: "Consolas", "DejaVu Sans Mono", "Courier New", monospace;
   --ui: "Segoe UI", Tahoma, Verdana, sans-serif;
 }
 
@@ -1069,8 +1070,10 @@ main {
 .cell-edit:focus { border-color: var(--cyan); box-shadow: inset 0 0 0 1px var(--cyan); }
 .col-whl, .col-act { text-align: center; overflow: visible; max-width: none; }
 .grid td.col-whl, .grid th.col-whl { padding-left: 3px; padding-right: 3px; }
+/* narrow (tag/action) column headers stay centred over their tags */
+.grid thead th.col-whl, .grid thead th.col-act { text-align: center; }
 /* locked (tag/action) columns: fixed narrow width, header text ellipsized */
-.grid th.col-whl, .grid td.col-whl { width: 58px; }
+.grid th.col-whl, .grid td.col-whl { width: 48px; }
 .grid th.col-act, .grid td.col-act { width: 40px; }
 
 /* copyright tag: a diagonal split — top-left = registration, bottom-right = renewal.
@@ -1105,20 +1108,20 @@ main {
 
 /* --- History tab --- */
 .hist-row { cursor: pointer; }
-.hist-row .hist-time { color: var(--face-sh2); white-space: nowrap; font-variant-numeric: tabular-nums; }
-.hist-row .hist-rev { text-align: center; color: var(--blue); width: 20px; }
-.hist-badge {
-  display: inline-block; min-width: 62px; margin-right: 8px; padding: 0 6px;
-  border-radius: 3px; font-size: 10.5px; text-align: center; color: #fff;
+.hist-row .hist-time {
+  color: var(--face-sh2); white-space: nowrap; font-variant-numeric: tabular-nums;
+  border-left: 3px solid var(--face-sh); padding-left: 6px;
 }
-.hist-edit .hist-badge { background: #3b7dd8; }
-.hist-add .hist-badge { background: #4a9e5c; }
-.hist-remove .hist-badge { background: #d64545; }
-.hist-repopulate .hist-badge { background: #8a5cd6; }
-.hist-verify .hist-badge { background: #2f9e9e; }
-.hist-scan .hist-badge { background: #d6862f; }
-.hist-source .hist-badge { background: #7a7a7a; }
-.hist-other .hist-badge { background: #9a9a9a; }
+.hist-row .hist-rev { text-align: center; color: var(--blue); width: 20px; }
+/* action type -> a thin coloured left border (was a large badge) */
+.hist-edit .hist-time { border-left-color: #3b7dd8; }
+.hist-add .hist-time { border-left-color: #4a9e5c; }
+.hist-remove .hist-time { border-left-color: #d64545; }
+.hist-repopulate .hist-time { border-left-color: #8a5cd6; }
+.hist-verify .hist-time { border-left-color: #2f9e9e; }
+.hist-scan .hist-time { border-left-color: #d6862f; }
+.hist-source .hist-time { border-left-color: #7a7a7a; }
+.hist-other .hist-time { border-left-color: #9a9a9a; }
 .hist-reverted { opacity: 0.55; }
 .hist-reverted .hist-label { text-decoration: line-through; }
 .hist-detail-row > td { background: var(--face-hi); padding: 0; }
@@ -1153,13 +1156,14 @@ body.resizing { cursor: col-resize; user-select: none; }
   position: relative;
   display: inline-block;
   box-sizing: border-box;
-  width: 48px;
+  width: 42px;
   text-align: center;
   overflow: hidden;
   text-overflow: ellipsis;
   vertical-align: middle;
-  font-size: 10px;
-  letter-spacing: 0.5px;
+  font-family: var(--mono2, var(--mono));
+  font-size: 9px;
+  letter-spacing: 0.3px;
   padding: 0 2px;
   border: 1px solid currentColor;
   white-space: nowrap;
@@ -1190,26 +1194,21 @@ a.badge:hover { text-decoration: underline; }
 .dl-dot.err { background: var(--red); }
 .dl-dot.prog { background: var(--amber); }
 
-/* per-source verification marker fused to the tag's right edge */
+/* per-source verification state -> a bold outline around the tag (was a dot) */
 .tag-unit {
   display: inline-flex;
   align-items: stretch;
   vertical-align: middle;
-  width: 48px;
-}
-.tag-unit .badge { flex: 1 1 auto; width: auto; min-width: 0; }
-.vmark {
-  flex: 0 0 7px;
-  width: 7px;
-  margin-left: -1px;
-  box-sizing: border-box;
-  border: 1px solid;
+  padding: 2px;
+  border-radius: 3px;
   cursor: pointer;
+  box-shadow: inset 0 0 0 2px transparent;
 }
-.vmark.pending { border-color: var(--amber); background: #d8a00055; }
-.vmark.approved { border-color: var(--green); background: #23b03955; }
-.vmark.rejected { border-color: var(--red); background: #c0392b55; }
-.vmark:hover { filter: brightness(1.35); }
+.tag-unit .badge { flex: 0 0 auto; }
+.tag-unit.vmk-pending  { box-shadow: inset 0 0 0 2px var(--amber); }
+.tag-unit.vmk-approved { box-shadow: inset 0 0 0 2px var(--green); }
+.tag-unit.vmk-rejected { box-shadow: inset 0 0 0 2px var(--red); }
+.tag-unit[data-vsrc]:hover { filter: brightness(1.12); }
 
 /* Q while hovering: "needs attention" — outranks per-kind row tints like
    .grid tbody tr.is-manual */

@@ -87,7 +87,7 @@ const state = {
     markFilter: "ALL", srcFilter: "ALL", dlFilter: "ALL",
     topTable: "checked", bottomActive: 0,
     whlMode: "edit", checkedMode: "edit",
-    paneWidth: null, theme: "", font: "", fontUi: "",
+    paneWidth: null, theme: "", font: "", fontUi: "", fontMono2: "",
     aiBase: "", aiModel: "", aiKey: "", aiInstructions: "",
     // OCR services (Settings > OCR). Tesseract runs locally; Claude /
     // Textract / Azure / OpenAI need credentials — cloud processing is
@@ -409,6 +409,9 @@ function applyFont() {
   const u = state.settings.fontUi || "";
   if (u) document.body.style.setProperty("--ui", u);
   else document.body.style.removeProperty("--ui");
+  const m2 = state.settings.fontMono2 || "";
+  if (m2) document.body.style.setProperty("--mono2", m2);
+  else document.body.style.removeProperty("--mono2");
 }
 
 const el = (id) => document.getElementById(id);
@@ -908,9 +911,9 @@ const UPLOAD_COLS = [
 // column per table stretches to absorb leftover width so the table never
 // leaves empty space on its right — the Title column by default.
 const LOCKED_COLS = {
-  checked: { copyright: 30, whl: 58, ia: 58, ht: 58, mark: 58, action: 40 },
-  whl: { status: 58, copyright: 30 },
-  upload: { status: 58, action: 40 },
+  checked: { copyright: 30, whl: 48, ia: 48, ht: 48, mark: 58, action: 40 },
+  whl: { status: 48, copyright: 30 },
+  upload: { status: 48, action: 40 },
 };
 const STRETCH_COL = { checked: "title", whl: "title", upload: "title" };
 
@@ -1448,6 +1451,7 @@ function renderSettings() {
   };
   fillFontSelect("font-ui-select", FONT_CHOICES, "fontUi", applyFont);
   fillFontSelect("font-select", FONT_CHOICES, "font", applyFont);
+  fillFontSelect("font-mono2-select", FONT_CHOICES, "fontMono2", applyFont);
 
   // AI
   for (const [id, k] of [["set-ai-base", "aiBase"], ["set-ai-model", "aiModel"],
@@ -1894,9 +1898,9 @@ function getManualUrl(row, source) {
 }
 
 const VERIFY_TIPS = {
-  pending: "Pending — click the marker to approve",
-  approved: "Approved — click the marker to reject (false positive)",
-  rejected: "Rejected (false positive) — click the marker to reset.\nClick the tag to paste a manually located source.",
+  pending: "Pending — click the outline to approve",
+  approved: "Approved — click the outline to reject (false positive)",
+  rejected: "Rejected (false positive) — click the outline to reset.\nClick the tag itself to paste a manually located source.",
 };
 
 function verifyUnit(row, source, tagHtml) {
@@ -1904,10 +1908,9 @@ function verifyUnit(row, source, tagHtml) {
   const manual = st === "rejected" && getManualUrl(row, source);
   const cls = manual ? "approved" : st;
   const tip = manual
-    ? "Manually located source — click the marker to reset"
+    ? "Manually located source — click the outline to reset"
     : VERIFY_TIPS[st];
-  return `<span class="tag-unit" data-vsrc="${source}">${tagHtml}` +
-    `<span class="vmark ${cls}" data-tip="${esc(tip)}"></span></span>`;
+  return `<span class="tag-unit vmk-${cls}" data-vsrc="${source}" data-tip="${esc(tip)}">${tagHtml}</span>`;
 }
 
 function scanBadge(row, source, dot) {
@@ -2779,11 +2782,11 @@ function onCheckedClick(ev) {
   }
   // plain click anywhere on a set header (arrow, tag, title) expands/collapses it
   if (setHdr) { toggleSet(setHdr.dataset.setKey); return; }
-  const mark = ev.target.closest(".vmark");
-  if (mark) {
-    const unit = mark.closest("[data-vsrc]");
-    const tr = mark.closest("tr");
-    if (unit && tr) cycleVerify(tr.dataset.rowId, unit.dataset.vsrc);
+  // clicking the verify outline (the tag-unit frame, not the inner link) cycles state
+  const vunit = ev.target.closest(".tag-unit[data-vsrc]");
+  if (vunit && !ev.target.closest("a.badge")) {
+    const tr = vunit.closest("tr");
+    if (tr) cycleVerify(tr.dataset.rowId, vunit.dataset.vsrc);
     return;
   }
   // SCAN mark: attach a local scan PDF (the row becomes a verified source);
@@ -3221,7 +3224,7 @@ function renderHistoryRows() {
       : "Click for detail" + (r.reverted ? " (already reverted)" : " (not revertible here)");
     tr.innerHTML =
       `<td class="hist-time">${esc(fmtActionTime(r.ts))}</td>` +
-      `<td class="hist-label"><span class="hist-badge">${esc(ACTION_TYPE_LABEL[r.type] || "Action")}</span>${esc(r.label)}</td>` +
+      `<td class="hist-label" data-tip="${esc(ACTION_TYPE_LABEL[r.type] || "Action")}">${esc(r.label)}</td>` +
       `<td class="hist-rev">${r.reverted ? "✓" : (histCanRevert(r) ? "↶" : "")}</td>`;
     tbody.appendChild(tr);
   }
