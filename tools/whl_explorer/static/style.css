@@ -1660,6 +1660,19 @@ form.orig-view .cad-input {
 .whl-cons[hidden] { display: none; }
 .cons-hint { color: var(--face-sh2); font-size: 10.5px; letter-spacing: 0.3px; }
 
+/* year-range filter in the table toolbar */
+.year-filter { display: flex; align-items: center; gap: 3px; }
+.yr-input {
+  width: 46px;
+  text-align: center;
+  padding: 1px 3px;
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+.yr-input::-webkit-outer-spin-button,
+.yr-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.yr-dash { color: var(--face-sh2); }
+
 /* bottom pane */
 #bottom-pane {
   flex: 1;

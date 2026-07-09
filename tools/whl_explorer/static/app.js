@@ -85,6 +85,7 @@ const state = {
   settings: {
     checkedCols: {}, showCatalog: false,
     markFilter: "ALL", srcFilter: "ALL", dlFilter: "ALL",
+    yearFrom: null, yearTo: null,   // inclusive year-range filter (both tables)
     topTable: "checked", bottomActive: 0,
     whlMode: "edit", checkedMode: "edit",
     paneWidth: null, theme: "", font: "", fontUi: "", fontMono2: "",
@@ -775,6 +776,7 @@ async function syncClientStateOnLoad() {
     if (server.settings && typeof server.settings === "object") {
       state.settings = Object.assign(state.settings, server.settings);
       normalizeSettings();
+      syncYearFilterInputs();   // reflect adopted year-range into the toolbar
       try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings)); } catch (e) {}
     }
     if (server.attention && typeof server.attention === "object") {
@@ -2675,12 +2677,38 @@ function updateCheckedCount() {
 }
 
 // the FIND box + the filter menu, applied identically for display and export
+// the first 4-digit year in a value ("c1887", "1887-90" -> 1887), or null
+function parseYearNum(y) {
+  const m = String(y == null ? "" : y).match(/\d{4}/);
+  return m ? parseInt(m[0], 10) : null;
+}
+// inclusive year-range filter shared by both top tables. With no bounds set,
+// everything passes; with a bound set, rows whose year can't be parsed are out.
+function yearInRange(y) {
+  const from = state.settings.yearFrom, to = state.settings.yearTo;
+  if (from == null && to == null) return true;
+  const n = parseYearNum(y);
+  if (n == null) return false;
+  if (from != null && n < from) return false;
+  if (to != null && n > to) return false;
+  return true;
+}
+
+// reflect the persisted year-range into the toolbar inputs (init + after the
+// server copy of settings is adopted)
+function syncYearFilterInputs() {
+  const f = el("year-from"), t = el("year-to");
+  if (f) f.value = state.settings.yearFrom != null ? state.settings.yearFrom : "";
+  if (t) t.value = state.settings.yearTo != null ? state.settings.yearTo : "";
+}
+
 function filteredCheckedRows() {
   let rows = combinedRows();
   const q = findQuery();
   if (!q.empty)
     rows = rows.filter((r) => matchesFind(
       q, `${r.book.title} ${r.book.subtitle || ""}`, r.book.author, r.book.year));
+  rows = rows.filter((r) => yearInRange(r.book.year));
   const mf = state.settings.markFilter || "ALL";
   if (mf !== "ALL") rows = rows.filter((r) => rowMarkState(r) === mf);
   const sf = state.settings.srcFilter || "ALL";
@@ -3626,7 +3654,8 @@ function renderWhlTop() {
   updateModeTag();
   const q = findQuery();
   let rows = (state.whlRows || [])
-    .filter((r) => matchesFind(q, `${r.title} ${r.subtitle || ""}`, r.authors, r.year));
+    .filter((r) => matchesFind(q, `${r.title} ${r.subtitle || ""}`, r.authors, r.year))
+    .filter((r) => yearInRange(r.year));
   const so = state.sort.whl;
   if (so) rows = sortRowsBy(rows, (r) => whlSortVal(r, so.key), so.dir);
   const cap = maxRows();
@@ -8179,6 +8208,25 @@ function init() {
     scheduleOlRealtime();
   });
   el("checked-rows").addEventListener("click", onCheckedClick);
+
+  // year-range filter (applies to whichever top table is shown)
+  const onYearFilter = () => {
+    const num = (v) => { const n = parseInt(v, 10); return Number.isFinite(n) ? n : null; };
+    state.settings.yearFrom = num(el("year-from").value);
+    state.settings.yearTo = num(el("year-to").value);
+    saveSettings();
+    renderTop();
+  };
+  el("year-from").addEventListener("input", onYearFilter);
+  el("year-to").addEventListener("input", onYearFilter);
+  el("year-clear").addEventListener("click", () => {
+    el("year-from").value = "";
+    el("year-to").value = "";
+    state.settings.yearFrom = state.settings.yearTo = null;
+    saveSettings();
+    renderTop();
+  });
+  syncYearFilterInputs();
 
   // top pane: table selector + WHL interactions
   el("top-table").addEventListener("change", () => switchTopTable(el("top-table").value));

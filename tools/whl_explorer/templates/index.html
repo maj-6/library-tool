@@ -418,6 +418,16 @@
               <span class="icon-label" data-icon="target"></span>
               <span class="cons-hint">Ctrl+click a column = search term</span>
             </span>
+            <span class="year-filter" data-tip="Show only rows within this year range (inclusive)">
+              <span class="tool-label">Year</span>
+              <input id="year-from" class="cad-input yr-input" type="number"
+                     inputmode="numeric" placeholder="from" />
+              <span class="yr-dash">–</span>
+              <input id="year-to" class="cad-input yr-input" type="number"
+                     inputmode="numeric" placeholder="to" />
+              <button id="year-clear" class="cad-btn tiny icon-btn" type="button"
+                      data-icon="remove" data-tip="Clear the year range"></button>
+            </span>
             <span class="bar-spacer"></span>
             <button id="export-json" class="cad-btn tiny icon-btn" type="button"
                     data-icon="export" data-tip="Export the table as JSON (respects the active filters)"></button>
