@@ -19,6 +19,7 @@ import json
 import os
 import re
 import sys
+import threading
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -99,6 +100,7 @@ def cprs_registration(title: str, author: str = "", year_value=None,
 # runs don't re-scan ~640k records.
 NYPL_DIR: str | None = None
 _nypl_index: dict | None = None   # {"sig", "entries": [ {title,author,regnum,year} ], "by_token": {tok:[i]}}
+_nypl_lock = threading.Lock()
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _STOP = {"the", "a", "an", "of", "and", "or", "to", "in", "on", "for", "with",
@@ -123,7 +125,7 @@ def _nypl_signature(root: Path) -> str:
     for p in sorted(root.rglob("*.xml")):
         try:
             st = p.stat()
-            h.update(f"{p.name}|{st.st_size}|{int(st.st_mtime)}".encode())
+            h.update(f"{p.relative_to(root).as_posix()}|{st.st_size}|{st.st_mtime!r}".encode())
         except OSError:
             pass
     return h.hexdigest()[:16]
@@ -143,7 +145,7 @@ def _parse_nypl_dir(root: Path) -> list[dict]:
                 continue
             an = el.find("author/authorName")
             author = ("".join(an.itertext()).strip() if an is not None else "")
-            regnum = (el.get("regnum") or "").strip()
+            regnum = (el.get("regnum") or "").strip().rstrip(".")
             if not regnum:
                 rn = el.find("regNum")
                 regnum = ("".join(rn.itertext()).strip().rstrip(".") if rn is not None else "")
@@ -164,27 +166,34 @@ def _load_nypl_index() -> dict | None:
     sig = _nypl_signature(root)
     if _nypl_index is not None and _nypl_index.get("sig") == sig:
         return _nypl_index
-    cache = root / ".nypl_index.json"
-    entries = None
-    if cache.is_file():
-        try:
-            blob = json.loads(cache.read_text("utf-8"))
-            if blob.get("sig") == sig:
-                entries = blob.get("entries")
-        except Exception:
-            entries = None
-    if entries is None:
-        entries = _parse_nypl_dir(root)
-        try:
-            cache.write_text(json.dumps({"sig": sig, "entries": entries}), "utf-8")
-        except Exception:
-            pass
-    by_token: dict[str, list[int]] = {}
-    for i, e in enumerate(entries):
-        for tok in set(_title_tokens(e["title"])):
-            by_token.setdefault(tok, []).append(i)
-    _nypl_index = {"sig": sig, "entries": entries, "by_token": by_token}
-    return _nypl_index
+    with _nypl_lock:   # serialize the heavy build; another thread may have won
+        if _nypl_index is not None and _nypl_index.get("sig") == sig:
+            return _nypl_index
+        cache = root / ".nypl_index.json"
+        entries = None
+        if cache.is_file():
+            try:
+                blob = json.loads(cache.read_text("utf-8"))
+                if blob.get("sig") == sig and isinstance(blob.get("entries"), list):
+                    entries = blob["entries"]
+            except Exception:
+                entries = None
+        if entries is None:
+            entries = _parse_nypl_dir(root)
+            try:                                   # atomic write (no torn cache file)
+                tmp = cache.with_name(cache.name + ".tmp")
+                tmp.write_text(json.dumps({"sig": sig, "entries": entries}), "utf-8")
+                os.replace(tmp, cache)
+            except Exception:
+                pass
+        by_token: dict[str, list[int]] = {}
+        for i, e in enumerate(entries):
+            if not isinstance(e, dict):
+                continue
+            for tok in set(_title_tokens(e.get("title", ""))):
+                by_token.setdefault(tok, []).append(i)
+        _nypl_index = {"sig": sig, "entries": entries, "by_token": by_token}
+        return _nypl_index
 
 
 def nypl_registration(title: str, author: str = "", year_value=None) -> dict | None:
@@ -203,20 +212,23 @@ def nypl_registration(title: str, author: str = "", year_value=None) -> dict | N
     if not toks:
         return None
     by_token, entries = idx["by_token"], idx["entries"]
-    postings = [by_token.get(t, ()) for t in set(toks)]
-    postings = [p for p in postings if p]
-    if not postings:
-        return None
-    candidates = min(postings, key=len)   # the most selective title token
+    # union of every shared title token's postings (mirrors catalog_checks
+    # candidate gathering) — a min()-by-rarest-token prefilter would miss a valid
+    # record whose only shared token happens to be a common one.
+    candidates: set[int] = set()
+    for t in set(toks):
+        candidates.update(by_token.get(t, ()))
     for i in candidates:
         e = entries[i]
-        if cc.title_author_match(title, author, e["title"], e["author"]):
+        if not isinstance(e, dict):
+            continue
+        if cc.title_author_match(title, author, e.get("title", ""), e.get("author", "")):
             return {
                 "source": "nypl",
-                "reg_number": e["regnum"],
-                "title": e["title"],
-                "author": e["author"],
-                "year": e["year"],
+                "reg_number": e.get("regnum", ""),
+                "title": e.get("title", ""),
+                "author": e.get("author", ""),
+                "year": e.get("year", ""),
                 "record_id": "",
             }
     return None
