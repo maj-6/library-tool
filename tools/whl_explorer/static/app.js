@@ -79,6 +79,8 @@ const state = {
   downloads: new Map(),
   dlTimers: new Map(),
   downloadedIds: new Set(),
+  autoDlQueue: [],            // {ident, book} pending background IA downloads
+  autoDlActive: new Set(),    // identifiers currently auto-downloading
   prov: {},                   // manual-form field provenance
   msrcTarget: null,
   mdTarget: null,             // markdown overlay target textarea
@@ -86,6 +88,7 @@ const state = {
     checkedCols: {}, showCatalog: false,
     markFilter: "ALL", srcFilter: "ALL", dlFilter: "ALL",
     yearFrom: null, yearTo: null,   // inclusive year-range filter (both tables)
+    autoIaDownload: true,           // background-download an IA PDF when a source is found
     topTable: "checked", bottomActive: 0,
     whlMode: "edit", checkedMode: "edit",
     paneWidth: null, theme: "", font: "", fontUi: "", fontMono2: "",
@@ -1404,6 +1407,7 @@ function renderSettings() {
   };
   for (const [id, k] of [["set-preview-original", "previewOriginal"],
                          ["set-keep-originals", "keepOriginals"],
+                         ["set-auto-ia-dl", "autoIaDownload"],
                          ["set-trim-blank", "trimBlank"]]) {
     const n = el(id);
     n.checked = !!state.settings[k];
@@ -5313,6 +5317,13 @@ async function startDownload(identifier, book) {
   } catch (e) {
     status("IA DOWNLOAD FAILED TO START");
   }
+  // if this call did not enter the polling loop (already saved, or failed to
+  // start), release any background-download slot it was holding and pump next
+  if (!state.dlTimers.has(identifier)) {
+    state.autoDlActive.delete(identifier);
+    pumpAutoDl();
+  }
+  updateDlProgress();
   renderChecked();
 }
 
@@ -5329,19 +5340,25 @@ function pollDownload(identifier) {
       } else {
         clearInterval(t);
         state.dlTimers.delete(identifier);
+        state.autoDlActive.delete(identifier);   // free a background slot
         if (data.status === "done") {
           state.downloadedIds.add(identifier);
           status(`IA PDF SAVED :: ${data.path || identifier}`);
         } else if (data.status === "error") {
           status(`IA DOWNLOAD ERROR :: ${data.error || "unknown"}`);
         }
+        pumpAutoDl();                             // start the next queued download
       }
+      updateDlProgress();
       renderChecked();
     } catch (e) {
       failures += 1;
       if (failures >= 8) {
         clearInterval(t);
         state.dlTimers.delete(identifier);
+        state.autoDlActive.delete(identifier);
+        pumpAutoDl();
+        updateDlProgress();
         status(`IA DOWNLOAD POLLING STOPPED (SERVER UNREACHABLE) :: ${identifier}`);
       }
     }
@@ -5369,6 +5386,57 @@ async function downloadApproved() {
     (noIa ? ` / ${noIa} WITHOUT IA MATCH` : ""));
 }
 
+// --- automatic background IA download (on a found source) --------------------
+// When a scan turns up an available IA source, queue a background download of
+// its PDF (which the server also turns into a compressed 10-page preview). A
+// small concurrency cap keeps it from hammering archive.org / the disk.
+const AUTO_DL_MAX = 2;
+
+function maybeAutoDownloadIa(row) {
+  if (!state.settings.autoIaDownload) return;
+  const s = row && row.scans && row.scans.internet_archive;
+  if (!s || s.available !== true) return;           // only a genuinely-found source
+  const ident = iaIdentifierForRow(row);
+  if (!ident) return;
+  if (state.downloadedIds.has(ident)) return;       // already saved
+  if (state.downloads.get(ident)) return;           // already known (in-flight/errored)
+  if (state.autoDlActive.has(ident)) return;
+  if (state.autoDlQueue.some((q) => q.ident === ident)) return;
+  state.autoDlQueue.push({ ident, book: row.book || {} });
+  pumpAutoDl();
+}
+
+function pumpAutoDl() {
+  while (state.autoDlActive.size < AUTO_DL_MAX && state.autoDlQueue.length) {
+    const { ident, book } = state.autoDlQueue.shift();
+    if (state.downloadedIds.has(ident) || state.autoDlActive.has(ident) ||
+        (state.downloads.get(ident) || {}).status === "downloading") continue;
+    state.autoDlActive.add(ident);
+    startDownload(ident, book);   // pollDownload's terminal state pumps the next
+  }
+  updateDlProgress();
+}
+
+// footer progress bar: aggregate of all in-flight downloads + queue depth
+function updateDlProgress() {
+  const wrap = el("dl-progress");
+  if (!wrap) return;
+  let active = 0, bytes = 0, total = 0;
+  for (const dl of state.downloads.values()) {
+    if (dl && dl.status === "downloading") {
+      active += 1; bytes += dl.bytes || 0; total += dl.total || 0;
+    }
+  }
+  const queued = state.autoDlQueue.length;
+  if (!active && !queued) { wrap.hidden = true; return; }
+  wrap.hidden = false;
+  const pct = total ? Math.round((bytes / total) * 100) : 0;
+  el("dl-progbar").style.width = pct + "%";
+  el("dl-progtext").textContent =
+    `IA ${active} downloading` + (queued ? ` · ${queued} queued` : "") +
+    (total ? ` · ${pct}%` : "");
+}
+
 // --- automatic checks + scans -----------------------------------------------
 
 const scanQueue = [];
@@ -5391,6 +5459,7 @@ async function processScanQueue() {
     try {
       const scans = await runRowScans(row);
       status(`AUTO SCAN DONE :: ${row.book.title} :: ${scanStatusLine(scans)}`);
+      maybeAutoDownloadIa(row);   // found an IA source -> background-download it
     } catch (e) {
       status(`AUTO SCAN FAILED :: ${row.book.title}`);
     }
@@ -8028,6 +8097,78 @@ function reloadWebView() {
 }
 
 // --- Internet Archive viewer (PDF preview + metadata + downloads) ------------
+// --- IA preview page viewer (local compressed copy, arrow-key paging) --------
+const iaViewer = { pages: 0, page: 1 };
+
+function renderIaPages(previewPath, pages) {
+  const box = el("ia-pages");
+  let h = "";
+  for (let i = 1; i <= pages; i++) {
+    h += `<div class="ia-pgrow" data-page="${i}">` +
+      `<img loading="lazy" alt="page ${i}" ` +
+      `src="/api/pdf/pageimg?path=${encodeURIComponent(previewPath)}&page=${i}&w=900">` +
+      `<div class="ia-pgnum">${i} / ${pages}</div></div>`;
+  }
+  box.innerHTML = h;
+  box.scrollTop = 0;
+  iaViewer.pages = pages;
+  iaViewer.page = 1;
+  highlightIaPage(1, false);
+}
+
+function highlightIaPage(n, scroll) {
+  const box = el("ia-pages");
+  box.querySelectorAll(".ia-pgrow").forEach((r) =>
+    r.classList.toggle("ia-pgcur", +r.dataset.page === n));
+  if (scroll) {
+    const cur = box.querySelector(`.ia-pgrow[data-page="${n}"]`);
+    if (cur) cur.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+}
+
+function iaGoPage(n) {
+  if (!iaViewer.pages) return;
+  iaViewer.page = Math.max(1, Math.min(iaViewer.pages, n));
+  highlightIaPage(iaViewer.page, true);
+}
+
+// ←/↑/PageUp and →/↓/PageDown step through the framed preview
+function onIaViewerKey(ev) {
+  if (el("ia-overlay").hidden || el("ia-pages").hidden) return;
+  if (/^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName) || ev.target.isContentEditable) return;
+  if (ev.key === "ArrowRight" || ev.key === "ArrowDown" || ev.key === "PageDown") {
+    ev.preventDefault(); iaGoPage(iaViewer.page + 1);
+  } else if (ev.key === "ArrowLeft" || ev.key === "ArrowUp" || ev.key === "PageUp") {
+    ev.preventDefault(); iaGoPage(iaViewer.page - 1);
+  }
+}
+
+// choose the framed local preview if we have one; else the proxied iframe
+async function showIaPreview(ident, data) {
+  el("ia-pages").hidden = true;
+  el("ia-frame").hidden = false;
+  let pv = null;
+  try { pv = await (await fetch("/api/ia/preview/" + encodeURIComponent(ident))).json(); }
+  catch (e) { pv = null; }
+  if (pv && pv.ok && pv.pages) {
+    renderIaPages(pv.preview, pv.pages);
+    el("ia-pages").hidden = false;
+    el("ia-frame").hidden = true;
+    el("ia-frame").src = "about:blank";
+    return;
+  }
+  el("ia-frame").src = (data && data.pdf)
+    ? "/api/pdf?url=" + encodeURIComponent(data.pdf) + "&preview=1"
+    : "/api/webview?url=" + encodeURIComponent(
+        (data && data.details) || ("https://archive.org/details/" + ident));
+  // no local copy yet — kick off a background download so the framed preview
+  // (and its compressed 10-page copy) is ready next time
+  if (state.settings.autoIaDownload && !state.downloadedIds.has(ident) &&
+      !(state.downloads.get(ident) || {}).status) {
+    startDownload(ident, {});
+  }
+}
+
 async function openIaViewer(ident) {
   if (!ident) return;
   const meta = el("ia-meta"), dls = el("ia-downloads");
@@ -8045,10 +8186,9 @@ async function openIaViewer(ident) {
   const arr = (v) => Array.isArray(v) ? v.join("; ") : (v == null ? "" : String(v));
   el("ia-title").textContent = arr(md.title) || ident;
   el("ia-external").onclick = () => window.open(data.details, "_blank", "noopener");
-  // PDF preview (or the details page proxied, if there is no downloadable PDF)
-  el("ia-frame").src = data.pdf
-    ? "/api/pdf?url=" + encodeURIComponent(data.pdf) + "&preview=1"
-    : "/api/webview?url=" + encodeURIComponent(data.details);
+  // Prefer the locally-downloaded compressed preview (page frames + arrow keys);
+  // otherwise fall back to the proxied remote preview iframe.
+  await showIaPreview(ident, data);
   const rows = [["Title", "title"], ["Author", "creator"], ["Year", "year"], ["Date", "date"],
     ["Publisher", "publisher"], ["Language", "language"], ["Pages", "imagecount"],
     ["Subjects", "subject"], ["Collection", "collection"]];
@@ -8068,6 +8208,10 @@ async function openIaViewer(ident) {
 function closeIaViewer() {
   el("ia-overlay").hidden = true;
   el("ia-frame").src = "about:blank";
+  el("ia-pages").innerHTML = "";
+  el("ia-pages").hidden = true;
+  iaViewer.pages = 0;
+  iaViewer.page = 1;
 }
 
 function initWebView() {
@@ -8100,6 +8244,7 @@ function initWebView() {
   el("ia-overlay").addEventListener("click", (ev) => {
     if (ev.target === el("ia-overlay")) closeIaViewer();
   });
+  document.addEventListener("keydown", onIaViewerKey);   // arrow-key paging
   document.addEventListener("keydown", (ev) => {
     if (ev.key !== "Escape") return;
     if (!el("ia-overlay").hidden) closeIaViewer();

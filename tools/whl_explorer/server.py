@@ -1415,6 +1415,15 @@ def _ia_download_job(identifier: str, book: dict) -> None:
                 job["bytes"] = got
         tmp.replace(dest)
 
+        # A compressed, first-10-pages preview copy drives the fast page viewer
+        # (the full PDF stays on disk; the preview is what the client renders).
+        preview_rel = ""
+        try:
+            preview_rel = str(_preview_pdf(dest, 10).relative_to(lib.DATA_ROOT))
+            job["preview"] = preview_rel
+        except Exception:
+            pass
+
         # Cataloging entry: our book metadata + where the scan came from.
         meta = info.get("metadata") or {}
         catalog = lib.load_json(lib.IA_CATALOG_PATH, {})
@@ -1423,6 +1432,7 @@ def _ia_download_job(identifier: str, book: dict) -> None:
             "source_url": f"https://archive.org/details/{identifier}",
             "pdf_file": name,
             "saved_as": str(dest.relative_to(lib.DATA_ROOT)),
+            "preview": preview_rel,
             "size_bytes": got,
             "downloaded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "ia_title": meta.get("title", ""),
@@ -1445,8 +1455,31 @@ def _download_state(identifier: str) -> dict:
     catalog = lib.load_json(lib.IA_CATALOG_PATH, {})
     if identifier in catalog and _ia_pdf_path(identifier).exists():
         return {"identifier": identifier, "status": "done",
-                "path": catalog[identifier].get("saved_as", "")}
+                "path": catalog[identifier].get("saved_as", ""),
+                "preview": catalog[identifier].get("preview", "")}
     return {"identifier": identifier, "status": "none"}
+
+
+@app.route("/api/ia/preview/<path:identifier>")
+def api_ia_preview(identifier: str):
+    """Ensure a compressed first-10-pages preview exists for a downloaded IA PDF
+    and return its DATA_ROOT-relative path + page count (generated on demand so
+    downloads from earlier builds get a preview too)."""
+    pdf = _ia_pdf_path(identifier)
+    if not pdf.is_file():
+        return jsonify({"ok": False, "error": "not downloaded"}), 404
+    try:
+        prev = _preview_pdf(pdf, 10)
+        rel = str(prev.relative_to(lib.DATA_ROOT))
+        from pypdf import PdfReader
+        pages = len(PdfReader(str(prev)).pages)
+        catalog = lib.load_json(lib.IA_CATALOG_PATH, {})
+        if identifier in catalog and catalog[identifier].get("preview") != rel:
+            catalog[identifier]["preview"] = rel
+            lib.save_json(lib.IA_CATALOG_PATH, catalog)
+        return jsonify({"ok": True, "preview": rel, "pages": pages})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
 
 @app.route("/api/ia/download", methods=["POST"])

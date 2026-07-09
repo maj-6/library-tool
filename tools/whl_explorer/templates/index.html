@@ -902,6 +902,9 @@
               <input id="set-preview-original" type="checkbox" />
               <label class="tool-label" for="set-keep-originals">Keep IA originals after a folder build</label>
               <input id="set-keep-originals" type="checkbox" />
+              <label class="tool-label" for="set-auto-ia-dl">Auto-download IA PDFs in the background</label>
+              <input id="set-auto-ia-dl" type="checkbox"
+                     data-tip="When a scan finds an Internet Archive source, download its PDF and build a compressed 10-page preview in the background (can pull a lot of data)" />
               <label class="tool-label" for="set-trim-blank">Trim blank pages automatically (folder build)</label>
               <input id="set-trim-blank" type="checkbox"
                      data-tip="Blank pages are removed from the actual PDF during a folder build (backup kept, OCR renumbered)" />
@@ -1098,6 +1101,11 @@
   <div id="statusbar">
     <span id="status-msg">READY</span>
     <span class="foot-right">
+      <span id="dl-progress" class="dl-progress" hidden
+            data-tip="Internet Archive PDF downloads running in the background">
+        <span id="dl-progtext" class="dl-progtext"></span>
+        <span class="dl-progtrack"><span id="dl-progbar" class="dl-progbar"></span></span>
+      </span>
       <span id="mode-tag" class="foot-tag" hidden></span>
       <span id="status-right"></span>
     </span>
@@ -1113,6 +1121,8 @@
         <button id="ia-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
       </div>
       <div class="ia-body">
+        <div id="ia-pages" class="ia-pages" hidden
+             data-tip="Local compressed preview — ← / → to page through"></div>
         <iframe id="ia-frame" class="ia-frame" referrerpolicy="no-referrer"></iframe>
         <div class="ia-side">
           <table id="ia-meta" class="ia-meta"></table>
