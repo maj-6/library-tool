@@ -2804,6 +2804,7 @@ function renderChecked() {
 
   applyTableChrome("checked");
   markSortHeaders("checked");
+  refreshInfoIfActive();
   renderBottomPane();
 }
 
@@ -2916,6 +2917,7 @@ function selectCheckedSearchRow(id) {
   const row = state.rowsById.get(String(id));
   if (!row) return;
   state.checkedSelected = String(id);
+  state.editTarget = null;   // a live search selection supersedes a prior edit target (Info pane)
   const b = row.book;
   state.olOverride = searchOverrideFrom({
     title: b.title, author: b.author, year: b.year, publisher: b.publisher,
@@ -3654,6 +3656,7 @@ function renderWhlTop() {
     `${rows.length} WHL rows` + (rows.length > cap ? ` (showing ${cap})` : "");
   applyTableChrome("whl");
   markSortHeaders("whl");
+  refreshInfoIfActive();
 }
 
 function whlRowCells(r, mode) {
@@ -3813,6 +3816,7 @@ function selectWhlSearchRow(idx) {
   const row = whlRowByIdx(idx);
   if (!row) return;
   state.whlSelected = idx;
+  state.editTarget = null;   // a live search selection supersedes a prior edit target (Info pane)
   state.olOverride = searchOverrideFrom({
     title: row.title, author: row.authors, year: row.year,
     publisher: row.publisher, city: row.city, edition: row.edition,
@@ -5579,13 +5583,184 @@ function clearSearchForm() {
 }
 
 function switchPaneTab(id) {
-  const wasSearch = document.querySelector("#pane-search.active");
   document.querySelectorAll("#manual-pane .pane-tab[data-ptab]").forEach((t) =>
     t.classList.toggle("active", t.dataset.ptab === id));
   document.querySelectorAll("#manual-pane .pane-sub").forEach((p) =>
     p.classList.toggle("active", p.id === id));
-  // the search form empties itself when left behind
-  if (wasSearch && id !== "pane-search") clearSearchForm();
+  if (id === "pane-info") renderInfoPane();
+}
+
+// --- Advanced Search popup (the form lives outside the left pane now) ---------
+function openAdvSearch() {
+  const pop = el("adv-search-pop"), r = el("adv-search-btn").getBoundingClientRect();
+  pop.style.top = (r.bottom + 4) + "px";
+  pop.style.left = r.left + "px";
+  pop.hidden = false;
+  el("s-title").focus();
+}
+function closeAdvSearch() {
+  el("adv-search-pop").hidden = true;
+  // dropping the advanced fields stops them constraining the bottom pane once
+  // the popup is dismissed; a row-selection override (state.olOverride) is left
+  // intact — use the popup's Clear button to reset that too.
+  let had = false;
+  for (const f of ["title", "author", "publisher", "city", "year", "edition", "volume"]) {
+    if (el("s-" + f).value) { el("s-" + f).value = ""; had = true; }
+  }
+  el("ol-msg").textContent = "";
+  if (had && activeBottomTable() === "ol") olRealtime();
+}
+function toggleAdvSearch() {
+  if (el("adv-search-pop").hidden) openAdvSearch(); else closeAdvSearch();
+}
+
+// --- Info tab: a read-only inspector that follows the selected / open row ----
+function currentInfoTarget() {
+  const et = state.editTarget;
+  if (et) {
+    if (et.kind === "row") {
+      const r = state.rowsById.get(String(et.id));
+      if (r) return { label: r.kind === "manual" ? "Manual entry" : "Checked book",
+                      book: r.book, row: r };
+    } else if (et.kind === "ch") {
+      const b = (state.chBooks || []).find((x) => x.idx === et.idx);
+      if (b) {
+        const ex = state.checked.get(ckey("ch_library", et.idx));
+        return { label: "Master list #" + et.idx,
+                 book: ex ? ex.book : parseBook(b), row: ex || null };
+      }
+    } else if (et.kind === "whl") {
+      const w = whlRowByIdx(et.idx);
+      if (w) return { label: "WHL catalog", whl: w };
+    } else if (et.kind === "set") {
+      const vols = setMembers(et.key);
+      if (vols.length) return { label: "Volume set", set: { key: et.key, vols } };
+    }
+  }
+  if (state.checkedSelected != null) {
+    const r = state.rowsById.get(String(state.checkedSelected));
+    if (r) return { label: r.kind === "manual" ? "Manual entry" : "Checked book",
+                    book: r.book, row: r };
+  }
+  if (state.whlSelected != null) {
+    const w = whlRowByIdx(state.whlSelected);
+    if (w) return { label: "WHL catalog", whl: w };
+  }
+  return null;
+}
+
+function infoRow(label, valueHtml, cls) {
+  if (valueHtml == null || valueHtml === "") return "";
+  return `<div class="info-row ${cls || ""}"><span class="info-k">${esc(label)}</span>` +
+    `<span class="info-v">${valueHtml}</span></div>`;
+}
+
+function infoStatusRow(label, st) {
+  const dot = st.cls ? `<span class="info-dot ${st.cls}"></span>` : "";
+  const val = st.url
+    ? `<a href="${esc(st.url)}" target="_blank" rel="noopener">${esc(st.text)}</a>`
+    : esc(st.text);
+  return infoRow(label, dot + val);
+}
+
+function infoWhlStatus(row) {
+  const c = row && row.checks;
+  if (!c || c.error) return { text: "Not checked", cls: "" };
+  const m = c.whl_match || {};
+  const suf = m.title ? " — " + m.title : "";
+  if (c.in_whl === "yes") return { text: "In WHL" + suf, cls: "ok", url: m.permalink };
+  if (c.in_whl === "draft") return { text: "Draft in WHL" + suf, cls: "warn", url: m.permalink };
+  if (c.in_whl === "no") return { text: "Not in WHL", cls: "" };
+  return { text: "Unknown", cls: "" };
+}
+
+function infoScanStatus(row, source) {
+  const s = row && row.scans && row.scans[source];
+  if (!s) return { text: "Not searched", cls: "" };
+  if (s.error) return { text: "Error", cls: "err" };
+  if (s.available === true) {
+    const best = s.best_match || {};
+    return { text: s.full_view ? "Full view available" : "Available", cls: "ok",
+             url: best.url || best.record_url || "" };
+  }
+  if (s.no_download) return { text: "Borrow/lending only", cls: "warn", url: s.search_url || "" };
+  if (s.available === false) return { text: "Not found", cls: "" };
+  return { text: "Unknown", cls: "" };
+}
+
+function renderInfoPane() {
+  const body = el("info-body");
+  if (!body) return;
+  const t = currentInfoTarget();
+  if (!t) {
+    body.innerHTML = `<div class="info-empty">Select a row to see its details.</div>`;
+    return;
+  }
+  if (t.whl) {                                        // a WHL catalogue row
+    const w = t.whl;
+    let h = `<div class="info-head">${esc(t.label)}</div><div class="info-sec">`;
+    h += infoRow("Title", esc(w.title));
+    h += infoRow("Authors", esc(w.authors));
+    h += infoRow("Year", esc(w.year));
+    h += infoRow("Publisher", esc(w.publisher));
+    h += infoRow("Pages", esc(w.pages));
+    h += infoRow("Language", esc(w.language));
+    h += infoRow("Subject", esc(w.subject));
+    h += infoRow("Status", esc(w.status));
+    const wurl = w.permalink || w.url;   // WHL rows carry the page under permalink
+    if (wurl) h += infoRow("URL",
+      `<a href="${esc(wurl)}" target="_blank" rel="noopener">${esc(wurl)}</a>`);
+    body.innerHTML = h + `</div>`;
+    return;
+  }
+  if (t.set) {                                        // a multi-volume set
+    const vols = t.set.vols;
+    let h = `<div class="info-head">${esc(t.label)} :: ${esc(setBaseTitle(vols[0].book))}</div>`;
+    h += `<div class="info-sec">`;
+    h += infoRow("Volumes present", esc(String(vols.length)));
+    h += infoRow("Declared count", esc(String(setDefinedCount(t.set.key) || "?")));
+    h += `</div><div class="info-sec"><div class="info-sec-h">Volumes</div>`;
+    for (const v of vols) h += infoRow("Vol " + (volNum(v.book) || "?"), esc(v.book.title));
+    body.innerHTML = h + `</div>`;
+    return;
+  }
+  const b = t.book || {};                             // a checked / manual / master book
+  const row = t.row;
+  let h = `<div class="info-head">${esc(t.label)}</div>`;
+  h += `<div class="info-sec"><div class="info-sec-h">Fields</div>`;
+  for (const [k, label] of TIP_FIELDS) {
+    if (k === "url" || k === "status") continue;      // not book-owned in this table
+    const v = (b[k] == null ? "" : String(b[k])).trim();
+    if (v) h += infoRow(label, esc(v));
+  }
+  h += `</div>`;
+  if (row) {                                          // derived status needs a checked row
+    h += `<div class="info-sec"><div class="info-sec-h">Status</div>`;
+    h += infoStatusRow("WHL", infoWhlStatus(row));
+    h += infoStatusRow("Internet Archive", infoScanStatus(row, "internet_archive"));
+    h += infoStatusRow("HathiTrust", infoScanStatus(row, "hathitrust"));
+    const cp = row.checks && row.checks.copyright_status;
+    if (cp) h += infoRow("Copyright", esc(cp));
+    const dl = dlState(row);
+    const dlText = { done: "Downloaded", downloading: "Downloading…", failed: "Download failed" }[dl];
+    if (dlText) h += infoStatusRow("Download",
+      { text: dlText, cls: dl === "done" ? "ok" : dl === "failed" ? "err" : "warn" });
+    const lpdf = row.localPdf || row.local_pdf;   // raw state.checked uses snake_case
+    if (lpdf) h += infoRow("Local scan", esc(lpdf));
+    h += `</div>`;
+  }
+  const sk = setKeyOf(b), cnt = setDefinedCount(sk), vn = volNum(b);
+  if (cnt > 0 || vn > 0) {
+    h += `<div class="info-sec"><div class="info-sec-h">Volume set</div>`;
+    h += infoRow("This volume", vn ? esc("Volume " + vn) : "—");
+    h += infoRow("Set size", cnt ? esc(cnt + " volumes") : "?");
+    h += `</div>`;
+  }
+  body.innerHTML = h;
+}
+
+function refreshInfoIfActive() {
+  if (document.querySelector("#pane-info.active")) renderInfoPane();
 }
 
 async function loadOlStatus() {
@@ -7981,6 +8156,18 @@ function init() {
   syncFilterBtn();
   syncSrcFilterBtn();
   el("ol-clear").addEventListener("click", clearSearchForm);
+  // Advanced Search popup (moved out of the left pane)
+  el("adv-search-btn").addEventListener("click", toggleAdvSearch);
+  el("adv-search-close").addEventListener("click", closeAdvSearch);
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && !el("adv-search-pop").hidden) closeAdvSearch();
+  });
+  document.addEventListener("mousedown", (ev) => {
+    const pop = el("adv-search-pop");
+    if (pop.hidden) return;
+    if (pop.contains(ev.target) || ev.target.closest("#adv-search-btn")) return;
+    closeAdvSearch();
+  });
 
   // checked-tab find bar
   el("sync-master-btn").addEventListener("click", syncMasterList);

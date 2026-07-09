@@ -1555,6 +1555,61 @@ form.orig-view .cad-input {
 .pane-sub { display: none; }
 .pane-sub.active { display: block; }
 
+/* Advanced Search popup (opened from the toolbar button) */
+.adv-pop {
+  position: fixed;
+  z-index: 50;
+  width: 340px;
+  max-width: calc(100vw - 24px);
+  max-height: 70vh;
+  overflow: auto;
+  background: var(--face);
+  border: 1px solid var(--face-sh2);
+  border-radius: var(--radius);
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.28);
+  padding: 8px 10px 10px;
+}
+.adv-pop[hidden] { display: none; }
+.adv-pop-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  font-size: 11px;
+  letter-spacing: 0.5px;
+  color: var(--face-sh2);
+}
+.adv-pop-title { font-weight: bold; color: var(--ink); }
+
+/* Info tab: read-only inspector of the selected / open row */
+.info-body { font-size: 12px; }
+.info-empty { color: var(--face-sh2); font-size: 11px; padding: 6px 2px; }
+.info-head {
+  font-weight: bold; color: var(--blue); font-size: 12px;
+  padding-bottom: 4px; margin-bottom: 6px; border-bottom: 1px solid var(--face-sh);
+  word-break: break-word;
+}
+.info-sec { margin-bottom: 8px; }
+.info-sec-h {
+  font-size: 10px; letter-spacing: 1px; text-transform: uppercase;
+  color: var(--face-sh2); margin-bottom: 3px;
+}
+.info-row { display: flex; gap: 8px; padding: 1px 0; align-items: baseline; }
+.info-k { flex: 0 0 88px; color: var(--face-sh2); font-size: 11px; }
+.info-v {
+  flex: 1 1 auto; min-width: 0; color: var(--ink);
+  font-family: var(--mono); word-break: break-word;
+}
+.info-v a { color: var(--cyan); text-decoration: none; }
+.info-v a:hover { text-decoration: underline; }
+.info-dot {
+  display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+  margin-right: 5px; vertical-align: middle; background: var(--face-sh2);
+}
+.info-dot.ok { background: var(--green); }
+.info-dot.warn { background: var(--amber); }
+.info-dot.err { background: var(--red); }
+
 /* field provenance: yellow = auto-populated, green = hand-typed */
 .cad-input.prov-auto { background: #fdf3c4; color: #1b1b1b; }
 .cad-input.prov-manual { background: #e0f5d8; color: #1b1b1b; }

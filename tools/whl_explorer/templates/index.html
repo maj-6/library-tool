@@ -93,60 +93,74 @@
         <span class="icon-label" id="find-icon" data-icon="search"></span>
         <input id="checked-search" class="cad-input" type="text"
                placeholder="[title] @author #year" autocomplete="off" />
+        <button id="adv-search-btn" class="cad-btn tiny" type="button"
+                data-tip="Advanced Open Library search (by field)">Advanced Search</button>
         <span class="bar-spacer"></span>
         <span class="tool-count" id="checked-count"></span>
         <button id="sync-master-btn" class="cad-btn tiny" type="button"
                 data-tip="Sync the master list to Google Sheets">Sync Master List</button>
       </div>
 
+      <!-- Advanced Search popup (opened by #adv-search-btn) -->
+      <div id="adv-search-pop" class="adv-pop" hidden>
+        <div class="adv-pop-head">
+          <span class="adv-pop-title">Advanced Search — Open Library</span>
+          <button id="adv-search-close" class="cad-btn tiny icon-btn" type="button"
+                  data-icon="remove" data-tip="Close"></button>
+        </div>
+        <form id="ol-form" autocomplete="off">
+          <div class="mf-grid">
+            <div class="mf-field mf-full">
+              <label class="tool-label" for="s-title">Title</label>
+              <input id="s-title" class="cad-input" />
+            </div>
+            <div class="mf-field mf-full">
+              <label class="tool-label" for="s-author">Author</label>
+              <input id="s-author" class="cad-input" />
+            </div>
+            <div class="mf-field">
+              <label class="tool-label" for="s-publisher">Publisher</label>
+              <input id="s-publisher" class="cad-input" />
+            </div>
+            <div class="mf-field">
+              <label class="tool-label" for="s-city">City</label>
+              <input id="s-city" class="cad-input" />
+            </div>
+            <div class="mf-field mf-third">
+              <label class="tool-label" for="s-year">Year</label>
+              <input id="s-year" class="cad-input" />
+            </div>
+            <div class="mf-field mf-third">
+              <label class="tool-label" for="s-edition">Edition</label>
+              <input id="s-edition" class="cad-input" />
+            </div>
+            <div class="mf-field mf-third">
+              <label class="tool-label" for="s-volume">Volume</label>
+              <input id="s-volume" class="cad-input" />
+            </div>
+          </div>
+          <div class="mf-actions">
+            <button id="ol-search-btn" class="cad-btn icon-btn" type="submit"
+                    data-icon="search" data-tip="Search Open Library"></button>
+            <button id="ol-clear" class="cad-btn icon-btn" type="button"
+                    data-icon="remove" data-tip="Clear the search fields"></button>
+            <span class="tool-label" id="ol-msg"></span>
+          </div>
+        </form>
+      </div>
+
       <div id="checked-split">
         <div id="manual-pane">
           <div class="pane-tabs">
-            <button class="pane-tab active" data-ptab="pane-search" type="button">Search</button>
+            <button class="pane-tab active" data-ptab="pane-info" type="button">Info</button>
             <button class="pane-tab" data-ptab="pane-entry" type="button">Manual entry</button>
             <button class="pane-tab" data-ptab="pane-edit" type="button" id="whledit-tab" hidden>Edit</button>
           </div>
 
-          <div id="pane-search" class="pane-sub active">
-            <form id="ol-form" autocomplete="off">
-              <div class="mf-grid">
-                <div class="mf-field mf-full">
-                  <label class="tool-label" for="s-title">Title</label>
-                  <input id="s-title" class="cad-input" />
-                </div>
-                <div class="mf-field mf-full">
-                  <label class="tool-label" for="s-author">Author</label>
-                  <input id="s-author" class="cad-input" />
-                </div>
-                <div class="mf-field">
-                  <label class="tool-label" for="s-publisher">Publisher</label>
-                  <input id="s-publisher" class="cad-input" />
-                </div>
-                <div class="mf-field">
-                  <label class="tool-label" for="s-city">City</label>
-                  <input id="s-city" class="cad-input" />
-                </div>
-                <div class="mf-field mf-third">
-                  <label class="tool-label" for="s-year">Year</label>
-                  <input id="s-year" class="cad-input" />
-                </div>
-                <div class="mf-field mf-third">
-                  <label class="tool-label" for="s-edition">Edition</label>
-                  <input id="s-edition" class="cad-input" />
-                </div>
-                <div class="mf-field mf-third">
-                  <label class="tool-label" for="s-volume">Volume</label>
-                  <input id="s-volume" class="cad-input" />
-                </div>
-              </div>
-              <div class="mf-actions">
-                <button id="ol-search-btn" class="cad-btn icon-btn" type="submit"
-                        data-icon="search" data-tip="Search Open Library"></button>
-                <button id="ol-clear" class="cad-btn icon-btn" type="button"
-                        data-icon="remove" data-tip="Clear the search fields"></button>
-                <span class="tool-label" id="ol-msg"></span>
-              </div>
-            </form>
+          <div id="pane-info" class="pane-sub active">
+            <div id="info-body" class="info-body">
+              <div class="info-empty">Select a row to see its details.</div>
+            </div>
           </div>
 
           <div id="pane-entry" class="pane-sub">
