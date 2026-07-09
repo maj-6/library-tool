@@ -911,9 +911,9 @@ const UPLOAD_COLS = [
 // column per table stretches to absorb leftover width so the table never
 // leaves empty space on its right — the Title column by default.
 const LOCKED_COLS = {
-  checked: { copyright: 30, whl: 46, ia: 46, ht: 46, mark: 58, action: 40 },
-  whl: { status: 46, copyright: 30 },
-  upload: { status: 46, action: 40 },
+  checked: { copyright: 30, whl: 38, ia: 38, ht: 38, mark: 40, action: 40 },
+  whl: { status: 38, copyright: 30 },
+  upload: { status: 38, action: 40 },
 };
 const STRETCH_COL = { checked: "title", whl: "title", upload: "title" };
 

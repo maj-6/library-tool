@@ -1069,11 +1069,11 @@ main {
 }
 .cell-edit:focus { border-color: var(--cyan); box-shadow: inset 0 0 0 1px var(--cyan); }
 .col-whl, .col-act { text-align: center; overflow: visible; max-width: none; }
-.grid td.col-whl, .grid th.col-whl { padding-left: 3px; padding-right: 3px; }
+.grid td.col-whl, .grid th.col-whl { padding-left: 2px; padding-right: 2px; }
 /* narrow (tag/action) column headers stay centred over their tags */
 .grid thead th.col-whl, .grid thead th.col-act { text-align: center; }
 /* locked (tag/action) columns: fixed narrow width, header text ellipsized */
-.grid th.col-whl, .grid td.col-whl { width: 46px; }
+.grid th.col-whl, .grid td.col-whl { width: 38px; }
 .grid th.col-act, .grid td.col-act { width: 40px; }
 
 /* copyright tag: a diagonal split — top-left = registration, bottom-right = renewal.
@@ -1156,7 +1156,9 @@ body.resizing { cursor: col-resize; user-select: none; }
   position: relative;
   display: inline-block;
   box-sizing: border-box;
-  width: 40px;
+  width: 34px;
+  height: 15px;            /* match the copyright colour tag's height */
+  line-height: 13px;       /* 15px - 2px border: vertically centres the label */
   text-align: center;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1190,7 +1192,7 @@ a.badge:hover { text-decoration: underline; }
   display: inline-flex;
   align-items: stretch;
   vertical-align: middle;
-  width: 40px;
+  width: 34px;
 }
 .tag-unit .badge { flex: 1 1 auto; width: auto; min-width: 0; }
 .vmark {
