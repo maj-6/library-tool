@@ -911,9 +911,9 @@ const UPLOAD_COLS = [
 // column per table stretches to absorb leftover width so the table never
 // leaves empty space on its right — the Title column by default.
 const LOCKED_COLS = {
-  checked: { copyright: 30, whl: 48, ia: 48, ht: 48, mark: 58, action: 40 },
-  whl: { status: 48, copyright: 30 },
-  upload: { status: 48, action: 40 },
+  checked: { copyright: 30, whl: 46, ia: 46, ht: 46, mark: 58, action: 40 },
+  whl: { status: 46, copyright: 30 },
+  upload: { status: 46, action: 40 },
 };
 const STRETCH_COL = { checked: "title", whl: "title", upload: "title" };
 
@@ -1629,16 +1629,17 @@ function matchesFind(q, title, author, year) {
 // record, and the tooltip carries the full match details.
 
 function badge(cls, label, opts = {}) {
-  const tip = opts.tip ? ` data-tip="${esc(opts.tip)}"` : "";
+  // download state rides as a bold outline around the whole tag (dl-ok/err/prog),
+  // not a dot inside it; its tip folds into the tag's own tooltip
+  const dl = opts.dot ? " dl-" + opts.dot.cls : "";
+  let tipText = opts.tip || "";
+  if (opts.dot && opts.dot.tip)
+    tipText = tipText ? tipText + "\n" + opts.dot.tip : opts.dot.tip;
+  const tip = tipText ? ` data-tip="${esc(tipText)}"` : "";
   const attrs = opts.attrs || "";
-  // a small status dot inside the tag's right edge; the label stays centered
-  const dot = opts.dot
-    ? `<span class="dl-dot ${opts.dot.cls}"` +
-      (opts.dot.tip ? ` data-tip="${esc(opts.dot.tip)}"` : "") + `></span>`
-    : "";
   if (opts.href)
-    return `<a class="badge ${cls}" href="${esc(opts.href)}" target="_blank" rel="noopener"${tip}${attrs}>${esc(label)}${dot}</a>`;
-  return `<span class="badge ${cls}"${tip}${attrs}>${esc(label)}${dot}</span>`;
+    return `<a class="badge ${cls}${dl}" href="${esc(opts.href)}" target="_blank" rel="noopener"${tip}${attrs}>${esc(label)}</a>`;
+  return `<span class="badge ${cls}${dl}"${tip}${attrs}>${esc(label)}</span>`;
 }
 
 function tipForLocalWhl(checks) {
@@ -1898,9 +1899,9 @@ function getManualUrl(row, source) {
 }
 
 const VERIFY_TIPS = {
-  pending: "Pending — click the outline to approve",
-  approved: "Approved — click the outline to reject (false positive)",
-  rejected: "Rejected (false positive) — click the outline to reset.\nClick the tag itself to paste a manually located source.",
+  pending: "Pending — click the marker to approve",
+  approved: "Approved — click the marker to reject (false positive)",
+  rejected: "Rejected (false positive) — click the marker to reset.\nClick the tag to paste a manually located source.",
 };
 
 function verifyUnit(row, source, tagHtml) {
@@ -1908,9 +1909,10 @@ function verifyUnit(row, source, tagHtml) {
   const manual = st === "rejected" && getManualUrl(row, source);
   const cls = manual ? "approved" : st;
   const tip = manual
-    ? "Manually located source — click the outline to reset"
+    ? "Manually located source — click the marker to reset"
     : VERIFY_TIPS[st];
-  return `<span class="tag-unit vmk-${cls}" data-vsrc="${source}" data-tip="${esc(tip)}">${tagHtml}</span>`;
+  return `<span class="tag-unit" data-vsrc="${source}">${tagHtml}` +
+    `<span class="vmark ${cls}" data-tip="${esc(tip)}"></span></span>`;
 }
 
 function scanBadge(row, source, dot) {
@@ -2782,11 +2784,11 @@ function onCheckedClick(ev) {
   }
   // plain click anywhere on a set header (arrow, tag, title) expands/collapses it
   if (setHdr) { toggleSet(setHdr.dataset.setKey); return; }
-  // clicking the verify outline (the tag-unit frame, not the inner link) cycles state
-  const vunit = ev.target.closest(".tag-unit[data-vsrc]");
-  if (vunit && !ev.target.closest("a.badge")) {
-    const tr = vunit.closest("tr");
-    if (tr) cycleVerify(tr.dataset.rowId, vunit.dataset.vsrc);
+  const mark = ev.target.closest(".vmark");
+  if (mark) {
+    const unit = mark.closest("[data-vsrc]");
+    const tr = mark.closest("tr");
+    if (unit && tr) cycleVerify(tr.dataset.rowId, unit.dataset.vsrc);
     return;
   }
   // SCAN mark: attach a local scan PDF (the row becomes a verified source);

@@ -1073,7 +1073,7 @@ main {
 /* narrow (tag/action) column headers stay centred over their tags */
 .grid thead th.col-whl, .grid thead th.col-act { text-align: center; }
 /* locked (tag/action) columns: fixed narrow width, header text ellipsized */
-.grid th.col-whl, .grid td.col-whl { width: 48px; }
+.grid th.col-whl, .grid td.col-whl { width: 46px; }
 .grid th.col-act, .grid td.col-act { width: 40px; }
 
 /* copyright tag: a diagonal split — top-left = registration, bottom-right = renewal.
@@ -1084,7 +1084,6 @@ main {
   display: inline-block;
   width: 15px;
   height: 15px;
-  border-radius: 3px;
   overflow: hidden;
   border: 1px solid var(--face-sh2);
   vertical-align: middle;
@@ -1095,15 +1094,16 @@ main {
 .cr-tag.cr-split::after {   /* the diagonal divider (only on differing-colour tags) */
   content: ""; position: absolute; inset: 0; pointer-events: none;
   background: linear-gradient(to bottom right,
-    transparent calc(50% - 0.7px), rgba(0, 0, 0, 0.4) calc(50% - 0.7px),
-    rgba(0, 0, 0, 0.4) calc(50% + 0.7px), transparent calc(50% + 0.7px));
+    transparent calc(50% - 0.6px), rgba(0, 0, 0, 0.25) calc(50% - 0.6px),
+    rgba(0, 0, 0, 0.25) calc(50% + 0.6px), transparent calc(50% + 0.6px));
 }
-.cr-blue    { background: #3f76c8; }
-.cr-yellow  { background: #e3bf3e; }
-.cr-gray    { background: #adadad; }
-.cr-green   { background: #46955a; }
-.cr-magenta { background: #c0399b; }
-.cr-orange  { background: #e08a2b; }
+/* muted, desaturated fills so the tag sits quietly within the CAD themes */
+.cr-blue    { background: #5f7fa0; }
+.cr-yellow  { background: #c3aa5c; }
+.cr-gray    { background: #a6a69f; }
+.cr-green   { background: #5f8b6c; }
+.cr-magenta { background: #a3638d; }
+.cr-orange  { background: #bd875a; }
 .cr-pending { background: repeating-linear-gradient(45deg, #d8d8d8, #d8d8d8 3px, #ececec 3px, #ececec 6px); }
 
 /* --- History tab --- */
@@ -1156,7 +1156,7 @@ body.resizing { cursor: col-resize; user-select: none; }
   position: relative;
   display: inline-block;
   box-sizing: border-box;
-  width: 42px;
+  width: 40px;
   text-align: center;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1164,7 +1164,7 @@ body.resizing { cursor: col-resize; user-select: none; }
   font-family: var(--mono2, var(--mono));
   font-size: 9px;
   letter-spacing: 0.3px;
-  padding: 0 2px;
+  padding: 0 1px;
   border: 1px solid currentColor;
   white-space: nowrap;
 }
@@ -1178,37 +1178,41 @@ a.badge:hover { text-decoration: underline; }
 .badge.upload { color: var(--amber); font-weight: bold; }
 .badge.approved { color: var(--green); font-weight: bold; }
 
-/* download-state dot inside the tag's right edge; the label stays centered */
-.dl-dot {
-  position: absolute;
-  right: 2px;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  pointer-events: auto;
-}
-.tag-unit .badge .dl-dot { right: auto; left: 2px; }
-.dl-dot.ok { background: var(--green); }
-.dl-dot.err { background: var(--red); }
-.dl-dot.prog { background: var(--amber); }
+/* download state -> a bold outline around the tag (replaces the old dl-dot):
+   green = downloaded, red = failed, amber = downloading. Freeing the space the
+   dot needed inside the tag lets the tags (and columns) run narrower. */
+.badge.dl-ok   { box-shadow: 0 0 0 2px var(--green); }
+.badge.dl-err  { box-shadow: 0 0 0 2px var(--red); }
+.badge.dl-prog { box-shadow: 0 0 0 2px var(--amber); }
 
-/* per-source verification state -> a bold outline around the tag (was a dot) */
+/* per-source verification marker fused to the tag's right edge (clickable) */
 .tag-unit {
   display: inline-flex;
   align-items: stretch;
   vertical-align: middle;
-  padding: 2px;
-  border-radius: 3px;
-  cursor: pointer;
-  box-shadow: inset 0 0 0 2px transparent;
+  width: 40px;
 }
-.tag-unit .badge { flex: 0 0 auto; }
-.tag-unit.vmk-pending  { box-shadow: inset 0 0 0 2px var(--amber); }
-.tag-unit.vmk-approved { box-shadow: inset 0 0 0 2px var(--green); }
-.tag-unit.vmk-rejected { box-shadow: inset 0 0 0 2px var(--red); }
-.tag-unit[data-vsrc]:hover { filter: brightness(1.12); }
+.tag-unit .badge { flex: 1 1 auto; width: auto; min-width: 0; }
+.vmark {
+  flex: 0 0 7px;
+  width: 7px;
+  margin-left: -1px;
+  box-sizing: border-box;
+  border: 1px solid;
+  cursor: pointer;
+}
+.vmark.pending { border-color: var(--amber); background: #d8a00055; }
+.vmark.approved { border-color: var(--green); background: #23b03955; }
+.vmark.rejected { border-color: var(--red); background: #c0392b55; }
+.vmark:hover { filter: brightness(1.35); }
+/* when a downloaded source also carries a verify marker, outline the whole
+   unit so the marker sits inside the outline rather than beside a clipped one */
+.tag-unit:has(.badge.dl-ok)   { box-shadow: 0 0 0 2px var(--green); }
+.tag-unit:has(.badge.dl-err)  { box-shadow: 0 0 0 2px var(--red); }
+.tag-unit:has(.badge.dl-prog) { box-shadow: 0 0 0 2px var(--amber); }
+.tag-unit:has(.badge.dl-ok) .badge.dl-ok,
+.tag-unit:has(.badge.dl-err) .badge.dl-err,
+.tag-unit:has(.badge.dl-prog) .badge.dl-prog { box-shadow: none; }
 
 /* Q while hovering: "needs attention" — outranks per-kind row tints like
    .grid tbody tr.is-manual */
