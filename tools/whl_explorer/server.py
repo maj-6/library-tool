@@ -31,7 +31,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from flask import Flask, abort, jsonify, render_template, request, send_file
+from flask import Flask, Response, abort, jsonify, render_template, request, send_file
 
 # Make tools/ importable for the shared helpers.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -1071,11 +1071,24 @@ def api_pdf_text():
     return jsonify(out)
 
 
+def _downloads_dir() -> Path:
+    dl = Path.home() / "Downloads"
+    return dl if dl.is_dir() else Path.home()
+
+
 @app.route("/api/pdf/browse")
 def api_pdf_browse():
-    """List a directory's subdirectories and PDF files (the file picker)."""
+    """List a directory's subdirectories and PDF files (the file picker).
+    ?preset=downloads (with no dir) opens the user's Downloads folder; each PDF
+    carries its mtime + server 'now' so the client can filter to recently
+    downloaded scans."""
     raw = (request.args.get("dir") or "").strip()
-    d = _resolve_local(raw) if raw else lib.IA_DOWNLOADS_DIR
+    if raw:
+        d = _resolve_local(raw)
+    elif request.args.get("preset") == "downloads":
+        d = _downloads_dir()
+    else:
+        d = lib.IA_DOWNLOADS_DIR
     if d is None or not d.is_dir():
         d = lib.DATA_ROOT
     dirs: list[dict] = []
@@ -1087,15 +1100,17 @@ def api_pdf_browse():
                     if not entry.name.startswith("."):
                         dirs.append({"name": entry.name, "path": str(entry)})
                 elif entry.suffix.lower() == ".pdf":
+                    st = entry.stat()
                     pdfs.append({"name": entry.name, "path": str(entry),
-                                 "size": entry.stat().st_size})
+                                 "size": st.st_size, "mtime": st.st_mtime})
             except OSError:
                 continue
     except OSError:
         pass
     parent = str(d.parent) if d.parent != d else None
     return jsonify({"dir": str(d), "parent": parent, "dirs": dirs,
-                    "pdfs": pdfs, "drives": _drives()})
+                    "pdfs": pdfs, "drives": _drives(),
+                    "now": datetime.now(timezone.utc).timestamp()})
 
 
 _DRIVES_CACHE: list[str] | None = None
@@ -1641,6 +1656,40 @@ def api_db_download():
                          args=(name, url, _DB_TARGETS[name][0]), daemon=True).start()
         started.append(name)
     return jsonify({"ok": True, "started": started, "skipped_no_url": skipped})
+
+
+@app.route("/api/webview")
+def api_webview():
+    """Proxy a remote URL for the in-app web view: fetch it and re-serve it from
+    this origin WITHOUT the X-Frame-Options / frame-ancestors headers that would
+    block embedding. HTML gets a <base> so its relative assets resolve to the
+    original site; PDFs stream through. The client frames this in a SANDBOXED
+    iframe (no allow-same-origin) so the proxied page's scripts run isolated and
+    cannot reach the app. (Local/loopback only — never expose publicly: it is an
+    open fetch proxy.)"""
+    url = (request.args.get("url") or "").strip()
+    if not url.lower().startswith(("http://", "https://")):
+        abort(400)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": whl_client.USER_AGENT})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            body = resp.read(25 * 1024 * 1024)   # cap: don't proxy huge pages
+            charset = resp.headers.get_content_charset() or "utf-8"
+    except Exception:
+        abort(502)
+    if "pdf" in ctype or url.lower().split("?")[0].endswith(".pdf"):
+        return Response(body, content_type="application/pdf")
+    if "html" in ctype or not ctype:
+        html = body.decode(charset, "replace")
+        base = '<base href="' + url.replace('"', "%22") + '">'
+        if re.search(r"<head[^>]*>", html, re.I):
+            html = re.sub(r"(<head[^>]*>)", lambda m: m.group(1) + base, html,
+                          count=1, flags=re.I)
+        else:
+            html = base + html
+        return Response(html, content_type="text/html; charset=utf-8")
+    return Response(body, content_type=ctype or "application/octet-stream")
 
 
 # --- WHL catalogue view (editable via a corrections overlay) --------------------

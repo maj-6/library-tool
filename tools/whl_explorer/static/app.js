@@ -105,6 +105,7 @@ const state = {
     cloudSearchUrl: "",         // remote instance of this app; used when no local index
     dbUrls: {},                 // per-database download URLs (name -> url)
     uploadSplitH: null, pdfBrowseDir: "",
+    scanRecentMin: 30,          // scan-attach picker: show only PDFs this new
     maxRows: 400,               // row cap for the big table views
     whlModalOcr: false,         // OCR panel in the WHL publication viewer
     previewPages: 20,           // page cap for PDF preview derivatives
@@ -548,6 +549,9 @@ function normalizeSettings() {
   }
   state.settings.maxRows =
     Math.max(50, Math.min(5000, parseInt(state.settings.maxRows, 10) || 400));
+  let _srm = parseInt(state.settings.scanRecentMin, 10);
+  if (!Number.isFinite(_srm)) _srm = 30;         // 0 = no recency filter
+  state.settings.scanRecentMin = Math.max(0, Math.min(1440, _srm));
   // v2.6 inserted Subtitle/Vol/Ed into the master-list bottom table; its
   // saved column settings are keyed by index (c0..cN), so pre-v2.6 keys
   // must shift to keep pointing at the same columns
@@ -1260,6 +1264,15 @@ function renderSettings() {
     pp.value = state.settings.previewPages;
     saveSettings();
   };
+  const sr = el("set-scan-recent");
+  sr.value = state.settings.scanRecentMin;
+  sr.onchange = () => {
+    let v = parseInt(sr.value, 10);
+    if (!Number.isFinite(v)) v = 30;
+    state.settings.scanRecentMin = Math.max(0, Math.min(1440, v));
+    sr.value = state.settings.scanRecentMin;
+    saveSettings();
+  };
   for (const [id, k] of [["set-preview-original", "previewOriginal"],
                          ["set-keep-originals", "keepOriginals"],
                          ["set-trim-blank", "trimBlank"]]) {
@@ -1680,27 +1693,30 @@ function rowMarkState(row) {
 
 function markCell(row) {
   const { mark, reason } = computeMark(row);
-  // an attached scan stays visible (and replaceable/detachable) even when
-  // the computed mark has moved on — the row is still a verified source;
-  // the green dot marks it as an approved source
-  if (row.localPdf) {
-    return `<span data-scanattach="1">${badge("approved", "SCAN", {
-      tip: `Verified source — attached scan:\n${row.localPdf}\n` +
-        "Click to replace the PDF · Shift+click to detach",
-      dot: { cls: "ok", tip: "Approved source (attached scan)" },
-    })}</span>`;
-  }
+  const attached = !!row.localPdf;
+  // Clicking SCAN or UPLD opens the file browser to attach/replace a local PDF
+  // (Shift+click detaches); an attached PDF keeps the mark's label and gains a
+  // green dot marking it as an approved verified source.
+  const dot = attached ? { cls: "ok", tip: "PDF attached — verified source" } : null;
+  const tail = attached
+    ? `Attached PDF:\n${row.localPdf}\nClick to replace · Shift+click to detach`
+    : "Click to attach a local PDF";
+  let cls, label, base;
   if (mark === "SCAN") {
-    return `<span data-scanattach="1">${badge("scan", "SCAN", {
-      tip: reason + "\nClick to attach a scanned PDF (marks it as a verified source)",
-    })}</span>`;
+    cls = attached ? "approved" : "scan"; label = "SCAN"; base = reason;
+  } else if (mark === "UPLOAD") {
+    const ready = anyApprovedSource(row);
+    cls = attached || ready ? "approved" : "upload"; label = "UPLD";
+    base = ready ? "Verified source(s) ready — see the Editor tab" : reason;
+  } else if (attached) {
+    // no computed mark, but an attached scan keeps the row clickable/detachable
+    cls = "approved"; label = "SCAN"; base = reason;
+  } else {
+    // no mark and nothing attached — not an attach target
+    return badge("unknown", "—", { tip: reason });
   }
-  if (mark === "UPLOAD") {
-    if (anyApprovedSource(row))
-      return badge("approved", "UPLD", { tip: "Verified source(s) ready — see the Editor tab" });
-    return badge("upload", "UPLD", { tip: reason });
-  }
-  return badge("unknown", "—", { tip: reason });
+  return `<span data-scanattach="1">${badge(cls, label, {
+    tip: base ? base + "\n" + tail : tail, dot })}</span>`;
 }
 
 // attach a local PDF scan to a SCAN-marked row: it becomes a verified
@@ -1708,10 +1724,11 @@ function markCell(row) {
 function attachRowScan(id) {
   const row = state.rowsById.get(String(id));
   if (!row) return;
-  const start = row.localPdf
-    ? row.localPdf.replace(/[\\/][^\\/]*$/, "")
-    : (state.settings.pdfBrowseDir || "");
-  openFileBrowser(start, (path) => setRowLocalPdf(id, path));
+  // default to the Downloads folder filtered to recently downloaded PDFs; if
+  // the row already has a scan, reopen at that file's folder (unfiltered)
+  const start = row.localPdf ? row.localPdf.replace(/[\\/][^\\/]*$/, "") : "";
+  openFileBrowser(start, (path) => setRowLocalPdf(id, path),
+    { downloadsDefault: !start, recentMin: state.settings.scanRecentMin });
 }
 
 // PATCH a manual entry's local_pdf without touching its scans
@@ -1996,6 +2013,62 @@ function onAttentionKey(ev) {
   } else {
     target.apply(target.current ? "" : "1");
   }
+}
+
+// Resolve the row/entry under the mouse into its book fields (for the "S"
+// Google-search shortcut).
+function bookAtHover() {
+  const bi = document.querySelector("#builds-list .build-item:hover");
+  if (bi) {
+    const b = state.builds[bi.dataset.bid];
+    if (b) return { title: b.title, author: b.authors, year: b.year };
+  }
+  const tr = document.querySelector(
+    "#checked-rows tr:hover, #whltop-rows tr:hover, " +
+    "#upload-rows tr:hover, #bottom-rows tr:hover");
+  if (!tr) return null;
+  const host = tr.parentElement.id;
+  if (host === "checked-rows") {
+    if (tr.classList.contains("set-header") && tr.dataset.setKey) {
+      const vols = setMembers(tr.dataset.setKey);
+      if (vols.length) return { title: setBaseTitle(vols[0].book),
+        author: firstVal(vols, "author"), year: firstVal(vols, "year") };
+    }
+    if (tr.dataset.rowId) {
+      const row = state.rowsById.get(String(tr.dataset.rowId));
+      if (row) return { title: row.book.title, author: row.book.author, year: row.book.year };
+    }
+    return null;
+  }
+  if (host === "whltop-rows" && tr.dataset.widx != null) {
+    const r = whlRowByIdx(parseInt(tr.dataset.widx, 10));
+    if (r) return { title: r.title, author: r.authors, year: r.year };
+  }
+  if (host === "upload-rows" && tr.dataset.si != null) {
+    const s = (state.uploadSources || [])[+tr.dataset.si];
+    if (s) return { title: s.title, author: s.authors || s.author, year: s.year };
+  }
+  if (host === "bottom-rows" && tr.dataset.bi != null) {
+    const rec = (state.bottomRecords || [])[+tr.dataset.bi];
+    if (rec) return { title: rec.title, author: rec.author || rec.authors,
+      year: rec.year || rec.first_year };
+  }
+  return null;
+}
+
+// S over any entry: Google the title + author + year, in the embedded web view
+function onSearchKey(ev) {
+  if (ev.key !== "s" && ev.key !== "S") return;
+  if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+  if (/^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName) || ev.target.isContentEditable) return;
+  const b = bookAtHover();
+  if (!b || !b.title) return;
+  ev.preventDefault();
+  const q = [b.title, b.author, b.year].map((x) => String(x || "").trim())
+    .filter(Boolean).join(" ");
+  const url = "https://www.google.com/search?q=" + encodeURIComponent(q);
+  if (!openWebView(url)) window.open(url, "_blank", "noopener");
+  status("SEARCH :: " + q.slice(0, 60));
 }
 
 // --- the Ctrl+Q reason modal --
@@ -3179,19 +3252,32 @@ const OL_MARK_FIELDS = { c0: "title", c1: "author", c2: "year",
                          c3: "publisher", c4: "city", c5: "edition",
                          c6: "volume", c7: "language" };
 
+// Build the column-inclusion test from the OL column marks. If ANY column is
+// marked "include" (copy), the marks act as an allow-list — unmarked columns
+// are excluded (their per-field default is ignored); "exclude" always wins.
+// With no "include" marks, the per-field defaults apply (title/author/year).
+function olMarkGate() {
+  const marks = state.olColMarks || {};
+  const anyCopy = Object.values(marks).some((v) => v === "copy");
+  return (k, dflt) =>
+    marks[k] === "exclude" ? false
+      : marks[k] === "copy" ? true
+        : anyCopy ? false : dflt;
+}
+
 // checked/manual rows can take every Open Library column.
 // titleCase/flipName only normalize Open Library records — CH and WHL
 // records copy verbatim, matching every other copy path.
 function repopBookFields(rec) {
   const ol = rec._src === "ol";
   const cased = (t) => ol ? titleCase(t) : t;
-  const marks = state.olColMarks;
-  const on = (k, dflt) =>
-    marks[k] === "exclude" ? false : marks[k] === "copy" ? true : dflt;
+  const on = olMarkGate();
   const f = {};
-  if (on("title", true))
-    f.title = cased(rec.title) +
-      (rec.subtitle ? ": " + cased(rec.subtitle) : "");
+  if (on("title", true)) {
+    f.title = cased(rec.title);
+    // the subtitle goes in the Subtitle field, not appended to the title
+    if (rec.subtitle) f.subtitle = cased(rec.subtitle);
+  }
   if (on("author", true)) f.author = ol ? flipName(rec.author) : rec.author;
   if (on("year", true)) f.year = rec.year;
   if (on("publisher", false) && rec.publisher) f.publisher = rec.publisher;
@@ -3238,9 +3324,7 @@ async function repopulateCheckedRow(rec) {
 function repopFields(rec) {
   const ol = rec._src === "ol";
   const cased = (t) => ol ? titleCase(t) : t;
-  const marks = state.olColMarks;
-  const on = (k, dflt) =>
-    marks[k] === "exclude" ? false : marks[k] === "copy" ? true : dflt;
+  const on = olMarkGate();
   const fields = {};
   if (on("title", true)) {
     // OL titles are sentence case; catalog entries use conventional caps
@@ -4473,6 +4557,8 @@ function closePdfModal() {
 // --- local file browser (pick a PDF) ---------------------------------------------
 
 let fbOnPick = null;
+let fbOpts = {};          // { downloadsDefault, recentMin } for the current open
+let fbShowAll = false;    // "show all" overrides the recency filter
 
 function fmtSize(n) {
   if (!n && n !== 0) return "";
@@ -4482,9 +4568,11 @@ function fmtSize(n) {
 }
 
 async function fbLoad(dir) {
+  let url = "/api/pdf/browse?dir=" + encodeURIComponent(dir || "");
+  if (!dir && fbOpts.downloadsDefault) url += "&preset=downloads";
   let data;
   try {
-    data = await (await fetch("/api/pdf/browse?dir=" + encodeURIComponent(dir || ""))).json();
+    data = await (await fetch(url)).json();
   } catch (e) {
     el("fb-list").innerHTML = `<p class="empty">Cannot list this folder</p>`;
     return;
@@ -4514,21 +4602,49 @@ async function fbLoad(dir) {
     div.addEventListener("click", cb);
     list.appendChild(div);
   };
-  if (data.parent) row("↑ ..", "dir", () => fbLoad(data.parent));
-  for (const d of data.dirs) row("▸ " + d.name, "dir", () => fbLoad(d.path));
-  for (const f of data.pdfs)
+  // the list shows PDF files only; navigate folders via the path bar / drives
+
+  // scan-attach: show only PDFs downloaded within the last N minutes
+  let pdfs = data.pdfs || [];
+  let hidden = 0;
+  const filtering = fbOpts.recentMin && !fbShowAll;
+  if (filtering) {
+    const now = data.now || (Date.now() / 1000);
+    const cutoff = now - fbOpts.recentMin * 60;
+    const kept = pdfs.filter((f) => (f.mtime || 0) >= cutoff);
+    hidden = pdfs.length - kept.length;
+    pdfs = kept;
+  }
+  if (filtering && (pdfs.length || hidden)) {
+    const note = document.createElement("div");
+    note.className = "fb-note";
+    note.textContent = `Showing PDFs downloaded in the last ${fbOpts.recentMin} min`;
+    list.appendChild(note);
+  }
+  for (const f of pdfs)
     row(`▤ ${f.name}  (${fmtSize(f.size)})`, "pdf", () => {
       if (fbOnPick) fbOnPick(f.path);
       closeFileBrowser();
     }, f.path);
-  if (!data.dirs.length && !data.pdfs.length)
-    list.innerHTML = `<p class="empty">No subfolders or PDF files</p>`;
+  if (hidden) {
+    const showAll = document.createElement("div");
+    showAll.className = "fb-row note";
+    showAll.textContent = `— ${hidden} older PDF${hidden > 1 ? "s" : ""} hidden · show all`;
+    showAll.addEventListener("click", () => { fbShowAll = true; fbLoad(dir); });
+    list.appendChild(showAll);
+  }
+  if (!pdfs.length && !hidden)
+    list.innerHTML = `<p class="empty">No PDF files in this folder</p>`;
 }
 
-function openFileBrowser(startDir, onPick) {
+function openFileBrowser(startDir, onPick, opts) {
   fbOnPick = onPick;
+  fbOpts = opts || {};
+  fbShowAll = false;
   el("fb-overlay").hidden = false;
-  fbLoad(startDir || state.settings.pdfBrowseDir || "downloads/ia");
+  const start = startDir ||
+    (fbOpts.downloadsDefault ? "" : (state.settings.pdfBrowseDir || "downloads/ia"));
+  fbLoad(start);
 }
 
 function closeFileBrowser() {
@@ -7042,6 +7158,55 @@ function initMenubar() {
 
 // --- wire up ---------------------------------------------------------------
 
+// --- embedded web view -------------------------------------------------------
+// Links that would open a new browser tab open here instead: a proxied,
+// SANDBOXED iframe. /api/webview strips the X-Frame-Options that block framing;
+// the sandbox has no allow-same-origin, so the proxied page's scripts run
+// isolated and cannot reach the app. Ctrl/Cmd+click still opens a real tab.
+function openWebView(url) {
+  if (!/^https?:\/\//i.test(url)) return false;
+  el("webview-url").textContent = url;
+  el("webview-url").dataset.url = url;
+  el("webview-frame").src = "/api/webview?url=" + encodeURIComponent(url);
+  el("webview-overlay").hidden = false;
+  return true;
+}
+function closeWebView() {
+  el("webview-overlay").hidden = true;
+  el("webview-frame").src = "about:blank";   // stop loading and drop the page
+}
+function reloadWebView() {
+  const u = el("webview-url").dataset.url;
+  if (u) el("webview-frame").src = "/api/webview?url=" + encodeURIComponent(u);
+}
+function initWebView() {
+  el("webview-close").onclick = closeWebView;
+  el("webview-reload").onclick = reloadWebView;
+  el("webview-external").onclick = () => {
+    const u = el("webview-url").dataset.url;
+    if (u) window.open(u, "_blank", "noopener");   // escape hatch: real tab
+  };
+  el("webview-overlay").addEventListener("click", (ev) => {
+    if (ev.target === el("webview-overlay")) closeWebView();
+  });
+  // intercept target=_blank clicks app-wide. Bubble phase + defaultPrevented
+  // check so specialized handlers (e.g. a rejected badge opening the manual-
+  // source modal) still win; modifier-click keeps the native new-tab behavior.
+  document.addEventListener("click", (ev) => {
+    if (ev.defaultPrevented || ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey)
+      return;
+    const a = ev.target.closest && ev.target.closest('a[target="_blank"]');
+    if (!a) return;
+    const href = a.getAttribute("href") || "";
+    if (!/^https?:\/\//i.test(href)) return;
+    ev.preventDefault();
+    openWebView(href);
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && !el("webview-overlay").hidden) closeWebView();
+  });
+}
+
 // custom window controls for the frameless Electron shell (no-op in a browser)
 const _WIN_MAX_ICON =
   '<svg viewBox="0 0 10 10"><rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="currentColor"/></svg>';
@@ -7067,6 +7232,7 @@ function initDesktopChrome() {
 
 function init() {
   initDesktopChrome();
+  initWebView();
   loadSettings();
   applyTheme();
   applyFont();
@@ -7410,6 +7576,7 @@ function init() {
   // Ctrl+Q records a reason
   loadAttn();
   document.addEventListener("keydown", onAttentionKey);
+  document.addEventListener("keydown", onSearchKey);
   initAttnModal();
   el("b-pdf-attach").addEventListener("click", () => attachPdfFile());
   el("b-pdf_file").addEventListener("keydown", (ev) => {

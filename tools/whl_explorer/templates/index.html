@@ -876,6 +876,9 @@
               <input id="set-whl-ocr" type="checkbox" />
               <label class="tool-label" for="set-preview-pages">PDF preview page limit</label>
               <input id="set-preview-pages" class="cad-input" type="number" min="1" max="500" step="5" />
+              <label class="tool-label" for="set-scan-recent">Scan attach: show PDFs from the last N minutes (0 = all)</label>
+              <input id="set-scan-recent" class="cad-input" type="number" min="0" max="1440" step="5"
+                     data-tip="The UPLD/SCAN file picker defaults to Downloads and lists only PDFs downloaded within this many minutes" />
               <label class="tool-label" for="set-preview-original">Preview the original (unmodified) PDF</label>
               <input id="set-preview-original" type="checkbox" />
               <label class="tool-label" for="set-keep-originals">Keep IA originals after a folder build</label>
@@ -1069,6 +1072,22 @@
       <span id="mode-tag" class="foot-tag" hidden></span>
       <span id="status-right"></span>
     </span>
+  </div>
+
+  <!-- EMBEDDED WEB VIEW (links open here instead of a new tab) -->
+  <div id="webview-overlay" class="overlay" hidden>
+    <div id="webview-window" class="win webview-win">
+      <div class="win-titlebar webview-bar">
+        <button id="webview-external" class="cad-btn tiny" type="button"
+                data-tip="Open in your browser">&#8599;</button>
+        <button id="webview-reload" class="cad-btn tiny" type="button"
+                data-tip="Reload">&#8635;</button>
+        <span id="webview-url" class="webview-url"></span>
+        <button id="webview-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
+      </div>
+      <iframe id="webview-frame" class="webview-frame" referrerpolicy="no-referrer"
+              sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox"></iframe>
+    </div>
   </div>
 
   <script src="{{ url_for('static', filename='app.js') }}?v={{ app_v }}"></script>

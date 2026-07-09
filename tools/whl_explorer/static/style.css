@@ -1253,6 +1253,35 @@ form.orig-view .cad-input {
   border-radius: var(--radius);
 }
 
+/* embedded web view */
+#webview-overlay { z-index: 60; padding: 4vh 12px; }
+.webview-win {
+  width: min(1500px, 94vw);
+  height: 90vh;
+  padding: 0;
+  overflow: hidden;
+}
+.webview-bar { justify-content: flex-start; gap: 6px; }
+.webview-bar .cad-btn { color: #fff; flex: 0 0 auto; }
+.webview-url {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: normal;
+  letter-spacing: 0;
+  font-size: 12px;
+  opacity: 0.92;
+}
+.webview-frame {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  border: 0;
+  background: #fff;
+}
+
 #msrc-overlay { z-index: 55; }
 #msrc-window { width: min(560px, 100%); }
 #msrc-body { padding: 10px; }
@@ -1344,6 +1373,16 @@ form.orig-view .cad-input {
 }
 .fb-row:hover { background: var(--blue); color: #fff; }
 .fb-row.dir { font-weight: bold; }
+/* recency-filter header note (non-interactive) */
+.fb-note {
+  padding: 3px 8px;
+  font-size: 11px;
+  font-style: italic;
+  color: var(--face-sh2);
+  border-bottom: 1px dotted #ccc;
+}
+/* the "show all" affordance is a clickable, de-emphasized row */
+.fb-row.note { font-style: italic; color: var(--face-sh2); }
 
 .empty {
   color: var(--face-sh2);
