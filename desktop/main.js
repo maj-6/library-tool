@@ -11,7 +11,7 @@
 // (sys.frozen) libcommon reads shipped assets from the bundle and writes state
 // to the per-user dir. So the shell stays tiny.
 
-const { app, BrowserWindow, dialog, shell, Menu } = require("electron");
+const { app, BrowserWindow, dialog, shell, Menu, ipcMain } = require("electron");
 const { spawn } = require("child_process");
 const path = require("path");
 const http = require("http");
@@ -23,6 +23,15 @@ let mainWindow = null;
 let sidecarPort = null;
 
 const isDev = !app.isPackaged;
+
+// custom title-bar controls (the window is frameless) driven from the renderer
+ipcMain.on("win:minimize", () => mainWindow && mainWindow.minimize());
+ipcMain.on("win:toggle-maximize", () => {
+  if (!mainWindow) return;
+  if (mainWindow.isMaximized()) mainWindow.unmaximize();
+  else mainWindow.maximize();
+});
+ipcMain.on("win:close", () => mainWindow && mainWindow.close());
 
 // a free loopback port so multiple installs / a running dev server never clash
 function freePort() {
@@ -104,6 +113,7 @@ function createWindow() {
     width: 1440, height: 920, minWidth: 900, minHeight: 600,
     title: "Catalog Explorer",
     backgroundColor: "#1d1f21",
+    frame: false,           // no OS chrome — the web UI's title bar is the frame
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -111,6 +121,9 @@ function createWindow() {
     },
   });
   Menu.setApplicationMenu(null);   // the web UI has its own menu bar
+  // keep the renderer's maximize/restore icon in sync with the real state
+  mainWindow.on("maximize", () => mainWindow.webContents.send("win:maximized", true));
+  mainWindow.on("unmaximize", () => mainWindow.webContents.send("win:maximized", false));
   mainWindow.loadURL(`http://127.0.0.1:${sidecarPort}/`);
   // open target=_blank / external links in the system browser, not a new window
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {

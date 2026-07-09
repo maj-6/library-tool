@@ -779,6 +779,32 @@ body {
 .tb-meta { font-weight: normal; opacity: 0.85; }
 .tb-right { display: flex; align-items: center; gap: 10px; }
 
+/* --- frameless desktop window: the title bar drags; controls don't --- */
+#titlebar { -webkit-app-region: drag; }
+#titlebar button, #titlebar input { -webkit-app-region: no-drag; }
+/* custom min/max/close — shown only inside the Electron shell (body.desktop) */
+.win-controls { display: none; align-self: stretch; margin: -4px -8px -4px 8px; }
+body.desktop .win-controls { display: inline-flex; }
+.win-btn {
+  -webkit-app-region: no-drag;
+  width: 44px;
+  border: 0;
+  background: transparent;
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+}
+.win-btn svg { width: 10px; height: 10px; display: block; }
+.win-btn svg rect, .win-btn svg path { stroke: currentColor; }
+.win-btn svg rect[fill]:not([fill="none"]) { fill: currentColor; }
+.win-btn:hover { background: rgba(255, 255, 255, 0.16); }
+.win-btn:active { background: rgba(255, 255, 255, 0.26); }
+.win-close:hover { background: #e81123; }
+.win-close:active { background: #c50e1f; }
+
 /* --- menu bar --- */
 #menubar {
   display: flex;

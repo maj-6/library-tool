@@ -7042,7 +7042,31 @@ function initMenubar() {
 
 // --- wire up ---------------------------------------------------------------
 
+// custom window controls for the frameless Electron shell (no-op in a browser)
+const _WIN_MAX_ICON =
+  '<svg viewBox="0 0 10 10"><rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="currentColor"/></svg>';
+const _WIN_RESTORE_ICON =
+  '<svg viewBox="0 0 10 10"><rect x="0.5" y="2.5" width="7" height="7" fill="none" stroke="currentColor"/>' +
+  '<path d="M2.5 2.5 V0.5 H9.5 V7.5 H7.5" fill="none" stroke="currentColor"/></svg>';
+
+function initDesktopChrome() {
+  const d = window.whlDesktop;
+  if (!d || !d.isDesktop || !d.win) return;   // a browser keeps its own chrome
+  document.body.classList.add("desktop");
+  const min = el("win-min"), max = el("win-max"), close = el("win-close");
+  if (min) min.onclick = () => d.win.minimize();
+  if (max) max.onclick = () => d.win.toggleMaximize();
+  if (close) close.onclick = () => d.win.close();
+  if (d.win.onMaximized) d.win.onMaximized((m) => {
+    if (!max) return;
+    max.innerHTML = m ? _WIN_RESTORE_ICON : _WIN_MAX_ICON;
+    max.title = m ? "Restore" : "Maximize";
+    max.setAttribute("aria-label", m ? "Restore" : "Maximize");
+  });
+}
+
 function init() {
+  initDesktopChrome();
   loadSettings();
   applyTheme();
   applyFont();
