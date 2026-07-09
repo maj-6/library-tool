@@ -111,6 +111,9 @@ const state = {
     colVis: {},                 // per-table column visibility
     colWidths: {},              // per-table column widths (px)
     whlCons: { title: false, authors: false, year: true },
+    sets: {},                   // multi-volume sets: baseKey -> {count, exp}
+    expandSets: false,          // expand multi-volume sets by default
+    hideVolTitles: false,       // hide the titles of individual volumes
   },
   editTarget: null,             // record open in the EDIT tab
   sort: { checked: null, whl: null },  // {key, dir} per top table
@@ -517,6 +520,10 @@ function normalizeSettings() {
   state.settings.checkedCols = state.settings.checkedCols || {};
   state.settings.whlCons = state.settings.whlCons ||
     { title: false, authors: false, year: true };
+  if (!state.settings.sets || typeof state.settings.sets !== "object")
+    state.settings.sets = {};
+  state.settings.expandSets = !!state.settings.expandSets;
+  state.settings.hideVolTitles = !!state.settings.hideVolTitles;
   state.settings.colVis = state.settings.colVis || {};
   state.settings.colWidths = state.settings.colWidths || {};
   // migrate the old single-table column setting
@@ -1154,6 +1161,17 @@ function renderSettings() {
       saveSettings();
     };
   }
+  // multi-volume set display prefs — re-render the checked table on change
+  for (const [id, k] of [["set-expand-sets", "expandSets"],
+                         ["set-hide-vol-titles", "hideVolTitles"]]) {
+    const n = el(id);
+    n.checked = !!state.settings[k];
+    n.onchange = () => {
+      state.settings[k] = n.checked;
+      saveSettings();
+      renderChecked();
+    };
+  }
 
   // APPEARANCE
   const themeSel = el("theme-select");
@@ -1674,6 +1692,97 @@ function combinedRows() {
   return rows;
 }
 
+// --- multi-volume sets -------------------------------------------------------
+// Books that share a base title (the title with any volume stripped) and carry
+// a volume number are grouped into a "set". Grouping is derived at render time;
+// only per-set state (defined count + expanded) and the two display prefs are
+// persisted, in settings, so they ride the client_state sync.
+
+function volNum(book) {
+  const n = parseInt(book && book.volume, 10);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+// the base title (volume stripped) used for display
+function setBaseTitle(book) {
+  let t = String((book && book.title) || "");
+  const v = extractVolume(t);
+  if (v && v.clean) t = v.clean;
+  return t.trim();
+}
+
+// stable, case/space-insensitive grouping key (base title only, per the spec)
+function setKeyOf(book) {
+  return setBaseTitle(book).toLowerCase().replace(/\s+/g, " ");
+}
+
+function setsMap() {
+  if (!state.settings.sets || typeof state.settings.sets !== "object")
+    state.settings.sets = {};
+  return state.settings.sets;
+}
+function setRec(key) { return setsMap()[key] || null; }
+function setDefinedCount(key) {
+  const r = setRec(key);
+  return r && r.count > 0 ? r.count : 0;
+}
+function setExpanded(key) {
+  const r = setRec(key);
+  return r && typeof r.exp === "boolean" ? r.exp : !!state.settings.expandSets;
+}
+function setSetExpanded(key, val) {
+  const m = setsMap();
+  m[key] = Object.assign({}, m[key], { exp: !!val });
+  saveSettings();
+}
+function setSetCount(key, count) {
+  const m = setsMap();
+  m[key] = Object.assign({}, m[key], { count: Math.max(0, count | 0) });
+  saveSettings();
+}
+
+function firstVal(rows, f) {
+  for (const r of rows) { const v = (r.book && r.book[f]) || ""; if (v) return v; }
+  return "";
+}
+
+// group a flat (already filtered/sorted) row list into an ordered display list:
+//   { type:"row", row } | { type:"set", key, title, author, publisher,
+//                            count, expanded, vols:[row...] }
+// Only rows that carry a volume number join a group; a group becomes a rendered
+// set once it has >=2 volumes present OR a defined count of >=2.
+function groupSets(rows) {
+  const groups = new Map();
+  for (const r of rows) {
+    if (volNum(r.book) <= 0) continue;
+    const key = setKeyOf(r.book);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(r);
+  }
+  const isSet = (key) =>
+    (groups.get(key) || []).length >= 2 || setDefinedCount(key) >= 2;
+  const out = [], emitted = new Set();
+  for (const r of rows) {
+    const key = volNum(r.book) > 0 ? setKeyOf(r.book) : null;
+    if (key && isSet(key)) {
+      if (emitted.has(key)) continue;   // emit the set at its first member
+      emitted.add(key);
+      const vols = groups.get(key).slice()
+        .sort((a, b) => volNum(a.book) - volNum(b.book));
+      const maxVol = vols.reduce((m, x) => Math.max(m, volNum(x.book)), 0);
+      const count = Math.max(setDefinedCount(key), vols.length, maxVol);
+      out.push({
+        type: "set", key, title: setBaseTitle(vols[0].book),
+        author: firstVal(vols, "author"), publisher: firstVal(vols, "publisher"),
+        count, expanded: setExpanded(key), vols,
+      });
+    } else {
+      out.push({ type: "row", row: r });
+    }
+  }
+  return out;
+}
+
 // --- "needs attention" marks (press Q while hovering a row) ---------------------
 // Checked/manual rows and builder entries persist their flag on the data;
 // every other table keeps a lightweight browser-side mark keyed per row.
@@ -2003,6 +2112,80 @@ function filteredCheckedRows() {
   return rows;
 }
 
+// build a normal (or volume-child) row <tr>
+function checkedRowTr(row, cmode, opts) {
+  opts = opts || {};
+  const b = row.book;
+  const tr = document.createElement("tr");
+  tr.dataset.rowId = row.id;
+  if (row.kind === "manual") tr.classList.add("is-manual");
+  if (opts.isVol) {
+    tr.classList.add("set-vol", "set-open");
+    if (opts.setKey) tr.dataset.setKey = opts.setKey;
+  }
+  if (row.attention) {
+    tr.classList.add("attention");
+    const why = attnReason(row.attention);
+    if (why) tr.dataset.tip = "Needs attention: " + why;
+  }
+  if (cmode === "search" && state.checkedSelected === String(row.id))
+    tr.classList.add("whl-selected");
+  const editable = (f) =>
+    cmode === "search" || (row.kind === "manual" && f === "acquired")
+      ? "" : ` class="editable" data-edit="${f}"`;
+  // volume titles are implied by the set header — optionally hide them
+  const hideTitle = opts.isVol && !!state.settings.hideVolTitles;
+  const cell = (f) => {
+    const val = f === "title" && hideTitle ? "" : b[f];
+    return f === "title" && cmode === "search"
+      ? `<td data-csearch="1">${esc(val)}</td>`
+      : `<td${editable(f)}>${esc(val)}</td>`;
+  };
+  tr.innerHTML = `
+    <td>${row.kind === "manual" ? "MANUAL"
+      : row.source === "ch_library" ? "MASTER" : esc(row.source.toUpperCase())}</td>
+    ${BOOK_COLS.map(cell).join("\n      ")}
+    <td class="col-whl">${copyrightBadge(row.checks)}</td>
+    <td class="col-whl">${whlBadge(row)}</td>
+    <td class="col-whl">${iaCell(row)}</td>
+    <td class="col-whl">${scanBadge(row, "hathitrust")}</td>
+    <td class="col-whl">${markCell(row)}</td>
+    <td class="col-act">
+      ${row.kind === "manual"
+        ? `<button class="cad-btn tiny icon-btn danger" data-mdel="${esc(row.id)}" data-tip="Delete this manual entry">${ICONS.trash}</button>`
+        : `<button class="cad-btn tiny icon-btn" data-unchk="${esc(row.id)}" data-tip="Remove from checked books">${ICONS.remove}</button>`}
+    </td>`;
+  return tr;
+}
+
+// build a set-header <tr>: colored tag, drop-down arrow, base title + (N)
+function checkedSetHeaderTr(item, cmode) {
+  const tr = document.createElement("tr");
+  tr.className = "set-header" + (item.expanded ? " set-open" : "");
+  tr.dataset.setKey = item.key;
+  const arrow = item.expanded ? "▾" : "▸";   // down / right triangle
+  const titleCell =
+    `<td class="set-title-cell">` +
+      `<span class="set-arrow">${arrow}</span>` +
+      `<span class="set-title">${esc(item.title)}</span> ` +
+      `<span class="set-count">(${item.count})</span></td>`;
+  const cells = BOOK_COLS.map((f) =>
+    f === "title" ? titleCell
+      : f === "author" ? `<td>${esc(item.author)}</td>`
+      : f === "publisher" ? `<td>${esc(item.publisher)}</td>`
+      : "<td></td>").join("\n      ");
+  tr.innerHTML = `
+    <td class="set-src"><span class="set-tag" title="Multi-volume set"></span></td>
+    ${cells}
+    <td class="col-whl"></td>
+    <td class="col-whl"></td>
+    <td class="col-whl"></td>
+    <td class="col-whl"></td>
+    <td class="col-whl"></td>
+    <td class="col-act"></td>`;
+  return tr;
+}
+
 function renderChecked() {
   // Background re-renders must not destroy an in-progress cell edit.
   const active = document.activeElement;
@@ -2023,39 +2206,19 @@ function renderChecked() {
 
   el("checked-empty").hidden = rows.length !== 0;
 
-  for (const row of rows) {
-    const b = row.book;
-    const tr = document.createElement("tr");
-    tr.dataset.rowId = row.id;
-    if (row.kind === "manual") tr.classList.add("is-manual");
-    if (row.attention) {
-      tr.classList.add("attention");
-      const why = attnReason(row.attention);
-      if (why) tr.dataset.tip = "Needs attention: " + why;
+  for (const item of groupSets(rows)) {
+    if (item.type === "set") {
+      tbody.appendChild(checkedSetHeaderTr(item, cmode));
+      if (item.expanded) {
+        item.vols.forEach((vr, i) => {
+          const tr = checkedRowTr(vr, cmode, { isVol: true, setKey: item.key });
+          if (i === item.vols.length - 1) tr.classList.add("set-last");
+          tbody.appendChild(tr);
+        });
+      }
+    } else {
+      tbody.appendChild(checkedRowTr(item.row, cmode, {}));
     }
-    if (cmode === "search" && state.checkedSelected === String(row.id))
-      tr.classList.add("whl-selected");
-    const editable = (f) =>
-      cmode === "search" || (row.kind === "manual" && f === "acquired")
-        ? "" : ` class="editable" data-edit="${f}"`;
-    const cell = (f) => f === "title" && cmode === "search"
-      ? `<td data-csearch="1">${esc(b[f])}</td>`
-      : `<td${editable(f)}>${esc(b[f])}</td>`;
-    tr.innerHTML = `
-      <td>${row.kind === "manual" ? "MANUAL"
-        : row.source === "ch_library" ? "MASTER" : esc(row.source.toUpperCase())}</td>
-      ${BOOK_COLS.map(cell).join("\n      ")}
-      <td class="col-whl">${copyrightBadge(row.checks)}</td>
-      <td class="col-whl">${whlBadge(row)}</td>
-      <td class="col-whl">${iaCell(row)}</td>
-      <td class="col-whl">${scanBadge(row, "hathitrust")}</td>
-      <td class="col-whl">${markCell(row)}</td>
-      <td class="col-act">
-        ${row.kind === "manual"
-          ? `<button class="cad-btn tiny icon-btn danger" data-mdel="${esc(row.id)}" data-tip="Delete this manual entry">${ICONS.trash}</button>`
-          : `<button class="cad-btn tiny icon-btn" data-unchk="${esc(row.id)}" data-tip="Remove from checked books">${ICONS.remove}</button>`}
-      </td>`;
-    tbody.appendChild(tr);
   }
 
   applyTableChrome("checked");
@@ -2065,7 +2228,9 @@ function renderChecked() {
 
 // One delegated handler covers verify markers / delete / uncheck / edit clicks.
 function onCheckedClick(ev) {
+  const setHdr = ev.target.closest("tr.set-header");
   if (ev.ctrlKey || ev.metaKey) {
+    if (setHdr) { ev.preventDefault(); openSetEditTab(setHdr.dataset.setKey); return; }
     const tr = ev.target.closest("tr");
     if (tr && tr.dataset.rowId) {
       ev.preventDefault();
@@ -2073,6 +2238,8 @@ function onCheckedClick(ev) {
     }
     return;
   }
+  // plain click anywhere on a set header (arrow, tag, title) expands/collapses it
+  if (setHdr) { toggleSet(setHdr.dataset.setKey); return; }
   const mark = ev.target.closest(".vmark");
   if (mark) {
     const unit = mark.closest("[data-vsrc]");
@@ -2131,6 +2298,7 @@ function selectCheckedSearchRow(id) {
     verbatim: !!cons.title,
     author: cons.authors ? row.book.author : "",
     year: cons.year ? row.book.year : "",
+    volume: row.book.volume || "",
   };
   setSearchPane(true);
   const tabs = bottomTabs();
@@ -2493,6 +2661,8 @@ async function olRealtime() {
   if (ov && ov.verbatim) params.set("title_verbatim", "1");
   if (q.author) params.set("author", q.author);
   if (q.year) params.set("year", q.year);
+  // a selected volume narrows the match to its volume number
+  if (ov && ov.volume) params.set("volume", ov.volume);
   for (const f of ["author", "publisher", "city", "year", "edition", "volume"]) {
     const v = el("s-" + f).value.trim();
     if (v && !params.has(f)) params.set(f, v);
@@ -2878,6 +3048,7 @@ function selectWhlSearchRow(idx) {
     verbatim: !!cons.title,
     author: cons.authors ? row.authors : "",
     year: cons.year ? row.year : "",
+    volume: row.volume || "",
   };
   setSearchPane(true);
   const tabs = bottomTabs();
@@ -3043,8 +3214,137 @@ function showEditForms(kind) {
   }
   el("whledit-tab").hidden = false;
   el("whledit-form").hidden = kind !== "whl";
-  el("bookedit-form").hidden = kind === "whl";
+  el("setedit-form").hidden = kind !== "set";
+  el("bookedit-form").hidden = kind === "whl" || kind === "set";
   switchPaneTab("pane-edit");
+}
+
+// --- multi-volume set editor -------------------------------------------------
+
+// current volume rows of a set (share the base key, carry a volume), vol-sorted
+function setMembers(key) {
+  return combinedRows()
+    .filter((r) => volNum(r.book) > 0 && setKeyOf(r.book) === key)
+    .sort((a, b) => volNum(a.book) - volNum(b.book));
+}
+
+function toggleSet(key) {
+  if (!key) return;
+  setSetExpanded(key, !setExpanded(key));
+  renderChecked();
+}
+
+// update a checked catalog book's metadata + queue a fresh check
+function updateCheckedBook(id, fields) {
+  const entry = state.checked.get(id);
+  if (!entry) return;
+  trackChecked(`edit ${(fields.title || entry.book.title || "").slice(0, 36)}`, id, () => {
+    entry.book = Object.assign({}, entry.book, fields);
+    entry.checks = null; entry.scans = null; entry.verify = null;
+    queueScan(id);
+  });
+  saveChecked();
+}
+
+// POST a new manual book (used to autofill a set's missing volumes)
+async function createManualBook(book) {
+  try {
+    const res = await fetch("/api/manual", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(parseBook(book)),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.ok) {
+      state.manual.unshift(data.entry);
+      queueScan(data.entry.id);
+      return data.entry;
+    }
+  } catch (e) { /* offline / failed — skip */ }
+  return null;
+}
+
+// ensure a set has volumes 1..count, creating missing ones as manual books
+// autofilled from the shared title/author/publisher
+async function ensureSetVolumes(key, count, shared) {
+  const have = new Set(setMembers(key).map((r) => volNum(r.book)));
+  let created = 0;
+  for (let v = 1; v <= count; v++) {
+    if (have.has(v)) continue;
+    if (await createManualBook({
+      title: shared.title, author: shared.author || "",
+      publisher: shared.publisher || "", volume: String(v),
+    })) created++;
+  }
+  return created;
+}
+
+function openSetEditTab(key) {
+  const vols = setMembers(key);
+  if (!vols.length) return;
+  const title = setBaseTitle(vols[0].book);
+  state.editTarget = { kind: "set", key };
+  el("whledit-note").textContent = `Multi-volume set :: ${title.slice(0, 60)}`;
+  el("es-title").value = title;
+  el("es-author").value = firstVal(vols, "author");
+  el("es-publisher").value = firstVal(vols, "publisher");
+  const maxVol = vols.reduce((m, x) => Math.max(m, volNum(x.book)), 0);
+  el("es-count").value = Math.max(setDefinedCount(key), vols.length, maxVol);
+  el("setedit-msg").textContent = "";
+  showEditForms("set");
+  el("es-title").focus();
+}
+
+async function saveSetEditTab(ev) {
+  ev.preventDefault();
+  const t = state.editTarget;
+  if (!t || t.kind !== "set") return;
+  const title = el("es-title").value.trim();
+  const author = el("es-author").value.trim();
+  const publisher = el("es-publisher").value.trim();
+  const count = Math.max(1, Math.min(99, parseInt(el("es-count").value, 10) || 1));
+  if (!title) { el("setedit-msg").textContent = "Title is required"; return; }
+  el("setedit-msg").textContent = "Saving ...";
+
+  // apply the shared fields to every existing volume
+  for (const r of setMembers(t.key)) {
+    const fields = {};
+    if (title !== setBaseTitle(r.book)) fields.title = title;
+    if (author && author !== (r.book.author || "")) fields.author = author;
+    if (publisher && publisher !== (r.book.publisher || "")) fields.publisher = publisher;
+    if (!Object.keys(fields).length) continue;
+    if (r.kind === "manual") await patchManualFields(r.id, fields);
+    else updateCheckedBook(r.id, fields);
+  }
+  // a title change re-keys the set; move its persisted state across
+  const newKey = title.toLowerCase().replace(/\s+/g, " ").trim();
+  if (newKey !== t.key) {
+    const m = setsMap();
+    if (m[t.key]) { m[newKey] = m[t.key]; delete m[t.key]; }
+    t.key = newKey;
+  }
+  setSetCount(newKey, count);
+  const created = await ensureSetVolumes(newKey, count, { title, author, publisher });
+  renderChecked();
+  el("setedit-msg").textContent = created
+    ? `Saved — ${created} volume${created > 1 ? "s" : ""} autofilled`
+    : "Saved";
+  status(`SET SAVED :: ${title} (${count})`);
+}
+
+// promote a single book to an N-volume set from the book editor's "# volumes"
+async function promoteRowToSet(rowId, vals, count) {
+  const row = state.rowsById.get(String(rowId));
+  if (!row) return;
+  if (volNum(row.book) <= 0) {   // the anchor becomes volume 1
+    if (row.kind === "manual") await patchManualFields(rowId, { volume: "1" });
+    else updateCheckedBook(rowId, { volume: "1" });
+  }
+  const key = setKeyOf({ title: vals.title });
+  setSetCount(key, count);
+  await ensureSetVolumes(key, count,
+    { title: vals.title, author: vals.author, publisher: vals.publisher });
+  renderChecked();
 }
 
 function openWhlEditTab(idx) {
@@ -3072,6 +3372,15 @@ function fillBookEditForm(book, showAcquired) {
 }
 
 // a checked-books / manual row
+// how many volumes the book's set holds today (1 = not a set)
+function bookSetCount(book) {
+  const key = setKeyOf(book);
+  const members = combinedRows()
+    .filter((r) => volNum(r.book) > 0 && setKeyOf(r.book) === key);
+  const maxVol = members.reduce((m, x) => Math.max(m, volNum(x.book)), 0);
+  return Math.max(setDefinedCount(key), maxVol, volNum(book), 1);
+}
+
 function openBookEditTab(rowId) {
   const row = state.rowsById.get(String(rowId));
   if (!row) return;
@@ -3080,6 +3389,7 @@ function openBookEditTab(rowId) {
     `${row.kind === "manual" ? "Manual entry" : "Checked book"} :: ` +
     `${(row.book.title || "").slice(0, 60)}`;
   fillBookEditForm(row.book, row.kind !== "manual");
+  el("e-setcount").value = bookSetCount(row.book);
   showEditForms("book");
   el("e-title").focus();
 }
@@ -3094,6 +3404,7 @@ function openChEditTab(idx) {
   const existing = state.checked.get(ckey("ch_library", idx));
   // prefill matches what the table shows: the parsed title/subtitle/vol/ed
   fillBookEditForm(existing ? existing.book : parseBook(book), true);
+  el("e-setcount").value = volNum(existing ? existing.book : book) || 1;
   showEditForms("book");
   el("e-title").focus();
 }
@@ -3122,6 +3433,8 @@ async function saveBookEditTab(ev) {
   const vals = {};
   for (const f of BOOK_EDIT_FIELDS) vals[f] = el("e-" + f).value.trim();
   if (!vals.title) { el("bookedit-msg").textContent = "Title is required"; return; }
+  // "Volumes in set" >= 2 turns this book into (or updates) a multi-volume set
+  const setCount = Math.max(1, Math.min(99, parseInt(el("e-setcount").value, 10) || 1));
 
   if (t.kind === "row") {
     const row = state.rowsById.get(t.id);
@@ -3137,7 +3450,8 @@ async function saveBookEditTab(ev) {
         pushOp(`edit entry ${vals.title.slice(0, 32)}`,
           () => patchManualFields(t.id, before),
           () => patchManualFields(t.id, fields));
-        el("bookedit-msg").textContent = "Saved";
+        if (setCount >= 2) await promoteRowToSet(t.id, vals, setCount);
+        el("bookedit-msg").textContent = setCount >= 2 ? "Saved as set" : "Saved";
         status(`ENTRY SAVED :: ${vals.title} :: RESCANNING`);
       } else {
         el("bookedit-msg").textContent = "Save failed";
@@ -3156,7 +3470,8 @@ async function saveBookEditTab(ev) {
     });
     saveChecked();
     renderChecked();
-    el("bookedit-msg").textContent = "Saved";
+    if (setCount >= 2) await promoteRowToSet(t.id, vals, setCount);
+    el("bookedit-msg").textContent = setCount >= 2 ? "Saved as set" : "Saved";
     status(`BOOK SAVED :: ${vals.title} :: RESCANNING`);
     return;
   }
@@ -6748,6 +7063,7 @@ function init() {
   });
   el("whledit-form").addEventListener("submit", saveWhlEditTab);
   el("bookedit-form").addEventListener("submit", saveBookEditTab);
+  el("setedit-form").addEventListener("submit", saveSetEditTab);
   for (const [box, key] of CONS_BOXES) {
     el(box).addEventListener("change", () => {
       // read/write the LIVE settings object — a captured reference would

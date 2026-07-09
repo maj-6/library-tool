@@ -1146,6 +1146,38 @@ tr.whl-selected {
 }
 td[data-wsearch], td[data-csearch] { cursor: pointer; text-decoration: underline dotted; }
 
+/* --- multi-volume sets --- */
+.grid tbody tr.set-header {
+  cursor: pointer;
+  background: var(--row-checked);
+  font-weight: 600;
+}
+.grid tbody tr.set-header:hover { filter: brightness(1.05); }
+/* small colored tag on the left of a set row */
+.set-tag {
+  display: inline-block;
+  width: 10px; height: 15px;
+  border-radius: 2px;
+  background: var(--cyan);
+  vertical-align: middle;
+}
+.set-arrow {
+  display: inline-block;
+  width: 1em;
+  color: var(--face-sh2);
+  user-select: none;
+}
+.set-count { font-style: italic; color: var(--face-sh2); }
+/* the individual volumes of an expanded set are tinted light gray */
+.grid tbody tr.set-vol { background: rgba(128, 128, 128, 0.15); }
+/* a dotted bounding box drawn around an expanded set (header + its volumes) */
+.grid tbody tr.set-header.set-open td { border-top: 1px dashed var(--cyan); }
+.grid tbody tr.set-header.set-open td:first-child,
+.grid tbody tr.set-vol.set-open td:first-child { border-left: 1px dashed var(--cyan); }
+.grid tbody tr.set-header.set-open td:last-child,
+.grid tbody tr.set-vol.set-open td:last-child { border-right: 1px dashed var(--cyan); }
+.grid tbody tr.set-vol.set-last td { border-bottom: 1px dashed var(--cyan); }
+
 /* the Alt view of an original (pre-correction) record */
 tr.orig-view {
   background: rgba(216, 178, 0, 0.16) !important;

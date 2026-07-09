@@ -413,3 +413,20 @@ is decided by a tolerant composite rather than exact strings:
   a detached whlCons copy the search never read. The handler now reads/writes
   the live state.settings.whlCons, and the boxes are re-synced after adoption
   (syncConsCheckboxes).
+- Multi-volume sets in the Checked books + manual table. Books that share a
+  base title (title with the volume stripped, case/space-insensitive) and
+  carry a volume number group under one set header (colored tag, base title,
+  italic volume count "(N)"); grouping is derived at render, keyed by base
+  title only. A group renders as a set once it has >=2 present volumes or a
+  defined count >=2; the header expands/collapses (dotted bounding box, gray
+  volume rows), state per-set in settings.sets ({count, exp}). Ctrl+click a
+  set header opens a set editor (title/author/publisher/# volumes) that
+  applies the shared fields to every volume and autofills missing volumes as
+  manual books (author/publisher carried over); it never deletes on a
+  decrease. The book editor gained a "Volumes in set" field that promotes a
+  single book (it becomes vol 1). Volume-aware search adds the selected
+  volume's number to the OL query. Two TABLE-VIEW settings: expand sets by
+  default, hide individual volume titles. server.py gained a WHL_PORT env so
+  a throwaway test instance can run on a separate origin (distinct
+  localStorage) against a scratch WHL_DATA_ROOT — the required isolation for
+  testing state-mutating UI without touching live data.

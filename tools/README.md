@@ -130,7 +130,22 @@ UI conventions used everywhere:
   its right. Every table has a **column-visibility icon** in the bar
   above it. The maximum number of displayed rows is a setting (TABLE
   VIEW).
-- **Ctrl+click a row in any table to open it in the EDIT tab**.
+- **Ctrl+click a row in any table to open it in the EDIT tab** (Ctrl+click a
+  multi-volume *set header* opens the set editor instead — see below).
+- **Multi-volume sets** (Checked books + manual table): books that share a
+  base title (the title with its volume stripped) and carry a volume number
+  are grouped under one **set header** — a colored tag on the left, the base
+  title, and the volume count in italic *(N)*. Click the header (or its
+  arrow) to expand/collapse; an expanded set draws a dotted box around its
+  volumes and tints them gray. A book with a volume number auto-joins its
+  set (created on demand). **Ctrl+click a set header** opens the set editor
+  (title / author / publisher / number of volumes); raising the volume count
+  autofills the missing volumes as manual books (author/publisher carried
+  over) — it never deletes on a decrease. The normal book editor has a
+  **Volumes in set** field that promotes a single book into a set the same
+  way. Search in a set's volume adds its volume number to the Open Library
+  query. Two TABLE-VIEW settings: expand every set by default, and hide the
+  (implied) titles on individual volume rows.
 - Status tags are fixed-width and abbreviated; a tag that matched a record
   is itself the link to that record.
 - **Undo/Redo** (tab-strip icons, EDIT menu, Ctrl+Z / Ctrl+Y) covers
