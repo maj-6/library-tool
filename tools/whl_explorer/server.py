@@ -507,14 +507,13 @@ def api_build_folder_sync(build_id: str):
                     b["updated_at"] = datetime.now(timezone.utc).isoformat(
                         timespec="seconds")
                     lib.save_json(BUILDS_PATH, builds)
-                    catalog = lib.load_json(lib.IA_CATALOG_PATH, {})
-                    stale = [k for k, v in catalog.items()
-                             if (lib.DATA_ROOT / str(v.get("saved_as") or "?")).resolve()
-                             == srcr]
-                    for k in stale:
-                        del catalog[k]
-                    if stale:
-                        lib.save_json(lib.IA_CATALOG_PATH, catalog)
+
+                    def _drop_stale(catalog):
+                        for k in [k for k, v in catalog.items()
+                                  if (lib.DATA_ROOT / str(v.get("saved_as") or "?")).resolve()
+                                  == srcr]:
+                            del catalog[k]
+                    _update_ia_catalog(_drop_stale)
             except Exception as exc:
                 notes.append(f"original cleanup failed: {exc}")
     out = _entry_folder_info(build_id)
@@ -1360,6 +1359,23 @@ def api_manual_source(entry_id: str):
 _downloads: dict[str, dict] = {}
 _downloads_lock = threading.Lock()
 
+# The IA download catalog is a single shared JSON file written by concurrent
+# download threads + the preview/folder-build endpoints; serialize every
+# read-modify-write so a save can't drop another writer's entry or be read mid-write.
+_ia_catalog_lock = threading.Lock()
+
+
+def _read_ia_catalog() -> dict:
+    with _ia_catalog_lock:
+        return lib.load_json(lib.IA_CATALOG_PATH, {})
+
+
+def _update_ia_catalog(mutate) -> None:
+    with _ia_catalog_lock:
+        catalog = lib.load_json(lib.IA_CATALOG_PATH, {})
+        mutate(catalog)
+        lib.save_json(lib.IA_CATALOG_PATH, catalog)
+
 
 def _ia_get_json(url: str) -> dict:
     req = urllib.request.Request(url, headers={"User-Agent": scan_search.USER_AGENT})
@@ -1426,8 +1442,7 @@ def _ia_download_job(identifier: str, book: dict) -> None:
 
         # Cataloging entry: our book metadata + where the scan came from.
         meta = info.get("metadata") or {}
-        catalog = lib.load_json(lib.IA_CATALOG_PATH, {})
-        catalog[identifier] = {
+        entry = {
             "identifier": identifier,
             "source_url": f"https://archive.org/details/{identifier}",
             "pdf_file": name,
@@ -1440,7 +1455,7 @@ def _ia_download_job(identifier: str, book: dict) -> None:
             "ia_date": meta.get("date", ""),
             "book": book,
         }
-        lib.save_json(lib.IA_CATALOG_PATH, catalog)
+        _update_ia_catalog(lambda c: c.__setitem__(identifier, entry))
         job["status"] = "done"
         job["path"] = str(dest.relative_to(lib.DATA_ROOT))
     except Exception as exc:
@@ -1452,7 +1467,7 @@ def _download_state(identifier: str) -> dict:
     job = _downloads.get(identifier)
     if job:
         return {"identifier": identifier, **{k: v for k, v in job.items() if k != "thread"}}
-    catalog = lib.load_json(lib.IA_CATALOG_PATH, {})
+    catalog = _read_ia_catalog()
     if identifier in catalog and _ia_pdf_path(identifier).exists():
         return {"identifier": identifier, "status": "done",
                 "path": catalog[identifier].get("saved_as", ""),
@@ -1473,10 +1488,12 @@ def api_ia_preview(identifier: str):
         rel = str(prev.relative_to(lib.DATA_ROOT))
         from pypdf import PdfReader
         pages = len(PdfReader(str(prev)).pages)
-        catalog = lib.load_json(lib.IA_CATALOG_PATH, {})
+        catalog = _read_ia_catalog()
         if identifier in catalog and catalog[identifier].get("preview") != rel:
-            catalog[identifier]["preview"] = rel
-            lib.save_json(lib.IA_CATALOG_PATH, catalog)
+            def _set_preview(c):
+                if identifier in c:
+                    c[identifier]["preview"] = rel
+            _update_ia_catalog(_set_preview)
         return jsonify({"ok": True, "preview": rel, "pages": pages})
     except Exception as exc:
         return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
@@ -1507,7 +1524,7 @@ def api_ia_download_status(identifier: str):
 
 @app.route("/api/ia/downloads")
 def api_ia_downloads():
-    return jsonify(lib.load_json(lib.IA_CATALOG_PATH, {}))
+    return jsonify(_read_ia_catalog())
 
 
 # --- Open Library indexes (constrained search + realtime + autocomplete) --------

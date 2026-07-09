@@ -1405,9 +1405,16 @@ function renderSettings() {
     sr.value = state.settings.scanRecentMin;
     saveSettings();
   };
+  // auto-IA-download toggle: disabling it must also drop anything still queued
+  const autoDl = el("set-auto-ia-dl");
+  autoDl.checked = state.settings.autoIaDownload !== false;
+  autoDl.onchange = () => {
+    state.settings.autoIaDownload = autoDl.checked;
+    if (!autoDl.checked) { state.autoDlQueue = []; updateDlProgress(); }
+    saveSettings();
+  };
   for (const [id, k] of [["set-preview-original", "previewOriginal"],
                          ["set-keep-originals", "keepOriginals"],
-                         ["set-auto-ia-dl", "autoIaDownload"],
                          ["set-trim-blank", "trimBlank"]]) {
     const n = el(id);
     n.checked = !!state.settings[k];
@@ -5392,21 +5399,28 @@ async function downloadApproved() {
 // small concurrency cap keeps it from hammering archive.org / the disk.
 const AUTO_DL_MAX = 2;
 
-function maybeAutoDownloadIa(row) {
-  if (!state.settings.autoIaDownload) return;
-  const s = row && row.scans && row.scans.internet_archive;
-  if (!s || s.available !== true) return;           // only a genuinely-found source
-  const ident = iaIdentifierForRow(row);
+// enqueue one background download (deduped); the single entry point so every
+// caller (auto-scan + viewer fallback) shares the AUTO_DL_MAX cap + accounting
+function enqueueAutoDl(ident, book) {
   if (!ident) return;
   if (state.downloadedIds.has(ident)) return;       // already saved
   if (state.downloads.get(ident)) return;           // already known (in-flight/errored)
   if (state.autoDlActive.has(ident)) return;
   if (state.autoDlQueue.some((q) => q.ident === ident)) return;
-  state.autoDlQueue.push({ ident, book: row.book || {} });
+  state.autoDlQueue.push({ ident, book: book || {} });
   pumpAutoDl();
 }
 
+function maybeAutoDownloadIa(row) {
+  if (!state.settings.autoIaDownload) return;
+  const s = row && row.scans && row.scans.internet_archive;
+  if (!s || s.available !== true) return;           // only a genuinely-found source
+  enqueueAutoDl(iaIdentifierForRow(row), row.book || {});
+}
+
 function pumpAutoDl() {
+  // disabling the setting mid-run abandons anything still queued
+  if (!state.settings.autoIaDownload) { state.autoDlQueue = []; updateDlProgress(); return; }
   while (state.autoDlActive.size < AUTO_DL_MAX && state.autoDlQueue.length) {
     const { ident, book } = state.autoDlQueue.shift();
     if (state.downloadedIds.has(ident) || state.autoDlActive.has(ident) ||
@@ -5459,7 +5473,8 @@ async function processScanQueue() {
     try {
       const scans = await runRowScans(row);
       status(`AUTO SCAN DONE :: ${row.book.title} :: ${scanStatusLine(scans)}`);
-      maybeAutoDownloadIa(row);   // found an IA source -> background-download it
+      // rowById()'s row has no scans field — pass the freshly-fetched ones
+      maybeAutoDownloadIa({ ...row, scans });   // found an IA source -> background-download it
     } catch (e) {
       status(`AUTO SCAN FAILED :: ${row.book.title}`);
     }
@@ -8161,12 +8176,9 @@ async function showIaPreview(ident, data) {
     ? "/api/pdf?url=" + encodeURIComponent(data.pdf) + "&preview=1"
     : "/api/webview?url=" + encodeURIComponent(
         (data && data.details) || ("https://archive.org/details/" + ident));
-  // no local copy yet — kick off a background download so the framed preview
-  // (and its compressed 10-page copy) is ready next time
-  if (state.settings.autoIaDownload && !state.downloadedIds.has(ident) &&
-      !(state.downloads.get(ident) || {}).status) {
-    startDownload(ident, {});
-  }
+  // no local copy yet — queue a background download (shares the cap/accounting)
+  // so the framed preview (and its compressed 10-page copy) is ready next time
+  if (state.settings.autoIaDownload) enqueueAutoDl(ident, {});
 }
 
 async function openIaViewer(ident) {
