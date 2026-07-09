@@ -1073,26 +1073,35 @@ main {
 .grid th.col-whl, .grid td.col-whl { width: 58px; }
 .grid th.col-act, .grid td.col-act { width: 40px; }
 
-/* copyright split tag: left half = registration record, right half = renewal */
+/* copyright tag: a diagonal split — top-left = registration, bottom-right = renewal.
+   Square so the split is a true 45° line; a single solid tag (cr-mono) when both
+   halves are the same colour, so there's no divider. */
 .cr-tag {
-  display: inline-flex;
-  width: 42px;
-  height: 14px;
+  position: relative;
+  display: inline-block;
+  width: 15px;
+  height: 15px;
   border-radius: 3px;
   overflow: hidden;
   border: 1px solid var(--face-sh2);
   vertical-align: middle;
 }
-.cr-tag .cr-left, .cr-tag .cr-right { flex: 1 1 50%; }
-.cr-tag .cr-left { border-right: 1px solid rgba(0, 0, 0, 0.28); }
-.cr-blue { background: #3b7dd8; }
-.cr-yellow { background: #e6c34a; }
-.cr-gray { background: #b0b0b0; }
-.cr-red { background: #d64545; }
-.cr-green { background: #4a9e5c; }
-.cr-pending {
-  background: repeating-linear-gradient(45deg, #d8d8d8, #d8d8d8 3px, #ececec 3px, #ececec 6px);
+.cr-tag.cr-split .cr-left, .cr-tag.cr-split .cr-right { position: absolute; inset: 0; }
+.cr-tag.cr-split .cr-left { clip-path: polygon(0 0, 100% 0, 0 100%); }        /* top-left */
+.cr-tag.cr-split .cr-right { clip-path: polygon(100% 0, 100% 100%, 0 100%); }  /* bottom-right */
+.cr-tag.cr-split::after {   /* the diagonal divider (only on differing-colour tags) */
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background: linear-gradient(to bottom right,
+    transparent calc(50% - 0.7px), rgba(0, 0, 0, 0.4) calc(50% - 0.7px),
+    rgba(0, 0, 0, 0.4) calc(50% + 0.7px), transparent calc(50% + 0.7px));
 }
+.cr-blue    { background: #3f76c8; }
+.cr-yellow  { background: #e3bf3e; }
+.cr-gray    { background: #adadad; }
+.cr-green   { background: #46955a; }
+.cr-magenta { background: #c0399b; }
+.cr-orange  { background: #e08a2b; }
+.cr-pending { background: repeating-linear-gradient(45deg, #d8d8d8, #d8d8d8 3px, #ececec 3px, #ececec 6px); }
 
 /* --- History tab --- */
 .hist-row { cursor: pointer; }

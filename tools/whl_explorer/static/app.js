@@ -896,7 +896,7 @@ const WHL_COLS = [
   ["src", "Src"], ["title", "Title"], ["subtitle", "Subtitle"],
   ["authors", "Authors"], ["year", "Year"], ["publisher", "Publisher"],
   ["pages", "Pages"], ["lang", "Lang"], ["subject", "Subject"],
-  ["description", "Description"], ["status", "Status"],
+  ["description", "Description"], ["status", "Status"], ["copyright", "©"],
 ];
 const UPLOAD_COLS = [
   ["title", "Title"], ["subtitle", "Subtitle"], ["author", "Author"],
@@ -908,8 +908,8 @@ const UPLOAD_COLS = [
 // column per table stretches to absorb leftover width so the table never
 // leaves empty space on its right — the Title column by default.
 const LOCKED_COLS = {
-  checked: { copyright: 58, whl: 58, ia: 58, ht: 58, mark: 58, action: 40 },
-  whl: { status: 58 },
+  checked: { copyright: 30, whl: 58, ia: 58, ht: 58, mark: 58, action: 40 },
+  whl: { status: 58, copyright: 30 },
   upload: { status: 58, action: 40 },
 };
 const STRETCH_COL = { checked: "title", whl: "title", upload: "title" };
@@ -1745,64 +1745,123 @@ function pumpRegQueue() {
       year: b.year, sources: sources.join(",") });
     fetch("/api/copyright/registration?" + p)
       .then((r) => r.json())
-      .then((res) => { regCache().set(b._key, res); saveRegCache(); updateCrTags(b._key); })
+      .then((res) => { regCache().set(b._key, res); saveRegCache(); scheduleCrRefresh(); })
       .catch(() => { /* leave uncached; retried on next render */ })
       .finally(() => { _regInFlight--; pumpRegQueue(); });
   }
 }
-// update just the on-screen tags for one book key (no full table re-render)
-function updateCrTags(key) {
-  const reg = regCache().get(key);
+// --- copyright renewal-status cache (needed for WHL rows, which lack checks) ---
+const CRSTATUS_KEY = "whl_cr_status_v1";
+let _crStatusCache = null;
+const _crStatusQueue = [];
+let _crStatusInFlight = 0;
+
+function crStatusCache() {
+  if (_crStatusCache) return _crStatusCache;
+  _crStatusCache = new Map();
+  try {
+    const o = JSON.parse(localStorage.getItem(CRSTATUS_KEY) || "{}");
+    for (const k in o) _crStatusCache.set(k, o[k]);
+  } catch (e) { /* ignore */ }
+  return _crStatusCache;
+}
+function saveCrStatusCache() {
+  try {
+    const o = {};
+    for (const [k, v] of crStatusCache()) o[k] = v;
+    localStorage.setItem(CRSTATUS_KEY, JSON.stringify(o));
+  } catch (e) { /* ignore */ }
+}
+function crStatusKey(b) {
+  const n = (s) => String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
+  return n(b.title) + "|" + n(b.author) + "|" + n(b.year);
+}
+function queueCrStatus(b) {
+  const key = crStatusKey(b);
+  if (crStatusCache().has(key) || _crStatusQueue.some((x) => x._key === key)) return;
+  _crStatusQueue.push({ _key: key, title: b.title || "", author: b.author || "", year: b.year || "" });
+  pumpCrStatus();
+}
+function pumpCrStatus() {
+  while (_crStatusInFlight < REG_CONCURRENCY && _crStatusQueue.length) {
+    const b = _crStatusQueue.shift();
+    _crStatusInFlight++;
+    const p = new URLSearchParams({ title: b.title, author: b.author, year: b.year });
+    fetch("/api/copyright/status?" + p).then((r) => r.json())
+      .then((res) => { crStatusCache().set(b._key, res.copyright_status || ""); saveCrStatusCache(); scheduleCrRefresh(); })
+      .catch(() => { /* leave uncached; retried on next render */ })
+      .finally(() => { _crStatusInFlight--; pumpCrStatus(); });
+  }
+}
+
+// re-render all on-screen copyright tags after a status/registration fetch resolves
+let _crRefreshTimer = null;
+function scheduleCrRefresh() {
+  clearTimeout(_crRefreshTimer);
+  _crRefreshTimer = setTimeout(refreshAllCrTags, 180);
+}
+function refreshAllCrTags() {
   document.querySelectorAll(".cr-tag").forEach((tag) => {
-    if (tag.dataset.crkey !== key || tag.dataset.crfixed === "1") return;
-    const left = tag.querySelector(".cr-left");
-    if (!left) return;
-    left.classList.remove("cr-pending", "cr-yellow", "cr-gray");
-    if (reg && reg.found) {
-      left.classList.add("cr-yellow");
-      left.dataset.tip = "Copyright registration found via " +
-        (reg.sources || []).map((s) => s.toUpperCase()).join(", ");
-    } else {
-      left.classList.add("cr-gray");
-      left.dataset.tip = "No copyright registration record found";
-    }
+    const b = { title: tag.dataset.crt || "", author: tag.dataset.cra || "", year: tag.dataset.cry || "" };
+    let st = tag.dataset.crs;
+    if (st === "") { const c = crStatusCache().get(crStatusKey(b)); st = c === undefined ? undefined : c; }
+    const tmp = document.createElement("template");
+    tmp.innerHTML = renderCrTag(b, st).trim();
+    if (tmp.content.firstElementChild) tag.replaceWith(tmp.content.firstElementChild);
   });
 }
 
-function copyrightTag(row) {
-  const checks = row && row.checks;
-  if (!checks) return badge("unknown", "---", { tip: "Not checked yet" });
-  if (checks.error) return badge("error", "ERR", { tip: checks.error });
-  const s = checks.copyright_status || "";
-  const tooOld = s.startsWith("Public domain (published");
-  // right half — renewal
-  let right = "gray";
-  if (tooOld) right = "blue";
-  else if (s.startsWith("In copyright")) right = "red";
-  else if (s.startsWith("Public domain (no renewal")) right = "green";
-  const wholeRed = right === "red";
-  // left half — registration
-  let left, leftTip, fixed = false;
-  if (tooOld) { left = "blue"; leftTip = "Public domain by age (too old for copyright)"; fixed = true; }
-  else if (wholeRed) { left = "red"; leftTip = "Under copyright"; fixed = true; }
-  else if (!copyrightSources().length) {
-    left = "gray"; leftTip = "Registration lookup disabled — enable a source in Settings"; fixed = true;
-  } else {
-    const reg = regCache().get(regKey(row.book));
-    if (reg === undefined) {
-      left = "pending"; leftTip = "Checking copyright registration …";
-      queueReg(row.book);
-    } else if (reg.found) {
-      left = "yellow";
-      leftTip = "Copyright registration found via " +
-        (reg.sources || []).map((x) => x.toUpperCase()).join(", ");
-    } else { left = "gray"; leftTip = "No copyright registration record found"; }
+// Colours for the diagonal copyright tag. Left = registration record, right =
+// renewal. The renewal half depends on the registration lookup: no record found
+// -> blue; found -> magenta (auto-renewed), orange (renewal on file), or green
+// (registered, not renewed). Too old for copyright -> both blue.
+function copyrightColors(b, status) {
+  if (status === undefined) return { left: "pending", right: "pending", lt: "Checking copyright …", rt: "Checking copyright …" };
+  if (!status || status.startsWith("Unknown"))
+    return { left: "gray", right: "gray", lt: status || "Copyright status unknown", rt: status || "Copyright status unknown" };
+  if (status.startsWith("Public domain (published"))
+    return { left: "blue", right: "blue", lt: "Public domain by age (too old for copyright)", rt: status };
+  if (!copyrightSources().length)
+    return { left: "gray", right: "gray", lt: "Registration lookup disabled — enable a source in Settings", rt: status };
+  const reg = regCache().get(regKey(b));
+  if (reg === undefined) { queueReg(b); return { left: "pending", right: "pending", lt: "Checking registration …", rt: "Checking registration …" }; }
+  if (!reg.found)
+    return { left: "gray", right: "blue", lt: "No copyright registration record found", rt: "No registration record — renewal not assessable" };
+  const lt = "Copyright registration found via " + (reg.sources || []).map((s) => s.toUpperCase()).join(", ");
+  const [rc, rt] = status.startsWith("In copyright (renewal") ? ["orange", "Renewal record found — in copyright"]
+    : status.startsWith("In copyright") ? ["magenta", "Auto-renewed — in copyright"]
+    : status.startsWith("Public domain (no renewal") ? ["green", "Registered but not renewed — likely public domain"]
+    : ["gray", status];
+  return { left: "yellow", right: rc, lt, rt };
+}
+
+function renderCrTag(b, status) {
+  const c = copyrightColors(b, status);
+  const attrs = `data-crkey="${esc(regKey(b))}" data-crt="${esc(b.title || "")}" ` +
+    `data-cra="${esc(b.author || "")}" data-cry="${esc(b.year || "")}" data-crs="${esc(status == null ? "" : status)}"`;
+  // no divider when both halves are the same colour: render a single solid tag
+  if (c.left === c.right)
+    return `<span class="cr-tag cr-mono cr-${c.left}" ${attrs} data-tip="${esc(c.rt || c.lt)}"></span>`;
+  return `<span class="cr-tag cr-split" ${attrs}>` +
+    `<span class="cr-left cr-${c.left}" data-tip="${esc(c.lt)}"></span>` +
+    `<span class="cr-right cr-${c.right}" data-tip="${esc(c.rt)}"></span></span>`;
+}
+
+// book: {title, author, year}; status: copyright_status string, or undefined to
+// fetch it (WHL / unchecked rows). Checked rows pass their checks.copyright_status.
+function copyrightTag(book, status) {
+  const b = { title: book.title, author: book.author, year: book.year };
+  if (status === undefined) {
+    const cached = crStatusCache().get(crStatusKey(b));
+    if (cached === undefined) queueCrStatus(b);
+    else status = cached;
   }
-  const rightTip = s || "Copyright/renewal status unknown";
-  return `<span class="cr-tag" data-crkey="${esc(regKey(row.book))}" data-crfixed="${fixed ? 1 : 0}">` +
-    `<span class="cr-left cr-${left}" data-tip="${esc(leftTip)}"></span>` +
-    `<span class="cr-right cr-${right}" data-tip="${esc(rightTip)}"></span>` +
-    `</span>`;
+  return renderCrTag(b, status);
+}
+function copyrightCell(row) {
+  const ch = row.checks;
+  if (ch && ch.error) return badge("error", "ERR", { tip: ch.error });
+  return copyrightTag(row.book, ch ? ch.copyright_status : undefined);
 }
 
 function tipForScan(s, isHt) {
@@ -2625,7 +2684,7 @@ function checkedRowTr(row, cmode, opts) {
     <td>${row.kind === "manual" ? "MANUAL"
       : row.source === "ch_library" ? "MASTER" : esc(row.source.toUpperCase())}</td>
     ${BOOK_COLS.map(cell).join("\n      ")}
-    <td class="col-whl">${copyrightTag(row)}</td>
+    <td class="col-whl">${copyrightCell(row)}</td>
     <td class="col-whl">${whlBadge(row)}</td>
     <td class="col-whl">${iaCell(row)}</td>
     <td class="col-whl">${scanBadge(row, "hathitrust")}</td>
@@ -3533,7 +3592,8 @@ function whlRowCells(r, mode) {
       <td${editable("language")}>${esc(r.language || "")}</td>
       <td${editable("subject")}>${esc(r.subject || "")}</td>
       <td${editable("description")}>${esc(r.description || "")}</td>
-      <td class="col-whl">${statusCell}</td>`;
+      <td class="col-whl">${statusCell}</td>
+      <td class="col-whl">${copyrightTag({ title: r.title, author: r.authors, year: r.year })}</td>`;
 }
 
 // --- ALT: view the original (pre-correction) record ------------------------------

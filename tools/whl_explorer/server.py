@@ -1779,6 +1779,34 @@ def api_copyright_registration():
     return jsonify(result)
 
 
+@app.route("/api/copyright/status")
+def api_copyright_status():
+    """Renewal-based copyright status for a title/author/year (the tag's right
+    half). Checked books already carry this in their checks; WHL rows don't, so
+    the tag fetches it here. Offline (renewals CSV) + cached."""
+    title = (request.args.get("title") or "").strip()
+    author = (request.args.get("author") or "").strip()
+    year = (request.args.get("year") or "").strip()
+    if not title:
+        return jsonify({"copyright_status": ""})
+    key = _reg_cache_key(title, author, ("__status__", year))
+    with _reg_cache_lock:
+        cache = _reg_cache_load()
+        if key in cache:
+            return jsonify(cache[key])
+    status = checks.copyright_status_for(title, author, year, checks.get_renewals())
+    result = {"copyright_status": status}
+    with _reg_cache_lock:
+        cache = _reg_cache_load()
+        cache[key] = result
+        try:
+            _REG_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _REG_CACHE_PATH.write_text(json.dumps(cache), "utf-8")
+        except Exception:
+            pass
+    return jsonify(result)
+
+
 # --- WHL catalogue view (editable via a corrections overlay) --------------------
 
 WHL_CORRECTIONS_PATH = lib.OUTPUT_DIR / "whl_corrections.json"
