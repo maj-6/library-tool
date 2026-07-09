@@ -1072,6 +1072,27 @@ main {
 /* locked (tag/action) columns: fixed narrow width, header text ellipsized */
 .grid th.col-whl, .grid td.col-whl { width: 58px; }
 .grid th.col-act, .grid td.col-act { width: 40px; }
+
+/* copyright split tag: left half = registration record, right half = renewal */
+.cr-tag {
+  display: inline-flex;
+  width: 42px;
+  height: 14px;
+  border-radius: 3px;
+  overflow: hidden;
+  border: 1px solid var(--face-sh2);
+  vertical-align: middle;
+}
+.cr-tag .cr-left, .cr-tag .cr-right { flex: 1 1 50%; }
+.cr-tag .cr-left { border-right: 1px solid rgba(0, 0, 0, 0.28); }
+.cr-blue { background: #3b7dd8; }
+.cr-yellow { background: #e6c34a; }
+.cr-gray { background: #b0b0b0; }
+.cr-red { background: #d64545; }
+.cr-green { background: #4a9e5c; }
+.cr-pending {
+  background: repeating-linear-gradient(45deg, #d8d8d8, #d8d8d8 3px, #ececec 3px, #ececec 6px);
+}
 .grid thead th.col-locked { overflow: hidden; text-overflow: ellipsis; }
 .grid a { color: var(--cyan); text-decoration: none; }
 .grid a:hover { text-decoration: underline; }
