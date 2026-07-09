@@ -1463,10 +1463,44 @@ def api_ia_downloads():
 
 # --- Open Library indexes (constrained search + realtime + autocomplete) --------
 
+# Cloud config lives in the client settings blob (synced via /api/client_state),
+# so a per-user remote URL and DB source URLs need no separate config file.
+def _client_settings():
+    return (lib.load_json(lib.CLIENT_STATE_PATH, {}) or {}).get("settings") or {}
+
+
+def _cloud_base():
+    url = str(_client_settings().get("cloudSearchUrl") or "").strip().rstrip("/")
+    return url or None
+
+
+def _proxy_ol(kind):
+    """Forward the current OL query to the configured cloud instance (a remote
+    deployment of this same app). Returns parsed JSON, or None when there is no
+    cloud URL or the request fails, so callers fall back to a local result."""
+    base = _cloud_base()
+    if not base:
+        return None
+    try:
+        qs = urllib.parse.urlencode(list(request.args.items(multi=True)))
+        req = urllib.request.Request(f"{base}/api/ol/{kind}?{qs}",
+                                     headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        if isinstance(data, dict):
+            data.setdefault("source", "cloud")
+        return data
+    except Exception:
+        return None
+
+
 @app.route("/api/ol/status")
 def api_ol_status():
     st = ol_client.db_stats()
     st["editions"] = ol_client.editions_index_stats()
+    st["local"] = ol_client.editions_index_available()
+    st["cloud"] = bool(_cloud_base())
+    st["mode"] = "local" if st["local"] else ("cloud" if st["cloud"] else "none")
     return jsonify(st)
 
 
@@ -1491,10 +1525,14 @@ def _ol_params():
 @app.route("/api/ol/search")
 def api_ol_search():
     params = _ol_params()
-    # The consolidated editions index answers everything locally; the works
-    # index (+ live API) is only the fallback while it hasn't been built.
+    # Local-first: the consolidated editions index answers everything locally.
     if ol_client.editions_index_available():
         return jsonify(ol_client.search_editions(**params))
+    # No local index -> the configured cloud instance, then the local works
+    # index / live API as a last resort.
+    remote = _proxy_ol("search")
+    if remote is not None:
+        return jsonify(remote)
     return jsonify(ol_client.search_works(
         **params, deep=(request.args.get("deep") or "") in ("1", "true")))
 
@@ -1506,6 +1544,9 @@ def api_ol_realtime():
     if ol_client.editions_index_available():
         verbatim = (request.args.get("title_verbatim") or "") in ("1", "true")
         return jsonify(ol_client.search_editions(**params, title_verbatim=verbatim))
+    remote = _proxy_ol("realtime")
+    if remote is not None:
+        return jsonify(remote)
     out = ol_client.search_works(
         title=params["title"], author=params["author"], year=params["year"],
         edition=params["edition"], volume=params["volume"],
@@ -1513,6 +1554,93 @@ def api_ol_realtime():
         limit=params["limit"], deep=False)
     out["kind"] = "work"
     return jsonify(out)
+
+
+# --- downloadable databases (offline local search) ------------------------------
+# The cloud DBs are downloaded/synced into the writable data root from URLs the
+# user configures in Settings. Once present, search resolves locally (offline).
+
+_DB_TARGETS = {
+    # name -> (path relative to DATA_ROOT, human label)
+    "ol_search": ("output/ol_search.db", "Open Library search index"),
+    "ol_works": ("output/ol_works.db", "Open Library works index"),
+    "copyright_renewals": ("copyright_renewals.csv", "Copyright renewals"),
+    "whl_catalog": ("whl_catalog.csv", "WHL catalog"),
+}
+_db_jobs = {}          # name -> {status, downloaded, total, error}
+_db_lock = threading.Lock()
+
+
+def _db_urls():
+    urls = _client_settings().get("dbUrls")
+    return urls if isinstance(urls, dict) else {}
+
+
+def _run_db_download(name, url, rel):
+    dest = lib.DATA_ROOT / rel
+    tmp = dest.with_name(dest.name + ".part")
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        req = urllib.request.Request(url, headers={"User-Agent": "whl-explorer"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            total = int(r.headers.get("Content-Length") or 0)
+            _db_jobs[name].update(total=total)
+            done = 0
+            with open(tmp, "wb") as fh:
+                while True:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    done += len(chunk)
+                    _db_jobs[name]["downloaded"] = done
+        os.replace(tmp, dest)
+        _db_jobs[name] = {"status": "done", "downloaded": done, "total": total}
+    except Exception as e:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        _db_jobs[name] = {"status": "error", "error": str(e)}
+
+
+@app.route("/api/db/status")
+def api_db_status():
+    urls = _db_urls()
+    out = {}
+    for name, (rel, label) in _DB_TARGETS.items():
+        p = lib.DATA_ROOT / rel
+        out[name] = {
+            "label": label, "path": rel,
+            "present": p.exists(),
+            "size": p.stat().st_size if p.exists() else 0,
+            "url": str(urls.get(name) or ""),
+            "job": _db_jobs.get(name),
+        }
+    return jsonify({"data_root": str(lib.DATA_ROOT), "targets": out})
+
+
+@app.route("/api/db/download", methods=["POST"])
+def api_db_download():
+    names = (request.get_json(silent=True) or {}).get("names")
+    urls = _db_urls()
+    started, skipped = [], []
+    for name in (names or list(_DB_TARGETS)):
+        if name not in _DB_TARGETS:
+            continue
+        url = str(urls.get(name) or "").strip()
+        if not url:
+            skipped.append(name)
+            continue
+        with _db_lock:
+            if (_db_jobs.get(name) or {}).get("status") == "downloading":
+                continue
+            _db_jobs[name] = {"status": "downloading", "downloaded": 0, "total": 0}
+        threading.Thread(target=_run_db_download,
+                         args=(name, url, _DB_TARGETS[name][0]), daemon=True).start()
+        started.append(name)
+    return jsonify({"ok": True, "started": started, "skipped_no_url": skipped})
 
 
 # --- WHL catalogue view (editable via a corrections overlay) --------------------

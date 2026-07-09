@@ -430,3 +430,20 @@ is decided by a tolerant composite rather than exact strings:
   a throwaway test instance can run on a separate origin (distinct
   localStorage) against a scratch WHL_DATA_ROOT — the required isolation for
   testing state-mutating UI without touching live data.
+- Desktop packaging: an Electron shell (desktop/) spawns the Flask backend
+  frozen by PyInstaller (a "sidecar") on a free loopback port with a per-user
+  writable data root, and loads it in a window. A frozen-aware Flask init
+  (_flask_app) points template/static at the bundle root when frozen.
+  electron-builder produces a Windows .msi (icon desktop/build/icon.ico from
+  the user's icon.png, transparent). Validated end to end locally: the frozen
+  sidecar boots and serves; the .msi builds. Signing/DB-hosting are the user's.
+- Cloud + local search and downloadable databases. Search is LOCAL-FIRST: if
+  the Open Library index is present in the data root it answers locally
+  (offline); otherwise /api/ol/search|realtime proxy to a configured cloud
+  instance (a remote deployment of this same app), else fall back to the local
+  works index / live API. Databases download/sync into the data root from
+  per-database URLs (/api/db/download + /api/db/status, threaded with
+  progress). The cloud base URL + per-DB source URLs are set in Settings >
+  Sync and ride the client_state settings sync (no separate config). URLs are
+  placeholders until the user stands up the backend / hosts the files. The
+  installer's "download databases" option is offered by the app on first run.

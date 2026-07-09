@@ -1027,6 +1027,21 @@
               <input id="set-gs-sheet-name" class="cad-input" spellcheck="false"
                      placeholder="Master list" />
             </div>
+
+            <div class="settings-head" style="margin-top:16px">Cloud search &amp; databases</div>
+            <p class="settings-note">Search resolves <b>local-first</b>: a downloaded database is
+              used offline; otherwise queries go to the cloud URL below (a remote instance of this
+              app). Set a source URL per database and download it for offline use.</p>
+            <div class="settings-rows">
+              <label class="tool-label" for="set-cloud-url">Cloud search URL</label>
+              <input id="set-cloud-url" class="cad-input" spellcheck="false"
+                     placeholder="https://your-server.example" />
+            </div>
+            <div id="db-rows" class="settings-rows"></div>
+            <div class="mf-actions">
+              <button id="db-download" class="cad-btn" type="button">Download / update databases</button>
+              <span class="tool-label" id="db-status-msg"></span>
+            </div>
           </div>
           <div id="sec-paths" class="settings-sec">
             <div class="settings-head">File paths</div>

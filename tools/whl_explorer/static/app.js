@@ -101,6 +101,9 @@ const state = {
     ocrKeyMap: { 1: "tesseract", 2: "claude", 3: "textract", 4: "azure", 5: "openai" },
     // master list -> Google Sheets publishing (Settings > Sync)
     gsSpreadsheetId: "", gsKeyFile: "", gsSheetName: "Master list",
+    // cloud search + downloadable databases (Settings > Sync)
+    cloudSearchUrl: "",         // remote instance of this app; used when no local index
+    dbUrls: {},                 // per-database download URLs (name -> url)
     uploadSplitH: null, pdfBrowseDir: "",
     maxRows: 400,               // row cap for the big table views
     whlModalOcr: false,         // OCR panel in the WHL publication viewer
@@ -524,6 +527,9 @@ function normalizeSettings() {
     state.settings.sets = {};
   state.settings.expandSets = !!state.settings.expandSets;
   state.settings.hideVolTitles = !!state.settings.hideVolTitles;
+  state.settings.cloudSearchUrl = state.settings.cloudSearchUrl || "";
+  if (!state.settings.dbUrls || typeof state.settings.dbUrls !== "object")
+    state.settings.dbUrls = {};
   state.settings.colVis = state.settings.colVis || {};
   state.settings.colWidths = state.settings.colWidths || {};
   // migrate the old single-table column setting
@@ -1126,6 +1132,109 @@ function fillFontSelect(id, list, settingKey, apply) {
   };
 }
 
+// --- Settings > Sync: downloadable databases --------------------------------
+
+let _dbPollTimer = null;
+
+function dbFmtBytes(n) {
+  n = n || 0;
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + " GB";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + " MB";
+  if (n >= 1e3) return (n / 1e3).toFixed(0) + " KB";
+  return n + " B";
+}
+
+function dbStatusMsg(targets) {
+  const msg = el("db-status-msg");
+  if (!msg) return;
+  const jobs = Object.entries(targets).map(([n, t]) => [n, t.job]).filter(([, j]) => j);
+  const dl = jobs.filter(([, j]) => j.status === "downloading");
+  if (dl.length) {
+    msg.textContent = dl.map(([n, j]) =>
+      `${n}: ${dbFmtBytes(j.downloaded)}${j.total ? " / " + dbFmtBytes(j.total) : ""}`).join("  ·  ");
+  } else {
+    const err = jobs.find(([, j]) => j.status === "error");
+    msg.textContent = err ? ("error: " + err[1].error) : "";
+  }
+}
+
+async function renderDbSync() {
+  const host = el("db-rows");
+  if (!host) return;
+  let data;
+  try { data = await (await fetch("/api/db/status")).json(); }
+  catch (e) { host.innerHTML = "<span class='tool-label'>backend unavailable</span>"; return; }
+  const targets = data.targets || {};
+  host.innerHTML = "";
+  for (const [name, t] of Object.entries(targets)) {
+    const lab = document.createElement("label");
+    lab.className = "tool-label";
+    lab.setAttribute("for", "set-dburl-" + name);
+    lab.textContent = t.label + (t.present ? ` — downloaded (${dbFmtBytes(t.size)})` : "");
+    const inp = document.createElement("input");
+    inp.id = "set-dburl-" + name;
+    inp.className = "cad-input";
+    inp.spellcheck = false;
+    inp.placeholder = "https://…/" + t.path.split("/").pop();
+    inp.value = (state.settings.dbUrls && state.settings.dbUrls[name]) || t.url || "";
+    inp.onchange = () => {
+      state.settings.dbUrls = state.settings.dbUrls || {};
+      state.settings.dbUrls[name] = inp.value.trim();
+      saveSettings();
+    };
+    host.appendChild(lab);
+    host.appendChild(inp);
+  }
+  const btn = el("db-download");
+  if (btn) btn.onclick = startDbDownload;
+  dbStatusMsg(targets);
+}
+
+async function startDbDownload() {
+  // capture any un-blurred URL edits, then push settings so the server sees them
+  state.settings.dbUrls = state.settings.dbUrls || {};
+  for (const inp of document.querySelectorAll("[id^='set-dburl-']"))
+    state.settings.dbUrls[inp.id.replace("set-dburl-", "")] = inp.value.trim();
+  const cu = el("set-cloud-url");
+  if (cu) state.settings.cloudSearchUrl = cu.value.trim();
+  saveSettings();
+  await flushClientState();
+  const btn = el("db-download");
+  if (btn) btn.disabled = true;
+  el("db-status-msg").textContent = "Starting …";
+  try {
+    const r = await (await fetch("/api/db/download",
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })).json();
+    if (!r.started || !r.started.length) {
+      el("db-status-msg").textContent = "Set a source URL for at least one database first.";
+      if (btn) btn.disabled = false;
+      return;
+    }
+  } catch (e) {
+    el("db-status-msg").textContent = "Could not start the download.";
+    if (btn) btn.disabled = false;
+    return;
+  }
+  pollDbStatus();
+}
+
+function pollDbStatus() {
+  clearTimeout(_dbPollTimer);
+  _dbPollTimer = setTimeout(async () => {
+    let data;
+    try { data = await (await fetch("/api/db/status")).json(); } catch (e) { return; }
+    const targets = data.targets || {};
+    dbStatusMsg(targets);
+    if (Object.values(targets).some((t) => t.job && t.job.status === "downloading")) {
+      pollDbStatus();
+    } else {
+      const btn = el("db-download");
+      if (btn) btn.disabled = false;
+      renderDbSync();   // refresh present/size after completion
+    }
+  }, 1000);
+}
+
 function renderSettings() {
   // GENERAL
   el("gen-info").textContent =
@@ -1223,7 +1332,8 @@ function renderSettings() {
                          ["set-ocr-aws-region", "ocrAwsRegion"],
                          ["set-gs-sheet-id", "gsSpreadsheetId"],
                          ["set-gs-keyfile", "gsKeyFile"],
-                         ["set-gs-sheet-name", "gsSheetName"]]) {
+                         ["set-gs-sheet-name", "gsSheetName"],
+                         ["set-cloud-url", "cloudSearchUrl"]]) {
     const n = el(id);
     n.value = state.settings[k] || "";
     n.onchange = () => {
@@ -1231,6 +1341,7 @@ function renderSettings() {
       saveSettings();
     };
   }
+  renderDbSync();
   // OCR rasterization width — the compression/shrink experiment knob
   const iw = el("set-ocr-width");
   iw.value = state.settings.ocrImageWidth || 1400;
