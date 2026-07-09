@@ -267,6 +267,54 @@ function extractVolume(text) {
   return null;
 }
 
+// A volume-of-total designator: an explicit "N/M" or "N of M" (optionally with
+// a vol/v. keyword) at the very END of the title — e.g. "Elements of Botany
+// 2/5" (or a whole volume field of "2/5"). Unlike VOL_RES it carries the SET
+// SIZE (the total), used to auto-create a group. ANCHORED to the end so an
+// incidental fraction earlier in a title ("The 1/2 Blood Prince", "Notes on
+// 3/4 and 5/8 meter") is never misread; a page/part prefix ("pp. 2/5") and a
+// non-lettered base are rejected. `clean` has the designator removed.
+const VOL_TOTAL_RE =
+  /(^|[\s,;:.([])(?:vol(?:ume)?s?\.?\s*|v\.?\s*)?([0-9]{1,3})\s*(?:\/|\s+of\s+)\s*([0-9]{1,3})\s*[)\].]*\s*$/i;
+const VOL_PAGEISH_RE = /\b(?:p|pp|pg|pgs|pages?|pt|pts|parts?|no|nos|num|figs?|plates?)\.?\s*$/i;
+
+function extractVolTotal(text) {
+  const s = String(text || "");
+  const m = VOL_TOTAL_RE.exec(s);
+  if (!m) return null;
+  const vol = parseInt(m[2], 10), total = parseInt(m[3], 10);
+  if (!(vol > 0) || !(total > 1) || total > 99 || vol > total) return null;
+  const head = s.slice(0, m.index) + m[1];       // everything up to the designator
+  if (VOL_PAGEISH_RE.test(head)) return null;     // "pp. 2/5" is a page range, not a set
+  const clean = tidyTitleText(head + s.slice(m.index + m[0].length));
+  if (!/[a-z]/i.test(clean)) return null;         // the base must be a real, lettered title
+  return { vol, total, clean };
+}
+
+// Grouping intent from an edited TITLE: { title: clean, volume: "N", count }.
+// Prefers the "N/M" total form (declares an M-volume set); falls back to a
+// plain "vol N" indicator (sets the volume, leaves the set size open: count 0).
+function volGroupFromTitle(value) {
+  const vt = extractVolTotal(value);
+  if (vt && vt.clean) return { title: vt.clean, volume: String(vt.vol), count: vt.total };
+  const v = extractVolume(value);
+  if (v && v.clean) return { title: v.clean, volume: v.volume, count: 0 };
+  return null;
+}
+
+// Grouping intent from an edited VOLUME field: { volume: "N", count }.
+// "N/M" -> volume N of an M-volume set; "N" (no slash) -> volume N of an
+// N-volume set (per the spec). Non-numeric input returns null (kept verbatim).
+function volGroupFromVolume(value) {
+  const m = String(value || "").trim().match(/^([0-9]{1,3})\s*(?:\/\s*([0-9]{1,3}))?$/);
+  if (!m) return null;
+  const vol = parseInt(m[1], 10);
+  if (!(vol > 0)) return null;
+  const total = m[2] ? parseInt(m[2], 10) : vol;
+  if (total > 99 || vol > total) return null;
+  return { volume: String(vol), count: total };
+}
+
 const ORD_WORDS = {
   first: 1, second: 2, third: 3, fourth: 4, fifth: 5, sixth: 6, seventh: 7,
   eighth: 8, ninth: 9, tenth: 10, eleventh: 11, twelfth: 12,
@@ -528,6 +576,7 @@ function normalizeSettings() {
     state.settings.sets = {};
   state.settings.expandSets = !!state.settings.expandSets;
   state.settings.hideVolTitles = !!state.settings.hideVolTitles;
+  state.settings.setsBackfilled = !!state.settings.setsBackfilled;
   state.settings.cloudSearchUrl = state.settings.cloudSearchUrl || "";
   if (!state.settings.dbUrls || typeof state.settings.dbUrls !== "object")
     state.settings.dbUrls = {};
@@ -1839,8 +1888,9 @@ function volNum(book) {
 // the base title (volume stripped) used for display
 function setBaseTitle(book) {
   let t = String((book && book.title) || "");
-  const v = extractVolume(t);
-  if (v && v.clean) t = v.clean;
+  const vt = extractVolTotal(t);       // trailing "N/M" / "N of M"
+  if (vt && vt.clean) t = vt.clean;
+  else { const v = extractVolume(t); if (v && v.clean) t = v.clean; }  // "vol N"
   return t.trim();
 }
 
@@ -2194,11 +2244,43 @@ async function migrateParsedManual() {
   return changed;
 }
 
+// One-time: declare a multi-volume set for every base title that already has
+// volume-bearing books, so lone volumes and pre-existing multi-volume works
+// render as groups. Settings-only (reversible via the set editor — set the
+// count to 1 to dissolve), and guarded so it runs exactly once.
+function backfillSets() {
+  if (state.settings.setsBackfilled) return 0;
+  const rows = combinedRows();
+  if (!rows.length) return 0;                 // data not ready — retry on a later pass
+  const maxByKey = new Map();
+  for (const r of rows) {
+    const v = volNum(r.book);
+    if (v <= 0) continue;
+    const key = setKeyOf(r.book);
+    if (!key) continue;
+    maxByKey.set(key, Math.max(maxByKey.get(key) || 0, v));
+  }
+  const m = setsMap();
+  let n = 0;
+  for (const [key, maxVol] of maxByKey) {
+    if (maxVol < 2) continue;                 // a lone volume 1 is not a set
+    const want = Math.max(setDefinedCount(key), maxVol);
+    if (setDefinedCount(key) !== want) { m[key] = Object.assign({}, m[key], { count: want }); n++; }
+  }
+  state.settings.setsBackfilled = true;
+  saveSettings();                             // one persist for the whole backfill
+  return n;
+}
+
 async function migrateParsedEntries() {
   const n = migrateParsedChecked() + (await migrateParsedManual());
-  if (n) {
+  const s = backfillSets();
+  if (n || s) {
     renderChecked();
-    status(`Parsed volume/edition/subtitle out of ${n} stored titles`);
+    const bits = [];
+    if (n) bits.push(`parsed volume/edition/subtitle out of ${n} title${n > 1 ? "s" : ""}`);
+    if (s) bits.push(`grouped ${s} multi-volume set${s > 1 ? "s" : ""}`);
+    status(bits.join(" · ").replace(/^./, (c) => c.toUpperCase()));
   }
 }
 
@@ -2550,46 +2632,77 @@ function startEdit(td) {
   input.addEventListener("blur", () => finish(true));
 }
 
-async function patchManualField(id, field, value) {
-  const res = await fetch(`/api/manual/${encodeURIComponent(id)}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ [field]: value }),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (res.ok && data.ok) {
-    const i = state.manual.findIndex((x) => x.id === id);
-    if (i >= 0) state.manual[i] = data.entry;
-    renderChecked();
-    queueScan(id);
-    return true;
+// Apply a one-or-more-field patch to a checked/manual book, tracked for undo.
+async function applyEditPatch(row, patch) {
+  const fields = Object.keys(patch);
+  const label = `edit ${fields.join("+")} of ${String(row.book.title || "").slice(0, 32)}`;
+  const tag = fields.join(", ").toUpperCase();
+  if (row.kind === "manual") {
+    const before = {};
+    for (const k of fields) before[k] = String(row.book[k] || "");
+    if (await patchManualFields(row.id, patch)) {
+      pushOp(label,
+        () => patchManualFields(row.id, before),
+        () => patchManualFields(row.id, patch));
+      status(`UPDATED ${tag} :: RESCANNING`);
+      return true;
+    }
+    status("UPDATE FAILED");
+    return false;
   }
-  return false;
+  const entry = state.checked.get(row.id);
+  if (!entry) return false;
+  trackChecked(label, row.id, () => {
+    entry.book = Object.assign({}, entry.book, patch);
+    entry.checks = null;
+    entry.scans = null;
+    entry.verify = null;
+    queueScan(row.id);
+  });
+  saveChecked();
+  status(`UPDATED ${tag} :: RESCANNING`);
+  return true;
 }
 
 async function commitEdit(row, field, value) {
-  if (row.kind === "manual") {
-    const oldValue = String(row.book[field] || "");
-    if (await patchManualField(row.id, field, value)) {
-      pushOp(`edit ${field} of ${row.book.title.slice(0, 32)}`,
-        () => patchManualField(row.id, field, oldValue),
-        () => patchManualField(row.id, field, value));
-      status(`UPDATED ${field.toUpperCase()} :: RESCANNING`);
-    } else {
-      status("UPDATE FAILED");
+  // Editing the title or the volume field with a volume designator — a title
+  // like "Elements of Botany 2/5", or a volume of "2/5" / "3" — strips the
+  // designator into the volume field and auto-declares a multi-volume set for
+  // the base title (see volGroupFromTitle / volGroupFromVolume).
+  let patch = { [field]: value };
+  let count = 0;
+  if (field === "title") {
+    const g = volGroupFromTitle(value);
+    if (g) { patch = { title: g.title, volume: g.volume }; count = g.count; }
+  } else if (field === "volume") {
+    const g = volGroupFromVolume(value);
+    if (g) { patch = { volume: g.volume }; count = g.count; }
+  }
+  const ok = await applyEditPatch(row, patch);
+  if (ok && count >= 2) {
+    // set membership is derived from the (stripped) base title + volume number
+    const key = setKeyOf(Object.assign({}, row.book, patch));
+    const m = setsMap();
+    const want = key ? Math.max(setDefinedCount(key), count) : 0;
+    if (key && setDefinedCount(key) !== want) {
+      const beforeRec = m[key] ? Object.assign({}, m[key]) : null;
+      setSetCount(key, want);
+      const afterRec = Object.assign({}, m[key]);
+      // Fold the set declaration into the edit's undo op (applyEditPatch just
+      // pushed it) so a single Ctrl+Z reverts BOTH the fields and the set —
+      // otherwise undo would leave an orphan set record in settings.
+      const top = history.stack[history.ptr - 1];
+      if (top) {
+        const baseUndo = top.undoFn, baseRedo = top.redoFn;
+        const put = (rec) => {
+          const mm = setsMap();
+          if (rec) mm[key] = Object.assign({}, rec); else delete mm[key];
+          saveSettings();
+        };
+        top.undoFn = async () => { put(beforeRec); const r = await baseUndo(); renderChecked(); return r; };
+        top.redoFn = async () => { put(afterRec); const r = await baseRedo(); renderChecked(); return r; };
+      }
     }
-  } else {
-    const entry = state.checked.get(row.id);
-    if (!entry) return;
-    trackChecked(`edit ${field} of ${row.book.title.slice(0, 32)}`, row.id, () => {
-      entry.book = Object.assign({}, entry.book, { [field]: value });
-      entry.checks = null;
-      entry.scans = null;
-      entry.verify = null;
-      queueScan(row.id);
-    });
-    saveChecked();
-    status(`UPDATED ${field.toUpperCase()} :: RESCANNING`);
   }
   renderChecked();
 }
@@ -3301,6 +3414,14 @@ function repopBookFields(rec) {
   return f;
 }
 
+// A copy/repopulate consumes the OL column marks; clear them afterwards so the
+// next book starts unconstrained (the marks persist only for the pending copy).
+function clearOlColMarks() {
+  if (!state.olColMarks || !Object.keys(state.olColMarks).length) return;
+  state.olColMarks = {};
+  renderBottomRows();
+}
+
 async function repopulateCheckedRow(rec) {
   const row = state.rowsById.get(String(state.checkedSelected));
   if (!row) return;
@@ -3315,6 +3436,7 @@ async function repopulateCheckedRow(rec) {
         () => patchManualFields(row.id, before),
         () => patchManualFields(row.id, vals));
       status(`ROW REPOPULATED :: ${vals.title || row.book.title}`);
+      clearOlColMarks();
     } else {
       status("REPOPULATE FAILED");
     }
@@ -3332,6 +3454,7 @@ async function repopulateCheckedRow(rec) {
   saveChecked();
   renderChecked();
   status(`ROW REPOPULATED :: ${vals.title || row.book.title}`);
+  clearOlColMarks();
 }
 
 function repopFields(rec) {
@@ -3363,6 +3486,7 @@ async function repopulateWhlRow(rec) {
     pushWhlFieldsOp(`repopulate WHL row ${(fields.title || row.title).slice(0, 30)}`,
       idx, before, fields);
     status(`WHL ROW REPOPULATED :: ${fields.title || row.title}`);
+    clearOlColMarks();
   } else {
     status("WHL REPOPULATE FAILED");
   }
