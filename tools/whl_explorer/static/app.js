@@ -5878,7 +5878,7 @@ function renderUpload() {
         ? `<a href="${esc(s.url)}" target="_blank" rel="noopener" data-tip="${esc(s.url)}">${esc(s.matched_title) || "(record)"}</a>`
         : esc(s.matched_title)}</td>
       <td class="col-whl">${st === "done" ? badge("approved", "DONE", { tip: "The entry built from this source is verified" })
-          : st === "draft" ? badge("upload", "DRAFT", { tip: "An entry built from this source is in the editor" })
+          : st === "draft" ? badge("upload", "DRFT", { tip: "An entry built from this source is in the editor" })
           : ""}</td>
       <td class="col-act"><button class="cad-btn tiny icon-btn" data-build-src="${i}"
         data-tip="Build a catalog entry prefilled from this source">${ICONS.docplus}</button></td>`;
