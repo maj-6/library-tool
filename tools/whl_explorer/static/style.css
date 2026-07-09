@@ -1093,6 +1093,34 @@ main {
 .cr-pending {
   background: repeating-linear-gradient(45deg, #d8d8d8, #d8d8d8 3px, #ececec 3px, #ececec 6px);
 }
+
+/* --- History tab --- */
+.hist-row { cursor: pointer; }
+.hist-row .hist-time { color: var(--face-sh2); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.hist-row .hist-rev { text-align: center; color: var(--blue); width: 20px; }
+.hist-badge {
+  display: inline-block; min-width: 62px; margin-right: 8px; padding: 0 6px;
+  border-radius: 3px; font-size: 10.5px; text-align: center; color: #fff;
+}
+.hist-edit .hist-badge { background: #3b7dd8; }
+.hist-add .hist-badge { background: #4a9e5c; }
+.hist-remove .hist-badge { background: #d64545; }
+.hist-repopulate .hist-badge { background: #8a5cd6; }
+.hist-verify .hist-badge { background: #2f9e9e; }
+.hist-scan .hist-badge { background: #d6862f; }
+.hist-source .hist-badge { background: #7a7a7a; }
+.hist-other .hist-badge { background: #9a9a9a; }
+.hist-reverted { opacity: 0.55; }
+.hist-reverted .hist-label { text-decoration: line-through; }
+.hist-detail-row > td { background: var(--face-hi); padding: 0; }
+.hist-detail { padding: 6px 10px; }
+.hist-detail-meta { font-size: 11px; color: var(--ink); margin-bottom: 3px; }
+.hist-detail-cap { font-size: 10px; color: var(--face-sh2); }
+.hist-detail-json {
+  margin: 2px 0 0; max-height: 220px; overflow: auto;
+  font: 11px/1.4 var(--mono); white-space: pre-wrap; word-break: break-word;
+  color: var(--ink); background: var(--input-bg); padding: 6px; border-radius: 3px;
+}
 .grid thead th.col-locked { overflow: hidden; text-overflow: ellipsis; }
 .grid a { color: var(--cyan); text-decoration: none; }
 .grid a:hover { text-decoration: underline; }

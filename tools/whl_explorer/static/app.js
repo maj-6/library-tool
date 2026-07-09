@@ -470,12 +470,14 @@ function injectIcons() {
 
 const history = { stack: [], ptr: 0 };
 
-function pushOp(label, undoFn, redoFn) {
+function pushOp(label, undoFn, redoFn, revert) {
+  const id = logAction(label, revert);   // logAction mints the id from the freshest max
   history.stack.length = history.ptr;
-  history.stack.push({ label, undoFn, redoFn });
+  history.stack.push({ id, label, undoFn, redoFn });
   if (history.stack.length > 100) history.stack.shift();
   history.ptr = history.stack.length;
   updateHistoryButtons();
+  return id;
 }
 
 function updateHistoryButtons() {
@@ -531,7 +533,70 @@ function trackChecked(label, key, mutate) {
   const after = snapshotChecked(key);
   pushOp(label,
     () => restoreChecked(key, before),
-    () => restoreChecked(key, after));
+    () => restoreChecked(key, after),
+    { kind: "checked", key, before });   // full snapshot -> cross-session revert
+}
+
+// --- persistent action log (History tab) -------------------------------------
+// Every undo-tracked action is logged with a serializable "revert" descriptor
+// so the History tab can revert it even across reloads (the in-memory undo
+// closures can't be persisted). Stored in localStorage; clearable in Settings.
+const ACTIONLOG_KEY = "whl_action_log_v1";
+const ACTIONLOG_CAP = 1000;
+let _actionLog = null;
+let _opSeq = 0;
+
+function actionLog() {
+  if (_actionLog) return _actionLog;
+  try { _actionLog = JSON.parse(localStorage.getItem(ACTIONLOG_KEY) || "[]"); }
+  catch (e) { _actionLog = []; }
+  if (!Array.isArray(_actionLog)) _actionLog = [];
+  for (const r of _actionLog) if (typeof r.id === "number" && r.id > _opSeq) _opSeq = r.id;
+  return _actionLog;
+}
+function saveActionLog() {
+  try { localStorage.setItem(ACTIONLOG_KEY, JSON.stringify(actionLog())); } catch (e) {}
+}
+// canonical action type (drives the History colour) from the label's first word
+const ACTION_TYPES = {
+  edit: "edit", correct: "edit",
+  add: "add", check: "add", create: "add",
+  uncheck: "remove", delete: "remove",
+  repopulate: "repopulate", verify: "verify",
+  attach: "scan", detach: "scan", manual: "source", source: "source",
+};
+function actionType(label) {
+  const w = String(label || "").trim().split(/\s+/)[0].toLowerCase();
+  return ACTION_TYPES[w] || "other";
+}
+function actionTargetKey(revert) {
+  if (!revert) return "";
+  if (revert.kind === "checked") return "checked:" + revert.key;
+  if (revert.kind === "whl") return "whl:" + revert.idx;
+  if (String(revert.kind || "").startsWith("manual")) return "manual:" + revert.id;
+  return "";
+}
+function logAction(label, revert) {
+  // Re-read the persisted log so a second tab's appends aren't clobbered, and
+  // mint the id from the freshest max (no cross-tab / cross-session id reuse).
+  let stored = [];
+  try {
+    const a = JSON.parse(localStorage.getItem(ACTIONLOG_KEY) || "[]");
+    if (Array.isArray(a)) stored = a;
+  } catch (e) { /* ignore */ }
+  const id = stored.reduce((m, r) => Math.max(m, r.id || 0), _opSeq) + 1;
+  _opSeq = id;
+  stored.push({
+    id, ts: Date.now(), type: actionType(label), label: String(label || ""),
+    tkey: actionTargetKey(revert), revert: revert || null, reverted: false,
+  });
+  if (stored.length > ACTIONLOG_CAP) stored.splice(0, stored.length - ACTIONLOG_CAP);
+  _actionLog = stored;
+  saveActionLog();
+  if (typeof activeBottomTable === "function" && activeBottomTable() === "history") {
+    renderBottomRows();
+  }
+  return id;
 }
 
 // --- persistence -----------------------------------------------------------
@@ -1301,6 +1366,13 @@ function renderSettings() {
     try { localStorage.removeItem(SETTINGS_KEY); } catch (e) {}
     location.reload();
   };
+  el("clear-history-btn").onclick = () => {
+    if (!window.confirm("Clear the entire action history? This cannot be undone.")) return;
+    _actionLog = [];
+    saveActionLog();
+    if (activeBottomTable() === "history") renderBottomRows();
+    status("HISTORY CLEARED");
+  };
   const ocr = el("set-whl-ocr");
   ocr.checked = !!state.settings.whlModalOcr;
   ocr.onchange = () => {
@@ -1939,7 +2011,8 @@ async function setRowLocalPdf(id, path) {
     if (!await patchManualLocalPdf(id, path)) { status("Attach failed"); return; }
     pushOp(`${verb} ${(row.book.title || "").slice(0, 36)}`,
       () => patchManualLocalPdf(id, prior),
-      () => patchManualLocalPdf(id, path));
+      () => patchManualLocalPdf(id, path),
+      { kind: "manual-localpdf", id, before: prior });
   } else {
     const entry = state.checked.get(id);
     if (!entry) return;
@@ -2771,7 +2844,8 @@ async function applyEditPatch(row, patch) {
     if (await patchManualFields(row.id, patch)) {
       pushOp(label,
         () => patchManualFields(row.id, before),
-        () => patchManualFields(row.id, patch));
+        () => patchManualFields(row.id, patch),
+        { kind: "manual-fields", id: row.id, before });
       status(`UPDATED ${tag} :: RESCANNING`);
       return true;
     }
@@ -2829,6 +2903,11 @@ async function commitEdit(row, field, value) {
         };
         top.undoFn = async () => { put(beforeRec); const r = await baseUndo(); renderChecked(); return r; };
         top.redoFn = async () => { put(afterRec); const r = await baseRedo(); renderChecked(); return r; };
+        // also record the folded set change in the persisted History revert
+        // descriptor so a History-tab revert undoes the set, not just the fields
+        const lr = actionLog();
+        const rec = lr.length && lr[lr.length - 1].id === top.id ? lr[lr.length - 1] : null;
+        if (rec && rec.revert) { rec.revert.set = { key, beforeRec }; saveActionLog(); }
       }
     }
   }
@@ -2915,6 +2994,11 @@ const BOTTOM_TABLES = {
     cells: (r) => [linkCell(r.title, r.url), esc(r.author), esc(r.year),
                    esc(r.status)],
   },
+  history: {
+    label: "History",
+    cols: ["Time", "Action", ""],   // custom-rendered (see renderHistoryRows)
+    history: true,
+  },
 };
 
 function linkCell(text, url) {
@@ -2971,6 +3055,7 @@ async function renderBottomPane() {
 function renderBottomRows() {
   const t = activeBottomTable();
   const def = BOTTOM_TABLES[t];
+  if (def.history) { renderHistoryRows(); return; }
   el("bottom-head").innerHTML =
     "<tr>" + def.cols.map((c) => `<th>${c}</th>`).join("") + "</tr>";
   if (t === "ol") {
@@ -3039,10 +3124,133 @@ function renderBottomRows() {
     tr.innerHTML = def.cells(rec).map((c) => `<td>${c == null ? "" : c}</td>`).join("");
     tbody.appendChild(tr);
   });
+  el("bottom-empty").textContent = "No matches";   // reset from the History tab's message
   el("bottom-empty").hidden = records.length !== 0;
   el("bottom-count").textContent =
     `${records.length} rows` + (t === "ol" && state.olNote ? ` — ${state.olNote}` : "");
   applyTableChrome("b-" + t);
+}
+
+// --- History tab: a persistent, revertible action log ------------------------
+const ACTION_TYPE_LABEL = {
+  edit: "Edit", add: "Add", remove: "Remove", repopulate: "Repopulate",
+  verify: "Verify", scan: "Scan", source: "Source", other: "Action",
+};
+function fmtActionTime(ts) {
+  const d = new Date(ts), now = new Date();
+  const hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return d.toDateString() === now.toDateString()
+    ? hm : d.toLocaleDateString([], { month: "short", day: "numeric" }) + " " + hm;
+}
+function histCanRevert(r) {
+  return !r.reverted && !!r.revert;   // data-based revert only (see revertHistoryAction)
+}
+
+function renderHistoryRows() {
+  el("bottom-head").innerHTML = "<tr><th>Time</th><th>Action</th><th></th></tr>";
+  const tbody = el("bottom-rows");
+  tbody.innerHTML = "";
+  const log = actionLog();
+  const q = (state.checkedFilter || "").toLowerCase();
+  const rows = log.filter((r) => !q || r.label.toLowerCase().includes(q)).slice().reverse();
+  for (const r of rows) {
+    const tr = document.createElement("tr");
+    tr.className = "hist-row hist-" + r.type + (r.reverted ? " hist-reverted" : "");
+    tr.dataset.hid = r.id;
+    tr.dataset.tip = histCanRevert(r)
+      ? "Click for detail · Ctrl+click to revert this action"
+      : "Click for detail" + (r.reverted ? " (already reverted)" : " (not revertible here)");
+    tr.innerHTML =
+      `<td class="hist-time">${esc(fmtActionTime(r.ts))}</td>` +
+      `<td class="hist-label"><span class="hist-badge">${esc(ACTION_TYPE_LABEL[r.type] || "Action")}</span>${esc(r.label)}</td>` +
+      `<td class="hist-rev">${r.reverted ? "✓" : (histCanRevert(r) ? "↶" : "")}</td>`;
+    tbody.appendChild(tr);
+  }
+  el("bottom-empty").hidden = rows.length !== 0;
+  if (!rows.length) el("bottom-empty").textContent = "No actions recorded yet";
+  el("bottom-count").textContent =
+    `${log.length} action${log.length === 1 ? "" : "s"}` + (q ? ` (${rows.length} shown)` : "");
+  applyTableChrome("b-history");
+}
+
+function histDetailHtml(rec) {
+  const meta = [
+    `Time: ${new Date(rec.ts).toLocaleString()}`,
+    `Type: ${ACTION_TYPE_LABEL[rec.type] || rec.type}`,
+    rec.tkey ? `Target: ${rec.tkey}` : "",
+    rec.reverted ? "Status: REVERTED" : "",
+  ].filter(Boolean).join("  ·  ");
+  const b = rec.revert && (rec.revert.before !== undefined ? rec.revert.before
+    : rec.revert.snap !== undefined ? rec.revert.snap : rec.revert.beforeSnaps);
+  let json = "";
+  if (b !== undefined && b !== null) {
+    try { json = JSON.stringify(b, null, 1); } catch (e) { json = String(b); }
+  }
+  return `<td colspan="3"><div class="hist-detail"><div class="hist-detail-meta">${esc(meta)}</div>` +
+    (json ? `<div class="hist-detail-cap">Restores on revert:</div><pre class="hist-detail-json">${esc(json.slice(0, 4000))}</pre>` : "") +
+    `</div></td>`;
+}
+
+// data-based inverse of a logged action (works across reloads)
+async function applyRevert(m) {
+  if (!m) return false;
+  let ok = false;
+  switch (m.kind) {
+    case "checked": restoreChecked(m.key, m.before); ok = true; break;
+    case "manual-fields": ok = !!(await patchManualFields(m.id, m.before)); break;
+    case "manual-create": ok = !!(await deleteManualById(m.id)); break;
+    case "manual-restore": ok = !!(await restoreManualEntry(m.snap)); break;
+    case "manual-localpdf": ok = !!(await patchManualLocalPdf(m.id, m.before)); break;
+    case "manual-verify":
+      await setVerify(m.id, m.source, m.before, false);
+      if (m.beforeUrl) await setManualUrl(m.id, m.source, m.beforeUrl, false);
+      ok = true; break;
+    case "manual-url": ok = !!(await setManualUrl(m.id, m.source, m.before, false)); break;
+    case "whl": ok = !!(await whlApplySnaps(m.idx, m.beforeSnaps)); break;
+    default: ok = false;
+  }
+  // also revert a multi-volume set declaration that commitEdit folded into this edit
+  if (ok && m.set) {
+    const mm = setsMap();
+    if (m.set.beforeRec) mm[m.set.key] = Object.assign({}, m.set.beforeRec);
+    else delete mm[m.set.key];
+    saveSettings();
+    renderChecked();
+  }
+  return ok;
+}
+
+async function revertHistoryAction(hid) {
+  const log = actionLog();
+  const rec = log.find((r) => r.id === hid);
+  if (!rec || rec.reverted || !rec.revert) return;
+  if (rec.tkey && log.some((r) => r.id > rec.id && !r.reverted && r.tkey === rec.tkey)) {
+    if (!window.confirm("A newer action changed the same record. Reverting this one will " +
+      "discard that newer change. Continue?")) return;
+  }
+  const ok = await applyRevert(rec.revert);
+  if (ok) {
+    rec.reverted = true;
+    saveActionLog();
+    // neutralize the still-live in-session undo op so Ctrl+Z/Y won't re-apply it
+    const op = history.stack.find((o) => o.id === hid);
+    if (op) { op.undoFn = op.redoFn = () => {}; }
+    renderBottomRows();
+    status("REVERTED :: " + rec.label.slice(0, 50));
+  } else status("REVERT FAILED :: " + rec.label.slice(0, 40));
+}
+
+// expand/collapse the full-detail row under a History entry
+function toggleHistDetail(hrow, hid) {
+  const next = hrow.nextElementSibling;
+  if (next && next.classList.contains("hist-detail-row")) { next.remove(); return; }
+  document.querySelectorAll("tr.hist-detail-row").forEach((el2) => el2.remove());
+  const rec = actionLog().find((r) => r.id === hid);
+  if (!rec) return;
+  const dr = document.createElement("tr");
+  dr.className = "hist-detail-row";
+  dr.innerHTML = histDetailHtml(rec);
+  hrow.after(dr);
 }
 
 // --- realtime Open Library table --
@@ -3441,7 +3649,8 @@ async function whlApplySnaps(idx, snaps) {
 function pushWhlFieldsOp(label, idx, beforeSnaps, afterFields) {
   pushOp(label,
     () => whlApplySnaps(idx, beforeSnaps),
-    () => whlPost({ idx, fields: afterFields }));
+    () => whlPost({ idx, fields: afterFields }),
+    { kind: "whl", idx, beforeSnaps });
 }
 
 function selectWhlSearchRow(idx) {
@@ -3877,7 +4086,8 @@ async function saveBookEditTab(ev) {
       if (await patchManualFields(t.id, fields)) {
         pushOp(`edit entry ${vals.title.slice(0, 32)}`,
           () => patchManualFields(t.id, before),
-          () => patchManualFields(t.id, fields));
+          () => patchManualFields(t.id, fields),
+          { kind: "manual-fields", id: t.id, before });
         if (setCount >= 2) await promoteRowToSet(t.id, vals, setCount);
         el("bookedit-msg").textContent = setCount >= 2 ? "Saved as set" : "Saved";
         status(`ENTRY SAVED :: ${vals.title} :: RESCANNING`);
@@ -5069,7 +5279,8 @@ async function setVerify(id, source, verdict, track = true) {
             await setVerify(id, source, prior, false);
             if (priorUrl) await setManualUrl(id, source, priorUrl, false);
           },
-          () => setVerify(id, source, verdict, false));
+          () => setVerify(id, source, verdict, false),
+          { kind: "manual-verify", id, source, before: prior, beforeUrl: priorUrl });
       }
     }
   } else {
@@ -5122,7 +5333,8 @@ async function setManualUrl(id, source, url, track = true) {
       if (track) {
         pushOp(`manual source on ${row.book.title.slice(0, 32)}`,
           () => setManualUrl(id, source, prior, false),
-          () => setManualUrl(id, source, url, false));
+          () => setManualUrl(id, source, url, false),
+          { kind: "manual-url", id, source, before: prior });
       }
     }
   } else {
@@ -5435,7 +5647,8 @@ function pushManualCreateOp(entry) {
   const snap = JSON.parse(JSON.stringify(entry));
   pushOp(`create entry ${String(entry.title || "").slice(0, 36)}`,
     () => deleteManualById(snap.id),
-    () => restoreManualEntry(snap));
+    () => restoreManualEntry(snap),
+    { kind: "manual-create", id: snap.id });
 }
 
 async function deleteManual(id) {
@@ -5446,7 +5659,8 @@ async function deleteManual(id) {
     if (snap) {
       pushOp(`delete entry ${String(snap.title || "").slice(0, 36)}`,
         () => restoreManualEntry(snap),
-        () => deleteManualById(snap.id));
+        () => deleteManualById(snap.id),
+        { kind: "manual-restore", snap });
     }
     status("MANUAL ENTRY DELETED");
   } else {
@@ -7723,6 +7937,14 @@ function init() {
   });
   el("bottom-rows").addEventListener("click", (ev) => {
     if (ev.target.closest("a")) return;
+    // History tab: Ctrl+click reverts that action; plain click toggles detail
+    const hrow = ev.target.closest("tr.hist-row");
+    if (hrow) {
+      const hid = parseInt(hrow.dataset.hid, 10);
+      if (ev.ctrlKey || ev.metaKey) revertHistoryAction(hid);
+      else toggleHistDetail(hrow, hid);
+      return;
+    }
     const tr = ev.target.closest("tr.bottom-row");
     if (!tr) return;
     const rec = state.bottomRecords[parseInt(tr.dataset.bi, 10)];
