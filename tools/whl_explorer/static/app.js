@@ -2994,8 +2994,12 @@ function uncheckRow(key) {
 // Delete key while hovering a checked-table row trashes that entry — the
 // reversible replacement for the removed Actions column (undo restores it).
 function onRowDeleteKey(ev) {
-  if (ev.key !== "Delete") return;
+  if (ev.key !== "Delete" || ev.repeat) return;   // ignore key auto-repeat (a hold = one delete)
   if (/^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName) || ev.target.isContentEditable) return;
+  // don't delete a row out from under an open floating popup (it doesn't cover
+  // the rows the way a full-screen .overlay modal does)
+  const pm = el("popup-menu"), asp = el("adv-search-pop");
+  if ((pm && !pm.hidden) || (asp && !asp.hidden)) return;
   const tr = document.querySelector("#checked-rows tr:hover");
   if (!tr || !tr.dataset.rowId) return;   // real/volume rows only (not set headers)
   const row = state.rowsById.get(String(tr.dataset.rowId));
