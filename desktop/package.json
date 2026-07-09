@@ -1,0 +1,54 @@
+{
+  "name": "whl-catalog-explorer",
+  "productName": "Catalog Explorer",
+  "version": "3.0.0",
+  "description": "Desktop shell for the World Herb Library Catalog Explorer (Flask sidecar + Electron)",
+  "author": "Andrew James Miller",
+  "license": "UNLICENSED",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build:sidecar": "python -m PyInstaller --clean --noconfirm --distpath dist-sidecar --workpath build-sidecar sidecar/whl_explorer.spec",
+    "pack": "electron-builder --dir",
+    "dist": "npm run build:sidecar && electron-builder --win"
+  },
+  "devDependencies": {
+    "electron": "^31.7.7",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "org.worldherblibrary.catalogexplorer",
+    "productName": "Catalog Explorer",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "dist-sidecar/whl-explorer-sidecar",
+        "to": "sidecar",
+        "filter": ["**/*"]
+      }
+    ],
+    "win": {
+      "target": [
+        { "target": "msi", "arch": ["x64"] }
+      ],
+      "icon": "build/icon.ico",
+      "artifactName": "CatalogExplorer-${version}.${ext}"
+    },
+    "msi": {
+      "oneClick": false,
+      "perMachine": false,
+      "runAfterFinish": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  }
+}

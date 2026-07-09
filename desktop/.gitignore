@@ -1,0 +1,6 @@
+# Electron / build artifacts
+node_modules/
+release/
+dist-sidecar/
+build-sidecar/
+*.log

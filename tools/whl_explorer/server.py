@@ -21,6 +21,7 @@ then open http://127.0.0.1:5001
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import threading
@@ -41,7 +42,19 @@ import scan_search  # noqa: E402
 import whl_client  # noqa: E402
 import whl_scrape  # noqa: E402
 
-app = Flask(__name__)
+def _flask_app():
+    # When frozen (PyInstaller), templates/ and static/ are bundled at the
+    # extraction root (sys._MEIPASS), not next to this module — point Flask
+    # there. In a normal checkout Flask's default relative lookup is correct.
+    if getattr(sys, "frozen", False):
+        base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+        return Flask(__name__,
+                     template_folder=str(base / "templates"),
+                     static_folder=str(base / "static"))
+    return Flask(__name__)
+
+
+app = _flask_app()
 
 
 # --- the CH private-library catalogue -------------------------------------------
@@ -1802,4 +1815,8 @@ if __name__ == "__main__":
                         _drives()),
         daemon=True,
     ).start()
-    app.run(host="127.0.0.1", port=5001, debug=False)
+    # WHL_PORT lets a second instance run on another port (a distinct origin,
+    # so its localStorage/client-state can't collide with the main one) — used
+    # to test against a throwaway WHL_DATA_ROOT without touching live state.
+    port = int(os.environ.get("WHL_PORT") or 5001)
+    app.run(host="127.0.0.1", port=port, debug=False)
