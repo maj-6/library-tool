@@ -43,6 +43,10 @@ import scan_search  # noqa: E402
 import whl_client  # noqa: E402
 import whl_scrape  # noqa: E402
 
+# NYPL Catalog of Copyright Entries dataset (optional, for the copyright tag's
+# registration half): drop the parsed XML tree under <DATA_ROOT>/nypl_cce/.
+copyreg.NYPL_DIR = str(lib.DATA_ROOT / "nypl_cce")
+
 def _flask_app():
     # When frozen (PyInstaller), templates/ and static/ are bundled at the
     # extraction root (sys._MEIPASS), not next to this module — point Flask

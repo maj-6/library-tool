@@ -16,9 +16,12 @@ identity test).
 from __future__ import annotations
 
 import json
+import os
+import re
 import sys
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -88,12 +91,134 @@ def cprs_registration(title: str, author: str = "", year_value=None,
     return None
 
 
-def nypl_registration(title: str, author: str = "", year_value=None) -> dict | None:
-    """Placeholder for the NYPL CCE registrations dataset lookup (offline).
+# --- NYPL Catalog of Copyright Entries (books 1923-1963) --------------------
+# The dataset is the parsed XML from github.com/NYPL/catalog_of_copyright_entries_project
+# (its `xml/` tree of <copyrightEntry> records). NYPL matching is OFF unless the
+# dataset directory is present. The server points NYPL_DIR at <DATA_ROOT>/nypl_cce;
+# WHL_NYPL_CCE_DIR overrides. A parsed index is cached beside the data so repeat
+# runs don't re-scan ~640k records.
+NYPL_DIR: str | None = None
+_nypl_index: dict | None = None   # {"sig", "entries": [ {title,author,regnum,year} ], "by_token": {tok:[i]}}
 
-    Returns None until the dataset is fetched and indexed; wiring it here keeps
-    registration_lookup source-agnostic.
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_STOP = {"the", "a", "an", "of", "and", "or", "to", "in", "on", "for", "with",
+         "by", "de", "la", "le", "el", "und", "der", "die", "das"}
+
+
+def _title_tokens(title: str) -> list[str]:
+    return [t for t in _TOKEN_RE.findall(str(title or "").lower())
+            if len(t) > 2 and t not in _STOP]
+
+
+def _nypl_dataset_dir() -> Path | None:
+    for cand in (NYPL_DIR, os.environ.get("WHL_NYPL_CCE_DIR")):
+        if cand and Path(cand).is_dir():
+            return Path(cand)
+    return None
+
+
+def _nypl_signature(root: Path) -> str:
+    import hashlib
+    h = hashlib.sha1()
+    for p in sorted(root.rglob("*.xml")):
+        try:
+            st = p.stat()
+            h.update(f"{p.name}|{st.st_size}|{int(st.st_mtime)}".encode())
+        except OSError:
+            pass
+    return h.hexdigest()[:16]
+
+
+def _parse_nypl_dir(root: Path) -> list[dict]:
+    entries: list[dict] = []
+    for xf in sorted(root.rglob("*.xml")):
+        try:
+            tree = ET.parse(str(xf))
+        except (ET.ParseError, OSError):
+            continue
+        for el in tree.iter("copyrightEntry"):
+            te = el.find("title")   # note: an Element with no children is falsy, so `is not None`
+            title = ("".join(te.itertext()).strip() if te is not None else "")
+            if not title:
+                continue
+            an = el.find("author/authorName")
+            author = ("".join(an.itertext()).strip() if an is not None else "")
+            regnum = (el.get("regnum") or "").strip()
+            if not regnum:
+                rn = el.find("regNum")
+                regnum = ("".join(rn.itertext()).strip().rstrip(".") if rn is not None else "")
+            rd = el.find("regDate")
+            date = (rd.get("date") if rd is not None else "") or ""
+            year = date[:4] if date[:4].isdigit() else ""
+            entries.append({"title": title, "author": author,
+                            "regnum": regnum, "year": year})
+    return entries
+
+
+def _load_nypl_index() -> dict | None:
+    """Lazily build (and disk-cache) the title-token index of the NYPL dataset."""
+    global _nypl_index
+    root = _nypl_dataset_dir()
+    if root is None:
+        return None
+    sig = _nypl_signature(root)
+    if _nypl_index is not None and _nypl_index.get("sig") == sig:
+        return _nypl_index
+    cache = root / ".nypl_index.json"
+    entries = None
+    if cache.is_file():
+        try:
+            blob = json.loads(cache.read_text("utf-8"))
+            if blob.get("sig") == sig:
+                entries = blob.get("entries")
+        except Exception:
+            entries = None
+    if entries is None:
+        entries = _parse_nypl_dir(root)
+        try:
+            cache.write_text(json.dumps({"sig": sig, "entries": entries}), "utf-8")
+        except Exception:
+            pass
+    by_token: dict[str, list[int]] = {}
+    for i, e in enumerate(entries):
+        for tok in set(_title_tokens(e["title"])):
+            by_token.setdefault(tok, []).append(i)
+    _nypl_index = {"sig": sig, "entries": entries, "by_token": by_token}
+    return _nypl_index
+
+
+def nypl_registration(title: str, author: str = "", year_value=None) -> dict | None:
+    """Best matching book registration in the NYPL CCE dataset, or None.
+
+    Prefilters candidates by the rarest shared title token, then applies the
+    shared title/author identity test. Inert (None) when the dataset is absent.
     """
+    title = str(title or "").strip()
+    if not title:
+        return None
+    idx = _load_nypl_index()
+    if not idx:
+        return None
+    toks = _title_tokens(title)
+    if not toks:
+        return None
+    by_token, entries = idx["by_token"], idx["entries"]
+    postings = [by_token.get(t, ()) for t in set(toks)]
+    postings = [p for p in postings if p]
+    if not postings:
+        return None
+    candidates = min(postings, key=len)   # the most selective title token
+    for i in candidates:
+        e = entries[i]
+        if cc.title_author_match(title, author, e["title"], e["author"]):
+            return {
+                "source": "nypl",
+                "reg_number": e["regnum"],
+                "title": e["title"],
+                "author": e["author"],
+                "year": e["year"],
+                "record_id": "",
+            }
     return None
 
 
