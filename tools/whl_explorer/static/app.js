@@ -2126,11 +2126,12 @@ function onSearchKey(ev) {
     status("IA SEARCH :: " + q.slice(0, 55));
     return;
   }
-  // otherwise Google title + author + year in the embedded view
+  // otherwise Google title + author + year in a new browser tab (the embedded
+  // view can't render Google — it blocks framing)
   const q = [b.title, b.author, b.year].map((x) => String(x || "").trim())
     .filter(Boolean).join(" ");
   const url = "https://www.google.com/search?q=" + encodeURIComponent(q);
-  if (!openWebView(url)) window.open(url, "_blank", "noopener");
+  window.open(url, "_blank", "noopener");
   status("SEARCH :: " + q.slice(0, 60));
 }
 
@@ -6503,6 +6504,31 @@ async function renderOcrPages() {
   decorateOcrPages();
 }
 
+// Swap only the OCR text alongside the already-rendered page images — used when
+// selecting another document of the SAME book in the page view, so the PDF page
+// images stay loaded instead of being torn down and re-fetched. Returns false
+// if the on-screen structure (paged vs. whole) doesn't match the new doc, so
+// the caller can fall back to a full re-render.
+function refillOcrPageText(d) {
+  const box = el("ocr-pages");
+  const paged = box.querySelectorAll("textarea[data-pn]");
+  const whole = box.querySelector("textarea[data-whole]");
+  const sections = ocrPageSections(d.text);
+  if (sections && paged.length) {
+    ocrState.pages = sections;
+    paged.forEach((ta) => { ta.value = sections.map.get(+ta.dataset.pn) || ""; });
+    decorateOcrPages();
+    return true;
+  }
+  if (!sections && whole) {
+    ocrState.pages = null;
+    whole.value = d.text;
+    decorateOcrPages();
+    return true;
+  }
+  return false;
+}
+
 // edits in the page view flow back into the document text (debounced; the
 // pending write is bound to this doc + section structure, so a late fire
 // after switching documents can never touch the wrong one)
@@ -7097,7 +7123,17 @@ function initOcrTab() {
     const li = ev.target.closest("li.ocr-doc");
     if (!li) return;
     ocrSyncEditor();
+    const prev = ocrSelDoc();
     ocrState.sel = li.dataset.did;
+    const d = ocrSelDoc();
+    // Page view + same book: keep the loaded page images and swap only the text
+    // alongside them (don't tear down and re-fetch the PDF).
+    const sameBook = ocrState.view === "pdf" && d && prev && d.buildId &&
+      d.buildId === prev.buildId && el("ocr-pages").querySelector(".ocr-pgrow");
+    if (sameBook && refillOcrPageText(d)) {
+      renderOcrDocs();   // refresh the docs-list active highlight only
+      return;
+    }
     renderOcrTab();
   });
   el("ocr-view-edit").addEventListener("click", () => setOcrView("edit"));
