@@ -119,7 +119,8 @@ def search_internet_archive(
         url = IA_SEARCH_API + "?" + urllib.parse.urlencode(
             {
                 "q": q,
-                "fl[]": ["identifier", "title", "creator", "year"],
+                "fl[]": ["identifier", "title", "creator", "year",
+                         "access-restricted-item"],
                 "rows": limit,
                 "output": "json",
             },
@@ -148,12 +149,17 @@ def search_internet_archive(
                 creator = d.get("creator")
                 if isinstance(creator, list):
                     creator = "; ".join(str(c) for c in creator)
+                # access-restricted-item == "true" means borrow/lending only,
+                # i.e. no direct download; anything else is downloadable
+                restricted = str(
+                    d.get("access-restricted-item", "") or "").strip().lower() == "true"
                 m = {
                     "identifier": ident,
                     "title": str(d.get("title", "") or ""),
                     "author": str(creator or ""),
                     "year": str(d.get("year", "") or ""),
                     "url": f"https://archive.org/details/{ident}",
+                    "downloadable": not restricted,
                 }
                 m["accuracy"], m["_rank"] = _score(query, m["title"], m["author"], m["year"])
                 by_id[ident] = m
@@ -167,9 +173,13 @@ def search_internet_archive(
     matches = sorted(by_id.values(), key=lambda m: (m["_rank"], m["accuracy"]), reverse=True)
     for m in matches:
         del m["_rank"]
-    out["matches"] = matches[:MAX_MATCHES]
-    out["best_match"] = matches[0] if matches else None
-    out["available"] = bool(matches and matches[0]["accuracy"] >= MATCH_THRESHOLD)
+    # only matches with an available download count; a set of matches that are
+    # all borrow/lending only surfaces as "no_download" (the ND tag)
+    downloadable = [m for m in matches if m.get("downloadable")]
+    out["matches"] = downloadable[:MAX_MATCHES]
+    out["best_match"] = downloadable[0] if downloadable else None
+    out["available"] = bool(downloadable and downloadable[0]["accuracy"] >= MATCH_THRESHOLD)
+    out["no_download"] = bool(matches and not downloadable)
     return out
 
 

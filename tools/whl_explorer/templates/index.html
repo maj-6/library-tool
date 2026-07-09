@@ -1074,6 +1074,26 @@
     </span>
   </div>
 
+  <!-- INTERNET ARCHIVE VIEWER (PDF preview + metadata + downloads) -->
+  <div id="ia-overlay" class="overlay" hidden>
+    <div id="ia-window" class="win ia-win">
+      <div class="win-titlebar ia-bar">
+        <span id="ia-title" class="ia-title">Internet Archive</span>
+        <button id="ia-external" class="cad-btn tiny" type="button"
+                data-tip="Open on archive.org">&#8599;</button>
+        <button id="ia-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
+      </div>
+      <div class="ia-body">
+        <iframe id="ia-frame" class="ia-frame" referrerpolicy="no-referrer"></iframe>
+        <div class="ia-side">
+          <table id="ia-meta" class="ia-meta"></table>
+          <div class="ia-dl-head">Downloads</div>
+          <div id="ia-downloads" class="ia-downloads"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- EMBEDDED WEB VIEW (links open here instead of a new tab) -->
   <div id="webview-overlay" class="overlay" hidden>
     <div id="webview-window" class="win webview-win">

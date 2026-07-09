@@ -1692,6 +1692,41 @@ def api_webview():
     return Response(body, content_type=ctype or "application/octet-stream")
 
 
+@app.route("/api/ia/meta")
+def api_ia_meta():
+    """An Internet Archive item's metadata + downloadable files, for the in-app
+    IA viewer (preview + metadata table + download links)."""
+    ident = (request.args.get("id") or "").strip()
+    if not ident:
+        abort(400)
+    try:
+        with urllib.request.urlopen(
+                "https://archive.org/metadata/" + urllib.parse.quote(ident),
+                timeout=25) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        abort(502)
+    md = data.get("metadata") or {}
+    want = ("pdf", "epub", "text", "djvu")
+    dloads, seen = [], set()
+    for f in data.get("files") or []:
+        name, fmt = f.get("name") or "", f.get("format") or ""
+        low = fmt.lower()
+        if not name or not any(w in low for w in want) or fmt in seen:
+            continue
+        seen.add(fmt)   # one entry per format is enough for the picker
+        dloads.append({
+            "name": name, "format": fmt, "size": f.get("size"),
+            "url": (f"https://archive.org/download/{urllib.parse.quote(ident)}"
+                    f"/{urllib.parse.quote(name)}"),
+        })
+    pdf = next((d["url"] for d in dloads if "pdf" in d["format"].lower()), "")
+    return jsonify({
+        "id": ident, "metadata": md, "downloads": dloads, "pdf": pdf,
+        "details": "https://archive.org/details/" + ident,
+    })
+
+
 # --- WHL catalogue view (editable via a corrections overlay) --------------------
 
 WHL_CORRECTIONS_PATH = lib.OUTPUT_DIR / "whl_corrections.json"

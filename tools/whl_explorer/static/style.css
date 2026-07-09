@@ -1253,6 +1253,35 @@ form.orig-view .cad-input {
   border-radius: var(--radius);
 }
 
+/* internet archive viewer (PDF preview + metadata + downloads) */
+#ia-overlay { z-index: 61; padding: 4vh 12px; }
+.ia-win { width: min(1500px, 94vw); height: 90vh; padding: 0; overflow: hidden; }
+.ia-bar { justify-content: flex-start; gap: 6px; }
+.ia-bar .cad-btn { color: #fff; flex: 0 0 auto; }
+.ia-title {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-weight: normal; letter-spacing: 0; font-size: 13px;
+}
+.ia-body { flex: 1 1 auto; min-height: 0; display: flex; }
+.ia-frame { flex: 1 1 auto; min-width: 0; border: 0; background: #fff; }
+.ia-side {
+  flex: 0 0 320px; overflow: auto; padding: 8px 10px;
+  border-left: 1px solid var(--face-sh2); background: var(--face);
+}
+.ia-meta { width: 100%; border-collapse: collapse; font-size: 12px; }
+.ia-meta th {
+  text-align: left; vertical-align: top; white-space: nowrap;
+  padding: 2px 8px 2px 0; color: var(--face-sh2); font-weight: bold;
+}
+.ia-meta td { padding: 2px 0; word-break: break-word; }
+.ia-dl-head {
+  margin-top: 12px; padding-top: 8px; font-weight: bold; font-size: 12px;
+  border-top: 1px solid var(--face-sh2);
+}
+.ia-downloads { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.ia-dl { cursor: pointer; }
+
 /* embedded web view */
 #webview-overlay { z-index: 60; padding: 4vh 12px; }
 .webview-win {

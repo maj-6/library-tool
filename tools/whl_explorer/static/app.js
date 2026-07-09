@@ -1631,6 +1631,11 @@ function scanBadge(row, source, dot) {
     return verifyUnit(row, source,
       badge("available", isHt && s.full_view ? "VIEW" : "YES", { tip, href, dot }));
   }
+  // IA matched books, but every one is borrow/lending only (no direct download)
+  if (s.no_download) return badge("missing", "ND", {
+    tip: "Found on Internet Archive, but every match is borrow/lending only" +
+      " — no available download.\n" + tip,
+    href: s.search_url || "", dot });
   if (s.available === false) return badge("missing", "NO", { tip, dot });
   return badge("unknown", "?", { tip, href: s.search_url || "", dot });
 }
@@ -2064,6 +2069,14 @@ function onSearchKey(ev) {
   const b = bookAtHover();
   if (!b || !b.title) return;
   ev.preventDefault();
+  // over an Internet Archive tag -> IA search (title + author) in a new tab
+  if (document.querySelector('.tag-unit[data-vsrc="internet_archive"]:hover')) {
+    const q = [b.title, b.author].map((x) => String(x || "").trim()).filter(Boolean).join(" ");
+    window.open("https://archive.org/search?query=" + encodeURIComponent(q), "_blank", "noopener");
+    status("IA SEARCH :: " + q.slice(0, 55));
+    return;
+  }
+  // otherwise Google title + author + year in the embedded view
   const q = [b.title, b.author, b.year].map((x) => String(x || "").trim())
     .filter(Boolean).join(" ");
   const url = "https://www.google.com/search?q=" + encodeURIComponent(q);
@@ -7179,6 +7192,50 @@ function reloadWebView() {
   const u = el("webview-url").dataset.url;
   if (u) el("webview-frame").src = "/api/webview?url=" + encodeURIComponent(u);
 }
+
+// --- Internet Archive viewer (PDF preview + metadata + downloads) ------------
+async function openIaViewer(ident) {
+  if (!ident) return;
+  const meta = el("ia-meta"), dls = el("ia-downloads");
+  el("ia-title").textContent = "Internet Archive :: " + ident;
+  el("ia-frame").src = "about:blank";
+  meta.innerHTML = "<tr><td>Loading …</td></tr>";
+  dls.innerHTML = "";
+  el("ia-external").onclick = () =>
+    window.open("https://archive.org/details/" + ident, "_blank", "noopener");
+  el("ia-overlay").hidden = false;
+  let data;
+  try { data = await (await fetch("/api/ia/meta?id=" + encodeURIComponent(ident))).json(); }
+  catch (e) { meta.innerHTML = "<tr><td>Could not load Internet Archive metadata</td></tr>"; return; }
+  const md = data.metadata || {};
+  const arr = (v) => Array.isArray(v) ? v.join("; ") : (v == null ? "" : String(v));
+  el("ia-title").textContent = arr(md.title) || ident;
+  el("ia-external").onclick = () => window.open(data.details, "_blank", "noopener");
+  // PDF preview (or the details page proxied, if there is no downloadable PDF)
+  el("ia-frame").src = data.pdf
+    ? "/api/pdf?url=" + encodeURIComponent(data.pdf) + "&preview=1"
+    : "/api/webview?url=" + encodeURIComponent(data.details);
+  const rows = [["Title", "title"], ["Author", "creator"], ["Year", "year"], ["Date", "date"],
+    ["Publisher", "publisher"], ["Language", "language"], ["Pages", "imagecount"],
+    ["Subjects", "subject"], ["Collection", "collection"]];
+  meta.innerHTML = rows.map(([label, k]) => {
+    const v = arr(md[k]);
+    return v ? `<tr><th>${esc(label)}</th><td>${esc(v)}</td></tr>` : "";
+  }).join("") || "<tr><td>No metadata</td></tr>";
+  // download buttons — window.open bypasses the embedded-view interceptor
+  dls.innerHTML = (data.downloads || []).map((d, i) =>
+    `<button class="cad-btn tiny ia-dl" type="button" data-i="${i}">` +
+    `${esc(d.format || d.name)}${d.size ? " · " + fmtSize(+d.size) : ""}</button>`)
+    .join("") || "<span class='empty'>No downloads available</span>";
+  dls.querySelectorAll(".ia-dl").forEach((btn) => {
+    btn.onclick = () => window.open(data.downloads[+btn.dataset.i].url, "_blank", "noopener");
+  });
+}
+function closeIaViewer() {
+  el("ia-overlay").hidden = true;
+  el("ia-frame").src = "about:blank";
+}
+
 function initWebView() {
   el("webview-close").onclick = closeWebView;
   el("webview-reload").onclick = reloadWebView;
@@ -7200,10 +7257,19 @@ function initWebView() {
     const href = a.getAttribute("href") || "";
     if (!/^https?:\/\//i.test(href)) return;
     ev.preventDefault();
+    // Internet Archive links open the rich IA viewer instead of the web view
+    const iam = href.match(/archive\.org\/details\/([^/?#]+)/i);
+    if (iam) { openIaViewer(decodeURIComponent(iam[1])); return; }
     openWebView(href);
   });
+  el("ia-close").onclick = closeIaViewer;
+  el("ia-overlay").addEventListener("click", (ev) => {
+    if (ev.target === el("ia-overlay")) closeIaViewer();
+  });
   document.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape" && !el("webview-overlay").hidden) closeWebView();
+    if (ev.key !== "Escape") return;
+    if (!el("ia-overlay").hidden) closeIaViewer();
+    else if (!el("webview-overlay").hidden) closeWebView();
   });
 }
 
