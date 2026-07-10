@@ -2982,6 +2982,36 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 #cad-tooltip[hidden] { display: none; }
 
 /* --- settings window --- */
+/* --- changelog viewer (Help > View changelog) --- */
+#changelog-overlay { z-index: 55; }   /* same layer as the other detail windows */
+#changelog-window { width: min(560px, 100%); height: min(560px, 80vh); }
+.changelog-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px 18px 20px;
+}
+.cl-rel { margin: 0 0 18px; }
+.cl-rel:last-child { margin-bottom: 0; }
+.cl-ver {
+  margin: 0 0 6px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+  border-bottom: 1px solid var(--face-sh);
+  padding-bottom: 4px;
+}
+.cl-date {
+  font-weight: normal;
+  font-size: 11px;
+  color: var(--face-sh2);
+  font-family: var(--mono);
+  margin-left: 6px;
+  letter-spacing: 0.3px;
+}
+.cl-list { margin: 8px 0 0; padding-left: 18px; }
+.cl-list li { margin: 0 0 4px; line-height: 1.45; }
+
 #settings-overlay { z-index: 50; }
 #settings-window {
   width: min(760px, 100%);

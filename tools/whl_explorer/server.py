@@ -692,13 +692,42 @@ def _asset_v(filename):
         return "0"
 
 
+def _app_version():
+    """The version shown in the title bar. The Electron shell passes its own
+    version via WHL_APP_VERSION; a plain web run falls back to the newest
+    changelog heading so the number is never a stale hardcoded string."""
+    env_v = (os.environ.get("WHL_APP_VERSION") or "").strip()
+    if env_v:
+        return env_v
+    try:
+        text = lib.CHANGELOG_PATH.read_text(encoding="utf-8")
+        m = re.search(r"^##\s+(\S+)", text, re.MULTILINE)
+        if m:
+            return m.group(1)
+    except OSError:
+        pass
+    return "dev"
+
+
 @app.route("/")
 def home():
     return render_template(
         "index.html",
         app_v=_asset_v("app.js"),
         css_v=_asset_v("style.css"),
+        app_version=_app_version(),
     )
+
+
+@app.route("/api/changelog")
+def api_changelog():
+    """The shared release notes (website/changelog.md), served raw for the
+    in-app changelog viewer to render. Missing file -> empty, not an error."""
+    try:
+        text = lib.CHANGELOG_PATH.read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+    return Response(text, mimetype="text/markdown")   # Flask adds charset=utf-8
 
 
 @app.route("/api/books")

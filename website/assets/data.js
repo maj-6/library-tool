@@ -98,6 +98,38 @@ export async function latestReleases() {
   return rest("releases?select=*&order=published_at.desc");
 }
 
+/** The shared release notes: changelog.md at the site root, the same file the
+ *  desktop app bundles. Returns [{version, date, items[]}] newest-first, or []
+ *  on any failure so the pages degrade to no changelog rather than an error. */
+export async function fetchChangelog() {
+  try {
+    const r = await fetch("changelog.md");
+    if (!r.ok) return [];
+    return parseChangelog(await r.text());
+  } catch {
+    return [];
+  }
+}
+
+/** Terse markdown -> versions. "## <version> — <date>" starts an entry; "- "
+ *  lines are its bullets; a title or any preamble before the first entry is
+ *  ignored. Pure text out; the caller escapes before it touches the DOM. */
+export function parseChangelog(md) {
+  const out = [];
+  let cur = null;
+  for (const raw of String(md || "").split(/\r?\n/)) {
+    const line = raw.trim();
+    let m;
+    if ((m = /^##\s+(.+?)(?:\s+[—–·-]\s+(.+))?$/.exec(line))) {   // em/en/middot/hyphen date separator
+      cur = { version: m[1].trim(), date: (m[2] || "").trim(), items: [] };
+      out.push(cur);
+    } else if (cur && (m = /^[-*]\s+(.+)$/.exec(line))) {
+      cur.items.push(m[1].trim());
+    }
+  }
+  return out;
+}
+
 function orderClause(sort) {
   if (sort === "year") return "year.asc.nullslast,title.asc";
   if (sort === "year-desc") return "year.desc.nullslast,title.asc";

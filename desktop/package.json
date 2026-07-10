@@ -1,7 +1,7 @@
 {
   "name": "whl-library-tool",
   "productName": "Library Tool",
-  "version": "3.0.1",
+  "version": "3.1.0",
   "description": "Desktop shell for Library Tool — a World Herb Library companion (Flask sidecar + Electron)",
   "author": "Andrew James Miller",
   "license": "UNLICENSED",
@@ -31,6 +31,8 @@
     "files": [
       "main.js",
       "preload.js",
+      "updater.html",
+      "updater-preload.js",
       "package.json"
     ],
     "extraResources": [
@@ -45,7 +47,9 @@
         { "target": "nsis", "arch": ["x64"] }
       ],
       "icon": "build/icon.ico",
-      "artifactName": "LibraryTool-Setup-${version}.${ext}"
+      "artifactName": "LibraryTool-Setup-${version}.${ext}",
+      "signingHashAlgorithms": ["sha256"],
+      "rfc3161TimeStampServer": "http://timestamp.digicert.com"
     },
     "nsis": {
       "oneClick": false,

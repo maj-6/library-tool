@@ -31,6 +31,9 @@ _candidates = [
     (os.path.join(REPO, "output", "ch_library.json"), "output"),
     (os.path.join(REPO, "copyright_renewals.csv"), "."),
     (os.path.join(REPO, "whl_catalog.csv"), "."),
+    # release notes shared with the website; libcommon.CHANGELOG_PATH reads it
+    # from the bundle root when frozen.
+    (os.path.join(REPO, "website", "changelog.md"), "."),
 ]
 datas = [(s, d) for (s, d) in _candidates if os.path.exists(s)]
 

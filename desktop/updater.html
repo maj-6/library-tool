@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" />
+<title>Updating Library Tool</title>
+<style>
+  /* Self-contained: this splash paints BEFORE the Flask sidecar or the web UI
+     exist, so it carries its own copy of the app's theme palettes. The values
+     mirror the body[data-theme="…"] blocks in tools/whl_explorer/static/
+     style.css — keep them in step when a theme's core colours change. Only the
+     handful the splash needs: panel (window face), ink, muted, accent (bar
+     fill), track (bar groove), and radius. Default/unknown -> sage. */
+  :root {
+    --panel: #ffffff; --ink: #21261f; --muted: #8d9787;
+    --accent: #34635a; --track: #e6eae3; --radius: 6px;
+    --ui: "Segoe UI", Tahoma, Verdana, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--panel);
+    color: var(--ink);
+    font: 13px/1.5 var(--ui);
+    -webkit-font-smoothing: antialiased;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    /* the window is frameless; a hairline keeps the card off the desktop */
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--muted) 55%, transparent);
+    user-select: none;
+    cursor: default;
+    overflow: hidden;
+  }
+  main { width: 100%; padding: 20px 22px; }
+  .row { display: flex; align-items: baseline; gap: 8px; }
+  .app { font-size: 15px; font-weight: 600; letter-spacing: 0.2px; }
+  .ver { color: var(--muted); font-size: 12px; }
+  .status { margin: 12px 0 8px; color: var(--ink); }
+  .track {
+    height: 8px;
+    width: 100%;
+    background: var(--track);
+    border-radius: var(--radius);
+    overflow: hidden;
+    position: relative;
+  }
+  .fill {
+    height: 100%;
+    width: 0%;
+    background: var(--accent);
+    border-radius: inherit;
+    transition: width 0.25s ease;
+  }
+  /* indeterminate sweep, used before the first byte and during install */
+  body.busy .fill {
+    width: 40% !important;
+    transition: none;
+    animation: sweep 1.15s ease-in-out infinite;
+  }
+  @keyframes sweep {
+    0%   { transform: translateX(-110%); }
+    100% { transform: translateX(275%); }
+  }
+  .sub {
+    margin-top: 8px;
+    color: var(--muted);
+    font-size: 12px;
+    min-height: 15px;
+    font-variant-numeric: tabular-nums;
+  }
+</style>
+</head>
+<body class="busy">
+  <main>
+    <div class="row">
+      <span class="app">Library Tool</span>
+      <span class="ver" id="ver"></span>
+    </div>
+    <div class="status" id="status">Preparing update&hellip;</div>
+    <div class="track"><div class="fill" id="fill"></div></div>
+    <div class="sub" id="sub"></div>
+  </main>
+<script>
+  // Palettes mirror style.css theme blocks. { panel, ink, muted, accent, track, radius }.
+  var THEMES = {
+    sage:     { panel:"#ffffff", ink:"#21261f", muted:"#8d9787", accent:"#34635a", track:"#e6eae3", radius:"6px" },
+    ledger:   { panel:"#f6f5f1", ink:"#26241f", muted:"#8f8d84", accent:"#22685e", track:"#e8e7e2", radius:"2px" },
+    foolscap: { panel:"#f2efe8", ink:"#221c14", muted:"#a49d8e", accent:"#2f6f68", track:"#e6e3db", radius:"1px" },
+    vellum:   { panel:"#f6f2ea", ink:"#2a2620", muted:"#a49a86", accent:"#2f6a63", track:"#e9e4d8", radius:"2px" },
+    linen:    { panel:"#efece4", ink:"#2c2a24", muted:"#948e7e", accent:"#356a60", track:"#e0dcd2", radius:"2px" },
+    quarto:   { panel:"#ffffff", ink:"#1b1f26", muted:"#98a1af", accent:"#2c5a8a", track:"#e9ecf1", radius:"1px" },
+    pewter:   { panel:"#f2f4f6", ink:"#23282e", muted:"#99a0aa", accent:"#37656e", track:"#dde0e5", radius:"2px" },
+    folio:    { panel:"#eef1f6", ink:"#232830", muted:"#98a3b4", accent:"#2f6675", track:"#dbe1e9", radius:"2px" },
+    platinum: { panel:"#f5f6f7", ink:"#1e2124", muted:"#8e939a", accent:"#38646e", track:"#e2e4e6", radius:"1px" },
+    redmond:  { panel:"#e7e5de", ink:"#201e19", muted:"#808080", accent:"#2e6a74", track:"#d6d3ca", radius:"0px" },
+    motif:    { panel:"#e2e5ee", ink:"#22262e", muted:"#7c8399", accent:"#366b70", track:"#ccd0dc", radius:"0px" },
+  };
+  function applyTheme(name) {
+    var t = THEMES[name] || THEMES.sage;
+    var r = document.documentElement.style;
+    r.setProperty("--panel", t.panel);
+    r.setProperty("--ink", t.ink);
+    r.setProperty("--muted", t.muted);
+    r.setProperty("--accent", t.accent);
+    r.setProperty("--track", t.track);
+    r.setProperty("--radius", t.radius);
+  }
+  var $ = function (id) { return document.getElementById(id); };
+  function fmtMB(bytes) { return (bytes / 1048576).toFixed(1) + " MB"; }
+
+  var api = window.whlUpdater;
+  if (api) {
+    api.onTheme(applyTheme);
+    api.onStatus(function (s) {
+      if (!s) return;
+      if (s.phase === "install") {
+        $("status").textContent = "Installing" + (s.version ? " " + s.version : "") + "…";
+        $("sub").textContent = "The app will restart automatically.";
+        document.body.classList.add("busy");           // indeterminate during install
+      } else if (s.phase === "download") {
+        $("status").textContent = "Downloading update" + (s.version ? " " + s.version : "") + "…";
+        if (s.version) $("ver").textContent = "v" + s.version;
+      }
+    });
+    api.onProgress(function (p) {
+      if (!p || typeof p.percent !== "number") return;
+      document.body.classList.remove("busy");           // switch to determinate
+      var pct = Math.max(0, Math.min(100, p.percent));
+      $("fill").style.width = pct.toFixed(0) + "%";
+      var line = pct.toFixed(0) + "%";
+      if (p.total) line += "  ·  " + fmtMB(p.transferred || 0) + " of " + fmtMB(p.total);
+      $("sub").textContent = line;
+    });
+  }
+</script>
+</body>
+</html>

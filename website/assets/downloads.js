@@ -1,4 +1,4 @@
-import { latestReleases, usingCloud, safeHttpUrl } from "./data.js";
+import { latestReleases, usingCloud, safeHttpUrl, fetchChangelog } from "./data.js";
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -50,8 +50,22 @@ try {
   const rows = usingCloud ? newest(await latestReleases()) : [];
   box.innerHTML = rows.length
     ? rows.map(card).join("")
-    : `<div class="note">No release has been published yet. Build from source
-       below, or check back once the first installer ships.</div>`;
+    : `<div class="note">No release has been published yet — check back once the
+       first installer ships, or build from the source on GitHub.</div>`;
 } catch (e) {
   box.innerHTML = `<div class="note">Could not load releases: ${esc(e.message)}</div>`;
+}
+
+// "What's new": the newest changelog entry, with a link to the full history.
+const clBox = document.getElementById("changelog");
+const versions = await fetchChangelog();
+clBox.innerHTML = versions.length
+  ? release(versions[0])
+  : `<p class="muted">No release notes yet.</p>`;
+
+function release(v) {
+  return `<section class="cl-rel">
+    <h3 class="cl-ver">${esc(v.version)}${v.date ? ` <span class="cl-date">${esc(v.date)}</span>` : ""}</h3>
+    <ul class="cl-list">${v.items.map((i) => `<li>${esc(i)}</li>`).join("")}</ul>
+  </section>`;
 }

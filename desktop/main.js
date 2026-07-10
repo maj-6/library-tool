@@ -20,7 +20,9 @@ const fs = require("fs");
 
 let sidecar = null;
 let mainWindow = null;
+let updaterWin = null;        // frameless update splash, shown only while updating
 let sidecarPort = null;
+let mainReady = false;        // gates window-all-closed: don't quit mid-startup
 
 const isDev = !app.isPackaged;
 
@@ -57,6 +59,7 @@ function sidecarCommand(port, dataRoot) {
   const env = Object.assign({}, process.env, {
     WHL_PORT: String(port),
     WHL_DATA_ROOT: dataRoot,
+    WHL_APP_VERSION: app.getVersion(),   // so the UI shows the real shell version
   });
   if (isDev) {
     // dev: run the Python source straight from the repo (../tools/...)
@@ -138,40 +141,159 @@ function createWindow() {
     return { action: "deny" };
   });
   mainWindow.on("closed", () => { mainWindow = null; });
+  mainReady = true;   // from here a window-all-closed is a real user quit
 }
 
-// Auto-update: check GitHub Releases (maj-6/library-tool) once at startup,
-// download in the background, and offer a restart when it is ready. Offline or
-// rate-limited just means "no update today" — never a dialog.
-function startUpdateCheck() {
-  if (isDev) return;                       // dev runs from source
-  let updater;
+// The persisted UI theme, read straight off disk so the update splash matches
+// it before the sidecar (which owns client_state) is even running. Mirrors the
+// theme ids in tools/whl_explorer/static/app.js; anything unknown -> sage.
+const KNOWN_THEMES = new Set([
+  "sage", "ledger", "foolscap", "vellum", "linen", "quarto",
+  "pewter", "folio", "platinum", "redmond", "motif",
+]);
+function readActiveTheme() {
   try {
-    updater = require("electron-updater").autoUpdater;
+    const p = path.join(app.getPath("userData"), "output", "client_state.json");
+    const t = JSON.parse(fs.readFileSync(p, "utf8"))?.settings?.theme;
+    return KNOWN_THEMES.has(t) ? t : "sage";
   } catch (e) {
-    return;                                // packaged without the dep: skip
+    return "sage";                         // first run / unreadable -> default
   }
-  updater.autoDownload = true;
-  updater.on("error", (err) => console.error("[updater]", err && err.message));
-  updater.on("update-downloaded", (info) => {
-    // "Later" is the default: this dialog pops at an unpredictable moment, and
-    // a buffered Enter from mid-typing must not quit the app into an installer.
-    dialog.showMessageBox(mainWindow, {
-      type: "info",
-      buttons: ["Restart now", "Later"],
-      defaultId: 1,
-      cancelId: 1,
-      title: "Library Tool",
-      message: `Library Tool ${info.version} is ready to install.`,
-      detail: "It installs when the app restarts. Your catalogue and settings are untouched.",
-    }).then(({ response }) => {
-      if (response === 0) updater.quitAndInstall();
+}
+
+let updaterStatus = null;     // latest {phase, version} pushed to the splash
+
+function sendUpdater(channel, payload) {
+  if (updaterWin && !updaterWin.isDestroyed() && updaterWin.webContents) {
+    updaterWin.webContents.send(channel, payload);
+  }
+}
+
+// Set + push the splash status. Storing it means did-finish-load can REPLAY the
+// current phase: on a cached/fast update, update-downloaded ("install") can fire
+// before the renderer has registered its listeners, so a plain send is dropped —
+// the replay ensures the splash lands on "Installing…", not a stale "Downloading".
+function setUpdaterStatus(status) {
+  updaterStatus = status;
+  sendUpdater("updater:status", status);
+}
+
+function createUpdaterWindow(theme) {
+  updaterWin = new BrowserWindow({
+    width: 460, height: 200,
+    resizable: false, movable: false, minimizable: false, maximizable: false,
+    center: true, frame: false, show: false, skipTaskbar: false,
+    title: "Updating Library Tool",
+    webPreferences: {
+      preload: path.join(__dirname, "updater-preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  // replay theme + the CURRENT status once the renderer has run its script
+  // (listeners registered); show once it has painted — avoids a lost IPC and a
+  // white flash.
+  updaterWin.webContents.on("did-finish-load", () => {
+    sendUpdater("updater:theme", theme);
+    if (updaterStatus) sendUpdater("updater:status", updaterStatus);
+  });
+  updaterWin.once("ready-to-show", () => { if (updaterWin) updaterWin.show(); });
+  updaterWin.on("closed", () => { updaterWin = null; });
+  updaterWin.loadFile(path.join(__dirname, "updater.html"));
+}
+
+function closeUpdaterWindow() {
+  if (updaterWin && !updaterWin.isDestroyed()) updaterWin.close();
+  updaterWin = null;
+  updaterStatus = null;
+}
+
+// Auto-update GATE: on startup (packaged only) check GitHub Releases once. If an
+// update is waiting, show the frameless progress splash, download it, install
+// it, and let NSIS relaunch the new version — the main app never opens on the
+// old one. No update, offline, a slow check, or any error just falls through to
+// a normal launch, so startup can never hang on the network. Resolves 'launch'
+// (open the app now) or 'installing' (we are quitting into the installer).
+function runUpdateGate() {
+  return new Promise((resolve) => {
+    if (isDev) return resolve("launch");   // dev runs from source; updater is inert
+    let updater;
+    try {
+      updater = require("electron-updater").autoUpdater;
+    } catch (e) {
+      return resolve("launch");            // packaged without the dep: skip
+    }
+
+    let settled = false;
+    let checkTimer = null;
+    let stallTimer = null;
+    const finish = (outcome) => {
+      if (settled) return;
+      settled = true;
+      if (checkTimer) clearTimeout(checkTimer);
+      if (stallTimer) clearTimeout(stallTimer);
+      if (outcome === "launch") closeUpdaterWindow();
+      resolve(outcome);
+    };
+    // a download that stalls with no bytes and no error must not strand startup
+    const armStall = () => {
+      if (stallTimer) clearTimeout(stallTimer);
+      stallTimer = setTimeout(() => finish("launch"), 120000);
+    };
+
+    const theme = readActiveTheme();
+    updater.autoDownload = false;                 // probe first, then decide
+    updater.autoInstallOnAppQuit = true;          // if we fall through mid-download, install on next quit
+
+    // The progress listener MUST exist before the download starts (electron-updater
+    // only wires onProgress when something is listening), so attach it up front.
+    updater.on("download-progress", (p) => { armStall(); sendUpdater("updater:progress", p); });
+    updater.on("update-not-available", () => finish("launch"));
+    updater.on("error", (err) => {
+      console.error("[updater]", err && err.message);
+      finish("launch");                           // never block launch on an update error
+    });
+    updater.on("update-available", (info) => {
+      if (settled) return;
+      if (checkTimer) { clearTimeout(checkTimer); checkTimer = null; }  // committed: the download sets its own pace
+      setUpdaterStatus({ phase: "download", version: info.version });
+      createUpdaterWindow(theme);
+      armStall();
+      updater.downloadUpdate().catch((err) => {
+        console.error("[updater] download", err && err.message);
+        finish("launch");
+      });
+    });
+    updater.on("update-downloaded", (info) => {
+      if (settled) return;
+      settled = true;                             // committed to installing; the splash rides until quit
+      if (checkTimer) clearTimeout(checkTimer);
+      if (stallTimer) clearTimeout(stallTimer);
+      setUpdaterStatus({ phase: "install", version: info.version });
+      app.isQuitting = true;
+      // a short beat so "Installing…" paints before the app tears down
+      setTimeout(() => updater.quitAndInstall(false, true), 500);
+      resolve("installing");
+    });
+
+    checkTimer = setTimeout(() => finish("launch"), 8000);   // slow/hung check -> just launch
+    updater.checkForUpdates().catch((err) => {
+      console.error("[updater] check", err && err.message);
+      finish("launch");
     });
   });
-  updater.checkForUpdates().catch(() => { /* offline; next launch tries again */ });
 }
 
 app.whenReady().then(async () => {
+  // Update first: if one is installing, we quit into NSIS and never launch here.
+  let outcome = "launch";
+  try {
+    outcome = await runUpdateGate();
+  } catch (e) {
+    outcome = "launch";
+  }
+  if (outcome === "installing") return;
+
   try {
     await startSidecar();
   } catch (e) {
@@ -179,14 +301,16 @@ app.whenReady().then(async () => {
     app.quit();
     return;
   }
+  closeUpdaterWindow();     // no-op unless a failed download left the splash up
   createWindow();
-  startUpdateCheck();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 });
 
-app.on("window-all-closed", () => app.quit());
+// Don't quit while the splash opens and closes during startup; only once the
+// real window has existed does closing the last window mean the user is done.
+app.on("window-all-closed", () => { if (mainReady) app.quit(); });
 app.on("before-quit", () => {
   app.isQuitting = true;
   if (sidecar) { try { sidecar.kill(); } catch (e) { /* already gone */ } }

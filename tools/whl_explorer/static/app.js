@@ -2399,6 +2399,52 @@ function initSettingsNav() {
 function openSettings() { renderSettings(); el("settings-overlay").hidden = false; }
 function closeSettings() { el("settings-overlay").hidden = true; }
 
+// --- changelog viewer ----------------------------------------------------------
+// Renders the shared release notes (website/changelog.md, served by
+// /api/changelog). The format is terse: "## <version> — <date>" headings and
+// "- " bullets, with any preamble before the first version ignored. Everything
+// is escaped; no markdown HTML is trusted.
+let changelogLoaded = false;
+function openChangelog() {
+  el("changelog-overlay").hidden = false;
+  if (changelogLoaded) return;
+  const body = el("changelog-body");
+  body.innerHTML = '<p class="pane-note">Loading…</p>';
+  fetch("/api/changelog")
+    .then((r) => (r.ok ? r.text() : Promise.reject(new Error("http " + r.status))))
+    .then((md) => { body.innerHTML = changelogHTML(parseChangelog(md)); changelogLoaded = true; })
+    .catch(() => { body.innerHTML = '<p class="pane-note">Couldn’t load the changelog.</p>'; });
+}
+function closeChangelog() { el("changelog-overlay").hidden = true; }
+
+function parseChangelog(md) {
+  const versions = [];
+  let cur = null;
+  for (const raw of String(md || "").split(/\r?\n/)) {
+    const line = raw.trim();
+    let m;
+    if ((m = /^##\s+(.+?)(?:\s+[—–·-]\s+(.+))?$/.exec(line))) {   // em/en/middot/hyphen date separator
+      cur = { version: m[1].trim(), date: (m[2] || "").trim(), items: [] };
+      versions.push(cur);
+    } else if (cur && (m = /^[-*]\s+(.+)$/.exec(line))) {
+      cur.items.push(m[1].trim());
+    }
+    // title, preamble, and blank lines are ignored
+  }
+  return versions;
+}
+
+function changelogHTML(versions) {
+  if (!versions.length) return '<p class="pane-note">No changelog yet.</p>';
+  return versions.map((v) =>
+    '<section class="cl-rel"><h3 class="cl-ver">' + esc(v.version) +
+    (v.date ? ' <span class="cl-date">' + esc(v.date) + "</span>" : "") +
+    "</h3><ul class=\"cl-list\">" +
+    v.items.map((i) => "<li>" + esc(i) + "</li>").join("") +
+    "</ul></section>"
+  ).join("");
+}
+
 // --- FIND syntax ---------------------------------------------------------------
 // @token constrains by author (last name), #token by publication year,
 // everything else is title text.
@@ -10080,6 +10126,7 @@ const MENU_CMDS = {
   "scrape": () => startWhlScrape(),
   "dl-approved": () => downloadApproved(),
   "setup-guide": () => showWizard(),
+  "changelog": () => openChangelog(),
   "site-home": () => openWebView("https://maj-6.github.io/library-tool/"),
 };
 
@@ -10907,6 +10954,10 @@ function init() {
   el("settings-overlay").addEventListener("mousedown", (ev) => {
     if (ev.target === el("settings-overlay")) closeSettings();
   });
+  el("changelog-close").addEventListener("click", closeChangelog);
+  el("changelog-overlay").addEventListener("mousedown", (ev) => {
+    if (ev.target === el("changelog-overlay")) closeChangelog();
+  });
   document.addEventListener("keydown", (ev) => {
     if (ev.key !== "Escape") return;
     if (!el("auth-overlay").hidden) hideAuthOverlay();   // topmost (z 62)
@@ -10917,6 +10968,7 @@ function init() {
     else if (!el("md-overlay").hidden) closeMarkdownEditor(false);
     else if (!el("msrc-overlay").hidden) closeManualSource();
     else if (!el("review-overlay").hidden) closeReviewWin();
+    else if (!el("changelog-overlay").hidden) closeChangelog();
     else if (!el("settings-overlay").hidden) closeSettings();
   });
 

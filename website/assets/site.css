@@ -210,6 +210,33 @@ ol.volumes { list-style: none; margin: 0; padding: 0; }
 }
 .rel .actions { grid-column: 2; grid-row: 1 / span 2; }
 
+/* --- changelog / release notes --- */
+.changelog { margin: 0; }
+.cl-rel { padding: 16px 0; border-top: 1px solid var(--rule-soft); }
+.cl-rel:first-child { border-top: none; padding-top: 2px; }
+.cl-ver {
+  font-family: var(--slab);
+  font-size: 18px;
+  font-weight: 600;
+  margin: 0 0 8px;
+  color: var(--ink);
+}
+.cl-date {
+  font: 12px/1 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  letter-spacing: 0.5px;
+  color: var(--ink-faint);
+  font-weight: normal;
+  margin-left: 8px;
+}
+.cl-list { margin: 0; padding-left: 20px; }
+.cl-list li { margin: 0 0 5px; color: var(--ink); }
+.changelog-more {
+  margin-top: 20px;
+  font: 12px/1 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
 @media (max-width: 720px) {
   /* Stack the nav above the content; run the links horizontally like tabs. */
   .layout { grid-template-columns: 1fr; gap: 22px; margin-top: 28px; }

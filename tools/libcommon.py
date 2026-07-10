@@ -65,6 +65,15 @@ CLIENT_STATE_PATH = OUTPUT_DIR / "client_state.json"
 XLSX_PATH = APP_ROOT / "ch_library.xlsx"
 CH_LIBRARY_JSON_PATH = APP_ROOT / "output" / "ch_library.json"
 
+# Release notes, authored once in website/changelog.md and shared by the website
+# and the desktop app (Help > View changelog). A frozen build bundles the file
+# to the app root (see desktop/sidecar/whl_explorer.spec); a dev checkout reads
+# it straight from website/.
+CHANGELOG_PATH = (
+    APP_ROOT / "changelog.md" if getattr(sys, "frozen", False)
+    else ROOT / "website" / "changelog.md"
+)
+
 # Internet Archive PDF downloads + their cataloging metadata (writable).
 IA_DOWNLOADS_DIR = DATA_ROOT / "downloads" / "ia"
 IA_CATALOG_PATH = IA_DOWNLOADS_DIR / "catalog.json"
