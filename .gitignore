@@ -21,6 +21,9 @@ output/activity.jsonl
 downloads/ia/*.pdf
 downloads/ia/*.part
 
+# per-worktree launcher + its private DATA_ROOT (tools/worktree.py)
+.wt/
+
 # python
 __pycache__/
 *.pyc
