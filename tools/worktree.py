@@ -21,9 +21,11 @@ PORT.  The server binds 5001 unless WHL_PORT says otherwise, so a second one
 fails to start. Each worktree is assigned its own port and gets a .claude/
 launch.json pointing at it, so `preview_start` works without collisions.
 
-WEIGHT.  A full checkout is ~330 MB, of which photo/ and books/ are 273 MB of
-capture images that no code reads. Worktrees exclude them by sparse-checkout
-(pass --full to keep everything), which brings a worktree to roughly 57 MB.
+WEIGHT.  The corpus images under photo/ and books/ (273 MB that no code
+reads) are untracked as of the corpus-leaves-git commit and sync via
+tools/corpus_sync.py instead, so new checkouts are ~57 MB by default. The
+sparse-checkout exclusion below still matters when a worktree is based on an
+older commit that tracks them (pass --full to keep everything).
 """
 from __future__ import annotations
 

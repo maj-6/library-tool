@@ -192,6 +192,72 @@ def list_buckets(cfg: dict, timeout: float = 30.0) -> list[str]:
     return [e.text or "" for e in root.findall(path, ns)]
 
 
+def list_objects(cfg: dict, prefix: str = "", timeout: float = 60.0) -> dict[str, int]:
+    """Every object under `prefix`, as {key: size}. Follows continuation
+    tokens, so the result is complete however large the bucket grows."""
+    _check(cfg)
+    import xml.etree.ElementTree as ET
+    out: dict[str, int] = {}
+    token = ""
+    while True:
+        params = [("list-type", "2"), ("prefix", prefix)]
+        if token:
+            params.append(("continuation-token", token))
+        # SigV4 canonicalizes the query string sorted and RFC3986-encoded;
+        # build it that way so the signed string and the sent string agree.
+        query = urllib.parse.urlencode(sorted(params),
+                                       quote_via=urllib.parse.quote, safe="")
+        url = f"{_endpoint(cfg)}/{cfg['bucket']}?{query}"
+        empty = hashlib.sha256(b"").hexdigest()
+        headers = _authorize(cfg, "GET", url, {}, empty)
+        raw = _send(urllib.request.Request(url, headers=headers, method="GET"), timeout)
+        root = ET.fromstring(raw)
+        ns = {"s3": root.tag.split("}")[0].strip("{")} if "}" in root.tag else {}
+        pfx = "s3:" if ns else ""
+        for item in root.findall(f"{pfx}Contents", ns):
+            key = item.findtext(f"{pfx}Key", "", ns)
+            size = int(item.findtext(f"{pfx}Size", "0", ns) or 0)
+            if key:
+                out[key] = size
+        token = root.findtext(f"{pfx}NextContinuationToken", "", ns)
+        if root.findtext(f"{pfx}IsTruncated", "false", ns) != "true" or not token:
+            return out
+
+
+def get_file(cfg: dict, key: str, dest: Path, timeout: float = 3600.0,
+             on_progress=None) -> Path:
+    """Download an object to `dest`, streamed via a .part + atomic replace."""
+    _check(cfg)
+    import os
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    url = f"{_endpoint(cfg)}/{cfg['bucket']}/{urllib.parse.quote(key.lstrip('/'))}"
+    empty = hashlib.sha256(b"").hexdigest()
+    headers = _authorize(cfg, "GET", url, {}, empty)
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    part = dest.with_suffix(dest.suffix + ".part")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            done = 0
+            with open(part, "wb") as fh:
+                for block in iter(lambda: resp.read(CHUNK), b""):
+                    fh.write(block)
+                    done += len(block)
+                    if on_progress:
+                        on_progress(done, total)
+        os.replace(part, dest)
+        return dest
+    except urllib.error.HTTPError as exc:
+        part.unlink(missing_ok=True)
+        raise StoreError(f"HTTP {exc.code} on GET {url.split('?')[0]}")
+    except Exception as exc:
+        part.unlink(missing_ok=True)
+        if isinstance(exc, StoreError):
+            raise
+        raise StoreError(f"{type(exc).__name__}: {exc}")
+
+
 def delete(cfg: dict, key: str, timeout: float = 60.0) -> None:
     _check(cfg)
     url = f"{_endpoint(cfg)}/{cfg['bucket']}/{urllib.parse.quote(key.lstrip('/'))}"
