@@ -16,11 +16,15 @@ pushed:
    keystore secret if present, the runner's debug key if not) and names the APK
    after its gradle `versionName`.
 2. **desktop** freezes the Flask sidecar with PyInstaller and runs
-   electron-builder on a Windows runner, producing
-   `LibraryTool-<package.json version>.msi`.
-3. **publish** attaches both files to a GitHub Release named after the tag,
-   then registers each in the `releases` table via `tools/release_publish.py`
-   (URL → the GitHub Release asset). The Downloads page shows them immediately.
+   electron-builder on a Windows runner, producing the NSIS installer
+   `LibraryTool-Setup-<package.json version>.exe` **plus `latest.yml` and the
+   `.blockmap`** — those two are the auto-update channel: installed apps check
+   the newest GitHub Release at startup and read them to fetch the update.
+3. **publish** attaches everything to a GitHub Release named after the tag,
+   then registers the APK and the installer in the `releases` table via
+   `tools/release_publish.py` (URL → the GitHub Release asset). The Downloads
+   page shows them immediately, and existing installs pick the update up on
+   their next launch.
 
 So cutting a release is:
 
@@ -60,8 +64,8 @@ desktop's Supabase credentials (Settings → Sync) or `SUPABASE_URL` /
 python tools/release_publish.py BookCapture-1.0.apk --platform android --version 1.0
 
 # register a file hosted elsewhere (sha256/bytes computed if the file is local)
-python tools/release_publish.py LibraryTool-3.0.0.msi \
-    --url https://github.com/…/LibraryTool-3.0.0.msi --platform windows --version 3.0.0
+python tools/release_publish.py LibraryTool-Setup-3.0.0.exe \
+    --url https://github.com/…/LibraryTool-Setup-3.0.0.exe --platform windows --version 3.0.0
 ```
 
 The bucket route is for small files — Supabase's free tier caps one object
@@ -70,9 +74,12 @@ same platform/version/channel replaces the row, so corrections are safe.
 
 ## Known caveats
 
-- The MSI is unsigned (no code-signing cert), so SmartScreen will warn on
-  first run. electron-builder's MSI target also leans on WiX 3; if the Windows
-  runner ever balks, the `nsis` target is the planned v3 direction anyway.
+- The installer is unsigned (no code-signing cert), so SmartScreen will warn
+  on first run.
 - The 40 MB `copyright_renewals.csv` is deliberately absent from the public
   mirror; the sidecar spec skips missing data files, so the CI build simply
-  ships without that dataset.
+  ships without that dataset — the in-app setup guide offers it (and the other
+  large databases) as a download on first run.
+- A version only auto-updates existing installs if `latest.yml` made it onto
+  the newest GitHub Release — the artifact step fails loudly if it is missing,
+  but don't delete it from a release by hand.

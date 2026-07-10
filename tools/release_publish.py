@@ -2,7 +2,7 @@
 """Put one app build on the website's Downloads page.
 
     python3 tools/release_publish.py BookCapture-1.0.apk --platform android --version 1.0
-    python3 tools/release_publish.py --url https://github.com/.../LibraryTool-3.0.0.msi \
+    python3 tools/release_publish.py --url https://github.com/.../LibraryTool-Setup-3.0.0.exe \
             --platform windows --version 3.0.0 [--sha256 <hex> --bytes <n>]
 
 The Downloads page renders the `releases` table newest-first, one card per
