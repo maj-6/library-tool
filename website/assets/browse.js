@@ -73,8 +73,10 @@ function record(v) {
     v.pages && `${v.pages} pp`,
   ].filter(Boolean).map((x) => `<span>${x}</span>`).join("");
 
+  // quiet row actions on purpose — a primary button on every record would
+  // stripe the catalogue with dark blocks; the book page carries the primary
   const actions = href
-    ? `<a class="btn primary" href="read.html?slug=${slug}">Read</a>
+    ? `<a class="btn" href="read.html?slug=${slug}">Read</a>
        <a class="btn" href="${esc(href)}" target="_blank" rel="noopener"
           title="${bytes(v.pdf_bytes) || "PDF"}">PDF</a>`
     : `<a class="btn" aria-disabled="true" title="No scan yet">Read</a>`;

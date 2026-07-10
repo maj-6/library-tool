@@ -44,6 +44,13 @@
 
 * { box-sizing: border-box; }
 html, body { margin: 0; }
+
+/* one focus treatment everywhere: the keyboard's version of the accent band */
+a:focus-visible, button:focus-visible, input:focus-visible,
+select:focus-visible, [tabindex]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
 body {
   background: var(--paper);
   color: var(--ink);
@@ -71,11 +78,12 @@ a { color: var(--accent-ink); }
 }
 .masthead-inner {
   display: flex;
-  align-items: baseline;
-  gap: 18px 22px;
+  align-items: center;
+  gap: 14px 22px;
   flex-wrap: wrap;
-  padding: 18px 26px 16px;
+  padding: 15px 26px 14px;
 }
+.wm-mark { display: block; flex: none; }
 .wordmark { margin-right: auto; }
 .wm-title {
   font-size: 25px;
@@ -193,7 +201,9 @@ a { color: var(--accent-ink); }
   display: flex;
   align-items: baseline;
   gap: 6px;
-  padding: 3px 0;
+  padding: 3px 0 3px 8px;
+  margin-left: -8px;
+  border-left: 2px solid transparent;
 }
 .cat-row a {
   color: var(--ink-soft);
@@ -202,6 +212,8 @@ a { color: var(--accent-ink); }
   min-width: 0;
 }
 .cat-row a:hover { color: var(--ink); text-decoration: underline; }
+/* the app's active mark: a quiet band, not a fill */
+.cat-row.active { border-left-color: var(--accent); }
 .cat-row.active > a { color: var(--ink); font-weight: 600; }
 .cat-row .cat-count {
   font-size: 11px;
@@ -219,10 +231,13 @@ a { color: var(--accent-ink); }
   display: flex;
   align-items: baseline;
   gap: 6px;
-  padding: 3px 0;
+  padding: 3px 0 3px 8px;
+  margin-left: -8px;
+  border-left: 2px solid transparent;
 }
 .lang-row a { color: var(--ink-soft); text-decoration: none; flex: 1 1 auto; }
 .lang-row a:hover { color: var(--ink); text-decoration: underline; }
+.lang-row.active { border-left-color: var(--accent); }
 .lang-row.active > a { color: var(--ink); font-weight: 600; }
 .lang-row .cat-count { font-size: 11px; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
 
@@ -657,6 +672,9 @@ body.reader { display: flex; flex-direction: column; overflow: hidden; }
 }
 @media (max-width: 560px) {
   .lib-shell { padding: 0 16px; }
-  .masthead-inner { padding: 16px; }
+  .masthead-inner { padding: 14px 16px; }
+  .wm-mark { width: 32px; height: 32px; }
   .book-title { font-size: 25px; }
+  /* a 168px rail on a 375px screen leaves no room to read */
+  .thumbs { display: none !important; }
 }
