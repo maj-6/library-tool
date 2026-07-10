@@ -155,7 +155,10 @@ def cmd_add(args) -> None:
     (wt / "info.json").write_text(
         json.dumps({"name": name, "port": port, "base": args.base}, indent=2), encoding="utf-8")
 
-    # preview_start reads this; the wrapper is what actually applies the port
+    # preview_start reads this; the wrapper is what actually applies the port.
+    # launch.json is gitignored, so writing it here leaves the branch clean --
+    # an earlier attempt used `update-index --skip-worktree`, which cannot work:
+    # that bit is the very mechanism sparse-checkout uses, and it resets it.
     (path / ".claude").mkdir(exist_ok=True)
     (path / ".claude" / "launch.json").write_text(json.dumps({
         "version": "0.0.1",
@@ -167,8 +170,6 @@ def cmd_add(args) -> None:
             "autoPort": False,
         }],
     }, indent=2) + "\n", encoding="utf-8")
-    # ...and that edit must not show up as a change on the branch
-    git("update-index", "--skip-worktree", ".claude/launch.json", cwd=path)
 
     if args.seed:
         for rel in SEED_FILES:
@@ -193,9 +194,9 @@ def cmd_rm(args) -> None:
     path = WORKTREES / args.name
     if not path.exists():
         sys.exit(f"no worktree at {path}")
-    # leaving skip-worktree set on a file git is about to drop confuses git
-    git("update-index", "--no-skip-worktree", ".claude/launch.json", cwd=path, check=False)
-    git("worktree", "remove", "--force" if args.force else "--", str(path))
+    # .wt/ is ignored, so a clean tree removes without --force
+    cmd = ["worktree", "remove"] + (["--force"] if args.force else []) + [str(path)]
+    git(*cmd)
     if args.delete_branch:
         git("branch", "-D", args.name)
         print(f"removed worktree and branch {args.name}")
