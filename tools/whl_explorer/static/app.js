@@ -7748,9 +7748,16 @@ async function selectOcrBook(bid) {
     // the first time the book is opened here (pages=400 = extraction cap)
     if (!folder.ocr.length && ocrBookPdf(bid)) {
       try {
-        await fetch("/api/pdf/text?pages=400&path=" +
+        const ex = await (await fetch("/api/pdf/text?pages=400&path=" +
           encodeURIComponent(ocrBookPdf(bid)) +
-          "&save_build=" + encodeURIComponent(bid));
+          "&save_build=" + encodeURIComponent(bid))).json();
+        // A scan carries a text layer on its cover sheet and nowhere else, so
+        // the extraction "succeeds" and yields one page of Google boilerplate.
+        // Say so, rather than presenting an empty folder as a mystery.
+        if (ex.ok && (ex.pages_with_text || 0) <= 1) {
+          el("ocr-msg").textContent =
+            "This PDF has no text layer — OCR the pages (digit keys stage a service)";
+        }
         await loadOcrBooks();
         folder = (ocrState.books || {})[bid] || folder;
       } catch (e) { /* extraction failed; the empty folder renders as-is */ }
@@ -8062,7 +8069,9 @@ async function fillOcrLayout(pane, pdf) {
   if (!pane.isConnected) return;
   if (!res.ok || !res.found) {
     pane.classList.add("empty");
-    pane.textContent = res.ok ? "No text layer on this page" : (res.error || "Could not read the page");
+    pane.textContent = res.ok
+      ? "No text layer on this page — OCR it"
+      : (res.error || "Could not read the page");
     return;
   }
   pane.classList.remove("empty");
@@ -8759,12 +8768,11 @@ function initOcrTab() {
   el("ocr-view-diff").addEventListener("click", () => setOcrView("diff"));
   el("ocr-view-pdf").addEventListener("click", () =>
     setOcrView(ocrState.view === "pdf" ? "edit" : "pdf"));
-  ocrState.layout = !!state.settings.ocrLayout;
-  el("ocr-layout").addEventListener("click", () => setOcrLayout(!ocrState.layout));
   el("ocr-pages").addEventListener("input", onOcrPageInput);
   // page-view shortcuts: click selects, Ctrl+click extends the range,
   // digits STAGE the selection/hovered page, T marks a title page,
-  // Delete removes selected pages from the PDF
+  // Delete removes selected pages from the PDF. These come FIRST: they are the
+  // load-bearing handlers, and anything that throws above them takes them out.
   el("ocr-pages").addEventListener("mouseover", (ev) => {
     const row = ev.target.closest(".ocr-pgrow");
     if (row) ocrHoverPage = +row.dataset.page;
@@ -8772,6 +8780,8 @@ function initOcrTab() {
   el("ocr-pages").addEventListener("mouseleave", () => { ocrHoverPage = 0; });
   el("ocr-pages").addEventListener("click", onOcrPagesClick);
   document.addEventListener("keydown", onOcrPagesKey);
+  ocrState.layout = !!state.settings.ocrLayout;
+  el("ocr-layout").addEventListener("click", () => setOcrLayout(!ocrState.layout));
   // page-image failures (e.g. PyMuPDF not installed — 501) must be visible,
   // not a wall of broken-image icons; error events don't bubble, so capture
   el("ocr-pages").addEventListener("error", (ev) => {
@@ -9152,25 +9162,39 @@ function initDesktopChrome() {
   });
 }
 
+// One init step must not be able to take out the ones after it. A missing
+// element used to throw here and silently disable everything downstream -- an
+// old template plus a new app.js killed the OCR page handlers that way, and the
+// only trace was a devtools line nobody was reading. Now each step is isolated
+// and its failure is reported, in the footer and in the Info tab's console.
+function boot(name, fn) {
+  try {
+    fn();
+  } catch (e) {
+    conPut("error", `init: ${name} failed -- ${e.message}`, "app");
+    statusCrit(`STARTUP :: ${name.toUpperCase()} FAILED (see the Info tab)`);
+  }
+}
+
 function init() {
-  initDesktopChrome();
-  initWebView();
-  loadSettings();
-  applyTheme();
-  applyFont();
-  loadChecked();
-  injectIcons();
-  initTabs();
-  initTooltips();
-  initPaneTabs();
-  installActorHeader();   // before any write goes out
-  initMenubar();
-  initConsole();          // before anything can throw or call status()
-  initHome();
-  fitTitleBar();          // after the menus exist: their width sets the clamp
-  initSettingsNav();
-  initColResize();
-  loadOlStatus();
+  initConsole();          // first: it is where every later failure is reported
+  boot("desktop chrome", initDesktopChrome);
+  boot("web view", initWebView);
+  boot("settings", loadSettings);
+  boot("theme", applyTheme);
+  boot("font", applyFont);
+  boot("checked books", loadChecked);
+  boot("icons", injectIcons);
+  boot("tabs", initTabs);
+  boot("tooltips", initTooltips);
+  boot("pane tabs", initPaneTabs);
+  boot("actor header", installActorHeader);   // before any write goes out
+  boot("menu bar", initMenubar);
+  boot("home", initHome);
+  boot("title bar", fitTitleBar);   // after the menus exist: their width sets the clamp
+  boot("settings nav", initSettingsNav);
+  boot("column resize", initColResize);
+  boot("open library status", loadOlStatus);
 
   // undo / redo (toolbar)
   el("undo-btn").addEventListener("click", undo);
@@ -9529,14 +9553,14 @@ function init() {
     const chip = ev.target.closest("[data-ocr]");
     if (chip) setActiveOcr(chip.dataset.ocr);
   });
-  initOcrTab();
+  boot("OCR tab", initOcrTab);
   // Q while hovering a row (any table) or a builder entry: mark it as needing
   // attention, and offer a reason
   loadAttn();
   document.addEventListener("keydown", onAttentionKey);
   document.addEventListener("keydown", onSearchKey);
   document.addEventListener("keydown", onRowDeleteKey);
-  initAttnPop();
+  boot("attention popover", initAttnPop);
   el("b-pdf-attach").addEventListener("click", () => attachPdfFile());
   el("b-pdf_file").addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") { ev.preventDefault(); attachPdfFile(); }

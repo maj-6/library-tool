@@ -67,6 +67,14 @@ def _flask_app():
 
 
 app = _flask_app()
+# Jinja compiles index.html once and caches it when debug is off, while static/
+# is read from disk on every request. Editing the template therefore served a NEW
+# app.js against an OLD DOM until someone restarted the server -- and one missing
+# element kills every listener registered after it in the same init function.
+# Stat the template instead: one stat per page load, and the whole class of bug
+# (twice now: the reason popover, then the OCR Layout button) goes away.
+app.config["TEMPLATES_AUTO_RELOAD"] = True
+app.jinja_env.auto_reload = True
 
 
 # --- application log ------------------------------------------------------------
@@ -538,17 +546,31 @@ def _entry_folder_info(build_id: str) -> dict:
             "metadata": (d / "metadata.json").is_file()}
 
 
-def _pdf_extract_text(p: Path, max_pages: int) -> tuple[int, int, str]:
-    """(total_pages, shown_pages, text) of a PDF's text/OCR layer."""
-    from pypdf import PdfReader
-    reader = PdfReader(str(p))
-    total = len(reader.pages)
-    shown = min(total, max_pages)
-    parts = []
-    for i in range(shown):
-        text = (reader.pages[i].extract_text() or "").strip()
-        parts.append(f"--- page {i + 1} ---\n{text}")
-    return total, shown, "\n\n".join(parts)
+def _pdf_extract_text(p: Path, max_pages: int) -> tuple[int, int, str, int]:
+    """(total_pages, shown_pages, text, pages_with_text) of a PDF's text layer.
+
+    PyMuPDF rather than pypdf: it is the same library that rasterises these
+    pages and reads their word boxes, so extraction and the Layout view can
+    never disagree about what text a page holds.
+
+    pages_with_text is what tells a scanned book from a digitised one. A Google
+    scan carries a text layer on its own front matter and nothing else, so the
+    extraction looks like it worked while every real page comes back empty.
+    """
+    import fitz
+    doc = fitz.open(str(p))
+    try:
+        total = doc.page_count
+        shown = min(total, max_pages)
+        parts, with_text = [], 0
+        for i in range(shown):
+            text = doc[i].get_text().strip()
+            if text:
+                with_text += 1
+            parts.append(f"--- page {i + 1} ---\n{text}")
+    finally:
+        doc.close()
+    return total, shown, "\n\n".join(parts), with_text
 
 
 def _preview_pdf(src: Path, pages: int) -> Path:
@@ -649,12 +671,14 @@ def api_build_folder_sync(build_id: str):
         except Exception as exc:
             notes.append(f"preview failed: {exc}")
         try:
-            total, shown, text = _pdf_extract_text(src, 400)
-            if text.strip():
+            total, shown, text, with_text = _pdf_extract_text(src, 400)
+            # a Google scan carries text on its front matter and nowhere else:
+            # the extraction "succeeds" and is worthless
+            if with_text > 1:
                 (d / "ocr" / "extracted.txt").write_text(
                     text, encoding="utf-8", errors="replace")
             else:
-                notes.append("no text layer (supply OCR separately)")
+                notes.append("no text layer (OCR the pages)")
         except Exception as exc:
             notes.append(f"text extraction failed: {exc}")
         # IA originals are temporary artifacts unless configured otherwise.
@@ -1308,20 +1332,22 @@ def api_pdf_text():
     out = _PDF_TEXT_CACHE.get(key)
     if out is None:
         try:
-            from pypdf import PdfReader  # noqa: F401
+            import fitz  # noqa: F401
         except ImportError:
             return jsonify({"ok": False,
-                            "error": "pypdf is not installed "
-                                     "(python3 -m pip install pypdf)"})
+                            "error": "PyMuPDF is not installed "
+                                     "(python3 -m pip install PyMuPDF)"})
         try:
-            total, shown, text = _pdf_extract_text(p, max_pages)
-            out = {"ok": True, "pages": total, "shown": shown, "text": text}
+            total, shown, text, with_text = _pdf_extract_text(p, max_pages)
+            out = {"ok": True, "pages": total, "shown": shown, "text": text,
+                   "pages_with_text": with_text}
         except Exception as exc:
             out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         _PDF_TEXT_CACHE[key] = out
-    # auto-save into the entry folder (never clobbers an existing file)
+    # Auto-save into the entry folder (never clobbers an existing file). One
+    # page of text is a scanner's cover sheet, not an extraction: don't save it.
     bid = (request.args.get("save_build") or "").strip()
-    if bid and out.get("ok") and out.get("text", "").strip():
+    if bid and out.get("ok") and out.get("pages_with_text", 0) > 1:
         if bid in lib.load_json(BUILDS_PATH, {}):
             f = _entry_dir(bid) / "ocr" / "extracted.txt"
             if not f.is_file():

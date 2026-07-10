@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Library Tool</title>
+  <link rel="icon" href="{{ url_for('static', filename='icon.png') }}" />
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v={{ css_v }}" />
 </head>
 <body>
@@ -100,8 +101,12 @@
     <section id="home" class="panel-view active">
       <div id="home-inner">
         <div id="home-title">
-          <h1>Library Tool</h1>
-          <p id="home-sub">Cataloguing workbench for rare works on botany</p>
+          <div id="home-titletext">
+            <h1>Library Tool</h1>
+            <p id="home-sub">Cataloguing workbench for rare works on botany</p>
+          </div>
+          <img id="home-icon" src="{{ url_for('static', filename='icon.png') }}"
+               width="76" height="76" alt="" />
         </div>
         <div id="home-cols">
           <div class="home-card">
