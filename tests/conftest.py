@@ -19,7 +19,7 @@ from pathlib import Path
 if "libcommon" in sys.modules:  # pragma: no cover — misconfiguration guard
     raise RuntimeError("libcommon was imported before conftest set WHL_DATA_ROOT")
 
-_TMP = Path(tempfile.mkdtemp(prefix="whl-tests-"))
+_TMP = Path(tempfile.mkdtemp(prefix="whl-tests-")).resolve()
 atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["WHL_DATA_ROOT"] = str(_TMP)
 
