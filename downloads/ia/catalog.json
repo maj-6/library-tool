@@ -31,7 +31,8 @@
       "subtitle": "",
       "title": "Every Man His Own Doctor or a Treatise on the Prevention and Cure of Diseases",
       "year": "1816"
-    }
+    },
+    "preview": "downloads\\cache\\previews\\ca513a88af393063.pdf"
   },
   "monthlyfloraorb00unkngoog": {
     "identifier": "monthlyfloraorb00unkngoog",
@@ -565,5 +566,18 @@
       "title": "The British Flora Medica",
       "year": "1877"
     }
+  },
+  "b30342028_0002": {
+    "identifier": "b30342028_0002",
+    "source_url": "https://archive.org/details/b30342028_0002",
+    "pdf_file": "b30342028_0002.pdf",
+    "saved_as": "downloads\\ia\\b30342028_0002.pdf",
+    "preview": "downloads\\cache\\previews\\82178eeb3a9ccd3d.pdf",
+    "size_bytes": 129381726,
+    "downloaded_at": "2026-07-09T21:31:10+00:00",
+    "ia_title": "Iatrica; seu, Praxis medendi. : The practice of curing diseases. Being a medicinal history of near two hundred famous observations in the cure of diseases ... Whereunto is added ... a compleat theory, or method of precepts, wherein the names, definitions ... and various ways of cure are methodically instituted ... to vulgar practice. To which is newly added, as an appendix, Observations upon the lethargy, carus, frenzy, madness, defects of the internal senses, and hurts of the external senses",
+    "ia_creator": "Salmon, William, 1644-1713",
+    "ia_date": "1694",
+    "book": {}
   }
 }

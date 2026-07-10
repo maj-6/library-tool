@@ -146,7 +146,7 @@
   },
   "a377d4d2b810": {
     "title": "Flora Rustica",
-    "author": "Martyn, Thomas",
+    "author": "Thomas Martyn",
     "publisher": "F.P. Nodder",
     "city": "London",
     "year": "1792",
@@ -163,7 +163,7 @@
     "created_at": "2026-07-03T23:54:25+00:00",
     "checks": {
       "copyright_status": "Public domain (published 1792)",
-      "checked_at": "2026-07-08T02:59:44+00:00",
+      "checked_at": "2026-07-09T06:31:42+00:00",
       "in_whl": "yes",
       "whl_match": {
         "title": "Flora Rustica Vol. 1",
@@ -176,33 +176,36 @@
     "attention": "1",
     "scans": {
       "query_title": "Flora Rustica",
-      "query_author": "Martyn, Thomas",
+      "query_author": "Thomas Martyn",
       "query_year": "1792",
       "internet_archive": {
         "available": true,
         "best_match": {
-          "identifier": "bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_2",
-          "title": "Flora rustica: exhibiting accurate figures of such plants as are either useful or injurious in husbandry. Drawn and engraved by Frederick P. Nodder, ... and coloured under his inspection. With scientific characters, popular descriptions, and useful observations, by Thomas Martyn, ... 1792: Vol 2",
+          "identifier": "bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_1",
+          "title": "Flora rustica: exhibiting accurate figures of such plants as are either useful or injurious in husbandry. Drawn and engraved by Frederick P. Nodder, ... and coloured under his inspection. With scientific characters, popular descriptions, and useful observations, by Thomas Martyn, ... 1792: Vol 1",
           "author": "Martyn, Thomas, B. D., F. R. S.",
           "year": "1792",
-          "url": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_2",
+          "url": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_1",
+          "downloadable": true,
           "accuracy": 0.948
         },
         "matches": [
-          {
-            "identifier": "bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_2",
-            "title": "Flora rustica: exhibiting accurate figures of such plants as are either useful or injurious in husbandry. Drawn and engraved by Frederick P. Nodder, ... and coloured under his inspection. With scientific characters, popular descriptions, and useful observations, by Thomas Martyn, ... 1792: Vol 2",
-            "author": "Martyn, Thomas, B. D., F. R. S.",
-            "year": "1792",
-            "url": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_2",
-            "accuracy": 0.948
-          },
           {
             "identifier": "bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_1",
             "title": "Flora rustica: exhibiting accurate figures of such plants as are either useful or injurious in husbandry. Drawn and engraved by Frederick P. Nodder, ... and coloured under his inspection. With scientific characters, popular descriptions, and useful observations, by Thomas Martyn, ... 1792: Vol 1",
             "author": "Martyn, Thomas, B. D., F. R. S.",
             "year": "1792",
             "url": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_1",
+            "downloadable": true,
+            "accuracy": 0.948
+          },
+          {
+            "identifier": "bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_2",
+            "title": "Flora rustica: exhibiting accurate figures of such plants as are either useful or injurious in husbandry. Drawn and engraved by Frederick P. Nodder, ... and coloured under his inspection. With scientific characters, popular descriptions, and useful observations, by Thomas Martyn, ... 1792: Vol 2",
+            "author": "Martyn, Thomas, B. D., F. R. S.",
+            "year": "1792",
+            "url": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_2",
+            "downloadable": true,
             "accuracy": 0.948
           },
           {
@@ -211,6 +214,7 @@
             "author": "Martyn, Thomas, B. D., F. R. S.",
             "year": "1792",
             "url": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_3",
+            "downloadable": true,
             "accuracy": 0.948
           },
           {
@@ -219,6 +223,7 @@
             "author": "Martyn, Thomas, B. D., F. R. S.",
             "year": "1794",
             "url": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1794_4",
+            "downloadable": true,
             "accuracy": 0.748
           },
           {
@@ -227,10 +232,12 @@
             "author": "Martyn, Thomas, 1735-1825. n 85089625; Nodder, Frederick Polydore, illustrator. nr 93028470",
             "year": "1791",
             "url": "https://archive.org/details/b28774528_0001",
+            "downloadable": true,
             "accuracy": 0.748
           }
         ],
-        "search_url": "https://archive.org/search?query=Flora+Rustica+Martyn%2C+Thomas"
+        "search_url": "https://archive.org/search?query=Flora+Rustica+Thomas+Martyn",
+        "no_download": false
       },
       "hathitrust": {
         "available": true,
@@ -271,14 +278,9 @@
           "903996423"
         ]
       },
-      "checked_at": "2026-07-08T02:59:45+00:00"
+      "checked_at": "2026-07-09T06:31:44+00:00"
     },
-    "verify": {
-      "internet_archive": "rejected"
-    },
-    "manual_urls": {
-      "internet_archive": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_3"
-    }
+    "verify": {}
   },
   "59f4063794c5": {
     "title": "Flora Medica",
@@ -581,8 +583,8 @@
   },
   "363e30583910": {
     "title": "A Greene Forest",
-    "author": "Maplet",
-    "publisher": "",
+    "author": "John Maplet",
+    "publisher": "The Hesperides press",
     "city": "",
     "year": "1930",
     "edition": "",
@@ -598,88 +600,48 @@
     "created_at": "2026-07-04T20:22:09+00:00",
     "checks": {
       "copyright_status": "Public domain (published 1930)",
-      "checked_at": "2026-07-04T20:22:09+00:00",
+      "checked_at": "2026-07-09T04:54:39+00:00",
       "in_whl": "no",
       "whl_match": null
     },
+    "attention": "1",
     "scans": {
-      "query_title": "A Greene Forest",
-      "query_author": "Maplet",
+      "query_title": "A Greene Forest: Or, a Naturall Historie, Wherein May Bee Seene First the Most Sufferaigne Vertues in All the Whole Kinde of Stones & Mettals: Next of Plants, as of Herbes Trees and Schrubs, Lastly of Brute Beastes, Foules, Fishes, Creepingormes, and Serpents, and That Alphabetically: So That a Table Shall Not Neede",
+      "query_author": "John Maplet",
       "query_year": "1930",
       "internet_archive": {
         "available": true,
         "best_match": {
-          "identifier": "bim_early-english-books-1475-1640_a-greene-forest-or-a-_maplet-john_1567",
-          "title": "A greene forest , or, a natural historie, ... 1567",
-          "author": "Maplet, John.",
+          "identifier": "b30328081",
+          "title": "A greene forest, or a naturall historie, wherein may bee seene first the most sufferaigne vertues in all the whole kinde of stones and mettals: next of plants, as of herbes, trees, and shrubs, lastly of brute beastes, foules, fishes, creeping wormes, and serpents",
+          "author": "Maplet, John, -1592",
           "year": "1567",
-          "url": "https://archive.org/details/bim_early-english-books-1475-1640_a-greene-forest-or-a-_maplet-john_1567",
-          "accuracy": 0.784
+          "url": "https://archive.org/details/b30328081",
+          "accuracy": 0.8
         },
         "matches": [
-          {
-            "identifier": "bim_early-english-books-1475-1640_a-greene-forest-or-a-_maplet-john_1567",
-            "title": "A greene forest , or, a natural historie, ... 1567",
-            "author": "Maplet, John.",
-            "year": "1567",
-            "url": "https://archive.org/details/bim_early-english-books-1475-1640_a-greene-forest-or-a-_maplet-john_1567",
-            "accuracy": 0.784
-          },
           {
             "identifier": "b30328081",
             "title": "A greene forest, or a naturall historie, wherein may bee seene first the most sufferaigne vertues in all the whole kinde of stones and mettals: next of plants, as of herbes, trees, and shrubs, lastly of brute beastes, foules, fishes, creeping wormes, and serpents",
             "author": "Maplet, John, -1592",
             "year": "1567",
             "url": "https://archive.org/details/b30328081",
-            "accuracy": 0.784
+            "accuracy": 0.8
           }
         ],
-        "search_url": "https://archive.org/search?query=A+Greene+Forest+Maplet"
+        "search_url": "https://archive.org/search?query=A+Greene+Forest%3A+Or%2C+a+Naturall+Historie%2C+Wherein+May+Bee+Seene+First+the+Most+Sufferaigne+Vertues+in+All+the+Whole+Kinde+of+Stones+%26+Mettals%3A+Next+of+Plants%2C+as+of+Herbes+Trees+and+Schrubs%2C+Lastly+of+Brute+Beastes%2C+Foules%2C+Fishes%2C+Creepingormes%2C+and+Serpents%2C+and+That+Alphabetically%3A+So+That+a+Table+Shall+Not+Neede+John+Maplet"
       },
       "hathitrust": {
-        "available": true,
-        "full_view": true,
-        "best_match": {
-          "title": "A greene forest : or, A naturall historie, wherein may bee seene first the most sufferaigne vertues in all the whole kinde of stones & mettals : next of plants, as of herbes, trees and shrubs : lastly of brute beastes, foules, fishes, creeping wormes, and serpents, and that alphabetically : so that a table shall not neede",
-          "year": "1930",
-          "record_url": "https://catalog.hathitrust.org/Record/001490086",
-          "items": [
-            {
-              "url": "https://babel.hathitrust.org/cgi/pt?id=mdp.39015031083978",
-              "rights": "Full view",
-              "volume": ""
-            }
-          ],
-          "full_view": true,
-          "accuracy": 0.977
-        },
-        "matches": [
-          {
-            "title": "A greene forest : or, A naturall historie, wherein may bee seene first the most sufferaigne vertues in all the whole kinde of stones & mettals : next of plants, as of herbes, trees and shrubs : lastly of brute beastes, foules, fishes, creeping wormes, and serpents, and that alphabetically : so that a table shall not neede",
-            "year": "1930",
-            "record_url": "https://catalog.hathitrust.org/Record/001490086",
-            "items": [
-              {
-                "url": "https://babel.hathitrust.org/cgi/pt?id=mdp.39015031083978",
-                "rights": "Full view",
-                "volume": ""
-              }
-            ],
-            "full_view": true,
-            "accuracy": 0.977
-          }
-        ],
-        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=A+Greene+Forest&type=title",
-        "oclcs_tried": [
-          "187442162",
-          "18340467",
-          "1025077"
-        ]
+        "available": null,
+        "full_view": false,
+        "best_match": null,
+        "matches": [],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=A+Greene+Forest%3A+Or%2C+a+Naturall+Historie%2C+Wherein+May+Bee+Seene+First+the+Most+Sufferaigne+Vertues+in+All+the+Whole+Kinde+of+Stones+%26+Mettals%3A+Next+of+Plants%2C+as+of+Herbes+Trees+and+Schrubs%2C+Lastly+of+Brute+Beastes%2C+Foules%2C+Fishes%2C+Creepingormes%2C+and+Serpents%2C+and+That+Alphabetically%3A+So+That+a+Table+Shall+Not+Neede&type=title",
+        "note": "no OCLC identifier found via Open Library; use the search link to check by hand"
       },
-      "checked_at": "2026-07-04T20:22:13+00:00"
+      "checked_at": "2026-07-09T04:54:41+00:00"
     },
-    "verify": {},
-    "attention": "1"
+    "subtitle": "Or, a Naturall Historie, Wherein May Bee Seene First the Most Sufferaigne Vertues in All the Whole Kinde of Stones & Mettals: Next of Plants, as of Herbes Trees and Schrubs, Lastly of Brute Beastes, Foules, Fishes, Creepingormes, and Serpents, and That Alphabetically: So That a Table Shall Not Neede"
   },
   "520391858e01": {
     "title": "Effects of ginkgo biloba extract on organic cerebral impairment",
@@ -2109,7 +2071,8 @@
         ]
       },
       "checked_at": "2026-07-08T01:52:30+00:00"
-    }
+    },
+    "verify": {}
   },
   "5db40a804db4": {
     "title": "The Practice of Curing Diseases",
@@ -2132,7 +2095,7 @@
     "created_at": "2026-07-07T21:30:51+00:00",
     "checks": {
       "copyright_status": "Public domain (published 1694)",
-      "checked_at": "2026-07-07T21:34:57+00:00",
+      "checked_at": "2026-07-09T08:42:28+00:00",
       "in_whl": "no",
       "whl_match": null
     },
@@ -2143,28 +2106,31 @@
       "internet_archive": {
         "available": true,
         "best_match": {
-          "identifier": "b30342028",
+          "identifier": "b30342028_0002",
           "title": "Iatrica; seu, Praxis medendi. : The practice of curing diseases. Being a medicinal history of near two hundred famous observations in the cure of diseases ... Whereunto is added ... a compleat theory, or method of precepts, wherein the names, definitions ... and various ways of cure are methodically instituted ... to vulgar practice. To which is newly added, as an appendix, Observations upon the lethargy, carus, frenzy, madness, defects of the internal senses, and hurts of the external senses",
           "author": "Salmon, William, 1644-1713",
           "year": "1694",
-          "url": "https://archive.org/details/b30342028",
+          "url": "https://archive.org/details/b30342028_0002",
+          "downloadable": true,
           "accuracy": 0.688
         },
         "matches": [
-          {
-            "identifier": "b30342028",
-            "title": "Iatrica; seu, Praxis medendi. : The practice of curing diseases. Being a medicinal history of near two hundred famous observations in the cure of diseases ... Whereunto is added ... a compleat theory, or method of precepts, wherein the names, definitions ... and various ways of cure are methodically instituted ... to vulgar practice. To which is newly added, as an appendix, Observations upon the lethargy, carus, frenzy, madness, defects of the internal senses, and hurts of the external senses",
-            "author": "Salmon, William, 1644-1713",
-            "year": "1694",
-            "url": "https://archive.org/details/b30342028",
-            "accuracy": 0.688
-          },
           {
             "identifier": "b30342028_0002",
             "title": "Iatrica; seu, Praxis medendi. : The practice of curing diseases. Being a medicinal history of near two hundred famous observations in the cure of diseases ... Whereunto is added ... a compleat theory, or method of precepts, wherein the names, definitions ... and various ways of cure are methodically instituted ... to vulgar practice. To which is newly added, as an appendix, Observations upon the lethargy, carus, frenzy, madness, defects of the internal senses, and hurts of the external senses",
             "author": "Salmon, William, 1644-1713",
             "year": "1694",
             "url": "https://archive.org/details/b30342028_0002",
+            "downloadable": true,
+            "accuracy": 0.688
+          },
+          {
+            "identifier": "b30342028",
+            "title": "Iatrica; seu, Praxis medendi. : The practice of curing diseases. Being a medicinal history of near two hundred famous observations in the cure of diseases ... Whereunto is added ... a compleat theory, or method of precepts, wherein the names, definitions ... and various ways of cure are methodically instituted ... to vulgar practice. To which is newly added, as an appendix, Observations upon the lethargy, carus, frenzy, madness, defects of the internal senses, and hurts of the external senses",
+            "author": "Salmon, William, 1644-1713",
+            "year": "1694",
+            "url": "https://archive.org/details/b30342028",
+            "downloadable": true,
             "accuracy": 0.688
           },
           {
@@ -2173,26 +2139,30 @@
             "author": "Salmon, William, 1644-1713",
             "year": "1684",
             "url": "https://archive.org/details/b30342016",
+            "downloadable": true,
             "accuracy": 0.487
           },
           {
-            "identifier": "b30333623",
-            "title": "Markham's master-piece revived. Contayning all knowledge belonging to the smith, farrier, or horse-leech, touching the curing of all diseases in horses. Drawn ... from approved experience, and the publick practice of the best horse-marshals in Christendom. Divided into two books. The I. containing cures physical; the II. all cures chirurgical: together with the nature, use and quality of every simple mentioned through the whole work",
-            "author": "Markham, Gervase, 1568?-1637",
-            "year": "1694",
-            "url": "https://archive.org/details/b30333623",
-            "accuracy": 0.294
+            "identifier": "artofpreventingl00scot",
+            "title": "The art of preventing the loss of the teeth : with instructions calculated to enable medical practitioners, heads of families, and others, travelling or residing in distant parts, to adopt the author's practice of treating the diseases of the teeth and gums : including the stopping of decayed teeth, and curing of tooth-ache, by the use of the anodyne cement, etc., etc. : also, stating the improvements in fixing artificial teeth, and a description of the siliceous pearl teeth and teeth-renovator : with testimonials from their Majesties' physicians and surgeons",
+            "author": "Scott, Joseph",
+            "year": "1831",
+            "url": "https://archive.org/details/artofpreventingl00scot",
+            "downloadable": true,
+            "accuracy": 0.312
           },
           {
-            "identifier": "b30329759",
-            "title": "The store-house of physical practice: being a general treatise of the causes and signs of all diseases afflicting human bodies. Together with the shortest, plainest and safest way of curing them ... To which is added ... several choice forms of medicines used by the London physicians ...",
-            "author": "Pechey, John, 1655-1716",
-            "year": "1695",
-            "url": "https://archive.org/details/b30329759",
-            "accuracy": 0.281
+            "identifier": "b33093878",
+            "title": "The art of preventing the loss of the teeth : with instructions calculated to enable medical practioners ... to adopt the author's practice of treating the diseases of the teeth and gums including the stopping of decayed teeth, and curing of tooth-ache, by the use of the anodyne cement, etc. etc. : also, stating the improvements in fixing artificial teeth, and a description of the siliceous pearl teeth and teeth-renovator : with testimonials from their Majesties' physcians and surgeons",
+            "author": "Scott, Joseph (Dentist)",
+            "year": "1831",
+            "url": "https://archive.org/details/b33093878",
+            "downloadable": true,
+            "accuracy": 0.312
           }
         ],
-        "search_url": "https://archive.org/search?query=The+Practice+of+Curing+Diseases+Salmon%2C+William"
+        "search_url": "https://archive.org/search?query=The+Practice+of+Curing+Diseases+Salmon%2C+William",
+        "no_download": false
       },
       "hathitrust": {
         "available": null,
@@ -2202,8 +2172,9 @@
         "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=The+Practice+of+Curing+Diseases&type=title",
         "note": "no OCLC identifier found via Open Library; use the search link to check by hand"
       },
-      "checked_at": "2026-07-07T21:35:00+00:00"
-    }
+      "checked_at": "2026-07-09T08:42:30+00:00"
+    },
+    "verify": {}
   },
   "48fa8d49c640": {
     "title": "Merck's 1907 Index.",
@@ -2374,7 +2345,7 @@
     "created_at": "2026-07-08T04:44:20+00:00",
     "checks": {
       "copyright_status": "Public domain (published 1828)",
-      "checked_at": "2026-07-08T04:44:30+00:00",
+      "checked_at": "2026-07-09T08:49:16+00:00",
       "in_whl": "yes",
       "whl_match": {
         "title": "The New England farrier and Family physician",
@@ -2396,6 +2367,7 @@
           "author": "Richardson, Josiah, 1778-1857; Williams, John, Dr. Dr. John Williams' Last legacy, and useful family guide",
           "year": "1828",
           "url": "https://archive.org/details/63611240R.nlm.nih.gov",
+          "downloadable": true,
           "accuracy": 0.7
         },
         "matches": [
@@ -2405,10 +2377,12 @@
             "author": "Richardson, Josiah, 1778-1857; Williams, John, Dr. Dr. John Williams' Last legacy, and useful family guide",
             "year": "1828",
             "url": "https://archive.org/details/63611240R.nlm.nih.gov",
+            "downloadable": true,
             "accuracy": 0.7
           }
         ],
-        "search_url": "https://archive.org/search?query=The+New-England+Farrier%2C+and+Family+Physician+...+Jewett%2C+Paul"
+        "search_url": "https://archive.org/search?query=The+New-England+Farrier%2C+and+Family+Physician+...+Jewett%2C+Paul",
+        "no_download": false
       },
       "hathitrust": {
         "available": false,
@@ -2420,149 +2394,145 @@
           "13630371"
         ]
       },
-      "checked_at": "2026-07-08T04:44:33+00:00"
-    },
-    "verify": {
-      "whl": "approved",
-      "internet_archive": "approved"
+      "checked_at": "2026-07-09T08:49:21+00:00"
     }
   },
   "397b67846366": {
-    "title": "Flora Rustica",
-    "subtitle": "Exhibiting Accurate Figures of Such Plants as Are Either Useful or Injurious in Husbandry",
-    "author": "Thomas Martyn",
-    "publisher": "F.P. Nodder",
-    "city": "London",
-    "year": "1792",
-    "edition": "",
-    "volume": "1",
-    "language": "eng",
-    "pages": "",
-    "condition": "",
-    "price": "",
-    "illustrations": "",
-    "categories": "",
-    "notes": "From Open Library: https://openlibrary.org/books/OL44674105M",
-    "local_pdf": "",
     "attention": "",
-    "id": "397b67846366",
-    "created_at": "2026-07-08T04:47:02+00:00",
+    "author": "Thomas Martyn",
+    "categories": "",
     "checks": {
-      "copyright_status": "Public domain (published 1792)",
       "checked_at": "2026-07-08T04:49:02+00:00",
+      "copyright_status": "Public domain (published 1792)",
       "in_whl": "yes",
       "whl_match": {
-        "title": "Flora Rustica Vol. 1",
         "author": "Thomas Martyn",
-        "year": "1792",
+        "permalink": "https://worldherblibrary.org/catalog/flora-rustica-vol-1/",
         "status": "publish",
-        "permalink": "https://worldherblibrary.org/catalog/flora-rustica-vol-1/"
+        "title": "Flora Rustica Vol. 1",
+        "year": "1792"
       }
     },
+    "city": "London",
+    "condition": "",
+    "created_at": "2026-07-08T04:47:02+00:00",
+    "edition": "",
+    "id": "397b67846366",
+    "illustrations": "",
+    "language": "eng",
+    "local_pdf": "",
+    "manual_urls": {
+      "internet_archive": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_1"
+    },
+    "notes": "From Open Library: https://openlibrary.org/books/OL44674105M",
+    "pages": "",
+    "price": "",
+    "publisher": "F.P. Nodder",
     "scans": {
-      "query_title": "Flora Rustica",
-      "query_author": "Thomas Martyn",
-      "query_year": "1792",
+      "checked_at": "2026-07-08T04:49:03+00:00",
+      "hathitrust": {
+        "available": true,
+        "best_match": {
+          "accuracy": 0.926,
+          "full_view": true,
+          "items": [
+            {
+              "rights": "Full view",
+              "url": "https://babel.hathitrust.org/cgi/pt?id=mdp.39015015340725",
+              "volume": ""
+            }
+          ],
+          "record_url": "https://catalog.hathitrust.org/Record/001824841",
+          "title": "Flora rustica : exhibiting accurate figures of such plants as are either useful or injurious in husbandry",
+          "year": "1792"
+        },
+        "full_view": true,
+        "matches": [
+          {
+            "accuracy": 0.926,
+            "full_view": true,
+            "items": [
+              {
+                "rights": "Full view",
+                "url": "https://babel.hathitrust.org/cgi/pt?id=mdp.39015015340725",
+                "volume": ""
+              }
+            ],
+            "record_url": "https://catalog.hathitrust.org/Record/001824841",
+            "title": "Flora rustica : exhibiting accurate figures of such plants as are either useful or injurious in husbandry",
+            "year": "1792"
+          }
+        ],
+        "oclcs_tried": [
+          "6858984",
+          "903996423"
+        ],
+        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=Flora+Rustica&type=title"
+      },
       "internet_archive": {
         "available": true,
         "best_match": {
+          "accuracy": 0.948,
+          "author": "Martyn, Thomas, B. D., F. R. S.",
           "identifier": "bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_3",
           "title": "Flora rustica: exhibiting accurate figures of such plants as are either useful or injurious in husbandry. Drawn and engraved by Frederick P. Nodder, ... and coloured under his inspection. With scientific characters, popular descriptions, and useful observations, by Thomas Martyn, ... 1792: Vol 3",
-          "author": "Martyn, Thomas, B. D., F. R. S.",
-          "year": "1792",
           "url": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_3",
-          "accuracy": 0.948
+          "year": "1792"
         },
         "matches": [
           {
+            "accuracy": 0.948,
+            "author": "Martyn, Thomas, B. D., F. R. S.",
             "identifier": "bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_3",
             "title": "Flora rustica: exhibiting accurate figures of such plants as are either useful or injurious in husbandry. Drawn and engraved by Frederick P. Nodder, ... and coloured under his inspection. With scientific characters, popular descriptions, and useful observations, by Thomas Martyn, ... 1792: Vol 3",
-            "author": "Martyn, Thomas, B. D., F. R. S.",
-            "year": "1792",
             "url": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_3",
-            "accuracy": 0.948
+            "year": "1792"
           },
           {
+            "accuracy": 0.948,
+            "author": "Martyn, Thomas, B. D., F. R. S.",
             "identifier": "bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_2",
             "title": "Flora rustica: exhibiting accurate figures of such plants as are either useful or injurious in husbandry. Drawn and engraved by Frederick P. Nodder, ... and coloured under his inspection. With scientific characters, popular descriptions, and useful observations, by Thomas Martyn, ... 1792: Vol 2",
-            "author": "Martyn, Thomas, B. D., F. R. S.",
-            "year": "1792",
             "url": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_2",
-            "accuracy": 0.948
+            "year": "1792"
           },
           {
+            "accuracy": 0.948,
+            "author": "Martyn, Thomas, B. D., F. R. S.",
             "identifier": "bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_1",
             "title": "Flora rustica: exhibiting accurate figures of such plants as are either useful or injurious in husbandry. Drawn and engraved by Frederick P. Nodder, ... and coloured under his inspection. With scientific characters, popular descriptions, and useful observations, by Thomas Martyn, ... 1792: Vol 1",
-            "author": "Martyn, Thomas, B. D., F. R. S.",
-            "year": "1792",
             "url": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_1",
-            "accuracy": 0.948
+            "year": "1792"
           },
           {
+            "accuracy": 0.748,
+            "author": "Martyn, Thomas, 1735-1825. n 85089625; Nodder, Frederick Polydore, illustrator. nr 93028470",
             "identifier": "b28774528_0002",
             "title": "Flora rustica: exhibiting ... figures of such plants as are either useful or injurious in husbandry",
-            "author": "Martyn, Thomas, 1735-1825. n 85089625; Nodder, Frederick Polydore, illustrator. nr 93028470",
-            "year": "1791",
             "url": "https://archive.org/details/b28774528_0002",
-            "accuracy": 0.748
+            "year": "1791"
           },
           {
+            "accuracy": 0.748,
+            "author": "Martyn, Thomas, 1735-1825. n 85089625; Nodder, Frederick Polydore, illustrator. nr 93028470",
             "identifier": "b28774528_0001",
             "title": "Flora rustica: exhibiting ... figures of such plants as are either useful or injurious in husbandry",
-            "author": "Martyn, Thomas, 1735-1825. n 85089625; Nodder, Frederick Polydore, illustrator. nr 93028470",
-            "year": "1791",
             "url": "https://archive.org/details/b28774528_0001",
-            "accuracy": 0.748
+            "year": "1791"
           }
         ],
         "search_url": "https://archive.org/search?query=Flora+Rustica+Thomas+Martyn"
       },
-      "hathitrust": {
-        "available": true,
-        "full_view": true,
-        "best_match": {
-          "title": "Flora rustica : exhibiting accurate figures of such plants as are either useful or injurious in husbandry",
-          "year": "1792",
-          "record_url": "https://catalog.hathitrust.org/Record/001824841",
-          "items": [
-            {
-              "url": "https://babel.hathitrust.org/cgi/pt?id=mdp.39015015340725",
-              "rights": "Full view",
-              "volume": ""
-            }
-          ],
-          "full_view": true,
-          "accuracy": 0.926
-        },
-        "matches": [
-          {
-            "title": "Flora rustica : exhibiting accurate figures of such plants as are either useful or injurious in husbandry",
-            "year": "1792",
-            "record_url": "https://catalog.hathitrust.org/Record/001824841",
-            "items": [
-              {
-                "url": "https://babel.hathitrust.org/cgi/pt?id=mdp.39015015340725",
-                "rights": "Full view",
-                "volume": ""
-              }
-            ],
-            "full_view": true,
-            "accuracy": 0.926
-          }
-        ],
-        "search_url": "https://catalog.hathitrust.org/Search/Home?lookfor=Flora+Rustica&type=title",
-        "oclcs_tried": [
-          "6858984",
-          "903996423"
-        ]
-      },
-      "checked_at": "2026-07-08T04:49:03+00:00"
+      "query_author": "Thomas Martyn",
+      "query_title": "Flora Rustica",
+      "query_year": "1792"
     },
+    "subtitle": "Exhibiting Accurate Figures of Such Plants as Are Either Useful or Injurious in Husbandry",
+    "title": "Flora Rustica",
     "verify": {
       "internet_archive": "rejected"
     },
-    "manual_urls": {
-      "internet_archive": "https://archive.org/details/bim_eighteenth-century_flora-rustica-exhibitin_martyn-thomas-b-d-f_1792_1"
-    }
+    "volume": "1",
+    "year": "1792"
   }
 }
