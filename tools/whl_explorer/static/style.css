@@ -1577,6 +1577,20 @@ body.desktop .win-controls { display: inline-flex; }
 .win-btn.win-close:hover,
 .win-btn.win-close:active { color: #fff; }
 
+/* The frameless main-window controls sit directly on the title band, so they
+   must read as part of it -- never as discrete faced buttons. The generic
+   `.win-close` face (below) and every per-theme `.win-close` override would
+   otherwise leak a white bordered face onto the close glyph (and, being more
+   specific, even swallow its red hover). Scoping under the `#titlebar` id
+   outranks all of them, so min/max/close stay bar-coloured and the close still
+   lights red on hover per the OS convention. Colour is left to inherit so each
+   theme keeps its own titlebar ink. */
+#titlebar .win-btn { background: transparent; border: 0; border-radius: 0; }
+#titlebar .win-btn:hover { background: rgba(20, 24, 28, 0.08); }
+#titlebar .win-btn:active { background: rgba(20, 24, 28, 0.16); }
+#titlebar .win-btn.win-close:hover { background: #e81123; color: #fff; }
+#titlebar .win-btn.win-close:active { background: #c50e1f; color: #fff; }
+
 /* --- menu bar (merged into the title bar) --- */
 #menubar {
   display: flex;
