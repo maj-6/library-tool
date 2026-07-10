@@ -16,10 +16,22 @@ output/client_state.json
 output/backups/
 # append-only feed behind the Home tab; grows per machine, merges badly
 output/activity.jsonl
+# the signed-in Supabase session (user tokens) + the activity push cursor
+output/auth_session.json
 
-# downloaded scans (large binaries; downloads/ia/catalog.json IS tracked)
+# downloaded scans (large binaries)
 downloads/ia/*.pdf
 downloads/ia/*.part
+
+# live catalogue data: mutated by the running app and synced through the
+# cloud backend, not through git (entry folders hold per-book OCR + PDF
+# derivatives; whl_builds.json is the builds database; catalog.json tracks
+# what's on disk; corrections + the generated report are working artifacts)
+downloads/ia/catalog.json
+output/whl_builds.json
+output/whl_corrections.json
+output/ch_library_report.xlsx
+output/entries/
 
 # per-worktree launcher + its private DATA_ROOT (tools/worktree.py)
 .wt/
@@ -30,8 +42,8 @@ website/assets/config.js
 # python
 __pycache__/
 *.pyc
+*.egg-info/
 downloads/cache/
-output/entries/**/*.pdf
 
 # Claude Code's per-machine permission grants — the approved command lines can
 # quote API keys verbatim, so this must never be committed
