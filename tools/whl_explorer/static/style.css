@@ -34,27 +34,28 @@
    THEMES
 
    A theme is a body[data-theme] block defining the same 21 custom
-   properties, plus whatever chrome rules its material needs. The :root
-   block above is NOT a selectable theme any more -- it is the variable
-   fallback and the sole home of the font vars (--mono/--mono2/--ui).
+   properties, plus whatever chrome rules its paper stock needs. The :root
+   block above is NOT a selectable theme -- it is the variable fallback and
+   the sole home of the font vars (--mono/--mono2/--ui).
+
+   All themes are light: this is a scholarly tool, read for hours. --canvas
+   (behind the tables, the PDF pane and the OCR pane) never drops below 0.85
+   relative luminance, accents stay desaturated, radius <= 3px.
 
    SAGE           - muted green-gray light neutral.
    ARCHIVE LEDGER - institutional card-catalog: neutral archival paper,
                     ruled tables, double rules, letterpress accents.
-   FOOLSCAP       - letterpress galley proof: cream laid paper, debossed controls,
-                    a wet-ink canvas, iron-gall accents.
-   HERBARIUM      - pressed-specimen sheet: bone label paper on an umber backing
-                    board; no borders -- tint steps and 1px shadows only.
-   BLUEPRINT LINEN - reverse cyanotype: slubbed linen chrome over a Prussian-indigo
-                    board, drawn double rules, pigment accents.
-   OXBLOOD        - bound-leather reading room: oxblood calf frames a parchment
-                    page (light canvas, dark chrome), gilt tooling.
-   PORCELAIN      - glazed enamel instrument: high-key cool grey chrome around the
-                    brightest surface in the app; hairlines, not boxes.
-   OSCILLOSCOPE   - phosphor instrument: a near-black panel framing a glowing green
-                    screen; luminous rules, scanlines, zero radius.
-   TERMINAL AMBER - monochrome amber CRT: one hue at four luminances behind glass;
-                    only ok/error break monochrome.
+   FOOLSCAP       - letterpress galley proof on daylight paper: debossed controls,
+                    a single ink rule under the statusbar, low chroma.
+   VELLUM         - warm off-white vellum, near-zero chroma, warm brown-black ink.
+   LINEN          - neutral warm-grey linen board; the lowest-contrast chrome of the
+                    set, for long sessions.
+   QUARTO         - a crisp scholarly quarto: cool near-white paper, one restrained
+                    ink-blue accent, hairline rules.
+   PEWTER         - cool neutral pewter chrome around a white canvas; uniform
+                    hairlines, like a lab notebook.
+   FOLIO          - faintly blue-grey tinted paper, easier on the eyes than white;
+                    tint steps instead of borders.
    ==================================================================== */
 
 /* ---------- SAGE (muted green-gray light) ---------- */
@@ -147,7 +148,6 @@ body[data-theme="sage"] ::-webkit-scrollbar-thumb {
 body[data-theme="sage"] ::-webkit-scrollbar-thumb:hover { background: #a2ac9b; }
 
 /* ---------- ARCHIVE LEDGER ---------- */
-/* ---------- ARCHIVE LEDGER ---------- */
 body[data-theme="ledger"] {
   --face: #e8e7e2;
   --face-hi: #f6f5f1;
@@ -223,60 +223,61 @@ body[data-theme="ledger"] ::-webkit-scrollbar-thumb {
 }
 
 /* ---------- FOOLSCAP ---------- */
+/* ---------- FOOLSCAP (revised: light laid paper, warm-neutral chrome) ---------- */
 body[data-theme="foolscap"] {
-  --face: #e8e1cf;
-  --face-hi: #f3ecdb;
-  --face-sh: #cec4ac;
-  --face-sh2: #9c8f70;
-  --face-active: #ddd3ba;
-  --canvas: #1a150e;
-  --canvas-line: #2a2318;
-  --ink: #241d10;
-  --ink-light: #d8cdb4;
-  --input-bg: #f4eddb;
-  --input-ink: #241d10;
-  --row-hover: #241d12;
-  --row-checked: #16292a;
-  --row-manual: #2b1f2e;
-  --cyan: #86a1ac;
-  --green: #94a17e;
-  --amber: #c6a05a;
-  --red: #c07d6e;
-  --blue: #2c2417;
-  --blue2: #40341f;
+  --face: #e6e3db;
+  --face-hi: #f2efe8;
+  --face-sh: #d0ccc1;
+  --face-sh2: #a49d8e;
+  --face-active: #dcd8ce;
+  --canvas: #f4f1eb;
+  --canvas-line: #e6e2d9;
+  --ink: #221c14;
+  --ink-light: #262019;
+  --input-bg: #faf8f3;
+  --input-ink: #221c14;
+  --row-hover: #ece8df;
+  --row-checked: #e0e7e6;
+  --row-manual: #eae2e7;
+  --cyan: #2f6f68;
+  --green: #4a7a3f;
+  --amber: #8f6d33;
+  --red: #9c4033;
+  --blue: #2f3a4a;
+  --blue2: #45566b;
   --radius: 1px;
 }
 /* letterpress buttons: type debossed into the sheet */
 body[data-theme="foolscap"] .cad-btn,
 body[data-theme="foolscap"] .win-close {
-  border: 1px solid #9c8f70;
-  background: #f1ead8;
-  box-shadow: inset 1px 1px 1px rgba(58, 44, 20, 0.16),
-              inset -1px -1px 0 rgba(255, 252, 244, 0.7);
+  border: 1px solid #a49d8e;
+  background: #f2f0e9;
+  box-shadow: inset 1px 1px 1px rgba(50, 44, 34, 0.14),
+              inset -1px -1px 0 rgba(255, 254, 250, 0.7);
 }
-body[data-theme="foolscap"] .cad-btn:hover { background: #f6f0e0; }
+body[data-theme="foolscap"] .cad-btn:hover { background: #f7f5ef; }
 body[data-theme="foolscap"] .cad-btn:active {
-  background: #ddd3ba;
-  box-shadow: inset 1px 1px 3px rgba(46, 34, 14, 0.30);
+  background: #dcd7cc;
+  box-shadow: inset 1px 1px 3px rgba(40, 34, 24, 0.26);
   transform: translateY(1px);
 }
-body[data-theme="foolscap"] .cad-btn.danger { color: #8a2f20; }
+body[data-theme="foolscap"] .cad-btn.danger { color: var(--red); }
 /* form fields pressed into the paper */
 body[data-theme="foolscap"] .cad-input,
 body[data-theme="foolscap"] .cell-edit,
 body[data-theme="foolscap"] .md-live {
-  border: 1px solid #a99c7e;
-  box-shadow: inset 1px 1px 2px rgba(58, 44, 20, 0.14);
+  border: 1px solid #a8a192;
+  box-shadow: inset 1px 1px 2px rgba(50, 44, 34, 0.12);
 }
 body[data-theme="foolscap"] .cad-input:focus { border-color: var(--cyan); }
 /* square proof tabs; active tab freshly pressed with a deep-ink registration rule */
 body[data-theme="foolscap"] .tab,
 body[data-theme="foolscap"] .pane-tab {
-  border: 1px solid #b3a889;
+  border: 1px solid #b0a99a;
   border-bottom: none;
   border-radius: 0;
-  background: #ddd4bd;
-  color: #5b5138;
+  background: #ddd9cf;
+  color: #565043;
 }
 body[data-theme="foolscap"] .tab.active,
 body[data-theme="foolscap"] .pane-tab.active {
@@ -285,761 +286,517 @@ body[data-theme="foolscap"] .pane-tab.active {
   box-shadow: inset 0 2px 0 var(--blue);
   font-weight: 600;
 }
-body[data-theme="foolscap"] .pane-tabs { border-bottom: 1px solid #b3a889; }
-/* titlebar: a pressed ink slab under a single paper-tan rule */
+body[data-theme="foolscap"] .pane-tabs { border-bottom: 1px solid #b0a99a; }
+/* titlebar: a pressed-ink slab (the one permitted muted band) under a single paper rule */
 body[data-theme="foolscap"] #titlebar,
 body[data-theme="foolscap"] .win-titlebar {
-  background: linear-gradient(180deg, #33291a, #251d11);
-  color: #ece3cf;
-  border-bottom: 1px solid #b3a889;
+  background: linear-gradient(180deg, #565049, #4c473f);
+  color: #ece7db;
+  border-bottom: 1px solid #b0a99a;
   letter-spacing: 1px;
 }
-/* grid on the wet-ink canvas: single hairline rules, no vertical ruling */
+/* grid on the paper canvas: light ruled header, single hairline rules, no vertical ruling */
 body[data-theme="foolscap"] .grid thead th {
-  background: #241d13;
-  color: #c9bd9f;
+  background: #ece6da;
+  color: #3a3226;
   border-right: none;
-  border-bottom: 1px solid #6a5c3f;
+  border-bottom: 1px solid #8a8070;
 }
 body[data-theme="foolscap"] .grid tbody td {
   border-right: none;
-  border-bottom: 1px solid rgba(216, 205, 180, 0.09);
+  border-bottom: 1px solid rgba(50, 44, 34, 0.14);
 }
-body[data-theme="foolscap"] .badge { background: rgba(216, 205, 180, 0.05); }
+body[data-theme="foolscap"] .badge { background: rgba(60, 50, 35, 0.05); }
+/* light proof-slip tooltip with dark ink */
 body[data-theme="foolscap"] #cad-tooltip,
 body[data-theme="foolscap"] #attn-pop {
-  background: #14100a;
-  color: var(--ink-light);
-  border: 1px solid #6a5c3f;
+  background: #f6f2e9;
+  color: var(--ink);
+  border: 1px solid #a49d8e;
   border-radius: 1px;
 }
 /* the single rule that separates the workspace from the statusbar */
-body[data-theme="foolscap"] #statusbar { border-top: 1px solid #b3a889; }
+body[data-theme="foolscap"] #statusbar { border-top: 1px solid #b0a99a; }
 body[data-theme="foolscap"] .win {
   border-radius: 1px;
   overflow: hidden;
-  box-shadow: 0 12px 32px rgba(30, 22, 10, 0.35);
+  box-shadow: 0 12px 32px rgba(40, 34, 24, 0.28);
 }
 body[data-theme="foolscap"] .menu-drop,
 body[data-theme="foolscap"] #popup-menu { border-radius: 1px; }
-/* inked scrollbars to match the canvas, not the paper */
+/* pale paper scrollbars to match the sheet */
 body[data-theme="foolscap"] ::-webkit-scrollbar { width: 11px; height: 11px; }
-body[data-theme="foolscap"] ::-webkit-scrollbar-track { background: #221b12; }
+body[data-theme="foolscap"] ::-webkit-scrollbar-track { background: #ece7dc; }
 body[data-theme="foolscap"] ::-webkit-scrollbar-thumb {
-  background: #4a3f28; border: 2px solid #221b12; border-radius: 1px;
+  background: #d5cfc1; border: 2px solid #ece7dc; border-radius: 1px;
 }
-body[data-theme="foolscap"] ::-webkit-scrollbar-thumb:hover { background: #6a5c3f; }
+body[data-theme="foolscap"] ::-webkit-scrollbar-thumb:hover { background: #cdc7b8; }
 
-/* ---------- HERBARIUM ---------- */
-body[data-theme="herbarium"] {
-  --face: #e9e2ce;        /* bone label paper, dry olive/ochre cast */
-  --face-hi: #f4efe0;     /* bleached raised paper */
-  --face-sh: #d6cdb4;     /* light tint-step rule */
-  --face-sh2: #b3a988;    /* strong tint-step rule / disabled ink */
-  --face-active: #ddd3b9; /* pressed / dented sheet */
-  --canvas: #2b2118;      /* warm dark-umber mounting board */
-  --canvas-line: #3a2e22; /* faint umber ruling */
-  --ink: #2a2318;         /* umber-black */
-  --ink-light: #e3d8bf;   /* pale bone ink on umber */
-  --input-bg: #f6f1e4;    /* fresh specimen label */
-  --input-ink: #2a2318;
-  --row-hover: #362a1f;   /* warm umber wash */
-  --row-checked: #223530; /* verdigris wash */
-  --row-manual: #342537;  /* dried-flower violet wash */
-  --cyan: #1d6b62;        /* verdigris — focus/accent */
-  --green: #3f6a24;       /* sap green — ok */
-  --amber: #8a6410;       /* gamboge ochre — warn */
-  --red: #9c3a2a;         /* madder — error */
-  --blue: #35506e;        /* woad indigo */
-  --blue2: #4d6a88;       /* pale indigo */
-  --radius: 3px;
-}
-/* buttons: embossed paper, no border — 1px cast shadow + top highlight */
-body[data-theme="herbarium"] .cad-btn,
-body[data-theme="herbarium"] .win-close {
-  border: none;
-  background: var(--face-hi);
-  box-shadow: 0 1px 0 #c3b995, inset 0 1px 0 #fbf7ec;
-}
-body[data-theme="herbarium"] .cad-btn:hover { background: #f8f3e6; }
-body[data-theme="herbarium"] .cad-btn:active {
-  transform: translateY(1px);
-  background: var(--face-active);
-  box-shadow: inset 0 1px 2px rgba(60, 46, 26, 0.28);
-}
-body[data-theme="herbarium"] .cad-btn.active {
-  color: var(--cyan);
-  background: var(--face-active);
-  box-shadow: inset 0 0 0 1px var(--cyan);
-}
-/* inputs: recessed label wells, no border — inset shadow + hairline tint ring */
-body[data-theme="herbarium"] .cad-input,
-body[data-theme="herbarium"] .cell-edit,
-body[data-theme="herbarium"] .md-live {
-  border: none;
-  box-shadow: inset 0 1px 2px rgba(60, 46, 26, 0.16), inset 0 0 0 1px #d6cdb4;
-}
-body[data-theme="herbarium"] .cad-input:focus {
-  box-shadow: inset 0 1px 2px rgba(60, 46, 26, 0.08), inset 0 0 0 1px var(--cyan);
-}
-body[data-theme="herbarium"] .cad-input.prov-auto { background: #efe6cb; color: #7a5a10; }
-body[data-theme="herbarium"] .cad-input.prov-manual { background: #e7ecdb; color: #43621f; }
-/* tabs: no border, ochre index-tab underline */
-body[data-theme="herbarium"] .tab,
-body[data-theme="herbarium"] .pane-tab {
-  border: none;
-  border-radius: 0;
-  background: transparent;
-  color: #6b6047;
-}
-body[data-theme="herbarium"] .tab.active,
-body[data-theme="herbarium"] .pane-tab.active {
-  background: transparent;
-  color: var(--ink);
-  box-shadow: inset 0 -2px 0 var(--amber);
-  font-weight: 600;
-}
-body[data-theme="herbarium"] .pane-tabs { box-shadow: inset 0 -1px 0 #d0c7ae; }
-/* titlebar: umber mounting board, pale bone text, no gradient/border */
-body[data-theme="herbarium"] #titlebar,
-body[data-theme="herbarium"] .win-titlebar {
-  background: var(--canvas);
-  color: var(--ink-light);
-  border-bottom: none;
-  box-shadow: 0 1px 0 #17110b;
-}
-/* grid: separation by tint step + 1px shadow rule, no hard borders */
-body[data-theme="herbarium"] .grid thead th {
-  background: #ded4bb;
-  color: #4a4230;
-  border-right: none;
-  border-bottom: none;
-  box-shadow: inset 0 -1px 0 #b3a988;
-}
-body[data-theme="herbarium"] .grid tbody td {
-  border-right: none;
-  border-bottom: 1px solid #33271c;
-}
-body[data-theme="herbarium"] .badge { background: rgba(120, 105, 70, 0.10); }
-/* tooltip: dark mounting-board card */
-body[data-theme="herbarium"] #cad-tooltip,
-body[data-theme="herbarium"] #attn-pop {
-  background: #221a12;
-  color: var(--ink-light);
-  border: none;
-  border-radius: 3px;
-  box-shadow: 0 4px 14px rgba(30, 20, 10, 0.35);
-}
-body[data-theme="herbarium"] #statusbar { box-shadow: inset 0 1px 0 #cabf9f; }
-body[data-theme="herbarium"] .win {
-  border-radius: 6px;
-  overflow: hidden;
-  box-shadow: 0 16px 44px rgba(40, 28, 14, 0.30);
-}
-body[data-theme="herbarium"] .menu-drop,
-body[data-theme="herbarium"] #popup-menu { border-radius: 4px; }
-body[data-theme="herbarium"] ::-webkit-scrollbar { width: 10px; height: 10px; }
-body[data-theme="herbarium"] ::-webkit-scrollbar-track { background: #ded4bb; }
-body[data-theme="herbarium"] ::-webkit-scrollbar-thumb {
-  background: #b3a988; border-radius: 3px; border: 2px solid #ded4bb;
-}
-body[data-theme="herbarium"] ::-webkit-scrollbar-thumb:hover { background: #9c9074; }
-
-/* ---------- BLUEPRINT LINEN ---------- */
-body[data-theme="blueprint-linen"] {
-  --face: #e9e3d3;
-  --face-hi: #f5f0e2;
-  --face-sh: #cfc7b3;
-  --face-sh2: #928975;
-  --face-active: #f7f3ea;
-  --canvas: #13324e;
-  --canvas-line: #254a6d;
+/* ---------- VELLUM ---------- */
+body[data-theme="vellum"] {
+  --face: #e9e4d8;
+  --face-hi: #f6f2ea;
+  --face-sh: #cdc7b8;
+  --face-sh2: #a49a86;
+  --face-active: #fbf8f1;
+  --canvas: #f7f4ec;
+  --canvas-line: #ece7db;
   --ink: #2a2620;
-  --ink-light: #e9e3d2;
-  --input-bg: #fdfbf4;
+  --ink-light: #2e2921;
+  --input-bg: #fdfbf5;
   --input-ink: #2a2620;
-  --row-hover: #1c3f5e;
-  --row-checked: #154347;
-  --row-manual: #3a2c34;
-  --cyan: #8fbfd6;
-  --green: #66b39a;
-  --amber: #c99a3f;
-  --red: #dd8270;
-  --blue: #16324f;
-  --blue2: #294f72;
-  --radius: 0px;
-}
-body[data-theme="blueprint-linen"] .cad-btn,
-body[data-theme="blueprint-linen"] .win-close {
-  border: 1px solid #34557a;
-  border-bottom-width: 2px;
-  border-radius: 0;
-  background: #efe9db;
-  box-shadow: inset 0 1px 0 #fbf7ec;
-}
-body[data-theme="blueprint-linen"] .cad-btn:hover { background: #f5f0e4; border-color: #16324f; }
-body[data-theme="blueprint-linen"] .cad-btn:active {
-  transform: translateY(1px);
-  background: #e2dccb;
-  box-shadow: inset 0 1px 2px rgba(19, 50, 78, 0.25);
-}
-body[data-theme="blueprint-linen"] .cad-input,
-body[data-theme="blueprint-linen"] .cell-edit,
-body[data-theme="blueprint-linen"] .md-live { border: 1px solid #34557a; border-radius: 0; }
-body[data-theme="blueprint-linen"] .cad-input:focus {
-  border-color: #16324f;
-  box-shadow: inset 0 0 0 1px #34557a;
-}
-body[data-theme="blueprint-linen"] .tab,
-body[data-theme="blueprint-linen"] .pane-tab {
-  border: 1px solid #34557a;
-  border-bottom: none;
-  border-radius: 0;
-  background: #ded7c6;
-  color: #4a4436;
-}
-body[data-theme="blueprint-linen"] .tab.active,
-body[data-theme="blueprint-linen"] .pane-tab.active {
-  background: var(--face-active);
-  color: var(--ink);
-  box-shadow: inset 0 3px 0 var(--blue);
-}
-body[data-theme="blueprint-linen"] .pane-tabs { border-bottom: 1px solid #34557a; }
-body[data-theme="blueprint-linen"] #titlebar,
-body[data-theme="blueprint-linen"] .win-titlebar {
-  background: var(--blue);
-  color: #eae4d4;
-  border-bottom: 3px double #7f96ab;
-  letter-spacing: 2px;
-}
-body[data-theme="blueprint-linen"] .grid thead th {
-  background: #1c3f5e;
-  color: var(--ink-light);
-  border-right: none;
-  border-bottom: 3px double #7f96ab;
-}
-body[data-theme="blueprint-linen"] .grid tbody td {
-  border-right: none;
-  border-bottom: 1px solid rgba(233, 227, 210, 0.10);
-}
-body[data-theme="blueprint-linen"] .badge { background: rgba(233, 227, 210, 0.06); }
-body[data-theme="blueprint-linen"] #cad-tooltip,
-body[data-theme="blueprint-linen"] #attn-pop {
-  background: #0f2a42;
-  color: var(--ink-light);
-  border: 1px solid #7f96ab;
-  border-radius: 0;
-  box-shadow: 0 4px 14px rgba(10, 26, 42, 0.5);
-}
-body[data-theme="blueprint-linen"] #statusbar { border-top: 3px double #34557a; }
-body[data-theme="blueprint-linen"] .win {
-  border-radius: 0;
-  box-shadow: 0 14px 40px rgba(15, 40, 68, 0.35);
-}
-body[data-theme="blueprint-linen"] .menu-drop,
-body[data-theme="blueprint-linen"] #popup-menu {
-  border-radius: 0;
-  border: 1px solid #34557a;
-}
-body[data-theme="blueprint-linen"] ::-webkit-scrollbar { width: 12px; height: 12px; }
-body[data-theme="blueprint-linen"] ::-webkit-scrollbar-track { background: #ded7c6; }
-body[data-theme="blueprint-linen"] ::-webkit-scrollbar-thumb {
-  background: #294f72; border: 2px solid #ded7c6; border-radius: 0;
-}
-body[data-theme="blueprint-linen"] ::-webkit-scrollbar-thumb:hover { background: #16324f; }
-
-/* ---------- OXBLOOD ---------- */
-body[data-theme="oxblood"] {
-  --face: #4a1e23;
-  --face-hi: #6e3237;
-  --face-sh: #341419;
-  --face-sh2: #8a6a48;
-  --face-active: #3d181c;
-  --canvas: #e9ddc4;
-  --canvas-line: #d8c8a5;
-  --ink: #f0e4cf;
-  --ink-light: #3a2c1c;
-  --input-bg: #f4ecd6;
-  --input-ink: #33261a;
-  --row-hover: #e0d2b0;
-  --row-checked: #d6ddbc;
-  --row-manual: #e6d3c4;
-  --cyan: #2b665d;
-  --green: #3c6a2b;
-  --amber: #7c5510;
-  --red: #9c2f22;
-  --blue: #3a4668;
-  --blue2: #5a4b7a;
+  --row-hover: #f0ebde;
+  --row-checked: #e4ead7;
+  --row-manual: #e9e4ec;
+  --cyan: #2f6a63;
+  --green: #4a6a34;
+  --amber: #866a2e;
+  --red: #964034;
+  --blue: #3a556e;
+  --blue2: #4c6683;
   --radius: 2px;
 }
-body[data-theme="oxblood"] .cad-btn,
-body[data-theme="oxblood"] .win-close {
-  border: 1px solid #8f6f42;
-  background: linear-gradient(#5a262b, #46191e);
+body[data-theme="vellum"] .cad-btn,
+body[data-theme="vellum"] .win-close {
+  border: 1px solid #c1baa8;
+  background: #f6f2ea;
+}
+body[data-theme="vellum"] .cad-btn:hover { background: #efeadd; border-color: #a49a86; }
+body[data-theme="vellum"] .cad-btn:active { background: #e6e0d1; }
+body[data-theme="vellum"] .cad-input,
+body[data-theme="vellum"] .cell-edit,
+body[data-theme="vellum"] .md-live { border: 1px solid #c1baa8; }
+body[data-theme="vellum"] .cad-input:focus { border-color: #2f6a63; }
+body[data-theme="vellum"] .tab,
+body[data-theme="vellum"] .pane-tab {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: #6a6252;
+}
+body[data-theme="vellum"] .tab.active,
+body[data-theme="vellum"] .pane-tab.active {
+  background: transparent;
   color: var(--ink);
-  box-shadow: inset 0 1px 0 rgba(176, 137, 75, 0.28);
-}
-body[data-theme="oxblood"] .cad-btn:hover {
-  background: linear-gradient(#68302f, #4f1f24);
-  border-color: #b0894b;
-}
-body[data-theme="oxblood"] .cad-btn:active {
-  transform: translateY(1px);
-  background: #3d181c;
-  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.45);
-}
-body[data-theme="oxblood"] .cad-input,
-body[data-theme="oxblood"] .cell-edit,
-body[data-theme="oxblood"] .md-live { border: 1px solid #b39a63; }
-body[data-theme="oxblood"] .cad-input:focus {
-  border-color: var(--cyan);
-  box-shadow: inset 0 0 0 1px var(--cyan);
-}
-body[data-theme="oxblood"] .tab,
-body[data-theme="oxblood"] .pane-tab {
-  border: 1px solid #7a5636;
-  border-bottom: none;
-  border-radius: 3px 3px 0 0;
-  background: #3d181c;
-  color: #b89a63;
-}
-body[data-theme="oxblood"] .tab.active,
-body[data-theme="oxblood"] .pane-tab.active {
-  background: var(--canvas);
-  color: var(--ink-light);
-  box-shadow: inset 0 2px 0 #b0894b;
+  box-shadow: inset 0 -2px 0 #3a556e;
   font-weight: 600;
 }
-body[data-theme="oxblood"] .pane-tabs { border-bottom: 1px solid #7a5636; }
-body[data-theme="oxblood"] #titlebar,
-body[data-theme="oxblood"] .win-titlebar {
-  background: linear-gradient(#5a262b, #3d181c);
-  color: #e6c98f;
-  border-bottom: 3px double #b0894b;
-  text-shadow: 0 1px 0 rgba(0, 0, 0, 0.4);
+body[data-theme="vellum"] .pane-tabs { border-bottom: 1px solid #cdc7b8; }
+body[data-theme="vellum"] #titlebar,
+body[data-theme="vellum"] .win-titlebar {
+  background: #6b6353;
+  color: #f2ede2;
+  border-bottom: 1px solid #574f41;
 }
-body[data-theme="oxblood"] .grid thead th {
-  background: #e6d9be;
-  color: #4a3820;
+body[data-theme="vellum"] .grid thead th {
+  background: #f0ebde;
+  color: #4c463a;
   border-right: none;
-  border-bottom: 2px solid #b0894b;
+  border-bottom: 1px solid #cdc7ba;
 }
-body[data-theme="oxblood"] .grid tbody td {
+body[data-theme="vellum"] .grid tbody td {
   border-right: none;
-  border-bottom: 1px solid #ddceac;
+  border-bottom: 1px solid #ece7db;
 }
-body[data-theme="oxblood"] .badge { background: rgba(74, 56, 32, 0.09); }
-body[data-theme="oxblood"] #cad-tooltip,
-body[data-theme="oxblood"] #attn-pop {
-  background: #3d181c;
-  color: #f0e4cf;
-  border: 1px solid #8f6f42;
+body[data-theme="vellum"] .badge { background: #f0ebde; }
+body[data-theme="vellum"] #cad-tooltip,
+body[data-theme="vellum"] #attn-pop {
+  background: #f7f3ea;
+  color: #2a2620;
+  border: 1px solid #c1baa8;
   border-radius: 2px;
-  box-shadow: 0 6px 18px rgba(20, 8, 10, 0.45);
+  box-shadow: 0 6px 18px rgba(60, 52, 36, 0.18);
 }
-body[data-theme="oxblood"] .win {
-  border-radius: 4px;
+body[data-theme="vellum"] .win {
+  border-radius: 2px;
   overflow: hidden;
-  box-shadow: 0 16px 44px rgba(28, 10, 12, 0.5);
+  box-shadow: 0 14px 40px rgba(60, 52, 36, 0.18);
 }
-body[data-theme="oxblood"] .menu-drop,
-body[data-theme="oxblood"] #popup-menu {
+body[data-theme="vellum"] .menu-drop,
+body[data-theme="vellum"] #popup-menu { border-radius: 2px; }
+body[data-theme="vellum"] ::-webkit-scrollbar { width: 9px; height: 9px; }
+body[data-theme="vellum"] ::-webkit-scrollbar-track { background: transparent; }
+body[data-theme="vellum"] ::-webkit-scrollbar-thumb {
+  background: #cdc7b8; border-radius: 4px; border: 2px solid #f7f4ec;
+}
+body[data-theme="vellum"] ::-webkit-scrollbar-thumb:hover { background: #cdc7ba; }
+
+/* ---------- LINEN ---------- */
+body[data-theme="linen"] {
+  --face: #e0dcd2;
+  --face-hi: #efece4;
+  --face-sh: #c3beb1;
+  --face-sh2: #948e7e;
+  --face-active: #f2efe8;
+  --canvas: #f1efe8;
+  --canvas-line: #e2dfd5;
+  --ink: #2c2a24;
+  --ink-light: #302e28;
+  --input-bg: #faf8f2;
+  --input-ink: #2c2a24;
+  --row-hover: #e9e6dd;
+  --row-checked: #dde3d7;
+  --row-manual: #e6e0e6;
+  --cyan: #356a60;
+  --green: #3a6d38;
+  --amber: #806a34;
+  --red: #9a3a2a;
+  --blue: #3c5570;
+  --blue2: #556c86;
+  --radius: 2px;
+}
+/* linen chrome: soft flax board, hairline rules, no hard black */
+body[data-theme="linen"] .cad-btn,
+body[data-theme="linen"] .win-close {
+  border: 1px solid #b8b2a3;
+  background: linear-gradient(#f1eee6, #e9e5db);
+}
+body[data-theme="linen"] .cad-btn:hover { background: #f4f1ea; border-color: #a39c8b; }
+body[data-theme="linen"] .cad-btn:active {
+  background: #e0dcd2;
+  transform: translateY(1px);
+}
+body[data-theme="linen"] .cad-btn.danger { color: #9a3a2a; }
+body[data-theme="linen"] .cad-input,
+body[data-theme="linen"] .cell-edit,
+body[data-theme="linen"] .md-live { border: 1px solid #b8b2a3; }
+body[data-theme="linen"] .cad-input:focus,
+body[data-theme="linen"] .cell-edit:focus { border-color: #356a60; }
+/* tabs: flat, marked by a soft slate underline when active */
+body[data-theme="linen"] .tab,
+body[data-theme="linen"] .pane-tab {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: #5f5a4f;
+}
+body[data-theme="linen"] .tab.active,
+body[data-theme="linen"] .pane-tab.active {
+  background: transparent;
+  color: var(--ink);
+  box-shadow: inset 0 -2px 0 #3c5570;
+  font-weight: 600;
+}
+body[data-theme="linen"] .pane-tabs { border-bottom: 1px solid #c3beb1; }
+/* muted warm band, the one permitted dark surface */
+body[data-theme="linen"] #titlebar,
+body[data-theme="linen"] .win-titlebar {
+  background: #4a4740;
+  color: #efece4;
+  border-bottom: 1px solid #383630;
+}
+/* ruled catalogue table: single hairlines, no vertical rules */
+body[data-theme="linen"] .grid thead th {
+  background: #e7e3da;
+  color: #4c4739;
+  border-right: none;
+  border-bottom: 1px solid #a39c8b;
+}
+body[data-theme="linen"] .grid tbody td {
+  border-right: none;
+  border-bottom: 1px solid #e5e1d7;
+}
+body[data-theme="linen"] .badge { background: rgba(148, 142, 126, 0.08); }
+body[data-theme="linen"] #statusbar { border-top: 1px solid #c3beb1; }
+body[data-theme="linen"] #cad-tooltip,
+body[data-theme="linen"] #attn-pop {
+  background: #faf8f2;
+  color: var(--ink);
+  border: 1px solid #948e7e;
+  border-radius: 2px;
+}
+body[data-theme="linen"] .win {
   border-radius: 3px;
-  border: 1px solid #8f6f42;
+  overflow: hidden;
+  box-shadow: 0 10px 30px rgba(60, 56, 46, 0.20);
 }
-body[data-theme="oxblood"] #statusbar { border-top: 3px double #8f6f42; }
-body[data-theme="oxblood"] ::-webkit-scrollbar { width: 11px; height: 11px; }
-body[data-theme="oxblood"] ::-webkit-scrollbar-track { background: transparent; }
-body[data-theme="oxblood"] ::-webkit-scrollbar-thumb {
-  background: #a98a54; border-radius: 2px;
+body[data-theme="linen"] ::-webkit-scrollbar { width: 12px; height: 12px; }
+body[data-theme="linen"] ::-webkit-scrollbar-track { background: #e7e3da; }
+body[data-theme="linen"] ::-webkit-scrollbar-thumb {
+  background: #cdc8bc; border: 2px solid #e7e3da; border-radius: 2px;
 }
-body[data-theme="oxblood"] ::-webkit-scrollbar-thumb:hover { background: #b89a63; }
 
-/* ---------- PORCELAIN ---------- */
-body[data-theme="porcelain"] {
-  --face: #eaedf1;
+/* ---------- QUARTO ---------- */
+/* ---------- QUARTO (crisp scholarly quarto) ---------- */
+body[data-theme="quarto"] {
+  --face: #e9ecf1;
   --face-hi: #ffffff;
-  --face-sh: #d5dae1;
-  --face-sh2: #a8b0bb;
-  --face-active: #f2f5f9;
-  --canvas: #fbfcfd;
-  --canvas-line: #e6eaef;
-  --ink: #1c222b;
-  --ink-light: #20272f;
+  --face-sh: #ccd2db;
+  --face-sh2: #98a1af;
+  --face-active: #fbfcfe;
+  --canvas: #f6f8fb;
+  --canvas-line: #e6eaf1;
+  --ink: #1b1f26;
+  --ink-light: #1b1f26;
   --input-bg: #ffffff;
-  --input-ink: #1c222b;
-  --row-hover: #eef4fb;
-  --row-checked: #dcebfb;
-  --row-manual: #e2f2ea;
-  --cyan: #05658f;
-  --green: #0f7d43;
-  --amber: #986206;
-  --red: #c3352a;
-  --blue: #33455c;
-  --blue2: #47617f;
-  --radius: 5px;
+  --input-ink: #1b1f26;
+  --row-hover: #eef1f6;
+  --row-checked: #e0e8f3;
+  --row-manual: #f0ece2;
+  --cyan: #2c5a8a;
+  --green: #3d6b41;
+  --amber: #886c34;
+  --red: #8f3529;
+  --blue: #3c4759;
+  --blue2: #5b626d;
+  --radius: 1px;
 }
-/* Buttons: smooth enamel — hairline cool edge over a faint top gloss */
-body[data-theme="porcelain"] .cad-btn,
-body[data-theme="porcelain"] .win-close {
-  border: 1px solid #c4ccd6;
-  background: linear-gradient(#ffffff, #f3f6fa);
+body[data-theme="quarto"] .cad-btn,
+body[data-theme="quarto"] .win-close {
+  border: 1px solid #c6cbd4;
+  background: linear-gradient(#ffffff, #f1f3f7);
 }
-body[data-theme="porcelain"] .cad-btn:hover { background: linear-gradient(#ffffff, #eaf1f8); border-color: #a8b0bb; }
-body[data-theme="porcelain"] .cad-btn:active { background: #e7edf4; box-shadow: inset 0 1px 2px rgba(40, 60, 90, 0.12); }
-/* Inputs: hairline cool rule, saturated cyan focus ring */
-body[data-theme="porcelain"] .cad-input,
-body[data-theme="porcelain"] .cell-edit,
-body[data-theme="porcelain"] .md-live { border: 1px solid #c4ccd6; }
-body[data-theme="porcelain"] .cad-input:focus { border-color: #0678a8; box-shadow: 0 0 0 2px rgba(6, 120, 168, 0.18); }
-/* Tabs: borderless, live-cyan underline instead of chrome-dark */
-body[data-theme="porcelain"] .tab,
-body[data-theme="porcelain"] .pane-tab {
+body[data-theme="quarto"] .cad-btn:hover { background: #f4f6fa; border-color: #98a1af; }
+body[data-theme="quarto"] .cad-btn:active { background: #e6eaf1; }
+body[data-theme="quarto"] .cad-input,
+body[data-theme="quarto"] .cell-edit,
+body[data-theme="quarto"] .md-live { border: 1px solid #c6cbd4; }
+body[data-theme="quarto"] .cad-input:focus { border-color: #2c5a8a; }
+body[data-theme="quarto"] .tab,
+body[data-theme="quarto"] .pane-tab {
   border: none;
   border-radius: 0;
   background: transparent;
-  color: #55606e;
+  color: #5a6472;
 }
-body[data-theme="porcelain"] .tab.active,
-body[data-theme="porcelain"] .pane-tab.active {
+body[data-theme="quarto"] .tab.active,
+body[data-theme="quarto"] .pane-tab.active {
   background: transparent;
   color: var(--ink);
-  box-shadow: inset 0 -2px 0 #0678a8;
+  box-shadow: inset 0 -2px 0 #2c5a8a;
   font-weight: 600;
 }
-body[data-theme="porcelain"] .pane-tabs { border-bottom: 1px solid #dbe1e9; }
-/* Titlebar: deep cool slate instrument bar */
-body[data-theme="porcelain"] #titlebar,
-body[data-theme="porcelain"] .win-titlebar {
-  background: #33455c;
+body[data-theme="quarto"] .pane-tabs { border-bottom: 1px solid #ccd2db; }
+body[data-theme="quarto"] #titlebar,
+body[data-theme="quarto"] .win-titlebar {
+  background: #3c4759;
+  color: #eef1f6;
+  border-bottom: 1px solid #2c3441;
+}
+body[data-theme="quarto"] .grid thead th {
+  background: #eef1f6;
+  color: #414a57;
+  border-right: none;
+  border-bottom: 1px solid #98a1af;
+}
+body[data-theme="quarto"] .grid tbody td {
+  border-right: none;
+  border-bottom: 1px solid #edf0f5;
+}
+body[data-theme="quarto"] .badge { background: #eef1f6; }
+body[data-theme="quarto"] #cad-tooltip,
+body[data-theme="quarto"] #attn-pop {
+  background: #f8f9fc;
+  color: var(--ink);
+  border: 1px solid #98a1af;
+}
+body[data-theme="quarto"] #statusbar { border-top: 1px solid #ccd2db; }
+body[data-theme="quarto"] .win {
+  border-radius: 1px;
+  overflow: hidden;
+  box-shadow: 0 10px 30px rgba(28, 34, 46, 0.18);
+}
+body[data-theme="quarto"] .menu-drop,
+body[data-theme="quarto"] #popup-menu { border-radius: 1px; }
+body[data-theme="quarto"] ::-webkit-scrollbar { width: 10px; height: 10px; }
+body[data-theme="quarto"] ::-webkit-scrollbar-track { background: #eef1f6; }
+body[data-theme="quarto"] ::-webkit-scrollbar-thumb {
+  background: #ccd2db; border: 2px solid #eef1f6; border-radius: 1px;
+}
+body[data-theme="quarto"] ::-webkit-scrollbar-thumb:hover { background: #c6cbd4; }
+
+/* ---------- PEWTER ---------- */
+/* ---------- PEWTER (cool neutral grey, hairline rules) ----------
+   A quiet lab-notebook instrument: light pewter chrome around a white
+   canvas, slate accents, uniform single hairlines. Radius 2px. */
+body[data-theme="pewter"] {
+  --face: #dde0e5;
+  --face-hi: #f2f4f6;
+  --face-sh: #c4c9d0;
+  --face-sh2: #99a0aa;
+  --face-active: #f7f9fb;
+  --canvas: #f8fafb;
+  --canvas-line: #e6eaee;
+  --ink: #23282e;
+  --ink-light: #23282e;
+  --input-bg: #ffffff;
+  --input-ink: #22262c;
+  --row-hover: #eceff3;
+  --row-checked: #dce4ea;
+  --row-manual: #e0e6df;
+  --cyan: #37656e;
+  --green: #3c6b40;
+  --amber: #87692a;
+  --red: #9c3b2e;
+  --blue: #3c4a5a;
+  --blue2: #56657a;
+  --radius: 2px;
+}
+body[data-theme="pewter"] .cad-btn,
+body[data-theme="pewter"] .win-close {
+  border: 1px solid #b7bdc5;
+  background: linear-gradient(#f2f4f6, #e4e8ec);
+}
+body[data-theme="pewter"] .cad-btn:hover {
+  background: linear-gradient(#f7f9fb, #eaedf0);
+  border-color: #99a0aa;
+}
+body[data-theme="pewter"] .cad-btn:active {
+  transform: translateY(1px);
+  background: #dce0e6;
+}
+body[data-theme="pewter"] .cad-input,
+body[data-theme="pewter"] .cell-edit,
+body[data-theme="pewter"] .md-live { border: 1px solid #b7bdc5; }
+body[data-theme="pewter"] .cad-input:focus { border-color: var(--cyan); }
+body[data-theme="pewter"] .tab,
+body[data-theme="pewter"] .pane-tab {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: #56606c;
+}
+body[data-theme="pewter"] .tab.active,
+body[data-theme="pewter"] .pane-tab.active {
+  background: transparent;
+  color: var(--ink);
+  box-shadow: inset 0 -2px 0 var(--blue);
+  font-weight: 600;
+}
+body[data-theme="pewter"] .pane-tabs { border-bottom: 1px solid #c4c9d0; }
+body[data-theme="pewter"] #titlebar,
+body[data-theme="pewter"] .win-titlebar {
+  background: #545d68;
+  color: #eef1f4;
+  border-bottom: 1px solid #3f4650;
+}
+body[data-theme="pewter"] .grid thead th {
+  background: #edf0f3;
+  color: #454c56;
+  border-right: none;
+  border-bottom: 1px solid #99a0aa;
+}
+body[data-theme="pewter"] .grid tbody td {
+  border-right: none;
+  border-bottom: 1px solid #e6eaee;
+}
+body[data-theme="pewter"] .badge { background: rgba(90, 100, 112, 0.08); }
+body[data-theme="pewter"] #cad-tooltip,
+body[data-theme="pewter"] #attn-pop {
+  background: #f4f6f8;
+  color: var(--ink);
+  border: 1px solid #99a0aa;
+  border-radius: 2px;
+}
+body[data-theme="pewter"] #statusbar { border-top: 1px solid #c4c9d0; }
+body[data-theme="pewter"] .win {
+  border-radius: 2px;
+  overflow: hidden;
+  box-shadow: 0 14px 40px rgba(40, 48, 58, 0.16);
+}
+body[data-theme="pewter"] .menu-drop,
+body[data-theme="pewter"] #popup-menu { border-radius: 2px; }
+body[data-theme="pewter"] ::-webkit-scrollbar { width: 10px; height: 10px; }
+body[data-theme="pewter"] ::-webkit-scrollbar-track { background: #edf0f3; }
+body[data-theme="pewter"] ::-webkit-scrollbar-thumb {
+  background: #ccd0d6; border: 2px solid #f8fafb; border-radius: 2px;
+}
+body[data-theme="pewter"] ::-webkit-scrollbar-thumb:hover { background: #c0c5cd; }
+
+/* ---------- FOLIO ---------- */
+/* ---------- FOLIO (cool blue-grey laid paper) ----------
+   A softly blue-grey-tinted folio sheet: the canvas is a faint cool
+   off-white (L=0.884), easier on the eyes than pure white. The catalogue
+   is built from tint steps rather than boxes -- hairline rules only where
+   a printed page would carry one. Radius 2px. */
+body[data-theme="folio"] {
+  --face: #dbe1e9;
+  --face-hi: #eef1f6;
+  --face-sh: #c2cbd7;
+  --face-sh2: #98a3b4;
+  --face-active: #f4f6fa;
+  --canvas: #eef2f7;
+  --canvas-line: #dde3ec;
+  --ink: #232830;
+  --ink-light: #232830;
+  --input-bg: #f7f9fc;
+  --input-ink: #232830;
+  --row-hover: #e0e6f0;
+  --row-checked: #d9e2ee;
+  --row-manual: #e0e6df;
+  --cyan: #2f6675;
+  --green: #3a6b3d;
+  --amber: #83692b;
+  --red: #9c3b2e;
+  --blue: #3a4c66;
+  --blue2: #4c6488;
+  --radius: 2px;
+}
+/* flat controls: a bright sheet under a single cool hairline */
+body[data-theme="folio"] .cad-btn,
+body[data-theme="folio"] .win-close {
+  border: 1px solid #c3cbd5;
+  background: #f2f4f8;
+}
+body[data-theme="folio"] .cad-btn:hover { background: #e9edf3; border-color: #98a3b4; }
+body[data-theme="folio"] .cad-btn:active { background: #dee4ec; }
+body[data-theme="folio"] .cad-btn.danger { color: #9c3b2e; }
+/* form fields: the brightest surface, hairline framed, cyan on focus */
+body[data-theme="folio"] .cad-input,
+body[data-theme="folio"] .cell-edit,
+body[data-theme="folio"] .md-live { border: 1px solid #c3cbd5; }
+body[data-theme="folio"] .cad-input:focus { border-color: #2f6675; }
+/* borderless tabs; active marked by an inked registration rule, not a box */
+body[data-theme="folio"] .tab,
+body[data-theme="folio"] .pane-tab {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: #55606f;
+}
+body[data-theme="folio"] .tab.active,
+body[data-theme="folio"] .pane-tab.active {
+  background: transparent;
+  color: var(--ink);
+  box-shadow: inset 0 -2px 0 #3a4c66;
+  font-weight: 600;
+}
+body[data-theme="folio"] .pane-tabs { border-bottom: 1px solid #c2cbd7; }
+/* titlebar: a muted blue-grey band under a thin rule */
+body[data-theme="folio"] #titlebar,
+body[data-theme="folio"] .win-titlebar {
+  background: #3a4c66;
   color: #eef2f7;
-  border-bottom: 1px solid #263442;
+  border-bottom: 1px solid #2c3a4f;
 }
-/* Grid: no vertical rules; header floats on white, hairline rows */
-body[data-theme="porcelain"] .grid thead th {
-  background: #ffffff;
-  color: #46515f;
+/* grid: a tint-band header on one hairline; horizontal ruling only */
+body[data-theme="folio"] .grid thead th {
+  background: #e5eaf1;
+  color: #47515f;
   border-right: none;
-  border-bottom: 1px solid #cdd5de;
+  border-bottom: 1px solid #98a3b4;
 }
-body[data-theme="porcelain"] .grid tbody td {
-  border-right: 1px solid #e6eaef;   /* column tracking, faint */
-  border-bottom: 1px solid #cfd6df;  /* row tracking: 1.11:1 was invisible */
+body[data-theme="folio"] .grid tbody td {
+  border-right: none;
+  border-bottom: 1px solid #e2e7ef;
 }
-body[data-theme="porcelain"] .badge { background: #eef2f7; }
-/* Tooltip stays high-key: white card, hairline edge, cool soft shadow */
-body[data-theme="porcelain"] #cad-tooltip,
-body[data-theme="porcelain"] #attn-pop {
-  background: #ffffff;
+body[data-theme="folio"] .badge { background: #e5eaf1; }
+/* tooltip: a light card with dark ink and a hairline */
+body[data-theme="folio"] #cad-tooltip,
+body[data-theme="folio"] #attn-pop {
+  background: #f7f9fc;
   color: var(--ink);
-  border: 1px solid #cdd5de;
-  border-radius: 5px;
-  box-shadow: 0 6px 20px rgba(40, 60, 90, 0.16);
+  border: 1px solid #98a3b4;
+  border-radius: 2px;
 }
-/* Windows: a porcelain object floating on a light surface */
-body[data-theme="porcelain"] .win {
-  border-radius: 8px;
-  overflow: hidden;
-  box-shadow: 0 16px 44px rgba(40, 60, 90, 0.18);
+body[data-theme="folio"] #statusbar { border-top: 1px solid #c2cbd7; }
+body[data-theme="folio"] ::-webkit-scrollbar { width: 10px; height: 10px; }
+body[data-theme="folio"] ::-webkit-scrollbar-track { background: #e5eaf1; }
+body[data-theme="folio"] ::-webkit-scrollbar-thumb {
+  background: #c2cbd7; border: 2px solid #e5eaf1; border-radius: 2px;
 }
-body[data-theme="porcelain"] .menu-drop,
-body[data-theme="porcelain"] #popup-menu { border-radius: 6px; }
-/* Accent identity: the cyan focus threads through nav */
-body[data-theme="porcelain"] .snav.active { color: #05658f; box-shadow: inset 2px 0 0 #05658f; }
-/* Provenance chips kept in the high-key register */
-body[data-theme="porcelain"] .cad-input.prov-auto { background: #fbf3e0; color: #7a5205; }
-body[data-theme="porcelain"] .cad-input.prov-manual { background: #e6f3ec; color: #145e34; }
-/* Scrollbars: thin, cool, airy */
-body[data-theme="porcelain"] ::-webkit-scrollbar { width: 9px; height: 9px; }
-body[data-theme="porcelain"] ::-webkit-scrollbar-track { background: transparent; }
-body[data-theme="porcelain"] ::-webkit-scrollbar-thumb { background: #cbd3dd; border-radius: 5px; border: 2px solid #ffffff; }
-body[data-theme="porcelain"] ::-webkit-scrollbar-thumb:hover { background: #aeb8c5; }
+body[data-theme="folio"] ::-webkit-scrollbar-thumb:hover { background: #c3cbd5; }
 
-/* ---------- OSCILLOSCOPE ---------- */
-body[data-theme="scope"] {
-  --face: #0a0d0b;
-  --face-hi: #16241b;
-  --face-sh: #1d3a29;
-  --face-sh2: #2f6f4a;
-  --face-active: #11201a;
-  --canvas: #0c1a11;
-  --canvas-line: #17361f;
-  --ink: #9ff0bf;
-  --ink-light: #8affb8;
-  --input-bg: #05100a;
-  --input-ink: #9dffc4;
-  --row-hover: #13291b;
-  --row-checked: #0c2b31;
-  --row-manual: #2a1424;
-  --cyan: #2fe0e0;
-  --green: #4dff8a;
-  --amber: #ffcf3a;
-  --red: #ff5a48;
-  --blue: #4b8fdb;
-  --blue2: #6aabee;
-  --radius: 0px;
-}
-body[data-theme="scope"] .cad-btn,
-body[data-theme="scope"] .win-close {
-  border: 1px solid #2f6f4a;
-  background: #0e1611;
-  color: var(--ink);
-  box-shadow: inset 0 0 6px rgba(47, 224, 224, 0.04);
-  text-shadow: 0 0 4px rgba(77, 255, 138, 0.22);
-}
-body[data-theme="scope"] .cad-btn:hover {
-  border-color: #2fe0e0;
-  background: #12201a;
-  box-shadow: 0 0 6px rgba(47, 224, 224, 0.32), inset 0 0 6px rgba(47, 224, 224, 0.08);
-}
-body[data-theme="scope"] .cad-btn:active {
-  background: #0a1510;
-  box-shadow: inset 0 0 8px rgba(0, 0, 0, 0.6);
-}
-body[data-theme="scope"] .cad-input,
-body[data-theme="scope"] .cell-edit,
-body[data-theme="scope"] .md-live {
-  border: 1px solid #245a3c;
-  box-shadow: inset 0 0 6px rgba(0, 0, 0, 0.5);
-}
-body[data-theme="scope"] .cad-input:focus {
-  border-color: #2fe0e0;
-  box-shadow: 0 0 6px rgba(47, 224, 224, 0.4), inset 0 0 6px rgba(47, 224, 224, 0.1);
-}
-body[data-theme="scope"] .tab,
-body[data-theme="scope"] .pane-tab {
-  border: none;
-  border-radius: 0;
-  background: transparent;
-  color: #4f8c68;
-  text-shadow: 0 0 3px rgba(77, 255, 138, 0.15);
-}
-body[data-theme="scope"] .tab.active,
-body[data-theme="scope"] .pane-tab.active {
-  background: transparent;
-  color: var(--cyan);
-  box-shadow: inset 0 -2px 0 #2fe0e0, inset 0 -9px 10px -7px rgba(47, 224, 224, 0.35);
-  text-shadow: 0 0 6px rgba(47, 224, 224, 0.5);
-  font-weight: 600;
-}
-body[data-theme="scope"] .pane-tabs { border-bottom: 1px solid #17361f; }
-body[data-theme="scope"] #titlebar,
-body[data-theme="scope"] .win-titlebar {
-  background:
-    repeating-linear-gradient(0deg, rgba(0,0,0,0) 0 2px, rgba(0,0,0,0.35) 2px 3px),
-    linear-gradient(#0a1410, #060d0a);
-  color: var(--green);
-  border-bottom: 1px solid #2f6f4a;
-  box-shadow: inset 0 -1px 0 rgba(47, 224, 224, 0.25), 0 1px 6px rgba(47, 224, 224, 0.12);
-  text-shadow: 0 0 6px rgba(77, 255, 138, 0.5);
-  letter-spacing: 2px;
-}
-body[data-theme="scope"] .grid thead th {
-  background: #0a1410;
-  color: #5aa07a;
-  border-right: none;
-  border-bottom: 1px solid #2f6f4a;
-  box-shadow: inset 0 -1px 4px -2px rgba(47, 224, 224, 0.4);
-  letter-spacing: 1px;
-}
-body[data-theme="scope"] .grid tbody td {
-  border-right: none;
-  border-bottom: 1px solid rgba(45, 111, 74, 0.18);
-}
-body[data-theme="scope"] .badge {
-  background: rgba(77, 255, 138, 0.06);
-  box-shadow: inset 0 0 0 1px rgba(45, 111, 74, 0.3);
-}
-body[data-theme="scope"] #cad-tooltip,
-body[data-theme="scope"] #attn-pop {
-  background:
-    repeating-linear-gradient(0deg, rgba(0,0,0,0) 0 2px, rgba(0,0,0,0.25) 2px 3px),
-    #08140d;
-  color: var(--ink-light);
-  border: 1px solid #2fe0e0;
-  border-radius: 0;
-  box-shadow: 0 0 10px rgba(47, 224, 224, 0.25), inset 0 0 12px rgba(47, 224, 224, 0.06);
-  text-shadow: 0 0 4px rgba(138, 255, 184, 0.4);
-}
-body[data-theme="scope"] #statusbar {
-  border-top: 1px solid #2f6f4a;
-  box-shadow: inset 0 1px 4px -2px rgba(47, 224, 224, 0.35);
-}
-body[data-theme="scope"] .menu-btn:hover,
-body[data-theme="scope"] .menu-btn.active {
-  color: var(--cyan);
-  text-shadow: 0 0 6px rgba(47, 224, 224, 0.4);
-}
-body[data-theme="scope"] .pm-head,
-body[data-theme="scope"] .settings-head {
-  color: var(--cyan);
-  text-shadow: 0 0 6px rgba(47, 224, 224, 0.35);
-}
-body[data-theme="scope"] .snav.active {
-  color: var(--cyan);
-  box-shadow: inset 2px 0 0 #2fe0e0;
-}
-body[data-theme="scope"] #manual-msg { color: var(--cyan); }
-body[data-theme="scope"] #status-msg::before { color: var(--green); }
-body[data-theme="scope"] .cad-input.prov-auto { background: #2a2410; color: #ffcf3a; }
-body[data-theme="scope"] .cad-input.prov-manual { background: #12291b; color: #7dffb0; }
-body[data-theme="scope"] .ol-item { border-bottom: 1px dotted #24503a; }
-body[data-theme="scope"] .ol-item:hover { background: #12281a; color: var(--ink-light); }
-body[data-theme="scope"] .fb-row { border-bottom: 1px dotted #24503a; }
-body[data-theme="scope"] .fb-row:hover { background: #12281a; color: var(--ink-light); }
-body[data-theme="scope"] .win {
-  border-radius: 0;
-  border: 1px solid #2f6f4a;
-  overflow: hidden;
-  box-shadow: 0 20px 52px rgba(0, 0, 0, 0.75), 0 0 12px rgba(47, 224, 224, 0.12);
-}
-body[data-theme="scope"] .menu-drop,
-body[data-theme="scope"] #popup-menu {
-  border-radius: 0;
-  background: #0a1410;
-  border: 1px solid #2f6f4a;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.7), 0 0 10px rgba(47, 224, 224, 0.1);
-}
-body[data-theme="scope"] ::-webkit-scrollbar { width: 10px; height: 10px; }
-body[data-theme="scope"] ::-webkit-scrollbar-track { background: #06100a; }
-body[data-theme="scope"] ::-webkit-scrollbar-thumb {
-  background: #1d3a29; border: 2px solid #06100a; border-radius: 0;
-}
-body[data-theme="scope"] ::-webkit-scrollbar-thumb:hover { background: #2f6f4a; }
-
-/* ---------- TERMINAL AMBER ---------- */
-body[data-theme="terminal-amber"] {
-  --face: #2a2620;
-  --face-hi: #3a332a;
-  --face-sh: #4a3d24;
-  --face-sh2: #6b5426;
-  --face-active: #201b15;
-  --canvas: #14100a;
-  --canvas-line: #2e2110;
-  --ink: #f0c67a;
-  --ink-light: #f6cd88;
-  --input-bg: #1a140a;
-  --input-ink: #f6cd88;
-  --row-hover: #221a0d;
-  --row-checked: #32260f;
-  --row-manual: #1c2410;
-  --cyan: #ffb000;
-  --green: #5cbf6a;
-  --amber: #ffd166;
-  --red: #f0503a;
-  --blue: #5c421e;
-  --blue2: #8a6a30;
-  --radius: 0px;
-}
-body[data-theme="terminal-amber"] .cad-btn,
-body[data-theme="terminal-amber"] .win-close {
-  border: 1px solid rgba(255, 176, 0, 0.32);
-  background: #241f18;
-  color: var(--ink);
-}
-body[data-theme="terminal-amber"] .cad-btn:hover {
-  background: #2f281d;
-  border-color: rgba(255, 176, 0, 0.55);
-}
-body[data-theme="terminal-amber"] .cad-btn:active {
-  background: #191510;
-  border-color: rgba(255, 176, 0, 0.7);
-}
-body[data-theme="terminal-amber"] .cad-input,
-body[data-theme="terminal-amber"] .cell-edit,
-body[data-theme="terminal-amber"] .md-live { border: 1px solid rgba(255, 176, 0, 0.28); }
-body[data-theme="terminal-amber"] .cad-input:focus {
-  border-color: #ffb000;
-  box-shadow: 0 0 0 1px rgba(255, 176, 0, 0.35), 0 0 6px rgba(255, 176, 0, 0.28);
-}
-body[data-theme="terminal-amber"] .tab,
-body[data-theme="terminal-amber"] .pane-tab {
-  border: none;
-  border-radius: 0;
-  background: transparent;
-  color: #a8813e;
-}
-body[data-theme="terminal-amber"] .tab.active,
-body[data-theme="terminal-amber"] .pane-tab.active {
-  background: transparent;
-  color: #ffb000;
-  box-shadow: inset 0 -2px 0 #ffb000;
-  text-shadow: 0 0 5px rgba(255, 176, 0, 0.5);
-  font-weight: 600;
-}
-body[data-theme="terminal-amber"] .pane-tabs { border-bottom: 1px solid rgba(255, 176, 0, 0.2); }
-body[data-theme="terminal-amber"] #titlebar,
-body[data-theme="terminal-amber"] .win-titlebar {
-  background:
-    repeating-linear-gradient(0deg, rgba(0, 0, 0, 0.28) 0 1px, transparent 1px 3px),
-    #1c1810;
-  color: #ffb000;
-  border-bottom: 1px solid rgba(255, 176, 0, 0.3);
-  letter-spacing: 1px;
-  text-shadow: 0 0 5px rgba(255, 176, 0, 0.55);
-}
-body[data-theme="terminal-amber"] .menu-btn:hover,
-body[data-theme="terminal-amber"] .menu-btn.active { color: #ffb000; }
-body[data-theme="terminal-amber"] .pm-head,
-body[data-theme="terminal-amber"] .settings-head { color: #ffb000; }
-body[data-theme="terminal-amber"] .snav.active {
-  color: #ffb000;
-  box-shadow: inset 2px 0 0 #ffb000;
-}
-body[data-theme="terminal-amber"] #manual-msg { color: #ffb000; }
-body[data-theme="terminal-amber"] #status-msg::before { color: #ffb000; }
-body[data-theme="terminal-amber"] .drafting {
-  background:
-    repeating-linear-gradient(0deg, rgba(255, 176, 0, 0.03) 0 1px, transparent 1px 3px),
-    var(--canvas);
-  border-color: rgba(255, 176, 0, 0.28);
-}
-body[data-theme="terminal-amber"] .grid thead th {
-  background: #1c1610;
-  color: #c79a4a;
-  border-right: none;
-  border-bottom: 1px solid rgba(255, 176, 0, 0.3);
-  letter-spacing: 0.5px;
-}
-body[data-theme="terminal-amber"] .grid tbody td {
-  border-right: none;
-  border-bottom: 1px solid rgba(255, 176, 0, 0.08);
-}
-body[data-theme="terminal-amber"] .badge { background: rgba(255, 176, 0, 0.07); }
-body[data-theme="terminal-amber"] .cad-input.prov-auto { background: #33280f; color: #ffd166; }
-body[data-theme="terminal-amber"] .cad-input.prov-manual { background: #1d2913; color: #b6e2be; }
-body[data-theme="terminal-amber"] .ol-item { border-bottom: 1px dotted rgba(255, 176, 0, 0.18); }
-body[data-theme="terminal-amber"] .ol-item:hover { background: #2c2210; color: #ffd88f; }
-body[data-theme="terminal-amber"] .fb-row { border-bottom: 1px dotted rgba(255, 176, 0, 0.18); }
-body[data-theme="terminal-amber"] .fb-row:hover { background: #2c2210; color: #ffd88f; }
-body[data-theme="terminal-amber"] #cad-tooltip,
-body[data-theme="terminal-amber"] #attn-pop {
-  background:
-    repeating-linear-gradient(0deg, rgba(255, 176, 0, 0.04) 0 1px, transparent 1px 3px),
-    #0e0b06;
-  color: #f6cd88;
-  border: 1px solid rgba(255, 176, 0, 0.4);
-  border-radius: 0;
-  box-shadow: 0 0 14px rgba(255, 176, 0, 0.14), 0 6px 18px rgba(0, 0, 0, 0.55);
-}
-body[data-theme="terminal-amber"] .win {
-  border-radius: 0;
-  overflow: hidden;
-  box-shadow: 0 0 0 1px rgba(255, 176, 0, 0.14), 0 20px 52px rgba(0, 0, 0, 0.72);
-}
-body[data-theme="terminal-amber"] .menu-drop,
-body[data-theme="terminal-amber"] #popup-menu {
-  border-radius: 0;
-  background: #1c1810;
-  border: 1px solid rgba(255, 176, 0, 0.3);
-}
-body[data-theme="terminal-amber"] #statusbar { border-top: 1px solid rgba(255, 176, 0, 0.25); }
-body[data-theme="terminal-amber"] ::-webkit-scrollbar { width: 10px; height: 10px; }
-body[data-theme="terminal-amber"] ::-webkit-scrollbar-track { background: #14100a; }
-body[data-theme="terminal-amber"] ::-webkit-scrollbar-thumb {
-  background: #4a3d24; border: 2px solid #14100a; border-radius: 0;
-}
-body[data-theme="terminal-amber"] ::-webkit-scrollbar-thumb:hover { background: #6b5426; }
 
 
 /* ===================== base ===================== */
@@ -2559,6 +2316,24 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   border-top: 1px solid var(--face-sh);
 }
 #status-msg::before { content: "> "; color: var(--blue); }
+
+/* Footer severity: an error highlights the line yellow, a critical one red.
+   The text stays --ink, as under a highlighter -- amber only reaches ~3.9:1 on
+   --face in every theme, so amber-on-face text would be under-contrast. The
+   tint carries the severity; the "> " prompt echoes it. */
+#status-msg.err,
+#status-msg.crit {
+  padding: 0 6px;
+  border-radius: var(--radius);
+  font-weight: bold;
+  color: var(--ink);
+}
+#status-msg.err  { background: color-mix(in srgb, var(--amber) 34%, transparent); }
+#status-msg.crit { background: color-mix(in srgb, var(--red) 38%, transparent); }
+/* two ids: a theme may recolour the "> " prompt, and severity must outrank it */
+#statusbar #status-msg.err::before  { color: var(--amber); }
+#statusbar #status-msg.crit::before { color: var(--red); }
+
 .foot-right { display: flex; align-items: center; gap: 10px; }
 
 /* background IA download progress bar (footer) */
@@ -2707,6 +2482,33 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   border: 1px solid var(--canvas-line);
   background: #fff;
 }
+/* layout mode: a facsimile pane the same shape as the page, holding the page's
+   own words at their own positions. Selectable, read-only. */
+.ocr-pglayout {
+  position: relative;
+  width: 100%;
+  background: var(--input-bg);
+  border: 1px solid var(--canvas-line);
+  overflow: hidden;
+}
+.ocr-pglayout.empty {
+  aspect-ratio: auto;
+  min-height: 120px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  color: var(--face-sh2);
+}
+.ocr-word {
+  position: absolute;
+  transform-origin: 0 0;      /* scaleX squeezes each word into its own box */
+  white-space: pre;
+  line-height: 1;
+  color: var(--input-ink);
+  font-family: var(--mono);
+}
+
 .ocr-pgtext {
   resize: none;
   height: 100%;

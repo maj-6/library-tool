@@ -107,7 +107,8 @@ const state = {
     ocrService: "tesseract", ocrAzureEndpoint: "", ocrAzureKey: "",
     ocrTesseract: "", ocrClaudeKey: "", ocrClaudeModel: "",
     ocrAwsKey: "", ocrAwsSecret: "", ocrAwsRegion: "",
-    ocrImageWidth: 1400,        // rasterization width for OCR input —
+    ocrImageWidth: 1400,
+    ocrLayout: false,   // page view: place words where they sit on the page        // rasterization width for OCR input —
                                 // tune to see how shrinking affects quality
     // page-view digit shortcuts: press N over a page to queue it
     ocrKeyMap: { 1: "tesseract", 2: "claude", 3: "textract", 4: "azure", 5: "openai" },
@@ -137,27 +138,32 @@ const state = {
 
 // --- appearance: themes are full chrome redesigns; fonts are user-selectable --
 
+// All light. This is a scholarly tool, read for hours: no dark modes, no loud
+// accents. They differ by paper stock, rule weight and ink colour.
 const THEMES = [
   ["sage", "Sage"],
   ["ledger", "Archive Ledger"],
   ["foolscap", "Foolscap"],
-  ["herbarium", "Herbarium"],
-  ["blueprint-linen", "Blueprint Linen"],
-  ["oxblood", "Oxblood"],
-  ["porcelain", "Porcelain"],
-  ["scope", "Oscilloscope"],
-  ["terminal-amber", "Terminal Amber"],
+  ["vellum", "Vellum"],
+  ["linen", "Linen"],
+  ["quarto", "Quarto"],
+  ["pewter", "Pewter"],
+  ["folio", "Folio"],
 ];
 const DEFAULT_THEME = "sage";
 // Retired ids map to the survivor closest in spirit, so a stored theme never
 // falls through to the bare :root fallback. "" was Classic CAD, the old default.
 const LEGACY_THEMES = {
   "": DEFAULT_THEME,
-  platinum: "porcelain", blueprint: "blueprint-linen", modern: "porcelain",
-  dark: "scope", stone: "ledger", midnight: "scope",
-  cde: "ledger", xp2003: DEFAULT_THEME, acad: "scope",
-  workstation: DEFAULT_THEME, slate: "scope", mainframe: "terminal-amber",
-  graphite: "scope",
+  // the dark/loud round, retired after one release
+  scope: "pewter", "terminal-amber": "vellum", "blueprint-linen": "quarto",
+  oxblood: "ledger", porcelain: "pewter", herbarium: "vellum",
+  // the original set
+  platinum: "pewter", blueprint: "quarto", modern: "pewter",
+  dark: "pewter", stone: "linen", midnight: "pewter",
+  cde: "ledger", xp2003: DEFAULT_THEME, acad: "pewter",
+  workstation: DEFAULT_THEME, slate: "pewter", mainframe: "vellum",
+  graphite: "pewter",
 };
 
 // One shared font list; the interface (--ui) and data/table (--mono) fonts
@@ -450,7 +456,18 @@ const esc = (s) =>
   String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-function status(msg) { el("status-msg").textContent = msg; }
+// The footer carries the last thing that happened, at its true severity:
+// "error" tints it amber, "critical" red. A failure that only cost time is an
+// error; one that means the user's data did not persist, or that the backend is
+// gone, is critical. Any later plain status() clears the tint, so no timer.
+function status(msg, level) {
+  const n = el("status-msg");
+  n.textContent = msg;
+  n.classList.toggle("err", level === "error");
+  n.classList.toggle("crit", level === "critical");
+}
+const statusErr = (msg) => status(msg, "error");
+const statusCrit = (msg) => status(msg, "critical");
 function ckey(source, idx) { return `${source}:${idx}`; }
 
 // --- icon set (inline SVG, stroke = currentColor) ------------------------------
@@ -546,7 +563,7 @@ async function undo() {
   historyBusy = true;
   const op = history.stack[--history.ptr];
   try { await op.undoFn(); status(`UNDO :: ${op.label}`); }
-  catch (e) { status(`UNDO FAILED :: ${op.label}`); }
+  catch (e) { statusErr(`UNDO FAILED :: ${op.label}`); }
   historyBusy = false;
   updateHistoryButtons();
 }
@@ -559,7 +576,7 @@ async function redo() {
   historyBusy = true;
   const op = history.stack[history.ptr++];
   try { await op.redoFn(); status(`REDO :: ${op.label}`); }
-  catch (e) { status(`REDO FAILED :: ${op.label}`); }
+  catch (e) { statusErr(`REDO FAILED :: ${op.label}`); }
   historyBusy = false;
   updateHistoryButtons();
 }
@@ -2312,7 +2329,7 @@ async function setRowLocalPdf(id, path) {
   if (row.kind === "manual") {
     const entry = state.manual.find((x) => x.id === id) || {};
     const prior = entry.local_pdf || "";
-    if (!await patchManualLocalPdf(id, path)) { status("Attach failed"); return; }
+    if (!await patchManualLocalPdf(id, path)) { statusErr("Attach failed"); return; }
     pushOp(`${verb} ${(row.book.title || "").slice(0, 36)}`,
       () => patchManualLocalPdf(id, prior),
       () => patchManualLocalPdf(id, path),
@@ -3341,7 +3358,7 @@ async function applyEditPatch(row, patch) {
       status(`UPDATED ${tag} :: RESCANNING`);
       return true;
     }
-    status("UPDATE FAILED");
+    statusCrit("UPDATE FAILED");
     return false;
   }
   const entry = state.checked.get(row.id);
@@ -3731,7 +3748,7 @@ async function revertHistoryAction(hid) {
     if (op) { op.undoFn = op.redoFn = () => {}; }
     renderBottomRows();
     status("REVERTED :: " + rec.label.slice(0, 50));
-  } else status("REVERT FAILED :: " + rec.label.slice(0, 40));
+  } else statusCrit("REVERT FAILED :: " + rec.label.slice(0, 40));
 }
 
 // expand/collapse the full-detail row under a History entry
@@ -3825,7 +3842,7 @@ async function addToTop(rec) {
         });
       status(`ADDED TO WHL CATALOG (CORRECTIONS) :: ${rec.title}`);
     } else {
-      status("WHL ADD FAILED");
+      statusErr("WHL ADD FAILED");
     }
     return;
   }
@@ -3859,10 +3876,10 @@ async function addToTop(rec) {
       queueScan(data.entry.id);
       status(`ADDED TO CHECKED BOOKS :: ${rec.title}`);
     } else {
-      status(data.error || "ADD FAILED");
+      statusErr(data.error || "ADD FAILED");
     }
   } catch (e) {
-    status("ADD FAILED");
+    statusErr("ADD FAILED");
   }
 }
 
@@ -4249,7 +4266,7 @@ async function repopulateCheckedRow(rec) {
       status(`ROW REPOPULATED :: ${vals.title || row.book.title}`);
       clearOlColMarks();
     } else {
-      status("REPOPULATE FAILED");
+      statusErr("REPOPULATE FAILED");
     }
     return;
   }
@@ -4299,7 +4316,7 @@ async function repopulateWhlRow(rec) {
     status(`WHL ROW REPOPULATED :: ${fields.title || row.title}`);
     clearOlColMarks();
   } else {
-    status("WHL REPOPULATE FAILED");
+    statusErr("WHL REPOPULATE FAILED");
   }
 }
 
@@ -4331,7 +4348,7 @@ function startWhlEdit(td) {
         status(`WHL ${field.toUpperCase()} CORRECTED :: ${row.title}`);
         return;
       }
-      status("WHL EDIT FAILED");
+      statusErr("WHL EDIT FAILED");
     }
     renderWhlTop();
   };
@@ -4672,7 +4689,7 @@ async function startWhlScrape() {
     await fetch("/api/whl_scrape", { method: "POST" });
   } catch (e) {
     scrapeRunning = false;
-    status("SCRAPE FAILED TO START");
+    statusErr("SCRAPE FAILED TO START");
     return;
   }
   status("SCRAPING WHL WEBSITE METADATA ...");
@@ -4690,7 +4707,7 @@ async function startWhlScrape() {
     scrapePoll = null;
     scrapeRunning = false;
     if (s.status === "error") {
-      status(`SCRAPE ERROR :: ${s.error || "unknown"}`);
+      statusErr(`SCRAPE ERROR :: ${s.error || "unknown"}`);
       return;
     }
     await loadWhlRows(true);
@@ -5345,9 +5362,10 @@ function createPdfViewer() {
         });
       const data = await res.json().catch(() => ({}));
       if (data.ok) pagesDirty = false;
-      status(data.ok ? `OCR SAVED :: ${target.name}` : "OCR SAVE FAILED");
+      if (data.ok) status(`OCR SAVED :: ${target.name}`);
+      else statusCrit("OCR SAVE FAILED");
     } catch (e) {
-      status("OCR SAVE FAILED");
+      statusCrit("OCR SAVE FAILED");
     }
   }
 
@@ -5623,7 +5641,7 @@ async function startDownload(identifier, book) {
     if (data.status === "done") state.downloadedIds.add(identifier);
     else if (data.status === "downloading") pollDownload(identifier);
   } catch (e) {
-    status("IA DOWNLOAD FAILED TO START");
+    statusErr("IA DOWNLOAD FAILED TO START");
   }
   // if this call did not enter the polling loop (already saved, or failed to
   // start), release any background-download slot it was holding and pump next
@@ -5653,7 +5671,7 @@ function pollDownload(identifier) {
           state.downloadedIds.add(identifier);
           status(`IA PDF SAVED :: ${data.path || identifier}`);
         } else if (data.status === "error") {
-          status(`IA DOWNLOAD ERROR :: ${data.error || "unknown"}`);
+          statusErr(`IA DOWNLOAD ERROR :: ${data.error || "unknown"}`);
         }
         pumpAutoDl();                             // start the next queued download
       }
@@ -5667,7 +5685,7 @@ function pollDownload(identifier) {
         state.autoDlActive.delete(identifier);
         pumpAutoDl();
         updateDlProgress();
-        status(`IA DOWNLOAD POLLING STOPPED (SERVER UNREACHABLE) :: ${identifier}`);
+        statusCrit(`IA DOWNLOAD POLLING STOPPED (SERVER UNREACHABLE) :: ${identifier}`);
       }
     }
   }, 1500);
@@ -5777,7 +5795,7 @@ async function processScanQueue() {
       // rowById()'s row has no scans field — pass the freshly-fetched ones
       maybeAutoDownloadIa({ ...row, scans });   // found an IA source -> background-download it
     } catch (e) {
-      status(`AUTO SCAN FAILED :: ${row.book.title}`);
+      statusErr(`AUTO SCAN FAILED :: ${row.book.title}`);
     }
     renderChecked();
   }
@@ -6400,8 +6418,8 @@ async function runCloudSync() {
   try {
     await flushClientState();   // the engine reads settings server-side — push first
     const r = await (await fetch("/api/cloudsync/run", { method: "POST" })).json();
-    if (!r.ok) { status("CLOUD SYNC :: " + (r.error || "failed to start")); return; }
-  } catch (e) { status("CLOUD SYNC :: server unreachable"); return; }
+    if (!r.ok) { statusErr("CLOUD SYNC :: " + (r.error || "failed to start")); return; }
+  } catch (e) { statusCrit("CLOUD SYNC :: server unreachable"); return; }
   btn.disabled = true;
   status("CLOUD SYNC :: RUNNING");
   clearInterval(_cloudPoll);
@@ -6415,10 +6433,15 @@ async function runCloudSync() {
     btn.disabled = false;
     const r = st.last_result || {};
     if (r.imported) await loadManual();        // new entries -> refresh the table
-    status(r.ok === false
-      ? "CLOUD SYNC FAILED :: " + (r.error || (r.errors || []).join("; ") || "?")
-      : `CLOUD SYNC :: ${r.imported || 0} imported / ${r.books_pushed || 0} books pushed` +
-        ((r.errors || []).length ? ` / ${r.errors.length} errors` : ""));
+    if (r.ok === false) {
+      statusCrit("CLOUD SYNC FAILED :: " +
+        (r.error || (r.errors || []).join("; ") || "?"));
+    } else {
+      // a sync that finished but dropped rows is an error, not a success
+      const dropped = (r.errors || []).length;
+      status(`CLOUD SYNC :: ${r.imported || 0} imported / ${r.books_pushed || 0} books pushed` +
+        (dropped ? ` / ${dropped} errors` : ""), dropped ? "error" : undefined);
+    }
   }, 1500);
 }
 
@@ -6465,7 +6488,7 @@ async function deleteManual(id) {
     }
     status("MANUAL ENTRY DELETED");
   } else {
-    status("DELETE FAILED");
+    statusCrit("DELETE FAILED");
   }
 }
 
@@ -6816,7 +6839,7 @@ async function createBuild(seed, label) {
     body: JSON.stringify({ build: seed || {} }),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok || !data.ok) { status("BUILD CREATE FAILED"); return null; }
+  if (!res.ok || !data.ok) { statusCrit("BUILD CREATE FAILED"); return null; }
   state.builds[data.build.id] = data.build;
   const snap = JSON.parse(JSON.stringify(data.build));
   pushOp(`create build ${label || snap.title || snap.id}`,
@@ -6952,7 +6975,7 @@ async function deleteBuild() {
     renderUpload();
     status(`BUILD DELETED :: ${snap.title || id}`);
   } else {
-    status("BUILD DELETE FAILED");
+    statusCrit("BUILD DELETE FAILED");
   }
 }
 
@@ -7284,6 +7307,9 @@ async function attachPdfFile(path) {
 
 const ocrState = {
   docs: [], sel: null, view: "edit", jobs: [], seq: 0,
+  lastRendered: null,      // doc id the views currently hold, so a re-render
+                           // of the SAME doc can keep the reader's scroll
+  layout: false,           // page view: words placed as they sit on the page
   books: null,             // build id -> {ocr, preview} (entry folders)
   book: null,              // selected book (build id)
   bookLoading: null,       // build id currently loading (re-entrancy guard)
@@ -7530,12 +7556,23 @@ function setOcrView(v) {
   el("ocr-editor").hidden = v !== "edit";
   el("ocr-diff").hidden = v !== "diff";
   el("ocr-pages").hidden = v !== "pdf";
+  el("ocr-layout").hidden = v !== "pdf";       // layout is a mode of the page view
+  el("ocr-layout").classList.toggle("active", ocrState.layout);
   if (v === "diff") renderOcrDiff();
   else if (v === "pdf") renderOcrPages();
   else {
     const d = ocrSelDoc();
     el("ocr-editor").value = d ? d.text : "";
   }
+}
+
+function setOcrLayout(on) {
+  ocrSyncEditor();          // don't lose pending edits when the textareas go away
+  ocrState.layout = !!on;
+  state.settings.ocrLayout = ocrState.layout;
+  saveSettings();
+  el("ocr-layout").classList.toggle("active", ocrState.layout);
+  if (ocrState.view === "pdf") renderOcrPages();
 }
 
 // --- side-by-side page view: PDF page images next to that page's OCR text --
@@ -7612,6 +7649,23 @@ async function renderOcrPages() {
   ocrState.pages = null;
   const img = (n) => `<img loading="lazy" alt="page ${n}"
       src="/api/pdf/pageimg?path=${encodeURIComponent(pdf)}&page=${n}&w=700" />`;
+  // Layout mode swaps each editable textarea for a facsimile pane: the page's
+  // own words, at the position and scale they occupy on the page. Boxes are
+  // fetched per page as it scrolls into view -- a 400-page book must not fire
+  // 400 requests up front.
+  if (ocrState.layout) {
+    box.innerHTML =
+      (count > shown ? `<div class="ocr-pgnote empty">Showing the first ${shown} of ${count} pages</div>` : "") +
+      Array.from({ length: shown }, (_, i) => `
+      <div class="ocr-pgrow" data-page="${i + 1}">
+        <div class="ocr-pgimg">${img(i + 1)}</div>
+        <div class="ocr-pglayout" data-lay="${i + 1}"></div>
+      </div>`).join("");
+    if (sections) ocrState.pages = sections;
+    observeOcrLayout(pdf);
+    decorateOcrPages();
+    return;
+  }
   if (!sections) {
     // no page markers: the whole text sits beside the first page
     box.innerHTML = `
@@ -7646,6 +7700,72 @@ async function renderOcrPages() {
   decorateOcrPages();
 }
 
+// --- layout mode: the page's own words, where they sit on the page -----------
+// The coordinates come from the PDF's embedded text layer (the same ones the
+// browser's viewer uses to draw a selection), read server-side with PyMuPDF and
+// normalised to 0..1, so they survive any render width.
+
+let ocrLayoutObs = null;
+
+function observeOcrLayout(pdf) {
+  if (ocrLayoutObs) ocrLayoutObs.disconnect();
+  ocrLayoutObs = new IntersectionObserver((entries, obs) => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      obs.unobserve(e.target);
+      fillOcrLayout(e.target, pdf).catch(() => { /* page left the view */ });
+    }
+  }, { root: el("ocr-pages"), rootMargin: "300px" });
+  for (const pane of el("ocr-pages").querySelectorAll(".ocr-pglayout")) {
+    ocrLayoutObs.observe(pane);
+  }
+}
+
+async function fillOcrLayout(pane, pdf) {
+  const page = +pane.dataset.lay;
+  pane.textContent = "…";
+  const res = await (await fetch(
+    `/api/pdf/words?path=${encodeURIComponent(pdf)}&page=${page}`)).json();
+  if (!pane.isConnected) return;
+  if (!res.ok || !res.found) {
+    pane.classList.add("empty");
+    pane.textContent = res.ok ? "No text layer on this page" : (res.error || "Could not read the page");
+    return;
+  }
+  pane.classList.remove("empty");
+  pane.textContent = "";
+  pane.style.aspectRatio = `${res.page_w} / ${res.page_h}`;
+  // read the pane's box once: touching clientWidth per word would force a
+  // layout per word, and a dense page carries ~400 of them
+  const paneW = pane.clientWidth;
+  const paneH = pane.clientHeight || (paneW * res.page_h / res.page_w);
+  const frag = document.createDocumentFragment();
+  const placed = [];
+  for (const line of res.lines) {
+    const size = Math.max(1, line.s * paneH);   // one type size for the line
+    for (const sp of line.spans) {
+      const e = document.createElement("span");
+      e.className = "ocr-word";
+      e.textContent = sp.t;
+      e.style.left = sp.x * 100 + "%";
+      e.style.top = line.y * 100 + "%";         // the line's baseline
+      e.style.fontSize = size + "px";
+      frag.appendChild(e);
+      placed.push([e, sp.w * paneW]);
+    }
+  }
+  pane.appendChild(frag);
+  // Squeeze each span to the width of its box -- the screen font is never the
+  // page's font, so glyph widths never agree. Read every width first, THEN
+  // write every transform: interleaving them would thrash layout once per span.
+  // The lift is an approximate ascent, since `top` is the baseline.
+  const widths = placed.map(([e]) => e.getBoundingClientRect().width);
+  placed.forEach(([e, want], i) => {
+    const k = widths[i] > 0.5 && want > 0.5 ? want / widths[i] : 1;
+    e.style.transform = `translateY(-0.79em) scaleX(${k})`;
+  });
+}
+
 // Swap only the OCR text alongside the already-rendered page images — used when
 // selecting another document of the SAME book in the page view, so the PDF page
 // images stay loaded instead of being torn down and re-fetched. Returns false
@@ -7653,6 +7773,9 @@ async function renderOcrPages() {
 // the caller can fall back to a full re-render.
 function refillOcrPageText(d) {
   const box = el("ocr-pages");
+  // layout mode reads its text from the PDF, not from the doc, so a merged OCR
+  // result changes nothing on screen -- and there are no textareas to refill
+  if (ocrState.layout) return !!box.querySelector(".ocr-pglayout");
   const paged = box.querySelectorAll("textarea[data-pn]");
   const whole = box.querySelector("textarea[data-whole]");
   const sections = ocrPageSections(d.text);
@@ -7724,9 +7847,27 @@ function renderOcrTab() {
     sel.value = prevWith;
   }
   const d = ocrSelDoc();
-  if (ocrState.view === "edit") el("ocr-editor").value = d ? d.text : "";
-  else if (ocrState.view === "diff") renderOcrDiff();
-  else renderOcrPages();
+  // A re-render of the doc already on screen must not throw the reader back to
+  // the top -- this fires from the OCR-job poller, mid-read. Only a switch to a
+  // different document legitimately resets the scroll.
+  const sameDoc = !!d && d.id === ocrState.lastRendered;
+  ocrState.lastRendered = d ? d.id : null;
+  if (ocrState.view === "edit") {
+    const ta = el("ocr-editor");
+    const top = sameDoc ? ta.scrollTop : 0;   // assigning .value resets scrollTop
+    ta.value = d ? d.text : "";
+    ta.scrollTop = top;
+  } else if (ocrState.view === "diff") {
+    const box = el("ocr-diff");
+    const top = sameDoc ? box.scrollTop : 0;
+    renderOcrDiff();
+    box.scrollTop = top;
+  } else if (!(sameDoc && d && refillOcrPageText(d))) {
+    // refillOcrPageText swaps text into the rows that are already mounted, so
+    // scroll and the loaded page images survive. It declines when the page
+    // structure changed (markers appeared, pages deleted) -- then rebuild.
+    renderOcrPages();
+  }
   // quality reflects the doc's book (when folder-sourced)
   const build = d && d.buildId ? state.builds[d.buildId] : null;
   el("ocr-quality").value = (build && build.ocr_quality) || "";
@@ -8285,6 +8426,8 @@ function initOcrTab() {
   el("ocr-view-diff").addEventListener("click", () => setOcrView("diff"));
   el("ocr-view-pdf").addEventListener("click", () =>
     setOcrView(ocrState.view === "pdf" ? "edit" : "pdf"));
+  ocrState.layout = !!state.settings.ocrLayout;
+  el("ocr-layout").addEventListener("click", () => setOcrLayout(!ocrState.layout));
   el("ocr-pages").addEventListener("input", onOcrPageInput);
   // page-view shortcuts: click selects, Ctrl+click extends the range,
   // digits STAGE the selection/hovered page, T marks a title page,
@@ -8353,10 +8496,10 @@ async function syncMasterList() {
       }),
     });
     const data = await res.json().catch(() => ({}));
-    status(data.ok ? `MASTER LIST SYNCED :: ${data.rows} ROWS`
-                   : `SYNC FAILED :: ${data.error || "?"}`);
+    if (data.ok) status(`MASTER LIST SYNCED :: ${data.rows} ROWS`);
+    else statusCrit(`SYNC FAILED :: ${data.error || "?"}`);
   } catch (e) {
-    status("SYNC FAILED");
+    statusCrit("SYNC FAILED");
   }
 }
 

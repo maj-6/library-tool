@@ -576,6 +576,86 @@ def _pageimg_pdf(raw: str) -> Path:
     return p
 
 
+@app.route("/api/pdf/words")
+def api_pdf_words():
+    """Word boxes of one page of a local PDF (?path=&page=N).
+
+    These are the very coordinates the browser's built-in viewer uses to draw
+    its selection highlight, read straight off the PDF's own text layer.
+    Everything is normalised to 0..1 of the page, so the caller can scale it
+    onto a page image rendered at any width. `found` is false for an image-only
+    page (a scan never OCR'd into a text layer) -- there is nothing to place.
+
+    The unit is the LINE, and lines are rebuilt by clustering spans on their
+    baseline rather than trusting the PDF's own line structure. These scans
+    carry an OCR-produced text layer where every word is its own span with its
+    own estimated size (4.2pt..10pt across one page of body text), and PyMuPDF
+    often reports each such word as its own "line" -- so both per-span sizing
+    and per-line medians leave single words rendering a size or two off. The
+    median over a baseline cluster is stable against that.
+
+    `y` is the line's baseline and `s` its font size, both as a fraction of page
+    height; each span reports `x`/`w` as a fraction of page width. Multiply by
+    the rendered pane's box for pixels.
+    """
+    p = _pageimg_pdf(request.args.get("path"))
+    try:
+        page = max(1, int(request.args.get("page") or 1))
+    except ValueError:
+        page = 1
+    try:
+        import fitz  # PyMuPDF: renders these pages already, so no new dependency
+    except ImportError:
+        return jsonify({"ok": False, "error": "PyMuPDF is not installed"}), 501
+    from statistics import median
+    doc = fitz.open(str(p))
+    try:
+        if page > doc.page_count:
+            abort(404)
+        pg = doc[page - 1]
+        pw, ph = float(pg.rect.width), float(pg.rect.height)
+        if pw <= 0 or ph <= 0:
+            return jsonify({"ok": True, "found": False, "lines": []})
+        raw = []
+        for block in pg.get_text("dict").get("blocks", []):
+            if block.get("type") != 0:      # 0 = text; 1 = image
+                continue
+            for line in block.get("lines", []):
+                for sp in line.get("spans", []):
+                    t = sp.get("text") or ""
+                    if not t.strip():
+                        continue
+                    x0, _y0, x1, _y1 = sp["bbox"]
+                    size = float(sp.get("size") or 0)
+                    if size <= 0:
+                        continue
+                    raw.append((float(sp.get("origin", (0, 0))[1]), x0, x1, t, size))
+
+        # cluster on the baseline: spans within a fraction of a line's own type
+        # size sit on the same line, whatever the PDF claims
+        raw.sort()
+        clusters: list[list] = []
+        for r in raw:
+            if clusters and abs(r[0] - clusters[-1][0][0]) <= 0.4 * clusters[-1][0][4]:
+                clusters[-1].append(r)
+            else:
+                clusters.append([r])
+
+        lines = []
+        for c in clusters:
+            c.sort(key=lambda r: r[1])      # left to right
+            lines.append({
+                "y": round(median([r[0] for r in c]) / ph, 5),
+                "s": round(median([r[4] for r in c]) / ph, 6),
+                "spans": [{"t": r[3], "x": round(r[1] / pw, 5),
+                           "w": round((r[2] - r[1]) / pw, 5)} for r in c],
+            })
+    finally:
+        doc.close()
+    return jsonify({"ok": True, "found": bool(lines), "page_w": pw, "page_h": ph,
+                    "lines": lines})
+
+
 @app.route("/api/pdf/info")
 def api_pdf_info():
     """Page count of a local PDF."""
