@@ -25,6 +25,18 @@ __pycache__/
 downloads/cache/
 output/entries/**/*.pdf
 
+# Claude Code's per-machine permission grants — the approved command lines can
+# quote API keys verbatim, so this must never be committed
+.claude/settings.local.json
+
+# Android Studio local state: build cache, and local.properties (the SDK path;
+# the file itself says not to commit it). The gradle wrapper IS tracked, so a
+# fresh clone can still ./gradlew build.
+android/BookCapture/.gradle/
+android/BookCapture/build/
+android/BookCapture/app/build/
+android/BookCapture/local.properties
+
 # large binaries kept local, excluded from the published repo
 photo/
 copyright_renewals.csv
