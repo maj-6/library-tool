@@ -1094,23 +1094,24 @@ function renderHome() {
   if (!prog || !feed) return;
 
   const p = progressSummary();
-  const stat = (n, label, tab, sub) =>
-    `<button class="home-stat" data-gotab="${tab}">` +
-      `<span class="hs-n">${n}</span>` +
-      `<span class="hs-l">${esc(label)}</span>` +
-      `<span class="hs-sub">${sub ? esc(sub) : ""}</span>` +
+  // one line per metric, count first, breakdown right-aligned and muted —
+  // a status readout in the app's row idiom, not a dashboard of tiles
+  const row = (n, label, tab, detail) =>
+    `<button class="home-row" data-gotab="${tab}">` +
+      `<span class="hr-n">${n}</span>` +
+      `<span class="hr-l">${esc(label)}</span>` +
+      (detail ? `<span class="hr-d">${esc(detail)}</span>` : "") +
     `</button>`;
   const inEditor = p.drafts.length + p.ready;
   const attn = p.attnCat + p.attnEd;
-  let html = `<div id="home-stats">` +
-    stat(inEditor, inEditor === 1 ? "entry in the editor" : "entries in the editor",
-         "upload", inEditor ? `${p.drafts.length} draft · ${p.ready} to upload` : "") +
-    stat(p.srcPending, p.srcPending === 1 ? "PDF source pending verification"
-         : "PDF sources pending verification", "upload") +
-    stat(attn, attn === 1 ? "item marked for attention"
-         : "items marked for attention", p.attnCat || !p.attnEd ? "checked" : "upload",
-         p.attnCat && p.attnEd ? `${p.attnCat} catalog · ${p.attnEd} editor` : "") +
-    `</div>`;
+  let html =
+    row(inEditor, inEditor === 1 ? "entry in the editor" : "entries in the editor",
+        "upload", inEditor ? `${p.drafts.length} draft · ${p.ready} to upload` : "") +
+    row(p.srcPending, p.srcPending === 1 ? "PDF source pending verification"
+        : "PDF sources pending verification", "upload") +
+    row(attn, attn === 1 ? "item marked for attention"
+        : "items marked for attention", p.attnCat || !p.attnEd ? "checked" : "upload",
+        p.attnCat && p.attnEd ? `${p.attnCat} catalog · ${p.attnEd} editor` : "");
 
   // the freshest few drafts, so unfinished work is one click away
   const relIso = (iso) => { const t = Date.parse(iso || ""); return isNaN(t) ? "" : relTime(t); };
