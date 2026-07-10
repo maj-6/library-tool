@@ -963,7 +963,12 @@
               <label class="tool-label" for="set-user-name">Your name</label>
               <input id="set-user-name" class="cad-input" spellcheck="false"
                      placeholder="Andrew Miller"
-                     data-tip="Attributed to your changes in the Home tab's activity feed" />
+                     data-tip="Attributed to your changes when you are not signed in; a signed-in account's display name takes precedence" />
+              <label class="tool-label">Cloud account</label>
+              <span class="set-account">
+                <span id="set-account-state" class="tool-label">Not signed in</span>
+                <button id="set-account-btn" class="cad-btn" type="button">Sign in&hellip;</button>
+              </span>
               <label class="tool-label" for="set-whl-ocr">OCR panel in the WHL PDF viewer</label>
               <input id="set-whl-ocr" type="checkbox" />
               <label class="tool-label" for="set-preview-pages">PDF preview page limit</label>
@@ -1177,6 +1182,9 @@
                      placeholder="https://xxxx.supabase.co" />
               <label class="tool-label" for="set-sb-key">Supabase service key</label>
               <input id="set-sb-key" class="cad-input" type="password" spellcheck="false" />
+              <label class="tool-label" for="set-sb-anon">Supabase anon key</label>
+              <input id="set-sb-anon" class="cad-input" type="password" spellcheck="false"
+                     data-tip="The public (anon) key — used to sign users in. python3 tools/cloud_setup.py anon-key prints it." />
               <label class="tool-label" for="set-r2-account">R2 account id</label>
               <input id="set-r2-account" class="cad-input" spellcheck="false"
                      data-tip="Cloudflare R2 stores published PDFs. Leave blank to use Supabase storage (1 GB on the free tier)." />
@@ -1250,6 +1258,39 @@
   <!-- IMAGE LIGHTBOX (entry photos from the Info panel) -->
   <div id="img-lightbox" class="overlay" hidden>
     <img id="img-lightbox-img" alt="entry photo" />
+  </div>
+
+  <!-- SIGN IN (Library Tool cloud account; shown at startup, or from Settings) -->
+  <div id="auth-overlay" class="overlay" hidden>
+    <form id="auth-win" class="win auth-win">
+      <div class="win-titlebar">
+        <span id="auth-title">SIGN IN</span>
+        <button id="auth-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
+      </div>
+      <div class="auth-body">
+        <p class="settings-note" id="auth-blurb">Contributions are recorded under your
+          account. Everything else works without one.</p>
+        <div class="settings-rows">
+          <label class="tool-label" for="auth-email">Email</label>
+          <input id="auth-email" class="cad-input" type="email" spellcheck="false"
+                 autocomplete="username" />
+          <label class="tool-label" for="auth-pass">Password</label>
+          <input id="auth-pass" class="cad-input" type="password"
+                 autocomplete="current-password" />
+          <label class="tool-label auth-signup-only" for="auth-name" hidden>Display name</label>
+          <input id="auth-name" class="cad-input auth-signup-only" spellcheck="false"
+                 placeholder="shown in the activity feed" hidden />
+        </div>
+        <div id="auth-msg" hidden></div>
+        <div class="mf-actions">
+          <button id="auth-submit" class="cad-btn" type="submit">Sign in</button>
+          <button id="auth-mode" class="cad-btn" type="button">Create account&hellip;</button>
+          <span class="auth-spacer"></span>
+          <button id="auth-skip" class="cad-btn" type="button"
+                  data-tip="Use the app without an account; won't ask again at startup">Work locally</button>
+        </div>
+      </div>
+    </form>
   </div>
 
   <!-- EMBEDDED WEB VIEW (links open here instead of a new tab) -->

@@ -102,7 +102,8 @@ const state = {
     // TODO-verify until the user has API keys.
     // Cloud capture (phone -> Supabase -> manual entries) + Mistral key,
     // shared by the capture pipeline and the Mistral OCR service
-    supabaseUrl: "", supabaseKey: "", mistralKey: "",
+    supabaseUrl: "", supabaseKey: "", supabaseAnonKey: "", mistralKey: "",
+    authPromptDismissed: false,   // "Work locally" said: don't ask at startup
     // Cloudflare R2 for published PDFs (Supabase storage is 1 GB on free)
     r2Account: "", r2Bucket: "", r2KeyId: "", r2Secret: "", r2PublicBase: "",
     cloudSyncMinutes: 0, cloudDeleteRemote: true,
@@ -995,21 +996,150 @@ async function syncClientStateOnLoad() {
 // Recent activity comes from the server's append-only feed; pending tasks are
 // derived from data already in memory, so they need no store of their own.
 
-// Every write carries who made it. There are no accounts yet, so this is a name
-// from Settings -- but the server records it per event, which is the shape real
-// accounts will need.
+// Every write carries who made it. A signed-in account's display name wins
+// (the server also knows the session and prefers it); the Settings name covers
+// working locally.
 function installActorHeader() {
   const raw = window.fetch.bind(window);
   window.fetch = (input, init) => {
     const method = String((init && init.method) ||
       (input && input.method) || "GET").toUpperCase();
-    if (method !== "GET" && method !== "HEAD" && state.settings.userName) {
+    const who = authState.displayName || state.settings.userName;
+    if (method !== "GET" && method !== "HEAD" && who) {
       init = { ...(init || {}) };
       init.headers = new Headers(init.headers || (input && input.headers) || {});
-      init.headers.set("X-WHL-Actor", state.settings.userName);
+      init.headers.set("X-WHL-Actor", who);
     }
     return raw(input, init);
   };
+}
+
+// --- cloud account -------------------------------------------------------------
+// A real Supabase user. The server owns the session (tokens never reach the
+// browser); this side only asks who is signed in and shows the door.
+
+const authState = { cloud: false, signedIn: false, email: "", displayName: "" };
+
+async function refreshAuthStatus() {
+  try {
+    const r = await (await fetch("/api/auth/status")).json();
+    authState.cloud = !!r.cloud;
+    authState.signedIn = !!r.signed_in;
+    authState.email = r.email || "";
+    authState.displayName = r.display_name || "";
+  } catch (e) { /* server unreachable; keep whatever we knew */ }
+  renderAccountState();
+}
+
+function renderAccountState() {
+  const s = el("set-account-state"), b = el("set-account-btn");
+  if (!s || !b) return;
+  if (authState.signedIn) {
+    s.textContent = `${authState.displayName || authState.email} (${authState.email})`;
+    b.textContent = "Sign out";
+  } else {
+    s.textContent = authState.cloud ? "Not signed in"
+      : "Not signed in — set the Supabase URL and anon key under Sync first";
+    b.textContent = "Sign in…";
+  }
+}
+
+function authMsg(text, ok) {
+  const m = el("auth-msg");
+  m.textContent = text || "";
+  m.hidden = !text;
+  m.classList.toggle("ok", !!ok);
+}
+
+function showAuthOverlay() {
+  setAuthMode(false);
+  authMsg("");
+  el("auth-overlay").hidden = false;
+  el("auth-email").focus();
+}
+
+function hideAuthOverlay() {
+  el("auth-overlay").hidden = true;
+}
+
+// one dialog, two modes: sign in, or create an account (adds a name field)
+let authSignup = false;
+function setAuthMode(signup) {
+  authSignup = signup;
+  el("auth-title").textContent = signup ? "CREATE ACCOUNT" : "SIGN IN";
+  el("auth-submit").textContent = signup ? "Create account" : "Sign in";
+  el("auth-mode").textContent = signup ? "I have an account…" : "Create account…";
+  el("auth-pass").autocomplete = signup ? "new-password" : "current-password";
+  for (const n of document.querySelectorAll(".auth-signup-only")) n.hidden = !signup;
+}
+
+async function submitAuth() {
+  const email = el("auth-email").value.trim();
+  const password = el("auth-pass").value;
+  if (!email || !password) { authMsg("email and password are both required"); return; }
+  el("auth-submit").disabled = true;
+  authMsg(authSignup ? "Creating account…" : "Signing in…", true);
+  try {
+    const body = { email, password };
+    if (authSignup) body.display_name = el("auth-name").value.trim();
+    const r = await fetch(authSignup ? "/api/auth/signup" : "/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) { authMsg(j.error || `sign-in failed (HTTP ${r.status})`); return; }
+    if (j.confirm) {   // account made; the project wants the email link clicked first
+      setAuthMode(false);
+      authMsg("Account created — click the link in your email, then sign in here.", true);
+      return;
+    }
+    hideAuthOverlay();
+    await refreshAuthStatus();
+    status(`SIGNED IN :: ${j.display_name || j.email}`);
+    loadActivity();          // the feed switches to the shared cloud view
+  } catch (e) {
+    authMsg("could not reach the server");
+  } finally {
+    el("auth-submit").disabled = false;
+  }
+}
+
+function initAuth() {
+  el("auth-win").addEventListener("submit", (ev) => { ev.preventDefault(); submitAuth(); });
+  el("auth-mode").onclick = () => { setAuthMode(!authSignup); authMsg(""); };
+  el("auth-close").onclick = hideAuthOverlay;
+  el("auth-skip").onclick = () => {
+    state.settings.authPromptDismissed = true;
+    saveSettings();
+    hideAuthOverlay();
+  };
+  // Escape lives in init()'s exclusive overlay chain — a handler here would
+  // also close the Settings window underneath in the same keypress.
+  el("set-account-btn").onclick = async () => {
+    if (authState.signedIn) {
+      try { await fetch("/api/auth/logout", { method: "POST" }); } catch (e) {}
+      await refreshAuthStatus();
+      status("SIGNED OUT");
+      loadActivity();        // back to the local feed
+    } else {
+      showAuthOverlay();
+    }
+  };
+  refreshAuthStatus();
+}
+
+// Ask once at startup, and only when it could work: cloud configured, no
+// session, and the user hasn't said "work locally". Called AFTER the server's
+// client_state has been adopted: before that, authPromptDismissed is a local
+// default, and a "Work locally" click would be dropped by the write-through
+// gate and then overwritten by the sync.
+function maybeAuthPrompt() {
+  refreshAuthStatus().then(() => {
+    if (authState.cloud && !authState.signedIn && !state.settings.authPromptDismissed) {
+      showAuthOverlay();
+    }
+  });
 }
 
 const homeState = { events: [], loaded: false };
@@ -1067,6 +1197,7 @@ function activityPhrase(g) {
     const prep = g.verb === "removed" ? "from" : "to";   // never "removed ... to"
     return `${g.verb} ${g.n} book${g.n === 1 ? "" : "s"} ${prep} Checked Books`;
   }
+  if (g.subject === "the cloud") return `${g.verb} ${g.subject}`;   // "signed in to the cloud"
   return g.n === 1
     ? `${g.verb} ${article(g.subject)}${g.subject}`
     : `${g.verb} ${g.n} ${pluralize(g.subject)}`;
@@ -1882,6 +2013,7 @@ function renderSettings() {
                          ["set-cloud-url", "cloudSearchUrl"],
                          ["set-sb-url", "supabaseUrl"],
                          ["set-sb-key", "supabaseKey"],
+                         ["set-sb-anon", "supabaseAnonKey"],
                          ["set-mistral-key", "mistralKey"]]) {
     const n = el(id);
     n.value = state.settings[k] || "";
@@ -9778,6 +9910,7 @@ function init() {
   boot("actor header", installActorHeader);   // before any write goes out
   boot("menu bar", initMenubar);
   boot("home", initHome);
+  boot("account", initAuth);
   boot("title bar", fitTitleBar);   // after the menus exist: their width sets the clamp
   boot("settings nav", initSettingsNav);
   boot("column resize", initColResize);
@@ -10266,7 +10399,8 @@ function init() {
   });
   document.addEventListener("keydown", (ev) => {
     if (ev.key !== "Escape") return;
-    if (!el("attn-pop").hidden) closeAttnPop();
+    if (!el("auth-overlay").hidden) hideAuthOverlay();   // topmost (z 62)
+    else if (!el("attn-pop").hidden) closeAttnPop();
     else if (!el("fb-overlay").hidden) closeFileBrowser();
     else if (!el("pdfm-overlay").hidden) closePdfModal();
     else if (!el("md-overlay").hidden) closeMarkdownEditor(false);
@@ -10291,6 +10425,7 @@ function init() {
   // first render reflects whatever the server holds.
   syncClientStateOnLoad().then((adopted) => {
     if (adopted) { applyTheme(); applyFont(); }
+    maybeAuthPrompt();   // needs the adopted settings: authPromptDismissed
     loadDownloads();
     // Home's pending tasks are derived from these, so it re-renders once the
     // data it counts has actually arrived
