@@ -1182,12 +1182,17 @@ a.badge:hover { text-decoration: underline; }
 .badge.upload { color: var(--amber); font-weight: bold; }
 .badge.approved { color: var(--green); font-weight: bold; }
 
-/* download state -> a bold outline around the tag (replaces the old dl-dot):
-   green = downloaded, red = failed, amber = downloading. Freeing the space the
-   dot needed inside the tag lets the tags (and columns) run narrower. */
-.badge.dl-ok   { box-shadow: 0 0 0 2px var(--green); }
-.badge.dl-err  { box-shadow: 0 0 0 2px var(--red); }
-.badge.dl-prog { box-shadow: 0 0 0 2px var(--amber); }
+/* download state -> a 2px dotted outline around the tag (replaces the old
+   dl-dot): green = downloaded, red = failed, amber = downloading. Freeing the
+   space the dot needed inside the tag lets the tags (and columns) run
+   narrower. `outline` (not box-shadow) so it can be dotted; it sits outside
+   the border and takes no layout space. */
+.badge.dl-ok   { outline: 2px dotted var(--green); outline-offset: 0; }
+.badge.dl-err  { outline: 2px dotted var(--red); outline-offset: 0; }
+.badge.dl-prog { outline: 2px dotted var(--amber); outline-offset: 0; }
+
+/* a glyph standing in for a tag's text label (centred in the 13px content box) */
+.badge .bico { display: block; margin: 1px auto 0; }
 
 /* per-source verification marker fused to the tag's right edge (clickable) */
 .tag-unit {
@@ -1211,12 +1216,12 @@ a.badge:hover { text-decoration: underline; }
 .vmark:hover { filter: brightness(1.35); }
 /* when a downloaded source also carries a verify marker, outline the whole
    unit so the marker sits inside the outline rather than beside a clipped one */
-.tag-unit:has(.badge.dl-ok)   { box-shadow: 0 0 0 2px var(--green); }
-.tag-unit:has(.badge.dl-err)  { box-shadow: 0 0 0 2px var(--red); }
-.tag-unit:has(.badge.dl-prog) { box-shadow: 0 0 0 2px var(--amber); }
+.tag-unit:has(.badge.dl-ok)   { outline: 2px dotted var(--green); outline-offset: 0; }
+.tag-unit:has(.badge.dl-err)  { outline: 2px dotted var(--red); outline-offset: 0; }
+.tag-unit:has(.badge.dl-prog) { outline: 2px dotted var(--amber); outline-offset: 0; }
 .tag-unit:has(.badge.dl-ok) .badge.dl-ok,
 .tag-unit:has(.badge.dl-err) .badge.dl-err,
-.tag-unit:has(.badge.dl-prog) .badge.dl-prog { box-shadow: none; }
+.tag-unit:has(.badge.dl-prog) .badge.dl-prog { outline: none; }
 
 /* Q while hovering: "needs attention" — outranks per-kind row tints like
    .grid tbody tr.is-manual */

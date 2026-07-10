@@ -470,6 +470,20 @@ const ICONS = {
   go: _SVG('<path d="M2.5 8 h9 M8.2 4.5 L11.8 8 L8.2 11.5"/>'),
 };
 
+// Glyphs that stand in for a tag's text label. Sized to sit inside a 15px
+// badge (the full-size ICONS are 14px and would overflow it).
+const _SVGB = (body) =>
+  `<svg class="bico" viewBox="0 0 16 16" width="11" height="11" fill="none" ` +
+  `stroke="currentColor" stroke-width="2.2" stroke-linecap="round" ` +
+  `stroke-linejoin="round" aria-hidden="true">${body}</svg>`;
+
+const BICONS = {
+  check: _SVGB('<path d="M3 8.4 L6.4 11.8 L13 3.8"/>'),      // approved match
+  cross: _SVGB('<path d="M4 4 L12 12 M12 4 L4 12"/>'),        // rejected match
+  pencil: _SVGB('<path d="M3 13 l0.7-2.8 L10.9 2.6 l2.5 2.5 -8 8 Z"/>'),  // WHL draft
+  upload: _SVGB('<path d="M8 12.8 V3.6 M4.4 7.2 L8 3.6 L11.6 7.2"/>'),    // ready to upload
+};
+
 function injectIcons() {
   for (const node of document.querySelectorAll("[data-icon]")) {
     const svg = ICONS[node.dataset.icon];
@@ -1703,9 +1717,11 @@ function badge(cls, label, opts = {}) {
     tipText = tipText ? tipText + "\n" + opts.dot.tip : opts.dot.tip;
   const tip = tipText ? ` data-tip="${esc(tipText)}"` : "";
   const attrs = opts.attrs || "";
+  // a label may be one of the inline-SVG glyphs below instead of text
+  const body = String(label).startsWith("<svg") ? label : esc(label);
   if (opts.href)
-    return `<a class="badge ${cls}${dl}" href="${esc(opts.href)}" target="_blank" rel="noopener"${tip}${attrs}>${esc(label)}</a>`;
-  return `<span class="badge ${cls}${dl}"${tip}${attrs}>${esc(label)}</span>`;
+    return `<a class="badge ${cls}${dl}" href="${esc(opts.href)}" target="_blank" rel="noopener"${tip}${attrs}>${body}</a>`;
+  return `<span class="badge ${cls}${dl}"${tip}${attrs}>${body}</span>`;
 }
 
 function tipForLocalWhl(checks) {
@@ -1733,21 +1749,24 @@ function whlBadge(row) {
     case "draft": {
       if (rejected) {
         if (murl)
-          return wrap(badge("available", "YES", {
+          return wrap(badge("available", BICONS.check, {
             tip: "Manually located source:\n" + murl +
               "\n(automatic match was rejected as a false positive)",
             href: murl,
           }));
-        return wrap(badge("missing", "NO", {
+        return wrap(badge("missing", BICONS.cross, {
           tip: "REJECTED AS FALSE POSITIVE.\n" + tip +
             "\nCLICK TAG: paste the URL of a manually located source",
           href: m.permalink || "",
         }));
       }
-      return wrap(badge(c.in_whl === "yes" ? "available" : "missing",
-        c.in_whl === "yes" ? "YES" : "DRFT", { tip, href: m.permalink || "" }));
+      // a draft entry is shown as a pencil whatever its verify state
+      if (c.in_whl === "draft")
+        return wrap(badge("missing", BICONS.pencil, { tip, href: m.permalink || "" }));
+      return wrap(badge("available", verifyGlyph(row, "whl"),
+        { tip, href: m.permalink || "" }));
     }
-    case "no": return badge("missing", "NO", { tip });
+    case "no": return badge("missing", NO_TAG, { tip });
     default: return badge("unknown", "?", { tip: "whl_catalog.csv not found" });
   }
 }
@@ -1970,6 +1989,16 @@ const VERIFY_TIPS = {
   rejected: "Rejected (false positive) — click the marker to reset.\nClick the tag to paste a manually located source.",
 };
 
+// "no match here" reads as a dash rather than a word
+const NO_TAG = "–";
+
+// An unrejected match shows its verification state as the tag itself:
+// pending = ~, approved = check. (Rejected tags are built by the callers,
+// which also need to swap the link/tooltip, and show a cross.)
+function verifyGlyph(row, source) {
+  return getVerify(row, source) === "approved" ? BICONS.check : "~";
+}
+
 function verifyUnit(row, source, tagHtml) {
   const st = getVerify(row, source);
   const manual = st === "rejected" && getManualUrl(row, source);
@@ -1991,30 +2020,35 @@ function scanBadge(row, source, dot) {
   if (s.available === true) {
     const best = s.best_match || {};
     const href = best.url || best.record_url || "";
+    // A HathiTrust match without full view is view-only: there is no source to
+    // fetch, so it carries no verification marker.
+    if (isHt && !s.full_view) return badge("error", "VO", {
+      tip: "View-only on HathiTrust (no full view — nothing to download).\n" + tip,
+      href, dot });
     if (getVerify(row, source) === "rejected") {
       const murl = getManualUrl(row, source);
       if (murl) {
-        return verifyUnit(row, source, badge("available", "YES", {
+        return verifyUnit(row, source, badge("available", BICONS.check, {
           tip: "Manually located source:\n" + murl +
             "\n(automatic match was rejected as a false positive)",
           href: murl, dot,
         }));
       }
-      return verifyUnit(row, source, badge("missing", "NO", {
+      return verifyUnit(row, source, badge("missing", BICONS.cross, {
         tip: "Rejected as false positive.\n" + tip +
           "\nClick the tag to paste the URL of a manually located source",
         href, dot,
       }));
     }
     return verifyUnit(row, source,
-      badge("available", isHt && s.full_view ? "VIEW" : "YES", { tip, href, dot }));
+      badge("available", verifyGlyph(row, source), { tip, href, dot }));
   }
   // IA matched books, but every one is borrow/lending only (no direct download)
   if (s.no_download) return badge("missing", "ND", {
     tip: "Found on Internet Archive, but every match is borrow/lending only" +
       " — no available download.\n" + tip,
     href: s.search_url || "", dot });
-  if (s.available === false) return badge("missing", "NO", { tip, dot });
+  if (s.available === false) return badge("missing", NO_TAG, { tip, dot });
   return badge("unknown", "?", { tip, href: s.search_url || "", dot });
 }
 
@@ -2086,14 +2120,15 @@ function markCell(row) {
     : "Click to attach a local PDF";
   let cls, label, base;
   if (mark === "SCAN") {
-    cls = attached ? "approved" : "scan"; label = "SCAN"; base = reason;
+    // NF = not found: no scan exists anywhere, so this copy must be scanned
+    cls = attached ? "approved" : "scan"; label = "NF"; base = reason;
   } else if (mark === "UPLOAD") {
     const ready = anyApprovedSource(row);
-    cls = attached || ready ? "approved" : "upload"; label = "UPLD";
+    cls = attached || ready ? "approved" : "upload"; label = BICONS.upload;
     base = ready ? "Verified source(s) ready — see the Editor tab" : reason;
   } else if (attached) {
     // no computed mark, but an attached scan keeps the row clickable/detachable
-    cls = "approved"; label = "SCAN"; base = reason;
+    cls = "approved"; label = "NF"; base = reason;
   } else {
     // no mark and nothing attached — not an attach target
     return badge("unknown", "—", { tip: reason });
@@ -6391,7 +6426,7 @@ function renderUpload() {
         ? `<a href="${esc(s.url)}" target="_blank" rel="noopener" data-tip="${esc(s.url)}">${esc(s.matched_title) || "(record)"}</a>`
         : esc(s.matched_title)}</td>
       <td class="col-whl">${st === "done" ? badge("approved", "DONE", { tip: "The entry built from this source is verified" })
-          : st === "draft" ? badge("upload", "DRFT", { tip: "An entry built from this source is in the editor" })
+          : st === "draft" ? badge("upload", BICONS.pencil, { tip: "An entry built from this source is in the editor" })
           : ""}</td>
       <td class="col-act"><button class="cad-btn tiny icon-btn" data-build-src="${i}"
         data-tip="Build a catalog entry prefilled from this source">${ICONS.docplus}</button></td>`;
