@@ -447,3 +447,17 @@ is decided by a tolerant composite rather than exact strings:
   Sync and ride the client_state settings sync (no separate config). URLs are
   placeholders until the user stands up the backend / hosts the files. The
   installer's "download databases" option is offered by the app on first run.
+- Home page rework: the wordmark is set in a bundled Roboto Slab (variable
+  woff2, latin subset, static/fonts/) with the version number after the title,
+  mirrored from the title bar's #tb-meta so it is stated once; the subtitle is
+  gone. "Pending tasks" became an IN PROGRESS panel: three clickable stat
+  tiles (entries in the editor with a draft/to-upload breakdown, PDF sources
+  pending verification -- approved sources without a verified entry yet -- and
+  items marked for attention, now counting builds too) over an EDITOR DRAFTS
+  list of the freshest drafts with relative last-modified times; clicking a
+  draft opens that build in the Editor. Theme round: three classic-desktop
+  chrome translations join the paper set -- PLATINUM (Mac OS 8/9 pinstriped
+  light titlebar, 1px bevels), REDMOND (Windows 2000 outset bevels,
+  desaturated navy titlebar fade), MOTIF (CDE chamfers, slate-indigo band).
+  Retired theme ids revive as their heirs (cde/workstation -> motif,
+  xp2003 -> redmond) and platinum is a real theme again.
