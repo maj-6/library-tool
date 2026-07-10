@@ -757,6 +757,28 @@ def api_build_ocr_put(build_id: str):
                     "folder": _entry_folder_info(build_id)})
 
 
+@app.route("/api/builds/<build_id>/ocr/images/<name>")
+def api_build_ocr_image(build_id: str, name: str):
+    """A figure an OCR service cut out of a page (saved by the OCR job)."""
+    if build_id not in lib.load_json(BUILDS_PATH, {}):
+        abort(404)
+    safe = re.sub(r"[^\w.\-]", "_", name or "")
+    f = _entry_dir(build_id) / "ocr" / "images" / safe
+    if not safe or not f.is_file():
+        abort(404)
+    return send_file(f, conditional=True)
+
+
+@app.route("/api/builds/<build_id>/ocr-layout")
+def api_build_ocr_layout(build_id: str):
+    """Positions of the extracted figures: ocr/layout.json, {images: {name:
+    {page, x, y, w, h}}} with boxes normalised to 0..1 of the page."""
+    if build_id not in lib.load_json(BUILDS_PATH, {}):
+        abort(404)
+    meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
+    return jsonify({"ok": True, "images": meta.get("images") or {}})
+
+
 # --- PDF page rasterization (the OCR tab's side-by-side page view) ---------------
 
 def _pageimg_pdf(raw: str) -> Path:
@@ -846,21 +868,50 @@ def api_pdf_words():
                     "lines": lines})
 
 
+# page count + dimensions, cached on mtime: the OCR tab asks on every page-view
+# render, and pypdf walked the whole xref of a 400 MB scan to answer
+_pdf_info_cache: dict[str, tuple[float, dict]] = {}
+
+
 @app.route("/api/pdf/info")
 def api_pdf_info():
-    """Page count of a local PDF."""
+    """Page count and per-page [w, h] (PDF points) of a local PDF. The
+    dimensions let the client reserve every page's box before its image
+    loads, so lazy loading never shifts the scroll position."""
     p = _pageimg_pdf(request.args.get("path"))
+    key = str(p)
     try:
-        from pypdf import PdfReader
-        return jsonify({"ok": True, "pages": len(PdfReader(str(p)).pages)})
+        mtime = p.stat().st_mtime
+        hit = _pdf_info_cache.get(key)
+        if hit and hit[0] == mtime:
+            return jsonify(hit[1])
+        try:
+            import fitz
+            doc = fitz.open(key)
+            try:
+                dims = [[round(pg.rect.width, 2), round(pg.rect.height, 2)]
+                        for pg in doc]
+                out = {"ok": True, "pages": doc.page_count, "dims": dims}
+            finally:
+                doc.close()
+        except ImportError:
+            from pypdf import PdfReader
+            out = {"ok": True, "pages": len(PdfReader(key).pages)}
+        if len(_pdf_info_cache) > 64:
+            _pdf_info_cache.clear()
+        _pdf_info_cache[key] = (mtime, out)
+        return jsonify(out)
     except Exception as exc:
         return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
 
 @app.route("/api/pdf/pageimg")
 def api_pdf_pageimg():
-    """One page of a local PDF rendered as a PNG (?path=&page=N&w=W).
-    Rendered via PyMuPDF and cached on disk by path+mtime+page+width."""
+    """One page of a local PDF rendered as an image (?path=&page=N&w=W).
+    Rendered via PyMuPDF and cached on disk by path+mtime+page+width.
+    JPEG: a scanned page as PNG runs 500 KB+ against ~80 KB, and encodes
+    slower too — these are photographs, not line art. Older caches hold
+    .png files; they stay valid and are served as-is."""
     p = _pageimg_pdf(request.args.get("path"))
     try:
         page = max(1, int(request.args.get("page") or 1))
@@ -879,7 +930,10 @@ def api_pdf_pageimg():
     cache.mkdir(parents=True, exist_ok=True)
     key = hashlib.sha1(
         f"{p}|{p.stat().st_mtime}|{page}|{w}".encode("utf-8")).hexdigest()[:16]
-    out = cache / f"{key}.png"
+    old = cache / f"{key}.png"
+    if old.is_file():
+        return send_file(old, mimetype="image/png", conditional=True)
+    out = cache / f"{key}.jpg"
     if not out.is_file():
         doc = fitz.open(str(p))
         try:
@@ -888,14 +942,19 @@ def api_pdf_pageimg():
             pg = doc[page - 1]
             zoom = w / max(1.0, pg.rect.width)
             pix = pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
-            # pymupdf infers the format from the extension — the tmp name
-            # must end in .png
-            tmp = out.with_suffix(f".{page}.tmp.png")
-            pix.save(str(tmp))
+            tmp = out.with_suffix(f".{page}.tmp.jpg")
+            try:
+                tmp.write_bytes(pix.tobytes("jpeg", jpg_quality=82))
+            except Exception:
+                # PyMuPDF without JPEG output: fall back to PNG
+                tmp = old.with_suffix(f".{page}.tmp.png")
+                pix.save(str(tmp))
+                tmp.replace(old)
+                return send_file(old, mimetype="image/png", conditional=True)
             tmp.replace(out)
         finally:
             doc.close()
-    return send_file(out, mimetype="image/png", conditional=True)
+    return send_file(out, mimetype="image/jpeg", conditional=True)
 
 
 # --- OCR processing jobs -----------------------------------------------------------
@@ -983,11 +1042,42 @@ def _ocr_textract(png: bytes, cfg: dict) -> str:
                      if b.get("BlockType") == "LINE")
 
 
-def _ocr_mistral(png: bytes, cfg: dict) -> str:
+def _ocr_mistral(png: bytes, cfg: dict) -> dict:
+    """Mistral returns markdown plus the figures it cut out of the page.
+    The result dict carries the text and the decoded images with their
+    boxes normalised to 0..1 of the page, ready for _ocr_save_page_images."""
     key = (cfg.get("mistral_key") or "").strip()
     if not key:
         raise RuntimeError("Mistral API key not configured (Settings > OCR)")
-    return capture.mistral_ocr(png, key)
+    import base64
+    pages = capture.mistral_ocr_pages(png, key, want_images=True)
+    text = "\n\n".join(p.get("markdown", "") for p in pages).strip()
+    images = []
+    for pg in pages:
+        dim = pg.get("dimensions") or {}
+        pw, ph = float(dim.get("width") or 0), float(dim.get("height") or 0)
+        for im in pg.get("images") or []:
+            b64 = str(im.get("image_base64") or "")
+            if "," in b64[:64]:                 # strip a data: URL prefix
+                b64 = b64.split(",", 1)[1]
+            try:
+                raw = base64.b64decode(b64)
+            except Exception:
+                continue
+            if not raw:
+                continue
+            bbox = None
+            if pw > 0 and ph > 0:
+                x0 = float(im.get("top_left_x") or 0)
+                y0 = float(im.get("top_left_y") or 0)
+                x1 = float(im.get("bottom_right_x") or 0)
+                y1 = float(im.get("bottom_right_y") or 0)
+                bbox = {"x": round(x0 / pw, 5), "y": round(y0 / ph, 5),
+                        "w": round(max(0.0, x1 - x0) / pw, 5),
+                        "h": round(max(0.0, y1 - y0) / ph, 5)}
+            images.append({"id": str(im.get("id") or f"img-{len(images)}.jpeg"),
+                           "data": raw, "bbox": bbox})
+    return {"text": text, "images": images}
 
 
 _OCR_SERVICES = {
@@ -1020,6 +1110,36 @@ def _ocr_merge_page(build_id: str, target: str, page: int, text: str) -> None:
         f.write_text("\n\n".join(parts), encoding="utf-8", errors="replace")
 
 
+def _ocr_save_page_images(build_id: str, page: int, images: list[dict],
+                          text: str) -> str:
+    """Persist the figures an OCR service cut out of one page.
+
+    Files land in the entry folder (ocr/images/p<page>-<id>), their boxes in
+    ocr/layout.json, and the markdown's ![id](id) references are rewritten to
+    the saved names so every reference stays unique across the compiled file.
+    Returns the rewritten text."""
+    if not images:
+        return text
+    d = _entry_dir(build_id) / "ocr" / "images"
+    d.mkdir(parents=True, exist_ok=True)
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    with _ocr_merge_lock:
+        meta = lib.load_json(meta_path, {})
+        meta.setdefault("images", {})
+        for im in images:
+            safe = re.sub(r"[^\w.\-]", "_", im["id"]) or "img"
+            if "." not in safe:
+                safe += ".jpeg"
+            name = f"p{page}-{safe}"
+            (d / name).write_bytes(im["data"])
+            meta["images"][name] = dict(im["bbox"] or {}, page=page)
+            # every ![id](id) in this page's markdown points at the saved file
+            text = re.sub(r"(!\[[^\]]*\]\()" + re.escape(im["id"]) + r"(\))",
+                          r"\g<1>" + name + r"\g<2>", text)
+        lib.save_json(meta_path, meta)
+    return text
+
+
 def _ocr_job_run(job_id: str) -> None:
     job = _ocr_jobs[job_id]
     cfg = job["cfg"]
@@ -1031,7 +1151,14 @@ def _ocr_job_run(job_id: str) -> None:
             runner = _OCR_SERVICES.get(svc)
             if runner is None:
                 raise RuntimeError(f"unsupported service: {svc}")
-            text = runner(png, cfg)
+            result = runner(png, cfg)
+            # a runner may return {text, images} (Mistral) instead of a string
+            if isinstance(result, dict):
+                text = _ocr_save_page_images(
+                    job["build_id"], n, result.get("images") or [],
+                    str(result.get("text") or ""))
+            else:
+                text = result
             _ocr_merge_page(job["build_id"], job["target"], n, text)
             item["status"] = "ok"
         except Exception as exc:

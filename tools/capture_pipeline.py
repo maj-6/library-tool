@@ -174,16 +174,31 @@ def _mistral_post(url: str, payload: dict, api_key: str, timeout: float) -> dict
         return json.loads(resp.read().decode("utf-8", "replace"))
 
 
-def mistral_ocr(img_bytes: bytes, api_key: str, timeout: float = 90.0) -> str:
-    """OCR one image via Mistral; returns the concatenated markdown text."""
+def mistral_ocr_pages(img_bytes: bytes, api_key: str, timeout: float = 90.0,
+                      want_images: bool = False) -> list[dict]:
+    """OCR one image via Mistral; returns the raw page dicts.
+
+    Each page carries `markdown`, `dimensions` {width, height, dpi}, and —
+    with want_images — `images` [{id, top_left_x/y, bottom_right_x/y,
+    image_base64}] for every figure the model cut out of the page. The
+    markdown references those figures as ![id](id).
+    """
     mime = "image/png" if img_bytes[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
     b64 = base64.b64encode(img_bytes).decode("ascii")
-    data = _mistral_post(MISTRAL_OCR_URL, {
+    payload = {
         "model": OCR_MODEL,
         "document": {"type": "image_url",
                      "image_url": f"data:{mime};base64,{b64}"},
-    }, api_key, timeout)
-    pages = data.get("pages") or []
+    }
+    if want_images:
+        payload["include_image_base64"] = True
+    data = _mistral_post(MISTRAL_OCR_URL, payload, api_key, timeout)
+    return data.get("pages") or []
+
+
+def mistral_ocr(img_bytes: bytes, api_key: str, timeout: float = 90.0) -> str:
+    """OCR one image via Mistral; returns the concatenated markdown text."""
+    pages = mistral_ocr_pages(img_bytes, api_key, timeout)
     return "\n\n".join(p.get("markdown", "") for p in pages).strip()
 
 

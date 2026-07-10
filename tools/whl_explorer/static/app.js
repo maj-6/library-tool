@@ -7608,6 +7608,9 @@ async function syncBuildFolder() {
       // the sync may have retired the IA original and repointed pdf_file
       // at the folder's preview.pdf
       if (data.build) state.builds[b.id] = data.build;
+      // a blank-page trim rewrites the PDF: cached counts/dims are stale
+      ocrState.pdfInfo = {};
+      ocrState.wordsCache.clear();
       el("b-src-msg").textContent =
         "Folder ready" + (data.notes && data.notes.length
           ? " — " + data.notes.join("; ") : "");
@@ -7702,6 +7705,11 @@ const ocrState = {
   pageRunning: new Map(),  // "bid:page" -> service, submitted and processing
   pageSel: new Set(),      // selected page numbers (current book's view)
   selAnchor: 0,            // last plain-clicked page (Ctrl+click ranges)
+  pagesPdf: "",            // pdf path the page view currently shows — a
+                           // re-render of the SAME pdf keeps the scroll
+  pdfInfo: {},             // pdf path -> {pages, dims} (/api/pdf/info cache)
+  layoutMeta: {},          // build id -> extracted-figure boxes (ocr-layout)
+  wordsCache: new Map(),   // "pdf|page" -> /api/pdf/words result
 };
 
 function ocrSelDoc() {
@@ -8015,30 +8023,56 @@ function flushOcrPageSync() {
 
 async function renderOcrPages() {
   const box = el("ocr-pages");
+  // Rebuilding while the page view is display:none (another tab, or a job
+  // finishing in the background) reads scrollTop as 0 and destroys the real
+  // position. Skip — returning to the tab re-renders via renderOcrTab with
+  // the box visible and its scroll offset intact.
+  if (box.offsetParent === null) return;
   const d = ocrSelDoc();
-  if (!d) { box.innerHTML = `<p class="empty">No document selected</p>`; return; }
+  if (!d) { box.innerHTML = `<p class="empty">No document selected</p>`; ocrState.pagesPdf = ""; return; }
   const pdf = d.buildId ? ocrBookPdf(d.buildId) : "";
   if (!pdf) {
     box.innerHTML = `<p class="empty">No PDF for this document — attach one in the Editor tab</p>`;
+    ocrState.pagesPdf = "";
     return;
   }
-  box.innerHTML = `<p class="empty">Loading pages &hellip;</p>`;
-  let count = 0;
-  try {
-    const info = await (await fetch("/api/pdf/info?path=" + encodeURIComponent(pdf))).json();
-    if (info.ok) count = info.pages;
-  } catch (e) { /* handled below */ }
-  if (ocrSelDoc() !== d || ocrState.view !== "pdf") return;   // switched away
+  // A rebuild of the SAME pdf (layout toggle, doc switch, replace-all, job
+  // merge) must never throw the reader back to the top: each page's box is
+  // reserved from info.dims below, so restoring scrollTop lands exactly.
+  const keepTop = ocrState.pagesPdf === pdf ? box.scrollTop : 0;
+  let info = ocrState.pdfInfo[pdf];
+  if (!info) {
+    box.innerHTML = `<p class="empty">Loading pages &hellip;</p>`;
+    try {
+      const r = await (await fetch("/api/pdf/info?path=" + encodeURIComponent(pdf))).json();
+      if (r.ok) { info = r; ocrState.pdfInfo[pdf] = r; }
+    } catch (e) { /* handled below */ }
+    if (ocrSelDoc() !== d || ocrState.view !== "pdf") return;   // switched away
+  }
+  const count = info ? info.pages : 0;
   if (!count) {
     box.innerHTML = `<p class="empty">Could not read the PDF (${esc(pdf)})</p>`;
+    ocrState.pagesPdf = "";
     return;
   }
   const sections = ocrPageSections(d.text);
   const cap = 400;   // matches the extraction cap
   const shown = Math.min(count, cap);
   ocrState.pages = null;
-  const img = (n) => `<img loading="lazy" alt="page ${n}"
+  // reserving each page's true shape up front keeps lazy image loads from
+  // shifting the content under the reader
+  const dims = info.dims || [];
+  const ar = (n) => {
+    const dd = dims[n - 1];
+    return dd && dd[0] > 0 && dd[1] > 0 ? `aspect-ratio:${dd[0]} / ${dd[1]};` : "";
+  };
+  const img = (n) => `<img loading="lazy" decoding="async" alt="page ${n}" style="${ar(n)}"
       src="/api/pdf/pageimg?path=${encodeURIComponent(pdf)}&page=${n}&w=700" />`;
+  const done = () => {
+    ocrState.pagesPdf = pdf;
+    if (keepTop) box.scrollTop = keepTop;
+    decorateOcrPages();
+  };
   // Layout mode swaps each editable textarea for a facsimile pane: the page's
   // own words, at the position and scale they occupy on the page. Boxes are
   // fetched per page as it scrolls into view -- a 400-page book must not fire
@@ -8049,11 +8083,11 @@ async function renderOcrPages() {
       Array.from({ length: shown }, (_, i) => `
       <div class="ocr-pgrow" data-page="${i + 1}">
         <div class="ocr-pgimg">${img(i + 1)}</div>
-        <div class="ocr-pglayout" data-lay="${i + 1}"></div>
+        <div class="ocr-pglayout" data-lay="${i + 1}" style="${ar(i + 1)}"></div>
       </div>`).join("");
     if (sections) ocrState.pages = sections;
     observeOcrLayout(pdf);
-    decorateOcrPages();
+    done();
     return;
   }
   if (!sections) {
@@ -8070,7 +8104,7 @@ async function renderOcrPages() {
         <textarea class="ocr-pgtext cad-input" spellcheck="false" disabled></textarea>
       </div>`).join("");
     box.querySelector("[data-whole]").value = d.text;
-    decorateOcrPages();   // title-page chips apply here too
+    done();   // title-page chips apply here too
     return;
   }
   ocrState.pages = sections;
@@ -8087,7 +8121,7 @@ async function renderOcrPages() {
   box.querySelectorAll("textarea[data-pn]").forEach((ta) => {
     ta.value = sections.map.get(+ta.dataset.pn) || "";
   });
-  decorateOcrPages();
+  done();
 }
 
 // --- layout mode: the page's own words, where they sit on the page -----------
@@ -8111,11 +8145,75 @@ function observeOcrLayout(pdf) {
   }
 }
 
+// the extracted-figure boxes for a book (ocr/layout.json), fetched once
+async function ocrLayoutMeta(bid) {
+  if (!bid) return {};
+  if (!ocrState.layoutMeta[bid]) {
+    try {
+      const r = await (await fetch(
+        `/api/builds/${encodeURIComponent(bid)}/ocr-layout`)).json();
+      ocrState.layoutMeta[bid] = (r.ok && r.images) || {};
+    } catch (e) { ocrState.layoutMeta[bid] = {}; }
+  }
+  return ocrState.layoutMeta[bid];
+}
+
+// Markdown-lite for one page of OCR output (Mistral emits markdown): headers,
+// paragraphs, and the extracted figures back at their place in the page flow,
+// each scaled to the width fraction it occupied on the printed page.
+function ocrMarkdownHtml(text, bid, meta) {
+  let h = esc(text);
+  h = h.replace(/!\[[^\]\n]*\]\(([\w.\- ]+)\)/g, (m, src) => {
+    const box = (meta || {})[src];
+    const style = box && box.w ? ` style="width:${Math.min(100, box.w * 100).toFixed(1)}%"` : "";
+    return `<img class="ocr-layimg" loading="lazy" decoding="async" alt="${src}"${style} src="/api/builds/${encodeURIComponent(bid)}/ocr/images/${encodeURIComponent(src)}">`;
+  });
+  return h.split(/\n{2,}/).map((par) => {
+    const mh = par.match(/^(#{1,6})\s+([\s\S]+)$/);
+    if (mh) return `<div class="ocr-mdh h${mh[1].length}">${mh[2]}</div>`;
+    return `<p>${par.replace(/\n/g, "<br>")}</p>`;
+  }).join("");
+}
+
+// OCR output (compiled.txt and friends): the doc's own text for this page,
+// flowed into a page-shaped pane with its figures inline
+async function fillOcrLayoutDoc(pane, d, page) {
+  const sec = ocrState.pages;
+  const text = sec && sec.map.has(page) ? sec.map.get(page) : null;
+  pane.classList.remove("doctext", "empty");
+  if (text == null || !text.trim()) {
+    pane.classList.add("empty");
+    pane.textContent = "No text for this page in this document — OCR it";
+    return;
+  }
+  const meta = await ocrLayoutMeta(d.buildId);
+  if (!pane.isConnected || ocrSelDoc() !== d) return;
+  pane.classList.add("doctext");
+  pane.innerHTML = ocrMarkdownHtml(text, d.buildId, meta);
+}
+
 async function fillOcrLayout(pane, pdf) {
   const page = +pane.dataset.lay;
+  const d = ocrSelDoc();
+  // Only the PDF's own extraction has word boxes in the text layer; any other
+  // doc (an OCR result) shows ITS text for this page, so switching between
+  // compiled and extracted actually swaps what the facsimile holds.
+  if (d && d.buildId && ocrState.pages &&
+      (d.fileName || d.name) !== "extracted.txt") {
+    return fillOcrLayoutDoc(pane, d, page);
+  }
+  pane.classList.remove("doctext");
   pane.textContent = "…";
-  const res = await (await fetch(
-    `/api/pdf/words?path=${encodeURIComponent(pdf)}&page=${page}`)).json();
+  const ck = `${pdf}|${page}`;
+  let res = ocrState.wordsCache.get(ck);
+  if (!res) {
+    res = await (await fetch(
+      `/api/pdf/words?path=${encodeURIComponent(pdf)}&page=${page}`)).json();
+    if (res && res.ok) {
+      if (ocrState.wordsCache.size > 500) ocrState.wordsCache.clear();
+      ocrState.wordsCache.set(ck, res);
+    }
+  }
   if (!pane.isConnected) return;
   if (!res.ok || !res.found) {
     pane.classList.add("empty");
@@ -8165,9 +8263,16 @@ async function fillOcrLayout(pane, pdf) {
 // the caller can fall back to a full re-render.
 function refillOcrPageText(d) {
   const box = el("ocr-pages");
-  // layout mode reads its text from the PDF, not from the doc, so a merged OCR
-  // result changes nothing on screen -- and there are no textareas to refill
-  if (ocrState.layout) return !!box.querySelector(".ocr-pglayout");
+  // layout mode: the panes stay mounted (and the page images loaded), but the
+  // facsimiles must show the NEW doc's text — re-observe every pane, so the
+  // visible ones refill immediately and the rest as they scroll into view
+  if (ocrState.layout) {
+    if (!box.querySelector(".ocr-pglayout")) return false;
+    ocrState.pages = ocrPageSections(d.text);
+    observeOcrLayout(d.buildId ? ocrBookPdf(d.buildId) : "");
+    decorateOcrPages();
+    return true;
+  }
   const paged = box.querySelectorAll("textarea[data-pn]");
   const whole = box.querySelector("textarea[data-whole]");
   const sections = ocrPageSections(d.text);
@@ -8528,6 +8633,7 @@ function pollOcrJobs() {
 // keeps the user's local (possibly unsaved) version — a running edit
 // session must not be clobbered by a finishing job.
 async function refreshCompiledDoc(bid, donePages) {
+  delete ocrState.layoutMeta[bid];   // the job may have added figures
   await loadOcrBooks();
   try {
     const data = await (await fetch(
@@ -8721,6 +8827,9 @@ async function deleteSelectedPages() {
     }
     status(`PAGES DELETED :: ${pages.length} (backup: ${data.backup})`);
     el("ocr-msg").textContent = "";
+    // the PDF changed on disk: page counts, dims and word boxes are stale
+    ocrState.pdfInfo = {};
+    ocrState.wordsCache.clear();
     // reload the renumbered OCR docs and the shrunken PDF
     await loadOcrBooks();
     ocrState.bookLoading = null;
@@ -8809,6 +8918,9 @@ function initOcrTab() {
     const sameBook = ocrState.view === "pdf" && d && prev && d.buildId &&
       d.buildId === prev.buildId && el("ocr-pages").querySelector(".ocr-pgrow");
     if (sameBook && refillOcrPageText(d)) {
+      // the views now hold THIS doc — a later re-render (the OCR-job poller)
+      // must see it as the same doc, or it tears the page view down
+      ocrState.lastRendered = d.id;
       renderOcrDocs();   // refresh the docs-list active highlight only
       return;
     }

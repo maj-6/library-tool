@@ -2608,6 +2608,28 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   color: var(--input-ink);
   font-family: var(--mono);
 }
+/* layout mode, OCR-output docs (compiled.txt): the doc's text flowed into the
+   page-shaped pane, its extracted figures inline at their place in the flow */
+.ocr-pglayout.doctext {
+  padding: 4% 5%;
+  overflow-y: auto;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--input-ink);
+  user-select: text;
+}
+.ocr-pglayout.doctext p { margin: 0 0 0.7em; }
+.ocr-mdh { font-weight: bold; margin: 0.4em 0 0.5em; }
+.ocr-mdh.h1 { font-size: 1.45em; }
+.ocr-mdh.h2 { font-size: 1.3em; }
+.ocr-mdh.h3 { font-size: 1.15em; }
+.ocr-layimg {
+  display: block;
+  max-width: 100%;
+  margin: 0.5em auto;
+  border: 1px solid var(--canvas-line);
+  background: #fff;
+}
 
 .ocr-pgtext {
   resize: none;
