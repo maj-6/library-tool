@@ -41,6 +41,7 @@
           <button class="menu-item" data-cmd="run-scans" type="button">Run scans</button>
           <button class="menu-item" data-cmd="scrape" type="button">Scrape WHL</button>
           <button class="menu-item" data-cmd="dl-approved" type="button">Download verified sources</button>
+          <button class="menu-item" data-cmd="categories" type="button">Categories&hellip;</button>
           <div class="menu-sep"></div>
           <button class="menu-item" data-cmd="master-sync" type="button">Sync master list to Google Sheets&hellip;</button>
         </div>
@@ -275,8 +276,8 @@
                 <input id="m-illustrations" class="cad-input" name="illustrations" />
               </div>
               <div class="mf-field mf-full">
-                <label class="tool-label" for="m-categories">Categories</label>
-                <input id="m-categories" class="cad-input" name="categories" />
+                <label class="tool-label">Categories</label>
+                <div id="m-categories" class="cat-picker"></div>
               </div>
               <div class="mf-field mf-full">
                 <label class="tool-label" for="m-notes">Notes</label>
@@ -407,8 +408,8 @@
                   <input id="e-acquired" class="cad-input" />
                 </div>
                 <div class="mf-field mf-full">
-                  <label class="tool-label" for="e-categories">Categories</label>
-                  <input id="e-categories" class="cad-input" />
+                  <label class="tool-label">Categories</label>
+                  <div id="e-categories" class="cat-picker"></div>
                 </div>
                 <div class="mf-field mf-full">
                   <label class="tool-label" for="e-notes">Notes</label>
@@ -653,8 +654,8 @@
                     <input id="b-pages" class="cad-input" />
                   </div>
                   <div class="mf-field mf-third">
-                    <label class="tool-label" for="b-categories">Categories</label>
-                    <input id="b-categories" class="cad-input" />
+                    <label class="tool-label">Categories</label>
+                    <div id="b-categories" class="cat-picker"></div>
                   </div>
                   <div class="mf-field mf-full">
                     <label class="tool-label" for="b-pdf_source">PDF source (URL)
@@ -969,6 +970,32 @@
         <button id="changelog-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
       </div>
       <div id="changelog-body" class="changelog-body"></div>
+    </div>
+  </div>
+
+  <!-- CATEGORY TAXONOMY WINDOW: the vocabulary behind category_ids (Tools menu) -->
+  <div id="cat-overlay" class="overlay" hidden>
+    <div id="cat-window" class="win">
+      <div class="win-titlebar">
+        <span>Categories</span>
+        <button id="cat-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
+      </div>
+      <div id="cat-body">
+        <div class="pane-bar">
+          <button id="cat-add-root" class="cad-btn tiny" type="button"
+                  data-tip="Add a top-level category">Add root</button>
+          <button id="cat-adopt" class="cad-btn tiny" type="button"
+                  data-tip="Parse the old comma-separated categories text on every record into the taxonomy">Adopt legacy&hellip;</button>
+          <input id="cat-new-name" class="cad-input" type="text" hidden
+                 autocomplete="off" />
+          <span class="tool-label" id="cat-msg"></span>
+          <span class="tb-spacer"></span>
+          <span class="tool-label" id="cat-count"></span>
+        </div>
+        <div id="cat-tree" class="drafting"></div>
+        <p class="pane-note">Click a name to rename &middot; drag onto a category to move it
+          &middot; assignments follow merges and deletions.</p>
+      </div>
     </div>
   </div>
 

@@ -26,10 +26,12 @@
 const LS_KEY = "whl_cad_checked_v1";
 const SETTINGS_KEY = "whl_cad_settings_v1";
 
+// `categories` left this list with the taxonomy overhaul: assignments are
+// category_ids lists handled by the chip pickers, not looped text inputs.
 const MANUAL_FIELDS = [
   "title", "subtitle", "author", "publisher", "city", "year", "edition",
   "volume", "language", "pages", "condition", "price", "illustrations",
-  "categories", "notes",
+  "notes",
 ];
 
 // Metadata columns of the combined table, in cell order; click-to-edit.
@@ -54,7 +56,7 @@ const WHL_ROW_FIELDS = ["title", "subtitle", "authors", "year", "publisher",
   "pages", "language", "subject", "categories", "description"];
 
 const BUILD_FIELDS = ["title", "subtitle", "authors", "year", "publisher",
-  "publisher_city", "edition", "language", "pages", "categories",
+  "publisher_city", "edition", "language", "pages",
   "pdf_source", "pdf_file", "source_url", "notes"];
 
 const state = {
@@ -75,6 +77,7 @@ const state = {
   uploadSources: [],          // approved sources as last rendered
   builds: {},                 // book builder entries (id -> build)
   buildSel: null,             // selected build id
+  taxonomy: {},               // category nodes (id -> {name, parent})
   buildFolder: null,          // entry-folder info for the selected build
   downloads: new Map(),
   dlTimers: new Map(),
@@ -3147,6 +3150,7 @@ function manualToBook(e) {
     pages: e.pages || "", condition: e.condition || "",
     illustrations: e.illustrations || "", price: e.price || "",
     acquired: "", categories: e.categories || "", notes: e.notes || "",
+    category_ids: e.category_ids || [],
   };
   // non-column metadata (phone captures): shown in the Info panel
   if (e.extra && Object.keys(e.extra).length) book.extra = e.extra;
@@ -3989,7 +3993,9 @@ const TIP_FIELDS = [
 function recordTip(rec, header) {
   const lines = header ? [header] : [];
   for (const [k, label] of TIP_FIELDS) {
-    let v = (rec[k] || "").toString().trim();
+    let v = k === "categories"
+      ? bookCatsText(rec)
+      : (rec[k] || "").toString().trim();
     if (!v) continue;
     // keep the tooltip a manageable size: long fields (notes, descriptions)
     // are abbreviated
@@ -4074,7 +4080,8 @@ function checkedRowTr(row, cmode, opts) {
   // volume titles are implied by the set header — optionally hide them
   const hideTitle = opts.isVol && !!state.settings.hideVolTitles;
   const cell = (f) => {
-    const val = f === "title" && hideTitle ? "" : b[f];
+    const val = f === "title" && hideTitle ? ""
+      : f === "categories" ? bookCatsText(b) : b[f];
     return f === "title" && cmode === "search"
       ? `<td data-csearch="1">${esc(val)}</td>`
       : `<td${editable(f)}>${esc(val)}</td>`;
@@ -4351,6 +4358,8 @@ function startEdit(td) {
   const row = state.rowsById.get(String(tr.dataset.rowId));
   if (!row) return;
   const field = td.dataset.edit;
+  // categories are structured now — they edit through the chip picker
+  if (field === "categories") return startEditCategories(td, row);
   const original = String(row.book[field] || "");
   hideTip();
   td.classList.add("editing");
@@ -5558,6 +5567,7 @@ function fillBookEditForm(book, showAcquired) {
   for (const f of BOOK_EDIT_FIELDS) {
     el("e-" + f).value = book[f] || "";
   }
+  catPickers["e-categories"].set(book.category_ids || []);
   // manual entries have no ACQUIRED field — the form adapts to the source
   el("e-acquired").closest(".mf-field").hidden = !showAcquired;
   el("bookedit-msg").textContent = "";
@@ -5624,6 +5634,7 @@ async function saveBookEditTab(ev) {
   if (!t || t.kind === "whl") return;
   const vals = {};
   for (const f of BOOK_EDIT_FIELDS) vals[f] = el("e-" + f).value.trim();
+  const catIds = catPickers["e-categories"].get();
   if (!vals.title) { el("bookedit-msg").textContent = "Title is required"; return; }
   // "Volumes in set" >= 2 turns this book into (or updates) a multi-volume set
   const setCount = Math.max(1, Math.min(99, parseInt(el("e-setcount").value, 10) || 1));
@@ -5632,8 +5643,8 @@ async function saveBookEditTab(ev) {
     const row = state.rowsById.get(t.id);
     if (!row) { el("bookedit-msg").textContent = "Row is gone"; return; }
     if (row.kind === "manual") {
-      const fields = {};
-      const before = {};
+      const fields = { category_ids: catIds };
+      const before = { category_ids: (row.book.category_ids || []).slice() };
       for (const f of MANUAL_FIELDS) {
         fields[f] = vals[f];
         before[f] = row.book[f] || "";
@@ -5655,7 +5666,8 @@ async function saveBookEditTab(ev) {
     const entry = state.checked.get(t.id);
     if (!entry) { el("bookedit-msg").textContent = "Row is gone"; return; }
     trackChecked(`edit ${vals.title.slice(0, 36)}`, t.id, () => {
-      entry.book = Object.assign({}, entry.book, vals);
+      entry.book = Object.assign({}, entry.book, vals,
+                                 { category_ids: catIds });
       entry.checks = null;
       entry.scans = null;
       entry.verify = null;
@@ -7088,6 +7100,506 @@ async function saveManualSource(clear) {
   closeManualSource();
 }
 
+// --- category taxonomy -------------------------------------------------------------
+// The hierarchical vocabulary behind category_ids (docs/library-analyze-design.md).
+// state.taxonomy holds the {id: {name, parent}} node map from /api/categories;
+// records carry category_ids lists. The old free-text `categories` is display
+// fallback only.
+
+async function loadTaxonomy() {
+  try {
+    const res = await fetch("/api/categories");
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.ok) state.taxonomy = data.nodes || {};
+  } catch (e) { /* offline boot: pickers degrade to empty vocab */ }
+  for (const p of Object.values(catPickers)) p.refresh();
+  if (!el("cat-overlay").hidden) renderCatTree();
+  renderChecked();   // table cells resolve names once the vocab lands
+}
+
+// root→leaf names for one node; cycle-safe (a bad sync must not hang render)
+function catPathNames(id) {
+  const names = [], seen = new Set();
+  let cur = String(id || "");
+  while (cur && state.taxonomy[cur] && !seen.has(cur)) {
+    seen.add(cur);
+    names.push(state.taxonomy[cur].name || "?");
+    cur = String(state.taxonomy[cur].parent || "");
+  }
+  return names.reverse();
+}
+
+function catPathText(id) { return catPathNames(id).join(" › "); }
+
+// leaf names for a record's assignment — what dense table cells show
+function catNamesText(ids) {
+  return (ids || [])
+    .map((i) => (state.taxonomy[i] || {}).name || "")
+    .filter(Boolean).join(", ");
+}
+
+// a book's categories for display: resolved names, else the legacy text
+function bookCatsText(b) {
+  if (b && Array.isArray(b.category_ids) && b.category_ids.length) {
+    const t = catNamesText(b.category_ids);
+    if (t) return t;
+  }
+  return (b && b.categories) || "";
+}
+
+const catPickers = {};   // mount id -> picker, so loadTaxonomy can refresh all
+
+// A chip picker: chips for the assigned nodes + an autocomplete input over
+// the taxonomy. Options are labelled with their full path; an unmatched
+// entry offers "Create". Mounted into a .cat-picker div; get()/set() speak
+// category_ids.
+function makeCatPicker(mountId, onChange) {
+  const mount = el(mountId);
+  let ids = [];
+  mount.classList.add("cat-picker");
+  mount.innerHTML =
+    `<span class="cat-chips"></span>` +
+    `<input class="cat-input" type="text" autocomplete="off" ` +
+    `placeholder="add category…" />` +
+    `<div class="catpick-pop" hidden></div>`;
+  const chips = mount.querySelector(".cat-chips");
+  const input = mount.querySelector(".cat-input");
+  const pop = mount.querySelector(".catpick-pop");
+  let active = -1, options = [];
+
+  function renderChips() {
+    chips.innerHTML = ids.map((i) =>
+      `<span class="cat-chip" data-id="${esc(i)}" data-tip="${esc(catPathText(i))}">` +
+      `${esc((state.taxonomy[i] || {}).name || "?")}` +
+      `<button type="button" class="cat-x" aria-label="Remove">&#10005;</button></span>`
+    ).join("");
+  }
+
+  function close() { pop.hidden = true; active = -1; }
+
+  function openPop() {
+    const q = input.value.trim().toLowerCase();
+    options = Object.keys(state.taxonomy)
+      .filter((i) => !ids.includes(i))
+      .map((i) => ({ id: i, path: catPathText(i) }))
+      .filter((o) => !q || o.path.toLowerCase().includes(q))
+      .sort((a, b) => a.path.localeCompare(b.path))
+      .slice(0, 12);
+    const exact = Object.values(state.taxonomy).some(
+      (n) => (n.name || "").toLowerCase() === q);
+    const rows = options.map((o, i) =>
+      `<div class="catpick-item${i === active ? " active" : ""}" data-i="${i}">` +
+      `${esc(o.path)}</div>`);
+    if (q && !exact) {
+      rows.push(`<div class="catpick-item catpick-new${active === options.length ? " active" : ""}" ` +
+        `data-new="1">Create &ldquo;${esc(input.value.trim())}&rdquo;</div>`);
+    }
+    pop.innerHTML = rows.join("");
+    pop.hidden = !rows.length;
+  }
+
+  async function createAndAdd(name) {
+    try {
+      const res = await fetch("/api/categories", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.ok) {
+        state.taxonomy[data.id] = data.node;
+        add(data.id);
+        for (const p of Object.values(catPickers)) if (p !== api) p.refresh();
+      } else statusErr(`CATEGORY :: ${(data.error || "create failed").toUpperCase()}`);
+    } catch (e) { statusErr("CATEGORY :: CREATE FAILED"); }
+  }
+
+  function add(id) {
+    if (!ids.includes(id)) ids.push(id);
+    input.value = "";
+    renderChips();
+    close();
+    if (onChange) onChange(ids.slice());
+  }
+
+  function pick(i) {
+    if (i >= 0 && i < options.length) add(options[i].id);
+    else if (input.value.trim()) createAndAdd(input.value.trim());
+  }
+
+  input.addEventListener("input", () => { active = -1; openPop(); });
+  input.addEventListener("focus", openPop);
+  input.addEventListener("blur", () => setTimeout(close, 150));
+  input.addEventListener("keydown", (ev) => {
+    const total = pop.hidden ? 0 : pop.children.length;
+    if (ev.key === "ArrowDown" && total) {
+      ev.preventDefault(); active = (active + 1) % total; openPop();
+    } else if (ev.key === "ArrowUp" && total) {
+      ev.preventDefault(); active = (active - 1 + total) % total; openPop();
+    } else if (ev.key === "Enter") {
+      ev.preventDefault();
+      if (total) pick(active >= 0 ? active : 0);
+      else if (input.value.trim()) createAndAdd(input.value.trim());
+    } else if (ev.key === "Escape" && !pop.hidden) {
+      ev.stopPropagation(); close();
+    } else if (ev.key === "Backspace" && !input.value && ids.length) {
+      ids.pop(); renderChips();
+      if (onChange) onChange(ids.slice());
+    }
+  });
+  // mousedown, not click: the input's blur fires first and closes the pop
+  pop.addEventListener("mousedown", (ev) => {
+    ev.preventDefault();
+    const item = ev.target.closest(".catpick-item");
+    if (!item) return;
+    if (item.dataset.new) pick(-1);
+    else pick(parseInt(item.dataset.i, 10));
+  });
+  chips.addEventListener("click", (ev) => {
+    const x = ev.target.closest(".cat-x");
+    if (!x) return;
+    const id = x.closest(".cat-chip").dataset.id;
+    ids = ids.filter((i) => i !== id);
+    renderChips();
+    if (onChange) onChange(ids.slice());
+  });
+
+  const api = {
+    get: () => ids.slice(),
+    set: (v) => { ids = (v || []).slice(); input.value = ""; renderChips(); close(); },
+    refresh: renderChips,
+  };
+  catPickers[mountId] = api;
+  return api;
+}
+
+// The categories cell of the combined table edits through a floating picker,
+// not the plain text input — the field is structured now.
+function startEditCategories(td, row) {
+  hideTip();
+  const before = ((row.book && row.book.category_ids) || []).slice();
+  const holder = document.createElement("div");
+  holder.className = "catcell-pop";
+  holder.innerHTML = `<div id="catcell-picker"></div>`;
+  document.body.appendChild(holder);
+  const r = td.getBoundingClientRect();
+  holder.style.left = `${Math.min(r.left, window.innerWidth - 340)}px`;
+  holder.style.top = `${r.bottom + 2}px`;
+  const picker = makeCatPicker("catcell-picker");
+  picker.set(before);
+  holder.querySelector(".cat-input").focus();
+
+  let done = false;
+  const finish = (commit) => {
+    if (done) return;
+    done = true;
+    const after = picker.get();
+    delete catPickers["catcell-picker"];
+    holder.remove();
+    document.removeEventListener("mousedown", onAway, true);
+    document.removeEventListener("keydown", onKey, true);
+    if (commit && JSON.stringify(after) !== JSON.stringify(before)) {
+      applyCategoryEdit(row, before, after);
+    } else renderChecked();
+  };
+  const onAway = (ev) => { if (!holder.contains(ev.target)) finish(true); };
+  const onKey = (ev) => {
+    if (ev.key === "Escape") {
+      // let an open suggestion list close first; second Escape cancels
+      if (holder.querySelector(".catpick-pop").hidden) { ev.stopPropagation(); finish(false); }
+    } else if (ev.key === "Enter" && !ev.target.closest(".cat-input")) finish(true);
+  };
+  document.addEventListener("mousedown", onAway, true);
+  document.addEventListener("keydown", onKey, true);
+}
+
+async function applyCategoryEdit(row, before, after) {
+  const label = `edit categories of ${String(row.book.title || "").slice(0, 32)}`;
+  if (row.kind === "manual") {
+    // _preserve: assigning categories doesn't change the book's identity, so
+    // checks/scans/verifications survive
+    const patch = (ids) =>
+      patchManualFields(row.id, { category_ids: ids, _preserve: true });
+    if (await patch(after)) {
+      pushOp(label, () => patch(before), () => patch(after));
+      status("CATEGORIES UPDATED");
+    } else statusCrit("UPDATE FAILED");
+    renderChecked();
+    return;
+  }
+  const entry = state.checked.get(row.id);
+  if (!entry) return;
+  const setIds = (ids) => {
+    const e = state.checked.get(row.id);
+    if (e) { e.book = Object.assign({}, e.book, { category_ids: ids }); }
+  };
+  pushOp(label,
+    () => { setIds(before); saveChecked(); renderChecked(); },
+    () => { setIds(after); saveChecked(); renderChecked(); });
+  setIds(after);
+  saveChecked();
+  renderChecked();
+  status("CATEGORIES UPDATED");
+}
+
+// --- the taxonomy manager window (Tools > Categories…) ---------------------------
+
+let catMergeFrom = null;   // node id armed for a merge, or null
+let catAdoptPreview = null; // adopt runs dry first; the second click applies
+
+function openCategories() {
+  catMergeFrom = null;
+  catAdoptPreview = null;
+  el("cat-msg").textContent = "";
+  el("cat-overlay").hidden = false;
+  loadTaxonomy().then(renderCatTree);
+}
+
+function closeCategories() { el("cat-overlay").hidden = true; }
+
+// usage counts: how many records point at each node (builds + manual + checked)
+function catUsage() {
+  const n = {};
+  const bump = (ids) => (ids || []).forEach((i) => { n[i] = (n[i] || 0) + 1; });
+  for (const b of Object.values(state.builds || {})) bump(b.category_ids);
+  for (const e of state.manual || []) bump(e.category_ids);
+  for (const [, entry] of state.checked) bump((entry.book || {}).category_ids);
+  return n;
+}
+
+function renderCatTree() {
+  const tree = el("cat-tree");
+  const nodes = state.taxonomy;
+  const use = catUsage();
+  const kids = {};
+  for (const [id, node] of Object.entries(nodes)) {
+    const p = nodes[node.parent] ? node.parent : "";
+    (kids[p] = kids[p] || []).push(id);
+  }
+  for (const arr of Object.values(kids)) {
+    arr.sort((a, b) => (nodes[a].name || "").localeCompare(nodes[b].name || ""));
+  }
+  const rows = [];
+  const walk = (parent, depth, seen) => {
+    for (const id of kids[parent] || []) {
+      if (seen.has(id)) continue;   // cycle guard
+      seen.add(id);
+      rows.push({ id, depth });
+      walk(id, depth + 1, seen);
+    }
+  };
+  walk("", 0, new Set());
+  el("cat-count").textContent = `${rows.length} categories`;
+  if (!rows.length) {
+    tree.innerHTML = `<p class="pane-note">No categories yet. Add a root, or adopt
+      the legacy text fields.</p>`;
+    return;
+  }
+  tree.innerHTML = rows.map(({ id, depth }) => {
+    const count = use[id] || 0;
+    return `<div class="cat-row${catMergeFrom === id ? " merge-src" : ""}" ` +
+      `draggable="true" data-id="${esc(id)}" style="padding-left:${8 + depth * 18}px">` +
+      `<span class="cat-name" data-tip="Click to rename">${esc(nodes[id].name || "?")}</span>` +
+      `<span class="cat-use">${count ? count : ""}</span>` +
+      `<span class="cat-acts">` +
+      `<button type="button" class="cad-btn tiny" data-act="child" data-tip="Add a subcategory">+</button>` +
+      `<button type="button" class="cad-btn tiny" data-act="merge" data-tip="Merge into another category">&#8646;</button>` +
+      `<button type="button" class="cad-btn tiny danger" data-act="del" data-tip="Delete (children move up)">&#10005;</button>` +
+      `</span></div>`;
+  }).join("") +
+  `<div class="cat-root-drop" data-rootdrop="1">drop here for top level</div>`;
+}
+
+async function catApi(method, path, body) {
+  try {
+    const res = await fetch(path, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.ok) return data;
+    el("cat-msg").textContent = data.error || "failed";
+  } catch (e) { el("cat-msg").textContent = "request failed"; }
+  return null;
+}
+
+async function catAfterChange() {
+  await loadTaxonomy();
+  renderCatTree();
+  renderChecked();               // table cells + tooltips resolve names
+  renderBuildEditor();
+}
+
+function catInlineRename(rowEl, id) {
+  const nameEl = rowEl.querySelector(".cat-name");
+  const old = (state.taxonomy[id] || {}).name || "";
+  nameEl.innerHTML = `<input class="cell-edit" value="${esc(old)}" />`;
+  const input = nameEl.querySelector("input");
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = async (commit) => {
+    if (done) return;
+    done = true;
+    const v = input.value.trim();
+    if (commit && v && v !== old) {
+      if (await catApi("PATCH", `/api/categories/${encodeURIComponent(id)}`, { name: v })) {
+        await catAfterChange();
+        return;
+      }
+    }
+    renderCatTree();
+  };
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); finish(true); }
+    else if (ev.key === "Escape") { ev.stopPropagation(); finish(false); }
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+
+function initCategories() {
+  makeCatPicker("m-categories");
+  makeCatPicker("e-categories");
+  makeCatPicker("b-categories");
+  MENU_CMDS["categories"] = () => openCategories();
+  el("cat-close").addEventListener("click", closeCategories);
+  el("cat-overlay").addEventListener("mousedown", (ev) => {
+    if (ev.target === el("cat-overlay")) closeCategories();
+  });
+
+  // window.prompt is unavailable in the Electron shell, so "add" flows
+  // through an inline input in the window's toolbar
+  let catNewParent = null;
+  const newInput = el("cat-new-name");
+  const askNewCat = (parent) => {
+    catNewParent = parent;
+    newInput.placeholder = parent
+      ? `new subcategory of ${(state.taxonomy[parent] || {}).name || "?"}…`
+      : "new top-level category…";
+    newInput.hidden = false;
+    newInput.value = "";
+    newInput.focus();
+  };
+  newInput.addEventListener("keydown", async (ev) => {
+    if (ev.key === "Escape") {
+      ev.stopPropagation();
+      newInput.hidden = true;
+      return;
+    }
+    if (ev.key !== "Enter") return;
+    ev.preventDefault();
+    const name = newInput.value.trim();
+    if (!name) { newInput.hidden = true; return; }
+    if (await catApi("POST", "/api/categories",
+                     { name, parent: catNewParent || "" })) {
+      newInput.hidden = true;
+      await catAfterChange();
+    }
+  });
+  newInput.addEventListener("blur", () => { newInput.hidden = true; });
+
+  el("cat-add-root").addEventListener("click", () => askNewCat(""));
+
+  // adopt is destructive-ish (writes every store), so it runs dry first and
+  // asks for a second click with the numbers on the table
+  el("cat-adopt").addEventListener("click", async () => {
+    if (!catAdoptPreview) {
+      const data = await catApi("POST", "/api/categories/adopt", { dry_run: true });
+      if (!data) return;
+      if (!data.records) {
+        el("cat-msg").textContent = "nothing to adopt — no legacy text without categories";
+        return;
+      }
+      catAdoptPreview = data;
+      el("cat-msg").textContent =
+        `${data.records} records, ${(data.new || []).length} new categories — click again to apply`;
+      return;
+    }
+    const data = await catApi("POST", "/api/categories/adopt", {});
+    catAdoptPreview = null;
+    if (data) {
+      el("cat-msg").textContent =
+        `adopted: ${data.records} records, ${data.created} new categories`;
+      status(`CATEGORIES :: ADOPTED ${data.records} RECORDS`);
+      await catAfterChange();
+    }
+  });
+
+  el("cat-tree").addEventListener("click", async (ev) => {
+    const rowEl = ev.target.closest(".cat-row");
+    if (!rowEl) return;
+    const id = rowEl.dataset.id;
+    const act = (ev.target.closest("[data-act]") || {}).dataset;
+    if (act && act.act === "child") {
+      askNewCat(id);
+      return;
+    }
+    if (act && act.act === "merge") {
+      if (catMergeFrom === id) {
+        catMergeFrom = null;
+        el("cat-msg").textContent = "";
+      } else if (catMergeFrom) {
+        const from = catMergeFrom;
+        catMergeFrom = null;
+        const data = await catApi("POST", "/api/categories/merge", { from, into: id });
+        if (data) {
+          el("cat-msg").textContent = `merged — ${data.reassigned} records moved`;
+          await catAfterChange();
+          return;
+        }
+      } else {
+        catMergeFrom = id;
+        el("cat-msg").textContent =
+          `merging "${(state.taxonomy[id] || {}).name}" — click ⇄ on the target`;
+      }
+      renderCatTree();
+      return;
+    }
+    if (act && act.act === "del") {
+      const n = (state.taxonomy[id] || {}).name || "?";
+      if (!confirm(`Delete "${n}"? Its subcategories move up; assignments drop it.`)) return;
+      if (await catApi("DELETE", `/api/categories/${encodeURIComponent(id)}`)) {
+        await catAfterChange();
+      }
+      return;
+    }
+    if (ev.target.closest(".cat-name")) catInlineRename(rowEl, id);
+  });
+
+  // drag a row onto another row (or the root strip) to re-parent
+  el("cat-tree").addEventListener("dragstart", (ev) => {
+    const rowEl = ev.target.closest(".cat-row");
+    if (!rowEl) return;
+    ev.dataTransfer.setData("text/whl-cat", rowEl.dataset.id);
+    ev.dataTransfer.effectAllowed = "move";
+  });
+  el("cat-tree").addEventListener("dragover", (ev) => {
+    if (ev.dataTransfer.types.includes("text/whl-cat")) {
+      ev.preventDefault();
+      const over = ev.target.closest(".cat-row, .cat-root-drop");
+      el("cat-tree").querySelectorAll(".drop-target").forEach((x) =>
+        x.classList.remove("drop-target"));
+      if (over) over.classList.add("drop-target");
+    }
+  });
+  el("cat-tree").addEventListener("drop", async (ev) => {
+    const id = ev.dataTransfer.getData("text/whl-cat");
+    if (!id) return;
+    ev.preventDefault();
+    el("cat-tree").querySelectorAll(".drop-target").forEach((x) =>
+      x.classList.remove("drop-target"));
+    const over = ev.target.closest(".cat-row, .cat-root-drop");
+    if (!over) return;
+    const parent = over.dataset.rootdrop ? "" : over.dataset.id;
+    if (parent === id) return;
+    if (await catApi("PATCH", `/api/categories/${encodeURIComponent(id)}`,
+                     { parent })) {
+      await catAfterChange();
+    }
+  });
+}
+
 // --- manual entry form -----------------------------------------------------------
 
 const PROV_FIELDS = ["title", "author", "publisher", "city", "year", "edition", "volume"];
@@ -7515,6 +8027,7 @@ async function submitManual(ev) {
   for (const f of MANUAL_FIELDS) body[f] = el("m-" + f).value;
   if (!body.title.trim()) { el("manual-msg").textContent = "Title is required"; return; }
   body = parseBook(body);   // colon subtitle + volume / edition indicators
+  body.category_ids = catPickers["m-categories"].get();
 
   const btn = el("manual-submit");
   btn.disabled = true;
@@ -7532,6 +8045,7 @@ async function submitManual(ev) {
       pushManualCreateOp(data.entry);
       renderChecked();
       el("manual-form").reset();
+      catPickers["m-categories"].set([]);   // pickers sit outside form.reset()
       clearProv();
       hideOlSuggest();
       el("m-title").focus();
@@ -7686,6 +8200,7 @@ function approvedSources() {
         author: row.book.author || "",
         publisher: row.book.publisher || "",
         year: row.book.year || "",
+        category_ids: (row.book.category_ids || []).slice(),
         archive: "Local scan",
         url: "",
         matched_title: row.localPdf.split(/[\\/]/).pop() || row.localPdf,
@@ -7701,6 +8216,7 @@ function approvedSources() {
         author: row.book.author || "",
         publisher: row.book.publisher || "",
         year: row.book.year || "",
+        category_ids: (row.book.category_ids || []).slice(),
         archive: ARCHIVE_NAMES[source],
       };
       const st = getVerify(row, source);
@@ -8000,6 +8516,7 @@ function renderBuildEditor() {
     const input = el("b-" + f);
     if (input) input.value = b[f] || "";
   }
+  catPickers["b-categories"].set(b.category_ids || []);
   el("b-ready").classList.toggle("active", b.status === "ready");
   el("b-verified-tag").hidden = b.status !== "ready";
   // only reset the description editor when its saved content changed —
@@ -8074,6 +8591,7 @@ function buildSeedFromSource(s) {
   return {
     title: s.title, subtitle: s.subtitle, authors: s.author,
     year: s.year, publisher: s.publisher,
+    category_ids: s.category_ids || [],
     pdf_source: pdfUrl, pdf_file: pdfFile, source_url: s.url,
     notes: `Source: ${s.archive}${s.matched_title ? " — " + s.matched_title : ""}`,
   };
@@ -8119,6 +8637,7 @@ async function saveBuildFields(ev) {
     const input = el("b-" + f);
     if (input) fields[f] = input.value.trim();
   }
+  fields.category_ids = catPickers["b-categories"].get();
   fields.description = buildDescMd.get();
   // an uploaded entry keeps its status — saving a typo fix must not pull
   // it back into the Pending queue
@@ -10928,6 +11447,8 @@ function init() {
   document.addEventListener("keydown", onRowDeleteKey);
   boot("attention popover", initAttnPop);
   boot("review queue", initReviewWin);
+  boot("categories", initCategories);
+  loadTaxonomy();   // async; pickers and cells refresh when the vocab lands
   el("b-pdf-attach").addEventListener("click", () => attachPdfFile());
   el("b-pdf_file").addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") { ev.preventDefault(); attachPdfFile(); }
@@ -10990,6 +11511,7 @@ function init() {
     else if (!el("msrc-overlay").hidden) closeManualSource();
     else if (!el("review-overlay").hidden) closeReviewWin();
     else if (!el("changelog-overlay").hidden) closeChangelog();
+    else if (!el("cat-overlay").hidden) closeCategories();
     else if (!el("settings-overlay").hidden) closeSettings();
   });
 

@@ -2891,3 +2891,136 @@ body[data-theme] .drafting::-webkit-scrollbar {
 /* the editor book list, tightened: more rows on screen */
 #builds-list .build-item { padding: 2px 8px; line-height: 1.25; }
 #builds-list .bi-meta { font-size: 9px; }
+
+/* --- category taxonomy ------------------------------------------------------- */
+/* The chip picker replacing the plain categories inputs: a cad-input-shaped
+   well holding chips + an inline autocomplete, themed off the same vars. */
+.cat-picker {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 3px;
+  min-height: 24px;
+  padding: 2px 4px;
+  background: var(--input-bg);
+  border: 1px solid var(--face-sh2);
+  border-radius: var(--radius);
+}
+.cat-picker:focus-within { border-color: var(--cyan); }
+.cat-chips { display: contents; }
+.cat-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-family: var(--ui);
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 0 2px 0 6px;
+  color: var(--ink);
+  background: var(--row-checked);
+  border: 1px solid var(--face-sh);
+  border-radius: var(--radius);
+  white-space: nowrap;
+}
+.cat-x {
+  border: none;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 10px;
+  line-height: 1;
+  padding: 1px 3px;
+  opacity: 0.55;
+}
+.cat-x:hover { opacity: 1; color: var(--red); }
+.cat-input {
+  flex: 1 1 90px;
+  min-width: 70px;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--input-ink);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 2px;
+}
+.catpick-pop {
+  position: absolute;
+  top: 100%;
+  left: -1px;
+  right: -1px;
+  z-index: 40;
+  max-height: 220px;
+  overflow-y: auto;
+  background: var(--input-bg);
+  border: 1px solid var(--face-sh2);
+  border-radius: 0 0 var(--radius) var(--radius);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.18);
+}
+.catpick-item {
+  font-family: var(--ui);
+  font-size: 11px;
+  padding: 4px 8px;
+  cursor: pointer;
+  color: var(--ink);
+}
+.catpick-item:hover, .catpick-item.active { background: var(--row-hover); }
+.catpick-new { font-style: italic; color: var(--cyan); }
+
+/* floating picker for the combined table's Categories cells */
+.catcell-pop {
+  position: fixed;
+  z-index: 70;
+  width: 330px;
+  padding: 6px;
+  background: var(--face);
+  border: 1px solid var(--face-sh2);
+  border-radius: var(--radius);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+}
+
+/* the taxonomy manager window */
+#cat-window { width: min(560px, 92vw); }
+#cat-body { display: flex; flex-direction: column; padding: 8px; gap: 6px; }
+#cat-body .pane-bar { display: flex; align-items: center; gap: 6px; }
+#cat-new-name { flex: 1 1 140px; }
+#cat-tree {
+  height: 340px;
+  overflow-y: auto;
+  border: 1px solid var(--canvas-line);
+}
+.cat-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  font-family: var(--ui);
+  font-size: 12px;
+  border-bottom: 1px solid var(--canvas-line);
+}
+.cat-row:hover { background: var(--row-hover); }
+.cat-row.merge-src { background: var(--row-manual); }
+.cat-row.drop-target { box-shadow: inset 0 0 0 1px var(--cyan); }
+.cat-name { cursor: text; }
+.cat-name .cell-edit { width: 160px; }
+.cat-use {
+  font-size: 10px;
+  color: var(--ink-light);
+  opacity: 0.6;
+  margin-left: auto;
+}
+.cat-acts { display: inline-flex; gap: 3px; visibility: hidden; }
+.cat-row:hover .cat-acts { visibility: visible; }
+.cat-root-drop {
+  font-family: var(--ui);
+  font-size: 10px;
+  text-align: center;
+  color: var(--ink-light);
+  opacity: 0.5;
+  padding: 6px;
+  border: 1px dashed var(--face-sh);
+  margin: 6px;
+  border-radius: var(--radius);
+}
+.cat-root-drop.drop-target { opacity: 1; box-shadow: inset 0 0 0 1px var(--cyan); }

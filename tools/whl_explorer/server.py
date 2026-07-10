@@ -760,11 +760,16 @@ BUILDS_PATH = lib.OUTPUT_DIR / "whl_builds.json"
 _BUILD_FIELDS = ("published_slug",
                  "title", "subtitle", "authors", "year", "publisher",
                  "publisher_city", "edition", "language", "pages",
-                 "categories", "description", "pdf_source", "pdf_file",
+                 "categories", "category_ids", "description",
+                 "pdf_source", "pdf_file",
                  "pdf_sources",
                  "source_url", "notes", "status",
                  "ocr_active", "ocr_verified", "ocr_quality",
                  "title_pages", "attention")
+
+# The structured exceptions to the str() coercion below. `categories` (flat
+# text) is deprecated in favour of category_ids — kept as display fallback.
+_BUILD_LIST_FIELDS = ("pdf_sources", "category_ids")
 
 
 def _clean_pdf_sources(raw) -> list:
@@ -812,8 +817,10 @@ def api_builds_create():
     seed = payload.get("build") or {}
     builds = lib.load_json(BUILDS_PATH, {})
     build = {f: str(seed.get(f, "") or "").strip() for f in _BUILD_FIELDS
-             if f != "pdf_sources"}
+             if f not in _BUILD_LIST_FIELDS}
     build["pdf_sources"] = _clean_pdf_sources(seed.get("pdf_sources"))
+    build["category_ids"] = _clean_category_ids(seed.get("category_ids"),
+                                                lib.load_taxonomy()["nodes"])
     if build["status"] not in _BUILD_STATUSES:
         build["status"] = "draft"
     build["id"] = lib.gen_id(set(builds))
@@ -838,6 +845,8 @@ def api_builds_update(build_id: str):
             continue
         if f == "pdf_sources":
             b[f] = _clean_pdf_sources(payload[f])
+        elif f == "category_ids":
+            b[f] = _clean_category_ids(payload[f], lib.load_taxonomy()["nodes"])
         else:
             b[f] = str(payload[f] or "").strip()
     if b.get("status") not in _BUILD_STATUSES:
@@ -873,6 +882,321 @@ def api_builds_restore():
     builds[bid] = build
     lib.save_json(BUILDS_PATH, builds)
     return jsonify({"ok": True, "build": build})
+
+
+# --- category taxonomy -------------------------------------------------------------
+# The vocabulary behind every record's category_ids: a tree of {name, parent}
+# nodes in output/categories.json (see docs/library-analyze-design.md §1). The
+# old comma-separated `categories` text fields are deprecated — still shown as
+# a fallback, no longer edited. Nodes sync across machines through the
+# `taxonomy` cloud table (tools/store_sync.py), so every mutation stamps
+# updated_at.
+
+_categories_lock = threading.Lock()
+
+
+def _tax_ts() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _tax_sibling_taken(nodes: dict, name: str, parent: str, skip: str = "") -> bool:
+    low = name.strip().lower()
+    return any(n.get("parent", "") == parent
+               and str(n.get("name", "")).strip().lower() == low
+               and nid != skip
+               for nid, n in nodes.items())
+
+
+def _tax_descends(nodes: dict, node_id: str, ancestor: str) -> bool:
+    """True when ancestor sits on node_id's parent chain (or is node_id)."""
+    cur, seen = node_id, set()
+    while cur and cur in nodes and cur not in seen:
+        if cur == ancestor:
+            return True
+        seen.add(cur)
+        cur = str(nodes[cur].get("parent") or "")
+    return cur == ancestor
+
+
+def _clean_category_ids(raw, nodes: dict | None = None) -> list:
+    """A record's category assignment: a de-duplicated list of node ids.
+    Like pdf_sources, this is the structured exception to the str() coercion.
+    When the taxonomy is at hand, ids that don't resolve are dropped."""
+    out, seen = [], set()
+    if isinstance(raw, list):
+        for v in raw:
+            cid = re.sub(r"[^\w]", "", str(v or ""))[:12]
+            if not cid or cid in seen:
+                continue
+            if nodes is not None and cid not in nodes:
+                continue
+            seen.add(cid)
+            out.append(cid)
+    return out
+
+
+def _remap_category_ids(fn) -> int:
+    """Apply fn(list) -> list to every category_ids in builds, manual entries
+    and checked books; returns how many records changed. Used by node delete
+    and merge so assignments never dangle locally."""
+    changed = 0
+
+    with _builds_lock:
+        builds = lib.load_json(BUILDS_PATH, {})
+        dirty = False
+        for b in builds.values():
+            old = b.get("category_ids") or []
+            new = fn(list(old))
+            if new != old:
+                b["category_ids"] = new
+                b["updated_at"] = _tax_ts()
+                dirty, changed = True, changed + 1
+        if dirty:
+            lib.save_json(BUILDS_PATH, builds)
+
+    with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+        dirty = False
+        for e in entries.values():
+            old = e.get("category_ids") or []
+            new = fn(list(old))
+            if new != old:
+                e["category_ids"] = new
+                dirty, changed = True, changed + 1
+        if dirty:
+            lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+
+    with _client_state_lock:
+        state = lib.load_json(lib.CLIENT_STATE_PATH, {})
+        dirty = False
+        for pair in state.get("checked") or []:
+            book = (pair[1] or {}).get("book") if len(pair) == 2 else None
+            if not isinstance(book, dict):
+                continue
+            old = book.get("category_ids") or []
+            new = fn(list(old))
+            if new != old:
+                book["category_ids"] = new
+                dirty, changed = True, changed + 1
+        if dirty:
+            state["updated_at"] = _tax_ts()
+            lib.save_json(lib.CLIENT_STATE_PATH, state)
+
+    return changed
+
+
+@app.route("/api/categories")
+def api_categories():
+    return jsonify({"ok": True, "nodes": lib.load_taxonomy()["nodes"]})
+
+
+@app.route("/api/categories", methods=["POST"])
+def api_categories_create():
+    payload = request.get_json(silent=True) or {}
+    name = str(payload.get("name") or "").strip()[:80]
+    parent = re.sub(r"[^\w]", "", str(payload.get("parent") or ""))[:12]
+    if not name:
+        return jsonify({"ok": False, "error": "a category needs a name"}), 400
+    with _categories_lock:
+        doc = lib.load_taxonomy()
+        nodes = doc["nodes"]
+        if parent and parent not in nodes:
+            return jsonify({"ok": False, "error": "no such parent"}), 404
+        if _tax_sibling_taken(nodes, name, parent):
+            return jsonify({"ok": False, "error": "that name is taken here"}), 409
+        cid = lib.gen_id(set(nodes))
+        now = _tax_ts()
+        nodes[cid] = {"name": name, "parent": parent,
+                      "created_at": now, "updated_at": now}
+        lib.save_json(lib.CATEGORIES_PATH, doc)
+    return jsonify({"ok": True, "id": cid, "node": nodes[cid]})
+
+
+@app.route("/api/categories/<cid>", methods=["PATCH"])
+def api_categories_update(cid: str):
+    """Rename and/or re-parent. Re-parenting under a descendant would cut the
+    subtree loose from the root, so it is refused."""
+    payload = request.get_json(silent=True) or {}
+    with _categories_lock:
+        doc = lib.load_taxonomy()
+        nodes = doc["nodes"]
+        if cid not in nodes:
+            abort(404)
+        node = nodes[cid]
+        name = str(payload.get("name") or node["name"]).strip()[:80]
+        parent = node.get("parent", "")
+        if "parent" in payload:
+            parent = re.sub(r"[^\w]", "", str(payload.get("parent") or ""))[:12]
+            if parent and parent not in nodes:
+                return jsonify({"ok": False, "error": "no such parent"}), 404
+            if parent and _tax_descends(nodes, parent, cid):
+                return jsonify({"ok": False, "error":
+                                "a category cannot move under its own child"}), 400
+        if not name:
+            return jsonify({"ok": False, "error": "a category needs a name"}), 400
+        if _tax_sibling_taken(nodes, name, parent, skip=cid):
+            return jsonify({"ok": False, "error": "that name is taken here"}), 409
+        node.update(name=name, parent=parent, updated_at=_tax_ts())
+        lib.save_json(lib.CATEGORIES_PATH, doc)
+    return jsonify({"ok": True, "node": node})
+
+
+@app.route("/api/categories/<cid>", methods=["DELETE"])
+def api_categories_delete(cid: str):
+    """Remove a node: children move up to its parent, assignments drop it."""
+    with _categories_lock:
+        doc = lib.load_taxonomy()
+        nodes = doc["nodes"]
+        if cid not in nodes:
+            abort(404)
+        parent = nodes[cid].get("parent", "")
+        now = _tax_ts()
+        for n in nodes.values():
+            if n.get("parent") == cid:
+                n["parent"] = parent
+                n["updated_at"] = now
+        del nodes[cid]
+        lib.save_json(lib.CATEGORIES_PATH, doc)
+    n = _remap_category_ids(lambda ids: [i for i in ids if i != cid])
+    return jsonify({"ok": True, "unassigned": n})
+
+
+@app.route("/api/categories/merge", methods=["POST"])
+def api_categories_merge():
+    """Fold one node into another: its children and its assignments move to
+    the target, then the node goes away. The cleanup for a vocabulary that
+    grew two spellings of the same thing (adopt-legacy produces these)."""
+    payload = request.get_json(silent=True) or {}
+    src = re.sub(r"[^\w]", "", str(payload.get("from") or ""))[:12]
+    dst = re.sub(r"[^\w]", "", str(payload.get("into") or ""))[:12]
+    with _categories_lock:
+        doc = lib.load_taxonomy()
+        nodes = doc["nodes"]
+        if src not in nodes or dst not in nodes:
+            abort(404)
+        if src == dst or _tax_descends(nodes, dst, src):
+            return jsonify({"ok": False, "error":
+                            "cannot merge a category into its own subtree"}), 400
+        now = _tax_ts()
+        for n in nodes.values():
+            if n.get("parent") == src:
+                n["parent"] = dst
+                n["updated_at"] = now
+        del nodes[src]
+        lib.save_json(lib.CATEGORIES_PATH, doc)
+
+    def swap(ids):
+        out = [dst if i == src else i for i in ids]
+        seen, deduped = set(), []
+        for i in out:
+            if i not in seen:
+                seen.add(i)
+                deduped.append(i)
+        return deduped
+
+    n = _remap_category_ids(swap)
+    activity("merged", "category", detail=f"{n} records moved")
+    return jsonify({"ok": True, "reassigned": n})
+
+
+@app.route("/api/categories/adopt", methods=["POST"])
+def api_categories_adopt():
+    """Migrate the legacy comma-separated categories text into the taxonomy.
+
+    Scans builds, manual entries and checked books; every distinct label
+    becomes a root-level node (matched case-insensitively against existing
+    root names) and the records get category_ids. The legacy text is left in
+    place — it is display fallback now, and the CH/WHL sources it came from
+    are read-only anyway. The tree is expected to be curated afterwards:
+    re-parent and merge are what turn a flat harvest into a hierarchy.
+    """
+    payload = request.get_json(silent=True) or {}
+    dry = bool(payload.get("dry_run"))
+
+    def labels_of(text) -> list[str]:
+        return [t.strip() for t in str(text or "").split(",") if t.strip()]
+
+    # pass 1: collect every legacy label from records that have no assignment yet
+    stores = {
+        "builds": lib.load_json(BUILDS_PATH, {}),
+        "manual": lib.load_json(lib.MANUAL_ENTRIES_PATH, {}),
+        "checked": lib.load_json(lib.CLIENT_STATE_PATH, {}),
+    }
+    pending: list[tuple[str, str, list[str]]] = []   # (store, key, labels)
+    for bid, b in stores["builds"].items():
+        if not b.get("category_ids") and b.get("categories"):
+            pending.append(("builds", bid, labels_of(b["categories"])))
+    for eid, e in stores["manual"].items():
+        if not e.get("category_ids") and e.get("categories"):
+            pending.append(("manual", eid, labels_of(e["categories"])))
+    for pair in stores["checked"].get("checked") or []:
+        book = (pair[1] or {}).get("book") if len(pair) == 2 else None
+        if isinstance(book, dict) and not book.get("category_ids") \
+                and book.get("categories"):
+            pending.append(("checked", str(pair[0]), labels_of(book["categories"])))
+
+    wanted = sorted({lab for _, _, labs in pending for lab in labs},
+                    key=str.lower)
+    with _categories_lock:
+        doc = lib.load_taxonomy()
+        nodes = doc["nodes"]
+        by_name = {str(n.get("name", "")).strip().lower(): nid
+                   for nid, n in nodes.items() if not n.get("parent")}
+        to_create = [lab for lab in wanted if lab.lower() not in by_name]
+
+        if dry:
+            return jsonify({"ok": True, "dry_run": True,
+                            "records": len(pending),
+                            "labels": wanted, "new": to_create})
+
+        now = _tax_ts()
+        for lab in to_create:
+            cid = lib.gen_id(set(nodes))
+            nodes[cid] = {"name": lab, "parent": "",
+                          "created_at": now, "updated_at": now}
+            by_name[lab.lower()] = cid
+        if to_create:
+            lib.save_json(lib.CATEGORIES_PATH, doc)
+
+    # pass 2: assign. Store writes take their own locks; records are re-read
+    # so nothing that changed since pass 1 is clobbered.
+    ids_for = lambda labs: [by_name[l.lower()] for l in labs   # noqa: E731
+                            if l.lower() in by_name]
+    assigned = 0
+    with _builds_lock:
+        builds = lib.load_json(BUILDS_PATH, {})
+        for sid, key, labs in pending:
+            if sid == "builds" and key in builds \
+                    and not builds[key].get("category_ids"):
+                builds[key]["category_ids"] = ids_for(labs)
+                builds[key]["updated_at"] = _tax_ts()
+                assigned += 1
+        lib.save_json(BUILDS_PATH, builds)
+    with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+        for sid, key, labs in pending:
+            if sid == "manual" and key in entries \
+                    and not entries[key].get("category_ids"):
+                entries[key]["category_ids"] = ids_for(labs)
+                assigned += 1
+        lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+    with _client_state_lock:
+        state = lib.load_json(lib.CLIENT_STATE_PATH, {})
+        by_key = {str(p[0]): p[1] for p in state.get("checked") or []
+                  if len(p) == 2 and isinstance(p[1], dict)}
+        for sid, key, labs in pending:
+            if sid != "checked" or key not in by_key:
+                continue
+            book = by_key[key].get("book")
+            if isinstance(book, dict) and not book.get("category_ids"):
+                book["category_ids"] = ids_for(labs)
+                assigned += 1
+        state["updated_at"] = _tax_ts()
+        lib.save_json(lib.CLIENT_STATE_PATH, state)
+
+    activity("adopted", "legacy categories", n=assigned)
+    return jsonify({"ok": True, "records": assigned,
+                    "created": len(to_create), "labels": wanted})
 
 
 # --- local PDF serving + browsing (for the builder's SOURCE tab) ------------------
@@ -2206,12 +2530,16 @@ def api_master_sync():
         rows.append([row["title"], "", row["author"], row["year"], "",
                      row["edition"], row["publisher"], row["city"],
                      row["categories"], row["notes"], "master"])
+    tax = lib.load_taxonomy()["nodes"]
     for e in lib.load_json(lib.MANUAL_ENTRIES_PATH, {}).values():
+        # resolved taxonomy paths when assigned; the deprecated text otherwise
+        paths = lib.category_paths(tax, e.get("category_ids"))
+        cats = lib.categories_text(paths) if paths else e.get("categories", "")
         rows.append([e.get("title", ""), e.get("subtitle", ""),
                      e.get("author", ""), e.get("year", ""),
                      e.get("volume", ""), e.get("edition", ""),
                      e.get("publisher", ""), e.get("city", ""),
-                     e.get("categories", ""), e.get("notes", ""), "manual"])
+                     cats, e.get("notes", ""), "manual"])
     try:
         creds = service_account.Credentials.from_service_account_file(
             str(kf), scopes=["https://www.googleapis.com/auth/spreadsheets"])
@@ -2494,6 +2822,9 @@ def api_manual_add():
         entry["extra"] = _clean_extra(payload.get("extra"))
     if payload.get("images"):
         entry["images"] = _clean_images(payload.get("images"))
+    if payload.get("category_ids"):
+        entry["category_ids"] = _clean_category_ids(
+            payload.get("category_ids"), lib.load_taxonomy()["nodes"])
 
     entry["created_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     entry["checks"] = _entry_checks(entry)
@@ -2528,6 +2859,9 @@ def api_manual_update(entry_id: str):
             e["extra"] = _clean_extra(payload.get("extra"))
         if "images" in payload:
             e["images"] = _clean_images(payload.get("images"))
+        if "category_ids" in payload:
+            e["category_ids"] = _clean_category_ids(
+                payload.get("category_ids"), lib.load_taxonomy()["nodes"])
         if not e.get("title"):
             return jsonify({"ok": False, "error": "TITLE IS REQUIRED"}), 400
         if not payload.get("_preserve"):
@@ -3507,12 +3841,20 @@ def _r2_cfg() -> dict:
 
 def _volume_row(b: dict, slug: str, url: str, path: str, size: int, actor: str) -> dict:
     num = lambda v: int(v) if str(v or "").strip().isdigit() else None   # noqa: E731
+    # Categories publish as resolved taxonomy paths; the flat text column is
+    # their rendering (and stays inside the fts index). Builds that predate
+    # the taxonomy fall back to their legacy free text. Note the allowlist
+    # nature of this row: internal fields (relevance, bundle) never enter it.
+    paths = lib.category_paths(lib.load_taxonomy()["nodes"],
+                               b.get("category_ids"))
+    cats = lib.categories_text(paths) if paths else (b.get("categories") or "")
     return {"slug": slug, "title": b.get("title") or "",
             "subtitle": b.get("subtitle") or "", "authors": b.get("authors") or "",
             "year": num(b.get("year")), "publisher": b.get("publisher") or "",
             "publisher_city": b.get("publisher_city") or "",
             "edition": b.get("edition") or "", "language": b.get("language") or "",
-            "pages": num(b.get("pages")), "categories": b.get("categories") or "",
+            "pages": num(b.get("pages")), "categories": cats,
+            "category_paths": paths,
             "description": b.get("description") or "",
             "source_url": b.get("source_url") or b.get("pdf_source") or "",
             "pdf_url": url, "pdf_path": path, "pdf_bytes": size,
@@ -3620,7 +3962,18 @@ def _publish_run(bid: str, actor: str) -> None:
                     extras.append((name_i, name_i))
 
             stage("recording")
-            sbase.upsert_volume(cloud, _volume_row(b, slug, url, path, size, actor))
+            row = _volume_row(b, slug, url, path, size, actor)
+            try:
+                sbase.upsert_volume(cloud, row)
+            except sbase.SyncError as exc:
+                # A live project that hasn't re-run schema.sql lacks the
+                # category_paths column; the book still deserves to publish.
+                if "category_paths" not in str(exc):
+                    raise
+                row.pop("category_paths", None)
+                sbase.upsert_volume(cloud, row)
+                log.warning("volumes.category_paths missing on the cloud "
+                            "project — re-run docs/cloud/schema.sql")
         except Exception:
             _unpublish_object(cloud, slug, path)
             for name_i, path_i in extras:

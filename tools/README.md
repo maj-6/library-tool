@@ -200,6 +200,11 @@ drives the realtime Open Library query — `[title]` words, `@author`
   subtitle, edition, volume number, language, pages, condition, price,
   illustrations, categories, notes; title required). Entries are saved to
   `output/manual_entries.json` and checked automatically on submit.
+  **Categories are a hierarchical taxonomy** (Tools → Categories…): the
+  form's chip picker assigns nodes from `output/categories.json` (stored
+  as `category_ids`, synced to the cloud like builds), and the manager
+  window renames, nests, merges, and can adopt the deprecated
+  comma-separated text still found on old records.
   **Titles are parsed on submit**: text after a colon becomes the
   subtitle, and volume/edition indicators (`vol. 1`, `v2`, `v. iii`,
   `2nd ed.`, `Third Edition`) are removed from the title and land in
