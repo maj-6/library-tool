@@ -45,6 +45,7 @@ import catalog_checks as checks  # noqa: E402
 import copyright_registration as copyreg  # noqa: E402
 import libcommon as lib  # noqa: E402
 import r2_store as r2  # noqa: E402
+import supabase_auth as sauth  # noqa: E402
 import supabase_sync as sbase  # noqa: E402
 import ol_client  # noqa: E402
 import scan_search  # noqa: E402
@@ -176,13 +177,16 @@ _activity_lock = threading.Lock()
 
 
 def _actor() -> str:
-    """Who is acting. Until there are real accounts this is a name the client
-    carries in a header; an unnamed client is still distinguishable from a
-    background job, which passes its own actor explicitly."""
-    try:
-        name = (request.headers.get("X-WHL-Actor") or "").strip()
-    except RuntimeError:            # outside a request context (background jobs)
-        name = ""
+    """Who is acting. A signed-in session is the identity; the X-WHL-Actor
+    header (the name from Settings) covers working locally, and a background
+    job passes its own actor explicitly."""
+    ses = (_auth_doc().get("session") or {})
+    name = str(ses.get("display_name") or "").strip()
+    if not name:
+        try:
+            name = (request.headers.get("X-WHL-Actor") or "").strip()
+        except RuntimeError:        # outside a request context (background jobs)
+            name = ""
     return name[:60] or "Unnamed user"
 
 
@@ -196,27 +200,331 @@ def activity(verb: str, subject: str, n: int = 1, actor: str | None = None) -> N
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception as exc:        # the feed is a nicety; never break the write
         log.warning("activity log write failed: %s", exc)
+    _push_wake.set()                # the cloud mirror catches up in the background
+
+
+def _activity_lines() -> list[str]:
+    if not ACTIVITY_PATH.is_file():
+        return []
+    with _activity_lock:
+        with open(ACTIVITY_PATH, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.readlines()
 
 
 @app.route("/api/activity")
 def api_activity():
-    """The newest events, newest first. Bad lines are skipped, not fatal."""
+    """The newest events, newest first. Signed in, the shared cloud feed is the
+    source (it includes everyone, yourself included, because every local event
+    is mirrored up); the local file covers signed-out and offline. Bad lines
+    are skipped, not fatal."""
     try:
         limit = max(1, min(500, int(request.args.get("limit") or 200)))
     except ValueError:
         limit = 200
-    rows: list[dict] = []
-    if ACTIVITY_PATH.is_file():
-        with _activity_lock:
-            with open(ACTIVITY_PATH, "r", encoding="utf-8", errors="replace") as fh:
-                tail = collections.deque(fh, maxlen=limit)
-        for line in tail:
+    cloud = _cloud_events(limit)
+    if cloud is not None:
+        # events written since the pusher last ran are only in the local file;
+        # the cursor marks exactly what the cloud already has, so prepending
+        # the lines beyond it duplicates nothing
+        cursor = int(_auth_doc().get("push_cursor") or 0)
+        fresh: list[dict] = []
+        for line in _activity_lines()[cursor:]:
             try:
-                rows.append(json.loads(line))
+                rec = json.loads(line)
             except ValueError:
                 continue
+            if isinstance(rec, dict):
+                fresh.append(rec)
+        # merge by time: after an offline stretch the unpushed tail can be
+        # OLDER than cloud events other machines wrote in the meantime
+        merged = sorted(fresh + cloud,
+                        key=lambda r: str(r.get("ts") or ""), reverse=True)
+        return jsonify({"ok": True, "cloud": True, "events": merged[:limit]})
+    rows: list[dict] = []
+    for line in _activity_lines()[-limit:]:
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            continue
     rows.reverse()
-    return jsonify({"ok": True, "events": rows})
+    return jsonify({"ok": True, "cloud": False, "events": rows})
+
+
+# --- accounts -------------------------------------------------------------------
+# A real Supabase user, signed in from the desktop. The session (plus the
+# activity push cursor) lives in DATA_ROOT/output/auth_session.json — device
+# state, gitignored like client_state.json. Contributions reach the cloud as
+# the authenticated user, so row-level security applies and no policy has to
+# trust a plain-text name. Settings and API keys never leave the machine.
+
+AUTH_SESSION_PATH = lib.DATA_ROOT / "output" / "auth_session.json"
+_auth_lock = threading.RLock()
+_push_wake = threading.Event()
+
+
+def _auth_doc() -> dict:
+    # No lock: save_json is atomic (temp file + os.replace), so a read can
+    # never see a torn file. Taking _auth_lock here would make _actor() — and
+    # with it every activity-logging request — block behind a token refresh's
+    # network round-trip. Read-modify-write sequences still take the lock.
+    return lib.load_json(AUTH_SESSION_PATH, {}) or {}
+
+
+def _auth_cfg() -> dict | None:
+    """GoTrue wants a project API key in `apikey`; the anon key is the right
+    one, but the service key works too, so use whichever Settings holds."""
+    s = _client_settings()
+    url = str(s.get("supabaseUrl") or "").strip()
+    key = (str(s.get("supabaseAnonKey") or "").strip()
+           or str(s.get("supabaseKey") or "").strip())
+    return {"url": url, "key": key} if url and key else None
+
+
+def _auth_session() -> dict | None:
+    """A live session, refreshed when stale. Refresh tokens rotate, so the
+    refreshed session is persisted before anything uses it, under the lock —
+    two concurrent refreshes with one token can revoke the whole family."""
+    cfg = _auth_cfg()
+    if not cfg:
+        return None
+    with _auth_lock:
+        doc = _auth_doc()
+        ses = doc.get("session")
+        if not ses or not ses.get("refresh_token"):
+            return None
+        if time.time() < float(ses.get("expires_at") or 0) - 90:
+            return ses
+        try:
+            fresh = sauth.refresh(cfg, ses["refresh_token"])
+        except sauth.AuthError as exc:
+            # Only a definitive rejection kills the session. A transport
+            # failure (offline, DNS, captive portal) says nothing about the
+            # refresh token — destroying it here would sign the user out
+            # every time the laptop slept through a token expiry.
+            if exc.status in (400, 401, 403):
+                log.warning("session refresh rejected (%s) — signed out", exc)
+                doc.pop("session", None)
+                lib.save_json(AUTH_SESSION_PATH, doc)
+            else:
+                log.warning("session refresh unavailable (%s) — will retry", exc)
+            return None
+        # the stored name came from the profiles row; a refresh only knows
+        # user_metadata, which may be blank or stale
+        fresh["display_name"] = (ses.get("display_name")
+                                 or fresh.get("display_name") or "")
+        doc["session"] = fresh
+        lib.save_json(AUTH_SESSION_PATH, doc)
+        return fresh
+
+
+def _adopt_profile(cfg: dict, ses: dict) -> dict:
+    """The profiles row is the shared display name. Prefer it; seed it from
+    signup metadata or the email when it does not exist yet."""
+    name = ses.get("display_name") or ""
+    try:
+        rows = sauth.rest(cfg, ses["access_token"], "GET",
+                          f"profiles?id=eq.{ses['user_id']}&select=display_name") or []
+        if rows and str(rows[0].get("display_name") or "").strip():
+            name = str(rows[0]["display_name"]).strip()
+        else:
+            name = name or ses.get("email", "").split("@")[0]
+            sauth.rest(cfg, ses["access_token"], "POST", "profiles?on_conflict=id",
+                       [{"id": ses["user_id"], "display_name": name}],
+                       prefer="resolution=merge-duplicates,return=minimal")
+    except sauth.AuthError as exc:
+        log.warning("profile lookup failed: %s", exc)
+        name = name or ses.get("email", "").split("@")[0]
+    return dict(ses, display_name=name[:60])
+
+
+def _store_session(ses: dict) -> None:
+    with _auth_lock:
+        doc = _auth_doc()
+        doc["session"] = ses
+        # Share from here on — pushing the backlog would stamp this user's id
+        # onto events they may not have made. Applies on the first sign-in AND
+        # whenever a different account takes over the machine.
+        if "push_cursor" not in doc or doc.get("account_id") != ses["user_id"]:
+            doc["push_cursor"] = len(_activity_lines())
+        doc["account_id"] = ses["user_id"]
+        lib.save_json(AUTH_SESSION_PATH, doc)
+    _push_wake.set()
+
+
+@app.route("/api/auth/status")
+def api_auth_status():
+    """Who is signed in, from the stored session — no refresh, no network.
+    Offline must not read as signed-out: the tokens are still on disk and the
+    pusher refreshes them when it actually needs them."""
+    cfg = _auth_cfg()
+    ses = (_auth_doc().get("session") or {}) if cfg else {}
+    return jsonify({"ok": True, "cloud": bool(cfg),
+                    "signed_in": bool(ses.get("refresh_token")),
+                    "email": ses.get("email", ""),
+                    "display_name": ses.get("display_name", "")})
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def api_auth_login():
+    cfg = _auth_cfg()
+    if not cfg:
+        return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Sync)"}), 400
+    p = request.get_json(silent=True) or {}
+    email = str(p.get("email") or "").strip()
+    password = str(p.get("password") or "")
+    if not email or not password:
+        return jsonify({"ok": False, "error": "email and password are both required"}), 400
+    try:
+        ses = sauth.sign_in(cfg, email, password)
+    except sauth.AuthError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 401
+    ses = _adopt_profile(cfg, ses)
+    _store_session(ses)
+    activity("signed in to", "the cloud", actor=ses["display_name"] or email)
+    return jsonify({"ok": True, "email": ses["email"],
+                    "display_name": ses["display_name"]})
+
+
+@app.route("/api/auth/signup", methods=["POST"])
+def api_auth_signup():
+    cfg = _auth_cfg()
+    if not cfg:
+        return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Sync)"}), 400
+    p = request.get_json(silent=True) or {}
+    email = str(p.get("email") or "").strip()
+    password = str(p.get("password") or "")
+    name = str(p.get("display_name") or "").strip()[:60]
+    if not email or not password:
+        return jsonify({"ok": False, "error": "email and password are both required"}), 400
+    if len(password) < 6:
+        return jsonify({"ok": False, "error": "password must be at least 6 characters"}), 400
+    try:
+        ses = sauth.sign_up(cfg, email, password, name)
+    except sauth.AuthError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    if ses is None:     # project requires email confirmation (the default)
+        return jsonify({"ok": True, "confirm": True})
+    ses = _adopt_profile(cfg, ses)
+    _store_session(ses)
+    activity("signed in to", "the cloud", actor=ses["display_name"] or email)
+    return jsonify({"ok": True, "email": ses["email"],
+                    "display_name": ses["display_name"]})
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def api_auth_logout():
+    cfg = _auth_cfg()
+    with _auth_lock:
+        doc = _auth_doc()
+        ses = doc.pop("session", None)
+        # push_cursor stays: signing back in resumes the mirror, no re-push
+        lib.save_json(AUTH_SESSION_PATH, doc)
+    if cfg and ses and ses.get("access_token"):
+        sauth.sign_out(cfg, ses["access_token"])
+    return jsonify({"ok": True})
+
+
+# --- the activity mirror: local jsonl -> cloud events table ----------------------
+# The local file is the source of truth; the cursor in auth_session.json marks
+# how much of it the cloud already has. Push failures leave the cursor alone,
+# so offline work catches up on the next wake. One daemon thread, poked by
+# activity() and by sign-in, with a slow heartbeat for retries.
+
+def _push_events_once() -> None:
+    cfg = _auth_cfg()
+    ses = _auth_session() if cfg else None
+    if not cfg or not ses:
+        return
+    with _auth_lock:
+        cursor = int(_auth_doc().get("push_cursor") or 0)
+    lines = _activity_lines()
+    if cursor > len(lines):        # the file was truncated by hand: resync
+        cursor = len(lines)
+        with _auth_lock:
+            doc = _auth_doc()
+            doc["push_cursor"] = cursor
+            lib.save_json(AUTH_SESSION_PATH, doc)
+    if cursor >= len(lines):
+        return
+    chunk = lines[cursor:cursor + 200]
+    batch = []
+    for line in chunk:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue               # a bad line is skipped, and the cursor passes it
+        if not isinstance(r, dict):
+            continue               # `[1]` or `"x"` would AttributeError below
+        ev = {"actor": str(r.get("actor") or "")[:60], "actor_id": ses["user_id"],
+              "verb": str(r.get("verb") or ""), "subject": str(r.get("subject") or "")}
+        try:
+            ev["n"] = int(r.get("n") or 1)
+        except (ValueError, TypeError):
+            ev["n"] = 1
+        ts = str(r.get("ts") or "").strip()
+        if ts:
+            ev["at"] = ts          # absent -> the column's now() default
+        batch.append(ev)
+    if batch:
+        try:
+            sauth.rest(cfg, ses["access_token"], "POST", "events", batch,
+                       prefer="return=minimal")
+        except sauth.AuthError as exc:
+            if exc.status == 400:
+                # the DATA was rejected (e.g. a hand-mangled timestamp);
+                # retrying the same lines forever would wedge the mirror
+                log.warning("event batch rejected (%s) — skipping %d line(s)",
+                            exc, len(chunk))
+            else:
+                raise              # transient: retry next wake, cursor untouched
+    with _auth_lock:
+        doc = _auth_doc()
+        doc["push_cursor"] = cursor + len(chunk)
+        lib.save_json(AUTH_SESSION_PATH, doc)
+    _cloud_feed_cache["at"] = 0.0  # the feed should see what was just pushed
+    if cursor + len(chunk) < len(lines):
+        _push_wake.set()
+
+
+def _push_events_loop() -> None:
+    while True:
+        _push_wake.wait(timeout=300)
+        _push_wake.clear()
+        try:
+            _push_events_once()
+        except Exception as exc:   # offline, RLS, anything — retry on next wake
+            log.warning("activity push deferred: %s", exc)
+
+
+# The cloud read is cached briefly: Home re-renders freely, and the feed does
+# not need to be fresher than the pusher that feeds it. Failures are cached
+# too, or an unreachable Supabase would cost every feed load a full timeout.
+_cloud_feed_cache: dict = {"at": 0.0, "rows": [], "fail_at": 0.0}
+
+
+def _cloud_events(limit: int) -> list[dict] | None:
+    """The shared feed, or None when signed out / offline (caller falls back)."""
+    cfg = _auth_cfg()
+    ses = _auth_session() if cfg else None
+    if not cfg or not ses:
+        return None
+    now = time.time()
+    if now - _cloud_feed_cache["at"] < 15:
+        return _cloud_feed_cache["rows"]
+    if now - _cloud_feed_cache["fail_at"] < 30:
+        return None
+    try:
+        rows = sauth.rest(cfg, ses["access_token"], "GET",
+                          "events?select=at,actor,verb,subject,n"
+                          f"&order=at.desc&limit={int(limit)}", timeout=8.0) or []
+    except sauth.AuthError as exc:
+        log.warning("cloud feed unavailable: %s", exc)
+        _cloud_feed_cache["fail_at"] = now
+        return None
+    out = [{"ts": r.get("at"), "actor": r.get("actor"), "verb": r.get("verb"),
+            "subject": r.get("subject"), "n": r.get("n")} for r in rows]
+    _cloud_feed_cache.update(at=now, rows=out)
+    return out
 
 
 @app.route("/api/log")
@@ -3082,6 +3390,8 @@ if __name__ == "__main__":
     ).start()
     # Cloud capture autosync (interval read from settings each tick; 0 = off).
     threading.Thread(target=_cloud_autosync_loop, daemon=True).start()
+    # Activity mirror: local jsonl -> cloud events, as the signed-in user.
+    threading.Thread(target=_push_events_loop, daemon=True, name="event-push").start()
     # WHL_PORT lets a second instance run on another port (a distinct origin,
     # so its localStorage/client-state can't collide with the main one) — used
     # to test against a throwaway WHL_DATA_ROOT without touching live state.
