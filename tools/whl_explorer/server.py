@@ -157,6 +157,59 @@ def _log_unhandled(exc):
     return jsonify({"ok": False, "error": str(exc)}), 500
 
 
+# --- activity feed --------------------------------------------------------------
+# Append-only, and deliberately NOT part of client_state: that document is
+# overwritten wholesale on every PUT, so events folded into it would be clobbered.
+# One JSON object per line, oldest first.
+
+ACTIVITY_PATH = lib.DATA_ROOT / "output" / "activity.jsonl"
+_activity_lock = threading.Lock()
+
+
+def _actor() -> str:
+    """Who is acting. Until there are real accounts this is a name the client
+    carries in a header; an unnamed client is still distinguishable from a
+    background job, which passes its own actor explicitly."""
+    try:
+        name = (request.headers.get("X-WHL-Actor") or "").strip()
+    except RuntimeError:            # outside a request context (background jobs)
+        name = ""
+    return name[:60] or "Unnamed user"
+
+
+def activity(verb: str, subject: str, n: int = 1, actor: str | None = None) -> None:
+    rec = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+           "actor": actor or _actor(), "verb": verb, "subject": subject, "n": int(n)}
+    try:
+        with _activity_lock:
+            ACTIVITY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(ACTIVITY_PATH, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as exc:        # the feed is a nicety; never break the write
+        log.warning("activity log write failed: %s", exc)
+
+
+@app.route("/api/activity")
+def api_activity():
+    """The newest events, newest first. Bad lines are skipped, not fatal."""
+    try:
+        limit = max(1, min(500, int(request.args.get("limit") or 200)))
+    except ValueError:
+        limit = 200
+    rows: list[dict] = []
+    if ACTIVITY_PATH.is_file():
+        with _activity_lock:
+            with open(ACTIVITY_PATH, "r", encoding="utf-8", errors="replace") as fh:
+                tail = collections.deque(fh, maxlen=limit)
+        for line in tail:
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+    rows.reverse()
+    return jsonify({"ok": True, "events": rows})
+
+
 @app.route("/api/log")
 def api_log():
     """Console feed: everything after ?since=<seq>. `next` is the new cursor."""
@@ -271,6 +324,7 @@ def api_builds_create():
     build["updated_at"] = build["created_at"]
     builds[build["id"]] = build
     lib.save_json(BUILDS_PATH, builds)
+    activity("created", "draft entry")
     return jsonify({"ok": True, "build": build})
 
 
@@ -281,6 +335,7 @@ def api_builds_update(build_id: str):
         abort(404)
     payload = request.get_json(silent=True) or {}
     b = builds[build_id]
+    was = b.get("status")
     for f in _BUILD_FIELDS:
         if f in payload:
             b[f] = str(payload[f] or "").strip()
@@ -288,6 +343,9 @@ def api_builds_update(build_id: str):
         b["status"] = "draft"
     b["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     lib.save_json(BUILDS_PATH, builds)
+    # only the status transition is worth a feed entry; every keystroke is not
+    if b["status"] != was and b["status"] in ("ready", "uploaded"):
+        activity("uploaded" if b["status"] == "uploaded" else "verified", "book")
     return jsonify({"ok": True, "build": b})
 
 
@@ -1396,11 +1454,20 @@ def api_client_state_put():
             old_n = len(old) if isinstance(old, list) else 0
             if len(new_checked) < old_n:
                 _backup_client_state(state, old_n, len(new_checked))
+        old_checked = state.get("checked")
+        before = len(old_checked) if isinstance(old_checked, list) else 0
         for k in _CLIENT_STATE_KEYS:
             if k in payload:
                 state[k] = payload[k]
         state["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         lib.save_json(lib.CLIENT_STATE_PATH, state)
+    # the checked set is a blob, not a stream of adds -- diff it to get an event
+    if isinstance(new_checked, list) and new_checked is not None:
+        delta = len(new_checked) - before
+        if delta > 0:
+            activity("added", "Checked Books", delta)
+        elif delta < 0:
+            activity("removed", "Checked Books", -delta)
     return jsonify({"ok": True})
 
 
@@ -1451,6 +1518,7 @@ def api_manual_add():
         entry["id"] = lib.gen_id(set(entries))
         entries[entry["id"]] = entry
         lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+    activity("added", "manual entry")
     return jsonify({"ok": True, "entry": entry})
 
 
@@ -1515,6 +1583,7 @@ def api_manual_delete(entry_id: str):
             abort(404)
         del entries[entry_id]
         lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+    activity("deleted", "manual entry")
     return jsonify({"ok": True})
 
 
@@ -2476,6 +2545,8 @@ def _import_capture(cfg: dict, cap: dict, mistral_key: str,
         lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
 
     sbase.mark_capture(cfg, cap["id"], "imported")
+    # a phone capture is attributed to the device, not to whoever ran the sync
+    activity("captured", "book", actor=str(cap.get("device") or "phone")[:60])
     # keep the cloud copies when OCR/extraction had trouble — the originals
     # are local too, but leaving the remote set makes recovery foolproof
     if delete_remote and not result["errors"]:

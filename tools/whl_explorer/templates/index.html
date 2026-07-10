@@ -67,7 +67,8 @@
 
   <!-- tab strip with the action icons inline, right side -->
   <div id="tabs">
-    <button class="tab active" data-tab="checked">Catalogs</button>
+    <button class="tab active" data-tab="home">Home</button>
+    <button class="tab" data-tab="checked">Catalogs</button>
     <button class="tab" data-tab="upload">Editor</button>
     <button class="tab" data-tab="ocr">OCR</button>
     <button class="tab" data-tab="infotab">Info</button>
@@ -95,8 +96,28 @@
   </div>
 
   <main>
+    <!-- HOME: opens on startup -->
+    <section id="home" class="panel-view active">
+      <div id="home-inner">
+        <div id="home-title">
+          <h1>Library Tool</h1>
+          <p id="home-sub">Cataloguing workbench for rare works on botany</p>
+        </div>
+        <div id="home-cols">
+          <div class="home-card">
+            <div class="home-h">Pending tasks</div>
+            <div id="home-tasks"></div>
+          </div>
+          <div class="home-card">
+            <div class="home-h">Recent activity</div>
+            <div id="home-activity"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- CATALOGS -->
-    <section id="checked" class="panel-view active">
+    <section id="checked" class="panel-view">
       <div id="checked-toolbar">
         <span class="icon-label" id="find-icon" data-icon="search"></span>
         <input id="checked-search" class="cad-input" type="text"
@@ -922,6 +943,10 @@
             <div class="settings-head">General</div>
             <p class="settings-note" id="gen-info"></p>
             <div class="settings-rows">
+              <label class="tool-label" for="set-user-name">Your name</label>
+              <input id="set-user-name" class="cad-input" spellcheck="false"
+                     placeholder="Andrew Miller"
+                     data-tip="Attributed to your changes in the Home tab's activity feed" />
               <label class="tool-label" for="set-whl-ocr">OCR panel in the WHL PDF viewer</label>
               <input id="set-whl-ocr" type="checkbox" />
               <label class="tool-label" for="set-preview-pages">PDF preview page limit</label>

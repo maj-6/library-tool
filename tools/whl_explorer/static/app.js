@@ -108,7 +108,8 @@ const state = {
     ocrTesseract: "", ocrClaudeKey: "", ocrClaudeModel: "",
     ocrAwsKey: "", ocrAwsSecret: "", ocrAwsRegion: "",
     ocrImageWidth: 1400,
-    ocrLayout: false,   // page view: place words where they sit on the page        // rasterization width for OCR input —
+    ocrLayout: false,   // page view: place words where they sit on the page
+    userName: "",       // attributed to your changes in the activity feed        // rasterization width for OCR input —
                                 // tune to see how shrinking affects quality
     // page-view digit shortcuts: press N over a page to queue it
     ocrKeyMap: { 1: "tesseract", 2: "claude", 3: "textract", 4: "azure", 5: "openai" },
@@ -979,9 +980,138 @@ async function syncClientStateOnLoad() {
   return false;
 }
 
+// --- Home ---------------------------------------------------------------------
+// Recent activity comes from the server's append-only feed; pending tasks are
+// derived from data already in memory, so they need no store of their own.
+
+// Every write carries who made it. There are no accounts yet, so this is a name
+// from Settings -- but the server records it per event, which is the shape real
+// accounts will need.
+function installActorHeader() {
+  const raw = window.fetch.bind(window);
+  window.fetch = (input, init) => {
+    const method = String((init && init.method) ||
+      (input && input.method) || "GET").toUpperCase();
+    if (method !== "GET" && method !== "HEAD" && state.settings.userName) {
+      init = { ...(init || {}) };
+      init.headers = new Headers(init.headers || (input && input.headers) || {});
+      init.headers.set("X-WHL-Actor", state.settings.userName);
+    }
+    return raw(input, init);
+  };
+}
+
+const homeState = { events: [], loaded: false };
+
+async function loadActivity() {
+  try {
+    const r = await (await fetch("/api/activity?limit=300")).json();
+    homeState.events = r.ok ? r.events : [];
+  } catch (e) { homeState.events = []; }
+  homeState.loaded = true;
+  renderHome();
+}
+
+// "Andrew Miller added 5 books to Checked Books": consecutive events by the same
+// actor doing the same thing collapse into one line, if they happened close
+// together. Anything further apart is a separate session and stays separate.
+const GROUP_GAP_MS = 30 * 60 * 1000;
+
+function groupActivity(events) {
+  const out = [];
+  for (const e of events) {                    // newest first
+    const at = Date.parse(e.ts) || 0;
+    const last = out[out.length - 1];
+    if (last && last.actor === e.actor && last.verb === e.verb &&
+        last.subject === e.subject && Math.abs(last.oldest - at) <= GROUP_GAP_MS) {
+      last.n += e.n || 1;
+      last.oldest = at;
+      continue;
+    }
+    out.push({ actor: e.actor, verb: e.verb, subject: e.subject,
+               n: e.n || 1, at, oldest: at });
+  }
+  return out;
+}
+
+function relTime(ms) {
+  const s = Math.max(0, (Date.now() - ms) / 1000);
+  if (s < 90) return "just now";
+  const m = s / 60;
+  if (m < 60) return Math.round(m) + " min ago";
+  const h = m / 60;
+  if (h < 24) return Math.round(h) + " h ago";
+  const d = h / 24;
+  if (d < 30) return Math.round(d) + " d ago";
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+// "Checked Books" is a place you add to; every other subject is a bare singular
+// noun ("book", "manual entry") that takes an article or a plural.
+const article = (w) => (/^[aeiou]/i.test(w) ? "an " : "a ");
+const pluralize = (w) => (w.endsWith("y") ? w.slice(0, -1) + "ies" : w + "s");
+
+function activityPhrase(g) {
+  if (g.subject === "Checked Books") {
+    const prep = g.verb === "removed" ? "from" : "to";   // never "removed ... to"
+    return `${g.verb} ${g.n} book${g.n === 1 ? "" : "s"} ${prep} Checked Books`;
+  }
+  return g.n === 1
+    ? `${g.verb} ${article(g.subject)}${g.subject}`
+    : `${g.verb} ${g.n} ${pluralize(g.subject)}`;
+}
+
+// Everything here is computed from data the app already holds.
+function pendingTasks() {
+  const builds = Object.values(state.builds || {});
+  const drafts = builds.filter((b) => b.status === "draft").length;
+  const ready = builds.filter((b) => b.status === "ready").length;
+  const attn = Object.keys(state.attn || {}).length +
+    [...(state.rowsById || new Map()).values()].filter((r) => r.attention).length;
+  const noScan = (state.manual || []).filter(
+    (e) => e.checks && e.checks.in_whl === "no" && !e.scans).length;
+
+  const t = [];
+  if (ready) t.push({ n: ready, text: `verified ${ready === 1 ? "entry" : "entries"} ready to upload`, tab: "upload" });
+  if (drafts) t.push({ n: drafts, text: `${drafts === 1 ? "draft" : "drafts"} pending verification`, tab: "upload" });
+  if (attn) t.push({ n: attn, text: `${attn === 1 ? "item" : "items"} marked for attention`, tab: "checked" });
+  if (noScan) t.push({ n: noScan, text: `manual ${noScan === 1 ? "entry" : "entries"} not yet scanned`, tab: "checked" });
+  return t;
+}
+
+function renderHome() {
+  const tasks = el("home-tasks");
+  const feed = el("home-activity");
+  if (!tasks || !feed) return;
+
+  const t = pendingTasks();
+  tasks.innerHTML = t.length
+    ? t.map((x) => `<button class="home-task" data-gotab="${esc(x.tab)}">` +
+        `<span class="home-n">${x.n}</span><span>${esc(x.text)}</span></button>`).join("")
+    : `<div class="empty">Nothing pending</div>`;
+
+  if (!homeState.loaded) { feed.innerHTML = `<div class="empty">Loading …</div>`; return; }
+  const groups = groupActivity(homeState.events).slice(0, 12);
+  feed.innerHTML = groups.length
+    ? groups.map((g) => `<div class="home-act">` +
+        `<span class="home-who">${esc(g.actor)}</span> ` +
+        `<span class="home-what">${esc(activityPhrase(g))}</span>` +
+        `<span class="home-when">${esc(relTime(g.at))}</span></div>`).join("")
+    : `<div class="empty">No activity recorded yet</div>`;
+}
+
+function initHome() {
+  el("home-tasks").addEventListener("click", (ev) => {
+    const b = ev.target.closest("[data-gotab]");
+    if (b) document.querySelector(`#tabs .tab[data-tab="${b.dataset.gotab}"]`).click();
+  });
+  loadActivity();
+}
+
 // --- tabs + header -----------------------------------------------------------
 
-const TAB_TITLES = { checked: "Catalogs", upload: "Editor", ocr: "OCR", infotab: "Info" };
+const TAB_TITLES = { home: "Home", checked: "Catalogs", upload: "Editor",
+                     ocr: "OCR", infotab: "Info" };
 
 function setHeader(tabId) {
   // Both the visible title bar and the OS window title carry the active tab:
@@ -1012,6 +1142,7 @@ function initTabs() {
       tab.classList.add("active");
       el(tab.dataset.tab).classList.add("active");
       setHeader(tab.dataset.tab);
+      if (tab.dataset.tab === "home") loadActivity();   // refresh on every visit
       if (tab.dataset.tab === "checked") renderChecked();
       if (tab.dataset.tab === "upload") renderUpload();
       if (tab.dataset.tab === "infotab") renderConsole();
@@ -1020,7 +1151,7 @@ function initTabs() {
       if (tab.dataset.tab === "ocr") loadOcrBooks().then(renderOcrTab);
     });
   }
-  setHeader("checked");
+  setHeader("home");
 }
 
 // --- tooltip (match info + overflowed cells) ---------------------------------
@@ -1566,6 +1697,13 @@ function renderSettings() {
     saveActionLog();
     if (activeBottomTable() === "history") renderBottomRows();
     status("HISTORY CLEARED");
+  };
+  const un = el("set-user-name");
+  un.value = state.settings.userName || "";
+  un.onchange = () => {
+    state.settings.userName = un.value.trim().slice(0, 60);
+    saveSettings();
+    renderHome();          // the feed labels your own past events too
   };
   const ocr = el("set-whl-ocr");
   ocr.checked = !!state.settings.whlModalOcr;
@@ -9025,8 +9163,10 @@ function init() {
   initTabs();
   initTooltips();
   initPaneTabs();
+  installActorHeader();   // before any write goes out
   initMenubar();
   initConsole();          // before anything can throw or call status()
+  initHome();
   fitTitleBar();          // after the menus exist: their width sets the clamp
   initSettingsNav();
   initColResize();
@@ -9461,10 +9601,13 @@ function init() {
   syncClientStateOnLoad().then((adopted) => {
     if (adopted) { applyTheme(); applyFont(); }
     loadDownloads();
-    loadManual().then(migrateParsedEntries);
-    loadBuilds().then(renderUpload);
+    // Home's pending tasks are derived from these, so it re-renders once the
+    // data it counts has actually arrived
+    loadManual().then(migrateParsedEntries).then(renderHome);
+    loadBuilds().then(renderUpload).then(renderHome);
     switchTopTable(state.settings.topTable === "whl" ? "whl" : "checked");
     renderBottomPane();
+    renderHome();
   });
 }
 
