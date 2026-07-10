@@ -461,3 +461,23 @@ is decided by a tolerant composite rather than exact strings:
   desaturated navy titlebar fade), MOTIF (CDE chamfers, slate-indigo band).
   Retired theme ids revive as their heirs (cde/workstation -> motif,
   xp2003 -> redmond) and platinum is a real theme again.
+- Collaboration round. The home page is one framed sheet (max 1160px) with
+  three cards: IN PROGRESS (now also counting items awaiting review), RECENT
+  ACTIVITY, and CONTRIBUTORS (every activity actor + your Settings name, with
+  change counts and last-seen). Activity events carry a detail field (book
+  titles; checked-list PUTs are diffed by key set so adds and removals are
+  logged separately with counts that match their titles) and every feed group
+  expands in place to its member events with exact local times. The Q popover
+  gained NEEDS REVIEW: it files the item into a shared, server-backed review
+  queue (output/reviews.json; one open review per item, reopen guarded by a
+  409). The queue window (Home > items awaiting review) shows each item with
+  reason, requester, a Google-Docs-style comment thread (attributed via
+  X-WHL-Actor), and Resolve/Reopen; resolving clears the underlying attention
+  mark wherever it lives and repaints the table that showed it. Comment drafts
+  survive re-renders; failed POSTs report failure instead of pretending
+  success. Known limitation (multi-client, same as the attention sync it
+  rides on): another open client can re-push a cleared attention mark from
+  its stale full-map copy -- fixing that needs the version/tombstone work
+  already noted for checked-book deletes. The title bar (app + dialog) went
+  LIGHT in every theme: a tinted band with dark ink over the one separating
+  rule, so the tab strip reads as its own layer.

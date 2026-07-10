@@ -130,9 +130,9 @@ body[data-theme="sage"] .pane-tab.active {
 body[data-theme="sage"] .pane-tabs { border-bottom: 1px solid #c2cabc; }
 body[data-theme="sage"] #titlebar,
 body[data-theme="sage"] .win-titlebar {
-  background: #45564a;
-  color: #f0f4ee;
-  border-bottom: 1px solid #37453b;
+  background: #dfe6da;
+  color: #21261f;
+  border-bottom: 1px solid #a4ae9d;
 }
 body[data-theme="sage"] .grid thead th {
   background: #f0f4ed;
@@ -216,8 +216,9 @@ body[data-theme="ledger"] .pane-tab.active {
 }
 body[data-theme="ledger"] #titlebar,
 body[data-theme="ledger"] .win-titlebar {
-  background: var(--blue);
-  border-bottom: 3px double #24281f;
+  background: #e3e0d6;
+  color: #26241f;
+  border-bottom: 3px double #8f8d84;
 }
 body[data-theme="ledger"] .grid thead th {
   background: #edece5;
@@ -318,12 +319,12 @@ body[data-theme="foolscap"] .pane-tab.active {
   font-weight: 600;
 }
 body[data-theme="foolscap"] .pane-tabs { border-bottom: 1px solid #b0a99a; }
-/* titlebar: a pressed-ink slab (the one permitted muted band) under a single paper rule */
+/* titlebar: a light galley band closed off by the sheet's single ink rule */
 body[data-theme="foolscap"] #titlebar,
 body[data-theme="foolscap"] .win-titlebar {
-  background: linear-gradient(180deg, #565049, #4c473f);
-  color: #ece7db;
-  border-bottom: 1px solid #b0a99a;
+  background: #e9e5d9;
+  color: #221c14;
+  border-bottom: 1px solid #8a8070;
   letter-spacing: 1px;
 }
 /* grid on the paper canvas: light ruled header, single hairline rules, no vertical ruling */
@@ -415,9 +416,9 @@ body[data-theme="vellum"] .pane-tab.active {
 body[data-theme="vellum"] .pane-tabs { border-bottom: 1px solid #cdc7b8; }
 body[data-theme="vellum"] #titlebar,
 body[data-theme="vellum"] .win-titlebar {
-  background: #6b6353;
-  color: #f2ede2;
-  border-bottom: 1px solid #574f41;
+  background: #e7e1d3;
+  color: #2a2620;
+  border-bottom: 1px solid #a49a86;
 }
 body[data-theme="vellum"] .grid thead th {
   background: #f0ebde;
@@ -509,12 +510,12 @@ body[data-theme="linen"] .pane-tab.active {
   font-weight: 600;
 }
 body[data-theme="linen"] .pane-tabs { border-bottom: 1px solid #c3beb1; }
-/* muted warm band, the one permitted dark surface */
+/* a light flax band under a single warm rule */
 body[data-theme="linen"] #titlebar,
 body[data-theme="linen"] .win-titlebar {
-  background: #4a4740;
-  color: #efece4;
-  border-bottom: 1px solid #383630;
+  background: #dcd7ca;
+  color: #2c2a24;
+  border-bottom: 1px solid #948e7e;
 }
 /* ruled catalogue table: single hairlines, no vertical rules */
 body[data-theme="linen"] .grid thead th {
@@ -600,9 +601,9 @@ body[data-theme="quarto"] .pane-tab.active {
 body[data-theme="quarto"] .pane-tabs { border-bottom: 1px solid #ccd2db; }
 body[data-theme="quarto"] #titlebar,
 body[data-theme="quarto"] .win-titlebar {
-  background: #3c4759;
-  color: #eef1f6;
-  border-bottom: 1px solid #2c3441;
+  background: #e3e8ef;
+  color: #1b1f26;
+  border-bottom: 1px solid #98a1af;
 }
 body[data-theme="quarto"] .grid thead th {
   background: #eef1f6;
@@ -697,9 +698,9 @@ body[data-theme="pewter"] .pane-tab.active {
 body[data-theme="pewter"] .pane-tabs { border-bottom: 1px solid #c4c9d0; }
 body[data-theme="pewter"] #titlebar,
 body[data-theme="pewter"] .win-titlebar {
-  background: #545d68;
-  color: #eef1f4;
-  border-bottom: 1px solid #3f4650;
+  background: #e4e8ec;
+  color: #23282e;
+  border-bottom: 1px solid #99a0aa;
 }
 body[data-theme="pewter"] .grid thead th {
   background: #edf0f3;
@@ -793,12 +794,12 @@ body[data-theme="folio"] .pane-tab.active {
   font-weight: 600;
 }
 body[data-theme="folio"] .pane-tabs { border-bottom: 1px solid #c2cbd7; }
-/* titlebar: a muted blue-grey band under a thin rule */
+/* titlebar: a light blue-grey band under a thin rule */
 body[data-theme="folio"] #titlebar,
 body[data-theme="folio"] .win-titlebar {
-  background: #3a4c66;
-  color: #eef2f7;
-  border-bottom: 1px solid #2c3a4f;
+  background: #e2e8f1;
+  color: #232830;
+  border-bottom: 1px solid #98a3b4;
 }
 /* grid: a tint-band header on one hairline; horizontal ruling only */
 body[data-theme="folio"] .grid thead th {
@@ -1057,12 +1058,12 @@ body[data-theme="redmond"] .pane-tab.active {
   box-shadow: inset 0 2px 0 #2c3e66;
 }
 body[data-theme="redmond"] .pane-tabs { border-bottom: 1px solid #808080; }
-/* the signature left-to-right navy fade, chroma dialed down so it can sit in
-   the corner of your eye all afternoon; base white titlebar ink stands */
+/* the signature left-to-right fade survives as a pale steel wash — light
+   band, dark ink, the period gradient direction kept */
 body[data-theme="redmond"] #titlebar,
 body[data-theme="redmond"] .win-titlebar {
-  background: linear-gradient(90deg, #2c3e66, #5f7aa8);
-  color: #ffffff;
+  background: linear-gradient(90deg, #ccd6e6, #e3e9f3);
+  color: #201e19;
   border-bottom: 1px solid #6b675e;
 }
 /* header row as one flat button-face band: white bevel above, shadow below,
@@ -1194,13 +1195,13 @@ body[data-theme="motif"] .pane-tab.active {
   font-weight: 600;
 }
 body[data-theme="motif"] .pane-tabs { border-bottom: 1px solid #7c8399; }
-/* titlebar: the slate-indigo frame band, top edge lit, bottom edge in shade */
+/* titlebar: a pale indigo frame band, top edge lit, bottom edge in shade */
 body[data-theme="motif"] #titlebar,
 body[data-theme="motif"] .win-titlebar {
-  background: #4d5878;
-  color: #edeff6;
-  border-bottom: 1px solid #363f57;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22), inset 0 -1px 0 rgba(24, 29, 44, 0.35);
+  background: #d6dae6;
+  color: #22262e;
+  border-bottom: 1px solid #7c8399;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5), inset 0 -1px 0 rgba(36, 42, 60, 0.14);
 }
 /* grid: flat indigo tint band under one strong rule; horizontal ruling only */
 body[data-theme="motif"] .grid thead th {
@@ -1272,8 +1273,18 @@ body {
 }
 
 /* --- Home tab --- */
-#home { overflow: auto; }
-#home-inner { max-width: 860px; margin: 0 auto; padding: 34px 18px 24px; width: 100%; }
+#home { overflow: auto; padding: 22px 18px; }
+/* the page is one framed sheet on the panel face; wide enough that titles,
+   breakdowns and the feed don't ellipsize in normal use */
+#home-inner {
+  max-width: 1160px;
+  margin: 0 auto;
+  padding: 26px 30px 24px;
+  width: 100%;
+  background: var(--face-hi);
+  border: 1px solid var(--face-sh);
+  border-radius: var(--radius);
+}
 /* title on the left, mark on the right, and a printer's rule closing the head
    off from the page below it */
 #home-title {
@@ -1308,10 +1319,22 @@ body {
 }
 #home-icon { flex: 0 0 auto; display: block; width: 76px; height: 76px; }
 @media (max-width: 560px) { #home-icon { width: 52px; height: 52px; } }
-#home-cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: 18px; }
-@media (max-width: 720px) { #home-cols { grid-template-columns: minmax(0, 1fr); } }
+#home-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1.4fr) minmax(0, 0.85fr);
+  gap: 16px;
+}
+@media (max-width: 1000px) {
+  #home-cols { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  #home-cols .home-card:last-child { grid-column: 1 / -1; }
+}
+@media (max-width: 720px) {
+  #home-cols { grid-template-columns: minmax(0, 1fr); }
+  #home-cols .home-card:last-child { grid-column: auto; }
+}
+/* cards sit on the sheet, so they carry only a hairline — no second fill */
 .home-card {
-  background: var(--face-hi);
+  background: none;
   border: 1px solid var(--face-sh);
   border-radius: var(--radius);
   padding: 10px 12px 12px;
@@ -1402,6 +1425,66 @@ body {
 .home-who { font-weight: bold; color: var(--ink); white-space: nowrap; }
 .home-what { flex: 1 1 auto; min-width: 0; color: var(--ink); }
 .home-when { flex: 0 0 auto; color: var(--face-sh2); font-size: 10.5px; white-space: nowrap; }
+/* a feed row discloses its member events: exact times, exact items */
+.home-act { cursor: pointer; }
+.home-act-arrow { flex: 0 0 10px; color: var(--face-sh2); font-size: 9px; }
+.home-act:hover .home-act-arrow { color: var(--cyan); }
+.home-act-det { padding: 2px 2px 5px 20px; border-bottom: 1px solid var(--canvas-line); }
+.had-row { display: flex; gap: 8px; align-items: baseline; padding: 1px 0; }
+.had-ts { flex: 0 0 auto; font-family: var(--mono); font-size: 10px; color: var(--face-sh2); }
+.had-txt { flex: 1 1 auto; min-width: 0; font-size: 11.5px; color: var(--ink); overflow-wrap: anywhere; }
+
+/* --- Home: contributors --- */
+.home-user {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 2px;
+  font-size: 12px;
+  border-bottom: 1px solid var(--canvas-line);
+}
+.home-user:last-child { border-bottom: 0; }
+.hu-name { font-weight: bold; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hu-you {
+  flex: 0 0 auto;
+  color: var(--face-sh2);
+  font-size: 9px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  border: 1px solid var(--face-sh);
+  border-radius: var(--radius);
+  padding: 0 3px;
+}
+.hu-meta { flex: 1 1 auto; text-align: right; color: var(--face-sh2); font-size: 10.5px; white-space: nowrap; }
+.hu-when { flex: 0 0 auto; color: var(--face-sh2); font-size: 10.5px; white-space: nowrap; }
+
+/* --- review queue window --- */
+#review-overlay { z-index: 56; }   /* above the titlebar/menus, like its siblings */
+#review-window { width: min(640px, 100%); max-height: 78vh; }
+#review-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+#review-toolbar { flex: 0 0 auto; padding: 8px 12px 4px; }
+#review-show-resolved-row { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+#review-list { flex: 1; min-height: 0; overflow: auto; padding: 4px 12px 12px; }
+.review-item {
+  border: 1px solid var(--face-sh);
+  border-radius: var(--radius);
+  background: var(--face-hi);
+  padding: 8px 10px;
+  margin-bottom: 8px;
+}
+.review-item.resolved { opacity: 0.72; }
+.ri-head { display: flex; align-items: baseline; gap: 8px; }
+.ri-label { font-weight: bold; font-size: 12px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ri-meta { flex: 1 1 auto; text-align: right; color: var(--face-sh2); font-size: 10.5px; white-space: nowrap; }
+.ri-head .cad-btn { flex: 0 0 auto; }
+.ri-reason { margin-top: 3px; font-size: 11.5px; font-style: italic; }
+/* comments thread like a margin note: indented under a hairline gutter */
+.ri-comment { margin: 6px 0 0 10px; padding: 2px 0 2px 8px; border-left: 2px solid var(--face-sh); }
+.ric-author { font-weight: bold; font-size: 11px; }
+.ric-when { margin-left: 6px; color: var(--face-sh2); font-size: 10px; }
+.ric-text { font-size: 11.5px; overflow-wrap: anywhere; }
+.ri-add { display: flex; gap: 6px; margin-top: 8px; }
+.ri-add .ri-comment-input { flex: 1 1 auto; min-width: 0; }
 
 /* --- Info tab: the console --- */
 #infotab { flex-direction: column; gap: 0; padding: 6px; }
@@ -1429,9 +1512,12 @@ body {
 #con-level { width: 170px; }
 
 /* --- title bar --- */
+/* A light band with dark ink: the strong colour block it used to be read as
+   one slab with the tab strip below it. The single rule under it does the
+   separating now; themes re-tint the band, not the contrast scheme. */
 #titlebar {
-  background: linear-gradient(90deg, var(--blue), var(--blue2));
-  color: #fff;
+  background: var(--face-hi);
+  color: var(--ink);
   padding: 0;
   display: flex;
   align-items: stretch;
@@ -1472,7 +1558,7 @@ body.desktop .win-controls { display: inline-flex; }
   width: 44px;
   border: 0;
   background: transparent;
-  color: #fff;
+  color: var(--ink);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1482,10 +1568,14 @@ body.desktop .win-controls { display: inline-flex; }
 .win-btn svg { width: 10px; height: 10px; display: block; }
 .win-btn svg rect, .win-btn svg path { stroke: currentColor; }
 .win-btn svg rect[fill]:not([fill="none"]) { fill: currentColor; }
-.win-btn:hover { background: rgba(255, 255, 255, 0.16); }
-.win-btn:active { background: rgba(255, 255, 255, 0.26); }
+.win-btn:hover { background: rgba(20, 24, 28, 0.08); }
+.win-btn:active { background: rgba(20, 24, 28, 0.16); }
 .win-close:hover { background: #e81123; }
 .win-close:active { background: #c50e1f; }
+/* only the frameless window's control goes red-with-white; themed dialog
+   close buttons keep their light faces (and must keep their dark glyphs) */
+.win-btn.win-close:hover,
+.win-btn.win-close:active { color: #fff; }
 
 /* --- menu bar (merged into the title bar) --- */
 #menubar {
@@ -1504,16 +1594,16 @@ body.desktop .win-controls { display: inline-flex; }
   letter-spacing: 0.3px;
   padding: 6px 12px;
   background: transparent;
-  color: #fff;
+  color: var(--ink);
   border: none;
   border-radius: 0;
   cursor: pointer;
 }
-/* on the blue title bar the menu is always light-on-blue, regardless of theme;
+/* on the light title band the menu is always ink-on-paper, regardless of theme;
    the #titlebar id beats the per-theme `.menu-btn` accent-colour overrides */
-#titlebar .menu-btn { color: #fff; }
+#titlebar .menu-btn { color: var(--ink); }
 #titlebar .menu-btn:hover,
-#titlebar .menu-btn.active { background: rgba(255, 255, 255, 0.18); color: #fff; }
+#titlebar .menu-btn.active { background: rgba(20, 24, 28, 0.09); color: var(--ink); }
 .menu-drop {
   position: absolute;
   top: 100%;
@@ -1996,8 +2086,9 @@ form.orig-view .cad-input {
   justify-content: space-between;
   align-items: center;
   padding: 4px 8px;
-  background: linear-gradient(90deg, var(--blue), var(--blue2));
-  color: #fff;
+  background: var(--face-hi);
+  color: var(--ink);
+  border-bottom: 1px solid var(--face-sh2);
   letter-spacing: 1px;
   font-weight: bold;
 }
@@ -2015,7 +2106,7 @@ form.orig-view .cad-input {
 #ia-overlay { z-index: 61; padding: 4vh 12px; }
 .ia-win { width: min(1500px, 94vw); height: 90vh; padding: 0; overflow: hidden; }
 .ia-bar { justify-content: flex-start; gap: 6px; }
-.ia-bar .cad-btn { color: #fff; flex: 0 0 auto; }
+.ia-bar .cad-btn { color: var(--ink); flex: 0 0 auto; }
 .ia-title {
   flex: 1 1 auto; min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -2066,7 +2157,7 @@ form.orig-view .cad-input {
   overflow: hidden;
 }
 .webview-bar { justify-content: flex-start; gap: 6px; }
-.webview-bar .cad-btn { color: #fff; flex: 0 0 auto; }
+.webview-bar .cad-btn { color: var(--ink); flex: 0 0 auto; }
 .webview-url {
   flex: 1 1 auto;
   min-width: 0;
@@ -2190,6 +2281,16 @@ form.orig-view .cad-input {
 }
 #attn-pop-reason:focus { outline: none; border-color: var(--cyan); }
 #attn-pop-actions { display: flex; align-items: center; gap: 5px; }
+/* the review tick rides the action row's left edge; buttons keep the right */
+#attn-pop-review-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-right: auto;
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
 
 /* the viewer's page-aligned mode reuses the OCR tab's row styling */
 .pdf-pagesbox {

@@ -1142,9 +1142,10 @@ function maybeAuthPrompt() {
   });
 }
 
-const homeState = { events: [], loaded: false };
+const homeState = { events: [], loaded: false, expanded: new Set() };
 
 async function loadActivity() {
+  loadReviews().then(renderHome);   // the review count rides the same visit
   try {
     const r = await (await fetch("/api/activity?limit=300")).json();
     homeState.events = r.ok ? r.events : [];
@@ -1167,10 +1168,11 @@ function groupActivity(events) {
         last.subject === e.subject && Math.abs(last.oldest - at) <= GROUP_GAP_MS) {
       last.n += e.n || 1;
       last.oldest = at;
+      if (last.items.length < 40) last.items.push(e);   // enough for the expansion
       continue;
     }
     out.push({ actor: e.actor, verb: e.verb, subject: e.subject,
-               n: e.n || 1, at, oldest: at });
+               n: e.n || 1, at, oldest: at, items: [e] });
   }
   return out;
 }
@@ -1185,6 +1187,16 @@ function relTime(ms) {
   const d = h / 24;
   if (d < 30) return Math.round(d) + " d ago";
   return new Date(ms).toISOString().slice(0, 10);
+}
+
+const relIso = (iso) => { const t = Date.parse(iso || ""); return isNaN(t) ? "" : relTime(t); };
+
+// "2026-07-10 14:32" in local time — the expanded per-event view is exact
+function exactTime(ms) {
+  const d = new Date(ms);
+  const p = (x) => String(x).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+         `${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 // "Checked Books" is a place you add to; every other subject is a bare singular
@@ -1217,7 +1229,9 @@ function progressSummary() {
   const attnCat = Object.keys(state.attn || {}).length +
     [...(state.rowsById || new Map()).values()].filter((r) => r.attention).length;
   const attnEd = builds.filter((b) => b.attention && b.status !== "uploaded").length;
-  return { drafts, ready, srcPending, attnCat, attnEd };
+  const openReviews = Object.values(reviewsState.items || {})
+    .filter((r) => r.status === "open").length;
+  return { drafts, ready, srcPending, attnCat, attnEd, openReviews };
 }
 
 const HOME_DRAFTS_SHOWN = 4;
@@ -1230,8 +1244,8 @@ function renderHome() {
   const p = progressSummary();
   // one line per metric, count first, breakdown right-aligned and muted —
   // a status readout in the app's row idiom, not a dashboard of tiles
-  const row = (n, label, tab, detail) =>
-    `<button class="home-row" data-gotab="${tab}">` +
+  const row = (n, label, act, detail) =>
+    `<button class="home-row" ${act}>` +
       `<span class="hr-n">${n}</span>` +
       `<span class="hr-l">${esc(label)}</span>` +
       (detail ? `<span class="hr-d">${esc(detail)}</span>` : "") +
@@ -1240,15 +1254,17 @@ function renderHome() {
   const attn = p.attnCat + p.attnEd;
   let html =
     row(inEditor, inEditor === 1 ? "entry in the editor" : "entries in the editor",
-        "upload", inEditor ? `${p.drafts.length} draft · ${p.ready} to upload` : "") +
+        `data-gotab="upload"`, inEditor ? `${p.drafts.length} draft · ${p.ready} to upload` : "") +
     row(p.srcPending, p.srcPending === 1 ? "PDF source pending verification"
-        : "PDF sources pending verification", "upload") +
+        : "PDF sources pending verification", `data-gotab="upload"`) +
     row(attn, attn === 1 ? "item marked for attention"
-        : "items marked for attention", p.attnCat || !p.attnEd ? "checked" : "upload",
-        p.attnCat && p.attnEd ? `${p.attnCat} catalog · ${p.attnEd} editor` : "");
+        : "items marked for attention",
+        `data-gotab="${p.attnCat || !p.attnEd ? "checked" : "upload"}"`,
+        p.attnCat && p.attnEd ? `${p.attnCat} catalog · ${p.attnEd} editor` : "") +
+    row(p.openReviews, p.openReviews === 1 ? "item awaiting review"
+        : "items awaiting review", `data-review="1"`);
 
   // the freshest few drafts, so unfinished work is one click away
-  const relIso = (iso) => { const t = Date.parse(iso || ""); return isNaN(t) ? "" : relTime(t); };
   const drafts = p.drafts.slice()
     .sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
   const shown = drafts.slice(0, HOME_DRAFTS_SHOWN);
@@ -1265,14 +1281,59 @@ function renderHome() {
   }
   prog.innerHTML = html;
 
-  if (!homeState.loaded) { feed.innerHTML = `<div class="empty">Loading …</div>`; return; }
+  const users = el("home-users");
+  if (!homeState.loaded) {
+    feed.innerHTML = `<div class="empty">Loading …</div>`;
+    if (users) users.innerHTML = `<div class="empty">Loading …</div>`;
+    return;
+  }
+
+  // a group expands into its member events: exact local time + what exactly
   const groups = groupActivity(homeState.events).slice(0, 12);
+  const gkey = (g) => `${g.actor}|${g.verb}|${g.subject}|${g.at}`;
   feed.innerHTML = groups.length
-    ? groups.map((g) => `<div class="home-act">` +
-        `<span class="home-who">${esc(g.actor)}</span> ` +
-        `<span class="home-what">${esc(activityPhrase(g))}</span>` +
-        `<span class="home-when">${esc(relTime(g.at))}</span></div>`).join("")
+    ? groups.map((g) => {
+        const k = gkey(g);
+        const open = homeState.expanded.has(k);
+        const det = !open ? "" : `<div class="home-act-det">` +
+          g.items.map((e) => `<div class="had-row">` +
+            `<span class="had-ts">${esc(exactTime(Date.parse(e.ts) || 0))}</span>` +
+            `<span class="had-txt">${esc(e.detail ||
+              activityPhrase({ verb: e.verb, subject: e.subject, n: e.n || 1 }))}</span>` +
+            `</div>`).join("") + `</div>`;
+        return `<div class="home-act${open ? " open" : ""}" data-gk="${esc(k)}">` +
+          `<span class="home-act-arrow">${open ? "&#9662;" : "&#9656;"}</span>` +
+          `<span class="home-who">${esc(g.actor)}</span> ` +
+          `<span class="home-what">${esc(activityPhrase(g))}</span>` +
+          `<span class="home-when">${esc(relTime(g.at))}</span></div>` + det;
+      }).join("")
     : `<div class="empty">No activity recorded yet</div>`;
+
+  // everyone the feed has seen, newest first; your own name is always present
+  if (users) {
+    const me = (state.settings.userName || "").trim();
+    const seen = new Map();
+    for (const e of homeState.events) {
+      const who = String(e.actor || "").trim() || "Unnamed user";
+      const at = Date.parse(e.ts) || 0;
+      const m = seen.get(who) || { n: 0, last: 0 };
+      m.n += e.n || 1;
+      if (at > m.last) m.last = at;
+      seen.set(who, m);
+    }
+    if (me && !seen.has(me)) seen.set(me, { n: 0, last: 0 });
+    const list = [...seen.entries()].sort((a, b) => b[1].last - a[1].last);
+    users.innerHTML = list.length
+      ? list.map(([who, m]) => `<div class="home-user">` +
+          `<span class="hu-name">${esc(who)}</span>` +
+          (who === me ? `<span class="hu-you">you</span>` : "") +
+          `<span class="hu-meta">${m.n
+            ? `${m.n} ${m.n === 1 ? "change" : "changes"}`
+            : "no changes yet"}</span>` +
+          `<span class="hu-when">${m.last ? esc(relTime(m.last)) : ""}</span>` +
+          `</div>`).join("")
+      : `<div class="empty">No contributors recorded yet</div>`;
+  }
 }
 
 function initHome() {
@@ -1287,13 +1348,23 @@ function initHome() {
       selectBuild(d.dataset.draft);
       return;
     }
+    if (ev.target.closest("[data-review]")) { openReviewWin(); return; }
     const b = ev.target.closest("[data-gotab]");
     if (b) {
-      // every editor-bound tile advertises pending work, so land on the
+      // every editor-bound row advertises pending work, so land on the
       // Pending queue even if the sidebar was left on Uploaded
       if (b.dataset.gotab === "upload") state.buildsTab = "pending";
       document.querySelector(`#tabs .tab[data-tab="${b.dataset.gotab}"]`).click();
     }
+  });
+  // an activity row toggles its per-event detail
+  el("home-activity").addEventListener("click", (ev) => {
+    const row = ev.target.closest(".home-act[data-gk]");
+    if (!row) return;
+    const k = row.dataset.gk;
+    if (homeState.expanded.has(k)) homeState.expanded.delete(k);
+    else homeState.expanded.add(k);
+    renderHome();
   });
   loadActivity();
 }
@@ -3016,6 +3087,7 @@ function attnTargetAtHover() {
     if (!b) return null;
     return {
       node: bi,
+      kind: "build", ref: bi.dataset.bid,
       label: b.title || bi.dataset.bid,
       current: String(b.attention || ""),
       apply: (v) => patchBuildRaw(bi.dataset.bid, { attention: v })
@@ -3032,6 +3104,7 @@ function attnTargetAtHover() {
     if (!row) return null;
     return {
       node: tr,
+      kind: "row", ref: String(tr.dataset.rowId),
       label: row.book.title || tr.dataset.rowId,
       current: String(row.attention || ""),
       apply: (v) => setRowAttention(tr.dataset.rowId, v),
@@ -3039,6 +3112,7 @@ function attnTargetAtHover() {
   }
   const keyTarget = (k, label, rerender) => ({
     node: tr,
+    kind: "key", ref: k,
     label,
     current: String((state.attn || {})[k] || ""),
     apply: (v) => { setAttnKey(k, v); rerender(); },
@@ -3061,6 +3135,7 @@ function attnTargetAtHover() {
       const e = state.manual.find((x) => x.id === rec._mid);
       return {
         node: tr,
+        kind: "row", ref: String(rec._mid),
         label: rec.title || "manual entry",
         current: String((e && e.attention) || ""),
         apply: (v) => setRowAttention(rec._mid, v).then(renderBottomRows),
@@ -3195,6 +3270,10 @@ function openAttnPop(target, rect) {
   el("attn-pop-label").textContent = (target.label || "").slice(0, 60);
   const ta = el("attn-pop-reason");
   ta.value = attnReason(target.current);
+  // pre-tick when this item already sits in the shared review queue
+  const rk = target.kind ? `${target.kind}:${target.ref}` : "";
+  el("attn-pop-review").checked = !!(rk && Object.values(reviewsState.items || {})
+    .some((r) => r.key === rk && r.status === "open"));
   pop.hidden = false;
   hideTip();                       // the hover tooltip would sit under it otherwise
   positionAttnPop();
@@ -3226,8 +3305,27 @@ function closeAttnPop() {
 
 function saveAttnPop() {
   if (!attnPopTarget) return;
+  const t = attnPopTarget;
   const reason = el("attn-pop-reason").value.trim();
-  attnPopTarget.apply(reason || "1");   // empty reason = plain mark
+  t.apply(reason || "1");   // empty reason = plain mark
+  // "Needs review" raises (or refreshes) a shared queue item. Unticking never
+  // withdraws one — resolution is explicit, in the queue itself.
+  if (el("attn-pop-review").checked && t.kind) {
+    fetch("/api/reviews", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: t.kind, ref: String(t.ref),
+                             label: t.label || "", reason }),
+    }).then(async (res) => {
+      if (res.ok) {
+        await loadReviews();
+        renderHome();
+        status("Added to the review queue");
+      } else {
+        status("Review request failed — not queued");
+      }
+    }).catch(() => status("Review request failed — not queued"));
+  }
   closeAttnPop();
 }
 
@@ -3262,6 +3360,196 @@ function initAttnPop() {
   }, true);
   addEventListener("resize", () => {
     if (!el("attn-pop").hidden) positionAttnPop();
+  });
+}
+
+// --- the review queue ---------------------------------------------------------
+// Items flagged "Needs review" in the Q popover. Server-backed and shared:
+// every contributor sees the same queue, comments under their own name
+// (Settings > Your name), and an explicit resolution closes the item and
+// clears the underlying attention mark.
+
+const reviewsState = { items: {}, loaded: false, showResolved: false };
+
+async function loadReviews() {
+  try {
+    const r = await (await fetch("/api/reviews")).json();
+    // a failed fetch keeps the last-known queue rather than blanking it —
+    // "0 items awaiting review" must never be a euphemism for "server error"
+    if (r.ok) reviewsState.items = r.reviews || {};
+    reviewsState.loaded = true;
+  } catch (e) { /* keep the last-known queue */ }
+}
+
+function openReviewWin() {
+  el("review-overlay").hidden = false;
+  renderReviewList();                       // instant paint from what we have
+  loadReviews().then(renderReviewList);     // then freshen from the server
+}
+function closeReviewWin() { el("review-overlay").hidden = true; }
+
+function reviewsSorted() {
+  const all = Object.values(reviewsState.items || {});
+  const open = all.filter((r) => r.status === "open")
+    .sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+  if (!reviewsState.showResolved) return open;
+  return open.concat(all.filter((r) => r.status !== "open")
+    .sort((a, b) => (b.resolved_at || "").localeCompare(a.resolved_at || "")));
+}
+
+function renderReviewList() {
+  const host = el("review-list");
+  if (!host) return;
+  el("review-show-resolved").checked = reviewsState.showResolved;
+  // a rebuild must never clobber a comment in progress: typed drafts (and
+  // the caret) are carried across the innerHTML replacement
+  const drafts = {};
+  let focusRid = null;
+  for (const i of host.querySelectorAll(".ri-comment-input")) {
+    const it = i.closest(".review-item");
+    if (!it) continue;
+    if (i.value.trim()) drafts[it.dataset.rid] = i.value;
+    if (i === document.activeElement) focusRid = it.dataset.rid;
+  }
+  const items = reviewsSorted();
+  if (!items.length) {
+    host.innerHTML = `<div class="empty">${reviewsState.showResolved
+      ? "No review items yet" : "Nothing awaiting review"}</div>`;
+    return;
+  }
+  host.innerHTML = items.map((r) => {
+    const resolved = r.status !== "open";
+    return `<div class="review-item${resolved ? " resolved" : ""}" data-rid="${esc(r.id)}">` +
+      `<div class="ri-head">` +
+        `<span class="ri-label">${esc(r.label) || "(unlabelled item)"}</span>` +
+        `<span class="ri-meta">${resolved
+          ? `resolved by ${esc(r.resolved_by || "?")} &middot; ${esc(relIso(r.resolved_at))}`
+          : `${esc(r.created_by || "?")} &middot; ${esc(relIso(r.created_at))}`}</span>` +
+        `<button class="cad-btn tiny" type="button" data-rv-resolve="${resolved ? "0" : "1"}" ` +
+          `data-tip="${resolved ? "Reopen this item"
+            : "Mark resolved (also clears the attention mark)"}">${resolved ? "Reopen" : "Resolve"}</button>` +
+      `</div>` +
+      (r.reason ? `<div class="ri-reason">${esc(r.reason)}</div>` : "") +
+      (r.comments || []).map((c) => `<div class="ri-comment">` +
+        `<span class="ric-author">${esc(c.author || "?")}</span>` +
+        `<span class="ric-when">${esc(relIso(c.ts))}</span>` +
+        `<div class="ric-text">${esc(c.text)}</div></div>`).join("") +
+      `<div class="ri-add">` +
+        `<input class="cad-input ri-comment-input" placeholder="Add a comment&hellip;" spellcheck="false" />` +
+        `<button class="cad-btn tiny" type="button" data-rv-comment>Comment</button>` +
+      `</div></div>`;
+  }).join("");
+  for (const [rid, val] of Object.entries(drafts)) {
+    const inp = host.querySelector(`.review-item[data-rid="${CSS.escape(rid)}"] .ri-comment-input`);
+    if (inp) inp.value = val;
+  }
+  if (focusRid) {
+    const inp = host.querySelector(`.review-item[data-rid="${CSS.escape(focusRid)}"] .ri-comment-input`);
+    if (inp) { inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length); }
+  }
+}
+
+// resolving a review also clears the underlying attention mark, wherever
+// that mark lives (attn map / manual row / checked book / editor build)
+async function clearMark(kind, ref) {
+  if (kind === "key") {
+    setAttnKey(ref, "");
+    // repaint whichever table bakes this mark into its rows (the tab-switch
+    // renders only cover the checked/upload tables)
+    if (ref.startsWith("whl:")) renderWhlTop();
+    else if (ref.startsWith("src:")) renderUpload();
+    else renderBottomRows();
+    return;
+  }
+  if (kind === "build") {
+    if ((state.builds || {})[ref]) await patchBuildRaw(ref, { attention: "" });
+    return;
+  }
+  if (kind !== "row") return;
+  if (state.rowsById && state.rowsById.get(String(ref))) {
+    await setRowAttention(ref, "");
+    return;
+  }
+  // the combined table may not have rendered this session — go to the data
+  const e = (state.manual || []).find((x) => x.id === ref);
+  if (e) {
+    await fetch(`/api/manual/${encodeURIComponent(ref)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ attention: "", _preserve: true }),
+    }).catch(() => {});
+    e.attention = "";
+    return;
+  }
+  const v = state.checked && state.checked.get(ref);
+  if (v) { v.attention = ""; saveChecked(); }
+}
+
+function initReviewWin() {
+  el("review-close").addEventListener("click", closeReviewWin);
+  el("review-overlay").addEventListener("mousedown", (ev) => {
+    if (ev.target === el("review-overlay")) closeReviewWin();
+  });
+  el("review-show-resolved").addEventListener("change", (ev) => {
+    reviewsState.showResolved = ev.target.checked;
+    renderReviewList();
+  });
+  el("review-list").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && ev.target.classList.contains("ri-comment-input")) {
+      ev.preventDefault();
+      const btn = ev.target.closest(".review-item").querySelector("[data-rv-comment]");
+      if (btn) btn.click();
+    }
+  });
+  el("review-list").addEventListener("click", async (ev) => {
+    const item = ev.target.closest(".review-item");
+    if (!item) return;
+    const rid = item.dataset.rid;
+    const rbtn = ev.target.closest("[data-rv-resolve]");
+    if (rbtn) {
+      const resolved = rbtn.dataset.rvResolve === "1";
+      const res = await fetch(`/api/reviews/${encodeURIComponent(rid)}/resolve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ resolved }),
+      }).catch(() => null);
+      if (!res || !res.ok) {
+        status(res && res.status === 409
+          ? "This item already has an open review"
+          : "Review update failed");
+        return;
+      }
+      let note = resolved ? "Review resolved" : "Review reopened";
+      const r = (reviewsState.items || {})[rid];
+      if (resolved && r) {
+        // the review IS resolved at this point; a failed mark-clear must not
+        // abort the refresh below, only be reported
+        try { await clearMark(r.kind, r.ref); }
+        catch (e) { note = "Review resolved — attention mark not cleared"; }
+      }
+      await loadReviews();
+      renderReviewList();
+      renderHome();
+      status(note);
+      return;
+    }
+    if (ev.target.closest("[data-rv-comment]")) {
+      const input = item.querySelector(".ri-comment-input");
+      const text = (input.value || "").trim();
+      if (!text) return;
+      const res = await fetch(`/api/reviews/${encodeURIComponent(rid)}/comment`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      }).catch(() => null);
+      if (res && res.ok) {
+        input.value = "";   // posted — the draft is a comment now
+        await loadReviews();
+        renderReviewList();
+      } else {
+        status("Comment failed — not saved");
+      }
+    }
   });
 }
 
@@ -10350,6 +10638,7 @@ function init() {
   document.addEventListener("keydown", onSearchKey);
   document.addEventListener("keydown", onRowDeleteKey);
   boot("attention popover", initAttnPop);
+  boot("review queue", initReviewWin);
   el("b-pdf-attach").addEventListener("click", () => attachPdfFile());
   el("b-pdf_file").addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") { ev.preventDefault(); attachPdfFile(); }
@@ -10405,6 +10694,7 @@ function init() {
     else if (!el("pdfm-overlay").hidden) closePdfModal();
     else if (!el("md-overlay").hidden) closeMarkdownEditor(false);
     else if (!el("msrc-overlay").hidden) closeManualSource();
+    else if (!el("review-overlay").hidden) closeReviewWin();
     else if (!el("settings-overlay").hidden) closeSettings();
   });
 
