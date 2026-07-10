@@ -97,6 +97,8 @@
                 data-tip="Advanced Open Library search (by field)">Advanced Search</button>
         <span class="bar-spacer"></span>
         <span class="tool-count" id="checked-count"></span>
+        <button id="cloud-sync-btn" class="cad-btn tiny" type="button"
+                data-tip="Pull phone captures from the cloud now and push the catalog mirror (also runs automatically on the Settings interval)">Sync Cloud</button>
         <button id="sync-master-btn" class="cad-btn tiny" type="button"
                 data-tip="Sync the master list to Google Sheets">Sync Master List</button>
       </div>
@@ -488,6 +490,7 @@
                   <th data-col="acquired">Acq</th>
                   <th data-col="categories">Categories</th>
                   <th data-col="notes">Notes</th>
+                  <th class="col-whl" data-col="img" data-tip="Photos associated with the entry (click the icon to view in Info)">Img</th>
                   <th class="col-whl" data-col="copyright" data-tip="Copyright: registration (left) / renewal (right)">©</th>
                   <th class="col-whl" data-col="whl">WHL</th>
                   <th class="col-whl" data-col="ia">IA</th>
@@ -757,6 +760,7 @@
         <span class="tb-sep"></span>
         <select id="ocr-service" class="cad-input">
           <option value="tesseract">Tesseract (local)</option>
+          <option value="mistral">Mistral OCR</option>
           <option value="claude">Claude</option>
           <option value="textract">Amazon Textract</option>
           <option value="azure">Azure Document Intelligence</option>
@@ -979,6 +983,7 @@
               <label class="tool-label" for="set-ocr-service">Default service</label>
               <select id="set-ocr-service" class="cad-input">
                 <option value="tesseract">Tesseract (local)</option>
+                <option value="mistral">Mistral OCR</option>
                 <option value="claude">Claude</option>
                 <option value="textract">Amazon Textract</option>
                 <option value="azure">Azure Document Intelligence</option>
@@ -1011,6 +1016,7 @@
               <select id="set-ocr-key1" class="cad-input">
                 <option value="">&mdash;</option>
                 <option value="tesseract">Tesseract (local)</option>
+                <option value="mistral">Mistral OCR</option>
                 <option value="claude">Claude</option>
                 <option value="textract">Amazon Textract</option>
                 <option value="azure">Azure Document Intelligence</option>
@@ -1020,6 +1026,7 @@
               <select id="set-ocr-key2" class="cad-input">
                 <option value="">&mdash;</option>
                 <option value="tesseract">Tesseract (local)</option>
+                <option value="mistral">Mistral OCR</option>
                 <option value="claude">Claude</option>
                 <option value="textract">Amazon Textract</option>
                 <option value="azure">Azure Document Intelligence</option>
@@ -1029,6 +1036,7 @@
               <select id="set-ocr-key3" class="cad-input">
                 <option value="">&mdash;</option>
                 <option value="tesseract">Tesseract (local)</option>
+                <option value="mistral">Mistral OCR</option>
                 <option value="claude">Claude</option>
                 <option value="textract">Amazon Textract</option>
                 <option value="azure">Azure Document Intelligence</option>
@@ -1038,6 +1046,7 @@
               <select id="set-ocr-key4" class="cad-input">
                 <option value="">&mdash;</option>
                 <option value="tesseract">Tesseract (local)</option>
+                <option value="mistral">Mistral OCR</option>
                 <option value="claude">Claude</option>
                 <option value="textract">Amazon Textract</option>
                 <option value="azure">Azure Document Intelligence</option>
@@ -1047,6 +1056,7 @@
               <select id="set-ocr-key5" class="cad-input">
                 <option value="">&mdash;</option>
                 <option value="tesseract">Tesseract (local)</option>
+                <option value="mistral">Mistral OCR</option>
                 <option value="claude">Claude</option>
                 <option value="textract">Amazon Textract</option>
                 <option value="azure">Azure Document Intelligence</option>
@@ -1087,6 +1097,31 @@
             <div class="mf-actions">
               <button id="db-download" class="cad-btn" type="button">Download / update databases</button>
               <span class="tool-label" id="db-status-msg"></span>
+            </div>
+
+            <div class="settings-head" style="margin-top:16px">Phone capture (Supabase)</div>
+            <p class="settings-note">The Android capture app uploads book photos to a Supabase
+              project; syncing pulls pending captures, runs the photo pipeline (perspective
+              correction, compression, Mistral OCR, field extraction), and files each capture as
+              a manual entry with its photos attached. See <b>docs/cloud_capture_setup.md</b>.</p>
+            <div class="settings-rows">
+              <label class="tool-label" for="set-sb-url">Supabase project URL</label>
+              <input id="set-sb-url" class="cad-input" spellcheck="false"
+                     placeholder="https://xxxx.supabase.co" />
+              <label class="tool-label" for="set-sb-key">Supabase service key</label>
+              <input id="set-sb-key" class="cad-input" type="password" spellcheck="false" />
+              <label class="tool-label" for="set-mistral-key">Mistral API key</label>
+              <input id="set-mistral-key" class="cad-input" type="password" spellcheck="false"
+                     data-tip="Used for capture OCR + field extraction, and by the Mistral OCR service in the OCR tab" />
+              <label class="tool-label" for="set-cloud-minutes">Auto-sync interval (minutes, 0 = off)</label>
+              <input id="set-cloud-minutes" class="cad-input" type="number" min="0" max="1440" step="5" />
+              <label class="tool-label" for="set-cloud-delremote">Delete photos from the cloud after import</label>
+              <input id="set-cloud-delremote" type="checkbox"
+                     data-tip="Imported photos are kept locally under the data root; removing the cloud copies keeps the free storage tier from filling up" />
+            </div>
+            <div class="mf-actions">
+              <button id="cloud-test" class="cad-btn" type="button">Test connection</button>
+              <span class="tool-label" id="cloud-test-msg"></span>
             </div>
           </div>
           <div id="sec-paths" class="settings-sec">
@@ -1134,6 +1169,11 @@
         </div>
       </div>
     </div>
+  </div>
+
+  <!-- IMAGE LIGHTBOX (entry photos from the Info panel) -->
+  <div id="img-lightbox" class="overlay" hidden>
+    <img id="img-lightbox-img" alt="entry photo" />
   </div>
 
   <!-- EMBEDDED WEB VIEW (links open here instead of a new tab) -->

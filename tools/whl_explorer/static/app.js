@@ -46,8 +46,8 @@ const CHECKED_COLS = [
   ["city", "City"], ["language", "Language"], ["pages", "Pages"],
   ["condition", "Condition"], ["illustrations", "Illustrations"],
   ["price", "Price"], ["acquired", "Acquired"], ["categories", "Categories"],
-  ["notes", "Notes"], ["copyright", "Copyright"], ["whl", "WHL"],
-  ["ia", "IA"], ["ht", "HT"], ["mark", "Mark"],
+  ["notes", "Notes"], ["img", "Img"], ["copyright", "Copyright"],
+  ["whl", "WHL"], ["ia", "IA"], ["ht", "HT"], ["mark", "Mark"],
 ];
 
 const WHL_ROW_FIELDS = ["title", "subtitle", "authors", "year", "publisher",
@@ -99,6 +99,10 @@ const state = {
     // OCR services (Settings > OCR). Tesseract runs locally; Claude /
     // Textract / Azure / OpenAI need credentials — cloud processing is
     // TODO-verify until the user has API keys.
+    // Cloud capture (phone -> Supabase -> manual entries) + Mistral key,
+    // shared by the capture pipeline and the Mistral OCR service
+    supabaseUrl: "", supabaseKey: "", mistralKey: "",
+    cloudSyncMinutes: 0, cloudDeleteRemote: true,
     ocrService: "tesseract", ocrAzureEndpoint: "", ocrAzureKey: "",
     ocrTesseract: "", ocrClaudeKey: "", ocrClaudeModel: "",
     ocrAwsKey: "", ocrAwsSecret: "", ocrAwsRegion: "",
@@ -453,6 +457,7 @@ const ICONS = {
   export: _SVG('<path d="M8 10 V2.5 M4.8 5.5 L8 2.3 L11.2 5.5"/><path d="M3 9.5 v4 h10 v-4"/>'),
   check: _SVG('<path d="M2.8 8.6 L6.4 12 L13.2 4"/>'),
   target: _SVG('<circle cx="8" cy="8" r="4.4"/><path d="M8 1.5 v3 M8 11.5 v3 M1.5 8 h3 M11.5 8 h3"/>'),
+  image: _SVG('<rect x="2" y="3" width="12" height="10" rx="1"/><circle cx="5.8" cy="6.3" r="1.1"/><path d="M3.5 11.5 L7 8 l2.2 2.2 L11 8.5 l2.5 3"/>'),
   text: _SVG('<path d="M2.5 3.5 h11 M2.5 6.5 h11 M2.5 9.5 h8 M2.5 12.5 h10"/>'),
   sparkle: _SVG('<path d="M8 1.8 L9.5 6.5 L14.2 8 L9.5 9.5 L8 14.2 L6.5 9.5 L1.8 8 L6.5 6.5 Z"/><path d="M12.8 2 v2.6 M11.5 3.3 h2.6"/>'),
   fileup: _SVG('<path d="M3.5 2 h6 l3 3 v9 h-9 Z"/><path d="M9.5 2 v3 h3"/><path d="M8 11.5 V7.5 M6.2 9.2 L8 7.4 L9.8 9.2"/>'),
@@ -904,7 +909,7 @@ const UPLOAD_COLS = [
 // column per table stretches to absorb leftover width so the table never
 // leaves empty space on its right — the Title column by default.
 const LOCKED_COLS = {
-  checked: { copyright: 30, whl: 38, ia: 38, ht: 38, mark: 40 },
+  checked: { img: 30, copyright: 30, whl: 38, ia: 38, ht: 38, mark: 40 },
   whl: { status: 38, copyright: 30 },
   upload: { status: 38, action: 40 },
 };
@@ -1505,7 +1510,10 @@ function renderSettings() {
                          ["set-gs-sheet-id", "gsSpreadsheetId"],
                          ["set-gs-keyfile", "gsKeyFile"],
                          ["set-gs-sheet-name", "gsSheetName"],
-                         ["set-cloud-url", "cloudSearchUrl"]]) {
+                         ["set-cloud-url", "cloudSearchUrl"],
+                         ["set-sb-url", "supabaseUrl"],
+                         ["set-sb-key", "supabaseKey"],
+                         ["set-mistral-key", "mistralKey"]]) {
     const n = el(id);
     n.value = state.settings[k] || "";
     n.onchange = () => {
@@ -1513,6 +1521,33 @@ function renderSettings() {
       saveSettings();
     };
   }
+  // phone-capture sync interval + remote-cleanup toggle + connection test
+  const cm = el("set-cloud-minutes");
+  cm.value = state.settings.cloudSyncMinutes || 0;
+  cm.onchange = () => {
+    let v = parseInt(cm.value, 10);
+    if (!Number.isFinite(v)) v = 0;
+    state.settings.cloudSyncMinutes = Math.max(0, Math.min(1440, v));
+    cm.value = state.settings.cloudSyncMinutes;
+    saveSettings();
+  };
+  const cdr = el("set-cloud-delremote");
+  cdr.checked = state.settings.cloudDeleteRemote !== false;
+  cdr.onchange = () => {
+    state.settings.cloudDeleteRemote = cdr.checked;
+    saveSettings();
+  };
+  el("cloud-test").onclick = async () => {
+    el("cloud-test-msg").textContent = "Testing…";
+    try {
+      const r = await (await fetch("/api/cloudsync/test")).json();
+      el("cloud-test-msg").textContent = r.ok
+        ? "OK — captures table + storage bucket reachable"
+        : (r.error || "Failed");
+    } catch (e) {
+      el("cloud-test-msg").textContent = "Server unreachable";
+    }
+  };
   renderDbSync();
   // OCR rasterization width — the compression/shrink experiment knob
   const iw = el("set-ocr-width");
@@ -2123,7 +2158,7 @@ async function setRowLocalPdf(id, path) {
 // --- combined checked-books + manual-entries table -----------------------------
 
 function manualToBook(e) {
-  return {
+  const book = {
     title: e.title || "", subtitle: e.subtitle || "", author: e.author || "",
     year: e.year || "", edition: e.edition || "", volume: e.volume || "",
     publisher: e.publisher || "", city: e.city || "", language: e.language || "",
@@ -2131,6 +2166,10 @@ function manualToBook(e) {
     illustrations: e.illustrations || "", price: e.price || "",
     acquired: "", categories: e.categories || "", notes: e.notes || "",
   };
+  // non-column metadata (phone captures): shown in the Info panel
+  if (e.extra && Object.keys(e.extra).length) book.extra = e.extra;
+  if (e.images && e.images.length) book.images = e.images;
+  return book;
 }
 
 function migrateVerify(v) {
@@ -2771,12 +2810,23 @@ function checkedRowTr(row, cmode, opts) {
     <td>${row.kind === "manual" ? "MANUAL"
       : row.source === "ch_library" ? "MASTER" : esc(row.source.toUpperCase())}</td>
     ${BOOK_COLS.map(cell).join("\n      ")}
+    <td class="col-whl">${imgCell(row)}</td>
     <td class="col-whl">${copyrightCell(row)}</td>
     <td class="col-whl">${whlBadge(row)}</td>
     <td class="col-whl">${iaCell(row)}</td>
     <td class="col-whl">${scanBadge(row, "hathitrust")}</td>
     <td class="col-whl">${markCell(row)}</td>`;
   return tr;
+}
+
+// tiny image marker: present when the entry has photos; click -> Info panel
+function imgCell(row) {
+  const imgs = (row.book && row.book.images) || [];
+  if (!imgs.length) return "";
+  const n = imgs.length;
+  return `<span class="img-flag" data-imginfo="1" ` +
+    `data-tip="${n} photo${n > 1 ? "s" : ""} — click to view in Info">` +
+    `${ICONS.image}</span>`;
 }
 
 // build a set-header <tr>: colored tag, drop-down arrow, base title + (N)
@@ -2798,6 +2848,7 @@ function checkedSetHeaderTr(item, cmode) {
   tr.innerHTML = `
     <td class="set-src"><span class="set-tag" title="Multi-volume set"></span></td>
     ${cells}
+    <td class="col-whl"></td>
     <td class="col-whl"></td>
     <td class="col-whl"></td>
     <td class="col-whl"></td>
@@ -2896,6 +2947,16 @@ function onCheckedClick(ev) {
   if (t) {
     if (t.dataset.mdel !== undefined) deleteManual(t.dataset.mdel);
     else if (t.dataset.unchk !== undefined) uncheckRow(t.dataset.unchk);
+    return;
+  }
+  // the Img marker: open this entry's photos in the Info panel
+  const imf = ev.target.closest("[data-imginfo]");
+  if (imf) {
+    const tr = imf.closest("tr");
+    if (tr && tr.dataset.rowId) {
+      state.editTarget = { kind: "row", id: String(tr.dataset.rowId) };
+      switchPaneTab("pane-info");
+    }
     return;
   }
   // search mode: clicking a title looks it up on Open Library
@@ -5863,6 +5924,25 @@ function renderInfoPane() {
     if (v) h += infoRow(label, esc(v));
   }
   h += `</div>`;
+  // non-column metadata captured with the entry (phone captures etc.)
+  const extra = b.extra || {};
+  if (Object.keys(extra).length) {
+    h += `<div class="info-sec"><div class="info-sec-h">Extra</div>`;
+    for (const k of Object.keys(extra).sort())
+      h += infoRow(k.replace(/_/g, " "), esc(extra[k]));
+    h += `</div>`;
+  }
+  // associated photos: thumbnails, click for full size
+  const imgs = b.images || [];
+  if (imgs.length) {
+    h += `<div class="info-sec"><div class="info-sec-h">Photos</div><div class="info-imgs">`;
+    for (const p of imgs) {
+      const url = "/api/capture/image?path=" + encodeURIComponent(p);
+      h += `<img class="info-thumb" loading="lazy" src="${esc(url)}" ` +
+        `data-lightbox="${esc(url)}" alt="entry photo">`;
+    }
+    h += `</div></div>`;
+  }
   if (row) {                                          // derived status needs a checked row
     h += `<div class="info-sec"><div class="info-sec-h">Status</div>`;
     h += infoStatusRow("WHL", infoWhlStatus(row));
@@ -6084,6 +6164,37 @@ async function loadManual() {
   } catch (e) { state.manual = []; }
   updateCheckedCount();
   renderChecked();
+}
+
+// --- phone-capture cloud sync (Supabase) ---------------------------------------
+// The server pulls pending captures, runs the photo pipeline, and files them as
+// manual entries; this triggers a run and refreshes the table when it finishes.
+let _cloudPoll = null;
+
+async function runCloudSync() {
+  const btn = el("cloud-sync-btn");
+  try {
+    const r = await (await fetch("/api/cloudsync/run", { method: "POST" })).json();
+    if (!r.ok) { status("CLOUD SYNC :: " + (r.error || "failed to start")); return; }
+  } catch (e) { status("CLOUD SYNC :: server unreachable"); return; }
+  btn.disabled = true;
+  status("CLOUD SYNC :: RUNNING");
+  clearInterval(_cloudPoll);
+  _cloudPoll = setInterval(async () => {
+    let st = null;
+    try { st = await (await fetch("/api/cloudsync/status")).json(); }
+    catch (e) { return; }                      // transient; keep polling
+    if (st.running) return;
+    clearInterval(_cloudPoll);
+    _cloudPoll = null;
+    btn.disabled = false;
+    const r = st.last_result || {};
+    if (r.imported) await loadManual();        // new entries -> refresh the table
+    status(r.ok === false
+      ? "CLOUD SYNC FAILED :: " + (r.error || (r.errors || []).join("; ") || "?")
+      : `CLOUD SYNC :: ${r.imported || 0} imported / ${r.books_pushed || 0} books pushed` +
+        ((r.errors || []).length ? ` / ${r.errors.length} errors` : ""));
+  }, 1500);
 }
 
 async function deleteManualById(id) {
@@ -7472,15 +7583,17 @@ async function ocrSetQuality(v) {
 // is the chosen OCR service configured? (Settings > OCR)
 // services the server can actually run today; azure/openai queue as stubs
 // (their processors are TODO until credentials exist)
-const OCR_RUNNABLE = { tesseract: true, claude: true, textract: true };
+const OCR_RUNNABLE = { tesseract: true, mistral: true, claude: true, textract: true };
 const OCR_SERVICE_LABELS = {
-  tesseract: "Tesseract (local)", claude: "Claude", textract: "Amazon Textract",
+  tesseract: "Tesseract (local)", mistral: "Mistral OCR", claude: "Claude",
+  textract: "Amazon Textract",
   azure: "Azure Document Intelligence", openai: "OpenAI vision",
 };
 
 function ocrServiceReady(svc) {
   const s = state.settings;
   if (svc === "tesseract") return true;   // server falls back to the default install
+  if (svc === "mistral") return !!s.mistralKey;   // shared with the capture pipeline
   if (svc === "claude") return !!s.ocrClaudeKey;
   if (svc === "textract") return !!(s.ocrAwsKey && s.ocrAwsSecret);
   if (svc === "azure") return !!(s.ocrAzureEndpoint && s.ocrAzureKey);
@@ -7526,6 +7639,7 @@ async function ocrQueuePages(bid, pages) {
         claude_key: s.ocrClaudeKey || "", claude_model: s.ocrClaudeModel || "",
         aws_key: s.ocrAwsKey || "", aws_secret: s.ocrAwsSecret || "",
         aws_region: s.ocrAwsRegion || "",
+        mistral_key: s.mistralKey || "",
       }),
     });
     const data = await res.json().catch(() => ({}));
@@ -8273,9 +8387,23 @@ function initWebView() {
     if (ev.target === el("ia-overlay")) closeIaViewer();
   });
   document.addEventListener("keydown", onIaViewerKey);   // arrow-key paging
+  // entry-photo lightbox: any Info-panel thumbnail opens full size
+  document.addEventListener("click", (ev) => {
+    const th = ev.target.closest("[data-lightbox]");
+    if (!th) return;
+    el("img-lightbox-img").src = th.dataset.lightbox;
+    el("img-lightbox").hidden = false;
+  });
+  el("img-lightbox").addEventListener("click", () => {
+    el("img-lightbox").hidden = true;
+    el("img-lightbox-img").src = "";
+  });
   document.addEventListener("keydown", (ev) => {
     if (ev.key !== "Escape") return;
-    if (!el("ia-overlay").hidden) closeIaViewer();
+    if (!el("img-lightbox").hidden) {
+      el("img-lightbox").hidden = true;
+      el("img-lightbox-img").src = "";
+    } else if (!el("ia-overlay").hidden) closeIaViewer();
     else if (!el("webview-overlay").hidden) closeWebView();
   });
 }
@@ -8373,6 +8501,7 @@ function init() {
 
   // checked-tab find bar
   el("sync-master-btn").addEventListener("click", syncMasterList);
+  el("cloud-sync-btn").addEventListener("click", runCloudSync);
   el("checked-search").addEventListener("input", () => {
     state.checkedFilter = el("checked-search").value.trim();
     state.olOverride = null;

@@ -1627,6 +1627,22 @@ form.orig-view .cad-input {
 .info-dot.warn { background: var(--amber); }
 .info-dot.err { background: var(--red); }
 
+/* entry photos: Img column marker, Info-panel thumbnails, full-size lightbox */
+.img-flag { color: var(--cyan); cursor: pointer; display: inline-flex; vertical-align: middle; }
+.img-flag:hover { filter: brightness(1.3); }
+.info-imgs { display: flex; flex-wrap: wrap; gap: 6px; }
+.info-thumb {
+  width: 76px; height: 100px; object-fit: cover; cursor: zoom-in;
+  border: 1px solid var(--face-sh2); background: var(--face-hi);
+}
+.info-thumb:hover { outline: 2px solid var(--cyan); }
+#img-lightbox { display: flex; align-items: center; justify-content: center; cursor: zoom-out; }
+#img-lightbox[hidden] { display: none; }
+#img-lightbox img {
+  max-width: 92vw; max-height: 92vh;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5); background: #fff;
+}
+
 /* field provenance: yellow = auto-populated, green = hand-typed */
 .cad-input.prov-auto { background: #fdf3c4; color: #1b1b1b; }
 .cad-input.prov-manual { background: #e0f5d8; color: #1b1b1b; }

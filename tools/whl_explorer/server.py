@@ -35,9 +35,11 @@ from flask import Flask, Response, abort, jsonify, render_template, request, sen
 
 # Make tools/ importable for the shared helpers.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import capture_pipeline as capture  # noqa: E402
 import catalog_checks as checks  # noqa: E402
 import copyright_registration as copyreg  # noqa: E402
 import libcommon as lib  # noqa: E402
+import supabase_sync as sbase  # noqa: E402
 import ol_client  # noqa: E402
 import scan_search  # noqa: E402
 import whl_client  # noqa: E402
@@ -711,10 +713,18 @@ def _ocr_textract(png: bytes, cfg: dict) -> str:
                      if b.get("BlockType") == "LINE")
 
 
+def _ocr_mistral(png: bytes, cfg: dict) -> str:
+    key = (cfg.get("mistral_key") or "").strip()
+    if not key:
+        raise RuntimeError("Mistral API key not configured (Settings > OCR)")
+    return capture.mistral_ocr(png, key)
+
+
 _OCR_SERVICES = {
     "tesseract": _ocr_tesseract,
     "claude": _ocr_claude,
     "textract": _ocr_textract,
+    "mistral": _ocr_mistral,
 }
 
 
@@ -790,7 +800,8 @@ def api_ocr_run():
         "pages": pages, "done": 0, "errors": 0, "width": width,
         "status": "running",
         "cfg": {k: p.get(k) for k in ("tesseract", "claude_key", "claude_model",
-                                      "aws_key", "aws_secret", "aws_region")},
+                                      "aws_key", "aws_secret", "aws_region",
+                                      "mistral_key")},
     }
     with _ocr_jobs_lock:
         _ocr_jobs[job_id] = job
@@ -1208,12 +1219,38 @@ def api_manual_list():
     return jsonify(out)
 
 
+def _clean_extra(v) -> dict:
+    """Arbitrary non-column bibliographic facts: a flat str->str dict."""
+    if not isinstance(v, dict):
+        return {}
+    return {str(k).strip()[:64]: str(x)[:500] for k, x in v.items()
+            if str(k).strip() and str(x or "").strip()}
+
+
+def _clean_images(v) -> list[str]:
+    """Entry image paths: DATA_ROOT-relative, image suffixes only."""
+    if not isinstance(v, list):
+        return []
+    out = []
+    for p in v:
+        s = str(p or "").replace("\\", "/").strip().lstrip("/")
+        if not s or ".." in s:
+            continue
+        if s.lower().rsplit(".", 1)[-1] in ("jpg", "jpeg", "png", "webp"):
+            out.append(s)
+    return out
+
+
 @app.route("/api/manual", methods=["POST"])
 def api_manual_add():
     payload = request.get_json(silent=True) or {}
     entry = {f: str(payload.get(f, "") or "").strip() for f in lib.MANUAL_ENTRY_FIELDS}
     if not entry["title"]:
         return jsonify({"ok": False, "error": "TITLE IS REQUIRED"}), 400
+    if payload.get("extra"):
+        entry["extra"] = _clean_extra(payload.get("extra"))
+    if payload.get("images"):
+        entry["images"] = _clean_images(payload.get("images"))
 
     entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
     entry["id"] = lib.gen_id(set(entries))
@@ -1240,6 +1277,11 @@ def api_manual_update(entry_id: str):
     for f in lib.MANUAL_ENTRY_FIELDS:
         if f in payload:
             e[f] = str(payload[f] or "").strip()
+    # non-column metadata: only replaced when explicitly sent (survives edits)
+    if "extra" in payload:
+        e["extra"] = _clean_extra(payload.get("extra"))
+    if "images" in payload:
+        e["images"] = _clean_images(payload.get("images"))
     if not e.get("title"):
         return jsonify({"ok": False, "error": "TITLE IS REQUIRED"}), 400
     if not payload.get("_preserve"):
@@ -2107,6 +2149,226 @@ def api_scans():
     return jsonify(scan_search.search_scans(title, author or None, year or None))
 
 
+# --- cloud capture sync (phone -> Supabase -> manual entries) --------------------
+# The Android capture app drops photo sets into Supabase; this engine pulls
+# pending captures, runs the photo pipeline (perspective/compress/OCR/extract),
+# and files each capture as a manual entry with its processed images attached.
+# The checked/manual catalog is mirrored one-way into the cloud `books` table.
+
+CAPTURES_DIR = lib.DATA_ROOT / "captures"
+_cloudsync_lock = threading.Lock()
+_cloudsync = {"running": False, "last_run": "", "last_error": "", "last_result": None}
+_autosync_last = 0.0
+
+
+def _cloud_cfg() -> dict | None:
+    s = _client_settings()
+    url = str(s.get("supabaseUrl") or "").strip()
+    key = str(s.get("supabaseKey") or "").strip()
+    return {"url": url, "key": key} if url and key else None
+
+
+def _capture_note(cap: dict, errors: list[str]) -> str:
+    bits = ["Captured via phone"]
+    if cap.get("device"):
+        bits.append(f"({cap['device']})")
+    if cap.get("created_at"):
+        bits.append(str(cap["created_at"])[:19])
+    note = " ".join(bits)
+    if cap.get("note"):
+        note += "\n" + str(cap["note"])
+    if errors:
+        note += "\n" + "; ".join(errors)
+    return note
+
+
+def _import_capture(cfg: dict, cap: dict, mistral_key: str,
+                    delete_remote: bool) -> str:
+    """One pending capture -> a manual entry. Returns 'imported' | 'skipped'."""
+    cap_id = re.sub(r"[^A-Za-z0-9-]", "", str(cap.get("id") or ""))[:64]
+    if not cap_id:
+        return "skipped"
+    entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+    if any(e.get("capture_id") == cap_id for e in entries.values()):
+        sbase.mark_capture(cfg, cap["id"], "imported")   # already here: idempotent
+        return "skipped"
+    photo_paths = cap.get("photos") or []
+    if isinstance(photo_paths, str):
+        try:
+            photo_paths = json.loads(photo_paths)
+        except json.JSONDecodeError:
+            photo_paths = []
+    raw_photos = [sbase.download_photo(cfg, p) for p in photo_paths]
+    result = capture.process_capture(raw_photos, mistral_key)
+
+    cdir = CAPTURES_DIR / cap_id
+    cdir.mkdir(parents=True, exist_ok=True)
+    images = []
+    for i, jpg in enumerate(result["photos"], 1):
+        (cdir / f"photo_{i}.jpg").write_bytes(jpg)
+        images.append(f"captures/{cap_id}/photo_{i}.jpg")
+    if result["ocr_text"]:
+        (cdir / "ocr.txt").write_text(result["ocr_text"], "utf-8", errors="replace")
+
+    fields = result["fields"]
+    entry = {f: "" for f in lib.MANUAL_ENTRY_FIELDS}
+    for f in ("title", "subtitle", "author", "publisher", "city",
+              "year", "edition", "volume", "language"):
+        entry[f] = str(fields.get(f) or "").strip()
+    if not entry["title"]:                        # never lose a capture
+        entry["title"] = f"(untitled capture {cap_id[:8]})"
+    entry["notes"] = _capture_note(cap, result["errors"])
+    entry["extra"] = _clean_extra(result["extra"])
+    entry["images"] = images
+    entry["capture_id"] = cap_id
+    entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+    entry["id"] = lib.gen_id(set(entries))
+    entry["created_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    entry["checks"] = _entry_checks(entry)
+    entries[entry["id"]] = entry
+    lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+
+    sbase.mark_capture(cfg, cap["id"], "imported")
+    if delete_remote:
+        try:
+            sbase.delete_photos(cfg, photo_paths)
+        except sbase.SyncError:
+            pass                                   # cleanup is best-effort
+    return "imported"
+
+
+def _books_mirror_rows() -> list[dict]:
+    """The whole catalog (checked + manual) as cloud `books` upsert rows."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    rows = []
+    state = lib.load_json(lib.CLIENT_STATE_PATH, {}) or {}
+    for pair in (state.get("checked") or []):
+        try:
+            key, val = pair[0], pair[1]
+        except (TypeError, IndexError):
+            continue
+        book = (val or {}).get("book") or {}
+        if book:
+            rows.append({"key": str(key), "data": book, "updated_at": now})
+    for eid, e in (lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}).items():
+        data = {f: e.get(f, "") for f in lib.MANUAL_ENTRY_FIELDS}
+        for k in ("extra", "images"):
+            if e.get(k):
+                data[k] = e[k]
+        rows.append({"key": f"manual:{eid}", "data": data, "updated_at": now})
+    return rows
+
+
+def _cloud_sync_run() -> dict:
+    """One full sync pass: import pending captures, push the books mirror."""
+    cfg = _cloud_cfg()
+    if not cfg:
+        return {"ok": False, "error": "Supabase URL/key not configured"}
+    with _cloudsync_lock:
+        if _cloudsync["running"]:
+            return {"ok": False, "error": "sync already running"}
+        _cloudsync["running"] = True
+    s = _client_settings()
+    mistral_key = str(s.get("mistralKey") or "").strip()
+    delete_remote = s.get("cloudDeleteRemote") is not False
+    imported = skipped = 0
+    errors: list[str] = []
+    try:
+        for cap in sbase.list_pending_captures(cfg):
+            try:
+                if _import_capture(cfg, cap, mistral_key, delete_remote) == "imported":
+                    imported += 1
+                else:
+                    skipped += 1
+            except Exception as exc:      # one bad capture must not stop the rest
+                errors.append(f"capture {str(cap.get('id'))[:8]}: {exc}")
+        pushed = 0
+        try:
+            pushed = sbase.push_books(cfg, _books_mirror_rows())
+        except sbase.SyncError as exc:
+            errors.append(f"books mirror: {exc}")
+        result = {"ok": not errors, "imported": imported, "skipped": skipped,
+                  "books_pushed": pushed, "errors": errors}
+    except sbase.SyncError as exc:
+        result = {"ok": False, "error": str(exc), "imported": imported,
+                  "errors": errors}
+    finally:
+        with _cloudsync_lock:
+            _cloudsync["running"] = False
+            _cloudsync["last_run"] = datetime.now(timezone.utc).isoformat(
+                timespec="seconds")
+            _cloudsync["last_result"] = result
+            _cloudsync["last_error"] = (result.get("error", "")
+                                        or "; ".join(result.get("errors") or []))
+    return result
+
+
+def _cloud_autosync_loop() -> None:
+    """Background interval sync; the interval is re-read every tick so a
+    settings change applies without a restart (0 = off)."""
+    global _autosync_last
+    import time
+    while True:
+        time.sleep(30)
+        try:
+            minutes = int(_client_settings().get("cloudSyncMinutes") or 0)
+        except (TypeError, ValueError):
+            minutes = 0
+        if minutes <= 0 or not _cloud_cfg():
+            continue
+        if time.time() - _autosync_last >= minutes * 60:
+            _autosync_last = time.time()
+            try:
+                _cloud_sync_run()
+            except Exception:
+                pass
+
+
+@app.route("/api/cloudsync/run", methods=["POST"])
+def api_cloudsync_run():
+    """Manual sync trigger (the Catalogs-tab button). Runs in the background;
+    poll /api/cloudsync/status for the outcome."""
+    if not _cloud_cfg():
+        return jsonify({"ok": False, "error": "Supabase URL/key not configured"})
+    with _cloudsync_lock:
+        already = _cloudsync["running"]
+    if not already:
+        threading.Thread(target=_cloud_sync_run, daemon=True).start()
+    return jsonify({"ok": True, "started": not already})
+
+
+@app.route("/api/cloudsync/status")
+def api_cloudsync_status():
+    with _cloudsync_lock:
+        out = dict(_cloudsync)
+    out["configured"] = bool(_cloud_cfg())
+    return jsonify(out)
+
+
+@app.route("/api/cloudsync/test")
+def api_cloudsync_test():
+    cfg = _cloud_cfg()
+    if not cfg:
+        return jsonify({"ok": False, "error": "Supabase URL/key not configured"})
+    return jsonify(sbase.test_connection(cfg))
+
+
+@app.route("/api/capture/image")
+def api_capture_image():
+    """Serve an entry-associated image (DATA_ROOT-relative path)."""
+    p = _resolve_local(request.args.get("path") or "")
+    if (p is None or not p.is_file()
+            or p.suffix.lower() not in (".jpg", ".jpeg", ".png", ".webp")):
+        abort(404)
+    try:
+        p.relative_to(lib.DATA_ROOT.resolve())     # images never leave the data root
+    except ValueError:
+        abort(404)
+    mime = "image/png" if p.suffix.lower() == ".png" else \
+        "image/webp" if p.suffix.lower() == ".webp" else "image/jpeg"
+    return send_file(str(p), mimetype=mime, conditional=True)
+
+
 def _relativize_data_path(raw: str) -> str:
     """An absolute path that lives under the writable data root is rewritten
     to a DATA_ROOT-relative posix path so it survives the app being moved
@@ -2161,6 +2423,8 @@ if __name__ == "__main__":
                         _drives()),
         daemon=True,
     ).start()
+    # Cloud capture autosync (interval read from settings each tick; 0 = off).
+    threading.Thread(target=_cloud_autosync_loop, daemon=True).start()
     # WHL_PORT lets a second instance run on another port (a distinct origin,
     # so its localStorage/client-state can't collide with the main one) — used
     # to test against a throwaway WHL_DATA_ROOT without touching live state.
