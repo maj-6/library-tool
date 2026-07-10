@@ -2726,6 +2726,29 @@ def _run_db_download(name, url, rel):
         log.error("database download failed: %s", name, exc_info=e)
 
 
+@app.route("/api/ocr/tesseract")
+def api_tesseract_check():
+    """Is local (Tesseract) OCR available? The first-run wizard and the OCR
+    settings surface this. Checks the configured path, the Windows default, and
+    PATH; reports the version when found."""
+    import shutil
+    import subprocess
+    cfg_path = str(_client_settings().get("ocrTesseract") or "").strip()
+    candidates = [c for c in (cfg_path, _TESSERACT_DEFAULT) if c]
+    found = next((c for c in candidates if Path(c).is_file()), None) \
+        or shutil.which("tesseract")
+    if not found:
+        return jsonify({"ok": True, "installed": False, "path": "", "version": ""})
+    version = ""
+    try:
+        out = subprocess.run([found, "--version"], capture_output=True, text=True,
+                             timeout=8)
+        version = (out.stdout or out.stderr or "").splitlines()[0].strip()
+    except Exception as exc:                 # found the file but couldn't run it
+        log.warning("tesseract --version failed: %s", exc)
+    return jsonify({"ok": True, "installed": True, "path": found, "version": version})
+
+
 @app.route("/api/db/status")
 def api_db_status():
     urls = _db_urls()

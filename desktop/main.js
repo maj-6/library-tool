@@ -33,6 +33,13 @@ ipcMain.on("win:toggle-maximize", () => {
 });
 ipcMain.on("win:close", () => mainWindow && mainWindow.close());
 
+// open a web link in the OS browser (the renderer routes external links here so
+// they don't get trapped in the app). Re-validate the scheme: shell.openExternal
+// will happily launch file:, smb:, mailto: handlers, so only http(s) passes.
+ipcMain.on("win:open-external", (_e, url) => {
+  if (typeof url === "string" && /^https?:\/\//i.test(url)) shell.openExternal(url);
+});
+
 // a free loopback port so multiple installs / a running dev server never clash
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -133,6 +140,37 @@ function createWindow() {
   mainWindow.on("closed", () => { mainWindow = null; });
 }
 
+// Auto-update: check GitHub Releases (maj-6/library-tool) once at startup,
+// download in the background, and offer a restart when it is ready. Offline or
+// rate-limited just means "no update today" — never a dialog.
+function startUpdateCheck() {
+  if (isDev) return;                       // dev runs from source
+  let updater;
+  try {
+    updater = require("electron-updater").autoUpdater;
+  } catch (e) {
+    return;                                // packaged without the dep: skip
+  }
+  updater.autoDownload = true;
+  updater.on("error", (err) => console.error("[updater]", err && err.message));
+  updater.on("update-downloaded", (info) => {
+    // "Later" is the default: this dialog pops at an unpredictable moment, and
+    // a buffered Enter from mid-typing must not quit the app into an installer.
+    dialog.showMessageBox(mainWindow, {
+      type: "info",
+      buttons: ["Restart now", "Later"],
+      defaultId: 1,
+      cancelId: 1,
+      title: "Library Tool",
+      message: `Library Tool ${info.version} is ready to install.`,
+      detail: "It installs when the app restarts. Your catalogue and settings are untouched.",
+    }).then(({ response }) => {
+      if (response === 0) updater.quitAndInstall();
+    });
+  });
+  updater.checkForUpdates().catch(() => { /* offline; next launch tries again */ });
+}
+
 app.whenReady().then(async () => {
   try {
     await startSidecar();
@@ -142,6 +180,7 @@ app.whenReady().then(async () => {
     return;
   }
   createWindow();
+  startUpdateCheck();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });

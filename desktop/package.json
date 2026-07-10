@@ -9,9 +9,13 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "build:sidecar": "python -m PyInstaller --clean --noconfirm --distpath dist-sidecar --workpath build-sidecar sidecar/whl_explorer.spec",
+    "build:sidecar": "python3 -m PyInstaller --clean --noconfirm --distpath dist-sidecar --workpath build-sidecar sidecar/whl_explorer.spec",
     "pack": "electron-builder --dir",
-    "dist": "npm run build:sidecar && electron-builder --win"
+    "dist": "npm run build:sidecar && electron-builder --win",
+    "release": "npm run dist && echo Now: gh release create v%npm_package_version% release\\LibraryTool-Setup-%npm_package_version%.exe release\\latest.yml --title v%npm_package_version%"
+  },
+  "dependencies": {
+    "electron-updater": "^6.3.9"
   },
   "devDependencies": {
     "electron": "^31.7.7",
@@ -38,17 +42,29 @@
     ],
     "win": {
       "target": [
-        { "target": "msi", "arch": ["x64"] }
+        { "target": "nsis", "arch": ["x64"] }
       ],
       "icon": "build/icon.ico",
-      "artifactName": "LibraryTool-${version}.${ext}"
+      "artifactName": "LibraryTool-Setup-${version}.${ext}"
     },
-    "msi": {
+    "nsis": {
       "oneClick": false,
       "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "installerSidebar": "build/installerSidebar.bmp",
+      "uninstallerSidebar": "build/installerSidebar.bmp",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
       "runAfterFinish": true,
       "createDesktopShortcut": true,
-      "createStartMenuShortcut": true
+      "createStartMenuShortcut": true,
+      "shortcutName": "Library Tool",
+      "deleteAppDataOnUninstall": false
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "maj-6",
+      "repo": "library-tool"
     }
   }
 }
