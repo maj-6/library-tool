@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Downloads · Library Tool</title>
+<link rel="icon" href="assets/icon.png" />
+<link rel="stylesheet" href="assets/site.css" />
+</head>
+<body>
+<header class="site">
+  <div class="wrap">
+    <img src="assets/icon.png" alt="" />
+    <div class="name">Library Tool<small>World Herb Library</small></div>
+    <nav class="site">
+      <a href="index.html">About</a>
+      <a href="browse.html">Library</a>
+      <a href="downloads.html" aria-current="page">Downloads</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <h1>Downloads</h1>
+  <p class="lede">The cataloguing workbench, and the phone app that feeds it.</p>
+
+  <div id="releases"><p class="muted">Loading…</p></div>
+
+  <h2>Building from source</h2>
+  <p>
+    The desktop app is a Flask backend in an Electron shell; the capture app is
+    an Android Studio project. Both build from the repository —
+    <span class="mono">desktop/README.md</span> and
+    <span class="mono">android/BookCapture/README.md</span> have the steps.
+  </p>
+
+  <h2>What the desktop app needs</h2>
+  <p>
+    Tesseract, if you want to OCR image-only scans. API keys, if you want cloud
+    OCR or the phone-capture pipeline. Neither is required to catalogue, check
+    copyright, or read a scan that already carries a text layer. Everything is
+    optional and everything is entered in Settings.
+  </p>
+</main>
+
+<footer class="site">
+  <div class="wrap">Library Tool · a World Herb Library project</div>
+</footer>
+
+<script src="assets/config.js" onerror="void 0"></script>
+<script type="module" src="assets/downloads.js"></script>
+</body>
+</html>

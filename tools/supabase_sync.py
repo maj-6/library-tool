@@ -106,6 +106,44 @@ def delete_photos(cfg: dict, object_paths: list[str]) -> None:
                                                for p in object_paths]}).encode())
 
 
+def upload_object(cfg: dict, bucket: str, object_path: str, data: bytes,
+                  content_type: str = "application/octet-stream",
+                  upsert: bool = True) -> str:
+    """Put bytes into a bucket; returns the object path.
+
+    Upsert by default, so a retried publish replaces rather than 409s. The
+    timeout is generous on purpose: a 130 MB volume over a domestic uplink is
+    minutes, not seconds.
+    """
+    url, _, headers = _cfg(cfg)
+    path = urllib.parse.quote(str(object_path).lstrip("/"))
+    headers = dict(headers, **{"Content-Type": content_type,
+                               "x-upsert": "true" if upsert else "false"})
+    _request("POST", f"{url}/storage/v1/object/{bucket}/{path}",
+             headers, data, timeout=1800.0)
+    return str(object_path).lstrip("/")
+
+
+def public_url(cfg: dict, bucket: str, object_path: str) -> str:
+    """The unauthenticated URL of an object in a PUBLIC bucket."""
+    url = str(cfg.get("url") or "").strip().rstrip("/")
+    return f"{url}/storage/v1/object/public/{bucket}/" + \
+        urllib.parse.quote(str(object_path).lstrip("/"))
+
+
+# --- volumes: the public library the website browses -------------------------------
+
+def upsert_volume(cfg: dict, row: dict) -> None:
+    """Insert or update one volume, keyed on its slug."""
+    _rest(cfg, "POST", "volumes?on_conflict=slug", [row],
+          prefer="resolution=merge-duplicates,return=minimal")
+
+
+def list_volumes(cfg: dict, limit: int = 200) -> list[dict]:
+    rows = _rest(cfg, "GET", f"volumes?select=*&order=title.asc&limit={int(limit)}")
+    return rows or []
+
+
 # --- books mirror ----------------------------------------------------------------
 
 def push_books(cfg: dict, rows: list[dict], chunk: int = 200) -> int:

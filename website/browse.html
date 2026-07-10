@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Library · Library Tool</title>
+<link rel="icon" href="assets/icon.png" />
+<link rel="stylesheet" href="assets/site.css" />
+</head>
+<body>
+<header class="site">
+  <div class="wrap">
+    <img src="assets/icon.png" alt="" />
+    <div class="name">Library Tool<small>World Herb Library</small></div>
+    <nav class="site">
+      <a href="index.html">About</a>
+      <a href="browse.html" aria-current="page">Library</a>
+      <a href="downloads.html">Downloads</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <h1>Library</h1>
+  <p class="lede">Public-domain works on botany and herbal medicine, scanned in full.</p>
+
+  <div id="offline" class="note" hidden>
+    Showing a local fixture: no cloud is configured for this copy of the site.
+  </div>
+
+  <form class="controls" id="controls" role="search">
+    <input type="search" id="q" name="q" placeholder="Search titles, authors, subjects…"
+           autocomplete="off" aria-label="Search the library" />
+    <label for="from">Year</label>
+    <input type="number" id="from" name="from" placeholder="from" min="1400" max="2100" />
+    <input type="number" id="to" name="to" placeholder="to" min="1400" max="2100" />
+    <label for="sort">Sort</label>
+    <select id="sort" name="sort">
+      <option value="title">Title</option>
+      <option value="year">Year, oldest</option>
+      <option value="year-desc">Year, newest</option>
+      <option value="recent">Recently added</option>
+    </select>
+  </form>
+
+  <div class="count" id="count" aria-live="polite">Loading…</div>
+
+  <ol class="volumes" id="results"></ol>
+
+  <div class="pager" id="pager" hidden>
+    <button class="btn" id="prev" type="button">Previous</button>
+    <span class="spacer"></span>
+    <span class="mono muted" id="page"></span>
+    <span class="spacer"></span>
+    <button class="btn" id="next" type="button">Next</button>
+  </div>
+</main>
+
+<footer class="site">
+  <div class="wrap">Library Tool · a World Herb Library project</div>
+</footer>
+
+<script src="assets/config.js" onerror="void 0"></script>
+<script type="module" src="assets/browse.js"></script>
+</body>
+</html>

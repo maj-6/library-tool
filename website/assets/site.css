@@ -1,0 +1,195 @@
+/* Library Tool — the public site.
+   Light only, low chroma, printed-catalogue idiom: the same restraint the
+   desktop app settled on. No build step, no framework, no webfonts. */
+
+:root {
+  --paper: #fbfaf7;
+  --card: #ffffff;
+  --rule: #d9d5cc;
+  --rule-soft: #eae7e0;
+  --ink: #26241f;
+  --ink-soft: #6b675e;
+  --ink-faint: #928d82;
+  --accent: #3f5f52;      /* muted sage, from the app's Sage theme */
+  --accent-ink: #2c4438;
+  --warn-bg: #f6f1e2;
+}
+
+* { box-sizing: border-box; }
+
+html, body { margin: 0; }
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font: 16px/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap { max-width: 960px; margin: 0 auto; padding: 0 20px; }
+
+/* --- masthead --- */
+header.site {
+  border-bottom: 3px double var(--rule);
+  background: var(--card);
+}
+header.site .wrap {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding-top: 16px;
+  padding-bottom: 16px;
+}
+header.site img { width: 42px; height: 42px; display: block; }
+header.site .name {
+  font-size: 20px;
+  font-weight: bold;
+  letter-spacing: 0.6px;
+  margin-right: auto;
+}
+header.site .name small {
+  display: block;
+  font: 11px/1.4 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  letter-spacing: 1px;
+  color: var(--ink-faint);
+  text-transform: uppercase;
+  font-weight: normal;
+}
+nav.site a {
+  color: var(--ink-soft);
+  text-decoration: none;
+  font: 13px/1 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  margin-left: 18px;
+  padding-bottom: 3px;
+  border-bottom: 2px solid transparent;
+}
+nav.site a:hover { color: var(--ink); }
+nav.site a[aria-current="page"] { color: var(--ink); border-bottom-color: var(--accent); }
+
+/* --- generic --- */
+main { padding: 34px 0 60px; }
+h1 { font-size: 30px; margin: 0 0 6px; letter-spacing: 0.4px; }
+h2 { font-size: 20px; margin: 32px 0 10px; }
+.lede { color: var(--ink-soft); margin: 0 0 26px; }
+.mono { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
+.muted { color: var(--ink-faint); }
+a { color: var(--accent-ink); }
+
+.note {
+  background: var(--warn-bg);
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--accent);
+  padding: 10px 14px;
+  font-size: 14px;
+  margin: 18px 0;
+}
+
+/* --- search bar --- */
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  padding: 12px;
+  background: var(--card);
+  border: 1px solid var(--rule);
+  margin-bottom: 6px;
+}
+.controls input, .controls select {
+  font: 14px/1.4 inherit;
+  padding: 7px 9px;
+  border: 1px solid var(--rule);
+  background: #fff;
+  color: var(--ink);
+  border-radius: 2px;
+}
+.controls input[type="search"] { flex: 1 1 260px; min-width: 0; }
+.controls input[type="number"] { width: 88px; }
+.controls label {
+  font: 11px/1 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+.count {
+  font: 12px/1 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  color: var(--ink-faint);
+  padding: 8px 2px 16px;
+}
+
+/* --- volume list --- */
+ol.volumes { list-style: none; margin: 0; padding: 0; }
+.volume {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 4px 18px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--rule-soft);
+}
+.volume:first-child { border-top: 1px solid var(--rule-soft); }
+.volume h3 { margin: 0; font-size: 17px; font-weight: normal; }
+.volume h3 a { color: var(--ink); text-decoration: none; }
+.volume h3 a:hover { text-decoration: underline; }
+.volume .by { color: var(--ink-soft); font-size: 14px; }
+.volume .meta {
+  grid-column: 1 / -1;
+  font: 12px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  color: var(--ink-faint);
+  letter-spacing: 0.3px;
+}
+.volume .meta span + span::before { content: " · "; }
+.volume .actions { grid-row: 1 / span 2; align-self: center; white-space: nowrap; }
+
+.btn {
+  display: inline-block;
+  font: 12px/1 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  text-decoration: none;
+  padding: 9px 13px;
+  border: 1px solid var(--rule);
+  background: #fff;
+  color: var(--ink);
+  border-radius: 2px;
+}
+.btn:hover { border-color: var(--accent); color: var(--accent-ink); }
+.btn[aria-disabled="true"] { opacity: 0.45; pointer-events: none; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary:hover { background: var(--accent-ink); color: #fff; }
+
+.pager { display: flex; gap: 10px; align-items: center; margin-top: 26px; }
+.pager .spacer { flex: 1; }
+
+/* --- downloads --- */
+.rel {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px 18px;
+  align-items: center;
+  padding: 16px;
+  background: var(--card);
+  border: 1px solid var(--rule);
+  margin-bottom: 12px;
+}
+.rel h3 { margin: 0; font-size: 17px; font-weight: normal; }
+.rel .meta {
+  grid-column: 1;
+  font: 12px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  color: var(--ink-faint);
+}
+.rel .actions { grid-row: 1 / span 2; }
+
+footer.site {
+  border-top: 1px solid var(--rule);
+  padding: 20px 0 40px;
+  font-size: 13px;
+  color: var(--ink-faint);
+}
+
+@media (max-width: 620px) {
+  .volume, .rel { grid-template-columns: 1fr; }
+  .volume .actions, .rel .actions { grid-row: auto; }
+  header.site .wrap { flex-wrap: wrap; }
+  nav.site a { margin: 8px 16px 0 0; }
+}

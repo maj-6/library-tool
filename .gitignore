@@ -24,6 +24,9 @@ downloads/ia/*.part
 # per-worktree launcher + its private DATA_ROOT (tools/worktree.py)
 .wt/
 
+# the website's Supabase project ref + anon key — public by design, but yours
+website/assets/config.js
+
 # python
 __pycache__/
 *.pyc
