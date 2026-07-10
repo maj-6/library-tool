@@ -300,17 +300,51 @@ def api_books():
 BUILDS_PATH = lib.OUTPUT_DIR / "whl_builds.json"
 
 # The field set mirrors what a WHL catalog entry needs. pdf_source is the
-# source URL; pdf_file is the local PDF attached for the actual submission;
-# ocr_active/ocr_verified/ocr_quality track the entry folder's OCR files;
-# title_pages lists PDF pages marked as title pages (metadata extraction
-# uses them later); attention flags an entry as needing attention.
+# source URL; pdf_file is the local PDF attached for the actual submission
+# (the PRIMARY PDF source); pdf_sources lists SECONDARY PDFs — other scans
+# of the same book, each {id, path}, so OCR files can belong to a specific
+# scan; ocr_active/ocr_verified/ocr_quality track the entry folder's OCR
+# files; title_pages lists PDF pages marked as title pages (metadata
+# extraction uses them later); attention flags an entry as needing attention.
 _BUILD_FIELDS = ("published_slug",
                  "title", "subtitle", "authors", "year", "publisher",
                  "publisher_city", "edition", "language", "pages",
                  "categories", "description", "pdf_source", "pdf_file",
+                 "pdf_sources",
                  "source_url", "notes", "status",
                  "ocr_active", "ocr_verified", "ocr_quality",
                  "title_pages", "attention")
+
+
+def _clean_pdf_sources(raw) -> list:
+    """Secondary PDF sources: a list of {id, path}. Everything else in a
+    build is a flat string; this one field is structured, so it gets its
+    own sanitizer instead of the str() coercion."""
+    out = []
+    if isinstance(raw, list):
+        for it in raw:
+            if not isinstance(it, dict):
+                continue
+            path = str(it.get("path") or "").strip()
+            if not path:
+                continue
+            sid = re.sub(r"[^\w]", "", str(it.get("id") or ""))[:12]
+            if not sid or sid == "primary":   # "primary" is a reserved key
+                sid = lib.gen_id()
+            out.append({"id": sid, "path": path})
+    return out
+
+
+def _valid_src_key(b: dict, key) -> str:
+    """A client-supplied source key checked against the build: 'primary'
+    (also the meaning of empty), or a LIVE secondary id. Anything else —
+    a removed source, a typo — returns '' so callers refuse to record it."""
+    key = str(key or "").strip()
+    if not key or key == "primary":
+        return "primary"
+    if any(s.get("id") == key for s in (b.get("pdf_sources") or [])):
+        return key
+    return ""
 
 # draft -> ready (verified) -> uploaded (sent to WHL, cleared from Pending)
 _BUILD_STATUSES = ("draft", "ready", "uploaded")
@@ -326,7 +360,9 @@ def api_builds_create():
     payload = request.get_json(silent=True) or {}
     seed = payload.get("build") or {}
     builds = lib.load_json(BUILDS_PATH, {})
-    build = {f: str(seed.get(f, "") or "").strip() for f in _BUILD_FIELDS}
+    build = {f: str(seed.get(f, "") or "").strip() for f in _BUILD_FIELDS
+             if f != "pdf_sources"}
+    build["pdf_sources"] = _clean_pdf_sources(seed.get("pdf_sources"))
     if build["status"] not in _BUILD_STATUSES:
         build["status"] = "draft"
     build["id"] = lib.gen_id(set(builds))
@@ -347,7 +383,11 @@ def api_builds_update(build_id: str):
     b = builds[build_id]
     was = b.get("status")
     for f in _BUILD_FIELDS:
-        if f in payload:
+        if f not in payload:
+            continue
+        if f == "pdf_sources":
+            b[f] = _clean_pdf_sources(payload[f])
+        else:
             b[f] = str(payload[f] or "").strip()
     if b.get("status") not in _BUILD_STATUSES:
         b["status"] = "draft"
@@ -521,7 +561,9 @@ def api_ai_summarize():
 
 # --- entry folders: one directory per pending entry -------------------------------
 # output/entries/<build-id>/ holds metadata.json, a compressed + truncated
-# preview.pdf, and ocr/*.txt files (extracted plus any loaded for comparison).
+# primary.pdf (the book's own PDF derivative; preview.pdf is the legacy
+# name), and ocr/*.txt files (extracted plus any loaded for comparison),
+# each tied to its PDF source via ocr/sources.json.
 
 ENTRIES_DIR = lib.OUTPUT_DIR / "entries"
 
@@ -537,14 +579,53 @@ def _ocr_name(raw: str) -> str:
     return name
 
 
+# ocr/sources.json ties each OCR file to the PDF it came from: {name: key}
+# where key is "primary" (the build's pdf_file — the default, so it is
+# never written) or a secondary source id from build.pdf_sources.
+
+def _ocr_sources(build_id: str) -> dict:
+    return lib.load_json(_entry_dir(build_id) / "ocr" / "sources.json", {})
+
+
+def _ocr_set_source(build_id: str, name: str, key: str) -> None:
+    key = (key or "").strip()
+    with _ocr_merge_lock:
+        p = _entry_dir(build_id) / "ocr" / "sources.json"
+        m = lib.load_json(p, {})
+        if not key or key == "primary":
+            if name not in m:
+                return
+            del m[name]              # primary is the default mapping
+        elif m.get(name) == key:
+            return
+        else:
+            m[name] = key
+        p.parent.mkdir(parents=True, exist_ok=True)
+        lib.save_json(p, m)
+
+
+def _entry_primary_pdf(build_id: str) -> str:
+    """The folder's own PDF derivative: primary.pdf, or the legacy
+    preview.pdf name from before secondary sources existed."""
+    d = _entry_dir(build_id)
+    if (d / "primary.pdf").is_file():
+        return "primary.pdf"
+    if (d / "preview.pdf").is_file():
+        return "preview.pdf"
+    return ""
+
+
 def _entry_folder_info(build_id: str) -> dict:
     d = _entry_dir(build_id)
     ocr = []
     if (d / "ocr").is_dir():
+        srcmap = _ocr_sources(build_id)
         for f in sorted((d / "ocr").glob("*.txt")):
-            ocr.append({"name": f.name, "size": f.stat().st_size})
+            ocr.append({"name": f.name, "size": f.stat().st_size,
+                        "src": srcmap.get(f.name) or "primary"})
+    primary = _entry_primary_pdf(build_id)
     return {"exists": d.is_dir(), "path": str(d), "ocr": ocr,
-            "preview": (d / "preview.pdf").is_file(),
+            "preview": bool(primary), "primary_pdf": primary,
             "metadata": (d / "metadata.json").is_file()}
 
 
@@ -668,8 +749,22 @@ def api_build_folder_sync(build_id: str):
         try:
             prev = _preview_pdf(src, pages)
             import shutil
-            shutil.copyfile(prev, d / "preview.pdf")
+            shutil.copyfile(prev, d / "primary.pdf")
             preview_ok = True
+            # migrate away from the legacy name: anything pointing at the
+            # old preview.pdf (a keep_original repoint from an earlier run)
+            # moves to primary.pdf BEFORE the stale file goes
+            legacy = d / "preview.pdf"
+            if legacy.is_file():
+                old_rel = legacy.resolve().relative_to(
+                    lib.DATA_ROOT.resolve()).as_posix()
+                if (b.get("pdf_file") or "").replace("\\", "/") == old_rel:
+                    b["pdf_file"] = (d / "primary.pdf").resolve().relative_to(
+                        lib.DATA_ROOT.resolve()).as_posix()
+                    lib.save_json(BUILDS_PATH, builds)
+                    src = d / "primary.pdf"
+                legacy.unlink()
+                notes.append("renamed preview.pdf to primary.pdf")
         except Exception as exc:
             notes.append(f"preview failed: {exc}")
         try:
@@ -697,9 +792,9 @@ def api_build_folder_sync(build_id: str):
                     src.with_suffix(".bak.pdf").unlink(missing_ok=True)
                     notes.append("original removed (temporary artifact)")
                     # nothing may keep pointing at the deleted file: the
-                    # entry folder's preview becomes the build's PDF, and
+                    # entry folder's own PDF becomes the build's PDF, and
                     # the IA download catalog entry is retired
-                    b["pdf_file"] = (d / "preview.pdf").resolve().relative_to(
+                    b["pdf_file"] = (d / "primary.pdf").resolve().relative_to(
                         lib.DATA_ROOT.resolve()).as_posix()
                     b["updated_at"] = datetime.now(timezone.utc).isoformat(
                         timespec="seconds")
@@ -727,7 +822,8 @@ def api_entries():
     for bid in builds:
         info = _entry_folder_info(bid)
         if info["exists"]:
-            out[bid] = {"ocr": info["ocr"], "preview": info["preview"]}
+            out[bid] = {"ocr": info["ocr"], "preview": info["preview"],
+                        "primary_pdf": info["primary_pdf"]}
     return jsonify({"entries": out})
 
 
@@ -745,8 +841,10 @@ def api_build_ocr_get(build_id: str, name: str):
 
 @app.route("/api/builds/<build_id>/ocr", methods=["POST"])
 def api_build_ocr_put(build_id: str):
-    """Store an OCR text file on the entry folder. Body: {name, text}."""
-    if build_id not in lib.load_json(BUILDS_PATH, {}):
+    """Store an OCR text file on the entry folder. Body: {name, text, src?}
+    — src ties the file to a secondary PDF source (default: primary)."""
+    builds = lib.load_json(BUILDS_PATH, {})
+    if build_id not in builds:
         abort(404)
     p = request.get_json(silent=True) or {}
     name = _ocr_name(p.get("name") or "")
@@ -754,6 +852,10 @@ def api_build_ocr_put(build_id: str):
     d.mkdir(parents=True, exist_ok=True)
     (d / name).write_text(str(p.get("text") or ""),
                           encoding="utf-8", errors="replace")
+    if "src" in p:
+        src_key = _valid_src_key(builds[build_id], p.get("src"))
+        if src_key:
+            _ocr_set_source(build_id, name, src_key)
     return jsonify({"ok": True, "name": name,
                     "folder": _entry_folder_info(build_id)})
 
@@ -1192,6 +1294,14 @@ def api_ocr_run():
     except (TypeError, ValueError):
         width = 1400
     job_id = lib.gen_id(set(_ocr_jobs))
+    # the merged result belongs to the PDF it was read from (?src= key);
+    # an unknown/removed key is refused rather than recorded
+    src_key = _valid_src_key(lib.load_json(BUILDS_PATH, {}).get(build_id, {}),
+                             p.get("src"))
+    if src_key:
+        _ocr_set_source(build_id,
+                        _ocr_name(str(p.get("target") or "compiled.txt")),
+                        src_key)
     job = {
         "id": job_id, "build_id": build_id, "pdf": str(pdf),
         "target": str(p.get("target") or "compiled.txt"),
@@ -1316,13 +1426,30 @@ def _apply_page_deletion(build_id: str, builds: dict, pdf: Path,
     tmp.replace(pdf)
     # keep the build's OCR files and title pages aligned with the new
     # numbering (under the merge lock: a job finishing this instant must
-    # not interleave with the renumber writes)
+    # not interleave with the renumber writes). Only the files that came
+    # FROM this PDF renumber — a secondary scan's OCR has its own page
+    # numbering and must not shift with the primary's deletions.
     b = builds[build_id]
+    src_key = "primary"
+    pdfr = pdf.resolve()
+    # the primary claims the file FIRST: if the same scan is attached both
+    # as pdf_file and as a secondary (path spelling variants resolve to one
+    # file), a deletion must still renumber the primary's OCR files
+    primary = _resolve_local(str(b.get("pdf_file") or ""))
+    if primary is None or primary.resolve() != pdfr:
+        for s in (b.get("pdf_sources") or []):
+            sp = _resolve_local(str(s.get("path") or ""))
+            if sp is not None and sp.resolve() == pdfr:
+                src_key = s.get("id") or "primary"
+                break
+    srcmap = _ocr_sources(build_id)
     ocr_dir = _entry_dir(build_id) / "ocr"
     renumbered = []
     with _ocr_merge_lock:
         if ocr_dir.is_dir():
             for f in ocr_dir.glob("*.txt"):
+                if (srcmap.get(f.name) or "primary") != src_key:
+                    continue
                 try:
                     raw = f.read_text(encoding="utf-8", errors="replace")
                     # the renumbering is destructive too — a misfired trim
@@ -1334,8 +1461,11 @@ def _apply_page_deletion(build_id: str, builds: dict, pdf: Path,
                     renumbered.append(f.name)
                 except OSError:
                     continue
-    titles = [int(x) for x in str(b.get("title_pages") or "").split(",")
-              if x.strip().isdigit()]
+    # title pages are counted on the PRIMARY PDF; a secondary's deletions
+    # don't move them
+    titles = [] if src_key != "primary" else \
+        [int(x) for x in str(b.get("title_pages") or "").split(",")
+         if x.strip().isdigit()]
     if titles:
         remapped = []
         for t in titles:
@@ -1475,14 +1605,22 @@ def api_pdf_text():
         _PDF_TEXT_CACHE[key] = out
     # Auto-save into the entry folder (never clobbers an existing file). One
     # page of text is a scanner's cover sheet, not an extraction: don't save it.
+    # ?save_name= picks the file (default extracted.txt) and ?src= ties it to
+    # a secondary PDF source — extractions of a secondary scan live beside
+    # the primary's under their own name.
     bid = (request.args.get("save_build") or "").strip()
     if bid and out.get("ok") and out.get("pages_with_text", 0) > 1:
-        if bid in lib.load_json(BUILDS_PATH, {}):
-            f = _entry_dir(bid) / "ocr" / "extracted.txt"
+        builds = lib.load_json(BUILDS_PATH, {})
+        if bid in builds:
+            name = _ocr_name(request.args.get("save_name") or "extracted.txt")
+            f = _entry_dir(bid) / "ocr" / name
             if not f.is_file():
                 f.parent.mkdir(parents=True, exist_ok=True)
                 f.write_text(out["text"], encoding="utf-8", errors="replace")
-                out = dict(out, saved="extracted.txt")
+                src_key = _valid_src_key(builds[bid], request.args.get("src"))
+                if src_key:
+                    _ocr_set_source(bid, name, src_key)
+                out = dict(out, saved=name)
     return jsonify(out)
 
 
@@ -2739,12 +2877,36 @@ def _publish_run(bid: str, actor: str) -> None:
             sbase.upload_object(cloud, "volumes", name, data, "application/pdf")
             url, path = sbase.public_url(cloud, "volumes", name), name
 
-        stage("recording")
+        # Secondary scans ride along, named after the book like the primary.
+        # They live under scans/ — <slug>-2.pdf in the SAME namespace would
+        # collide with _publish_slug's "-N" disambiguation of other books
+        # (two scans of "Herbal 1600" already produce slugs herbal-1600 and
+        # herbal-1600-2). Objects only; the volumes row keeps pointing at
+        # the primary. Any failure past this point takes every uploaded
+        # object back down — a public object with no catalog row is a leak.
+        extras = []
         try:
+            for i, s in enumerate(b.get("pdf_sources") or [], start=2):
+                sp = _resolve_local(str(s.get("path") or ""))
+                if sp is None or not sp.is_file():
+                    continue
+                name_i = f"scans/{slug}-{i}.pdf"
+                stage(f"uploading {name_i}", sent=0, total=sp.stat().st_size)
+                if r2.configured(r2cfg):
+                    r2.put_file(r2cfg, f"volumes/{name_i}", sp,
+                                "application/pdf", on_progress=progress)
+                    extras.append((name_i, ""))
+                else:
+                    sbase.upload_object(cloud, "volumes", name_i,
+                                        sp.read_bytes(), "application/pdf")
+                    extras.append((name_i, name_i))
+
+            stage("recording")
             sbase.upsert_volume(cloud, _volume_row(b, slug, url, path, size, actor))
         except Exception:
-            # the object is already public and now belongs to nothing: take it back
             _unpublish_object(cloud, slug, path)
+            for name_i, path_i in extras:
+                _unpublish_object(cloud, name_i[:-4], path_i)
             raise
 
         # re-read: the upload took minutes, and another writer may have touched
