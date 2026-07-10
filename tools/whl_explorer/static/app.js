@@ -142,7 +142,9 @@ const state = {
 // --- appearance: themes are full chrome redesigns; fonts are user-selectable --
 
 // All light. This is a scholarly tool, read for hours: no dark modes, no loud
-// accents. They differ by paper stock, rule weight and ink colour.
+// accents. The paper set differs by stock, rule weight and ink colour; the
+// classic set translates period desktop chrome (bevels, pinstripes, navy
+// bands) onto the same fixed geometry.
 const THEMES = [
   ["sage", "Sage"],
   ["ledger", "Archive Ledger"],
@@ -152,20 +154,24 @@ const THEMES = [
   ["quarto", "Quarto"],
   ["pewter", "Pewter"],
   ["folio", "Folio"],
+  ["platinum", "Platinum"],
+  ["redmond", "Redmond"],
+  ["motif", "Motif"],
 ];
 const DEFAULT_THEME = "sage";
 // Retired ids map to the survivor closest in spirit, so a stored theme never
 // falls through to the bare :root fallback. "" was Classic CAD, the old default.
+// platinum came back as a real theme, so it no longer appears here.
 const LEGACY_THEMES = {
   "": DEFAULT_THEME,
   // the dark/loud round, retired after one release
   scope: "pewter", "terminal-amber": "vellum", "blueprint-linen": "quarto",
   oxblood: "ledger", porcelain: "pewter", herbarium: "vellum",
-  // the original set
-  platinum: "pewter", blueprint: "quarto", modern: "pewter",
+  // the original set; the classic-chrome ids revive as their nearest heirs
+  blueprint: "quarto", modern: "pewter",
   dark: "pewter", stone: "linen", midnight: "pewter",
-  cde: "ledger", xp2003: DEFAULT_THEME, acad: "pewter",
-  workstation: DEFAULT_THEME, slate: "pewter", mainframe: "vellum",
+  cde: "motif", xp2003: "redmond", acad: "pewter",
+  workstation: "motif", slate: "pewter", mainframe: "vellum",
   graphite: "pewter",
 };
 
@@ -1064,33 +1070,65 @@ function activityPhrase(g) {
 }
 
 // Everything here is computed from data the app already holds.
-function pendingTasks() {
+function progressSummary() {
   const builds = Object.values(state.builds || {});
-  const drafts = builds.filter((b) => b.status === "draft").length;
+  const drafts = builds.filter((b) => b.status === "draft");
   const ready = builds.filter((b) => b.status === "ready").length;
-  const attn = Object.keys(state.attn || {}).length +
+  // a source is settled once a verified entry has been built from it
+  const srcPending = approvedSources()
+    .filter((s) => sourceBuildStatus(s) !== "done").length;
+  // catalog-side marks (rows + the attn map) live in the Catalogs tab;
+  // marked builds live in the Editor's Pending queue — kept apart so the
+  // attention tile can land where its items actually are
+  const attnCat = Object.keys(state.attn || {}).length +
     [...(state.rowsById || new Map()).values()].filter((r) => r.attention).length;
-  const noScan = (state.manual || []).filter(
-    (e) => e.checks && e.checks.in_whl === "no" && !e.scans).length;
-
-  const t = [];
-  if (ready) t.push({ n: ready, text: `verified ${ready === 1 ? "entry" : "entries"} ready to upload`, tab: "upload" });
-  if (drafts) t.push({ n: drafts, text: `${drafts === 1 ? "draft" : "drafts"} pending verification`, tab: "upload" });
-  if (attn) t.push({ n: attn, text: `${attn === 1 ? "item" : "items"} marked for attention`, tab: "checked" });
-  if (noScan) t.push({ n: noScan, text: `manual ${noScan === 1 ? "entry" : "entries"} not yet scanned`, tab: "checked" });
-  return t;
+  const attnEd = builds.filter((b) => b.attention && b.status !== "uploaded").length;
+  return { drafts, ready, srcPending, attnCat, attnEd };
 }
 
-function renderHome() {
-  const tasks = el("home-tasks");
-  const feed = el("home-activity");
-  if (!tasks || !feed) return;
+const HOME_DRAFTS_SHOWN = 4;
 
-  const t = pendingTasks();
-  tasks.innerHTML = t.length
-    ? t.map((x) => `<button class="home-task" data-gotab="${esc(x.tab)}">` +
-        `<span class="home-n">${x.n}</span><span>${esc(x.text)}</span></button>`).join("")
-    : `<div class="empty">Nothing pending</div>`;
+function renderHome() {
+  const prog = el("home-progress");
+  const feed = el("home-activity");
+  if (!prog || !feed) return;
+
+  const p = progressSummary();
+  const stat = (n, label, tab, sub) =>
+    `<button class="home-stat" data-gotab="${tab}">` +
+      `<span class="hs-n">${n}</span>` +
+      `<span class="hs-l">${esc(label)}</span>` +
+      `<span class="hs-sub">${sub ? esc(sub) : ""}</span>` +
+    `</button>`;
+  const inEditor = p.drafts.length + p.ready;
+  const attn = p.attnCat + p.attnEd;
+  let html = `<div id="home-stats">` +
+    stat(inEditor, inEditor === 1 ? "entry in the editor" : "entries in the editor",
+         "upload", inEditor ? `${p.drafts.length} draft · ${p.ready} to upload` : "") +
+    stat(p.srcPending, p.srcPending === 1 ? "PDF source pending verification"
+         : "PDF sources pending verification", "upload") +
+    stat(attn, attn === 1 ? "item marked for attention"
+         : "items marked for attention", p.attnCat || !p.attnEd ? "checked" : "upload",
+         p.attnCat && p.attnEd ? `${p.attnCat} catalog · ${p.attnEd} editor` : "") +
+    `</div>`;
+
+  // the freshest few drafts, so unfinished work is one click away
+  const relIso = (iso) => { const t = Date.parse(iso || ""); return isNaN(t) ? "" : relTime(t); };
+  const drafts = p.drafts.slice()
+    .sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
+  const shown = drafts.slice(0, HOME_DRAFTS_SHOWN);
+  if (shown.length) {
+    html += `<div class="home-h home-h-sub">Editor drafts</div>` +
+      shown.map((b) => `<button class="home-draft" data-draft="${esc(b.id)}"
+          data-tip="Open this draft in the editor">` +
+        `<span class="hd-t">${esc(b.title) || "<em>(untitled)</em>"}</span>` +
+        `<span class="hd-meta">${esc(b.authors || "")}${b.authors && b.year ? " · " : ""}${esc(b.year || "")}</span>` +
+        `<span class="hd-when">${esc(relIso(b.updated_at))}</span></button>`).join("");
+    if (drafts.length > shown.length)
+      html += `<button class="home-more" data-gotab="upload">` +
+        `${drafts.length - shown.length} more in the editor…</button>`;
+  }
+  prog.innerHTML = html;
 
   if (!homeState.loaded) { feed.innerHTML = `<div class="empty">Loading …</div>`; return; }
   const groups = groupActivity(homeState.events).slice(0, 12);
@@ -1103,9 +1141,24 @@ function renderHome() {
 }
 
 function initHome() {
-  el("home-tasks").addEventListener("click", (ev) => {
+  // the version number is stated once, in the title bar markup; the home
+  // page wordmark mirrors it so the two can never disagree
+  el("home-ver").textContent = el("tb-meta").textContent;
+  el("home-progress").addEventListener("click", (ev) => {
+    const d = ev.target.closest("[data-draft]");
+    if (d) {
+      state.buildsTab = "pending";   // drafts live in the Pending queue
+      document.querySelector(`#tabs .tab[data-tab="upload"]`).click();
+      selectBuild(d.dataset.draft);
+      return;
+    }
     const b = ev.target.closest("[data-gotab]");
-    if (b) document.querySelector(`#tabs .tab[data-tab="${b.dataset.gotab}"]`).click();
+    if (b) {
+      // every editor-bound tile advertises pending work, so land on the
+      // Pending queue even if the sidebar was left on Uploaded
+      if (b.dataset.gotab === "upload") state.buildsTab = "pending";
+      document.querySelector(`#tabs .tab[data-tab="${b.dataset.gotab}"]`).click();
+    }
   });
   loadActivity();
 }
