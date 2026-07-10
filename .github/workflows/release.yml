@@ -1,0 +1,203 @@
+name: release
+
+# Build both apps and put them on the website's Downloads page.
+#
+# Push a tag like v3.1 and this builds the Android APK and the Windows
+# installer, attaches them to a GitHub Release named after the tag, and
+# registers each in the Supabase `releases` table — which is the Downloads
+# page's data source, so the site shows the new builds immediately, no
+# redeploy. Each app keeps its own version (gradle versionName, package.json);
+# the tag only names the GitHub Release that hosts the files.
+#
+# workflow_dispatch runs the two builds as a dry run: artifacts to inspect,
+# nothing published.
+#
+# One-time repository setup, all under Settings > Secrets and variables:
+#   vars.SUPABASE_URL                  (already set for the pages workflow)
+#   secrets.SUPABASE_SERVICE_ROLE_KEY  RLS leaves anon read-only on `releases`,
+#                                      so registering rows needs this. Without
+#                                      it the GitHub Release still happens and
+#                                      the register step says what is missing.
+#   secrets.ANDROID_KEYSTORE_B64       optional but recommended: base64 of the
+#   secrets.ANDROID_KEYSTORE_PASSWORD  signing keystore. Without them each APK
+#   secrets.ANDROID_KEY_ALIAS          is signed with the runner's throwaway
+#                                      debug key, and Android refuses to update
+#                                      an install whose key changed.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the release and upload its assets
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    defaults:
+      run:
+        working-directory: android/BookCapture
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Signing key (persistent if the secret is set, debug otherwise)
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/keystore.jks"
+            {
+              echo "WHL_KEYSTORE_FILE=$RUNNER_TEMP/keystore.jks"
+              echo "WHL_KEYSTORE_PASSWORD=$KS_PASS"
+              echo "WHL_KEY_ALIAS=${KS_ALIAS:-bookcapture}"
+            } >> "$GITHUB_ENV"
+          else
+            echo "::warning::No ANDROID_KEYSTORE_B64 secret: signing with the \
+          runner's debug key, so installing this build over one signed with a \
+          different key needs an uninstall first."
+          fi
+
+      - name: Build
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleRelease
+
+      - name: Name the APK after its versionName
+        id: ver
+        run: |
+          V=$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -1)
+          test -n "$V" || { echo "::error::no versionName in app/build.gradle.kts"; exit 1; }
+          mv app/build/outputs/apk/release/app-release.apk "BookCapture-$V.apk"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Keep the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: android/BookCapture/BookCapture-*.apk
+          if-no-files-found: error
+
+  desktop:
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python (for the PyInstaller sidecar)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Sidecar dependencies
+        run: python -m pip install -r ../tools/requirements.txt pyinstaller
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Shell dependencies
+        run: npm ci
+
+      # The two halves of `npm run dist`, spelled out: that script calls
+      # `python3` (the build machine's bare `python` is an unrelated toolchain),
+      # while the runner only guarantees `python`. No code signing on CI, so
+      # keep electron-builder from hunting for a cert.
+      - name: Freeze the sidecar
+        run: python -m PyInstaller --clean --noconfirm --distpath dist-sidecar --workpath build-sidecar sidecar/whl_explorer.spec
+
+      - name: Build the installer
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npx electron-builder --win --publish never
+
+      - name: Read the version
+        id: ver
+        shell: bash
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      # The NSIS exe is the download; latest.yml + the blockmap are the
+      # auto-update channel (electron-updater reads them off the GitHub
+      # Release). Ship all three or updates silently never happen.
+      - name: Keep the installer + update manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop
+          path: |
+            desktop/release/LibraryTool-Setup-*.exe
+            desktop/release/LibraryTool-Setup-*.exe.blockmap
+            desktop/release/latest.yml
+          if-no-files-found: error
+
+  # Tag pushes only: a dispatch run is a dry run and stops at the artifacts.
+  # `needs` both builds on purpose — a release always ships the pair, so a
+  # broken desktop build blocks the APK too rather than half-publishing.
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [android, desktop]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Collect the builds
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "Library Tool $GITHUB_REF_NAME" \
+              --notes "Android BookCapture ${{ needs.android.outputs.version }} · Desktop ${{ needs.desktop.outputs.version }}"
+          gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+
+      # The step the website actually sees. release_publish.py gets the local
+      # file (for sha256/bytes) plus --url, so the row points at the GitHub
+      # Release asset rather than the storage bucket.
+      - name: Register on the Downloads page
+        env:
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          if [ -z "$SUPABASE_KEY" ]; then
+            echo "::warning::SUPABASE_SERVICE_ROLE_KEY is not set, so the \
+          Downloads page was not updated. Add it under Settings > Secrets and \
+          re-run this job, or register by hand with tools/release_publish.py."
+            echo "- **warning:** release created, but not registered on the Downloads page (no SUPABASE_SERVICE_ROLE_KEY)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          BASE="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME"
+          APK=$(ls dist/BookCapture-*.apk)
+          EXE=$(ls dist/LibraryTool-Setup-*.exe)
+          python3 tools/release_publish.py "$APK" --url "$BASE/$(basename "$APK")" \
+            --platform android --version "${{ needs.android.outputs.version }}"
+          python3 tools/release_publish.py "$EXE" --url "$BASE/$(basename "$EXE")" \
+            --platform windows --version "${{ needs.desktop.outputs.version }}"

@@ -139,7 +139,9 @@ ol.volumes { list-style: none; margin: 0; padding: 0; }
   letter-spacing: 0.3px;
 }
 .volume .meta span + span::before { content: " · "; }
-.volume .actions { grid-row: 1 / span 2; align-self: center; white-space: nowrap; }
+/* grid-column is explicit because auto-placement seats row-locked items FIRST:
+   without it the button takes column 1 and the title auto-flows to the right */
+.volume .actions { grid-column: 2; grid-row: 1 / span 2; align-self: center; white-space: nowrap; }
 
 .btn {
   display: inline-block;
@@ -178,7 +180,7 @@ ol.volumes { list-style: none; margin: 0; padding: 0; }
   font: 12px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace;
   color: var(--ink-faint);
 }
-.rel .actions { grid-row: 1 / span 2; }
+.rel .actions { grid-column: 2; grid-row: 1 / span 2; }
 
 footer.site {
   border-top: 1px solid var(--rule);
@@ -189,7 +191,7 @@ footer.site {
 
 @media (max-width: 620px) {
   .volume, .rel { grid-template-columns: 1fr; }
-  .volume .actions, .rel .actions { grid-row: auto; }
+  .volume .actions, .rel .actions { grid-column: auto; grid-row: auto; }
   header.site .wrap { flex-wrap: wrap; }
   nav.site a { margin: 8px 16px 0 0; }
 }

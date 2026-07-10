@@ -3,6 +3,14 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// Release signing comes from the environment (local shell or CI secrets), so no
+// key material ever sits in the repo. Without WHL_KEYSTORE_FILE the release
+// build falls back to the debug key: still installable for sideloading, but
+// Android treats builds signed with different keys as different authors, so an
+// update over an old install needs an uninstall first. Keep one keystore.
+val releaseKeystore: String? =
+    System.getenv("WHL_KEYSTORE_FILE")?.takeIf { it.isNotBlank() }
+
 android {
     namespace = "org.whl.bookcapture"
     compileSdk = 34
@@ -15,9 +23,25 @@ android {
         versionName = "1.0"
     }
 
+    signingConfigs {
+        if (releaseKeystore != null) {
+            create("release") {
+                storeFile = file(releaseKeystore)
+                storePassword = System.getenv("WHL_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("WHL_KEY_ALIAS") ?: "bookcapture"
+                keyPassword = System.getenv("WHL_KEY_PASSWORD")
+                    ?: System.getenv("WHL_KEYSTORE_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = if (releaseKeystore != null)
+                signingConfigs.getByName("release")
+            else
+                signingConfigs.getByName("debug")
         }
     }
     compileOptions {
