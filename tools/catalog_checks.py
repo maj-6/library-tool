@@ -138,6 +138,34 @@ def renewal_match(title: str, author: str, ren: dict) -> dict | None:
     return best
 
 
+def renewal_details(ids) -> dict[str, dict]:
+    """Registration/renewal dates for renewal IDs, by one scan of the CSV.
+
+    The in-memory index (246k rows) deliberately holds only what matching needs;
+    carrying three more date strings per row would cost ~25 MB for a field the
+    tooltip wants on a handful of books. Callers cache the result instead.
+    """
+    want = {str(i).strip() for i in ids if str(i).strip()}
+    out: dict[str, dict] = {}
+    if not want or not RENEWALS_CSV.exists():
+        return out
+    with open(RENEWALS_CSV, "r", encoding="utf-8", errors="replace", newline="") as fh:
+        for raw in csv.DictReader(fh):
+            rid = (raw.get("ID") or "").strip()
+            if rid not in want:
+                continue
+            out[rid] = {
+                "id": rid,
+                "renewal_year": (raw.get("DATE") or "").strip(),
+                "renewal_date": (raw.get("DREG") or "").strip(),      # e.g. 12Jun50
+                "registration_date": (raw.get("ODAT") or "").strip(),  # e.g. 24Jun23
+                "registration_number": (raw.get("OREG") or "").strip(),
+            }
+            if len(out) == len(want):
+                break
+    return out
+
+
 def copyright_status_for(
     title: str, author: str, year_value, ren: dict, this_year: int | None = None
 ) -> str:

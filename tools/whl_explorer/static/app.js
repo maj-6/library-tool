@@ -482,6 +482,7 @@ const BICONS = {
   cross: _SVGB('<path d="M4 4 L12 12 M12 4 L4 12"/>'),        // rejected match
   pencil: _SVGB('<path d="M3 13 l0.7-2.8 L10.9 2.6 l2.5 2.5 -8 8 Z"/>'),  // WHL draft
   upload: _SVGB('<path d="M8 12.8 V3.6 M4.4 7.2 L8 3.6 L11.6 7.2"/>'),    // ready to upload
+  download: _SVGB('<path d="M8 2.4 V9.6 M4.6 6.4 L8 9.8 L11.4 6.4 M3.8 13.4 H12.2"/>'),  // file on disk
 };
 
 function injectIcons() {
@@ -1709,9 +1710,12 @@ function matchesFind(q, title, author, year) {
 // record, and the tooltip carries the full match details.
 
 function badge(cls, label, opts = {}) {
-  // download state rides as a bold outline around the whole tag (dl-ok/err/prog),
-  // not a dot inside it; its tip folds into the tag's own tooltip
+  // download state rides as a bold 2px border on the tag itself (dl-ok/err/prog),
+  // not a dot inside it; its tip folds into the tag's own tooltip. A file that
+  // is actually on disk also takes over the label with a download glyph — the
+  // verification state it displaces stays visible on the marker beside it.
   const dl = opts.dot ? " dl-" + opts.dot.cls : "";
+  if (opts.dot && opts.dot.cls === "ok") label = BICONS.download;
   let tipText = opts.tip || "";
   if (opts.dot && opts.dot.tip)
     tipText = tipText ? tipText + "\n" + opts.dot.tip : opts.dot.tip;
@@ -1884,6 +1888,59 @@ function pumpCrStatus() {
   }
 }
 
+// --- renewal record details (the dates the tooltip quotes) -------------------
+// A renewal status names its record ("In copyright (renewal R64009)"); the dates
+// live in the renewals CSV, fetched per ID in batches and cached for good.
+const REN_KEY = "whl_ren_cache_v1";
+let _renCache = null;
+const _renQueue = new Set();
+let _renTimer = null;
+
+function renCache() {
+  if (_renCache) return _renCache;
+  _renCache = new Map();
+  try {
+    const o = JSON.parse(localStorage.getItem(REN_KEY) || "{}");
+    for (const k in o) _renCache.set(k, o[k]);
+  } catch (e) { /* ignore */ }
+  return _renCache;
+}
+function saveRenCache() {
+  try {
+    const o = {};
+    for (const [k, v] of renCache()) o[k] = v;
+    localStorage.setItem(REN_KEY, JSON.stringify(o));
+  } catch (e) { /* ignore */ }
+}
+function queueRen(id) {
+  if (!id || renCache().has(id) || _renQueue.has(id)) return;
+  _renQueue.add(id);
+  clearTimeout(_renTimer);
+  _renTimer = setTimeout(flushRenQueue, 60);   // one request per render pass
+}
+function flushRenQueue() {
+  const ids = [..._renQueue].slice(0, 200);
+  if (!ids.length) return;
+  ids.forEach((i) => _renQueue.delete(i));
+  fetch("/api/copyright/renewal?ids=" + encodeURIComponent(ids.join(",")))
+    .then((r) => r.json())
+    .then((res) => {
+      // cache misses too ({}), so an absent record is never re-requested
+      for (const id of ids) renCache().set(id, res[id] || {});
+      saveRenCache();
+      scheduleCrRefresh();
+      if (_renQueue.size) flushRenQueue();
+    })
+    .catch(() => { /* leave uncached; retried on the next render */ });
+}
+// the renewals CSV writes dates as "12Jun50" (all 20th century)
+function crDate(s) {
+  const m = /^(\d{1,2})([A-Za-z]{3})(\d{2})$/.exec(String(s || "").trim());
+  if (!m) return String(s || "").trim();
+  const mon = m[2][0].toUpperCase() + m[2].slice(1).toLowerCase();
+  return `${Number(m[1])} ${mon} 19${m[3]}`;
+}
+
 // re-render all on-screen copyright tags after a status/registration fetch resolves
 let _crRefreshTimer = null;
 function scheduleCrRefresh() {
@@ -1902,27 +1959,80 @@ function refreshAllCrTags() {
 }
 
 // Colours for the diagonal copyright tag. Left = registration record, right =
-// renewal. The renewal half depends on the registration lookup: no record found
-// -> blue; found -> magenta (auto-renewed), orange (renewal on file), or green
-// (registered, not renewed). Too old for copyright -> both blue.
+// renewal. The two halves read as one sentence: "was it registered, and did the
+// registration survive?".
+//
+//   left   purple = registered, but public domain by age (a registration exists
+//                   all the same — the fact the tag is there to surface)
+//          yellow = registered during the renewal era (1931-1963)
+//          red    = published after 1963 — in copyright whether or not a
+//                   registration record turns up
+//          gray   = renewal era, no registration record found
+//          blue   = public domain by age, no registration record
+//   right  blue   = public domain by age (or a renewal we can't assess)
+//          green  = registered but never renewed -> public domain
+//          orange = auto-renewed (published 1964-1977)
+//          red    = renewal on file, or published after the renewal era
+//
+// A negative renewal result is only trusted when a registration backs it up:
+// "no renewal found" for a book with no registration record means nothing, so
+// the right half stays blue. A renewal that IS on file needs no such backing.
 function copyrightColors(b, status) {
   if (status === undefined) return { left: "pending", right: "pending", lt: "Checking copyright …", rt: "Checking copyright …" };
   if (!status || status.startsWith("Unknown"))
     return { left: "gray", right: "gray", lt: status || "Copyright status unknown", rt: status || "Copyright status unknown" };
-  if (status.startsWith("Public domain (published"))
-    return { left: "blue", right: "blue", lt: "Public domain by age (too old for copyright)", rt: status };
-  if (!copyrightSources().length)
-    return { left: "gray", right: "gray", lt: "Registration lookup disabled — enable a source in Settings", rt: status };
+
+  const pdAge = status.startsWith("Public domain (published");
+  const renewedId = (/^In copyright \(renewal (.+)\)$/.exec(status) || [])[1] || "";
+  const autoRen = status.startsWith("In copyright (auto-renewed");
+  const notRen = status.startsWith("Public domain (no renewal");
+  const post63 = status.startsWith("In copyright") && !renewedId;  // auto-renewed or later
+
+  // --- right half: the renewal question, answered offline from the CSV
+  let rc, rt;
+  if (pdAge) { rc = "blue"; rt = status; }
+  else if (renewedId) {
+    rc = "red";
+    rt = "Renewal " + renewedId + " on file — in copyright";
+    const ren = renCache().get(renewedId);
+    if (ren === undefined) queueRen(renewedId);
+    else if (ren.renewal_date || ren.renewal_year) {
+      rt += "\nRenewed " + (crDate(ren.renewal_date) || ren.renewal_year);
+      if (ren.registration_date)
+        rt += " · originally registered " + crDate(ren.registration_date) +
+          (ren.registration_number ? " (" + ren.registration_number + ")" : "");
+    }
+  } else if (autoRen) { rc = "orange"; rt = "Auto-renewed — in copyright"; }
+  else if (post63) { rc = "red"; rt = "In copyright — published after the renewal era"; }
+  else if (notRen) { rc = "green"; rt = "Registered but not renewed — likely public domain"; }
+  else { rc = "gray"; rt = status; }
+
+  // --- left half: the registration record
+  if (post63)
+    return { left: "red", right: rc, rt,
+      lt: "Published after 1963 — in copyright regardless of registration" };
+  if (!copyrightSources().length) {
+    const settled = pdAge || renewedId;   // answers that don't need the lookup
+    return { left: pdAge ? "blue" : "gray", right: settled ? rc : "blue",
+      lt: "Registration lookup disabled — enable a source in Settings",
+      rt: settled ? rt : "No registration lookup — renewal not assessable" };
+  }
   const reg = regCache().get(regKey(b));
-  if (reg === undefined) { queueReg(b); return { left: "pending", right: "pending", lt: "Checking registration …", rt: "Checking registration …" }; }
-  if (!reg.found)
-    return { left: "gray", right: "blue", lt: "No copyright registration record found", rt: "No registration record — renewal not assessable" };
-  const lt = "Copyright registration found via " + (reg.sources || []).map((s) => s.toUpperCase()).join(", ");
-  const [rc, rt] = status.startsWith("In copyright (renewal") ? ["orange", "Renewal record found — in copyright"]
-    : status.startsWith("In copyright") ? ["magenta", "Auto-renewed — in copyright"]
-    : status.startsWith("Public domain (no renewal") ? ["green", "Registered but not renewed — likely public domain"]
-    : ["gray", status];
-  return { left: "yellow", right: rc, lt, rt };
+  if (reg === undefined) { queueReg(b); return { left: "pending", right: rc, lt: "Checking registration …", rt }; }
+  if (!reg.found) {
+    if (pdAge)
+      return { left: "blue", right: "blue", rt,
+        lt: "Public domain by age; no registration record found" };
+    return { left: "gray", right: renewedId ? rc : "blue",
+      lt: "No copyright registration record found",
+      rt: renewedId ? rt : "No registration record — renewal not assessable" };
+  }
+  const when = reg.match && (reg.match.date || reg.match.year);
+  const lt = "Copyright registration found via " +
+    (reg.sources || []).map((s) => s.toUpperCase()).join(", ") +
+    (when ? "\nRegistered " + when : "") +
+    (reg.match && reg.match.reg_number ? " (" + reg.match.reg_number + ")" : "");
+  return { left: pdAge ? "purple" : "yellow", right: rc, lt, rt };
 }
 
 function renderCrTag(b, status) {
@@ -2111,9 +2221,9 @@ function rowMarkState(row) {
 function markCell(row) {
   const { mark, reason } = computeMark(row);
   const attached = !!row.localPdf;
-  // Clicking SCAN or UPLD opens the file browser to attach/replace a local PDF
-  // (Shift+click detaches); an attached PDF keeps the mark's label and gains a
-  // green dot marking it as an approved verified source.
+  // Clicking the mark opens the file browser to attach/replace a local PDF
+  // (Shift+click detaches); an attached PDF shows as a download glyph in a
+  // green-bordered tag, marking it as an approved verified source.
   const dot = attached ? { cls: "ok", tip: "PDF attached — verified source" } : null;
   const tail = attached
     ? `Attached PDF:\n${row.localPdf}\nClick to replace · Shift+click to detach`
@@ -2722,8 +2832,8 @@ function dlState(row) {
 }
 
 function iaCell(row) {
-  // download state rides inside the tag as a dot on its right edge — the
-  // label stays centered: green = downloaded, red = failed
+  // download state colours the tag's 2px border: green = downloaded (the tag
+  // also shows a download glyph), red = failed, amber = in progress
   const ident = iaIdentifierForRow(row);
   const st = dlState(row);
   let dot = null;

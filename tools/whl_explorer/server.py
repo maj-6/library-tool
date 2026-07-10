@@ -1852,6 +1852,14 @@ def _reg_cache_load() -> dict:
     return _reg_cache
 
 
+def _reg_cache_store(cache: dict) -> None:
+    try:
+        _REG_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _REG_CACHE_PATH.write_text(json.dumps(cache), "utf-8")
+    except Exception:
+        pass
+
+
 def _reg_cache_key(title: str, author: str, sources) -> str:
     def n(s):
         return " ".join(str(s or "").lower().split())
@@ -1879,11 +1887,7 @@ def api_copyright_registration():
     with _reg_cache_lock:
         cache = _reg_cache_load()
         cache[key] = result
-        try:
-            _REG_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            _REG_CACHE_PATH.write_text(json.dumps(cache), "utf-8")
-        except Exception:
-            pass
+        _reg_cache_store(cache)
     return jsonify(result)
 
 
@@ -1907,12 +1911,34 @@ def api_copyright_status():
     with _reg_cache_lock:
         cache = _reg_cache_load()
         cache[key] = result
-        try:
-            _REG_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            _REG_CACHE_PATH.write_text(json.dumps(cache), "utf-8")
-        except Exception:
-            pass
+        _reg_cache_store(cache)
     return jsonify(result)
+
+
+@app.route("/api/copyright/renewal")
+def api_copyright_renewal():
+    """Dates for the renewal IDs named in a copyright status, for the tag's
+    tooltip. One CSV scan resolves the whole batch, and misses are cached too,
+    so an ID is scanned for at most once ever."""
+    ids = [s for s in (request.args.get("ids") or "").split(",") if s.strip()][:200]
+    out: dict[str, dict] = {}
+    missing: list[str] = []
+    with _reg_cache_lock:
+        cache = _reg_cache_load()
+        for rid in ids:
+            hit = cache.get("__renewal__|" + rid)
+            if hit is None:
+                missing.append(rid)
+            else:
+                out[rid] = hit
+    if missing:
+        found = checks.renewal_details(missing)   # offline; one scan for the batch
+        with _reg_cache_lock:
+            cache = _reg_cache_load()
+            for rid in missing:
+                out[rid] = cache["__renewal__|" + rid] = found.get(rid) or {}
+            _reg_cache_store(cache)
+    return jsonify(out)
 
 
 # --- WHL catalogue view (editable via a corrections overlay) --------------------

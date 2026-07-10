@@ -153,7 +153,7 @@ def _parse_nypl_dir(root: Path) -> list[dict]:
             date = (rd.get("date") if rd is not None else "") or ""
             year = date[:4] if date[:4].isdigit() else ""
             entries.append({"title": title, "author": author,
-                            "regnum": regnum, "year": year})
+                            "regnum": regnum, "year": year, "date": date})
     return entries
 
 
@@ -229,6 +229,7 @@ def nypl_registration(title: str, author: str = "", year_value=None) -> dict | N
                 "title": e.get("title", ""),
                 "author": e.get("author", ""),
                 "year": e.get("year", ""),
+                "date": e.get("date", ""),   # full registration date when the CCE has one
                 "record_id": "",
             }
     return None

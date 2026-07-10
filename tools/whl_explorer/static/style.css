@@ -1104,8 +1104,9 @@ main {
 .cr-yellow  { background: #c3aa5c; }
 .cr-gray    { background: #a6a69f; }
 .cr-green   { background: #5f8b6c; }
-.cr-magenta { background: #a3638d; }
+.cr-purple  { background: #7a5fa8; }
 .cr-orange  { background: #bd875a; }
+.cr-red     { background: #ab5147; }
 .cr-pending { background: repeating-linear-gradient(45deg, #d8d8d8, #d8d8d8 3px, #ececec 3px, #ececec 6px); }
 
 /* --- History tab --- */
@@ -1182,17 +1183,18 @@ a.badge:hover { text-decoration: underline; }
 .badge.upload { color: var(--amber); font-weight: bold; }
 .badge.approved { color: var(--green); font-weight: bold; }
 
-/* download state -> a 2px dotted outline around the tag (replaces the old
-   dl-dot): green = downloaded, red = failed, amber = downloading. Freeing the
-   space the dot needed inside the tag lets the tags (and columns) run
-   narrower. `outline` (not box-shadow) so it can be dotted; it sits outside
-   the border and takes no layout space. */
-.badge.dl-ok   { outline: 2px dotted var(--green); outline-offset: 0; }
-.badge.dl-err  { outline: 2px dotted var(--red); outline-offset: 0; }
-.badge.dl-prog { outline: 2px dotted var(--amber); outline-offset: 0; }
+/* download state -> the tag's own border doubles to 2px and takes the state's
+   colour (replaces the old dl-dot inside it): green = downloaded, red = failed,
+   amber = downloading. A finished download also swaps the label for a download
+   glyph. box-sizing keeps the tag 15px tall, so nothing reflows. */
+.badge.dl-ok, .badge.dl-err, .badge.dl-prog { border-width: 2px; line-height: 11px; }
+.badge.dl-ok   { border-color: var(--green); }
+.badge.dl-err  { border-color: var(--red); }
+.badge.dl-prog { border-color: var(--amber); }
 
 /* a glyph standing in for a tag's text label (centred in the 13px content box) */
 .badge .bico { display: block; margin: 1px auto 0; }
+.badge.dl-ok .bico, .badge.dl-err .bico, .badge.dl-prog .bico { margin-top: 0; }
 
 /* per-source verification marker fused to the tag's right edge (clickable) */
 .tag-unit {
@@ -1214,14 +1216,11 @@ a.badge:hover { text-decoration: underline; }
 .vmark.approved { border-color: var(--green); background: #23b03955; }
 .vmark.rejected { border-color: var(--red); background: #c0392b55; }
 .vmark:hover { filter: brightness(1.35); }
-/* when a downloaded source also carries a verify marker, outline the whole
-   unit so the marker sits inside the outline rather than beside a clipped one */
-.tag-unit:has(.badge.dl-ok)   { outline: 2px dotted var(--green); outline-offset: 0; }
-.tag-unit:has(.badge.dl-err)  { outline: 2px dotted var(--red); outline-offset: 0; }
-.tag-unit:has(.badge.dl-prog) { outline: 2px dotted var(--amber); outline-offset: 0; }
-.tag-unit:has(.badge.dl-ok) .badge.dl-ok,
-.tag-unit:has(.badge.dl-err) .badge.dl-err,
-.tag-unit:has(.badge.dl-prog) .badge.dl-prog { outline: none; }
+/* the marker fused to a downloaded tag thickens with it, so the pair reads as
+   one 2px-bordered unit; the marker keeps its own verification colour */
+.tag-unit:has(.badge.dl-ok) .vmark,
+.tag-unit:has(.badge.dl-err) .vmark,
+.tag-unit:has(.badge.dl-prog) .vmark { border-width: 2px; margin-left: -2px; }
 
 /* Q while hovering: "needs attention" — outranks per-kind row tints like
    .grid tbody tr.is-manual */
