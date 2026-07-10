@@ -12,6 +12,9 @@ a standalone CLI.
 - `whl_explorer/` — **the catalog explorer** (Flask; `server.py`,
   `templates/`, `static/`). The whole workflow lives here.
 - `libcommon.py` — shared helpers (repo paths, ids, JSON IO).
+- `corpus_sync.py` — the private corpus (`photo/`, `books/` images) is
+  gitignored, not version-controlled; this syncs it against the R2 bucket's
+  `corpus/` prefix instead (`status`, `push --run`, `pull --run`).
 - `convert_xlsx.py` — converts `ch_library.xlsx` to `output/ch_library.json`.
 - `catalog_checks.py` — offline copyright + WHL-catalogue checks (loaders,
   indexes, and the shared cross-database identity test).

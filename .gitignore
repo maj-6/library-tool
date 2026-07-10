@@ -33,6 +33,14 @@ output/whl_corrections.json
 output/ch_library_report.xlsx
 output/entries/
 
+# the private book corpus: capture photography + per-book scan images.
+# Synced through R2 (tools/corpus_sync.py), not through git; the OCR
+# transcripts (books/*/transcript.txt) stay tracked — small, diffable text.
+photo/
+books/**/*.jpg
+books/**/*.jpeg
+books/**/*.png
+
 # per-worktree launcher + its private DATA_ROOT (tools/worktree.py)
 .wt/
 
