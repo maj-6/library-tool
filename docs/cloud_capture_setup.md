@@ -15,28 +15,25 @@ extraction), and files each capture as a manual entry with its photos.
 
 ## 2. Create the tables
 
-SQL Editor → run:
+Paste **`docs/cloud/schema.sql`** into the SQL Editor and run it. That one script
+is the whole backend — `captures` and `books` for this pipeline, plus `volumes`,
+`releases`, `profiles` and `events` for the website. It is idempotent, so re-run
+it whenever the schema changes.
 
-```sql
-create table if not exists captures (
-  id         uuid primary key default gen_random_uuid(),
-  created_at timestamptz default now(),
-  device     text default '',
-  status     text default 'pending',   -- pending | imported | void
-  photos     jsonb default '[]',       -- storage object paths
-  note       text default ''
-);
+## 3. Create the storage buckets
 
-create table if not exists books (
-  key        text primary key,         -- "<source>:<idx>" or "manual:<id>"
-  data       jsonb not null,           -- the book record (one-way mirror)
-  updated_at timestamptz default now()
-);
+```
+python3 tools/cloud_setup.py buckets --apply
 ```
 
-## 3. Create the storage bucket
+`captures` (private) for phone photos, `volumes` (public) for published PDFs.
+The Storage API accepts the service_role key, so this needs no SQL.
 
-Storage → New bucket → name **captures**, private.
+Then check the whole thing:
+
+```
+python3 tools/cloud_setup.py check
+```
 
 ## 4. Wire up both ends
 
