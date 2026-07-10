@@ -36,6 +36,10 @@ android/BookCapture/.gradle/
 android/BookCapture/build/
 android/BookCapture/app/build/
 android/BookCapture/local.properties
+# ...and the per-machine corners of .idea: a 2k-line device catalogue and
+# whichever device the Run button last pointed at
+android/BookCapture/.idea/caches/
+android/BookCapture/.idea/deploymentTargetSelector.xml
 
 # large binaries kept local, excluded from the published repo
 photo/
