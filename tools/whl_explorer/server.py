@@ -186,9 +186,12 @@ def _actor() -> str:
     return name[:60] or "Unnamed user"
 
 
-def activity(verb: str, subject: str, n: int = 1, actor: str | None = None) -> None:
+def activity(verb: str, subject: str, n: int = 1, actor: str | None = None,
+             detail: str = "") -> None:
     rec = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
            "actor": actor or _actor(), "verb": verb, "subject": subject, "n": int(n)}
+    if detail:                      # what exactly (book titles etc.), for the
+        rec["detail"] = str(detail)[:200]   # feed's expandable per-event view
     try:
         with _activity_lock:
             ACTIVITY_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -217,6 +220,109 @@ def api_activity():
                 continue
     rows.reverse()
     return jsonify({"ok": True, "events": rows})
+
+
+# --- review queue ----------------------------------------------------------------
+# An attention mark is a personal flag; a REVIEW is a shared work item raised
+# from the Q popover: visible to every contributor, carrying a comment thread
+# and an explicit resolution (the Google-Docs pattern, minus accounts).
+# kind/ref name the marked item so resolving can clear the underlying mark:
+#   key   -> a state.attn map key ("whl:12", "src:<url>", "ol:3" ...)
+#   row   -> a checked/manual row id
+#   build -> an editor build id
+
+REVIEWS_PATH = lib.OUTPUT_DIR / "reviews.json"
+_reviews_lock = threading.Lock()
+_REVIEW_KINDS = ("key", "row", "build")
+
+
+@app.route("/api/reviews")
+def api_reviews_list():
+    with _reviews_lock:
+        reviews = lib.load_json(REVIEWS_PATH, {})
+    return jsonify({"ok": True, "reviews": reviews})
+
+
+@app.route("/api/reviews", methods=["POST"])
+def api_reviews_create():
+    payload = request.get_json(silent=True) or {}
+    kind = str(payload.get("kind") or "")
+    ref = str(payload.get("ref") or "").strip()
+    if kind not in _REVIEW_KINDS or not ref:
+        abort(400)
+    key = f"{kind}:{ref}"
+    label = str(payload.get("label") or "").strip()[:120]
+    reason = str(payload.get("reason") or "").strip()[:500]
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    created = False
+    with _reviews_lock:
+        reviews = lib.load_json(REVIEWS_PATH, {})
+        # one OPEN review per item -- flagging again refreshes label/reason
+        r = next((x for x in reviews.values()
+                  if x.get("key") == key and x.get("status") == "open"), None)
+        if r:
+            r["label"] = label or r.get("label", "")
+            if reason:
+                r["reason"] = reason
+        else:
+            rid = lib.gen_id(set(reviews))
+            r = reviews[rid] = {
+                "id": rid, "key": key, "kind": kind, "ref": ref,
+                "label": label, "reason": reason, "status": "open",
+                "created_by": _actor(), "created_at": now,
+                "resolved_by": "", "resolved_at": "", "comments": [],
+            }
+            created = True
+        lib.save_json(REVIEWS_PATH, reviews)
+    if created:
+        activity("opened", "review", detail=label)
+    return jsonify({"ok": True, "review": r})
+
+
+@app.route("/api/reviews/<rid>/comment", methods=["POST"])
+def api_reviews_comment(rid: str):
+    payload = request.get_json(silent=True) or {}
+    text = str(payload.get("text") or "").strip()[:1000]
+    if not text:
+        abort(400)
+    with _reviews_lock:
+        reviews = lib.load_json(REVIEWS_PATH, {})
+        if rid not in reviews:
+            abort(404)
+        r = reviews[rid]
+        r.setdefault("comments", []).append({
+            "author": _actor(), "text": text,
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds")})
+        lib.save_json(REVIEWS_PATH, reviews)
+    activity("commented on", "review", detail=r.get("label", ""))
+    return jsonify({"ok": True, "review": r})
+
+
+@app.route("/api/reviews/<rid>/resolve", methods=["POST"])
+def api_reviews_resolve(rid: str):
+    payload = request.get_json(silent=True) or {}
+    resolved = bool(payload.get("resolved", True))
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with _reviews_lock:
+        reviews = lib.load_json(REVIEWS_PATH, {})
+        if rid not in reviews:
+            abort(404)
+        r = reviews[rid]
+        # reopening must not sidestep the one-open-review-per-item rule
+        if not resolved:
+            dup = next((x for x in reviews.values()
+                        if x is not r and x.get("key") == r.get("key")
+                        and x.get("status") == "open"), None)
+            if dup:
+                return jsonify({"ok": False,
+                                "error": "This item already has an open review"}), 409
+        r["status"] = "resolved" if resolved else "open"
+        r["resolved_by"] = _actor() if resolved else ""
+        r["resolved_at"] = now if resolved else ""
+        lib.save_json(REVIEWS_PATH, reviews)
+    activity("resolved" if resolved else "reopened", "review",
+             detail=r.get("label", ""))
+    return jsonify({"ok": True, "review": r})
 
 
 @app.route("/api/log")
@@ -334,7 +440,7 @@ def api_builds_create():
     build["updated_at"] = build["created_at"]
     builds[build["id"]] = build
     lib.save_json(BUILDS_PATH, builds)
-    activity("created", "draft entry")
+    activity("created", "draft entry", detail=build.get("title", ""))
     return jsonify({"ok": True, "build": build})
 
 
@@ -355,7 +461,8 @@ def api_builds_update(build_id: str):
     lib.save_json(BUILDS_PATH, builds)
     # only the status transition is worth a feed entry; every keystroke is not
     if b["status"] != was and b["status"] in ("ready", "uploaded"):
-        activity("uploaded" if b["status"] == "uploaded" else "verified", "book")
+        activity("uploaded" if b["status"] == "uploaded" else "verified", "book",
+                 detail=b.get("title", ""))
     return jsonify({"ok": True, "build": b})
 
 
@@ -1616,14 +1723,40 @@ def api_client_state_put():
                 state[k] = payload[k]
         state["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         lib.save_json(lib.CLIENT_STATE_PATH, state)
-    # the checked set is a blob, not a stream of adds -- diff it to get an event
+    # the checked set is a blob, not a stream of adds -- diff it to get events.
+    # Adds and removals are logged separately from the key-set differences, so
+    # each event's count always agrees with the titles it names (a PUT that
+    # both adds and removes books yields two events, not one net delta).
     if isinstance(new_checked, list) and new_checked is not None:
-        delta = len(new_checked) - before
-        if delta > 0:
-            activity("added", "Checked Books", delta)
-        elif delta < 0:
-            activity("removed", "Checked Books", -delta)
+        n_add, add_titles = _checked_diff(old_checked, new_checked)
+        n_rm, rm_titles = _checked_diff(new_checked, old_checked)
+        if n_add:
+            activity("added", "Checked Books", n_add, detail=add_titles)
+        if n_rm:
+            activity("removed", "Checked Books", n_rm, detail=rm_titles)
     return jsonify({"ok": True})
+
+
+def _checked_diff(old, new, cap: int = 3):
+    """(count, titles) of books in `new` but not `old` ([key, value] pair
+    lists). Purely a nicety for the feed: malformed shapes yield (0, "")."""
+    try:
+        as_map = lambda lst: {p[0]: p[1] for p in (lst or [])
+                              if isinstance(p, list) and len(p) == 2}
+        old_map, new_map = as_map(old), as_map(new)
+        added = [k for k in new_map if k not in old_map]
+        titles = []
+        for k in added:
+            v = new_map[k]
+            b = v.get("book") if isinstance(v, dict) else None
+            t = str(b.get("title") or "").strip() if isinstance(b, dict) else ""
+            if t:
+                titles.append(t)
+        extra = len(titles) - cap
+        return len(added), ("; ".join(titles[:cap]) +
+                            (f" (+{extra} more)" if extra > 0 else ""))
+    except Exception:
+        return 0, ""
 
 
 @app.route("/api/manual")
@@ -1673,7 +1806,7 @@ def api_manual_add():
         entry["id"] = lib.gen_id(set(entries))
         entries[entry["id"]] = entry
         lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
-    activity("added", "manual entry")
+    activity("added", "manual entry", detail=entry.get("title", ""))
     return jsonify({"ok": True, "entry": entry})
 
 
@@ -1736,9 +1869,10 @@ def api_manual_delete(entry_id: str):
         entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
         if entry_id not in entries:
             abort(404)
+        title = entries[entry_id].get("title", "")
         del entries[entry_id]
         lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
-    activity("deleted", "manual entry")
+    activity("deleted", "manual entry", detail=title)
     return jsonify({"ok": True})
 
 
@@ -2871,7 +3005,8 @@ def _import_capture(cfg: dict, cap: dict, mistral_key: str,
 
     sbase.mark_capture(cfg, cap["id"], "imported")
     # a phone capture is attributed to the device, not to whoever ran the sync
-    activity("captured", "book", actor=str(cap.get("device") or "phone")[:60])
+    activity("captured", "book", actor=str(cap.get("device") or "phone")[:60],
+             detail=entry.get("title", ""))
     # keep the cloud copies when OCR/extraction had trouble — the originals
     # are local too, but leaving the remote set makes recovery foolproof
     if delete_remote and not result["errors"]:
