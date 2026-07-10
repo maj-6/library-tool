@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.BookCapture" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="colorPrimary">#6FBBD3</item>
+        <item name="android:statusBarColor">#111111</item>
+    </style>
+
+    <color name="entry_idle">#66333333</color>
+    <color name="entry_active">#884A9E5C</color>
+</resources>
