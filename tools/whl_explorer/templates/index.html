@@ -572,6 +572,7 @@
             <p id="builds-empty" class="empty">No entries yet</p>
           </div>
         </div>
+        <div id="builds-splitter"></div>
 
         <div id="build-editor" hidden>
           <div class="mf-actions build-actions">
@@ -654,6 +655,7 @@
                   </div>
                 </div>
               </form>
+              <div id="form-splitter"></div>
               <div id="build-desc-col">
                 <div class="desc-label-row">
                   <label class="tool-label">Description</label>
@@ -671,13 +673,19 @@
 
           <div id="btab-source" class="pane-sub">
             <div class="src-row">
-              <label class="tool-label" for="b-pdf_file">Path to PDF</label>
+              <label class="tool-label" for="b-pdf_file">Primary PDF source</label>
               <input id="b-pdf_file" class="cad-input" spellcheck="false" />
               <button id="b-pdf-browse" class="cad-btn icon-btn" type="button"
                       data-icon="folder" data-tip="Browse"></button>
               <button id="b-pdf-attach" class="cad-btn icon-btn" type="button"
-                      data-icon="attach" data-tip="Attach"></button>
+                      data-icon="attach" data-tip="Attach as the primary PDF source"></button>
               <span class="tool-label" id="b-src-msg"></span>
+            </div>
+            <div class="src-row">
+              <label class="tool-label">Secondary</label>
+              <span id="b-pdf-sources" class="ocr-chiplist"></span>
+              <button id="b-pdf2-add" class="cad-btn tiny icon-btn" type="button"
+                      data-icon="docplus" data-tip="Add a secondary PDF source — another scan of the same book"></button>
             </div>
             <div class="src-row">
               <label class="tool-label">OCR</label>
@@ -739,6 +747,7 @@
             <ul id="ocr-books"></ul>
             <p id="ocr-books-empty" class="empty">No book folders (build them in the Editor tab)</p>
           </div>
+          <div id="ocr-side-splitter"></div>
           <div class="pane-bar"><span class="tool-label">Documents</span>
             <span class="bar-spacer"></span>
             <button id="ocr-load-file" class="cad-btn tiny icon-btn" type="button"
@@ -750,16 +759,18 @@
             <p id="ocr-docs-empty" class="empty">No documents</p>
           </div>
         </div>
+        <div id="ocr-splitter"></div>
         <div id="ocr-mainpane">
           <div class="pane-bar">
-            <button id="ocr-view-edit" class="cad-btn tiny icon-btn active" type="button"
+            <button id="ocr-view-edit" class="cad-btn tiny icon-btn" type="button"
                     data-icon="pencil" data-tip="Edit the OCR text"></button>
             <button id="ocr-view-diff" class="cad-btn tiny icon-btn" type="button"
                     data-icon="diff" data-tip="Compare against another document"></button>
-            <button id="ocr-view-pdf" class="cad-btn tiny icon-btn" type="button"
+            <button id="ocr-view-pdf" class="cad-btn tiny icon-btn active" type="button"
                     data-icon="pdfpage" data-tip="Show the PDF beside the text, page by page"></button>
-            <button id="ocr-layout" class="cad-btn tiny" type="button" hidden
-                    data-tip="Lay the text out at the position and scale it occupies on the page (read-only). Needs a text layer in the PDF.">Layout</button>
+            <button id="ocr-layout" class="cad-btn tiny icon-btn" type="button"
+                    data-icon="layout"
+                    data-tip="Facsimile layout: the document's text at the position and scale it occupies on the page (read-only)"></button>
             <button id="ocr-del-pages" class="cad-btn tiny icon-btn danger" type="button"
                     data-icon="trash" data-tip="Delete the selected pages from the PDF itself (a .bak.pdf backup is kept; OCR files are renumbered)"></button>
             <select id="ocr-diff-with" class="cad-input" data-tip="Compare against"></select>
@@ -786,11 +797,12 @@
                     data-icon="save" data-tip="Save to the entry folder"></button>
             <span class="tool-label" id="ocr-msg"></span>
           </div>
-          <textarea id="ocr-editor" class="cad-input" spellcheck="false"></textarea>
+          <textarea id="ocr-editor" class="cad-input" spellcheck="false" hidden></textarea>
           <div class="drafting" id="ocr-diff" hidden></div>
-          <div class="drafting" id="ocr-pages" hidden></div>
+          <div class="drafting" id="ocr-pages"></div>
         </div>
       </div>
+      <div id="ocr-queue-splitter"></div>
       <div class="pane-bar">
         <span class="tool-label">OCR queue</span>
         <span class="tb-sep"></span>

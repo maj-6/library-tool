@@ -3196,3 +3196,65 @@ body[data-theme] .drafting::-webkit-scrollbar {
   height: 0;
   display: none;
 }
+
+/* --- pane gutters: drag to resize, double-click to reset ------------------ */
+#ocr-splitter, #builds-splitter, #form-splitter {
+  flex: 0 0 6px;
+  cursor: col-resize;
+  background: transparent;
+  border-left: 1px solid var(--face-sh);
+}
+#ocr-side-splitter, #ocr-queue-splitter {
+  flex: 0 0 6px;
+  cursor: row-resize;
+  background: transparent;
+  border-top: 1px solid var(--face-sh);
+}
+#ocr-splitter:hover, #builds-splitter:hover, #form-splitter:hover,
+#ocr-side-splitter:hover, #ocr-queue-splitter:hover {
+  background: var(--face-active);
+}
+
+/* --- documents tree: one node per PDF source, its OCR files beneath ------- */
+.ocr-src {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 6px;
+  border-bottom: 1px solid var(--canvas-line);
+  cursor: pointer;
+  font-family: var(--mono);
+  color: var(--ink-light);
+}
+.ocr-src:hover { background: var(--row-hover); }
+.ocr-src .bi-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: bold;
+}
+.tree-arrow { width: 10px; font-size: 9px; opacity: 0.7; text-align: center; }
+.tree-ico { display: inline-flex; opacity: 0.7; }
+.tree-ico svg { width: 12px; height: 12px; }
+.tree-count { font-size: 10px; opacity: 0.6; }
+.ocr-doc.tree-doc { padding-left: 28px; }
+
+/* secondary PDF source chips (editor Source tab) */
+.src2-chip { display: inline-flex; align-items: center; gap: 4px; }
+.src2-del {
+  border: none;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 0 1px;
+  opacity: 0.6;
+}
+.src2-del:hover { opacity: 1; color: var(--red); }
+
+/* the editor book list, tightened: more rows on screen */
+#builds-list .build-item { padding: 2px 8px; line-height: 1.25; }
+#builds-list .bi-meta { font-size: 9px; }
