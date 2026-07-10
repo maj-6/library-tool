@@ -6,6 +6,7 @@ explorer, the Open Library index builders, and the catalog checks.
 from __future__ import annotations
 
 import json
+import re
 import os
 import sys
 import time
@@ -92,6 +93,23 @@ MANUAL_ENTRY_FIELDS = [
 
 
 # --- ids -------------------------------------------------------------------
+
+def slugify(title: str, year=None, taken: set | None = None) -> str:
+    """A stable, readable url key: "flora-rustica-1792".
+
+    Deduplicated against `taken` when given, so two editions of the same book in
+    the same year get -2, -3 rather than colliding on a unique index.
+    """
+    base = re.sub(r"[^a-z0-9]+", "-", f"{title} {year or ''}".lower()).strip("-")[:60]
+    base = base or "volume"
+    if taken is None:
+        return base
+    slug, n = base, 2
+    while slug in taken:
+        slug, n = f"{base}-{n}", n + 1
+    taken.add(slug)
+    return slug
+
 
 def gen_id(existing: set[str] | None = None) -> str:
     """Return a short random hex id not present in existing."""

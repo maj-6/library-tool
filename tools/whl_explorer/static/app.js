@@ -103,6 +103,8 @@ const state = {
     // Cloud capture (phone -> Supabase -> manual entries) + Mistral key,
     // shared by the capture pipeline and the Mistral OCR service
     supabaseUrl: "", supabaseKey: "", mistralKey: "",
+    // Cloudflare R2 for published PDFs (Supabase storage is 1 GB on free)
+    r2Account: "", r2Bucket: "", r2KeyId: "", r2Secret: "", r2PublicBase: "",
     cloudSyncMinutes: 0, cloudDeleteRemote: true,
     ocrService: "tesseract", ocrAzureEndpoint: "", ocrAzureKey: "",
     ocrTesseract: "", ocrClaudeKey: "", ocrClaudeModel: "",
@@ -1786,7 +1788,10 @@ function renderSettings() {
   fillFontSelect("font-mono2-select", FONT_CHOICES, "fontMono2", applyFont);
 
   // AI
-  for (const [id, k] of [["set-ai-base", "aiBase"], ["set-ai-model", "aiModel"],
+  for (const [id, k] of [["set-r2-account", "r2Account"], ["set-r2-bucket", "r2Bucket"],
+                        ["set-r2-key", "r2KeyId"], ["set-r2-secret", "r2Secret"],
+                        ["set-r2-public", "r2PublicBase"],
+                        ["set-ai-base", "aiBase"], ["set-ai-model", "aiModel"],
                          ["set-ai-key", "aiKey"],
                          ["set-ai-instructions", "aiInstructions"]]) {
     const n = el(id);
@@ -7108,22 +7113,67 @@ function renderBuildsList() {
   }
 }
 
-// "Upload to WHL": the actual submission API call is a later feature —
-// for now this moves the verified entry out of the Pending queue into
-// the Uploaded tab (undoable).
+// Publish a verified entry to the Library Tool cloud: its PDF to object
+// storage, its metadata to Supabase, where the website's library browser reads
+// it. This used to be "Upload to WHL", which flipped a status field and sent
+// nothing anywhere -- there was no WHL write API to call.
 async function uploadBuild() {
   const b = currentBuild();
   if (!b) return;
   if (b.status !== "ready") {
-    el("build-msg").textContent = "Only verified entries can be uploaded";
+    el("build-msg").textContent = "Only verified entries can be published";
     return;
   }
-  if (await patchBuild(b.id, { status: "uploaded" },
-      `upload ${b.title || b.id}`)) {
-    state.buildSel = null;
-    renderUpload();
-    status(`MARKED UPLOADED :: ${b.title || b.id} (WHL upload API pending)`);
+  if (!(b.pdf_file || "").trim()) {
+    el("build-msg").textContent = "Attach the PDF before publishing";
+    return;
   }
+  let res;
+  try {
+    res = await (await fetch("/api/volumes/publish", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ build_id: b.id }),
+    })).json();
+  } catch (e) {
+    statusCrit("PUBLISH :: server unreachable");
+    return;
+  }
+  if (!res.ok) { statusErr("PUBLISH :: " + (res.error || "failed to start")); return; }
+  status(`PUBLISHING :: ${b.title || b.id}`);
+  pollPublish();
+}
+
+// A 129 MB volume is minutes, not seconds, so the upload runs server-side and
+// the footer carries its progress.
+let _publishTimer = null;
+function pollPublish() {
+  clearInterval(_publishTimer);
+  _publishTimer = setInterval(async () => {
+    let st;
+    try {
+      st = await (await fetch("/api/volumes/publish/status")).json();
+    } catch (e) {
+      clearInterval(_publishTimer);
+      statusCrit("PUBLISH :: server unreachable");
+      return;
+    }
+    if (st.stage === "uploading" && st.total) {
+      const pct = Math.floor((st.sent / st.total) * 100);
+      status(`PUBLISHING :: ${pct}% of ${(st.total / 1048576).toFixed(0)} MB via ${st.store}`);
+      return;
+    }
+    if (st.stage === "recording") { status("PUBLISHING :: recording the volume"); return; }
+    if (st.running) return;
+    clearInterval(_publishTimer);
+    if (st.stage === "error") { statusCrit("PUBLISH FAILED :: " + st.error); return; }
+    if (st.stage === "done") {
+      await loadBuilds();
+      state.buildSel = null;
+      renderUpload();
+      renderHome();
+      status(`PUBLISHED :: ${st.slug}`);
+    }
+  }, 700);
 }
 
 function activeBuildTab() {

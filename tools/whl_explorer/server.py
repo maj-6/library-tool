@@ -44,6 +44,7 @@ import capture_pipeline as capture  # noqa: E402
 import catalog_checks as checks  # noqa: E402
 import copyright_registration as copyreg  # noqa: E402
 import libcommon as lib  # noqa: E402
+import r2_store as r2  # noqa: E402
 import supabase_sync as sbase  # noqa: E402
 import ol_client  # noqa: E402
 import scan_search  # noqa: E402
@@ -2493,6 +2494,124 @@ def _cloud_cfg() -> dict | None:
     key = str(s.get("supabaseKey") or "").strip()
     return {"url": url, "key": key} if url and key else None
 
+
+
+# --- publishing a volume to the cloud library ---------------------------------
+# The Editor's old "Upload to WHL" only flipped a status field; there was no WHL
+# write API and nothing ever left the machine. A volume now goes to object
+# storage, and its metadata to Supabase, where the website reads it.
+#
+# Two stores, because the free Supabase tier is 1 GB and one local scan is
+# 129 MB: R2 when configured (metadata still in Supabase), otherwise the
+# Supabase `volumes` bucket. The volumes row records whichever URL resulted, so
+# the reader never needs to know which was used.
+
+_publish_lock = threading.Lock()
+_publish: dict = {"running": False, "build": "", "stage": "idle", "sent": 0,
+                  "total": 0, "error": "", "url": "", "slug": ""}
+
+
+def _r2_cfg() -> dict:
+    s = _client_settings()
+    return {"account": str(s.get("r2Account") or "").strip(),
+            "bucket": str(s.get("r2Bucket") or "").strip(),
+            "key_id": str(s.get("r2KeyId") or "").strip(),
+            "secret": str(s.get("r2Secret") or "").strip(),
+            "public_base": str(s.get("r2PublicBase") or "").strip()}
+
+
+def _volume_row(b: dict, slug: str, url: str, path: str, size: int, actor: str) -> dict:
+    num = lambda v: int(v) if str(v or "").strip().isdigit() else None   # noqa: E731
+    return {"slug": slug, "title": b.get("title") or "",
+            "subtitle": b.get("subtitle") or "", "authors": b.get("authors") or "",
+            "year": num(b.get("year")), "publisher": b.get("publisher") or "",
+            "publisher_city": b.get("publisher_city") or "",
+            "edition": b.get("edition") or "", "language": b.get("language") or "",
+            "pages": num(b.get("pages")), "categories": b.get("categories") or "",
+            "description": b.get("description") or "",
+            "source_url": b.get("source_url") or b.get("pdf_source") or "",
+            "pdf_url": url, "pdf_path": path, "pdf_bytes": size,
+            "uploaded_by_name": actor,
+            "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+
+
+def _publish_run(bid: str, actor: str) -> None:
+    def stage(name, **kw):
+        with _publish_lock:
+            _publish.update(stage=name, **kw)
+    try:
+        builds = lib.load_json(BUILDS_PATH, {})
+        b = builds.get(bid) or {}
+        pdf = _resolve_local(b.get("pdf_file") or "")
+        if pdf is None or not pdf.is_file():
+            raise RuntimeError("this entry has no local PDF attached")
+        cloud = _cloud_cfg()
+        if not cloud:
+            raise RuntimeError("Supabase is not configured (Settings > Sync)")
+
+        size = pdf.stat().st_size
+        slug = lib.slugify(b.get("title") or "", b.get("year"))
+        name = f"{slug}.pdf"
+        stage("uploading", sent=0, total=size)
+
+        def progress(sent, total):
+            with _publish_lock:
+                _publish["sent"] = sent
+
+        r2cfg = _r2_cfg()
+        if r2.configured(r2cfg):
+            # an R2 bucket may also hold installers, so namespace the volumes
+            url = r2.put_file(r2cfg, f"volumes/{name}", pdf, "application/pdf",
+                              on_progress=progress)
+            path = ""
+        else:
+            # the Supabase bucket IS "volumes" -- prefixing again would nest it
+            data = pdf.read_bytes()          # storage has no streaming upload
+            progress(size, size)
+            sbase.upload_object(cloud, "volumes", name, data, "application/pdf")
+            url, path = sbase.public_url(cloud, "volumes", name), name
+
+        stage("recording")
+        sbase.upsert_volume(cloud, _volume_row(b, slug, url, path, size, actor))
+
+        b["status"] = "uploaded"
+        b["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        lib.save_json(BUILDS_PATH, builds)
+        activity("published", "book", actor=actor or None)
+        log.info("published volume %s (%.0f MB) -> %s", slug, size / 1e6, url)
+        stage("done", url=url, slug=slug, error="")
+    except Exception as exc:
+        log.error("publish failed for build %s", bid, exc_info=exc)
+        stage("error", error=f"{type(exc).__name__}: {exc}")
+    finally:
+        with _publish_lock:
+            _publish["running"] = False
+
+
+@app.route("/api/volumes/publish", methods=["POST"])
+def api_volumes_publish():
+    p = request.get_json(silent=True) or {}
+    bid = str(p.get("build_id") or "").strip()
+    builds = lib.load_json(BUILDS_PATH, {})
+    if bid not in builds:
+        abort(404)
+    if builds[bid].get("status") not in ("ready", "uploaded"):
+        return jsonify({"ok": False, "error": "only verified entries can be published"}), 400
+    if not _cloud_cfg():
+        return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Sync)"}), 400
+    with _publish_lock:
+        if _publish["running"]:
+            return jsonify({"ok": False, "error": "a publish is already running"}), 409
+        _publish.update(running=True, build=bid, stage="starting", sent=0, total=0,
+                        error="", url="", slug="")
+    threading.Thread(target=_publish_run, args=(bid, _actor()), daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/volumes/publish/status")
+def api_volumes_publish_status():
+    with _publish_lock:
+        return jsonify(dict(_publish, store="r2" if r2.configured(_r2_cfg()) else "supabase"))
 
 def _capture_note(cap: dict, errors: list[str]) -> str:
     bits = ["Captured via phone"]
