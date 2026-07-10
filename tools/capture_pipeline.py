@@ -86,6 +86,18 @@ def find_page_quad(img_bytes: bytes):
     if best is None or best_area < 0.25 * sh * sw:
         return None
     quad = _order_quad(best.reshape(4, 2))
+    # a page on a desk is much brighter inside the quad than outside; a
+    # decorative border box INSIDE a full-frame page is not — warping to that
+    # box would crop away real content, so require the contrast
+    mask = np.zeros((sh, sw), np.uint8)
+    cv2.fillPoly(mask, [quad.astype(np.int32)], 255)
+    gray2 = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    inside = cv2.mean(gray2, mask=mask)[0]
+    outside_mask = cv2.bitwise_not(mask)
+    if cv2.countNonZero(outside_mask) > 0.02 * sh * sw:
+        outside = cv2.mean(gray2, mask=outside_mask)[0]
+        if inside - outside < 25:
+            return None
     if scale < 1:
         quad = quad / scale
     return quad
@@ -222,7 +234,17 @@ def extract_bibliography(ocr_text: str, api_key: str, timeout: float = 60.0) -> 
         return empty
     out = {k: str(obj.get(k) or "").strip() for k in FIELDS}
     extra = obj.get("extra")
-    out["extra"] = ({str(k): str(v) for k, v in extra.items() if str(v or "").strip()}
+
+    def _flat(v):                       # nested values -> JSON, not Python reprs
+        return (json.dumps(v, ensure_ascii=False)
+                if isinstance(v, (dict, list)) else str(v).strip())
+
+    def _keep(v):
+        if isinstance(v, (dict, list)):
+            return bool(v)
+        return bool(str(v or "").strip())
+
+    out["extra"] = ({str(k): _flat(v) for k, v in extra.items() if _keep(v)}
                     if isinstance(extra, dict) else {})
     return out
 
@@ -244,6 +266,8 @@ def process_capture(photo_bytes_list: list[bytes], api_key: str) -> dict:
     photos: list[bytes] = []
     texts: list[str] = []
     errors: list[str] = []
+    if not api_key:
+        errors.append("OCR skipped (no Mistral API key configured)")
     for i, raw in enumerate(photo_bytes_list, 1):
         try:
             processed = process_photo(raw)
@@ -253,12 +277,20 @@ def process_capture(photo_bytes_list: list[bytes], api_key: str) -> dict:
         photos.append(processed)
         if not api_key:
             continue
-        try:
-            text = mistral_ocr(ocr_preprocess(processed), api_key)
-            if text:
-                texts.append(f"--- Photo {i} ---\n{text}")
-        except Exception as exc:
-            errors.append(f"photo {i}: OCR failed ({type(exc).__name__}: {exc})")
+        # one retry: a transient 429/5xx/network blip must not permanently
+        # cost this capture its extraction (it is only OCRed once, at import)
+        for attempt in (1, 2):
+            try:
+                text = mistral_ocr(ocr_preprocess(processed), api_key)
+                if text:
+                    texts.append(f"--- Photo {i} ---\n{text}")
+                break
+            except Exception as exc:
+                if attempt == 2:
+                    errors.append(f"photo {i}: OCR failed ({type(exc).__name__}: {exc})")
+                else:
+                    import time
+                    time.sleep(2.0)
     ocr_text = "\n\n".join(texts)
     fields = {k: "" for k in FIELDS}
     extra: dict = {}

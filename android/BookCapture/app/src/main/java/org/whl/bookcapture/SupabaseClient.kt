@@ -58,7 +58,9 @@ class SupabaseClient(private val baseUrl: String, private val key: String) {
             .put("photos", JSONArray(photoPaths))
             .put("note", note)
         val conn = open("POST", "$baseUrl/rest/v1/captures", "application/json")
-        conn.setRequestProperty("Prefer", "return=minimal,resolution=merge-duplicates")
+        // ignore-duplicates: a retried upload after the desktop already imported
+        // the row must NOT reset its status back to pending
+        conn.setRequestProperty("Prefer", "return=minimal,resolution=ignore-duplicates")
         conn.doOutput = true
         conn.outputStream.use { it.write(body.toString().toByteArray()) }
         finish(conn)

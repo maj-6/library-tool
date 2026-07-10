@@ -1540,6 +1540,7 @@ function renderSettings() {
   el("cloud-test").onclick = async () => {
     el("cloud-test-msg").textContent = "Testing…";
     try {
+      await flushClientState();   // the server reads settings server-side — push first
       const r = await (await fetch("/api/cloudsync/test")).json();
       el("cloud-test-msg").textContent = r.ok
         ? "OK — captures table + storage bucket reachable"
@@ -6174,6 +6175,7 @@ let _cloudPoll = null;
 async function runCloudSync() {
   const btn = el("cloud-sync-btn");
   try {
+    await flushClientState();   // the engine reads settings server-side — push first
     const r = await (await fetch("/api/cloudsync/run", { method: "POST" })).json();
     if (!r.ok) { status("CLOUD SYNC :: " + (r.error || "failed to start")); return; }
   } catch (e) { status("CLOUD SYNC :: server unreachable"); return; }

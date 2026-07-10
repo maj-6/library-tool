@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
 import android.os.Bundle
 import android.view.View
+import android.view.WindowManager
 import android.widget.ImageView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
@@ -39,7 +40,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cues: AudioCues
     private var voice: VoiceController? = null
     private var imageCapture: ImageCapture? = null
-    private var busy = false          // a shot is being written
+    private var busy = false                  // a shot is being written
+    private var pendingCommand: String? = null   // "done"/"cancel" said mid-shot
 
     private val permissions = arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
 
@@ -47,8 +49,9 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         session = CaptureSession(this)
-        cues = AudioCues(this) { speaking -> voice?.suppressed = speaking }
+        cues = AudioCues(this) { speaking -> voice?.suppress(speaking) }
 
         binding.btnStart.setOnClickListener { command("start") }
         binding.btnPhoto.setOnClickListener { command("photo") }
@@ -79,15 +82,15 @@ class MainActivity : AppCompatActivity() {
             onCommand = { word -> runOnUiThread { command(word) } },
             onState = { msg -> runOnUiThread { setStatus(msg) } })
         voice = v
-        if (v.modelReady) v.start()
-        else lifecycleScope.launch {
+        lifecycleScope.launch(Dispatchers.IO) {    // model download/load off the UI thread
             try {
-                withContext(Dispatchers.IO) {
+                if (!v.modelReady)
                     v.downloadModel { p -> runOnUiThread { setStatus(p) } }
-                }
                 v.start()
             } catch (e: Exception) {
-                setStatus(getString(R.string.model_download_failed, e.message ?: "?"))
+                withContext(Dispatchers.Main) {
+                    setStatus(getString(R.string.model_download_failed, e.message ?: "?"))
+                }
             }
         }
         updateUi()
@@ -113,16 +116,22 @@ class MainActivity : AppCompatActivity() {
     // --- the command state machine --------------------------------------------
 
     private fun command(word: String) {
+        // a shot is still being written: sealing/voiding now would lose it, so
+        // remember the command and run it the moment the shot lands
+        if (busy && (word == "done" || word == "cancel")) {
+            pendingCommand = word
+            return
+        }
         when (word) {
             "start" -> {
-                if (session.active) cues.error("already started, say done or cancel")
+                if (session.active) cues.error("entry already open")
                 else {
                     session.start()
                     cues.started()
                 }
             }
             "photo" -> {
-                if (!session.active) cues.error("say start first")
+                if (!session.active) cues.error("no entry open")
                 else takePhoto()
             }
             "done" -> {
@@ -130,7 +139,7 @@ class MainActivity : AppCompatActivity() {
                 else {
                     val photos = session.photoCount
                     val id = session.done()
-                    if (id == null) cues.error("no photos, entry dropped")
+                    if (id == null) cues.error("no pages, entry dropped")
                     else {
                         cues.saved(photos)
                         UploadWorker.enqueue(this)
@@ -139,7 +148,7 @@ class MainActivity : AppCompatActivity() {
             }
             "cancel" -> {
                 if (session.cancel()) cues.cancelled()
-                else cues.error("nothing to cancel")
+                else cues.error("nothing to discard")
             }
         }
         updateUi()
@@ -147,7 +156,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun takePhoto() {
         val capture = imageCapture ?: return cues.error("camera not ready")
-        if (busy) return                          // a shot is already in flight
+        if (busy) { cues.error("hold on"); return }   // audible, never silent
         val file = session.nextPhotoFile() ?: return
         busy = true
         val opts = ImageCapture.OutputFileOptions.Builder(file).build()
@@ -159,13 +168,21 @@ class MainActivity : AppCompatActivity() {
                     cues.photo(session.photoCount)
                     addThumbnail(file.absolutePath)
                     updateUi()
+                    runPending()
                 }
                 override fun onError(e: ImageCaptureException) {
                     busy = false
-                    cues.error("photo failed")
+                    cues.error("capture failed")
                     setStatus("Capture error: ${e.message}")
+                    runPending()
                 }
             })
+    }
+
+    private fun runPending() {
+        val cmd = pendingCommand ?: return
+        pendingCommand = null
+        command(cmd)
     }
 
     // --- UI ---------------------------------------------------------------------
@@ -207,7 +224,13 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        voice?.setPaused(false)               // mic live only while on screen
         updateUi()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        voice?.setPaused(true)
     }
 
     override fun onDestroy() {

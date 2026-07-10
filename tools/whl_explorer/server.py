@@ -1160,6 +1160,11 @@ def _entry_checks(entry: dict) -> dict:
 
 _CLIENT_STATE_KEYS = ("checked", "settings", "attention")
 _client_state_lock = threading.Lock()
+
+# manual_entries.json is rewritten whole by every mutation; now that the cloud
+# capture importer writes it from a background thread, every read-modify-write
+# must hold this lock or a concurrent save silently drops the other's entry.
+_manual_lock = threading.Lock()
 _CS_BACKUP_KEEP = 40
 
 
@@ -1252,12 +1257,13 @@ def api_manual_add():
     if payload.get("images"):
         entry["images"] = _clean_images(payload.get("images"))
 
-    entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
-    entry["id"] = lib.gen_id(set(entries))
     entry["created_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     entry["checks"] = _entry_checks(entry)
-    entries[entry["id"]] = entry
-    lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+    with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+        entry["id"] = lib.gen_id(set(entries))
+        entries[entry["id"]] = entry
+        lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
     return jsonify({"ok": True, "entry": entry})
 
 
@@ -1269,28 +1275,29 @@ def api_manual_update(entry_id: str):
     "_preserve": true keeps checks/scans/verifications — used for changes
     that don't alter the book's identity (title parsing migration, attaching
     a local scan PDF)."""
-    entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
-    if entry_id not in entries:
-        abort(404)
     payload = request.get_json(silent=True) or {}
-    e = entries[entry_id]
-    for f in lib.MANUAL_ENTRY_FIELDS:
-        if f in payload:
-            e[f] = str(payload[f] or "").strip()
-    # non-column metadata: only replaced when explicitly sent (survives edits)
-    if "extra" in payload:
-        e["extra"] = _clean_extra(payload.get("extra"))
-    if "images" in payload:
-        e["images"] = _clean_images(payload.get("images"))
-    if not e.get("title"):
-        return jsonify({"ok": False, "error": "TITLE IS REQUIRED"}), 400
-    if not payload.get("_preserve"):
-        e["checks"] = _entry_checks(e)
-        # Metadata changed: stored matches and their verifications are stale.
-        e.pop("scans", None)
-        e.pop("verify", None)
-        e.pop("manual_urls", None)
-    lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+    with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+        if entry_id not in entries:
+            abort(404)
+        e = entries[entry_id]
+        for f in lib.MANUAL_ENTRY_FIELDS:
+            if f in payload:
+                e[f] = str(payload[f] or "").strip()
+        # non-column metadata: only replaced when explicitly sent (survives edits)
+        if "extra" in payload:
+            e["extra"] = _clean_extra(payload.get("extra"))
+        if "images" in payload:
+            e["images"] = _clean_images(payload.get("images"))
+        if not e.get("title"):
+            return jsonify({"ok": False, "error": "TITLE IS REQUIRED"}), 400
+        if not payload.get("_preserve"):
+            e["checks"] = _entry_checks(e)
+            # Metadata changed: stored matches and their verifications are stale.
+            e.pop("scans", None)
+            e.pop("verify", None)
+            e.pop("manual_urls", None)
+        lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
     return jsonify({"ok": True, "entry": e})
 
 
@@ -1306,19 +1313,21 @@ def api_manual_restore():
     eid = str(entry.get("id") or "")
     if not eid or not str(entry.get("title", "") or "").strip():
         abort(400)
-    entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
-    entries[eid] = entry
-    lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+    with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+        entries[eid] = entry
+        lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
     return jsonify({"ok": True, "entry": entry})
 
 
 @app.route("/api/manual/<entry_id>", methods=["DELETE"])
 def api_manual_delete(entry_id: str):
-    entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
-    if entry_id not in entries:
-        abort(404)
-    del entries[entry_id]
-    lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+    with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+        if entry_id not in entries:
+            abort(404)
+        del entries[entry_id]
+        lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
     return jsonify({"ok": True})
 
 
@@ -1335,12 +1344,13 @@ def api_manual_scans(entry_id: str):
     # The scan search is slow (network): the entry may have been edited in
     # the meantime. Re-read and merge only the scans, so this request can't
     # resurrect a stale snapshot of the other fields.
-    entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
-    if entry_id not in entries:
-        abort(404)
-    e = entries[entry_id]
-    e["scans"] = scans
-    lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+    with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+        if entry_id not in entries:
+            abort(404)
+        e = entries[entry_id]
+        e["scans"] = scans
+        lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
     return jsonify({"ok": True, "entry": e})
 
 
@@ -1353,25 +1363,26 @@ def api_manual_verify(entry_id: str):
     'rejected' marks the match as a false positive; 'pending' clears the
     verification.
     """
-    entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
-    if entry_id not in entries:
-        abort(404)
     payload = request.get_json(silent=True) or {}
     source = str(payload.get("source", "") or "")
     verdict = str(payload.get("state", "") or "")
     if source not in ("whl", "internet_archive", "hathitrust") or \
             verdict not in ("approved", "rejected", "pending"):
         abort(400)
-    e = entries[entry_id]
-    verify = e.setdefault("verify", {})
-    if verdict == "pending":
-        verify.pop(source, None)
-    else:
-        verify[source] = verdict
-    if verdict != "rejected":
-        # A manually located source only exists alongside a rejected match.
-        (e.get("manual_urls") or {}).pop(source, None)
-    lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+    with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+        if entry_id not in entries:
+            abort(404)
+        e = entries[entry_id]
+        verify = e.setdefault("verify", {})
+        if verdict == "pending":
+            verify.pop(source, None)
+        else:
+            verify[source] = verdict
+        if verdict != "rejected":
+            # A manually located source only exists alongside a rejected match.
+            (e.get("manual_urls") or {}).pop(source, None)
+        lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
     return jsonify({"ok": True, "entry": e})
 
 
@@ -1382,21 +1393,22 @@ def api_manual_source(entry_id: str):
     Body: {"source": "whl"|"internet_archive"|"hathitrust", "url": "..."};
     an empty url clears it.
     """
-    entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
-    if entry_id not in entries:
-        abort(404)
     payload = request.get_json(silent=True) or {}
     source = str(payload.get("source", "") or "")
     url = str(payload.get("url", "") or "").strip()
     if source not in ("whl", "internet_archive", "hathitrust"):
         abort(400)
-    e = entries[entry_id]
-    urls = e.setdefault("manual_urls", {})
-    if url:
-        urls[source] = url
-    else:
-        urls.pop(source, None)
-    lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+    with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+        if entry_id not in entries:
+            abort(404)
+        e = entries[entry_id]
+        urls = e.setdefault("manual_urls", {})
+        if url:
+            urls[source] = url
+        else:
+            urls.pop(source, None)
+        lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
     return jsonify({"ok": True, "entry": e})
 
 
@@ -2188,17 +2200,30 @@ def _import_capture(cfg: dict, cap: dict, mistral_key: str,
     cap_id = re.sub(r"[^A-Za-z0-9-]", "", str(cap.get("id") or ""))[:64]
     if not cap_id:
         return "skipped"
-    entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
-    if any(e.get("capture_id") == cap_id for e in entries.values()):
-        sbase.mark_capture(cfg, cap["id"], "imported")   # already here: idempotent
-        return "skipped"
     photo_paths = cap.get("photos") or []
     if isinstance(photo_paths, str):
         try:
             photo_paths = json.loads(photo_paths)
         except json.JSONDecodeError:
             photo_paths = []
-    raw_photos = [sbase.download_photo(cfg, p) for p in photo_paths]
+    with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+        dup = any(e.get("capture_id") == cap_id for e in entries.values())
+    if dup:
+        sbase.mark_capture(cfg, cap["id"], "imported")   # already here: idempotent
+        if delete_remote:                                # a lost mark left these behind
+            try:
+                sbase.delete_photos(cfg, photo_paths)
+            except sbase.SyncError:
+                pass
+        return "skipped"
+    try:
+        raw_photos = [sbase.download_photo(cfg, p) for p in photo_paths]
+    except sbase.SyncError as exc:
+        if "HTTP 404" in str(exc) or "HTTP 400" in str(exc):
+            # the photos are gone — this row can never import; stop retrying it
+            sbase.mark_capture(cfg, cap["id"], "error")
+        raise
     result = capture.process_capture(raw_photos, mistral_key)
 
     cdir = CAPTURES_DIR / cap_id
@@ -2207,6 +2232,8 @@ def _import_capture(cfg: dict, cap: dict, mistral_key: str,
     for i, jpg in enumerate(result["photos"], 1):
         (cdir / f"photo_{i}.jpg").write_bytes(jpg)
         images.append(f"captures/{cap_id}/photo_{i}.jpg")
+    for i, raw in enumerate(raw_photos, 1):       # originals: re-OCR stays possible
+        (cdir / f"orig_{i}.jpg").write_bytes(raw)
     if result["ocr_text"]:
         (cdir / "ocr.txt").write_text(result["ocr_text"], "utf-8", errors="replace")
 
@@ -2221,15 +2248,18 @@ def _import_capture(cfg: dict, cap: dict, mistral_key: str,
     entry["extra"] = _clean_extra(result["extra"])
     entry["images"] = images
     entry["capture_id"] = cap_id
-    entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
-    entry["id"] = lib.gen_id(set(entries))
     entry["created_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     entry["checks"] = _entry_checks(entry)
-    entries[entry["id"]] = entry
-    lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+    with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+        entry["id"] = lib.gen_id(set(entries))
+        entries[entry["id"]] = entry
+        lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
 
     sbase.mark_capture(cfg, cap["id"], "imported")
-    if delete_remote:
+    # keep the cloud copies when OCR/extraction had trouble — the originals
+    # are local too, but leaving the remote set makes recovery foolproof
+    if delete_remote and not result["errors"]:
         try:
             sbase.delete_photos(cfg, photo_paths)
         except sbase.SyncError:
@@ -2260,7 +2290,11 @@ def _books_mirror_rows() -> list[dict]:
 
 
 def _cloud_sync_run() -> dict:
-    """One full sync pass: import pending captures, push the books mirror."""
+    """One full sync pass: import pending captures, push the books mirror.
+
+    Everything after the flag is claimed runs inside try/finally, and ANY
+    exception lands in `result` — the flag can never stay stuck on, and a
+    failed pass can't masquerade as the previous run's outcome."""
     cfg = _cloud_cfg()
     if not cfg:
         return {"ok": False, "error": "Supabase URL/key not configured"}
@@ -2268,12 +2302,13 @@ def _cloud_sync_run() -> dict:
         if _cloudsync["running"]:
             return {"ok": False, "error": "sync already running"}
         _cloudsync["running"] = True
-    s = _client_settings()
-    mistral_key = str(s.get("mistralKey") or "").strip()
-    delete_remote = s.get("cloudDeleteRemote") is not False
     imported = skipped = 0
     errors: list[str] = []
+    result: dict = {"ok": False, "error": "sync crashed", "errors": errors}
     try:
+        s = _client_settings()
+        mistral_key = str(s.get("mistralKey") or "").strip()
+        delete_remote = s.get("cloudDeleteRemote") is not False
         for cap in sbase.list_pending_captures(cfg):
             try:
                 if _import_capture(cfg, cap, mistral_key, delete_remote) == "imported":
@@ -2289,9 +2324,9 @@ def _cloud_sync_run() -> dict:
             errors.append(f"books mirror: {exc}")
         result = {"ok": not errors, "imported": imported, "skipped": skipped,
                   "books_pushed": pushed, "errors": errors}
-    except sbase.SyncError as exc:
-        result = {"ok": False, "error": str(exc), "imported": imported,
-                  "errors": errors}
+    except Exception as exc:
+        result = {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                  "imported": imported, "errors": errors}
     finally:
         with _cloudsync_lock:
             _cloudsync["running"] = False
@@ -2310,18 +2345,17 @@ def _cloud_autosync_loop() -> None:
     import time
     while True:
         time.sleep(30)
+        # the WHOLE tick is guarded: a torn settings read (or anything else)
+        # must never kill this thread — it would silently stop syncing forever
         try:
             minutes = int(_client_settings().get("cloudSyncMinutes") or 0)
-        except (TypeError, ValueError):
-            minutes = 0
-        if minutes <= 0 or not _cloud_cfg():
-            continue
-        if time.time() - _autosync_last >= minutes * 60:
-            _autosync_last = time.time()
-            try:
+            if minutes <= 0 or not _cloud_cfg():
+                continue
+            if time.time() - _autosync_last >= minutes * 60:
+                _autosync_last = time.time()
                 _cloud_sync_run()
-            except Exception:
-                pass
+        except Exception:
+            pass
 
 
 @app.route("/api/cloudsync/run", methods=["POST"])

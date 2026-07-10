@@ -53,9 +53,10 @@ default) deletes the cloud copies.
 ## Notes
 
 - If both apps use the service_role key, leave RLS off on these two tables
-  (single-user project). If you prefer the anon key on the phone, add RLS
-  policies allowing `insert` on `captures` and `insert/update` on storage
-  objects under `captures/*` for the anon role.
+  (single-user project). If you prefer the anon key on the phone, it needs
+  RLS policies for `select` + `insert` on `captures` (the connection test
+  reads one row; retried inserts use ignore-duplicates) and `insert` +
+  `update` on storage objects under `captures/*` (uploads are upsert).
 - The `books` table is a one-way mirror of the desktop catalog (checked +
   manual) so future tools (or the phone) can read it; the desktop never
   reads it back.

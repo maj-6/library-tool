@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -112,6 +113,29 @@ def load_json(path: Path, default):
 
 
 def save_json(path: Path, data) -> None:
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
+    """Atomic write (tmp + replace): a concurrent reader sees the old or the
+    new file, never a torn half-write. Background threads (cloud sync, OCR)
+    read these files while request handlers rewrite them.
+
+    Windows can refuse the replace while another handle has the target open
+    (sharing violation); those read windows are milliseconds, so retry briefly
+    and fall back to an in-place write rather than dropping the data."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+    with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2, ensure_ascii=False)
+    for attempt in range(5):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            time.sleep(0.05 * (attempt + 1))
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass

@@ -46,8 +46,14 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             try {
                 uploadEntry(client, dir)
                 dir.deleteRecursively()
+            } catch (e: org.json.JSONException) {
+                // corrupt manifest: retrying forever would wedge the queue —
+                // set the folder aside instead of deleting the photos
+                val bad = File(File(applicationContext.filesDir, "failed"), dir.name)
+                bad.parentFile?.mkdirs()
+                if (!dir.renameTo(bad)) dir.deleteRecursively()
             } catch (e: Exception) {
-                failed = true            // keep the folder; retry this run later
+                failed = true            // transient: keep the folder; retry later
             }
         }
         if (failed) Result.retry() else Result.success()
