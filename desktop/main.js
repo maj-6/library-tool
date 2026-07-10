@@ -120,7 +120,12 @@ async function startSidecar() {
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1440, height: 920, minWidth: 900, minHeight: 600,
+    // These are the RESTORED (un-maximized) bounds. The app launches
+    // maximized (below), and this is the reasonable window it drops back to
+    // when the user hits the restore button — deliberately well short of a
+    // full screen so "windowed" actually looks windowed.
+    width: 1200, height: 800, minWidth: 900, minHeight: 600,
+    show: false,            // shown once maximized, so there's no small-window flash
     title: "Library Tool",
     backgroundColor: "#1d1f21",
     frame: false,           // no OS chrome — the web UI's title bar is the frame
@@ -134,7 +139,20 @@ function createWindow() {
   // keep the renderer's maximize/restore icon in sync with the real state
   mainWindow.on("maximize", () => mainWindow.webContents.send("win:maximized", true));
   mainWindow.on("unmaximize", () => mainWindow.webContents.send("win:maximized", false));
+  // The icon is event-driven and the renderer registers its listener at load,
+  // so a maximize() that fired before then would leave a stale icon. Re-send
+  // the real state once the page is up (also covers reloads).
+  mainWindow.webContents.on("did-finish-load", () => {
+    if (mainWindow) mainWindow.webContents.send("win:maximized", mainWindow.isMaximized());
+  });
   mainWindow.loadURL(`http://127.0.0.1:${sidecarPort}/`);
+  // Start maximized. Maximizing while the constructor bounds are set records
+  // 1200×800 as the restore target, so the restore button returns there.
+  mainWindow.once("ready-to-show", () => {
+    if (!mainWindow) return;
+    mainWindow.maximize();
+    mainWindow.show();
+  });
   // open target=_blank / external links in the system browser, not a new window
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:/i.test(url)) shell.openExternal(url);
