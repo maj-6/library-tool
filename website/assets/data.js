@@ -130,7 +130,9 @@ export function pdfHref(v) {
   return "";
 }
 
-function safeHttpUrl(raw) {
+/** Escaping a string does nothing to its scheme, so anything that reaches an
+ *  href has to come through here. Only http(s) survives. */
+export function safeHttpUrl(raw) {
   try {
     const u = new URL(String(raw), location.href);
     return u.protocol === "https:" || u.protocol === "http:" ? u.href : "";

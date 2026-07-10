@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Not found · Library Tool</title>
+<!-- Deliberately self-contained. Pages serves this file for a miss at any depth,
+     so `assets/site.css` would resolve against the path that does not exist. -->
+<style>
+  :root { --paper:#fbfaf7; --ink:#26241f; --ink-soft:#6b675e; --accent:#3f5f52; }
+  html,body { margin:0; height:100%; }
+  body {
+    background:var(--paper); color:var(--ink);
+    font:16px/1.6 Georgia,"Iowan Old Style","Palatino Linotype",serif;
+    display:flex; align-items:center; justify-content:center; text-align:center;
+  }
+  main { padding:0 20px; }
+  h1 { font-size:30px; margin:0 0 6px; letter-spacing:0.4px; font-weight:normal; }
+  p { color:var(--ink-soft); margin:0 0 22px; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Not found</h1>
+  <p>No such page. The shelf is over here:</p>
+  <p><a id="home" href="/">Library Tool</a></p>
+</main>
+<script>
+  // Same reason the styles are inline: a relative href on a 404 points into the
+  // missing path. A project site lives under /<repo>/, a custom domain at /.
+  var seg = location.pathname.split("/")[1];
+  document.getElementById("home").href =
+    location.hostname.endsWith("github.io") && seg ? "/" + seg + "/" : "/";
+</script>
+</body>
+</html>

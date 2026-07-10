@@ -1,4 +1,4 @@
-import { latestReleases, usingCloud } from "./data.js";
+import { latestReleases, usingCloud, safeHttpUrl } from "./data.js";
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -12,14 +12,24 @@ const PLATFORM = {
 
 const bytes = (n) => (n ? `${(n / 1048576).toFixed(0)} MB` : "");
 
+// toISOString() throws a RangeError on an unparseable date, which would take the
+// whole page down rather than lose one line of metadata.
+function day(raw) {
+  const d = new Date(raw ?? "");
+  return Number.isNaN(d.getTime()) ? "" : d.toISOString().slice(0, 10);
+}
+
 function card(r) {
   const p = PLATFORM[r.platform] || { name: r.platform, note: "" };
-  const meta = [p.note, r.version && `v${esc(r.version)}`, bytes(r.bytes),
-                r.published_at && new Date(r.published_at).toISOString().slice(0, 10)]
+  const href = safeHttpUrl(r.url);
+  const meta = [p.note, r.version && `v${esc(r.version)}`, bytes(r.bytes), day(r.published_at)]
     .filter(Boolean).join(" · ");
+  const action = href
+    ? `<a class="btn primary" href="${esc(href)}">Download</a>`
+    : `<a class="btn" aria-disabled="true" title="No download link">Unavailable</a>`;
   return `<div class="rel">
     <h3>${esc(p.name)}</h3>
-    <div class="actions"><a class="btn primary" href="${esc(r.url)}">Download</a></div>
+    <div class="actions">${action}</div>
     <div class="meta">${meta}</div>
     ${r.notes ? `<div class="meta">${esc(r.notes)}</div>` : ""}
   </div>`;

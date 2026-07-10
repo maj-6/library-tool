@@ -1,0 +1,55 @@
+name: website
+
+# The site is plain files, so there is no build: check out, drop in the Supabase
+# config, upload website/ as the Pages artifact. The artifact's root becomes the
+# site root, which is why every link in the pages is relative -- they have to
+# survive being served from /library-tool/ rather than /.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "website/**"
+      - ".github/workflows/pages.yml"
+      - ".github/scripts/write_config.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read # checkout, and nothing more
+  pages: write # create the deployment
+  id-token: write # deploy-pages proves the artifact came from this run
+
+# One live site. Let a running deploy finish rather than cancelling it half-way.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # Variables, not secrets: the anon key is public by design, and a secret
+      # would be masked as *** in the logs for no benefit. write_config.py
+      # refuses any key whose JWT role is not `anon`.
+      - name: Point the site at Supabase
+        env:
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY }}
+        run: python3 .github/scripts/write_config.py
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload website/
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: website
+
+      - name: Deploy
+        id: deploy
+        uses: actions/deploy-pages@v4
