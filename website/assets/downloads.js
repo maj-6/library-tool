@@ -4,7 +4,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 const PLATFORM = {
-  windows: { name: "Windows", note: "Installer (.exe)" },
+  windows: { name: "Windows", note: "Installer (.msi)" },
   macos:   { name: "macOS",   note: "Disk image (.dmg)" },
   linux:   { name: "Linux",   note: "AppImage" },
   android: { name: "Android", note: "Book Capture (.apk)" },
