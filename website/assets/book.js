@@ -67,13 +67,17 @@ function hostOf(url) {
 function availability(v) {
   const a = (v && v.assets) || {};
   const items = [];
+  // assets is untyped jsonb on an anon-readable row — numbers are coerced,
+  // never interpolated raw
+  const pages = Number(a.pages) || 0;
+  const notes = Number(a.notes) || 0;
   if (a.about) items.push("About article");
-  if (a.pages) items.push(`Full text · ${a.pages} page${a.pages === 1 ? "" : "s"}`);
+  if (pages) items.push(`Full text · ${pages} page${pages === 1 ? "" : "s"}`);
   if (a.translations && typeof a.translations === "object") {
     const langs = Object.keys(a.translations);
     if (langs.length) items.push(`Translations · ${langs.map(esc).join(", ")}`);
   }
-  if (a.notes) items.push(`${a.notes} annotation${a.notes === 1 ? "" : "s"}`);
+  if (notes) items.push(`${notes} annotation${notes === 1 ? "" : "s"}`);
   const body = items.length
     ? items.map((x) => `<div class="avail-item">${x}</div>`).join("")
     : `<div class="avail-none">The scan only, so far.</div>`;
