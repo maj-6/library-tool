@@ -115,11 +115,34 @@ function sortRows(rows, sort) {
   return [...rows].sort(by);
 }
 
-/** Where the PDF actually lives: an absolute URL wins, else the public bucket. */
+/** Where the PDF actually lives: an absolute URL wins, else the public bucket.
+ *
+ * pdf_url is a database column, and `volumes` is writable by any authenticated
+ * user. Rendering it straight into an href would let a row carrying
+ * `javascript:…` run script for every visitor, since escaping the string does
+ * nothing to the scheme. Only http(s) survives.
+ */
 export function pdfHref(v) {
-  if (v.pdf_url) return v.pdf_url;
+  if (v.pdf_url) return safeHttpUrl(v.pdf_url);
   if (v.pdf_path && usingCloud) {
-    return `${CFG.supabaseUrl.replace(/\/$/, "")}/storage/v1/object/public/volumes/${v.pdf_path}`;
+    return `${CFG.supabaseUrl.replace(/\/$/, "")}/storage/v1/object/public/volumes/${encodeURI(v.pdf_path)}`;
   }
   return "";
+}
+
+function safeHttpUrl(raw) {
+  try {
+    const u = new URL(String(raw), location.href);
+    return u.protocol === "https:" || u.protocol === "http:" ? u.href : "";
+  } catch {
+    return "";
+  }
+}
+
+/** A year from a URL is a string an attacker chose: "abc" -> NaN, "1e999" ->
+ *  Infinity, and either goes straight into a PostgREST filter. */
+export function safeYear(raw) {
+  if (raw === null || raw === undefined || raw === "") return null;
+  const n = Math.trunc(Number(raw));
+  return Number.isFinite(n) && n >= 1000 && n <= 2999 ? n : null;
 }

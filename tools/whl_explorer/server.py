@@ -304,7 +304,8 @@ BUILDS_PATH = lib.OUTPUT_DIR / "whl_builds.json"
 # ocr_active/ocr_verified/ocr_quality track the entry folder's OCR files;
 # title_pages lists PDF pages marked as title pages (metadata extraction
 # uses them later); attention flags an entry as needing attention.
-_BUILD_FIELDS = ("title", "subtitle", "authors", "year", "publisher",
+_BUILD_FIELDS = ("published_slug",
+                 "title", "subtitle", "authors", "year", "publisher",
                  "publisher_city", "edition", "language", "pages",
                  "categories", "description", "pdf_source", "pdf_file",
                  "source_url", "notes", "status",
@@ -2634,6 +2635,7 @@ def _cloud_cfg() -> dict | None:
 # the reader never needs to know which was used.
 
 _publish_lock = threading.Lock()
+_builds_lock = threading.Lock()      # whl_builds.json is read-modify-written
 _publish: dict = {"running": False, "build": "", "stage": "idle", "sent": 0,
                   "total": 0, "error": "", "url": "", "slug": ""}
 
@@ -2662,6 +2664,45 @@ def _volume_row(b: dict, slug: str, url: str, path: str, size: int, actor: str) 
             "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
 
 
+def _publish_slug(cloud: dict, b: dict) -> str:
+    """A slug that belongs to THIS build, for good.
+
+    Publishing wrote to `slugify(title, year)` with no uniqueness check, so two
+    distinct builds sharing a title and a year -- two scans of the same edition,
+    which this catalogue really has -- resolved to one object key and one unique
+    `slug` row. The second publish overwrote the first book's PDF and, via
+    on_conflict=slug merge-duplicates, its metadata too. Silently.
+
+    The build now remembers the slug it took, so a re-publish overwrites itself
+    and only itself; a new build steps around whatever is already there.
+    """
+    if (b.get("published_slug") or "").strip():
+        return b["published_slug"].strip()
+    base = lib.slugify(b.get("title") or "", b.get("year"))
+    try:
+        rows = sbase._rest(cloud, "GET",
+                           f"volumes?select=slug&slug=like.{urllib.parse.quote(base)}*") or []
+        taken = {r["slug"] for r in rows}
+    except Exception:
+        taken = set()                      # a lookup failure must not block a first publish
+    slug, n = base, 2
+    while slug in taken:
+        slug, n = f"{base}-{n}", n + 1
+    return slug
+
+
+def _unpublish_object(cloud: dict, slug: str, path: str) -> None:
+    """Best-effort removal of an object whose catalogue row never landed."""
+    try:
+        if path:
+            sbase.delete_objects(cloud, "volumes", [path])
+        else:
+            r2.delete(_r2_cfg(), f"volumes/{slug}.pdf")
+        log.warning("rolled back orphaned object for %s", slug)
+    except Exception as exc:
+        log.error("could not roll back orphaned object for %s: %s", slug, exc)
+
+
 def _publish_run(bid: str, actor: str) -> None:
     def stage(name, **kw):
         with _publish_lock:
@@ -2677,7 +2718,7 @@ def _publish_run(bid: str, actor: str) -> None:
             raise RuntimeError("Supabase is not configured (Settings > Sync)")
 
         size = pdf.stat().st_size
-        slug = lib.slugify(b.get("title") or "", b.get("year"))
+        slug = _publish_slug(cloud, b)
         name = f"{slug}.pdf"
         stage("uploading", sent=0, total=size)
 
@@ -2699,11 +2740,23 @@ def _publish_run(bid: str, actor: str) -> None:
             url, path = sbase.public_url(cloud, "volumes", name), name
 
         stage("recording")
-        sbase.upsert_volume(cloud, _volume_row(b, slug, url, path, size, actor))
+        try:
+            sbase.upsert_volume(cloud, _volume_row(b, slug, url, path, size, actor))
+        except Exception:
+            # the object is already public and now belongs to nothing: take it back
+            _unpublish_object(cloud, slug, path)
+            raise
 
-        b["status"] = "uploaded"
-        b["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        lib.save_json(BUILDS_PATH, builds)
+        # re-read: the upload took minutes, and another writer may have touched
+        # builds meanwhile. Only this build's fields are ours to change.
+        with _builds_lock:
+            fresh = lib.load_json(BUILDS_PATH, {})
+            row = fresh.get(bid)
+            if row is not None:
+                row["status"] = "uploaded"
+                row["published_slug"] = slug
+                row["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                lib.save_json(BUILDS_PATH, fresh)
         activity("published", "book", actor=actor or None)
         log.info("published volume %s (%.0f MB) -> %s", slug, size / 1e6, url)
         stage("done", url=url, slug=slug, error="")

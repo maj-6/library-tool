@@ -133,8 +133,11 @@ create table if not exists profiles (
 );
 alter table profiles enable row level security;
 drop policy if exists profiles_read_all   on profiles;
+drop policy if exists profiles_read_authed on profiles;
 drop policy if exists profiles_write_self on profiles;
-create policy profiles_read_all on profiles for select using (true);
+-- `using (true)` with no `to` clause grants PUBLIC, i.e. the anon key the website
+-- ships. Contributor names are not for the open internet: signed-in only.
+create policy profiles_read_authed on profiles for select to authenticated using (true);
 create policy profiles_write_self on profiles
   for all to authenticated using (id = auth.uid()) with check (id = auth.uid());
 
@@ -168,3 +171,12 @@ create policy events_insert_authed on events for insert to authenticated with ch
 --
 -- The volumes bucket is world-readable. That is the point: it is a public
 -- library. Nothing else is.
+--
+-- KNOWN GAP: `captures` has RLS on with no policy, and its bucket is private, so
+-- only service_role can write them. The Android app therefore has to carry the
+-- service_role key -- a project-wide superuser credential -- on a device that is
+-- easy to lose. Closing this properly needs a scoped credential (an Edge
+-- Function the phone calls, or a per-device key), not an anon-insert policy: the
+-- anon key is published with the website, so anyone could then spam captures.
+-- Until then: treat the phone's key as sensitive, and rotate it if the device is
+-- lost. The app no longer allows its preferences into Android backups.

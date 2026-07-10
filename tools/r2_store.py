@@ -175,6 +175,31 @@ def head(cfg: dict, key: str, timeout: float = 30.0) -> bool:
         raise
 
 
+def list_buckets(cfg: dict, timeout: float = 30.0) -> list[str]:
+    """Every bucket the credentials can see. Doubles as a credential check —
+    a bad key fails here rather than halfway through a 129 MB upload."""
+    for k in ("account", "key_id", "secret"):
+        if not str(cfg.get(k) or "").strip():
+            raise StoreError(f"R2 {k} not configured")
+    url = f"{_endpoint(cfg)}/"
+    empty = hashlib.sha256(b"").hexdigest()
+    headers = _authorize(cfg, "GET", url, {}, empty)
+    raw = _send(urllib.request.Request(url, headers=headers, method="GET"), timeout)
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(raw)
+    ns = {"s3": root.tag.split("}")[0].strip("{")} if "}" in root.tag else {}
+    path = "s3:Buckets/s3:Bucket/s3:Name" if ns else "Buckets/Bucket/Name"
+    return [e.text or "" for e in root.findall(path, ns)]
+
+
+def delete(cfg: dict, key: str, timeout: float = 60.0) -> None:
+    _check(cfg)
+    url = f"{_endpoint(cfg)}/{cfg['bucket']}/{urllib.parse.quote(key.lstrip('/'))}"
+    empty = hashlib.sha256(b"").hexdigest()
+    headers = _authorize(cfg, "DELETE", url, {}, empty)
+    _send(urllib.request.Request(url, headers=headers, method="DELETE"), timeout)
+
+
 def public_url(cfg: dict, key: str) -> str:
     base = str(cfg.get("public_base") or "").strip().rstrip("/")
     if not base:

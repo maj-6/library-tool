@@ -1,20 +1,22 @@
-import { searchVolumes, pdfHref, usingCloud } from "./data.js";
+import { searchVolumes, pdfHref, usingCloud, safeYear } from "./data.js";
 
 const PAGE = 24;
 const el = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+const SORTS = new Set(["title", "year", "year-desc", "recent"]);
 const state = { q: "", from: null, to: null, sort: "title", page: 0 };
 
 // The query lives in the URL, so a search is linkable and the back button works.
 function readUrl() {
   const p = new URLSearchParams(location.search);
-  state.q = p.get("q") || "";
-  state.from = p.get("from") ? +p.get("from") : null;
-  state.to = p.get("to") ? +p.get("to") : null;
-  state.sort = p.get("sort") || "title";
-  state.page = Math.max(0, (+p.get("page") || 1) - 1);
+  state.q = (p.get("q") || "").slice(0, 200);
+  state.from = safeYear(p.get("from"));      // "abc" and "1e999" are not years
+  state.to = safeYear(p.get("to"));
+  state.sort = SORTS.has(p.get("sort")) ? p.get("sort") : "title";
+  const page = Math.trunc(Number(p.get("page")));
+  state.page = Number.isFinite(page) && page > 0 ? page - 1 : 0;
   el("q").value = state.q;
   el("from").value = state.from ?? "";
   el("to").value = state.to ?? "";
@@ -109,10 +111,10 @@ let debounce;
 el("controls").addEventListener("input", (ev) => {
   clearTimeout(debounce);
   debounce = setTimeout(() => {
-    state.q = el("q").value.trim();
-    state.from = el("from").value ? +el("from").value : null;
-    state.to = el("to").value ? +el("to").value : null;
-    state.sort = el("sort").value;
+    state.q = el("q").value.trim().slice(0, 200);
+    state.from = safeYear(el("from").value);
+    state.to = safeYear(el("to").value);
+    state.sort = SORTS.has(el("sort").value) ? el("sort").value : "title";
     state.page = 0;
     go(ev.target.id === "q");   // typing replaces history; a filter change pushes
   }, 220);

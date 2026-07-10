@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The Supabase key in these preferences is currently a service_role key: a
+  project-wide superuser credential (see docs/cloud/schema.sql, KNOWN GAP).
+  allowBackup="false" already keeps it out of Android Auto Backup; this keeps it
+  out of device-to-device transfer too, which allowBackup does not cover.
+-->
+<data-extraction-rules>
+  <cloud-backup>
+    <exclude domain="sharedpref" path="bookcapture.xml" />
+  </cloud-backup>
+  <device-transfer>
+    <exclude domain="sharedpref" path="bookcapture.xml" />
+  </device-transfer>
+</data-extraction-rules>

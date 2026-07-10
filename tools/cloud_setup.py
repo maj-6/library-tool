@@ -139,19 +139,26 @@ def slugify(title: str, year, taken: set[str]) -> str:
     return slug
 
 
-def volume_rows(ready_only: bool = False, actor: str = "") -> list[dict]:
-    """The local builds, shaped as `volumes` rows. No PDFs, metadata only."""
+def volume_rows(ready_only: bool = False, actor: str = "") -> list[tuple[str, dict]]:
+    """The local builds as (build_id, `volumes` row). No PDFs, metadata only.
+
+    A build's slug is sticky: once seeded or published it is written back onto
+    the build. The publish path then fills THIS row in, rather than deduping to
+    `-2` beside it, and two books sharing a title and a year never collide.
+    """
     builds = lib.load_json(lib.OUTPUT_DIR / "whl_builds.json", {})
-    rows, taken = [], set()
-    for b in builds.values():
+    rows: list[tuple[str, dict]] = []
+    taken = {str(b.get("published_slug") or "") for b in builds.values()} - {""}
+    for bid, b in builds.items():
         if not (b.get("title") or "").strip():
             continue
         if ready_only and b.get("status") not in ("ready", "uploaded"):
             continue
         year = str(b.get("year") or "")
         pages = str(b.get("pages") or "")
-        rows.append({
-            "slug": slugify(b["title"], year, taken),
+        slug = str(b.get("published_slug") or "") or slugify(b["title"], year, taken)
+        rows.append((bid, {
+            "slug": slug,
             "title": b["title"],
             "subtitle": b.get("subtitle") or "",
             "authors": b.get("authors") or "",
@@ -165,37 +172,93 @@ def volume_rows(ready_only: bool = False, actor: str = "") -> list[dict]:
             "description": b.get("description") or "",
             "source_url": b.get("source_url") or b.get("pdf_source") or "",
             "uploaded_by_name": actor,
-        })
+        }))
     return rows
 
 
 def cmd_seed(args) -> None:
-    """Publish the local builds as volumes. Metadata only — no PDFs are sent."""
+    """Publish the local builds as volumes. Metadata only, no PDFs are sent."""
     cfg = config()
-    rows = volume_rows(args.ready_only, args.actor)
-    if not rows:
+    pairs = volume_rows(args.ready_only, args.actor)
+    if not pairs:
         sys.exit("no builds to seed")
-    print(f"{len(rows)} volume(s):")
-    for r in rows[:20]:
+    print(f"{len(pairs)} volume(s):")
+    for _bid, r in pairs[:20]:
         print(f"  {r['slug']:<44} {r['title'][:40]}")
     if args.dry_run:
-        print("\n(dry run — pass --apply to upsert)")
+        print("\n(dry run, pass --apply to upsert)")
         return
-    sb._rest(cfg, "POST", "volumes?on_conflict=slug", rows,
+    sb._rest(cfg, "POST", "volumes?on_conflict=slug", [r for _b, r in pairs],
              prefer="resolution=merge-duplicates,return=minimal")
-    print(f"\nupserted {len(rows)} volume(s)")
+
+    # Remember which slug each build owns, so publishing later updates that very
+    # row instead of creating a second one beside it.
+    path = lib.OUTPUT_DIR / "whl_builds.json"
+    builds = lib.load_json(path, {})
+    changed = 0
+    for bid, r in pairs:
+        if bid in builds and builds[bid].get("published_slug") != r["slug"]:
+            builds[bid]["published_slug"] = r["slug"]
+            changed += 1
+    if changed:
+        lib.save_json(path, builds)
+    print(f"\nupserted {len(pairs)} volume(s); recorded {changed} slug(s) on the builds")
 
 
 def cmd_fixture(args) -> None:
     """website/fixtures/volumes.json — lets the site be built and reviewed
     before the cloud holds a single row."""
-    rows = volume_rows(args.ready_only, "")
+    rows = [r for _bid, r in volume_rows(args.ready_only, "")]
     for i, r in enumerate(rows):
         r["created_at"] = f"2026-07-{(i % 28) + 1:02d}T00:00:00+00:00"
     out = Path(__file__).resolve().parent.parent / "website" / "fixtures" / "volumes.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(rows, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"wrote {out.relative_to(Path.cwd())} ({len(rows)} volumes)")
+
+
+def cmd_r2(args) -> None:
+    """Prove the R2 credentials work, end to end, before a 129 MB upload does not.
+
+    Lists buckets, uploads a probe, HEADs it, fetches it through the PUBLIC url
+    with no credentials at all, and deletes it. Note the browser User-Agent: the
+    r2.dev domain sits behind Cloudflare's bot check, which answers a bare
+    `Python-urllib` with 403 error-code-1010 and looks exactly like the bucket
+    not being public.
+    """
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import r2_store as r2
+    import tempfile, urllib.request, urllib.error
+
+    s = lib.load_json(lib.CLIENT_STATE_PATH, {}).get("settings", {})
+    cfg = {"account": str(s.get("r2Account") or ""), "bucket": str(s.get("r2Bucket") or ""),
+           "key_id": str(s.get("r2KeyId") or ""), "secret": str(s.get("r2Secret") or ""),
+           "public_base": str(s.get("r2PublicBase") or "")}
+    if not r2.configured(cfg):
+        sys.exit("R2 is not configured (Settings > Sync). Published PDFs would go "
+                 "to Supabase storage instead.")
+
+    print("buckets:", r2.list_buckets(cfg))
+    if cfg["bucket"] not in r2.list_buckets(cfg):
+        print(f"  ! configured bucket {cfg['bucket']!r} is not among them")
+
+    probe = Path(tempfile.gettempdir()) / "whl_r2_probe.txt"
+    probe.write_bytes(b"library-tool probe\n")
+    key = "volumes/_probe.txt"
+    url = r2.put_file(cfg, key, probe, "text/plain")
+    print("upload  ok ->", url)
+    print("head    ok ->", r2.head(cfg, key))
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 Chrome/120.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            print(f"public  ok -> HTTP {r.status}, {len(r.read())} bytes")
+    except urllib.error.HTTPError as exc:
+        print(f"public  FAILED -> HTTP {exc.code}: enable the bucket's public "
+              f"development URL, or set a custom domain")
+    r2.delete(cfg, key)
+    probe.unlink(missing_ok=True)
+    print("delete  ok")
 
 
 def cmd_anon_key(_args) -> None:
@@ -229,6 +292,7 @@ def main() -> None:
     f.add_argument("--ready-only", action="store_true")
     f.set_defaults(fn=cmd_fixture)
 
+    sub.add_parser("r2", help="prove the R2 credentials work, end to end").set_defaults(fn=cmd_r2)
     sub.add_parser("anon-key", help="print the website config snippet").set_defaults(fn=cmd_anon_key)
 
     args = ap.parse_args()

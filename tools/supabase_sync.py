@@ -106,6 +106,16 @@ def delete_photos(cfg: dict, object_paths: list[str]) -> None:
                                                for p in object_paths]}).encode())
 
 
+def delete_objects(cfg: dict, bucket: str, object_paths: list[str]) -> None:
+    """Remove objects from any bucket (delete_photos is captures-only)."""
+    if not object_paths:
+        return
+    url, _, headers = _cfg(cfg)
+    headers = dict(headers, **{"Content-Type": "application/json"})
+    _request("DELETE", f"{url}/storage/v1/object/{bucket}", headers,
+             json.dumps({"prefixes": [str(p).lstrip("/") for p in object_paths]}).encode())
+
+
 def upload_object(cfg: dict, bucket: str, object_path: str, data: bytes,
                   content_type: str = "application/octet-stream",
                   upsert: bool = True) -> str:
