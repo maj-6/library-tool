@@ -61,6 +61,13 @@ header.site .name {
   letter-spacing: 0.4px;
   margin-right: auto;
 }
+header.site .gh {
+  color: var(--ink-soft);
+  display: flex;
+  transition: color 0.15s;
+}
+header.site .gh:hover { color: var(--accent); }
+header.site .gh svg { display: block; width: 22px; height: 22px; }
 
 /* --- page layout: nav sidebar + content --- */
 .layout {
