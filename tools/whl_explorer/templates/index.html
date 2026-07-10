@@ -16,8 +16,6 @@
           <button class="menu-item" data-cmd="export" type="button">Export table (JSON)</button>
           <button class="menu-item" data-cmd="export-builds" type="button">Export builds</button>
           <button class="menu-item" data-cmd="dl-sources" type="button">Download sources list</button>
-          <div class="menu-sep"></div>
-          <button class="menu-item" data-cmd="settings" type="button">Settings&hellip;</button>
         </div>
       </div>
       <div class="menu">
@@ -46,8 +44,17 @@
           <button class="menu-item" data-cmd="master-sync" type="button">Sync master list to Google Sheets&hellip;</button>
         </div>
       </div>
+      <div class="menu">
+        <button class="menu-btn" type="button">Settings</button>
+        <div class="menu-drop" hidden>
+          <button class="menu-item" data-cmd="settings" type="button">All settings&hellip;</button>
+          <div class="menu-sep"></div>
+          <!-- theme items are generated from THEMES by buildThemeMenu() -->
+          <div id="menu-themes"></div>
+        </div>
+      </div>
     </div>
-    <span class="tb-title" id="tb-title">Library Tool <span class="tb-meta" id="tb-meta">v2.9</span></span>
+    <span class="tb-title" id="tb-title"><span class="tb-tab" id="tb-tab"></span>Library Tool <span class="tb-meta" id="tb-meta">v2.9</span></span>
     <span id="win-controls" class="win-controls">
       <button class="win-btn" id="win-min" type="button" title="Minimize" aria-label="Minimize">
         <svg viewBox="0 0 10 10"><rect x="0" y="4.5" width="10" height="1"/></svg></button>
@@ -832,25 +839,16 @@
     </div>
   </div>
 
-  <!-- NEEDS-ATTENTION REASON WINDOW (Ctrl+Q) -->
-  <div id="attn-overlay" class="overlay" hidden>
-    <div id="attn-window" class="win">
-      <div id="attn-titlebar" class="win-titlebar">
-        <span>Needs attention</span>
-        <button id="attn-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
-      </div>
-      <div id="attn-body">
-        <p class="pane-note" id="attn-label"></p>
-        <textarea id="attn-reason" class="cad-input" rows="4"
-                  placeholder="Why does this need attention?"></textarea>
-        <div class="mf-actions">
-          <button id="attn-save" class="cad-btn icon-btn" type="button"
-                  data-icon="save" data-tip="Mark with this reason"></button>
-          <button id="attn-clear" class="cad-btn icon-btn danger" type="button"
-                  data-icon="remove" data-tip="Clear the mark"></button>
-          <span class="tool-label" id="attn-msg"></span>
-        </div>
-      </div>
+  <!-- NEEDS-ATTENTION REASON POPOVER (Q), pinned under the marked row -->
+  <div id="attn-pop" hidden>
+    <div id="attn-pop-label"></div>
+    <textarea id="attn-pop-reason" rows="3" spellcheck="false"
+              placeholder="Why? (optional)"></textarea>
+    <div id="attn-pop-actions">
+      <button id="attn-pop-save" class="cad-btn icon-btn" type="button"
+              data-icon="save" data-tip="Save reason &#183; Enter&#10;Esc keeps the mark without one"></button>
+      <button id="attn-pop-clear" class="cad-btn icon-btn danger" type="button"
+              data-icon="remove" data-tip="Remove the mark"></button>
     </div>
   </div>
 

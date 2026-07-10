@@ -94,6 +94,7 @@ const state = {
     autoIaDownload: true,           // background-download an IA PDF when a source is found
     topTable: "checked", bottomActive: 0,
     whlMode: "edit", checkedMode: "edit",
+    // "" is the retired Classic CAD id; applyTheme() migrates it to DEFAULT_THEME
     paneWidth: null, theme: "", font: "", fontUi: "", fontMono2: "",
     aiBase: "", aiModel: "", aiKey: "", aiInstructions: "",
     // OCR services (Settings > OCR). Tesseract runs locally; Claude /
@@ -137,19 +138,26 @@ const state = {
 // --- appearance: themes are full chrome redesigns; fonts are user-selectable --
 
 const THEMES = [
-  ["", "Classic CAD"],
-  ["ledger", "Archive Ledger"],
-  ["platinum", "Platinum"],
-  ["blueprint", "Blueprint"],
-  ["modern", "Modern light"],
-  ["dark", "Modern dark"],
-  ["stone", "Stone"],
-  ["midnight", "Midnight"],
   ["sage", "Sage"],
+  ["ledger", "Archive Ledger"],
+  ["foolscap", "Foolscap"],
+  ["herbarium", "Herbarium"],
+  ["blueprint-linen", "Blueprint Linen"],
+  ["oxblood", "Oxblood"],
+  ["porcelain", "Porcelain"],
+  ["scope", "Oscilloscope"],
+  ["terminal-amber", "Terminal Amber"],
 ];
+const DEFAULT_THEME = "sage";
+// Retired ids map to the survivor closest in spirit, so a stored theme never
+// falls through to the bare :root fallback. "" was Classic CAD, the old default.
 const LEGACY_THEMES = {
-  cde: "ledger", xp2003: "", acad: "dark",
-  workstation: "", slate: "dark", mainframe: "dark", graphite: "dark",
+  "": DEFAULT_THEME,
+  platinum: "porcelain", blueprint: "blueprint-linen", modern: "porcelain",
+  dark: "scope", stone: "ledger", midnight: "scope",
+  cde: "ledger", xp2003: DEFAULT_THEME, acad: "scope",
+  workstation: DEFAULT_THEME, slate: "scope", mainframe: "terminal-amber",
+  graphite: "scope",
 };
 
 // One shared font list; the interface (--ui) and data/table (--mono) fonts
@@ -403,13 +411,26 @@ function bookParseChanged(a, b) {
 
 function applyTheme() {
   let t = state.settings.theme || "";
-  if (t in LEGACY_THEMES) {
-    t = LEGACY_THEMES[t];
+  // migrate a retired id, and clamp anything unrecognised: an orphan id would
+  // otherwise stick in localStorage, sync to the server, and silently render
+  // the bare :root fallback while the picker showed nothing
+  if (t in LEGACY_THEMES) t = LEGACY_THEMES[t];
+  if (!THEMES.some(([id]) => id === t)) t = DEFAULT_THEME;
+  if (t !== state.settings.theme) {
     state.settings.theme = t;
     saveSettings();
   }
-  if (t) document.body.dataset.theme = t;
-  else delete document.body.dataset.theme;
+  document.body.dataset.theme = t;
+}
+
+// the one way to change theme: the Settings menu and the Appearance select
+// both come through here, so the menu ticks and the <select> never disagree
+function setTheme(id) {
+  state.settings.theme = id;
+  saveSettings();
+  applyTheme();
+  const sel = el("theme-select");
+  if (sel) sel.value = id;
 }
 
 function applyFont() {
@@ -839,11 +860,24 @@ async function syncClientStateOnLoad() {
 const TAB_TITLES = { checked: "Catalogs", upload: "Editor", ocr: "OCR" };
 
 function setHeader(tabId) {
-  // The visible title bar shows the static "Library Tool vN" (centered); the
-  // per-tab context only feeds the browser/OS window title.
-  document.title = `${TAB_TITLES[tabId] || ""} :: Library Tool`;
+  // Both the visible title bar and the OS window title carry the active tab:
+  // "Catalogs :: Library Tool v2.9".
+  const name = TAB_TITLES[tabId] || "";
+  document.title = `${name} :: Library Tool`;
+  el("tb-tab").textContent = name ? name + " :: " : "";
   // the tab strip shows the active tab's command icons
   el("tg-upload").hidden = tabId !== "upload";
+}
+
+// The title is centred on the window, so the wider of the two flanking regions
+// sets how much room it may claim before it would slide under one of them.
+// Below twice that, a centred title cannot avoid the menus at all -- drop it.
+function fitTitleBar() {
+  const w = (id) => el(id).getBoundingClientRect().width;
+  const inset = Math.max(w("menubar"), w("win-controls")) + 12;
+  const bar = el("titlebar");
+  bar.style.setProperty("--tb-inset", inset + "px");
+  el("tb-title").hidden = bar.clientWidth - 2 * inset < 56;
 }
 
 function initTabs() {
@@ -1482,13 +1516,8 @@ function renderSettings() {
     o.textContent = label;
     themeSel.appendChild(o);
   }
-  const curTheme = state.settings.theme || "";
-  themeSel.value = curTheme in LEGACY_THEMES ? LEGACY_THEMES[curTheme] : curTheme;
-  themeSel.onchange = () => {
-    state.settings.theme = themeSel.value;
-    saveSettings();
-    applyTheme();
-  };
+  themeSel.value = state.settings.theme;   // applyTheme() has already normalized it
+  themeSel.onchange = () => setTheme(themeSel.value);
   fillFontSelect("font-ui-select", FONT_CHOICES, "fontUi", applyFont);
   fillFontSelect("font-select", FONT_CHOICES, "font", applyFont);
   fillFontSelect("font-mono2-select", FONT_CHOICES, "fontMono2", applyFont);
@@ -2473,14 +2502,15 @@ function setAttnKey(k, val) {
 }
 
 // Resolve whatever row (any table) or builder entry the mouse is over into
-// an attention target: {label, current, apply(value)}. Q toggles it,
-// Ctrl+Q opens the reason modal on it.
+// an attention target: {label, current, apply(value)}. Q marks it and opens
+// the reason popover on it.
 function attnTargetAtHover() {
   const bi = document.querySelector("#builds-list .build-item:hover");
   if (bi) {
     const b = state.builds[bi.dataset.bid];
     if (!b) return null;
     return {
+      node: bi,
       label: b.title || bi.dataset.bid,
       current: String(b.attention || ""),
       apply: (v) => patchBuildRaw(bi.dataset.bid, { attention: v })
@@ -2496,12 +2526,14 @@ function attnTargetAtHover() {
     const row = state.rowsById.get(String(tr.dataset.rowId));
     if (!row) return null;
     return {
+      node: tr,
       label: row.book.title || tr.dataset.rowId,
       current: String(row.attention || ""),
       apply: (v) => setRowAttention(tr.dataset.rowId, v),
     };
   }
   const keyTarget = (k, label, rerender) => ({
+    node: tr,
     label,
     current: String((state.attn || {})[k] || ""),
     apply: (v) => { setAttnKey(k, v); rerender(); },
@@ -2523,6 +2555,7 @@ function attnTargetAtHover() {
       // master-list manual rows share the manual entry's persistent flag
       const e = state.manual.find((x) => x.id === rec._mid);
       return {
+        node: tr,
         label: rec.title || "manual entry",
         current: String((e && e.attention) || ""),
         apply: (v) => setRowAttention(rec._mid, v).then(renderBottomRows),
@@ -2533,8 +2566,11 @@ function attnTargetAtHover() {
   return null;
 }
 
-// Q toggles the purple mark on whatever the mouse is over; Ctrl+Q opens a
-// modal to record WHY it needs attention
+// Q on whatever the mouse is over: mark it as needing attention and open the
+// reason popover so you can say why. An unmarked row is marked at once, so
+// dismissing the popover still leaves the plain mark behind (what Q always did).
+// Ctrl+Q is kept as an alias, but most browsers reserve it (Firefox: Quit), so
+// it never reaches the page — which is why reason capture moved onto plain Q.
 function onAttentionKey(ev) {
   if (ev.key !== "q" && ev.key !== "Q") return;
   if (/^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName) ||
@@ -2542,11 +2578,10 @@ function onAttentionKey(ev) {
   const target = attnTargetAtHover();
   if (!target) return;
   ev.preventDefault();
-  if (ev.ctrlKey) {
-    openAttnModal(target);
-  } else {
-    target.apply(target.current ? "" : "1");
-  }
+  // grab the anchor rect first: apply() re-renders some tables, detaching the row
+  const rect = target.node ? target.node.getBoundingClientRect() : null;
+  if (!target.current) target.apply("1");   // mark first; the reason is optional
+  openAttnPop(target, rect);
 }
 
 // Resolve the row/entry under the mouse into its book fields (for the "S"
@@ -2640,45 +2675,88 @@ function onSearchKey(ev) {
   status("SEARCH :: " + q.slice(0, 60));
 }
 
-// --- the Ctrl+Q reason modal --
+// --- the reason popover (Q) --------------------------------------------------
+// A tooltip-shaped popover pinned to the marked row, hosting a word-wrapped
+// textarea. Unlike #cad-tooltip it takes pointer events (you type in it), so it
+// is a separate element and initTooltips' hideTip() must not reach it.
 
-let attnModalTarget = null;
+let attnPopTarget = null;
+let attnPopRect = null;   // the anchor row's rect, captured before apply() re-renders it
 
-function openAttnModal(target) {
-  attnModalTarget = target;
-  el("attn-label").textContent = (target.label || "").slice(0, 80);
-  el("attn-reason").value = attnReason(target.current);
-  el("attn-msg").textContent = "";
-  el("attn-overlay").hidden = false;
-  el("attn-reason").focus();
+function openAttnPop(target, rect) {
+  attnPopTarget = target;
+  attnPopRect = rect;
+  const pop = el("attn-pop");
+  el("attn-pop-label").textContent = (target.label || "").slice(0, 60);
+  const ta = el("attn-pop-reason");
+  ta.value = attnReason(target.current);
+  pop.hidden = false;
+  hideTip();                       // the hover tooltip would sit under it otherwise
+  positionAttnPop();
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
 }
 
-function closeAttnModal() {
-  el("attn-overlay").hidden = true;
-  attnModalTarget = null;
+// pin below the anchor row, flipping up / clamping in at the viewport edges
+function positionAttnPop() {
+  const pop = el("attn-pop");
+  const p = pop.getBoundingClientRect();
+  const r = attnPopRect ||
+    { left: innerWidth / 2, top: innerHeight / 2, bottom: innerHeight / 2 };
+  let left = r.left;
+  let top = r.bottom + 4;
+  if (left + p.width > innerWidth - 8) left = Math.max(8, innerWidth - p.width - 8);
+  if (top + p.height > innerHeight - 8) top = Math.max(8, r.top - p.height - 4);
+  pop.style.left = Math.max(8, left) + "px";
+  pop.style.top = top + "px";
 }
 
-function initAttnModal() {
-  el("attn-save").addEventListener("click", () => {
-    if (!attnModalTarget) return;
-    const reason = el("attn-reason").value.trim();
-    attnModalTarget.apply(reason || "1");   // empty reason = plain mark
-    closeAttnModal();
+// Escape / click-away / scroll leave the mark as it stands: the row was marked
+// the moment the popover opened, so dismissing can never silently unmark it.
+function closeAttnPop() {
+  el("attn-pop").hidden = true;
+  attnPopTarget = null;
+  attnPopRect = null;
+}
+
+function saveAttnPop() {
+  if (!attnPopTarget) return;
+  const reason = el("attn-pop-reason").value.trim();
+  attnPopTarget.apply(reason || "1");   // empty reason = plain mark
+  closeAttnPop();
+}
+
+function initAttnPop() {
+  el("attn-pop-save").addEventListener("click", saveAttnPop);
+  el("attn-pop-clear").addEventListener("click", () => {
+    if (!attnPopTarget) return;
+    attnPopTarget.apply("");
+    closeAttnPop();
   });
-  el("attn-clear").addEventListener("click", () => {
-    if (!attnModalTarget) return;
-    attnModalTarget.apply("");
-    closeAttnModal();
-  });
-  el("attn-close").addEventListener("click", closeAttnModal);
-  el("attn-reason").addEventListener("keydown", (ev) => {
+  el("attn-pop-reason").addEventListener("keydown", (ev) => {
+    ev.stopPropagation();            // Q / S / Delete / undo must not fire while typing
     if (ev.key === "Enter" && !ev.shiftKey) {
       ev.preventDefault();
-      el("attn-save").click();
+      saveAttnPop();
     } else if (ev.key === "Escape") {
-      ev.stopPropagation();
-      closeAttnModal();
+      closeAttnPop();
     }
+  });
+  // click anywhere outside dismisses (the mark survives)
+  document.addEventListener("mousedown", (ev) => {
+    if (el("attn-pop").hidden) return;
+    if (!(ev.target.closest && ev.target.closest("#attn-pop"))) closeAttnPop();
+  });
+  // scrolling moves the anchor row out from under the popover -- but the
+  // textarea's own overflow scroll must not close it
+  document.addEventListener("scroll", (ev) => {
+    if (el("attn-pop").hidden) return;
+    const t = ev.target;
+    if (t && t.closest && t.closest("#attn-pop")) return;
+    closeAttnPop();
+  }, true);
+  addEventListener("resize", () => {
+    if (!el("attn-pop").hidden) positionAttnPop();
   });
 }
 
@@ -6659,7 +6737,7 @@ function renderBuildsList() {
       `Status: ${uploaded ? "uploaded" : ready ? "verified" : "draft"}\n` +
       `Updated: ${b.updated_at || ""}` +
       (attnReason(b.attention) ? `\nNeeds attention: ${attnReason(b.attention)}` : "") +
-      "\nQ while hovering: mark as needing attention (Ctrl+Q: with a reason)";
+      "\nQ: mark as needing attention, with a reason";
     // compact: title with the status icon inline on the right, then a
     // single author · year meta line
     li.innerHTML = `
@@ -8298,6 +8376,24 @@ const MENU_CMDS = {
   "dl-approved": () => downloadApproved(),
 };
 
+// Settings > (themes): generated from THEMES so adding a theme needs no markup.
+// Each gets a MENU_CMDS entry, since the menu dispatcher is a data-cmd lookup.
+function buildThemeMenu() {
+  const host = el("menu-themes");
+  if (!host) return;
+  host.innerHTML = "";
+  for (const [id, label] of THEMES) {
+    const cmd = "theme:" + id;
+    MENU_CMDS[cmd] = () => setTheme(id);
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "menu-item";
+    b.dataset.cmd = cmd;
+    b.innerHTML = `<span class="menu-check"></span>${esc(label)}`;
+    host.appendChild(b);
+  }
+}
+
 function updateMenuState() {
   const onChecked = state.settings.topTable === "checked";
   const dis = (cmd, v) => {
@@ -8317,9 +8413,11 @@ function updateMenuState() {
   check("search-pane", state.settings.showCatalog);
   check("table-checked", onChecked);
   check("table-whl", !onChecked);
+  for (const [id] of THEMES) check("theme:" + id, id === state.settings.theme);
 }
 
 function initMenubar() {
+  buildThemeMenu();
   const menus = [...document.querySelectorAll("#menubar .menu")];
   let openMenu = null;
   const closeAll = () => {
@@ -8590,6 +8688,7 @@ function init() {
   initTooltips();
   initPaneTabs();
   initMenubar();
+  fitTitleBar();          // after the menus exist: their width sets the clamp
   initSettingsNav();
   initColResize();
   loadOlStatus();
@@ -8952,13 +9051,13 @@ function init() {
     if (chip) setActiveOcr(chip.dataset.ocr);
   });
   initOcrTab();
-  // Q while hovering a row (any table) or a builder entry: needs-attention;
-  // Ctrl+Q records a reason
+  // Q while hovering a row (any table) or a builder entry: mark it as needing
+  // attention, and offer a reason
   loadAttn();
   document.addEventListener("keydown", onAttentionKey);
   document.addEventListener("keydown", onSearchKey);
   document.addEventListener("keydown", onRowDeleteKey);
-  initAttnModal();
+  initAttnPop();
   el("b-pdf-attach").addEventListener("click", () => attachPdfFile());
   el("b-pdf_file").addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") { ev.preventDefault(); attachPdfFile(); }
@@ -8995,12 +9094,9 @@ function init() {
   el("settings-overlay").addEventListener("mousedown", (ev) => {
     if (ev.target === el("settings-overlay")) closeSettings();
   });
-  el("attn-overlay").addEventListener("mousedown", (ev) => {
-    if (ev.target === el("attn-overlay")) closeAttnModal();
-  });
   document.addEventListener("keydown", (ev) => {
     if (ev.key !== "Escape") return;
-    if (!el("attn-overlay").hidden) closeAttnModal();
+    if (!el("attn-pop").hidden) closeAttnPop();
     else if (!el("fb-overlay").hidden) closeFileBrowser();
     else if (!el("pdfm-overlay").hidden) closePdfModal();
     else if (!el("md-overlay").hidden) closeMarkdownEditor(false);
@@ -9011,6 +9107,7 @@ function init() {
   // keep sized tables filling their panes when the window or panes resize
   let rzTimer = null;
   window.addEventListener("resize", () => {
+    fitTitleBar();        // cheap; must not wait for the debounce
     clearTimeout(rzTimer);
     rzTimer = setTimeout(() => {
       applyTableChrome(state.settings.topTable === "whl" ? "whl" : "checked");
