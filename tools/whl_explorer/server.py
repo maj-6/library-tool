@@ -2163,7 +2163,6 @@ def api_client_state_put():
             if len(new_checked) < old_n:
                 _backup_client_state(state, old_n, len(new_checked))
         old_checked = state.get("checked")
-        before = len(old_checked) if isinstance(old_checked, list) else 0
         for k in _CLIENT_STATE_KEYS:
             if k in payload:
                 state[k] = payload[k]
@@ -2187,8 +2186,9 @@ def _checked_diff(old, new, cap: int = 3):
     """(count, titles) of books in `new` but not `old` ([key, value] pair
     lists). Purely a nicety for the feed: malformed shapes yield (0, "")."""
     try:
-        as_map = lambda lst: {p[0]: p[1] for p in (lst or [])
-                              if isinstance(p, list) and len(p) == 2}
+        def as_map(lst):
+            return {p[0]: p[1] for p in (lst or [])
+                    if isinstance(p, list) and len(p) == 2}
         old_map, new_map = as_map(old), as_map(new)
         added = [k for k in new_map if k not in old_map]
         titles = []

@@ -322,12 +322,25 @@ def test_backup_failure_is_silent_and_write_still_lands(client, data_root, monke
 # --- activity side effect ------------------------------------------------------
 
 
-def test_activity_events_on_checked_count_change(client, data_root):
+def _pair(key, title=None):
+    """A checked entry as the client stores it: a [key, value] pair, where a
+    real value carries the book metadata the feed pulls titles from."""
+    return [key, {"book": {"title": title}} if title else {}]
+
+
+def test_activity_events_on_checked_delta(client, data_root):
+    # Since the accounts change, checked-set activity is a KEY diff, not a
+    # count diff: adds and removals log as separate events whose n counts key
+    # changes, while detail names up to 3 titled books plus a "(+N more)"
+    # overflow counting only the titled remainder.
     _reset(data_root)
     activity = _activity_path(data_root)
 
-    # growth 0 -> 5: one "added" event, default actor
-    client.put(URL, json={"checked": ["a", "b", "c", "d", "e"]})
+    # growth 0 -> 5 (4 of them titled): one "added" event, default actor
+    client.put(URL, json={"checked": [
+        _pair("a", "Alpha"), _pair("b", "Beta"), _pair("c", "Gamma"),
+        _pair("d", "Delta"), _pair("e"),
+    ]})
     lines = activity.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
     ev = json.loads(lines[0])
@@ -335,22 +348,44 @@ def test_activity_events_on_checked_count_change(client, data_root):
     assert ev["verb"] == "added"
     assert ev["subject"] == "Checked Books"
     assert ev["n"] == 5
+    assert ev["detail"] == "Alpha; Beta; Gamma (+1 more)"
 
-    # same-length replace: zero delta, no event
-    client.put(URL, json={"checked": ["v", "w", "x", "y", "z"]})
-    assert len(activity.read_text(encoding="utf-8").splitlines()) == 1
+    # same-length replace with disjoint keys: TWO events (added, then
+    # removed) — each n agrees with the titles it names, no net delta
+    client.put(URL, json={"checked": [
+        _pair("v", "V"), _pair("w", "W"), _pair("x", "X"),
+        _pair("y", "Y"), _pair("z", "Z"),
+    ]})
+    lines = activity.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 3
+    added, removed = json.loads(lines[1]), json.loads(lines[2])
+    assert (added["verb"], added["n"]) == ("added", 5)
+    assert added["detail"] == "V; W; X (+2 more)"
+    assert (removed["verb"], removed["n"]) == ("removed", 5)
+    assert removed["detail"] == "Alpha; Beta; Gamma (+1 more)"
 
-    # non-list payload for "checked": no event either
+    # non-list payload for "checked": no event
     client.put(URL, json={"settings": {"theme": "dark"}})
-    assert len(activity.read_text(encoding="utf-8").splitlines()) == 1
+    assert len(activity.read_text(encoding="utf-8").splitlines()) == 3
 
-    # shrink 5 -> 3 with a named actor
+    # shrink 5 -> 3 with a named actor: one "removed" event naming the losses
     client.put(
-        URL, json={"checked": ["v", "w", "x"]}, headers={"X-WHL-Actor": "Tester"}
+        URL,
+        json={"checked": [_pair("v", "V"), _pair("w", "W"), _pair("x", "X")]},
+        headers={"X-WHL-Actor": "Tester"},
     )
     lines = activity.read_text(encoding="utf-8").splitlines()
-    assert len(lines) == 2
-    ev = json.loads(lines[1])
+    assert len(lines) == 4
+    ev = json.loads(lines[3])
     assert ev["actor"] == "Tester"
-    assert ev["verb"] == "removed"
-    assert ev["n"] == 2
+    assert (ev["verb"], ev["n"]) == ("removed", 2)
+    assert ev["detail"] == "Y; Z"
+
+
+def test_activity_ignores_malformed_checked_shapes(client, data_root):
+    # Entries that are not [key, value] pairs (e.g. bare strings) are dropped
+    # by the diff — the PUT persists them, but no activity event fires and
+    # the feed file is never created. Pins the shape contract of the diff.
+    _reset(data_root)
+    client.put(URL, json={"checked": ["p", "q", "r"]})
+    assert not _activity_path(data_root).exists()
