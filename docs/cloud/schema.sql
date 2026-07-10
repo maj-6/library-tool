@@ -94,10 +94,10 @@ drop policy if exists volumes_update_owner   on volumes;
 
 create policy volumes_read_all on volumes
   for select using (true);
-create policy volumes_insert_authed on volumes
-  for insert to authenticated with check (true);
-create policy volumes_update_owner on volumes
-  for update to authenticated using (uploaded_by = auth.uid());
+-- Writes: service_role only (the desktop publish path bypasses RLS). This
+-- table IS the public website, and signup is open, so an authenticated-insert
+-- policy would let any stranger who creates an account put rows on it. If
+-- in-app authed uploads ever land, add a narrowly-scoped policy back then.
 
 -- =====================================================================
 -- releases — the desktop installer and the Android APK
@@ -158,7 +158,10 @@ alter table events enable row level security;
 drop policy if exists events_read_authed   on events;
 drop policy if exists events_insert_authed on events;
 create policy events_read_authed on events for select to authenticated using (true);
-create policy events_insert_authed on events for insert to authenticated with check (true);
+-- actor_id must be the writer's own id: without the check, any signed-in user
+-- could file events under someone else's identity.
+create policy events_insert_authed on events
+  for insert to authenticated with check (actor_id = auth.uid());
 
 -- =====================================================================
 -- storage buckets

@@ -49,6 +49,19 @@ See [tools/README.md](tools/README.md) for the full tool documentation:
 building the Open Library indexes, every explorer feature, and the
 standalone CLI tools.
 
+## Development
+
+Dependencies and tool configuration are declared in `pyproject.toml`.
+One-time setup, then the pre-push gate:
+
+```
+python3 -m pip install -e ".[dev]"   # runtime deps + pytest + ruff
+scripts/check.ps1                    # ruff + pytest (scripts/check.sh on POSIX)
+```
+
+Tests run against a throwaway `WHL_DATA_ROOT` (see `tests/conftest.py`);
+they never read or write the live `output/` state.
+
 ## Layout
 
 | Path | What it is |

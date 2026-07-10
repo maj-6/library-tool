@@ -229,7 +229,9 @@ def cmd_r2(args) -> None:
     import sys as _sys
     _sys.path.insert(0, str(Path(__file__).resolve().parent))
     import r2_store as r2
-    import tempfile, urllib.request, urllib.error
+    import tempfile
+    import urllib.request
+    import urllib.error
 
     s = lib.load_json(lib.CLIENT_STATE_PATH, {}).get("settings", {})
     cfg = {"account": str(s.get("r2Account") or ""), "bucket": str(s.get("r2Bucket") or ""),

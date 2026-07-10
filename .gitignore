@@ -16,10 +16,30 @@ output/client_state.json
 output/backups/
 # append-only feed behind the Home tab; grows per machine, merges badly
 output/activity.jsonl
+# the signed-in Supabase session (user tokens) + the activity push cursor
+output/auth_session.json
 
-# downloaded scans (large binaries; downloads/ia/catalog.json IS tracked)
+# downloaded scans (large binaries)
 downloads/ia/*.pdf
 downloads/ia/*.part
+
+# live catalogue data: mutated by the running app and synced through the
+# cloud backend, not through git (entry folders hold per-book OCR + PDF
+# derivatives; whl_builds.json is the builds database; catalog.json tracks
+# what's on disk; corrections + the generated report are working artifacts)
+downloads/ia/catalog.json
+output/whl_builds.json
+output/whl_corrections.json
+output/ch_library_report.xlsx
+output/entries/
+
+# the private book corpus: capture photography + per-book scan images.
+# Synced through R2 (tools/corpus_sync.py), not through git; the OCR
+# transcripts (books/*/transcript.txt) stay tracked — small, diffable text.
+photo/
+books/**/*.jpg
+books/**/*.jpeg
+books/**/*.png
 
 # per-worktree launcher + its private DATA_ROOT (tools/worktree.py)
 .wt/
@@ -30,8 +50,8 @@ website/assets/config.js
 # python
 __pycache__/
 *.pyc
+*.egg-info/
 downloads/cache/
-output/entries/**/*.pdf
 
 # Claude Code's per-machine permission grants — the approved command lines can
 # quote API keys verbatim, so this must never be committed
@@ -51,7 +71,6 @@ android/BookCapture/local.properties
 android/BookCapture/.idea/caches/
 android/BookCapture/.idea/deploymentTargetSelector.xml
 
-# large binaries kept local, excluded from the published repo
-photo/
+# large binaries kept local, excluded from the published repo (the corpus
+# images are covered by their own block above since they left git entirely)
 copyright_renewals.csv
-books/**/*.jpg

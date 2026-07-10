@@ -20,7 +20,6 @@ import base64
 import json
 import os
 import pathlib
-import sys
 import time
 from urllib.parse import urlsplit
 

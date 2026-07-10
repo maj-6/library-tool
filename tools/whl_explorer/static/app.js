@@ -102,7 +102,8 @@ const state = {
     // TODO-verify until the user has API keys.
     // Cloud capture (phone -> Supabase -> manual entries) + Mistral key,
     // shared by the capture pipeline and the Mistral OCR service
-    supabaseUrl: "", supabaseKey: "", mistralKey: "",
+    supabaseUrl: "", supabaseKey: "", supabaseAnonKey: "", mistralKey: "",
+    authPromptDismissed: false,   // "Work locally" said: don't ask at startup
     // Cloudflare R2 for published PDFs (Supabase storage is 1 GB on free)
     r2Account: "", r2Bucket: "", r2KeyId: "", r2Secret: "", r2PublicBase: "",
     cloudSyncMinutes: 0, cloudDeleteRemote: true,
@@ -110,7 +111,7 @@ const state = {
     ocrTesseract: "", ocrClaudeKey: "", ocrClaudeModel: "",
     ocrAwsKey: "", ocrAwsSecret: "", ocrAwsRegion: "",
     ocrImageWidth: 1400,
-    ocrLayout: false,   // page view: place words where they sit on the page
+    ocrLayout: true,    // page view: place words where they sit on the page
     userName: "",       // attributed to your changes in the activity feed        // rasterization width for OCR input —
                                 // tune to see how shrinking affects quality
     // page-view digit shortcuts: press N over a page to queue it
@@ -142,7 +143,9 @@ const state = {
 // --- appearance: themes are full chrome redesigns; fonts are user-selectable --
 
 // All light. This is a scholarly tool, read for hours: no dark modes, no loud
-// accents. They differ by paper stock, rule weight and ink colour.
+// accents. The paper set differs by stock, rule weight and ink colour; the
+// classic set translates period desktop chrome (bevels, pinstripes, navy
+// bands) onto the same fixed geometry.
 const THEMES = [
   ["sage", "Sage"],
   ["ledger", "Archive Ledger"],
@@ -152,20 +155,24 @@ const THEMES = [
   ["quarto", "Quarto"],
   ["pewter", "Pewter"],
   ["folio", "Folio"],
+  ["platinum", "Platinum"],
+  ["redmond", "Redmond"],
+  ["motif", "Motif"],
 ];
 const DEFAULT_THEME = "sage";
 // Retired ids map to the survivor closest in spirit, so a stored theme never
 // falls through to the bare :root fallback. "" was Classic CAD, the old default.
+// platinum came back as a real theme, so it no longer appears here.
 const LEGACY_THEMES = {
   "": DEFAULT_THEME,
   // the dark/loud round, retired after one release
   scope: "pewter", "terminal-amber": "vellum", "blueprint-linen": "quarto",
   oxblood: "ledger", porcelain: "pewter", herbarium: "vellum",
-  // the original set
-  platinum: "pewter", blueprint: "quarto", modern: "pewter",
+  // the original set; the classic-chrome ids revive as their nearest heirs
+  blueprint: "quarto", modern: "pewter",
   dark: "pewter", stone: "linen", midnight: "pewter",
-  cde: "ledger", xp2003: DEFAULT_THEME, acad: "pewter",
-  workstation: DEFAULT_THEME, slate: "pewter", mainframe: "vellum",
+  cde: "motif", xp2003: "redmond", acad: "pewter",
+  workstation: "motif", slate: "pewter", mainframe: "vellum",
   graphite: "pewter",
 };
 
@@ -616,6 +623,9 @@ const ICONS = {
   replace: _SVG('<path d="M2.5 5.5 h8 M8.2 3.2 L10.5 5.5 L8.2 7.8"/><path d="M13.5 10.5 h-8 M7.8 8.2 L5.5 10.5 L7.8 12.8"/>'),
   star: _SVG('<path d="M8 2 L9.8 6 L14 6.4 L10.8 9.2 L11.8 13.4 L8 11.2 L4.2 13.4 L5.2 9.2 L2 6.4 L6.2 6 Z"/>'),
   go: _SVG('<path d="M2.5 8 h9 M8.2 4.5 L11.8 8 L8.2 11.5"/>'),
+  // a page with a figure block above flowing text: the facsimile layout view
+  layout: _SVG('<rect x="3" y="2" width="10" height="12" rx="1"/><rect x="5" y="4" width="6" height="3.4"/><path d="M5 9.6 h6 M5 11.8 h4.2"/>'),
+  pdf: _SVG('<path d="M3.5 2 h6 l3 3 v9 h-9 Z"/><path d="M9.5 2 v3 h3"/><path d="M5.4 7.5 h5.2 M5.4 9.7 h5.2 M5.4 11.9 h3.4"/>'),
 };
 
 // Glyphs that stand in for a tag's text label. Sized to sit inside a 15px
@@ -986,26 +996,156 @@ async function syncClientStateOnLoad() {
 // Recent activity comes from the server's append-only feed; pending tasks are
 // derived from data already in memory, so they need no store of their own.
 
-// Every write carries who made it. There are no accounts yet, so this is a name
-// from Settings -- but the server records it per event, which is the shape real
-// accounts will need.
+// Every write carries who made it. A signed-in account's display name wins
+// (the server also knows the session and prefers it); the Settings name covers
+// working locally.
 function installActorHeader() {
   const raw = window.fetch.bind(window);
   window.fetch = (input, init) => {
     const method = String((init && init.method) ||
       (input && input.method) || "GET").toUpperCase();
-    if (method !== "GET" && method !== "HEAD" && state.settings.userName) {
+    const who = authState.displayName || state.settings.userName;
+    if (method !== "GET" && method !== "HEAD" && who) {
       init = { ...(init || {}) };
       init.headers = new Headers(init.headers || (input && input.headers) || {});
-      init.headers.set("X-WHL-Actor", state.settings.userName);
+      init.headers.set("X-WHL-Actor", who);
     }
     return raw(input, init);
   };
 }
 
-const homeState = { events: [], loaded: false };
+// --- cloud account -------------------------------------------------------------
+// A real Supabase user. The server owns the session (tokens never reach the
+// browser); this side only asks who is signed in and shows the door.
+
+const authState = { cloud: false, signedIn: false, email: "", displayName: "" };
+
+async function refreshAuthStatus() {
+  try {
+    const r = await (await fetch("/api/auth/status")).json();
+    authState.cloud = !!r.cloud;
+    authState.signedIn = !!r.signed_in;
+    authState.email = r.email || "";
+    authState.displayName = r.display_name || "";
+  } catch (e) { /* server unreachable; keep whatever we knew */ }
+  renderAccountState();
+}
+
+function renderAccountState() {
+  const s = el("set-account-state"), b = el("set-account-btn");
+  if (!s || !b) return;
+  if (authState.signedIn) {
+    s.textContent = `${authState.displayName || authState.email} (${authState.email})`;
+    b.textContent = "Sign out";
+  } else {
+    s.textContent = authState.cloud ? "Not signed in"
+      : "Not signed in — set the Supabase URL and anon key under Sync first";
+    b.textContent = "Sign in…";
+  }
+}
+
+function authMsg(text, ok) {
+  const m = el("auth-msg");
+  m.textContent = text || "";
+  m.hidden = !text;
+  m.classList.toggle("ok", !!ok);
+}
+
+function showAuthOverlay() {
+  setAuthMode(false);
+  authMsg("");
+  el("auth-overlay").hidden = false;
+  el("auth-email").focus();
+}
+
+function hideAuthOverlay() {
+  el("auth-overlay").hidden = true;
+}
+
+// one dialog, two modes: sign in, or create an account (adds a name field)
+let authSignup = false;
+function setAuthMode(signup) {
+  authSignup = signup;
+  el("auth-title").textContent = signup ? "CREATE ACCOUNT" : "SIGN IN";
+  el("auth-submit").textContent = signup ? "Create account" : "Sign in";
+  el("auth-mode").textContent = signup ? "I have an account…" : "Create account…";
+  el("auth-pass").autocomplete = signup ? "new-password" : "current-password";
+  for (const n of document.querySelectorAll(".auth-signup-only")) n.hidden = !signup;
+}
+
+async function submitAuth() {
+  const email = el("auth-email").value.trim();
+  const password = el("auth-pass").value;
+  if (!email || !password) { authMsg("email and password are both required"); return; }
+  el("auth-submit").disabled = true;
+  authMsg(authSignup ? "Creating account…" : "Signing in…", true);
+  try {
+    const body = { email, password };
+    if (authSignup) body.display_name = el("auth-name").value.trim();
+    const r = await fetch(authSignup ? "/api/auth/signup" : "/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) { authMsg(j.error || `sign-in failed (HTTP ${r.status})`); return; }
+    if (j.confirm) {   // account made; the project wants the email link clicked first
+      setAuthMode(false);
+      authMsg("Account created — click the link in your email, then sign in here.", true);
+      return;
+    }
+    hideAuthOverlay();
+    await refreshAuthStatus();
+    status(`SIGNED IN :: ${j.display_name || j.email}`);
+    loadActivity();          // the feed switches to the shared cloud view
+  } catch (e) {
+    authMsg("could not reach the server");
+  } finally {
+    el("auth-submit").disabled = false;
+  }
+}
+
+function initAuth() {
+  el("auth-win").addEventListener("submit", (ev) => { ev.preventDefault(); submitAuth(); });
+  el("auth-mode").onclick = () => { setAuthMode(!authSignup); authMsg(""); };
+  el("auth-close").onclick = hideAuthOverlay;
+  el("auth-skip").onclick = () => {
+    state.settings.authPromptDismissed = true;
+    saveSettings();
+    hideAuthOverlay();
+  };
+  // Escape lives in init()'s exclusive overlay chain — a handler here would
+  // also close the Settings window underneath in the same keypress.
+  el("set-account-btn").onclick = async () => {
+    if (authState.signedIn) {
+      try { await fetch("/api/auth/logout", { method: "POST" }); } catch (e) {}
+      await refreshAuthStatus();
+      status("SIGNED OUT");
+      loadActivity();        // back to the local feed
+    } else {
+      showAuthOverlay();
+    }
+  };
+  refreshAuthStatus();
+}
+
+// Ask once at startup, and only when it could work: cloud configured, no
+// session, and the user hasn't said "work locally". Called AFTER the server's
+// client_state has been adopted: before that, authPromptDismissed is a local
+// default, and a "Work locally" click would be dropped by the write-through
+// gate and then overwritten by the sync.
+function maybeAuthPrompt() {
+  refreshAuthStatus().then(() => {
+    if (authState.cloud && !authState.signedIn && !state.settings.authPromptDismissed) {
+      showAuthOverlay();
+    }
+  });
+}
+
+const homeState = { events: [], loaded: false, expanded: new Set() };
 
 async function loadActivity() {
+  loadReviews().then(renderHome);   // the review count rides the same visit
   try {
     const r = await (await fetch("/api/activity?limit=300")).json();
     homeState.events = r.ok ? r.events : [];
@@ -1028,10 +1168,11 @@ function groupActivity(events) {
         last.subject === e.subject && Math.abs(last.oldest - at) <= GROUP_GAP_MS) {
       last.n += e.n || 1;
       last.oldest = at;
+      if (last.items.length < 40) last.items.push(e);   // enough for the expansion
       continue;
     }
     out.push({ actor: e.actor, verb: e.verb, subject: e.subject,
-               n: e.n || 1, at, oldest: at });
+               n: e.n || 1, at, oldest: at, items: [e] });
   }
   return out;
 }
@@ -1048,6 +1189,16 @@ function relTime(ms) {
   return new Date(ms).toISOString().slice(0, 10);
 }
 
+const relIso = (iso) => { const t = Date.parse(iso || ""); return isNaN(t) ? "" : relTime(t); };
+
+// "2026-07-10 14:32" in local time — the expanded per-event view is exact
+function exactTime(ms) {
+  const d = new Date(ms);
+  const p = (x) => String(x).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+         `${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 // "Checked Books" is a place you add to; every other subject is a bare singular
 // noun ("book", "manual entry") that takes an article or a plural.
 const article = (w) => (/^[aeiou]/i.test(w) ? "an " : "a ");
@@ -1058,54 +1209,162 @@ function activityPhrase(g) {
     const prep = g.verb === "removed" ? "from" : "to";   // never "removed ... to"
     return `${g.verb} ${g.n} book${g.n === 1 ? "" : "s"} ${prep} Checked Books`;
   }
+  if (g.subject === "the cloud") return `${g.verb} ${g.subject}`;   // "signed in to the cloud"
   return g.n === 1
     ? `${g.verb} ${article(g.subject)}${g.subject}`
     : `${g.verb} ${g.n} ${pluralize(g.subject)}`;
 }
 
 // Everything here is computed from data the app already holds.
-function pendingTasks() {
+function progressSummary() {
   const builds = Object.values(state.builds || {});
-  const drafts = builds.filter((b) => b.status === "draft").length;
+  const drafts = builds.filter((b) => b.status === "draft");
   const ready = builds.filter((b) => b.status === "ready").length;
-  const attn = Object.keys(state.attn || {}).length +
+  // a source is settled once a verified entry has been built from it
+  const srcPending = approvedSources()
+    .filter((s) => sourceBuildStatus(s) !== "done").length;
+  // catalog-side marks (rows + the attn map) live in the Catalogs tab;
+  // marked builds live in the Editor's Pending queue — kept apart so the
+  // attention tile can land where its items actually are
+  const attnCat = Object.keys(state.attn || {}).length +
     [...(state.rowsById || new Map()).values()].filter((r) => r.attention).length;
-  const noScan = (state.manual || []).filter(
-    (e) => e.checks && e.checks.in_whl === "no" && !e.scans).length;
-
-  const t = [];
-  if (ready) t.push({ n: ready, text: `verified ${ready === 1 ? "entry" : "entries"} ready to upload`, tab: "upload" });
-  if (drafts) t.push({ n: drafts, text: `${drafts === 1 ? "draft" : "drafts"} pending verification`, tab: "upload" });
-  if (attn) t.push({ n: attn, text: `${attn === 1 ? "item" : "items"} marked for attention`, tab: "checked" });
-  if (noScan) t.push({ n: noScan, text: `manual ${noScan === 1 ? "entry" : "entries"} not yet scanned`, tab: "checked" });
-  return t;
+  const attnEd = builds.filter((b) => b.attention && b.status !== "uploaded").length;
+  const openReviews = Object.values(reviewsState.items || {})
+    .filter((r) => r.status === "open").length;
+  return { drafts, ready, srcPending, attnCat, attnEd, openReviews };
 }
 
+const HOME_DRAFTS_SHOWN = 4;
+
 function renderHome() {
-  const tasks = el("home-tasks");
+  const prog = el("home-progress");
   const feed = el("home-activity");
-  if (!tasks || !feed) return;
+  if (!prog || !feed) return;
 
-  const t = pendingTasks();
-  tasks.innerHTML = t.length
-    ? t.map((x) => `<button class="home-task" data-gotab="${esc(x.tab)}">` +
-        `<span class="home-n">${x.n}</span><span>${esc(x.text)}</span></button>`).join("")
-    : `<div class="empty">Nothing pending</div>`;
+  const p = progressSummary();
+  // one line per metric, count first, breakdown right-aligned and muted —
+  // a status readout in the app's row idiom, not a dashboard of tiles
+  const row = (n, label, act, detail) =>
+    `<button class="home-row" ${act}>` +
+      `<span class="hr-n">${n}</span>` +
+      `<span class="hr-l">${esc(label)}</span>` +
+      (detail ? `<span class="hr-d">${esc(detail)}</span>` : "") +
+    `</button>`;
+  const inEditor = p.drafts.length + p.ready;
+  const attn = p.attnCat + p.attnEd;
+  let html =
+    row(inEditor, inEditor === 1 ? "entry in the editor" : "entries in the editor",
+        `data-gotab="upload"`, inEditor ? `${p.drafts.length} draft · ${p.ready} to upload` : "") +
+    row(p.srcPending, p.srcPending === 1 ? "PDF source pending verification"
+        : "PDF sources pending verification", `data-gotab="upload"`) +
+    row(attn, attn === 1 ? "item marked for attention"
+        : "items marked for attention",
+        `data-gotab="${p.attnCat || !p.attnEd ? "checked" : "upload"}"`,
+        p.attnCat && p.attnEd ? `${p.attnCat} catalog · ${p.attnEd} editor` : "") +
+    row(p.openReviews, p.openReviews === 1 ? "item awaiting review"
+        : "items awaiting review", `data-review="1"`);
 
-  if (!homeState.loaded) { feed.innerHTML = `<div class="empty">Loading …</div>`; return; }
+  // the freshest few drafts, so unfinished work is one click away
+  const drafts = p.drafts.slice()
+    .sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
+  const shown = drafts.slice(0, HOME_DRAFTS_SHOWN);
+  if (shown.length) {
+    html += `<div class="home-h home-h-sub">Editor drafts</div>` +
+      shown.map((b) => `<button class="home-draft" data-draft="${esc(b.id)}"
+          data-tip="Open this draft in the editor">` +
+        `<span class="hd-t">${esc(b.title) || "<em>(untitled)</em>"}</span>` +
+        `<span class="hd-meta">${esc(b.authors || "")}${b.authors && b.year ? " · " : ""}${esc(b.year || "")}</span>` +
+        `<span class="hd-when">${esc(relIso(b.updated_at))}</span></button>`).join("");
+    if (drafts.length > shown.length)
+      html += `<button class="home-more" data-gotab="upload">` +
+        `${drafts.length - shown.length} more in the editor…</button>`;
+  }
+  prog.innerHTML = html;
+
+  const users = el("home-users");
+  if (!homeState.loaded) {
+    feed.innerHTML = `<div class="empty">Loading …</div>`;
+    if (users) users.innerHTML = `<div class="empty">Loading …</div>`;
+    return;
+  }
+
+  // a group expands into its member events: exact local time + what exactly
   const groups = groupActivity(homeState.events).slice(0, 12);
+  const gkey = (g) => `${g.actor}|${g.verb}|${g.subject}|${g.at}`;
   feed.innerHTML = groups.length
-    ? groups.map((g) => `<div class="home-act">` +
-        `<span class="home-who">${esc(g.actor)}</span> ` +
-        `<span class="home-what">${esc(activityPhrase(g))}</span>` +
-        `<span class="home-when">${esc(relTime(g.at))}</span></div>`).join("")
+    ? groups.map((g) => {
+        const k = gkey(g);
+        const open = homeState.expanded.has(k);
+        const det = !open ? "" : `<div class="home-act-det">` +
+          g.items.map((e) => `<div class="had-row">` +
+            `<span class="had-ts">${esc(exactTime(Date.parse(e.ts) || 0))}</span>` +
+            `<span class="had-txt">${esc(e.detail ||
+              activityPhrase({ verb: e.verb, subject: e.subject, n: e.n || 1 }))}</span>` +
+            `</div>`).join("") + `</div>`;
+        return `<div class="home-act${open ? " open" : ""}" data-gk="${esc(k)}">` +
+          `<span class="home-act-arrow">${open ? "&#9662;" : "&#9656;"}</span>` +
+          `<span class="home-who">${esc(g.actor)}</span> ` +
+          `<span class="home-what">${esc(activityPhrase(g))}</span>` +
+          `<span class="home-when">${esc(relTime(g.at))}</span></div>` + det;
+      }).join("")
     : `<div class="empty">No activity recorded yet</div>`;
+
+  // everyone the feed has seen, newest first; your own name is always present
+  if (users) {
+    const me = (state.settings.userName || "").trim();
+    const seen = new Map();
+    for (const e of homeState.events) {
+      const who = String(e.actor || "").trim() || "Unnamed user";
+      const at = Date.parse(e.ts) || 0;
+      const m = seen.get(who) || { n: 0, last: 0 };
+      m.n += e.n || 1;
+      if (at > m.last) m.last = at;
+      seen.set(who, m);
+    }
+    if (me && !seen.has(me)) seen.set(me, { n: 0, last: 0 });
+    const list = [...seen.entries()].sort((a, b) => b[1].last - a[1].last);
+    users.innerHTML = list.length
+      ? list.map(([who, m]) => `<div class="home-user">` +
+          `<span class="hu-name">${esc(who)}</span>` +
+          (who === me ? `<span class="hu-you">you</span>` : "") +
+          `<span class="hu-meta">${m.n
+            ? `${m.n} ${m.n === 1 ? "change" : "changes"}`
+            : "no changes yet"}</span>` +
+          `<span class="hu-when">${m.last ? esc(relTime(m.last)) : ""}</span>` +
+          `</div>`).join("")
+      : `<div class="empty">No contributors recorded yet</div>`;
+  }
 }
 
 function initHome() {
-  el("home-tasks").addEventListener("click", (ev) => {
+  // the version number is stated once, in the title bar markup; the home
+  // page wordmark mirrors it so the two can never disagree
+  el("home-ver").textContent = el("tb-meta").textContent;
+  el("home-progress").addEventListener("click", (ev) => {
+    const d = ev.target.closest("[data-draft]");
+    if (d) {
+      state.buildsTab = "pending";   // drafts live in the Pending queue
+      document.querySelector(`#tabs .tab[data-tab="upload"]`).click();
+      selectBuild(d.dataset.draft);
+      return;
+    }
+    if (ev.target.closest("[data-review]")) { openReviewWin(); return; }
     const b = ev.target.closest("[data-gotab]");
-    if (b) document.querySelector(`#tabs .tab[data-tab="${b.dataset.gotab}"]`).click();
+    if (b) {
+      // every editor-bound row advertises pending work, so land on the
+      // Pending queue even if the sidebar was left on Uploaded
+      if (b.dataset.gotab === "upload") state.buildsTab = "pending";
+      document.querySelector(`#tabs .tab[data-tab="${b.dataset.gotab}"]`).click();
+    }
+  });
+  // an activity row toggles its per-event detail
+  el("home-activity").addEventListener("click", (ev) => {
+    const row = ev.target.closest(".home-act[data-gk]");
+    if (!row) return;
+    const k = row.dataset.gk;
+    if (homeState.expanded.has(k)) homeState.expanded.delete(k);
+    else homeState.expanded.add(k);
+    renderHome();
   });
   loadActivity();
 }
@@ -1825,6 +2084,7 @@ function renderSettings() {
                          ["set-cloud-url", "cloudSearchUrl"],
                          ["set-sb-url", "supabaseUrl"],
                          ["set-sb-key", "supabaseKey"],
+                         ["set-sb-anon", "supabaseAnonKey"],
                          ["set-mistral-key", "mistralKey"]]) {
     const n = el(id);
     n.value = state.settings[k] || "";
@@ -2827,6 +3087,7 @@ function attnTargetAtHover() {
     if (!b) return null;
     return {
       node: bi,
+      kind: "build", ref: bi.dataset.bid,
       label: b.title || bi.dataset.bid,
       current: String(b.attention || ""),
       apply: (v) => patchBuildRaw(bi.dataset.bid, { attention: v })
@@ -2843,6 +3104,7 @@ function attnTargetAtHover() {
     if (!row) return null;
     return {
       node: tr,
+      kind: "row", ref: String(tr.dataset.rowId),
       label: row.book.title || tr.dataset.rowId,
       current: String(row.attention || ""),
       apply: (v) => setRowAttention(tr.dataset.rowId, v),
@@ -2850,6 +3112,7 @@ function attnTargetAtHover() {
   }
   const keyTarget = (k, label, rerender) => ({
     node: tr,
+    kind: "key", ref: k,
     label,
     current: String((state.attn || {})[k] || ""),
     apply: (v) => { setAttnKey(k, v); rerender(); },
@@ -2872,6 +3135,7 @@ function attnTargetAtHover() {
       const e = state.manual.find((x) => x.id === rec._mid);
       return {
         node: tr,
+        kind: "row", ref: String(rec._mid),
         label: rec.title || "manual entry",
         current: String((e && e.attention) || ""),
         apply: (v) => setRowAttention(rec._mid, v).then(renderBottomRows),
@@ -3006,6 +3270,10 @@ function openAttnPop(target, rect) {
   el("attn-pop-label").textContent = (target.label || "").slice(0, 60);
   const ta = el("attn-pop-reason");
   ta.value = attnReason(target.current);
+  // pre-tick when this item already sits in the shared review queue
+  const rk = target.kind ? `${target.kind}:${target.ref}` : "";
+  el("attn-pop-review").checked = !!(rk && Object.values(reviewsState.items || {})
+    .some((r) => r.key === rk && r.status === "open"));
   pop.hidden = false;
   hideTip();                       // the hover tooltip would sit under it otherwise
   positionAttnPop();
@@ -3037,8 +3305,27 @@ function closeAttnPop() {
 
 function saveAttnPop() {
   if (!attnPopTarget) return;
+  const t = attnPopTarget;
   const reason = el("attn-pop-reason").value.trim();
-  attnPopTarget.apply(reason || "1");   // empty reason = plain mark
+  t.apply(reason || "1");   // empty reason = plain mark
+  // "Needs review" raises (or refreshes) a shared queue item. Unticking never
+  // withdraws one — resolution is explicit, in the queue itself.
+  if (el("attn-pop-review").checked && t.kind) {
+    fetch("/api/reviews", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: t.kind, ref: String(t.ref),
+                             label: t.label || "", reason }),
+    }).then(async (res) => {
+      if (res.ok) {
+        await loadReviews();
+        renderHome();
+        status("Added to the review queue");
+      } else {
+        status("Review request failed — not queued");
+      }
+    }).catch(() => status("Review request failed — not queued"));
+  }
   closeAttnPop();
 }
 
@@ -3073,6 +3360,196 @@ function initAttnPop() {
   }, true);
   addEventListener("resize", () => {
     if (!el("attn-pop").hidden) positionAttnPop();
+  });
+}
+
+// --- the review queue ---------------------------------------------------------
+// Items flagged "Needs review" in the Q popover. Server-backed and shared:
+// every contributor sees the same queue, comments under their own name
+// (Settings > Your name), and an explicit resolution closes the item and
+// clears the underlying attention mark.
+
+const reviewsState = { items: {}, loaded: false, showResolved: false };
+
+async function loadReviews() {
+  try {
+    const r = await (await fetch("/api/reviews")).json();
+    // a failed fetch keeps the last-known queue rather than blanking it —
+    // "0 items awaiting review" must never be a euphemism for "server error"
+    if (r.ok) reviewsState.items = r.reviews || {};
+    reviewsState.loaded = true;
+  } catch (e) { /* keep the last-known queue */ }
+}
+
+function openReviewWin() {
+  el("review-overlay").hidden = false;
+  renderReviewList();                       // instant paint from what we have
+  loadReviews().then(renderReviewList);     // then freshen from the server
+}
+function closeReviewWin() { el("review-overlay").hidden = true; }
+
+function reviewsSorted() {
+  const all = Object.values(reviewsState.items || {});
+  const open = all.filter((r) => r.status === "open")
+    .sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+  if (!reviewsState.showResolved) return open;
+  return open.concat(all.filter((r) => r.status !== "open")
+    .sort((a, b) => (b.resolved_at || "").localeCompare(a.resolved_at || "")));
+}
+
+function renderReviewList() {
+  const host = el("review-list");
+  if (!host) return;
+  el("review-show-resolved").checked = reviewsState.showResolved;
+  // a rebuild must never clobber a comment in progress: typed drafts (and
+  // the caret) are carried across the innerHTML replacement
+  const drafts = {};
+  let focusRid = null;
+  for (const i of host.querySelectorAll(".ri-comment-input")) {
+    const it = i.closest(".review-item");
+    if (!it) continue;
+    if (i.value.trim()) drafts[it.dataset.rid] = i.value;
+    if (i === document.activeElement) focusRid = it.dataset.rid;
+  }
+  const items = reviewsSorted();
+  if (!items.length) {
+    host.innerHTML = `<div class="empty">${reviewsState.showResolved
+      ? "No review items yet" : "Nothing awaiting review"}</div>`;
+    return;
+  }
+  host.innerHTML = items.map((r) => {
+    const resolved = r.status !== "open";
+    return `<div class="review-item${resolved ? " resolved" : ""}" data-rid="${esc(r.id)}">` +
+      `<div class="ri-head">` +
+        `<span class="ri-label">${esc(r.label) || "(unlabelled item)"}</span>` +
+        `<span class="ri-meta">${resolved
+          ? `resolved by ${esc(r.resolved_by || "?")} &middot; ${esc(relIso(r.resolved_at))}`
+          : `${esc(r.created_by || "?")} &middot; ${esc(relIso(r.created_at))}`}</span>` +
+        `<button class="cad-btn tiny" type="button" data-rv-resolve="${resolved ? "0" : "1"}" ` +
+          `data-tip="${resolved ? "Reopen this item"
+            : "Mark resolved (also clears the attention mark)"}">${resolved ? "Reopen" : "Resolve"}</button>` +
+      `</div>` +
+      (r.reason ? `<div class="ri-reason">${esc(r.reason)}</div>` : "") +
+      (r.comments || []).map((c) => `<div class="ri-comment">` +
+        `<span class="ric-author">${esc(c.author || "?")}</span>` +
+        `<span class="ric-when">${esc(relIso(c.ts))}</span>` +
+        `<div class="ric-text">${esc(c.text)}</div></div>`).join("") +
+      `<div class="ri-add">` +
+        `<input class="cad-input ri-comment-input" placeholder="Add a comment&hellip;" spellcheck="false" />` +
+        `<button class="cad-btn tiny" type="button" data-rv-comment>Comment</button>` +
+      `</div></div>`;
+  }).join("");
+  for (const [rid, val] of Object.entries(drafts)) {
+    const inp = host.querySelector(`.review-item[data-rid="${CSS.escape(rid)}"] .ri-comment-input`);
+    if (inp) inp.value = val;
+  }
+  if (focusRid) {
+    const inp = host.querySelector(`.review-item[data-rid="${CSS.escape(focusRid)}"] .ri-comment-input`);
+    if (inp) { inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length); }
+  }
+}
+
+// resolving a review also clears the underlying attention mark, wherever
+// that mark lives (attn map / manual row / checked book / editor build)
+async function clearMark(kind, ref) {
+  if (kind === "key") {
+    setAttnKey(ref, "");
+    // repaint whichever table bakes this mark into its rows (the tab-switch
+    // renders only cover the checked/upload tables)
+    if (ref.startsWith("whl:")) renderWhlTop();
+    else if (ref.startsWith("src:")) renderUpload();
+    else renderBottomRows();
+    return;
+  }
+  if (kind === "build") {
+    if ((state.builds || {})[ref]) await patchBuildRaw(ref, { attention: "" });
+    return;
+  }
+  if (kind !== "row") return;
+  if (state.rowsById && state.rowsById.get(String(ref))) {
+    await setRowAttention(ref, "");
+    return;
+  }
+  // the combined table may not have rendered this session — go to the data
+  const e = (state.manual || []).find((x) => x.id === ref);
+  if (e) {
+    await fetch(`/api/manual/${encodeURIComponent(ref)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ attention: "", _preserve: true }),
+    }).catch(() => {});
+    e.attention = "";
+    return;
+  }
+  const v = state.checked && state.checked.get(ref);
+  if (v) { v.attention = ""; saveChecked(); }
+}
+
+function initReviewWin() {
+  el("review-close").addEventListener("click", closeReviewWin);
+  el("review-overlay").addEventListener("mousedown", (ev) => {
+    if (ev.target === el("review-overlay")) closeReviewWin();
+  });
+  el("review-show-resolved").addEventListener("change", (ev) => {
+    reviewsState.showResolved = ev.target.checked;
+    renderReviewList();
+  });
+  el("review-list").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && ev.target.classList.contains("ri-comment-input")) {
+      ev.preventDefault();
+      const btn = ev.target.closest(".review-item").querySelector("[data-rv-comment]");
+      if (btn) btn.click();
+    }
+  });
+  el("review-list").addEventListener("click", async (ev) => {
+    const item = ev.target.closest(".review-item");
+    if (!item) return;
+    const rid = item.dataset.rid;
+    const rbtn = ev.target.closest("[data-rv-resolve]");
+    if (rbtn) {
+      const resolved = rbtn.dataset.rvResolve === "1";
+      const res = await fetch(`/api/reviews/${encodeURIComponent(rid)}/resolve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ resolved }),
+      }).catch(() => null);
+      if (!res || !res.ok) {
+        status(res && res.status === 409
+          ? "This item already has an open review"
+          : "Review update failed");
+        return;
+      }
+      let note = resolved ? "Review resolved" : "Review reopened";
+      const r = (reviewsState.items || {})[rid];
+      if (resolved && r) {
+        // the review IS resolved at this point; a failed mark-clear must not
+        // abort the refresh below, only be reported
+        try { await clearMark(r.kind, r.ref); }
+        catch (e) { note = "Review resolved — attention mark not cleared"; }
+      }
+      await loadReviews();
+      renderReviewList();
+      renderHome();
+      status(note);
+      return;
+    }
+    if (ev.target.closest("[data-rv-comment]")) {
+      const input = item.querySelector(".ri-comment-input");
+      const text = (input.value || "").trim();
+      if (!text) return;
+      const res = await fetch(`/api/reviews/${encodeURIComponent(rid)}/comment`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      }).catch(() => null);
+      if (res && res.ok) {
+        input.value = "";   // posted — the draft is a comment now
+        await loadReviews();
+        renderReviewList();
+      } else {
+        status("Comment failed — not saved");
+      }
+    }
   });
 }
 
@@ -5531,6 +6008,8 @@ function createPdfViewer() {
       <span class="pdf-size tool-label"></span>
       <button class="cad-btn tiny icon-btn pdf-pagesbtn" type="button"
               data-tip="PDF pages beside the OCR text (like the OCR tab)" hidden>${ICONS.pdfpage}</button>
+      <button class="cad-btn tiny icon-btn pdf-laybtn" type="button"
+              data-tip="Facsimile layout: the OCR text at the position and scale it occupies on the page (read-only)" hidden>${ICONS.layout}</button>
       <button class="cad-btn tiny icon-btn pdf-pagesave" type="button"
               data-tip="Save the page-view edits to the OCR file" hidden>${ICONS.save}</button>
       <button class="cad-btn tiny icon-btn pdf-ocr" type="button"
@@ -5552,6 +6031,7 @@ function createPdfViewer() {
   const ocrBtn = root.querySelector(".pdf-ocr");
   const ocrPane = root.querySelector(".pdf-ocrpane");
   const pagesBtn = root.querySelector(".pdf-pagesbtn");
+  const layBtn = root.querySelector(".pdf-laybtn");
   const pagesSave = root.querySelector(".pdf-pagesave");
   const pagesBox = root.querySelector(".pdf-pagesbox");
   let sizeSeq = 0;
@@ -5559,6 +6039,10 @@ function createPdfViewer() {
   let ocrOn = false;
   let ocrLoadedFor = "";
   let pagesOn = false;
+  // facsimile mode of the page view — read from settings at use time, so
+  // both viewer instances (and a server-adopted settings blob) stay in sync
+  const isLay = () => !!state.settings.viewerLayout;
+  let layObs = null;        // this viewer's own lazy-fill observer
   let pagesPdf = "";        // local path for /api/pdf/pageimg
   let pagesSaveTo = null;   // {buildId, name} — where page edits save
   let pagesSec = null;      // {pre, map} sections while the page view is up
@@ -5570,19 +6054,30 @@ function createPdfViewer() {
   // text), scrolling together — the same idiom as the OCR tab
   async function renderPages() {
     const seq = ++pagesSeq;
+    // a rebuild of the SAME pdf (layout toggle, refetch) keeps the scroll
+    const keepTop = pagesBox.dataset.pdf === pagesPdf ? pagesBox.scrollTop : 0;
     // no stale sections may survive into the next render: a Save clicked
-    // mid-load must be a no-op, never a cross-build overwrite
+    // mid-load must be a no-op, never a cross-build overwrite. The old
+    // render stays visible through the fetches below, so its textareas are
+    // locked — with pagesSec null their keystrokes would silently vanish.
     pagesSec = null;
     pagesWhole = false;
     pagesDirty = false;
     pagesSave.hidden = true;
-    pagesBox.innerHTML = `<p class="empty">Loading pages &hellip;</p>`;
-    let count = 0;
-    try {
-      const info = await (await fetch(
-        "/api/pdf/info?path=" + encodeURIComponent(pagesPdf))).json();
-      if (info.ok) count = info.pages;
-    } catch (e) { /* handled below */ }
+    if (layObs) { layObs.disconnect(); layObs = null; }
+    pagesBox.querySelectorAll("textarea").forEach((t) => { t.disabled = true; });
+    let info = ocrState.pdfInfo[pagesPdf];
+    if (!info || !textSrc) {
+      pagesBox.innerHTML = `<p class="empty">Loading pages &hellip;</p>`;
+    }
+    if (!info) {
+      try {
+        const r = await (await fetch(
+          "/api/pdf/info?path=" + encodeURIComponent(pagesPdf))).json();
+        if (r.ok) { info = r; ocrState.pdfInfo[pagesPdf] = r; }
+      } catch (e) { /* handled below */ }
+    }
+    const count = info ? info.pages : 0;
     let text = "";
     let textOk = !textSrc;   // no OCR source at all = legitimately empty
     if (textSrc) {
@@ -5594,6 +6089,7 @@ function createPdfViewer() {
     if (seq !== pagesSeq || !pagesOn) return;
     if (!count) {
       pagesBox.innerHTML = `<p class="empty">Could not read the PDF</p>`;
+      delete pagesBox.dataset.pdf;
       return;
     }
     const sections = ocrPageSections(text);
@@ -5604,14 +6100,35 @@ function createPdfViewer() {
     }
     // a failed OCR fetch renders read-only with saving disabled — one
     // stray Save must not overwrite the real file with emptiness
-    const editable = !!pagesSaveTo && textOk;
+    const editable = !!pagesSaveTo && textOk && !isLay();
     const shown = Math.min(count, 400);
-    const img = (n) => `<img loading="lazy" alt="page ${n}"
+    // reserved page boxes: lazy image loads must not shift the content
+    const dims = (info && info.dims) || [];
+    const ar = (n) => {
+      const dd = dims[n - 1];
+      return dd && dd[0] > 0 && dd[1] > 0 ? `aspect-ratio:${dd[0]} / ${dd[1]};` : "";
+    };
+    const img = (n) => `<img loading="lazy" decoding="async" alt="page ${n}" style="${ar(n)}"
         src="/api/pdf/pageimg?path=${encodeURIComponent(pagesPdf)}&page=${n}&w=700" />`;
-    pagesBox.innerHTML =
+    const notes =
       (!textOk ? `<div class="ocr-pgnote empty">OCR text unavailable — saving disabled</div>` : "") +
-      (pagesWhole ? `<div class="ocr-pgnote empty">This OCR file has no page markers — the full text sits beside page 1 and saves verbatim</div>` : "") +
-      (count > shown ? `<div class="ocr-pgnote empty">Showing the first ${shown} of ${count} pages</div>` : "") +
+      (pagesWhole ? `<div class="ocr-pgnote empty">This OCR file has no page markers — the full text sits beside page 1${isLay() ? "" : " and saves verbatim"}</div>` : "") +
+      (count > shown ? `<div class="ocr-pgnote empty">Showing the first ${shown} of ${count} pages</div>` : "");
+    if (isLay()) {
+      // facsimile mode: the page's text where it sits on the page, read-only
+      pagesBox.innerHTML = notes +
+        Array.from({ length: shown }, (_, i) => `
+        <div class="ocr-pgrow" data-page="${i + 1}">
+          <div class="ocr-pgimg">${img(i + 1)}</div>
+          <div class="ocr-pglayout" data-lay="${i + 1}" style="${ar(i + 1)}"></div>
+        </div>`).join("");
+      if (layObs) layObs.disconnect();
+      layObs = makeLayoutObserver(pagesBox, fillViewerLayout);
+      pagesBox.dataset.pdf = pagesPdf;
+      pagesBox.scrollTop = keepTop;   // 0 on a pdf switch: no bleed-through
+      return;
+    }
+    pagesBox.innerHTML = notes +
       Array.from({ length: shown }, (_, i) => `
         <div class="ocr-pgrow" data-page="${i + 1}">
           <div class="ocr-pgimg">${img(i + 1)}</div>
@@ -5632,6 +6149,25 @@ function createPdfViewer() {
       }
     }
     pagesSave.hidden = !editable;
+    pagesBox.dataset.pdf = pagesPdf;
+    pagesBox.scrollTop = keepTop;   // 0 on a pdf switch: no bleed-through
+  }
+
+  // one facsimile pane: the extraction gets the word boxes of THIS pdf's
+  // text layer; OCR results flow their own page text (figures inline).
+  // Exact name match — "extracted_claude.txt" is somebody's OCR output,
+  // not the pdf's own text layer.
+  async function fillViewerLayout(pane) {
+    const page = +pane.dataset.lay;
+    const name = ((pagesSaveTo && pagesSaveTo.name) || "").toLowerCase();
+    if (name === "extracted.txt" || !pagesSec) {
+      return fillWordLayout(pane, pagesPdf, page);
+    }
+    const text = pagesSec.map.has(page) ? pagesSec.map.get(page) : null;
+    const bid = (pagesSaveTo && pagesSaveTo.buildId) || "";
+    const meta = bid ? await ocrLayoutMeta(bid) : {};
+    if (!pane.isConnected) return;
+    fillDocLayout(pane, text, bid, meta);
   }
 
   pagesBox.addEventListener("input", (ev) => {
@@ -5671,6 +6207,8 @@ function createPdfViewer() {
   function setPages(on) {
     pagesOn = !!on && !!pagesPdf;
     pagesBtn.classList.toggle("active", pagesOn);
+    layBtn.hidden = !pagesOn;              // layout is a mode of the page view
+    layBtn.classList.toggle("active", isLay());
     pagesBox.hidden = !pagesOn;
     pagesSave.hidden = true;   // renderPages re-shows it when editable
     frameWrap.hidden = pagesOn || !frame.getAttribute("src");
@@ -5683,6 +6221,7 @@ function createPdfViewer() {
       pagesWhole = false;
       pagesDirty = false;
       pagesBox.innerHTML = "";
+      delete pagesBox.dataset.pdf;
       setOcr(ocrOn);
     }
   }
@@ -5690,6 +6229,13 @@ function createPdfViewer() {
     if (pagesOn && pagesDirty &&
         !window.confirm("Discard unsaved page edits?")) return;
     setPages(!pagesOn);
+  });
+  layBtn.addEventListener("click", () => {
+    if (pagesDirty && !window.confirm("Discard unsaved page edits?")) return;
+    state.settings.viewerLayout = !isLay();
+    saveSettings();
+    layBtn.classList.toggle("active", isLay());
+    if (pagesOn) renderPages();
   });
   pagesSave.addEventListener("click", () => savePages());
 
@@ -5792,9 +6338,12 @@ function createPdfViewer() {
       pagesOn = false;
       pagesBtn.hidden = true;
       pagesBtn.classList.remove("active");
+      layBtn.hidden = true;
       pagesSave.hidden = true;
       pagesBox.hidden = true;
       pagesBox.innerHTML = "";
+      delete pagesBox.dataset.pdf;
+      if (layObs) { layObs.disconnect(); layObs = null; }
     },
   };
 }
@@ -7475,9 +8024,18 @@ function pdfViewSrc(path) {
     : base + "&preview=1&pages=" + (state.settings.previewPages || 20);
 }
 
+// The Source-tab viewer shows the PRIMARY PDF's pages, so only OCR files
+// that belong to the primary may sit beside them — a secondary scan's
+// active file would misalign every page (and page-view edits would save
+// back misaligned).
+function buildPrimaryOcrFiles() {
+  return ((state.buildFolder && state.buildFolder.ocr) || [])
+    .filter((f) => (f.src || "primary") === "primary");
+}
+
 // the OCR file page-view edits save into: the active file, else extracted
 function buildActiveOcrName(b) {
-  const files = (state.buildFolder && state.buildFolder.ocr) || [];
+  const files = buildPrimaryOcrFiles();
   if (b.ocr_active && files.some((f) => f.name === b.ocr_active)) return b.ocr_active;
   return "extracted.txt";
 }
@@ -7485,7 +8043,7 @@ function buildActiveOcrName(b) {
 // the active OCR file's text feeds the viewer's OCR pane; without one, the
 // folder's extracted.txt, then live extraction from the PDF itself
 function buildTextSrc(b) {
-  const files = (state.buildFolder && state.buildFolder.ocr) || [];
+  const files = buildPrimaryOcrFiles();
   const name = (b.ocr_active && files.some((f) => f.name === b.ocr_active))
     ? b.ocr_active
     : (files.some((f) => f.name === "extracted.txt") ? "extracted.txt" : "");
@@ -7538,6 +8096,63 @@ async function loadBuildFolder(b) {
   }
 }
 
+// --- secondary PDF sources: other scans of the same book -------------------------
+
+function renderPdfSources(b) {
+  const wrap = el("b-pdf-sources");
+  wrap.innerHTML = "";
+  const list = (b.pdf_sources || []);
+  if (!list.length) {
+    const noneEl = document.createElement("span");
+    noneEl.className = "tool-label";
+    noneEl.textContent = "none";
+    wrap.appendChild(noneEl);
+    return;
+  }
+  for (const s of list) {
+    const chip = document.createElement("span");
+    chip.className = "ocr-chip src2-chip";
+    chip.dataset.tip = `${s.path}\nOCR files of this scan sit under it in the OCR tab`;
+    chip.innerHTML = `${esc((s.path || "").replace(/\\/g, "/").split("/").pop())}
+      <button class="src2-del" type="button" data-sid="${esc(s.id)}"
+              data-tip="Remove this secondary source (its OCR files stay)">&times;</button>`;
+    wrap.appendChild(chip);
+  }
+}
+
+async function addSecondaryPdf(path) {
+  const b = currentBuild();
+  if (!b || !path) return;
+  const p = path.trim();
+  let ok = false;
+  try { ok = (await fetch(pdfLocalSrc(p), { method: "HEAD" })).ok; } catch (e) {}
+  if (!ok) { el("b-src-msg").textContent = "File not found (or not a PDF)"; return; }
+  const cur = b.pdf_sources || [];
+  if ((b.pdf_file || "").trim() === p || cur.some((s) => s.path === p)) {
+    el("b-src-msg").textContent = "Already attached";
+    return;
+  }
+  const id = Math.random().toString(16).slice(2, 10);
+  if (await patchBuild(b.id, { pdf_sources: [...cur, { id, path: p }] },
+      `add secondary PDF to ${b.title || b.id}`)) {
+    el("b-src-msg").textContent = "Secondary source added";
+    refreshSourceTab();
+  }
+}
+
+async function removeSecondaryPdf(sid) {
+  const b = currentBuild();
+  if (!b) return;
+  const cur = b.pdf_sources || [];
+  const next = cur.filter((s) => s.id !== sid);
+  if (next.length === cur.length) return;
+  if (await patchBuild(b.id, { pdf_sources: next },
+      `remove secondary PDF from ${b.title || b.id}`)) {
+    el("b-src-msg").textContent = "Secondary source removed";
+    refreshSourceTab();
+  }
+}
+
 async function refreshSourceTab() {
   const b = currentBuild();
   if (!b) return;
@@ -7559,6 +8174,7 @@ async function refreshSourceTab() {
   await loadBuildFolder(b);
   if (stale()) return;
   renderOcrChips(b);
+  renderPdfSources(b);
   const textSrc = buildTextSrc(b);
   if (localPath) {
     // an entry folder's preview.pdf is already a derivative — serve it as-is
@@ -7692,7 +8308,7 @@ async function attachPdfFile(path) {
 // verify against a live service when the user has an API key.
 
 const ocrState = {
-  docs: [], sel: null, view: "edit", jobs: [], seq: 0,
+  docs: [], sel: null, view: "pdf", jobs: [], seq: 0,   // page view is home
   lastRendered: null,      // doc id the views currently hold, so a re-render
                            // of the SAME doc can keep the reader's scroll
   layout: false,           // page view: words placed as they sit on the page
@@ -7701,15 +8317,19 @@ const ocrState = {
   bookLoading: null,       // build id currently loading (re-entrancy guard)
   verifiedOnly: false,     // sidebar filter
   pages: null,             // {pre, map} sections for the side-by-side view
-  pageTags: new Map(),     // "bid:page" -> service, STAGED (submit is manual)
-  pageRunning: new Map(),  // "bid:page" -> service, submitted and processing
-  pageSel: new Set(),      // selected page numbers (current book's view)
+  pageTags: new Map(),     // "bid:src:page" -> service, STAGED (submit is manual)
+  pageRunning: new Map(),  // "bid:src:page" -> service, submitted and processing
+  pageSel: new Set(),      // selected page numbers (current page view's PDF;
+                           // cleared whenever the view swaps to another PDF)
   selAnchor: 0,            // last plain-clicked page (Ctrl+click ranges)
   pagesPdf: "",            // pdf path the page view currently shows — a
                            // re-render of the SAME pdf keeps the scroll
+  pagesSrc: "primary",     // source key of that pdf (staging/selection bind
+                           // to the source, not just the book)
   pdfInfo: {},             // pdf path -> {pages, dims} (/api/pdf/info cache)
   layoutMeta: {},          // build id -> extracted-figure boxes (ocr-layout)
   wordsCache: new Map(),   // "pdf|page" -> /api/pdf/words result
+  treeCollapsed: new Set(),// "bid:srckey" — collapsed nodes of the docs tree
 };
 
 function ocrSelDoc() {
@@ -7753,14 +8373,51 @@ function ocrBookList() {
   return out;
 }
 
-// the book's OCR target: its PDF (the attached file, or the folder preview)
+// the book's OCR target: its PRIMARY PDF (the attached file, or the entry
+// folder's own primary.pdf / legacy preview.pdf derivative)
 function ocrBookPdf(bid) {
   const b = state.builds[bid];
   const pf = b && (b.pdf_file || "").trim();
   if (pf) return pf;
   const folder = (ocrState.books || {})[bid];
+  if (folder && folder.primary_pdf) {
+    return `output/entries/${bid}/${folder.primary_pdf}`;
+  }
   if (folder && folder.preview) return `output/entries/${bid}/preview.pdf`;
   return "";
+}
+
+// every PDF source of a book: the primary plus the secondaries, in order
+function bookSources(bid) {
+  const b = state.builds[bid];
+  const out = [];
+  const primary = ocrBookPdf(bid);
+  out.push({ key: "primary", path: primary, label: "primary.pdf" });
+  for (const s of (b && b.pdf_sources) || []) {
+    const path = (s.path || "").trim();
+    if (!path) continue;
+    out.push({ key: s.id, path,
+               label: path.replace(/\\/g, "/").split("/").pop() || s.id });
+  }
+  return out;
+}
+
+function ocrSrcPdf(bid, key) {
+  if (!key || key === "primary") return ocrBookPdf(bid);
+  const s = bookSources(bid).find((x) => x.key === key);
+  return s ? s.path : "";
+}
+
+// which PDF a document belongs to: its recorded source, else the primary
+function docSrcKey(d) { return (d && d.src) || "primary"; }
+function docPdf(d) { return d && d.buildId ? ocrSrcPdf(d.buildId, docSrcKey(d)) : ""; }
+
+// the OCR-merge target for a source: one compiled file per PDF
+function srcCompiledName(key) {
+  return !key || key === "primary" ? "compiled.txt" : `compiled-${key}.txt`;
+}
+function srcExtractedName(key) {
+  return !key || key === "primary" ? "extracted.txt" : `extracted-${key}.txt`;
 }
 
 function renderOcrBooks() {
@@ -7829,7 +8486,8 @@ async function selectOcrBook(bid) {
         const data = await (await fetch(
           `/api/builds/${encodeURIComponent(bid)}/ocr/` +
           encodeURIComponent(f.name))).json();
-        if (data.ok) loaded.push({ name: f.name, text: String(data.text || "") });
+        if (data.ok) loaded.push({ name: f.name, text: String(data.text || ""),
+                                   src: f.src || "primary" });
       } catch (e) { /* skip unreadable files */ }
       if (ocrState.book !== bid) return;   // switched away mid-load
     }
@@ -7838,7 +8496,7 @@ async function selectOcrBook(bid) {
     for (const l of loaded) {
       const id = "d" + (++ocrState.seq);
       ocrState.docs.push({ id, name: l.name, text: l.text,
-                           buildId: bid, fileName: l.name });
+                           buildId: bid, fileName: l.name, src: l.src });
       if (!firstId) firstId = id;
     }
     if (firstId) ocrState.sel = firstId;
@@ -7856,21 +8514,114 @@ function ocrVisibleDocs() {
   return ocrState.docs.filter((d) => !d.buildId || d.buildId === ocrState.book);
 }
 
+// The documents pane is a file tree: one node per PDF source of the selected
+// book (primary.pdf first, then each secondary scan), its OCR files beneath.
+// Loose .txt files loaded by hand sit under their own "Local files" node.
 function renderOcrDocs() {
   const list = el("ocr-docs");
   list.innerHTML = "";
   const docs = ocrVisibleDocs();
-  el("ocr-docs-empty").hidden = docs.length !== 0;
-  for (const d of docs) {
+  const bid = ocrState.book;
+  const sources = bid ? bookSources(bid) : [];
+  el("ocr-docs-empty").hidden = docs.length !== 0 || sources.length !== 0;
+
+  const docLi = (d) => {
     const li = document.createElement("li");
-    li.className = "ocr-doc" + (d.id === ocrState.sel ? " active" : "");
+    li.className = "ocr-doc tree-doc" + (d.id === ocrState.sel ? " active" : "");
     li.dataset.did = d.id;
-    const build = d.buildId ? state.builds[d.buildId] : null;
     li.innerHTML = `
       <span class="bi-title">${esc(d.name)}</span>
-      <span class="bi-meta">${build ? esc((build.title || d.buildId).slice(0, 30)) : "local file"}
-        &middot; ${Math.max(1, Math.round(d.text.length / 1000))}k chars</span>`;
+      <span class="bi-meta">${Math.max(1, Math.round(d.text.length / 1000))}k chars</span>`;
+    return li;
+  };
+
+  for (const s of sources) {
+    const children = docs.filter((d) => d.buildId === bid && docSrcKey(d) === s.key);
+    const collapsed = ocrState.treeCollapsed.has(`${bid}:${s.key}`);
+    const li = document.createElement("li");
+    li.className = "ocr-src";
+    li.dataset.src = s.key;
+    li.dataset.tip = s.path || "No PDF attached";
+    // a source with a PDF but no extraction offers to pull its text layer
+    const canExtract = s.path &&
+      !children.some((d) => (d.fileName || d.name) === srcExtractedName(s.key));
+    li.innerHTML = `
+      <span class="tree-arrow">${collapsed ? "&#9656;" : "&#9662;"}</span>
+      <span class="tree-ico">${ICONS.pdf}</span>
+      <span class="bi-title">${esc(s.label)}</span>
+      <span class="tree-count">${children.length || ""}</span>` +
+      (canExtract ? `<button class="cad-btn tiny icon-btn src-extract" type="button"
+         data-src="${esc(s.key)}" data-tip="Extract this PDF's text layer">${ICONS.text}</button>` : "");
     list.appendChild(li);
+    if (!collapsed) for (const d of children) list.appendChild(docLi(d));
+  }
+  // docs whose source was removed still exist on disk and stay reachable —
+  // a book must never hold an invisible selected document
+  const keys = new Set(sources.map((s) => s.key));
+  const orphans = docs.filter((d) => d.buildId === bid && !keys.has(docSrcKey(d)));
+  if (orphans.length) {
+    const li = document.createElement("li");
+    li.className = "ocr-src";
+    li.dataset.src = "";
+    li.dataset.tip = "OCR files of a PDF source that was removed from the book";
+    li.innerHTML = `
+      <span class="tree-arrow"></span>
+      <span class="tree-ico">${ICONS.folder}</span>
+      <span class="bi-title">Removed source</span>
+      <span class="tree-count">${orphans.length}</span>`;
+    list.appendChild(li);
+    for (const d of orphans) list.appendChild(docLi(d));
+  }
+  const loose = docs.filter((d) => !d.buildId);
+  if (loose.length) {
+    const li = document.createElement("li");
+    li.className = "ocr-src";
+    li.dataset.src = "";
+    li.innerHTML = `
+      <span class="tree-arrow"></span>
+      <span class="tree-ico">${ICONS.folder}</span>
+      <span class="bi-title">Local files</span>
+      <span class="tree-count">${loose.length}</span>`;
+    list.appendChild(li);
+    for (const d of loose) list.appendChild(docLi(d));
+  }
+}
+
+// Pull a secondary (or the primary) PDF's text layer into its own document.
+// Only the NEW file is fetched and added — the book's other documents stay
+// as they are, unsaved edits included.
+async function ocrExtractSource(key) {
+  const bid = ocrState.book;
+  const pdf = ocrSrcPdf(bid, key);
+  if (!bid || !pdf) return;
+  el("ocr-msg").textContent = "Extracting text ...";
+  try {
+    const name = srcExtractedName(key);
+    const ex = await (await fetch("/api/pdf/text?pages=400&path=" +
+      encodeURIComponent(pdf) +
+      "&save_build=" + encodeURIComponent(bid) +
+      "&save_name=" + encodeURIComponent(name) +
+      "&src=" + encodeURIComponent(key))).json();
+    if (ex.ok && (ex.pages_with_text || 0) <= 1) {
+      el("ocr-msg").textContent =
+        "This PDF has no text layer — OCR the pages (digit keys stage a service)";
+    } else {
+      el("ocr-msg").textContent = ex.ok ? "" : (ex.error || "extraction failed");
+    }
+    await loadOcrBooks();
+    if (ocrState.book !== bid) return;
+    if (ex.ok && ex.saved &&
+        !ocrState.docs.some((d) => d.buildId === bid &&
+                                   (d.fileName || d.name) === ex.saved)) {
+      ocrSyncEditor();
+      const id = "d" + (++ocrState.seq);
+      ocrState.docs.push({ id, name: ex.saved, text: ex.text || "",
+                           buildId: bid, fileName: ex.saved, src: key });
+      ocrState.sel = id;
+    }
+    renderOcrTab();
+  } catch (e) {
+    el("ocr-msg").textContent = "extraction failed";
   }
 }
 
@@ -8030,7 +8781,11 @@ async function renderOcrPages() {
   if (box.offsetParent === null) return;
   const d = ocrSelDoc();
   if (!d) { box.innerHTML = `<p class="empty">No document selected</p>`; ocrState.pagesPdf = ""; return; }
-  const pdf = d.buildId ? ocrBookPdf(d.buildId) : "";
+  const pdf = docPdf(d);   // the doc's OWN source: a secondary scan's OCR
+                           // renders beside the secondary PDF's pages
+  // a view swap to ANOTHER pdf invalidates the page selection — its page
+  // numbers pointed at the previous scan (Delete would hit the wrong file)
+  if (ocrState.pagesPdf !== pdf && ocrState.pageSel.size) clearOcrPageSel();
   if (!pdf) {
     box.innerHTML = `<p class="empty">No PDF for this document — attach one in the Editor tab</p>`;
     ocrState.pagesPdf = "";
@@ -8070,7 +8825,8 @@ async function renderOcrPages() {
       src="/api/pdf/pageimg?path=${encodeURIComponent(pdf)}&page=${n}&w=700" />`;
   const done = () => {
     ocrState.pagesPdf = pdf;
-    if (keepTop) box.scrollTop = keepTop;
+    ocrState.pagesSrc = d.buildId ? docSrcKey(d) : "primary";
+    box.scrollTop = keepTop;   // 0 on a pdf switch: no scroll bleed-through
     decorateOcrPages();
   };
   // Layout mode swaps each editable textarea for a facsimile pane: the page's
@@ -8129,20 +8885,29 @@ async function renderOcrPages() {
 // browser's viewer uses to draw a selection), read server-side with PyMuPDF and
 // normalised to 0..1, so they survive any render width.
 
+// panes fill lazily as they scroll into view — a 400-page book must not
+// fire 400 fetches up front. Shared by the OCR tab and the pdf viewer
+// (each holds its own observer instance).
+function makeLayoutObserver(rootEl, fill) {
+  const obs = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      obs.unobserve(e.target);
+      fill(e.target).catch(() => { /* page left the view */ });
+    }
+  }, { root: rootEl, rootMargin: "300px" });
+  for (const pane of rootEl.querySelectorAll(".ocr-pglayout")) {
+    obs.observe(pane);
+  }
+  return obs;
+}
+
 let ocrLayoutObs = null;
 
 function observeOcrLayout(pdf) {
   if (ocrLayoutObs) ocrLayoutObs.disconnect();
-  ocrLayoutObs = new IntersectionObserver((entries, obs) => {
-    for (const e of entries) {
-      if (!e.isIntersecting) continue;
-      obs.unobserve(e.target);
-      fillOcrLayout(e.target, pdf).catch(() => { /* page left the view */ });
-    }
-  }, { root: el("ocr-pages"), rootMargin: "300px" });
-  for (const pane of el("ocr-pages").querySelectorAll(".ocr-pglayout")) {
-    ocrLayoutObs.observe(pane);
-  }
+  ocrLayoutObs = makeLayoutObserver(el("ocr-pages"),
+    (pane) => fillOcrLayout(pane, pdf));
 }
 
 // the extracted-figure boxes for a book (ocr/layout.json), fetched once
@@ -8175,21 +8940,18 @@ function ocrMarkdownHtml(text, bid, meta) {
   }).join("");
 }
 
-// OCR output (compiled.txt and friends): the doc's own text for this page,
-// flowed into a page-shaped pane with its figures inline
-async function fillOcrLayoutDoc(pane, d, page) {
-  const sec = ocrState.pages;
-  const text = sec && sec.map.has(page) ? sec.map.get(page) : null;
+// OCR output (compiled.txt and friends): the page's text flowed into the
+// page-shaped pane with its figures inline. Shared by the OCR tab and the
+// pdf viewer; `text` may be null (no section for this page).
+function fillDocLayout(pane, text, bid, meta) {
   pane.classList.remove("doctext", "empty");
   if (text == null || !text.trim()) {
     pane.classList.add("empty");
     pane.textContent = "No text for this page in this document — OCR it";
     return;
   }
-  const meta = await ocrLayoutMeta(d.buildId);
-  if (!pane.isConnected || ocrSelDoc() !== d) return;
   pane.classList.add("doctext");
-  pane.innerHTML = ocrMarkdownHtml(text, d.buildId, meta);
+  pane.innerHTML = ocrMarkdownHtml(text, bid, meta);
 }
 
 async function fillOcrLayout(pane, pdf) {
@@ -8199,9 +8961,20 @@ async function fillOcrLayout(pane, pdf) {
   // doc (an OCR result) shows ITS text for this page, so switching between
   // compiled and extracted actually swaps what the facsimile holds.
   if (d && d.buildId && ocrState.pages &&
-      (d.fileName || d.name) !== "extracted.txt") {
-    return fillOcrLayoutDoc(pane, d, page);
+      (d.fileName || d.name) !== srcExtractedName(docSrcKey(d))) {
+    const sec = ocrState.pages;
+    const text = sec && sec.map.has(page) ? sec.map.get(page) : null;
+    const meta = await ocrLayoutMeta(d.buildId);
+    if (!pane.isConnected || ocrSelDoc() !== d) return;
+    fillDocLayout(pane, text, d.buildId, meta);
+    return;
   }
+  return fillWordLayout(pane, pdf, page);
+}
+
+// the word-box facsimile of one page, from the PDF's own text layer —
+// shared by the OCR tab and the pdf viewer
+async function fillWordLayout(pane, pdf, page) {
   pane.classList.remove("doctext");
   pane.textContent = "…";
   const ck = `${pdf}|${page}`;
@@ -8263,13 +9036,16 @@ async function fillOcrLayout(pane, pdf) {
 // the caller can fall back to a full re-render.
 function refillOcrPageText(d) {
   const box = el("ocr-pages");
+  // a doc from ANOTHER PDF source shows different page images — refill
+  // can't help there, the caller must rebuild against the doc's own PDF
+  if (ocrState.pagesPdf && docPdf(d) !== ocrState.pagesPdf) return false;
   // layout mode: the panes stay mounted (and the page images loaded), but the
   // facsimiles must show the NEW doc's text — re-observe every pane, so the
   // visible ones refill immediately and the rest as they scroll into view
   if (ocrState.layout) {
     if (!box.querySelector(".ocr-pglayout")) return false;
     ocrState.pages = ocrPageSections(d.text);
-    observeOcrLayout(d.buildId ? ocrBookPdf(d.buildId) : "");
+    observeOcrLayout(docPdf(d));
     decorateOcrPages();
     return true;
   }
@@ -8409,7 +9185,8 @@ async function ocrSaveDoc() {
     const res = await fetch(`/api/builds/${encodeURIComponent(d.buildId)}/ocr`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: d.fileName || d.name, text: d.text }),
+      body: JSON.stringify({ name: d.fileName || d.name, text: d.text,
+                             src: docSrcKey(d) }),
     });
     const data = await res.json().catch(() => ({}));
     el("ocr-msg").textContent = data.ok ? "Saved" : "Save failed";
@@ -8465,10 +9242,21 @@ function ocrServiceReady(svc) {
 }
 
 // POST a page batch to the server OCR runner; results merge into ONE
-// compiled OCR document (ocr/compiled.txt), saved page by page
-async function ocrQueuePages(bid, pages) {
+// compiled OCR document per PDF source (ocr/compiled.txt for the primary,
+// compiled-<src>.txt for a secondary), saved page by page. The batch runs
+// against the source its pages were STAGED on — never whatever doc
+// happens to be selected at submit time.
+async function ocrQueuePages(bid, srcKey, pages) {
   const b = state.builds[bid];
-  const pdf = ocrBookPdf(bid);
+  srcKey = srcKey || "primary";
+  if (srcKey !== "primary" && !bookSources(bid).some((s) => s.key === srcKey)) {
+    el("ocr-msg").textContent =
+      "That PDF source was removed from the book — staging discarded";
+    for (const x of pages) ocrState.pageTags.delete(`${bid}:${srcKey}:${x.page}`);
+    return;
+  }
+  const pdf = ocrSrcPdf(bid, srcKey);
+  const target = srcCompiledName(srcKey);
   if (!b || !pdf || !pages.length) return;
   const bad = pages.find((x) => !OCR_RUNNABLE[x.service]);
   if (bad) {
@@ -8496,7 +9284,7 @@ async function ocrQueuePages(bid, pages) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        build_id: bid, pdf, pages,
+        build_id: bid, pdf, pages, target, src: srcKey,
         width: s.ocrImageWidth || 1400,
         tesseract: s.ocrTesseract || "",
         claude_key: s.ocrClaudeKey || "", claude_model: s.ocrClaudeModel || "",
@@ -8513,12 +9301,16 @@ async function ocrQueuePages(bid, pages) {
     const job = data.job;
     ocrState.jobs.push({
       id: job.id, buildId: bid, book: b.title || bid, pdf,
+      target, src: srcKey,
       service: [...new Set(pages.map((x) => OCR_SERVICE_LABELS[x.service]))].join(", "),
       status: `Running — 0/${job.pages.length}`,
       at: new Date().toLocaleTimeString(),
     });
-    // keyed by build AND page: markers must not leak across books
-    for (const x of pages) ocrState.pageRunning.set(`${bid}:${x.page}`, x.service);
+    // keyed by build AND source AND page: markers must not leak across
+    // books or across scans of one book
+    for (const x of pages) {
+      ocrState.pageRunning.set(`${bid}:${srcKey}:${x.page}`, x.service);
+    }
     decorateOcrPages();
     renderOcrQueue();
     pollOcrJobs();
@@ -8530,19 +9322,31 @@ async function ocrQueuePages(bid, pages) {
   return false;
 }
 
-// staged tags for one book, grouped for a single mixed-service job
+// staged tags for one book: src key -> [{page, service}], each source's
+// pages sorted — one job per PDF source, so page numbers always run
+// against the scan they were staged on
 function stagedPagesFor(bid) {
-  const out = [];
+  const bySrc = new Map();
   for (const [k, svc] of ocrState.pageTags) {
-    const [kb, kn] = k.split(":");
-    if (kb === bid) out.push({ page: +kn, service: svc });
+    const parts = k.split(":");
+    if (parts[0] !== bid) continue;
+    const src = parts[1];
+    if (!bySrc.has(src)) bySrc.set(src, []);
+    bySrc.get(src).push({ page: +parts[2], service: svc });
   }
-  return out.sort((a, b) => a.page - b.page);
+  for (const list of bySrc.values()) list.sort((a, b) => a.page - b.page);
+  return bySrc;
+}
+
+function stagedCountFor(bid) {
+  let n = 0;
+  for (const list of stagedPagesFor(bid).values()) n += list.length;
+  return n;
 }
 
 function updateOcrStagedMsg() {
   const bid = ocrState.book;
-  const n = bid ? stagedPagesFor(bid).length : 0;
+  const n = bid ? stagedCountFor(bid) : 0;
   const sel = ocrState.pageSel.size;
   el("ocr-msg").textContent =
     (sel ? `${sel} page(s) selected` : "") +
@@ -8551,28 +9355,33 @@ function updateOcrStagedMsg() {
 }
 
 // SUBMIT: processing is prompted manually — the staged mix (possibly
-// several services) goes out as one job
+// several services) goes out as one job PER SOURCE, each against the scan
+// its pages were staged on
 async function ocrSubmitStaged() {
   const bid = ocrState.book;
   if (!bid) { el("ocr-msg").textContent = "Pick a book first"; return; }
-  const staged = stagedPagesFor(bid);
-  if (!staged.length) {
+  const bySrc = stagedPagesFor(bid);
+  if (!bySrc.size) {
     el("ocr-msg").textContent = "Nothing staged — hover a page and press a digit";
     return;
   }
-  // stub services can't run: one honest queue row PER service
-  const stubs = staged.filter((x) => !OCR_RUNNABLE[x.service]);
-  const runnable = staged.filter((x) => OCR_RUNNABLE[x.service]);
-  for (const svc of new Set(stubs.map((x) => x.service))) {
-    ocrQueuePages(bid, [stubs.find((x) => x.service === svc)]);
-  }
-  for (const x of stubs) ocrState.pageTags.delete(`${bid}:${x.page}`);
   let failed = false;
-  if (runnable.length) {
-    if (await ocrQueuePages(bid, runnable)) {
-      for (const x of runnable) ocrState.pageTags.delete(`${bid}:${x.page}`);
-    } else {
-      failed = true;   // ocrQueuePages already explained why in ocr-msg
+  for (const [src, staged] of bySrc) {
+    // stub services can't run: one honest queue row PER service
+    const stubs = staged.filter((x) => !OCR_RUNNABLE[x.service]);
+    const runnable = staged.filter((x) => OCR_RUNNABLE[x.service]);
+    for (const svc of new Set(stubs.map((x) => x.service))) {
+      ocrQueuePages(bid, src, [stubs.find((x) => x.service === svc)]);
+    }
+    for (const x of stubs) ocrState.pageTags.delete(`${bid}:${src}:${x.page}`);
+    if (runnable.length) {
+      if (await ocrQueuePages(bid, src, runnable)) {
+        for (const x of runnable) {
+          ocrState.pageTags.delete(`${bid}:${src}:${x.page}`);
+        }
+      } else {
+        failed = true;   // ocrQueuePages already explained why in ocr-msg
+      }
     }
   }
   decorateOcrPages();
@@ -8609,10 +9418,11 @@ function pollOcrJobs() {
           j.finished = true;
           // finished pages (ok or errored) are no longer running
           for (const x of job.pages) {
-            ocrState.pageRunning.delete(`${j.buildId}:${x.page}`);
+            ocrState.pageRunning.delete(`${j.buildId}:${j.src || "primary"}:${x.page}`);
           }
           refreshCompiledDoc(j.buildId,
-            job.pages.filter((x) => x.status === "ok").map((x) => x.page));
+            job.pages.filter((x) => x.status === "ok").map((x) => x.page),
+            j.target, j.src);
         }
       } catch (e) {
         // repeated garbage responses: give up rather than poll forever
@@ -8632,18 +9442,21 @@ function pollOcrJobs() {
 // The job's finished pages come from the SERVER text; every other section
 // keeps the user's local (possibly unsaved) version — a running edit
 // session must not be clobbered by a finishing job.
-async function refreshCompiledDoc(bid, donePages) {
+async function refreshCompiledDoc(bid, donePages, target, src) {
+  target = target || "compiled.txt";
   delete ocrState.layoutMeta[bid];   // the job may have added figures
   await loadOcrBooks();
   try {
     const data = await (await fetch(
-      `/api/builds/${encodeURIComponent(bid)}/ocr/compiled.txt`)).json();
+      `/api/builds/${encodeURIComponent(bid)}/ocr/` +
+      encodeURIComponent(target))).json();
     if (!data.ok) return;
     const doc = ocrState.docs.find(
-      (d) => d.buildId === bid && (d.fileName || d.name) === "compiled.txt");
+      (d) => d.buildId === bid && (d.fileName || d.name) === target);
     if (!doc) {
-      ocrState.docs.push({ id: "d" + (++ocrState.seq), name: "compiled.txt",
-                           text: data.text, buildId: bid, fileName: "compiled.txt" });
+      ocrState.docs.push({ id: "d" + (++ocrState.seq), name: target,
+                           text: data.text, buildId: bid, fileName: target,
+                           src: src || "primary" });
     } else {
       ocrSyncEditor();   // flush pending editor/page-view edits first
       const local = ocrPageSections(doc.text);
@@ -8658,16 +9471,20 @@ async function refreshCompiledDoc(bid, donePages) {
       }
     }
     renderOcrTab();
-    status("OCR RESULT MERGED :: compiled.txt");
+    status(`OCR RESULT MERGED :: ${target}`);
   } catch (e) { /* folder list already refreshed */ }
 }
 
-// stage the whole book with the selected service (submit stays manual)
+// stage the whole book with the selected service (submit stays manual);
+// "the book" means the PDF the page view currently shows — the selected
+// doc's own source
 async function ocrQueueJob() {
   const bid = ocrState.book;
   const b = bid ? state.builds[bid] : null;
   if (!b) { el("ocr-msg").textContent = "Pick a book first"; return; }
-  const pdf = ocrBookPdf(bid);
+  const d = ocrSelDoc();
+  const src = d && d.buildId === bid ? docSrcKey(d) : "primary";
+  const pdf = ocrSrcPdf(bid, src);
   if (!pdf) { el("ocr-msg").textContent = "This book has no PDF"; return; }
   const svc = el("ocr-service").value;
   let count = 0;
@@ -8676,7 +9493,9 @@ async function ocrQueueJob() {
     if (info.ok) count = Math.min(info.pages, 400);
   } catch (e) { /* handled below */ }
   if (!count) { el("ocr-msg").textContent = "Could not read the PDF"; return; }
-  for (let n = 1; n <= count; n++) ocrState.pageTags.set(`${bid}:${n}`, svc);
+  for (let n = 1; n <= count; n++) {
+    ocrState.pageTags.set(`${bid}:${src}:${n}`, svc);
+  }
   decorateOcrPages();
   updateOcrStagedMsg();
 }
@@ -8725,12 +9544,14 @@ function onOcrPagesKey(ev) {
     const svc = (state.settings.ocrKeyMap || {})[ev.key];
     if (!svc) return;
     ev.preventDefault();
-    // stage the selection (or the hovered page); the same digit untags
+    // stage the selection (or the hovered page); the same digit untags.
+    // Tags bind to the page view's SOURCE: page numbers of one scan mean
+    // nothing on another.
     const targets = ocrState.pageSel.size
       ? [...ocrState.pageSel]
       : (ocrHoverPage ? [ocrHoverPage] : []);
     for (const n of targets) {
-      const k = `${bid}:${n}`;
+      const k = `${bid}:${ocrState.pagesSrc}:${n}`;
       if (ocrState.pageTags.get(k) === svc) ocrState.pageTags.delete(k);
       else ocrState.pageTags.set(k, svc);
     }
@@ -8740,6 +9561,13 @@ function onOcrPagesKey(ev) {
   }
   if ((ev.key === "t" || ev.key === "T") && ocrHoverPage) {
     ev.preventDefault();
+    // title pages are counted on the PRIMARY PDF; numbers from another
+    // scan's view would mark the wrong pages
+    if (ocrState.pagesSrc !== "primary") {
+      el("ocr-msg").textContent =
+        "Title pages are marked on the primary PDF's page view";
+      return;
+    }
     toggleTitlePage(bid, ocrHoverPage);
   }
 }
@@ -8774,8 +9602,9 @@ async function deleteSelectedPages() {
   const d = ocrSelDoc();
   const bid = d && d.buildId;
   if (!bid || !ocrState.pageSel.size) return;
-  const b = state.builds[bid];
-  const pdf = (b && (b.pdf_file || "").trim());
+  // the deletion hits the PDF the page view shows — the doc's own source;
+  // the server renumbers only that source's OCR files
+  const pdf = docPdf(d);
   if (!pdf) { el("ocr-msg").textContent = "This book has no attached PDF"; return; }
   if (/^output[\/\\]entries[\/\\]/i.test(pdf)) {
     el("ocr-msg").textContent =
@@ -8869,8 +9698,9 @@ function decorateOcrPages() {
   const titles = titlePageSet(b);
   document.querySelectorAll("#ocr-pages .ocr-pgrow").forEach((row) => {
     const n = +row.dataset.page;
-    const staged = b ? ocrState.pageTags.get(`${d.buildId}:${n}`) : undefined;
-    const running = b ? ocrState.pageRunning.get(`${d.buildId}:${n}`) : undefined;
+    const k = `${d && d.buildId}:${ocrState.pagesSrc}:${n}`;
+    const staged = b ? ocrState.pageTags.get(k) : undefined;
+    const running = b ? ocrState.pageRunning.get(k) : undefined;
     row.classList.toggle("pg-title", titles.has(n));
     row.classList.toggle("pg-staged", !!staged);
     row.classList.toggle("pg-queued", !!running);
@@ -8907,6 +9737,18 @@ function initOcrTab() {
     if (li) selectOcrBook(li.dataset.bid);
   });
   el("ocr-docs").addEventListener("click", (ev) => {
+    // tree chrome first: extract-text action, then node collapse/expand
+    const ex = ev.target.closest("button.src-extract");
+    if (ex) { ocrExtractSource(ex.dataset.src); return; }
+    const srcLi = ev.target.closest("li.ocr-src");
+    if (srcLi) {
+      if (!srcLi.dataset.src) return;   // the local-files node doesn't fold
+      const k = `${ocrState.book}:${srcLi.dataset.src}`;
+      if (ocrState.treeCollapsed.has(k)) ocrState.treeCollapsed.delete(k);
+      else ocrState.treeCollapsed.add(k);
+      renderOcrDocs();
+      return;
+    }
     const li = ev.target.closest("li.ocr-doc");
     if (!li) return;
     ocrSyncEditor();
@@ -8942,8 +9784,11 @@ function initOcrTab() {
   el("ocr-pages").addEventListener("mouseleave", () => { ocrHoverPage = 0; });
   el("ocr-pages").addEventListener("click", onOcrPagesClick);
   document.addEventListener("keydown", onOcrPagesKey);
-  ocrState.layout = !!state.settings.ocrLayout;
+  ocrState.layout = state.settings.ocrLayout !== false;   // layout is home
   el("ocr-layout").addEventListener("click", () => setOcrLayout(!ocrState.layout));
+  // reflect the default view (page view, layout on) in the toolbar/panes —
+  // the tab isn't visible yet, so no page render fires here
+  setOcrView(ocrState.view);
   // page-image failures (e.g. PyMuPDF not installed — 501) must be visible,
   // not a wall of broken-image icons; error events don't bubble, so capture
   el("ocr-pages").addEventListener("error", (ev) => {
@@ -9353,6 +10198,7 @@ function init() {
   boot("actor header", installActorHeader);   // before any write goes out
   boot("menu bar", initMenubar);
   boot("home", initHome);
+  boot("account", initAuth);
   boot("title bar", fitTitleBar);   // after the menus exist: their width sets the clamp
   boot("settings nav", initSettingsNav);
   boot("column resize", initColResize);
@@ -9644,6 +10490,75 @@ function init() {
     });
   })();
 
+  // Generic pane splitter: drag a gutter to size the target pane, persist
+  // per-split in settings.paneSizes, double-click to fall back to the
+  // stylesheet default. `measure(ev)` turns the pointer position into the
+  // target's new pixel size; `apply(px)`/`reset()` write/clear it.
+  function initSplitter(id, opts) {
+    const sp = el(id);
+    if (!sp) return;
+    const sizes = () => (state.settings.paneSizes =
+      state.settings.paneSizes || {});
+    // clamp a saved size before applying it — a corrupt/stale value must
+    // not wedge a pane off-screen. opts.max() can't be trusted here (the
+    // pane may still be display:none, measuring 0), so a fixed ceiling.
+    if (sizes()[opts.key]) {
+      opts.apply(Math.max(opts.min, Math.min(2400, +sizes()[opts.key] || opts.min)));
+    }
+    let dragging = false;
+    sp.addEventListener("mousedown", (ev) => {
+      dragging = true;
+      ev.preventDefault();
+      document.body.classList.add(opts.vertical ? "resizing-v" : "resizing");
+    });
+    document.addEventListener("mousemove", (ev) => {
+      if (!dragging) return;
+      opts.apply(Math.min(opts.max(), Math.max(opts.min, opts.measure(ev))));
+    });
+    document.addEventListener("mouseup", () => {
+      if (!dragging) return;
+      dragging = false;
+      document.body.classList.remove("resizing", "resizing-v");
+      sizes()[opts.key] = Math.round(opts.value());
+      saveSettings();
+    });
+    sp.addEventListener("dblclick", () => {
+      delete sizes()[opts.key];
+      opts.reset();
+      saveSettings();
+    });
+  }
+  const widthSplit = (id, key, paneId, min, max) => {
+    const pane = el(paneId);
+    initSplitter(id, {
+      key, min, max: () => max,
+      measure: (ev) => ev.clientX - pane.getBoundingClientRect().left,
+      apply: (px) => { pane.style.width = px + "px"; },
+      value: () => pane.offsetWidth,
+      reset: () => { pane.style.width = ""; },
+    });
+  };
+  widthSplit("ocr-splitter", "ocrSide", "ocr-side", 200, 620);
+  widthSplit("builds-splitter", "buildsPane", "builds-pane", 180, 620);
+  widthSplit("form-splitter", "buildForm", "build-form", 280, 720);
+  initSplitter("ocr-side-splitter", {
+    key: "ocrBooks", vertical: true, min: 60,
+    max: () => el("ocr-side").clientHeight - 120,
+    measure: (ev) => ev.clientY - el("ocr-books-wrap").getBoundingClientRect().top,
+    apply: (px) => { el("ocr-books-wrap").style.flex = `0 0 ${px}px`; },
+    value: () => el("ocr-books-wrap").offsetHeight,
+    reset: () => { el("ocr-books-wrap").style.flex = ""; },
+  });
+  initSplitter("ocr-queue-splitter", {
+    key: "ocrQueue", vertical: true, min: 60,
+    max: () => el("ocr").clientHeight - 220,
+    measure: (ev) =>
+      el("ocr-queue-wrap").getBoundingClientRect().bottom - ev.clientY,
+    apply: (px) => { el("ocr-queue-wrap").style.flex = `0 0 ${px}px`; },
+    value: () => el("ocr-queue-wrap").offsetHeight,
+    reset: () => { el("ocr-queue-wrap").style.flex = ""; },
+  });
+
   // markdown: the builder's live editor + the overlay window (WHL pencil)
   buildDescMd = createMdEditor(el("b-desc-editor"));
   overlayMd = createMdEditor(el("md-live-overlay"));
@@ -9723,6 +10638,7 @@ function init() {
   document.addEventListener("keydown", onSearchKey);
   document.addEventListener("keydown", onRowDeleteKey);
   boot("attention popover", initAttnPop);
+  boot("review queue", initReviewWin);
   el("b-pdf-attach").addEventListener("click", () => attachPdfFile());
   el("b-pdf_file").addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") { ev.preventDefault(); attachPdfFile(); }
@@ -9732,6 +10648,17 @@ function init() {
     const dir = cur.includes("/") || cur.includes("\\")
       ? cur.replace(/[/\\][^/\\]*$/, "") : "";
     openFileBrowser(dir, (path) => attachPdfFile(path));
+  });
+  // secondary PDF sources: browse-to-add; × on a chip removes it
+  el("b-pdf2-add").addEventListener("click", () => {
+    const cur = el("b-pdf_file").value.trim();
+    const dir = cur.includes("/") || cur.includes("\\")
+      ? cur.replace(/[/\\][^/\\]*$/, "") : "";
+    openFileBrowser(dir, (path) => addSecondaryPdf(path));
+  });
+  el("b-pdf-sources").addEventListener("click", (ev) => {
+    const del = ev.target.closest("button.src2-del");
+    if (del) removeSecondaryPdf(del.dataset.sid);
   });
 
   // file browser window
@@ -9761,11 +10688,13 @@ function init() {
   });
   document.addEventListener("keydown", (ev) => {
     if (ev.key !== "Escape") return;
-    if (!el("attn-pop").hidden) closeAttnPop();
+    if (!el("auth-overlay").hidden) hideAuthOverlay();   // topmost (z 62)
+    else if (!el("attn-pop").hidden) closeAttnPop();
     else if (!el("fb-overlay").hidden) closeFileBrowser();
     else if (!el("pdfm-overlay").hidden) closePdfModal();
     else if (!el("md-overlay").hidden) closeMarkdownEditor(false);
     else if (!el("msrc-overlay").hidden) closeManualSource();
+    else if (!el("review-overlay").hidden) closeReviewWin();
     else if (!el("settings-overlay").hidden) closeSettings();
   });
 
@@ -9786,6 +10715,7 @@ function init() {
   // first render reflects whatever the server holds.
   syncClientStateOnLoad().then((adopted) => {
     if (adopted) { applyTheme(); applyFont(); }
+    maybeAuthPrompt();   // needs the adopted settings: authPromptDismissed
     loadDownloads();
     // Home's pending tasks are derived from these, so it re-renders once the
     // data it counts has actually arrived

@@ -45,6 +45,7 @@ import catalog_checks as checks  # noqa: E402
 import copyright_registration as copyreg  # noqa: E402
 import libcommon as lib  # noqa: E402
 import r2_store as r2  # noqa: E402
+import supabase_auth as sauth  # noqa: E402
 import supabase_sync as sbase  # noqa: E402
 import ol_client  # noqa: E402
 import scan_search  # noqa: E402
@@ -176,19 +177,25 @@ _activity_lock = threading.Lock()
 
 
 def _actor() -> str:
-    """Who is acting. Until there are real accounts this is a name the client
-    carries in a header; an unnamed client is still distinguishable from a
-    background job, which passes its own actor explicitly."""
-    try:
-        name = (request.headers.get("X-WHL-Actor") or "").strip()
-    except RuntimeError:            # outside a request context (background jobs)
-        name = ""
+    """Who is acting. A signed-in session is the identity; the X-WHL-Actor
+    header (the name from Settings) covers working locally, and a background
+    job passes its own actor explicitly."""
+    ses = (_auth_doc().get("session") or {})
+    name = str(ses.get("display_name") or "").strip()
+    if not name:
+        try:
+            name = (request.headers.get("X-WHL-Actor") or "").strip()
+        except RuntimeError:        # outside a request context (background jobs)
+            name = ""
     return name[:60] or "Unnamed user"
 
 
-def activity(verb: str, subject: str, n: int = 1, actor: str | None = None) -> None:
+def activity(verb: str, subject: str, n: int = 1, actor: str | None = None,
+             detail: str = "") -> None:
     rec = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
            "actor": actor or _actor(), "verb": verb, "subject": subject, "n": int(n)}
+    if detail:                      # what exactly (book titles etc.), for the
+        rec["detail"] = str(detail)[:200]   # feed's expandable per-event view
     try:
         with _activity_lock:
             ACTIVITY_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -196,27 +203,434 @@ def activity(verb: str, subject: str, n: int = 1, actor: str | None = None) -> N
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception as exc:        # the feed is a nicety; never break the write
         log.warning("activity log write failed: %s", exc)
+    _push_wake.set()                # the cloud mirror catches up in the background
+
+
+def _activity_lines() -> list[str]:
+    if not ACTIVITY_PATH.is_file():
+        return []
+    with _activity_lock:
+        with open(ACTIVITY_PATH, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.readlines()
 
 
 @app.route("/api/activity")
 def api_activity():
-    """The newest events, newest first. Bad lines are skipped, not fatal."""
+    """The newest events, newest first. Signed in, the shared cloud feed is the
+    source (it includes everyone, yourself included, because every local event
+    is mirrored up); the local file covers signed-out and offline. Bad lines
+    are skipped, not fatal."""
     try:
         limit = max(1, min(500, int(request.args.get("limit") or 200)))
     except ValueError:
         limit = 200
-    rows: list[dict] = []
-    if ACTIVITY_PATH.is_file():
-        with _activity_lock:
-            with open(ACTIVITY_PATH, "r", encoding="utf-8", errors="replace") as fh:
-                tail = collections.deque(fh, maxlen=limit)
-        for line in tail:
+    cloud = _cloud_events(limit)
+    if cloud is not None:
+        # events written since the pusher last ran are only in the local file;
+        # the cursor marks exactly what the cloud already has, so prepending
+        # the lines beyond it duplicates nothing
+        cursor = int(_auth_doc().get("push_cursor") or 0)
+        fresh: list[dict] = []
+        for line in _activity_lines()[cursor:]:
             try:
-                rows.append(json.loads(line))
+                rec = json.loads(line)
             except ValueError:
                 continue
+            if isinstance(rec, dict):
+                fresh.append(rec)
+        # merge by time: after an offline stretch the unpushed tail can be
+        # OLDER than cloud events other machines wrote in the meantime
+        merged = sorted(fresh + cloud,
+                        key=lambda r: str(r.get("ts") or ""), reverse=True)
+        return jsonify({"ok": True, "cloud": True, "events": merged[:limit]})
+    rows: list[dict] = []
+    for line in _activity_lines()[-limit:]:
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            continue
     rows.reverse()
-    return jsonify({"ok": True, "events": rows})
+    return jsonify({"ok": True, "cloud": False, "events": rows})
+
+
+# --- accounts -------------------------------------------------------------------
+# A real Supabase user, signed in from the desktop. The session (plus the
+# activity push cursor) lives in DATA_ROOT/output/auth_session.json — device
+# state, gitignored like client_state.json. Contributions reach the cloud as
+# the authenticated user, so row-level security applies and no policy has to
+# trust a plain-text name. Settings and API keys never leave the machine.
+
+AUTH_SESSION_PATH = lib.DATA_ROOT / "output" / "auth_session.json"
+_auth_lock = threading.RLock()
+_push_wake = threading.Event()
+
+
+def _auth_doc() -> dict:
+    # No lock: save_json is atomic (temp file + os.replace), so a read can
+    # never see a torn file. Taking _auth_lock here would make _actor() — and
+    # with it every activity-logging request — block behind a token refresh's
+    # network round-trip. Read-modify-write sequences still take the lock.
+    return lib.load_json(AUTH_SESSION_PATH, {}) or {}
+
+
+def _auth_cfg() -> dict | None:
+    """GoTrue wants a project API key in `apikey`; the anon key is the right
+    one, but the service key works too, so use whichever Settings holds."""
+    s = _client_settings()
+    url = str(s.get("supabaseUrl") or "").strip()
+    key = (str(s.get("supabaseAnonKey") or "").strip()
+           or str(s.get("supabaseKey") or "").strip())
+    return {"url": url, "key": key} if url and key else None
+
+
+def _auth_session() -> dict | None:
+    """A live session, refreshed when stale. Refresh tokens rotate, so the
+    refreshed session is persisted before anything uses it, under the lock —
+    two concurrent refreshes with one token can revoke the whole family."""
+    cfg = _auth_cfg()
+    if not cfg:
+        return None
+    with _auth_lock:
+        doc = _auth_doc()
+        ses = doc.get("session")
+        if not ses or not ses.get("refresh_token"):
+            return None
+        if time.time() < float(ses.get("expires_at") or 0) - 90:
+            return ses
+        try:
+            fresh = sauth.refresh(cfg, ses["refresh_token"])
+        except sauth.AuthError as exc:
+            # Only a definitive rejection kills the session. A transport
+            # failure (offline, DNS, captive portal) says nothing about the
+            # refresh token — destroying it here would sign the user out
+            # every time the laptop slept through a token expiry.
+            if exc.status in (400, 401, 403):
+                log.warning("session refresh rejected (%s) — signed out", exc)
+                doc.pop("session", None)
+                lib.save_json(AUTH_SESSION_PATH, doc)
+            else:
+                log.warning("session refresh unavailable (%s) — will retry", exc)
+            return None
+        # the stored name came from the profiles row; a refresh only knows
+        # user_metadata, which may be blank or stale
+        fresh["display_name"] = (ses.get("display_name")
+                                 or fresh.get("display_name") or "")
+        doc["session"] = fresh
+        lib.save_json(AUTH_SESSION_PATH, doc)
+        return fresh
+
+
+def _adopt_profile(cfg: dict, ses: dict) -> dict:
+    """The profiles row is the shared display name. Prefer it; seed it from
+    signup metadata or the email when it does not exist yet."""
+    name = ses.get("display_name") or ""
+    try:
+        rows = sauth.rest(cfg, ses["access_token"], "GET",
+                          f"profiles?id=eq.{ses['user_id']}&select=display_name") or []
+        if rows and str(rows[0].get("display_name") or "").strip():
+            name = str(rows[0]["display_name"]).strip()
+        else:
+            name = name or ses.get("email", "").split("@")[0]
+            sauth.rest(cfg, ses["access_token"], "POST", "profiles?on_conflict=id",
+                       [{"id": ses["user_id"], "display_name": name}],
+                       prefer="resolution=merge-duplicates,return=minimal")
+    except sauth.AuthError as exc:
+        log.warning("profile lookup failed: %s", exc)
+        name = name or ses.get("email", "").split("@")[0]
+    return dict(ses, display_name=name[:60])
+
+
+def _store_session(ses: dict) -> None:
+    with _auth_lock:
+        doc = _auth_doc()
+        doc["session"] = ses
+        # Share from here on — pushing the backlog would stamp this user's id
+        # onto events they may not have made. Applies on the first sign-in AND
+        # whenever a different account takes over the machine.
+        if "push_cursor" not in doc or doc.get("account_id") != ses["user_id"]:
+            doc["push_cursor"] = len(_activity_lines())
+        doc["account_id"] = ses["user_id"]
+        lib.save_json(AUTH_SESSION_PATH, doc)
+    _push_wake.set()
+
+
+@app.route("/api/auth/status")
+def api_auth_status():
+    """Who is signed in, from the stored session — no refresh, no network.
+    Offline must not read as signed-out: the tokens are still on disk and the
+    pusher refreshes them when it actually needs them."""
+    cfg = _auth_cfg()
+    ses = (_auth_doc().get("session") or {}) if cfg else {}
+    return jsonify({"ok": True, "cloud": bool(cfg),
+                    "signed_in": bool(ses.get("refresh_token")),
+                    "email": ses.get("email", ""),
+                    "display_name": ses.get("display_name", "")})
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def api_auth_login():
+    cfg = _auth_cfg()
+    if not cfg:
+        return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Sync)"}), 400
+    p = request.get_json(silent=True) or {}
+    email = str(p.get("email") or "").strip()
+    password = str(p.get("password") or "")
+    if not email or not password:
+        return jsonify({"ok": False, "error": "email and password are both required"}), 400
+    try:
+        ses = sauth.sign_in(cfg, email, password)
+    except sauth.AuthError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 401
+    ses = _adopt_profile(cfg, ses)
+    _store_session(ses)
+    activity("signed in to", "the cloud", actor=ses["display_name"] or email)
+    return jsonify({"ok": True, "email": ses["email"],
+                    "display_name": ses["display_name"]})
+
+
+@app.route("/api/auth/signup", methods=["POST"])
+def api_auth_signup():
+    cfg = _auth_cfg()
+    if not cfg:
+        return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Sync)"}), 400
+    p = request.get_json(silent=True) or {}
+    email = str(p.get("email") or "").strip()
+    password = str(p.get("password") or "")
+    name = str(p.get("display_name") or "").strip()[:60]
+    if not email or not password:
+        return jsonify({"ok": False, "error": "email and password are both required"}), 400
+    if len(password) < 6:
+        return jsonify({"ok": False, "error": "password must be at least 6 characters"}), 400
+    try:
+        ses = sauth.sign_up(cfg, email, password, name)
+    except sauth.AuthError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    if ses is None:     # project requires email confirmation (the default)
+        return jsonify({"ok": True, "confirm": True})
+    ses = _adopt_profile(cfg, ses)
+    _store_session(ses)
+    activity("signed in to", "the cloud", actor=ses["display_name"] or email)
+    return jsonify({"ok": True, "email": ses["email"],
+                    "display_name": ses["display_name"]})
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def api_auth_logout():
+    cfg = _auth_cfg()
+    with _auth_lock:
+        doc = _auth_doc()
+        ses = doc.pop("session", None)
+        # push_cursor stays: signing back in resumes the mirror, no re-push
+        lib.save_json(AUTH_SESSION_PATH, doc)
+    if cfg and ses and ses.get("access_token"):
+        sauth.sign_out(cfg, ses["access_token"])
+    return jsonify({"ok": True})
+
+
+# --- the activity mirror: local jsonl -> cloud events table ----------------------
+# The local file is the source of truth; the cursor in auth_session.json marks
+# how much of it the cloud already has. Push failures leave the cursor alone,
+# so offline work catches up on the next wake. One daemon thread, poked by
+# activity() and by sign-in, with a slow heartbeat for retries.
+
+def _push_events_once() -> None:
+    cfg = _auth_cfg()
+    ses = _auth_session() if cfg else None
+    if not cfg or not ses:
+        return
+    with _auth_lock:
+        cursor = int(_auth_doc().get("push_cursor") or 0)
+    lines = _activity_lines()
+    if cursor > len(lines):        # the file was truncated by hand: resync
+        cursor = len(lines)
+        with _auth_lock:
+            doc = _auth_doc()
+            doc["push_cursor"] = cursor
+            lib.save_json(AUTH_SESSION_PATH, doc)
+    if cursor >= len(lines):
+        return
+    chunk = lines[cursor:cursor + 200]
+    batch = []
+    for line in chunk:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue               # a bad line is skipped, and the cursor passes it
+        if not isinstance(r, dict):
+            continue               # `[1]` or `"x"` would AttributeError below
+        ev = {"actor": str(r.get("actor") or "")[:60], "actor_id": ses["user_id"],
+              "verb": str(r.get("verb") or ""), "subject": str(r.get("subject") or "")}
+        try:
+            ev["n"] = int(r.get("n") or 1)
+        except (ValueError, TypeError):
+            ev["n"] = 1
+        ts = str(r.get("ts") or "").strip()
+        if ts:
+            ev["at"] = ts          # absent -> the column's now() default
+        batch.append(ev)
+    if batch:
+        try:
+            sauth.rest(cfg, ses["access_token"], "POST", "events", batch,
+                       prefer="return=minimal")
+        except sauth.AuthError as exc:
+            if exc.status == 400:
+                # the DATA was rejected (e.g. a hand-mangled timestamp);
+                # retrying the same lines forever would wedge the mirror
+                log.warning("event batch rejected (%s) — skipping %d line(s)",
+                            exc, len(chunk))
+            else:
+                raise              # transient: retry next wake, cursor untouched
+    with _auth_lock:
+        doc = _auth_doc()
+        doc["push_cursor"] = cursor + len(chunk)
+        lib.save_json(AUTH_SESSION_PATH, doc)
+    _cloud_feed_cache["at"] = 0.0  # the feed should see what was just pushed
+    if cursor + len(chunk) < len(lines):
+        _push_wake.set()
+
+
+def _push_events_loop() -> None:
+    while True:
+        _push_wake.wait(timeout=300)
+        _push_wake.clear()
+        try:
+            _push_events_once()
+        except Exception as exc:   # offline, RLS, anything — retry on next wake
+            log.warning("activity push deferred: %s", exc)
+
+
+# The cloud read is cached briefly: Home re-renders freely, and the feed does
+# not need to be fresher than the pusher that feeds it. Failures are cached
+# too, or an unreachable Supabase would cost every feed load a full timeout.
+_cloud_feed_cache: dict = {"at": 0.0, "rows": [], "fail_at": 0.0}
+
+
+def _cloud_events(limit: int) -> list[dict] | None:
+    """The shared feed, or None when signed out / offline (caller falls back)."""
+    cfg = _auth_cfg()
+    ses = _auth_session() if cfg else None
+    if not cfg or not ses:
+        return None
+    now = time.time()
+    if now - _cloud_feed_cache["at"] < 15:
+        return _cloud_feed_cache["rows"]
+    if now - _cloud_feed_cache["fail_at"] < 30:
+        return None
+    try:
+        rows = sauth.rest(cfg, ses["access_token"], "GET",
+                          "events?select=at,actor,verb,subject,n"
+                          f"&order=at.desc&limit={int(limit)}", timeout=8.0) or []
+    except sauth.AuthError as exc:
+        log.warning("cloud feed unavailable: %s", exc)
+        _cloud_feed_cache["fail_at"] = now
+        return None
+    out = [{"ts": r.get("at"), "actor": r.get("actor"), "verb": r.get("verb"),
+            "subject": r.get("subject"), "n": r.get("n")} for r in rows]
+    _cloud_feed_cache.update(at=now, rows=out)
+    return out
+
+
+# --- review queue ----------------------------------------------------------------
+# An attention mark is a personal flag; a REVIEW is a shared work item raised
+# from the Q popover: visible to every contributor, carrying a comment thread
+# and an explicit resolution (the Google-Docs pattern, minus accounts).
+# kind/ref name the marked item so resolving can clear the underlying mark:
+#   key   -> a state.attn map key ("whl:12", "src:<url>", "ol:3" ...)
+#   row   -> a checked/manual row id
+#   build -> an editor build id
+
+REVIEWS_PATH = lib.OUTPUT_DIR / "reviews.json"
+_reviews_lock = threading.Lock()
+_REVIEW_KINDS = ("key", "row", "build")
+
+
+@app.route("/api/reviews")
+def api_reviews_list():
+    with _reviews_lock:
+        reviews = lib.load_json(REVIEWS_PATH, {})
+    return jsonify({"ok": True, "reviews": reviews})
+
+
+@app.route("/api/reviews", methods=["POST"])
+def api_reviews_create():
+    payload = request.get_json(silent=True) or {}
+    kind = str(payload.get("kind") or "")
+    ref = str(payload.get("ref") or "").strip()
+    if kind not in _REVIEW_KINDS or not ref:
+        abort(400)
+    key = f"{kind}:{ref}"
+    label = str(payload.get("label") or "").strip()[:120]
+    reason = str(payload.get("reason") or "").strip()[:500]
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    created = False
+    with _reviews_lock:
+        reviews = lib.load_json(REVIEWS_PATH, {})
+        # one OPEN review per item -- flagging again refreshes label/reason
+        r = next((x for x in reviews.values()
+                  if x.get("key") == key and x.get("status") == "open"), None)
+        if r:
+            r["label"] = label or r.get("label", "")
+            if reason:
+                r["reason"] = reason
+        else:
+            rid = lib.gen_id(set(reviews))
+            r = reviews[rid] = {
+                "id": rid, "key": key, "kind": kind, "ref": ref,
+                "label": label, "reason": reason, "status": "open",
+                "created_by": _actor(), "created_at": now,
+                "resolved_by": "", "resolved_at": "", "comments": [],
+            }
+            created = True
+        lib.save_json(REVIEWS_PATH, reviews)
+    if created:
+        activity("opened", "review", detail=label)
+    return jsonify({"ok": True, "review": r})
+
+
+@app.route("/api/reviews/<rid>/comment", methods=["POST"])
+def api_reviews_comment(rid: str):
+    payload = request.get_json(silent=True) or {}
+    text = str(payload.get("text") or "").strip()[:1000]
+    if not text:
+        abort(400)
+    with _reviews_lock:
+        reviews = lib.load_json(REVIEWS_PATH, {})
+        if rid not in reviews:
+            abort(404)
+        r = reviews[rid]
+        r.setdefault("comments", []).append({
+            "author": _actor(), "text": text,
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds")})
+        lib.save_json(REVIEWS_PATH, reviews)
+    activity("commented on", "review", detail=r.get("label", ""))
+    return jsonify({"ok": True, "review": r})
+
+
+@app.route("/api/reviews/<rid>/resolve", methods=["POST"])
+def api_reviews_resolve(rid: str):
+    payload = request.get_json(silent=True) or {}
+    resolved = bool(payload.get("resolved", True))
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with _reviews_lock:
+        reviews = lib.load_json(REVIEWS_PATH, {})
+        if rid not in reviews:
+            abort(404)
+        r = reviews[rid]
+        # reopening must not sidestep the one-open-review-per-item rule
+        if not resolved:
+            dup = next((x for x in reviews.values()
+                        if x is not r and x.get("key") == r.get("key")
+                        and x.get("status") == "open"), None)
+            if dup:
+                return jsonify({"ok": False,
+                                "error": "This item already has an open review"}), 409
+        r["status"] = "resolved" if resolved else "open"
+        r["resolved_by"] = _actor() if resolved else ""
+        r["resolved_at"] = now if resolved else ""
+        lib.save_json(REVIEWS_PATH, reviews)
+    activity("resolved" if resolved else "reopened", "review",
+             detail=r.get("label", ""))
+    return jsonify({"ok": True, "review": r})
 
 
 @app.route("/api/log")
@@ -300,17 +714,51 @@ def api_books():
 BUILDS_PATH = lib.OUTPUT_DIR / "whl_builds.json"
 
 # The field set mirrors what a WHL catalog entry needs. pdf_source is the
-# source URL; pdf_file is the local PDF attached for the actual submission;
-# ocr_active/ocr_verified/ocr_quality track the entry folder's OCR files;
-# title_pages lists PDF pages marked as title pages (metadata extraction
-# uses them later); attention flags an entry as needing attention.
+# source URL; pdf_file is the local PDF attached for the actual submission
+# (the PRIMARY PDF source); pdf_sources lists SECONDARY PDFs — other scans
+# of the same book, each {id, path}, so OCR files can belong to a specific
+# scan; ocr_active/ocr_verified/ocr_quality track the entry folder's OCR
+# files; title_pages lists PDF pages marked as title pages (metadata
+# extraction uses them later); attention flags an entry as needing attention.
 _BUILD_FIELDS = ("published_slug",
                  "title", "subtitle", "authors", "year", "publisher",
                  "publisher_city", "edition", "language", "pages",
                  "categories", "description", "pdf_source", "pdf_file",
+                 "pdf_sources",
                  "source_url", "notes", "status",
                  "ocr_active", "ocr_verified", "ocr_quality",
                  "title_pages", "attention")
+
+
+def _clean_pdf_sources(raw) -> list:
+    """Secondary PDF sources: a list of {id, path}. Everything else in a
+    build is a flat string; this one field is structured, so it gets its
+    own sanitizer instead of the str() coercion."""
+    out = []
+    if isinstance(raw, list):
+        for it in raw:
+            if not isinstance(it, dict):
+                continue
+            path = str(it.get("path") or "").strip()
+            if not path:
+                continue
+            sid = re.sub(r"[^\w]", "", str(it.get("id") or ""))[:12]
+            if not sid or sid == "primary":   # "primary" is a reserved key
+                sid = lib.gen_id()
+            out.append({"id": sid, "path": path})
+    return out
+
+
+def _valid_src_key(b: dict, key) -> str:
+    """A client-supplied source key checked against the build: 'primary'
+    (also the meaning of empty), or a LIVE secondary id. Anything else —
+    a removed source, a typo — returns '' so callers refuse to record it."""
+    key = str(key or "").strip()
+    if not key or key == "primary":
+        return "primary"
+    if any(s.get("id") == key for s in (b.get("pdf_sources") or [])):
+        return key
+    return ""
 
 # draft -> ready (verified) -> uploaded (sent to WHL, cleared from Pending)
 _BUILD_STATUSES = ("draft", "ready", "uploaded")
@@ -326,7 +774,9 @@ def api_builds_create():
     payload = request.get_json(silent=True) or {}
     seed = payload.get("build") or {}
     builds = lib.load_json(BUILDS_PATH, {})
-    build = {f: str(seed.get(f, "") or "").strip() for f in _BUILD_FIELDS}
+    build = {f: str(seed.get(f, "") or "").strip() for f in _BUILD_FIELDS
+             if f != "pdf_sources"}
+    build["pdf_sources"] = _clean_pdf_sources(seed.get("pdf_sources"))
     if build["status"] not in _BUILD_STATUSES:
         build["status"] = "draft"
     build["id"] = lib.gen_id(set(builds))
@@ -334,7 +784,7 @@ def api_builds_create():
     build["updated_at"] = build["created_at"]
     builds[build["id"]] = build
     lib.save_json(BUILDS_PATH, builds)
-    activity("created", "draft entry")
+    activity("created", "draft entry", detail=build.get("title", ""))
     return jsonify({"ok": True, "build": build})
 
 
@@ -347,7 +797,11 @@ def api_builds_update(build_id: str):
     b = builds[build_id]
     was = b.get("status")
     for f in _BUILD_FIELDS:
-        if f in payload:
+        if f not in payload:
+            continue
+        if f == "pdf_sources":
+            b[f] = _clean_pdf_sources(payload[f])
+        else:
             b[f] = str(payload[f] or "").strip()
     if b.get("status") not in _BUILD_STATUSES:
         b["status"] = "draft"
@@ -355,7 +809,8 @@ def api_builds_update(build_id: str):
     lib.save_json(BUILDS_PATH, builds)
     # only the status transition is worth a feed entry; every keystroke is not
     if b["status"] != was and b["status"] in ("ready", "uploaded"):
-        activity("uploaded" if b["status"] == "uploaded" else "verified", "book")
+        activity("uploaded" if b["status"] == "uploaded" else "verified", "book",
+                 detail=b.get("title", ""))
     return jsonify({"ok": True, "build": b})
 
 
@@ -521,7 +976,9 @@ def api_ai_summarize():
 
 # --- entry folders: one directory per pending entry -------------------------------
 # output/entries/<build-id>/ holds metadata.json, a compressed + truncated
-# preview.pdf, and ocr/*.txt files (extracted plus any loaded for comparison).
+# primary.pdf (the book's own PDF derivative; preview.pdf is the legacy
+# name), and ocr/*.txt files (extracted plus any loaded for comparison),
+# each tied to its PDF source via ocr/sources.json.
 
 ENTRIES_DIR = lib.OUTPUT_DIR / "entries"
 
@@ -537,14 +994,53 @@ def _ocr_name(raw: str) -> str:
     return name
 
 
+# ocr/sources.json ties each OCR file to the PDF it came from: {name: key}
+# where key is "primary" (the build's pdf_file — the default, so it is
+# never written) or a secondary source id from build.pdf_sources.
+
+def _ocr_sources(build_id: str) -> dict:
+    return lib.load_json(_entry_dir(build_id) / "ocr" / "sources.json", {})
+
+
+def _ocr_set_source(build_id: str, name: str, key: str) -> None:
+    key = (key or "").strip()
+    with _ocr_merge_lock:
+        p = _entry_dir(build_id) / "ocr" / "sources.json"
+        m = lib.load_json(p, {})
+        if not key or key == "primary":
+            if name not in m:
+                return
+            del m[name]              # primary is the default mapping
+        elif m.get(name) == key:
+            return
+        else:
+            m[name] = key
+        p.parent.mkdir(parents=True, exist_ok=True)
+        lib.save_json(p, m)
+
+
+def _entry_primary_pdf(build_id: str) -> str:
+    """The folder's own PDF derivative: primary.pdf, or the legacy
+    preview.pdf name from before secondary sources existed."""
+    d = _entry_dir(build_id)
+    if (d / "primary.pdf").is_file():
+        return "primary.pdf"
+    if (d / "preview.pdf").is_file():
+        return "preview.pdf"
+    return ""
+
+
 def _entry_folder_info(build_id: str) -> dict:
     d = _entry_dir(build_id)
     ocr = []
     if (d / "ocr").is_dir():
+        srcmap = _ocr_sources(build_id)
         for f in sorted((d / "ocr").glob("*.txt")):
-            ocr.append({"name": f.name, "size": f.stat().st_size})
+            ocr.append({"name": f.name, "size": f.stat().st_size,
+                        "src": srcmap.get(f.name) or "primary"})
+    primary = _entry_primary_pdf(build_id)
     return {"exists": d.is_dir(), "path": str(d), "ocr": ocr,
-            "preview": (d / "preview.pdf").is_file(),
+            "preview": bool(primary), "primary_pdf": primary,
             "metadata": (d / "metadata.json").is_file()}
 
 
@@ -668,8 +1164,22 @@ def api_build_folder_sync(build_id: str):
         try:
             prev = _preview_pdf(src, pages)
             import shutil
-            shutil.copyfile(prev, d / "preview.pdf")
+            shutil.copyfile(prev, d / "primary.pdf")
             preview_ok = True
+            # migrate away from the legacy name: anything pointing at the
+            # old preview.pdf (a keep_original repoint from an earlier run)
+            # moves to primary.pdf BEFORE the stale file goes
+            legacy = d / "preview.pdf"
+            if legacy.is_file():
+                old_rel = legacy.resolve().relative_to(
+                    lib.DATA_ROOT.resolve()).as_posix()
+                if (b.get("pdf_file") or "").replace("\\", "/") == old_rel:
+                    b["pdf_file"] = (d / "primary.pdf").resolve().relative_to(
+                        lib.DATA_ROOT.resolve()).as_posix()
+                    lib.save_json(BUILDS_PATH, builds)
+                    src = d / "primary.pdf"
+                legacy.unlink()
+                notes.append("renamed preview.pdf to primary.pdf")
         except Exception as exc:
             notes.append(f"preview failed: {exc}")
         try:
@@ -697,9 +1207,9 @@ def api_build_folder_sync(build_id: str):
                     src.with_suffix(".bak.pdf").unlink(missing_ok=True)
                     notes.append("original removed (temporary artifact)")
                     # nothing may keep pointing at the deleted file: the
-                    # entry folder's preview becomes the build's PDF, and
+                    # entry folder's own PDF becomes the build's PDF, and
                     # the IA download catalog entry is retired
-                    b["pdf_file"] = (d / "preview.pdf").resolve().relative_to(
+                    b["pdf_file"] = (d / "primary.pdf").resolve().relative_to(
                         lib.DATA_ROOT.resolve()).as_posix()
                     b["updated_at"] = datetime.now(timezone.utc).isoformat(
                         timespec="seconds")
@@ -727,7 +1237,8 @@ def api_entries():
     for bid in builds:
         info = _entry_folder_info(bid)
         if info["exists"]:
-            out[bid] = {"ocr": info["ocr"], "preview": info["preview"]}
+            out[bid] = {"ocr": info["ocr"], "preview": info["preview"],
+                        "primary_pdf": info["primary_pdf"]}
     return jsonify({"entries": out})
 
 
@@ -745,8 +1256,10 @@ def api_build_ocr_get(build_id: str, name: str):
 
 @app.route("/api/builds/<build_id>/ocr", methods=["POST"])
 def api_build_ocr_put(build_id: str):
-    """Store an OCR text file on the entry folder. Body: {name, text}."""
-    if build_id not in lib.load_json(BUILDS_PATH, {}):
+    """Store an OCR text file on the entry folder. Body: {name, text, src?}
+    — src ties the file to a secondary PDF source (default: primary)."""
+    builds = lib.load_json(BUILDS_PATH, {})
+    if build_id not in builds:
         abort(404)
     p = request.get_json(silent=True) or {}
     name = _ocr_name(p.get("name") or "")
@@ -754,6 +1267,10 @@ def api_build_ocr_put(build_id: str):
     d.mkdir(parents=True, exist_ok=True)
     (d / name).write_text(str(p.get("text") or ""),
                           encoding="utf-8", errors="replace")
+    if "src" in p:
+        src_key = _valid_src_key(builds[build_id], p.get("src"))
+        if src_key:
+            _ocr_set_source(build_id, name, src_key)
     return jsonify({"ok": True, "name": name,
                     "folder": _entry_folder_info(build_id)})
 
@@ -1192,6 +1709,14 @@ def api_ocr_run():
     except (TypeError, ValueError):
         width = 1400
     job_id = lib.gen_id(set(_ocr_jobs))
+    # the merged result belongs to the PDF it was read from (?src= key);
+    # an unknown/removed key is refused rather than recorded
+    src_key = _valid_src_key(lib.load_json(BUILDS_PATH, {}).get(build_id, {}),
+                             p.get("src"))
+    if src_key:
+        _ocr_set_source(build_id,
+                        _ocr_name(str(p.get("target") or "compiled.txt")),
+                        src_key)
     job = {
         "id": job_id, "build_id": build_id, "pdf": str(pdf),
         "target": str(p.get("target") or "compiled.txt"),
@@ -1316,13 +1841,30 @@ def _apply_page_deletion(build_id: str, builds: dict, pdf: Path,
     tmp.replace(pdf)
     # keep the build's OCR files and title pages aligned with the new
     # numbering (under the merge lock: a job finishing this instant must
-    # not interleave with the renumber writes)
+    # not interleave with the renumber writes). Only the files that came
+    # FROM this PDF renumber — a secondary scan's OCR has its own page
+    # numbering and must not shift with the primary's deletions.
     b = builds[build_id]
+    src_key = "primary"
+    pdfr = pdf.resolve()
+    # the primary claims the file FIRST: if the same scan is attached both
+    # as pdf_file and as a secondary (path spelling variants resolve to one
+    # file), a deletion must still renumber the primary's OCR files
+    primary = _resolve_local(str(b.get("pdf_file") or ""))
+    if primary is None or primary.resolve() != pdfr:
+        for s in (b.get("pdf_sources") or []):
+            sp = _resolve_local(str(s.get("path") or ""))
+            if sp is not None and sp.resolve() == pdfr:
+                src_key = s.get("id") or "primary"
+                break
+    srcmap = _ocr_sources(build_id)
     ocr_dir = _entry_dir(build_id) / "ocr"
     renumbered = []
     with _ocr_merge_lock:
         if ocr_dir.is_dir():
             for f in ocr_dir.glob("*.txt"):
+                if (srcmap.get(f.name) or "primary") != src_key:
+                    continue
                 try:
                     raw = f.read_text(encoding="utf-8", errors="replace")
                     # the renumbering is destructive too — a misfired trim
@@ -1334,8 +1876,11 @@ def _apply_page_deletion(build_id: str, builds: dict, pdf: Path,
                     renumbered.append(f.name)
                 except OSError:
                     continue
-    titles = [int(x) for x in str(b.get("title_pages") or "").split(",")
-              if x.strip().isdigit()]
+    # title pages are counted on the PRIMARY PDF; a secondary's deletions
+    # don't move them
+    titles = [] if src_key != "primary" else \
+        [int(x) for x in str(b.get("title_pages") or "").split(",")
+         if x.strip().isdigit()]
     if titles:
         remapped = []
         for t in titles:
@@ -1475,14 +2020,22 @@ def api_pdf_text():
         _PDF_TEXT_CACHE[key] = out
     # Auto-save into the entry folder (never clobbers an existing file). One
     # page of text is a scanner's cover sheet, not an extraction: don't save it.
+    # ?save_name= picks the file (default extracted.txt) and ?src= ties it to
+    # a secondary PDF source — extractions of a secondary scan live beside
+    # the primary's under their own name.
     bid = (request.args.get("save_build") or "").strip()
     if bid and out.get("ok") and out.get("pages_with_text", 0) > 1:
-        if bid in lib.load_json(BUILDS_PATH, {}):
-            f = _entry_dir(bid) / "ocr" / "extracted.txt"
+        builds = lib.load_json(BUILDS_PATH, {})
+        if bid in builds:
+            name = _ocr_name(request.args.get("save_name") or "extracted.txt")
+            f = _entry_dir(bid) / "ocr" / name
             if not f.is_file():
                 f.parent.mkdir(parents=True, exist_ok=True)
                 f.write_text(out["text"], encoding="utf-8", errors="replace")
-                out = dict(out, saved="extracted.txt")
+                src_key = _valid_src_key(builds[bid], request.args.get("src"))
+                if src_key:
+                    _ocr_set_source(bid, name, src_key)
+                out = dict(out, saved=name)
     return jsonify(out)
 
 
@@ -1610,20 +2163,46 @@ def api_client_state_put():
             if len(new_checked) < old_n:
                 _backup_client_state(state, old_n, len(new_checked))
         old_checked = state.get("checked")
-        before = len(old_checked) if isinstance(old_checked, list) else 0
         for k in _CLIENT_STATE_KEYS:
             if k in payload:
                 state[k] = payload[k]
         state["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         lib.save_json(lib.CLIENT_STATE_PATH, state)
-    # the checked set is a blob, not a stream of adds -- diff it to get an event
+    # the checked set is a blob, not a stream of adds -- diff it to get events.
+    # Adds and removals are logged separately from the key-set differences, so
+    # each event's count always agrees with the titles it names (a PUT that
+    # both adds and removes books yields two events, not one net delta).
     if isinstance(new_checked, list) and new_checked is not None:
-        delta = len(new_checked) - before
-        if delta > 0:
-            activity("added", "Checked Books", delta)
-        elif delta < 0:
-            activity("removed", "Checked Books", -delta)
+        n_add, add_titles = _checked_diff(old_checked, new_checked)
+        n_rm, rm_titles = _checked_diff(new_checked, old_checked)
+        if n_add:
+            activity("added", "Checked Books", n_add, detail=add_titles)
+        if n_rm:
+            activity("removed", "Checked Books", n_rm, detail=rm_titles)
     return jsonify({"ok": True})
+
+
+def _checked_diff(old, new, cap: int = 3):
+    """(count, titles) of books in `new` but not `old` ([key, value] pair
+    lists). Purely a nicety for the feed: malformed shapes yield (0, "")."""
+    try:
+        def as_map(lst):
+            return {p[0]: p[1] for p in (lst or [])
+                    if isinstance(p, list) and len(p) == 2}
+        old_map, new_map = as_map(old), as_map(new)
+        added = [k for k in new_map if k not in old_map]
+        titles = []
+        for k in added:
+            v = new_map[k]
+            b = v.get("book") if isinstance(v, dict) else None
+            t = str(b.get("title") or "").strip() if isinstance(b, dict) else ""
+            if t:
+                titles.append(t)
+        extra = len(titles) - cap
+        return len(added), ("; ".join(titles[:cap]) +
+                            (f" (+{extra} more)" if extra > 0 else ""))
+    except Exception:
+        return 0, ""
 
 
 @app.route("/api/manual")
@@ -1673,7 +2252,7 @@ def api_manual_add():
         entry["id"] = lib.gen_id(set(entries))
         entries[entry["id"]] = entry
         lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
-    activity("added", "manual entry")
+    activity("added", "manual entry", detail=entry.get("title", ""))
     return jsonify({"ok": True, "entry": entry})
 
 
@@ -1736,9 +2315,10 @@ def api_manual_delete(entry_id: str):
         entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
         if entry_id not in entries:
             abort(404)
+        title = entries[entry_id].get("title", "")
         del entries[entry_id]
         lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
-    activity("deleted", "manual entry")
+    activity("deleted", "manual entry", detail=title)
     return jsonify({"ok": True})
 
 
@@ -2739,12 +3319,36 @@ def _publish_run(bid: str, actor: str) -> None:
             sbase.upload_object(cloud, "volumes", name, data, "application/pdf")
             url, path = sbase.public_url(cloud, "volumes", name), name
 
-        stage("recording")
+        # Secondary scans ride along, named after the book like the primary.
+        # They live under scans/ — <slug>-2.pdf in the SAME namespace would
+        # collide with _publish_slug's "-N" disambiguation of other books
+        # (two scans of "Herbal 1600" already produce slugs herbal-1600 and
+        # herbal-1600-2). Objects only; the volumes row keeps pointing at
+        # the primary. Any failure past this point takes every uploaded
+        # object back down — a public object with no catalog row is a leak.
+        extras = []
         try:
+            for i, s in enumerate(b.get("pdf_sources") or [], start=2):
+                sp = _resolve_local(str(s.get("path") or ""))
+                if sp is None or not sp.is_file():
+                    continue
+                name_i = f"scans/{slug}-{i}.pdf"
+                stage(f"uploading {name_i}", sent=0, total=sp.stat().st_size)
+                if r2.configured(r2cfg):
+                    r2.put_file(r2cfg, f"volumes/{name_i}", sp,
+                                "application/pdf", on_progress=progress)
+                    extras.append((name_i, ""))
+                else:
+                    sbase.upload_object(cloud, "volumes", name_i,
+                                        sp.read_bytes(), "application/pdf")
+                    extras.append((name_i, name_i))
+
+            stage("recording")
             sbase.upsert_volume(cloud, _volume_row(b, slug, url, path, size, actor))
         except Exception:
-            # the object is already public and now belongs to nothing: take it back
             _unpublish_object(cloud, slug, path)
+            for name_i, path_i in extras:
+                _unpublish_object(cloud, name_i[:-4], path_i)
             raise
 
         # re-read: the upload took minutes, and another writer may have touched
@@ -2871,7 +3475,8 @@ def _import_capture(cfg: dict, cap: dict, mistral_key: str,
 
     sbase.mark_capture(cfg, cap["id"], "imported")
     # a phone capture is attributed to the device, not to whoever ran the sync
-    activity("captured", "book", actor=str(cap.get("device") or "phone")[:60])
+    activity("captured", "book", actor=str(cap.get("device") or "phone")[:60],
+             detail=entry.get("title", ""))
     # keep the cloud copies when OCR/extraction had trouble — the originals
     # are local too, but leaving the remote set makes recovery foolproof
     if delete_remote and not result["errors"]:
@@ -3082,6 +3687,8 @@ if __name__ == "__main__":
     ).start()
     # Cloud capture autosync (interval read from settings each tick; 0 = off).
     threading.Thread(target=_cloud_autosync_loop, daemon=True).start()
+    # Activity mirror: local jsonl -> cloud events, as the signed-in user.
+    threading.Thread(target=_push_events_loop, daemon=True, name="event-push").start()
     # WHL_PORT lets a second instance run on another port (a distinct origin,
     # so its localStorage/client-state can't collide with the main one) — used
     # to test against a throwaway WHL_DATA_ROOT without touching live state.

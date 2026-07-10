@@ -447,3 +447,37 @@ is decided by a tolerant composite rather than exact strings:
   Sync and ride the client_state settings sync (no separate config). URLs are
   placeholders until the user stands up the backend / hosts the files. The
   installer's "download databases" option is offered by the app on first run.
+- Home page rework: the wordmark is set in a bundled Roboto Slab (variable
+  woff2, latin subset, static/fonts/) with the version number after the title,
+  mirrored from the title bar's #tb-meta so it is stated once; the subtitle is
+  gone. "Pending tasks" became an IN PROGRESS panel: three clickable stat
+  tiles (entries in the editor with a draft/to-upload breakdown, PDF sources
+  pending verification -- approved sources without a verified entry yet -- and
+  items marked for attention, now counting builds too) over an EDITOR DRAFTS
+  list of the freshest drafts with relative last-modified times; clicking a
+  draft opens that build in the Editor. Theme round: three classic-desktop
+  chrome translations join the paper set -- PLATINUM (Mac OS 8/9 pinstriped
+  light titlebar, 1px bevels), REDMOND (Windows 2000 outset bevels,
+  desaturated navy titlebar fade), MOTIF (CDE chamfers, slate-indigo band).
+  Retired theme ids revive as their heirs (cde/workstation -> motif,
+  xp2003 -> redmond) and platinum is a real theme again.
+- Collaboration round. The home page is one framed sheet (max 1160px) with
+  three cards: IN PROGRESS (now also counting items awaiting review), RECENT
+  ACTIVITY, and CONTRIBUTORS (every activity actor + your Settings name, with
+  change counts and last-seen). Activity events carry a detail field (book
+  titles; checked-list PUTs are diffed by key set so adds and removals are
+  logged separately with counts that match their titles) and every feed group
+  expands in place to its member events with exact local times. The Q popover
+  gained NEEDS REVIEW: it files the item into a shared, server-backed review
+  queue (output/reviews.json; one open review per item, reopen guarded by a
+  409). The queue window (Home > items awaiting review) shows each item with
+  reason, requester, a Google-Docs-style comment thread (attributed via
+  X-WHL-Actor), and Resolve/Reopen; resolving clears the underlying attention
+  mark wherever it lives and repaints the table that showed it. Comment drafts
+  survive re-renders; failed POSTs report failure instead of pretending
+  success. Known limitation (multi-client, same as the attention sync it
+  rides on): another open client can re-push a cleared attention mark from
+  its stale full-map copy -- fixing that needs the version/tombstone work
+  already noted for checked-book deletes. The title bar (app + dialog) went
+  LIGHT in every theme: a tinted band with dark ink over the one separating
+  rule, so the tab strip reads as its own layer.
