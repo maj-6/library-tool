@@ -3,6 +3,17 @@
    corners over the dark drafting canvas, monospace data on sans chrome.
    Themes below rework the chrome; geometry (text sizes, paddings, element
    sizes) is preserved. */
+
+/* Bundled wordmark face (see static/fonts/README.md); variable weight,
+   latin subset -- used only for the home-page title */
+@font-face {
+  font-family: "Roboto Slab";
+  src: url("fonts/roboto-slab-var.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
   --face: #e7e9ec;       /* panel face */
   --face-hi: #ffffff;    /* raised surfaces */
@@ -56,6 +67,15 @@
                     hairlines, like a lab notebook.
    FOLIO          - faintly blue-grey tinted paper, easier on the eyes than white;
                     tint steps instead of borders.
+
+   The classic set translates period desktop chrome onto the same geometry
+   (still light, still desaturated):
+   PLATINUM       - Mac OS 8/9: pinstriped light titlebar with dark ink,
+                    1px bevels, lavender-slate accent.
+   REDMOND        - Windows 2000: warm-grey button faces, outset bevels,
+                    desaturated navy titlebar gradient.
+   MOTIF          - CDE workstation: dusty indigo-grey chrome, wide bevels,
+                    slate-indigo titlebar band.
    ==================================================================== */
 
 /* ---------- SAGE (muted green-gray light) ---------- */
@@ -262,6 +282,12 @@ body[data-theme="foolscap"] .cad-btn:active {
   transform: translateY(1px);
 }
 body[data-theme="foolscap"] .cad-btn.danger { color: var(--red); }
+/* a held toggle: debossed face plus the base cyan ring (the deboss shadow
+   would otherwise bury the .active indicator) */
+body[data-theme="foolscap"] .cad-btn.active {
+  background: #dcd7cc;
+  box-shadow: inset 0 0 0 1px var(--cyan), inset 1px 1px 2px rgba(40, 34, 24, 0.2);
+}
 /* form fields pressed into the paper */
 body[data-theme="foolscap"] .cad-input,
 body[data-theme="foolscap"] .cell-edit,
@@ -270,6 +296,11 @@ body[data-theme="foolscap"] .md-live {
   box-shadow: inset 1px 1px 2px rgba(50, 44, 34, 0.12);
 }
 body[data-theme="foolscap"] .cad-input:focus { border-color: var(--cyan); }
+/* the cell being edited must still announce itself over the pressed shadow */
+body[data-theme="foolscap"] .cell-edit:focus {
+  border-color: var(--cyan);
+  box-shadow: inset 0 0 0 1px var(--cyan);
+}
 /* square proof tabs; active tab freshly pressed with a deep-ink registration rule */
 body[data-theme="foolscap"] .tab,
 body[data-theme="foolscap"] .pane-tab {
@@ -799,6 +830,428 @@ body[data-theme="folio"] ::-webkit-scrollbar-thumb:hover { background: #c3cbd5; 
 
 
 
+/* ---------- PLATINUM (Mac OS 8/9 grayscale chrome) ----------
+   Classic Platinum translated onto the fixed geometry: cool neutral greys,
+   crisp 1px bevels drawn as inset shadows (light NW, mid-grey SE), square
+   corners, the pinstriped light titlebar, and Apple's lavender softened to
+   a slate #5c5c85. Radius 1px. */
+body[data-theme="platinum"] {
+  --face: #e2e4e6;
+  --face-hi: #f5f6f7;
+  --face-sh: #c9ccd0;
+  --face-sh2: #8e939a;
+  --face-active: #f7f8f9;
+  --canvas: #f7f8f9;
+  --canvas-line: #e6e8ea;
+  --ink: #1e2124;
+  --ink-light: #1e2124;
+  --input-bg: #ffffff;
+  --input-ink: #1e2124;
+  --row-hover: #eceef0;
+  --row-checked: #e0e1eb;
+  --row-manual: #e0e7df;
+  --cyan: #38646e;
+  --green: #3e6b43;
+  --amber: #85682a;
+  --red: #9b3a2e;
+  --blue: #5c5c85;
+  --blue2: #75759c;
+  --radius: 1px;
+}
+/* the Platinum button: light NW / mid-grey SE bevel inside a hairline frame */
+body[data-theme="platinum"] .cad-btn,
+body[data-theme="platinum"] .win-close {
+  border: 1px solid #8e939a;
+  background: linear-gradient(#f2f3f4, #dfe2e4);
+  box-shadow: inset 1px 1px 0 #ffffff, inset -1px -1px 0 #c2c6ca;
+}
+body[data-theme="platinum"] .cad-btn:hover {
+  background: linear-gradient(#f7f8f9, #e6e8ea);
+}
+/* pressed = the bevel inverts, the face darkens; no travel */
+body[data-theme="platinum"] .cad-btn:active {
+  background: #d0d4d7;
+  box-shadow: inset 1px 1px 0 #aeb3b8, inset -1px -1px 0 #e2e4e6;
+}
+/* a held toggle: pressed bevel plus the base cyan ring (the bevel shadow
+   would otherwise bury the .active indicator) */
+body[data-theme="platinum"] .cad-btn.active {
+  background: #d0d4d7;
+  box-shadow: inset 0 0 0 1px var(--cyan), inset 1px 1px 0 #aeb3b8;
+}
+/* fields are wells sunk into the face: dark inner NW edge on white */
+body[data-theme="platinum"] .cad-input,
+body[data-theme="platinum"] .cell-edit,
+body[data-theme="platinum"] .md-live {
+  border: 1px solid #8e939a;
+  box-shadow: inset 1px 1px 0 #d3d7da;
+}
+body[data-theme="platinum"] .cad-input:focus { border-color: #5c5c85; }
+/* the cell being edited must still announce itself over the well shadow */
+body[data-theme="platinum"] .cell-edit:focus {
+  border-color: var(--cyan);
+  box-shadow: inset 0 0 0 1px var(--cyan);
+}
+/* boxed tabs; the front tab takes the pane's own colour, rear tabs recede */
+body[data-theme="platinum"] .tab,
+body[data-theme="platinum"] .pane-tab {
+  border: 1px solid #8e939a;
+  border-bottom: none;
+  border-radius: 2px 2px 0 0;
+  background: linear-gradient(#e4e6e8, #d6d9dc);
+  color: #4c5259;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+}
+body[data-theme="platinum"] .tab.active,
+body[data-theme="platinum"] .pane-tab.active {
+  background: var(--face-active);
+  color: var(--ink);
+  box-shadow: inset 0 1px 0 #ffffff;
+  font-weight: 600;
+}
+body[data-theme="platinum"] .pane-tabs { border-bottom: 1px solid #8e939a; }
+/* the iconic pinstriped bar: 2px horizontal stripes, near-black ink */
+body[data-theme="platinum"] #titlebar,
+body[data-theme="platinum"] .win-titlebar {
+  background: repeating-linear-gradient(180deg,
+    #f0f1f2 0, #f0f1f2 1px, #dfe1e3 1px, #dfe1e3 2px);
+  color: #1e2124;
+  border-bottom: 1px solid #8e939a;
+}
+/* light bar: re-ink the menu titles; open menu highlights in the accent,
+   the base white-tint hover would vanish here */
+body[data-theme="platinum"] #titlebar { color: #1e2124; }
+body[data-theme="platinum"] #titlebar .menu-btn { color: #1e2124; }
+body[data-theme="platinum"] #titlebar .menu-btn:hover {
+  background: rgba(58, 58, 94, 0.12);
+  color: #1e2124;
+}
+body[data-theme="platinum"] #titlebar .menu-btn.active {
+  background: #5c5c85;
+  color: #fff;
+}
+/* window controls: dark glyphs, dark-tinted hover; close keeps its red */
+body[data-theme="platinum"] .win-btn { color: #1e2124; }
+body[data-theme="platinum"] .win-btn:hover { background: rgba(58, 58, 94, 0.12); }
+body[data-theme="platinum"] .win-btn:active { background: rgba(58, 58, 94, 0.22); }
+body[data-theme="platinum"] .win-btn.win-close:hover { background: #e81123; color: #fff; }
+body[data-theme="platinum"] .win-btn.win-close:active { background: #c50e1f; color: #fff; }
+/* list view: each column header a bevelled sort button, clean ruled rows */
+body[data-theme="platinum"] .grid thead th {
+  background: linear-gradient(#f2f3f4, #e1e4e6);
+  color: #3c4147;
+  border-right: 1px solid #c2c6ca;
+  border-bottom: 1px solid #8e939a;
+}
+body[data-theme="platinum"] .grid tbody td {
+  border-right: none;
+  border-bottom: 1px solid #e8eaec;
+}
+body[data-theme="platinum"] .badge { background: rgba(92, 92, 133, 0.07); }
+body[data-theme="platinum"] #cad-tooltip,
+body[data-theme="platinum"] #attn-pop {
+  background: #f4f5f6;
+  color: var(--ink);
+  border: 1px solid #8e939a;
+  border-radius: 1px;
+}
+body[data-theme="platinum"] #statusbar { border-top: 1px solid #8e939a; }
+/* hard-edged dialogs on a soft drop */
+body[data-theme="platinum"] .win {
+  border-radius: 1px;
+  overflow: hidden;
+  box-shadow: 0 12px 30px rgba(30, 34, 40, 0.28);
+}
+body[data-theme="platinum"] .menu-drop,
+body[data-theme="platinum"] #popup-menu { border-radius: 1px; }
+/* light grey gutter, bevelled square thumb (reads raised either axis) */
+body[data-theme="platinum"] ::-webkit-scrollbar { width: 11px; height: 11px; }
+body[data-theme="platinum"] ::-webkit-scrollbar-track { background: #eaeced; }
+body[data-theme="platinum"] ::-webkit-scrollbar-thumb {
+  background: #dde0e2;
+  border: 1px solid #8e939a;
+  border-radius: 1px;
+  box-shadow: inset 1px 1px 0 #f5f6f7, inset -1px -1px 0 #c2c6ca;
+}
+body[data-theme="platinum"] ::-webkit-scrollbar-thumb:hover { background: #d3d7da; }
+
+/* ---------- REDMOND (classic Windows 2000 chrome) ----------
+   Warm-grey button faces, outset NW-lit bevels, the left-to-right navy
+   titlebar fade -- desaturated for long shifts, not nostalgia. White canvas,
+   square corners, InfoBk-yellow tips. Radius 0. */
+body[data-theme="redmond"] {
+  --face: #d6d3ca;       /* stock #d4d0c8 with the yellow eased off */
+  --face-hi: #e7e5de;
+  --face-sh: #b5b1a6;
+  --face-sh2: #808080;   /* the canonical ButtonShadow */
+  --face-active: #cbc8bf; /* pressed face: a step darker, not lighter */
+  --canvas: #ffffff;
+  --canvas-line: #e8e6df;
+  --ink: #201e19;        /* warm near-black, 11:1 on the face */
+  --ink-light: #201e19;
+  --input-bg: #ffffff;
+  --input-ink: #201e19;
+  --row-hover: #f0efe9;
+  --row-checked: #dfe5ef; /* a pale echo of the selection navy */
+  --row-manual: #e5ebdf;
+  --cyan: #2e6a74;
+  --green: #3f6f42;
+  --amber: #8a6a1e;
+  --red: #9e352a;
+  --blue: #2c3e66;       /* titlebar fade, left edge */
+  --blue2: #5f7aa8;      /* titlebar fade, right edge */
+  --radius: 0px;
+}
+/* outset 3D bevel, lit from the NW like every dialog since NT: white outer
+   top-left, dark outer bottom-right, #808080 inner shadow */
+body[data-theme="redmond"] .cad-btn,
+body[data-theme="redmond"] .win-close {
+  border: 1px solid;
+  border-color: #fcfcfa #6b675e #6b675e #fcfcfa;
+  background: #d6d3ca;
+  box-shadow: inset 1px 1px 0 #ffffff, inset -1px -1px 0 #808080;
+}
+body[data-theme="redmond"] .cad-btn:hover {
+  background: #dedbd2;   /* Win2k had no hover; allow a whisper of one */
+}
+body[data-theme="redmond"] .cad-btn:active {
+  border-color: #6b675e #fcfcfa #fcfcfa #6b675e;  /* pressed = the bevel inverts */
+  background: #ccc9c0;
+  box-shadow: inset 1px 1px 0 #808080, inset -1px -1px 0 #ffffff;
+}
+/* a held toggle: the button stays sunken and carries the base cyan ring */
+body[data-theme="redmond"] .cad-btn.active {
+  border-color: #6b675e #fcfcfa #fcfcfa #6b675e;
+  background: #ccc9c0;
+  box-shadow: inset 0 0 0 1px var(--cyan);
+}
+/* sunken fields: shadow rim top-left, lit rim bottom-right, white well */
+body[data-theme="redmond"] .cad-input,
+body[data-theme="redmond"] .cell-edit,
+body[data-theme="redmond"] .md-live {
+  border: 1px solid;
+  border-color: #808080 #f4f2ec #f4f2ec #808080;
+  box-shadow: inset 1px 1px 0 rgba(80, 76, 66, 0.16);
+}
+body[data-theme="redmond"] .cad-input:focus { border-color: #2c3e66; }
+/* the cell being edited must still announce itself over the sunken bevel */
+body[data-theme="redmond"] .cell-edit:focus {
+  border-color: var(--cyan);
+  box-shadow: inset 0 0 0 1px var(--cyan);
+}
+/* property-sheet tabs: raised faces in the back row; the active tab joins
+   the sheet and carries a navy registration rule in lieu of popping taller */
+body[data-theme="redmond"] .tab,
+body[data-theme="redmond"] .pane-tab {
+  border: 1px solid;
+  border-bottom: none;
+  border-radius: 0;
+  border-color: #fcfcfa #6b675e #6b675e #fcfcfa;
+  background: #cfccc2;
+  color: #4a4740;
+}
+body[data-theme="redmond"] .tab.active,
+body[data-theme="redmond"] .pane-tab.active {
+  background: #d6d3ca;
+  color: var(--ink);
+  box-shadow: inset 0 2px 0 #2c3e66;
+}
+body[data-theme="redmond"] .pane-tabs { border-bottom: 1px solid #808080; }
+/* the signature left-to-right navy fade, chroma dialed down so it can sit in
+   the corner of your eye all afternoon; base white titlebar ink stands */
+body[data-theme="redmond"] #titlebar,
+body[data-theme="redmond"] .win-titlebar {
+  background: linear-gradient(90deg, #2c3e66, #5f7aa8);
+  color: #ffffff;
+  border-bottom: 1px solid #6b675e;
+}
+/* header row as one flat button-face band: white bevel above, shadow below,
+   segmented like a listview header (borders only -- box-shadow belongs to
+   the mark-copy/exclude/search column markers) */
+body[data-theme="redmond"] .grid thead th {
+  background: #d6d3ca;
+  color: #35322b;
+  border-top: 1px solid #ffffff;
+  border-right: 1px solid #b5b1a6;
+  border-bottom: 1px solid #808080;
+}
+body[data-theme="redmond"] .grid tbody td {
+  border-right: none;
+  border-bottom: 1px solid #ecebe4;
+}
+body[data-theme="redmond"] .badge { background: #e7e5de; }
+/* InfoBk: the little yellow tip card, chroma eased, period black hairline */
+body[data-theme="redmond"] #cad-tooltip,
+body[data-theme="redmond"] #attn-pop {
+  background: #faf8e4;
+  color: #201e19;
+  border: 1px solid #55524a;
+  border-radius: 0;
+}
+/* statusbar sits under the classic etched groove, not a flat rule */
+body[data-theme="redmond"] #statusbar { border-top: 2px groove #cfccc2; }
+body[data-theme="redmond"] .win {
+  border-radius: 0;
+  overflow: hidden;
+  /* raised dialog edge + a shorter, harder drop than the base soft float */
+  box-shadow: inset 1px 1px 0 #fcfcfa, 0 10px 26px rgba(28, 32, 42, 0.4);
+}
+body[data-theme="redmond"] .menu-drop,
+body[data-theme="redmond"] #popup-menu { border-radius: 0; }
+/* full-width 12px scrollbars; the track is the 50% face/white stipple dither,
+   drawn with a repeating gradient; the thumb is a bevelled button face */
+body[data-theme="redmond"] ::-webkit-scrollbar { width: 12px; height: 12px; }
+body[data-theme="redmond"] ::-webkit-scrollbar-track {
+  background: repeating-linear-gradient(45deg, #ffffff 0 1px, #dedbd2 1px 2px);
+}
+body[data-theme="redmond"] ::-webkit-scrollbar-thumb {
+  background: #d6d3ca;
+  border: 1px solid #808080;
+  box-shadow: inset 1px 1px 0 #ffffff, inset -1px -1px 0 #9a968a;
+  border-radius: 0;
+}
+body[data-theme="redmond"] ::-webkit-scrollbar-thumb:hover { background: #dedbd2; }
+
+/* ---------- MOTIF (CDE workstation chrome) ----------
+   A 1993 Unix workstation dressed for a library: dusty indigo-grey chrome
+   cut with Motif's wide two-step chamfer -- every control reads as carved
+   from one slab, lit from the top-left. Square everything: radius 0. */
+body[data-theme="motif"] {
+  --face: #ccd0dc;
+  --face-hi: #e2e5ee;
+  --face-sh: #aab0c2;
+  --face-sh2: #7c8399;
+  --face-active: #eceef5;
+  --canvas: #f4f6fa;
+  --canvas-line: #e3e7f0;
+  --ink: #22262e;
+  --ink-light: #22262e;
+  --input-bg: #f6f8fc;
+  --input-ink: #22262e;
+  --row-hover: #e8ebf3;
+  --row-checked: #d9e4e6;
+  --row-manual: #e0e2ef;
+  --cyan: #366b70;
+  --green: #3d6b45;
+  --amber: #8a6b2a;
+  --red: #99392e;
+  --blue: #4d5878;
+  --blue2: #667192;
+  --radius: 0px;
+}
+/* pushbuttons: the classic raised chamfer -- two light steps top-left, two
+   shade steps bottom-right, all box-shadow inside a single 1px frame */
+body[data-theme="motif"] .cad-btn,
+body[data-theme="motif"] .win-close {
+  border: 1px solid #7c8399;
+  background: #ccd0dc;
+  box-shadow: inset 1px 1px 0 #f0f2f8, inset 2px 2px 0 rgba(255, 255, 255, 0.45),
+              inset -1px -1px 0 #99a0b5, inset -2px -2px 0 rgba(90, 98, 122, 0.28);
+}
+body[data-theme="motif"] .cad-btn:hover { background: #d4d8e3; }
+/* press = the chamfer flips and the label rides down 1px, like real Motif */
+body[data-theme="motif"] .cad-btn:active {
+  background: #c2c7d5;
+  box-shadow: inset 1px 1px 0 #99a0b5, inset 2px 2px 2px rgba(70, 78, 102, 0.30),
+              inset -1px -1px 0 #e8ebf3;
+  transform: translateY(1px);
+}
+/* a held toggle: sunken chamfer plus the base cyan ring */
+body[data-theme="motif"] .cad-btn.active {
+  background: #c2c7d5;
+  box-shadow: inset 0 0 0 1px var(--cyan), inset 1px 1px 0 #99a0b5;
+}
+body[data-theme="motif"] .cad-btn.danger { color: var(--red); }
+/* text wells sunk below the panel surface: the lowered bevel */
+body[data-theme="motif"] .cad-input,
+body[data-theme="motif"] .cell-edit,
+body[data-theme="motif"] .md-live {
+  border: 1px solid #7c8399;
+  box-shadow: inset 1px 1px 0 #a5abbe, inset 2px 2px 0 rgba(96, 104, 128, 0.16);
+}
+body[data-theme="motif"] .cad-input:focus { border-color: var(--cyan); }
+/* the cell being edited must still announce itself over the lowered bevel */
+body[data-theme="motif"] .cell-edit:focus {
+  border-color: var(--cyan);
+  box-shadow: inset 0 0 0 1px var(--cyan);
+}
+/* square workstation tabs; the active one raised flush with the page and
+   keyed by a dusty-teal top rule */
+body[data-theme="motif"] .tab,
+body[data-theme="motif"] .pane-tab {
+  border: 1px solid #7c8399;
+  border-bottom: none;
+  border-radius: 0;
+  background: #bfc4d3;
+  color: #474e63;
+  box-shadow: inset 1px 1px 0 rgba(255, 255, 255, 0.45);
+}
+body[data-theme="motif"] .tab.active,
+body[data-theme="motif"] .pane-tab.active {
+  background: var(--face-active);
+  color: var(--ink);
+  box-shadow: inset 0 2px 0 var(--cyan), inset 1px 0 0 #f0f2f8;
+  font-weight: 600;
+}
+body[data-theme="motif"] .pane-tabs { border-bottom: 1px solid #7c8399; }
+/* titlebar: the slate-indigo frame band, top edge lit, bottom edge in shade */
+body[data-theme="motif"] #titlebar,
+body[data-theme="motif"] .win-titlebar {
+  background: #4d5878;
+  color: #edeff6;
+  border-bottom: 1px solid #363f57;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22), inset 0 -1px 0 rgba(24, 29, 44, 0.35);
+}
+/* grid: flat indigo tint band under one strong rule; horizontal ruling only */
+body[data-theme="motif"] .grid thead th {
+  background: #dde1ea;
+  color: #3e455a;
+  border-right: none;
+  border-bottom: 2px solid #7c8399;
+}
+body[data-theme="motif"] .grid tbody td {
+  border-right: none;
+  border-bottom: 1px solid #e6e9f1;
+}
+body[data-theme="motif"] .badge { background: rgba(77, 88, 120, 0.10); }
+/* popups as raised panels: hard offset shadow, no soft blur anywhere */
+body[data-theme="motif"] #cad-tooltip,
+body[data-theme="motif"] #attn-pop {
+  background: #eef0f6;
+  color: var(--ink);
+  border: 1px solid #7c8399;
+  border-radius: 0;
+  box-shadow: inset 1px 1px 0 #ffffff, 2px 2px 0 rgba(36, 42, 60, 0.22);
+}
+/* statusbar behind a carved groove: a shade line over a lit line */
+body[data-theme="motif"] #statusbar {
+  border-top: 1px solid #7c8399;
+  box-shadow: inset 0 1px 0 #f0f2f8;
+}
+body[data-theme="motif"] .win {
+  border-radius: 0;
+  overflow: hidden;
+  box-shadow: 0 14px 40px rgba(30, 36, 54, 0.30);
+}
+body[data-theme="motif"] .menu-drop,
+body[data-theme="motif"] #popup-menu {
+  border-radius: 0;
+  box-shadow: inset 1px 1px 0 #f0f2f8, 2px 2px 0 rgba(36, 42, 60, 0.18);
+}
+/* chunky Motif scrollbars: a raised chrome-grey thumb in a sunken trough */
+body[data-theme="motif"] ::-webkit-scrollbar { width: 12px; height: 12px; }
+body[data-theme="motif"] ::-webkit-scrollbar-track {
+  background: #b6bccb;
+  box-shadow: inset 1px 1px 0 rgba(90, 98, 122, 0.35);
+}
+body[data-theme="motif"] ::-webkit-scrollbar-thumb {
+  background: #ccd0dc;
+  border: 1px solid #7c8399;
+  border-radius: 0;
+  box-shadow: inset 1px 1px 0 #f0f2f8, inset -1px -1px 0 #99a0b5;
+}
+body[data-theme="motif"] ::-webkit-scrollbar-thumb:hover { background: #d6dae4; }
+
 /* ===================== base ===================== */
 
 * { box-sizing: border-box; }
@@ -835,16 +1288,27 @@ body {
 #home-titletext { min-width: 0; }
 #home-title h1 {
   margin: 0;
-  font-family: var(--ui);
-  font-size: 26px;
-  font-weight: bold;
-  letter-spacing: 1.5px;
+  font-family: "Roboto Slab", Georgia, "Times New Roman", serif;
+  font-size: 27px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
   color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-#home-sub { margin: 4px 0 0; color: var(--face-sh2); font-size: 11.5px; letter-spacing: 0.4px; }
+/* the version rides the wordmark's baseline, deliberately quiet */
+#home-ver {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: normal;
+  letter-spacing: 0.5px;
+  color: var(--face-sh2);
+  margin-left: 2px;
+}
 #home-icon { flex: 0 0 auto; display: block; width: 76px; height: 76px; }
 @media (max-width: 560px) { #home-icon { width: 52px; height: 52px; } }
-#home-cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); gap: 18px; }
+#home-cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: 18px; }
 @media (max-width: 720px) { #home-cols { grid-template-columns: minmax(0, 1fr); } }
 .home-card {
   background: var(--face-hi);
@@ -861,7 +1325,33 @@ body {
   padding-bottom: 5px;
   margin-bottom: 7px;
 }
-.home-task {
+/* In-progress panel: three quiet stat tiles over the freshest drafts.
+   Counts in the data face, labels under-styled -- no pills, no colour. */
+#home-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+.home-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  padding: 7px 9px 6px;
+  background: none;
+  border: 1px solid var(--face-sh);
+  border-radius: var(--radius);
+  text-align: left;
+  font-family: var(--ui);
+  color: var(--ink);
+  cursor: pointer;
+}
+.home-stat:hover { border-color: var(--face-sh2); }
+.hs-n { font-family: var(--mono); font-size: 19px; font-weight: bold; line-height: 1.15; }
+.hs-l { font-size: 10.5px; line-height: 1.3; color: var(--face-sh2); }
+.hs-sub { font-size: 10px; line-height: 1.3; color: var(--face-sh2); min-height: 13px; }
+.home-h-sub { margin-top: 12px; }
+.home-draft {
   display: flex;
   align-items: baseline;
   gap: 8px;
@@ -875,8 +1365,36 @@ body {
   color: var(--ink);
   cursor: pointer;
 }
-.home-task:hover { color: var(--cyan); }
-.home-n { flex: 0 0 auto; min-width: 22px; font-family: var(--mono); font-weight: bold; }
+.home-draft:hover .hd-t { color: var(--cyan); }
+.hd-t {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hd-meta {
+  flex: 0 1 auto;
+  max-width: 38%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--face-sh2);
+  font-size: 11px;
+}
+.hd-when { flex: 0 0 auto; color: var(--face-sh2); font-size: 10.5px; white-space: nowrap; }
+.home-more {
+  display: block;
+  padding: 3px 2px 0;
+  background: none;
+  border: 0;
+  text-align: left;
+  font-family: var(--ui);
+  font-size: 11px;
+  color: var(--face-sh2);
+  cursor: pointer;
+}
+.home-more:hover { color: var(--cyan); }
 .home-act {
   display: flex;
   align-items: baseline;

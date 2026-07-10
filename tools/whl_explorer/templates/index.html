@@ -102,16 +102,16 @@
       <div id="home-inner">
         <div id="home-title">
           <div id="home-titletext">
-            <h1>Library Tool</h1>
-            <p id="home-sub">Cataloguing workbench for rare works on botany</p>
+            <!-- the version mirrors #tb-meta (initHome), so it is stated once -->
+            <h1>Library Tool <span id="home-ver"></span></h1>
           </div>
           <img id="home-icon" src="{{ url_for('static', filename='icon.png') }}"
                width="76" height="76" alt="" />
         </div>
         <div id="home-cols">
           <div class="home-card">
-            <div class="home-h">Pending tasks</div>
-            <div id="home-tasks"></div>
+            <div class="home-h">In progress</div>
+            <div id="home-progress"></div>
           </div>
           <div class="home-card">
             <div class="home-h">Recent activity</div>
