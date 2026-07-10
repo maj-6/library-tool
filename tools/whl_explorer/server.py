@@ -1294,7 +1294,13 @@ def api_build_ocr_layout(build_id: str):
     if build_id not in lib.load_json(BUILDS_PATH, {}):
         abort(404)
     meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
-    return jsonify({"ok": True, "images": meta.get("images") or {}})
+    # word_pages is per source: {"<src>": [pages...]}, so the client places a
+    # facsimile only for the source whose boxes it actually has
+    word_pages = {src: sorted(int(k) for k in pages if str(k).isdigit())
+                  for src, pages in (meta.get("words") or {}).items()
+                  if isinstance(pages, dict)}
+    return jsonify({"ok": True, "images": meta.get("images") or {},
+                    "word_pages": word_pages})
 
 
 # --- PDF page rasterization (the OCR tab's side-by-side page view) ---------------
@@ -1382,8 +1388,89 @@ def api_pdf_words():
             })
     finally:
         doc.close()
+    # No text layer? Fall back to this build's stored OCR word boxes, so an
+    # image-only scan that has been OCR'd still gets a placed facsimile. The
+    # build id is validated (it indexes an entry folder) before it is used.
+    source = "pdf"
+    if not lines:
+        bid = str(request.args.get("build_id") or "").strip()
+        builds = lib.load_json(BUILDS_PATH, {})
+        if bid and bid in builds:
+            # the boxes are stored per source; pick the one this PDF path is
+            src = _src_key_for_path(builds[bid], p)
+            meta = lib.load_json(_entry_dir(bid) / "ocr" / "layout.json", {})
+            pages = (meta.get("words") or {}).get(src) or {}
+            ocr_lines = _lines_from_ocr_words(pages.get(str(page)))
+            if ocr_lines:
+                lines, source = ocr_lines, "ocr"
     return jsonify({"ok": True, "found": bool(lines), "page_w": pw, "page_h": ph,
-                    "lines": lines})
+                    "source": source, "lines": lines})
+
+
+def _src_key_for_path(build: dict, pdf: Path) -> str:
+    """Which source a resolved PDF path is for this build: 'primary' (its
+    pdf_file) or a secondary id from pdf_sources. The primary claims the file
+    first, so a scan attached as both still counts as primary."""
+    try:
+        pdfr = pdf.resolve()
+    except OSError:
+        return "primary"
+    primary = _resolve_local(str(build.get("pdf_file") or ""))
+    if primary is not None and primary.resolve() == pdfr:
+        return "primary"
+    for s in (build.get("pdf_sources") or []):
+        sp = _resolve_local(str(s.get("path") or ""))
+        if sp is not None and sp.resolve() == pdfr:
+            return s.get("id") or "primary"
+    return "primary"
+
+
+def _lines_from_ocr_words(words) -> list:
+    """Rebuild /api/pdf/words' line structure from stored OCR word boxes
+    (already 0..1 of the page). Words that carry the OCR engine's line id (`l`)
+    are grouped by it — the engine segments lines far better than box geometry;
+    any without one fall back to baseline clustering (baseline = box bottom).
+    Per line, baseline = median box bottom and size = median height, so the
+    client places these identically to the text-layer path."""
+    from statistics import median
+    groups: dict = {}
+    loose: list = []
+    for w in words or []:
+        t = str((w or {}).get("t") or "")
+        if not t.strip():
+            continue
+        try:
+            x = float(w.get("x") or 0)
+            y = float(w.get("y") or 0)
+            ww = float(w.get("w") or 0)
+            h = float(w.get("h") or 0)
+        except (TypeError, ValueError):
+            continue
+        if h <= 0 or ww <= 0:
+            continue
+        rec = (y + h, x, x + ww, t, h)      # (baseline, x0, x1, text, size)
+        lid = (w or {}).get("l")
+        if isinstance(lid, int):
+            groups.setdefault(lid, []).append(rec)
+        else:
+            loose.append(rec)
+    # words with no line id: cluster on the baseline like the text-layer path
+    loose.sort()
+    cur: list = []
+    for r in loose:
+        if cur and abs(r[0] - cur[-1][0]) <= 0.4 * cur[-1][4]:
+            cur.append(r)          # same list object lives in `groups`
+        else:
+            cur = [r]
+            groups[("loose", len(groups))] = cur
+    lines = []
+    for key in sorted(groups, key=lambda k: median([r[0] for r in groups[k]])):
+        c = sorted(groups[key], key=lambda r: r[1])
+        lines.append({"y": round(median([r[0] for r in c]), 5),
+                      "s": round(median([r[4] for r in c]), 6),
+                      "spans": [{"t": r[3], "x": round(r[1], 5),
+                                 "w": round(r[2] - r[1], 5)} for r in c]})
+    return lines
 
 
 # page count + dimensions, cached on mtime: the OCR tab asks on every page-view
@@ -1503,14 +1590,56 @@ def _ocr_page_png(pdf: Path, page: int, width: int) -> bytes:
         doc.close()
 
 
-def _ocr_tesseract(png: bytes, cfg: dict) -> str:
+def _ocr_tesseract(png: bytes, cfg: dict) -> dict:
+    """One Tesseract pass via image_to_data, so the word boxes are kept, not
+    just the text: `words` (each box normalised to 0..1 of the page) lets the
+    Layout view place an image-only scan the same way a text-layer PDF is
+    placed. The transcription is rebuilt from the same data — one OCR run, not
+    two — grouping words by Tesseract's block/paragraph/line and breaking
+    paragraphs where the block or paragraph changes."""
     import pytesseract
+    from pytesseract import Output
     from PIL import Image
     import io as _io
     exe = (cfg.get("tesseract") or "").strip() or _TESSERACT_DEFAULT
     if Path(exe).is_file():
         pytesseract.pytesseract.tesseract_cmd = exe
-    return pytesseract.image_to_string(Image.open(_io.BytesIO(png)))
+    img = Image.open(_io.BytesIO(png))
+    iw, ih = img.size
+    data = pytesseract.image_to_data(img, output_type=Output.DICT)
+    words: list[dict] = []
+    grouped: dict[tuple, list[str]] = {}
+    line_ids: dict[tuple, int] = {}    # (block,par,line) -> reading-order id
+    for i in range(len(data.get("text", []))):
+        t = (data["text"][i] or "").strip()
+        if not t:
+            continue
+        try:
+            conf = float(data["conf"][i])
+        except (TypeError, ValueError):
+            conf = -1.0
+        if conf < 0:            # -1 marks the structural (non-word) rows
+            continue
+        lk = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        lid = line_ids.setdefault(lk, len(line_ids))   # first seen = reading order
+        if iw > 0 and ih > 0:
+            # `l` is Tesseract's own line grouping — carried through so the
+            # facsimile rebuilds real lines instead of re-guessing them from box
+            # geometry (descenders make a per-word box bottom a poor baseline)
+            words.append({"t": t, "l": lid,
+                          "x": round(data["left"][i] / iw, 5),
+                          "y": round(data["top"][i] / ih, 5),
+                          "w": round(data["width"][i] / iw, 5),
+                          "h": round(data["height"][i] / ih, 5)})
+        grouped.setdefault(lk, []).append(t)
+    parts: list[str] = []
+    prev = None
+    for key in sorted(grouped):
+        if prev is not None and key[:2] != prev[:2]:
+            parts.append("")     # blank line between paragraphs/blocks
+        parts.append(" ".join(grouped[key]))
+        prev = key
+    return {"text": "\n".join(parts), "words": words}
 
 
 def _ocr_claude(png: bytes, cfg: dict) -> str:
@@ -1556,8 +1685,35 @@ def _ocr_textract(png: bytes, cfg: dict) -> str:
         "textract", region_name=(cfg.get("aws_region") or "us-east-1").strip(),
         aws_access_key_id=key, aws_secret_access_key=secret)
     resp = client.detect_document_text(Document={"Bytes": png})
-    return "\n".join(b["Text"] for b in resp.get("Blocks", [])
-                     if b.get("BlockType") == "LINE")
+    blocks = resp.get("Blocks", [])
+    # Textract already reports Geometry.BoundingBox as 0..1 of the page, so the
+    # Layout word boxes come for free alongside the line transcription. Its LINE
+    # blocks carry the line grouping (via CHILD relationships) -> each word's `l`.
+    word_line = {}
+    lidx = 0
+    for b in blocks:
+        if b.get("BlockType") != "LINE":
+            continue
+        for rel in b.get("Relationships") or []:
+            if rel.get("Type") == "CHILD":
+                for cid in rel.get("Ids") or []:
+                    word_line[cid] = lidx
+        lidx += 1
+    words = []
+    for b in blocks:
+        if b.get("BlockType") != "WORD":
+            continue
+        bb = (b.get("Geometry") or {}).get("BoundingBox") or {}
+        w = {"t": b.get("Text") or "",
+             "x": round(float(bb.get("Left") or 0), 5),
+             "y": round(float(bb.get("Top") or 0), 5),
+             "w": round(float(bb.get("Width") or 0), 5),
+             "h": round(float(bb.get("Height") or 0), 5)}
+        if b.get("Id") in word_line:
+            w["l"] = word_line[b["Id"]]
+        words.append(w)
+    text = "\n".join(b["Text"] for b in blocks if b.get("BlockType") == "LINE")
+    return {"text": text, "words": words}
 
 
 def _ocr_mistral(png: bytes, cfg: dict) -> dict:
@@ -1658,6 +1814,30 @@ def _ocr_save_page_images(build_id: str, page: int, images: list[dict],
     return text
 
 
+def _ocr_save_page_words(build_id: str, src_key: str, page: int, words: list) -> None:
+    """Persist one page's OCR word boxes to the sidecar (ocr/layout.json,
+    {words: {"<src>": {"<page>": [{t,x,y,w,h,l}, ...]}}}). /api/pdf/words reads
+    these back for a scan with no text layer, so the Layout facsimile works on
+    it too. Keyed by SOURCE like the compiled .txt files, so a secondary scan's
+    boxes never clobber the primary's. An empty list DROPS the page — a re-OCR
+    with a service that has no boxes (Claude, Mistral) must not leave a stale
+    facsimile behind the new transcription."""
+    src_key = src_key or "primary"
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    with _ocr_merge_lock:
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta = lib.load_json(meta_path, {})
+        wmap = meta.setdefault("words", {})
+        pages = wmap.setdefault(src_key, {})
+        if words:
+            pages[str(int(page))] = words
+        else:
+            pages.pop(str(int(page)), None)
+            if not pages:
+                wmap.pop(src_key, None)
+        lib.save_json(meta_path, meta)
+
+
 def _ocr_job_run(job_id: str) -> None:
     job = _ocr_jobs[job_id]
     cfg = job["cfg"]
@@ -1670,13 +1850,21 @@ def _ocr_job_run(job_id: str) -> None:
             if runner is None:
                 raise RuntimeError(f"unsupported service: {svc}")
             result = runner(png, cfg)
-            # a runner may return {text, images} (Mistral) instead of a string
+            # a runner may return a dict instead of a string: {text, images}
+            # (Mistral figures) and/or {text, words} (Tesseract/Textract boxes)
+            src_key = job.get("src_key") or "primary"
             if isinstance(result, dict):
-                text = _ocr_save_page_images(
-                    job["build_id"], n, result.get("images") or [],
-                    str(result.get("text") or ""))
+                text = str(result.get("text") or "")
+                if result.get("images"):
+                    text = _ocr_save_page_images(
+                        job["build_id"], n, result["images"], text)
+                # save boxes when the service produced them, else clear this
+                # page's stale boxes (a figures-only or text-only re-OCR)
+                _ocr_save_page_words(job["build_id"], src_key, n,
+                                     result.get("words") or [])
             else:
                 text = result
+                _ocr_save_page_words(job["build_id"], src_key, n, [])
             _ocr_merge_page(job["build_id"], job["target"], n, text)
             item["status"] = "ok"
         except Exception as exc:
@@ -1720,6 +1908,7 @@ def api_ocr_run():
     job = {
         "id": job_id, "build_id": build_id, "pdf": str(pdf),
         "target": str(p.get("target") or "compiled.txt"),
+        "src_key": src_key or "primary",     # word boxes are stored per source
         "pages": pages, "done": 0, "errors": 0, "width": width,
         "status": "running",
         "cfg": {k: p.get(k) for k in ("tesseract", "claude_key", "claude_model",
@@ -1745,6 +1934,37 @@ def api_ocr_job(job_id: str):
 
 
 # --- PDF page deletion ---------------------------------------------------------------
+
+def _renumber_layout_words(build_id: str, src_key: str, removed: list[int]) -> None:
+    """Drop the deleted pages' word boxes from ONE source's sidecar map and
+    shift the rest down, matching _renumber_marked_text on the compiled files.
+    Source-scoped like that renumber, so a deletion on one scan never disturbs
+    another's boxes. Its own lock, so call it OUTSIDE the caller's
+    _ocr_merge_lock block (non-reentrant)."""
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    if not meta_path.is_file():
+        return
+    removed_set = set(removed)
+    with _ocr_merge_lock:
+        meta = lib.load_json(meta_path, {})
+        wmap = meta.get("words")
+        if not isinstance(wmap, dict):
+            return
+        pages = wmap.get(src_key or "primary")
+        if not isinstance(pages, dict):
+            return
+        remapped = {}
+        for k, v in pages.items():
+            try:
+                n = int(k)
+            except (TypeError, ValueError):
+                continue
+            if n in removed_set:
+                continue
+            remapped[str(n - sum(1 for r in removed if r < n))] = v
+        wmap[src_key or "primary"] = remapped
+        lib.save_json(meta_path, meta)
+
 
 def _renumber_marked_text(text: str, removed: list[int]) -> str:
     """Remap "--- page N ---" markers after pages were deleted: sections for
@@ -1845,18 +2065,7 @@ def _apply_page_deletion(build_id: str, builds: dict, pdf: Path,
     # FROM this PDF renumber — a secondary scan's OCR has its own page
     # numbering and must not shift with the primary's deletions.
     b = builds[build_id]
-    src_key = "primary"
-    pdfr = pdf.resolve()
-    # the primary claims the file FIRST: if the same scan is attached both
-    # as pdf_file and as a secondary (path spelling variants resolve to one
-    # file), a deletion must still renumber the primary's OCR files
-    primary = _resolve_local(str(b.get("pdf_file") or ""))
-    if primary is None or primary.resolve() != pdfr:
-        for s in (b.get("pdf_sources") or []):
-            sp = _resolve_local(str(s.get("path") or ""))
-            if sp is not None and sp.resolve() == pdfr:
-                src_key = s.get("id") or "primary"
-                break
+    src_key = _src_key_for_path(b, pdf)
     srcmap = _ocr_sources(build_id)
     ocr_dir = _entry_dir(build_id) / "ocr"
     renumbered = []
@@ -1876,6 +2085,10 @@ def _apply_page_deletion(build_id: str, builds: dict, pdf: Path,
                     renumbered.append(f.name)
                 except OSError:
                     continue
+    # the OCR word-box sidecar is page-keyed per source like the compiled
+    # files; keep THIS source's boxes aligned so the placed facsimile never
+    # shows a deleted page's words.
+    _renumber_layout_words(build_id, src_key, pages)
     # title pages are counted on the PRIMARY PDF; a secondary's deletions
     # don't move them
     titles = [] if src_key != "primary" else \

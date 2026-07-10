@@ -6349,14 +6349,19 @@ function createPdfViewer() {
   async function fillViewerLayout(pane) {
     const page = +pane.dataset.lay;
     const name = ((pagesSaveTo && pagesSaveTo.name) || "").toLowerCase();
+    const bid = (pagesSaveTo && pagesSaveTo.buildId) || "";
+    const src = (pagesSaveTo && pagesSaveTo.src) || "primary";
     if (name === "extracted.txt" || !pagesSec) {
-      return fillWordLayout(pane, pagesPdf, page);
+      return fillWordLayout(pane, pagesPdf, page, bid);
+    }
+    const meta = bid ? await ocrLayoutMeta(bid) : { images: {}, wordPages: {} };
+    if (!pane.isConnected) return;
+    // an OCR result with word boxes places a facsimile; else it flows its text
+    if (ocrHasWords(meta, src, page)) {
+      return fillWordLayout(pane, pagesPdf, page, bid);
     }
     const text = pagesSec.map.has(page) ? pagesSec.map.get(page) : null;
-    const bid = (pagesSaveTo && pagesSaveTo.buildId) || "";
-    const meta = bid ? await ocrLayoutMeta(bid) : {};
-    if (!pane.isConnected) return;
-    fillDocLayout(pane, text, bid, meta);
+    fillDocLayout(pane, text, bid, meta.images);
   }
 
   pagesBox.addEventListener("input", (ev) => {
@@ -9099,17 +9104,27 @@ function observeOcrLayout(pdf) {
     (pane) => fillOcrLayout(pane, pdf));
 }
 
-// the extracted-figure boxes for a book (ocr/layout.json), fetched once
+// the OCR sidecar for a book (ocr/layout.json), fetched once: the extracted-
+// figure boxes AND, per source, the pages that carry OCR word boxes (so Layout
+// knows which pages to place as a facsimile rather than flow as text)
 async function ocrLayoutMeta(bid) {
-  if (!bid) return {};
+  if (!bid) return { images: {}, wordPages: {} };
   if (!ocrState.layoutMeta[bid]) {
     try {
       const r = await (await fetch(
         `/api/builds/${encodeURIComponent(bid)}/ocr-layout`)).json();
-      ocrState.layoutMeta[bid] = (r.ok && r.images) || {};
-    } catch (e) { ocrState.layoutMeta[bid] = {}; }
+      ocrState.layoutMeta[bid] = r.ok
+        ? { images: r.images || {}, wordPages: r.word_pages || {} }
+        : { images: {}, wordPages: {} };
+    } catch (e) { ocrState.layoutMeta[bid] = { images: {}, wordPages: {} }; }
   }
   return ocrState.layoutMeta[bid];
+}
+
+// does the selected source have OCR word boxes for this page?
+function ocrHasWords(meta, srcKey, page) {
+  const wp = meta && meta.wordPages && meta.wordPages[srcKey || "primary"];
+  return Array.isArray(wp) && wp.includes(page);
 }
 
 // Markdown-lite for one page of OCR output (Mistral emits markdown): headers,
@@ -9146,31 +9161,38 @@ function fillDocLayout(pane, text, bid, meta) {
 async function fillOcrLayout(pane, pdf) {
   const page = +pane.dataset.lay;
   const d = ocrSelDoc();
-  // Only the PDF's own extraction has word boxes in the text layer; any other
-  // doc (an OCR result) shows ITS text for this page, so switching between
-  // compiled and extracted actually swaps what the facsimile holds.
+  // The PDF's own text-layer extraction always shows the placed facsimile. Any
+  // other doc (an OCR result) shows ITS content, so switching docs swaps what
+  // the page holds: a result WITH word boxes (Tesseract/Textract, incl. an
+  // image-only scan) places a facsimile from the sidecar; a text-only result
+  // (Claude) flows its text into the page.
   if (d && d.buildId && ocrState.pages &&
       (d.fileName || d.name) !== srcExtractedName(docSrcKey(d))) {
-    const sec = ocrState.pages;
-    const text = sec && sec.map.has(page) ? sec.map.get(page) : null;
     const meta = await ocrLayoutMeta(d.buildId);
     if (!pane.isConnected || ocrSelDoc() !== d) return;
-    fillDocLayout(pane, text, d.buildId, meta);
+    if (ocrHasWords(meta, docSrcKey(d), page)) {
+      return fillWordLayout(pane, pdf, page, d.buildId);
+    }
+    const sec = ocrState.pages;
+    const text = sec && sec.map.has(page) ? sec.map.get(page) : null;
+    fillDocLayout(pane, text, d.buildId, meta.images);
     return;
   }
-  return fillWordLayout(pane, pdf, page);
+  return fillWordLayout(pane, pdf, page, d && d.buildId);
 }
 
-// the word-box facsimile of one page, from the PDF's own text layer —
+// the word-box facsimile of one page: the PDF's own text layer, or (with a
+// buildId, for a scan that has no text layer) this book's stored OCR boxes —
 // shared by the OCR tab and the pdf viewer
-async function fillWordLayout(pane, pdf, page) {
+async function fillWordLayout(pane, pdf, page, buildId) {
   pane.classList.remove("doctext");
   pane.textContent = "…";
-  const ck = `${pdf}|${page}`;
+  const ck = `${pdf}|${page}|${buildId || ""}`;
   let res = ocrState.wordsCache.get(ck);
   if (!res) {
-    res = await (await fetch(
-      `/api/pdf/words?path=${encodeURIComponent(pdf)}&page=${page}`)).json();
+    let url = `/api/pdf/words?path=${encodeURIComponent(pdf)}&page=${page}`;
+    if (buildId) url += `&build_id=${encodeURIComponent(buildId)}`;
+    res = await (await fetch(url)).json();
     if (res && res.ok) {
       if (ocrState.wordsCache.size > 500) ocrState.wordsCache.clear();
       ocrState.wordsCache.set(ck, res);
@@ -9633,7 +9655,8 @@ function pollOcrJobs() {
 // session must not be clobbered by a finishing job.
 async function refreshCompiledDoc(bid, donePages, target, src) {
   target = target || "compiled.txt";
-  delete ocrState.layoutMeta[bid];   // the job may have added figures
+  delete ocrState.layoutMeta[bid];   // the job may have added figures / word boxes
+  ocrState.wordsCache.clear();       // OCR'd pages now have placeable boxes
   await loadOcrBooks();
   try {
     const data = await (await fetch(
