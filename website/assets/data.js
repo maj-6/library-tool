@@ -2,14 +2,23 @@
 //
 // With window.WHL_CONFIG set (assets/config.js, gitignored) it queries Supabase
 // over PostgREST directly -- no SDK, no build step, the same HTTP the desktop's
-// supabase_sync.py speaks. Without it, it falls back to fixtures/volumes.json,
+// supabase_sync.py speaks. Without it, it falls back to the fixtures/ folder,
 // so the site is developable and reviewable before the cloud has any rows.
 //
 // The anon key is meant to be public. Row-level security is what protects the
-// project: anon may read `volumes` and `releases` and nothing else.
+// project: anon may read `volumes`, `volume_texts`, `volume_pages`,
+// `volume_notes` and `releases`, and nothing else.
 
 const CFG = window.WHL_CONFIG || {};
 export const usingCloud = Boolean(CFG.supabaseUrl && CFG.supabaseAnonKey);
+
+// The separator used to render a category path (root -> leaf) as one string.
+// It matches the desktop publish step, so the flat `categories` text a cloud row
+// carries contains these exact joins -- which is why an `ilike` substring filter
+// on a parent path also matches every child (a child's text begins with it).
+export const CAT_SEP = " › ";                 // " › "
+export const catText = (path) =>
+  (Array.isArray(path) ? path : []).map((n) => String(n)).filter(Boolean).join(CAT_SEP);
 
 function rest(path) {
   return fetch(`${CFG.supabaseUrl.replace(/\/$/, "")}/rest/v1/${path}`, {
@@ -23,21 +32,41 @@ function rest(path) {
   });
 }
 
-let _fixture = null;
-async function fixture() {
-  if (!_fixture) {
-    const r = await fetch("fixtures/volumes.json");
-    if (!r.ok) throw new Error("no cloud configured and no fixture found");
-    _fixture = await r.json();
+// A tiny fixture loader/cache. Each fixture file is fetched at most once.
+const _fx = {};
+async function fixture(name = "volumes") {
+  if (!_fx[name]) {
+    _fx[name] = fetch(`fixtures/${name}.json`).then((r) => {
+      if (!r.ok) throw new Error(`fixture ${name} not found`);
+      return r.json();
+    });
   }
-  return _fixture;
+  return _fx[name];
 }
 
 const norm = (s) => String(s || "").toLowerCase();
 
-/** {q, yearFrom, yearTo, sort, limit, offset} -> {rows, total} */
+// PostgREST `ilike` runs SQL LIKE underneath: `%` and `_` are wildcards there,
+// and `*` is PostgREST's own wildcard token. A category name an attacker chose
+// must not smuggle any of them in, so escape them before wrapping in `*...*`.
+const likeEscape = (s) => String(s).replace(/([\\%_*])/g, "\\$1");
+
+// Does a fixture row sit under a category path (subtree prefix match)?
+function rowInCat(v, wanted) {
+  if (!wanted) return true;
+  const paths = Array.isArray(v.category_paths) ? v.category_paths : [];
+  return paths.some((p) => {
+    const t = catText(p);
+    return t === wanted || t.startsWith(wanted + CAT_SEP);
+  });
+}
+
+/** {q, yearFrom, yearTo, cat, lang, sort, limit, offset} -> {rows, total} */
 export async function searchVolumes(opts = {}) {
-  const { q = "", yearFrom = null, yearTo = null, sort = "title", limit = 24, offset = 0 } = opts;
+  const {
+    q = "", yearFrom = null, yearTo = null, cat = "", lang = "",
+    sort = "title", limit = 24, offset = 0,
+  } = opts;
 
   if (!usingCloud) {
     let rows = await fixture();
@@ -50,29 +79,36 @@ export async function searchVolumes(opts = {}) {
     }
     if (yearFrom != null) rows = rows.filter((v) => v.year && v.year >= yearFrom);
     if (yearTo != null) rows = rows.filter((v) => v.year && v.year <= yearTo);
+    if (cat) rows = rows.filter((v) => rowInCat(v, cat));
+    if (lang) rows = rows.filter((v) => String(v.language || "") === lang);
     rows = sortRows(rows, sort);
     return { rows: rows.slice(offset, offset + limit), total: rows.length };
   }
 
   // PostgREST: the database does the search, so a query never ships the catalogue
-  const params = ["select=*"];
-  if (q) params.push(`fts=plfts(english).${encodeURIComponent(q)}`);
-  if (yearFrom != null) params.push(`year=gte.${yearFrom}`);
-  if (yearTo != null) params.push(`year=lte.${yearTo}`);
+  const params = filterParams(q, yearFrom, yearTo, cat, lang);
+  params.unshift("select=*");
   params.push(`order=${orderClause(sort)}`);
   params.push(`limit=${limit}`, `offset=${offset}`);
 
   const rows = await rest(`volumes?${params.join("&")}`);
-  // a count needs a HEAD with Prefer: count=exact; one extra cheap request
-  const total = await countVolumes(q, yearFrom, yearTo).catch(() => rows.length);
+  const total = await countVolumes(q, yearFrom, yearTo, cat, lang).catch(() => rows.length);
   return { rows, total };
 }
 
-async function countVolumes(q, yearFrom, yearTo) {
-  const params = ["select=id"];
+// The filter half of a volumes query, shared by the row fetch and the count.
+function filterParams(q, yearFrom, yearTo, cat, lang) {
+  const params = [];
   if (q) params.push(`fts=plfts(english).${encodeURIComponent(q)}`);
   if (yearFrom != null) params.push(`year=gte.${yearFrom}`);
   if (yearTo != null) params.push(`year=lte.${yearTo}`);
+  if (cat) params.push(`categories=ilike.*${encodeURIComponent(likeEscape(cat))}*`);
+  if (lang) params.push(`language=eq.${encodeURIComponent(lang)}`);
+  return params;
+}
+
+async function countVolumes(q, yearFrom, yearTo, cat, lang) {
+  const params = ["select=id", ...filterParams(q, yearFrom, yearTo, cat, lang)];
   const r = await fetch(`${CFG.supabaseUrl.replace(/\/$/, "")}/rest/v1/volumes?${params.join("&")}`, {
     method: "HEAD",
     headers: {
@@ -91,6 +127,63 @@ export async function getVolume(slug) {
   if (!usingCloud) return (await fixture()).find((v) => v.slug === slug) || null;
   const rows = await rest(`volumes?slug=eq.${encodeURIComponent(slug)}&select=*&limit=1`);
   return rows[0] || null;
+}
+
+/** The About article (Markdown) for a volume, or "" when there is none. */
+export async function getAbout(slug) {
+  if (!usingCloud) {
+    const t = (await fixture("texts").catch(() => ({})))[slug];
+    return (t && t.about) || "";
+  }
+  const rows = await rest(
+    `volume_texts?slug=eq.${encodeURIComponent(slug)}&kind=eq.about&select=body,lang&order=lang.asc&limit=1`
+  );
+  return (rows[0] && rows[0].body) || "";
+}
+
+/** Anchored annotations for a volume, page-ascending. */
+export async function getNotes(slug) {
+  if (!usingCloud) {
+    return (await fixture("notes").catch(() => ({})))[slug] || [];
+  }
+  return rest(
+    `volume_notes?slug=eq.${encodeURIComponent(slug)}&select=note_id,page,quote,kind,body&order=page.asc,note_id.asc`
+  );
+}
+
+/** Page-aligned text: lang "" is the original layer; "es"/"de"/... translations.
+ *  Returns a { <page>: <text> } map for pages in [from, to]. */
+export async function getPages(slug, lang = "", from = 1, to = 9999) {
+  const out = {};
+  if (!usingCloud) {
+    const byLang = (await fixture("pages").catch(() => ({})))[slug] || {};
+    const src = byLang[lang] || {};
+    for (const k of Object.keys(src)) {
+      const p = Number(k);
+      if (p >= from && p <= to) out[p] = src[k];
+    }
+    return out;
+  }
+  const rows = await rest(
+    `volume_pages?slug=eq.${encodeURIComponent(slug)}&lang=eq.${encodeURIComponent(lang)}` +
+    `&page=gte.${from}&page=lte.${to}&select=page,body&order=page.asc`
+  );
+  for (const r of rows) out[r.page] = r.body;
+  return out;
+}
+
+/** The light rows the browse page needs to build its facets client-side:
+ *  {slug, category_paths, language, year} for every volume. */
+export async function facetSource() {
+  if (!usingCloud) {
+    return (await fixture()).map((v) => ({
+      slug: v.slug,
+      category_paths: v.category_paths || [],
+      language: v.language || "",
+      year: v.year ?? null,
+    }));
+  }
+  return rest("volumes?select=slug,category_paths,language,year");
 }
 
 export async function latestReleases() {
@@ -156,16 +249,25 @@ function sortRows(rows, sort) {
   return [...rows].sort(by);
 }
 
-/** Where the PDF actually lives: an absolute URL wins, else the public bucket.
+/** Where the PDF actually lives.
  *
- * pdf_url is a database column, and `volumes` is writable by any authenticated
- * user. Rendering it straight into an href would let a row carrying
- * `javascript:…` run script for every visitor, since escaping the string does
- * nothing to the scheme. Only http(s) survives.
+ * In fixture mode there is no cloud storage, so any volume whose fixture assets
+ * declare an original text layer (assets.pages) is served the bundled
+ * fixtures/sample.pdf -- a relative path, resolved against the page that reads
+ * it (browse/book/read all sit at the site root, so it resolves the same way).
+ *
+ * On the cloud path, pdf_url is a database column and `volumes` is
+ * attacker-influenceable, so a row carrying `javascript:…` would run script for
+ * every visitor; escaping the string does nothing to its scheme. Only http(s)
+ * survives, via safeHttpUrl().
  */
 export function pdfHref(v) {
+  if (!usingCloud) {
+    const a = (v && v.assets) || {};
+    return a.pages ? "fixtures/sample.pdf" : "";
+  }
   if (v.pdf_url) return safeHttpUrl(v.pdf_url);
-  if (v.pdf_path && usingCloud) {
+  if (v.pdf_path) {
     return `${CFG.supabaseUrl.replace(/\/$/, "")}/storage/v1/object/public/volumes/${encodeURI(v.pdf_path)}`;
   }
   return "";
