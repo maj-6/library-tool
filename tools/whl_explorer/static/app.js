@@ -460,14 +460,121 @@ const esc = (s) =>
 // "error" tints it amber, "critical" red. A failure that only cost time is an
 // error; one that means the user's data did not persist, or that the backend is
 // gone, is critical. Any later plain status() clears the tint, so no timer.
+// Every line is also teed into the Info tab's console, which keeps scrollback.
 function status(msg, level) {
   const n = el("status-msg");
   n.textContent = msg;
   n.classList.toggle("err", level === "error");
   n.classList.toggle("crit", level === "critical");
+  conPut(level === "critical" ? "error" : level === "error" ? "warn" : "info", msg, "app");
 }
 const statusErr = (msg) => status(msg, "error");
 const statusCrit = (msg) => status(msg, "critical");
+
+// --- console (Info tab) -------------------------------------------------------
+// One stream, two sources: `app` lines are teed from status() and from anything
+// the page throws; `server`/`http` lines are pulled from the Flask ring over
+// /api/log. The footer only ever shows the newest line -- this is the scrollback.
+
+const CON_CAP = 3000;
+const CON_RANK = { debug: 0, info: 1, warn: 2, error: 3 };
+const conState = { lines: [], since: 0, follow: true, dirty: false, dropped: false };
+
+function conPut(level, msg, src) {
+  conState.lines.push({ ts: Date.now(), level, src: src || "app", msg: String(msg) });
+  if (conState.lines.length > CON_CAP) conState.lines.splice(0, conState.lines.length - CON_CAP);
+  conState.dirty = true;
+  if (conVisible()) scheduleConRender();
+}
+
+function conVisible() {
+  const p = el("infotab");
+  return !!p && p.classList.contains("active");
+}
+
+let _conTimer = null;
+function scheduleConRender() {
+  if (_conTimer) return;
+  _conTimer = setTimeout(() => { _conTimer = null; renderConsole(); }, 120);
+}
+
+function conFiltered() {
+  const min = CON_RANK[el("con-level").value] ?? 1;
+  const q = el("con-find").value.trim().toLowerCase();
+  return conState.lines.filter((l) =>
+    (CON_RANK[l.level] ?? 1) >= min && (!q || l.msg.toLowerCase().includes(q)));
+}
+
+const conTime = (ts) => new Date(ts).toTimeString().slice(0, 8);
+
+function renderConsole() {
+  const box = el("con-lines");
+  if (!box) return;
+  conState.dirty = false;
+  const rows = conFiltered();
+  el("con-count").textContent =
+    `${rows.length}/${conState.lines.length}` + (conState.dropped ? " (truncated)" : "");
+  box.innerHTML = rows.map((l) =>
+    `<div class="con-line con-${esc(l.level)}">` +
+    `<span class="con-ts">${conTime(l.ts)}</span>` +
+    `<span class="con-src">${esc(l.src)}</span>` +
+    `<span class="con-msg">${esc(l.msg)}</span></div>`).join("") ||
+    `<div class="empty">Nothing to show at this level</div>`;
+  if (conState.follow) box.scrollTop = box.scrollHeight;
+}
+
+async function pollConsoleLog() {
+  if (document.hidden) return;
+  try {
+    const r = await (await fetch("/api/log?since=" + conState.since)).json();
+    if (!r.ok) return;
+    if (r.dropped) conState.dropped = true;
+    conState.since = r.next;
+    for (const e of r.entries) conPut(e.level, e.msg, e.src);
+  } catch (e) { /* the server going away is itself reported by the caller */ }
+}
+
+function initConsole() {
+  // anything the page throws lands here, not only in devtools
+  addEventListener("error", (ev) =>
+    conPut("error", `${ev.message} (${ev.filename}:${ev.lineno})`, "app"));
+  addEventListener("unhandledrejection", (ev) =>
+    conPut("error", "Unhandled rejection: " + (ev.reason && ev.reason.message || ev.reason), "app"));
+  for (const lvl of ["warn", "error"]) {
+    const orig = console[lvl].bind(console);
+    console[lvl] = (...a) => {
+      conPut(lvl, a.map((x) => (x && x.stack) || String(x)).join(" "), "app");
+      orig(...a);
+    };
+  }
+  el("con-level").addEventListener("change", renderConsole);
+  el("con-find").addEventListener("input", renderConsole);
+  el("con-follow").addEventListener("click", () => {
+    conState.follow = !conState.follow;
+    el("con-follow").classList.toggle("active", conState.follow);
+    if (conState.follow) renderConsole();
+  });
+  el("con-lines").addEventListener("scroll", () => {
+    // scrolling up detaches follow, the way a terminal does
+    const box = el("con-lines");
+    const atEnd = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
+    if (conState.follow !== atEnd) {
+      conState.follow = atEnd;
+      el("con-follow").classList.toggle("active", atEnd);
+    }
+  });
+  el("con-copy").addEventListener("click", () => {
+    const text = conFiltered().map((l) => `${conTime(l.ts)} ${l.src} ${l.level} ${l.msg}`).join("\n");
+    navigator.clipboard.writeText(text).then(() => status(`COPIED ${conFiltered().length} LINES`));
+  });
+  el("con-clear").addEventListener("click", () => {
+    conState.lines = [];
+    conState.dropped = false;
+    renderConsole();
+  });
+  pollConsoleLog();
+  setInterval(pollConsoleLog, 3000);
+}
 function ckey(source, idx) { return `${source}:${idx}`; }
 
 // --- icon set (inline SVG, stroke = currentColor) ------------------------------
@@ -874,7 +981,7 @@ async function syncClientStateOnLoad() {
 
 // --- tabs + header -----------------------------------------------------------
 
-const TAB_TITLES = { checked: "Catalogs", upload: "Editor", ocr: "OCR" };
+const TAB_TITLES = { checked: "Catalogs", upload: "Editor", ocr: "OCR", infotab: "Info" };
 
 function setHeader(tabId) {
   // Both the visible title bar and the OS window title carry the active tab:
@@ -907,6 +1014,7 @@ function initTabs() {
       setHeader(tab.dataset.tab);
       if (tab.dataset.tab === "checked") renderChecked();
       if (tab.dataset.tab === "upload") renderUpload();
+      if (tab.dataset.tab === "infotab") renderConsole();
       // refresh the folder list on every visit — builds/folders may have
       // changed in the Editor tab meanwhile
       if (tab.dataset.tab === "ocr") loadOcrBooks().then(renderOcrTab);
@@ -8918,6 +9026,7 @@ function init() {
   initTooltips();
   initPaneTabs();
   initMenubar();
+  initConsole();          // before anything can throw or call status()
   fitTitleBar();          // after the menus exist: their width sets the clamp
   initSettingsNav();
   initColResize();

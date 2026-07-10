@@ -20,11 +20,15 @@ then open http://127.0.0.1:5001
 """
 from __future__ import annotations
 
+import collections
 import json
+import logging
 import os
 import re
 import sys
 import threading
+import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -32,6 +36,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Flask, Response, abort, jsonify, render_template, request, send_file
+from werkzeug.exceptions import HTTPException
 
 # Make tools/ importable for the shared helpers.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -62,6 +67,108 @@ def _flask_app():
 
 
 app = _flask_app()
+
+
+# --- application log ------------------------------------------------------------
+# The app had no logging at all: a failing background job left its reason in a
+# job dict that only one poller ever read. Everything now lands in a bounded
+# in-memory ring, which the Info tab's console reads over /api/log. Nothing is
+# written to disk -- this is a console, not an audit trail.
+
+_LOG_CAP = 1000
+_log_lock = threading.Lock()
+_log_seq = 0
+_log_ring: collections.deque = collections.deque(maxlen=_LOG_CAP)
+
+_LOG_LEVELS = {
+    logging.DEBUG: "debug", logging.INFO: "info", logging.WARNING: "warn",
+    logging.ERROR: "error", logging.CRITICAL: "error",
+}
+
+
+def _log_put(level: str, msg: str, src: str = "server") -> None:
+    global _log_seq
+    with _log_lock:
+        _log_seq += 1
+        _log_ring.append({"seq": _log_seq, "ts": time.time(), "level": level,
+                          "src": src, "msg": str(msg)[:4000]})
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+# 127.0.0.1 - - [09/Jul/2026 23:46:01] "GET /api/builds HTTP/1.1" 200 -
+_REQLINE = re.compile(r'^\S+ - - \[[^\]]+\] "(\S+) (.*?) HTTP/[\d.]+" (\d{3})')
+
+
+class _RingHandler(logging.Handler):
+    """Tee every log record into the ring the console reads."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = record.getMessage()
+            if record.exc_info:
+                msg += "\n" + "".join(traceback.format_exception(*record.exc_info)).rstrip()
+        except Exception:            # a broken __repr__ must not kill the logger
+            return
+        src = "http" if record.name.startswith("werkzeug") else "server"
+        if src == "http":
+            # the console polls /api/log; logging that poll would feed itself
+            if "/api/log" in msg:
+                return
+            msg = _ANSI.sub("", msg)      # werkzeug colours its status codes
+            # drop the ip and the timestamp: the console shows its own clock
+            m = _REQLINE.match(msg)
+            if m:
+                msg = f"{m.group(1)} {m.group(2)} -> {m.group(3)}"
+        # request lines are debug noise; only their failures deserve attention
+        level = _LOG_LEVELS.get(record.levelno, "info")
+        if src == "http" and level == "info":
+            level = "debug"
+        _log_put(level, msg, src)
+
+
+log = logging.getLogger("whl")
+
+
+def _init_logging() -> None:
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    ring = _RingHandler()
+    ring.setLevel(logging.DEBUG)
+    root.addHandler(ring)
+    if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
+        stream = logging.StreamHandler()
+        stream.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+        root.addHandler(stream)
+    # werkzeug logs one INFO line per request; keep them, demoted to debug
+    logging.getLogger("werkzeug").setLevel(logging.INFO)
+
+
+_init_logging()
+
+
+@app.errorhandler(Exception)
+def _log_unhandled(exc):
+    """Any route that raises now says so in the console instead of vanishing."""
+    if isinstance(exc, HTTPException):
+        if exc.code and exc.code >= 500:
+            log.error("%s %s -> %s", request.method, request.path, exc)
+        return exc
+    log.error("%s %s failed", request.method, request.path, exc_info=exc)
+    return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/api/log")
+def api_log():
+    """Console feed: everything after ?since=<seq>. `next` is the new cursor."""
+    try:
+        since = int(request.args.get("since") or 0)
+    except ValueError:
+        since = 0
+    with _log_lock:
+        rows = [r for r in _log_ring if r["seq"] > since]
+        last = _log_seq
+        dropped = since > 0 and _log_ring and _log_ring[0]["seq"] > since + 1
+    return jsonify({"ok": True, "entries": rows, "next": last, "dropped": bool(dropped)})
 
 
 # --- the CH private-library catalogue -------------------------------------------
@@ -1543,6 +1650,7 @@ def _ia_pdf_path(identifier: str) -> Path:
 def _ia_download_job(identifier: str, book: dict) -> None:
     """Download the item's PDF and write a cataloging entry (runs in a thread)."""
     job = _downloads[identifier]
+    log.info("IA download started: %s", identifier)
     try:
         info = _ia_get_json(f"https://archive.org/metadata/{urllib.parse.quote(identifier)}")
         pdf = _pick_pdf(info.get("files") or [])
@@ -1596,9 +1704,11 @@ def _ia_download_job(identifier: str, book: dict) -> None:
         _update_ia_catalog(lambda c: c.__setitem__(identifier, entry))
         job["status"] = "done"
         job["path"] = str(dest.relative_to(lib.DATA_ROOT))
+        log.info("IA download done: %s", identifier)
     except Exception as exc:
         job["status"] = "error"
         job["error"] = f"{type(exc).__name__}: {exc}"
+        log.error("IA download failed: %s", identifier, exc_info=exc)
 
 
 def _download_state(identifier: str) -> dict:
@@ -1783,6 +1893,7 @@ def _db_urls():
 def _run_db_download(name, url, rel):
     dest = lib.DATA_ROOT / rel
     tmp = dest.with_name(dest.name + ".part")
+    log.info("database download started: %s <- %s", name, url)
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
         req = urllib.request.Request(url, headers={"User-Agent": "whl-explorer"})
@@ -1800,6 +1911,7 @@ def _run_db_download(name, url, rel):
                     _db_jobs[name]["downloaded"] = done
         os.replace(tmp, dest)
         _db_jobs[name] = {"status": "done", "downloaded": done, "total": total}
+        log.info("database download done: %s (%d bytes)", name, done)
     except Exception as e:
         try:
             if tmp.exists():
@@ -1807,6 +1919,7 @@ def _run_db_download(name, url, rel):
         except OSError:
             pass
         _db_jobs[name] = {"status": "error", "error": str(e)}
+        log.error("database download failed: %s", name, exc_info=e)
 
 
 @app.route("/api/db/status")
@@ -2411,6 +2524,7 @@ def _cloud_sync_run() -> dict:
     imported = skipped = 0
     errors: list[str] = []
     result: dict = {"ok": False, "error": "sync crashed", "errors": errors}
+    log.info("cloud sync started")
     try:
         s = _client_settings()
         mistral_key = str(s.get("mistralKey") or "").strip()
@@ -2433,6 +2547,7 @@ def _cloud_sync_run() -> dict:
     except Exception as exc:
         result = {"ok": False, "error": f"{type(exc).__name__}: {exc}",
                   "imported": imported, "errors": errors}
+        log.error("cloud sync crashed", exc_info=exc)
     finally:
         with _cloudsync_lock:
             _cloudsync["running"] = False
@@ -2441,6 +2556,13 @@ def _cloud_sync_run() -> dict:
             _cloudsync["last_result"] = result
             _cloudsync["last_error"] = (result.get("error", "")
                                         or "; ".join(result.get("errors") or []))
+        if result.get("ok"):
+            log.info("cloud sync done: %d imported, %d skipped, %d books pushed",
+                     result.get("imported", 0), result.get("skipped", 0),
+                     result.get("books_pushed", 0))
+        elif result.get("error") != "sync crashed":
+            log.warning("cloud sync finished with errors: %s",
+                        result.get("error") or "; ".join(errors))
     return result
 
 
@@ -2448,7 +2570,6 @@ def _cloud_autosync_loop() -> None:
     """Background interval sync; the interval is re-read every tick so a
     settings change applies without a restart (0 = off)."""
     global _autosync_last
-    import time
     while True:
         time.sleep(30)
         # the WHOLE tick is guarded: a torn settings read (or anything else)
@@ -2569,4 +2690,5 @@ if __name__ == "__main__":
     # so its localStorage/client-state can't collide with the main one) — used
     # to test against a throwaway WHL_DATA_ROOT without touching live state.
     port = int(os.environ.get("WHL_PORT") or 5001)
+    log.info("Library Tool on 127.0.0.1:%d - DATA_ROOT=%s", port, lib.DATA_ROOT)
     app.run(host="127.0.0.1", port=port, debug=False)

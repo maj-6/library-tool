@@ -818,6 +818,31 @@ body {
   height: 100vh;
 }
 
+/* --- Info tab: the console --- */
+#infotab { flex-direction: column; gap: 0; padding: 6px; }
+#con-lines {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  margin-top: 6px;
+  padding: 4px 6px;
+  background: var(--canvas);
+  border: 1px solid var(--canvas-line);
+  border-radius: var(--radius);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.con-line { display: flex; gap: 8px; align-items: baseline; white-space: pre-wrap; overflow-wrap: anywhere; }
+.con-ts { flex: 0 0 auto; color: var(--face-sh2); }
+.con-src { flex: 0 0 46px; color: var(--face-sh2); text-transform: uppercase; font-size: 9px; letter-spacing: 0.5px; }
+.con-msg { flex: 1 1 auto; min-width: 0; color: var(--ink-light); }
+.con-debug .con-msg { color: var(--face-sh2); }
+.con-warn .con-msg { color: var(--amber); }
+.con-error .con-msg { color: var(--red); font-weight: bold; }
+#con-find { width: 160px; }
+#con-level { width: 170px; }
+
 /* --- title bar --- */
 #titlebar {
   background: linear-gradient(90deg, var(--blue), var(--blue2));

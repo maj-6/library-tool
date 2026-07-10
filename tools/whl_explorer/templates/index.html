@@ -70,6 +70,7 @@
     <button class="tab active" data-tab="checked">Catalogs</button>
     <button class="tab" data-tab="upload">Editor</button>
     <button class="tab" data-tab="ocr">OCR</button>
+    <button class="tab" data-tab="infotab">Info</button>
     <span class="tb-spacer"></span>
     <div class="tb-group">
       <button id="undo-btn" class="tool-btn icon-btn" type="button" disabled
@@ -788,6 +789,29 @@
         </table>
         <p id="ocr-queue-empty" class="empty">No OCR jobs</p>
       </div>
+    </section>
+
+    <!-- INFO: the console, for now; more lands here later -->
+    <section id="infotab" class="panel-view">
+      <div class="pane-bar">
+        <span class="tool-label">Console</span>
+        <select id="con-level" class="cad-input" data-tip="Lowest level to show">
+          <option value="info">Info and above</option>
+          <option value="warn">Warnings and errors</option>
+          <option value="error">Errors only</option>
+          <option value="debug">Everything (with HTTP)</option>
+        </select>
+        <input id="con-find" class="cad-input" placeholder="filter" spellcheck="false" />
+        <span class="tb-spacer"></span>
+        <span id="con-count" class="tool-label"></span>
+        <button id="con-follow" class="cad-btn tiny active" type="button"
+                data-tip="Scroll to follow new lines">Follow</button>
+        <button id="con-copy" class="cad-btn tiny icon-btn" type="button"
+                data-icon="export" data-tip="Copy the visible lines"></button>
+        <button id="con-clear" class="cad-btn tiny icon-btn danger" type="button"
+                data-icon="remove" data-tip="Clear the console (the server keeps its own ring)"></button>
+      </div>
+      <div id="con-lines"></div>
     </section>
   </main>
 
