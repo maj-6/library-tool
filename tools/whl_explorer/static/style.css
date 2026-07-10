@@ -1166,7 +1166,8 @@ main {
 .cr-yellow  { background: #c3aa5c; }
 .cr-gray    { background: #a6a69f; }
 .cr-green   { background: #5f8b6c; }
-.cr-purple  { background: #7a5fa8; }
+/* magenta, not purple: purple read as a shade of the blue it sits beside */
+.cr-magenta { background: #a4508b; }
 .cr-orange  { background: #bd875a; }
 .cr-red     { background: #ab5147; }
 .cr-pending { background: repeating-linear-gradient(45deg, #d8d8d8, #d8d8d8 3px, #ececec 3px, #ececec 6px); }
@@ -1721,6 +1722,8 @@ form.orig-view .cad-input {
 }
 .info-v a { color: var(--cyan); text-decoration: none; }
 .info-v a:hover { text-decoration: underline; }
+/* provenance under a record: where it came from, not the record itself */
+.info-row.info-sub .info-v, span.info-sub { color: var(--face-sh2); font-size: 10.5px; }
 .info-dot {
   display: inline-block; width: 7px; height: 7px; border-radius: 50%;
   margin-right: 5px; vertical-align: middle; background: var(--face-sh2);

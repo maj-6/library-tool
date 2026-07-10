@@ -2002,83 +2002,128 @@ function refreshAllCrTags() {
     tmp.innerHTML = renderCrTag(b, st).trim();
     if (tmp.content.firstElementChild) tag.replaceWith(tmp.content.firstElementChild);
   });
+  // the Info pane spells the same records out, so it resolves on the same fetch
+  refreshInfoIfActive();
 }
 
 // Colours for the diagonal copyright tag. Left = registration record, right =
 // renewal. The two halves read as one sentence: "was it registered, and did the
 // registration survive?".
 //
-//   left   purple = registered, but public domain by age (a registration exists
-//                   all the same — the fact the tag is there to surface)
-//          yellow = registered during the renewal era (1931-1963)
-//          red    = published after 1963 — in copyright whether or not a
-//                   registration record turns up
-//          gray   = renewal era, no registration record found
-//          blue   = public domain by age, no registration record
-//   right  blue   = public domain by age (or a renewal we can't assess)
-//          green  = registered but never renewed -> public domain
-//          orange = auto-renewed (published 1964-1977)
-//          red    = renewal on file, or published after the renewal era
+//   left   magenta = registered, but public domain by age (a registration exists
+//                    all the same — the fact the tag is there to surface)
+//          yellow  = registered during the renewal era (1931-1963)
+//          red     = registered, published after 1963
+//          gray    = no registration record found
+//          blue    = public domain by age, no registration record
+//   right  blue    = public domain by age (or a renewal we can't assess)
+//          green   = registered but never renewed -> public domain
+//          orange  = auto-renewed (published 1964-1977)
+//          red     = renewal on file, or published from 1978
 //
 // A negative renewal result is only trusted when a registration backs it up:
 // "no renewal found" for a book with no registration record means nothing, so
 // the right half stays blue. A renewal that IS on file needs no such backing.
+
+// Registration evidence has TWO independent sources: the CPRS/NYPL lookup, and
+// the renewal record itself, which cites the original registration it renews.
+// Hollingsworth's "Flower Chronicles" is the case that forced this — its renewal
+// names an original registration that the searched registers do not hold. A
+// renewal cannot exist without a registration, so the citation IS a record.
+function crEvidence(b, status) {
+  const e = { status, pdAge: false, renewedId: "", autoRen: false, notRen: false,
+              post63: false, reg: null, regPending: false, renewal: null,
+              renPending: false, record: null };
+  if (!status || status.startsWith("Unknown")) return e;
+  e.pdAge = status.startsWith("Public domain (published");
+  e.renewedId = (/^In copyright \(renewal (.+)\)$/.exec(status) || [])[1] || "";
+  e.autoRen = status.startsWith("In copyright (auto-renewed");
+  e.notRen = status.startsWith("Public domain (no renewal");
+  e.post63 = status.startsWith("In copyright") && !e.renewedId;
+
+  if (e.renewedId) {
+    const r = renCache().get(e.renewedId);
+    if (r === undefined) { queueRen(e.renewedId); e.renPending = true; }
+    else if (r && Object.keys(r).length) e.renewal = r;
+  }
+  if (copyrightSources().length) {
+    const r = regCache().get(regKey(b));
+    if (r === undefined) { queueReg(b); e.regPending = true; }
+    else e.reg = r;
+  }
+
+  const m = e.reg && e.reg.found ? e.reg.match : null;
+  if (m) {
+    e.record = { number: m.reg_number || "", date: m.date || m.year || "",
+                 via: (e.reg.sources || []).map((s) => s.toUpperCase()).join(", "),
+                 title: m.title || "", author: m.author || "" };
+  } else if (e.renewal && (e.renewal.registration_number || e.renewal.registration_date)) {
+    e.record = { number: e.renewal.registration_number || "",
+                 date: crDate(e.renewal.registration_date) || "",
+                 via: "cited by renewal " + e.renewedId, title: "", author: "" };
+  }
+  return e;
+}
+
+// "D64591 · 24 Jun 1923" + where it came from
+function crRecordLine(rec) {
+  const head = "Registration " + (rec.number || "(unnumbered)") +
+    (rec.date ? " · " + rec.date : "");
+  return rec.via ? head + "\n" + rec.via : head;
+}
+
 function copyrightColors(b, status) {
   if (status === undefined) return { left: "pending", right: "pending", lt: "Checking copyright …", rt: "Checking copyright …" };
   if (!status || status.startsWith("Unknown"))
     return { left: "gray", right: "gray", lt: status || "Copyright status unknown", rt: status || "Copyright status unknown" };
 
-  const pdAge = status.startsWith("Public domain (published");
-  const renewedId = (/^In copyright \(renewal (.+)\)$/.exec(status) || [])[1] || "";
-  const autoRen = status.startsWith("In copyright (auto-renewed");
-  const notRen = status.startsWith("Public domain (no renewal");
-  const post63 = status.startsWith("In copyright") && !renewedId;  // auto-renewed or later
+  const e = crEvidence(b, status);
+  const rec = e.record;
+  const noRec = !copyrightSources().length
+    ? "Registration lookup disabled — enable a source in Settings"
+    : "No copyright registration record found";
 
-  // --- right half: the renewal question, answered offline from the CSV
+  // --- right half: the renewal question, answered offline from the CSV.
+  // Post-1963 works are not automatically in copyright, so their tooltip cites
+  // the registration record rather than asserting a term from the date alone.
   let rc, rt;
-  if (pdAge) { rc = "blue"; rt = status; }
-  else if (renewedId) {
+  if (e.pdAge) { rc = "blue"; rt = status; }
+  else if (e.renewedId) {
     rc = "red";
-    rt = "Renewal " + renewedId + " on file — in copyright";
-    const ren = renCache().get(renewedId);
-    if (ren === undefined) queueRen(renewedId);
-    else if (ren.renewal_date || ren.renewal_year) {
-      rt += "\nRenewed " + (crDate(ren.renewal_date) || ren.renewal_year);
-      if (ren.registration_date)
-        rt += " · originally registered " + crDate(ren.registration_date) +
-          (ren.registration_number ? " (" + ren.registration_number + ")" : "");
-    }
-  } else if (autoRen) { rc = "orange"; rt = "Auto-renewed — in copyright"; }
-  else if (post63) { rc = "red"; rt = "In copyright — published after the renewal era"; }
-  else if (notRen) { rc = "green"; rt = "Registered but not renewed — likely public domain"; }
+    rt = "Renewal " + e.renewedId + " on file — in copyright";
+    if (e.renewal && (e.renewal.renewal_date || e.renewal.renewal_year))
+      rt += "\nRenewed " + (crDate(e.renewal.renewal_date) || e.renewal.renewal_year);
+    if (e.renewal && e.renewal.registration_date)
+      rt += "\nRenews registration " + (e.renewal.registration_number || "(unnumbered)") +
+        " of " + crDate(e.renewal.registration_date);
+  } else if (e.autoRen) {
+    rc = "orange";
+    rt = "Published 1964-1977: renewal was automatic, if it was registered";
+    rt += "\n" + (rec ? crRecordLine(rec) : noRec);
+  } else if (e.post63) {
+    rc = "red";
+    rt = "Published from 1978: copyright runs without registration";
+    rt += "\n" + (rec ? crRecordLine(rec) : noRec);
+  } else if (e.notRen) { rc = "green"; rt = "Registered but not renewed — likely public domain"; }
   else { rc = "gray"; rt = status; }
 
-  // --- left half: the registration record
-  if (post63)
-    return { left: "red", right: rc, rt,
-      lt: "Published after 1963 — in copyright regardless of registration" };
-  if (!copyrightSources().length) {
-    const settled = pdAge || renewedId;   // answers that don't need the lookup
-    return { left: pdAge ? "blue" : "gray", right: settled ? rc : "blue",
-      lt: "Registration lookup disabled — enable a source in Settings",
-      rt: settled ? rt : "No registration lookup — renewal not assessable" };
+  // --- left half: the registration record itself
+  if (!rec && (e.regPending || (e.renewedId && e.renPending)))
+    return { left: "pending", right: rc, lt: "Checking registration …", rt };
+
+  if (rec) {
+    const lt = crRecordLine(rec) +
+      (rec.title ? "\n" + rec.title + (rec.author ? " — " + rec.author : "") : "");
+    const left = e.pdAge ? "magenta" : e.post63 || e.autoRen ? "red" : "yellow";
+    return { left, right: rc, lt, rt };
   }
-  const reg = regCache().get(regKey(b));
-  if (reg === undefined) { queueReg(b); return { left: "pending", right: rc, lt: "Checking registration …", rt }; }
-  if (!reg.found) {
-    if (pdAge)
-      return { left: "blue", right: "blue", rt,
-        lt: "Public domain by age; no registration record found" };
-    return { left: "gray", right: renewedId ? rc : "blue",
-      lt: "No copyright registration record found",
-      rt: renewedId ? rt : "No registration record — renewal not assessable" };
-  }
-  const when = reg.match && (reg.match.date || reg.match.year);
-  const lt = "Copyright registration found via " +
-    (reg.sources || []).map((s) => s.toUpperCase()).join(", ") +
-    (when ? "\nRegistered " + when : "") +
-    (reg.match && reg.match.reg_number ? " (" + reg.match.reg_number + ")" : "");
-  return { left: pdAge ? "purple" : "yellow", right: rc, lt, rt };
+  if (e.pdAge)
+    return { left: "blue", right: "blue", rt,
+      lt: "Public domain by age; no registration record found" };
+  // no record: a "no renewal found" verdict has nothing backing it
+  return { left: "gray", right: e.renewedId || e.autoRen || e.post63 ? rc : "blue",
+    lt: noRec,
+    rt: e.renewedId || e.autoRen || e.post63 ? rt : "No registration record — renewal not assessable" };
 }
 
 function renderCrTag(b, status) {
@@ -2095,13 +2140,16 @@ function renderCrTag(b, status) {
 
 // book: {title, author, year}; status: copyright_status string, or undefined to
 // fetch it (WHL / unchecked rows). Checked rows pass their checks.copyright_status.
+// undefined while the offline status is still being fetched
+function crStatusFor(b) {
+  const cached = crStatusCache().get(crStatusKey(b));
+  if (cached === undefined) queueCrStatus(b);
+  return cached;
+}
+
 function copyrightTag(book, status) {
   const b = { title: book.title, author: book.author, year: book.year };
-  if (status === undefined) {
-    const cached = crStatusCache().get(crStatusKey(b));
-    if (cached === undefined) queueCrStatus(b);
-    else status = cached;
-  }
+  if (status === undefined) status = crStatusFor(b);
   return renderCrTag(b, status);
 }
 function copyrightCell(row) {
@@ -6087,6 +6135,44 @@ function infoRow(label, valueHtml, cls) {
     `<span class="info-v">${valueHtml}</span></div>`;
 }
 
+// The records behind the copyright tag, spelled out: the registration (whether
+// found in a register or merely cited by the renewal), and the renewal itself.
+function infoCopyright(b, status) {
+  const key = { title: b.title, author: b.author, year: b.year };
+  if (status === undefined) status = crStatusFor(key);
+  const sec = (rows) => `<div class="info-sec"><div class="info-sec-h">Copyright</div>${rows}</div>`;
+  if (status === undefined) return sec(infoRow("Status", "Checking …"));
+  if (!status) return "";
+
+  const e = crEvidence(key, status);
+  let h = infoRow("Status", esc(status));
+
+  const rec = e.record;
+  if (rec) {
+    h += infoRow("Registration",
+      esc([rec.number || "(unnumbered)", rec.date].filter(Boolean).join(" · ")));
+    if (rec.via) h += infoRow("Source", esc(rec.via), "info-sub");
+    if (rec.title)
+      h += infoRow("Registered as", esc(rec.title + (rec.author ? " — " + rec.author : "")), "info-sub");
+  } else if (e.regPending || (e.renewedId && e.renPending)) {
+    h += infoRow("Registration", "Checking …");
+  } else if (!copyrightSources().length) {
+    h += infoRow("Registration", "Lookup disabled");
+  } else {
+    h += infoRow("Registration", "No record found");
+  }
+
+  if (e.renewedId) {
+    const r = e.renewal;
+    h += infoRow("Renewal", esc([e.renewedId,
+      r && (crDate(r.renewal_date) || r.renewal_year)].filter(Boolean).join(" · ")) +
+      (!r && e.renPending ? " <span class='info-sub'>checking …</span>" : ""));
+  } else if (e.notRen) {
+    h += infoRow("Renewal", "No renewal record found");
+  }
+  return sec(h);
+}
+
 function infoStatusRow(label, st) {
   const dot = st.cls ? `<span class="info-dot ${st.cls}"></span>` : "";
   const val = st.url
@@ -6190,8 +6276,6 @@ function renderInfoPane() {
     h += infoStatusRow("WHL", infoWhlStatus(row));
     h += infoStatusRow("Internet Archive", infoScanStatus(row, "internet_archive"));
     h += infoStatusRow("HathiTrust", infoScanStatus(row, "hathitrust"));
-    const cp = row.checks && row.checks.copyright_status;
-    if (cp) h += infoRow("Copyright", esc(cp));
     const dl = dlState(row);
     const dlText = { done: "Downloaded", downloading: "Downloading…", failed: "Download failed" }[dl];
     if (dlText) h += infoStatusRow("Download",
@@ -6200,6 +6284,9 @@ function renderInfoPane() {
     if (lpdf) h += infoRow("Local scan", esc(lpdf));
     h += `</div>`;
   }
+  // the copyright + renewal records behind the tag (works for any book, not
+  // just checked rows: the offline status is fetched on demand)
+  h += infoCopyright(b, row && row.checks ? row.checks.copyright_status : undefined);
   const sk = setKeyOf(b), cnt = setDefinedCount(sk), vn = volNum(b);
   if (cnt > 0 || vn > 0) {
     h += `<div class="info-sec"><div class="info-sec-h">Volume set</div>`;

@@ -293,14 +293,22 @@ indexes load once at server start):
   top-left = the registration record (looked up online per book), bottom-right
   = the renewal:
 
-  | half | purple | yellow | red | green | orange | blue | gray |
+  | half | magenta | yellow | red | green | orange | blue | gray |
   | --- | --- | --- | --- | --- | --- | --- | --- |
-  | registration | registered, but PD by age | registered 1931–1963 | published after 1963 | — | — | PD by age, no record | no record found |
-  | renewal | — | — | renewal on file, or after 1977 | registered, never renewed | auto-renewed | PD by age, or not assessable | unknown |
+  | registration | registered, but PD by age | registered 1931–1963 | registered, published after 1963 | — | — | PD by age, no record | no record found |
+  | renewal | — | — | renewal on file, or published from 1978 | registered, never renewed | auto-renewed | PD by age, or not assessable | unknown |
 
-  A "no renewal found" result is only believed when a registration backs it
-  up; without one the renewal half stays blue. Both halves name their dates in
-  the tooltip (`/api/copyright/renewal` resolves a renewal id to its dates).
+  A "no renewal found" result is only believed when a registration backs it up;
+  without one the renewal half stays blue. Both halves name their records in the
+  tooltip, and the Info pane spells them out in full.
+
+  A registration record comes from either of two places: the online lookup, or
+  the renewal record itself, which cites the registration it renews (`OREG` +
+  `ODAT`). A renewal cannot exist without a registration, so that citation *is*
+  a record — Hollingsworth's *Flower Chronicles* renews `A343340`, which no
+  searched register holds. Works published after 1963 are not automatically in
+  copyright either, so their tooltips cite the registration record rather than
+  inferring a term from the date.
 - `WHL` via the local catalogue copy `whl_catalog.csv`: `YES` with a link
   to the matched catalogue page, `DRFT` (draft only), or `NO`. The WHL
   website is never queried for this check.
