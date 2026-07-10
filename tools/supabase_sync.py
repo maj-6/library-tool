@@ -154,6 +154,27 @@ def list_volumes(cfg: dict, limit: int = 200) -> list[dict]:
     return rows or []
 
 
+# --- volume artifacts: About texts, page texts/translations, margin notes ---------
+# The published bundle beyond the PDF (volume_texts / volume_pages /
+# volume_notes). Composite conflict targets, chunked like everything else.
+
+def upsert_rows(cfg: dict, table: str, on_conflict: str, rows: list[dict],
+                chunk: int = 200) -> int:
+    pushed = 0
+    for i in range(0, len(rows), chunk):
+        batch = rows[i:i + chunk]
+        _rest(cfg, "POST", f"{table}?on_conflict={on_conflict}", batch,
+              prefer="resolution=merge-duplicates,return=minimal")
+        pushed += len(batch)
+    return pushed
+
+
+def delete_rows(cfg: dict, table: str, filters: str) -> None:
+    """DELETE with a caller-built PostgREST filter string. The caller is
+    trusted to scope it to one slug — this is the desktop's service key."""
+    _rest(cfg, "DELETE", f"{table}?{filters}", prefer="return=minimal")
+
+
 # --- books mirror ----------------------------------------------------------------
 
 def push_books(cfg: dict, rows: list[dict], chunk: int = 200) -> int:

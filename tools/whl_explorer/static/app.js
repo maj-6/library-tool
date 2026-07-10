@@ -78,6 +78,7 @@ const state = {
   builds: {},                 // book builder entries (id -> build)
   buildSel: null,             // selected build id
   taxonomy: {},               // category nodes (id -> {name, parent})
+  anSel: null,                // build open in the Analyze tab
   buildFolder: null,          // entry-folder info for the selected build
   downloads: new Map(),
   dlTimers: new Map(),
@@ -1560,7 +1561,7 @@ function initHome() {
 // --- tabs + header -----------------------------------------------------------
 
 const TAB_TITLES = { home: "Home", checked: "Catalogs", upload: "Editor",
-                     ocr: "OCR", infotab: "Info" };
+                     ocr: "OCR", analyze: "Analyze", infotab: "Info" };
 
 function setHeader(tabId) {
   // Both the visible title bar and the OS window title carry the active tab:
@@ -1598,6 +1599,7 @@ function initTabs() {
       // refresh the folder list on every visit — builds/folders may have
       // changed in the Editor tab meanwhile
       if (tab.dataset.tab === "ocr") loadOcrBooks().then(renderOcrTab);
+      if (tab.dataset.tab === "analyze") renderAnalyze();
     });
   }
   setHeader("home");
@@ -7100,6 +7102,567 @@ async function saveManualSource(clear) {
   closeManualSource();
 }
 
+// --- Analyze tab -------------------------------------------------------------------
+// AI over VERIFIED builds (status ready/uploaded): summary, About article,
+// category suggestions, page-aligned translations, anchored annotations, and
+// the relevance assessment (internal only). Long jobs run server-side and are
+// polled like OCR jobs. DeepSeek is the default provider (Settings > AI).
+
+let anAboutMd = null;          // live markdown editor for the About article
+const anJobs = new Map();      // job id -> {kind, buildId}
+let anPollTimer = null;
+
+function anSelected() {
+  return state.anSel && state.builds[state.anSel] ? state.builds[state.anSel] : null;
+}
+
+function anAnalyzable(b) { return b.status === "ready" || b.status === "uploaded"; }
+
+async function renderAnalyze() {
+  await loadBuilds();
+  renderAnList();
+  renderAnMain();
+}
+
+function renderAnList() {
+  const ul = el("an-list");
+  const items = Object.values(state.builds)
+    .sort((a, b) => (a.title || "").localeCompare(b.title || ""));
+  ul.innerHTML = items.map((b) => {
+    const ok = anAnalyzable(b);
+    const sel = state.anSel === b.id;
+    return `<li class="build-item an-item${sel ? " active" : ""}${ok ? "" : " an-locked"}"
+      data-id="${esc(b.id)}" ${ok ? "" : 'data-tip="Mark it verified in the Editor first"'}>
+      <div class="bi-title">${esc(b.title || "(untitled)")}</div>
+      <div class="bi-meta">${esc(b.authors || "")}${b.year ? " · " + esc(b.year) : ""}
+        · ${b.status === "uploaded" ? "published" : esc(b.status)}</div></li>`;
+  }).join("") || `<li class="empty">No entries yet — create one in the Editor.</li>`;
+}
+
+function anSelect(id) {
+  const b = state.builds[id];
+  if (!b || !anAnalyzable(b)) return;
+  state.anSel = id;
+  renderAnList();
+  renderAnMain();
+}
+
+function activeAnPane() {
+  const t = document.querySelector("#an-tabs .pane-tab.active");
+  return t ? t.dataset.antab : "an-overview";
+}
+
+function switchAnPane(id) {
+  document.querySelectorAll("#an-tabs .pane-tab").forEach((t) =>
+    t.classList.toggle("active", t.dataset.antab === id));
+  document.querySelectorAll("#analyze .an-pane").forEach((p) =>
+    p.classList.toggle("active", p.id === id));
+  renderAnPane(id);
+}
+
+function renderAnMain() {
+  const b = anSelected();
+  el("an-empty").hidden = !!b;
+  el("an-work").hidden = !b;
+  if (!b) return;
+  el("an-title").textContent = b.title || "(untitled)";
+  el("an-sub").textContent =
+    `${b.authors || ""}${b.year ? " · " + b.year : ""} · ` +
+    (b.status === "uploaded" ? "published" : "verified");
+  renderAnPane(activeAnPane());
+}
+
+function renderAnPane(id) {
+  const b = anSelected();
+  if (!b) return;
+  if (id === "an-overview") loadAnOverview(b);
+  else if (id === "an-cats") renderAnCats(b);
+  else if (id === "an-trans") loadAnTranslations(b);
+  else if (id === "an-notes") loadAnNotes(b);
+  else if (id === "an-rel") renderAnRelevance(b);
+  else if (id === "an-bundle") renderAnBundle(b);
+}
+
+// --- jobs: start + poll -------------------------------------------------------
+
+async function anStartJob(path, body, label) {
+  el("an-msg").textContent = "";
+  try {
+    const res = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      el("an-msg").textContent = data.error || "failed";
+      statusErr(`ANALYZE :: ${(data.error || "FAILED").toUpperCase()}`);
+      return null;
+    }
+    anJobs.set(data.job, { kind: label, buildId: body.build_id });
+    status(`ANALYZE :: ${label.toUpperCase()} STARTED`);
+    anEnsurePolling();
+    return data;
+  } catch (e) {
+    el("an-msg").textContent = "request failed";
+    return null;
+  }
+}
+
+function anEnsurePolling() {
+  if (anPollTimer || !anJobs.size) return;
+  anPollTimer = setInterval(async () => {
+    for (const [id, meta] of [...anJobs]) {
+      let job = null;
+      try {
+        const res = await fetch(`/api/analyze/job/${id}`);
+        if (res.status === 404) { anJobs.delete(id); continue; }
+        job = await res.json();
+      } catch (e) { continue; }
+      const pct = job.total ? Math.round((job.done / job.total) * 100) : 0;
+      status(`ANALYZE :: ${meta.kind.toUpperCase()} :: ${job.done}/${job.total} (${pct}%)` +
+        (job.errors ? ` :: ${job.errors} ERRORS` : ""));
+      if (job.status.startsWith("done") || job.status === "error") {
+        anJobs.delete(id);
+        if (job.status === "error") {
+          statusErr(`ANALYZE :: ${meta.kind.toUpperCase()} FAILED :: ${job.error}`);
+          el("an-msg").textContent = job.error;
+        } else {
+          status(`ANALYZE :: ${meta.kind.toUpperCase()} ${job.status.toUpperCase()}` +
+            (job.note ? ` :: ${job.note}` : ""));
+          if (meta.kind === "relevance") await loadBuilds(true);
+          if (state.anSel === meta.buildId) renderAnPane(activeAnPane());
+        }
+      }
+    }
+    if (!anJobs.size) { clearInterval(anPollTimer); anPollTimer = null; }
+  }, 1500);
+}
+
+// --- Overview: summary + About article -----------------------------------------
+
+async function loadAnOverview(b) {
+  try {
+    const [s, a] = await Promise.all([
+      fetch(`/api/builds/${b.id}/summary`).then((r) => r.json()),
+      fetch(`/api/builds/${b.id}/about`).then((r) => r.json()),
+    ]);
+    if (state.anSel !== b.id) return;   // stale response
+    el("an-summary").textContent = (s.text || "").trim() || "No summary yet.";
+    // don't clobber an in-progress edit with a background refresh
+    if (anAboutMd && document.activeElement?.closest?.("#an-about-editor") == null) {
+      anAboutMd.set(a.text || "");
+    }
+  } catch (e) { /* leave the pane as-is */ }
+}
+
+// --- Categories: assignment + suggestions --------------------------------------
+
+let anSuggestions = [];
+
+function renderAnCats(b) {
+  const picker = catPickers["an-cat-picker"];
+  picker.set(b.category_ids || []);
+  renderAnSuggestions();
+}
+
+function renderAnSuggestions() {
+  const host = el("an-sugg");
+  el("an-sugg-all").hidden = !anSuggestions.some((s) => s.exists && !s.added);
+  if (!anSuggestions.length) {
+    host.innerHTML = `<p class="pane-note">No suggestions yet.</p>`;
+    return;
+  }
+  host.innerHTML = anSuggestions.map((s, i) =>
+    `<div class="an-sugg-row">
+      <button class="cad-btn tiny" data-sg="${i}" type="button"
+        ${s.added ? "disabled" : ""}>${s.added ? "Added" : s.exists ? "Assign" : "Create + assign"}</button>
+      <span class="an-sugg-path${s.exists ? "" : " an-sugg-new"}">${esc(s.path.join(" › "))}</span>
+      <span class="an-sugg-why">${esc(s.reason || "")}</span>
+    </div>`).join("");
+}
+
+// a novel suggested path: create missing nodes along the chain, return leaf id
+async function anCreatePath(path) {
+  let parent = "";
+  for (const name of path) {
+    const low = name.toLowerCase();
+    let nid = Object.keys(state.taxonomy).find((k) =>
+      (state.taxonomy[k].parent || "") === parent &&
+      (state.taxonomy[k].name || "").trim().toLowerCase() === low);
+    if (!nid) {
+      const res = await fetch("/api/categories", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, parent }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) return "";
+      state.taxonomy[data.id] = data.node;
+      nid = data.id;
+    }
+    parent = nid;
+  }
+  return parent;
+}
+
+async function anAssignSuggestion(i) {
+  const b = anSelected();
+  const s = anSuggestions[i];
+  if (!b || !s || s.added) return;
+  const nid = s.exists ? s.id : await anCreatePath(s.path);
+  if (!nid) { el("an-msg").textContent = "could not create the category"; return; }
+  const ids = (b.category_ids || []).slice();
+  if (!ids.includes(nid)) ids.push(nid);
+  if (await patchBuild(b.id, { category_ids: ids }, "assign category")) {
+    s.added = true;
+    await loadTaxonomy();
+    renderAnCats(state.builds[b.id]);
+  }
+}
+
+// --- Translations ----------------------------------------------------------------
+
+async function loadAnTranslations(b) {
+  el("an-trans-view").hidden = true;
+  try {
+    const data = await (await fetch(`/api/builds/${b.id}/translations`)).json();
+    if (state.anSel !== b.id) return;
+    const list = data.translations || [];
+    el("an-trans-list").innerHTML = list.length
+      ? list.map((t) =>
+        `<div class="an-trans-row">
+          <span class="mono">${esc(t.lang)}</span>
+          <span class="tool-label">${t.pages} pages</span>
+          <button class="cad-btn tiny" data-tview="${esc(t.lang)}" type="button">View</button>
+          <button class="cad-btn tiny danger" data-tdel="${esc(t.lang)}" type="button">Delete</button>
+        </div>`).join("")
+      : `<p class="pane-note">No translations yet. Pages translate one by one and
+         partial runs resume where they stopped.</p>`;
+  } catch (e) { /* keep pane */ }
+}
+
+// --- Annotations -----------------------------------------------------------------
+
+async function loadAnNotes(b) {
+  try {
+    const data = await (await fetch(`/api/builds/${b.id}/annotations`)).json();
+    if (state.anSel !== b.id) return;
+    const notes = (data.doc && data.doc.notes) || [];
+    const counts = { approved: 0, suggested: 0, rejected: 0 };
+    notes.forEach((n) => { counts[n.status] = (counts[n.status] || 0) + 1; });
+    el("an-notes-count").textContent = notes.length
+      ? `${counts.approved} approved · ${counts.suggested} suggested · ${counts.rejected} rejected`
+      : "";
+    el("an-notes-list").innerHTML = notes.length
+      ? notes.sort((a, x) => (a.page - x.page) || (a.created_at || "").localeCompare(x.created_at || ""))
+        .map((n) =>
+          `<div class="an-note an-note-${esc(n.status)}" data-note="${esc(n.id)}">
+            <div class="an-note-head">
+              <span class="an-note-page">p.${n.page}</span>
+              <span class="an-note-kind">${esc(n.kind || "")}</span>
+              <span class="tb-spacer"></span>
+              <button class="cad-btn tiny" data-napp="1" type="button"
+                ${n.status === "approved" ? "disabled" : ""}>Approve</button>
+              <button class="cad-btn tiny" data-nrej="1" type="button"
+                ${n.status === "rejected" ? "disabled" : ""}>Reject</button>
+              <button class="cad-btn tiny danger" data-ndel="1" type="button">&#10005;</button>
+            </div>
+            ${n.quote ? `<div class="an-note-quote">&ldquo;${esc(n.quote)}&rdquo;</div>` : ""}
+            <div class="an-note-body" data-tip="Click to edit">${esc(n.body)}</div>
+          </div>`).join("")
+      : `<p class="pane-note">No annotations yet. Generated notes arrive as
+         suggestions; only approved ones publish.</p>`;
+  } catch (e) { /* keep pane */ }
+}
+
+async function anNotePatch(bid, payload) {
+  const res = await fetch(`/api/builds/${bid}/annotations`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.ok && data.ok) loadAnNotes(state.builds[bid]);
+  else el("an-msg").textContent = data.error || "update failed";
+}
+
+// --- Relevance ---------------------------------------------------------------------
+
+function anCriteria() {
+  const c = state.settings.relevanceCriteria;
+  return Array.isArray(c) ? c : [];
+}
+
+function renderAnRelevance(b) {
+  const crits = anCriteria();
+  el("an-crit").innerHTML = crits.length
+    ? crits.map((c, i) =>
+      `<div class="an-crit-row" data-ci="${i}">
+        <input class="cad-input an-crit-name" value="${esc(c.name || "")}"
+               placeholder="criterion" />
+        <input class="cad-input an-crit-desc" value="${esc(c.description || "")}"
+               placeholder="what makes a work score high" />
+        <button class="cad-btn tiny danger" data-cdel="${i}" type="button">&#10005;</button>
+      </div>`).join("")
+    : `<p class="pane-note">No criteria yet — define what makes a work relevant
+       to the collection, then assess. Scores stay internal: they are never
+       published.</p>`;
+  const r = b.relevance;
+  el("an-relres").innerHTML = !r
+    ? `<p class="pane-note">Not assessed yet.</p>`
+    : `<div class="an-rel-overall">
+         <span class="an-score">${r.overall}/10</span>
+         <span>${esc(r.summary || "")}</span>
+         <span class="tool-label">${esc(r.model || "")} · ${esc((r.assessed_at || "").slice(0, 10))}</span>
+       </div>` +
+      (r.criteria || []).map((c) =>
+        `<div class="an-rel-row">
+          <span class="an-rel-name">${esc(c.name)}</span>
+          <span class="an-bar"><span class="an-bar-fill" style="width:${(c.score || 0) * 10}%"></span></span>
+          <span class="an-score">${c.score}/10</span>
+          <div class="an-rel-why">${esc(c.rationale || "")}</div>
+        </div>`).join("");
+}
+
+function anSaveCriteria() {
+  const rows = [...document.querySelectorAll("#an-crit .an-crit-row")];
+  state.settings.relevanceCriteria = rows.map((r, i) => ({
+    id: (anCriteria()[i] || {}).id || String(Date.now()) + i,
+    name: r.querySelector(".an-crit-name").value.trim(),
+    description: r.querySelector(".an-crit-desc").value.trim(),
+  })).filter((c) => c.name);
+  saveSettings();
+}
+
+// --- Bundle ---------------------------------------------------------------------
+
+async function renderAnBundle(b) {
+  const bundle = b.bundle || {};
+  let langs = [];
+  try {
+    const data = await (await fetch(`/api/builds/${b.id}/translations`)).json();
+    langs = (data.translations || []).map((t) => t.lang);
+  } catch (e) { /* offline: no langs */ }
+  const chosen = bundle.translations || [];
+  const row = (id, label, checked, tip) =>
+    `<label class="an-bundle-row" data-tip="${esc(tip)}">
+      <input type="checkbox" id="${id}" ${checked ? "checked" : ""} /> ${label}</label>`;
+  el("an-bundle-opts").innerHTML =
+    row("anb-about", "About article", bundle.about,
+        "about.md — shown on the book's page in the public library") +
+    row("anb-pages", "Original text, page-aligned", bundle.pages_text,
+        "the OCR text layer, one row per page, for the reader's text panel") +
+    row("anb-notes", "Approved annotations", bundle.annotations,
+        "margin notes — only the ones marked approved") +
+    (langs.length
+      ? `<div class="tool-label" style="margin-top:6px">Translations</div>` +
+        langs.map((l) =>
+          `<label class="an-bundle-row"><input type="checkbox" data-anb-lang="${esc(l)}"
+            ${chosen.includes(l) ? "checked" : ""} /> ${esc(l)}</label>`).join("")
+      : "");
+}
+
+async function anSaveBundle() {
+  const b = anSelected();
+  if (!b) return;
+  const bundle = {
+    about: el("anb-about").checked,
+    pages_text: el("anb-pages").checked,
+    annotations: el("anb-notes").checked,
+    translations: [...document.querySelectorAll("[data-anb-lang]")]
+      .filter((x) => x.checked).map((x) => x.dataset.anbLang),
+  };
+  if (await patchBuild(b.id, { bundle }, "edit publish bundle")) {
+    el("an-bundle-msg").textContent = b.status === "uploaded"
+      ? "Saved — republish from the Editor to apply"
+      : "Saved — applies when the entry publishes";
+  } else el("an-bundle-msg").textContent = "save failed";
+}
+
+// --- wiring ----------------------------------------------------------------------
+
+function initAnalyze() {
+  makeCatPicker("an-cat-picker", async (ids) => {
+    const b = anSelected();
+    if (b && await patchBuildRaw(b.id, { category_ids: ids }, true)) {
+      status("CATEGORIES UPDATED");
+    }
+  });
+
+  el("an-list").addEventListener("click", (ev) => {
+    const li = ev.target.closest(".an-item");
+    if (li) anSelect(li.dataset.id);
+  });
+  for (const t of document.querySelectorAll("#an-tabs .pane-tab")) {
+    t.addEventListener("click", () => switchAnPane(t.dataset.antab));
+  }
+
+  anAboutMd = createMdEditor(el("an-about-editor"));
+
+  el("an-summarize").addEventListener("click", () => {
+    const b = anSelected();
+    if (b) anStartJob("/api/analyze/summarize", { build_id: b.id }, "summarize");
+  });
+  el("an-about-draft").addEventListener("click", async () => {
+    const b = anSelected();
+    if (!b) return;
+    const existing = anAboutMd.get().trim();
+    if (existing && !confirm("Replace the current About draft?")) return;
+    anStartJob("/api/analyze/about",
+               { build_id: b.id, overwrite: !!existing }, "about");
+  });
+  el("an-about-save").addEventListener("click", async () => {
+    const b = anSelected();
+    if (!b) return;
+    const res = await fetch(`/api/builds/${b.id}/about`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: anAboutMd.get() }),
+    });
+    const data = await res.json().catch(() => ({}));
+    el("an-msg").textContent = res.ok && data.ok ? "About saved" : (data.error || "save failed");
+  });
+
+  el("an-suggest").addEventListener("click", async () => {
+    const b = anSelected();
+    if (!b) return;
+    el("an-sugg").innerHTML = `<p class="pane-note">Asking…</p>`;
+    try {
+      const res = await fetch("/api/analyze/categories", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ build_id: b.id }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) {
+        el("an-sugg").innerHTML =
+          `<p class="pane-note">${esc(data.error || "failed")}</p>`;
+        return;
+      }
+      anSuggestions = (data.suggestions || []).map((s) =>
+        Object.assign(s, { added: s.exists && (b.category_ids || []).includes(s.id) }));
+      renderAnSuggestions();
+    } catch (e) {
+      el("an-sugg").innerHTML = `<p class="pane-note">request failed</p>`;
+    }
+  });
+  el("an-sugg").addEventListener("click", (ev) => {
+    const btn = ev.target.closest("[data-sg]");
+    if (btn) anAssignSuggestion(parseInt(btn.dataset.sg, 10));
+  });
+  el("an-sugg-all").addEventListener("click", async () => {
+    for (let i = 0; i < anSuggestions.length; i++) {
+      if (anSuggestions[i].exists && !anSuggestions[i].added) {
+        await anAssignSuggestion(i);
+      }
+    }
+    renderAnSuggestions();
+  });
+
+  el("an-translate").addEventListener("click", () => {
+    const b = anSelected();
+    const lang = el("an-lang").value.trim().toLowerCase();
+    if (!b || !lang) { el("an-trans-msg").textContent = "language code?"; return; }
+    el("an-trans-msg").textContent = "";
+    anStartJob("/api/analyze/translate", { build_id: b.id, lang },
+               `translate ${lang}`);
+  });
+  el("an-trans-list").addEventListener("click", async (ev) => {
+    const b = anSelected();
+    if (!b) return;
+    const view = ev.target.closest("[data-tview]");
+    const del = ev.target.closest("[data-tdel]");
+    if (view) {
+      const data = await (await fetch(
+        `/api/builds/${b.id}/translations/${encodeURIComponent(view.dataset.tview)}`)).json();
+      el("an-trans-view").textContent = data.text || "";
+      el("an-trans-view").hidden = false;
+    } else if (del) {
+      if (!confirm(`Delete the ${del.dataset.tdel} translation?`)) return;
+      await fetch(`/api/builds/${b.id}/translations/${encodeURIComponent(del.dataset.tdel)}`,
+                  { method: "DELETE" });
+      loadAnTranslations(b);
+    }
+  });
+
+  el("an-annotate").addEventListener("click", () => {
+    const b = anSelected();
+    if (b) anStartJob("/api/analyze/annotate", { build_id: b.id }, "annotate");
+  });
+  el("an-notes-list").addEventListener("click", (ev) => {
+    const b = anSelected();
+    const box = ev.target.closest(".an-note");
+    if (!b || !box) return;
+    const id = box.dataset.note;
+    if (ev.target.closest("[data-napp]")) {
+      anNotePatch(b.id, { update: { id, status: "approved" } });
+    } else if (ev.target.closest("[data-nrej]")) {
+      anNotePatch(b.id, { update: { id, status: "rejected" } });
+    } else if (ev.target.closest("[data-ndel]")) {
+      anNotePatch(b.id, { remove: id });
+    } else if (ev.target.closest(".an-note-body")) {
+      const bodyEl = box.querySelector(".an-note-body");
+      const old = bodyEl.textContent;
+      bodyEl.innerHTML = `<textarea class="cad-input an-note-edit">${esc(old)}</textarea>`;
+      const ta = bodyEl.querySelector("textarea");
+      ta.focus();
+      const done = () => {
+        const v = ta.value.trim();
+        if (v && v !== old) anNotePatch(b.id, { update: { id, body: v } });
+        else loadAnNotes(b);
+      };
+      ta.addEventListener("blur", done);
+      ta.addEventListener("keydown", (kev) => {
+        if (kev.key === "Escape") { kev.stopPropagation(); ta.value = old; ta.blur(); }
+      });
+    }
+  });
+
+  el("an-crit-add").addEventListener("click", () => {
+    anSaveCriteria();
+    state.settings.relevanceCriteria = anCriteria().concat(
+      [{ id: String(Date.now()), name: "", description: "" }]);
+    const b = anSelected();
+    if (b) renderAnRelevance(b);
+  });
+  el("an-crit").addEventListener("change", anSaveCriteria);
+  el("an-crit").addEventListener("click", (ev) => {
+    const d = ev.target.closest("[data-cdel]");
+    if (!d) return;
+    const crits = anCriteria();
+    crits.splice(parseInt(d.dataset.cdel, 10), 1);
+    state.settings.relevanceCriteria = crits;
+    saveSettings();
+    const b = anSelected();
+    if (b) renderAnRelevance(b);
+  });
+  el("an-assess").addEventListener("click", () => {
+    anSaveCriteria();
+    const b = anSelected();
+    if (!b) return;
+    if (!anCriteria().length) {
+      el("an-msg").textContent = "define at least one criterion first";
+      return;
+    }
+    anStartJob("/api/analyze/relevance", { build_id: b.id }, "relevance");
+  });
+
+  el("an-bundle-save").addEventListener("click", anSaveBundle);
+
+  // Editor -> Analyze jump for the open build
+  el("b-analyze").addEventListener("click", () => {
+    const b = currentBuild();
+    if (!b) return;
+    if (!anAnalyzable(b)) {
+      el("build-msg").textContent = "mark it verified first";
+      return;
+    }
+    state.anSel = b.id;
+    document.querySelector('#tabs .tab[data-tab="analyze"]').click();
+  });
+}
+
 // --- category taxonomy -------------------------------------------------------------
 // The hierarchical vocabulary behind category_ids (docs/library-analyze-design.md).
 // state.taxonomy holds the {id: {name, parent}} node map from /api/categories;
@@ -11448,6 +12011,7 @@ function init() {
   boot("attention popover", initAttnPop);
   boot("review queue", initReviewWin);
   boot("categories", initCategories);
+  boot("analyze", initAnalyze);
   loadTaxonomy();   // async; pickers and cells refresh when the vocab lands
   el("b-pdf-attach").addEventListener("click", () => attachPdfFile());
   el("b-pdf_file").addEventListener("keydown", (ev) => {

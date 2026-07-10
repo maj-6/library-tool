@@ -81,6 +81,7 @@
     <button class="tab" data-tab="checked">Catalogs</button>
     <button class="tab" data-tab="upload">Editor</button>
     <button class="tab" data-tab="ocr">OCR</button>
+    <button class="tab" data-tab="analyze">Analyze</button>
     <button class="tab" data-tab="infotab">Info</button>
     <span class="tb-spacer"></span>
     <div class="tb-group">
@@ -605,6 +606,8 @@
                     data-icon="check" data-tip="Mark verified"></button>
             <button id="build-upload" class="cad-btn icon-btn" type="button"
                     data-icon="export" data-tip="Publish to the Library Tool cloud — uploads the PDF and lists the volume on the website"></button>
+            <button id="b-analyze" class="cad-btn tiny" type="button"
+                    data-tip="Open this entry in the Analyze tab (verified entries only)">Analyze</button>
             <span id="b-verified-tag" class="foot-tag tag-verified" hidden>Verified</span>
             <span class="tool-label" id="build-msg"></span>
           </div>
@@ -846,6 +849,118 @@
           <tbody id="ocr-queue-rows"></tbody>
         </table>
         <p id="ocr-queue-empty" class="empty">No OCR jobs</p>
+      </div>
+    </section>
+
+    <!-- ANALYZE: AI over verified entries — summaries, categories,
+         translations, annotations, relevance, and the publish bundle -->
+    <section id="analyze" class="panel-view">
+      <div id="an-split">
+        <aside id="an-books">
+          <div class="pane-bar"><span class="tool-label">Verified entries</span></div>
+          <ul id="an-list"></ul>
+        </aside>
+        <div id="an-main">
+          <div id="an-empty" class="empty">Select a verified entry.
+            Drafts must be marked verified in the Editor first.</div>
+          <div id="an-work" hidden>
+            <div id="an-head">
+              <span id="an-title"></span>
+              <span id="an-sub" class="tool-label"></span>
+              <span class="tb-spacer"></span>
+              <span class="tool-label" id="an-msg"></span>
+            </div>
+            <div class="pane-tabs" id="an-tabs">
+              <button class="pane-tab active" data-antab="an-overview" type="button">Overview</button>
+              <button class="pane-tab" data-antab="an-cats" type="button">Categories</button>
+              <button class="pane-tab" data-antab="an-trans" type="button">Translations</button>
+              <button class="pane-tab" data-antab="an-notes" type="button">Annotations</button>
+              <button class="pane-tab" data-antab="an-rel" type="button">Relevance</button>
+              <button class="pane-tab" data-antab="an-bundle" type="button">Bundle</button>
+            </div>
+
+            <div class="an-pane active" id="an-overview">
+              <div class="an-col">
+                <div class="pane-bar">
+                  <span class="tool-label">Summary (internal)</span>
+                  <button id="an-summarize" class="cad-btn tiny" type="button"
+                          data-tip="Generate a cataloguer's summary from the OCR text">Generate</button>
+                </div>
+                <pre id="an-summary" class="an-text"></pre>
+              </div>
+              <div class="an-col">
+                <div class="pane-bar">
+                  <span class="tool-label">About article (publishable)</span>
+                  <button id="an-about-draft" class="cad-btn tiny" type="button"
+                          data-tip="Draft the About article from the summary">Draft from summary</button>
+                  <button id="an-about-save" class="cad-btn tiny" type="button"
+                          data-tip="Save the article to the entry folder">Save</button>
+                </div>
+                <div id="an-about-editor"></div>
+              </div>
+            </div>
+
+            <div class="an-pane" id="an-cats">
+              <div class="pane-bar">
+                <span class="tool-label">Assigned categories</span>
+              </div>
+              <div id="an-cat-picker" class="cat-picker"></div>
+              <div class="pane-bar">
+                <span class="tool-label">Suggestions</span>
+                <button id="an-suggest" class="cad-btn tiny" type="button"
+                        data-tip="Ask the model to classify this work against the taxonomy">Suggest</button>
+                <button id="an-sugg-all" class="cad-btn tiny" type="button" hidden
+                        data-tip="Assign every suggestion that matches an existing category">Assign all existing</button>
+              </div>
+              <div id="an-sugg"></div>
+            </div>
+
+            <div class="an-pane" id="an-trans">
+              <div class="pane-bar">
+                <span class="tool-label">Translate to</span>
+                <input id="an-lang" class="cad-input" type="text" size="6"
+                       placeholder="es" data-tip="A language code: es, de, fr, la…" />
+                <button id="an-translate" class="cad-btn tiny" type="button">Translate</button>
+                <span class="tool-label" id="an-trans-msg"></span>
+              </div>
+              <div id="an-trans-list"></div>
+              <pre id="an-trans-view" class="an-text" hidden></pre>
+            </div>
+
+            <div class="an-pane" id="an-notes">
+              <div class="pane-bar">
+                <span class="tool-label">Anchored notes</span>
+                <button id="an-annotate" class="cad-btn tiny" type="button"
+                        data-tip="Propose margin notes anchored to passages">Generate</button>
+                <span class="tool-label" id="an-notes-count"></span>
+              </div>
+              <div id="an-notes-list" class="drafting"></div>
+            </div>
+
+            <div class="an-pane" id="an-rel">
+              <div class="pane-bar">
+                <span class="tool-label">Relevance criteria (yours; internal only)</span>
+                <button id="an-crit-add" class="cad-btn tiny" type="button">Add criterion</button>
+                <button id="an-assess" class="cad-btn tiny" type="button"
+                        data-tip="Score this work against the criteria">Assess</button>
+              </div>
+              <div id="an-crit"></div>
+              <div id="an-relres"></div>
+            </div>
+
+            <div class="an-pane" id="an-bundle">
+              <p class="pane-note">What publishes with this book beyond the PDF.
+                Everything unchecked — and the relevance assessment, always —
+                stays on this machine. Applied on the next publish from the
+                Editor.</p>
+              <div id="an-bundle-opts"></div>
+              <div class="mf-actions">
+                <button id="an-bundle-save" class="cad-btn tiny" type="button">Save bundle</button>
+                <span class="tool-label" id="an-bundle-msg"></span>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -1111,13 +1226,16 @@
           </div>
           <div id="sec-ai" class="settings-sec">
             <div class="settings-head">AI</div>
+            <p class="settings-note">The Analyze tab's provider. DeepSeek is the
+              default — leave base and model blank and paste a key. Any
+              OpenAI-compatible endpoint works.</p>
             <div class="settings-rows">
               <label class="tool-label" for="set-ai-base">API base URL</label>
               <input id="set-ai-base" class="cad-input" spellcheck="false"
-                     placeholder="https://api.openai.com/v1" />
+                     placeholder="https://api.deepseek.com" />
               <label class="tool-label" for="set-ai-model">Model</label>
               <input id="set-ai-model" class="cad-input" spellcheck="false"
-                     placeholder="gpt-5.2" />
+                     placeholder="deepseek-chat" />
               <label class="tool-label" for="set-ai-key">API key</label>
               <input id="set-ai-key" class="cad-input" type="password" spellcheck="false" />
               <label class="tool-label" for="set-ai-instructions">Custom instructions</label>

@@ -762,14 +762,33 @@ _BUILD_FIELDS = ("published_slug",
                  "publisher_city", "edition", "language", "pages",
                  "categories", "category_ids", "description",
                  "pdf_source", "pdf_file",
-                 "pdf_sources",
+                 "pdf_sources", "bundle",
                  "source_url", "notes", "status",
                  "ocr_active", "ocr_verified", "ocr_quality",
                  "title_pages", "attention")
 
 # The structured exceptions to the str() coercion below. `categories` (flat
 # text) is deprecated in favour of category_ids — kept as display fallback.
-_BUILD_LIST_FIELDS = ("pdf_sources", "category_ids")
+# `bundle` picks which Analyze artifacts publish with the book; `relevance`
+# is also structured but deliberately NOT accepted here — only the
+# assessment job writes it.
+_BUILD_LIST_FIELDS = ("pdf_sources", "category_ids", "bundle")
+
+
+def _clean_bundle(raw) -> dict:
+    """What publishes beyond the PDF: {about, annotations, pages_text,
+    translations: [lang]} — everything else the Analyze tab produces stays
+    on this machine (and the service_role-only sync)."""
+    raw = raw if isinstance(raw, dict) else {}
+    langs = []
+    for v in raw.get("translations") or []:
+        code = re.sub(r"[^a-z\-]", "", str(v or "").lower())[:12]
+        if code and code not in langs:
+            langs.append(code)
+    return {"about": bool(raw.get("about")),
+            "annotations": bool(raw.get("annotations")),
+            "pages_text": bool(raw.get("pages_text")),
+            "translations": langs}
 
 
 def _clean_pdf_sources(raw) -> list:
@@ -821,6 +840,7 @@ def api_builds_create():
     build["pdf_sources"] = _clean_pdf_sources(seed.get("pdf_sources"))
     build["category_ids"] = _clean_category_ids(seed.get("category_ids"),
                                                 lib.load_taxonomy()["nodes"])
+    build["bundle"] = _clean_bundle(seed.get("bundle"))
     if build["status"] not in _BUILD_STATUSES:
         build["status"] = "draft"
     build["id"] = lib.gen_id(set(builds))
@@ -847,6 +867,8 @@ def api_builds_update(build_id: str):
             b[f] = _clean_pdf_sources(payload[f])
         elif f == "category_ids":
             b[f] = _clean_category_ids(payload[f], lib.load_taxonomy()["nodes"])
+        elif f == "bundle":
+            b[f] = _clean_bundle(payload[f])
         else:
             b[f] = str(payload[f] or "").strip()
     if b.get("status") not in _BUILD_STATUSES:
@@ -3814,6 +3836,683 @@ def _cloud_cfg() -> dict | None:
 
 
 
+# --- Analyze: AI summaries, categories, translations, annotations, relevance -----
+# DeepSeek by default: with Settings > AI left blank the app talks to
+# https://api.deepseek.com with model deepseek-chat, so pasting a key is the
+# whole setup. Any OpenAI-compatible endpoint works. Credentials are read
+# server-side (_client_settings) because these jobs outlive the page that
+# started them. Only verified builds (status ready/uploaded) are analyzable.
+#
+# Artifacts land in the entry folder — the per-book bundle that already
+# mirrors to R2 — and publishing pushes whatever build.bundle includes to the
+# anon-readable volume_texts / volume_pages / volume_notes tables. The
+# relevance assessment is the deliberate exception: it stays on the build
+# record (service_role-only sync) and never enters a published row.
+
+_AI_DEFAULT_BASE = "https://api.deepseek.com"
+_AI_DEFAULT_MODEL = "deepseek-chat"
+
+
+def _ai_cfg() -> dict:
+    s = _client_settings()
+    return {"base": str(s.get("aiBase") or "").strip() or _AI_DEFAULT_BASE,
+            "model": str(s.get("aiModel") or "").strip() or _AI_DEFAULT_MODEL,
+            "key": str(s.get("aiKey") or "").strip(),
+            "instructions": str(s.get("aiInstructions") or "").strip()}
+
+
+def _ai_chat(cfg: dict, messages: list, json_mode: bool = False,
+             temperature: float = 0.3, timeout: float = 240.0) -> str:
+    """One chat-completions call; returns the assistant text. Raises
+    RuntimeError with the HTTP body truncated to 300 chars, the same error
+    convention every other integration here uses."""
+    if not cfg["key"]:
+        raise RuntimeError("no AI key — set one in Settings > AI "
+                           "(DeepSeek is the default provider)")
+    body = {"model": cfg["model"], "messages": messages,
+            "temperature": temperature}
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
+    req = urllib.request.Request(
+        cfg["base"].rstrip("/") + "/chat/completions",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {cfg['key']}"},
+        method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
+    try:
+        return data["choices"][0]["message"]["content"] or ""
+    except (KeyError, IndexError) as exc:
+        raise RuntimeError("malformed chat response") from exc
+
+
+def _ai_json(cfg: dict, messages: list, temperature: float = 0.2) -> dict:
+    """A JSON-mode call, code fences stripped, parse failure = {}."""
+    raw = _ai_chat(cfg, messages, json_mode=True, temperature=temperature)
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
+    try:
+        out = json.loads(raw)
+        return out if isinstance(out, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+_PAGE_MARK = re.compile(r"^--- page (\d+) ---$", re.M)
+
+
+def _an_pages(text: str) -> dict[int, str]:
+    """Split an OCR doc on its page markers (the client's exact convention);
+    an unmarked doc is one page."""
+    marks = list(_PAGE_MARK.finditer(text))
+    if not marks:
+        return {1: text.strip()} if text.strip() else {}
+    out = {}
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        out[int(m.group(1))] = text[m.end():end].strip()
+    return out
+
+
+def _analyze_doc(bid: str, b: dict) -> tuple[str, str]:
+    """(name, text) of the build's best OCR document: the verified one, the
+    active one, then the conventional names."""
+    d = _entry_dir(bid) / "ocr"
+    candidates = [b.get("ocr_verified"), b.get("ocr_active"),
+                  "compiled.txt", "extracted.txt"]
+    for name in candidates:
+        name = _ocr_name(name) if name else ""
+        if name and (d / name).is_file():
+            return name, (d / name).read_text(encoding="utf-8", errors="replace")
+    return "", ""
+
+
+def _an_meta_line(b: dict) -> str:
+    bits = [b.get("title") or "?"]
+    if b.get("subtitle"):
+        bits.append(b["subtitle"])
+    if b.get("authors"):
+        bits.append(f"by {b['authors']}")
+    for k in ("year", "publisher", "publisher_city", "edition", "language"):
+        if b.get(k):
+            bits.append(str(b[k]))
+    return " — ".join(bits)
+
+
+def _an_gate(bid: str):
+    """The build, or an error response: Analyze works on verified entries."""
+    builds = lib.load_json(BUILDS_PATH, {})
+    b = builds.get(bid)
+    if not b:
+        return None, (jsonify({"ok": False, "error": "no such entry"}), 404)
+    if b.get("status") not in ("ready", "uploaded"):
+        return None, (jsonify({
+            "ok": False,
+            "error": "only verified entries can be analyzed — mark it "
+                     "verified in the Editor first"}), 400)
+    return b, None
+
+
+# --- analyze artifacts: about.md, summary.md, annotations.json, translations/ ----
+
+_an_notes_lock = threading.Lock()
+
+
+def _read_entry_text(bid: str, rel: str) -> str:
+    p = _entry_dir(bid) / rel
+    return p.read_text(encoding="utf-8", errors="replace") if p.is_file() else ""
+
+
+def _write_entry_text(bid: str, rel: str, text: str) -> None:
+    p = _entry_dir(bid) / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8")
+
+
+def _load_annotations(bid: str) -> dict:
+    doc = lib.load_json(_entry_dir(bid) / "annotations.json", None)
+    if not isinstance(doc, dict) or not isinstance(doc.get("notes"), list):
+        return {"version": 1, "notes": []}
+    return doc
+
+
+def _lang_code(raw: str) -> str:
+    return re.sub(r"[^a-z\-]", "", str(raw or "").lower())[:12]
+
+
+def _translations_info(bid: str) -> list[dict]:
+    d = _entry_dir(bid) / "translations"
+    out = []
+    if d.is_dir():
+        for f in sorted(d.glob("*.txt")):
+            pages = _an_pages(f.read_text(encoding="utf-8", errors="replace"))
+            out.append({"lang": f.stem, "pages": len(pages),
+                        "size": f.stat().st_size})
+    return out
+
+
+@app.route("/api/builds/<bid>/about", methods=["GET", "PUT"])
+def api_build_about(bid: str):
+    if request.method == "GET":
+        return jsonify({"ok": True, "text": _read_entry_text(bid, "about.md")})
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    payload = request.get_json(silent=True) or {}
+    _write_entry_text(bid, "about.md", str(payload.get("text") or ""))
+    return jsonify({"ok": True})
+
+
+@app.route("/api/builds/<bid>/summary")
+def api_build_summary(bid: str):
+    return jsonify({"ok": True, "text": _read_entry_text(bid, "summary.md")})
+
+
+@app.route("/api/builds/<bid>/annotations", methods=["GET", "PUT"])
+def api_build_annotations(bid: str):
+    """GET the note list; PUT curation changes: {update: {id, status?, body?,
+    kind?}} or {remove: id}. Wholesale replacement is deliberately absent —
+    notes are curated one by one."""
+    if request.method == "GET":
+        return jsonify({"ok": True, "doc": _load_annotations(bid)})
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    payload = request.get_json(silent=True) or {}
+    with _an_notes_lock:
+        doc = _load_annotations(bid)
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        if payload.get("remove"):
+            doc["notes"] = [n for n in doc["notes"]
+                            if n.get("id") != payload["remove"]]
+        upd = payload.get("update") or {}
+        if upd.get("id"):
+            for n in doc["notes"]:
+                if n.get("id") != upd["id"]:
+                    continue
+                if upd.get("status") in ("suggested", "approved", "rejected"):
+                    n["status"] = upd["status"]
+                if "body" in upd:
+                    n["body"] = str(upd["body"] or "").strip()
+                if "kind" in upd:
+                    n["kind"] = str(upd["kind"] or "").strip()[:24]
+                n["updated_at"] = now
+        lib.save_json(_entry_dir(bid) / "annotations.json", doc)
+    return jsonify({"ok": True, "doc": doc})
+
+
+@app.route("/api/builds/<bid>/translations")
+def api_build_translations(bid: str):
+    return jsonify({"ok": True, "translations": _translations_info(bid)})
+
+
+@app.route("/api/builds/<bid>/translations/<lang>", methods=["GET", "DELETE"])
+def api_build_translation(bid: str, lang: str):
+    lang = _lang_code(lang)
+    p = _entry_dir(bid) / "translations" / f"{lang}.txt"
+    if request.method == "GET":
+        if not p.is_file():
+            abort(404)
+        return jsonify({"ok": True, "lang": lang,
+                        "text": p.read_text(encoding="utf-8", errors="replace")})
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    if p.is_file():
+        p.unlink()
+    return jsonify({"ok": True})
+
+
+# --- analyze jobs: one daemon thread each, polled like OCR jobs ------------------
+
+_an_jobs: dict = {}
+_an_jobs_lock = threading.Lock()
+_an_write_lock = threading.Lock()
+
+
+def _an_job_new(bid: str, kind: str, total: int) -> dict:
+    job = {"id": lib.gen_id(set(_an_jobs)), "build_id": bid, "kind": kind,
+           "done": 0, "total": total, "errors": 0,
+           "status": "running", "error": "", "note": ""}
+    with _an_jobs_lock:
+        _an_jobs[job["id"]] = job
+    return job
+
+
+def _an_job_start(bid: str, kind: str, total: int, target) -> dict:
+    job = _an_job_new(bid, kind, total)
+    threading.Thread(target=target, args=(job,), daemon=True).start()
+    return job
+
+
+def _an_finish(job: dict, error: str = "") -> None:
+    with _an_jobs_lock:
+        job["status"] = "error" if error else (
+            "done (with errors)" if job["errors"] else "done")
+        job["error"] = error
+
+
+@app.route("/api/analyze/job/<job_id>")
+def api_analyze_job(job_id: str):
+    with _an_jobs_lock:
+        job = _an_jobs.get(job_id)
+        if job is None:
+            abort(404)
+        return jsonify(dict(job))
+
+
+# chunk pages to a character budget; DeepSeek's context is generous but a
+# 400-page herbal is not one call
+def _an_chunks(pages: dict[int, str], budget: int = 22000) -> list[tuple[list[int], str]]:
+    chunks, nums, buf, size = [], [], [], 0
+    for n in sorted(pages):
+        t = pages[n]
+        if size + len(t) > budget and buf:
+            chunks.append((nums, "\n\n".join(buf)))
+            nums, buf, size = [], [], 0
+        nums = nums + [n]
+        buf.append(f"[page {n}]\n{t}")
+        size += len(t)
+    if buf:
+        chunks.append((nums, "\n\n".join(buf)))
+    return chunks
+
+
+@app.route("/api/analyze/summarize", methods=["POST"])
+def api_analyze_summarize():
+    p = request.get_json(silent=True) or {}
+    bid = str(p.get("build_id") or "").strip()
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    name, text = _analyze_doc(bid, b)
+    pages = _an_pages(text)
+    if not pages:
+        return jsonify({"ok": False, "error":
+                        "no OCR text for this entry — extract or run OCR first"}), 400
+    cfg = _ai_cfg()
+    chunks = _an_chunks(pages)
+    meta = _an_meta_line(b)
+
+    def run(job):
+        try:
+            notes = []
+            for i, (nums, chunk) in enumerate(chunks):
+                out = _ai_chat(cfg, [
+                    {"role": "system", "content":
+                     "You are a rare-books cataloguer summarizing a historical "
+                     "botanical/medical work from its OCR text. Note the "
+                     "subjects covered, structure, notable content, and any "
+                     "period context. OCR noise is expected; read through it. "
+                     "Be factual and specific. Reply with dense notes."},
+                    {"role": "user", "content":
+                     f"Work: {meta}\nPages {nums[0]}–{nums[-1]} of the text:\n\n{chunk}"},
+                ])
+                notes.append(out)
+                with _an_jobs_lock:
+                    job["done"] = i + 1
+            final = _ai_chat(cfg, [
+                {"role": "system", "content":
+                 "Combine these section notes into one summary of the work "
+                 "for a library catalogue: 300-500 words of Markdown — an "
+                 "opening paragraph on what the work is, then its scope and "
+                 "structure, then notable content. Factual, no invention, "
+                 "no header line."},
+                {"role": "user", "content":
+                 f"Work: {meta}\n\n" + "\n\n---\n\n".join(notes)},
+            ])
+            with _an_write_lock:
+                _write_entry_text(bid, "summary.md", final.strip() + "\n")
+            activity("summarized", "book", detail=b.get("title", ""))
+            _an_finish(job)
+        except Exception as exc:
+            log.error("summarize failed for %s", bid, exc_info=exc)
+            _an_finish(job, f"{type(exc).__name__}: {exc}")
+
+    job = _an_job_start(bid, "summarize", len(chunks) + 1, run)
+    return jsonify({"ok": True, "job": job["id"], "chunks": len(chunks),
+                    "doc": name})
+
+
+@app.route("/api/analyze/about", methods=["POST"])
+def api_analyze_about():
+    """Draft the public About article from the summary + metadata. Refuses to
+    overwrite an existing article unless told to — it may be hand-edited."""
+    p = request.get_json(silent=True) or {}
+    bid = str(p.get("build_id") or "").strip()
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    summary = _read_entry_text(bid, "summary.md")
+    if not summary.strip():
+        return jsonify({"ok": False, "error":
+                        "no summary yet — generate one first"}), 400
+    if _read_entry_text(bid, "about.md").strip() and not p.get("overwrite"):
+        return jsonify({"ok": False, "error": "an About article already "
+                        "exists — pass overwrite to replace it"}), 409
+    cfg = _ai_cfg()
+    meta = _an_meta_line(b)
+
+    def run(job):
+        try:
+            out = _ai_chat(cfg, [
+                {"role": "system", "content":
+                 "Write the About article for a volume in a public digital "
+                 "library of rare botanical works. Neutral, archival tone; "
+                 "200-400 words of Markdown; describe what the work is, its "
+                 "context and significance, and what a reader will find. No "
+                 "title header, no invented facts, no bibliographic citation "
+                 "block."},
+                {"role": "user", "content": f"Work: {meta}\n\nCataloguer's "
+                 f"summary:\n{summary}"},
+            ], temperature=0.4)
+            with _an_write_lock:
+                _write_entry_text(bid, "about.md", out.strip() + "\n")
+            _an_finish(job)
+        except Exception as exc:
+            _an_finish(job, f"{type(exc).__name__}: {exc}")
+
+    job = _an_job_start(bid, "about", 1, run)
+    return jsonify({"ok": True, "job": job["id"]})
+
+
+@app.route("/api/analyze/categories", methods=["POST"])
+def api_analyze_categories():
+    """Suggest taxonomy paths for a work; synchronous (one call). Existing
+    paths resolve to node ids so the client can assign them directly; novel
+    paths come back as proposals."""
+    p = request.get_json(silent=True) or {}
+    bid = str(p.get("build_id") or "").strip()
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    nodes = lib.load_taxonomy()["nodes"]
+    vocab = sorted(" › ".join(lib.category_path(nodes, nid))
+                   for nid in nodes)
+    summary = _read_entry_text(bid, "summary.md")
+    _, text = _analyze_doc(bid, b)
+    excerpt = summary or "\n".join(list(_an_pages(text).values())[:6])[:8000]
+    try:
+        out = _ai_json(_ai_cfg(), [
+            {"role": "system", "content":
+             "You classify works for a digital library of rare botanical and "
+             "medical books. Its category taxonomy is hierarchical; paths are "
+             "written 'Parent › Child'. Suggest 1-5 categories for the work: "
+             "prefer existing paths verbatim; propose a new path only when "
+             "nothing fits, reusing an existing parent where possible. Reply "
+             "as JSON: {\"suggestions\": [{\"path\": [\"Botany\",\"Herbals\"], "
+             "\"reason\": \"...\"}]}"},
+            {"role": "user", "content":
+             "Existing taxonomy paths:\n" + ("\n".join(vocab) or "(empty)") +
+             f"\n\nWork: {_an_meta_line(b)}\n\nWhat is known of its content:\n"
+             + excerpt[:9000]},
+        ])
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 502
+
+    # resolve each suggested path against the tree, walking name by name
+    def resolve(path: list) -> str:
+        cur = ""
+        for name in path:
+            low = str(name or "").strip().lower()
+            nxt = next((nid for nid, n in nodes.items()
+                        if (n.get("parent") or "") == cur
+                        and str(n.get("name", "")).strip().lower() == low), None)
+            if not nxt:
+                return ""
+            cur = nxt
+        return cur
+
+    suggestions = []
+    for s in (out.get("suggestions") or [])[:8]:
+        path = [str(x).strip()[:80] for x in (s.get("path") or []) if str(x).strip()]
+        if not path:
+            continue
+        nid = resolve(path)
+        suggestions.append({"path": path, "id": nid, "exists": bool(nid),
+                            "reason": str(s.get("reason") or "")[:300]})
+    return jsonify({"ok": True, "suggestions": suggestions})
+
+
+@app.route("/api/analyze/translate", methods=["POST"])
+def api_analyze_translate():
+    p = request.get_json(silent=True) or {}
+    bid = str(p.get("build_id") or "").strip()
+    lang = _lang_code(p.get("lang"))
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    if not lang:
+        return jsonify({"ok": False, "error": "no target language"}), 400
+    name, text = _analyze_doc(bid, b)
+    pages = _an_pages(text)
+    if not pages:
+        return jsonify({"ok": False, "error":
+                        "no OCR text for this entry — extract or run OCR first"}), 400
+    rel = f"translations/{lang}.txt"
+    done_pages = _an_pages(_read_entry_text(bid, rel))
+    todo = [n for n in sorted(pages) if pages[n].strip()
+            and not done_pages.get(n, "").strip()]
+    if not todo:
+        return jsonify({"ok": False, "error":
+                        "every page with text is already translated"}), 400
+    cfg = _ai_cfg()
+    meta = _an_meta_line(b)
+
+    def run(job):
+        try:
+            for i, n in enumerate(todo):
+                try:
+                    out = _ai_chat(cfg, [
+                        {"role": "system", "content":
+                         f"Translate this page of a historical work into "
+                         f"{lang}. Preserve paragraph breaks and the sense of "
+                         f"period language; do not annotate, do not add "
+                         f"anything. OCR noise is expected — translate "
+                         f"through it. Reply with the translation only."},
+                        {"role": "user", "content":
+                         f"Work: {meta}\nPage {n}:\n\n{pages[n][:14000]}"},
+                    ], temperature=0.2)
+                except RuntimeError as exc:
+                    with _an_jobs_lock:
+                        job["errors"] += 1
+                        job["note"] = f"page {n}: {exc}"
+                    continue
+                finally:
+                    with _an_jobs_lock:
+                        job["done"] = i + 1
+                # progressive save under a lock: a partial job loses nothing
+                with _an_write_lock:
+                    cur = _an_pages(_read_entry_text(bid, rel))
+                    cur[n] = out.strip()
+                    doc = "\n\n".join(f"--- page {k} ---\n{cur[k]}"
+                                      for k in sorted(cur))
+                    _write_entry_text(bid, rel, doc + "\n")
+            activity("translated", "book", n=len(todo) - job["errors"],
+                     detail=f"{b.get('title', '')} -> {lang}")
+            _an_finish(job)
+        except Exception as exc:
+            log.error("translate failed for %s", bid, exc_info=exc)
+            _an_finish(job, f"{type(exc).__name__}: {exc}")
+
+    job = _an_job_start(bid, f"translate:{lang}", len(todo), run)
+    return jsonify({"ok": True, "job": job["id"], "pages": len(todo)})
+
+
+@app.route("/api/analyze/annotate", methods=["POST"])
+def api_analyze_annotate():
+    p = request.get_json(silent=True) or {}
+    bid = str(p.get("build_id") or "").strip()
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    name, text = _analyze_doc(bid, b)
+    pages = _an_pages(text)
+    if not pages:
+        return jsonify({"ok": False, "error":
+                        "no OCR text for this entry — extract or run OCR first"}), 400
+    cfg = _ai_cfg()
+    chunks = _an_chunks(pages, budget=14000)
+    meta = _an_meta_line(b)
+
+    def run(job):
+        try:
+            added = 0
+            for i, (nums, chunk) in enumerate(chunks):
+                try:
+                    out = _ai_json(cfg, [
+                        {"role": "system", "content":
+                         "You annotate a historical botanical/medical work "
+                         "for modern readers. Propose margin notes anchored "
+                         "to short verbatim quotes: explain archaic terms, "
+                         "identify plants (modern binomials), people, places, "
+                         "preparations, and give context worth a note. Only "
+                         "genuinely noteworthy passages — 0 to 4 notes per "
+                         "page. Reply as JSON: {\"notes\": [{\"page\": N, "
+                         "\"quote\": \"exact words from the page\", \"kind\": "
+                         "\"term|plant|person|place|context\", \"note\": "
+                         "\"...\"}]}"},
+                        {"role": "user", "content":
+                         f"Work: {meta}\n\n{chunk}"},
+                    ])
+                except RuntimeError as exc:
+                    with _an_jobs_lock:
+                        job["errors"] += 1
+                        job["note"] = str(exc)
+                    continue
+                finally:
+                    with _an_jobs_lock:
+                        job["done"] = i + 1
+                fresh = []
+                now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                for raw in (out.get("notes") or [])[:40]:
+                    try:
+                        page = int(raw.get("page"))
+                    except (TypeError, ValueError):
+                        continue
+                    if page not in pages:
+                        continue
+                    quote = str(raw.get("quote") or "").strip()[:300]
+                    body = str(raw.get("note") or "").strip()[:1000]
+                    if not body:
+                        continue
+                    # an anchor that isn't on the page is noise, not an anchor
+                    flat = re.sub(r"\s+", " ", pages[page]).lower()
+                    if quote and re.sub(r"\s+", " ", quote).lower() not in flat:
+                        quote = ""
+                    fresh.append({"id": lib.gen_id(), "page": page,
+                                  "quote": quote,
+                                  "kind": str(raw.get("kind") or "context")[:24],
+                                  "body": body, "status": "suggested",
+                                  "source": f"ai:{cfg['model']}",
+                                  "created_at": now, "updated_at": now})
+                if fresh:
+                    with _an_notes_lock:
+                        doc = _load_annotations(bid)
+                        # no duplicate suggestions on re-runs: same page+body
+                        seen = {(n.get("page"), n.get("body")) for n in doc["notes"]}
+                        doc["notes"].extend(
+                            n for n in fresh
+                            if (n["page"], n["body"]) not in seen)
+                        lib.save_json(_entry_dir(bid) / "annotations.json", doc)
+                    added += len(fresh)
+            activity("annotated", "book", n=added, detail=b.get("title", ""))
+            _an_finish(job)
+        except Exception as exc:
+            log.error("annotate failed for %s", bid, exc_info=exc)
+            _an_finish(job, f"{type(exc).__name__}: {exc}")
+
+    job = _an_job_start(bid, "annotate", len(chunks), run)
+    return jsonify({"ok": True, "job": job["id"], "chunks": len(chunks)})
+
+
+@app.route("/api/analyze/relevance", methods=["POST"])
+def api_analyze_relevance():
+    """Assess the work against the user's custom criteria (defined in the
+    Analyze tab, stored in settings.relevanceCriteria). The result lands on
+    the build record — an internal metric, never published (_volume_row is an
+    allowlist and does not carry it)."""
+    p = request.get_json(silent=True) or {}
+    bid = str(p.get("build_id") or "").strip()
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    criteria = [c for c in (_client_settings().get("relevanceCriteria") or [])
+                if isinstance(c, dict) and str(c.get("name") or "").strip()]
+    if not criteria:
+        return jsonify({"ok": False, "error":
+                        "no relevance criteria defined yet"}), 400
+    summary = _read_entry_text(bid, "summary.md")
+    _, text = _analyze_doc(bid, b)
+    excerpt = summary or "\n".join(list(_an_pages(text).values())[:6])[:8000]
+    if not excerpt.strip():
+        return jsonify({"ok": False, "error":
+                        "no summary or OCR text to assess from"}), 400
+    cfg = _ai_cfg()
+    crit_lines = "\n".join(
+        f"- {c['name']}: {str(c.get('description') or '').strip()}"
+        for c in criteria)
+    meta = _an_meta_line(b)
+
+    def run(job):
+        try:
+            out = _ai_json(cfg, [
+                {"role": "system", "content":
+                 "Assess how relevant a historical work is to a private "
+                 "collection, against the collector's own criteria. Score "
+                 "each criterion 0-10 with a one-sentence rationale, then an "
+                 "overall 0-10. Be honest — a poor fit scores low. Reply as "
+                 "JSON: {\"criteria\": [{\"name\": \"...\", \"score\": N, "
+                 "\"rationale\": \"...\"}], \"overall\": N, "
+                 "\"summary\": \"one sentence\"}"},
+                {"role": "user", "content":
+                 f"Criteria:\n{crit_lines}\n\nWork: {meta}\n\n"
+                 f"What is known of it:\n{excerpt[:9000]}"},
+            ])
+            clamp = lambda v: max(0, min(10, int(v)))   # noqa: E731
+            scored, by_name = [], {str(c.get("name", "")).strip().lower(): c
+                                   for c in (out.get("criteria") or [])
+                                   if isinstance(c, dict)}
+            for c in criteria:
+                got = by_name.get(c["name"].strip().lower(), {})
+                try:
+                    score = clamp(got.get("score"))
+                except (TypeError, ValueError):
+                    score = 0
+                scored.append({"id": str(c.get("id") or ""), "name": c["name"],
+                               "score": score,
+                               "rationale": str(got.get("rationale") or "")[:400]})
+            try:
+                overall = clamp(out.get("overall"))
+            except (TypeError, ValueError):
+                overall = 0
+            result = {"assessed_at": datetime.now(timezone.utc)
+                      .isoformat(timespec="seconds"),
+                      "model": cfg["model"], "overall": overall,
+                      "summary": str(out.get("summary") or "")[:400],
+                      "criteria": scored}
+            with _builds_lock:
+                fresh = lib.load_json(BUILDS_PATH, {})
+                row = fresh.get(bid)
+                if row is not None:
+                    row["relevance"] = result
+                    row["updated_at"] = result["assessed_at"]
+                    lib.save_json(BUILDS_PATH, fresh)
+            _an_finish(job)
+        except Exception as exc:
+            log.error("relevance failed for %s", bid, exc_info=exc)
+            _an_finish(job, f"{type(exc).__name__}: {exc}")
+
+    job = _an_job_start(bid, "relevance", 1, run)
+    return jsonify({"ok": True, "job": job["id"]})
+
+
 # --- publishing a volume to the cloud library ---------------------------------
 # The Editor's old "Upload to WHL" only flipped a status field; there was no WHL
 # write API and nothing ever left the machine. A volume now goes to object
@@ -3860,6 +4559,89 @@ def _volume_row(b: dict, slug: str, url: str, path: str, size: int, actor: str) 
             "pdf_url": url, "pdf_path": path, "pdf_bytes": size,
             "uploaded_by_name": actor,
             "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+
+
+def _bundle_artifacts(bid: str, b: dict) -> dict:
+    """Everything build.bundle says should publish, read once: the About
+    text, page texts (original and per-language translations), approved
+    notes — plus the assets manifest the volumes row carries so the site
+    knows what exists without probing."""
+    bundle = _clean_bundle(b.get("bundle"))
+    out = {"about": "", "pages": {}, "notes": [], "assets": {}}
+    if bundle["about"]:
+        out["about"] = _read_entry_text(bid, "about.md").strip()
+        if out["about"]:
+            out["assets"]["about"] = True
+    if bundle["pages_text"]:
+        _, text = _analyze_doc(bid, b)
+        pages = {n: t for n, t in _an_pages(text).items() if t.strip()}
+        if pages:
+            out["pages"][""] = pages
+            out["assets"]["pages"] = len(pages)
+    langs = {}
+    for lang in bundle["translations"]:
+        pages = {n: t for n, t in _an_pages(
+            _read_entry_text(bid, f"translations/{lang}.txt")).items()
+            if t.strip()}
+        if pages:
+            out["pages"][lang] = pages
+            langs[lang] = len(pages)
+    if langs:
+        out["assets"]["translations"] = langs
+    if bundle["annotations"]:
+        out["notes"] = [n for n in _load_annotations(bid)["notes"]
+                        if n.get("status") == "approved"]
+        if out["notes"]:
+            out["assets"]["notes"] = len(out["notes"])
+    return out
+
+
+def _publish_bundle(cloud: dict, slug: str, art: dict) -> None:
+    """Upsert the bundle's artifacts and prune what left it, so a republish
+    converges on exactly what the bundle says. Runs after the volumes row —
+    an artifact failure leaves a published book missing extras, not an
+    orphaned object."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    q = urllib.parse.quote
+
+    if art["about"]:
+        sbase.upsert_rows(cloud, "volume_texts", "slug,kind,lang",
+                          [{"slug": slug, "kind": "about", "lang": "",
+                            "body": art["about"], "updated_at": now}])
+    else:
+        sbase.delete_rows(cloud, "volume_texts",
+                          f"slug=eq.{q(slug)}&kind=eq.about")
+
+    kept = sorted(art["pages"])
+    if kept:
+        rows = [{"slug": slug, "lang": lang, "page": n, "body": t,
+                 "updated_at": now}
+                for lang in kept for n, t in sorted(art["pages"][lang].items())]
+        sbase.upsert_rows(cloud, "volume_pages", "slug,lang,page", rows)
+        langs_in = ",".join(f'"{l}"' for l in kept)
+        sbase.delete_rows(cloud, "volume_pages",
+                          f"slug=eq.{q(slug)}&lang=not.in.({q(langs_in)})")
+        for lang in kept:
+            top = max(art["pages"][lang])
+            sbase.delete_rows(
+                cloud, "volume_pages",
+                f"slug=eq.{q(slug)}&lang=eq.{q(lang)}&page=gt.{top}")
+    else:
+        sbase.delete_rows(cloud, "volume_pages", f"slug=eq.{q(slug)}")
+
+    if art["notes"]:
+        rows = [{"slug": slug, "note_id": str(n.get("id") or ""),
+                 "page": int(n.get("page") or 0),
+                 "quote": str(n.get("quote") or ""),
+                 "kind": str(n.get("kind") or ""),
+                 "body": str(n.get("body") or ""), "updated_at": now}
+                for n in art["notes"] if n.get("id")]
+        sbase.upsert_rows(cloud, "volume_notes", "slug,note_id", rows)
+        ids_in = ",".join(f'"{r["note_id"]}"' for r in rows)
+        sbase.delete_rows(cloud, "volume_notes",
+                          f"slug=eq.{q(slug)}&note_id=not.in.({q(ids_in)})")
+    else:
+        sbase.delete_rows(cloud, "volume_notes", f"slug=eq.{q(slug)}")
 
 
 def _publish_slug(cloud: dict, b: dict) -> str:
@@ -3962,23 +4744,39 @@ def _publish_run(bid: str, actor: str) -> None:
                     extras.append((name_i, name_i))
 
             stage("recording")
-            row = _volume_row(b, slug, url, path, size, actor)
+            art = _bundle_artifacts(bid, b)
+            row = dict(_volume_row(b, slug, url, path, size, actor),
+                       assets=art["assets"])
             try:
                 sbase.upsert_volume(cloud, row)
             except sbase.SyncError as exc:
-                # A live project that hasn't re-run schema.sql lacks the
-                # category_paths column; the book still deserves to publish.
-                if "category_paths" not in str(exc):
+                # A live project that hasn't re-run schema.sql lacks the new
+                # columns; the book still deserves to publish.
+                if not any(k in str(exc) for k in ("category_paths", "assets")):
                     raise
                 row.pop("category_paths", None)
+                row.pop("assets", None)
                 sbase.upsert_volume(cloud, row)
-                log.warning("volumes.category_paths missing on the cloud "
-                            "project — re-run docs/cloud/schema.sql")
+                log.warning("volumes.category_paths/assets missing on the "
+                            "cloud project — re-run docs/cloud/schema.sql")
         except Exception:
             _unpublish_object(cloud, slug, path)
             for name_i, path_i in extras:
                 _unpublish_object(cloud, name_i[:-4], path_i)
             raise
+
+        # The bundle's artifacts go after the row: a failure here leaves the
+        # book published without its extras (retryable by republishing), not
+        # an orphaned public object.
+        stage("bundle")
+        try:
+            _publish_bundle(cloud, slug, art)
+        except sbase.SyncError as exc:
+            if not any(t in str(exc) for t in
+                       ("volume_texts", "volume_pages", "volume_notes")):
+                raise
+            log.warning("artifact tables missing on the cloud project — "
+                        "re-run docs/cloud/schema.sql (%s)", exc)
 
         # re-read: the upload took minutes, and another writer may have touched
         # builds meanwhile. Only this build's fields are ours to change.
