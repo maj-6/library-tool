@@ -117,6 +117,32 @@ def free_port(taken: set[int]) -> int:
     sys.exit("no free port in %d..%d" % (PORT_BASE, PORT_BASE + 50))
 
 
+def _assert_main_intact(name: str, path: Path) -> None:
+    """Sparse-checkout leaking into the shared config empties the main checkout.
+
+    It is a silent, 273 MB deletion, so verify rather than trust: the flag must
+    not be in the main checkout's config, and the heavy directories must still
+    be on disk. On failure, undo everything before returning the error.
+    """
+    leaked = git("config", "--local", "--get", "core.sparseCheckout", check=False)
+    missing = [h.strip("/") for h in HEAVY if not (REPO / h.strip("/")).is_dir()]
+    if not leaked and not missing:
+        return
+    git("worktree", "remove", "--force", str(path), check=False)
+    git("branch", "-D", name, check=False)
+    if leaked:
+        git("sparse-checkout", "disable", check=False)
+    if missing:
+        git("checkout", "--", *missing, check=False)
+    sys.exit(
+        "ABORTED: sparse-checkout leaked into the main checkout"
+        + (f" (core.sparseCheckout={leaked})" if leaked else "")
+        + (f", emptying {', '.join(missing)}" if missing else "")
+        + "\nThe worktree was removed and the main checkout restored."
+        "\nRe-run with --full to skip sparse-checkout entirely."
+    )
+
+
 def cmd_list(_args) -> None:
     rows = worktrees()
     print(f"main  {REPO}  (port 5001)")
@@ -145,9 +171,17 @@ def cmd_add(args) -> None:
     # slower than never writing it
     git("worktree", "add", "--no-checkout", "-b", name, str(path), args.base)
     if not args.full:
+        # WITHOUT this, `git sparse-checkout init` writes core.sparseCheckout to
+        # the SHARED config, and the main checkout starts honouring a pattern
+        # file it does not have -- which silently deletes photo/ and books/ from
+        # it. Ask me how I know. With it, both the flag and the patterns live
+        # under .git/worktrees/<name>/.
+        git("config", "extensions.worktreeConfig", "true")
         git("sparse-checkout", "init", "--no-cone", cwd=path)
+        git("config", "--worktree", "core.sparseCheckout", "true", cwd=path)
         git("sparse-checkout", "set", "--no-cone", "/*", *[f"!{h}" for h in HEAVY], cwd=path)
     git("checkout", cwd=path)
+    _assert_main_intact(name, path)
 
     wt = path / ".wt"
     (wt / "data").mkdir(parents=True, exist_ok=True)

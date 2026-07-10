@@ -46,6 +46,18 @@ works in every session at once.
 sparse-checkout, landing at ~57 MB (mostly the 40 MB renewals CSV, which the
 copyright tag needs). `--full` keeps everything.
 
+Sparse-checkout has a sharp edge that cost this repo its `photo/` directory
+once. `git sparse-checkout init` writes `core.sparseCheckout` to the **shared**
+config unless `extensions.worktreeConfig` is enabled first. The main checkout
+then honours a pattern file it does not have, decides nothing is included, and
+silently deletes 273 MB from its working tree on the next index refresh. Nothing
+is lost — the files are in git objects, and `git sparse-checkout disable && git
+checkout -- photo books` brings them back — but it is alarming. The script
+enables `extensions.worktreeConfig` first, so both the flag and the patterns
+live under `.git/worktrees/<name>/`, and then it verifies: if the flag ever
+shows up in the main config, or the heavy directories go missing, it removes the
+new worktree, restores the main checkout, and refuses.
+
 ## Things worth knowing
 
 - **A branch can only be checked out once.** `git worktree add` refuses a branch
