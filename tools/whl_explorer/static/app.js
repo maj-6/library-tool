@@ -104,6 +104,7 @@ const state = {
     // shared by the capture pipeline and the Mistral OCR service
     supabaseUrl: "", supabaseKey: "", supabaseAnonKey: "", mistralKey: "",
     authPromptDismissed: false,   // "Work locally" said: don't ask at startup
+    wizardDone: false,            // first-run setup guide finished or skipped
     // Cloudflare R2 for published PDFs (Supabase storage is 1 GB on free)
     r2Account: "", r2Bucket: "", r2KeyId: "", r2Secret: "", r2PublicBase: "",
     cloudSyncMinutes: 0, cloudDeleteRemote: true,
@@ -1032,6 +1033,8 @@ async function refreshAuthStatus() {
 }
 
 function renderAccountState() {
+  // the wizard's account step mirrors the same signed-in state
+  if (typeof wizAccountState === "function" && !el("wizard-overlay").hidden) wizAccountState();
   const s = el("set-account-state"), b = el("set-account-btn");
   if (!s || !b) return;
   if (authState.signedIn) {
@@ -1136,10 +1139,196 @@ function initAuth() {
 // gate and then overwritten by the sync.
 function maybeAuthPrompt() {
   refreshAuthStatus().then(() => {
+    if (!el("wizard-overlay").hidden) return;   // the wizard's account step covers it
     if (authState.cloud && !authState.signedIn && !state.settings.authPromptDismissed) {
       showAuthOverlay();
     }
   });
+}
+
+// --- first-run setup wizard ------------------------------------------------------
+// Shown once, on the desktop shell's first launch (the installer stays dumb;
+// the app is where keys, Tesseract and the big optional downloads make sense).
+// Re-openable any time from Help > Setup guide. Every step is skippable, and
+// everything it sets lives in the same settings the Settings window edits.
+
+const WIZ_STEPS = [
+  ["welcome", "WELCOME"],
+  ["account", "YOUR NAME"],
+  ["ocr", "OCR"],
+  ["cloud", "CLOUD"],
+  ["db", "OFFLINE SEARCH"],
+  ["done", "READY"],
+];
+let wizStep = 0;
+let wizDbTimer = null;
+
+function showWizard() {
+  wizStep = 0;
+  el("wizard-overlay").hidden = false;
+  wizRender();
+}
+
+function closeWizard(markDone) {
+  if (markDone) {
+    state.settings.wizardDone = true;
+    saveSettings();
+  }
+  clearTimeout(wizDbTimer);
+  wizDbTimer = null;
+  el("wizard-overlay").hidden = true;
+}
+
+// values are committed when leaving a step, so Back/Next/Finish all keep work
+function wizCommit() {
+  const step = WIZ_STEPS[wizStep][0];
+  if (step === "account") {
+    state.settings.userName = el("wiz-name").value.trim().slice(0, 60);
+    const un = el("set-user-name");
+    if (un) un.value = state.settings.userName;
+  } else if (step === "ocr") {
+    state.settings.mistralKey = el("wiz-mistral").value.trim();
+  } else if (step === "cloud") {
+    state.settings.supabaseUrl = el("wiz-sb-url").value.trim();
+    state.settings.supabaseAnonKey = el("wiz-sb-anon").value.trim();
+    state.settings.supabaseKey = el("wiz-sb-key").value.trim();
+  } else {
+    return;
+  }
+  saveSettings();
+}
+
+function wizRender() {
+  const [step, title] = WIZ_STEPS[wizStep];
+  for (const p of document.querySelectorAll("#wizard-body .wiz-pane")) {
+    p.hidden = p.dataset.step !== step;
+  }
+  el("wizard-title").textContent = title;
+  el("wizard-step").textContent = `${wizStep + 1} / ${WIZ_STEPS.length}`;
+  el("wizard-back").disabled = wizStep === 0;
+  el("wizard-next").textContent = wizStep === WIZ_STEPS.length - 1 ? "Finish" : "Next";
+  el("wizard-skip").hidden = wizStep === WIZ_STEPS.length - 1;
+  clearTimeout(wizDbTimer);
+  wizDbTimer = null;
+  if (step === "account") {
+    el("wiz-name").value = state.settings.userName || "";
+    wizAccountState();
+  } else if (step === "ocr") {
+    el("wiz-mistral").value = state.settings.mistralKey || "";
+    wizCheckTesseract();
+  } else if (step === "cloud") {
+    el("wiz-sb-url").value = state.settings.supabaseUrl || "";
+    el("wiz-sb-anon").value = state.settings.supabaseAnonKey || "";
+    el("wiz-sb-key").value = state.settings.supabaseKey || "";
+  } else if (step === "db") {
+    wizDbTick();
+  }
+}
+
+function wizAccountState() {
+  const s = el("wiz-account-state"), b = el("wiz-signin");
+  if (authState.signedIn) {
+    s.textContent = `${authState.displayName || authState.email}`;
+    b.textContent = "Signed in";
+    b.disabled = true;
+  } else {
+    s.textContent = "Not signed in";
+    b.textContent = "Sign in…";
+    b.disabled = false;
+  }
+}
+
+async function wizCheckTesseract() {
+  const s = el("wiz-tess-state"), link = el("wiz-tess-link");
+  s.textContent = "Checking for Tesseract…";
+  s.className = "tool-label";
+  link.hidden = true;
+  try {
+    const r = await (await fetch("/api/ocr/tesseract")).json();
+    if (r.installed) {
+      s.textContent = `Tesseract found — ${r.version || r.path}`;
+      s.classList.add("wiz-tess-ok");
+    } else {
+      s.textContent = "Tesseract not found (local OCR unavailable until installed)";
+      s.classList.add("wiz-tess-no");
+      link.hidden = false;
+    }
+  } catch (e) {
+    s.textContent = "Could not check for Tesseract";
+  }
+}
+
+const wizBytes = (n) => !n ? "" : n >= 1 << 30 ? (n / (1 << 30)).toFixed(1) + " GB"
+  : n >= 1 << 20 ? Math.round(n / (1 << 20)) + " MB" : Math.round(n / 1024) + " KB";
+
+async function wizDbTick() {
+  let data;
+  try {
+    data = await (await fetch("/api/db/status")).json();
+  } catch (e) {
+    el("wiz-db-list").innerHTML = `<span class="tool-label">Could not read database status</span>`;
+    return;
+  }
+  const rows = [];
+  let polling = false;
+  for (const [name, t] of Object.entries(data.targets || {})) {
+    let stateHtml;
+    const job = t.job;
+    if (job && job.status === "downloading") {
+      polling = true;
+      const pct = job.total ? Math.round(100 * job.downloaded / job.total) : 0;
+      stateHtml = `<span class="wiz-db-track"><span class="wiz-db-bar" style="width:${pct}%"></span></span>` +
+        `<span class="tool-label">${pct}%</span>`;
+    } else if (t.present) {
+      stateHtml = `<span class="tool-label wiz-tess-ok">downloaded (${wizBytes(t.size)})</span>`;
+    } else if (!t.url) {
+      stateHtml = `<span class="tool-label">no URL set — see Settings &gt; Sync</span>`;
+    } else {
+      stateHtml = `<button class="cad-btn" data-wizdl="${esc(name)}" type="button">Download</button>`;
+    }
+    rows.push(`<div class="wiz-db-row"><span class="tool-label">${esc(t.label || name)}</span>${stateHtml}</div>`);
+  }
+  el("wiz-db-list").innerHTML = rows.join("") ||
+    `<span class="tool-label">No downloadable databases configured</span>`;
+  if (polling && !el("wizard-overlay").hidden && WIZ_STEPS[wizStep][0] === "db") {
+    wizDbTimer = setTimeout(wizDbTick, 1500);
+  }
+}
+
+function initWizard() {
+  el("wizard-next").onclick = () => {
+    wizCommit();
+    if (wizStep >= WIZ_STEPS.length - 1) { closeWizard(true); return; }
+    wizStep++;
+    wizRender();
+  };
+  el("wizard-back").onclick = () => {
+    wizCommit();
+    if (wizStep > 0) { wizStep--; wizRender(); }
+  };
+  el("wizard-skip").onclick = () => { wizCommit(); closeWizard(true); };
+  el("wiz-signin").onclick = () => showAuthOverlay();   // z 62, above the wizard
+  el("wiz-db-list").addEventListener("click", async (ev) => {
+    const b = ev.target.closest("[data-wizdl]");
+    if (!b) return;
+    b.disabled = true;
+    try {
+      await fetch("/api/db/download", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ names: [b.dataset.wizdl] }),
+      });
+    } catch (e) { /* the next tick shows whatever happened */ }
+    wizDbTick();
+  });
+}
+
+// auto-show only in the desktop shell: a fresh install is the moment the guide
+// is for. In a browser the server may hold years of state, and Help > Setup
+// guide is always there.
+function maybeWizard() {
+  const d = window.whlDesktop;
+  if (d && d.isDesktop && !state.settings.wizardDone) showWizard();
 }
 
 const homeState = { events: [], loaded: false, expanded: new Set() };
@@ -9867,6 +10056,8 @@ const MENU_CMDS = {
   "run-scans": () => runScansBatch(),
   "scrape": () => startWhlScrape(),
   "dl-approved": () => downloadApproved(),
+  "setup-guide": () => showWizard(),
+  "site-home": () => openWebView("https://maj-6.github.io/library-tool/"),
 };
 
 // Settings > (themes): generated from THEMES so adding a theme needs no markup.
@@ -9964,6 +10155,12 @@ function initMenubar() {
 // isolated and cannot reach the app. Ctrl/Cmd+click still opens a real tab.
 function openWebView(url) {
   if (!/^https?:\/\//i.test(url)) return false;
+  // In the desktop shell a plain web link belongs in the real browser, not an
+  // embedded frame — many sites refuse framing, and the OS browser is right
+  // there. The Internet Archive viewer is a different path (a curated feature
+  // with local preview + downloads) and stays in-app on desktop.
+  const d = window.whlDesktop;
+  if (d && d.isDesktop && d.openExternal) { d.openExternal(url); return true; }
   el("webview-url").textContent = url;
   el("webview-url").dataset.url = url;
   el("webview-frame").src = "/api/webview?url=" + encodeURIComponent(url);
@@ -10199,6 +10396,7 @@ function init() {
   boot("menu bar", initMenubar);
   boot("home", initHome);
   boot("account", initAuth);
+  boot("setup wizard", initWizard);
   boot("title bar", fitTitleBar);   // after the menus exist: their width sets the clamp
   boot("settings nav", initSettingsNav);
   boot("column resize", initColResize);
@@ -10689,6 +10887,7 @@ function init() {
   document.addEventListener("keydown", (ev) => {
     if (ev.key !== "Escape") return;
     if (!el("auth-overlay").hidden) hideAuthOverlay();   // topmost (z 62)
+    else if (!el("wizard-overlay").hidden) { wizCommit(); closeWizard(true); }   // Esc = skip, typed fields kept
     else if (!el("attn-pop").hidden) closeAttnPop();
     else if (!el("fb-overlay").hidden) closeFileBrowser();
     else if (!el("pdfm-overlay").hidden) closePdfModal();
@@ -10715,6 +10914,7 @@ function init() {
   // first render reflects whatever the server holds.
   syncClientStateOnLoad().then((adopted) => {
     if (adopted) { applyTheme(); applyFont(); }
+    maybeWizard();       // first desktop launch: the guide covers sign-in too
     maybeAuthPrompt();   // needs the adopted settings: authPromptDismissed
     loadDownloads();
     // Home's pending tasks are derived from these, so it re-renders once the

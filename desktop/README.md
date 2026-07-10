@@ -25,33 +25,45 @@ npm install
 npm start           # spawns the Python source; needs Python on PATH (or set WHL_PYTHON)
 ```
 
-## Build the Windows .msi installer
+## Build the Windows installer (NSIS)
 
 Prerequisites on the build machine: Python 3 with the app's requirements
-installed, `pip install pyinstaller`, Node 18+, and — for the MSI target —
-**.NET Framework 3.5** (WiX 3's dependency; electron-builder downloads the WiX
-tools themselves). A *signed* build additionally needs a code-signing cert.
+installed, `pip install pyinstaller`, Node 18+. electron-builder downloads the
+NSIS tooling itself. A *signed* build additionally needs a code-signing cert.
 
 ```
 cd desktop
 npm install
 npm run build:sidecar     # PyInstaller → dist-sidecar/whl-explorer-sidecar/
-npm run dist              # electron-builder → release/CatalogExplorer-<version>.msi
+npm run dist              # electron-builder → release/LibraryTool-Setup-<version>.exe
 ```
 
-`npm run dist` bundles the frozen sidecar as `resources/sidecar/` and produces
-an **`.msi`** (assisted UI, per-user by default; silent install with
-`msiexec /i CatalogExplorer-<version>.msi /qn`).
+The installer is branded (the app icon + a Roboto Slab sidebar generated from
+the repo's own assets — regenerate with the script noted in build/), assisted
+(license-free, per-user, choose-your-directory), and creates desktop + start
+menu shortcuts. Uninstall keeps the data root: the catalogue outlives the app.
+
+## Releasing an update
+
+The app checks GitHub Releases (`maj-6/library-tool`) once at startup,
+downloads in the background, and offers a restart when ready. Publishing a
+release is: bump `version` in package.json, build, then
+
+```
+gh release create v<version> release/LibraryTool-Setup-<version>.exe release/latest.yml --title v<version>
+```
+
+`latest.yml` is what electron-updater reads; without it the check is a no-op.
+Offline machines simply skip the check.
 
 ### Downloading the databases (offline search)
 
-electron-builder's MSI has no custom installer UI, so the *"download a local
-copy of the databases"* option is presented by the **app on first launch**: if
-no local Open Library index is found it offers to download one from the URLs in
-**Settings → Sync** (multi-GB, so it never belongs inside the installer). For
-unattended/enterprise installs, the databases can be pre-placed in the data
-root or fetched later from Settings. (An NSIS `.exe` target with an in-installer
-checkbox is also possible — ask if you want both.)
+The installer stays small on purpose: API keys, Tesseract, and the multi-GB
+Open Library index are handled by the **in-app setup guide** on first launch
+(re-openable from Help → Setup guide), which detects Tesseract, takes the
+optional keys, and downloads databases with progress from the URLs in
+**Settings → Sync**. For unattended installs, pre-place the databases in the
+data root or fetch them later from Settings.
 
 ### Databases (local vs cloud)
 

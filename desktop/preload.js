@@ -13,4 +13,11 @@ contextBridge.exposeInMainWorld("whlDesktop", {
     close: () => ipcRenderer.send("win:close"),
     onMaximized: (cb) => ipcRenderer.on("win:maximized", (_e, v) => cb(!!v)),
   },
+  // Hand a web link to the OS browser. Only http(s) is forwarded; the main
+  // process validates the scheme again before shell.openExternal.
+  openExternal: (url) => {
+    if (typeof url === "string" && /^https?:\/\//i.test(url)) {
+      ipcRenderer.send("win:open-external", url);
+    }
+  },
 });
