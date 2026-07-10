@@ -1,0 +1,18 @@
+{
+  "_comment": [
+    "Copy to .claude/launch.json, which is gitignored because the port is",
+    "per-checkout. tools/worktree.py writes one for each worktree it creates,",
+    "pointing at that tree's .wt/serve.py so it gets its own port and DATA_ROOT.",
+    "autoPort must stay false: server.py reads WHL_PORT, never PORT."
+  ],
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "whl-explorer",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["tools/whl_explorer/server.py"],
+      "port": 5001,
+      "autoPort": false
+    }
+  ]
+}
