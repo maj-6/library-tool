@@ -4,6 +4,11 @@ Newest first. The Downloads page highlights the significant releases; every
 version, down to the small fixes, is on the Release notes page. The desktop
 app reads this same file (Help → View changelog).
 
+## 0.5.0 — 2026-07-11
+- Databases: drop your Open Library or copyright files into a `~/.library-tool` folder in your home directory — they're used offline with no URL and no download. A source URL is only needed to *fetch* a database you don't already have.
+- UI scale: fixed a stray page scrollbar when the interface is zoomed.
+- Book Capture (Android 0.3.0): the app now opens on a Home page of your recent scans — page thumbnails, extracted title / author / year, and upload status — instead of dropping straight into the camera. "New scan" leads into capture.
+
 ## 0.4.0 — 2026-07-11
 - Version numbering reset to a pre-1.0 line. The project is still early and actively changing, so it continues here as 0.4.0 (Book Capture as 0.2.0) rather than presenting as a finished 3.x product. Nothing about the app itself changed in this entry; the earlier 3.x / 2.x history is kept below as-is.
 
