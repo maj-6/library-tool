@@ -26,6 +26,23 @@ let mainReady = false;        // gates window-all-closed: don't quit mid-startup
 
 const isDev = !app.isPackaged;
 
+// Only one packaged instance may run at a time. A second launch hands off to
+// the first (focusing its window) and exits immediately. This is what makes an
+// in-place update safe: NSIS cannot replace a running .exe, so a second
+// instance open during an update is exactly the failure this avoids. Dev
+// (electron .) is exempt, so a dev instance and the installed app can still run
+// side by side.
+const gotSingleInstanceLock = isDev || app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    if (!mainWindow) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.focus();
+  });
+}
+
 // custom title-bar controls (the window is frameless) driven from the renderer
 ipcMain.on("win:minimize", () => mainWindow && mainWindow.minimize());
 ipcMain.on("win:toggle-maximize", () => {
@@ -307,6 +324,7 @@ function runUpdateGate() {
 }
 
 app.whenReady().then(async () => {
+  if (!gotSingleInstanceLock) return;   // a second instance — it is already quitting
   // Update first: if one is installing, we quit into NSIS and never launch here.
   let outcome = "launch";
   try {
