@@ -156,11 +156,15 @@ jobs:
             desktop/release/latest.yml
           if-no-files-found: error
 
-  # Tag pushes only: a dispatch run is a dry run and stops at the artifacts.
-  # `needs` both builds on purpose — a release always ships the pair, so a
-  # broken desktop build blocks the APK too rather than half-publishing.
+  # Tag pushes only (a dispatch run is a dry run and stops at the artifacts).
+  # Publishes whichever app(s) actually built: the two are versioned and
+  # released independently, so a broken Android signing config must not block a
+  # good desktop release (or vice versa). Runs when EITHER build succeeded, and
+  # each publish step below is guarded on its artifact being present.
   publish:
-    if: startsWith(github.ref, 'refs/tags/')
+    if: |
+      always() && startsWith(github.ref, 'refs/tags/') &&
+      (needs.desktop.result == 'success' || needs.android.result == 'success')
     needs: [android, desktop]
     runs-on: ubuntu-latest
     steps:
@@ -176,11 +180,16 @@ jobs:
       - name: GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          APK_V: ${{ needs.android.outputs.version }}
+          EXE_V: ${{ needs.desktop.outputs.version }}
         run: |
+          # a failed job leaves its version output empty, so name only what shipped
+          notes=""
+          [ -n "$EXE_V" ] && notes="Desktop $EXE_V"
+          [ -n "$APK_V" ] && notes="${notes:+$notes · }Android BookCapture $APK_V"
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
-              --title "Library Tool $GITHUB_REF_NAME" \
-              --notes "Android BookCapture ${{ needs.android.outputs.version }} · Desktop ${{ needs.desktop.outputs.version }}"
+              --title "Library Tool $GITHUB_REF_NAME" --notes "$notes"
           gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
 
       # The step the website actually sees. release_publish.py gets the local
@@ -199,9 +208,15 @@ jobs:
             exit 0
           fi
           BASE="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME"
-          APK=$(ls dist/BookCapture-*.apk)
-          EXE=$(ls dist/LibraryTool-Setup-*.exe)
-          python3 tools/release_publish.py "$APK" --url "$BASE/$(basename "$APK")" \
-            --platform android --version "${{ needs.android.outputs.version }}"
-          python3 tools/release_publish.py "$EXE" --url "$BASE/$(basename "$EXE")" \
-            --platform windows --version "${{ needs.desktop.outputs.version }}"
+          # register only the app(s) whose artifact is present, so one build's
+          # failure never blocks the other from reaching the Downloads page
+          EXE=$(ls dist/LibraryTool-Setup-*.exe 2>/dev/null | head -1 || true)
+          APK=$(ls dist/BookCapture-*.apk 2>/dev/null | head -1 || true)
+          if [ -n "$EXE" ]; then
+            python3 tools/release_publish.py "$EXE" --url "$BASE/$(basename "$EXE")" \
+              --platform windows --version "${{ needs.desktop.outputs.version }}"
+          fi
+          if [ -n "$APK" ]; then
+            python3 tools/release_publish.py "$APK" --url "$BASE/$(basename "$APK")" \
+              --platform android --version "${{ needs.android.outputs.version }}"
+          fi
