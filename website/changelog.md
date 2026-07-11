@@ -4,6 +4,9 @@ Newest first. The Downloads page highlights the significant releases; every
 version, down to the small fixes, is on the Release notes page. The desktop
 app reads this same file (Help → View changelog).
 
+## 3.2.1 — 2026-07-11
+- Size the interface to taste: a UI scale setting under Settings → Appearance, with Ctrl +/− to zoom and Ctrl 0 to reset.
+
 ## 3.2.0 — 2026-07-11
 - New Analyze tab: AI summaries, margin annotations, and page-aligned translations for a verified volume (bring your own DeepSeek or Mistral key).
 - Organise the collection with a hierarchical category tree, and browse the online Library as an archival catalogue with an in-page reader.
