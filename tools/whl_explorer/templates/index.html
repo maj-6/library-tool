@@ -14,9 +14,14 @@
       <div class="menu">
         <button class="menu-btn" type="button">File</button>
         <div class="menu-drop" hidden>
+          <button class="menu-item" data-cmd="new-entry" type="button">New entry</button>
+          <div class="menu-sep"></div>
           <button class="menu-item" data-cmd="export" type="button">Export table (JSON)</button>
           <button class="menu-item" data-cmd="export-builds" type="button">Export builds</button>
           <button class="menu-item" data-cmd="dl-sources" type="button">Download sources list</button>
+          <button class="menu-item" data-cmd="dl-approved" type="button">Download verified sources</button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" data-cmd="master-sync" type="button">Sync master list to Google Sheets&hellip;</button>
         </div>
       </div>
       <div class="menu">
@@ -24,6 +29,10 @@
         <div class="menu-drop" hidden>
           <button class="menu-item" data-cmd="undo" type="button">Undo<span class="menu-key">Ctrl+Z</span></button>
           <button class="menu-item" data-cmd="redo" type="button">Redo<span class="menu-key">Ctrl+Y</span></button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" data-cmd="categories" type="button">Categories&hellip;</button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" data-cmd="settings" type="button">Preferences&hellip;<span class="menu-key">Ctrl+,</span></button>
         </div>
       </div>
       <div class="menu">
@@ -33,6 +42,12 @@
           <div class="menu-sep"></div>
           <button class="menu-item" data-cmd="table-checked" type="button"><span class="menu-check"></span>Checked books table</button>
           <button class="menu-item" data-cmd="table-whl" type="button"><span class="menu-check"></span>WHL table</button>
+          <div class="menu-sep"></div>
+          <!-- Theme picker as a hover submenu; #menu-themes is filled from THEMES
+               by buildThemeMenu(). Appearance is a View concern. -->
+          <div class="menu-item menu-sub">Theme<span class="menu-caret">&#9656;</span>
+            <div class="menu-drop menu-sub-drop"><div id="menu-themes"></div></div>
+          </div>
         </div>
       </div>
       <div class="menu">
@@ -40,25 +55,6 @@
         <div class="menu-drop" hidden>
           <button class="menu-item" data-cmd="run-scans" type="button">Run scans</button>
           <button class="menu-item" data-cmd="scrape" type="button">Scrape WHL</button>
-          <button class="menu-item" data-cmd="dl-approved" type="button">Download verified sources</button>
-          <button class="menu-item" data-cmd="categories" type="button">Categories&hellip;</button>
-          <div class="menu-sep"></div>
-          <button class="menu-item" data-cmd="master-sync" type="button">Sync master list to Google Sheets&hellip;</button>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn" type="button">Settings</button>
-        <div class="menu-drop" hidden>
-          <button class="menu-item" data-cmd="settings" type="button">All settings&hellip;</button>
-          <div class="menu-sep"></div>
-          <!-- Theme + OCR-engine pickers as hover submenus; the hosts are filled
-               from THEMES / OCR_SERVICES by buildThemeMenu() / buildOcrMenu() -->
-          <div class="menu-item menu-sub">Theme<span class="menu-caret">&#9656;</span>
-            <div class="menu-drop menu-sub-drop"><div id="menu-themes"></div></div>
-          </div>
-          <div class="menu-item menu-sub">OCR engine<span class="menu-caret">&#9656;</span>
-            <div class="menu-drop menu-sub-drop"><div id="menu-ocr-service"></div></div>
-          </div>
           <div class="menu-sep"></div>
           <button class="menu-item" data-cmd="opt-auto-ia" type="button"><span class="menu-check"></span>Auto-download IA scans</button>
           <button class="menu-item" data-cmd="opt-expand-sets" type="button"><span class="menu-check"></span>Expand multi-volume sets</button>
@@ -70,6 +66,8 @@
           <button class="menu-item" data-cmd="setup-guide" type="button">Setup guide&hellip;</button>
           <button class="menu-item" data-cmd="changelog" type="button">View changelog&hellip;</button>
           <button class="menu-item" data-cmd="site-home" type="button">Library Tool website</button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" data-cmd="about" type="button">About Library Tool&hellip;</button>
         </div>
       </div>
     </div>
@@ -1432,6 +1430,28 @@
               <input id="set-browse-dir" class="cad-input" spellcheck="false" />
             </div>
           </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ABOUT -->
+  <div id="about-overlay" class="overlay" hidden>
+    <div id="about-window" class="win">
+      <div class="win-titlebar">
+        <span>About Library Tool</span>
+        <button id="about-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
+      </div>
+      <div id="about-body">
+        <img id="about-icon" src="{{ url_for('static', filename='icon.png') }}"
+             width="56" height="56" alt="" />
+        <div class="about-title">Library Tool <span id="about-ver">v{{ app_version }}</span></div>
+        <p class="about-desc">A desktop cataloguing and OCR workbench for the World Herb
+          Library — building, verifying, and publishing an archival catalogue of
+          historical herbals.</p>
+        <div class="about-links">
+          <button class="cad-btn" data-cmd="site-home" type="button">Website</button>
+          <button class="cad-btn" data-cmd="changelog" type="button">Changelog</button>
         </div>
       </div>
     </div>
