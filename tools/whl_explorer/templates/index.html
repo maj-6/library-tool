@@ -114,7 +114,7 @@
             <h1>Library Tool <span id="home-ver"></span></h1>
           </div>
           <img id="home-icon" src="{{ url_for('static', filename='icon.png') }}"
-               width="76" height="76" alt="" />
+               width="64" height="64" alt="" />
         </div>
         <div id="home-cols">
           <div class="home-card">
@@ -129,6 +129,13 @@
             <div class="home-h">Contributors</div>
             <div id="home-users"></div>
           </div>
+        </div>
+        <div class="home-card home-reviews-card">
+          <div class="home-h home-reviews-h">
+            <span>Awaiting review</span>
+            <label class="home-rv-resolved"><input id="home-review-resolved" type="checkbox" /> Show resolved</label>
+          </div>
+          <div id="home-reviews" class="review-host"></div>
         </div>
       </div>
     </section>
