@@ -64,10 +64,12 @@ jobs:
             # strip any CR/LF/space first: a secret uploaded from a Windows
             # CRLF .b64 carries a \r that GNU `base64 -d` rejects (invalid input)
             echo "$KS_B64" | tr -d '\r\n ' | base64 -d > "$RUNNER_TEMP/keystore.jks"
+            # the password/alias secrets were uploaded the same Windows way, so
+            # strip any stray CR too — a trailing \r reads as a wrong password.
             {
               echo "WHL_KEYSTORE_FILE=$RUNNER_TEMP/keystore.jks"
-              echo "WHL_KEYSTORE_PASSWORD=$KS_PASS"
-              echo "WHL_KEY_ALIAS=${KS_ALIAS:-bookcapture}"
+              echo "WHL_KEYSTORE_PASSWORD=$(printf '%s' "$KS_PASS" | tr -d '\r\n')"
+              echo "WHL_KEY_ALIAS=$(printf '%s' "${KS_ALIAS:-bookcapture}" | tr -d '\r\n')"
             } >> "$GITHUB_ENV"
           else
             echo "::warning::No ANDROID_KEYSTORE_B64 secret: signing with the \
