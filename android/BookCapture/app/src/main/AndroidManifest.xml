@@ -16,9 +16,10 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.BookCapture">
 
-        <!-- keep-screen-on is a window flag set in MainActivity.onCreate -->
+        <!-- Home is the landing screen: the app opens on the recent-scans list,
+             not the camera. -->
         <activity
-            android:name=".MainActivity"
+            android:name=".HomeActivity"
             android:exported="true"
             android:screenOrientation="portrait">
             <intent-filter>
@@ -26,6 +27,14 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Capture, reached from Home's "New scan". keep-screen-on is a window
+             flag set in MainActivity.onCreate. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="false"
+            android:parentActivityName=".HomeActivity"
+            android:screenOrientation="portrait" />
 
         <activity
             android:name=".LoginActivity"
