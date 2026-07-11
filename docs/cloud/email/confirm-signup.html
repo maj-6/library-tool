@@ -1,0 +1,56 @@
+<!-- Supabase → Authentication → Email Templates → "Confirm signup"
+     Subject:  Confirm your Library Tool account
+
+     Paste the markup below into the template body. Supabase substitutes
+     {{ .ConfirmationURL }} with the verify link (which then redirects to the
+     Site URL / redirect_to — the desktop points it at .../confirmed.html).
+     Email clients ignore <style> blocks and external CSS, so every style here
+     is inline. -->
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+       style="background:#f7f4ec;margin:0;padding:28px 0;">
+  <tr>
+    <td align="center">
+      <table role="presentation" width="480" cellpadding="0" cellspacing="0"
+             style="width:480px;max-width:92%;background:#fbf8f1;border:1px solid #d8d1c1;border-radius:8px;">
+        <tr>
+          <td style="padding:30px 34px 8px;font-family:'Roboto Slab',Georgia,serif;font-size:15px;font-weight:600;letter-spacing:0.3px;color:#6d665a;">
+            Library Tool
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:6px 34px 0;font-family:'Roboto Slab',Georgia,serif;font-size:24px;font-weight:600;color:#2a2620;">
+            Confirm your email
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:14px 34px 0;font-family:Georgia,serif;font-size:16px;line-height:1.6;color:#4a4438;">
+            Welcome. You’re one step from a Library Tool account. Confirm this
+            address, then return to the app and sign in with your email and
+            password.
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:24px 34px 6px;">
+            <a href="{{ .ConfirmationURL }}"
+               style="display:inline-block;background:#3c5b52;color:#f7f4ec;text-decoration:none;font-family:'Roboto Slab',Georgia,serif;font-size:15px;font-weight:600;padding:11px 22px;border-radius:6px;">
+              Confirm this email
+            </a>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:12px 34px 0;font-family:Georgia,serif;font-size:13px;line-height:1.6;color:#6d665a;">
+            If the button doesn’t work, copy this link into your browser:<br />
+            <a href="{{ .ConfirmationURL }}" style="color:#3c5b52;word-break:break-all;">{{ .ConfirmationURL }}</a>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:22px 34px 30px;border-top:1px solid #ece7db;margin-top:20px;font-family:Georgia,serif;font-size:13px;line-height:1.6;color:#9a927f;">
+            Library Tool catalogues old and rare works on botany and herbal
+            medicine. If you didn’t create an account, you can ignore this
+            email — nothing will happen until the address is confirmed.
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+</table>

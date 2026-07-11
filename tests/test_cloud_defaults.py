@@ -86,3 +86,53 @@ def test_auth_status_reports_cloud_without_any_settings(settings, client):
     r = client.get("/api/auth/status").get_json()
     assert r["cloud"] is True
     assert r["signed_in"] is False
+
+
+# --- signup confirmation redirect (the ERR_CONNECTION_REFUSED fix) --------------
+
+def test_confirm_redirect_defaults_to_the_website(settings):
+    settings(cloudSiteUrl="")
+    assert server._email_confirm_redirect() == \
+        cloud_defaults.WEBSITE_URL + "/confirmed.html"
+
+
+def test_confirm_redirect_honours_a_custom_site(settings):
+    settings(cloudSiteUrl="https://example.org/lib/")   # trailing slash trimmed
+    assert server._email_confirm_redirect() == "https://example.org/lib/confirmed.html"
+
+
+def test_sign_up_encodes_redirect_to_on_the_signup_path(monkeypatch):
+    import supabase_auth as sauth
+    seen = {}
+
+    def fake_post(cfg, path, payload, bearer=""):
+        seen["path"] = path
+        return {}                       # confirm-required: no access_token
+    monkeypatch.setattr(sauth, "_post", fake_post)
+    out = sauth.sign_up({"url": "https://x.co", "key": "k"}, "a@b.co", "pw",
+                        "Nom", redirect_to="https://site/confirmed.html")
+    assert out is None
+    assert seen["path"] == "signup?redirect_to=https%3A%2F%2Fsite%2Fconfirmed.html"
+
+
+def test_sign_up_without_redirect_is_a_plain_signup(monkeypatch):
+    import supabase_auth as sauth
+    seen = {}
+    monkeypatch.setattr(sauth, "_post",
+                        lambda cfg, path, payload, bearer="": seen.update(path=path) or {})
+    sauth.sign_up({"url": "https://x.co", "key": "k"}, "a@b.co", "pw", "Nom")
+    assert seen["path"] == "signup"
+
+
+def test_signup_endpoint_passes_the_confirmation_redirect(settings, client, monkeypatch):
+    settings(supabaseUrl="", supabaseAnonKey="", supabaseKey="", cloudSiteUrl="")
+    seen = {}
+
+    def fake_sign_up(cfg, email, password, name, redirect_to=""):
+        seen["redirect_to"] = redirect_to
+        return None                     # confirmation required
+    monkeypatch.setattr(server.sauth, "sign_up", fake_sign_up)
+    r = client.post("/api/auth/signup",
+                    json={"email": "a@b.co", "password": "secret"}).get_json()
+    assert r == {"ok": True, "confirm": True}
+    assert seen["redirect_to"] == cloud_defaults.WEBSITE_URL + "/confirmed.html"

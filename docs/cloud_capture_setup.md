@@ -52,6 +52,12 @@ The `captures` bucket stays small: after an entry is imported the desktop
 keeps the processed photos locally under `DATA_ROOT/captures/<id>/` and (by
 default) deletes the cloud copies.
 
+## 5. Accounts: confirmation links + email copy
+
+If people will sign in from the app, set the auth **Site URL / Redirect URLs**
+(a fresh project's default makes confirmation links refuse the connection) and
+the project-specific confirmation email — both in **[docs/cloud/auth_setup.md](cloud/auth_setup.md)**.
+
 ## Notes
 
 - If both apps use the service_role key, leave RLS off on these two tables

@@ -21,3 +21,13 @@ SUPABASE_ANON_KEY = (
     "ImFub24iLCJpYXQiOjE3ODM2NDg3MDQsImV4cCI6MjA5OTIyNDcwNH0."
     "bQ9YOFntTfsbNngl5rcm4mB2DP7gq67zEPufdxHkzkI"
 )
+
+# The public website (GitHub Pages). The desktop has no web server of its own —
+# it runs on a throwaway loopback port — so the account-confirmation email must
+# land somewhere real and stable. It lands on WEBSITE_URL/confirmed.html, which
+# tells the user to return to the app and sign in. Signup sends this as GoTrue's
+# `redirect_to`; the Supabase project's Site URL should also point here, so the
+# link works even for the default (no-redirect) flow. Settings > Sync can
+# override it (cloudSiteUrl) for a fork pointed at its own project + site.
+WEBSITE_URL = "https://maj-6.github.io/library-tool"
+EMAIL_CONFIRM_PATH = "/confirmed.html"

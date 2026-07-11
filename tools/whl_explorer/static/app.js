@@ -153,30 +153,42 @@ const state = {
 // bands) onto the same fixed geometry.
 const THEMES = [
   ["sage", "Sage"],
-  ["ledger", "Archive Ledger"],
-  ["foolscap", "Foolscap"],
+  ["ledger", "Ledger"],
+  ["foolscap", "Manuscript"],
   ["vellum", "Vellum"],
   ["linen", "Linen"],
-  ["platinum", "Platinum"],
 ];
 const DEFAULT_THEME = "sage";
 // Retired ids map to the survivor closest in spirit, so a stored theme never
 // falls through to the bare :root fallback. "" was Classic CAD, the old default.
 const LEGACY_THEMES = {
   "": DEFAULT_THEME,
-  // removed 2026-07-10 -> nearest surviving chrome
-  quarto: "platinum", pewter: "platinum", folio: "linen",
-  redmond: "platinum", motif: "platinum",
+  // platinum retired 2026-07-11 -> linen, the surviving neutral; every chrome
+  // id that used to inherit platinum follows it there.
+  platinum: "linen",
+  quarto: "linen", pewter: "linen", folio: "linen",
+  redmond: "linen", motif: "linen",
   // the dark/loud round, retired earlier
-  scope: "platinum", "terminal-amber": "vellum", "blueprint-linen": "linen",
-  oxblood: "ledger", porcelain: "platinum", herbarium: "vellum",
+  scope: "linen", "terminal-amber": "vellum", "blueprint-linen": "linen",
+  oxblood: "ledger", porcelain: "linen", herbarium: "vellum",
   // the original classic-chrome set
-  blueprint: "linen", modern: "platinum",
-  dark: "platinum", stone: "linen", midnight: "platinum",
-  cde: "platinum", xp2003: "platinum", acad: "platinum",
-  workstation: "platinum", slate: "platinum", mainframe: "vellum",
-  graphite: "platinum",
+  blueprint: "linen", modern: "linen",
+  dark: "linen", stone: "linen", midnight: "linen",
+  cde: "linen", xp2003: "linen", acad: "linen",
+  workstation: "linen", slate: "linen", mainframe: "vellum",
+  graphite: "linen",
 };
+
+// OCR engines, mirrored from the two <select id="…ocr-service"> lists so the
+// Settings-menu picker stays in step with them (index.html).
+const OCR_SERVICES = [
+  ["tesseract", "Tesseract (local)"],
+  ["mistral", "Mistral OCR"],
+  ["claude", "Claude"],
+  ["textract", "Amazon Textract"],
+  ["azure", "Azure Document Intelligence"],
+  ["openai", "OpenAI vision"],
+];
 
 // One shared font list; the interface (--ui) and data/table (--mono) fonts
 // are chosen independently from it.
@@ -11247,6 +11259,18 @@ const MENU_CMDS = {
   "setup-guide": () => showWizard(),
   "changelog": () => openChangelog(),
   "site-home": () => openWebView("https://maj-6.github.io/library-tool/"),
+  // quick settings (mirror the Settings-dialog handlers, side effects and all)
+  "opt-auto-ia": () => {
+    const on = state.settings.autoIaDownload === false;   // was off -> turning on
+    state.settings.autoIaDownload = on;
+    if (!on) { state.autoDlQueue = []; updateDlProgress(); }   // off: drop the queue
+    saveSettings();
+  },
+  "opt-expand-sets": () => {
+    state.settings.expandSets = !state.settings.expandSets;
+    saveSettings();
+    renderChecked();                                       // the checked table shows sets
+  },
 };
 
 // Settings > (themes): generated from THEMES so adding a theme needs no markup.
@@ -11258,6 +11282,31 @@ function buildThemeMenu() {
   for (const [id, label] of THEMES) {
     const cmd = "theme:" + id;
     MENU_CMDS[cmd] = () => setTheme(id);
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "menu-item";
+    b.dataset.cmd = cmd;
+    b.innerHTML = `<span class="menu-check"></span>${esc(label)}`;
+    host.appendChild(b);
+  }
+}
+
+// Settings > OCR engine: the same generated-picker pattern as themes. The value
+// lives in TWO <select>s (the OCR toolbar + the Settings dialog); keep both in
+// step, exactly as the dialog's onchange does.
+function setOcrService(id) {
+  state.settings.ocrService = id;
+  saveSettings();
+  const q = el("ocr-service"); if (q) q.value = id;
+  const s = el("set-ocr-service"); if (s) s.value = id;
+}
+function buildOcrMenu() {
+  const host = el("menu-ocr-service");
+  if (!host) return;
+  host.innerHTML = "";
+  for (const [id, label] of OCR_SERVICES) {
+    const cmd = "ocrsvc:" + id;
+    MENU_CMDS[cmd] = () => setOcrService(id);
     const b = document.createElement("button");
     b.type = "button";
     b.className = "menu-item";
@@ -11286,11 +11335,16 @@ function updateMenuState() {
   check("search-pane", state.settings.showCatalog);
   check("table-checked", onChecked);
   check("table-whl", !onChecked);
+  check("opt-auto-ia", state.settings.autoIaDownload !== false);   // default-on
+  check("opt-expand-sets", !!state.settings.expandSets);
   for (const [id] of THEMES) check("theme:" + id, id === state.settings.theme);
+  const svc = state.settings.ocrService || "tesseract";
+  for (const [id] of OCR_SERVICES) check("ocrsvc:" + id, id === svc);
 }
 
 function initMenubar() {
   buildThemeMenu();
+  buildOcrMenu();
   const menus = [...document.querySelectorAll("#menubar .menu")];
   let openMenu = null;
   const closeAll = () => {
@@ -11326,6 +11380,7 @@ function initMenubar() {
   document.addEventListener("click", (ev) => {
     const item = ev.target.closest("#menubar .menu-item");
     if (!item || item.disabled) return;
+    if (item.classList.contains("menu-sub")) return;   // a submenu parent only opens its child (on hover)
     closeAll();
     const cmd = MENU_CMDS[item.dataset.cmd];
     if (cmd) cmd();

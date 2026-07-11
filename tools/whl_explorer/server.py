@@ -292,6 +292,15 @@ def _auth_cfg() -> dict | None:
     return {"url": url, "key": key} if url and key else None
 
 
+def _email_confirm_redirect() -> str:
+    """Where the signup-confirmation email link should land: the public
+    website's confirmation page, since the desktop has no stable URL of its
+    own. Overridable (cloudSiteUrl) for a fork on its own project + site."""
+    base = (str(_client_settings().get("cloudSiteUrl") or "").strip().rstrip("/")
+            or cloud_defaults.WEBSITE_URL)
+    return base + cloud_defaults.EMAIL_CONFIRM_PATH
+
+
 def _auth_session() -> dict | None:
     """A live session, refreshed when stale. Refresh tokens rotate, so the
     refreshed session is persisted before anything uses it, under the lock —
@@ -411,7 +420,8 @@ def api_auth_signup():
     if len(password) < 6:
         return jsonify({"ok": False, "error": "password must be at least 6 characters"}), 400
     try:
-        ses = sauth.sign_up(cfg, email, password, name)
+        ses = sauth.sign_up(cfg, email, password, name,
+                            redirect_to=_email_confirm_redirect())
     except sauth.AuthError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     if ses is None:     # project requires email confirmation (the default)
