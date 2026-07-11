@@ -1,7 +1,7 @@
 /* World Herb Library — the archival catalogue.
    A SEPARATE, denser layout from the site pages (site.css): an application-like
    catalogue idiom in the manner of archive.org collections and the HathiTrust
-   catalogue. Light only. Same Linen palette family and the same self-hosted
+   catalogue. Light only. Same Vellum palette family and the same self-hosted
    Roboto Slab, duplicated here so these three pages (browse / book / read)
    stand entirely on their own.
    No build step, no framework, no CDN. */
@@ -25,19 +25,19 @@
 }
 
 :root {
-  --paper: #f1efe8;
-  --card: #faf8f2;
-  --chrome: #e8e4da;
-  --rule: #948e7e;
-  --rule-mid: #c3beb1;
-  --rule-soft: #e2dfd5;
-  --ink: #2c2a24;
-  --ink-soft: #5f5a4f;
-  --ink-faint: #928c7d;
-  --accent: #3c5570;        /* the slate band (Linen active mark) */
-  --accent-ink: #356a60;    /* Linen's teal */
-  --chip: #e9e6dd;
-  --warn-bg: #faf8ee;
+  --paper: #f5efe1;
+  --card: #fbf7ee;
+  --chrome: #ece4d2;
+  --rule: #a89c84;
+  --rule-mid: #cec5b1;
+  --rule-soft: #e8e0cd;
+  --ink: #2a2118;
+  --ink-soft: #5c5346;
+  --ink-faint: #978c77;
+  --accent: #4c6a34;        /* muted botanical-green band */
+  --accent-ink: #46602e;    /* the same green, deepened */
+  --chip: #ece4d1;
+  --warn-bg: #faf4e6;
   --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
   --shell: 1440px;
 }
