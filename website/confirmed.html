@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Email confirmed · Library Tool</title>
+<link rel="icon" href="assets/icon.png" />
+<!-- Deliberately self-contained (like 404.html). Supabase appends a token or
+     an error to the URL fragment when it redirects here; keeping the styles
+     inline means the page renders no matter what trails the path. -->
+<style>
+  :root {
+    --paper:#f7f4ec; --card:#fbf8f1; --rule:#d8d1c1;
+    --ink:#2a2620; --ink-soft:#6d665a; --accent:#3c5b52;
+    --slab:"Roboto Slab",Georgia,"Times New Roman",serif;
+  }
+  html,body { margin:0; height:100%; }
+  body {
+    background:var(--paper); color:var(--ink);
+    font:16px/1.6 Georgia,"Iowan Old Style","Palatino Linotype",serif;
+    display:flex; align-items:center; justify-content:center; text-align:center;
+    padding:0 20px;
+  }
+  main { max-width:440px; }
+  .mark {
+    font-family:var(--slab); font-weight:600; font-size:15px;
+    letter-spacing:0.3px; color:var(--ink-soft); text-transform:none;
+    margin-bottom:26px;
+  }
+  .mark img { width:34px; height:34px; vertical-align:middle; margin-right:9px; }
+  h1 {
+    font-family:var(--slab); font-weight:600; font-size:27px;
+    letter-spacing:0.2px; margin:0 0 12px;
+  }
+  p { color:var(--ink-soft); margin:0 0 14px; }
+  .card {
+    background:var(--card); border:1px solid var(--rule); border-radius:8px;
+    padding:30px 28px 26px;
+  }
+  .foot { font-size:13px; color:var(--ink-soft); margin-top:22px; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <div class="mark"><img src="assets/icon.png" alt="" />Library Tool</div>
+  <div class="card">
+    <h1 id="head">Email confirmed</h1>
+    <p id="msg">Your account is ready. Return to <b>Library Tool</b> and sign in
+       with your email and password.</p>
+  </div>
+  <p class="foot">Library Tool catalogues old and rare works on botany and herbal
+     medicine. <a id="home" href="/">Learn more</a>.</p>
+</main>
+<script>
+  // A project site lives under /<repo>/; a custom domain at /.
+  (function () {
+    var seg = location.pathname.split("/")[1];
+    document.getElementById("home").href =
+      location.hostname.endsWith("github.io") && seg ? "/" + seg + "/" : "/";
+
+    // Supabase reports a bad link via error params, in the hash (implicit flow)
+    // or the query. Read both and, if present, say so plainly instead of
+    // claiming success.
+    var p = new URLSearchParams(location.hash.slice(1));
+    var q = new URLSearchParams(location.search);
+    var err = p.get("error_description") || q.get("error_description") ||
+              p.get("error") || q.get("error");
+    if (err) {
+      document.getElementById("head").textContent = "Link expired";
+      document.getElementById("msg").innerHTML =
+        "This confirmation link is no longer valid — they are single-use and " +
+        "time-limited. Open <b>Library Tool</b> and create the account again, or " +
+        "just sign in if it already went through.";
+    }
+  })();
+</script>
+</body>
+</html>

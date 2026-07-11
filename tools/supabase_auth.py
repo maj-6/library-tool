@@ -104,11 +104,21 @@ def sign_in(cfg: dict, email: str, password: str) -> dict:
     return _session(body)
 
 
-def sign_up(cfg: dict, email: str, password: str, display_name: str) -> dict | None:
+def sign_up(cfg: dict, email: str, password: str, display_name: str,
+            redirect_to: str = "") -> dict | None:
     """Create an account. Returns a session, or None when the project requires
     email confirmation first (the default) -- the caller tells the user to go
-    click the link and sign in afterwards."""
-    body = _post(cfg, "signup", {
+    click the link and sign in afterwards.
+
+    `redirect_to` is where the confirmation link sends the browser after GoTrue
+    verifies the token. Passed as a query param on /signup; GoTrue honours it
+    only when it matches the project's allow-listed Redirect URLs, otherwise it
+    falls back to the Site URL. Without either pointing somewhere real, the
+    default (localhost:3000) is what refuses the connection."""
+    path = "signup"
+    if redirect_to:
+        path += "?redirect_to=" + urllib.parse.quote(redirect_to, safe="")
+    body = _post(cfg, path, {
         "email": email, "password": password,
         "data": {"display_name": display_name},
     })
