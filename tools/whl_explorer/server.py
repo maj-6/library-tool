@@ -1183,8 +1183,8 @@ def api_categories_adopt():
 
     # pass 2: assign. Store writes take their own locks; records are re-read
     # so nothing that changed since pass 1 is clobbered.
-    ids_for = lambda labs: [by_name[l.lower()] for l in labs   # noqa: E731
-                            if l.lower() in by_name]
+    ids_for = lambda labs: [by_name[lab.lower()] for lab in labs   # noqa: E731
+                            if lab.lower() in by_name]
     assigned = 0
     with _builds_lock:
         builds = lib.load_json(BUILDS_PATH, {})
@@ -4619,7 +4619,7 @@ def _publish_bundle(cloud: dict, slug: str, art: dict) -> None:
                  "updated_at": now}
                 for lang in kept for n, t in sorted(art["pages"][lang].items())]
         sbase.upsert_rows(cloud, "volume_pages", "slug,lang,page", rows)
-        langs_in = ",".join(f'"{l}"' for l in kept)
+        langs_in = ",".join(f'"{lang}"' for lang in kept)
         sbase.delete_rows(cloud, "volume_pages",
                           f"slug=eq.{q(slug)}&lang=not.in.({q(langs_in)})")
         for lang in kept:
