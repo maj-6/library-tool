@@ -11380,18 +11380,31 @@ async function toggleTitlePage(bid, page) {
 // corner chips + outlines on the page rows: T = title page, amber chip =
 // staged (awaiting submit), cyan chip = processing, amber outline = selected
 function decorateOcrPages() {
+  const box = el("ocr-pages");
+  // Hidden (another tab, or a background job while the user is elsewhere): the
+  // chips are pure display over ocrState, so skip — a return to the tab
+  // re-renders and re-decorates with the box visible.
+  if (box.offsetParent === null) return;
   const d = ocrSelDoc();
   const b = d && d.buildId ? state.builds[d.buildId] : null;
   const titles = titlePageSet(b);
-  document.querySelectorAll("#ocr-pages .ocr-pgrow").forEach((row) => {
+  box.querySelectorAll(".ocr-pgrow").forEach((row) => {
     const n = +row.dataset.page;
     const k = `${d && d.buildId}:${ocrState.pagesSrc}:${n}`;
     const staged = b ? ocrState.pageTags.get(k) : undefined;
     const running = b ? ocrState.pageRunning.get(k) : undefined;
-    row.classList.toggle("pg-title", titles.has(n));
+    const title = titles.has(n);
+    row.classList.toggle("pg-title", title);
     row.classList.toggle("pg-staged", !!staged);
     row.classList.toggle("pg-queued", !!running);
     row.classList.toggle("pg-sel", ocrState.pageSel.has(n));
+    // The chip HTML depends only on title/staged/running. Rebuild it only when
+    // one of those changed, so the 1.5s job poller doesn't rewrite every row's
+    // innerHTML every tick — on a long book only the handful of pages that just
+    // changed state get touched. (Selection is a class-only cue, not a chip.)
+    const sig = `${title ? "T" : ""}|${staged || ""}|${running || ""}`;
+    if (row.dataset.chipSig === sig) return;
+    row.dataset.chipSig = sig;
     let chip = row.querySelector(".pg-chips");
     if (!chip) {
       chip = document.createElement("span");
@@ -11399,7 +11412,7 @@ function decorateOcrPages() {
       row.querySelector(".ocr-pgimg").appendChild(chip);
     }
     chip.innerHTML =
-      (titles.has(n) ? `<span class="pg-chip title" data-tip="Title page">T</span>` : "") +
+      (title ? `<span class="pg-chip title" data-tip="Title page">T</span>` : "") +
       (staged ? `<span class="pg-chip staged" data-tip="Staged: ${esc(OCR_SERVICE_LABELS[staged])} — press submit">${esc(staged.slice(0, 2).toUpperCase())}</span>` : "") +
       (running ? `<span class="pg-chip svc" data-tip="Processing: ${esc(OCR_SERVICE_LABELS[running])}">${esc(running.slice(0, 2).toUpperCase())}</span>` : "");
   });
