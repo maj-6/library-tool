@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -1770,6 +1771,76 @@ def _cached_page_file(path: Path, mimetype: str):
     return resp
 
 
+def _pages_cache_dir() -> Path:
+    d = lib.DATA_ROOT / "downloads" / "cache" / "pages"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _page_cache_key(path: Path, mtime: float, page: int, width: int) -> str:
+    """Content address for one rendered page: the same (path, mtime, page,
+    width) always maps to the same cache file, so the background warmer and the
+    live endpoint share files with no coordination."""
+    return hashlib.sha1(
+        f"{path}|{mtime}|{page}|{width}".encode("utf-8")).hexdigest()[:16]
+
+
+# Warming the page cache in the background. The reader hits /api/pdf/info the
+# instant a book opens, so that is where rendering every page at the reader's
+# width into the same on-disk cache is kicked off. Ship-1 windowing means the
+# viewport only fetches a few pages, but a fast scroll to page 900 then lands on
+# a warm file instead of a cold render. Warmed once per (path, mtime, width); a
+# re-saved file re-warms under its new mtime. Storage here is deliberately
+# unbounded — precomputing the whole book is the point.
+_warm_started: set = set()
+_warm_lock = threading.Lock()
+
+
+def _warm_pages_async(path: Path, width: int = 700) -> None:
+    try:
+        import fitz  # noqa: F401  -- no renderer, nothing to warm
+    except ImportError:
+        return
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return
+    key = (str(path), mtime, width)
+    with _warm_lock:
+        if key in _warm_started:
+            return
+        _warm_started.add(key)
+
+    def run():
+        import fitz
+        cache = _pages_cache_dir()
+        try:
+            doc = fitz.open(str(path))
+        except Exception:
+            with _warm_lock:
+                _warm_started.discard(key)       # a later open may still work
+            return
+        try:
+            for page in range(1, doc.page_count + 1):
+                ck = _page_cache_key(path, mtime, page, width)
+                if (cache / f"{ck}.jpg").is_file() or (cache / f"{ck}.png").is_file():
+                    continue
+                try:
+                    pg = doc[page - 1]
+                    zoom = width / max(1.0, pg.rect.width)
+                    pix = pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+                    tmp = cache / f"{ck}.warm.tmp.jpg"
+                    tmp.write_bytes(pix.tobytes("jpeg", jpg_quality=82))
+                    tmp.replace(cache / f"{ck}.jpg")
+                except Exception:
+                    pass             # a page that won't encode is left to the live path
+                time.sleep(0.005)    # yield so interactive renders stay snappy
+        finally:
+            doc.close()
+
+    threading.Thread(target=run, daemon=True, name="pdf-warm").start()
+
+
 @app.route("/api/pdf/words")
 def api_pdf_words():
     """Word boxes of one page of a local PDF (?path=&page=N).
@@ -1939,6 +2010,7 @@ def api_pdf_info():
     dimensions let the client reserve every page's box before its image
     loads, so lazy loading never shifts the scroll position."""
     p = _pageimg_pdf(request.args.get("path"))
+    _warm_pages_async(p)          # fill the page cache ahead of the scroll
     key = str(p)
     try:
         mtime = p.stat().st_mtime
@@ -1985,11 +2057,8 @@ def api_pdf_pageimg():
         import fitz  # PyMuPDF
     except ImportError:
         return jsonify({"ok": False, "error": "PyMuPDF is not installed"}), 501
-    import hashlib
-    cache = lib.DATA_ROOT / "downloads" / "cache" / "pages"
-    cache.mkdir(parents=True, exist_ok=True)
-    key = hashlib.sha1(
-        f"{p}|{p.stat().st_mtime}|{page}|{w}".encode("utf-8")).hexdigest()[:16]
+    cache = _pages_cache_dir()
+    key = _page_cache_key(p, p.stat().st_mtime, page, w)
     old = cache / f"{key}.png"
     if old.is_file():
         return _cached_page_file(old, "image/png")
