@@ -128,15 +128,32 @@ jobs:
 
       # The two halves of `npm run dist`, spelled out: that script calls
       # `python3` (the build machine's bare `python` is an unrelated toolchain),
-      # while the runner only guarantees `python`. No code signing on CI, so
-      # keep electron-builder from hunting for a cert.
+      # while the runner only guarantees `python`.
       - name: Freeze the sidecar
         run: python -m PyInstaller --clean --noconfirm --distpath dist-sidecar --workpath build-sidecar sidecar/whl_explorer.spec
 
+      # Sign only when the cert secret is present. electron-builder's CSC_LINK
+      # takes the PFX as base64 directly, so no file is written to disk. Without
+      # the secret the installer builds unsigned (auto-discovery off so
+      # electron-builder doesn't hunt the runner's cert store). A self-managed
+      # PKI cert clears the "unknown publisher" warning only on machines that
+      # trust its root CA; public downloaders still see it until a CA-issued
+      # cert (e.g. Azure Trusted Signing) fills WIN_CSC_LINK_B64.
       - name: Build the installer
+        shell: bash
         env:
-          CSC_IDENTITY_AUTO_DISCOVERY: "false"
-        run: npx electron-builder --win --publish never
+          WIN_CSC_LINK_B64: ${{ secrets.WIN_CSC_LINK_B64 }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: |
+          if [ -n "$WIN_CSC_LINK_B64" ]; then
+            export CSC_LINK="$WIN_CSC_LINK_B64"
+            export CSC_KEY_PASSWORD="$WIN_CSC_KEY_PASSWORD"
+            echo "Signing the installer with the configured certificate."
+          else
+            export CSC_IDENTITY_AUTO_DISCOVERY=false
+            echo "::warning::No WIN_CSC_LINK_B64 secret: the installer will be unsigned."
+          fi
+          npx electron-builder --win --publish never
 
       - name: Read the version
         id: ver

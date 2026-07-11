@@ -3,6 +3,11 @@
 Terse notes, newest first. The desktop app reads this same file
 (Help → View changelog); the website renders it on Downloads and Release notes.
 
+## 3.1.2 — 2026-07-10
+- Updates now install silently in the background and relaunch on their own — no installer window or clicks. (Takes effect for updates *from* this version onward.)
+- Tidied the update progress window: removed the empty space above the title.
+- The Windows installer is now code-signed.
+
 ## 3.1.1 — 2026-07-10
 - Refreshed the theme set: a focused lineup of six (Sage, Archive Ledger, Foolscap, Vellum, Linen, Platinum), with a warmer Sage. (This shipped in the source just after 3.1.0 was built, so it missed that release.)
 
