@@ -61,7 +61,9 @@ jobs:
           KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
         run: |
           if [ -n "$KS_B64" ]; then
-            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/keystore.jks"
+            # strip any CR/LF/space first: a secret uploaded from a Windows
+            # CRLF .b64 carries a \r that GNU `base64 -d` rejects (invalid input)
+            echo "$KS_B64" | tr -d '\r\n ' | base64 -d > "$RUNNER_TEMP/keystore.jks"
             {
               echo "WHL_KEYSTORE_FILE=$RUNNER_TEMP/keystore.jks"
               echo "WHL_KEYSTORE_PASSWORD=$KS_PASS"
