@@ -1,9 +1,9 @@
 /* World Herb Library — the archival catalogue.
-   A SEPARATE design from the marketing pages (site.css): an application-like,
-   denser catalogue idiom in the manner of archive.org collections and the
-   HathiTrust catalogue. Light only. Same Archive Ledger palette family and the
-   same self-hosted Roboto Slab, duplicated here so these three pages
-   (browse / book / read) stand entirely on their own.
+   A SEPARATE, denser layout from the site pages (site.css): an application-like
+   catalogue idiom in the manner of archive.org collections and the HathiTrust
+   catalogue. Light only. Same Linen palette family and the same self-hosted
+   Roboto Slab, duplicated here so these three pages (browse / book / read)
+   stand entirely on their own.
    No build step, no framework, no CDN. */
 
 /* --- fonts (duplicated from site.css so this stylesheet is independent) --- */
@@ -25,19 +25,19 @@
 }
 
 :root {
-  --paper: #fbfaf7;
-  --card: #fffefc;
-  --chrome: #f6f5f1;
-  --rule: #8f8d84;
-  --rule-mid: #c8c6bd;
-  --rule-soft: #e6e4db;
-  --ink: #26241f;
-  --ink-soft: #5c5a52;
-  --ink-faint: #8f8d84;
-  --accent: #3d443e;        /* the slate-green band */
-  --accent-ink: #22685e;
-  --chip: #f0efe9;
-  --warn-bg: #fffef6;
+  --paper: #f1efe8;
+  --card: #faf8f2;
+  --chrome: #e8e4da;
+  --rule: #948e7e;
+  --rule-mid: #c3beb1;
+  --rule-soft: #e2dfd5;
+  --ink: #2c2a24;
+  --ink-soft: #5f5a4f;
+  --ink-faint: #928c7d;
+  --accent: #3c5570;        /* the slate band (Linen active mark) */
+  --accent-ink: #356a60;    /* Linen's teal */
+  --chip: #e9e6dd;
+  --warn-bg: #faf8ee;
   --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
   --shell: 1440px;
 }
