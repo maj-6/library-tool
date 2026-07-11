@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/whl_canvas">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="12dp">
+
+        <LinearLayout style="@style/WhlPanelSection"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/title"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textSize="17sp"
+                android:textStyle="bold"
+                android:textColor="@color/whl_ink" />
+
+            <TextView
+                android:id="@+id/subline"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:fontFamily="monospace"
+                android:textSize="12sp"
+                android:textColor="@color/whl_ink_dim" />
+
+            <TextView
+                android:id="@+id/stateLine"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:fontFamily="monospace"
+                android:textSize="11sp"
+                android:textAllCaps="true"
+                android:textColor="@color/whl_ink_dim" />
+
+            <!-- extracted fields, one mono row each, added in code -->
+            <LinearLayout
+                android:id="@+id/fields"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:orientation="vertical" />
+        </LinearLayout>
+
+        <LinearLayout style="@style/WhlPanelSection"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="vertical">
+            <TextView style="@style/WhlLabel"
+                android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:text="@string/detail_photos" />
+            <HorizontalScrollView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp">
+                <LinearLayout
+                    android:id="@+id/photos"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal" />
+            </HorizontalScrollView>
+        </LinearLayout>
+
+        <LinearLayout style="@style/WhlPanelSection"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="vertical">
+            <TextView style="@style/WhlLabel"
+                android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:text="@string/detail_ocr" />
+            <TextView
+                android:id="@+id/ocrText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:fontFamily="monospace"
+                android:textSize="11sp"
+                android:textIsSelectable="true"
+                android:textColor="@color/whl_ink" />
+        </LinearLayout>
+
+        <Button
+            android:id="@+id/discard"
+            style="@style/WhlButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:layout_gravity="end"
+            android:textSize="12sp"
+            android:textColor="@color/whl_red"
+            android:paddingStart="14dp"
+            android:paddingEnd="14dp"
+            android:visibility="gone"
+            android:text="@string/detail_discard" />
+    </LinearLayout>
+</ScrollView>

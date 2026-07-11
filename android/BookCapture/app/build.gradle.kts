@@ -11,6 +11,14 @@ plugins {
 val releaseKeystore: String? =
     System.getenv("WHL_KEYSTORE_FILE")?.takeIf { it.isNotBlank() }
 
+// The Supabase project the app signs into. The anon key is public by design
+// (the website ships it to every visitor); it is the LOGIN that authorizes
+// anything. CI injects these from the repo variables; a blank fallback just
+// means Settings must point at a project before first use. Escaped so a stray
+// quote/backslash in a var can't break the generated BuildConfig string.
+fun env(name: String) = (System.getenv(name)?.trim() ?: "")
+    .replace("\\", "\\\\").replace("\"", "\\\"")
+
 android {
     namespace = "org.whl.bookcapture"
     compileSdk = 34
@@ -19,8 +27,10 @@ android {
         applicationId = "org.whl.bookcapture"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 3
+        versionName = "2.0"
+        buildConfigField("String", "SUPABASE_URL", "\"${env("WHL_SUPABASE_URL")}\"")
+        buildConfigField("String", "SUPABASE_ANON_KEY", "\"${env("WHL_SUPABASE_ANON_KEY")}\"")
     }
 
     signingConfigs {
@@ -53,6 +63,7 @@ android {
     }
     buildFeatures {
         viewBinding = true
+        buildConfig = true
     }
 }
 
@@ -63,6 +74,7 @@ dependencies {
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
+    implementation("androidx.exifinterface:exifinterface:1.3.7")
 
     val camerax = "1.3.4"
     implementation("androidx.camera:camera-core:$camerax")

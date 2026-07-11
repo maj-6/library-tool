@@ -77,7 +77,13 @@ jobs:
           different key needs an uninstall first."
           fi
 
+      # The anon key is public by design (the website ships it to every
+      # visitor); baking it in spares first-run typing — sign-in is what
+      # authorizes anything. Blank falls back to the in-app Settings project.
       - name: Build
+        env:
+          WHL_SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          WHL_SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY }}
         run: |
           chmod +x gradlew
           ./gradlew --no-daemon assembleRelease

@@ -1,5 +1,6 @@
 package org.whl.bookcapture
 
+import android.content.Intent
 import android.os.Bundle
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
@@ -8,7 +9,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.whl.bookcapture.databinding.ActivitySettingsBinding
 
-/** Supabase project URL/key + a device label (shows up in imported entries). */
+/**
+ * Account, device label and API keys. The keys belong to the ACCOUNT, not the
+ * device: saving pushes them to the cloud profile, so the desktop (and the
+ * next phone) picks them up without pasting anything twice.
+ */
 class SettingsActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivitySettingsBinding
@@ -18,33 +23,67 @@ class SettingsActivity : AppCompatActivity() {
         binding = ActivitySettingsBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        binding.url.setText(Prefs.supabaseUrl(this))
-        binding.key.setText(Prefs.supabaseKey(this))
+        binding.accountEmail.text = Prefs.email(this)
+        binding.displayName.setText(Prefs.displayName(this))
         binding.device.setText(Prefs.deviceName(this))
+        binding.mistralKey.setText(Prefs.mistralKey(this))
+        binding.deepseekKey.setText(Prefs.deepseekKey(this))
 
-        binding.save.setOnClickListener {
-            Prefs.save(this,
-                binding.url.text.toString(),
-                binding.key.text.toString(),
-                binding.device.text.toString())
-            binding.msg.text = getString(R.string.saved)
+        // freshen the cache; another device may have changed the keys. Only
+        // overwrite a field the user has NOT touched since it was populated,
+        // so a slow network pull can't wipe a key they are mid-typing.
+        val shown = mapOf(
+            binding.displayName to Prefs.displayName(this),
+            binding.mistralKey to Prefs.mistralKey(this),
+            binding.deepseekKey to Prefs.deepseekKey(this))
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                Auth.pullProfile(this@SettingsActivity)
+                withContext(Dispatchers.Main) {
+                    val fresh = mapOf(
+                        binding.displayName to Prefs.displayName(this@SettingsActivity),
+                        binding.mistralKey to Prefs.mistralKey(this@SettingsActivity),
+                        binding.deepseekKey to Prefs.deepseekKey(this@SettingsActivity))
+                    for ((field, was) in shown)
+                        if (field.text.toString() == was) field.setText(fresh[field])
+                }
+            } catch (_: Exception) { /* offline: the cache stands */ }
         }
 
-        binding.test.setOnClickListener {
-            Prefs.save(this,
-                binding.url.text.toString(),
-                binding.key.text.toString(),
-                binding.device.text.toString())
+        binding.save.setOnClickListener {
+            Prefs.setDeviceName(this, binding.device.text.toString())
             binding.msg.text = getString(R.string.testing)
             lifecycleScope.launch {
                 val err = withContext(Dispatchers.IO) {
-                    if (!Prefs.configured(this@SettingsActivity)) "URL / key missing"
-                    else SupabaseClient(
-                        Prefs.supabaseUrl(this@SettingsActivity),
-                        Prefs.supabaseKey(this@SettingsActivity)).testConnection()
+                    Auth.pushProfile(this@SettingsActivity,
+                        binding.displayName.text.toString(),
+                        binding.mistralKey.text.toString(),
+                        binding.deepseekKey.text.toString())
+                }
+                binding.msg.text = err ?: getString(R.string.saved)
+                if (err == null) {
+                    // new keys may unblock processing; new anything, uploads
+                    ProcessWorker.enqueue(this@SettingsActivity)
+                    UploadWorker.enqueue(this@SettingsActivity)
+                }
+            }
+        }
+
+        binding.test.setOnClickListener {
+            binding.msg.text = getString(R.string.testing)
+            lifecycleScope.launch {
+                val err = withContext(Dispatchers.IO) {
+                    SupabaseClient(this@SettingsActivity).testConnection()
                 }
                 binding.msg.text = err ?: getString(R.string.connection_ok)
+                if (err == null) UploadWorker.enqueue(this@SettingsActivity)
             }
+        }
+
+        binding.signOut.setOnClickListener {
+            Auth.signOut(this)
+            startActivity(Intent(this, LoginActivity::class.java))
+            finish()
         }
     }
 }
