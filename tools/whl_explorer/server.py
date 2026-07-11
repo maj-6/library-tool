@@ -2808,6 +2808,7 @@ def api_client_state_put():
         lib.save_json(lib.CLIENT_STATE_PATH, state)
         if "settings" in payload:
             _apply_log_level()   # verbose-logging toggle takes effect immediately
+            _apply_lan_state()   # a LAN toggle takes effect without an app restart
     # the checked set is a blob, not a stream of adds -- diff it to get events.
     # Adds and removals are logged separately from the key-set differences, so
     # each event's count always agrees with the titles it names (a PUT that
@@ -5489,20 +5490,41 @@ def _api_lan_info():
     return jsonify(enabled=enabled, port=port, token=_lan_token(), ips=_lan_ips())
 
 
-def _start_lan_server() -> None:
-    """Start the LAN listener in a daemon thread if the user has enabled it."""
+_lan_lock = threading.Lock()
+_lan_server: dict = {"srv": None, "thread": None, "port": None}
+
+
+def _apply_lan_state() -> None:
+    """Start, stop, or restart the LAN listener to match the current setting.
+    Idempotent — safe to call from startup AND from the settings-save path, so
+    the desktop toggle takes effect live, no app restart."""
     enabled, port = _lan_settings()
-    if not enabled:
-        return
-    from werkzeug.serving import make_server
-    try:
-        srv = make_server("0.0.0.0", port, lan_app, threaded=True)
-    except OSError as exc:
-        log.warning("LAN capture listener not started (%s)", exc)
-        return
-    threading.Thread(target=srv.serve_forever, daemon=True, name="lan-capture").start()
-    log.info("LAN capture on 0.0.0.0:%d  token=%s  ips=%s",
-             port, _lan_token(), ", ".join(_lan_ips()) or "?")
+    with _lan_lock:
+        running = _lan_server["srv"] is not None
+        if enabled and running and _lan_server["port"] == port:
+            return                                     # already in the desired state
+        if not enabled and not running:
+            return
+        if running:                                    # stop (disabled or port changed)
+            try:
+                _lan_server["srv"].shutdown()
+            except Exception:
+                pass
+            _lan_server.update(srv=None, thread=None, port=None)
+        if not enabled:
+            log.info("LAN capture off")
+            return
+        from werkzeug.serving import make_server
+        try:
+            srv = make_server("0.0.0.0", port, lan_app, threaded=True)
+        except OSError as exc:
+            log.warning("LAN capture listener not started (%s)", exc)
+            return
+        t = threading.Thread(target=srv.serve_forever, daemon=True, name="lan-capture")
+        t.start()
+        _lan_server.update(srv=srv, thread=t, port=port)
+        log.info("LAN capture on 0.0.0.0:%d  token=%s  ips=%s",
+                 port, _lan_token(), ", ".join(_lan_ips()) or "?")
 
 
 if __name__ == "__main__":
@@ -5519,7 +5541,7 @@ if __name__ == "__main__":
     # Cloud capture autosync (interval read from settings each tick; 0 = off).
     threading.Thread(target=_cloud_autosync_loop, daemon=True).start()
     # LAN capture listener (offline phone -> desktop); off unless opted in.
-    _start_lan_server()
+    _apply_lan_state()
     # Activity mirror: local jsonl -> cloud events, as the signed-in user.
     threading.Thread(target=_push_events_loop, daemon=True, name="event-push").start()
     # WHL_PORT lets a second instance run on another port (a distinct origin,

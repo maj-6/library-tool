@@ -1156,6 +1156,7 @@
           <button class="snav" data-sec="sec-ai" type="button">AI</button>
           <button class="snav" data-sec="sec-ocr" type="button">OCR</button>
           <button class="snav" data-sec="sec-integrations" type="button">Integrations</button>
+          <button class="snav" data-sec="sec-lan" type="button">LAN</button>
           <button class="snav" data-sec="sec-credentials" type="button">Credentials</button>
           <button class="snav" data-sec="sec-updates" type="button">Updates</button>
           <button class="snav" data-sec="sec-advanced" type="button">Advanced</button>
@@ -1187,6 +1188,24 @@
                       data-tip="Erase the History tab's action log (cannot be undone)">Clear action history</button>
               <button id="reset-settings" class="cad-btn danger" type="button">Restore default settings</button>
             </div>
+          </div>
+          <div id="sec-lan" class="settings-sec">
+            <div class="settings-head">LAN capture</div>
+            <p class="settings-note">Let the phone send captures straight to this
+               computer over the local network, bypassing the cloud — handy
+               offline (a hotspot with no internet). Turn it on, then enter the
+               address and token below in the phone's Settings &rsaquo; Transport.</p>
+            <div class="settings-rows">
+              <label class="tool-label" for="set-lan-enable">Accept LAN captures</label>
+              <input id="set-lan-enable" type="checkbox" />
+              <label class="tool-label" for="set-lan-port">Port</label>
+              <input id="set-lan-port" class="cad-input" type="number" min="1024" max="65535" step="1" />
+              <label class="tool-label">This computer&rsquo;s address</label>
+              <span id="set-lan-ips" class="tool-label"></span>
+              <label class="tool-label">Pairing token</label>
+              <input id="set-lan-token" class="cad-input" readonly spellcheck="false" />
+            </div>
+            <p class="settings-note" id="set-lan-note"></p>
           </div>
           <div id="sec-appearance" class="settings-sec">
             <div class="settings-head">Appearance</div>
