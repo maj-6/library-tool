@@ -55,15 +55,15 @@
 
    SAGE           - warm, earthy, bookish neutral: cream paper, taupe chrome,
                     brown-black ink, a muted sage-teal accent (the default).
-   ARCHIVE LEDGER - institutional card-catalog: neutral archival paper, ruled
+   LEDGER         - institutional card-catalog: neutral archival paper, ruled
                     tables, double rules, letterpress accents. Square corners.
-   FOOLSCAP       - letterpress galley proof on daylight paper: debossed controls,
+                    (id "ledger"; the label was "Archive Ledger".)
+   MANUSCRIPT     - letterpress galley proof on daylight paper: debossed controls,
                     a single ink rule under the statusbar, low chroma.
+                    (id "foolscap"; the label was "Foolscap".)
    VELLUM         - warm off-white vellum, near-zero chroma, warm brown-black ink.
    LINEN          - neutral warm-grey linen board; the lowest-contrast chrome of the
                     set, for long sessions.
-   PLATINUM       - the one period-chrome survivor: Mac OS 8/9 pinstriped light
-                    titlebar with dark ink, 1px bevels, lavender-slate accent.
    ==================================================================== */
 
 /* ---------- SAGE (muted green-gray light) ---------- */
