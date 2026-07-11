@@ -30,18 +30,18 @@
    green a herbarium would use. The double rule does the work a border colour
    normally would. */
 :root {
-  --paper: #f5efe1;       /* aged vellum cream */
-  --card: #fbf7ee;        /* stock, a shade lighter and creamier */
-  --chrome: #ece4d2;      /* the warm sand masthead board */
-  --rule: #a89c84;        /* the strong warm-taupe rule (the double rules) */
-  --rule-mid: #cec5b1;
-  --rule-soft: #e8e0cd;
-  --ink: #2a2118;         /* warm sepia brown-black, the letterpress ink */
-  --ink-soft: #5c5346;
-  --ink-faint: #978c77;
+  --paper: #f6ecd9;       /* aged vellum cream, warmed toward gold */
+  --card: #fbf6ea;        /* stock, a shade lighter and creamier */
+  --chrome: #86a05e;      /* the botanical-olive masthead board */
+  --rule: #ab9878;        /* the strong warm-tan rule (the double rules) */
+  --rule-mid: #d4c6a9;
+  --rule-soft: #eee1c9;
+  --ink: #2b2015;         /* warm sepia brown-black, the letterpress ink */
+  --ink-soft: #5f5140;
+  --ink-faint: #9c8a6c;
   --accent: #4c6a34;      /* a muted botanical-green band */
   --accent-ink: #46602e;  /* the same green, deepened, carrying the links */
-  --warn-bg: #faf4e6;
+  --warn-bg: #fbf1de;
   --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
 }
 
@@ -59,7 +59,7 @@ body {
 
 /* --- masthead --- */
 header.site {
-  border-bottom: 3px double var(--rule);
+  border-bottom: 3px double #6b7d45;   /* a deeper botanical olive frames the board */
   background: var(--chrome);
 }
 header.site .wrap {
@@ -94,7 +94,8 @@ header.site .gh svg { display: block; width: 22px; height: 22px; }
 aside.side {
   position: sticky;
   top: 0;
-  padding: 38px 22px 40px 0;
+  padding: 38px 20px 40px 16px;
+  background: #efe4cc;                  /* the page cream, a shade darker, on the nav rail */
   border-right: 1px solid var(--rule-soft);
 }
 nav.site { display: flex; flex-direction: column; }
