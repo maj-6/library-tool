@@ -155,7 +155,20 @@ def _init_logging() -> None:
     logging.getLogger("werkzeug").setLevel(logging.INFO)
 
 
+def _apply_log_level() -> None:
+    """Root logger -> DEBUG when Settings > Advanced enables verbose logging,
+    else INFO. Read straight off client_state so it applies at startup and
+    after every settings push."""
+    try:
+        s = lib.load_json(lib.CLIENT_STATE_PATH, {}).get("settings", {})
+        verbose = bool(s.get("verboseLogging"))
+    except Exception:
+        verbose = False
+    logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
+
+
 _init_logging()
+_apply_log_level()
 
 
 @app.errorhandler(Exception)
@@ -2036,6 +2049,14 @@ def _ocr_tesseract(png: bytes, cfg: dict) -> dict:
     return {"text": "\n".join(parts), "words": words}
 
 
+def _ocr_max_tokens() -> int:
+    """Vision-OCR output cap (Settings > OCR); dense pages need it raised."""
+    try:
+        return max(1024, min(32000, int(_client_settings().get("ocrMaxTokens") or 8192)))
+    except (TypeError, ValueError):
+        return 8192
+
+
 def _ocr_claude(png: bytes, cfg: dict) -> str:
     key = (cfg.get("claude_key") or "").strip()
     if not key:
@@ -2044,7 +2065,7 @@ def _ocr_claude(png: bytes, cfg: dict) -> str:
     model = (cfg.get("claude_model") or "").strip() or "claude-haiku-4-5-20251001"
     body = json.dumps({
         "model": model,
-        "max_tokens": 8192,
+        "max_tokens": _ocr_max_tokens(),
         "messages": [{"role": "user", "content": [
             {"type": "image", "source": {
                 "type": "base64", "media_type": "image/png",
@@ -2779,6 +2800,8 @@ def api_client_state_put():
                 state[k] = payload[k]
         state["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         lib.save_json(lib.CLIENT_STATE_PATH, state)
+        if "settings" in payload:
+            _apply_log_level()   # verbose-logging toggle takes effect immediately
     # the checked set is a blob, not a stream of adds -- diff it to get events.
     # Adds and removals are logged separately from the key-set differences, so
     # each event's count always agrees with the titles it names (a PUT that
@@ -3916,7 +3939,10 @@ def _ai_cfg() -> dict:
     return {"base": str(s.get("aiBase") or "").strip() or _AI_DEFAULT_BASE,
             "model": str(s.get("aiModel") or "").strip() or _AI_DEFAULT_MODEL,
             "key": str(s.get("aiKey") or "").strip(),
-            "instructions": str(s.get("aiInstructions") or "").strip()}
+            "instructions": str(s.get("aiInstructions") or "").strip(),
+            # user overrides (Settings > AI): blank temperature keeps each call's own default
+            "temperature": s.get("aiTemperature"),
+            "timeout": s.get("aiTimeout")}
 
 
 def _ai_chat(cfg: dict, messages: list, json_mode: bool = False,
@@ -3927,6 +3953,19 @@ def _ai_chat(cfg: dict, messages: list, json_mode: bool = False,
     if not cfg["key"]:
         raise RuntimeError("no AI key — set one in Settings > AI "
                            "(DeepSeek is the default provider)")
+    # a set temperature/timeout in Settings > AI overrides the per-call defaults
+    _t = cfg.get("temperature")
+    if _t not in (None, ""):
+        try:
+            temperature = max(0.0, min(2.0, float(_t)))
+        except (TypeError, ValueError):
+            pass
+    _to = cfg.get("timeout")
+    if _to:
+        try:
+            timeout = max(10.0, min(1200.0, float(_to)))
+        except (TypeError, ValueError):
+            pass
     body = {"model": cfg["model"], "messages": messages,
             "temperature": temperature}
     if json_mode:
