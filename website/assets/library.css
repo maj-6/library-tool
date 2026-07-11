@@ -1,9 +1,11 @@
 /* World Herb Library — the archival catalogue.
    A SEPARATE, denser layout from the site pages (site.css): an application-like
    catalogue idiom in the manner of archive.org collections and the HathiTrust
-   catalogue. Light only. Same Vellum palette family and the same self-hosted
-   Roboto Slab, duplicated here so these three pages (browse / book / read)
-   stand entirely on their own.
+   catalogue. Light only. Same Manuscript palette family (lifted from the desktop
+   app's Foolscap/Manuscript theme: quiet galley paper, near-black ink, a single
+   hairline masthead rule, debossed controls) and the same self-hosted Roboto
+   Slab, duplicated here so these three pages (browse / book / read) stand
+   entirely on their own.
    No build step, no framework, no CDN. */
 
 /* --- fonts (duplicated from site.css so this stylesheet is independent) --- */
@@ -25,19 +27,19 @@
 }
 
 :root {
-  --paper: #f6ecd9;
-  --card: #fbf6ea;
-  --chrome: #ede1ca;
-  --rule: #ab9878;
-  --rule-mid: #d4c6a9;
-  --rule-soft: #eee1c9;
-  --ink: #2b2015;
-  --ink-soft: #5f5140;
-  --ink-faint: #9c8a6c;
-  --accent: #4c6a34;        /* muted botanical-green band */
-  --accent-ink: #46602e;    /* the same green, deepened */
-  --chip: #ede0c6;
-  --warn-bg: #fbf1de;
+  --paper: #f4f1eb;        /* quiet warm-grey galley paper */
+  --card: #faf8f3;         /* stock, a shade lighter */
+  --chrome: #e6e3db;       /* the quiet warm-grey masthead/toolbar board */
+  --rule: #a49d8e;         /* the single hairline ink rule */
+  --rule-mid: #d0ccc1;
+  --rule-soft: #e6e2d9;
+  --ink: #221c14;          /* near-black letterpress ink */
+  --ink-soft: #554f40;
+  --ink-faint: #a49d8e;
+  --accent: #4a7a3f;        /* Foolscap's deeper forest green */
+  --accent-ink: #2f6f68;    /* Foolscap's teal, carrying the links */
+  --chip: #ebe5d8;
+  --warn-bg: #f7f4ec;
   --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
   --shell: 1440px;
 }
@@ -73,8 +75,8 @@ a { color: var(--accent-ink); }
 
 /* ============================ masthead ============================ */
 .lib-masthead {
-  background: #86a05e;                  /* botanical-olive board, matching the site masthead */
-  border-bottom: 3px double #6b7d45;
+  background: var(--chrome);
+  border-bottom: 1px solid var(--rule);   /* Manuscript's single ink rule, matching the site masthead */
 }
 .masthead-inner {
   display: flex;
@@ -136,7 +138,9 @@ a { color: var(--accent-ink); }
   border: 1px solid var(--rule-mid);
   background: #fff;
   color: var(--ink);
-  border-radius: 2px;
+  border-radius: 1px;
+  box-shadow: inset 1px 1px 1px rgba(50, 44, 34, 0.14),
+              inset -1px -1px 0 rgba(255, 254, 250, 0.7);
 }
 .searchfield input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .sortbox { display: flex; align-items: center; gap: 8px; }
@@ -146,7 +150,9 @@ a { color: var(--accent-ink); }
   border: 1px solid var(--rule-mid);
   background: #fff;
   color: var(--ink);
-  border-radius: 2px;
+  border-radius: 1px;
+  box-shadow: inset 1px 1px 1px rgba(50, 44, 34, 0.14),
+              inset -1px -1px 0 rgba(255, 254, 250, 0.7);
 }
 .result-count {
   font-size: 12px;
@@ -178,7 +184,7 @@ a { color: var(--accent-ink); }
   position: sticky;
   top: 0;
   padding: 22px 22px 24px 16px;
-  background: #efe4cc;                  /* the page cream, a shade darker, matching the site nav rail */
+  background: #efe4cc;                  /* the page cream, a shade darker, matching the site nav rail (site.css also leaves this un-retinted under Manuscript) */
   border-right: 1px solid var(--rule-soft);
   align-self: start;
   max-height: 100vh;
@@ -251,7 +257,9 @@ a { color: var(--accent-ink); }
   border: 1px solid var(--rule-mid);
   background: #fff;
   color: var(--ink);
-  border-radius: 2px;
+  border-radius: 1px;
+  box-shadow: inset 1px 1px 1px rgba(50, 44, 34, 0.14),
+              inset -1px -1px 0 rgba(255, 254, 250, 0.7);
 }
 .yearbox .dash { color: var(--ink-faint); }
 
@@ -265,7 +273,7 @@ a { color: var(--accent-ink); }
   background: none;
   border: 1px solid var(--rule-mid);
   padding: 7px 11px;
-  border-radius: 2px;
+  border-radius: 1px;
   cursor: pointer;
 }
 .facet-clear:hover { border-color: var(--accent); color: var(--accent-ink); }
@@ -287,7 +295,7 @@ a { color: var(--accent-ink); }
   font-size: 12px;
   background: var(--chip);
   border: 1px solid var(--rule-mid);
-  border-radius: 2px;
+  border-radius: 1px;
   padding: 4px 9px;
   color: var(--ink);
 }
@@ -318,7 +326,7 @@ a { color: var(--accent-ink); }
   color: var(--ink-soft);
   background: var(--chip);
   border: 1px solid var(--rule-soft);
-  border-radius: 2px;
+  border-radius: 1px;
   padding: 3px 8px;
   text-decoration: none;
 }
@@ -346,7 +354,9 @@ a { color: var(--accent-ink); }
   border: 1px solid var(--rule-mid);
   background: #fff;
   color: var(--ink);
-  border-radius: 2px;
+  border-radius: 1px;
+  box-shadow: inset 1px 1px 1px rgba(50, 44, 34, 0.14),
+              inset -1px -1px 0 rgba(255, 254, 250, 0.7);
   cursor: pointer;
 }
 .btn:hover { border-color: var(--accent); color: var(--accent-ink); }
@@ -411,7 +421,7 @@ a { color: var(--accent-ink); }
   font-size: 0.9em;
   background: var(--chrome);
   padding: 1px 5px;
-  border-radius: 2px;
+  border-radius: 1px;
 }
 .prose a { color: var(--accent-ink); }
 .prose hr { border: none; border-top: 1px solid var(--rule-soft); margin: 20px 0; }
@@ -510,7 +520,9 @@ body.reader { display: flex; flex-direction: column; overflow: hidden; }
   border: 1px solid var(--rule-mid);
   background: #fff;
   color: var(--ink);
-  border-radius: 2px;
+  border-radius: 1px;
+  box-shadow: inset 1px 1px 1px rgba(50, 44, 34, 0.14),
+              inset -1px -1px 0 rgba(255, 254, 250, 0.7);
   cursor: pointer;
   white-space: nowrap;
 }
@@ -523,7 +535,9 @@ body.reader { display: flex; flex-direction: column; overflow: hidden; }
   font: 12px/1 inherit;
   padding: 6px 6px;
   border: 1px solid var(--rule-mid);
-  border-radius: 2px;
+  border-radius: 1px;
+  box-shadow: inset 1px 1px 1px rgba(50, 44, 34, 0.14),
+              inset -1px -1px 0 rgba(255, 254, 250, 0.7);
   text-align: right;
 }
 
@@ -620,7 +634,9 @@ body.reader { display: flex; flex-direction: column; overflow: hidden; }
 .tp-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
 .tp-head select {
   font: 12px/1.3 inherit; padding: 6px 8px;
-  border: 1px solid var(--rule-mid); border-radius: 2px; background: #fff;
+  border: 1px solid var(--rule-mid); border-radius: 1px; background: #fff;
+  box-shadow: inset 1px 1px 1px rgba(50, 44, 34, 0.14),
+              inset -1px -1px 0 rgba(255, 254, 250, 0.7);
 }
 .tp-head .label { margin: 0; }
 .tp-page { margin-bottom: 22px; }

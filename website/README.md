@@ -10,8 +10,10 @@ Two designs under one roof, sharing a data layer but not a stylesheet:
   manner of archive.org collections and the HathiTrust catalogue. It has its own
   masthead ("World Herb Library", with a quiet link back to the About page) and
   is light-only. The two stylesheets are deliberately independent — the
-  `@font-face` blocks and the Vellum palette are duplicated into
-  `library.css` so the catalogue pages stand on their own.
+  `@font-face` blocks and the Manuscript/letterpress palette (quiet galley
+  paper, near-black ink, a single hairline masthead rule, debossed controls)
+  are duplicated into `library.css`, so the catalogue pages stand on their own
+  rather than importing from `site.css`.
 
 No build step, no framework, no CDN — `fetch` against PostgREST is the whole
 data layer (`assets/data.js`), and it speaks the same HTTP as
