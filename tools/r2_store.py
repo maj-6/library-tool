@@ -193,11 +193,20 @@ def list_buckets(cfg: dict, timeout: float = 30.0) -> list[str]:
 
 
 def list_objects(cfg: dict, prefix: str = "", timeout: float = 60.0) -> dict[str, int]:
-    """Every object under `prefix`, as {key: size}. Follows continuation
-    tokens, so the result is complete however large the bucket grows."""
+    """Every object under `prefix`, as {key: size}."""
+    return {k: m["size"] for k, m in list_objects_meta(cfg, prefix, timeout).items()}
+
+
+def list_objects_meta(cfg: dict, prefix: str = "",
+                      timeout: float = 60.0) -> dict[str, dict]:
+    """Every object under `prefix`, as {key: {size, etag, modified}}. The etag
+    is the content MD5 for single-PUT objects (all of ours), which lets a sync
+    detect in-place edits; `modified` is the upload time, ISO-8601. Follows
+    continuation tokens, so the result is complete however large the bucket
+    grows."""
     _check(cfg)
     import xml.etree.ElementTree as ET
-    out: dict[str, int] = {}
+    out: dict[str, dict] = {}
     token = ""
     while True:
         params = [("list-type", "2"), ("prefix", prefix)]
@@ -218,7 +227,9 @@ def list_objects(cfg: dict, prefix: str = "", timeout: float = 60.0) -> dict[str
             key = item.findtext(f"{pfx}Key", "", ns)
             size = int(item.findtext(f"{pfx}Size", "0", ns) or 0)
             if key:
-                out[key] = size
+                out[key] = {"size": size,
+                            "etag": item.findtext(f"{pfx}ETag", "", ns).strip('"'),
+                            "modified": item.findtext(f"{pfx}LastModified", "", ns)}
         token = root.findtext(f"{pfx}NextContinuationToken", "", ns)
         if root.findtext(f"{pfx}IsTruncated", "false", ns) != "true" or not token:
             return out

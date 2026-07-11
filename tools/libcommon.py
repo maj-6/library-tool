@@ -78,6 +78,13 @@ CHANGELOG_PATH = (
 IA_DOWNLOADS_DIR = DATA_ROOT / "downloads" / "ia"
 IA_CATALOG_PATH = IA_DOWNLOADS_DIR / "catalog.json"
 
+# The category taxonomy: a tree of {name, parent} nodes keyed by id. Replaces
+# the deprecated comma-separated `categories` text fields; records point at
+# nodes via `category_ids` lists. Synced across machines like the builds
+# (tools/store_sync.py), published as resolved name paths (docs/
+# library-analyze-design.md).
+CATEGORIES_PATH = OUTPUT_DIR / "categories.json"
+
 # Ordered fields for manually added books. local_pdf holds a locally
 # attached scan (a verified source for books marked SCAN).
 MANUAL_ENTRY_FIELDS = [
@@ -128,6 +135,53 @@ def gen_id(existing: set[str] | None = None) -> str:
         if candidate not in existing:
             existing.add(candidate)
             return candidate
+
+
+# --- category taxonomy -------------------------------------------------------
+# Shared by the server (assignment, publishing) and tools/cloud_setup.py
+# (seed/fixture), which resolve ids to paths without a running server.
+
+def load_taxonomy() -> dict:
+    """The taxonomy document: {"version": 1, "nodes": {id: {name, parent,
+    created_at, updated_at}}}. Absent file = empty tree."""
+    doc = load_json(CATEGORIES_PATH, None)
+    if not isinstance(doc, dict) or not isinstance(doc.get("nodes"), dict):
+        return {"version": 1, "nodes": {}}
+    return doc
+
+
+def category_path(nodes: dict, node_id: str) -> list[str]:
+    """Root→leaf name path for one node. A dangling or cyclic parent chain
+    yields what could be resolved rather than raising: assignments must not
+    break because a node was deleted on another machine mid-sync."""
+    path, seen = [], set()
+    cur = node_id
+    while cur and cur in nodes and cur not in seen:
+        seen.add(cur)
+        path.append(str(nodes[cur].get("name") or "").strip() or "?")
+        cur = str(nodes[cur].get("parent") or "")
+    return list(reversed(path))
+
+
+def category_paths(nodes: dict, ids) -> list[list[str]]:
+    """Resolved, de-duplicated, sorted paths for a record's category_ids."""
+    out, seen = [], set()
+    for cid in ids or []:
+        p = category_path(nodes, str(cid))
+        if not p:
+            continue
+        key = "\x1f".join(p)
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return sorted(out)
+
+
+def categories_text(paths: list[list[str]]) -> str:
+    """The flat rendering of paths — " › " within a path, ", " between —
+    which is what the volumes.categories text column (and its fts index)
+    carries after the overhaul."""
+    return ", ".join(" › ".join(p) for p in paths)
 
 
 # --- json ------------------------------------------------------------------

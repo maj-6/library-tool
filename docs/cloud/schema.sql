@@ -38,6 +38,55 @@ alter table captures enable row level security;
 alter table books    enable row level security;
 
 -- =====================================================================
+-- desktop working stores — two-way sync of the files that left git
+-- =====================================================================
+-- whl_builds.json, downloads/ia/catalog.json and whl_corrections.json are
+-- gitignored live data; these tables are their sync channel (the entry
+-- FOLDERS — OCR text, previews — are files, and mirror to R2 instead).
+-- One row per record, the record itself verbatim in `data`. A delete
+-- arrives as a tombstone: `deleted` flips true but the row keeps its data,
+-- so nothing a machine ever synced can be destroyed remotely. The desktop
+-- merges per record by updated_at (see tools/store_sync.py).
+
+create table if not exists builds (
+  id         text primary key,                  -- the build's local hex id
+  data       jsonb not null,
+  updated_at timestamptz not null default now(),
+  deleted    boolean not null default false
+);
+
+create table if not exists ia_catalog (
+  identifier text primary key,                  -- the Internet Archive item id
+  data       jsonb not null,
+  updated_at timestamptz not null default now(),
+  deleted    boolean not null default false
+);
+
+create table if not exists corrections (
+  key        text primary key,                  -- "edit:<csv row>" | "add:<id>"
+  data       jsonb not null,
+  updated_at timestamptz not null default now(),
+  deleted    boolean not null default false
+);
+
+-- Like books/captures: RLS on with no policy — only service_role reaches them.
+alter table builds      enable row level security;
+alter table ia_catalog  enable row level security;
+alter table corrections enable row level security;
+
+-- The category taxonomy (output/categories.json) syncs the same way: one row
+-- per node, the node verbatim in `data` ({name, parent}). The taxonomy is a
+-- desktop working store — the website never reads it; published volumes carry
+-- their resolved category paths instead (volumes.category_paths below).
+create table if not exists taxonomy (
+  id         text primary key,                  -- the node's local hex id
+  data       jsonb not null,
+  updated_at timestamptz not null default now(),
+  deleted    boolean not null default false
+);
+alter table taxonomy enable row level security;
+
+-- =====================================================================
 -- volumes — what the library browser lists
 -- =====================================================================
 
@@ -71,6 +120,17 @@ create table if not exists volumes (
   updated_at       timestamptz not null default now()
 );
 
+-- Structured categories: an array of paths, each path an array of names from
+-- root to leaf, e.g. [["Botany","Herbals"],["Materia Medica"]]. The flat
+-- `categories` text above stays as the human-readable / fts-searchable
+-- rendering of the same paths (" › " within a path, ", " between them).
+alter table volumes add column if not exists category_paths jsonb not null default '[]';
+
+-- What extra published material exists for this volume, so the site can show
+-- affordances without probing: {"about": true, "pages": 312,
+-- "translations": {"es": 312}, "notes": 47}
+alter table volumes add column if not exists assets jsonb not null default '{}';
+
 -- One searchable column, maintained by the database. The website queries it
 -- with PostgREST's `fts` operator, so search never ships the catalogue.
 alter table volumes drop column if exists fts;
@@ -98,6 +158,62 @@ create policy volumes_read_all on volumes
 -- table IS the public website, and signup is open, so an authenticated-insert
 -- policy would let any stranger who creates an account put rows on it. If
 -- in-app authed uploads ever land, add a narrowly-scoped policy back then.
+
+-- =====================================================================
+-- volume artifacts — the published bundle beyond the PDF
+-- =====================================================================
+-- Everything here is chosen explicitly in the desktop's bundle interface
+-- before publish; nothing internal (working notes, relevance assessments)
+-- ever has a column on these tables. All three are anon-readable — they ARE
+-- the public library — and written only by the desktop's service_role key.
+
+-- Long-form texts. kind 'about' is the volume's About article (Markdown).
+create table if not exists volume_texts (
+  slug       text not null references volumes(slug) on delete cascade,
+  kind       text not null,                     -- 'about' (more kinds later)
+  lang       text not null default '',          -- '' = site language
+  body       text not null default '',
+  updated_at timestamptz not null default now(),
+  primary key (slug, kind, lang)
+);
+
+-- Page-aligned text: the original text layer (lang '') and translations
+-- (lang 'es', 'de', …), one row per page, aligned to the PDF's page numbers.
+create table if not exists volume_pages (
+  slug       text not null references volumes(slug) on delete cascade,
+  lang       text not null default '',
+  page       int  not null,
+  body       text not null default '',
+  updated_at timestamptz not null default now(),
+  primary key (slug, lang, page)
+);
+
+-- Anchored annotations: margin notes tied to a page and (optionally) a quoted
+-- passage on it. note_id is the desktop's annotation id, so a republish
+-- upserts in place.
+create table if not exists volume_notes (
+  slug       text not null references volumes(slug) on delete cascade,
+  note_id    text not null,
+  page       int  not null,
+  quote      text not null default '',
+  kind       text not null default '',          -- context | term | plant | …
+  body       text not null default '',
+  updated_at timestamptz not null default now(),
+  primary key (slug, note_id)
+);
+create index if not exists volume_notes_page_idx on volume_notes (slug, page);
+
+alter table volume_texts enable row level security;
+alter table volume_pages enable row level security;
+alter table volume_notes enable row level security;
+
+drop policy if exists volume_texts_read_all on volume_texts;
+drop policy if exists volume_pages_read_all on volume_pages;
+drop policy if exists volume_notes_read_all on volume_notes;
+create policy volume_texts_read_all on volume_texts for select using (true);
+create policy volume_pages_read_all on volume_pages for select using (true);
+create policy volume_notes_read_all on volume_notes for select using (true);
+-- writes: service_role only, same stance as volumes
 
 -- =====================================================================
 -- releases — the desktop installer and the Android APK

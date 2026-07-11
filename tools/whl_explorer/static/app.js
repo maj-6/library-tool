@@ -26,10 +26,12 @@
 const LS_KEY = "whl_cad_checked_v1";
 const SETTINGS_KEY = "whl_cad_settings_v1";
 
+// `categories` left this list with the taxonomy overhaul: assignments are
+// category_ids lists handled by the chip pickers, not looped text inputs.
 const MANUAL_FIELDS = [
   "title", "subtitle", "author", "publisher", "city", "year", "edition",
   "volume", "language", "pages", "condition", "price", "illustrations",
-  "categories", "notes",
+  "notes",
 ];
 
 // Metadata columns of the combined table, in cell order; click-to-edit.
@@ -54,7 +56,7 @@ const WHL_ROW_FIELDS = ["title", "subtitle", "authors", "year", "publisher",
   "pages", "language", "subject", "categories", "description"];
 
 const BUILD_FIELDS = ["title", "subtitle", "authors", "year", "publisher",
-  "publisher_city", "edition", "language", "pages", "categories",
+  "publisher_city", "edition", "language", "pages",
   "pdf_source", "pdf_file", "source_url", "notes"];
 
 const state = {
@@ -75,6 +77,8 @@ const state = {
   uploadSources: [],          // approved sources as last rendered
   builds: {},                 // book builder entries (id -> build)
   buildSel: null,             // selected build id
+  taxonomy: {},               // category nodes (id -> {name, parent})
+  anSel: null,                // build open in the Analyze tab
   buildFolder: null,          // entry-folder info for the selected build
   downloads: new Map(),
   dlTimers: new Map(),
@@ -153,28 +157,25 @@ const THEMES = [
   ["foolscap", "Foolscap"],
   ["vellum", "Vellum"],
   ["linen", "Linen"],
-  ["quarto", "Quarto"],
-  ["pewter", "Pewter"],
-  ["folio", "Folio"],
   ["platinum", "Platinum"],
-  ["redmond", "Redmond"],
-  ["motif", "Motif"],
 ];
 const DEFAULT_THEME = "sage";
 // Retired ids map to the survivor closest in spirit, so a stored theme never
 // falls through to the bare :root fallback. "" was Classic CAD, the old default.
-// platinum came back as a real theme, so it no longer appears here.
 const LEGACY_THEMES = {
   "": DEFAULT_THEME,
-  // the dark/loud round, retired after one release
-  scope: "pewter", "terminal-amber": "vellum", "blueprint-linen": "quarto",
-  oxblood: "ledger", porcelain: "pewter", herbarium: "vellum",
-  // the original set; the classic-chrome ids revive as their nearest heirs
-  blueprint: "quarto", modern: "pewter",
-  dark: "pewter", stone: "linen", midnight: "pewter",
-  cde: "motif", xp2003: "redmond", acad: "pewter",
-  workstation: "motif", slate: "pewter", mainframe: "vellum",
-  graphite: "pewter",
+  // removed 2026-07-10 -> nearest surviving chrome
+  quarto: "platinum", pewter: "platinum", folio: "linen",
+  redmond: "platinum", motif: "platinum",
+  // the dark/loud round, retired earlier
+  scope: "platinum", "terminal-amber": "vellum", "blueprint-linen": "linen",
+  oxblood: "ledger", porcelain: "platinum", herbarium: "vellum",
+  // the original classic-chrome set
+  blueprint: "linen", modern: "platinum",
+  dark: "platinum", stone: "linen", midnight: "platinum",
+  cde: "platinum", xp2003: "platinum", acad: "platinum",
+  workstation: "platinum", slate: "platinum", mainframe: "vellum",
+  graphite: "platinum",
 };
 
 // One shared font list; the interface (--ui) and data/table (--mono) fonts
@@ -1152,11 +1153,13 @@ function maybeAuthPrompt() {
 // Re-openable any time from Help > Setup guide. Every step is skippable, and
 // everything it sets lives in the same settings the Settings window edits.
 
+// No cloud-keys step: the app ships knowing its own cloud (the server bakes
+// in the project URL + public anon key), so accounts just work. The service
+// key is an owner concern and lives in Settings > Sync.
 const WIZ_STEPS = [
   ["welcome", "WELCOME"],
   ["account", "YOUR NAME"],
   ["ocr", "OCR"],
-  ["cloud", "CLOUD"],
   ["db", "OFFLINE SEARCH"],
   ["done", "READY"],
 ];
@@ -1188,10 +1191,6 @@ function wizCommit() {
     if (un) un.value = state.settings.userName;
   } else if (step === "ocr") {
     state.settings.mistralKey = el("wiz-mistral").value.trim();
-  } else if (step === "cloud") {
-    state.settings.supabaseUrl = el("wiz-sb-url").value.trim();
-    state.settings.supabaseAnonKey = el("wiz-sb-anon").value.trim();
-    state.settings.supabaseKey = el("wiz-sb-key").value.trim();
   } else {
     return;
   }
@@ -1216,10 +1215,6 @@ function wizRender() {
   } else if (step === "ocr") {
     el("wiz-mistral").value = state.settings.mistralKey || "";
     wizCheckTesseract();
-  } else if (step === "cloud") {
-    el("wiz-sb-url").value = state.settings.supabaseUrl || "";
-    el("wiz-sb-anon").value = state.settings.supabaseAnonKey || "";
-    el("wiz-sb-key").value = state.settings.supabaseKey || "";
   } else if (step === "db") {
     wizDbTick();
   }
@@ -1523,6 +1518,11 @@ function renderHome() {
           `</div>`).join("")
       : `<div class="empty">No contributors recorded yet</div>`;
   }
+
+  // the review queue as an inline pane (the overlay window still exists too)
+  const hcb = el("home-review-resolved");
+  if (hcb) hcb.checked = reviewsState.showResolved;
+  renderReviewsInto(el("home-reviews"));
 }
 
 function initHome() {
@@ -1561,7 +1561,7 @@ function initHome() {
 // --- tabs + header -----------------------------------------------------------
 
 const TAB_TITLES = { home: "Home", checked: "Catalogs", upload: "Editor",
-                     ocr: "OCR", infotab: "Info" };
+                     ocr: "OCR", analyze: "Analyze", infotab: "Info" };
 
 function setHeader(tabId) {
   // Both the visible title bar and the OS window title carry the active tab:
@@ -1599,6 +1599,7 @@ function initTabs() {
       // refresh the folder list on every visit — builds/folders may have
       // changed in the Editor tab meanwhile
       if (tab.dataset.tab === "ocr") loadOcrBooks().then(renderOcrTab);
+      if (tab.dataset.tab === "analyze") renderAnalyze();
     });
   }
   setHeader("home");
@@ -3151,6 +3152,7 @@ function manualToBook(e) {
     pages: e.pages || "", condition: e.condition || "",
     illustrations: e.illustrations || "", price: e.price || "",
     acquired: "", categories: e.categories || "", notes: e.notes || "",
+    category_ids: e.category_ids || [],
   };
   // non-column metadata (phone captures): shown in the Info panel
   if (e.extra && Object.keys(e.extra).length) book.extra = e.extra;
@@ -3632,12 +3634,34 @@ function reviewsSorted() {
     .sort((a, b) => (b.resolved_at || "").localeCompare(a.resolved_at || "")));
 }
 
-function renderReviewList() {
-  const host = el("review-list");
+function reviewItemHtml(r) {
+  const resolved = r.status !== "open";
+  return `<div class="review-item${resolved ? " resolved" : ""}" data-rid="${esc(r.id)}">` +
+    `<div class="ri-head">` +
+      `<span class="ri-label">${esc(r.label) || "(unlabelled item)"}</span>` +
+      `<span class="ri-meta">${resolved
+        ? `resolved by ${esc(r.resolved_by || "?")} &middot; ${esc(relIso(r.resolved_at))}`
+        : `${esc(r.created_by || "?")} &middot; ${esc(relIso(r.created_at))}`}</span>` +
+      `<button class="cad-btn tiny" type="button" data-rv-resolve="${resolved ? "0" : "1"}" ` +
+        `data-tip="${resolved ? "Reopen this item"
+          : "Mark resolved (also clears the attention mark)"}">${resolved ? "Reopen" : "Resolve"}</button>` +
+    `</div>` +
+    (r.reason ? `<div class="ri-reason">${esc(r.reason)}</div>` : "") +
+    (r.comments || []).map((c) => `<div class="ri-comment">` +
+      `<span class="ric-author">${esc(c.author || "?")}</span>` +
+      `<span class="ric-when">${esc(relIso(c.ts))}</span>` +
+      `<div class="ric-text">${esc(c.text)}</div></div>`).join("") +
+    `<div class="ri-add">` +
+      `<input class="cad-input ri-comment-input" placeholder="Add a comment&hellip;" spellcheck="false" />` +
+      `<button class="cad-btn tiny" type="button" data-rv-comment>Comment</button>` +
+    `</div></div>`;
+}
+
+// Render the queue into one host (the overlay list or the home pane). A rebuild
+// must never clobber a comment in progress, so typed drafts and the caret are
+// carried across the innerHTML replacement, per host.
+function renderReviewsInto(host) {
   if (!host) return;
-  el("review-show-resolved").checked = reviewsState.showResolved;
-  // a rebuild must never clobber a comment in progress: typed drafts (and
-  // the caret) are carried across the innerHTML replacement
   const drafts = {};
   let focusRid = null;
   for (const i of host.querySelectorAll(".ri-comment-input")) {
@@ -3652,28 +3676,7 @@ function renderReviewList() {
       ? "No review items yet" : "Nothing awaiting review"}</div>`;
     return;
   }
-  host.innerHTML = items.map((r) => {
-    const resolved = r.status !== "open";
-    return `<div class="review-item${resolved ? " resolved" : ""}" data-rid="${esc(r.id)}">` +
-      `<div class="ri-head">` +
-        `<span class="ri-label">${esc(r.label) || "(unlabelled item)"}</span>` +
-        `<span class="ri-meta">${resolved
-          ? `resolved by ${esc(r.resolved_by || "?")} &middot; ${esc(relIso(r.resolved_at))}`
-          : `${esc(r.created_by || "?")} &middot; ${esc(relIso(r.created_at))}`}</span>` +
-        `<button class="cad-btn tiny" type="button" data-rv-resolve="${resolved ? "0" : "1"}" ` +
-          `data-tip="${resolved ? "Reopen this item"
-            : "Mark resolved (also clears the attention mark)"}">${resolved ? "Reopen" : "Resolve"}</button>` +
-      `</div>` +
-      (r.reason ? `<div class="ri-reason">${esc(r.reason)}</div>` : "") +
-      (r.comments || []).map((c) => `<div class="ri-comment">` +
-        `<span class="ric-author">${esc(c.author || "?")}</span>` +
-        `<span class="ric-when">${esc(relIso(c.ts))}</span>` +
-        `<div class="ric-text">${esc(c.text)}</div></div>`).join("") +
-      `<div class="ri-add">` +
-        `<input class="cad-input ri-comment-input" placeholder="Add a comment&hellip;" spellcheck="false" />` +
-        `<button class="cad-btn tiny" type="button" data-rv-comment>Comment</button>` +
-      `</div></div>`;
-  }).join("");
+  host.innerHTML = items.map(reviewItemHtml).join("");
   for (const [rid, val] of Object.entries(drafts)) {
     const inp = host.querySelector(`.review-item[data-rid="${CSS.escape(rid)}"] .ri-comment-input`);
     if (inp) inp.value = val;
@@ -3682,6 +3685,17 @@ function renderReviewList() {
     const inp = host.querySelector(`.review-item[data-rid="${CSS.escape(focusRid)}"] .ri-comment-input`);
     if (inp) { inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length); }
   }
+}
+
+// The queue lives in two places at once — the overlay window and the home
+// pane — so a change in either refreshes both.
+function renderReviewList() {
+  const cb = el("review-show-resolved");
+  if (cb) cb.checked = reviewsState.showResolved;
+  const hcb = el("home-review-resolved");
+  if (hcb) hcb.checked = reviewsState.showResolved;
+  renderReviewsInto(el("review-list"));
+  renderReviewsInto(el("home-reviews"));
 }
 
 // resolving a review also clears the underlying attention mark, wherever
@@ -3720,72 +3734,85 @@ async function clearMark(kind, ref) {
   if (v) { v.attention = ""; saveChecked(); }
 }
 
+// Enter in a comment box posts it (the button holds the actual logic).
+function onReviewKeydown(ev) {
+  if (ev.key === "Enter" && ev.target.classList.contains("ri-comment-input")) {
+    ev.preventDefault();
+    const btn = ev.target.closest(".review-item").querySelector("[data-rv-comment]");
+    if (btn) btn.click();
+  }
+}
+
+// Resolve / reopen / comment — shared by the overlay list and the home pane.
+async function onReviewClick(ev) {
+  const item = ev.target.closest(".review-item");
+  if (!item) return;
+  const rid = item.dataset.rid;
+  const rbtn = ev.target.closest("[data-rv-resolve]");
+  if (rbtn) {
+    const resolved = rbtn.dataset.rvResolve === "1";
+    const res = await fetch(`/api/reviews/${encodeURIComponent(rid)}/resolve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ resolved }),
+    }).catch(() => null);
+    if (!res || !res.ok) {
+      status(res && res.status === 409
+        ? "This item already has an open review"
+        : "Review update failed");
+      return;
+    }
+    let note = resolved ? "Review resolved" : "Review reopened";
+    const r = (reviewsState.items || {})[rid];
+    if (resolved && r) {
+      // the review IS resolved at this point; a failed mark-clear must not
+      // abort the refresh below, only be reported
+      try { await clearMark(r.kind, r.ref); }
+      catch (e) { note = "Review resolved — attention mark not cleared"; }
+    }
+    await loadReviews();
+    renderReviewList();
+    renderHome();
+    status(note);
+    return;
+  }
+  if (ev.target.closest("[data-rv-comment]")) {
+    const input = item.querySelector(".ri-comment-input");
+    const text = (input.value || "").trim();
+    if (!text) return;
+    const res = await fetch(`/api/reviews/${encodeURIComponent(rid)}/comment`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    }).catch(() => null);
+    if (res && res.ok) {
+      input.value = "";   // posted — the draft is a comment now
+      await loadReviews();
+      renderReviewList();
+    } else {
+      status("Comment failed — not saved");
+    }
+  }
+}
+
 function initReviewWin() {
   el("review-close").addEventListener("click", closeReviewWin);
   el("review-overlay").addEventListener("mousedown", (ev) => {
     if (ev.target === el("review-overlay")) closeReviewWin();
   });
-  el("review-show-resolved").addEventListener("change", (ev) => {
+  const onShowResolved = (ev) => {
     reviewsState.showResolved = ev.target.checked;
     renderReviewList();
-  });
-  el("review-list").addEventListener("keydown", (ev) => {
-    if (ev.key === "Enter" && ev.target.classList.contains("ri-comment-input")) {
-      ev.preventDefault();
-      const btn = ev.target.closest(".review-item").querySelector("[data-rv-comment]");
-      if (btn) btn.click();
-    }
-  });
-  el("review-list").addEventListener("click", async (ev) => {
-    const item = ev.target.closest(".review-item");
-    if (!item) return;
-    const rid = item.dataset.rid;
-    const rbtn = ev.target.closest("[data-rv-resolve]");
-    if (rbtn) {
-      const resolved = rbtn.dataset.rvResolve === "1";
-      const res = await fetch(`/api/reviews/${encodeURIComponent(rid)}/resolve`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ resolved }),
-      }).catch(() => null);
-      if (!res || !res.ok) {
-        status(res && res.status === 409
-          ? "This item already has an open review"
-          : "Review update failed");
-        return;
-      }
-      let note = resolved ? "Review resolved" : "Review reopened";
-      const r = (reviewsState.items || {})[rid];
-      if (resolved && r) {
-        // the review IS resolved at this point; a failed mark-clear must not
-        // abort the refresh below, only be reported
-        try { await clearMark(r.kind, r.ref); }
-        catch (e) { note = "Review resolved — attention mark not cleared"; }
-      }
-      await loadReviews();
-      renderReviewList();
-      renderHome();
-      status(note);
-      return;
-    }
-    if (ev.target.closest("[data-rv-comment]")) {
-      const input = item.querySelector(".ri-comment-input");
-      const text = (input.value || "").trim();
-      if (!text) return;
-      const res = await fetch(`/api/reviews/${encodeURIComponent(rid)}/comment`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
-      }).catch(() => null);
-      if (res && res.ok) {
-        input.value = "";   // posted — the draft is a comment now
-        await loadReviews();
-        renderReviewList();
-      } else {
-        status("Comment failed — not saved");
-      }
-    }
-  });
+  };
+  el("review-show-resolved").addEventListener("change", onShowResolved);
+  const hcb = el("home-review-resolved");
+  if (hcb) hcb.addEventListener("change", onShowResolved);
+  // the queue is interactive in both places, so bind both hosts
+  for (const host of [el("review-list"), el("home-reviews")]) {
+    if (!host) continue;
+    host.addEventListener("keydown", onReviewKeydown);
+    host.addEventListener("click", onReviewClick);
+  }
 }
 
 async function setRowAttention(id, value) {
@@ -3968,7 +3995,9 @@ const TIP_FIELDS = [
 function recordTip(rec, header) {
   const lines = header ? [header] : [];
   for (const [k, label] of TIP_FIELDS) {
-    let v = (rec[k] || "").toString().trim();
+    let v = k === "categories"
+      ? bookCatsText(rec)
+      : (rec[k] || "").toString().trim();
     if (!v) continue;
     // keep the tooltip a manageable size: long fields (notes, descriptions)
     // are abbreviated
@@ -4053,7 +4082,8 @@ function checkedRowTr(row, cmode, opts) {
   // volume titles are implied by the set header — optionally hide them
   const hideTitle = opts.isVol && !!state.settings.hideVolTitles;
   const cell = (f) => {
-    const val = f === "title" && hideTitle ? "" : b[f];
+    const val = f === "title" && hideTitle ? ""
+      : f === "categories" ? bookCatsText(b) : b[f];
     return f === "title" && cmode === "search"
       ? `<td data-csearch="1">${esc(val)}</td>`
       : `<td${editable(f)}>${esc(val)}</td>`;
@@ -4330,6 +4360,8 @@ function startEdit(td) {
   const row = state.rowsById.get(String(tr.dataset.rowId));
   if (!row) return;
   const field = td.dataset.edit;
+  // categories are structured now — they edit through the chip picker
+  if (field === "categories") return startEditCategories(td, row);
   const original = String(row.book[field] || "");
   hideTip();
   td.classList.add("editing");
@@ -5537,6 +5569,7 @@ function fillBookEditForm(book, showAcquired) {
   for (const f of BOOK_EDIT_FIELDS) {
     el("e-" + f).value = book[f] || "";
   }
+  catPickers["e-categories"].set(book.category_ids || []);
   // manual entries have no ACQUIRED field — the form adapts to the source
   el("e-acquired").closest(".mf-field").hidden = !showAcquired;
   el("bookedit-msg").textContent = "";
@@ -5603,6 +5636,7 @@ async function saveBookEditTab(ev) {
   if (!t || t.kind === "whl") return;
   const vals = {};
   for (const f of BOOK_EDIT_FIELDS) vals[f] = el("e-" + f).value.trim();
+  const catIds = catPickers["e-categories"].get();
   if (!vals.title) { el("bookedit-msg").textContent = "Title is required"; return; }
   // "Volumes in set" >= 2 turns this book into (or updates) a multi-volume set
   const setCount = Math.max(1, Math.min(99, parseInt(el("e-setcount").value, 10) || 1));
@@ -5611,8 +5645,8 @@ async function saveBookEditTab(ev) {
     const row = state.rowsById.get(t.id);
     if (!row) { el("bookedit-msg").textContent = "Row is gone"; return; }
     if (row.kind === "manual") {
-      const fields = {};
-      const before = {};
+      const fields = { category_ids: catIds };
+      const before = { category_ids: (row.book.category_ids || []).slice() };
       for (const f of MANUAL_FIELDS) {
         fields[f] = vals[f];
         before[f] = row.book[f] || "";
@@ -5634,7 +5668,8 @@ async function saveBookEditTab(ev) {
     const entry = state.checked.get(t.id);
     if (!entry) { el("bookedit-msg").textContent = "Row is gone"; return; }
     trackChecked(`edit ${vals.title.slice(0, 36)}`, t.id, () => {
-      entry.book = Object.assign({}, entry.book, vals);
+      entry.book = Object.assign({}, entry.book, vals,
+                                 { category_ids: catIds });
       entry.checks = null;
       entry.scans = null;
       entry.verify = null;
@@ -7067,6 +7102,1067 @@ async function saveManualSource(clear) {
   closeManualSource();
 }
 
+// --- Analyze tab -------------------------------------------------------------------
+// AI over VERIFIED builds (status ready/uploaded): summary, About article,
+// category suggestions, page-aligned translations, anchored annotations, and
+// the relevance assessment (internal only). Long jobs run server-side and are
+// polled like OCR jobs. DeepSeek is the default provider (Settings > AI).
+
+let anAboutMd = null;          // live markdown editor for the About article
+const anJobs = new Map();      // job id -> {kind, buildId}
+let anPollTimer = null;
+
+function anSelected() {
+  return state.anSel && state.builds[state.anSel] ? state.builds[state.anSel] : null;
+}
+
+function anAnalyzable(b) { return b.status === "ready" || b.status === "uploaded"; }
+
+async function renderAnalyze() {
+  await loadBuilds();
+  renderAnList();
+  renderAnMain();
+}
+
+function renderAnList() {
+  const ul = el("an-list");
+  const items = Object.values(state.builds)
+    .sort((a, b) => (a.title || "").localeCompare(b.title || ""));
+  ul.innerHTML = items.map((b) => {
+    const ok = anAnalyzable(b);
+    const sel = state.anSel === b.id;
+    return `<li class="build-item an-item${sel ? " active" : ""}${ok ? "" : " an-locked"}"
+      data-id="${esc(b.id)}" ${ok ? "" : 'data-tip="Mark it verified in the Editor first"'}>
+      <div class="bi-title">${esc(b.title || "(untitled)")}</div>
+      <div class="bi-meta">${esc(b.authors || "")}${b.year ? " · " + esc(b.year) : ""}
+        · ${b.status === "uploaded" ? "published" : esc(b.status)}</div></li>`;
+  }).join("") || `<li class="empty">No entries yet — create one in the Editor.</li>`;
+}
+
+function anSelect(id) {
+  const b = state.builds[id];
+  if (!b || !anAnalyzable(b)) return;
+  state.anSel = id;
+  renderAnList();
+  renderAnMain();
+}
+
+function activeAnPane() {
+  const t = document.querySelector("#an-tabs .pane-tab.active");
+  return t ? t.dataset.antab : "an-overview";
+}
+
+function switchAnPane(id) {
+  document.querySelectorAll("#an-tabs .pane-tab").forEach((t) =>
+    t.classList.toggle("active", t.dataset.antab === id));
+  document.querySelectorAll("#analyze .an-pane").forEach((p) =>
+    p.classList.toggle("active", p.id === id));
+  renderAnPane(id);
+}
+
+function renderAnMain() {
+  const b = anSelected();
+  el("an-empty").hidden = !!b;
+  el("an-work").hidden = !b;
+  if (!b) return;
+  el("an-title").textContent = b.title || "(untitled)";
+  el("an-sub").textContent =
+    `${b.authors || ""}${b.year ? " · " + b.year : ""} · ` +
+    (b.status === "uploaded" ? "published" : "verified");
+  renderAnPane(activeAnPane());
+}
+
+function renderAnPane(id) {
+  const b = anSelected();
+  if (!b) return;
+  if (id === "an-overview") loadAnOverview(b);
+  else if (id === "an-cats") renderAnCats(b);
+  else if (id === "an-trans") loadAnTranslations(b);
+  else if (id === "an-notes") loadAnNotes(b);
+  else if (id === "an-rel") renderAnRelevance(b);
+  else if (id === "an-bundle") renderAnBundle(b);
+}
+
+// --- jobs: start + poll -------------------------------------------------------
+
+async function anStartJob(path, body, label) {
+  el("an-msg").textContent = "";
+  try {
+    const res = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      el("an-msg").textContent = data.error || "failed";
+      statusErr(`ANALYZE :: ${(data.error || "FAILED").toUpperCase()}`);
+      return null;
+    }
+    anJobs.set(data.job, { kind: label, buildId: body.build_id });
+    status(`ANALYZE :: ${label.toUpperCase()} STARTED`);
+    anEnsurePolling();
+    return data;
+  } catch (e) {
+    el("an-msg").textContent = "request failed";
+    return null;
+  }
+}
+
+function anEnsurePolling() {
+  if (anPollTimer || !anJobs.size) return;
+  anPollTimer = setInterval(async () => {
+    for (const [id, meta] of [...anJobs]) {
+      let job = null;
+      try {
+        const res = await fetch(`/api/analyze/job/${id}`);
+        if (res.status === 404) { anJobs.delete(id); continue; }
+        job = await res.json();
+      } catch (e) { continue; }
+      const pct = job.total ? Math.round((job.done / job.total) * 100) : 0;
+      status(`ANALYZE :: ${meta.kind.toUpperCase()} :: ${job.done}/${job.total} (${pct}%)` +
+        (job.errors ? ` :: ${job.errors} ERRORS` : ""));
+      if (job.status.startsWith("done") || job.status === "error") {
+        anJobs.delete(id);
+        if (job.status === "error") {
+          statusErr(`ANALYZE :: ${meta.kind.toUpperCase()} FAILED :: ${job.error}`);
+          el("an-msg").textContent = job.error;
+        } else {
+          status(`ANALYZE :: ${meta.kind.toUpperCase()} ${job.status.toUpperCase()}` +
+            (job.note ? ` :: ${job.note}` : ""));
+          if (meta.kind === "relevance") await loadBuilds(true);
+          if (state.anSel === meta.buildId) renderAnPane(activeAnPane());
+        }
+      }
+    }
+    if (!anJobs.size) { clearInterval(anPollTimer); anPollTimer = null; }
+  }, 1500);
+}
+
+// --- Overview: summary + About article -----------------------------------------
+
+async function loadAnOverview(b) {
+  try {
+    const [s, a] = await Promise.all([
+      fetch(`/api/builds/${b.id}/summary`).then((r) => r.json()),
+      fetch(`/api/builds/${b.id}/about`).then((r) => r.json()),
+    ]);
+    if (state.anSel !== b.id) return;   // stale response
+    el("an-summary").textContent = (s.text || "").trim() || "No summary yet.";
+    // don't clobber an in-progress edit with a background refresh
+    if (anAboutMd && document.activeElement?.closest?.("#an-about-editor") == null) {
+      anAboutMd.set(a.text || "");
+    }
+  } catch (e) { /* leave the pane as-is */ }
+}
+
+// --- Categories: assignment + suggestions --------------------------------------
+
+let anSuggestions = [];
+
+function renderAnCats(b) {
+  const picker = catPickers["an-cat-picker"];
+  picker.set(b.category_ids || []);
+  renderAnSuggestions();
+}
+
+function renderAnSuggestions() {
+  const host = el("an-sugg");
+  el("an-sugg-all").hidden = !anSuggestions.some((s) => s.exists && !s.added);
+  if (!anSuggestions.length) {
+    host.innerHTML = `<p class="pane-note">No suggestions yet.</p>`;
+    return;
+  }
+  host.innerHTML = anSuggestions.map((s, i) =>
+    `<div class="an-sugg-row">
+      <button class="cad-btn tiny" data-sg="${i}" type="button"
+        ${s.added ? "disabled" : ""}>${s.added ? "Added" : s.exists ? "Assign" : "Create + assign"}</button>
+      <span class="an-sugg-path${s.exists ? "" : " an-sugg-new"}">${esc(s.path.join(" › "))}</span>
+      <span class="an-sugg-why">${esc(s.reason || "")}</span>
+    </div>`).join("");
+}
+
+// a novel suggested path: create missing nodes along the chain, return leaf id
+async function anCreatePath(path) {
+  let parent = "";
+  for (const name of path) {
+    const low = name.toLowerCase();
+    let nid = Object.keys(state.taxonomy).find((k) =>
+      (state.taxonomy[k].parent || "") === parent &&
+      (state.taxonomy[k].name || "").trim().toLowerCase() === low);
+    if (!nid) {
+      const res = await fetch("/api/categories", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, parent }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) return "";
+      state.taxonomy[data.id] = data.node;
+      nid = data.id;
+    }
+    parent = nid;
+  }
+  return parent;
+}
+
+async function anAssignSuggestion(i) {
+  const b = anSelected();
+  const s = anSuggestions[i];
+  if (!b || !s || s.added) return;
+  const nid = s.exists ? s.id : await anCreatePath(s.path);
+  if (!nid) { el("an-msg").textContent = "could not create the category"; return; }
+  const ids = (b.category_ids || []).slice();
+  if (!ids.includes(nid)) ids.push(nid);
+  if (await patchBuild(b.id, { category_ids: ids }, "assign category")) {
+    s.added = true;
+    await loadTaxonomy();
+    renderAnCats(state.builds[b.id]);
+  }
+}
+
+// --- Translations ----------------------------------------------------------------
+
+async function loadAnTranslations(b) {
+  el("an-trans-view").hidden = true;
+  try {
+    const data = await (await fetch(`/api/builds/${b.id}/translations`)).json();
+    if (state.anSel !== b.id) return;
+    const list = data.translations || [];
+    el("an-trans-list").innerHTML = list.length
+      ? list.map((t) =>
+        `<div class="an-trans-row">
+          <span class="mono">${esc(t.lang)}</span>
+          <span class="tool-label">${t.pages} pages</span>
+          <button class="cad-btn tiny" data-tview="${esc(t.lang)}" type="button">View</button>
+          <button class="cad-btn tiny danger" data-tdel="${esc(t.lang)}" type="button">Delete</button>
+        </div>`).join("")
+      : `<p class="pane-note">No translations yet. Pages translate one by one and
+         partial runs resume where they stopped.</p>`;
+  } catch (e) { /* keep pane */ }
+}
+
+// --- Annotations -----------------------------------------------------------------
+
+async function loadAnNotes(b) {
+  try {
+    const data = await (await fetch(`/api/builds/${b.id}/annotations`)).json();
+    if (state.anSel !== b.id) return;
+    const notes = (data.doc && data.doc.notes) || [];
+    const counts = { approved: 0, suggested: 0, rejected: 0 };
+    notes.forEach((n) => { counts[n.status] = (counts[n.status] || 0) + 1; });
+    el("an-notes-count").textContent = notes.length
+      ? `${counts.approved} approved · ${counts.suggested} suggested · ${counts.rejected} rejected`
+      : "";
+    el("an-notes-list").innerHTML = notes.length
+      ? notes.sort((a, x) => (a.page - x.page) || (a.created_at || "").localeCompare(x.created_at || ""))
+        .map((n) =>
+          `<div class="an-note an-note-${esc(n.status)}" data-note="${esc(n.id)}">
+            <div class="an-note-head">
+              <span class="an-note-page">p.${n.page}</span>
+              <span class="an-note-kind">${esc(n.kind || "")}</span>
+              <span class="tb-spacer"></span>
+              <button class="cad-btn tiny" data-napp="1" type="button"
+                ${n.status === "approved" ? "disabled" : ""}>Approve</button>
+              <button class="cad-btn tiny" data-nrej="1" type="button"
+                ${n.status === "rejected" ? "disabled" : ""}>Reject</button>
+              <button class="cad-btn tiny danger" data-ndel="1" type="button">&#10005;</button>
+            </div>
+            ${n.quote ? `<div class="an-note-quote">&ldquo;${esc(n.quote)}&rdquo;</div>` : ""}
+            <div class="an-note-body" data-tip="Click to edit">${esc(n.body)}</div>
+          </div>`).join("")
+      : `<p class="pane-note">No annotations yet. Generated notes arrive as
+         suggestions; only approved ones publish.</p>`;
+  } catch (e) { /* keep pane */ }
+}
+
+async function anNotePatch(bid, payload) {
+  const res = await fetch(`/api/builds/${bid}/annotations`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.ok && data.ok) loadAnNotes(state.builds[bid]);
+  else el("an-msg").textContent = data.error || "update failed";
+}
+
+// --- Relevance ---------------------------------------------------------------------
+
+function anCriteria() {
+  const c = state.settings.relevanceCriteria;
+  return Array.isArray(c) ? c : [];
+}
+
+function renderAnRelevance(b) {
+  const crits = anCriteria();
+  el("an-crit").innerHTML = crits.length
+    ? crits.map((c, i) =>
+      `<div class="an-crit-row" data-ci="${i}">
+        <input class="cad-input an-crit-name" value="${esc(c.name || "")}"
+               placeholder="criterion" />
+        <input class="cad-input an-crit-desc" value="${esc(c.description || "")}"
+               placeholder="what makes a work score high" />
+        <button class="cad-btn tiny danger" data-cdel="${i}" type="button">&#10005;</button>
+      </div>`).join("")
+    : `<p class="pane-note">No criteria yet — define what makes a work relevant
+       to the collection, then assess. Scores stay internal: they are never
+       published.</p>`;
+  const r = b.relevance;
+  el("an-relres").innerHTML = !r
+    ? `<p class="pane-note">Not assessed yet.</p>`
+    : `<div class="an-rel-overall">
+         <span class="an-score">${r.overall}/10</span>
+         <span>${esc(r.summary || "")}</span>
+         <span class="tool-label">${esc(r.model || "")} · ${esc((r.assessed_at || "").slice(0, 10))}</span>
+       </div>` +
+      (r.criteria || []).map((c) =>
+        `<div class="an-rel-row">
+          <span class="an-rel-name">${esc(c.name)}</span>
+          <span class="an-bar"><span class="an-bar-fill" style="width:${(c.score || 0) * 10}%"></span></span>
+          <span class="an-score">${c.score}/10</span>
+          <div class="an-rel-why">${esc(c.rationale || "")}</div>
+        </div>`).join("");
+}
+
+function anSaveCriteria() {
+  const rows = [...document.querySelectorAll("#an-crit .an-crit-row")];
+  state.settings.relevanceCriteria = rows.map((r, i) => ({
+    id: (anCriteria()[i] || {}).id || String(Date.now()) + i,
+    name: r.querySelector(".an-crit-name").value.trim(),
+    description: r.querySelector(".an-crit-desc").value.trim(),
+  })).filter((c) => c.name);
+  saveSettings();
+}
+
+// --- Bundle ---------------------------------------------------------------------
+
+async function renderAnBundle(b) {
+  const bundle = b.bundle || {};
+  let langs = [];
+  try {
+    const data = await (await fetch(`/api/builds/${b.id}/translations`)).json();
+    langs = (data.translations || []).map((t) => t.lang);
+  } catch (e) { /* offline: no langs */ }
+  const chosen = bundle.translations || [];
+  const row = (id, label, checked, tip) =>
+    `<label class="an-bundle-row" data-tip="${esc(tip)}">
+      <input type="checkbox" id="${id}" ${checked ? "checked" : ""} /> ${label}</label>`;
+  el("an-bundle-opts").innerHTML =
+    row("anb-about", "About article", bundle.about,
+        "about.md — shown on the book's page in the public library") +
+    row("anb-pages", "Original text, page-aligned", bundle.pages_text,
+        "the OCR text layer, one row per page, for the reader's text panel") +
+    row("anb-notes", "Approved annotations", bundle.annotations,
+        "margin notes — only the ones marked approved") +
+    (langs.length
+      ? `<div class="tool-label" style="margin-top:6px">Translations</div>` +
+        langs.map((l) =>
+          `<label class="an-bundle-row"><input type="checkbox" data-anb-lang="${esc(l)}"
+            ${chosen.includes(l) ? "checked" : ""} /> ${esc(l)}</label>`).join("")
+      : "");
+}
+
+async function anSaveBundle() {
+  const b = anSelected();
+  if (!b) return;
+  const bundle = {
+    about: el("anb-about").checked,
+    pages_text: el("anb-pages").checked,
+    annotations: el("anb-notes").checked,
+    translations: [...document.querySelectorAll("[data-anb-lang]")]
+      .filter((x) => x.checked).map((x) => x.dataset.anbLang),
+  };
+  if (await patchBuild(b.id, { bundle }, "edit publish bundle")) {
+    el("an-bundle-msg").textContent = b.status === "uploaded"
+      ? "Saved — republish from the Editor to apply"
+      : "Saved — applies when the entry publishes";
+  } else el("an-bundle-msg").textContent = "save failed";
+}
+
+// --- wiring ----------------------------------------------------------------------
+
+function initAnalyze() {
+  makeCatPicker("an-cat-picker", async (ids) => {
+    const b = anSelected();
+    if (b && await patchBuildRaw(b.id, { category_ids: ids }, true)) {
+      status("CATEGORIES UPDATED");
+    }
+  });
+
+  el("an-list").addEventListener("click", (ev) => {
+    const li = ev.target.closest(".an-item");
+    if (li) anSelect(li.dataset.id);
+  });
+  for (const t of document.querySelectorAll("#an-tabs .pane-tab")) {
+    t.addEventListener("click", () => switchAnPane(t.dataset.antab));
+  }
+
+  anAboutMd = createMdEditor(el("an-about-editor"));
+
+  el("an-summarize").addEventListener("click", () => {
+    const b = anSelected();
+    if (b) anStartJob("/api/analyze/summarize", { build_id: b.id }, "summarize");
+  });
+  el("an-about-draft").addEventListener("click", async () => {
+    const b = anSelected();
+    if (!b) return;
+    const existing = anAboutMd.get().trim();
+    if (existing && !confirm("Replace the current About draft?")) return;
+    anStartJob("/api/analyze/about",
+               { build_id: b.id, overwrite: !!existing }, "about");
+  });
+  el("an-about-save").addEventListener("click", async () => {
+    const b = anSelected();
+    if (!b) return;
+    const res = await fetch(`/api/builds/${b.id}/about`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: anAboutMd.get() }),
+    });
+    const data = await res.json().catch(() => ({}));
+    el("an-msg").textContent = res.ok && data.ok ? "About saved" : (data.error || "save failed");
+  });
+
+  el("an-suggest").addEventListener("click", async () => {
+    const b = anSelected();
+    if (!b) return;
+    el("an-sugg").innerHTML = `<p class="pane-note">Asking…</p>`;
+    try {
+      const res = await fetch("/api/analyze/categories", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ build_id: b.id }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) {
+        el("an-sugg").innerHTML =
+          `<p class="pane-note">${esc(data.error || "failed")}</p>`;
+        return;
+      }
+      anSuggestions = (data.suggestions || []).map((s) =>
+        Object.assign(s, { added: s.exists && (b.category_ids || []).includes(s.id) }));
+      renderAnSuggestions();
+    } catch (e) {
+      el("an-sugg").innerHTML = `<p class="pane-note">request failed</p>`;
+    }
+  });
+  el("an-sugg").addEventListener("click", (ev) => {
+    const btn = ev.target.closest("[data-sg]");
+    if (btn) anAssignSuggestion(parseInt(btn.dataset.sg, 10));
+  });
+  el("an-sugg-all").addEventListener("click", async () => {
+    for (let i = 0; i < anSuggestions.length; i++) {
+      if (anSuggestions[i].exists && !anSuggestions[i].added) {
+        await anAssignSuggestion(i);
+      }
+    }
+    renderAnSuggestions();
+  });
+
+  el("an-translate").addEventListener("click", () => {
+    const b = anSelected();
+    const lang = el("an-lang").value.trim().toLowerCase();
+    if (!b || !lang) { el("an-trans-msg").textContent = "language code?"; return; }
+    el("an-trans-msg").textContent = "";
+    anStartJob("/api/analyze/translate", { build_id: b.id, lang },
+               `translate ${lang}`);
+  });
+  el("an-trans-list").addEventListener("click", async (ev) => {
+    const b = anSelected();
+    if (!b) return;
+    const view = ev.target.closest("[data-tview]");
+    const del = ev.target.closest("[data-tdel]");
+    if (view) {
+      const data = await (await fetch(
+        `/api/builds/${b.id}/translations/${encodeURIComponent(view.dataset.tview)}`)).json();
+      el("an-trans-view").textContent = data.text || "";
+      el("an-trans-view").hidden = false;
+    } else if (del) {
+      if (!confirm(`Delete the ${del.dataset.tdel} translation?`)) return;
+      await fetch(`/api/builds/${b.id}/translations/${encodeURIComponent(del.dataset.tdel)}`,
+                  { method: "DELETE" });
+      loadAnTranslations(b);
+    }
+  });
+
+  el("an-annotate").addEventListener("click", () => {
+    const b = anSelected();
+    if (b) anStartJob("/api/analyze/annotate", { build_id: b.id }, "annotate");
+  });
+  el("an-notes-list").addEventListener("click", (ev) => {
+    const b = anSelected();
+    const box = ev.target.closest(".an-note");
+    if (!b || !box) return;
+    const id = box.dataset.note;
+    if (ev.target.closest("[data-napp]")) {
+      anNotePatch(b.id, { update: { id, status: "approved" } });
+    } else if (ev.target.closest("[data-nrej]")) {
+      anNotePatch(b.id, { update: { id, status: "rejected" } });
+    } else if (ev.target.closest("[data-ndel]")) {
+      anNotePatch(b.id, { remove: id });
+    } else if (ev.target.closest(".an-note-body")) {
+      const bodyEl = box.querySelector(".an-note-body");
+      const old = bodyEl.textContent;
+      bodyEl.innerHTML = `<textarea class="cad-input an-note-edit">${esc(old)}</textarea>`;
+      const ta = bodyEl.querySelector("textarea");
+      ta.focus();
+      const done = () => {
+        const v = ta.value.trim();
+        if (v && v !== old) anNotePatch(b.id, { update: { id, body: v } });
+        else loadAnNotes(b);
+      };
+      ta.addEventListener("blur", done);
+      ta.addEventListener("keydown", (kev) => {
+        if (kev.key === "Escape") { kev.stopPropagation(); ta.value = old; ta.blur(); }
+      });
+    }
+  });
+
+  el("an-crit-add").addEventListener("click", () => {
+    anSaveCriteria();
+    state.settings.relevanceCriteria = anCriteria().concat(
+      [{ id: String(Date.now()), name: "", description: "" }]);
+    const b = anSelected();
+    if (b) renderAnRelevance(b);
+  });
+  el("an-crit").addEventListener("change", anSaveCriteria);
+  el("an-crit").addEventListener("click", (ev) => {
+    const d = ev.target.closest("[data-cdel]");
+    if (!d) return;
+    const crits = anCriteria();
+    crits.splice(parseInt(d.dataset.cdel, 10), 1);
+    state.settings.relevanceCriteria = crits;
+    saveSettings();
+    const b = anSelected();
+    if (b) renderAnRelevance(b);
+  });
+  el("an-assess").addEventListener("click", () => {
+    anSaveCriteria();
+    const b = anSelected();
+    if (!b) return;
+    if (!anCriteria().length) {
+      el("an-msg").textContent = "define at least one criterion first";
+      return;
+    }
+    anStartJob("/api/analyze/relevance", { build_id: b.id }, "relevance");
+  });
+
+  el("an-bundle-save").addEventListener("click", anSaveBundle);
+
+  // Editor -> Analyze jump for the open build
+  el("b-analyze").addEventListener("click", () => {
+    const b = currentBuild();
+    if (!b) return;
+    if (!anAnalyzable(b)) {
+      el("build-msg").textContent = "mark it verified first";
+      return;
+    }
+    state.anSel = b.id;
+    document.querySelector('#tabs .tab[data-tab="analyze"]').click();
+  });
+}
+
+// --- category taxonomy -------------------------------------------------------------
+// The hierarchical vocabulary behind category_ids (docs/library-analyze-design.md).
+// state.taxonomy holds the {id: {name, parent}} node map from /api/categories;
+// records carry category_ids lists. The old free-text `categories` is display
+// fallback only.
+
+async function loadTaxonomy() {
+  try {
+    const res = await fetch("/api/categories");
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.ok) state.taxonomy = data.nodes || {};
+  } catch (e) { /* offline boot: pickers degrade to empty vocab */ }
+  for (const p of Object.values(catPickers)) p.refresh();
+  if (!el("cat-overlay").hidden) renderCatTree();
+  renderChecked();   // table cells resolve names once the vocab lands
+}
+
+// root→leaf names for one node; cycle-safe (a bad sync must not hang render)
+function catPathNames(id) {
+  const names = [], seen = new Set();
+  let cur = String(id || "");
+  while (cur && state.taxonomy[cur] && !seen.has(cur)) {
+    seen.add(cur);
+    names.push(state.taxonomy[cur].name || "?");
+    cur = String(state.taxonomy[cur].parent || "");
+  }
+  return names.reverse();
+}
+
+function catPathText(id) { return catPathNames(id).join(" › "); }
+
+// leaf names for a record's assignment — what dense table cells show
+function catNamesText(ids) {
+  return (ids || [])
+    .map((i) => (state.taxonomy[i] || {}).name || "")
+    .filter(Boolean).join(", ");
+}
+
+// a book's categories for display: resolved names, else the legacy text
+function bookCatsText(b) {
+  if (b && Array.isArray(b.category_ids) && b.category_ids.length) {
+    const t = catNamesText(b.category_ids);
+    if (t) return t;
+  }
+  return (b && b.categories) || "";
+}
+
+const catPickers = {};   // mount id -> picker, so loadTaxonomy can refresh all
+
+// A chip picker: chips for the assigned nodes + an autocomplete input over
+// the taxonomy. Options are labelled with their full path; an unmatched
+// entry offers "Create". Mounted into a .cat-picker div; get()/set() speak
+// category_ids.
+function makeCatPicker(mountId, onChange) {
+  const mount = el(mountId);
+  let ids = [];
+  mount.classList.add("cat-picker");
+  mount.innerHTML =
+    `<span class="cat-chips"></span>` +
+    `<input class="cat-input" type="text" autocomplete="off" ` +
+    `placeholder="add category…" />` +
+    `<div class="catpick-pop" hidden></div>`;
+  const chips = mount.querySelector(".cat-chips");
+  const input = mount.querySelector(".cat-input");
+  const pop = mount.querySelector(".catpick-pop");
+  let active = -1, options = [];
+
+  function renderChips() {
+    chips.innerHTML = ids.map((i) =>
+      `<span class="cat-chip" data-id="${esc(i)}" data-tip="${esc(catPathText(i))}">` +
+      `${esc((state.taxonomy[i] || {}).name || "?")}` +
+      `<button type="button" class="cat-x" aria-label="Remove">&#10005;</button></span>`
+    ).join("");
+  }
+
+  function close() { pop.hidden = true; active = -1; }
+
+  function openPop() {
+    const q = input.value.trim().toLowerCase();
+    options = Object.keys(state.taxonomy)
+      .filter((i) => !ids.includes(i))
+      .map((i) => ({ id: i, path: catPathText(i) }))
+      .filter((o) => !q || o.path.toLowerCase().includes(q))
+      .sort((a, b) => a.path.localeCompare(b.path))
+      .slice(0, 12);
+    const exact = Object.values(state.taxonomy).some(
+      (n) => (n.name || "").toLowerCase() === q);
+    const rows = options.map((o, i) =>
+      `<div class="catpick-item${i === active ? " active" : ""}" data-i="${i}">` +
+      `${esc(o.path)}</div>`);
+    if (q && !exact) {
+      rows.push(`<div class="catpick-item catpick-new${active === options.length ? " active" : ""}" ` +
+        `data-new="1">Create &ldquo;${esc(input.value.trim())}&rdquo;</div>`);
+    }
+    pop.innerHTML = rows.join("");
+    pop.hidden = !rows.length;
+  }
+
+  async function createAndAdd(name) {
+    try {
+      const res = await fetch("/api/categories", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.ok) {
+        state.taxonomy[data.id] = data.node;
+        add(data.id);
+        for (const p of Object.values(catPickers)) if (p !== api) p.refresh();
+      } else statusErr(`CATEGORY :: ${(data.error || "create failed").toUpperCase()}`);
+    } catch (e) { statusErr("CATEGORY :: CREATE FAILED"); }
+  }
+
+  function add(id) {
+    if (!ids.includes(id)) ids.push(id);
+    input.value = "";
+    renderChips();
+    close();
+    if (onChange) onChange(ids.slice());
+  }
+
+  function pick(i) {
+    if (i >= 0 && i < options.length) add(options[i].id);
+    else if (input.value.trim()) createAndAdd(input.value.trim());
+  }
+
+  input.addEventListener("input", () => { active = -1; openPop(); });
+  input.addEventListener("focus", openPop);
+  input.addEventListener("blur", () => setTimeout(close, 150));
+  input.addEventListener("keydown", (ev) => {
+    const total = pop.hidden ? 0 : pop.children.length;
+    if (ev.key === "ArrowDown" && total) {
+      ev.preventDefault(); active = (active + 1) % total; openPop();
+    } else if (ev.key === "ArrowUp" && total) {
+      ev.preventDefault(); active = (active - 1 + total) % total; openPop();
+    } else if (ev.key === "Enter") {
+      ev.preventDefault();
+      if (total) pick(active >= 0 ? active : 0);
+      else if (input.value.trim()) createAndAdd(input.value.trim());
+    } else if (ev.key === "Escape" && !pop.hidden) {
+      ev.stopPropagation(); close();
+    } else if (ev.key === "Backspace" && !input.value && ids.length) {
+      ids.pop(); renderChips();
+      if (onChange) onChange(ids.slice());
+    }
+  });
+  // mousedown, not click: the input's blur fires first and closes the pop
+  pop.addEventListener("mousedown", (ev) => {
+    ev.preventDefault();
+    const item = ev.target.closest(".catpick-item");
+    if (!item) return;
+    if (item.dataset.new) pick(-1);
+    else pick(parseInt(item.dataset.i, 10));
+  });
+  chips.addEventListener("click", (ev) => {
+    const x = ev.target.closest(".cat-x");
+    if (!x) return;
+    const id = x.closest(".cat-chip").dataset.id;
+    ids = ids.filter((i) => i !== id);
+    renderChips();
+    if (onChange) onChange(ids.slice());
+  });
+
+  const api = {
+    get: () => ids.slice(),
+    set: (v) => { ids = (v || []).slice(); input.value = ""; renderChips(); close(); },
+    refresh: renderChips,
+  };
+  catPickers[mountId] = api;
+  return api;
+}
+
+// The categories cell of the combined table edits through a floating picker,
+// not the plain text input — the field is structured now.
+function startEditCategories(td, row) {
+  hideTip();
+  const before = ((row.book && row.book.category_ids) || []).slice();
+  const holder = document.createElement("div");
+  holder.className = "catcell-pop";
+  holder.innerHTML = `<div id="catcell-picker"></div>`;
+  document.body.appendChild(holder);
+  const r = td.getBoundingClientRect();
+  holder.style.left = `${Math.min(r.left, window.innerWidth - 340)}px`;
+  holder.style.top = `${r.bottom + 2}px`;
+  const picker = makeCatPicker("catcell-picker");
+  picker.set(before);
+  holder.querySelector(".cat-input").focus();
+
+  let done = false;
+  const finish = (commit) => {
+    if (done) return;
+    done = true;
+    const after = picker.get();
+    delete catPickers["catcell-picker"];
+    holder.remove();
+    document.removeEventListener("mousedown", onAway, true);
+    document.removeEventListener("keydown", onKey, true);
+    if (commit && JSON.stringify(after) !== JSON.stringify(before)) {
+      applyCategoryEdit(row, before, after);
+    } else renderChecked();
+  };
+  const onAway = (ev) => { if (!holder.contains(ev.target)) finish(true); };
+  const onKey = (ev) => {
+    if (ev.key === "Escape") {
+      // let an open suggestion list close first; second Escape cancels
+      if (holder.querySelector(".catpick-pop").hidden) { ev.stopPropagation(); finish(false); }
+    } else if (ev.key === "Enter" && !ev.target.closest(".cat-input")) finish(true);
+  };
+  document.addEventListener("mousedown", onAway, true);
+  document.addEventListener("keydown", onKey, true);
+}
+
+async function applyCategoryEdit(row, before, after) {
+  const label = `edit categories of ${String(row.book.title || "").slice(0, 32)}`;
+  if (row.kind === "manual") {
+    // _preserve: assigning categories doesn't change the book's identity, so
+    // checks/scans/verifications survive
+    const patch = (ids) =>
+      patchManualFields(row.id, { category_ids: ids, _preserve: true });
+    if (await patch(after)) {
+      pushOp(label, () => patch(before), () => patch(after));
+      status("CATEGORIES UPDATED");
+    } else statusCrit("UPDATE FAILED");
+    renderChecked();
+    return;
+  }
+  const entry = state.checked.get(row.id);
+  if (!entry) return;
+  const setIds = (ids) => {
+    const e = state.checked.get(row.id);
+    if (e) { e.book = Object.assign({}, e.book, { category_ids: ids }); }
+  };
+  pushOp(label,
+    () => { setIds(before); saveChecked(); renderChecked(); },
+    () => { setIds(after); saveChecked(); renderChecked(); });
+  setIds(after);
+  saveChecked();
+  renderChecked();
+  status("CATEGORIES UPDATED");
+}
+
+// --- the taxonomy manager window (Tools > Categories…) ---------------------------
+
+let catMergeFrom = null;   // node id armed for a merge, or null
+let catAdoptPreview = null; // adopt runs dry first; the second click applies
+
+function openCategories() {
+  catMergeFrom = null;
+  catAdoptPreview = null;
+  el("cat-msg").textContent = "";
+  el("cat-overlay").hidden = false;
+  loadTaxonomy().then(renderCatTree);
+}
+
+function closeCategories() { el("cat-overlay").hidden = true; }
+
+// usage counts: how many records point at each node (builds + manual + checked)
+function catUsage() {
+  const n = {};
+  const bump = (ids) => (ids || []).forEach((i) => { n[i] = (n[i] || 0) + 1; });
+  for (const b of Object.values(state.builds || {})) bump(b.category_ids);
+  for (const e of state.manual || []) bump(e.category_ids);
+  for (const [, entry] of state.checked) bump((entry.book || {}).category_ids);
+  return n;
+}
+
+function renderCatTree() {
+  const tree = el("cat-tree");
+  const nodes = state.taxonomy;
+  const use = catUsage();
+  const kids = {};
+  for (const [id, node] of Object.entries(nodes)) {
+    const p = nodes[node.parent] ? node.parent : "";
+    (kids[p] = kids[p] || []).push(id);
+  }
+  for (const arr of Object.values(kids)) {
+    arr.sort((a, b) => (nodes[a].name || "").localeCompare(nodes[b].name || ""));
+  }
+  const rows = [];
+  const walk = (parent, depth, seen) => {
+    for (const id of kids[parent] || []) {
+      if (seen.has(id)) continue;   // cycle guard
+      seen.add(id);
+      rows.push({ id, depth });
+      walk(id, depth + 1, seen);
+    }
+  };
+  walk("", 0, new Set());
+  el("cat-count").textContent = `${rows.length} categories`;
+  if (!rows.length) {
+    tree.innerHTML = `<p class="pane-note">No categories yet. Add a root, or adopt
+      the legacy text fields.</p>`;
+    return;
+  }
+  tree.innerHTML = rows.map(({ id, depth }) => {
+    const count = use[id] || 0;
+    return `<div class="cat-row${catMergeFrom === id ? " merge-src" : ""}" ` +
+      `draggable="true" data-id="${esc(id)}" style="padding-left:${8 + depth * 18}px">` +
+      `<span class="cat-name" data-tip="Click to rename">${esc(nodes[id].name || "?")}</span>` +
+      `<span class="cat-use">${count ? count : ""}</span>` +
+      `<span class="cat-acts">` +
+      `<button type="button" class="cad-btn tiny" data-act="child" data-tip="Add a subcategory">+</button>` +
+      `<button type="button" class="cad-btn tiny" data-act="merge" data-tip="Merge into another category">&#8646;</button>` +
+      `<button type="button" class="cad-btn tiny danger" data-act="del" data-tip="Delete (children move up)">&#10005;</button>` +
+      `</span></div>`;
+  }).join("") +
+  `<div class="cat-root-drop" data-rootdrop="1">drop here for top level</div>`;
+}
+
+async function catApi(method, path, body) {
+  try {
+    const res = await fetch(path, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.ok) return data;
+    el("cat-msg").textContent = data.error || "failed";
+  } catch (e) { el("cat-msg").textContent = "request failed"; }
+  return null;
+}
+
+async function catAfterChange() {
+  await loadTaxonomy();
+  renderCatTree();
+  renderChecked();               // table cells + tooltips resolve names
+  renderBuildEditor();
+}
+
+function catInlineRename(rowEl, id) {
+  const nameEl = rowEl.querySelector(".cat-name");
+  const old = (state.taxonomy[id] || {}).name || "";
+  nameEl.innerHTML = `<input class="cell-edit" value="${esc(old)}" />`;
+  const input = nameEl.querySelector("input");
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = async (commit) => {
+    if (done) return;
+    done = true;
+    const v = input.value.trim();
+    if (commit && v && v !== old) {
+      if (await catApi("PATCH", `/api/categories/${encodeURIComponent(id)}`, { name: v })) {
+        await catAfterChange();
+        return;
+      }
+    }
+    renderCatTree();
+  };
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); finish(true); }
+    else if (ev.key === "Escape") { ev.stopPropagation(); finish(false); }
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+
+function initCategories() {
+  makeCatPicker("m-categories");
+  makeCatPicker("e-categories");
+  makeCatPicker("b-categories");
+  MENU_CMDS["categories"] = () => openCategories();
+  el("cat-close").addEventListener("click", closeCategories);
+  el("cat-overlay").addEventListener("mousedown", (ev) => {
+    if (ev.target === el("cat-overlay")) closeCategories();
+  });
+
+  // window.prompt is unavailable in the Electron shell, so "add" flows
+  // through an inline input in the window's toolbar
+  let catNewParent = null;
+  const newInput = el("cat-new-name");
+  const askNewCat = (parent) => {
+    catNewParent = parent;
+    newInput.placeholder = parent
+      ? `new subcategory of ${(state.taxonomy[parent] || {}).name || "?"}…`
+      : "new top-level category…";
+    newInput.hidden = false;
+    newInput.value = "";
+    newInput.focus();
+  };
+  newInput.addEventListener("keydown", async (ev) => {
+    if (ev.key === "Escape") {
+      ev.stopPropagation();
+      newInput.hidden = true;
+      return;
+    }
+    if (ev.key !== "Enter") return;
+    ev.preventDefault();
+    const name = newInput.value.trim();
+    if (!name) { newInput.hidden = true; return; }
+    if (await catApi("POST", "/api/categories",
+                     { name, parent: catNewParent || "" })) {
+      newInput.hidden = true;
+      await catAfterChange();
+    }
+  });
+  newInput.addEventListener("blur", () => { newInput.hidden = true; });
+
+  el("cat-add-root").addEventListener("click", () => askNewCat(""));
+
+  // adopt is destructive-ish (writes every store), so it runs dry first and
+  // asks for a second click with the numbers on the table
+  el("cat-adopt").addEventListener("click", async () => {
+    if (!catAdoptPreview) {
+      const data = await catApi("POST", "/api/categories/adopt", { dry_run: true });
+      if (!data) return;
+      if (!data.records) {
+        el("cat-msg").textContent = "nothing to adopt — no legacy text without categories";
+        return;
+      }
+      catAdoptPreview = data;
+      el("cat-msg").textContent =
+        `${data.records} records, ${(data.new || []).length} new categories — click again to apply`;
+      return;
+    }
+    const data = await catApi("POST", "/api/categories/adopt", {});
+    catAdoptPreview = null;
+    if (data) {
+      el("cat-msg").textContent =
+        `adopted: ${data.records} records, ${data.created} new categories`;
+      status(`CATEGORIES :: ADOPTED ${data.records} RECORDS`);
+      await catAfterChange();
+    }
+  });
+
+  el("cat-tree").addEventListener("click", async (ev) => {
+    const rowEl = ev.target.closest(".cat-row");
+    if (!rowEl) return;
+    const id = rowEl.dataset.id;
+    const act = (ev.target.closest("[data-act]") || {}).dataset;
+    if (act && act.act === "child") {
+      askNewCat(id);
+      return;
+    }
+    if (act && act.act === "merge") {
+      if (catMergeFrom === id) {
+        catMergeFrom = null;
+        el("cat-msg").textContent = "";
+      } else if (catMergeFrom) {
+        const from = catMergeFrom;
+        catMergeFrom = null;
+        const data = await catApi("POST", "/api/categories/merge", { from, into: id });
+        if (data) {
+          el("cat-msg").textContent = `merged — ${data.reassigned} records moved`;
+          await catAfterChange();
+          return;
+        }
+      } else {
+        catMergeFrom = id;
+        el("cat-msg").textContent =
+          `merging "${(state.taxonomy[id] || {}).name}" — click ⇄ on the target`;
+      }
+      renderCatTree();
+      return;
+    }
+    if (act && act.act === "del") {
+      const n = (state.taxonomy[id] || {}).name || "?";
+      if (!confirm(`Delete "${n}"? Its subcategories move up; assignments drop it.`)) return;
+      if (await catApi("DELETE", `/api/categories/${encodeURIComponent(id)}`)) {
+        await catAfterChange();
+      }
+      return;
+    }
+    if (ev.target.closest(".cat-name")) catInlineRename(rowEl, id);
+  });
+
+  // drag a row onto another row (or the root strip) to re-parent
+  el("cat-tree").addEventListener("dragstart", (ev) => {
+    const rowEl = ev.target.closest(".cat-row");
+    if (!rowEl) return;
+    ev.dataTransfer.setData("text/whl-cat", rowEl.dataset.id);
+    ev.dataTransfer.effectAllowed = "move";
+  });
+  el("cat-tree").addEventListener("dragover", (ev) => {
+    if (ev.dataTransfer.types.includes("text/whl-cat")) {
+      ev.preventDefault();
+      const over = ev.target.closest(".cat-row, .cat-root-drop");
+      el("cat-tree").querySelectorAll(".drop-target").forEach((x) =>
+        x.classList.remove("drop-target"));
+      if (over) over.classList.add("drop-target");
+    }
+  });
+  el("cat-tree").addEventListener("drop", async (ev) => {
+    const id = ev.dataTransfer.getData("text/whl-cat");
+    if (!id) return;
+    ev.preventDefault();
+    el("cat-tree").querySelectorAll(".drop-target").forEach((x) =>
+      x.classList.remove("drop-target"));
+    const over = ev.target.closest(".cat-row, .cat-root-drop");
+    if (!over) return;
+    const parent = over.dataset.rootdrop ? "" : over.dataset.id;
+    if (parent === id) return;
+    if (await catApi("PATCH", `/api/categories/${encodeURIComponent(id)}`,
+                     { parent })) {
+      await catAfterChange();
+    }
+  });
+}
+
 // --- manual entry form -----------------------------------------------------------
 
 const PROV_FIELDS = ["title", "author", "publisher", "city", "year", "edition", "volume"];
@@ -7494,6 +8590,7 @@ async function submitManual(ev) {
   for (const f of MANUAL_FIELDS) body[f] = el("m-" + f).value;
   if (!body.title.trim()) { el("manual-msg").textContent = "Title is required"; return; }
   body = parseBook(body);   // colon subtitle + volume / edition indicators
+  body.category_ids = catPickers["m-categories"].get();
 
   const btn = el("manual-submit");
   btn.disabled = true;
@@ -7511,6 +8608,7 @@ async function submitManual(ev) {
       pushManualCreateOp(data.entry);
       renderChecked();
       el("manual-form").reset();
+      catPickers["m-categories"].set([]);   // pickers sit outside form.reset()
       clearProv();
       hideOlSuggest();
       el("m-title").focus();
@@ -7560,13 +8658,29 @@ async function runCloudSync() {
     btn.disabled = false;
     const r = st.last_result || {};
     if (r.imported) await loadManual();        // new entries -> refresh the table
+    // stores that pulled records changed local files -> refresh their views
+    const stores = r.stores || {};
+    const sum = (k) => Object.values(stores).reduce((n, s) => n + (s[k] || 0), 0);
+    const up = sum("pushed") + sum("tombstoned");
+    const down = sum("pulled") + sum("deleted");
+    if (((stores.builds || {}).pulled || 0) + ((stores.builds || {}).deleted || 0)) {
+      await loadBuilds();
+      renderBuildsList();
+    }
+    if (((stores.corrections || {}).pulled || 0) + ((stores.corrections || {}).deleted || 0)) {
+      await loadWhlRows(true);
+      renderWhlTop();
+    }
     if (r.ok === false) {
       statusCrit("CLOUD SYNC FAILED :: " +
         (r.error || (r.errors || []).join("; ") || "?"));
     } else {
       // a sync that finished but dropped rows is an error, not a success
       const dropped = (r.errors || []).length;
+      const en = r.entries || {};
       status(`CLOUD SYNC :: ${r.imported || 0} imported / ${r.books_pushed || 0} books pushed` +
+        ` / stores ${up} up ${down} down` +
+        (en.pushed || en.pulled ? ` / files ${en.pushed || 0} up ${en.pulled || 0} down` : "") +
         (dropped ? ` / ${dropped} errors` : ""), dropped ? "error" : undefined);
     }
   }, 1500);
@@ -7665,6 +8779,7 @@ function approvedSources() {
         author: row.book.author || "",
         publisher: row.book.publisher || "",
         year: row.book.year || "",
+        category_ids: (row.book.category_ids || []).slice(),
         archive: "Local scan",
         url: "",
         matched_title: row.localPdf.split(/[\\/]/).pop() || row.localPdf,
@@ -7680,6 +8795,7 @@ function approvedSources() {
         author: row.book.author || "",
         publisher: row.book.publisher || "",
         year: row.book.year || "",
+        category_ids: (row.book.category_ids || []).slice(),
         archive: ARCHIVE_NAMES[source],
       };
       const st = getVerify(row, source);
@@ -7979,6 +9095,7 @@ function renderBuildEditor() {
     const input = el("b-" + f);
     if (input) input.value = b[f] || "";
   }
+  catPickers["b-categories"].set(b.category_ids || []);
   el("b-ready").classList.toggle("active", b.status === "ready");
   el("b-verified-tag").hidden = b.status !== "ready";
   // only reset the description editor when its saved content changed —
@@ -8053,6 +9170,7 @@ function buildSeedFromSource(s) {
   return {
     title: s.title, subtitle: s.subtitle, authors: s.author,
     year: s.year, publisher: s.publisher,
+    category_ids: s.category_ids || [],
     pdf_source: pdfUrl, pdf_file: pdfFile, source_url: s.url,
     notes: `Source: ${s.archive}${s.matched_title ? " — " + s.matched_title : ""}`,
   };
@@ -8098,6 +9216,7 @@ async function saveBuildFields(ev) {
     const input = el("b-" + f);
     if (input) fields[f] = input.value.trim();
   }
+  fields.category_ids = catPickers["b-categories"].get();
   fields.description = buildDescMd.get();
   // an uploaded entry keeps its status — saving a typo fix must not pull
   // it back into the Pending queue
@@ -10907,6 +12026,9 @@ function init() {
   document.addEventListener("keydown", onRowDeleteKey);
   boot("attention popover", initAttnPop);
   boot("review queue", initReviewWin);
+  boot("categories", initCategories);
+  boot("analyze", initAnalyze);
+  loadTaxonomy();   // async; pickers and cells refresh when the vocab lands
   el("b-pdf-attach").addEventListener("click", () => attachPdfFile());
   el("b-pdf_file").addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") { ev.preventDefault(); attachPdfFile(); }
@@ -10968,6 +12090,7 @@ function init() {
     else if (!el("md-overlay").hidden) closeMarkdownEditor(false);
     else if (!el("msrc-overlay").hidden) closeManualSource();
     else if (!el("review-overlay").hidden) closeReviewWin();
+    else if (!el("cat-overlay").hidden) closeCategories();
     else if (!el("changelog-overlay").hidden) closeChangelog();
     else if (!el("settings-overlay").hidden) closeSettings();
   });
