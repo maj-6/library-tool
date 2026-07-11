@@ -1151,10 +1151,11 @@
           <button class="snav active" data-sec="sec-general" type="button">General</button>
           <button class="snav" data-sec="sec-appearance" type="button">Appearance</button>
           <button class="snav" data-sec="sec-tables" type="button">Table view</button>
+          <button class="snav" data-sec="sec-library" type="button">Library &amp; data</button>
           <button class="snav" data-sec="sec-ai" type="button">AI</button>
           <button class="snav" data-sec="sec-ocr" type="button">OCR</button>
-          <button class="snav" data-sec="sec-sync" type="button">Sync</button>
-          <button class="snav" data-sec="sec-paths" type="button">File paths</button>
+          <button class="snav" data-sec="sec-integrations" type="button">Integrations</button>
+          <button class="snav" data-sec="sec-credentials" type="button">Credentials</button>
         </div>
         <div id="settings-content">
           <div id="sec-general" class="settings-sec active">
@@ -1177,28 +1178,6 @@
               <label class="tool-label" for="set-scan-recent">Scan attach: show PDFs from the last N minutes (0 = all)</label>
               <input id="set-scan-recent" class="cad-input" type="number" min="0" max="1440" step="5"
                      data-tip="The UPLD/SCAN file picker defaults to Downloads and lists only PDFs downloaded within this many minutes" />
-              <label class="tool-label" for="set-preview-original">Preview the original (unmodified) PDF</label>
-              <input id="set-preview-original" type="checkbox" />
-              <label class="tool-label" for="set-keep-originals">Keep IA originals after a folder build</label>
-              <input id="set-keep-originals" type="checkbox" />
-              <label class="tool-label" for="set-auto-ia-dl">Auto-download IA PDFs in the background</label>
-              <input id="set-auto-ia-dl" type="checkbox"
-                     data-tip="When a scan finds an Internet Archive source, download its PDF and build a compressed 10-page preview in the background (can pull a lot of data)" />
-              <label class="tool-label" for="set-trim-blank">Trim blank pages automatically (folder build)</label>
-              <input id="set-trim-blank" type="checkbox"
-                     data-tip="Blank pages are removed from the actual PDF during a folder build (backup kept, OCR renumbered)" />
-              <label class="tool-label" for="set-expand-sets">Expand multi-volume sets by default</label>
-              <input id="set-expand-sets" type="checkbox"
-                     data-tip="Show the individual volumes of every set without clicking the arrow" />
-              <label class="tool-label" for="set-hide-vol-titles">Hide individual volume titles</label>
-              <input id="set-hide-vol-titles" type="checkbox"
-                     data-tip="The set header already shows the title, so leave volume rows' titles blank" />
-              <label class="tool-label" for="set-cr-cprs">Copyright: look up registrations on publicrecords.copyright.gov</label>
-              <input id="set-cr-cprs" type="checkbox"
-                     data-tip="Left half of the copyright tag: query the U.S. Copyright Office public records (CPRS) for an original registration" />
-              <label class="tool-label" for="set-cr-nypl">Copyright: also use the NYPL registrations dataset</label>
-              <input id="set-cr-nypl" type="checkbox"
-                     data-tip="Additionally match against the NYPL Catalog of Copyright Entries registrations (1923-1964), when the dataset is present" />
             </div>
             <div class="mf-actions">
               <button id="clear-history-btn" class="cad-btn" type="button"
@@ -1233,6 +1212,45 @@
               <button id="reset-widths" class="cad-btn" type="button">Reset column widths</button>
             </div>
           </div>
+          <div id="sec-library" class="settings-sec">
+            <div class="settings-head">Library &amp; data</div>
+            <div class="settings-subhead">Internet Archive</div>
+            <div class="settings-rows">
+              <label class="tool-label" for="set-auto-ia-dl">Auto-download IA PDFs in the background</label>
+              <input id="set-auto-ia-dl" type="checkbox"
+                     data-tip="When a scan finds an Internet Archive source, download its PDF and build a compressed 10-page preview in the background (can pull a lot of data)" />
+              <label class="tool-label" for="set-keep-originals">Keep IA originals after a folder build</label>
+              <input id="set-keep-originals" type="checkbox" />
+              <label class="tool-label" for="set-preview-original">Preview the original (unmodified) PDF</label>
+              <input id="set-preview-original" type="checkbox" />
+              <label class="tool-label" for="set-trim-blank">Trim blank pages automatically (folder build)</label>
+              <input id="set-trim-blank" type="checkbox"
+                     data-tip="Blank pages are removed from the actual PDF during a folder build (backup kept, OCR renumbered)" />
+            </div>
+            <div class="settings-subhead" style="margin-top:16px">Multi-volume sets</div>
+            <div class="settings-rows">
+              <label class="tool-label" for="set-expand-sets">Expand multi-volume sets by default</label>
+              <input id="set-expand-sets" type="checkbox"
+                     data-tip="Show the individual volumes of every set without clicking the arrow" />
+              <label class="tool-label" for="set-hide-vol-titles">Hide individual volume titles</label>
+              <input id="set-hide-vol-titles" type="checkbox"
+                     data-tip="The set header already shows the title, so leave volume rows' titles blank" />
+            </div>
+            <div class="settings-subhead" style="margin-top:16px">Copyright lookup</div>
+            <div class="settings-rows">
+              <label class="tool-label" for="set-cr-cprs">Look up registrations on publicrecords.copyright.gov</label>
+              <input id="set-cr-cprs" type="checkbox"
+                     data-tip="Left half of the copyright tag: query the U.S. Copyright Office public records (CPRS) for an original registration" />
+              <label class="tool-label" for="set-cr-nypl">Also use the NYPL registrations dataset</label>
+              <input id="set-cr-nypl" type="checkbox"
+                     data-tip="Additionally match against the NYPL Catalog of Copyright Entries registrations (1923-1964), when the dataset is present" />
+            </div>
+            <div class="settings-subhead" style="margin-top:16px">Paths</div>
+            <div class="settings-rows">
+              <label class="tool-label" for="set-browse-dir">PDF browser start folder</label>
+              <input id="set-browse-dir" class="cad-input" spellcheck="false" />
+            </div>
+          </div>
           <div id="sec-ai" class="settings-sec">
             <div class="settings-head">AI</div>
             <p class="settings-note">The Analyze tab's provider. DeepSeek is the
@@ -1245,8 +1263,6 @@
               <label class="tool-label" for="set-ai-model">Model</label>
               <input id="set-ai-model" class="cad-input" spellcheck="false"
                      placeholder="deepseek-chat" />
-              <label class="tool-label" for="set-ai-key">API key</label>
-              <input id="set-ai-key" class="cad-input" type="password" spellcheck="false" />
               <label class="tool-label" for="set-ai-instructions">Custom instructions</label>
               <textarea id="set-ai-instructions" class="cad-input" rows="6"></textarea>
             </div>
@@ -1265,26 +1281,15 @@
                 <option value="azure">Azure Document Intelligence</option>
                 <option value="openai">OpenAI vision</option>
               </select>
-              <label class="tool-label" for="set-mistral-key">Mistral API key</label>
-              <input id="set-mistral-key" class="cad-input" type="password" spellcheck="false"
-                     data-tip="Used by the Mistral OCR service, and by the phone-capture pipeline" />
               <label class="tool-label" for="set-ocr-azure-endpoint">Azure endpoint</label>
               <input id="set-ocr-azure-endpoint" class="cad-input" spellcheck="false"
                      placeholder="https://&lt;resource&gt;.cognitiveservices.azure.com/" />
-              <label class="tool-label" for="set-ocr-azure-key">Azure API key</label>
-              <input id="set-ocr-azure-key" class="cad-input" type="password" spellcheck="false" />
               <label class="tool-label" for="set-ocr-tesseract">Tesseract executable</label>
               <input id="set-ocr-tesseract" class="cad-input" spellcheck="false"
                      placeholder="C:\Program Files\Tesseract-OCR\tesseract.exe" />
-              <label class="tool-label" for="set-ocr-claude-key">Anthropic API key</label>
-              <input id="set-ocr-claude-key" class="cad-input" type="password" spellcheck="false" />
               <label class="tool-label" for="set-ocr-claude-model">Claude model</label>
               <input id="set-ocr-claude-model" class="cad-input" spellcheck="false"
                      placeholder="claude-haiku-4-5-20251001" />
-              <label class="tool-label" for="set-ocr-aws-key">AWS access key (Textract)</label>
-              <input id="set-ocr-aws-key" class="cad-input" spellcheck="false" />
-              <label class="tool-label" for="set-ocr-aws-secret">AWS secret key</label>
-              <input id="set-ocr-aws-secret" class="cad-input" type="password" spellcheck="false" />
               <label class="tool-label" for="set-ocr-aws-region">AWS region</label>
               <input id="set-ocr-aws-region" class="cad-input" spellcheck="false"
                      placeholder="us-east-1" />
@@ -1347,17 +1352,14 @@
               them with that service — mixed batches are fine; nothing runs until the submit
               button. The same digit untags.</p>
           </div>
-          <div id="sec-sync" class="settings-sec">
-            <div class="settings-head">Sync</div>
+          <div id="sec-integrations" class="settings-sec">
+            <div class="settings-head">Google Sheets</div>
             <p class="settings-note">Publishes the master list (plus manual entries) to a Google
               Sheet — always triggered manually (Tools &gt; Sync master list). Requires a Google
               service-account JSON key; not verified yet (no credentials).</p>
             <div class="settings-rows">
               <label class="tool-label" for="set-gs-sheet-id">Spreadsheet ID</label>
               <input id="set-gs-sheet-id" class="cad-input" spellcheck="false" />
-              <label class="tool-label" for="set-gs-keyfile">Service-account key file</label>
-              <input id="set-gs-keyfile" class="cad-input" spellcheck="false"
-                     placeholder="path\to\service-account.json" />
               <label class="tool-label" for="set-gs-sheet-name">Sheet name</label>
               <input id="set-gs-sheet-name" class="cad-input" spellcheck="false"
                      placeholder="Master list" />
@@ -1393,22 +1395,11 @@
               <input id="set-sb-url" class="cad-input" spellcheck="false"
                      placeholder="built in — set only to use your own project"
                      data-tip="The app ships knowing the Library Tool cloud; accounts work with nothing entered here." />
-              <label class="tool-label" for="set-sb-key">Supabase service key</label>
-              <input id="set-sb-key" class="cad-input" type="password" spellcheck="false"
-                     data-tip="The owner secret — unlocks phone capture, publishing, and the working-store sync. Regular users leave it blank." />
-              <label class="tool-label" for="set-sb-anon">Supabase anon key</label>
-              <input id="set-sb-anon" class="cad-input" type="password" spellcheck="false"
-                     placeholder="built in"
-                     data-tip="The public (anon) key — signs users in. Built in; set only with your own project URL." />
               <label class="tool-label" for="set-r2-account">R2 account id</label>
               <input id="set-r2-account" class="cad-input" spellcheck="false"
                      data-tip="Cloudflare R2 stores published PDFs. Leave blank to use Supabase storage (1 GB on the free tier)." />
               <label class="tool-label" for="set-r2-bucket">R2 bucket</label>
               <input id="set-r2-bucket" class="cad-input" spellcheck="false" />
-              <label class="tool-label" for="set-r2-key">R2 access key id</label>
-              <input id="set-r2-key" class="cad-input" spellcheck="false" />
-              <label class="tool-label" for="set-r2-secret">R2 secret</label>
-              <input id="set-r2-secret" class="cad-input" type="password" spellcheck="false" />
               <label class="tool-label" for="set-r2-public">R2 public base URL</label>
               <input id="set-r2-public" class="cad-input" spellcheck="false"
                      placeholder="https://pub-xxxx.r2.dev" />
@@ -1423,11 +1414,49 @@
               <span class="tool-label" id="cloud-test-msg"></span>
             </div>
           </div>
-          <div id="sec-paths" class="settings-sec">
-            <div class="settings-head">File paths</div>
+          <div id="sec-credentials" class="settings-sec">
+            <div class="settings-head">Credentials</div>
+            <p class="settings-note">API keys and secrets for the services configured under
+              AI, OCR, and Integrations. Kept on this machine; leave blank to use the built-in
+              Library Tool cloud.</p>
+            <div class="settings-subhead">AI (Analyze)</div>
             <div class="settings-rows">
-              <label class="tool-label" for="set-browse-dir">PDF browser start folder</label>
-              <input id="set-browse-dir" class="cad-input" spellcheck="false" />
+              <label class="tool-label" for="set-ai-key">API key</label>
+              <input id="set-ai-key" class="cad-input" type="password" spellcheck="false" />
+            </div>
+            <div class="settings-subhead" style="margin-top:16px">OCR</div>
+            <div class="settings-rows">
+              <label class="tool-label" for="set-mistral-key">Mistral API key</label>
+              <input id="set-mistral-key" class="cad-input" type="password" spellcheck="false"
+                     data-tip="Used by the Mistral OCR service, and by the phone-capture pipeline" />
+              <label class="tool-label" for="set-ocr-claude-key">Anthropic API key</label>
+              <input id="set-ocr-claude-key" class="cad-input" type="password" spellcheck="false" />
+              <label class="tool-label" for="set-ocr-azure-key">Azure API key</label>
+              <input id="set-ocr-azure-key" class="cad-input" type="password" spellcheck="false" />
+              <label class="tool-label" for="set-ocr-aws-key">AWS access key (Textract)</label>
+              <input id="set-ocr-aws-key" class="cad-input" spellcheck="false" />
+              <label class="tool-label" for="set-ocr-aws-secret">AWS secret key</label>
+              <input id="set-ocr-aws-secret" class="cad-input" type="password" spellcheck="false" />
+            </div>
+            <div class="settings-subhead" style="margin-top:16px">Phone capture &amp; storage</div>
+            <div class="settings-rows">
+              <label class="tool-label" for="set-sb-key">Supabase service key</label>
+              <input id="set-sb-key" class="cad-input" type="password" spellcheck="false"
+                     data-tip="The owner secret — unlocks phone capture, publishing, and the working-store sync. Regular users leave it blank." />
+              <label class="tool-label" for="set-sb-anon">Supabase anon key</label>
+              <input id="set-sb-anon" class="cad-input" type="password" spellcheck="false"
+                     placeholder="built in"
+                     data-tip="The public (anon) key — signs users in. Built in; set only with your own project URL." />
+              <label class="tool-label" for="set-r2-key">R2 access key id</label>
+              <input id="set-r2-key" class="cad-input" spellcheck="false" />
+              <label class="tool-label" for="set-r2-secret">R2 secret</label>
+              <input id="set-r2-secret" class="cad-input" type="password" spellcheck="false" />
+            </div>
+            <div class="settings-subhead" style="margin-top:16px">Google Sheets</div>
+            <div class="settings-rows">
+              <label class="tool-label" for="set-gs-keyfile">Service-account key file</label>
+              <input id="set-gs-keyfile" class="cad-input" spellcheck="false"
+                     placeholder="path\to\service-account.json" />
             </div>
           </div>
         </div>
