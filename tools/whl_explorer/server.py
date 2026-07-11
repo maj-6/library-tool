@@ -1795,24 +1795,45 @@ def _page_cache_key(path: Path, mtime: float, page: int, width: int) -> str:
 _warm_started: set = set()
 _warm_lock = threading.Lock()
 
+# The reader paints a low-res thumbnail as a blur-up placeholder, then the sharp
+# render on top. Warming the 200 px tier FIRST (≈10 ms/page) means a fast scroll
+# has something for every page almost immediately; the 700 px tier follows.
+_WARM_THUMB_W = 200
+_WARM_FULL_W = 700
 
-def _warm_pages_async(path: Path, width: int = 700) -> None:
+
+def _warm_pages_async(path: Path) -> None:
     try:
-        import fitz  # noqa: F401  -- no renderer, nothing to warm
+        import fitz  # binds `fitz` for the nested renderers; nothing to warm without it
     except ImportError:
         return
     try:
         mtime = path.stat().st_mtime
     except OSError:
         return
-    key = (str(path), mtime, width)
+    key = (str(path), mtime)
     with _warm_lock:
         if key in _warm_started:
             return
         _warm_started.add(key)
 
+    def render_pass(doc, cache, width):
+        for page in range(1, doc.page_count + 1):
+            ck = _page_cache_key(path, mtime, page, width)
+            if (cache / f"{ck}.jpg").is_file() or (cache / f"{ck}.png").is_file():
+                continue
+            try:
+                pg = doc[page - 1]
+                zoom = width / max(1.0, pg.rect.width)
+                pix = pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+                tmp = cache / f"{ck}.warm.tmp.jpg"
+                tmp.write_bytes(pix.tobytes("jpeg", jpg_quality=82))
+                tmp.replace(cache / f"{ck}.jpg")
+            except Exception:
+                pass             # a page that won't encode is left to the live path
+            time.sleep(0.005)    # yield so interactive renders stay snappy
+
     def run():
-        import fitz
         cache = _pages_cache_dir()
         try:
             doc = fitz.open(str(path))
@@ -1821,20 +1842,8 @@ def _warm_pages_async(path: Path, width: int = 700) -> None:
                 _warm_started.discard(key)       # a later open may still work
             return
         try:
-            for page in range(1, doc.page_count + 1):
-                ck = _page_cache_key(path, mtime, page, width)
-                if (cache / f"{ck}.jpg").is_file() or (cache / f"{ck}.png").is_file():
-                    continue
-                try:
-                    pg = doc[page - 1]
-                    zoom = width / max(1.0, pg.rect.width)
-                    pix = pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
-                    tmp = cache / f"{ck}.warm.tmp.jpg"
-                    tmp.write_bytes(pix.tobytes("jpeg", jpg_quality=82))
-                    tmp.replace(cache / f"{ck}.jpg")
-                except Exception:
-                    pass             # a page that won't encode is left to the live path
-                time.sleep(0.005)    # yield so interactive renders stay snappy
+            render_pass(doc, cache, _WARM_THUMB_W)   # blur-up tier first: quick
+            render_pass(doc, cache, _WARM_FULL_W)    # then the sharp image
         finally:
             doc.close()
 

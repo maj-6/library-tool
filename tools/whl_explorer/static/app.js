@@ -6647,6 +6647,7 @@ function createPdfViewer() {
       return dd && dd[0] > 0 && dd[1] > 0 ? `aspect-ratio:${dd[0]} / ${dd[1]};` : "";
     };
     const img = (n) => `<img decoding="async" alt="page ${n}" style="${ar(n)}"
+        data-thumb="/api/pdf/pageimg?path=${encodeURIComponent(pagesPdf)}&page=${n}&w=200"
         data-src="/api/pdf/pageimg?path=${encodeURIComponent(pagesPdf)}&page=${n}&w=700" />`;
     const notes =
       (!textOk ? `<div class="ocr-pgnote empty">OCR text unavailable — saving disabled</div>` : "") +
@@ -10451,6 +10452,7 @@ async function renderOcrPages() {
     return dd && dd[0] > 0 && dd[1] > 0 ? `aspect-ratio:${dd[0]} / ${dd[1]};` : "";
   };
   const img = (n) => `<img decoding="async" alt="page ${n}" style="${ar(n)}"
+      data-thumb="/api/pdf/pageimg?path=${encodeURIComponent(pdf)}&page=${n}&w=200"
       data-src="/api/pdf/pageimg?path=${encodeURIComponent(pdf)}&page=${n}&w=700" />`;
   const done = () => {
     ocrState.pagesPdf = pdf;
@@ -10547,6 +10549,12 @@ function observePageImgs(container) {
     for (const e of entries) {
       const im = e.target;
       if (e.isIntersecting) {
+        // a low-res thumbnail sits behind the img as a blur-up placeholder, so
+        // the row is never a blank box while the full render arrives
+        const box = im.parentElement;   // .ocr-pgimg
+        if (box && im.dataset.thumb && !box.style.backgroundImage) {
+          box.style.backgroundImage = `url("${im.dataset.thumb}")`;
+        }
         if (im.dataset.src && !im.getAttribute("src")) im.src = im.dataset.src;
       } else if (!im.complete && im.getAttribute("src")) {
         im.removeAttribute("src");   // abort the in-flight load, free the slot
