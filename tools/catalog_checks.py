@@ -21,9 +21,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import libcommon as lib  # noqa: E402
 import whl_client as whl  # noqa: E402
 
-# reference data shipped read-only with the app
-RENEWALS_CSV = lib.APP_ROOT / "copyright_renewals.csv"
-WHL_CATALOG_CSV = lib.APP_ROOT / "whl_catalog.csv"
+# Reference data, resolved most-accessible-first (the ~/.library-tool drop-in
+# folder, the data root, then the copy shipped with the app), so a local file
+# from a flash drive is used with no download and no URL.
+RENEWALS_CSV = lib.find_db("copyright_renewals.csv")
+WHL_CATALOG_CSV = lib.find_db("whl_catalog.csv")
 
 # Renewal era: works published in this inclusive window needed a renewal to
 # keep copyright. Older works are public domain by age; newer were auto-renewed.

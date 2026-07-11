@@ -2114,12 +2114,19 @@ async function renderDbSync() {
   try { data = await (await fetch("/api/db/status")).json(); }
   catch (e) { host.innerHTML = "<span class='tool-label'>backend unavailable</span>"; return; }
   const targets = data.targets || {};
+  const pathEl = el("db-folder-path");
+  if (pathEl) pathEl.textContent = data.db_dir || data.data_root || "";
+  const openBtn = el("db-open-folder");
+  if (openBtn) openBtn.onclick = openDataFolder;
   host.innerHTML = "";
   for (const [name, t] of Object.entries(targets)) {
+    const file = t.filename || (t.path || "").split("/").pop();
     const lab = document.createElement("label");
     lab.className = "tool-label";
     lab.setAttribute("for", "set-dburl-" + name);
-    lab.textContent = t.label + (t.present ? ` — downloaded (${dbFmtBytes(t.size)})` : "");
+    lab.textContent = t.label + (t.present
+      ? ` — present ✓ (${dbFmtBytes(t.size)})`
+      : ` — not found · drop ${file} in the data folder, or download`);
     const inp = document.createElement("input");
     inp.id = "set-dburl-" + name;
     inp.className = "cad-input";
@@ -2139,6 +2146,15 @@ async function renderDbSync() {
   dbStatusMsg(targets);
 }
 
+// Open the writable data folder so the user can drop database files straight in
+// (local-first: a file here is used offline, no download or URL needed).
+async function openDataFolder() {
+  try {
+    const r = await (await fetch("/api/db/reveal", { method: "POST" })).json();
+    if (r && r.ok === false) status("DATA FOLDER :: " + (r.error || "could not open"));
+  } catch (e) { status("DATA FOLDER :: could not open"); }
+}
+
 async function startDbDownload() {
   // capture any un-blurred URL edits, then push settings so the server sees them
   state.settings.dbUrls = state.settings.dbUrls || {};
@@ -2155,7 +2171,8 @@ async function startDbDownload() {
     const r = await (await fetch("/api/db/download",
       { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })).json();
     if (!r.started || !r.started.length) {
-      el("db-status-msg").textContent = "Set a source URL for at least one database first.";
+      el("db-status-msg").textContent =
+        "Nothing to download — set a source URL, or drop the file in the data folder.";
       if (btn) btn.disabled = false;
       return;
     }

@@ -3306,13 +3306,38 @@ _db_jobs = {}          # name -> {status, downloaded, total, error}
 _db_lock = threading.Lock()
 
 
+def _db_local(rel):
+    """Where a database actually is, or None if nowhere. LOCAL-FIRST via
+    lib.find_db: the ~/.library-tool drop-in folder, the data root, then the copy
+    bundled with the app. None only when no copy exists — the sole case a
+    download is offered."""
+    p = lib.find_db(rel.split("/")[-1], rel)
+    return p if p.exists() else None
+
+
 def _db_urls():
-    urls = _client_settings().get("dbUrls")
-    return urls if isinstance(urls, dict) else {}
+    """Effective download URL per database: a Settings override wins, else the
+    baked default (cloud_defaults.DB_URLS[name], or DB_BASE_URL/<file>). Empty
+    when neither is set — the database is then local-drop-in only."""
+    out = {}
+    base = str(getattr(cloud_defaults, "DB_BASE_URL", "") or "").strip().rstrip("/")
+    defaults = getattr(cloud_defaults, "DB_URLS", {}) or {}
+    for name, (rel, _label) in _DB_TARGETS.items():
+        u = str(defaults.get(name) or "").strip()
+        if not u and base:
+            u = f"{base}/{rel.split('/')[-1]}"
+        if u:
+            out[name] = u
+    s = _client_settings().get("dbUrls")
+    if isinstance(s, dict):
+        for k, v in s.items():
+            if str(v or "").strip():
+                out[k] = str(v).strip()
+    return out
 
 
 def _run_db_download(name, url, rel):
-    dest = lib.DATA_ROOT / rel
+    dest = lib.DB_DIR / rel.split("/")[-1]   # downloads land in the drop-in folder
     tmp = dest.with_name(dest.name + ".part")
     log.info("database download started: %s <- %s", name, url)
     try:
@@ -3371,15 +3396,37 @@ def api_db_status():
     urls = _db_urls()
     out = {}
     for name, (rel, label) in _DB_TARGETS.items():
-        p = lib.DATA_ROOT / rel
+        p = _db_local(rel)
         out[name] = {
             "label": label, "path": rel,
-            "present": p.exists(),
-            "size": p.stat().st_size if p.exists() else 0,
+            "filename": rel.split("/")[-1],
+            "present": p is not None,
+            "size": p.stat().st_size if p else 0,
             "url": str(urls.get(name) or ""),
             "job": _db_jobs.get(name),
         }
-    return jsonify({"data_root": str(lib.DATA_ROOT), "targets": out})
+    return jsonify({"data_root": str(lib.DATA_ROOT), "db_dir": str(lib.DB_DIR),
+                    "targets": out})
+
+
+@app.route("/api/db/reveal", methods=["POST"])
+def api_db_reveal():
+    """Open the writable data folder in the OS file manager so a user can drop
+    database files straight in — local-first means a file here is used with no
+    download and no URL."""
+    import subprocess
+    target = lib.DB_DIR
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            os.startfile(str(target))            # noqa: S606 - a local desktop app
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(target)])
+        else:
+            subprocess.Popen(["xdg-open", str(target)])
+        return jsonify({"ok": True, "path": str(target)})
+    except Exception as exc:                      # noqa: BLE001
+        return jsonify({"ok": False, "error": str(exc), "path": str(target)}), 500
 
 
 @app.route("/api/db/download", methods=["POST"])

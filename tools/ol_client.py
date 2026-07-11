@@ -33,8 +33,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import libcommon as lib  # noqa: E402
 import whl_client as whl  # noqa: E402
 
-DB_PATH = lib.OUTPUT_DIR / "ol_works.db"
-SEARCH_DB_PATH = lib.OUTPUT_DIR / "ol_search.db"
+DB_PATH = lib.find_db("ol_works.db", "output/ol_works.db")
+SEARCH_DB_PATH = lib.find_db("ol_search.db", "output/ol_search.db")
 CACHE_PATH = lib.OUTPUT_DIR / ".ol_api_cache.json"
 OL_API = "https://openlibrary.org"
 USER_AGENT = "world-herb-library-tools/1.0"
