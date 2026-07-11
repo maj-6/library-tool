@@ -15,6 +15,14 @@ a standalone CLI.
 - `corpus_sync.py` — the private corpus (`photo/`, `books/` images) is
   gitignored, not version-controlled; this syncs it against the R2 bucket's
   `corpus/` prefix instead (`status`, `push --run`, `pull --run`).
+- `store_sync.py` — the working stores that also left git
+  (`output/whl_builds.json`, `downloads/ia/catalog.json`,
+  `output/whl_corrections.json`, and the `output/entries/` folders) sync
+  through here: the JSON stores merge record-by-record against their
+  Supabase tables (tombstoned deletes, last-write-wins, a shadow ledger, and
+  a wipe guard so an emptier side never clobbers a fuller one); the entry
+  files mirror to the R2 bucket's `entries/` prefix. Runs inside the app's
+  cloud-sync pass, and as a CLI (`status`, `sync --run`).
 - `convert_xlsx.py` — converts `ch_library.xlsx` to `output/ch_library.json`.
 - `catalog_checks.py` — offline copyright + WHL-catalogue checks (loaders,
   indexes, and the shared cross-database identity test).
@@ -200,6 +208,11 @@ drives the realtime Open Library query — `[title]` words, `@author`
   subtitle, edition, volume number, language, pages, condition, price,
   illustrations, categories, notes; title required). Entries are saved to
   `output/manual_entries.json` and checked automatically on submit.
+  **Categories are a hierarchical taxonomy** (Tools → Categories…): the
+  form's chip picker assigns nodes from `output/categories.json` (stored
+  as `category_ids`, synced to the cloud like builds), and the manager
+  window renames, nests, merges, and can adopt the deprecated
+  comma-separated text still found on old records.
   **Titles are parsed on submit**: text after a colon becomes the
   subtitle, and volume/edition indicators (`vol. 1`, `v2`, `v. iii`,
   `2nd ed.`, `Third Edition`) are removed from the title and land in

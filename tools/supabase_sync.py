@@ -154,6 +154,27 @@ def list_volumes(cfg: dict, limit: int = 200) -> list[dict]:
     return rows or []
 
 
+# --- volume artifacts: About texts, page texts/translations, margin notes ---------
+# The published bundle beyond the PDF (volume_texts / volume_pages /
+# volume_notes). Composite conflict targets, chunked like everything else.
+
+def upsert_rows(cfg: dict, table: str, on_conflict: str, rows: list[dict],
+                chunk: int = 200) -> int:
+    pushed = 0
+    for i in range(0, len(rows), chunk):
+        batch = rows[i:i + chunk]
+        _rest(cfg, "POST", f"{table}?on_conflict={on_conflict}", batch,
+              prefer="resolution=merge-duplicates,return=minimal")
+        pushed += len(batch)
+    return pushed
+
+
+def delete_rows(cfg: dict, table: str, filters: str) -> None:
+    """DELETE with a caller-built PostgREST filter string. The caller is
+    trusted to scope it to one slug — this is the desktop's service key."""
+    _rest(cfg, "DELETE", f"{table}?{filters}", prefer="return=minimal")
+
+
 # --- books mirror ----------------------------------------------------------------
 
 def push_books(cfg: dict, rows: list[dict], chunk: int = 200) -> int:
@@ -163,6 +184,37 @@ def push_books(cfg: dict, rows: list[dict], chunk: int = 200) -> int:
     for i in range(0, len(rows), chunk):
         batch = rows[i:i + chunk]
         _rest(cfg, "POST", f"{table}?on_conflict=key", batch,
+              prefer="resolution=merge-duplicates,return=minimal")
+        pushed += len(batch)
+    return pushed
+
+
+# --- desktop working stores (builds / ia_catalog / corrections) -------------------
+# One row per record: {<pk>, data, updated_at, deleted}. The merge logic lives
+# in store_sync.py; these are just the paged read and the chunked upsert.
+
+def list_store_rows(cfg: dict, table: str, pk: str) -> list[dict]:
+    """Every row of a store table, tombstones included, paged so the result
+    is complete past PostgREST's max-rows cap."""
+    out: list[dict] = []
+    page = 1000
+    while True:
+        rows = _rest(cfg, "GET",
+                     f"{table}?select={pk},data,updated_at,deleted"
+                     f"&order={pk}.asc&limit={page}&offset={len(out)}")
+        rows = rows if isinstance(rows, list) else []
+        out.extend(rows)
+        if len(rows) < page:
+            return out
+
+
+def upsert_store_rows(cfg: dict, table: str, pk: str, rows: list[dict],
+                      chunk: int = 200) -> int:
+    """Upsert store rows keyed on their primary column."""
+    pushed = 0
+    for i in range(0, len(rows), chunk):
+        batch = rows[i:i + chunk]
+        _rest(cfg, "POST", f"{table}?on_conflict={pk}", batch,
               prefer="resolution=merge-duplicates,return=minimal")
         pushed += len(batch)
     return pushed

@@ -1,32 +1,46 @@
 /* Library Tool — the public site.
    Light only, low chroma, printed-catalogue idiom: the same restraint the
-   desktop app settled on. No build step, no framework. The one webfont is
-   Roboto Slab, bundled locally (SIL OFL) — used for the wordmark and headings,
-   the same way the desktop app uses it. */
+   desktop app settled on. No build step, no framework, no CDN — the one
+   typeface is served from assets/fonts/ alongside everything else. */
 
+/* Roboto Slab, variable weight, subset to latin + latin-ext — the same files
+   the Google Fonts CSS serves, bundled in assets/fonts/. The unicode-ranges
+   mean a plain-ASCII page downloads one file. */
 @font-face {
   font-family: "Roboto Slab";
-  src: url("fonts/roboto-slab-var.woff2") format("woff2");
-  font-weight: 100 900;
   font-style: normal;
+  font-weight: 100 900;
   font-display: swap;
+  src: url(fonts/roboto-slab-var-latin-ext.woff2) format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: "Roboto Slab";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url(fonts/roboto-slab-var.woff2) format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
 
+/* Archive Ledger, lifted from the desktop theme of the same name: warm grey
+   chrome over near-white stock, ink at #26241f, a slate-green band for the
+   active mark, and the double rule doing the work a border colour normally
+   would. */
 :root {
-  /* Gentle warm palette, lifted from the app's VELLUM theme: warm off-white
-     paper, near-zero chroma, a soft brown-black ink and a muted sage accent. */
-  --paper: #f7f4ec;
-  --card: #fbf8f1;
-  --rule: #d8d1c1;
-  --rule-soft: #ece7db;
-  --ink: #2a2620;
-  --ink-soft: #6d665a;
-  --ink-faint: #9a927f;
-  --accent: #4d7268;      /* muted sage-teal, softened from the app's Sage/Vellum */
-  --accent-ink: #3c5b52;
-  --warn-bg: #f3efe0;
-
-  --slab: "Roboto Slab", Georgia, "Times New Roman", serif;
+  --paper: #fbfaf7;
+  --card: #fffefc;
+  --chrome: #f6f5f1;
+  --rule: #8f8d84;
+  --rule-mid: #c8c6bd;
+  --rule-soft: #e6e4db;
+  --ink: #26241f;
+  --ink-soft: #5c5a52;
+  --ink-faint: #8f8d84;
+  --accent: #3d443e;      /* the band, from the app's Archive Ledger theme */
+  --accent-ink: #22685e;
+  --warn-bg: #fffef6;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
 }
 
 * { box-sizing: border-box; }
@@ -35,16 +49,16 @@ html, body { margin: 0; }
 body {
   background: var(--paper);
   color: var(--ink);
-  font: 16px/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  font: 16px/1.6 "Roboto Slab", Georgia, "Palatino Linotype", serif;
   -webkit-font-smoothing: antialiased;
 }
 
-.wrap { max-width: 960px; margin: 0 auto; padding: 0 20px; }
+.wrap { max-width: 1020px; margin: 0 auto; padding: 0 20px; }
 
 /* --- masthead --- */
 header.site {
   border-bottom: 3px double var(--rule);
-  background: var(--card);
+  background: var(--chrome);
 }
 header.site .wrap {
   display: flex;
@@ -53,12 +67,11 @@ header.site .wrap {
   padding-top: 16px;
   padding-bottom: 16px;
 }
-header.site img { width: 42px; height: 42px; display: block; }
+header.site img { width: 54px; height: 54px; display: block; }
 header.site .name {
-  font-family: var(--slab);
-  font-size: 22px;
-  font-weight: 600;
-  letter-spacing: 0.4px;
+  font-size: 20px;
+  font-weight: bold;
+  letter-spacing: 0.6px;
   margin-right: auto;
 }
 header.site .gh {
@@ -69,44 +82,44 @@ header.site .gh {
 header.site .gh:hover { color: var(--accent); }
 header.site .gh svg { display: block; width: 22px; height: 22px; }
 
-/* --- page layout: nav sidebar + content --- */
-.layout {
+/* --- sidebar --- */
+.shell {
   display: grid;
-  grid-template-columns: 156px 1fr;
-  gap: 44px;
-  margin-top: 44px;   /* breathing room after the header bar */
-  padding-bottom: 72px;
+  grid-template-columns: 172px 1fr;
+  gap: 0 34px;
+  align-items: start;
 }
-
-aside.sidebar nav { position: sticky; top: 28px; }
+aside.side {
+  position: sticky;
+  top: 0;
+  padding: 38px 22px 40px 0;
+  border-right: 1px solid var(--rule-soft);
+}
 nav.site { display: flex; flex-direction: column; }
 nav.site a {
   color: var(--ink-soft);
   text-decoration: none;
-  font: 13px/1 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 13px;
   letter-spacing: 1px;
   text-transform: uppercase;
-  padding: 8px 0 8px 12px;
+  padding: 7px 0 7px 11px;
   border-left: 2px solid transparent;
 }
-nav.site a:hover { color: var(--ink); }
-nav.site a[aria-current="page"] {
-  color: var(--ink);
-  border-left-color: var(--accent);
-}
+nav.site a:hover { color: var(--ink); border-left-color: var(--rule-mid); }
+nav.site a[aria-current="page"] { color: var(--ink); border-left-color: var(--accent); }
 
 /* --- generic --- */
-main { min-width: 0; }        /* let the content column shrink inside the grid */
-h1 { font-family: var(--slab); font-size: 30px; font-weight: 600; margin: 0 0 6px; letter-spacing: 0.2px; }
-h2 { font-family: var(--slab); font-size: 20px; font-weight: 600; margin: 32px 0 10px; }
+main { padding: 34px 0 60px; min-width: 0; }
+h1 { font-size: 30px; margin: 0 0 6px; letter-spacing: 0.4px; }
+h2 { font-size: 20px; margin: 32px 0 10px; }
 .lede { color: var(--ink-soft); margin: 0 0 26px; }
-.mono { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
+.mono { font-family: var(--mono); }
 .muted { color: var(--ink-faint); }
 a { color: var(--accent-ink); }
 
 .note {
   background: var(--warn-bg);
-  border: 1px solid var(--rule);
+  border: 1px solid var(--rule-mid);
   border-left: 3px solid var(--accent);
   padding: 10px 14px;
   font-size: 14px;
@@ -121,13 +134,13 @@ a { color: var(--accent-ink); }
   align-items: center;
   padding: 12px;
   background: var(--card);
-  border: 1px solid var(--rule);
+  border: 1px solid var(--rule-mid);
   margin-bottom: 6px;
 }
 .controls input, .controls select {
   font: 14px/1.4 inherit;
   padding: 7px 9px;
-  border: 1px solid var(--rule);
+  border: 1px solid var(--rule-mid);
   background: #fff;
   color: var(--ink);
   border-radius: 2px;
@@ -135,13 +148,16 @@ a { color: var(--accent-ink); }
 .controls input[type="search"] { flex: 1 1 260px; min-width: 0; }
 .controls input[type="number"] { width: 88px; }
 .controls label {
-  font: 11px/1 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1;
   letter-spacing: 1px;
   text-transform: uppercase;
   color: var(--ink-faint);
 }
 .count {
-  font: 12px/1 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1;
+  letter-spacing: 0.5px;
   color: var(--ink-faint);
   padding: 8px 2px 16px;
 }
@@ -155,30 +171,29 @@ ol.volumes { list-style: none; margin: 0; padding: 0; }
   padding: 14px 0;
   border-bottom: 1px solid var(--rule-soft);
 }
-.volume:first-child { border-top: 1px solid var(--rule-soft); }
+.volume:first-child { border-top: 3px double var(--rule); }
 .volume h3 { margin: 0; font-size: 17px; font-weight: normal; }
 .volume h3 a { color: var(--ink); text-decoration: none; }
 .volume h3 a:hover { text-decoration: underline; }
 .volume .by { color: var(--ink-soft); font-size: 14px; }
 .volume .meta {
   grid-column: 1 / -1;
-  font: 12px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
   color: var(--ink-faint);
   letter-spacing: 0.3px;
 }
 .volume .meta span + span::before { content: " · "; }
-/* grid-column is explicit because auto-placement seats row-locked items FIRST:
-   without it the button takes column 1 and the title auto-flows to the right */
-.volume .actions { grid-column: 2; grid-row: 1 / span 2; align-self: center; white-space: nowrap; }
+.volume .actions { grid-row: 1 / span 2; align-self: center; white-space: nowrap; }
 
 .btn {
   display: inline-block;
-  font: 12px/1 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font: 12px/1 inherit;
   letter-spacing: 1px;
   text-transform: uppercase;
   text-decoration: none;
   padding: 9px 13px;
-  border: 1px solid var(--rule);
+  border: 1px solid var(--rule-mid);
   background: #fff;
   color: var(--ink);
   border-radius: 2px;
@@ -186,7 +201,7 @@ ol.volumes { list-style: none; margin: 0; padding: 0; }
 .btn:hover { border-color: var(--accent); color: var(--accent-ink); }
 .btn[aria-disabled="true"] { opacity: 0.45; pointer-events: none; }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-.btn.primary:hover { background: var(--accent-ink); color: #fff; }
+.btn.primary:hover { background: var(--ink); color: #fff; }
 
 .pager { display: flex; gap: 10px; align-items: center; margin-top: 26px; }
 .pager .spacer { flex: 1; }
@@ -199,30 +214,30 @@ ol.volumes { list-style: none; margin: 0; padding: 0; }
   align-items: center;
   padding: 16px;
   background: var(--card);
-  border: 1px solid var(--rule);
+  border: 1px solid var(--rule-mid);
   margin-bottom: 12px;
 }
 .rel h3 { margin: 0; font-size: 17px; font-weight: normal; }
 .rel .meta {
   grid-column: 1;
-  font: 12px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
   color: var(--ink-faint);
 }
-.rel .actions { grid-column: 2; grid-row: 1 / span 2; }
+.rel .actions { grid-row: 1 / span 2; }
 
 /* --- changelog / release notes --- */
 .changelog { margin: 0; }
 .cl-rel { padding: 16px 0; border-top: 1px solid var(--rule-soft); }
 .cl-rel:first-child { border-top: none; padding-top: 2px; }
 .cl-ver {
-  font-family: var(--slab);
   font-size: 18px;
   font-weight: 600;
   margin: 0 0 8px;
   color: var(--ink);
 }
 .cl-date {
-  font: 12px/1 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font: 12px/1 var(--mono);
   letter-spacing: 0.5px;
   color: var(--ink-faint);
   font-weight: normal;
@@ -232,29 +247,32 @@ ol.volumes { list-style: none; margin: 0; padding: 0; }
 .cl-list li { margin: 0 0 5px; color: var(--ink); }
 .changelog-more {
   margin-top: 20px;
-  font: 12px/1 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font: 12px/1 var(--mono);
   letter-spacing: 0.5px;
   text-transform: uppercase;
 }
 
-@media (max-width: 720px) {
-  /* Stack the nav above the content; run the links horizontally like tabs. */
-  .layout { grid-template-columns: 1fr; gap: 22px; margin-top: 28px; }
-  aside.sidebar nav { position: static; top: auto; }
-  nav.site {
-    flex-direction: row;
-    flex-wrap: wrap;
-    gap: 4px 6px;
+@media (max-width: 820px) {
+  .shell { grid-template-columns: 1fr; }
+  aside.side {
+    position: static;
+    padding: 0;
+    border-right: none;
     border-bottom: 1px solid var(--rule-soft);
-    padding-bottom: 12px;
   }
+  nav.site { flex-direction: row; flex-wrap: wrap; }
   nav.site a {
-    padding: 6px 12px 6px 0;
+    padding: 12px 0 10px;
+    margin-right: 20px;
     border-left: none;
     border-bottom: 2px solid transparent;
   }
-  nav.site a[aria-current="page"] { border-left-color: transparent; border-bottom-color: var(--accent); }
+  nav.site a:hover { border-bottom-color: var(--rule-mid); }
+  nav.site a[aria-current="page"] { border-bottom-color: var(--accent); }
+  main { padding-top: 26px; }
+}
+
+@media (max-width: 620px) {
   .volume, .rel { grid-template-columns: 1fr; }
-  .volume .actions, .rel .actions { grid-column: auto; grid-row: auto; }
-  header.site .wrap { flex-wrap: wrap; }
+  .volume .actions, .rel .actions { grid-row: auto; }
 }

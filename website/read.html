@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en" class="reader">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Reader · World Herb Library</title>
+<link rel="icon" href="assets/icon.png" />
+<link rel="stylesheet" href="assets/library.css" />
+</head>
+<body class="reader">
+<div class="reader-bar" id="bar">
+  <a class="rb-back" id="back" href="browse.html">← Record</a>
+  <span class="rb-sep"></span>
+  <span class="rb-title" id="title">Reader</span>
+  <span class="rb-spacer"></span>
+
+  <div class="rb-page">
+    <button class="rb-btn" id="pprev" type="button" title="Previous page" aria-label="Previous page">‹</button>
+    <input id="pageinput" type="text" inputmode="numeric" autocomplete="off" value="1"
+           aria-label="Current page" />
+    <span id="pagecount">/ –</span>
+    <button class="rb-btn" id="pnext" type="button" title="Next page" aria-label="Next page">›</button>
+  </div>
+  <span class="rb-sep"></span>
+  <div class="rb-group">
+    <button class="rb-btn" id="zoomout" type="button" title="Zoom out (−)">−</button>
+    <button class="rb-btn" id="fitwidth" type="button" title="Fit width">Fit width</button>
+    <button class="rb-btn" id="fitpage" type="button" title="Fit page">Fit page</button>
+    <button class="rb-btn" id="zoomin" type="button" title="Zoom in (+)">+</button>
+  </div>
+  <span class="rb-sep"></span>
+  <div class="rb-group">
+    <button class="rb-btn" id="tthumbs" type="button" title="Thumbnails (t)">Thumbnails</button>
+    <button class="rb-btn" id="tnotes" type="button" title="Annotations">Notes</button>
+    <button class="rb-btn" id="ttext" type="button" title="Text / translation">Text</button>
+  </div>
+</div>
+
+<div class="reader-body" id="reader-body">
+  <aside class="thumbs" id="thumbs" hidden aria-label="Thumbnails"></aside>
+  <div class="scroller" id="scroller" tabindex="0">
+    <div class="reader-msg"><span class="label">Loading</span>Opening the volume…</div>
+  </div>
+  <aside class="textpanel" id="textpanel" hidden aria-label="Text and translations">
+    <div class="tp-head">
+      <span class="label">Text</span>
+      <select id="tp-lang" aria-label="Text language"></select>
+    </div>
+    <div id="tp-body"></div>
+  </aside>
+</div>
+
+<script src="assets/config.js" onerror="void 0"></script>
+<script type="module" src="assets/read.js"></script>
+</body>
+</html>

@@ -3,67 +3,81 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Library · Library Tool</title>
+<title>World Herb Library</title>
 <link rel="icon" href="assets/icon.png" />
-<link rel="stylesheet" href="assets/site.css" />
+<link rel="stylesheet" href="assets/library.css" />
 </head>
 <body>
-<header class="site">
-  <div class="wrap">
-    <img src="assets/icon.png" alt="" />
-    <div class="name">Library Tool</div>
-    <a class="gh" href="https://github.com/maj-6/library-tool" target="_blank" rel="noopener" aria-label="Source on GitHub">
-      <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-    </a>
+<header class="lib-masthead">
+  <div class="masthead-inner">
+    <img class="wm-mark" src="assets/icon.png" alt="" width="40" height="40" />
+    <div class="wordmark">
+      <a class="wm-title" href="browse.html">World Herb Library</a>
+      <div class="wm-sub">An archival collection of botanical &amp; medical works</div>
+    </div>
+    <a class="wm-parent" href="index.html">part of Library&nbsp;Tool ↩</a>
   </div>
 </header>
 
-<div class="layout wrap">
-  <aside class="sidebar">
-    <nav class="site">
-      <a href="index.html">About</a>
-      <a href="downloads.html">Downloads</a>
-      <a href="releases.html">Release notes</a>
-      <a href="docs.html">Documentation</a>
-      <a href="browse.html" aria-current="page">Library (experimental)</a>
-    </nav>
-  </aside>
+<div class="lib-shell" id="lib-body">
+  <div class="toolbar">
+    <form class="toolbar-form" id="controls" role="search">
+      <div class="searchfield">
+        <input type="search" id="q" name="q" placeholder="Search titles, authors, subjects…"
+               autocomplete="off" aria-label="Search the library" />
+      </div>
+      <div class="sortbox">
+        <label class="label" for="sort">Sort</label>
+        <select id="sort" name="sort">
+          <option value="title">Title</option>
+          <option value="year">Year, oldest</option>
+          <option value="year-desc">Year, newest</option>
+          <option value="recent">Recently added</option>
+        </select>
+      </div>
+    </form>
+    <div class="result-count" id="count" aria-live="polite">Loading…</div>
+  </div>
 
-  <main>
-  <h1>Library</h1>
-  <p class="lede">Public-domain works on botany and herbal medicine, scanned in full.</p>
-
-  <div id="offline" class="note" hidden>
+  <div class="offline-note" id="offline" hidden>
     Showing a local fixture: no cloud is configured for this copy of the site.
   </div>
 
-  <form class="controls" id="controls" role="search">
-    <input type="search" id="q" name="q" placeholder="Search titles, authors, subjects…"
-           autocomplete="off" aria-label="Search the library" />
-    <label for="from">Year</label>
-    <input type="number" id="from" name="from" placeholder="from" min="1400" max="2100" />
-    <input type="number" id="to" name="to" placeholder="to" min="1400" max="2100" />
-    <label for="sort">Sort</label>
-    <select id="sort" name="sort">
-      <option value="title">Title</option>
-      <option value="year">Year, oldest</option>
-      <option value="year-desc">Year, newest</option>
-      <option value="recent">Recently added</option>
-    </select>
-  </form>
+  <div class="catalogue">
+    <aside class="facets" id="facets" aria-label="Filters">
+      <section class="facet">
+        <h2>Categories</h2>
+        <div class="cat-tree" id="facet-cats"></div>
+      </section>
+      <section class="facet">
+        <h2>Year</h2>
+        <div class="yearbox">
+          <input type="number" id="from" name="from" placeholder="from" min="1000" max="2100"
+                 aria-label="Year from" />
+          <span class="dash">–</span>
+          <input type="number" id="to" name="to" placeholder="to" min="1000" max="2100"
+                 aria-label="Year to" />
+        </div>
+      </section>
+      <section class="facet">
+        <h2>Language</h2>
+        <div class="lang-list" id="facet-langs"></div>
+      </section>
+      <button type="button" class="facet-clear" id="clear-facets" hidden>Clear filters</button>
+    </aside>
 
-  <div class="count" id="count" aria-live="polite">Loading…</div>
-
-  <ol class="volumes" id="results"></ol>
-
-  <div class="pager" id="pager" hidden>
-    <button class="btn" id="prev" type="button">Previous</button>
-    <span class="spacer"></span>
-    <span class="mono muted" id="page"></span>
-    <span class="spacer"></span>
-    <button class="btn" id="next" type="button">Next</button>
+    <main class="records">
+      <div class="active-filters" id="active-filters"></div>
+      <ol class="records-list" id="results"></ol>
+      <div class="pager" id="pager" hidden>
+        <button class="btn" id="prev" type="button">Previous</button>
+        <span class="spacer"></span>
+        <span class="page-label" id="page"></span>
+        <span class="spacer"></span>
+        <button class="btn" id="next" type="button">Next</button>
+      </div>
+    </main>
   </div>
-  </main>
 </div>
 
 <script src="assets/config.js" onerror="void 0"></script>
