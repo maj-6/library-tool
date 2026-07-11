@@ -25,6 +25,24 @@
 
 const LS_KEY = "whl_cad_checked_v1";
 const SETTINGS_KEY = "whl_cad_settings_v1";
+const VIEWSTATE_KEY = "whl_cad_viewstate_v1";
+// Per-device UI / session state: persisted LOCALLY but never synced to the server
+// as "settings". These are things one machine should not push onto another — the
+// active table/mode, toolbar filters, split-pane and column sizes, and the
+// first-run flags. Everything else in state.settings is a real preference and
+// still syncs. (state.settings stays the single in-memory object; only the
+// persistence layer partitions it.)
+const VIEW_STATE_KEYS = new Set([
+  "markFilter", "srcFilter", "dlFilter", "yearFrom", "yearTo",
+  "topTable", "bottomActive", "whlMode", "checkedMode", "showCatalog",
+  "paneWidth", "uploadSplitH", "colWidths",
+  "authPromptDismissed", "wizardDone", "checkedCols",
+]);
+function partitionSettings(s) {
+  const prefs = {}, view = {};
+  for (const k of Object.keys(s)) (VIEW_STATE_KEYS.has(k) ? view : prefs)[k] = s[k];
+  return { prefs, view };
+}
 
 // `categories` left this list with the taxonomy overhaul: assignments are
 // category_ids lists handled by the chip pickers, not looped text inputs.
@@ -831,7 +849,13 @@ function loadChecked() {
 }
 
 function saveSettings() {
-  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings)); } catch (e) {}
+  // preferences -> SETTINGS_KEY (and the server); per-device view state -> its
+  // own local key, never pushed. state.settings stays whole in memory.
+  const { prefs, view } = partitionSettings(state.settings);
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(prefs));
+    localStorage.setItem(VIEWSTATE_KEY, JSON.stringify(view));
+  } catch (e) {}
   pushClientState("settings");
 }
 
@@ -874,7 +898,10 @@ function onUiScaleKey(ev) {
 function loadSettings() {
   try {
     const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
-    state.settings = Object.assign(state.settings, s);
+    const v = JSON.parse(localStorage.getItem(VIEWSTATE_KEY) || "{}");
+    // legacy caches kept view state inside SETTINGS_KEY; apply it, then let the
+    // dedicated view-state store win. The next saveSettings re-partitions both.
+    state.settings = Object.assign(state.settings, s, v);
   } catch (e) { /* keep defaults */ }
   normalizeSettings();
 }
@@ -954,7 +981,7 @@ let _csTimer = null;
 
 function clientStateBlob(kind) {
   if (kind === "checked") return checkedArray();
-  if (kind === "settings") return state.settings;
+  if (kind === "settings") return partitionSettings(state.settings).prefs;
   if (kind === "attention") return state.attn || {};
   return null;
 }
@@ -1024,11 +1051,20 @@ async function syncClientStateOnLoad() {
       try { localStorage.setItem(LS_KEY, JSON.stringify(checkedArray())); } catch (e) {}
     }
     if (server.settings && typeof server.settings === "object") {
-      state.settings = Object.assign(state.settings, server.settings);
+      // adopt the server's PREFERENCES; per-device view state stays whatever this
+      // machine holds (the server no longer carries it, but old data might)
+      const incoming = {};
+      for (const k of Object.keys(server.settings))
+        if (!VIEW_STATE_KEYS.has(k)) incoming[k] = server.settings[k];
+      state.settings = Object.assign(state.settings, incoming);
       normalizeSettings();
-      syncYearFilterInputs();   // reflect adopted year-range into the toolbar
+      syncYearFilterInputs();   // reflect the (local) year-range into the toolbar
       syncSearchConsCheckboxes();
-      try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings)); } catch (e) {}
+      try {
+        const { prefs, view } = partitionSettings(state.settings);
+        localStorage.setItem(SETTINGS_KEY, JSON.stringify(prefs));
+        localStorage.setItem(VIEWSTATE_KEY, JSON.stringify(view));
+      } catch (e) {}
     }
     if (server.attention && typeof server.attention === "object") {
       // Attention marks (unlike checked books) are a low-stakes set that
@@ -2220,7 +2256,10 @@ function renderSettings() {
     (el("status-right").textContent || "");
   el("reset-settings").onclick = () => {
     if (!window.confirm("Reset every interface setting? (Catalog data is kept.)")) return;
-    try { localStorage.removeItem(SETTINGS_KEY); } catch (e) {}
+    try {
+      localStorage.removeItem(SETTINGS_KEY);
+      localStorage.removeItem(VIEWSTATE_KEY);
+    } catch (e) {}
     location.reload();
   };
   el("clear-history-btn").onclick = () => {
