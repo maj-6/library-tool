@@ -2330,6 +2330,25 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   width: min(760px, 100%);
   height: min(560px, 82vh);
 }
+#about-window {
+  width: min(380px, 100%);
+}
+#about-body {
+  padding: 22px 24px 20px;
+  text-align: center;
+  font-family: var(--ui);
+  color: var(--ink);
+}
+#about-icon { image-rendering: auto; margin-bottom: 6px; }
+.about-title { font-size: 15px; letter-spacing: 0.5px; margin-bottom: 8px; }
+.about-title span { color: var(--ink-light); }
+.about-desc {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--ink-light);
+  margin: 0 0 16px;
+}
+.about-links { display: flex; gap: 8px; justify-content: center; }
 #settings-body {
   flex: 1;
   min-height: 0;

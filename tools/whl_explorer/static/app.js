@@ -2477,6 +2477,23 @@ function initSettingsNav() {
 function openSettings() { renderSettings(); el("settings-overlay").hidden = false; }
 function closeSettings() { el("settings-overlay").hidden = true; }
 
+function openAbout() { const o = el("about-overlay"); if (o) o.hidden = false; }
+function closeAbout() { const o = el("about-overlay"); if (o) o.hidden = true; }
+function initAbout() {
+  const close = el("about-close");
+  if (close) close.addEventListener("click", closeAbout);
+  const ov = el("about-overlay");
+  if (ov) ov.addEventListener("mousedown", (ev) => { if (ev.target === ov) closeAbout(); });
+  // the About footer buttons reuse menu commands (Website / Changelog)
+  for (const b of document.querySelectorAll("#about-body [data-cmd]")) {
+    b.addEventListener("click", () => {
+      closeAbout();
+      const f = MENU_CMDS[b.dataset.cmd];
+      if (f) f();
+    });
+  }
+}
+
 // --- changelog viewer ----------------------------------------------------------
 // Renders the shared release notes (website/changelog.md, served by
 // /api/changelog). The format is terse: "## <version> — <date>" headings and
@@ -6455,8 +6472,8 @@ function createPdfViewer() {
       const dd = dims[n - 1];
       return dd && dd[0] > 0 && dd[1] > 0 ? `aspect-ratio:${dd[0]} / ${dd[1]};` : "";
     };
-    const img = (n) => `<img loading="lazy" decoding="async" alt="page ${n}" style="${ar(n)}"
-        src="/api/pdf/pageimg?path=${encodeURIComponent(pagesPdf)}&page=${n}&w=700" />`;
+    const img = (n) => `<img decoding="async" alt="page ${n}" style="${ar(n)}"
+        data-src="/api/pdf/pageimg?path=${encodeURIComponent(pagesPdf)}&page=${n}&w=700" />`;
     const notes =
       (!textOk ? `<div class="ocr-pgnote empty">OCR text unavailable — saving disabled</div>` : "") +
       (pagesWhole ? `<div class="ocr-pgnote empty">This OCR file has no page markers — the full text sits beside page 1${isLay() ? "" : " and saves verbatim"}</div>` : "") +
@@ -6473,6 +6490,7 @@ function createPdfViewer() {
       layObs = makeLayoutObserver(pagesBox, fillViewerLayout);
       pagesBox.dataset.pdf = pagesPdf;
       pagesBox.scrollTop = keepTop;   // 0 on a pdf switch: no bleed-through
+      observePageImgs(pagesBox);
       return;
     }
     pagesBox.innerHTML = notes +
@@ -6498,6 +6516,7 @@ function createPdfViewer() {
     pagesSave.hidden = !editable;
     pagesBox.dataset.pdf = pagesPdf;
     pagesBox.scrollTop = keepTop;   // 0 on a pdf switch: no bleed-through
+    observePageImgs(pagesBox);
   }
 
   // one facsimile pane: the extraction gets the word boxes of THIS pdf's
@@ -10257,13 +10276,14 @@ async function renderOcrPages() {
     const dd = dims[n - 1];
     return dd && dd[0] > 0 && dd[1] > 0 ? `aspect-ratio:${dd[0]} / ${dd[1]};` : "";
   };
-  const img = (n) => `<img loading="lazy" decoding="async" alt="page ${n}" style="${ar(n)}"
-      src="/api/pdf/pageimg?path=${encodeURIComponent(pdf)}&page=${n}&w=700" />`;
+  const img = (n) => `<img decoding="async" alt="page ${n}" style="${ar(n)}"
+      data-src="/api/pdf/pageimg?path=${encodeURIComponent(pdf)}&page=${n}&w=700" />`;
   const done = () => {
     ocrState.pagesPdf = pdf;
     ocrState.pagesSrc = d.buildId ? docSrcKey(d) : "primary";
     box.scrollTop = keepTop;   // 0 on a pdf switch: no scroll bleed-through
     decorateOcrPages();
+    observePageImgs(box);
   };
   // Layout mode swaps each editable textarea for a facsimile pane: the page's
   // own words, at the position and scale they occupy on the page. Boxes are
@@ -10335,6 +10355,34 @@ function makeLayoutObserver(rootEl, fill) {
   for (const pane of rootEl.querySelectorAll(".ocr-pglayout")) {
     obs.observe(pane);
   }
+  return obs;
+}
+
+// Page images load only near the viewport, and — crucially — an image scrolled
+// away before it finished loading is aborted (its src removed) so it stops
+// holding one of the browser's ~6 per-origin connections. Native loading="lazy"
+// never cancels, so a fast scroll fires a request per page in DOM order with no
+// way to jump the queue: the page you land on waits behind every page you flew
+// past, and the ones at the bottom take forever. Finished images are kept (no
+// reload flicker on a small scroll-back); in-flight ones are dropped and reload
+// when they return. Rows and their textareas always stay mounted, so saving and
+// decorateOcrPages still see every page.
+function observePageImgs(container) {
+  if (container._imgObs) container._imgObs.disconnect();
+  const obs = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      const im = e.target;
+      if (e.isIntersecting) {
+        if (im.dataset.src && !im.getAttribute("src")) im.src = im.dataset.src;
+      } else if (!im.complete && im.getAttribute("src")) {
+        im.removeAttribute("src");   // abort the in-flight load, free the slot
+      }
+    }
+  }, { root: container, rootMargin: "1000px 0px" });
+  for (const im of container.querySelectorAll(".ocr-pgimg img[data-src]")) {
+    obs.observe(im);
+  }
+  container._imgObs = obs;
   return obs;
 }
 
@@ -11324,6 +11372,14 @@ const MENU_CMDS = {
   "setup-guide": () => showWizard(),
   "changelog": () => openChangelog(),
   "site-home": () => openWebView("https://maj-6.github.io/library-tool/"),
+  "about": () => openAbout(),
+  // File > New entry: same flow as the Editor toolbar's + button, but reachable
+  // from anywhere — switch to the Editor tab first so the new build is visible.
+  "new-entry": () => {
+    const t = document.querySelector('#tabs .tab[data-tab="upload"]');
+    if (t) t.click();
+    createBuild({}, "(blank)");
+  },
   // quick settings (mirror the Settings-dialog handlers, side effects and all)
   "opt-auto-ia": () => {
     const on = state.settings.autoIaDownload === false;   // was off -> turning on
@@ -11452,6 +11508,11 @@ function initMenubar() {
   });
   document.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape" && openMenu) closeAll();
+    // Ctrl/Cmd+, opens Preferences (the desktop convention)
+    if ((ev.ctrlKey || ev.metaKey) && ev.key === ",") {
+      ev.preventDefault();
+      openSettings();
+    }
   });
 }
 
@@ -11709,6 +11770,7 @@ function init() {
   boot("setup wizard", initWizard);
   boot("title bar", fitTitleBar);   // after the menus exist: their width sets the clamp
   boot("settings nav", initSettingsNav);
+  boot("about", initAbout);
   boot("column resize", initColResize);
   boot("open library status", loadOlStatus);
 
