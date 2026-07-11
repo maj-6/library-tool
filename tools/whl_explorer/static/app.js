@@ -836,6 +836,10 @@ const UI_SCALES = [0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1
 function applyUiScale() {
   const s = state.settings.uiScale || 1;
   document.documentElement.style.zoom = String(s);
+  // The shell is height:100vh, but `zoom` renders it at 100vh * s, which would
+  // push it past the window and raise a page scrollbar. Expose the factor so
+  // the body height can divide it back out (see body { height } in style.css).
+  document.documentElement.style.setProperty("--ui-scale", String(s));
   const sel = el("ui-scale-select");
   if (sel) sel.value = String(s);
 }

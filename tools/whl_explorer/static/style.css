@@ -543,6 +543,10 @@ body[data-theme="linen"] ::-webkit-scrollbar-thumb {
 html, body {
   margin: 0;
   height: 100%;
+  /* The shell is a fixed 100vh column; it never scrolls at the window level
+     (every pane scrolls internally). overflow:hidden keeps stray sub-pixel or
+     zoom residue from ever raising a page scrollbar. */
+  overflow: hidden;
   background: var(--face);
   color: var(--ink);
   font-family: var(--ui);
@@ -552,7 +556,10 @@ html, body {
 body {
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  /* Divide out the root `zoom` (UI scale) so the shell fills the real window
+     instead of 100vh * scale — otherwise zooming in raises a page scrollbar
+     and pushes the status bar off-screen. --ui-scale is set by applyUiScale. */
+  height: calc(100vh / var(--ui-scale, 1));
 }
 
 /* --- Home tab --- */
