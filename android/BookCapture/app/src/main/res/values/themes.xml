@@ -1,29 +1,38 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- The desktop Library Tool's CAD language, translated: light panel faces
-     over the dark drafting canvas, flat 1px chrome, monospace data on sans
-     chrome, desaturated accents. Palette = style.css :root. -->
+<!-- The desktop Library Tool's Linen theme, translated to Android: a warm paper
+     canvas, light panel faces, flat 1px chrome, monospace data on sans chrome,
+     desaturated accents. The palette mirrors body[data-theme="linen"] in
+     tools/whl_explorer/static/style.css — keep it in step when Linen changes.
+     Layering: canvas is the base; panels sit slightly darker+bordered
+     (recessed), inputs/buttons slightly brighter+bordered (raised). -->
 <resources>
-    <color name="whl_canvas">#1C1F24</color>
-    <color name="whl_canvas_line">#2B2F36</color>
-    <color name="whl_face">#E7E9EC</color>
-    <color name="whl_face_hi">#FFFFFF</color>
-    <color name="whl_face_sh">#CFD3D9</color>
-    <color name="whl_face_sh2">#9AA1AA</color>
-    <color name="whl_ink">#23272E</color>
-    <color name="whl_ink_light">#D9DCE1</color>
-    <color name="whl_ink_dim">#6B7280</color>
-    <color name="whl_cyan">#00B7C3</color>
-    <color name="whl_green">#23B039</color>
-    <color name="whl_amber">#D8A000</color>
-    <color name="whl_red">#C0392B</color>
-    <color name="whl_blue">#33587E</color>
+    <color name="whl_canvas">#F1EFE8</color>
+    <color name="whl_canvas_line">#E2DFD5</color>
+    <color name="whl_face">#E0DCD2</color>
+    <color name="whl_face_hi">#FAF8F2</color>
+    <color name="whl_face_sh">#C3BEB1</color>
+    <color name="whl_face_sh2">#B8B2A3</color>
+    <color name="whl_ink">#2C2A24</color>
+    <color name="whl_ink_light">#302E28</color>
+    <color name="whl_ink_dim">#948E7E</color>
+    <color name="whl_cyan">#356A60</color>
+    <color name="whl_green">#3A6D38</color>
+    <color name="whl_amber">#806A34</color>
+    <color name="whl_red">#9A3A2A</color>
+    <color name="whl_blue">#3C5570</color>
     <color name="ic_launcher_bg">#F2F1EA</color>
 
-    <style name="Theme.BookCapture" parent="Theme.Material3.Dark.NoActionBar">
+    <!-- Light theme now (Linen is a paper palette): default widget text goes
+         dark, and the status/nav bars carry dark icons over the light canvas. -->
+    <style name="Theme.BookCapture" parent="Theme.Material3.Light.NoActionBar">
         <item name="colorPrimary">@color/whl_cyan</item>
+        <item name="android:textColorPrimary">@color/whl_ink</item>
+        <item name="android:textColorSecondary">@color/whl_ink_dim</item>
         <item name="android:statusBarColor">@color/whl_canvas</item>
         <item name="android:navigationBarColor">@color/whl_canvas</item>
         <item name="android:windowBackground">@color/whl_canvas</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
     </style>
 
     <!-- flat glyph button: face plate, 1px strong border, ink glyph -->

@@ -4,6 +4,11 @@
     <string name="app_wordmark">LIBRARY TOOL</string>
     <string name="settings_title">Capture settings</string>
 
+    <string name="home_title">Book Capture</string>
+    <string name="home_subtitle">recent scans</string>
+    <string name="home_new_scan">＋  New scan</string>
+    <string name="home_empty">No scans yet.\nTap “New scan” to photograph a book.</string>
+
     <string name="entry_idle">IDLE</string>
     <string name="entry_active">OPEN (%1$d)</string>
     <string name="recent_chip">%1$d ▾</string>

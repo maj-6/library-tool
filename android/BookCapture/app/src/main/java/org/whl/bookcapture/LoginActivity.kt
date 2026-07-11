@@ -45,9 +45,10 @@ class LoginActivity : AppCompatActivity() {
             if (err == null && Auth.signedIn(this@LoginActivity)) {
                 // the queue may hold captures made while signed out
                 UploadWorker.enqueue(this@LoginActivity)
-                // reset the task to a single clean MainActivity, whether we got
-                // here from a cold start or a sign-out in Settings
-                startActivity(Intent(this@LoginActivity, MainActivity::class.java)
+                // land on Home (the recent-scans list), resetting the task to a
+                // single clean entry whether we got here from a cold start or a
+                // sign-out in Settings
+                startActivity(Intent(this@LoginActivity, HomeActivity::class.java)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
                 finish()
             } else {
