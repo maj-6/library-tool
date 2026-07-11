@@ -23,25 +23,25 @@
   unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
 
-/* Vellum, warmed a step further for a more bookish, aged-paper feel: lifted from
-   the desktop theme of the same name (warm off-white vellum, near-zero chroma,
-   warm brown-black ink) and pushed toward cream stock and a deeper sepia ink,
-   with a muted botanical-green band and links in place of the app's teal — the
-   green a herbarium would use. The double rule does the work a border colour
-   normally would. */
+/* Manuscript, lifted from the desktop app's Foolscap/Manuscript theme: a
+   letterpress galley-proof feel — quieter, greyer paper than the old
+   gold-cream stock, near-black ink, and a single hairline ink rule under the
+   masthead in place of a double rule. Buttons and boxed controls take a
+   debossed, inset-shadow treatment instead of a flat border, echoing the
+   desktop theme's type-pressed-into-the-sheet look. */
 :root {
-  --paper: #f6ecd9;       /* aged vellum cream, warmed toward gold */
-  --card: #fbf6ea;        /* stock, a shade lighter and creamier */
-  --chrome: #86a05e;      /* the botanical-olive masthead board */
-  --rule: #ab9878;        /* the strong warm-tan rule (the double rules) */
-  --rule-mid: #d4c6a9;
-  --rule-soft: #eee1c9;
-  --ink: #2b2015;         /* warm sepia brown-black, the letterpress ink */
-  --ink-soft: #5f5140;
-  --ink-faint: #9c8a6c;
-  --accent: #4c6a34;      /* a muted botanical-green band */
-  --accent-ink: #46602e;  /* the same green, deepened, carrying the links */
-  --warn-bg: #fbf1de;
+  --paper: #f4f1eb;       /* quiet warm-grey galley paper */
+  --card: #faf8f3;        /* stock, a shade lighter */
+  --chrome: #e6e3db;      /* the quiet warm-grey masthead board */
+  --rule: #a49d8e;        /* the single hairline ink rule */
+  --rule-mid: #d0ccc1;
+  --rule-soft: #e6e2d9;
+  --ink: #221c14;         /* near-black letterpress ink */
+  --ink-soft: #554f40;
+  --ink-faint: #a49d8e;
+  --accent: #4a7a3f;      /* Foolscap's deeper forest green */
+  --accent-ink: #2f6f68;  /* Foolscap's teal, carrying the links */
+  --warn-bg: #f7f4ec;
   --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
 }
 
@@ -59,7 +59,7 @@ body {
 
 /* --- masthead --- */
 header.site {
-  border-bottom: 3px double #6b7d45;   /* a deeper botanical olive frames the board */
+  border-bottom: 1px solid var(--rule);   /* Manuscript's single ink rule, not a double */
   background: var(--chrome);
 }
 header.site .wrap {
@@ -145,7 +145,9 @@ a { color: var(--accent-ink); }
   border: 1px solid var(--rule-mid);
   background: #fff;
   color: var(--ink);
-  border-radius: 2px;
+  border-radius: 1px;
+  box-shadow: inset 1px 1px 1px rgba(50, 44, 34, 0.14),
+              inset -1px -1px 0 rgba(255, 254, 250, 0.7);
 }
 .controls input[type="search"] { flex: 1 1 260px; min-width: 0; }
 .controls input[type="number"] { width: 88px; }
@@ -198,7 +200,9 @@ ol.volumes { list-style: none; margin: 0; padding: 0; }
   border: 1px solid var(--rule-mid);
   background: #fff;
   color: var(--ink);
-  border-radius: 2px;
+  border-radius: 1px;
+  box-shadow: inset 1px 1px 1px rgba(50, 44, 34, 0.14),
+              inset -1px -1px 0 rgba(255, 254, 250, 0.7);
 }
 .btn:hover { border-color: var(--accent); color: var(--accent-ink); }
 .btn[aria-disabled="true"] { opacity: 0.45; pointer-events: none; }
