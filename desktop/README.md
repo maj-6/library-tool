@@ -58,12 +58,15 @@ Offline machines simply skip the check.
 
 ### Downloading the databases (offline search)
 
-The installer stays small on purpose: API keys, Tesseract, and the multi-GB
-Open Library index are handled by the **in-app setup guide** on first launch
-(re-openable from Help → Setup guide), which detects Tesseract, takes the
-optional keys, and downloads databases with progress from the URLs in
-**Settings → Sync**. For unattended installs, pre-place the databases in the
-data root or fetch them later from Settings.
+The installer stays small on purpose: Tesseract, optional API keys, and the
+multi-GB Open Library index are handled by the **in-app setup guide** on
+first launch (re-openable from Help → Setup guide), which detects Tesseract,
+takes the optional Mistral key, and downloads databases with progress from
+the URLs in **Settings → Sync**. Cloud accounts need no setup at all — the
+app ships knowing its own project URL and public anon key
+(`tools/cloud_defaults.py`); only the owner's service key is ever entered by
+hand. For unattended installs, pre-place the databases in the data root or
+fetch them later from Settings.
 
 ### Databases (local vs cloud)
 

@@ -7,11 +7,11 @@
 <!-- Deliberately self-contained. Pages serves this file for a miss at any depth,
      so `assets/site.css` would resolve against the path that does not exist. -->
 <style>
-  :root { --paper:#f7f4ec; --ink:#2a2620; --ink-soft:#6d665a; --accent:#3c5b52; }
+  :root { --paper:#fbfaf7; --ink:#26241f; --ink-soft:#5c5a52; --accent:#22685e; }
   html,body { margin:0; height:100%; }
   body {
     background:var(--paper); color:var(--ink);
-    font:16px/1.6 Georgia,"Iowan Old Style","Palatino Linotype",serif;
+    font:16px/1.6 "Roboto Slab",Georgia,"Palatino Linotype",serif;
     display:flex; align-items:center; justify-content:center; text-align:center;
   }
   main { padding:0 20px; }
@@ -30,8 +30,16 @@
   // Same reason the styles are inline: a relative href on a 404 points into the
   // missing path. A project site lives under /<repo>/, a custom domain at /.
   var seg = location.pathname.split("/")[1];
-  document.getElementById("home").href =
-    location.hostname.endsWith("github.io") && seg ? "/" + seg + "/" : "/";
+  var base = location.hostname.endsWith("github.io") && seg ? "/" + seg + "/" : "/";
+  document.getElementById("home").href = base;
+
+  // The typeface lives at a fixed path too, so it needs the same base. Without
+  // this the page still reads, in whatever slab or serif the reader has.
+  var f = document.createElement("style");
+  f.textContent =
+    '@font-face{font-family:"Roboto Slab";font-style:normal;font-weight:100 900;' +
+    'font-display:swap;src:url("' + base + 'assets/fonts/roboto-slab-var.woff2") format("woff2")}';
+  document.head.appendChild(f);
 </script>
 </body>
 </html>

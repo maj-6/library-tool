@@ -16,9 +16,12 @@ extraction), and files each capture as a manual entry with its photos.
 ## 2. Create the tables
 
 Paste **`docs/cloud/schema.sql`** into the SQL Editor and run it. That one script
-is the whole backend — `captures` and `books` for this pipeline, plus `volumes`,
-`releases`, `profiles` and `events` for the website. It is idempotent, so re-run
-it whenever the schema changes.
+is the whole backend — `captures` and `books` for this pipeline, `volumes`,
+`releases`, `profiles` and `events` for the website, plus `builds`,
+`ia_catalog` and `corrections` for the working-store sync (the desktop's
+gitignored builds / IA-download catalog / WHL corrections merge through
+these; see `tools/store_sync.py`). It is idempotent, so re-run it whenever
+the schema changes.
 
 ## 3. Create the storage buckets
 
@@ -37,9 +40,11 @@ python3 tools/cloud_setup.py check
 
 ## 4. Wire up both ends
 
-- **Desktop** (Settings → Sync → *Phone capture*): project URL +
-  service_role key, Mistral API key, auto-sync interval (e.g. 15 min).
-  **Test connection** should report both the table and the bucket reachable.
+- **Desktop** (Settings → Sync → *Phone capture*): the service_role key,
+  Mistral API key, auto-sync interval (e.g. 15 min). The project URL and the
+  anon key are built into the app (`tools/cloud_defaults.py`) — set them only
+  when pointing at your own project. **Test connection** should report both
+  the table and the bucket reachable.
 - **Phone** (Book Capture ⚙): the same URL + key, a device name,
   **Test connection**.
 

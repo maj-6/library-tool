@@ -23,10 +23,13 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cloud_defaults            # noqa: E402
 import libcommon as lib          # noqa: E402
 import supabase_sync as sb       # noqa: E402
 
-TABLES = ["captures", "books", "volumes", "releases", "profiles", "events"]
+TABLES = ["captures", "books", "volumes", "releases", "profiles", "events",
+          "builds", "ia_catalog", "corrections", "taxonomy",
+          "volume_texts", "volume_pages", "volume_notes"]
 BUCKETS = {"captures": False, "volumes": True}       # name -> public?
 
 
@@ -37,8 +40,9 @@ def config() -> dict:
         state = lib.load_json(lib.CLIENT_STATE_PATH, {}).get("settings", {})
         url = url or str(state.get("supabaseUrl") or "")
         key = key or str(state.get("supabaseKey") or "")
-    if not (url and key):
-        sys.exit("No Supabase URL/key. Set them in Settings > Sync, or export "
+    url = url or cloud_defaults.SUPABASE_URL   # the key is a secret; the URL isn't
+    if not key:
+        sys.exit("No Supabase service key. Set it in Settings > Sync, or export "
                  "SUPABASE_URL and SUPABASE_KEY.")
     return {"url": url.rstrip("/"), "key": key}
 
@@ -147,6 +151,7 @@ def volume_rows(ready_only: bool = False, actor: str = "") -> list[tuple[str, di
     `-2` beside it, and two books sharing a title and a year never collide.
     """
     builds = lib.load_json(lib.OUTPUT_DIR / "whl_builds.json", {})
+    nodes = lib.load_taxonomy()["nodes"]
     rows: list[tuple[str, dict]] = []
     taken = {str(b.get("published_slug") or "") for b in builds.values()} - {""}
     for bid, b in builds.items():
@@ -157,6 +162,9 @@ def volume_rows(ready_only: bool = False, actor: str = "") -> list[tuple[str, di
         year = str(b.get("year") or "")
         pages = str(b.get("pages") or "")
         slug = str(b.get("published_slug") or "") or slugify(b["title"], year, taken)
+        # taxonomy paths when assigned, the deprecated free text otherwise
+        paths = lib.category_paths(nodes, b.get("category_ids"))
+        cats = lib.categories_text(paths) if paths else (b.get("categories") or "")
         rows.append((bid, {
             "slug": slug,
             "title": b["title"],
@@ -168,7 +176,8 @@ def volume_rows(ready_only: bool = False, actor: str = "") -> list[tuple[str, di
             "edition": b.get("edition") or "",
             "language": b.get("language") or "",
             "pages": int(pages) if pages.isdigit() else None,
-            "categories": b.get("categories") or "",
+            "categories": cats,
+            "category_paths": paths,
             "description": b.get("description") or "",
             "source_url": b.get("source_url") or b.get("pdf_source") or "",
             "uploaded_by_name": actor,
@@ -188,8 +197,19 @@ def cmd_seed(args) -> None:
     if args.dry_run:
         print("\n(dry run, pass --apply to upsert)")
         return
-    sb._rest(cfg, "POST", "volumes?on_conflict=slug", [r for _b, r in pairs],
-             prefer="resolution=merge-duplicates,return=minimal")
+    try:
+        sb._rest(cfg, "POST", "volumes?on_conflict=slug", [r for _b, r in pairs],
+                 prefer="resolution=merge-duplicates,return=minimal")
+    except sb.SyncError as exc:
+        if "category_paths" not in str(exc):
+            raise
+        # the live project predates the taxonomy — publish without the column
+        print("note: volumes.category_paths is missing on the cloud project;"
+              " re-run docs/cloud/schema.sql")
+        rows = [{k: v for k, v in r.items() if k != "category_paths"}
+                for _b, r in pairs]
+        sb._rest(cfg, "POST", "volumes?on_conflict=slug", rows,
+                 prefer="resolution=merge-duplicates,return=minimal")
 
     # Remember which slug each build owns, so publishing later updates that very
     # row instead of creating a second one beside it.

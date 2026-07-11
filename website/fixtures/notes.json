@@ -1,0 +1,41 @@
+{
+  "flora-rustica-1792": [
+    {
+      "note_id": "n1",
+      "page": 3,
+      "quote": "resembles the tail of a fox, whence the trivial name.",
+      "kind": "term",
+      "body": "The \"trivial name\" is the Linnaean specific epithet — here *pratensis*, \"of the meadow.\" Martyn keeps the binomial but explains it in plain English for the farming reader."
+    },
+    {
+      "note_id": "n2",
+      "page": 4,
+      "quote": "The twigs serve for besoms, and the old wood for fuel.",
+      "kind": "context",
+      "body": "A *besom* is a broom of bound twigs. Broom (Spartium scoparium) was a genuine rural resource: brushwood, thatching, tanning bark, and winter browse for sheep."
+    },
+    {
+      "note_id": "n3",
+      "page": 6,
+      "quote": "with the whole plant is acrid and poisonous.",
+      "kind": "plant",
+      "body": "Meadow Saffron (Colchicum autumnale) contains colchicine. Martyn's warning is sound — it remains a notable cause of livestock poisoning in damp pastures to this day."
+    }
+  ],
+  "the-monthly-flora-1846": [
+    {
+      "note_id": "m1",
+      "page": 1,
+      "quote": "one gathering delivered each month",
+      "kind": "context",
+      "body": "Part-issue was the dominant model for illustrated works in the 1840s: it spread the cost of hand-colouring across a year of subscription."
+    },
+    {
+      "note_id": "m2",
+      "page": 2,
+      "quote": "",
+      "kind": "context",
+      "body": "The binder's instructions at the front of the volume show how the twelve monthly parts were meant to be re-ordered into systematic sequence."
+    }
+  ]
+}
