@@ -139,6 +139,16 @@ const state = {
     sets: {},                   // multi-volume sets: baseKey -> {count, exp}
     expandSets: false,          // expand multi-volume sets by default
     hideVolTitles: false,       // hide the titles of individual volumes
+    // --- Settings redesign, Stage 2: new tunables ---
+    aiTemperature: "",          // "" = per-call defaults; a number overrides all Analyze calls
+    aiTimeout: 240,             // seconds allowed for an Analyze/AI request
+    ocrMaxTokens: 8192,         // vision-OCR output cap (raise for dense pages)
+    historyLimit: 300,          // recent actions shown in the History feed
+    olLimit: 60,                // Open Library results per realtime search
+    confirmDiscard: true,       // ask before discarding unsaved page edits
+    verboseLogging: false,      // raise the server log level to DEBUG
+    autoUpdate: true,           // desktop: check for updates on launch
+    updateChannel: "stable",    // desktop: update channel (stable | beta)
   },
   editTarget: null,             // record open in the EDIT tab
   sort: { checked: null, whl: null },  // {key, dir} per top table
@@ -1384,7 +1394,8 @@ const homeState = { events: [], loaded: false, expanded: new Set() };
 async function loadActivity() {
   loadReviews().then(renderHome);   // the review count rides the same visit
   try {
-    const r = await (await fetch("/api/activity?limit=300")).json();
+    const r = await (await fetch(
+      "/api/activity?limit=" + (state.settings.historyLimit || 300))).json();
     homeState.events = r.ok ? r.events : [];
   } catch (e) { homeState.events = []; }
   homeState.loaded = true;
@@ -2461,6 +2472,88 @@ function renderSettings() {
     state.settings.pdfBrowseDir = bd.value.trim();
     saveSettings();
   };
+
+  // --- Stage 2 tunables (guarded by id, so a control's absence is harmless) ---
+  // AI: temperature override (blank = each call's own default) + request timeout
+  const aiTemp = el("set-ai-temp");
+  if (aiTemp) {
+    aiTemp.value = state.settings.aiTemperature ?? "";
+    aiTemp.onchange = () => {
+      const v = aiTemp.value.trim();
+      state.settings.aiTemperature =
+        v === "" ? "" : Math.max(0, Math.min(2, parseFloat(v) || 0));
+      aiTemp.value = state.settings.aiTemperature;
+      saveSettings();
+    };
+  }
+  const aiTo = el("set-ai-timeout");
+  if (aiTo) {
+    aiTo.value = state.settings.aiTimeout || 240;
+    aiTo.onchange = () => {
+      state.settings.aiTimeout =
+        Math.max(10, Math.min(1200, parseInt(aiTo.value, 10) || 240));
+      aiTo.value = state.settings.aiTimeout;
+      saveSettings();
+    };
+  }
+  // OCR: vision output-token cap (dense pages truncate at 8192)
+  const omt = el("set-ocr-maxtokens");
+  if (omt) {
+    omt.value = state.settings.ocrMaxTokens || 8192;
+    omt.onchange = () => {
+      state.settings.ocrMaxTokens =
+        Math.max(1024, Math.min(32000, parseInt(omt.value, 10) || 8192));
+      omt.value = state.settings.ocrMaxTokens;
+      saveSettings();
+    };
+  }
+  // EDITING
+  const hl = el("set-history-limit");
+  if (hl) {
+    hl.value = state.settings.historyLimit || 300;
+    hl.onchange = () => {
+      state.settings.historyLimit =
+        Math.max(20, Math.min(2000, parseInt(hl.value, 10) || 300));
+      hl.value = state.settings.historyLimit;
+      saveSettings();
+    };
+  }
+  const oll = el("set-ol-limit");
+  if (oll) {
+    oll.value = state.settings.olLimit || 60;
+    oll.onchange = () => {
+      state.settings.olLimit =
+        Math.max(1, Math.min(100, parseInt(oll.value, 10) || 60));
+      oll.value = state.settings.olLimit;
+      saveSettings();
+    };
+  }
+  const cd = el("set-confirm-discard");
+  if (cd) {
+    cd.checked = state.settings.confirmDiscard !== false;
+    cd.onchange = () => { state.settings.confirmDiscard = cd.checked; saveSettings(); };
+  }
+  // ADVANCED: verbose server logging (pushed so the server re-reads its level)
+  const vl = el("set-verbose-log");
+  if (vl) {
+    vl.checked = !!state.settings.verboseLogging;
+    vl.onchange = () => {
+      state.settings.verboseLogging = vl.checked;
+      saveSettings();
+      flushClientState();
+    };
+  }
+  // UPDATES (desktop shell reads these off client_state at launch)
+  const au = el("set-auto-update");
+  if (au) {
+    au.checked = state.settings.autoUpdate !== false;
+    au.onchange = () => { state.settings.autoUpdate = au.checked; saveSettings(); };
+  }
+  const uc = el("set-update-channel");
+  if (uc) {
+    uc.value = state.settings.updateChannel || "stable";
+    uc.onchange = () => { state.settings.updateChannel = uc.value; saveSettings(); };
+  }
 }
 
 function initSettingsNav() {
@@ -4912,7 +5005,7 @@ function scheduleOlRealtime() {
 
 async function olRealtime() {
   if (activeBottomTable() !== "ol" || !state.settings.showCatalog) return;
-  const params = new URLSearchParams({ limit: "60" });
+  const params = new URLSearchParams({ limit: String(state.settings.olLimit || 60) });
   const ov = state.olOverride;
   const q = ov
     ? { title: ov.title, author: ov.author || "", year: ov.year || "", empty: false }
@@ -6598,11 +6691,11 @@ function createPdfViewer() {
   }
   pagesBtn.addEventListener("click", () => {
     if (pagesOn && pagesDirty &&
-        !window.confirm("Discard unsaved page edits?")) return;
+        state.settings.confirmDiscard !== false && !window.confirm("Discard unsaved page edits?")) return;
     setPages(!pagesOn);
   });
   layBtn.addEventListener("click", () => {
-    if (pagesDirty && !window.confirm("Discard unsaved page edits?")) return;
+    if (pagesDirty && state.settings.confirmDiscard !== false && !window.confirm("Discard unsaved page edits?")) return;
     state.settings.viewerLayout = !isLay();
     saveSettings();
     layBtn.classList.toggle("active", isLay());
@@ -6637,7 +6730,7 @@ function createPdfViewer() {
   }
   ocrBtn.addEventListener("click", () => {
     if (pagesOn) {
-      if (pagesDirty && !window.confirm("Discard unsaved page edits?")) return;
+      if (pagesDirty && state.settings.confirmDiscard !== false && !window.confirm("Discard unsaved page edits?")) return;
       // intent: leave the page view and SHOW the OCR pane
       setPages(false);
       setOcr(true);
