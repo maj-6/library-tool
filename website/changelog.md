@@ -1,18 +1,19 @@
 # Library Tool — Changelog
 
-Terse notes, newest first. The desktop app reads this same file
-(Help → View changelog); the website renders it on Downloads and Release notes.
+Newest first. The Downloads page highlights the significant releases; every
+version, down to the small fixes, is on the Release notes page. The desktop
+app reads this same file (Help → View changelog).
 
 ## 3.1.1 — 2026-07-10
-- Refreshed the theme set: a focused lineup of six (Sage, Archive Ledger, Foolscap, Vellum, Linen, Platinum), with a warmer Sage. (This shipped in the source just after 3.1.0 was built, so it missed that release.)
+- Refreshed the theme set — a focused lineup of six, with a warmer Sage.
 
 ## 3.1.0 — 2026-07-10
-- Automatic updates: the app checks on launch and installs a new version before opening, with a small progress window.
+- Automatic updates: the app checks on launch and installs a new version before opening.
 - View the changelog in the app from Help → View changelog.
-- Website: Downloads shows the latest notes; a new Release notes page lists every version.
+- Website: a Downloads page with the latest notes, and a Release notes page listing every version.
 
 ## 3.0.1 — 2026-07-10
-- Fixed: the window close button now sits flush with the title bar instead of looking like a separate button.
+- Minor interface fixes.
 
 ## 3.0.0 — 2026-07-10
 - New Windows desktop app: one installer, no Python setup.
