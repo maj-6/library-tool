@@ -1365,16 +1365,22 @@
                      placeholder="Master list" />
             </div>
 
-            <div class="settings-head" style="margin-top:16px">Cloud search &amp; databases</div>
-            <p class="settings-note">Search resolves <b>local-first</b>: a downloaded database is
-              used offline; otherwise queries go to the cloud URL below (a remote instance of this
-              app). Set a source URL per database and download it for offline use.</p>
+            <div class="settings-head" style="margin-top:16px">Search databases</div>
+            <p class="settings-note">Search is <b>local-first</b>: a database already in the data
+              folder is used offline — no download, no URL. Have copies (say, on a flash drive)?
+              Open the folder, drop them in, and reopen the app. A source URL is only needed to
+              <i>download</i> a database you don't already have; without one, queries fall back to
+              the cloud search URL below.</p>
+            <div class="mf-actions">
+              <button id="db-open-folder" class="cad-btn" type="button">Open data folder…</button>
+              <span class="tool-label mono" id="db-folder-path"></span>
+            </div>
+            <div id="db-rows" class="settings-rows"></div>
             <div class="settings-rows">
-              <label class="tool-label" for="set-cloud-url">Cloud search URL</label>
+              <label class="tool-label" for="set-cloud-url">Cloud search URL (remote fallback)</label>
               <input id="set-cloud-url" class="cad-input" spellcheck="false"
                      placeholder="https://your-server.example" />
             </div>
-            <div id="db-rows" class="settings-rows"></div>
             <div class="mf-actions">
               <button id="db-download" class="cad-btn" type="button">Download / update databases</button>
               <span class="tool-label" id="db-status-msg"></span>

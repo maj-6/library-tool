@@ -31,3 +31,14 @@ SUPABASE_ANON_KEY = (
 # override it (cloudSiteUrl) for a fork pointed at its own project + site.
 WEBSITE_URL = "https://maj-6.github.io/library-tool"
 EMAIL_CONFIRM_PATH = "/confirmed.html"
+
+# Offline-search databases (the Open Library indexes, the copyright-renewal
+# CSV). Search is LOCAL-FIRST: if the file is already in the data folder (copied
+# from a flash drive, or previously downloaded) it is used as-is with no network
+# and no URL. These defaults only matter for the *download* fallback: a per-file
+# URL in DB_URLS wins, else `DB_BASE_URL/<filename>`. Both are empty by default,
+# so out of the box the app relies purely on local copies; fill in the bucket
+# base once known (Settings > Sync still overrides per database). Public
+# identifiers only — never a signed/credentialed URL (those belong in Settings).
+DB_BASE_URL = ""      # e.g. "https://my-bucket.s3.us-east-1.amazonaws.com/whl-db"
+DB_URLS = {}          # name -> full URL, overrides DB_BASE_URL for that database
