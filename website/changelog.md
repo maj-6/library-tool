@@ -3,6 +3,9 @@
 Terse notes, newest first. The desktop app reads this same file
 (Help → View changelog); the website renders it on Downloads and Release notes.
 
+## 3.1.1 — 2026-07-10
+- Refreshed the theme set: a focused lineup of six (Sage, Archive Ledger, Foolscap, Vellum, Linen, Platinum), with a warmer Sage. (This shipped in the source just after 3.1.0 was built, so it missed that release.)
+
 ## 3.1.0 — 2026-07-10
 - Automatic updates: the app checks on launch and installs a new version before opening, with a small progress window.
 - View the changelog in the app from Help → View changelog.
