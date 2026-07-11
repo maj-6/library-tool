@@ -91,6 +91,71 @@
                 android:text="@string/set_sharpen_note" />
         </LinearLayout>
 
+        <!-- transport / LAN pairing -->
+        <LinearLayout style="@style/WhlPanelSection"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="vertical">
+            <TextView style="@style/WhlLabel"
+                android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:text="@string/set_transport" />
+            <RadioGroup
+                android:id="@+id/transportGroup"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:orientation="horizontal">
+                <RadioButton android:id="@+id/transportCloud"
+                    android:layout_width="0dp" android:layout_height="wrap_content"
+                    android:layout_weight="1" android:fontFamily="monospace"
+                    android:textSize="12sp" android:textColor="@color/whl_ink"
+                    android:text="@string/transport_cloud" />
+                <RadioButton android:id="@+id/transportLan"
+                    android:layout_width="0dp" android:layout_height="wrap_content"
+                    android:layout_weight="1" android:fontFamily="monospace"
+                    android:textSize="12sp" android:textColor="@color/whl_ink"
+                    android:text="@string/transport_lan" />
+                <RadioButton android:id="@+id/transportAuto"
+                    android:layout_width="0dp" android:layout_height="wrap_content"
+                    android:layout_weight="1" android:fontFamily="monospace"
+                    android:textSize="12sp" android:textColor="@color/whl_ink"
+                    android:text="@string/transport_auto" />
+            </RadioGroup>
+            <TextView style="@style/WhlLabel"
+                android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/lan_host" />
+            <EditText android:id="@+id/lanHost"
+                style="@style/WhlInput"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:layout_marginTop="3dp"
+                android:inputType="textNoSuggestions"
+                android:importantForAutofill="no"
+                android:hint="@string/lan_host_hint" />
+            <TextView style="@style/WhlLabel"
+                android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/lan_token" />
+            <EditText android:id="@+id/lanToken"
+                style="@style/WhlInput"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:layout_marginTop="3dp"
+                android:inputType="textPassword"
+                android:importantForAutofill="no" />
+            <Button android:id="@+id/lanTest"
+                style="@style/WhlButton"
+                android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:textSize="12sp"
+                android:paddingStart="14dp" android:paddingEnd="14dp"
+                android:text="@string/lan_test" />
+            <TextView
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:fontFamily="monospace" android:textSize="11sp"
+                android:textColor="@color/whl_ink_dim"
+                android:text="@string/lan_note" />
+        </LinearLayout>
+
         <!-- API keys, synced to the account -->
         <LinearLayout style="@style/WhlPanelSection"
             android:layout_width="match_parent" android:layout_height="wrap_content"

@@ -50,6 +50,17 @@
     <string name="set_capture">Capture</string>
     <string name="set_sharpen">Sharpen viewfinder</string>
     <string name="set_sharpen_note">A crisper live preview. Android 13+ only.</string>
+    <string name="set_transport">Transport</string>
+    <string name="transport_cloud">Cloud</string>
+    <string name="transport_lan">LAN</string>
+    <string name="transport_auto">Auto</string>
+    <string name="lan_host">Desktop address</string>
+    <string name="lan_host_hint">192.168.1.5:8899</string>
+    <string name="lan_token">Pairing token</string>
+    <string name="lan_test">TEST LAN</string>
+    <string name="lan_note">LAN sends captures straight to a paired desktop over the local network — works offline (e.g. a hotspot). Find the address and token in the desktop app.</string>
+    <string name="lan_ok">OK — desktop reachable</string>
+    <string name="lan_unreachable">No desktop at that address</string>
     <string name="set_api_keys">API keys</string>
     <string name="set_api_keys_note">Stored in your cloud profile — the desktop app can use the same keys. Mistral does the OCR; DeepSeek (when set) extracts the fields.</string>
     <string name="set_mistral">Mistral API key</string>

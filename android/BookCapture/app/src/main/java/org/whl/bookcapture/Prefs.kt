@@ -38,6 +38,17 @@ object Prefs {
     fun setProject(ctx: Context, url: String, anon: String) =
         put(ctx, "supabase_url" to url.trim(), "anon_key" to anon.trim())
 
+    // --- transport: how captures leave the phone -----------------------------
+    // "cloud" (Supabase, the default), "lan" (a paired desktop over the local
+    // network, offline), or "auto" (LAN when the desktop answers, else cloud).
+
+    fun transport(ctx: Context): String = str(ctx, "transport").ifEmpty { "cloud" }
+    fun setTransport(ctx: Context, v: String) = put(ctx, "transport" to v)
+    fun lanHost(ctx: Context): String = str(ctx, "lan_host")      // "192.168.1.5:8899"
+    fun lanToken(ctx: Context): String = str(ctx, "lan_token")
+    fun setLan(ctx: Context, host: String, token: String) =
+        put(ctx, "lan_host" to host.trim(), "lan_token" to token.trim())
+
     fun configured(ctx: Context): Boolean =
         supabaseUrl(ctx).isNotEmpty() && anonKey(ctx).isNotEmpty()
 
