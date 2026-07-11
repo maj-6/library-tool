@@ -65,12 +65,12 @@ header.site .wrap {
   display: flex;
   align-items: center;
   gap: 14px;
-  padding-top: 16px;
-  padding-bottom: 16px;
+  padding-top: 12px;
+  padding-bottom: 12px;
 }
-header.site img { width: 54px; height: 54px; display: block; }
+header.site img { width: 58px; height: 58px; display: block; }
 header.site .name {
-  font-size: 27px;
+  font-size: 30px;
   font-weight: bold;
   letter-spacing: 0.2px;
   margin-right: auto;
