@@ -23,24 +23,25 @@
   unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
 
-/* Linen, lifted from the desktop theme of the same name: a soft flax board over
-   warm off-white stock, ink at #2c2a24, hairline warm-grey rules, and a muted
-   slate band (#3c5570) for the active mark — the lowest-contrast, least inky of
-   the app's papers. Teal (#356a60) carries the links, as it carries focus in
-   the app. The double rule does the work a border colour normally would. */
+/* Vellum, warmed a step further for a more bookish, aged-paper feel: lifted from
+   the desktop theme of the same name (warm off-white vellum, near-zero chroma,
+   warm brown-black ink) and pushed toward cream stock and a deeper sepia ink,
+   with a muted botanical-green band and links in place of the app's teal — the
+   green a herbarium would use. The double rule does the work a border colour
+   normally would. */
 :root {
-  --paper: #f1efe8;       /* the flax canvas */
-  --card: #faf8f2;        /* stock, a shade lighter than the board */
-  --chrome: #e8e4da;      /* the masthead board */
-  --rule: #948e7e;        /* the strong warm-grey rule (the double rules) */
-  --rule-mid: #c3beb1;
-  --rule-soft: #e2dfd5;
-  --ink: #2c2a24;
-  --ink-soft: #5f5a4f;
-  --ink-faint: #928c7d;
-  --accent: #3c5570;      /* the slate band, from the app's Linen active mark */
-  --accent-ink: #356a60;  /* Linen's teal, carrying the links */
-  --warn-bg: #faf8ee;
+  --paper: #f5efe1;       /* aged vellum cream */
+  --card: #fbf7ee;        /* stock, a shade lighter and creamier */
+  --chrome: #ece4d2;      /* the warm sand masthead board */
+  --rule: #a89c84;        /* the strong warm-taupe rule (the double rules) */
+  --rule-mid: #cec5b1;
+  --rule-soft: #e8e0cd;
+  --ink: #2a2118;         /* warm sepia brown-black, the letterpress ink */
+  --ink-soft: #5c5346;
+  --ink-faint: #978c77;
+  --accent: #4c6a34;      /* a muted botanical-green band */
+  --accent-ink: #46602e;  /* the same green, deepened, carrying the links */
+  --warn-bg: #faf4e6;
   --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
 }
 
