@@ -41,6 +41,13 @@ object Prefs {
     fun configured(ctx: Context): Boolean =
         supabaseUrl(ctx).isNotEmpty() && anonKey(ctx).isNotEmpty()
 
+    // --- capture options -----------------------------------------------------
+
+    /** Optional live-viewfinder sharpen (Android 13+); off by default. */
+    fun sharpenPreview(ctx: Context): Boolean = sp(ctx).getBoolean("sharpen_preview", false)
+    fun setSharpenPreview(ctx: Context, on: Boolean) =
+        sp(ctx).edit().putBoolean("sharpen_preview", on).apply()
+
     // --- device --------------------------------------------------------------
 
     fun deviceName(ctx: Context): String =
@@ -86,8 +93,14 @@ object Prefs {
             .remove("access_token").remove("refresh_token").remove("token_expiry")
             .remove("user_id").remove("email").remove("display_name")
             .remove("mistral_key").remove("deepseek_key")
+            .remove("pkce_verifier")
             .apply()
     }
+
+    /** Transient PKCE verifier held between the OAuth authorize redirect and the
+     *  code exchange; a one-shot, cleared on redeem and on sign-out. */
+    fun pkceVerifier(ctx: Context): String = str(ctx, "pkce_verifier")
+    fun setPkceVerifier(ctx: Context, v: String) = put(ctx, "pkce_verifier" to v)
 
     // --- API keys (cache of the cloud profile_secrets row) -----------------------
 

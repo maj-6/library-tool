@@ -1,6 +1,7 @@
 package org.whl.bookcapture
 
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
@@ -28,6 +29,13 @@ class SettingsActivity : AppCompatActivity() {
         binding.device.setText(Prefs.deviceName(this))
         binding.mistralKey.setText(Prefs.mistralKey(this))
         binding.deepseekKey.setText(Prefs.deepseekKey(this))
+
+        // viewfinder sharpen is a GPU shader on the preview — Android 13+ only
+        binding.sharpenPreview.isEnabled = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+        binding.sharpenPreview.isChecked = Prefs.sharpenPreview(this)
+        binding.sharpenPreview.setOnCheckedChangeListener { _, on ->
+            Prefs.setSharpenPreview(this, on)
+        }
 
         // freshen the cache; another device may have changed the keys. Only
         // overwrite a field the user has NOT touched since it was populated,

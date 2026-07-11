@@ -39,11 +39,17 @@
     <string name="login_missing">email and password, both</string>
     <string name="login_working">Signing in…</string>
     <string name="login_failed">sign-in failed</string>
+    <string name="login_or">or</string>
+    <string name="login_google">SIGN IN WITH GOOGLE</string>
+    <string name="login_github">SIGN IN WITH GITHUB</string>
 
     <string name="set_account">Account</string>
     <string name="set_display_name">Display name (contributor credit)</string>
     <string name="set_sign_out">SIGN OUT</string>
     <string name="device_name">Device name (shows in imported entries)</string>
+    <string name="set_capture">Capture</string>
+    <string name="set_sharpen">Sharpen viewfinder</string>
+    <string name="set_sharpen_note">A crisper live preview. Android 13+ only.</string>
     <string name="set_api_keys">API keys</string>
     <string name="set_api_keys_note">Stored in your cloud profile — the desktop app can use the same keys. Mistral does the OCR; DeepSeek (when set) extracts the fields.</string>
     <string name="set_mistral">Mistral API key</string>

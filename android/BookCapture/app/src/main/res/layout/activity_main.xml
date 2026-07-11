@@ -46,6 +46,7 @@
                 android:id="@+id/queueChip"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
+                android:background="?attr/selectableItemBackgroundBorderless"
                 android:fontFamily="monospace"
                 android:textSize="12sp"
                 android:textColor="@color/whl_ink"
@@ -56,6 +57,7 @@
                 android:id="@+id/btnSettings"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
+                android:background="?attr/selectableItemBackgroundBorderless"
                 android:fontFamily="monospace"
                 android:textSize="16sp"
                 android:textColor="@color/whl_ink"
@@ -83,6 +85,28 @@
         app:layout_constraintBottom_toTopOf="@id/thumbs_scroll"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
+
+    <!-- shutter flash: a white overlay pulsed on capture, invisible at rest -->
+    <View
+        android:id="@+id/shutterFlash"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:background="#FFFFFF"
+        android:alpha="0"
+        app:layout_constraintTop_toTopOf="@id/preview"
+        app:layout_constraintBottom_toBottomOf="@id/preview"
+        app:layout_constraintStart_toStartOf="@id/preview"
+        app:layout_constraintEnd_toEndOf="@id/preview" />
+
+    <!-- page-bound hint: the detected outline over the live preview -->
+    <org.whl.bookcapture.PageGuideOverlay
+        android:id="@+id/pageGuide"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        app:layout_constraintTop_toTopOf="@id/preview"
+        app:layout_constraintBottom_toBottomOf="@id/preview"
+        app:layout_constraintStart_toStartOf="@id/preview"
+        app:layout_constraintEnd_toEndOf="@id/preview" />
 
     <!-- the recent-scans dropdown, over the preview -->
     <ScrollView
