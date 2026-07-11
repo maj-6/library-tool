@@ -5,6 +5,21 @@ newest row per platform. Publishing a release means getting a row into that
 table with a URL people can download; the static site itself never changes or
 redeploys for a release.
 
+## Versioning
+
+The project is pre-1.0: it versions on a `0.x` line while it is still taking
+shape (`0.x` signals that anything may still change). The two apps version
+independently — the desktop from `desktop/package.json`, Book Capture from its
+gradle `versionName` — and the `v*` tag names the GitHub Release after the
+desktop version. Bump the patch for fixes and the minor (`0.4` → `0.5`) for
+features; save `1.0.0` for the first release meant to be stable. Do not renumber
+back into `3.x` — those tags are kept only as archived history from before the
+reset. One consequence of the reset: a desktop release numbered below an
+installed `3.x` build will not auto-update it (electron-updater only moves
+forward), so those few installs need a one-time manual reinstall. Android is
+unaffected — it updates by `versionCode`, which keeps climbing regardless of the
+`versionName`.
+
 Two ways a row gets there:
 
 ## The pipeline (the normal way)
@@ -32,7 +47,7 @@ So cutting a release is:
 # bump versions first if warranted:
 #   android/BookCapture/app/build.gradle.kts   versionCode + versionName
 #   desktop/package.json                       version
-git tag v3.1
+git tag v0.4.0
 git push <public> master:main --follow-tags    # or push the tag with the next mirror publish
 ```
 
@@ -61,11 +76,11 @@ desktop's Supabase credentials (Settings → Sync) or `SUPABASE_URL` /
 
 ```
 # upload a local file to the public `releases` bucket and register it
-python tools/release_publish.py BookCapture-1.0.apk --platform android --version 1.0
+python tools/release_publish.py BookCapture-0.2.0.apk --platform android --version 0.2.0
 
 # register a file hosted elsewhere (sha256/bytes computed if the file is local)
-python tools/release_publish.py LibraryTool-Setup-3.0.0.exe \
-    --url https://github.com/…/LibraryTool-Setup-3.0.0.exe --platform windows --version 3.0.0
+python tools/release_publish.py LibraryTool-Setup-0.4.0.exe \
+    --url https://github.com/…/LibraryTool-Setup-0.4.0.exe --platform windows --version 0.4.0
 ```
 
 The bucket route is for small files — Supabase's free tier caps one object

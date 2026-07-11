@@ -4,6 +4,9 @@ Newest first. The Downloads page highlights the significant releases; every
 version, down to the small fixes, is on the Release notes page. The desktop
 app reads this same file (Help → View changelog).
 
+## 0.4.0 — 2026-07-11
+- Version numbering reset to a pre-1.0 line. The project is still early and actively changing, so it continues here as 0.4.0 (Book Capture as 0.2.0) rather than presenting as a finished 3.x product. Nothing about the app itself changed in this entry; the earlier 3.x / 2.x history is kept below as-is.
+
 ## 3.2.1 — 2026-07-11
 - Size the interface to taste: a UI scale setting under Settings → Appearance, with Ctrl +/− to zoom and Ctrl 0 to reset.
 
