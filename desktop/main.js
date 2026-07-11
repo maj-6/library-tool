@@ -179,7 +179,9 @@ function setUpdaterStatus(status) {
 
 function createUpdaterWindow(theme) {
   updaterWin = new BrowserWindow({
-    width: 460, height: 200,
+    // frameless, so this height IS the content height; the splash box is ~136px
+    // tall, so 140 fits it snugly (no centered blank space above the title)
+    width: 460, height: 140,
     resizable: false, movable: false, minimizable: false, maximizable: false,
     center: true, frame: false, show: false, skipTaskbar: false,
     title: "Updating Library Tool",
@@ -270,8 +272,11 @@ function runUpdateGate() {
       if (stallTimer) clearTimeout(stallTimer);
       setUpdaterStatus({ phase: "install", version: info.version });
       app.isQuitting = true;
-      // a short beat so "Installing…" paints before the app tears down
-      setTimeout(() => updater.quitAndInstall(false, true), 500);
+      // a short beat so "Installing…" paints before the app tears down.
+      // quitAndInstall(isSilent=true, isForceRunAfter=true): /S runs the NSIS
+      // installer with no wizard and no clicks, then --force-run relaunches the
+      // new version. perMachine:false keeps it a per-user install, so no UAC.
+      setTimeout(() => updater.quitAndInstall(true, true), 500);
       resolve("installing");
     });
 

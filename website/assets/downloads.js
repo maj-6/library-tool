@@ -1,4 +1,4 @@
-import { latestReleases, usingCloud, safeHttpUrl, fetchChangelog } from "./data.js";
+import { latestReleases, usingCloud, safeHttpUrl, fetchChangelog, isSignificantVersion } from "./data.js";
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -56,11 +56,14 @@ try {
   box.innerHTML = `<div class="note">Could not load releases: ${esc(e.message)}</div>`;
 }
 
-// "What's new": the newest changelog entry, with a link to the full history.
+// "What's new": the newest *significant* release. Cosmetic patch releases
+// (e.g. 3.0.1) stay off the download page — the full history, including them,
+// is on the Release notes page.
 const clBox = document.getElementById("changelog");
 const versions = await fetchChangelog();
-clBox.innerHTML = versions.length
-  ? release(versions[0])
+const latest = versions.find((v) => isSignificantVersion(v.version));
+clBox.innerHTML = latest
+  ? release(latest)
   : `<p class="muted">No release notes yet.</p>`;
 
 function release(v) {

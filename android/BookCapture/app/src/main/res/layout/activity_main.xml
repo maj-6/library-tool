@@ -4,61 +4,118 @@
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="@android:color/black">
+    android:background="@color/whl_canvas">
+
+    <!-- chrome: title row + status line, one face panel like the desktop toolbar -->
+    <LinearLayout
+        android:id="@+id/topbar"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:background="@drawable/whl_panel"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:paddingStart="10dp"
+            android:paddingEnd="4dp"
+            android:paddingTop="6dp"
+            android:paddingBottom="2dp">
+
+            <TextView
+                android:id="@+id/entryState"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:fontFamily="monospace"
+                android:textSize="14sp"
+                android:textStyle="bold"
+                android:textColor="@color/whl_ink"
+                android:text="@string/entry_idle" />
+
+            <Space
+                android:layout_width="0dp"
+                android:layout_height="1dp"
+                android:layout_weight="1" />
+
+            <TextView
+                android:id="@+id/queueChip"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:fontFamily="monospace"
+                android:textSize="12sp"
+                android:textColor="@color/whl_ink"
+                android:padding="8dp"
+                android:text="@string/recent_chip" />
+
+            <TextView
+                android:id="@+id/btnSettings"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:fontFamily="monospace"
+                android:textSize="16sp"
+                android:textColor="@color/whl_ink"
+                android:padding="8dp"
+                android:text="@string/gear" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingStart="10dp"
+            android:paddingEnd="10dp"
+            android:paddingBottom="5dp"
+            android:fontFamily="monospace"
+            android:textSize="11sp"
+            android:textColor="@color/whl_ink_dim" />
+    </LinearLayout>
 
     <androidx.camera.view.PreviewView
         android:id="@+id/preview"
         android:layout_width="0dp"
         android:layout_height="0dp"
-        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/topbar"
         app:layout_constraintBottom_toTopOf="@id/thumbs_scroll"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
-    <TextView
-        android:id="@+id/entryState"
+    <!-- the recent-scans dropdown, over the preview -->
+    <ScrollView
+        android:id="@+id/recentPanel"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
-        android:padding="10dp"
-        android:textColor="@android:color/white"
-        android:textSize="16sp"
-        android:textStyle="bold"
-        android:background="@color/entry_idle"
-        android:text="@string/entry_idle"
-        app:layout_constraintTop_toTopOf="parent"
+        android:background="@drawable/whl_panel"
+        android:visibility="gone"
+        android:elevation="6dp"
+        app:layout_constrainedHeight="true"
+        app:layout_constraintHeight_max="320dp"
+        app:layout_constraintTop_toBottomOf="@id/topbar"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent" />
+        app:layout_constraintEnd_toEndOf="parent">
 
-    <TextView
-        android:id="@+id/status"
-        android:layout_width="0dp"
-        android:layout_height="wrap_content"
-        android:padding="6dp"
-        android:textColor="#DDDDDD"
-        android:textSize="12sp"
-        android:background="#66000000"
-        app:layout_constraintTop_toBottomOf="@id/entryState"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent" />
-
-    <TextView
-        android:id="@+id/queueState"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:padding="6dp"
-        android:textColor="#FFCC66"
-        android:textSize="12sp"
-        app:layout_constraintTop_toBottomOf="@id/status"
-        app:layout_constraintStart_toStartOf="parent" />
+        <LinearLayout
+            android:id="@+id/recentList"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingTop="2dp"
+            android:paddingBottom="4dp" />
+    </ScrollView>
 
     <TextView
         android:id="@+id/configWarning"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
         android:padding="8dp"
-        android:textColor="@android:color/white"
-        android:background="#AACC3333"
-        android:text="@string/not_configured"
+        android:fontFamily="monospace"
+        android:textSize="12sp"
+        android:textColor="@color/whl_ink_light"
+        android:background="@color/whl_red"
         android:visibility="gone"
         app:layout_constraintBottom_toTopOf="@id/thumbs_scroll"
         app:layout_constraintStart_toStartOf="parent"
@@ -67,8 +124,8 @@
     <HorizontalScrollView
         android:id="@+id/thumbs_scroll"
         android:layout_width="0dp"
-        android:layout_height="96dp"
-        android:background="#222222"
+        android:layout_height="88dp"
+        android:background="@color/whl_canvas_line"
         android:padding="4dp"
         app:layout_constraintBottom_toTopOf="@id/buttons"
         app:layout_constraintStart_toStartOf="parent"
@@ -81,12 +138,13 @@
             android:orientation="horizontal" />
     </HorizontalScrollView>
 
+    <!-- glyph controls; labels are the abstraction, tones the confirmation -->
     <LinearLayout
         android:id="@+id/buttons"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
         android:orientation="horizontal"
-        android:background="#111111"
+        android:background="@drawable/whl_panel"
         android:padding="6dp"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintStart_toStartOf="parent"
@@ -94,41 +152,41 @@
 
         <Button
             android:id="@+id/btnStart"
-            style="?attr/materialButtonOutlinedStyle"
+            style="@style/WhlButton"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="@string/cmd_start" />
+            android:layout_marginEnd="6dp"
+            android:contentDescription="@string/cmd_start"
+            android:text="@string/glyph_start" />
 
         <Button
             android:id="@+id/btnPhoto"
-            style="?attr/materialButtonOutlinedStyle"
+            style="@style/WhlButton"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="@string/cmd_photo" />
+            android:layout_weight="2"
+            android:layout_marginEnd="6dp"
+            android:contentDescription="@string/cmd_photo"
+            android:text="@string/glyph_photo" />
 
         <Button
             android:id="@+id/btnDone"
-            style="?attr/materialButtonOutlinedStyle"
+            style="@style/WhlButton"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="@string/cmd_done" />
+            android:layout_marginEnd="6dp"
+            android:contentDescription="@string/cmd_done"
+            android:text="@string/glyph_done" />
 
         <Button
             android:id="@+id/btnCancel"
-            style="?attr/materialButtonOutlinedStyle"
+            style="@style/WhlButton"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="@string/cmd_cancel" />
-
-        <Button
-            android:id="@+id/btnSettings"
-            style="?attr/materialButtonOutlinedStyle"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="@string/gear" />
+            android:contentDescription="@string/cmd_cancel"
+            android:text="@string/glyph_cancel" />
     </LinearLayout>
 </androidx.constraintlayout.widget.ConstraintLayout>

@@ -18,6 +18,8 @@ output/backups/
 output/activity.jsonl
 # the signed-in Supabase session (user tokens) + the activity push cursor
 output/auth_session.json
+# device-local record of what the cloud already has (working-store sync shadow)
+output/cloud_shadow.json
 
 # downloaded scans (large binaries)
 downloads/ia/*.pdf

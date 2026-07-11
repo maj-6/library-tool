@@ -204,6 +204,15 @@ export async function fetchChangelog() {
   }
 }
 
+/** A release is "significant" — highlighted on the Downloads page — when it is
+ *  a major or minor version, i.e. its patch component is absent or 0 (3.0.0,
+ *  3.1.0, 4.0). Cosmetic patch releases (3.0.1, 3.1.2) show only on the full
+ *  Release notes page. */
+export function isSignificantVersion(version) {
+  const patch = String(version || "").trim().replace(/^v/i, "").split(".")[2];
+  return patch === undefined || /^0+$/.test(patch);
+}
+
 /** Terse markdown -> versions. "## <version> — <date>" starts an entry; "- "
  *  lines are its bullets; a title or any preamble before the first entry is
  *  ignored. Pure text out; the caller escapes before it touches the DOM. */
