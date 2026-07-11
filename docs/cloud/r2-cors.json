@@ -1,0 +1,9 @@
+[
+  {
+    "AllowedOrigins": ["https://maj-6.github.io"],
+    "AllowedMethods": ["GET", "HEAD"],
+    "AllowedHeaders": ["range", "if-range", "content-type"],
+    "ExposeHeaders": ["Content-Range", "Content-Length", "Accept-Ranges", "ETag"],
+    "MaxAgeSeconds": 86400
+  }
+]
