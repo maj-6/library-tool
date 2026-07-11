@@ -1149,11 +1149,13 @@ function maybeAuthPrompt() {
 // Re-openable any time from Help > Setup guide. Every step is skippable, and
 // everything it sets lives in the same settings the Settings window edits.
 
+// No cloud-keys step: the app ships knowing its own cloud (the server bakes
+// in the project URL + public anon key), so accounts just work. The service
+// key is an owner concern and lives in Settings > Sync.
 const WIZ_STEPS = [
   ["welcome", "WELCOME"],
   ["account", "YOUR NAME"],
   ["ocr", "OCR"],
-  ["cloud", "CLOUD"],
   ["db", "OFFLINE SEARCH"],
   ["done", "READY"],
 ];
@@ -1185,10 +1187,6 @@ function wizCommit() {
     if (un) un.value = state.settings.userName;
   } else if (step === "ocr") {
     state.settings.mistralKey = el("wiz-mistral").value.trim();
-  } else if (step === "cloud") {
-    state.settings.supabaseUrl = el("wiz-sb-url").value.trim();
-    state.settings.supabaseAnonKey = el("wiz-sb-anon").value.trim();
-    state.settings.supabaseKey = el("wiz-sb-key").value.trim();
   } else {
     return;
   }
@@ -1213,10 +1211,6 @@ function wizRender() {
   } else if (step === "ocr") {
     el("wiz-mistral").value = state.settings.mistralKey || "";
     wizCheckTesseract();
-  } else if (step === "cloud") {
-    el("wiz-sb-url").value = state.settings.supabaseUrl || "";
-    el("wiz-sb-anon").value = state.settings.supabaseAnonKey || "";
-    el("wiz-sb-key").value = state.settings.supabaseKey || "";
   } else if (step === "db") {
     wizDbTick();
   }

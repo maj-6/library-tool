@@ -42,6 +42,7 @@ from werkzeug.exceptions import HTTPException
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import capture_pipeline as capture  # noqa: E402
 import catalog_checks as checks  # noqa: E402
+import cloud_defaults  # noqa: E402
 import copyright_registration as copyreg  # noqa: E402
 import libcommon as lib  # noqa: E402
 import r2_store as r2  # noqa: E402
@@ -275,11 +276,18 @@ def _auth_doc() -> dict:
 
 def _auth_cfg() -> dict | None:
     """GoTrue wants a project API key in `apikey`; the anon key is the right
-    one, but the service key works too, so use whichever Settings holds."""
+    one, but the service key works too, so use whichever Settings holds.
+
+    Nothing configured is NOT unconfigured: the app ships knowing its own
+    cloud (cloud_defaults), so accounts work on a fresh install with no keys
+    entered. Settings override; a custom project URL with no key of its own
+    stays unconfigured rather than pairing with the default key."""
     s = _client_settings()
-    url = str(s.get("supabaseUrl") or "").strip()
+    url = str(s.get("supabaseUrl") or "").strip() or cloud_defaults.SUPABASE_URL
     key = (str(s.get("supabaseAnonKey") or "").strip()
            or str(s.get("supabaseKey") or "").strip())
+    if not key and url == cloud_defaults.SUPABASE_URL:
+        key = cloud_defaults.SUPABASE_ANON_KEY
     return {"url": url, "key": key} if url and key else None
 
 
@@ -3462,8 +3470,11 @@ _autosync_last = 0.0
 
 
 def _cloud_cfg() -> dict | None:
+    """The service-role config for the owner pipelines (captures, publish,
+    store sync). The URL defaults to the shipped project; the service key is
+    a secret and must always come from Settings."""
     s = _client_settings()
-    url = str(s.get("supabaseUrl") or "").strip()
+    url = str(s.get("supabaseUrl") or "").strip() or cloud_defaults.SUPABASE_URL
     key = str(s.get("supabaseKey") or "").strip()
     return {"url": url, "key": key} if url and key else None
 

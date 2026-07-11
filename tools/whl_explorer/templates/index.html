@@ -1231,12 +1231,15 @@
             <div class="settings-rows">
               <label class="tool-label" for="set-sb-url">Supabase project URL</label>
               <input id="set-sb-url" class="cad-input" spellcheck="false"
-                     placeholder="https://xxxx.supabase.co" />
+                     placeholder="built in — set only to use your own project"
+                     data-tip="The app ships knowing the Library Tool cloud; accounts work with nothing entered here." />
               <label class="tool-label" for="set-sb-key">Supabase service key</label>
-              <input id="set-sb-key" class="cad-input" type="password" spellcheck="false" />
+              <input id="set-sb-key" class="cad-input" type="password" spellcheck="false"
+                     data-tip="The owner secret — unlocks phone capture, publishing, and the working-store sync. Regular users leave it blank." />
               <label class="tool-label" for="set-sb-anon">Supabase anon key</label>
               <input id="set-sb-anon" class="cad-input" type="password" spellcheck="false"
-                     data-tip="The public (anon) key — used to sign users in. python3 tools/cloud_setup.py anon-key prints it." />
+                     placeholder="built in"
+                     data-tip="The public (anon) key — signs users in. Built in; set only with your own project URL." />
               <label class="tool-label" for="set-r2-account">R2 account id</label>
               <input id="set-r2-account" class="cad-input" spellcheck="false"
                      data-tip="Cloudflare R2 stores published PDFs. Leave blank to use Supabase storage (1 GB on the free tier)." />
@@ -1358,22 +1361,6 @@
             <label class="tool-label" for="wiz-mistral">Mistral API key <span class="wiz-opt">(optional)</span></label>
             <input id="wiz-mistral" class="cad-input" type="password" spellcheck="false"
                    placeholder="leave blank to skip" />
-          </div>
-        </div>
-
-        <div class="wiz-pane" data-step="cloud" hidden>
-          <p class="settings-note">A Supabase project powers cloud accounts, the shared
-             activity feed, and the phone-capture pipeline. Paste your project URL and keys,
-             or skip — the app runs fully offline without them.</p>
-          <div class="settings-rows">
-            <label class="tool-label" for="wiz-sb-url">Supabase project URL</label>
-            <input id="wiz-sb-url" class="cad-input" spellcheck="false" placeholder="https://xxxx.supabase.co" />
-            <label class="tool-label" for="wiz-sb-anon">Anon key <span class="wiz-opt">(public)</span></label>
-            <input id="wiz-sb-anon" class="cad-input" type="password" spellcheck="false"
-                   placeholder="signs users in" />
-            <label class="tool-label" for="wiz-sb-key">Service key <span class="wiz-opt">(secret)</span></label>
-            <input id="wiz-sb-key" class="cad-input" type="password" spellcheck="false"
-                   placeholder="capture + publishing" />
           </div>
         </div>
 
