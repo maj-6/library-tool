@@ -118,8 +118,8 @@ body[data-theme="sage"] .pane-tab.active {
 body[data-theme="sage"] .pane-tabs { border-bottom: 1px solid #cec6b4; }
 body[data-theme="sage"] #titlebar,
 body[data-theme="sage"] .win-titlebar {
-  background: #d8cdb4;      /* a distinct warm band, deeper than the chrome */
-  color: #2b2720;
+  background: #9c9482;      /* a darker warm band so the menu bar reads as chrome */
+  color: #201c15;
   border-bottom: 1px solid #b2a88f;
 }
 body[data-theme="sage"] .grid thead th {
@@ -204,9 +204,9 @@ body[data-theme="ledger"] .pane-tab.active {
 }
 body[data-theme="ledger"] #titlebar,
 body[data-theme="ledger"] .win-titlebar {
-  background: #e3e0d6;
-  color: #26241f;
-  border-bottom: 3px double #8f8d84;
+  background: #a3a19a;
+  color: #201f1b;
+  border-bottom: 3px double #6f6d66;
 }
 body[data-theme="ledger"] .grid thead th {
   background: #edece5;
@@ -310,9 +310,9 @@ body[data-theme="foolscap"] .pane-tabs { border-bottom: 1px solid #b0a99a; }
 /* titlebar: a light galley band closed off by the sheet's single ink rule */
 body[data-theme="foolscap"] #titlebar,
 body[data-theme="foolscap"] .win-titlebar {
-  background: #e9e5d9;
-  color: #221c14;
-  border-bottom: 1px solid #8a8070;
+  background: #a8a59c;
+  color: #1c1810;
+  border-bottom: 1px solid #6f665a;
   letter-spacing: 1px;
 }
 /* grid on the paper canvas: light ruled header, single hairline rules, no vertical ruling */
@@ -404,9 +404,9 @@ body[data-theme="vellum"] .pane-tab.active {
 body[data-theme="vellum"] .pane-tabs { border-bottom: 1px solid #cdc7b8; }
 body[data-theme="vellum"] #titlebar,
 body[data-theme="vellum"] .win-titlebar {
-  background: #e7e1d3;
-  color: #2a2620;
-  border-bottom: 1px solid #a49a86;
+  background: #a6a298;
+  color: #201c17;
+  border-bottom: 1px solid #7c7364;
 }
 body[data-theme="vellum"] .grid thead th {
   background: #f0ebde;
@@ -501,9 +501,9 @@ body[data-theme="linen"] .pane-tabs { border-bottom: 1px solid #c3beb1; }
 /* a light flax band under a single warm rule */
 body[data-theme="linen"] #titlebar,
 body[data-theme="linen"] .win-titlebar {
-  background: #dcd7ca;
-  color: #2c2a24;
-  border-bottom: 1px solid #948e7e;
+  background: #9e9b91;
+  color: #201e18;
+  border-bottom: 1px solid #6e6a5e;
 }
 /* ruled catalogue table: single hairlines, no vertical rules */
 body[data-theme="linen"] .grid thead th {
@@ -535,151 +535,6 @@ body[data-theme="linen"] ::-webkit-scrollbar-track { background: #e7e3da; }
 body[data-theme="linen"] ::-webkit-scrollbar-thumb {
   background: #cdc8bc; border: 2px solid #e7e3da; border-radius: 2px;
 }
-
-/* ---------- PLATINUM (Mac OS 8/9 grayscale chrome) ----------
-   Classic Platinum translated onto the fixed geometry: cool neutral greys,
-   crisp 1px bevels drawn as inset shadows (light NW, mid-grey SE), square
-   corners, the pinstriped light titlebar, and Apple's lavender softened to
-   a slate #5c5c85. Radius 1px. */
-body[data-theme="platinum"] {
-  --face: #e2e4e6;
-  --face-hi: #f5f6f7;
-  --face-sh: #c9ccd0;
-  --face-sh2: #8e939a;
-  --face-active: #f7f8f9;
-  --canvas: #f7f8f9;
-  --canvas-line: #e6e8ea;
-  --ink: #1e2124;
-  --ink-light: #1e2124;
-  --input-bg: #ffffff;
-  --input-ink: #1e2124;
-  --row-hover: #eceef0;
-  --row-checked: #e0e1eb;
-  --row-manual: #e0e7df;
-  --cyan: #38646e;
-  --green: #3e6b43;
-  --amber: #85682a;
-  --red: #9b3a2e;
-  --blue: #5c5c85;
-  --blue2: #75759c;
-  --radius: 1px;
-}
-/* the Platinum button: light NW / mid-grey SE bevel inside a hairline frame */
-body[data-theme="platinum"] .cad-btn,
-body[data-theme="platinum"] .win-close {
-  border: 1px solid #8e939a;
-  background: linear-gradient(#f2f3f4, #dfe2e4);
-  box-shadow: inset 1px 1px 0 #ffffff, inset -1px -1px 0 #c2c6ca;
-}
-body[data-theme="platinum"] .cad-btn:hover {
-  background: linear-gradient(#f7f8f9, #e6e8ea);
-}
-/* pressed = the bevel inverts, the face darkens; no travel */
-body[data-theme="platinum"] .cad-btn:active {
-  background: #d0d4d7;
-  box-shadow: inset 1px 1px 0 #aeb3b8, inset -1px -1px 0 #e2e4e6;
-}
-/* a held toggle: pressed bevel plus the base cyan ring (the bevel shadow
-   would otherwise bury the .active indicator) */
-body[data-theme="platinum"] .cad-btn.active {
-  background: #d0d4d7;
-  box-shadow: inset 0 0 0 1px var(--cyan), inset 1px 1px 0 #aeb3b8;
-}
-/* fields are wells sunk into the face: dark inner NW edge on white */
-body[data-theme="platinum"] .cad-input,
-body[data-theme="platinum"] .cell-edit,
-body[data-theme="platinum"] .md-live {
-  border: 1px solid #8e939a;
-  box-shadow: inset 1px 1px 0 #d3d7da;
-}
-body[data-theme="platinum"] .cad-input:focus { border-color: #5c5c85; }
-/* the cell being edited must still announce itself over the well shadow */
-body[data-theme="platinum"] .cell-edit:focus {
-  border-color: var(--cyan);
-  box-shadow: inset 0 0 0 1px var(--cyan);
-}
-/* boxed tabs; the front tab takes the pane's own colour, rear tabs recede */
-body[data-theme="platinum"] .tab,
-body[data-theme="platinum"] .pane-tab {
-  border: 1px solid #8e939a;
-  border-bottom: none;
-  border-radius: 2px 2px 0 0;
-  background: linear-gradient(#e4e6e8, #d6d9dc);
-  color: #4c5259;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7);
-}
-body[data-theme="platinum"] .tab.active,
-body[data-theme="platinum"] .pane-tab.active {
-  background: var(--face-active);
-  color: var(--ink);
-  box-shadow: inset 0 1px 0 #ffffff;
-  font-weight: 600;
-}
-body[data-theme="platinum"] .pane-tabs { border-bottom: 1px solid #8e939a; }
-/* the iconic pinstriped bar: 2px horizontal stripes, near-black ink */
-body[data-theme="platinum"] #titlebar,
-body[data-theme="platinum"] .win-titlebar {
-  background: repeating-linear-gradient(180deg,
-    #f0f1f2 0, #f0f1f2 1px, #dfe1e3 1px, #dfe1e3 2px);
-  color: #1e2124;
-  border-bottom: 1px solid #8e939a;
-}
-/* light bar: re-ink the menu titles; open menu highlights in the accent,
-   the base white-tint hover would vanish here */
-body[data-theme="platinum"] #titlebar { color: #1e2124; }
-body[data-theme="platinum"] #titlebar .menu-btn { color: #1e2124; }
-body[data-theme="platinum"] #titlebar .menu-btn:hover {
-  background: rgba(58, 58, 94, 0.12);
-  color: #1e2124;
-}
-body[data-theme="platinum"] #titlebar .menu-btn.active {
-  background: #5c5c85;
-  color: #fff;
-}
-/* window controls: dark glyphs, dark-tinted hover; close keeps its red */
-body[data-theme="platinum"] .win-btn { color: #1e2124; }
-body[data-theme="platinum"] .win-btn:hover { background: rgba(58, 58, 94, 0.12); }
-body[data-theme="platinum"] .win-btn:active { background: rgba(58, 58, 94, 0.22); }
-body[data-theme="platinum"] .win-btn.win-close:hover { background: #e81123; color: #fff; }
-body[data-theme="platinum"] .win-btn.win-close:active { background: #c50e1f; color: #fff; }
-/* list view: each column header a bevelled sort button, clean ruled rows */
-body[data-theme="platinum"] .grid thead th {
-  background: linear-gradient(#f2f3f4, #e1e4e6);
-  color: #3c4147;
-  border-right: 1px solid #c2c6ca;
-  border-bottom: 1px solid #8e939a;
-}
-body[data-theme="platinum"] .grid tbody td {
-  border-right: none;
-  border-bottom: 1px solid #e8eaec;
-}
-body[data-theme="platinum"] .badge { background: rgba(92, 92, 133, 0.07); }
-body[data-theme="platinum"] #cad-tooltip,
-body[data-theme="platinum"] #attn-pop {
-  background: #f4f5f6;
-  color: var(--ink);
-  border: 1px solid #8e939a;
-  border-radius: 1px;
-}
-body[data-theme="platinum"] #statusbar { border-top: 1px solid #8e939a; }
-/* hard-edged dialogs on a soft drop */
-body[data-theme="platinum"] .win {
-  border-radius: 1px;
-  overflow: hidden;
-  box-shadow: 0 12px 30px rgba(30, 34, 40, 0.28);
-}
-body[data-theme="platinum"] .menu-drop,
-body[data-theme="platinum"] #popup-menu { border-radius: 1px; }
-/* light grey gutter, bevelled square thumb (reads raised either axis) */
-body[data-theme="platinum"] ::-webkit-scrollbar { width: 11px; height: 11px; }
-body[data-theme="platinum"] ::-webkit-scrollbar-track { background: #eaeced; }
-body[data-theme="platinum"] ::-webkit-scrollbar-thumb {
-  background: #dde0e2;
-  border: 1px solid #8e939a;
-  border-radius: 1px;
-  box-shadow: inset 1px 1px 0 #f5f6f7, inset -1px -1px 0 #c2c6ca;
-}
-body[data-theme="platinum"] ::-webkit-scrollbar-thumb:hover { background: #d3d7da; }
 
 /* ===================== base ===================== */
 
@@ -1094,6 +949,15 @@ body.desktop .win-controls { display: inline-flex; }
 .menu-check { display: inline-block; width: 12px; }
 .menu-check.on::before { content: "\2713"; }
 .menu-sep { margin: 3px 6px; border-top: 1px solid var(--face-sh); }
+
+/* Theme / OCR-engine hover submenus. The parent is a .menu-item (no data-cmd —
+   the click handler skips .menu-sub); its child .menu-drop reuses the dropdown
+   chrome and opens on hover, edge-adjacent (left:100%, no gap) so :hover holds
+   across the seam without a JS hover-intent timer. */
+.menu-sub { position: relative; }
+.menu-sub > .menu-caret { margin-left: auto; opacity: 0.6; font-size: 9px; padding-left: 18px; }
+.menu-sub-drop { top: -4px; left: 100%; min-width: 160px; display: none; }
+.menu-sub:hover > .menu-sub-drop { display: block; }
 
 /* --- tab strip with inline actions --- */
 #tabs {

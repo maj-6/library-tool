@@ -148,7 +148,7 @@ function createWindow() {
 // it before the sidecar (which owns client_state) is even running. Mirrors the
 // theme ids in tools/whl_explorer/static/app.js; anything unknown -> sage.
 const KNOWN_THEMES = new Set([
-  "sage", "ledger", "foolscap", "vellum", "linen", "platinum",
+  "sage", "ledger", "foolscap", "vellum", "linen",
 ]);
 function readActiveTheme() {
   try {

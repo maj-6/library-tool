@@ -51,8 +51,17 @@
         <div class="menu-drop" hidden>
           <button class="menu-item" data-cmd="settings" type="button">All settings&hellip;</button>
           <div class="menu-sep"></div>
-          <!-- theme items are generated from THEMES by buildThemeMenu() -->
-          <div id="menu-themes"></div>
+          <!-- Theme + OCR-engine pickers as hover submenus; the hosts are filled
+               from THEMES / OCR_SERVICES by buildThemeMenu() / buildOcrMenu() -->
+          <div class="menu-item menu-sub">Theme<span class="menu-caret">&#9656;</span>
+            <div class="menu-drop menu-sub-drop"><div id="menu-themes"></div></div>
+          </div>
+          <div class="menu-item menu-sub">OCR engine<span class="menu-caret">&#9656;</span>
+            <div class="menu-drop menu-sub-drop"><div id="menu-ocr-service"></div></div>
+          </div>
+          <div class="menu-sep"></div>
+          <button class="menu-item" data-cmd="opt-auto-ia" type="button"><span class="menu-check"></span>Auto-download IA scans</button>
+          <button class="menu-item" data-cmd="opt-expand-sets" type="button"><span class="menu-check"></span>Expand multi-volume sets</button>
         </div>
       </div>
       <div class="menu">
