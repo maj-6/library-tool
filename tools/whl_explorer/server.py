@@ -3307,14 +3307,12 @@ _db_lock = threading.Lock()
 
 
 def _db_local(rel):
-    """Where a database actually is, LOCAL-FIRST: the writable data root (a file
-    dropped in from a flash drive, or downloaded) wins; a copy bundled with the
-    app is the fallback. Returns the Path, or None when neither exists — only
-    then is a download offered."""
-    for p in (lib.DATA_ROOT / rel, lib.APP_ROOT / rel.split("/")[-1]):
-        if p.exists():
-            return p
-    return None
+    """Where a database actually is, or None if nowhere. LOCAL-FIRST via
+    lib.find_db: the ~/.library-tool drop-in folder, the data root, then the copy
+    bundled with the app. None only when no copy exists — the sole case a
+    download is offered."""
+    p = lib.find_db(rel.split("/")[-1], rel)
+    return p if p.exists() else None
 
 
 def _db_urls():
@@ -3339,7 +3337,7 @@ def _db_urls():
 
 
 def _run_db_download(name, url, rel):
-    dest = lib.DATA_ROOT / rel
+    dest = lib.DB_DIR / rel.split("/")[-1]   # downloads land in the drop-in folder
     tmp = dest.with_name(dest.name + ".part")
     log.info("database download started: %s <- %s", name, url)
     try:
@@ -3407,7 +3405,8 @@ def api_db_status():
             "url": str(urls.get(name) or ""),
             "job": _db_jobs.get(name),
         }
-    return jsonify({"data_root": str(lib.DATA_ROOT), "targets": out})
+    return jsonify({"data_root": str(lib.DATA_ROOT), "db_dir": str(lib.DB_DIR),
+                    "targets": out})
 
 
 @app.route("/api/db/reveal", methods=["POST"])
@@ -3416,7 +3415,7 @@ def api_db_reveal():
     database files straight in — local-first means a file here is used with no
     download and no URL."""
     import subprocess
-    target = lib.DATA_ROOT
+    target = lib.DB_DIR
     try:
         target.mkdir(parents=True, exist_ok=True)
         if sys.platform == "win32":

@@ -21,16 +21,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import libcommon as lib  # noqa: E402
 import whl_client as whl  # noqa: E402
 
-# Reference data. A copy in the writable data root (dropped in from a flash
-# drive, or downloaded) wins; the copy shipped with the app is the fallback.
-# So a local file never needs a download or a URL — just drop it in the data
-# folder before launch. Resolved at import; the sidecar restarts each app launch.
-def _reference_csv(name: str) -> Path:
-    p = lib.DATA_ROOT / name
-    return p if p.exists() else lib.APP_ROOT / name
-
-RENEWALS_CSV = _reference_csv("copyright_renewals.csv")
-WHL_CATALOG_CSV = _reference_csv("whl_catalog.csv")
+# Reference data, resolved most-accessible-first (the ~/.library-tool drop-in
+# folder, the data root, then the copy shipped with the app), so a local file
+# from a flash drive is used with no download and no URL.
+RENEWALS_CSV = lib.find_db("copyright_renewals.csv")
+WHL_CATALOG_CSV = lib.find_db("whl_catalog.csv")
 
 # Renewal era: works published in this inclusive window needed a renewal to
 # keep copyright. Older works are public domain by age; newer were auto-renewed.

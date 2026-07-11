@@ -2111,7 +2111,7 @@ async function renderDbSync() {
   catch (e) { host.innerHTML = "<span class='tool-label'>backend unavailable</span>"; return; }
   const targets = data.targets || {};
   const pathEl = el("db-folder-path");
-  if (pathEl) pathEl.textContent = data.data_root || "";
+  if (pathEl) pathEl.textContent = data.db_dir || data.data_root || "";
   const openBtn = el("db-open-folder");
   if (openBtn) openBtn.onclick = openDataFolder;
   host.innerHTML = "";

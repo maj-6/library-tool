@@ -61,6 +61,29 @@ MANUAL_ENTRIES_PATH = OUTPUT_DIR / "manual_entries.json"
 # port-independent and syncable (checked books, settings, attention marks).
 CLIENT_STATE_PATH = OUTPUT_DIR / "client_state.json"
 
+# Search databases (the Open Library indexes, the copyright-renewal CSV) are
+# large and are often copied by hand from a flash drive, so they live somewhere
+# easy to reach: a ~/.library-tool folder in the home directory. They resolve
+# MOST-ACCESSIBLE-FIRST — that drop-in folder, then the app's data root, then the
+# copy shipped with the app — so a local file is always used with no URL and no
+# download. DB_DIR is where a download or a hand-drop is expected.
+DB_DIR = Path.home() / ".library-tool"
+
+
+def find_db(basename: str, data_rel: str = "") -> Path:
+    """First existing copy of a database file across the drop-in folder, the data
+    root (its root and, if given, data_rel like 'output/x.db'), and the app
+    bundle. When none exists, returns the drop-in target DB_DIR/basename — where a
+    download or a hand-drop should go."""
+    candidates = [DB_DIR / basename]
+    if data_rel:
+        candidates.append(DATA_ROOT / data_rel)
+    candidates += [DATA_ROOT / basename, APP_ROOT / basename]
+    for p in candidates:
+        if p.exists():
+            return p
+    return DB_DIR / basename
+
 # read-only shipped assets
 XLSX_PATH = APP_ROOT / "ch_library.xlsx"
 CH_LIBRARY_JSON_PATH = APP_ROOT / "output" / "ch_library.json"
