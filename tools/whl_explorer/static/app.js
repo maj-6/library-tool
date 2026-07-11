@@ -153,28 +153,25 @@ const THEMES = [
   ["foolscap", "Foolscap"],
   ["vellum", "Vellum"],
   ["linen", "Linen"],
-  ["quarto", "Quarto"],
-  ["pewter", "Pewter"],
-  ["folio", "Folio"],
   ["platinum", "Platinum"],
-  ["redmond", "Redmond"],
-  ["motif", "Motif"],
 ];
 const DEFAULT_THEME = "sage";
 // Retired ids map to the survivor closest in spirit, so a stored theme never
 // falls through to the bare :root fallback. "" was Classic CAD, the old default.
-// platinum came back as a real theme, so it no longer appears here.
 const LEGACY_THEMES = {
   "": DEFAULT_THEME,
-  // the dark/loud round, retired after one release
-  scope: "pewter", "terminal-amber": "vellum", "blueprint-linen": "quarto",
-  oxblood: "ledger", porcelain: "pewter", herbarium: "vellum",
-  // the original set; the classic-chrome ids revive as their nearest heirs
-  blueprint: "quarto", modern: "pewter",
-  dark: "pewter", stone: "linen", midnight: "pewter",
-  cde: "motif", xp2003: "redmond", acad: "pewter",
-  workstation: "motif", slate: "pewter", mainframe: "vellum",
-  graphite: "pewter",
+  // removed 2026-07-10 -> nearest surviving chrome
+  quarto: "platinum", pewter: "platinum", folio: "linen",
+  redmond: "platinum", motif: "platinum",
+  // the dark/loud round, retired earlier
+  scope: "platinum", "terminal-amber": "vellum", "blueprint-linen": "linen",
+  oxblood: "ledger", porcelain: "platinum", herbarium: "vellum",
+  // the original classic-chrome set
+  blueprint: "linen", modern: "platinum",
+  dark: "platinum", stone: "linen", midnight: "platinum",
+  cde: "platinum", xp2003: "platinum", acad: "platinum",
+  workstation: "platinum", slate: "platinum", mainframe: "vellum",
+  graphite: "platinum",
 };
 
 // One shared font list; the interface (--ui) and data/table (--mono) fonts
@@ -1523,6 +1520,11 @@ function renderHome() {
           `</div>`).join("")
       : `<div class="empty">No contributors recorded yet</div>`;
   }
+
+  // the review queue as an inline pane (the overlay window still exists too)
+  const hcb = el("home-review-resolved");
+  if (hcb) hcb.checked = reviewsState.showResolved;
+  renderReviewsInto(el("home-reviews"));
 }
 
 function initHome() {
@@ -3632,12 +3634,34 @@ function reviewsSorted() {
     .sort((a, b) => (b.resolved_at || "").localeCompare(a.resolved_at || "")));
 }
 
-function renderReviewList() {
-  const host = el("review-list");
+function reviewItemHtml(r) {
+  const resolved = r.status !== "open";
+  return `<div class="review-item${resolved ? " resolved" : ""}" data-rid="${esc(r.id)}">` +
+    `<div class="ri-head">` +
+      `<span class="ri-label">${esc(r.label) || "(unlabelled item)"}</span>` +
+      `<span class="ri-meta">${resolved
+        ? `resolved by ${esc(r.resolved_by || "?")} &middot; ${esc(relIso(r.resolved_at))}`
+        : `${esc(r.created_by || "?")} &middot; ${esc(relIso(r.created_at))}`}</span>` +
+      `<button class="cad-btn tiny" type="button" data-rv-resolve="${resolved ? "0" : "1"}" ` +
+        `data-tip="${resolved ? "Reopen this item"
+          : "Mark resolved (also clears the attention mark)"}">${resolved ? "Reopen" : "Resolve"}</button>` +
+    `</div>` +
+    (r.reason ? `<div class="ri-reason">${esc(r.reason)}</div>` : "") +
+    (r.comments || []).map((c) => `<div class="ri-comment">` +
+      `<span class="ric-author">${esc(c.author || "?")}</span>` +
+      `<span class="ric-when">${esc(relIso(c.ts))}</span>` +
+      `<div class="ric-text">${esc(c.text)}</div></div>`).join("") +
+    `<div class="ri-add">` +
+      `<input class="cad-input ri-comment-input" placeholder="Add a comment&hellip;" spellcheck="false" />` +
+      `<button class="cad-btn tiny" type="button" data-rv-comment>Comment</button>` +
+    `</div></div>`;
+}
+
+// Render the queue into one host (the overlay list or the home pane). A rebuild
+// must never clobber a comment in progress, so typed drafts and the caret are
+// carried across the innerHTML replacement, per host.
+function renderReviewsInto(host) {
   if (!host) return;
-  el("review-show-resolved").checked = reviewsState.showResolved;
-  // a rebuild must never clobber a comment in progress: typed drafts (and
-  // the caret) are carried across the innerHTML replacement
   const drafts = {};
   let focusRid = null;
   for (const i of host.querySelectorAll(".ri-comment-input")) {
@@ -3652,28 +3676,7 @@ function renderReviewList() {
       ? "No review items yet" : "Nothing awaiting review"}</div>`;
     return;
   }
-  host.innerHTML = items.map((r) => {
-    const resolved = r.status !== "open";
-    return `<div class="review-item${resolved ? " resolved" : ""}" data-rid="${esc(r.id)}">` +
-      `<div class="ri-head">` +
-        `<span class="ri-label">${esc(r.label) || "(unlabelled item)"}</span>` +
-        `<span class="ri-meta">${resolved
-          ? `resolved by ${esc(r.resolved_by || "?")} &middot; ${esc(relIso(r.resolved_at))}`
-          : `${esc(r.created_by || "?")} &middot; ${esc(relIso(r.created_at))}`}</span>` +
-        `<button class="cad-btn tiny" type="button" data-rv-resolve="${resolved ? "0" : "1"}" ` +
-          `data-tip="${resolved ? "Reopen this item"
-            : "Mark resolved (also clears the attention mark)"}">${resolved ? "Reopen" : "Resolve"}</button>` +
-      `</div>` +
-      (r.reason ? `<div class="ri-reason">${esc(r.reason)}</div>` : "") +
-      (r.comments || []).map((c) => `<div class="ri-comment">` +
-        `<span class="ric-author">${esc(c.author || "?")}</span>` +
-        `<span class="ric-when">${esc(relIso(c.ts))}</span>` +
-        `<div class="ric-text">${esc(c.text)}</div></div>`).join("") +
-      `<div class="ri-add">` +
-        `<input class="cad-input ri-comment-input" placeholder="Add a comment&hellip;" spellcheck="false" />` +
-        `<button class="cad-btn tiny" type="button" data-rv-comment>Comment</button>` +
-      `</div></div>`;
-  }).join("");
+  host.innerHTML = items.map(reviewItemHtml).join("");
   for (const [rid, val] of Object.entries(drafts)) {
     const inp = host.querySelector(`.review-item[data-rid="${CSS.escape(rid)}"] .ri-comment-input`);
     if (inp) inp.value = val;
@@ -3682,6 +3685,17 @@ function renderReviewList() {
     const inp = host.querySelector(`.review-item[data-rid="${CSS.escape(focusRid)}"] .ri-comment-input`);
     if (inp) { inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length); }
   }
+}
+
+// The queue lives in two places at once — the overlay window and the home
+// pane — so a change in either refreshes both.
+function renderReviewList() {
+  const cb = el("review-show-resolved");
+  if (cb) cb.checked = reviewsState.showResolved;
+  const hcb = el("home-review-resolved");
+  if (hcb) hcb.checked = reviewsState.showResolved;
+  renderReviewsInto(el("review-list"));
+  renderReviewsInto(el("home-reviews"));
 }
 
 // resolving a review also clears the underlying attention mark, wherever
@@ -3720,72 +3734,85 @@ async function clearMark(kind, ref) {
   if (v) { v.attention = ""; saveChecked(); }
 }
 
+// Enter in a comment box posts it (the button holds the actual logic).
+function onReviewKeydown(ev) {
+  if (ev.key === "Enter" && ev.target.classList.contains("ri-comment-input")) {
+    ev.preventDefault();
+    const btn = ev.target.closest(".review-item").querySelector("[data-rv-comment]");
+    if (btn) btn.click();
+  }
+}
+
+// Resolve / reopen / comment — shared by the overlay list and the home pane.
+async function onReviewClick(ev) {
+  const item = ev.target.closest(".review-item");
+  if (!item) return;
+  const rid = item.dataset.rid;
+  const rbtn = ev.target.closest("[data-rv-resolve]");
+  if (rbtn) {
+    const resolved = rbtn.dataset.rvResolve === "1";
+    const res = await fetch(`/api/reviews/${encodeURIComponent(rid)}/resolve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ resolved }),
+    }).catch(() => null);
+    if (!res || !res.ok) {
+      status(res && res.status === 409
+        ? "This item already has an open review"
+        : "Review update failed");
+      return;
+    }
+    let note = resolved ? "Review resolved" : "Review reopened";
+    const r = (reviewsState.items || {})[rid];
+    if (resolved && r) {
+      // the review IS resolved at this point; a failed mark-clear must not
+      // abort the refresh below, only be reported
+      try { await clearMark(r.kind, r.ref); }
+      catch (e) { note = "Review resolved — attention mark not cleared"; }
+    }
+    await loadReviews();
+    renderReviewList();
+    renderHome();
+    status(note);
+    return;
+  }
+  if (ev.target.closest("[data-rv-comment]")) {
+    const input = item.querySelector(".ri-comment-input");
+    const text = (input.value || "").trim();
+    if (!text) return;
+    const res = await fetch(`/api/reviews/${encodeURIComponent(rid)}/comment`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    }).catch(() => null);
+    if (res && res.ok) {
+      input.value = "";   // posted — the draft is a comment now
+      await loadReviews();
+      renderReviewList();
+    } else {
+      status("Comment failed — not saved");
+    }
+  }
+}
+
 function initReviewWin() {
   el("review-close").addEventListener("click", closeReviewWin);
   el("review-overlay").addEventListener("mousedown", (ev) => {
     if (ev.target === el("review-overlay")) closeReviewWin();
   });
-  el("review-show-resolved").addEventListener("change", (ev) => {
+  const onShowResolved = (ev) => {
     reviewsState.showResolved = ev.target.checked;
     renderReviewList();
-  });
-  el("review-list").addEventListener("keydown", (ev) => {
-    if (ev.key === "Enter" && ev.target.classList.contains("ri-comment-input")) {
-      ev.preventDefault();
-      const btn = ev.target.closest(".review-item").querySelector("[data-rv-comment]");
-      if (btn) btn.click();
-    }
-  });
-  el("review-list").addEventListener("click", async (ev) => {
-    const item = ev.target.closest(".review-item");
-    if (!item) return;
-    const rid = item.dataset.rid;
-    const rbtn = ev.target.closest("[data-rv-resolve]");
-    if (rbtn) {
-      const resolved = rbtn.dataset.rvResolve === "1";
-      const res = await fetch(`/api/reviews/${encodeURIComponent(rid)}/resolve`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ resolved }),
-      }).catch(() => null);
-      if (!res || !res.ok) {
-        status(res && res.status === 409
-          ? "This item already has an open review"
-          : "Review update failed");
-        return;
-      }
-      let note = resolved ? "Review resolved" : "Review reopened";
-      const r = (reviewsState.items || {})[rid];
-      if (resolved && r) {
-        // the review IS resolved at this point; a failed mark-clear must not
-        // abort the refresh below, only be reported
-        try { await clearMark(r.kind, r.ref); }
-        catch (e) { note = "Review resolved — attention mark not cleared"; }
-      }
-      await loadReviews();
-      renderReviewList();
-      renderHome();
-      status(note);
-      return;
-    }
-    if (ev.target.closest("[data-rv-comment]")) {
-      const input = item.querySelector(".ri-comment-input");
-      const text = (input.value || "").trim();
-      if (!text) return;
-      const res = await fetch(`/api/reviews/${encodeURIComponent(rid)}/comment`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
-      }).catch(() => null);
-      if (res && res.ok) {
-        input.value = "";   // posted — the draft is a comment now
-        await loadReviews();
-        renderReviewList();
-      } else {
-        status("Comment failed — not saved");
-      }
-    }
-  });
+  };
+  el("review-show-resolved").addEventListener("change", onShowResolved);
+  const hcb = el("home-review-resolved");
+  if (hcb) hcb.addEventListener("change", onShowResolved);
+  // the queue is interactive in both places, so bind both hosts
+  for (const host of [el("review-list"), el("home-reviews")]) {
+    if (!host) continue;
+    host.addEventListener("keydown", onReviewKeydown);
+    host.addEventListener("click", onReviewClick);
+  }
 }
 
 async function setRowAttention(id, value) {
