@@ -26,6 +26,15 @@ create table if not exists captures (
 );
 create index if not exists captures_status_idx on captures (status, created_at);
 
+-- Who captured it. The phone signs in with the same account as the desktop,
+-- so a capture carries its contributor: the uuid for joins, the name so the
+-- import needs none. ocr/meta are what the phone extracted in the background
+-- (Mistral OCR + DeepSeek/Mistral fields) — the desktop may reuse or redo.
+alter table captures add column if not exists created_by  uuid references auth.users on delete set null;
+alter table captures add column if not exists contributor text not null default '';
+alter table captures add column if not exists ocr         jsonb not null default '{}';
+alter table captures add column if not exists meta        jsonb not null default '{}';
+
 -- one-way mirror of the desktop catalog, so other tools can read it
 create table if not exists books (
   key        text primary key,                  -- "<source>:<idx>" | "manual:<id>"
@@ -33,9 +42,18 @@ create table if not exists books (
   updated_at timestamptz not null default now()
 );
 
--- Neither is public. RLS on with no policy = only service_role reaches them.
 alter table captures enable row level security;
-alter table books    enable row level security;
+alter table books    enable row level security;   -- no policy: service_role only
+
+-- The phone is a signed-in user, not a service_role holder (see the storage
+-- note at the bottom): it may file captures as itself and follow their status.
+-- The desktop's service key still bypasses all of this for ingest.
+drop policy if exists captures_insert_own on captures;
+drop policy if exists captures_select_own on captures;
+create policy captures_insert_own on captures
+  for insert to authenticated with check (created_by = auth.uid());
+create policy captures_select_own on captures
+  for select to authenticated using (created_by = auth.uid());
 
 -- =====================================================================
 -- desktop working stores — two-way sync of the files that left git
@@ -257,6 +275,20 @@ create policy profiles_read_authed on profiles for select to authenticated using
 create policy profiles_write_self on profiles
   for all to authenticated using (id = auth.uid()) with check (id = auth.uid());
 
+-- Bring-your-own API keys (Mistral, DeepSeek), shared across Android and
+-- desktop by the account rather than pasted into each device. A separate
+-- table, NOT a profiles column: profiles are readable by every signed-in
+-- user, and these rows must be readable by exactly one.
+create table if not exists profile_secrets (
+  id         uuid primary key references auth.users on delete cascade,
+  api_keys   jsonb not null default '{}',       -- {"mistral": "...", "deepseek": "..."}
+  updated_at timestamptz not null default now()
+);
+alter table profile_secrets enable row level security;
+drop policy if exists profile_secrets_own on profile_secrets;
+create policy profile_secrets_own on profile_secrets
+  for all to authenticated using (id = auth.uid()) with check (id = auth.uid());
+
 -- Append-only: the desktop's output/activity.jsonl, shared. `actor` is a plain
 -- name until accounts land; actor_id is filled once a session is signed in.
 create table if not exists events (
@@ -291,11 +323,19 @@ create policy events_insert_authed on events
 -- The volumes bucket is world-readable. That is the point: it is a public
 -- library. Nothing else is.
 --
--- KNOWN GAP: `captures` has RLS on with no policy, and its bucket is private, so
--- only service_role can write them. The Android app therefore has to carry the
--- service_role key -- a project-wide superuser credential -- on a device that is
--- easy to lose. Closing this properly needs a scoped credential (an Edge
--- Function the phone calls, or a per-device key), not an anon-insert policy: the
--- anon key is published with the website, so anyone could then spam captures.
--- Until then: treat the phone's key as sensitive, and rotate it if the device is
--- lost. The app no longer allows its preferences into Android backups.
+-- The old KNOWN GAP (the phone carrying the service_role key because captures
+-- were service-only) is closed: the phone signs in as a user, and these
+-- policies let any signed-in account file photos into the private captures
+-- bucket. Reading stays service-only, so a stolen session can spam but not
+-- browse. Uploads are scoped to the bucket, not to a per-user prefix — with a
+-- handful of trusted contributors, one being able to overwrite another's
+-- pending object is accepted; revisit with a path convention if that changes.
+
+drop policy if exists captures_objects_insert_authed on storage.objects;
+drop policy if exists captures_objects_update_authed on storage.objects;
+create policy captures_objects_insert_authed on storage.objects
+  for insert to authenticated with check (bucket_id = 'captures');
+-- x-upsert (a retried upload) is an UPDATE under the hood
+create policy captures_objects_update_authed on storage.objects
+  for update to authenticated
+  using (bucket_id = 'captures') with check (bucket_id = 'captures');
