@@ -1,27 +1,56 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Book Capture</string>
+    <string name="app_wordmark">LIBRARY TOOL</string>
     <string name="settings_title">Capture settings</string>
 
-    <string name="entry_idle">No entry — say “start”</string>
-    <string name="entry_active">Entry open — %1$d photo(s) — say “photo”, “done” or “cancel”</string>
+    <string name="entry_idle">IDLE</string>
+    <string name="entry_active">OPEN (%1$d)</string>
+    <string name="recent_chip">%1$d ▾</string>
+    <string name="recent_chip_empty">— ▾</string>
+    <string name="recent_none">Nothing captured yet</string>
     <string name="uploads_pending">%1$d entr(ies) waiting to upload</string>
-    <string name="not_configured">Supabase is not configured — open settings (⚙)</string>
+    <string name="uploads_stuck">%1$d entr(ies) stuck — %2$s — check settings (⚙)</string>
+    <string name="not_signed_in">Signed out — captures stay on the phone until you sign in (⚙)</string>
     <string name="need_permissions">Camera + microphone permissions are required</string>
     <string name="model_download_failed">Voice model download failed: %1$s (buttons still work)</string>
 
-    <string name="cmd_start">Start</string>
-    <string name="cmd_photo">Photo</string>
-    <string name="cmd_done">Done</string>
-    <string name="cmd_cancel">Cancel</string>
+    <!-- glyph controls; the words live in the content descriptions -->
+    <string name="glyph_start">▶</string>
+    <string name="glyph_photo">●</string>
+    <string name="glyph_done">✓</string>
+    <string name="glyph_cancel">✕</string>
+    <string name="cmd_start">Start entry</string>
+    <string name="cmd_photo">Photograph page</string>
+    <string name="cmd_done">Seal entry</string>
+    <string name="cmd_cancel">Discard entry</string>
     <string name="gear">⚙</string>
 
-    <string name="supabase_url">Supabase project URL</string>
-    <string name="supabase_key">Supabase key (anon or service)</string>
+    <string name="login_sub">book capture · sign in</string>
+    <string name="login_email">Email</string>
+    <string name="login_password">Password</string>
+    <string name="login_sign_in">SIGN IN</string>
+    <string name="login_register">CREATE ACCOUNT</string>
+    <string name="login_missing">email and password, both</string>
+    <string name="login_working">Signing in…</string>
+    <string name="login_failed">sign-in failed</string>
+
+    <string name="set_account">Account</string>
+    <string name="set_display_name">Display name (contributor credit)</string>
+    <string name="set_sign_out">SIGN OUT</string>
     <string name="device_name">Device name (shows in imported entries)</string>
-    <string name="save">Save</string>
-    <string name="test_connection">Test connection</string>
+    <string name="set_api_keys">API keys</string>
+    <string name="set_api_keys_note">Stored in your cloud profile — the desktop app can use the same keys. Mistral does the OCR; DeepSeek (when set) extracts the fields.</string>
+    <string name="set_mistral">Mistral API key</string>
+    <string name="set_deepseek">DeepSeek API key</string>
+    <string name="save">SAVE</string>
+    <string name="test_connection">TEST</string>
     <string name="testing">Testing…</string>
-    <string name="connection_ok">OK — captures table reachable</string>
+    <string name="connection_ok">OK — signed in, captures reachable</string>
     <string name="saved">Saved</string>
+
+    <string name="detail_photos">Pages</string>
+    <string name="detail_ocr">OCR text</string>
+    <string name="detail_discard">DISCARD ENTRY</string>
+    <string name="detail_no_ocr">(no OCR text yet)</string>
 </resources>
