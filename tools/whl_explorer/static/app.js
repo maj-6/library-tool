@@ -38,9 +38,20 @@ const VIEW_STATE_KEYS = new Set([
   "paneWidth", "uploadSplitH", "colWidths",
   "authPromptDismissed", "wizardDone", "checkedCols",
 ]);
+// Credentials: never persisted client-side and never synced. They live only in
+// the server's local, Host-guarded secrets store (/api/secrets); the dialog
+// loads/saves them there. Dropped from BOTH persistence buckets below.
+const SECRET_KEYS = new Set([
+  "aiKey", "mistralKey", "ocrClaudeKey", "ocrAzureKey", "ocrAwsKey",
+  "ocrAwsSecret", "supabaseKey", "supabaseAnonKey", "r2KeyId", "r2Secret",
+  "gsKeyFile",
+]);
 function partitionSettings(s) {
   const prefs = {}, view = {};
-  for (const k of Object.keys(s)) (VIEW_STATE_KEYS.has(k) ? view : prefs)[k] = s[k];
+  for (const k of Object.keys(s)) {
+    if (SECRET_KEYS.has(k)) continue;               // secrets go to the server-only store
+    (VIEW_STATE_KEYS.has(k) ? view : prefs)[k] = s[k];
+  }
   return { prefs, view };
 }
 
@@ -2410,6 +2421,37 @@ function renderSettings() {
       saveSettings();
     };
   }
+  // Credentials: re-wire the secret fields the generic loops above touched so
+  // their values load from and save to the server's local, Host-guarded secrets
+  // store — never localStorage, never the synced client_state.
+  (async () => {
+    const SECRET_FIELDS = [
+      ["set-ai-key", "aiKey"], ["set-mistral-key", "mistralKey"],
+      ["set-ocr-claude-key", "ocrClaudeKey"], ["set-ocr-azure-key", "ocrAzureKey"],
+      ["set-ocr-aws-key", "ocrAwsKey"], ["set-ocr-aws-secret", "ocrAwsSecret"],
+      ["set-sb-key", "supabaseKey"], ["set-sb-anon", "supabaseAnonKey"],
+      ["set-r2-key", "r2KeyId"], ["set-r2-secret", "r2Secret"],
+      ["set-gs-keyfile", "gsKeyFile"],
+    ];
+    let secrets = {};
+    try { secrets = await (await fetch("/api/secrets")).json(); } catch (e) { /* keep blanks */ }
+    for (const [id, k] of SECRET_FIELDS) {
+      const n = el(id);
+      if (!n) continue;
+      const v = secrets[k] || "";
+      n.value = v;
+      state.settings[k] = v;                 // in-memory only (client-side uses, e.g. master sync)
+      n.onchange = () => {
+        const val = n.value.trim();
+        state.settings[k] = val;
+        fetch("/api/secrets", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ updates: { [k]: val } }),
+        }).catch(() => {});
+      };
+    }
+  })();
   // phone-capture sync interval + remote-cleanup toggle + connection test
   const cm = el("set-cloud-minutes");
   cm.value = state.settings.cloudSyncMinutes || 0;

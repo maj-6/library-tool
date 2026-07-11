@@ -18,6 +18,8 @@ output/backups/
 output/activity.jsonl
 # the signed-in Supabase session (user tokens) + the activity push cursor
 output/auth_session.json
+# API keys / secrets — local-only, never synced (kept out of client_state)
+output/secrets.json
 # device-local record of what the cloud already has (working-store sync shadow)
 output/cloud_shadow.json
 
