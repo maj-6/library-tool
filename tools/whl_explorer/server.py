@@ -3680,11 +3680,61 @@ def _capture_note(cap: dict, errors: list[str]) -> str:
     if cap.get("created_at"):
         bits.append(str(cap["created_at"])[:19])
     note = " ".join(bits)
+    if cap.get("contributor"):
+        note += f"\nContributor: {str(cap['contributor'])[:80]}"
     if cap.get("note"):
         note += "\n" + str(cap["note"])
     if errors:
         note += "\n" + "; ".join(errors)
     return note
+
+
+def _phone_result(cap: dict, raw_photos: list[bytes], photo_paths: list) -> dict | None:
+    """Reuse the OCR + fields the phone (BookCapture 2.0+) extracted in the
+    background, so import doesn't pay for a second OCR pass. Returns a
+    process_capture-shaped dict, or None when the phone sent nothing usable
+    (older app, or no API key on the phone) — the caller falls back to the full
+    desktop pipeline.
+
+    The images are still perspective-corrected + standardized here: that step
+    needs OpenCV, which the phone deliberately does not ship, so the stored copy
+    is the desktop's better one — only the text/fields are the phone's.
+    """
+    ocr = cap.get("ocr")
+    meta = cap.get("meta")
+    if isinstance(ocr, str):
+        try:
+            ocr = json.loads(ocr)
+        except json.JSONDecodeError:
+            ocr = None
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except json.JSONDecodeError:
+            meta = None
+    ocr = ocr if isinstance(ocr, dict) else {}
+    meta = meta if isinstance(meta, dict) else {}
+    has_fields = any(str(meta.get(f) or "").strip() for f in capture.FIELDS)
+    if not (ocr or has_fields):
+        return None                       # phone had no keys / extracted nothing
+
+    photos, errors = [], []
+    for i, raw in enumerate(raw_photos, 1):
+        try:
+            photos.append(capture.process_photo(raw))
+        except Exception as exc:          # noqa: BLE001 - never lose a photo to a bad warp
+            photos.append(raw)
+            errors.append(f"photo {i}: processing failed ({type(exc).__name__})")
+    # OCR text in page order, keyed by the object path's basename
+    parts = []
+    for i, p in enumerate(photo_paths, 1):
+        text = str(ocr.get(str(p).rsplit("/", 1)[-1]) or "").strip()
+        if text:
+            parts.append(f"--- Photo {i} ---\n{text}")
+    fields = {f: str(meta.get(f) or "").strip() for f in capture.FIELDS}
+    extra = meta.get("extra") if isinstance(meta.get("extra"), dict) else {}
+    return {"photos": photos, "ocr_text": "\n\n".join(parts),
+            "fields": fields, "extra": extra, "errors": errors}
 
 
 def _import_capture(cfg: dict, cap: dict, mistral_key: str,
@@ -3717,7 +3767,11 @@ def _import_capture(cfg: dict, cap: dict, mistral_key: str,
             # the photos are gone — this row can never import; stop retrying it
             sbase.mark_capture(cfg, cap["id"], "error")
         raise
-    result = capture.process_capture(raw_photos, mistral_key)
+    # the phone (BookCapture 2.0+) OCRs + extracts in the background, so prefer
+    # its results and skip a second OCR pass; fall back to the full desktop
+    # pipeline when the phone sent nothing (older app, or no key on the phone)
+    result = _phone_result(cap, raw_photos, photo_paths) \
+        or capture.process_capture(raw_photos, mistral_key)
 
     cdir = CAPTURES_DIR / cap_id
     cdir.mkdir(parents=True, exist_ok=True)
@@ -3750,9 +3804,10 @@ def _import_capture(cfg: dict, cap: dict, mistral_key: str,
         lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
 
     sbase.mark_capture(cfg, cap["id"], "imported")
-    # a phone capture is attributed to the device, not to whoever ran the sync
-    activity("captured", "book", actor=str(cap.get("device") or "phone")[:60],
-             detail=entry.get("title", ""))
+    # a phone capture is attributed to whoever photographed it (the signed-in
+    # contributor), not to whoever ran the sync; device name is the fallback
+    actor = str(cap.get("contributor") or cap.get("device") or "phone")[:60]
+    activity("captured", "book", actor=actor, detail=entry.get("title", ""))
     # keep the cloud copies when OCR/extraction had trouble — the originals
     # are local too, but leaving the remote set makes recovery foolproof
     if delete_remote and not result["errors"]:
