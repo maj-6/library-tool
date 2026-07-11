@@ -824,6 +824,39 @@ function saveSettings() {
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings)); } catch (e) {}
   pushClientState("settings");
 }
+
+// --- UI scale (whole-interface zoom) -----------------------------------------
+// A Settings > Appearance control and Ctrl/Cmd +/- (reset with Ctrl/Cmd 0).
+// Applied as a CSS zoom on the root, so it scales the custom chrome too and
+// works both in Electron and the dev browser. The native menu is removed
+// (main.js), so there is no built-in zoom to fight.
+const UI_SCALE_MIN = 0.7, UI_SCALE_MAX = 2.0, UI_SCALE_STEP = 0.1;
+const UI_SCALES = [0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0];
+
+function applyUiScale() {
+  const s = state.settings.uiScale || 1;
+  document.documentElement.style.zoom = String(s);
+  const sel = el("ui-scale-select");
+  if (sel) sel.value = String(s);
+}
+function setUiScale(v) {
+  state.settings.uiScale =
+    Math.round(Math.min(UI_SCALE_MAX, Math.max(UI_SCALE_MIN, v)) * 100) / 100;
+  applyUiScale();
+  saveSettings();
+}
+function nudgeUiScale(d) { setUiScale((state.settings.uiScale || 1) + d); }
+
+function onUiScaleKey(ev) {
+  if (!(ev.ctrlKey || ev.metaKey) || ev.altKey) return;
+  const k = ev.key;
+  if (k === "=" || k === "+") nudgeUiScale(UI_SCALE_STEP);
+  else if (k === "-" || k === "_") nudgeUiScale(-UI_SCALE_STEP);
+  else if (k === "0") setUiScale(1);
+  else return;
+  ev.preventDefault();                       // stop the browser's own zoom
+  status("UI SCALE :: " + Math.round((state.settings.uiScale || 1) * 100) + "%");
+}
 function loadSettings() {
   try {
     const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
@@ -866,6 +899,10 @@ function normalizeSettings() {
   }
   state.settings.maxRows =
     Math.max(50, Math.min(5000, parseInt(state.settings.maxRows, 10) || 400));
+  const _uisc = Number(state.settings.uiScale);
+  state.settings.uiScale =
+    (Number.isFinite(_uisc) && _uisc >= UI_SCALE_MIN && _uisc <= UI_SCALE_MAX)
+      ? Math.round(_uisc * 100) / 100 : 1;
   let _srm = parseInt(state.settings.scanRecentMin, 10);
   if (!Number.isFinite(_srm)) _srm = 30;         // 0 = no recency filter
   state.settings.scanRecentMin = Math.max(0, Math.min(1440, _srm));
@@ -2244,6 +2281,13 @@ function renderSettings() {
   }
   themeSel.value = state.settings.theme;   // applyTheme() has already normalized it
   themeSel.onchange = () => setTheme(themeSel.value);
+  const scaleSel = el("ui-scale-select");
+  if (scaleSel) {
+    scaleSel.innerHTML = UI_SCALES.map((v) =>
+      `<option value="${v}">${Math.round(v * 100)}%</option>`).join("");
+    scaleSel.value = String(state.settings.uiScale || 1);
+    scaleSel.onchange = () => setUiScale(Number(scaleSel.value));
+  }
   fillFontSelect("font-ui-select", FONT_CHOICES, "fontUi", applyFont);
   fillFontSelect("font-select", FONT_CHOICES, "font", applyFont);
   fillFontSelect("font-mono2-select", FONT_CHOICES, "fontMono2", applyFont);
@@ -11630,6 +11674,7 @@ function init() {
   boot("web view", initWebView);
   boot("settings", loadSettings);
   boot("theme", applyTheme);
+  boot("ui scale", applyUiScale);
   boot("font", applyFont);
   boot("checked books", loadChecked);
   boot("icons", injectIcons);
@@ -12079,6 +12124,7 @@ function init() {
   document.addEventListener("keydown", onAttentionKey);
   document.addEventListener("keydown", onSearchKey);
   document.addEventListener("keydown", onRowDeleteKey);
+  document.addEventListener("keydown", onUiScaleKey);
   boot("attention popover", initAttnPop);
   boot("review queue", initReviewWin);
   boot("categories", initCategories);
