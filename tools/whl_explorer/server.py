@@ -21,6 +21,7 @@ then open http://127.0.0.1:5001
 from __future__ import annotations
 
 import collections
+import contextlib
 import json
 import logging
 import os
@@ -1719,6 +1720,56 @@ def _pageimg_pdf(raw: str) -> Path:
     return p
 
 
+# A tiny LRU of open PyMuPDF handles, keyed by (path, mtime). fitz.open reparses
+# the whole xref/object table every call, so the interactive reader — which asks
+# for one page at a time — reopened a 400 MB scan once per page; one shared handle
+# makes it a single parse. fitz Documents are not thread-safe, so _doc_lock is
+# held across the render: fine here — rasterization is GIL-bound, only a handful
+# of pages render before the on-disk cache serves them, and the background OCR
+# job keeps its own handle so it never waits on this.
+_doc_cache = collections.OrderedDict()
+_doc_lock = threading.Lock()
+_DOC_CACHE_MAX = 4
+
+
+@contextlib.contextmanager
+def _pdf_doc(path: Path):
+    """Yield a shared, cached fitz.Document for `path`, opened at most once per
+    (path, mtime). The lock is held for the whole `with` body, so keep it short:
+    read one page and get out."""
+    import fitz
+    key = (str(path), path.stat().st_mtime)
+    with _doc_lock:
+        doc = _doc_cache.get(key)
+        if doc is None:
+            # a re-saved file (new mtime) must not keep serving the stale handle
+            for k in [k for k in _doc_cache if k[0] == key[0]]:
+                try:
+                    _doc_cache.pop(k).close()
+                except Exception:
+                    pass
+            doc = fitz.open(key[0])
+            _doc_cache[key] = doc
+            while len(_doc_cache) > _DOC_CACHE_MAX:
+                _, evicted = _doc_cache.popitem(last=False)
+                try:
+                    evicted.close()
+                except Exception:
+                    pass
+        else:
+            _doc_cache.move_to_end(key)
+        yield doc
+
+
+def _cached_page_file(path: Path, mimetype: str):
+    """Serve a rendered page image. Its bytes are immutable for this URL — the
+    cache key folds in path+mtime+page+width — so let the browser hold it for a
+    year and skip the per-page 304 revalidation on every scroll-back."""
+    resp = send_file(path, mimetype=mimetype, conditional=True)
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return resp
+
+
 @app.route("/api/pdf/words")
 def api_pdf_words():
     """Word boxes of one page of a local PDF (?path=&page=N).
@@ -1751,8 +1802,7 @@ def api_pdf_words():
     except ImportError:
         return jsonify({"ok": False, "error": "PyMuPDF is not installed"}), 501
     from statistics import median
-    doc = fitz.open(str(p))
-    try:
+    with _pdf_doc(p) as doc:
         if page > doc.page_count:
             abort(404)
         pg = doc[page - 1]
@@ -1793,8 +1843,6 @@ def api_pdf_words():
                 "spans": [{"t": r[3], "x": round(r[1] / pw, 5),
                            "w": round((r[2] - r[1]) / pw, 5)} for r in c],
             })
-    finally:
-        doc.close()
     # No text layer? Fall back to this build's stored OCR word boxes, so an
     # image-only scan that has been OCR'd still gets a placed facsimile. The
     # build id is validated (it indexes an entry folder) before it is used.
@@ -1944,11 +1992,10 @@ def api_pdf_pageimg():
         f"{p}|{p.stat().st_mtime}|{page}|{w}".encode("utf-8")).hexdigest()[:16]
     old = cache / f"{key}.png"
     if old.is_file():
-        return send_file(old, mimetype="image/png", conditional=True)
+        return _cached_page_file(old, "image/png")
     out = cache / f"{key}.jpg"
     if not out.is_file():
-        doc = fitz.open(str(p))
-        try:
+        with _pdf_doc(p) as doc:
             if page > doc.page_count:
                 abort(404)
             pg = doc[page - 1]
@@ -1962,11 +2009,9 @@ def api_pdf_pageimg():
                 tmp = old.with_suffix(f".{page}.tmp.png")
                 pix.save(str(tmp))
                 tmp.replace(old)
-                return send_file(old, mimetype="image/png", conditional=True)
+                return _cached_page_file(old, "image/png")
             tmp.replace(out)
-        finally:
-            doc.close()
-    return send_file(out, mimetype="image/jpeg", conditional=True)
+    return _cached_page_file(out, "image/jpeg")
 
 
 # --- OCR processing jobs -----------------------------------------------------------
