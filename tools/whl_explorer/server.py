@@ -1521,6 +1521,9 @@ def _pdf_extract_text(p: Path, max_pages: int | None = None) -> tuple[int, int, 
     return total, shown, "\n\n".join(parts), with_text
 
 
+_preview_pdf_lock = threading.Lock()
+
+
 def _preview_pdf(src: Path, pages: int) -> Path:
     """A compressed, truncated preview derivative, cached by mtime."""
     import hashlib
@@ -1529,22 +1532,30 @@ def _preview_pdf(src: Path, pages: int) -> Path:
     key = hashlib.sha1(
         f"{src}|{src.stat().st_mtime}|{pages}".encode("utf-8")).hexdigest()[:16]
     out = cache / f"{key}.pdf"
-    if out.is_file():
-        return out
-    from pypdf import PdfReader, PdfWriter
-    reader = PdfReader(str(src))
-    writer = PdfWriter()
-    for i in range(min(len(reader.pages), pages)):
-        page = reader.pages[i]
-        try:
-            page.compress_content_streams()
-        except Exception:
-            pass
-        writer.add_page(page)
-    tmp = out.with_suffix(".tmp")
-    with open(tmp, "wb") as fh:
-        writer.write(fh)
-    tmp.replace(out)
+    # Serialize concurrent generation of the same preview, exactly as
+    # _remote_pdf_cache does for its fetch: the viewer fires several requests
+    # for one source at once (iframe GET + size probe + OCR fetch). Without the
+    # lock, two of them both find no cached file and both run the write; the
+    # loser's atomic replace then targets a file the winner already created and
+    # the viewer holds open, which Windows surfaces as PermissionError
+    # (Errno 13).
+    with _preview_pdf_lock:
+        if out.is_file():
+            return out
+        from pypdf import PdfReader, PdfWriter
+        reader = PdfReader(str(src))
+        writer = PdfWriter()
+        for i in range(min(len(reader.pages), pages)):
+            page = reader.pages[i]
+            try:
+                page.compress_content_streams()
+            except Exception:
+                pass
+            writer.add_page(page)
+        tmp = out.with_suffix(".tmp")
+        with open(tmp, "wb") as fh:
+            writer.write(fh)
+        tmp.replace(out)
     return out
 
 
