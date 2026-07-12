@@ -177,7 +177,6 @@ const state = {
     confirmDiscard: true,       // ask before discarding unsaved page edits
     verboseLogging: false,      // raise the server log level to DEBUG
     autoUpdate: true,           // desktop: check for updates on launch
-    updateChannel: "stable",    // desktop: update channel (stable | beta)
   },
   editTarget: null,             // record open in the EDIT tab
   sort: { checked: null, whl: null },  // {key, dir} per top table
@@ -2630,11 +2629,6 @@ function renderSettings() {
   if (au) {
     au.checked = state.settings.autoUpdate !== false;
     au.onchange = () => { state.settings.autoUpdate = au.checked; saveSettings(); };
-  }
-  const uc = el("set-update-channel");
-  if (uc) {
-    uc.value = state.settings.updateChannel || "stable";
-    uc.onchange = () => { state.settings.updateChannel = uc.value; saveSettings(); };
   }
 }
 

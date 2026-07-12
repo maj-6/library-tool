@@ -196,17 +196,14 @@ function readActiveTheme() {
 }
 
 // Update prefs (Settings > Updates), read off client_state the same way the
-// theme is — before the sidecar is up. Defaults: auto-update on, stable channel.
+// theme is — before the sidecar is up. Defaults to auto-update on.
 function readUpdatePrefs() {
   try {
     const p = path.join(app.getPath("userData"), "output", "client_state.json");
     const s = JSON.parse(fs.readFileSync(p, "utf8"))?.settings || {};
-    return {
-      auto: s.autoUpdate !== false,
-      channel: s.updateChannel === "beta" ? "beta" : "stable",
-    };
+    return { auto: s.autoUpdate !== false };
   } catch (e) {
-    return { auto: true, channel: "stable" };
+    return { auto: true };
   }
 }
 
@@ -275,10 +272,9 @@ function runUpdateGate() {
       return resolve("launch");            // packaged without the dep: skip
     }
 
-    // Settings > Updates: honour the user's auto-update + channel choice
+    // Settings > Updates: honour the user's auto-update choice.
     const prefs = readUpdatePrefs();
     if (!prefs.auto) return resolve("launch");    // user disabled auto-update
-    try { updater.channel = prefs.channel; } catch (e) { /* older electron-updater */ }
 
     let settled = false;
     let checkTimer = null;

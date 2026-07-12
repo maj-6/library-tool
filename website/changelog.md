@@ -6,6 +6,14 @@ items fold under "Other changes". The Downloads page shows only the highlights
 of the most recent releases. The desktop app reads this same file
 (Help → View changelog).
 
+## 0.6.0 — 2026-07-11
+- PDF reader: long books now expose every page, with faster near-viewport loading, background page caching, thumbnail placeholders, keyboard navigation, and a page-jump control.
+- Settings and menus follow desktop conventions; preferences are organized by task, with new editing, AI, OCR, update, and logging controls.
+- Credentials now stay in a local-only secrets store, while device-specific layout state no longer syncs between machines.
+<!--more-->
+- Release notes are grouped by major version, with lesser changes folded away; the Downloads page has clearer platform rows and recent highlights.
+- Local API requests now reject untrusted Host headers globally, closing the remaining DNS-rebinding path to client state, local PDFs, and the in-app fetch proxy.
+
 ## 0.5.0 — 2026-07-11
 - Databases: drop Open Library or copyright files into a `~/.library-tool` folder in the home directory — used offline, with no URL and no download. A source URL is only needed to *fetch* a database not already present.
 - Book Capture (Android 0.3.0): opens on a Home page of recent scans — page thumbnails, extracted title / author / year, and upload status — instead of dropping straight into the camera. "New scan" leads into capture.
