@@ -2579,14 +2579,18 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 .pg-chip {
   font-family: var(--ui);
   font-size: 10px;
-  font-weight: bold;
-  padding: 1px 5px;
+  letter-spacing: 0.5px;
+  padding: 0 4px;
+  border: 1px solid var(--face-sh2);
   border-radius: var(--radius);
-  color: #fff;
+  background: var(--face-hi);
+  color: var(--ink-light);
 }
-.pg-chip.title { background: #9b59b6; }
-.pg-chip.staged { background: var(--amber); color: #2b2000; }
-.pg-chip.svc { background: var(--cyan); color: #06282d; }
+/* state as a thin coloured edge + text — the row's own image outline already
+   carries the state, so no loud filled pill (matches .ocr-chip's CAD idiom) */
+.pg-chip.title { border-color: #9b59b6; color: #9b59b6; }
+.pg-chip.staged { border-color: var(--amber); color: var(--amber); }
+.pg-chip.svc { border-color: var(--cyan); color: var(--cyan); }
 .ocr-pgimg { cursor: pointer; }
 .ocr-pgrow.pg-title .ocr-pgimg img { outline: 2px solid #9b59b6; outline-offset: -2px; }
 .ocr-pgrow.pg-staged .ocr-pgimg img { outline: 2px dashed var(--amber); outline-offset: -2px; }
