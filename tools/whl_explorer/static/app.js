@@ -1701,7 +1701,7 @@ function initTabs() {
       el(tab.dataset.tab).classList.add("active");
       setHeader(tab.dataset.tab);
       if (tab.dataset.tab === "home") loadActivity();   // refresh on every visit
-      if (tab.dataset.tab === "checked") renderChecked();
+      if (tab.dataset.tab === "checked") { renderChecked(); loadOlStatus(); }
       if (tab.dataset.tab === "upload") renderUpload();
       if (tab.dataset.tab === "infotab") renderConsole();
       // refresh the folder list on every visit — builds/folders may have
@@ -2679,7 +2679,13 @@ function renderLanSettings() {
 }
 
 function openSettings() { renderSettings(); el("settings-overlay").hidden = false; }
-function closeSettings() { el("settings-overlay").hidden = true; }
+function closeSettings() {
+  el("settings-overlay").hidden = true;
+  // The Databases panel lives in Settings; a file dropped into ~/.library-tool
+  // (or a finished download) leaves the OL-index badge stale, and closing a
+  // modal fires no window-focus event to refresh it — so refresh on the way out.
+  loadOlStatus();
+}
 
 function openAbout() { const o = el("about-overlay"); if (o) o.hidden = false; }
 function closeAbout() { const o = el("about-overlay"); if (o) o.hidden = true; }
