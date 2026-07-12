@@ -105,7 +105,7 @@ try {
 
   if (preBox) {
     preBox.innerHTML = pre.length
-      ? `<div class="dl-list">${pre.map((r) => card(r, { channel: true })).join("")}</div>`
+      ? `<div class="dl-list is-compact">${pre.map((r) => card(r, { channel: true })).join("")}</div>`
       : `<div class="note">No testing build is published right now.</div>`;
   }
 } catch (e) {

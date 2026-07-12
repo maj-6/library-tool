@@ -270,6 +270,29 @@ ol.volumes { list-style: none; margin: 0; padding: 0; }
 .dl-btn[aria-disabled="true"] { border-color: var(--rule-mid); color: var(--ink-faint); pointer-events: none; }
 .dl-arrow { width: 13px; height: 13px; flex: none; }
 
+/* Testing builds are supporting links, not headline download cards. */
+.dl-list.is-compact { border-top-width: 1px; }
+.dl-list.is-compact .dl-row {
+  gap: 0 10px;
+  padding: 8px 4px;
+}
+.dl-list.is-compact .dl-ico { width: 17px; height: 17px; }
+.dl-list.is-compact .dl-name { font-size: 14px; }
+.dl-list.is-compact .dl-tag { margin-left: 6px; }
+.dl-list.is-compact .dl-meta {
+  display: inline;
+  margin: 0 0 0 8px;
+  font-size: 11px;
+}
+.dl-list.is-compact .dl-btn {
+  gap: 5px;
+  padding: 3px 0;
+  border: 0;
+  font-size: 12px;
+}
+.dl-list.is-compact .dl-btn:hover { background: transparent; color: var(--accent-ink); }
+.dl-list.is-compact .dl-arrow { width: 11px; height: 11px; }
+
 /* --- changelog / release notes --- */
 .changelog { margin: 0; }
 .cl-rel { padding: 16px 0; border-top: 1px solid var(--rule-soft); }
