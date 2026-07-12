@@ -215,21 +215,41 @@ export function isSignificantVersion(version) {
 
 /** Terse markdown -> versions. "## <version> — <date>" starts an entry; "- "
  *  lines are its bullets; a title or any preamble before the first entry is
- *  ignored. Pure text out; the caller escapes before it touches the DOM. */
+ *  ignored. A `<!--more-->` fold splits an entry's bullets into `items` (the
+ *  highlights, authored biggest-first) and `more` (the lesser fixes below the
+ *  fold). Pure text out; the caller escapes before it touches the DOM. */
 export function parseChangelog(md) {
   const out = [];
   let cur = null;
+  let below = false;                          // past this entry's <!--more--> fold?
   for (const raw of String(md || "").split(/\r?\n/)) {
     const line = raw.trim();
     let m;
     if ((m = /^##\s+(.+?)(?:\s+[—–·-]\s+(.+))?$/.exec(line))) {   // em/en/middot/hyphen date separator
-      cur = { version: m[1].trim(), date: (m[2] || "").trim(), items: [] };
+      cur = { version: m[1].trim(), date: (m[2] || "").trim(), items: [], more: [] };
       out.push(cur);
+      below = false;
+    } else if (cur && /^<!--\s*more\s*-->$/i.test(line)) {
+      below = true;
     } else if (cur && (m = /^[-*]\s+(.+)$/.exec(line))) {
-      cur.items.push(m[1].trim());
+      (below ? cur.more : cur.items).push(m[1].trim());
     }
   }
   return out;
+}
+
+/** Group a newest-first version list by major version, order preserved:
+ *  [{major:"3", versions:[…]}, …]. The Release notes page renders each major as
+ *  a heading with its versions as subheadings. */
+export function groupByMajor(versions) {
+  const groups = [];
+  const at = new Map();
+  for (const v of versions || []) {
+    const major = String(v.version || "").replace(/^v/i, "").split(".")[0] || "?";
+    if (!at.has(major)) { at.set(major, groups.length); groups.push({ major, versions: [] }); }
+    groups[at.get(major)].versions.push(v);
+  }
+  return groups;
 }
 
 function orderClause(sort) {
