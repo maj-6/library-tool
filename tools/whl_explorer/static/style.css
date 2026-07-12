@@ -2423,7 +2423,6 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   margin-bottom: 10px;
 }
 #theme-select, #font-select, #font-ui-select { max-width: 280px; }
-#set-max-rows { max-width: 120px; }
 .settings-cols {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -2525,7 +2524,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 #ocr-doc-wrap { flex: 1 1 55%; min-height: 60px; overflow-y: auto; }
 #ocr-docs { list-style: none; margin: 0; padding: 0; font-family: var(--mono); }
 .ocr-doc {
-  padding: 5px 8px;
+  padding: 3px 8px;
   border-bottom: 1px solid var(--canvas-line);
   cursor: pointer;
   color: var(--ink-light);
@@ -2591,6 +2590,18 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 .pg-chip.title { border-color: #9b59b6; color: #9b59b6; }
 .pg-chip.staged { border-color: var(--amber); color: var(--amber); }
 .pg-chip.svc { border-color: var(--cyan); color: var(--cyan); }
+/* the title-page toggle button (a .pg-chip): faded until the row is hovered or
+   it's already marked, so it doesn't clutter every thumbnail; takes the same
+   purple edge as a .title chip when on */
+.pg-title-toggle {
+  cursor: pointer;
+  opacity: 0.3;
+  transition: opacity 0.1s;
+}
+.pg-title-toggle.on { border-color: #9b59b6; color: #9b59b6; }
+.ocr-pgrow:hover .pg-title-toggle, .pg-title-toggle.on, .pg-title-toggle:focus-visible {
+  opacity: 1;
+}
 .ocr-pgimg { cursor: pointer; }
 .ocr-pgrow.pg-title .ocr-pgimg img { outline: 2px solid #9b59b6; outline-offset: -2px; }
 .ocr-pgrow.pg-staged .ocr-pgimg img { outline: 2px dashed var(--amber); outline-offset: -2px; }
@@ -2716,6 +2727,38 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 .ocr-chip.active.verified { color: var(--green); border-color: var(--green);
   box-shadow: inset 0 0 0 1px var(--green); }
 
+/* ============================ Resources tab ============================ */
+.res-section { margin-bottom: 18px; }
+.res-section > .tool-label { display: block; margin-bottom: 6px; }
+.res-empty { font-family: var(--ui); font-size: 12px; color: var(--face-sh2); margin: 0; }
+.res-current { min-height: 20px; }
+.res-current-img {
+  display: block;
+  width: 140px;
+  height: auto;
+  border: 1px solid var(--face-sh2);
+  background: #fff;
+}
+.res-gallery { display: flex; flex-wrap: wrap; gap: 10px; }
+.res-card {
+  width: 110px;
+  border: 1px solid var(--face-sh2);
+  background: var(--face-hi);
+  padding: 5px;
+  text-align: center;
+}
+.res-card img {
+  display: block;
+  width: 100%;
+  height: 130px;
+  object-fit: cover;
+  border: 1px solid var(--canvas-line);
+  background: #fff;
+  margin-bottom: 4px;
+}
+.res-card-label { font-family: var(--ui); font-size: 10px; color: var(--face-sh2); margin-bottom: 4px; }
+.res-card .res-use { width: 100%; font-size: 10px; }
+
 /* Table views hide their scrollbars (content still scrolls). Last so it
    wins over per-theme scrollbar chrome. */
 .drafting { scrollbar-width: none; }
@@ -2768,7 +2811,18 @@ body[data-theme] .drafting::-webkit-scrollbar {
 .tree-ico { display: inline-flex; opacity: 0.7; }
 .tree-ico svg { width: 12px; height: 12px; }
 .tree-count { font-size: 10px; opacity: 0.6; }
-.ocr-doc.tree-doc { padding-left: 28px; }
+.ocr-doc.tree-doc { padding-left: 22px; }
+
+/* extracted-figure rows, alongside the compiled-text rows above */
+.ocr-img-row { display: flex; align-items: center; gap: 6px; }
+.ocr-img-thumb {
+  width: 22px;
+  height: 28px;
+  object-fit: cover;
+  border: 1px solid var(--face-sh2);
+  background: #fff;
+  flex: none;
+}
 
 /* secondary PDF source chips (editor Source tab) */
 .src2-chip { display: inline-flex; align-items: center; gap: 4px; }

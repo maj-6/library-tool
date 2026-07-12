@@ -238,3 +238,46 @@ def test_apply_page_deletion_no_titles_no_ocr(data_root):
     assert "title_pages" not in builds[bid]
     # save_json is skipped entirely when there are no title pages
     assert server.BUILDS_PATH.read_text(encoding="utf-8") == sentinel
+
+
+# --- thumbnail_source remap on page deletion (mirrors title_pages) ----------
+
+def test_apply_page_deletion_shifts_thumbnail_source_page_reference(data_root):
+    """thumbnail_source="page:3" shifts to "page:2" when page 2 is deleted
+    from a 3-page primary PDF, the same arithmetic as title_pages."""
+    bid = "testdel005"
+    pdf = data_root / "downloads" / "ia" / "testbook5" / "book.pdf"
+    _make_pdf(pdf, 3)
+    builds = {bid: {"title": "Thumb", "thumbnail_source": "page:3"}}
+
+    result = server._apply_page_deletion(bid, builds, pdf, [2])
+
+    assert result["build"]["thumbnail_source"] == "page:2"
+    on_disk = json.loads(server.BUILDS_PATH.read_text(encoding="utf-8"))
+    assert on_disk[bid]["thumbnail_source"] == "page:2"
+
+
+def test_apply_page_deletion_clears_thumbnail_source_of_deleted_page(data_root):
+    """thumbnail_source pointing at the page being deleted clears to "" --
+    the publish pipeline falls back to the cover-candidate heuristic."""
+    bid = "testdel006"
+    pdf = data_root / "downloads" / "ia" / "testbook6" / "book.pdf"
+    _make_pdf(pdf, 3)
+    builds = {bid: {"title": "Thumb", "thumbnail_source": "page:2"}}
+
+    result = server._apply_page_deletion(bid, builds, pdf, [2])
+
+    assert result["build"]["thumbnail_source"] == ""
+
+
+def test_apply_page_deletion_leaves_image_thumbnail_source_untouched(data_root):
+    """An "image:<name>" source references an OCR-extracted figure, not a
+    PDF page number -- page deletion must never rewrite or clear it."""
+    bid = "testdel007"
+    pdf = data_root / "downloads" / "ia" / "testbook7" / "book.pdf"
+    _make_pdf(pdf, 3)
+    builds = {bid: {"title": "Thumb", "thumbnail_source": "image:p2-fig1.jpeg"}}
+
+    result = server._apply_page_deletion(bid, builds, pdf, [2])
+
+    assert result["build"]["thumbnail_source"] == "image:p2-fig1.jpeg"

@@ -621,6 +621,7 @@
           <div class="pane-tabs" id="build-tabs">
             <button class="pane-tab active" data-btab="btab-entry" type="button">Entry</button>
             <button class="pane-tab" data-btab="btab-source" type="button">Source (PDF)</button>
+            <button class="pane-tab" data-btab="btab-resources" type="button">Resources</button>
           </div>
 
           <div id="btab-entry" class="pane-sub active">
@@ -728,6 +729,25 @@
               <input id="b-ocr-file" type="file" accept=".txt,.text,.md" hidden />
             </div>
             <div id="b-pdf-viewer"></div>
+          </div>
+
+          <div id="btab-resources" class="pane-sub">
+            <div class="res-section">
+              <label class="tool-label">Current thumbnail</label>
+              <div id="res-current" class="res-current"></div>
+            </div>
+            <div class="res-section">
+              <label class="tool-label">Title pages</label>
+              <div id="res-titlepages" class="res-gallery"></div>
+            </div>
+            <div class="res-section">
+              <label class="tool-label">Cover candidate</label>
+              <div id="res-cover" class="res-gallery"></div>
+            </div>
+            <div class="res-section">
+              <label class="tool-label">Extracted images (Mistral OCR)</label>
+              <div id="res-images" class="res-gallery"></div>
+            </div>
           </div>
         </div>
       </div>
@@ -1230,10 +1250,6 @@
           </div>
           <div id="sec-tables" class="settings-sec">
             <div class="settings-head">Table view</div>
-            <div class="settings-rows">
-              <label class="tool-label" for="set-max-rows">Max displayed rows</label>
-              <input id="set-max-rows" class="cad-input" type="number" min="50" max="5000" step="50" />
-            </div>
             <div class="settings-subhead">Checked books table :: visible columns</div>
             <div id="cols-checked" class="settings-cols"></div>
             <div class="mf-actions">

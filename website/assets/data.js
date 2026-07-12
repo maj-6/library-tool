@@ -7,7 +7,8 @@
 //
 // The anon key is meant to be public. Row-level security is what protects the
 // project: anon may read `volumes`, `volume_texts`, `volume_pages`,
-// `volume_notes` and `releases`, and nothing else.
+// `volume_notes`, `author_pages`, `author_index` and `releases`, and nothing
+// else.
 
 const CFG = window.WHL_CONFIG || {};
 export const usingCloud = Boolean(CFG.supabaseUrl && CFG.supabaseAnonKey);
@@ -61,10 +62,10 @@ function rowInCat(v, wanted) {
   });
 }
 
-/** {q, yearFrom, yearTo, cat, lang, sort, limit, offset} -> {rows, total} */
+/** {q, yearFrom, yearTo, cat, lang, author, sort, limit, offset} -> {rows, total} */
 export async function searchVolumes(opts = {}) {
   const {
-    q = "", yearFrom = null, yearTo = null, cat = "", lang = "",
+    q = "", yearFrom = null, yearTo = null, cat = "", lang = "", author = "",
     sort = "title", limit = 24, offset = 0,
   } = opts;
 
@@ -81,34 +82,38 @@ export async function searchVolumes(opts = {}) {
     if (yearTo != null) rows = rows.filter((v) => v.year && v.year <= yearTo);
     if (cat) rows = rows.filter((v) => rowInCat(v, cat));
     if (lang) rows = rows.filter((v) => String(v.language || "") === lang);
+    if (author) rows = rows.filter((v) => v.authors === author);
     rows = sortRows(rows, sort);
     return { rows: rows.slice(offset, offset + limit), total: rows.length };
   }
 
   // PostgREST: the database does the search, so a query never ships the catalogue
-  const params = filterParams(q, yearFrom, yearTo, cat, lang);
+  const params = filterParams(q, yearFrom, yearTo, cat, lang, author);
   params.unshift("select=*");
   params.push(`order=${orderClause(sort)}`);
   params.push(`limit=${limit}`, `offset=${offset}`);
 
   const rows = await rest(`volumes?${params.join("&")}`);
-  const total = await countVolumes(q, yearFrom, yearTo, cat, lang).catch(() => rows.length);
+  const total = await countVolumes(q, yearFrom, yearTo, cat, lang, author).catch(() => rows.length);
   return { rows, total };
 }
 
 // The filter half of a volumes query, shared by the row fetch and the count.
-function filterParams(q, yearFrom, yearTo, cat, lang) {
+function filterParams(q, yearFrom, yearTo, cat, lang, author) {
   const params = [];
   if (q) params.push(`fts=plfts(english).${encodeURIComponent(q)}`);
   if (yearFrom != null) params.push(`year=gte.${yearFrom}`);
   if (yearTo != null) params.push(`year=lte.${yearTo}`);
   if (cat) params.push(`categories=ilike.*${encodeURIComponent(likeEscape(cat))}*`);
   if (lang) params.push(`language=eq.${encodeURIComponent(lang)}`);
+  // Exact match: this is "this literal published author string," matching how
+  // author_pages/author_index are keyed -- never a substring/ilike filter here.
+  if (author) params.push(`authors=eq.${encodeURIComponent(author)}`);
   return params;
 }
 
-async function countVolumes(q, yearFrom, yearTo, cat, lang) {
-  const params = ["select=id", ...filterParams(q, yearFrom, yearTo, cat, lang)];
+async function countVolumes(q, yearFrom, yearTo, cat, lang, author) {
+  const params = ["select=id", ...filterParams(q, yearFrom, yearTo, cat, lang, author)];
   const r = await fetch(`${CFG.supabaseUrl.replace(/\/$/, "")}/rest/v1/volumes?${params.join("&")}`, {
     method: "HEAD",
     headers: {
@@ -184,6 +189,55 @@ export async function facetSource() {
     }));
   }
   return rest("volumes?select=slug,category_paths,language,year");
+}
+
+/** Title matches for the search-box autocomplete: [{slug, title, authors, year}]. */
+export async function suggestTitles(q, limit = 6) {
+  const words = norm(q);
+  if (!words) return [];
+  if (!usingCloud) {
+    const rows = (await fixture()).filter((v) => norm(v.title).includes(words));
+    return sortRows(rows, "title").slice(0, limit)
+      .map((v) => ({ slug: v.slug, title: v.title, authors: v.authors, year: v.year }));
+  }
+  return rest(
+    `volumes?select=slug,title,authors,year&title=ilike.*${encodeURIComponent(likeEscape(q))}*` +
+    `&order=title.asc&limit=${limit}`
+  );
+}
+
+/** Author matches for the search-box autocomplete: [{author, work_count}],
+ *  grouped on the exact `authors` string (see author_pages/author_index — no
+ *  name-variant merging). */
+export async function suggestAuthors(q, limit = 6) {
+  const words = norm(q);
+  if (!words) return [];
+  if (!usingCloud) {
+    const counts = new Map();
+    for (const v of await fixture()) {
+      const a = v.authors;
+      if (a) counts.set(a, (counts.get(a) || 0) + 1);
+    }
+    return [...counts.entries()]
+      .filter(([author]) => norm(author).includes(words))
+      .map(([author, work_count]) => ({ author, work_count }))
+      .sort((a, b) => b.work_count - a.work_count || a.author.localeCompare(b.author))
+      .slice(0, limit);
+  }
+  return rest(
+    `author_index?author=ilike.*${encodeURIComponent(likeEscape(q))}*` +
+    `&order=work_count.desc,author.asc&limit=${limit}`
+  );
+}
+
+/** The bio (Markdown) for an author, or "" when none has been written yet. */
+export async function getAuthorBio(author) {
+  if (!usingCloud) {
+    const a = (await fixture("authors").catch(() => ({})))[author];
+    return (a && a.bio) || "";
+  }
+  const rows = await rest(`author_pages?author=eq.${encodeURIComponent(author)}&select=bio&limit=1`);
+  return (rows[0] && rows[0].bio) || "";
 }
 
 export async function latestReleases() {
@@ -289,6 +343,24 @@ export function pdfHref(v) {
   if (v.pdf_url) return safeHttpUrl(v.pdf_url);
   if (v.pdf_path) {
     return `${CFG.supabaseUrl.replace(/\/$/, "")}/storage/v1/object/public/volumes/${encodeURI(v.pdf_path)}`;
+  }
+  return "";
+}
+
+/** Where the thumbnail actually lives -- same dual-field pattern as pdfHref().
+ *
+ * In fixture mode, a volume whose assets declare a thumbnail (assets.thumbnail)
+ * is served the bundled fixtures/sample-thumb.jpg, mirroring how assets.pages
+ * serves fixtures/sample.pdf.
+ */
+export function thumbHref(v) {
+  if (!usingCloud) {
+    const a = (v && v.assets) || {};
+    return a.thumbnail ? "fixtures/sample-thumb.jpg" : "";
+  }
+  if (v.thumbnail_url) return safeHttpUrl(v.thumbnail_url);
+  if (v.thumbnail_path) {
+    return `${CFG.supabaseUrl.replace(/\/$/, "")}/storage/v1/object/public/volumes/${encodeURI(v.thumbnail_path)}`;
   }
   return "";
 }

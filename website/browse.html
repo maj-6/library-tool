@@ -24,7 +24,9 @@
     <form class="toolbar-form" id="controls" role="search">
       <div class="searchfield">
         <input type="search" id="q" name="q" placeholder="Search titles, authors, subjects…"
-               autocomplete="off" aria-label="Search the library" />
+               autocomplete="off" aria-label="Search the library"
+               role="combobox" aria-expanded="false" aria-controls="q-suggest" aria-autocomplete="list" />
+        <ul class="suggest" id="q-suggest" role="listbox" hidden></ul>
       </div>
       <div class="sortbox">
         <label class="label" for="sort">Sort</label>
@@ -67,6 +69,7 @@
     </aside>
 
     <main class="records">
+      <div class="author-card" id="author-card" hidden></div>
       <div class="active-filters" id="active-filters"></div>
       <ol class="records-list" id="results"></ol>
       <div class="pager" id="pager" hidden>

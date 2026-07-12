@@ -808,7 +808,7 @@ _BUILD_FIELDS = ("published_slug",
                  "pdf_sources", "bundle",
                  "source_url", "notes", "status",
                  "ocr_active", "ocr_verified", "ocr_quality",
-                 "title_pages", "attention")
+                 "title_pages", "thumbnail_source", "attention")
 
 # The structured exceptions to the str() coercion below. `categories` (flat
 # text) is deprecated in favour of category_ids — kept as display fallback.
@@ -1456,6 +1456,26 @@ def _entry_primary_pdf(build_id: str) -> str:
     return ""
 
 
+def _ocr_extracted_images(build_id: str) -> list[dict]:
+    """Figures an OCR service (Mistral) cut out of a page: [{name, page,
+    size}], cross-referencing ocr/layout.json's bbox map against the actual
+    files on disk. Used to surface them in the OCR tab's Documents tree
+    alongside the compiled .txt output, which _entry_folder_info previously
+    listed on its own."""
+    d = _entry_dir(build_id) / "ocr" / "images"
+    if not d.is_dir():
+        return []
+    meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
+    images_meta = meta.get("images") or {}
+    out = []
+    for f in sorted(d.iterdir()):
+        if not f.is_file():
+            continue
+        info = images_meta.get(f.name) or {}
+        out.append({"name": f.name, "page": info.get("page"), "size": f.stat().st_size})
+    return out
+
+
 def _entry_folder_info(build_id: str) -> dict:
     d = _entry_dir(build_id)
     ocr = []
@@ -1466,6 +1486,7 @@ def _entry_folder_info(build_id: str) -> dict:
                         "src": srcmap.get(f.name) or "primary"})
     primary = _entry_primary_pdf(build_id)
     return {"exists": d.is_dir(), "path": str(d), "ocr": ocr,
+            "images": _ocr_extracted_images(build_id),
             "preview": bool(primary), "primary_pdf": primary,
             "metadata": (d / "metadata.json").is_file()}
 
@@ -1663,7 +1684,8 @@ def api_entries():
     for bid in builds:
         info = _entry_folder_info(bid)
         if info["exists"]:
-            out[bid] = {"ocr": info["ocr"], "preview": info["preview"],
+            out[bid] = {"ocr": info["ocr"], "images": info["images"],
+                        "preview": info["preview"],
                         "primary_pdf": info["primary_pdf"]}
     return jsonify({"entries": out})
 
@@ -1711,6 +1733,26 @@ def api_build_ocr_image(build_id: str, name: str):
     if not safe or not f.is_file():
         abort(404)
     return send_file(f, conditional=True)
+
+
+@app.route("/api/builds/<build_id>/cover-candidate")
+def api_build_cover_candidate(build_id: str):
+    """The Resources tab's computed "cover" suggestion: the first page of the
+    primary PDF that isn't blank, per first_content_page()'s ink+text
+    heuristic. {page: N} or {page: null} if there's no PDF yet or nothing
+    qualifies — never a hard failure, since this is only ever a suggestion."""
+    builds = lib.load_json(BUILDS_PATH, {})
+    b = builds.get(build_id)
+    if b is None:
+        abort(404)
+    pdf = _resolve_local(str(b.get("pdf_file") or ""))
+    if pdf is None or pdf.suffix.lower() != ".pdf" or not pdf.is_file():
+        return jsonify({"ok": True, "page": None})
+    try:
+        page = first_content_page(pdf)
+    except Exception:
+        page = None
+    return jsonify({"ok": True, "page": page})
 
 
 @app.route("/api/builds/<build_id>/ocr-layout")
@@ -2063,36 +2105,29 @@ def api_pdf_info():
         return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
 
-@app.route("/api/pdf/pageimg")
-def api_pdf_pageimg():
-    """One page of a local PDF rendered as an image (?path=&page=N&w=W).
-    Rendered via PyMuPDF and cached on disk by path+mtime+page+width.
-    JPEG: a scanned page as PNG runs 500 KB+ against ~80 KB, and encodes
-    slower too — these are photographs, not line art. Older caches hold
-    .png files; they stay valid and are served as-is."""
-    p = _pageimg_pdf(request.args.get("path"))
-    try:
-        page = max(1, int(request.args.get("page") or 1))
-    except ValueError:
-        page = 1
-    try:
-        w = max(200, min(1600, int(request.args.get("w") or 700)))
-    except ValueError:
-        w = 700
-    try:
-        import fitz  # PyMuPDF
-    except ImportError:
-        return jsonify({"ok": False, "error": "PyMuPDF is not installed"}), 501
+def _render_pdf_page(pdf_path: Path, page: int, w: int) -> Path:
+    """Render one page of a local PDF to a cached image file, returning its
+    path. Cached on disk by path+mtime+page+width (see _page_cache_key). JPEG:
+    a scanned page as PNG runs 500 KB+ against ~80 KB, and encodes slower too —
+    these are photographs, not line art. Older caches hold .png files; they
+    stay valid and are returned as-is.
+
+    Pulled out of the /api/pdf/pageimg route so the publish pipeline
+    (thumbnails) can render a page directly, without an HTTP round trip, and
+    share the same on-disk cache (and the _pdf_doc handle cache) the OCR tab's
+    page view already warms. Raises ImportError if PyMuPDF is unavailable,
+    FileNotFoundError if `page` is out of range."""
+    import fitz  # PyMuPDF
     cache = _pages_cache_dir()
-    key = _page_cache_key(p, p.stat().st_mtime, page, w)
+    key = _page_cache_key(pdf_path, pdf_path.stat().st_mtime, page, w)
     old = cache / f"{key}.png"
     if old.is_file():
-        return _cached_page_file(old, "image/png")
+        return old
     out = cache / f"{key}.jpg"
     if not out.is_file():
-        with _pdf_doc(p) as doc:
+        with _pdf_doc(pdf_path) as doc:
             if page > doc.page_count:
-                abort(404)
+                raise FileNotFoundError(f"page {page} out of range")
             pg = doc[page - 1]
             zoom = w / max(1.0, pg.rect.width)
             pix = pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
@@ -2104,9 +2139,31 @@ def api_pdf_pageimg():
                 tmp = old.with_suffix(f".{page}.tmp.png")
                 pix.save(str(tmp))
                 tmp.replace(old)
-                return _cached_page_file(old, "image/png")
+                return old
             tmp.replace(out)
-    return _cached_page_file(out, "image/jpeg")
+    return out
+
+
+@app.route("/api/pdf/pageimg")
+def api_pdf_pageimg():
+    """One page of a local PDF rendered as an image (?path=&page=N&w=W)."""
+    p = _pageimg_pdf(request.args.get("path"))
+    try:
+        page = max(1, int(request.args.get("page") or 1))
+    except ValueError:
+        page = 1
+    try:
+        w = max(200, min(1600, int(request.args.get("w") or 700)))
+    except ValueError:
+        w = 700
+    try:
+        out = _render_pdf_page(p, page, w)
+    except ImportError:
+        return jsonify({"ok": False, "error": "PyMuPDF is not installed"}), 501
+    except FileNotFoundError:
+        abort(404)
+    mime = "image/png" if out.suffix == ".png" else "image/jpeg"
+    return _cached_page_file(out, mime)
 
 
 # --- OCR processing jobs -----------------------------------------------------------
@@ -2649,6 +2706,7 @@ def _apply_page_deletion(build_id: str, builds: dict, pdf: Path,
     titles = [] if src_key != "primary" else \
         [int(x) for x in str(b.get("title_pages") or "").split(",")
          if x.strip().isdigit()]
+    dirty = False
     if titles:
         remapped = []
         for t in titles:
@@ -2656,6 +2714,19 @@ def _apply_page_deletion(build_id: str, builds: dict, pdf: Path,
                 continue
             remapped.append(t - sum(1 for r in pages if r < t))
         b["title_pages"] = ",".join(str(t) for t in remapped)
+        dirty = True
+    # thumbnail_source references a primary-PDF page the same way title_pages
+    # does ("page:<n>") — remap it the same way, or clear it if the referenced
+    # page was itself deleted. An "image:<name>" source points at an OCR-
+    # extracted figure, not a PDF page, so page deletion never touches it.
+    if src_key == "primary":
+        m = re.match(r"^page:(\d+)$", str(b.get("thumbnail_source") or ""))
+        if m:
+            t = int(m.group(1))
+            b["thumbnail_source"] = "" if t in set(pages) else \
+                f"page:{t - sum(1 for r in pages if r < t)}"
+            dirty = True
+    if dirty:
         lib.save_json(BUILDS_PATH, builds)
     return {"deleted": pages, "pages": len(keep),
             "renumbered": renumbered,
@@ -2689,6 +2760,34 @@ def _blank_pages(pdf: Path, ink_threshold: float = 0.003) -> list[int]:
     finally:
         doc.close()
     return blank
+
+
+def first_content_page(pdf: Path, ink_threshold: float = 0.003,
+                        max_scan: int = 20) -> int | None:
+    """1-based number of the first page that ISN'T blank by _blank_pages'
+    test — a cheap "cover candidate" heuristic (ink density + text-layer
+    presence only; no vision model, that's future work). Deliberately its own
+    small scan rather than calling _blank_pages() and diffing the result:
+    that function always walks the whole document before returning, which
+    defeats the point of an early exit here. Capped at max_scan pages so a
+    pathological all-blank document doesn't scan forever; None if nothing
+    qualifies within the cap."""
+    import fitz
+    doc = fitz.open(str(pdf))
+    try:
+        for i in range(min(doc.page_count, max_scan)):
+            pg = doc[i]
+            zoom = 160 / max(1.0, pg.rect.width)
+            pix = pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace="gray")
+            samples = pix.samples
+            inked = sum(1 for v in samples if v < 200)
+            has_ink = inked / max(1, len(samples)) >= ink_threshold
+            has_text = bool((pg.get_text() or "").strip())
+            if has_ink or has_text:
+                return i + 1
+        return None
+    finally:
+        doc.close()
 
 
 # --- master list -> Google Sheets sync ----------------------------------------------
@@ -4868,7 +4967,8 @@ def _r2_cfg() -> dict:
             "public_base": str(s.get("r2PublicBase") or "").strip()}
 
 
-def _volume_row(b: dict, slug: str, url: str, path: str, size: int, actor: str) -> dict:
+def _volume_row(b: dict, slug: str, url: str, path: str, size: int, actor: str,
+                 thumb_url: str = "", thumb_path: str = "") -> dict:
     num = lambda v: int(v) if str(v or "").strip().isdigit() else None   # noqa: E731
     # Categories publish as resolved taxonomy paths; the flat text column is
     # their rendering (and stays inside the fts index). Builds that predate
@@ -4887,6 +4987,7 @@ def _volume_row(b: dict, slug: str, url: str, path: str, size: int, actor: str) 
             "description": b.get("description") or "",
             "source_url": b.get("source_url") or b.get("pdf_source") or "",
             "pdf_url": url, "pdf_path": path, "pdf_bytes": size,
+            "thumbnail_url": thumb_url, "thumbnail_path": thumb_path,
             "uploaded_by_name": actor,
             "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
 
@@ -5001,13 +5102,15 @@ def _publish_slug(cloud: dict, b: dict) -> str:
     return slug
 
 
-def _unpublish_object(cloud: dict, slug: str, path: str) -> None:
-    """Best-effort removal of an object whose catalogue row never landed."""
+def _unpublish_object(cloud: dict, slug: str, path: str, r2_name: str = "") -> None:
+    """Best-effort removal of an object whose catalogue row never landed.
+    r2_name overrides the default "<slug>.pdf" R2 key -- needed for anything
+    that isn't the primary PDF (a secondary scan, a thumbnail)."""
     try:
         if path:
             sbase.delete_objects(cloud, "volumes", [path])
         else:
-            r2.delete(_r2_cfg(), f"volumes/{slug}.pdf")
+            r2.delete(_r2_cfg(), f"volumes/{r2_name or slug + '.pdf'}")
         log.warning("rolled back orphaned object for %s", slug)
     except Exception as exc:
         log.error("could not roll back orphaned object for %s: %s", slug, exc)
@@ -5057,7 +5160,8 @@ def _publish_run(bid: str, actor: str) -> None:
         # the primary. Any failure past this point takes every uploaded
         # object back down — a public object with no catalog row is a leak.
         extras = []
-        try:
+        thumb_url = thumb_path = ""   # defined before the try: an early failure
+        try:                          # in the loop below must still see these
             for i, s in enumerate(b.get("pdf_sources") or [], start=2):
                 sp = _resolve_local(str(s.get("path") or ""))
                 if sp is None or not sp.is_file():
@@ -5073,26 +5177,75 @@ def _publish_run(bid: str, actor: str) -> None:
                                         sp.read_bytes(), "application/pdf")
                     extras.append((name_i, name_i))
 
+            # Thumbnail: whatever the Editor's Resources tab picked
+            # (thumbnail_source, "page:<n>" or "image:<name>"), or — if
+            # nothing was picked, or the pick no longer resolves — the same
+            # first-non-blank-page heuristic the Resources tab offers as its
+            # own "cover candidate" suggestion. A book with no usable page at
+            # all just publishes without a thumbnail; that's never a publish
+            # failure, a thumbnail is a nice-to-have.
+            thumb_local = None
+            tsrc = str(b.get("thumbnail_source") or "")
+            m = re.match(r"^page:(\d+)$", tsrc)
+            if m:
+                try:
+                    thumb_local = _render_pdf_page(pdf, int(m.group(1)), 640)
+                except Exception:
+                    thumb_local = None
+            else:
+                m2 = re.match(r"^image:(.+)$", tsrc)
+                if m2:
+                    cand = (_entry_dir(bid) / "ocr" / "images" /
+                            re.sub(r"[^\w.\-]", "_", m2.group(1)))
+                    if cand.is_file():
+                        thumb_local = cand
+            if thumb_local is None:
+                try:
+                    cover_page = first_content_page(pdf)
+                    if cover_page:
+                        thumb_local = _render_pdf_page(pdf, cover_page, 640)
+                except Exception:
+                    thumb_local = None
+            thumb_name = f"{slug}-thumb.jpg"
+            if thumb_local is not None:
+                try:
+                    if r2.configured(r2cfg):
+                        thumb_url = r2.put_file(r2cfg, f"volumes/{thumb_name}",
+                                                thumb_local, "image/jpeg")
+                    else:
+                        sbase.upload_object(cloud, "volumes", thumb_name,
+                                            thumb_local.read_bytes(), "image/jpeg")
+                        thumb_url = sbase.public_url(cloud, "volumes", thumb_name)
+                        thumb_path = thumb_name
+                except Exception as exc:
+                    log.warning("thumbnail upload failed for %s: %s", slug, exc)
+                    thumb_url = thumb_path = ""
+
             stage("recording")
             art = _bundle_artifacts(bid, b)
-            row = dict(_volume_row(b, slug, url, path, size, actor),
+            row = dict(_volume_row(b, slug, url, path, size, actor,
+                                    thumb_url, thumb_path),
                        assets=art["assets"])
             try:
                 sbase.upsert_volume(cloud, row)
             except sbase.SyncError as exc:
                 # A live project that hasn't re-run schema.sql lacks the new
                 # columns; the book still deserves to publish.
-                if not any(k in str(exc) for k in ("category_paths", "assets")):
+                missing = ("category_paths", "assets", "thumbnail_url", "thumbnail_path")
+                if not any(k in str(exc) for k in missing):
                     raise
-                row.pop("category_paths", None)
-                row.pop("assets", None)
+                for k in ("category_paths", "assets", "thumbnail_url", "thumbnail_path"):
+                    row.pop(k, None)
                 sbase.upsert_volume(cloud, row)
-                log.warning("volumes.category_paths/assets missing on the "
-                            "cloud project — re-run docs/cloud/schema.sql")
+                log.warning("volumes.category_paths/assets/thumbnail_* missing "
+                            "on the cloud project — re-run docs/cloud/schema.sql")
         except Exception:
             _unpublish_object(cloud, slug, path)
             for name_i, path_i in extras:
                 _unpublish_object(cloud, name_i[:-4], path_i)
+            if thumb_url or thumb_path:
+                _unpublish_object(cloud, f"{slug}-thumb", thumb_path,
+                                  r2_name=f"{slug}-thumb.jpg")
             raise
 
         # The bundle's artifacts go after the row: a failure here leaves the
