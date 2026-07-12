@@ -292,7 +292,8 @@ def api_activity():
 # activity push cursor) lives in DATA_ROOT/output/auth_session.json — device
 # state, gitignored like client_state.json. Contributions reach the cloud as
 # the authenticated user, so row-level security applies and no policy has to
-# trust a plain-text name. Settings and API keys never leave the machine.
+# trust a plain-text name. The Mistral key is the one account-level credential:
+# it syncs through the private profile_secrets row shared with Book Capture.
 
 AUTH_SESSION_PATH = lib.DATA_ROOT / "output" / "auth_session.json"
 _auth_lock = threading.RLock()
@@ -433,6 +434,7 @@ def api_auth_login():
         return jsonify({"ok": False, "error": str(exc)}), 401
     ses = _adopt_profile(cfg, ses)
     _store_session(ses)
+    _sync_profile_mistral_key()
     activity("signed in to", "the cloud", actor=ses["display_name"] or email)
     return jsonify({"ok": True, "email": ses["email"],
                     "display_name": ses["display_name"]})
@@ -460,6 +462,7 @@ def api_auth_signup():
         return jsonify({"ok": True, "confirm": True})
     ses = _adopt_profile(cfg, ses)
     _store_session(ses)
+    _sync_profile_mistral_key()
     activity("signed in to", "the cloud", actor=ses["display_name"] or email)
     return jsonify({"ok": True, "email": ses["email"],
                     "display_name": ses["display_name"]})
@@ -3482,6 +3485,7 @@ _SECRET_KEYS = frozenset({
     "gsKeyFile",
 })
 _SECRETS_PATH = lib.DATA_ROOT / "output" / "secrets.json"
+_MISTRAL_PENDING = "_mistralCloudPending"
 
 
 def _load_secrets() -> dict:
@@ -3512,6 +3516,9 @@ def _local_only() -> bool:
 def api_secrets_get():
     if not _local_only():
         return jsonify({"error": "forbidden"}), 403
+    # Mistral belongs to the signed-in user's private cloud data. Refresh its
+    # local cache when the settings dialog opens; offline falls back cleanly.
+    _sync_profile_mistral_key()
     secrets = _load_secrets()
     return jsonify({k: secrets.get(k, "") for k in _SECRET_KEYS})
 
@@ -3530,8 +3537,54 @@ def api_secrets_put():
             secrets[k] = v
         else:
             secrets.pop(k, None)
+        if k == "mistralKey":
+            secrets[_MISTRAL_PENDING] = True
     _save_secrets(secrets)
+    if "mistralKey" in updates:
+        _sync_profile_mistral_key()
     return jsonify({"ok": True})
+
+
+def _sync_profile_mistral_key() -> str | None:
+    """Reconcile the local Mistral cache with this user's profile_secrets row.
+
+    A locally edited value is marked pending until its cloud upsert succeeds;
+    otherwise the cloud value wins so Android edits reach the desktop. Returns
+    the reconciled key, or None when signed out/offline.
+    """
+    cfg = _auth_cfg()
+    ses = _auth_session() if cfg else None
+    if not cfg or not ses:
+        return None
+    secrets = _load_secrets()
+    local = str(secrets.get("mistralKey") or "").strip()
+    pending = bool(secrets.get(_MISTRAL_PENDING))
+    try:
+        rows = sauth.rest(
+            cfg, ses["access_token"], "GET",
+            f"profile_secrets?id=eq.{ses['user_id']}&select=api_keys",
+        ) or []
+        keys = dict(rows[0].get("api_keys") or {}) if rows else {}
+        if pending or "mistral" not in keys:
+            keys["mistral"] = local
+            sauth.rest(
+                cfg, ses["access_token"], "POST",
+                "profile_secrets?on_conflict=id",
+                [{"id": ses["user_id"], "api_keys": keys}],
+                prefer="resolution=merge-duplicates,return=minimal",
+            )
+            secrets.pop(_MISTRAL_PENDING, None)
+        else:
+            local = str(keys.get("mistral") or "").strip()
+            if local:
+                secrets["mistralKey"] = local
+            else:
+                secrets.pop("mistralKey", None)
+        _save_secrets(secrets)
+        return local
+    except sauth.AuthError as exc:
+        log.warning("Mistral profile sync deferred: %s", exc)
+        return None
 
 
 def _migrate_secrets_from_client_state() -> None:
@@ -5844,6 +5897,7 @@ if __name__ == "__main__":
     # so its localStorage/client-state can't collide with the main one) — used
     # to test against a throwaway WHL_DATA_ROOT without touching live state.
     _migrate_secrets_from_client_state()   # lift any secrets off the synced blob
+    _sync_profile_mistral_key()            # user cloud data; cached for offline use
     port = int(os.environ.get("WHL_PORT") or 5001)
     log.info("Library Tool on 127.0.0.1:%d - DATA_ROOT=%s", port, lib.DATA_ROOT)
     app.run(host="127.0.0.1", port=port, debug=False)
