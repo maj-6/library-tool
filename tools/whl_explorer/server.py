@@ -23,6 +23,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -81,6 +82,22 @@ app = _flask_app()
 # (twice now: the reason popover, then the OCR Layout button) goes away.
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 app.jinja_env.auto_reload = True
+
+
+_TRUSTED_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
+
+
+@app.before_request
+def _reject_untrusted_host():
+    """Reject DNS-rebinding requests before any local API can run.
+
+    The administrative app is intentionally bound to IPv4 loopback.  Checking
+    only credential routes is insufficient because other endpoints expose
+    client state, local PDFs, and a fetch proxy.
+    """
+    host = (request.host or "").partition(":")[0].lower().rstrip(".")
+    if host not in _TRUSTED_LOOPBACK_HOSTS:
+        abort(403)
 
 
 # --- application log ------------------------------------------------------------
@@ -1879,9 +1896,7 @@ def api_pdf_words():
         page = max(1, int(request.args.get("page") or 1))
     except ValueError:
         page = 1
-    try:
-        import fitz  # PyMuPDF: renders these pages already, so no new dependency
-    except ImportError:
+    if importlib.util.find_spec("fitz") is None:
         return jsonify({"ok": False, "error": "PyMuPDF is not installed"}), 501
     from statistics import median
     with _pdf_doc(p) as doc:
