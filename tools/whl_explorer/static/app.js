@@ -233,6 +233,7 @@ const state = {
     // Settings > Theme editor: per-theme chrome token overrides,
     // shape { [themeId]: { "--var": "value", … } }. Applied as inline body vars.
     themeOverrides: {},
+    savedThemes: [],            // saved {name, base, overrides} snapshots (Theme editor)
   },
   editTarget: null,             // record open in the EDIT tab
   sort: { checked: null, whl: null },  // {key, dir} per top table
@@ -546,6 +547,7 @@ function applyTheme() {
   }
   document.body.dataset.theme = t;
   applyThemeOverrides();   // re-apply this theme's edits (and clear the old set)
+  applyFont();             // fonts too: a per-theme font override, else the global default
 }
 
 // the one way to change theme: the Settings menu and the Appearance select
@@ -587,16 +589,17 @@ function applyThemeOverrides() {
   }
 }
 
+// fonts resolve per-theme-override first, then the global Appearance setting,
+// then the :root default. Kept out of applyThemeOverrides() (which owns the
+// non-font tokens) so the two never fight over the same inline body vars.
+const FONT_SETTING_VARS = [["fontUi", "--ui"], ["font", "--mono"], ["fontMono2", "--mono2"]];
 function applyFont() {
-  const f = state.settings.font || "";
-  if (f) document.body.style.setProperty("--mono", f);
-  else document.body.style.removeProperty("--mono");
-  const u = state.settings.fontUi || "";
-  if (u) document.body.style.setProperty("--ui", u);
-  else document.body.style.removeProperty("--ui");
-  const m2 = state.settings.fontMono2 || "";
-  if (m2) document.body.style.setProperty("--mono2", m2);
-  else document.body.style.removeProperty("--mono2");
+  const ov = (state.settings.themeOverrides || {})[document.body.dataset.theme] || {};
+  for (const [key, cssVar] of FONT_SETTING_VARS) {
+    const val = ov[cssVar] || state.settings[key] || "";   // per-theme, else global, else default
+    if (val) document.body.style.setProperty(cssVar, val);
+    else document.body.style.removeProperty(cssVar);
+  }
 }
 
 const el = (id) => document.getElementById(id);
@@ -1146,6 +1149,7 @@ function normalizeSettings() {
   state.settings.colVis = state.settings.colVis || {};
   if (!state.settings.themeOverrides || typeof state.settings.themeOverrides !== "object")
     state.settings.themeOverrides = {};
+  if (!Array.isArray(state.settings.savedThemes)) state.settings.savedThemes = [];
   state.settings.colWidths = state.settings.colWidths || {};
   // migrate the old single-table column setting
   if (Object.keys(state.settings.checkedCols).length &&
@@ -3061,7 +3065,33 @@ const THEME_TOKENS = [
     { v: "--wt-strong", l: "Heading weight",   t: "wt", def: "700",
       opts: [["400", "Regular"], ["500", "Medium"], ["600", "Semibold"], ["700", "Bold"]] },
   ]],
+  // fonts are per-theme here; "Default" falls back to the global Appearance font
+  ["Fonts", [
+    { v: "--ui",    l: "Interface font", t: "font" },
+    { v: "--mono",  l: "Data / table font", t: "font" },
+    { v: "--mono2", l: "Tag / marker font", t: "font" },
+  ]],
 ];
+
+// the exact set of tokens the editor owns -- the allowlist for imports
+const THEME_TOKEN_VARS = new Set(THEME_TOKENS.flatMap(([, toks]) => toks.map((t) => t.v)));
+// keep only known "--token": "safe value" pairs -- defends applyThemeOverrides and
+// the font path against a hand-edited or hostile imported theme file: reject
+// unknown keys, non-strings, empty/oversized values, and anything with CSS
+// punctuation (a url(...) in a token consumed by background: would phone home).
+function sanitizeOverrides(o) {
+  const out = {};
+  if (o && typeof o === "object" && !Array.isArray(o)) {
+    for (const [k, v] of Object.entries(o)) {
+      if (!THEME_TOKEN_VARS.has(k) || typeof v !== "string") continue;
+      const val = v.trim();
+      if (!val || val.length > 200) continue;
+      if (/[();]|url\(|@import|expression|javascript:/i.test(val)) continue;
+      out[k] = val;
+    }
+  }
+  return out;
+}
 
 // coerce a colour token to #rrggbb for <input type=color> (theme values are
 // authored as 6-digit hex, but be defensive about #rgb and stray whitespace)
@@ -3133,6 +3163,7 @@ function renderThemeEditor() {
     }
     saveSettings();
     applyThemeOverrides();
+    applyFont();               // a reset font token falls back to the global default
     renderThemeEditor();
   };
 
@@ -3203,6 +3234,36 @@ function renderThemeEditor() {
         rng.addEventListener("change", () => apply(rng.value, true));
         num.addEventListener("change", () => apply(num.value, true));
         ctl.append(rng, num, unit);
+      } else if (tok.t === "font") {
+        const sel = document.createElement("select");
+        sel.className = "cad-input te-fontsel";
+        const def = document.createElement("option");
+        def.value = ""; def.textContent = "Default (Appearance)";
+        sel.appendChild(def);
+        for (const [val, name] of FONT_CHOICES) {
+          if (!val) continue;                              // skip FONT_CHOICES' own "Default"
+          const o = document.createElement("option");
+          o.value = val; o.textContent = name;
+          sel.appendChild(o);
+        }
+        const stored = ov[tok.v] || "";
+        sel.value = stored;
+        if (sel.value !== stored) {                        // an imported/custom stack: keep it
+          const o = document.createElement("option");
+          o.value = stored; o.textContent = "Custom";
+          sel.appendChild(o); sel.value = stored;
+        }
+        sel.addEventListener("change", () => {
+          const m = overrides();
+          if (sel.value) { m[tok.v] = sel.value; markDirty(); }
+          else {
+            delete m[tok.v];
+            if (!Object.keys(m).length) delete state.settings.themeOverrides[theme];
+            rev.classList.remove("on");
+          }
+          applyFont(); saveSettings(); updateCount();      // fonts: applyFont, not setTok
+        });
+        ctl.append(sel);
       } else {                                             // weight dropdown
         const sel = document.createElement("select");
         sel.className = "cad-input te-wsel";
@@ -3230,7 +3291,106 @@ function renderThemeEditor() {
     delete state.settings.themeOverrides[theme];
     saveSettings();
     applyThemeOverrides();
+    applyFont();
     renderThemeEditor();
+  };
+
+  // --- saved themes: named snapshots (settings.savedThemes) + file export/import ---
+  const clone = (o) => JSON.parse(JSON.stringify(o || {}));
+  const themeLabel = (id) => (THEMES.find(([x]) => x === id) || [, id])[1];
+  const normBase = (id) => {
+    const b = id in LEGACY_THEMES ? LEGACY_THEMES[id] : id;
+    return THEMES.some(([x]) => x === b) ? b : DEFAULT_THEME;
+  };
+  const saved = state.settings.savedThemes;
+  const ssel = el("te-saved");
+  if (ssel) {
+    ssel.innerHTML = "";
+    if (!saved.length) {
+      const o = document.createElement("option");
+      o.value = ""; o.textContent = "(no saved themes)";
+      ssel.appendChild(o); ssel.disabled = true;
+    } else {
+      ssel.disabled = false;
+      saved.forEach((s, i) => {
+        const o = document.createElement("option");
+        o.value = String(i);
+        o.textContent = `${s.name} · ${themeLabel(s.base)}`;
+        ssel.appendChild(o);
+      });
+    }
+  }
+  const savedIdx = () => parseInt((el("te-saved") || {}).value, 10);
+  const onClick = (id, fn) => { const b = el(id); if (b) b.onclick = fn; };
+
+  onClick("te-save", () => {
+    const nameEl = el("te-save-name");
+    let name = (nameEl && nameEl.value.trim()) || `${themeLabel(theme)} custom`;
+    saved.push({ name: name.slice(0, 60), base: theme, overrides: clone(state.settings.themeOverrides[theme]) });
+    if (nameEl) nameEl.value = "";
+    saveSettings();
+    status(`SAVED THEME "${name}"`);
+    renderThemeEditor();
+  });
+  onClick("te-load", () => {
+    const s = saved[savedIdx()];
+    if (!s) return;
+    const base = normBase(s.base);
+    state.settings.themeOverrides[base] = sanitizeOverrides(s.overrides);
+    saveSettings();
+    setTheme(base);          // applies overrides + fonts and re-renders the editor
+    status(`LOADED THEME "${s.name}"`);
+  });
+  onClick("te-delete", () => {
+    const i = savedIdx();
+    if (!(i >= 0) || !saved[i]) return;
+    const name = saved[i].name;
+    saved.splice(i, 1);
+    saveSettings();
+    status(`DELETED THEME "${name}"`);
+    renderThemeEditor();
+  });
+  onClick("te-export", () => {
+    const payload = {
+      app: "whl-theme", version: 1,
+      name: themeLabel(theme), base: theme,
+      overrides: clone(state.settings.themeOverrides[theme]),
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${theme}-theme.whltheme.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    status("EXPORTED THEME");
+  });
+  onClick("te-import", () => { const f = el("te-import-file"); if (f) f.click(); });
+  const fileEl = el("te-import-file");
+  if (fileEl) fileEl.onchange = () => {
+    const f = fileEl.files && fileEl.files[0];
+    fileEl.value = "";
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      let obj;
+      try { obj = JSON.parse(reader.result); }
+      catch (e) { statusErr("IMPORT FAILED :: not valid JSON"); return; }
+      // require the export handshake so a stray .json can't silently wipe a theme
+      if (!obj || typeof obj !== "object" || obj.app !== "whl-theme" ||
+          typeof obj.base !== "string" || !obj.overrides || typeof obj.overrides !== "object") {
+        statusErr("IMPORT FAILED :: not a Library Tool theme file");
+        return;
+      }
+      const base = normBase(obj.base);
+      const overrides = sanitizeOverrides(obj.overrides);
+      const name = (typeof obj.name === "string" && obj.name.trim()) || `${themeLabel(base)} import`;
+      state.settings.themeOverrides[base] = overrides;
+      state.settings.savedThemes.push({ name: name.slice(0, 60), base, overrides: clone(overrides) });
+      saveSettings();
+      setTheme(base);        // applies + re-renders
+      status(`IMPORTED THEME "${name}"`);
+    };
+    reader.readAsText(f);
   };
 }
 

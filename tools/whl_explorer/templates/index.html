@@ -1480,16 +1480,30 @@
           </div>
           <div id="sec-theme" class="settings-sec">
             <div class="settings-head">Theme editor</div>
-            <p class="settings-note">Fine-tune the colours, corners, line weight and
-               text weight of the selected theme. Edits are saved per theme and layer
-               over the built-in look — reset any single control, or the whole theme,
-               at any time. Fonts are shared across every theme; set them under
-               <b>Appearance</b>.</p>
+            <p class="settings-note">Fine-tune the colours, corners, line weight,
+               text weight and fonts of the selected theme. Edits are saved per theme
+               and layer over the built-in look — reset any single control, or the
+               whole theme, at any time. A font left on <b>Default</b> follows the
+               global choice under <b>Appearance</b>. Save a look you like, then load,
+               export or import it below.</p>
             <div class="te-topbar">
               <label for="te-theme">Theme</label>
               <select id="te-theme" class="cad-input"></select>
               <span id="te-count" class="te-count">No changes</span>
               <button id="te-reset-theme" class="cad-btn danger te-reset-theme" type="button">Reset this theme</button>
+            </div>
+            <div class="te-savebar">
+              <label for="te-saved">Saved</label>
+              <select id="te-saved" class="cad-input"></select>
+              <button id="te-load" class="cad-btn" type="button">Load</button>
+              <button id="te-delete" class="cad-btn" type="button">Delete</button>
+              <span class="te-savebar-sep"></span>
+              <input id="te-save-name" class="cad-input" placeholder="Name…" spellcheck="false" maxlength="60" />
+              <button id="te-save" class="cad-btn" type="button">Save current</button>
+              <span class="te-savebar-sep"></span>
+              <button id="te-export" class="cad-btn" type="button">Export</button>
+              <button id="te-import" class="cad-btn" type="button">Import</button>
+              <input id="te-import-file" type="file" accept=".json,.whltheme,application/json" hidden />
             </div>
             <div class="te-preview" aria-hidden="true" inert>
               <div class="te-pv-bar"><span>Preview</span><span class="te-pv-file">herbarium.pdf</span></div>

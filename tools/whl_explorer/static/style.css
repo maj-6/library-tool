@@ -2759,6 +2759,21 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 .te-count.dirty::before { background: var(--amber); border-color: var(--amber); }
 .te-topbar .te-reset-theme { margin-left: auto; }
 
+/* save / load / export / import bar */
+.te-savebar {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--face-sh);
+}
+.te-savebar label { font-size: 11px; letter-spacing: 1px; color: var(--ink); }
+.te-savebar select { max-width: 160px; }
+.te-savebar #te-save-name { width: 120px; }
+.te-savebar-sep { width: 1px; align-self: stretch; margin: 1px 3px; background: var(--face-sh); }
+
 /* live specimen: real classes so it reflects edits (colours, radius, weight) */
 .te-preview {
   border: 1px solid var(--face-sh);
@@ -2829,6 +2844,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 .te-num { width: 52px; font-family: var(--mono); }
 .te-unit { font-size: 11px; letter-spacing: 1px; color: var(--face-sh2); }
 .te-wsel { max-width: 160px; }
+.te-fontsel { max-width: 190px; }
 .te-revert {
   visibility: hidden;                /* reserves space so rows never reflow */
   width: 18px; height: 18px; flex: 0 0 auto;
