@@ -21,6 +21,8 @@ then open http://127.0.0.1:5001
 from __future__ import annotations
 
 import collections
+import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -1451,7 +1453,7 @@ def _entry_folder_info(build_id: str) -> dict:
             "metadata": (d / "metadata.json").is_file()}
 
 
-def _pdf_extract_text(p: Path, max_pages: int) -> tuple[int, int, str, int]:
+def _pdf_extract_text(p: Path, max_pages: int | None = None) -> tuple[int, int, str, int]:
     """(total_pages, shown_pages, text, pages_with_text) of a PDF's text layer.
 
     PyMuPDF rather than pypdf: it is the same library that rasterises these
@@ -1466,7 +1468,7 @@ def _pdf_extract_text(p: Path, max_pages: int) -> tuple[int, int, str, int]:
     doc = fitz.open(str(p))
     try:
         total = doc.page_count
-        shown = min(total, max_pages)
+        shown = total if max_pages is None else min(total, max_pages)
         parts, with_text = [], 0
         for i in range(shown):
             text = doc[i].get_text().strip()
@@ -1590,7 +1592,7 @@ def api_build_folder_sync(build_id: str):
         except Exception as exc:
             notes.append(f"preview failed: {exc}")
         try:
-            total, shown, text, with_text = _pdf_extract_text(src, 400)
+            total, shown, text, with_text = _pdf_extract_text(src)   # every page (the 400 cap was legacy)
             # a Google scan carries text on its front matter and nowhere else:
             # the extraction "succeeds" and is worthless
             if with_text > 1:
@@ -1719,6 +1721,137 @@ def _pageimg_pdf(raw: str) -> Path:
     return p
 
 
+# A tiny LRU of open PyMuPDF handles, keyed by (path, mtime). fitz.open reparses
+# the whole xref/object table every call, so the interactive reader — which asks
+# for one page at a time — reopened a 400 MB scan once per page; one shared handle
+# makes it a single parse. fitz Documents are not thread-safe, so _doc_lock is
+# held across the render: fine here — rasterization is GIL-bound, only a handful
+# of pages render before the on-disk cache serves them, and the background OCR
+# job keeps its own handle so it never waits on this.
+_doc_cache = collections.OrderedDict()
+_doc_lock = threading.Lock()
+_DOC_CACHE_MAX = 4
+
+
+@contextlib.contextmanager
+def _pdf_doc(path: Path):
+    """Yield a shared, cached fitz.Document for `path`, opened at most once per
+    (path, mtime). The lock is held for the whole `with` body, so keep it short:
+    read one page and get out."""
+    import fitz
+    key = (str(path), path.stat().st_mtime)
+    with _doc_lock:
+        doc = _doc_cache.get(key)
+        if doc is None:
+            # a re-saved file (new mtime) must not keep serving the stale handle
+            for k in [k for k in _doc_cache if k[0] == key[0]]:
+                try:
+                    _doc_cache.pop(k).close()
+                except Exception:
+                    pass
+            doc = fitz.open(key[0])
+            _doc_cache[key] = doc
+            while len(_doc_cache) > _DOC_CACHE_MAX:
+                _, evicted = _doc_cache.popitem(last=False)
+                try:
+                    evicted.close()
+                except Exception:
+                    pass
+        else:
+            _doc_cache.move_to_end(key)
+        yield doc
+
+
+def _cached_page_file(path: Path, mimetype: str):
+    """Serve a rendered page image. A moderate max-age keeps scroll-back fast
+    (no 304 per page for a few minutes), but NOT `immutable`: the URL is only
+    path+page+width with no mtime, so an in-place page delete/trim that rewrites
+    the PDF must still be picked up — once max-age lapses the ETag (conditional=
+    True) revalidates and the endpoint serves the freshly-keyed render."""
+    resp = send_file(path, mimetype=mimetype, conditional=True)
+    resp.headers["Cache-Control"] = "public, max-age=300"
+    return resp
+
+
+def _pages_cache_dir() -> Path:
+    d = lib.DATA_ROOT / "downloads" / "cache" / "pages"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _page_cache_key(path: Path, mtime: float, page: int, width: int) -> str:
+    """Content address for one rendered page: the same (path, mtime, page,
+    width) always maps to the same cache file, so the background warmer and the
+    live endpoint share files with no coordination."""
+    return hashlib.sha1(
+        f"{path}|{mtime}|{page}|{width}".encode("utf-8")).hexdigest()[:16]
+
+
+# Warming the page cache in the background. The reader hits /api/pdf/info the
+# instant a book opens, so that is where rendering every page at the reader's
+# width into the same on-disk cache is kicked off. Ship-1 windowing means the
+# viewport only fetches a few pages, but a fast scroll to page 900 then lands on
+# a warm file instead of a cold render. Warmed once per (path, mtime, width); a
+# re-saved file re-warms under its new mtime. Storage here is deliberately
+# unbounded — precomputing the whole book is the point.
+_warm_started: set = set()
+_warm_lock = threading.Lock()
+
+# The reader paints a low-res thumbnail as a blur-up placeholder, then the sharp
+# render on top. Warming the 200 px tier FIRST (≈10 ms/page) means a fast scroll
+# has something for every page almost immediately; the 700 px tier follows.
+_WARM_THUMB_W = 200
+_WARM_FULL_W = 700
+
+
+def _warm_pages_async(path: Path) -> None:
+    try:
+        import fitz  # binds `fitz` for the nested renderers; nothing to warm without it
+    except ImportError:
+        return
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return
+    key = (str(path), mtime)
+    with _warm_lock:
+        if key in _warm_started:
+            return
+        _warm_started.add(key)
+
+    def render_pass(doc, cache, width):
+        for page in range(1, doc.page_count + 1):
+            ck = _page_cache_key(path, mtime, page, width)
+            if (cache / f"{ck}.jpg").is_file() or (cache / f"{ck}.png").is_file():
+                continue
+            try:
+                pg = doc[page - 1]
+                zoom = width / max(1.0, pg.rect.width)
+                pix = pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+                tmp = cache / f"{ck}.warm.tmp.jpg"
+                tmp.write_bytes(pix.tobytes("jpeg", jpg_quality=82))
+                tmp.replace(cache / f"{ck}.jpg")
+            except Exception:
+                pass             # a page that won't encode is left to the live path
+            time.sleep(0.005)    # yield so interactive renders stay snappy
+
+    def run():
+        cache = _pages_cache_dir()
+        try:
+            doc = fitz.open(str(path))
+        except Exception:
+            with _warm_lock:
+                _warm_started.discard(key)       # a later open may still work
+            return
+        try:
+            render_pass(doc, cache, _WARM_THUMB_W)   # blur-up tier first: quick
+            render_pass(doc, cache, _WARM_FULL_W)    # then the sharp image
+        finally:
+            doc.close()
+
+    threading.Thread(target=run, daemon=True, name="pdf-warm").start()
+
+
 @app.route("/api/pdf/words")
 def api_pdf_words():
     """Word boxes of one page of a local PDF (?path=&page=N).
@@ -1751,8 +1884,7 @@ def api_pdf_words():
     except ImportError:
         return jsonify({"ok": False, "error": "PyMuPDF is not installed"}), 501
     from statistics import median
-    doc = fitz.open(str(p))
-    try:
+    with _pdf_doc(p) as doc:
         if page > doc.page_count:
             abort(404)
         pg = doc[page - 1]
@@ -1793,8 +1925,6 @@ def api_pdf_words():
                 "spans": [{"t": r[3], "x": round(r[1] / pw, 5),
                            "w": round((r[2] - r[1]) / pw, 5)} for r in c],
             })
-    finally:
-        doc.close()
     # No text layer? Fall back to this build's stored OCR word boxes, so an
     # image-only scan that has been OCR'd still gets a placed facsimile. The
     # build id is validated (it indexes an entry folder) before it is used.
@@ -1891,6 +2021,7 @@ def api_pdf_info():
     dimensions let the client reserve every page's box before its image
     loads, so lazy loading never shifts the scroll position."""
     p = _pageimg_pdf(request.args.get("path"))
+    _warm_pages_async(p)          # fill the page cache ahead of the scroll
     key = str(p)
     try:
         mtime = p.stat().st_mtime
@@ -1937,18 +2068,14 @@ def api_pdf_pageimg():
         import fitz  # PyMuPDF
     except ImportError:
         return jsonify({"ok": False, "error": "PyMuPDF is not installed"}), 501
-    import hashlib
-    cache = lib.DATA_ROOT / "downloads" / "cache" / "pages"
-    cache.mkdir(parents=True, exist_ok=True)
-    key = hashlib.sha1(
-        f"{p}|{p.stat().st_mtime}|{page}|{w}".encode("utf-8")).hexdigest()[:16]
+    cache = _pages_cache_dir()
+    key = _page_cache_key(p, p.stat().st_mtime, page, w)
     old = cache / f"{key}.png"
     if old.is_file():
-        return send_file(old, mimetype="image/png", conditional=True)
+        return _cached_page_file(old, "image/png")
     out = cache / f"{key}.jpg"
     if not out.is_file():
-        doc = fitz.open(str(p))
-        try:
+        with _pdf_doc(p) as doc:
             if page > doc.page_count:
                 abort(404)
             pg = doc[page - 1]
@@ -1962,11 +2089,9 @@ def api_pdf_pageimg():
                 tmp = old.with_suffix(f".{page}.tmp.png")
                 pix.save(str(tmp))
                 tmp.replace(old)
-                return send_file(old, mimetype="image/png", conditional=True)
+                return _cached_page_file(old, "image/png")
             tmp.replace(out)
-        finally:
-            doc.close()
-    return send_file(out, mimetype="image/jpeg", conditional=True)
+    return _cached_page_file(out, "image/jpeg")
 
 
 # --- OCR processing jobs -----------------------------------------------------------
@@ -2620,10 +2745,13 @@ def api_pdf_text():
     is saved automatically the first time a book's PDF is read."""
     raw_path = (request.args.get("path") or "").strip()
     url = (request.args.get("url") or "").strip()
+    # pages<=0 means every page (text extraction is cheap); a positive value caps
+    # it (default 100 for a quick preview). The old min(…, 500) was the legacy cap.
     try:
-        max_pages = max(1, min(500, int(request.args.get("pages") or 100)))
+        n = int(request.args.get("pages") or 100)
     except ValueError:
-        max_pages = 100
+        n = 100
+    max_pages = None if n <= 0 else min(2000, n)
     if raw_path:
         p = _resolve_local(raw_path)
         if p is None or not p.is_file():

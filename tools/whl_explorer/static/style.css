@@ -2545,6 +2545,8 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 }
 #ocr-mainpane .pane-bar { flex-wrap: wrap; }
 #ocr-find, #ocr-replace { width: 130px; }
+.ocr-pagenav { display: inline-flex; align-items: center; gap: 4px; }
+#ocr-page-jump { width: 3.6em; text-align: center; }
 #ocr-editor {
   flex: 1;
   min-height: 0;
@@ -2572,19 +2574,23 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 .pane-bar select.cad-input { height: 22px; padding: 1px 4px; }
 
 /* page-view marks: title pages, queued-for-OCR pages, range start */
-.ocr-pgimg { position: relative; }
+.ocr-pgimg { position: relative; background: #fff center / cover no-repeat; }
 .pg-chips { position: absolute; top: 4px; right: 4px; display: flex; gap: 3px; }
 .pg-chip {
   font-family: var(--ui);
   font-size: 10px;
-  font-weight: bold;
-  padding: 1px 5px;
+  letter-spacing: 0.5px;
+  padding: 0 4px;
+  border: 1px solid var(--face-sh2);
   border-radius: var(--radius);
-  color: #fff;
+  background: var(--face-hi);
+  color: var(--ink-light);
 }
-.pg-chip.title { background: #9b59b6; }
-.pg-chip.staged { background: var(--amber); color: #2b2000; }
-.pg-chip.svc { background: var(--cyan); color: #06282d; }
+/* state as a thin coloured edge + text — the row's own image outline already
+   carries the state, so no loud filled pill (matches .ocr-chip's CAD idiom) */
+.pg-chip.title { border-color: #9b59b6; color: #9b59b6; }
+.pg-chip.staged { border-color: var(--amber); color: var(--amber); }
+.pg-chip.svc { border-color: var(--cyan); color: var(--cyan); }
 .ocr-pgimg { cursor: pointer; }
 .ocr-pgrow.pg-title .ocr-pgimg img { outline: 2px solid #9b59b6; outline-offset: -2px; }
 .ocr-pgrow.pg-staged .ocr-pgimg img { outline: 2px dashed var(--amber); outline-offset: -2px; }
@@ -2616,7 +2622,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   display: block;
   width: 100%;
   border: 1px solid var(--canvas-line);
-  background: #fff;
+  background: transparent;   /* the blur-up thumbnail on .ocr-pgimg shows through */
 }
 /* layout mode: a facsimile pane the same shape as the page, holding the page's
    own words at their own positions. Selectable, read-only. */

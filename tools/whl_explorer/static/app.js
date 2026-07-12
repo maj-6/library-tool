@@ -6639,7 +6639,7 @@ function createPdfViewer() {
     // a failed OCR fetch renders read-only with saving disabled — one
     // stray Save must not overwrite the real file with emptiness
     const editable = !!pagesSaveTo && textOk && !isLay();
-    const shown = Math.min(count, 400);
+    const shown = count;   // no cap: images window in via observePageImgs
     // reserved page boxes: lazy image loads must not shift the content
     const dims = (info && info.dims) || [];
     const ar = (n) => {
@@ -6647,6 +6647,7 @@ function createPdfViewer() {
       return dd && dd[0] > 0 && dd[1] > 0 ? `aspect-ratio:${dd[0]} / ${dd[1]};` : "";
     };
     const img = (n) => `<img decoding="async" alt="page ${n}" style="${ar(n)}"
+        data-thumb="/api/pdf/pageimg?path=${encodeURIComponent(pagesPdf)}&page=${n}&w=200"
         data-src="/api/pdf/pageimg?path=${encodeURIComponent(pagesPdf)}&page=${n}&w=700" />`;
     const notes =
       (!textOk ? `<div class="ocr-pgnote empty">OCR text unavailable — saving disabled</div>` : "") +
@@ -9682,15 +9683,15 @@ function buildTextSrc(b) {
   }
   const localPath = (b.pdf_file || "").trim();
   // live extraction auto-saves into the entry folder (ocr/extracted.txt);
-  // pages=400 matches the folder-sync extraction cap — the default 100
-  // would permanently truncate longer books
+  // pages=0 extracts every page — the default 100 (and the old 400) would
+  // permanently truncate longer books
   if (localPath) {
-    return "/api/pdf/text?pages=400&path=" + encodeURIComponent(localPath) +
+    return "/api/pdf/text?pages=0&path=" + encodeURIComponent(localPath) +
       "&save_build=" + encodeURIComponent(b.id);
   }
   const url = (b.pdf_source || "").trim();
   if (/^https?:\/\//i.test(url)) {
-    return "/api/pdf/text?pages=400&url=" + encodeURIComponent(url) +
+    return "/api/pdf/text?pages=0&url=" + encodeURIComponent(url) +
       "&save_build=" + encodeURIComponent(b.id);
   }
   return "";
@@ -10089,10 +10090,10 @@ async function selectOcrBook(bid) {
   ocrState.bookLoading = bid;
   try {
     // a folder without OCR files gets its extraction saved automatically
-    // the first time the book is opened here (pages=400 = extraction cap)
+    // the first time the book is opened here (pages=0 = every page)
     if (!folder.ocr.length && ocrBookPdf(bid)) {
       try {
-        const ex = await (await fetch("/api/pdf/text?pages=400&path=" +
+        const ex = await (await fetch("/api/pdf/text?pages=0&path=" +
           encodeURIComponent(ocrBookPdf(bid)) +
           "&save_build=" + encodeURIComponent(bid))).json();
         // A scan carries a text layer on its cover sheet and nowhere else, so
@@ -10226,7 +10227,7 @@ async function ocrExtractSource(key) {
   el("ocr-msg").textContent = "Extracting text ...";
   try {
     const name = srcExtractedName(key);
-    const ex = await (await fetch("/api/pdf/text?pages=400&path=" +
+    const ex = await (await fetch("/api/pdf/text?pages=0&path=" +
       encodeURIComponent(pdf) +
       "&save_build=" + encodeURIComponent(bid) +
       "&save_name=" + encodeURIComponent(name) +
@@ -10335,6 +10336,7 @@ function setOcrView(v) {
   el("ocr-diff").hidden = v !== "diff";
   el("ocr-pages").hidden = v !== "pdf";
   el("ocr-layout").hidden = v !== "pdf";       // layout is a mode of the page view
+  el("ocr-pagenav").hidden = v !== "pdf";      // page jump/nav is page-view only
   el("ocr-layout").classList.toggle("active", ocrState.layout);
   if (v === "diff") renderOcrDiff();
   else if (v === "pdf") renderOcrPages();
@@ -10440,8 +10442,11 @@ async function renderOcrPages() {
     return;
   }
   const sections = ocrPageSections(d.text);
-  const cap = 400;   // matches the extraction cap
-  const shown = Math.min(count, cap);
+  // Every page is reachable — no fixed cap. The images window in via
+  // observePageImgs (only near-viewport pages fetch), so building all rows up
+  // front is DOM-only and cheap: ~60ms at 1000 pages, ~150ms at 2000 (measured),
+  // against a silent 400-page truncation before.
+  const shown = count;
   ocrState.pages = null;
   // reserving each page's true shape up front keeps lazy image loads from
   // shifting the content under the reader
@@ -10451,6 +10456,7 @@ async function renderOcrPages() {
     return dd && dd[0] > 0 && dd[1] > 0 ? `aspect-ratio:${dd[0]} / ${dd[1]};` : "";
   };
   const img = (n) => `<img decoding="async" alt="page ${n}" style="${ar(n)}"
+      data-thumb="/api/pdf/pageimg?path=${encodeURIComponent(pdf)}&page=${n}&w=200"
       data-src="/api/pdf/pageimg?path=${encodeURIComponent(pdf)}&page=${n}&w=700" />`;
   const done = () => {
     ocrState.pagesPdf = pdf;
@@ -10458,6 +10464,8 @@ async function renderOcrPages() {
     box.scrollTop = keepTop;   // 0 on a pdf switch: no scroll bleed-through
     decorateOcrPages();
     observePageImgs(box);
+    el("ocr-page-total").textContent = "/ " + ocrPageRows().length;
+    ocrSyncPageInput(ocrTopPage());
   };
   // Layout mode swaps each editable textarea for a facsimile pane: the page's
   // own words, at the position and scale they occupy on the page. Boxes are
@@ -10547,6 +10555,12 @@ function observePageImgs(container) {
     for (const e of entries) {
       const im = e.target;
       if (e.isIntersecting) {
+        // a low-res thumbnail sits behind the img as a blur-up placeholder, so
+        // the row is never a blank box while the full render arrives
+        const box = im.parentElement;   // .ocr-pgimg
+        if (box && im.dataset.thumb && !box.style.backgroundImage) {
+          box.style.backgroundImage = `url("${im.dataset.thumb}")`;
+        }
         if (im.dataset.src && !im.getAttribute("src")) im.src = im.dataset.src;
       } else if (!im.complete && im.getAttribute("src")) {
         im.removeAttribute("src");   // abort the in-flight load, free the slot
@@ -11166,7 +11180,7 @@ async function ocrQueueJob() {
   let count = 0;
   try {
     const info = await (await fetch("/api/pdf/info?path=" + encodeURIComponent(pdf))).json();
-    if (info.ok) count = Math.min(info.pages, 400);
+    if (info.ok) count = info.pages;   // stage the whole book, not just page 400
   } catch (e) { /* handled below */ }
   if (!count) { el("ocr-msg").textContent = "Could not read the PDF"; return; }
   for (let n = 1; n <= count; n++) {
@@ -11196,10 +11210,50 @@ function clearOcrPageSel() {
   ocrState.selAnchor = 0;
 }
 
+// --- page navigation -----------------------------------------------------------
+// The reader is a continuous scroll (not a one-page-at-a-time viewer), so arrows
+// keep their native line-scroll; PageUp/PageDown step a whole page, Home/End
+// jump to the ends, and the pane-bar box reads (and jumps to) the page currently
+// at the top of the viewport. data-page is 1..N contiguous, so row count == last
+// page number.
+function ocrPageRows() { return el("ocr-pages").querySelectorAll(".ocr-pgrow"); }
+
+function ocrTopPage() {
+  const box = el("ocr-pages");
+  const rows = ocrPageRows();
+  if (!rows.length) return 1;
+  const top = box.getBoundingClientRect().top;
+  let cur = +rows[0].dataset.page;
+  for (const r of rows) {
+    if (r.getBoundingClientRect().top - top <= 4) cur = +r.dataset.page;   // scrolled to/above the top edge
+    else break;
+  }
+  return cur;
+}
+
+// reflect the current page in the jump box, unless the user is typing in it
+function ocrSyncPageInput(n) {
+  const inp = el("ocr-page-jump");
+  if (inp && document.activeElement !== inp) inp.value = n;
+}
+
+function ocrScrollToPage(n) {
+  const rows = ocrPageRows();
+  if (!rows.length) return;
+  n = Math.max(1, Math.min(rows.length, n));
+  const row = el("ocr-pages").querySelector(`.ocr-pgrow[data-page="${n}"]`);
+  if (row) { row.scrollIntoView({ block: "start" }); ocrSyncPageInput(n); }
+}
+
 function onOcrPagesKey(ev) {
   if (!ocrPagesActive()) return;
   if (/^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName) ||
       ev.target.isContentEditable) return;
+  // page navigation works on any viewed PDF, so it runs before the build gate
+  if (ev.key === "PageDown") { ev.preventDefault(); ocrScrollToPage(ocrTopPage() + 1); return; }
+  if (ev.key === "PageUp") { ev.preventDefault(); ocrScrollToPage(ocrTopPage() - 1); return; }
+  if (ev.key === "Home") { ev.preventDefault(); ocrScrollToPage(1); return; }
+  if (ev.key === "End") { ev.preventDefault(); ocrScrollToPage(ocrPageRows().length); return; }
   const d = ocrSelDoc();
   const bid = d && d.buildId;
   if (!bid) return;
@@ -11369,18 +11423,31 @@ async function toggleTitlePage(bid, page) {
 // corner chips + outlines on the page rows: T = title page, amber chip =
 // staged (awaiting submit), cyan chip = processing, amber outline = selected
 function decorateOcrPages() {
+  const box = el("ocr-pages");
+  // Hidden (another tab, or a background job while the user is elsewhere): the
+  // chips are pure display over ocrState, so skip — a return to the tab
+  // re-renders and re-decorates with the box visible.
+  if (box.offsetParent === null) return;
   const d = ocrSelDoc();
   const b = d && d.buildId ? state.builds[d.buildId] : null;
   const titles = titlePageSet(b);
-  document.querySelectorAll("#ocr-pages .ocr-pgrow").forEach((row) => {
+  box.querySelectorAll(".ocr-pgrow").forEach((row) => {
     const n = +row.dataset.page;
     const k = `${d && d.buildId}:${ocrState.pagesSrc}:${n}`;
     const staged = b ? ocrState.pageTags.get(k) : undefined;
     const running = b ? ocrState.pageRunning.get(k) : undefined;
-    row.classList.toggle("pg-title", titles.has(n));
+    const title = titles.has(n);
+    row.classList.toggle("pg-title", title);
     row.classList.toggle("pg-staged", !!staged);
     row.classList.toggle("pg-queued", !!running);
     row.classList.toggle("pg-sel", ocrState.pageSel.has(n));
+    // The chip HTML depends only on title/staged/running. Rebuild it only when
+    // one of those changed, so the 1.5s job poller doesn't rewrite every row's
+    // innerHTML every tick — on a long book only the handful of pages that just
+    // changed state get touched. (Selection is a class-only cue, not a chip.)
+    const sig = `${title ? "T" : ""}|${staged || ""}|${running || ""}`;
+    if (row.dataset.chipSig === sig) return;
+    row.dataset.chipSig = sig;
     let chip = row.querySelector(".pg-chips");
     if (!chip) {
       chip = document.createElement("span");
@@ -11388,7 +11455,7 @@ function decorateOcrPages() {
       row.querySelector(".ocr-pgimg").appendChild(chip);
     }
     chip.innerHTML =
-      (titles.has(n) ? `<span class="pg-chip title" data-tip="Title page">T</span>` : "") +
+      (title ? `<span class="pg-chip title" data-tip="Title page">T</span>` : "") +
       (staged ? `<span class="pg-chip staged" data-tip="Staged: ${esc(OCR_SERVICE_LABELS[staged])} — press submit">${esc(staged.slice(0, 2).toUpperCase())}</span>` : "") +
       (running ? `<span class="pg-chip svc" data-tip="Processing: ${esc(OCR_SERVICE_LABELS[running])}">${esc(running.slice(0, 2).toUpperCase())}</span>` : "");
   });
@@ -11460,6 +11527,18 @@ function initOcrTab() {
   el("ocr-pages").addEventListener("mouseleave", () => { ocrHoverPage = 0; });
   el("ocr-pages").addEventListener("click", onOcrPagesClick);
   document.addEventListener("keydown", onOcrPagesKey);
+  // jump-to-page box + a scroll-tracked "page N / total" readout
+  el("ocr-page-jump").addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter") return;
+    ev.preventDefault();
+    const n = parseInt(el("ocr-page-jump").value, 10);
+    if (n) ocrScrollToPage(n);
+  });
+  let ocrPageRaf = 0;
+  el("ocr-pages").addEventListener("scroll", () => {
+    if (ocrPageRaf) return;
+    ocrPageRaf = requestAnimationFrame(() => { ocrPageRaf = 0; ocrSyncPageInput(ocrTopPage()); });
+  }, { passive: true });
   ocrState.layout = state.settings.ocrLayout !== false;   // layout is home
   el("ocr-layout").addEventListener("click", () => setOcrLayout(!ocrState.layout));
   // reflect the default view (page view, layout on) in the toolbar/panes —

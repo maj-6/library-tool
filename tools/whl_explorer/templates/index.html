@@ -803,6 +803,12 @@
                     data-tip="Facsimile layout: the document's text at the position and scale it occupies on the page (read-only)"></button>
             <button id="ocr-del-pages" class="cad-btn tiny icon-btn danger" type="button"
                     data-icon="trash" data-tip="Delete the selected pages from the PDF itself (a .bak.pdf backup is kept; OCR files are renumbered)"></button>
+            <span id="ocr-pagenav" class="ocr-pagenav" hidden>
+              <label class="tool-label" for="ocr-page-jump">Page</label>
+              <input id="ocr-page-jump" class="cad-input" type="text" inputmode="numeric"
+                     data-tip="Go to page — PageUp / PageDown / Home / End also navigate" />
+              <span class="tool-label" id="ocr-page-total"></span>
+            </span>
             <select id="ocr-diff-with" class="cad-input" data-tip="Compare against"></select>
             <span class="tb-sep"></span>
             <input id="ocr-find" class="cad-input" placeholder="find" />
