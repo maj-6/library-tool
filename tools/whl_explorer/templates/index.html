@@ -901,8 +901,10 @@
     <section id="analyze" class="panel-view">
       <div id="an-split">
         <aside id="an-books">
-          <div class="pane-bar"><span class="tool-label">Verified entries</span></div>
-          <ul id="an-list"></ul>
+          <div class="pane-bar"><span class="tool-label"
+                data-tip="Every entry is listed; only verified entries can be analysed (mark them verified in the Editor first)">Entries</span>
+            <span class="tool-count" id="an-count"></span></div>
+          <div class="drafting" id="an-list-wrap"><ul id="an-list"></ul></div>
         </aside>
         <div id="an-main">
           <div id="an-empty" class="empty">Select a verified entry.

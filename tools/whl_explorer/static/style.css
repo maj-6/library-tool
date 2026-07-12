@@ -2999,6 +2999,7 @@ body[data-theme] .drafting::-webkit-scrollbar {
   border-right: 1px solid var(--face-sh);
   background: var(--face);
 }
+#an-list-wrap { margin: 4px; }
 #an-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
 #an-list .an-item.an-locked { opacity: 0.45; cursor: default; }
 #an-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
