@@ -26,6 +26,9 @@
          dark, and the status/nav bars carry dark icons over the light canvas. -->
     <style name="Theme.BookCapture" parent="Theme.Material3.Light.NoActionBar">
         <item name="colorPrimary">@color/whl_cyan</item>
+        <!-- Roboto Slab is the interface font; the mono data cells override it -->
+        <item name="android:fontFamily">@font/roboto_slab</item>
+        <item name="fontFamily">@font/roboto_slab</item>
         <item name="android:textColorPrimary">@color/whl_ink</item>
         <item name="android:textColorSecondary">@color/whl_ink_dim</item>
         <item name="android:statusBarColor">@color/whl_canvas</item>
@@ -35,9 +38,12 @@
         <item name="android:windowLightNavigationBar">true</item>
     </style>
 
-    <!-- flat glyph button: face plate, 1px strong border, ink glyph -->
+    <!-- flat glyph button: face plate, 1px strong border, ink glyph. The face
+         plate press-state comes from the selector; a foreground ripple adds the
+         quick tactile confirm on top (the plate alone read as "dead"). -->
     <style name="WhlButton" parent="Widget.AppCompat.Button.Borderless">
         <item name="android:background">@drawable/whl_button</item>
+        <item name="android:foreground">?attr/selectableItemBackground</item>
         <item name="android:textColor">@color/whl_ink</item>
         <item name="android:fontFamily">monospace</item>
         <item name="android:textSize">20sp</item>

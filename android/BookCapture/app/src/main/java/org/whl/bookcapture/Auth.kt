@@ -1,10 +1,14 @@
 package org.whl.bookcapture
 
 import android.content.Context
+import android.net.Uri
+import android.util.Base64
 import org.json.JSONObject
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.MessageDigest
+import java.security.SecureRandom
 
 /**
  * Supabase Auth over plain REST — the same accounts the desktop signs in
@@ -37,6 +41,47 @@ object Auth {
     }
 
     fun signOut(ctx: Context) = Prefs.clearSession(ctx)
+
+    // --- OAuth (Google / GitHub via Supabase PKCE) ------------------------------
+    // The provider brokering happens server-side in GoTrue; the phone only opens
+    // a browser tab and later redeems a one-time code. The token response is
+    // byte-for-byte the password grant's, so it flows through session() unchanged.
+
+    const val OAUTH_REDIRECT = "org.whl.bookcapture://auth-callback"
+
+    /** URL to open in a browser tab to start provider sign-in. Stashes the PKCE
+     *  verifier for [completeOAuth] to redeem against the redirect's code. */
+    fun oauthAuthorizeUrl(ctx: Context, provider: String): String {
+        val verifier = randomVerifier()
+        Prefs.setPkceVerifier(ctx, verifier)
+        val challenge = s256(verifier)
+        return "${Prefs.supabaseUrl(ctx)}/auth/v1/authorize" +
+            "?provider=$provider" +
+            "&redirect_to=${Uri.encode(OAUTH_REDIRECT)}" +
+            "&code_challenge=$challenge&code_challenge_method=s256"
+    }
+
+    /** Redeem the redirect's auth code for a session. Blocking; returns null or a
+     *  readable error. Same response shape as signIn, so the stored session +
+     *  pullProfile happen exactly as the password path. */
+    fun completeOAuth(ctx: Context, code: String): String? {
+        val verifier = Prefs.pkceVerifier(ctx)
+        if (verifier.isEmpty()) return "sign-in expired — try again"
+        val err = session(ctx, "token?grant_type=pkce",
+                          JSONObject().put("auth_code", code).put("code_verifier", verifier))
+        Prefs.setPkceVerifier(ctx, "")            // one-shot, win or lose
+        return err
+    }
+
+    private fun randomVerifier(): String {
+        val bytes = ByteArray(64).also { SecureRandom().nextBytes(it) }
+        return Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
+    }
+
+    private fun s256(verifier: String): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(verifier.toByteArray())
+        return Base64.encodeToString(digest, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
+    }
 
     /** A live access token, silently refreshed when within a minute of
      *  expiry; null when signed out or the refresh token was revoked.

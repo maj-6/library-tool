@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Roboto Slab, the website's heading face, as the app's interface font.
+     Static Regular/Bold instanced from the repo's variable woff2. The mono
+     "data cells" set android:fontFamily="monospace" explicitly, so the theme
+     default below never touches them — they stay mono. -->
+<font-family xmlns:android="http://schemas.android.com/apk/res/android">
+    <font
+        android:fontStyle="normal"
+        android:fontWeight="400"
+        android:font="@font/roboto_slab_regular" />
+    <font
+        android:fontStyle="normal"
+        android:fontWeight="700"
+        android:font="@font/roboto_slab_bold" />
+</font-family>

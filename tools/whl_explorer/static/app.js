@@ -2351,6 +2351,7 @@ function renderSettings() {
       renderChecked();   // reg cache is keyed by source set -> re-fetch under the new key
     };
   }
+  renderLanSettings();
 
   // APPEARANCE
   const themeSel = el("theme-select");
@@ -2646,6 +2647,39 @@ function initSettingsNav() {
         s.classList.toggle("active", s.id === b.dataset.sec));
     });
   }
+}
+
+// LAN capture: bind the toggle/port to settings, and pull the live token + this
+// machine's addresses from the server (which starts/stops the listener on save).
+function renderLanSettings() {
+  const en = el("set-lan-enable"), port = el("set-lan-port");
+  const token = el("set-lan-token"), ips = el("set-lan-ips"), note = el("set-lan-note");
+  if (!en) return;                                   // section not in this build
+  en.checked = !!state.settings.lanCapture;
+  port.value = state.settings.lanPort || 8899;
+  const refresh = () => {
+    fetch("/api/lan_info").then(r => r.json()).then(info => {
+      token.value = info.token || "";
+      ips.textContent = (info.ips && info.ips.length)
+        ? info.ips.map(ip => ip + ":" + info.port).join("   ")
+        : "no LAN address found";
+      note.textContent = info.enabled
+        ? "Listening. Pair the phone with an address + the token above."
+        : "Off. Turn on to accept captures from the phone.";
+    }).catch(() => { note.textContent = "LAN info unavailable."; });
+  };
+  en.onchange = () => {
+    state.settings.lanCapture = en.checked;
+    saveSettings();                                  // PUT re-applies the listener
+    setTimeout(refresh, 400);
+  };
+  port.onchange = () => {
+    state.settings.lanPort = Math.max(1024, Math.min(65535, parseInt(port.value, 10) || 8899));
+    port.value = state.settings.lanPort;
+    saveSettings();
+    setTimeout(refresh, 400);
+  };
+  refresh();
 }
 
 function openSettings() { renderSettings(); el("settings-overlay").hidden = false; }

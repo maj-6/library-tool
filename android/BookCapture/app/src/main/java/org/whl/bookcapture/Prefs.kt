@@ -38,8 +38,26 @@ object Prefs {
     fun setProject(ctx: Context, url: String, anon: String) =
         put(ctx, "supabase_url" to url.trim(), "anon_key" to anon.trim())
 
+    // --- transport: how captures leave the phone -----------------------------
+    // "cloud" (Supabase, the default), "lan" (a paired desktop over the local
+    // network, offline), or "auto" (LAN when the desktop answers, else cloud).
+
+    fun transport(ctx: Context): String = str(ctx, "transport").ifEmpty { "cloud" }
+    fun setTransport(ctx: Context, v: String) = put(ctx, "transport" to v)
+    fun lanHost(ctx: Context): String = str(ctx, "lan_host")      // "192.168.1.5:8899"
+    fun lanToken(ctx: Context): String = str(ctx, "lan_token")
+    fun setLan(ctx: Context, host: String, token: String) =
+        put(ctx, "lan_host" to host.trim(), "lan_token" to token.trim())
+
     fun configured(ctx: Context): Boolean =
         supabaseUrl(ctx).isNotEmpty() && anonKey(ctx).isNotEmpty()
+
+    // --- capture options -----------------------------------------------------
+
+    /** Optional live-viewfinder sharpen (Android 13+); off by default. */
+    fun sharpenPreview(ctx: Context): Boolean = sp(ctx).getBoolean("sharpen_preview", false)
+    fun setSharpenPreview(ctx: Context, on: Boolean) =
+        sp(ctx).edit().putBoolean("sharpen_preview", on).apply()
 
     // --- device --------------------------------------------------------------
 
@@ -86,8 +104,14 @@ object Prefs {
             .remove("access_token").remove("refresh_token").remove("token_expiry")
             .remove("user_id").remove("email").remove("display_name")
             .remove("mistral_key").remove("deepseek_key")
+            .remove("pkce_verifier")
             .apply()
     }
+
+    /** Transient PKCE verifier held between the OAuth authorize redirect and the
+     *  code exchange; a one-shot, cleared on redeem and on sign-out. */
+    fun pkceVerifier(ctx: Context): String = str(ctx, "pkce_verifier")
+    fun setPkceVerifier(ctx: Context, v: String) = put(ctx, "pkce_verifier" to v)
 
     // --- API keys (cache of the cloud profile_secrets row) -----------------------
 

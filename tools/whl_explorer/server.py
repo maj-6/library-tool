@@ -2936,6 +2936,7 @@ def api_client_state_put():
         lib.save_json(lib.CLIENT_STATE_PATH, state)
         if "settings" in payload:
             _apply_log_level()   # verbose-logging toggle takes effect immediately
+            _apply_lan_state()   # a LAN toggle takes effect without an app restart
     # the checked set is a blob, not a stream of adds -- diff it to get events.
     # Adds and removals are logged separately from the key-set differences, so
     # each event's count always agrees with the titles it names (a PUT that
@@ -5202,40 +5203,23 @@ def _phone_result(cap: dict, raw_photos: list[bytes], photo_paths: list) -> dict
             "fields": fields, "extra": extra, "errors": errors}
 
 
-def _import_capture(cfg: dict, cap: dict, mistral_key: str,
-                    delete_remote: bool) -> str:
-    """One pending capture -> a manual entry. Returns 'imported' | 'skipped'."""
+def ingest_capture(cap: dict, raw_photos: list[bytes], mistral_key: str,
+                   photo_paths: list | None = None):
+    """Raw photo bytes + a capture dict -> a manual entry, with NO cloud
+    involved. Shared by the cloud sync (photos downloaded first) and the LAN
+    endpoint (photos arrive in the request). Prefers the phone's OCR/fields (via
+    _phone_result), else the full desktop pipeline. Returns (entry_id, errors),
+    or (None, None) when it's a duplicate (idempotent on capture_id)."""
     cap_id = re.sub(r"[^A-Za-z0-9-]", "", str(cap.get("id") or ""))[:64]
     if not cap_id:
-        return "skipped"
-    photo_paths = cap.get("photos") or []
-    if isinstance(photo_paths, str):
-        try:
-            photo_paths = json.loads(photo_paths)
-        except json.JSONDecodeError:
-            photo_paths = []
+        return None, None
     with _manual_lock:
         entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
-        dup = any(e.get("capture_id") == cap_id for e in entries.values())
-    if dup:
-        sbase.mark_capture(cfg, cap["id"], "imported")   # already here: idempotent
-        if delete_remote:                                # a lost mark left these behind
-            try:
-                sbase.delete_photos(cfg, photo_paths)
-            except sbase.SyncError:
-                pass
-        return "skipped"
-    try:
-        raw_photos = [sbase.download_photo(cfg, p) for p in photo_paths]
-    except sbase.SyncError as exc:
-        if "HTTP 404" in str(exc) or "HTTP 400" in str(exc):
-            # the photos are gone — this row can never import; stop retrying it
-            sbase.mark_capture(cfg, cap["id"], "error")
-        raise
-    # the phone (BookCapture 2.0+) OCRs + extracts in the background, so prefer
-    # its results and skip a second OCR pass; fall back to the full desktop
-    # pipeline when the phone sent nothing (older app, or no key on the phone)
-    result = _phone_result(cap, raw_photos, photo_paths) \
+        if any(e.get("capture_id") == cap_id for e in entries.values()):
+            return None, None                     # already here: idempotent
+    # prefer the phone's OCR/fields (BookCapture 2.0+) to skip a second OCR pass;
+    # fall back to the full desktop pipeline when the phone sent nothing
+    result = _phone_result(cap, raw_photos, photo_paths or []) \
         or capture.process_capture(raw_photos, mistral_key)
 
     cdir = CAPTURES_DIR / cap_id
@@ -5268,19 +5252,54 @@ def _import_capture(cfg: dict, cap: dict, mistral_key: str,
         entries[entry["id"]] = entry
         lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
 
-    sbase.mark_capture(cfg, cap["id"], "imported")
     # a phone capture is attributed to whoever photographed it (the signed-in
     # contributor), not to whoever ran the sync; device name is the fallback
     actor = str(cap.get("contributor") or cap.get("device") or "phone")[:60]
     activity("captured", "book", actor=actor, detail=entry.get("title", ""))
+    return entry["id"], result["errors"]
+
+
+def _import_capture(cfg: dict, cap: dict, mistral_key: str,
+                    delete_remote: bool) -> str:
+    """One pending CLOUD capture -> a manual entry. Returns 'imported'|'skipped'."""
+    cap_id = re.sub(r"[^A-Za-z0-9-]", "", str(cap.get("id") or ""))[:64]
+    if not cap_id:
+        return "skipped"
+    photo_paths = cap.get("photos") or []
+    if isinstance(photo_paths, str):
+        try:
+            photo_paths = json.loads(photo_paths)
+        except json.JSONDecodeError:
+            photo_paths = []
+    with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+        dup = any(e.get("capture_id") == cap_id for e in entries.values())
+    if dup:
+        sbase.mark_capture(cfg, cap["id"], "imported")   # already here: idempotent
+        if delete_remote:                                # a lost mark left these behind
+            try:
+                sbase.delete_photos(cfg, photo_paths)
+            except sbase.SyncError:
+                pass
+        return "skipped"
+    try:
+        raw_photos = [sbase.download_photo(cfg, p) for p in photo_paths]
+    except sbase.SyncError as exc:
+        if "HTTP 404" in str(exc) or "HTTP 400" in str(exc):
+            # the photos are gone — this row can never import; stop retrying it
+            sbase.mark_capture(cfg, cap["id"], "error")
+        raise
+    new_id, errors = ingest_capture(cap, raw_photos, mistral_key, photo_paths)
+
+    sbase.mark_capture(cfg, cap["id"], "imported")
     # keep the cloud copies when OCR/extraction had trouble — the originals
     # are local too, but leaving the remote set makes recovery foolproof
-    if delete_remote and not result["errors"]:
+    if delete_remote and not errors:
         try:
             sbase.delete_photos(cfg, photo_paths)
         except sbase.SyncError:
             pass                                   # cleanup is best-effort
-    return "imported"
+    return "imported" if new_id else "skipped"
 
 
 def _books_mirror_rows() -> list[dict]:
@@ -5499,6 +5518,143 @@ def _migrate_stored_paths() -> None:
         lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
 
 
+# --- LAN capture (offline phone -> desktop, bypassing the cloud) --------------
+# A SECOND HTTP listener bound to 0.0.0.0 serving ONLY /lan/ping and
+# /lan/capture. The admin sidecar (this module's `app`) stays loopback-only and
+# is never exposed. Off unless the user opts in (client setting `lanCapture`, or
+# the WHL_LAN_ENABLE env from the desktop shell); a pairing token guards the
+# capture route. Photos arrive in the request and feed the SAME ingest the cloud
+# sync uses, so a LAN capture lands as an identical manual entry — no internet.
+
+_LAN_TOKEN_PATH = lib.DATA_ROOT / "lan_token.txt"
+
+
+def _lan_token() -> str:
+    """The pairing token the phone must present; generated once, kept locally."""
+    import secrets
+    try:
+        tok = _LAN_TOKEN_PATH.read_text("utf-8").strip()
+    except OSError:
+        tok = ""
+    if not tok:
+        tok = secrets.token_urlsafe(18)
+        try:
+            _LAN_TOKEN_PATH.write_text(tok, "utf-8")
+        except OSError:
+            pass
+    return tok
+
+
+def _lan_settings() -> tuple[bool, int]:
+    """(enabled, port). Env overrides the client setting so the desktop shell
+    can flip it on without a UI round-trip; default off, port 8899."""
+    env_en = os.environ.get("WHL_LAN_ENABLE")
+    s = _client_settings()
+    enabled = (env_en == "1") if env_en is not None else bool(s.get("lanCapture"))
+    try:
+        port = int(os.environ.get("WHL_LAN_PORT") or s.get("lanPort") or 8899)
+    except (TypeError, ValueError):
+        port = 8899
+    return enabled, port
+
+
+def _lan_ips() -> list[str]:
+    """This host's LAN IPv4 addresses, so the desktop can tell the phone where
+    to point (manual pairing)."""
+    import socket
+    ips = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if not ip.startswith("127."):
+                ips.add(ip)
+    except OSError:
+        pass
+    return sorted(ips)
+
+
+lan_app = Flask("whl_lan")
+
+
+@lan_app.get("/lan/ping")
+def _lan_ping():
+    # unauthenticated liveness so the phone can confirm it reached the right host
+    import socket
+    return jsonify(app="whl-capture", device=socket.gethostname() or "desktop")
+
+
+@lan_app.post("/lan/capture")
+def _lan_capture():
+    import hmac
+    if not hmac.compare_digest(request.headers.get("X-WHL-Token", ""), _lan_token()):
+        abort(401)
+    try:
+        cap = json.loads(request.form.get("meta", "{}"))
+    except json.JSONDecodeError:
+        abort(400)
+    if not isinstance(cap, dict):
+        abort(400)
+    files = request.files.getlist("photo")
+    names = [f.filename or "" for f in files]
+    photos = [p for p in (f.read() for f in files) if p]
+    if not photos:
+        abort(400)
+    mistral_key = str(_client_settings().get("mistralKey") or "").strip()
+    try:
+        # pass the filenames so _phone_result can key the phone's OCR by name
+        entry_id, _errors = ingest_capture(cap, photos, mistral_key, names)
+    except Exception as exc:                       # noqa: BLE001 — report, don't 500-crash
+        log.exception("LAN capture ingest failed")
+        return jsonify(error=str(exc)[:200]), 500
+    if entry_id is None:
+        return jsonify(status="duplicate"), 200    # idempotent: a retried POST
+    return jsonify(status="imported", id=entry_id), 200
+
+
+@app.get("/api/lan_info")
+def _api_lan_info():
+    """Loopback-only: the desktop UI reads this to show the pairing details."""
+    enabled, port = _lan_settings()
+    return jsonify(enabled=enabled, port=port, token=_lan_token(), ips=_lan_ips())
+
+
+_lan_lock = threading.Lock()
+_lan_server: dict = {"srv": None, "thread": None, "port": None}
+
+
+def _apply_lan_state() -> None:
+    """Start, stop, or restart the LAN listener to match the current setting.
+    Idempotent — safe to call from startup AND from the settings-save path, so
+    the desktop toggle takes effect live, no app restart."""
+    enabled, port = _lan_settings()
+    with _lan_lock:
+        running = _lan_server["srv"] is not None
+        if enabled and running and _lan_server["port"] == port:
+            return                                     # already in the desired state
+        if not enabled and not running:
+            return
+        if running:                                    # stop (disabled or port changed)
+            try:
+                _lan_server["srv"].shutdown()
+            except Exception:
+                pass
+            _lan_server.update(srv=None, thread=None, port=None)
+        if not enabled:
+            log.info("LAN capture off")
+            return
+        from werkzeug.serving import make_server
+        try:
+            srv = make_server("0.0.0.0", port, lan_app, threaded=True)
+        except OSError as exc:
+            log.warning("LAN capture listener not started (%s)", exc)
+            return
+        t = threading.Thread(target=srv.serve_forever, daemon=True, name="lan-capture")
+        t.start()
+        _lan_server.update(srv=srv, thread=t, port=port)
+        log.info("LAN capture on 0.0.0.0:%d  token=%s  ips=%s",
+                 port, _lan_token(), ", ".join(_lan_ips()) or "?")
+
+
 if __name__ == "__main__":
     # Make existing user data portable (absolute -> data-root-relative paths).
     _migrate_stored_paths()
@@ -5512,6 +5668,8 @@ if __name__ == "__main__":
     ).start()
     # Cloud capture autosync (interval read from settings each tick; 0 = off).
     threading.Thread(target=_cloud_autosync_loop, daemon=True).start()
+    # LAN capture listener (offline phone -> desktop); off unless opted in.
+    _apply_lan_state()
     # Activity mirror: local jsonl -> cloud events, as the signed-in user.
     threading.Thread(target=_push_events_loop, daemon=True, name="event-push").start()
     # WHL_PORT lets a second instance run on another port (a distinct origin,
