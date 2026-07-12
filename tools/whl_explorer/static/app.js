@@ -535,19 +535,20 @@ function bookParseChanged(a, b) {
 }
 
 function applyTheme() {
-  let t = state.settings.theme || "";
-  // migrate a retired id, and clamp anything unrecognised: an orphan id would
-  // otherwise stick in localStorage, sync to the server, and silently render
-  // the bare :root fallback while the picker showed nothing
-  if (t in LEGACY_THEMES) t = LEGACY_THEMES[t];
-  if (!THEMES.some(([id]) => id === t)) t = DEFAULT_THEME;
-  if (t !== state.settings.theme) {
-    state.settings.theme = t;
-    saveSettings();
+  let id = state.settings.theme || "";
+  // resolve the active theme: a custom theme keeps its id and renders on its
+  // base built-in's chrome; a legacy/unknown built-in id clamps to a survivor
+  // (an orphan id would otherwise stick in localStorage and render the bare
+  // :root fallback while the picker showed nothing)
+  if (!findCustom(id)) {
+    let t = id in LEGACY_THEMES ? LEGACY_THEMES[id] : id;
+    if (!THEMES.some(([x]) => x === t)) t = DEFAULT_THEME;
+    if (t !== state.settings.theme) { state.settings.theme = t; saveSettings(); }
+    id = t;
   }
-  document.body.dataset.theme = t;
-  applyThemeOverrides();   // re-apply this theme's edits (and clear the old set)
-  applyFont();             // fonts too: a per-theme font override, else the global default
+  document.body.dataset.theme = themeBase(id);   // base built-in supplies the CSS chrome
+  applyThemeOverrides();   // this theme's edits (custom.overrides or the built-in's), inline
+  applyFont();             // fonts too: a per-theme override, else the global default
 }
 
 // the one way to change theme: the Settings menu and the Appearance select
@@ -581,7 +582,7 @@ let _appliedThemeVars = [];
 function applyThemeOverrides() {
   for (const name of _appliedThemeVars) document.body.style.removeProperty(name);
   _appliedThemeVars = [];
-  const ov = (state.settings.themeOverrides || {})[document.body.dataset.theme] || {};
+  const ov = activeOverrides();
   for (const [name, val] of Object.entries(ov)) {
     if (THEME_FONT_VARS.has(name) || val == null || val === "") continue;
     document.body.style.setProperty(name, val);
@@ -594,12 +595,70 @@ function applyThemeOverrides() {
 // non-font tokens) so the two never fight over the same inline body vars.
 const FONT_SETTING_VARS = [["fontUi", "--ui"], ["font", "--mono"], ["fontMono2", "--mono2"]];
 function applyFont() {
-  const ov = (state.settings.themeOverrides || {})[document.body.dataset.theme] || {};
+  const ov = activeOverrides();
   for (const [key, cssVar] of FONT_SETTING_VARS) {
     const val = ov[cssVar] || state.settings[key] || "";   // per-theme, else global, else default
     if (val) document.body.style.setProperty(cssVar, val);
     else document.body.style.removeProperty(cssVar);
   }
+}
+
+// --- theme model: built-in themes (THEMES + CSS body[data-theme]) plus user
+// "custom" themes (settings.savedThemes: {id, name, base, overrides}). A custom
+// theme renders as its base built-in's chrome with its own overrides layered on
+// top, so it reuses the whole override/font machinery; only the pickers and the
+// Settings menu need to know custom themes exist.
+function customThemes() { return state.settings.savedThemes || []; }
+function findCustom(id) { return customThemes().find((t) => t && t.id === id); }
+// the built-in id whose CSS chrome a theme uses (a custom's base, else itself,
+// normalized through the legacy map and clamped to a real built-in)
+function themeBase(id) {
+  const c = findCustom(id);
+  let b = c ? c.base : id;
+  if (b in LEGACY_THEMES) b = LEGACY_THEMES[b];
+  return THEMES.some(([x]) => x === b) ? b : DEFAULT_THEME;
+}
+// the override map that IS a theme's edits (custom.overrides, or the built-in's
+// themeOverrides[base]); created on demand only when `create` is set
+function themeOverrideMap(id, create) {
+  const c = findCustom(id);
+  if (c) return c.overrides || (create ? (c.overrides = {}) : {});
+  const base = themeBase(id), o = state.settings.themeOverrides;
+  return o[base] || (create ? (o[base] = {}) : {});
+}
+function activeOverrides() { return themeOverrideMap(state.settings.theme, false); }
+function themeLabelOf(id) {
+  const c = findCustom(id);
+  return c ? c.name : (THEMES.find(([x]) => x === id) || [, id])[1];
+}
+// [id, label, isCustom] for every selectable theme (built-ins, then customs)
+function allThemes() {
+  return THEMES.map(([id, label]) => [id, label, false])
+    .concat(customThemes().map((t) => [t.id, t.name, true]));
+}
+function newThemeId() {
+  const used = new Set(customThemes().map((t) => t.id));
+  let n = 1; while (used.has("custom-" + n)) n++;
+  return "custom-" + n;
+}
+// fill a <select> with built-ins + custom themes (custom shown italic)
+function fillThemeSelect(sel) {
+  if (!sel) return;
+  sel.innerHTML = "";
+  for (const [id, label, custom] of allThemes()) {
+    const o = document.createElement("option");
+    o.value = id; o.textContent = label;
+    if (custom) o.style.fontStyle = "italic";
+    sel.appendChild(o);
+  }
+  sel.value = state.settings.theme;
+}
+// rebuild everywhere the theme list appears, after a custom theme is added,
+// renamed or removed
+function refreshThemePickers() {
+  fillThemeSelect(el("theme-select"));
+  fillThemeSelect(el("te-theme"));
+  buildThemeMenu();
 }
 
 const el = (id) => document.getElementById(id);
@@ -1150,6 +1209,22 @@ function normalizeSettings() {
   if (!state.settings.themeOverrides || typeof state.settings.themeOverrides !== "object")
     state.settings.themeOverrides = {};
   if (!Array.isArray(state.settings.savedThemes)) state.settings.savedThemes = [];
+  // custom themes need a stable unique id + a well-formed shape (older snapshots
+  // predate the id; a duplicate/missing id would collide in the picker)
+  state.settings.savedThemes = state.settings.savedThemes.filter((t) => t && typeof t === "object");
+  {
+    const used = new Set();
+    for (const t of state.settings.savedThemes) {
+      if (typeof t.id !== "string" || !t.id || used.has(t.id)) {
+        let n = 1; while (used.has("custom-" + n)) n++;
+        t.id = "custom-" + n;
+      }
+      used.add(t.id);
+      if (typeof t.name !== "string" || !t.name) t.name = "Custom";
+      if (typeof t.base !== "string") t.base = DEFAULT_THEME;
+      if (!t.overrides || typeof t.overrides !== "object") t.overrides = {};
+    }
+  }
   state.settings.colWidths = state.settings.colWidths || {};
   // migrate the old single-table column setting
   if (Object.keys(state.settings.checkedCols).length &&
@@ -2727,14 +2802,7 @@ function renderSettings() {
 
   // APPEARANCE
   const themeSel = el("theme-select");
-  themeSel.innerHTML = "";
-  for (const [id, label] of THEMES) {
-    const o = document.createElement("option");
-    o.value = id;
-    o.textContent = label;
-    themeSel.appendChild(o);
-  }
-  themeSel.value = state.settings.theme;   // applyTheme() has already normalized it
+  fillThemeSelect(themeSel);               // built-ins + custom themes (custom italic)
   themeSel.onchange = () => setTheme(themeSel.value);
   const scaleSel = el("ui-scale-select");
   if (scaleSel) {
@@ -3108,27 +3176,21 @@ function themeHex(v) {
 function renderThemeEditor() {
   const host = el("te-rows");
   if (!host) return;
-  const theme = document.body.dataset.theme || DEFAULT_THEME;
+  const activeId = state.settings.theme;
+  const custom = findCustom(activeId);
+  const base = themeBase(activeId);        // = document.body.dataset.theme; the base chrome
 
-  // theme picker: switching the active theme switches what you are editing
+  // theme picker: rebuilt each render (custom themes change); switching switches
+  // both the active theme and what the editor edits
   const tsel = el("te-theme");
   if (tsel) {
-    if (!tsel.options.length) {
-      for (const [id, label] of THEMES) {
-        const o = document.createElement("option");
-        o.value = id; o.textContent = label;
-        tsel.appendChild(o);
-      }
-      tsel.onchange = () => setTheme(tsel.value);
-    }
-    tsel.value = theme;
+    fillThemeSelect(tsel);
+    tsel.onchange = () => setTheme(tsel.value);
   }
 
   const cs = getComputedStyle(document.body);
-  const overrides = () =>
-    state.settings.themeOverrides[theme] ||
-    (state.settings.themeOverrides[theme] = {});
-  const ov = state.settings.themeOverrides[theme] || {};
+  const getOv = () => themeOverrideMap(activeId, true);    // create-on-demand edit target
+  const ov = themeOverrideMap(activeId, false);
   // effective value: the override if present, else the theme's own value
   // (resolved from CSS; synthetic tokens with no CSS value fall back to def)
   const eff = (tok) => {
@@ -3138,8 +3200,7 @@ function renderThemeEditor() {
   };
 
   function updateCount() {
-    const m = state.settings.themeOverrides[theme] || {};
-    const n = Object.keys(m).length;
+    const n = Object.keys(themeOverrideMap(activeId, false)).length;
     const c = el("te-count");
     if (c) {
       c.textContent = n ? `${n} override${n === 1 ? "" : "s"}` : "No changes";
@@ -3150,16 +3211,18 @@ function renderThemeEditor() {
   }
 
   const setTok = (tok, val) => {
-    overrides()[tok.v] = val;
+    getOv()[tok.v] = val;
     document.body.style.setProperty(tok.v, val);          // live preview
     if (!_appliedThemeVars.includes(tok.v)) _appliedThemeVars.push(tok.v);
     updateCount();
   };
   const resetTok = (tok) => {
-    const m = state.settings.themeOverrides[theme];
-    if (m) {
-      delete m[tok.v];
-      if (!Object.keys(m).length) delete state.settings.themeOverrides[theme];
+    delete themeOverrideMap(activeId, false)[tok.v];
+    // built-in: drop the now-empty override object. A custom theme is kept even
+    // with no overrides -- it is still a distinct theme (identical to its base).
+    if (!custom) {
+      const bm = state.settings.themeOverrides[base];
+      if (bm && !Object.keys(bm).length) delete state.settings.themeOverrides[base];
     }
     saveSettings();
     applyThemeOverrides();
@@ -3254,11 +3317,13 @@ function renderThemeEditor() {
           sel.appendChild(o); sel.value = stored;
         }
         sel.addEventListener("change", () => {
-          const m = overrides();
-          if (sel.value) { m[tok.v] = sel.value; markDirty(); }
+          if (sel.value) { getOv()[tok.v] = sel.value; markDirty(); }
           else {
-            delete m[tok.v];
-            if (!Object.keys(m).length) delete state.settings.themeOverrides[theme];
+            delete themeOverrideMap(activeId, false)[tok.v];
+            if (!custom) {
+              const bm = state.settings.themeOverrides[base];
+              if (bm && !Object.keys(bm).length) delete state.settings.themeOverrides[base];
+            }
             rev.classList.remove("on");
           }
           applyFont(); saveSettings(); updateCount();      // fonts: applyFont, not setTok
@@ -3287,79 +3352,75 @@ function renderThemeEditor() {
 
   const resetBtn = el("te-reset-theme");
   if (resetBtn) resetBtn.onclick = () => {
-    if (!state.settings.themeOverrides[theme]) return;
-    delete state.settings.themeOverrides[theme];
+    if (custom) {
+      if (!custom.overrides || !Object.keys(custom.overrides).length) return;
+      custom.overrides = {};
+    } else {
+      const bm = state.settings.themeOverrides[base];
+      if (!bm || !Object.keys(bm).length) return;
+      delete state.settings.themeOverrides[base];
+    }
     saveSettings();
     applyThemeOverrides();
     applyFont();
     renderThemeEditor();
   };
 
-  // --- saved themes: named snapshots (settings.savedThemes) + file export/import ---
+  // --- custom themes: Duplicate (copy any theme into a new editable one),
+  // Rename / Delete (custom only), and file Export / Import ---
   const clone = (o) => JSON.parse(JSON.stringify(o || {}));
-  const themeLabel = (id) => (THEMES.find(([x]) => x === id) || [, id])[1];
   const normBase = (id) => {
     const b = id in LEGACY_THEMES ? LEGACY_THEMES[id] : id;
     return THEMES.some(([x]) => x === b) ? b : DEFAULT_THEME;
   };
-  const saved = state.settings.savedThemes;
-  const ssel = el("te-saved");
-  if (ssel) {
-    ssel.innerHTML = "";
-    if (!saved.length) {
-      const o = document.createElement("option");
-      o.value = ""; o.textContent = "(no saved themes)";
-      ssel.appendChild(o); ssel.disabled = true;
-    } else {
-      ssel.disabled = false;
-      saved.forEach((s, i) => {
-        const o = document.createElement("option");
-        o.value = String(i);
-        o.textContent = `${s.name} · ${themeLabel(s.base)}`;
-        ssel.appendChild(o);
-      });
-    }
-  }
-  const savedIdx = () => parseInt((el("te-saved") || {}).value, 10);
+  const nameEl = el("te-save-name");
   const onClick = (id, fn) => { const b = el(id); if (b) b.onclick = fn; };
+  const setDisabled = (id, v) => { const b = el(id); if (b) b.disabled = v; };
+  setDisabled("te-rename", !custom);   // built-in themes can't be renamed or deleted
+  setDisabled("te-delete", !custom);
 
-  onClick("te-save", () => {
-    const nameEl = el("te-save-name");
-    let name = (nameEl && nameEl.value.trim()) || `${themeLabel(theme)} custom`;
-    saved.push({ name: name.slice(0, 60), base: theme, overrides: clone(state.settings.themeOverrides[theme]) });
+  onClick("te-duplicate", () => {
+    const nid = newThemeId();
+    const typed = nameEl && nameEl.value.trim();
+    const name = (typed || `${themeLabelOf(activeId)} copy`).slice(0, 60);
+    customThemes().push({ id: nid, name, base, overrides: clone(themeOverrideMap(activeId, false)) });
     if (nameEl) nameEl.value = "";
     saveSettings();
-    status(`SAVED THEME "${name}"`);
-    renderThemeEditor();
+    refreshThemePickers();
+    setTheme(nid);           // switch to (and edit) the new copy
+    status(`CREATED THEME "${name}"`);
   });
-  onClick("te-load", () => {
-    const s = saved[savedIdx()];
-    if (!s) return;
-    const base = normBase(s.base);
-    state.settings.themeOverrides[base] = sanitizeOverrides(s.overrides);
+  onClick("te-rename", () => {
+    if (!custom) { statusErr("RENAME :: duplicate a built-in theme first"); return; }
+    const typed = nameEl && nameEl.value.trim();
+    if (!typed) { statusErr("RENAME :: type a name first"); return; }
+    custom.name = typed.slice(0, 60);
+    if (nameEl) nameEl.value = "";
     saveSettings();
-    setTheme(base);          // applies overrides + fonts and re-renders the editor
-    status(`LOADED THEME "${s.name}"`);
+    refreshThemePickers();
+    renderThemeEditor();
+    status(`RENAMED THEME "${custom.name}"`);
   });
   onClick("te-delete", () => {
-    const i = savedIdx();
-    if (!(i >= 0) || !saved[i]) return;
-    const name = saved[i].name;
-    saved.splice(i, 1);
+    if (!custom) return;
+    const i = customThemes().indexOf(custom);
+    const nm = custom.name;
+    if (i >= 0) customThemes().splice(i, 1);
     saveSettings();
-    status(`DELETED THEME "${name}"`);
-    renderThemeEditor();
+    refreshThemePickers();
+    setTheme(base);          // fall back to the base built-in
+    status(`DELETED THEME "${nm}"`);
   });
   onClick("te-export", () => {
     const payload = {
       app: "whl-theme", version: 1,
-      name: themeLabel(theme), base: theme,
-      overrides: clone(state.settings.themeOverrides[theme]),
+      name: themeLabelOf(activeId), base,
+      overrides: clone(themeOverrideMap(activeId, false)),
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = `${theme}-theme.whltheme.json`;
+    a.download = `${(custom ? custom.name : base).replace(/[^\w.-]+/g, "-").toLowerCase()}.whltheme.json`;
     a.click();
     URL.revokeObjectURL(a.href);
     status("EXPORTED THEME");
@@ -3375,19 +3436,20 @@ function renderThemeEditor() {
       let obj;
       try { obj = JSON.parse(reader.result); }
       catch (e) { statusErr("IMPORT FAILED :: not valid JSON"); return; }
-      // require the export handshake so a stray .json can't silently wipe a theme
+      // require the export handshake so a stray .json can't masquerade as a theme
       if (!obj || typeof obj !== "object" || obj.app !== "whl-theme" ||
           typeof obj.base !== "string" || !obj.overrides || typeof obj.overrides !== "object") {
         statusErr("IMPORT FAILED :: not a Library Tool theme file");
         return;
       }
-      const base = normBase(obj.base);
+      const b = normBase(obj.base);
       const overrides = sanitizeOverrides(obj.overrides);
-      const name = (typeof obj.name === "string" && obj.name.trim()) || `${themeLabel(base)} import`;
-      state.settings.themeOverrides[base] = overrides;
-      state.settings.savedThemes.push({ name: name.slice(0, 60), base, overrides: clone(overrides) });
+      const name = ((typeof obj.name === "string" && obj.name.trim()) || `${themeLabelOf(b)} import`).slice(0, 60);
+      const nid = newThemeId();
+      customThemes().push({ id: nid, name, base: b, overrides });   // import creates a new custom theme
       saveSettings();
-      setTheme(base);        // applies + re-renders
+      refreshThemePickers();
+      setTheme(nid);
       status(`IMPORTED THEME "${name}"`);
     };
     reader.readAsText(f);
@@ -15671,12 +15733,12 @@ function buildThemeMenu() {
   const host = el("menu-themes");
   if (!host) return;
   host.innerHTML = "";
-  for (const [id, label] of THEMES) {
+  for (const [id, label, custom] of allThemes()) {
     const cmd = "theme:" + id;
     MENU_CMDS[cmd] = () => setTheme(id);
     const b = document.createElement("button");
     b.type = "button";
-    b.className = "menu-item";
+    b.className = "menu-item" + (custom ? " menu-item-custom" : "");
     b.dataset.cmd = cmd;
     b.innerHTML = `<span class="menu-check"></span>${esc(label)}`;
     host.appendChild(b);
@@ -15730,7 +15792,7 @@ function updateMenuState() {
   check("table-whl", !onChecked);
   check("opt-auto-ia", state.settings.autoIaDownload !== false);   // default-on
   check("opt-expand-sets", !!state.settings.expandSets);
-  for (const [id] of THEMES) check("theme:" + id, id === state.settings.theme);
+  for (const [id] of allThemes()) check("theme:" + id, id === state.settings.theme);
   const svc = state.settings.ocrService || "tesseract";
   for (const [id] of OCR_SERVICES) check("ocrsvc:" + id, id === svc);
 }
@@ -16733,7 +16795,10 @@ function init() {
   // first render reflects whatever the server holds.
   syncClientStateOnLoad().then((adopted) => {
     hydrateSecrets();      // warm credentials without delaying the initial UI
-    if (adopted) { applyTheme(); applyFont(); }
+    // adopted server settings can carry a different set of custom themes, so
+    // rebuild the pickers/menu before re-applying (else the menubar Theme
+    // submenu keeps the pre-sync list)
+    if (adopted) { refreshThemePickers(); applyTheme(); applyFont(); }
     maybeWizard();       // first desktop launch: the guide covers sign-in too
     maybeAuthPrompt();   // needs the adopted settings: authPromptDismissed
     loadDownloads();

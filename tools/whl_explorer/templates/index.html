@@ -1484,8 +1484,9 @@
                text weight and fonts of the selected theme. Edits are saved per theme
                and layer over the built-in look — reset any single control, or the
                whole theme, at any time. A font left on <b>Default</b> follows the
-               global choice under <b>Appearance</b>. Save a look you like, then load,
-               export or import it below.</p>
+               global choice under <b>Appearance</b>. <b>Duplicate</b> any theme to make
+               your own editable copy: custom themes appear in the theme list in
+               <i>italics</i> and can be renamed, deleted, exported or imported.</p>
             <div class="te-topbar">
               <label for="te-theme">Theme</label>
               <select id="te-theme" class="cad-input"></select>
@@ -1493,13 +1494,10 @@
               <button id="te-reset-theme" class="cad-btn danger te-reset-theme" type="button">Reset this theme</button>
             </div>
             <div class="te-savebar">
-              <label for="te-saved">Saved</label>
-              <select id="te-saved" class="cad-input"></select>
-              <button id="te-load" class="cad-btn" type="button">Load</button>
+              <input id="te-save-name" class="cad-input" placeholder="New name…" spellcheck="false" maxlength="60" />
+              <button id="te-duplicate" class="cad-btn" type="button">Duplicate</button>
+              <button id="te-rename" class="cad-btn" type="button">Rename</button>
               <button id="te-delete" class="cad-btn" type="button">Delete</button>
-              <span class="te-savebar-sep"></span>
-              <input id="te-save-name" class="cad-input" placeholder="Name…" spellcheck="false" maxlength="60" />
-              <button id="te-save" class="cad-btn" type="button">Save current</button>
               <span class="te-savebar-sep"></span>
               <button id="te-export" class="cad-btn" type="button">Export</button>
               <button id="te-import" class="cad-btn" type="button">Import</button>

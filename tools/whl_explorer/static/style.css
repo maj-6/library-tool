@@ -975,6 +975,7 @@ body.desktop .win-controls { display: inline-flex; }
 .menu-key { margin-left: auto; opacity: 0.6; font-size: 10px; padding-left: 18px; }
 .menu-check { display: inline-block; width: 12px; }
 .menu-check.on::before { content: "\2713"; }
+.menu-item-custom { font-style: italic; }   /* user-made themes, set apart from the built-ins */
 .menu-sep { margin: 3px 6px; border-top: var(--border-w, 1px) solid var(--face-sh); }
 
 /* Theme / OCR-engine hover submenus. The parent is a .menu-item (no data-cmd —
