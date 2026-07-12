@@ -3,18 +3,19 @@
 // a `seq` stale-response guard, and a 220ms debounce) with category and
 // language facets so every view of the catalogue deep-links.
 
-import { searchVolumes, pdfHref, usingCloud, safeYear, facetSource, catText } from "./data.js";
+import {
+  searchVolumes, usingCloud, safeYear, facetSource, catText,
+  suggestTitles, suggestAuthors, getAuthorBio,
+} from "./data.js";
+import { renderRecord } from "./records.js";
 
 const PAGE = 24;
 const el = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-// A description may carry Markdown emphasis; the snippet wants plain text.
-const plain = (s) => String(s ?? "").replace(/[*_`>#]+/g, "").replace(/\s+/g, " ").trim();
-
 const SORTS = new Set(["title", "year", "year-desc", "recent"]);
-const state = { q: "", from: null, to: null, cat: "", lang: "", sort: "title", page: 0 };
+const state = { q: "", from: null, to: null, cat: "", lang: "", author: "", sort: "title", page: 0 };
 
 // The query lives in the URL, so a search is linkable and the back button works.
 function readUrl() {
@@ -24,6 +25,7 @@ function readUrl() {
   state.to = safeYear(p.get("to"));
   state.cat = (p.get("cat") || "").slice(0, 300);
   state.lang = (p.get("lang") || "").slice(0, 60);
+  state.author = (p.get("author") || "").slice(0, 300);
   state.sort = SORTS.has(p.get("sort")) ? p.get("sort") : "title";
   const page = Math.trunc(Number(p.get("page")));
   state.page = Number.isFinite(page) && page > 0 ? page - 1 : 0;
@@ -40,59 +42,11 @@ function writeUrl(replace) {
   if (state.to != null) p.set("to", state.to);
   if (state.cat) p.set("cat", state.cat);
   if (state.lang) p.set("lang", state.lang);
+  if (state.author) p.set("author", state.author);
   if (state.sort !== "title") p.set("sort", state.sort);
   if (state.page) p.set("page", state.page + 1);
   const url = p.toString() ? `?${p}` : location.pathname;
   history[replace ? "replaceState" : "pushState"]({}, "", url);
-}
-
-function bytes(n) {
-  if (!n) return "";
-  const mb = n / 1048576;
-  return mb >= 1 ? `${mb.toFixed(0)} MB` : `${(n / 1024).toFixed(0)} KB`;
-}
-
-// ---- catalogue record ------------------------------------------------------
-function chips(v) {
-  const paths = Array.isArray(v.category_paths) ? v.category_paths : [];
-  return paths.map((p) => {
-    const t = catText(p);
-    if (!t) return "";
-    return `<a class="chip" href="?cat=${encodeURIComponent(t)}">${esc(t)}</a>`;
-  }).join("");
-}
-
-function record(v) {
-  const href = pdfHref(v);
-  const slug = encodeURIComponent(v.slug);
-  const imprint = [
-    v.publisher && esc(v.publisher),
-    v.publisher_city && esc(v.publisher_city),
-    v.year && String(v.year),
-    v.edition && esc(v.edition),
-    v.pages && `${v.pages} pp`,
-  ].filter(Boolean).map((x) => `<span>${x}</span>`).join("");
-
-  // quiet row actions on purpose — a primary button on every record would
-  // stripe the catalogue with dark blocks; the book page carries the primary
-  const actions = href
-    ? `<a class="btn" href="read.html?slug=${slug}">Read</a>
-       <a class="btn" href="${esc(href)}" target="_blank" rel="noopener"
-          title="${bytes(v.pdf_bytes) || "PDF"}">PDF</a>`
-    : `<a class="btn" aria-disabled="true" title="No scan yet">Read</a>`;
-
-  const cats = chips(v);
-  const desc = plain(v.description);
-
-  return `<li class="record">
-    <h3 class="rec-title"><a href="book.html?slug=${slug}">${esc(v.title)}</a></h3>
-    ${v.subtitle ? `<div class="rec-author">${esc(v.subtitle)}</div>` : ""}
-    ${v.authors ? `<div class="rec-author">${esc(v.authors)}</div>` : ""}
-    ${imprint ? `<div class="rec-imprint">${imprint}</div>` : ""}
-    ${cats ? `<div class="rec-cats">${cats}</div>` : ""}
-    ${desc ? `<p class="rec-desc">${esc(desc)}</p>` : ""}
-    <div class="rec-actions">${actions}</div>
-  </li>`;
 }
 
 // ---- facets (built once from the whole corpus) -----------------------------
@@ -185,6 +139,7 @@ function markFacets() {
 
 function renderActiveFilters() {
   const tags = [];
+  if (state.author) tags.push(["Author", state.author, "author"]);
   if (state.cat) tags.push(["Category", state.cat, "cat"]);
   if (state.lang) tags.push(["Language", state.lang, "lang"]);
   if (state.from != null || state.to != null) {
@@ -195,8 +150,30 @@ function renderActiveFilters() {
     `<span class="filter-tag">${esc(k)}: ${esc(v)}
        <a href="#" data-drop="${key}" role="button" aria-label="Remove ${esc(k)} filter">×</a></span>`
   ).join("");
-  const any = state.cat || state.lang || state.from != null || state.to != null || state.q;
+  const any = state.cat || state.lang || state.author || state.from != null || state.to != null || state.q;
   el("clear-facets").hidden = !any;
+}
+
+// ---- author About-card ------------------------------------------------------
+// Shown above the results when browsing a single author (arrived at via the
+// autocomplete or a deep link). The bio fills in asynchronously so it never
+// blocks the results render.
+let authorBioSeq = 0;
+function renderAuthorCard(author, total) {
+  const box = el("author-card");
+  if (!author) { box.hidden = true; box.innerHTML = ""; return; }
+  box.hidden = false;
+  box.innerHTML = `
+    <h2 class="author-card-name">${esc(author)}</h2>
+    <p class="author-stats">${total} work${total === 1 ? "" : "s"} in the catalogue ·
+      <a href="author.html?author=${encodeURIComponent(author)}">About this author →</a></p>
+    <div class="author-card-bio" id="author-card-bio"></div>`;
+  const mine = ++authorBioSeq;
+  getAuthorBio(author).then((bio) => {
+    if (mine !== authorBioSeq || !bio) return;
+    const bioBox = document.getElementById("author-card-bio");
+    if (bioBox) bioBox.textContent = bio.replace(/[*_`>#]+/g, "").split(/\n{2,}/)[0].trim();
+  }).catch(() => { /* a missing bio is not an error */ });
 }
 
 // ---- render ----------------------------------------------------------------
@@ -210,7 +187,7 @@ async function render() {
   try {
     res = await searchVolumes({
       q: state.q, yearFrom: state.from, yearTo: state.to,
-      cat: state.cat, lang: state.lang, sort: state.sort,
+      cat: state.cat, lang: state.lang, author: state.author, sort: state.sort,
       limit: PAGE, offset: state.page * PAGE,
     });
   } catch (e) {
@@ -231,8 +208,10 @@ async function render() {
     return render();
   }
 
+  renderAuthorCard(state.author, total);
+
   el("results").innerHTML = rows.length
-    ? rows.map(record).join("")
+    ? rows.map(renderRecord).join("")
     : `<li class="empty">${state.q ? `Nothing matches “${esc(state.q)}”.` : "No volumes match these filters."}</li>`;
 
   const first = state.page * PAGE + 1;
@@ -290,13 +269,14 @@ el("active-filters").addEventListener("click", (ev) => {
   const which = drop.dataset.drop;
   if (which === "cat") state.cat = "";
   else if (which === "lang") state.lang = "";
+  else if (which === "author") state.author = "";
   else if (which === "year") { state.from = state.to = null; el("from").value = ""; el("to").value = ""; }
   state.page = 0;
   go(false);
 });
 
 el("clear-facets").addEventListener("click", () => {
-  state.q = state.cat = state.lang = "";
+  state.q = state.cat = state.lang = state.author = "";
   state.from = state.to = null;
   state.sort = "title";
   state.page = 0;
@@ -308,6 +288,113 @@ el("prev").addEventListener("click", () => { state.page--; go(); el("results").s
 el("next").addEventListener("click", () => { state.page++; go(); el("results").scrollIntoView({ block: "start" }); });
 addEventListener("popstate", () => { readUrl(); render(); });
 
+// ---- autocomplete -----------------------------------------------------------
+// Titles and authors, in one dropdown under the search box. A title suggestion
+// goes straight to its record; an author suggestion replaces the search with
+// that author's whole bibliography (the About-card view above), rather than
+// just narrowing the current text search.
+let suggestSeq = 0;
+let suggestItems = [];   // flat list, titles then authors, in display order
+let suggestActive = -1;
+
+function closeSuggest() {
+  el("q-suggest").hidden = true;
+  el("q-suggest").innerHTML = "";
+  suggestItems = [];
+  suggestActive = -1;
+  el("q").setAttribute("aria-expanded", "false");
+}
+
+function renderSuggest(titles, authors) {
+  suggestItems = [
+    ...titles.map((t) => ({ type: "title", ...t })),
+    ...authors.map((a) => ({ type: "author", ...a })),
+  ];
+  suggestActive = -1;
+  if (!suggestItems.length) { closeSuggest(); return; }
+  const titleRows = titles.map((t, i) =>
+    `<li class="suggest-row" data-idx="${i}" role="option">
+       <span class="suggest-title">${esc(t.title)}</span>
+       ${t.authors ? `<span class="suggest-meta">${esc(t.authors)}</span>` : ""}
+     </li>`).join("");
+  const authorRows = authors.map((a, i) =>
+    `<li class="suggest-row" data-idx="${titles.length + i}" role="option">
+       <span class="suggest-title">${esc(a.author)}</span>
+       <span class="cat-count">${a.work_count}</span>
+     </li>`).join("");
+  el("q-suggest").innerHTML =
+    (titles.length ? `<li class="suggest-group-label">Titles</li>${titleRows}` : "") +
+    (authors.length ? `<li class="suggest-group-label">Authors</li>${authorRows}` : "");
+  el("q-suggest").hidden = false;
+  el("q").setAttribute("aria-expanded", "true");
+}
+
+function markSuggestActive() {
+  el("q-suggest").querySelectorAll(".suggest-row").forEach((r) =>
+    r.classList.toggle("active", Number(r.dataset.idx) === suggestActive));
+}
+
+function chooseSuggest(idx) {
+  const item = suggestItems[idx];
+  if (!item) return;
+  closeSuggest();
+  if (item.type === "title") {
+    location.href = `book.html?slug=${encodeURIComponent(item.slug)}`;
+    return;
+  }
+  state.author = item.author;
+  state.q = "";
+  el("q").value = "";
+  state.page = 0;
+  go(false);
+}
+
+let suggestDebounce;
+el("q").addEventListener("input", () => {
+  clearTimeout(suggestDebounce);
+  const q = el("q").value.trim();
+  if (q.length < 2) { closeSuggest(); return; }
+  suggestDebounce = setTimeout(async () => {
+    const mine = ++suggestSeq;
+    const [titles, authors] = await Promise.all([
+      suggestTitles(q).catch(() => []),
+      suggestAuthors(q).catch(() => []),
+    ]);
+    if (mine !== suggestSeq) return;
+    if (el("q").value.trim() !== q) return;   // stale by the time it resolved
+    renderSuggest(titles, authors);
+  }, 150);
+});
+
+// mousedown (not click) so it fires before the input's blur would close the list
+el("q-suggest").addEventListener("mousedown", (ev) => {
+  const row = ev.target.closest("[data-idx]");
+  if (!row) return;
+  ev.preventDefault();
+  chooseSuggest(Number(row.dataset.idx));
+});
+
+el("q").addEventListener("keydown", (ev) => {
+  if (el("q-suggest").hidden) return;
+  if (ev.key === "ArrowDown") {
+    ev.preventDefault();
+    suggestActive = Math.min(suggestActive + 1, suggestItems.length - 1);
+    markSuggestActive();
+  } else if (ev.key === "ArrowUp") {
+    ev.preventDefault();
+    suggestActive = Math.max(suggestActive - 1, 0);
+    markSuggestActive();
+  } else if (ev.key === "Enter") {
+    if (suggestActive >= 0) { ev.preventDefault(); chooseSuggest(suggestActive); }
+  } else if (ev.key === "Escape") {
+    closeSuggest();
+  }
+});
+
+document.addEventListener("click", (ev) => {
+  if (!ev.target.closest(".searchfield")) closeSuggest();
+});
+
 // ---- boot ------------------------------------------------------------------
 el("offline").hidden = usingCloud;
 readUrl();
@@ -318,6 +405,12 @@ facetSource()
     renderCatTree(f);
     renderLangs(f);
     markFacets();
+    if (Number.isFinite(f.ymin) && Number.isFinite(f.ymax)) {
+      el("from").placeholder = String(f.ymin);
+      el("to").placeholder = String(f.ymax);
+      el("from").min = el("to").min = String(f.ymin);
+      el("from").max = el("to").max = String(f.ymax);
+    }
   })
   .catch(() => {
     el("facet-cats").innerHTML = `<div class="note-more">Categories unavailable.</div>`;

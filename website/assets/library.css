@@ -143,6 +143,54 @@ a { color: var(--accent-ink); }
               inset -1px -1px 0 rgba(255, 254, 250, 0.7);
 }
 .searchfield input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+/* autocomplete dropdown: titles + authors, in one panel under the search box */
+.suggest {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 20;
+  margin: 2px 0 0;
+  padding: 4px 0;
+  list-style: none;
+  background: #fff;
+  border: 1px solid var(--rule-mid);
+  border-top: none;
+  max-height: 340px;
+  overflow: auto;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.10);
+}
+.suggest-group-label {
+  font-size: 10.5px;
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  font-weight: 600;
+  padding: 6px 12px 4px;
+}
+.suggest-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 12px;
+  border-left: 2px solid transparent;
+  cursor: pointer;
+}
+.suggest-row:hover, .suggest-row.active {
+  background: var(--card);
+  border-left-color: var(--accent);
+}
+.suggest-title {
+  font-size: 14px;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.suggest-meta { font-size: 12px; color: var(--ink-faint); white-space: nowrap; margin-left: 10px; }
+
 .sortbox { display: flex; align-items: center; gap: 8px; }
 .sortbox select {
   font: 13px/1.4 inherit;
@@ -248,18 +296,26 @@ a { color: var(--accent-ink); }
 .lang-row.active > a { color: var(--ink); font-weight: 600; }
 .lang-row .cat-count { font-size: 11px; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
 
-/* year range */
-.yearbox { display: flex; align-items: center; gap: 8px; }
-.yearbox input {
-  width: 76px;
-  font: 13px/1.4 inherit;
-  padding: 7px 8px;
+/* year range — one bordered pill, not two separately-boxed inputs */
+.yearbox {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px;
   border: 1px solid var(--rule-mid);
   background: #fff;
-  color: var(--ink);
   border-radius: 1px;
   box-shadow: inset 1px 1px 1px rgba(50, 44, 34, 0.14),
               inset -1px -1px 0 rgba(255, 254, 250, 0.7);
+}
+.yearbox input {
+  width: 56px;
+  font: 13px/1.4 inherit;
+  padding: 5px 4px;
+  border: none;
+  background: transparent;
+  color: var(--ink);
+  text-align: center;
 }
 .yearbox .dash { color: var(--ink-faint); }
 
@@ -280,6 +336,22 @@ a { color: var(--accent-ink); }
 
 /* ---- results ---- */
 .records { min-width: 0; padding-top: 6px; }
+
+/* the About-card header shown above the results when browsing one author's
+   whole bibliography (arrived at via the search autocomplete or a deep link) */
+.author-card {
+  padding: 16px 18px;
+  margin: 0 0 4px;
+  background: var(--card);
+  border: 1px solid var(--rule-mid);
+  border-left: 3px solid var(--accent);
+}
+.author-card-name { font-size: 20px; margin: 0 0 4px; font-weight: 600; }
+.author-card .author-stats { margin: 0 0 8px; }
+.author-card-bio { font-size: 14px; color: var(--ink-soft); line-height: 1.5; }
+
+.author-stats { font-size: 14px; color: var(--ink-soft); margin: 0 0 20px; }
+.author-stats a { color: var(--accent-ink); }
 
 .active-filters {
   display: flex;
@@ -304,10 +376,21 @@ a { color: var(--accent-ink); }
 
 .records-list { list-style: none; margin: 0; padding: 0; }
 .record {
+  display: flex;
+  gap: 16px;
   padding: 20px 0;
   border-bottom: 1px solid var(--rule-soft);
 }
 .record:first-child { border-top: 3px double var(--rule); }
+.rec-thumb {
+  flex: 0 0 84px;
+  width: 84px;
+  height: 112px;
+  object-fit: cover;
+  border: 1px solid var(--rule-soft);
+  background: #fff;
+}
+.rec-body { min-width: 0; flex: 1 1 auto; }
 .rec-title { margin: 0 0 3px; font-size: 19px; font-weight: 600; line-height: 1.25; }
 .rec-title a { color: var(--ink); text-decoration: none; }
 .rec-title a:hover { color: var(--accent-ink); text-decoration: underline; }
@@ -453,8 +536,19 @@ a { color: var(--accent-ink); }
 .note-page { font-size: 11px; color: var(--ink-faint); float: right; }
 .note-more { font-size: 13px; color: var(--ink-soft); }
 
-/* side column: metadata table + actions */
+/* side column: cover thumbnail + metadata table + actions */
 .book-side { align-self: start; position: sticky; top: 20px; }
+.book-thumb {
+  display: block;
+  width: 100%;
+  max-width: 200px;
+  height: auto;
+  aspect-ratio: 3 / 4;
+  object-fit: cover;
+  border: 1px solid var(--rule-soft);
+  background: #fff;
+  margin: 0 0 18px;
+}
 .meta-table { width: 100%; border-collapse: collapse; font-size: 13.5px; margin-bottom: 22px; }
 .meta-table th, .meta-table td { text-align: left; vertical-align: top; padding: 8px 0; border-bottom: 1px solid var(--rule-soft); }
 .meta-table th {

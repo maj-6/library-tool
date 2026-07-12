@@ -157,7 +157,6 @@ const state = {
     dbUrls: {},                 // per-database download URLs (name -> url)
     uploadSplitH: null, pdfBrowseDir: "",
     scanRecentMin: 30,          // scan-attach picker: show only PDFs this new
-    maxRows: 400,               // row cap for the big table views
     whlModalOcr: false,         // OCR panel in the WHL publication viewer
     previewPages: 20,           // page cap for PDF preview derivatives
     previewOriginal: false,     // view the original PDF instead of a preview
@@ -977,7 +976,6 @@ function normalizeSettings() {
   }
 }
 
-function maxRows() { return state.settings.maxRows || 400; }
 
 // --- client-state sync (localStorage cache + authoritative server copy) ----------
 // The three blobs (checked books / settings / attention marks) write through
@@ -1870,10 +1868,23 @@ function applyTableChrome(key) {
     table.style.width = "";
   }
   table.dataset.ck = key;
-  for (const tr of table.querySelectorAll("tbody tr")) {
-    [...tr.children].forEach((td, i) => {
-      td.style.display = hide[i] ? "none" : "";
-    });
+  applyColHide(table, table.querySelectorAll("tbody tr"));
+}
+
+// Column hiding is per-<td> (there is no colgroup): set display:none on each
+// hidden column's cell. Column widths are header-driven under table-layout:fixed,
+// so ONLY this display mask needs re-applying to rows built after
+// applyTableChrome's one-shot pass — i.e. every streamed chunk past the first,
+// which is why streamRows() calls this on each appended chunk.
+function applyColHide(table, rows) {
+  const key = table && table.dataset.ck;
+  const def = key && tableDef(key);
+  if (!def) return;
+  const vis = state.settings.colVis[key] || {};
+  const hide = def.cols.map(([k]) => vis[k] === false);
+  for (const tr of rows) {
+    const tds = tr.children;
+    for (let i = 0; i < tds.length; i++) tds[i].style.display = hide[i] ? "none" : "";
   }
 }
 
@@ -2504,16 +2515,6 @@ function renderSettings() {
   }
 
   // TABLE VIEW
-  const mr = el("set-max-rows");
-  mr.value = maxRows();
-  mr.onchange = () => {
-    state.settings.maxRows =
-      Math.max(50, Math.min(5000, parseInt(mr.value, 10) || 400));
-    mr.value = state.settings.maxRows;
-    saveSettings();
-    renderTop();
-    renderBottomRows();
-  };
   const wrap = el("cols-checked");
   wrap.innerHTML = "";
   const vis = state.settings.colVis.checked || {};
@@ -4435,13 +4436,59 @@ function checkedSetHeaderTr(item, cmode) {
   return tr;
 }
 
+// Chunked ("streaming") table rendering. Render the first STREAM_CHUNK rows
+// now, then append the next chunk as the user scrolls toward the bottom — an
+// IntersectionObserver watches the tail and pulls the next chunk a screenful
+// early (rootMargin). This replaces the old fixed maxRows cap: every row is
+// reachable, but only a viewport-plus-buffer's worth sit in the DOM at first,
+// so a table of thousands opens instantly instead of building every <tr> up
+// front. items[] is the full ordered list; renderItem(item, index) returns a
+// <tr>. The delegated table click/edit handlers are unaffected — they read
+// dataset off whatever rows are currently in the DOM.
+const STREAM_CHUNK = 200;
+function streamRows(tbody, items, renderItem) {
+  const pane = tbody.closest(".drafting");   // the scroll container
+  if (tbody._streamCleanup) tbody._streamCleanup();   // detach the previous render's listener
+  tbody.innerHTML = "";
+  let rendered = 0;
+  const appendChunk = () => {
+    const end = Math.min(rendered + STREAM_CHUNK, items.length);
+    const frag = document.createDocumentFragment();
+    const fresh = [];
+    for (let i = rendered; i < end; i++) {
+      const tr = renderItem(items[i], i);
+      if (tr) { frag.appendChild(tr); fresh.push(tr); }
+    }
+    tbody.appendChild(frag);
+    rendered = end;
+    // carry the hidden-column mask onto the new rows (applyTableChrome only ran
+    // over the first chunk); no-op when nothing is hidden or the table is fresh.
+    applyColHide(tbody.closest("table"), fresh);
+  };
+  // A scroll listener, not an IntersectionObserver: IO does not fire for
+  // table-row targets, and a <tbody> can't hold a non-table element to observe
+  // instead. Append the next chunk whenever the pane is scrolled within 800px
+  // of the bottom (and, on first render, until 200 rows overflow the pane).
+  // clientHeight>0 guards a hidden pane (a re-render behind another tab), where
+  // "near bottom" would otherwise be trivially true and load every row.
+  const nearBottom = () => !pane ||
+    (pane.clientHeight > 0 && pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 800);
+  const fill = () => { while (rendered < items.length && nearBottom()) appendChunk(); };
+  if (pane) pane.addEventListener("scroll", fill, { passive: true });
+  tbody._streamCleanup = () => {
+    if (pane) pane.removeEventListener("scroll", fill);
+    tbody._streamCleanup = null;
+  };
+  appendChunk();   // first chunk now
+  fill();          // top up until the (visible) pane is filled
+}
+
 function renderChecked() {
   // Background re-renders must not destroy an in-progress cell edit.
   const active = document.activeElement;
   if (active && active.classList && active.classList.contains("cell-edit")) return;
   updateCheckedCount();
   const tbody = el("checked-rows");
-  tbody.innerHTML = "";
   state.rowsById = new Map(combinedRows().map((r) => [String(r.id), r]));
   // a deleted/unchecked row can no longer be the repopulation target
   if (state.checkedSelected != null &&
@@ -4455,20 +4502,29 @@ function renderChecked() {
 
   el("checked-empty").hidden = rows.length !== 0;
 
+  // flatten sets (a header + its expanded volumes) into one ordered list so the
+  // streamer can chunk across set boundaries.
+  const items = [];
   for (const item of groupSets(rows)) {
     if (item.type === "set") {
-      tbody.appendChild(checkedSetHeaderTr(item, cmode));
+      items.push({ set: item });
       if (item.expanded) {
-        item.vols.forEach((vr, i) => {
-          const tr = checkedRowTr(vr, cmode, { isVol: true, setKey: item.key });
-          if (i === item.vols.length - 1) tr.classList.add("set-last");
-          tbody.appendChild(tr);
-        });
+        item.vols.forEach((vr, i) =>
+          items.push({ vr, setKey: item.key, last: i === item.vols.length - 1 }));
       }
     } else {
-      tbody.appendChild(checkedRowTr(item.row, cmode, {}));
+      items.push({ row: item.row });
     }
   }
+  streamRows(tbody, items, (d) => {
+    if (d.set) return checkedSetHeaderTr(d.set, cmode);
+    if (d.vr) {
+      const tr = checkedRowTr(d.vr, cmode, { isVol: true, setKey: d.setKey });
+      if (d.last) tr.classList.add("set-last");
+      return tr;
+    }
+    return checkedRowTr(d.row, cmode, {});
+  });
 
   applyTableChrome("checked");
   markSortHeaders("checked");
@@ -4929,7 +4985,7 @@ function renderBottomRows() {
   } else if (t === "ch") {
     records = (state.chBooks || [])
       .filter((b) => matchesFind(q, `${b.title} ${b.subtitle || ""}`, b.author, b.year))
-      .slice(0, maxRows()).map(chToRecord);
+      .map(chToRecord);
     // the master list is the Google Sheets publish preview: manual entries
     // (light yellow) are the rows a sync would append
     for (const e of state.manual) {
@@ -4943,42 +4999,46 @@ function renderBottomRows() {
   } else {
     records = (state.whlRows || [])
       .filter((r) => matchesFind(q, `${r.title} ${r.subtitle || ""}`, r.authors, r.year))
-      .slice(0, maxRows()).map(whlToRecord);
+      .map(whlToRecord);
   }
 
   state.bottomRecords = records;
-  records.forEach((rec, i) => {
-    const tr = document.createElement("tr");
-    tr.className = "bottom-row";
-    // master-list publish preview: manual additions light yellow, rows
-    // already checked into the working table light blue
-    if (t === "ch") {
-      if (rec._src === "manual") tr.classList.add("ml-manual");
-      else if (state.checked.has(ckey("ch_library", rec._idx))) tr.classList.add("ml-checked");
-    }
-    // needs-attention marks (Q while hovering) apply here too
-    let bWhy = "";
-    if (rec._src === "manual" && rec._mid) {
-      const e = state.manual.find((x) => x.id === rec._mid);
-      if (e && e.attention) {
-        tr.classList.add("attention");
-        bWhy = attnReason(e.attention);
-      }
-    } else if (attnHas(`${rec._src}:${rec._idx}`)) {
-      tr.classList.add("attention");
-      bWhy = attnReason((state.attn || {})[`${rec._src}:${rec._idx}`]);
-    }
-    tr.dataset.bi = i;
-    tr.dataset.tip = recordTip(rec, def.label) +
-      (bWhy ? "\nNeeds attention: " + bWhy : "");
-    tr.innerHTML = def.cells(rec).map((c) => `<td>${c == null ? "" : c}</td>`).join("");
-    tbody.appendChild(tr);
-  });
+  streamRows(tbody, records, (rec, i) => bottomRecordTr(rec, i, t, def));
   el("bottom-empty").textContent = "No matches";   // reset from the History tab's message
   el("bottom-empty").hidden = records.length !== 0;
   el("bottom-count").textContent =
     `${records.length} rows` + (t === "ol" && state.olNote ? ` — ${state.olNote}` : "");
   applyTableChrome("b-" + t);
+}
+
+// build one bottom-pane row <tr>; `i` is the absolute index into
+// state.bottomRecords, read back by the delegated click handler.
+function bottomRecordTr(rec, i, t, def) {
+  const tr = document.createElement("tr");
+  tr.className = "bottom-row";
+  // master-list publish preview: manual additions light yellow, rows
+  // already checked into the working table light blue
+  if (t === "ch") {
+    if (rec._src === "manual") tr.classList.add("ml-manual");
+    else if (state.checked.has(ckey("ch_library", rec._idx))) tr.classList.add("ml-checked");
+  }
+  // needs-attention marks (Q while hovering) apply here too
+  let bWhy = "";
+  if (rec._src === "manual" && rec._mid) {
+    const e = state.manual.find((x) => x.id === rec._mid);
+    if (e && e.attention) {
+      tr.classList.add("attention");
+      bWhy = attnReason(e.attention);
+    }
+  } else if (attnHas(`${rec._src}:${rec._idx}`)) {
+    tr.classList.add("attention");
+    bWhy = attnReason((state.attn || {})[`${rec._src}:${rec._idx}`]);
+  }
+  tr.dataset.bi = i;
+  tr.dataset.tip = recordTip(rec, def.label) +
+    (bWhy ? "\nNeeds attention: " + bWhy : "");
+  tr.innerHTML = def.cells(rec).map((c) => `<td>${c == null ? "" : c}</td>`).join("");
+  return tr;
 }
 
 // --- History tab: a persistent, revertible action log ------------------------
@@ -4999,6 +5059,9 @@ function histCanRevert(r) {
 function renderHistoryRows() {
   el("bottom-head").innerHTML = "<tr><th>Time</th><th>Action</th><th></th></tr>";
   const tbody = el("bottom-rows");
+  // #bottom-rows is shared with the streamed tables; drop any live stream scroll
+  // listener so it can't append foreign (Master-list) rows into the History list.
+  if (tbody._streamCleanup) tbody._streamCleanup();
   tbody.innerHTML = "";
   const log = actionLog();
   const q = (state.checkedFilter || "").toLowerCase();
@@ -5333,34 +5396,32 @@ function renderWhlTop() {
     .filter((r) => yearInRange(r.year));
   const so = state.sort.whl;
   if (so) rows = sortRowsBy(rows, (r) => whlSortVal(r, so.key), so.dir);
-  const cap = maxRows();
-  const shown = rows.slice(0, cap);
-  const tbody = el("whltop-rows");
-  tbody.innerHTML = "";
   origRowShown = null;
-  for (const r of shown) {
-    const tr = document.createElement("tr");
-    tr.dataset.widx = r.idx;
-    // Corrected, added, and draft rows are visually distinct.
-    if (r.added) tr.classList.add("whl-row-added");
-    else if (r.corrected) tr.classList.add("whl-row-corrected");
-    if (r.status === "draft") tr.classList.add("whl-row-draft");
-    if (attnHas("whl:" + r.idx)) tr.classList.add("attention");
-    if (state.whlSelected === r.idx) tr.classList.add("whl-selected");
-    tr.dataset.tip = recordTip(
-      Object.assign(whlToRecord(r), { subtitle: r.subtitle || "",
-        categories: r.categories || "", notes: r.description || "" }), "WHL");
-    const whlWhy = attnReason((state.attn || {})["whl:" + r.idx]);
-    if (whlWhy) tr.dataset.tip += "\nNeeds attention: " + whlWhy;
-    tr.innerHTML = whlRowCells(r, mode);
-    tbody.appendChild(tr);
-  }
-  el("whltop-empty").hidden = shown.length !== 0;
-  el("top-count").textContent =
-    `${rows.length} WHL rows` + (rows.length > cap ? ` (showing ${cap})` : "");
+  streamRows(el("whltop-rows"), rows, (r) => whlRowTr(r, mode));
+  el("whltop-empty").hidden = rows.length !== 0;
+  el("top-count").textContent = `${rows.length} WHL rows`;
   applyTableChrome("whl");
   markSortHeaders("whl");
   refreshInfoIfActive();
+}
+
+// build one WHL top-table row <tr>
+function whlRowTr(r, mode) {
+  const tr = document.createElement("tr");
+  tr.dataset.widx = r.idx;
+  // Corrected, added, and draft rows are visually distinct.
+  if (r.added) tr.classList.add("whl-row-added");
+  else if (r.corrected) tr.classList.add("whl-row-corrected");
+  if (r.status === "draft") tr.classList.add("whl-row-draft");
+  if (attnHas("whl:" + r.idx)) tr.classList.add("attention");
+  if (state.whlSelected === r.idx) tr.classList.add("whl-selected");
+  tr.dataset.tip = recordTip(
+    Object.assign(whlToRecord(r), { subtitle: r.subtitle || "",
+      categories: r.categories || "", notes: r.description || "" }), "WHL");
+  const whlWhy = attnReason((state.attn || {})["whl:" + r.idx]);
+  if (whlWhy) tr.dataset.tip += "\nNeeds attention: " + whlWhy;
+  tr.innerHTML = whlRowCells(r, mode);
+  return tr;
 }
 
 function whlRowCells(r, mode) {
@@ -9588,6 +9649,7 @@ function switchBuildTab(id) {
   document.querySelectorAll("#build-editor .pane-sub").forEach((p) =>
     p.classList.toggle("active", p.id === id));
   if (id === "btab-source") refreshSourceTab();
+  if (id === "btab-resources") refreshResourcesTab();
 }
 
 // --- AI summary from the OCR text (OpenAI-compatible API via the server) --
@@ -9809,6 +9871,83 @@ async function removeSecondaryPdf(sid) {
     el("b-src-msg").textContent = "Secondary source removed";
     refreshSourceTab();
   }
+}
+
+// --- Resources tab: pick a thumbnail from title pages, a computed cover
+// candidate, or any figures the OCR pipeline already extracted -------------
+
+function resourceCard(src, source, label) {
+  return `
+    <div class="res-card" data-source="${esc(source)}">
+      <img loading="lazy" decoding="async" src="${esc(src)}" alt="" />
+      <div class="res-card-label">${esc(label)}</div>
+      <button type="button" class="cad-btn tiny res-use">Use as thumbnail</button>
+    </div>`;
+}
+
+function resourcePreviewHtml(bid, pdf, source) {
+  const m = /^page:(\d+)$/.exec(source || "");
+  if (m && pdf) {
+    return `<img class="res-current-img" loading="lazy" decoding="async"
+      src="/api/pdf/pageimg?path=${encodeURIComponent(pdf)}&page=${m[1]}&w=220" alt="" />`;
+  }
+  const im = /^image:(.+)$/.exec(source || "");
+  if (im) {
+    return `<img class="res-current-img" loading="lazy" decoding="async"
+      src="/api/builds/${encodeURIComponent(bid)}/ocr/images/${encodeURIComponent(im[1])}" alt="" />`;
+  }
+  return `<p class="res-empty">None chosen — falls back to an auto-detected page at publish.</p>`;
+}
+
+async function setThumbnailSource(bid, source) {
+  if (await patchBuildRaw(bid, { thumbnail_source: source }, true)) {
+    status(`THUMBNAIL SET :: ${source}`);
+    refreshResourcesTab();
+  }
+}
+
+async function refreshResourcesTab() {
+  const b = currentBuild();
+  const bid = b && b.id;
+  if (!bid) return;
+  const stale = () => state.buildSel !== bid;
+  const pdf = (b.pdf_file || "").trim();
+
+  el("res-current").innerHTML = resourcePreviewHtml(bid, pdf, b.thumbnail_source);
+
+  const titles = [...titlePageSet(b)].sort((a, z) => a - z);
+  el("res-titlepages").innerHTML = pdf && titles.length
+    ? titles.map((n) =>
+        resourceCard(`/api/pdf/pageimg?path=${encodeURIComponent(pdf)}&page=${n}&w=220`,
+          `page:${n}`, `Page ${n}`)).join("")
+    : `<p class="res-empty">No title pages marked yet — mark one in the OCR tab's page view.</p>`;
+
+  if (!pdf) {
+    el("res-cover").innerHTML = `<p class="res-empty">Attach a PDF first.</p>`;
+  } else {
+    el("res-cover").innerHTML = `<p class="res-empty">Checking…</p>`;
+    try {
+      const r = await (await fetch(`/api/builds/${encodeURIComponent(bid)}/cover-candidate`)).json();
+      if (stale()) return;
+      el("res-cover").innerHTML = r.ok && r.page
+        ? resourceCard(`/api/pdf/pageimg?path=${encodeURIComponent(pdf)}&page=${r.page}&w=220`,
+            `page:${r.page}`, `Cover (page ${r.page})`)
+        : `<p class="res-empty">No content page detected.</p>`;
+    } catch (e) {
+      if (!stale()) el("res-cover").innerHTML = `<p class="res-empty">Could not check for a cover candidate.</p>`;
+    }
+  }
+
+  const meta = await ocrLayoutMeta(bid);
+  if (stale()) return;
+  const names = Object.keys(meta.images || {});
+  el("res-images").innerHTML = names.length
+    ? names.map((name) => {
+        const page = (meta.images[name] || {}).page;
+        return resourceCard(`/api/builds/${encodeURIComponent(bid)}/ocr/images/${encodeURIComponent(name)}`,
+          `image:${name}`, page ? `p. ${page}` : name);
+      }).join("")
+    : `<p class="res-empty">None yet — run OCR with the Mistral service to extract figures.</p>`;
 }
 
 async function refreshSourceTab() {
@@ -10242,6 +10381,32 @@ function renderOcrDocs() {
       <span class="tree-count">${loose.length}</span>`;
     list.appendChild(li);
     for (const d of loose) list.appendChild(docLi(d));
+  }
+
+  // figures an OCR service (Mistral) cut out of a page, alongside the
+  // compiled text output above — from the same /api/entries folder info
+  const images = bid ? ((ocrState.books || {})[bid] || {}).images || [] : [];
+  if (images.length) {
+    const hdr = document.createElement("li");
+    hdr.className = "ocr-src";
+    hdr.dataset.src = "";
+    hdr.dataset.tip = "Figures an OCR service cut out of a page";
+    hdr.innerHTML = `
+      <span class="tree-arrow"></span>
+      <span class="tree-ico">${ICONS.image}</span>
+      <span class="bi-title">Images</span>
+      <span class="tree-count">${images.length}</span>`;
+    list.appendChild(hdr);
+    for (const im of images) {
+      const row = document.createElement("li");
+      row.className = "ocr-doc tree-doc ocr-img-row";
+      row.dataset.imgName = im.name;
+      row.innerHTML = `
+        <img class="ocr-img-thumb" loading="lazy" decoding="async" alt=""
+             src="/api/builds/${encodeURIComponent(bid)}/ocr/images/${encodeURIComponent(im.name)}" />
+        <span class="bi-title">${im.page ? `p. ${im.page}` : esc(im.name)}</span>`;
+      list.appendChild(row);
+    }
   }
 }
 
@@ -11331,6 +11496,17 @@ function onOcrPagesKey(ev) {
 }
 
 function onOcrPagesClick(ev) {
+  // the title-page toggle sits inside .ocr-pgimg — handle it before the
+  // image-click (row-select) logic below, or clicking it would also
+  // select/deselect the row
+  const titleBtn = ev.target.closest(".pg-title-toggle");
+  if (titleBtn) {
+    ev.preventDefault();
+    const row = titleBtn.closest(".ocr-pgrow");
+    const d = ocrSelDoc();
+    if (row && d && d.buildId) toggleTitlePage(d.buildId, +row.dataset.page);
+    return;
+  }
   // clicks on the page IMAGE select; clicks in the text boxes edit
   const img = ev.target.closest(".ocr-pgimg");
   if (!img) return;
@@ -11482,8 +11658,12 @@ function decorateOcrPages() {
       chip.className = "pg-chips";
       row.querySelector(".ocr-pgimg").appendChild(chip);
     }
+    // the title-page toggle is always in the DOM (so it's clickable), and CSS
+    // keeps it subtle until the row is hovered or it's already marked — the
+    // "T" keyboard shortcut still works too, this is just the discoverable path
     chip.innerHTML =
-      (title ? `<span class="pg-chip title" data-tip="Title page">T</span>` : "") +
+      `<button type="button" class="pg-chip pg-title-toggle${title ? " on" : ""}"
+               data-tip="${title ? "Title page — click to unmark" : "Mark as title page"}">T</button>` +
       (staged ? `<span class="pg-chip staged" data-tip="Staged: ${esc(OCR_SERVICE_LABELS[staged])} — press submit">${esc(staged.slice(0, 2).toUpperCase())}</span>` : "") +
       (running ? `<span class="pg-chip svc" data-tip="Processing: ${esc(OCR_SERVICE_LABELS[running])}">${esc(running.slice(0, 2).toUpperCase())}</span>` : "");
   });
@@ -11511,6 +11691,13 @@ function initOcrTab() {
     // tree chrome first: extract-text action, then node collapse/expand
     const ex = ev.target.closest("button.src-extract");
     if (ex) { ocrExtractSource(ex.dataset.src); return; }
+    // an extracted-image row isn't a document to select — open it full size
+    const imgRow = ev.target.closest("li.ocr-img-row");
+    if (imgRow) {
+      window.open(`/api/builds/${encodeURIComponent(ocrState.book)}/ocr/images/` +
+        encodeURIComponent(imgRow.dataset.imgName), "_blank");
+      return;
+    }
     const srcLi = ev.target.closest("li.ocr-src");
     if (srcLi) {
       if (!srcLi.dataset.src) return;   // the local-files node doesn't fold
@@ -12453,6 +12640,14 @@ function init() {
   }
   el("build-upload").addEventListener("click", uploadBuild);
   el("src-filter").addEventListener("click", () => openSrcFilterMenu(el("src-filter")));
+  el("btab-resources").addEventListener("click", (ev) => {
+    const btn = ev.target.closest(".res-use");
+    if (!btn) return;
+    const card = btn.closest(".res-card");
+    const b = currentBuild();
+    if (!card || !b) return;
+    setThumbnailSource(b.id, card.dataset.source);
+  });
   el("build-form").addEventListener("submit", saveBuildFields);
   el("build-save").addEventListener("click", saveBuildFields);
   el("build-delete").addEventListener("click", deleteBuild);

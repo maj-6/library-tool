@@ -3,7 +3,7 @@
 // preview; the side column carries a formal metadata table and the action
 // buttons, with availability affordances driven by volumes.assets.
 
-import { getVolume, getAbout, getNotes, pdfHref, safeHttpUrl, catText } from "./data.js";
+import { getVolume, getAbout, getNotes, pdfHref, thumbHref, safeHttpUrl, catText } from "./data.js";
 import { renderMarkdown } from "./markdown.js";
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
@@ -58,6 +58,11 @@ function metaTable(v) {
     metaRow("Added", day(v.created_at)),
   ].filter(Boolean).join("");
   return `<table class="meta-table"><tbody>${rows}</tbody></table>`;
+}
+
+function bookThumb(v) {
+  const thumb = thumbHref(v);
+  return thumb ? `<img class="book-thumb" src="${esc(thumb)}" alt="" loading="lazy" />` : "";
 }
 
 function hostOf(url) {
@@ -161,6 +166,7 @@ async function main() {
         <div id="notes-slot"></div>
       </div>
       <aside class="book-side">
+        ${bookThumb(v)}
         ${metaTable(v)}
         <div class="side-actions">${actions(v)}</div>
         ${availability(v)}

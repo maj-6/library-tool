@@ -149,6 +149,12 @@ alter table volumes add column if not exists category_paths jsonb not null defau
 -- "translations": {"es": 312}, "notes": 47}
 alter table volumes add column if not exists assets jsonb not null default '{}';
 
+-- The thumbnail lives EITHER in the `volumes` bucket (thumbnail_path) or
+-- anywhere else (thumbnail_url), the same dual-field pattern as pdf_path/
+-- pdf_url above -- readers prefer thumbnail_url when it is set.
+alter table volumes add column if not exists thumbnail_path text not null default '';
+alter table volumes add column if not exists thumbnail_url  text not null default '';
+
 -- One searchable column, maintained by the database. The website queries it
 -- with PostgREST's `fts` operator, so search never ships the catalogue.
 alter table volumes drop column if exists fts;
@@ -232,6 +238,38 @@ create policy volume_texts_read_all on volume_texts for select using (true);
 create policy volume_pages_read_all on volume_pages for select using (true);
 create policy volume_notes_read_all on volume_notes for select using (true);
 -- writes: service_role only, same stance as volumes
+
+-- =====================================================================
+-- authors — an optional bio per author, keyed on the exact string in
+-- volumes.authors (not a normalized entity: names are messy free text, e.g.
+-- "Boerhaave, Herman" vs "Boerhaave, H." for the same person, or multi-name
+-- strings like "Barton, B.H. & T. Castle (revised by J. R. Jackson)" — never
+-- split on a delimiter). A bio is optional and can be added later; the
+-- author page and dropdown work from volumes.authors alone until then.
+-- =====================================================================
+
+create table if not exists author_pages (
+  author     text primary key,
+  bio        text not null default '',
+  updated_at timestamptz not null default now()
+);
+alter table author_pages enable row level security;
+drop policy if exists author_pages_read_all on author_pages;
+create policy author_pages_read_all on author_pages for select using (true);
+-- writes: service_role only, same stance as volume_texts
+
+-- Read-only aggregation for the autocomplete's author suggestions (name +
+-- work count). PostgREST can't GROUP BY without a view. security_invoker
+-- makes the view honor volumes_read_all's RLS rather than the view owner's
+-- bypass rights; the grant is required regardless since grants don't
+-- inherit through a view.
+create or replace view author_index
+  with (security_invoker = true) as
+  select authors as author, count(*)::int as work_count
+  from volumes
+  where authors <> ''
+  group by authors;
+grant select on author_index to anon;
 
 -- =====================================================================
 -- releases — the desktop installer and the Android APK
