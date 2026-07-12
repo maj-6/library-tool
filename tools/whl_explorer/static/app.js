@@ -230,6 +230,9 @@ const state = {
     includePrereleaseUpdates: false, // desktop: allow alpha/beta/rc auto-updates
     publishGroup: "sets",           // organization of the Publish file tree
     publishSidebarCollapsed: false,
+    // Settings > Theme editor: per-theme chrome token overrides,
+    // shape { [themeId]: { "--var": "value", … } }. Applied as inline body vars.
+    themeOverrides: {},
   },
   editTarget: null,             // record open in the EDIT tab
   sort: { checked: null, whl: null },  // {key, dir} per top table
@@ -542,6 +545,7 @@ function applyTheme() {
     saveSettings();
   }
   document.body.dataset.theme = t;
+  applyThemeOverrides();   // re-apply this theme's edits (and clear the old set)
 }
 
 // the one way to change theme: the Settings menu and the Appearance select
@@ -552,6 +556,35 @@ function setTheme(id) {
   applyTheme();
   const sel = el("theme-select");
   if (sel) sel.value = id;
+  const te = el("te-theme");
+  if (te) te.value = id;
+  // keep the Theme editor in step when it is open (it edits the active theme)
+  if (el("te-rows") && el("settings-overlay") && !el("settings-overlay").hidden)
+    renderThemeEditor();
+}
+
+// --- theme editor: per-theme chrome token overrides --------------------------
+// The editor writes CSS custom properties as inline styles on <body>. Inline
+// styles beat the body[data-theme] attribute selector, so an override wins over
+// the theme's own value -- the same mechanism applyFont() uses for --mono/--ui.
+// Overrides are keyed by theme id, so each theme carries its own edits and
+// switching theme swaps the whole set.
+
+// font vars are owned by applyFont(); the token editor must never touch them
+const THEME_FONT_VARS = new Set(["--mono", "--mono2", "--ui"]);
+// the vars currently applied inline -- tracked so the next apply can remove the
+// ones no longer overridden (a reset must clear the stale inline value)
+let _appliedThemeVars = [];
+
+function applyThemeOverrides() {
+  for (const name of _appliedThemeVars) document.body.style.removeProperty(name);
+  _appliedThemeVars = [];
+  const ov = (state.settings.themeOverrides || {})[document.body.dataset.theme] || {};
+  for (const [name, val] of Object.entries(ov)) {
+    if (THEME_FONT_VARS.has(name) || val == null || val === "") continue;
+    document.body.style.setProperty(name, val);
+    _appliedThemeVars.push(name);
+  }
 }
 
 function applyFont() {
@@ -1111,6 +1144,8 @@ function normalizeSettings() {
   if (!state.settings.dbUrls || typeof state.settings.dbUrls !== "object")
     state.settings.dbUrls = {};
   state.settings.colVis = state.settings.colVis || {};
+  if (!state.settings.themeOverrides || typeof state.settings.themeOverrides !== "object")
+    state.settings.themeOverrides = {};
   state.settings.colWidths = state.settings.colWidths || {};
   // migrate the old single-table column setting
   if (Object.keys(state.settings.checkedCols).length &&
@@ -2707,6 +2742,7 @@ function renderSettings() {
   fillFontSelect("font-ui-select", FONT_CHOICES, "fontUi", applyFont);
   fillFontSelect("font-select", FONT_CHOICES, "font", applyFont);
   fillFontSelect("font-mono2-select", FONT_CHOICES, "fontMono2", applyFont);
+  renderThemeEditor();
 
   // AI
   for (const [id, k] of [["set-r2-account", "r2Account"], ["set-r2-bucket", "r2Bucket"],
@@ -2975,6 +3011,227 @@ function renderSettings() {
     };
   }
   syncPrereleaseEnabled();
+}
+
+// --- Settings > Theme editor --------------------------------------------------
+// The chrome tokens the editor exposes, grouped for the panel. Colours are
+// #rrggbb via the native <input type=color>; --radius/--border-w are px lengths
+// (slider + number); weights are a fixed dropdown. Font-family vars are
+// deliberately excluded -- they are global and stay under Appearance.
+const THEME_TOKENS = [
+  ["Accent & primary", [
+    { v: "--cyan",  l: "Accent (focus, links)", t: "color" },
+    { v: "--blue",  l: "Primary (title bar, tabs)", t: "color" },
+    { v: "--blue2", l: "Secondary", t: "color" },
+  ]],
+  ["Surfaces", [
+    { v: "--canvas",      l: "Canvas / paper", t: "color" },
+    { v: "--face",        l: "Panel face", t: "color" },
+    { v: "--face-hi",     l: "Panel raised", t: "color" },
+    { v: "--face-active", l: "Panel active", t: "color" },
+    { v: "--input-bg",    l: "Field background", t: "color" },
+  ]],
+  ["Text", [
+    { v: "--ink",       l: "Text", t: "color" },
+    { v: "--ink-light", l: "Text secondary", t: "color" },
+    { v: "--input-ink", l: "Field text", t: "color" },
+  ]],
+  ["Borders & rules", [
+    { v: "--face-sh",     l: "Border — light", t: "color" },
+    { v: "--face-sh2",    l: "Border — strong / muted text", t: "color" },
+    { v: "--canvas-line", l: "Table rules", t: "color" },
+  ]],
+  ["Rows", [
+    { v: "--row-hover",   l: "Row — hover", t: "color" },
+    { v: "--row-checked", l: "Row — checked", t: "color" },
+    { v: "--row-manual",  l: "Row — manual", t: "color" },
+  ]],
+  ["Status", [
+    { v: "--green", l: "Success", t: "color" },
+    { v: "--amber", l: "Warning", t: "color" },
+    { v: "--red",   l: "Error", t: "color" },
+  ]],
+  ["Geometry", [
+    { v: "--radius",   l: "Corner rounding", t: "len", min: 0, max: 14, step: 1, unit: "px", def: "4px" },
+    { v: "--border-w", l: "Border weight",   t: "len", min: 1, max: 3,  step: 1, unit: "px", def: "1px" },
+  ]],
+  ["Typography", [
+    { v: "--wt-ui",     l: "Interface weight", t: "wt", def: "400",
+      opts: [["400", "Regular"], ["500", "Medium"], ["600", "Semibold"]] },
+    { v: "--wt-strong", l: "Heading weight",   t: "wt", def: "700",
+      opts: [["400", "Regular"], ["500", "Medium"], ["600", "Semibold"], ["700", "Bold"]] },
+  ]],
+];
+
+// coerce a colour token to #rrggbb for <input type=color> (theme values are
+// authored as 6-digit hex, but be defensive about #rgb and stray whitespace)
+function themeHex(v) {
+  v = String(v == null ? "" : v).trim();
+  const m3 = /^#([0-9a-f])([0-9a-f])([0-9a-f])$/i.exec(v);
+  if (m3) return ("#" + m3[1] + m3[1] + m3[2] + m3[2] + m3[3] + m3[3]).toLowerCase();
+  return /^#[0-9a-f]{6}$/i.test(v) ? v.toLowerCase() : "#000000";
+}
+
+// Build the Theme editor panel for the active theme. Rebuilt whenever the
+// dialog opens or the theme changes; seeds each control from the effective
+// value (override if set, else the theme's own resolved value).
+function renderThemeEditor() {
+  const host = el("te-rows");
+  if (!host) return;
+  const theme = document.body.dataset.theme || DEFAULT_THEME;
+
+  // theme picker: switching the active theme switches what you are editing
+  const tsel = el("te-theme");
+  if (tsel) {
+    if (!tsel.options.length) {
+      for (const [id, label] of THEMES) {
+        const o = document.createElement("option");
+        o.value = id; o.textContent = label;
+        tsel.appendChild(o);
+      }
+      tsel.onchange = () => setTheme(tsel.value);
+    }
+    tsel.value = theme;
+  }
+
+  const cs = getComputedStyle(document.body);
+  const overrides = () =>
+    state.settings.themeOverrides[theme] ||
+    (state.settings.themeOverrides[theme] = {});
+  const ov = state.settings.themeOverrides[theme] || {};
+  // effective value: the override if present, else the theme's own value
+  // (resolved from CSS; synthetic tokens with no CSS value fall back to def)
+  const eff = (tok) => {
+    if (ov[tok.v] != null) return ov[tok.v];
+    const c = cs.getPropertyValue(tok.v).trim();
+    return c || tok.def || "";
+  };
+
+  function updateCount() {
+    const m = state.settings.themeOverrides[theme] || {};
+    const n = Object.keys(m).length;
+    const c = el("te-count");
+    if (c) {
+      c.textContent = n ? `${n} override${n === 1 ? "" : "s"}` : "No changes";
+      c.classList.toggle("dirty", n > 0);
+    }
+    const rb = el("te-reset-theme");
+    if (rb) rb.disabled = n === 0;
+  }
+
+  const setTok = (tok, val) => {
+    overrides()[tok.v] = val;
+    document.body.style.setProperty(tok.v, val);          // live preview
+    if (!_appliedThemeVars.includes(tok.v)) _appliedThemeVars.push(tok.v);
+    updateCount();
+  };
+  const resetTok = (tok) => {
+    const m = state.settings.themeOverrides[theme];
+    if (m) {
+      delete m[tok.v];
+      if (!Object.keys(m).length) delete state.settings.themeOverrides[theme];
+    }
+    saveSettings();
+    applyThemeOverrides();
+    renderThemeEditor();
+  };
+
+  host.innerHTML = "";
+  for (const [group, toks] of THEME_TOKENS) {
+    const h = document.createElement("div");
+    h.className = "settings-subhead";
+    h.textContent = group;
+    host.appendChild(h);
+
+    for (const tok of toks) {
+      const lab = document.createElement("label");
+      lab.textContent = tok.l;
+      const ctl = document.createElement("div");
+      ctl.className = "te-ctl";
+
+      const rev = document.createElement("button");
+      rev.type = "button";
+      rev.className = "te-revert" + (ov[tok.v] != null ? " on" : "");
+      rev.textContent = "↺";                          // reset arrow
+      rev.title = "Reset to theme default";
+      rev.addEventListener("click", () => resetTok(tok));
+      const markDirty = () => rev.classList.add("on");
+
+      if (tok.t === "color") {
+        const hex = themeHex(eff(tok));
+        const sw = document.createElement("input");
+        sw.type = "color"; sw.className = "te-swatch"; sw.value = hex;
+        const tx = document.createElement("input");
+        tx.className = "cad-input te-hex"; tx.value = hex.toUpperCase();
+        tx.spellcheck = false; tx.maxLength = 7;
+        sw.addEventListener("input", () => {
+          tx.value = sw.value.toUpperCase(); tx.classList.remove("bad");
+          setTok(tok, sw.value); markDirty();
+        });
+        sw.addEventListener("change", saveSettings);
+        tx.addEventListener("input", () => {
+          const val = tx.value.trim();
+          if (/^#[0-9a-fA-F]{6}$/.test(val)) {
+            sw.value = val.toLowerCase(); tx.classList.remove("bad");
+            setTok(tok, val.toLowerCase()); markDirty();
+          } else {
+            tx.classList.add("bad");
+          }
+        });
+        tx.addEventListener("change", () => {
+          tx.value = sw.value.toUpperCase();   // snap back to the last valid colour
+          tx.classList.remove("bad"); saveSettings();
+        });
+        ctl.append(sw, tx);
+      } else if (tok.t === "len") {
+        const cur = parseInt(eff(tok), 10) || 0;
+        const rng = document.createElement("input");
+        rng.type = "range"; rng.className = "te-range";
+        rng.min = tok.min; rng.max = tok.max; rng.step = tok.step; rng.value = cur;
+        const num = document.createElement("input");
+        num.type = "number"; num.className = "cad-input te-num";
+        num.min = tok.min; num.max = tok.max; num.step = tok.step; num.value = cur;
+        const unit = document.createElement("span");
+        unit.className = "te-unit"; unit.textContent = tok.unit;
+        const apply = (raw, persist) => {
+          const n = Math.max(tok.min, Math.min(tok.max, parseInt(raw, 10) || 0));
+          rng.value = n; num.value = n;
+          setTok(tok, n + tok.unit); markDirty();
+          if (persist) saveSettings();
+        };
+        rng.addEventListener("input", () => apply(rng.value, false));
+        rng.addEventListener("change", () => apply(rng.value, true));
+        num.addEventListener("change", () => apply(num.value, true));
+        ctl.append(rng, num, unit);
+      } else {                                             // weight dropdown
+        const sel = document.createElement("select");
+        sel.className = "cad-input te-wsel";
+        for (const [val, name] of tok.opts) {
+          const o = document.createElement("option");
+          o.value = val; o.textContent = `${name} (${val})`;
+          sel.appendChild(o);
+        }
+        sel.value = String(parseInt(eff(tok), 10) || tok.def);
+        sel.addEventListener("change", () => {
+          setTok(tok, sel.value); markDirty(); saveSettings();
+        });
+        ctl.append(sel);
+      }
+
+      ctl.appendChild(rev);
+      host.append(lab, ctl);
+    }
+  }
+  updateCount();
+
+  const resetBtn = el("te-reset-theme");
+  if (resetBtn) resetBtn.onclick = () => {
+    if (!state.settings.themeOverrides[theme]) return;
+    delete state.settings.themeOverrides[theme];
+    saveSettings();
+    applyThemeOverrides();
+    renderThemeEditor();
+  };
 }
 
 function initSettingsNav() {
