@@ -39,14 +39,20 @@ function day(raw) {
 
 // One download as a row: platform glyph, name (+ tag) over its metadata, and a
 // ghost download button that fills on hover. The desktop build is tinted as the
-// primary one.
-function card(r) {
+// primary one. In the "Other downloads" section (opts.channel) a prerelease row
+// is badged with its channel (alpha/beta/rc) instead of the platform tag, and is
+// never tinted as primary — a testing build shouldn't read as the headline one.
+function card(r, opts = {}) {
   const p = PLATFORM[r.platform] || { name: r.platform, note: "" };
   const href = safeHttpUrl(r.url);
   const meta = [p.note, r.version && `v${esc(r.version)}`, bytes(r.bytes), day(r.published_at)]
     .filter(Boolean).join(" · ");
-  const tag = p.tag ? ` <span class="dl-tag">${esc(p.tag)}</span>` : "";
-  const primary = r.platform === "windows";
+  const chan = (r.channel || "").trim();
+  const isPre = opts.channel && chan && chan !== "stable";
+  const tag = isPre
+    ? ` <span class="dl-tag is-pre">${esc(chan)}</span>`
+    : (p.tag ? ` <span class="dl-tag">${esc(p.tag)}</span>` : "");
+  const primary = !isPre && r.platform === "windows";
   const action = href
     ? `<a class="dl-btn" href="${esc(href)}">${DL_ARROW}Download</a>`
     : `<a class="dl-btn" aria-disabled="true" title="No download link">Unavailable</a>`;
@@ -80,15 +86,31 @@ function ordered(rows) {
   return [...rows].sort((a, b) => rank(a) - rank(b));
 }
 
+// A row is stable unless it carries a non-stable channel (alpha/beta/rc). The
+// releases query returns every channel, so the main list MUST filter to stable —
+// otherwise a published testing build would leak in as an unlabelled duplicate.
+const isStable = (r) => !(r.channel || "").trim() || (r.channel || "").trim() === "stable";
+
 const box = document.getElementById("releases");
+const preBox = document.getElementById("prereleases");
 try {
-  const rows = usingCloud ? ordered(newest(await latestReleases())) : [];
-  box.innerHTML = rows.length
-    ? `<div class="dl-list">${rows.map(card).join("")}</div>`
+  const all = usingCloud ? ordered(newest(await latestReleases())) : [];
+  const stable = all.filter(isStable);
+  const pre = all.filter((r) => !isStable(r));
+
+  box.innerHTML = stable.length
+    ? `<div class="dl-list">${stable.map((r) => card(r)).join("")}</div>`
     : `<div class="note">No release has been published yet — check back once the
        first installer ships, or build from the source on GitHub.</div>`;
+
+  if (preBox) {
+    preBox.innerHTML = pre.length
+      ? `<div class="dl-list">${pre.map((r) => card(r, { channel: true })).join("")}</div>`
+      : `<div class="note">No testing build is published right now.</div>`;
+  }
 } catch (e) {
   box.innerHTML = `<div class="note">Could not load releases: ${esc(e.message)}</div>`;
+  if (preBox) preBox.innerHTML = `<div class="note">Could not load testing builds.</div>`;
 }
 
 // "What's new": the most recent *significant* releases (major/minor), each

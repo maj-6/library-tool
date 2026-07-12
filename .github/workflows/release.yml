@@ -210,8 +210,14 @@ jobs:
           notes=""
           [ -n "$EXE_V" ] && notes="Desktop $EXE_V"
           [ -n "$APK_V" ] && notes="${notes:+$notes · }Android BookCapture $APK_V"
+          # A prerelease tag (v0.7.0-alpha.1 / -beta / -rc) is flagged prerelease
+          # on GitHub so the stable auto-updater (allowPrerelease stays false in
+          # desktop/main.js) never offers it — testers still grab it by hand from
+          # the Releases page and the Downloads-page "Other downloads" section.
+          pre=""
+          case "$GITHUB_REF_NAME" in *-alpha*|*-beta*|*-rc*) pre="--prerelease" ;; esac
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
-            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag $pre \
               --title "Library Tool $GITHUB_REF_NAME" --notes "$notes"
           gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
 
@@ -231,15 +237,24 @@ jobs:
             exit 0
           fi
           BASE="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME"
+          # A prerelease tag registers on its own channel so the row lands in the
+          # Downloads page's "Other downloads" section instead of replacing the
+          # stable card (the table's unique key is platform+version+channel).
+          CH=stable
+          case "$GITHUB_REF_NAME" in
+            *-alpha*) CH=alpha ;;
+            *-beta*)  CH=beta ;;
+            *-rc*)    CH=rc ;;
+          esac
           # register only the app(s) whose artifact is present, so one build's
           # failure never blocks the other from reaching the Downloads page
           EXE=$(ls dist/LibraryTool-Setup-*.exe 2>/dev/null | head -1 || true)
           APK=$(ls dist/BookCapture-*.apk 2>/dev/null | head -1 || true)
           if [ -n "$EXE" ]; then
             python3 tools/release_publish.py "$EXE" --url "$BASE/$(basename "$EXE")" \
-              --platform windows --version "${{ needs.desktop.outputs.version }}"
+              --platform windows --version "${{ needs.desktop.outputs.version }}" --channel "$CH"
           fi
           if [ -n "$APK" ]; then
             python3 tools/release_publish.py "$APK" --url "$BASE/$(basename "$APK")" \
-              --platform android --version "${{ needs.android.outputs.version }}"
+              --platform android --version "${{ needs.android.outputs.version }}" --channel "$CH"
           fi

@@ -237,6 +237,14 @@ ol.volumes { list-style: none; margin: 0; padding: 0; }
   margin-left: 10px;
   vertical-align: 2px;
 }
+/* the testing-channel badge (alpha/beta/rc): ochre and outlined, set apart from
+   the solid-green platform tag so a prerelease build reads as such at a glance */
+.dl-tag.is-pre {
+  color: #9a6b1f;
+  background: transparent;
+  border: 1px solid #caa96b;
+  padding: 2px 5px;
+}
 .dl-meta {
   font: 12px/1.5 var(--mono);
   letter-spacing: 0.3px;
