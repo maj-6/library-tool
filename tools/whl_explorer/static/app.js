@@ -12336,6 +12336,21 @@ function init() {
   boot("about", initAbout);
   boot("column resize", initColResize);
   boot("open library status", loadOlStatus);
+  // A database dropped into ~/.library-tool while the app is open should
+  // register without a restart: the backend already resolves it live, so just
+  // re-read the offline-index status whenever the window regains focus (e.g.
+  // after dropping files in the file manager). Throttled so a focus/blur storm
+  // can't hammer the endpoint.
+  let _olStatusAt = 0;
+  const refreshOlStatusOnReturn = () => {
+    if (document.visibilityState !== "visible") return;
+    const now = Date.now();
+    if (now - _olStatusAt < 2000) return;
+    _olStatusAt = now;
+    loadOlStatus();
+  };
+  document.addEventListener("visibilitychange", refreshOlStatusOnReturn);
+  window.addEventListener("focus", refreshOlStatusOnReturn);
 
   // undo / redo (toolbar)
   el("undo-btn").addEventListener("click", undo);

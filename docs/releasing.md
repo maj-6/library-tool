@@ -20,6 +20,37 @@ forward), so those few installs need a one-time manual reinstall. Android is
 unaffected — it updates by `versionCode`, which keeps climbing regardless of the
 `versionName`.
 
+## Release standards
+
+The project is pre-1.0 and ships **intermediate builds on purpose**. Alpha/beta
+builds are expected to be produced and published for download and testing —
+known TODOs, loose threads, and half-finished features (see **Known caveats**
+below, and whatever is open at the time) are acceptable in them. That bar does
+**not** carry to a stable release: `1.0.0`, and any later build promoted as
+stable, must clear a higher one — no non-functioning or visibly incomplete
+features, and the known caveats burned down. Treat everything before then as a
+testing line, and keep intermediate builds flowing so there is always something
+to try.
+
+Cut an intermediate build as a semver **prerelease** so it stays testable
+without reaching stable users:
+
+- Version it with a prerelease suffix — `desktop/package.json` `0.7.0-alpha.1`
+  (then `-alpha.2`, `-beta.1`, `-rc.1`, finally plain `0.7.0` for the stable
+  cut). Bump the Android `versionCode` too if the APK rides along.
+- Tag it `v0.7.0-alpha.1` and push. The existing `v*` pipeline builds it, and
+  because the tag carries `-alpha` / `-beta` / `-rc` it:
+  - flags the GitHub Release **prerelease**, so the desktop auto-updater
+    (`allowPrerelease` stays false — desktop/main.js) never offers it to stable
+    users; they hold at the last stable version.
+  - registers the `releases` row on the **`alpha` / `beta` / `rc` channel**, so
+    it appears in the Downloads page's **Other downloads** section instead of
+    replacing the stable card.
+
+A plain `vX.Y.Z` tag (no suffix) is the stable path — GitHub "Latest", the
+stable auto-update channel, and the main Downloads list. Reserve it for builds
+that actually meet the bar above.
+
 Two ways a row gets there:
 
 ## The pipeline (the normal way)
