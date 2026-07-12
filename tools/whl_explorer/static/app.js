@@ -7517,6 +7517,8 @@ function renderAnList() {
       <div class="bi-meta">${esc(b.authors || "")}${b.year ? " · " + esc(b.year) : ""}
         · ${b.status === "uploaded" ? "published" : esc(b.status)}</div></li>`;
   }).join("") || `<li class="empty">No entries yet — create one in the Editor.</li>`;
+  const verified = items.filter(anAnalyzable).length;
+  el("an-count").textContent = items.length ? `${verified} verified` : "";
 }
 
 function anSelect(id) {
@@ -7565,8 +7567,17 @@ function renderAnPane(id) {
 
 // --- jobs: start + poll -------------------------------------------------------
 
-async function anStartJob(path, body, label) {
+async function anStartJob(path, body, label, btn) {
+  // guard re-entry: a second job of the same kind on the same entry would race
+  // (two summaries overwrite; a translate recomputes and re-does pages)
+  for (const m of anJobs.values()) {
+    if (m.kind === label && m.buildId === body.build_id) {
+      el("an-msg").textContent = `${label} already running…`;
+      return null;
+    }
+  }
   el("an-msg").textContent = "";
+  if (btn) btn.disabled = true;
   try {
     const res = await fetch(path, {
       method: "POST",
@@ -7575,15 +7586,18 @@ async function anStartJob(path, body, label) {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.ok) {
+      if (btn) btn.disabled = false;
       el("an-msg").textContent = data.error || "failed";
       statusErr(`ANALYZE :: ${(data.error || "FAILED").toUpperCase()}`);
       return null;
     }
-    anJobs.set(data.job, { kind: label, buildId: body.build_id });
+    anJobs.set(data.job, { kind: label, buildId: body.build_id, btn });
+    el("an-msg").textContent = `${label} — starting…`;
     status(`ANALYZE :: ${label.toUpperCase()} STARTED`);
     anEnsurePolling();
     return data;
   } catch (e) {
+    if (btn) btn.disabled = false;
     el("an-msg").textContent = "request failed";
     return null;
   }
@@ -7602,16 +7616,26 @@ function anEnsurePolling() {
       const pct = job.total ? Math.round((job.done / job.total) * 100) : 0;
       status(`ANALYZE :: ${meta.kind.toUpperCase()} :: ${job.done}/${job.total} (${pct}%)` +
         (job.errors ? ` :: ${job.errors} ERRORS` : ""));
+      // in-pane progress (only while the user is on that entry)
+      if (state.anSel === meta.buildId && !job.status.startsWith("done") &&
+          job.status !== "error") {
+        el("an-msg").textContent = `${meta.kind} — ${job.done}/${job.total}` +
+          (job.errors ? ` (${job.errors} errors)` : "");
+      }
       if (job.status.startsWith("done") || job.status === "error") {
         anJobs.delete(id);
+        if (meta.btn) meta.btn.disabled = false;
         if (job.status === "error") {
           statusErr(`ANALYZE :: ${meta.kind.toUpperCase()} FAILED :: ${job.error}`);
-          el("an-msg").textContent = job.error;
+          if (state.anSel === meta.buildId) el("an-msg").textContent = job.error;
         } else {
           status(`ANALYZE :: ${meta.kind.toUpperCase()} ${job.status.toUpperCase()}` +
             (job.note ? ` :: ${job.note}` : ""));
           if (meta.kind === "relevance") await loadBuilds(true);
-          if (state.anSel === meta.buildId) renderAnPane(activeAnPane());
+          if (state.anSel === meta.buildId) {
+            el("an-msg").textContent = "";
+            renderAnPane(activeAnPane());
+          }
         }
       }
     }
@@ -7882,7 +7906,8 @@ function initAnalyze() {
 
   el("an-summarize").addEventListener("click", () => {
     const b = anSelected();
-    if (b) anStartJob("/api/analyze/summarize", { build_id: b.id }, "summarize");
+    if (b) anStartJob("/api/analyze/summarize", { build_id: b.id }, "summarize",
+                      el("an-summarize"));
   });
   el("an-about-draft").addEventListener("click", async () => {
     const b = anSelected();
@@ -7890,7 +7915,7 @@ function initAnalyze() {
     const existing = anAboutMd.get().trim();
     if (existing && !confirm("Replace the current About draft?")) return;
     anStartJob("/api/analyze/about",
-               { build_id: b.id, overwrite: !!existing }, "about");
+               { build_id: b.id, overwrite: !!existing }, "about", el("an-about-draft"));
   });
   el("an-about-save").addEventListener("click", async () => {
     const b = anSelected();
@@ -7950,7 +7975,7 @@ function initAnalyze() {
         `API credits. It saves as it goes and resumes if interrupted.`)) return;
     el("an-trans-msg").textContent = "";
     anStartJob("/api/analyze/translate", { build_id: b.id, lang },
-               `translate ${lang}`);
+               `translate ${lang}`, el("an-translate"));
   });
   el("an-trans-list").addEventListener("click", async (ev) => {
     const b = anSelected();
@@ -7972,7 +7997,8 @@ function initAnalyze() {
 
   el("an-annotate").addEventListener("click", () => {
     const b = anSelected();
-    if (b) anStartJob("/api/analyze/annotate", { build_id: b.id }, "annotate");
+    if (b) anStartJob("/api/analyze/annotate", { build_id: b.id }, "annotate",
+                      el("an-annotate"));
   });
   el("an-notes-list").addEventListener("click", (ev) => {
     const b = anSelected();
@@ -8029,7 +8055,8 @@ function initAnalyze() {
       el("an-msg").textContent = "define at least one criterion first";
       return;
     }
-    anStartJob("/api/analyze/relevance", { build_id: b.id }, "relevance");
+    anStartJob("/api/analyze/relevance", { build_id: b.id }, "relevance",
+               el("an-assess"));
   });
 
   el("an-bundle-save").addEventListener("click", anSaveBundle);
@@ -9337,6 +9364,12 @@ function downloadUploadList() {
 let buildDescMd = null;      // live markdown editor in the ENTRY tab
 let buildPdfViewer = null;   // PDF viewer in the SOURCE tab
 const descState = { id: null, val: null };  // last value set into the editor
+let buildDirty = false;      // the entry form has unsaved metadata edits
+function buildIsDirty() {
+  return buildDirty ||
+    (buildDescMd && descState.id === state.buildSel &&
+     buildDescMd.get() !== descState.val);
+}
 
 async function loadBuilds() {
   try {
@@ -9499,10 +9532,14 @@ function renderBuildEditor() {
   el("b-src-open").hidden = !/^https?:\/\//i.test(src);
   el("b-src-open").href = src;
   el("build-msg").textContent = "";
+  buildDirty = false;   // a freshly loaded form is clean
   if (activeBuildTab() === "btab-source") refreshSourceTab();
 }
 
 function selectBuild(id) {
+  if (id !== state.buildSel && buildIsDirty() &&
+      state.settings.confirmDiscard !== false &&
+      !window.confirm("Discard unsaved changes to this entry?")) return;
   state.buildSel = id;
   renderBuildsList();
   renderBuildEditor();
@@ -9618,6 +9655,7 @@ async function saveBuildFields(ev) {
   if (await patchBuild(id, fields, `edit build ${fields.title.slice(0, 30)}`)) {
     descState.id = id;
     descState.val = fields.description;
+    buildDirty = false;
     el("build-msg").textContent = "Saved";
     status(`BUILD SAVED :: ${fields.title}`);
   } else {
@@ -12675,9 +12713,16 @@ function init() {
   el("pdfm-overlay").addEventListener("mousedown", (ev) => {
     if (ev.target === el("pdfm-overlay")) closePdfModal();
   });
-  el("b-ready").addEventListener("click", () => {
+  el("b-ready").addEventListener("click", async () => {
+    const b = currentBuild();
+    if (!b) return;
     const on = el("b-ready").classList.toggle("active");
     el("b-verified-tag").hidden = !on;
+    // persist immediately (quiet: keep any unsaved field edits) so the badge and
+    // the list check icon never claim a verified state that was not written
+    const newStatus = b.status === "uploaded" ? "uploaded" : (on ? "ready" : "draft");
+    await patchBuildRaw(b.id, { status: newStatus }, true);
+    renderBuildsList();
   });
   el("build-new").addEventListener("click", () => createBuild({}, "(blank)"));
   el("export-builds").addEventListener("click", exportBuilds);
@@ -12706,8 +12751,18 @@ function init() {
     setThumbnailSource(b.id, card.dataset.source);
   });
   el("build-form").addEventListener("submit", saveBuildFields);
+  el("build-form").addEventListener("input", () => { buildDirty = true; });
   el("build-save").addEventListener("click", saveBuildFields);
   el("build-delete").addEventListener("click", deleteBuild);
+  // Ctrl/Cmd+S saves the open entry (only on the Editor tab, entry open)
+  document.addEventListener("keydown", (ev) => {
+    if (!((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "s")) return;
+    const tab = document.querySelector("#tabs .tab.active");
+    if (tab && tab.dataset.tab === "upload" && !el("build-editor").hidden) {
+      ev.preventDefault();
+      saveBuildFields();
+    }
+  });
   el("upload-rows").addEventListener("click", (ev) => {
     const b = ev.target.closest("[data-build-src]");
     if (!b) return;
