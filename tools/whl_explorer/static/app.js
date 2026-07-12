@@ -38,9 +38,9 @@ const VIEW_STATE_KEYS = new Set([
   "paneWidth", "uploadSplitH", "colWidths",
   "authPromptDismissed", "wizardDone", "checkedCols",
 ]);
-// Credentials: never persisted client-side and never synced. They live only in
-// the server's local, Host-guarded secrets store (/api/secrets); the dialog
-// loads/saves them there. Dropped from BOTH persistence buckets below.
+// Credentials are never persisted client-side. They live in the server's
+// Host-guarded secrets store (/api/secrets); Mistral additionally syncs through
+// the signed-in user's private cloud profile so Book Capture can share it.
 const SECRET_KEYS = new Set([
   "aiKey", "mistralKey", "ocrClaudeKey", "ocrAzureKey", "ocrAwsKey",
   "ocrAwsSecret", "supabaseKey", "supabaseAnonKey", "r2KeyId", "r2Secret",
@@ -980,8 +980,8 @@ function normalizeSettings() {
 // --- client-state sync (localStorage cache + authoritative server copy) ----------
 // The three blobs (checked books / settings / attention marks) write through
 // to /api/client_state so they survive a port change and can sync to the
-// cloud later. NOTE: settings currently include API keys — a future cloud
-// sync layer must exclude credential fields before pushing off-device.
+// cloud later. Credential fields are excluded from this general settings blob;
+// Mistral uses the dedicated private profile_secrets sync path instead.
 
 let clientStateReady = false;   // gates write-through until the load-sync ran
 const _csPending = {};          // kind -> true, coalesced
@@ -2433,8 +2433,9 @@ function renderSettings() {
     };
   }
   // Credentials: re-wire the secret fields the generic loops above touched so
-  // their values load from and save to the server's local, Host-guarded secrets
-  // store — never localStorage, never the synced client_state.
+  // their values load from and save to the server's Host-guarded secrets API.
+  // Mistral is cached there and synchronized with the private cloud profile;
+  // the others remain device-local.
   (async () => {
     const SECRET_FIELDS = [
       ["set-ai-key", "aiKey"], ["set-mistral-key", "mistralKey"],
