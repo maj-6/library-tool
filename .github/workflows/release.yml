@@ -166,9 +166,12 @@ jobs:
         shell: bash
         run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
 
-      # The NSIS exe is the download; latest.yml + the blockmap are the
-      # auto-update channel (electron-updater reads them off the GitHub
-      # Release). Ship all three or updates silently never happen.
+      # The NSIS exe is the download; the channel manifest + the blockmap are the
+      # auto-update channel (electron-updater reads them off the GitHub Release).
+      # The manifest is latest.yml for a stable version, or alpha.yml/beta.yml
+      # for a prerelease (electron-builder derives the channel from the version's
+      # suffix), so glob *.yml to catch whichever it is. Ship all three or
+      # updates silently never happen.
       - name: Keep the installer + update manifest
         uses: actions/upload-artifact@v4
         with:
@@ -176,7 +179,7 @@ jobs:
           path: |
             desktop/release/LibraryTool-Setup-*.exe
             desktop/release/LibraryTool-Setup-*.exe.blockmap
-            desktop/release/latest.yml
+            desktop/release/*.yml
           if-no-files-found: error
 
   # Tag pushes only (a dispatch run is a dry run and stops at the artifacts).
