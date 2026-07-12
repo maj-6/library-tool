@@ -1763,11 +1763,13 @@ def _pdf_doc(path: Path):
 
 
 def _cached_page_file(path: Path, mimetype: str):
-    """Serve a rendered page image. Its bytes are immutable for this URL — the
-    cache key folds in path+mtime+page+width — so let the browser hold it for a
-    year and skip the per-page 304 revalidation on every scroll-back."""
+    """Serve a rendered page image. A moderate max-age keeps scroll-back fast
+    (no 304 per page for a few minutes), but NOT `immutable`: the URL is only
+    path+page+width with no mtime, so an in-place page delete/trim that rewrites
+    the PDF must still be picked up — once max-age lapses the ETag (conditional=
+    True) revalidates and the endpoint serves the freshly-keyed render."""
     resp = send_file(path, mimetype=mimetype, conditional=True)
-    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    resp.headers["Cache-Control"] = "public, max-age=300"
     return resp
 
 
