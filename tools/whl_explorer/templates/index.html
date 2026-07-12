@@ -17,7 +17,7 @@
           <button class="menu-item" data-cmd="new-entry" type="button">New entry</button>
           <div class="menu-sep"></div>
           <button class="menu-item" data-cmd="export" type="button">Export table (JSON)</button>
-          <button class="menu-item" data-cmd="export-builds" type="button">Export builds</button>
+          <button class="menu-item" data-cmd="export-builds" type="button">Export entries</button>
           <button class="menu-item" data-cmd="dl-sources" type="button">Download sources list</button>
           <button class="menu-item" data-cmd="dl-approved" type="button">Download verified sources</button>
           <div class="menu-sep"></div>
@@ -90,7 +90,7 @@
     <button class="tab" data-tab="ocr">OCR</button>
     <button class="tab" data-tab="analyze">Analyze</button>
     <button class="tab" data-tab="infotab">Info</button>
-    <span class="tb-spacer"></span>
+    <span class="bar-spacer"></span>
     <div class="tb-group">
       <button id="undo-btn" class="tool-btn icon-btn" type="button" disabled
               data-icon="undo" data-tip="Undo (Ctrl+Z)"></button>
@@ -102,7 +102,7 @@
       <button id="build-new" class="tool-btn icon-btn" type="button"
               data-icon="plus" data-tip="New entry"></button>
       <button id="export-builds" class="tool-btn icon-btn" type="button"
-              data-icon="export" data-tip="Export builds (JSON)"></button>
+              data-icon="export" data-tip="Export entries (JSON)"></button>
       <button id="download-upload-list" class="tool-btn icon-btn" type="button"
               data-icon="download" data-tip="Download sources list (JSON)"></button>
     </div>
@@ -602,6 +602,7 @@
         </div>
         <div id="builds-splitter"></div>
 
+        <div id="build-empty" class="empty build-empty" hidden>Select an entry on the left, or press <b>+</b> to create one.</div>
         <div id="build-editor" hidden>
           <div class="mf-actions build-actions">
             <button id="build-save" class="cad-btn icon-btn" type="button"
@@ -610,7 +611,7 @@
                     data-icon="trash" data-tip="Delete"></button>
             <span class="act-sep"></span>
             <button id="b-ready" class="cad-btn icon-btn toggle" type="button"
-                    data-icon="check" data-tip="Mark verified"></button>
+                    data-icon="check" data-tip="Mark verified — the metadata is confirmed and the entry can be published (distinct from a verified source, which is a good scan matched to a record)"></button>
             <button id="build-upload" class="cad-btn icon-btn" type="button"
                     data-icon="export" data-tip="Publish to the Library Tool cloud — uploads the PDF and lists the volume on the website"></button>
             <button id="b-analyze" class="cad-btn tiny" type="button"
@@ -664,7 +665,7 @@
                     <label class="tool-label" for="b-pages">Pages</label>
                     <input id="b-pages" class="cad-input" />
                   </div>
-                  <div class="mf-field mf-third">
+                  <div class="mf-field mf-full">
                     <label class="tool-label">Categories</label>
                     <div id="b-categories" class="cat-picker"></div>
                   </div>
@@ -755,7 +756,8 @@
       <div id="upload-splitter"></div>
 
       <div id="upload-sources-pane">
-        <div class="pane-bar"><span class="tool-label">Verified sources</span>
+        <div class="pane-bar"><span class="tool-label"
+              data-tip="A good-quality scan matched to a catalogue record (approve a source in the Catalogs tab). Sources are the basis for entries — build one below.">Verified sources</span>
           <span class="bar-spacer"></span>
           <button id="src-filter" class="cad-btn tiny icon-btn" type="button"
                   data-icon="filter" data-tip="Filter by status (hide done, etc.)"></button>
@@ -855,6 +857,7 @@
           </div>
           <textarea id="ocr-editor" class="cad-input" spellcheck="false" hidden></textarea>
           <div class="drafting" id="ocr-diff" hidden></div>
+          <div class="ocr-keymap" id="ocr-keymap" hidden></div>
           <div class="drafting" id="ocr-pages"></div>
         </div>
       </div>
@@ -862,7 +865,9 @@
       <div class="pane-bar">
         <span class="tool-label">OCR queue</span>
         <span class="tb-sep"></span>
-        <select id="ocr-service" class="cad-input">
+        <label class="tool-label" for="ocr-service">Stage all with</label>
+        <select id="ocr-service" class="cad-input"
+                data-tip="Engine the + button stages every page with. Pages staged by digit keys keep their own engine.">
           <option value="tesseract">Tesseract (local)</option>
           <option value="mistral">Mistral OCR</option>
           <option value="claude">Claude</option>
@@ -871,9 +876,15 @@
           <option value="openai">OpenAI vision</option>
         </select>
         <button id="ocr-queue-add" class="cad-btn tiny icon-btn" type="button"
-                data-icon="plus" data-tip="Stage every page of the book with this service (nothing runs until submit)"></button>
+                data-icon="plus" data-tip="Stage every page with the engine at left (nothing runs until Submit)"></button>
+        <button id="ocr-queue-clear" class="cad-btn tiny icon-btn" type="button"
+                data-icon="remove" data-tip="Un-stage all staged pages"></button>
+        <span class="tb-sep"></span>
         <button id="ocr-submit" class="cad-btn tiny icon-btn" type="button"
-                data-icon="go" data-tip="Submit the staged pages for processing"></button>
+                data-icon="go" data-tip="Submit all staged pages — each runs the engine it was staged with"></button>
+        <span class="bar-spacer"></span>
+        <button id="ocr-queue-clear-done" class="cad-btn tiny icon-btn" type="button"
+                data-icon="trash" data-tip="Dismiss finished and lost jobs"></button>
         <span class="tool-count" id="ocr-queue-count"></span>
       </div>
       <div class="drafting" id="ocr-queue-wrap">
@@ -900,7 +911,9 @@
             <div id="an-head">
               <span id="an-title"></span>
               <span id="an-sub" class="tool-label"></span>
-              <span class="tb-spacer"></span>
+              <span class="bar-spacer"></span>
+              <span class="tool-label" id="an-provider"
+                    data-tip="The AI provider and model that will run — configure in Settings &gt; AI"></span>
               <span class="tool-label" id="an-msg"></span>
             </div>
             <div class="pane-tabs" id="an-tabs">
@@ -1008,7 +1021,7 @@
           <option value="debug">Everything (with HTTP)</option>
         </select>
         <input id="con-find" class="cad-input" placeholder="filter" spellcheck="false" />
-        <span class="tb-spacer"></span>
+        <span class="bar-spacer"></span>
         <span id="con-count" class="tool-label"></span>
         <button id="con-follow" class="cad-btn tiny active" type="button"
                 data-tip="Scroll to follow new lines">Follow</button>
@@ -1126,7 +1139,7 @@
           <input id="cat-new-name" class="cad-input" type="text" hidden
                  autocomplete="off" />
           <span class="tool-label" id="cat-msg"></span>
-          <span class="tb-spacer"></span>
+          <span class="bar-spacer"></span>
           <span class="tool-label" id="cat-count"></span>
         </div>
         <div id="cat-tree" class="drafting"></div>

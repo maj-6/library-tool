@@ -7482,6 +7482,26 @@ async function renderAnalyze() {
   await loadBuilds();
   renderAnList();
   renderAnMain();
+  updateAnProvider();
+}
+
+// show which provider/model an analysis will run on, and warn when no key is set
+async function updateAnProvider() {
+  const host = el("an-provider");
+  if (!host) return;
+  const s = state.settings;
+  const model = (s.aiModel || "").trim() || "deepseek-chat";
+  const base = (s.aiBase || "").trim();
+  const provider = base ? base.replace(/^https?:\/\//, "").split("/")[0] : "DeepSeek";
+  let hasKey = false;
+  try {
+    const sec = await (await fetch("/api/secrets")).json();
+    hasKey = !!String(sec.aiKey || "").trim();
+  } catch (e) { /* leave as no-key */ }
+  host.classList.toggle("an-warn", !hasKey);
+  host.textContent = hasKey
+    ? `${provider} · ${model}`
+    : "No AI key — set one in Settings > AI";
 }
 
 function renderAnList() {
@@ -7924,6 +7944,10 @@ function initAnalyze() {
     const b = anSelected();
     const lang = el("an-lang").value.trim().toLowerCase();
     if (!b || !lang) { el("an-trans-msg").textContent = "language code?"; return; }
+    if (!window.confirm(
+        `Translate this entry into “${lang}”?\n\nThis runs one AI request per ` +
+        `untranslated page — a long book can be hundreds of calls and use real ` +
+        `API credits. It saves as it goes and resumes if interrupted.`)) return;
     el("an-trans-msg").textContent = "";
     anStartJob("/api/analyze/translate", { build_id: b.id, lang },
                `translate ${lang}`);
@@ -9350,6 +9374,8 @@ function renderBuildsList() {
   document.querySelectorAll("#builds-tabs .pane-tab").forEach((t) =>
     t.classList.toggle("active", t.dataset.bstab === buildsTab()));
   el("builds-empty").hidden = builds.length !== 0;
+  el("builds-empty").textContent =
+    buildsTab() === "uploaded" ? "Nothing uploaded yet" : "No entries yet";
   for (const b of builds) {
     const ready = b.status === "ready";
     const uploaded = b.status === "uploaded";
@@ -9450,6 +9476,7 @@ function renderBuildEditor() {
   const ed = el("build-editor");
   const b = currentBuild();
   ed.hidden = !b;
+  el("build-empty").hidden = !!b;
   if (!b) return;
   for (const f of BUILD_FIELDS) {
     const input = el("b-" + f);
@@ -10489,19 +10516,9 @@ function renderOcrDiff() {
   const ops = diffLines(a.text, b.text);
   const parts = [];
   let same = 0;
-  const flushSame = () => {
-    if (same > 6) {
-      parts.push(`<div class="d-skip">&middot; &middot; &middot; ${same} unchanged lines</div>`);
-    } else if (same > 0) {
-      // short runs were buffered below; nothing extra to do
-    }
-    same = 0;
-  };
-  let buffer = [];
   for (const [op, line] of ops) {
     if (op === "=") {
       same++;
-      buffer.push(line);
       if (same <= 3) parts.push(`<div class="d-same">${esc(line) || "&nbsp;"}</div>`);
       continue;
     }
@@ -10509,7 +10526,6 @@ function renderOcrDiff() {
       parts.push(`<div class="d-skip">&middot; &middot; &middot; ${same - 3} more unchanged lines</div>`);
     }
     same = 0;
-    buffer = [];
     if (op === "-") parts.push(`<div class="d-del">- ${esc(line)}</div>`);
     else if (op === "+") parts.push(`<div class="d-add">+ ${esc(line)}</div>`);
     else parts.push(`<div class="d-skip">${esc(line)}</div>`);
@@ -10517,6 +10533,24 @@ function renderOcrDiff() {
   if (same > 3)
     parts.push(`<div class="d-skip">&middot; &middot; &middot; ${same - 3} more unchanged lines</div>`);
   box.innerHTML = parts.join("") || `<p class="empty">No differences</p>`;
+}
+
+// the digit->engine staging legend shown above the page view — the core
+// staging gesture is otherwise only documented in Settings > OCR
+function buildOcrKeymapLegend() {
+  const host = el("ocr-keymap");
+  if (!host) return;
+  const map = state.settings.ocrKeyMap || {};
+  const SHORT = { tesseract: "Tesseract", mistral: "Mistral", claude: "Claude",
+                  textract: "Textract", azure: "Azure", openai: "OpenAI" };
+  const parts = [];
+  for (const k of ["1", "2", "3", "4", "5"]) {
+    if (map[k]) parts.push(`<b>${k}</b> ${esc(SHORT[map[k]] || map[k])}`);
+  }
+  host.innerHTML = parts.length
+    ? `Hover a page and press a digit to stage its engine — ${parts.join(" · ")}` +
+      ` · <b>T</b> title page`
+    : "";
 }
 
 function setOcrView(v) {
@@ -10530,6 +10564,8 @@ function setOcrView(v) {
   el("ocr-pages").hidden = v !== "pdf";
   el("ocr-layout").hidden = v !== "pdf";       // layout is a mode of the page view
   el("ocr-pagenav").hidden = v !== "pdf";      // page jump/nav is page-view only
+  el("ocr-keymap").hidden = v !== "pdf";       // digit->engine legend, page-view only
+  if (v === "pdf") buildOcrKeymapLegend();
   el("ocr-layout").classList.toggle("active", ocrState.layout);
   if (v === "diff") renderOcrDiff();
   else if (v === "pdf") renderOcrPages();
@@ -10604,7 +10640,7 @@ async function renderOcrPages() {
   // the box visible and its scroll offset intact.
   if (box.offsetParent === null) return;
   const d = ocrSelDoc();
-  if (!d) { box.innerHTML = `<p class="empty">No document selected</p>`; ocrState.pagesPdf = ""; return; }
+  if (!d) { box.innerHTML = `<p class="empty">Select a book on the left to view and correct its OCR.</p>`; ocrState.pagesPdf = ""; return; }
   const pdf = docPdf(d);   // the doc's OWN source: a secondary scan's OCR
                            // renders beside the secondary PDF's pages
   // a view swap to ANOTHER pdf invalidates the page selection — its page
@@ -11032,9 +11068,10 @@ function renderOcrTab() {
 }
 
 function ocrFindNext() {
-  const ta = el("ocr-editor");
   const needle = el("ocr-find").value;
-  if (!needle || ta.hidden) return;
+  if (!needle) return;
+  if (el("ocr-editor").hidden) setOcrView("edit");   // Find operates on the editable text
+  const ta = el("ocr-editor");
   const from = ta.selectionEnd || 0;
   let i = ta.value.indexOf(needle, from);
   if (i < 0) i = ta.value.indexOf(needle);   // wrap around
@@ -11268,6 +11305,24 @@ async function ocrSubmitStaged() {
   }
   decorateOcrPages();
   if (!failed) updateOcrStagedMsg();
+}
+
+// un-stage every page staged on the current book (an escape from a stray
+// "stage every page"); the per-source keys keep other books' staging intact
+function clearOcrStaging() {
+  const bid = ocrState.book;
+  if (!bid) return;
+  for (const k of [...ocrState.pageTags.keys()]) {
+    if (k.startsWith(bid + ":")) ocrState.pageTags.delete(k);
+  }
+  decorateOcrPages();
+  updateOcrStagedMsg();
+}
+
+// drop finished / lost rows so the queue only shows what is still running
+function clearOcrFinishedJobs() {
+  ocrState.jobs = ocrState.jobs.filter((j) => !j.finished);
+  renderOcrQueue();
 }
 
 let ocrPollTimer = null;
@@ -11791,7 +11846,9 @@ function initOcrTab() {
     saveSettings();
   });
   el("ocr-queue-add").addEventListener("click", ocrQueueJob);
+  el("ocr-queue-clear").addEventListener("click", clearOcrStaging);
   el("ocr-submit").addEventListener("click", ocrSubmitStaged);
+  el("ocr-queue-clear-done").addEventListener("click", clearOcrFinishedJobs);
   el("ocr-del-pages").addEventListener("click", deleteSelectedPages);
   el("ocr-editor").addEventListener("input", () => {
     const d = ocrSelDoc();

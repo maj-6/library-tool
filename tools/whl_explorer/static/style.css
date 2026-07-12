@@ -1002,7 +1002,7 @@ body.desktop .win-controls { display: inline-flex; }
   margin: 0 6px 3px;
   border-left: 1px solid var(--face-sh);
 }
-.tb-spacer { flex: 1; }
+/* .tb-spacer folded into .bar-spacer (identical) */
 .tool-btn {
   font-family: var(--ui);
   font-size: 11px;
@@ -2118,6 +2118,9 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   border-radius: var(--radius);
 }
 #build-editor[hidden] { display: none; }
+.build-empty:not([hidden]) {
+  flex: 1; display: flex; align-items: center; justify-content: center; text-align: center;
+}
 .build-actions { margin: 0 0 8px; flex: none; gap: 6px; }
 .act-sep {
   align-self: stretch;
@@ -2546,6 +2549,17 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 #ocr-find, #ocr-replace { width: 130px; }
 .ocr-pagenav { display: inline-flex; align-items: center; gap: 4px; }
 #ocr-page-jump { width: 3.6em; text-align: center; }
+.ocr-keymap {
+  flex: 0 0 auto;
+  font-size: 11px;
+  letter-spacing: .5px;
+  color: var(--face-sh2);
+  padding: 4px 9px;
+  background: var(--face-hi);
+  border: 1px solid var(--face-sh);
+  border-radius: var(--radius);
+}
+.ocr-keymap b { color: var(--ink); font-weight: 600; letter-spacing: 0; }
 #ocr-editor {
   flex: 1;
   min-height: 0;
@@ -2996,6 +3010,8 @@ body[data-theme] .drafting::-webkit-scrollbar {
   padding: 8px 12px 4px;
 }
 #an-title { font-size: 15px; font-weight: bold; color: var(--ink); }
+#an-provider { color: var(--face-sh2); }
+#an-provider.an-warn { color: var(--amber); }
 .an-pane {
   display: none;
   flex: 1;
