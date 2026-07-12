@@ -20,7 +20,7 @@ const fs = require("fs");
 
 let sidecar = null;
 let mainWindow = null;
-let updaterWin = null;        // frameless update splash, shown only while updating
+let updaterWin = null;        // frameless splash: covers startup, and update progress
 let sidecarPort = null;
 let mainReady = false;        // gates window-all-closed: don't quit mid-startup
 
@@ -118,7 +118,7 @@ async function startSidecar() {
   fs.mkdirSync(dataRoot, { recursive: true });
   sidecarPort = await freePort();
   const { cmd, args, opts } = sidecarCommand(sidecarPort, dataRoot);
-  sidecar = spawn(cmd, args, opts);
+  sidecar = spawn(cmd, args, { ...opts, windowsHide: true });   // no console flash on Windows
   sidecar.stdout.on("data", (d) => process.stdout.write(`[sidecar] ${d}`));
   sidecar.stderr.on("data", (d) => process.stderr.write(`[sidecar] ${d}`));
   sidecar.on("error", (err) => {
@@ -150,6 +150,7 @@ function createWindow() {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,          // preload uses only contextBridge/ipcRenderer/process.platform
     },
   });
   Menu.setApplicationMenu(null);   // the web UI has its own menu bar
@@ -169,6 +170,7 @@ function createWindow() {
     if (!mainWindow) return;
     mainWindow.maximize();
     mainWindow.show();
+    closeUpdaterWindow();   // hand off from the startup splash to the real window
   });
   // open target=_blank / external links in the system browser, not a new window
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -219,7 +221,7 @@ function createUpdaterWindow(theme) {
     width: 460, height: 140,
     resizable: false, movable: false, minimizable: false, maximizable: false,
     center: true, frame: false, show: false, skipTaskbar: false,
-    title: "Updating Library Tool",
+    title: "Library Tool",
     webPreferences: {
       preload: path.join(__dirname, "updater-preload.js"),
       contextIsolation: true,
@@ -268,7 +270,9 @@ function runUpdateGate() {
       settled = true;
       if (checkTimer) clearTimeout(checkTimer);
       if (stallTimer) clearTimeout(stallTimer);
-      if (outcome === "launch") closeUpdaterWindow();
+      // Keep the splash up for the sidecar warm that follows a "launch"; reset
+      // it to the neutral "starting" label in case an update download had begun.
+      if (outcome === "launch") setUpdaterStatus({ phase: "starting" });
       resolve(outcome);
     };
     // a download that stalls with no bytes and no error must not strand startup
@@ -277,7 +281,6 @@ function runUpdateGate() {
       stallTimer = setTimeout(() => finish("launch"), 120000);
     };
 
-    const theme = readActiveTheme();
     updater.autoDownload = false;                 // probe first, then decide
     updater.autoInstallOnAppQuit = true;          // if we fall through mid-download, install on next quit
 
@@ -293,7 +296,6 @@ function runUpdateGate() {
       if (settled) return;
       if (checkTimer) { clearTimeout(checkTimer); checkTimer = null; }  // committed: the download sets its own pace
       setUpdaterStatus({ phase: "download", version: info.version });
-      createUpdaterWindow(theme);
       armStall();
       updater.downloadUpdate().catch((err) => {
         console.error("[updater] download", err && err.message);
@@ -325,6 +327,14 @@ function runUpdateGate() {
 
 app.whenReady().then(async () => {
   if (!gotSingleInstanceLock) return;   // a second instance — it is already quitting
+  // A themed splash covers the WHOLE startup — the update check and the sidecar
+  // warm-up — so a slow start never looks like a blank hang. The same window
+  // doubles as the update-progress splash if a download begins, and closes when
+  // the main window paints (or rides into the installer if we quit to update).
+  // Shown in dev too, where the Python sidecar takes a few seconds to answer.
+  setUpdaterStatus({ phase: "starting" });
+  createUpdaterWindow(readActiveTheme());
+
   // Update first: if one is installing, we quit into NSIS and never launch here.
   let outcome = "launch";
   try {
@@ -337,12 +347,12 @@ app.whenReady().then(async () => {
   try {
     await startSidecar();
   } catch (e) {
+    closeUpdaterWindow();
     dialog.showErrorBox("Library Tool", "The local backend failed to start.\n" + e.message);
     app.quit();
     return;
   }
-  closeUpdaterWindow();     // no-op unless a failed download left the splash up
-  createWindow();
+  createWindow();          // the splash closes in the window's ready-to-show
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });

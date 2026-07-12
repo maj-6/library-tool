@@ -78,7 +78,7 @@
       <span class="app">Library Tool</span>
       <span class="ver" id="ver"></span>
     </div>
-    <div class="status" id="status">Preparing update&hellip;</div>
+    <div class="status" id="status">Starting Library Tool&hellip;</div>
     <div class="track"><div class="fill" id="fill"></div></div>
     <div class="sub" id="sub"></div>
   </main>
@@ -116,6 +116,11 @@
       } else if (s.phase === "download") {
         $("status").textContent = "Downloading update" + (s.version ? " " + s.version : "") + "…";
         if (s.version) $("ver").textContent = "v" + s.version;
+      } else if (s.phase === "starting") {
+        $("status").textContent = "Starting Library Tool…";
+        $("sub").textContent = "";
+        $("ver").textContent = "";
+        document.body.classList.add("busy");
       }
     });
     api.onProgress(function (p) {
