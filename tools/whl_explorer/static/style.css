@@ -2545,6 +2545,8 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 }
 #ocr-mainpane .pane-bar { flex-wrap: wrap; }
 #ocr-find, #ocr-replace { width: 130px; }
+.ocr-pagenav { display: inline-flex; align-items: center; gap: 4px; }
+#ocr-page-jump { width: 3.6em; text-align: center; }
 #ocr-editor {
   flex: 1;
   min-height: 0;

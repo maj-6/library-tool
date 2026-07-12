@@ -10336,6 +10336,7 @@ function setOcrView(v) {
   el("ocr-diff").hidden = v !== "diff";
   el("ocr-pages").hidden = v !== "pdf";
   el("ocr-layout").hidden = v !== "pdf";       // layout is a mode of the page view
+  el("ocr-pagenav").hidden = v !== "pdf";      // page jump/nav is page-view only
   el("ocr-layout").classList.toggle("active", ocrState.layout);
   if (v === "diff") renderOcrDiff();
   else if (v === "pdf") renderOcrPages();
@@ -10463,6 +10464,8 @@ async function renderOcrPages() {
     box.scrollTop = keepTop;   // 0 on a pdf switch: no scroll bleed-through
     decorateOcrPages();
     observePageImgs(box);
+    el("ocr-page-total").textContent = "/ " + ocrPageRows().length;
+    ocrSyncPageInput(ocrTopPage());
   };
   // Layout mode swaps each editable textarea for a facsimile pane: the page's
   // own words, at the position and scale they occupy on the page. Boxes are
@@ -11207,10 +11210,50 @@ function clearOcrPageSel() {
   ocrState.selAnchor = 0;
 }
 
+// --- page navigation -----------------------------------------------------------
+// The reader is a continuous scroll (not a one-page-at-a-time viewer), so arrows
+// keep their native line-scroll; PageUp/PageDown step a whole page, Home/End
+// jump to the ends, and the pane-bar box reads (and jumps to) the page currently
+// at the top of the viewport. data-page is 1..N contiguous, so row count == last
+// page number.
+function ocrPageRows() { return el("ocr-pages").querySelectorAll(".ocr-pgrow"); }
+
+function ocrTopPage() {
+  const box = el("ocr-pages");
+  const rows = ocrPageRows();
+  if (!rows.length) return 1;
+  const top = box.getBoundingClientRect().top;
+  let cur = +rows[0].dataset.page;
+  for (const r of rows) {
+    if (r.getBoundingClientRect().top - top <= 4) cur = +r.dataset.page;   // scrolled to/above the top edge
+    else break;
+  }
+  return cur;
+}
+
+// reflect the current page in the jump box, unless the user is typing in it
+function ocrSyncPageInput(n) {
+  const inp = el("ocr-page-jump");
+  if (inp && document.activeElement !== inp) inp.value = n;
+}
+
+function ocrScrollToPage(n) {
+  const rows = ocrPageRows();
+  if (!rows.length) return;
+  n = Math.max(1, Math.min(rows.length, n));
+  const row = el("ocr-pages").querySelector(`.ocr-pgrow[data-page="${n}"]`);
+  if (row) { row.scrollIntoView({ block: "start" }); ocrSyncPageInput(n); }
+}
+
 function onOcrPagesKey(ev) {
   if (!ocrPagesActive()) return;
   if (/^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName) ||
       ev.target.isContentEditable) return;
+  // page navigation works on any viewed PDF, so it runs before the build gate
+  if (ev.key === "PageDown") { ev.preventDefault(); ocrScrollToPage(ocrTopPage() + 1); return; }
+  if (ev.key === "PageUp") { ev.preventDefault(); ocrScrollToPage(ocrTopPage() - 1); return; }
+  if (ev.key === "Home") { ev.preventDefault(); ocrScrollToPage(1); return; }
+  if (ev.key === "End") { ev.preventDefault(); ocrScrollToPage(ocrPageRows().length); return; }
   const d = ocrSelDoc();
   const bid = d && d.buildId;
   if (!bid) return;
@@ -11484,6 +11527,18 @@ function initOcrTab() {
   el("ocr-pages").addEventListener("mouseleave", () => { ocrHoverPage = 0; });
   el("ocr-pages").addEventListener("click", onOcrPagesClick);
   document.addEventListener("keydown", onOcrPagesKey);
+  // jump-to-page box + a scroll-tracked "page N / total" readout
+  el("ocr-page-jump").addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter") return;
+    ev.preventDefault();
+    const n = parseInt(el("ocr-page-jump").value, 10);
+    if (n) ocrScrollToPage(n);
+  });
+  let ocrPageRaf = 0;
+  el("ocr-pages").addEventListener("scroll", () => {
+    if (ocrPageRaf) return;
+    ocrPageRaf = requestAnimationFrame(() => { ocrPageRaf = 0; ocrSyncPageInput(ocrTopPage()); });
+  }, { passive: true });
   ocrState.layout = state.settings.ocrLayout !== false;   // layout is home
   el("ocr-layout").addEventListener("click", () => setOcrLayout(!ocrState.layout));
   // reflect the default view (page view, layout on) in the toolbar/panes —
