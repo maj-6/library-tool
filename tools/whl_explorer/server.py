@@ -155,7 +155,20 @@ def _init_logging() -> None:
     logging.getLogger("werkzeug").setLevel(logging.INFO)
 
 
+def _apply_log_level() -> None:
+    """Root logger -> DEBUG when Settings > Advanced enables verbose logging,
+    else INFO. Read straight off client_state so it applies at startup and
+    after every settings push."""
+    try:
+        s = lib.load_json(lib.CLIENT_STATE_PATH, {}).get("settings", {})
+        verbose = bool(s.get("verboseLogging"))
+    except Exception:
+        verbose = False
+    logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
+
+
 _init_logging()
+_apply_log_level()
 
 
 @app.errorhandler(Exception)
@@ -2036,6 +2049,14 @@ def _ocr_tesseract(png: bytes, cfg: dict) -> dict:
     return {"text": "\n".join(parts), "words": words}
 
 
+def _ocr_max_tokens() -> int:
+    """Vision-OCR output cap (Settings > OCR); dense pages need it raised."""
+    try:
+        return max(1024, min(32000, int(_client_settings().get("ocrMaxTokens") or 8192)))
+    except (TypeError, ValueError):
+        return 8192
+
+
 def _ocr_claude(png: bytes, cfg: dict) -> str:
     key = (cfg.get("claude_key") or "").strip()
     if not key:
@@ -2044,7 +2065,7 @@ def _ocr_claude(png: bytes, cfg: dict) -> str:
     model = (cfg.get("claude_model") or "").strip() or "claude-haiku-4-5-20251001"
     body = json.dumps({
         "model": model,
-        "max_tokens": 8192,
+        "max_tokens": _ocr_max_tokens(),
         "messages": [{"role": "user", "content": [
             {"type": "image", "source": {
                 "type": "base64", "media_type": "image/png",
@@ -2539,7 +2560,8 @@ def api_master_sync():
     Google service-account JSON key — TODO: verify once the user has one."""
     p = request.get_json(silent=True) or {}
     sheet_id = str(p.get("spreadsheet_id") or "").strip()
-    keyfile = str(p.get("service_account_file") or "").strip()
+    keyfile = (str(p.get("service_account_file") or "").strip()
+               or str(_client_settings().get("gsKeyFile") or "").strip())
     sheet_name = str(p.get("sheet_name") or "Master list").strip()
     if not sheet_id or not keyfile:
         return jsonify({"ok": False,
@@ -2777,8 +2799,15 @@ def api_client_state_put():
         for k in _CLIENT_STATE_KEYS:
             if k in payload:
                 state[k] = payload[k]
+        # secrets never persist in the synced client_state (they live in the
+        # local secrets store); strip them defensively even if a client sends them
+        if isinstance(state.get("settings"), dict):
+            for _sk in _SECRET_KEYS:
+                state["settings"].pop(_sk, None)
         state["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         lib.save_json(lib.CLIENT_STATE_PATH, state)
+        if "settings" in payload:
+            _apply_log_level()   # verbose-logging toggle takes effect immediately
     # the checked set is a blob, not a stream of adds -- diff it to get events.
     # Adds and removals are logged separately from the key-set differences, so
     # each event's count always agrees with the titles it names (a PUT that
@@ -3200,8 +3229,91 @@ def api_ia_downloads():
 
 # Cloud config lives in the client settings blob (synced via /api/client_state),
 # so a per-user remote URL and DB source URLs need no separate config file.
+# --- credentials: a LOCAL-ONLY secrets store, kept out of the synced (and
+# rebinding-reachable) client_state. The dialog reads/writes it through
+# /api/secrets (Host-guarded); every server-side credential read goes through
+# _client_settings, which overlays these on top of the synced preferences. ------
+_SECRET_KEYS = frozenset({
+    "aiKey", "mistralKey", "ocrClaudeKey", "ocrAzureKey", "ocrAwsKey",
+    "ocrAwsSecret", "supabaseKey", "supabaseAnonKey", "r2KeyId", "r2Secret",
+    "gsKeyFile",
+})
+_SECRETS_PATH = lib.DATA_ROOT / "output" / "secrets.json"
+
+
+def _load_secrets() -> dict:
+    d = lib.load_json(_SECRETS_PATH, {})
+    return d if isinstance(d, dict) else {}
+
+
+def _save_secrets(d: dict) -> None:
+    lib.save_json(_SECRETS_PATH, d)
+
+
 def _client_settings():
-    return (lib.load_json(lib.CLIENT_STATE_PATH, {}) or {}).get("settings") or {}
+    s = dict((lib.load_json(lib.CLIENT_STATE_PATH, {}) or {}).get("settings") or {})
+    for k, v in _load_secrets().items():
+        if v:
+            s[k] = v                     # secrets override; they never persist here
+    return s
+
+
+def _local_only() -> bool:
+    """Block DNS-rebinding: only requests whose Host is the loopback origin the
+    app itself is served from may touch the secrets store."""
+    host = (request.host or "").split(":")[0].lower()
+    return host in ("127.0.0.1", "localhost")
+
+
+@app.route("/api/secrets", methods=["GET"])
+def api_secrets_get():
+    if not _local_only():
+        return jsonify({"error": "forbidden"}), 403
+    secrets = _load_secrets()
+    return jsonify({k: secrets.get(k, "") for k in _SECRET_KEYS})
+
+
+@app.route("/api/secrets", methods=["PUT"])
+def api_secrets_put():
+    if not _local_only():
+        return jsonify({"error": "forbidden"}), 403
+    updates = (request.get_json(silent=True) or {}).get("updates") or {}
+    secrets = _load_secrets()
+    for k, v in updates.items():
+        if k not in _SECRET_KEYS:
+            continue
+        v = str(v or "").strip()
+        if v:
+            secrets[k] = v
+        else:
+            secrets.pop(k, None)
+    _save_secrets(secrets)
+    return jsonify({"ok": True})
+
+
+def _migrate_secrets_from_client_state() -> None:
+    """One-time lift of secret keys out of the synced client_state settings into
+    the local-only secrets store, so they stop riding in a rebinding-reachable,
+    cloud-synced blob. Idempotent."""
+    with _client_state_lock:
+        state = lib.load_json(lib.CLIENT_STATE_PATH, {})
+        s = state.get("settings")
+        if not isinstance(s, dict):
+            return
+        moved, removed = {}, False
+        for k in list(s):
+            if k in _SECRET_KEYS:
+                v = s.pop(k)
+                removed = True
+                if v:
+                    moved[k] = v
+        if moved:
+            secrets = _load_secrets()
+            for k, v in moved.items():
+                secrets.setdefault(k, v)   # never clobber a secrets.json value
+            _save_secrets(secrets)
+        if removed:
+            lib.save_json(lib.CLIENT_STATE_PATH, state)
 
 
 def _cloud_base():
@@ -3916,7 +4028,10 @@ def _ai_cfg() -> dict:
     return {"base": str(s.get("aiBase") or "").strip() or _AI_DEFAULT_BASE,
             "model": str(s.get("aiModel") or "").strip() or _AI_DEFAULT_MODEL,
             "key": str(s.get("aiKey") or "").strip(),
-            "instructions": str(s.get("aiInstructions") or "").strip()}
+            "instructions": str(s.get("aiInstructions") or "").strip(),
+            # user overrides (Settings > AI): blank temperature keeps each call's own default
+            "temperature": s.get("aiTemperature"),
+            "timeout": s.get("aiTimeout")}
 
 
 def _ai_chat(cfg: dict, messages: list, json_mode: bool = False,
@@ -3927,6 +4042,19 @@ def _ai_chat(cfg: dict, messages: list, json_mode: bool = False,
     if not cfg["key"]:
         raise RuntimeError("no AI key — set one in Settings > AI "
                            "(DeepSeek is the default provider)")
+    # a set temperature/timeout in Settings > AI overrides the per-call defaults
+    _t = cfg.get("temperature")
+    if _t not in (None, ""):
+        try:
+            temperature = max(0.0, min(2.0, float(_t)))
+        except (TypeError, ValueError):
+            pass
+    _to = cfg.get("timeout")
+    if _to:
+        try:
+            timeout = max(10.0, min(1200.0, float(_to)))
+        except (TypeError, ValueError):
+            pass
     body = {"model": cfg["model"], "messages": messages,
             "temperature": temperature}
     if json_mode:
@@ -5261,6 +5389,7 @@ if __name__ == "__main__":
     # WHL_PORT lets a second instance run on another port (a distinct origin,
     # so its localStorage/client-state can't collide with the main one) — used
     # to test against a throwaway WHL_DATA_ROOT without touching live state.
+    _migrate_secrets_from_client_state()   # lift any secrets off the synced blob
     port = int(os.environ.get("WHL_PORT") or 5001)
     log.info("Library Tool on 127.0.0.1:%d - DATA_ROOT=%s", port, lib.DATA_ROOT)
     app.run(host="127.0.0.1", port=port, debug=False)

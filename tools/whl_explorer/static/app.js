@@ -25,6 +25,35 @@
 
 const LS_KEY = "whl_cad_checked_v1";
 const SETTINGS_KEY = "whl_cad_settings_v1";
+const VIEWSTATE_KEY = "whl_cad_viewstate_v1";
+// Per-device UI / session state: persisted LOCALLY but never synced to the server
+// as "settings". These are things one machine should not push onto another — the
+// active table/mode, toolbar filters, split-pane and column sizes, and the
+// first-run flags. Everything else in state.settings is a real preference and
+// still syncs. (state.settings stays the single in-memory object; only the
+// persistence layer partitions it.)
+const VIEW_STATE_KEYS = new Set([
+  "markFilter", "srcFilter", "dlFilter", "yearFrom", "yearTo",
+  "topTable", "bottomActive", "whlMode", "checkedMode", "showCatalog",
+  "paneWidth", "uploadSplitH", "colWidths",
+  "authPromptDismissed", "wizardDone", "checkedCols",
+]);
+// Credentials: never persisted client-side and never synced. They live only in
+// the server's local, Host-guarded secrets store (/api/secrets); the dialog
+// loads/saves them there. Dropped from BOTH persistence buckets below.
+const SECRET_KEYS = new Set([
+  "aiKey", "mistralKey", "ocrClaudeKey", "ocrAzureKey", "ocrAwsKey",
+  "ocrAwsSecret", "supabaseKey", "supabaseAnonKey", "r2KeyId", "r2Secret",
+  "gsKeyFile",
+]);
+function partitionSettings(s) {
+  const prefs = {}, view = {};
+  for (const k of Object.keys(s)) {
+    if (SECRET_KEYS.has(k)) continue;               // secrets go to the server-only store
+    (VIEW_STATE_KEYS.has(k) ? view : prefs)[k] = s[k];
+  }
+  return { prefs, view };
+}
 
 // `categories` left this list with the taxonomy overhaul: assignments are
 // category_ids lists handled by the chip pickers, not looped text inputs.
@@ -139,6 +168,16 @@ const state = {
     sets: {},                   // multi-volume sets: baseKey -> {count, exp}
     expandSets: false,          // expand multi-volume sets by default
     hideVolTitles: false,       // hide the titles of individual volumes
+    // --- Settings redesign, Stage 2: new tunables ---
+    aiTemperature: "",          // "" = per-call defaults; a number overrides all Analyze calls
+    aiTimeout: 240,             // seconds allowed for an Analyze/AI request
+    ocrMaxTokens: 8192,         // vision-OCR output cap (raise for dense pages)
+    historyLimit: 300,          // recent actions shown in the History feed
+    olLimit: 60,                // Open Library results per realtime search
+    confirmDiscard: true,       // ask before discarding unsaved page edits
+    verboseLogging: false,      // raise the server log level to DEBUG
+    autoUpdate: true,           // desktop: check for updates on launch
+    updateChannel: "stable",    // desktop: update channel (stable | beta)
   },
   editTarget: null,             // record open in the EDIT tab
   sort: { checked: null, whl: null },  // {key, dir} per top table
@@ -821,7 +860,13 @@ function loadChecked() {
 }
 
 function saveSettings() {
-  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings)); } catch (e) {}
+  // preferences -> SETTINGS_KEY (and the server); per-device view state -> its
+  // own local key, never pushed. state.settings stays whole in memory.
+  const { prefs, view } = partitionSettings(state.settings);
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(prefs));
+    localStorage.setItem(VIEWSTATE_KEY, JSON.stringify(view));
+  } catch (e) {}
   pushClientState("settings");
 }
 
@@ -864,7 +909,10 @@ function onUiScaleKey(ev) {
 function loadSettings() {
   try {
     const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
-    state.settings = Object.assign(state.settings, s);
+    const v = JSON.parse(localStorage.getItem(VIEWSTATE_KEY) || "{}");
+    // legacy caches kept view state inside SETTINGS_KEY; apply it, then let the
+    // dedicated view-state store win. The next saveSettings re-partitions both.
+    state.settings = Object.assign(state.settings, s, v);
   } catch (e) { /* keep defaults */ }
   normalizeSettings();
 }
@@ -944,7 +992,7 @@ let _csTimer = null;
 
 function clientStateBlob(kind) {
   if (kind === "checked") return checkedArray();
-  if (kind === "settings") return state.settings;
+  if (kind === "settings") return partitionSettings(state.settings).prefs;
   if (kind === "attention") return state.attn || {};
   return null;
 }
@@ -1014,11 +1062,20 @@ async function syncClientStateOnLoad() {
       try { localStorage.setItem(LS_KEY, JSON.stringify(checkedArray())); } catch (e) {}
     }
     if (server.settings && typeof server.settings === "object") {
-      state.settings = Object.assign(state.settings, server.settings);
+      // adopt the server's PREFERENCES; per-device view state stays whatever this
+      // machine holds (the server no longer carries it, but old data might)
+      const incoming = {};
+      for (const k of Object.keys(server.settings))
+        if (!VIEW_STATE_KEYS.has(k)) incoming[k] = server.settings[k];
+      state.settings = Object.assign(state.settings, incoming);
       normalizeSettings();
-      syncYearFilterInputs();   // reflect adopted year-range into the toolbar
+      syncYearFilterInputs();   // reflect the (local) year-range into the toolbar
       syncSearchConsCheckboxes();
-      try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings)); } catch (e) {}
+      try {
+        const { prefs, view } = partitionSettings(state.settings);
+        localStorage.setItem(SETTINGS_KEY, JSON.stringify(prefs));
+        localStorage.setItem(VIEWSTATE_KEY, JSON.stringify(view));
+      } catch (e) {}
     }
     if (server.attention && typeof server.attention === "object") {
       // Attention marks (unlike checked books) are a low-stakes set that
@@ -1384,7 +1441,8 @@ const homeState = { events: [], loaded: false, expanded: new Set() };
 async function loadActivity() {
   loadReviews().then(renderHome);   // the review count rides the same visit
   try {
-    const r = await (await fetch("/api/activity?limit=300")).json();
+    const r = await (await fetch(
+      "/api/activity?limit=" + (state.settings.historyLimit || 300))).json();
     homeState.events = r.ok ? r.events : [];
   } catch (e) { homeState.events = []; }
   homeState.loaded = true;
@@ -2209,7 +2267,10 @@ function renderSettings() {
     (el("status-right").textContent || "");
   el("reset-settings").onclick = () => {
     if (!window.confirm("Reset every interface setting? (Catalog data is kept.)")) return;
-    try { localStorage.removeItem(SETTINGS_KEY); } catch (e) {}
+    try {
+      localStorage.removeItem(SETTINGS_KEY);
+      localStorage.removeItem(VIEWSTATE_KEY);
+    } catch (e) {}
     location.reload();
   };
   el("clear-history-btn").onclick = () => {
@@ -2360,6 +2421,37 @@ function renderSettings() {
       saveSettings();
     };
   }
+  // Credentials: re-wire the secret fields the generic loops above touched so
+  // their values load from and save to the server's local, Host-guarded secrets
+  // store — never localStorage, never the synced client_state.
+  (async () => {
+    const SECRET_FIELDS = [
+      ["set-ai-key", "aiKey"], ["set-mistral-key", "mistralKey"],
+      ["set-ocr-claude-key", "ocrClaudeKey"], ["set-ocr-azure-key", "ocrAzureKey"],
+      ["set-ocr-aws-key", "ocrAwsKey"], ["set-ocr-aws-secret", "ocrAwsSecret"],
+      ["set-sb-key", "supabaseKey"], ["set-sb-anon", "supabaseAnonKey"],
+      ["set-r2-key", "r2KeyId"], ["set-r2-secret", "r2Secret"],
+      ["set-gs-keyfile", "gsKeyFile"],
+    ];
+    let secrets = {};
+    try { secrets = await (await fetch("/api/secrets")).json(); } catch (e) { /* keep blanks */ }
+    for (const [id, k] of SECRET_FIELDS) {
+      const n = el(id);
+      if (!n) continue;
+      const v = secrets[k] || "";
+      n.value = v;
+      state.settings[k] = v;                 // in-memory only (client-side uses, e.g. master sync)
+      n.onchange = () => {
+        const val = n.value.trim();
+        state.settings[k] = val;
+        fetch("/api/secrets", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ updates: { [k]: val } }),
+        }).catch(() => {});
+      };
+    }
+  })();
   // phone-capture sync interval + remote-cleanup toggle + connection test
   const cm = el("set-cloud-minutes");
   cm.value = state.settings.cloudSyncMinutes || 0;
@@ -2461,6 +2553,88 @@ function renderSettings() {
     state.settings.pdfBrowseDir = bd.value.trim();
     saveSettings();
   };
+
+  // --- Stage 2 tunables (guarded by id, so a control's absence is harmless) ---
+  // AI: temperature override (blank = each call's own default) + request timeout
+  const aiTemp = el("set-ai-temp");
+  if (aiTemp) {
+    aiTemp.value = state.settings.aiTemperature ?? "";
+    aiTemp.onchange = () => {
+      const v = aiTemp.value.trim();
+      state.settings.aiTemperature =
+        v === "" ? "" : Math.max(0, Math.min(2, parseFloat(v) || 0));
+      aiTemp.value = state.settings.aiTemperature;
+      saveSettings();
+    };
+  }
+  const aiTo = el("set-ai-timeout");
+  if (aiTo) {
+    aiTo.value = state.settings.aiTimeout || 240;
+    aiTo.onchange = () => {
+      state.settings.aiTimeout =
+        Math.max(10, Math.min(1200, parseInt(aiTo.value, 10) || 240));
+      aiTo.value = state.settings.aiTimeout;
+      saveSettings();
+    };
+  }
+  // OCR: vision output-token cap (dense pages truncate at 8192)
+  const omt = el("set-ocr-maxtokens");
+  if (omt) {
+    omt.value = state.settings.ocrMaxTokens || 8192;
+    omt.onchange = () => {
+      state.settings.ocrMaxTokens =
+        Math.max(1024, Math.min(32000, parseInt(omt.value, 10) || 8192));
+      omt.value = state.settings.ocrMaxTokens;
+      saveSettings();
+    };
+  }
+  // EDITING
+  const hl = el("set-history-limit");
+  if (hl) {
+    hl.value = state.settings.historyLimit || 300;
+    hl.onchange = () => {
+      state.settings.historyLimit =
+        Math.max(20, Math.min(2000, parseInt(hl.value, 10) || 300));
+      hl.value = state.settings.historyLimit;
+      saveSettings();
+    };
+  }
+  const oll = el("set-ol-limit");
+  if (oll) {
+    oll.value = state.settings.olLimit || 60;
+    oll.onchange = () => {
+      state.settings.olLimit =
+        Math.max(1, Math.min(100, parseInt(oll.value, 10) || 60));
+      oll.value = state.settings.olLimit;
+      saveSettings();
+    };
+  }
+  const cd = el("set-confirm-discard");
+  if (cd) {
+    cd.checked = state.settings.confirmDiscard !== false;
+    cd.onchange = () => { state.settings.confirmDiscard = cd.checked; saveSettings(); };
+  }
+  // ADVANCED: verbose server logging (pushed so the server re-reads its level)
+  const vl = el("set-verbose-log");
+  if (vl) {
+    vl.checked = !!state.settings.verboseLogging;
+    vl.onchange = () => {
+      state.settings.verboseLogging = vl.checked;
+      saveSettings();
+      flushClientState();
+    };
+  }
+  // UPDATES (desktop shell reads these off client_state at launch)
+  const au = el("set-auto-update");
+  if (au) {
+    au.checked = state.settings.autoUpdate !== false;
+    au.onchange = () => { state.settings.autoUpdate = au.checked; saveSettings(); };
+  }
+  const uc = el("set-update-channel");
+  if (uc) {
+    uc.value = state.settings.updateChannel || "stable";
+    uc.onchange = () => { state.settings.updateChannel = uc.value; saveSettings(); };
+  }
 }
 
 function initSettingsNav() {
@@ -2476,6 +2650,23 @@ function initSettingsNav() {
 
 function openSettings() { renderSettings(); el("settings-overlay").hidden = false; }
 function closeSettings() { el("settings-overlay").hidden = true; }
+
+function openAbout() { const o = el("about-overlay"); if (o) o.hidden = false; }
+function closeAbout() { const o = el("about-overlay"); if (o) o.hidden = true; }
+function initAbout() {
+  const close = el("about-close");
+  if (close) close.addEventListener("click", closeAbout);
+  const ov = el("about-overlay");
+  if (ov) ov.addEventListener("mousedown", (ev) => { if (ev.target === ov) closeAbout(); });
+  // the About footer buttons reuse menu commands (Website / Changelog)
+  for (const b of document.querySelectorAll("#about-body [data-cmd]")) {
+    b.addEventListener("click", () => {
+      closeAbout();
+      const f = MENU_CMDS[b.dataset.cmd];
+      if (f) f();
+    });
+  }
+}
 
 // --- changelog viewer ----------------------------------------------------------
 // Renders the shared release notes (website/changelog.md, served by
@@ -4895,7 +5086,7 @@ function scheduleOlRealtime() {
 
 async function olRealtime() {
   if (activeBottomTable() !== "ol" || !state.settings.showCatalog) return;
-  const params = new URLSearchParams({ limit: "60" });
+  const params = new URLSearchParams({ limit: String(state.settings.olLimit || 60) });
   const ov = state.olOverride;
   const q = ov
     ? { title: ov.title, author: ov.author || "", year: ov.year || "", empty: false }
@@ -6455,8 +6646,8 @@ function createPdfViewer() {
       const dd = dims[n - 1];
       return dd && dd[0] > 0 && dd[1] > 0 ? `aspect-ratio:${dd[0]} / ${dd[1]};` : "";
     };
-    const img = (n) => `<img loading="lazy" decoding="async" alt="page ${n}" style="${ar(n)}"
-        src="/api/pdf/pageimg?path=${encodeURIComponent(pagesPdf)}&page=${n}&w=700" />`;
+    const img = (n) => `<img decoding="async" alt="page ${n}" style="${ar(n)}"
+        data-src="/api/pdf/pageimg?path=${encodeURIComponent(pagesPdf)}&page=${n}&w=700" />`;
     const notes =
       (!textOk ? `<div class="ocr-pgnote empty">OCR text unavailable — saving disabled</div>` : "") +
       (pagesWhole ? `<div class="ocr-pgnote empty">This OCR file has no page markers — the full text sits beside page 1${isLay() ? "" : " and saves verbatim"}</div>` : "") +
@@ -6473,6 +6664,7 @@ function createPdfViewer() {
       layObs = makeLayoutObserver(pagesBox, fillViewerLayout);
       pagesBox.dataset.pdf = pagesPdf;
       pagesBox.scrollTop = keepTop;   // 0 on a pdf switch: no bleed-through
+      observePageImgs(pagesBox);
       return;
     }
     pagesBox.innerHTML = notes +
@@ -6498,6 +6690,7 @@ function createPdfViewer() {
     pagesSave.hidden = !editable;
     pagesBox.dataset.pdf = pagesPdf;
     pagesBox.scrollTop = keepTop;   // 0 on a pdf switch: no bleed-through
+    observePageImgs(pagesBox);
   }
 
   // one facsimile pane: the extraction gets the word boxes of THIS pdf's
@@ -6579,11 +6772,11 @@ function createPdfViewer() {
   }
   pagesBtn.addEventListener("click", () => {
     if (pagesOn && pagesDirty &&
-        !window.confirm("Discard unsaved page edits?")) return;
+        state.settings.confirmDiscard !== false && !window.confirm("Discard unsaved page edits?")) return;
     setPages(!pagesOn);
   });
   layBtn.addEventListener("click", () => {
-    if (pagesDirty && !window.confirm("Discard unsaved page edits?")) return;
+    if (pagesDirty && state.settings.confirmDiscard !== false && !window.confirm("Discard unsaved page edits?")) return;
     state.settings.viewerLayout = !isLay();
     saveSettings();
     layBtn.classList.toggle("active", isLay());
@@ -6618,7 +6811,7 @@ function createPdfViewer() {
   }
   ocrBtn.addEventListener("click", () => {
     if (pagesOn) {
-      if (pagesDirty && !window.confirm("Discard unsaved page edits?")) return;
+      if (pagesDirty && state.settings.confirmDiscard !== false && !window.confirm("Discard unsaved page edits?")) return;
       // intent: leave the page view and SHOW the OCR pane
       setPages(false);
       setOcr(true);
@@ -10257,13 +10450,14 @@ async function renderOcrPages() {
     const dd = dims[n - 1];
     return dd && dd[0] > 0 && dd[1] > 0 ? `aspect-ratio:${dd[0]} / ${dd[1]};` : "";
   };
-  const img = (n) => `<img loading="lazy" decoding="async" alt="page ${n}" style="${ar(n)}"
-      src="/api/pdf/pageimg?path=${encodeURIComponent(pdf)}&page=${n}&w=700" />`;
+  const img = (n) => `<img decoding="async" alt="page ${n}" style="${ar(n)}"
+      data-src="/api/pdf/pageimg?path=${encodeURIComponent(pdf)}&page=${n}&w=700" />`;
   const done = () => {
     ocrState.pagesPdf = pdf;
     ocrState.pagesSrc = d.buildId ? docSrcKey(d) : "primary";
     box.scrollTop = keepTop;   // 0 on a pdf switch: no scroll bleed-through
     decorateOcrPages();
+    observePageImgs(box);
   };
   // Layout mode swaps each editable textarea for a facsimile pane: the page's
   // own words, at the position and scale they occupy on the page. Boxes are
@@ -10335,6 +10529,34 @@ function makeLayoutObserver(rootEl, fill) {
   for (const pane of rootEl.querySelectorAll(".ocr-pglayout")) {
     obs.observe(pane);
   }
+  return obs;
+}
+
+// Page images load only near the viewport, and — crucially — an image scrolled
+// away before it finished loading is aborted (its src removed) so it stops
+// holding one of the browser's ~6 per-origin connections. Native loading="lazy"
+// never cancels, so a fast scroll fires a request per page in DOM order with no
+// way to jump the queue: the page you land on waits behind every page you flew
+// past, and the ones at the bottom take forever. Finished images are kept (no
+// reload flicker on a small scroll-back); in-flight ones are dropped and reload
+// when they return. Rows and their textareas always stay mounted, so saving and
+// decorateOcrPages still see every page.
+function observePageImgs(container) {
+  if (container._imgObs) container._imgObs.disconnect();
+  const obs = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      const im = e.target;
+      if (e.isIntersecting) {
+        if (im.dataset.src && !im.getAttribute("src")) im.src = im.dataset.src;
+      } else if (!im.complete && im.getAttribute("src")) {
+        im.removeAttribute("src");   // abort the in-flight load, free the slot
+      }
+    }
+  }, { root: container, rootMargin: "1000px 0px" });
+  for (const im of container.querySelectorAll(".ocr-pgimg img[data-src]")) {
+    obs.observe(im);
+  }
+  container._imgObs = obs;
   return obs;
 }
 
@@ -11324,6 +11546,14 @@ const MENU_CMDS = {
   "setup-guide": () => showWizard(),
   "changelog": () => openChangelog(),
   "site-home": () => openWebView("https://maj-6.github.io/library-tool/"),
+  "about": () => openAbout(),
+  // File > New entry: same flow as the Editor toolbar's + button, but reachable
+  // from anywhere — switch to the Editor tab first so the new build is visible.
+  "new-entry": () => {
+    const t = document.querySelector('#tabs .tab[data-tab="upload"]');
+    if (t) t.click();
+    createBuild({}, "(blank)");
+  },
   // quick settings (mirror the Settings-dialog handlers, side effects and all)
   "opt-auto-ia": () => {
     const on = state.settings.autoIaDownload === false;   // was off -> turning on
@@ -11452,6 +11682,11 @@ function initMenubar() {
   });
   document.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape" && openMenu) closeAll();
+    // Ctrl/Cmd+, opens Preferences (the desktop convention)
+    if ((ev.ctrlKey || ev.metaKey) && ev.key === ",") {
+      ev.preventDefault();
+      openSettings();
+    }
   });
 }
 
@@ -11709,6 +11944,7 @@ function init() {
   boot("setup wizard", initWizard);
   boot("title bar", fitTitleBar);   // after the menus exist: their width sets the clamp
   boot("settings nav", initSettingsNav);
+  boot("about", initAbout);
   boot("column resize", initColResize);
   boot("open library status", loadOlStatus);
 
