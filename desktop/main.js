@@ -23,6 +23,11 @@ let mainWindow = null;
 let updaterWin = null;        // frameless splash: covers startup, and update progress
 let sidecarPort = null;
 let mainReady = false;        // gates window-all-closed: don't quit mid-startup
+let sidecarRestarts = 0;      // recovery: bounded auto-restart of a crashed backend
+let lastSidecarStart = 0;     // when the sidecar last came up (to spot a crash loop)
+let sidecarRestarting = false;
+const MAX_SIDECAR_RESTARTS = 3;
+const SIDECAR_STABLE_MS = 60000;   // ran this long -> a fresh crash isn't the loop
 
 const isDev = !app.isPackaged;
 
@@ -113,7 +118,7 @@ function waitForServer(port, timeoutMs) {
   });
 }
 
-async function startSidecar() {
+async function startSidecar(timeoutMs = 45000) {
   const dataRoot = app.getPath("userData");   // %APPDATA%\Library Tool
   fs.mkdirSync(dataRoot, { recursive: true });
   sidecarPort = await freePort();
@@ -127,12 +132,58 @@ async function startSidecar() {
       (isDev ? "\n\n(Dev mode expects Python on PATH — set WHL_PYTHON to override.)" : ""));
   });
   sidecar.on("exit", (code) => {
-    if (code && !app.isQuitting) {
-      dialog.showErrorBox("Library Tool", `The backend exited unexpectedly (code ${code}).`);
-      app.quit();
-    }
+    if (code && !app.isQuitting) handleSidecarCrash(code);
   });
-  await waitForServer(sidecarPort, 45000);
+  await waitForServer(sidecarPort, timeoutMs);
+  lastSidecarStart = Date.now();
+}
+
+// The sidecar died while the app was running. Rather than kill the whole app on
+// one transient backend crash, bring it back: respawn on a fresh port, wait for
+// it, and reload the window there, with a splash over the gap. Bounded — a real
+// crash loop (several crashes in quick succession) falls through to error+quit,
+// but a lone hiccup after a long stable run resets the budget so it always gets
+// a retry. During INITIAL startup (no window yet) we keep the old fail-fast.
+function handleSidecarCrash(code) {
+  if (!mainReady) {
+    dialog.showErrorBox("Library Tool", `The backend exited unexpectedly (code ${code}).`);
+    app.quit();
+    return;
+  }
+  if (sidecarRestarting) return;                 // a restart is already in flight
+  if (Date.now() - lastSidecarStart > SIDECAR_STABLE_MS) sidecarRestarts = 0;
+  if (sidecarRestarts >= MAX_SIDECAR_RESTARTS) {
+    dialog.showErrorBox("Library Tool",
+      `The backend keeps exiting unexpectedly (code ${code}); giving up after ${sidecarRestarts} restarts.`);
+    app.quit();
+    return;
+  }
+  sidecarRestarts++;
+  restartSidecar();
+}
+
+async function restartSidecar() {
+  sidecarRestarting = true;
+  setUpdaterStatus({ phase: "restarting" });
+  createUpdaterWindow(readActiveTheme());        // a splash over the app while it comes back
+  try {
+    await startSidecar(20000);                   // shorter wait: a failed restart shouldn't hang
+  } catch (e) {
+    sidecarRestarting = false;
+    if (app.isQuitting) return;
+    closeUpdaterWindow();
+    dialog.showErrorBox("Library Tool", "The backend could not be restarted.\n" + e.message);
+    app.quit();
+    return;
+  }
+  sidecarRestarting = false;
+  if (!mainWindow) { closeUpdaterWindow(); return; }
+  // reload at the NEW port; close the splash once the fresh page paints, with a
+  // safety timeout so a stalled reload can never strand it.
+  const done = () => closeUpdaterWindow();
+  mainWindow.webContents.once("did-finish-load", done);
+  setTimeout(done, 5000);
+  mainWindow.loadURL(`http://127.0.0.1:${sidecarPort}/`);
 }
 
 function createWindow() {

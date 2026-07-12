@@ -121,6 +121,11 @@
         $("sub").textContent = "";
         $("ver").textContent = "";
         document.body.classList.add("busy");
+      } else if (s.phase === "restarting") {
+        $("status").textContent = "Restarting the backend…";
+        $("sub").textContent = "";
+        $("ver").textContent = "";
+        document.body.classList.add("busy");
       }
     });
     api.onProgress(function (p) {
