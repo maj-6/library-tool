@@ -1453,7 +1453,7 @@ def _entry_folder_info(build_id: str) -> dict:
             "metadata": (d / "metadata.json").is_file()}
 
 
-def _pdf_extract_text(p: Path, max_pages: int) -> tuple[int, int, str, int]:
+def _pdf_extract_text(p: Path, max_pages: int | None = None) -> tuple[int, int, str, int]:
     """(total_pages, shown_pages, text, pages_with_text) of a PDF's text layer.
 
     PyMuPDF rather than pypdf: it is the same library that rasterises these
@@ -1468,7 +1468,7 @@ def _pdf_extract_text(p: Path, max_pages: int) -> tuple[int, int, str, int]:
     doc = fitz.open(str(p))
     try:
         total = doc.page_count
-        shown = min(total, max_pages)
+        shown = total if max_pages is None else min(total, max_pages)
         parts, with_text = [], 0
         for i in range(shown):
             text = doc[i].get_text().strip()
@@ -1592,7 +1592,7 @@ def api_build_folder_sync(build_id: str):
         except Exception as exc:
             notes.append(f"preview failed: {exc}")
         try:
-            total, shown, text, with_text = _pdf_extract_text(src, 400)
+            total, shown, text, with_text = _pdf_extract_text(src)   # every page (the 400 cap was legacy)
             # a Google scan carries text on its front matter and nowhere else:
             # the extraction "succeeds" and is worthless
             if with_text > 1:
@@ -2743,10 +2743,13 @@ def api_pdf_text():
     is saved automatically the first time a book's PDF is read."""
     raw_path = (request.args.get("path") or "").strip()
     url = (request.args.get("url") or "").strip()
+    # pages<=0 means every page (text extraction is cheap); a positive value caps
+    # it (default 100 for a quick preview). The old min(…, 500) was the legacy cap.
     try:
-        max_pages = max(1, min(500, int(request.args.get("pages") or 100)))
+        n = int(request.args.get("pages") or 100)
     except ValueError:
-        max_pages = 100
+        n = 100
+    max_pages = None if n <= 0 else min(2000, n)
     if raw_path:
         p = _resolve_local(raw_path)
         if p is None or not p.is_file():

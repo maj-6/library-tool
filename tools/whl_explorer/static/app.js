@@ -9683,15 +9683,15 @@ function buildTextSrc(b) {
   }
   const localPath = (b.pdf_file || "").trim();
   // live extraction auto-saves into the entry folder (ocr/extracted.txt);
-  // pages=400 matches the folder-sync extraction cap — the default 100
-  // would permanently truncate longer books
+  // pages=0 extracts every page — the default 100 (and the old 400) would
+  // permanently truncate longer books
   if (localPath) {
-    return "/api/pdf/text?pages=400&path=" + encodeURIComponent(localPath) +
+    return "/api/pdf/text?pages=0&path=" + encodeURIComponent(localPath) +
       "&save_build=" + encodeURIComponent(b.id);
   }
   const url = (b.pdf_source || "").trim();
   if (/^https?:\/\//i.test(url)) {
-    return "/api/pdf/text?pages=400&url=" + encodeURIComponent(url) +
+    return "/api/pdf/text?pages=0&url=" + encodeURIComponent(url) +
       "&save_build=" + encodeURIComponent(b.id);
   }
   return "";
@@ -10090,10 +10090,10 @@ async function selectOcrBook(bid) {
   ocrState.bookLoading = bid;
   try {
     // a folder without OCR files gets its extraction saved automatically
-    // the first time the book is opened here (pages=400 = extraction cap)
+    // the first time the book is opened here (pages=0 = every page)
     if (!folder.ocr.length && ocrBookPdf(bid)) {
       try {
-        const ex = await (await fetch("/api/pdf/text?pages=400&path=" +
+        const ex = await (await fetch("/api/pdf/text?pages=0&path=" +
           encodeURIComponent(ocrBookPdf(bid)) +
           "&save_build=" + encodeURIComponent(bid))).json();
         // A scan carries a text layer on its cover sheet and nowhere else, so
@@ -10227,7 +10227,7 @@ async function ocrExtractSource(key) {
   el("ocr-msg").textContent = "Extracting text ...";
   try {
     const name = srcExtractedName(key);
-    const ex = await (await fetch("/api/pdf/text?pages=400&path=" +
+    const ex = await (await fetch("/api/pdf/text?pages=0&path=" +
       encodeURIComponent(pdf) +
       "&save_build=" + encodeURIComponent(bid) +
       "&save_name=" + encodeURIComponent(name) +
