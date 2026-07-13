@@ -129,17 +129,29 @@ OCR TEXT:
 
     /** OCR text -> {title, ..., extra:{}}. DeepSeek when its key is set, else
      *  Mistral (whose extraction the desktop has verified live). */
-    fun extract(ocrText: String, deepseekKey: String, mistralKey: String): JSONObject {
+    fun extract(ocrText: String, deepseekKey: String, mistralKey: String,
+                customInstructions: String = ""): JSONObject {
         val (url, model, key) =
             if (deepseekKey.isNotEmpty()) Triple(DEEPSEEK_CHAT_URL, DEEPSEEK_EXTRACT_MODEL, deepseekKey)
             else Triple(MISTRAL_CHAT_URL, MISTRAL_EXTRACT_MODEL, mistralKey)
+        val custom = customInstructions.trim().take(4_000)
+        val prompt = buildString {
+            append(EXTRACT_PROMPT.removeSuffix("OCR TEXT:\n"))
+            if (custom.isNotEmpty()) {
+                append("BOOK-SPECIFIC INSTRUCTIONS:\n")
+                append(custom)
+                append("\n\n")
+            }
+            append("OCR TEXT:\n")
+            append(ocrText.take(12_000))
+        }
         val payload = JSONObject()
             .put("model", model)
             .put("temperature", 0)
             .put("response_format", JSONObject().put("type", "json_object"))
             .put("messages", org.json.JSONArray().put(JSONObject()
                 .put("role", "user")
-                .put("content", EXTRACT_PROMPT + ocrText.take(12_000))))
+                .put("content", prompt)))
         val data = post(url, payload, key, 60_000)
         val raw = data.optJSONArray("choices")?.optJSONObject(0)
             ?.optJSONObject("message")?.optString("content") ?: ""

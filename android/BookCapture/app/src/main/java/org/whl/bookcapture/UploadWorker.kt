@@ -88,6 +88,7 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
 
         for (dir in session.pendingUploads()) {
             val entry = Entries.find(ctx, dir.name) ?: continue
+            if (File(dir, Entries.REPROCESS_PENDING).isFile) continue
             // give the pipeline its window, unless nothing will ever process
             val canProcess = Prefs.mistralKey(ctx).isNotEmpty()
             if (canProcess && entry.meta == null && now - entry.createdAt < PROCESS_GRACE_MS)

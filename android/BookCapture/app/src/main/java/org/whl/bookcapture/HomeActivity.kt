@@ -6,8 +6,10 @@ import android.graphics.Typeface
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
+import android.widget.CheckBox
 import android.widget.ImageView
 import android.widget.TextView
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import androidx.work.WorkManager
@@ -31,6 +33,8 @@ class HomeActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityHomeBinding
     private var thumbJob: Job? = null
+    private var selectionMode = false
+    private val selectedIds = linkedSetOf<String>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -43,6 +47,13 @@ class HomeActivity : AppCompatActivity() {
         binding.btnSettings.setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
+        binding.btnSelect.setOnClickListener {
+            selectionMode = true
+            updateSelectionUi()
+            refreshHome()
+        }
+        binding.cancelSelection.setOnClickListener { leaveSelectionMode() }
+        binding.deleteSelected.setOnClickListener { confirmDeleteSelected() }
         // when background OCR / upload lands, the list re-renders itself
         for (name in listOf("capture-process", "capture-upload"))
             WorkManager.getInstance(this)
@@ -77,6 +88,8 @@ class HomeActivity : AppCompatActivity() {
         list.removeAllViews()
         thumbJob?.cancel()
         val entries = Entries.recent(this)
+        selectedIds.retainAll(entries.map { it.id }.toSet())
+        updateSelectionUi()
         if (entries.isEmpty()) {
             val empty = TextView(this)
             empty.typeface = Typeface.MONOSPACE
@@ -99,10 +112,20 @@ class HomeActivity : AppCompatActivity() {
             row.findViewById<TextView>(R.id.state).text = state
             row.findViewById<View>(R.id.marker).setBackgroundColor(getColor(markerColor(state)))
             val thumb = row.findViewById<ImageView>(R.id.thumb)
+            val selected = row.findViewById<CheckBox>(R.id.selected)
+            selected.visibility = if (selectionMode) View.VISIBLE else View.GONE
+            selected.isChecked = e.id in selectedIds
+            selected.setOnClickListener { toggleSelection(e.id) }
             e.photos().firstOrNull()?.let { thumbs.add(thumb to it) }
             row.setOnClickListener {
-                startActivity(Intent(this, EntryDetailActivity::class.java)
-                    .putExtra(EntryDetailActivity.EXTRA_ID, e.id))
+                if (selectionMode) toggleSelection(e.id)
+                else startActivity(Intent(this, EntryDetailActivity::class.java)
+                        .putExtra(EntryDetailActivity.EXTRA_ID, e.id))
+            }
+            row.setOnLongClickListener {
+                if (!selectionMode) selectionMode = true
+                toggleSelection(e.id)
+                true
             }
             list.addView(row)
         }
@@ -116,6 +139,48 @@ class HomeActivity : AppCompatActivity() {
                 iv.setImageBitmap(bmp)
             }
         }
+    }
+
+    private fun toggleSelection(id: String) {
+        if (id in selectedIds) selectedIds.remove(id) else selectedIds.add(id)
+        updateSelectionUi()
+        refreshHome()
+    }
+
+    private fun updateSelectionUi() {
+        binding.selectionBar.visibility = if (selectionMode) View.VISIBLE else View.GONE
+        binding.btnSelect.visibility = if (selectionMode) View.GONE else View.VISIBLE
+        binding.newScan.isEnabled = !selectionMode
+        binding.selectionCount.text = resources.getQuantityString(
+            R.plurals.home_selected_count, selectedIds.size, selectedIds.size)
+        binding.deleteSelected.isEnabled = selectedIds.isNotEmpty()
+        binding.deleteSelected.alpha = if (selectedIds.isNotEmpty()) 1f else .45f
+    }
+
+    private fun leaveSelectionMode() {
+        selectionMode = false
+        selectedIds.clear()
+        updateSelectionUi()
+        refreshHome()
+    }
+
+    private fun confirmDeleteSelected() {
+        if (selectedIds.isEmpty()) return
+        val count = selectedIds.size
+        AlertDialog.Builder(this)
+            .setTitle(R.string.home_delete_title)
+            .setMessage(resources.getQuantityString(
+                R.plurals.home_delete_message, count, count))
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(R.string.home_delete_selected) { _, _ ->
+                Entries.recent(this)
+                    .filter { it.id in selectedIds }
+                    .forEach { Entries.deleteLocal(this, it) }
+                selectionMode = false
+                selectedIds.clear()
+                refreshHome()
+            }
+            .show()
     }
 
     private fun markerColor(state: String): Int = when (state) {

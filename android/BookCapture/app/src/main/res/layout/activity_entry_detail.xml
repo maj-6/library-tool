@@ -55,6 +55,45 @@
             android:orientation="vertical">
             <TextView style="@style/WhlLabel"
                 android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:text="@string/detail_deepseek_instructions" />
+            <EditText
+                android:id="@+id/customInstructions"
+                style="@style/WhlInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="7dp"
+                android:minHeight="84dp"
+                android:gravity="top|start"
+                android:inputType="textCapSentences|textMultiLine"
+                android:importantForAutofill="no"
+                android:maxLength="4000"
+                android:hint="@string/detail_deepseek_hint" />
+            <TextView
+                android:id="@+id/reprocessState"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:fontFamily="monospace"
+                android:textSize="11sp"
+                android:textColor="@color/whl_ink_dim" />
+            <Button
+                android:id="@+id/resubmit"
+                style="@style/WhlButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:layout_gravity="end"
+                android:textSize="12sp"
+                android:paddingStart="14dp"
+                android:paddingEnd="14dp"
+                android:text="@string/detail_resubmit" />
+        </LinearLayout>
+
+        <LinearLayout style="@style/WhlPanelSection"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="vertical">
+            <TextView style="@style/WhlLabel"
+                android:layout_width="wrap_content" android:layout_height="wrap_content"
                 android:text="@string/detail_photos" />
             <HorizontalScrollView
                 android:layout_width="match_parent"
