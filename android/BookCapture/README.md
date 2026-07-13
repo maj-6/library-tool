@@ -27,9 +27,9 @@ into a title, author and year).
 
 1. Open `android/BookCapture` in Android Studio (Hedgehog or newer) and let
    it sync (AGP 8.5 / Kotlin 1.9; Android Studio supplies Gradle).
-2. Optionally export `WHL_SUPABASE_URL` / `WHL_SUPABASE_ANON_KEY` before
-   building to bake the Supabase project in (CI does; the anon key is public
-   by design). Without them, point the app at a project in ⚙.
+2. Fork maintainers export `WHL_SUPABASE_URL` / `WHL_SUPABASE_ANON_KEY` before
+   building to bake their public project configuration in (release CI already
+   does this for official builds). App users never enter a Supabase key.
 3. Run on a device with Android 8.0+ (minSdk 26). Grant camera + microphone.
 4. Sign in with your Library Tool account (see
    `docs/cloud_capture_setup.md`); set the Mistral / DeepSeek API keys once —

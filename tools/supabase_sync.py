@@ -6,10 +6,13 @@ pulls pending rows here, runs the photo pipeline, and marks them imported.
 The checked/manual book catalog is mirrored one-way into the `books` table.
 
 Uses plain PostgREST + storage HTTP calls (urllib, no SDK). All functions take
-a cfg dict {"url": "https://<project>.supabase.co", "key": "<service key>"};
-optional keys "table" (default "captures"), "bucket" (default "captures"),
-"books_table" (default "books"). Errors raise SyncError with a readable
-message — callers report, they don't crash.
+a cfg dict {"url": "https://<project>.supabase.co", "key": "<project key>"}.
+Authenticated-user calls also carry ``access_token``; the project key stays in
+``apikey`` while the user's JWT goes in ``Authorization``, so RLS sees that
+user. Owner-only calls omit ``access_token`` and continue to use the service
+credential as their bearer. Optional keys "table" (default "captures"),
+"bucket" (default "captures"), "books_table" (default "books"). Errors raise
+SyncError with a readable message — callers report, they don't crash.
 """
 from __future__ import annotations
 
@@ -30,7 +33,8 @@ def _cfg(cfg: dict) -> tuple[str, str, dict]:
     key = str(cfg.get("key") or "").strip()
     if not url or not key:
         raise SyncError("Supabase URL / key not configured")
-    headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+    bearer = str(cfg.get("access_token") or "").strip() or key
+    headers = {"apikey": key, "Authorization": f"Bearer {bearer}"}
     return url, key, headers
 
 

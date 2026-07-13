@@ -7,9 +7,9 @@ to trust a plain-text name.
 
 Same conventions as supabase_sync.py: plain urllib, a cfg dict of
 {"url": ..., "key": ...}, readable AuthError messages. The `key` here is the
-project API key GoTrue wants in the `apikey` header -- the anon key is the
-right one, but the service key also works, so callers pass whichever the
-settings hold. The session tokens returned are the USER's, not the project's.
+public project API key GoTrue wants in the `apikey` header. The session tokens
+returned are the USER's, not the project's; privileged service credentials do
+not participate in account or phone-capture flows.
 
 One subtlety worth the comment: Supabase rotates the refresh token on every
 refresh, and reusing an old one outside the grace window revokes the whole

@@ -66,11 +66,37 @@ def test_auth_cfg_never_pairs_the_default_key_with_a_custom_url(settings):
     assert server._auth_cfg() is None
 
 
-def test_auth_cfg_service_key_alone_rides_the_default_url(settings):
-    # the owner's historical setup: only the service key pasted
+def test_auth_cfg_never_uses_the_owner_service_key(settings):
+    # Owner credentials are for privileged publishing/maintenance only.
     settings(supabaseUrl="", supabaseAnonKey="", supabaseKey="service-secret")
     assert server._auth_cfg() == {"url": cloud_defaults.SUPABASE_URL,
-                                  "key": "service-secret"}
+                                  "key": cloud_defaults.SUPABASE_ANON_KEY}
+
+
+def test_capture_cfg_uses_public_key_plus_user_session(settings, monkeypatch):
+    settings(supabaseUrl="", supabaseAnonKey="", supabaseKey="")
+    monkeypatch.setattr(server, "_auth_session",
+                        lambda: {"access_token": "user-jwt", "user_id": "u1"})
+    assert server._capture_cfg() == {
+        "url": cloud_defaults.SUPABASE_URL,
+        "key": cloud_defaults.SUPABASE_ANON_KEY,
+        "access_token": "user-jwt",
+    }
+
+
+def test_capture_cfg_requires_a_signed_in_user(settings, monkeypatch):
+    settings(supabaseUrl="", supabaseAnonKey="", supabaseKey="")
+    monkeypatch.setattr(server, "_auth_session", lambda: None)
+    assert server._capture_cfg() is None
+
+
+def test_capture_rest_headers_separate_public_key_and_user_jwt():
+    import supabase_sync as sbase
+    _, _, headers = sbase._cfg({"url": "https://x.supabase.co",
+                                "key": "public-key",
+                                "access_token": "user-jwt"})
+    assert headers == {"apikey": "public-key",
+                       "Authorization": "Bearer user-jwt"}
 
 
 def test_cloud_cfg_still_requires_the_service_key(settings):
@@ -79,6 +105,24 @@ def test_cloud_cfg_still_requires_the_service_key(settings):
     settings(supabaseKey="service-secret")
     assert server._cloud_cfg() == {"url": cloud_defaults.SUPABASE_URL,
                                    "key": "service-secret"}
+
+
+def test_phone_sync_does_not_run_owner_pipelines(monkeypatch):
+    public = {"url": "https://x.supabase.co", "key": "public-key",
+              "access_token": "user-jwt"}
+    monkeypatch.setattr(server, "_capture_cfg", lambda: public)
+    monkeypatch.setattr(server, "_cloud_cfg", lambda: None)
+    monkeypatch.setattr(server.sbase, "list_pending_captures",
+                        lambda cfg, limit=50: [] if cfg == public else 1 / 0)
+    monkeypatch.setattr(server.sbase, "push_books",
+                        lambda *a, **k: pytest.fail("owner mirror must not run"))
+    monkeypatch.setattr(server.store_sync, "sync_stores",
+                        lambda *a, **k: pytest.fail("owner stores must not run"))
+    out = server._cloud_sync_run()
+    assert out["ok"] is True
+    assert out["owner_sync"] is False
+    assert out["imported"] == 0
+    assert out["stores"] == {}
 
 
 def test_auth_status_reports_cloud_without_any_settings(settings, client):
