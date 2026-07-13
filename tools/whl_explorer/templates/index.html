@@ -883,13 +883,13 @@
         <button id="ocr-submit" class="cad-btn tiny icon-btn" type="button"
                 data-icon="go" data-tip="Submit all staged pages — each runs the engine it was staged with"></button>
         <span class="bar-spacer"></span>
-        <button id="ocr-queue-clear-done" class="cad-btn tiny icon-btn" type="button"
-                data-icon="trash" data-tip="Dismiss finished and lost jobs"></button>
+        <button id="ocr-queue-stop" class="cad-btn tiny icon-btn danger" type="button"
+                data-icon="remove" data-tip="Stop all running OCR jobs after their current pages finish"></button>
         <span class="tool-count" id="ocr-queue-count"></span>
       </div>
       <div class="drafting" id="ocr-queue-wrap">
         <table class="grid" id="ocr-queue-table">
-          <thead><tr><th>Book</th><th>PDF</th><th>Service</th><th>Status</th><th>Submitted</th></tr></thead>
+          <thead><tr><th>Book</th><th>PDF</th><th>Service</th><th>Status</th><th>Submitted</th><th></th></tr></thead>
           <tbody id="ocr-queue-rows"></tbody>
         </table>
         <p id="ocr-queue-empty" class="empty">No OCR jobs</p>

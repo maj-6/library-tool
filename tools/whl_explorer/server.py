@@ -1598,7 +1598,7 @@ def api_build_folder_sync(build_id: str):
     if trim_blank and src is not None:
         running = [j for j in _ocr_jobs.values()
                    if j.get("build_id") == build_id
-                   and j.get("status") == "running"]
+                   and j.get("status") in ("running", "cancelling")]
         is_deriv = False
         try:
             is_deriv = src.resolve().is_relative_to(ENTRIES_DIR.resolve())
@@ -2468,8 +2468,18 @@ def _ocr_job_run(job_id: str) -> None:
     job = _ocr_jobs[job_id]
     cfg = job["cfg"]
     pdf = Path(job["pdf"])
-    for item in job["pages"]:
+    for index, item in enumerate(job["pages"]):
+        # OCR engines are synchronous calls, so cancellation takes effect at
+        # the page boundary. A page already inside Tesseract/API processing is
+        # allowed to finish and be saved; everything after it is skipped.
+        if job.get("cancel_requested"):
+            for pending in job["pages"][index:]:
+                if pending["status"] == "queued":
+                    pending["status"] = "cancelled"
+                    job["cancelled"] += 1
+            break
         n, svc = item["page"], item["service"]
+        item["status"] = "running"
         try:
             png = _ocr_page_png(pdf, n, job["width"])
             runner = _OCR_SERVICES.get(svc)
@@ -2504,7 +2514,17 @@ def _ocr_job_run(job_id: str) -> None:
             log.error("OCR failed: book=%s page=%s service=%s: %s",
                       job["build_id"], n, svc, detail, exc_info=True)
         job["done"] += 1
-    job["status"] = "done" if not job["errors"] else "done (with errors)"
+    if job.get("cancel_requested"):
+        # Covers a request received while the final page was processing.
+        for pending in job["pages"]:
+            if pending["status"] == "queued":
+                pending["status"] = "cancelled"
+                job["cancelled"] += 1
+        job["status"] = "cancelled"
+        log.info("OCR cancelled: book=%s completed=%s skipped=%s",
+                 job["build_id"], job["done"], job["cancelled"])
+    else:
+        job["status"] = "done" if not job["errors"] else "done (with errors)"
 
 
 @app.route("/api/ocr/run", methods=["POST"])
@@ -2542,7 +2562,8 @@ def api_ocr_run():
         "id": job_id, "build_id": build_id, "pdf": str(pdf),
         "target": str(p.get("target") or "compiled.txt"),
         "src_key": src_key or "primary",     # word boxes are stored per source
-        "pages": pages, "done": 0, "errors": 0, "width": width,
+        "pages": pages, "done": 0, "errors": 0, "cancelled": 0,
+        "cancel_requested": False, "width": width,
         "status": "running",
         "cfg": _ocr_request_cfg(p),
     }
@@ -2578,6 +2599,19 @@ def api_ocr_job(job_id: str):
     job = _ocr_jobs.get(job_id)
     if not job:
         abort(404)
+    return jsonify({"ok": True, "job": _ocr_job_state(job)})
+
+
+@app.route("/api/ocr/job/<job_id>/cancel", methods=["POST"])
+def api_ocr_job_cancel(job_id: str):
+    """Request a cooperative stop after the currently processing page."""
+    with _ocr_jobs_lock:
+        job = _ocr_jobs.get(job_id)
+        if not job:
+            abort(404)
+        if job.get("status") in ("running", "cancelling"):
+            job["cancel_requested"] = True
+            job["status"] = "cancelling"
     return jsonify({"ok": True, "job": _ocr_job_state(job)})
 
 
@@ -2650,7 +2684,8 @@ def api_pdf_pages_delete():
     # a running OCR job reads page numbers that deletion would shift under
     # its feet — refuse until it finishes
     running = [j for j in _ocr_jobs.values()
-               if j.get("build_id") == build_id and j.get("status") == "running"]
+               if j.get("build_id") == build_id
+               and j.get("status") in ("running", "cancelling")]
     if running:
         return jsonify({"ok": False,
                         "error": "an OCR job is running for this book — "

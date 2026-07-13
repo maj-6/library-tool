@@ -35,8 +35,8 @@ const VIEWSTATE_KEY = "whl_cad_viewstate_v1";
 const VIEW_STATE_KEYS = new Set([
   "markFilter", "srcFilter", "dlFilter", "yearFrom", "yearTo",
   "topTable", "bottomActive", "whlMode", "checkedMode", "showCatalog",
-  "paneWidth", "uploadSplitH", "colWidths",
-  "authPromptDismissed", "wizardDone", "checkedCols",
+  "paneWidth", "uploadSplitH",
+  "authPromptDismissed", "checkedCols",
 ]);
 // Credentials are never persisted client-side. They live in the server's
 // Host-guarded secrets store (/api/secrets); Mistral additionally syncs through
@@ -1074,6 +1074,7 @@ async function syncClientStateOnLoad() {
       state.checked = merged;
       try { localStorage.setItem(LS_KEY, JSON.stringify(checkedArray())); } catch (e) {}
     }
+    let migratePersistentView = false;
     if (server.settings && typeof server.settings === "object") {
       // adopt the server's PREFERENCES; per-device view state stays whatever this
       // machine holds (the server no longer carries it, but old data might)
@@ -1082,6 +1083,19 @@ async function syncClientStateOnLoad() {
         if (!VIEW_STATE_KEYS.has(k)) incoming[k] = server.settings[k];
       state.settings = Object.assign(state.settings, incoming);
       normalizeSettings();
+      // wizardDone and colWidths used to be browser-origin view state. Existing
+      // settings prove this is not a first launch, even if the old origin-local
+      // wizard flag is unavailable on today's sidecar port. Migrate both values
+      // into the port-independent settings file.
+      if (!("wizardDone" in server.settings) &&
+          (state.settings.wizardDone === true || Object.keys(server.settings).length > 0)) {
+        state.settings.wizardDone = true;
+        migratePersistentView = true;
+      }
+      if (!("colWidths" in server.settings) &&
+          Object.keys(state.settings.colWidths || {}).length > 0) {
+        migratePersistentView = true;
+      }
       syncYearFilterInputs();   // reflect the (local) year-range into the toolbar
       syncSearchConsCheckboxes();
       try {
@@ -1099,6 +1113,7 @@ async function syncClientStateOnLoad() {
     }
     clientStateReady = true;
     if (healChecked) pushClientState("checked");
+    if (migratePersistentView) pushClientState("settings");
     return true;
   }
   // seed the server from local, then allow write-through
@@ -9404,6 +9419,9 @@ let buildPdfViewer = null;   // PDF viewer in the SOURCE tab
 const descState = { id: null, val: null };  // last value set into the editor
 let buildDirty = false;      // the entry form has unsaved metadata edits
 function buildIsDirty() {
+  // The markdown editor exists before any entry is selected; its initial empty
+  // value differs from descState.val=null, but that is not an unsaved draft.
+  if (!currentBuild()) return false;
   return buildDirty ||
     (buildDescMd && descState.id === state.buildSel &&
      buildDescMd.get() !== descState.val);
@@ -11085,9 +11103,34 @@ function renderOcrQueue() {
   el("ocr-queue-count").textContent = `${ocrState.jobs.length} jobs`;
   for (const j of ocrState.jobs) {
     const tr = document.createElement("tr");
+    const stop = j.id && !j.finished
+      ? `<button class="cad-btn tiny danger" type="button" data-ocr-cancel="${esc(j.id)}"` +
+        `${j.cancelling ? " disabled" : ""}>${j.cancelling ? "Stopping…" : "Stop"}</button>`
+      : "";
     tr.innerHTML = `<td>${esc(j.book)}</td><td data-tip="${esc(j.pdf)}">${esc(j.pdf)}</td>
-      <td>${esc(j.service)}</td><td>${esc(j.status)}</td><td>${esc(j.at)}</td>`;
+      <td>${esc(j.service)}</td><td>${esc(j.status)}</td><td>${esc(j.at)}</td><td>${stop}</td>`;
     tbody.appendChild(tr);
+  }
+}
+
+async function cancelOcrJob(jobId) {
+  const j = ocrState.jobs.find((x) => x.id === jobId && !x.finished);
+  if (!j || j.cancelling) return;
+  j.cancelling = true;
+  j.status = "Cancelling — finishing the current page…";
+  renderOcrQueue();
+  try {
+    const res = await fetch(`/api/ocr/job/${encodeURIComponent(jobId)}/cancel`, {
+      method: "POST",
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    status("OCR CANCELLATION REQUESTED");
+  } catch (e) {
+    j.cancelling = false;
+    j.status = `Could not stop — ${e.message || e}`;
+    statusErr(`OCR STOP FAILED :: ${e.message || e}`);
+    renderOcrQueue();
   }
 }
 
@@ -11419,10 +11462,13 @@ function clearOcrStaging() {
   updateOcrStagedMsg();
 }
 
-// drop finished / lost rows so the queue only shows what is still running
-function clearOcrFinishedJobs() {
-  ocrState.jobs = ocrState.jobs.filter((j) => !j.finished);
-  renderOcrQueue();
+async function cancelAllOcrJobs() {
+  const running = ocrState.jobs.filter((j) => j.id && !j.finished && !j.cancelling);
+  if (!running.length) {
+    status("OCR :: NO RUNNING JOBS TO STOP");
+    return;
+  }
+  await Promise.all(running.map((j) => cancelOcrJob(j.id)));
 }
 
 let ocrPollTimer = null;
@@ -11448,16 +11494,37 @@ function pollOcrJobs() {
         const data = await res.json();
         if (!data.ok) continue;
         const job = data.job;
+        if (!(j.mergedPages instanceof Set)) j.mergedPages = new Set();
+        const newlyCompleted = job.pages
+          .filter((x) => x.status === "ok" && !j.mergedPages.has(x.page))
+          .map((x) => x.page);
+        if (newlyCompleted.length && await refreshCompiledDoc(
+            j.buildId, newlyCompleted, j.target, j.src, true)) {
+          for (const page of newlyCompleted) j.mergedPages.add(page);
+        }
+        // Page badges stop showing the spinner as each page completes; they do
+        // not wait for the rest of a large batch either.
+        for (const x of job.pages) {
+          if (x.status !== "queued" && x.status !== "running") {
+            ocrState.pageRunning.delete(`${j.buildId}:${j.src || "primary"}:${x.page}`);
+          }
+        }
         const pageErrors = job.pages.filter((x) =>
           typeof x.status === "string" && x.status.startsWith("error:"));
         const errorDetail = pageErrors.length
           ? pageErrors.map((x) => `page ${x.page} (${OCR_SERVICE_LABELS[x.service] || x.service}): ` +
               x.status.slice("error:".length).trim()).join("; ")
           : "";
+        const active = job.status === "running" || job.status === "cancelling";
+        j.cancelling = job.status === "cancelling";
         j.status = job.status === "running"
           ? `Running — ${job.done}/${job.pages.length}`
-          : job.status + (errorDetail ? ` — ${errorDetail}` : "");
-        if (job.status !== "running") {
+          : job.status === "cancelling"
+            ? `Cancelling — ${job.done}/${job.pages.length} completed; finishing current page…`
+            : job.status === "cancelled"
+              ? `Cancelled — ${job.done} completed, ${job.cancelled || 0} skipped`
+              : job.status + (errorDetail ? ` — ${errorDetail}` : "");
+        if (!active) {
           j.finished = true;
           if (errorDetail) {
             const message = `OCR FAILED :: ${j.book} :: ${errorDetail}`;
@@ -11470,9 +11537,6 @@ function pollOcrJobs() {
           for (const x of job.pages) {
             ocrState.pageRunning.delete(`${j.buildId}:${j.src || "primary"}:${x.page}`);
           }
-          refreshCompiledDoc(j.buildId,
-            job.pages.filter((x) => x.status === "ok").map((x) => x.page),
-            j.target, j.src);
         }
       } catch (e) {
         // repeated garbage responses: give up rather than poll forever
@@ -11488,11 +11552,10 @@ function pollOcrJobs() {
   }, 1500);
 }
 
-// Pull the merged compiled.txt back into the documents list after a job.
-// The job's finished pages come from the SERVER text; every other section
-// keeps the user's local (possibly unsaved) version — a running edit
-// session must not be clobbered by a finishing job.
-async function refreshCompiledDoc(bid, donePages, target, src) {
+// Pull newly finished pages from the server's compiled.txt while a job is
+// still running. Every other section keeps the user's local (possibly
+// unsaved) version, so a running edit session is not clobbered.
+async function refreshCompiledDoc(bid, donePages, target, src, quiet) {
   target = target || "compiled.txt";
   delete ocrState.layoutMeta[bid];   // the job may have added figures / word boxes
   ocrState.wordsCache.clear();       // OCR'd pages now have placeable boxes
@@ -11501,7 +11564,7 @@ async function refreshCompiledDoc(bid, donePages, target, src) {
     const data = await (await fetch(
       `/api/builds/${encodeURIComponent(bid)}/ocr/` +
       encodeURIComponent(target))).json();
-    if (!data.ok) return;
+    if (!data.ok) return false;
     const doc = ocrState.docs.find(
       (d) => d.buildId === bid && (d.fileName || d.name) === target);
     if (!doc) {
@@ -11522,8 +11585,11 @@ async function refreshCompiledDoc(bid, donePages, target, src) {
       }
     }
     renderOcrTab();
-    status(`OCR RESULT MERGED :: ${target}`);
-  } catch (e) { /* folder list already refreshed */ }
+    if (!quiet) status(`OCR RESULT MERGED :: ${target}`);
+    return true;
+  } catch (e) {
+    return false;   // retry these pages on the next poll
+  }
 }
 
 // stage the whole book with the selected service (submit stays manual);
@@ -11961,7 +12027,11 @@ function initOcrTab() {
   el("ocr-queue-add").addEventListener("click", ocrQueueJob);
   el("ocr-queue-clear").addEventListener("click", clearOcrStaging);
   el("ocr-submit").addEventListener("click", ocrSubmitStaged);
-  el("ocr-queue-clear-done").addEventListener("click", clearOcrFinishedJobs);
+  el("ocr-queue-stop").addEventListener("click", cancelAllOcrJobs);
+  el("ocr-queue-rows").addEventListener("click", (ev) => {
+    const btn = ev.target.closest("[data-ocr-cancel]");
+    if (btn) cancelOcrJob(btn.dataset.ocrCancel);
+  });
   el("ocr-del-pages").addEventListener("click", deleteSelectedPages);
   el("ocr-editor").addEventListener("input", () => {
     const d = ocrSelDoc();
