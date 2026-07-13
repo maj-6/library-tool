@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en" data-theme="sage">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Starting Library Tool</title>
+  <style>
+    :root { --bg:#25352d; --panel:#31463a; --ink:#f4edda; --muted:#c6cfbd; --accent:#d6a85f; }
+    :root[data-theme="ledger"] { --bg:#20282c; --panel:#29363b; --ink:#eef2e8; --muted:#bcc8c5; --accent:#d7a95f; }
+    :root[data-theme="foolscap"] { --bg:#40372c; --panel:#514638; --ink:#fff8e7; --muted:#d9cfbb; --accent:#c99048; }
+    :root[data-theme="vellum"] { --bg:#e7dcc2; --panel:#f2e8d2; --ink:#352d24; --muted:#6f6657; --accent:#8c5d2d; }
+    :root[data-theme="linen"] { --bg:#dad3c5; --panel:#eee8dc; --ink:#2f302d; --muted:#666a62; --accent:#65764e; }
+    * { box-sizing:border-box; }
+    html, body { width:100%; height:100%; margin:0; overflow:hidden; }
+    body {
+      display:grid; place-items:center; color:var(--ink); background:var(--bg);
+      font-family:Georgia, "Times New Roman", serif; user-select:none;
+      -webkit-app-region:drag;
+    }
+    main {
+      width:calc(100% - 24px); height:calc(100% - 24px); padding:30px 34px 25px;
+      border:1px solid color-mix(in srgb, var(--accent) 55%, transparent);
+      background:linear-gradient(145deg, var(--panel), var(--bg));
+      box-shadow:0 15px 45px rgba(0,0,0,.28); text-align:center;
+    }
+    .mark { width:68px; height:68px; margin:0 auto 12px; color:var(--accent); }
+    h1 { margin:0; font-size:27px; font-weight:600; letter-spacing:.025em; }
+    .rule { width:72px; height:1px; margin:13px auto 16px; background:var(--accent); opacity:.8; }
+    #status { min-height:20px; color:var(--muted); font:14px system-ui, sans-serif; }
+    .progress { width:190px; height:3px; margin:18px auto 0; overflow:hidden; background:rgba(127,127,127,.22); }
+    .progress::after {
+      content:""; display:block; width:42%; height:100%; background:var(--accent);
+      animation:travel 1.25s ease-in-out infinite;
+    }
+    @keyframes travel { from { transform:translateX(-105%); } to { transform:translateX(345%); } }
+    @media (prefers-reduced-motion:reduce) { .progress::after { animation-duration:2.8s; } }
+  </style>
+</head>
+<body>
+  <main>
+    <svg class="mark" viewBox="0 0 72 72" fill="none" aria-hidden="true">
+      <path d="M36 63V24M36 38C24 37 16 30 13 17c13-1 22 5 23 21ZM36 48c12-1 20-8 23-21-13-1-22 5-23 21Z"
+            stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M29 63h14" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+    </svg>
+    <h1>Library Tool</h1>
+    <div class="rule"></div>
+    <div id="status" role="status" aria-live="polite">Starting Library Tool…</div>
+    <div class="progress" aria-hidden="true"></div>
+  </main>
+  <script>
+    window.whlStartup.onStatus((message) => { document.getElementById("status").textContent = message; });
+    window.whlStartup.onTheme((theme) => { document.documentElement.dataset.theme = theme; });
+  </script>
+</body>
+</html>

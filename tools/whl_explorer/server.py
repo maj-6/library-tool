@@ -2494,8 +2494,15 @@ def _ocr_job_run(job_id: str) -> None:
             _ocr_merge_page(job["build_id"], job["target"], n, text)
             item["status"] = "ok"
         except Exception as exc:
-            item["status"] = f"error: {exc}"
+            detail = f"{type(exc).__name__}: {exc}"
+            item["status"] = f"error: {detail}"
             job["errors"] += 1
+            # Background failures otherwise exist only in the transient job
+            # object. Emit them to the ring consumed by the Info tab, with
+            # enough context to diagnose the executable, dependency, PDF, or
+            # individual bad page without reproducing under a debugger.
+            log.error("OCR failed: book=%s page=%s service=%s: %s",
+                      job["build_id"], n, svc, detail, exc_info=True)
         job["done"] += 1
     job["status"] = "done" if not job["errors"] else "done (with errors)"
 
@@ -2537,14 +2544,29 @@ def api_ocr_run():
         "src_key": src_key or "primary",     # word boxes are stored per source
         "pages": pages, "done": 0, "errors": 0, "width": width,
         "status": "running",
-        "cfg": {k: p.get(k) for k in ("tesseract", "claude_key", "claude_model",
-                                      "aws_key", "aws_secret", "aws_region",
-                                      "mistral_key")},
+        "cfg": _ocr_request_cfg(p),
     }
     with _ocr_jobs_lock:
         _ocr_jobs[job_id] = job
     threading.Thread(target=_ocr_job_run, args=(job_id,), daemon=True).start()
     return jsonify({"ok": True, "job": _ocr_job_state(job)})
+
+
+def _ocr_request_cfg(payload: dict) -> dict:
+    """Build an OCR worker config from the authoritative local secret store."""
+    local = _client_settings()
+    cfg = {k: payload.get(k) for k in (
+        "tesseract", "claude_key", "claude_model", "aws_key", "aws_secret",
+        "aws_region", "mistral_key",
+    )}
+    for request_key, setting_key in (
+        ("mistral_key", "mistralKey"),
+        ("claude_key", "ocrClaudeKey"),
+        ("aws_key", "ocrAwsKey"),
+        ("aws_secret", "ocrAwsSecret"),
+    ):
+        cfg[request_key] = local.get(setting_key) or cfg.get(request_key)
+    return cfg
 
 
 def _ocr_job_state(job: dict) -> dict:

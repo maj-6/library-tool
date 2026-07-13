@@ -55,6 +55,21 @@ function partitionSettings(s) {
   return { prefs, view };
 }
 
+// Hydrate the renderer's ephemeral credential cache. Mistral may arrive from
+// the signed-in user's private cloud profile; partitionSettings keeps every
+// value here out of localStorage and client_state.
+async function hydrateSecrets() {
+  try {
+    const res = await fetch("/api/secrets");
+    if (!res.ok) return {};
+    const secrets = await res.json();
+    for (const k of SECRET_KEYS) state.settings[k] = secrets[k] || "";
+    return secrets;
+  } catch (e) {
+    return {};
+  }
+}
+
 // `categories` left this list with the taxonomy overhaul: assignments are
 // category_ids lists handled by the chip pickers, not looped text inputs.
 const MANUAL_FIELDS = [
@@ -176,6 +191,7 @@ const state = {
     confirmDiscard: true,       // ask before discarding unsaved page edits
     verboseLogging: false,      // raise the server log level to DEBUG
     autoUpdate: true,           // desktop: check for updates on launch
+    includePrereleaseUpdates: false, // desktop: allow alpha/beta/rc auto-updates
   },
   editTarget: null,             // record open in the EDIT tab
   sort: { checked: null, whl: null },  // {key, dir} per top table
@@ -2445,8 +2461,7 @@ function renderSettings() {
       ["set-r2-key", "r2KeyId"], ["set-r2-secret", "r2Secret"],
       ["set-gs-keyfile", "gsKeyFile"],
     ];
-    let secrets = {};
-    try { secrets = await (await fetch("/api/secrets")).json(); } catch (e) { /* keep blanks */ }
+    const secrets = await hydrateSecrets();
     for (const [id, k] of SECRET_FIELDS) {
       const n = el(id);
       if (!n) continue;
@@ -2628,10 +2643,26 @@ function renderSettings() {
   }
   // UPDATES (desktop shell reads these off client_state at launch)
   const au = el("set-auto-update");
+  const pre = el("set-prerelease-update");
+  const syncPrereleaseEnabled = () => {
+    if (pre) pre.disabled = au ? !au.checked : false;
+  };
   if (au) {
     au.checked = state.settings.autoUpdate !== false;
-    au.onchange = () => { state.settings.autoUpdate = au.checked; saveSettings(); };
+    au.onchange = () => {
+      state.settings.autoUpdate = au.checked;
+      syncPrereleaseEnabled();
+      saveSettings();
+    };
   }
+  if (pre) {
+    pre.checked = state.settings.includePrereleaseUpdates === true;
+    pre.onchange = () => {
+      state.settings.includePrereleaseUpdates = pre.checked;
+      saveSettings();
+    };
+  }
+  syncPrereleaseEnabled();
 }
 
 function initSettingsNav() {
@@ -11236,6 +11267,10 @@ async function ocrQueuePages(bid, srcKey, pages) {
     renderOcrQueue();
     return;
   }
+  // Opening Settings is not a prerequisite for cloud-backed credentials.
+  // Refresh on demand before deciding that a selected service is unavailable.
+  if (pages.some((x) => x.service !== "tesseract" && !ocrServiceReady(x.service)))
+    await hydrateSecrets();
   const missing = pages.find((x) => !ocrServiceReady(x.service));
   if (missing) {
     el("ocr-msg").textContent =
@@ -11321,7 +11356,21 @@ function updateOcrStagedMsg() {
 // SUBMIT: processing is prompted manually — the staged mix (possibly
 // several services) goes out as one job PER SOURCE, each against the scan
 // its pages were staged on
+let ocrSubmitting = false;
 async function ocrSubmitStaged() {
+  if (ocrSubmitting) return;              // double-clicks must not duplicate jobs
+  ocrSubmitting = true;
+  const button = el("ocr-submit");
+  if (button) button.disabled = true;
+  try {
+    await ocrSubmitStagedOnce();
+  } finally {
+    ocrSubmitting = false;
+    if (button) button.disabled = false;
+  }
+}
+
+async function ocrSubmitStagedOnce() {
   const bid = ocrState.book;
   if (!bid) { el("ocr-msg").textContent = "Pick a book first"; return; }
   const bySrc = stagedPagesFor(bid);
@@ -11330,6 +11379,7 @@ async function ocrSubmitStaged() {
     return;
   }
   let failed = false;
+  let submitted = false;
   for (const [src, staged] of bySrc) {
     // stub services can't run: one honest queue row PER service
     const stubs = staged.filter((x) => !OCR_RUNNABLE[x.service]);
@@ -11340,6 +11390,7 @@ async function ocrSubmitStaged() {
     for (const x of stubs) ocrState.pageTags.delete(`${bid}:${src}:${x.page}`);
     if (runnable.length) {
       if (await ocrQueuePages(bid, src, runnable)) {
+        submitted = true;
         for (const x of runnable) {
           ocrState.pageTags.delete(`${bid}:${src}:${x.page}`);
         }
@@ -11348,6 +11399,10 @@ async function ocrSubmitStaged() {
       }
     }
   }
+  // Successful pages are already unstaged above. Clear the visual page
+  // selection too, so another digit + submit cannot enqueue the same pages.
+  // Failed pages remain staged for an intentional retry.
+  if (submitted) clearOcrPageSel();
   decorateOcrPages();
   if (!failed) updateOcrStagedMsg();
 }
@@ -11393,11 +11448,24 @@ function pollOcrJobs() {
         const data = await res.json();
         if (!data.ok) continue;
         const job = data.job;
+        const pageErrors = job.pages.filter((x) =>
+          typeof x.status === "string" && x.status.startsWith("error:"));
+        const errorDetail = pageErrors.length
+          ? pageErrors.map((x) => `page ${x.page} (${OCR_SERVICE_LABELS[x.service] || x.service}): ` +
+              x.status.slice("error:".length).trim()).join("; ")
+          : "";
         j.status = job.status === "running"
           ? `Running — ${job.done}/${job.pages.length}`
-          : job.status + (job.errors ? ` (${job.errors} failed)` : "");
+          : job.status + (errorDetail ? ` — ${errorDetail}` : "");
         if (job.status !== "running") {
           j.finished = true;
+          if (errorDetail) {
+            const message = `OCR FAILED :: ${j.book} :: ${errorDetail}`;
+            statusErr(message);
+            // statusErr already tees this into Info; keep the OCR pane useful
+            // without requiring a tab switch as well.
+            el("ocr-msg").textContent = errorDetail;
+          }
           // finished pages (ok or errored) are no longer running
           for (const x of job.pages) {
             ocrState.pageRunning.delete(`${j.buildId}:${j.src || "primary"}:${x.page}`);
@@ -12905,6 +12973,7 @@ function init() {
   // (or seed it from localStorage on first run), THEN boot the views so the
   // first render reflects whatever the server holds.
   syncClientStateOnLoad().then((adopted) => {
+    hydrateSecrets();      // warm credentials without delaying the initial UI
     if (adopted) { applyTheme(); applyFont(); }
     maybeWizard();       // first desktop launch: the guide covers sign-in too
     maybeAuthPrompt();   // needs the adopted settings: authPromptDismissed
