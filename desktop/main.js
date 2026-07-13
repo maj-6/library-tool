@@ -55,6 +55,20 @@ ipcMain.on("win:toggle-maximize", () => {
 });
 ipcMain.on("win:close", () => mainWindow && mainWindow.close());
 
+// Splash renderers signal only after their embedded icon and font have loaded,
+// preventing a visible fallback-font or blank-icon frame.
+ipcMain.on("startup:ready", (event) => {
+  if (startupWin && !startupWin.isDestroyed() && startupWin.webContents === event.sender) {
+    startupWin.show();
+  }
+});
+ipcMain.on("updater:ready", (event) => {
+  if (updaterWin && !updaterWin.isDestroyed() && updaterWin.webContents === event.sender) {
+    updaterWin.show();
+    closeStartupWindow();
+  }
+});
+
 // open a web link in the OS browser (the renderer routes external links here so
 // they don't get trapped in the app). Re-validate the scheme: shell.openExternal
 // will happily launch file:, smb:, mailto: handlers, so only http(s) passes.
@@ -138,7 +152,24 @@ async function startSidecar() {
   await waitForServer(sidecarPort, 45000);
 }
 
-let startupStatus = "Starting Library Tool…";
+let startupStatus = "Preparing";
+let cachedSplashAssets = null;
+
+function readSplashAssets() {
+  if (cachedSplashAssets) return cachedSplashAssets;
+  const asset = (name, devPath, mimeType) => {
+    const packaged = path.join(process.resourcesPath, "startup-assets", name);
+    const assetPath = fs.existsSync(packaged) ? packaged : devPath;
+    return `data:${mimeType};base64,${fs.readFileSync(assetPath).toString("base64")}`;
+  };
+  cachedSplashAssets = {
+    icon: asset("icon.png", path.join(__dirname, "..", "icon.png"), "image/png"),
+    font: asset("roboto-slab-var.woff2", path.join(
+      __dirname, "..", "tools", "whl_explorer", "static", "fonts",
+      "roboto-slab-var.woff2"), "font/woff2"),
+  };
+  return cachedSplashAssets;
+}
 
 function sendStartupStatus(message) {
   startupStatus = message;
@@ -149,10 +180,10 @@ function sendStartupStatus(message) {
 
 function createStartupWindow(theme) {
   startupWin = new BrowserWindow({
-    width: 400, height: 150,
+    width: 420, height: 148,
     resizable: false, movable: true, minimizable: false, maximizable: false,
     center: true, frame: false, roundedCorners: false, show: false, skipTaskbar: false,
-    title: "Starting Library Tool",
+    title: "Library Tool",
     backgroundColor: "#fbf7ee",
     webPreferences: {
       preload: path.join(__dirname, "startup-preload.js"),
@@ -162,11 +193,10 @@ function createStartupWindow(theme) {
   });
   startupWin.webContents.on("did-finish-load", () => {
     if (!startupWin || startupWin.isDestroyed()) return;
+    startupWin.webContents.send("startup:assets", readSplashAssets());
     startupWin.webContents.send("startup:theme", theme);
+    startupWin.webContents.send("startup:version", app.getVersion());
     startupWin.webContents.send("startup:status", startupStatus);
-  });
-  startupWin.once("ready-to-show", () => {
-    if (startupWin && !startupWin.isDestroyed()) startupWin.show();
   });
   // With no frame there is no close button, but Alt+F4 still exists. Keep the
   // splash alive until startup deliberately hands off to another window.
@@ -186,7 +216,7 @@ function closeStartupWindow() {
 }
 
 function createWindow() {
-  sendStartupStatus("Loading your library…");
+  sendStartupStatus("Opening library");
   mainWindow = new BrowserWindow({
     // These are the RESTORED (un-maximized) bounds. The app launches
     // maximized (below), and this is the reasonable window it drops back to
@@ -281,12 +311,11 @@ function setUpdaterStatus(status) {
 
 function createUpdaterWindow(theme) {
   updaterWin = new BrowserWindow({
-    // frameless, so this height IS the content height; the splash box is ~136px
-    // tall, so 140 fits it snugly (no centered blank space above the title)
-    width: 460, height: 140,
-    resizable: false, movable: false, minimizable: false, maximizable: false,
-    center: true, frame: false, show: false, skipTaskbar: false,
+    width: 420, height: 148,
+    resizable: false, movable: true, minimizable: false, maximizable: false,
+    center: true, frame: false, roundedCorners: false, show: false, skipTaskbar: false,
     title: "Updating Library Tool",
+    backgroundColor: "#fbf7ee",
     webPreferences: {
       preload: path.join(__dirname, "updater-preload.js"),
       contextIsolation: true,
@@ -297,13 +326,10 @@ function createUpdaterWindow(theme) {
   // (listeners registered); show once it has painted — avoids a lost IPC and a
   // white flash.
   updaterWin.webContents.on("did-finish-load", () => {
+    sendUpdater("updater:assets", readSplashAssets());
     sendUpdater("updater:theme", theme);
+    sendUpdater("updater:version", app.getVersion());
     if (updaterStatus) sendUpdater("updater:status", updaterStatus);
-  });
-  updaterWin.once("ready-to-show", () => {
-    if (updaterWin) updaterWin.show();
-    // Hand off only after the updater has painted, so there is no blank gap.
-    closeStartupWindow();
   });
   updaterWin.on("closed", () => { updaterWin = null; });
   updaterWin.loadFile(path.join(__dirname, "updater.html"));
@@ -407,7 +433,7 @@ function runUpdateGate() {
 app.whenReady().then(async () => {
   if (!gotSingleInstanceLock) return;   // a second instance — it is already quitting
   createStartupWindow(readActiveTheme());
-  sendStartupStatus(isDev ? "Preparing local services…" : "Checking for updates…");
+  sendStartupStatus(isDev ? "Preparing local services" : "Checking for updates");
   // Update first: if one is installing, we quit into NSIS and never launch here.
   let outcome = "launch";
   try {
@@ -418,7 +444,7 @@ app.whenReady().then(async () => {
   if (outcome === "installing") return;
 
   try {
-    sendStartupStatus("Starting the local library service…");
+    sendStartupStatus("Loading library service");
     await startSidecar();
   } catch (e) {
     closeStartupWindow();
