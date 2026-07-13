@@ -45,7 +45,9 @@ def _first(v):
 
 def _cprs_query(title: str, author: str = "") -> str:
     """Build a CPRS phrase query so common title words do not swamp results."""
-    phrase = lambda value: '"' + str(value).replace('"', " ").strip() + '"'
+    def phrase(value):
+        return '"' + str(value).replace('"', " ").strip() + '"'
+
     parts = [phrase(title)]
     if str(author or "").strip():
         parts.append(phrase(author))
