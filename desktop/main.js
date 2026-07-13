@@ -149,11 +149,11 @@ function sendStartupStatus(message) {
 
 function createStartupWindow(theme) {
   startupWin = new BrowserWindow({
-    width: 500, height: 260,
+    width: 400, height: 150,
     resizable: false, movable: true, minimizable: false, maximizable: false,
     center: true, frame: false, show: false, skipTaskbar: false,
     title: "Starting Library Tool",
-    backgroundColor: "#25352d",
+    backgroundColor: "#fbf7ee",
     webPreferences: {
       preload: path.join(__dirname, "startup-preload.js"),
       contextIsolation: true,

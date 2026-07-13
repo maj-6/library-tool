@@ -42,6 +42,14 @@
         "from": "dist-sidecar/whl-explorer-sidecar",
         "to": "sidecar",
         "filter": ["**/*"]
+      },
+      {
+        "from": "../icon.png",
+        "to": "startup-assets/icon.png"
+      },
+      {
+        "from": "../tools/whl_explorer/static/fonts/roboto-slab-var.woff2",
+        "to": "startup-assets/roboto-slab-var.woff2"
       }
     ],
     "win": {
