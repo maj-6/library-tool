@@ -20,6 +20,8 @@ const fs = require("fs");
 
 let sidecar = null;
 let mainWindow = null;
+let startupWin = null;        // immediate launch feedback while the sidecar/UI load
+let startupClosing = false;
 let updaterWin = null;        // frameless update splash, shown only while updating
 let sidecarPort = null;
 let mainReady = false;        // gates window-all-closed: don't quit mid-startup
@@ -37,9 +39,10 @@ if (!gotSingleInstanceLock) {
   app.quit();
 } else {
   app.on("second-instance", () => {
-    if (!mainWindow) return;
-    if (mainWindow.isMinimized()) mainWindow.restore();
-    mainWindow.focus();
+    const win = mainWindow || startupWin || updaterWin;
+    if (!win) return;
+    if (win.isMinimized()) win.restore();
+    win.focus();
   });
 }
 
@@ -135,7 +138,55 @@ async function startSidecar() {
   await waitForServer(sidecarPort, 45000);
 }
 
+let startupStatus = "Starting Library Tool…";
+
+function sendStartupStatus(message) {
+  startupStatus = message;
+  if (startupWin && !startupWin.isDestroyed()) {
+    startupWin.webContents.send("startup:status", message);
+  }
+}
+
+function createStartupWindow(theme) {
+  startupWin = new BrowserWindow({
+    width: 500, height: 260,
+    resizable: false, movable: true, minimizable: false, maximizable: false,
+    center: true, frame: false, show: false, skipTaskbar: false,
+    title: "Starting Library Tool",
+    backgroundColor: "#25352d",
+    webPreferences: {
+      preload: path.join(__dirname, "startup-preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  startupWin.webContents.on("did-finish-load", () => {
+    if (!startupWin || startupWin.isDestroyed()) return;
+    startupWin.webContents.send("startup:theme", theme);
+    startupWin.webContents.send("startup:status", startupStatus);
+  });
+  startupWin.once("ready-to-show", () => {
+    if (startupWin && !startupWin.isDestroyed()) startupWin.show();
+  });
+  // With no frame there is no close button, but Alt+F4 still exists. Keep the
+  // splash alive until startup deliberately hands off to another window.
+  startupWin.on("close", (event) => {
+    if (!startupClosing && !app.isQuitting) event.preventDefault();
+  });
+  startupWin.on("closed", () => { startupWin = null; startupClosing = false; });
+  startupWin.loadFile(path.join(__dirname, "startup.html"));
+}
+
+function closeStartupWindow() {
+  if (startupWin && !startupWin.isDestroyed()) {
+    startupClosing = true;
+    startupWin.close();
+  }
+  startupWin = null;
+}
+
 function createWindow() {
+  sendStartupStatus("Loading your library…");
   mainWindow = new BrowserWindow({
     // These are the RESTORED (un-maximized) bounds. The app launches
     // maximized (below), and this is the reasonable window it drops back to
@@ -169,6 +220,7 @@ function createWindow() {
     if (!mainWindow) return;
     mainWindow.maximize();
     mainWindow.show();
+    closeStartupWindow();
   });
   // open target=_blank / external links in the system browser, not a new window
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -201,9 +253,12 @@ function readUpdatePrefs() {
   try {
     const p = path.join(app.getPath("userData"), "output", "client_state.json");
     const s = JSON.parse(fs.readFileSync(p, "utf8"))?.settings || {};
-    return { auto: s.autoUpdate !== false };
+    return {
+      auto: s.autoUpdate !== false,
+      prerelease: s.includePrereleaseUpdates === true,
+    };
   } catch (e) {
-    return { auto: true };
+    return { auto: true, prerelease: false };
   }
 }
 
@@ -245,7 +300,11 @@ function createUpdaterWindow(theme) {
     sendUpdater("updater:theme", theme);
     if (updaterStatus) sendUpdater("updater:status", updaterStatus);
   });
-  updaterWin.once("ready-to-show", () => { if (updaterWin) updaterWin.show(); });
+  updaterWin.once("ready-to-show", () => {
+    if (updaterWin) updaterWin.show();
+    // Hand off only after the updater has painted, so there is no blank gap.
+    closeStartupWindow();
+  });
   updaterWin.on("closed", () => { updaterWin = null; });
   updaterWin.loadFile(path.join(__dirname, "updater.html"));
 }
@@ -294,6 +353,9 @@ function runUpdateGate() {
     };
 
     const theme = readActiveTheme();
+    // Set this explicitly: electron-updater otherwise enables prereleases by
+    // default when the installed app version itself has a prerelease suffix.
+    updater.allowPrerelease = prefs.prerelease;
     updater.autoDownload = false;                 // probe first, then decide
     updater.autoInstallOnAppQuit = true;          // if we fall through mid-download, install on next quit
 
@@ -341,6 +403,8 @@ function runUpdateGate() {
 
 app.whenReady().then(async () => {
   if (!gotSingleInstanceLock) return;   // a second instance — it is already quitting
+  createStartupWindow(readActiveTheme());
+  sendStartupStatus(isDev ? "Preparing local services…" : "Checking for updates…");
   // Update first: if one is installing, we quit into NSIS and never launch here.
   let outcome = "launch";
   try {
@@ -351,8 +415,10 @@ app.whenReady().then(async () => {
   if (outcome === "installing") return;
 
   try {
+    sendStartupStatus("Starting the local library service…");
     await startSidecar();
   } catch (e) {
+    closeStartupWindow();
     dialog.showErrorBox("Library Tool", "The local backend failed to start.\n" + e.message);
     app.quit();
     return;

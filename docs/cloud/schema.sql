@@ -370,10 +370,22 @@ create policy events_insert_authed on events
 -- pending object is accepted; revisit with a path convention if that changes.
 
 drop policy if exists captures_objects_insert_authed on storage.objects;
+drop policy if exists captures_objects_select_upload_authed on storage.objects;
 drop policy if exists captures_objects_update_authed on storage.objects;
 create policy captures_objects_insert_authed on storage.objects
   for insert to authenticated with check (bucket_id = 'captures');
--- x-upsert (a retried upload) is an UPDATE under the hood
+-- Storage returns object metadata after an upload, and x-upsert also reads the
+-- existing row before updating it. Limit SELECT to those two Storage API
+-- operations so signed-in phones still cannot list or download captures.
+create policy captures_objects_select_upload_authed on storage.objects
+  for select to authenticated using (
+    bucket_id = 'captures'
+    and storage.allow_any_operation(array[
+      'storage.object.upload',
+      'storage.object.upload_update'
+    ])
+  );
+-- x-upsert (a retried upload) is an UPDATE under the hood.
 create policy captures_objects_update_authed on storage.objects
   for update to authenticated
   using (bucket_id = 'captures') with check (bucket_id = 'captures');

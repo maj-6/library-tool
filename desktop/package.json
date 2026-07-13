@@ -31,6 +31,8 @@
     "files": [
       "main.js",
       "preload.js",
+      "startup.html",
+      "startup-preload.js",
       "updater.html",
       "updater-preload.js",
       "package.json"
