@@ -5,35 +5,43 @@
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'none'; img-src data:; font-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Starting Library Tool</title>
+  <title>Library Tool</title>
   <style>
-    :root { --surface:#fbf7ee; --ink:#2b2720; --muted:#6a6152; --rule:#9c9280; --accent:#35635a; }
+    :root {
+      --surface:#fbf7ee; --ink:#2b2720; --muted:#6a6152;
+      --rule:#9c9280; --accent:#35635a; --border:#292620;
+    }
     :root[data-theme="ledger"] { --surface:#fbfaf7; --ink:#26241f; --muted:#5f5d56; --rule:#8f8d84; --accent:#3d443e; }
     :root[data-theme="foolscap"] { --surface:#f4f1eb; --ink:#221c14; --muted:#665e52; --rule:#a49d8e; --accent:#2f3a4a; }
     :root[data-theme="vellum"] { --surface:#f7f4ec; --ink:#2a2620; --muted:#6a6252; --rule:#a49a86; --accent:#3a556e; }
     :root[data-theme="linen"] { --surface:#f1efe8; --ink:#2c2a24; --muted:#5f5a4f; --rule:#948e7e; --accent:#3c5570; }
-    * { box-sizing:border-box; }
-    html, body { width:100%; height:100%; margin:0; overflow:hidden; border-radius:0; }
+    * { box-sizing:border-box; border-radius:0; }
+    html, body { width:100%; height:100%; margin:0; overflow:hidden; }
     body {
       color:var(--ink); background:var(--surface);
       font-family:"Roboto Slab", Georgia, serif; user-select:none;
       -webkit-app-region:drag;
     }
     main {
-      width:100%; height:100%; padding:20px 22px;
-      display:grid; grid-template-columns:72px 1fr; column-gap:18px; align-items:center;
-      border:1px solid #292620; border-radius:0; background:var(--surface);
+      width:100%; height:100%; padding:17px 19px;
+      display:grid; grid-template-columns:64px 1fr; column-gap:17px; align-items:center;
+      border:1px solid var(--border); background:var(--surface);
     }
-    .icon { width:72px; height:72px; object-fit:contain; }
+    .icon { width:64px; height:64px; object-fit:contain; }
     .copy { min-width:0; }
-    h1 { margin:0 0 9px; font-size:22px; font-weight:650; letter-spacing:.01em; }
-    #status { min-height:19px; color:var(--muted); font-size:13px; }
-    .progress { width:100%; height:2px; margin-top:15px; overflow:hidden; background:color-mix(in srgb, var(--rule) 24%, transparent); }
-    .progress::after {
-      content:""; display:block; width:42%; height:100%; background:var(--accent);
-      animation:travel 1.25s ease-in-out infinite;
+    .heading { display:flex; align-items:baseline; gap:8px; min-width:0; }
+    h1 { margin:0; font-size:20px; font-weight:650; letter-spacing:.01em; white-space:nowrap; }
+    .version { color:var(--muted); font-size:11px; white-space:nowrap; }
+    .progress {
+      width:100%; height:8px; margin-top:13px; overflow:hidden;
+      border:1px solid var(--border); background:color-mix(in srgb, var(--rule) 22%, var(--surface));
     }
-    @keyframes travel { from { transform:translateX(-105%); } to { transform:translateX(345%); } }
+    .progress::after {
+      content:""; display:block; width:38%; height:100%; background:var(--accent);
+      animation:travel 1.2s ease-in-out infinite;
+    }
+    .stage { min-height:16px; margin-top:7px; color:var(--muted); font-size:11px; line-height:16px; }
+    @keyframes travel { from { transform:translateX(-105%); } to { transform:translateX(370%); } }
     @media (prefers-reduced-motion:reduce) { .progress::after { animation-duration:2.8s; } }
   </style>
 </head>
@@ -41,21 +49,39 @@
   <main>
     <img id="program-icon" class="icon" alt="" />
     <div class="copy">
-      <h1>Library Tool</h1>
-      <div id="status" role="status" aria-live="polite">Starting Library Tool…</div>
+      <div class="heading">
+        <h1>Library Tool</h1>
+        <span id="version" class="version"></span>
+      </div>
       <div class="progress" aria-hidden="true"></div>
+      <div id="stage" class="stage" role="status" aria-live="polite">Preparing</div>
     </div>
   </main>
   <script>
-    document.getElementById("program-icon").src = window.whlStartup.assets.icon;
-    const font = new FontFace(
-      "Roboto Slab",
-      `url("${window.whlStartup.assets.font}") format("woff2")`,
-      { weight: "100 900", style: "normal" },
-    );
-    font.load().then((loaded) => document.fonts.add(loaded)).catch(() => {});
-    window.whlStartup.onStatus((message) => { document.getElementById("status").textContent = message; });
-    window.whlStartup.onTheme((theme) => { document.documentElement.dataset.theme = theme; });
+    const api = window.whlStartup;
+    const icon = document.getElementById("program-icon");
+    let readySent = false;
+
+    api.onAssets((assets) => {
+      if (readySent || !assets) return;
+      readySent = true;
+      icon.src = assets.icon;
+      const font = new FontFace(
+        "Roboto Slab",
+        `url("${assets.font}") format("woff2")`,
+        { weight: "100 900", style: "normal" },
+      );
+      const fontReady = font.load().then((loaded) => document.fonts.add(loaded));
+      const iconReady = icon.decode ? icon.decode() : Promise.resolve();
+      Promise.race([
+        Promise.allSettled([fontReady, iconReady]),
+        new Promise((resolve) => setTimeout(resolve, 1200)),
+      ]).then(() => api.ready());
+    });
+
+    api.onStatus((message) => { document.getElementById("stage").textContent = message; });
+    api.onTheme((theme) => { document.documentElement.dataset.theme = theme; });
+    api.onVersion((version) => { document.getElementById("version").textContent = `v${version}`; });
   </script>
 </body>
 </html>

@@ -4,11 +4,14 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("whlUpdater", {
+  onAssets: (cb) => ipcRenderer.on("updater:assets", (_e, assets) => cb(assets)),
   // main pushes the persisted theme name once, up front, so the splash can
   // paint itself in the same palette the app will open with.
   onTheme: (cb) => ipcRenderer.on("updater:theme", (_e, name) => cb(name)),
+  onVersion: (cb) => ipcRenderer.on("updater:version", (_e, version) => cb(version)),
   // { phase: "download" | "install", version } — coarse state for the label.
   onStatus: (cb) => ipcRenderer.on("updater:status", (_e, s) => cb(s)),
   // electron-updater ProgressInfo: { percent, transferred, total, bytesPerSecond }.
   onProgress: (cb) => ipcRenderer.on("updater:progress", (_e, p) => cb(p)),
+  ready: () => ipcRenderer.send("updater:ready"),
 });
