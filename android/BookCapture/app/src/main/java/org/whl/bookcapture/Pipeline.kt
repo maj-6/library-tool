@@ -108,10 +108,13 @@ object Pipeline {
     private const val EXTRACT_PROMPT = """You are cataloguing old books. Below is OCR text from photos of a book's title page and/or copyright page. Extract the bibliographic data as strict JSON.
 
 Return a single JSON object with exactly these keys (string values; "" when absent):
-  "title"      - the main title, in its original capitalization, without the subtitle
-  "subtitle"   - the subtitle if present (text after the title, often following a colon)
-  "author"     - primary author(s) as printed, "First Last" form, "; " between multiple
-  "volume"     - volume number as a plain number string if this is one volume of a set
+  "title"      - the main title without the subtitle; render it in regular title case,
+                 normalizing all-caps or erratic OCR capitalization
+  "subtitle"   - the subtitle if present; render it in regular title case
+  "author"     - primary author name(s) only, in "First Last" form, with "; " between
+                 multiple; omit honorifics and titles such as Dr., Prof., Rev., or Sir
+  "volume"     - volume number as an Arabic numeral string if this is one volume of a set;
+                 convert Roman numerals and spelled-out numbers
   "edition"    - edition statement as a short ordinal ("2nd", "3rd, revised") if stated
   "publisher"  - the publishing house
   "year"       - the publication year as a 4-digit Arabic number (convert Roman numerals)

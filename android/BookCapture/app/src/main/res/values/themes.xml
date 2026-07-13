@@ -1,30 +1,32 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- The desktop Library Tool's Linen theme, translated to Android: a warm paper
+<!-- The desktop Library Tool's Sage theme, translated to Android: a warm paper
      canvas, light panel faces, flat 1px chrome, monospace data on sans chrome,
-     desaturated accents. The palette mirrors body[data-theme="linen"] in
-     tools/whl_explorer/static/style.css — keep it in step when Linen changes.
+     desaturated accents. Keep this palette in step with the desktop Sage theme.
      Layering: canvas is the base; panels sit slightly darker+bordered
      (recessed), inputs/buttons slightly brighter+bordered (raised). -->
 <resources>
-    <color name="whl_canvas">#F1EFE8</color>
-    <color name="whl_canvas_line">#E2DFD5</color>
-    <color name="whl_face">#E0DCD2</color>
-    <color name="whl_face_hi">#FAF8F2</color>
-    <color name="whl_face_sh">#C3BEB1</color>
-    <color name="whl_face_sh2">#B8B2A3</color>
-    <color name="whl_ink">#2C2A24</color>
-    <color name="whl_ink_light">#302E28</color>
-    <color name="whl_ink_dim">#948E7E</color>
-    <color name="whl_cyan">#356A60</color>
-    <color name="whl_green">#3A6D38</color>
-    <color name="whl_amber">#806A34</color>
-    <color name="whl_red">#9A3A2A</color>
-    <color name="whl_blue">#3C5570</color>
-    <color name="ic_launcher_bg">#F2F1EA</color>
+    <color name="whl_canvas">#FBF7EE</color>
+    <color name="whl_canvas_line">#ECE4D5</color>
+    <color name="whl_face">#E7E2D6</color>
+    <color name="whl_face_hi">#FBF9F2</color>
+    <color name="whl_face_sh">#CEC6B4</color>
+    <color name="whl_face_sh2">#9C9280</color>
+    <color name="whl_ink">#2B2720</color>
+    <color name="whl_ink_light">#2B2720</color>
+    <color name="whl_ink_dim">#6A6152</color>
+    <color name="whl_cyan">#35635A</color>
+    <color name="whl_green">#4A743A</color>
+    <color name="whl_amber">#97681A</color>
+    <color name="whl_red">#A5402C</color>
+    <color name="whl_blue">#55503F</color>
+    <color name="whl_blue2">#6F6853</color>
+    <color name="whl_row_checked">#DDE7D5</color>
+    <color name="whl_button_text">#FBF9F2</color>
+    <color name="ic_launcher_bg">#FBF7EE</color>
 
-    <!-- Light theme now (Linen is a paper palette): default widget text goes
+    <!-- Sage is a light paper palette: default widget text goes
          dark, and the status/nav bars carry dark icons over the light canvas. -->
-    <style name="Theme.BookCapture" parent="Theme.Material3.Light.NoActionBar">
+    <style name="Theme.BookCapture.Base" parent="Theme.Material3.Light.NoActionBar">
         <item name="colorPrimary">@color/whl_cyan</item>
         <!-- Roboto Slab is the interface font; the mono data cells override it -->
         <item name="android:fontFamily">@font/roboto_slab</item>
@@ -35,8 +37,9 @@
         <item name="android:navigationBarColor">@color/whl_canvas</item>
         <item name="android:windowBackground">@color/whl_canvas</item>
         <item name="android:windowLightStatusBar">true</item>
-        <item name="android:windowLightNavigationBar">true</item>
     </style>
+
+    <style name="Theme.BookCapture" parent="Theme.BookCapture.Base" />
 
     <!-- flat glyph button: face plate, 1px strong border, ink glyph. The face
          plate press-state comes from the selector; a foreground ripple adds the
@@ -44,7 +47,7 @@
     <style name="WhlButton" parent="Widget.AppCompat.Button.Borderless">
         <item name="android:background">@drawable/whl_button</item>
         <item name="android:foreground">?attr/selectableItemBackground</item>
-        <item name="android:textColor">@color/whl_ink</item>
+        <item name="android:textColor">@color/whl_button_text</item>
         <item name="android:fontFamily">monospace</item>
         <item name="android:textSize">20sp</item>
         <item name="android:minHeight">52dp</item>

@@ -4,22 +4,25 @@
     <string name="app_wordmark">LIBRARY TOOL</string>
     <string name="settings_title">Capture settings</string>
 
-    <string name="home_title">Book Capture</string>
-    <string name="home_subtitle">recent scans</string>
-    <string name="home_new_scan">＋  New scan</string>
-    <string name="home_empty">No scans yet.\nTap “New scan” to photograph a book.</string>
+    <string name="home_title">Recent Scans</string>
+    <string name="home_new_scan">New Capture</string>
+    <string name="home_empty">No captures yet.\nTap “New Capture” to photograph a book.</string>
     <string name="home_select">SELECT</string>
-    <string name="home_select_scan">Select scan</string>
+    <string name="home_select_scan">Select capture</string>
     <plurals name="home_selected_count">
         <item quantity="one">%1$d selected</item>
         <item quantity="other">%1$d selected</item>
     </plurals>
     <string name="home_delete_selected">DELETE</string>
     <string name="home_cancel_select">CANCEL</string>
-    <string name="home_delete_title">Delete selected scans?</string>
+    <string name="home_delete_title">Delete selected captures?</string>
     <plurals name="home_delete_message">
-        <item quantity="one">Deletes %1$d local phone scan. Uploaded and imported cloud copies are not deleted.</item>
-        <item quantity="other">Deletes %1$d local phone scans. Uploaded and imported cloud copies are not deleted.</item>
+        <item quantity="one">Deletes %1$d local phone capture. Uploaded and imported cloud copies are not deleted.</item>
+        <item quantity="other">Deletes %1$d local phone captures. Uploaded and imported cloud copies are not deleted.</item>
+    </plurals>
+    <plurals name="capture_count">
+        <item quantity="one">%1$d capture</item>
+        <item quantity="other">%1$d captures</item>
     </plurals>
 
     <string name="entry_idle">IDLE</string>
@@ -34,12 +37,10 @@
     <string name="model_download_failed">Voice model download failed: %1$s (buttons still work)</string>
 
     <!-- glyph controls; the words live in the content descriptions -->
-    <string name="glyph_start">▶</string>
-    <string name="glyph_photo">●</string>
     <string name="glyph_done">✓</string>
     <string name="glyph_cancel">✕</string>
-    <string name="cmd_start">Start entry</string>
-    <string name="cmd_photo">Photograph page</string>
+    <string name="cmd_start">New capture</string>
+    <string name="cmd_photo">Take capture</string>
     <string name="cmd_done">Seal entry</string>
     <string name="cmd_cancel">Discard entry</string>
     <string name="gear">⚙</string>
@@ -84,7 +85,7 @@
     <string name="connection_ok">OK — signed in, captures reachable</string>
     <string name="saved">Saved</string>
 
-    <string name="detail_photos">Pages</string>
+    <string name="detail_photos">Captures</string>
     <string name="detail_ocr">OCR text</string>
     <string name="detail_discard">DISCARD ENTRY</string>
     <string name="detail_no_ocr">(no OCR text yet)</string>

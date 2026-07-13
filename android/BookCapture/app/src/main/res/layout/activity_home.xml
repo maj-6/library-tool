@@ -22,30 +22,23 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent">
 
-        <LinearLayout
+        <ImageView
+            android:layout_width="36dp"
+            android:layout_height="36dp"
+            android:layout_marginEnd="10dp"
+            android:contentDescription="@string/app_name"
+            android:scaleType="fitCenter"
+            android:src="@drawable/ic_launcher_fg" />
+
+        <TextView
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:orientation="vertical">
-
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:fontFamily="monospace"
-                android:textSize="16sp"
-                android:textStyle="bold"
-                android:textColor="@color/whl_ink"
-                android:text="@string/home_title" />
-
-            <TextView
-                android:id="@+id/homeSub"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:fontFamily="monospace"
-                android:textSize="11sp"
-                android:textColor="@color/whl_ink_dim"
-                android:text="@string/home_subtitle" />
-        </LinearLayout>
+            android:fontFamily="@font/roboto_slab"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:textColor="@color/whl_ink"
+            android:text="@string/home_title" />
 
         <TextView
             android:id="@+id/btnSelect"
@@ -155,6 +148,9 @@
         android:layout_width="0dp"
         android:layout_height="wrap_content"
         android:layout_margin="12dp"
+        android:drawableStart="@drawable/ic_camera_new"
+        android:drawablePadding="8dp"
+        android:gravity="center"
         android:textSize="15sp"
         android:text="@string/home_new_scan"
         app:layout_constraintBottom_toBottomOf="parent"

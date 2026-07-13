@@ -48,7 +48,7 @@ object Entries {
 
         fun ocrText(): String = photos().mapIndexedNotNull { i, p ->
             val t = File(dir, p.name + ".txt").takeIf { it.isFile }?.readText()?.trim()
-            if (t.isNullOrEmpty()) null else "--- Photo ${i + 1} ---\n$t"
+            if (t.isNullOrEmpty()) null else "--- Capture ${i + 1} ---\n$t"
         }.joinToString("\n\n")
 
         fun customInstructions(): String =

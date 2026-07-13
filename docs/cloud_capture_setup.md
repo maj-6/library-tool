@@ -45,9 +45,11 @@ python3 tools/cloud_setup.py check
 
 - **Desktop**: sign in to a Library Tool account, then choose the auto-sync
   interval under Settings → Sync → *Phone capture*. No Supabase key is needed.
-- **Phone**: sign in to the same account and select Cloud transport. No
-  Supabase key is needed. **Test connection** verifies that the signed-in
-  capture path is reachable.
+- **Phone**: sign in and select Cloud transport. The same account works by
+  default; a project maintainer can also link a separate contributor account
+  to the curator's desktop in `capture_ingest_grants`. No Supabase key is
+  needed. **Test connection** verifies that the signed-in capture path is
+  reachable.
 
 The public project URL/key are compiled into official builds. A fork points
 both apps at its own project as part of its build/configuration; that remains
@@ -65,10 +67,10 @@ the project-specific confirmation email — both in **[docs/cloud/auth_setup.md]
 
 ## Notes
 
-- Keep RLS enabled. `schema.sql` lets an authenticated account insert, select,
-  and update only its own capture rows. Storage download/delete is likewise
-  limited to object paths referenced by that account's capture rows; upload
-  remains available to signed-in phones.
+- Keep RLS enabled. `schema.sql` lets an authenticated account insert its own
+  captures, and lets a desktop process only its own or explicitly assigned
+  contributors' captures. Storage follows the same rule; upload remains
+  available to signed-in phones.
 - A service credential is still appropriate for explicitly privileged owner
   tasks such as publishing public volumes and maintaining project-wide working
   stores. It is optional and is not part of phone sync.

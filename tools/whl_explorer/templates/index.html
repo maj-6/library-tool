@@ -535,7 +535,8 @@
             <table class="grid" id="checked-table">
               <thead>
                 <tr>
-                  <th data-col="src">Src</th>
+                  <th class="col-src" data-col="src"
+                      data-tip="Camera: phone capture · pen/paper: manual · list/file: master · * edited">Src</th>
                   <th data-col="title">Title</th>
                   <th data-col="subtitle">Subtitle</th>
                   <th data-col="author">Author</th>
@@ -902,13 +903,12 @@
       <div id="an-split">
         <aside id="an-books">
           <div class="pane-bar"><span class="tool-label"
-                data-tip="Every entry is listed; only verified entries can be analysed (mark them verified in the Editor first)">Entries</span>
+                data-tip="Only verified, available entries are listed (mark drafts verified in the Editor first)">Entries</span>
             <span class="tool-count" id="an-count"></span></div>
           <div class="drafting" id="an-list-wrap"><ul id="an-list"></ul></div>
         </aside>
         <div id="an-main">
-          <div id="an-empty" class="empty">Select a verified entry.
-            Drafts must be marked verified in the Editor first.</div>
+          <div id="an-empty" class="empty">Select an available verified entry.</div>
           <div id="an-work" hidden>
             <div id="an-head">
               <span id="an-title"></span>
@@ -1299,7 +1299,7 @@
             <div class="settings-rows">
               <label class="tool-label" for="set-cr-cprs">Look up registrations on publicrecords.copyright.gov</label>
               <input id="set-cr-cprs" type="checkbox"
-                     data-tip="Left half of the copyright tag: query the U.S. Copyright Office public records (CPRS) for an original registration" />
+                     data-tip="Left half of the copyright tag: query U.S. Copyright Office CPRS registrations, including post-1978 records" />
               <label class="tool-label" for="set-cr-nypl">Also use the NYPL registrations dataset</label>
               <input id="set-cr-nypl" type="checkbox"
                      data-tip="Additionally match against the NYPL Catalog of Copyright Entries registrations (1923-1964), when the dataset is present" />
@@ -1468,9 +1468,10 @@
 
             <div class="settings-head" style="margin-top:16px">Phone capture (Supabase)</div>
             <p class="settings-note">Phone photos land here; syncing runs the pipeline and files
-              each capture as a manual entry. Sign in to the same Library Tool account on the
-              phone and desktop; the built-in public cloud configuration handles the rest, with
-              no Supabase key to enter. The Mistral key it needs lives under <b>OCR</b>.</p>
+              each capture as a manual entry. Sign in on the phone and desktop; the same account
+              works automatically, and linked contributor accounts are also supported. The
+              built-in public cloud configuration handles the rest, with no Supabase key to
+              enter. The Mistral key it needs lives under <b>OCR</b>.</p>
             <div class="settings-rows">
               <label class="tool-label" for="set-sb-url">Supabase project URL</label>
               <input id="set-sb-url" class="cad-input" spellcheck="false"

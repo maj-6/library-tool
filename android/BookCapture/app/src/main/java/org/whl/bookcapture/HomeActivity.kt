@@ -106,7 +106,11 @@ class HomeActivity : AppCompatActivity() {
             val row = inflater.inflate(R.layout.item_home, list, false)
             row.findViewById<TextView>(R.id.title).text = Entries.titleLabel(this, e)
             row.findViewById<TextView>(R.id.sub).text =
-                listOf(e.author, e.year, "${e.photoCount} page(s)")
+                listOf(
+                    e.author,
+                    e.year,
+                    resources.getQuantityString(
+                        R.plurals.capture_count, e.photoCount, e.photoCount))
                     .filter { it.isNotEmpty() }.joinToString(" · ")
             val state = Entries.statusLabel(this, e)
             row.findViewById<TextView>(R.id.state).text = state

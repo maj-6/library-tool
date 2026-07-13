@@ -1138,7 +1138,26 @@ main {
   max-width: 200px;
 }
 .grid tbody tr:hover { background: var(--row-hover); }
-.grid tbody tr.is-manual { background: var(--row-manual); }
+.grid tbody td.missing-core {
+  background: color-mix(in srgb, var(--amber) 9%, transparent);
+  box-shadow: inset 2px 0 color-mix(in srgb, var(--amber) 42%, transparent);
+}
+.grid tbody tr:hover td.missing-core {
+  background: color-mix(in srgb, var(--amber) 15%, var(--row-hover));
+}
+.grid td.col-src, .grid th.col-src { text-align: center; overflow: visible; }
+.src-mark {
+  display: inline-flex;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 1px;
+  min-width: 20px;
+  color: var(--face-sh2);
+  font-size: 9px;
+  line-height: 14px;
+}
+.src-mark svg { flex: none; }
+.src-edited { color: var(--amber); font-weight: bold; line-height: 9px; }
 
 /* click-to-edit metadata cells */
 .grid tbody td.editable { cursor: text; }
@@ -1312,8 +1331,7 @@ a.badge:hover { text-decoration: underline; }
 .tag-unit:has(.badge.dl-err) .vmark,
 .tag-unit:has(.badge.dl-prog) .vmark { border-width: 2px; margin-left: -2px; }
 
-/* Q while hovering: "needs attention" — outranks per-kind row tints like
-   .grid tbody tr.is-manual */
+/* Q while hovering: "needs attention" — outranks normal row presentation. */
 .grid tbody tr.attention { background: rgba(155, 89, 182, 0.16); }
 .grid tbody tr.attention td:first-child { box-shadow: inset 3px 0 0 #9b59b6; }
 .build-item.attention { background: rgba(155, 89, 182, 0.16); }
@@ -1802,7 +1820,7 @@ form.orig-view .cad-input {
 .info-k { flex: 0 0 88px; color: var(--face-sh2); font-size: 11px; }
 .info-v {
   flex: 1 1 auto; min-width: 0; color: var(--ink);
-  font-family: var(--mono); word-break: break-word;
+  font-family: var(--mono); word-break: break-word; white-space: pre-wrap;
 }
 .info-v a { color: var(--cyan); text-decoration: none; }
 .info-v a:hover { text-decoration: underline; }
@@ -1825,7 +1843,15 @@ form.orig-view .cad-input {
   border: 1px solid var(--face-sh2); background: var(--face-hi);
 }
 .info-thumb:hover { outline: 2px solid var(--cyan); }
-#img-lightbox { display: flex; align-items: center; justify-content: center; cursor: zoom-out; }
+#img-lightbox {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: zoom-out;
+  /* Above sticky Catalog/Editor headers and desktop chrome, so the backdrop
+     dims the entire application instead of being painted underneath them. */
+  z-index: 80;
+}
 #img-lightbox[hidden] { display: none; }
 #img-lightbox img {
   max-width: 92vw; max-height: 92vh;
@@ -3001,7 +3027,6 @@ body[data-theme] .drafting::-webkit-scrollbar {
 }
 #an-list-wrap { margin: 4px; }
 #an-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
-#an-list .an-item.an-locked { opacity: 0.45; cursor: default; }
 #an-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 #an-work { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 #an-head {

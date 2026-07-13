@@ -48,7 +48,8 @@ class EntryDetailActivity : AppCompatActivity() {
             .filter { it.isNotEmpty() }.joinToString(" · ")
         binding.stateLine.text = listOf(
             Entries.statusLabel(this, entry),
-            "${entry.photoCount} page(s)",
+            resources.getQuantityString(
+                R.plurals.capture_count, entry.photoCount, entry.photoCount),
             android.text.format.DateFormat.format("yyyy-MM-dd HH:mm", entry.createdAt),
         ).joinToString("  ·  ")
 

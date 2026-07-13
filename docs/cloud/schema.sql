@@ -26,9 +26,9 @@ create table if not exists captures (
 );
 create index if not exists captures_status_idx on captures (status, created_at);
 
--- Who captured it. The phone signs in with the same account as the desktop,
--- so a capture carries its contributor: the uuid for joins, the name so the
--- import needs none. ocr/meta are what the phone extracted in the background
+-- Who captured it. A capture carries its contributor: the uuid for ownership
+-- and ingest grants, the name for attribution after import. ocr/meta are what
+-- the phone extracted in the background
 -- (Mistral OCR + DeepSeek/Mistral fields) — the desktop may reuse or redo.
 alter table captures add column if not exists created_by  uuid references auth.users on delete set null;
 alter table captures add column if not exists contributor text not null default '';
@@ -36,6 +36,19 @@ alter table captures add column if not exists ocr         jsonb not null default
 alter table captures add column if not exists meta        jsonb not null default '{}';
 create index if not exists captures_owner_status_idx
   on captures (created_by, status, created_at);
+
+-- A contributor may capture on a different account from the curator's desktop.
+-- Grants are provisioned centrally; neither app receives a service-role key.
+-- Keeping this as contributor -> ingester pairs avoids exposing every user's
+-- capture queue to every signed-in desktop.
+create table if not exists capture_ingest_grants (
+  ingester_id    uuid not null references auth.users on delete cascade,
+  contributor_id uuid not null references auth.users on delete cascade,
+  created_at     timestamptz not null default now(),
+  primary key (ingester_id, contributor_id)
+);
+create index if not exists capture_ingest_grants_contributor_idx
+  on capture_ingest_grants (contributor_id);
 
 -- one-way mirror of the desktop catalog, so other tools can read it
 create table if not exists books (
@@ -45,21 +58,53 @@ create table if not exists books (
 );
 
 alter table captures enable row level security;
+alter table capture_ingest_grants enable row level security;
 alter table books    enable row level security;   -- no policy: service_role only
 
--- Phone and desktop sign in as the same user. The phone files captures; the
--- desktop may read, process, and update only that account's captures.
+-- Grant rows are maintainer-managed. Authenticated clients may only inspect
+-- grants assigned to their own desktop account and cannot create/edit them.
+revoke all on capture_ingest_grants from anon, authenticated;
+grant select on capture_ingest_grants to authenticated;
+drop policy if exists capture_ingest_grants_select_own on capture_ingest_grants;
+create policy capture_ingest_grants_select_own on capture_ingest_grants
+  for select to authenticated using (ingester_id = (select auth.uid()));
+
+-- Phones file captures for themselves. A desktop can process its own captures
+-- plus captures from contributors explicitly assigned to it above.
 drop policy if exists captures_insert_own on captures;
 drop policy if exists captures_select_own on captures;
 drop policy if exists captures_update_own on captures;
+drop policy if exists captures_select_authorized on captures;
+drop policy if exists captures_update_authorized on captures;
 create policy captures_insert_own on captures
   for insert to authenticated with check (created_by = (select auth.uid()));
-create policy captures_select_own on captures
-  for select to authenticated using (created_by = (select auth.uid()));
-create policy captures_update_own on captures
+create policy captures_select_authorized on captures
+  for select to authenticated using (
+    created_by = (select auth.uid())
+    or exists (
+      select 1 from capture_ingest_grants grant_row
+      where grant_row.ingester_id = (select auth.uid())
+        and grant_row.contributor_id = captures.created_by
+    )
+  );
+create policy captures_update_authorized on captures
   for update to authenticated
-  using (created_by = (select auth.uid()))
-  with check (created_by = (select auth.uid()));
+  using (
+    created_by = (select auth.uid())
+    or exists (
+      select 1 from capture_ingest_grants grant_row
+      where grant_row.ingester_id = (select auth.uid())
+        and grant_row.contributor_id = captures.created_by
+    )
+  )
+  with check (
+    created_by = (select auth.uid())
+    or exists (
+      select 1 from capture_ingest_grants grant_row
+      where grant_row.ingester_id = (select auth.uid())
+        and grant_row.contributor_id = captures.created_by
+    )
+  );
 
 -- =====================================================================
 -- desktop working stores — two-way sync of the files that left git
@@ -368,15 +413,17 @@ create policy events_insert_authed on events
 -- library. Nothing else is.
 --
 -- Both apps act as the signed-in user. Upload is allowed in the private bucket;
--- download/delete is limited to object paths referenced by that user's own
--- capture rows. This supports the existing <device>/<capture>/... paths while
--- preventing one account from listing or ingesting another account's photos.
+-- download/delete is limited to object paths referenced by the user's own
+-- captures or an explicit contributor -> ingester grant. This supports the
+-- existing <device>/<capture>/... paths without exposing unrelated accounts.
 
 drop policy if exists captures_objects_insert_authed on storage.objects;
 drop policy if exists captures_objects_select_upload_authed on storage.objects;
 drop policy if exists captures_objects_update_authed on storage.objects;
 drop policy if exists captures_objects_select_own on storage.objects;
 drop policy if exists captures_objects_delete_own on storage.objects;
+drop policy if exists captures_objects_select_authorized on storage.objects;
+drop policy if exists captures_objects_delete_authorized on storage.objects;
 create policy captures_objects_insert_authed on storage.objects
   for insert to authenticated with check (bucket_id = 'captures');
 -- Storage returns object metadata after an upload, and x-upsert also reads the
@@ -401,23 +448,37 @@ create policy captures_objects_update_authed on storage.objects
     bucket_id = 'captures'
     and owner_id = (select auth.uid()::text)
   );
-create policy captures_objects_select_own on storage.objects
+create policy captures_objects_select_authorized on storage.objects
   for select to authenticated using (
     bucket_id = 'captures'
-    and owner_id = (select auth.uid()::text)
     and exists (
       select 1 from public.captures c
-      where c.created_by = (select auth.uid())
-        and c.photos ? storage.objects.name
+      where c.photos ? storage.objects.name
+        and (
+          (c.created_by = (select auth.uid())
+           and owner_id = (select auth.uid()::text))
+          or exists (
+            select 1 from public.capture_ingest_grants grant_row
+            where grant_row.ingester_id = (select auth.uid())
+              and grant_row.contributor_id = c.created_by
+          )
+        )
     )
   );
-create policy captures_objects_delete_own on storage.objects
+create policy captures_objects_delete_authorized on storage.objects
   for delete to authenticated using (
     bucket_id = 'captures'
-    and owner_id = (select auth.uid()::text)
     and exists (
       select 1 from public.captures c
-      where c.created_by = (select auth.uid())
-        and c.photos ? storage.objects.name
+      where c.photos ? storage.objects.name
+        and (
+          (c.created_by = (select auth.uid())
+           and owner_id = (select auth.uid()::text))
+          or exists (
+            select 1 from public.capture_ingest_grants grant_row
+            where grant_row.ingester_id = (select auth.uid())
+              and grant_row.contributor_id = c.created_by
+          )
+        )
     )
   );

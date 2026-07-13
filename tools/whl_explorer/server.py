@@ -3167,11 +3167,34 @@ def api_manual_list():
 
 
 def _clean_extra(v) -> dict:
-    """Arbitrary non-column bibliographic facts: a flat str->str dict."""
+    """Arbitrary non-column bibliographic facts, kept as JSON-compatible data.
+
+    Phone extractors are allowed to learn new fields without a desktop release.
+    Preserve their complete values here; the Info tab renders this structure,
+    while the book table continues to use its explicit column list.
+    """
     if not isinstance(v, dict):
         return {}
-    return {str(k).strip()[:64]: str(x)[:500] for k, x in v.items()
-            if str(k).strip() and str(x or "").strip()}
+
+    def clean(x):
+        if isinstance(x, dict):
+            return {str(k).strip(): cleaned for k, value in x.items()
+                    if str(k).strip() and (cleaned := clean(value)) is not None}
+        if isinstance(x, list):
+            return [cleaned for value in x
+                    if (cleaned := clean(value)) is not None]
+        if x is None:
+            return None
+        if isinstance(x, str):
+            value = x.strip()
+            return value if value else None
+        if isinstance(x, (bool, int, float)):
+            return x
+        value = str(x).strip()
+        return value if value else None
+
+    return {str(k).strip(): cleaned for k, value in v.items()
+            if str(k).strip() and (cleaned := clean(value)) is not None}
 
 
 def _clean_images(v) -> list[str]:
@@ -3240,6 +3263,8 @@ def api_manual_update(entry_id: str):
                 payload.get("category_ids"), lib.load_taxonomy()["nodes"])
         if not e.get("title"):
             return jsonify({"ok": False, "error": "TITLE IS REQUIRED"}), 400
+        if payload.get("_edited"):
+            e["edited"] = True
         if not payload.get("_preserve"):
             e["checks"] = _entry_checks(e)
             # Metadata changed: stored matches and their verifications are stale.
@@ -5505,8 +5530,13 @@ def _phone_result(cap: dict, raw_photos: list[bytes], photo_paths: list) -> dict
             meta = None
     ocr = ocr if isinstance(ocr, dict) else {}
     meta = meta if isinstance(meta, dict) else {}
-    has_fields = any(str(meta.get(f) or "").strip() for f in capture.FIELDS)
-    if not (ocr or has_fields):
+    def has_value(value):
+        if isinstance(value, (dict, list)):
+            return bool(value)
+        return bool(str(value or "").strip())
+
+    has_metadata = any(has_value(value) for value in meta.values())
+    if not (ocr or has_metadata):
         return None                       # phone had no keys / extracted nothing
 
     photos, errors = [], []
@@ -5523,7 +5553,13 @@ def _phone_result(cap: dict, raw_photos: list[bytes], photo_paths: list) -> dict
         if text:
             parts.append(f"--- Photo {i} ---\n{text}")
     fields = {f: str(meta.get(f) or "").strip() for f in capture.FIELDS}
-    extra = meta.get("extra") if isinstance(meta.get("extra"), dict) else {}
+    # The phone normally puts non-column facts under `extra`. Be liberal when
+    # reading older/newer extractors: preserve every unknown top-level key too,
+    # so adding metadata on Android never silently loses it on desktop.
+    extra = dict(meta.get("extra")) if isinstance(meta.get("extra"), dict) else {}
+    for key, value in meta.items():
+        if key not in capture.FIELDS and key != "extra" and has_value(value):
+            extra.setdefault(key, value)
     return {"photos": photos, "ocr_text": "\n\n".join(parts),
             "fields": fields, "extra": extra, "errors": errors}
 

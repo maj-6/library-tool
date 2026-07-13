@@ -19,10 +19,8 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
-import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
@@ -33,8 +31,6 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.work.WorkManager
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -81,7 +77,6 @@ class MainActivity : AppCompatActivity() {
     private var busy = false                  // a shot is being written
     private var pendingCommand: String? = null   // "done"/"cancel" said mid-shot
     private var sharpenBound = false             // the sharpen mode the camera is bound with
-    private val analysisExecutor: ExecutorService = Executors.newSingleThreadExecutor()
 
     private val permissions = arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
 
@@ -161,7 +156,6 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         voice?.stop()
         cues.shutdown()
-        analysisExecutor.shutdown()
     }
 
     override fun onRequestPermissionsResult(
@@ -233,54 +227,12 @@ class MainActivity : AppCompatActivity() {
                         .build())
                 .build()
             imageCapture = capture
-            // page-bound detection runs on a small, latest-only analysis stream
-            val analysis = ImageAnalysis.Builder()
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setResolutionSelector(
-                    ResolutionSelector.Builder()
-                        .setResolutionStrategy(
-                            ResolutionStrategy(
-                                Size(640, 480),
-                                ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER))
-                        .build())
-                .build()
-                .also { it.setAnalyzer(analysisExecutor, ::analyzeFrame) }
             provider.unbindAll()
-            try {
-                // Preview + ImageCapture + ImageAnalysis — some LIMITED-level
-                // devices can't do three streams; fall back to no page-detect.
-                provider.bindToLifecycle(
-                    this, CameraSelector.DEFAULT_BACK_CAMERA, preview, capture, analysis)
-            } catch (e: Exception) {
-                provider.bindToLifecycle(
-                    this, CameraSelector.DEFAULT_BACK_CAMERA, preview, capture)
-            }
+            provider.bindToLifecycle(
+                this, CameraSelector.DEFAULT_BACK_CAMERA, preview, capture)
             applyPreviewSharpen(sharpen)
             sharpenBound = sharpen
         }, ContextCompat.getMainExecutor(this))
-    }
-
-    /** Cheap page-bound hint on the analysis stream; skipped unless a shot is
-     *  wanted (session open, not mid-capture) so it never taxes the shutter. */
-    private fun analyzeFrame(image: ImageProxy) {
-        try {
-            if (!session.active || busy) {
-                runOnUiThread { binding.pageGuide.setHint(null) }
-                return
-            }
-            val plane = image.planes[0]
-            val buf = plane.buffer
-            val bytes = ByteArray(buf.remaining())
-            buf.get(bytes)
-            val hint = PageDetector.detect(
-                bytes, image.width, image.height, plane.rowStride,
-                image.imageInfo.rotationDegrees)
-            runOnUiThread { binding.pageGuide.setHint(hint) }
-        } catch (_: Exception) {
-            // a bad frame is not worth crashing the camera over
-        } finally {
-            image.close()
-        }
     }
 
     /** Set or clear the AGSL sharpen RenderEffect on the preview (Android 13+). */
@@ -326,7 +278,7 @@ class MainActivity : AppCompatActivity() {
                         // null + still active = the manifest write failed
                         // (disk full); the pages are kept and "done" can retry
                         session.active -> cues.error("could not save, still open")
-                        else -> cues.error("no pages, entry dropped")
+                        else -> cues.error("no captures, entry dropped")
                     }
                 }
             }
@@ -419,10 +371,7 @@ class MainActivity : AppCompatActivity() {
         binding.btnPhoto.isEnabled = active
         binding.btnDone.isEnabled = active
         binding.btnCancel.isEnabled = active
-        if (!active) {
-            binding.thumbs.removeAllViews()
-            binding.pageGuide.setHint(null)     // no page hint while idle
-        }
+        if (!active) binding.thumbs.removeAllViews()
 
         val signedIn = Auth.signedIn(this)
         val err = Prefs.lastUploadError(this) ?: Prefs.lastProcError(this)
@@ -464,7 +413,11 @@ class MainActivity : AppCompatActivity() {
             val row = inflater.inflate(R.layout.item_recent, list, false)
             row.findViewById<TextView>(R.id.title).text = Entries.titleLabel(this, e)
             row.findViewById<TextView>(R.id.sub).text =
-                listOf(e.author, e.year, "${e.photoCount}p")
+                listOf(
+                    e.author,
+                    e.year,
+                    resources.getQuantityString(
+                        R.plurals.capture_count, e.photoCount, e.photoCount))
                     .filter { it.isNotEmpty() }.joinToString(" · ")
             val state = Entries.statusLabel(this, e)
             row.findViewById<TextView>(R.id.state).text = state
