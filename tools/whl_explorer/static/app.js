@@ -2494,7 +2494,8 @@ function renderSettings() {
       };
     }
   })();
-  // phone-capture sync interval + remote-cleanup toggle + connection test
+  // Phone capture uses the signed-in account + built-in public project key;
+  // there is no Supabase credential for a normal user to configure here.
   const cm = el("set-cloud-minutes");
   cm.value = state.settings.cloudSyncMinutes || 0;
   cm.onchange = () => {
@@ -2516,7 +2517,7 @@ function renderSettings() {
       await flushClientState();   // the server reads settings server-side — push first
       const r = await (await fetch("/api/cloudsync/test")).json();
       el("cloud-test-msg").textContent = r.ok
-        ? "OK — captures table + storage bucket reachable"
+        ? "OK — signed-in phone sync is reachable"
         : (r.error || "Failed");
     } catch (e) {
       el("cloud-test-msg").textContent = "Server unreachable";
@@ -9138,7 +9139,7 @@ async function runCloudSync() {
     if (r.ok === false) {
       statusCrit("CLOUD SYNC FAILED :: " +
         (r.error || (r.errors || []).join("; ") || "?"));
-    } else {
+    } else if (r.owner_sync) {
       // a sync that finished but dropped rows is an error, not a success
       const dropped = (r.errors || []).length;
       const en = r.entries || {};
@@ -9146,6 +9147,8 @@ async function runCloudSync() {
         ` / stores ${up} up ${down} down` +
         (en.pushed || en.pulled ? ` / files ${en.pushed || 0} up ${en.pulled || 0} down` : "") +
         (dropped ? ` / ${dropped} errors` : ""), dropped ? "error" : undefined);
+    } else {
+      status(`PHONE SYNC :: ${r.imported || 0} imported / ${r.skipped || 0} already present`);
     }
   }, 1500);
 }

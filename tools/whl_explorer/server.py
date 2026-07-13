@@ -309,17 +309,17 @@ def _auth_doc() -> dict:
 
 
 def _auth_cfg() -> dict | None:
-    """GoTrue wants a project API key in `apikey`; the anon key is the right
-    one, but the service key works too, so use whichever Settings holds.
+    """GoTrue wants a public project API key in ``apikey``.
 
     Nothing configured is NOT unconfigured: the app ships knowing its own
     cloud (cloud_defaults), so accounts work on a fresh install with no keys
     entered. Settings override; a custom project URL with no key of its own
-    stays unconfigured rather than pairing with the default key."""
+    stays unconfigured rather than pairing with the default key. The owner
+    service credential is deliberately ignored here: normal account and phone
+    capture traffic must never depend on it."""
     s = _client_settings()
     url = str(s.get("supabaseUrl") or "").strip() or cloud_defaults.SUPABASE_URL
-    key = (str(s.get("supabaseAnonKey") or "").strip()
-           or str(s.get("supabaseKey") or "").strip())
+    key = str(s.get("supabaseAnonKey") or "").strip()
     if not key and url == cloud_defaults.SUPABASE_URL:
         key = cloud_defaults.SUPABASE_ANON_KEY
     return {"url": url, "key": key} if url and key else None
@@ -4378,13 +4378,31 @@ _autosync_last = 0.0
 
 
 def _cloud_cfg() -> dict | None:
-    """The service-role config for the owner pipelines (captures, publish,
-    store sync). The URL defaults to the shipped project; the service key is
-    a secret and must always come from Settings."""
+    """Service-role config for privileged owner publishing and maintenance.
+
+    Phone capture intentionally does not use this path; see ``_capture_cfg``.
+    The URL defaults to the shipped project, but this secret never does.
+    """
     s = _client_settings()
     url = str(s.get("supabaseUrl") or "").strip() or cloud_defaults.SUPABASE_URL
     key = str(s.get("supabaseKey") or "").strip()
     return {"url": url, "key": key} if url and key else None
+
+
+def _capture_cfg() -> dict | None:
+    """Public project identity plus the signed-in user's current JWT.
+
+    This is the complete phone-sync credential. Supabase uses ``key`` only to
+    identify the public app component and ``access_token`` to enforce the
+    user's capture/storage RLS policies. A fresh install therefore needs a
+    login, never a pasted Supabase key.
+    """
+    cfg = _auth_cfg()
+    ses = _auth_session() if cfg else None
+    token = str((ses or {}).get("access_token") or "").strip()
+    if not cfg or not token:
+        return None
+    return dict(cfg, access_token=token)
 
 
 
@@ -5632,16 +5650,20 @@ def _books_mirror_rows() -> list[dict]:
 
 
 def _cloud_sync_run() -> dict:
-    """One full sync pass: import pending captures, push the books mirror,
-    merge the working stores (builds / IA catalog / corrections) with their
-    cloud tables, and mirror the entry folders to R2.
+    """Import this user's pending phone captures, with optional owner work.
+
+    Capture ingest runs with the signed-in user's JWT and RLS. If an owner has
+    separately configured a service credential, the same pass also pushes the
+    catalog mirror, merges the owner working stores, and mirrors entry folders.
 
     Everything after the flag is claimed runs inside try/finally, and ANY
     exception lands in `result` — the flag can never stay stuck on, and a
     failed pass can't masquerade as the previous run's outcome."""
-    cfg = _cloud_cfg()
-    if not cfg:
-        return {"ok": False, "error": "Supabase URL/key not configured"}
+    owner_cfg = _cloud_cfg()
+    capture_cfg = _capture_cfg() or owner_cfg  # legacy owner-only installs
+    if not capture_cfg:
+        return {"ok": False,
+                "error": "Sign in to your Library Tool account to sync phone captures"}
     with _cloudsync_lock:
         if _cloudsync["running"]:
             return {"ok": False, "error": "sync already running"}
@@ -5654,40 +5676,45 @@ def _cloud_sync_run() -> dict:
         s = _client_settings()
         mistral_key = str(s.get("mistralKey") or "").strip()
         delete_remote = s.get("cloudDeleteRemote") is not False
-        for cap in sbase.list_pending_captures(cfg):
+        for cap in sbase.list_pending_captures(capture_cfg):
             try:
-                if _import_capture(cfg, cap, mistral_key, delete_remote) == "imported":
+                if _import_capture(capture_cfg, cap, mistral_key, delete_remote) == "imported":
                     imported += 1
                 else:
                     skipped += 1
             except Exception as exc:      # one bad capture must not stop the rest
                 errors.append(f"capture {str(cap.get('id'))[:8]}: {exc}")
         pushed = 0
-        try:
-            pushed = sbase.push_books(cfg, _books_mirror_rows())
-        except sbase.SyncError as exc:
-            errors.append(f"books mirror: {exc}")
-        # the working stores that left git in 87a9bf2 (two-way, per record;
-        # store_sync guards against an emptier side clobbering a fuller one)
-        stores = store_sync.sync_stores(cfg, locks={
-            "builds": _builds_lock, "ia_catalog": _ia_catalog_lock})
-        for name, res in stores.items():
-            if res.get("error"):
-                errors.append(f"{name}: {res['error']}")
-            if res.get("guard"):          # a wipe was caught: worth surfacing
-                errors.append(f"{name}: {res['guard']}")
+        stores: dict = {}
         entries_res: dict = {}
-        r2cfg = _r2_cfg()
-        if r2.configured(r2cfg):
+        if owner_cfg:
             try:
-                entries_res = store_sync.sync_entry_files(r2cfg)
-            except Exception as exc:
-                errors.append(f"entry files: {exc}")
+                pushed = sbase.push_books(owner_cfg, _books_mirror_rows())
+            except sbase.SyncError as exc:
+                errors.append(f"books mirror: {exc}")
+            # the working stores that left git in 87a9bf2 (two-way, per record;
+            # store_sync guards against an emptier side clobbering a fuller one)
+            stores = store_sync.sync_stores(owner_cfg, locks={
+                "builds": _builds_lock, "ia_catalog": _ia_catalog_lock})
+            for name, res in stores.items():
+                if res.get("error"):
+                    errors.append(f"{name}: {res['error']}")
+                if res.get("guard"):      # a wipe was caught: worth surfacing
+                    errors.append(f"{name}: {res['guard']}")
+            r2cfg = _r2_cfg()
+            if r2.configured(r2cfg):
+                try:
+                    entries_res = store_sync.sync_entry_files(r2cfg)
+                except Exception as exc:
+                    errors.append(f"entry files: {exc}")
+            else:
+                entries_res = {"skipped": "R2 not configured"}
         else:
-            entries_res = {"skipped": "R2 not configured"}
+            entries_res = {"skipped": "owner sync not configured"}
         result = {"ok": not errors, "imported": imported, "skipped": skipped,
                   "books_pushed": pushed, "stores": stores,
-                  "entries": entries_res, "errors": errors}
+                  "entries": entries_res, "errors": errors,
+                  "owner_sync": bool(owner_cfg)}
     except Exception as exc:
         result = {"ok": False, "error": f"{type(exc).__name__}: {exc}",
                   "imported": imported, "errors": errors}
@@ -5728,7 +5755,7 @@ def _cloud_autosync_loop() -> None:
         # must never kill this thread — it would silently stop syncing forever
         try:
             minutes = int(_client_settings().get("cloudSyncMinutes") or 0)
-            if minutes <= 0 or not _cloud_cfg():
+            if minutes <= 0 or not (_capture_cfg() or _cloud_cfg()):
                 continue
             if time.time() - _autosync_last >= minutes * 60:
                 _autosync_last = time.time()
@@ -5741,8 +5768,9 @@ def _cloud_autosync_loop() -> None:
 def api_cloudsync_run():
     """Manual sync trigger (the Catalogs-tab button). Runs in the background;
     poll /api/cloudsync/status for the outcome."""
-    if not _cloud_cfg():
-        return jsonify({"ok": False, "error": "Supabase URL/key not configured"})
+    if not (_capture_cfg() or _cloud_cfg()):
+        return jsonify({"ok": False,
+                        "error": "Sign in to your Library Tool account to sync phone captures"})
     with _cloudsync_lock:
         already = _cloudsync["running"]
     if not already:
@@ -5754,15 +5782,16 @@ def api_cloudsync_run():
 def api_cloudsync_status():
     with _cloudsync_lock:
         out = dict(_cloudsync)
-    out["configured"] = bool(_cloud_cfg())
+    out["configured"] = bool(_capture_cfg() or _cloud_cfg())
     return jsonify(out)
 
 
 @app.route("/api/cloudsync/test")
 def api_cloudsync_test():
-    cfg = _cloud_cfg()
+    cfg = _capture_cfg() or _cloud_cfg()
     if not cfg:
-        return jsonify({"ok": False, "error": "Supabase URL/key not configured"})
+        return jsonify({"ok": False,
+                        "error": "Sign in to your Library Tool account to test phone sync"})
     return jsonify(sbase.test_connection(cfg))
 
 

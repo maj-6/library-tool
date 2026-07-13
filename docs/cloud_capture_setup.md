@@ -9,9 +9,10 @@ extraction), and files each capture as a manual entry with its photos.
 ## 1. Create the project
 
 1. <https://supabase.com> → New project (free tier is plenty).
-2. Note the **Project URL** (`https://xxxx.supabase.co`) and, from
-   *Settings → API*, the **service_role key** (used by the desktop; treat it
-   like a password — it bypasses row security).
+2. For a custom build, note the **Project URL** (`https://xxxx.supabase.co`)
+   and its public **publishable** key. These are application build settings,
+   not values an end user should ever have to enter. The official Library Tool
+   builds already contain them.
 
 ## 2. Create the tables
 
@@ -29,8 +30,10 @@ the schema changes.
 python3 tools/cloud_setup.py buckets --apply
 ```
 
-`captures` (private) for phone photos, `volumes` (public) for published PDFs.
-The Storage API accepts the service_role key, so this needs no SQL.
+`captures` (private) holds phone photos; `volumes` (public) holds published
+PDFs. Bucket creation is an owner setup task. `tools/cloud_setup.py` reads a
+service credential from `SUPABASE_KEY` for this one-time administration step;
+that credential is never distributed to phone or desktop users.
 
 Then check the whole thing:
 
@@ -40,13 +43,15 @@ python3 tools/cloud_setup.py check
 
 ## 4. Wire up both ends
 
-- **Desktop** (Settings → Sync → *Phone capture*): the service_role key,
-  Mistral API key, auto-sync interval (e.g. 15 min). The project URL and the
-  anon key are built into the app (`tools/cloud_defaults.py`) — set them only
-  when pointing at your own project. **Test connection** should report both
-  the table and the bucket reachable.
-- **Phone** (Book Capture ⚙): the same URL + key, a device name,
-  **Test connection**.
+- **Desktop**: sign in to a Library Tool account, then choose the auto-sync
+  interval under Settings → Sync → *Phone capture*. No Supabase key is needed.
+- **Phone**: sign in to the same account and select Cloud transport. No
+  Supabase key is needed. **Test connection** verifies that the signed-in
+  capture path is reachable.
+
+The public project URL/key are compiled into official builds. A fork points
+both apps at its own project as part of its build/configuration; that remains
+the fork maintainer's responsibility, not the user's.
 
 The `captures` bucket stays small: after an entry is imported the desktop
 keeps the processed photos locally under `DATA_ROOT/captures/<id>/` and (by
@@ -60,11 +65,13 @@ the project-specific confirmation email — both in **[docs/cloud/auth_setup.md]
 
 ## Notes
 
-- If both apps use the service_role key, leave RLS off on these two tables
-  (single-user project). If you prefer the anon key on the phone, it needs
-  RLS policies for `select` + `insert` on `captures` (the connection test
-  reads one row; retried inserts use ignore-duplicates) and `insert` +
-  `update` on storage objects under `captures/*` (uploads are upsert).
+- Keep RLS enabled. `schema.sql` lets an authenticated account insert, select,
+  and update only its own capture rows. Storage download/delete is likewise
+  limited to object paths referenced by that account's capture rows; upload
+  remains available to signed-in phones.
+- A service credential is still appropriate for explicitly privileged owner
+  tasks such as publishing public volumes and maintaining project-wide working
+  stores. It is optional and is not part of phone sync.
 - The `books` table is a one-way mirror of the desktop catalog (checked +
   manual) so future tools (or the phone) can read it; the desktop never
   reads it back.

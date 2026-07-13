@@ -1468,8 +1468,9 @@
 
             <div class="settings-head" style="margin-top:16px">Phone capture (Supabase)</div>
             <p class="settings-note">Phone photos land here; syncing runs the pipeline and files
-              each capture as a manual entry. The Mistral key it needs lives under
-              <b>OCR</b>. See <b>docs/cloud_capture_setup.md</b>.</p>
+              each capture as a manual entry. Sign in to the same Library Tool account on the
+              phone and desktop; the built-in public cloud configuration handles the rest, with
+              no Supabase key to enter. The Mistral key it needs lives under <b>OCR</b>.</p>
             <div class="settings-rows">
               <label class="tool-label" for="set-sb-url">Supabase project URL</label>
               <input id="set-sb-url" class="cad-input" spellcheck="false"
@@ -1518,15 +1519,15 @@
               <label class="tool-label" for="set-ocr-aws-secret">AWS secret key</label>
               <input id="set-ocr-aws-secret" class="cad-input" type="password" spellcheck="false" />
             </div>
-            <div class="settings-subhead" style="margin-top:16px">Phone capture &amp; storage</div>
+            <div class="settings-subhead" style="margin-top:16px">Owner publishing &amp; storage</div>
             <div class="settings-rows">
-              <label class="tool-label" for="set-sb-key">Supabase service key</label>
+              <label class="tool-label" for="set-sb-key">Owner service key (optional)</label>
               <input id="set-sb-key" class="cad-input" type="password" spellcheck="false"
-                     data-tip="The owner secret — unlocks phone capture, publishing, and the working-store sync. Regular users leave it blank." />
-              <label class="tool-label" for="set-sb-anon">Supabase anon key</label>
+                     data-tip="Only for library-owner publishing and maintenance. Phone capture never needs this secret." />
+              <label class="tool-label" for="set-sb-anon">Custom-project public key</label>
               <input id="set-sb-anon" class="cad-input" type="password" spellcheck="false"
                      placeholder="built in"
-                     data-tip="The public (anon) key — signs users in. Built in; set only with your own project URL." />
+                     data-tip="Built in for Library Tool. Only forks using a different Supabase project enter its publishable or anon key." />
               <label class="tool-label" for="set-r2-key">R2 access key id</label>
               <input id="set-r2-key" class="cad-input" spellcheck="false" />
               <label class="tool-label" for="set-r2-secret">R2 secret</label>

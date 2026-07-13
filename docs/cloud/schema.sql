@@ -6,11 +6,11 @@
 --
 -- Afterwards:  python3 tools/cloud_setup.py check
 --
--- Two keys, two audiences. The desktop app holds the service_role key, which
--- bypasses row-level security entirely — it is a trusted client on your own
--- machine. The website ships the anon key, which is public by design, and can
--- do only what the policies below allow: read volumes and releases. Nothing in
--- these tables is secret; the point of the site is to publish them.
+-- Public and privileged credentials have separate jobs. Website, phone, and
+-- desktop account/phone-sync flows ship the public project key and authorize
+-- each person with their Supabase Auth JWT + RLS. No user pastes a Supabase
+-- key. A library owner may separately configure service_role for publishing
+-- and maintenance that genuinely need project-wide access.
 
 -- =====================================================================
 -- phone capture (the Android app -> desktop ingest pipeline)
@@ -34,6 +34,8 @@ alter table captures add column if not exists created_by  uuid references auth.u
 alter table captures add column if not exists contributor text not null default '';
 alter table captures add column if not exists ocr         jsonb not null default '{}';
 alter table captures add column if not exists meta        jsonb not null default '{}';
+create index if not exists captures_owner_status_idx
+  on captures (created_by, status, created_at);
 
 -- one-way mirror of the desktop catalog, so other tools can read it
 create table if not exists books (
@@ -45,15 +47,19 @@ create table if not exists books (
 alter table captures enable row level security;
 alter table books    enable row level security;   -- no policy: service_role only
 
--- The phone is a signed-in user, not a service_role holder (see the storage
--- note at the bottom): it may file captures as itself and follow their status.
--- The desktop's service key still bypasses all of this for ingest.
+-- Phone and desktop sign in as the same user. The phone files captures; the
+-- desktop may read, process, and update only that account's captures.
 drop policy if exists captures_insert_own on captures;
 drop policy if exists captures_select_own on captures;
+drop policy if exists captures_update_own on captures;
 create policy captures_insert_own on captures
-  for insert to authenticated with check (created_by = auth.uid());
+  for insert to authenticated with check (created_by = (select auth.uid()));
 create policy captures_select_own on captures
-  for select to authenticated using (created_by = auth.uid());
+  for select to authenticated using (created_by = (select auth.uid()));
+create policy captures_update_own on captures
+  for update to authenticated
+  using (created_by = (select auth.uid()))
+  with check (created_by = (select auth.uid()));
 
 -- =====================================================================
 -- desktop working stores — two-way sync of the files that left git
@@ -361,17 +367,16 @@ create policy events_insert_authed on events
 -- The volumes bucket is world-readable. That is the point: it is a public
 -- library. Nothing else is.
 --
--- The old KNOWN GAP (the phone carrying the service_role key because captures
--- were service-only) is closed: the phone signs in as a user, and these
--- policies let any signed-in account file photos into the private captures
--- bucket. Reading stays service-only, so a stolen session can spam but not
--- browse. Uploads are scoped to the bucket, not to a per-user prefix — with a
--- handful of trusted contributors, one being able to overwrite another's
--- pending object is accepted; revisit with a path convention if that changes.
+-- Both apps act as the signed-in user. Upload is allowed in the private bucket;
+-- download/delete is limited to object paths referenced by that user's own
+-- capture rows. This supports the existing <device>/<capture>/... paths while
+-- preventing one account from listing or ingesting another account's photos.
 
 drop policy if exists captures_objects_insert_authed on storage.objects;
 drop policy if exists captures_objects_select_upload_authed on storage.objects;
 drop policy if exists captures_objects_update_authed on storage.objects;
+drop policy if exists captures_objects_select_own on storage.objects;
+drop policy if exists captures_objects_delete_own on storage.objects;
 create policy captures_objects_insert_authed on storage.objects
   for insert to authenticated with check (bucket_id = 'captures');
 -- Storage returns object metadata after an upload, and x-upsert also reads the
@@ -380,6 +385,7 @@ create policy captures_objects_insert_authed on storage.objects
 create policy captures_objects_select_upload_authed on storage.objects
   for select to authenticated using (
     bucket_id = 'captures'
+    and owner_id = (select auth.uid()::text)
     and storage.allow_any_operation(array[
       'storage.object.upload',
       'storage.object.upload_update'
@@ -388,4 +394,30 @@ create policy captures_objects_select_upload_authed on storage.objects
 -- x-upsert (a retried upload) is an UPDATE under the hood.
 create policy captures_objects_update_authed on storage.objects
   for update to authenticated
-  using (bucket_id = 'captures') with check (bucket_id = 'captures');
+  using (
+    bucket_id = 'captures'
+    and owner_id = (select auth.uid()::text)
+  ) with check (
+    bucket_id = 'captures'
+    and owner_id = (select auth.uid()::text)
+  );
+create policy captures_objects_select_own on storage.objects
+  for select to authenticated using (
+    bucket_id = 'captures'
+    and owner_id = (select auth.uid()::text)
+    and exists (
+      select 1 from public.captures c
+      where c.created_by = (select auth.uid())
+        and c.photos ? storage.objects.name
+    )
+  );
+create policy captures_objects_delete_own on storage.objects
+  for delete to authenticated using (
+    bucket_id = 'captures'
+    and owner_id = (select auth.uid()::text)
+    and exists (
+      select 1 from public.captures c
+      where c.created_by = (select auth.uid())
+        and c.photos ? storage.objects.name
+    )
+  );

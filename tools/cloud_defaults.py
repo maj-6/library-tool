@@ -6,9 +6,10 @@ same pair the website ships to every visitor (website/assets/config.js).
 Row-level security is what protects the project: the anon key can read
 volumes and releases and write nothing, and signing in only unlocks what the
 policies grant that user. The service_role key is NEVER shipped; owner
-machines paste it in Settings > Sync for the capture / publish / store-sync
-pipelines. Anything set in Settings overrides these, so a fork can point the
-app at its own project.
+machines may add it for privileged publishing and working-store maintenance.
+Phone capture uses the signed-in user's session and needs no user-supplied
+Supabase key. Anything set in Settings overrides these, so a fork can point
+the app at its own project.
 
 tests/test_cloud_defaults.py asserts the baked key's JWT role is `anon` —
 a service key can not be committed here without failing CI.
