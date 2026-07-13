@@ -680,6 +680,9 @@ const ICONS = {
   check: _SVG('<path d="M2.8 8.6 L6.4 12 L13.2 4"/>'),
   target: _SVG('<circle cx="8" cy="8" r="4.4"/><path d="M8 1.5 v3 M8 11.5 v3 M1.5 8 h3 M11.5 8 h3"/>'),
   image: _SVG('<rect x="2" y="3" width="12" height="10" rx="1"/><circle cx="5.8" cy="6.3" r="1.1"/><path d="M3.5 11.5 L7 8 l2.2 2.2 L11 8.5 l2.5 3"/>'),
+  camera: _SVG('<path d="M2 5 h2.2 l1.1-1.8 h5.4 L11.8 5 H14 v8 H2 Z"/><circle cx="8" cy="8.8" r="2.5"/>'),
+  manual: _SVG('<path d="M2.5 2.5 h7 l2.5 2.5 v8.5 h-9.5 Z"/><path d="M9.5 2.5 V5 H12"/><path d="M5 11.8 l.5-2 L11 4.3 l1.7 1.7 -5.5 5.5 Z"/>'),
+  listfile: _SVG('<path d="M3 2 h7 l3 3 v9 H3 Z"/><path d="M10 2 v3 h3 M5.2 7.3 h5.6 M5.2 9.6 h5.6 M5.2 11.9 h3.8"/>'),
   text: _SVG('<path d="M2.5 3.5 h11 M2.5 6.5 h11 M2.5 9.5 h8 M2.5 12.5 h10"/>'),
   sparkle: _SVG('<path d="M8 1.8 L9.5 6.5 L14.2 8 L9.5 9.5 L8 14.2 L6.5 9.5 L1.8 8 L6.5 6.5 Z"/><path d="M12.8 2 v2.6 M11.5 3.3 h2.6"/>'),
   fileup: _SVG('<path d="M3.5 2 h6 l3 3 v9 h-9 Z"/><path d="M9.5 2 v3 h3"/><path d="M8 11.5 V7.5 M6.2 9.2 L8 7.4 L9.8 9.2"/>'),
@@ -2012,7 +2015,7 @@ function scanSortVal(row, src) {
 
 function checkedSortVal(row, key) {
   switch (key) {
-    case "src": return row.kind === "manual" ? "manual" : row.source;
+    case "src": return row.captured ? "captured" : row.kind === "manual" ? "manual" : row.source;
     case "copyright": return (row.checks && row.checks.copyright_status) || "";
     case "whl": return (row.checks && row.checks.in_whl) || "";
     case "ia": return scanSortVal(row, "internet_archive");
@@ -3525,6 +3528,8 @@ function combinedRows() {
   for (const e of state.manual) {
     rows.push({
       kind: "manual", id: e.id, source: "manual", book: manualToBook(e),
+      captured: !!e.capture_id,
+      edited: !!e.edited,
       checks: e.checks || null, scans: e.scans || null,
       verify: migrateVerify(e) || {},
       manualUrls: e.manual_urls || {},
@@ -3535,6 +3540,8 @@ function combinedRows() {
   for (const [k, v] of state.checked.entries()) {
     rows.push({
       kind: "catalog", id: k, source: k.split(":")[0],
+      captured: false,
+      edited: !!v.edited,
       book: Object.assign({ subtitle: "", volume: "", language: "" }, v.book),
       checks: v.checks || null, scans: v.scans || null,
       verify: migrateVerify(v) || {},
@@ -4415,7 +4422,6 @@ function checkedRowTr(row, cmode, opts) {
   const b = row.book;
   const tr = document.createElement("tr");
   tr.dataset.rowId = row.id;
-  if (row.kind === "manual") tr.classList.add("is-manual");
   if (opts.isVol) {
     tr.classList.add("set-vol", "set-open");
     if (opts.setKey) tr.dataset.setKey = opts.setKey;
@@ -4427,21 +4433,27 @@ function checkedRowTr(row, cmode, opts) {
   }
   if (cmode === "search" && state.checkedSelected === String(row.id))
     tr.classList.add("whl-selected");
-  const editable = (f) =>
-    cmode === "search" || (row.kind === "manual" && f === "acquired")
-      ? "" : ` class="editable" data-edit="${f}"`;
   // volume titles are implied by the set header — optionally hide them
   const hideTitle = opts.isVol && !!state.settings.hideVolTitles;
   const cell = (f) => {
     const val = f === "title" && hideTitle ? ""
       : f === "categories" ? bookCatsText(b) : b[f];
-    return f === "title" && cmode === "search"
-      ? `<td data-csearch="1">${esc(val)}</td>`
-      : `<td${editable(f)}>${esc(val)}</td>`;
+    const classes = [], attrs = [];
+    if (cmode !== "search" && !(row.kind === "manual" && f === "acquired")) {
+      classes.push("editable");
+      attrs.push(`data-edit="${f}"`);
+    }
+    const coreLabel = { year: "date", author: "author", publisher: "publisher" }[f];
+    if (coreLabel && !String(val || "").trim()) {
+      classes.push("missing-core");
+      attrs.push(`data-tip="Missing ${coreLabel}"`);
+    }
+    if (f === "title" && cmode === "search") attrs.push('data-csearch="1"');
+    return `<td${classes.length ? ` class="${classes.join(" ")}"` : ""}` +
+      `${attrs.length ? " " + attrs.join(" ") : ""}>${esc(val)}</td>`;
   };
   tr.innerHTML = `
-    <td>${row.kind === "manual" ? "MANUAL"
-      : row.source === "ch_library" ? "MASTER" : esc(row.source.toUpperCase())}</td>
+    <td class="col-src">${rowSourceMark(row)}</td>
     ${BOOK_COLS.map(cell).join("\n      ")}
     <td class="col-whl">${imgCell(row)}</td>
     <td class="col-whl">${copyrightCell(row)}</td>
@@ -4450,6 +4462,27 @@ function checkedRowTr(row, cmode, opts) {
     <td class="col-whl">${scanBadge(row, "hathitrust")}</td>
     <td class="col-whl">${markCell(row)}</td>`;
   return tr;
+}
+
+function rowSourceMark(row) {
+  let glyph, label;
+  if (row.captured) {
+    glyph = ICONS.camera;
+    label = "Phone capture";
+  } else if (row.kind === "manual") {
+    glyph = ICONS.manual;
+    label = "Manual entry";
+  } else if (row.source === "ch_library") {
+    glyph = ICONS.listfile;
+    label = "Master list";
+  } else {
+    glyph = esc(String(row.source || "catalog").toUpperCase());
+    label = String(row.source || "Catalog");
+  }
+  const edited = row.edited
+    ? '<span class="src-edited" aria-label="edited">*</span>' : "";
+  return `<span class="src-mark" data-tip="${esc(label)}${row.edited ? " — edited" : ""}">` +
+    `${glyph}${edited}</span>`;
 }
 
 // tiny image marker: present when the entry has photos; click -> Info panel
@@ -4814,6 +4847,7 @@ async function applyEditPatch(row, patch) {
   if (!entry) return false;
   trackChecked(label, row.id, () => {
     entry.book = Object.assign({}, entry.book, patch);
+    entry.edited = true;
     entry.checks = null;
     entry.scans = null;
     entry.verify = null;
@@ -5728,6 +5762,7 @@ async function repopulateCheckedRow(rec) {
   if (!entry) return;
   trackChecked(label, row.id, () => {
     entry.book = Object.assign({}, entry.book, vals);
+    entry.edited = true;
     entry.checks = null;
     entry.scans = null;
     entry.verify = null;
@@ -5854,6 +5889,7 @@ function updateCheckedBook(id, fields) {
   if (!entry) return;
   trackChecked(`edit ${(fields.title || entry.book.title || "").slice(0, 36)}`, id, () => {
     entry.book = Object.assign({}, entry.book, fields);
+    entry.edited = true;
     entry.checks = null; entry.scans = null; entry.verify = null;
     queueScan(id);
   });
@@ -6028,7 +6064,7 @@ async function patchManualFields(id, fields) {
   const res = await fetch(`/api/manual/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(fields),
+    body: JSON.stringify(Object.assign({}, fields, { _edited: true })),
   });
   const data = await res.json().catch(() => ({}));
   if (res.ok && data.ok) {
@@ -6081,6 +6117,7 @@ async function saveBookEditTab(ev) {
     trackChecked(`edit ${vals.title.slice(0, 36)}`, t.id, () => {
       entry.book = Object.assign({}, entry.book, vals,
                                  { category_ids: catIds });
+      entry.edited = true;
       entry.checks = null;
       entry.scans = null;
       entry.verify = null;
@@ -6102,6 +6139,7 @@ async function saveBookEditTab(ev) {
     const base = (state.chBooks || []).find((x) => x.idx === t.idx) || {};
     state.checked.set(key, {
       book: parseBook(Object.assign({ idx: t.idx }, base, prev.book || {}, vals)),
+      edited: true,
       checks: null, scans: null, verify: null, manual_urls: null,
     });
     queueScan(key);
@@ -7527,13 +7565,15 @@ const anJobs = new Map();      // job id -> {kind, buildId}
 let anPollTimer = null;
 
 function anSelected() {
-  return state.anSel && state.builds[state.anSel] ? state.builds[state.anSel] : null;
+  const b = state.anSel && state.builds[state.anSel] ? state.builds[state.anSel] : null;
+  return b && anAnalyzable(b) ? b : null;
 }
 
 function anAnalyzable(b) { return b.status === "ready" || b.status === "uploaded"; }
 
 async function renderAnalyze() {
   await loadBuilds();
+  if (state.anSel && !anAnalyzable(state.builds[state.anSel] || {})) state.anSel = null;
   renderAnList();
   renderAnMain();
   updateAnProvider();
@@ -7561,18 +7601,17 @@ async function updateAnProvider() {
 function renderAnList() {
   const ul = el("an-list");
   const items = Object.values(state.builds)
+    .filter(anAnalyzable)
     .sort((a, b) => (a.title || "").localeCompare(b.title || ""));
   ul.innerHTML = items.map((b) => {
-    const ok = anAnalyzable(b);
     const sel = state.anSel === b.id;
-    return `<li class="build-item an-item${sel ? " active" : ""}${ok ? "" : " an-locked"}"
-      data-id="${esc(b.id)}" ${ok ? "" : 'data-tip="Mark it verified in the Editor first"'}>
+    return `<li class="build-item an-item${sel ? " active" : ""}"
+      data-id="${esc(b.id)}">
       <div class="bi-title">${esc(b.title || "(untitled)")}</div>
       <div class="bi-meta">${esc(b.authors || "")}${b.year ? " · " + esc(b.year) : ""}
         · ${b.status === "uploaded" ? "published" : esc(b.status)}</div></li>`;
-  }).join("") || `<li class="empty">No entries yet — create one in the Editor.</li>`;
-  const verified = items.filter(anAnalyzable).length;
-  el("an-count").textContent = items.length ? `${verified} verified` : "";
+  }).join("") || `<li class="empty">No verified entries available.</li>`;
+  el("an-count").textContent = items.length ? `${items.length} available` : "";
 }
 
 function anSelect(id) {
@@ -8736,6 +8775,15 @@ function infoRow(label, valueHtml, cls) {
     `<span class="info-v">${valueHtml}</span></div>`;
 }
 
+function infoExtraValue(value) {
+  if (value == null) return "";
+  if (typeof value === "object") {
+    try { return JSON.stringify(value, null, 2); }
+    catch (e) { return String(value); }
+  }
+  return String(value);
+}
+
 // The records behind the copyright tag, spelled out: the registration (whether
 // found in a register or merely cited by the renewal), and the renewal itself.
 function infoCopyright(b, status) {
@@ -8858,7 +8906,7 @@ function renderInfoPane() {
   if (Object.keys(extra).length) {
     h += `<div class="info-sec"><div class="info-sec-h">Extra</div>`;
     for (const k of Object.keys(extra).sort())
-      h += infoRow(k.replace(/_/g, " "), esc(extra[k]));
+      h += infoRow(k.replace(/_/g, " "), esc(infoExtraValue(extra[k])));
     h += `</div>`;
   }
   // associated photos: thumbnails, click for full size

@@ -5,7 +5,8 @@ sources so a book can show whether an original copyright registration exists:
 
   - cprs : the U.S. Copyright Office public records system
            (https://publicrecords.copyright.gov) via its simple_search_dsl API,
-           which covers pre-1978 Catalog of Copyright Entries card records.
+           which covers registrations from 1978 to the present as well as the
+           historical card records currently included by CPRS.
   - nypl : the NYPL "Catalog of Copyright Entries" registrations dataset
            (books 1923-1964); optional, wired when the dataset is present.
 
@@ -42,6 +43,62 @@ def _first(v):
     return v or ""
 
 
+def _cprs_query(title: str, author: str = "") -> str:
+    """Build a CPRS phrase query so common title words do not swamp results."""
+    phrase = lambda value: '"' + str(value).replace('"', " ").strip() + '"'
+    parts = [phrase(title)]
+    if str(author or "").strip():
+        parts.append(phrase(author))
+    return " ".join(parts)
+
+
+def _cprs_titles(hit: dict) -> list[str]:
+    """Return title candidates from both CPRS card and post-1978 schemas."""
+    values = hit.get("title_of_work") or []
+    titles = list(values if isinstance(values, list) else [values])
+    for item in hit.get("primary_titles_list") or []:
+        if not isinstance(item, dict):
+            continue
+        proper = item.get("title_primary_title_title_proper")
+        if proper:
+            titles.append(str(proper))
+    for item in hit.get("title_application_list") or []:
+        if isinstance(item, dict) and item.get("title_application_title"):
+            titles.append(str(item["title_application_title"]))
+    if not titles and hit.get("title_concatenated"):
+        titles.append(str(hit["title_concatenated"]))
+    return list(dict.fromkeys(t for t in titles if t))
+
+
+def _cprs_authors(hit: dict) -> str:
+    """Return author text from both CPRS card and post-1978 schemas."""
+    values = hit.get("author") or []
+    authors = list(values if isinstance(values, list) else [values])
+    if not authors:
+        for person in (hit.get("display_names") or {}).get("persons") or []:
+            if (isinstance(person, dict)
+                    and "author" in (person.get("roles") or [])
+                    and person.get("name")):
+                authors.append(person["name"])
+    if not authors:
+        for item in hit.get("author_statement_list") or []:
+            if isinstance(item, dict) and item.get("author_full_name"):
+                authors.append(item["author_full_name"])
+    return "; ".join(str(a).strip() for a in authors if str(a).strip())
+
+
+def _cprs_is_book(hit: dict) -> bool:
+    work = hit.get("cc_type_of_work") or hit.get("type_of_work") or ""
+    allwork = hit.get("all_type_of_work") or []
+    classes = hit.get("registration_class") or []
+    allwork = allwork if isinstance(allwork, list) else [allwork]
+    classes = classes if isinstance(classes, list) else [classes]
+    kinds = {str(v).lower() for v in [work, *allwork, *classes] if v}
+    if not kinds:
+        return True
+    return bool(kinds & {"book", "text", "tx"})
+
+
 def cprs_registration(title: str, author: str = "", year_value=None,
                       timeout: float = 12.0) -> dict | None:
     """Best matching book REGISTRATION on publicrecords.copyright.gov, or None.
@@ -53,8 +110,11 @@ def cprs_registration(title: str, author: str = "", year_value=None,
     title = str(title or "").strip()
     if not title:
         return None
-    params = urllib.parse.urlencode(
-        {"query": title, "records_per_page": "40", "page_number": "0"})
+    params = urllib.parse.urlencode({
+        "query": _cprs_query(title, author),
+        "records_per_page": "40",
+        "page_number": "0",
+    })
     req = urllib.request.Request(
         CPRS_SEARCH_URL + "?" + params,
         headers={"User-Agent": _UA, "Accept": "application/json"})
@@ -63,25 +123,27 @@ def cprs_registration(title: str, author: str = "", year_value=None,
             data = json.loads(resp.read().decode("utf-8", "replace"))
     except Exception:
         return None
-    for row in (data.get("data") or []):
+    target_year = None
+    match = re.search(r"\b(1[5-9]\d{2}|20\d{2})\b", str(year_value or ""))
+    if match:
+        target_year = int(match.group(1))
+    candidates: list[tuple[int, int, dict]] = []
+    for position, row in enumerate(data.get("data") or []):
         hit = row.get("hit") or {}
         if hit.get("type_of_record") != "registration":
             continue
-        work = hit.get("cc_type_of_work") or ""
-        allwork = hit.get("all_type_of_work") or []
-        if work and work not in ("book", "text") and "book" not in allwork:
+        if not _cprs_is_book(hit):
             continue
-        authors = hit.get("author") or []
-        cand_author = ("; ".join(a for a in authors if a)
-                       if isinstance(authors, list) else str(authors or ""))
-        titles = hit.get("title_of_work") or []
-        for ct in (titles if isinstance(titles, list) else [titles]):
+        cand_author = _cprs_authors(hit)
+        for ct in _cprs_titles(hit):
             if ct and cc.title_author_match(title, author, str(ct), cand_author):
                 regnum = (hit.get("copyright_number_for_display")
                           or _first(hit.get("registration_number")))
                 ryear = (hit.get("first_published_date_as_year")
-                         or hit.get("fee_date_as_year") or "")
-                return {
+                         or hit.get("publication_date_as_year")
+                         or hit.get("fee_date_as_year")
+                         or str(hit.get("registration_date") or "")[:4])
+                result = {
                     "source": "cprs",
                     "reg_number": str(regnum or "").strip(),
                     "title": str(ct),
@@ -89,7 +151,16 @@ def cprs_registration(title: str, author: str = "", year_value=None,
                     "year": str(ryear or "").strip(),
                     "record_id": hit.get("public_records_id") or "",
                 }
-    return None
+                found_year = None
+                ymatch = re.search(r"\b(1[5-9]\d{2}|20\d{2})\b", result["year"])
+                if ymatch:
+                    found_year = int(ymatch.group(1))
+                distance = (abs(found_year - target_year)
+                            if target_year is not None and found_year is not None
+                            else 10_000)
+                candidates.append((distance, position, result))
+                break
+    return min(candidates, default=(0, 0, None))[2]
 
 
 # --- NYPL Catalog of Copyright Entries (books 1923-1963) --------------------

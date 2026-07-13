@@ -11,7 +11,7 @@
     android:paddingEnd="12dp"
     android:paddingTop="9dp"
     android:paddingBottom="9dp"
-    android:background="?android:attr/selectableItemBackground">
+    android:background="@drawable/whl_row">
 
     <CheckBox
         android:id="@+id/selected"

@@ -11,7 +11,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.whl.bookcapture.databinding.ActivityLoginBinding
 
-/** The same account as the desktop app; the session persists on the device,
+/** A Library Tool account; it may be the desktop account or a contributor
+ *  account linked to it by the library. The session persists on the device,
  *  so this screen appears once, not per use. Email/password or an OAuth
  *  provider (Google/GitHub) — both land in the same stored session. */
 class LoginActivity : AppCompatActivity() {

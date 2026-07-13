@@ -318,7 +318,9 @@ indexes load once at server start):
   without one the renewal half stays blue. Both halves name their records in the
   tooltip, and the Info pane spells them out in full.
 
-  A registration record comes from either of two places: the online lookup, or
+  A registration record comes from either of two places: the Copyright Public
+  Records System online lookup (post-1978 registrations plus the historical
+  card records CPRS has digitized), or
   the renewal record itself, which cites the registration it renews (`OREG` +
   `ODAT`). A renewal cannot exist without a registration, so that citation *is*
   a record — Hollingsworth's *Flower Chronicles* renews `A343340`, which no
