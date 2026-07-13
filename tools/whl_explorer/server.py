@@ -3792,6 +3792,24 @@ def api_tesseract_check():
     """Is local (Tesseract) OCR available? The first-run wizard and the OCR
     settings surface this. Checks the configured path, the Windows default, and
     PATH; reports the version when found."""
+    bridge_error = _tesseract_bridge_error()
+    if bridge_error:
+        return jsonify({"ok": True, "installed": False, "path": "", "version": "",
+                        "error": bridge_error})
+    return _tesseract_status()
+
+
+def _tesseract_bridge_error() -> str:
+    """Return why the Python bridge cannot load, or an empty string."""
+    try:
+        import pytesseract  # noqa: F401 -- availability is what this probes
+    except ImportError as exc:
+        return f"Python OCR bridge unavailable: {exc}"
+    return ""
+
+
+def _tesseract_status():
+    """Continue the executable probe after the bridge has loaded."""
     import shutil
     import subprocess
     cfg_path = str(_client_settings().get("ocrTesseract") or "").strip()

@@ -40,6 +40,7 @@ datas = [(s, d) for (s, d) in _candidates if os.path.exists(s)]
 hiddenimports = (
     collect_submodules("fitz")            # PyMuPDF
     + collect_submodules("pypdf")
+    + collect_submodules("pytesseract")
     + ["flask", "jinja2", "openpyxl", "openpyxl.cell._writer", "sqlite3"]
 )
 

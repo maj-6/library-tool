@@ -23,13 +23,17 @@ dependencies = [
     "Flask>=3.0",
     "pypdf>=5.0",
     "PyMuPDF>=1.24",
+    # The desktop's default OCR engine imports this at job runtime. Keeping it
+    # optional made the frozen sidecar pass its executable check, then fail as
+    # soon as the background worker tried to import the bridge.
+    "pytesseract>=0.3.13",
 ]
 
 [project.optional-dependencies]
 # These back lazy in-function imports; missing ones degrade features at
 # runtime. The frozen sidecar build must install every extra it intends to
 # ship (desktop/package.json build:sidecar) — PyInstaller only warns.
-ocr = ["pytesseract"]
+ocr = []
 aws = ["boto3"]
 sheets = ["google-api-python-client", "google-auth"]
 capture = ["opencv-python-headless", "numpy"]
