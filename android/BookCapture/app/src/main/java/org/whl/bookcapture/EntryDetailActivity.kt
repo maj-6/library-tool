@@ -6,8 +6,10 @@ import android.view.View
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
+import androidx.work.WorkManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -21,11 +23,16 @@ class EntryDetailActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityEntryDetailBinding
     private var photoJob: Job? = null
+    private var instructionsLoadedFor: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityEntryDetailBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        binding.resubmit.setOnClickListener { resubmit() }
+        WorkManager.getInstance(this)
+            .getWorkInfosForUniqueWorkLiveData("capture-process")
+            .observe(this) { render() }
     }
 
     override fun onResume() {
@@ -64,6 +71,19 @@ class EntryDetailActivity : AppCompatActivity() {
         val ocr = entry.ocrText()
         binding.ocrText.text = ocr.ifEmpty { getString(R.string.detail_no_ocr) }
 
+        if (instructionsLoadedFor != entry.id && !binding.customInstructions.hasFocus()) {
+            binding.customInstructions.setText(entry.customInstructions())
+            instructionsLoadedFor = entry.id
+        }
+        val pending = entry.reprocessPending()
+        val error = entry.reprocessError()
+        binding.resubmit.isEnabled = !pending
+        binding.reprocessState.text = when {
+            pending -> getString(R.string.detail_reprocessing)
+            error.isNotEmpty() -> getString(R.string.detail_reprocess_error, error)
+            else -> ""
+        }
+
         // pages, decoded off the UI thread at thumbnail scale. Cancel any decode
         // still running from a previous render (a second onResume) so its views
         // can't append onto the freshly-cleared strip and duplicate pages.
@@ -89,10 +109,27 @@ class EntryDetailActivity : AppCompatActivity() {
         // discard is for what has not shipped; the cloud copy is the desktop's
         binding.discard.visibility = if (entry.uploaded) View.GONE else View.VISIBLE
         binding.discard.setOnClickListener {
-            if (Prefs.currentEntryId(this) == entry.id) Prefs.setCurrentEntryId(this, null)
-            entry.dir.deleteRecursively()
+            Entries.deleteLocal(this, entry)
             finish()
         }
+    }
+
+    private fun resubmit() {
+        val entry = Entries.find(this, intent.getStringExtra(EXTRA_ID) ?: "") ?: return
+        if (Prefs.deepseekKey(this).isEmpty()) {
+            Toast.makeText(this, R.string.detail_need_deepseek, Toast.LENGTH_LONG).show()
+            return
+        }
+        if (entry.ocrText().isEmpty()) {
+            Toast.makeText(this, R.string.detail_need_ocr, Toast.LENGTH_LONG).show()
+            return
+        }
+        entry.setCustomInstructions(binding.customInstructions.text.toString())
+        entry.requestReprocess()
+        Prefs.setLastProcError(this, null)
+        ProcessWorker.enqueue(this, entry.id)
+        render()
+        Toast.makeText(this, R.string.detail_reprocess_queued, Toast.LENGTH_SHORT).show()
     }
 
     private fun fieldRow(label: String, value: String): View {

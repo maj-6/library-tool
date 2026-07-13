@@ -13,6 +13,15 @@
     android:paddingBottom="9dp"
     android:background="?android:attr/selectableItemBackground">
 
+    <CheckBox
+        android:id="@+id/selected"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginEnd="7dp"
+        android:buttonTint="@color/whl_cyan"
+        android:visibility="gone"
+        android:contentDescription="@string/home_select_scan" />
+
     <ImageView
         android:id="@+id/thumb"
         android:layout_width="46dp"

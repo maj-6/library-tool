@@ -8,6 +8,19 @@
     <string name="home_subtitle">recent scans</string>
     <string name="home_new_scan">＋  New scan</string>
     <string name="home_empty">No scans yet.\nTap “New scan” to photograph a book.</string>
+    <string name="home_select">SELECT</string>
+    <string name="home_select_scan">Select scan</string>
+    <plurals name="home_selected_count">
+        <item quantity="one">%1$d selected</item>
+        <item quantity="other">%1$d selected</item>
+    </plurals>
+    <string name="home_delete_selected">DELETE</string>
+    <string name="home_cancel_select">CANCEL</string>
+    <string name="home_delete_title">Delete selected scans?</string>
+    <plurals name="home_delete_message">
+        <item quantity="one">Deletes %1$d local phone scan. Uploaded and imported cloud copies are not deleted.</item>
+        <item quantity="other">Deletes %1$d local phone scans. Uploaded and imported cloud copies are not deleted.</item>
+    </plurals>
 
     <string name="entry_idle">IDLE</string>
     <string name="entry_active">OPEN (%1$d)</string>
@@ -75,4 +88,12 @@
     <string name="detail_ocr">OCR text</string>
     <string name="detail_discard">DISCARD ENTRY</string>
     <string name="detail_no_ocr">(no OCR text yet)</string>
+    <string name="detail_deepseek_instructions">DeepSeek instructions</string>
+    <string name="detail_deepseek_hint">Optional corrections or guidance for this book</string>
+    <string name="detail_resubmit">SAVE &amp; REPROCESS</string>
+    <string name="detail_reprocessing">Reprocessing with DeepSeek…</string>
+    <string name="detail_reprocess_error">Last attempt failed: %1$s</string>
+    <string name="detail_need_deepseek">Add a DeepSeek API key in Settings first.</string>
+    <string name="detail_need_ocr">OCR text is required before reprocessing.</string>
+    <string name="detail_reprocess_queued">DeepSeek reprocessing queued.</string>
 </resources>

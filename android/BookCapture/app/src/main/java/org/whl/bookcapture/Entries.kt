@@ -3,6 +3,8 @@ package org.whl.bookcapture
 import android.content.Context
 import org.json.JSONObject
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 
 /**
  * The on-disk life of an entry, read side. Folders move through:
@@ -22,6 +24,9 @@ import java.io.File
 object Entries {
 
     const val KEEP_SENT = 15    // uploaded entries kept for the recent list
+    const val REPROCESS_PENDING = "reprocess.pending"
+    private const val INSTRUCTIONS = "instructions.txt"
+    private const val REPROCESS_ERROR = "reprocess.error"
 
     class Entry(
         val id: String,
@@ -45,6 +50,31 @@ object Entries {
             val t = File(dir, p.name + ".txt").takeIf { it.isFile }?.readText()?.trim()
             if (t.isNullOrEmpty()) null else "--- Photo ${i + 1} ---\n$t"
         }.joinToString("\n\n")
+
+        fun customInstructions(): String =
+            File(dir, INSTRUCTIONS).takeIf { it.isFile }?.readText()?.trim() ?: ""
+
+        fun setCustomInstructions(value: String) {
+            val text = value.trim()
+            val target = File(dir, INSTRUCTIONS)
+            if (text.isEmpty()) target.delete() else Entries.atomicWrite(target, text)
+        }
+
+        fun reprocessPending(): Boolean = File(dir, REPROCESS_PENDING).isFile
+        fun reprocessError(): String =
+            File(dir, REPROCESS_ERROR).takeIf { it.isFile }?.readText()?.trim() ?: ""
+
+        fun requestReprocess() {
+            File(dir, REPROCESS_ERROR).delete()
+            File(dir, REPROCESS_PENDING).writeText("")
+        }
+
+        fun finishReprocess(error: String? = null) {
+            File(dir, REPROCESS_PENDING).delete()
+            val errorFile = File(dir, REPROCESS_ERROR)
+            if (error.isNullOrBlank()) errorFile.delete()
+            else Entries.atomicWrite(errorFile, error.trim())
+        }
     }
 
     fun queueRoot(ctx: Context): File = File(ctx.filesDir, "queue").apply { mkdirs() }
@@ -61,6 +91,13 @@ object Entries {
         val q = File(queueRoot(ctx), id)
         val s = File(sentRoot(ctx), id)
         return load(ctx, if (q.isDirectory) q else s)
+    }
+
+    /** Remove only this device's browsing/queue copy. Uploaded cloud captures
+     *  and desktop imports are intentionally left alone. */
+    fun deleteLocal(ctx: Context, entry: Entry) {
+        if (Prefs.currentEntryId(ctx) == entry.id) Prefs.setCurrentEntryId(ctx, null)
+        entry.dir.deleteRecursively()
     }
 
     private fun load(ctx: Context, dir: File): Entry? {
@@ -112,6 +149,17 @@ object Entries {
         dirs.sortedByDescending { load(ctx, it)?.createdAt ?: 0L }
             .drop(KEEP_SENT)
             .forEach { it.deleteRecursively() }
+    }
+
+    fun atomicWrite(target: File, text: String) {
+        val tmp = File(target.parentFile, target.name + ".tmp")
+        tmp.writeText(text)
+        try {
+            Files.move(tmp.toPath(), target.toPath(),
+                StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+        } catch (_: Exception) {
+            Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+        }
     }
 }
 

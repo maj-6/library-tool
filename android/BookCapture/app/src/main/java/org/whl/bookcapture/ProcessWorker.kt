@@ -9,6 +9,7 @@ import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import androidx.work.workDataOf
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -29,12 +30,15 @@ import java.util.concurrent.TimeUnit
 class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
 
     companion object {
-        fun enqueue(ctx: Context) {
-            val req = OneTimeWorkRequestBuilder<ProcessWorker>()
+        private const val KEY_ENTRY_ID = "entry_id"
+
+        fun enqueue(ctx: Context, entryId: String? = null) {
+            val builder = OneTimeWorkRequestBuilder<ProcessWorker>()
                 .setConstraints(
                     Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 15, TimeUnit.SECONDS)
-                .build()
+            if (!entryId.isNullOrEmpty()) builder.setInputData(workDataOf(KEY_ENTRY_ID to entryId))
+            val req = builder.build()
             // APPEND_OR_REPLACE: a photo taken mid-run chains one more pass
             // (each pass rescans everything, so one queued run is enough)
             WorkManager.getInstance(ctx)
@@ -46,10 +50,14 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
         val ctx = applicationContext
         val mistral = Prefs.mistralKey(ctx)
         val deepseek = Prefs.deepseekKey(ctx)
+        val requestedId = inputData.getString(KEY_ENTRY_ID)?.takeIf { it.isNotBlank() }
         var transient = false
         var permanent: String? = null
 
-        for (dir in Entries.queueRoot(ctx).listFiles { f: File -> f.isDirectory } ?: emptyArray()) {
+        val dirs = requestedId?.let { id -> Entries.find(ctx, id)?.let { listOf(it.dir) } ?: emptyList() }
+            ?: (Entries.queueRoot(ctx).listFiles { f: File -> f.isDirectory }?.toList() ?: emptyList())
+        for (dir in dirs) {
+            val forced = requestedId == dir.name
             val photos = dir.listFiles { f -> f.isFile && f.name.matches(PHOTO_NAME) }
                 ?.sortedBy { photoNumber(it.name) } ?: continue
             for (photo in photos) {
@@ -76,20 +84,41 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
             }
             // extraction: sealed, has text, not yet extracted
             if (!File(dir, "manifest.json").isFile) continue
-            if (File(dir, "meta.json").isFile) continue
+            if (File(dir, "meta.json").isFile && !forced) continue
             if (mistral.isEmpty() && deepseek.isEmpty()) continue
             val entry = Entries.find(ctx, dir.name) ?: continue
+            if (forced && deepseek.isEmpty()) {
+                val message = "DeepSeek API key is missing"
+                entry.finishReprocess(message)
+                permanent = message
+                continue
+            }
             val text = entry.ocrText()
             // wait for every photo's OCR before extracting, else the fields
             // come from half a title page and never get revised
-            if (text.isEmpty() || photos.any { !File(dir, it.name + ".txt").isFile }) continue
+            if (text.isEmpty() || photos.any { !File(dir, it.name + ".txt").isFile }) {
+                if (forced) {
+                    val message = permanent ?: if (mistral.isEmpty())
+                        "OCR is incomplete; add a Mistral key and try again"
+                    else {
+                        transient = true
+                        null
+                    }
+                    if (message != null) {
+                        entry.finishReprocess(message)
+                        permanent = message
+                    }
+                }
+                continue
+            }
             try {
-                val meta = Pipeline.extract(text, deepseek, mistral)
-                val tmp = File(dir, "meta.json.tmp")
-                tmp.writeText(meta.toString())
-                tmp.renameTo(File(dir, "meta.json"))
+                val meta = Pipeline.extract(text, deepseek, mistral, entry.customInstructions())
+                Entries.atomicWrite(File(dir, "meta.json"), meta.toString())
+                entry.finishReprocess()
             } catch (e: Pipeline.PermanentError) {
-                permanent = "extract: ${e.message?.take(120)}"
+                val message = "extract: ${e.message?.take(120)}"
+                if (forced) entry.finishReprocess(message)
+                permanent = message
             } catch (e: Exception) {
                 transient = true
             }
