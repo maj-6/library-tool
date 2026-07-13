@@ -353,9 +353,12 @@ function runUpdateGate() {
     };
 
     const theme = readActiveTheme();
-    // Set this explicitly: electron-updater otherwise enables prereleases by
-    // default when the installed app version itself has a prerelease suffix.
-    updater.allowPrerelease = prefs.prerelease;
+    // A machine already running an alpha/beta/rc must keep following that
+    // prerelease line automatically. The preference is only the stable-build
+    // opt-in; using it as an unconditional override stranded alpha.5 because
+    // its default false made electron-updater search only the stable channel.
+    const installedPrerelease = app.getVersion().includes("-");
+    updater.allowPrerelease = installedPrerelease || prefs.prerelease;
     updater.autoDownload = false;                 // probe first, then decide
     updater.autoInstallOnAppQuit = true;          // if we fall through mid-download, install on next quit
 
