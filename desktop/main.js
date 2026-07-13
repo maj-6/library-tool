@@ -151,7 +151,7 @@ function createStartupWindow(theme) {
   startupWin = new BrowserWindow({
     width: 400, height: 150,
     resizable: false, movable: true, minimizable: false, maximizable: false,
-    center: true, frame: false, show: false, skipTaskbar: false,
+    center: true, frame: false, roundedCorners: false, show: false, skipTaskbar: false,
     title: "Starting Library Tool",
     backgroundColor: "#fbf7ee",
     webPreferences: {
