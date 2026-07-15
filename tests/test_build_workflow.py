@@ -31,6 +31,77 @@ def test_verified_build_without_folder_is_listed_for_ocr(client):
     assert entries[created["id"]]["ocr"] == []
 
 
+def test_captured_metadata_survives_build_creation_and_manifest(client, data_root):
+    photo = data_root / "captures" / "capture-01" / "photo_1.jpg"
+    photo.parent.mkdir(parents=True, exist_ok=True)
+    photo.write_bytes(b"captured-photo")
+
+    response = client.post("/api/builds", json={"build": {
+        "title": "Captured Work",
+        "status": "ready",
+        "capture_id": "capture-01",
+        "images": [
+            "captures/capture-01/photo_1.jpg",
+            "captures/capture-01/photo_1.jpg",
+            "../outside.jpg",
+            "/captures/capture-01/photo_1.jpg",
+            "C:/captures/capture-01/photo_1.jpg",
+            "captures/capture-01/not-an-image.txt",
+        ],
+        "extra": {
+            "binding": {"material": "  cloth  ", "empty": " "},
+            "copy_count": 2,
+            "missing": None,
+        },
+    }})
+
+    assert response.status_code == 200
+    build = response.get_json()["build"]
+    assert build["capture_id"] == "capture-01"
+    assert build["images"] == ["captures/capture-01/photo_1.jpg"]
+    assert build["extra"] == {
+        "binding": {"material": "cloth"},
+        "copy_count": 2,
+    }
+
+    manifest = client.get(f"/api/builds/{build['id']}/folder").get_json()
+    assert manifest["captured_images"] == [{
+        "name": "photo_1.jpg",
+        "path": "captures/capture-01/photo_1.jpg",
+        "size": len(b"captured-photo"),
+        "available": True,
+    }]
+    served = client.get(
+        "/api/capture/image?path=captures%2Fcapture-01%2Fphoto_1.jpg")
+    assert served.status_code == 200
+    assert served.data == b"captured-photo"
+
+
+def test_full_text_manifest_disambiguates_root_and_directory_files(client):
+    build = client.post("/api/builds", json={"build": {
+        "title": "Two full text artifacts",
+        "status": "ready",
+    }}).get_json()["build"]
+    entry = server._entry_dir(build["id"])
+    (entry / "full_text").mkdir(parents=True, exist_ok=True)
+    (entry / "full_text.txt").write_text("root text", encoding="utf-8")
+    (entry / "full_text" / "full_text.txt").write_text(
+        "directory text", encoding="utf-8")
+
+    manifest = client.get(f"/api/builds/{build['id']}/folder").get_json()
+    assert [(row["name"], row["artifact"]) for row in manifest["full_text"]] == [
+        ("full_text.txt", "full_text.txt"),
+        ("full_text.txt", "full_text/full_text.txt"),
+    ]
+
+    root = client.get(
+        f"/api/builds/{build['id']}/artifact/full_text/full_text.txt")
+    nested = client.get(
+        f"/api/builds/{build['id']}/artifact/full_text/full_text/full_text.txt")
+    assert root.get_json()["text"] == "root text"
+    assert nested.get_json()["text"] == "directory text"
+
+
 def test_analyze_summary_updates_editor_description(data_root):
     server.BUILDS_PATH.parent.mkdir(parents=True, exist_ok=True)
     server.BUILDS_PATH.write_text(json.dumps({

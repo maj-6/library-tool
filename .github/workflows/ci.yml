@@ -29,6 +29,11 @@ jobs:
           python-version: "3.13"
           cache: pip
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - name: Install (runtime deps + dev tools, from pyproject.toml)
         run: python -m pip install -e ".[dev]"
 
@@ -37,3 +42,8 @@ jobs:
 
       - name: Test
         run: python -m pytest -q
+
+      - name: JavaScript checks
+        run: |
+          node --check tools/whl_explorer/static/app.js
+          node --test tests/publish_tree_behavior.test.js

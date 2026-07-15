@@ -61,10 +61,20 @@ alter table captures enable row level security;
 alter table capture_ingest_grants enable row level security;
 alter table books    enable row level security;   -- no policy: service_role only
 
+-- Data API table privileges are explicit. Supabase no longer guarantees that
+-- new public tables inherit grants, and a policy cannot run when the role has
+-- no table privilege. Keep grants least-privilege and next to the RLS setup.
+revoke all on public.captures from anon, authenticated;
+grant select, insert, update on public.captures to authenticated;
+grant select, insert, update, delete on public.captures to service_role;
+revoke all on public.books from anon, authenticated;
+grant select, insert, update, delete on public.books to service_role;
+
 -- Grant rows are maintainer-managed. Authenticated clients may only inspect
 -- grants assigned to their own desktop account and cannot create/edit them.
 revoke all on capture_ingest_grants from anon, authenticated;
 grant select on capture_ingest_grants to authenticated;
+grant select, insert, update, delete on public.capture_ingest_grants to service_role;
 drop policy if exists capture_ingest_grants_select_own on capture_ingest_grants;
 create policy capture_ingest_grants_select_own on capture_ingest_grants
   for select to authenticated using (ingester_id = (select auth.uid()));
@@ -142,6 +152,10 @@ create table if not exists corrections (
 alter table builds      enable row level security;
 alter table ia_catalog  enable row level security;
 alter table corrections enable row level security;
+revoke all on public.builds, public.ia_catalog, public.corrections
+  from anon, authenticated;
+grant select, insert, update, delete
+  on public.builds, public.ia_catalog, public.corrections to service_role;
 
 -- The category taxonomy (output/categories.json) syncs the same way: one row
 -- per node, the node verbatim in `data` ({name, parent}). The taxonomy is a
@@ -154,6 +168,8 @@ create table if not exists taxonomy (
   deleted    boolean not null default false
 );
 alter table taxonomy enable row level security;
+revoke all on public.taxonomy from anon, authenticated;
+grant select, insert, update, delete on public.taxonomy to service_role;
 
 -- =====================================================================
 -- volumes — what the library browser lists
@@ -225,8 +241,12 @@ alter table volumes add column fts tsvector
 create index if not exists volumes_fts_idx  on volumes using gin (fts);
 create index if not exists volumes_year_idx on volumes (year);
 create index if not exists volumes_title_idx on volumes (lower(title));
+create index if not exists volumes_uploaded_by_idx on volumes (uploaded_by);
 
 alter table volumes enable row level security;
+revoke all on public.volumes from anon, authenticated;
+grant select on public.volumes to anon, authenticated;
+grant select, insert, update, delete on public.volumes to service_role;
 
 drop policy if exists volumes_read_all       on volumes;
 drop policy if exists volumes_insert_authed  on volumes;
@@ -286,6 +306,12 @@ create index if not exists volume_notes_page_idx on volume_notes (slug, page);
 alter table volume_texts enable row level security;
 alter table volume_pages enable row level security;
 alter table volume_notes enable row level security;
+revoke all on public.volume_texts, public.volume_pages, public.volume_notes
+  from anon, authenticated;
+grant select on public.volume_texts, public.volume_pages, public.volume_notes
+  to anon, authenticated;
+grant select, insert, update, delete
+  on public.volume_texts, public.volume_pages, public.volume_notes to service_role;
 
 drop policy if exists volume_texts_read_all on volume_texts;
 drop policy if exists volume_pages_read_all on volume_pages;
@@ -310,6 +336,9 @@ create table if not exists author_pages (
   updated_at timestamptz not null default now()
 );
 alter table author_pages enable row level security;
+revoke all on public.author_pages from anon, authenticated;
+grant select on public.author_pages to anon, authenticated;
+grant select, insert, update, delete on public.author_pages to service_role;
 drop policy if exists author_pages_read_all on author_pages;
 create policy author_pages_read_all on author_pages for select using (true);
 -- writes: service_role only, same stance as volume_texts
@@ -325,7 +354,7 @@ create or replace view author_index
   from volumes
   where authors <> ''
   group by authors;
-grant select on author_index to anon;
+grant select on author_index to anon, authenticated, service_role;
 
 -- =====================================================================
 -- releases — the desktop installer and the Android APK
@@ -346,6 +375,9 @@ create table if not exists releases (
 create index if not exists releases_latest_idx on releases (platform, channel, published_at desc);
 
 alter table releases enable row level security;
+revoke all on public.releases from anon, authenticated;
+grant select on public.releases to anon, authenticated;
+grant select, insert, update, delete on public.releases to service_role;
 drop policy if exists releases_read_all on releases;
 create policy releases_read_all on releases for select using (true);
 -- writes: service_role only (it bypasses RLS), so a publish step needs the key
@@ -360,14 +392,25 @@ create table if not exists profiles (
   created_at   timestamptz not null default now()
 );
 alter table profiles enable row level security;
+revoke all on public.profiles from anon, authenticated;
+grant select, insert, update, delete on public.profiles to authenticated;
+grant select, insert, update, delete on public.profiles to service_role;
 drop policy if exists profiles_read_all   on profiles;
 drop policy if exists profiles_read_authed on profiles;
 drop policy if exists profiles_write_self on profiles;
+drop policy if exists profiles_insert_self on profiles;
+drop policy if exists profiles_update_self on profiles;
+drop policy if exists profiles_delete_self on profiles;
 -- `using (true)` with no `to` clause grants PUBLIC, i.e. the anon key the website
 -- ships. Contributor names are not for the open internet: signed-in only.
 create policy profiles_read_authed on profiles for select to authenticated using (true);
-create policy profiles_write_self on profiles
-  for all to authenticated using (id = auth.uid()) with check (id = auth.uid());
+create policy profiles_insert_self on profiles
+  for insert to authenticated with check (id = (select auth.uid()));
+create policy profiles_update_self on profiles
+  for update to authenticated using (id = (select auth.uid()))
+  with check (id = (select auth.uid()));
+create policy profiles_delete_self on profiles
+  for delete to authenticated using (id = (select auth.uid()));
 
 -- Bring-your-own API keys (Mistral, DeepSeek), shared across Android and
 -- desktop by the account rather than pasted into each device. A separate
@@ -379,9 +422,13 @@ create table if not exists profile_secrets (
   updated_at timestamptz not null default now()
 );
 alter table profile_secrets enable row level security;
+revoke all on public.profile_secrets from anon, authenticated;
+grant select, insert, update, delete on public.profile_secrets to authenticated;
+grant select, insert, update, delete on public.profile_secrets to service_role;
 drop policy if exists profile_secrets_own on profile_secrets;
 create policy profile_secrets_own on profile_secrets
-  for all to authenticated using (id = auth.uid()) with check (id = auth.uid());
+  for all to authenticated using (id = (select auth.uid()))
+  with check (id = (select auth.uid()));
 
 -- Append-only: the desktop's output/activity.jsonl, shared. `actor` is a plain
 -- name until accounts land; actor_id is filled once a session is signed in.
@@ -395,15 +442,21 @@ create table if not exists events (
   n        int not null default 1
 );
 create index if not exists events_at_idx on events (at desc);
+create index if not exists events_actor_id_idx on events (actor_id);
 
 alter table events enable row level security;
+revoke all on public.events from anon, authenticated;
+grant select, insert on public.events to authenticated;
+grant select, insert, update, delete on public.events to service_role;
+revoke all on sequence public.events_id_seq from anon, authenticated;
+grant usage, select on sequence public.events_id_seq to authenticated, service_role;
 drop policy if exists events_read_authed   on events;
 drop policy if exists events_insert_authed on events;
 create policy events_read_authed on events for select to authenticated using (true);
 -- actor_id must be the writer's own id: without the check, any signed-in user
 -- could file events under someone else's identity.
 create policy events_insert_authed on events
-  for insert to authenticated with check (actor_id = auth.uid());
+  for insert to authenticated with check (actor_id = (select auth.uid()));
 
 -- =====================================================================
 -- storage buckets
