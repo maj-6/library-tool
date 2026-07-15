@@ -119,6 +119,7 @@ MANUAL_ENTRY_FIELDS = [
     "year",
     "edition",
     "volume",
+    "group_id",
     "language",
     "pages",
     "condition",

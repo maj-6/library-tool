@@ -2109,6 +2109,17 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   background: rgba(35, 176, 57, 0.16);
   box-shadow: inset 3px 0 0 var(--green);
 }
+.build-group {
+  list-style: none;
+  padding: 5px 8px 4px;
+  border-bottom: 1px dotted var(--face-sh2);
+  background: var(--face);
+  cursor: pointer;
+  font-weight: bold;
+}
+.build-group:hover { background: var(--row-hover); }
+.build-group .bi-meta { padding-left: 14px; font-weight: normal; }
+.build-item.volume-member { padding-left: 22px; }
 .bi-row { display: flex; align-items: center; gap: 5px; min-width: 0; }
 .bi-title {
   display: block;

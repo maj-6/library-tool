@@ -169,6 +169,8 @@ create table if not exists volumes (
   publisher        text not null default '',
   publisher_city   text not null default '',
   edition          text not null default '',
+  volume           text not null default '',
+  group_id         text not null default '',
   language         text not null default '',
   pages            int,
   categories       text not null default '',
@@ -194,6 +196,9 @@ create table if not exists volumes (
 -- `categories` text above stays as the human-readable / fts-searchable
 -- rendering of the same paths (" › " within a path, ", " between them).
 alter table volumes add column if not exists category_paths jsonb not null default '[]';
+alter table volumes add column if not exists volume text not null default '';
+alter table volumes add column if not exists group_id text not null default '';
+create index if not exists volumes_group_idx on volumes (group_id) where group_id <> '';
 
 -- What extra published material exists for this volume, so the site can show
 -- affordances without probing: {"about": true, "pages": 312,

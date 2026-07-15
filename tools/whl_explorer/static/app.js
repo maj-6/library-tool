@@ -100,7 +100,7 @@ const WHL_ROW_FIELDS = ["title", "subtitle", "authors", "year", "publisher",
   "pages", "language", "subject", "categories", "description"];
 
 const BUILD_FIELDS = ["title", "subtitle", "authors", "year", "publisher",
-  "publisher_city", "edition", "language", "pages",
+  "publisher_city", "edition", "volume", "group_id", "language", "pages",
   "pdf_source", "pdf_file", "source_url", "notes"];
 
 const state = {
@@ -945,6 +945,7 @@ function normalizeSettings() {
   state.settings.expandSets = !!state.settings.expandSets;
   state.settings.hideVolTitles = !!state.settings.hideVolTitles;
   state.settings.setsBackfilled = !!state.settings.setsBackfilled;
+  state.settings.groupMetadataBackfilled = !!state.settings.groupMetadataBackfilled;
   if (!state.settings.copyrightSources || typeof state.settings.copyrightSources !== "object")
     state.settings.copyrightSources = { cprs: true, nypl: false };
   state.settings.cloudSearchUrl = state.settings.cloudSearchUrl || "";
@@ -3502,6 +3503,7 @@ function manualToBook(e) {
   const book = {
     title: e.title || "", subtitle: e.subtitle || "", author: e.author || "",
     year: e.year || "", edition: e.edition || "", volume: e.volume || "",
+    group_id: e.group_id || "",
     publisher: e.publisher || "", city: e.city || "", language: e.language || "",
     pages: e.pages || "", condition: e.condition || "",
     illustrations: e.illustrations || "", price: e.price || "",
@@ -3554,10 +3556,9 @@ function combinedRows() {
 }
 
 // --- multi-volume sets -------------------------------------------------------
-// Books that share a base title (the title with any volume stripped) and carry
-// a volume number are grouped into a "set". Grouping is derived at render time;
-// only per-set state (defined count + expanded) and the two display prefs are
-// persisted, in settings, so they ride the client_state sync.
+// Books carrying the same metadata group_id and a volume number render as a
+// set. Membership belongs to each book; only presentation state (defined count
+// and expansion) lives in settings.
 
 function volNum(book) {
   const n = parseInt(book && book.volume, 10);
@@ -3573,9 +3574,22 @@ function setBaseTitle(book) {
   return t.trim();
 }
 
-// stable, case/space-insensitive grouping key (base title only, per the spec)
+// stable default association for newly detected legacy volume sets
 function setKeyOf(book) {
   return setBaseTitle(book).toLowerCase().replace(/\s+/g, " ");
+}
+
+// Editor builds carry their association explicitly. The title-derived key is
+// only a default when a volume first enters the Editor; subsequent grouping
+// reads group_id from the book metadata instead of guessing from duplicate
+// titles on every render.
+function buildGroupIdFor(book) {
+  const explicit = String((book && book.group_id) || "").trim();
+  return explicit || (volNum(book) > 0 ? setKeyOf(book) : "");
+}
+
+function groupIdOf(book) {
+  return String((book && book.group_id) || "").trim();
 }
 
 function setsMap() {
@@ -3617,7 +3631,8 @@ function groupSets(rows) {
   const groups = new Map();
   for (const r of rows) {
     if (volNum(r.book) <= 0) continue;
-    const key = setKeyOf(r.book);
+    const key = groupIdOf(r.book);
+    if (!key) continue;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(r);
   }
@@ -3625,7 +3640,7 @@ function groupSets(rows) {
     (groups.get(key) || []).length >= 2 || setDefinedCount(key) >= 2;
   const out = [], emitted = new Set();
   for (const r of rows) {
-    const key = volNum(r.book) > 0 ? setKeyOf(r.book) : null;
+    const key = volNum(r.book) > 0 ? groupIdOf(r.book) : null;
     if (key && isSet(key)) {
       if (emitted.has(key)) continue;   // emit the set at its first member
       emitted.add(key);
@@ -4241,22 +4256,42 @@ async function migrateParsedManual() {
   return changed;
 }
 
-// One-time: declare a multi-volume set for every base title that already has
-// volume-bearing books, so lone volumes and pre-existing multi-volume works
-// render as groups. Settings-only (reversible via the set editor — set the
-// count to 1 to dissolve), and guarded so it runs exactly once.
-function backfillSets() {
-  if (state.settings.setsBackfilled) return 0;
+// One-time: persist group_id on legacy volume-bearing books and retain their
+// existing set count/expansion presentation settings.
+async function backfillSets() {
+  if (state.settings.groupMetadataBackfilled) return 0;
   const rows = combinedRows();
   if (!rows.length) return 0;                 // data not ready — retry on a later pass
   const maxByKey = new Map();
+  let checkedChanged = false;
+  let migrationComplete = true;
   for (const r of rows) {
     const v = volNum(r.book);
     if (v <= 0) continue;
-    const key = setKeyOf(r.book);
+    const key = groupIdOf(r.book) || setKeyOf(r.book);
     if (!key) continue;
+    if (!groupIdOf(r.book)) {
+      if (r.kind === "manual") {
+        try {
+          const res = await fetch(`/api/manual/${encodeURIComponent(r.id)}`, {
+            method: "PATCH", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ group_id: key, _preserve: true }),
+          });
+          const data = await res.json().catch(() => ({}));
+          const i = state.manual.findIndex((e) => e.id === r.id);
+          if (res.ok && data.ok && i >= 0) state.manual[i] = data.entry;
+          else { migrationComplete = false; continue; }
+        } catch (e) { migrationComplete = false; continue; }
+      } else {
+        const entry = state.checked.get(r.id);
+        if (!entry) continue;
+        entry.book = Object.assign({}, entry.book, { group_id: key });
+        checkedChanged = true;
+      }
+    }
     maxByKey.set(key, Math.max(maxByKey.get(key) || 0, v));
   }
+  if (checkedChanged) saveChecked();
   const m = setsMap();
   let n = 0;
   for (const [key, maxVol] of maxByKey) {
@@ -4264,14 +4299,14 @@ function backfillSets() {
     const want = Math.max(setDefinedCount(key), maxVol);
     if (setDefinedCount(key) !== want) { m[key] = Object.assign({}, m[key], { count: want }); n++; }
   }
-  state.settings.setsBackfilled = true;
+  state.settings.groupMetadataBackfilled = migrationComplete;
   saveSettings();                             // one persist for the whole backfill
   return n;
 }
 
 async function migrateParsedEntries() {
   const n = migrateParsedChecked() + (await migrateParsedManual());
-  const s = backfillSets();
+  const s = await backfillSets();
   if (n || s) {
     renderChecked();
     const bits = [];
@@ -4867,15 +4902,25 @@ async function commitEdit(row, field, value) {
   let count = 0;
   if (field === "title") {
     const g = volGroupFromTitle(value);
-    if (g) { patch = { title: g.title, volume: g.volume }; count = g.count; }
+    if (g) {
+      const book = Object.assign({}, row.book, { title: g.title, volume: g.volume });
+      patch = { title: g.title, volume: g.volume,
+                group_id: groupIdOf(row.book) || setKeyOf(book) };
+      count = g.count;
+    }
   } else if (field === "volume") {
     const g = volGroupFromVolume(value);
-    if (g) { patch = { volume: g.volume }; count = g.count; }
+    if (g) {
+      const book = Object.assign({}, row.book, { volume: g.volume });
+      patch = { volume: g.volume,
+                group_id: groupIdOf(row.book) || setKeyOf(book) };
+      count = g.count;
+    }
   }
   const ok = await applyEditPatch(row, patch);
   if (ok && count >= 2) {
-    // set membership is derived from the (stripped) base title + volume number
-    const key = setKeyOf(Object.assign({}, row.book, patch));
+    // group_id is the durable association; the title may change independently
+    const key = patch.group_id || groupIdOf(row.book);
     const m = setsMap();
     const want = key ? Math.max(setDefinedCount(key), count) : 0;
     if (key && setDefinedCount(key) !== want) {
@@ -5873,7 +5918,7 @@ function showEditForms(kind) {
 // current volume rows of a set (share the base key, carry a volume), vol-sorted
 function setMembers(key) {
   return combinedRows()
-    .filter((r) => volNum(r.book) > 0 && setKeyOf(r.book) === key)
+    .filter((r) => volNum(r.book) > 0 && groupIdOf(r.book) === key)
     .sort((a, b) => volNum(a.book) - volNum(b.book));
 }
 
@@ -5923,7 +5968,7 @@ async function ensureSetVolumes(key, count, shared) {
     if (have.has(v)) continue;
     if (await createManualBook({
       title: shared.title, author: shared.author || "",
-      publisher: shared.publisher || "", volume: String(v),
+      publisher: shared.publisher || "", volume: String(v), group_id: key,
     })) created++;
   }
   return created;
@@ -5966,13 +6011,8 @@ async function saveSetEditTab(ev) {
     if (r.kind === "manual") await patchManualFields(r.id, fields);
     else updateCheckedBook(r.id, fields);
   }
-  // a title change re-keys the set; move its persisted state across
-  const newKey = title.toLowerCase().replace(/\s+/g, " ").trim();
-  if (newKey !== t.key) {
-    const m = setsMap();
-    if (m[t.key]) { m[newKey] = m[t.key]; delete m[t.key]; }
-    t.key = newKey;
-  }
+  // Keep the existing metadata association even when the shared title changes.
+  const newKey = t.key;   // stable metadata association; titles may change
   setSetCount(newKey, count);
   const created = await ensureSetVolumes(newKey, count, { title, author, publisher });
   renderChecked();
@@ -5986,11 +6026,11 @@ async function saveSetEditTab(ev) {
 async function promoteRowToSet(rowId, vals, count) {
   const row = state.rowsById.get(String(rowId));
   if (!row) return;
-  if (volNum(row.book) <= 0) {   // the anchor becomes volume 1
-    if (row.kind === "manual") await patchManualFields(rowId, { volume: "1" });
-    else updateCheckedBook(rowId, { volume: "1" });
-  }
   const key = setKeyOf({ title: vals.title });
+  const fields = { group_id: key };
+  if (volNum(row.book) <= 0) fields.volume = "1";   // the anchor becomes volume 1
+  if (row.kind === "manual") await patchManualFields(rowId, fields);
+  else updateCheckedBook(rowId, fields);
   setSetCount(key, count);
   await ensureSetVolumes(key, count,
     { title: vals.title, author: vals.author, publisher: vals.publisher });
@@ -6025,9 +6065,10 @@ function fillBookEditForm(book, showAcquired) {
 // a checked-books / manual row
 // how many volumes the book's set holds today (1 = not a set)
 function bookSetCount(book) {
-  const key = setKeyOf(book);
+  const key = groupIdOf(book);
+  if (!key) return Math.max(volNum(book), 1);
   const members = combinedRows()
-    .filter((r) => volNum(r.book) > 0 && setKeyOf(r.book) === key);
+    .filter((r) => volNum(r.book) > 0 && groupIdOf(r.book) === key);
   const maxVol = members.reduce((m, x) => Math.max(m, volNum(x.book)), 0);
   return Math.max(setDefinedCount(key), maxVol, volNum(book), 1);
 }
@@ -7350,9 +7391,9 @@ function updateDlProgress() {
 const scanQueue = [];
 let scanQueueRunning = false;
 
-function queueScan(id) {
-  if (scanQueue.includes(id)) return;
-  scanQueue.push(id);
+function queueScan(id, autoDownload = true) {
+  if (scanQueue.some((task) => task.id === id)) return;
+  scanQueue.push({ id, autoDownload });
   processScanQueue();
 }
 
@@ -7360,7 +7401,8 @@ async function processScanQueue() {
   if (scanQueueRunning) return;
   scanQueueRunning = true;
   while (scanQueue.length) {
-    const id = scanQueue.shift();
+    const task = scanQueue.shift();
+    const { id } = task;
     const row = rowById(id);
     if (!row || !(row.book.title || "").trim()) continue;
     status(`AUTO SCAN :: ${row.book.title}`);
@@ -7368,7 +7410,7 @@ async function processScanQueue() {
       const scans = await runRowScans(row);
       status(`AUTO SCAN DONE :: ${row.book.title} :: ${scanStatusLine(scans)}`);
       // rowById()'s row has no scans field — pass the freshly-fetched ones
-      maybeAutoDownloadIa({ ...row, scans });   // found an IA source -> background-download it
+      if (task.autoDownload) maybeAutoDownloadIa({ ...row, scans });
     } catch (e) {
       statusErr(`AUTO SCAN FAILED :: ${row.book.title}`);
     }
@@ -7417,7 +7459,7 @@ async function runRowScans(row) {
 async function runScansBatch() {
   const rows = combinedRows().filter((r) => !r.scans);
   if (!rows.length) { status("ALL ROWS ALREADY SCANNED"); return; }
-  for (const row of rows) queueScan(row.id);
+  for (const row of rows) queueScan(row.id, false);
   status(`QUEUED ${rows.length} BOOKS FOR SCANNING`);
 }
 
@@ -7724,7 +7766,11 @@ function anEnsurePolling() {
         } else {
           status(`ANALYZE :: ${meta.kind.toUpperCase()} ${job.status.toUpperCase()}` +
             (job.note ? ` :: ${job.note}` : ""));
-          if (meta.kind === "relevance") await loadBuilds(true);
+          if (meta.kind === "relevance" || meta.kind === "summarize") {
+            await loadBuilds();
+            if (meta.kind === "summarize" && state.buildSel === meta.buildId &&
+                !buildIsDirty()) renderBuildEditor();
+          }
           if (state.anSel === meta.buildId) {
             el("an-msg").textContent = "";
             renderAnPane(activeAnPane());
@@ -8936,7 +8982,7 @@ function renderInfoPane() {
   // the copyright + renewal records behind the tag (works for any book, not
   // just checked rows: the offline status is fetched on demand)
   h += infoCopyright(b, row && row.checks ? row.checks.copyright_status : undefined);
-  const sk = setKeyOf(b), cnt = setDefinedCount(sk), vn = volNum(b);
+  const sk = groupIdOf(b), cnt = sk ? setDefinedCount(sk) : 0, vn = volNum(b);
   if (cnt > 0 || vn > 0) {
     h += `<div class="info-sec"><div class="info-sec-h">Volume set</div>`;
     h += infoRow("This volume", vn ? esc("Volume " + vn) : "—");
@@ -9482,6 +9528,23 @@ async function loadBuilds() {
   try {
     const res = await fetch("/api/builds");
     state.builds = res.ok ? (await res.json()).builds || {} : {};
+    // One-time migration for builds that already had a volume before explicit
+    // group metadata was introduced. Persist the association, then render from
+    // metadata on every subsequent load.
+    for (const b of Object.values(state.builds)) {
+      if (!volNum(b) || String(b.group_id || "").trim()) continue;
+      const groupId = buildGroupIdFor(b);
+      if (!groupId) continue;
+      b.group_id = groupId;
+      try {
+        const patch = await fetch(`/api/builds/${encodeURIComponent(b.id)}`, {
+          method: "PATCH", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ group_id: groupId }),
+        });
+        const data = await patch.json().catch(() => ({}));
+        if (patch.ok && data.ok) state.builds[b.id] = data.build;
+      } catch (e) { /* local display still uses the migrated association */ }
+    }
   } catch (e) { state.builds = {}; }
 }
 
@@ -9516,12 +9579,66 @@ function renderBuildsList() {
   el("builds-empty").hidden = builds.length !== 0;
   el("builds-empty").textContent =
     buildsTab() === "uploaded" ? "Nothing uploaded yet" : "No entries yet";
+  for (const item of editorBuildItems(builds)) {
+    if (item.type === "group") {
+      const li = document.createElement("li");
+      li.className = "build-group";
+      li.dataset.gid = item.id;
+      li.innerHTML = `<span class="bi-row"><span class="bi-title">${
+        item.expanded ? "&#9662;" : "&#9656;"} ${esc(item.title)}</span></span>
+        <span class="bi-meta">${item.total} volume${item.total === 1 ? "" : "s"}${
+          item.members.length === item.total ? "" : ` &middot; ${item.members.length} in this queue`}</span>`;
+      list.appendChild(li);
+      if (item.expanded) {
+        for (const member of item.members) appendBuildListItem(list, member, true);
+      }
+      continue;
+    }
+    appendBuildListItem(list, item.build, false);
+  }
+}
+
+function editorBuildItems(builds) {
+  const allGroups = new Map();
+  for (const b of Object.values(state.builds)) {
+    const id = String(b.group_id || "").trim();
+    if (!id) continue;
+    if (!allGroups.has(id)) allGroups.set(id, []);
+    allGroups.get(id).push(b);
+  }
+  const visibleGroups = new Map();
   for (const b of builds) {
+    const id = String(b.group_id || "").trim();
+    if (!id) continue;
+    if (!visibleGroups.has(id)) visibleGroups.set(id, []);
+    visibleGroups.get(id).push(b);
+  }
+  const out = [], emitted = new Set();
+  for (const b of builds) {
+    const id = String(b.group_id || "").trim();
+    const members = id ? (visibleGroups.get(id) || []) : [];
+    const total = id ? (allGroups.get(id) || []).length : 0;
+    if (total < 2) {
+      out.push({ type: "build", build: b });
+      continue;
+    }
+    if (emitted.has(id)) continue;
+    emitted.add(id);
+    members.sort((a, z) => volNum(a) - volNum(z) ||
+      (a.updated_at || "").localeCompare(z.updated_at || ""));
+    out.push({ type: "group", id, members, total, expanded: setExpanded(id),
+               title: setBaseTitle(members[0]) || id });
+  }
+  return out;
+}
+
+function appendBuildListItem(list, b, grouped) {
     const ready = b.status === "ready";
     const uploaded = b.status === "uploaded";
     const li = document.createElement("li");
     li.className = "build-item" + (b.id === state.buildSel ? " active" : "") +
-      (ready ? " ready" : "") + (b.attention ? " attention" : "");
+      (ready ? " ready" : "") + (b.attention ? " attention" : "") +
+      (grouped ? " volume-member" : "");
     li.dataset.bid = b.id;
     li.dataset.tip = `${b.title || "(untitled)"}\n` +
       `${b.authors ? "Authors: " + b.authors + "\n" : ""}` +
@@ -9539,9 +9656,9 @@ function renderBuildsList() {
               data-tip="${uploaded ? "Uploaded" : ready ? "Verified" : "Draft"}">${
                 uploaded ? ICONS.export : ready ? ICONS.check : ICONS.pencil}</span>
       </span>
-      <span class="bi-meta">${esc(b.authors || "")}${b.authors && b.year ? " &middot; " : ""}${esc(b.year || "")}</span>`;
+      <span class="bi-meta">${b.volume ? `Vol. ${esc(b.volume)} &middot; ` : ""}${
+        esc(b.authors || "")}${b.authors && b.year ? " &middot; " : ""}${esc(b.year || "")}</span>`;
     list.appendChild(li);
-  }
 }
 
 // Publish a verified entry to the Library Tool cloud: its PDF to object
@@ -9650,6 +9767,7 @@ function selectBuild(id) {
   state.buildSel = id;
   renderBuildsList();
   renderBuildEditor();
+  if (activeBuildTab() === "btab-resources") refreshResourcesTab();
 }
 
 async function createBuild(seed, label) {
@@ -9700,7 +9818,8 @@ function buildSeedFromSource(s) {
   }
   return {
     title: s.title, subtitle: s.subtitle, authors: s.author,
-    year: s.year, publisher: s.publisher,
+    year: s.year, publisher: s.publisher, volume: s.volume || "",
+    group_id: buildGroupIdFor(s),
     category_ids: s.category_ids || [],
     pdf_source: pdfUrl, pdf_file: pdfFile, source_url: s.url,
     notes: `Source: ${s.archive}${s.matched_title ? " — " + s.matched_title : ""}`,
@@ -9741,7 +9860,7 @@ async function patchBuild(id, fields, label) {
 async function saveBuildFields(ev) {
   if (ev) ev.preventDefault();
   const id = state.buildSel;
-  if (!id) return;
+  if (!id) return false;
   const fields = {};
   for (const f of BUILD_FIELDS) {
     const input = el("b-" + f);
@@ -9749,6 +9868,7 @@ async function saveBuildFields(ev) {
   }
   fields.category_ids = catPickers["b-categories"].get();
   fields.description = buildDescMd.get();
+  if (fields.volume && !fields.group_id) fields.group_id = buildGroupIdFor(fields);
   // an uploaded entry keeps its status — saving a typo fix must not pull
   // it back into the Pending queue
   const cur0 = currentBuild();
@@ -9758,15 +9878,17 @@ async function saveBuildFields(ev) {
   // saving verifies the currently active OCR file for this book
   const cur = currentBuild();
   if (cur && cur.ocr_active) fields.ocr_verified = cur.ocr_active;
-  if (!fields.title) { el("build-msg").textContent = "Title is required"; return; }
+  if (!fields.title) { el("build-msg").textContent = "Title is required"; return false; }
   if (await patchBuild(id, fields, `edit build ${fields.title.slice(0, 30)}`)) {
     descState.id = id;
     descState.val = fields.description;
     buildDirty = false;
     el("build-msg").textContent = "Saved";
     status(`BUILD SAVED :: ${fields.title}`);
+    return true;
   } else {
     el("build-msg").textContent = "Save failed";
+    return false;
   }
 }
 
@@ -10336,7 +10458,7 @@ function ocrBookList() {
   for (const b of allBuildsSorted()) {
     const folder = (ocrState.books || {})[b.id];
     if (!folder) continue;
-    if (ocrState.verifiedOnly && b.status !== "ready") continue;
+    if (ocrState.verifiedOnly && !anAnalyzable(b)) continue;
     out.push({ build: b, folder });
   }
   return out;
@@ -10396,7 +10518,7 @@ function renderOcrBooks() {
   el("ocr-books-empty").hidden = books.length !== 0;
   el("ocr-filter-verified").classList.toggle("active", ocrState.verifiedOnly);
   for (const { build: b, folder } of books) {
-    const ready = b.status === "ready";
+    const ready = anAnalyzable(b);
     const li = document.createElement("li");
     li.className = "ocr-book" + (b.id === ocrState.book ? " active" : "");
     li.dataset.bid = b.id;
@@ -12929,16 +13051,27 @@ function init() {
     if (!b) return;
     const on = el("b-ready").classList.toggle("active");
     el("b-verified-tag").hidden = !on;
-    // persist immediately (quiet: keep any unsaved field edits) so the badge and
-    // the list check icon never claim a verified state that was not written
-    const newStatus = b.status === "uploaded" ? "uploaded" : (on ? "ready" : "draft");
-    await patchBuildRaw(b.id, { status: newStatus }, true);
+    // Verification is a save action: persist every field and the description,
+    // not just the badge. This also records the active OCR file as verified.
+    const saved = await saveBuildFields();
+    if (!saved) {
+      const cur = currentBuild();
+      const verified = cur && (cur.status === "ready" || cur.status === "uploaded");
+      el("b-ready").classList.toggle("active", !!verified);
+      el("b-verified-tag").hidden = !verified;
+    }
     renderBuildsList();
   });
   el("build-new").addEventListener("click", () => createBuild({}, "(blank)"));
   el("export-builds").addEventListener("click", exportBuilds);
   el("download-upload-list").addEventListener("click", downloadUploadList);
   el("builds-list").addEventListener("click", (ev) => {
+    const group = ev.target.closest("li.build-group");
+    if (group) {
+      setSetExpanded(group.dataset.gid, !setExpanded(group.dataset.gid));
+      renderBuildsList();
+      return;
+    }
     const li = ev.target.closest("li.build-item");
     if (li) selectBuild(li.dataset.bid);
   });
