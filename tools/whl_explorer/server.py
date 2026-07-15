@@ -805,7 +805,8 @@ BUILDS_PATH = lib.OUTPUT_DIR / "whl_builds.json"
 # extraction uses them later); attention flags an entry as needing attention.
 _BUILD_FIELDS = ("published_slug",
                  "title", "subtitle", "authors", "year", "publisher",
-                 "publisher_city", "edition", "language", "pages",
+                 "publisher_city", "edition", "volume", "group_id",
+                 "language", "pages",
                  "categories", "category_ids", "description",
                  "pdf_source", "pdf_file",
                  "pdf_sources", "bundle",
@@ -1695,9 +1696,12 @@ def api_entries():
     the OCR tab's book list doesn't need a request per build."""
     builds = lib.load_json(BUILDS_PATH, {})
     out = {}
-    for bid in builds:
+    for bid, build in builds.items():
         info = _entry_folder_info(bid)
-        if info["exists"]:
+        # Verified entries belong in the OCR workspace even before anything has
+        # created their sidecar folder. Their empty document tree is actionable:
+        # attach/open the PDF and run OCR from here.
+        if info["exists"] or build.get("status") in ("ready", "uploaded"):
             out[bid] = {"ocr": info["ocr"], "images": info["images"],
                         "preview": info["preview"],
                         "primary_pdf": info["primary_pdf"]}
@@ -4550,7 +4554,7 @@ def _an_meta_line(b: dict) -> str:
         bits.append(b["subtitle"])
     if b.get("authors"):
         bits.append(f"by {b['authors']}")
-    for k in ("year", "publisher", "publisher_city", "edition", "language"):
+    for k in ("year", "publisher", "publisher_city", "edition", "volume", "language"):
         if b.get(k):
             bits.append(str(b[k]))
     return " — ".join(bits)
@@ -4584,6 +4588,23 @@ def _write_entry_text(bid: str, rel: str, text: str) -> None:
     p = _entry_dir(bid) / rel
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(text, encoding="utf-8")
+
+
+def _save_analyze_summary(bid: str, text: str) -> None:
+    """Persist an Analyze summary as both an artifact and catalog metadata.
+
+    The Editor's description is the public catalog description. Keeping it in
+    the build record makes Analyze output visible there immediately and ensures
+    publication does not depend on a second manual copy/paste step.
+    """
+    summary = str(text or "").strip()
+    _write_entry_text(bid, "summary.md", summary + ("\n" if summary else ""))
+    builds = lib.load_json(BUILDS_PATH, {})
+    if bid not in builds:
+        return
+    builds[bid]["description"] = summary
+    builds[bid]["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    lib.save_json(BUILDS_PATH, builds)
 
 
 def _load_annotations(bid: str) -> dict:
@@ -4779,7 +4800,7 @@ def api_analyze_summarize():
                  f"Work: {meta}\n\n" + "\n\n---\n\n".join(notes)},
             ])
             with _an_write_lock:
-                _write_entry_text(bid, "summary.md", final.strip() + "\n")
+                _save_analyze_summary(bid, final)
             activity("summarized", "book", detail=b.get("title", ""))
             _an_finish(job)
         except Exception as exc:
@@ -5163,7 +5184,9 @@ def _volume_row(b: dict, slug: str, url: str, path: str, size: int, actor: str,
             "subtitle": b.get("subtitle") or "", "authors": b.get("authors") or "",
             "year": num(b.get("year")), "publisher": b.get("publisher") or "",
             "publisher_city": b.get("publisher_city") or "",
-            "edition": b.get("edition") or "", "language": b.get("language") or "",
+            "edition": b.get("edition") or "", "volume": b.get("volume") or "",
+            "group_id": b.get("group_id") or "",
+            "language": b.get("language") or "",
             "pages": num(b.get("pages")), "categories": cats,
             "category_paths": paths,
             "description": b.get("description") or "",
@@ -5413,14 +5436,16 @@ def _publish_run(bid: str, actor: str) -> None:
             except sbase.SyncError as exc:
                 # A live project that hasn't re-run schema.sql lacks the new
                 # columns; the book still deserves to publish.
-                missing = ("category_paths", "assets", "thumbnail_url", "thumbnail_path")
+                missing = ("category_paths", "assets", "thumbnail_url", "thumbnail_path",
+                           "volume", "group_id")
                 if not any(k in str(exc) for k in missing):
                     raise
-                for k in ("category_paths", "assets", "thumbnail_url", "thumbnail_path"):
+                for k in ("category_paths", "assets", "thumbnail_url", "thumbnail_path",
+                          "volume", "group_id"):
                     row.pop(k, None)
                 sbase.upsert_volume(cloud, row)
-                log.warning("volumes.category_paths/assets/thumbnail_* missing "
-                            "on the cloud project — re-run docs/cloud/schema.sql")
+                log.warning("optional volumes metadata is missing on the cloud "
+                            "project — re-run docs/cloud/schema.sql")
         except Exception:
             _unpublish_object(cloud, slug, path)
             for name_i, path_i in extras:

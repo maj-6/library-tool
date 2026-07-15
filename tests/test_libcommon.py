@@ -59,6 +59,7 @@ def test_manual_entry_fields_exact_order():
         "year",
         "edition",
         "volume",
+        "group_id",
         "language",
         "pages",
         "condition",

@@ -174,6 +174,8 @@ def volume_rows(ready_only: bool = False, actor: str = "") -> list[tuple[str, di
             "publisher": b.get("publisher") or "",
             "publisher_city": b.get("publisher_city") or "",
             "edition": b.get("edition") or "",
+            "volume": b.get("volume") or "",
+            "group_id": b.get("group_id") or "",
             "language": b.get("language") or "",
             "pages": int(pages) if pages.isdigit() else None,
             "categories": cats,
@@ -201,12 +203,13 @@ def cmd_seed(args) -> None:
         sb._rest(cfg, "POST", "volumes?on_conflict=slug", [r for _b, r in pairs],
                  prefer="resolution=merge-duplicates,return=minimal")
     except sb.SyncError as exc:
-        if "category_paths" not in str(exc):
+        optional = ("category_paths", "volume", "group_id")
+        if not any(k in str(exc) for k in optional):
             raise
-        # the live project predates the taxonomy — publish without the column
-        print("note: volumes.category_paths is missing on the cloud project;"
+        # Older projects can publish while optional metadata awaits schema sync.
+        print("note: optional volumes metadata is missing on the cloud project;"
               " re-run docs/cloud/schema.sql")
-        rows = [{k: v for k, v in r.items() if k != "category_paths"}
+        rows = [{k: v for k, v in r.items() if k not in optional}
                 for _b, r in pairs]
         sb._rest(cfg, "POST", "volumes?on_conflict=slug", rows,
                  prefer="resolution=merge-duplicates,return=minimal")
