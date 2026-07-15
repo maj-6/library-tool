@@ -812,14 +812,16 @@ _BUILD_FIELDS = ("published_slug",
                  "pdf_sources", "bundle",
                  "source_url", "notes", "status",
                  "ocr_active", "ocr_verified", "ocr_quality",
-                 "title_pages", "thumbnail_source", "attention")
+                 "title_pages", "thumbnail_source", "attention",
+                 "images", "extra", "capture_id")
 
 # The structured exceptions to the str() coercion below. `categories` (flat
 # text) is deprecated in favour of category_ids — kept as display fallback.
 # `bundle` picks which Analyze artifacts publish with the book; `relevance`
 # is also structured but deliberately NOT accepted here — only the
 # assessment job writes it.
-_BUILD_LIST_FIELDS = ("pdf_sources", "category_ids", "bundle")
+_BUILD_STRUCTURED_FIELDS = ("pdf_sources", "category_ids", "bundle",
+                            "images", "extra", "capture_id")
 
 
 def _clean_bundle(raw) -> dict:
@@ -883,11 +885,14 @@ def api_builds_create():
     seed = payload.get("build") or {}
     builds = lib.load_json(BUILDS_PATH, {})
     build = {f: str(seed.get(f, "") or "").strip() for f in _BUILD_FIELDS
-             if f not in _BUILD_LIST_FIELDS}
+             if f not in _BUILD_STRUCTURED_FIELDS}
     build["pdf_sources"] = _clean_pdf_sources(seed.get("pdf_sources"))
     build["category_ids"] = _clean_category_ids(seed.get("category_ids"),
                                                 lib.load_taxonomy()["nodes"])
     build["bundle"] = _clean_bundle(seed.get("bundle"))
+    build["images"] = _clean_images(seed.get("images"))
+    build["extra"] = _clean_extra(seed.get("extra"))
+    build["capture_id"] = _clean_capture_id(seed.get("capture_id"))
     if build["status"] not in _BUILD_STATUSES:
         build["status"] = "draft"
     build["id"] = lib.gen_id(set(builds))
@@ -916,6 +921,12 @@ def api_builds_update(build_id: str):
             b[f] = _clean_category_ids(payload[f], lib.load_taxonomy()["nodes"])
         elif f == "bundle":
             b[f] = _clean_bundle(payload[f])
+        elif f == "images":
+            b[f] = _clean_images(payload[f])
+        elif f == "extra":
+            b[f] = _clean_extra(payload[f])
+        elif f == "capture_id":
+            b[f] = _clean_capture_id(payload[f])
         else:
             b[f] = str(payload[f] or "").strip()
     if b.get("status") not in _BUILD_STATUSES:
@@ -947,6 +958,9 @@ def api_builds_restore():
     bid = str(build.get("id") or "")
     if not bid:
         abort(400)
+    build["images"] = _clean_images(build.get("images"))
+    build["extra"] = _clean_extra(build.get("extra"))
+    build["capture_id"] = _clean_capture_id(build.get("capture_id"))
     builds = lib.load_json(BUILDS_PATH, {})
     builds[bid] = build
     lib.save_json(BUILDS_PATH, builds)
@@ -1480,18 +1494,90 @@ def _ocr_extracted_images(build_id: str) -> list[dict]:
     return out
 
 
-def _entry_folder_info(build_id: str) -> dict:
+def _captured_images(build: dict | None) -> list[dict]:
+    """Captured-photo manifest rows backed by the safe capture-image route."""
+    out = []
+    root = lib.DATA_ROOT.resolve()
+    for raw in _clean_images((build or {}).get("images")):
+        resolved = _resolve_local(raw)
+        available = False
+        size = 0
+        if resolved is not None:
+            try:
+                resolved.relative_to(root)
+                available = (resolved.is_file()
+                             and resolved.suffix.lower()
+                             in (".jpg", ".jpeg", ".png", ".webp"))
+                if available:
+                    size = resolved.stat().st_size
+            except (ValueError, OSError):
+                available = False
+        out.append({"name": Path(raw).name, "path": raw,
+                    "size": size, "available": available})
+    return out
+
+
+def _entry_folder_info(build_id: str, build: dict | None = None) -> dict:
+    """Return the book's on-disk artifact manifest for the desktop tree.
+
+    Keep this scan self-contained: it is defined before the Analyze helpers,
+    and the folder endpoint is also useful when Analyze has never been opened.
+    """
     d = _entry_dir(build_id)
+    if build is None:
+        build = lib.load_json(BUILDS_PATH, {}).get(build_id) or {}
     ocr = []
     if (d / "ocr").is_dir():
         srcmap = _ocr_sources(build_id)
         for f in sorted((d / "ocr").glob("*.txt")):
             ocr.append({"name": f.name, "size": f.stat().st_size,
                         "src": srcmap.get(f.name) or "primary"})
+
+    full_text = []
+    root_text = d / "full_text.txt"
+    if root_text.is_file():
+        full_text.append({"name": root_text.name,
+                          "artifact": root_text.name,
+                          "size": root_text.stat().st_size})
+    full_text_dir = d / "full_text"
+    if full_text_dir.is_dir():
+        for f in sorted(full_text_dir.iterdir()):
+            if f.is_file() and f.suffix.lower() in (".txt", ".md"):
+                full_text.append({"name": f.name,
+                                  "artifact": f"full_text/{f.name}",
+                                  "size": f.stat().st_size})
+
+    translations = []
+    translations_dir = d / "translations"
+    if translations_dir.is_dir():
+        page_mark = re.compile(r"^--- page \d+ ---$", re.M)
+        for f in sorted(translations_dir.glob("*.txt")):
+            text = f.read_text(encoding="utf-8", errors="replace")
+            markers = page_mark.findall(text)
+            translations.append({"name": f.name, "lang": f.stem,
+                                 "pages": len(markers) or (1 if text.strip() else 0),
+                                 "size": f.stat().st_size})
+
+    analysis = []
+    analysis_dir = d / "analysis"
+    if analysis_dir.is_dir():
+        for f in sorted(analysis_dir.glob("*.md")):
+            analysis.append({"name": f.name, "size": f.stat().st_size})
+
+    def text_artifact(name: str) -> dict:
+        f = d / name
+        return {"exists": f.is_file(),
+                "size": f.stat().st_size if f.is_file() else 0}
+
     primary = _entry_primary_pdf(build_id)
     return {"exists": d.is_dir(), "path": str(d), "ocr": ocr,
             "images": _ocr_extracted_images(build_id),
+            "captured_images": _captured_images(build),
             "preview": bool(primary), "primary_pdf": primary,
+            "processed_pdf": "processed.pdf" if (d / "processed.pdf").is_file() else "",
+            "full_text": full_text, "translations": translations,
+            "analysis": analysis, "summary": text_artifact("summary.md"),
+            "about": text_artifact("about.md"),
             "metadata": (d / "metadata.json").is_file()}
 
 
@@ -1563,6 +1649,41 @@ def _preview_pdf(src: Path, pages: int) -> Path:
 @app.route("/api/builds/<build_id>/folder")
 def api_build_folder_info(build_id: str):
     return jsonify(_entry_folder_info(build_id))
+
+
+@app.route("/api/builds/<build_id>/artifact/<kind>/<path:name>")
+def api_build_text_artifact(build_id: str, kind: str, name: str):
+    """Read a Full Text or Analysis artifact without permitting traversal."""
+    if build_id not in lib.load_json(BUILDS_PATH, {}):
+        abort(404)
+    entry = _entry_dir(build_id).resolve()
+    if not entry.is_relative_to(ENTRIES_DIR.resolve()):
+        abort(404)
+
+    if kind == "full_text" and name == "full_text.txt":
+        candidate = entry / "full_text.txt"
+        allowed_root = entry
+    elif kind == "full_text" and name.startswith("full_text/"):
+        allowed_root = (entry / "full_text").resolve()
+        candidate = entry / name
+    elif kind == "full_text":
+        # Backward compatibility for clients that used the bare filename for
+        # directory artifacts before the manifest gained an explicit path.
+        allowed_root = (entry / "full_text").resolve()
+        candidate = allowed_root / name
+    elif kind == "analysis":
+        allowed_root = (entry / "analysis").resolve()
+        candidate = allowed_root / name
+    else:
+        abort(404)
+
+    candidate = candidate.resolve()
+    if (not candidate.is_relative_to(allowed_root) or not candidate.is_file()
+            or candidate.suffix.lower() not in (".txt", ".md")):
+        abort(404)
+    return jsonify({"ok": True, "kind": kind, "name": name,
+                    "text": candidate.read_text(
+                        encoding="utf-8", errors="replace")})
 
 
 @app.route("/api/builds/<build_id>/folder", methods=["POST"])
@@ -1697,14 +1818,21 @@ def api_entries():
     builds = lib.load_json(BUILDS_PATH, {})
     out = {}
     for bid, build in builds.items():
-        info = _entry_folder_info(bid)
+        info = _entry_folder_info(bid, build)
         # Verified entries belong in the OCR workspace even before anything has
         # created their sidecar folder. Their empty document tree is actionable:
         # attach/open the PDF and run OCR from here.
         if info["exists"] or build.get("status") in ("ready", "uploaded"):
             out[bid] = {"ocr": info["ocr"], "images": info["images"],
+                        "captured_images": info["captured_images"],
                         "preview": info["preview"],
-                        "primary_pdf": info["primary_pdf"]}
+                        "primary_pdf": info["primary_pdf"],
+                        "processed_pdf": info["processed_pdf"],
+                        "full_text": info["full_text"],
+                        "translations": info["translations"],
+                        "analysis": info["analysis"],
+                        "summary": info["summary"],
+                        "about": info["about"]}
     return jsonify({"entries": out})
 
 
@@ -3202,17 +3330,31 @@ def _clean_extra(v) -> dict:
 
 
 def _clean_images(v) -> list[str]:
-    """Entry image paths: DATA_ROOT-relative, image suffixes only."""
+    """Entry image paths: normalized DATA_ROOT-relative image paths only.
+
+    Captured photos are renderer-visible through ``/api/capture/image``. Keep
+    absolute paths, traversal segments, URL-like drive prefixes, duplicates,
+    and unbounded client payloads out of the persisted build record.
+    """
     if not isinstance(v, list):
         return []
     out = []
-    for p in v:
-        s = str(p or "").replace("\\", "/").strip().lstrip("/")
-        if not s or ".." in s:
+    for p in v[:200]:
+        s = str(p or "").replace("\\", "/").strip()
+        parts = s.split("/")
+        if (not s or len(s) > 500 or s.startswith("/")
+                or not all(part and part not in (".", "..") for part in parts)
+                or ":" in parts[0]):
             continue
-        if s.lower().rsplit(".", 1)[-1] in ("jpg", "jpeg", "png", "webp"):
+        if (s.lower().rsplit(".", 1)[-1] in ("jpg", "jpeg", "png", "webp")
+                and s not in out):
             out.append(s)
     return out
+
+
+def _clean_capture_id(v) -> str:
+    """The phone capture identifier used for provenance, never as a path."""
+    return re.sub(r"[^A-Za-z0-9-]", "", str(v or ""))[:64]
 
 
 @app.route("/api/manual", methods=["POST"])
@@ -4607,6 +4749,25 @@ def _save_analyze_summary(bid: str, text: str) -> None:
     lib.save_json(BUILDS_PATH, builds)
 
 
+def _save_analyze_about(bid: str, text: str) -> None:
+    """Persist the About article and mirror it into Editor Description.
+
+    The article remains a publishable per-book artifact while the build record
+    is the Editor's source of truth. Lock the read-modify-write so a completed
+    background analysis cannot discard an unrelated Editor or publish update.
+    """
+    about = str(text or "").strip()
+    _write_entry_text(bid, "about.md", about + ("\n" if about else ""))
+    with _builds_lock:
+        builds = lib.load_json(BUILDS_PATH, {})
+        if bid not in builds:
+            return
+        builds[bid]["description"] = about
+        builds[bid]["updated_at"] = datetime.now(
+            timezone.utc).isoformat(timespec="seconds")
+        lib.save_json(BUILDS_PATH, builds)
+
+
 def _load_annotations(bid: str) -> dict:
     doc = lib.load_json(_entry_dir(bid) / "annotations.json", None)
     if not isinstance(doc, dict) or not isinstance(doc.get("notes"), list):
@@ -4637,7 +4798,8 @@ def api_build_about(bid: str):
     if err:
         return err
     payload = request.get_json(silent=True) or {}
-    _write_entry_text(bid, "about.md", str(payload.get("text") or ""))
+    with _an_write_lock:
+        _save_analyze_about(bid, str(payload.get("text") or ""))
     return jsonify({"ok": True})
 
 
@@ -4717,8 +4879,17 @@ def _an_job_new(bid: str, kind: str, total: int) -> dict:
     return job
 
 
-def _an_job_start(bid: str, kind: str, total: int, target) -> dict:
+def _an_job_start(bid: str, kind: str, total: int, target,
+                  decorate=None) -> dict:
+    """Create and start a background Analyze job.
+
+    ``decorate`` may attach immutable request metadata after the id is known
+    but before the worker can run. Existing callers need no decoration.
+    """
     job = _an_job_new(bid, kind, total)
+    if decorate is not None:
+        with _an_jobs_lock:
+            decorate(job)
     threading.Thread(target=target, args=(job,), daemon=True).start()
     return job
 
@@ -4754,6 +4925,108 @@ def _an_chunks(pages: dict[int, str], budget: int = 22000) -> list[tuple[list[in
     if buf:
         chunks.append((nums, "\n\n".join(buf)))
     return chunks
+
+
+@app.route("/api/analyze/pages", methods=["POST"])
+def api_analyze_pages():
+    """Analyze selected OCR pages and save the result as a book artifact.
+
+    Body: ``{build_id, pages: [1, ...], doc?, engine?}``. ``engine`` is
+    descriptive job metadata; requests continue to use the one configured
+    OpenAI-compatible provider returned by :func:`_ai_cfg`.
+    """
+    p = request.get_json(silent=True) or {}
+    bid = str(p.get("build_id") or "").strip()
+    b, err = _an_gate(bid)
+    if err:
+        return err
+
+    raw_pages = p.get("pages")
+    if (not isinstance(raw_pages, list) or not raw_pages
+            or any(isinstance(n, bool) or not isinstance(n, int) or n < 1
+                   for n in raw_pages)):
+        return jsonify({"ok": False, "error":
+                        "pages must be a non-empty list of positive integers"}), 400
+    wanted = sorted(set(raw_pages))
+
+    requested_doc = str(p.get("doc") or "").strip()
+    doc_name, text = "", ""
+    if requested_doc and _ocr_name(requested_doc) == requested_doc:
+        ocr_root = (_entry_dir(bid) / "ocr").resolve()
+        candidate = (ocr_root / requested_doc).resolve()
+        if candidate.is_relative_to(ocr_root) and candidate.is_file():
+            doc_name = requested_doc
+            text = candidate.read_text(encoding="utf-8", errors="replace")
+    if not text:
+        doc_name, text = _analyze_doc(bid, b)
+
+    all_pages = _an_pages(text)
+    missing = [n for n in wanted if n not in all_pages]
+    if not all_pages:
+        return jsonify({"ok": False, "error":
+                        "no OCR text for this entry - extract or run OCR first"}), 400
+    if missing:
+        return jsonify({"ok": False, "error":
+                        "OCR text does not contain page(s): "
+                        + ", ".join(str(n) for n in missing)}), 400
+    selected = {n: all_pages[n] for n in wanted}
+    chunks = _an_chunks(selected)
+    cfg = _ai_cfg()
+    engine = str(p.get("engine") or cfg["model"]).strip()[:100] or cfg["model"]
+    meta = _an_meta_line(b)
+
+    if wanted == list(range(wanted[0], wanted[-1] + 1)):
+        page_slug = (str(wanted[0]) if len(wanted) == 1
+                     else f"{wanted[0]}-{wanted[-1]}")
+    elif len(wanted) <= 12:
+        page_slug = "_".join(str(n) for n in wanted)
+    else:
+        page_slug = f"{wanted[0]}-{wanted[-1]}-{len(wanted)}pages"
+
+    def decorate(job):
+        safe_id = re.sub(r"[^\w-]", "_", str(job["id"]))
+        job.update(pages=wanted, engine=engine, doc=doc_name,
+                   artifact=f"page-analysis-{page_slug}-{safe_id}.md")
+
+    def run(job):
+        try:
+            results = []
+            for i, (nums, chunk) in enumerate(chunks):
+                result = _ai_chat(cfg, [
+                    {"role": "system", "content":
+                     "You are analyzing selected pages of a historical "
+                     "botanical or medical work for a rare-books cataloguer. "
+                     "Identify subjects, named people and works, structure, "
+                     "notable claims, and OCR uncertainties. Be concise, "
+                     "factual, and do not invent missing context. Reply in "
+                     "Markdown."},
+                    {"role": "user", "content":
+                     f"Work: {meta}\nSelected pages {nums}:\n\n{chunk}"},
+                ])
+                results.append((nums, result.strip()))
+                with _an_jobs_lock:
+                    job["done"] = i + 1
+
+            parts = [f"# Page analysis: {b.get('title') or 'Untitled'}",
+                     f"_OCR source: {doc_name}; engine: {engine}_"]
+            for nums, result in results:
+                label = (str(nums[0]) if len(nums) == 1
+                         else f"{nums[0]}-{nums[-1]}")
+                parts.extend((f"## Pages {label}", result))
+            with _an_write_lock:
+                _write_entry_text(
+                    bid, f"analysis/{job['artifact']}",
+                    "\n\n".join(parts).strip() + "\n")
+            activity("analyzed pages", "book", detail=b.get("title", ""))
+            _an_finish(job)
+        except Exception as exc:
+            log.error("page analysis failed for %s", bid, exc_info=exc)
+            _an_finish(job, f"{type(exc).__name__}: {exc}")
+
+    job = _an_job_start(bid, "page-analysis", len(chunks), run, decorate)
+    return jsonify({"ok": True, "job": job["id"], "pages": wanted,
+                    "engine": engine, "doc": doc_name,
+                    "artifact": job["artifact"]})
 
 
 @app.route("/api/analyze/summarize", methods=["POST"])
@@ -4845,7 +5118,7 @@ def api_analyze_about():
                  f"summary:\n{summary}"},
             ], temperature=0.4)
             with _an_write_lock:
-                _write_entry_text(bid, "about.md", out.strip() + "\n")
+                _save_analyze_about(bid, out)
             _an_finish(job)
         except Exception as exc:
             _an_finish(job, f"{type(exc).__name__}: {exc}")
@@ -5230,6 +5503,180 @@ def _bundle_artifacts(bid: str, b: dict) -> dict:
         if out["notes"]:
             out["assets"]["notes"] = len(out["notes"])
     return out
+
+
+def _publish_preview_thumb(bid: str, b: dict) -> str:
+    """A local thumbnail URL for an uploaded build when cloud data is absent."""
+    source = str(b.get("thumbnail_source") or "")
+    page = re.match(r"^page:(\d+)$", source)
+    pdf = str(b.get("pdf_file") or "").strip()
+    if page and pdf:
+        return ("/api/pdf/pageimg?path=" + urllib.parse.quote(pdf, safe="")
+                + "&page=" + page.group(1) + "&w=640")
+    image = re.match(r"^image:(.+)$", source)
+    if image:
+        return (f"/api/builds/{urllib.parse.quote(bid, safe='')}/ocr/images/"
+                + urllib.parse.quote(image.group(1), safe=""))
+    return ""
+
+
+def _local_preview_assets(bid: str, b: dict) -> dict:
+    """Cheap availability hints for the catalogue tree's offline fallback.
+
+    The full publish bundler parses every OCR/translation page. A catalogue
+    refresh must not do that for every uploaded book merely to draw badges.
+    """
+    bundle = _clean_bundle(b.get("bundle"))
+    assets = {}
+    if bundle["about"] and _read_entry_text(bid, "about.md").strip():
+        assets["about"] = True
+    if bundle["annotations"]:
+        count = sum(1 for n in _load_annotations(bid)["notes"]
+                    if n.get("status") == "approved")
+        if count:
+            assets["notes"] = count
+    return assets
+
+
+def _local_publish_rows(builds: dict | None = None) -> list[dict]:
+    """Website-shaped rows for builds this checkout remembers publishing."""
+    builds = builds if isinstance(builds, dict) else \
+        lib.load_json(BUILDS_PATH, {})
+    rows = []
+    for bid, b in builds.items():
+        slug = str(b.get("published_slug") or "").strip()
+        if b.get("status") != "uploaded" or not slug:
+            continue
+        pdf = _resolve_local(str(b.get("pdf_file") or ""))
+        size = pdf.stat().st_size if pdf and pdf.is_file() else 0
+        row = _volume_row(b, slug, "", "", size, "")
+        row["updated_at"] = b.get("updated_at") or row["updated_at"]
+        row["assets"] = _local_preview_assets(str(bid), b)
+        row["local_build_id"] = str(bid)
+        row["preview_thumbnail"] = _publish_preview_thumb(str(bid), b)
+        rows.append(row)
+    return rows
+
+
+def _public_volume_rows(cfg: dict) -> list[dict]:
+    """Read the complete public catalogue in bounded PostgREST pages."""
+    rows = []
+    page_size = 1000
+    offset = 0
+    while True:
+        batch = sbase._rest(
+            cfg, "GET", "volumes?select=*&order=title.asc,slug.asc"
+            f"&limit={page_size}&offset={offset}") or []
+        if not isinstance(batch, list):
+            raise RuntimeError("online catalogue returned an invalid response")
+        rows.extend(x for x in batch if isinstance(x, dict))
+        if len(batch) < page_size:
+            break
+        offset += page_size
+    return rows
+
+
+def _public_preview_urls(cfg: dict, row: dict) -> dict:
+    """Resolve the site's dual URL/path asset fields for a local preview."""
+    item = dict(row)
+    base = str(cfg.get("url") or "").rstrip("/")
+    storage = f"{base}/storage/v1/object/public/volumes/"
+    for url_key, path_key in (("pdf_url", "pdf_path"),
+                              ("thumbnail_url", "thumbnail_path")):
+        path = str(item.get(path_key) or "").strip()
+        if base and path and not item.get(url_key):
+            item[url_key] = storage + urllib.parse.quote(path, safe="/")
+    return item
+
+
+@app.route("/api/publish/catalog")
+def api_publish_catalog():
+    """The website catalogue, or local uploads when it cannot be reached.
+
+    This deliberately uses the public project key, never the owner-only
+    service credential. If the network/catalogue is unavailable, builds that
+    this checkout successfully uploaded still provide a useful offline tree.
+    """
+    warning = ""
+    cloud_rows = []
+    cloud_ok = False
+    cfg = _auth_cfg()
+    if cfg:
+        try:
+            cloud_rows = [_public_preview_urls(cfg, row)
+                          for row in _public_volume_rows(cfg)]
+            cloud_ok = True
+            if cloud_rows and any("group_id" not in row or "volume" not in row
+                                  for row in cloud_rows):
+                warning = ("Online catalogue schema is missing book-set metadata; "
+                           "set grouping is temporarily unavailable.")
+        except Exception as exc:
+            warning = f"Online catalogue unavailable: {exc}"
+    else:
+        warning = "Online catalogue unavailable; showing local uploads."
+
+    # A successful public read is authoritative, including an empty result.
+    # Mixing in local builds here could preview stale edits or an upload that
+    # has since been unpublished. Local rows are strictly an offline fallback.
+    entries = cloud_rows if cloud_ok else _local_publish_rows()
+    entries = [row for row in entries if str(row.get("slug") or "").strip()]
+    entries.sort(key=lambda r: (str(r.get("title") or "").casefold(),
+                                str(r.get("volume") or ""),
+                                str(r.get("slug") or "")))
+    source = "cloud" if cloud_ok else "local"
+    site_url = (str(_client_settings().get("cloudSiteUrl") or "").strip().rstrip("/")
+                or cloud_defaults.WEBSITE_URL)
+    return jsonify({"ok": True, "entries": entries, "source": source,
+                    "warning": warning, "site_url": site_url})
+
+
+@app.route("/api/publish/preview/<slug>")
+def api_publish_preview(slug: str):
+    """Publishable About text and notes for one catalogue volume."""
+    slug = str(slug or "").strip()[:240]
+    builds = lib.load_json(BUILDS_PATH, {})
+    match = next(((bid, b) for bid, b in builds.items()
+                  if b.get("status") == "uploaded"
+                  and str(b.get("published_slug") or "") == slug), None)
+    about, notes, warning, source = "", [], "", "local"
+    cloud_ok = False
+    cfg = _auth_cfg()
+    if cfg and slug:
+        q = urllib.parse.quote(slug, safe="")
+        try:
+            texts = sbase._rest(
+                cfg, "GET", f"volume_texts?slug=eq.{q}&kind=eq.about"
+                "&select=body,lang&order=lang.asc&limit=1") or []
+            remote_notes = sbase._rest(
+                cfg, "GET", f"volume_notes?slug=eq.{q}"
+                "&select=note_id,page,quote,kind,body"
+                "&order=page.asc,note_id.asc") or []
+            if not isinstance(texts, list) or not isinstance(remote_notes, list):
+                raise RuntimeError("online preview returned an invalid response")
+            if texts:
+                about = str(texts[0].get("body") or "")
+            notes = [n for n in remote_notes if isinstance(n, dict)]
+            cloud_ok = True
+            source = "cloud"
+        except Exception as exc:
+            warning = f"Online preview details unavailable: {exc}"
+    # Empty cloud rows are authoritative. Only consult a local bundle if the
+    # public catalogue was unavailable, never to fill a successful response.
+    if match and not cloud_ok:
+        bid, build = match
+        bundle = _clean_bundle(build.get("bundle"))
+        if bundle["about"]:
+            about = _read_entry_text(str(bid), "about.md").strip()
+        if bundle["annotations"]:
+            notes = [{"note_id": str(n.get("id") or ""),
+                      "page": int(n.get("page") or 0),
+                      "quote": str(n.get("quote") or ""),
+                      "kind": str(n.get("kind") or ""),
+                      "body": str(n.get("body") or "")}
+                     for n in _load_annotations(str(bid))["notes"]
+                     if n.get("status") == "approved"]
+    return jsonify({"ok": True, "about": about, "notes": notes,
+                    "source": source, "warning": warning})
 
 
 def _publish_bundle(cloud: dict, slug: str, art: dict) -> None:

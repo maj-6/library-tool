@@ -9,11 +9,17 @@ from __future__ import annotations
 
 import base64
 import json
+from pathlib import Path
 
 import cloud_defaults
 import libcommon as lib
 import pytest
 import server
+
+
+SCHEMA_SQL = (Path(__file__).parents[1] / "docs" / "cloud" /
+              "schema.sql").read_text(encoding="utf-8")
+SCHEMA_SQL_FLAT = " ".join(SCHEMA_SQL.split())
 
 
 def _jwt_payload(key: str) -> dict:
@@ -31,6 +37,24 @@ def test_shipped_key_is_the_anon_role():
 def test_shipped_url_shape():
     assert cloud_defaults.SUPABASE_URL.startswith("https://")
     assert not cloud_defaults.SUPABASE_URL.endswith("/")
+
+
+def test_data_api_tables_have_explicit_least_privilege_grants():
+    """RLS policies do not expose a table when its role lacks privileges.
+
+    Keep the schema valid for Supabase projects where new public tables no
+    longer inherit broad Data API grants.
+    """
+    assert ("grant select on public.volumes to anon, authenticated;" in
+            SCHEMA_SQL_FLAT)
+    assert ("grant select on public.volume_texts, public.volume_pages, "
+            "public.volume_notes to anon, authenticated;" in SCHEMA_SQL_FLAT)
+    assert ("grant select, insert, update on public.captures to authenticated;"
+            in SCHEMA_SQL_FLAT)
+    assert ("grant select, insert, update, delete on public.profile_secrets "
+            "to authenticated;" in SCHEMA_SQL_FLAT)
+    assert ("revoke all on public.books from anon, authenticated;" in
+            SCHEMA_SQL_FLAT)
 
 
 @pytest.fixture()

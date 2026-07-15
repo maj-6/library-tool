@@ -6,6 +6,16 @@ items fold under "Other changes". The Downloads page shows only the highlights
 of the most recent releases. The desktop app reads this same file
 (Help → View changelog).
 
+## 0.7.0 — 2026-07-15
+- Analyze now brings OCR and text analysis into one workspace: a resizable facsimile, book artifacts, page-level analysis staging, shared OCR/text jobs, and credential-aware engine defaults.
+- Book Capture and desktop cloud sync use signed-in user sessions instead of asking users for a Supabase service-role key; phone scans, profile OCR credentials, and captured metadata flow back into the desktop catalogue.
+- Publish adds a catalogue tree and an online-record preview, grouped by book set, author, category, or date.
+<!--more-->
+- Generated About articles populate the Editor description automatically, while OCR, full text, translations, images, PDFs, and analysis output remain distinct artifacts.
+- Android adds scan management and reprocessing controls; desktop OCR adds packaged Tesseract support, clearer diagnostics, safer staged-job handling, and improved multi-volume editing.
+- Copyright lookup includes post-1978 CPRS records with year-aware matching, and the public library adds author pages, search suggestions, and cover thumbnails.
+- Desktop startup, updater behavior, persistent view settings, and PDF-preview concurrency are more reliable.
+
 ## 0.6.0 — 2026-07-11
 - PDF reader: long books now expose every page, with faster near-viewport loading, background page caching, thumbnail placeholders, keyboard navigation, and a page-jump control.
 - Settings and menus follow desktop conventions; preferences are organized by task, with new editing, AI, OCR, update, and logging controls.

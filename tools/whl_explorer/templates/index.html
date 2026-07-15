@@ -87,8 +87,8 @@
     <button class="tab active" data-tab="home">Home</button>
     <button class="tab" data-tab="checked">Catalogs</button>
     <button class="tab" data-tab="upload">Editor</button>
-    <button class="tab" data-tab="ocr">OCR</button>
-    <button class="tab" data-tab="analyze">Analyze</button>
+    <button class="tab" data-tab="ocr">Analyze</button>
+    <button class="tab" data-tab="publish">Publish</button>
     <button class="tab" data-tab="infotab">Info</button>
     <span class="bar-spacer"></span>
     <div class="tb-group">
@@ -810,7 +810,7 @@
             <p id="ocr-books-empty" class="empty">No book folders (build them in the Editor tab)</p>
           </div>
           <div id="ocr-side-splitter"></div>
-          <div class="pane-bar"><span class="tool-label">Documents</span>
+          <div class="pane-bar"><span class="tool-label">Artifacts</span>
             <span class="bar-spacer"></span>
             <button id="ocr-load-file" class="cad-btn tiny icon-btn" type="button"
                     data-icon="fileup" data-tip="Load OCR text files"></button>
@@ -818,11 +818,34 @@
           </div>
           <div class="drafting" id="ocr-doc-wrap">
             <ul id="ocr-docs"></ul>
-            <p id="ocr-docs-empty" class="empty">No documents</p>
+            <p id="ocr-docs-empty" class="empty">No artifacts</p>
           </div>
         </div>
         <div id="ocr-splitter"></div>
-        <div id="ocr-mainpane">
+        <div id="ocr-workspace">
+          <div class="pane-tabs" id="ocr-workspace-tabs">
+            <button class="pane-tab active" data-worktab="analysis" type="button">Analysis</button>
+            <button class="pane-tab" data-worktab="document" type="button">Document</button>
+          </div>
+          <div id="ocr-analysis-workspace" class="ocr-workpane active">
+            <div id="an-facsimile-pane">
+              <div class="pane-bar">
+                <span class="tool-label">Facsimile</span>
+                <span id="an-page-count" class="tool-count"></span>
+                <span class="bar-spacer"></span>
+                <span id="an-page-msg" class="tool-label"></span>
+                <button id="an-stage-pages" class="cad-btn tiny" type="button"
+                        data-tip="Stage the selected pages for text analysis">Stage selected pages</button>
+              </div>
+              <div id="an-facsimile" class="drafting">
+                <p id="an-facsimile-empty" class="empty">Select an OCR artifact to view its pages.</p>
+              </div>
+            </div>
+            <div id="an-facsimile-splitter"></div>
+            <div id="an-integrated-host"></div>
+          </div>
+          <div id="ocr-document-workspace" class="ocr-workpane" hidden>
+            <div id="ocr-mainpane">
           <div class="pane-bar">
             <button id="ocr-view-edit" class="cad-btn tiny icon-btn" type="button"
                     data-icon="pencil" data-tip="Edit the OCR text"></button>
@@ -868,25 +891,20 @@
           <textarea id="ocr-editor" class="cad-input" spellcheck="false" hidden></textarea>
           <div class="drafting" id="ocr-diff" hidden></div>
           <div class="ocr-keymap" id="ocr-keymap" hidden></div>
-          <div class="drafting" id="ocr-pages"></div>
+              <div class="drafting" id="ocr-pages"></div>
+            </div>
+          </div>
         </div>
       </div>
       <div id="ocr-queue-splitter"></div>
       <div class="pane-bar">
-        <span class="tool-label">OCR queue</span>
+        <span class="tool-label">Jobs</span>
         <span class="tb-sep"></span>
-        <label class="tool-label" for="ocr-service">Stage all with</label>
-        <select id="ocr-service" class="cad-input"
-                data-tip="Engine the + button stages every page with. Pages staged by digit keys keep their own engine.">
-          <option value="tesseract">Tesseract (local)</option>
-          <option value="mistral">Mistral OCR</option>
-          <option value="claude">Claude</option>
-          <option value="textract">Amazon Textract</option>
-          <option value="azure">Azure Document Intelligence</option>
-          <option value="openai">OpenAI vision</option>
-        </select>
+        <button id="engine-defaults-open" class="cad-btn tiny" type="button"
+                data-tip="Choose the default OCR and text-analysis engines">Default Engine:</button>
+        <span id="engine-defaults-summary" class="tool-label"></span>
         <button id="ocr-queue-add" class="cad-btn tiny icon-btn" type="button"
-                data-icon="plus" data-tip="Stage every page with the engine at left (nothing runs until Submit)"></button>
+                data-icon="plus" data-tip="Stage every page with the default OCR engine (nothing runs until Submit)"></button>
         <button id="ocr-queue-clear" class="cad-btn tiny icon-btn" type="button"
                 data-icon="remove" data-tip="Un-stage all staged pages"></button>
         <span class="tb-sep"></span>
@@ -899,16 +917,16 @@
       </div>
       <div class="drafting" id="ocr-queue-wrap">
         <table class="grid" id="ocr-queue-table">
-          <thead><tr><th>Book</th><th>PDF</th><th>Service</th><th>Status</th><th>Submitted</th><th></th></tr></thead>
+          <thead><tr><th>Type</th><th>Book</th><th>Artifact</th><th>Engine</th><th>Status</th><th>Submitted</th><th></th></tr></thead>
           <tbody id="ocr-queue-rows"></tbody>
         </table>
-        <p id="ocr-queue-empty" class="empty">No OCR jobs</p>
+        <p id="ocr-queue-empty" class="empty">No jobs</p>
       </div>
     </section>
 
     <!-- ANALYZE: AI over verified entries — summaries, categories,
          translations, annotations, relevance, and the publish bundle -->
-    <section id="analyze" class="panel-view">
+    <section id="analyze" hidden>
       <div id="an-split">
         <aside id="an-books">
           <div class="pane-bar"><span class="tool-label"
@@ -1021,6 +1039,45 @@
       </div>
     </section>
 
+    <!-- PUBLISH: browse the public catalogue and preview its book pages -->
+    <section id="publish" class="panel-view">
+      <div id="publish-layout">
+        <aside id="publish-side" aria-label="Published books">
+          <div class="pane-bar publish-side-bar">
+            <button id="publish-side-toggle" class="cad-btn tiny" type="button"
+                    aria-expanded="true" data-tip="Collapse published books sidebar">&#9664;</button>
+            <label class="tool-label" for="publish-group">Group by</label>
+            <select id="publish-group" class="cad-input">
+              <option value="sets">Book / set</option>
+              <option value="author">Author</option>
+              <option value="category">Categories</option>
+              <option value="date">Date range</option>
+            </select>
+            <button id="publish-refresh" class="cad-btn tiny" type="button"
+                    data-tip="Refresh the online catalogue">Refresh</button>
+            <span id="publish-count" class="tool-count"></span>
+          </div>
+          <div id="publish-tree-wrap" class="drafting">
+            <div id="publish-tree" aria-label="Published catalogue"></div>
+            <p id="publish-tree-empty" class="empty">Loading published books&hellip;</p>
+          </div>
+        </aside>
+        <div id="publish-splitter"></div>
+        <div id="publish-main">
+          <div id="publish-preview-bar" class="pane-bar">
+            <span id="publish-preview-label" class="tool-label">World Herb Library preview</span>
+            <span class="bar-spacer"></span>
+            <span id="publish-source" class="tool-label"></span>
+            <button id="publish-open-live" class="cad-btn tiny" type="button" hidden>Open live page</button>
+          </div>
+          <div id="publish-preview" class="publish-preview">
+            <div id="publish-empty" class="empty">Select a published book or book set.</div>
+            <div id="publish-record" hidden></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- INFO: the console, for now; more lands here later -->
     <section id="infotab" class="panel-view">
       <div class="pane-bar">
@@ -1044,6 +1101,43 @@
       <div id="con-lines"></div>
     </section>
   </main>
+
+  <!-- DEFAULT ENGINES WINDOW: shared by OCR and text-analysis staging -->
+  <div id="engine-overlay" class="overlay" hidden>
+    <div id="engine-window" class="win">
+      <div class="win-titlebar">
+        <span>Default Engine</span>
+        <button id="engine-close" class="win-close" type="button"
+                aria-label="Close">&#10005;</button>
+      </div>
+      <div id="engine-body">
+        <p class="pane-note">These engines are used when pages are staged. Cloud engines
+          remain unavailable until their API keys are configured.</p>
+        <div class="engine-defaults-fields">
+          <label class="tool-label" for="ocr-service">OCR</label>
+          <select id="ocr-service" class="cad-input">
+            <option value="tesseract">Tesseract (local)</option>
+            <option value="mistral">Mistral OCR</option>
+            <option value="claude">Claude</option>
+            <option value="textract">Amazon Textract</option>
+          </select>
+          <span></span>
+          <span id="ocr-engine-note" class="tool-label"></span>
+          <label class="tool-label" for="analysis-service">Text Analysis</label>
+          <select id="analysis-service" class="cad-input">
+            <option value="configured">Configured AI provider</option>
+          </select>
+          <span></span>
+          <span id="analysis-engine-note" class="tool-label"></span>
+        </div>
+        <div class="mf-actions">
+          <button id="engine-settings" class="cad-btn" type="button">Open Settings</button>
+          <span class="bar-spacer"></span>
+          <button id="engine-done" class="cad-btn" type="button">Done</button>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <div id="cad-tooltip" hidden></div>
   <div id="popup-menu" hidden></div>

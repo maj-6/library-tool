@@ -35,7 +35,7 @@ const VIEWSTATE_KEY = "whl_cad_viewstate_v1";
 const VIEW_STATE_KEYS = new Set([
   "markFilter", "srcFilter", "dlFilter", "yearFrom", "yearTo",
   "topTable", "bottomActive", "whlMode", "checkedMode", "showCatalog",
-  "paneWidth", "uploadSplitH",
+  "paneWidth", "uploadSplitH", "publishSidebarCollapsed", "analysisWorkspace",
   "authPromptDismissed", "checkedCols",
 ]);
 // Credentials are never persisted client-side. They live in the server's
@@ -123,6 +123,18 @@ const state = {
   buildSel: null,             // selected build id
   taxonomy: {},               // category nodes (id -> {name, parent})
   anSel: null,                // build open in the Analyze tab
+  publishEntries: [],         // public volumes rows shown in the Publish tree
+  publishSel: null,           // stable "book:<slug>" or "set:<group_id>" key
+  publishOpen: new Set(),     // explicitly opened Publish tree folders
+  publishClosed: new Set(),   // organizational folders closed from default-open
+  publishDetails: new Map(),  // slug -> {about, notes} preview cache
+  publishLoaded: false,
+  publishSource: "",
+  publishWarning: "",
+  publishSiteUrl: "",
+  publishCatalogSeq: 0,
+  publishCatalogLoading: null,
+  publishPreviewSeq: 0,
   buildFolder: null,          // entry-folder info for the selected build
   downloads: new Map(),
   dlTimers: new Map(),
@@ -161,6 +173,8 @@ const state = {
     ocrAwsKey: "", ocrAwsSecret: "", ocrAwsRegion: "",
     ocrImageWidth: 1400,
     ocrLayout: true,    // page view: place words where they sit on the page
+    textAnalysisService: "configured",
+    analysisWorkspace: "analysis",
     userName: "",       // attributed to your changes in the activity feed        // rasterization width for OCR input —
                                 // tune to see how shrinking affects quality
     // page-view digit shortcuts: press N over a page to queue it
@@ -192,6 +206,8 @@ const state = {
     verboseLogging: false,      // raise the server log level to DEBUG
     autoUpdate: true,           // desktop: check for updates on launch
     includePrereleaseUpdates: false, // desktop: allow alpha/beta/rc auto-updates
+    publishGroup: "sets",           // organization of the Publish file tree
+    publishSidebarCollapsed: false,
   },
   editTarget: null,             // record open in the EDIT tab
   sort: { checked: null, whl: null },  // {key, dir} per top table
@@ -946,6 +962,14 @@ function normalizeSettings() {
   state.settings.hideVolTitles = !!state.settings.hideVolTitles;
   state.settings.setsBackfilled = !!state.settings.setsBackfilled;
   state.settings.groupMetadataBackfilled = !!state.settings.groupMetadataBackfilled;
+  if (!["sets", "author", "category", "date"].includes(state.settings.publishGroup))
+    state.settings.publishGroup = "sets";
+  state.settings.publishSidebarCollapsed = !!state.settings.publishSidebarCollapsed;
+  if (!["tesseract", "mistral", "claude", "textract"].includes(state.settings.ocrService))
+    state.settings.ocrService = "tesseract";
+  state.settings.textAnalysisService = "configured";
+  if (!["analysis", "document"].includes(state.settings.analysisWorkspace))
+    state.settings.analysisWorkspace = "analysis";
   if (!state.settings.copyrightSources || typeof state.settings.copyrightSources !== "object")
     state.settings.copyrightSources = { cprs: true, nypl: false };
   state.settings.cloudSearchUrl = state.settings.cloudSearchUrl || "";
@@ -1704,7 +1728,8 @@ function initHome() {
 // --- tabs + header -----------------------------------------------------------
 
 const TAB_TITLES = { home: "Home", checked: "Catalogs", upload: "Editor",
-                     ocr: "OCR", analyze: "Analyze", infotab: "Info" };
+                     ocr: "Analyze", publish: "Publish",
+                     infotab: "Info" };
 
 function setHeader(tabId) {
   // Both the visible title bar and the OS window title carry the active tab:
@@ -1741,8 +1766,10 @@ function initTabs() {
       if (tab.dataset.tab === "infotab") renderConsole();
       // refresh the folder list on every visit — builds/folders may have
       // changed in the Editor tab meanwhile
-      if (tab.dataset.tab === "ocr") loadOcrBooks().then(renderOcrTab);
-      if (tab.dataset.tab === "analyze") renderAnalyze();
+      if (tab.dataset.tab === "ocr") {
+        loadOcrBooks().then(() => { renderOcrTab(); renderAnalyze(); });
+      }
+      if (tab.dataset.tab === "publish") renderPublish();
     });
   }
   setHeader("home");
@@ -2443,6 +2470,7 @@ function renderSettings() {
     state.settings.ocrService = svc.value;
     el("ocr-service").value = svc.value;
     saveSettings();
+    updateDefaultEngineSummary();
   };
   for (const [id, k] of [["set-ocr-azure-endpoint", "ocrAzureEndpoint"],
                          ["set-ocr-azure-key", "ocrAzureKey"],
@@ -3513,6 +3541,7 @@ function manualToBook(e) {
   // non-column metadata (phone captures): shown in the Info panel
   if (e.extra && Object.keys(e.extra).length) book.extra = e.extra;
   if (e.images && e.images.length) book.images = e.images;
+  if (e.capture_id) book.capture_id = e.capture_id;
   return book;
 }
 
@@ -7605,6 +7634,8 @@ async function saveManualSource(clear) {
 let anAboutMd = null;          // live markdown editor for the About article
 const anJobs = new Map();      // job id -> {kind, buildId}
 let anPollTimer = null;
+let anFacsimileSeq = 0;
+let anFacsimileObserver = null;
 
 function anSelected() {
   const b = state.anSel && state.builds[state.anSel] ? state.builds[state.anSel] : null;
@@ -7615,10 +7646,138 @@ function anAnalyzable(b) { return b.status === "ready" || b.status === "uploaded
 
 async function renderAnalyze() {
   await loadBuilds();
+  if (ocrState.book && anAnalyzable(state.builds[ocrState.book] || {}))
+    state.anSel = ocrState.book;
   if (state.anSel && !anAnalyzable(state.builds[state.anSel] || {})) state.anSel = null;
   renderAnList();
   renderAnMain();
+  renderAnFacsimile();
   updateAnProvider();
+}
+
+function setAnalyzeWorkspace(which, persist) {
+  which = which === "document" ? "document" : "analysis";
+  document.querySelectorAll("#ocr-workspace-tabs [data-worktab]").forEach((tab) => {
+    const on = tab.dataset.worktab === which;
+    tab.classList.toggle("active", on);
+    tab.setAttribute("aria-selected", String(on));
+  });
+  el("ocr-document-workspace").hidden = which !== "document";
+  el("ocr-document-workspace").classList.toggle("active", which === "document");
+  el("ocr-analysis-workspace").hidden = which !== "analysis";
+  el("ocr-analysis-workspace").classList.toggle("active", which === "analysis");
+  if (persist) {
+    state.settings.analysisWorkspace = which;
+    saveSettings();
+  }
+  if (which === "analysis") {
+    renderAnMain();
+    renderAnFacsimile();
+  } else {
+    renderOcrTab();
+  }
+}
+
+function decorateAnFacsimile() {
+  const box = el("an-facsimile");
+  if (!box) return;
+  const d = ocrSelDoc();
+  const bid = d && d.buildId;
+  for (const row of box.querySelectorAll(".an-fac-page")) {
+    const page = +row.dataset.page;
+    const key = `${bid}:${docSrcKey(d)}:${page}`;
+    const staged = bid ? ocrState.analysisTags.get(key) : null;
+    const running = [...anJobs.values()].some((job) => !job.finished &&
+      job.buildId === bid && (job.src || "primary") === docSrcKey(d) &&
+      Array.isArray(job.pages) && job.pages.includes(page));
+    row.classList.toggle("pg-sel", ocrState.pageSel.has(page));
+    row.classList.toggle("pg-analysis-staged", !!staged);
+    row.classList.toggle("pg-analysis-running", running);
+    const badge = row.querySelector(".an-fac-badge");
+    if (badge) {
+      badge.hidden = !staged && !running;
+      badge.textContent = running ? "ANALYZING" : "STAGED";
+    }
+  }
+}
+
+async function renderAnFacsimile() {
+  const box = el("an-facsimile");
+  if (!box || el("ocr-analysis-workspace").hidden || box.offsetParent === null) return;
+  const seq = ++anFacsimileSeq;
+  if (anFacsimileObserver) { anFacsimileObserver.disconnect(); anFacsimileObserver = null; }
+  const d = ocrSelDoc();
+  const b = d && d.buildId ? state.builds[d.buildId] : null;
+  if (!d || !b || !anAnalyzable(b)) {
+    box.innerHTML = `<p class="empty">Select an available verified book with OCR data.</p>`;
+    return;
+  }
+  let sections = ocrPageSections(d.text);
+  if (!sections) sections = { pre: "", map: new Map([[1, d.text]]) };
+  const pages = [...sections.map.keys()].sort((a, z) => a - z);
+  if (!pages.length) {
+    box.innerHTML = `<p class="empty">This artifact has no page-aligned OCR text.</p>`;
+    return;
+  }
+  const pdf = docPdf(d);
+  let info = pdf ? ocrState.pdfInfo[pdf] : null;
+  if (pdf && !info) {
+    try {
+      const data = await (await fetch("/api/pdf/info?path=" + encodeURIComponent(pdf))).json();
+      if (data.ok) { info = data; ocrState.pdfInfo[pdf] = data; }
+    } catch (e) { /* a text-only facsimile still renders */ }
+  }
+  if (seq !== anFacsimileSeq || ocrSelDoc() !== d) return;
+  ocrState.pages = sections;
+  ocrState.pagesSrc = docSrcKey(d);
+  box.innerHTML = pages.map((page) => {
+    const dim = info && info.dims && info.dims[page - 1];
+    const ratio = dim && dim[0] > 0 && dim[1] > 0
+      ? `aspect-ratio:${dim[0]} / ${dim[1]};` : "aspect-ratio:3 / 4;";
+    return `<article class="an-fac-page" data-page="${page}">
+      <button class="an-fac-pagebar" type="button" data-tip="Select page ${page}; Ctrl+click extends a range">
+        <span>Page ${page}</span><span class="an-fac-badge" hidden></span>
+      </button>
+      <div class="ocr-pglayout" data-lay="${page}" style="${ratio}"></div>
+    </article>`;
+  }).join("");
+  const panes = [...box.querySelectorAll(".ocr-pglayout")];
+  const fill = (pane) => fillOcrLayout(pane, pdf);
+  if ("IntersectionObserver" in window) {
+    anFacsimileObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        anFacsimileObserver.unobserve(entry.target);
+        fill(entry.target);
+      }
+    }, { root: box, rootMargin: "500px 0px" });
+    panes.forEach((pane) => anFacsimileObserver.observe(pane));
+  } else {
+    panes.forEach(fill);
+  }
+  decorateAnFacsimile();
+}
+
+function onAnFacsimileClick(ev) {
+  const bar = ev.target.closest(".an-fac-pagebar");
+  if (!bar) return;
+  const row = bar.closest(".an-fac-page");
+  const page = row ? +row.dataset.page : 0;
+  if (!page) return;
+  if (ev.ctrlKey && ocrState.selAnchor) {
+    const from = Math.min(ocrState.selAnchor, page);
+    const to = Math.max(ocrState.selAnchor, page);
+    for (let n = from; n <= to; n++) ocrState.pageSel.add(n);
+  } else if (ocrState.pageSel.has(page)) {
+    ocrState.pageSel.delete(page);
+    ocrState.selAnchor = page;
+  } else {
+    ocrState.pageSel.add(page);
+    ocrState.selAnchor = page;
+  }
+  decorateAnFacsimile();
+  decorateOcrPages();
+  updateOcrStagedMsg();
 }
 
 // show which provider/model an analysis will run on, and warn when no key is set
@@ -7660,8 +7819,7 @@ function anSelect(id) {
   const b = state.builds[id];
   if (!b || !anAnalyzable(b)) return;
   state.anSel = id;
-  renderAnList();
-  renderAnMain();
+  selectOcrBook(id);
 }
 
 function activeAnPane() {
@@ -7672,7 +7830,7 @@ function activeAnPane() {
 function switchAnPane(id) {
   document.querySelectorAll("#an-tabs .pane-tab").forEach((t) =>
     t.classList.toggle("active", t.dataset.antab === id));
-  document.querySelectorAll("#analyze .an-pane").forEach((p) =>
+  document.querySelectorAll("#ocr-analysis-workspace .an-pane").forEach((p) =>
     p.classList.toggle("active", p.id === id));
   renderAnPane(id);
 }
@@ -7706,12 +7864,14 @@ async function anStartJob(path, body, label, btn) {
   // guard re-entry: a second job of the same kind on the same entry would race
   // (two summaries overwrite; a translate recomputes and re-does pages)
   for (const m of anJobs.values()) {
-    if (m.kind === label && m.buildId === body.build_id) {
+    if (!m.finished && path !== "/api/analyze/pages" &&
+        m.kind === label && m.buildId === body.build_id) {
       el("an-msg").textContent = `${label} already running…`;
       return null;
     }
   }
   el("an-msg").textContent = "";
+  body.engine = body.engine || state.settings.textAnalysisService || "configured";
   if (btn) btn.disabled = true;
   try {
     const res = await fetch(path, {
@@ -7726,9 +7886,19 @@ async function anStartJob(path, body, label, btn) {
       statusErr(`ANALYZE :: ${(data.error || "FAILED").toUpperCase()}`);
       return null;
     }
-    anJobs.set(data.job, { kind: label, buildId: body.build_id, btn });
+    const build = state.builds[body.build_id] || {};
+    anJobs.set(data.job, {
+      kind: label, buildId: body.build_id, btn, path,
+      book: build.title || body.build_id,
+      engine: data.engine || body.engine || "configured",
+      pages: data.pages || body.pages || [], src: body.src || "primary",
+      doc: data.doc || body.doc || "", artifact: data.artifact || "",
+      status: "Starting...", at: new Date().toLocaleTimeString(), finished: false,
+    });
     el("an-msg").textContent = `${label} — starting…`;
     status(`ANALYZE :: ${label.toUpperCase()} STARTED`);
+    renderOcrQueue();
+    decorateAnFacsimile();
     anEnsurePolling();
     return data;
   } catch (e) {
@@ -7739,16 +7909,26 @@ async function anStartJob(path, body, label, btn) {
 }
 
 function anEnsurePolling() {
-  if (anPollTimer || !anJobs.size) return;
+  if (anPollTimer || ![...anJobs.values()].some((job) => !job.finished)) return;
   anPollTimer = setInterval(async () => {
     for (const [id, meta] of [...anJobs]) {
+      if (meta.finished) continue;
       let job = null;
       try {
         const res = await fetch(`/api/analyze/job/${id}`);
-        if (res.status === 404) { anJobs.delete(id); continue; }
+        if (res.status === 404) {
+          meta.finished = true;
+          meta.status = "Lost - the server restarted mid-job";
+          if (meta.btn) meta.btn.disabled = false;
+          continue;
+        }
         job = await res.json();
       } catch (e) { continue; }
       const pct = job.total ? Math.round((job.done / job.total) * 100) : 0;
+      meta.status = job.status === "running"
+        ? `Running - ${job.done}/${job.total}` : String(job.status || "Running");
+      meta.pages = job.pages || meta.pages;
+      meta.artifact = job.artifact || meta.artifact;
       status(`ANALYZE :: ${meta.kind.toUpperCase()} :: ${job.done}/${job.total} (${pct}%)` +
         (job.errors ? ` :: ${job.errors} ERRORS` : ""));
       // in-pane progress (only while the user is on that entry)
@@ -7758,7 +7938,10 @@ function anEnsurePolling() {
           (job.errors ? ` (${job.errors} errors)` : "");
       }
       if (job.status.startsWith("done") || job.status === "error") {
-        anJobs.delete(id);
+        meta.finished = true;
+        meta.status = job.status === "error"
+          ? `Error - ${job.error || "analysis failed"}`
+          : `${job.status}${job.note ? ` - ${job.note}` : ""}`;
         if (meta.btn) meta.btn.disabled = false;
         if (job.status === "error") {
           statusErr(`ANALYZE :: ${meta.kind.toUpperCase()} FAILED :: ${job.error}`);
@@ -7766,19 +7949,26 @@ function anEnsurePolling() {
         } else {
           status(`ANALYZE :: ${meta.kind.toUpperCase()} ${job.status.toUpperCase()}` +
             (job.note ? ` :: ${job.note}` : ""));
-          if (meta.kind === "relevance" || meta.kind === "summarize") {
+          if (["relevance", "summarize", "about"].includes(meta.kind)) {
             await loadBuilds();
-            if (meta.kind === "summarize" && state.buildSel === meta.buildId &&
-                !buildIsDirty()) renderBuildEditor();
+            if (["summarize", "about"].includes(meta.kind) &&
+                state.buildSel === meta.buildId && !buildIsDirty()) renderBuildEditor();
           }
+          if (meta.path === "/api/analyze/pages") await loadOcrBooks();
           if (state.anSel === meta.buildId) {
             el("an-msg").textContent = "";
             renderAnPane(activeAnPane());
+            renderOcrDocs();
           }
         }
       }
     }
-    if (!anJobs.size) { clearInterval(anPollTimer); anPollTimer = null; }
+    renderOcrQueue();
+    decorateAnFacsimile();
+    if (![...anJobs.values()].some((job) => !job.finished)) {
+      clearInterval(anPollTimer);
+      anPollTimer = null;
+    }
   }, 1500);
 }
 
@@ -8026,6 +8216,10 @@ async function anSaveBundle() {
 // --- wiring ----------------------------------------------------------------------
 
 function initAnalyze() {
+  // The former top-level Analyze panel now lives beside the OCR facsimile in
+  // the unified Analyze workspace. Moving the existing node preserves every
+  // pane/editor id and its event contracts while removing the duplicate book list.
+  el("an-integrated-host").appendChild(el("an-main"));
   makeCatPicker("an-cat-picker", async (ids) => {
     const b = anSelected();
     if (b && await patchBuildRaw(b.id, { category_ids: ids }, true)) {
@@ -8042,6 +8236,8 @@ function initAnalyze() {
   }
 
   anAboutMd = createMdEditor(el("an-about-editor"));
+  el("an-facsimile").addEventListener("click", onAnFacsimileClick);
+  el("an-stage-pages").addEventListener("click", stageSelectedAnalysisPages);
 
   el("an-summarize").addEventListener("click", () => {
     const b = anSelected();
@@ -8066,6 +8262,12 @@ function initAnalyze() {
     });
     const data = await res.json().catch(() => ({}));
     el("an-msg").textContent = res.ok && data.ok ? "About saved" : (data.error || "save failed");
+    if (res.ok && data.ok) {
+      await loadBuilds();
+      if (state.buildSel === b.id && !buildIsDirty()) renderBuildEditor();
+      await loadOcrBooks();
+      renderOcrDocs();
+    }
   });
 
   el("an-suggest").addEventListener("click", async () => {
@@ -8209,7 +8411,9 @@ function initAnalyze() {
       return;
     }
     state.anSel = b.id;
-    document.querySelector('#tabs .tab[data-tab="analyze"]').click();
+    document.querySelector('#tabs .tab[data-tab="ocr"]').click();
+    setAnalyzeWorkspace("analysis", true);
+    selectOcrBook(b.id);
   });
 }
 
@@ -8466,6 +8670,626 @@ function openCategories() {
   el("cat-msg").textContent = "";
   el("cat-overlay").hidden = false;
   loadTaxonomy().then(renderCatTree);
+}
+
+
+// --- Publish tab: public-catalogue tree + website-format preview ------------
+
+function publishSlug(v) { return String((v && v.slug) || "").trim(); }
+
+function publishStableCompare(a, b) {
+  const left = String(a == null ? "" : a), right = String(b == null ? "" : b);
+  const foldedLeft = left.normalize("NFKC").toLowerCase();
+  const foldedRight = right.normalize("NFKC").toLowerCase();
+  if (foldedLeft < foldedRight) return -1;
+  if (foldedLeft > foldedRight) return 1;
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
+
+function publishPositiveVolume(value) {
+  const text = String(value == null ? "" : value).trim();
+  if (!/^\d+$/.test(text)) return null;
+  const number = Number(text);
+  return Number.isSafeInteger(number) && number > 0 ? number : null;
+}
+
+function publishMemberSort(a, b) {
+  const av = publishPositiveVolume(a.volume), bv = publishPositiveVolume(b.volume);
+  const an = av !== null, bn = bv !== null;
+  if (an !== bn) return an ? -1 : 1;
+  if (an && av !== bv) return av - bv;
+  const vt = publishStableCompare(a.volume, b.volume);
+  if (vt) return vt;
+  return publishStableCompare(a.title, b.title) ||
+    publishStableCompare(publishSlug(a), publishSlug(b));
+}
+
+function publishEntities() {
+  const groups = new Map(), singles = [];
+  for (const v of state.publishEntries) {
+    if (!publishSlug(v)) continue;
+    const gid = String(v.group_id || "").trim();
+    if (!gid) {
+      singles.push({ kind: "book", key: "book:" + publishSlug(v),
+        label: String(v.title || "Untitled"), entries: [v] });
+      continue;
+    }
+    if (!groups.has(gid)) groups.set(gid, []);
+    groups.get(gid).push(v);
+  }
+  const out = singles;
+  for (const [gid, members] of groups) {
+    members.sort(publishMemberSort);
+    out.push({ kind: "set", key: "set:" + gid, groupId: gid,
+      label: setBaseTitle(members[0]) || String(members[0].title || gid),
+      entries: members });
+  }
+  return out.sort((a, b) => publishStableCompare(a.label, b.label) ||
+    publishStableCompare(a.key, b.key));
+}
+
+function publishBookLabel(v, inSet) {
+  const title = String(v.title || "Untitled");
+  if (!inSet) return title;
+  const vol = String(v.volume || "").trim();
+  return (vol ? `Volume ${vol}` : "Volume") + (title ? ` — ${title}` : "");
+}
+
+function publishAliasNodeId(parentNodeId, selectionKey) {
+  return `alias:${encodeURIComponent(String(parentNodeId))}:` +
+    encodeURIComponent(String(selectionKey));
+}
+
+function publishEntityNode(entity, parentNodeId) {
+  const nodeId = publishAliasNodeId(parentNodeId, entity.key);
+  if (entity.kind === "book") {
+    return { kind: "book", nodeId, selectKey: entity.key, label: entity.label,
+      entry: entity.entries[0], children: [] };
+  }
+  return { kind: "set", nodeId, selectKey: entity.key, label: entity.label,
+    entries: entity.entries,
+    children: entity.entries.map((v) => {
+      const selectKey = "book:" + publishSlug(v);
+      return { kind: "book", nodeId: publishAliasNodeId(nodeId, selectKey),
+        selectKey, label: publishBookLabel(v, true), entry: v, children: [] };
+    }) };
+}
+
+function publishEntryPaths(v) {
+  const raw = Array.isArray(v.category_paths) ? v.category_paths : [];
+  const seen = new Set(), out = [];
+  for (const p of raw) {
+    if (!Array.isArray(p)) continue;
+    const clean = p.map((x) => String(x || "").trim()).filter(Boolean);
+    const key = JSON.stringify(clean);
+    if (clean.length && !seen.has(key)) { seen.add(key); out.push(clean); }
+  }
+  return out;
+}
+
+function publishMostSpecificPaths(paths) {
+  return paths.filter((p, i) => !paths.some((q, j) => j !== i && q.length > p.length &&
+    p.every((name, n) => q[n] === name)));
+}
+
+function publishEntityPaths(entity) {
+  const byKey = new Map();
+  for (const v of entity.entries) {
+    for (const path of publishEntryPaths(v)) byKey.set(JSON.stringify(path), path);
+  }
+  return publishMostSpecificPaths([...byKey.values()]);
+}
+
+function publishYearBucket(raw) {
+  const year = Number(raw);
+  if (!Number.isInteger(year) || year < 1000 || year > 2999)
+    return { key: "undated", label: "Undated", rank: 9999 };
+  const start = Math.floor(year / 100) * 100;
+  return { key: String(start), label: `${start}–${start + 99}`, rank: start };
+}
+
+function publishGroupNode(id, label, entities, rank) {
+  return { kind: "group", nodeId: id, selectKey: "", label,
+    rank: rank == null ? 0 : rank,
+    children: entities.map((entity) => publishEntityNode(entity, id)) };
+}
+
+const PUBLISH_UNKNOWN_AUTHOR = Symbol("publish-unknown-author");
+
+function publishTreeModel() {
+  const entities = publishEntities();
+  const mode = state.settings.publishGroup;
+  if (mode === "sets")
+    return entities.map((entity) => publishEntityNode(entity, "group:sets:root"));
+
+  if (mode === "author") {
+    const buckets = new Map();
+    for (const entity of entities) {
+      const authors = [...new Set(entity.entries.map((v) => String(v.authors || "").trim())
+        .filter(Boolean))];
+      for (const author of (authors.length ? authors : [PUBLISH_UNKNOWN_AUTHOR])) {
+        if (!buckets.has(author)) buckets.set(author, new Map());
+        buckets.get(author).set(entity.key, entity);
+      }
+    }
+    return [...buckets].sort((a, b) => {
+      if (a[0] === PUBLISH_UNKNOWN_AUTHOR)
+        return b[0] === PUBLISH_UNKNOWN_AUTHOR ? 0 : 1;
+      if (b[0] === PUBLISH_UNKNOWN_AUTHOR) return -1;
+      return publishStableCompare(a[0], b[0]);
+    }).map(([author, rows]) => {
+      const unknown = author === PUBLISH_UNKNOWN_AUTHOR;
+      const label = unknown ? "Unknown author" : author;
+      const id = unknown ? "group:author:unknown" :
+        "group:author:" + encodeURIComponent(author);
+      return publishGroupNode(id, label, [...rows.values()]);
+    });
+  }
+
+  if (mode === "date") {
+    const buckets = new Map();
+    for (const entity of entities) {
+      const values = new Map();
+      for (const v of entity.entries) {
+        const bucket = publishYearBucket(v.year);
+        if (bucket.key !== "undated") values.set(bucket.key, bucket);
+      }
+      if (!values.size) values.set("undated", publishYearBucket(null));
+      for (const bucket of values.values()) {
+        if (!buckets.has(bucket.key)) buckets.set(bucket.key,
+          { bucket, entities: new Map() });
+        buckets.get(bucket.key).entities.set(entity.key, entity);
+      }
+    }
+    return [...buckets.values()].sort((a, b) => a.bucket.rank - b.bucket.rank)
+      .map(({ bucket, entities: rows }) => publishGroupNode(
+        "group:date:" + bucket.key, bucket.label, [...rows.values()], bucket.rank));
+  }
+
+  const root = { children: new Map(), entities: new Map() };
+  const uncategorized = new Map();
+  for (const entity of entities) {
+    const paths = publishEntityPaths(entity);
+    if (!paths.length) { uncategorized.set(entity.key, entity); continue; }
+    for (const path of paths) {
+      let branch = root;
+      for (let i = 0; i < path.length; i++) {
+        const names = path.slice(0, i + 1);
+        const key = JSON.stringify(names);
+        if (!branch.children.has(key)) branch.children.set(key,
+          { id: "group:category:" + key, label: path[i], children: new Map(),
+            entities: new Map() });
+        branch = branch.children.get(key);
+      }
+      branch.entities.set(entity.key, entity);
+    }
+  }
+  const categoryNodes = (branch) => {
+    const folders = [...branch.children.values()]
+      .sort((a, b) => publishStableCompare(a.label, b.label) ||
+        publishStableCompare(a.id, b.id))
+      .map((child) => ({ kind: "group", nodeId: child.id, selectKey: "",
+        label: child.label,
+        children: [...categoryNodes(child), ...[...child.entities.values()]
+          .map((entity) => publishEntityNode(entity, child.id))] }));
+    return folders;
+  };
+  const out = categoryNodes(root);
+  if (uncategorized.size) out.push(publishGroupNode(
+    "group:category:uncategorized", "Uncategorized", [...uncategorized.values()], 9999));
+  return out;
+}
+
+function publishNodeOpen(node, depth) {
+  if (state.publishOpen.has(node.nodeId)) return true;
+  if (state.publishClosed.has(node.nodeId)) return false;
+  return node.kind === "group" && depth === 0;
+}
+
+function publishSelectedNodePath(nodes, selectKey) {
+  for (const node of nodes) {
+    if (node.selectKey && node.selectKey === selectKey) return [node.nodeId];
+    const childPath = publishSelectedNodePath(node.children || [], selectKey);
+    if (childPath) return [node.nodeId, ...childPath];
+  }
+  return null;
+}
+
+function publishRevealSelected(nodes, selectKey) {
+  const path = publishSelectedNodePath(nodes, selectKey);
+  if (!path) return null;
+  for (const nodeId of path.slice(0, -1)) {
+    state.publishClosed.delete(nodeId);
+    state.publishOpen.add(nodeId);
+  }
+  return path;
+}
+
+function publishTreeNodeHtml(node, depth) {
+  const folder = node.kind === "group" || node.kind === "set";
+  const open = folder && publishNodeOpen(node, depth);
+  const selected = !!node.selectKey && node.selectKey === state.publishSel;
+  const selectable = node.kind === "book" || node.kind === "set";
+  const count = node.kind === "set" ? `${node.entries.length}` : "";
+  const caret = folder
+    ? `<button class="publish-caret" type="button" data-publish-toggle="${esc(node.nodeId)}"
+         aria-label="${open ? "Collapse" : "Expand"}" aria-expanded="${open}">${open ? "▾" : "▸"}</button>`
+    : `<span class="publish-caret spacer"></span>`;
+  const label = selectable
+    ? `<button class="publish-tree-label" type="button" data-publish-select="${esc(node.selectKey)}" title="${esc(node.label)}">${esc(node.label)}</button>`
+    : folder
+      ? `<button class="publish-tree-label" type="button" data-publish-toggle="${esc(node.nodeId)}" aria-expanded="${open}" title="${esc(node.label)}">${esc(node.label)}</button>`
+      : `<span class="publish-tree-label" title="${esc(node.label)}">${esc(node.label)}</span>`;
+  const children = open && node.children.length
+    ? `<div class="publish-tree-children">${node.children
+      .map((child) => publishTreeNodeHtml(child, depth + 1)).join("")}</div>` : "";
+  return `<div class="publish-tree-node ${node.kind}${selected ? " selected" : ""}"
+      data-publish-node="${esc(node.nodeId)}">
+    <div class="publish-tree-row" style="--tree-depth:${depth}">${caret}
+      <span class="publish-tree-icon" aria-hidden="true">${node.kind === "book" ? "□" : "▣"}</span>
+      ${label}${count ? `<span class="publish-tree-count">${count}</span>` : ""}</div>${children}</div>`;
+}
+
+function publishFindEntity(key) {
+  if (String(key || "").startsWith("book:")) {
+    const slug = String(key).slice(5);
+    const entry = state.publishEntries.find((v) => publishSlug(v) === slug);
+    if (entry) return { kind: "book", key: "book:" + slug,
+      label: String(entry.title || "Untitled"), entries: [entry] };
+  }
+  return publishEntities().find((entity) => entity.key === key) || null;
+}
+
+function renderPublishTree(revealSelection = false) {
+  const model = publishTreeModel();
+  const entities = publishEntities();
+  if (!publishFindEntity(state.publishSel) && entities.length) {
+    state.publishSel = entities[0].key;
+    revealSelection = true;
+  }
+  if (revealSelection) publishRevealSelected(model, state.publishSel);
+  const tree = el("publish-tree");
+  tree.removeAttribute("role");
+  tree.innerHTML = model.map((node) => publishTreeNodeHtml(node, 0)).join("");
+  el("publish-tree-empty").hidden = entities.length > 0;
+  el("publish-count").textContent = `${state.publishEntries.length} volume${
+    state.publishEntries.length === 1 ? "" : "s"}`;
+}
+
+function publishSafeUrl(raw, allowLocal) {
+  const value = String(raw || "").trim();
+  if (allowLocal && value.startsWith("/")) return value;
+  try {
+    const u = new URL(value);
+    return /^(https?:)$/.test(u.protocol) ? u.href : "";
+  } catch (e) { return ""; }
+}
+
+function publishThumb(v) {
+  return publishSafeUrl(v.thumbnail_url, false) ||
+    publishSafeUrl(v.preview_thumbnail, true);
+}
+
+function publishCategoryHtml(v, links) {
+  return publishEntryPaths(v).map((path) => {
+    const text = path.join(" › ");
+    return links
+      ? `<span class="ppub-cat-link">${esc(text)}</span>`
+      : `<span class="ppub-chip">${esc(text)}</span>`;
+  }).join(links ? "<br>" : "");
+}
+
+function publishMetaRow(label, value) {
+  return value ? `<tr><th>${esc(label)}</th><td>${value}</td></tr>` : "";
+}
+
+function publishDay(raw) {
+  const date = new Date(raw || "");
+  return Number.isNaN(date.getTime()) ? "" : date.toISOString().slice(0, 10);
+}
+
+function publishMetadata(v) {
+  const src = publishSafeUrl(v.source_url, false);
+  const rows = [
+    publishMetaRow("Author", v.authors ? esc(v.authors) : ""),
+    publishMetaRow("Published", v.year ? esc(v.year) : ""),
+    publishMetaRow("Publisher", v.publisher ? esc(v.publisher) : ""),
+    publishMetaRow("Place", v.publisher_city ? esc(v.publisher_city) : ""),
+    publishMetaRow("Edition", v.edition ? esc(v.edition) : ""),
+    publishMetaRow("Volume", v.volume ? esc(v.volume) : ""),
+    publishMetaRow("Language", v.language ? esc(v.language) : ""),
+    publishMetaRow("Pages", v.pages ? esc(v.pages) : ""),
+    publishMetaRow("Categories", publishCategoryHtml(v, true)),
+    publishMetaRow("Source", src ? `<a href="${esc(src)}" target="_blank" rel="noopener">${esc(new URL(src).hostname.replace(/^www\./, ""))}</a>` : ""),
+    publishMetaRow("Copyright", v.copyright_status ? esc(v.copyright_status) : ""),
+    publishMetaRow("Added", publishDay(v.created_at)),
+  ].join("");
+  return `<table class="ppub-meta"><tbody>${rows}</tbody></table>`;
+}
+
+function publishImprint(v) {
+  return [v.publisher, v.publisher_city, v.year, v.edition,
+    v.pages && `${v.pages} pp`, v.volume && `Volume ${v.volume}`]
+    .filter(Boolean).map((x) => `<span>${esc(x)}</span>`).join("");
+}
+
+function publishUnescapeEntities(value) {
+  return String(value).replace(/&amp;/g, "&").replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+}
+
+function publishMarkdownInline(text) {
+  let value = text;
+  value = value.replace(/`([^`]+)`/g, (_, code) => `<code>${code}</code>`);
+  value = value.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+  value = value.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+  value = value.replace(/(^|[^_\w])_([^_\n]+)_/g, "$1<em>$2</em>");
+  value = value.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (match, label, url) => {
+    const safe = publishSafeUrl(publishUnescapeEntities(url), false);
+    return safe
+      ? `<a href="${esc(safe)}" target="_blank" rel="noopener nofollow">${label}</a>`
+      : label;
+  });
+  return value;
+}
+
+// Kept in step with website/assets/markdown.js: escape the whole source first,
+// allow no raw HTML, and validate every link target before creating an anchor.
+function publishMarkdown(src) {
+  const lines = esc(String(src || "")).replace(/\r\n?/g, "\n").split("\n");
+  const out = [];
+  let i = 0, paragraph = [];
+  const flushParagraph = () => {
+    if (paragraph.length) {
+      out.push(`<p>${publishMarkdownInline(paragraph.join(" "))}</p>`);
+      paragraph = [];
+    }
+  };
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^```/.test(line)) {
+      flushParagraph();
+      const code = [];
+      i++;
+      while (i < lines.length && !/^```/.test(lines[i])) code.push(lines[i++]);
+      i++;
+      out.push(`<pre><code>${code.join("\n")}</code></pre>`);
+      continue;
+    }
+    if (/^\s*$/.test(line)) { flushParagraph(); i++; continue; }
+    const heading = line.match(/^(#{1,6})\s+(.*)$/);
+    if (heading) {
+      flushParagraph();
+      const level = heading[1].length;
+      out.push(`<h${level}>${publishMarkdownInline(heading[2].trim())}</h${level}>`);
+      i++;
+      continue;
+    }
+    if (/^(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+      flushParagraph(); out.push("<hr>"); i++; continue;
+    }
+    if (/^&gt;\s?/.test(line)) {
+      flushParagraph();
+      const quote = [];
+      while (i < lines.length && /^&gt;\s?/.test(lines[i]))
+        quote.push(lines[i++].replace(/^&gt;\s?/, ""));
+      out.push(`<blockquote>${publishMarkdownInline(quote.join(" "))}</blockquote>`);
+      continue;
+    }
+    if (/^\s*[-*+]\s+/.test(line)) {
+      flushParagraph();
+      const items = [];
+      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i]))
+        items.push(`<li>${publishMarkdownInline(lines[i++].replace(/^\s*[-*+]\s+/, ""))}</li>`);
+      out.push(`<ul>${items.join("")}</ul>`);
+      continue;
+    }
+    if (/^\s*\d+\.\s+/.test(line)) {
+      flushParagraph();
+      const items = [];
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i]))
+        items.push(`<li>${publishMarkdownInline(lines[i++].replace(/^\s*\d+\.\s+/, ""))}</li>`);
+      out.push(`<ol>${items.join("")}</ol>`);
+      continue;
+    }
+    paragraph.push(line.trim());
+    i++;
+  }
+  flushParagraph();
+  return out.join("\n");
+}
+
+function publishNotes(notes) {
+  if (!Array.isArray(notes) || !notes.length) return "";
+  const shown = notes.slice(0, 3).map((n) => `<div class="ppub-note">
+    <span class="ppub-note-page">p. ${esc(n.page || "?")}</span>
+    ${n.kind ? `<span class="ppub-note-kind">${esc(n.kind)}</span>` : ""}
+    ${n.quote ? `<p class="ppub-note-quote">“${esc(n.quote)}”</p>` : ""}
+    ${n.body ? `<p>${esc(n.body)}</p>` : ""}</div>`).join("");
+  const more = notes.length > 3
+    ? `<p class="ppub-note-more">…and ${notes.length - 3} more in the reader.</p>` : "";
+  return `<h2 class="ppub-section-head">Annotations · ${notes.length}</h2>${shown}${more}`;
+}
+
+function publishAvailability(v) {
+  const assets = v.assets && typeof v.assets === "object" ? v.assets : {};
+  const items = [];
+  if (assets.about) items.push("About article");
+  if (+assets.pages) items.push(`Full text · ${+assets.pages} page${+assets.pages === 1 ? "" : "s"}`);
+  if (assets.translations && typeof assets.translations === "object") {
+    const langs = Object.keys(assets.translations);
+    if (langs.length) items.push(`Translations · ${langs.join(", ")}`);
+  }
+  if (+assets.notes) items.push(`${+assets.notes} annotation${+assets.notes === 1 ? "" : "s"}`);
+  return `<div class="ppub-avail"><span class="ppub-label">Also available</span>${
+    items.length ? items.map((x) => `<div>› ${esc(x)}</div>`).join("")
+      : `<div class="ppub-faint">The scan only, so far.</div>`}</div>`;
+}
+
+function publishActions(v) {
+  const pdf = publishSafeUrl(v.pdf_url, false);
+  const base = publishSafeUrl(state.publishSiteUrl, false).replace(/\/$/, "");
+  const read = base && publishSlug(v)
+    ? `${base}/read.html?slug=${encodeURIComponent(publishSlug(v))}` : "";
+  if (!pdf) return `<span class="ppub-btn disabled">Read online</span>
+    <span class="ppub-btn disabled">PDF pending</span>`;
+  const readButton = read
+    ? `<a class="ppub-btn primary" href="${esc(read)}" target="_blank" rel="noopener">Read online</a>`
+    : `<span class="ppub-btn disabled">Read online</span>`;
+  return `${readButton}
+    <a class="ppub-btn" href="${esc(pdf)}" target="_blank" rel="noopener">Download PDF</a>`;
+}
+
+function publishMasthead(body) {
+  return `<div class="ppub-masthead"><img src="/static/icon.png" width="40" height="40" alt="">
+    <div><div class="ppub-wordmark">World Herb Library</div>
+      <div class="ppub-sub">An archival collection of botanical &amp; medical works</div></div></div>
+    <div class="ppub-shell">${body}</div>`;
+}
+
+function publishBookHtml(v, details) {
+  const thumb = publishThumb(v);
+  const cats = publishCategoryHtml(v, false);
+  const assets = v.assets && typeof v.assets === "object" ? v.assets : {};
+  const aboutHead = details && /^\s*#{1,6}\s/.test(details.about || "")
+    ? "" : `<h2 class="ppub-section-head">About this volume</h2>`;
+  const about = details && details.about ? `${aboutHead}
+    <div class="ppub-prose">${publishMarkdown(details.about)}</div>` :
+    (!details && assets.about ? `<p class="ppub-loading">Loading About article…</p>` : "");
+  const fallback = details && details.source === "local" && details.warning
+    ? `<div class="ppub-preview-warning" role="status" title="${esc(details.warning)}">Online article details are unavailable. Showing the last uploaded local copy.</div>`
+    : "";
+  return publishMasthead(`<p class="ppub-crumb">Catalogue › ${esc(v.title || "Untitled")}</p>
+    <div class="ppub-record-page"><div class="ppub-book-main">
+      <h1 class="ppub-book-title">${esc(v.title || "Untitled")}</h1>
+      ${v.subtitle ? `<p class="ppub-book-subtitle">${esc(v.subtitle)}</p>` : ""}
+      ${v.authors ? `<p class="ppub-book-author">${esc(v.authors)}</p>` : ""}
+      <p class="ppub-imprint">${publishImprint(v)}</p>
+      ${cats ? `<div class="ppub-cats">${cats}</div>` : ""}
+      ${fallback}${about}${publishNotes(details && details.notes)}
+    </div><aside class="ppub-book-side">
+      ${thumb ? `<img class="ppub-thumb" src="${esc(thumb)}" alt="">` : ""}
+      ${publishMetadata(v)}
+      <div class="ppub-actions">${publishActions(v)}</div>
+      ${publishAvailability(v)}
+    </aside></div>`);
+}
+
+function publishPlainDescription(value) {
+  return String(value || "").replace(/[*_`>#]+/g, "").replace(/\s+/g, " ").trim();
+}
+
+function publishCatalogRow(v) {
+  const thumb = publishThumb(v), desc = publishPlainDescription(v.description);
+  const cats = publishCategoryHtml(v, false);
+  return `<li class="ppub-catalog-row${thumb ? " has-thumb" : ""}">
+    ${thumb ? `<img src="${esc(thumb)}" alt="" loading="lazy">` : ""}
+    <div><button class="ppub-row-title" type="button" data-publish-book="${esc(publishSlug(v))}">${esc(v.title || "Untitled")}</button>
+      ${v.subtitle ? `<div class="ppub-row-author">${esc(v.subtitle)}</div>` : ""}
+      ${v.authors ? `<div class="ppub-row-author">${esc(v.authors)}</div>` : ""}
+      <div class="ppub-row-imprint">${publishImprint(v)}</div>
+      ${cats ? `<div class="ppub-row-cats">${cats}</div>` : ""}
+      ${desc ? `<p>${esc(desc)}</p>` : ""}
+      <button class="ppub-btn" type="button" data-publish-book="${esc(publishSlug(v))}">Preview volume</button>
+    </div></li>`;
+}
+
+function publishSetHtml(entity) {
+  return publishMasthead(`<p class="ppub-crumb">Catalogue › Book set</p>
+    <div class="ppub-set-head"><span class="ppub-label">Book set</span>
+      <h1 class="ppub-book-title">${esc(entity.label)}</h1>
+      <p>${entity.entries.length} published volume${entity.entries.length === 1 ? "" : "s"}</p></div>
+    <ol class="ppub-catalog-list">${entity.entries.map(publishCatalogRow).join("")}</ol>`);
+}
+
+async function renderPublishPreview() {
+  const entity = publishFindEntity(state.publishSel);
+  el("publish-empty").hidden = !!entity;
+  el("publish-record").hidden = !entity;
+  el("publish-open-live").hidden = !entity || entity.kind !== "book" ||
+    !publishSafeUrl(state.publishSiteUrl, false);
+  if (!entity) { el("publish-record").innerHTML = ""; return; }
+  if (entity.kind === "set") {
+    el("publish-preview-label").textContent = `${entity.label} · set preview`;
+    el("publish-record").innerHTML = publishSetHtml(entity);
+    return;
+  }
+  const v = entity.entries[0], slug = publishSlug(v), mine = ++state.publishPreviewSeq;
+  el("publish-preview-label").textContent = `${v.title || "Untitled"} · catalog preview`;
+  const cached = state.publishDetails.get(slug);
+  el("publish-record").innerHTML = publishBookHtml(v, cached || null);
+  if (cached) return;
+  try {
+    const res = await fetch("/api/publish/preview/" + encodeURIComponent(slug));
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    state.publishDetails.set(slug, data);
+    if (mine === state.publishPreviewSeq && state.publishSel === entity.key)
+      el("publish-record").innerHTML = publishBookHtml(v, data);
+  } catch (e) {
+    if (mine === state.publishPreviewSeq) statusErr("PUBLISH PREVIEW :: " + e.message);
+  }
+}
+
+function setPublishSidebarCollapsed(on, persist) {
+  const collapsed = !!on;
+  el("publish-layout").classList.toggle("sidebar-collapsed", collapsed);
+  el("publish-side-toggle").textContent = collapsed ? "▶" : "◀";
+  el("publish-side-toggle").setAttribute("aria-expanded", String(!collapsed));
+  el("publish-side-toggle").dataset.tip = collapsed
+    ? "Expand published books sidebar" : "Collapse published books sidebar";
+  if (persist) {
+    state.settings.publishSidebarCollapsed = collapsed;
+    saveSettings();
+  }
+}
+
+function loadPublishCatalog() {
+  if (state.publishCatalogLoading) return state.publishCatalogLoading;
+  const mine = ++state.publishCatalogSeq;
+  const refresh = el("publish-refresh");
+  refresh.disabled = true;
+  el("publish-source").textContent = state.publishEntries.length ? "Refreshing…" : "Loading…";
+  state.publishCatalogLoading = (async () => {
+    try {
+      const res = await fetch("/api/publish/catalog");
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      if (mine !== state.publishCatalogSeq) return;
+      state.publishEntries = Array.isArray(data.entries) ? data.entries : [];
+      state.publishSource = data.source || "";
+      state.publishWarning = data.warning || "";
+      state.publishSiteUrl = String(data.site_url || "");
+      state.publishDetails.clear();
+      state.publishLoaded = true;
+      el("publish-source").textContent = state.publishWarning ||
+        (state.publishSource === "cloud" ? "Online catalogue" : "Local uploads");
+      el("publish-source").title = state.publishWarning;
+      renderPublishTree(true);
+      renderPublishPreview();
+    } catch (e) {
+      if (mine !== state.publishCatalogSeq) return;
+      el("publish-source").textContent = "Could not load catalogue";
+      el("publish-tree-empty").textContent = e.message;
+      el("publish-tree-empty").hidden = state.publishEntries.length > 0;
+      statusErr("PUBLISH CATALOGUE :: " + e.message);
+    } finally {
+      if (mine === state.publishCatalogSeq) state.publishCatalogLoading = null;
+      refresh.disabled = false;
+    }
+  })();
+  return state.publishCatalogLoading;
+}
+
+function renderPublish() {
+  el("publish-group").value = state.settings.publishGroup;
+  setPublishSidebarCollapsed(state.settings.publishSidebarCollapsed, false);
+  if (state.publishLoaded) {
+    renderPublishTree(true);
+    renderPublishPreview();
+  } else loadPublishCatalog();
 }
 
 function closeCategories() { el("cat-overlay").hidden = true; }
@@ -9329,12 +10153,21 @@ function setSearchPane(on) {
 
 const ARCHIVE_NAMES = { internet_archive: "Internet Archive", hathitrust: "HathiTrust" };
 
+function capturedSourceMeta(row) {
+  const book = (row && row.book) || {};
+  return {
+    extra: book.extra && typeof book.extra === "object" ? book.extra : {},
+    images: Array.isArray(book.images) ? book.images.slice() : [],
+    capture_id: String(book.capture_id || ""),
+  };
+}
+
 function approvedSources() {
   const out = [];
   for (const row of combinedRows()) {
     // a locally attached scan is a verified source in its own right
     if (row.localPdf) {
-      out.push({
+      out.push(Object.assign({
         title: row.book.title || "",
         subtitle: row.book.subtitle || "",
         author: row.book.author || "",
@@ -9347,10 +10180,10 @@ function approvedSources() {
         identifier: "",
         local_pdf: row.localPdf,
         _rowId: row.id,
-      });
+      }, capturedSourceMeta(row)));
     }
     for (const source of ["internet_archive", "hathitrust"]) {
-      const meta = {
+      const meta = Object.assign({
         title: row.book.title || "",
         subtitle: row.book.subtitle || "",
         author: row.book.author || "",
@@ -9358,7 +10191,7 @@ function approvedSources() {
         year: row.book.year || "",
         category_ids: (row.book.category_ids || []).slice(),
         archive: ARCHIVE_NAMES[source],
-      };
+      }, capturedSourceMeta(row));
       const st = getVerify(row, source);
       if (st === "approved") {
         const s = row.scans && row.scans[source];
@@ -9821,6 +10654,7 @@ function buildSeedFromSource(s) {
     year: s.year, publisher: s.publisher, volume: s.volume || "",
     group_id: buildGroupIdFor(s),
     category_ids: s.category_ids || [],
+    extra: s.extra || {}, images: s.images || [], capture_id: s.capture_id || "",
     pdf_source: pdfUrl, pdf_file: pdfFile, source_url: s.url,
     notes: `Source: ${s.archive}${s.matched_title ? " — " + s.matched_title : ""}`,
   };
@@ -10406,10 +11240,11 @@ const ocrState = {
   books: null,             // build id -> {ocr, preview} (entry folders)
   book: null,              // selected book (build id)
   bookLoading: null,       // build id currently loading (re-entrancy guard)
-  verifiedOnly: false,     // sidebar filter
+  verifiedOnly: true,      // Analyze starts with unavailable drafts hidden
   pages: null,             // {pre, map} sections for the side-by-side view
   pageTags: new Map(),     // "bid:src:page" -> service, STAGED (submit is manual)
   pageRunning: new Map(),  // "bid:src:page" -> service, submitted and processing
+  analysisTags: new Map(), // "bid:src:page" -> {engine, doc}, staged analysis
   pageSel: new Set(),      // selected page numbers (current page view's PDF;
                            // cleared whenever the view swaps to another PDF)
   selAnchor: 0,            // last plain-clicked page (Ctrl+click ranges)
@@ -10483,7 +11318,9 @@ function bookSources(bid) {
   const b = state.builds[bid];
   const out = [];
   const primary = ocrBookPdf(bid);
-  out.push({ key: "primary", path: primary, label: "primary.pdf" });
+  const primaryName = primary.replace(/\\/g, "/").split("/").pop();
+  out.push({ key: "primary", path: primary,
+             label: primaryName ? `Original PDF - ${primaryName}` : "Original PDF" });
   for (const s of (b && b.pdf_sources) || []) {
     const path = (s.path || "").trim();
     if (!path) continue;
@@ -10543,6 +11380,7 @@ async function selectOcrBook(bid) {
   if (ocrState.bookLoading === bid) return;
   ocrSyncEditor();
   ocrState.book = bid;
+  state.anSel = anAnalyzable(state.builds[bid] || {}) ? bid : null;
   clearOcrPageSel();   // selections don't carry across books
   let folder = (ocrState.books || {})[bid];
   if (!folder) { renderOcrTab(); return; }
@@ -10592,6 +11430,8 @@ async function selectOcrBook(bid) {
     }
     if (firstId) ocrState.sel = firstId;
     renderOcrTab();
+    renderAnList();
+    renderAnMain();
     status(folder.ocr.length
       ? `Loaded ${folder.ocr.length} OCR file(s)`
       : "No OCR files in this folder (build it from the Editor tab)");
@@ -10608,7 +11448,7 @@ function ocrVisibleDocs() {
 // The documents pane is a file tree: one node per PDF source of the selected
 // book (primary.pdf first, then each secondary scan), its OCR files beneath.
 // Loose .txt files loaded by hand sit under their own "Local files" node.
-function renderOcrDocs() {
+function legacyRenderDocuments() {
   const list = el("ocr-docs");
   list.innerHTML = "";
   const docs = ocrVisibleDocs();
@@ -10701,6 +11541,202 @@ function renderOcrDocs() {
         <span class="bi-title">${im.page ? `p. ${im.page}` : esc(im.name)}</span>`;
       list.appendChild(row);
     }
+  }
+}
+
+// The Analyze sidebar is an artifact manifest, not just an OCR-file list.
+// Text artifacts lazy-load into the central Document workspace; large PDFs and
+// images remain external viewers so selecting an artifact never reads a whole
+// scan into renderer memory.
+function renderOcrDocs() {
+  const list = el("ocr-docs");
+  list.innerHTML = "";
+  const docs = ocrVisibleDocs();
+  const bid = ocrState.book;
+  const folder = bid ? ((ocrState.books || {})[bid] || {}) : {};
+  const sources = bid ? bookSources(bid) : [];
+
+  const header = (label, icon, count, tip) => {
+    const li = document.createElement("li");
+    li.className = "artifact-group";
+    if (tip) li.dataset.tip = tip;
+    li.innerHTML = `<span class="tree-ico">${icon}</span>` +
+      `<span class="bi-title">${esc(label)}</span>` +
+      `<span class="tree-count">${count || ""}</span>`;
+    list.appendChild(li);
+  };
+  const placeholder = (label) => {
+    const li = document.createElement("li");
+    li.className = "artifact-placeholder";
+    li.textContent = label;
+    list.appendChild(li);
+  };
+  const textArtifact = (label, kind, name, meta) => {
+    const li = document.createElement("li");
+    const selected = ocrSelDoc();
+    li.className = "ocr-doc tree-doc artifact-text" +
+      (selected && selected.artifactKind === kind && selected.artifactName === name ? " active" : "");
+    li.dataset.artifactKind = kind;
+    li.dataset.artifactName = name;
+    const size = meta && meta.size ? `${Math.max(1, Math.round(meta.size / 1024))}k` : "";
+    li.innerHTML = `<span class="tree-ico">${ICONS.text}</span>` +
+      `<span class="bi-title">${esc(label)}</span>` +
+      `<span class="bi-meta">${esc(size)}</span>`;
+    list.appendChild(li);
+  };
+
+  if (!bid) {
+    el("ocr-docs-empty").hidden = docs.length !== 0;
+    for (const d of docs) {
+      const li = document.createElement("li");
+      li.className = "ocr-doc tree-doc" + (d.id === ocrState.sel ? " active" : "");
+      li.dataset.did = d.id;
+      li.innerHTML = `<span class="bi-title">${esc(d.name)}</span>`;
+      list.appendChild(li);
+    }
+    return;
+  }
+  el("ocr-docs-empty").hidden = true;
+
+  header("PDF documents", ICONS.pdf, sources.filter((s) => s.path).length +
+    (folder.processed_pdf ? 1 : 0));
+  for (const s of sources) {
+    const li = document.createElement("li");
+    li.className = "artifact-pdf-row" + (s.path ? "" : " unavailable");
+    li.dataset.src = s.key;
+    li.dataset.tip = s.path || "No PDF attached";
+    const canExtract = s.path && !docs.some((d) => !d.artifactKind &&
+      d.buildId === bid && docSrcKey(d) === s.key &&
+      (d.fileName || d.name) === srcExtractedName(s.key));
+    li.innerHTML = `<span class="tree-ico">${ICONS.pdf}</span>` +
+      `<span class="bi-title">${esc(s.label)}</span>` +
+      (s.path ? `<button class="cad-btn tiny artifact-open-pdf" type="button" ` +
+        `data-pdf="${esc(s.path)}">Open</button>` : `<span class="bi-meta">missing</span>`) +
+      (canExtract ? `<button class="cad-btn tiny icon-btn src-extract" type="button" ` +
+        `data-src="${esc(s.key)}" data-tip="Extract this PDF's text layer">${ICONS.text}</button>` : "");
+    list.appendChild(li);
+  }
+  if (folder.processed_pdf) {
+    const processed = `output/entries/${bid}/${folder.processed_pdf}`;
+    const li = document.createElement("li");
+    li.className = "artifact-pdf-row";
+    li.innerHTML = `<span class="tree-ico">${ICONS.pdf}</span>` +
+      `<span class="bi-title">Processed PDF</span>` +
+      `<button class="cad-btn tiny artifact-open-pdf" type="button" data-pdf="${esc(processed)}">Open</button>`;
+    list.appendChild(li);
+  } else {
+    placeholder("Processed PDF - not generated (preprocessing is coming later)");
+  }
+
+  const ocrDocs = docs.filter((d) => d.buildId === bid && !d.artifactKind);
+  header("OCR data", ICONS.text, ocrDocs.length);
+  if (!ocrDocs.length) placeholder("No OCR data");
+  for (const d of ocrDocs) {
+    const li = document.createElement("li");
+    li.className = "ocr-doc tree-doc" + (d.id === ocrState.sel ? " active" : "");
+    li.dataset.did = d.id;
+    const source = sources.find((s) => s.key === docSrcKey(d));
+    li.innerHTML = `<span class="bi-title">${esc(d.name)}</span>` +
+      `<span class="bi-meta">${esc(source ? source.label : "removed source")}</span>`;
+    list.appendChild(li);
+  }
+
+  const fullText = folder.full_text || [];
+  header("Full text", ICONS.text, fullText.length,
+         "Curated text is distinct from any single OCR pass");
+  if (!fullText.length) placeholder("No combined full text");
+  for (const f of fullText)
+    textArtifact(f.artifact || f.name, "full_text", f.artifact || f.name, f);
+
+  const translations = folder.translations || [];
+  header("Translations", ICONS.text, translations.length);
+  if (!translations.length) placeholder("No translations");
+  for (const t of translations) {
+    textArtifact(`${String(t.lang || t.name).toUpperCase()} translation`,
+                 "translation", t.lang || String(t.name || "").replace(/\.txt$/i, ""), t);
+  }
+
+  const analysis = folder.analysis || [];
+  const analysisCount = analysis.length + (folder.summary && folder.summary.exists ? 1 : 0) +
+    (folder.about && folder.about.exists ? 1 : 0);
+  header("Analysis data", ICONS.text, analysisCount);
+  if (folder.summary && folder.summary.exists)
+    textArtifact("Summary", "summary", "summary.md", folder.summary);
+  if (folder.about && folder.about.exists)
+    textArtifact("Description / About", "about", "about.md", folder.about);
+  for (const a of analysis) textArtifact(a.name, "analysis", a.name, a);
+  if (!analysisCount) placeholder("No text-analysis artifacts");
+
+  const capturedImages = folder.captured_images || [];
+  const extractedImages = folder.images || [];
+  header("Images", ICONS.image, capturedImages.length + extractedImages.length);
+  if (!capturedImages.length && !extractedImages.length)
+    placeholder("No captured or extracted images");
+  for (const im of capturedImages) {
+    const row = document.createElement("li");
+    const url = "/api/capture/image?path=" + encodeURIComponent(im.path || "");
+    row.className = "ocr-doc tree-doc ocr-img-row capture-img-row" +
+      (im.available ? "" : " unavailable");
+    row.dataset.capturePath = im.path || "";
+    row.dataset.captureAvailable = im.available ? "1" : "";
+    row.innerHTML = (im.available
+      ? `<img class="ocr-img-thumb" loading="lazy" decoding="async" alt="" src="${esc(url)}" />`
+      : `<span class="tree-ico">${ICONS.image}</span>`) +
+      `<span class="bi-title">Captured photo - ${esc(im.name || "image")}</span>` +
+      (im.available ? "" : `<span class="bi-meta">missing</span>`);
+    list.appendChild(row);
+  }
+  for (const im of extractedImages) {
+    const row = document.createElement("li");
+    row.className = "ocr-doc tree-doc ocr-img-row";
+    row.dataset.imgName = im.name;
+    row.innerHTML = `<img class="ocr-img-thumb" loading="lazy" decoding="async" alt="" ` +
+      `src="/api/builds/${encodeURIComponent(bid)}/ocr/images/${encodeURIComponent(im.name)}" />` +
+      `<span class="bi-title">${im.page ? `p. ${im.page}` : esc(im.name)}</span>`;
+    list.appendChild(row);
+  }
+
+  const loose = docs.filter((d) => !d.buildId);
+  if (loose.length) {
+    header("Local files", ICONS.folder, loose.length);
+    for (const d of loose) {
+      const li = document.createElement("li");
+      li.className = "ocr-doc tree-doc" + (d.id === ocrState.sel ? " active" : "");
+      li.dataset.did = d.id;
+      li.innerHTML = `<span class="bi-title">${esc(d.name)}</span>`;
+      list.appendChild(li);
+    }
+  }
+}
+
+async function openTextArtifact(kind, name) {
+  const bid = ocrState.book;
+  if (!bid || !kind || !name) return;
+  let url = "";
+  if (kind === "summary" || kind === "about") {
+    url = `/api/builds/${encodeURIComponent(bid)}/${kind}`;
+  } else if (kind === "translation") {
+    url = `/api/builds/${encodeURIComponent(bid)}/translations/${encodeURIComponent(name)}`;
+  } else {
+    const artifactPath = String(name).split("/").map(encodeURIComponent).join("/");
+    url = `/api/builds/${encodeURIComponent(bid)}/artifact/${encodeURIComponent(kind)}/` +
+      artifactPath;
+  }
+  try {
+    const res = await fetch(url);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    const id = `artifact:${bid}:${kind}:${name}`;
+    ocrState.docs = ocrState.docs.filter((d) => d.id !== id);
+    ocrState.docs.push({ id, name, text: String(data.text || ""), buildId: bid,
+                         artifactKind: kind, artifactName: name,
+                         readOnly: true, src: "primary" });
+    ocrState.sel = id;
+    setAnalyzeWorkspace("document", true);
+    setOcrView("edit");
+    renderOcrTab();
+  } catch (e) {
+    el("ocr-msg").textContent = `Could not open artifact: ${e.message || e}`;
   }
 }
 
@@ -11272,16 +12308,33 @@ function onOcrPageInput(ev) {
 function renderOcrQueue() {
   const tbody = el("ocr-queue-rows");
   tbody.innerHTML = "";
-  el("ocr-queue-empty").hidden = ocrState.jobs.length !== 0;
-  el("ocr-queue-count").textContent = `${ocrState.jobs.length} jobs`;
+  const analysisJobs = [...anJobs.entries()];
+  const total = ocrState.jobs.length + analysisJobs.length;
+  el("ocr-queue-empty").hidden = total !== 0;
+  const staged = (ocrState.book ? stagedCountFor(ocrState.book) : 0) +
+    (ocrState.book ? analysisStagedCount(ocrState.book) : 0);
+  el("ocr-queue-count").textContent = `${total} jobs${staged ? ` · ${staged} staged` : ""}`;
   for (const j of ocrState.jobs) {
     const tr = document.createElement("tr");
     const stop = j.id && !j.finished
       ? `<button class="cad-btn tiny danger" type="button" data-ocr-cancel="${esc(j.id)}"` +
         `${j.cancelling ? " disabled" : ""}>${j.cancelling ? "Stopping…" : "Stop"}</button>`
       : "";
-    tr.innerHTML = `<td>${esc(j.book)}</td><td data-tip="${esc(j.pdf)}">${esc(j.pdf)}</td>
-      <td>${esc(j.service)}</td><td>${esc(j.status)}</td><td>${esc(j.at)}</td><td>${stop}</td>`;
+    const artifact = j.target || String(j.pdf || "").replace(/\\/g, "/").split("/").pop();
+    tr.innerHTML = `<td>OCR</td><td>${esc(j.book)}</td>` +
+      `<td data-tip="${esc(j.pdf)}">${esc(artifact)}</td>` +
+      `<td>${esc(j.service)}</td><td>${esc(j.status)}</td><td>${esc(j.at)}</td><td>${stop}</td>`;
+    tbody.appendChild(tr);
+  }
+  for (const [id, j] of analysisJobs) {
+    const tr = document.createElement("tr");
+    tr.dataset.analysisJob = id;
+    const artifact = j.artifact || (j.pages && j.pages.length
+      ? `Pages ${j.pages.join(", ")}` : j.kind);
+    tr.innerHTML = `<td>Text analysis</td><td>${esc(j.book || j.buildId)}</td>` +
+      `<td>${esc(artifact)}</td>` +
+      `<td>${esc(TEXT_ANALYSIS_LABELS[j.engine] || j.engine || "Configured AI")}</td>` +
+      `<td>${esc(j.status || "Starting...")}</td><td>${esc(j.at || "")}</td><td></td>`;
     tbody.appendChild(tr);
   }
 }
@@ -11339,6 +12392,7 @@ function renderOcrTab() {
     const ta = el("ocr-editor");
     const top = sameDoc ? ta.scrollTop : 0;   // assigning .value resets scrollTop
     ta.value = d ? d.text : "";
+    ta.readOnly = !!(d && d.readOnly);
     ta.scrollTop = top;
   } else if (ocrState.view === "diff") {
     const box = el("ocr-diff");
@@ -11354,9 +12408,13 @@ function renderOcrTab() {
   // quality reflects the doc's book (when folder-sourced)
   const build = d && d.buildId ? state.builds[d.buildId] : null;
   el("ocr-quality").value = (build && build.ocr_quality) || "";
-  el("ocr-set-active").disabled = !(d && d.buildId);
-  el("ocr-save").disabled = !d;
+  el("ocr-quality").disabled = !!(d && d.readOnly);
+  el("ocr-replace").disabled = !!(d && d.readOnly);
+  el("ocr-replace-all").disabled = !!(d && d.readOnly);
+  el("ocr-set-active").disabled = !(d && d.buildId) || !!d.readOnly;
+  el("ocr-save").disabled = !d || !!d.readOnly;
   renderOcrQueue();
+  renderAnFacsimile();
 }
 
 function ocrFindNext() {
@@ -11376,7 +12434,7 @@ function ocrFindNext() {
 function ocrReplaceAll() {
   const d = ocrSelDoc();
   const needle = el("ocr-find").value;
-  if (!d || !needle) return;
+  if (!d || d.readOnly || !needle) return;
   ocrSyncEditor();
   const repl = el("ocr-replace").value;
   const count = d.text.split(needle).length - 1;
@@ -11390,7 +12448,7 @@ function ocrReplaceAll() {
 
 async function ocrSaveDoc() {
   const d = ocrSelDoc();
-  if (!d) return;
+  if (!d || d.readOnly) return;
   ocrSyncEditor();
   if (d.buildId) {
     const res = await fetch(`/api/builds/${encodeURIComponent(d.buildId)}/ocr`, {
@@ -11450,6 +12508,128 @@ function ocrServiceReady(svc) {
   if (svc === "azure") return !!(s.ocrAzureEndpoint && s.ocrAzureKey);
   if (svc === "openai") return !!s.aiKey;         // reuses the AI credentials
   return false;
+}
+
+const TEXT_ANALYSIS_LABELS = { configured: "Configured AI provider" };
+
+function analysisServiceReady(engine) {
+  return engine === "configured" && !!String(state.settings.aiKey || "").trim();
+}
+
+function updateDefaultEngineSummary() {
+  const host = el("engine-defaults-summary");
+  if (!host) return;
+  const ocr = OCR_SERVICE_LABELS[state.settings.ocrService] || "Tesseract (local)";
+  const analysis = TEXT_ANALYSIS_LABELS[state.settings.textAnalysisService] ||
+    "Configured AI provider";
+  host.textContent = `${ocr} / ${analysis}`;
+}
+
+function refreshDefaultEngineOptions() {
+  const ocr = el("ocr-service");
+  if (!ocr) return;
+  for (const option of ocr.options) {
+    const ready = ocrServiceReady(option.value);
+    option.disabled = !ready;
+    option.title = ready ? "" : "Add this engine's API key in Settings > OCR";
+  }
+  ocr.value = state.settings.ocrService || "tesseract";
+  const analysis = el("analysis-service");
+  const ready = analysisServiceReady("configured");
+  analysis.value = "configured";
+  analysis.disabled = !ready;
+  analysis.options[0].disabled = !ready;
+  const model = String(state.settings.aiModel || "").trim() || "deepseek-chat";
+  analysis.options[0].textContent = ready
+    ? `Configured AI provider - ${model}`
+    : `Configured AI provider - API key required`;
+  el("ocr-engine-note").textContent = [...ocr.options].some((o) => o.disabled)
+    ? "Cloud engines without credentials are unavailable." : "";
+  el("analysis-engine-note").textContent = ready
+    ? "" : "Add an AI API key in Settings > AI.";
+  updateDefaultEngineSummary();
+}
+
+async function openDefaultEngines() {
+  await hydrateSecrets();
+  refreshDefaultEngineOptions();
+  el("engine-overlay").hidden = false;
+}
+
+function closeDefaultEngines() { el("engine-overlay").hidden = true; }
+
+function stagedAnalysisPagesFor(bid) {
+  const groups = new Map();
+  for (const [key, meta] of ocrState.analysisTags) {
+    const [book, src, rawPage] = key.split(":");
+    if (book !== bid) continue;
+    const groupKey = `${src}|${meta.engine}|${meta.doc}`;
+    if (!groups.has(groupKey)) groups.set(groupKey, {
+      src, engine: meta.engine, doc: meta.doc, pages: [],
+    });
+    groups.get(groupKey).pages.push(+rawPage);
+  }
+  for (const group of groups.values()) group.pages.sort((a, b) => a - b);
+  return groups;
+}
+
+function analysisStagedCount(bid) {
+  let count = 0;
+  for (const group of stagedAnalysisPagesFor(bid).values()) count += group.pages.length;
+  return count;
+}
+
+async function stageSelectedAnalysisPages() {
+  const d = ocrSelDoc();
+  const bid = d && d.buildId;
+  if (!bid || d.artifactKind || !anAnalyzable(state.builds[bid] || {})) {
+    el("an-page-msg").textContent = "Select OCR data for an available verified book.";
+    return;
+  }
+  if (!ocrState.pageSel.size) {
+    el("an-page-msg").textContent = "Select one or more facsimile pages first.";
+    return;
+  }
+  const engine = state.settings.textAnalysisService || "configured";
+  if (!analysisServiceReady(engine)) await hydrateSecrets();
+  if (!analysisServiceReady(engine)) {
+    el("an-page-msg").textContent = "Text Analysis needs an API key.";
+    await openDefaultEngines();
+    return;
+  }
+  const src = docSrcKey(d);
+  const doc = d.fileName || d.name;
+  for (const page of ocrState.pageSel) {
+    ocrState.analysisTags.set(`${bid}:${src}:${page}`, { engine, doc });
+  }
+  decorateAnFacsimile();
+  updateOcrStagedMsg();
+  renderOcrQueue();
+}
+
+async function submitAnalysisStaged(bid) {
+  const groups = stagedAnalysisPagesFor(bid);
+  if (!groups.size) return { submitted: false, failed: false };
+  if (!analysisServiceReady(state.settings.textAnalysisService || "configured"))
+    await hydrateSecrets();
+  if (!analysisServiceReady(state.settings.textAnalysisService || "configured")) {
+    el("an-page-msg").textContent = "Text Analysis needs an API key.";
+    return { submitted: false, failed: true };
+  }
+  let submitted = false;
+  let failed = false;
+  for (const group of groups.values()) {
+    const data = await anStartJob("/api/analyze/pages", {
+      build_id: bid, pages: group.pages, doc: group.doc,
+      engine: group.engine, src: group.src,
+    }, "page analysis", null);
+    if (!data) { failed = true; continue; }
+    submitted = true;
+    for (const page of group.pages)
+      ocrState.analysisTags.delete(`${bid}:${group.src}:${page}`);
+  }
+  decorateAnFacsimile();
+  return { submitted, failed };
 }
 
 // POST a page batch to the server OCR runner; results merge into ONE
@@ -11562,11 +12742,16 @@ function stagedCountFor(bid) {
 function updateOcrStagedMsg() {
   const bid = ocrState.book;
   const n = bid ? stagedCountFor(bid) : 0;
+  const analysis = bid ? analysisStagedCount(bid) : 0;
   const sel = ocrState.pageSel.size;
-  el("ocr-msg").textContent =
-    (sel ? `${sel} page(s) selected` : "") +
-    (sel && n ? " · " : "") +
-    (n ? `${n} staged — press submit to process` : "");
+  const bits = [];
+  if (sel) bits.push(`${sel} page(s) selected`);
+  if (n) bits.push(`${n} staged for OCR`);
+  if (analysis) bits.push(`${analysis} staged for text analysis`);
+  const message = bits.join(" · ") + ((n || analysis) ? " — press Submit" : "");
+  el("ocr-msg").textContent = message;
+  if (el("an-page-msg")) el("an-page-msg").textContent = message;
+  renderOcrQueue();
 }
 
 // SUBMIT: processing is prompted manually — the staged mix (possibly
@@ -11590,8 +12775,9 @@ async function ocrSubmitStagedOnce() {
   const bid = ocrState.book;
   if (!bid) { el("ocr-msg").textContent = "Pick a book first"; return; }
   const bySrc = stagedPagesFor(bid);
-  if (!bySrc.size) {
-    el("ocr-msg").textContent = "Nothing staged — hover a page and press a digit";
+  const analysisGroups = stagedAnalysisPagesFor(bid);
+  if (!bySrc.size && !analysisGroups.size) {
+    el("ocr-msg").textContent = "Nothing staged — select pages for OCR or text analysis";
     return;
   }
   let failed = false;
@@ -11615,11 +12801,15 @@ async function ocrSubmitStagedOnce() {
       }
     }
   }
+  const analysis = await submitAnalysisStaged(bid);
+  submitted = submitted || analysis.submitted;
+  failed = failed || analysis.failed;
   // Successful pages are already unstaged above. Clear the visual page
   // selection too, so another digit + submit cannot enqueue the same pages.
   // Failed pages remain staged for an intentional retry.
   if (submitted) clearOcrPageSel();
   decorateOcrPages();
+  decorateAnFacsimile();
   if (!failed) updateOcrStagedMsg();
 }
 
@@ -11631,7 +12821,11 @@ function clearOcrStaging() {
   for (const k of [...ocrState.pageTags.keys()]) {
     if (k.startsWith(bid + ":")) ocrState.pageTags.delete(k);
   }
+  for (const k of [...ocrState.analysisTags.keys()]) {
+    if (k.startsWith(bid + ":")) ocrState.analysisTags.delete(k);
+  }
   decorateOcrPages();
+  decorateAnFacsimile();
   updateOcrStagedMsg();
 }
 
@@ -11802,7 +12996,7 @@ let ocrHoverPage = 0;
 
 function ocrPagesActive() {
   return document.querySelector('#tabs .tab.active[data-tab="ocr"]') &&
-    ocrState.view === "pdf";
+    !el("ocr-document-workspace").hidden && ocrState.view === "pdf";
 }
 
 function clearOcrPageSel() {
@@ -11995,6 +13189,9 @@ async function deleteSelectedPages() {
     for (const k of [...ocrState.pageTags.keys()]) {
       if (k.startsWith(bid + ":")) ocrState.pageTags.delete(k);
     }
+    for (const k of [...ocrState.analysisTags.keys()]) {
+      if (k.startsWith(bid + ":")) ocrState.analysisTags.delete(k);
+    }
     status(`PAGES DELETED :: ${pages.length} (backup: ${data.backup})`);
     el("ocr-msg").textContent = "";
     // the PDF changed on disk: page counts, dims and word boxes are stale
@@ -12098,6 +13295,20 @@ function initOcrTab() {
     // tree chrome first: extract-text action, then node collapse/expand
     const ex = ev.target.closest("button.src-extract");
     if (ex) { ocrExtractSource(ex.dataset.src); return; }
+    const pdf = ev.target.closest("button.artifact-open-pdf");
+    if (pdf) { window.open(pdfApiUrl(pdf.dataset.pdf), "_blank"); return; }
+    const artifact = ev.target.closest("li.artifact-text");
+    if (artifact) {
+      openTextArtifact(artifact.dataset.artifactKind, artifact.dataset.artifactName);
+      return;
+    }
+    const captureRow = ev.target.closest("li.capture-img-row");
+    if (captureRow) {
+      if (captureRow.dataset.captureAvailable)
+        window.open("/api/capture/image?path=" +
+          encodeURIComponent(captureRow.dataset.capturePath), "_blank");
+      return;
+    }
     // an extracted-image row isn't a document to select — open it full size
     const imgRow = ev.target.closest("li.ocr-img-row");
     if (imgRow) {
@@ -12190,13 +13401,35 @@ function initOcrTab() {
     ocrSetQuality(el("ocr-quality").value));
   el("ocr-save").addEventListener("click", ocrSaveDoc);
   el("ocr-set-active").addEventListener("click", ocrSetActive);
+  for (const tab of document.querySelectorAll("#ocr-workspace-tabs [data-worktab]")) {
+    tab.addEventListener("click", () => setAnalyzeWorkspace(tab.dataset.worktab, true));
+  }
+  setAnalyzeWorkspace(state.settings.analysisWorkspace || "analysis", false);
   // the queue's service select starts on the configured default and keeps
   // the setting in sync when changed here
   el("ocr-service").value = state.settings.ocrService || "tesseract";
   el("ocr-service").addEventListener("change", () => {
     state.settings.ocrService = el("ocr-service").value;
     saveSettings();
+    updateDefaultEngineSummary();
   });
+  el("analysis-service").value = state.settings.textAnalysisService || "configured";
+  el("analysis-service").addEventListener("change", () => {
+    state.settings.textAnalysisService = el("analysis-service").value;
+    saveSettings();
+    updateDefaultEngineSummary();
+  });
+  el("engine-defaults-open").addEventListener("click", openDefaultEngines);
+  el("engine-close").addEventListener("click", closeDefaultEngines);
+  el("engine-done").addEventListener("click", closeDefaultEngines);
+  el("engine-settings").addEventListener("click", () => {
+    closeDefaultEngines();
+    el("open-settings").click();
+  });
+  el("engine-overlay").addEventListener("click", (ev) => {
+    if (ev.target === el("engine-overlay")) closeDefaultEngines();
+  });
+  updateDefaultEngineSummary();
   el("ocr-queue-add").addEventListener("click", ocrQueueJob);
   el("ocr-queue-clear").addEventListener("click", clearOcrStaging);
   el("ocr-submit").addEventListener("click", ocrSubmitStaged);
@@ -12301,6 +13534,7 @@ function setOcrService(id) {
   saveSettings();
   const q = el("ocr-service"); if (q) q.value = id;
   const s = el("set-ocr-service"); if (s) s.value = id;
+  updateDefaultEngineSummary();
 }
 function buildOcrMenu() {
   const host = el("menu-ocr-service");
@@ -13005,8 +14239,10 @@ function init() {
     });
   };
   widthSplit("ocr-splitter", "ocrSide", "ocr-side", 200, 620);
+  widthSplit("an-facsimile-splitter", "anFacsimile", "an-facsimile-pane", 280, 900);
   widthSplit("builds-splitter", "buildsPane", "builds-pane", 180, 620);
   widthSplit("form-splitter", "buildForm", "build-form", 280, 720);
+  widthSplit("publish-splitter", "publishSide", "publish-side", 230, 620);
   initSplitter("ocr-side-splitter", {
     key: "ocrBooks", vertical: true, min: 60,
     max: () => el("ocr-side").clientHeight - 120,
@@ -13085,6 +14321,68 @@ function init() {
     });
   }
   el("build-upload").addEventListener("click", uploadBuild);
+
+  // public catalogue tree + website-format publication preview
+  el("publish-side-toggle").addEventListener("click", () =>
+    setPublishSidebarCollapsed(!state.settings.publishSidebarCollapsed, true));
+  el("publish-group").addEventListener("change", () => {
+    state.settings.publishGroup = el("publish-group").value;
+    state.publishOpen.clear();
+    state.publishClosed.clear();
+    saveSettings();
+    renderPublishTree(true);
+    renderPublishPreview();
+  });
+  el("publish-refresh").addEventListener("click", loadPublishCatalog);
+  el("publish-tree").addEventListener("click", (ev) => {
+    const toggle = ev.target.closest("[data-publish-toggle]");
+    if (toggle) {
+      const id = toggle.dataset.publishToggle;
+      const node = (() => {
+        const walk = (rows, depth) => {
+          for (const n of rows) {
+            if (n.nodeId === id) return { node: n, depth };
+            const hit = walk(n.children || [], depth + 1);
+            if (hit) return hit;
+          }
+          return null;
+        };
+        return walk(publishTreeModel(), 0);
+      })();
+      if (node) {
+        if (publishNodeOpen(node.node, node.depth)) {
+          state.publishOpen.delete(id); state.publishClosed.add(id);
+        } else {
+          state.publishClosed.delete(id); state.publishOpen.add(id);
+        }
+        renderPublishTree();
+        const replacement = [...el("publish-tree").querySelectorAll(
+          "[data-publish-toggle]")].find((button) =>
+          button.dataset.publishToggle === id);
+        if (replacement) replacement.focus();
+      }
+      return;
+    }
+    const pick = ev.target.closest("[data-publish-select]");
+    if (!pick) return;
+    state.publishSel = pick.dataset.publishSelect;
+    renderPublishTree(true);
+    renderPublishPreview();
+  });
+  el("publish-preview").addEventListener("click", (ev) => {
+    const pick = ev.target.closest("[data-publish-book]");
+    if (!pick) return;
+    state.publishSel = "book:" + pick.dataset.publishBook;
+    renderPublishTree(true);
+    renderPublishPreview();
+  });
+  el("publish-open-live").addEventListener("click", () => {
+    const entity = publishFindEntity(state.publishSel);
+    if (!entity || entity.kind !== "book") return;
+    const base = publishSafeUrl(state.publishSiteUrl, false).replace(/\/$/, "");
+    const slug = publishSlug(entity.entries[0]);
+    if (base && slug) openWebView(`${base}/book.html?slug=${encodeURIComponent(slug)}`);
+  });
   el("src-filter").addEventListener("click", () => openSrcFilterMenu(el("src-filter")));
   el("btab-resources").addEventListener("click", (ev) => {
     const btn = ev.target.closest(".res-use");

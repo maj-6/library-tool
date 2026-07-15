@@ -5,6 +5,8 @@ from pathlib import Path
 
 APP = (Path(__file__).parents[1] / "tools" / "whl_explorer" / "static" /
        "app.js").read_text(encoding="utf-8")
+TEMPLATE = (Path(__file__).parents[1] / "tools" / "whl_explorer" / "templates" /
+            "index.html").read_text(encoding="utf-8")
 
 
 def test_catalog_source_markers_cover_capture_manual_master_and_edits():
@@ -63,6 +65,42 @@ def test_legacy_group_migration_persists_association_on_each_book():
     body = _function("backfillSets", "migrateParsedEntries")
     assert 'JSON.stringify({ group_id: key, _preserve: true })' in body
     assert 'entry.book, { group_id: key }' in body
+
+
+def test_publish_tab_has_tree_grouping_and_catalog_preview():
+    assert 'data-tab="publish">Publish</button>' in TEMPLATE
+    for mode in ("sets", "author", "category", "date"):
+        assert f'<option value="{mode}">' in TEMPLATE
+    assert 'id="publish-tree" aria-label="Published catalogue"' in TEMPLATE
+    assert 'role="tree"' not in TEMPLATE
+    assert 'id="publish-side-toggle"' in TEMPLATE
+    assert 'id="publish-record"' in TEMPLATE
+
+
+def test_publish_tree_uses_published_metadata_not_duplicate_titles():
+    entities = _function("publishEntities", "publishBookLabel")
+    assert 'String(v.group_id || "").trim()' in entities
+    assert '"set:" + gid' in entities
+    assert "setKeyOf" not in entities
+    assert '"book:" + publishSlug(v)' in entities
+
+    grouping = APP.split("function publishEntryPaths", 1)[1].split(
+        "function publishNodeOpen", 1)[0]
+    assert "category_paths" in grouping
+    assert "JSON.stringify(names)" in grouping
+    assert 'String(v.authors || "").trim()' in grouping
+    assert 'year < 1000 || year > 2999' in grouping
+
+
+def test_publish_preview_matches_online_record_shape_and_supports_sets():
+    preview = APP.split("function publishMetadata", 1)[1].split(
+        "async function renderPublishPreview", 1)[0]
+    assert 'class="ppub-record-page"' in preview
+    assert 'class="ppub-book-main"' in preview
+    assert 'class="ppub-book-side"' in preview
+    assert 'class="ppub-meta"' in preview
+    assert "publishCatalogRow" in preview
+    assert 'data-publish-book=' in preview
 
 
 def test_ocr_verified_filter_includes_published_entries():
