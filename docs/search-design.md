@@ -179,8 +179,8 @@ create table if not exists passages (
 exist); the hybrid variant fuses lexical and vector ranks server-side in
 wave 3 (#140). The website never issues raw reads against indexed tables.
 
-**Ranked search (002).** Wave 2 shipped as
-`docs/cloud/migrations/002_page_search.sql`: `volume_pages.search_body`
+**Ranked search (003).** Wave 2 shipped as
+`docs/cloud/migrations/003_page_search.sql`: `volume_pages.search_body`
 (the desktop-normalized layer, `_search_normalize` in the explorer server,
 mirroring the reader's client-side fold), a stored `simple`+`english`
 tsvector with GIN, a pg_trgm index, and

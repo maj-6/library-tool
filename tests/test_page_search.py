@@ -4,7 +4,7 @@ _search_normalize must mirror website/assets/textsearch.js exactly -- the
 vectors here are the SAME ones tests/textsearch.test.js runs against the
 client-side fold -- and _publish_bundle must carry the normalized layer to
 volume_pages.search_body, degrading (not failing) on a live project that has
-not applied docs/cloud/migrations/002_page_search.sql yet.
+not applied docs/cloud/migrations/003_page_search.sql yet.
 """
 from __future__ import annotations
 
@@ -104,7 +104,7 @@ def test_publish_bundle_degrades_without_the_search_column(monkeypatch, caplog):
     assert "search_body" in first[1][0]
     assert "search_body" not in second[1][0]
     assert second[1][0]["body"] == "Phyſick"  # the verbatim text still lands
-    assert "002_page_search" in caplog.text
+    assert "003_page_search" in caplog.text
 
 
 def test_publish_bundle_reraises_unrelated_sync_errors(monkeypatch):

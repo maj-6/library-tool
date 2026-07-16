@@ -1,4 +1,4 @@
--- 002_page_search — ranked page-text search over volume_pages (issue #139).
+-- 003_page_search — ranked page-text search over volume_pages (issue #139).
 --
 -- Paste into the Supabase SQL Editor and run, after 001_baseline. Safe to run
 -- again: every statement is `if not exists` / `create or replace`, and the
@@ -121,4 +121,4 @@ grant execute on function search_volume(text, text, text, int)
   to anon, authenticated, service_role;
 
 -- record this migration (every migration ends with its own id)
-insert into schema_migrations (id) values ('002_page_search') on conflict do nothing;
+insert into schema_migrations (id) values ('003_page_search') on conflict do nothing;

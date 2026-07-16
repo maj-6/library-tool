@@ -6243,7 +6243,7 @@ def _publish_bundle(cloud: dict, slug: str, art: dict) -> None:
     kept = sorted(art["pages"])
     if kept:
         # body is the verbatim reading; search_body is the normalized layer
-        # docs/cloud/migrations/002_page_search.sql indexes (issue #139).
+        # docs/cloud/migrations/003_page_search.sql indexes (issue #139).
         rows = [{"slug": slug, "lang": lang, "page": n, "body": t,
                  "search_body": _search_normalize(t), "updated_at": now}
                 for lang in kept for n, t in sorted(art["pages"][lang].items())]
@@ -6260,7 +6260,7 @@ def _publish_bundle(cloud: dict, slug: str, art: dict) -> None:
             sbase.upsert_rows(cloud, "volume_pages", "slug,lang,page", rows)
             log.warning("volume_pages.search_body is missing on the cloud "
                         "project — apply docs/cloud/migrations/"
-                        "002_page_search.sql (page text published unindexed)")
+                        "003_page_search.sql (page text published unindexed)")
         langs_in = ",".join(f'"{lang}"' for lang in kept)
         sbase.delete_rows(cloud, "volume_pages",
                           f"slug=eq.{q(slug)}&lang=not.in.({q(langs_in)})")

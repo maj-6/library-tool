@@ -227,7 +227,7 @@ export async function getAllPages(slug, lang = "") {
  *  [{page, rank, snippet}], the snippet carrying «...» around each match --
  *  see rpcSnippetHtml in textsearch.js. Cloud only: fixture mode has no
  *  database, and a live project still behind on
- *  docs/cloud/migrations/002_page_search.sql answers 404 -- the reader
+ *  docs/cloud/migrations/003_page_search.sql answers 404 -- the reader
  *  catches either and falls back to the client-side search path. */
 export async function searchVolume(slug, q, lang = "") {
   if (!usingCloud) throw new Error("no cloud configured");
