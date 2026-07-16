@@ -1867,6 +1867,7 @@ def api_build_ocr_put(build_id: str):
         src_key = _valid_src_key(builds[build_id], p.get("src"))
         if src_key:
             _ocr_set_source(build_id, name, src_key)
+    _revalidate_note_anchors(build_id, builds[build_id], name)
     return jsonify({"ok": True, "name": name,
                     "folder": _entry_folder_info(build_id)})
 
@@ -4777,18 +4778,80 @@ def _load_annotations(bid: str) -> dict:
     return doc
 
 
+def _revalidate_note_anchors(bid: str, b: dict, saved: str) -> None:
+    """After an OCR text edit, re-check that each note's quote still exists on
+    its page. A quote that no longer matches is flagged, never deleted — the
+    curator decides what a rewritten page means for the note."""
+    doc_name, text = _analyze_doc(bid, b)
+    if saved != doc_name:
+        return                        # not the document the notes anchor to
+    src_pages = _an_pages(text)
+    with _an_notes_lock:
+        doc = _load_annotations(bid)
+        changed = False
+        for n in doc["notes"]:
+            quote = str(n.get("quote") or "")
+            if not quote:
+                continue
+            flat = re.sub(r"\s+", " ", src_pages.get(n.get("page"), "")).lower()
+            anchor = ("ok" if re.sub(r"\s+", " ", quote).lower() in flat
+                      else "orphaned")
+            if n.get("anchor") != anchor:
+                n["anchor"] = anchor
+                changed = True
+        if changed:
+            lib.save_json(_entry_dir(bid) / "annotations.json", doc)
+
+
 def _lang_code(raw: str) -> str:
     return re.sub(r"[^a-z\-]", "", str(raw or "").lower())[:12]
+
+
+def _page_sha(text: str) -> str:
+    return hashlib.sha1(
+        re.sub(r"\s+", " ", text.strip()).encode("utf-8")).hexdigest()
+
+
+def _translation_meta_path(bid: str, lang: str):
+    return _entry_dir(bid) / "translations" / f"{lang}.meta.json"
+
+
+def _load_translation_meta(bid: str, lang: str) -> dict:
+    doc = lib.load_json(_translation_meta_path(bid, lang), None)
+    if not isinstance(doc, dict) or not isinstance(doc.get("pages"), dict):
+        return {"version": 1, "src": "", "model": "", "pages": {}}
+    return doc
+
+
+def _stale_translation_pages(meta: dict, src_pages: dict[int, str]) -> list[int]:
+    """Pages whose recorded source hash no longer matches the OCR text. Pages
+    translated before hashes were recorded can't be judged — never "stale"."""
+    out = []
+    for key, rec in meta.get("pages", {}).items():
+        try:
+            n = int(key)
+        except (TypeError, ValueError):
+            continue
+        if (n in src_pages and isinstance(rec, dict) and rec.get("sha1")
+                and rec["sha1"] != _page_sha(src_pages[n])):
+            out.append(n)
+    return sorted(out)
 
 
 def _translations_info(bid: str) -> list[dict]:
     d = _entry_dir(bid) / "translations"
     out = []
     if d.is_dir():
+        b = lib.load_json(BUILDS_PATH, {}).get(bid) or {}
+        src_pages = _an_pages(_analyze_doc(bid, b)[1])
         for f in sorted(d.glob("*.txt")):
             pages = _an_pages(f.read_text(encoding="utf-8", errors="replace"))
+            meta = _load_translation_meta(bid, f.stem)
             out.append({"lang": f.stem, "pages": len(pages),
-                        "size": f.stat().st_size})
+                        "size": f.stat().st_size,
+                        "stale": len(_stale_translation_pages(meta, src_pages)),
+                        "untracked": sum(1 for n in pages
+                                         if str(n) not in meta["pages"])})
     return out
 
 
@@ -4862,6 +4925,9 @@ def api_build_translation(bid: str, lang: str):
         return err
     if p.is_file():
         p.unlink()
+    m = _translation_meta_path(bid, lang)
+    if m.is_file():
+        m.unlink()
     return jsonify({"ok": True})
 
 
@@ -5204,11 +5270,33 @@ def api_analyze_translate():
                         "no OCR text for this entry — extract or run OCR first"}), 400
     rel = f"translations/{lang}.txt"
     done_pages = _an_pages(_read_entry_text(bid, rel))
-    todo = [n for n in sorted(pages) if pages[n].strip()
-            and not done_pages.get(n, "").strip()]
-    if not todo:
-        return jsonify({"ok": False, "error":
-                        "every page with text is already translated"}), 400
+    want = p.get("pages")
+    if isinstance(want, list):
+        # explicit re-translation: the client names the pages, current or not
+        try:
+            want = sorted({int(n) for n in want})
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "pages must be integers"}), 400
+        todo = [n for n in want if pages.get(n, "").strip()]
+        if not todo:
+            return jsonify({"ok": False, "error":
+                            "none of those pages have source text"}), 400
+    elif p.get("mode") == "stale":
+        # bring the translation current: pages whose source text changed since
+        # they were translated, plus pages never translated at all
+        stale = _stale_translation_pages(_load_translation_meta(bid, lang), pages)
+        todo = sorted(set(stale) | {n for n in pages if pages[n].strip()
+                                    and not done_pages.get(n, "").strip()})
+        if not todo:
+            return jsonify({"ok": False, "error":
+                            "no outdated or missing pages — the translation "
+                            "is current"}), 400
+    else:
+        todo = [n for n in sorted(pages) if pages[n].strip()
+                and not done_pages.get(n, "").strip()]
+        if not todo:
+            return jsonify({"ok": False, "error":
+                            "every page with text is already translated"}), 400
     cfg = _ai_cfg()
     meta = _an_meta_line(b)
 
@@ -5241,6 +5329,16 @@ def api_analyze_translate():
                     doc = "\n\n".join(f"--- page {k} ---\n{cur[k]}"
                                       for k in sorted(cur))
                     _write_entry_text(bid, rel, doc + "\n")
+                    # provenance sidecar: which source text (by hash) and
+                    # model each page was translated from — staleness is a
+                    # hash comparison later
+                    tm = _load_translation_meta(bid, lang)
+                    tm["src"], tm["model"] = name, cfg["model"]
+                    tm["pages"][str(n)] = {
+                        "sha1": _page_sha(pages[n]),
+                        "at": datetime.now(timezone.utc).isoformat(
+                            timespec="seconds")}
+                    lib.save_json(_translation_meta_path(bid, lang), tm)
             activity("translated", "book", n=len(todo) - job["errors"],
                      detail=f"{b.get('title', '')} -> {lang}")
             _an_finish(job)
