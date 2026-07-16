@@ -39,12 +39,13 @@ export function renderRecord(v) {
   ].filter(Boolean).map((x) => `<span>${x}</span>`).join("");
 
   // quiet row actions on purpose — a primary button on every record would
-  // stripe the catalogue with dark blocks; the book page carries the primary
+  // stripe the catalogue with dark blocks; the book page carries the primary.
+  // No scan yet = plain visible metadata, never a dead button-shaped control.
   const actions = href
     ? `<a class="btn" href="read.html?slug=${slug}">Read</a>
        <a class="btn" href="${esc(href)}" target="_blank" rel="noopener"
           title="${bytes(v.pdf_bytes) || "PDF"}">PDF</a>`
-    : `<a class="btn" aria-disabled="true" title="No scan yet">Read</a>`;
+    : `<span class="rec-noscan">Scan unavailable</span>`;
 
   const cats = chips(v);
   const desc = plain(v.description);

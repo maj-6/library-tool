@@ -731,6 +731,7 @@ const ICONS = {
   // a page with a figure block above flowing text: the facsimile layout view
   layout: _SVG('<rect x="3" y="2" width="10" height="12" rx="1"/><rect x="5" y="4" width="6" height="3.4"/><path d="M5 9.6 h6 M5 11.8 h4.2"/>'),
   pdf: _SVG('<path d="M3.5 2 h6 l3 3 v9 h-9 Z"/><path d="M9.5 2 v3 h3"/><path d="M5.4 7.5 h5.2 M5.4 9.7 h5.2 M5.4 11.9 h3.4"/>'),
+  close: _SVG('<path d="M4.2 4.2 L11.8 11.8 M11.8 4.2 L4.2 11.8"/>'),
 };
 
 // Glyphs that stand in for a tag's text label. Sized to sit inside a 15px
@@ -753,6 +754,98 @@ function injectIcons() {
     const svg = ICONS[node.dataset.icon];
     if (svg) node.innerHTML = svg;
   }
+}
+
+// --- confirmation dialog -------------------------------------------------------
+// Product-styled replacement for window.confirm: resolves true/false, never
+// blocks. `danger` paints the confirming action red and starts focus on the
+// safe choice; `cost` renders an amber money/credits note. Enter activates
+// the focused button (initial focus = the default), Escape/backdrop/close all
+// take the Cancel path.
+
+let _confirmResolve = null;
+let _confirmOpener = null;   // survives dialog-replaces-dialog, so focus
+                             // returns to the ORIGINAL opener, not the confirm
+
+function confirmDialog(opts) {
+  const o = typeof opts === "string" ? { message: opts } : (opts || {});
+  const overlay = el("confirm-overlay");
+  const okBtn = el("confirm-ok");
+  if (_confirmResolve) _confirmResolve(false);   // replaced: keep the opener
+  else _confirmOpener = document.activeElement;
+  el("confirm-title").textContent = o.title || "Confirm";
+  el("confirm-msg").textContent = o.message || "";
+  el("confirm-detail").textContent = o.detail || "";
+  el("confirm-detail").hidden = !o.detail;
+  el("confirm-cost").textContent = o.cost || "";
+  el("confirm-cost").hidden = !o.cost;
+  okBtn.textContent = o.confirmLabel || "OK";
+  okBtn.classList.toggle("danger", !!o.danger);
+  el("confirm-cancel").textContent = o.cancelLabel || "Cancel";
+  overlay.hidden = false;
+  // destructive confirms focus the safe choice; routine ones the primary
+  (o.danger ? el("confirm-cancel") : okBtn).focus();
+  return new Promise((resolve) => {
+    _confirmResolve = (val) => {
+      _confirmResolve = null;
+      overlay.hidden = true;
+      resolve(val);
+      // Restore focus after the caller has finished closing whatever
+      // spawned the confirm, and only if the opener is still visible — a
+      // discarded editor takes its focus target away with it.
+      setTimeout(() => {
+        if (_confirmResolve) return;   // a follow-up confirm owns focus now
+        const op = _confirmOpener;
+        _confirmOpener = null;
+        if (op && op.focus && op.isConnected && op.offsetParent !== null) op.focus();
+      }, 0);
+    };
+  });
+}
+
+function initConfirmDialog() {
+  const overlay = el("confirm-overlay");
+  const okBtn = el("confirm-ok");
+  okBtn.addEventListener("click", () => _confirmResolve && _confirmResolve(true));
+  el("confirm-cancel").addEventListener("click", () => _confirmResolve && _confirmResolve(false));
+  el("confirm-close").addEventListener("click", () => _confirmResolve && _confirmResolve(false));
+  overlay.addEventListener("mousedown", (ev) => {
+    if (ev.target === overlay && _confirmResolve) {
+      ev.preventDefault();   // don't let the browser refocus under the dialog
+      _confirmResolve(false);
+    }
+  });
+  // Capture phase so an open confirm behaves like a real modal: it owns
+  // Escape/Tab/Enter, and every other key stops here so app-wide shortcuts
+  // (undo, Ctrl+S, the OCR page keys) cannot act behind it. Native button
+  // activation is a default action, so Enter/Space on a focused action
+  // still works after stopImmediatePropagation.
+  document.addEventListener("keydown", (ev) => {
+    if (overlay.hidden || !_confirmResolve) return;
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      _confirmResolve(false);
+      return;
+    }
+    const ring = [el("confirm-close"), el("confirm-cancel"), okBtn];
+    if (ev.key === "Tab") {
+      const i = ring.indexOf(document.activeElement);
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      ring[(i + (ev.shiftKey ? -1 : 1) + ring.length) % ring.length].focus();
+      return;
+    }
+    if (ev.key === "Enter" && !ring.includes(document.activeElement)) {
+      // focus strayed outside the dialog: Enter takes the default action
+      // (the safe choice on destructive confirms)
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      (okBtn.classList.contains("danger") ? el("confirm-cancel") : okBtn).click();
+      return;
+    }
+    ev.stopImmediatePropagation();
+  }, true);
 }
 
 // --- undo / redo -------------------------------------------------------------
@@ -1259,7 +1352,7 @@ function hideAuthOverlay() {
 let authSignup = false;
 function setAuthMode(signup) {
   authSignup = signup;
-  el("auth-title").textContent = signup ? "CREATE ACCOUNT" : "SIGN IN";
+  el("auth-title").textContent = signup ? "Create account" : "Sign in";
   el("auth-submit").textContent = signup ? "Create account" : "Sign in";
   el("auth-mode").textContent = signup ? "I have an account…" : "Create account…";
   el("auth-pass").autocomplete = signup ? "new-password" : "current-password";
@@ -1346,11 +1439,11 @@ function maybeAuthPrompt() {
 // in the project URL + public anon key), so accounts just work. The service
 // key is an owner concern and stays out of this normal-user flow.
 const WIZ_STEPS = [
-  ["welcome", "WELCOME"],
-  ["account", "PROFILE"],
-  ["services", "TEXT TOOLS"],
-  ["db", "OFFLINE SEARCH"],
-  ["done", "READY"],
+  ["welcome", "Welcome"],
+  ["account", "Profile"],
+  ["services", "Text tools"],
+  ["db", "Offline search"],
+  ["done", "Ready"],
 ];
 let wizStep = 0;
 let wizDbTimer = null;
@@ -2469,16 +2562,28 @@ function renderSettings() {
     `Library Tool ${el("tb-meta").textContent} — ` +
     `${state.manual.length} manual entries / ${state.checked.size} checked books. ` +
     (el("status-right").textContent || "");
-  el("reset-settings").onclick = () => {
-    if (!window.confirm("Reset every interface setting? (Catalog data is kept.)")) return;
+  el("reset-settings").onclick = async () => {
+    if (!(await confirmDialog({
+      title: "Reset interface settings",
+      message: "Reset every interface setting?",
+      detail: "Catalog data is kept.",
+      confirmLabel: "Reset settings",
+      danger: true,
+    }))) return;
     try {
       localStorage.removeItem(SETTINGS_KEY);
       localStorage.removeItem(VIEWSTATE_KEY);
     } catch (e) {}
     location.reload();
   };
-  el("clear-history-btn").onclick = () => {
-    if (!window.confirm("Clear the entire action history? This cannot be undone.")) return;
+  el("clear-history-btn").onclick = async () => {
+    if (!(await confirmDialog({
+      title: "Clear history",
+      message: "Clear the entire action history?",
+      detail: "This cannot be undone.",
+      confirmLabel: "Clear history",
+      danger: true,
+    }))) return;
     _actionLog = [];
     saveActionLog();
     if (activeBottomTable() === "history") renderBottomRows();
@@ -5527,8 +5632,13 @@ async function revertHistoryAction(hid) {
   const rec = log.find((r) => r.id === hid);
   if (!rec || rec.reverted || !rec.revert) return;
   if (rec.tkey && log.some((r) => r.id > rec.id && !r.reverted && r.tkey === rec.tkey)) {
-    if (!window.confirm("A newer action changed the same record. Reverting this one will " +
-      "discard that newer change. Continue?")) return;
+    if (!(await confirmDialog({
+      title: "Revert action",
+      message: "A newer action changed the same record.",
+      detail: "Reverting this one will discard that newer change.",
+      confirmLabel: "Revert anyway",
+      danger: true,
+    }))) return;
   }
   const ok = await applyRevert(rec.revert);
   if (ok) {
@@ -6978,15 +7088,30 @@ function createMdEditor(container, opts = {}) {
 // --- markdown overlay window (WHL description pencil) --
 
 let overlayMd = null;
+let mdOpenValue = "";   // editor content at open time, to detect dirty state
+
 function openMarkdownEditor(targetTextareaId, title) {
   state.mdTarget = targetTextareaId;
   el("md-title").textContent = title || "Markdown editor";
   overlayMd.set(el(targetTextareaId).value);
+  mdOpenValue = overlayMd.get();
   el("md-overlay").hidden = false;
   overlayMd.focus();
 }
 
-function closeMarkdownEditor(apply) {
+async function closeMarkdownEditor(apply) {
+  // Cancel/Escape/backdrop with edited content confirms before discarding,
+  // so an incidental click outside the window can't throw the text away.
+  if (!apply && state.mdTarget && overlayMd.get() !== mdOpenValue &&
+      state.settings.confirmDiscard !== false) {
+    if (!(await confirmDialog({
+      title: "Discard changes",
+      message: "Discard the unsaved Markdown changes?",
+      confirmLabel: "Discard changes",
+      cancelLabel: "Keep editing",
+      danger: true,
+    }))) return;
+  }
   if (apply && state.mdTarget) {
     el(state.mdTarget).value = overlayMd.get();
   }
@@ -7249,13 +7374,20 @@ function createPdfViewer() {
       setOcr(ocrOn);
     }
   }
-  pagesBtn.addEventListener("click", () => {
-    if (pagesOn && pagesDirty &&
-        state.settings.confirmDiscard !== false && !window.confirm("Discard unsaved page edits?")) return;
+  const confirmDiscardPages = async () =>
+    state.settings.confirmDiscard === false || confirmDialog({
+      title: "Discard page edits",
+      message: "Discard unsaved page edits?",
+      confirmLabel: "Discard edits",
+      cancelLabel: "Keep editing",
+      danger: true,
+    });
+  pagesBtn.addEventListener("click", async () => {
+    if (pagesOn && pagesDirty && !(await confirmDiscardPages())) return;
     setPages(!pagesOn);
   });
-  layBtn.addEventListener("click", () => {
-    if (pagesDirty && state.settings.confirmDiscard !== false && !window.confirm("Discard unsaved page edits?")) return;
+  layBtn.addEventListener("click", async () => {
+    if (pagesDirty && !(await confirmDiscardPages())) return;
     state.settings.viewerLayout = !isLay();
     saveSettings();
     layBtn.classList.toggle("active", isLay());
@@ -7288,9 +7420,9 @@ function createPdfViewer() {
     ocrPane.hidden = !ocrOn || pagesOn;
     if (ocrOn && !pagesOn) loadOcr();
   }
-  ocrBtn.addEventListener("click", () => {
+  ocrBtn.addEventListener("click", async () => {
     if (pagesOn) {
-      if (pagesDirty && state.settings.confirmDiscard !== false && !window.confirm("Discard unsaved page edits?")) return;
+      if (pagesDirty && !(await confirmDiscardPages())) return;
       // intent: leave the page view and SHOW the OCR pane
       setPages(false);
       setOcr(true);
@@ -7863,6 +7995,8 @@ async function setManualUrl(id, source, url, track = true) {
   status(url ? `MANUAL SOURCE SAVED :: ${row.book.title}` : "MANUAL SOURCE CLEARED");
 }
 
+let msrcOpenValue = "";   // URL at open time, to detect an unsaved edit
+
 function openManualSource(id, source) {
   state.msrcTarget = { id: String(id), source };
   const row = state.rowsById.get(String(id));
@@ -7870,12 +8004,28 @@ function openManualSource(id, source) {
   el("msrc-label").textContent =
     `${names[source] || source} :: ${row ? row.book.title : id}`;
   el("msrc-url").value = row ? getManualUrl(row, source) : "";
+  msrcOpenValue = el("msrc-url").value;
   el("msrc-msg").textContent = "";
   el("msrc-overlay").hidden = false;
   el("msrc-url").focus();
 }
 
-function closeManualSource() { el("msrc-overlay").hidden = true; }
+// Escape/backdrop/close with an edited URL confirms before discarding;
+// the save path passes force after it has persisted the value.
+async function closeManualSource(force) {
+  if (force !== true && !el("msrc-overlay").hidden &&
+      el("msrc-url").value.trim() !== msrcOpenValue.trim() &&
+      state.settings.confirmDiscard !== false) {
+    if (!(await confirmDialog({
+      title: "Discard link",
+      message: "Discard the unsaved source link?",
+      confirmLabel: "Discard",
+      cancelLabel: "Keep editing",
+      danger: true,
+    }))) return;
+  }
+  el("msrc-overlay").hidden = true;
+}
 
 async function saveManualSource(clear) {
   const t = state.msrcTarget;
@@ -7886,7 +8036,7 @@ async function saveManualSource(clear) {
     return;
   }
   await setManualUrl(t.id, t.source, url);
-  closeManualSource();
+  closeManualSource(true);
 }
 
 // --- Analyze tab -------------------------------------------------------------------
@@ -8525,7 +8675,13 @@ function initAnalyze() {
     const b = anSelected();
     if (!b) return;
     const existing = anAboutMd.get().trim();
-    if (existing && !confirm("Replace the current About draft?")) return;
+    if (existing && !(await confirmDialog({
+      title: "Replace About draft",
+      message: "Replace the current About draft?",
+      detail: "The existing draft text is overwritten by the new one.",
+      confirmLabel: "Replace draft",
+      danger: true,
+    }))) return;
     anStartJob("/api/analyze/about",
                { build_id: b.id, overwrite: !!existing }, "about", el("an-about-draft"));
   });
@@ -8583,14 +8739,18 @@ function initAnalyze() {
     renderAnSuggestions();
   });
 
-  el("an-translate").addEventListener("click", () => {
+  el("an-translate").addEventListener("click", async () => {
     const b = anSelected();
     const lang = el("an-lang").value.trim().toLowerCase();
     if (!b || !lang) { el("an-trans-msg").textContent = "language code?"; return; }
-    if (!window.confirm(
-        `Translate this entry into “${lang}”?\n\nThis runs one AI request per ` +
-        `untranslated page — a long book can be hundreds of calls and use real ` +
-        `API credits. It saves as it goes and resumes if interrupted.`)) return;
+    if (!(await confirmDialog({
+      title: "Translate entry",
+      message: `Translate this entry into “${lang}”?`,
+      detail: "It saves as it goes and resumes if interrupted.",
+      cost: "This runs one AI request per untranslated page — a long book " +
+        "can be hundreds of calls and use real API credits.",
+      confirmLabel: "Translate",
+    }))) return;
     el("an-trans-msg").textContent = "";
     anStartJob("/api/analyze/translate", { build_id: b.id, lang },
                `translate ${lang}`, el("an-translate"));
@@ -8613,7 +8773,12 @@ function initAnalyze() {
       el("an-trans-view").textContent = data.text || "";
       el("an-trans-view").hidden = false;
     } else if (del) {
-      if (!confirm(`Delete the ${del.dataset.tdel} translation?`)) return;
+      if (!(await confirmDialog({
+        title: "Delete translation",
+        message: `Delete the ${del.dataset.tdel} translation?`,
+        confirmLabel: "Delete",
+        danger: true,
+      }))) return;
       await fetch(`/api/builds/${b.id}/translations/${encodeURIComponent(del.dataset.tdel)}`,
                   { method: "DELETE" });
       loadAnTranslations(b);
@@ -9779,7 +9944,13 @@ function initCategories() {
     }
     if (act && act.act === "del") {
       const n = (state.taxonomy[id] || {}).name || "?";
-      if (!confirm(`Delete "${n}"? Its subcategories move up; assignments drop it.`)) return;
+      if (!(await confirmDialog({
+        title: "Delete category",
+        message: `Delete "${n}"?`,
+        detail: "Its subcategories move up a level; record assignments drop it.",
+        confirmLabel: "Delete category",
+        danger: true,
+      }))) return;
       if (await catApi("DELETE", `/api/categories/${encodeURIComponent(id)}`)) {
         await catAfterChange();
       }
@@ -10067,11 +10238,13 @@ function renderInfoPane() {
   const imgs = b.images || [];
   if (imgs.length) {
     h += `<div class="info-sec"><div class="info-sec-h">Photos</div><div class="info-imgs">`;
-    for (const p of imgs) {
+    const capTitle = (b.title || "").trim() || "Entry";
+    imgs.forEach((p, i) => {
       const url = "/api/capture/image?path=" + encodeURIComponent(p);
-      h += `<img class="info-thumb" loading="lazy" src="${esc(url)}" ` +
-        `data-lightbox="${esc(url)}" alt="entry photo">`;
-    }
+      const cap = `${capTitle} — photo ${i + 1} of ${imgs.length}`;
+      h += `<img class="info-thumb" loading="lazy" src="${esc(url)}" tabindex="0" ` +
+        `data-lightbox="${esc(url)}" data-cap="${esc(cap)}" alt="${esc(cap)}">`;
+    });
     h += `</div></div>`;
   }
   if (row) {                                          // derived status needs a checked row
@@ -10908,10 +11081,16 @@ function renderBuildEditor() {
   if (activeBuildTab() === "btab-source") refreshSourceTab();
 }
 
-function selectBuild(id) {
+async function selectBuild(id) {
   if (id !== state.buildSel && buildIsDirty() &&
       state.settings.confirmDiscard !== false &&
-      !window.confirm("Discard unsaved changes to this entry?")) return;
+      !(await confirmDialog({
+        title: "Discard entry changes",
+        message: "Discard unsaved changes to this entry?",
+        confirmLabel: "Discard changes",
+        cancelLabel: "Keep editing",
+        danger: true,
+      }))) return;
   state.buildSel = id;
   renderBuildsList();
   renderBuildEditor();
@@ -13616,10 +13795,14 @@ async function deleteSelectedPages() {
     return;
   }
   const pages = [...ocrState.pageSel].sort((a, z) => a - z);
-  if (!window.confirm(
-      `Delete ${pages.length} page(s) [${pages.join(", ")}] from the PDF?\n` +
-      `${pdf}\n\nThe previous version is kept as a .bak.pdf next to it; ` +
-      "OCR files and title pages are renumbered to match.")) {
+  if (!(await confirmDialog({
+      title: "Delete PDF pages",
+      message: `Delete ${pages.length} page(s) [${pages.join(", ")}] from the PDF?`,
+      detail: `${pdf}\n\nThe previous version is kept as a .bak.pdf next to ` +
+        "it; OCR files and title pages are renumbered to match.",
+      confirmLabel: "Delete pages",
+      danger: true,
+    }))) {
     return;
   }
   el("ocr-msg").textContent = "Deleting pages ...";
@@ -14280,23 +14463,53 @@ function initWebView() {
     if (ev.target === el("ia-overlay")) closeIaViewer();
   });
   document.addEventListener("keydown", onIaViewerKey);   // arrow-key paging
-  // entry-photo lightbox: any Info-panel thumbnail opens full size
-  document.addEventListener("click", (ev) => {
-    const th = ev.target.closest("[data-lightbox]");
-    if (!th) return;
+  // entry-photo viewer: any Info-panel thumbnail opens full size. Focus
+  // moves to the viewer's close control and returns to the thumbnail on
+  // close; only the backdrop and the close button dismiss (not the image).
+  let lightboxOpener = null;
+  const openLightbox = (th) => {
+    lightboxOpener = th;
+    const cap = th.dataset.cap || th.alt || "Entry photo";
     el("img-lightbox-img").src = th.dataset.lightbox;
+    el("img-lightbox-img").alt = cap;
+    el("img-lightbox-cap").textContent = cap;
     el("img-lightbox").hidden = false;
-  });
-  el("img-lightbox").addEventListener("click", () => {
+    el("img-lightbox-close").focus();
+  };
+  const closeLightbox = () => {
     el("img-lightbox").hidden = true;
     el("img-lightbox-img").src = "";
+    if (lightboxOpener && document.contains(lightboxOpener)) lightboxOpener.focus();
+    lightboxOpener = null;
+  };
+  document.addEventListener("click", (ev) => {
+    const th = ev.target.closest("[data-lightbox]");
+    if (th) openLightbox(th);
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter" || ev.repeat || !el("img-lightbox").hidden) return;
+    const th = ev.target.closest && ev.target.closest("[data-lightbox]");
+    if (th) openLightbox(th);
+  });
+  el("img-lightbox-close").addEventListener("click", closeLightbox);
+  el("img-lightbox").addEventListener("mousedown", (ev) => {
+    if (ev.target === el("img-lightbox")) {
+      ev.preventDefault();
+      closeLightbox();
+    }
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (el("img-lightbox").hidden) return;
+    // the close control is the viewer's only focusable: keep Tab on it
+    if (ev.key === "Tab") {
+      ev.preventDefault();
+      el("img-lightbox-close").focus();
+    }
   });
   document.addEventListener("keydown", (ev) => {
     if (ev.key !== "Escape") return;
-    if (!el("img-lightbox").hidden) {
-      el("img-lightbox").hidden = true;
-      el("img-lightbox-img").src = "";
-    } else if (!el("ia-overlay").hidden) closeIaViewer();
+    if (!el("img-lightbox").hidden) closeLightbox();
+    else if (!el("ia-overlay").hidden) closeIaViewer();
     else if (!el("webview-overlay").hidden) closeWebView();
   });
 }
@@ -14348,6 +14561,7 @@ function init() {
   boot("font", applyFont);
   boot("checked books", loadChecked);
   boot("icons", injectIcons);
+  boot("confirm dialog", initConfirmDialog);
   boot("tabs", initTabs);
   boot("jobs", initJobs);
   boot("tooltips", initTooltips);
@@ -14746,7 +14960,10 @@ function init() {
   el("md-cancel").addEventListener("click", () => closeMarkdownEditor(false));
   el("md-close").addEventListener("click", () => closeMarkdownEditor(false));
   el("md-overlay").addEventListener("mousedown", (ev) => {
-    if (ev.target === el("md-overlay")) closeMarkdownEditor(false);
+    if (ev.target === el("md-overlay")) {
+      ev.preventDefault();   // keep focus with the discard confirm, not <body>
+      closeMarkdownEditor(false);
+    }
   });
 
   // upload list / book builder
@@ -14963,7 +15180,10 @@ function init() {
     if (ev.key === "Enter") { ev.preventDefault(); saveManualSource(false); }
   });
   el("msrc-overlay").addEventListener("mousedown", (ev) => {
-    if (ev.target === el("msrc-overlay")) closeManualSource();
+    if (ev.target === el("msrc-overlay")) {
+      ev.preventDefault();   // keep focus with the discard confirm, not <body>
+      closeManualSource();
+    }
   });
   el("open-settings").addEventListener("click", openSettings);
   el("settings-close").addEventListener("click", closeSettings);
@@ -14990,6 +15210,8 @@ function init() {
     else if (!el("cat-overlay").hidden) closeCategories();
     else if (!el("changelog-overlay").hidden) closeChangelog();
     else if (!el("settings-overlay").hidden) closeSettings();
+    else if (!el("engine-overlay").hidden) closeDefaultEngines();
+    else if (!el("about-overlay").hidden) closeAbout();
   });
 
   // keep sized tables filling their panes when the window or panes resize
