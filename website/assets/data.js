@@ -14,9 +14,10 @@ const CFG = window.WHL_CONFIG || {};
 export const usingCloud = Boolean(CFG.supabaseUrl && CFG.supabaseAnonKey);
 
 // The separator used to render a category path (root -> leaf) as one string.
-// It matches the desktop publish step, so the flat `categories` text a cloud row
-// carries contains these exact joins -- which is why an `ilike` substring filter
-// on a parent path also matches every child (a child's text begins with it).
+// It matches the desktop publish step. Category filtering is a path-prefix
+// test over `category_paths` (rowInCat below) in both modes, so selecting
+// "Botany" takes its whole subtree and never an unrelated branch that merely
+// contains the same text somewhere in its rendering.
 export const CAT_SEP = " › ";                 // " › "
 export const catText = (path) =>
   (Array.isArray(path) ? path : []).map((n) => String(n)).filter(Boolean).join(CAT_SEP);
@@ -31,6 +32,31 @@ function rest(path) {
     if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
     return r.json();
   });
+}
+
+// One GET that carries its own exact total: `Prefer: count=exact` makes
+// PostgREST answer "first-last/total" in Content-Range, so the rows and the
+// count arrive together -- there is no second count request to race the
+// first or to fail on its own. total comes back null when the header is
+// missing or uncounted ("0-23/*"); callers must treat null as "unknown",
+// never as zero.
+async function restWithCount(path) {
+  const r = await fetch(`${CFG.supabaseUrl.replace(/\/$/, "")}/rest/v1/${path}`, {
+    headers: {
+      apikey: CFG.supabaseAnonKey,
+      Authorization: `Bearer ${CFG.supabaseAnonKey}`,
+      Prefer: "count=exact",
+    },
+  });
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  return { rows: await r.json(), total: contentRangeTotal(r.headers.get("content-range")) };
+}
+
+// The total out of a Content-Range header: "0-23/137" -> 137, "*/0" -> 0,
+// "0-23/*" (the server declined to count), malformed, and missing -> null.
+export function contentRangeTotal(header) {
+  const m = /^\s*(?:\d+-\d+|\*)\/(\d+)\s*$/.exec(String(header || ""));
+  return m ? parseInt(m[1], 10) : null;
 }
 
 // PostgREST stored functions: POST /rest/v1/rpc/<name> with the arguments as
@@ -71,7 +97,10 @@ const norm = (s) => String(s || "").toLowerCase();
 // must not smuggle any of them in, so escape them before wrapping in `*...*`.
 const likeEscape = (s) => String(s).replace(/([\\%_*])/g, "\\$1");
 
-// Does a fixture row sit under a category path (subtree prefix match)?
+// Does a row sit under a category path (subtree prefix match)? This is THE
+// definition of category filtering: the fixture path filters rows with it
+// directly, and the cloud path uses it to pick slugs out of the facet corpus
+// (see searchVolumes) -- one function, so the two modes cannot drift apart.
 function rowInCat(v, wanted) {
   if (!wanted) return true;
   const paths = Array.isArray(v.category_paths) ? v.category_paths : [];
@@ -81,7 +110,35 @@ function rowInCat(v, wanted) {
   });
 }
 
-/** {q, yearFrom, yearTo, cat, lang, author, sort, limit, offset} -> {rows, total} */
+// How many slugs one `slug=in.(...)` filter may carry. Slugs run ~40-60
+// characters, so 50 keeps the whole query URL a few KB -- safely inside
+// proxy and server header limits -- while a low-thousands corpus still
+// resolves in a handful of requests.
+const IN_CHUNK = 50;
+
+// PostgREST in-list values are double-quoted so a slug carrying `,` or `)`
+// cannot break the list apart.
+const inValue = (s) => encodeURIComponent(`"${String(s).replace(/([\\"])/g, "\\$1")}"`);
+
+// Fetch volumes rows for an explicit slug list, IN_CHUNK slugs per request.
+// No server-side order: across chunks it would be meaningless anyway, so
+// callers sort what comes back.
+async function bySlugs(slugs, select, params = []) {
+  const out = [];
+  for (let i = 0; i < slugs.length; i += IN_CHUNK) {
+    const chunk = slugs.slice(i, i + IN_CHUNK);
+    out.push(...await rest(
+      `volumes?select=${select}&slug=in.(${chunk.map(inValue).join(",")})` +
+      (params.length ? `&${params.join("&")}` : "")
+    ));
+  }
+  return out;
+}
+
+/** {q, yearFrom, yearTo, cat, lang, author, sort, limit, offset} ->
+ *  {rows, total}. total is the exact match count, or null when the cloud
+ *  answered with rows but no usable count -- "unknown", which callers must
+ *  surface as such and never render as zero. */
 export async function searchVolumes(opts = {}) {
   const {
     q = "", yearFrom = null, yearTo = null, cat = "", lang = "", author = "",
@@ -106,45 +163,50 @@ export async function searchVolumes(opts = {}) {
     return { rows: rows.slice(offset, offset + limit), total: rows.length };
   }
 
-  // PostgREST: the database does the search, so a query never ships the catalogue
-  const params = filterParams(q, yearFrom, yearTo, cat, lang, author);
+  // PostgREST: the database does the search, so a query never ships the
+  // catalogue. Categories are the one exception: PostgREST's flat filters
+  // cannot express "some path in this jsonb array starts with this prefix",
+  // and an `ilike` substring over the flat categories text matched unrelated
+  // branches (selecting the root "Flora" also caught "Botany › Flora"). So a
+  // category resolves client-side against the complete, paginated facet
+  // corpus with the same rowInCat the fixture path uses, and the rows come
+  // back by slug.
+  if (cat) {
+    const corpus = await facetSource();
+    const slugs = corpus.filter((v) => rowInCat(v, cat)).map((v) => v.slug);
+    if (!slugs.length) return { rows: [], total: 0 };
+
+    // The slug in-list is chunked (URL length), and chunks come back in
+    // table order, not ours -- so the merged set is sorted here, over light
+    // rows, before one last fetch hydrates just the visible page. The
+    // corpus is small (low thousands); this stays cheap.
+    const light = await bySlugs(slugs, "slug,title,year,created_at",
+      filterParams(q, yearFrom, yearTo, lang, author));
+    const page = sortRows(light, sort).slice(offset, offset + limit);
+    const full = new Map((await bySlugs(page.map((v) => v.slug), "*")).map((r) => [r.slug, r]));
+    return { rows: page.map((v) => full.get(v.slug)).filter(Boolean), total: light.length };
+  }
+
+  const params = filterParams(q, yearFrom, yearTo, lang, author);
   params.unshift("select=*");
   params.push(`order=${orderClause(sort)}`);
   params.push(`limit=${limit}`, `offset=${offset}`);
-
-  const rows = await rest(`volumes?${params.join("&")}`);
-  const total = await countVolumes(q, yearFrom, yearTo, cat, lang, author).catch(() => rows.length);
-  return { rows, total };
+  // rows + exact total in one request; total is null if the count is unavailable
+  return restWithCount(`volumes?${params.join("&")}`);
 }
 
-// The filter half of a volumes query, shared by the row fetch and the count.
-function filterParams(q, yearFrom, yearTo, cat, lang, author) {
+// The filter half of a volumes query. Category is not here: it cannot be a
+// plain PostgREST filter (see searchVolumes) and resolves to a slug list.
+function filterParams(q, yearFrom, yearTo, lang, author) {
   const params = [];
   if (q) params.push(`fts=plfts(english).${encodeURIComponent(q)}`);
   if (yearFrom != null) params.push(`year=gte.${yearFrom}`);
   if (yearTo != null) params.push(`year=lte.${yearTo}`);
-  if (cat) params.push(`categories=ilike.*${encodeURIComponent(likeEscape(cat))}*`);
   if (lang) params.push(`language=eq.${encodeURIComponent(lang)}`);
   // Exact match: this is "this literal published author string," matching how
   // author_pages/author_index are keyed -- never a substring/ilike filter here.
   if (author) params.push(`authors=eq.${encodeURIComponent(author)}`);
   return params;
-}
-
-async function countVolumes(q, yearFrom, yearTo, cat, lang, author) {
-  const params = ["select=id", ...filterParams(q, yearFrom, yearTo, cat, lang, author)];
-  const r = await fetch(`${CFG.supabaseUrl.replace(/\/$/, "")}/rest/v1/volumes?${params.join("&")}`, {
-    method: "HEAD",
-    headers: {
-      apikey: CFG.supabaseAnonKey,
-      Authorization: `Bearer ${CFG.supabaseAnonKey}`,
-      Prefer: "count=exact",
-      Range: "0-0",
-    },
-  });
-  const cr = r.headers.get("content-range") || "";        // "0-0/137"
-  const n = parseInt(cr.split("/")[1], 10);
-  return Number.isFinite(n) ? n : 0;
 }
 
 export async function getVolume(slug) {
@@ -237,7 +299,14 @@ export async function searchVolume(slug, q, lang = "") {
 }
 
 /** The light rows the browse page needs to build its facets client-side:
- *  {slug, category_paths, language, year} for every volume. */
+ *  {slug, category_paths, language, year} for EVERY volume. PostgREST
+ *  silently caps an unpaginated response (~1000 rows), so the cloud path
+ *  walks ordered limit/offset batches until a short batch says the table is
+ *  drained (the getAllPages idiom) -- a growing catalogue must never come
+ *  back silently truncated, or the facet rail and the category filter would
+ *  both quietly lose volumes. Cached: the browse page boots from it and
+ *  every category-filtered search reuses it. */
+let _facetRows = null;
 export async function facetSource() {
   if (!usingCloud) {
     return (await fixture()).map((v) => ({
@@ -247,7 +316,22 @@ export async function facetSource() {
       year: v.year ?? null,
     }));
   }
-  return rest("volumes?select=slug,category_paths,language,year");
+  if (!_facetRows) {
+    _facetRows = (async () => {
+      const out = [];
+      const limit = 500;
+      for (let offset = 0; ; offset += limit) {
+        const rows = await rest(
+          `volumes?select=slug,category_paths,language,year&order=slug.asc&limit=${limit}&offset=${offset}`
+        );
+        out.push(...rows);
+        if (rows.length < limit) break;
+      }
+      return out;
+    })();
+    _facetRows.catch(() => { _facetRows = null; });   // a failed walk may be retried
+  }
+  return _facetRows;
 }
 
 /** Title matches for the search-box autocomplete: [{slug, title, authors, year}]. */
