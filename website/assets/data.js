@@ -246,8 +246,8 @@ export async function latestReleases() {
 }
 
 /** The shared release notes: changelog.md at the site root, the same file the
- *  desktop app bundles. Returns [{version, date, items[]}] newest-first, or []
- *  on any failure so the pages degrade to no changelog rather than an error. */
+ *  desktop app bundles. Returns [{version, date, categories, items}] newest-first,
+ *  or [] on any failure so the pages degrade to no changelog rather than an error. */
 export async function fetchChangelog() {
   try {
     const r = await fetch("changelog.md");
@@ -267,26 +267,49 @@ export function isSignificantVersion(version) {
   return patch === undefined || /^0+$/.test(patch);
 }
 
-/** Terse markdown -> versions. "## <version> — <date>" starts an entry; "- "
- *  lines are its bullets; a title or any preamble before the first entry is
- *  ignored. A `<!--more-->` fold splits an entry's bullets into `items` (the
- *  highlights, authored biggest-first) and `more` (the lesser fixes below the
- *  fold). Pure text out; the caller escapes before it touches the DOM. */
+const CHANGELOG_CATEGORIES = new Map([
+  ["additions", "Additions"],
+  ["other changes", "Other Changes"],
+  ["bugfixes", "Bugfixes"],
+]);
+
+function changelogCategory(cur, name) {
+  let category = cur.categories.find((c) => c.name === name);
+  if (!category) {
+    category = { name, items: [] };
+    cur.categories.push(category);
+  }
+  return category;
+}
+
+/** Terse markdown -> versions. "## <version> — <date>" starts an entry and
+ *  "### Additions", "### Other Changes", or "### Bugfixes" starts a category.
+ *  Plain bullets without a category remain supported as Other Changes. Titles,
+ *  preamble, and unknown subheadings are ignored. Pure text out; the caller
+ *  escapes before it touches the DOM. */
 export function parseChangelog(md) {
   const out = [];
   let cur = null;
-  let below = false;                          // past this entry's <!--more--> fold?
+  let category = null;
   for (const raw of String(md || "").split(/\r?\n/)) {
     const line = raw.trim();
     let m;
     if ((m = /^##\s+(.+?)(?:\s+[—–·-]\s+(.+))?$/.exec(line))) {   // em/en/middot/hyphen date separator
-      cur = { version: m[1].trim(), date: (m[2] || "").trim(), items: [], more: [] };
+      cur = {
+        version: m[1].trim(),
+        date: (m[2] || "").trim(),
+        categories: [],
+        items: [],
+      };
       out.push(cur);
-      below = false;
-    } else if (cur && /^<!--\s*more\s*-->$/i.test(line)) {
-      below = true;
+      category = null;
+    } else if (cur && (m = /^###\s+(.+)$/.exec(line))) {
+      const name = CHANGELOG_CATEGORIES.get(m[1].trim().toLowerCase());
+      category = name ? changelogCategory(cur, name) : null;
     } else if (cur && (m = /^[-*]\s+(.+)$/.exec(line))) {
-      (below ? cur.more : cur.items).push(m[1].trim());
+      const item = m[1].trim();
+      (category || changelogCategory(cur, "Other Changes")).items.push(item);
+      cur.items.push(item);                    // legacy flat-list consumers
     }
   }
   return out;

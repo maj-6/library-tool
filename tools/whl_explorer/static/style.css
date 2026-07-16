@@ -2362,7 +2362,17 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   margin-left: 6px;
   letter-spacing: 0.3px;
 }
+.cl-category { margin-top: 8px; }
+.cl-category + .cl-category { margin-top: 11px; }
+.cl-category-name {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.4;
+  font-weight: 600;
+  color: var(--ink-light);
+}
 .cl-list { margin: 8px 0 0; padding-left: 18px; }
+.cl-category .cl-list { margin-top: 4px; }
 .cl-list li { margin: 0 0 4px; line-height: 1.45; }
 
 #settings-overlay { z-index: 50; }

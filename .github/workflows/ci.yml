@@ -46,4 +46,6 @@ jobs:
       - name: JavaScript checks
         run: |
           node --check tools/whl_explorer/static/app.js
-          node --test tests/publish_tree_behavior.test.js
+          node --experimental-default-type=module --check website/assets/data.js
+          node --experimental-default-type=module --check website/assets/releases.js
+          node --test tests/changelog_behavior.test.js tests/publish_tree_behavior.test.js
