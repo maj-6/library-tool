@@ -139,3 +139,30 @@ def test_tooltip_geometry_converts_visual_pixels_back_through_root_zoom():
     assert "Number(state.settings.uiScale) || 1" in body
     assert 'tip.style.left = (left / scale) + "px"' in body
     assert 'tip.style.top = (top / scale) + "px"' in body
+
+
+def test_copyright_tag_uses_independent_semantic_halves_and_accessible_text():
+    colors = _function("copyrightColors", "renderCrTag")
+    assert 'left: "reg-found"' in colors
+    assert 'rc = "public-domain"' in colors
+    assert 'rc = "in-copyright"' in colors
+    assert 'rc = "inconclusive"' in colors
+    assert 'left: copyrightSources().length ? "reg-none" : "unknown"' in colors
+
+    render = _function("renderCrTag", "crStatusFor")
+    assert 'role="img"' in render
+    assert 'aria-label=' in render
+    assert 'aria-hidden="true"' in render
+    assert "c.left === c.right" not in render
+    assert "cr-mono" not in render
+
+    assert "registration evidence (upper-left) / copyright status (lower-right)" in TEMPLATE
+
+
+def test_registration_client_cache_is_versioned_year_aware_and_retries_errors():
+    assert 'const REG_KEY = "whl_reg_cache_v2"' in APP
+    key = _function("regKey", "queueReg")
+    assert "book && book.year" in key
+    pump = _function("pumpRegQueue", "crStatusCache")
+    assert "if (!r.ok) throw new Error" in pump
+    assert "_cachedAt: Date.now()" in pump

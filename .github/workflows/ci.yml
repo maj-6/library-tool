@@ -45,8 +45,12 @@ jobs:
 
       - name: JavaScript checks
         run: |
+          node --check desktop/main.js
+          node --check desktop/preload.js
+          node --check desktop/startup-preload.js
+          node --check desktop/updater-preload.js
           node --check tools/whl_explorer/static/app.js
           node --experimental-default-type=module --check website/assets/data.js
           node --experimental-default-type=module --check website/assets/releases.js
           node --experimental-default-type=module --check website/assets/textsearch.js
-          node --test tests/changelog_behavior.test.js tests/publish_tree_behavior.test.js tests/desktop_issue_fixes_behavior.test.js tests/textsearch.test.js
+          node --test tests/changelog_behavior.test.js tests/publish_tree_behavior.test.js tests/desktop_issue_fixes_behavior.test.js tests/electron_lifecycle_behavior.test.js tests/copyright_cache_behavior.test.js tests/textsearch.test.js

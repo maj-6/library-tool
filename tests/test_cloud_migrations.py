@@ -20,6 +20,8 @@ MIGRATIONS = sorted((Path(__file__).parents[1] / "docs" / "cloud" /
 SQL = {p.stem: p.read_text(encoding="utf-8") for p in MIGRATIONS}
 BASELINE = SQL["001_baseline"]
 BASELINE_FLAT = " ".join(BASELINE.split())
+HARDENING = SQL["002_capture_owner_hardening"]
+HARDENING_FLAT = " ".join(HARDENING.split())
 
 
 # --- the migration files themselves ----------------------------------------------
@@ -31,6 +33,7 @@ def test_migrations_exist_ordered_and_well_named():
     numbers = [int(m[:3]) for m in ids]
     assert numbers[0] == 1
     assert numbers == sorted(numbers) and len(set(numbers)) == len(numbers)
+    assert ids[:2] == ["001_baseline", "002_capture_owner_hardening"]
 
 
 def test_every_migration_records_itself_last():
@@ -57,6 +60,17 @@ def test_baseline_is_rerun_safe():
     assert not re.search(r"create index (?!if not exists)", body)
 
 
+def test_capture_hardening_is_append_only_and_rerun_safe():
+    """002 repairs recorded baselines without rewriting schema or stored data."""
+    body = re.sub(r"--[^\n]*", "", HARDENING)
+    assert "create table" not in body
+    assert "alter table" not in body
+    assert "drop table" not in body and "drop column" not in body
+    assert "create index if not exists captures_photos_idx" in body
+    assert HARDENING.count("drop policy if exists") == 2
+    assert HARDENING.count("create policy captures_objects_") == 2
+
+
 def test_baseline_folds_in_the_production_drift_fixes():
     # the unindexed volumes.uploaded_by foreign key
     assert ("create index if not exists volumes_uploaded_by_idx on volumes "
@@ -68,6 +82,35 @@ def test_baseline_folds_in_the_production_drift_fixes():
     # one permissive profiles read policy, and the old one dropped
     assert BASELINE.count("create policy profiles_read") == 1
     assert "drop policy if exists profiles_read_all" in BASELINE
+
+
+def test_capture_owner_identity_is_not_mutable_by_authenticated_clients():
+    """created_by anchors capture and Storage RLS, so UPDATE must exclude it."""
+    for sql in (BASELINE_FLAT, HARDENING_FLAT):
+        assert "grant select, insert on public.captures to authenticated;" in sql
+        assert ("grant update (device, status, photos, note, contributor, ocr, "
+                "meta) on public.captures to authenticated;" in sql)
+        assert ("revoke update (id, created_at, created_by) on public.captures "
+                "from authenticated;" in sql)
+        assert "grant select, insert, update on public.captures" not in sql
+    # Already-baselined projects still hold 001's old table-wide privilege;
+    # the append-only repair must revoke it before granting per-column UPDATE.
+    assert "revoke update on public.captures from authenticated;" in HARDENING_FLAT
+
+
+def test_capture_storage_policies_bind_object_owner_to_capture_owner():
+    """A granted capture cannot become a pointer to another user's object."""
+    for sql, flat in ((BASELINE, BASELINE_FLAT), (HARDENING, HARDENING_FLAT)):
+        assert ("create index if not exists captures_photos_idx on captures "
+                "using gin (photos);" in flat)
+        body = re.sub(r"--[^\n]*", "", sql)
+        for name in ("captures_objects_select_authorized",
+                     "captures_objects_delete_authorized"):
+            match = re.search(rf"create policy {name}\b.*?;", body, re.DOTALL)
+            assert match, name
+            policy = " ".join(match.group(0).split())
+            assert "storage.objects.owner_id = c.created_by::text" in policy
+            assert "grant_row.contributor_id = c.created_by" in policy
 
 
 def test_migrations_lint_clean():

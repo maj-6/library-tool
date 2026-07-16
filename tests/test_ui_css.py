@@ -28,3 +28,16 @@ def test_modal_backdrops_cover_sticky_table_headers():
 def test_catalog_uses_field_cues_instead_of_manual_row_tint():
     assert ".grid tbody tr.is-manual" not in STYLE
     assert ".grid tbody td.missing-core" in STYLE
+
+
+def test_copyright_tag_palette_is_semantic_and_pattern_redundant():
+    for selector in (
+        ".cr-reg-found", ".cr-reg-none", ".cr-public-domain",
+        ".cr-in-copyright", ".cr-inconclusive", ".cr-unknown",
+        ".cr-pending",
+    ):
+        assert selector in STYLE
+    assert ".cr-in-copyright {\n  background: repeating-linear-gradient" in STYLE
+    assert ".cr-inconclusive {\n  background: repeating-linear-gradient" in STYLE
+    for legacy in (".cr-blue", ".cr-yellow", ".cr-magenta", ".cr-orange"):
+        assert legacy not in STYLE

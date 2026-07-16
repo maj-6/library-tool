@@ -40,9 +40,9 @@ without reaching stable users:
   cut). Bump the Android `versionCode` too if the APK rides along.
 - Tag it `v0.7.0-alpha.1` and push. The existing `v*` pipeline builds it, and
   because the tag carries `-alpha` / `-beta` / `-rc` it:
-  - flags the GitHub Release **prerelease**, so the desktop auto-updater
-    (`allowPrerelease` stays false — desktop/main.js) never offers it to stable
-    users; they hold at the last stable version.
+  - flags the GitHub Release **prerelease**, so ordinary stable installs never
+    receive it. Installed prereleases continue following the prerelease line;
+    stable installs can opt in from Settings.
   - registers the `releases` row on the **`alpha` / `beta` / `rc` channel**, so
     it appears in the Downloads page's **Other downloads** section instead of
     replacing the stable card.
