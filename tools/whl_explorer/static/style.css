@@ -2572,6 +2572,19 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   background: var(--face-sh); border-radius: 3px; overflow: hidden;
 }
 .dl-progbar { display: block; height: 100%; width: 0; background: var(--cyan); transition: width 0.3s ease; }
+/* quiet background-jobs marker (deliberately under-styled: dim text, thin rule) */
+.foot-jobs {
+  color: var(--face-sh2);
+  font-size: 10.5px;
+  letter-spacing: 0.3px;
+  padding-left: 8px;
+  border-left: 1px solid var(--face-sh);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.foot-jobs:hover { color: var(--ink); }
+.foot-jobs[hidden] { display: none; }
+
 .foot-tag {
   border: 1px solid currentColor;
   border-radius: var(--radius);

@@ -2374,6 +2374,219 @@ def api_pdf_pageimg():
     return _cached_page_file(out, mime)
 
 
+# --- unified background-job registry ---------------------------------------------
+# Every long-running worker (OCR, analyze, publish) enters ONE registry with a
+# shared lifecycle: queued | running | cancelling | cancelled | failed | done,
+# plus `interrupted` for work a restart cut short. Entries are the SAME dicts
+# the per-kind registries hold, so the existing pollers keep their legacy
+# fields (`status` strings) while /api/jobs and the snapshot read the
+# canonical ones (`state`). The snapshot — an allowlist, never credentials,
+# request payloads, or prompt text — lands in DATA_ROOT/output/jobs.json on
+# every state transition, so after a restart a poll gets an honest
+# "interrupted" answer instead of a 404. Cancellation is cooperative: a
+# threading.Event per job (never serialized), checked by each worker at its
+# natural boundary (OCR page, analyze chunk, publish stage).
+
+JOBS_PATH = lib.OUTPUT_DIR / "jobs.json"
+_JOBS_KEEP = 50                       # newest finished/interrupted entries kept
+_JOB_ACTIVE = ("queued", "running", "cancelling")
+_JOB_FIELDS = ("id", "kind", "build_id", "label", "state", "status", "done",
+               "total", "errors", "error", "note", "created_at", "finished_at")
+_JOB_STATES = {"queued": "queued", "running": "running",
+               "cancelling": "cancelling", "cancelled": "cancelled",
+               "error": "failed", "done": "done", "done (with errors)": "done",
+               "interrupted": "interrupted"}
+_jobs: dict[str, dict] = {}
+_jobs_events: dict[str, threading.Event] = {}   # cancel flags; never serialized
+_jobs_lock = threading.Lock()
+
+
+class _JobCancelled(Exception):
+    """Raised inside a worker at a stage boundary after a cancel request."""
+
+
+def _job_state_of(status) -> str:
+    return _JOB_STATES.get(str(status or ""), "running")
+
+
+def _job_public(job: dict) -> dict:
+    return {k: job.get(k) for k in _JOB_FIELDS if k in job}
+
+
+def _jobs_save_locked() -> None:
+    try:
+        lib.save_json(JOBS_PATH, {jid: _job_public(j) for jid, j in _jobs.items()})
+    except OSError:
+        log.warning("could not persist the job registry", exc_info=True)
+
+
+def _job_book_label(bid: str) -> str:
+    b = lib.load_json(BUILDS_PATH, {}).get(str(bid or "")) or {}
+    return str(b.get("title") or "").strip() or str(bid or "")
+
+
+def _jobs_prune_locked() -> None:
+    """Drop the oldest finished/interrupted entries beyond the retention cap.
+    Active jobs are never pruned."""
+    done = sorted((j for j in _jobs.values()
+                   if j.get("state") not in _JOB_ACTIVE),
+                  key=lambda j: str(j.get("finished_at")
+                                    or j.get("created_at") or ""),
+                  reverse=True)
+    for old in done[_JOBS_KEEP:]:
+        _jobs.pop(str(old.get("id")), None)
+        _jobs_events.pop(str(old.get("id")), None)
+
+
+def _job_track(job: dict, kind: str, label: str = "") -> threading.Event:
+    """Enter a per-kind job dict into the unified registry (shared dict) and
+    return its cancellation event. Insertion prunes the oldest finished
+    entries beyond _JOBS_KEEP and persists the snapshot."""
+    ev = threading.Event()
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with _jobs_lock:
+        job.setdefault("id", lib.gen_id(set(_jobs)))
+        job.setdefault("kind", kind)
+        job.setdefault("build_id", "")
+        for k, v in (("done", 0), ("total", 0), ("errors", 0), ("note", "")):
+            job.setdefault(k, v)
+        job.setdefault("status", "running")
+        job["label"] = label or str(job.get("label") or "")
+        job["state"] = _job_state_of(job["status"])
+        job["created_at"] = now
+        job["finished_at"] = ""
+        _jobs[job["id"]] = job
+        _jobs_events[job["id"]] = ev
+        _jobs_prune_locked()
+        _jobs_save_locked()
+    return ev
+
+
+def _job_transition(job: dict, status: str, **fields) -> None:
+    """Move a job to a lifecycle status (legacy string), stamp the canonical
+    state, and persist. Safe on untracked dicts (tests build jobs directly)."""
+    with _jobs_lock:
+        job.update(fields)
+        job["status"] = status
+        job["state"] = _job_state_of(status)
+        if job["state"] not in _JOB_ACTIVE and not job.get("finished_at"):
+            job["finished_at"] = datetime.now(timezone.utc).isoformat(
+                timespec="seconds")
+        if _jobs.get(str(job.get("id") or "")) is job:
+            if job["state"] not in _JOB_ACTIVE:
+                _jobs_prune_locked()
+            _jobs_save_locked()
+
+
+def _job_cancelled(job: dict) -> bool:
+    ev = _jobs_events.get(str(job.get("id") or ""))
+    return ev is not None and ev.is_set()
+
+
+def _job_interrupt_note(kind: str) -> str:
+    k = str(kind or "")
+    if k == "ocr" or k.startswith("translate") or k == "annotate":
+        return "interrupted by restart — progressive output kept"
+    if k == "publish":
+        return "interrupted by restart — not applied"
+    return "interrupted by restart — output not written"
+
+
+def _jobs_load() -> None:
+    """Rehydrate the persisted registry on startup: whatever was still active
+    when the process died becomes `interrupted`, distinguishing resumable
+    output (progressively-saved OCR/translation pages) from abandoned work.
+    Live entries are never clobbered."""
+    try:
+        stored = lib.load_json(JOBS_PATH, {})
+    except (OSError, ValueError):
+        return
+    if not isinstance(stored, dict) or not stored:
+        return
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with _jobs_lock:
+        for jid, raw in stored.items():
+            if not isinstance(raw, dict) or jid in _jobs:
+                continue
+            job = _job_public(raw)
+            job["id"] = str(jid)
+            if job.get("state") in _JOB_ACTIVE or not job.get("state"):
+                job["status"] = job["state"] = "interrupted"
+                job["note"] = _job_interrupt_note(job.get("kind"))
+                job["finished_at"] = job.get("finished_at") or now
+            _jobs[job["id"]] = job
+        _jobs_prune_locked()
+        _jobs_save_locked()
+
+
+_jobs_load()
+
+
+@app.route("/api/jobs")
+def api_jobs():
+    """Every registry entry (oldest first) plus read-only rows for the other
+    background work — IA downloads and cloud sync — so one poll paints the
+    whole queue table."""
+    with _jobs_lock:
+        rows = [_job_public(j) for j in _jobs.values()]
+    rows.sort(key=lambda r: (str(r.get("created_at") or ""),
+                             str(r.get("id") or "")))
+    with _downloads_lock:
+        for ident, d in _downloads.items():
+            if d.get("status") == "downloading":
+                rows.append({"kind": "download", "label": ident,
+                             "state": "running",
+                             "done": int(d.get("bytes") or 0),
+                             "total": int(d.get("total") or 0)})
+    with _cloudsync_lock:
+        if _cloudsync.get("running"):
+            rows.append({"kind": "cloudsync", "label": "Cloud sync",
+                         "state": "running"})
+    active = sum(1 for r in rows if r.get("state") in _JOB_ACTIVE)
+    return jsonify({"ok": True, "jobs": rows, "active": active})
+
+
+@app.route("/api/jobs/active")
+def api_jobs_active():
+    """Count + labels of unfinished work, for the desktop shell's quit guard.
+    Cloud sync is deliberately excluded: it converges on its next run."""
+    with _jobs_lock:
+        act = [_job_public(j) for j in _jobs.values()
+               if j.get("state") in _JOB_ACTIVE]
+    act.sort(key=lambda r: str(r.get("created_at") or ""))
+    jobs = [{"id": r.get("id") or "", "kind": r.get("kind") or "",
+             "label": r.get("label") or "", "cancellable": True} for r in act]
+    with _downloads_lock:
+        for ident, d in _downloads.items():
+            if d.get("status") == "downloading":
+                jobs.append({"id": "", "kind": "download", "label": ident,
+                             "cancellable": False})
+    labels = [f"{j['kind']}: {j['label']}" if j["label"] else j["kind"]
+              for j in jobs]
+    return jsonify({"ok": True, "count": len(jobs), "labels": labels,
+                    "jobs": jobs})
+
+
+@app.route("/api/jobs/<job_id>/cancel", methods=["POST"])
+def api_jobs_cancel(job_id: str):
+    """Cooperative cancel for any tracked job kind. The worker notices at its
+    next boundary (OCR page, analyze chunk, publish stage); already-finished
+    jobs return unchanged (idempotent)."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        ev = _jobs_events.get(job_id)
+    if job is None:
+        abort(404)
+    if ev is None or job.get("state") not in _JOB_ACTIVE:
+        return jsonify({"ok": True, "job": _job_public(job)})
+    ev.set()
+    if job.get("kind") == "ocr":
+        with _ocr_jobs_lock:
+            job["cancel_requested"] = True   # the page loop's existing flag
+    _job_transition(job, "cancelling")
+    return jsonify({"ok": True, "job": _job_public(job)})
+
+
 # --- OCR processing jobs -----------------------------------------------------------
 # Pages are rasterized (PyMuPDF) and run through the chosen OCR service;
 # every finished page is merged into ONE compiled OCR file in the entry
@@ -2666,6 +2879,8 @@ def _ocr_job_run(job_id: str) -> None:
         # OCR engines are synchronous calls, so cancellation takes effect at
         # the page boundary. A page already inside Tesseract/API processing is
         # allowed to finish and be saved; everything after it is skipped.
+        if _job_cancelled(job):             # unified /api/jobs/<id>/cancel
+            job["cancel_requested"] = True
         if job.get("cancel_requested"):
             for pending in job["pages"][index:]:
                 if pending["status"] == "queued":
@@ -2708,17 +2923,20 @@ def _ocr_job_run(job_id: str) -> None:
             log.error("OCR failed: book=%s page=%s service=%s: %s",
                       job["build_id"], n, svc, detail, exc_info=True)
         job["done"] += 1
-    if job.get("cancel_requested"):
+    if job.get("cancel_requested") or _job_cancelled(job):
         # Covers a request received while the final page was processing.
         for pending in job["pages"]:
             if pending["status"] == "queued":
                 pending["status"] = "cancelled"
                 job["cancelled"] += 1
-        job["status"] = "cancelled"
+        _job_transition(job, "cancelled",
+                        note=f"{job['done']} page(s) completed and saved; "
+                             f"{job['cancelled']} skipped")
         log.info("OCR cancelled: book=%s completed=%s skipped=%s",
                  job["build_id"], job["done"], job["cancelled"])
     else:
-        job["status"] = "done" if not job["errors"] else "done (with errors)"
+        _job_transition(job, "done" if not job["errors"]
+                        else "done (with errors)")
 
 
 @app.route("/api/ocr/run", methods=["POST"])
@@ -2743,7 +2961,7 @@ def api_ocr_run():
         width = max(600, min(3000, int(p.get("width") or 1400)))
     except (TypeError, ValueError):
         width = 1400
-    job_id = lib.gen_id(set(_ocr_jobs))
+    job_id = lib.gen_id(set(_ocr_jobs) | set(_jobs))
     # the merged result belongs to the PDF it was read from (?src= key);
     # an unknown/removed key is refused rather than recorded
     src_key = _valid_src_key(lib.load_json(BUILDS_PATH, {}).get(build_id, {}),
@@ -2756,13 +2974,15 @@ def api_ocr_run():
         "id": job_id, "build_id": build_id, "pdf": str(pdf),
         "target": str(p.get("target") or "compiled.txt"),
         "src_key": src_key or "primary",     # word boxes are stored per source
-        "pages": pages, "done": 0, "errors": 0, "cancelled": 0,
+        "pages": pages, "done": 0, "total": len(pages), "errors": 0,
+        "cancelled": 0,
         "cancel_requested": False, "width": width,
         "status": "running",
         "cfg": _ocr_request_cfg(p),
     }
     with _ocr_jobs_lock:
         _ocr_jobs[job_id] = job
+    _job_track(job, "ocr", label=_job_book_label(build_id))
     threading.Thread(target=_ocr_job_run, args=(job_id,), daemon=True).start()
     return jsonify({"ok": True, "job": _ocr_job_state(job)})
 
@@ -2792,7 +3012,14 @@ def _ocr_job_state(job: dict) -> dict:
 def api_ocr_job(job_id: str):
     job = _ocr_jobs.get(job_id)
     if not job:
-        abort(404)
+        # a restart dropped the worker: report the persisted outcome
+        # (usually `interrupted`) instead of a 404 the client reads as "lost"
+        with _jobs_lock:
+            gone = _jobs.get(job_id)
+        if gone is None:
+            abort(404)
+        return jsonify({"ok": True,
+                        "job": dict(_job_public(gone), pages=[], cancelled=0)})
     return jsonify({"ok": True, "job": _ocr_job_state(job)})
 
 
@@ -2803,9 +3030,14 @@ def api_ocr_job_cancel(job_id: str):
         job = _ocr_jobs.get(job_id)
         if not job:
             abort(404)
-        if job.get("status") in ("running", "cancelling"):
+        stopping = job.get("status") in ("running", "cancelling")
+        if stopping:
             job["cancel_requested"] = True
-            job["status"] = "cancelling"
+    if stopping:
+        ev = _jobs_events.get(job_id)
+        if ev is not None:
+            ev.set()
+        _job_transition(job, "cancelling")
     return jsonify({"ok": True, "job": _ocr_job_state(job)})
 
 
@@ -5016,11 +5248,12 @@ _an_write_lock = threading.Lock()
 
 
 def _an_job_new(bid: str, kind: str, total: int) -> dict:
-    job = {"id": lib.gen_id(set(_an_jobs)), "build_id": bid, "kind": kind,
-           "done": 0, "total": total, "errors": 0,
+    job = {"id": lib.gen_id(set(_an_jobs) | set(_jobs)), "build_id": bid,
+           "kind": kind, "done": 0, "total": total, "errors": 0,
            "status": "running", "error": "", "note": ""}
     with _an_jobs_lock:
         _an_jobs[job["id"]] = job
+    _job_track(job, kind, label=_job_book_label(bid))
     return job
 
 
@@ -5041,18 +5274,33 @@ def _an_job_start(bid: str, kind: str, total: int, target,
 
 def _an_finish(job: dict, error: str = "") -> None:
     with _an_jobs_lock:
-        job["status"] = "error" if error else (
-            "done (with errors)" if job["errors"] else "done")
         job["error"] = error
+        status = "error" if error else (
+            "done (with errors)" if job["errors"] else "done")
+    _job_transition(job, status)
+
+
+def _an_cancel_check(job: dict, note: str) -> bool:
+    """True when a cancel was requested — the run() closure returns at once.
+    Whatever the loop already saved stays on disk; `note` says what that is."""
+    if not _job_cancelled(job):
+        return False
+    _job_transition(job, "cancelled", note=note)
+    return True
 
 
 @app.route("/api/analyze/job/<job_id>")
 def api_analyze_job(job_id: str):
     with _an_jobs_lock:
         job = _an_jobs.get(job_id)
-        if job is None:
-            abort(404)
-        return jsonify(dict(job))
+        if job is not None:
+            return jsonify(dict(job))
+    # a restart dropped the worker: the persisted registry still knows it
+    with _jobs_lock:
+        gone = _jobs.get(job_id)
+    if gone is None:
+        abort(404)
+    return jsonify(_job_public(gone))
 
 
 # chunk pages to a character budget; DeepSeek's context is generous but a
@@ -5137,6 +5385,9 @@ def api_analyze_pages():
         try:
             results = []
             for i, (nums, chunk) in enumerate(chunks):
+                if _an_cancel_check(job, f"{job['done']}/{job['total']} chunks "
+                                    "analyzed — artifact not written"):
+                    return
                 result = _ai_chat(cfg, [
                     {"role": "system", "content":
                      "You are analyzing selected pages of a historical "
@@ -5194,6 +5445,9 @@ def api_analyze_summarize():
         try:
             notes = []
             for i, (nums, chunk) in enumerate(chunks):
+                if _an_cancel_check(job, f"{job['done']}/{job['total']} sections "
+                                    "read — no summary written"):
+                    return
                 out = _ai_chat(cfg, [
                     {"role": "system", "content":
                      "You are a rare-books cataloguer summarizing a historical "
@@ -5207,6 +5461,9 @@ def api_analyze_summarize():
                 notes.append(out)
                 with _an_jobs_lock:
                     job["done"] = i + 1
+            if _an_cancel_check(job, f"{job['done']}/{job['total']} sections "
+                                "read — no summary written"):
+                return
             final = _ai_chat(cfg, [
                 {"role": "system", "content":
                  "Combine these section notes into one summary of the work "
@@ -5251,6 +5508,9 @@ def api_analyze_about():
 
     def run(job):
         try:
+            if _an_cancel_check(job, "cancelled before the draft call — "
+                                "nothing written"):
+                return
             out = _ai_chat(cfg, [
                 {"role": "system", "content":
                  "Write the About article for a volume in a public digital "
@@ -5380,6 +5640,10 @@ def api_analyze_translate():
     def run(job):
         try:
             for i, n in enumerate(todo):
+                if _an_cancel_check(job, f"{job['done'] - job['errors']} of "
+                                    f"{len(todo)} pages translated — "
+                                    "saved pages kept"):
+                    return
                 try:
                     out = _ai_chat(cfg, [
                         {"role": "system", "content":
@@ -5447,6 +5711,9 @@ def api_analyze_annotate():
         try:
             added = 0
             for i, (nums, chunk) in enumerate(chunks):
+                if _an_cancel_check(job, f"{job['done']}/{job['total']} chunks "
+                                    "annotated — saved notes kept"):
+                    return
                 try:
                     out = _ai_json(cfg, [
                         {"role": "system", "content":
@@ -5544,6 +5811,9 @@ def api_analyze_relevance():
 
     def run(job):
         try:
+            if _an_cancel_check(job, "cancelled before assessment — "
+                                "nothing written"):
+                return
             out = _ai_json(cfg, [
                 {"role": "system", "content":
                  "Assess how relevant a historical work is to a private "
@@ -5607,7 +5877,8 @@ def api_analyze_relevance():
 
 _publish_lock = threading.Lock()
 _publish: dict = {"running": False, "build": "", "stage": "idle", "sent": 0,
-                  "total": 0, "error": "", "url": "", "slug": "", "note": ""}
+                  "total": 0, "error": "", "url": "", "slug": "", "note": "",
+                  "job": ""}
 
 
 def _r2_cfg() -> dict:
@@ -5961,10 +6232,16 @@ def _unpublish_object(cloud: dict, slug: str, path: str, r2_name: str = "") -> N
         log.error("could not roll back orphaned object for %s: %s", slug, exc)
 
 
-def _publish_run(bid: str, actor: str) -> None:
-    def stage(name, **kw):
+def _publish_run(bid: str, actor: str, job: dict | None = None) -> None:
+    def stage(name, cancellable=True, **kw):
+        # cancellation is checked at stage boundaries only: past "recording"
+        # the volumes row is public, so aborting would not be a clean cancel
+        if cancellable and job is not None and _job_cancelled(job):
+            raise _JobCancelled()
         with _publish_lock:
             _publish.update(stage=name, **kw)
+        if job is not None and job.get("state") in _JOB_ACTIVE:
+            job["note"] = name
     try:
         builds = lib.load_json(BUILDS_PATH, {})
         b = builds.get(bid) or {}
@@ -5983,6 +6260,8 @@ def _publish_run(bid: str, actor: str) -> None:
         def progress(sent, total):
             with _publish_lock:
                 _publish["sent"] = sent
+            if job is not None:                 # unified table sees bytes
+                job["done"], job["total"] = int(sent), int(total)
 
         r2cfg = _r2_cfg()
         if r2.configured(r2cfg):
@@ -6029,6 +6308,7 @@ def _publish_run(bid: str, actor: str) -> None:
             # own "cover candidate" suggestion. A book with no usable page at
             # all just publishes without a thumbnail; that's never a publish
             # failure, a thumbnail is a nice-to-have.
+            stage("thumbnail")
             thumb_local = None
             tsrc = str(b.get("thumbnail_source") or "")
             m = re.match(r"^page:(\d+)$", tsrc)
@@ -6096,8 +6376,9 @@ def _publish_run(bid: str, actor: str) -> None:
 
         # The bundle's artifacts go after the row: a failure here leaves the
         # book published without its extras (retryable by republishing), not
-        # an orphaned public object.
-        stage("bundle")
+        # an orphaned public object. Past this point a cancel would strand a
+        # published row, so the remaining stages ignore the request.
+        stage("bundle", cancellable=False)
         try:
             _publish_bundle(cloud, slug, art)
         except sbase.SyncError as exc:
@@ -6121,11 +6402,24 @@ def _publish_run(bid: str, actor: str) -> None:
         log.info("published volume %s (%.0f MB) -> %s", slug, size / 1e6, url)
         if withheld:
             log.info("text withheld for %s (rights: %s)", slug, b.get("rights"))
-        stage("done", url=url, slug=slug, error="",
-              note="page text and notes withheld (rights)" if withheld else "")
+        note = "page text and notes withheld (rights)" if withheld else ""
+        stage("done", cancellable=False, url=url, slug=slug, error="", note=note)
+        if job is not None:
+            _job_transition(job, "done", note=note)
+    except _JobCancelled:
+        # every uploaded object was rolled back by the block that raised
+        log.info("publish cancelled for build %s", bid)
+        with _publish_lock:
+            _publish.update(stage="cancelled", error="")
+        if job is not None:
+            _job_transition(job, "cancelled", note="cancelled — uploaded "
+                            "objects rolled back; nothing published")
     except Exception as exc:
         log.error("publish failed for build %s", bid, exc_info=exc)
-        stage("error", error=f"{type(exc).__name__}: {exc}")
+        stage("error", cancellable=False, error=f"{type(exc).__name__}: {exc}")
+        if job is not None:
+            _job_transition(job, "error",
+                            error=f"{type(exc).__name__}: {exc}", note="")
     finally:
         with _publish_lock:
             _publish["running"] = False
@@ -6149,9 +6443,15 @@ def api_volumes_publish():
         if _publish["running"]:
             return jsonify({"ok": False, "error": "a publish is already running"}), 409
         _publish.update(running=True, build=bid, stage="starting", sent=0, total=0,
-                        error="", url="", slug="", note="")
-    threading.Thread(target=_publish_run, args=(bid, _actor()), daemon=True).start()
-    return jsonify({"ok": True})
+                        error="", url="", slug="", note="", job="")
+    job = {"id": lib.gen_id(set(_jobs)), "build_id": bid, "kind": "publish",
+           "status": "running"}
+    _job_track(job, "publish", label=_job_book_label(bid))
+    with _publish_lock:
+        _publish["job"] = job["id"]
+    threading.Thread(target=_publish_run, args=(bid, _actor(), job),
+                     daemon=True).start()
+    return jsonify({"ok": True, "job": job["id"]})
 
 
 @app.route("/api/volumes/publish/status")

@@ -1845,6 +1845,7 @@ function initTabs() {
       // changed in the Editor tab meanwhile
       if (tab.dataset.tab === "ocr") {
         loadOcrBooks().then(() => { renderOcrTab(); renderAnalyze(); });
+        pollJobs();       // paint the queue table now, not next tick
       }
       if (tab.dataset.tab === "publish") renderPublish();
     });
@@ -8117,7 +8118,8 @@ function anEnsurePolling() {
         el("an-msg").textContent = `${meta.kind} — ${job.done}/${job.total}` +
           (job.errors ? ` (${job.errors} errors)` : "");
       }
-      if (job.status.startsWith("done") || job.status === "error") {
+      if (job.status.startsWith("done") || job.status === "error" ||
+          job.status === "cancelled" || job.status === "interrupted") {
         meta.finished = true;
         meta.status = job.status === "error"
           ? `Error - ${job.error || "analysis failed"}`
@@ -10746,6 +10748,10 @@ function pollPublish() {
     if (st.running) return;
     clearInterval(_publishTimer);
     if (st.stage === "error") { statusCrit("PUBLISH FAILED :: " + st.error); return; }
+    if (st.stage === "cancelled") {
+      status("PUBLISH CANCELLED :: nothing published");
+      return;
+    }
     if (st.stage === "done") {
       await loadBuilds();
       state.buildSel = null;
@@ -12539,16 +12545,138 @@ function onOcrPageInput(ev) {
   ocrPageSync = { t: setTimeout(() => { ocrPageSync = null; run(); }, 250), run };
 }
 
+// --- unified job registry (server /api/jobs) ------------------------------------
+// One poller for every background kind: the server registry is authoritative —
+// it survives restarts (`interrupted` entries) and carries OCR + text analysis
+// + publish plus read-only download/sync rows. The legacy per-kind pollers
+// stay for their side effects (page merges, badges, button re-enables); the
+// queue table itself renders from here.
+const JOB_ACTIVE_STATES = ["queued", "running", "cancelling"];
+const jobsState = { rows: [], active: 0 };
+
+function jobTypeLabel(kind) {
+  if (kind === "ocr") return "OCR";
+  if (kind === "publish") return "Publish";
+  if (kind === "download") return "Download";
+  if (kind === "cloudsync") return "Cloud sync";
+  return "Text analysis";
+}
+
+function jobStatusText(r) {
+  if (r.state === "queued") return "Queued";
+  if (r.state === "running") {
+    if ((r.kind === "download" || r.kind === "publish") && r.total) {
+      return `${r.note || "Running"} — ` +
+        `${Math.round(((r.done || 0) / r.total) * 100)}%`;
+    }
+    return r.total ? `Running — ${r.done || 0}/${r.total}`
+      : (r.note || "Running");
+  }
+  if (r.state === "cancelling") return "Cancelling…";
+  if (r.state === "cancelled") return `Cancelled${r.note ? ` — ${r.note}` : ""}`;
+  if (r.state === "failed") return `Error — ${r.error || r.note || "failed"}`;
+  if (r.state === "interrupted") {
+    return `Interrupted${r.note ? ` — ${r.note}` : ""}`;
+  }
+  return (r.status || r.state || "") +
+    (r.errors ? ` — ${r.errors} errors` : "");
+}
+
+async function pollJobs() {
+  if (document.hidden) return;
+  let data;
+  try {
+    data = await (await fetch("/api/jobs")).json();
+  } catch (e) { return; }
+  if (!data.ok) return;
+  jobsState.rows = data.jobs || [];
+  jobsState.active = data.active || 0;
+  renderJobsFooter();
+  const tab = document.querySelector("#tabs .tab.active");
+  if (tab && tab.dataset.tab === "ocr") renderOcrQueue();
+}
+
+// footer: a quiet "N jobs running" marker when work is active out of sight of
+// the Analyze tab's queue table; clicking it goes there
+function renderJobsFooter() {
+  const n = el("status-jobs");
+  if (!n) return;
+  const tab = document.querySelector("#tabs .tab.active");
+  const away = !tab || tab.dataset.tab !== "ocr";
+  n.hidden = !(jobsState.active && away);
+  if (!n.hidden) {
+    n.textContent =
+      `${jobsState.active} job${jobsState.active === 1 ? "" : "s"} running`;
+  }
+}
+
+function initJobs() {
+  const n = el("status-jobs");
+  if (n) {
+    n.addEventListener("click", () => {
+      const tab = document.querySelector('#tabs .tab[data-tab="ocr"]');
+      if (tab) tab.click();
+    });
+  }
+  pollJobs();
+  setInterval(pollJobs, 2000);
+}
+
+async function cancelJob(jobId) {
+  try {
+    const res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
+      method: "POST",
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    const row = jobsState.rows.find((r) => r.id === jobId);
+    if (row) row.state = "cancelling";
+    // the OCR page loop keeps its own flag; mirror it so badges update fast
+    const j = ocrState.jobs.find((x) => x.id === jobId);
+    if (j) j.cancelling = true;
+    status("JOB CANCELLATION REQUESTED");
+    renderOcrQueue();
+  } catch (e) {
+    statusErr(`JOB STOP FAILED :: ${e.message || e}`);
+  }
+}
+
 function renderOcrQueue() {
   const tbody = el("ocr-queue-rows");
   tbody.innerHTML = "";
-  const analysisJobs = [...anJobs.entries()];
-  const total = ocrState.jobs.length + analysisJobs.length;
-  el("ocr-queue-empty").hidden = total !== 0;
-  const staged = (ocrState.book ? stagedCountFor(ocrState.book) : 0) +
-    (ocrState.book ? analysisStagedCount(ocrState.book) : 0);
-  el("ocr-queue-count").textContent = `${total} jobs${staged ? ` · ${staged} staged` : ""}`;
+  // Server registry rows first, enriched with the richer presentation this
+  // session already has for its own jobs (book/artifact/engine columns).
+  const localOcr = new Map(
+    ocrState.jobs.filter((j) => j.id).map((j) => [j.id, j]));
+  const seen = new Set();
+  for (const r of jobsState.rows) {
+    if (r.id) seen.add(r.id);
+    const m = (r.id && (localOcr.get(r.id) || anJobs.get(r.id))) || null;
+    const active = JOB_ACTIVE_STATES.includes(r.state);
+    const stop = r.id && active && r.kind !== "download" && r.kind !== "cloudsync"
+      ? `<button class="cad-btn tiny danger" type="button" data-job-cancel="${esc(r.id)}"` +
+        `${r.state === "cancelling" ? " disabled" : ""}>` +
+        `${r.state === "cancelling" ? "Stopping…" : "Stop"}</button>`
+      : "";
+    const book = (m && m.book) || r.label || r.build_id || "";
+    const artifact = m
+      ? (m.target || m.artifact || (m.pages && m.pages.length
+        ? `Pages ${m.pages.join(", ")}` : m.kind || r.kind))
+      : r.kind;
+    const engine = m
+      ? (m.service || TEXT_ANALYSIS_LABELS[m.engine] || m.engine || "") : "";
+    const at = (m && m.at) ||
+      (r.created_at ? new Date(r.created_at).toLocaleTimeString() : "");
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${esc(jobTypeLabel(r.kind))}</td><td>${esc(book)}</td>` +
+      `<td>${esc(artifact)}</td><td>${esc(engine)}</td>` +
+      `<td>${esc(jobStatusText(r))}</td><td>${esc(at)}</td><td>${stop}</td>`;
+    tbody.appendChild(tr);
+  }
+  // Session-local rows the registry doesn't know: engine stubs (never got a
+  // server job) and just-submitted jobs whose first /api/jobs poll is pending.
   for (const j of ocrState.jobs) {
+    if (j.id && seen.has(j.id)) continue;
     const tr = document.createElement("tr");
     const stop = j.id && !j.finished
       ? `<button class="cad-btn tiny danger" type="button" data-ocr-cancel="${esc(j.id)}"` +
@@ -12560,7 +12688,8 @@ function renderOcrQueue() {
       `<td>${esc(j.service)}</td><td>${esc(j.status)}</td><td>${esc(j.at)}</td><td>${stop}</td>`;
     tbody.appendChild(tr);
   }
-  for (const [id, j] of analysisJobs) {
+  for (const [id, j] of anJobs.entries()) {
+    if (seen.has(id)) continue;
     const tr = document.createElement("tr");
     tr.dataset.analysisJob = id;
     const artifact = j.artifact || (j.pages && j.pages.length
@@ -12571,6 +12700,11 @@ function renderOcrQueue() {
       `<td>${esc(j.status || "Starting...")}</td><td>${esc(j.at || "")}</td><td></td>`;
     tbody.appendChild(tr);
   }
+  const total = tbody.children.length;
+  el("ocr-queue-empty").hidden = total !== 0;
+  const staged = (ocrState.book ? stagedCountFor(ocrState.book) : 0) +
+    (ocrState.book ? analysisStagedCount(ocrState.book) : 0);
+  el("ocr-queue-count").textContent = `${total} jobs${staged ? ` · ${staged} staged` : ""}`;
 }
 
 async function cancelOcrJob(jobId) {
@@ -13678,6 +13812,8 @@ function initOcrTab() {
   el("ocr-queue-rows").addEventListener("click", (ev) => {
     const btn = ev.target.closest("[data-ocr-cancel]");
     if (btn) cancelOcrJob(btn.dataset.ocrCancel);
+    const unified = ev.target.closest("[data-job-cancel]");
+    if (unified) cancelJob(unified.dataset.jobCancel);
   });
   el("ocr-del-pages").addEventListener("click", deleteSelectedPages);
   el("ocr-editor").addEventListener("input", () => {
@@ -14117,6 +14253,7 @@ function init() {
   boot("checked books", loadChecked);
   boot("icons", injectIcons);
   boot("tabs", initTabs);
+  boot("jobs", initJobs);
   boot("tooltips", initTooltips);
   boot("pane tabs", initPaneTabs);
   boot("actor header", installActorHeader);   // before any write goes out

@@ -111,6 +111,70 @@ function sidecarCommand(port, dataRoot) {
   return { cmd: exe, args: [], opts: { env } };
 }
 
+// tiny loopback JSON helpers for the quit guard (no fetch dep in main)
+function sidecarJson(method, apiPath, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: "127.0.0.1", port: sidecarPort, path: apiPath, method,
+      timeout: timeoutMs || 1500,
+    }, (res) => {
+      let body = "";
+      res.on("data", (d) => { body += d; });
+      res.on("end", () => {
+        try { resolve(JSON.parse(body)); } catch (e) { reject(e); }
+      });
+    });
+    req.on("error", reject);
+    req.on("timeout", () => req.destroy(new Error("timed out")));
+    req.end();
+  });
+}
+
+// Closing the window used to kill active OCR/analysis/publish work silently.
+// Ask the sidecar what is still running; if anything is, the user chooses:
+// Wait (abort the quit), Cancel all and quit (cooperative cancel, bounded
+// wait), or Quit anyway. An unreachable sidecar means a normal quit.
+let closingThrough = false;
+
+async function confirmCloseWithJobs() {
+  let active = null;
+  try {
+    active = await sidecarJson("GET", "/api/jobs/active", 1500);
+  } catch (e) {
+    active = null;                       // sidecar gone: nothing to protect
+  }
+  if (!active || !active.count) return true;
+  const labels = (active.labels || []).slice(0, 8);
+  const pick = dialog.showMessageBoxSync(mainWindow, {
+    type: "warning",
+    title: "Library Tool",
+    message: `${active.count} task${active.count === 1 ? " is" : "s are"} still running`,
+    detail: labels.join("\n") +
+      "\n\nCancelling stops each task at its next safe point; pages and " +
+      "stages already saved are kept.",
+    buttons: ["Wait", "Cancel all and quit", "Quit anyway"],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+  });
+  if (pick === 0) return false;          // Wait: abort the quit
+  if (pick === 1) {
+    const cancellable = (active.jobs || []).filter((j) => j.cancellable && j.id);
+    await Promise.all(cancellable.map((j) =>
+      sidecarJson("POST", `/api/jobs/${encodeURIComponent(j.id)}/cancel`, 1500)
+        .catch(() => {})));
+    const deadline = Date.now() + 5000;  // bounded: quit happens regardless
+    while (Date.now() < deadline) {
+      try {
+        const a = await sidecarJson("GET", "/api/jobs/active", 1000);
+        if (!a.count) break;
+      } catch (e) { break; }
+      await new Promise((r) => setTimeout(r, 400));
+    }
+  }
+  return true;                           // Quit anyway / after cancelling
+}
+
 // poll the sidecar's "/" until it answers (or we give up)
 function waitForServer(port, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -257,7 +321,18 @@ function createWindow() {
     if (/^https?:/i.test(url)) shell.openExternal(url);
     return { action: "deny" };
   });
-  mainWindow.on("closed", () => { mainWindow = null; });
+  // The 'close' event is synchronous, so hold it, ask the sidecar about
+  // active jobs, and re-close once the user has decided.
+  mainWindow.on("close", (event) => {
+    if (closingThrough || app.isQuitting) return;
+    event.preventDefault();
+    confirmCloseWithJobs().then((proceed) => {
+      if (!proceed || !mainWindow || mainWindow.isDestroyed()) return;
+      closingThrough = true;
+      mainWindow.close();
+    });
+  });
+  mainWindow.on("closed", () => { mainWindow = null; closingThrough = false; });
   mainReady = true;   // from here a window-all-closed is a real user quit
 }
 
