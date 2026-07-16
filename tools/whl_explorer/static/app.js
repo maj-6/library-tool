@@ -12356,9 +12356,12 @@ async function syncBuildFolder() {
       // the sync may have retired the IA original and repointed pdf_file
       // at the folder's preview.pdf
       if (data.build) state.builds[b.id] = data.build;
-      // a blank-page trim rewrites the PDF: cached counts/dims are stale
+      // a blank-page trim rewrites the PDF: cached counts/dims are stale,
+      // and the trim renumbers the word/region sidecars server-side
       ocrState.pdfInfo = {};
       ocrState.wordsCache.clear();
+      ocrState.regionsCache.clear();
+      delete ocrState.layoutMeta[b.id];
       el("b-src-msg").textContent =
         "Folder ready" + (data.notes && data.notes.length
           ? " — " + data.notes.join("; ") : "");
@@ -13424,10 +13427,15 @@ const OCR_FURNITURE_ROLES = new Set(["marginalia", "header", "footer",
 // inside — paragraph grain, so margin notes sit IN the margin instead of
 // polluting the body flow. Placed only when the record carries the doc being
 // viewed (the words_doc staleness contract); returns false so the caller can
-// flow the doc's own text instead.
-async function fillRegionLayout(pane, bid, srcKey, page, docName) {
+// flow the doc's own text instead. `still` re-checks the caller's context
+// after the fetch: a same-book doc switch keeps the panes MOUNTED
+// (refillOcrPageText), so isConnected alone can't stop a late fill from
+// painting the previous doc's regions over the new doc's page.
+async function fillRegionLayout(pane, bid, srcKey, page, docName, still) {
   const rec = await ocrPageRegions(bid, srcKey, page);
-  if (!pane.isConnected) return true;   // stale pane: nothing left to draw into
+  if (!pane.isConnected || (still && !still())) {
+    return true;   // context moved on: its own fill pass owns this pane now
+  }
   if (!rec || !rec.ok || !rec.found || !(rec.items || []).length) return false;
   if (rec.doc &&
       String(rec.doc).toLowerCase() !== String(docName || "").toLowerCase()) {
@@ -13533,7 +13541,8 @@ async function fillOcrLayout(pane, pdf) {
     // gives a paragraph-grain facsimile; failing that, flow the text
     if (ocrHasRegions(meta, docSrcKey(d), page)) {
       if (await fillRegionLayout(pane, d.buildId, docSrcKey(d), page,
-                                 d.fileName || d.name)) return;
+                                 d.fileName || d.name,
+                                 () => ocrSelDoc() === d)) return;
       if (!pane.isConnected || ocrSelDoc() !== d) return;
     }
     const sec = ocrState.pages;
@@ -14688,9 +14697,13 @@ async function deleteSelectedPages() {
     }
     status(`PAGES DELETED :: ${pages.length} (backup: ${data.backup})`);
     el("ocr-msg").textContent = "";
-    // the PDF changed on disk: page counts, dims and word boxes are stale
+    // the PDF changed on disk: page counts, dims, word boxes, and the
+    // renumbered region records are all stale — a cache hit here would
+    // paint the deleted page's regions beside the shifted page image
     ocrState.pdfInfo = {};
     ocrState.wordsCache.clear();
+    ocrState.regionsCache.clear();
+    delete ocrState.layoutMeta[bid];
     // reload the renumbered OCR docs and the shrunken PDF
     await loadOcrBooks();
     ocrState.bookLoading = null;
