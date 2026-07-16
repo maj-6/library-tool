@@ -89,6 +89,20 @@ function availability(v) {
   return `<div class="avail"><span class="label">Also available</span>${body}</div>`;
 }
 
+// Search inside the book: a plain GET form straight into the reader, which
+// picks the query up as its ?q= deep link. Only offered when page text exists.
+function searchForm(v) {
+  const a = (v && v.assets) || {};
+  if (!Number(a.pages)) return "";
+  return `
+    <form class="book-search" action="read.html" method="get">
+      <input type="hidden" name="slug" value="${esc(v.slug)}" />
+      <input type="search" name="q" placeholder="Search inside this book…"
+             aria-label="Search inside this book" required />
+      <button class="btn" type="submit">Search</button>
+    </form>`;
+}
+
 function actions(v) {
   const href = pdfHref(v);
   const slug = encodeURIComponent(v.slug);
@@ -169,6 +183,7 @@ async function main() {
         ${bookThumb(v)}
         ${metaTable(v)}
         <div class="side-actions">${actions(v)}</div>
+        ${searchForm(v)}
         ${availability(v)}
       </aside>
     </div>`;

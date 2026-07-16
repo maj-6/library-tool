@@ -177,6 +177,32 @@ export async function getPages(slug, lang = "", from = 1, to = 9999) {
   return out;
 }
 
+/** Every page of one text layer, page-ascending: [{page, body}]. This feeds
+ *  in-book search, which needs the whole text at once. PostgREST silently caps
+ *  an unpaginated response (~1000 rows), so the cloud path walks limit/offset
+ *  batches until a short batch says the table is drained -- a long book must
+ *  never come back silently truncated. */
+export async function getAllPages(slug, lang = "") {
+  if (!usingCloud) {
+    const byLang = (await fixture("pages").catch(() => ({})))[slug] || {};
+    const src = byLang[lang] || {};
+    return Object.keys(src)
+      .map((k) => ({ page: Number(k), body: src[k] }))
+      .sort((a, b) => a.page - b.page);
+  }
+  const out = [];
+  const limit = 500;
+  for (let offset = 0; ; offset += limit) {
+    const rows = await rest(
+      `volume_pages?slug=eq.${encodeURIComponent(slug)}&lang=eq.${encodeURIComponent(lang)}` +
+      `&select=page,body&order=page.asc&limit=${limit}&offset=${offset}`
+    );
+    out.push(...rows);
+    if (rows.length < limit) break;
+  }
+  return out;
+}
+
 /** The light rows the browse page needs to build its facets client-side:
  *  {slug, category_paths, language, year} for every volume. */
 export async function facetSource() {
