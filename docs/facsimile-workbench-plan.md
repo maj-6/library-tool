@@ -48,14 +48,14 @@ Two caveats that gate everything:
    Tesseract boxes. "Engine has no geometry" (leave sidecar alone) and "page
    is empty" (delete) must be distinct. Prerequisite for any engine-mixing.
    **Fixed in Phase 0.**
-2. **Malformed mime** — `capture_pipeline.py` built `"image\png"` (literal
-   backslash) for PNG uploads to Mistral. Tolerated by the API, still wrong.
-   **Fixed in Phase 0.**
-3. **Translation staleness** — translation resume skips pages already present
+2. **Translation staleness** — translation resume skips pages already present
    in `translations/<lang>.txt`, keyed by page number only. The moment region
    separation cleans `compiled.txt`, every existing translation of dirty text
    silently never refreshes. Needs a per-page source-text hash before body-only
    recompile ships (Phase 1).
+
+(A third find — a `"image\png"` mime typo in the Mistral request — turned out
+to exist only in an uncommitted working copy, not at HEAD.)
 
 ## Phase 0 — validate (before designing further)
 

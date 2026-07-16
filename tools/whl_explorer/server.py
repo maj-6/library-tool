@@ -3161,9 +3161,13 @@ def _ocr_save_page_words(build_id: str, src_key: str, page: int, words: list) ->
     {words: {"<src>": {"<page>": [{t,x,y,w,h,l}, ...]}}}). /api/pdf/words reads
     these back for a scan with no text layer, so the Layout facsimile works on
     it too. Keyed by SOURCE like the compiled .txt files, so a secondary scan's
-    boxes never clobber the primary's. An empty list DROPS the page — a re-OCR
-    with a service that has no boxes (Claude, Mistral) must not leave a stale
-    facsimile behind the new transcription."""
+    boxes never clobber the primary's. An empty list DROPS the page — the
+    engine that owns the geometry saw a blank page. Only geometry-speaking
+    engines may call this (see _ocr_job_run): a text-only re-OCR must not
+    destroy boxes another engine paid to produce — the box positions stay
+    valid for the unchanged page image even when the transcription moves on,
+    and cross-engine work (clip-from-words, region seeding) depends on them
+    surviving."""
     src_key = src_key or "primary"
     meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
     with _ocr_merge_lock:
@@ -3212,13 +3216,16 @@ def _ocr_job_run(job_id: str) -> None:
                 if result.get("images"):
                     text = _ocr_save_page_images(
                         job["build_id"], n, result["images"], text, src_key)
-                # save boxes when the service produced them, else clear this
-                # page's stale boxes (a figures-only or text-only re-OCR)
-                _ocr_save_page_words(job["build_id"], src_key, n,
-                                     result.get("words") or [])
+                # a "words" key marks a geometry-speaking engine, and its
+                # value is authoritative ([] = blank page). Engines without
+                # one (Mistral, Claude) replace the text but must leave the
+                # boxes alone — Tesseract geometry stays valid for the same
+                # page image no matter which engine wrote the transcription.
+                if "words" in result:
+                    _ocr_save_page_words(job["build_id"], src_key, n,
+                                         result.get("words") or [])
             else:
                 text = result
-                _ocr_save_page_words(job["build_id"], src_key, n, [])
             _ocr_merge_page(job["build_id"], job["target"], n, text)
             item["status"] = "ok"
         except Exception as exc:
