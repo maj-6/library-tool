@@ -331,6 +331,43 @@ ol.volumes { list-style: none; margin: 0; padding: 0; }
   color: var(--ink-faint);
 }
 
+/* --- documentation --- */
+.docs h3 { font-size: 16px; margin: 24px 0 6px; }
+.toc {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  padding: 10px 14px;
+  background: var(--card);
+  border: 1px solid var(--rule-mid);
+  font-size: 14px;
+  margin-bottom: 4px;
+}
+.toc a { text-decoration: none; }
+.toc a:hover { text-decoration: underline; }
+.docs figure { margin: 14px 0 22px; }
+.docs figure img {
+  display: block;
+  width: 100%;
+  border: 1px solid var(--rule-mid);
+  box-shadow: 1px 2px 4px rgba(50, 44, 34, 0.08);
+}
+.docs figcaption {
+  font-size: 12px;
+  letter-spacing: 0.3px;
+  color: var(--ink-faint);
+  margin-top: 7px;
+}
+.docs kbd {
+  font: 13px/1 var(--mono);
+  background: var(--card);
+  border: 1px solid var(--rule-mid);
+  border-radius: 1px;
+  padding: 2px 5px;
+}
+.glossary dt { font-weight: 600; margin-top: 12px; }
+.glossary dd { margin: 2px 0 0 0; color: var(--ink-soft); }
+
 @media (max-width: 820px) {
   .shell { grid-template-columns: 1fr; }
   aside.side {

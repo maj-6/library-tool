@@ -4,6 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Documentation · Library Tool</title>
+<meta name="description" content="What Library Tool is, what each part does, and how to get started." />
 <link rel="icon" href="assets/icon.png" />
 <link rel="stylesheet" href="assets/site.css" />
 </head>
@@ -29,9 +30,190 @@
     </nav>
   </aside>
 
-  <main>
+  <main class="docs">
     <h1>Documentation</h1>
-    <p class="muted">To be written.</p>
+    <p class="lede">What Library Tool is, what each part does, and how to get started.</p>
+
+    <nav class="toc" aria-label="On this page">
+      <a href="#what">What it is</a>
+      <a href="#start">Getting started</a>
+      <a href="#desktop">The desktop app</a>
+      <a href="#capture">Book Capture</a>
+      <a href="#archive">The Archive Browser</a>
+      <a href="#data">Where your data lives</a>
+      <a href="#glossary">Glossary</a>
+    </nav>
+
+    <h2 id="what">What it is</h2>
+    <p>Library Tool turns a shelf of old botanical and medical books into a
+      public online library. For each book it answers three questions — is it
+      already in the World Herb Library? is it out of copyright? does a scan
+      already exist in another archive? — and then helps you prepare the
+      worthwhile ones for publication: catalogue metadata, a written
+      description, and a readable scan.</p>
+    <p>It comes in three parts:</p>
+    <ul>
+      <li><strong>The desktop app</strong> (Windows) — the workbench where the
+        checking, editing, and publishing happen.</li>
+      <li><strong>Book Capture</strong> (Android) — a companion camera app for
+        recording books straight off the shelf.</li>
+      <li><strong>The <a href="browse.html">Archive Browser</a></strong> — the
+        public face: a searchable catalogue of the published books, with a
+        built-in reader.</li>
+    </ul>
+
+    <h2 id="start">Getting started</h2>
+    <ol>
+      <li>Install the desktop app from the <a href="downloads.html">Downloads</a>
+        page. Windows may warn that the installer is unrecognised; choose
+        “More info”, then “Run anyway”.</li>
+      <li>On first launch a short setup guide walks through the optional
+        pieces: an account, service keys for OCR and AI features, and the
+        offline search databases. Everything can be skipped and revisited
+        later — the guide is always available under <span class="mono">Help &gt;
+        Setup guide</span>.</li>
+      <li>Sign in or choose <em>Work locally</em>. An account records your
+        contributions and connects the phone app; everything else works
+        without one.</li>
+    </ol>
+    <p>The phone app is on the same Downloads page. Install it, sign in with
+      the same account, and its captures flow to the desktop.</p>
+
+    <h2 id="desktop">The desktop app</h2>
+    <p>Six tabs, arranged roughly in the order a book travels through them.</p>
+
+    <h3>Home</h3>
+    <p>The landing view: work in progress, recent activity, contributors, and
+      anything awaiting review. Each item links into the tab where the work
+      happens.</p>
+    <figure>
+      <img src="assets/docs/app-home.png" alt="The Home tab: in-progress counts, recent activity, contributors, and an awaiting-review panel." loading="lazy" />
+      <figcaption>Home — the dashboard.</figcaption>
+    </figure>
+
+    <h3>Catalogs</h3>
+    <p>The main working area. Pick a table to work in — your checked and
+      hand-entered books, or the whole World Herb Library catalogue — and find
+      books with the search field (<span class="mono">[title] @author
+      #year</span>). Selecting a row shows everything known about it in the
+      left panel: its details, whether it is in the WHL, whether the Internet
+      Archive or HathiTrust holds a scan, and its copyright status with the
+      records behind the verdict.</p>
+    <p>The checks run automatically, but every automatic match is only a
+      suggestion: each one is approved or rejected by hand, and a rejected
+      match can be replaced with a source you locate yourself. Books that
+      clear the checks are marked <span class="mono">SCAN</span> (out of
+      copyright, no scan exists — the physical book is worth scanning) or
+      <span class="mono">UPLD</span> (a scan exists elsewhere and can be
+      re-homed). New books are added on the <em>Manual entry</em> panel, or
+      arrive from the phone app via <em>Sync Cloud</em>.</p>
+    <figure>
+      <img src="assets/docs/app-catalogs.png" alt="The Catalogs tab: a table of checked books with an Info panel showing WHL, archive, and copyright status for the selected book." loading="lazy" />
+      <figcaption>Catalogs — a selected book, with its archive and copyright verdicts in the Info panel.</figcaption>
+    </figure>
+
+    <h3>Editor</h3>
+    <p>Where an approved source becomes a finished catalogue entry. The
+      <em>Verified sources</em> table lists every book with an approved scan;
+      one click builds a draft entry prefilled from it. The entry holds the
+      catalogue metadata, a written description, and the PDF itself, each on
+      its own panel. When the entry is complete, <em>Publish</em> sends it to
+      the online catalogue.</p>
+    <figure>
+      <img src="assets/docs/app-editor.png" alt="The Editor tab: a draft entry with metadata form and description panel, and the verified-sources table below." loading="lazy" />
+      <figcaption>Editor — a draft entry built from a verified source.</figcaption>
+    </figure>
+
+    <h3>Analyze</h3>
+    <p>The reading room for the scan itself. It extracts the text of a book
+      (locally by default; cloud services if you add keys in Settings), shows
+      the result beside a page facsimile, and lets you correct it. With an AI
+      key configured it also drafts the things a catalogue entry needs: a
+      summary, a publishable “About” article, category suggestions,
+      translations, and margin annotations — each reviewed by you before it
+      ships with the book.</p>
+    <figure>
+      <img src="assets/docs/app-analyze.png" alt="The Analyze tab: books and artifacts lists, a page facsimile viewer, the analysis panel, and an OCR jobs queue." loading="lazy" />
+      <figcaption>Analyze — text extraction and analysis around a page facsimile.</figcaption>
+    </figure>
+
+    <h3>Publish</h3>
+    <p>The online catalogue as readers see it. Browse the published books —
+      grouped by set, author, category, or date — and preview any record
+      before opening its live page.</p>
+    <figure>
+      <img src="assets/docs/app-publish.png" alt="The Publish tab: the list of published volumes beside a preview of a catalogue record." loading="lazy" />
+      <figcaption>Publish — previewing a published record.</figcaption>
+    </figure>
+
+    <h3>Info</h3>
+    <p>The app’s console: a live log with level and text filters. Useful when
+      something misbehaves and you want to see — or report — what happened.</p>
+
+    <h3>Settings</h3>
+    <p>Behind the gear icon, top right. Appearance holds the themes; Updates
+      controls automatic updates and pre-release builds; Credentials holds
+      service keys; LAN pairs the phone app for offline capture. The rest is
+      worth a browse once and rarely after.</p>
+
+    <h2 id="capture">Book Capture</h2>
+    <p>The Android companion. Point the camera at a book and work hands-free:
+      say <kbd>start</kbd> to open an entry, <kbd>photo</kbd> for each page
+      you want, <kbd>done</kbd> to seal it — or tap the matching buttons. Text
+      is read from the pages in the background, so a capture identifies its
+      own title and author moments after you shoot it. Finished captures
+      upload to your account (or straight to the desktop over your home
+      network) and appear in the desktop’s Catalogs tab as manual entries,
+      ready for checking. The app needs a Library Tool account to send its
+      captures anywhere.</p>
+
+    <h2 id="archive">The Archive Browser</h2>
+    <p>The public library. Search the catalogue, narrow it by category, year,
+      or language, and open a book’s record for its description and formal
+      metadata. Books with a scan read in the browser: continuous pages,
+      thumbnails, zoom, margin notes, and a text panel with translations where
+      they exist. It remembers where you left off in each book, and every
+      view — a search, a filter, a page — can be bookmarked and shared as a
+      link.</p>
+    <figure>
+      <img src="assets/docs/site-browse.png" alt="The Archive Browser: a search box, category, year, and language filters, and catalogue records with Read buttons." loading="lazy" />
+      <figcaption>The Archive Browser — the faceted catalogue.</figcaption>
+    </figure>
+    <figure>
+      <img src="assets/docs/site-reader.png" alt="The reader: a book page with navigation, zoom, thumbnails, notes, and text controls in the toolbar." loading="lazy" />
+      <figcaption>The reader.</figcaption>
+    </figure>
+
+    <h2 id="data">Where your data lives</h2>
+    <p>On your computer. The desktop app keeps its catalogue, entries, and
+      downloads in your Windows profile
+      (<span class="mono">%APPDATA%\Library Tool</span>), and the copyright
+      and archive checks run against local copies and indexes, so day-to-day
+      work is fast and works offline. The network is used for what genuinely
+      needs it: searching the archives for scans, downloading PDFs, syncing
+      phone captures, and publishing.</p>
+
+    <h2 id="glossary">Glossary</h2>
+    <dl class="glossary">
+      <dt>World Herb Library (WHL)</dt>
+      <dd>The public collection of botanical and medical works this tool
+        prepares books for.</dd>
+      <dt>Public domain</dt>
+      <dd>No longer under copyright, so a scan may be published freely. The
+        tool checks U.S. registration and renewal records to decide.</dd>
+      <dt>Internet Archive / HathiTrust</dt>
+      <dd>Large digital archives. If one of them already scanned a book,
+        the scan can be re-homed instead of scanning the book again.</dd>
+      <dt>OCR</dt>
+      <dd>Optical character recognition — turning photographed pages into
+        searchable text.</dd>
+      <dt>Verified source</dt>
+      <dd>A scan that has been checked by hand and confirmed to be the right
+        book and edition.</dd>
+    </dl>
+
+    <p class="muted">Found something wrong or missing? Please
+      <a href="https://github.com/maj-6/library-tool/issues">open an issue</a>.</p>
   </main>
 </div>
 </body>
