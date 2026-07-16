@@ -51,18 +51,25 @@ All steps except #4 are one-time.
    is what lets pdf.js read the range/length headers it needs. Add the site's own
    custom domain to `AllowedOrigins` too if you ever move off `maj-6.github.io`.
 
-3. **Point new publishes at the custom domain.** In the desktop app: **Settings →
-   Sync → R2 public base** (`r2PublicBase`) → `https://files.<yourdomain>`. Every
-   future published volume's `pdf_url` is then built on the CORS-capable host.
+3. **Point new publishes at the custom domain.** In the desktop app: **Settings
+   → Integrations → Phone capture (Supabase) → R2 public base URL** (stored as
+   `r2PublicBase`) → `https://files.<yourdomain>`. Every future published
+   volume's `pdf_url` is then built on the CORS-capable host.
 
 4. **Repoint the volumes already published** (currently 1 row):
 
    ```bash
    # dry run first — read-only, the anon key is enough
    python3 tools/fix_pdf_url_host.py --to https://files.<yourdomain>
-   # then write (needs the service_role key: Settings > Sync, or SUPABASE_KEY env)
+   # then write (service_role key required: Settings > Credentials >
+   # Owner publishing & storage > Owner service key, or SUPABASE_KEY env)
    python3 tools/fix_pdf_url_host.py --to https://files.<yourdomain> --apply
    ```
+
+   `--from <host>` restricts the rewrite to rows still on that old host. The
+   script refuses `--apply` unless the configured key actually decodes to
+   `service_role`, and warns when `--to` is an r2.dev host — which can never
+   serve CORS.
 
 5. **Verify.** The CORS header should now be present, and the reader should load:
 
@@ -75,11 +82,22 @@ All steps except #4 are one-time.
 
    Then open `https://maj-6.github.io/library-tool/read.html?slug=libellus-de-materia-medicae-1727`.
 
+   Caveat when probing **r2.dev** URLs from curl or a script: Cloudflare's bot
+   check answers a non-browser User-Agent (e.g. `Python-urllib`) with `403`
+   error-code-1010, which looks exactly like the bucket not being public
+   (`tools/cloud_setup.py`, `cmd_r2`). Send a browser User-Agent before
+   concluding anything from a failed r2.dev probe.
+
 ## Option 2 (fallback — serve from Supabase storage)
 
 The reader already falls back to the Supabase public `volumes` bucket when a row
 has `pdf_path` set and no `pdf_url` (`website/assets/data.js`). Supabase storage
-URLs send CORS. To use this instead, upload the PDFs to the Supabase `volumes`
-bucket and clear `pdf_url` (leaving `pdf_path`). Downside: PDFs are large
-(~80 MB each) and may exceed the Supabase free-tier storage cap, which is why R2
-+ a custom domain is preferred.
+URLs send CORS. The Publish flow takes this path **automatically**: leave the R2
+credentials blank (the Settings tip says "Leave blank to use Supabase storage")
+and the PDF is uploaded to the Supabase `volumes` bucket instead, the row
+pointing at Supabase storage (`tools/whl_explorer/server.py`). For rows already
+published to R2, upload the PDFs to the Supabase `volumes` bucket, set
+`pdf_path` to the uploaded object name (`<slug>.pdf` — R2-published rows store
+it empty), and clear `pdf_url`. Downside: PDFs are large (~80 MB each) and may
+exceed the Supabase free-tier storage cap, which is why R2 + a custom domain is
+preferred.

@@ -13,9 +13,11 @@ builds, downloads) under DATA_ROOT, which defaults to the repo root. Two
 worktrees sharing a checkout would be fine, but two SERVERS writing the same
 output/ would not: client_state is server-authoritative on load, and a second
 instance has already cost this project its checked-book set once. Every worktree
-therefore gets a private DATA_ROOT at .wt/data. Read-only assets (the renewals
-CSV, the WHL catalogue, ch_library.json) still come from the worktree's own
-checkout via APP_ROOT, so the app is fully functional against empty state.
+therefore gets a private DATA_ROOT at .wt/data. ch_library.json still comes from
+the worktree's own checkout via APP_ROOT, and the databases (the renewals CSV,
+the WHL catalogue, the OL indexes) resolve most-accessible-first via find_db —
+the shared ~/.library-tool drop-in, then DATA_ROOT, then the checkout — so the
+app is fully functional against empty state.
 
 PORT.  The server binds 5001 unless WHL_PORT says otherwise, so a second one
 fails to start. Each worktree is assigned its own port and gets a .claude/
@@ -23,9 +25,11 @@ launch.json pointing at it, so `preview_start` works without collisions.
 
 WEIGHT.  The corpus images under photo/ and books/ (273 MB that no code
 reads) are untracked as of the corpus-leaves-git commit and sync via
-tools/corpus_sync.py instead, so new checkouts are ~57 MB by default. The
+tools/corpus_sync.py instead, so new checkouts are ~20 MB by default. The
 sparse-checkout exclusion below still matters when a worktree is based on an
-older commit that tracks them (pass --full to keep everything).
+older commit that tracks them (pass --full to keep everything). Note the
+pattern covers all of books/, so a sparse worktree also omits the tracked
+books/*/transcript.txt OCR transcripts; --full restores those on any base.
 """
 from __future__ import annotations
 
@@ -250,7 +254,7 @@ def main() -> None:
     a.add_argument("name")
     a.add_argument("--base", default="master", help="branch to fork from (default: master)")
     a.add_argument("--port", type=int, help="override the assigned port")
-    a.add_argument("--full", action="store_true", help="check out photo/ and books/ too (+273 MB)")
+    a.add_argument("--full", action="store_true", help="check out photo/ and books/ too (tracked transcripts; +273 MB of images on pre-corpus-sync bases)")
     a.add_argument("--seed", action="store_true",
                    help="copy the main checkout's books and settings into this worktree's DATA_ROOT")
     a.set_defaults(fn=cmd_add)

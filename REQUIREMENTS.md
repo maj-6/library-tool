@@ -1,5 +1,12 @@
 # Catalog cross-reference requirements
 
+> **Historical document.** This is the original requirements spec plus the
+> v2.x-era decision/status log, kept as history and no longer maintained —
+> its "Status / decisions" entries stop before the 0.x versioning reset.
+> For the current state of the project see [README.md](README.md), the
+> [website documentation](https://maj-6.github.io/library-tool/docs.html),
+> and [docs/](docs/).
+
 Reference for the cross-database catalog work (title-page ingestion, local
 library consolidation, and the CH Library status report). Captured for later;
 the current build focuses on the copyright/report utility.
