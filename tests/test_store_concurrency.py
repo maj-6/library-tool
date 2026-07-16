@@ -72,8 +72,18 @@ def test_concurrent_correction_adds_all_retained():
 
 def test_build_update_stale_expectation_conflicts(client):
     b = _create(client, "Optimistic")
-    first = client.patch(f"/api/builds/{b['id']}", json={"notes": "first"})
+    original_token = b["updated_at"]
+    first = client.patch(f"/api/builds/{b['id']}", json={
+        "notes": "first", "expect_updated_at": original_token})
     current = first.get_json()["build"]
+    assert current["updated_at"] != original_token
+
+    # This used to pass whenever both writes landed in the same wall-clock
+    # second because the token was rounded to seconds.
+    same_second_stale = client.patch(f"/api/builds/{b['id']}", json={
+        "notes": "lost update", "expect_updated_at": original_token})
+    assert same_second_stale.status_code == 409
+    assert same_second_stale.get_json()["build"]["notes"] == "first"
 
     stale = client.patch(f"/api/builds/{b['id']}", json={
         "notes": "second", "expect_updated_at": "2000-01-01T00:00:00+00:00"})
@@ -90,6 +100,49 @@ def test_build_update_stale_expectation_conflicts(client):
     # clients that don't send the expectation keep the old semantics
     plain = client.patch(f"/api/builds/{b['id']}", json={"notes": "fourth"})
     assert plain.status_code == 200
+
+
+def test_background_build_apply_always_bumps_editor_revision(client):
+    b = _create(client, "Background revision")
+    old = b["updated_at"]
+
+    token = server._builds_apply(b["id"], {"title_pages": "1,3"})
+    assert token and token != old
+    current = lib.load_json(server.BUILDS_PATH, {})[b["id"]]
+    assert current["updated_at"] == token
+
+    stale = client.patch(f"/api/builds/{b['id']}", json={
+        "notes": "stale editor", "expect_updated_at": old})
+    assert stale.status_code == 409
+    assert stale.get_json()["build"]["title_pages"] == "1,3"
+
+
+def test_folder_sync_returns_revision_from_legacy_preview_rename(
+        client, data_root, monkeypatch):
+    b = _create(client, "Legacy preview")
+    entry = server._entry_dir(b["id"])
+    entry.mkdir(parents=True, exist_ok=True)
+    legacy = entry / "preview.pdf"
+    legacy.write_bytes(b"%PDF-legacy")
+    rel = legacy.resolve().relative_to(data_root.resolve()).as_posix()
+    before = server._builds_apply(b["id"], {"pdf_file": rel})
+
+    generated = data_root / "generated-preview.pdf"
+    generated.write_bytes(b"%PDF-primary")
+    monkeypatch.setattr(server, "_preview_pdf", lambda _src, _pages: generated)
+    monkeypatch.setattr(
+        server, "_pdf_extract_text", lambda _src: (1, 1, "page text", 1))
+
+    response = client.post(
+        f"/api/builds/{b['id']}/folder", json={"keep_original": True})
+    assert response.status_code == 200
+    returned = response.get_json()["build"]
+    saved = lib.load_json(server.BUILDS_PATH, {})[b["id"]]
+
+    assert returned["pdf_file"].endswith(f"/{b['id']}/primary.pdf")
+    assert returned["updated_at"] == saved["updated_at"]
+    assert returned["updated_at"] != before
+    assert not legacy.exists()
 
 
 def test_save_json_concurrent_same_path_never_corrupts(data_root):

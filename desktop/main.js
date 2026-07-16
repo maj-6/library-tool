@@ -111,6 +111,55 @@ function sidecarCommand(port, dataRoot) {
   return { cmd: exe, args: [], opts: { env } };
 }
 
+// --- Testable process/window lifecycle guards ---------------------------------
+// Keep these helpers free of Electron globals so their race behavior can be
+// exercised under plain Node in CI.
+function createSingleFlightGate() {
+  let active = false;
+  return {
+    enter() {
+      if (active) return false;
+      active = true;
+      return true;
+    },
+    leave() { active = false; },
+    isActive() { return active; },
+  };
+}
+
+function superviseChildProcess(child, readiness, onUnexpectedEnd) {
+  let ready = false;
+  let ended = false;
+  let rejectStartup;
+  const startupFailure = new Promise((_resolve, reject) => { rejectStartup = reject; });
+
+  const finish = (end) => {
+    if (ended) return;
+    ended = true;
+    if (ready) {
+      onUnexpectedEnd(end);
+      return;
+    }
+    if (end.type === "error") {
+      rejectStartup(new Error(`Could not launch the backend: ${end.error.message}`));
+      return;
+    }
+    const reason = end.code !== null && end.code !== undefined
+      ? `code ${end.code}`
+      : `signal ${end.signal || "unknown"}`;
+    rejectStartup(new Error(`The backend exited before it became ready (${reason}).`));
+  };
+
+  child.once("error", (error) => finish({ type: "error", error }));
+  child.once("exit", (code, signal) => finish({ type: "exit", code, signal }));
+
+  return Promise.race([Promise.resolve(readiness), startupFailure]).then((value) => {
+    ready = true;
+    return value;
+  });
+}
+// --- End testable process/window lifecycle guards -----------------------------
+
 // tiny loopback JSON helpers for the quit guard (no fetch dep in main)
 function sidecarJson(method, apiPath, timeoutMs) {
   return new Promise((resolve, reject) => {
@@ -135,6 +184,7 @@ function sidecarJson(method, apiPath, timeoutMs) {
 // Wait (abort the quit), Cancel all and quit (cooperative cancel, bounded
 // wait), or Quit anyway. An unreachable sidecar means a normal quit.
 let closingThrough = false;
+const closeConfirmGate = createSingleFlightGate();
 
 async function confirmCloseWithJobs() {
   let active = null;
@@ -202,18 +252,16 @@ async function startSidecar() {
   sidecar = spawn(cmd, args, opts);
   sidecar.stdout.on("data", (d) => process.stdout.write(`[sidecar] ${d}`));
   sidecar.stderr.on("data", (d) => process.stderr.write(`[sidecar] ${d}`));
-  sidecar.on("error", (err) => {
-    dialog.showErrorBox("Library Tool",
-      "Could not launch the backend:\n" + err.message +
-      (isDev ? "\n\n(Dev mode expects Python on PATH — set WHL_PYTHON to override.)" : ""));
+  await superviseChildProcess(sidecar, waitForServer(sidecarPort, 45000), (end) => {
+    if (app.isQuitting) return;
+    const reason = end.type === "error"
+      ? end.error.message
+      : (end.code !== null && end.code !== undefined
+        ? `code ${end.code}`
+        : `signal ${end.signal || "unknown"}`);
+    dialog.showErrorBox("Library Tool", `The backend exited unexpectedly (${reason}).`);
+    app.quit();
   });
-  sidecar.on("exit", (code) => {
-    if (code && !app.isQuitting) {
-      dialog.showErrorBox("Library Tool", `The backend exited unexpectedly (code ${code}).`);
-      app.quit();
-    }
-  });
-  await waitForServer(sidecarPort, 45000);
 }
 
 let startupStatus = "Preparing";
@@ -326,13 +374,21 @@ function createWindow() {
   mainWindow.on("close", (event) => {
     if (closingThrough || app.isQuitting) return;
     event.preventDefault();
-    confirmCloseWithJobs().then((proceed) => {
-      if (!proceed || !mainWindow || mainWindow.isDestroyed()) return;
-      closingThrough = true;
-      mainWindow.close();
-    });
+    if (!closeConfirmGate.enter()) return;
+    confirmCloseWithJobs()
+      .then((proceed) => {
+        if (!proceed || !mainWindow || mainWindow.isDestroyed()) return;
+        closingThrough = true;
+        mainWindow.close();
+      })
+      .catch((err) => console.error("[quit guard]", err && err.message))
+      .finally(() => closeConfirmGate.leave());
   });
-  mainWindow.on("closed", () => { mainWindow = null; closingThrough = false; });
+  mainWindow.on("closed", () => {
+    mainWindow = null;
+    closingThrough = false;
+    closeConfirmGate.leave();
+  });
   mainReady = true;   // from here a window-all-closed is a real user quit
 }
 
@@ -523,7 +579,8 @@ app.whenReady().then(async () => {
     await startSidecar();
   } catch (e) {
     closeStartupWindow();
-    dialog.showErrorBox("Library Tool", "The local backend failed to start.\n" + e.message);
+    dialog.showErrorBox("Library Tool", "The local backend failed to start.\n" + e.message +
+      (isDev ? "\n\n(Dev mode expects Python on PATH — set WHL_PYTHON to override.)" : ""));
     app.quit();
     return;
   }

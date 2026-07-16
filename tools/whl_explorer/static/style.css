@@ -35,6 +35,13 @@
   --red: #c0392b;
   --blue: #33587e;
   --blue2: #4a7099;
+  /* Copyright tags use one cross-theme semantic palette. */
+  --cr-reg-found: #47789b;
+  --cr-reg-none: #7d817c;
+  --cr-public-domain: #3f7c68;
+  --cr-in-copyright: #b45132;
+  --cr-inconclusive: #9b6a24;
+  --cr-unknown: #7d817c;
   --radius: 4px;
   --mono: "Consolas", "DejaVu Sans Mono", "Courier New", monospace;
   --mono2: "Consolas", "DejaVu Sans Mono", "Courier New", monospace;
@@ -1186,9 +1193,9 @@ main {
 .grid th.col-whl, .grid td.col-whl { width: 38px; }
 .grid th.col-act, .grid td.col-act { width: 40px; }
 
-/* copyright tag: a diagonal split — top-left = registration, bottom-right = renewal.
-   Square so the split is a true 45° line; a single solid tag (cr-mono) when both
-   halves are the same colour, so there's no divider. */
+/* Copyright tag: upper-left = registration evidence, lower-right = overall
+   copyright status. It is always split so the two independent questions remain
+   visible even when they share a neutral colour. */
 .cr-tag {
   position: relative;
   display: inline-block;
@@ -1207,15 +1214,20 @@ main {
     transparent calc(50% - 0.6px), rgba(0, 0, 0, 0.25) calc(50% - 0.6px),
     rgba(0, 0, 0, 0.25) calc(50% + 0.6px), transparent calc(50% + 0.6px));
 }
-/* muted, desaturated fills so the tag sits quietly within the CAD themes */
-.cr-blue    { background: #5f7fa0; }
-.cr-yellow  { background: #c3aa5c; }
-.cr-gray    { background: #a6a69f; }
-.cr-green   { background: #5f8b6c; }
-/* magenta, not purple: purple read as a shade of the blue it sits beside */
-.cr-magenta { background: #a4508b; }
-.cr-orange  { background: #bd875a; }
-.cr-red     { background: #ab5147; }
+/* Hue communicates the semantic state; restrained patterns keep the outcome
+   distinguishable without relying on red/green colour perception alone. */
+.cr-reg-found { background: var(--cr-reg-found); }
+.cr-reg-none { background: var(--cr-reg-none); }
+.cr-public-domain { background: var(--cr-public-domain); }
+.cr-in-copyright {
+  background: repeating-linear-gradient(90deg,
+    var(--cr-in-copyright) 0, var(--cr-in-copyright) 3px, #91432f 3px, #91432f 4px);
+}
+.cr-inconclusive {
+  background: repeating-linear-gradient(135deg,
+    var(--cr-inconclusive) 0, var(--cr-inconclusive) 3px, #b8883f 3px, #b8883f 5px);
+}
+.cr-unknown { background: var(--cr-unknown); }
 .cr-pending { background: repeating-linear-gradient(45deg, #d8d8d8, #d8d8d8 3px, #ececec 3px, #ececec 6px); }
 
 /* --- History tab --- */

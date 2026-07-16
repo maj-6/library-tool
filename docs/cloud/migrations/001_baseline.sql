@@ -64,6 +64,9 @@ alter table captures add column if not exists ocr         jsonb not null default
 alter table captures add column if not exists meta        jsonb not null default '{}';
 create index if not exists captures_owner_status_idx
   on captures (created_by, status, created_at);
+-- Storage authorization resolves an object name through captures.photos (`?`).
+-- Keep that lookup indexed; otherwise every download/delete scans all captures.
+create index if not exists captures_photos_idx on captures using gin (photos);
 
 -- A contributor may capture on a different account from the curator's desktop.
 -- Grants are provisioned centrally; neither app receives a service-role key.
@@ -93,7 +96,14 @@ alter table books    enable row level security;   -- no policy: service_role onl
 -- new public tables inherit grants, and a policy cannot run when the role has
 -- no table privilege. Keep grants least-privilege and next to the RLS setup.
 revoke all on public.captures from anon, authenticated;
-grant select, insert, update on public.captures to authenticated;
+revoke update (id, created_at, created_by) on public.captures from authenticated;
+grant select, insert on public.captures to authenticated;
+-- `created_by` is the security boundary for both capture rows and their
+-- Storage objects. Authenticated clients may revise capture contents/status,
+-- but may never transfer a row to another account (nor rewrite its id/time).
+-- Column-level UPDATE privileges enforce that invariant independently of RLS.
+grant update (device, status, photos, note, contributor, ocr, meta)
+  on public.captures to authenticated;
 grant select, insert, update, delete on public.captures to service_role;
 revoke all on public.books from anon, authenticated;
 grant select, insert, update, delete on public.books to service_role;
@@ -544,9 +554,13 @@ create policy captures_objects_select_authorized on storage.objects
     and exists (
       select 1 from public.captures c
       where c.photos ? storage.objects.name
+        -- A mutable capture row must never be usable as a pointer to another
+        -- contributor's object. Storage ownership is assigned from the JWT at
+        -- upload time; bind it to the capture owner before applying grants.
+        and storage.objects.owner_id = c.created_by::text
         and (
           (c.created_by = (select auth.uid())
-           and owner_id = (select auth.uid()::text))
+           and storage.objects.owner_id = (select auth.uid()::text))
           or exists (
             select 1 from public.capture_ingest_grants grant_row
             where grant_row.ingester_id = (select auth.uid())
@@ -561,9 +575,10 @@ create policy captures_objects_delete_authorized on storage.objects
     and exists (
       select 1 from public.captures c
       where c.photos ? storage.objects.name
+        and storage.objects.owner_id = c.created_by::text
         and (
           (c.created_by = (select auth.uid())
-           and owner_id = (select auth.uid()::text))
+           and storage.objects.owner_id = (select auth.uid()::text))
           or exists (
             select 1 from public.capture_ingest_grants grant_row
             where grant_row.ingester_id = (select auth.uid())
