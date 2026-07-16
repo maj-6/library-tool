@@ -17,8 +17,10 @@ import pytest
 import server
 
 
-SCHEMA_SQL = (Path(__file__).parents[1] / "docs" / "cloud" /
-              "schema.sql").read_text(encoding="utf-8")
+SCHEMA_SQL = "\n".join(
+    p.read_text(encoding="utf-8")
+    for p in sorted((Path(__file__).parents[1] / "docs" / "cloud" /
+                     "migrations").glob("*.sql")))
 SCHEMA_SQL_FLAT = " ".join(SCHEMA_SQL.split())
 
 
