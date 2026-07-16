@@ -1,7 +1,7 @@
 # The library view, categories, and the Analyze tab
 
 Design contract for three features that land together. Frozen 2026-07-10;
-the schema half lives in `docs/cloud/schema.sql` (taxonomy, volume_texts,
+the schema half lives in `docs/cloud/migrations/` (taxonomy, volume_texts,
 volume_pages, volume_notes, volumes.category_paths + volumes.assets).
 
 ## 1. Categories: a hierarchical taxonomy

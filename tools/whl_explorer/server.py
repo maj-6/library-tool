@@ -843,7 +843,7 @@ _BUILD_FIELDS = ("published_slug",
                  "categories", "category_ids", "description",
                  "pdf_source", "pdf_file",
                  "pdf_sources", "bundle",
-                 "source_url", "notes", "status",
+                 "source_url", "notes", "status", "rights",
                  "ocr_active", "ocr_verified", "ocr_quality",
                  "title_pages", "thumbnail_source", "attention",
                  "images", "extra", "capture_id")
@@ -906,6 +906,15 @@ def _valid_src_key(b: dict, key) -> str:
 # draft -> ready (verified) -> uploaded (sent to WHL, cleared from Pending)
 _BUILD_STATUSES = ("draft", "ready", "uploaded")
 
+# The curator's explicit publication-rights decision (docs/rights.md). Empty
+# means undecided, which blocks publishing; only the _RIGHTS_TEXT_OK states
+# let the book's own words (page text, translations, notes) go public.
+# _RIGHTS_PUBLIC is how each state reads on the site (volumes.copyright_status).
+_BUILD_RIGHTS = ("", "public-domain", "cleared", "searchable-only", "no-public-text")
+_RIGHTS_TEXT_OK = ("public-domain", "cleared")
+_RIGHTS_PUBLIC = {"public-domain": "Public domain", "cleared": "Cleared",
+                  "searchable-only": "Search only", "no-public-text": "Restricted"}
+
 
 @app.route("/api/builds")
 def api_builds():
@@ -929,6 +938,9 @@ def api_builds_create():
         build["capture_id"] = _clean_capture_id(seed.get("capture_id"))
         if build["status"] not in _BUILD_STATUSES:
             build["status"] = "draft"
+        if build["rights"] not in _BUILD_RIGHTS:
+            return jsonify({"ok": False,
+                            "error": f"unknown rights value {build['rights']!r}"}), 400
         build["id"] = lib.gen_id(set(builds))
         build["created_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         build["updated_at"] = build["created_at"]
@@ -945,6 +957,9 @@ def api_builds_update(build_id: str):
         if build_id not in builds:
             abort(404)
         payload = request.get_json(silent=True) or {}
+        if str(payload.get("rights") or "").strip() not in _BUILD_RIGHTS:
+            return jsonify({"ok": False,
+                            "error": f"unknown rights value {payload['rights']!r}"}), 400
         b = builds[build_id]
         # optimistic concurrency: an editor that loaded the record before
         # another writer touched it gets the current record back, not a merge
@@ -1911,6 +1926,7 @@ def api_build_ocr_put(build_id: str):
         src_key = _valid_src_key(builds[build_id], p.get("src"))
         if src_key:
             _ocr_set_source(build_id, name, src_key)
+    _revalidate_note_anchors(build_id, builds[build_id], name)
     return jsonify({"ok": True, "name": name,
                     "folder": _entry_folder_info(build_id)})
 
@@ -4839,18 +4855,80 @@ def _load_annotations(bid: str) -> dict:
     return doc
 
 
+def _revalidate_note_anchors(bid: str, b: dict, saved: str) -> None:
+    """After an OCR text edit, re-check that each note's quote still exists on
+    its page. A quote that no longer matches is flagged, never deleted — the
+    curator decides what a rewritten page means for the note."""
+    doc_name, text = _analyze_doc(bid, b)
+    if saved != doc_name:
+        return                        # not the document the notes anchor to
+    src_pages = _an_pages(text)
+    with _an_notes_lock:
+        doc = _load_annotations(bid)
+        changed = False
+        for n in doc["notes"]:
+            quote = str(n.get("quote") or "")
+            if not quote:
+                continue
+            flat = re.sub(r"\s+", " ", src_pages.get(n.get("page"), "")).lower()
+            anchor = ("ok" if re.sub(r"\s+", " ", quote).lower() in flat
+                      else "orphaned")
+            if n.get("anchor") != anchor:
+                n["anchor"] = anchor
+                changed = True
+        if changed:
+            lib.save_json(_entry_dir(bid) / "annotations.json", doc)
+
+
 def _lang_code(raw: str) -> str:
     return re.sub(r"[^a-z\-]", "", str(raw or "").lower())[:12]
+
+
+def _page_sha(text: str) -> str:
+    return hashlib.sha1(
+        re.sub(r"\s+", " ", text.strip()).encode("utf-8")).hexdigest()
+
+
+def _translation_meta_path(bid: str, lang: str):
+    return _entry_dir(bid) / "translations" / f"{lang}.meta.json"
+
+
+def _load_translation_meta(bid: str, lang: str) -> dict:
+    doc = lib.load_json(_translation_meta_path(bid, lang), None)
+    if not isinstance(doc, dict) or not isinstance(doc.get("pages"), dict):
+        return {"version": 1, "src": "", "model": "", "pages": {}}
+    return doc
+
+
+def _stale_translation_pages(meta: dict, src_pages: dict[int, str]) -> list[int]:
+    """Pages whose recorded source hash no longer matches the OCR text. Pages
+    translated before hashes were recorded can't be judged — never "stale"."""
+    out = []
+    for key, rec in meta.get("pages", {}).items():
+        try:
+            n = int(key)
+        except (TypeError, ValueError):
+            continue
+        if (n in src_pages and isinstance(rec, dict) and rec.get("sha1")
+                and rec["sha1"] != _page_sha(src_pages[n])):
+            out.append(n)
+    return sorted(out)
 
 
 def _translations_info(bid: str) -> list[dict]:
     d = _entry_dir(bid) / "translations"
     out = []
     if d.is_dir():
+        b = lib.load_json(BUILDS_PATH, {}).get(bid) or {}
+        src_pages = _an_pages(_analyze_doc(bid, b)[1])
         for f in sorted(d.glob("*.txt")):
             pages = _an_pages(f.read_text(encoding="utf-8", errors="replace"))
+            meta = _load_translation_meta(bid, f.stem)
             out.append({"lang": f.stem, "pages": len(pages),
-                        "size": f.stat().st_size})
+                        "size": f.stat().st_size,
+                        "stale": len(_stale_translation_pages(meta, src_pages)),
+                        "untracked": sum(1 for n in pages
+                                         if str(n) not in meta["pages"])})
     return out
 
 
@@ -4924,6 +5002,9 @@ def api_build_translation(bid: str, lang: str):
         return err
     if p.is_file():
         p.unlink()
+    m = _translation_meta_path(bid, lang)
+    if m.is_file():
+        m.unlink()
     return jsonify({"ok": True})
 
 
@@ -5266,11 +5347,33 @@ def api_analyze_translate():
                         "no OCR text for this entry — extract or run OCR first"}), 400
     rel = f"translations/{lang}.txt"
     done_pages = _an_pages(_read_entry_text(bid, rel))
-    todo = [n for n in sorted(pages) if pages[n].strip()
-            and not done_pages.get(n, "").strip()]
-    if not todo:
-        return jsonify({"ok": False, "error":
-                        "every page with text is already translated"}), 400
+    want = p.get("pages")
+    if isinstance(want, list):
+        # explicit re-translation: the client names the pages, current or not
+        try:
+            want = sorted({int(n) for n in want})
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "pages must be integers"}), 400
+        todo = [n for n in want if pages.get(n, "").strip()]
+        if not todo:
+            return jsonify({"ok": False, "error":
+                            "none of those pages have source text"}), 400
+    elif p.get("mode") == "stale":
+        # bring the translation current: pages whose source text changed since
+        # they were translated, plus pages never translated at all
+        stale = _stale_translation_pages(_load_translation_meta(bid, lang), pages)
+        todo = sorted(set(stale) | {n for n in pages if pages[n].strip()
+                                    and not done_pages.get(n, "").strip()})
+        if not todo:
+            return jsonify({"ok": False, "error":
+                            "no outdated or missing pages — the translation "
+                            "is current"}), 400
+    else:
+        todo = [n for n in sorted(pages) if pages[n].strip()
+                and not done_pages.get(n, "").strip()]
+        if not todo:
+            return jsonify({"ok": False, "error":
+                            "every page with text is already translated"}), 400
     cfg = _ai_cfg()
     meta = _an_meta_line(b)
 
@@ -5303,6 +5406,16 @@ def api_analyze_translate():
                     doc = "\n\n".join(f"--- page {k} ---\n{cur[k]}"
                                       for k in sorted(cur))
                     _write_entry_text(bid, rel, doc + "\n")
+                    # provenance sidecar: which source text (by hash) and
+                    # model each page was translated from — staleness is a
+                    # hash comparison later
+                    tm = _load_translation_meta(bid, lang)
+                    tm["src"], tm["model"] = name, cfg["model"]
+                    tm["pages"][str(n)] = {
+                        "sha1": _page_sha(pages[n]),
+                        "at": datetime.now(timezone.utc).isoformat(
+                            timespec="seconds")}
+                    lib.save_json(_translation_meta_path(bid, lang), tm)
             activity("translated", "book", n=len(todo) - job["errors"],
                      detail=f"{b.get('title', '')} -> {lang}")
             _an_finish(job)
@@ -5494,7 +5607,7 @@ def api_analyze_relevance():
 
 _publish_lock = threading.Lock()
 _publish: dict = {"running": False, "build": "", "stage": "idle", "sent": 0,
-                  "total": 0, "error": "", "url": "", "slug": ""}
+                  "total": 0, "error": "", "url": "", "slug": "", "note": ""}
 
 
 def _r2_cfg() -> dict:
@@ -5527,6 +5640,7 @@ def _volume_row(b: dict, slug: str, url: str, path: str, size: int, actor: str,
             "category_paths": paths,
             "description": b.get("description") or "",
             "source_url": b.get("source_url") or b.get("pdf_source") or "",
+            "copyright_status": _RIGHTS_PUBLIC.get(b.get("rights") or "", ""),
             "pdf_url": url, "pdf_path": path, "pdf_bytes": size,
             "thumbnail_url": thumb_url, "thumbnail_path": thumb_path,
             "uploaded_by_name": actor,
@@ -5566,6 +5680,22 @@ def _bundle_artifacts(bid: str, b: dict) -> dict:
         if out["notes"]:
             out["assets"]["notes"] = len(out["notes"])
     return out
+
+
+def _rights_artifacts(bid: str, b: dict) -> tuple[dict, bool]:
+    """The bundle the rights decision actually allows out (art, withheld).
+    The About article is the curator's own writing and always publishes; the
+    book's words — page text, translations, notes (verbatim quotes) — only
+    with a permitting decision. _publish_bundle's pruning then removes any
+    text rows a previous publish sent."""
+    art = _bundle_artifacts(bid, b)
+    if b.get("rights") in _RIGHTS_TEXT_OK:
+        return art, False
+    withheld = bool(art["pages"] or art["notes"])
+    art["pages"], art["notes"] = {}, []
+    art["assets"] = {k: v for k, v in art["assets"].items()
+                     if k not in ("pages", "translations", "notes")}
+    return art, withheld
 
 
 def _publish_preview_thumb(bid: str, b: dict) -> str:
@@ -5937,25 +6067,24 @@ def _publish_run(bid: str, actor: str) -> None:
                     thumb_url = thumb_path = ""
 
             stage("recording")
-            art = _bundle_artifacts(bid, b)
+            art, withheld = _rights_artifacts(bid, b)
             row = dict(_volume_row(b, slug, url, path, size, actor,
                                     thumb_url, thumb_path),
                        assets=art["assets"])
             try:
                 sbase.upsert_volume(cloud, row)
             except sbase.SyncError as exc:
-                # A live project that hasn't re-run schema.sql lacks the new
+                # A live project behind on docs/cloud/migrations lacks the new
                 # columns; the book still deserves to publish.
                 missing = ("category_paths", "assets", "thumbnail_url", "thumbnail_path",
-                           "volume", "group_id")
+                           "volume", "group_id", "copyright_status")
                 if not any(k in str(exc) for k in missing):
                     raise
-                for k in ("category_paths", "assets", "thumbnail_url", "thumbnail_path",
-                          "volume", "group_id"):
+                for k in missing:
                     row.pop(k, None)
                 sbase.upsert_volume(cloud, row)
                 log.warning("optional volumes metadata is missing on the cloud "
-                            "project — re-run docs/cloud/schema.sql")
+                            "project — apply the pending docs/cloud/migrations")
         except Exception:
             _unpublish_object(cloud, slug, path)
             for name_i, path_i in extras:
@@ -5976,7 +6105,7 @@ def _publish_run(bid: str, actor: str) -> None:
                        ("volume_texts", "volume_pages", "volume_notes")):
                 raise
             log.warning("artifact tables missing on the cloud project — "
-                        "re-run docs/cloud/schema.sql (%s)", exc)
+                        "apply the pending docs/cloud/migrations (%s)", exc)
 
         # re-read: the upload took minutes, and another writer may have touched
         # builds meanwhile. Only this build's fields are ours to change.
@@ -5990,7 +6119,10 @@ def _publish_run(bid: str, actor: str) -> None:
                 lib.save_json(BUILDS_PATH, fresh)
         activity("published", "book", actor=actor or None)
         log.info("published volume %s (%.0f MB) -> %s", slug, size / 1e6, url)
-        stage("done", url=url, slug=slug, error="")
+        if withheld:
+            log.info("text withheld for %s (rights: %s)", slug, b.get("rights"))
+        stage("done", url=url, slug=slug, error="",
+              note="page text and notes withheld (rights)" if withheld else "")
     except Exception as exc:
         log.error("publish failed for build %s", bid, exc_info=exc)
         stage("error", error=f"{type(exc).__name__}: {exc}")
@@ -6008,13 +6140,16 @@ def api_volumes_publish():
         abort(404)
     if builds[bid].get("status") not in ("ready", "uploaded"):
         return jsonify({"ok": False, "error": "only verified entries can be published"}), 400
+    if builds[bid].get("rights") not in _BUILD_RIGHTS[1:]:
+        return jsonify({"ok": False, "error": "no rights decision — set Rights in "
+                        "the Editor before publishing"}), 400
     if not _cloud_cfg():
         return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Sync)"}), 400
     with _publish_lock:
         if _publish["running"]:
             return jsonify({"ok": False, "error": "a publish is already running"}), 409
         _publish.update(running=True, build=bid, stage="starting", sent=0, total=0,
-                        error="", url="", slug="")
+                        error="", url="", slug="", note="")
     threading.Thread(target=_publish_run, args=(bid, _actor()), daemon=True).start()
     return jsonify({"ok": True})
 

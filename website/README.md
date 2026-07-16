@@ -107,8 +107,9 @@ python3 tools/cloud_setup.py anon-key      # prints the snippet
 
 Write it to `assets/config.js` — gitignored, because the project reference is
 yours. The **anon** key belongs here, never the service_role key. Row-level
-security is what protects the project: `docs/cloud/schema.sql` grants anon
-exactly two reads, `volumes` and `releases`, and nothing else.
+security is what protects the project: `docs/cloud/migrations/` grants anon
+only the published library reads (`volumes` and its artifact tables,
+`releases`) and nothing else.
 
 ## Publishing
 

@@ -3565,6 +3565,12 @@ button.publish-tree-label { cursor: pointer; }
   padding: 4px 0;
   border-bottom: 1px solid var(--canvas-line);
 }
+.an-trans-stale {
+  font-size: 9px;
+  color: var(--amber);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
 .an-note {
   border: 1px solid var(--canvas-line);
   border-left: 3px solid var(--face-sh2);
@@ -3588,6 +3594,11 @@ button.publish-tree-label { cursor: pointer; }
   border-radius: var(--radius);
 }
 .an-note-quote { font-style: italic; color: var(--ink-light); margin-bottom: 3px; }
+.an-note-quote.orphaned {
+  opacity: 0.62;
+  text-decoration: underline dashed;
+  text-underline-offset: 3px;
+}
 .an-note-body { cursor: text; }
 .an-note-edit { width: 100%; min-height: 60px; }
 .an-crit-row {

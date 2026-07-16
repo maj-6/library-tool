@@ -120,7 +120,7 @@ const WHL_ROW_FIELDS = ["title", "subtitle", "authors", "year", "publisher",
 
 const BUILD_FIELDS = ["title", "subtitle", "authors", "year", "publisher",
   "publisher_city", "edition", "volume", "group_id", "language", "pages",
-  "pdf_source", "pdf_file", "source_url", "notes"];
+  "rights", "pdf_source", "pdf_file", "source_url", "notes"];
 
 const state = {
   // key `${source}:${idx}` -> { book, checks, scans, verify, manual_urls }
@@ -8247,6 +8247,9 @@ async function loadAnTranslations(b) {
         `<div class="an-trans-row">
           <span class="mono">${esc(t.lang)}</span>
           <span class="tool-label">${t.pages} pages</span>
+          ${t.stale ? `<span class="an-trans-stale">${t.stale} outdated</span>
+          <button class="cad-btn tiny" data-tstale="${esc(t.lang)}" type="button"
+            data-tip="Re-translate the pages whose OCR text changed since">Update</button>` : ""}
           <button class="cad-btn tiny" data-tview="${esc(t.lang)}" type="button">View</button>
           <button class="cad-btn tiny danger" data-tdel="${esc(t.lang)}" type="button">Delete</button>
         </div>`).join("")
@@ -8264,8 +8267,10 @@ async function loadAnNotes(b) {
     const notes = (data.doc && data.doc.notes) || [];
     const counts = { approved: 0, suggested: 0, rejected: 0 };
     notes.forEach((n) => { counts[n.status] = (counts[n.status] || 0) + 1; });
+    const orphaned = notes.filter((n) => n.anchor === "orphaned").length;
     el("an-notes-count").textContent = notes.length
       ? `${counts.approved} approved · ${counts.suggested} suggested · ${counts.rejected} rejected`
+        + (orphaned ? ` · ${orphaned} orphaned` : "")
       : "";
     el("an-notes-list").innerHTML = notes.length
       ? notes.sort((a, x) => (a.page - x.page) || (a.created_at || "").localeCompare(x.created_at || ""))
@@ -8281,7 +8286,9 @@ async function loadAnNotes(b) {
                 ${n.status === "rejected" ? "disabled" : ""}>Reject</button>
               <button class="cad-btn tiny danger" data-ndel="1" type="button">&#10005;</button>
             </div>
-            ${n.quote ? `<div class="an-note-quote">&ldquo;${esc(n.quote)}&rdquo;</div>` : ""}
+            ${n.quote ? `<div class="an-note-quote${n.anchor === "orphaned" ? " orphaned" : ""}"${
+              n.anchor === "orphaned" ? ' data-tip="Quote no longer matches the page text"' : ""
+            }>&ldquo;${esc(n.quote)}&rdquo;</div>` : ""}
             <div class="an-note-body" data-tip="Click to edit">${esc(n.body)}</div>
           </div>`).join("")
       : `<p class="pane-note">No annotations yet. Generated notes arrive as
@@ -8501,6 +8508,13 @@ function initAnalyze() {
   el("an-trans-list").addEventListener("click", async (ev) => {
     const b = anSelected();
     if (!b) return;
+    const stale = ev.target.closest("[data-tstale]");
+    if (stale) {
+      anStartJob("/api/analyze/translate",
+                 { build_id: b.id, lang: stale.dataset.tstale, mode: "stale" },
+                 `translate ${stale.dataset.tstale}`, stale);
+      return;
+    }
     const view = ev.target.closest("[data-tview]");
     const del = ev.target.closest("[data-tdel]");
     if (view) {
@@ -10689,6 +10703,11 @@ async function uploadBuild() {
     el("build-msg").textContent = "Attach the PDF before publishing";
     return;
   }
+  // convenience only — the publish route enforces this server-side
+  if (!(b.rights || "").trim()) {
+    el("build-msg").textContent = "Set Rights before publishing";
+    return;
+  }
   let res;
   try {
     res = await (await fetch("/api/volumes/publish", {
@@ -10732,9 +10751,31 @@ function pollPublish() {
       state.buildSel = null;
       renderUpload();
       renderHome();
-      status(`PUBLISHED :: ${st.slug}`);
+      status(`PUBLISHED :: ${st.slug}${st.note ? " :: " + st.note : ""}`);
     }
   }, 700);
+}
+
+// Rights suggestion: the offline renewal check (the same one behind the
+// Catalogs copyright tag). Only a clear "Public domain (…)" finding
+// preselects the state; the curator still reviews and saves.
+async function suggestRights() {
+  const msg = el("build-msg");
+  const title = el("b-title").value.trim();
+  if (!title) { msg.textContent = "Title is required"; return; }
+  const q = new URLSearchParams({
+    title, author: el("b-authors").value.trim(), year: el("b-year").value.trim(),
+  });
+  let res;
+  try {
+    res = await (await fetch("/api/copyright/status?" + q)).json();
+  } catch (e) { msg.textContent = "Copyright check unreachable"; return; }
+  const s = res.copyright_status || "";
+  if (s.startsWith("Public domain")) {
+    el("b-rights").value = "public-domain";
+    buildDirty = true;
+  }
+  msg.textContent = s || "No determination";
 }
 
 function activeBuildTab() {
@@ -14616,6 +14657,10 @@ function init() {
   for (const t of document.querySelectorAll("#build-tabs .pane-tab")) {
     t.addEventListener("click", () => switchBuildTab(t.dataset.btab));
   }
+  el("b-rights-suggest").addEventListener("click", (ev) => {
+    ev.preventDefault();
+    suggestRights();
+  });
   el("b-ai").addEventListener("click", generateAiSummary);
   el("b-desc-load").addEventListener("click", () => el("b-desc-file").click());
   el("b-desc-file").addEventListener("change", () => {
