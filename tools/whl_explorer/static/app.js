@@ -13371,10 +13371,12 @@ async function ocrLayoutMeta(bid) {
         `/api/builds/${encodeURIComponent(bid)}/ocr-layout`)).json();
       ocrState.layoutMeta[bid] = r.ok
         ? { images: r.images || {}, wordPages: r.word_pages || {},
-            wordDocs: r.word_docs || {}, regionPages: r.region_pages || {} }
-        : { images: {}, wordPages: {}, wordDocs: {}, regionPages: {} };
+            wordDocs: r.word_docs || {}, regionPages: r.region_pages || {},
+            regionStates: r.region_states || {} }
+        : { images: {}, wordPages: {}, wordDocs: {}, regionPages: {}, regionStates: {} };
     } catch (e) {
-      ocrState.layoutMeta[bid] = { images: {}, wordPages: {}, wordDocs: {}, regionPages: {} };
+      ocrState.layoutMeta[bid] = { images: {}, wordPages: {}, wordDocs: {},
+                                   regionPages: {}, regionStates: {} };
     }
   }
   return ocrState.layoutMeta[bid];
@@ -14823,8 +14825,13 @@ const rwState = {
   dims: null, items: [],
   sel: [],          // selected region ids; the LAST one is active
   dirty: false, pageCount: 0, regionPages: [],
+  regionStates: {}, // page -> review flag ("verified"), for the strip chips
+  outliers: [],     // pages flagged by the last template-outlier run
+  templates: [],    // this source's template names
+  layer: "text",    // which text layer the panel edits: "text" | "norm"
+  pageState: "",    // this page's review flag
   drag: null,       // {kind: move|resize|draw, id, corner, start, box0, moved}
-  lastPos: null,    // pointer in page fractions — the S/V split guide
+  lastPos: null,    // pointer in page fractions — the split guide
   seq: 0, idSeq: 0,
 };
 
@@ -14880,7 +14887,34 @@ async function selectReplicaBook(bid) {
   sel.value = rwState.src;
   await renderReplicaPages(seq);
   if (seq !== rwState.seq) return;
+  await rwLoadTemplates(seq);
+  if (seq !== rwState.seq) return;
   rwSyncBar();
+}
+
+async function rwLoadTemplates(seq) {
+  let names = [];
+  try {
+    const r = await (await fetch(
+      `/api/builds/${encodeURIComponent(rwState.book)}/ocr-templates` +
+      `?src=${encodeURIComponent(rwState.src)}`)).json();
+    if (r.ok) names = (r.templates || []).map((t) => t.name);
+  } catch (e) { /* no templates yet */ }
+  if (seq !== rwState.seq) return;
+  rwState.templates = names;
+  const sel = el("rw-tpl");
+  sel.innerHTML = ['<option value="">tpl…</option>',
+    ...names.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`)].join("");
+}
+
+// the page strip chip: an outlier flag beats the review check beats the
+// plain has-regions dot
+function rwPageChip(n) {
+  if (rwState.outliers.includes(n)) return '<span class="rw-warn">!</span>';
+  if ((rwState.regionStates || {})[String(n)] === "verified") {
+    return '<span class="rw-check">✓</span>';
+  }
+  return rwState.regionPages.includes(n) ? '<span class="rw-dot">●</span>' : "";
 }
 
 async function renderReplicaPages(seq) {
@@ -14905,6 +14939,7 @@ async function renderReplicaPages(seq) {
   }
   rwState.pdf = pdf;
   rwState.regionPages = regionPages;
+  rwState.regionStates = (meta.regionStates || {})[src] || {};
   rwState.pageCount = Math.max(count, ...regionPages, 0);
   const box = el("rw-pages");
   box.innerHTML = "";
@@ -14914,8 +14949,7 @@ async function renderReplicaPages(seq) {
     d.type = "button";
     d.className = "rw-pagebtn" + (n === rwState.page ? " active" : "");
     d.dataset.page = n;
-    d.innerHTML = `${n}` + (rwState.regionPages.includes(n)
-      ? '<span class="rw-dot">●</span>' : "");
+    d.innerHTML = `${n}` + rwPageChip(n);
     frag.appendChild(d);
   }
   box.appendChild(frag);
@@ -14946,9 +14980,12 @@ async function selectReplicaPage(n) {
     box: { x: +((it.box || {}).x) || 0, y: +((it.box || {}).y) || 0,
            w: +((it.box || {}).w) || 0, h: +((it.box || {}).h) || 0 },
     text: String(it.text || ""),
+    norm: String(it.norm || ""),
   }));
   rwState.doc = (rec.found && rec.doc) || "compiled.txt";
   rwState.dims = rec.found ? rec.dims : null;
+  rwState.pageState = (rec.found && rec.state) || "";
+  rwSetLayer("text");
   let ratio = "";
   if (rwState.dims && rwState.dims.w > 0) {
     ratio = `${rwState.dims.w} / ${rwState.dims.h}`;
@@ -15002,20 +15039,51 @@ function rwPaintRegion(it) {
   e.style.height = it.box.h * 100 + "%";
 }
 
+// switch which text layer the panel shows and edits (diplomatic | normalized)
+function rwSetLayer(layer) {
+  rwState.layer = layer === "norm" ? "norm" : "text";
+  el("rw-layer-dipl").classList.toggle("active", rwState.layer === "text");
+  el("rw-layer-norm").classList.toggle("active", rwState.layer === "norm");
+  const ta = el("rw-text");
+  ta.placeholder = rwState.layer === "norm"
+    ? "No normalized reading yet — Propose drafts one from the diplomatic text"
+    : "Select a region";
+  rwSyncBar();
+}
+
+// the mechanical normalization PROPOSAL: resolve long s and the common
+// ligatures, join line-end hyphenation. Deliberately shallow — u/v and i/j
+// swaps, spelling, and everything judgement-shaped stays with the human.
+function rwNormalize(text) {
+  return String(text || "")
+    .replace(/ſ/g, "s")
+    .replace(/ﬀ/g, "ff").replace(/ﬁ/g, "fi").replace(/ﬂ/g, "fl")
+    .replace(/ﬃ/g, "ffi").replace(/ﬄ/g, "ffl").replace(/ﬅ|ﬆ/g, "st")
+    .replace(/([A-Za-zæœÆŒ])[-¬⸗]\n(\S+)(\n?)/g, "$1$2$3")
+    .replace(/ /g, " ");
+}
+
 function rwSyncBar() {
   const nItems = rwState.items.length;
   el("rw-status").textContent = rwState.page
     ? `p ${rwState.page} · ${nItems} region${nItems === 1 ? "" : "s"}` +
+      (rwState.pageState === "verified" ? " · ✓" : "") +
       (rwState.dirty ? " · unsaved" : "")
     : "";
   el("rw-save").disabled = !rwState.dirty || !rwState.page;
   el("rw-recompile").disabled = !rwState.book || !rwState.regionPages.length;
+  el("rw-tpl-save").disabled = !rwState.page;
+  el("rw-tpl-apply").disabled = !el("rw-tpl").value;
+  el("rw-tpl-outliers").disabled = !el("rw-tpl").value;
   const a = rwActive();
   el("rw-region-info").textContent = a ? `${a.role} · order ${a.order}` : "";
   const ta = el("rw-text");
   ta.disabled = !a;
-  if (document.activeElement !== ta) ta.value = a ? a.text : "";
+  if (document.activeElement !== ta) {
+    ta.value = a ? (rwState.layer === "norm" ? a.norm || "" : a.text) : "";
+  }
   el("rw-clip").disabled = !a;
+  el("rw-normalize").disabled = !a;
 }
 
 function rwDirty() { rwState.dirty = true; rwSyncBar(); }
@@ -15225,9 +15293,11 @@ function rwKeyDown(ev) {
     rwState.sel = [];
     rwRenderOverlay(); rwSyncBar();
   } else if ((ev.key === "s" || ev.key === "S") && a) {
-    rwSplit(a, "h");
-  } else if ((ev.key === "v" || ev.key === "V") && a) {
-    rwSplit(a, "v");
+    rwSplit(a, ev.shiftKey ? "v" : "h");
+  } else if ((ev.key === "v" || ev.key === "V") && rwState.page) {
+    // toggle the page's review flag; saved with the regions
+    rwState.pageState = rwState.pageState === "verified" ? "" : "verified";
+    rwDirty();
   } else if ((ev.key === "m" || ev.key === "M") && rwState.sel.length >= 2) {
     rwMerge();
   } else if (ev.key === "Tab" && rwState.items.length) {
@@ -15270,7 +15340,8 @@ async function rwClipWords() {
     if (picked.length) out.push(picked.join(" "));
   }
   if (!out.length) { status("CLIP :: no words inside this region"); return; }
-  a.text = out.join("\n");
+  a.text = out.join("\n");   // clipped OCR words are diplomatic material
+  rwSetLayer("text");
   rwDirty(); rwSyncBar();
   status(`CLIP :: ${out.length} line(s) from word boxes`);
 }
@@ -15282,15 +15353,17 @@ async function rwSave() {
   // wiped the NEW page's dirty flag and dotted the wrong page button
   const book = rwState.book, src = rwState.src, page = rwState.page;
   const seq = rwState.seq;
+  const pageState = rwState.pageState;
   const items = [...rwState.items].sort((a, b) => a.order - b.order)
-    .map((it, i) => ({ role: it.role, order: i, box: it.box, text: it.text }));
+    .map((it, i) => ({ role: it.role, order: i, box: it.box,
+                       text: it.text, norm: it.norm || "" }));
   try {
     const r = await (await fetch(
       `/api/builds/${encodeURIComponent(book)}/ocr-regions`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ src, page, doc: rwState.doc,
-                               dims: rwState.dims, items }),
+                               dims: rwState.dims, state: pageState, items }),
       })).json();
     if (!r.ok) throw new Error(r.error || "save failed");
   } catch (e) {
@@ -15306,11 +15379,10 @@ async function rwSave() {
     if (!items.length && has) {
       rwState.regionPages = rwState.regionPages.filter((p) => p !== page);
     }
+    if (items.length && pageState) rwState.regionStates[String(page)] = pageState;
+    else delete rwState.regionStates[String(page)];
     const btn = el("rw-pages").querySelector(`[data-page="${page}"]`);
-    if (btn) {
-      btn.innerHTML = `${page}` +
-        (items.length ? '<span class="rw-dot">●</span>' : "");
-    }
+    if (btn) btn.innerHTML = `${page}` + rwPageChip(page);
   }
   if (seq === rwState.seq) rwState.dirty = false;
   status(`REGIONS SAVED :: p ${page} · ${items.length}`);
@@ -15320,17 +15392,117 @@ async function rwSave() {
 async function rwRecompile() {
   if (!rwState.book) return;
   if (rwState.dirty) { status("RECOMPILE :: save the page first"); return; }
+  // the toggled text layer is the layer that compiles: diplomatic body into
+  // each record's own doc, the normalized reading into normalized.txt
+  const body = { src: rwState.src };
+  if (rwState.layer === "norm") body.layer = "norm";
   try {
     const r = await (await fetch(
       `/api/builds/${encodeURIComponent(rwState.book)}/ocr-regions/recompile`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ src: rwState.src }),
+        body: JSON.stringify(body),
       })).json();
     if (!r.ok) throw new Error(r.error || "recompile failed");
     status(`RECOMPILED :: ${r.pages} page(s) -> ${(r.docs || []).join(", ")}`);
   } catch (e) {
     status("RECOMPILE :: " + e.message);
+  }
+}
+
+async function rwTplSave() {
+  if (!rwState.page) return;
+  if (rwState.dirty) { status("TEMPLATE :: save the page first"); return; }
+  const name = (prompt("Template name (e.g. recto, verso):",
+                       el("rw-tpl").value || "recto") || "").trim();
+  if (!name) return;
+  try {
+    const r = await (await fetch(
+      `/api/builds/${encodeURIComponent(rwState.book)}/ocr-templates`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ src: rwState.src, name,
+                               from_page: rwState.page }),
+      })).json();
+    if (!r.ok) throw new Error(r.error || "template save failed");
+    status(`TEMPLATE :: "${name}" · ${r.items} regions (from p ${rwState.page})`);
+  } catch (e) {
+    status("TEMPLATE :: " + e.message);
+    return;
+  }
+  await rwLoadTemplates(rwState.seq);
+  el("rw-tpl").value = name;
+  rwSyncBar();
+}
+
+// "121-140, 150" -> [121..140, 150], capped at 500 pages
+function rwParsePages(spec) {
+  const out = new Set();
+  for (const part of String(spec || "").split(",")) {
+    const m = part.trim().match(/^(\d+)(?:\s*-\s*(\d+))?$/);
+    if (!m) continue;
+    const a = +m[1], b = m[2] ? +m[2] : +m[1];
+    for (let n = Math.min(a, b); n <= Math.max(a, b) && out.size <= 500; n++) {
+      if (n >= 1) out.add(n);
+    }
+  }
+  return [...out].sort((a, b) => a - b);
+}
+
+async function rwTplApply() {
+  const name = el("rw-tpl").value;
+  if (!name || !rwState.book) return;
+  const spec = prompt(
+    `Apply "${name}" to pages (e.g. 121-140, 150):\n` +
+    "Pages that already have regions are skipped. Each stamped region " +
+    "pre-fills its text from the word boxes inside it, when the page has any.");
+  const pages = rwParsePages(spec);
+  if (!pages.length) return;
+  try {
+    const r = await (await fetch(
+      `/api/builds/${encodeURIComponent(rwState.book)}/ocr-templates/apply`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ src: rwState.src, name, pages }),
+      })).json();
+    if (!r.ok) throw new Error(r.error || "apply failed");
+    status(`TEMPLATE :: applied to ${r.applied.length}` +
+           (r.skipped.length ? ` · skipped ${r.skipped.length} (have regions)` : "") +
+           (r.clipped.length ? ` · text clipped on ${r.clipped.length}` : ""));
+  } catch (e) {
+    status("TEMPLATE :: " + e.message);
+    return;
+  }
+  const seq = ++rwState.seq;   // strip + meta changed server-side
+  delete ocrState.layoutMeta[rwState.book];
+  ocrState.regionsCache.clear();
+  await renderReplicaPages(seq);
+  if (seq !== rwState.seq) return;
+  if (rwState.page) selectReplicaPage(rwState.page);
+  rwSyncBar();
+}
+
+async function rwTplOutliers() {
+  const name = el("rw-tpl").value;
+  if (!name || !rwState.book) return;
+  try {
+    const r = await (await fetch(
+      `/api/builds/${encodeURIComponent(rwState.book)}/ocr-templates/outliers`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ src: rwState.src, name }),
+      })).json();
+    if (!r.ok) throw new Error(r.error || "outlier scan failed");
+    rwState.outliers = r.outliers || [];
+    for (const btn of el("rw-pages").querySelectorAll(".rw-pagebtn")) {
+      const n = +btn.dataset.page;
+      btn.innerHTML = `${n}` + rwPageChip(n);
+    }
+    status(`OUTLIERS :: ${rwState.outliers.length} page(s) break the "${name}" grid` +
+           (rwState.outliers.length
+             ? ` — ${rwState.outliers.slice(0, 12).join(", ")}` : ""));
+  } catch (e) {
+    status("OUTLIERS :: " + e.message);
   }
 }
 
@@ -15365,12 +15537,26 @@ function initReplica() {
   el("rw-text").addEventListener("input", () => {
     const a = rwActive();
     if (!a) return;
-    a.text = el("rw-text").value;
+    if (rwState.layer === "norm") a.norm = el("rw-text").value;
+    else a.text = el("rw-text").value;
     rwDirty();
   });
   el("rw-clip").addEventListener("click", rwClipWords);
   el("rw-save").addEventListener("click", rwSave);
   el("rw-recompile").addEventListener("click", rwRecompile);
+  el("rw-layer-dipl").addEventListener("click", () => rwSetLayer("text"));
+  el("rw-layer-norm").addEventListener("click", () => rwSetLayer("norm"));
+  el("rw-normalize").addEventListener("click", () => {
+    const a = rwActive();
+    if (!a) return;
+    a.norm = rwNormalize(a.text);
+    rwSetLayer("norm");
+    rwDirty();
+  });
+  el("rw-tpl").addEventListener("change", rwSyncBar);
+  el("rw-tpl-save").addEventListener("click", rwTplSave);
+  el("rw-tpl-apply").addEventListener("click", rwTplApply);
+  el("rw-tpl-outliers").addEventListener("click", rwTplOutliers);
   el("rw-legend").innerHTML = RW_ROLES.map((r, i) =>
     `<span class="rw-key role-${esc(r)}" data-tip="${esc(r)}">${(i + 1) % 10}</span>`).join("");
 }

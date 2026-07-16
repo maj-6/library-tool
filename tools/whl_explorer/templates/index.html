@@ -1174,10 +1174,18 @@
             <span class="bar-spacer"></span>
             <span id="rw-legend" class="tool-label"></span>
             <span class="bar-spacer"></span>
+            <select id="rw-tpl" class="cad-input" data-tip="Layout template — one corrected recto/verso page becomes a reusable grid"></select>
+            <button id="rw-tpl-save" class="cad-btn tiny" type="button" disabled
+                    data-tip="Save this page's SAVED regions as a template (geometry + roles, no text)">Tpl+</button>
+            <button id="rw-tpl-apply" class="cad-btn tiny" type="button" disabled
+                    data-tip="Stamp the template onto a page range; each region pre-fills its text from the word boxes inside it">Apply</button>
+            <button id="rw-tpl-outliers" class="cad-btn tiny" type="button" disabled
+                    data-tip="Flag region pages that break the template's grid — plates, chapter openings, errata">Outliers</button>
+            <span class="bar-spacer"></span>
             <button id="rw-save" class="cad-btn tiny" type="button" disabled
                     data-tip="Save this page's regions (Ctrl+S)">Save</button>
             <button id="rw-recompile" class="cad-btn tiny" type="button" disabled
-                    data-tip="Rewrite the compiled document's body text from every saved region page of this source — furniture (marginalia, heads, catchwords) stays out of the flow">Recompile body</button>
+                    data-tip="Rewrite compiled text from every saved region page of this source — furniture stays out of the flow. The toggled layer compiles: diplomatic into each record's doc, normalized into normalized.txt">Recompile</button>
           </div>
           <div id="rw-canvas-wrap" class="drafting">
             <div id="rw-canvas" hidden>
@@ -1192,13 +1200,19 @@
             <span class="tool-label">Region</span>
             <span class="tool-count" id="rw-region-info"></span>
             <span class="bar-spacer"></span>
+            <button id="rw-layer-dipl" class="cad-btn tiny active" type="button"
+                    data-tip="Diplomatic layer: the text as printed (long ſ, ligatures, line-end hyphens)">Dipl</button>
+            <button id="rw-layer-norm" class="cad-btn tiny" type="button"
+                    data-tip="Normalized layer: the modern reading">Norm</button>
+            <button id="rw-normalize" class="cad-btn tiny" type="button" disabled
+                    data-tip="Propose a normalization of the diplomatic text (ſ→s, ligatures, dehyphenate) — then edit it">Propose</button>
             <button id="rw-clip" class="cad-btn tiny" type="button" disabled
-                    data-tip="Replace this region's text with the word boxes inside it (Tesseract/Textract or the PDF text layer)">Clip words</button>
+                    data-tip="Replace this region's diplomatic text with the word boxes inside it (Tesseract/Textract or the PDF text layer)">Clip words</button>
           </div>
           <textarea id="rw-text" class="cad-input" spellcheck="false" disabled
                     placeholder="Select a region"></textarea>
           <div class="pane-bar">
-            <span id="rw-keys" class="tool-label">draw: drag &nbsp; move/resize: drag box/corner &nbsp; roles: 1–9,0 &nbsp; split: S/V &nbsp; merge: M &nbsp; del: Del &nbsp; order: [ ] &nbsp; walk: Tab</span>
+            <span id="rw-keys" class="tool-label">draw: drag &nbsp; move/resize: drag box/corner &nbsp; roles: 1–9,0 &nbsp; split: S / Shift+S &nbsp; merge: M &nbsp; verify page: V &nbsp; del: Del &nbsp; order: [ ] &nbsp; walk: Tab</span>
           </div>
         </aside>
       </div>

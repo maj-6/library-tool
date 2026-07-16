@@ -162,9 +162,30 @@ editable overlay, region text panel), draw/move/resize/split/merge/roles/
 order/delete with the digit-key legend, Clip words, Save (PUT `/ocr-regions`,
 server-sanitized, `src_type: human`), and Recompile body (POST
 `/ocr-regions/recompile`, per-page merge through `compose_text`). Verified
-live end-to-end on the 1605 p120 regions. Still open from the full Phase 3
-design: layout templates + outlier chips, diplomatic⇄normalized layers,
-source-compare, review states.
+live end-to-end on the 1605 p120 regions.
+
+**Phase 3 completion SHIPPED on this branch**:
+
+- **Layout templates**: one corrected page's SAVED regions snapshot into a
+  named grid (geometry + roles, no text; `templates.<src>.<name>` in
+  layout.json, GET/PUT/DELETE `/ocr-templates`). Apply stamps a page range
+  (`/ocr-templates/apply`, skip-unless-overwrite), and each stamped region
+  pre-fills its text from the word boxes inside it — stored OCR boxes or the
+  PDF text layer (`clip_words_to_box`) — so template + geometry drafts whole
+  pages. `/ocr-templates/outliers` scores every region page against the grid
+  (mean best-IoU per template region) and flags the pages that broke it.
+- **Diplomatic ⇄ normalized layers**: per-region optional `norm` string;
+  panel toggle edits either layer; "Propose" drafts the normalization
+  mechanically (ſ→s, ligatures, dehyphenation — judgement stays with the
+  human); `compose_text(layer="norm")` falls back per region, and Recompile
+  under the Norm toggle writes `normalized.txt` — the modern-edition text.
+- **Review flag**: `V` toggles the page's `state: verified` (saved with the
+  regions; a machine re-seed clears it). Page strip chips: ✓ verified,
+  ● has regions, ! broke the template grid.
+
+Deliberately NOT built: the 5-state review machine (verified is the one flag
+that earns its keep pre-1.0) and per-region source-compare (Clip words covers
+adopting the geometric variant; a diff view can come with real usage).
 
 ## Phase 4 — `.lib` export and the modernized edition
 

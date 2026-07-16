@@ -2253,14 +2253,21 @@ def api_build_ocr_layout(build_id: str):
                   for src, pages in (meta.get("words") or {}).items()
                   if isinstance(pages, dict)}
     # region_pages mirrors word_pages: which pages have a typed-region record
-    # (fetched individually via /ocr-regions — the records carry full text)
+    # (fetched individually via /ocr-regions — the records carry full text);
+    # region_states carries each page's review flag for the workbench strip
     region_pages = {src: sorted(int(k) for k in pages if str(k).isdigit())
                     for src, pages in (meta.get("regions") or {}).items()
                     if isinstance(pages, dict)}
+    region_states = {
+        src: {k: rec.get("state") for k, rec in pages.items()
+              if isinstance(rec, dict) and rec.get("state")}
+        for src, pages in (meta.get("regions") or {}).items()
+        if isinstance(pages, dict)}
     return jsonify({"ok": True, "images": meta.get("images") or {},
                     "word_pages": word_pages,
                     "word_docs": meta.get("words_doc") or {},
-                    "region_pages": region_pages})
+                    "region_pages": region_pages,
+                    "region_states": {k: v for k, v in region_states.items() if v}})
 
 
 @app.route("/api/builds/<build_id>/ocr-regions")
@@ -2281,6 +2288,7 @@ def api_build_ocr_regions(build_id: str):
         return jsonify({"ok": True, "found": False})
     return jsonify({"ok": True, "found": True, "doc": rec.get("doc") or "",
                     "dims": rec.get("dims") or {},
+                    "state": rec.get("state") or "",
                     "items": rec.get("items") or []})
 
 
@@ -2335,19 +2343,27 @@ def api_build_ocr_regions_put(build_id: str):
         role = str(it.get("role") or "body").lower()
         if not _RW_ROLE_RE.match(role):
             role = "body"
-        items.append({"id": f"r{len(items)}", "role": role,
-                      "src_type": "human", "order": len(items),
-                      "box": {"x": round(x, 5), "y": round(y, 5),
-                              "w": round(w, 5), "h": round(h, 5)},
-                      "text": str(it.get("text") or "")[:20000]})
+        rec = {"id": f"r{len(items)}", "role": role,
+               "src_type": "human", "order": len(items),
+               "box": {"x": round(x, 5), "y": round(y, 5),
+                       "w": round(w, 5), "h": round(h, 5)},
+               "text": str(it.get("text") or "")[:20000]}
+        # the normalized reading layer (long-s resolved, dehyphenated…),
+        # stored only when it exists — compose_text falls back per region
+        norm = str(it.get("norm") or "")[:20000]
+        if norm:
+            rec["norm"] = norm
+        items.append(rec)
     dims = p.get("dims") if isinstance(p.get("dims"), dict) else None
     if dims:
         try:
             dims = {k: int(dims.get(k) or 0) for k in ("w", "h", "dpi")}
         except (TypeError, ValueError, OverflowError):
             dims = None
+    state = "verified" if p.get("state") == "verified" else ""
     _ocr_save_page_regions(build_id, src, page, items, dims,
-                           doc=_ocr_name(str(p.get("doc") or "compiled.txt")))
+                           doc=_ocr_name(str(p.get("doc") or "compiled.txt")),
+                           state=state)
     return jsonify({"ok": True, "count": len(items)})
 
 
@@ -2376,6 +2392,13 @@ def api_build_ocr_regions_recompile(build_id: str):
             only = 0
         if only < 1:
             return jsonify({"ok": False, "error": "bad page"}), 400
+    # layer "norm" composes the normalized reading into ONE explicit target
+    # (default normalized.txt) — the modern-edition text; the default layer
+    # writes each page's diplomatic body into the file its record names
+    layer = "norm" if str(p.get("layer") or "") in ("norm", "normalized") \
+        else "text"
+    target = _ocr_name(str(p.get("target") or "normalized.txt")) \
+        if layer == "norm" else ""
     meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
     pages = (meta.get("regions") or {}).get(src) or {}
     done, docs = 0, set()
@@ -2384,12 +2407,211 @@ def api_build_ocr_regions_recompile(build_id: str):
         n = int(k)
         if not isinstance(rec, dict) or (only is not None and n != only):
             continue
-        doc = _ocr_name(str(rec.get("doc") or "compiled.txt"))
+        doc = target or _ocr_name(str(rec.get("doc") or "compiled.txt"))
         _ocr_merge_page(build_id, doc, n,
-                        layout_roles.compose_text(rec.get("items") or []))
+                        layout_roles.compose_text(rec.get("items") or [],
+                                                  layer=layer))
         docs.add(doc)
         done += 1
     return jsonify({"ok": True, "pages": done, "docs": sorted(docs)})
+
+
+# --- layout templates: recto/verso grids applied across a book -------------------
+
+_RW_TPL_RE = re.compile(r"^[\w\- ]{1,24}$")
+
+
+def _clip_source_words(build_id: str, src: str, pdf, page: int) -> list:
+    """Word boxes usable to pre-fill an applied template's regions: the
+    stored OCR boxes for the page when an engine produced them, else the
+    PDF's own text layer (fitz "words": pixel corners -> 0..1, block/line ->
+    a line id). Best-effort — no words just means empty regions to fill by
+    hand."""
+    meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
+    words = ((meta.get("words") or {}).get(src) or {}).get(str(page))
+    if isinstance(words, list) and words:
+        return words
+    if pdf is None or importlib.util.find_spec("fitz") is None:
+        return []
+    try:
+        with _pdf_doc(pdf) as doc:
+            if page > doc.page_count:
+                return []
+            pg = doc[page - 1]
+            pw, ph = float(pg.rect.width), float(pg.rect.height)
+            if pw <= 0 or ph <= 0:
+                return []
+            out = []
+            lids: dict = {}
+            for x0, y0, x1, y1, text, blk, ln, _wn in pg.get_text("words"):
+                lid = lids.setdefault((blk, ln), len(lids))
+                out.append({"t": text, "l": lid,
+                            "x": x0 / pw, "y": y0 / ph,
+                            "w": max(0.0, (x1 - x0) / pw),
+                            "h": max(0.0, (y1 - y0) / ph)})
+            return out
+    except Exception:
+        return []
+
+
+@app.route("/api/builds/<build_id>/ocr-templates", methods=["GET", "PUT", "DELETE"])
+def api_build_ocr_templates(build_id: str):
+    """Layout templates — hand-press books are grid-stable, so one corrected
+    exemplar page (a recto, a verso) becomes a reusable region grid.
+    GET ?src= lists them; PUT {src?, name, from_page} snapshots the SAVED
+    region record of from_page (geometry + roles, no text); DELETE {src?,
+    name} removes one. Stored in layout.json under templates.<src>.<name>."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    if request.method == "GET":
+        src = _valid_src_key(b, request.args.get("src"))
+        tpls = ((lib.load_json(meta_path, {}).get("templates") or {})
+                .get(src or "primary") or {})
+        return jsonify({"ok": True, "templates": [
+            {"name": name, "items": len(t.get("items") or []),
+             "from_page": t.get("from_page")}
+            for name, t in sorted(tpls.items()) if isinstance(t, dict)]})
+    p = request.get_json(silent=True) or {}
+    src = _valid_src_key(b, p.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    name = str(p.get("name") or "").strip()
+    if not _RW_TPL_RE.match(name):
+        return jsonify({"ok": False, "error": "bad template name"}), 400
+    with _ocr_merge_lock:
+        meta = lib.load_json(meta_path, {})
+        tmap = meta.setdefault("templates", {}).setdefault(src, {})
+        if request.method == "DELETE":
+            tmap.pop(name, None)
+            if not tmap:
+                meta["templates"].pop(src, None)
+            if not meta["templates"]:
+                meta.pop("templates", None)
+            lib.save_json(meta_path, meta)
+            return jsonify({"ok": True})
+        try:
+            from_page = int(p.get("from_page") or 0)
+        except (TypeError, ValueError, OverflowError):
+            from_page = 0
+        rec = ((meta.get("regions") or {}).get(src) or {}).get(str(from_page))
+        if not isinstance(rec, dict) or not rec.get("items"):
+            return jsonify({"ok": False, "error":
+                            "that page has no saved regions"}), 400
+        tmap[name] = {
+            "from_page": from_page,
+            "doc": rec.get("doc") or "",
+            "dims": rec.get("dims") or {},
+            "items": [{"role": it.get("role") or "body",
+                       "order": it.get("order") or i,
+                       "box": it.get("box") or {}}
+                      for i, it in enumerate(rec.get("items") or [])],
+        }
+        lib.save_json(meta_path, meta)
+    return jsonify({"ok": True, "items": len(tmap[name]["items"])})
+
+
+@app.route("/api/builds/<build_id>/ocr-templates/apply", methods=["POST"])
+def api_build_ocr_templates_apply(build_id: str):
+    """Stamp a template's region grid onto a page range. Body: {src?, name,
+    pages: [ints], overwrite?: bool, clip?: bool (default true)}. Pages that
+    already carry a region record are skipped unless overwrite. With clip,
+    each stamped region's text pre-fills from the word boxes inside it
+    (stored OCR boxes, else the PDF text layer) — a template plus word
+    geometry drafts the whole page; the human corrects instead of typing."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    p = request.get_json(silent=True) or {}
+    src = _valid_src_key(b, p.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    name = str(p.get("name") or "").strip()
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    meta = lib.load_json(meta_path, {})
+    tpl = ((meta.get("templates") or {}).get(src) or {}).get(name)
+    if not isinstance(tpl, dict) or not tpl.get("items"):
+        return jsonify({"ok": False, "error": "unknown template"}), 400
+    raw_pages = p.get("pages")
+    if not isinstance(raw_pages, list) or not raw_pages or len(raw_pages) > 500:
+        return jsonify({"ok": False, "error": "bad pages"}), 400
+    pages = []
+    for x in raw_pages:
+        try:
+            n = int(x)
+        except (TypeError, ValueError, OverflowError):
+            return jsonify({"ok": False, "error": "bad pages"}), 400
+        if n < 1:
+            return jsonify({"ok": False, "error": "bad pages"}), 400
+        pages.append(n)
+    overwrite = bool(p.get("overwrite"))
+    clip = p.get("clip") is not False
+    pdf = None
+    if clip:
+        raw = str(b.get("pdf_file") or "") if src == "primary" else next(
+            (s.get("path") for s in (b.get("pdf_sources") or [])
+             if s.get("id") == src), "")
+        pdf = _resolve_local(raw or "")
+    existing = (meta.get("regions") or {}).get(src) or {}
+    applied, skipped, clipped = [], [], []
+    for n in sorted(set(pages)):
+        if not overwrite and str(n) in existing:
+            skipped.append(n)
+            continue
+        items = []
+        words = _clip_source_words(build_id, src, pdf, n) if clip else []
+        for i, t in enumerate(sorted(tpl["items"],
+                                     key=lambda x: x.get("order") or 0)):
+            box = t.get("box") or {}
+            text = layout_roles.clip_words_to_box(words, box) if words else ""
+            items.append({"id": f"r{i}", "role": t.get("role") or "body",
+                          "src_type": "template", "order": i,
+                          "box": box, "text": text})
+        if words and any(it["text"] for it in items):
+            clipped.append(n)
+        _ocr_save_page_regions(build_id, src, n, items,
+                               tpl.get("dims") or None,
+                               doc=_ocr_name(str(tpl.get("doc")
+                                                 or "compiled.txt")))
+        applied.append(n)
+    return jsonify({"ok": True, "applied": applied, "skipped": skipped,
+                    "clipped": clipped})
+
+
+@app.route("/api/builds/<build_id>/ocr-templates/outliers", methods=["POST"])
+def api_build_ocr_templates_outliers(build_id: str):
+    """Score every region page of the source against a template: the pages
+    where the grid broke (plates, chapter openings, errata) are the ones
+    worth a human look. Body: {src?, name, threshold?: 0.5}. Returns {scores:
+    {page: 0..1}, outliers: [pages below threshold]}."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    p = request.get_json(silent=True) or {}
+    src = _valid_src_key(b, p.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    name = str(p.get("name") or "").strip()
+    meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
+    tpl = ((meta.get("templates") or {}).get(src) or {}).get(name)
+    if not isinstance(tpl, dict) or not tpl.get("items"):
+        return jsonify({"ok": False, "error": "unknown template"}), 400
+    try:
+        threshold = min(1.0, max(0.0, float(p.get("threshold") or 0.5)))
+    except (TypeError, ValueError, OverflowError):
+        threshold = 0.5
+    pages = (meta.get("regions") or {}).get(src) or {}
+    scores, outliers = {}, []
+    for k in sorted((k for k in pages if str(k).isdigit()), key=int):
+        rec = pages[k]
+        if not isinstance(rec, dict):
+            continue
+        s = layout_roles.template_score(tpl["items"], rec.get("items") or [])
+        scores[k] = round(s, 3)
+        if s < threshold:
+            outliers.append(int(k))
+    return jsonify({"ok": True, "scores": scores, "outliers": outliers})
 
 
 # --- PDF page rasterization (the OCR tab's side-by-side page view) ---------------
@@ -3366,14 +3588,16 @@ def _ocr_save_page_words(build_id: str, src_key: str, page: int, words: list,
 
 def _ocr_save_page_regions(build_id: str, src_key: str, page: int,
                            regions: list, dims: dict | None,
-                           doc: str = "") -> None:
+                           doc: str = "", state: str = "") -> None:
     """Persist one page's typed regions (ocr/layout.json, {regions: {"<src>":
     {"<page>": {doc, dims, items: [{id, role, box, order, text}]}}}}), boxes
     0..1 like the word sidecar. Unlike word boxes, regions CARRY their run's
     text, so a re-OCR through the region-producing path replaces them and an
     empty list drops the page — stale region text must not outlive its
     transcription. `doc` names the compiled file that run's text landed in;
-    `dims` is the API-reported raster size/dpi (not physical page size)."""
+    `dims` is the API-reported raster size/dpi (not physical page size);
+    `state` is the review flag ("verified" once a human signed the page off —
+    a machine re-seed writes none, so re-OCR naturally un-verifies)."""
     src_key = src_key or "primary"
     meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
     with _ocr_merge_lock:
@@ -3382,8 +3606,10 @@ def _ocr_save_page_regions(build_id: str, src_key: str, page: int,
         rmap = meta.setdefault("regions", {})
         pages = rmap.setdefault(src_key, {})
         if regions:
-            pages[str(int(page))] = {"doc": doc, "dims": dims or {},
-                                     "items": regions}
+            rec = {"doc": doc, "dims": dims or {}, "items": regions}
+            if state:
+                rec["state"] = state
+            pages[str(int(page))] = rec
         else:
             pages.pop(str(int(page)), None)
             if not pages:

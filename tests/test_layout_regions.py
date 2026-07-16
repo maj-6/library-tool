@@ -279,12 +279,202 @@ def test_region_record_dropped_when_its_doc_is_reocred(data_root):
     assert "9" not in (meta.get("regions", {}).get("primary") or {})
 
 
-def test_translate_todo_hash_semantics():
+def _put(client, bid, body):
+    return client.put(f"/api/builds/{bid}/ocr-regions", json=body).get_json()
+
+
+def test_regions_put_sanitizes_and_saves(client, data_root):
+    import libcommon as lib
     import server
-    pages = {1: "alpha", 2: "beta", 3: "gamma", 4: "", 5: "delta"}
-    done = {1: "uno", 2: "dos", 5: "cinco"}
-    recorded = {"1": server._tr_src_hash("alpha"),      # current -> skip
-                "2": server._tr_src_hash("OLD beta")}   # stale  -> redo
-    # 3 untranslated -> todo; 4 blank source -> never; 5 translated pre-hash
-    # (no record) -> counts as current
-    assert server._translate_todo(pages, done, recorded) == [2, 3]
+    bid = "beef12345678"
+    builds = lib.load_json(server.BUILDS_PATH, {})
+    builds[bid] = {"id": bid, "title": "T"}
+    lib.save_json(server.BUILDS_PATH, builds)
+
+    r = _put(client, bid, {"page": 2, "doc": "compiled.txt", "items": [
+        # arrives out of order; order values win
+        {"role": "marginalia", "order": 5,
+         "box": {"x": 0.05, "y": 0.3, "w": 0.1, "h": 0.06}, "text": "note"},
+        {"role": "Body<script>", "order": 1,          # bad role -> body
+         "box": {"x": 0.9, "y": 0.9, "w": 0.5, "h": 0.5}, "text": "clamped"},
+        {"role": "body", "order": 2,
+         "box": {"x": 0.2, "y": 0.2, "w": 0, "h": 0.4}, "text": "dropped"},
+    ]})
+    assert r["ok"] and r["count"] == 2
+    got = client.get(f"/api/builds/{bid}/ocr-regions?page=2").get_json()
+    assert got["found"] and got["doc"] == "compiled.txt"
+    roles = [(i["role"], i["order"], i["src_type"]) for i in got["items"]]
+    assert roles == [("body", 0, "human"), ("marginalia", 1, "human")]
+    b0 = got["items"][0]["box"]
+    assert b0["x"] + b0["w"] <= 1.0 and b0["y"] + b0["h"] <= 1.0  # clamped
+
+    # an empty save drops the record
+    r = _put(client, bid, {"page": 2, "items": []})
+    assert r["ok"] and r["count"] == 0
+    assert not client.get(f"/api/builds/{bid}/ocr-regions?page=2").get_json()["found"]
+
+    assert _put(client, bid, {"page": 0, "items": []})["ok"] is False
+    assert _put(client, bid, {"page": 1, "src": "nope", "items": []})["ok"] is False
+
+
+def test_regions_put_survives_hostile_values(client, data_root):
+    import libcommon as lib
+    import server
+    bid = "abad12345678"
+    builds = lib.load_json(server.BUILDS_PATH, {})
+    builds[bid] = {"id": bid, "title": "T"}
+    lib.save_json(server.BUILDS_PATH, builds)
+
+    # json.loads accepts the non-standard Infinity literal; int(inf) raises
+    # OverflowError, not ValueError — both spots must answer 400/degrade
+    r = client.put(f"/api/builds/{bid}/ocr-regions",
+                   data='{"page": Infinity, "items": []}',
+                   content_type="application/json")
+    assert r.status_code == 400 and r.get_json()["ok"] is False
+
+    r = client.put(
+        f"/api/builds/{bid}/ocr-regions",
+        data='{"page": 4, "dims": {"w": Infinity}, "items": '
+             '[{"role": "body", "order": "x", '
+             '"box": {"x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2}, "text": "a"},'
+             ' {"role": "body", "order": 1, '
+             '"box": {"x": 0.1, "y": 0.4, "w": 0.2, "h": 0.2}, "text": "b"}]}',
+        content_type="application/json")
+    # mixed str/int order must not 500 the sort; Infinity dims degrade to none
+    assert r.status_code == 200 and r.get_json()["count"] == 2
+    got = client.get(f"/api/builds/{bid}/ocr-regions?page=4").get_json()
+    assert got["found"] and got["dims"] == {}
+
+    # a present-but-garbage recompile page refuses instead of silently
+    # widening to every page
+    r = client.post(f"/api/builds/{bid}/ocr-regions/recompile",
+                    json={"page": 0})
+    assert r.status_code == 400
+    r = client.post(f"/api/builds/{bid}/ocr-regions/recompile",
+                    data='{"page": "abc"}', content_type="application/json")
+    assert r.status_code == 400
+    # targeted recompile touches exactly the asked page
+    r = client.post(f"/api/builds/{bid}/ocr-regions/recompile",
+                    json={"page": 4}).get_json()
+    assert r["ok"] and r["pages"] == 1
+
+
+def test_regions_recompile_writes_body_only_text(client, data_root):
+    import libcommon as lib
+    import server
+    bid = "feed12345678"
+    builds = lib.load_json(server.BUILDS_PATH, {})
+    builds[bid] = {"id": bid, "title": "T"}
+    lib.save_json(server.BUILDS_PATH, builds)
+
+    _put(client, bid, {"page": 3, "doc": "compiled.txt", "items": [
+        {"role": "header", "order": 0,
+         "box": {"x": 0.4, "y": 0.05, "w": 0.2, "h": 0.03}, "text": "RUNNING HEAD"},
+        {"role": "body", "order": 1,
+         "box": {"x": 0.2, "y": 0.1, "w": 0.6, "h": 0.6}, "text": "the body text"},
+        {"role": "marginalia", "order": 2,
+         "box": {"x": 0.02, "y": 0.2, "w": 0.1, "h": 0.1}, "text": "a gloss"},
+    ]})
+    r = client.post(f"/api/builds/{bid}/ocr-regions/recompile",
+                    json={}).get_json()
+    assert r["ok"] and r["pages"] == 1 and r["docs"] == ["compiled.txt"]
+    text = (server._entry_dir(bid) / "ocr" / "compiled.txt").read_text(encoding="utf-8")
+    assert "--- page 3 ---" in text
+    assert "the body text" in text
+    assert "a gloss" not in text and "RUNNING HEAD" not in text
+
+
+# --- templates, layers, review states -------------------------------------------
+
+def test_clip_words_to_box_and_iou():
+    words = [
+        {"t": "How", "l": 1, "x": 0.05, "y": 0.30, "w": 0.03, "h": 0.01},
+        {"t": "to", "l": 1, "x": 0.09, "y": 0.30, "w": 0.02, "h": 0.01},
+        {"t": "keepe", "l": 2, "x": 0.05, "y": 0.32, "w": 0.04, "h": 0.01},
+        {"t": "body", "l": 3, "x": 0.50, "y": 0.30, "w": 0.04, "h": 0.01},  # outside
+    ]
+    box = {"x": 0.04, "y": 0.29, "w": 0.10, "h": 0.06}
+    assert layout_roles.clip_words_to_box(words, box) == "How to\nkeepe"
+    assert layout_roles.box_iou(box, box) == 1.0
+    assert layout_roles.box_iou(box, {"x": 0.5, "y": 0.5, "w": 0.1, "h": 0.1}) == 0.0
+    tpl = [{"box": box}]
+    assert layout_roles.template_score(tpl, [{"box": dict(box)}]) == 1.0
+    assert layout_roles.template_score(tpl, []) == 0.0
+
+
+def test_compose_text_norm_layer_falls_back():
+    regions = [
+        {"role": "body", "order": 0, "text": "Waſſer", "norm": "Wasser"},
+        {"role": "body", "order": 1, "text": "unchanged"},
+        {"role": "marginalia", "order": 2, "text": "gloſſe", "norm": "glosse"},
+    ]
+    assert layout_roles.compose_text(regions) == "Waſſer\n\nunchanged"
+    assert layout_roles.compose_text(regions, layer="norm") == "Wasser\n\nunchanged"
+
+
+def test_templates_apply_and_outliers(client, data_root):
+    import libcommon as lib
+    import server
+    bid = "cafe87654321"
+    builds = lib.load_json(server.BUILDS_PATH, {})
+    builds[bid] = {"id": bid, "title": "T"}
+    lib.save_json(server.BUILDS_PATH, builds)
+
+    # an exemplar page: body + margin note, saved and verified
+    _put(client, bid, {"page": 10, "doc": "compiled.txt", "state": "verified",
+                       "items": [
+        {"role": "body", "order": 0,
+         "box": {"x": 0.3, "y": 0.1, "w": 0.55, "h": 0.7}, "text": "body ten",
+         "norm": "body ten (norm)"},
+        {"role": "marginalia", "order": 1,
+         "box": {"x": 0.05, "y": 0.28, "w": 0.12, "h": 0.08}, "text": "gloss"},
+    ]})
+    got = client.get(f"/api/builds/{bid}/ocr-regions?page=10").get_json()
+    assert got["state"] == "verified" and got["items"][0]["norm"]
+    layout = client.get(f"/api/builds/{bid}/ocr-layout").get_json()
+    assert layout["region_states"] == {"primary": {"10": "verified"}}
+
+    # snapshot it as a template (no text), then stamp pages 11-12; page 11
+    # has stored word boxes inside the margin box, so its text pre-fills
+    r = client.put(f"/api/builds/{bid}/ocr-templates",
+                   json={"name": "recto", "from_page": 10}).get_json()
+    assert r["ok"] and r["items"] == 2
+    assert client.get(f"/api/builds/{bid}/ocr-templates").get_json()[
+        "templates"] == [{"name": "recto", "items": 2, "from_page": 10}]
+
+    server._ocr_save_page_words(bid, "primary", 11, [
+        {"t": "Lib", "l": 0, "x": 0.06, "y": 0.30, "w": 0.03, "h": 0.01},
+        {"t": "6.", "l": 0, "x": 0.10, "y": 0.30, "w": 0.02, "h": 0.01},
+    ], doc="tess.txt")
+    r = client.post(f"/api/builds/{bid}/ocr-templates/apply",
+                    json={"name": "recto", "pages": [10, 11, 12]}).get_json()
+    assert r["applied"] == [11, 12] and r["skipped"] == [10]
+    assert r["clipped"] == [11]
+    p11 = client.get(f"/api/builds/{bid}/ocr-regions?page=11").get_json()
+    texts = {i["role"]: i["text"] for i in p11["items"]}
+    assert texts["marginalia"] == "Lib 6." and texts["body"] == ""
+    assert p11["items"][0]["src_type"] == "template"
+    assert p11["state"] == ""            # a stamped page is not verified
+
+    # knock page 12's regions off the grid -> outlier
+    _put(client, bid, {"page": 12, "doc": "compiled.txt", "items": [
+        {"role": "figure", "order": 0,
+         "box": {"x": 0.1, "y": 0.55, "w": 0.8, "h": 0.4}, "text": ""}]})
+    r = client.post(f"/api/builds/{bid}/ocr-templates/outliers",
+                    json={"name": "recto"}).get_json()
+    assert r["ok"] and r["outliers"] == [12]
+    assert r["scores"]["10"] == 1.0 and r["scores"]["11"] == 1.0
+
+    # normalized layer recompiles into its own target
+    r = client.post(f"/api/builds/{bid}/ocr-regions/recompile",
+                    json={"layer": "normalized", "page": 10}).get_json()
+    assert r["ok"] and r["docs"] == ["normalized.txt"]
+    text = (server._entry_dir(bid) / "ocr" / "normalized.txt").read_text(
+        encoding="utf-8")
+    assert "body ten (norm)" in text and "gloss" not in text
+
+    # unknown template and bad name refuse
+    assert client.post(f"/api/builds/{bid}/ocr-templates/apply",
+                       json={"name": "nope", "pages": [1]}).get_json()["ok"] is False
+    assert client.put(f"/api/builds/{bid}/ocr-templates",
+                      json={"name": "../x", "from_page": 10}).status_code == 400

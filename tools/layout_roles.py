@@ -154,15 +154,84 @@ def classify(regions: list[dict]) -> None:
             r["role"] = "marginalia"
 
 
-def compose_text(regions: list[dict]) -> str:
+def compose_text(regions: list[dict], layer: str = "text") -> str:
     """The body flow: every non-furniture region's text in reading order.
     Figure regions keep their place — their block content IS the markdown
     ![id](id) placeholder, so downstream figure-reference rewriting keeps
-    working on the composed text."""
-    parts = [r["text"].strip()
-             for r in sorted(regions, key=lambda r: r.get("order", 0))
-             if r["role"] not in SECONDARY_ROLES and r["text"].strip()]
+    working on the composed text. `layer` picks an alternate text layer per
+    region (e.g. "norm", the human-curated normalized reading), falling back
+    to the diplomatic `text` where the layer is empty — a partially
+    normalized page still composes complete."""
+    def txt(r):
+        if layer != "text":
+            v = str(r.get(layer) or "").strip()
+            if v:
+                return v
+        return str(r.get("text") or "").strip()
+    parts = [txt(r) for r in sorted(regions, key=lambda r: r.get("order", 0))
+             if r["role"] not in SECONDARY_ROLES and txt(r)]
     return "\n\n".join(parts)
+
+
+def box_iou(a: dict, b: dict) -> float:
+    """Intersection-over-union of two {x,y,w,h} boxes (0..1 fractions)."""
+    ax1, ay1 = a["x"] + a["w"], a["y"] + a["h"]
+    bx1, by1 = b["x"] + b["w"], b["y"] + b["h"]
+    iw = min(ax1, bx1) - max(a["x"], b["x"])
+    ih = min(ay1, by1) - max(a["y"], b["y"])
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    inter = iw * ih
+    union = a["w"] * a["h"] + b["w"] * b["h"] - inter
+    return inter / union if union > 0 else 0.0
+
+
+def template_score(tpl_items: list[dict], page_items: list[dict]) -> float:
+    """How well a page's regions fit a layout template: the mean, over the
+    template's regions, of the best IoU any page region achieves against it.
+    1.0 = the grid held; low = the page broke the grid (a plate, a chapter
+    opening) and deserves the human's attention. Geometry only — roles may
+    legitimately differ after reclassification."""
+    if not tpl_items:
+        return 1.0
+    best = [max((box_iou(t.get("box") or {}, p.get("box") or {})
+                 for p in page_items), default=0.0) for t in tpl_items]
+    return sum(best) / len(best)
+
+
+def clip_words_to_box(words: list, box: dict) -> str:
+    """The text of every word box whose centre falls inside `box`, rebuilt
+    into lines: grouped by the OCR engine's line id when present, else by
+    1%-of-page-height bands; lines top-to-bottom, words left-to-right. This
+    is the server-side twin of the workbench's Clip words — what template
+    application uses to pre-fill a region's text from existing geometry."""
+    inside = []
+    for w in words or []:
+        t = str((w or {}).get("t") or "")
+        if not t.strip():
+            continue
+        try:
+            x = float(w.get("x") or 0)
+            y = float(w.get("y") or 0)
+            ww = float(w.get("w") or 0)
+            h = float(w.get("h") or 0)
+        except (TypeError, ValueError):
+            continue
+        cx, cy = x + ww / 2, y + h / 2
+        if (box["x"] <= cx <= box["x"] + box["w"]
+                and box["y"] <= cy <= box["y"] + box["h"]):
+            inside.append((w.get("l"), y, x, t))
+    if not inside:
+        return ""
+    lines: dict = {}
+    for lid, y, x, t in inside:
+        key = lid if isinstance(lid, int) else ("y", round(y * 100))
+        lines.setdefault(key, []).append((y, x, t))
+    out = []
+    for key in sorted(lines, key=lambda k: min(r[0] for r in lines[k])):
+        out.append(" ".join(t for _y, _x, t in sorted(lines[key],
+                                                      key=lambda r: r[1])))
+    return "\n".join(out)
 
 
 def coverage(regions: list[dict], markdown: str) -> float:
