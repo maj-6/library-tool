@@ -56,8 +56,9 @@ SHADOW_PATH = lib.OUTPUT_DIR / "cloud_shadow.json"
 BACKUP_KEEP = 20
 _shadow_lock = threading.Lock()
 
-# corrections has no lock in server.py; syncing adds a second writer, so it
-# brings its own. builds/ia_catalog use the server's locks when run in-process.
+# In-process the server passes its own per-store locks into sync_stores, so
+# sync and route writes serialize on the same lock. This fallback only covers
+# the standalone CLI, where this module is the sole (single-threaded) writer.
 _corrections_lock = threading.Lock()
 
 
