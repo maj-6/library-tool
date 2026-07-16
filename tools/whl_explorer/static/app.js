@@ -8241,12 +8241,17 @@ function anEnsurePolling() {
 
 async function loadAnOverview(b) {
   try {
-    const [s, a] = await Promise.all([
+    const [s, a, f] = await Promise.all([
       fetch(`/api/builds/${b.id}/summary`).then((r) => r.json()),
       fetch(`/api/builds/${b.id}/about`).then((r) => r.json()),
+      fetch(`/api/builds/${b.id}/folder`).then((r) => r.json()).catch(() => ({})),
     ]);
     if (state.anSel !== b.id) return;   // stale response
     el("an-summary").textContent = (s.text || "").trim() || "No summary yet.";
+    // manifest staleness: only an explicit true shows the notice (legacy
+    // artifacts without a manifest row report null)
+    el("an-summary-stale").hidden = !(f.summary && f.summary.stale === true);
+    el("an-about-stale").hidden = !(f.about && f.about.stale === true);
     // don't clobber an in-progress edit with a background refresh
     if (anAboutMd && document.activeElement?.closest?.("#an-about-editor") == null) {
       anAboutMd.set(a.text || "");
@@ -11894,6 +11899,11 @@ function renderOcrDocs() {
     li.textContent = label;
     list.appendChild(li);
   };
+  // manifest staleness: true = an input changed since generation; null/undefined
+  // (no manifest row — legacy artifact) shows nothing
+  const staleMark = (meta) => meta && meta.stale === true
+    ? `<span class="artifact-stale" data-tip="An input changed since this was generated">outdated</span>`
+    : "";
   const textArtifact = (label, kind, name, meta) => {
     const li = document.createElement("li");
     const selected = ocrSelDoc();
@@ -11904,6 +11914,7 @@ function renderOcrDocs() {
     const size = meta && meta.size ? `${Math.max(1, Math.round(meta.size / 1024))}k` : "";
     li.innerHTML = `<span class="tree-ico">${ICONS.text}</span>` +
       `<span class="bi-title">${esc(label)}</span>` +
+      staleMark(meta) +
       `<span class="bi-meta">${esc(size)}</span>`;
     list.appendChild(li);
   };
@@ -11952,6 +11963,7 @@ function renderOcrDocs() {
   }
 
   const ocrDocs = docs.filter((d) => d.buildId === bid && !d.artifactKind);
+  const ocrProv = new Map((folder.ocr || []).map((o) => [o.name, o]));
   header("OCR data", ICONS.text, ocrDocs.length);
   if (!ocrDocs.length) placeholder("No OCR data");
   for (const d of ocrDocs) {
@@ -11960,6 +11972,7 @@ function renderOcrDocs() {
     li.dataset.did = d.id;
     const source = sources.find((s) => s.key === docSrcKey(d));
     li.innerHTML = `<span class="bi-title">${esc(d.name)}</span>` +
+      staleMark(ocrProv.get(d.fileName || d.name)) +
       `<span class="bi-meta">${esc(source ? source.label : "removed source")}</span>`;
     list.appendChild(li);
   }
