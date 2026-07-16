@@ -189,6 +189,41 @@ Phase 0 → 1 → 2 → 3-MVP ship as separate `v0.x-alpha` prereleases per
 `docs/releasing.md` → Release standards. Phase 4 follows once MVP usage shows
 how much machinery templates/style board actually need.
 
-## Phase 0 findings
+## Phase 0 findings (2026-07-15)
 
-*(pending — appended when the validation run completes)*
+Probe run: `tools/ocr_blocks_probe.py`, 19 pages across four scans — *The
+Haven of Health* (1605, blackletter + roman marginalia), Boerhaave *Materia
+Medica* (1741) and *Libellus* (1755, long-s roman), *Flora Rustica* (1792,
+engraved plates). `mistral-ocr-latest` accepted `include_blocks` and returned
+typed pixel-coordinate blocks plus `dimensions` on every page.
+
+**Verdict: the middle row of the outcome table — boxes good, types only
+partially reliable. Proceed with Phase 1, geometry-first.**
+
+- **Geometry is excellent on all four eras.** On the hardest page (1605
+  blackletter body with four roman margin notes): every margin note came back
+  as its own tightly-fitted block, body paragraphs and chapter headings as
+  separate blocks, running title and page number typed `header` — through
+  heavy show-through and gutter shadow. A two-column index page returned 64
+  per-entry blocks in correct column-major reading order. An engraved plate
+  returned one `image` block (+ figure crop with bbox), and its tiny engraved
+  imprint line was caught as `footer`.
+- **Block `content` is cleanly separated**: body blocks exclude the margin
+  text; the margin blocks contain exactly the notes. The same page's
+  `markdown` — what `compiled.txt` stores today — interleaves the notes as
+  anonymous paragraphs mid-body, confirming blocks fix the dirty-text problem
+  at the source.
+- **Types are the weak half.** `header`/`footer`/`title`/`image` fired
+  reliably. `aside_text` never fired: marginalia, catchwords, and the like all
+  arrive typed `text`; *Flora Rustica* text pages came back typed
+  `references`. So Phase 1's role mapping treats the Mistral type as a hint
+  and assigns roles geometrically — which the block geometry makes nearly
+  trivial (on the 1605 page a single x-threshold separates the margin column;
+  the index catchword was already an isolated bottom-right block).
+- **Reading order interleaves margin notes at their vertical anchor
+  position** — free anchoring hints for margin-note ↔ body association.
+- `dimensions.dpi` was 200 for a 1400-px raster — synthetic, as assumed;
+  physical size must come from the PDF MediaBox or the human.
+- Transcription on 1605 blackletter is good but not clean (long-s/æ
+  confusions, drop-cap misreads like "O Menges" for "Orenges" — the drop cap
+  lives inside its body block); the 1700s pages are near-perfect.
