@@ -70,6 +70,25 @@ async function hydrateSecrets() {
   }
 }
 
+// Persist personal service credentials through the same loopback-only endpoint
+// used by Settings. Normal settings deliberately exclude SECRET_KEYS, so a
+// wizard must never rely on saveSettings() for these values.
+async function persistSecrets(updates) {
+  const clean = {};
+  for (const [k, value] of Object.entries(updates || {})) {
+    if (!SECRET_KEYS.has(k)) continue;
+    clean[k] = String(value || "").trim();
+  }
+  if (!Object.keys(clean).length) return;
+  const res = await fetch("/api/secrets", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ updates: clean }),
+  });
+  if (!res.ok) throw new Error(`credential save failed (HTTP ${res.status})`);
+  for (const [k, value] of Object.entries(clean)) state.settings[k] = value;
+}
+
 // `categories` left this list with the taxonomy overhaul: assignments are
 // category_ids lists handled by the chip pickers, not looped text inputs.
 const MANUAL_FIELDS = [
@@ -145,7 +164,7 @@ const state = {
   msrcTarget: null,
   mdTarget: null,             // markdown overlay target textarea
   settings: {
-    checkedCols: {}, showCatalog: false,
+    checkedCols: {}, showCatalog: true,
     markFilter: "ALL", srcFilter: "ALL", dlFilter: "ALL",
     yearFrom: null, yearTo: null,   // inclusive year-range filter (both tables)
     // Open Library search constraints (title=verbatim; also toggled by Ctrl+click
@@ -153,7 +172,7 @@ const state = {
     searchCons: { author: true, year: true },
     autoIaDownload: true,           // background-download an IA PDF when a source is found
     topTable: "checked", bottomActive: 0,
-    whlMode: "edit", checkedMode: "edit",
+    whlMode: "search", checkedMode: "search",
     // "" is the retired Classic CAD id; applyTheme() migrates it to DEFAULT_THEME
     paneWidth: null, theme: "", font: "", fontUi: "", fontMono2: "",
     aiBase: "", aiModel: "", aiKey: "", aiInstructions: "",
@@ -920,6 +939,10 @@ function applyUiScale() {
   document.documentElement.style.setProperty("--ui-scale", String(s));
   const sel = el("ui-scale-select");
   if (sel) sel.value = String(s);
+  // CSS zoom changes the width available to fixed-layout tables without
+  // reliably producing a window resize event. Re-run their stretch-column
+  // calculation after the browser has applied the new scale.
+  scheduleTableChromeRefresh();
 }
 function setUiScale(v) {
   state.settings.uiScale =
@@ -1317,23 +1340,27 @@ function maybeAuthPrompt() {
 // Shown once, on the desktop shell's first launch (the installer stays dumb;
 // the app is where keys, Tesseract and the big optional downloads make sense).
 // Re-openable any time from Help > Setup guide. Every step is skippable, and
-// everything it sets lives in the same settings the Settings window edits.
+// everything it sets remains available from the Settings window.
 
 // No cloud-keys step: the app ships knowing its own cloud (the server bakes
 // in the project URL + public anon key), so accounts just work. The service
-// key is an owner concern and lives in Settings > Sync.
+// key is an owner concern and stays out of this normal-user flow.
 const WIZ_STEPS = [
   ["welcome", "WELCOME"],
-  ["account", "YOUR NAME"],
-  ["ocr", "OCR"],
+  ["account", "PROFILE"],
+  ["services", "TEXT TOOLS"],
   ["db", "OFFLINE SEARCH"],
   ["done", "READY"],
 ];
 let wizStep = 0;
 let wizDbTimer = null;
+let wizSecretsLoad = null;
 
 function showWizard() {
   wizStep = 0;
+  // Start this while the user reads the first steps. When they reach Text
+  // tools, existing keys can be shown without a visible loading pause.
+  wizSecretsLoad = hydrateSecrets();
   el("wizard-overlay").hidden = false;
   wizRender();
 }
@@ -1348,19 +1375,39 @@ function closeWizard(markDone) {
   el("wizard-overlay").hidden = true;
 }
 
-// values are committed when leaving a step, so Back/Next/Finish all keep work
-function wizCommit() {
+// Values are committed when leaving a step, so Back/Next/Finish all keep work.
+// Credentials use /api/secrets; saveSettings intentionally strips them.
+async function wizCommit() {
   const step = WIZ_STEPS[wizStep][0];
   if (step === "account") {
     state.settings.userName = el("wiz-name").value.trim().slice(0, 60);
     const un = el("set-user-name");
     if (un) un.value = state.settings.userName;
-  } else if (step === "ocr") {
-    state.settings.mistralKey = el("wiz-mistral").value.trim();
+    saveSettings();
+  } else if (step === "services") {
+    const fields = [["wiz-mistral", "mistralKey"], ["wiz-deepseek", "aiKey"]];
+    const updates = {};
+    for (const [id, key] of fields) {
+      const value = el(id).value.trim();
+      if (value !== String(state.settings[key] || "")) updates[key] = value;
+    }
+    if (!Object.keys(updates).length) return true;
+    const msg = el("wiz-keys-msg");
+    msg.textContent = "Saving API keys…";
+    msg.classList.remove("err");
+    try {
+      await persistSecrets(updates);
+      msg.textContent = "API keys saved.";
+    } catch (e) {
+      msg.textContent = "Could not save API keys. Try again, or leave them blank and continue.";
+      msg.classList.add("err");
+      statusErr("SETUP :: COULD NOT SAVE API KEYS");
+      return false;
+    }
   } else {
-    return;
+    return true;
   }
-  saveSettings();
+  return true;
 }
 
 function wizRender() {
@@ -1369,17 +1416,33 @@ function wizRender() {
     p.hidden = p.dataset.step !== step;
   }
   el("wizard-title").textContent = title;
-  el("wizard-step").textContent = `${wizStep + 1} / ${WIZ_STEPS.length}`;
+  el("wizard-step").textContent = `Step ${wizStep + 1} of ${WIZ_STEPS.length}`;
+  el("wizard-progress").value = wizStep + 1;
   el("wizard-back").disabled = wizStep === 0;
-  el("wizard-next").textContent = wizStep === WIZ_STEPS.length - 1 ? "Finish" : "Next";
+  el("wizard-next").textContent = wizStep === WIZ_STEPS.length - 1 ? "Start" : "Next";
   el("wizard-skip").hidden = wizStep === WIZ_STEPS.length - 1;
   clearTimeout(wizDbTimer);
   wizDbTimer = null;
   if (step === "account") {
     el("wiz-name").value = state.settings.userName || "";
     wizAccountState();
-  } else if (step === "ocr") {
-    el("wiz-mistral").value = state.settings.mistralKey || "";
+  } else if (step === "services") {
+    const fields = [["wiz-mistral", "mistralKey"], ["wiz-deepseek", "aiKey"]];
+    for (const [id, key] of fields) {
+      const input = el(id);
+      delete input.dataset.edited;
+      input.value = state.settings[key] || "";
+    }
+    el("wiz-keys-msg").textContent = "";
+    // A slow profile refresh must not overwrite a key the user has started
+    // typing. The input listener in initWizard marks touched fields.
+    (wizSecretsLoad || hydrateSecrets()).then((secrets) => {
+      if (WIZ_STEPS[wizStep][0] !== "services") return;
+      for (const [id, key] of fields) {
+        const input = el(id);
+        if (!input.dataset.edited) input.value = secrets[key] || "";
+      }
+    });
     wizCheckTesseract();
   } else if (step === "db") {
     wizDbTick();
@@ -1443,7 +1506,7 @@ async function wizDbTick() {
     } else if (t.present) {
       stateHtml = `<span class="tool-label wiz-tess-ok">downloaded (${wizBytes(t.size)})</span>`;
     } else if (!t.url) {
-      stateHtml = `<span class="tool-label">no URL set — see Settings &gt; Sync</span>`;
+      stateHtml = `<span class="tool-label">no URL set — see Settings &gt; Integrations</span>`;
     } else {
       stateHtml = `<button class="cad-btn" data-wizdl="${esc(name)}" type="button">Download</button>`;
     }
@@ -1457,18 +1520,32 @@ async function wizDbTick() {
 }
 
 function initWizard() {
-  el("wizard-next").onclick = () => {
-    wizCommit();
-    if (wizStep >= WIZ_STEPS.length - 1) { closeWizard(true); return; }
-    wizStep++;
-    wizRender();
+  el("wizard-next").onclick = async () => {
+    const button = el("wizard-next");
+    button.disabled = true;
+    try {
+      if (!(await wizCommit())) return;
+      if (wizStep >= WIZ_STEPS.length - 1) { closeWizard(true); return; }
+      wizStep++;
+      wizRender();
+    } finally {
+      button.disabled = false;
+    }
   };
-  el("wizard-back").onclick = () => {
-    wizCommit();
-    if (wizStep > 0) { wizStep--; wizRender(); }
+  el("wizard-back").onclick = async () => {
+    const button = el("wizard-back");
+    button.disabled = true;
+    try {
+      if (!(await wizCommit())) return;
+      if (wizStep > 0) { wizStep--; wizRender(); }
+    } finally {
+      button.disabled = false;
+    }
   };
-  el("wizard-skip").onclick = () => { wizCommit(); closeWizard(true); };
+  el("wizard-skip").onclick = async () => { await wizCommit(); closeWizard(true); };
   el("wiz-signin").onclick = () => showAuthOverlay();   // z 62, above the wizard
+  for (const id of ["wiz-mistral", "wiz-deepseek"])
+    el(id).addEventListener("input", () => { el(id).dataset.edited = "1"; });
   el("wiz-db-list").addEventListener("click", async (ev) => {
     const b = ev.target.closest("[data-wizdl]");
     if (!b) return;
@@ -1782,13 +1859,22 @@ function showTip(text, x, y) {
   if (!text) { tip.hidden = true; return; }
   tip.textContent = text;
   tip.hidden = false;
-  const pad = 14;
+  // Root CSS zoom scales fixed-position offsets as well as the tooltip itself,
+  // while pointer coordinates and viewport bounds remain in visual pixels.
+  // Measure at a stable origin, do all collision work in visual pixels, then
+  // convert the final position back to the root's pre-zoom coordinate space.
+  tip.style.left = "0px";
+  tip.style.top = "0px";
   const r = tip.getBoundingClientRect();
+  const scale = Math.max(0.01, Number(state.settings.uiScale) || 1);
+  const pad = 14 * scale, edge = 8 * scale;
   let left = x + pad, top = y + pad;
-  if (left + r.width > innerWidth - 8) left = Math.max(8, innerWidth - r.width - 8);
-  if (top + r.height > innerHeight - 8) top = Math.max(8, y - r.height - pad);
-  tip.style.left = left + "px";
-  tip.style.top = top + "px";
+  if (left + r.width > innerWidth - edge)
+    left = Math.max(edge, innerWidth - r.width - edge);
+  if (top + r.height > innerHeight - edge)
+    top = Math.max(edge, y - r.height - pad);
+  tip.style.left = (left / scale) + "px";
+  tip.style.top = (top / scale) + "px";
 }
 function hideTip() { el("cad-tooltip").hidden = true; }
 
@@ -1861,6 +1947,26 @@ function tableDef(key) {
       } : null;
     }
   }
+}
+
+// Table widths depend on the space left after the side panes and UI scale are
+// applied. Coalesce layout-affecting changes into one animation-frame pass so
+// splitter drags remain smooth while every visible table stays flush with its
+// pane.
+let tableChromeRefreshFrame = null;
+function refreshVisibleTableChrome() {
+  applyTableChrome(state.settings.topTable === "whl" ? "whl" : "checked");
+  applyTableChrome("upload");
+  if (state.settings.showCatalog)
+    applyTableChrome("b-" + activeBottomTable());
+}
+function scheduleTableChromeRefresh() {
+  if (tableChromeRefreshFrame !== null)
+    cancelAnimationFrame(tableChromeRefreshFrame);
+  tableChromeRefreshFrame = requestAnimationFrame(() => {
+    tableChromeRefreshFrame = null;
+    refreshVisibleTableChrome();
+  });
 }
 
 function colKeyAt(def, i) {
@@ -7374,15 +7480,26 @@ function pollDownload(identifier) {
   state.dlTimers.set(identifier, t);
 }
 
+// One eligibility contract for both the toolbar's batch action and the
+// automatic action after a user approves an IA match. A rejected automatic
+// match with a manually supplied IA URL remains eligible for the batch action.
+function iaDownloadCandidate(row, verdict) {
+  const current = verdict == null ? getVerify(row, "internet_archive") : verdict;
+  const ia = row && row.scans && row.scans.internet_archive;
+  const eligible = (current === "approved" && ia && ia.available === true) ||
+    (current === "rejected" && getManualUrl(row, "internet_archive"));
+  if (!eligible) return null;
+  return { ident: iaIdentifierForRow(row), book: row.book || {} };
+}
+
 async function downloadApproved() {
-  const approved = combinedRows().filter((r) =>
-    (getVerify(r, "internet_archive") === "approved" &&
-      r.scans && r.scans.internet_archive && r.scans.internet_archive.available === true) ||
-    (getVerify(r, "internet_archive") === "rejected" && getManualUrl(r, "internet_archive")));
+  const approved = combinedRows().map((row) => ({
+    row, candidate: iaDownloadCandidate(row),
+  })).filter((item) => item.candidate);
   if (!approved.length) { status("NO VERIFIED IA SOURCES"); return; }
   let started = 0, saved = 0, noIa = 0;
-  for (const row of approved) {
-    const ident = iaIdentifierForRow(row);
+  for (const { row, candidate } of approved) {
+    const { ident } = candidate;
     if (!ident) { noIa += 1; continue; }
     if (state.downloadedIds.has(ident)) { saved += 1; continue; }
     const dl = state.downloads.get(ident);
@@ -7403,13 +7520,17 @@ const AUTO_DL_MAX = 2;
 // enqueue one background download (deduped); the single entry point so every
 // caller (auto-scan + viewer fallback) shares the AUTO_DL_MAX cap + accounting
 function enqueueAutoDl(ident, book) {
-  if (!ident) return;
-  if (state.downloadedIds.has(ident)) return;       // already saved
-  if (state.downloads.get(ident)) return;           // already known (in-flight/errored)
-  if (state.autoDlActive.has(ident)) return;
-  if (state.autoDlQueue.some((q) => q.ident === ident)) return;
+  if (!ident) return false;
+  if (state.downloadedIds.has(ident)) return false;       // already saved
+  const known = state.downloads.get(ident);
+  // An error is retryable: the server replaces errored jobs safely under its
+  // download lock. Only terminal success and active work are duplicates.
+  if (known && (known.status === "downloading" || known.status === "done")) return false;
+  if (state.autoDlActive.has(ident)) return false;
+  if (state.autoDlQueue.some((q) => q.ident === ident)) return false;
   state.autoDlQueue.push({ ident, book: book || {} });
   pumpAutoDl();
+  return true;
 }
 
 function maybeAutoDownloadIa(row) {
@@ -7419,13 +7540,21 @@ function maybeAutoDownloadIa(row) {
   enqueueAutoDl(iaIdentifierForRow(row), row.book || {});
 }
 
+function maybeAutoDownloadVerifiedIa(row, verdict = "approved") {
+  if (!state.settings.autoIaDownload) return false;
+  const candidate = iaDownloadCandidate(row, verdict);
+  if (!candidate || !candidate.ident) return false;
+  return enqueueAutoDl(candidate.ident, candidate.book);
+}
+
 function pumpAutoDl() {
   // disabling the setting mid-run abandons anything still queued
   if (!state.settings.autoIaDownload) { state.autoDlQueue = []; updateDlProgress(); return; }
   while (state.autoDlActive.size < AUTO_DL_MAX && state.autoDlQueue.length) {
     const { ident, book } = state.autoDlQueue.shift();
+    const known = (state.downloads.get(ident) || {}).status;
     if (state.downloadedIds.has(ident) || state.autoDlActive.has(ident) ||
-        (state.downloads.get(ident) || {}).status === "downloading") continue;
+        known === "downloading" || known === "done") continue;
     state.autoDlActive.add(ident);
     startDownload(ident, book);   // pollDownload's terminal state pumps the next
   }
@@ -7540,28 +7669,36 @@ function scanStatusLine(scans) {
 
 async function setVerify(id, source, verdict, track = true) {
   const row = state.rowsById.get(String(id));
-  if (!row) return;
+  if (!row) return false;
   if (row.kind === "manual") {
     const prior = getVerify(row, source);
     const priorUrl = getManualUrl(row, source);
-    const res = await fetch(`/api/manual/${encodeURIComponent(id)}/verify`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ source, state: verdict }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (data.ok) {
-      const i = state.manual.findIndex((x) => x.id === id);
-      if (i >= 0) state.manual[i] = data.entry;
-      if (track) {
-        pushOp(`verify ${source} ${verdict} on ${row.book.title.slice(0, 30)}`,
-          async () => {
-            await setVerify(id, source, prior, false);
-            if (priorUrl) await setManualUrl(id, source, priorUrl, false);
-          },
-          () => setVerify(id, source, verdict, false),
-          { kind: "manual-verify", id, source, before: prior, beforeUrl: priorUrl });
-      }
+    let res, data;
+    try {
+      res = await fetch(`/api/manual/${encodeURIComponent(id)}/verify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source, state: verdict }),
+      });
+      data = await res.json().catch(() => ({}));
+    } catch (e) {
+      statusErr(`${source.toUpperCase()} MATCH COULD NOT BE SAVED`);
+      return false;
+    }
+    if (!res.ok || !data.ok || !data.entry) {
+      statusErr(`${source.toUpperCase()} MATCH COULD NOT BE SAVED`);
+      return false;
+    }
+    const i = state.manual.findIndex((x) => x.id === id);
+    if (i >= 0) state.manual[i] = data.entry;
+    if (track) {
+      pushOp(`verify ${source} ${verdict} on ${row.book.title.slice(0, 30)}`,
+        async () => {
+          await setVerify(id, source, prior, false);
+          if (priorUrl) await setManualUrl(id, source, priorUrl, false);
+        },
+        () => setVerify(id, source, verdict, false),
+        { kind: "manual-verify", id, source, before: prior, beforeUrl: priorUrl });
     }
   } else {
     const entry = state.checked.get(id);
@@ -7584,6 +7721,12 @@ async function setVerify(id, source, verdict, track = true) {
   renderChecked();
   const names = { whl: "WHL", internet_archive: "IA", hathitrust: "HT" };
   status(`${names[source] || source} MATCH ${verdict.toUpperCase()} :: ${row.book.title}`);
+  if (source === "internet_archive" && verdict === "approved") {
+    // renderChecked refreshes rowsById; use that row when available so the
+    // download sees the persisted verdict and latest scan metadata.
+    maybeAutoDownloadVerifiedIa(state.rowsById.get(String(id)) || row, verdict);
+  }
+  return true;
 }
 
 function cycleVerify(id, source) {
@@ -13310,6 +13453,28 @@ function decorateOcrPages() {
   });
 }
 
+function selectOcrDocument(id) {
+  ocrSyncEditor();
+  const prev = ocrSelDoc();
+  ocrState.sel = id;
+  const d = ocrSelDoc();
+  // Page view + same book: keep the loaded page images and swap only the text
+  // alongside them (don't tear down and re-fetch the PDF).
+  const sameBook = ocrState.view === "pdf" && d && prev && d.buildId &&
+    d.buildId === prev.buildId && el("ocr-pages").querySelector(".ocr-pgrow");
+  if (sameBook && refillOcrPageText(d)) {
+    // the views now hold THIS doc — a later re-render (the OCR-job poller)
+    // must see it as the same doc, or it tears the page view down
+    ocrState.lastRendered = d.id;
+    renderOcrDocs();   // refresh the docs-list active highlight only
+    // Analysis has its own facsimile tree. The page-view refill above does not
+    // touch it, so refresh it explicitly before taking this optimized return.
+    renderAnFacsimile();
+    return;
+  }
+  renderOcrTab();
+}
+
 function initOcrTab() {
   el("ocr-load-file").addEventListener("click", () => el("ocr-file-input").click());
   el("ocr-file-input").addEventListener("change", () => {
@@ -13364,22 +13529,7 @@ function initOcrTab() {
     }
     const li = ev.target.closest("li.ocr-doc");
     if (!li) return;
-    ocrSyncEditor();
-    const prev = ocrSelDoc();
-    ocrState.sel = li.dataset.did;
-    const d = ocrSelDoc();
-    // Page view + same book: keep the loaded page images and swap only the text
-    // alongside them (don't tear down and re-fetch the PDF).
-    const sameBook = ocrState.view === "pdf" && d && prev && d.buildId &&
-      d.buildId === prev.buildId && el("ocr-pages").querySelector(".ocr-pgrow");
-    if (sameBook && refillOcrPageText(d)) {
-      // the views now hold THIS doc — a later re-render (the OCR-job poller)
-      // must see it as the same doc, or it tears the page view down
-      ocrState.lastRendered = d.id;
-      renderOcrDocs();   // refresh the docs-list active highlight only
-      return;
-    }
-    renderOcrTab();
+    selectOcrDocument(li.dataset.did);
   });
   el("ocr-view-edit").addEventListener("click", () => setOcrView("edit"));
   el("ocr-view-diff").addEventListener("click", () => setOcrView("diff"));
@@ -14183,6 +14333,7 @@ function init() {
       if (!dragging) return;
       const left = pane.getBoundingClientRect().left;
       pane.style.width = Math.min(760, Math.max(260, ev.clientX - left)) + "px";
+      scheduleTableChromeRefresh();
     });
     document.addEventListener("mouseup", () => {
       if (!dragging) return;
@@ -14190,6 +14341,7 @@ function init() {
       document.body.classList.remove("resizing");
       state.settings.paneWidth = parseInt(pane.style.width, 10) || null;
       saveSettings();
+      scheduleTableChromeRefresh();
     });
   })();
 
@@ -14534,7 +14686,10 @@ function init() {
   document.addEventListener("keydown", (ev) => {
     if (ev.key !== "Escape") return;
     if (!el("auth-overlay").hidden) hideAuthOverlay();   // topmost (z 62)
-    else if (!el("wizard-overlay").hidden) { wizCommit(); closeWizard(true); }   // Esc = skip, typed fields kept
+    else if (!el("wizard-overlay").hidden) {
+      // Esc = set up later. Keep anything typed before recording completion.
+      wizCommit().finally(() => closeWizard(true));
+    }
     else if (!el("attn-pop").hidden) closeAttnPop();
     else if (!el("fb-overlay").hidden) closeFileBrowser();
     else if (!el("pdfm-overlay").hidden) closePdfModal();
@@ -14552,9 +14707,7 @@ function init() {
     fitTitleBar();        // cheap; must not wait for the debounce
     clearTimeout(rzTimer);
     rzTimer = setTimeout(() => {
-      applyTableChrome(state.settings.topTable === "whl" ? "whl" : "checked");
-      applyTableChrome("upload");
-      applyTableChrome("b-" + activeBottomTable());
+      refreshVisibleTableChrome();
     }, 120);
   });
 

@@ -514,6 +514,7 @@ def _push_events_once() -> None:
             continue               # `[1]` or `"x"` would AttributeError below
         ev = {"actor": str(r.get("actor") or "")[:60], "actor_id": ses["user_id"],
               "verb": str(r.get("verb") or ""), "subject": str(r.get("subject") or "")}
+        ev["detail"] = str(r.get("detail") or "")[:200]
         try:
             ev["n"] = int(r.get("n") or 1)
         except (ValueError, TypeError):
@@ -572,14 +573,15 @@ def _cloud_events(limit: int) -> list[dict] | None:
         return None
     try:
         rows = sauth.rest(cfg, ses["access_token"], "GET",
-                          "events?select=at,actor,verb,subject,n"
+                          "events?select=at,actor,verb,subject,n,detail"
                           f"&order=at.desc&limit={int(limit)}", timeout=8.0) or []
     except sauth.AuthError as exc:
         log.warning("cloud feed unavailable: %s", exc)
         _cloud_feed_cache["fail_at"] = now
         return None
     out = [{"ts": r.get("at"), "actor": r.get("actor"), "verb": r.get("verb"),
-            "subject": r.get("subject"), "n": r.get("n")} for r in rows]
+            "subject": r.get("subject"), "n": r.get("n"),
+            "detail": r.get("detail") or ""} for r in rows]
     _cloud_feed_cache.update(at=now, rows=out)
     return out
 

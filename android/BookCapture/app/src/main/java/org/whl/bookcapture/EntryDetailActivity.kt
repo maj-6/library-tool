@@ -7,6 +7,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import androidx.work.WorkManager
@@ -15,6 +16,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.whl.bookcapture.databinding.ActivityEntryDetailBinding
+import org.whl.bookcapture.databinding.DialogDeepseekInstructionsBinding
 
 /** One recent scan, in full: extracted record, pages, OCR text, status. */
 class EntryDetailActivity : AppCompatActivity() {
@@ -23,13 +25,14 @@ class EntryDetailActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityEntryDetailBinding
     private var photoJob: Job? = null
-    private var instructionsLoadedFor: String? = null
+    private var instructionsDialog: AlertDialog? = null
+    private var instructionsDialogBinding: DialogDeepseekInstructionsBinding? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityEntryDetailBinding.inflate(layoutInflater)
         setContentView(binding.root)
-        binding.resubmit.setOnClickListener { resubmit() }
+        binding.deepseekInstructions.setOnClickListener { showDeepseekInstructions() }
         WorkManager.getInstance(this)
             .getWorkInfosForUniqueWorkLiveData("capture-process")
             .observe(this) { render() }
@@ -38,6 +41,14 @@ class EntryDetailActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         render()
+    }
+
+    override fun onDestroy() {
+        photoJob?.cancel()
+        instructionsDialog?.dismiss()
+        instructionsDialog = null
+        instructionsDialogBinding = null
+        super.onDestroy()
     }
 
     private fun render() {
@@ -72,18 +83,7 @@ class EntryDetailActivity : AppCompatActivity() {
         val ocr = entry.ocrText()
         binding.ocrText.text = ocr.ifEmpty { getString(R.string.detail_no_ocr) }
 
-        if (instructionsLoadedFor != entry.id && !binding.customInstructions.hasFocus()) {
-            binding.customInstructions.setText(entry.customInstructions())
-            instructionsLoadedFor = entry.id
-        }
-        val pending = entry.reprocessPending()
-        val error = entry.reprocessError()
-        binding.resubmit.isEnabled = !pending
-        binding.reprocessState.text = when {
-            pending -> getString(R.string.detail_reprocessing)
-            error.isNotEmpty() -> getString(R.string.detail_reprocess_error, error)
-            else -> ""
-        }
+        renderDeepseekDialog(entry)
 
         // pages, decoded off the UI thread at thumbnail scale. Cancel any decode
         // still running from a previous render (a second onResume) so its views
@@ -115,7 +115,44 @@ class EntryDetailActivity : AppCompatActivity() {
         }
     }
 
-    private fun resubmit() {
+    private fun showDeepseekInstructions() {
+        if (instructionsDialog?.isShowing == true) return
+        val entry = Entries.find(this, intent.getStringExtra(EXTRA_ID) ?: "") ?: return
+        val dialogBinding = DialogDeepseekInstructionsBinding.inflate(layoutInflater)
+        dialogBinding.customInstructions.setText(entry.customInstructions())
+        dialogBinding.customInstructions.setSelection(dialogBinding.customInstructions.length())
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.detail_deepseek_instructions)
+            .setView(dialogBinding.root)
+            .setNegativeButton(R.string.close, null)
+            .create()
+        instructionsDialog = dialog
+        instructionsDialogBinding = dialogBinding
+        dialogBinding.resubmit.setOnClickListener {
+            resubmit(dialogBinding.customInstructions.text?.toString().orEmpty())
+        }
+        dialog.setOnDismissListener {
+            instructionsDialog = null
+            instructionsDialogBinding = null
+        }
+        renderDeepseekDialog(entry)
+        dialog.show()
+    }
+
+    private fun renderDeepseekDialog(entry: Entries.Entry) {
+        val dialogBinding = instructionsDialogBinding ?: return
+        val pending = entry.reprocessPending()
+        val error = entry.reprocessError()
+        dialogBinding.resubmit.isEnabled = !pending
+        dialogBinding.reprocessState.text = when {
+            pending -> getString(R.string.detail_reprocessing)
+            error.isNotEmpty() -> getString(R.string.detail_reprocess_error, error)
+            else -> ""
+        }
+    }
+
+    private fun resubmit(customInstructions: String) {
         val entry = Entries.find(this, intent.getStringExtra(EXTRA_ID) ?: "") ?: return
         if (Prefs.deepseekKey(this).isEmpty()) {
             Toast.makeText(this, R.string.detail_need_deepseek, Toast.LENGTH_LONG).show()
@@ -125,7 +162,7 @@ class EntryDetailActivity : AppCompatActivity() {
             Toast.makeText(this, R.string.detail_need_ocr, Toast.LENGTH_LONG).show()
             return
         }
-        entry.setCustomInstructions(binding.customInstructions.text.toString())
+        entry.setCustomInstructions(customInstructions)
         entry.requestReprocess()
         Prefs.setLastProcError(this, null)
         ProcessWorker.enqueue(this, entry.id)

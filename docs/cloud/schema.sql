@@ -439,8 +439,11 @@ create table if not exists events (
   actor_id uuid references auth.users on delete set null,
   verb     text not null,
   subject  text not null,
-  n        int not null default 1
+  n        int not null default 1,
+  detail   text not null default ''
 );
+-- Existing installations predate the expandable event detail field.
+alter table events add column if not exists detail text not null default '';
 create index if not exists events_at_idx on events (at desc);
 create index if not exists events_actor_id_idx on events (actor_id);
 

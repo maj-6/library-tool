@@ -106,3 +106,36 @@ def test_publish_preview_matches_online_record_shape_and_supports_sets():
 def test_ocr_verified_filter_includes_published_entries():
     body = _function("ocrBookList", "ocrBookPdf")
     assert "!anAnalyzable(b)" in body
+
+
+def test_catalog_defaults_to_open_search_workspace_without_overwriting_saved_view():
+    defaults = APP.split("settings: {", 1)[1].split("sort:", 1)[0]
+    assert "checkedCols: {}, showCatalog: true" in defaults
+    assert 'whlMode: "search", checkedMode: "search"' in defaults
+
+    load = _function("loadSettings", "normalizeSettings")
+    assert "Object.assign(state.settings, s, v)" in load
+    for key in ("showCatalog", "whlMode", "checkedMode"):
+        assert f'"{key}"' in APP.split("const VIEW_STATE_KEYS", 1)[1].split("]);", 1)[0]
+
+
+def test_table_chrome_reflows_after_scale_and_catalog_side_panel_changes():
+    scale = _function("applyUiScale", "setUiScale")
+    assert "scheduleTableChromeRefresh()" in scale
+
+    refresh = _function("refreshVisibleTableChrome", "scheduleTableChromeRefresh")
+    assert 'applyTableChrome(state.settings.topTable === "whl" ? "whl" : "checked")' in refresh
+    assert 'applyTableChrome("b-" + activeBottomTable())' in refresh
+
+    splitter = APP.split("// resizable left panel", 1)[1].split(
+        "// resizable approved-sources pane", 1)[0]
+    assert splitter.count("scheduleTableChromeRefresh()") >= 2
+
+
+def test_tooltip_geometry_converts_visual_pixels_back_through_root_zoom():
+    body = _function("showTip", "hideTip")
+    assert 'tip.style.left = "0px"' in body
+    assert 'tip.style.top = "0px"' in body
+    assert "Number(state.settings.uiScale) || 1" in body
+    assert 'tip.style.left = (left / scale) + "px"' in body
+    assert 'tip.style.top = (top / scale) + "px"' in body

@@ -1574,7 +1574,7 @@
               each capture as a manual entry. Sign in on the phone and desktop; the same account
               works automatically, and linked contributor accounts are also supported. The
               built-in public cloud configuration handles the rest, with no Supabase key to
-              enter. The Mistral key it needs lives under <b>OCR</b>.</p>
+              enter. The Mistral key it needs lives under <b>Credentials</b>.</p>
             <div class="settings-rows">
               <label class="tool-label" for="set-sb-url">Supabase project URL</label>
               <input id="set-sb-url" class="cad-input" spellcheck="false"
@@ -1601,12 +1601,12 @@
           </div>
           <div id="sec-credentials" class="settings-sec">
             <div class="settings-head">Credentials</div>
-            <p class="settings-note">API keys and secrets for the services configured under
-              AI, OCR, and Integrations. Kept on this machine; leave blank to use the built-in
-              Library Tool cloud.</p>
+            <p class="settings-note">Optional service credentials. A Library Tool account
+              uses the built-in public cloud configuration and never needs an owner key.
+              Mistral follows your signed-in profile; other provider keys stay on this machine.</p>
             <div class="settings-subhead">AI (Analyze)</div>
             <div class="settings-rows">
-              <label class="tool-label" for="set-ai-key">API key</label>
+              <label class="tool-label" for="set-ai-key">DeepSeek / AI provider API key</label>
               <input id="set-ai-key" class="cad-input" type="password" spellcheck="false" />
             </div>
             <div class="settings-subhead" style="margin-top:16px">OCR</div>
@@ -1740,59 +1740,91 @@
         <span id="wizard-title">WELCOME</span>
         <span id="wizard-step" class="wizard-step"></span>
       </div>
+      <progress id="wizard-progress" class="wizard-progress" max="5" value="1"
+                aria-label="Setup progress"></progress>
       <div id="wizard-body" class="wizard-body">
 
         <div class="wiz-pane" data-step="welcome">
-          <p><b>Library Tool</b> catalogues old and rare works on botany and herbal
-             medicine — checking a private collection against the World Herb Library,
-             tracking copyright, and turning scans into readable volumes.</p>
-          <p class="settings-note">This quick setup is optional. Everything here can be
-             changed later under <b>Settings</b>, and the app is fully usable without any
-             of it.</p>
+          <p class="wiz-lead">Welcome to <b>Library Tool</b>.</p>
+          <p>Catalog books, compare them with library records, review copyright and
+             source availability, and turn verified scans into readable volumes.</p>
+          <ul class="wiz-points">
+            <li><b>Catalogs</b> is where you search, compare, and verify books.</li>
+            <li><b>Editor</b> organizes sources and publication details.</li>
+            <li><b>Analyze</b> handles OCR and optional AI-assisted text work.</li>
+          </ul>
+          <p class="settings-note">Setup takes about a minute. Every choice is optional
+             and remains available in <b>Settings</b>.</p>
         </div>
 
         <div class="wiz-pane" data-step="account" hidden>
-          <p class="settings-note">Your name labels your changes in the activity feed. Sign
-             in to a cloud account to record contributions under your identity and share the
-             feed with other contributors.</p>
+          <p class="wiz-lead">Choose how your work is identified.</p>
+          <p class="settings-note">A display name labels your local activity. Sign in to use
+             phone capture and share contributor activity. Local cataloging does not require
+             an account.</p>
           <div class="settings-rows">
-            <label class="tool-label" for="wiz-name">Your name</label>
-            <input id="wiz-name" class="cad-input" spellcheck="false" placeholder="Andrew Miller" />
-            <label class="tool-label">Cloud account</label>
+            <label class="tool-label" for="wiz-name">Display name <span class="wiz-opt">(optional)</span></label>
+            <input id="wiz-name" class="cad-input" spellcheck="false"
+                   placeholder="Name shown in activity" />
+            <label class="tool-label">Library Tool account</label>
             <span class="set-account">
               <span id="wiz-account-state" class="tool-label">Not signed in</span>
               <button id="wiz-signin" class="cad-btn" type="button">Sign in&hellip;</button>
             </span>
           </div>
+          <p class="settings-note wiz-footnote">To work locally, leave this as it is and
+             choose <b>Next</b>. You can sign in later from Settings.</p>
         </div>
 
-        <div class="wiz-pane" data-step="ocr" hidden>
-          <p class="settings-note">Scans without a text layer can be read through OCR.
-             <b>Tesseract</b> runs locally and is free; <b>Mistral</b> is a cloud service
-             that needs an API key. Both are optional.</p>
-          <div class="wiz-detect">
-            <span id="wiz-tess-state" class="tool-label">Checking for Tesseract&hellip;</span>
-            <a id="wiz-tess-link" href="https://github.com/UB-Mannheim/tesseract/wiki"
-               target="_blank" rel="noopener" hidden>Get Tesseract</a>
+        <div class="wiz-pane" data-step="services" hidden>
+          <p class="wiz-lead">Add only the text tools you plan to use.</p>
+          <p class="settings-note">Library Tool works without API keys. These are your
+             personal service keys, not Library Tool cloud or publishing credentials.</p>
+          <div class="wiz-service-grid">
+            <section class="wiz-service-card wiz-service-local">
+              <div class="wiz-service-head"><b>Tesseract</b><span class="wiz-badge">LOCAL OCR</span></div>
+              <p>Free OCR on this computer; no account or API key.</p>
+              <div class="wiz-detect">
+                <span id="wiz-tess-state" class="tool-label">Checking&hellip;</span>
+                <a id="wiz-tess-link" href="https://github.com/UB-Mannheim/tesseract/wiki"
+                   target="_blank" rel="noopener" hidden>Install</a>
+              </div>
+            </section>
+            <section class="wiz-service-card">
+              <div class="wiz-service-head"><b>Mistral</b><span class="wiz-badge">CLOUD OCR</span></div>
+              <p>Reads page images and phone captures.</p>
+              <label class="tool-label" for="wiz-mistral">API key <span class="wiz-opt">(optional)</span></label>
+              <input id="wiz-mistral" class="cad-input" type="password" spellcheck="false"
+                     autocomplete="off" placeholder="Leave blank to skip" />
+            </section>
+            <section class="wiz-service-card">
+              <div class="wiz-service-head"><b>DeepSeek</b><span class="wiz-badge">ANALYSIS</span></div>
+              <p>Powers summaries, translation, and other Analyze tools.</p>
+              <label class="tool-label" for="wiz-deepseek">API key <span class="wiz-opt">(optional)</span></label>
+              <input id="wiz-deepseek" class="cad-input" type="password" spellcheck="false"
+                     autocomplete="off" placeholder="Leave blank to skip" />
+            </section>
           </div>
-          <div class="settings-rows">
-            <label class="tool-label" for="wiz-mistral">Mistral API key <span class="wiz-opt">(optional)</span></label>
-            <input id="wiz-mistral" class="cad-input" type="password" spellcheck="false"
-                   placeholder="leave blank to skip" />
-          </div>
+          <p id="wiz-keys-msg" class="tool-label wiz-keys-msg" aria-live="polite"></p>
         </div>
 
         <div class="wiz-pane" data-step="db" hidden>
-          <p class="settings-note">The Open Library index makes book search work offline. It
-             is several gigabytes, so it downloads on demand — skip now and fetch it later from
-             <b>Settings &gt; Sync</b> whenever you like.</p>
+          <p class="wiz-lead">Offline search is optional.</p>
+          <p class="settings-note">Local databases make lookup faster and available without
+             a network connection. They can be large; download them now or manage them later
+             under <b>Settings &gt; Integrations</b>. Live search remains available when online.</p>
           <div id="wiz-db-list" class="wiz-db-list"><span class="tool-label">Checking&hellip;</span></div>
         </div>
 
         <div class="wiz-pane" data-step="done" hidden>
-          <p>You’re set. <b>Library Tool</b> opens on the Home tab; the tools are along the
-             top, and everything you skipped is under <b>Settings</b>.</p>
-          <p class="settings-note">Re-open this guide any time from <b>Help &gt; Setup guide</b>.</p>
+          <p class="wiz-lead">You’re ready.</p>
+          <ul class="wiz-points wiz-ready-list">
+            <li>Use <b>Catalogs</b> to find a book and compare source records.</li>
+            <li>Use <b>Editor</b> after a source is verified and downloaded.</li>
+            <li>Check <b>Home</b> for running work, reviews, and recent activity.</li>
+          </ul>
+          <p class="settings-note">Anything you skipped can be added later in
+             <b>Settings</b>. Re-open this guide from <b>Help &gt; Setup guide</b>.</p>
         </div>
 
       </div>
@@ -1800,7 +1832,7 @@
         <button id="wizard-back" class="cad-btn" type="button">Back</button>
         <span class="wizard-spacer"></span>
         <button id="wizard-skip" class="cad-btn" type="button"
-                data-tip="Close the guide; won't show again at startup">Skip setup</button>
+                data-tip="Close the guide; it won't reopen automatically">Set up later</button>
         <button id="wizard-next" class="cad-btn" type="button">Next</button>
       </div>
     </div>

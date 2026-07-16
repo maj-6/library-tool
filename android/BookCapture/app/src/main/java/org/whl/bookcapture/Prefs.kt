@@ -108,11 +108,6 @@ object Prefs {
             .apply()
     }
 
-    /** Transient PKCE verifier held between the OAuth authorize redirect and the
-     *  code exchange; a one-shot, cleared on redeem and on sign-out. */
-    fun pkceVerifier(ctx: Context): String = str(ctx, "pkce_verifier")
-    fun setPkceVerifier(ctx: Context, v: String) = put(ctx, "pkce_verifier" to v)
-
     // --- API keys (cache of the cloud profile_secrets row) -----------------------
 
     fun mistralKey(ctx: Context): String = str(ctx, "mistral_key")
