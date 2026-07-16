@@ -43,7 +43,7 @@ async function main() {
     <div id="bio-slot"></div>
     <h2 class="section-head">Works</h2>
     <ol class="records-list">${rows.map(renderRecord).join("")}</ol>`;
-  document.title = `${author} · World Herb Library`;
+  document.title = `${author} · Archive Browser`;
 
   getAuthorBio(author).then((bio) => {
     document.getElementById("bio-slot").innerHTML = bio

@@ -1,4 +1,4 @@
-import { latestReleases, usingCloud, safeHttpUrl, fetchChangelog, isSignificantVersion } from "./data.js";
+import { latestReleases, usingCloud, safeHttpUrl } from "./data.js";
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -36,10 +36,9 @@ function day(raw) {
   const d = new Date(raw ?? "");
   return Number.isNaN(d.getTime()) ? "" : d.toISOString().slice(0, 10);
 }
-
 // One download as a row: platform glyph, name (+ tag) over its metadata, and a
 // ghost download button that fills on hover. The desktop build is tinted as the
-// primary one. In the "Other downloads" section (opts.channel) a prerelease row
+// primary one. In the "Pre-release builds" section (opts.channel) a prerelease row
 // is badged with its channel (alpha/beta/rc) instead of the platform tag, and is
 // never tinted as primary — a testing build shouldn't read as the headline one.
 function card(r, opts = {}) {
@@ -111,25 +110,4 @@ try {
 } catch (e) {
   box.innerHTML = `<div class="note">Could not load releases: ${esc(e.message)}</div>`;
   if (preBox) preBox.innerHTML = `<div class="note">Could not load testing builds.</div>`;
-}
-
-// "What's new": the most recent *significant* releases (major/minor), each
-// trimmed to its highlights. Cosmetic patch releases and each release's lesser
-// fixes (the changelog's <!--more--> fold) stay off the download page — the
-// full history is one click away on the Release notes page.
-const RECENT = 4;
-const clBox = document.getElementById("changelog");
-const versions = await fetchChangelog();
-const recent = versions.filter((v) => isSignificantVersion(v.version)).slice(0, RECENT);
-clBox.innerHTML = recent.length
-  ? recent.map(release).join("")
-  : `<p class="muted">No release notes yet.</p>`;
-
-// Highlights only (v.items); the "other/minor changes" link below leads to the
-// Release notes page, where each release expands to its full set.
-function release(v) {
-  return `<section class="cl-rel">
-    <h3 class="cl-ver">${esc(v.version)}${v.date ? ` <span class="cl-date">${esc(v.date)}</span>` : ""}</h3>
-    <ul class="cl-list">${v.items.map((i) => `<li>${esc(i)}</li>`).join("")}</ul>
-  </section>`;
 }
