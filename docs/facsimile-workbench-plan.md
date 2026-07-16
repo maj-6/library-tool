@@ -112,7 +112,7 @@ pages translated before hashes existed have no record and count as current.
   `[A-Z]{1,2}\d?`; drop cap = >2.5× median line height.
 - **Translation source hashes** (bug 3 above).
 
-## Phase 2 — facsimile display for Mistral pages
+## Phase 2 — facsimile display for Mistral pages — **SHIPPED on this branch**
 
 Extend the existing renderer, don't fork it: word boxes → `fillWordLayout` as
 today; regions only → each region rendered as an absolutely-positioned box
@@ -120,6 +120,14 @@ today; regions only → each region rendered as an absolutely-positioned box
 with margin notes visually in the margin. Role-based styling (small italic
 marginalia, centered running heads) and a hide-furniture toggle. Per-page
 fallback chain: word facsimile → region facsimile → whole-page flow.
+
+Implemented as `fillRegionLayout` (app.js), dispatched from both the OCR-tab
+page view and the embedded PDF viewer; the Analysis-workspace facsimile
+inherits it via `fillOcrLayout`. Region records place only for the doc that
+produced them (the words_doc contract). Block type size = box height /
+line count, the block-grain analogue of the word facsimile's per-line sizing.
+The furniture toggle (`#ocr-furniture`, `ocrFurniture` setting) is a CSS
+class flip — no re-render. Verified live against the 1605 p120 regions.
 
 ## Phase 3 — Replica workbench (new top-level tab)
 

@@ -3235,6 +3235,31 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   border: 1px solid var(--canvas-line);
   background: #fff;
 }
+/* Region facsimile: typed blocks (Mistral OCR-4) placed on the page. Under-
+   styled on purpose — roles read through type treatment, not chrome. */
+.ocr-region {
+  position: absolute;
+  overflow: hidden;
+  white-space: pre-wrap;
+  line-height: 1.12;
+  color: var(--input-ink);
+  font-family: var(--mono);
+}
+.ocr-region[data-role="marginalia"] { font-style: italic; opacity: 0.78; }
+.ocr-region[data-role="header"],
+.ocr-region[data-role="footer"],
+.ocr-region[data-role="page-number"],
+.ocr-region[data-role="catch-word"],
+.ocr-region[data-role="signature-mark"] { opacity: 0.55; }
+.ocr-region[data-role="title"] { font-weight: 600; }
+.ocr-region[data-role="caption"] { font-style: italic; }
+.ocr-region img.ocr-regimg {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+.ocr-hidefurn .ocr-region[data-furniture="1"] { display: none; }
 
 .ocr-pgtext {
   resize: none;

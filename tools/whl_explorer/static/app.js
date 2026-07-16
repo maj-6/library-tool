@@ -194,6 +194,7 @@ const state = {
     ocrAwsKey: "", ocrAwsSecret: "", ocrAwsRegion: "",
     ocrImageWidth: 1400,
     ocrLayout: true,    // page view: place words where they sit on the page
+    ocrFurniture: true, // region facsimile: show marginalia/headers/catchwords
     textAnalysisService: "configured",
     workbenchPhase: "record",   // last phase open on the Workbench
     jobsDrawerOpen: false,      // the jobs drawer starts as a one-line summary
@@ -782,6 +783,9 @@ const ICONS = {
   go: _SVG('<path d="M2.5 8 h9 M8.2 4.5 L11.8 8 L8.2 11.5"/>'),
   // a page with a figure block above flowing text: the facsimile layout view
   layout: _SVG('<rect x="3" y="2" width="10" height="12" rx="1"/><rect x="5" y="4" width="6" height="3.4"/><path d="M5 9.6 h6 M5 11.8 h4.2"/>'),
+  // a page with a note block in the margin beside the text column: the
+  // furniture (marginalia / running heads / catchwords) visibility toggle
+  margins: _SVG('<rect x="2.5" y="2" width="11" height="12" rx="1"/><rect x="4.2" y="6" width="2.4" height="3.2"/><path d="M8.6 4.4 h3 M8.6 6.6 h3 M8.6 8.8 h3 M8.6 11 h2"/>'),
   pdf: _SVG('<path d="M3.5 2 h6 l3 3 v9 h-9 Z"/><path d="M9.5 2 v3 h3"/><path d="M5.4 7.5 h5.2 M5.4 9.7 h5.2 M5.4 11.9 h3.4"/>'),
   // a magic wand with a star tip: the smart-check trigger
   wand: _SVG('<path d="M2.4 13.6 L9.4 6.6"/><path d="M12 1.6 L12.7 3.3 L14.4 4 L12.7 4.7 L12 6.4 L11.3 4.7 L9.6 4 L11.3 3.3 Z"/><path d="M13.4 7.8 v1.8 M12.5 8.7 h1.8"/>'),
@@ -7583,7 +7587,8 @@ function createPdfViewer() {
     if (name === "extracted.txt" || !pagesSec) {
       return fillWordLayout(pane, pagesPdf, page, bid);
     }
-    const meta = bid ? await ocrLayoutMeta(bid) : { images: {}, wordPages: {}, wordDocs: {} };
+    const meta = bid ? await ocrLayoutMeta(bid)
+      : { images: {}, wordPages: {}, wordDocs: {}, regionPages: {} };
     if (!pane.isConnected) return;
     // the doc that produced the word boxes places a facsimile; any other doc
     // flows its own text (the boxes carry the box run's transcription, which
@@ -7591,6 +7596,11 @@ function createPdfViewer() {
     if (ocrHasWords(meta, src, page) &&
         ocrWordsAreDocs(meta, src, page, (pagesSaveTo && pagesSaveTo.name) || "")) {
       return fillWordLayout(pane, pagesPdf, page, bid);
+    }
+    if (bid && ocrHasRegions(meta, src, page)) {
+      if (await fillRegionLayout(pane, bid, src, page,
+                                 (pagesSaveTo && pagesSaveTo.name) || "")) return;
+      if (!pane.isConnected) return;
     }
     const text = pagesSec.map.has(page) ? pagesSec.map.get(page) : null;
     fillDocLayout(pane, text, bid, meta.images);
@@ -12453,6 +12463,7 @@ const ocrState = {
   pdfInfo: {},             // pdf path -> {pages, dims} (/api/pdf/info cache)
   layoutMeta: {},          // build id -> extracted-figure boxes (ocr-layout)
   wordsCache: new Map(),   // "pdf|page" -> /api/pdf/words result
+  regionsCache: new Map(), // "bid|src|page" -> /ocr-regions record
   treeCollapsed: new Set(),// "bid:srckey" — collapsed nodes of the docs tree
 };
 
@@ -13082,10 +13093,13 @@ function setOcrView(v) {
   el("ocr-diff").hidden = v !== "diff";
   el("ocr-pages").hidden = v !== "pdf";
   el("ocr-layout").hidden = v !== "pdf";       // layout is a mode of the page view
+  el("ocr-furniture").hidden = v !== "pdf";    // …as is the furniture toggle
   el("ocr-pagenav").hidden = v !== "pdf";      // page jump/nav is page-view only
   el("ocr-keymap").hidden = v !== "pdf";       // digit->engine legend, page-view only
   if (v === "pdf") buildOcrKeymapLegend();
   el("ocr-layout").classList.toggle("active", ocrState.layout);
+  el("ocr-furniture").classList.toggle("active", !!state.settings.ocrFurniture);
+  el("ocr-pages").classList.toggle("ocr-hidefurn", !state.settings.ocrFurniture);
   if (v === "diff") renderOcrDiff();
   else if (v === "pdf") renderOcrPages();
   else {
@@ -13101,6 +13115,15 @@ function setOcrLayout(on) {
   saveSettings();
   el("ocr-layout").classList.toggle("active", ocrState.layout);
   if (ocrState.view === "pdf") renderOcrPages();
+}
+
+// show/hide page furniture (marginalia, running heads, catchwords…) in the
+// region facsimile — a CSS class flip, no re-render; the regions stay mounted
+function setOcrFurniture(on) {
+  state.settings.ocrFurniture = !!on;
+  saveSettings();
+  el("ocr-furniture").classList.toggle("active", !!on);
+  el("ocr-pages").classList.toggle("ocr-hidefurn", !on);
 }
 
 // --- side-by-side page view: PDF page images next to that page's OCR text --
@@ -13340,9 +13363,12 @@ async function ocrLayoutMeta(bid) {
       const r = await (await fetch(
         `/api/builds/${encodeURIComponent(bid)}/ocr-layout`)).json();
       ocrState.layoutMeta[bid] = r.ok
-        ? { images: r.images || {}, wordPages: r.word_pages || {}, wordDocs: r.word_docs || {} }
-        : { images: {}, wordPages: {}, wordDocs: {} };
-    } catch (e) { ocrState.layoutMeta[bid] = { images: {}, wordPages: {}, wordDocs: {} }; }
+        ? { images: r.images || {}, wordPages: r.word_pages || {},
+            wordDocs: r.word_docs || {}, regionPages: r.region_pages || {} }
+        : { images: {}, wordPages: {}, wordDocs: {}, regionPages: {} };
+    } catch (e) {
+      ocrState.layoutMeta[bid] = { images: {}, wordPages: {}, wordDocs: {}, regionPages: {} };
+    }
   }
   return ocrState.layoutMeta[bid];
 }
@@ -13362,6 +13388,95 @@ function ocrWordsAreDocs(meta, srcKey, page, docName) {
   const dm = meta && meta.wordDocs && meta.wordDocs[srcKey || "primary"];
   const rec = dm && dm[String(page)];
   return !rec || String(rec).toLowerCase() === String(docName || "").toLowerCase();
+}
+
+// does the selected source have a typed-region record for this page?
+function ocrHasRegions(meta, srcKey, page) {
+  const rp = meta && meta.regionPages && meta.regionPages[srcKey || "primary"];
+  return Array.isArray(rp) && rp.includes(page);
+}
+
+// one page's typed regions (/ocr-regions), cached like the word boxes
+async function ocrPageRegions(bid, srcKey, page) {
+  const ck = `${bid}|${srcKey || "primary"}|${page}`;
+  let rec = ocrState.regionsCache.get(ck);
+  if (!rec) {
+    try {
+      rec = await (await fetch(
+        `/api/builds/${encodeURIComponent(bid)}/ocr-regions` +
+        `?src=${encodeURIComponent(srcKey || "primary")}&page=${page}`)).json();
+    } catch (e) { rec = { ok: false }; }
+    if (rec && rec.ok) {
+      if (ocrState.regionsCache.size > 500) ocrState.regionsCache.clear();
+      ocrState.regionsCache.set(ck, rec);
+    }
+  }
+  return rec;
+}
+
+// mirror of the server's SECONDARY_ROLES: page furniture the reading-focus
+// toggle can hide (the facsimile's point is showing it IN place, so default on)
+const OCR_FURNITURE_ROLES = new Set(["marginalia", "header", "footer",
+  "page-number", "catch-word", "signature-mark"]);
+
+// The region facsimile: each typed region (Mistral OCR-4 blocks, role-
+// classified server-side) becomes a positioned box with its text flowed
+// inside — paragraph grain, so margin notes sit IN the margin instead of
+// polluting the body flow. Placed only when the record carries the doc being
+// viewed (the words_doc staleness contract); returns false so the caller can
+// flow the doc's own text instead.
+async function fillRegionLayout(pane, bid, srcKey, page, docName) {
+  const rec = await ocrPageRegions(bid, srcKey, page);
+  if (!pane.isConnected) return true;   // stale pane: nothing left to draw into
+  if (!rec || !rec.ok || !rec.found || !(rec.items || []).length) return false;
+  if (rec.doc &&
+      String(rec.doc).toLowerCase() !== String(docName || "").toLowerCase()) {
+    return false;
+  }
+  const dims = rec.dims || {};
+  pane.classList.remove("doctext", "empty");
+  pane.textContent = "";
+  if (dims.w > 0 && dims.h > 0) pane.style.aspectRatio = `${dims.w} / ${dims.h}`;
+  const paneW = pane.clientWidth;
+  const paneH = pane.clientHeight ||
+    (dims.w > 0 ? paneW * dims.h / dims.w : paneW * 1.4);
+  const frag = document.createDocumentFragment();
+  for (const it of rec.items || []) {
+    const box = it.box || {};
+    const e = document.createElement("div");
+    e.className = "ocr-region";
+    e.dataset.role = it.role || "body";
+    e.title = it.role || "";
+    if (OCR_FURNITURE_ROLES.has(it.role)) e.dataset.furniture = "1";
+    e.style.left = (box.x || 0) * 100 + "%";
+    e.style.top = (box.y || 0) * 100 + "%";
+    e.style.width = (box.w || 0) * 100 + "%";
+    e.style.height = (box.h || 0) * 100 + "%";
+    const text = String(it.text || "");
+    const fig = it.role === "figure" &&
+      text.match(/!\[[^\]\n]*\]\(([\w.\- ]+)\)/);
+    if (fig) {
+      const img = document.createElement("img");
+      img.className = "ocr-regimg";
+      img.loading = "lazy";
+      img.decoding = "async";
+      img.alt = fig[1];
+      img.src = `/api/builds/${encodeURIComponent(bid)}` +
+        `/ocr/images/${encodeURIComponent(fig[1])}`;
+      e.appendChild(img);
+    } else {
+      // one type size per block, chosen so its lines roughly fill the box —
+      // the block-grain analogue of the word facsimile's per-line sizing
+      const lines = Math.max(1, text.split("\n").length);
+      const size = Math.max(6, Math.min(
+        ((box.h || 0) * paneH) / lines * 0.78, paneW * 0.05));
+      e.style.fontSize = size + "px";
+      e.textContent = text;
+    }
+    frag.appendChild(e);
+  }
+  pane.appendChild(frag);
+  return true;
 }
 
 // Markdown-lite for one page of OCR output (Mistral emits markdown): headers,
@@ -13413,6 +13528,13 @@ async function fillOcrLayout(pane, pdf) {
     if (ocrHasWords(meta, docSrcKey(d), page) &&
         ocrWordsAreDocs(meta, docSrcKey(d), page, d.fileName || d.name)) {
       return fillWordLayout(pane, pdf, page, d.buildId);
+    }
+    // no word boxes for this doc: a typed-region record (Mistral blocks)
+    // gives a paragraph-grain facsimile; failing that, flow the text
+    if (ocrHasRegions(meta, docSrcKey(d), page)) {
+      if (await fillRegionLayout(pane, d.buildId, docSrcKey(d), page,
+                                 d.fileName || d.name)) return;
+      if (!pane.isConnected || ocrSelDoc() !== d) return;
     }
     const sec = ocrState.pages;
     const text = sec && sec.map.has(page) ? sec.map.get(page) : null;
@@ -14290,7 +14412,8 @@ function pollOcrJobs() {
 // unsaved) version, so a running edit session is not clobbered.
 async function refreshCompiledDoc(bid, donePages, target, src, quiet) {
   target = target || "compiled.txt";
-  delete ocrState.layoutMeta[bid];   // the job may have added figures / word boxes
+  delete ocrState.layoutMeta[bid];   // the job may have added figures / boxes
+  ocrState.regionsCache.clear();     // …or replaced/dropped region records
   ocrState.wordsCache.clear();       // OCR'd pages now have placeable boxes
   await loadOcrBooks();
   try {
@@ -14758,6 +14881,8 @@ function initOcrTab() {
   }, { passive: true });
   ocrState.layout = state.settings.ocrLayout !== false;   // layout is home
   el("ocr-layout").addEventListener("click", () => setOcrLayout(!ocrState.layout));
+  el("ocr-furniture").addEventListener("click",
+    () => setOcrFurniture(!state.settings.ocrFurniture));
   // reflect the default view (page view, layout on) in the toolbar/panes —
   // the tab isn't visible yet, so no page render fires here
   setOcrView(ocrState.view);
