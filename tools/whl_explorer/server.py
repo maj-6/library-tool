@@ -47,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import capture_pipeline as capture  # noqa: E402
 import catalog_checks as checks  # noqa: E402
 import cloud_defaults  # noqa: E402
+import layout_roles  # noqa: E402
 import copyright_registration as copyreg  # noqa: E402
 import libcommon as lib  # noqa: E402
 import r2_store as r2  # noqa: E402
@@ -2251,9 +2252,36 @@ def api_build_ocr_layout(build_id: str):
     word_pages = {src: sorted(int(k) for k in pages if str(k).isdigit())
                   for src, pages in (meta.get("words") or {}).items()
                   if isinstance(pages, dict)}
+    # region_pages mirrors word_pages: which pages have a typed-region record
+    # (fetched individually via /ocr-regions — the records carry full text)
+    region_pages = {src: sorted(int(k) for k in pages if str(k).isdigit())
+                    for src, pages in (meta.get("regions") or {}).items()
+                    if isinstance(pages, dict)}
     return jsonify({"ok": True, "images": meta.get("images") or {},
                     "word_pages": word_pages,
-                    "word_docs": meta.get("words_doc") or {}})
+                    "word_docs": meta.get("words_doc") or {},
+                    "region_pages": region_pages})
+
+
+@app.route("/api/builds/<build_id>/ocr-regions")
+def api_build_ocr_regions(build_id: str):
+    """One page's typed regions — the Phase 1 substrate the region facsimile
+    and the Replica workbench read: {ok, found, doc, dims, items: [{id, role,
+    box, order, text}]}. ?src= and ?page= select the record."""
+    if build_id not in lib.load_json(BUILDS_PATH, {}):
+        abort(404)
+    src = request.args.get("src") or "primary"
+    try:
+        page = int(request.args.get("page") or 0)
+    except (TypeError, ValueError):
+        page = 0
+    meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
+    rec = ((meta.get("regions") or {}).get(src) or {}).get(str(page))
+    if not isinstance(rec, dict):
+        return jsonify({"ok": True, "found": False})
+    return jsonify({"ok": True, "found": True, "doc": rec.get("doc") or "",
+                    "dims": rec.get("dims") or {},
+                    "items": rec.get("items") or []})
 
 
 # --- PDF page rasterization (the OCR tab's side-by-side page view) ---------------
@@ -3061,19 +3089,34 @@ def _ocr_textract(png: bytes, cfg: dict) -> str:
 
 
 def _ocr_mistral(png: bytes, cfg: dict) -> dict:
-    """Mistral returns markdown plus the figures it cut out of the page.
-    The result dict carries the text and the decoded images with their
-    boxes normalised to 0..1 of the page, ready for _ocr_save_page_images."""
+    """Mistral returns markdown, the figures it cut out of the page, and
+    (OCR-4, include_blocks) typed text blocks in reading order. The result
+    carries: `text` — the body flow composed from role-classified regions,
+    with page furniture (marginalia, running heads, catchwords…) lifted out
+    so compiled text, translations, and volume_pages stay clean; `images` —
+    decoded figures with 0..1 boxes for _ocr_save_page_images; `regions` —
+    the typed-region sidecar records; `dims` — the raster size/dpi the API
+    reported (NOT the physical page — it describes our own rasterization).
+    When blocks are missing or carry under 70% of the markdown's characters
+    (a segmentation failure), the text falls back to the full markdown so
+    nothing is silently lost."""
     key = (cfg.get("mistral_key") or "").strip()
     if not key:
         raise RuntimeError("Mistral API key not configured (Settings > OCR)")
     import base64
-    pages = capture.mistral_ocr_pages(png, key, want_images=True)
-    text = "\n\n".join(p.get("markdown", "") for p in pages).strip()
+    pages = capture.mistral_ocr_pages(png, key, want_images=True,
+                                      want_blocks=True)
+    markdown = "\n\n".join(p.get("markdown", "") for p in pages).strip()
+    regions: list[dict] = []
+    dims = None
     images = []
     for pg in pages:
         dim = pg.get("dimensions") or {}
         pw, ph = float(dim.get("width") or 0), float(dim.get("height") or 0)
+        if dims is None and (pw > 0 or ph > 0):
+            dims = {"w": int(pw), "h": int(ph),
+                    "dpi": int(dim.get("dpi") or 0)}
+        regions.extend(layout_roles.regions_from_blocks(pg.get("blocks"), dim))
         for im in pg.get("images") or []:
             b64 = str(im.get("image_base64") or "")
             if "," in b64[:64]:                 # strip a data: URL prefix
@@ -3095,7 +3138,11 @@ def _ocr_mistral(png: bytes, cfg: dict) -> dict:
                         "h": round(max(0.0, y1 - y0) / ph, 5)}
             images.append({"id": str(im.get("id") or f"img-{len(images)}.jpeg"),
                            "data": raw, "bbox": bbox})
-    return {"text": text, "images": images}
+    if regions and layout_roles.coverage(regions, markdown) >= 0.7:
+        text = layout_roles.compose_text(regions)
+    else:
+        text = markdown
+    return {"text": text, "images": images, "regions": regions, "dims": dims}
 
 
 _OCR_SERVICES = {
@@ -3202,6 +3249,35 @@ def _ocr_save_page_words(build_id: str, src_key: str, page: int, words: list,
         lib.save_json(meta_path, meta)
 
 
+def _ocr_save_page_regions(build_id: str, src_key: str, page: int,
+                           regions: list, dims: dict | None,
+                           doc: str = "") -> None:
+    """Persist one page's typed regions (ocr/layout.json, {regions: {"<src>":
+    {"<page>": {doc, dims, items: [{id, role, box, order, text}]}}}}), boxes
+    0..1 like the word sidecar. Unlike word boxes, regions CARRY their run's
+    text, so a re-OCR through the region-producing path replaces them and an
+    empty list drops the page — stale region text must not outlive its
+    transcription. `doc` names the compiled file that run's text landed in;
+    `dims` is the API-reported raster size/dpi (not physical page size)."""
+    src_key = src_key or "primary"
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    with _ocr_merge_lock:
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta = lib.load_json(meta_path, {})
+        rmap = meta.setdefault("regions", {})
+        pages = rmap.setdefault(src_key, {})
+        if regions:
+            pages[str(int(page))] = {"doc": doc, "dims": dims or {},
+                                     "items": regions}
+        else:
+            pages.pop(str(int(page)), None)
+            if not pages:
+                rmap.pop(src_key, None)
+        if not rmap:
+            meta.pop("regions", None)
+        lib.save_json(meta_path, meta)
+
+
 def _ocr_job_run(job_id: str) -> None:
     job = _ocr_jobs[job_id]
     cfg = job["cfg"]
@@ -3243,6 +3319,14 @@ def _ocr_job_run(job_id: str) -> None:
                     _ocr_save_page_words(job["build_id"], src_key, n,
                                          result.get("words") or [],
                                          doc=_ocr_name(job["target"]))
+                # likewise a "regions" key marks the region-producing path
+                # (Mistral blocks); its value is authoritative — [] clears
+                # the page's regions along with the transcription they held
+                if "regions" in result:
+                    _ocr_save_page_regions(job["build_id"], src_key, n,
+                                           result.get("regions") or [],
+                                           result.get("dims"),
+                                           doc=_ocr_name(job["target"]))
             else:
                 text = result
             _ocr_merge_page(job["build_id"], job["target"], n, text)
@@ -3451,8 +3535,8 @@ def _renumber_layout_words(build_id: str, src_key: str, removed: list[int]) -> N
     with _ocr_merge_lock:
         meta = lib.load_json(meta_path, {})
         dirty = False
-        # words and words_doc share the src/page keying; shift both
-        for key in ("words", "words_doc"):
+        # words, words_doc, and regions share the src/page keying; shift all
+        for key in ("words", "words_doc", "regions"):
             wmap = meta.get(key)
             if not isinstance(wmap, dict):
                 continue

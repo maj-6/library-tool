@@ -73,7 +73,16 @@ typed boxes on the page rasters for human inspection.
 The workbench design is unchanged in all three cases; only the seeding quality
 differs. Findings get appended to this doc.
 
-## Phase 1 — region substrate (pipeline, no UI)
+## Phase 1 — region substrate (pipeline, no UI) — **SHIPPED on this branch**
+
+Everything below is implemented (tools/layout_roles.py + server.py, tests in
+tests/test_layout_regions.py) and verified end-to-end: a live Mistral run on
+the 1605 marginalia page produced body-only compiled text with all four
+margin notes typed `marginalia` in the regions sidecar. Notes from the
+implementation: page-delete renumbers `ocr/*.txt` but has never renumbered
+`translations/*.txt` — with source hashes this now self-heals (shifted source
+⇒ hash mismatch ⇒ re-translated on the next run) at re-translation cost;
+pages translated before hashes existed have no record and count as current.
 
 - **One canonical region store**: a `"regions"` key in `ocr/layout.json`
   beside `words`/`images` — per source, per page, boxes normalized 0..1, same
