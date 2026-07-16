@@ -179,6 +179,16 @@ create table if not exists passages (
 exist); the hybrid variant fuses lexical and vector ranks server-side in
 wave 3 (#140). The website never issues raw reads against indexed tables.
 
+**Ranked search (002).** Wave 2 shipped as
+`docs/cloud/migrations/002_page_search.sql`: `volume_pages.search_body`
+(the desktop-normalized layer, `_search_normalize` in the explorer server,
+mirroring the reader's client-side fold), a stored `simple`+`english`
+tsvector with GIN, a pg_trgm index, and
+`search_volume(p_slug, p_query, p_lang, p_limit)` returning page /
+rank / `ts_headline` snippet with a trigram fallback arm. The reader calls
+it in cloud mode and falls back to #138's client-side path on any RPC
+error or zero hits; fixture mode is unchanged.
+
 ## 6. Sequencing
 
 1. **Now (0.7.x alphas)** — #136 (stale-translation fix) and provenance

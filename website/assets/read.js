@@ -5,8 +5,8 @@
 // pre-sized placeholder so the scrollbar never jumps. Margin annotations come
 // from volume_notes; a page-aligned text/translation panel from volume_pages.
 
-import { getVolume, getNotes, getPages, getAllPages, pdfHref } from "./data.js";
-import { normalizeSearchText, findMatchRanges, searchPages } from "./textsearch.js";
+import { getVolume, getNotes, getPages, getAllPages, pdfHref, searchVolume, usingCloud } from "./data.js";
+import { normalizeSearchText, findMatchRanges, searchPages, rpcSnippetHtml, rpcHitsUsable } from "./textsearch.js";
 import * as pdfjsLib from "./vendor/pdfjs/build/pdf.min.mjs";
 
 // The worker is a sibling file; resolve it relative to THIS module so it works
@@ -297,7 +297,8 @@ async function runSearch() {
   const q = el("tp-q").value.trim();
   const seq = ++searchSeq;
   const box = el("tp-results");
-  if (normalizeSearchText(q).length < 2) {     // nothing (sensible) to search for
+  const nq = normalizeSearchText(q);
+  if (nq.length < 2) {                         // nothing (sensible) to search for
     S.searchQuery = "";
     box.hidden = true;
     box.innerHTML = "";
@@ -307,6 +308,26 @@ async function runSearch() {
   S.searchQuery = q;
   const lang = S.textLang;
   box.hidden = false;
+
+  // Cloud mode asks the database first: one search_volume round-trip, ranked
+  // by Postgres FTS with a trigram fallback, snippets cut server-side. The
+  // query goes over folded, matching the published search layer, so
+  // "phyſick" finds "physick" there too. Any failure (a live project still
+  // behind on migrations answers 404, or the network is down) or zero hits
+  // falls back silently to the client-side path below, whose own folding may
+  // still match. The panel's in-page highlighting stays local either way.
+  if (usingCloud) {
+    let rows = null;
+    try { rows = await searchVolume(slug, nq, lang); } catch { rows = null; }
+    if (seq !== searchSeq || lang !== S.textLang) return;
+    if (rpcHitsUsable(rows)) {
+      renderHits(rows.map((r) =>
+        ({ page: r.page, html: rpcSnippetHtml(r.snippet), more: 0 })));
+      refreshText();           // the visible pages pick up their <mark>s
+      return;
+    }
+  }
+
   if (!S.searchCache[lang]) box.innerHTML = `<p class="note-more">Fetching the full text…</p>`;
   let pages;
   try {
@@ -327,6 +348,14 @@ function snippetHtml(h) {
     esc(h.snippet.slice(h.matchEnd));
 }
 
+// One hit row's snippet HTML. Client-side hits carry match offsets into a
+// verbatim snippet and are escaped-then-marked here; RPC hits arrive as
+// prebuilt safe HTML (rpcSnippetHtml) with the fragment ts_headline chose.
+function hitHtml(h) {
+  if (h.html !== undefined) return h.html;
+  return `${h.cutStart ? "…" : ""}${snippetHtml(h)}${h.cutEnd ? "…" : ""}`;
+}
+
 function renderHits(hits) {
   const box = el("tp-results");
   box.hidden = false;
@@ -339,7 +368,7 @@ function renderHits(hits) {
   const rows = hits.map((h) => `
     <button type="button" class="tp-hit" data-page="${h.page}">
       <span class="tp-hit-page">p. ${h.page}</span>
-      <span class="tp-hit-snip">${h.cutStart ? "…" : ""}${snippetHtml(h)}${h.cutEnd ? "…" : ""}</span>
+      <span class="tp-hit-snip">${hitHtml(h)}</span>
       ${h.more ? `<span class="tp-hit-more">+${h.more} more on this page</span>` : ""}
     </button>`).join("");
   box.innerHTML = `

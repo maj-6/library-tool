@@ -32,6 +32,7 @@ import sys
 import threading
 import time
 import traceback
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -6143,6 +6144,86 @@ def api_publish_preview(slug: str):
                     "source": source, "warning": warning})
 
 
+# The website's textsearch.js folds the same glyphs client-side; the two maps
+# must stay identical (tests/test_page_search.py runs the same vectors as
+# tests/textsearch.test.js). U+FB05 is the long-s + t ligature, so it lands
+# on "st" like every other long s.
+_SEARCH_LIGATURES = {
+    "\u017f": "s",                                     # long s
+    "\ufb00": "ff", "\ufb01": "fi", "\ufb02": "fl",
+    "\ufb03": "ffi", "\ufb04": "ffl",
+    "\ufb05": "st", "\ufb06": "st",
+    "\u00e6": "ae", "\u0153": "oe",                 # ae / oe ligature vowels
+}
+# JavaScript's \s, character for character, so the desktop's normalization
+# collapses exactly the runs the client's does (Python's str.isspace()
+# differs at the margins: \x1c-\x1f and \x85 in, U+FEFF out).
+_SEARCH_SPACE = frozenset(
+    "\t\n\v\f\r \u00a0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006"
+    "\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000\ufeff")
+
+
+def _search_fold_char(c: str) -> str:
+    """One character -> its folded form: lowercase, ligature-expanded, then
+    NFD with the combining marks stripped ("\u00fa" -> "u"). May emit
+    0..3 characters."""
+    lower = c.lower()
+    base = _SEARCH_LIGATURES.get(lower, lower)
+    return "".join(ch for ch in unicodedata.normalize("NFD", base)
+                   if not "\u0300" <= ch <= "\u036f")
+
+
+def _search_normalize(text: str | None) -> str:
+    """volume_pages.search_body — the normalized search layer (issue #139).
+
+    A faithful port of buildSearchIndex in website/assets/textsearch.js,
+    minus the offset map: lowercase, long s and ligatures expanded,
+    diacritics stripped, hyphenated line breaks joined, whitespace
+    collapsed. The desktop owns this normalization; the verbatim `body` is
+    a separate layer and is never altered.
+    """
+    s = str(text or "")
+    n = len(s)
+    out: list[str] = []
+    i = 0
+    while i < n:
+        c = s[i]
+        # A hyphen carried across a line break is a typesetting artefact,
+        # not a character of the word: "phy-" + newline + "sick" folds to
+        # "physick". The soft hyphen (U+00AD) and the dedicated hyphen
+        # (U+2010) count too.
+        if c in "-\u00ad\u2010":
+            j = i + 1
+            while j < n and s[j] in " \t\r":
+                j += 1
+            if j < n and s[j] == "\n":
+                j += 1
+                while j < n and s[j] in _SEARCH_SPACE:
+                    j += 1
+                i = j
+                continue
+            if c == "\u00ad":     # a soft hyphen is invisible anywhere
+                i += 1
+                continue
+        if c in _SEARCH_SPACE:
+            j = i + 1
+            while j < n and s[j] in _SEARCH_SPACE:
+                j += 1
+            if out and out[-1] != " ":   # collapse runs, never lead
+                out.append(" ")
+            i = j
+            continue
+        folded = _search_fold_char(c)
+        if folded:                       # 0 chars: a bare combining mark
+            out.append(folded)
+        i += 1
+    if out and out[-1] == " ":           # never trail either
+        out.pop()
+    return "".join(out)
+
+
 def _publish_bundle(cloud: dict, slug: str, art: dict) -> None:
     """Upsert the bundle's artifacts and prune what left it, so a republish
     converges on exactly what the bundle says. Runs after the volumes row —
@@ -6161,10 +6242,25 @@ def _publish_bundle(cloud: dict, slug: str, art: dict) -> None:
 
     kept = sorted(art["pages"])
     if kept:
+        # body is the verbatim reading; search_body is the normalized layer
+        # docs/cloud/migrations/002_page_search.sql indexes (issue #139).
         rows = [{"slug": slug, "lang": lang, "page": n, "body": t,
-                 "updated_at": now}
+                 "search_body": _search_normalize(t), "updated_at": now}
                 for lang in kept for n, t in sorted(art["pages"][lang].items())]
-        sbase.upsert_rows(cloud, "volume_pages", "slug,lang,page", rows)
+        try:
+            sbase.upsert_rows(cloud, "volume_pages", "slug,lang,page", rows)
+        except sbase.SyncError as exc:
+            # A live project behind on docs/cloud/migrations lacks the search
+            # column; the page text still deserves to publish (the same
+            # degradation as _publish_run's volumes upsert).
+            if "search_body" not in str(exc):
+                raise
+            for row in rows:
+                row.pop("search_body", None)
+            sbase.upsert_rows(cloud, "volume_pages", "slug,lang,page", rows)
+            log.warning("volume_pages.search_body is missing on the cloud "
+                        "project — apply docs/cloud/migrations/"
+                        "002_page_search.sql (page text published unindexed)")
         langs_in = ",".join(f'"{lang}"' for lang in kept)
         sbase.delete_rows(cloud, "volume_pages",
                           f"slug=eq.{q(slug)}&lang=not.in.({q(langs_in)})")
