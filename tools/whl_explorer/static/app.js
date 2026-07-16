@@ -120,7 +120,7 @@ const WHL_ROW_FIELDS = ["title", "subtitle", "authors", "year", "publisher",
 
 const BUILD_FIELDS = ["title", "subtitle", "authors", "year", "publisher",
   "publisher_city", "edition", "volume", "group_id", "language", "pages",
-  "pdf_source", "pdf_file", "source_url", "notes"];
+  "rights", "pdf_source", "pdf_file", "source_url", "notes"];
 
 const state = {
   // key `${source}:${idx}` -> { book, checks, scans, verify, manual_urls }
@@ -10689,6 +10689,11 @@ async function uploadBuild() {
     el("build-msg").textContent = "Attach the PDF before publishing";
     return;
   }
+  // convenience only — the publish route enforces this server-side
+  if (!(b.rights || "").trim()) {
+    el("build-msg").textContent = "Set Rights before publishing";
+    return;
+  }
   let res;
   try {
     res = await (await fetch("/api/volumes/publish", {
@@ -10732,9 +10737,31 @@ function pollPublish() {
       state.buildSel = null;
       renderUpload();
       renderHome();
-      status(`PUBLISHED :: ${st.slug}`);
+      status(`PUBLISHED :: ${st.slug}${st.note ? " :: " + st.note : ""}`);
     }
   }, 700);
+}
+
+// Rights suggestion: the offline renewal check (the same one behind the
+// Catalogs copyright tag). Only a clear "Public domain (…)" finding
+// preselects the state; the curator still reviews and saves.
+async function suggestRights() {
+  const msg = el("build-msg");
+  const title = el("b-title").value.trim();
+  if (!title) { msg.textContent = "Title is required"; return; }
+  const q = new URLSearchParams({
+    title, author: el("b-authors").value.trim(), year: el("b-year").value.trim(),
+  });
+  let res;
+  try {
+    res = await (await fetch("/api/copyright/status?" + q)).json();
+  } catch (e) { msg.textContent = "Copyright check unreachable"; return; }
+  const s = res.copyright_status || "";
+  if (s.startsWith("Public domain")) {
+    el("b-rights").value = "public-domain";
+    buildDirty = true;
+  }
+  msg.textContent = s || "No determination";
 }
 
 function activeBuildTab() {
@@ -14603,6 +14630,10 @@ function init() {
   for (const t of document.querySelectorAll("#build-tabs .pane-tab")) {
     t.addEventListener("click", () => switchBuildTab(t.dataset.btab));
   }
+  el("b-rights-suggest").addEventListener("click", (ev) => {
+    ev.preventDefault();
+    suggestRights();
+  });
   el("b-ai").addEventListener("click", generateAiSummary);
   el("b-desc-load").addEventListener("click", () => el("b-desc-file").click());
   el("b-desc-file").addEventListener("change", () => {

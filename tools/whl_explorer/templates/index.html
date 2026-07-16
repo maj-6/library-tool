@@ -675,6 +675,20 @@
                     <label class="tool-label" for="b-pages">Pages</label>
                     <input id="b-pages" class="cad-input" />
                   </div>
+                  <div class="mf-field mf-third">
+                    <label class="tool-label" for="b-rights">Rights
+                      <a id="b-rights-suggest" class="mini-link" href="#"
+                         data-tip="Check the offline renewal data; a clear public-domain finding preselects">Suggest</a>
+                    </label>
+                    <select id="b-rights" class="cad-input"
+                            data-tip="What may publish: text only for public domain / cleared (docs/rights.md)">
+                      <option value="">Undecided</option>
+                      <option value="public-domain">Public domain</option>
+                      <option value="cleared">Cleared</option>
+                      <option value="searchable-only">Search only</option>
+                      <option value="no-public-text">No public text</option>
+                    </select>
+                  </div>
                   <div class="mf-field mf-full">
                     <label class="tool-label">Categories</label>
                     <div id="b-categories" class="cat-picker"></div>

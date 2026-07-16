@@ -812,7 +812,7 @@ _BUILD_FIELDS = ("published_slug",
                  "categories", "category_ids", "description",
                  "pdf_source", "pdf_file",
                  "pdf_sources", "bundle",
-                 "source_url", "notes", "status",
+                 "source_url", "notes", "status", "rights",
                  "ocr_active", "ocr_verified", "ocr_quality",
                  "title_pages", "thumbnail_source", "attention",
                  "images", "extra", "capture_id")
@@ -875,6 +875,15 @@ def _valid_src_key(b: dict, key) -> str:
 # draft -> ready (verified) -> uploaded (sent to WHL, cleared from Pending)
 _BUILD_STATUSES = ("draft", "ready", "uploaded")
 
+# The curator's explicit publication-rights decision (docs/rights.md). Empty
+# means undecided, which blocks publishing; only the _RIGHTS_TEXT_OK states
+# let the book's own words (page text, translations, notes) go public.
+# _RIGHTS_PUBLIC is how each state reads on the site (volumes.copyright_status).
+_BUILD_RIGHTS = ("", "public-domain", "cleared", "searchable-only", "no-public-text")
+_RIGHTS_TEXT_OK = ("public-domain", "cleared")
+_RIGHTS_PUBLIC = {"public-domain": "Public domain", "cleared": "Cleared",
+                  "searchable-only": "Search only", "no-public-text": "Restricted"}
+
 
 @app.route("/api/builds")
 def api_builds():
@@ -897,6 +906,9 @@ def api_builds_create():
     build["capture_id"] = _clean_capture_id(seed.get("capture_id"))
     if build["status"] not in _BUILD_STATUSES:
         build["status"] = "draft"
+    if build["rights"] not in _BUILD_RIGHTS:
+        return jsonify({"ok": False,
+                        "error": f"unknown rights value {build['rights']!r}"}), 400
     build["id"] = lib.gen_id(set(builds))
     build["created_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     build["updated_at"] = build["created_at"]
@@ -912,6 +924,9 @@ def api_builds_update(build_id: str):
     if build_id not in builds:
         abort(404)
     payload = request.get_json(silent=True) or {}
+    if str(payload.get("rights") or "").strip() not in _BUILD_RIGHTS:
+        return jsonify({"ok": False,
+                        "error": f"unknown rights value {payload['rights']!r}"}), 400
     b = builds[build_id]
     was = b.get("status")
     for f in _BUILD_FIELDS:
@@ -5433,7 +5448,7 @@ def api_analyze_relevance():
 _publish_lock = threading.Lock()
 _builds_lock = threading.Lock()      # whl_builds.json is read-modify-written
 _publish: dict = {"running": False, "build": "", "stage": "idle", "sent": 0,
-                  "total": 0, "error": "", "url": "", "slug": ""}
+                  "total": 0, "error": "", "url": "", "slug": "", "note": ""}
 
 
 def _r2_cfg() -> dict:
@@ -5466,6 +5481,7 @@ def _volume_row(b: dict, slug: str, url: str, path: str, size: int, actor: str,
             "category_paths": paths,
             "description": b.get("description") or "",
             "source_url": b.get("source_url") or b.get("pdf_source") or "",
+            "copyright_status": _RIGHTS_PUBLIC.get(b.get("rights") or "", ""),
             "pdf_url": url, "pdf_path": path, "pdf_bytes": size,
             "thumbnail_url": thumb_url, "thumbnail_path": thumb_path,
             "uploaded_by_name": actor,
@@ -5505,6 +5521,22 @@ def _bundle_artifacts(bid: str, b: dict) -> dict:
         if out["notes"]:
             out["assets"]["notes"] = len(out["notes"])
     return out
+
+
+def _rights_artifacts(bid: str, b: dict) -> tuple[dict, bool]:
+    """The bundle the rights decision actually allows out (art, withheld).
+    The About article is the curator's own writing and always publishes; the
+    book's words — page text, translations, notes (verbatim quotes) — only
+    with a permitting decision. _publish_bundle's pruning then removes any
+    text rows a previous publish sent."""
+    art = _bundle_artifacts(bid, b)
+    if b.get("rights") in _RIGHTS_TEXT_OK:
+        return art, False
+    withheld = bool(art["pages"] or art["notes"])
+    art["pages"], art["notes"] = {}, []
+    art["assets"] = {k: v for k, v in art["assets"].items()
+                     if k not in ("pages", "translations", "notes")}
+    return art, withheld
 
 
 def _publish_preview_thumb(bid: str, b: dict) -> str:
@@ -5876,7 +5908,7 @@ def _publish_run(bid: str, actor: str) -> None:
                     thumb_url = thumb_path = ""
 
             stage("recording")
-            art = _bundle_artifacts(bid, b)
+            art, withheld = _rights_artifacts(bid, b)
             row = dict(_volume_row(b, slug, url, path, size, actor,
                                     thumb_url, thumb_path),
                        assets=art["assets"])
@@ -5886,11 +5918,10 @@ def _publish_run(bid: str, actor: str) -> None:
                 # A live project that hasn't re-run schema.sql lacks the new
                 # columns; the book still deserves to publish.
                 missing = ("category_paths", "assets", "thumbnail_url", "thumbnail_path",
-                           "volume", "group_id")
+                           "volume", "group_id", "copyright_status")
                 if not any(k in str(exc) for k in missing):
                     raise
-                for k in ("category_paths", "assets", "thumbnail_url", "thumbnail_path",
-                          "volume", "group_id"):
+                for k in missing:
                     row.pop(k, None)
                 sbase.upsert_volume(cloud, row)
                 log.warning("optional volumes metadata is missing on the cloud "
@@ -5929,7 +5960,10 @@ def _publish_run(bid: str, actor: str) -> None:
                 lib.save_json(BUILDS_PATH, fresh)
         activity("published", "book", actor=actor or None)
         log.info("published volume %s (%.0f MB) -> %s", slug, size / 1e6, url)
-        stage("done", url=url, slug=slug, error="")
+        if withheld:
+            log.info("text withheld for %s (rights: %s)", slug, b.get("rights"))
+        stage("done", url=url, slug=slug, error="",
+              note="page text and notes withheld (rights)" if withheld else "")
     except Exception as exc:
         log.error("publish failed for build %s", bid, exc_info=exc)
         stage("error", error=f"{type(exc).__name__}: {exc}")
@@ -5947,13 +5981,16 @@ def api_volumes_publish():
         abort(404)
     if builds[bid].get("status") not in ("ready", "uploaded"):
         return jsonify({"ok": False, "error": "only verified entries can be published"}), 400
+    if builds[bid].get("rights") not in _BUILD_RIGHTS[1:]:
+        return jsonify({"ok": False, "error": "no rights decision — set Rights in "
+                        "the Editor before publishing"}), 400
     if not _cloud_cfg():
         return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Sync)"}), 400
     with _publish_lock:
         if _publish["running"]:
             return jsonify({"ok": False, "error": "a publish is already running"}), 409
         _publish.update(running=True, build=bid, stage="starting", sent=0, total=0,
-                        error="", url="", slug="")
+                        error="", url="", slug="", note="")
     threading.Thread(target=_publish_run, args=(bid, _actor()), daemon=True).start()
     return jsonify({"ok": True})
 
