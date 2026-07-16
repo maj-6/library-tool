@@ -112,9 +112,8 @@ function actions(v) {
       <a class="btn primary" href="read.html?slug=${slug}">Read online</a>
       <a class="btn" href="${esc(href)}" target="_blank" rel="noopener">Download PDF${size ? ` · ${size}` : ""}</a>`;
   }
-  return `
-    <a class="btn" aria-disabled="true" title="No scan yet">Read online</a>
-    <a class="btn" aria-disabled="true" title="No scan yet">PDF pending</a>`;
+  // no scan yet: say so in plain text rather than dead button-shaped controls
+  return `<span class="rec-noscan">Scan unavailable — no digitized copy yet</span>`;
 }
 
 function notFound(slug) {
