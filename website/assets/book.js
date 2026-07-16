@@ -172,7 +172,7 @@ async function main() {
         ${availability(v)}
       </aside>
     </div>`;
-  document.title = `${v.title} · World Herb Library`;
+  document.title = `${v.title} · Archive Browser`;
 
   const a = (v && v.assets) || {};
   if (a.about) {
