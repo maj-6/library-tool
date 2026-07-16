@@ -2304,17 +2304,24 @@ def api_build_ocr_regions_put(build_id: str):
     if not src:
         return jsonify({"ok": False, "error": "unknown source"}), 400
     try:
+        # OverflowError: json.loads accepts the non-standard Infinity
+        # literal, and int(inf) raises it rather than ValueError
         page = int(p.get("page") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         page = 0
     if page < 1:
         return jsonify({"ok": False, "error": "bad page"}), 400
     raw = p.get("items")
     if not isinstance(raw, list) or len(raw) > _RW_MAX_ITEMS:
         return jsonify({"ok": False, "error": "bad items"}), 400
+
+    def order_of(it):
+        o = it.get("order")
+        return float(o) if isinstance(o, (int, float)) \
+            and not isinstance(o, bool) else 0.0
+
     items = []
-    for it in sorted((x for x in raw if isinstance(x, dict)),
-                     key=lambda x: x.get("order") or 0):
+    for it in sorted((x for x in raw if isinstance(x, dict)), key=order_of):
         box = it.get("box") or {}
         try:
             x = min(1.0, max(0.0, float(box.get("x") or 0)))
@@ -2337,7 +2344,7 @@ def api_build_ocr_regions_put(build_id: str):
     if dims:
         try:
             dims = {k: int(dims.get(k) or 0) for k in ("w", "h", "dpi")}
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             dims = None
     _ocr_save_page_regions(build_id, src, page, items, dims,
                            doc=_ocr_name(str(p.get("doc") or "compiled.txt")))
@@ -2358,17 +2365,24 @@ def api_build_ocr_regions_recompile(build_id: str):
     src = _valid_src_key(b, p.get("src"))
     if not src:
         return jsonify({"ok": False, "error": "unknown source"}), 400
-    try:
-        only = int(p["page"]) if "page" in p else None
-    except (TypeError, ValueError, KeyError):
-        only = None
+    # an absent page means "every region page"; a PRESENT but garbage page
+    # must refuse — mapping it to the no-filter case would rewrite the whole
+    # compiled file when the caller asked to touch exactly one page
+    only = None
+    if "page" in p:
+        try:
+            only = int(p["page"])
+        except (TypeError, ValueError, OverflowError):
+            only = 0
+        if only < 1:
+            return jsonify({"ok": False, "error": "bad page"}), 400
     meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
     pages = (meta.get("regions") or {}).get(src) or {}
     done, docs = 0, set()
     for k in sorted((k for k in pages if str(k).isdigit()), key=int):
         rec = pages[k]
         n = int(k)
-        if not isinstance(rec, dict) or (only and n != only):
+        if not isinstance(rec, dict) or (only is not None and n != only):
             continue
         doc = _ocr_name(str(rec.get("doc") or "compiled.txt"))
         _ocr_merge_page(build_id, doc, n,

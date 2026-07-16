@@ -14859,6 +14859,11 @@ function renderReplicaBooks() {
 
 async function selectReplicaBook(bid) {
   if (rwState.dirty && !confirm("Discard unsaved region edits?")) return;
+  // one shared sequence for book, source, AND page context: any in-flight
+  // fetch from before this click resolves into a dead sequence number and
+  // must not install its data (two quick book clicks used to interleave —
+  // book A's page strip and PDF under book B's regions)
+  const seq = ++rwState.seq;
   rwState.book = bid; rwState.page = 0; rwState.items = [];
   rwState.sel = []; rwState.dirty = false;
   el("rw-canvas").hidden = true;
@@ -14873,28 +14878,34 @@ async function selectReplicaBook(bid) {
   sel.hidden = srcs.length < 2;
   rwState.src = srcs.includes(rwState.src) ? rwState.src : "primary";
   sel.value = rwState.src;
-  await renderReplicaPages();
+  await renderReplicaPages(seq);
+  if (seq !== rwState.seq) return;
   rwSyncBar();
 }
 
-async function renderReplicaPages() {
+async function renderReplicaPages(seq) {
   const bid = rwState.book;
+  const src = rwState.src;
+  const pdf = rwPdfForSrc(bid, src);
   const meta = await ocrLayoutMeta(bid);
-  rwState.pdf = rwPdfForSrc(bid, rwState.src);
-  rwState.regionPages = ((meta.regionPages || {})[rwState.src] || []).slice();
+  if (seq !== rwState.seq) return;
+  const regionPages = ((meta.regionPages || {})[src] || []).slice();
   let count = 0;
-  if (rwState.pdf) {
-    let info = ocrState.pdfInfo[rwState.pdf];
+  if (pdf) {
+    let info = ocrState.pdfInfo[pdf];
     if (!info) {
       try {
         const data = await (await fetch(
-          "/api/pdf/info?path=" + encodeURIComponent(rwState.pdf))).json();
-        if (data.ok) { info = data; ocrState.pdfInfo[rwState.pdf] = data; }
+          "/api/pdf/info?path=" + encodeURIComponent(pdf))).json();
+        if (data.ok) { info = data; ocrState.pdfInfo[pdf] = data; }
       } catch (e) { /* the strip still lists the region pages */ }
+      if (seq !== rwState.seq) return;
     }
     if (info) count = info.pages || (info.dims || []).length || 0;
   }
-  rwState.pageCount = Math.max(count, ...rwState.regionPages, 0);
+  rwState.pdf = pdf;
+  rwState.regionPages = regionPages;
+  rwState.pageCount = Math.max(count, ...regionPages, 0);
   const box = el("rw-pages");
   box.innerHTML = "";
   const frag = document.createDocumentFragment();
@@ -15186,12 +15197,20 @@ function rwReorder(it, dir) {
 function rwKeyDown(ev) {
   const panel = el("replica");
   if (!panel || !panel.classList.contains("active")) return;
+  // a global overlay (Settings, catalog pickers…) over the tab owns its own
+  // keys — Del/Tab/digits reaching the workbench would edit regions unseen
+  if (document.querySelector(".overlay:not([hidden])")) return;
+  // only keys aimed at the workbench (or at nothing at all) count: focus in
+  // some other component's control must not drive the region editor
+  const t = ev.target;
+  const elT = t instanceof Element ? t : null;
+  const inReplica = !!(elT && elT.closest("#replica"));
+  if (!inReplica && t !== document.body && t !== document.documentElement) return;
   if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "s") {
     ev.preventDefault(); rwSave(); return;
   }
-  const t = ev.target;
-  if (t && (t.tagName === "TEXTAREA" || t.tagName === "INPUT" ||
-            t.tagName === "SELECT")) return;
+  if (elT && (elT.isContentEditable || elT.tagName === "TEXTAREA" ||
+              elT.tagName === "INPUT" || elT.tagName === "SELECT")) return;
   const a = rwActive();
   if (/^[0-9]$/.test(ev.key) && rwState.sel.length) {
     const role = RW_ROLES[(parseInt(ev.key, 10) + 9) % 10];
@@ -15226,12 +15245,16 @@ function rwKeyDown(ev) {
 async function rwClipWords() {
   const a = rwActive();
   if (!a || !rwState.pdf) return;
+  const seq = rwState.seq;
   let res = null;
   try {
     res = await (await fetch(
       `/api/pdf/words?path=${encodeURIComponent(rwState.pdf)}` +
       `&page=${rwState.page}&build_id=${encodeURIComponent(rwState.book)}`)).json();
   } catch (e) { /* handled below */ }
+  // the page (or the region itself) may be gone by now: applying the clip
+  // would write onto an orphan and dirty a page the user never touched
+  if (seq !== rwState.seq || !rwState.items.includes(a)) return;
   if (!res || !res.ok || !res.found) {
     status("CLIP :: no word boxes on this page — run Tesseract, or no text layer");
     return;
@@ -15254,37 +15277,43 @@ async function rwClipWords() {
 
 async function rwSave() {
   if (!rwState.dirty || !rwState.page) return;
+  // everything after the await must use THIS context, not whatever page or
+  // book the user navigated to while the PUT was in flight — the old code
+  // wiped the NEW page's dirty flag and dotted the wrong page button
+  const book = rwState.book, src = rwState.src, page = rwState.page;
+  const seq = rwState.seq;
   const items = [...rwState.items].sort((a, b) => a.order - b.order)
     .map((it, i) => ({ role: it.role, order: i, box: it.box, text: it.text }));
   try {
     const r = await (await fetch(
-      `/api/builds/${encodeURIComponent(rwState.book)}/ocr-regions`, {
+      `/api/builds/${encodeURIComponent(book)}/ocr-regions`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ src: rwState.src, page: rwState.page,
-                               doc: rwState.doc, dims: rwState.dims, items }),
+        body: JSON.stringify({ src, page, doc: rwState.doc,
+                               dims: rwState.dims, items }),
       })).json();
     if (!r.ok) throw new Error(r.error || "save failed");
   } catch (e) {
     status("REGIONS :: " + e.message);
     return;
   }
-  rwState.dirty = false;
   // the facsimile caches now describe the old record
   ocrState.regionsCache.clear();
-  delete ocrState.layoutMeta[rwState.book];
-  const has = rwState.regionPages.includes(rwState.page);
-  if (items.length && !has) rwState.regionPages.push(rwState.page);
-  if (!items.length && has) {
-    rwState.regionPages = rwState.regionPages.filter((p) => p !== rwState.page);
+  delete ocrState.layoutMeta[book];
+  if (book === rwState.book && src === rwState.src) {
+    const has = rwState.regionPages.includes(page);
+    if (items.length && !has) rwState.regionPages.push(page);
+    if (!items.length && has) {
+      rwState.regionPages = rwState.regionPages.filter((p) => p !== page);
+    }
+    const btn = el("rw-pages").querySelector(`[data-page="${page}"]`);
+    if (btn) {
+      btn.innerHTML = `${page}` +
+        (items.length ? '<span class="rw-dot">●</span>' : "");
+    }
   }
-  const btn = el("rw-pages").querySelector(`[data-page="${rwState.page}"]`);
-  if (btn) {
-    btn.innerHTML = `${rwState.page}` +
-      (items.length ? '<span class="rw-dot">●</span>' : "");
-    btn.classList.add("active");
-  }
-  status(`REGIONS SAVED :: p ${rwState.page} · ${items.length}`);
+  if (seq === rwState.seq) rwState.dirty = false;
+  status(`REGIONS SAVED :: p ${page} · ${items.length}`);
   rwSyncBar();
 }
 
@@ -15319,12 +15348,14 @@ function initReplica() {
       el("rw-src").value = rwState.src;
       return;
     }
+    const seq = ++rwState.seq;   // kill any in-flight fetch of the old source
     rwState.src = el("rw-src").value;
     rwState.page = 0; rwState.items = []; rwState.sel = [];
     rwState.dirty = false;
     el("rw-canvas").hidden = true;
     el("rw-empty").hidden = false;
-    await renderReplicaPages();
+    await renderReplicaPages(seq);
+    if (seq !== rwState.seq) return;
     rwSyncBar();
   });
   el("rw-overlay").addEventListener("mousedown", rwMouseDown);
