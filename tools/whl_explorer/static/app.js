@@ -15410,11 +15410,42 @@ async function rwRecompile() {
   }
 }
 
+// Electron's renderer does not implement window.prompt (it throws) — a
+// minimal inline dialog stands in. Enter = OK, Esc / scrim click = cancel;
+// resolves the entered string, or null on cancel, like prompt() did.
+function rwPrompt(message, dflt) {
+  return new Promise((resolve) => {
+    const ov = document.createElement("div");
+    ov.className = "overlay";
+    ov.innerHTML = `<div class="win rw-prompt">
+      <p></p><input class="cad-input" type="text">
+      <div class="rw-prompt-btns">
+        <button class="cad-btn tiny" type="button" data-ok>OK</button>
+        <button class="cad-btn tiny" type="button" data-cancel>Cancel</button>
+      </div></div>`;
+    ov.querySelector("p").textContent = message;
+    const input = ov.querySelector("input");
+    input.value = dflt || "";
+    const done = (v) => { ov.remove(); resolve(v); };
+    ov.querySelector("[data-ok]").addEventListener("click", () => done(input.value));
+    ov.querySelector("[data-cancel]").addEventListener("click", () => done(null));
+    ov.addEventListener("mousedown", (ev) => { if (ev.target === ov) done(null); });
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") done(input.value);
+      else if (ev.key === "Escape") done(null);
+      ev.stopPropagation();
+    });
+    document.body.appendChild(ov);
+    input.focus();
+    input.select();
+  });
+}
+
 async function rwTplSave() {
   if (!rwState.page) return;
   if (rwState.dirty) { status("TEMPLATE :: save the page first"); return; }
-  const name = (prompt("Template name (e.g. recto, verso):",
-                       el("rw-tpl").value || "recto") || "").trim();
+  const name = ((await rwPrompt("Template name (e.g. recto, verso):",
+                                el("rw-tpl").value || "recto")) || "").trim();
   if (!name) return;
   try {
     const r = await (await fetch(
@@ -15452,10 +15483,11 @@ function rwParsePages(spec) {
 async function rwTplApply() {
   const name = el("rw-tpl").value;
   if (!name || !rwState.book) return;
-  const spec = prompt(
-    `Apply "${name}" to pages (e.g. 121-140, 150):\n` +
+  const spec = await rwPrompt(
+    `Apply "${name}" to pages (e.g. 121-140, 150).\n` +
     "Pages that already have regions are skipped. Each stamped region " +
-    "pre-fills its text from the word boxes inside it, when the page has any.");
+    "pre-fills its text from the word boxes inside it, when the page has any.",
+    "");
   const pages = rwParsePages(spec);
   if (!pages.length) return;
   try {
