@@ -103,9 +103,15 @@ def draw_overlay(png: bytes, page_dict: dict, out_path: Path) -> None:
     from PIL import Image, ImageDraw
     img = Image.open(io.BytesIO(png)).convert("RGB")
     dr = ImageDraw.Draw(img)
+    # API coords live in the response's `dimensions` space, which may differ
+    # from the sent raster if the API resized (same convention _ocr_mistral
+    # normalizes against) — scale into the raster's pixel space before drawing
+    dim = page_dict.get("dimensions") or {}
+    sx = img.width / float(dim.get("width") or img.width)
+    sy = img.height / float(dim.get("height") or img.height)
 
     def rect(box, color, label):
-        x0, y0, x1, y1 = box
+        x0, y0, x1, y1 = (box[0] * sx, box[1] * sy, box[2] * sx, box[3] * sy)
         if x1 <= x0 or y1 <= y0:
             return
         dr.rectangle([x0, y0, x1, y1], outline=color, width=3)
@@ -142,7 +148,14 @@ def main() -> None:
     pdf = Path(args.pdf)
     if not pdf.is_file():
         sys.exit(f"not a file: {pdf}")
+    import fitz
+    with fitz.open(str(pdf)) as doc:
+        page_count = doc.page_count
     pages = parse_pages(args.pages)
+    dropped = [n for n in pages if n > page_count]
+    if dropped:
+        print(f"skipping pages past the {page_count}-page PDF: {dropped}")
+        pages = [n for n in pages if n <= page_count]
     if not pages:
         sys.exit("no pages parsed")
     if not args.raster_only and len(pages) > args.limit:
@@ -152,7 +165,19 @@ def main() -> None:
     stem = pdf.stem[:40]
     key = "" if args.raster_only else find_key(args)
 
+    # summary.json is written in `finally`: a mid-run failure must not throw
+    # away the pages that were already paid for and inspected
     summary: dict[str, dict] = {}
+    try:
+        run_pages(args, pdf, pages, out, stem, key, summary)
+    finally:
+        (out / "summary.json").write_text(
+            json.dumps(summary, indent=1), encoding="utf-8")
+        print(f"wrote {out}/summary.json")
+
+
+def run_pages(args, pdf: Path, pages: list[int], out: Path, stem: str,
+              key: str, summary: dict) -> None:
     for n in pages:
         png = page_png(pdf, n, args.width)
         (out / f"{stem}-p{n}.raster.png").write_bytes(png)
@@ -166,6 +191,10 @@ def main() -> None:
             body = e.read().decode("utf-8", "replace")[:500]
             print(f"p{n}: HTTP {e.code}: {body}")
             summary[str(n)] = {"error": f"HTTP {e.code}", "detail": body}
+            continue
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            print(f"p{n}: {type(e).__name__}: {e}")
+            summary[str(n)] = {"error": f"{type(e).__name__}: {e}"}
             continue
         for pg in resp:
             for im in pg.get("images") or []:
@@ -185,9 +214,6 @@ def main() -> None:
                            "markdown_chars": len(pg.get("markdown") or "")}
         print(f"p{n}: {summary[str(n)]['n_blocks']} blocks {counts}, "
               f"{summary[str(n)]['n_figures']} figures")
-    (out / "summary.json").write_text(
-        json.dumps(summary, indent=1), encoding="utf-8")
-    print(f"wrote {out}/summary.json")
 
 
 if __name__ == "__main__":

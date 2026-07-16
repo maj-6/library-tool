@@ -2245,12 +2245,15 @@ def api_build_ocr_layout(build_id: str):
         abort(404)
     meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
     # word_pages is per source: {"<src>": [pages...]}, so the client places a
-    # facsimile only for the source whose boxes it actually has
+    # facsimile only for the source whose boxes it actually has; word_docs
+    # ({"<src>": {"<page>": name}}) says which compiled file each page's box
+    # text came from, so viewing any OTHER doc flows that doc's text instead
     word_pages = {src: sorted(int(k) for k in pages if str(k).isdigit())
                   for src, pages in (meta.get("words") or {}).items()
                   if isinstance(pages, dict)}
     return jsonify({"ok": True, "images": meta.get("images") or {},
-                    "word_pages": word_pages})
+                    "word_pages": word_pages,
+                    "word_docs": meta.get("words_doc") or {}})
 
 
 # --- PDF page rasterization (the OCR tab's side-by-side page view) ---------------
@@ -3156,7 +3159,8 @@ def _ocr_save_page_images(build_id: str, page: int, images: list[dict],
     return text
 
 
-def _ocr_save_page_words(build_id: str, src_key: str, page: int, words: list) -> None:
+def _ocr_save_page_words(build_id: str, src_key: str, page: int, words: list,
+                         doc: str = "") -> None:
     """Persist one page's OCR word boxes to the sidecar (ocr/layout.json,
     {words: {"<src>": {"<page>": [{t,x,y,w,h,l}, ...]}}}). /api/pdf/words reads
     these back for a scan with no text layer, so the Layout facsimile works on
@@ -3167,20 +3171,34 @@ def _ocr_save_page_words(build_id: str, src_key: str, page: int, words: list) ->
     destroy boxes another engine paid to produce — the box positions stay
     valid for the unchanged page image even when the transcription moves on,
     and cross-engine work (clip-from-words, region seeding) depends on them
-    surviving."""
+    surviving.
+
+    `doc` records WHICH compiled file's transcription the boxes carry
+    (words_doc, same src/page keying): the words' `t` values are that run's
+    text, and the client only places the facsimile when the doc being viewed
+    is the one the boxes belong to — any other doc flows its own text."""
     src_key = src_key or "primary"
     meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
     with _ocr_merge_lock:
         meta_path.parent.mkdir(parents=True, exist_ok=True)
         meta = lib.load_json(meta_path, {})
         wmap = meta.setdefault("words", {})
+        dmap = meta.setdefault("words_doc", {})
         pages = wmap.setdefault(src_key, {})
+        docs = dmap.setdefault(src_key, {})
         if words:
             pages[str(int(page))] = words
+            if doc:
+                docs[str(int(page))] = doc
         else:
             pages.pop(str(int(page)), None)
+            docs.pop(str(int(page)), None)
             if not pages:
                 wmap.pop(src_key, None)
+        if not docs:
+            dmap.pop(src_key, None)
+        if not dmap:
+            meta.pop("words_doc", None)
         lib.save_json(meta_path, meta)
 
 
@@ -3223,7 +3241,8 @@ def _ocr_job_run(job_id: str) -> None:
                 # page image no matter which engine wrote the transcription.
                 if "words" in result:
                     _ocr_save_page_words(job["build_id"], src_key, n,
-                                         result.get("words") or [])
+                                         result.get("words") or [],
+                                         doc=_ocr_name(job["target"]))
             else:
                 text = result
             _ocr_merge_page(job["build_id"], job["target"], n, text)
@@ -3416,24 +3435,32 @@ def _renumber_layout_words(build_id: str, src_key: str, removed: list[int]) -> N
     if not meta_path.is_file():
         return
     removed_set = set(removed)
+
+    def remap(pages: dict) -> dict:
+        out = {}
+        for k, v in pages.items():
+            try:
+                n = int(k)
+            except (TypeError, ValueError):
+                continue
+            if n in removed_set:
+                continue
+            out[str(n - sum(1 for r in removed if r < n))] = v
+        return out
+
     with _ocr_merge_lock:
         meta = lib.load_json(meta_path, {})
         dirty = False
-        wmap = meta.get("words")
-        if isinstance(wmap, dict):
+        # words and words_doc share the src/page keying; shift both
+        for key in ("words", "words_doc"):
+            wmap = meta.get(key)
+            if not isinstance(wmap, dict):
+                continue
             pages = wmap.get(src_key or "primary")
-            if isinstance(pages, dict):
-                remapped = {}
-                for k, v in pages.items():
-                    try:
-                        n = int(k)
-                    except (TypeError, ValueError):
-                        continue
-                    if n in removed_set:
-                        continue
-                    remapped[str(n - sum(1 for r in removed if r < n))] = v
-                wmap[src_key or "primary"] = remapped
-                dirty = True
+            if not isinstance(pages, dict):
+                continue
+            wmap[src_key or "primary"] = remap(pages)
+            dirty = True
 
         images = meta.get("images")
         if isinstance(images, dict):

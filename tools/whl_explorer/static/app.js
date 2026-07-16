@@ -7583,10 +7583,13 @@ function createPdfViewer() {
     if (name === "extracted.txt" || !pagesSec) {
       return fillWordLayout(pane, pagesPdf, page, bid);
     }
-    const meta = bid ? await ocrLayoutMeta(bid) : { images: {}, wordPages: {} };
+    const meta = bid ? await ocrLayoutMeta(bid) : { images: {}, wordPages: {}, wordDocs: {} };
     if (!pane.isConnected) return;
-    // an OCR result with word boxes places a facsimile; else it flows its text
-    if (ocrHasWords(meta, src, page)) {
+    // the doc that produced the word boxes places a facsimile; any other doc
+    // flows its own text (the boxes carry the box run's transcription, which
+    // outlives text-only re-OCRs — see ocrWordsAreDocs)
+    if (ocrHasWords(meta, src, page) &&
+        ocrWordsAreDocs(meta, src, page, (pagesSaveTo && pagesSaveTo.name) || "")) {
       return fillWordLayout(pane, pagesPdf, page, bid);
     }
     const text = pagesSec.map.has(page) ? pagesSec.map.get(page) : null;
@@ -13337,9 +13340,9 @@ async function ocrLayoutMeta(bid) {
       const r = await (await fetch(
         `/api/builds/${encodeURIComponent(bid)}/ocr-layout`)).json();
       ocrState.layoutMeta[bid] = r.ok
-        ? { images: r.images || {}, wordPages: r.word_pages || {} }
-        : { images: {}, wordPages: {} };
-    } catch (e) { ocrState.layoutMeta[bid] = { images: {}, wordPages: {} }; }
+        ? { images: r.images || {}, wordPages: r.word_pages || {}, wordDocs: r.word_docs || {} }
+        : { images: {}, wordPages: {}, wordDocs: {} };
+    } catch (e) { ocrState.layoutMeta[bid] = { images: {}, wordPages: {}, wordDocs: {} }; }
   }
   return ocrState.layoutMeta[bid];
 }
@@ -13348,6 +13351,17 @@ async function ocrLayoutMeta(bid) {
 function ocrHasWords(meta, srcKey, page) {
   const wp = meta && meta.wordPages && meta.wordPages[srcKey || "primary"];
   return Array.isArray(wp) && wp.includes(page);
+}
+
+// ...and do those boxes belong to the doc being viewed? The boxes' `t` values
+// are the transcription of the run that produced them (word_docs); showing
+// them under a DIFFERENT doc would place stale text over that doc's fresh
+// content, so the mismatch flows the doc's own text instead. A sidecar from
+// before word_docs existed has no record — treat as matching.
+function ocrWordsAreDocs(meta, srcKey, page, docName) {
+  const dm = meta && meta.wordDocs && meta.wordDocs[srcKey || "primary"];
+  const rec = dm && dm[String(page)];
+  return !rec || String(rec).toLowerCase() === String(docName || "").toLowerCase();
 }
 
 // Markdown-lite for one page of OCR output (Mistral emits markdown): headers,
@@ -13386,14 +13400,18 @@ async function fillOcrLayout(pane, pdf) {
   const d = ocrSelDoc();
   // The PDF's own text-layer extraction always shows the placed facsimile. Any
   // other doc (an OCR result) shows ITS content, so switching docs swaps what
-  // the page holds: a result WITH word boxes (Tesseract/Textract, incl. an
-  // image-only scan) places a facsimile from the sidecar; a text-only result
-  // (Claude) flows its text into the page.
+  // the page holds: the doc whose run produced the sidecar's word boxes
+  // (Tesseract/Textract, incl. an image-only scan) places a facsimile; every
+  // other doc — a text-only result (Claude/Mistral), or a different target —
+  // flows its own text into the page. Boxes persist across text-only re-OCRs
+  // (they still fit the page image), so the doc match is what keeps a fresh
+  // transcription from being shadowed by the box run's older text.
   if (d && d.buildId && ocrState.pages &&
       (d.fileName || d.name) !== srcExtractedName(docSrcKey(d))) {
     const meta = await ocrLayoutMeta(d.buildId);
     if (!pane.isConnected || ocrSelDoc() !== d) return;
-    if (ocrHasWords(meta, docSrcKey(d), page)) {
+    if (ocrHasWords(meta, docSrcKey(d), page) &&
+        ocrWordsAreDocs(meta, docSrcKey(d), page, d.fileName || d.name)) {
       return fillWordLayout(pane, pdf, page, d.buildId);
     }
     const sec = ocrState.pages;
