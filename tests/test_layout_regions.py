@@ -478,3 +478,32 @@ def test_templates_apply_and_outliers(client, data_root):
                        json={"name": "nope", "pages": [1]}).get_json()["ok"] is False
     assert client.put(f"/api/builds/{bid}/ocr-templates",
                       json={"name": "../x", "from_page": 10}).status_code == 400
+
+
+def test_norm_recompile_target_is_per_source(client, data_root):
+    import libcommon as lib
+    import server
+    bid = "b00212345678"
+    builds = lib.load_json(server.BUILDS_PATH, {})
+    builds[bid] = {"id": bid, "title": "T",
+                   "pdf_sources": [{"id": "scan2", "path": "x.pdf"}]}
+    lib.save_json(server.BUILDS_PATH, builds)
+    for src in ("primary", "scan2"):
+        _put(client, bid, {"src": src, "page": 1, "doc": "compiled.txt",
+                           "items": [{"role": "body", "order": 0,
+                                      "box": {"x": 0.1, "y": 0.1,
+                                              "w": 0.6, "h": 0.6},
+                                      "text": f"dipl {src}",
+                                      "norm": f"norm {src}"}]})
+    r1 = client.post(f"/api/builds/{bid}/ocr-regions/recompile",
+                     json={"layer": "norm"}).get_json()
+    r2 = client.post(f"/api/builds/{bid}/ocr-regions/recompile",
+                     json={"src": "scan2", "layer": "norm"}).get_json()
+    # two scans must not interleave into one modern-edition file
+    assert r1["docs"] == ["normalized.txt"]
+    assert r2["docs"] == ["normalized-scan2.txt"]
+    d = server._entry_dir(bid) / "ocr"
+    assert "norm primary" in (d / "normalized.txt").read_text(encoding="utf-8")
+    assert "norm scan2" in (d / "normalized-scan2.txt").read_text(encoding="utf-8")
+    # the secondary's file maps back to its scan like every per-source doc
+    assert server._ocr_sources(bid).get("normalized-scan2.txt") == "scan2"

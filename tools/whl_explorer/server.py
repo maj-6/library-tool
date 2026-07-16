@@ -2392,13 +2392,19 @@ def api_build_ocr_regions_recompile(build_id: str):
             only = 0
         if only < 1:
             return jsonify({"ok": False, "error": "bad page"}), 400
-    # layer "norm" composes the normalized reading into ONE explicit target
-    # (default normalized.txt) — the modern-edition text; the default layer
-    # writes each page's diplomatic body into the file its record names
+    # layer "norm" composes the normalized reading into one explicit target —
+    # the modern-edition text; the default layer writes each page's
+    # diplomatic body into the file its record names. The default target is
+    # per SOURCE (normalized.txt / normalized-<src>.txt): both sources of a
+    # two-scan build merge by bare page number, so sharing one file would
+    # silently interleave two different books' pages into a chimera.
     layer = "norm" if str(p.get("layer") or "") in ("norm", "normalized") \
         else "text"
-    target = _ocr_name(str(p.get("target") or "normalized.txt")) \
-        if layer == "norm" else ""
+    target = ""
+    if layer == "norm":
+        default_norm = "normalized.txt" if src == "primary" \
+            else f"normalized-{src}.txt"
+        target = _ocr_name(str(p.get("target") or default_norm))
     meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
     pages = (meta.get("regions") or {}).get(src) or {}
     done, docs = 0, set()
@@ -2413,6 +2419,10 @@ def api_build_ocr_regions_recompile(build_id: str):
                                                   layer=layer))
         docs.add(doc)
         done += 1
+    # a secondary source's normalized file must map back to its scan, like
+    # every other per-source OCR doc, or the UI pairs it with the wrong PDF
+    if layer == "norm" and done and src != "primary":
+        _ocr_set_source(build_id, target, src)
     return jsonify({"ok": True, "pages": done, "docs": sorted(docs)})
 
 
@@ -2421,16 +2431,10 @@ def api_build_ocr_regions_recompile(build_id: str):
 _RW_TPL_RE = re.compile(r"^[\w\- ]{1,24}$")
 
 
-def _clip_source_words(build_id: str, src: str, pdf, page: int) -> list:
-    """Word boxes usable to pre-fill an applied template's regions: the
-    stored OCR boxes for the page when an engine produced them, else the
-    PDF's own text layer (fitz "words": pixel corners -> 0..1, block/line ->
-    a line id). Best-effort — no words just means empty regions to fill by
-    hand."""
-    meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
-    words = ((meta.get("words") or {}).get(src) or {}).get(str(page))
-    if isinstance(words, list) and words:
-        return words
+def _pdf_layer_words(pdf, page: int) -> list:
+    """One page's text-layer words via fitz (pixel corners -> 0..1 fractions,
+    block/line -> a line id), shaped like the stored OCR word boxes. Best-
+    effort — no text layer just means empty regions to fill by hand."""
     if pdf is None or importlib.util.find_spec("fitz") is None:
         return []
     try:
@@ -2553,30 +2557,53 @@ def api_build_ocr_templates_apply(build_id: str):
             (s.get("path") for s in (b.get("pdf_sources") or [])
              if s.get("id") == src), "")
         pdf = _resolve_local(raw or "")
-    existing = (meta.get("regions") or {}).get(src) or {}
-    applied, skipped, clipped = [], [], []
+    # Two phases. Preparation runs UNLOCKED — text-layer clipping opens the
+    # PDF and must not stall OCR jobs — against a words snapshot read once
+    # (the old shape re-parsed the whole sidecar per page, 500 times). The
+    # skip-unless-overwrite decision is then re-made under the merge lock
+    # against FRESH state in one read-modify-write: a page the user saved
+    # while the loop ran must not get stamped over, and a snapshot-based
+    # skip check could do exactly that.
+    words_map = (meta.get("words") or {}).get(src) or {}
+    existing0 = (meta.get("regions") or {}).get(src) or {}
+    tpl_items = sorted(tpl["items"], key=lambda x: x.get("order") or 0)
+    doc = _ocr_name(str(tpl.get("doc") or "compiled.txt"))
+    prepared: dict[int, list] = {}
+    pre_skipped, clipped = [], []
     for n in sorted(set(pages)):
-        if not overwrite and str(n) in existing:
-            skipped.append(n)
+        if not overwrite and str(n) in existing0:
+            pre_skipped.append(n)
             continue
+        words = []
+        if clip:
+            words = words_map.get(str(n))
+            if not (isinstance(words, list) and words):
+                words = _pdf_layer_words(pdf, n)
         items = []
-        words = _clip_source_words(build_id, src, pdf, n) if clip else []
-        for i, t in enumerate(sorted(tpl["items"],
-                                     key=lambda x: x.get("order") or 0)):
+        for i, t in enumerate(tpl_items):
             box = t.get("box") or {}
             text = layout_roles.clip_words_to_box(words, box) if words else ""
             items.append({"id": f"r{i}", "role": t.get("role") or "body",
                           "src_type": "template", "order": i,
                           "box": box, "text": text})
-        if words and any(it["text"] for it in items):
+        if any(it["text"] for it in items):
             clipped.append(n)
-        _ocr_save_page_regions(build_id, src, n, items,
-                               tpl.get("dims") or None,
-                               doc=_ocr_name(str(tpl.get("doc")
-                                                 or "compiled.txt")))
-        applied.append(n)
-    return jsonify({"ok": True, "applied": applied, "skipped": skipped,
-                    "clipped": clipped})
+        prepared[n] = items
+    applied, skipped = [], list(pre_skipped)
+    with _ocr_merge_lock:
+        cur = lib.load_json(meta_path, {})
+        pmap = cur.setdefault("regions", {}).setdefault(src, {})
+        for n, items in prepared.items():
+            if not overwrite and str(n) in pmap:
+                skipped.append(n)
+                continue
+            pmap[str(n)] = {"doc": doc, "dims": tpl.get("dims") or {},
+                            "items": items}
+            applied.append(n)
+        lib.save_json(meta_path, cur)
+    clipped = [n for n in clipped if n in applied]
+    return jsonify({"ok": True, "applied": sorted(applied),
+                    "skipped": sorted(skipped), "clipped": sorted(clipped)})
 
 
 @app.route("/api/builds/<build_id>/ocr-templates/outliers", methods=["POST"])

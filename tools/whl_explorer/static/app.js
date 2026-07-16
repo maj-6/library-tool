@@ -14873,6 +14873,7 @@ async function selectReplicaBook(bid) {
   const seq = ++rwState.seq;
   rwState.book = bid; rwState.page = 0; rwState.items = [];
   rwState.sel = []; rwState.dirty = false;
+  rwState.outliers = [];   // the last scan flagged ANOTHER book's pages
   el("rw-canvas").hidden = true;
   el("rw-empty").hidden = false;
   renderReplicaBooks();
@@ -15055,12 +15056,19 @@ function rwSetLayer(layer) {
 // ligatures, join line-end hyphenation. Deliberately shallow — u/v and i/j
 // swaps, spelling, and everything judgement-shaped stays with the human.
 function rwNormalize(text) {
-  return String(text || "")
+  let t = String(text || "")
     .replace(/ſ/g, "s")
     .replace(/ﬀ/g, "ff").replace(/ﬁ/g, "fi").replace(/ﬂ/g, "fl")
     .replace(/ﬃ/g, "ffi").replace(/ﬄ/g, "ffl").replace(/ﬅ|ﬆ/g, "st")
-    .replace(/([A-Za-zæœÆŒ])[-¬⸗]\n(\S+)(\n?)/g, "$1$2$3")
     .replace(/ /g, " ");
+  // dehyphenate to a fixpoint: a single global pass consumes the next
+  // line's word (its trailing hyphen included), so "ma-\nte-\nria" only
+  // half-joined — every second break survived
+  for (let prev = ""; prev !== t;) {
+    prev = t;
+    t = t.replace(/([A-Za-zæœÆŒ])[-¬⸗]\n(\S+)/g, "$1$2");
+  }
+  return t;
 }
 
 function rwSyncBar() {
@@ -15279,6 +15287,9 @@ function rwKeyDown(ev) {
   }
   if (elT && (elT.isContentEditable || elT.tagName === "TEXTAREA" ||
               elT.tagName === "INPUT" || elT.tagName === "SELECT")) return;
+  // every command below is a BARE key: Ctrl+V is a paste reflex, not a
+  // request to flip the review flag, and Ctrl+digit belongs to the shell
+  if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
   const a = rwActive();
   if (/^[0-9]$/.test(ev.key) && rwState.sel.length) {
     const role = RW_ROLES[(parseInt(ev.key, 10) + 9) % 10];
@@ -15295,7 +15306,13 @@ function rwKeyDown(ev) {
   } else if ((ev.key === "s" || ev.key === "S") && a) {
     rwSplit(a, ev.shiftKey ? "v" : "h");
   } else if ((ev.key === "v" || ev.key === "V") && rwState.page) {
-    // toggle the page's review flag; saved with the regions
+    // toggle the page's review flag; saved with the regions. The flag lives
+    // ON the region record, so an empty page has nowhere to keep it — the
+    // server would drop record and flag together while the UI showed ✓
+    if (!rwState.items.length) {
+      status("VERIFY :: nothing on this page to verify — add regions first");
+      return;
+    }
     rwState.pageState = rwState.pageState === "verified" ? "" : "verified";
     rwDirty();
   } else if ((ev.key === "m" || ev.key === "M") && rwState.sel.length >= 2) {
@@ -15384,7 +15401,11 @@ async function rwSave() {
     const btn = el("rw-pages").querySelector(`[data-page="${page}"]`);
     if (btn) btn.innerHTML = `${page}` + rwPageChip(page);
   }
-  if (seq === rwState.seq) rwState.dirty = false;
+  if (seq === rwState.seq) {
+    rwState.dirty = false;
+    // an empty save dropped the record server-side — and any flag with it
+    if (!items.length) rwState.pageState = "";
+  }
   status(`REGIONS SAVED :: p ${page} · ${items.length}`);
   rwSyncBar();
 }
@@ -15473,7 +15494,7 @@ function rwParsePages(spec) {
     const m = part.trim().match(/^(\d+)(?:\s*-\s*(\d+))?$/);
     if (!m) continue;
     const a = +m[1], b = m[2] ? +m[2] : +m[1];
-    for (let n = Math.min(a, b); n <= Math.max(a, b) && out.size <= 500; n++) {
+    for (let n = Math.min(a, b); n <= Math.max(a, b) && out.size < 500; n++) {
       if (n >= 1) out.add(n);
     }
   }
@@ -15556,9 +15577,13 @@ function initReplica() {
     rwState.src = el("rw-src").value;
     rwState.page = 0; rwState.items = []; rwState.sel = [];
     rwState.dirty = false;
+    rwState.outliers = [];       // scores belong to the OLD source's grid
     el("rw-canvas").hidden = true;
     el("rw-empty").hidden = false;
     await renderReplicaPages(seq);
+    if (seq !== rwState.seq) return;
+    // templates are per source too — source A's names must not stamp B
+    await rwLoadTemplates(seq);
     if (seq !== rwState.seq) return;
     rwSyncBar();
   });
@@ -15581,7 +15606,12 @@ function initReplica() {
   el("rw-normalize").addEventListener("click", () => {
     const a = rwActive();
     if (!a) return;
-    a.norm = rwNormalize(a.text);
+    const proposal = rwNormalize(a.text);
+    // a differing existing norm is human judgement — never silently replace
+    if (a.norm && a.norm !== proposal &&
+        !confirm("This region already has a normalized reading. Replace it " +
+                 "with a fresh mechanical proposal?")) return;
+    a.norm = proposal;
     rwSetLayer("norm");
     rwDirty();
   });
