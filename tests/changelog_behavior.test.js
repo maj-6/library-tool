@@ -27,7 +27,7 @@ function websiteApi() {
     "const CHANGELOG_CATEGORIES",
     "/** Group a newest-first version list",
   ).replace("export function parseChangelog", "function parseChangelog");
-  const renderer = block(websiteReleases, "const esc =", "function group(g)");
+  const renderer = block(websiteReleases, "const esc =", "const box =");
   vm.runInContext(`${parser}\n${renderer}\nthis.api = { parseChangelog, release };`, context);
   return context.api;
 }
@@ -107,4 +107,10 @@ test("website and desktop renderers show ordered, escaped category sections", ()
     assert.ok(html.indexOf("Other Changes") < html.indexOf("Bugfixes"));
     assert.ok(!html.includes("<details"));
   }
+});
+
+test("website release notes render as a flat version list", () => {
+  assert.ok(websiteReleases.includes('versions.map(release).join("")'));
+  assert.ok(!websiteReleases.includes("groupByMajor"));
+  assert.ok(!websiteReleases.includes("cl-major"));
 });

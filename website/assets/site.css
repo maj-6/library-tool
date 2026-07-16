@@ -294,11 +294,15 @@ ol.volumes { list-style: none; margin: 0; padding: 0; }
 .dl-list.is-compact .dl-arrow { width: 11px; height: 11px; }
 
 /* --- changelog / release notes --- */
+.release-rule {
+  border: 0;
+  border-top: 1px solid var(--rule-soft);
+  margin: 14px 0 2px;
+}
 .changelog { margin: 0; }
-.cl-rel { padding: 16px 0; border-top: 1px solid var(--rule-soft); }
-.cl-rel:first-child { border-top: none; padding-top: 2px; }
+.cl-rel { padding: 16px 0; }
 .cl-ver {
-  font-size: 18px;
+  font-size: 20px;
   font-weight: 600;
   margin: 0 0 8px;
   color: var(--ink);
@@ -314,22 +318,13 @@ ol.volumes { list-style: none; margin: 0; padding: 0; }
 .cl-category + .cl-category { margin-top: 14px; }
 .cl-category-name {
   margin: 0 0 4px;
-  font-size: 13px;
+  font-size: 14px;
   line-height: 1.4;
   font-weight: 600;
   color: var(--ink-soft);
 }
 .cl-list { margin: 0; padding-left: 20px; }
 .cl-list li { margin: 0 0 5px; color: var(--ink); }
-/* major-version group heading, with the release versions as subheadings */
-.cl-major-group + .cl-major-group { margin-top: 28px; }
-.cl-major {
-  margin: 0 0 4px;
-  font: 12px/1 var(--mono);
-  letter-spacing: 1px;
-  text-transform: uppercase;
-  color: var(--ink-faint);
-}
 
 /* --- documentation --- */
 .docs h3 { font-size: 16px; margin: 24px 0 6px; }
