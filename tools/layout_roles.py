@@ -78,27 +78,60 @@ def regions_from_blocks(blocks: list | None, dims: dict | None) -> list[dict]:
     return out
 
 
+def _column_band(body: list[dict]) -> tuple[float, float]:
+    """The main text column's x-extent, from clustering the body blocks.
+
+    Blocks whose x-intervals overlap by >=50% of the narrower one belong to
+    one column; clusters merge to a fixpoint (a single extension pass made
+    the outcome depend on the order Mistral emitted blocks). The band is the
+    cluster that spans the page's horizontal centre — a margin note hugs an
+    edge, a text column almost never does — falling back to the largest
+    total ink area when no cluster reaches the centre (a plates-and-notes
+    page: erring toward keeping text as body, never losing it)."""
+    clusters: list[dict] = []
+    for r in sorted(body, key=lambda r: (r["box"]["x"], r["box"]["w"])):
+        x0, x1 = r["box"]["x"], r["box"]["x"] + r["box"]["w"]
+        clusters.append({"x0": x0, "x1": x1,
+                         "area": r["box"]["w"] * r["box"]["h"]})
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(clusters)):
+            for j in range(i + 1, len(clusters)):
+                a, b = clusters[i], clusters[j]
+                ov = min(a["x1"], b["x1"]) - max(a["x0"], b["x0"])
+                narrower = max(1e-6, min(a["x1"] - a["x0"], b["x1"] - b["x0"]))
+                if ov > 0 and ov / narrower >= 0.5:
+                    a["x0"] = min(a["x0"], b["x0"])
+                    a["x1"] = max(a["x1"], b["x1"])
+                    a["area"] += b["area"]
+                    del clusters[j]
+                    merged = True
+                    break
+            if merged:
+                break
+    best = max(clusters,
+               key=lambda c: (c["x0"] <= 0.5 <= c["x1"], c["area"]))
+    return best["x0"], best["x1"]
+
+
 def classify(regions: list[dict]) -> None:
     """Reassign early-print roles among the body-typed regions, in place.
 
-    The main text column (the "band") is anchored by the widest body block
-    and widened by every block that substantially overlaps it. Then:
+    The main text column (the "band") comes from _column_band. Then:
     marginalia sits mostly outside the band AND is much narrower than it
     (the width guard keeps two-column index pages intact — a second column
     is band-wide, a margin note is not); a catchword is a lone bottom token
     at the band's right edge; a signature mark is a short letter+digit
-    compositor code bottom-center; a page number is a small numeral in the
-    top or bottom margin."""
+    compositor code at the bottom (checked before page-number when it has a
+    digit — "B2" — since a bare roman letter like "C." is indistinguishable
+    from a folio number without book-level context and defaults to
+    page-number); a page number is a small numeral in the top or bottom
+    margin."""
     body = [r for r in regions if r["role"] == "body"]
     if not body:
         return
-    anchor = max(body, key=lambda r: r["box"]["w"])
-    bx0, bx1 = anchor["box"]["x"], anchor["box"]["x"] + anchor["box"]["w"]
-    for r in body:
-        x0, x1 = r["box"]["x"], r["box"]["x"] + r["box"]["w"]
-        ov = max(0.0, min(x1, bx1) - max(x0, bx0))
-        if r["box"]["w"] > 0 and ov / r["box"]["w"] >= 0.5:
-            bx0, bx1 = min(bx0, x0), max(bx1, x1)
+    bx0, bx1 = _column_band(body)
     band_w = max(1e-6, bx1 - bx0)
     for r in body:
         box = r["box"]
@@ -107,7 +140,10 @@ def classify(regions: list[dict]) -> None:
         ov = max(0.0, min(x1, bx1) - max(x0, bx0)) / max(1e-6, box["w"])
         top = box["y"] + box["h"] < 0.12
         bottom = box["y"] > 0.82
-        if (top or bottom) and box["w"] < 0.15 and _PAGENO.match(word or " "):
+        if (bottom and box["w"] < 0.12 and _SIGMARK.match(word or " ")
+                and any(ch.isdigit() for ch in word)):
+            r["role"] = "signature-mark"
+        elif (top or bottom) and box["w"] < 0.15 and _PAGENO.match(word or " "):
             r["role"] = "page-number"
         elif (bottom and box["w"] < 0.25 and word and " " not in word
                 and x1 >= bx1 - 0.15 * band_w):

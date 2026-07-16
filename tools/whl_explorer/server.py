@@ -3176,13 +3176,16 @@ def _ocr_merge_page(build_id: str, target: str, page: int, text: str) -> None:
 
 
 def _ocr_save_page_images(build_id: str, page: int, images: list[dict],
-                          text: str, src_key: str = "primary") -> str:
+                          text: str, src_key: str = "primary",
+                          regions: list | None = None) -> str:
     """Persist the figures an OCR service cut out of one page.
 
     Files land in the entry folder (ocr/images/p<page>-<id>), their boxes in
     ocr/layout.json, and the markdown's ![id](id) references are rewritten to
     the saved names so every reference stays unique across the compiled file.
-    Returns the rewritten text."""
+    Returns the rewritten text. `regions` get the same rewrite in place —
+    their text fields carry the same raw ids, and a region record that names
+    figures the compiled doc calls something else is a record that lies."""
     if not images:
         return text
     d = _entry_dir(build_id) / "ocr" / "images"
@@ -3200,8 +3203,12 @@ def _ocr_save_page_images(build_id: str, page: int, images: list[dict],
             meta["images"][name] = dict(
                 im["bbox"] or {}, page=page, src_key=src_key or "primary")
             # every ![id](id) in this page's markdown points at the saved file
-            text = re.sub(r"(!\[[^\]]*\]\()" + re.escape(im["id"]) + r"(\))",
-                          r"\g<1>" + name + r"\g<2>", text)
+            pat = re.compile(r"(!\[[^\]]*\]\()" + re.escape(im["id"]) + r"(\))")
+            text = pat.sub(r"\g<1>" + name + r"\g<2>", text)
+            for reg in regions or []:
+                if reg.get("text"):
+                    reg["text"] = pat.sub(r"\g<1>" + name + r"\g<2>",
+                                          reg["text"])
         lib.save_json(meta_path, meta)
     return text
 
@@ -3278,6 +3285,34 @@ def _ocr_save_page_regions(build_id: str, src_key: str, page: int,
         lib.save_json(meta_path, meta)
 
 
+def _ocr_drop_page_regions_for_doc(build_id: str, src_key: str, page: int,
+                                   doc: str) -> None:
+    """Drop a page's region record IF it claims to carry `doc`'s text.
+
+    A run without region output (Tesseract/Textract/Claude) that rewrites a
+    compiled page supersedes the text of any region record pointing at that
+    same file — serving the old transcription tagged with the current doc
+    would defeat the staleness contract. A run into a DIFFERENT target
+    leaves the record alone: the doc it describes is unchanged."""
+    src_key = src_key or "primary"
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    with _ocr_merge_lock:
+        meta = lib.load_json(meta_path, {})
+        rmap = meta.get("regions")
+        if not isinstance(rmap, dict):
+            return
+        pages = rmap.get(src_key)
+        rec = pages.get(str(int(page))) if isinstance(pages, dict) else None
+        if not (isinstance(rec, dict) and rec.get("doc") == doc):
+            return
+        pages.pop(str(int(page)), None)
+        if not pages:
+            rmap.pop(src_key, None)
+        if not rmap:
+            meta.pop("regions", None)
+        lib.save_json(meta_path, meta)
+
+
 def _ocr_job_run(job_id: str) -> None:
     job = _ocr_jobs[job_id]
     cfg = job["cfg"]
@@ -3309,7 +3344,8 @@ def _ocr_job_run(job_id: str) -> None:
                 text = str(result.get("text") or "")
                 if result.get("images"):
                     text = _ocr_save_page_images(
-                        job["build_id"], n, result["images"], text, src_key)
+                        job["build_id"], n, result["images"], text,
+                        src_key, regions=result.get("regions"))
                 # a "words" key marks a geometry-speaking engine, and its
                 # value is authoritative ([] = blank page). Engines without
                 # one (Mistral, Claude) replace the text but must leave the
@@ -3321,14 +3357,22 @@ def _ocr_job_run(job_id: str) -> None:
                                          doc=_ocr_name(job["target"]))
                 # likewise a "regions" key marks the region-producing path
                 # (Mistral blocks); its value is authoritative — [] clears
-                # the page's regions along with the transcription they held
+                # the page's regions along with the transcription they held.
+                # Region-silent engines instead DROP a record claiming this
+                # target's text: unlike word geometry, region text is
+                # superseded by the new transcription.
                 if "regions" in result:
                     _ocr_save_page_regions(job["build_id"], src_key, n,
                                            result.get("regions") or [],
                                            result.get("dims"),
                                            doc=_ocr_name(job["target"]))
+                else:
+                    _ocr_drop_page_regions_for_doc(job["build_id"], src_key,
+                                                   n, _ocr_name(job["target"]))
             else:
                 text = result
+                _ocr_drop_page_regions_for_doc(job["build_id"], src_key,
+                                               n, _ocr_name(job["target"]))
             _ocr_merge_page(job["build_id"], job["target"], n, text)
             item["status"] = "ok"
         except Exception as exc:

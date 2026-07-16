@@ -96,6 +96,45 @@ def test_catchword_signature_and_page_number():
     assert roles["102"] == "page-number"
 
 
+def test_roman_letter_ambiguity_defaults_to_page_number():
+    # "C." at the bottom is indistinguishable from a folio number without
+    # book-level context — page-number is the documented default; a digit
+    # ("C2") disambiguates to signature-mark.
+    roles = _classify([
+        BODY,
+        ("text", 630, 1620, 690, 1660, "C."),
+        ("text", 900, 1620, 960, 1660, "C2"),
+    ])
+    assert roles["C."] == "page-number"
+    assert roles["C2"] == "signature-mark"
+
+
+def test_sparse_page_wide_margin_note_loses_nothing():
+    # The band anchors on the centre-spanning cluster, not the widest block:
+    # a margin note wider than the only body line must not eject that line
+    # from the flow. The note erring toward body is the safe direction —
+    # noise kept beats text lost.
+    rows = [
+        ("text", 28, 500, 280, 680, "A wide margin gloss"),   # w 0.18, edge
+        ("text", 588, 700, 700, 740, "FINIS."),               # w 0.08, centre
+    ]
+    roles = _classify(rows)
+    assert roles["FINIS."] == "body"
+    text = layout_roles.compose_text(
+        layout_roles.regions_from_blocks(_blocks(rows), P120_DIMS))
+    assert "FINIS." in text
+
+
+def test_classification_is_input_order_independent():
+    base = layout_roles.regions_from_blocks(_blocks(P120_BLOCKS), P120_DIMS)
+    expect = {r["text"]: r["role"] for r in base}
+    for rows in (list(reversed(P120_BLOCKS)),
+                 P120_BLOCKS[5:] + P120_BLOCKS[:5]):
+        got = {r["text"]: r["role"]
+               for r in layout_roles.regions_from_blocks(_blocks(rows), P120_DIMS)}
+        assert got == expect
+
+
 def test_two_column_page_stays_body():
     # An index's second column is band-wide — the width guard must keep it
     # body, not demote it to marginalia (Phase 0: the p305 "TABLE" page).
@@ -210,3 +249,42 @@ def test_ocr_regions_endpoint(client, data_root):
 
     layout = client.get(f"/api/builds/{BID}/ocr-layout").get_json()
     assert layout["region_pages"] == {"primary": [7]}
+
+
+def test_figure_refs_rewritten_in_regions_too(data_root):
+    import server
+    regions = [{"id": "r0", "role": "figure", "order": 0,
+                "box": {"x": 0.3, "y": 0.8, "w": 0.4, "h": 0.1},
+                "text": "![img-0.jpeg](img-0.jpeg)"}]
+    text = server._ocr_save_page_images(
+        BID, 5, [{"id": "img-0.jpeg", "data": b"\xff", "bbox": None}],
+        "![img-0.jpeg](img-0.jpeg)", regions=regions)
+    assert text == "![img-0.jpeg](p5-img-0.jpeg)"
+    assert regions[0]["text"] == "![img-0.jpeg](p5-img-0.jpeg)"
+
+
+def test_region_record_dropped_when_its_doc_is_reocred(data_root):
+    import server
+    items = [{"id": "r0", "role": "body", "order": 0,
+              "box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}, "text": "old"}]
+    server._ocr_save_page_regions(BID, "primary", 9, items, None,
+                                  doc="compiled.txt")
+    # a re-OCR into a DIFFERENT target leaves the record alone…
+    server._ocr_drop_page_regions_for_doc(BID, "primary", 9, "tess.txt")
+    meta = json.loads(_layout_path(server).read_text(encoding="utf-8"))
+    assert "9" in meta["regions"]["primary"]
+    # …but rewriting the SAME doc's page supersedes the record's text
+    server._ocr_drop_page_regions_for_doc(BID, "primary", 9, "compiled.txt")
+    meta = json.loads(_layout_path(server).read_text(encoding="utf-8"))
+    assert "9" not in (meta.get("regions", {}).get("primary") or {})
+
+
+def test_translate_todo_hash_semantics():
+    import server
+    pages = {1: "alpha", 2: "beta", 3: "gamma", 4: "", 5: "delta"}
+    done = {1: "uno", 2: "dos", 5: "cinco"}
+    recorded = {"1": server._tr_src_hash("alpha"),      # current -> skip
+                "2": server._tr_src_hash("OLD beta")}   # stale  -> redo
+    # 3 untranslated -> todo; 4 blank source -> never; 5 translated pre-hash
+    # (no record) -> counts as current
+    assert server._translate_todo(pages, done, recorded) == [2, 3]
