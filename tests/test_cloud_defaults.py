@@ -51,8 +51,12 @@ def test_data_api_tables_have_explicit_least_privilege_grants():
             SCHEMA_SQL_FLAT)
     assert ("grant select on public.volume_texts, public.volume_pages, "
             "public.volume_notes to anon, authenticated;" in SCHEMA_SQL_FLAT)
+    assert ("grant select, insert on public.captures to authenticated;" in
+            SCHEMA_SQL_FLAT)
+    assert ("grant update (device, status, photos, note, contributor, ocr, "
+            "meta) on public.captures to authenticated;" in SCHEMA_SQL_FLAT)
     assert ("grant select, insert, update on public.captures to authenticated;"
-            in SCHEMA_SQL_FLAT)
+            not in SCHEMA_SQL_FLAT)
     assert ("grant select, insert, update, delete on public.profile_secrets "
             "to authenticated;" in SCHEMA_SQL_FLAT)
     assert ("revoke all on public.books from anon, authenticated;" in

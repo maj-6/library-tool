@@ -143,6 +143,33 @@ def test_apply_page_deletion_end_to_end(data_root):
     (ocr_dir / "compiled.txt").write_text(T3, encoding="utf-8")
     (ocr_dir / "extracted.txt").write_text("no markers at all",
                                            encoding="utf-8")
+    translations = server._entry_dir(bid) / "translations"
+    translations.mkdir(parents=True, exist_ok=True)
+    translated_before = (
+        "--- page 1 ---\nuno\n\n--- page 2 ---\ndos\n\n"
+        "--- page 3 ---\ntres")
+    (translations / "es.txt").write_text(translated_before, encoding="utf-8")
+    translation_meta = {
+        "version": 1, "src": "compiled.txt", "model": "test",
+        "pages": {
+            "1": {"sha1": server._page_sha("alpha")},
+            "2": {"sha1": server._page_sha("bravo")},
+            "3": {"sha1": server._page_sha("charlie")},
+        },
+    }
+    server.lib.save_json(translations / "es.meta.json", translation_meta)
+    server.lib.save_json(ocr_dir / "layout.json", {
+        "words": {"primary": {"1": ["one"], "2": ["two"], "3": ["three"]}},
+        "images": {
+            "p1-a.jpeg": {"page": 1, "src_key": "primary"},
+            "p2-b.jpeg": {"page": 2, "src_key": "primary"},
+            "p3-c.jpeg": {"page": 3, "src_key": "primary"},
+        },
+    })
+    images_dir = ocr_dir / "images"
+    images_dir.mkdir()
+    for name in ("p1-a.jpeg", "p2-b.jpeg", "p3-c.jpeg"):
+        (images_dir / name).write_bytes(name.encode())
     builds = {bid: {"title": "Test", "title_pages": "1,3"}}
     # the remap persists against a fresh read of the store, so the record
     # must exist on disk (in production the caller loaded builds from it)
@@ -151,14 +178,12 @@ def test_apply_page_deletion_end_to_end(data_root):
 
     result = server._apply_page_deletion(bid, builds, pdf, [2])
 
-    assert result == {
-        "deleted": [2],
-        "pages": 2,
-        # ordering comes from Path.glob; compare order-insensitively
-        "renumbered": result["renumbered"],
-        "backup": "book.bak.pdf",
-        "build": {"title": "Test", "title_pages": "1,2"},
-    }
+    assert result["deleted"] == [2]
+    assert result["pages"] == 2
+    assert result["backup"] == "book.bak.pdf"
+    assert result["build"]["title"] == "Test"
+    assert result["build"]["title_pages"] == "1,2"
+    assert result["build"]["updated_at"]
     assert sorted(result["renumbered"]) == ["compiled.txt", "extracted.txt"]
     # result["build"] is the same dict object mutated in place
     assert result["build"] is builds[bid]
@@ -179,9 +204,33 @@ def test_apply_page_deletion_end_to_end(data_root):
     assert (ocr_dir / "extracted.txt.bak").read_text(encoding="utf-8") == \
         "no markers at all"
 
+    # Translation text and its source hashes shift together; deleted-page
+    # content is gone rather than surviving as an obsolete trailing page.
+    assert (translations / "es.txt").read_text(encoding="utf-8") == \
+        "--- page 1 ---\nuno\n\n--- page 2 ---\ntres"
+    assert (translations / "es.txt.bak").read_text(encoding="utf-8") == \
+        translated_before
+    meta = json.loads((translations / "es.meta.json").read_text(encoding="utf-8"))
+    assert set(meta["pages"]) == {"1", "2"}
+    assert meta["pages"]["2"]["sha1"] == server._page_sha("charlie")
+    assert (translations / "es.meta.json.bak").is_file()
+
+    # Word boxes and extracted figures use the same remap. A figure from the
+    # deleted page is removed from layout metadata; the kept page 3 moves to 2.
+    layout = json.loads((ocr_dir / "layout.json").read_text(encoding="utf-8"))
+    assert set(layout["words"]["primary"]) == {"1", "2"}
+    assert layout["words"]["primary"]["2"] == ["three"]
+    assert "p2-b.jpeg" not in layout["images"]
+    assert layout["images"]["p3-c.jpeg"]["page"] == 2
+    assert not (images_dir / "p2-b.jpeg").exists()
+    assert (images_dir / ".page-delete-backup" / "p2-b.jpeg").is_file()
+    assert (images_dir / "p1-a.jpeg").is_file()
+    assert (images_dir / "p3-c.jpeg").is_file()
+
     # title_pages remap persisted the whole builds dict to BUILDS_PATH
     on_disk = json.loads(server.BUILDS_PATH.read_text(encoding="utf-8"))
     assert on_disk[bid]["title_pages"] == "1,2"
+    assert on_disk[bid]["updated_at"] == result["build"]["updated_at"]
 
 
 def test_apply_page_deletion_refusals_leave_pdf_untouched(data_root):
@@ -287,3 +336,44 @@ def test_apply_page_deletion_leaves_image_thumbnail_source_untouched(data_root):
     result = server._apply_page_deletion(bid, builds, pdf, [2])
 
     assert result["build"]["thumbnail_source"] == "image:p2-fig1.jpeg"
+
+
+def test_page_deletion_refuses_active_analyze_job(data_root):
+    bid = "testdelbusy"
+    pdf = data_root / "downloads" / "ia" / "busy" / "book.pdf"
+    _make_pdf(pdf, 2)
+    builds = {bid: {"title": "Busy"}}
+    job = {"id": "busytranslate", "build_id": bid,
+           "kind": "translate:es", "status": "running"}
+    with server._an_jobs_lock:
+        server._an_jobs[job["id"]] = job
+    try:
+        with pytest.raises(ValueError, match="page-processing job"):
+            server._apply_page_deletion(bid, builds, pdf, [1])
+    finally:
+        with server._an_jobs_lock:
+            server._an_jobs.pop(job["id"], None)
+
+    assert _page_count(pdf) == 2
+    assert not pdf.with_suffix(".bak.pdf").exists()
+
+
+def test_stale_ocr_and_analyze_snapshots_cannot_start_after_renumber():
+    bid = "revisionguard"
+    with server._page_structure_lock:
+        old = server._page_structure_revision.get(bid, 0)
+        server._page_structure_revision[bid] = old + 1
+    ocr = {"id": "stalerevision", "build_id": bid, "target": "compiled.txt",
+           "src_key": "primary", "status": "running"}
+    try:
+        assert server._ocr_job_start_guarded(ocr, old) is False
+        assert ocr["id"] not in server._ocr_jobs
+        with pytest.raises(server._AnalyzeSourceChanged):
+            server._an_job_start_guarded(
+                bid, old, "translate:es", 1, lambda _job: None)
+    finally:
+        with server._page_structure_lock:
+            if old:
+                server._page_structure_revision[bid] = old
+            else:
+                server._page_structure_revision.pop(bid, None)

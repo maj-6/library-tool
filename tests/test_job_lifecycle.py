@@ -9,6 +9,7 @@ pruned to a bounded history, and cancellable through POST
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import server
@@ -123,6 +124,23 @@ def test_snapshot_never_contains_credentials():
     assert set(snap[job["id"]]) <= set(server._JOB_FIELDS)
 
 
+def test_live_progress_checkpoint_is_persisted():
+    job = {"build_id": "checkpoint001", "done": 0, "total": 300}
+    server._job_track(job, "ocr", label="Large OCR batch")
+    try:
+        job["done"] = 137
+        job["note"] = "page 137"
+        server._job_checkpoint(job, force=True)
+
+        snap = json.loads(server.JOBS_PATH.read_text(encoding="utf-8"))
+        assert snap[job["id"]]["done"] == 137
+        assert snap[job["id"]]["total"] == 300
+        assert snap[job["id"]]["note"] == "page 137"
+        assert "_checkpoint_at" not in snap[job["id"]]
+    finally:
+        _finish(job["id"])
+
+
 # --- unified endpoints -----------------------------------------------------------
 
 def test_jobs_listing_includes_downloads_and_sync(client):
@@ -180,6 +198,56 @@ def test_unified_cancel_endpoint_flags_ocr_job(client):
     finally:
         server._ocr_jobs.pop(job["id"], None)
         _finish(job["id"])
+
+
+def test_cancel_race_cannot_overwrite_worker_terminal_state(client):
+    """A worker finishing during Event.set must win after cancellation.
+
+    Before the state check/transition became one registry-lock transaction,
+    this interleaving left the job permanently ``cancelling``.
+    """
+    def exercise(kind: str, legacy: bool) -> None:
+        job = {"build_id": f"race-{kind}", "status": "running"}
+        real_event = server._job_track(job, kind, label="Race")
+        if legacy:
+            server._ocr_jobs[job["id"]] = job
+        go = threading.Event()
+        attempted = threading.Event()
+
+        class FinishWhileCancelling:
+            def set(self):
+                real_event.set()
+                go.set()
+                assert attempted.wait(timeout=2)
+
+            def is_set(self):
+                return real_event.is_set()
+
+        server._jobs_events[job["id"]] = FinishWhileCancelling()
+
+        def finish():
+            assert go.wait(timeout=2)
+            attempted.set()              # transition blocks on _jobs_lock
+            server._job_transition(job, "done")
+
+        worker = threading.Thread(target=finish)
+        worker.start()
+        try:
+            path = (f"/api/ocr/job/{job['id']}/cancel" if legacy
+                    else f"/api/jobs/{job['id']}/cancel")
+            assert client.post(path).status_code == 200
+            worker.join(timeout=2)
+            assert not worker.is_alive()
+            assert job["state"] == "done"
+            assert job["state"] not in server._JOB_ACTIVE
+        finally:
+            if legacy:
+                server._ocr_jobs.pop(job["id"], None)
+            server._jobs_events[job["id"]] = real_event
+            _finish(job["id"])
+
+    exercise("summarize", False)
+    exercise("ocr", True)
 
 
 # --- cooperative cancellation of an analyze job ----------------------------------

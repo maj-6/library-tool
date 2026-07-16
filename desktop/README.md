@@ -45,16 +45,22 @@ menu shortcuts. Uninstall keeps the data root: the catalogue outlives the app.
 
 ## Releasing an update
 
-The app checks GitHub Releases (`maj-6/library-tool`) once at startup,
-downloads in the background, and offers a restart when ready. Publishing a
-release is: bump `version` in package.json, build, then
+The app checks GitHub Releases (`maj-6/library-tool`) once at startup and
+installs an eligible update before opening the main window. Releases are built
+by `.github/workflows/release.yml`: bump `version` in `package.json` (and the
+Android version when its APK rides along), commit the bumps, then push a tag
+matching the desktop version:
 
 ```
-gh release create v<version> release/LibraryTool-Setup-<version>.exe release/latest.yml --title v<version>
+git tag v<version>
+git push origin main v<version>
 ```
 
-`latest.yml` is what electron-updater reads; without it the check is a no-op.
-Offline machines simply skip the check.
+The workflow builds both applications, creates the GitHub Release, uploads the
+installer, its blockmap, `latest.yml`, and the APK, then registers the downloads
+for the website. `latest.yml` and the blockmap are both required for desktop
+auto-update. See `../docs/releasing.md` for prerelease channels, signing, and
+verification. Offline machines simply skip the update check.
 
 ### Downloading the databases (offline search)
 

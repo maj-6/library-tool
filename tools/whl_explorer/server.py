@@ -36,7 +36,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from flask import Flask, Response, abort, jsonify, render_template, request, send_file
@@ -808,6 +808,30 @@ BUILDS_PATH = lib.OUTPUT_DIR / "whl_builds.json"
 _builds_lock = threading.Lock()
 
 
+def _build_updated_at(previous: str = "") -> str:
+    """Return a build revision token strictly newer than ``previous``.
+
+    ``updated_at`` doubles as the Editor's optimistic-concurrency token.  A
+    wall-clock value rounded to seconds lets two saves in the same second
+    share a token, so a stale full-form save can pass the equality check and
+    overwrite the first one.  Microseconds make that unlikely; comparing with
+    the previous token and advancing by one microsecond makes it impossible
+    even when the clock stalls or moves backwards.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        prior = datetime.fromisoformat(str(previous or "").replace("Z", "+00:00"))
+        if prior.tzinfo is None:
+            prior = prior.replace(tzinfo=timezone.utc)
+        else:
+            prior = prior.astimezone(timezone.utc)
+        if now <= prior:
+            now = prior + timedelta(microseconds=1)
+    except (TypeError, ValueError):
+        pass
+    return now.isoformat(timespec="microseconds")
+
+
 def _mutate_json(path, lock, default, fn):
     """The write path for a mutable JSON store: hold the store's lock across
     load -> fn(doc) -> save so concurrent read-modify-writes serialize instead
@@ -820,15 +844,19 @@ def _mutate_json(path, lock, default, fn):
         return out
 
 
-def _builds_apply(bid: str, fields: dict) -> None:
+def _builds_apply(bid: str, fields: dict) -> str:
     """Fold field changes into one build against a FRESH read of the store —
     for slow work (folder sync, page deletion) whose snapshot may be minutes
     old: only this build's fields are ours to change (the _publish_run
     precedent)."""
     def apply(builds):
         if bid in builds:
-            builds[bid].update(fields)
-    _mutate_json(BUILDS_PATH, _builds_lock, {}, apply)
+            row = builds[bid]
+            row.update(fields)
+            row["updated_at"] = _build_updated_at(row.get("updated_at"))
+            return row["updated_at"]
+        return ""
+    return _mutate_json(BUILDS_PATH, _builds_lock, {}, apply)
 
 # The field set mirrors what a WHL catalog entry needs. pdf_source is the
 # source URL; pdf_file is the local PDF attached for the actual submission
@@ -943,7 +971,7 @@ def api_builds_create():
             return jsonify({"ok": False,
                             "error": f"unknown rights value {build['rights']!r}"}), 400
         build["id"] = lib.gen_id(set(builds))
-        build["created_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        build["created_at"] = _build_updated_at()
         build["updated_at"] = build["created_at"]
         builds[build["id"]] = build
         lib.save_json(BUILDS_PATH, builds)
@@ -988,7 +1016,7 @@ def api_builds_update(build_id: str):
                 b[f] = str(payload[f] or "").strip()
         if b.get("status") not in _BUILD_STATUSES:
             b["status"] = "draft"
-        b["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        b["updated_at"] = _build_updated_at(b.get("updated_at"))
         lib.save_json(BUILDS_PATH, builds)
     # only the status transition is worth a feed entry; every keystroke is not
     if b["status"] != was and b["status"] in ("ready", "uploaded"):
@@ -1021,6 +1049,7 @@ def api_builds_restore():
     build["capture_id"] = _clean_capture_id(build.get("capture_id"))
 
     def reinsert(builds):
+        build["updated_at"] = _build_updated_at(build.get("updated_at"))
         builds[bid] = build
     _mutate_json(BUILDS_PATH, _builds_lock, {}, reinsert)
     return jsonify({"ok": True, "build": build})
@@ -1091,7 +1120,7 @@ def _remap_category_ids(fn) -> int:
             new = fn(list(old))
             if new != old:
                 b["category_ids"] = new
-                b["updated_at"] = _tax_ts()
+                b["updated_at"] = _build_updated_at(b.get("updated_at"))
                 dirty, changed = True, changed + 1
         if dirty:
             lib.save_json(BUILDS_PATH, builds)
@@ -1311,7 +1340,8 @@ def api_categories_adopt():
             if sid == "builds" and key in builds \
                     and not builds[key].get("category_ids"):
                 builds[key]["category_ids"] = ids_for(labs)
-                builds[key]["updated_at"] = _tax_ts()
+                builds[key]["updated_at"] = _build_updated_at(
+                    builds[key].get("updated_at"))
                 assigned += 1
         lib.save_json(BUILDS_PATH, builds)
     with _manual_lock:
@@ -1820,7 +1850,8 @@ def api_build_folder_sync(build_id: str):
                         lib.DATA_ROOT.resolve()).as_posix()
                     # this function's snapshot is stale by now (preview render,
                     # extraction): fold in only this build's change
-                    _builds_apply(build_id, {"pdf_file": b["pdf_file"]})
+                    b["updated_at"] = _builds_apply(
+                        build_id, {"pdf_file": b["pdf_file"]})
                     src = d / "primary.pdf"
                 legacy.unlink()
                 notes.append("renamed preview.pdf to primary.pdf")
@@ -1855,10 +1886,8 @@ def api_build_folder_sync(build_id: str):
                     # the IA download catalog entry is retired
                     b["pdf_file"] = (d / "primary.pdf").resolve().relative_to(
                         lib.DATA_ROOT.resolve()).as_posix()
-                    b["updated_at"] = datetime.now(timezone.utc).isoformat(
-                        timespec="seconds")
-                    _builds_apply(build_id, {"pdf_file": b["pdf_file"],
-                                             "updated_at": b["updated_at"]})
+                    b["updated_at"] = _builds_apply(
+                        build_id, {"pdf_file": b["pdf_file"]})
 
                     def _drop_stale(catalog):
                         for k in [k for k, v in catalog.items()
@@ -2463,20 +2492,63 @@ def _job_track(job: dict, kind: str, label: str = "") -> threading.Event:
     return ev
 
 
+def _job_transition_locked(job: dict, status: str, **fields) -> None:
+    """The transition body for callers that already hold ``_jobs_lock``."""
+    job.update(fields)
+    job["status"] = status
+    job["state"] = _job_state_of(status)
+    if job["state"] not in _JOB_ACTIVE and not job.get("finished_at"):
+        job["finished_at"] = datetime.now(timezone.utc).isoformat(
+            timespec="seconds")
+    if _jobs.get(str(job.get("id") or "")) is job:
+        if job["state"] not in _JOB_ACTIVE:
+            _jobs_prune_locked()
+        _jobs_save_locked()
+
+
 def _job_transition(job: dict, status: str, **fields) -> None:
     """Move a job to a lifecycle status (legacy string), stamp the canonical
     state, and persist. Safe on untracked dicts (tests build jobs directly)."""
     with _jobs_lock:
-        job.update(fields)
-        job["status"] = status
-        job["state"] = _job_state_of(status)
-        if job["state"] not in _JOB_ACTIVE and not job.get("finished_at"):
-            job["finished_at"] = datetime.now(timezone.utc).isoformat(
-                timespec="seconds")
-        if _jobs.get(str(job.get("id") or "")) is job:
-            if job["state"] not in _JOB_ACTIVE:
-                _jobs_prune_locked()
-            _jobs_save_locked()
+        _job_transition_locked(job, status, **fields)
+
+
+def _job_checkpoint(job: dict, force: bool = False) -> None:
+    """Persist live progress at page/chunk boundaries, throttled to 1 Hz."""
+    now = time.monotonic()
+    with _jobs_lock:
+        if _jobs.get(str(job.get("id") or "")) is not job:
+            return
+        last = float(job.get("_checkpoint_at") or 0.0)
+        if not force and now - last < 1.0:
+            return
+        job["_checkpoint_at"] = now       # internal; _JOB_FIELDS omits it
+        _jobs_save_locked()
+
+
+def _job_request_cancel(job_id: str, fallback: dict | None = None) -> dict | None:
+    """Atomically request cancellation and return a stable job snapshot.
+
+    The active-state check and the ``cancelling`` transition must share the
+    registry lock with worker terminal transitions.  Otherwise a worker can
+    finish after the check but before the transition, and the request handler
+    overwrites ``done`` with a permanently-active ``cancelling`` state.
+    ``fallback`` preserves the legacy OCR endpoint's unit-test/untracked-job
+    behavior; production OCR jobs are always in the unified registry.
+    """
+    with _jobs_lock:
+        job = _jobs.get(job_id) or fallback
+        if job is None:
+            return None
+        state = job.get("state") or _job_state_of(job.get("status"))
+        ev = _jobs_events.get(job_id)
+        if state in _JOB_ACTIVE:
+            if ev is not None:
+                ev.set()
+            if job.get("kind") == "ocr" or fallback is not None:
+                job["cancel_requested"] = True
+            _job_transition_locked(job, "cancelling")
+        return dict(job)
 
 
 def _job_cancelled(job: dict) -> bool:
@@ -2573,18 +2645,9 @@ def api_jobs_cancel(job_id: str):
     """Cooperative cancel for any tracked job kind. The worker notices at its
     next boundary (OCR page, analyze chunk, publish stage); already-finished
     jobs return unchanged (idempotent)."""
-    with _jobs_lock:
-        job = _jobs.get(job_id)
-        ev = _jobs_events.get(job_id)
+    job = _job_request_cancel(job_id)
     if job is None:
         abort(404)
-    if ev is None or job.get("state") not in _JOB_ACTIVE:
-        return jsonify({"ok": True, "job": _job_public(job)})
-    ev.set()
-    if job.get("kind") == "ocr":
-        with _ocr_jobs_lock:
-            job["cancel_requested"] = True   # the page loop's existing flag
-    _job_transition(job, "cancelling")
     return jsonify({"ok": True, "job": _job_public(job)})
 
 
@@ -2819,7 +2882,7 @@ def _ocr_merge_page(build_id: str, target: str, page: int, text: str) -> None:
 
 
 def _ocr_save_page_images(build_id: str, page: int, images: list[dict],
-                          text: str) -> str:
+                          text: str, src_key: str = "primary") -> str:
     """Persist the figures an OCR service cut out of one page.
 
     Files land in the entry folder (ocr/images/p<page>-<id>), their boxes in
@@ -2840,7 +2903,8 @@ def _ocr_save_page_images(build_id: str, page: int, images: list[dict],
                 safe += ".jpeg"
             name = f"p{page}-{safe}"
             (d / name).write_bytes(im["data"])
-            meta["images"][name] = dict(im["bbox"] or {}, page=page)
+            meta["images"][name] = dict(
+                im["bbox"] or {}, page=page, src_key=src_key or "primary")
             # every ![id](id) in this page's markdown points at the saved file
             text = re.sub(r"(!\[[^\]]*\]\()" + re.escape(im["id"]) + r"(\))",
                           r"\g<1>" + name + r"\g<2>", text)
@@ -2903,7 +2967,7 @@ def _ocr_job_run(job_id: str) -> None:
                 text = str(result.get("text") or "")
                 if result.get("images"):
                     text = _ocr_save_page_images(
-                        job["build_id"], n, result["images"], text)
+                        job["build_id"], n, result["images"], text, src_key)
                 # save boxes when the service produced them, else clear this
                 # page's stale boxes (a figures-only or text-only re-OCR)
                 _ocr_save_page_words(job["build_id"], src_key, n,
@@ -2924,6 +2988,7 @@ def _ocr_job_run(job_id: str) -> None:
             log.error("OCR failed: book=%s page=%s service=%s: %s",
                       job["build_id"], n, svc, detail, exc_info=True)
         job["done"] += 1
+        _job_checkpoint(job)
     if job.get("cancel_requested") or _job_cancelled(job):
         # Covers a request received while the final page was processing.
         for pending in job["pages"]:
@@ -2950,6 +3015,8 @@ def api_ocr_run():
     build_id = str(p.get("build_id") or "")
     if build_id not in lib.load_json(BUILDS_PATH, {}):
         abort(404)
+    with _page_structure_lock:
+        source_revision = _page_structure_revision.get(build_id, 0)
     pdf = _resolve_local(str(p.get("pdf") or ""))
     if pdf is None or not pdf.is_file():
         return jsonify({"ok": False, "error": "PDF not found"})
@@ -2967,10 +3034,6 @@ def api_ocr_run():
     # an unknown/removed key is refused rather than recorded
     src_key = _valid_src_key(lib.load_json(BUILDS_PATH, {}).get(build_id, {}),
                              p.get("src"))
-    if src_key:
-        _ocr_set_source(build_id,
-                        _ocr_name(str(p.get("target") or "compiled.txt")),
-                        src_key)
     job = {
         "id": job_id, "build_id": build_id, "pdf": str(pdf),
         "target": str(p.get("target") or "compiled.txt"),
@@ -2981,10 +3044,9 @@ def api_ocr_run():
         "status": "running",
         "cfg": _ocr_request_cfg(p),
     }
-    with _ocr_jobs_lock:
-        _ocr_jobs[job_id] = job
-    _job_track(job, "ocr", label=_job_book_label(build_id))
-    threading.Thread(target=_ocr_job_run, args=(job_id,), daemon=True).start()
+    if not _ocr_job_start_guarded(job, source_revision, bool(src_key)):
+        return jsonify({"ok": False, "error":
+                        "page numbering changed — review the pages and retry"}), 409
     return jsonify({"ok": True, "job": _ocr_job_state(job)})
 
 
@@ -3031,48 +3093,153 @@ def api_ocr_job_cancel(job_id: str):
         job = _ocr_jobs.get(job_id)
         if not job:
             abort(404)
-        stopping = job.get("status") in ("running", "cancelling")
-        if stopping:
-            job["cancel_requested"] = True
-    if stopping:
-        ev = _jobs_events.get(job_id)
-        if ev is not None:
-            ev.set()
-        _job_transition(job, "cancelling")
-    return jsonify({"ok": True, "job": _ocr_job_state(job)})
+    snapshot = _job_request_cancel(job_id, fallback=job)
+    return jsonify({"ok": True,
+                    "job": {k: v for k, v in snapshot.items() if k != "cfg"}})
 
 
 # --- PDF page deletion ---------------------------------------------------------------
 
+_page_structure_lock = threading.RLock()
+_page_structure_revision: dict[str, int] = {}
+
+
+def _ocr_job_start_guarded(job: dict, source_revision: int,
+                           record_source: bool = False) -> bool:
+    """Register/start OCR atomically against page deletion."""
+    build_id = str(job.get("build_id") or "")
+    with _page_structure_lock:
+        if _page_structure_revision.get(build_id, 0) != source_revision:
+            return False
+        if record_source:
+            _ocr_set_source(build_id, _ocr_name(job.get("target") or "compiled.txt"),
+                            job.get("src_key") or "primary")
+        with _ocr_jobs_lock:
+            _ocr_jobs[job["id"]] = job
+        _job_track(job, "ocr", label=_job_book_label(build_id))
+        threading.Thread(target=_ocr_job_run, args=(job["id"],),
+                         daemon=True).start()
+        return True
+
+
+def _page_job_blockers(build_id: str) -> list[dict]:
+    """Live jobs whose page snapshot a deletion would invalidate."""
+    with _ocr_jobs_lock:
+        ocr = [j for j in _ocr_jobs.values()
+               if j.get("build_id") == build_id
+               and (j.get("state") or _job_state_of(j.get("status")))
+               in _JOB_ACTIVE]
+    # Defined later in the module, but always present by the time a request or
+    # folder-sync worker can call this helper.
+    with _an_jobs_lock:
+        analyze = [j for j in _an_jobs.values()
+                   if j.get("build_id") == build_id
+                   and (j.get("state") or _job_state_of(j.get("status")))
+                   in _JOB_ACTIVE]
+    return ocr + analyze
+
+
 def _renumber_layout_words(build_id: str, src_key: str, removed: list[int]) -> None:
-    """Drop the deleted pages' word boxes from ONE source's sidecar map and
-    shift the rest down, matching _renumber_marked_text on the compiled files.
-    Source-scoped like that renumber, so a deletion on one scan never disturbs
-    another's boxes. Its own lock, so call it OUTSIDE the caller's
-    _ocr_merge_lock block (non-reentrant)."""
+    """Remap page-keyed word boxes and extracted-image layout metadata.
+
+    Word boxes are source-scoped. Extracted figures belong to the OCR document
+    recorded in ``sources.json``; only figures for the PDF being edited move.
+    Deleted-page image files stay on disk as recovery artifacts, but disappear
+    from layout metadata so they cannot be placed on the wrong page.
+    """
     meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
     if not meta_path.is_file():
         return
     removed_set = set(removed)
     with _ocr_merge_lock:
         meta = lib.load_json(meta_path, {})
+        dirty = False
         wmap = meta.get("words")
-        if not isinstance(wmap, dict):
-            return
-        pages = wmap.get(src_key or "primary")
-        if not isinstance(pages, dict):
-            return
-        remapped = {}
-        for k, v in pages.items():
-            try:
-                n = int(k)
-            except (TypeError, ValueError):
+        if isinstance(wmap, dict):
+            pages = wmap.get(src_key or "primary")
+            if isinstance(pages, dict):
+                remapped = {}
+                for k, v in pages.items():
+                    try:
+                        n = int(k)
+                    except (TypeError, ValueError):
+                        continue
+                    if n in removed_set:
+                        continue
+                    remapped[str(n - sum(1 for r in removed if r < n))] = v
+                wmap[src_key or "primary"] = remapped
+                dirty = True
+
+        images = meta.get("images")
+        if isinstance(images, dict):
+            for name, info in list(images.items()):
+                if not isinstance(info, dict):
+                    continue
+                # Older sidecars predate src_key and therefore belong to the
+                # historical primary source.
+                if str(info.get("src_key") or "primary") != src_key:
+                    continue
+                try:
+                    n = int(info.get("page"))
+                except (TypeError, ValueError):
+                    continue
+                if n in removed_set:
+                    images.pop(name, None)
+                    image = _entry_dir(build_id) / "ocr" / "images" / name
+                    if image.is_file():
+                        import shutil
+                        backup = image.parent / ".page-delete-backup"
+                        backup.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(image, backup / name)
+                        image.unlink()
+                else:
+                    info["page"] = n - sum(1 for r in removed if r < n)
+                dirty = True
+        if dirty:
+            lib.save_json(meta_path, meta)
+
+
+def _renumber_translation_artifacts(build_id: str, src_key: str,
+                                    removed: list[int]) -> None:
+    """Keep translated text and its source-hash sidecars page-aligned."""
+    d = _entry_dir(build_id) / "translations"
+    if not d.is_dir():
+        return
+    srcmap = _ocr_sources(build_id)
+    removed_set = set(removed)
+    with _an_write_lock:
+        for text_path in sorted(d.glob("*.txt")):
+            lang = text_path.stem
+            meta_path = _translation_meta_path(build_id, lang)
+            meta = _load_translation_meta(build_id, lang)
+            source_doc = str(meta.get("src") or "")
+            source_key = srcmap.get(source_doc) or "primary"
+            if source_key != src_key:
                 continue
-            if n in removed_set:
+
+            raw = text_path.read_text(encoding="utf-8", errors="replace")
+            text_path.with_name(text_path.name + ".bak").write_text(
+                raw, encoding="utf-8", errors="replace")
+            text_path.write_text(_renumber_marked_text(raw, removed),
+                                 encoding="utf-8", errors="replace")
+
+            if not meta_path.is_file():
                 continue
-            remapped[str(n - sum(1 for r in removed if r < n))] = v
-        wmap[src_key or "primary"] = remapped
-        lib.save_json(meta_path, meta)
+            meta_path.with_name(meta_path.name + ".bak").write_text(
+                meta_path.read_text(encoding="utf-8", errors="replace"),
+                encoding="utf-8", errors="replace")
+            remapped = {}
+            for key, rec in meta.get("pages", {}).items():
+                try:
+                    n = int(key)
+                except (TypeError, ValueError):
+                    remapped[str(key)] = rec
+                    continue
+                if n in removed_set:
+                    continue
+                remapped[str(n - sum(1 for r in removed if r < n))] = rec
+            meta["pages"] = remapped
+            lib.save_json(meta_path, meta)
 
 
 def _renumber_marked_text(text: str, removed: list[int]) -> str:
@@ -3110,12 +3277,10 @@ def api_pdf_pages_delete():
         abort(404)
     # a running OCR job reads page numbers that deletion would shift under
     # its feet — refuse until it finishes
-    running = [j for j in _ocr_jobs.values()
-               if j.get("build_id") == build_id
-               and j.get("status") in ("running", "cancelling")]
+    running = _page_job_blockers(build_id)
     if running:
         return jsonify({"ok": False,
-                        "error": "an OCR job is running for this book — "
+                        "error": "a page-processing job is running for this book — "
                                  "wait for it to finish"})
     pdf = _resolve_local(str(p.get("pdf") or ""))
     if pdf is None or pdf.suffix.lower() != ".pdf" or not pdf.is_file():
@@ -3148,6 +3313,18 @@ def api_pdf_pages_delete():
 
 def _apply_page_deletion(build_id: str, builds: dict, pdf: Path,
                          pages: list[int]) -> dict:
+    """Guard the page structure while every page-keyed derivative is remapped."""
+    with _page_structure_lock:
+        if _page_job_blockers(build_id):
+            raise ValueError("a page-processing job is running for this book")
+        result = _apply_page_deletion_locked(build_id, builds, pdf, pages)
+        _page_structure_revision[build_id] = (
+            _page_structure_revision.get(build_id, 0) + 1)
+        return result
+
+
+def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
+                                pages: list[int]) -> dict:
     """Rewrite the PDF without the given pages (backup kept), renumber the
     build's OCR files, and remap title_pages. Shared by the deletion
     endpoint and blank-page trimming. Raises ValueError on refusal."""
@@ -3199,6 +3376,10 @@ def _apply_page_deletion(build_id: str, builds: dict, pdf: Path,
     # files; keep THIS source's boxes aligned so the placed facsimile never
     # shows a deleted page's words.
     _renumber_layout_words(build_id, src_key, pages)
+    # Translations use the same page-marker convention, and their provenance
+    # sidecars key each source hash by page. Move both in one protected pass so
+    # stale detection and eventual publication never retain an obsolete tail.
+    _renumber_translation_artifacts(build_id, src_key, pages)
     # title pages are counted on the PRIMARY PDF; a secondary's deletions
     # don't move them
     titles = [] if src_key != "primary" else \
@@ -3226,7 +3407,7 @@ def _apply_page_deletion(build_id: str, builds: dict, pdf: Path,
         # the caller's snapshot predates the slow PDF rewrite above — apply
         # the remap to a fresh read, and keep the returned record in step
         b.update(changed)
-        _builds_apply(build_id, changed)
+        b["updated_at"] = _builds_apply(build_id, changed)
     return {"deleted": pages, "pages": len(keep),
             "renumbered": renumbered,
             "backup": pdf.with_suffix(".bak.pdf").name,
@@ -4496,6 +4677,8 @@ def api_ia_meta():
 _REG_CACHE_PATH = lib.DATA_ROOT / "downloads" / "cache" / "copyright_reg.json"
 _reg_cache: dict | None = None
 _reg_cache_lock = threading.Lock()
+_REG_CACHE_VERSION = 2
+_REG_NEGATIVE_TTL = 24 * 60 * 60
 
 
 def _reg_cache_load() -> dict:
@@ -4515,10 +4698,20 @@ def _reg_cache_store(cache: dict) -> None:
         pass
 
 
-def _reg_cache_key(title: str, author: str, sources) -> str:
+def _reg_cache_key(title: str, author: str, year_value, sources) -> str:
     def n(s):
         return " ".join(str(s or "").lower().split())
-    return n(title) + "|" + n(author) + "|" + ",".join(sources)
+    source_key = ",".join(s for s in copyreg.SOURCES if s in set(sources))
+    return (f"registration-v{_REG_CACHE_VERSION}|{n(title)}|{n(author)}|"
+            f"{n(year_value)}|{source_key}")
+
+
+def _status_cache_key(title: str, author: str, year_value) -> str:
+    def n(s):
+        return " ".join(str(s or "").lower().split())
+    # Preserve the pre-v2 status namespace; only registration results need the
+    # parser-version invalidation above.
+    return n(title) + "|" + n(author) + "|__status__," + n(year_value)
 
 
 @app.route("/api/copyright/registration")
@@ -4529,19 +4722,31 @@ def api_copyright_registration():
     title = (request.args.get("title") or "").strip()
     author = (request.args.get("author") or "").strip()
     year = (request.args.get("year") or "").strip()
-    sources = tuple(s for s in (request.args.get("sources") or "cprs").split(",")
-                    if s in copyreg.SOURCES)
+    requested_sources = set(
+        (request.args.get("sources") or "cprs").split(","))
+    sources = tuple(s for s in copyreg.SOURCES if s in requested_sources)
     if not title or not sources:
         return jsonify({"found": False, "sources": [], "match": None})
-    key = _reg_cache_key(title, author, sources)
+    key = _reg_cache_key(title, author, year, sources)
+    now = time.time()
     with _reg_cache_lock:
         cache = _reg_cache_load()
-        if key in cache:
-            return jsonify(cache[key])
-    result = copyreg.registration_lookup(title, author, year, sources)  # network
+        cached = cache.get(key)
+        if isinstance(cached, dict) and isinstance(cached.get("result"), dict):
+            result = cached["result"]
+            age = now - float(cached.get("cached_at") or 0)
+            if result.get("found") or age < _REG_NEGATIVE_TTL:
+                return jsonify(result)
+    try:
+        result = copyreg.registration_lookup(title, author, year, sources)  # network
+    except copyreg.RegistrationLookupError as exc:
+        return jsonify({
+            "found": False, "sources": [], "match": None,
+            "error": str(exc), "retryable": True,
+        }), 503
     with _reg_cache_lock:
         cache = _reg_cache_load()
-        cache[key] = result
+        cache[key] = {"cached_at": now, "result": result}
         _reg_cache_store(cache)
     return jsonify(result)
 
@@ -4556,7 +4761,7 @@ def api_copyright_status():
     year = (request.args.get("year") or "").strip()
     if not title:
         return jsonify({"copyright_status": ""})
-    key = _reg_cache_key(title, author, ("__status__", year))
+    key = _status_cache_key(title, author, year)
     with _reg_cache_lock:
         cache = _reg_cache_load()
         if key in cache:
@@ -5002,6 +5207,28 @@ def _analyze_doc(bid: str, b: dict) -> tuple[str, str]:
     return "", ""
 
 
+def _analyze_doc_snapshot(bid: str, b: dict,
+                          requested: str = "") -> tuple[str, str, int]:
+    """Read one OCR source together with the page-structure revision.
+
+    A guarded job start later verifies the revision under the same lock. Thus
+    deletion either sees the registered job and refuses, or completes first
+    and causes the stale snapshot to be rejected before a worker starts.
+    """
+    with _page_structure_lock:
+        name, text = "", ""
+        requested = str(requested or "").strip()
+        if requested and _ocr_name(requested) == requested:
+            ocr_root = (_entry_dir(bid) / "ocr").resolve()
+            candidate = (ocr_root / requested).resolve()
+            if candidate.is_relative_to(ocr_root) and candidate.is_file():
+                name = requested
+                text = candidate.read_text(encoding="utf-8", errors="replace")
+        if not text:
+            name, text = _analyze_doc(bid, b)
+        return name, text, _page_structure_revision.get(bid, 0)
+
+
 def _an_meta_line(b: dict) -> str:
     bits = [b.get("title") or "?"]
     if b.get("subtitle"):
@@ -5058,7 +5285,8 @@ def _save_analyze_summary(bid: str, text: str) -> None:
         if bid not in builds:
             return
         builds[bid]["description"] = summary
-        builds[bid]["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        builds[bid]["updated_at"] = _build_updated_at(
+            builds[bid].get("updated_at"))
         lib.save_json(BUILDS_PATH, builds)
 
 
@@ -5076,8 +5304,8 @@ def _save_analyze_about(bid: str, text: str) -> None:
         if bid not in builds:
             return
         builds[bid]["description"] = about
-        builds[bid]["updated_at"] = datetime.now(
-            timezone.utc).isoformat(timespec="seconds")
+        builds[bid]["updated_at"] = _build_updated_at(
+            builds[bid].get("updated_at"))
         lib.save_json(BUILDS_PATH, builds)
 
 
@@ -5233,11 +5461,12 @@ def api_build_translation(bid: str, lang: str):
     b, err = _an_gate(bid)
     if err:
         return err
-    if p.is_file():
-        p.unlink()
-    m = _translation_meta_path(bid, lang)
-    if m.is_file():
-        m.unlink()
+    with _an_write_lock:
+        if p.is_file():
+            p.unlink()
+        m = _translation_meta_path(bid, lang)
+        if m.is_file():
+            m.unlink()
     return jsonify({"ok": True})
 
 
@@ -5246,6 +5475,10 @@ def api_build_translation(bid: str, lang: str):
 _an_jobs: dict = {}
 _an_jobs_lock = threading.Lock()
 _an_write_lock = threading.Lock()
+
+
+class _AnalyzeSourceChanged(Exception):
+    """The page structure changed between route validation and job start."""
 
 
 def _an_job_new(bid: str, kind: str, total: int) -> dict:
@@ -5265,12 +5498,22 @@ def _an_job_start(bid: str, kind: str, total: int, target,
     ``decorate`` may attach immutable request metadata after the id is known
     but before the worker can run. Existing callers need no decoration.
     """
-    job = _an_job_new(bid, kind, total)
-    if decorate is not None:
-        with _an_jobs_lock:
-            decorate(job)
-    threading.Thread(target=target, args=(job,), daemon=True).start()
-    return job
+    with _page_structure_lock:
+        job = _an_job_new(bid, kind, total)
+        if decorate is not None:
+            with _an_jobs_lock:
+                decorate(job)
+        threading.Thread(target=target, args=(job,), daemon=True).start()
+        return job
+
+
+def _an_job_start_guarded(bid: str, source_revision: int, kind: str,
+                          total: int, target, decorate=None) -> dict:
+    """Start only if the OCR snapshot still has its original page numbering."""
+    with _page_structure_lock:
+        if _page_structure_revision.get(bid, 0) != source_revision:
+            raise _AnalyzeSourceChanged()
+        return _an_job_start(bid, kind, total, target, decorate)
 
 
 def _an_finish(job: dict, error: str = "") -> None:
@@ -5344,15 +5587,8 @@ def api_analyze_pages():
     wanted = sorted(set(raw_pages))
 
     requested_doc = str(p.get("doc") or "").strip()
-    doc_name, text = "", ""
-    if requested_doc and _ocr_name(requested_doc) == requested_doc:
-        ocr_root = (_entry_dir(bid) / "ocr").resolve()
-        candidate = (ocr_root / requested_doc).resolve()
-        if candidate.is_relative_to(ocr_root) and candidate.is_file():
-            doc_name = requested_doc
-            text = candidate.read_text(encoding="utf-8", errors="replace")
-    if not text:
-        doc_name, text = _analyze_doc(bid, b)
+    doc_name, text, source_revision = _analyze_doc_snapshot(
+        bid, b, requested_doc)
 
     all_pages = _an_pages(text)
     missing = [n for n in wanted if n not in all_pages]
@@ -5403,6 +5639,7 @@ def api_analyze_pages():
                 results.append((nums, result.strip()))
                 with _an_jobs_lock:
                     job["done"] = i + 1
+                _job_checkpoint(job)
 
             parts = [f"# Page analysis: {b.get('title') or 'Untitled'}",
                      f"_OCR source: {doc_name}; engine: {engine}_"]
@@ -5420,7 +5657,12 @@ def api_analyze_pages():
             log.error("page analysis failed for %s", bid, exc_info=exc)
             _an_finish(job, f"{type(exc).__name__}: {exc}")
 
-    job = _an_job_start(bid, "page-analysis", len(chunks), run, decorate)
+    try:
+        job = _an_job_start_guarded(
+            bid, source_revision, "page-analysis", len(chunks), run, decorate)
+    except _AnalyzeSourceChanged:
+        return jsonify({"ok": False, "error":
+                        "page numbering changed — review the pages and retry"}), 409
     return jsonify({"ok": True, "job": job["id"], "pages": wanted,
                     "engine": engine, "doc": doc_name,
                     "artifact": job["artifact"]})
@@ -5433,7 +5675,7 @@ def api_analyze_summarize():
     b, err = _an_gate(bid)
     if err:
         return err
-    name, text = _analyze_doc(bid, b)
+    name, text, source_revision = _analyze_doc_snapshot(bid, b)
     pages = _an_pages(text)
     if not pages:
         return jsonify({"ok": False, "error":
@@ -5462,6 +5704,7 @@ def api_analyze_summarize():
                 notes.append(out)
                 with _an_jobs_lock:
                     job["done"] = i + 1
+                _job_checkpoint(job)
             if _an_cancel_check(job, f"{job['done']}/{job['total']} sections "
                                 "read — no summary written"):
                 return
@@ -5483,7 +5726,12 @@ def api_analyze_summarize():
             log.error("summarize failed for %s", bid, exc_info=exc)
             _an_finish(job, f"{type(exc).__name__}: {exc}")
 
-    job = _an_job_start(bid, "summarize", len(chunks) + 1, run)
+    try:
+        job = _an_job_start_guarded(
+            bid, source_revision, "summarize", len(chunks) + 1, run)
+    except _AnalyzeSourceChanged:
+        return jsonify({"ok": False, "error":
+                        "page numbering changed — review the pages and retry"}), 409
     return jsonify({"ok": True, "job": job["id"], "chunks": len(chunks),
                     "doc": name})
 
@@ -5601,7 +5849,7 @@ def api_analyze_translate():
         return err
     if not lang:
         return jsonify({"ok": False, "error": "no target language"}), 400
-    name, text = _analyze_doc(bid, b)
+    name, text, source_revision = _analyze_doc_snapshot(bid, b)
     pages = _an_pages(text)
     if not pages:
         return jsonify({"ok": False, "error":
@@ -5664,6 +5912,7 @@ def api_analyze_translate():
                 finally:
                     with _an_jobs_lock:
                         job["done"] = i + 1
+                    _job_checkpoint(job)
                 # progressive save under a lock: a partial job loses nothing
                 with _an_write_lock:
                     cur = _an_pages(_read_entry_text(bid, rel))
@@ -5688,7 +5937,12 @@ def api_analyze_translate():
             log.error("translate failed for %s", bid, exc_info=exc)
             _an_finish(job, f"{type(exc).__name__}: {exc}")
 
-    job = _an_job_start(bid, f"translate:{lang}", len(todo), run)
+    try:
+        job = _an_job_start_guarded(
+            bid, source_revision, f"translate:{lang}", len(todo), run)
+    except _AnalyzeSourceChanged:
+        return jsonify({"ok": False, "error":
+                        "page numbering changed — review the pages and retry"}), 409
     return jsonify({"ok": True, "job": job["id"], "pages": len(todo)})
 
 
@@ -5699,7 +5953,7 @@ def api_analyze_annotate():
     b, err = _an_gate(bid)
     if err:
         return err
-    name, text = _analyze_doc(bid, b)
+    name, text, source_revision = _analyze_doc_snapshot(bid, b)
     pages = _an_pages(text)
     if not pages:
         return jsonify({"ok": False, "error":
@@ -5739,6 +5993,7 @@ def api_analyze_annotate():
                 finally:
                     with _an_jobs_lock:
                         job["done"] = i + 1
+                    _job_checkpoint(job)
                 fresh = []
                 now = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 for raw in (out.get("notes") or [])[:40]:
@@ -5778,7 +6033,12 @@ def api_analyze_annotate():
             log.error("annotate failed for %s", bid, exc_info=exc)
             _an_finish(job, f"{type(exc).__name__}: {exc}")
 
-    job = _an_job_start(bid, "annotate", len(chunks), run)
+    try:
+        job = _an_job_start_guarded(
+            bid, source_revision, "annotate", len(chunks), run)
+    except _AnalyzeSourceChanged:
+        return jsonify({"ok": False, "error":
+                        "page numbering changed — review the pages and retry"}), 409
     return jsonify({"ok": True, "job": job["id"], "chunks": len(chunks)})
 
 
@@ -5799,7 +6059,7 @@ def api_analyze_relevance():
         return jsonify({"ok": False, "error":
                         "no relevance criteria defined yet"}), 400
     summary = _read_entry_text(bid, "summary.md")
-    _, text = _analyze_doc(bid, b)
+    _, text, source_revision = _analyze_doc_snapshot(bid, b)
     excerpt = summary or "\n".join(list(_an_pages(text).values())[:6])[:8000]
     if not excerpt.strip():
         return jsonify({"ok": False, "error":
@@ -5855,14 +6115,19 @@ def api_analyze_relevance():
                 row = fresh.get(bid)
                 if row is not None:
                     row["relevance"] = result
-                    row["updated_at"] = result["assessed_at"]
+                    row["updated_at"] = _build_updated_at(row.get("updated_at"))
                     lib.save_json(BUILDS_PATH, fresh)
             _an_finish(job)
         except Exception as exc:
             log.error("relevance failed for %s", bid, exc_info=exc)
             _an_finish(job, f"{type(exc).__name__}: {exc}")
 
-    job = _an_job_start(bid, "relevance", 1, run)
+    try:
+        job = _an_job_start_guarded(
+            bid, source_revision, "relevance", 1, run)
+    except _AnalyzeSourceChanged:
+        return jsonify({"ok": False, "error":
+                        "page numbering changed — review the pages and retry"}), 409
     return jsonify({"ok": True, "job": job["id"]})
 
 
@@ -6338,6 +6603,7 @@ def _publish_run(bid: str, actor: str, job: dict | None = None) -> None:
             _publish.update(stage=name, **kw)
         if job is not None and job.get("state") in _JOB_ACTIVE:
             job["note"] = name
+            _job_checkpoint(job, force=True)
     try:
         builds = lib.load_json(BUILDS_PATH, {})
         b = builds.get(bid) or {}
@@ -6358,6 +6624,7 @@ def _publish_run(bid: str, actor: str, job: dict | None = None) -> None:
                 _publish["sent"] = sent
             if job is not None:                 # unified table sees bytes
                 job["done"], job["total"] = int(sent), int(total)
+                _job_checkpoint(job)
 
         r2cfg = _r2_cfg()
         if r2.configured(r2cfg):
@@ -6492,7 +6759,7 @@ def _publish_run(bid: str, actor: str, job: dict | None = None) -> None:
             if row is not None:
                 row["status"] = "uploaded"
                 row["published_slug"] = slug
-                row["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                row["updated_at"] = _build_updated_at(row.get("updated_at"))
                 lib.save_json(BUILDS_PATH, fresh)
         activity("published", "book", actor=actor or None)
         log.info("published volume %s (%.0f MB) -> %s", slug, size / 1e6, url)
@@ -6944,6 +7211,7 @@ def _migrate_stored_paths() -> None:
             rel = _relativize_data_path(b.get("pdf_file", ""))
             if rel != (b.get("pdf_file") or ""):
                 b["pdf_file"] = rel
+                b["updated_at"] = _build_updated_at(b.get("updated_at"))
                 changed = True
         if changed:
             lib.save_json(BUILDS_PATH, builds)

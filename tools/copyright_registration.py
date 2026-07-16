@@ -37,6 +37,14 @@ _UA = "Mozilla/5.0 (world-herb-library tools)"
 SOURCES = ("cprs", "nypl")
 
 
+class RegistrationLookupError(RuntimeError):
+    """A registration source could not be searched reliably.
+
+    This is distinct from a successful search with no matching record. Callers
+    may cache the latter, but should retry the former.
+    """
+
+
 def _first(v):
     if isinstance(v, list):
         return v[0] if v else ""
@@ -123,8 +131,8 @@ def cprs_registration(title: str, author: str = "", year_value=None,
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace"))
-    except Exception:
-        return None
+    except Exception as exc:
+        raise RegistrationLookupError("CPRS registration lookup unavailable") from exc
     target_year = None
     match = re.search(r"\b(1[5-9]\d{2}|20\d{2})\b", str(year_value or ""))
     if match:
@@ -315,18 +323,26 @@ def registration_lookup(title: str, author: str = "", year_value=None,
     Returns {"found": bool, "sources": [names that matched], "match": <first>}.
     """
     matched: list[str] = []
+    unavailable: list[str] = []
     first = None
     for src in sources:
-        if src == "cprs":
-            m = cprs_registration(title, author, year_value)
-        elif src == "nypl":
-            m = nypl_registration(title, author, year_value)
-        else:
-            m = None
+        try:
+            if src == "cprs":
+                m = cprs_registration(title, author, year_value)
+            elif src == "nypl":
+                m = nypl_registration(title, author, year_value)
+            else:
+                m = None
+        except RegistrationLookupError:
+            unavailable.append(src)
+            continue
         if m:
             matched.append(src)
             if first is None:
                 first = m
+    if not matched and unavailable:
+        names = ", ".join(name.upper() for name in unavailable)
+        raise RegistrationLookupError(f"{names} registration lookup unavailable")
     return {"found": bool(matched), "sources": matched, "match": first}
 
 
