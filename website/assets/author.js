@@ -34,12 +34,15 @@ async function main() {
     return;
   }
   const { rows, total } = res;
-  if (!total) { notFound(author); return; }
+  if (!rows.length) { notFound(author); return; }
+  // total is null when the cloud answered rows without an exact count;
+  // the rows in hand are then a truthful floor, never an invented zero.
+  const works = total ?? rows.length;
 
   box.innerHTML = `
     <p class="crumb"><a href="browse.html">Catalogue</a> › ${esc(author)}</p>
     <h1 class="book-title">${esc(author)}</h1>
-    <p class="author-stats">${total} work${total === 1 ? "" : "s"} in the catalogue</p>
+    <p class="author-stats">${works} work${works === 1 ? "" : "s"} in the catalogue</p>
     <div id="bio-slot"></div>
     <h2 class="section-head">Works</h2>
     <ol class="records-list">${rows.map(renderRecord).join("")}</ol>`;
