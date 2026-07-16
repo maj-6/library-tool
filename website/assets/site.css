@@ -267,7 +267,7 @@ ol.volumes { list-style: none; margin: 0; padding: 0; }
   transition: background 0.15s, color 0.15s;
 }
 .dl-btn:hover { background: var(--accent); color: #fff; }
-.dl-btn[aria-disabled="true"] { border-color: var(--rule-mid); color: var(--ink-faint); pointer-events: none; }
+.dl-unavail { font-size: 12px; font-style: italic; color: var(--ink-faint); white-space: nowrap; }
 .dl-arrow { width: 13px; height: 13px; flex: none; }
 
 /* Testing builds are supporting links, not headline download cards. */

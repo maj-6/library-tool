@@ -43,6 +43,11 @@
   --cr-inconclusive: #9b6a24;
   --cr-unknown: #7d817c;
   --radius: 4px;
+  /* dialog shell spacing: every overlay window shares these so headers,
+     bodies, and footers line up across dialogs (see .win-titlebar) */
+  --dlg-pad-x: 14px;
+  --dlg-pad-y: 12px;
+  --dlg-gap: 10px;
   --mono: "Consolas", "DejaVu Sans Mono", "Courier New", monospace;
   --mono2: "Consolas", "DejaVu Sans Mono", "Courier New", monospace;
   --ui: "Segoe UI", Tahoma, Verdana, sans-serif;
@@ -97,8 +102,7 @@ body[data-theme="sage"] {
   --blue2: #6f6853;
   --radius: 6px;
 }
-body[data-theme="sage"] .cad-btn,
-body[data-theme="sage"] .win-close {
+body[data-theme="sage"] .cad-btn {
   border: 1px solid #b4ab97;
   background: #fdfbf5;
 }
@@ -186,8 +190,7 @@ body[data-theme="ledger"] {
   --blue2: #59635a;
   --radius: 0;             /* Archive Ledger is square-cornered */
 }
-body[data-theme="ledger"] .cad-btn,
-body[data-theme="ledger"] .win-close {
+body[data-theme="ledger"] .cad-btn {
   border: 1px solid #a5a296;
   border-bottom-width: 2px;
   background: linear-gradient(#f6f5ef, #eae8e0);
@@ -264,8 +267,7 @@ body[data-theme="foolscap"] {
   --radius: 1px;
 }
 /* letterpress buttons: type debossed into the sheet */
-body[data-theme="foolscap"] .cad-btn,
-body[data-theme="foolscap"] .win-close {
+body[data-theme="foolscap"] .cad-btn {
   border: 1px solid #a49d8e;
   background: #f2f0e9;
   box-shadow: inset 1px 1px 1px rgba(50, 44, 34, 0.14),
@@ -320,8 +322,10 @@ body[data-theme="foolscap"] .win-titlebar {
   background: #a8a59c;
   color: #1c1810;
   border-bottom: 1px solid #6f665a;
-  letter-spacing: 1px;
 }
+/* the wide galley tracking stays on the application band only; dialog
+   titles share the one cross-theme type treatment (#156) */
+body[data-theme="foolscap"] #titlebar { letter-spacing: 1px; }
 /* grid on the paper canvas: light ruled header, single hairline rules, no vertical ruling */
 body[data-theme="foolscap"] .grid thead th {
   background: #ece6da;
@@ -383,8 +387,7 @@ body[data-theme="vellum"] {
   --blue2: #4c6683;
   --radius: 2px;
 }
-body[data-theme="vellum"] .cad-btn,
-body[data-theme="vellum"] .win-close {
+body[data-theme="vellum"] .cad-btn {
   border: 1px solid #c1baa8;
   background: #f6f2ea;
 }
@@ -473,8 +476,7 @@ body[data-theme="linen"] {
   --radius: 2px;
 }
 /* linen chrome: soft flax board, hairline rules, no hard black */
-body[data-theme="linen"] .cad-btn,
-body[data-theme="linen"] .win-close {
+body[data-theme="linen"] .cad-btn {
   border: 1px solid #b8b2a3;
   background: linear-gradient(#f1eee6, #e9e5db);
 }
@@ -769,7 +771,7 @@ body {
 
 /* --- review queue window --- */
 #review-overlay { z-index: 56; }   /* above the titlebar/menus, like its siblings */
-#review-window { width: min(640px, 100%); max-height: 78vh; }
+#review-window { max-height: 78vh; }   /* width: .win-md */
 #review-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 #review-toolbar { flex: 0 0 auto; padding: 8px 12px 4px; }
 #review-show-resolved-row { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
@@ -879,24 +881,26 @@ body.desktop .win-controls { display: inline-flex; }
 .win-btn svg rect[fill]:not([fill="none"]) { fill: currentColor; }
 .win-btn:hover { background: rgba(20, 24, 28, 0.08); }
 .win-btn:active { background: rgba(20, 24, 28, 0.16); }
-.win-close:hover { background: #e81123; }
-.win-close:active { background: #c50e1f; }
-/* only the frameless window's control goes red-with-white; themed dialog
-   close buttons keep their light faces (and must keep their dark glyphs) */
-.win-btn.win-close:hover,
-.win-btn.win-close:active { color: #fff; }
 
 /* The frameless main-window controls sit directly on the title band, so they
    must read as part of it -- never as discrete faced buttons. The generic
-   `.win-close` face (below) and every per-theme `.win-close` override would
-   otherwise leak a white bordered face onto the close glyph (and, being more
-   specific, even swallow its red hover). Scoping under the `#titlebar` id
-   outranks all of them, so min/max/close stay bar-coloured and the close still
-   lights red on hover per the OS convention. Colour is left to inherit so each
+   dialog `.win-close` (a 32x32 ghost icon button, below) would otherwise
+   shrink the close glyph's 44px strip and round its corners. Scoping under
+   the `#titlebar` id outranks it, so min/max/close keep their bar geometry
+   and ONLY this close -- the one that quits the application -- lights red on
+   hover per the OS convention. Colour is left to inherit so each
    theme keeps its own titlebar ink. */
-#titlebar .win-btn { background: transparent; border: 0; border-radius: 0; }
+#titlebar .win-btn {
+  width: 44px;
+  height: auto;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  color: inherit;
+}
 #titlebar .win-btn:hover { background: rgba(20, 24, 28, 0.08); }
 #titlebar .win-btn:active { background: rgba(20, 24, 28, 0.16); }
+#titlebar .win-btn svg { width: 10px; height: 10px; }
 #titlebar .win-btn.win-close:hover { background: #e81123; color: #fff; }
 #titlebar .win-btn.win-close:active { background: #c50e1f; color: #fff; }
 
@@ -1094,6 +1098,58 @@ main {
   color: var(--cyan);
   box-shadow: inset 0 0 0 1px var(--cyan);
   background: var(--face-active);
+}
+/* Dialog action hierarchy (#157): at most one .primary per dialog footer,
+   quiet secondaries beside it, and explicit destructive verbs. `body ...`
+   keeps these at theme-rule specificity so per-theme .cad-btn:hover faces
+   (declared earlier) cannot repaint them. */
+body .cad-btn.primary {
+  background: var(--ink);
+  color: var(--face-hi);
+  border-color: var(--ink);
+  font-weight: 600;
+  box-shadow: none;   /* foolscap's letterpress deboss reads wrong on dark ink */
+}
+body .cad-btn.primary:hover {
+  background: color-mix(in srgb, var(--ink) 82%, var(--face-hi));
+  border-color: var(--ink);
+}
+body .cad-btn.primary:active {
+  background: var(--ink);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.4);
+}
+body .cad-btn.primary.danger {
+  background: var(--red);
+  border-color: var(--red);
+  color: #fff;
+}
+body .cad-btn.primary.danger:hover {
+  background: color-mix(in srgb, var(--red) 84%, #fff);
+  border-color: var(--red);
+}
+body .cad-btn.primary:disabled {
+  background: var(--face-hi);
+  color: var(--face-sh2);
+  border-color: var(--face-sh2);
+}
+/* a borderless secondary for low-emphasis dialog actions; its own ghost
+   hover/pressed states outrank the per-theme .cad-btn:hover faces so the
+   border never pops in on hover */
+body .cad-btn.quiet {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+body .cad-btn.quiet:hover {
+  background: rgba(20, 24, 28, 0.07);
+  border-color: transparent;
+  box-shadow: none;
+}
+body .cad-btn.quiet:active {
+  background: rgba(20, 24, 28, 0.14);
+  border-color: transparent;
+  box-shadow: none;
+  transform: none;
 }
 
 /* --- drafting canvas + grid table --- */
@@ -1446,22 +1502,78 @@ form.orig-view .cad-input {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 4px 8px;
+  gap: 8px;
+  min-height: 40px;
+  box-sizing: border-box;
+  padding: 4px 4px 4px var(--dlg-pad-x);
   background: var(--face-hi);
   color: var(--ink);
   border-bottom: 1px solid var(--face-sh2);
-  letter-spacing: 1px;
-  font-weight: bold;
+  letter-spacing: 0.2px;
+  font-weight: 600;
+  font-size: 13px;
 }
+/* Dialog close: one quiet 32x32 ghost icon button. Only the application
+   window's Close (scoped under #titlebar below) gets the destructive red
+   hover; dialog closes stay neutral. */
 .win-close {
-  font-family: var(--ui);
-  background: var(--face-hi);
-  color: var(--ink);
-  cursor: pointer;
-  padding: 0 6px;
-  border: 1px solid var(--face-sh2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
   border-radius: var(--radius);
+  cursor: pointer;
 }
+.win-close svg { width: 14px; height: 14px; display: block; }
+.win-close:hover { background: rgba(20, 24, 28, 0.09); }
+.win-close:active { background: rgba(20, 24, 28, 0.18); }
+.win-close:focus-visible { outline: 2px solid var(--cyan); outline-offset: -2px; }
+/* footer shared by dialog windows: quiet actions left, primary rightmost */
+.dlg-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: var(--dlg-gap);
+}
+.dlg-actions .dlg-spacer { flex: 1 1 auto; }
+/* dialog size variants: small (confirmations), medium (forms), large
+   (editors); viewer-class windows (.ia-win, .webview-win, #pdfm-window)
+   keep their own near-fullscreen sizing */
+.win-sm { width: min(440px, 92vw); }
+.win-md { width: min(640px, 94vw); }
+.win-lg { width: min(940px, 96vw); }
+
+/* product-styled confirmation dialog (replaces window.confirm, #157) */
+#confirm-overlay { z-index: 90; }
+#confirm-body { padding: var(--dlg-pad-y) var(--dlg-pad-x) var(--dlg-pad-x); }
+#confirm-msg { margin: 0; font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; }
+#confirm-detail {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--face-sh2);
+  overflow-wrap: anywhere;
+  white-space: pre-line;
+}
+#confirm-detail[hidden] { display: none; }
+/* the cost variant: a quiet amber note for operations that spend money */
+#confirm-cost {
+  margin: 8px 0 0;
+  padding: 4px 8px;
+  font-size: 12px;
+  line-height: 1.45;
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--amber) 26%, transparent);
+  color: var(--ink);
+}
+#confirm-cost[hidden] { display: none; }
 
 /* internet archive viewer (PDF preview + metadata + downloads) */
 #ia-overlay { z-index: 61; padding: 4vh 12px; }
@@ -1545,6 +1657,8 @@ form.orig-view .cad-input {
 #wizard-overlay { z-index: 59; }   /* below the sign-in window it can open (62) */
 .wizard-win { width: min(620px, 94vw); max-height: 88vh; overflow: hidden; }
 .wizard-step { font-weight: normal; letter-spacing: 0; opacity: 0.85; font-size: 12px; }
+/* no close control in this titlebar, so restore the full right inset */
+.wizard-win .win-titlebar { padding-right: var(--dlg-pad-x); }
 .wizard-progress {
   display: block; width: 100%; height: 4px; border: 0; border-radius: 0;
   color: var(--blue); background: var(--face-sh);
@@ -1608,10 +1722,10 @@ form.orig-view .cad-input {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  padding: 10px 12px 12px;
+  padding: var(--dlg-pad-y) var(--dlg-pad-x) var(--dlg-pad-x);
 }
 .auth-body .settings-note { margin: 0; }
-.auth-body .mf-actions { margin-top: 2px; }
+.auth-body .dlg-actions { margin-top: 2px; }
 .auth-spacer { flex: 1 1 auto; }
 #auth-msg {
   padding: 2px 6px;
@@ -1624,21 +1738,18 @@ form.orig-view .cad-input {
 /* the account row in Settings > General */
 .set-account { display: flex; align-items: center; gap: 10px; }
 #set-account-state { font-style: normal; }
-#msrc-body { padding: 10px; }
+#msrc-body { padding: var(--dlg-pad-y) var(--dlg-pad-x) var(--dlg-pad-x); }
 #msrc-body .cad-input { width: 100%; }
 #msrc-msg { color: var(--red); font-weight: bold; }
 
 #md-overlay { z-index: 58; }
-#md-window {
-  width: min(940px, 100%);
-  height: min(72vh, 640px);
-}
+#md-window { height: min(72vh, 640px); }   /* width: .win-lg */
 #md-body {
   flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
-  padding: 10px;
+  padding: var(--dlg-pad-y) var(--dlg-pad-x) var(--dlg-pad-x);
   gap: 8px;
 }
 #md-body .md-live { flex: 1; min-height: 0; }
@@ -1733,7 +1844,7 @@ form.orig-view .cad-input {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  padding: 10px;
+  padding: var(--dlg-pad-y) var(--dlg-pad-x) var(--dlg-pad-x);
 }
 .fb-path-row { display: flex; gap: 6px; }
 .fb-path-row .cad-input { flex: 1; min-width: 0; }
@@ -1897,6 +2008,9 @@ form.orig-view .cad-input {
   border: 1px solid var(--face-sh2); background: var(--face-hi);
 }
 .info-thumb:hover { outline: 2px solid var(--cyan); }
+/* Image viewer (#158): recognizable chrome — a caption/close bar over the
+   image — instead of a bare dismissal layer. Only the backdrop dismisses on
+   click; the image itself is inert, leaving room for zoom controls later. */
 #img-lightbox {
   display: flex;
   align-items: center;
@@ -1905,11 +2019,45 @@ form.orig-view .cad-input {
   /* Above sticky Catalog/Editor headers and desktop chrome, so the backdrop
      dims the entire application instead of being painted underneath them. */
   z-index: 80;
+  background: rgba(0, 0, 0, 0.72);
 }
 #img-lightbox[hidden] { display: none; }
+.lightbox-fig {
+  display: flex;
+  flex-direction: column;
+  max-width: 92vw;
+  max-height: 92vh;
+  margin: 0;
+  cursor: default;
+}
+.lightbox-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 2px 2px 2px 10px;
+  color: #e8eaee;
+  background: rgba(16, 18, 22, 0.85);
+  border-radius: var(--radius) var(--radius) 0 0;
+  font-size: 12.5px;
+}
+.lightbox-cap {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#img-lightbox .win-close { color: #e8eaee; }
+#img-lightbox .win-close:hover { background: rgba(255, 255, 255, 0.14); }
+#img-lightbox .win-close:active { background: rgba(255, 255, 255, 0.24); }
 #img-lightbox img {
-  max-width: 92vw; max-height: 92vh;
-  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5); background: #fff;
+  min-height: 0;
+  max-width: 92vw;
+  max-height: calc(92vh - 36px);
+  object-fit: contain;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+  background: #fff;
 }
 
 /* field provenance: yellow = auto-populated, green = hand-typed */
@@ -2386,7 +2534,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 14px 18px 20px;
+  padding: var(--dlg-pad-y) 18px 20px;
 }
 .cl-rel { margin: 0 0 18px; }
 .cl-rel:last-child { margin-bottom: 0; }
@@ -3295,7 +3443,12 @@ body[data-theme] .drafting::-webkit-scrollbar {
 
 /* the taxonomy manager window */
 #cat-window { width: min(560px, 92vw); }
-#cat-body { display: flex; flex-direction: column; padding: 8px; gap: 6px; }
+#cat-body {
+  display: flex;
+  flex-direction: column;
+  padding: var(--dlg-pad-y) var(--dlg-pad-x) var(--dlg-pad-x);
+  gap: 6px;
+}
 #cat-body .pane-bar { display: flex; align-items: center; gap: 6px; }
 #cat-new-name { flex: 1 1 140px; }
 #cat-tree {
@@ -3387,7 +3540,7 @@ body[data-theme] .drafting::-webkit-scrollbar {
 
 /* Default OCR / text-analysis engine chooser. */
 #engine-window { width: min(460px, 92vw); }
-#engine-body { padding: 10px 12px 12px; }
+#engine-body { padding: var(--dlg-pad-y) var(--dlg-pad-x) var(--dlg-pad-x); }
 #engine-body .pane-note { margin-top: 0; }
 .engine-defaults-fields {
   display: grid;

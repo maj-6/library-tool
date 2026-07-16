@@ -1164,9 +1164,9 @@
   <div id="engine-overlay" class="overlay" hidden>
     <div id="engine-window" class="win">
       <div class="win-titlebar">
-        <span>Default Engine</span>
+        <span>Default engines</span>
         <button id="engine-close" class="win-close" type="button"
-                aria-label="Close">&#10005;</button>
+                aria-label="Close" data-icon="close"></button>
       </div>
       <div id="engine-body">
         <p class="pane-note">These engines are used when pages are staged. Cloud engines
@@ -1188,10 +1188,10 @@
           <span></span>
           <span id="analysis-engine-note" class="tool-label"></span>
         </div>
-        <div class="mf-actions">
-          <button id="engine-settings" class="cad-btn" type="button">Open Settings</button>
-          <span class="bar-spacer"></span>
-          <button id="engine-done" class="cad-btn" type="button">Done</button>
+        <div class="dlg-actions">
+          <button id="engine-settings" class="cad-btn quiet" type="button">Open settings&hellip;</button>
+          <span class="dlg-spacer"></span>
+          <button id="engine-done" class="cad-btn primary" type="button">Done</button>
         </div>
       </div>
     </div>
@@ -1202,16 +1202,17 @@
 
   <!-- MARKDOWN EDITOR WINDOW -->
   <div id="md-overlay" class="overlay" hidden>
-    <div id="md-window" class="win">
+    <div id="md-window" class="win win-lg">
       <div id="md-titlebar" class="win-titlebar">
         <span id="md-title">Markdown editor</span>
-        <button id="md-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
+        <button id="md-close" class="win-close" type="button" aria-label="Close" data-icon="close"></button>
       </div>
       <div id="md-body">
         <div id="md-live-overlay"></div>
-        <div class="mf-actions">
-          <button id="md-apply" class="cad-btn" type="button">Apply</button>
+        <div class="dlg-actions">
+          <span class="dlg-spacer"></span>
           <button id="md-cancel" class="cad-btn" type="button">Cancel</button>
+          <button id="md-apply" class="cad-btn primary" type="button">Apply</button>
         </div>
       </div>
     </div>
@@ -1222,7 +1223,7 @@
     <div id="pdfm-window" class="win">
       <div id="pdfm-titlebar" class="win-titlebar">
         <span id="pdfm-title">Publication</span>
-        <button id="pdfm-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
+        <button id="pdfm-close" class="win-close" type="button" aria-label="Close" data-icon="close"></button>
       </div>
       <div id="pdfm-body"></div>
     </div>
@@ -1233,7 +1234,7 @@
     <div id="fb-window" class="win">
       <div id="fb-titlebar" class="win-titlebar">
         <span>Select a PDF file</span>
-        <button id="fb-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
+        <button id="fb-close" class="win-close" type="button" aria-label="Close" data-icon="close"></button>
       </div>
       <div id="fb-body">
         <div class="fb-path-row">
@@ -1269,18 +1270,18 @@
     <div id="msrc-window" class="win">
       <div id="msrc-titlebar" class="win-titlebar">
         <span>Manually located source</span>
-        <button id="msrc-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
+        <button id="msrc-close" class="win-close" type="button" aria-label="Close" data-icon="close"></button>
       </div>
       <div id="msrc-body">
         <p class="pane-note" id="msrc-label"></p>
         <input id="msrc-url" class="cad-input" type="text"
                placeholder="https://..." />
-        <div class="mf-actions">
-          <button id="msrc-save" class="cad-btn icon-btn" type="button"
-                  data-icon="save" data-tip="Save"></button>
-          <button id="msrc-clear" class="cad-btn icon-btn danger" type="button"
-                  data-icon="trash" data-tip="Clear the manual source"></button>
+        <div class="dlg-actions">
           <span class="tool-label" id="msrc-msg"></span>
+          <span class="dlg-spacer"></span>
+          <button id="msrc-clear" class="cad-btn quiet danger" type="button"
+                  data-tip="Remove the saved link from this record">Clear source</button>
+          <button id="msrc-save" class="cad-btn primary" type="button">Save</button>
         </div>
       </div>
     </div>
@@ -1291,7 +1292,7 @@
     <div id="cat-window" class="win">
       <div class="win-titlebar">
         <span>Categories</span>
-        <button id="cat-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
+        <button id="cat-close" class="win-close" type="button" aria-label="Close" data-icon="close"></button>
       </div>
       <div id="cat-body">
         <div class="pane-bar">
@@ -1317,7 +1318,7 @@
     <div id="changelog-window" class="win">
       <div class="win-titlebar">
         <span>Changelog</span>
-        <button id="changelog-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
+        <button id="changelog-close" class="win-close" type="button" aria-label="Close" data-icon="close"></button>
       </div>
       <div id="changelog-body" class="changelog-body"></div>
     </div>
@@ -1325,10 +1326,10 @@
 
   <!-- REVIEW QUEUE WINDOW: shared items flagged "needs review" from the Q popover -->
   <div id="review-overlay" class="overlay" hidden>
-    <div id="review-window" class="win">
+    <div id="review-window" class="win win-md">
       <div id="review-titlebar" class="win-titlebar">
         <span>Review queue</span>
-        <button id="review-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
+        <button id="review-close" class="win-close" type="button" aria-label="Close" data-icon="close"></button>
       </div>
       <div id="review-body">
         <div id="review-toolbar">
@@ -1346,7 +1347,7 @@
     <div id="settings-window" class="win">
       <div id="settings-titlebar" class="win-titlebar">
         <span>Settings</span>
-        <button id="settings-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
+        <button id="settings-close" class="win-close" type="button" aria-label="Close" data-icon="close"></button>
       </div>
       <div id="settings-body">
         <div id="settings-nav">
@@ -1734,7 +1735,7 @@
     <div id="about-window" class="win">
       <div class="win-titlebar">
         <span>About Library Tool</span>
-        <button id="about-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
+        <button id="about-close" class="win-close" type="button" aria-label="Close" data-icon="close"></button>
       </div>
       <div id="about-body">
         <img id="about-icon" src="{{ url_for('static', filename='icon.png') }}"
@@ -1773,7 +1774,7 @@
         <span id="ia-title" class="ia-title">Internet Archive</span>
         <button id="ia-external" class="cad-btn tiny" type="button"
                 data-tip="Open on archive.org">&#8599;</button>
-        <button id="ia-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
+        <button id="ia-close" class="win-close" type="button" aria-label="Close" data-icon="close"></button>
       </div>
       <div class="ia-body">
         <div id="ia-pages" class="ia-pages" hidden
@@ -1788,16 +1789,25 @@
     </div>
   </div>
 
-  <!-- IMAGE LIGHTBOX (entry photos from the Info panel) -->
-  <div id="img-lightbox" class="overlay" hidden>
-    <img id="img-lightbox-img" alt="entry photo" />
+  <!-- IMAGE VIEWER (entry photos from the Info panel; backdrop or the close
+       button dismisses -- the image itself is inert) -->
+  <div id="img-lightbox" class="overlay" hidden role="dialog" aria-modal="true"
+       aria-label="Image viewer">
+    <figure class="lightbox-fig">
+      <div class="lightbox-bar">
+        <span id="img-lightbox-cap" class="lightbox-cap"></span>
+        <button id="img-lightbox-close" class="win-close" type="button"
+                aria-label="Close viewer" data-icon="close"></button>
+      </div>
+      <img id="img-lightbox-img" alt="entry photo" />
+    </figure>
   </div>
 
   <!-- FIRST-RUN SETUP WIZARD (shown once on first launch; re-openable from the menu) -->
   <div id="wizard-overlay" class="overlay" hidden>
     <div id="wizard-win" class="win wizard-win">
       <div class="win-titlebar">
-        <span id="wizard-title">WELCOME</span>
+        <span id="wizard-title">Welcome</span>
         <span id="wizard-step" class="wizard-step"></span>
       </div>
       <progress id="wizard-progress" class="wizard-progress" max="5" value="1"
@@ -1891,9 +1901,9 @@
       <div class="wizard-nav">
         <button id="wizard-back" class="cad-btn" type="button">Back</button>
         <span class="wizard-spacer"></span>
-        <button id="wizard-skip" class="cad-btn" type="button"
+        <button id="wizard-skip" class="cad-btn quiet" type="button"
                 data-tip="Close the guide; it won't reopen automatically">Set up later</button>
-        <button id="wizard-next" class="cad-btn" type="button">Next</button>
+        <button id="wizard-next" class="cad-btn primary" type="button">Next</button>
       </div>
     </div>
   </div>
@@ -1902,8 +1912,8 @@
   <div id="auth-overlay" class="overlay" hidden>
     <form id="auth-win" class="win auth-win">
       <div class="win-titlebar">
-        <span id="auth-title">SIGN IN</span>
-        <button id="auth-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
+        <span id="auth-title">Sign in</span>
+        <button id="auth-close" class="win-close" type="button" aria-label="Close" data-icon="close"></button>
       </div>
       <div class="auth-body">
         <p class="settings-note" id="auth-blurb">Contributions are recorded under your
@@ -1920,15 +1930,39 @@
                  placeholder="shown in the activity feed" hidden />
         </div>
         <div id="auth-msg" hidden></div>
-        <div class="mf-actions">
-          <button id="auth-submit" class="cad-btn" type="submit">Sign in</button>
-          <button id="auth-mode" class="cad-btn" type="button">Create account&hellip;</button>
-          <span class="auth-spacer"></span>
-          <button id="auth-skip" class="cad-btn" type="button"
+        <div class="dlg-actions">
+          <button id="auth-mode" class="cad-btn quiet" type="button">Create account&hellip;</button>
+          <span class="dlg-spacer"></span>
+          <button id="auth-skip" class="cad-btn quiet" type="button"
                   data-tip="Use the app without an account; won't ask again at startup">Work locally</button>
+          <button id="auth-submit" class="cad-btn primary" type="submit">Sign in</button>
         </div>
       </div>
     </form>
+  </div>
+
+  <!-- CONFIRMATION DIALOG (promise-based confirmDialog(); replaces every
+       native window.confirm so confirmations match the product) -->
+  <div id="confirm-overlay" class="overlay" hidden>
+    <div id="confirm-window" class="win win-sm" role="alertdialog" aria-modal="true"
+         aria-labelledby="confirm-title"
+         aria-describedby="confirm-msg confirm-detail confirm-cost">
+      <div class="win-titlebar">
+        <span id="confirm-title">Confirm</span>
+        <button id="confirm-close" class="win-close" type="button"
+                aria-label="Cancel" data-icon="close"></button>
+      </div>
+      <div id="confirm-body">
+        <p id="confirm-msg"></p>
+        <p id="confirm-detail" hidden></p>
+        <p id="confirm-cost" hidden></p>
+        <div class="dlg-actions">
+          <span class="dlg-spacer"></span>
+          <button id="confirm-cancel" class="cad-btn" type="button">Cancel</button>
+          <button id="confirm-ok" class="cad-btn primary" type="button">OK</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- EMBEDDED WEB VIEW (links open here instead of a new tab) -->
@@ -1940,7 +1974,7 @@
         <button id="webview-reload" class="cad-btn tiny" type="button"
                 data-tip="Reload">&#8635;</button>
         <span id="webview-url" class="webview-url"></span>
-        <button id="webview-close" class="win-close" type="button" aria-label="Close">&#10005;</button>
+        <button id="webview-close" class="win-close" type="button" aria-label="Close" data-icon="close"></button>
       </div>
       <iframe id="webview-frame" class="webview-frame" referrerpolicy="no-referrer"
               sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox"></iframe>

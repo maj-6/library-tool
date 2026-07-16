@@ -424,7 +424,9 @@ a { color: var(--accent-ink); }
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
-.rec-actions { margin-top: 11px; display: flex; gap: 9px; }
+.rec-actions { margin-top: 11px; display: flex; gap: 9px; align-items: center; }
+/* records without a readable asset state it as quiet metadata, not a control */
+.rec-noscan { font-size: 12px; font-style: italic; color: var(--ink-faint); }
 
 /* ---- buttons (shared) ---- */
 .btn {
