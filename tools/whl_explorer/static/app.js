@@ -2099,7 +2099,8 @@ function initHome() {
 // --- tabs + header -----------------------------------------------------------
 
 const TAB_TITLES = { home: "Home", checked: "Catalogs",
-                     workbench: "Workbench", publish: "Published Library",
+                     workbench: "Workbench", replica: "Replica",
+                     publish: "Published Library",
                      infotab: "Info" };
 
 function setHeader(tabId) {
@@ -2140,6 +2141,9 @@ function initTabs() {
         renderUpload();
         loadOcrBooks().then(() => { renderOcrTab(); renderAnalyze(); renderWorkbench(); });
         pollJobs();       // paint the jobs drawer now, not next tick
+      }
+      if (tab.dataset.tab === "replica") {
+        loadOcrBooks().then(renderReplicaBooks);
       }
       if (tab.dataset.tab === "publish") renderPublish();
     });
@@ -14802,6 +14806,544 @@ function selectOcrDocument(id) {
   renderOcrTab();
 }
 
+// --- Replica workbench (docs/facsimile-workbench-plan.md, Phase 3) ----------
+// Correct the machine-proposed page regions — draw, move, resize, split,
+// merge, digit-key roles, reading order — then recompile the compiled
+// document's body text from them. The machine proposes, the person disposes.
+
+// digit keys 1..9,0 assign these roles, mirroring the OCR engine keymap habit
+const RW_ROLES = ["body", "marginalia", "header", "footer", "title",
+                  "caption", "figure", "page-number", "catch-word",
+                  "signature-mark"];
+
+const rwState = {
+  book: "", src: "primary", page: 0,
+  pdf: "",          // the source PDF (rasters + word clip)
+  doc: "",          // compiled file this page's regions belong to
+  dims: null, items: [],
+  sel: [],          // selected region ids; the LAST one is active
+  dirty: false, pageCount: 0, regionPages: [],
+  drag: null,       // {kind: move|resize|draw, id, corner, start, box0, moved}
+  lastPos: null,    // pointer in page fractions — the S/V split guide
+  seq: 0, idSeq: 0,
+};
+
+function rwActiveId() { return rwState.sel[rwState.sel.length - 1] || ""; }
+function rwActive() { return rwState.items.find((x) => x.id === rwActiveId()) || null; }
+function rwItem(id) { return rwState.items.find((x) => x.id === id) || null; }
+function rwNewId() { return "n" + (++rwState.idSeq); }
+
+function rwPdfForSrc(bid, src) {
+  if (!src || src === "primary") return ocrBookPdf(bid);
+  const b = state.builds[bid] || {};
+  const s = (b.pdf_sources || []).find((x) => x.id === src);
+  return s ? s.path : "";
+}
+
+function renderReplicaBooks() {
+  const list = el("rw-books");
+  list.innerHTML = "";
+  // every build with an entry folder — NOT ocrBookList(), whose verified-only
+  // filter belongs to Analyze; drafts are exactly what the workbench corrects
+  const books = allBuildsSorted().filter((b) => (ocrState.books || {})[b.id]);
+  el("rw-book-count").textContent = books.length || "";
+  for (const b of books) {
+    const li = document.createElement("li");
+    li.className = "ocr-book" + (b.id === rwState.book ? " active" : "");
+    li.dataset.bid = b.id;
+    li.innerHTML = `<span class="bi-title">${esc(b.title) || "<em>(untitled)</em>"}</span>
+      <span class="bi-meta">${esc(b.authors || "")}${b.authors && b.year ? " &middot; " : ""}${esc(b.year || "")}</span>`;
+    list.appendChild(li);
+  }
+}
+
+async function selectReplicaBook(bid) {
+  if (rwState.dirty && !confirm("Discard unsaved region edits?")) return;
+  rwState.book = bid; rwState.page = 0; rwState.items = [];
+  rwState.sel = []; rwState.dirty = false;
+  el("rw-canvas").hidden = true;
+  el("rw-empty").hidden = false;
+  renderReplicaBooks();
+  // fresh meta on every visit: jobs and edits move the sidecar under us
+  delete ocrState.layoutMeta[bid];
+  const b = state.builds[bid] || {};
+  const srcs = ["primary", ...(b.pdf_sources || []).map((s) => s.id)];
+  const sel = el("rw-src");
+  sel.innerHTML = srcs.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join("");
+  sel.hidden = srcs.length < 2;
+  rwState.src = srcs.includes(rwState.src) ? rwState.src : "primary";
+  sel.value = rwState.src;
+  await renderReplicaPages();
+  rwSyncBar();
+}
+
+async function renderReplicaPages() {
+  const bid = rwState.book;
+  const meta = await ocrLayoutMeta(bid);
+  rwState.pdf = rwPdfForSrc(bid, rwState.src);
+  rwState.regionPages = ((meta.regionPages || {})[rwState.src] || []).slice();
+  let count = 0;
+  if (rwState.pdf) {
+    let info = ocrState.pdfInfo[rwState.pdf];
+    if (!info) {
+      try {
+        const data = await (await fetch(
+          "/api/pdf/info?path=" + encodeURIComponent(rwState.pdf))).json();
+        if (data.ok) { info = data; ocrState.pdfInfo[rwState.pdf] = data; }
+      } catch (e) { /* the strip still lists the region pages */ }
+    }
+    if (info) count = info.pages || (info.dims || []).length || 0;
+  }
+  rwState.pageCount = Math.max(count, ...rwState.regionPages, 0);
+  const box = el("rw-pages");
+  box.innerHTML = "";
+  const frag = document.createDocumentFragment();
+  for (let n = 1; n <= rwState.pageCount; n++) {
+    const d = document.createElement("button");
+    d.type = "button";
+    d.className = "rw-pagebtn" + (n === rwState.page ? " active" : "");
+    d.dataset.page = n;
+    d.innerHTML = `${n}` + (rwState.regionPages.includes(n)
+      ? '<span class="rw-dot">●</span>' : "");
+    frag.appendChild(d);
+  }
+  box.appendChild(frag);
+  el("rw-page-count").textContent = rwState.pageCount || "";
+}
+
+async function selectReplicaPage(n) {
+  if (rwState.dirty && !confirm("Discard unsaved region edits?")) return;
+  rwState.page = n; rwState.sel = []; rwState.dirty = false;
+  const seq = ++rwState.seq;
+  for (const b of el("rw-pages").querySelectorAll(".rw-pagebtn")) {
+    b.classList.toggle("active", +b.dataset.page === n);
+  }
+  el("rw-page-img").src = `/api/pdf/pageimg?path=${encodeURIComponent(rwState.pdf)}&page=${n}&w=1100`;
+  el("rw-canvas").hidden = false;
+  el("rw-empty").hidden = true;
+  // always fetched fresh — this is the editor, never a cached copy
+  let rec = { found: false };
+  try {
+    rec = await (await fetch(
+      `/api/builds/${encodeURIComponent(rwState.book)}/ocr-regions` +
+      `?src=${encodeURIComponent(rwState.src)}&page=${n}`)).json();
+  } catch (e) { /* a bare page: draw from scratch */ }
+  if (seq !== rwState.seq) return;
+  rwState.items = (rec.found ? rec.items || [] : []).map((it, i) => ({
+    id: "r" + i, role: it.role || "body",
+    order: it.order != null ? +it.order : i,
+    box: { x: +((it.box || {}).x) || 0, y: +((it.box || {}).y) || 0,
+           w: +((it.box || {}).w) || 0, h: +((it.box || {}).h) || 0 },
+    text: String(it.text || ""),
+  }));
+  rwState.doc = (rec.found && rec.doc) || "compiled.txt";
+  rwState.dims = rec.found ? rec.dims : null;
+  let ratio = "";
+  if (rwState.dims && rwState.dims.w > 0) {
+    ratio = `${rwState.dims.w} / ${rwState.dims.h}`;
+  } else {
+    const info = ocrState.pdfInfo[rwState.pdf];
+    const d = info && info.dims && info.dims[n - 1];
+    if (d && d[0] > 0) ratio = `${d[0]} / ${d[1]}`;
+  }
+  el("rw-canvas").style.aspectRatio = ratio || "3 / 4";
+  rwRenderOverlay();
+  rwSyncBar();
+}
+
+function rwRenderOverlay() {
+  const ov = el("rw-overlay");
+  ov.innerHTML = "";
+  const frag = document.createDocumentFragment();
+  for (const it of rwState.items) {
+    const e = document.createElement("div");
+    e.className = "rw-region role-" + it.role;
+    if (rwState.sel.includes(it.id)) e.classList.add("sel");
+    if (it.id === rwActiveId()) e.classList.add("active");
+    e.dataset.id = it.id;
+    e.style.left = it.box.x * 100 + "%";
+    e.style.top = it.box.y * 100 + "%";
+    e.style.width = it.box.w * 100 + "%";
+    e.style.height = it.box.h * 100 + "%";
+    const lab = document.createElement("span");
+    lab.className = "rw-lab";
+    lab.textContent = `${it.order} ${it.role}`;
+    e.appendChild(lab);
+    if (it.id === rwActiveId()) {
+      for (const c of ["nw", "ne", "sw", "se"]) {
+        const h = document.createElement("span");
+        h.className = "rw-handle rw-" + c;
+        h.dataset.corner = c;
+        e.appendChild(h);
+      }
+    }
+    frag.appendChild(e);
+  }
+  ov.appendChild(frag);
+}
+
+function rwPaintRegion(it) {
+  const e = el("rw-overlay").querySelector(`[data-id="${it.id}"]`);
+  if (!e) return;
+  e.style.left = it.box.x * 100 + "%";
+  e.style.top = it.box.y * 100 + "%";
+  e.style.width = it.box.w * 100 + "%";
+  e.style.height = it.box.h * 100 + "%";
+}
+
+function rwSyncBar() {
+  const nItems = rwState.items.length;
+  el("rw-status").textContent = rwState.page
+    ? `p ${rwState.page} · ${nItems} region${nItems === 1 ? "" : "s"}` +
+      (rwState.dirty ? " · unsaved" : "")
+    : "";
+  el("rw-save").disabled = !rwState.dirty || !rwState.page;
+  el("rw-recompile").disabled = !rwState.book || !rwState.regionPages.length;
+  const a = rwActive();
+  el("rw-region-info").textContent = a ? `${a.role} · order ${a.order}` : "";
+  const ta = el("rw-text");
+  ta.disabled = !a;
+  if (document.activeElement !== ta) ta.value = a ? a.text : "";
+  el("rw-clip").disabled = !a;
+}
+
+function rwDirty() { rwState.dirty = true; rwSyncBar(); }
+
+function rwPos(ev) {
+  const r = el("rw-overlay").getBoundingClientRect();
+  if (!r.width || !r.height) return { x: 0, y: 0 };
+  return { x: Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width)),
+           y: Math.min(1, Math.max(0, (ev.clientY - r.top) / r.height)) };
+}
+
+function rwMouseDown(ev) {
+  if (!rwState.page || ev.button !== 0) return;
+  ev.preventDefault();
+  const pos = rwPos(ev);
+  const handle = ev.target.closest(".rw-handle");
+  const regEl = ev.target.closest(".rw-region");
+  if (handle && regEl) {
+    rwState.drag = { kind: "resize", id: regEl.dataset.id,
+                     corner: handle.dataset.corner, start: pos,
+                     box0: { ...rwItem(regEl.dataset.id).box } };
+    return;
+  }
+  if (regEl) {
+    const id = regEl.dataset.id;
+    if (ev.shiftKey) {
+      rwState.sel = rwState.sel.includes(id)
+        ? rwState.sel.filter((x) => x !== id) : [...rwState.sel, id];
+    } else if (rwState.sel.includes(id)) {
+      rwState.sel = [...rwState.sel.filter((x) => x !== id), id];
+    } else {
+      rwState.sel = [id];
+    }
+    rwState.drag = { kind: "move", id, start: pos,
+                     box0: { ...rwItem(id).box }, moved: false };
+    rwRenderOverlay(); rwSyncBar();
+    return;
+  }
+  rwState.sel = [];
+  rwState.drag = { kind: "draw", start: pos, id: "" };
+  rwRenderOverlay(); rwSyncBar();
+}
+
+function rwMouseMove(ev) {
+  const panel = el("replica");
+  if (!panel || !panel.classList.contains("active")) return;
+  const ovr = el("rw-overlay").getBoundingClientRect();
+  if (ovr.width > 0 && ev.clientX >= ovr.left && ev.clientX <= ovr.right &&
+      ev.clientY >= ovr.top && ev.clientY <= ovr.bottom) {
+    rwState.lastPos = rwPos(ev);
+  }
+  const d = rwState.drag;
+  if (!d) return;
+  const pos = rwPos(ev);
+  const dx = pos.x - d.start.x, dy = pos.y - d.start.y;
+  if (d.kind === "move") {
+    const it = rwItem(d.id); if (!it) return;
+    if (Math.abs(dx) + Math.abs(dy) > 0.002) d.moved = true;
+    it.box.x = Math.min(1 - it.box.w, Math.max(0, d.box0.x + dx));
+    it.box.y = Math.min(1 - it.box.h, Math.max(0, d.box0.y + dy));
+    rwPaintRegion(it);
+  } else if (d.kind === "resize") {
+    const it = rwItem(d.id); if (!it) return;
+    const b = { ...d.box0 };
+    if (d.corner.includes("w")) {
+      b.x = Math.min(d.box0.x + d.box0.w - 0.005, Math.max(0, d.box0.x + dx));
+      b.w = d.box0.x + d.box0.w - b.x;
+    }
+    if (d.corner.includes("e")) b.w = Math.max(0.005, d.box0.w + dx);
+    if (d.corner.includes("n")) {
+      b.y = Math.min(d.box0.y + d.box0.h - 0.005, Math.max(0, d.box0.y + dy));
+      b.h = d.box0.y + d.box0.h - b.y;
+    }
+    if (d.corner.includes("s")) b.h = Math.max(0.005, d.box0.h + dy);
+    b.w = Math.min(b.w, 1 - b.x);
+    b.h = Math.min(b.h, 1 - b.y);
+    it.box = b;
+    rwPaintRegion(it);
+  } else if (d.kind === "draw") {
+    if (!d.id && (Math.abs(dx) > 0.004 || Math.abs(dy) > 0.004)) {
+      const it = { id: rwNewId(), role: "body",
+                   order: rwState.items.length
+                     ? Math.max(...rwState.items.map((x) => x.order)) + 1 : 0,
+                   box: { x: d.start.x, y: d.start.y, w: 0.004, h: 0.004 },
+                   text: "" };
+      rwState.items.push(it);
+      d.id = it.id;
+      rwState.sel = [it.id];
+      rwRenderOverlay();
+    }
+    if (d.id) {
+      const it = rwItem(d.id);
+      it.box.x = Math.min(d.start.x, pos.x);
+      it.box.y = Math.min(d.start.y, pos.y);
+      it.box.w = Math.abs(pos.x - d.start.x);
+      it.box.h = Math.abs(pos.y - d.start.y);
+      rwPaintRegion(it);
+    }
+  }
+}
+
+function rwMouseUp() {
+  const d = rwState.drag;
+  if (!d) return;
+  rwState.drag = null;
+  if ((d.kind === "move" && d.moved) || d.kind === "resize" ||
+      (d.kind === "draw" && d.id)) rwDirty();
+  rwRenderOverlay(); rwSyncBar();
+}
+
+function rwSplit(it, axis) {
+  // cut under the pointer when it's inside the region, else the midpoint
+  const p = rwState.lastPos;
+  let f = 0.5;
+  if (p) {
+    if (axis === "h" && p.y > it.box.y && p.y < it.box.y + it.box.h) {
+      f = (p.y - it.box.y) / it.box.h;
+    } else if (axis === "v" && p.x > it.box.x && p.x < it.box.x + it.box.w) {
+      f = (p.x - it.box.x) / it.box.w;
+    }
+  }
+  f = Math.min(0.95, Math.max(0.05, f));
+  for (const x of rwState.items) if (x.order > it.order) x.order += 1;
+  const twin = { id: rwNewId(), role: it.role, order: it.order + 1,
+                 box: { ...it.box }, text: "" };
+  if (axis === "h") {
+    const cut = it.box.h * f;
+    twin.box.y = it.box.y + cut;
+    twin.box.h = it.box.h - cut;
+    it.box.h = cut;
+    // a horizontal cut can split the text by line, proportionally
+    const lines = it.text.split("\n");
+    if (lines.length > 1) {
+      const at = Math.max(1, Math.min(lines.length - 1,
+                                      Math.round(lines.length * f)));
+      twin.text = lines.slice(at).join("\n");
+      it.text = lines.slice(0, at).join("\n");
+    }
+  } else {
+    const cut = it.box.w * f;
+    twin.box.x = it.box.x + cut;
+    twin.box.w = it.box.w - cut;
+    it.box.w = cut;   // a vertical cut can't split text — the left keeps it
+  }
+  rwState.items.push(twin);
+  rwState.sel = [twin.id];
+  rwDirty(); rwRenderOverlay(); rwSyncBar();
+}
+
+function rwMerge() {
+  const sel = rwState.sel.map(rwItem).filter(Boolean)
+    .sort((a, b) => a.order - b.order);
+  if (sel.length < 2) return;
+  const first = sel[0];
+  const x0 = Math.min(...sel.map((r) => r.box.x));
+  const y0 = Math.min(...sel.map((r) => r.box.y));
+  first.box = {
+    x: x0, y: y0,
+    w: Math.max(...sel.map((r) => r.box.x + r.box.w)) - x0,
+    h: Math.max(...sel.map((r) => r.box.y + r.box.h)) - y0,
+  };
+  first.text = sel.map((r) => r.text.trim()).filter(Boolean).join("\n");
+  const drop = new Set(sel.slice(1).map((r) => r.id));
+  rwState.items = rwState.items.filter((x) => !drop.has(x.id));
+  rwState.sel = [first.id];
+  rwDirty(); rwRenderOverlay(); rwSyncBar();
+}
+
+function rwReorder(it, dir) {
+  const sorted = [...rwState.items].sort((a, b) => a.order - b.order);
+  const i = sorted.indexOf(it);
+  const j = i + dir;
+  if (j < 0 || j >= sorted.length) return;
+  const other = sorted[j];
+  const tmp = it.order; it.order = other.order; other.order = tmp;
+  rwDirty(); rwRenderOverlay(); rwSyncBar();
+}
+
+function rwKeyDown(ev) {
+  const panel = el("replica");
+  if (!panel || !panel.classList.contains("active")) return;
+  if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "s") {
+    ev.preventDefault(); rwSave(); return;
+  }
+  const t = ev.target;
+  if (t && (t.tagName === "TEXTAREA" || t.tagName === "INPUT" ||
+            t.tagName === "SELECT")) return;
+  const a = rwActive();
+  if (/^[0-9]$/.test(ev.key) && rwState.sel.length) {
+    const role = RW_ROLES[(parseInt(ev.key, 10) + 9) % 10];
+    for (const id of rwState.sel) { const it = rwItem(id); if (it) it.role = role; }
+    rwDirty(); rwRenderOverlay(); rwSyncBar();
+  } else if (ev.key === "Delete" || ev.key === "Backspace") {
+    if (!rwState.sel.length) return;
+    rwState.items = rwState.items.filter((x) => !rwState.sel.includes(x.id));
+    rwState.sel = [];
+    rwDirty(); rwRenderOverlay(); rwSyncBar();
+  } else if (ev.key === "Escape") {
+    rwState.sel = [];
+    rwRenderOverlay(); rwSyncBar();
+  } else if ((ev.key === "s" || ev.key === "S") && a) {
+    rwSplit(a, "h");
+  } else if ((ev.key === "v" || ev.key === "V") && a) {
+    rwSplit(a, "v");
+  } else if ((ev.key === "m" || ev.key === "M") && rwState.sel.length >= 2) {
+    rwMerge();
+  } else if (ev.key === "Tab" && rwState.items.length) {
+    ev.preventDefault();
+    const sorted = [...rwState.items].sort((x, y) => x.order - y.order);
+    const idx = sorted.findIndex((x) => x.id === rwActiveId());
+    const next = sorted[(idx + (ev.shiftKey ? -1 : 1) + sorted.length) % sorted.length];
+    rwState.sel = [next.id];
+    rwRenderOverlay(); rwSyncBar();
+  } else if ((ev.key === "[" || ev.key === "]") && a) {
+    rwReorder(a, ev.key === "]" ? 1 : -1);
+  }
+}
+
+async function rwClipWords() {
+  const a = rwActive();
+  if (!a || !rwState.pdf) return;
+  let res = null;
+  try {
+    res = await (await fetch(
+      `/api/pdf/words?path=${encodeURIComponent(rwState.pdf)}` +
+      `&page=${rwState.page}&build_id=${encodeURIComponent(rwState.book)}`)).json();
+  } catch (e) { /* handled below */ }
+  if (!res || !res.ok || !res.found) {
+    status("CLIP :: no word boxes on this page — run Tesseract, or no text layer");
+    return;
+  }
+  const out = [];
+  for (const line of res.lines || []) {
+    const cy = line.y - (line.s || 0) / 2;   // line.y is the baseline
+    if (cy < a.box.y || cy > a.box.y + a.box.h) continue;
+    const picked = (line.spans || []).filter((sp) => {
+      const cx = sp.x + (sp.w || 0) / 2;
+      return cx >= a.box.x && cx <= a.box.x + a.box.w;
+    }).map((sp) => sp.t);
+    if (picked.length) out.push(picked.join(" "));
+  }
+  if (!out.length) { status("CLIP :: no words inside this region"); return; }
+  a.text = out.join("\n");
+  rwDirty(); rwSyncBar();
+  status(`CLIP :: ${out.length} line(s) from word boxes`);
+}
+
+async function rwSave() {
+  if (!rwState.dirty || !rwState.page) return;
+  const items = [...rwState.items].sort((a, b) => a.order - b.order)
+    .map((it, i) => ({ role: it.role, order: i, box: it.box, text: it.text }));
+  try {
+    const r = await (await fetch(
+      `/api/builds/${encodeURIComponent(rwState.book)}/ocr-regions`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ src: rwState.src, page: rwState.page,
+                               doc: rwState.doc, dims: rwState.dims, items }),
+      })).json();
+    if (!r.ok) throw new Error(r.error || "save failed");
+  } catch (e) {
+    status("REGIONS :: " + e.message);
+    return;
+  }
+  rwState.dirty = false;
+  // the facsimile caches now describe the old record
+  ocrState.regionsCache.clear();
+  delete ocrState.layoutMeta[rwState.book];
+  const has = rwState.regionPages.includes(rwState.page);
+  if (items.length && !has) rwState.regionPages.push(rwState.page);
+  if (!items.length && has) {
+    rwState.regionPages = rwState.regionPages.filter((p) => p !== rwState.page);
+  }
+  const btn = el("rw-pages").querySelector(`[data-page="${rwState.page}"]`);
+  if (btn) {
+    btn.innerHTML = `${rwState.page}` +
+      (items.length ? '<span class="rw-dot">●</span>' : "");
+    btn.classList.add("active");
+  }
+  status(`REGIONS SAVED :: p ${rwState.page} · ${items.length}`);
+  rwSyncBar();
+}
+
+async function rwRecompile() {
+  if (!rwState.book) return;
+  if (rwState.dirty) { status("RECOMPILE :: save the page first"); return; }
+  try {
+    const r = await (await fetch(
+      `/api/builds/${encodeURIComponent(rwState.book)}/ocr-regions/recompile`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ src: rwState.src }),
+      })).json();
+    if (!r.ok) throw new Error(r.error || "recompile failed");
+    status(`RECOMPILED :: ${r.pages} page(s) -> ${(r.docs || []).join(", ")}`);
+  } catch (e) {
+    status("RECOMPILE :: " + e.message);
+  }
+}
+
+function initReplica() {
+  el("rw-books").addEventListener("click", (ev) => {
+    const li = ev.target.closest("[data-bid]");
+    if (li) selectReplicaBook(li.dataset.bid);
+  });
+  el("rw-pages").addEventListener("click", (ev) => {
+    const b = ev.target.closest(".rw-pagebtn");
+    if (b) selectReplicaPage(+b.dataset.page);
+  });
+  el("rw-src").addEventListener("change", async () => {
+    if (rwState.dirty && !confirm("Discard unsaved region edits?")) {
+      el("rw-src").value = rwState.src;
+      return;
+    }
+    rwState.src = el("rw-src").value;
+    rwState.page = 0; rwState.items = []; rwState.sel = [];
+    rwState.dirty = false;
+    el("rw-canvas").hidden = true;
+    el("rw-empty").hidden = false;
+    await renderReplicaPages();
+    rwSyncBar();
+  });
+  el("rw-overlay").addEventListener("mousedown", rwMouseDown);
+  document.addEventListener("mousemove", rwMouseMove);
+  document.addEventListener("mouseup", rwMouseUp);
+  document.addEventListener("keydown", rwKeyDown);
+  el("rw-text").addEventListener("input", () => {
+    const a = rwActive();
+    if (!a) return;
+    a.text = el("rw-text").value;
+    rwDirty();
+  });
+  el("rw-clip").addEventListener("click", rwClipWords);
+  el("rw-save").addEventListener("click", rwSave);
+  el("rw-recompile").addEventListener("click", rwRecompile);
+  el("rw-legend").innerHTML = RW_ROLES.map((r, i) =>
+    `<span class="rw-key role-${esc(r)}" data-tip="${esc(r)}">${(i + 1) % 10}</span>`).join("");
+}
+
 function initOcrTab() {
   el("ocr-load-file").addEventListener("click", () => el("ocr-file-input").click());
   el("ocr-file-input").addEventListener("change", () => {
@@ -16646,6 +17188,7 @@ function init() {
   boot("categories", initCategories);
   boot("analyze", initAnalyze);
   boot("workbench", initWorkbench);
+  boot("replica", initReplica);
   loadTaxonomy();   // async; pickers and cells refresh when the vocab lands
   el("b-pdf-attach").addEventListener("click", () => attachPdfFile());
   el("b-pdf_file").addEventListener("keydown", (ev) => {

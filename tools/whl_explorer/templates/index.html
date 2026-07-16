@@ -87,6 +87,7 @@
     <button class="tab active" data-tab="home">Home</button>
     <button class="tab" data-tab="checked">Catalogs</button>
     <button class="tab" data-tab="workbench">Workbench</button>
+    <button class="tab" data-tab="replica">Replica</button>
     <button class="tab" data-tab="publish">Published Library</button>
     <button class="tab" data-tab="infotab">Info</button>
     <span class="bar-spacer"></span>
@@ -1144,6 +1145,62 @@
             </div>
           </div>
         </div>
+      </div>
+    </section>
+
+    <!-- REPLICA: the facsimile workbench — correct machine-proposed page
+         regions (draw / split / merge / role keys), then recompile clean
+         body text. docs/facsimile-workbench-plan.md, Phase 3. -->
+    <section id="replica" class="panel-view">
+      <div id="rw-split">
+        <aside id="rw-side">
+          <div class="pane-bar">
+            <span class="tool-label">Books</span>
+            <span class="tool-count" id="rw-book-count"></span>
+          </div>
+          <ul id="rw-books" class="drafting"></ul>
+          <div class="pane-bar">
+            <span class="tool-label">Pages</span>
+            <span class="tool-count" id="rw-page-count"></span>
+            <span class="bar-spacer"></span>
+            <select id="rw-src" class="cad-input" hidden></select>
+          </div>
+          <div id="rw-pages" class="drafting"></div>
+        </aside>
+        <div id="rw-main">
+          <div class="pane-bar">
+            <span class="tool-label">Regions</span>
+            <span class="tool-count" id="rw-status"></span>
+            <span class="bar-spacer"></span>
+            <span id="rw-legend" class="tool-label"></span>
+            <span class="bar-spacer"></span>
+            <button id="rw-save" class="cad-btn tiny" type="button" disabled
+                    data-tip="Save this page's regions (Ctrl+S)">Save</button>
+            <button id="rw-recompile" class="cad-btn tiny" type="button" disabled
+                    data-tip="Rewrite the compiled document's body text from every saved region page of this source — furniture (marginalia, heads, catchwords) stays out of the flow">Recompile body</button>
+          </div>
+          <div id="rw-canvas-wrap" class="drafting">
+            <div id="rw-canvas" hidden>
+              <img id="rw-page-img" alt="" draggable="false">
+              <div id="rw-overlay"></div>
+            </div>
+            <p id="rw-empty" class="empty">Pick a book, then a page. Pages marked ● already have machine-proposed regions (run Mistral OCR to seed them); on any other page, drag to draw regions from scratch.</p>
+          </div>
+        </div>
+        <aside id="rw-textpanel">
+          <div class="pane-bar">
+            <span class="tool-label">Region</span>
+            <span class="tool-count" id="rw-region-info"></span>
+            <span class="bar-spacer"></span>
+            <button id="rw-clip" class="cad-btn tiny" type="button" disabled
+                    data-tip="Replace this region's text with the word boxes inside it (Tesseract/Textract or the PDF text layer)">Clip words</button>
+          </div>
+          <textarea id="rw-text" class="cad-input" spellcheck="false" disabled
+                    placeholder="Select a region"></textarea>
+          <div class="pane-bar">
+            <span id="rw-keys" class="tool-label">draw: drag &nbsp; move/resize: drag box/corner &nbsp; roles: 1–9,0 &nbsp; split: S/V &nbsp; merge: M &nbsp; del: Del &nbsp; order: [ ] &nbsp; walk: Tab</span>
+          </div>
+        </aside>
       </div>
     </section>
 

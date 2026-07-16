@@ -2284,6 +2284,100 @@ def api_build_ocr_regions(build_id: str):
                     "items": rec.get("items") or []})
 
 
+_RW_MAX_ITEMS = 800
+_RW_ROLE_RE = re.compile(r"^[a-z][a-z-]{0,23}$")
+
+
+@app.route("/api/builds/<build_id>/ocr-regions", methods=["PUT"])
+def api_build_ocr_regions_put(build_id: str):
+    """Replace one page's typed regions with the Replica workbench's edited
+    set. Body: {src?, page, doc?, dims?, items: [{role, box{x,y,w,h}, order,
+    text}]}. Items are sanitized (roles kebab-case, boxes clamped to the
+    page, text capped), re-ordered, and re-idd; an empty list drops the
+    page's record. src_type becomes "human" — the set is human-curated from
+    here on."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    p = request.get_json(silent=True) or {}
+    src = _valid_src_key(b, p.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    try:
+        page = int(p.get("page") or 0)
+    except (TypeError, ValueError):
+        page = 0
+    if page < 1:
+        return jsonify({"ok": False, "error": "bad page"}), 400
+    raw = p.get("items")
+    if not isinstance(raw, list) or len(raw) > _RW_MAX_ITEMS:
+        return jsonify({"ok": False, "error": "bad items"}), 400
+    items = []
+    for it in sorted((x for x in raw if isinstance(x, dict)),
+                     key=lambda x: x.get("order") or 0):
+        box = it.get("box") or {}
+        try:
+            x = min(1.0, max(0.0, float(box.get("x") or 0)))
+            y = min(1.0, max(0.0, float(box.get("y") or 0)))
+            w = min(1.0 - x, max(0.0, float(box.get("w") or 0)))
+            h = min(1.0 - y, max(0.0, float(box.get("h") or 0)))
+        except (TypeError, ValueError):
+            continue
+        if w < 0.001 or h < 0.001:
+            continue
+        role = str(it.get("role") or "body").lower()
+        if not _RW_ROLE_RE.match(role):
+            role = "body"
+        items.append({"id": f"r{len(items)}", "role": role,
+                      "src_type": "human", "order": len(items),
+                      "box": {"x": round(x, 5), "y": round(y, 5),
+                              "w": round(w, 5), "h": round(h, 5)},
+                      "text": str(it.get("text") or "")[:20000]})
+    dims = p.get("dims") if isinstance(p.get("dims"), dict) else None
+    if dims:
+        try:
+            dims = {k: int(dims.get(k) or 0) for k in ("w", "h", "dpi")}
+        except (TypeError, ValueError):
+            dims = None
+    _ocr_save_page_regions(build_id, src, page, items, dims,
+                           doc=_ocr_name(str(p.get("doc") or "compiled.txt")))
+    return jsonify({"ok": True, "count": len(items)})
+
+
+@app.route("/api/builds/<build_id>/ocr-regions/recompile", methods=["POST"])
+def api_build_ocr_regions_recompile(build_id: str):
+    """Rewrite compiled body text from the saved regions. Every region page
+    of the source (or just ?page) recomposes — furniture (marginalia, heads,
+    catchwords) stays out of the flow, figure refs stay in — and merges into
+    the compiled file its record names. The merge is per page, so pages
+    without regions keep their existing text."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    p = request.get_json(silent=True) or {}
+    src = _valid_src_key(b, p.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    try:
+        only = int(p["page"]) if "page" in p else None
+    except (TypeError, ValueError, KeyError):
+        only = None
+    meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
+    pages = (meta.get("regions") or {}).get(src) or {}
+    done, docs = 0, set()
+    for k in sorted((k for k in pages if str(k).isdigit()), key=int):
+        rec = pages[k]
+        n = int(k)
+        if not isinstance(rec, dict) or (only and n != only):
+            continue
+        doc = _ocr_name(str(rec.get("doc") or "compiled.txt"))
+        _ocr_merge_page(build_id, doc, n,
+                        layout_roles.compose_text(rec.get("items") or []))
+        docs.add(doc)
+        done += 1
+    return jsonify({"ok": True, "pages": done, "docs": sorted(docs)})
+
+
 # --- PDF page rasterization (the OCR tab's side-by-side page view) ---------------
 
 def _pageimg_pdf(raw: str) -> Path:

@@ -3261,6 +3261,136 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 }
 .ocr-hidefurn .ocr-region[data-furniture="1"] { display: none; }
 
+/* --- Replica workbench (facsimile plan, Phase 3) --------------------------
+   CAD-dense three-column screen: books+pages rail | raster with the
+   editable region overlay | region text panel. Role identity is a thin
+   1px colored border + a tiny corner label on the selected region only. */
+#replica { flex-direction: column; }
+#rw-split { display: flex; flex: 1; min-height: 0; }
+#rw-side {
+  width: 216px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--canvas-line);
+  min-height: 0;
+}
+#rw-books {
+  flex: 0 1 38%;
+  overflow-y: auto;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-bottom: 1px solid var(--canvas-line);
+}
+#rw-pages {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  gap: 2px;
+  padding: 4px;
+}
+.rw-pagebtn {
+  position: relative;
+  width: 38px;
+  height: 22px;
+  font: inherit;
+  font-size: 10px;
+  color: var(--input-ink);
+  background: var(--input-bg);
+  border: 1px solid var(--canvas-line);
+  cursor: pointer;
+  padding: 0;
+}
+.rw-pagebtn:hover { background: var(--row-hover); }
+.rw-pagebtn.active { border-color: var(--accent, #4a7fd4); }
+.rw-pagebtn .rw-dot {
+  position: absolute;
+  right: 1px;
+  top: -2px;
+  font-size: 7px;
+  color: var(--accent, #4a7fd4);
+}
+#rw-main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+#rw-canvas-wrap { flex: 1; overflow: auto; padding: 8px; }
+#rw-canvas {
+  position: relative;
+  width: min(100%, 980px);
+  margin: 0 auto;
+  border: 1px solid var(--canvas-line);
+  background: var(--input-bg);
+}
+#rw-page-img { width: 100%; height: 100%; display: block; user-select: none; }
+#rw-overlay { position: absolute; inset: 0; cursor: crosshair; }
+#rw-canvas-wrap .empty { font-size: 11px; color: var(--face-sh2); padding: 24px; text-align: center; }
+#rw-textpanel {
+  width: 264px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--canvas-line);
+  min-height: 0;
+}
+#rw-text {
+  flex: 1;
+  resize: none;
+  margin: 4px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+#rw-keys { font-size: 9px; white-space: normal; line-height: 1.5; }
+/* role colors — one hue per role, shared by regions and the digit legend */
+.role-body { --rw-c: #4a7fd4; }
+.role-marginalia { --rw-c: #cf4a55; }
+.role-header, .role-footer { --rw-c: #b89a2e; }
+.role-title { --rw-c: #9a4ac0; }
+.role-caption { --rw-c: #3d9e6a; }
+.role-figure { --rw-c: #8a8a8a; }
+.role-page-number, .role-catch-word, .role-signature-mark { --rw-c: #ce7c33; }
+.rw-region {
+  position: absolute;
+  border: 1px solid var(--rw-c, #4a7fd4);
+  cursor: move;
+}
+.rw-region.sel { background: color-mix(in srgb, var(--rw-c) 12%, transparent); }
+.rw-region .rw-lab {
+  display: none;
+  position: absolute;
+  top: -13px;
+  left: -1px;
+  font-size: 8px;
+  line-height: 12px;
+  padding: 0 3px;
+  background: var(--rw-c);
+  color: #fff;
+  white-space: nowrap;
+}
+.rw-region.sel .rw-lab, .rw-region:hover .rw-lab { display: block; }
+.rw-handle {
+  position: absolute;
+  width: 7px;
+  height: 7px;
+  background: var(--rw-c);
+  z-index: 2;
+}
+.rw-nw { left: -4px; top: -4px; cursor: nw-resize; }
+.rw-ne { right: -4px; top: -4px; cursor: ne-resize; }
+.rw-sw { left: -4px; bottom: -4px; cursor: sw-resize; }
+.rw-se { right: -4px; bottom: -4px; cursor: se-resize; }
+.rw-key {
+  display: inline-block;
+  min-width: 12px;
+  text-align: center;
+  font-size: 9px;
+  border: 1px solid var(--rw-c);
+  border-bottom-width: 2px;
+  margin: 0 1px;
+  padding: 0 2px;
+  color: var(--input-ink);
+}
+
 .ocr-pgtext {
   resize: none;
   height: 100%;
