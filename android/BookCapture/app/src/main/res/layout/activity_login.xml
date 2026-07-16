@@ -75,31 +75,6 @@
             android:textSize="12sp"
             android:text="@string/login_register" />
 
-        <TextView style="@style/WhlLabel"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:layout_marginBottom="6dp"
-            android:gravity="center"
-            android:text="@string/login_or" />
-
-        <Button
-            android:id="@+id/googleSignIn"
-            style="@style/WhlButton"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:textSize="12sp"
-            android:text="@string/login_google" />
-
-        <Button
-            android:id="@+id/githubSignIn"
-            style="@style/WhlButton"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:textSize="12sp"
-            android:text="@string/login_github" />
-
         <TextView
             android:id="@+id/msg"
             android:layout_width="match_parent"

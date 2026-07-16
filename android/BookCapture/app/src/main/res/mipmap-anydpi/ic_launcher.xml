@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Consistent fallback for launchers that present the icon as a legacy drawable. -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@color/ic_launcher_bg" />
+    <item android:drawable="@drawable/ic_launcher_safe_fg" />
+</layer-list>

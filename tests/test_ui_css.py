@@ -21,6 +21,10 @@ def test_image_lightbox_covers_headers_and_desktop_chrome():
     assert _z_index("#img-lightbox") > _z_index(".grid thead th")
 
 
+def test_modal_backdrops_cover_sticky_table_headers():
+    assert _z_index(".overlay") > _z_index(".grid thead th")
+
+
 def test_catalog_uses_field_cues_instead_of_manual_row_tint():
     assert ".grid tbody tr.is-manual" not in STYLE
     assert ".grid tbody td.missing-core" in STYLE

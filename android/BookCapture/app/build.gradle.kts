@@ -27,8 +27,8 @@ android {
         applicationId = "org.whl.bookcapture"
         minSdk = 26
         targetSdk = 34
-        versionCode = 19
-        versionName = "0.5.0"
+        versionCode = 20
+        versionName = "0.5.1-alpha.1"
         buildConfigField("String", "SUPABASE_URL", "\"${env("WHL_SUPABASE_URL")}\"")
         buildConfigField("String", "SUPABASE_ANON_KEY", "\"${env("WHL_SUPABASE_ANON_KEY")}\"")
     }
@@ -70,7 +70,6 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
-    implementation("androidx.browser:browser:1.8.0")   // Custom Tabs for OAuth sign-in
     implementation("com.google.android.material:material:1.12.0")
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
@@ -84,6 +83,8 @@ dependencies {
     implementation("androidx.camera:camera-view:$camerax")
 
     implementation("androidx.work:work-runtime-ktx:2.9.1")
+
+    testImplementation("junit:junit:4.13.2")
 
     // offline keyword spotting ("start" / "photo" / "done" / "cancel")
     implementation("com.alphacephei:vosk-android:0.3.47")

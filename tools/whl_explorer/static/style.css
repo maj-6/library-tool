@@ -1411,6 +1411,10 @@ form.orig-view .cad-input {
 .overlay {
   position: fixed;
   inset: 0;
+  /* Sticky table headers establish their own stacking layer. Keep every
+     modal backdrop above that layer, including dialogs without a dedicated
+     overlay z-index. */
+  z-index: 54;
   background: #00000066;
   display: flex;
   align-items: flex-start;
@@ -1527,15 +1531,49 @@ form.orig-view .cad-input {
 
 /* first-run setup wizard */
 #wizard-overlay { z-index: 59; }   /* below the sign-in window it can open (62) */
-.wizard-win { width: min(560px, 94vw); }
+.wizard-win { width: min(620px, 94vw); max-height: 88vh; overflow: hidden; }
 .wizard-step { font-weight: normal; letter-spacing: 0; opacity: 0.85; font-size: 12px; }
-.wizard-body { padding: 14px 16px; min-height: 190px; }
+.wizard-progress {
+  display: block; width: 100%; height: 4px; border: 0; border-radius: 0;
+  color: var(--blue); background: var(--face-sh);
+}
+.wizard-progress::-webkit-progress-bar { background: var(--face-sh); }
+.wizard-progress::-webkit-progress-value { background: var(--blue); }
+.wizard-progress::-moz-progress-bar { background: var(--blue); }
+.wizard-body { padding: 18px 20px; min-height: 270px; overflow-y: auto; }
 .wizard-body p { margin: 0 0 10px; }
 .wizard-body .settings-rows { margin-top: 12px; }
+.wiz-lead { font-size: 15px; color: var(--ink); }
+.wiz-points { margin: 12px 0; padding-left: 22px; color: var(--ink-light); }
+.wiz-points li { margin: 0 0 7px; line-height: 1.4; }
+.wiz-footnote { margin-top: 16px !important; }
 .wiz-opt { color: var(--ink-faint); font-weight: normal; }
 .wiz-detect { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
 .wiz-tess-ok { color: var(--green); }
 .wiz-tess-no { color: var(--ink-soft); }
+.wiz-service-grid {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px; margin-top: 14px;
+}
+.wiz-service-card {
+  display: flex; flex-direction: column; gap: 6px; min-width: 0;
+  padding: 10px; border: 1px solid var(--face-sh); border-radius: var(--radius);
+  background: var(--canvas);
+}
+.wiz-service-card p {
+  min-height: 32px; margin: 0; color: var(--ink-soft);
+  font-size: 11px; line-height: 1.45;
+}
+.wiz-service-local { grid-column: 1 / -1; }
+.wiz-service-local p { min-height: 0; }
+.wiz-service-head { display: flex; align-items: center; gap: 7px; color: var(--ink); }
+.wiz-badge {
+  padding: 1px 5px; border: 1px solid var(--face-sh2); border-radius: 10px;
+  color: var(--ink-soft); font: 9px var(--mono); letter-spacing: 0.5px;
+}
+.wiz-keys-msg { min-height: 16px; margin: 8px 0 0 !important; }
+.wiz-keys-msg.err { color: var(--red); }
+.wiz-ready-list { margin-top: 18px; margin-bottom: 18px; }
 .wiz-db-list { display: flex; flex-direction: column; gap: 8px; }
 .wiz-db-row { display: flex; align-items: center; gap: 10px; }
 .wiz-db-row .tool-label { flex: 1 1 auto; }
@@ -1546,6 +1584,10 @@ form.orig-view .cad-input {
   padding: 8px 12px; border-top: 1px solid var(--face-sh2);
 }
 .wizard-spacer { flex: 1 1 auto; }
+@media (max-width: 520px) {
+  .wiz-service-grid { grid-template-columns: 1fr; }
+  .wiz-service-local { grid-column: auto; }
+}
 
 /* sign-in window (cloud account) */
 #auth-overlay { z-index: 62; }

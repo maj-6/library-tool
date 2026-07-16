@@ -36,9 +36,7 @@
     <string name="need_permissions">Camera + microphone permissions are required</string>
     <string name="model_download_failed">Voice model download failed: %1$s (buttons still work)</string>
 
-    <!-- glyph controls; the words live in the content descriptions -->
-    <string name="glyph_done">✓</string>
-    <string name="glyph_cancel">✕</string>
+    <!-- Capture controls; the words live in the content descriptions. -->
     <string name="cmd_start">New capture</string>
     <string name="cmd_photo">Take capture</string>
     <string name="cmd_done">Seal entry</string>
@@ -53,9 +51,6 @@
     <string name="login_missing">email and password, both</string>
     <string name="login_working">Signing in…</string>
     <string name="login_failed">sign-in failed</string>
-    <string name="login_or">or</string>
-    <string name="login_google">SIGN IN WITH GOOGLE</string>
-    <string name="login_github">SIGN IN WITH GITHUB</string>
 
     <string name="set_account">Account</string>
     <string name="set_display_name">Display name (contributor credit)</string>
@@ -90,8 +85,13 @@
     <string name="detail_discard">DISCARD ENTRY</string>
     <string name="detail_no_ocr">(no OCR text yet)</string>
     <string name="detail_deepseek_instructions">DeepSeek instructions</string>
+    <string name="detail_deepseek_action">DEEPSEEK</string>
+    <string name="detail_deepseek_action_description">Open DeepSeek instructions</string>
+    <string name="detail_deepseek_help">Add optional corrections or guidance for this capture, then save to reprocess its OCR text with DeepSeek.</string>
     <string name="detail_deepseek_hint">Optional corrections or guidance for this book</string>
     <string name="detail_resubmit">SAVE &amp; REPROCESS</string>
+    <string name="detail_resubmit_description">Save instructions and reprocess with DeepSeek</string>
+    <string name="close">CLOSE</string>
     <string name="detail_reprocessing">Reprocessing with DeepSeek…</string>
     <string name="detail_reprocess_error">Last attempt failed: %1$s</string>
     <string name="detail_need_deepseek">Add a DeepSeek API key in Settings first.</string>
