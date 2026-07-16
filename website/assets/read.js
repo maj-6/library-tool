@@ -5,7 +5,8 @@
 // pre-sized placeholder so the scrollbar never jumps. Margin annotations come
 // from volume_notes; a page-aligned text/translation panel from volume_pages.
 
-import { getVolume, getNotes, getPages, pdfHref } from "./data.js";
+import { getVolume, getNotes, getPages, getAllPages, pdfHref } from "./data.js";
+import { normalizeSearchText, findMatchRanges, searchPages } from "./textsearch.js";
 import * as pdfjsLib from "./vendor/pdfjs/build/pdf.min.mjs";
 
 // The worker is a sibling file; resolve it relative to THIS module so it works
@@ -39,6 +40,8 @@ const S = {
   showText: false,
   textLang: "",          // "" = original layer
   textCache: {},         // { lang: { page: text } }
+  searchQuery: "",       // the active in-book search; "" = none
+  searchCache: {},       // { lang: Promise<[{page, body}]> } — the whole text, once
   thumbsBuilt: false,
 };
 
@@ -253,11 +256,99 @@ async function refreshText() {
     if (!body) continue;
     parts.push(`<div class="tp-page ${n === S.current ? "current" : ""}">
         <div class="tp-pnum">Page ${n}</div>
-        <div class="tp-body">${esc(body)}</div>
+        <div class="tp-body">${bodyHtml(body)}</div>
       </div>`);
   }
   el("tp-body").innerHTML = parts.length ? parts.join("") :
     `<p class="note-more">No text for these pages.</p>`;
+}
+
+// A page body for the panel: escaped, with the active search's matches marked.
+// Escape each segment first, then splice the <mark>s between them — a page
+// body must never reach innerHTML raw.
+function bodyHtml(body) {
+  const ranges = S.searchQuery ? findMatchRanges(body, S.searchQuery) : [];
+  if (!ranges.length) return esc(body);
+  let html = "";
+  let at = 0;
+  for (const [s, e] of ranges) {
+    html += `${esc(body.slice(at, s))}<mark>${esc(body.slice(s, e))}</mark>`;
+    at = e;
+  }
+  return html + esc(body.slice(at));
+}
+
+// ---- in-book search ---------------------------------------------------------
+let searchSeq = 0;   // the same stale-response guard refreshText uses
+
+// The whole text layer, fetched once per language and kept as a promise so
+// two quick searches never fire two full fetches.
+function allPagesFor(lang) {
+  if (!S.searchCache[lang]) {
+    S.searchCache[lang] = getAllPages(slug, lang).catch((e) => {
+      delete S.searchCache[lang];    // a failed fetch must stay retryable
+      throw e;
+    });
+  }
+  return S.searchCache[lang];
+}
+
+async function runSearch() {
+  const q = el("tp-q").value.trim();
+  const seq = ++searchSeq;
+  const box = el("tp-results");
+  if (normalizeSearchText(q).length < 2) {     // nothing (sensible) to search for
+    S.searchQuery = "";
+    box.hidden = true;
+    box.innerHTML = "";
+    refreshText();
+    return;
+  }
+  S.searchQuery = q;
+  const lang = S.textLang;
+  box.hidden = false;
+  if (!S.searchCache[lang]) box.innerHTML = `<p class="note-more">Fetching the full text…</p>`;
+  let pages;
+  try {
+    pages = await allPagesFor(lang);
+  } catch {
+    if (seq !== searchSeq) return;
+    box.innerHTML = `<p class="note-more">The text could not be fetched.</p>`;
+    return;
+  }
+  if (seq !== searchSeq || lang !== S.textLang) return;
+  renderHits(searchPages(pages, q));
+  refreshText();               // the visible pages pick up their <mark>s
+}
+
+function snippetHtml(h) {
+  return esc(h.snippet.slice(0, h.matchStart)) +
+    `<mark>${esc(h.snippet.slice(h.matchStart, h.matchEnd))}</mark>` +
+    esc(h.snippet.slice(h.matchEnd));
+}
+
+function renderHits(hits) {
+  const box = el("tp-results");
+  box.hidden = false;
+  if (!hits.length) {
+    box.innerHTML = `<p class="note-more">No matches in this text.</p>`;
+    return;
+  }
+  const pageCount = new Set(hits.map((h) => h.page)).size;
+  const total = hits.reduce((n, h) => n + 1 + (h.more || 0), 0);
+  const rows = hits.map((h) => `
+    <button type="button" class="tp-hit" data-page="${h.page}">
+      <span class="tp-hit-page">p. ${h.page}</span>
+      <span class="tp-hit-snip">${h.cutStart ? "…" : ""}${snippetHtml(h)}${h.cutEnd ? "…" : ""}</span>
+      ${h.more ? `<span class="tp-hit-more">+${h.more} more on this page</span>` : ""}
+    </button>`).join("");
+  box.innerHTML = `
+    <div class="tp-hits">
+      <div class="tp-hitcount">${total} match${total === 1 ? "" : "es"} · ${pageCount} page${pageCount === 1 ? "" : "s"}</div>
+      ${rows}
+    </div>`;
+  box.querySelectorAll(".tp-hit").forEach((b) =>
+    b.addEventListener("click", () => scrollToPage(Number(b.dataset.page))));
 }
 
 // ---- thumbnails ------------------------------------------------------------
@@ -453,6 +544,14 @@ async function main() {
   }
 
   wireControls();
+
+  // Deep link: ?q= (book.html's search form) opens the panel and runs the search.
+  const deepQ = new URLSearchParams(location.search).get("q") || "";
+  if (deepQ && hasText) {
+    el("tp-q").value = deepQ;
+    if (!S.showText) setText(true);
+    runSearch();
+  }
 }
 
 function wireControls() {
@@ -478,6 +577,24 @@ function wireControls() {
     S.textLang = el("tp-lang").value;
     refreshText();
     savePrefs();
+    if (el("tp-q").value.trim()) runSearch();   // re-run against the new layer
+  });
+
+  let searchTimer;
+  el("tp-q").addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(runSearch, 300);
+  });
+  el("tp-q").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      clearTimeout(searchTimer);
+      runSearch();
+    } else if (ev.key === "Escape") {
+      el("tp-q").value = "";
+      clearTimeout(searchTimer);
+      runSearch();
+    }
   });
 
   let resizeTimer;

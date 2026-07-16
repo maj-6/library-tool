@@ -1,83 +1,80 @@
-# World Herb Library — cataloging workbench
+# Library Tool
 
-A personal, local-only workbench for reconciling a private herbal library
-against the [World Herb Library](https://worldherblibrary.org) (WHL) and
-preparing new catalog entries for submission there.
+A cataloguing workbench that turns a shelf of old botanical and medical books
+into a public online library. For each book it answers three questions — is it
+already in the [World Herb Library](https://worldherblibrary.org)? is it out
+of copyright? does a scan already exist in another archive? — and then helps
+prepare the worthwhile ones for publication: catalogue metadata, a written
+description, and a readable scan.
 
-## Scope and intent
+**[Website](https://maj-6.github.io/library-tool/) ·
+[Downloads](https://maj-6.github.io/library-tool/downloads.html) ·
+[Documentation](https://maj-6.github.io/library-tool/docs.html) ·
+[Release notes](https://maj-6.github.io/library-tool/releases.html)**
 
-Everything in this repository serves one workflow:
+![The Catalogs tab: a table of checked books, with archive and copyright
+verdicts for the selected book in the Info panel](website/assets/docs/app-catalogs.png)
 
-1. **Check** — take a book (from the CH private-library spreadsheet, or
-   hand-entered from its title page) and determine, offline:
-   is it already in the WHL catalog? is it under copyright? does a scan
-   already exist in the Internet Archive or HathiTrust?
-2. **Verify** — every automatic match can be a false positive, so each one
-   is approved or rejected by hand; rejected matches can be replaced with a
-   manually located source URL.
-3. **Decide** — each book ends up marked `SCAN` (public domain, no scan
-   exists anywhere: the physical book should be scanned) or `UPLOAD` (a
-   scan exists in another archive and can be re-homed to WHL), or needs
-   nothing.
-4. **Prepare** — approved sources feed the *upload list*, where the book
-   builder assembles finished WHL catalog entries (full metadata, a
-   Markdown description, and a PDF source — an archive URL or a locally
-   downloaded file) ready for submission.
+## The parts
 
-Along the way the WHL catalog itself can be cleaned up: the explorer shows
-the whole WHL catalog as an editable table, and corrections are kept in a
-local overlay file (`output/whl_corrections.json`) — the exported CSV is
-never modified.
+| Part | Where | What it is |
+| --- | --- | --- |
+| Desktop app | `desktop/` + `tools/whl_explorer/` | The workbench: an Electron shell around a local Flask app. Windows installer with auto-update. |
+| Book Capture | `android/BookCapture/` | Android companion: voice-driven camera capture with on-the-fly OCR; captures sync to the desktop. |
+| Website | `website/` | This repo's public face on GitHub Pages: downloads, docs, and the **Archive Browser** — the published catalogue with a built-in reader (vendored pdf.js, no build step, no CDN). |
+| Cloud | `docs/cloud/` | Supabase schema + object storage behind accounts, capture sync, and the published catalogue. The site falls back to local fixtures without it. |
 
-Everything is designed to run **offline** against local copies and indexes:
-the WHL catalog CSV (plus metadata scraped once from the website API), a
-copyright-renewals CSV, and a consolidated Open Library editions index
-(~7.7M pre-1950 editions, local SQLite FTS). Only the scan search (Internet
-Archive / HathiTrust), the WHL metadata scrape, and IA PDF downloads touch
-the network.
+## The workflow
 
-## The application
+1. **Check** — each book (from the library spreadsheet, hand-entered, or
+   captured by phone) is checked offline: WHL presence, U.S. copyright
+   registration/renewal records, and existing scans in the Internet Archive
+   or HathiTrust.
+2. **Verify** — every automatic match is only a suggestion; each is approved
+   or rejected by hand, and a rejected match can be replaced with a manually
+   located source.
+3. **Decide** — books end up marked `SCAN` (public domain, no scan exists:
+   worth scanning) or `UPLD` (a scan exists elsewhere and can be re-homed).
+4. **Prepare** — verified sources become draft catalogue entries in the
+   Editor: metadata, a Markdown description, and the PDF. The Analyze tab
+   extracts and corrects the text and (with AI keys) drafts summaries,
+   categories, translations, and annotations.
+5. **Publish** — finished entries go to the online catalogue, readable by
+   anyone in the Archive Browser.
 
-The single application is the **catalog explorer** — a Flask web app with a
-classic-CAD styled UI (seven selectable themes):
+Checks run against local copies and indexes (the WHL catalogue export, a
+copyright-renewals CSV, and a ~7.7M-edition Open Library index in SQLite),
+so day-to-day work is offline; the network is used for scan search,
+downloads, sync, and publishing.
 
-```
-python3 tools/whl_explorer/server.py    # then open http://127.0.0.1:5001
-```
-
-See [tools/README.md](tools/README.md) for the full tool documentation:
-building the Open Library indexes, every explorer feature, and the
-standalone CLI tools.
-
-## Development
-
-Dependencies and tool configuration are declared in `pyproject.toml`.
-One-time setup, then the pre-push gate:
+## Running from source
 
 ```
-python3 -m pip install -e ".[dev]"   # runtime deps + pytest + ruff
-scripts/check.ps1                    # ruff + pytest (scripts/check.sh on POSIX)
+python3 -m pip install -e ".[dev]"      # runtime deps + pytest + ruff
+python3 tools/whl_explorer/server.py    # the app: http://127.0.0.1:5001
 ```
 
-Tests run against a throwaway `WHL_DATA_ROOT` (see `tests/conftest.py`);
-they never read or write the live `output/` state.
+The desktop shell wraps the same server: `cd desktop && npm install && npm
+start`. The website is static: `python3 website/serve.py 8080`. Book Capture
+builds from `android/BookCapture/` with Gradle or Android Studio.
 
-## Layout
+Before pushing: `scripts/check.ps1` (`check.sh` on POSIX) runs ruff + pytest.
+Tests use a throwaway `WHL_DATA_ROOT` and never touch live state.
 
-| Path | What it is |
-| --- | --- |
-| `ch_library.xlsx` | the CH private-library spreadsheet (source of truth) |
-| `whl_catalog.csv` | exported WHL catalog (read-only; corrections overlay it) |
-| `copyright_renewals.csv` | US copyright-renewal records for the offline check |
-| `tools/` | all code: the explorer, index builders, checkers, CLIs |
-| `output/` | everything generated: converted catalogs, indexes, manual entries, corrections, builds |
-| `downloads/ia/` | Internet Archive PDFs downloaded for approved books (+ `catalog.json`) |
+See [tools/README.md](tools/README.md) for the full tool documentation —
+index builders, every explorer feature, data layout, and the standalone CLIs
+— and [docs/](docs/) for design notes and the cloud setup.
 
-Key generated files in `output/`:
+## Data
 
-- `ch_library.json` — the spreadsheet converted to JSON (`convert_xlsx.py`)
-- `manual_entries.json` — hand-entered books with their check/scan results
-- `whl_scraped.json` — full metadata for every published WHL book (website API)
-- `whl_corrections.json` — local edits/additions to the WHL catalog
-- `whl_builds.json` — catalog entries being prepared for WHL submission
-- `ol_search.db` / `ol_works.db` — local Open Library indexes
+The packaged app keeps its state (document store, entries, downloads,
+indexes) in `%APPDATA%\Library Tool`; a source checkout uses the repo root.
+`WHL_DATA_ROOT` overrides either. Shipped read-only assets (the catalogue
+exports) live alongside the code.
+
+## Releases
+
+The project is pre-1.0 and ships intermediate builds deliberately: stable
+releases plus `alpha`/`beta` prerelease channels, both built by CI from `v*`
+tags and published to GitHub Releases and the website's Downloads page.
+Mechanics and standards are in [docs/releasing.md](docs/releasing.md).

@@ -144,6 +144,10 @@ def test_apply_page_deletion_end_to_end(data_root):
     (ocr_dir / "extracted.txt").write_text("no markers at all",
                                            encoding="utf-8")
     builds = {bid: {"title": "Test", "title_pages": "1,3"}}
+    # the remap persists against a fresh read of the store, so the record
+    # must exist on disk (in production the caller loaded builds from it)
+    server.BUILDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    server.BUILDS_PATH.write_text(json.dumps(builds), encoding="utf-8")
 
     result = server._apply_page_deletion(bid, builds, pdf, [2])
 
@@ -249,6 +253,8 @@ def test_apply_page_deletion_shifts_thumbnail_source_page_reference(data_root):
     pdf = data_root / "downloads" / "ia" / "testbook5" / "book.pdf"
     _make_pdf(pdf, 3)
     builds = {bid: {"title": "Thumb", "thumbnail_source": "page:3"}}
+    server.BUILDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    server.BUILDS_PATH.write_text(json.dumps(builds), encoding="utf-8")
 
     result = server._apply_page_deletion(bid, builds, pdf, [2])
 

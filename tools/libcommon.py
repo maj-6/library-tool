@@ -9,6 +9,7 @@ import json
 import re
 import os
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -227,7 +228,9 @@ def save_json(path: Path, data) -> None:
     and fall back to an in-place write rather than dropping the data."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+    # pid + thread id: concurrent writers (threads or processes) can never
+    # share a temp name, so one writer's replace can't consume another's file
+    tmp = path.with_name(path.name + f".tmp{os.getpid()}-{threading.get_ident()}")
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2, ensure_ascii=False)
     for attempt in range(5):
