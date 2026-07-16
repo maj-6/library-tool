@@ -2785,9 +2785,9 @@ function initAbout() {
 
 // --- changelog viewer ----------------------------------------------------------
 // Renders the shared release notes (website/changelog.md, served by
-// /api/changelog). The format is terse: "## <version> — <date>" headings and
-// "- " bullets, with any preamble before the first version ignored. Everything
-// is escaped; no markdown HTML is trusted.
+// /api/changelog). Each version contains Additions, Other Changes, and/or
+// Bugfixes headings with plain bullets. Everything is escaped; no markdown HTML
+// is trusted.
 let changelogLoaded = false;
 function openChangelog() {
   el("changelog-overlay").hidden = false;
@@ -2801,32 +2801,69 @@ function openChangelog() {
 }
 function closeChangelog() { el("changelog-overlay").hidden = true; }
 
+const CHANGELOG_CATEGORIES = new Map([
+  ["additions", "Additions"],
+  ["other changes", "Other Changes"],
+  ["bugfixes", "Bugfixes"],
+]);
+
+function changelogCategory(cur, name) {
+  let category = cur.categories.find((c) => c.name === name);
+  if (!category) {
+    category = { name, items: [] };
+    cur.categories.push(category);
+  }
+  return category;
+}
+
 function parseChangelog(md) {
   const versions = [];
   let cur = null;
+  let category = null;
   for (const raw of String(md || "").split(/\r?\n/)) {
     const line = raw.trim();
     let m;
     if ((m = /^##\s+(.+?)(?:\s+[—–·-]\s+(.+))?$/.exec(line))) {   // em/en/middot/hyphen date separator
-      cur = { version: m[1].trim(), date: (m[2] || "").trim(), items: [] };
+      cur = {
+        version: m[1].trim(),
+        date: (m[2] || "").trim(),
+        categories: [],
+        items: [],
+      };
       versions.push(cur);
+      category = null;
+    } else if (cur && (m = /^###\s+(.+)$/.exec(line))) {
+      const name = CHANGELOG_CATEGORIES.get(m[1].trim().toLowerCase());
+      category = name ? changelogCategory(cur, name) : null;
     } else if (cur && (m = /^[-*]\s+(.+)$/.exec(line))) {
-      cur.items.push(m[1].trim());
+      const item = m[1].trim();
+      (category || changelogCategory(cur, "Other Changes")).items.push(item);
+      cur.items.push(item);                    // legacy flat-list consumers
     }
-    // title, preamble, and blank lines are ignored
+    // title, preamble, unknown subheadings, and blank lines are ignored
   }
   return versions;
 }
 
+function changelogCategoryHTML(category) {
+  return '<div class="cl-category"><h4 class="cl-category-name">' +
+    esc(category.name) + '</h4><ul class="cl-list">' +
+    category.items.map((i) => "<li>" + esc(i) + "</li>").join("") +
+    "</ul></div>";
+}
+
 function changelogHTML(versions) {
   if (!versions.length) return '<p class="pane-note">No changelog yet.</p>';
-  return versions.map((v) =>
-    '<section class="cl-rel"><h3 class="cl-ver">' + esc(v.version) +
-    (v.date ? ' <span class="cl-date">' + esc(v.date) + "</span>" : "") +
-    "</h3><ul class=\"cl-list\">" +
-    v.items.map((i) => "<li>" + esc(i) + "</li>").join("") +
-    "</ul></section>"
-  ).join("");
+  return versions.map((v) => {
+    const categories = (v.categories || []).filter((c) => c.items && c.items.length);
+    const notes = categories.length
+      ? categories.map(changelogCategoryHTML).join("")
+      : '<ul class="cl-list">' +
+        (v.items || []).map((i) => "<li>" + esc(i) + "</li>").join("") + "</ul>";
+    return '<section class="cl-rel"><h3 class="cl-ver">' + esc(v.version) +
+      (v.date ? ' <span class="cl-date">' + esc(v.date) + "</span>" : "") +
+      "</h3>" + notes + "</section>";
+  }).join("");
 }
 
 // --- FIND syntax ---------------------------------------------------------------
