@@ -41,11 +41,14 @@ without reaching stable users:
 - Tag it `v0.7.0-alpha.1` and push. The existing `v*` pipeline builds it, and
   because the tag carries `-alpha` / `-beta` / `-rc` it:
   - flags the GitHub Release **prerelease**, so the desktop auto-updater
-    (`allowPrerelease` stays false — desktop/main.js) never offers it to stable
-    users; they hold at the last stable version.
+    never offers it to a stock stable install. `allowPrerelease`
+    (desktop/main.js) turns on only for an installed alpha/beta/rc — it keeps
+    following its prerelease line — or a stable install that opted in via
+    Settings > Updates (`includePrereleaseUpdates`); everyone else holds at
+    the last stable version.
   - registers the `releases` row on the **`alpha` / `beta` / `rc` channel**, so
-    it appears in the Downloads page's **Other downloads** section instead of
-    replacing the stable card.
+    it appears in the Downloads page's **Pre-release builds** section instead
+    of replacing the stable card.
 
 A plain `vX.Y.Z` tag (no suffix) is the stable path — GitHub "Latest", the
 stable auto-update channel, and the main Downloads list. Reserve it for builds
@@ -66,11 +69,14 @@ pushed:
    `LibraryTool-Setup-<package.json version>.exe` **plus `latest.yml` and the
    `.blockmap`** — those two are the auto-update channel: installed apps check
    the newest GitHub Release at startup and read them to fetch the update.
-3. **publish** attaches everything to a GitHub Release named after the tag,
-   then registers the APK and the installer in the `releases` table via
-   `tools/release_publish.py` (URL → the GitHub Release asset). The Downloads
-   page shows them immediately, and existing installs pick the update up on
-   their next launch.
+3. **publish** attaches the builds to a GitHub Release named after the tag,
+   then registers them in the `releases` table via `tools/release_publish.py`
+   (URL → the GitHub Release asset). The two apps release independently: the
+   job runs when either build succeeded and registers only the artifact(s)
+   present, so a broken Android build never blocks a desktop release (or vice
+   versa). The Downloads page shows the rows immediately, and existing
+   installs with auto-update on (the Settings > Updates default) pick the
+   update up on their next launch.
 
 So cutting a release is:
 
@@ -79,7 +85,7 @@ So cutting a release is:
 #   android/BookCapture/app/build.gradle.kts   versionCode + versionName
 #   desktop/package.json                       version
 git tag v0.4.0
-git push <public> master:main --follow-tags    # or push the tag with the next mirror publish
+git push <public> main --follow-tags           # or push the tag with the next mirror publish
 ```
 
 A `workflow_dispatch` run of the same workflow is a dry run: both apps build
@@ -90,10 +96,13 @@ and the artifacts are inspectable, nothing is published.
 | name | kind | purpose |
 |---|---|---|
 | `SUPABASE_URL` | variable | already set for the pages workflow |
+| `SUPABASE_ANON_KEY` | variable | baked into the APK at build time so first run needs no typing; blank falls back to the in-app Settings project |
 | `SUPABASE_SERVICE_ROLE_KEY` | secret | writes to `releases` (anon is read-only by RLS). Without it the GitHub Release still happens; the register step warns and skips. |
 | `ANDROID_KEYSTORE_B64` | secret | base64 of the signing keystore. Local copy: `~/.whl-release/bookcapture.jks(.b64)`, password in `bookcapture-keystore-info.txt` next to it. |
 | `ANDROID_KEYSTORE_PASSWORD` | secret | its password |
 | `ANDROID_KEY_ALIAS` | secret | `bookcapture` |
+| `WIN_CSC_LINK_B64` | secret | base64 PFX for Windows code signing, passed to electron-builder as `CSC_LINK`. Without it the installer builds unsigned. |
+| `WIN_CSC_KEY_PASSWORD` | secret | its password |
 
 Keep one keystore forever: Android refuses to update an installed app whose
 signing key changed — users would have to uninstall first (settings and the
@@ -120,12 +129,19 @@ same platform/version/channel replaces the row, so corrections are safe.
 
 ## Known caveats
 
-- The installer is unsigned (no code-signing cert), so SmartScreen will warn
-  on first run.
+- Code signing is optional: the installer step signs when the
+  `WIN_CSC_LINK_B64` / `WIN_CSC_KEY_PASSWORD` secrets hold a cert and builds
+  unsigned otherwise. Until a CA-issued cert fills them, public downloaders
+  see the SmartScreen warning on first run (a self-managed cert clears it
+  only on machines that trust its root CA).
 - The 40 MB `copyright_renewals.csv` is deliberately absent from the public
   mirror; the sidecar spec skips missing data files, so the CI build simply
   ships without that dataset — the in-app setup guide offers it (and the other
   large databases) as a download on first run.
 - A version only auto-updates existing installs if `latest.yml` made it onto
   the newest GitHub Release — the artifact step fails loudly if it is missing,
-  but don't delete it from a release by hand.
+  but don't delete it from a release by hand. Two gotchas baked into the
+  workflow: electron-builder writes `latest.yml` even for a prerelease (the
+  GitHub prerelease flag, not the manifest name, is what shields stable
+  updaters), and the artifact glob must stay exactly `latest.yml` — `*.yml`
+  once swept in `builder-debug.yml`.
