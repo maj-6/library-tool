@@ -798,6 +798,37 @@ def api_books():
 
 BUILDS_PATH = lib.OUTPUT_DIR / "whl_builds.json"
 
+# The one lock for every whl_builds.json read-modify-write: request handlers,
+# analysis/publish background threads, and the cloud sync (passed into
+# store_sync.sync_stores) all rewrite the whole file, so an unlocked
+# load->mutate->save silently drops whatever another writer changed in
+# between. Locks here are threading.Lock — the sidecar is a single process,
+# so cross-process coordination is deliberately out of scope.
+_builds_lock = threading.Lock()
+
+
+def _mutate_json(path, lock, default, fn):
+    """The write path for a mutable JSON store: hold the store's lock across
+    load -> fn(doc) -> save so concurrent read-modify-writes serialize instead
+    of overwriting each other. fn mutates the document in place; its return
+    value passes through. Raising inside fn (abort included) skips the save."""
+    with lock:
+        doc = lib.load_json(path, default)
+        out = fn(doc)
+        lib.save_json(path, doc)
+        return out
+
+
+def _builds_apply(bid: str, fields: dict) -> None:
+    """Fold field changes into one build against a FRESH read of the store —
+    for slow work (folder sync, page deletion) whose snapshot may be minutes
+    old: only this build's fields are ours to change (the _publish_run
+    precedent)."""
+    def apply(builds):
+        if bid in builds:
+            builds[bid].update(fields)
+    _mutate_json(BUILDS_PATH, _builds_lock, {}, apply)
+
 # The field set mirrors what a WHL catalog entry needs. pdf_source is the
 # source URL; pdf_file is the local PDF attached for the actual submission
 # (the PRIMARY PDF source); pdf_sources lists SECONDARY PDFs — other scans
@@ -885,56 +916,64 @@ def api_builds():
 def api_builds_create():
     payload = request.get_json(silent=True) or {}
     seed = payload.get("build") or {}
-    builds = lib.load_json(BUILDS_PATH, {})
-    build = {f: str(seed.get(f, "") or "").strip() for f in _BUILD_FIELDS
-             if f not in _BUILD_STRUCTURED_FIELDS}
-    build["pdf_sources"] = _clean_pdf_sources(seed.get("pdf_sources"))
-    build["category_ids"] = _clean_category_ids(seed.get("category_ids"),
-                                                lib.load_taxonomy()["nodes"])
-    build["bundle"] = _clean_bundle(seed.get("bundle"))
-    build["images"] = _clean_images(seed.get("images"))
-    build["extra"] = _clean_extra(seed.get("extra"))
-    build["capture_id"] = _clean_capture_id(seed.get("capture_id"))
-    if build["status"] not in _BUILD_STATUSES:
-        build["status"] = "draft"
-    build["id"] = lib.gen_id(set(builds))
-    build["created_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    build["updated_at"] = build["created_at"]
-    builds[build["id"]] = build
-    lib.save_json(BUILDS_PATH, builds)
+    with _builds_lock:
+        builds = lib.load_json(BUILDS_PATH, {})
+        build = {f: str(seed.get(f, "") or "").strip() for f in _BUILD_FIELDS
+                 if f not in _BUILD_STRUCTURED_FIELDS}
+        build["pdf_sources"] = _clean_pdf_sources(seed.get("pdf_sources"))
+        build["category_ids"] = _clean_category_ids(seed.get("category_ids"),
+                                                    lib.load_taxonomy()["nodes"])
+        build["bundle"] = _clean_bundle(seed.get("bundle"))
+        build["images"] = _clean_images(seed.get("images"))
+        build["extra"] = _clean_extra(seed.get("extra"))
+        build["capture_id"] = _clean_capture_id(seed.get("capture_id"))
+        if build["status"] not in _BUILD_STATUSES:
+            build["status"] = "draft"
+        build["id"] = lib.gen_id(set(builds))
+        build["created_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        build["updated_at"] = build["created_at"]
+        builds[build["id"]] = build
+        lib.save_json(BUILDS_PATH, builds)
     activity("created", "draft entry", detail=build.get("title", ""))
     return jsonify({"ok": True, "build": build})
 
 
 @app.route("/api/builds/<build_id>", methods=["PATCH"])
 def api_builds_update(build_id: str):
-    builds = lib.load_json(BUILDS_PATH, {})
-    if build_id not in builds:
-        abort(404)
-    payload = request.get_json(silent=True) or {}
-    b = builds[build_id]
-    was = b.get("status")
-    for f in _BUILD_FIELDS:
-        if f not in payload:
-            continue
-        if f == "pdf_sources":
-            b[f] = _clean_pdf_sources(payload[f])
-        elif f == "category_ids":
-            b[f] = _clean_category_ids(payload[f], lib.load_taxonomy()["nodes"])
-        elif f == "bundle":
-            b[f] = _clean_bundle(payload[f])
-        elif f == "images":
-            b[f] = _clean_images(payload[f])
-        elif f == "extra":
-            b[f] = _clean_extra(payload[f])
-        elif f == "capture_id":
-            b[f] = _clean_capture_id(payload[f])
-        else:
-            b[f] = str(payload[f] or "").strip()
-    if b.get("status") not in _BUILD_STATUSES:
-        b["status"] = "draft"
-    b["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    lib.save_json(BUILDS_PATH, builds)
+    with _builds_lock:
+        builds = lib.load_json(BUILDS_PATH, {})
+        if build_id not in builds:
+            abort(404)
+        payload = request.get_json(silent=True) or {}
+        b = builds[build_id]
+        # optimistic concurrency: an editor that loaded the record before
+        # another writer touched it gets the current record back, not a merge
+        expect = str(payload.get("expect_updated_at") or "")
+        if expect and expect != str(b.get("updated_at") or ""):
+            return jsonify({"ok": False, "error": "changed elsewhere",
+                            "build": b}), 409
+        was = b.get("status")
+        for f in _BUILD_FIELDS:
+            if f not in payload:
+                continue
+            if f == "pdf_sources":
+                b[f] = _clean_pdf_sources(payload[f])
+            elif f == "category_ids":
+                b[f] = _clean_category_ids(payload[f], lib.load_taxonomy()["nodes"])
+            elif f == "bundle":
+                b[f] = _clean_bundle(payload[f])
+            elif f == "images":
+                b[f] = _clean_images(payload[f])
+            elif f == "extra":
+                b[f] = _clean_extra(payload[f])
+            elif f == "capture_id":
+                b[f] = _clean_capture_id(payload[f])
+            else:
+                b[f] = str(payload[f] or "").strip()
+        if b.get("status") not in _BUILD_STATUSES:
+            b["status"] = "draft"
+        b["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        lib.save_json(BUILDS_PATH, builds)
     # only the status transition is worth a feed entry; every keystroke is not
     if b["status"] != was and b["status"] in ("ready", "uploaded"):
         activity("uploaded" if b["status"] == "uploaded" else "verified", "book",
@@ -944,11 +983,12 @@ def api_builds_update(build_id: str):
 
 @app.route("/api/builds/<build_id>", methods=["DELETE"])
 def api_builds_delete(build_id: str):
-    builds = lib.load_json(BUILDS_PATH, {})
-    if build_id not in builds:
-        abort(404)
-    del builds[build_id]
-    lib.save_json(BUILDS_PATH, builds)
+    with _builds_lock:
+        builds = lib.load_json(BUILDS_PATH, {})
+        if build_id not in builds:
+            abort(404)
+        del builds[build_id]
+        lib.save_json(BUILDS_PATH, builds)
     return jsonify({"ok": True})
 
 
@@ -963,9 +1003,10 @@ def api_builds_restore():
     build["images"] = _clean_images(build.get("images"))
     build["extra"] = _clean_extra(build.get("extra"))
     build["capture_id"] = _clean_capture_id(build.get("capture_id"))
-    builds = lib.load_json(BUILDS_PATH, {})
-    builds[bid] = build
-    lib.save_json(BUILDS_PATH, builds)
+
+    def reinsert(builds):
+        builds[bid] = build
+    _mutate_json(BUILDS_PATH, _builds_lock, {}, reinsert)
     return jsonify({"ok": True, "build": build})
 
 
@@ -1761,7 +1802,9 @@ def api_build_folder_sync(build_id: str):
                 if (b.get("pdf_file") or "").replace("\\", "/") == old_rel:
                     b["pdf_file"] = (d / "primary.pdf").resolve().relative_to(
                         lib.DATA_ROOT.resolve()).as_posix()
-                    lib.save_json(BUILDS_PATH, builds)
+                    # this function's snapshot is stale by now (preview render,
+                    # extraction): fold in only this build's change
+                    _builds_apply(build_id, {"pdf_file": b["pdf_file"]})
                     src = d / "primary.pdf"
                 legacy.unlink()
                 notes.append("renamed preview.pdf to primary.pdf")
@@ -1798,7 +1841,8 @@ def api_build_folder_sync(build_id: str):
                         lib.DATA_ROOT.resolve()).as_posix()
                     b["updated_at"] = datetime.now(timezone.utc).isoformat(
                         timespec="seconds")
-                    lib.save_json(BUILDS_PATH, builds)
+                    _builds_apply(build_id, {"pdf_file": b["pdf_file"],
+                                             "updated_at": b["updated_at"]})
 
                     def _drop_stale(catalog):
                         for k in [k for k, v in catalog.items()
@@ -2911,15 +2955,14 @@ def _apply_page_deletion(build_id: str, builds: dict, pdf: Path,
     titles = [] if src_key != "primary" else \
         [int(x) for x in str(b.get("title_pages") or "").split(",")
          if x.strip().isdigit()]
-    dirty = False
+    changed = {}
     if titles:
         remapped = []
         for t in titles:
             if t in set(pages):
                 continue
             remapped.append(t - sum(1 for r in pages if r < t))
-        b["title_pages"] = ",".join(str(t) for t in remapped)
-        dirty = True
+        changed["title_pages"] = ",".join(str(t) for t in remapped)
     # thumbnail_source references a primary-PDF page the same way title_pages
     # does ("page:<n>") — remap it the same way, or clear it if the referenced
     # page was itself deleted. An "image:<name>" source points at an OCR-
@@ -2928,11 +2971,13 @@ def _apply_page_deletion(build_id: str, builds: dict, pdf: Path,
         m = re.match(r"^page:(\d+)$", str(b.get("thumbnail_source") or ""))
         if m:
             t = int(m.group(1))
-            b["thumbnail_source"] = "" if t in set(pages) else \
+            changed["thumbnail_source"] = "" if t in set(pages) else \
                 f"page:{t - sum(1 for r in pages if r < t)}"
-            dirty = True
-    if dirty:
-        lib.save_json(BUILDS_PATH, builds)
+    if changed:
+        # the caller's snapshot predates the slow PDF rewrite above — apply
+        # the remap to a fresh read, and keep the returned record in step
+        b.update(changed)
+        _builds_apply(build_id, changed)
     return {"deleted": pages, "pages": len(keep),
             "renumbered": renumbered,
             "backup": pdf.with_suffix(".bak.pdf").name,
@@ -3727,6 +3772,9 @@ _SECRET_KEYS = frozenset({
 })
 _SECRETS_PATH = lib.DATA_ROOT / "output" / "secrets.json"
 _MISTRAL_PENDING = "_mistralCloudPending"
+# The one lock for every secrets.json read-modify-write (settings dialog,
+# profile reconciliation, the client_state migration). Single process.
+_secrets_lock = threading.Lock()
 
 
 def _load_secrets() -> dict:
@@ -3769,18 +3817,19 @@ def api_secrets_put():
     if not _local_only():
         return jsonify({"error": "forbidden"}), 403
     updates = (request.get_json(silent=True) or {}).get("updates") or {}
-    secrets = _load_secrets()
-    for k, v in updates.items():
-        if k not in _SECRET_KEYS:
-            continue
-        v = str(v or "").strip()
-        if v:
-            secrets[k] = v
-        else:
-            secrets.pop(k, None)
-        if k == "mistralKey":
-            secrets[_MISTRAL_PENDING] = True
-    _save_secrets(secrets)
+    with _secrets_lock:
+        secrets = _load_secrets()
+        for k, v in updates.items():
+            if k not in _SECRET_KEYS:
+                continue
+            v = str(v or "").strip()
+            if v:
+                secrets[k] = v
+            else:
+                secrets.pop(k, None)
+            if k == "mistralKey":
+                secrets[_MISTRAL_PENDING] = True
+        _save_secrets(secrets)
     if "mistralKey" in updates:
         _sync_profile_mistral_key()
     return jsonify({"ok": True})
@@ -3814,14 +3863,20 @@ def _sync_profile_mistral_key() -> str | None:
                 [{"id": ses["user_id"], "api_keys": keys}],
                 prefer="resolution=merge-duplicates,return=minimal",
             )
-            secrets.pop(_MISTRAL_PENDING, None)
+            adopt = None                   # local value pushed; only the flag clears
         else:
-            local = str(keys.get("mistral") or "").strip()
-            if local:
-                secrets["mistralKey"] = local
+            local = adopt = str(keys.get("mistral") or "").strip()
+        # the REST round-trips above took time: apply the outcome to a fresh
+        # read under the lock, not to the pre-network snapshot
+        with _secrets_lock:
+            secrets = _load_secrets()
+            if adopt is None:
+                secrets.pop(_MISTRAL_PENDING, None)
+            elif adopt:
+                secrets["mistralKey"] = adopt
             else:
                 secrets.pop("mistralKey", None)
-        _save_secrets(secrets)
+            _save_secrets(secrets)
         return local
     except sauth.AuthError as exc:
         log.warning("Mistral profile sync deferred: %s", exc)
@@ -3845,10 +3900,11 @@ def _migrate_secrets_from_client_state() -> None:
                 if v:
                     moved[k] = v
         if moved:
-            secrets = _load_secrets()
-            for k, v in moved.items():
-                secrets.setdefault(k, v)   # never clobber a secrets.json value
-            _save_secrets(secrets)
+            with _secrets_lock:
+                secrets = _load_secrets()
+                for k, v in moved.items():
+                    secrets.setdefault(k, v)   # never clobber a secrets.json value
+                _save_secrets(secrets)
         if removed:
             lib.save_json(lib.CLIENT_STATE_PATH, state)
 
@@ -4205,8 +4261,7 @@ def _reg_cache_load() -> dict:
 
 def _reg_cache_store(cache: dict) -> None:
     try:
-        _REG_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _REG_CACHE_PATH.write_text(json.dumps(cache), "utf-8")
+        lib.save_json(_REG_CACHE_PATH, cache)   # atomic, unlike write_text
     except Exception:
         pass
 
@@ -4295,6 +4350,11 @@ def api_copyright_renewal():
 # --- WHL catalogue view (editable via a corrections overlay) --------------------
 
 WHL_CORRECTIONS_PATH = lib.OUTPUT_DIR / "whl_corrections.json"
+# The one lock for every whl_corrections.json read-modify-write — the edit
+# route AND the cloud sync (passed into store_sync.sync_stores), so a sync
+# pass can never drop a correction recorded while it merged. Single process;
+# _whl_rows_lock below only guards the merged-rows cache, not this file.
+_corrections_lock = threading.Lock()
 _whl_rows_cache: list | None = None
 _whl_rows_lock = threading.Lock()
 
@@ -4443,60 +4503,61 @@ def api_whl_catalog_edit():
     output/whl_corrections.json so they are reviewable and revertible.
     """
     payload = request.get_json(silent=True) or {}
-    corr = lib.load_json(WHL_CORRECTIONS_PATH, {})
-    if "add" in payload:
-        a = payload.get("add") or {}
-        row = {f: str(a.get(f, "") or "").strip() for f in _WHL_EDIT_FIELDS}
-        if not row["title"]:
-            return jsonify({"ok": False, "error": "TITLE IS REQUIRED"}), 400
-        corr.setdefault("added", []).append(row)
-        lib.save_json(WHL_CORRECTIONS_PATH, corr)
-        return jsonify({"ok": True, "idx": -len(corr["added"])})
+    with _corrections_lock:
+        corr = lib.load_json(WHL_CORRECTIONS_PATH, {})
+        if "add" in payload:
+            a = payload.get("add") or {}
+            row = {f: str(a.get(f, "") or "").strip() for f in _WHL_EDIT_FIELDS}
+            if not row["title"]:
+                return jsonify({"ok": False, "error": "TITLE IS REQUIRED"}), 400
+            corr.setdefault("added", []).append(row)
+            lib.save_json(WHL_CORRECTIONS_PATH, corr)
+            return jsonify({"ok": True, "idx": -len(corr["added"])})
 
-    if "remove_added" in payload:  # undo of an add
+        if "remove_added" in payload:  # undo of an add
+            try:
+                j = -int(payload["remove_added"]) - 1
+            except (TypeError, ValueError):
+                abort(400)
+            added = corr.get("added") or []
+            if not (0 <= j < len(added)):
+                abort(404)
+            added.pop(j)
+            lib.save_json(WHL_CORRECTIONS_PATH, corr)
+            return jsonify({"ok": True})
+
+        fields = {f: str(v or "").strip() for f, v in (payload.get("fields") or {}).items()
+                  if f in _WHL_EDIT_FIELDS}
+        if "field" in payload:
+            field = str(payload.get("field", "") or "")
+            if field not in _WHL_EDIT_FIELDS:
+                abort(400)
+            fields[field] = str(payload.get("value", "") or "").strip()
+        clear = [f for f in (payload.get("clear_fields") or []) if f in _WHL_EDIT_FIELDS]
+        if not fields and not clear:
+            abort(400)
         try:
-            j = -int(payload["remove_added"]) - 1
+            idx = int(payload.get("idx"))
         except (TypeError, ValueError):
             abort(400)
-        added = corr.get("added") or []
-        if not (0 <= j < len(added)):
-            abort(404)
-        added.pop(j)
+        if idx >= 0:
+            if idx >= len(_load_whl_base()):
+                abort(404)
+            edits = corr.setdefault("edits", {}).setdefault(str(idx), {})
+            edits.update(fields)
+            for f in clear:  # drop the correction entirely -> CSV value shows again
+                edits.pop(f, None)
+            if not edits:
+                corr["edits"].pop(str(idx), None)
+        else:
+            added = corr.get("added") or []
+            j = -idx - 1
+            if j >= len(added):
+                abort(404)
+            added[j].update(fields)
+            for f in clear:
+                added[j][f] = ""
         lib.save_json(WHL_CORRECTIONS_PATH, corr)
-        return jsonify({"ok": True})
-
-    fields = {f: str(v or "").strip() for f, v in (payload.get("fields") or {}).items()
-              if f in _WHL_EDIT_FIELDS}
-    if "field" in payload:
-        field = str(payload.get("field", "") or "")
-        if field not in _WHL_EDIT_FIELDS:
-            abort(400)
-        fields[field] = str(payload.get("value", "") or "").strip()
-    clear = [f for f in (payload.get("clear_fields") or []) if f in _WHL_EDIT_FIELDS]
-    if not fields and not clear:
-        abort(400)
-    try:
-        idx = int(payload.get("idx"))
-    except (TypeError, ValueError):
-        abort(400)
-    if idx >= 0:
-        if idx >= len(_load_whl_base()):
-            abort(404)
-        edits = corr.setdefault("edits", {}).setdefault(str(idx), {})
-        edits.update(fields)
-        for f in clear:  # drop the correction entirely -> CSV value shows again
-            edits.pop(f, None)
-        if not edits:
-            corr["edits"].pop(str(idx), None)
-    else:
-        added = corr.get("added") or []
-        j = -idx - 1
-        if j >= len(added):
-            abort(404)
-        added[j].update(fields)
-        for f in clear:
-            added[j][f] = ""
-    lib.save_json(WHL_CORRECTIONS_PATH, corr)
     return jsonify({"ok": True})
 
 
@@ -4743,12 +4804,13 @@ def _save_analyze_summary(bid: str, text: str) -> None:
     """
     summary = str(text or "").strip()
     _write_entry_text(bid, "summary.md", summary + ("\n" if summary else ""))
-    builds = lib.load_json(BUILDS_PATH, {})
-    if bid not in builds:
-        return
-    builds[bid]["description"] = summary
-    builds[bid]["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    lib.save_json(BUILDS_PATH, builds)
+    with _builds_lock:
+        builds = lib.load_json(BUILDS_PATH, {})
+        if bid not in builds:
+            return
+        builds[bid]["description"] = summary
+        builds[bid]["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        lib.save_json(BUILDS_PATH, builds)
 
 
 def _save_analyze_about(bid: str, text: str) -> None:
@@ -5431,7 +5493,6 @@ def api_analyze_relevance():
 # the reader never needs to know which was used.
 
 _publish_lock = threading.Lock()
-_builds_lock = threading.Lock()      # whl_builds.json is read-modify-written
 _publish: dict = {"running": False, "build": "", "stage": "idle", "sent": 0,
                   "total": 0, "error": "", "url": "", "slug": ""}
 
@@ -6205,7 +6266,9 @@ def _cloud_sync_run() -> dict:
             # the working stores that left git in 87a9bf2 (two-way, per record;
             # store_sync guards against an emptier side clobbering a fuller one)
             stores = store_sync.sync_stores(owner_cfg, locks={
-                "builds": _builds_lock, "ia_catalog": _ia_catalog_lock})
+                "builds": _builds_lock, "ia_catalog": _ia_catalog_lock,
+                "corrections": _corrections_lock,
+                "taxonomy": _categories_lock})
             for name, res in stores.items():
                 if res.get("error"):
                     errors.append(f"{name}: {res['error']}")
@@ -6343,25 +6406,27 @@ def _migrate_stored_paths() -> None:
     """One-time (idempotent) migration: absolute pdf_file / local_pdf paths
     stored under the data root become relative, making existing user data
     portable across relocations."""
-    builds = lib.load_json(BUILDS_PATH, {})
-    changed = False
-    for b in builds.values():
-        rel = _relativize_data_path(b.get("pdf_file", ""))
-        if rel != (b.get("pdf_file") or ""):
-            b["pdf_file"] = rel
-            changed = True
-    if changed:
-        lib.save_json(BUILDS_PATH, builds)
+    with _builds_lock:
+        builds = lib.load_json(BUILDS_PATH, {})
+        changed = False
+        for b in builds.values():
+            rel = _relativize_data_path(b.get("pdf_file", ""))
+            if rel != (b.get("pdf_file") or ""):
+                b["pdf_file"] = rel
+                changed = True
+        if changed:
+            lib.save_json(BUILDS_PATH, builds)
 
-    entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
-    changed = False
-    for e in entries.values():
-        rel = _relativize_data_path(e.get("local_pdf", ""))
-        if rel != (e.get("local_pdf") or ""):
-            e["local_pdf"] = rel
-            changed = True
-    if changed:
-        lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+    with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+        changed = False
+        for e in entries.values():
+            rel = _relativize_data_path(e.get("local_pdf", ""))
+            if rel != (e.get("local_pdf") or ""):
+                e["local_pdf"] = rel
+                changed = True
+        if changed:
+            lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
 
 
 # --- LAN capture (offline phone -> desktop, bypassing the cloud) --------------

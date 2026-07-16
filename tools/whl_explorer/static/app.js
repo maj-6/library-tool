@@ -10840,7 +10840,10 @@ function buildSeedFromSource(s) {
   };
 }
 
+let buildPatchConflict = false;  // last patch came back 409 (record reloaded)
+
 async function patchBuildRaw(id, fields, quiet) {
+  buildPatchConflict = false;
   const res = await fetch(`/api/builds/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
@@ -10853,6 +10856,12 @@ async function patchBuildRaw(id, fields, quiet) {
     // and wipe unsaved field edits
     if (!quiet) renderUpload();
     return true;
+  }
+  if (res.status === 409 && data.build) {
+    // another writer (analysis, sync) got there first: adopt its record
+    buildPatchConflict = true;
+    state.builds[id] = data.build;
+    renderUpload();
   }
   return false;
 }
@@ -10893,6 +10902,9 @@ async function saveBuildFields(ev) {
   const cur = currentBuild();
   if (cur && cur.ocr_active) fields.ocr_verified = cur.ocr_active;
   if (!fields.title) { el("build-msg").textContent = "Title is required"; return false; }
+  // optimistic concurrency: a save over a record another writer already
+  // bumped comes back 409 and reloads instead of clobbering it
+  fields.expect_updated_at = (state.builds[id] || {}).updated_at || "";
   if (await patchBuild(id, fields, `edit build ${fields.title.slice(0, 30)}`)) {
     descState.id = id;
     descState.val = fields.description;
@@ -10901,7 +10913,8 @@ async function saveBuildFields(ev) {
     status(`BUILD SAVED :: ${fields.title}`);
     return true;
   } else {
-    el("build-msg").textContent = "Save failed";
+    el("build-msg").textContent = buildPatchConflict
+      ? "changed elsewhere — reloaded" : "Save failed";
     return false;
   }
 }
