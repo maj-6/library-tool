@@ -33,6 +33,25 @@ function rest(path) {
   });
 }
 
+// PostgREST stored functions: POST /rest/v1/rpc/<name> with the arguments as
+// the JSON body, same anon credentials as rest(). Failures surface as
+// exceptions -- callers that can degrade (the reader's search) catch and
+// fall back rather than letting one missing function break the page.
+function rpc(name, params) {
+  return fetch(`${CFG.supabaseUrl.replace(/\/$/, "")}/rest/v1/rpc/${name}`, {
+    method: "POST",
+    headers: {
+      apikey: CFG.supabaseAnonKey,
+      Authorization: `Bearer ${CFG.supabaseAnonKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(params),
+  }).then((r) => {
+    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+    return r.json();
+  });
+}
+
 // A tiny fixture loader/cache. Each fixture file is fetched at most once.
 const _fx = {};
 async function fixture(name = "volumes") {
@@ -201,6 +220,20 @@ export async function getAllPages(slug, lang = "") {
     if (rows.length < limit) break;
   }
   return out;
+}
+
+/** Ranked in-book search in one round-trip: the search_volume RPC (Postgres
+ *  FTS with a trigram fallback over the published search layer) returns
+ *  [{page, rank, snippet}], the snippet carrying «...» around each match --
+ *  see rpcSnippetHtml in textsearch.js. Cloud only: fixture mode has no
+ *  database, and a live project still behind on
+ *  docs/cloud/migrations/003_page_search.sql answers 404 -- the reader
+ *  catches either and falls back to the client-side search path. */
+export async function searchVolume(slug, q, lang = "") {
+  if (!usingCloud) throw new Error("no cloud configured");
+  const rows = await rpc("search_volume",
+    { p_slug: slug, p_query: q, p_lang: lang });
+  return Array.isArray(rows) ? rows : [];
 }
 
 /** The light rows the browse page needs to build its facets client-side:

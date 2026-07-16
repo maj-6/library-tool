@@ -11,10 +11,7 @@ const websiteTextsearch = fs.readFileSync(
 
 function searchApi() {
   const context = vm.createContext({});
-  const source = websiteTextsearch
-    .replace("export function normalizeSearchText", "function normalizeSearchText")
-    .replace("export function findMatchRanges", "function findMatchRanges")
-    .replace("export function searchPages", "function searchPages");
+  const source = websiteTextsearch.replace(/^export function /gm, "function ");
   vm.runInContext(
     `${source}\nthis.api = { normalizeSearchText, findMatchRanges, searchPages };`,
     context,

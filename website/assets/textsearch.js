@@ -146,3 +146,41 @@ export function searchPages(pages, query) {
   }
   return hits;
 }
+
+// ---- ranked cloud search (issue #139) --------------------------------------
+// The search_volume RPC returns [{page, rank, snippet}], the snippet being
+// ts_headline output with guillemet markers («match») around each hit. These
+// two helpers are the client's half of that contract; they live here, with
+// the rest of the search logic, so node can test them without a DOM.
+
+const escapeHtml = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+/** A ts_headline snippet as safe HTML: every segment is escaped FIRST, then
+ *  complete «...» pairs become <mark>...</mark>. Leftover markers -- an
+ *  unpaired «, a stray », guillemets quoted in the page text itself -- are
+ *  stripped, so nothing the database sends can pose as a marker or as HTML. */
+export function rpcSnippetHtml(snippet) {
+  const s = String(snippet || "");
+  const clean = (t) => escapeHtml(t).replace(/[«»]/g, "");
+  let html = "";
+  let at = 0;
+  for (;;) {
+    const open = s.indexOf("«", at);
+    const close = open === -1 ? -1 : s.indexOf("»", open + 1);
+    if (close === -1) break;
+    html += `${clean(s.slice(at, open))}<mark>${clean(s.slice(open + 1, close))}</mark>`;
+    at = close + 1;
+  }
+  return html + clean(s.slice(at));
+}
+
+/** The fallback decision: does an RPC response settle the search? Anything
+ *  else -- an error (the reader passes null), an empty result, malformed
+ *  rows -- falls back to the client-side path, whose folding may still
+ *  match what full text did not. */
+export function rpcHitsUsable(rows) {
+  return Array.isArray(rows) && rows.length > 0 &&
+    rows.every((r) => r && Number.isInteger(r.page) && r.page > 0 &&
+      typeof r.snippet === "string");
+}
