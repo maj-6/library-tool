@@ -5,7 +5,7 @@ whl_corrections.json and output/entries/ from version control on the promise
 that they would sync through the cloud instead; this module is that channel.
 
 The three JSON stores sync record-by-record against their Supabase tables
-(builds / ia_catalog / corrections — see docs/cloud/schema.sql), merged by
+(builds / ia_catalog / corrections — see docs/cloud/migrations/), merged by
 last-write-wins on updated_at. A local SHADOW LEDGER (output/cloud_shadow.json,
 what the cloud looked like after the last sync) is what tells "deleted here"
 apart from "added there", so no UI endpoint needs delete hooks. Deletes

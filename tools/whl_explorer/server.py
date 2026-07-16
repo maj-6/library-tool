@@ -5883,7 +5883,7 @@ def _publish_run(bid: str, actor: str) -> None:
             try:
                 sbase.upsert_volume(cloud, row)
             except sbase.SyncError as exc:
-                # A live project that hasn't re-run schema.sql lacks the new
+                # A live project behind on docs/cloud/migrations lacks the new
                 # columns; the book still deserves to publish.
                 missing = ("category_paths", "assets", "thumbnail_url", "thumbnail_path",
                            "volume", "group_id")
@@ -5894,7 +5894,7 @@ def _publish_run(bid: str, actor: str) -> None:
                     row.pop(k, None)
                 sbase.upsert_volume(cloud, row)
                 log.warning("optional volumes metadata is missing on the cloud "
-                            "project — re-run docs/cloud/schema.sql")
+                            "project — apply the pending docs/cloud/migrations")
         except Exception:
             _unpublish_object(cloud, slug, path)
             for name_i, path_i in extras:
@@ -5915,7 +5915,7 @@ def _publish_run(bid: str, actor: str) -> None:
                        ("volume_texts", "volume_pages", "volume_notes")):
                 raise
             log.warning("artifact tables missing on the cloud project — "
-                        "re-run docs/cloud/schema.sql (%s)", exc)
+                        "apply the pending docs/cloud/migrations (%s)", exc)
 
         # re-read: the upload took minutes, and another writer may have touched
         # builds meanwhile. Only this build's fields are ours to change.
