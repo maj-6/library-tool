@@ -3596,6 +3596,20 @@ button.publish-tree-label { cursor: pointer; }
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
+/* manifest staleness: same amber whisper as the translations pane */
+.artifact-stale {
+  font-size: 9px;
+  color: var(--amber);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-left: 4px;
+}
+.an-stale-note {
+  font-family: var(--ui);
+  font-size: 10px;
+  color: var(--amber);
+  margin: 3px 0 5px;
+}
 .an-note {
   border: 1px solid var(--canvas-line);
   border-left: 3px solid var(--face-sh2);

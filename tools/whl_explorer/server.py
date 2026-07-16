@@ -1563,6 +1563,181 @@ def _entry_primary_pdf(build_id: str) -> str:
     return ""
 
 
+# --- artifact provenance: output/entries/<bid>/manifest.json ---------------------
+# One row per derived artifact — content hash, producer, and the input hashes
+# recorded at job completion (docs/search-design.md D4). Staleness is a hash
+# comparison against the inputs as they stand now; artifacts that predate the
+# manifest have no row and report stale=None everywhere.
+
+_manifest_lock = threading.Lock()
+# Above this size (scan PDFs) size+mtime stand in for the content hash:
+# hashing a 130 MB scan on every folder listing is not acceptable, and
+# staleness for the text artifacts is the point.
+_MANIFEST_HASH_CAP = 32 << 20
+
+
+def _manifest_path(build_id: str) -> Path:
+    return _entry_dir(build_id) / "manifest.json"
+
+
+def _load_manifest(build_id: str) -> dict:
+    doc = lib.load_json(_manifest_path(build_id), None)
+    if not isinstance(doc, dict) or not isinstance(doc.get("artifacts"), dict):
+        return {"version": 1, "artifacts": {}}
+    return doc
+
+
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _artifact_fingerprint(path: Path) -> dict | None:
+    """{sha256} of the file bytes, {size, mtime} above the cap, None if
+    unreadable."""
+    try:
+        st = path.stat()
+        if st.st_size > _MANIFEST_HASH_CAP:
+            return {"size": st.st_size, "mtime": st.st_mtime}
+        return {"sha256": _file_sha256(path)}
+    except OSError:
+        return None
+
+
+def _manifest_input(build_id: str, rel: str, path: Path | None = None) -> dict:
+    """An input ref fingerprinted as it reads NOW — call at job start, not
+    completion. `rel` is entry-relative; an external file (a source PDF)
+    passes `path` and keeps a data-root-relative copy for re-fingerprinting."""
+    ref = {"artifact": rel}
+    if path is None:
+        path = _entry_dir(build_id) / rel
+    else:
+        try:
+            ref["path"] = path.resolve().relative_to(
+                lib.DATA_ROOT.resolve()).as_posix()
+        except (OSError, ValueError):
+            ref["path"] = str(path)
+    ref.update(_artifact_fingerprint(path) or {})
+    return ref
+
+
+def _manifest_record(build_id: str, rel: str, produced_by: dict,
+                     inputs: list[dict] | None = None) -> None:
+    """Upsert one artifact's provenance row, hashing the file as it stands
+    on disk. inputs=None keeps the row's recorded inputs (a manual edit
+    changes the content, not what it was derived from)."""
+    fp = _artifact_fingerprint(_entry_dir(build_id) / rel)
+    if fp is None:
+        return
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    def upsert(doc):
+        doc.setdefault("version", 1)
+        arts = doc.setdefault("artifacts", {})
+        old = arts.get(rel) if isinstance(arts.get(rel), dict) else {}
+        row = dict(fp)
+        row["produced_by"] = dict(produced_by)
+        row["inputs"] = ([dict(i) for i in inputs] if inputs is not None
+                         else list(old.get("inputs") or []))
+        row["created_at"] = old.get("created_at") or now
+        row["updated_at"] = now
+        arts[rel] = row
+
+    _mutate_json(_manifest_path(build_id), _manifest_lock,
+                 {"version": 1, "artifacts": {}}, upsert)
+
+
+def _manifest_input_current(build_id: str, ref: dict, cache: dict) -> dict | None:
+    """The input's fingerprint as it stands now, memoized per request so a
+    folder listing hashes each input once however many artifacts share it."""
+    p = str(ref.get("path") or "")
+    path = _resolve_local(p) if p else \
+        _entry_dir(build_id) / str(ref.get("artifact") or "")
+    if path is None:
+        return None
+    key = str(path)
+    if key not in cache:
+        cache[key] = _artifact_fingerprint(path)
+    return cache[key]
+
+
+def _manifest_inputs_stale(build_id: str, rel: str, doc: dict | None = None,
+                           cache: dict | None = None) -> list[str] | None:
+    """Names of `rel`'s inputs whose content changed since it was produced;
+    None = no manifest row (legacy artifact, staleness unknowable)."""
+    row = ((doc if doc is not None else _load_manifest(build_id))
+           .get("artifacts") or {}).get(rel)
+    if not isinstance(row, dict):
+        return None
+    if cache is None:
+        cache = {}
+    out = []
+    for ref in row.get("inputs") or []:
+        if not isinstance(ref, dict):
+            continue
+        cur = _manifest_input_current(build_id, ref, cache)
+        if cur is None:
+            continue          # input gone: unknowable, never "stale"
+        if ref.get("sha256") and cur.get("sha256"):
+            changed = ref["sha256"] != cur["sha256"]
+        elif "size" in ref and "size" in cur:
+            changed = ((ref.get("size"), ref.get("mtime"))
+                       != (cur.get("size"), cur.get("mtime")))
+        else:
+            changed = True    # crossed the hash cap: the size class changed
+        if changed:
+            out.append(str(ref.get("artifact") or ""))
+    return out
+
+
+def _manifest_after_renumber(build_id: str, edited: list[str],
+                             moved: list[str]) -> None:
+    """A page deletion rewrites the PDF and renumbers its OCR docs, layout
+    and translations in one lockstep pass: refresh those rows' fingerprints
+    AND their recorded input hashes so they stay current with each other,
+    while artifacts outside the pass (summary, analysis, annotations) keep
+    their recorded hashes and honestly go stale. The renumber itself is a
+    manual edit of the OCR doc + layout (`edited`); `moved` rows keep their
+    producer."""
+    if not _manifest_path(build_id).is_file():
+        return                # legacy entry: stay silent, create nothing
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    def apply(doc):
+        arts = doc.get("artifacts")
+        if not isinstance(arts, dict):
+            return
+        cache: dict = {}
+        for rel in edited + moved:
+            row = arts.get(rel)
+            if not isinstance(row, dict):
+                continue
+            fp = _artifact_fingerprint(_entry_dir(build_id) / rel)
+            if fp is None:
+                continue
+            for k in ("sha256", "size", "mtime"):
+                row.pop(k, None)
+            row.update(fp)
+            if rel in edited:
+                row["produced_by"] = {"kind": "manual-edit"}
+            for ref in row.get("inputs") or []:
+                if not isinstance(ref, dict):
+                    continue
+                cur = _manifest_input_current(build_id, ref, cache)
+                if cur is None:
+                    continue
+                for k in ("sha256", "size", "mtime"):
+                    ref.pop(k, None)
+                ref.update(cur)
+            row["updated_at"] = now
+
+    _mutate_json(_manifest_path(build_id), _manifest_lock,
+                 {"version": 1, "artifacts": {}}, apply)
+
+
 def _ocr_extracted_images(build_id: str) -> list[dict]:
     """Figures an OCR service (Mistral) cut out of a page: [{name, page,
     size}], cross-referencing ocr/layout.json's bbox map against the actual
@@ -1615,26 +1790,41 @@ def _entry_folder_info(build_id: str, build: dict | None = None) -> dict:
     d = _entry_dir(build_id)
     if build is None:
         build = lib.load_json(BUILDS_PATH, {}).get(build_id) or {}
+    manifest = _load_manifest(build_id)
+    fp_cache: dict = {}       # inputs hash once per folder call, not per row
+
+    def prov(rel: str) -> dict:
+        """{stale, produced_by} for one artifact; stale=None = no row."""
+        row = (manifest.get("artifacts") or {}).get(rel)
+        if not isinstance(row, dict):
+            return {"stale": None, "produced_by": None}
+        stale = _manifest_inputs_stale(build_id, rel, manifest, fp_cache)
+        return {"stale": bool(stale),
+                "produced_by": row.get("produced_by") or {}}
+
     ocr = []
     if (d / "ocr").is_dir():
         srcmap = _ocr_sources(build_id)
         for f in sorted((d / "ocr").glob("*.txt")):
-            ocr.append({"name": f.name, "size": f.stat().st_size,
-                        "src": srcmap.get(f.name) or "primary"})
+            ocr.append(dict({"name": f.name, "size": f.stat().st_size,
+                             "src": srcmap.get(f.name) or "primary"},
+                            **prov(f"ocr/{f.name}")))
 
     full_text = []
     root_text = d / "full_text.txt"
     if root_text.is_file():
-        full_text.append({"name": root_text.name,
-                          "artifact": root_text.name,
-                          "size": root_text.stat().st_size})
+        full_text.append(dict({"name": root_text.name,
+                               "artifact": root_text.name,
+                               "size": root_text.stat().st_size},
+                              **prov(root_text.name)))
     full_text_dir = d / "full_text"
     if full_text_dir.is_dir():
         for f in sorted(full_text_dir.iterdir()):
             if f.is_file() and f.suffix.lower() in (".txt", ".md"):
-                full_text.append({"name": f.name,
-                                  "artifact": f"full_text/{f.name}",
-                                  "size": f.stat().st_size})
+                full_text.append(dict({"name": f.name,
+                                       "artifact": f"full_text/{f.name}",
+                                       "size": f.stat().st_size},
+                                      **prov(f"full_text/{f.name}")))
 
     translations = []
     translations_dir = d / "translations"
@@ -1643,20 +1833,24 @@ def _entry_folder_info(build_id: str, build: dict | None = None) -> dict:
         for f in sorted(translations_dir.glob("*.txt")):
             text = f.read_text(encoding="utf-8", errors="replace")
             markers = page_mark.findall(text)
-            translations.append({"name": f.name, "lang": f.stem,
-                                 "pages": len(markers) or (1 if text.strip() else 0),
-                                 "size": f.stat().st_size})
+            translations.append(dict(
+                {"name": f.name, "lang": f.stem,
+                 "pages": len(markers) or (1 if text.strip() else 0),
+                 "size": f.stat().st_size},
+                **prov(f"translations/{f.name}")))
 
     analysis = []
     analysis_dir = d / "analysis"
     if analysis_dir.is_dir():
         for f in sorted(analysis_dir.glob("*.md")):
-            analysis.append({"name": f.name, "size": f.stat().st_size})
+            analysis.append(dict({"name": f.name, "size": f.stat().st_size},
+                                 **prov(f"analysis/{f.name}")))
 
     def text_artifact(name: str) -> dict:
         f = d / name
-        return {"exists": f.is_file(),
-                "size": f.stat().st_size if f.is_file() else 0}
+        return dict({"exists": f.is_file(),
+                     "size": f.stat().st_size if f.is_file() else 0},
+                    **prov(name))
 
     primary = _entry_primary_pdf(build_id)
     return {"exists": d.is_dir(), "path": str(d), "ocr": ocr,
@@ -1762,6 +1956,11 @@ def api_build_text_artifact(build_id: str, kind: str, name: str):
         candidate = allowed_root / name
     elif kind == "analysis":
         allowed_root = (entry / "analysis").resolve()
+        candidate = allowed_root / name
+    elif kind == "verbatim":
+        # the pre-correction OCR reading, snapshotted by api_build_ocr_put;
+        # read-only by construction — nothing writes here after the snapshot
+        allowed_root = (entry / "ocr" / "verbatim").resolve()
         candidate = allowed_root / name
     else:
         abort(404)
@@ -1950,12 +2149,23 @@ def api_build_ocr_put(build_id: str):
     name = _ocr_name(p.get("name") or "")
     d = _entry_dir(build_id) / "ocr"
     d.mkdir(parents=True, exist_ok=True)
-    (d / name).write_text(str(p.get("text") or ""),
-                          encoding="utf-8", errors="replace")
+    target = d / name
+    # the verbatim layer: snapshot the reading being overwritten ONCE, before
+    # the first manual correction, and never update it after (D4/D8 — the
+    # pre-correction reading must stay recoverable)
+    if target.is_file():
+        verbatim = d / "verbatim" / name
+        if not verbatim.is_file():
+            import shutil
+            verbatim.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(target, verbatim)
+    target.write_text(str(p.get("text") or ""),
+                      encoding="utf-8", errors="replace")
     if "src" in p:
         src_key = _valid_src_key(builds[build_id], p.get("src"))
         if src_key:
             _ocr_set_source(build_id, name, src_key)
+    _manifest_record(build_id, f"ocr/{name}", {"kind": "manual-edit"})
     _revalidate_note_anchors(build_id, builds[build_id], name)
     return jsonify({"ok": True, "name": name,
                     "folder": _entry_folder_info(build_id)})
@@ -2989,6 +3199,20 @@ def _ocr_job_run(job_id: str) -> None:
                       job["build_id"], n, svc, detail, exc_info=True)
         job["done"] += 1
         _job_checkpoint(job)
+    # provenance at job completion (cancelled-partial included): the compiled
+    # doc and its layout sidecar came from THIS source PDF via these engines
+    engines = sorted({i["service"] for i in job["pages"]
+                      if i["status"] == "ok"})
+    if engines:
+        produced = {"kind": "ocr", "engine": ", ".join(engines)}
+        src_ref = [_manifest_input(
+            job["build_id"], f"pdf:{job.get('src_key') or 'primary'}",
+            path=pdf)]
+        _manifest_record(job["build_id"], f"ocr/{_ocr_name(job['target'])}",
+                         produced, src_ref)
+        if (_entry_dir(job["build_id"]) / "ocr" / "layout.json").is_file():
+            _manifest_record(job["build_id"], "ocr/layout.json",
+                             produced, src_ref)
     if job.get("cancel_requested") or _job_cancelled(job):
         # Covers a request received while the final page was processing.
         for pending in job["pages"]:
@@ -3200,11 +3424,13 @@ def _renumber_layout_words(build_id: str, src_key: str, removed: list[int]) -> N
 
 
 def _renumber_translation_artifacts(build_id: str, src_key: str,
-                                    removed: list[int]) -> None:
-    """Keep translated text and its source-hash sidecars page-aligned."""
+                                    removed: list[int]) -> list[str]:
+    """Keep translated text and its source-hash sidecars page-aligned.
+    Returns the entry-relative paths of the renumbered translations."""
     d = _entry_dir(build_id) / "translations"
+    renumbered: list[str] = []
     if not d.is_dir():
-        return
+        return renumbered
     srcmap = _ocr_sources(build_id)
     removed_set = set(removed)
     with _an_write_lock:
@@ -3216,6 +3442,7 @@ def _renumber_translation_artifacts(build_id: str, src_key: str,
             source_key = srcmap.get(source_doc) or "primary"
             if source_key != src_key:
                 continue
+            renumbered.append(f"translations/{text_path.name}")
 
             raw = text_path.read_text(encoding="utf-8", errors="replace")
             text_path.with_name(text_path.name + ".bak").write_text(
@@ -3240,6 +3467,7 @@ def _renumber_translation_artifacts(build_id: str, src_key: str,
                 remapped[str(n - sum(1 for r in removed if r < n))] = rec
             meta["pages"] = remapped
             lib.save_json(meta_path, meta)
+    return renumbered
 
 
 def _renumber_marked_text(text: str, removed: list[int]) -> str:
@@ -3379,7 +3607,10 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
     # Translations use the same page-marker convention, and their provenance
     # sidecars key each source hash by page. Move both in one protected pass so
     # stale detection and eventual publication never retain an obsolete tail.
-    _renumber_translation_artifacts(build_id, src_key, pages)
+    moved = _renumber_translation_artifacts(build_id, src_key, pages)
+    _manifest_after_renumber(
+        build_id, [f"ocr/{n}" for n in renumbered] + ["ocr/layout.json"],
+        moved)
     # title pages are counted on the PRIMARY PDF; a secondary's deletions
     # don't move them
     titles = [] if src_key != "primary" else \
@@ -5403,6 +5634,7 @@ def api_build_about(bid: str):
     payload = request.get_json(silent=True) or {}
     with _an_write_lock:
         _save_analyze_about(bid, str(payload.get("text") or ""))
+    _manifest_record(bid, "about.md", {"kind": "manual-edit"})
     return jsonify({"ok": True})
 
 
@@ -5441,6 +5673,9 @@ def api_build_annotations(bid: str):
                     n["kind"] = str(upd["kind"] or "").strip()[:24]
                 n["updated_at"] = now
         lib.save_json(_entry_dir(bid) / "annotations.json", doc)
+    # curation changed the content by hand; the recorded inputs (the OCR doc
+    # the notes anchor to) are kept so staleness stays judgeable
+    _manifest_record(bid, "annotations.json", {"kind": "manual-edit"})
     return jsonify({"ok": True, "doc": doc})
 
 
@@ -5604,6 +5839,7 @@ def api_analyze_pages():
     cfg = _ai_cfg()
     engine = str(p.get("engine") or cfg["model"]).strip()[:100] or cfg["model"]
     meta = _an_meta_line(b)
+    src_input = _manifest_input(bid, f"ocr/{doc_name}")   # hashed at job start
 
     if wanted == list(range(wanted[0], wanted[-1] + 1)):
         page_slug = (str(wanted[0]) if len(wanted) == 1
@@ -5651,6 +5887,9 @@ def api_analyze_pages():
                 _write_entry_text(
                     bid, f"analysis/{job['artifact']}",
                     "\n\n".join(parts).strip() + "\n")
+            _manifest_record(bid, f"analysis/{job['artifact']}",
+                             {"kind": "page-analysis", "model": cfg["model"]},
+                             [src_input])
             activity("analyzed pages", "book", detail=b.get("title", ""))
             _an_finish(job)
         except Exception as exc:
@@ -5683,6 +5922,7 @@ def api_analyze_summarize():
     cfg = _ai_cfg()
     chunks = _an_chunks(pages)
     meta = _an_meta_line(b)
+    src_input = _manifest_input(bid, f"ocr/{name}")   # hashed at job start
 
     def run(job):
         try:
@@ -5720,6 +5960,9 @@ def api_analyze_summarize():
             ])
             with _an_write_lock:
                 _save_analyze_summary(bid, final)
+            _manifest_record(bid, "summary.md",
+                             {"kind": "summarize", "model": cfg["model"]},
+                             [src_input])
             activity("summarized", "book", detail=b.get("title", ""))
             _an_finish(job)
         except Exception as exc:
@@ -5754,6 +5997,9 @@ def api_analyze_about():
                         "exists — pass overwrite to replace it"}), 409
     cfg = _ai_cfg()
     meta = _an_meta_line(b)
+    # the About draft reads the summary, not the OCR doc — staleness chains:
+    # OCR edit -> summary stale -> regenerated summary -> About stale
+    src_input = _manifest_input(bid, "summary.md")
 
     def run(job):
         try:
@@ -5773,6 +6019,9 @@ def api_analyze_about():
             ], temperature=0.4)
             with _an_write_lock:
                 _save_analyze_about(bid, out)
+            _manifest_record(bid, "about.md",
+                             {"kind": "about", "model": cfg["model"]},
+                             [src_input])
             _an_finish(job)
         except Exception as exc:
             _an_finish(job, f"{type(exc).__name__}: {exc}")
@@ -5885,6 +6134,11 @@ def api_analyze_translate():
                             "every page with text is already translated"}), 400
     cfg = _ai_cfg()
     meta = _an_meta_line(b)
+    src_input = _manifest_input(bid, f"ocr/{name}")   # hashed at job start
+    # file-level provenance at job completion; the per-page meta sidecar
+    # stays authoritative for page detail
+    record = lambda: _manifest_record(     # noqa: E731
+        bid, rel, {"kind": "translate", "model": cfg["model"]}, [src_input])
 
     def run(job):
         try:
@@ -5892,6 +6146,8 @@ def api_analyze_translate():
                 if _an_cancel_check(job, f"{job['done'] - job['errors']} of "
                                     f"{len(todo)} pages translated — "
                                     "saved pages kept"):
+                    if job["done"] > job["errors"]:
+                        record()           # partial completion, pages saved
                     return
                 try:
                     out = _ai_chat(cfg, [
@@ -5930,6 +6186,7 @@ def api_analyze_translate():
                         "at": datetime.now(timezone.utc).isoformat(
                             timespec="seconds")}
                     lib.save_json(_translation_meta_path(bid, lang), tm)
+            record()
             activity("translated", "book", n=len(todo) - job["errors"],
                      detail=f"{b.get('title', '')} -> {lang}")
             _an_finish(job)
@@ -5961,6 +6218,10 @@ def api_analyze_annotate():
     cfg = _ai_cfg()
     chunks = _an_chunks(pages, budget=14000)
     meta = _an_meta_line(b)
+    src_input = _manifest_input(bid, f"ocr/{name}")   # hashed at job start
+    record = lambda: _manifest_record(     # noqa: E731
+        bid, "annotations.json",
+        {"kind": "annotate", "model": cfg["model"]}, [src_input])
 
     def run(job):
         try:
@@ -5968,6 +6229,8 @@ def api_analyze_annotate():
             for i, (nums, chunk) in enumerate(chunks):
                 if _an_cancel_check(job, f"{job['done']}/{job['total']} chunks "
                                     "annotated — saved notes kept"):
+                    if added:
+                        record()           # partial completion, notes saved
                     return
                 try:
                     out = _ai_json(cfg, [
@@ -6027,6 +6290,7 @@ def api_analyze_annotate():
                             if (n["page"], n["body"]) not in seen)
                         lib.save_json(_entry_dir(bid) / "annotations.json", doc)
                     added += len(fresh)
+            record()
             activity("annotated", "book", n=added, detail=b.get("title", ""))
             _an_finish(job)
         except Exception as exc:
