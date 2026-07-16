@@ -868,6 +868,16 @@ function actionTargetKey(revert) {
   if (revert.kind === "checked") return "checked:" + revert.key;
   if (revert.kind === "whl") return "whl:" + revert.idx;
   if (String(revert.kind || "").startsWith("manual")) return "manual:" + revert.id;
+  if (revert.kind === "smartbake") {
+    // a single-book bake targets that book; a grown group spans records and
+    // has no single key (scGroupLog clears the tkey when it folds item #2)
+    const it = (revert.items || []).length === 1 ? revert.items[0] : null;
+    if (!it) return "";
+    if (it.kind === "whl") return "whl:" + it.idx;
+    if (it.kind === "checked") return "checked:" + it.key;
+    if (it.kind === "manual-fields") return "manual:" + it.id;
+    if (it.kind === "build-fields") return "build:" + it.id;
+  }
   return "";
 }
 function logAction(label, revert) {
@@ -13951,7 +13961,9 @@ async function loadSmartChecks() {
 }
 
 function scHasPending() {
-  return Object.keys(scChecks).length > 0 || scJobs.size > 0;
+  // records only — a still-running job has nothing to toggle yet, and must
+  // not make TAB stop moving focus
+  return Object.keys(scChecks).length > 0;
 }
 
 // -- targets and their PDFs ---------------------------------------------------
@@ -14000,6 +14012,22 @@ function scProvFields(target, cur) {
 
 // -- the wand -----------------------------------------------------------------
 
+// what/when/how of a pending record, for the wand tooltip — the audit data
+// the server stores is surfaced right where the user decides to bake
+function scProvenanceTip(rec) {
+  const eng = rec.engine || {};
+  const lines = [`Extracted by ${eng.ocr || "?"} + ${eng.extract || "?"}` +
+    (rec.pages_ocred && rec.pages_ocred.length
+      ? ` from PDF page(s) ${rec.pages_ocred.join(", ")}` : "") +
+    (rec.created_at ? ` · ${rec.created_at}` : "")];
+  const extra = Object.entries(rec.extra || {}).slice(0, 4);
+  if (extra.length) {
+    lines.push("Also found: " + extra.map(([k, v]) =>
+      `${k}: ${String(v).slice(0, 40)}`).join(" · "));
+  }
+  return lines.join("\n");
+}
+
 function scWandHtml(target, pdfref, prov) {
   const rec = scChecks[target];
   if (!pdfref && !rec && !scJobs.has(target)) return "";
@@ -14013,11 +14041,13 @@ function scWandHtml(target, pdfref, prov) {
     cls = " sc-ready";
     tip = `Smart check: ${Object.keys(prov).length} field(s) differ — ` +
       "the light-yellow dotted cells are extracted values\n" +
+      scProvenanceTip(rec) + "\n" +
       "TAB compares with the original · SPACE over the row bakes them in\n" +
       "Shift+click dismisses · click re-runs";
   } else if (rec) {
     cls = " sc-match";
     tip = "Smart check: the PDF agrees with this record\n" +
+      scProvenanceTip(rec) + "\n" +
       "Shift+click dismisses · click re-runs";
   }
   return `<span class="sc-wand${cls}" data-sc-run="${esc(target)}"` +
@@ -14037,15 +14067,19 @@ function scDecorateWhlRow(tr, r, mode) {
   const prov = scProvFields(target, (f) => r[f]);
   const wand = scWandHtml(target, pdfref, prov);
   if (wand) {
-    const td = tr.children[10];        // beside the PUB badge
+    // the title cell: the badge columns are width-locked and cannot take it
+    const td = tr.children[1];
     if (td) td.insertAdjacentHTML("beforeend", wand);
   }
   if (!scShow || !prov) return;
   for (const [f, v] of Object.entries(prov)) {
     const td = tr.children[SC_WHL_CELL[f]];
     if (!td) continue;
+    const keep = f === "title" ? td.querySelector(".sc-wand") : null;
     td.textContent = v;
+    if (keep) td.appendChild(keep);
     td.classList.add("sc-prov");
+    td.classList.remove("missing-core");
     td.dataset.tip = "Smart check — original: " +
       (String(r[f] || "").trim() || "(blank)");
   }
@@ -14057,7 +14091,8 @@ function scDecorateCheckedRow(tr, row) {
   const prov = scProvFields(target, (f) => (row.book || {})[f]);
   const wand = scWandHtml(target, pdfref, prov);
   if (wand) {
-    const td = tr.children[1 + BOOK_COLS.length + 3];   // the IA badge cell
+    // the title cell: the badge columns are width-locked and cannot take it
+    const td = tr.children[1];
     if (td) td.insertAdjacentHTML("beforeend", wand);
   }
   if (!scShow || !prov) return;
@@ -14065,8 +14100,11 @@ function scDecorateCheckedRow(tr, row) {
     const i = BOOK_COLS.indexOf(f);
     const td = i >= 0 ? tr.children[1 + i] : null;
     if (!td) continue;
+    const keep = f === "title" ? td.querySelector(".sc-wand") : null;
     td.textContent = v;
+    if (keep) td.appendChild(keep);
     td.classList.add("sc-prov");
+    td.classList.remove("missing-core");
     td.dataset.tip = "Smart check — original: " +
       (String((row.book || {})[f] || "").trim() || "(blank)");
   }
@@ -14086,6 +14124,7 @@ function scClearBuildOverlay() {
     if (!inp || !inp.classList.contains("sc-prov")) continue;
     inp.classList.remove("sc-prov");
     inp.readOnly = false;
+    delete inp.dataset.tip;
     // restore only what we wrote — a re-rendered or re-selected form keeps
     // its own fresh values
     if (saved && saved.id === state.buildSel && inp.value === saved.set[f]) {
@@ -14127,6 +14166,15 @@ function scRerender() {
   if (state.whlRows) renderWhlTop();
   renderChecked();
   scApplyBuildOverlay();
+  // the footer tag is the persistent "provisional data exists" indicator
+  const n = Object.keys(scChecks).length;
+  const foot = el("status-smart");
+  if (foot) {
+    foot.hidden = !n && !scJobs.size;
+    foot.textContent = scJobs.size
+      ? `SMART CHECK: ${scJobs.size} running`
+      : `SMART CHECK: ${n} held (${scShow ? "shown" : "hidden"})`;
+  }
 }
 
 // -- running a check ------------------------------------------------------------
@@ -14178,8 +14226,25 @@ function scEnsurePolling() {
     for (const [target, j] of [...scJobs]) {
       let r;
       try {
-        r = await (await fetch("/api/smartcheck/job/" + j.id)).json();
-      } catch (e) { continue; }
+        const res = await fetch("/api/smartcheck/job/" + j.id);
+        if (res.status === 404) {   // gone from both registries: give up now
+          scJobs.delete(target);
+          statusErr("SMART CHECK LOST :: the server no longer knows this job");
+          scRerender();
+          continue;
+        }
+        r = await res.json();
+        j.bad = 0;
+      } catch (e) {
+        // a restarting/unreachable server: retry a few times, then let go
+        j.bad = (j.bad || 0) + 1;
+        if (j.bad >= 8) {
+          scJobs.delete(target);
+          statusErr("SMART CHECK LOST :: no answer from the server");
+          scRerender();
+        }
+        continue;
+      }
       const state2 = r.state || "";
       if (state2 === "queued" || state2 === "running" || state2 === "cancelling") continue;
       scJobs.delete(target);
@@ -14217,6 +14282,10 @@ async function scWandClick(target, ev) {
     return;
   }
   if (scJobs.has(target)) { status("SMART CHECK :: already running"); return; }
+  // a re-run replaces the held result and spends OCR/AI calls — make sure
+  if (scChecks[target] && state.settings.confirmDiscard !== false &&
+      !window.confirm("Re-run the smart check for this book? " +
+        "The held result will be replaced.")) return;
   const info = scRunInfo(target);
   if (!info || !info.pdfref) {
     statusErr("SMART CHECK :: no reachable PDF for this book");
@@ -14252,8 +14321,14 @@ async function scReplayItem(it) {
     case "checked": {
       const entry = state.checked.get(it.key);
       if (!entry) return false;
+      // mirror the original bake exactly: merged fields invalidate the
+      // stale checks/scans/verify and requeue the scan
       entry.book = Object.assign({}, entry.book, it.after);
       entry.edited = true;
+      entry.checks = null;
+      entry.scans = null;
+      entry.verify = null;
+      queueScan(it.key);
       saveChecked();
       return true;
     }
@@ -14283,6 +14358,7 @@ function scGroupLog(item, label) {
     scGroup.items.push(item);
     last.revert.items = scGroup.items;   // re-link (logAction may have re-parsed)
     last.label = `bake smart check into ${scGroup.items.length} books`;
+    last.tkey = "";   // a grown group spans records; no single conflict key
     saveActionLog();
     const items = scGroup.items;
     top.label = last.label;
@@ -14300,9 +14376,20 @@ function scGroupLog(item, label) {
   scGroup = { opId, ts0: now, items };
 }
 
+let scBaking = false;   // re-entry guard: a held SPACE must not double-bake
+
 async function scBakeTarget(target) {
   const rec = scChecks[target];
-  if (!rec) return false;
+  if (!rec || scBaking) return false;
+  scBaking = true;
+  try {
+    return await scBakeTargetInner(target, rec);
+  } finally {
+    scBaking = false;
+  }
+}
+
+async function scBakeTargetInner(target, rec) {
   const kind = target.split(":")[0];
   const ident = target.slice(kind.length + 1);
   let prov = null;
@@ -14330,11 +14417,16 @@ async function scBakeTarget(target) {
       const before = {};
       for (const f of Object.keys(prov)) before[f] = b[f] || "";
       scClearBuildOverlay();   // the form must not hold overlay values through a patch
-      if (!(await patchBuildRaw(ident, prov))) {
+      // quiet: a full renderUpload/renderBuildEditor would wipe the user's
+      // unsaved edits in OTHER fields — refresh only the inputs we baked
+      if (!(await patchBuildRaw(ident, prov, true))) {
         statusErr("BAKE FAILED"); return false;
       }
+      for (const [f, v] of Object.entries(prov)) {
+        const inp = el("b-" + f);
+        if (inp) inp.value = v;
+      }
       item = { kind: "build-fields", id: ident, before, after: prov };
-      renderBuildEditor();
     }
   } else if (kind === "manual") {
     const entry = state.manual.find((e) => String(e.id) === ident);
@@ -14396,9 +14488,11 @@ function scHoverTarget() {
 }
 
 function onSmartKey(ev) {
-  if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+  if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.repeat) return;
   const t = ev.target;
-  if (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable) return;
+  if (/^(INPUT|TEXTAREA|SELECT|BUTTON|A)$/.test(t.tagName) || t.isContentEditable) return;
+  // never fight a modal (settings, wizard, viewers all use .overlay)
+  if (document.querySelector(".overlay:not([hidden])")) return;
   if (ev.key === "Tab") {
     if (!scHasPending()) return;      // nothing provisional: TAB moves focus
     ev.preventDefault();
@@ -14410,10 +14504,14 @@ function onSmartKey(ev) {
     return;
   }
   if (ev.key === " ") {
-    if (t.tagName === "BUTTON" || t.tagName === "A") return;  // space = click
     const target = scHoverTarget();
     if (!target || !scChecks[target]) return;   // plain space scrolls as usual
     ev.preventDefault();
+    if (!scShow) {
+      // never bake values the user can't see
+      status("SMART CHECK :: extracted values are hidden — TAB shows them first");
+      return;
+    }
     scBakeTarget(target);
   }
 }
@@ -14432,8 +14530,29 @@ function initSmartCheck() {
     }, true);
   }
   el("b-smartcheck").addEventListener("click", (ev) => {
+    // drop focus so SPACE stays the bake key, not a button re-click
+    ev.currentTarget.blur();
     const b = currentBuild();
     if (b) scWandClick("build:" + b.id, ev);
+  });
+  el("status-smart").addEventListener("click", async (ev) => {
+    // Shift+click = dismiss everything held — the escape hatch for records
+    // whose row is gone (an unchecked book has no wand left to click)
+    if (ev.shiftKey) {
+      const targets = Object.keys(scChecks);
+      if (!targets.length) return;
+      if (!window.confirm(`Dismiss all ${targets.length} held smart-check ` +
+        "result(s)? Nothing already baked is affected.")) return;
+      for (const t of targets) {
+        await scResolve(t, "dismissed", {});
+        delete scChecks[t];
+      }
+      scRerender();
+      status("SMART CHECK :: all held results dismissed");
+      return;
+    }
+    scShow = !scShow;
+    scRerender();
   });
 }
 

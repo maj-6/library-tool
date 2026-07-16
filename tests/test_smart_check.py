@@ -232,6 +232,12 @@ def test_smart_check_validation(client, data_root, monkeypatch):
     assert client.post("/api/smartcheck/run", json={
         "target": "whl:notanumber", "pdf": pdf}).status_code == 400
     assert client.post("/api/smartcheck/run", json={
+        "target": "whl:99999999", "pdf": pdf}).status_code == 404
+    assert client.post("/api/smartcheck/run", json={
+        "target": "whl:-99999", "pdf": pdf}).status_code == 404
+    assert client.post("/api/smartcheck/run", json={
+        "target": "checked:noseparator", "pdf": pdf}).status_code == 400
+    assert client.post("/api/smartcheck/run", json={
         "target": f"build:{bid}"}).status_code == 400            # no pdf/url
     assert client.post("/api/smartcheck/run", json={
         "target": f"build:{bid}", "pdf": "missing.pdf"}).status_code == 404
@@ -239,6 +245,40 @@ def test_smart_check_validation(client, data_root, monkeypatch):
         "target": f"build:{bid}", "url": "ftp://x/y.pdf"}).status_code == 400
     assert client.post("/api/smartcheck/resolve", json={
         "target": "whl:1", "action": "shredded"}).status_code == 400
+
+
+def test_smart_check_empty_extraction_fails_the_job(client, data_root,
+                                                    monkeypatch):
+    """A parse failure ({} from the AI) must not file an all-blank record —
+    that would render as 'the PDF agrees with this record'."""
+    _install_inline_sc(monkeypatch)
+    _fake_pipeline(monkeypatch, _TEXTS, ai_reply={})
+    bid = _make_build(client)
+    pdf = _dummy_pdf(data_root)
+    r = client.post("/api/smartcheck/run",
+                    json={"target": f"build:{bid}", "pdf": pdf})
+    job = r.get_json()["job"]
+    assert job["status"] == "error"
+    assert "extraction returned no fields" in job["error"]
+    assert f"build:{bid}" not in client.get("/api/smartcheck").get_json()["pending"]
+
+
+def test_smart_check_orphaned_records_are_retired_on_list(client, data_root,
+                                                          monkeypatch):
+    """Deleting the book must not leave an immortal pending overlay."""
+    _install_inline_sc(monkeypatch)
+    _fake_pipeline(monkeypatch, _TEXTS, _AI_REPLY)
+    bid = _make_build(client)
+    pdf = _dummy_pdf(data_root)
+    client.post("/api/smartcheck/run", json={"target": f"build:{bid}", "pdf": pdf})
+    assert f"build:{bid}" in client.get("/api/smartcheck").get_json()["pending"]
+
+    assert client.delete(f"/api/builds/{bid}").status_code == 200
+    assert f"build:{bid}" not in client.get("/api/smartcheck").get_json()["pending"]
+    doc = json.loads((data_root / "output" / "smart_checks.json")
+                     .read_text(encoding="utf-8"))
+    trail = [x for x in doc["resolved"] if x["target"] == f"build:{bid}"]
+    assert trail and trail[-1]["resolved"]["action"] == "orphaned"
 
 
 def test_smart_check_duplicate_run_joins_the_live_job(client, data_root,
@@ -295,8 +335,10 @@ def test_smart_check_ui_contract():
                    "/api/smartcheck/run", "/api/smartcheck/resolve",
                    'case "smartbake"', "scDecorateWhlRow(tr, r, mode)",
                    "scDecorateCheckedRow(tr, row)", "scApplyBuildOverlay()",
-                   "bake: \"edit\"", "wand:"):
+                   "bake: \"edit\"", "wand:", "scProvenanceTip",
+                   'el("status-smart")'):
         assert needle in app_js, needle
     assert 'id="b-smartcheck"' in html
-    for needle in ("td.sc-prov", ".sc-wand", "sc-pulse"):
+    assert 'id="status-smart"' in html
+    for needle in ("td.sc-prov", ".sc-wand.sc-running", ".sc-wand.sc-ready"):
         assert needle in css, needle

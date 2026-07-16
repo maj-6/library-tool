@@ -1387,7 +1387,8 @@ def _resolve_local(raw: str) -> Path | None:
         return None
 
 
-_remote_pdf_lock = threading.Lock()
+_remote_pdf_lock = threading.Lock()              # guards the per-URL lock map
+_remote_pdf_url_locks: dict[str, threading.Lock] = {}
 
 
 def _remote_pdf_cache(url: str) -> Path:
@@ -1395,18 +1396,23 @@ def _remote_pdf_cache(url: str) -> Path:
     Browsers can't iframe third-party PDFs (X-Frame-Options), so remote
     sources are proxied through here. Raises ValueError on fetch failure.
 
-    Downloads land in a temp file and are renamed into place under a lock:
-    the viewer fires several concurrent requests for the same URL (iframe
-    GET + HEAD size probe + OCR text fetch), and none of them may see a
-    half-written file. A response that isn't a PDF is rejected instead of
-    being cached forever."""
+    Downloads land in a temp file and are renamed into place under a
+    PER-URL lock: the viewer fires several concurrent requests for the same
+    URL (iframe GET + HEAD size probe + OCR text fetch), and none of them
+    may see a half-written file or download it twice — but a long fetch of
+    one book (a background smart check pulling a full scan) must not block
+    every other remote PDF. A response that isn't a PDF is rejected instead
+    of being cached forever."""
     if not url.lower().startswith(("http://", "https://")):
         raise ValueError("not an http(s) URL")
     import hashlib
     cache_dir = lib.DATA_ROOT / "downloads" / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    p = cache_dir / (hashlib.sha1(url.encode("utf-8")).hexdigest()[:16] + ".pdf")
+    name = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16] + ".pdf"
+    p = cache_dir / name
     with _remote_pdf_lock:
+        url_lock = _remote_pdf_url_locks.setdefault(name, threading.Lock())
+    with url_lock:
         if p.exists():
             return p
         tmp = p.with_suffix(".fetch.tmp")
@@ -6412,11 +6418,14 @@ SMART_CHECKS_PATH = lib.OUTPUT_DIR / "smart_checks.json"
 _sc_lock = threading.Lock()          # every smart_checks.json read-modify-write
 _sc_jobs: dict = {}
 _sc_jobs_lock = threading.Lock()
+_sc_start_lock = threading.Lock()    # dedupe-scan + job insert, atomically
 
 _SC_SCAN_CAP = 15        # pages considered from the front (blanks included)
 _SC_OCR_CAP = 8          # pages actually sent to OCR
 _SC_WIDTH = 1400         # render width; the OCR queue's default
 _SC_RESOLVED_KEEP = 400  # audit-trail records kept after bake/dismiss
+_SC_PENDING_CAP = 200    # un-baked overlays kept; oldest are dropped first
+_SC_JOBS_KEEP = 20       # finished entries kept in the per-kind registry
 
 # extraction vocabulary (capture.FIELDS) -> each record store's field names
 _SC_FIELD_MAPS = {
@@ -6567,6 +6576,15 @@ def _sc_finish(job: dict, error: str = "") -> None:
         status = "error" if error else (
             "done (with errors)" if job["errors"] else "done")
     _job_transition(job, status)
+    # drop older finished entries from the per-kind registry — the unified
+    # registry keeps the durable snapshot, and polls fall back to it
+    with _sc_jobs_lock:
+        done = sorted((j for j in _sc_jobs.values()
+                       if j.get("state") not in _JOB_ACTIVE),
+                      key=lambda j: str(j.get("finished_at") or ""),
+                      reverse=True)
+        for old in done[_SC_JOBS_KEEP:]:
+            _sc_jobs.pop(str(old.get("id")), None)
 
 
 def _sc_run(job: dict, spec: dict) -> None:
@@ -6582,8 +6600,13 @@ def _sc_run(job: dict, spec: dict) -> None:
             raise RuntimeError("Mistral API key not configured (Settings > OCR)")
         pdf = spec.get("pdf_path")
         if pdf is None:
-            _job_transition(job, "running", note="downloading PDF")
+            # note only — a transition would clobber a 'cancelling' status
+            with _sc_jobs_lock:
+                job["note"] = "downloading PDF"
+            _job_checkpoint(job, force=True)
             pdf = _remote_pdf_cache(spec["url"])   # ValueError on failure
+            with _sc_jobs_lock:
+                job["note"] = ""
         pdf = Path(pdf)
         candidates = _sc_scan_pages(pdf)
         if not candidates:
@@ -6625,6 +6648,13 @@ def _sc_run(job: dict, spec: dict) -> None:
             return
         got, model = _sc_extract(ocr_text)
         extra = got.pop("extra", {}) or {}
+        # an unparseable/empty AI reply must fail loudly — filing an all-blank
+        # record would render as "the PDF agrees with this record"
+        if not extra and not any(str(v or "").strip() for v in got.values()):
+            raise RuntimeError("extraction returned no fields — the AI reply "
+                               "could not be parsed; try again")
+        if _an_cancel_check(job, "cancelled — nothing was written"):
+            return
         record = {
             "target": target, "kind": kind,
             "label": str(spec.get("label") or ""),
@@ -6638,7 +6668,15 @@ def _sc_run(job: dict, spec: dict) -> None:
                           .isoformat(timespec="seconds"),
             "job_id": job["id"],
         }
-        _sc_mutate(lambda doc: doc["pending"].__setitem__(target, record))
+        def put(doc):
+            pend = doc["pending"]
+            pend[target] = record
+            if len(pend) > _SC_PENDING_CAP:      # oldest overlays age out
+                for k in sorted(pend, key=lambda k: str(
+                        (pend[k] or {}).get("created_at") or ""))[
+                        :len(pend) - _SC_PENDING_CAP]:
+                    pend.pop(k, None)
+        _sc_mutate(put)
         with _sc_jobs_lock:
             job["done"] = job["total"]
         activity("smart-checked", "Book metadata",
@@ -6659,7 +6697,7 @@ def api_smartcheck_run():
     Returns the job to poll; a second request for a book whose check is
     still running returns that same job (``already: true``).
     """
-    p = request.get_json(force=True, silent=True) or {}
+    p = request.get_json(silent=True) or {}
     try:
         kind, ident = _sc_parse_target(p.get("target"))
     except ValueError:
@@ -6679,9 +6717,17 @@ def api_smartcheck_run():
         label = label or str(entry.get("title") or "")
     elif kind == "whl":
         try:
-            int(ident)
+            widx = int(ident)
         except ValueError:
             return jsonify({"ok": False, "error": "bad WHL index"}), 400
+        if widx >= 0 and widx >= len(_load_whl_base()):
+            return jsonify({"ok": False, "error": "unknown WHL row"}), 404
+        if widx < 0:      # negative idx = a row added through corrections
+            corr = lib.load_json(WHL_CORRECTIONS_PATH, {})
+            if -widx > len(corr.get("added") or []):
+                return jsonify({"ok": False, "error": "unknown WHL row"}), 404
+    elif kind == "checked" and ":" not in ident:
+        return jsonify({"ok": False, "error": "bad checked key"}), 400
     raw_pdf = str(p.get("pdf") or "").strip()
     url = str(p.get("url") or "").strip()
     spec = {"target": target, "label": label, "pdf_path": None, "url": url,
@@ -6698,14 +6744,17 @@ def api_smartcheck_run():
         spec["pdf_ref"] = {"url": url}     # fetched on the worker thread
     else:
         return jsonify({"ok": False, "error": "pdf or url required"}), 400
-    # one live job per book — a duplicate click joins the running check
-    with _jobs_lock:
-        for j in _jobs.values():
-            if (j.get("kind") == "smartcheck" and j.get("target") == target
-                    and j.get("state") in _JOB_ACTIVE):
-                return jsonify({"ok": True, "already": True,
-                                "job": dict(_job_public(j), target=target)})
-    job = _sc_job_start(target, label, lambda jb: _sc_run(jb, spec))
+    # one live job per book — a duplicate click joins the running check.
+    # _sc_start_lock makes the scan-then-insert atomic against a concurrent
+    # POST for the same target (the insert re-takes _jobs_lock internally).
+    with _sc_start_lock:
+        with _jobs_lock:
+            for j in _jobs.values():
+                if (j.get("kind") == "smartcheck" and j.get("target") == target
+                        and j.get("state") in _JOB_ACTIVE):
+                    return jsonify({"ok": True, "already": True,
+                                    "job": dict(_job_public(j), target=target)})
+        job = _sc_job_start(target, label, lambda jb: _sc_run(jb, spec))
     return jsonify({"ok": True, "job": dict(job)})
 
 
@@ -6725,10 +6774,40 @@ def api_smartcheck_job(job_id: str):
 
 @app.route("/api/smartcheck")
 def api_smartcheck_list():
-    """Every pending (un-baked) smart-check record, keyed by target."""
-    with _sc_lock:
-        doc = _sc_store_locked()
-    return jsonify({"ok": True, "pending": doc["pending"]})
+    """Every pending (un-baked) smart-check record, keyed by target.
+
+    Records whose build/manual target no longer exists are retired here as
+    ``orphaned`` — a deleted book must not leave an immortal overlay behind
+    (its wand is the only dismiss surface, and it's gone with the row)."""
+    builds = manuals = None
+
+    def prune(doc):
+        nonlocal builds, manuals
+        dead = []
+        for t in doc["pending"]:
+            k, _, ident = str(t).partition(":")
+            if k == "build":
+                if builds is None:
+                    builds = lib.load_json(BUILDS_PATH, {})
+                if ident not in builds:
+                    dead.append(t)
+            elif k == "manual":
+                if manuals is None:
+                    manuals = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+                if ident not in manuals:
+                    dead.append(t)
+        for t in dead:
+            rec = doc["pending"].pop(t)
+            if isinstance(rec, dict):
+                rec["resolved"] = {
+                    "action": "orphaned", "applied": {},
+                    "at": datetime.now(timezone.utc)
+                          .isoformat(timespec="seconds")}
+                doc["resolved"].append(rec)
+        del doc["resolved"][:-_SC_RESOLVED_KEEP]
+        return dict(doc["pending"])
+
+    return jsonify({"ok": True, "pending": _sc_mutate(prune)})
 
 
 @app.route("/api/smartcheck/resolve", methods=["POST"])
@@ -6737,7 +6816,7 @@ def api_smartcheck_resolve():
     through the normal edit endpoints) or ``dismissed``. Retired records move
     to the store's capped ``resolved`` list — the audit trail of what was
     extracted, what was applied, and when."""
-    p = request.get_json(force=True, silent=True) or {}
+    p = request.get_json(silent=True) or {}
     target = str(p.get("target") or "").strip()
     action = str(p.get("action") or "").strip()
     if action not in ("baked", "dismissed"):
