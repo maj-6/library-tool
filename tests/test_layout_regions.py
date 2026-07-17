@@ -402,6 +402,34 @@ def test_clip_words_to_box_and_iou():
     assert layout_roles.template_score(tpl, []) == 0.0
 
 
+def test_compose_text_joins_drop_capitals_into_the_flow():
+    regions = [
+        {"role": "header", "order": 0, "text": "RUNNING HEAD"},
+        {"role": "drop-capital", "order": 1, "text": "O"},
+        {"role": "body", "order": 2, "text": "Liues if they be ripe"},
+        {"role": "body", "order": 3, "text": "second paragraph"},
+    ]
+    # the capital opens its paragraph seamlessly — never its own paragraph
+    assert layout_roles.compose_text(regions) == \
+        "OLiues if they be ripe\n\nsecond paragraph"
+    # a trailing orphan capital still lands rather than vanishing
+    assert layout_roles.compose_text(
+        [{"role": "drop-capital", "order": 0, "text": "Q"}]) == "Q"
+
+
+def test_replica_style_accepts_colors():
+    import server
+    styles = server._rw_sanitize_styles({
+        "page": {"bg": "#fdfcf8", "color": "#1c1a17"},
+        "drop-capital": {"family": "EB Garamond", "color": "#8b1a1a",
+                         "bg": "#f2e2b0"},
+        "body": {"color": "not-a-color", "bg": "#GGGGGG"},
+    })
+    assert styles["page"] == {"bg": "#fdfcf8", "color": "#1c1a17"}
+    assert styles["drop-capital"]["bg"] == "#f2e2b0"
+    assert "color" not in styles.get("body", {})
+
+
 def test_compose_text_norm_layer_falls_back():
     regions = [
         {"role": "body", "order": 0, "text": "Waſſer", "norm": "Wasser"},

@@ -13478,6 +13478,12 @@ async function fillRegionLayout(pane, bid, srcKey, page, docName, still) {
       img.src = `/api/builds/${encodeURIComponent(bid)}` +
         `/ocr/images/${encodeURIComponent(fig[1])}`;
       e.appendChild(img);
+    } else if (it.role === "drop-capital") {
+      // a large capital fills its box — one letter at box height
+      e.style.fontSize = Math.max(8, (box.h || 0) * paneH * 0.9) + "px";
+      e.style.lineHeight = "1";
+      e.style.textAlign = "center";
+      e.textContent = text;
     } else {
       // one type size per block, chosen so its lines roughly fill the box —
       // the block-grain analogue of the word facsimile's per-line sizing
@@ -14817,6 +14823,8 @@ function selectOcrDocument(id) {
 const RW_ROLES = ["body", "marginalia", "header", "footer", "title",
                   "caption", "figure", "page-number", "catch-word",
                   "signature-mark"];
+// letter keys for the roles that outgrew the digits
+const RW_EXTRA_KEYS = { d: "drop-capital", f: "footnote" };
 
 const rwState = {
   book: "", src: "primary", page: 0,
@@ -15326,6 +15334,10 @@ function rwKeyDown(ev) {
     const role = RW_ROLES[(parseInt(ev.key, 10) + 9) % 10];
     for (const id of rwState.sel) { const it = rwItem(id); if (it) it.role = role; }
     rwDirty(); rwRenderOverlay(); rwSyncBar();
+  } else if (RW_EXTRA_KEYS[ev.key.toLowerCase()] && rwState.sel.length) {
+    const role = RW_EXTRA_KEYS[ev.key.toLowerCase()];
+    for (const id of rwState.sel) { const it = rwItem(id); if (it) it.role = role; }
+    rwDirty(); rwRenderOverlay(); rwSyncBar();
   } else if (ev.key === "Delete" || ev.key === "Backspace") {
     if (!rwState.sel.length) return;
     rwState.items = rwState.items.filter((x) => !rwState.sel.includes(x.id));
@@ -15728,6 +15740,10 @@ async function rwRenderPreview() {
   const pane = el("rw-preview");
   pane.innerHTML = "";
   const styles = rwState.styles || {};
+  // the "page" pseudo-role: the proof's paper and ink
+  const pg = styles.page || {};
+  pane.style.background = pg.bg || "#fdfcf8";
+  pane.style.color = pg.color || "#1c1a17";
   const paneW = pane.clientWidth || 500;
   const paneH = pane.clientHeight || paneW * 1.35;
   // the base type size: median content-fit of the body regions, so the
@@ -15759,11 +15775,21 @@ async function rwRenderPreview() {
     } else {
       const st = styles[it.role] || styles.body || {};
       e.style.fontFamily = (st.family ? `"${st.family}", ` : "") + "serif";
-      e.style.fontSize = Math.max(6, base * (st.size_em || 1)) + "px";
-      e.style.lineHeight = String(st.leading || 1.25);
+      if (it.role === "drop-capital") {
+        // an illuminated capital: box-height letter, its own ink and —
+        // when the style sets one — a decorated ground
+        e.style.fontSize = Math.max(8, it.box.h * paneH * 0.9) + "px";
+        e.style.lineHeight = "1";
+        e.style.textAlign = "center";
+      } else {
+        e.style.fontSize = Math.max(6, base * (st.size_em || 1)) + "px";
+        e.style.lineHeight = String(st.leading || 1.25);
+      }
       if (st.style === "italic") e.style.fontStyle = "italic";
       if (st.variant === "small-caps") e.style.fontVariant = "small-caps";
       if (st.align) e.style.textAlign = st.align;
+      if (st.color) e.style.color = st.color;
+      if (st.bg) e.style.background = st.bg;
       e.textContent = texts.get(it.id) || "";
     }
     frag.appendChild(e);
@@ -15776,7 +15802,10 @@ async function rwRenderPreview() {
 function rwStyleRoles() {
   const core = ["body", "marginalia", "title", "header", "caption"];
   const used = new Set(rwState.items.map((i) => i.role));
-  return [...new Set([...core, ...RW_ROLES.filter((r) => used.has(r))])]
+  const all = [...RW_ROLES, ...Object.values(RW_EXTRA_KEYS)];
+  // "page" leads: the proof's paper and ink; then content roles in use
+  return ["page",
+          ...new Set([...core, ...all.filter((r) => used.has(r))])]
     .filter((r) => r !== "figure");
 }
 
@@ -15803,41 +15832,74 @@ function rwRenderStyleboard() {
     const row = document.createElement("div");
     row.className = "rw-stylerow role-" + role;
     row.dataset.role = role;
+    if (role === "page") {
+      // the paper: background + ink only
+      row.innerHTML = `
+        <span class="rw-stylerole">page</span>
+        <span class="rw-st-lab">paper</span>
+        <input type="color" class="rw-st-bg" value="${esc(st.bg || "#fdfcf8")}"
+               data-tip="Facsimile background">
+        <span class="rw-st-lab">ink</span>
+        <input type="color" class="rw-st-color" value="${esc(st.color || "#1c1a17")}"
+               data-tip="Default ink">`;
+      box.appendChild(row);
+      continue;
+    }
+    const caps = role === "drop-capital";
     row.innerHTML = `
       <span class="rw-stylerole">${esc(role)}</span>
       <input class="cad-input rw-st-family" list="rw-fonts" placeholder="serif"
              value="${esc(st.family || "")}" data-tip="Typeface family">
       <input class="cad-input rw-st-size" type="number" step="0.05" min="0.3"
              max="4" value="${st.size_em != null ? st.size_em : 1}"
-             data-tip="Size relative to body">
+             data-tip="Size relative to body"${caps ? " hidden" : ""}>
       <button class="cad-btn tiny rw-st-italic${st.style === "italic" ? " active" : ""}"
               type="button" data-tip="Italic">I</button>
       <button class="cad-btn tiny rw-st-sc${st.variant === "small-caps" ? " active" : ""}"
               type="button" data-tip="Small caps">ᴀ</button>
-      <select class="cad-input rw-st-align" data-tip="Alignment">
+      <select class="cad-input rw-st-align" data-tip="Alignment"${caps ? " hidden" : ""}>
         ${["", "left", "center", "right", "justify"].map((a) =>
           `<option value="${a}"${(st.align || "") === a ? " selected" : ""}>${a || "·"}</option>`).join("")}
-      </select>`;
+      </select>` + (caps ? `
+      <input type="color" class="rw-st-color" value="${esc(st.color || "#8b1a1a")}"
+             data-tip="Capital ink — rubrication red by default">
+      <input type="color" class="rw-st-bg" value="${esc(st.bg || "#f2e2b0")}"
+             data-tip="Illuminated ground — applies once touched">
+      <button class="cad-btn tiny rw-st-bgclear" type="button"
+              data-tip="No ground">×</button>` : "");
     box.appendChild(row);
   }
 }
 
 // read one row back into rwState.styles and re-render the preview live
-function rwStyleRowChanged(row) {
+function rwStyleRowChanged(row, target) {
   if (!rwState.styles) return;   // board is read-only until a sheet loads
   const role = row.dataset.role;
   const styles = rwState.styles;
   const st = styles[role] || (styles[role] = {});
-  const family = row.querySelector(".rw-st-family").value.trim();
-  if (family) st.family = family; else delete st.family;
-  const size = parseFloat(row.querySelector(".rw-st-size").value);
-  if (size >= 0.3 && size <= 4) st.size_em = size;
-  st.style = row.querySelector(".rw-st-italic").classList.contains("active")
-    ? "italic" : "normal";
-  st.variant = row.querySelector(".rw-st-sc").classList.contains("active")
-    ? "small-caps" : "normal";
-  const align = row.querySelector(".rw-st-align").value;
-  if (align) st.align = align; else delete st.align;
+  const familyIn = row.querySelector(".rw-st-family");
+  if (familyIn) {
+    const family = familyIn.value.trim();
+    if (family) st.family = family; else delete st.family;
+    const size = parseFloat(row.querySelector(".rw-st-size").value);
+    if (size >= 0.3 && size <= 4) st.size_em = size;
+    st.style = row.querySelector(".rw-st-italic").classList.contains("active")
+      ? "italic" : "normal";
+    st.variant = row.querySelector(".rw-st-sc").classList.contains("active")
+      ? "small-caps" : "normal";
+    const align = row.querySelector(".rw-st-align").value;
+    if (align) st.align = align; else delete st.align;
+  }
+  const colorIn = row.querySelector(".rw-st-color");
+  if (colorIn && (st.color || role === "page" || target === colorIn)) {
+    st.color = colorIn.value;
+  }
+  const bgIn = row.querySelector(".rw-st-bg");
+  // a ground/background only APPLIES once touched — a color input cannot
+  // say "none", so the swatch's initial value is a suggestion, not a state
+  if (bgIn && (st.bg || role === "page" || target === bgIn)) {
+    st.bg = bgIn.value;
+  }
   rwRenderPreview();
 }
 
@@ -15998,14 +16060,21 @@ function initReplica() {
   });
   el("rw-styleboard").addEventListener("input", (ev) => {
     const row = ev.target.closest(".rw-stylerow");
-    if (row) rwStyleRowChanged(row);
+    if (row) rwStyleRowChanged(row, ev.target);
   });
   el("rw-styleboard").addEventListener("click", (ev) => {
+    const clear = ev.target.closest(".rw-st-bgclear");
+    if (clear) {
+      const row = clear.closest(".rw-stylerow");
+      const st = rwState.styles && rwState.styles[row.dataset.role];
+      if (st) { delete st.bg; rwRenderPreview(); }
+      return;
+    }
     const btn = ev.target.closest(".rw-st-italic, .rw-st-sc");
     if (!btn) return;
     btn.classList.toggle("active");
     const row = ev.target.closest(".rw-stylerow");
-    if (row) rwStyleRowChanged(row);
+    if (row) rwStyleRowChanged(row, btn);
   });
   el("rw-style-save").addEventListener("click", rwStyleSave);
   el("rw-style-reset").addEventListener("click", rwStyleReset);

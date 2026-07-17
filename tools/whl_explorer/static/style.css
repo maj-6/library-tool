@@ -3397,6 +3397,20 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 .role-caption { --rw-c: #3d9e6a; }
 .role-figure { --rw-c: #8a8a8a; }
 .role-page-number, .role-catch-word, .role-signature-mark { --rw-c: #ce7c33; }
+.role-drop-capital { --rw-c: #8b1a1a; }
+.role-footnote { --rw-c: #3a8ea0; }
+.role-page { --rw-c: #777; }
+/* facsimile drop caps render as one box-height letter */
+.ocr-region[data-role="drop-capital"] { overflow: visible; }
+.rw-st-lab { font-size: 9px; color: var(--face-sh2); flex: none; }
+.rw-stylerow input[type="color"] {
+  width: 22px;
+  height: 18px;
+  flex: none;
+  padding: 0;
+  border: 1px solid var(--canvas-line);
+  background: none;
+}
 .rw-region {
   position: absolute;
   border: 1px solid var(--rw-c, #4a7fd4);

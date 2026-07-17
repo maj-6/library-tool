@@ -2675,6 +2675,11 @@ _LIB_STYLESHEET = {
                    "align": "right"},
     "signature-mark": {"family": "EB Garamond", "size_em": 0.85,
                        "align": "center"},
+    # large capitals render at their box height; rubricated red by default —
+    # an illuminated look the style board's color/bg fields can build on
+    "drop-capital": {"family": "EB Garamond", "color": "#8b1a1a"},
+    # the "page" pseudo-role: the facsimile's paper and ink
+    "page": {"bg": "#fdfcf8", "color": "#1c1a17"},
 }
 
 _LIB_META_FIELDS = ("published_slug", "title", "subtitle", "authors", "year",

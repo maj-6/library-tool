@@ -168,8 +168,25 @@ def compose_text(regions: list[dict], layer: str = "text") -> str:
             if v:
                 return v
         return str(r.get("text") or "").strip()
-    parts = [txt(r) for r in sorted(regions, key=lambda r: r.get("order", 0))
-             if r["role"] not in SECONDARY_ROLES and txt(r)]
+    parts = []
+    pending_cap = ""
+    for r in sorted(regions, key=lambda r: r.get("order", 0)):
+        if r["role"] in SECONDARY_ROLES:
+            continue
+        t = txt(r)
+        if not t:
+            continue
+        # a drop capital is the first letter of the paragraph it opens —
+        # it joins the NEXT region's text seamlessly, never stands alone
+        if r["role"] == "drop-capital":
+            pending_cap += t
+            continue
+        if pending_cap:
+            t = pending_cap + t
+            pending_cap = ""
+        parts.append(t)
+    if pending_cap:
+        parts.append(pending_cap)
     return "\n\n".join(parts)
 
 
