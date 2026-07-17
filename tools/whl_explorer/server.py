@@ -587,6 +587,69 @@ def _cloud_events(limit: int) -> list[dict] | None:
     return out
 
 
+# A contributor's real metadata: account age from the profiles row plus the
+# real span of their activity from the shared events table. Both tables open
+# select to any signed-in user (RLS `using (true)`), so no owner credential is
+# involved. Cached briefly per name — the popup can reopen freely. Signed
+# out / offline yields None and the client keeps its feed-derived summary.
+_profile_cache: dict = {}   # display_name -> {"at": float, "data": dict | None}
+
+
+def _cloud_profile(name: str) -> dict | None:
+    cfg = _auth_cfg()
+    ses = _auth_session() if cfg else None
+    if not cfg or not ses:
+        return None
+    now = time.time()
+    hit = _profile_cache.get(name)
+    if hit and now - hit["at"] < (60 if hit["data"] is not None else 30):
+        return hit["data"]
+    if len(_profile_cache) > 200:      # a name is caller-supplied; keep it bounded
+        _profile_cache.clear()
+    tok = ses["access_token"]
+    q = urllib.parse.quote(name, safe="")          # the value only; keep &=/ out
+    data = {"display_name": name, "found": False,
+            "member_since": None, "last_active": None}
+    try:
+        # display_name is not unique; the earliest-created row is the canonical
+        # account (a later namesake can't backdate someone's "member since").
+        prof = sauth.rest(cfg, tok, "GET",
+                          f"profiles?display_name=eq.{q}"
+                          "&select=display_name,created_at"
+                          "&order=created_at.asc&limit=1", timeout=8.0) or []
+        if prof:
+            data["found"] = True
+            data["member_since"] = prof[0].get("created_at")
+        # last activity is one indexed row (no full scan, no count). first-seen
+        # is deliberately not fetched: cloud events only exist for a signed-in
+        # account, which always has a profiles row, so member_since covers it.
+        last = sauth.rest(cfg, tok, "GET",
+            f"events?actor=eq.{q}&select=at&order=at.desc&limit=1", timeout=8.0) or []
+        if last:
+            data["last_active"] = last[0].get("at")
+    except sauth.AuthError as exc:
+        log.warning("profile lookup unavailable: %s", exc)
+        _profile_cache[name] = {"at": now, "data": None}   # back off on failure
+        return None
+    _profile_cache[name] = {"at": now, "data": data}
+    return data
+
+
+@app.route("/api/profile")
+def api_profile():
+    """Real account metadata for one contributor, looked up by the display name
+    the feed shows: when their account was created and the true span of their
+    recorded activity. Cloud-only — signed out / offline returns cloud:false and
+    the client falls back to the activity feed it already holds."""
+    name = str(request.args.get("name") or "").strip()[:60]
+    if not name:
+        return jsonify({"ok": False, "error": "name is required"}), 400
+    data = _cloud_profile(name)
+    if data is None:
+        return jsonify({"ok": True, "cloud": False, "found": False})
+    return jsonify({"ok": True, "cloud": True, **data})
+
+
 # --- review queue ----------------------------------------------------------------
 # An attention mark is a personal flag; a REVIEW is a shared work item raised
 # from the Q popover: visible to every contributor, carrying a comment thread

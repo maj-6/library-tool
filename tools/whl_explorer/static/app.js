@@ -1869,12 +1869,29 @@ function userProfileData(name) {
 }
 
 let _uprofOpener = null;   // the chip clicked, so focus returns there on close
+let _profileName = null;   // whose profile is showing, so a slow /api/profile
+                           // response for a since-closed/replaced popup is dropped
+
+// The one-line stat readout. `srv` is the real account metadata from
+// /api/profile when the cloud can answer; without it we fall back to what the
+// loaded feed holds (clearly recent activity, never dressed up as account age).
+function renderProfileStats(d, srv) {
+  const stats = [d.total ? `${d.total} ${d.total === 1 ? "change" : "changes"}` : "no changes yet"];
+  const srvLast = srv ? Date.parse(srv.last_active || "") : NaN;
+  const lastMs = Math.max(d.last || 0, srvLast || 0);   // fresh local can beat cloud
+  if (lastMs) stats.push(`active ${relTime(lastMs)}`);
+  const since = srv ? Date.parse(srv.member_since || "") : NaN;
+  if (since) stats.push(`member since ${exactTime(since).slice(0, 10)}`);
+  else if (d.first && d.first !== d.last) stats.push(`first seen ${exactTime(d.first).slice(0, 10)}`);
+  el("uprof-stats").textContent = stats.join(" · ");
+}
 
 function openUserProfile(name) {
   const display = String(name == null ? "" : name).trim() || "Unnamed user";
   const d = userProfileData(display);
   const isMe = isSelfName(display);
   if (el("uprof-overlay").hidden) _uprofOpener = document.activeElement;
+  _profileName = display;
 
   el("uprof-avatar").innerHTML = userAvatar(display, "uav-lg");
   el("uprof-name").textContent = display;
@@ -1885,12 +1902,7 @@ function openUserProfile(name) {
     emailEl.hidden = false;
   } else emailEl.hidden = true;
 
-  const stats = [d.total ? `${d.total} ${d.total === 1 ? "change" : "changes"}` : "no changes yet"];
-  if (d.last) stats.push(`active ${relTime(d.last)}`);
-  // earliest activity still in the loaded feed — a local date, labelled plainly
-  // so it never reads as an account-creation date it isn't
-  if (d.first && d.first !== d.last) stats.push(`first seen ${exactTime(d.first).slice(0, 10)}`);
-  el("uprof-stats").textContent = stats.join(" · ");
+  renderProfileStats(d, null);   // instant, from the feed; upgraded below
 
   el("uprof-recent").innerHTML = d.recent.length
     ? d.recent.map((e) => `<div class="uprof-ev">` +
@@ -1901,9 +1913,21 @@ function openUserProfile(name) {
 
   el("uprof-overlay").hidden = false;
   el("uprof-close").focus();
+
+  // Upgrade the stat line with real account metadata (member-since + true
+  // activity span) when the cloud can answer. Fire-and-forget; a stale response
+  // for a popup the user has since closed or replaced is dropped.
+  fetch("/api/profile?name=" + encodeURIComponent(display))
+    .then((r) => r.json())
+    .then((j) => {
+      if (_profileName !== display || el("uprof-overlay").hidden) return;
+      if (j && j.ok && j.cloud) renderProfileStats(d, j);
+    })
+    .catch(() => {});
 }
 
 function closeUserProfile() {
+  _profileName = null;
   el("uprof-overlay").hidden = true;
   // return focus to the chip that opened it, if it's still on screen
   const op = _uprofOpener;
