@@ -15517,8 +15517,11 @@ function rwPrompt(message, dflt) {
   return new Promise((resolve) => {
     const ov = document.createElement("div");
     ov.className = "overlay";
-    ov.innerHTML = `<div class="win rw-prompt">
-      <p></p><input class="cad-input" type="text">
+    // created after initOverlayModals scanned the static overlays, so it
+    // self-manages — but it should still SPEAK dialog to assistive tech
+    ov.innerHTML = `<div class="win rw-prompt" role="dialog" aria-modal="true"
+      aria-labelledby="rw-prompt-msg">
+      <p id="rw-prompt-msg"></p><input class="cad-input" type="text">
       <div class="rw-prompt-btns">
         <button class="cad-btn tiny" type="button" data-ok>OK</button>
         <button class="cad-btn tiny" type="button" data-cancel>Cancel</button>
