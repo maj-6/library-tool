@@ -35,8 +35,8 @@ const VIEWSTATE_KEY = "whl_cad_viewstate_v1";
 const VIEW_STATE_KEYS = new Set([
   "markFilter", "srcFilter", "dlFilter", "yearFrom", "yearTo",
   "topTable", "bottomActive", "whlMode", "checkedMode", "showCatalog",
-  "paneWidth", "uploadSplitH", "publishSidebarCollapsed", "analysisWorkspace",
-  "authPromptDismissed", "checkedCols",
+  "paneWidth", "uploadSplitH", "publishSidebarCollapsed", "workbenchPhase",
+  "jobsDrawerOpen", "authPromptDismissed", "checkedCols",
 ]);
 // Credentials are never persisted client-side. They live in the server's
 // Host-guarded secrets store (/api/secrets); Mistral additionally syncs through
@@ -193,7 +193,8 @@ const state = {
     ocrImageWidth: 1400,
     ocrLayout: true,    // page view: place words where they sit on the page
     textAnalysisService: "configured",
-    analysisWorkspace: "analysis",
+    workbenchPhase: "record",   // last phase open on the Workbench
+    jobsDrawerOpen: false,      // the jobs drawer starts as a one-line summary
     userName: "",       // attributed to your changes in the activity feed        // rasterization width for OCR input —
                                 // tune to see how shrinking affects quality
     // page-view digit shortcuts: press N over a page to queue it
@@ -733,6 +734,7 @@ const ICONS = {
   pdf: _SVG('<path d="M3.5 2 h6 l3 3 v9 h-9 Z"/><path d="M9.5 2 v3 h3"/><path d="M5.4 7.5 h5.2 M5.4 9.7 h5.2 M5.4 11.9 h3.4"/>'),
   // a magic wand with a star tip: the smart-check trigger
   wand: _SVG('<path d="M2.4 13.6 L9.4 6.6"/><path d="M12 1.6 L12.7 3.3 L14.4 4 L12.7 4.7 L12 6.4 L11.3 4.7 L9.6 4 L11.3 3.3 Z"/><path d="M13.4 7.8 v1.8 M12.5 8.7 h1.8"/>'),
+  close: _SVG('<path d="M4.2 4.2 L11.8 11.8 M11.8 4.2 L4.2 11.8"/>'),
 };
 
 // Glyphs that stand in for a tag's text label. Sized to sit inside a 15px
@@ -755,6 +757,98 @@ function injectIcons() {
     const svg = ICONS[node.dataset.icon];
     if (svg) node.innerHTML = svg;
   }
+}
+
+// --- confirmation dialog -------------------------------------------------------
+// Product-styled replacement for window.confirm: resolves true/false, never
+// blocks. `danger` paints the confirming action red and starts focus on the
+// safe choice; `cost` renders an amber money/credits note. Enter activates
+// the focused button (initial focus = the default), Escape/backdrop/close all
+// take the Cancel path.
+
+let _confirmResolve = null;
+let _confirmOpener = null;   // survives dialog-replaces-dialog, so focus
+                             // returns to the ORIGINAL opener, not the confirm
+
+function confirmDialog(opts) {
+  const o = typeof opts === "string" ? { message: opts } : (opts || {});
+  const overlay = el("confirm-overlay");
+  const okBtn = el("confirm-ok");
+  if (_confirmResolve) _confirmResolve(false);   // replaced: keep the opener
+  else _confirmOpener = document.activeElement;
+  el("confirm-title").textContent = o.title || "Confirm";
+  el("confirm-msg").textContent = o.message || "";
+  el("confirm-detail").textContent = o.detail || "";
+  el("confirm-detail").hidden = !o.detail;
+  el("confirm-cost").textContent = o.cost || "";
+  el("confirm-cost").hidden = !o.cost;
+  okBtn.textContent = o.confirmLabel || "OK";
+  okBtn.classList.toggle("danger", !!o.danger);
+  el("confirm-cancel").textContent = o.cancelLabel || "Cancel";
+  overlay.hidden = false;
+  // destructive confirms focus the safe choice; routine ones the primary
+  (o.danger ? el("confirm-cancel") : okBtn).focus();
+  return new Promise((resolve) => {
+    _confirmResolve = (val) => {
+      _confirmResolve = null;
+      overlay.hidden = true;
+      resolve(val);
+      // Restore focus after the caller has finished closing whatever
+      // spawned the confirm, and only if the opener is still visible — a
+      // discarded editor takes its focus target away with it.
+      setTimeout(() => {
+        if (_confirmResolve) return;   // a follow-up confirm owns focus now
+        const op = _confirmOpener;
+        _confirmOpener = null;
+        if (op && op.focus && op.isConnected && op.offsetParent !== null) op.focus();
+      }, 0);
+    };
+  });
+}
+
+function initConfirmDialog() {
+  const overlay = el("confirm-overlay");
+  const okBtn = el("confirm-ok");
+  okBtn.addEventListener("click", () => _confirmResolve && _confirmResolve(true));
+  el("confirm-cancel").addEventListener("click", () => _confirmResolve && _confirmResolve(false));
+  el("confirm-close").addEventListener("click", () => _confirmResolve && _confirmResolve(false));
+  overlay.addEventListener("mousedown", (ev) => {
+    if (ev.target === overlay && _confirmResolve) {
+      ev.preventDefault();   // don't let the browser refocus under the dialog
+      _confirmResolve(false);
+    }
+  });
+  // Capture phase so an open confirm behaves like a real modal: it owns
+  // Escape/Tab/Enter, and every other key stops here so app-wide shortcuts
+  // (undo, Ctrl+S, the OCR page keys) cannot act behind it. Native button
+  // activation is a default action, so Enter/Space on a focused action
+  // still works after stopImmediatePropagation.
+  document.addEventListener("keydown", (ev) => {
+    if (overlay.hidden || !_confirmResolve) return;
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      _confirmResolve(false);
+      return;
+    }
+    const ring = [el("confirm-close"), el("confirm-cancel"), okBtn];
+    if (ev.key === "Tab") {
+      const i = ring.indexOf(document.activeElement);
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      ring[(i + (ev.shiftKey ? -1 : 1) + ring.length) % ring.length].focus();
+      return;
+    }
+    if (ev.key === "Enter" && !ring.includes(document.activeElement)) {
+      // focus strayed outside the dialog: Enter takes the default action
+      // (the safe choice on destructive confirms)
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      (okBtn.classList.contains("danger") ? el("confirm-cancel") : okBtn).click();
+      return;
+    }
+    ev.stopImmediatePropagation();
+  }, true);
 }
 
 // --- undo / redo -------------------------------------------------------------
@@ -1003,8 +1097,9 @@ function normalizeSettings() {
   if (!["tesseract", "mistral", "claude", "textract"].includes(state.settings.ocrService))
     state.settings.ocrService = "tesseract";
   state.settings.textAnalysisService = "configured";
-  if (!["analysis", "document"].includes(state.settings.analysisWorkspace))
-    state.settings.analysisWorkspace = "analysis";
+  if (!WB_PHASES.includes(state.settings.workbenchPhase))
+    state.settings.workbenchPhase = "record";
+  state.settings.jobsDrawerOpen = !!state.settings.jobsDrawerOpen;
   if (!state.settings.copyrightSources || typeof state.settings.copyrightSources !== "object")
     state.settings.copyrightSources = { cprs: true, nypl: false };
   state.settings.cloudSearchUrl = state.settings.cloudSearchUrl || "";
@@ -1271,7 +1366,7 @@ function hideAuthOverlay() {
 let authSignup = false;
 function setAuthMode(signup) {
   authSignup = signup;
-  el("auth-title").textContent = signup ? "CREATE ACCOUNT" : "SIGN IN";
+  el("auth-title").textContent = signup ? "Create account" : "Sign in";
   el("auth-submit").textContent = signup ? "Create account" : "Sign in";
   el("auth-mode").textContent = signup ? "I have an account…" : "Create account…";
   el("auth-pass").autocomplete = signup ? "new-password" : "current-password";
@@ -1358,11 +1453,11 @@ function maybeAuthPrompt() {
 // in the project URL + public anon key), so accounts just work. The service
 // key is an owner concern and stays out of this normal-user flow.
 const WIZ_STEPS = [
-  ["welcome", "WELCOME"],
-  ["account", "PROFILE"],
-  ["services", "TEXT TOOLS"],
-  ["db", "OFFLINE SEARCH"],
-  ["done", "READY"],
+  ["welcome", "Welcome"],
+  ["account", "Profile"],
+  ["services", "Text tools"],
+  ["db", "Offline search"],
+  ["done", "Ready"],
 ];
 let wizStep = 0;
 let wizDbTimer = null;
@@ -1693,14 +1788,14 @@ function renderHome() {
   const inEditor = p.drafts.length + p.ready;
   const attn = p.attnCat + p.attnEd;
   let html =
-    row(inEditor, inEditor === 1 ? "entry in the editor" : "entries in the editor",
-        `data-gotab="upload"`, inEditor ? `${p.drafts.length} draft · ${p.ready} to upload` : "") +
+    row(inEditor, inEditor === 1 ? "entry in the workbench" : "entries in the workbench",
+        `data-gotab="workbench"`, inEditor ? `${p.drafts.length} draft · ${p.ready} to publish` : "") +
     row(p.srcPending, p.srcPending === 1 ? "PDF source pending verification"
-        : "PDF sources pending verification", `data-gotab="upload"`) +
+        : "PDF sources pending verification", `data-gotab="workbench"`) +
     row(attn, attn === 1 ? "item marked for attention"
         : "items marked for attention",
-        `data-gotab="${p.attnCat || !p.attnEd ? "checked" : "upload"}"`,
-        p.attnCat && p.attnEd ? `${p.attnCat} catalog · ${p.attnEd} editor` : "") +
+        `data-gotab="${p.attnCat || !p.attnEd ? "checked" : "workbench"}"`,
+        p.attnCat && p.attnEd ? `${p.attnCat} catalog · ${p.attnEd} workbench` : "") +
     row(p.openReviews, p.openReviews === 1 ? "item awaiting review"
         : "items awaiting review", `data-review="1"`);
 
@@ -1709,15 +1804,15 @@ function renderHome() {
     .sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
   const shown = drafts.slice(0, HOME_DRAFTS_SHOWN);
   if (shown.length) {
-    html += `<div class="home-h home-h-sub">Editor drafts</div>` +
+    html += `<div class="home-h home-h-sub">Drafts</div>` +
       shown.map((b) => `<button class="home-draft" data-draft="${esc(b.id)}"
-          data-tip="Open this draft in the editor">` +
+          data-tip="Open this draft in the Workbench">` +
         `<span class="hd-t">${esc(b.title) || "<em>(untitled)</em>"}</span>` +
         `<span class="hd-meta">${esc(b.authors || "")}${b.authors && b.year ? " · " : ""}${esc(b.year || "")}</span>` +
         `<span class="hd-when">${esc(relIso(b.updated_at))}</span></button>`).join("");
     if (drafts.length > shown.length)
-      html += `<button class="home-more" data-gotab="upload">` +
-        `${drafts.length - shown.length} more in the editor…</button>`;
+      html += `<button class="home-more" data-gotab="workbench">` +
+        `${drafts.length - shown.length} more in the workbench…</button>`;
   }
   prog.innerHTML = html;
 
@@ -1789,16 +1884,17 @@ function initHome() {
     const d = ev.target.closest("[data-draft]");
     if (d) {
       state.buildsTab = "pending";   // drafts live in the Pending queue
-      document.querySelector(`#tabs .tab[data-tab="upload"]`).click();
-      selectBuild(d.dataset.draft);
+      document.querySelector(`#tabs .tab[data-tab="workbench"]`).click();
+      // a draft's next step is its Record — land there with the book selected
+      selectWorkbenchBook(d.dataset.draft, "record");
       return;
     }
     if (ev.target.closest("[data-review]")) { openReviewWin(); return; }
     const b = ev.target.closest("[data-gotab]");
     if (b) {
-      // every editor-bound row advertises pending work, so land on the
-      // Pending queue even if the sidebar was left on Uploaded
-      if (b.dataset.gotab === "upload") state.buildsTab = "pending";
+      // every workbench-bound row advertises pending work, so land on the
+      // Pending queue even if the book list was left on Uploaded
+      if (b.dataset.gotab === "workbench") state.buildsTab = "pending";
       document.querySelector(`#tabs .tab[data-tab="${b.dataset.gotab}"]`).click();
     }
   });
@@ -1816,8 +1912,8 @@ function initHome() {
 
 // --- tabs + header -----------------------------------------------------------
 
-const TAB_TITLES = { home: "Home", checked: "Catalogs", upload: "Editor",
-                     ocr: "Analyze", publish: "Publish",
+const TAB_TITLES = { home: "Home", checked: "Catalogs",
+                     workbench: "Workbench", publish: "Published Library",
                      infotab: "Info" };
 
 function setHeader(tabId) {
@@ -1827,7 +1923,7 @@ function setHeader(tabId) {
   document.title = `${name} :: Library Tool`;
   el("tb-tab").textContent = name ? name + " :: " : "";
   // the tab strip shows the active tab's command icons
-  el("tg-upload").hidden = tabId !== "upload";
+  el("tg-upload").hidden = tabId !== "workbench";
 }
 
 // The title is centred on the window, so the wider of the two flanking regions
@@ -1851,13 +1947,13 @@ function initTabs() {
       setHeader(tab.dataset.tab);
       if (tab.dataset.tab === "home") loadActivity();   // refresh on every visit
       if (tab.dataset.tab === "checked") { renderChecked(); loadOlStatus(); }
-      if (tab.dataset.tab === "upload") renderUpload();
       if (tab.dataset.tab === "infotab") renderConsole();
-      // refresh the folder list on every visit — builds/folders may have
-      // changed in the Editor tab meanwhile
-      if (tab.dataset.tab === "ocr") {
-        loadOcrBooks().then(() => { renderOcrTab(); renderAnalyze(); });
-        pollJobs();       // paint the queue table now, not next tick
+      // refresh builds and entry folders on every visit — either may have
+      // changed elsewhere meanwhile
+      if (tab.dataset.tab === "workbench") {
+        renderUpload();
+        loadOcrBooks().then(() => { renderOcrTab(); renderAnalyze(); renderWorkbench(); });
+        pollJobs();       // paint the jobs drawer now, not next tick
       }
       if (tab.dataset.tab === "publish") renderPublish();
     });
@@ -2481,16 +2577,28 @@ function renderSettings() {
     `Library Tool ${el("tb-meta").textContent} — ` +
     `${state.manual.length} manual entries / ${state.checked.size} checked books. ` +
     (el("status-right").textContent || "");
-  el("reset-settings").onclick = () => {
-    if (!window.confirm("Reset every interface setting? (Catalog data is kept.)")) return;
+  el("reset-settings").onclick = async () => {
+    if (!(await confirmDialog({
+      title: "Reset interface settings",
+      message: "Reset every interface setting?",
+      detail: "Catalog data is kept.",
+      confirmLabel: "Reset settings",
+      danger: true,
+    }))) return;
     try {
       localStorage.removeItem(SETTINGS_KEY);
       localStorage.removeItem(VIEWSTATE_KEY);
     } catch (e) {}
     location.reload();
   };
-  el("clear-history-btn").onclick = () => {
-    if (!window.confirm("Clear the entire action history? This cannot be undone.")) return;
+  el("clear-history-btn").onclick = async () => {
+    if (!(await confirmDialog({
+      title: "Clear history",
+      message: "Clear the entire action history?",
+      detail: "This cannot be undone.",
+      confirmLabel: "Clear history",
+      danger: true,
+    }))) return;
     _actionLog = [];
     saveActionLog();
     if (activeBottomTable() === "history") renderBottomRows();
@@ -3959,7 +4067,7 @@ function setAttnKey(k, val) {
 // an attention target: {label, current, apply(value)}. Q marks it and opens
 // the reason popover on it.
 function attnTargetAtHover() {
-  const bi = document.querySelector("#builds-list .build-item:hover");
+  const bi = document.querySelector("#ocr-books .build-item:hover");
   if (bi) {
     const b = state.builds[bi.dataset.bid];
     if (!b) return null;
@@ -4045,7 +4153,7 @@ function onAttentionKey(ev) {
 // Resolve the row/entry under the mouse into its book fields (for the "S"
 // Google-search shortcut).
 function bookAtHover() {
-  const bi = document.querySelector("#builds-list .build-item:hover");
+  const bi = document.querySelector("#ocr-books .build-item:hover");
   if (bi) {
     const b = state.builds[bi.dataset.bid];
     if (b) return { title: b.title, author: b.authors, year: b.year,
@@ -5541,8 +5649,13 @@ async function revertHistoryAction(hid) {
   const rec = log.find((r) => r.id === hid);
   if (!rec || rec.reverted || !rec.revert) return;
   if (rec.tkey && log.some((r) => r.id > rec.id && !r.reverted && r.tkey === rec.tkey)) {
-    if (!window.confirm("A newer action changed the same record. Reverting this one will " +
-      "discard that newer change. Continue?")) return;
+    if (!(await confirmDialog({
+      title: "Revert action",
+      message: "A newer action changed the same record.",
+      detail: "Reverting this one will discard that newer change.",
+      confirmLabel: "Revert anyway",
+      danger: true,
+    }))) return;
   }
   const ok = await applyRevert(rec.revert);
   if (ok) {
@@ -6993,15 +7106,30 @@ function createMdEditor(container, opts = {}) {
 // --- markdown overlay window (WHL description pencil) --
 
 let overlayMd = null;
+let mdOpenValue = "";   // editor content at open time, to detect dirty state
+
 function openMarkdownEditor(targetTextareaId, title) {
   state.mdTarget = targetTextareaId;
   el("md-title").textContent = title || "Markdown editor";
   overlayMd.set(el(targetTextareaId).value);
+  mdOpenValue = overlayMd.get();
   el("md-overlay").hidden = false;
   overlayMd.focus();
 }
 
-function closeMarkdownEditor(apply) {
+async function closeMarkdownEditor(apply) {
+  // Cancel/Escape/backdrop with edited content confirms before discarding,
+  // so an incidental click outside the window can't throw the text away.
+  if (!apply && state.mdTarget && overlayMd.get() !== mdOpenValue &&
+      state.settings.confirmDiscard !== false) {
+    if (!(await confirmDialog({
+      title: "Discard changes",
+      message: "Discard the unsaved Markdown changes?",
+      confirmLabel: "Discard changes",
+      cancelLabel: "Keep editing",
+      danger: true,
+    }))) return;
+  }
   if (apply && state.mdTarget) {
     el(state.mdTarget).value = overlayMd.get();
   }
@@ -7264,13 +7392,20 @@ function createPdfViewer() {
       setOcr(ocrOn);
     }
   }
-  pagesBtn.addEventListener("click", () => {
-    if (pagesOn && pagesDirty &&
-        state.settings.confirmDiscard !== false && !window.confirm("Discard unsaved page edits?")) return;
+  const confirmDiscardPages = async () =>
+    state.settings.confirmDiscard === false || confirmDialog({
+      title: "Discard page edits",
+      message: "Discard unsaved page edits?",
+      confirmLabel: "Discard edits",
+      cancelLabel: "Keep editing",
+      danger: true,
+    });
+  pagesBtn.addEventListener("click", async () => {
+    if (pagesOn && pagesDirty && !(await confirmDiscardPages())) return;
     setPages(!pagesOn);
   });
-  layBtn.addEventListener("click", () => {
-    if (pagesDirty && state.settings.confirmDiscard !== false && !window.confirm("Discard unsaved page edits?")) return;
+  layBtn.addEventListener("click", async () => {
+    if (pagesDirty && !(await confirmDiscardPages())) return;
     state.settings.viewerLayout = !isLay();
     saveSettings();
     layBtn.classList.toggle("active", isLay());
@@ -7303,9 +7438,9 @@ function createPdfViewer() {
     ocrPane.hidden = !ocrOn || pagesOn;
     if (ocrOn && !pagesOn) loadOcr();
   }
-  ocrBtn.addEventListener("click", () => {
+  ocrBtn.addEventListener("click", async () => {
     if (pagesOn) {
-      if (pagesDirty && state.settings.confirmDiscard !== false && !window.confirm("Discard unsaved page edits?")) return;
+      if (pagesDirty && !(await confirmDiscardPages())) return;
       // intent: leave the page view and SHOW the OCR pane
       setPages(false);
       setOcr(true);
@@ -7878,6 +8013,8 @@ async function setManualUrl(id, source, url, track = true) {
   status(url ? `MANUAL SOURCE SAVED :: ${row.book.title}` : "MANUAL SOURCE CLEARED");
 }
 
+let msrcOpenValue = "";   // URL at open time, to detect an unsaved edit
+
 function openManualSource(id, source) {
   state.msrcTarget = { id: String(id), source };
   const row = state.rowsById.get(String(id));
@@ -7885,12 +8022,28 @@ function openManualSource(id, source) {
   el("msrc-label").textContent =
     `${names[source] || source} :: ${row ? row.book.title : id}`;
   el("msrc-url").value = row ? getManualUrl(row, source) : "";
+  msrcOpenValue = el("msrc-url").value;
   el("msrc-msg").textContent = "";
   el("msrc-overlay").hidden = false;
   el("msrc-url").focus();
 }
 
-function closeManualSource() { el("msrc-overlay").hidden = true; }
+// Escape/backdrop/close with an edited URL confirms before discarding;
+// the save path passes force after it has persisted the value.
+async function closeManualSource(force) {
+  if (force !== true && !el("msrc-overlay").hidden &&
+      el("msrc-url").value.trim() !== msrcOpenValue.trim() &&
+      state.settings.confirmDiscard !== false) {
+    if (!(await confirmDialog({
+      title: "Discard link",
+      message: "Discard the unsaved source link?",
+      confirmLabel: "Discard",
+      cancelLabel: "Keep editing",
+      danger: true,
+    }))) return;
+  }
+  el("msrc-overlay").hidden = true;
+}
 
 async function saveManualSource(clear) {
   const t = state.msrcTarget;
@@ -7901,7 +8054,7 @@ async function saveManualSource(clear) {
     return;
   }
   await setManualUrl(t.id, t.source, url);
-  closeManualSource();
+  closeManualSource(true);
 }
 
 // --- Analyze tab -------------------------------------------------------------------
@@ -7934,27 +8087,211 @@ async function renderAnalyze() {
   updateAnProvider();
 }
 
+// --- Workbench shell (#133 stage 1) --------------------------------------------
+// One book-centred surface: a compact phase rail (Record / Source / Text /
+// Knowledge / Publish) over ONE shared selection. The phases host the former
+// Editor and Analyze panes, moved with their ids and event contracts intact.
+
+const WB_PHASES = ["record", "source", "text", "knowledge", "publish"];
+
+// Legacy adapter: the Analyze workspace toggle became Workbench phases.
 function setAnalyzeWorkspace(which, persist) {
-  which = which === "document" ? "document" : "analysis";
-  document.querySelectorAll("#ocr-workspace-tabs [data-worktab]").forEach((tab) => {
-    const on = tab.dataset.worktab === which;
-    tab.classList.toggle("active", on);
-    tab.setAttribute("aria-selected", String(on));
-  });
-  el("ocr-document-workspace").hidden = which !== "document";
-  el("ocr-document-workspace").classList.toggle("active", which === "document");
-  el("ocr-analysis-workspace").hidden = which !== "analysis";
-  el("ocr-analysis-workspace").classList.toggle("active", which === "analysis");
+  setWorkbenchPhase(which === "document" ? "text" : "knowledge", persist);
+}
+
+function wbActivePhase() {
+  const btn = document.querySelector("#wb-rail .wb-phase-btn.active");
+  return btn ? btn.dataset.phase : "record";
+}
+
+function setWorkbenchPhase(phase, persist) {
+  if (!WB_PHASES.includes(phase)) phase = "record";
+  document.querySelectorAll("#wb-rail .wb-phase-btn").forEach((b) =>
+    b.classList.toggle("active", b.dataset.phase === phase));
+  document.querySelectorAll("#wb-main .wb-phase").forEach((p) =>
+    p.classList.toggle("active", p.id === "phase-" + phase));
   if (persist) {
-    state.settings.analysisWorkspace = which;
+    state.settings.workbenchPhase = phase;
     saveSettings();
   }
-  if (which === "analysis") {
-    renderAnMain();
-    renderAnFacsimile();
-  } else {
-    renderOcrTab();
+  applyWorkbenchGates();
+  // entering a phase refreshes its panes, as its old tab switch did
+  if (phase === "record") renderBuildEditor();
+  else if (phase === "source") {
+    if (activeBuildTab() === "btab-resources") refreshResourcesTab();
+    else refreshSourceTab();
+  } else if (phase === "text") renderOcrTab();
+  else if (phase === "knowledge") { renderAnMain(); renderAnFacsimile(); }
+  else if (phase === "publish") {
+    const b = anSelected();
+    if (b) renderAnBundle(b);
   }
+}
+
+// Draft gating: what the Analyze tab used to lock stays locked per phase —
+// Text / Knowledge / Publish want a verified entry; Record / Source never lock.
+// The Publish phase keeps its action bar visible for drafts: the verify toggle
+// that lifts the lock lives there.
+function wbLockNote(phase) {
+  const b = currentBuild();
+  if (!b || anAnalyzable(b)) return "";
+  if (phase === "publish") {
+    return "This entry is a draft — mark it verified (the check above) to " +
+      "enable publishing and the bundle.";
+  }
+  return "This entry is a draft — verify it in the Publish phase to unlock " +
+    (phase === "text" ? "text work." : "analysis.");
+}
+
+function applyWorkbenchGates() {
+  const b = currentBuild();
+  const textNote = wbLockNote("text");
+  el("wb-text-locked").hidden = !textNote;
+  el("wb-text-locked").textContent = textNote;
+  el("ocr-document-workspace").hidden = !!textNote;
+  const knowNote = wbLockNote("knowledge");
+  el("wb-knowledge-locked").hidden = !knowNote;
+  el("wb-knowledge-locked").textContent = knowNote;
+  el("ocr-analysis-workspace").hidden = !!knowNote;
+  const pubNote = b ? wbLockNote("publish") : "Select a book on the left.";
+  el("wb-publish-locked").hidden = !pubNote;
+  el("wb-publish-locked").textContent = pubNote;
+  el("wb-publish-actions").hidden = !b;
+  el("an-bundle").hidden = !b || !!pubNote;
+  el("wb-source-empty").hidden = !!b;
+  el("wb-source-body").hidden = !b;
+}
+
+// Per-phase readiness, computed CLIENT-side from data already loaded: the
+// build record plus the entry-folder manifest (#135 provenance rows).
+function wbReadiness(b) {
+  const folder = (ocrState.books || {})[b.id] || null;
+  const ocr = (folder && folder.ocr) || [];
+  const r = {};
+  r.record = String(b.title || "").trim()
+    ? { state: "ok", note: "Title present" }
+    : { state: "todo", note: "No title yet" };
+  r.source = ocrBookPdf(b.id)
+    ? { state: "ok", note: "PDF attached" }
+    : { state: "todo", note: "No PDF attached" };
+  const staleOcr = ocr.filter((f) => f.stale === true).length;
+  r.text = !ocr.length
+    ? { state: "todo", note: "No OCR yet" }
+    : staleOcr
+      ? { state: "warn", badge: staleOcr,
+          note: `${staleOcr} OCR file${staleOcr === 1 ? "" : "s"} outdated` }
+      : b.ocr_verified
+        ? { state: "ok", note: `OCR verified — ${b.ocr_verified}` }
+        : { state: "warn",
+            note: `Needs review${b.ocr_quality ? ` — quality: ${b.ocr_quality}` : ""}` };
+  const summary = (folder && folder.summary) || {};
+  const about = (folder && folder.about) || {};
+  const analysis = (folder && folder.analysis) || [];
+  const translations = (folder && folder.translations) || [];
+  const have = [summary.exists && "summary", about.exists && "about",
+                analysis.length && "page analysis",
+                translations.length && "translations"].filter(Boolean);
+  const outdated = (summary.stale === true ? 1 : 0) +
+    (about.stale === true ? 1 : 0) +
+    analysis.filter((a) => a.stale === true).length +
+    translations.filter((t) => t.stale === true).length;
+  r.knowledge = !have.length
+    ? { state: "todo", note: "No analysis yet" }
+    : outdated
+      ? { state: "warn", badge: outdated, note: `${outdated} outdated` }
+      : { state: "ok", note: "Has " + have.join(", ") };
+  r.publish = b.status === "uploaded"
+    ? { state: "ok",
+        note: b.published_slug ? `Published — ${b.published_slug}` : "Published" }
+    : b.status === "ready"
+      ? { state: "warn", note: "Verified — ready to publish" }
+      : { state: "todo", note: "Draft" };
+  return r;
+}
+
+function renderWorkbenchChips() {
+  const host = el("wb-chips");
+  if (!host) return;
+  const b = currentBuild();
+  if (!b) { host.innerHTML = ""; return; }
+  const r = wbReadiness(b);
+  host.innerHTML = WB_PHASES.map((p) => {
+    const c = r[p] || { state: "todo", note: "" };
+    return `<button class="wb-chip ${c.state}" type="button" data-phase="${p}" ` +
+      `data-tip="${esc(c.note || "")}">${p[0].toUpperCase()}${p.slice(1)}${
+      c.badge ? ` ${c.badge}` : ""}</button>`;
+  }).join("");
+}
+
+// head + chips + gates: everything that tracks the shared selection
+function renderWorkbench() {
+  const b = currentBuild();
+  el("wb-title").textContent = b ? (b.title || "(untitled)") : "No book selected";
+  el("wb-sub").textContent = b
+    ? `${b.authors || ""}${b.authors && b.year ? " · " : ""}${b.year || ""}`
+    : "";
+  renderWorkbenchChips();
+  applyWorkbenchGates();
+}
+
+// THE selection entry point (#133): one book for every phase. state.buildSel,
+// ocrState.book and state.anSel remain aliases of the same choice, updated
+// together, so every existing consumer keeps working unchanged.
+async function selectWorkbenchBook(bid, phase) {
+  if (bid !== state.buildSel && buildIsDirty() &&
+      state.settings.confirmDiscard !== false &&
+      !(await confirmDialog({
+        title: "Discard entry changes",
+        message: "Discard unsaved changes to this entry?",
+        confirmLabel: "Discard changes",
+        cancelLabel: "Keep editing",
+        danger: true,
+      }))) return;
+  state.buildSel = bid;
+  const b = state.builds[bid];
+  // the queue view follows the book so the selection is always visible
+  if (b) state.buildsTab = b.status === "uploaded" ? "uploaded" : "pending";
+  renderBuildEditor();
+  if (wbActivePhase() === "source" && activeBuildTab() === "btab-resources") {
+    refreshResourcesTab();
+  }
+  selectOcrBook(bid);          // async: loads the folder's OCR documents
+  if (phase) setWorkbenchPhase(phase, false);
+  renderWorkbench();
+}
+
+function setJobsDrawer(open, persist) {
+  const body = el("wb-jobs-body");
+  if (!body) return;
+  body.hidden = !open;
+  el("ocr-queue-splitter").hidden = !open;
+  const t = el("wb-jobs-toggle");
+  t.innerHTML = open ? "&#9662;" : "&#9656;";
+  t.dataset.tip = open ? "Hide the jobs queue" : "Show the jobs queue";
+  t.setAttribute("aria-expanded", String(open));
+  if (persist) {
+    state.settings.jobsDrawerOpen = !!open;
+    saveSettings();
+  }
+  if (open) renderOcrQueue();
+}
+
+function initWorkbench() {
+  for (const btn of document.querySelectorAll("#wb-rail .wb-phase-btn")) {
+    btn.addEventListener("click", () => setWorkbenchPhase(btn.dataset.phase, true));
+  }
+  // a readiness chip is also a jump to its phase
+  el("wb-chips").addEventListener("click", (ev) => {
+    const chip = ev.target.closest("[data-phase]");
+    if (chip) setWorkbenchPhase(chip.dataset.phase, true);
+  });
+  el("wb-jobs-toggle").addEventListener("click", () =>
+    setJobsDrawer(el("wb-jobs-body").hidden, true));
+  setJobsDrawer(!!state.settings.jobsDrawerOpen, false);
+  // the rights select left the entry form (it lives in the Publish phase) but
+  // still saves with the form — keep the dirty flag in step
+  el("b-rights").addEventListener("change", () => { buildDirty = true; });
+  renderWorkbench();
 }
 
 function decorateAnFacsimile() {
@@ -8098,7 +8435,7 @@ function anSelect(id) {
   const b = state.builds[id];
   if (!b || !anAnalyzable(b)) return;
   state.anSel = id;
-  selectOcrBook(id);
+  selectWorkbenchBook(id);
 }
 
 function activeAnPane() {
@@ -8500,7 +8837,7 @@ async function anSaveBundle() {
   };
   if (await patchBuild(b.id, { bundle }, "edit publish bundle")) {
     el("an-bundle-msg").textContent = b.status === "uploaded"
-      ? "Saved — republish from the Editor to apply"
+      ? "Saved — republish to apply"
       : "Saved — applies when the entry publishes";
   } else el("an-bundle-msg").textContent = "save failed";
 }
@@ -8540,7 +8877,13 @@ function initAnalyze() {
     const b = anSelected();
     if (!b) return;
     const existing = anAboutMd.get().trim();
-    if (existing && !confirm("Replace the current About draft?")) return;
+    if (existing && !(await confirmDialog({
+      title: "Replace About draft",
+      message: "Replace the current About draft?",
+      detail: "The existing draft text is overwritten by the new one.",
+      confirmLabel: "Replace draft",
+      danger: true,
+    }))) return;
     anStartJob("/api/analyze/about",
                { build_id: b.id, overwrite: !!existing }, "about", el("an-about-draft"));
   });
@@ -8598,14 +8941,18 @@ function initAnalyze() {
     renderAnSuggestions();
   });
 
-  el("an-translate").addEventListener("click", () => {
+  el("an-translate").addEventListener("click", async () => {
     const b = anSelected();
     const lang = el("an-lang").value.trim().toLowerCase();
     if (!b || !lang) { el("an-trans-msg").textContent = "language code?"; return; }
-    if (!window.confirm(
-        `Translate this entry into “${lang}”?\n\nThis runs one AI request per ` +
-        `untranslated page — a long book can be hundreds of calls and use real ` +
-        `API credits. It saves as it goes and resumes if interrupted.`)) return;
+    if (!(await confirmDialog({
+      title: "Translate entry",
+      message: `Translate this entry into “${lang}”?`,
+      detail: "It saves as it goes and resumes if interrupted.",
+      cost: "This runs one AI request per untranslated page — a long book " +
+        "can be hundreds of calls and use real API credits.",
+      confirmLabel: "Translate",
+    }))) return;
     el("an-trans-msg").textContent = "";
     anStartJob("/api/analyze/translate", { build_id: b.id, lang },
                `translate ${lang}`, el("an-translate"));
@@ -8628,7 +8975,12 @@ function initAnalyze() {
       el("an-trans-view").textContent = data.text || "";
       el("an-trans-view").hidden = false;
     } else if (del) {
-      if (!confirm(`Delete the ${del.dataset.tdel} translation?`)) return;
+      if (!(await confirmDialog({
+        title: "Delete translation",
+        message: `Delete the ${del.dataset.tdel} translation?`,
+        confirmLabel: "Delete",
+        danger: true,
+      }))) return;
       await fetch(`/api/builds/${b.id}/translations/${encodeURIComponent(del.dataset.tdel)}`,
                   { method: "DELETE" });
       loadAnTranslations(b);
@@ -8701,7 +9053,7 @@ function initAnalyze() {
 
   el("an-bundle-save").addEventListener("click", anSaveBundle);
 
-  // Editor -> Analyze jump for the open build
+  // Record -> Knowledge jump for the open book (same Workbench selection)
   el("b-analyze").addEventListener("click", () => {
     const b = currentBuild();
     if (!b) return;
@@ -8710,9 +9062,8 @@ function initAnalyze() {
       return;
     }
     state.anSel = b.id;
-    document.querySelector('#tabs .tab[data-tab="ocr"]').click();
-    setAnalyzeWorkspace("analysis", true);
-    selectOcrBook(b.id);
+    if (ocrState.book !== b.id) selectOcrBook(b.id);
+    setWorkbenchPhase("knowledge", true);
   });
 }
 
@@ -9794,7 +10145,13 @@ function initCategories() {
     }
     if (act && act.act === "del") {
       const n = (state.taxonomy[id] || {}).name || "?";
-      if (!confirm(`Delete "${n}"? Its subcategories move up; assignments drop it.`)) return;
+      if (!(await confirmDialog({
+        title: "Delete category",
+        message: `Delete "${n}"?`,
+        detail: "Its subcategories move up a level; record assignments drop it.",
+        confirmLabel: "Delete category",
+        danger: true,
+      }))) return;
       if (await catApi("DELETE", `/api/categories/${encodeURIComponent(id)}`)) {
         await catAfterChange();
       }
@@ -10082,11 +10439,13 @@ function renderInfoPane() {
   const imgs = b.images || [];
   if (imgs.length) {
     h += `<div class="info-sec"><div class="info-sec-h">Photos</div><div class="info-imgs">`;
-    for (const p of imgs) {
+    const capTitle = (b.title || "").trim() || "Entry";
+    imgs.forEach((p, i) => {
       const url = "/api/capture/image?path=" + encodeURIComponent(p);
-      h += `<img class="info-thumb" loading="lazy" src="${esc(url)}" ` +
-        `data-lightbox="${esc(url)}" alt="entry photo">`;
-    }
+      const cap = `${capTitle} — photo ${i + 1} of ${imgs.length}`;
+      h += `<img class="info-thumb" loading="lazy" src="${esc(url)}" tabindex="0" ` +
+        `data-lightbox="${esc(url)}" data-cap="${esc(cap)}" alt="${esc(cap)}">`;
+    });
     h += `</div></div>`;
   }
   if (row) {                                          // derived status needs a checked row
@@ -10579,11 +10938,14 @@ function renderUpload() {
         data-tip="Build a catalog entry prefilled from this source">${ICONS.docplus}</button></td>`;
     tbody.appendChild(tr);
   });
-  el("upload-count").textContent =
-    `${Object.keys(state.builds).length} entries / ` +
+  // the count sits in the narrow book-list bar now: total only, detail in the tip
+  const count = el("upload-count");
+  count.textContent = `${Object.keys(state.builds).length} entries`;
+  count.dataset.tip =
     `${Object.values(state.builds).filter((b) => b.status === "ready").length} verified / ` +
-    `${Object.values(state.builds).filter((b) => b.status === "uploaded").length} uploaded`;
+    `${Object.values(state.builds).filter((b) => b.status === "uploaded").length} published`;
   applyTableChrome("upload");
+  renderWorkbench();   // head, chips and gates track every builds re-render
 }
 
 // which build (if any) was seeded from this verified source, and how far
@@ -10702,32 +11064,9 @@ function currentBuild() {
   return state.buildSel ? state.builds[state.buildSel] || null : null;
 }
 
+// legacy name — the Editor sidebar became the unified Workbench book list
 function renderBuildsList() {
-  const list = el("builds-list");
-  list.innerHTML = "";
-  const builds = buildsSorted();
-  document.querySelectorAll("#builds-tabs .pane-tab").forEach((t) =>
-    t.classList.toggle("active", t.dataset.bstab === buildsTab()));
-  el("builds-empty").hidden = builds.length !== 0;
-  el("builds-empty").textContent =
-    buildsTab() === "uploaded" ? "Nothing uploaded yet" : "No entries yet";
-  for (const item of editorBuildItems(builds)) {
-    if (item.type === "group") {
-      const li = document.createElement("li");
-      li.className = "build-group";
-      li.dataset.gid = item.id;
-      li.innerHTML = `<span class="bi-row"><span class="bi-title">${
-        item.expanded ? "&#9662;" : "&#9656;"} ${esc(item.title)}</span></span>
-        <span class="bi-meta">${item.total} volume${item.total === 1 ? "" : "s"}${
-          item.members.length === item.total ? "" : ` &middot; ${item.members.length} in this queue`}</span>`;
-      list.appendChild(li);
-      if (item.expanded) {
-        for (const member of item.members) appendBuildListItem(list, member, true);
-      }
-      continue;
-    }
-    appendBuildListItem(list, item.build, false);
-  }
+  renderOcrBooks();
 }
 
 function editorBuildItems(builds) {
@@ -10767,6 +11106,7 @@ function editorBuildItems(builds) {
 function appendBuildListItem(list, b, grouped) {
     const ready = b.status === "ready";
     const uploaded = b.status === "uploaded";
+    const folder = (ocrState.books || {})[b.id];
     const li = document.createElement("li");
     li.className = "build-item" + (b.id === state.buildSel ? " active" : "") +
       (ready ? " ready" : "") + (b.attention ? " attention" : "") +
@@ -10775,21 +11115,23 @@ function appendBuildListItem(list, b, grouped) {
     li.dataset.tip = `${b.title || "(untitled)"}\n` +
       `${b.authors ? "Authors: " + b.authors + "\n" : ""}` +
       `${b.year ? "Year: " + b.year + "\n" : ""}` +
-      `Status: ${uploaded ? "uploaded" : ready ? "verified" : "draft"}\n` +
+      `Status: ${uploaded ? "published" : ready ? "verified" : "draft"}\n` +
+      (folder ? `${folder.ocr.length} OCR file(s)\n` : "") +
       `Updated: ${b.updated_at || ""}` +
       (attnReason(b.attention) ? `\nNeeds attention: ${attnReason(b.attention)}` : "") +
       "\nQ: mark as needing attention, with a reason";
     // compact: title with the status icon inline on the right, then a
-    // single author · year meta line
+    // single author · year · OCR-count meta line
     li.innerHTML = `
       <span class="bi-row">
         <span class="bi-title">${esc(b.title) || "<em>(untitled)</em>"}</span>
         <span class="bi-status ${ready || uploaded ? "ok" : ""}"
-              data-tip="${uploaded ? "Uploaded" : ready ? "Verified" : "Draft"}">${
+              data-tip="${uploaded ? "Published" : ready ? "Verified" : "Draft"}">${
                 uploaded ? ICONS.export : ready ? ICONS.check : ICONS.pencil}</span>
       </span>
       <span class="bi-meta">${b.volume ? `Vol. ${esc(b.volume)} &middot; ` : ""}${
-        esc(b.authors || "")}${b.authors && b.year ? " &middot; " : ""}${esc(b.year || "")}</span>`;
+        esc(b.authors || "")}${b.authors && b.year ? " &middot; " : ""}${esc(b.year || "")}${
+        folder && folder.ocr.length ? ` &middot; ${folder.ocr.length} OCR` : ""}</span>`;
     list.appendChild(li);
 }
 
@@ -10857,7 +11199,10 @@ function pollPublish() {
     }
     if (st.stage === "done") {
       await loadBuilds();
+      // clear the (now published) selection in all three aliases
       state.buildSel = null;
+      state.anSel = null;
+      ocrState.book = null;
       renderUpload();
       renderHome();
       status(`PUBLISHED :: ${st.slug}${st.note ? " :: " + st.note : ""}`);
@@ -10887,9 +11232,10 @@ async function suggestRights() {
   msg.textContent = s || "No determination";
 }
 
+// which Source-phase sub-view is active (the Entry pane is its own phase now)
 function activeBuildTab() {
   const t = document.querySelector("#build-tabs .pane-tab.active");
-  return t ? t.dataset.btab : "btab-entry";
+  return t ? t.dataset.btab : "btab-source";
 }
 
 function renderBuildEditor() {
@@ -10921,17 +11267,14 @@ function renderBuildEditor() {
   el("build-msg").textContent = "";
   buildDirty = false;   // a freshly loaded form is clean
   scApplyBuildOverlay();
-  if (activeBuildTab() === "btab-source") refreshSourceTab();
+  if (wbActivePhase() === "source" && activeBuildTab() === "btab-source") {
+    refreshSourceTab();
+  }
 }
 
+// legacy name — selection is unified across the Workbench (#133)
 function selectBuild(id) {
-  if (id !== state.buildSel && buildIsDirty() &&
-      state.settings.confirmDiscard !== false &&
-      !window.confirm("Discard unsaved changes to this entry?")) return;
-  state.buildSel = id;
-  renderBuildsList();
-  renderBuildEditor();
-  if (activeBuildTab() === "btab-resources") refreshResourcesTab();
+  selectWorkbenchBook(id);
 }
 
 async function createBuild(seed, label) {
@@ -11120,7 +11463,7 @@ function exportBuilds() {
 function switchBuildTab(id) {
   document.querySelectorAll("#build-tabs .pane-tab").forEach((t) =>
     t.classList.toggle("active", t.dataset.btab === id));
-  document.querySelectorAll("#build-editor .pane-sub").forEach((p) =>
+  document.querySelectorAll("#wb-source-body .pane-sub").forEach((p) =>
     p.classList.toggle("active", p.id === id));
   if (id === "btab-source") refreshSourceTab();
   if (id === "btab-resources") refreshResourcesTab();
@@ -11586,7 +11929,8 @@ const ocrState = {
   books: null,             // build id -> {ocr, preview} (entry folders)
   book: null,              // selected book (build id)
   bookLoading: null,       // build id currently loading (re-entrancy guard)
-  verifiedOnly: true,      // Analyze starts with unavailable drafts hidden
+  verifiedOnly: false,     // off by default: drafts must be reachable to edit
+                           // their Record (the filter remains a toggle)
   pages: null,             // {pre, map} sections for the side-by-side view
   pageTags: new Map(),     // "bid:src:page" -> service, STAGED (submit is manual)
   pageRunning: new Map(),  // "bid:src:page" -> service, submitted and processing
@@ -11632,17 +11976,6 @@ async function loadOcrBooks() {
     const data = await (await fetch("/api/entries")).json();
     ocrState.books = data.entries || {};
   } catch (e) { ocrState.books = {}; }
-}
-
-function ocrBookList() {
-  const out = [];
-  for (const b of allBuildsSorted()) {
-    const folder = (ocrState.books || {})[b.id];
-    if (!folder) continue;
-    if (ocrState.verifiedOnly && !anAnalyzable(b)) continue;
-    out.push({ build: b, folder });
-  }
-  return out;
 }
 
 // the book's OCR target: its PRIMARY PDF (the attached file, or the entry
@@ -11694,29 +12027,36 @@ function srcExtractedName(key) {
   return !key || key === "primary" ? "extracted.txt" : `extracted-${key}.txt`;
 }
 
+// The ONE Workbench book list: every build — with or without an entry folder —
+// in the Editor's old Pending / Uploaded queues, grouped by volume set, with
+// the existing status icons and an OCR count where a folder exists.
 function renderOcrBooks() {
   const list = el("ocr-books");
   list.innerHTML = "";
-  const books = ocrBookList();
-  el("ocr-books-empty").hidden = books.length !== 0;
+  document.querySelectorAll("#builds-tabs .pane-tab").forEach((t) =>
+    t.classList.toggle("active", t.dataset.bstab === buildsTab()));
   el("ocr-filter-verified").classList.toggle("active", ocrState.verifiedOnly);
-  for (const { build: b, folder } of books) {
-    const ready = anAnalyzable(b);
-    const li = document.createElement("li");
-    li.className = "ocr-book" + (b.id === ocrState.book ? " active" : "");
-    li.dataset.bid = b.id;
-    li.dataset.tip = `${b.title || "(untitled)"}\n` +
-      `${folder.ocr.length} OCR file(s)` +
-      (ready ? "\nVerified" : "\nDraft") +
-      (ocrBookPdf(b.id) ? `\nPDF: ${ocrBookPdf(b.id)}` : "\nNo PDF");
-    li.innerHTML = `
-      <span class="bi-row">
-        <span class="bi-title">${esc(b.title) || "<em>(untitled)</em>"}</span>
-        <span class="bi-status ${ready ? "ok" : ""}">${ready ? ICONS.check : ICONS.pencil}</span>
-      </span>
-      <span class="bi-meta">${esc(b.authors || "")}${b.authors && b.year ? " &middot; " : ""}${esc(b.year || "")}
-        &middot; ${folder.ocr.length} OCR</span>`;
-    list.appendChild(li);
+  const builds = buildsSorted().filter((b) =>
+    !ocrState.verifiedOnly || anAnalyzable(b));
+  el("ocr-books-empty").hidden = builds.length !== 0;
+  el("ocr-books-empty").textContent =
+    buildsTab() === "uploaded" ? "Nothing published yet" : "No entries yet";
+  for (const item of editorBuildItems(builds)) {
+    if (item.type === "group") {
+      const li = document.createElement("li");
+      li.className = "build-group";
+      li.dataset.gid = item.id;
+      li.innerHTML = `<span class="bi-row"><span class="bi-title">${
+        item.expanded ? "&#9662;" : "&#9656;"} ${esc(item.title)}</span></span>
+        <span class="bi-meta">${item.total} volume${item.total === 1 ? "" : "s"}${
+          item.members.length === item.total ? "" : ` &middot; ${item.members.length} in this queue`}</span>`;
+      list.appendChild(li);
+      if (item.expanded) {
+        for (const member of item.members) appendBuildListItem(list, member, true);
+      }
+      continue;
+    }
+    appendBuildListItem(list, item.build, false);
   }
 }
 
@@ -11727,8 +12067,21 @@ async function selectOcrBook(bid) {
   ocrSyncEditor();
   ocrState.book = bid;
   state.anSel = anAnalyzable(state.builds[bid] || {}) ? bid : null;
+  // the three selections are aliases of one Workbench choice (#133)
+  if (state.buildSel !== bid) {
+    state.buildSel = bid;
+    renderBuildEditor();
+  }
+  renderWorkbench();
   clearOcrPageSel();   // selections don't carry across books
   let folder = (ocrState.books || {})[bid];
+  // A selection can arrive before the folder list has ever loaded (the Home
+  // jump selects immediately after switching tabs) — fetch it, don't give up.
+  if (!folder && ocrState.books === null) {
+    await loadOcrBooks();
+    if (ocrState.book !== bid) return;   // switched away while loading
+    folder = (ocrState.books || {})[bid];
+  }
   if (!folder) { renderOcrTab(); return; }
   // the guard must cover the auto-extraction await too, or a double-click
   // runs the (expensive) extraction twice
@@ -11778,9 +12131,10 @@ async function selectOcrBook(bid) {
     renderOcrTab();
     renderAnList();
     renderAnMain();
+    renderWorkbench();   // the folder manifest feeds the readiness chips
     status(folder.ocr.length
       ? `Loaded ${folder.ocr.length} OCR file(s)`
-      : "No OCR files in this folder (build it from the Editor tab)");
+      : "No OCR files for this book yet (attach a PDF in the Source phase)");
   } finally {
     if (ocrState.bookLoading === bid) ocrState.bookLoading = null;
   }
@@ -12707,29 +13061,33 @@ async function pollJobs() {
   jobsState.active = data.active || 0;
   renderJobsFooter();
   const tab = document.querySelector("#tabs .tab.active");
-  if (tab && tab.dataset.tab === "ocr") renderOcrQueue();
+  if (tab && tab.dataset.tab === "workbench") renderOcrQueue();
 }
 
-// footer: a quiet "N jobs running" marker when work is active out of sight of
-// the Analyze tab's queue table; clicking it goes there
+// The jobs drawer's one-line summary, plus the footer's quiet "N jobs running"
+// marker when work is active out of sight of the Workbench; clicking the
+// marker opens the drawer there.
 function renderJobsFooter() {
+  const line = jobsState.active
+    ? `${jobsState.active} job${jobsState.active === 1 ? "" : "s"} running`
+    : "";
+  const summary = el("wb-jobs-summary");
+  if (summary) summary.textContent = line || "No jobs running";
   const n = el("status-jobs");
   if (!n) return;
   const tab = document.querySelector("#tabs .tab.active");
-  const away = !tab || tab.dataset.tab !== "ocr";
+  const away = !tab || tab.dataset.tab !== "workbench";
   n.hidden = !(jobsState.active && away);
-  if (!n.hidden) {
-    n.textContent =
-      `${jobsState.active} job${jobsState.active === 1 ? "" : "s"} running`;
-  }
+  if (!n.hidden) n.textContent = line;
 }
 
 function initJobs() {
   const n = el("status-jobs");
   if (n) {
     n.addEventListener("click", () => {
-      const tab = document.querySelector('#tabs .tab[data-tab="ocr"]');
+      const tab = document.querySelector('#tabs .tab[data-tab="workbench"]');
       if (tab) tab.click();
+      setJobsDrawer(true, false);   // land with the queue in view
     });
   }
   pollJobs();
@@ -13477,7 +13835,8 @@ async function ocrQueueJob() {
 let ocrHoverPage = 0;
 
 function ocrPagesActive() {
-  return document.querySelector('#tabs .tab.active[data-tab="ocr"]') &&
+  return !!document.querySelector('#tabs .tab.active[data-tab="workbench"]') &&
+    !!document.querySelector("#phase-text.active") &&
     !el("ocr-document-workspace").hidden && ocrState.view === "pdf";
 }
 
@@ -13634,10 +13993,14 @@ async function deleteSelectedPages() {
     return;
   }
   const pages = [...ocrState.pageSel].sort((a, z) => a - z);
-  if (!window.confirm(
-      `Delete ${pages.length} page(s) [${pages.join(", ")}] from the PDF?\n` +
-      `${pdf}\n\nThe previous version is kept as a .bak.pdf next to it; ` +
-      "OCR files and title pages are renumbered to match.")) {
+  if (!(await confirmDialog({
+      title: "Delete PDF pages",
+      message: `Delete ${pages.length} page(s) [${pages.join(", ")}] from the PDF?`,
+      detail: `${pdf}\n\nThe previous version is kept as a .bak.pdf next to ` +
+        "it; OCR files and title pages are renumbered to match.",
+      confirmLabel: "Delete pages",
+      danger: true,
+    }))) {
     return;
   }
   el("ocr-msg").textContent = "Deleting pages ...";
@@ -13792,8 +14155,14 @@ function initOcrTab() {
     renderOcrBooks();
   });
   el("ocr-books").addEventListener("click", (ev) => {
-    const li = ev.target.closest("li.ocr-book");
-    if (li) selectOcrBook(li.dataset.bid);
+    const group = ev.target.closest("li.build-group");
+    if (group) {
+      setSetExpanded(group.dataset.gid, !setExpanded(group.dataset.gid));
+      renderOcrBooks();
+      return;
+    }
+    const li = ev.target.closest("li.build-item");
+    if (li) selectWorkbenchBook(li.dataset.bid);
   });
   el("ocr-docs").addEventListener("click", (ev) => {
     // tree chrome first: extract-text action, then node collapse/expand
@@ -13890,10 +14259,8 @@ function initOcrTab() {
     ocrSetQuality(el("ocr-quality").value));
   el("ocr-save").addEventListener("click", ocrSaveDoc);
   el("ocr-set-active").addEventListener("click", ocrSetActive);
-  for (const tab of document.querySelectorAll("#ocr-workspace-tabs [data-worktab]")) {
-    tab.addEventListener("click", () => setAnalyzeWorkspace(tab.dataset.worktab, true));
-  }
-  setAnalyzeWorkspace(state.settings.analysisWorkspace || "analysis", false);
+  // the Workbench opens on the phase it was left on
+  setWorkbenchPhase(state.settings.workbenchPhase || "record", false);
   // the queue's service select starts on the configured default and keeps
   // the setting in sync when changed here
   el("ocr-service").value = state.settings.ocrService || "tesseract";
@@ -14598,11 +14965,12 @@ const MENU_CMDS = {
   "changelog": () => openChangelog(),
   "site-home": () => openWebView("https://maj-6.github.io/library-tool/"),
   "about": () => openAbout(),
-  // File > New entry: same flow as the Editor toolbar's + button, but reachable
-  // from anywhere — switch to the Editor tab first so the new build is visible.
+  // File > New entry: same flow as the Workbench toolbar's + button, but
+  // reachable from anywhere — land on the Record phase so the form is visible.
   "new-entry": () => {
-    const t = document.querySelector('#tabs .tab[data-tab="upload"]');
+    const t = document.querySelector('#tabs .tab[data-tab="workbench"]');
     if (t) t.click();
+    setWorkbenchPhase("record", false);
     createBuild({}, "(blank)");
   },
   // quick settings (mirror the Settings-dialog handlers, side effects and all)
@@ -14918,23 +15286,53 @@ function initWebView() {
     if (ev.target === el("ia-overlay")) closeIaViewer();
   });
   document.addEventListener("keydown", onIaViewerKey);   // arrow-key paging
-  // entry-photo lightbox: any Info-panel thumbnail opens full size
-  document.addEventListener("click", (ev) => {
-    const th = ev.target.closest("[data-lightbox]");
-    if (!th) return;
+  // entry-photo viewer: any Info-panel thumbnail opens full size. Focus
+  // moves to the viewer's close control and returns to the thumbnail on
+  // close; only the backdrop and the close button dismiss (not the image).
+  let lightboxOpener = null;
+  const openLightbox = (th) => {
+    lightboxOpener = th;
+    const cap = th.dataset.cap || th.alt || "Entry photo";
     el("img-lightbox-img").src = th.dataset.lightbox;
+    el("img-lightbox-img").alt = cap;
+    el("img-lightbox-cap").textContent = cap;
     el("img-lightbox").hidden = false;
-  });
-  el("img-lightbox").addEventListener("click", () => {
+    el("img-lightbox-close").focus();
+  };
+  const closeLightbox = () => {
     el("img-lightbox").hidden = true;
     el("img-lightbox-img").src = "";
+    if (lightboxOpener && document.contains(lightboxOpener)) lightboxOpener.focus();
+    lightboxOpener = null;
+  };
+  document.addEventListener("click", (ev) => {
+    const th = ev.target.closest("[data-lightbox]");
+    if (th) openLightbox(th);
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter" || ev.repeat || !el("img-lightbox").hidden) return;
+    const th = ev.target.closest && ev.target.closest("[data-lightbox]");
+    if (th) openLightbox(th);
+  });
+  el("img-lightbox-close").addEventListener("click", closeLightbox);
+  el("img-lightbox").addEventListener("mousedown", (ev) => {
+    if (ev.target === el("img-lightbox")) {
+      ev.preventDefault();
+      closeLightbox();
+    }
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (el("img-lightbox").hidden) return;
+    // the close control is the viewer's only focusable: keep Tab on it
+    if (ev.key === "Tab") {
+      ev.preventDefault();
+      el("img-lightbox-close").focus();
+    }
   });
   document.addEventListener("keydown", (ev) => {
     if (ev.key !== "Escape") return;
-    if (!el("img-lightbox").hidden) {
-      el("img-lightbox").hidden = true;
-      el("img-lightbox-img").src = "";
-    } else if (!el("ia-overlay").hidden) closeIaViewer();
+    if (!el("img-lightbox").hidden) closeLightbox();
+    else if (!el("ia-overlay").hidden) closeIaViewer();
     else if (!el("webview-overlay").hidden) closeWebView();
   });
 }
@@ -14986,6 +15384,7 @@ function init() {
   boot("font", applyFont);
   boot("checked books", loadChecked);
   boot("icons", injectIcons);
+  boot("confirm dialog", initConfirmDialog);
   boot("tabs", initTabs);
   boot("jobs", initJobs);
   boot("smart check", initSmartCheck);
@@ -15291,7 +15690,7 @@ function init() {
     document.addEventListener("mousemove", (ev) => {
       if (!dragging) return;
       const min = 160;   // the CSS min-height enforces the usable floor
-      const max = Math.max(min, el("upload").clientHeight - 180);
+      const max = Math.max(min, el("workbench").clientHeight - 180);
       const h = Math.min(max, Math.max(min, ev.clientY - top.getBoundingClientRect().top));
       top.style.height = h + "px";
       top.style.flex = "none";
@@ -15355,7 +15754,6 @@ function init() {
   };
   widthSplit("ocr-splitter", "ocrSide", "ocr-side", 200, 620);
   widthSplit("an-facsimile-splitter", "anFacsimile", "an-facsimile-pane", 280, 900);
-  widthSplit("builds-splitter", "buildsPane", "builds-pane", 180, 620);
   widthSplit("form-splitter", "buildForm", "build-form", 280, 720);
   widthSplit("publish-splitter", "publishSide", "publish-side", 230, 620);
   initSplitter("ocr-side-splitter", {
@@ -15368,7 +15766,7 @@ function init() {
   });
   initSplitter("ocr-queue-splitter", {
     key: "ocrQueue", vertical: true, min: 60,
-    max: () => el("ocr").clientHeight - 220,
+    max: () => el("workbench").clientHeight - 220,
     measure: (ev) =>
       el("ocr-queue-wrap").getBoundingClientRect().bottom - ev.clientY,
     apply: (px) => { el("ocr-queue-wrap").style.flex = `0 0 ${px}px`; },
@@ -15385,7 +15783,10 @@ function init() {
   el("md-cancel").addEventListener("click", () => closeMarkdownEditor(false));
   el("md-close").addEventListener("click", () => closeMarkdownEditor(false));
   el("md-overlay").addEventListener("mousedown", (ev) => {
-    if (ev.target === el("md-overlay")) closeMarkdownEditor(false);
+    if (ev.target === el("md-overlay")) {
+      ev.preventDefault();   // keep focus with the discard confirm, not <body>
+      closeMarkdownEditor(false);
+    }
   });
 
   // upload list / book builder
@@ -15413,19 +15814,12 @@ function init() {
     }
     renderBuildsList();
   });
-  el("build-new").addEventListener("click", () => createBuild({}, "(blank)"));
+  el("build-new").addEventListener("click", () => {
+    setWorkbenchPhase("record", false);   // the blank form is the next step
+    createBuild({}, "(blank)");
+  });
   el("export-builds").addEventListener("click", exportBuilds);
   el("download-upload-list").addEventListener("click", downloadUploadList);
-  el("builds-list").addEventListener("click", (ev) => {
-    const group = ev.target.closest("li.build-group");
-    if (group) {
-      setSetExpanded(group.dataset.gid, !setExpanded(group.dataset.gid));
-      renderBuildsList();
-      return;
-    }
-    const li = ev.target.closest("li.build-item");
-    if (li) selectBuild(li.dataset.bid);
-  });
   for (const t of document.querySelectorAll("#builds-tabs .pane-tab")) {
     t.addEventListener("click", () => {
       state.buildsTab = t.dataset.bstab;
@@ -15511,11 +15905,14 @@ function init() {
   el("build-form").addEventListener("input", () => { buildDirty = true; });
   el("build-save").addEventListener("click", saveBuildFields);
   el("build-delete").addEventListener("click", deleteBuild);
-  // Ctrl/Cmd+S saves the open entry (only on the Editor tab, entry open)
+  // Ctrl/Cmd+S saves the open entry (only on the Workbench's editor-derived
+  // phases — the Text phase keeps the OCR editor's own save flow)
   document.addEventListener("keydown", (ev) => {
     if (!((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "s")) return;
     const tab = document.querySelector("#tabs .tab.active");
-    if (tab && tab.dataset.tab === "upload" && !el("build-editor").hidden) {
+    if (tab && tab.dataset.tab === "workbench" &&
+        ["record", "source", "publish"].includes(wbActivePhase()) &&
+        !el("build-editor").hidden) {
       ev.preventDefault();
       saveBuildFields();
     }
@@ -15561,6 +15958,7 @@ function init() {
   boot("review queue", initReviewWin);
   boot("categories", initCategories);
   boot("analyze", initAnalyze);
+  boot("workbench", initWorkbench);
   loadTaxonomy();   // async; pickers and cells refresh when the vocab lands
   el("b-pdf-attach").addEventListener("click", () => attachPdfFile());
   el("b-pdf_file").addEventListener("keydown", (ev) => {
@@ -15602,7 +16000,10 @@ function init() {
     if (ev.key === "Enter") { ev.preventDefault(); saveManualSource(false); }
   });
   el("msrc-overlay").addEventListener("mousedown", (ev) => {
-    if (ev.target === el("msrc-overlay")) closeManualSource();
+    if (ev.target === el("msrc-overlay")) {
+      ev.preventDefault();   // keep focus with the discard confirm, not <body>
+      closeManualSource();
+    }
   });
   el("open-settings").addEventListener("click", openSettings);
   el("settings-close").addEventListener("click", closeSettings);
@@ -15629,6 +16030,8 @@ function init() {
     else if (!el("cat-overlay").hidden) closeCategories();
     else if (!el("changelog-overlay").hidden) closeChangelog();
     else if (!el("settings-overlay").hidden) closeSettings();
+    else if (!el("engine-overlay").hidden) closeDefaultEngines();
+    else if (!el("about-overlay").hidden) closeAbout();
   });
 
   // keep sized tables filling their panes when the window or panes resize

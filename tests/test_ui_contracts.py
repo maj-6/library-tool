@@ -41,10 +41,21 @@ def test_verified_toggle_saves_the_whole_editor_form():
     assert "patchBuildRaw(b.id, { status:" not in handler
 
 
-def test_build_navigation_refreshes_resources_for_the_selected_id():
-    body = _function("selectBuild", "createBuild")
+def test_workbench_selection_is_unified_and_refreshes_resources():
+    # ONE selection entry point sets all three legacy aliases together
+    body = _function("selectWorkbenchBook", "setJobsDrawer")
+    assert "state.buildSel = bid" in body
+    assert "selectOcrBook(bid)" in body
     assert 'activeBuildTab() === "btab-resources"' in body
     assert "refreshResourcesTab()" in body
+
+    alias = _function("selectBuild", "createBuild")
+    assert "selectWorkbenchBook(id)" in alias
+
+    sync = _function("selectOcrBook", "ocrVisibleDocs")
+    assert "ocrState.book = bid" in sync
+    assert "state.anSel = anAnalyzable" in sync
+    assert "state.buildSel = bid" in sync
 
 
 def test_editor_groups_volumes_by_metadata_not_title():
@@ -68,7 +79,8 @@ def test_legacy_group_migration_persists_association_on_each_book():
 
 
 def test_publish_tab_has_tree_grouping_and_catalog_preview():
-    assert 'data-tab="publish">Publish</button>' in TEMPLATE
+    # renamed per #125: the tab browses what is already published
+    assert 'data-tab="publish">Published Library</button>' in TEMPLATE
     for mode in ("sets", "author", "category", "date"):
         assert f'<option value="{mode}">' in TEMPLATE
     assert 'id="publish-tree" aria-label="Published catalogue"' in TEMPLATE
@@ -103,9 +115,15 @@ def test_publish_preview_matches_online_record_shape_and_supports_sets():
     assert 'data-publish-book=' in preview
 
 
-def test_ocr_verified_filter_includes_published_entries():
-    body = _function("ocrBookList", "ocrBookPdf")
-    assert "!anAnalyzable(b)" in body
+def test_workbench_book_list_serves_all_builds_with_optional_verified_filter():
+    body = _function("renderOcrBooks", "selectOcrBook")
+    # the unified list reuses the Editor's queue + volume grouping and filters
+    # to verified (ready OR published) only on demand
+    assert "buildsSorted()" in body
+    assert "editorBuildItems" in body
+    assert "!ocrState.verifiedOnly || anAnalyzable(b)" in body
+    # drafts must be reachable to edit their Record: the filter defaults OFF
+    assert "verifiedOnly: false" in APP
 
 
 def test_catalog_defaults_to_open_search_workspace_without_overwriting_saved_view():
