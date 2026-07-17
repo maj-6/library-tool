@@ -23,18 +23,23 @@ P120_BLOCKS = [
     ("header", 493, 149, 554, 178, "102"),
     ("header", 684, 133, 1079, 178, "The Hauen of Health."),
     ("text", 329, 203, 488, 295, "How to keepe\nBarberies all\nthe yeare."),
+    # line counts matter: the classifier's line-height yardstick reads them,
+    # so each block carries its REAL printed line count from the scan
     ("text", 488, 194, 1230, 340, "and picke the leaues cleane from them, "
-     "and put them\nin a potte of earth."),
+     "and put them\nin a potte of earth, and fill the pot full of vernuice\n"
+     "or couer them ouer with salt, and take them out\nas you shall occupy them."),
     ("text", 660, 374, 1065, 418, "Of Oliues. Chap. 115."),
     ("text", 329, 774, 454, 871, "Lib 6. Simp.\nLib. 3. Diof.\ncap. 31."),
     ("text", 329, 921, 488, 1130, "A good me-\ndicine for\nthe cholicke\n"
      "and stone."),
     ("text", 329, 1245, 488, 1337, "Sacke & Salet\noile to pro-\ncure a vomit."),
     ("text", 488, 441, 1235, 1353, "O Liues if they be ripe are temperatly "
-     "hot, they which\nbe greene are cold and drie."),
+     "hot, they which\nbe greene are cold and drie.\n"
+     + "\n".join(f"printed line {i} of the chapter body" for i in range(27))),
     ("text", 645, 1380, 1064, 1425, "Of Orenges. Chap. 116."),
     ("text", 490, 1422, 1235, 1535, "O Menges are not wholly of one "
-     "temperature, for the\nrinde is hot in the first degree."),
+     "temperature, for the\nrinde is hot in the first degree,\n"
+     "and dry in the second degree."),
 ]
 
 
@@ -143,6 +148,31 @@ def test_two_column_page_stays_body():
         ("text", 620, 300, 1050, 1500, "right column entries"),
     ])
     assert set(roles.values()) == {"body"}
+
+
+def test_detection_drop_capital_heading_footnote():
+    ten = "\n".join(f"line {i}" for i in range(10))    # 10-line yardsticks
+    roles = _classify([
+        ("text", 300, 200, 378, 300, "O"),             # letter, body at right
+        ("text", 380, 200, 1200, 560, ten),
+        ("text", 300, 600, 1200, 960, ten),
+        ("text", 450, 100, 1000, 158, "OF THE VERTUES OF HERBES"),  # 1.6x line
+        ("text", 300, 1500, 1200, 1550, "a note\nanother note"),    # small, low
+    ])
+    assert roles["O"] == "drop-capital"
+    assert roles["OF THE VERTUES OF HERBES"] == "title"
+    assert roles["a note\nanother note"] == "footnote"
+    assert roles[ten] == "body"
+
+
+def test_detection_lone_letter_without_body_stays_body():
+    # a one-letter block with nothing at its shoulder (an ornament scrap, a
+    # damaged scan) must not masquerade as a drop capital
+    roles = _classify([
+        BODY,
+        ("text", 100, 200, 178, 300, "Q"),   # far from the body column
+    ])
+    assert roles["Q"] != "drop-capital"
 
 
 def test_aside_text_maps_directly_when_mistral_provides_it():

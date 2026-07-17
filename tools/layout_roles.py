@@ -127,12 +127,31 @@ def classify(regions: list[dict]) -> None:
     digit — "B2" — since a bare roman letter like "C." is indistinguishable
     from a folio number without book-level context and defaults to
     page-number); a page number is a small numeral in the top or bottom
-    margin."""
+    margin; a drop capital is a tiny one-letter block with body text
+    starting at its right shoulder; a chapter heading is a single line set
+    visibly larger than the band's body; a footnote is band text set
+    visibly smaller, low on the page."""
     body = [r for r in regions if r["role"] == "body"]
     if not body:
         return
     bx0, bx1 = _column_band(body)
     band_w = max(1e-6, bx1 - bx0)
+
+    def lines_of(r):
+        return max(1, len([ln for ln in r["text"].split("\n") if ln.strip()]))
+
+    def line_h(r):
+        return r["box"]["h"] / lines_of(r)
+
+    # the band's body line height, from its multi-line blocks — headings and
+    # stray one-liners must not pollute the yardstick they're measured by
+    def band_ov(r):
+        x0, x1 = r["box"]["x"], r["box"]["x"] + r["box"]["w"]
+        return max(0.0, min(x1, bx1) - max(x0, bx0)) / max(1e-6, r["box"]["w"])
+    yard = sorted(line_h(r) for r in body
+                  if band_ov(r) >= 0.5 and lines_of(r) >= 2)
+    med_lh = yard[len(yard) // 2] if yard else 0.0
+
     for r in body:
         box = r["box"]
         word = re.sub(r"\s+", " ", r["text"].strip())
@@ -140,7 +159,22 @@ def classify(regions: list[dict]) -> None:
         ov = max(0.0, min(x1, bx1) - max(x0, bx0)) / max(1e-6, box["w"])
         top = box["y"] + box["h"] < 0.12
         bottom = box["y"] > 0.82
-        if (bottom and box["w"] < 0.12 and _SIGMARK.match(word or " ")
+        cy = box["y"] + box["h"] / 2
+        # a one-or-two-letter block with a body block starting at its right
+        # shoulder: the letter the compositor set large to open the paragraph
+        is_cap = (len(word) in (1, 2) and word.isalpha()
+                  and box["w"] < 0.12 and box["h"] < 0.15
+                  and 0.3 < box["w"] / max(1e-6, box["h"]) < 3.0
+                  and any(o is not r and o["role"] == "body"
+                          and lines_of(o) >= 2
+                          and o["box"]["x"] >= x1 - 0.02
+                          and o["box"]["x"] <= x1 + 0.06
+                          and o["box"]["y"] <= cy <=
+                              o["box"]["y"] + o["box"]["h"]
+                          for o in body))
+        if is_cap:
+            r["role"] = "drop-capital"
+        elif (bottom and box["w"] < 0.12 and _SIGMARK.match(word or " ")
                 and any(ch.isdigit() for ch in word)):
             r["role"] = "signature-mark"
         elif (top or bottom) and box["w"] < 0.15 and _PAGENO.match(word or " "):
@@ -150,6 +184,12 @@ def classify(regions: list[dict]) -> None:
             r["role"] = "catch-word"
         elif (bottom and box["w"] < 0.12 and _SIGMARK.match(word or " ")):
             r["role"] = "signature-mark"
+        elif (med_lh > 0 and ov >= 0.5 and lines_of(r) == 1 and word
+                and box["w"] < 0.8 * band_w and line_h(r) > 1.35 * med_lh):
+            r["role"] = "title"
+        elif (med_lh > 0 and ov >= 0.5 and box["y"] > 0.7
+                and line_h(r) < 0.75 * med_lh and lines_of(r) >= 1 and word):
+            r["role"] = "footnote"
         elif ov < 0.3 and box["w"] < 0.5 * band_w:
             r["role"] = "marginalia"
 
