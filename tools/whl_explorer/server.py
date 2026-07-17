@@ -49,6 +49,7 @@ import capture_pipeline as capture  # noqa: E402
 import catalog_checks as checks  # noqa: E402
 import cloud_defaults  # noqa: E402
 import layout_roles  # noqa: E402
+import libformat  # noqa: E402
 import copyright_registration as copyreg  # noqa: E402
 import libcommon as lib  # noqa: E402
 import r2_store as r2  # noqa: E402
@@ -2293,56 +2294,14 @@ def api_build_ocr_regions(build_id: str):
                     "items": rec.get("items") or []})
 
 
-_RW_MAX_ITEMS = 800
-_RW_ROLE_RE = re.compile(r"^[a-z][a-z-]{0,23}$")
-
-
-def _rw_sanitize_items(raw: list, src_type: str = "human") -> list:
-    """One page's region items scrubbed for storage: roles kebab-case,
-    boxes clamped into the page, text layers capped, everything re-ordered
-    and re-idd. Shared by the workbench PUT and the .lib import — anything
-    that writes items the sidecar will trust must come through here."""
-    def order_of(it):
-        o = it.get("order")
-        return float(o) if isinstance(o, (int, float)) \
-            and not isinstance(o, bool) else 0.0
-
-    items = []
-    for it in sorted((x for x in raw if isinstance(x, dict)), key=order_of):
-        box = it.get("box") or {}
-        try:
-            x = min(1.0, max(0.0, float(box.get("x") or 0)))
-            y = min(1.0, max(0.0, float(box.get("y") or 0)))
-            w = min(1.0 - x, max(0.0, float(box.get("w") or 0)))
-            h = min(1.0 - y, max(0.0, float(box.get("h") or 0)))
-        except (TypeError, ValueError):
-            continue
-        if w < 0.001 or h < 0.001:
-            continue
-        role = str(it.get("role") or "body").lower()
-        if not _RW_ROLE_RE.match(role):
-            role = "body"
-        rec = {"id": f"r{len(items)}", "role": role,
-               "src_type": src_type, "order": len(items),
-               "box": {"x": round(x, 5), "y": round(y, 5),
-                       "w": round(w, 5), "h": round(h, 5)},
-               "text": str(it.get("text") or "")[:20000]}
-        # the normalized reading layer (long-s resolved, dehyphenated…),
-        # stored only when it exists — compose_text falls back per region
-        norm = str(it.get("norm") or "")[:20000]
-        if norm:
-            rec["norm"] = norm
-        items.append(rec)
-    return items
-
-
-def _rw_sanitize_dims(dims):
-    if not isinstance(dims, dict):
-        return None
-    try:
-        return {k: int(dims.get(k) or 0) for k in ("w", "h", "dpi")}
-    except (TypeError, ValueError, OverflowError):
-        return None
+# The sanitizers live in tools/libformat.py now — the single implementation
+# the .lib Python API and these routes share, so a file that round-trips
+# through the API can never come out a shape the app rejects. These aliases
+# keep the in-module names (and their exact call sites) unchanged.
+_RW_MAX_ITEMS = libformat.MAX_ITEMS
+_RW_ROLE_RE = libformat.ROLE_RE
+_rw_sanitize_items = libformat.sanitize_page_items
+_rw_sanitize_dims = libformat.sanitize_dims
 
 
 @app.route("/api/builds/<build_id>/ocr-regions", methods=["PUT"])
@@ -2688,41 +2647,8 @@ _LIB_META_FIELDS = ("published_slug", "title", "subtitle", "authors", "year",
                     "language", "pages", "source_url")
 
 
-_RW_HEX_RE = re.compile(r"^#[0-9a-fA-F]{3,8}$")
-
-
-def _rw_sanitize_styles(raw: dict) -> dict:
-    """A role->style mapping scrubbed for storage. Shared by the style-board
-    PUT and the .lib import — a .lib is somebody else's file."""
-    styles = {}
-    for role, st in raw.items():
-        role = str(role).lower()
-        if not _RW_ROLE_RE.match(role) or not isinstance(st, dict):
-            continue
-        out = {}
-        family = str(st.get("family") or "").strip()[:60]
-        if family:
-            out["family"] = family
-        for k, lo, hi in (("size_em", 0.3, 4.0), ("leading", 0.8, 3.0)):
-            try:
-                v = float(st.get(k))
-            except (TypeError, ValueError, OverflowError):
-                continue
-            if lo <= v <= hi:
-                out[k] = round(v, 2)
-        if st.get("style") in ("italic", "normal"):
-            out["style"] = st["style"]
-        if st.get("variant") in ("small-caps", "normal"):
-            out["variant"] = st["variant"]
-        if st.get("align") in ("left", "right", "center", "justify"):
-            out["align"] = st["align"]
-        for k in ("color", "bg"):
-            v = str(st.get(k) or "")
-            if _RW_HEX_RE.match(v):
-                out[k] = v
-        if out:
-            styles[role] = out
-    return styles
+_RW_HEX_RE = libformat.HEX_RE
+_rw_sanitize_styles = libformat.sanitize_styles
 
 
 def _replica_style_path(build_id: str):
@@ -3168,11 +3094,13 @@ def api_build_replica_print(build_id: str):
     return Response(doc, mimetype="text/html")
 
 
-_LIB_MAX_BYTES = 250 * 1024 * 1024
-_LIB_MAX_FIGURE = 15 * 1024 * 1024
-_LIB_MAX_PAGES = 2000
-_LIB_MAX_JSON = 10 * 1024 * 1024          # per JSON member, decompressed
-_LIB_MAX_INFLATED = 300 * 1024 * 1024     # total page-JSON budget
+# the .lib size caps live in libformat now (one place both the API and this
+# route enforce); the aliases keep the call sites below unchanged
+_LIB_MAX_BYTES = libformat.MAX_BYTES
+_LIB_MAX_FIGURE = libformat.MAX_FIGURE
+_LIB_MAX_PAGES = libformat.MAX_PAGES
+_LIB_MAX_JSON = libformat.MAX_JSON            # per JSON member, decompressed
+_LIB_MAX_INFLATED = libformat.MAX_INFLATED    # total page-JSON budget
 
 
 @app.route("/api/builds/<build_id>/replica-import", methods=["POST"])
