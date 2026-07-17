@@ -176,6 +176,8 @@ const state = {
     // "" is the retired Classic CAD id; applyTheme() migrates it to DEFAULT_THEME
     paneWidth: null, theme: "", font: "", fontUi: "", fontMono2: "",
     aiBase: "", aiModel: "", aiKey: "", aiInstructions: "",
+    // embeddings provider for search-index publishing (#140); blank = lexical-only
+    embedBase: "", embedModel: "", embedKey: "",
     // OCR services (Settings > OCR). Tesseract runs locally; Claude /
     // Textract / Azure / OpenAI need credentials — cloud processing is
     // TODO-verify until the user has API keys.
@@ -2693,6 +2695,8 @@ function renderSettings() {
                         ["set-r2-public", "r2PublicBase"],
                         ["set-ai-base", "aiBase"], ["set-ai-model", "aiModel"],
                          ["set-ai-key", "aiKey"],
+                         ["set-embed-base", "embedBase"],
+                         ["set-embed-model", "embedModel"],
                          ["set-ai-instructions", "aiInstructions"]]) {
     const n = el(id);
     n.value = state.settings[k] || "";
@@ -2741,7 +2745,8 @@ function renderSettings() {
   // the others remain device-local.
   (async () => {
     const SECRET_FIELDS = [
-      ["set-ai-key", "aiKey"], ["set-mistral-key", "mistralKey"],
+      ["set-ai-key", "aiKey"], ["set-embed-key", "embedKey"],
+      ["set-mistral-key", "mistralKey"],
       ["set-ocr-claude-key", "ocrClaudeKey"], ["set-ocr-azure-key", "ocrAzureKey"],
       ["set-ocr-aws-key", "ocrAwsKey"], ["set-ocr-aws-secret", "ocrAwsSecret"],
       ["set-sb-key", "supabaseKey"], ["set-sb-anon", "supabaseAnonKey"],
@@ -8109,7 +8114,7 @@ function setWorkbenchPhase(phase, persist) {
   else if (phase === "knowledge") { renderAnMain(); renderAnFacsimile(); }
   else if (phase === "publish") {
     const b = anSelected();
-    if (b) renderAnBundle(b);
+    if (b) { renderAnBundle(b); renderAnIndexCard(b); }
   }
 }
 
@@ -8142,7 +8147,7 @@ function applyWorkbenchGates() {
   el("wb-publish-locked").hidden = !pubNote;
   el("wb-publish-locked").textContent = pubNote;
   el("wb-publish-actions").hidden = !b;
-  el("an-bundle").hidden = !b || !!pubNote;
+  el("wb-publish-cards").hidden = !b || !!pubNote;
   el("wb-source-empty").hidden = !!b;
   el("wb-source-body").hidden = !b;
 }
@@ -8455,6 +8460,7 @@ function renderAnPane(id) {
   else if (id === "an-cats") renderAnCats(b);
   else if (id === "an-trans") loadAnTranslations(b);
   else if (id === "an-notes") loadAnNotes(b);
+  else if (id === "an-passages") loadAnPassages(b);
   else if (id === "an-rel") renderAnRelevance(b);
   else if (id === "an-bundle") renderAnBundle(b);
 }
@@ -8561,6 +8567,12 @@ function anEnsurePolling() {
             el("an-msg").textContent = "";
             renderAnPane(activeAnPane());
             renderOcrDocs();
+            // the Publish phase's Search index card tracks these jobs too
+            if (["segment", "index-publish"].includes(meta.kind) &&
+                wbActivePhase() === "publish") {
+              const cur = state.builds[meta.buildId];
+              if (cur) renderAnIndexCard(cur);
+            }
           }
         }
       }
@@ -8827,6 +8839,232 @@ async function anSaveBundle() {
   } else el("an-bundle-msg").textContent = "save failed";
 }
 
+// --- Passages (#140): structure-aware search passages over the OCR text ----------
+
+let anPassages = null;    // {doc, state} for the selected book, or null
+const AN_PSG_CAP = 300;   // rows rendered; the artifact itself is uncapped
+
+async function loadAnPassages(b) {
+  try {
+    const data = await (await fetch(`/api/builds/${b.id}/passages`)).json();
+    if (state.anSel !== b.id) return;   // stale response
+    anPassages = data.ok ? data : null;
+  } catch (e) { anPassages = null; }
+  renderAnPassages();
+}
+
+function psgTokens(t) {
+  const s = String(t || "").trim();
+  return s ? s.split(/\s+/).length : 0;
+}
+
+function renderAnPassages() {
+  const host = el("an-psg-rows");
+  if (!host) return;
+  const doc = anPassages && anPassages.doc;
+  const st = (anPassages && anPassages.state) || {};
+  const passages = (doc && doc.passages) || [];
+  const excluded = new Set((doc && doc.excluded) || []);
+  el("an-psg-generate").textContent = doc ? "Regenerate" : "Generate";
+  const r = st.recipe || {};
+  el("an-psg-recipe").textContent = r.child_min
+    ? `${r.child_min}–${r.child_max} / ${r.parent_min}–${r.parent_max} tokens`
+    : "";
+  el("an-psg-count").textContent = passages.length
+    ? `${passages.length} passages · ${excluded.size} excluded` : "";
+  el("an-psg-stale").hidden = st.stale !== true;
+  el("an-psg-empty").hidden = !!passages.length;
+  el("an-psg-view").hidden = true;
+  const over = passages.length > AN_PSG_CAP;
+  el("an-psg-more").hidden = !over;
+  if (over) {
+    el("an-psg-more").textContent =
+      `Showing the first ${AN_PSG_CAP} of ${passages.length} passages.`;
+  }
+  let prevParent = null;
+  host.innerHTML = passages.slice(0, AN_PSG_CAP).map((p, i) => {
+    // a thin separator row where a new parent section begins — under-styled
+    const sep = prevParent !== null && p.parent_id !== prevParent
+      ? `<tr class="psg-sep"><td colspan="4"></td></tr>` : "";
+    prevParent = p.parent_id;
+    const pages = p.page_from === p.page_to
+      ? String(p.page_from ?? "") : `${p.page_from}–${p.page_to}`;
+    const toks = psgTokens(p.text);
+    const open = String(p.text || "").trim().split(/\s+/).slice(0, 9).join(" ");
+    const out = excluded.has(p.id);
+    const next = passages[i + 1];
+    const canMerge = !!next && next.parent_id === p.parent_id;
+    return sep +
+      `<tr class="psg-row${out ? " psg-excluded" : ""}" data-psg="${esc(p.id)}">
+      <td class="psg-pages">${esc(pages)}</td>
+      <td class="psg-open">${esc(open)}${toks > 9 ? "…" : ""}</td>
+      <td class="psg-toks">${toks}</td>
+      <td class="psg-acts">
+        <button class="cad-btn tiny" data-psg-x="${esc(p.id)}" type="button">${
+          out ? "Include" : "Exclude"}</button>
+        <button class="cad-btn tiny" data-psg-split="${esc(p.id)}" type="button"
+                data-tip="Split at the middle sentence boundary">Split</button>
+        <button class="cad-btn tiny" data-psg-merge="${esc(p.id)}" type="button"${
+          canMerge ? "" : " disabled"}
+                data-tip="Merge with the next passage in the same section">Merge</button>
+      </td></tr>`;
+  }).join("");
+}
+
+async function anPsgPatch(body) {
+  const b = anSelected();
+  if (!b) return;
+  try {
+    const res = await fetch(`/api/builds/${b.id}/passages`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      el("an-psg-msg").textContent = data.error || "edit failed";
+      return;
+    }
+    el("an-psg-msg").textContent = "";
+    anPassages = data;
+    renderAnPassages();
+  } catch (e) {
+    el("an-psg-msg").textContent = "request failed";
+  }
+}
+
+function onAnPsgClick(ev) {
+  const x = ev.target.closest("[data-psg-x]");
+  if (x) {
+    const out = x.closest(".psg-row").classList.contains("psg-excluded");
+    anPsgPatch(out ? { include: [x.dataset.psgX] }
+                   : { exclude: [x.dataset.psgX] });
+    return;
+  }
+  const s = ev.target.closest("[data-psg-split]");
+  if (s) { anPsgPatch({ split: { id: s.dataset.psgSplit } }); return; }
+  const m = ev.target.closest("[data-psg-merge]");
+  if (m) { anPsgPatch({ merge: { id: m.dataset.psgMerge } }); return; }
+  const row = ev.target.closest(".psg-row");
+  if (!row) return;
+  const doc = anPassages && anPassages.doc;
+  const p = ((doc && doc.passages) || []).find((q) => q.id === row.dataset.psg);
+  if (p) {
+    el("an-psg-view").textContent = p.text || "";
+    el("an-psg-view").hidden = false;
+  }
+}
+
+// --- Publish phase: the Search index card (#140) ---------------------------------
+
+async function renderAnIndexCard(b) {
+  const stateEl = el("an-index-state");
+  if (!stateEl || !b) return;
+  stateEl.textContent = "…";
+  el("an-index-note").textContent = "";
+  el("an-index-versions").innerHTML = "";
+  el("an-index-rollback").hidden = true;
+  let data = null;
+  try {
+    data = await (await fetch(
+      `/api/knowledge/index/status?build_id=${encodeURIComponent(b.id)}`)).json();
+  } catch (e) { /* fall through */ }
+  if (state.buildSel !== b.id) return;   // stale response
+  if (!data || !data.ok) { stateEl.textContent = "status unavailable"; return; }
+  const st = data.state || {};
+  const versions = data.versions || [];
+  let line;
+  if (versions.length) {
+    const v = versions[0];
+    const when = v.built_at ? new Date(v.built_at).toLocaleString() : "";
+    line = `published v${versions.length} · ${v.channel || "stable"}` +
+      (when ? ` · ${when}` : "");
+    if (st.sha256 && v.source_hash && v.source_hash !== st.sha256) {
+      line += " · outdated — the text changed since";
+    }
+  } else if (!st.exists) line = "no passages";
+  else if (st.stale) line = "passages outdated";
+  else line = "ready to publish";
+  stateEl.textContent = line;
+  if (data.warning) el("an-index-note").textContent = data.warning;
+  el("an-index-rollback").hidden = versions.length < 2;
+  el("an-index-versions").innerHTML = versions.slice(0, 6).map((v, i) => {
+    const s = v.stats || {};
+    const model = (v.config || {}).model;
+    return `<div class="an-index-ver">
+      <span class="psg-pages">v${versions.length - i}</span>
+      <span>${esc(v.channel || "stable")}</span>
+      <span>${v.built_at ? esc(new Date(v.built_at).toLocaleString()) : ""}</span>
+      <span>${Number(s.passages) || 0} passages</span>
+      <span>${model ? esc(model) : "lexical"}</span>
+    </div>`;
+  }).join("");
+}
+
+async function anIndexPublish() {
+  const b = anSelected();
+  if (!b) return;
+  const btn = el("an-index-publish");
+  btn.disabled = true;
+  el("an-index-note").textContent = "";
+  try {
+    const res = await fetch("/api/knowledge/index/publish", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ build_id: b.id }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      btn.disabled = false;
+      el("an-index-note").textContent = data.error || "failed";
+      return;
+    }
+    anJobs.set(data.job, {
+      kind: "index-publish", buildId: b.id, btn,
+      path: "/api/knowledge/index/publish",
+      book: b.title || b.id, engine: data.model || "lexical",
+      pages: [], doc: "", artifact: data.slug || "",
+      status: "Starting...", at: new Date().toLocaleTimeString(),
+      finished: false,
+    });
+    el("an-index-state").textContent = "publishing…";
+    status("SEARCH INDEX :: PUBLISH STARTED");
+    renderOcrQueue();
+    anEnsurePolling();
+  } catch (e) {
+    btn.disabled = false;
+    el("an-index-note").textContent = "request failed";
+  }
+}
+
+async function anIndexRollback() {
+  const b = anSelected();
+  if (!b) return;
+  if (!(await confirmDialog({
+    title: "Roll back search index",
+    message: "Remove the newest index version?",
+    detail: "The previous version becomes current. The archive entry is untouched.",
+    confirmLabel: "Roll back",
+    danger: true,
+  }))) return;
+  try {
+    const res = await fetch("/api/knowledge/index/rollback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ build_id: b.id }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      el("an-index-note").textContent = data.error || "rollback failed";
+      return;
+    }
+    status("SEARCH INDEX :: ROLLED BACK");
+    renderAnIndexCard(b);
+  } catch (e) {
+    el("an-index-note").textContent = "request failed";
+  }
+}
+
 // --- wiring ----------------------------------------------------------------------
 
 function initAnalyze() {
@@ -9037,6 +9275,15 @@ function initAnalyze() {
   });
 
   el("an-bundle-save").addEventListener("click", anSaveBundle);
+
+  el("an-psg-generate").addEventListener("click", () => {
+    const b = anSelected();
+    if (b) anStartJob("/api/knowledge/segment", { build_id: b.id }, "segment",
+                      el("an-psg-generate"));
+  });
+  el("an-psg-wrap").addEventListener("click", onAnPsgClick);
+  el("an-index-publish").addEventListener("click", anIndexPublish);
+  el("an-index-rollback").addEventListener("click", anIndexRollback);
 
   // Record -> Knowledge jump for the open book (same Workbench selection)
   el("b-analyze").addEventListener("click", () => {
@@ -13009,6 +13256,8 @@ function jobTypeLabel(kind) {
   if (kind === "publish") return "Publish";
   if (kind === "download") return "Download";
   if (kind === "cloudsync") return "Cloud sync";
+  if (kind === "segment") return "Passages";
+  if (kind === "index-publish") return "Search index";
   return "Text analysis";
 }
 
@@ -13148,7 +13397,7 @@ function renderOcrQueue() {
     tr.dataset.analysisJob = id;
     const artifact = j.artifact || (j.pages && j.pages.length
       ? `Pages ${j.pages.join(", ")}` : j.kind);
-    tr.innerHTML = `<td>Text analysis</td><td>${esc(j.book || j.buildId)}</td>` +
+    tr.innerHTML = `<td>${esc(jobTypeLabel(j.kind))}</td><td>${esc(j.book || j.buildId)}</td>` +
       `<td>${esc(artifact)}</td>` +
       `<td>${esc(TEXT_ANALYSIS_LABELS[j.engine] || j.engine || "Configured AI")}</td>` +
       `<td>${esc(j.status || "Starting...")}</td><td>${esc(j.at || "")}</td><td></td>`;
