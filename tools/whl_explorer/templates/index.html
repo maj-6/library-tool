@@ -86,9 +86,8 @@
   <div id="tabs">
     <button class="tab active" data-tab="home">Home</button>
     <button class="tab" data-tab="checked">Catalogs</button>
-    <button class="tab" data-tab="upload">Editor</button>
-    <button class="tab" data-tab="ocr">Analyze</button>
-    <button class="tab" data-tab="publish">Publish</button>
+    <button class="tab" data-tab="workbench">Workbench</button>
+    <button class="tab" data-tab="publish">Published Library</button>
     <button class="tab" data-tab="infotab">Info</button>
     <span class="bar-spacer"></span>
     <div class="tb-group">
@@ -586,47 +585,77 @@
       </div>
     </section>
 
-    <!-- EDITOR -->
-    <section id="upload" class="panel-view">
-      <div id="upload-split">
-        <div id="builds-pane">
+    <!-- WORKBENCH: one book-centred surface (issue #133, stage 1). Five
+         phases — Record, Source, Text, Knowledge, Publish — over one shared
+         book selection. The panes were MOVED here from the former Editor and
+         Analyze tabs; element ids and event contracts are preserved. -->
+    <section id="workbench" class="panel-view">
+      <div id="wb-split">
+        <div id="ocr-side">
           <div class="pane-bar" id="builds-tabs">
             <button class="pane-tab active" data-bstab="pending" type="button"
                     data-tip="Awaiting publication">Pending</button>
             <button class="pane-tab" data-bstab="uploaded" type="button"
-                    data-tip="Already uploaded to WHL">Uploaded</button>
-            <span class="tool-count" id="upload-count"></span></div>
-          <div class="drafting" id="builds-list-wrap">
-            <ul id="builds-list"></ul>
-            <p id="builds-empty" class="empty">No entries yet</p>
+                    data-tip="Already published to WHL">Uploaded</button>
+            <span class="tool-count" id="upload-count"></span>
+            <span class="bar-spacer"></span>
+            <button id="ocr-filter-verified" class="cad-btn tiny icon-btn toggle" type="button"
+                    data-icon="check" data-tip="Show verified books only"></button>
+          </div>
+          <div class="drafting" id="ocr-books-wrap">
+            <ul id="ocr-books"></ul>
+            <p id="ocr-books-empty" class="empty">No entries yet</p>
+          </div>
+          <div id="ocr-side-splitter"></div>
+          <div class="pane-bar"><span class="tool-label">Artifacts</span>
+            <span class="bar-spacer"></span>
+            <button id="ocr-load-file" class="cad-btn tiny icon-btn" type="button"
+                    data-icon="fileup" data-tip="Load OCR text files"></button>
+            <input id="ocr-file-input" type="file" accept=".txt,.text,.md" multiple hidden />
+          </div>
+          <div class="drafting" id="ocr-doc-wrap">
+            <ul id="ocr-docs"></ul>
+            <p id="ocr-docs-empty" class="empty">No artifacts</p>
           </div>
         </div>
-        <div id="builds-splitter"></div>
-
-        <div id="build-empty" class="empty build-empty" hidden><span>Select an entry on the left, or press <b>+</b> to create one.</span></div>
-        <div id="build-editor" hidden>
-          <div class="mf-actions build-actions">
-            <button id="build-save" class="cad-btn icon-btn" type="button"
-                    data-icon="save" data-tip="Save"></button>
-            <button id="build-delete" class="cad-btn icon-btn danger" type="button"
-                    data-icon="trash" data-tip="Delete"></button>
-            <span class="act-sep"></span>
-            <button id="b-ready" class="cad-btn icon-btn toggle" type="button"
-                    data-icon="check" data-tip="Mark verified — the metadata is confirmed and the entry can be published (distinct from a verified source, which is a good scan matched to a record)"></button>
-            <button id="build-upload" class="cad-btn icon-btn" type="button"
-                    data-icon="export" data-tip="Publish to the Library Tool cloud — uploads the PDF and lists the volume on the website"></button>
-            <button id="b-analyze" class="cad-btn tiny" type="button"
-                    data-tip="Open this entry in the Analyze tab (verified entries only)">Analyze</button>
-            <span id="b-verified-tag" class="foot-tag tag-verified" hidden>Verified</span>
+        <div id="ocr-splitter"></div>
+        <nav id="wb-rail" aria-label="Workbench phases">
+          <button class="wb-phase-btn active" data-phase="record" type="button"
+                  data-tip="The catalogue record: metadata and description">Record</button>
+          <button class="wb-phase-btn" data-phase="source" type="button"
+                  data-tip="The PDF scan and its resources">Source</button>
+          <button class="wb-phase-btn" data-phase="text" type="button"
+                  data-tip="The OCR document editor">Text</button>
+          <button class="wb-phase-btn" data-phase="knowledge" type="button"
+                  data-tip="Summaries, categories, translations, annotations">Knowledge</button>
+          <button class="wb-phase-btn" data-phase="publish" type="button"
+                  data-tip="Verify, choose the bundle, and publish">Publish</button>
+        </nav>
+        <div id="wb-main">
+          <div class="pane-bar" id="wb-head">
+            <span id="wb-title"></span>
+            <span id="wb-sub" class="tool-label"></span>
+            <span id="wb-chips"></span>
+            <span class="bar-spacer"></span>
             <span class="tool-label" id="build-msg"></span>
           </div>
-          <div class="pane-tabs" id="build-tabs">
-            <button class="pane-tab active" data-btab="btab-entry" type="button">Entry</button>
-            <button class="pane-tab" data-btab="btab-source" type="button">Source (PDF)</button>
-            <button class="pane-tab" data-btab="btab-resources" type="button">Resources</button>
-          </div>
 
-          <div id="btab-entry" class="pane-sub active">
+          <!-- RECORD: the former Editor Entry pane + the verified-sources table -->
+          <div class="wb-phase active" id="phase-record">
+            <div id="upload-split">
+              <div id="build-empty" class="empty build-empty" hidden><span>Select a book on the left, or press <b>+</b> to create one.</span></div>
+              <div id="build-editor" hidden>
+                <div class="mf-actions build-actions">
+                  <button id="build-save" class="cad-btn icon-btn" type="button"
+                          data-icon="save" data-tip="Save"></button>
+                  <button id="build-delete" class="cad-btn icon-btn danger" type="button"
+                          data-icon="trash" data-tip="Delete"></button>
+                  <span class="act-sep"></span>
+                  <button id="b-analyze" class="cad-btn tiny" type="button"
+                          data-tip="Open the Knowledge phase (verified entries only)">Analyze</button>
+                </div>
+
+                <div id="btab-entry" class="pane-sub active">
             <div id="build-entry-split">
               <form id="build-form" autocomplete="off">
                 <div class="mf-grid">
@@ -675,20 +704,6 @@
                     <label class="tool-label" for="b-pages">Pages</label>
                     <input id="b-pages" class="cad-input" />
                   </div>
-                  <div class="mf-field mf-third">
-                    <label class="tool-label" for="b-rights">Rights
-                      <a id="b-rights-suggest" class="mini-link" href="#"
-                         data-tip="Check the offline renewal data; a clear public-domain finding preselects">Suggest</a>
-                    </label>
-                    <select id="b-rights" class="cad-input"
-                            data-tip="What may publish: text only for public domain / cleared (docs/rights.md)">
-                      <option value="">Undecided</option>
-                      <option value="public-domain">Public domain</option>
-                      <option value="cleared">Cleared</option>
-                      <option value="searchable-only">Search only</option>
-                      <option value="no-public-text">No public text</option>
-                    </select>
-                  </div>
                   <div class="mf-field mf-full">
                     <label class="tool-label">Categories</label>
                     <div id="b-categories" class="cat-picker"></div>
@@ -727,57 +742,9 @@
             </div>
           </div>
 
-          <div id="btab-source" class="pane-sub">
-            <div class="src-row">
-              <label class="tool-label" for="b-pdf_file">Primary PDF source</label>
-              <input id="b-pdf_file" class="cad-input" spellcheck="false" />
-              <button id="b-pdf-browse" class="cad-btn icon-btn" type="button"
-                      data-icon="folder" data-tip="Browse"></button>
-              <button id="b-pdf-attach" class="cad-btn icon-btn" type="button"
-                      data-icon="attach" data-tip="Attach as the primary PDF source"></button>
-              <span class="tool-label" id="b-src-msg"></span>
+              </div>
             </div>
-            <div class="src-row">
-              <label class="tool-label">Secondary</label>
-              <span id="b-pdf-sources" class="ocr-chiplist"></span>
-              <button id="b-pdf2-add" class="cad-btn tiny icon-btn" type="button"
-                      data-icon="docplus" data-tip="Add a secondary PDF source — another scan of the same book"></button>
-            </div>
-            <div class="src-row">
-              <label class="tool-label">OCR</label>
-              <span id="b-ocr-list" class="ocr-chiplist"></span>
-              <span class="bar-spacer"></span>
-              <button id="b-ocr-load" class="cad-btn tiny icon-btn" type="button"
-                      data-icon="fileup" data-tip="Load an OCR text file"></button>
-              <button id="b-folder" class="cad-btn tiny icon-btn" type="button"
-                      data-icon="foldersync" data-tip="Create/refresh the entry folder (metadata, PDF preview, extracted OCR)"></button>
-              <input id="b-ocr-file" type="file" accept=".txt,.text,.md" hidden />
-            </div>
-            <div id="b-pdf-viewer"></div>
-          </div>
-
-          <div id="btab-resources" class="pane-sub">
-            <div class="res-section">
-              <label class="tool-label">Current thumbnail</label>
-              <div id="res-current" class="res-current"></div>
-            </div>
-            <div class="res-section">
-              <label class="tool-label">Title pages</label>
-              <div id="res-titlepages" class="res-gallery"></div>
-            </div>
-            <div class="res-section">
-              <label class="tool-label">Cover candidate</label>
-              <div id="res-cover" class="res-gallery"></div>
-            </div>
-            <div class="res-section">
-              <label class="tool-label">Extracted images (Mistral OCR)</label>
-              <div id="res-images" class="res-gallery"></div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div id="upload-splitter"></div>
+            <div id="upload-splitter"></div>
 
       <div id="upload-sources-pane">
         <div class="pane-bar"><span class="tool-label"
@@ -808,40 +775,72 @@
           <p id="upload-empty" class="empty">No verified sources</p>
         </div>
       </div>
-    </section>
-    <!-- OCR: processing, reviewing, and editing OCR data. Targets are the
-         books' PDFs; the sidebar lists every entry folder. -->
-    <section id="ocr" class="panel-view">
-      <div id="ocr-split">
-        <div id="ocr-side">
-          <div class="pane-bar"><span class="tool-label">Books</span>
-            <span class="bar-spacer"></span>
-            <button id="ocr-filter-verified" class="cad-btn tiny icon-btn toggle" type="button"
-                    data-icon="check" data-tip="Show verified books only"></button>
           </div>
-          <div class="drafting" id="ocr-books-wrap">
-            <ul id="ocr-books"></ul>
-            <p id="ocr-books-empty" class="empty">No book folders (build them in the Editor tab)</p>
+
+          <!-- SOURCE: the former Editor Source (PDF) + Resources panes -->
+          <div class="wb-phase" id="phase-source">
+            <div id="wb-source-empty" class="empty build-empty" hidden><span>Select a book on the left.</span></div>
+            <div id="wb-source-body" hidden>
+              <div class="pane-tabs" id="build-tabs">
+                <button class="pane-tab active" data-btab="btab-source" type="button">Source (PDF)</button>
+                <button class="pane-tab" data-btab="btab-resources" type="button">Resources</button>
+              </div>
+
+              <div id="btab-source" class="pane-sub active">
+                <div class="src-row">
+                  <label class="tool-label" for="b-pdf_file">Primary PDF source</label>
+                  <input id="b-pdf_file" class="cad-input" spellcheck="false" />
+                  <button id="b-pdf-browse" class="cad-btn icon-btn" type="button"
+                          data-icon="folder" data-tip="Browse"></button>
+                  <button id="b-pdf-attach" class="cad-btn icon-btn" type="button"
+                          data-icon="attach" data-tip="Attach as the primary PDF source"></button>
+                  <span class="tool-label" id="b-src-msg"></span>
+                </div>
+                <div class="src-row">
+                  <label class="tool-label">Secondary</label>
+                  <span id="b-pdf-sources" class="ocr-chiplist"></span>
+                  <button id="b-pdf2-add" class="cad-btn tiny icon-btn" type="button"
+                          data-icon="docplus" data-tip="Add a secondary PDF source — another scan of the same book"></button>
+                </div>
+                <div class="src-row">
+                  <label class="tool-label">OCR</label>
+                  <span id="b-ocr-list" class="ocr-chiplist"></span>
+                  <span class="bar-spacer"></span>
+                  <button id="b-ocr-load" class="cad-btn tiny icon-btn" type="button"
+                          data-icon="fileup" data-tip="Load an OCR text file"></button>
+                  <button id="b-folder" class="cad-btn tiny icon-btn" type="button"
+                          data-icon="foldersync" data-tip="Create/refresh the entry folder (metadata, PDF preview, extracted OCR)"></button>
+                  <input id="b-ocr-file" type="file" accept=".txt,.text,.md" hidden />
+                </div>
+                <div id="b-pdf-viewer"></div>
+              </div>
+
+              <div id="btab-resources" class="pane-sub">
+                <div class="res-section">
+                  <label class="tool-label">Current thumbnail</label>
+                  <div id="res-current" class="res-current"></div>
+                </div>
+                <div class="res-section">
+                  <label class="tool-label">Title pages</label>
+                  <div id="res-titlepages" class="res-gallery"></div>
+                </div>
+                <div class="res-section">
+                  <label class="tool-label">Cover candidate</label>
+                  <div id="res-cover" class="res-gallery"></div>
+                </div>
+                <div class="res-section">
+                  <label class="tool-label">Extracted images (Mistral OCR)</label>
+                  <div id="res-images" class="res-gallery"></div>
+                </div>
+              </div>
+            </div>
           </div>
-          <div id="ocr-side-splitter"></div>
-          <div class="pane-bar"><span class="tool-label">Artifacts</span>
-            <span class="bar-spacer"></span>
-            <button id="ocr-load-file" class="cad-btn tiny icon-btn" type="button"
-                    data-icon="fileup" data-tip="Load OCR text files"></button>
-            <input id="ocr-file-input" type="file" accept=".txt,.text,.md" multiple hidden />
-          </div>
-          <div class="drafting" id="ocr-doc-wrap">
-            <ul id="ocr-docs"></ul>
-            <p id="ocr-docs-empty" class="empty">No artifacts</p>
-          </div>
-        </div>
-        <div id="ocr-splitter"></div>
-        <div id="ocr-workspace">
-          <div class="pane-tabs" id="ocr-workspace-tabs">
-            <button class="pane-tab active" data-worktab="analysis" type="button">Analysis</button>
-            <button class="pane-tab" data-worktab="document" type="button">Document</button>
-          </div>
-          <div id="ocr-analysis-workspace" class="ocr-workpane active">
+
+          <!-- KNOWLEDGE: the former Analyze Analysis workspace — facsimile
+               staging beside the transplanted #an-main panes -->
+          <div class="wb-phase" id="phase-knowledge">
+            <p id="wb-knowledge-locked" class="empty" hidden></p>
+            <div id="ocr-analysis-workspace" class="ocr-workpane active">
             <div id="an-facsimile-pane">
               <div class="pane-bar">
                 <span class="tool-label">Facsimile</span>
@@ -857,8 +856,13 @@
             </div>
             <div id="an-facsimile-splitter"></div>
             <div id="an-integrated-host"></div>
+            </div>
           </div>
-          <div id="ocr-document-workspace" class="ocr-workpane" hidden>
+
+          <!-- TEXT: the former Analyze Document workspace (the OCR editor) -->
+          <div class="wb-phase" id="phase-text">
+            <p id="wb-text-locked" class="empty" hidden></p>
+            <div id="ocr-document-workspace" class="ocr-workpane active">
             <div id="ocr-mainpane">
           <div class="pane-bar">
             <button id="ocr-view-edit" class="cad-btn tiny icon-btn" type="button"
@@ -907,34 +911,83 @@
           <div class="ocr-keymap" id="ocr-keymap" hidden></div>
               <div class="drafting" id="ocr-pages"></div>
             </div>
+            </div>
+          </div>
+
+          <!-- PUBLISH: verify + rights + the publish action (former Editor)
+               beside the publish bundle (former Analyze Bundle pane) -->
+          <div class="wb-phase" id="phase-publish">
+            <div class="mf-actions build-actions" id="wb-publish-actions" hidden>
+              <button id="b-ready" class="cad-btn icon-btn toggle" type="button"
+                      data-icon="check" data-tip="Mark verified — the metadata is confirmed and the entry can be published (distinct from a verified source, which is a good scan matched to a record)"></button>
+              <span id="b-verified-tag" class="foot-tag tag-verified" hidden>Verified</span>
+              <span class="act-sep"></span>
+              <label class="tool-label" for="b-rights">Rights
+                <a id="b-rights-suggest" class="mini-link" href="#"
+                   data-tip="Check the offline renewal data; a clear public-domain finding preselects">Suggest</a></label>
+              <select id="b-rights" class="cad-input"
+                      data-tip="What may publish: text only for public domain / cleared (docs/rights.md)">
+                <option value="">Undecided</option>
+                <option value="public-domain">Public domain</option>
+                <option value="cleared">Cleared</option>
+                <option value="searchable-only">Search only</option>
+                <option value="no-public-text">No public text</option>
+              </select>
+              <span class="act-sep"></span>
+              <button id="build-upload" class="cad-btn icon-btn" type="button"
+                      data-icon="export" data-tip="Publish to the Library Tool cloud — uploads the PDF and lists the volume on the website"></button>
+            </div>
+            <p id="wb-publish-locked" class="empty" hidden></p>
+            <div class="an-pane active" id="an-bundle">
+              <p class="pane-note">What publishes with this book beyond the PDF.
+                Everything unchecked — and the relevance assessment, always —
+                stays on this machine. Applied on the next publish.</p>
+              <div id="an-bundle-opts"></div>
+              <div class="mf-actions">
+                <button id="an-bundle-save" class="cad-btn tiny" type="button">Save bundle</button>
+                <span class="tool-label" id="an-bundle-msg"></span>
+              </div>
+            </div>
           </div>
         </div>
       </div>
-      <div id="ocr-queue-splitter"></div>
-      <div class="pane-bar">
-        <span class="tool-label">Jobs</span>
-        <span class="tb-sep"></span>
-        <button id="engine-defaults-open" class="cad-btn tiny" type="button"
-                data-tip="Choose the default OCR and text-analysis engines">Default Engine:</button>
-        <span id="engine-defaults-summary" class="tool-label"></span>
-        <button id="ocr-queue-add" class="cad-btn tiny icon-btn" type="button"
-                data-icon="plus" data-tip="Stage every page with the default OCR engine (nothing runs until Submit)"></button>
-        <button id="ocr-queue-clear" class="cad-btn tiny icon-btn" type="button"
-                data-icon="remove" data-tip="Un-stage all staged pages"></button>
-        <span class="tb-sep"></span>
-        <button id="ocr-submit" class="cad-btn tiny icon-btn" type="button"
-                data-icon="go" data-tip="Submit all staged pages — each runs the engine it was staged with"></button>
-        <span class="bar-spacer"></span>
-        <button id="ocr-queue-stop" class="cad-btn tiny icon-btn danger" type="button"
-                data-icon="remove" data-tip="Stop all running OCR jobs after their current pages finish"></button>
-        <span class="tool-count" id="ocr-queue-count"></span>
-      </div>
-      <div class="drafting" id="ocr-queue-wrap">
-        <table class="grid" id="ocr-queue-table">
-          <thead><tr><th>Type</th><th>Book</th><th>Artifact</th><th>Engine</th><th>Status</th><th>Submitted</th><th></th></tr></thead>
-          <tbody id="ocr-queue-rows"></tbody>
-        </table>
-        <p id="ocr-queue-empty" class="empty">No jobs</p>
+
+      <div id="ocr-queue-splitter" hidden></div>
+      <!-- JOBS DRAWER: background work, visible from every phase; collapsed
+           to a one-line summary by default -->
+      <div id="wb-jobs">
+        <div class="pane-bar" id="wb-jobs-bar">
+          <button id="wb-jobs-toggle" class="cad-btn tiny" type="button" aria-expanded="false"
+                  data-tip="Show the jobs queue">&#9656;</button>
+          <span class="tool-label">Jobs</span>
+          <span id="wb-jobs-summary" class="tool-label"></span>
+          <span class="bar-spacer"></span>
+          <span class="tool-count" id="ocr-queue-count"></span>
+        </div>
+        <div id="wb-jobs-body" hidden>
+          <div class="pane-bar">
+            <button id="engine-defaults-open" class="cad-btn tiny" type="button"
+                    data-tip="Choose the default OCR and text-analysis engines">Default Engine:</button>
+            <span id="engine-defaults-summary" class="tool-label"></span>
+            <button id="ocr-queue-add" class="cad-btn tiny icon-btn" type="button"
+                    data-icon="plus" data-tip="Stage every page with the default OCR engine (nothing runs until Submit)"></button>
+            <button id="ocr-queue-clear" class="cad-btn tiny icon-btn" type="button"
+                    data-icon="remove" data-tip="Un-stage all staged pages"></button>
+            <span class="tb-sep"></span>
+            <button id="ocr-submit" class="cad-btn tiny icon-btn" type="button"
+                    data-icon="go" data-tip="Submit all staged pages — each runs the engine it was staged with"></button>
+            <span class="bar-spacer"></span>
+            <button id="ocr-queue-stop" class="cad-btn tiny icon-btn danger" type="button"
+                    data-icon="remove" data-tip="Stop all running OCR jobs after their current pages finish"></button>
+          </div>
+          <div class="drafting" id="ocr-queue-wrap">
+            <table class="grid" id="ocr-queue-table">
+              <thead><tr><th>Type</th><th>Book</th><th>Artifact</th><th>Engine</th><th>Status</th><th>Submitted</th><th></th></tr></thead>
+              <tbody id="ocr-queue-rows"></tbody>
+            </table>
+            <p id="ocr-queue-empty" class="empty">No jobs</p>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -965,7 +1018,6 @@
               <button class="pane-tab" data-antab="an-trans" type="button">Translations</button>
               <button class="pane-tab" data-antab="an-notes" type="button">Annotations</button>
               <button class="pane-tab" data-antab="an-rel" type="button">Relevance</button>
-              <button class="pane-tab" data-antab="an-bundle" type="button">Bundle</button>
             </div>
 
             <div class="an-pane active" id="an-overview">
@@ -1039,18 +1091,6 @@
               </div>
               <div id="an-crit"></div>
               <div id="an-relres"></div>
-            </div>
-
-            <div class="an-pane" id="an-bundle">
-              <p class="pane-note">What publishes with this book beyond the PDF.
-                Everything unchecked — and the relevance assessment, always —
-                stays on this machine. Applied on the next publish from the
-                Editor.</p>
-              <div id="an-bundle-opts"></div>
-              <div class="mf-actions">
-                <button id="an-bundle-save" class="cad-btn tiny" type="button">Save bundle</button>
-                <span class="tool-label" id="an-bundle-msg"></span>
-              </div>
             </div>
           </div>
         </div>
@@ -1716,7 +1756,7 @@
     <span id="status-msg">READY</span>
     <span class="foot-right">
       <span id="status-jobs" class="foot-jobs" hidden
-            data-tip="Background jobs running — click for the Analyze queue"></span>
+            data-tip="Background jobs running — click for the Workbench jobs drawer"></span>
       <span id="dl-progress" class="dl-progress" hidden
             data-tip="Internet Archive PDF downloads running in the background">
         <span id="dl-progtext" class="dl-progtext"></span>
