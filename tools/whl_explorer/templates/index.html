@@ -735,6 +735,9 @@
                   <div class="mf-field mf-full">
                     <label class="tool-label" for="b-pdf_source">PDF source (URL)
                       <a id="b-pdf-open" class="mini-link" href="#" target="_blank" rel="noopener" hidden>Open</a>
+                      <button id="b-smartcheck" class="sc-wand sc-form-wand" type="button"
+                              data-icon="wand"
+                              data-tip="Smart check — extract real metadata from this book's PDF (Mistral OCR, then DeepSeek). Extracted values overlay the form until baked: TAB compares, SPACE over the form bakes them in."></button>
                     </label>
                     <input id="b-pdf_source" class="cad-input" />
                   </div>
@@ -962,14 +965,32 @@
                       data-icon="export" data-tip="Publish to the Library Tool cloud — uploads the PDF and lists the volume on the website"></button>
             </div>
             <p id="wb-publish-locked" class="empty" hidden></p>
-            <div class="an-pane active" id="an-bundle">
-              <p class="pane-note">What publishes with this book beyond the PDF.
-                Everything unchecked — and the relevance assessment, always —
-                stays on this machine. Applied on the next publish.</p>
-              <div id="an-bundle-opts"></div>
-              <div class="mf-actions">
-                <button id="an-bundle-save" class="cad-btn tiny" type="button">Save bundle</button>
-                <span class="tool-label" id="an-bundle-msg"></span>
+            <div id="wb-publish-cards" hidden>
+              <div class="an-pane active wb-pub-card" id="an-bundle">
+                <div class="pane-bar"><span class="tool-label">Archive entry</span></div>
+                <p class="pane-note">What publishes with this book beyond the PDF.
+                  Everything unchecked — and the relevance assessment, always —
+                  stays on this machine. Applied on the next publish.</p>
+                <div id="an-bundle-opts"></div>
+                <div class="mf-actions">
+                  <button id="an-bundle-save" class="cad-btn tiny" type="button">Save bundle</button>
+                  <span class="tool-label" id="an-bundle-msg"></span>
+                </div>
+              </div>
+              <!-- SEARCH INDEX: versioned, independent of the archive entry
+                   (#140) — corrected text re-indexes without republishing -->
+              <div class="an-pane active wb-pub-card" id="an-index">
+                <div class="pane-bar">
+                  <span class="tool-label">Search index</span>
+                  <span id="an-index-state" class="tool-label"></span>
+                  <span class="bar-spacer"></span>
+                  <button id="an-index-publish" class="cad-btn tiny" type="button"
+                          data-tip="Segment (if needed), embed when a provider is configured, and publish a new index version">Build &amp; publish index</button>
+                  <button id="an-index-rollback" class="cad-btn tiny danger" type="button" hidden
+                          data-tip="Remove the newest index version — the previous one becomes current">Roll back</button>
+                </div>
+                <p class="pane-note" id="an-index-note"></p>
+                <div id="an-index-versions"></div>
               </div>
             </div>
           </div>
@@ -982,7 +1003,7 @@
       <div id="wb-jobs">
         <div class="pane-bar" id="wb-jobs-bar">
           <button id="wb-jobs-toggle" class="cad-btn tiny" type="button" aria-expanded="false"
-                  data-tip="Show the jobs queue">&#9656;</button>
+                  aria-label="Jobs" data-tip="Show the jobs queue">&#9656;</button>
           <span class="tool-label">Jobs</span>
           <span id="wb-jobs-summary" class="tool-label"></span>
           <span class="bar-spacer"></span>
@@ -1041,6 +1062,7 @@
               <button class="pane-tab" data-antab="an-cats" type="button">Categories</button>
               <button class="pane-tab" data-antab="an-trans" type="button">Translations</button>
               <button class="pane-tab" data-antab="an-notes" type="button">Annotations</button>
+              <button class="pane-tab" data-antab="an-passages" type="button">Passages</button>
               <button class="pane-tab" data-antab="an-rel" type="button">Relevance</button>
             </div>
 
@@ -1104,6 +1126,31 @@
                 <span class="tool-label" id="an-notes-count"></span>
               </div>
               <div id="an-notes-list" class="drafting"></div>
+            </div>
+
+            <div class="an-pane" id="an-passages">
+              <div class="pane-bar">
+                <span class="tool-label">Passages</span>
+                <span id="an-psg-count" class="tool-count"></span>
+                <span id="an-psg-recipe" class="tool-label"></span>
+                <span class="bar-spacer"></span>
+                <span id="an-psg-msg" class="tool-label"></span>
+                <button id="an-psg-generate" class="cad-btn tiny" type="button"
+                        data-tip="Split the OCR text into search passages — structure first, token bounds second; sentences never break">Generate</button>
+              </div>
+              <p id="an-psg-stale" class="an-stale-note" hidden>Text changed
+                since these passages were generated &mdash; regenerate
+                (publishing the index also re-segments).</p>
+              <div class="drafting" id="an-psg-wrap">
+                <table class="grid" id="an-psg-table">
+                  <thead><tr><th>Pages</th><th>Opening words</th><th>~Tokens</th><th></th></tr></thead>
+                  <tbody id="an-psg-rows"></tbody>
+                </table>
+                <p id="an-psg-empty" class="empty">No passages yet &mdash;
+                  generate them from the OCR text.</p>
+                <p id="an-psg-more" class="pane-note" hidden></p>
+              </div>
+              <pre id="an-psg-view" class="an-text" hidden></pre>
             </div>
 
             <div class="an-pane" id="an-rel">
@@ -1176,9 +1223,11 @@
         <button id="con-follow" class="cad-btn tiny active" type="button"
                 data-tip="Scroll to follow new lines">Follow</button>
         <button id="con-copy" class="cad-btn tiny icon-btn" type="button"
-                data-icon="export" data-tip="Copy the visible lines"></button>
+                data-icon="export" data-tip="Copy the visible lines"
+                aria-label="Copy the visible lines"></button>
         <button id="con-clear" class="cad-btn tiny icon-btn danger" type="button"
-                data-icon="remove" data-tip="Clear the console (the server keeps its own ring)"></button>
+                data-icon="remove" data-tip="Clear the console (the server keeps its own ring)"
+                aria-label="Clear the console"></button>
       </div>
       <div id="con-lines"></div>
     </section>
@@ -1264,7 +1313,8 @@
         <div class="fb-path-row">
           <input id="fb-path" class="cad-input" spellcheck="false" />
           <button id="fb-go" class="cad-btn icon-btn" type="button"
-                  data-icon="go" data-tip="Open this folder"></button>
+                  data-icon="go" data-tip="Open this folder"
+                  aria-label="Open this folder"></button>
         </div>
         <div id="fb-drives"></div>
         <div id="fb-list"></div>
@@ -1283,9 +1333,11 @@
         <input id="attn-pop-review" type="checkbox" /> Needs review
       </label>
       <button id="attn-pop-save" class="cad-btn icon-btn" type="button"
-              data-icon="save" data-tip="Save reason &#183; Enter&#10;Esc keeps the mark without one"></button>
+              data-icon="save" data-tip="Save reason &#183; Enter&#10;Esc keeps the mark without one"
+              aria-label="Save reason"></button>
       <button id="attn-pop-clear" class="cad-btn icon-btn danger" type="button"
-              data-icon="remove" data-tip="Remove the mark"></button>
+              data-icon="remove" data-tip="Remove the mark"
+              aria-label="Remove the mark"></button>
     </div>
   </div>
 
@@ -1387,6 +1439,7 @@
           <button class="snav" data-sec="sec-credentials" type="button">Credentials</button>
           <button class="snav" data-sec="sec-updates" type="button">Updates</button>
           <button class="snav" data-sec="sec-advanced" type="button">Advanced</button>
+          <button class="snav" data-sec="sec-experimental" type="button">Experimental</button>
         </div>
         <div id="settings-content">
           <div id="sec-general" class="settings-sec active">
@@ -1528,6 +1581,14 @@
               <label class="tool-label" for="set-ai-timeout">Request timeout (seconds)</label>
               <input id="set-ai-timeout" class="cad-input" type="number" min="10" max="1200" step="10"
                      data-tip="How long an Analyze request may run before it is abandoned. Raise it for big summaries on slow or self-hosted endpoints." />
+              <label class="tool-label" for="set-embed-base">Embeddings API base URL</label>
+              <input id="set-embed-base" class="cad-input" spellcheck="false"
+                     placeholder="https://api.openai.com/v1"
+                     data-tip="Any OpenAI-compatible /embeddings endpoint. Used only when a search index publishes; blank keeps indexes lexical-only." />
+              <label class="tool-label" for="set-embed-model">Embeddings model</label>
+              <input id="set-embed-model" class="cad-input" spellcheck="false"
+                     placeholder="text-embedding-3-small"
+                     data-tip="Recorded on each index version, so the provider can change without breaking older versions. The key lives under Credentials." />
             </div>
           </div>
           <div id="sec-ocr" class="settings-sec">
@@ -1691,6 +1752,9 @@
             <div class="settings-rows">
               <label class="tool-label" for="set-ai-key">DeepSeek / AI provider API key</label>
               <input id="set-ai-key" class="cad-input" type="password" spellcheck="false" />
+              <label class="tool-label" for="set-embed-key">Embeddings provider API key</label>
+              <input id="set-embed-key" class="cad-input" type="password" spellcheck="false"
+                     data-tip="Optional — self-hosted embeddings endpoints work without one" />
             </div>
             <div class="settings-subhead" style="margin-top:16px">OCR</div>
             <div class="settings-rows">
@@ -1749,10 +1813,45 @@
             <p class="settings-note">Your library and settings live in the app's per-user data
               folder. Verbose logging helps diagnose failures — leave it off for normal use.</p>
           </div>
+          <div id="sec-experimental" class="settings-sec">
+            <div class="settings-head">Experimental features</div>
+            <p class="settings-note">Opt-in features still being built. They may be rough,
+              change, or disappear between builds — turn one off if it misbehaves.</p>
+            <div class="settings-subhead">Display sharpening</div>
+            <p class="settings-note">Overlays an unsharp filter across the whole interface to
+              crispen text and thin lines. Purely visual — it sits over the UI and never
+              touches your data. Strong settings can halo edges and cost a little GPU while on.</p>
+            <div class="settings-rows">
+              <label class="tool-label" for="set-exp-sharpen">Sharpen the interface</label>
+              <input id="set-exp-sharpen" type="checkbox"
+                     data-tip="Draw an adjustable sharpening layer over the entire interface" />
+              <label class="tool-label" for="set-exp-sharpen-amt">Amount</label>
+              <span class="set-slider-row">
+                <input id="set-exp-sharpen-amt" class="set-slider" type="range"
+                       min="0" max="100" step="1" />
+                <span id="set-exp-sharpen-val" class="set-slider-val">0%</span>
+              </span>
+            </div>
+          </div>
         </div>
       </div>
     </div>
   </div>
+
+  <!-- Adjustable interface sharpening (Settings › Experimental). The layer sits
+       above everything and sharpens whatever is painted behind it; the SVG
+       convolution kernel is rebuilt from the Amount slider. pointer-events:none
+       keeps it purely visual. Both hidden/inert until the feature is turned on. -->
+  <svg id="exp-sharpen-def" width="0" height="0" aria-hidden="true"
+       style="position:absolute;width:0;height:0;overflow:hidden">
+    <filter id="exp-sharpen-filter" x="0" y="0" width="100%" height="100%"
+            color-interpolation-filters="sRGB">
+      <feConvolveMatrix id="exp-sharpen-kernel" order="3" preserveAlpha="true"
+                        edgeMode="duplicate"
+                        kernelMatrix="0 0 0  0 1 0  0 0 0" />
+    </filter>
+  </svg>
+  <div id="exp-sharpen-layer" aria-hidden="true" hidden></div>
 
   <!-- ABOUT -->
   <div id="about-overlay" class="overlay" hidden>
@@ -1777,8 +1876,10 @@
   </div>
 
   <div id="statusbar">
-    <span id="status-msg">READY</span>
+    <span id="status-msg" role="status" aria-live="polite">READY</span>
     <span class="foot-right">
+      <span id="status-smart" class="foot-jobs" hidden
+            data-tip="Smart-check results held for review — TAB (or click here) toggles extracted vs original values, SPACE over a row bakes, Shift+click here dismisses all"></span>
       <span id="status-jobs" class="foot-jobs" hidden
             data-tip="Background jobs running — click for the Workbench jobs drawer"></span>
       <span id="dl-progress" class="dl-progress" hidden
@@ -1797,7 +1898,7 @@
       <div class="win-titlebar ia-bar">
         <span id="ia-title" class="ia-title">Internet Archive</span>
         <button id="ia-external" class="cad-btn tiny" type="button"
-                data-tip="Open on archive.org">&#8599;</button>
+                data-tip="Open on archive.org" aria-label="Open on archive.org">&#8599;</button>
         <button id="ia-close" class="win-close" type="button" aria-label="Close" data-icon="close"></button>
       </div>
       <div class="ia-body">
@@ -1994,9 +2095,9 @@
     <div id="webview-window" class="win webview-win">
       <div class="win-titlebar webview-bar">
         <button id="webview-external" class="cad-btn tiny" type="button"
-                data-tip="Open in your browser">&#8599;</button>
+                data-tip="Open in your browser" aria-label="Open in your browser">&#8599;</button>
         <button id="webview-reload" class="cad-btn tiny" type="button"
-                data-tip="Reload">&#8635;</button>
+                data-tip="Reload" aria-label="Reload">&#8635;</button>
         <span id="webview-url" class="webview-url"></span>
         <button id="webview-close" class="win-close" type="button" aria-label="Close" data-icon="close"></button>
       </div>

@@ -181,6 +181,8 @@ const state = {
     // "" is the retired Classic CAD id; applyTheme() migrates it to DEFAULT_THEME
     paneWidth: null, theme: "", font: "", fontUi: "", fontMono2: "",
     aiBase: "", aiModel: "", aiKey: "", aiInstructions: "",
+    // embeddings provider for search-index publishing (#140); blank = lexical-only
+    embedBase: "", embedModel: "", embedKey: "",
     // OCR services (Settings > OCR). Tesseract runs locally; Claude /
     // Textract / Azure / OpenAI need credentials — cloud processing is
     // TODO-verify until the user has API keys.
@@ -569,6 +571,42 @@ function applyFont() {
   else document.body.style.removeProperty("--mono2");
 }
 
+// --- Experimental: interface sharpening ---------------------------------------
+// An opt-in unsharp filter drawn over the whole UI. A click-through overlay
+// (#exp-sharpen-layer) carries a backdrop-filter that runs an SVG convolution
+// over everything painted behind it, so text and hairlines crispen without any
+// change to the DOM beneath. The kernel is the identity plus a scaled cross
+// Laplacian; it sums to 1, so overall brightness is preserved. When the feature
+// is off (or amount 0) the layer is hidden and carries no filter, costing
+// nothing. Confirmed to render in the desktop shell's Chromium.
+const EXP_SHARPEN_MAX = 1.4;        // convolution strength at 100%
+
+function expSharpenAmount() {
+  let a = parseInt(state.settings.expSharpenAmount, 10);
+  if (!Number.isFinite(a)) a = 0;
+  return Math.max(0, Math.min(100, a));
+}
+
+function applyExpSharpen() {
+  const layer = el("exp-sharpen-layer");
+  const kernel = el("exp-sharpen-kernel");
+  if (!layer || !kernel) return;             // markup absent in this build
+  const pct = expSharpenAmount();
+  const on = !!state.settings.expSharpen && pct > 0;
+  if (!on) {
+    layer.hidden = true;
+    layer.style.backdropFilter = "";
+    layer.style.webkitBackdropFilter = "";
+    return;
+  }
+  const a = (pct / 100) * EXP_SHARPEN_MAX;
+  const c = 1 + 4 * a, e = -a;
+  kernel.setAttribute("kernelMatrix", `0 ${e} 0  ${e} ${c} ${e}  0 ${e} 0`);
+  layer.hidden = false;
+  layer.style.backdropFilter = "url(#exp-sharpen-filter)";
+  layer.style.webkitBackdropFilter = "url(#exp-sharpen-filter)";
+}
+
 const el = (id) => document.getElementById(id);
 const esc = (s) =>
   String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
@@ -584,6 +622,9 @@ function status(msg, level) {
   n.textContent = msg;
   n.classList.toggle("err", level === "error");
   n.classList.toggle("crit", level === "critical");
+  // #status-msg is role="status" aria-live in the template; a critical failure
+  // (data did not persist, backend gone) interrupts, everything else is polite.
+  n.setAttribute("aria-live", level === "critical" ? "assertive" : "polite");
   conPut(level === "critical" ? "error" : level === "error" ? "warn" : "info", msg, "app");
 }
 const statusErr = (msg) => status(msg, "error");
@@ -641,8 +682,17 @@ function renderConsole() {
   if (conState.follow) box.scrollTop = box.scrollHeight;
 }
 
+let _conPollBusy = false;
 async function pollConsoleLog() {
   if (document.hidden) return;
+  // Skip the round-trip while the Info tab isn't showing: the `since` cursor
+  // catches the client up in one request when the tab opens (activation fires
+  // an immediate poll), and the server keeps its own ring meanwhile.
+  if (!conVisible()) return;
+  // Single flight: tab activation and the 3s interval can overlap; two polls
+  // reading the same cursor would append every returned line twice.
+  if (_conPollBusy) return;
+  _conPollBusy = true;
   try {
     const r = await (await fetch("/api/log?since=" + conState.since)).json();
     if (!r.ok) return;
@@ -650,6 +700,7 @@ async function pollConsoleLog() {
     conState.since = r.next;
     for (const e of r.entries) conPut(e.level, e.msg, e.src);
   } catch (e) { /* the server going away is itself reported by the caller */ }
+  finally { _conPollBusy = false; }
 }
 
 function initConsole() {
@@ -737,6 +788,8 @@ const ICONS = {
   // a page with a figure block above flowing text: the facsimile layout view
   layout: _SVG('<rect x="3" y="2" width="10" height="12" rx="1"/><rect x="5" y="4" width="6" height="3.4"/><path d="M5 9.6 h6 M5 11.8 h4.2"/>'),
   pdf: _SVG('<path d="M3.5 2 h6 l3 3 v9 h-9 Z"/><path d="M9.5 2 v3 h3"/><path d="M5.4 7.5 h5.2 M5.4 9.7 h5.2 M5.4 11.9 h3.4"/>'),
+  // a magic wand with a star tip: the smart-check trigger
+  wand: _SVG('<path d="M2.4 13.6 L9.4 6.6"/><path d="M12 1.6 L12.7 3.3 L14.4 4 L12.7 4.7 L12 6.4 L11.3 4.7 L9.6 4 L11.3 3.3 Z"/><path d="M13.4 7.8 v1.8 M12.5 8.7 h1.8"/>'),
   close: _SVG('<path d="M4.2 4.2 L11.8 11.8 M11.8 4.2 L4.2 11.8"/>'),
 };
 
@@ -854,6 +907,110 @@ function initConfirmDialog() {
   }, true);
 }
 
+// --- shared modal behaviour for .overlay > .win windows ----------------------
+// The confirm dialog (#confirm-overlay) and the image lightbox (#img-lightbox)
+// carry their own modal role + focus handling; EVERY OTHER overlay window gets
+// it here, stamped once at boot and driven by the overlay's `hidden` attribute,
+// so none of the scattered open/close call sites has to change. Each window then
+// gets: role="dialog" + aria-modal + aria-labelledby (a screen reader announces
+// it, by name, as modal), initial focus, a Tab focus-trap, focus restored to the
+// opener on close, and `inert` on the app chrome behind it.
+const _modalStack = [];
+const _SELF_MANAGED_OVERLAYS = new Set(["confirm-overlay", "img-lightbox"]);
+// The observer below runs a microtask after a dialog opens -- too late to read
+// the opener from document.activeElement once a dialog has self-focused (e.g.
+// auth -> email). So we remember the focus that PRECEDED the current one and use
+// it as the opener when the dialog has already moved focus into itself.
+let _priorFocus = null, _activeFocus = null;
+
+function _overlayWin(overlay) { return overlay.querySelector(".win"); }
+
+function _focusables(root) {
+  return [...root.querySelectorAll(
+    'a[href],button:not([disabled]),input:not([disabled]):not([type=hidden]),' +
+    'select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])')]
+    .filter((e) => e.getClientRects().length > 0);
+}
+
+// Disable everything behind the dialog: every top-level app section except the
+// overlays themselves and the floating tooltip/popover.
+function _setAppInert(on) {
+  for (const c of document.body.children) {
+    // keep #statusbar interactive so its role="status" aria-live region still
+    // announces to a screen reader while a modal is open (it sits behind the
+    // backdrop and the Tab-trap, so it is not reachable by mouse or keyboard).
+    if (c.classList.contains("overlay") || c.id === "cad-tooltip"
+        || c.id === "attn-pop" || c.id === "statusbar" || c.tagName === "SCRIPT") continue;
+    if (on) c.setAttribute("inert", "");
+    else c.removeAttribute("inert");
+  }
+}
+
+function _overlayShown(overlay) {
+  const win = _overlayWin(overlay);
+  if (!win) return;                       // not a .win dialog (e.g. md-live-overlay)
+  // if the dialog already grabbed focus, the true opener is the prior focus
+  overlay._opener = win.contains(document.activeElement) ? _priorFocus : document.activeElement;
+  _modalStack.push(overlay);
+  _setAppInert(true);
+  // Respect a dialog that already placed its own focus (e.g. auth -> email);
+  // otherwise land on the first field, else the first non-close control.
+  if (!win.contains(document.activeElement)) {
+    const f = _focusables(win);
+    const field = f.find((e) => /^(INPUT|SELECT|TEXTAREA)$/.test(e.tagName));
+    const target = field || f.find((e) => !e.classList.contains("win-close")) || f[0];
+    (target || win).focus?.();
+  }
+}
+
+function _overlayHidden(overlay) {
+  const i = _modalStack.indexOf(overlay);
+  if (i < 0) return;                      // wasn't tracked as an open .win modal
+  _modalStack.splice(i, 1);
+  if (!_modalStack.length) _setAppInert(false);
+  const op = overlay._opener; overlay._opener = null;
+  if (op && op.isConnected && op.offsetParent !== null) op.focus?.();
+}
+
+function initOverlayModals() {
+  // remember the previous focus target so _overlayShown can recover the real
+  // opener even after a dialog synchronously self-focuses
+  document.addEventListener("focusin", (ev) => {
+    _priorFocus = _activeFocus; _activeFocus = ev.target;
+  }, true);
+  for (const overlay of document.querySelectorAll(".overlay")) {
+    if (_SELF_MANAGED_OVERLAYS.has(overlay.id)) continue;
+    const win = _overlayWin(overlay);
+    if (!win) continue;
+    if (!win.getAttribute("role")) win.setAttribute("role", "dialog");
+    win.setAttribute("aria-modal", "true");
+    const title = win.querySelector(".win-titlebar span, .ia-title");
+    if (title) {
+      if (!title.id) title.id = `${overlay.id}-arialabel`;
+      win.setAttribute("aria-labelledby", title.id);
+    }
+    new MutationObserver(() => {
+      if (overlay.hidden) _overlayHidden(overlay);
+      else _overlayShown(overlay);
+    }).observe(overlay, { attributes: true, attributeFilter: ["hidden"] });
+  }
+  // Tab focus-trap for the topmost tracked modal. Defer to the confirm dialog
+  // and the lightbox when either is open -- they trap their own focus.
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Tab" || !_modalStack.length) return;
+    if (!el("confirm-overlay").hidden) return;
+    const lb = document.getElementById("img-lightbox");
+    if (lb && !lb.hidden) return;
+    const win = _overlayWin(_modalStack[_modalStack.length - 1]);
+    const f = win ? _focusables(win) : [];
+    if (!f.length) return;
+    const first = f[0], last = f[f.length - 1];
+    if (!win.contains(document.activeElement)) { ev.preventDefault(); first.focus(); }
+    else if (ev.shiftKey && document.activeElement === first) { ev.preventDefault(); last.focus(); }
+    else if (!ev.shiftKey && document.activeElement === last) { ev.preventDefault(); first.focus(); }
+  }, true);
+}
+
 // --- undo / redo -------------------------------------------------------------
 // Every mutating action pushes an operation with its inverse. Client-side
 // state (the checked map) is snapshot-restored; server-backed changes run
@@ -950,7 +1107,7 @@ function saveActionLog() {
 }
 // canonical action type (drives the History colour) from the label's first word
 const ACTION_TYPES = {
-  edit: "edit", correct: "edit",
+  edit: "edit", correct: "edit", bake: "edit",
   add: "add", check: "add", create: "add",
   uncheck: "remove", delete: "remove",
   repopulate: "repopulate", verify: "verify",
@@ -965,6 +1122,16 @@ function actionTargetKey(revert) {
   if (revert.kind === "checked") return "checked:" + revert.key;
   if (revert.kind === "whl") return "whl:" + revert.idx;
   if (String(revert.kind || "").startsWith("manual")) return "manual:" + revert.id;
+  if (revert.kind === "smartbake") {
+    // a single-book bake targets that book; a grown group spans records and
+    // has no single key (scGroupLog clears the tkey when it folds item #2)
+    const it = (revert.items || []).length === 1 ? revert.items[0] : null;
+    if (!it) return "";
+    if (it.kind === "whl") return "whl:" + it.idx;
+    if (it.kind === "checked") return "checked:" + it.key;
+    if (it.kind === "manual-fields") return "manual:" + it.id;
+    if (it.kind === "build-fields") return "build:" + it.id;
+  }
   return "";
 }
 function logAction(label, revert) {
@@ -1123,6 +1290,11 @@ function normalizeSettings() {
   let _srm = parseInt(state.settings.scanRecentMin, 10);
   if (!Number.isFinite(_srm)) _srm = 30;         // 0 = no recency filter
   state.settings.scanRecentMin = Math.max(0, Math.min(1440, _srm));
+  // Experimental: interface sharpening (off by default; amount is a 0-100 %)
+  state.settings.expSharpen = !!state.settings.expSharpen;
+  let _esa = parseInt(state.settings.expSharpenAmount, 10);
+  if (!Number.isFinite(_esa)) _esa = 35;         // a gentle default once enabled
+  state.settings.expSharpenAmount = Math.max(0, Math.min(100, _esa));
   // v2.6 inserted Subtitle/Vol/Ed into the master-list bottom table; its
   // saved column settings are keyed by index (c0..cN), so pre-v2.6 keys
   // must shift to keep pointing at the same columns
@@ -1153,6 +1325,7 @@ function normalizeSettings() {
 let clientStateReady = false;   // gates write-through until the load-sync ran
 const _csPending = {};          // kind -> true, coalesced
 let _csTimer = null;
+let _csBulk = 0;                // >0 during a bulk op: accumulate, flush once at end
 
 function clientStateBlob(kind) {
   if (kind === "checked") return checkedArray();
@@ -1165,8 +1338,25 @@ function clientStateBlob(kind) {
 function pushClientState(kind) {
   if (!clientStateReady) return;   // never clobber the server before load-sync
   _csPending[kind] = true;
+  // During a bulk op (e.g. a multi-book scan) each item mutates the checked map;
+  // without this a whole ~1MB client_state PUT would fire per item whenever the
+  // 700ms debounce lands between items. Accumulate here and flush once when the
+  // batch ends (withBulkClientState), collapsing N PUTs into one.
+  if (_csBulk > 0) return;
   clearTimeout(_csTimer);
   _csTimer = setTimeout(flushClientState, 700);
+}
+
+// Run an async op with per-item client_state pushes suppressed, flushing a
+// single coalesced PUT when it finishes (even if it throws). Safe to nest.
+async function withBulkClientState(fn) {
+  _csBulk++;
+  try {
+    return await fn();
+  } finally {
+    _csBulk--;
+    if (_csBulk === 0 && Object.keys(_csPending).length) flushClientState();
+  }
 }
 
 async function flushClientState() {
@@ -1402,6 +1592,10 @@ function initAuth() {
   el("auth-win").addEventListener("submit", (ev) => { ev.preventDefault(); submitAuth(); });
   el("auth-mode").onclick = () => { setAuthMode(!authSignup); authMsg(""); };
   el("auth-close").onclick = hideAuthOverlay;
+  // backdrop click dismisses, like every other form modal (same as the close X)
+  el("auth-overlay").addEventListener("mousedown", (ev) => {
+    if (ev.target === el("auth-overlay")) hideAuthOverlay();
+  });
   el("auth-skip").onclick = () => {
     state.settings.authPromptDismissed = true;
     saveSettings();
@@ -1940,7 +2134,7 @@ function initTabs() {
       setHeader(tab.dataset.tab);
       if (tab.dataset.tab === "home") loadActivity();   // refresh on every visit
       if (tab.dataset.tab === "checked") { renderChecked(); loadOlStatus(); }
-      if (tab.dataset.tab === "infotab") renderConsole();
+      if (tab.dataset.tab === "infotab") { pollConsoleLog(); renderConsole(); }
       // refresh builds and entry folders on every visit — either may have
       // changed elsewhere meanwhile
       if (tab.dataset.tab === "workbench") {
@@ -2138,7 +2332,16 @@ function applyTableChrome(key) {
     table.style.width = "";
   }
   table.dataset.ck = key;
-  applyColHide(table, table.querySelectorAll("tbody tr"));
+  // Re-masking every cell is O(rows*cols). On a width-only refresh (splitter
+  // drag, window resize, zoom) the hidden-column set is unchanged, so skip it —
+  // the rows already carry the right mask. Freshly built rows are masked by
+  // streamRows per chunk (and renderHistoryRows resets this signature so its
+  // direct-built rows are re-masked), so a skip here never strands a new row.
+  const hideSig = hide.join(",");
+  if (table.dataset.hideSig !== hideSig) {
+    applyColHide(table, table.querySelectorAll("tbody tr"));
+    table.dataset.hideSig = hideSig;
+  }
 }
 
 // Column hiding is per-<td> (there is no colgroup): set display:none on each
@@ -2698,6 +2901,8 @@ function renderSettings() {
                         ["set-r2-public", "r2PublicBase"],
                         ["set-ai-base", "aiBase"], ["set-ai-model", "aiModel"],
                          ["set-ai-key", "aiKey"],
+                         ["set-embed-base", "embedBase"],
+                         ["set-embed-model", "embedModel"],
                          ["set-ai-instructions", "aiInstructions"]]) {
     const n = el(id);
     n.value = state.settings[k] || "";
@@ -2746,7 +2951,8 @@ function renderSettings() {
   // the others remain device-local.
   (async () => {
     const SECRET_FIELDS = [
-      ["set-ai-key", "aiKey"], ["set-mistral-key", "mistralKey"],
+      ["set-ai-key", "aiKey"], ["set-embed-key", "embedKey"],
+      ["set-mistral-key", "mistralKey"],
       ["set-ocr-claude-key", "ocrClaudeKey"], ["set-ocr-azure-key", "ocrAzureKey"],
       ["set-ocr-aws-key", "ocrAwsKey"], ["set-ocr-aws-secret", "ocrAwsSecret"],
       ["set-sb-key", "supabaseKey"], ["set-sb-anon", "supabaseAnonKey"],
@@ -2932,6 +3138,39 @@ function renderSettings() {
       state.settings.verboseLogging = vl.checked;
       saveSettings();
       flushClientState();
+    };
+  }
+  // EXPERIMENTAL: interface sharpening (toggle + amount slider, live preview)
+  const esOn = el("set-exp-sharpen");
+  const esAmt = el("set-exp-sharpen-amt");
+  const esVal = el("set-exp-sharpen-val");
+  if (esOn && esAmt && esVal) {
+    const paintEs = () => {
+      esVal.textContent = expSharpenAmount() + "%";
+      esAmt.disabled = !esOn.checked;      // amount only bites while it is on
+    };
+    esOn.checked = !!state.settings.expSharpen;
+    esAmt.value = String(expSharpenAmount());
+    paintEs();
+    esOn.onchange = () => {
+      state.settings.expSharpen = esOn.checked;
+      paintEs();
+      applyExpSharpen();
+      saveSettings();
+    };
+    const readAmt = () => {
+      state.settings.expSharpenAmount =
+        Math.max(0, Math.min(100, parseInt(esAmt.value, 10) || 0));
+    };
+    esAmt.oninput = () => {          // drag: update the readout + preview live
+      readAmt();
+      esVal.textContent = expSharpenAmount() + "%";
+      applyExpSharpen();
+    };
+    esAmt.onchange = () => {         // release: persist
+      readAmt();
+      applyExpSharpen();
+      saveSettings();
     };
   }
   // UPDATES (desktop shell reads these off client_state at launch)
@@ -3847,7 +4086,7 @@ async function setRowLocalPdf(id, path) {
   if (row.kind === "manual") {
     const entry = state.manual.find((x) => x.id === id) || {};
     const prior = entry.local_pdf || "";
-    if (!await patchManualLocalPdf(id, path)) { statusErr("Attach failed"); return; }
+    if (!await patchManualLocalPdf(id, path)) { statusErr("ATTACH FAILED"); return; }
     pushOp(`${verb} ${(row.book.title || "").slice(0, 36)}`,
       () => patchManualLocalPdf(id, prior),
       () => patchManualLocalPdf(id, path),
@@ -4299,11 +4538,11 @@ function saveAttnPop() {
       if (res.ok) {
         await loadReviews();
         renderHome();
-        status("Added to the review queue");
+        status("ADDED TO REVIEW QUEUE");
       } else {
-        status("Review request failed — not queued");
+        status("REVIEW REQUEST FAILED :: NOT QUEUED");
       }
-    }).catch(() => status("Review request failed — not queued"));
+    }).catch(() => status("REVIEW REQUEST FAILED :: NOT QUEUED"));
   }
   closeAttnPop();
 }
@@ -4532,7 +4771,7 @@ async function onReviewClick(ev) {
       await loadReviews();
       renderReviewList();
     } else {
-      status("Comment failed — not saved");
+      status("COMMENT FAILED :: NOT SAVED");
     }
   }
 }
@@ -4801,8 +5040,10 @@ function syncYearFilterInputs() {
   if (t) t.value = state.settings.yearTo != null ? state.settings.yearTo : "";
 }
 
-function filteredCheckedRows() {
-  let rows = combinedRows();
+function filteredCheckedRows(prebuilt) {
+  // prebuilt lets renderChecked reuse the combinedRows() array it already
+  // built for rowsById, instead of rescanning all entries a second time.
+  let rows = prebuilt || combinedRows();
   const q = findQuery();
   if (!q.empty)
     rows = rows.filter((r) => matchesFind(
@@ -4866,6 +5107,7 @@ function checkedRowTr(row, cmode, opts) {
     <td class="col-whl">${iaCell(row)}</td>
     <td class="col-whl">${scanBadge(row, "hathitrust")}</td>
     <td class="col-whl">${markCell(row)}</td>`;
+  scDecorateCheckedRow(tr, row);
   return tr;
 }
 
@@ -4981,14 +5223,23 @@ function renderChecked() {
   if (active && active.classList && active.classList.contains("cell-edit")) return;
   updateCheckedCount();
   const tbody = el("checked-rows");
-  state.rowsById = new Map(combinedRows().map((r) => [String(r.id), r]));
+  const allRows = combinedRows();           // one scan, reused by the filter below
+  state.rowsById = new Map(allRows.map((r) => [String(r.id), r]));
   // a deleted/unchecked row can no longer be the repopulation target
   if (state.checkedSelected != null &&
       !state.rowsById.has(String(state.checkedSelected))) {
     state.checkedSelected = null;
   }
+  // Skip the expensive DOM teardown+rebuild while the checked table is not
+  // visible — a background download/scan re-render fired while the user is on
+  // another tab, or while the WHL table is shown. state.rowsById (above) stays
+  // fresh so lookups remain correct; every path that reveals the table
+  // (tab click -> renderChecked at initTabs, switchTopTable -> renderTop)
+  // re-renders it, so nothing is left stale.
+  if (!el("checked").classList.contains("active") || el("checked-pane").hidden)
+    return;
   const cmode = checkedMode();
-  let rows = filteredCheckedRows();
+  let rows = filteredCheckedRows(allRows);
   const so = state.sort.checked;
   if (so) rows = sortRowsBy(rows, (r) => checkedSortVal(r, so.key), so.dir);
 
@@ -5051,6 +5302,20 @@ function renderChecked() {
   markSortHeaders("checked");
   refreshInfoIfActive();
   renderBottomPane();
+}
+
+// rAF-coalesced renderChecked for high-frequency BACKGROUND callers (the IA
+// download and auto-scan pollers): repeated calls in one frame collapse to a
+// single rebuild, and while the window is hidden the frame never fires at all.
+// User-action callers keep calling renderChecked() directly — some read
+// state.rowsById synchronously right afterwards, so they must not be deferred.
+let _renderCheckedFrame = null;
+function scheduleRenderChecked() {
+  if (_renderCheckedFrame !== null) return;
+  _renderCheckedFrame = requestAnimationFrame(() => {
+    _renderCheckedFrame = null;
+    renderChecked();
+  });
 }
 
 // One delegated handler covers verify markers / delete / uncheck / edit clicks.
@@ -5776,6 +6041,10 @@ function renderHistoryRows() {
   if (!rows.length) el("bottom-empty").textContent = "No actions recorded yet";
   el("bottom-count").textContent =
     `${log.length} action${log.length === 1 ? "" : "s"}` + (q ? ` (${rows.length} shown)` : "");
+  // History rows are built directly (not via streamRows' per-chunk mask), so
+  // force applyTableChrome's guarded mask to re-run on these fresh rows.
+  const histTable = el("bottom-rows").closest("table");
+  if (histTable) histTable.dataset.hideSig = "";
   applyTableChrome("b-history");
 }
 
@@ -5813,6 +6082,7 @@ async function applyRevert(m) {
       ok = true; break;
     case "manual-url": ok = !!(await setManualUrl(m.id, m.source, m.before, false)); break;
     case "whl": ok = !!(await whlApplySnaps(m.idx, m.beforeSnaps)); break;
+    case "smartbake": ok = await scRevertItems(m.items || []); break;
     default: ok = false;
   }
   // also revert a multi-volume set declaration that commitEdit folded into this edit
@@ -6861,6 +7131,7 @@ function whlRowTr(r, mode) {
   const whlWhy = attnReason((state.attn || {})["whl:" + r.idx]);
   if (whlWhy) tr.dataset.tip += "\nNeeds attention: " + whlWhy;
   tr.innerHTML = whlRowCells(r, mode);
+  scDecorateWhlRow(tr, r, mode);
   return tr;
 }
 
@@ -8595,7 +8866,7 @@ async function startDownload(identifier, book) {
     pumpAutoDl();
   }
   updateDlProgress();
-  renderChecked();
+  scheduleRenderChecked();
 }
 
 function pollDownload(identifier) {
@@ -8621,7 +8892,7 @@ function pollDownload(identifier) {
         pumpAutoDl();                             // start the next queued download
       }
       updateDlProgress();
-      renderChecked();
+      scheduleRenderChecked();
     } catch (e) {
       failures += 1;
       if (failures >= 8) {
@@ -8752,22 +9023,25 @@ function queueScan(id, autoDownload = true) {
 async function processScanQueue() {
   if (scanQueueRunning) return;
   scanQueueRunning = true;
-  while (scanQueue.length) {
-    const task = scanQueue.shift();
-    const { id } = task;
-    const row = rowById(id);
-    if (!row || !(row.book.title || "").trim()) continue;
-    status(`AUTO SCAN :: ${row.book.title}`);
-    try {
-      const scans = await runRowScans(row);
-      status(`AUTO SCAN DONE :: ${row.book.title} :: ${scanStatusLine(scans)}`);
-      // rowById()'s row has no scans field — pass the freshly-fetched ones
-      if (task.autoDownload) maybeAutoDownloadIa({ ...row, scans });
-    } catch (e) {
-      statusErr(`AUTO SCAN FAILED :: ${row.book.title}`);
+  // One coalesced client_state PUT for the whole batch instead of one per book.
+  await withBulkClientState(async () => {
+    while (scanQueue.length) {
+      const task = scanQueue.shift();
+      const { id } = task;
+      const row = rowById(id);
+      if (!row || !(row.book.title || "").trim()) continue;
+      status(`AUTO SCAN :: ${row.book.title}`);
+      try {
+        const scans = await runRowScans(row);
+        status(`AUTO SCAN DONE :: ${row.book.title} :: ${scanStatusLine(scans)}`);
+        // rowById()'s row has no scans field — pass the freshly-fetched ones
+        if (task.autoDownload) maybeAutoDownloadIa({ ...row, scans });
+      } catch (e) {
+        statusErr(`AUTO SCAN FAILED :: ${row.book.title}`);
+      }
+      scheduleRenderChecked();
     }
-    renderChecked();
-  }
+  });
   scanQueueRunning = false;
 }
 
@@ -9047,7 +9321,7 @@ function setWorkbenchPhase(phase, persist) {
   else if (phase === "knowledge") { renderAnMain(); renderAnFacsimile(); }
   else if (phase === "publish") {
     const b = anSelected();
-    if (b) renderAnBundle(b);
+    if (b) { renderAnBundle(b); renderAnIndexCard(b); }
   }
 }
 
@@ -9080,7 +9354,7 @@ function applyWorkbenchGates() {
   el("wb-publish-locked").hidden = !pubNote;
   el("wb-publish-locked").textContent = pubNote;
   el("wb-publish-actions").hidden = !b;
-  el("an-bundle").hidden = !b || !!pubNote;
+  el("wb-publish-cards").hidden = !b || !!pubNote;
   el("wb-source-empty").hidden = !!b;
   el("wb-source-body").hidden = !b;
 }
@@ -9393,6 +9667,7 @@ function renderAnPane(id) {
   else if (id === "an-cats") renderAnCats(b);
   else if (id === "an-trans") loadAnTranslations(b);
   else if (id === "an-notes") loadAnNotes(b);
+  else if (id === "an-passages") loadAnPassages(b);
   else if (id === "an-rel") renderAnRelevance(b);
   else if (id === "an-bundle") renderAnBundle(b);
 }
@@ -9499,6 +9774,12 @@ function anEnsurePolling() {
             el("an-msg").textContent = "";
             renderAnPane(activeAnPane());
             renderOcrDocs();
+            // the Publish phase's Search index card tracks these jobs too
+            if (["segment", "index-publish"].includes(meta.kind) &&
+                wbActivePhase() === "publish") {
+              const cur = state.builds[meta.buildId];
+              if (cur) renderAnIndexCard(cur);
+            }
           }
         }
       }
@@ -9765,6 +10046,232 @@ async function anSaveBundle() {
   } else el("an-bundle-msg").textContent = "save failed";
 }
 
+// --- Passages (#140): structure-aware search passages over the OCR text ----------
+
+let anPassages = null;    // {doc, state} for the selected book, or null
+const AN_PSG_CAP = 300;   // rows rendered; the artifact itself is uncapped
+
+async function loadAnPassages(b) {
+  try {
+    const data = await (await fetch(`/api/builds/${b.id}/passages`)).json();
+    if (state.anSel !== b.id) return;   // stale response
+    anPassages = data.ok ? data : null;
+  } catch (e) { anPassages = null; }
+  renderAnPassages();
+}
+
+function psgTokens(t) {
+  const s = String(t || "").trim();
+  return s ? s.split(/\s+/).length : 0;
+}
+
+function renderAnPassages() {
+  const host = el("an-psg-rows");
+  if (!host) return;
+  const doc = anPassages && anPassages.doc;
+  const st = (anPassages && anPassages.state) || {};
+  const passages = (doc && doc.passages) || [];
+  const excluded = new Set((doc && doc.excluded) || []);
+  el("an-psg-generate").textContent = doc ? "Regenerate" : "Generate";
+  const r = st.recipe || {};
+  el("an-psg-recipe").textContent = r.child_min
+    ? `${r.child_min}–${r.child_max} / ${r.parent_min}–${r.parent_max} tokens`
+    : "";
+  el("an-psg-count").textContent = passages.length
+    ? `${passages.length} passages · ${excluded.size} excluded` : "";
+  el("an-psg-stale").hidden = st.stale !== true;
+  el("an-psg-empty").hidden = !!passages.length;
+  el("an-psg-view").hidden = true;
+  const over = passages.length > AN_PSG_CAP;
+  el("an-psg-more").hidden = !over;
+  if (over) {
+    el("an-psg-more").textContent =
+      `Showing the first ${AN_PSG_CAP} of ${passages.length} passages.`;
+  }
+  let prevParent = null;
+  host.innerHTML = passages.slice(0, AN_PSG_CAP).map((p, i) => {
+    // a thin separator row where a new parent section begins — under-styled
+    const sep = prevParent !== null && p.parent_id !== prevParent
+      ? `<tr class="psg-sep"><td colspan="4"></td></tr>` : "";
+    prevParent = p.parent_id;
+    const pages = p.page_from === p.page_to
+      ? String(p.page_from ?? "") : `${p.page_from}–${p.page_to}`;
+    const toks = psgTokens(p.text);
+    const open = String(p.text || "").trim().split(/\s+/).slice(0, 9).join(" ");
+    const out = excluded.has(p.id);
+    const next = passages[i + 1];
+    const canMerge = !!next && next.parent_id === p.parent_id;
+    return sep +
+      `<tr class="psg-row${out ? " psg-excluded" : ""}" data-psg="${esc(p.id)}">
+      <td class="psg-pages">${esc(pages)}</td>
+      <td class="psg-open">${esc(open)}${toks > 9 ? "…" : ""}</td>
+      <td class="psg-toks">${toks}</td>
+      <td class="psg-acts">
+        <button class="cad-btn tiny" data-psg-x="${esc(p.id)}" type="button">${
+          out ? "Include" : "Exclude"}</button>
+        <button class="cad-btn tiny" data-psg-split="${esc(p.id)}" type="button"
+                data-tip="Split at the middle sentence boundary">Split</button>
+        <button class="cad-btn tiny" data-psg-merge="${esc(p.id)}" type="button"${
+          canMerge ? "" : " disabled"}
+                data-tip="Merge with the next passage in the same section">Merge</button>
+      </td></tr>`;
+  }).join("");
+}
+
+async function anPsgPatch(body) {
+  const b = anSelected();
+  if (!b) return;
+  try {
+    const res = await fetch(`/api/builds/${b.id}/passages`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      el("an-psg-msg").textContent = data.error || "edit failed";
+      return;
+    }
+    el("an-psg-msg").textContent = "";
+    anPassages = data;
+    renderAnPassages();
+  } catch (e) {
+    el("an-psg-msg").textContent = "request failed";
+  }
+}
+
+function onAnPsgClick(ev) {
+  const x = ev.target.closest("[data-psg-x]");
+  if (x) {
+    const out = x.closest(".psg-row").classList.contains("psg-excluded");
+    anPsgPatch(out ? { include: [x.dataset.psgX] }
+                   : { exclude: [x.dataset.psgX] });
+    return;
+  }
+  const s = ev.target.closest("[data-psg-split]");
+  if (s) { anPsgPatch({ split: { id: s.dataset.psgSplit } }); return; }
+  const m = ev.target.closest("[data-psg-merge]");
+  if (m) { anPsgPatch({ merge: { id: m.dataset.psgMerge } }); return; }
+  const row = ev.target.closest(".psg-row");
+  if (!row) return;
+  const doc = anPassages && anPassages.doc;
+  const p = ((doc && doc.passages) || []).find((q) => q.id === row.dataset.psg);
+  if (p) {
+    el("an-psg-view").textContent = p.text || "";
+    el("an-psg-view").hidden = false;
+  }
+}
+
+// --- Publish phase: the Search index card (#140) ---------------------------------
+
+async function renderAnIndexCard(b) {
+  const stateEl = el("an-index-state");
+  if (!stateEl || !b) return;
+  stateEl.textContent = "…";
+  el("an-index-note").textContent = "";
+  el("an-index-versions").innerHTML = "";
+  el("an-index-rollback").hidden = true;
+  let data = null;
+  try {
+    data = await (await fetch(
+      `/api/knowledge/index/status?build_id=${encodeURIComponent(b.id)}`)).json();
+  } catch (e) { /* fall through */ }
+  if (state.buildSel !== b.id) return;   // stale response
+  if (!data || !data.ok) { stateEl.textContent = "status unavailable"; return; }
+  const st = data.state || {};
+  const versions = data.versions || [];
+  let line;
+  if (versions.length) {
+    const v = versions[0];
+    const when = v.built_at ? new Date(v.built_at).toLocaleString() : "";
+    line = `published v${versions.length} · ${v.channel || "stable"}` +
+      (when ? ` · ${when}` : "");
+    if (st.sha256 && v.source_hash && v.source_hash !== st.sha256) {
+      line += " · outdated — the text changed since";
+    }
+  } else if (!st.exists) line = "no passages";
+  else if (st.stale) line = "passages outdated";
+  else line = "ready to publish";
+  stateEl.textContent = line;
+  if (data.warning) el("an-index-note").textContent = data.warning;
+  el("an-index-rollback").hidden = versions.length < 2;
+  el("an-index-versions").innerHTML = versions.slice(0, 6).map((v, i) => {
+    const s = v.stats || {};
+    const model = (v.config || {}).model;
+    return `<div class="an-index-ver">
+      <span class="psg-pages">v${versions.length - i}</span>
+      <span>${esc(v.channel || "stable")}</span>
+      <span>${v.built_at ? esc(new Date(v.built_at).toLocaleString()) : ""}</span>
+      <span>${Number(s.passages) || 0} passages</span>
+      <span>${model ? esc(model) : "lexical"}</span>
+    </div>`;
+  }).join("");
+}
+
+async function anIndexPublish() {
+  const b = anSelected();
+  if (!b) return;
+  const btn = el("an-index-publish");
+  btn.disabled = true;
+  el("an-index-note").textContent = "";
+  try {
+    const res = await fetch("/api/knowledge/index/publish", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ build_id: b.id }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      btn.disabled = false;
+      el("an-index-note").textContent = data.error || "failed";
+      return;
+    }
+    anJobs.set(data.job, {
+      kind: "index-publish", buildId: b.id, btn,
+      path: "/api/knowledge/index/publish",
+      book: b.title || b.id, engine: data.model || "lexical",
+      pages: [], doc: "", artifact: data.slug || "",
+      status: "Starting...", at: new Date().toLocaleTimeString(),
+      finished: false,
+    });
+    el("an-index-state").textContent = "publishing…";
+    status("SEARCH INDEX :: PUBLISH STARTED");
+    renderOcrQueue();
+    anEnsurePolling();
+  } catch (e) {
+    btn.disabled = false;
+    el("an-index-note").textContent = "request failed";
+  }
+}
+
+async function anIndexRollback() {
+  const b = anSelected();
+  if (!b) return;
+  if (!(await confirmDialog({
+    title: "Roll back search index",
+    message: "Remove the newest index version?",
+    detail: "The previous version becomes current. The archive entry is untouched.",
+    confirmLabel: "Roll back",
+    danger: true,
+  }))) return;
+  try {
+    const res = await fetch("/api/knowledge/index/rollback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ build_id: b.id }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      el("an-index-note").textContent = data.error || "rollback failed";
+      return;
+    }
+    status("SEARCH INDEX :: ROLLED BACK");
+    renderAnIndexCard(b);
+  } catch (e) {
+    el("an-index-note").textContent = "request failed";
+  }
+}
+
 // --- wiring ----------------------------------------------------------------------
 
 function initAnalyze() {
@@ -9975,6 +10482,15 @@ function initAnalyze() {
   });
 
   el("an-bundle-save").addEventListener("click", anSaveBundle);
+
+  el("an-psg-generate").addEventListener("click", () => {
+    const b = anSelected();
+    if (b) anStartJob("/api/knowledge/segment", { build_id: b.id }, "segment",
+                      el("an-psg-generate"));
+  });
+  el("an-psg-wrap").addEventListener("click", onAnPsgClick);
+  el("an-index-publish").addEventListener("click", anIndexPublish);
+  el("an-index-rollback").addEventListener("click", anIndexRollback);
 
   // Record -> Knowledge jump for the open book (same Workbench selection)
   el("b-analyze").addEventListener("click", () => {
@@ -12189,6 +12705,7 @@ function renderBuildEditor() {
   el("b-src-open").href = src;
   el("build-msg").textContent = "";
   buildDirty = false;   // a freshly loaded form is clean
+  scApplyBuildOverlay();
   if (wbActivePhase() === "source" && activeBuildTab() === "btab-source") {
     refreshSourceTab();
   }
@@ -12300,6 +12817,8 @@ async function saveBuildFields(ev) {
   if (ev) ev.preventDefault();
   const id = state.buildSel;
   if (!id) return false;
+  // a smart-check overlay must never ride into a save — baking is explicit
+  scClearBuildOverlay();
   const fields = {};
   for (const f of BUILD_FIELDS) {
     const input = el("b-" + f);
@@ -12710,16 +13229,20 @@ async function refreshSourceTab() {
   renderOcrChips(b);
   renderPdfSources(b);
   const textSrc = buildTextSrc(b);
-  if (localPath) {
+  // no attached file? fall back to the entry folder's own primary.pdf /
+  // preview.pdf, exactly as the Source chip and the Text phase (ocrBookPdf)
+  // do — the viewer and the chip must agree. The attach row stays empty.
+  const viewPath = localPath || ocrBookPdf(b.id);
+  if (viewPath) {
     // an entry folder's preview.pdf is already a derivative — serve it as-is
-    const entryPrev = /^output[\/\\]entries[\/\\]/i.test(localPath);
+    const entryPrev = /^output[\/\\]entries[\/\\]/i.test(viewPath);
     const derived = !state.settings.previewOriginal && !entryPrev;
     buildPdfViewer.show(
-      derived ? pdfViewSrc(localPath) : pdfLocalSrc(localPath),
-      localPath + (derived || entryPrev ? "  (preview)" : ""), {
+      derived ? pdfViewSrc(viewPath) : pdfLocalSrc(viewPath),
+      viewPath + (derived || entryPrev ? "  (preview)" : ""), {
         textSrc,
         // page-aligned OCR view (like the OCR tab), editable + savable
-        pagesPdf: localPath,
+        pagesPdf: viewPath,
         pagesSaveTo: { buildId: b.id, name: buildActiveOcrName(b) },
       });
   } else if (/^https?:\/\//i.test((b.pdf_source || "").trim())) {
@@ -13947,6 +14470,8 @@ function jobTypeLabel(kind) {
   if (kind === "publish") return "Publish";
   if (kind === "download") return "Download";
   if (kind === "cloudsync") return "Cloud sync";
+  if (kind === "segment") return "Passages";
+  if (kind === "index-publish") return "Search index";
   return "Text analysis";
 }
 
@@ -14096,7 +14621,8 @@ function renderOcrQueue() {
   el("ocr-queue-empty").hidden = total !== 0;
   const staged = (ocrState.book ? stagedCountFor(ocrState.book) : 0) +
     (ocrState.book ? analysisStagedCount(ocrState.book) : 0);
-  el("ocr-queue-count").textContent = `${total} jobs${staged ? ` · ${staged} staged` : ""}`;
+  el("ocr-queue-count").textContent =
+    `${total} job${total === 1 ? "" : "s"}${staged ? ` · ${staged} staged` : ""}`;
 }
 
 async function cancelOcrJob(jobId) {
@@ -15223,6 +15749,626 @@ function initOcrTab() {
   });
 }
 
+// --- smart check: extract real metadata from the book's own PDF -------------------
+// Any record with a reachable PDF gets a magic-wand button. It asks the server
+// to OCR the PDF's front matter (Mistral) and extract bibliographic fields
+// (DeepSeek — the phone capture's exact chain), then holds the result as a
+// PENDING overlay: extracted values render in light yellow with a dotted
+// border, TAB flips the view back to the originals, and SPACE over a hovered
+// row bakes the fields into the record. Bakes are logged in History with full
+// before-snapshots (revertible), and consecutive bakes within SC_GROUP_MS fold
+// into ONE grouped history entry — bulk cleanups revert as a unit.
+
+let scChecks = {};          // target -> pending record (server: smart_checks.json)
+let scShow = true;          // TAB view: true = extracted values visible
+const scJobs = new Map();   // target -> { id } while a check runs
+let scPollTimer = null;
+let scGroup = null;         // open bake fold: { opId, ts0, items }
+const SC_GROUP_MS = 5 * 60 * 1000;
+
+async function loadSmartChecks() {
+  try {
+    const r = await (await fetch("/api/smartcheck")).json();
+    scChecks = (r && r.pending) || {};
+  } catch (e) { scChecks = {}; }
+}
+
+function scHasPending() {
+  // records only — a still-running job has nothing to toggle yet, and must
+  // not make TAB stop moving focus
+  return Object.keys(scChecks).length > 0;
+}
+
+// -- targets and their PDFs ---------------------------------------------------
+// A target names one book record ("whl:12", "build:<id>", "manual:<id>",
+// "checked:<key>"); the PDF reference is resolved fresh at click time.
+
+function scTargetForRow(row) {
+  return (row.kind === "manual" ? "manual:" : "checked:") + row.id;
+}
+
+function scPdfForRow(row) {
+  if (row.localPdf) return { pdf: row.localPdf };
+  const ident = iaIdentifierForRow(row);
+  if (ident && dlState(row) === "done")
+    return { pdf: "downloads/ia/" + ident + ".pdf" };
+  if (ident) return { url: `https://archive.org/download/${ident}/${ident}.pdf` };
+  return null;
+}
+
+function scPdfForWhl(r) {
+  return !r.added && r.file ? { url: r.file } : null;
+}
+
+function scPdfForBuild(b) {
+  const f = String(b.pdf_file || "").trim();
+  if (f) return { pdf: f };
+  const u = String(b.pdf_source || "").trim();
+  if (/^https?:\/\//i.test(u)) return { url: u };
+  return null;
+}
+
+// the fields of a pending record that actually differ from the current values
+// ({} = record matches the book; null = no pending record at all)
+function scProvFields(target, cur) {
+  const rec = scChecks[target];
+  if (!rec) return null;
+  const out = {};
+  for (const [f, v] of Object.entries(rec.mapped || {})) {
+    const val = String(v == null ? "" : v).trim();
+    if (!val) continue;
+    const c = cur(f);
+    if (String(c == null ? "" : c).trim() !== val) out[f] = val;
+  }
+  return out;
+}
+
+// -- the wand -----------------------------------------------------------------
+
+// what/when/how of a pending record, for the wand tooltip — the audit data
+// the server stores is surfaced right where the user decides to bake
+function scProvenanceTip(rec) {
+  const eng = rec.engine || {};
+  const lines = [`Extracted by ${eng.ocr || "?"} + ${eng.extract || "?"}` +
+    (rec.pages_ocred && rec.pages_ocred.length
+      ? ` from PDF page(s) ${rec.pages_ocred.join(", ")}` : "") +
+    (rec.created_at ? ` · ${rec.created_at}` : "")];
+  const extra = Object.entries(rec.extra || {}).slice(0, 4);
+  if (extra.length) {
+    lines.push("Also found: " + extra.map(([k, v]) =>
+      `${k}: ${String(v).slice(0, 40)}`).join(" · "));
+  }
+  return lines.join("\n");
+}
+
+function scWandHtml(target, pdfref, prov) {
+  const rec = scChecks[target];
+  if (!pdfref && !rec && !scJobs.has(target)) return "";
+  let cls = "";
+  let tip = "Smart check — extract real metadata from this book's PDF\n" +
+    "(Mistral OCR, then DeepSeek). Results overlay the row until baked.";
+  if (scJobs.has(target)) {
+    cls = " sc-running";
+    tip = "Smart check running — reading the PDF's front matter…";
+  } else if (rec && prov && Object.keys(prov).length) {
+    cls = " sc-ready";
+    tip = `Smart check: ${Object.keys(prov).length} field(s) differ — ` +
+      "the light-yellow dotted cells are extracted values\n" +
+      scProvenanceTip(rec) + "\n" +
+      "TAB compares with the original · SPACE over the row bakes them in\n" +
+      "Shift+click dismisses · click re-runs";
+  } else if (rec) {
+    cls = " sc-match";
+    tip = "Smart check: the PDF agrees with this record\n" +
+      scProvenanceTip(rec) + "\n" +
+      "Shift+click dismisses · click re-runs";
+  }
+  return `<span class="sc-wand${cls}" data-sc-run="${esc(target)}"` +
+    ` data-tip="${esc(tip)}">${ICONS.wand}</span>`;
+}
+
+// -- row decoration (runs inside the row builders on every render) -------------
+
+// whlRowCells' fixed cell order (src, ...fields..., status, copyright)
+const SC_WHL_CELL = { title: 1, subtitle: 2, authors: 3, year: 4, publisher: 5,
+                      pages: 6, language: 7, subject: 8, description: 9 };
+
+function scDecorateWhlRow(tr, r, mode) {
+  if (mode === "orig") return;         // Alt view shows the pre-correction record
+  const target = "whl:" + r.idx;
+  const pdfref = scPdfForWhl(r);
+  const prov = scProvFields(target, (f) => r[f]);
+  const wand = scWandHtml(target, pdfref, prov);
+  if (wand) {
+    // the title cell: the badge columns are width-locked and cannot take it
+    const td = tr.children[1];
+    if (td) td.insertAdjacentHTML("beforeend", wand);
+  }
+  if (!scShow || !prov) return;
+  for (const [f, v] of Object.entries(prov)) {
+    const td = tr.children[SC_WHL_CELL[f]];
+    if (!td) continue;
+    const keep = f === "title" ? td.querySelector(".sc-wand") : null;
+    td.textContent = v;
+    if (keep) td.appendChild(keep);
+    td.classList.add("sc-prov");
+    td.classList.remove("missing-core");
+    td.dataset.tip = "Smart check — original: " +
+      (String(r[f] || "").trim() || "(blank)");
+  }
+}
+
+function scDecorateCheckedRow(tr, row) {
+  const target = scTargetForRow(row);
+  const pdfref = scPdfForRow(row);
+  const prov = scProvFields(target, (f) => (row.book || {})[f]);
+  const wand = scWandHtml(target, pdfref, prov);
+  if (wand) {
+    // the title cell: the badge columns are width-locked and cannot take it
+    const td = tr.children[1];
+    if (td) td.insertAdjacentHTML("beforeend", wand);
+  }
+  if (!scShow || !prov) return;
+  for (const [f, v] of Object.entries(prov)) {
+    const i = BOOK_COLS.indexOf(f);
+    const td = i >= 0 ? tr.children[1 + i] : null;
+    if (!td) continue;
+    const keep = f === "title" ? td.querySelector(".sc-wand") : null;
+    td.textContent = v;
+    if (keep) td.appendChild(keep);
+    td.classList.add("sc-prov");
+    td.classList.remove("missing-core");
+    td.dataset.tip = "Smart check — original: " +
+      (String((row.book || {})[f] || "").trim() || "(blank)");
+  }
+}
+
+// -- Editor form overlay --------------------------------------------------------
+// Overlaid inputs go readOnly (bake or TAB back to edit); scBuildOrig remembers
+// what we wrote so the overlay never survives into a save or another build.
+
+let scBuildOrig = null;    // { id, vals: {f: original}, set: {f: provisional} }
+
+function scClearBuildOverlay() {
+  const saved = scBuildOrig;
+  scBuildOrig = null;
+  for (const f of BUILD_FIELDS) {
+    const inp = el("b-" + f);
+    if (!inp || !inp.classList.contains("sc-prov")) continue;
+    inp.classList.remove("sc-prov");
+    inp.readOnly = false;
+    delete inp.dataset.tip;
+    // restore only what we wrote — a re-rendered or re-selected form keeps
+    // its own fresh values
+    if (saved && saved.id === state.buildSel && inp.value === saved.set[f]) {
+      inp.value = saved.vals[f];
+    }
+  }
+}
+
+function scApplyBuildOverlay() {
+  scClearBuildOverlay();
+  const btn = el("b-smartcheck");
+  if (btn) btn.classList.remove("sc-running", "sc-ready", "sc-match");
+  const b = currentBuild();
+  if (!b) return;
+  const target = "build:" + b.id;
+  const prov = scProvFields(target, (f) => b[f]);
+  if (btn) {
+    if (scJobs.has(target)) btn.classList.add("sc-running");
+    else if (prov && Object.keys(prov).length) btn.classList.add("sc-ready");
+    else if (scChecks[target]) btn.classList.add("sc-match");
+  }
+  if (!scShow || !prov || !Object.keys(prov).length) return;
+  scBuildOrig = { id: b.id, vals: {}, set: {} };
+  for (const [f, v] of Object.entries(prov)) {
+    const inp = el("b-" + f);
+    if (!inp) continue;
+    scBuildOrig.vals[f] = inp.value;
+    scBuildOrig.set[f] = v;
+    inp.value = v;
+    inp.classList.add("sc-prov");
+    inp.readOnly = true;
+    inp.dataset.tip = "Smart check — original: " +
+      (String(b[f] || "").trim() || "(blank)") +
+      "\nSPACE over the form bakes · TAB shows the original";
+  }
+}
+
+function scRerender() {
+  if (state.whlRows) renderWhlTop();
+  renderChecked();
+  scApplyBuildOverlay();
+  // the footer tag is the persistent "provisional data exists" indicator
+  const n = Object.keys(scChecks).length;
+  const foot = el("status-smart");
+  if (foot) {
+    foot.hidden = !n && !scJobs.size;
+    foot.textContent = scJobs.size
+      ? `SMART CHECK: ${scJobs.size} running`
+      : `SMART CHECK: ${n} held (${scShow ? "shown" : "hidden"})`;
+  }
+}
+
+// -- running a check ------------------------------------------------------------
+
+function scRunInfo(target) {
+  const kind = target.split(":")[0];
+  const ident = target.slice(kind.length + 1);
+  if (kind === "whl") {
+    const row = whlRowByIdx(parseInt(ident, 10));
+    return row ? { pdfref: scPdfForWhl(row), label: row.title || "" } : null;
+  }
+  if (kind === "build") {
+    const b = state.builds[ident];
+    return b ? { pdfref: scPdfForBuild(b), label: b.title || "" } : null;
+  }
+  const row = state.rowsById.get(String(ident));
+  if (row) return { pdfref: scPdfForRow(row), label: (row.book || {}).title || "" };
+  return null;
+}
+
+async function startSmartCheck(target, pdfref, label) {
+  const body = Object.assign({ target, label }, pdfref);
+  let data;
+  try {
+    const res = await fetch("/api/smartcheck/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || "HTTP " + res.status);
+  } catch (e) {
+    statusErr(`SMART CHECK FAILED :: ${e.message || e}`);
+    return;
+  }
+  scJobs.set(target, { id: data.job.id });
+  scEnsurePolling();
+  scRerender();
+  status(`SMART CHECK :: ${label || target} — reading the PDF`);
+}
+
+function scEnsurePolling() {
+  if (scPollTimer) return;
+  scPollTimer = setInterval(async () => {
+    if (document.hidden || !scJobs.size) {
+      if (!scJobs.size) { clearInterval(scPollTimer); scPollTimer = null; }
+      return;
+    }
+    for (const [target, j] of [...scJobs]) {
+      let r;
+      try {
+        const res = await fetch("/api/smartcheck/job/" + j.id);
+        if (res.status === 404) {   // gone from both registries: give up now
+          scJobs.delete(target);
+          statusErr("SMART CHECK LOST :: the server no longer knows this job");
+          scRerender();
+          continue;
+        }
+        r = await res.json();
+        j.bad = 0;
+      } catch (e) {
+        // a restarting/unreachable server: retry a few times, then let go
+        j.bad = (j.bad || 0) + 1;
+        if (j.bad >= 8) {
+          scJobs.delete(target);
+          statusErr("SMART CHECK LOST :: no answer from the server");
+          scRerender();
+        }
+        continue;
+      }
+      const state2 = r.state || "";
+      if (state2 === "queued" || state2 === "running" || state2 === "cancelling") continue;
+      scJobs.delete(target);
+      if (String(r.status || "").startsWith("done")) {
+        await loadSmartChecks();
+        scShow = true;
+        status(`SMART CHECK DONE :: ${r.label || target} — ` +
+          "TAB compares, SPACE over the row bakes");
+      } else if (r.status === "cancelled") {
+        status(`SMART CHECK CANCELLED :: ${r.label || target}`);
+      } else {
+        statusErr(`SMART CHECK FAILED :: ${r.error || r.status || "lost"}`);
+      }
+      scRerender();
+    }
+  }, 1500);
+}
+
+async function scResolve(target, action, applied) {
+  try {
+    await fetch("/api/smartcheck/resolve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target, action, applied: applied || {} }),
+    });
+  } catch (e) { /* the pending record just stays; harmless */ }
+}
+
+async function scWandClick(target, ev) {
+  if (ev.shiftKey && scChecks[target]) {
+    await scResolve(target, "dismissed", {});
+    delete scChecks[target];
+    scRerender();
+    status("SMART CHECK :: dismissed");
+    return;
+  }
+  if (scJobs.has(target)) { status("SMART CHECK :: already running"); return; }
+  // a re-run replaces the held result and spends OCR/AI calls — make sure
+  if (scChecks[target] && state.settings.confirmDiscard !== false &&
+      !window.confirm("Re-run the smart check for this book? " +
+        "The held result will be replaced.")) return;
+  const info = scRunInfo(target);
+  if (!info || !info.pdfref) {
+    statusErr("SMART CHECK :: no reachable PDF for this book");
+    return;
+  }
+  await startSmartCheck(target, info.pdfref, info.label);
+}
+
+// -- baking: provisional fields -> the record, grouped + revertible ---------------
+
+async function scRevertItem(it) {
+  switch (it.kind) {
+    case "whl": return !!(await whlApplySnaps(it.idx, it.beforeSnaps));
+    case "build-fields": return !!(await patchBuildRaw(it.id, it.before));
+    case "manual-fields": return !!(await patchManualFields(it.id, it.before));
+    case "checked": restoreChecked(it.key, it.before); return true;
+    default: return false;
+  }
+}
+
+async function scRevertItems(items) {
+  let ok = true;
+  for (const it of [...items].reverse()) ok = (await scRevertItem(it)) && ok;
+  renderChecked();
+  return ok;
+}
+
+async function scReplayItem(it) {
+  switch (it.kind) {
+    case "whl": return !!(await whlPost({ idx: it.idx, fields: it.after }));
+    case "build-fields": return !!(await patchBuildRaw(it.id, it.after));
+    case "manual-fields": return !!(await patchManualFields(it.id, it.after));
+    case "checked": {
+      const entry = state.checked.get(it.key);
+      if (!entry) return false;
+      // mirror the original bake exactly: merged fields invalidate the
+      // stale checks/scans/verify and requeue the scan
+      entry.book = Object.assign({}, entry.book, it.after);
+      entry.edited = true;
+      entry.checks = null;
+      entry.scans = null;
+      entry.verify = null;
+      queueScan(it.key);
+      saveChecked();
+      return true;
+    }
+    default: return false;
+  }
+}
+
+async function scReplayItems(items) {
+  let ok = true;
+  for (const it of items) ok = (await scReplayItem(it)) && ok;
+  renderChecked();
+  return ok;
+}
+
+// One bake = one history entry; bakes landing within SC_GROUP_MS of the group's
+// start fold into it (same pattern commitEdit uses for set declarations), so
+// "cleaned up 30 books" is ONE revertible History row.
+function scGroupLog(item, label) {
+  const now = Date.now();
+  const lr = actionLog();
+  const top = history.stack[history.ptr - 1];
+  const last = lr.length ? lr[lr.length - 1] : null;
+  const open = scGroup && top && top.id === scGroup.opId &&
+    last && last.id === scGroup.opId && !last.reverted &&
+    last.revert && now - scGroup.ts0 < SC_GROUP_MS;
+  if (open) {
+    scGroup.items.push(item);
+    last.revert.items = scGroup.items;   // re-link (logAction may have re-parsed)
+    last.label = `bake smart check into ${scGroup.items.length} books`;
+    last.tkey = "";   // a grown group spans records; no single conflict key
+    saveActionLog();
+    const items = scGroup.items;
+    top.label = last.label;
+    top.undoFn = () => scRevertItems(items);
+    top.redoFn = () => scReplayItems(items);
+    updateHistoryButtons();
+    if (activeBottomTable() === "history") renderBottomRows();
+    return;
+  }
+  const items = [item];
+  const opId = pushOp(`bake smart check into ${String(label || "").slice(0, 40)}`,
+    () => scRevertItems(items),
+    () => scReplayItems(items),
+    { kind: "smartbake", items });
+  scGroup = { opId, ts0: now, items };
+}
+
+let scBaking = false;   // re-entry guard: a held SPACE must not double-bake
+
+async function scBakeTarget(target) {
+  const rec = scChecks[target];
+  if (!rec || scBaking) return false;
+  scBaking = true;
+  try {
+    return await scBakeTargetInner(target, rec);
+  } finally {
+    scBaking = false;
+  }
+}
+
+async function scBakeTargetInner(target, rec) {
+  const kind = target.split(":")[0];
+  const ident = target.slice(kind.length + 1);
+  let prov = null;
+  let item = null;
+  let label = rec.label || "";
+  if (kind === "whl") {
+    const idx = parseInt(ident, 10);
+    const row = whlRowByIdx(idx);
+    if (!row) { statusErr("SMART CHECK :: row not loaded"); return false; }
+    label = label || row.title || "";
+    prov = scProvFields(target, (f) => row[f]);
+    if (prov && Object.keys(prov).length) {
+      const snaps = whlFieldSnaps(row, Object.keys(prov));
+      if (!(await whlPost({ idx, fields: prov }))) {
+        statusErr("BAKE FAILED"); return false;
+      }
+      item = { kind: "whl", idx, beforeSnaps: snaps, after: prov };
+    }
+  } else if (kind === "build") {
+    const b = state.builds[ident];
+    if (!b) { statusErr("SMART CHECK :: entry not loaded"); return false; }
+    label = label || b.title || ident;
+    prov = scProvFields(target, (f) => b[f]);
+    if (prov && Object.keys(prov).length) {
+      const before = {};
+      for (const f of Object.keys(prov)) before[f] = b[f] || "";
+      scClearBuildOverlay();   // the form must not hold overlay values through a patch
+      // quiet: a full renderUpload/renderBuildEditor would wipe the user's
+      // unsaved edits in OTHER fields — refresh only the inputs we baked
+      if (!(await patchBuildRaw(ident, prov, true))) {
+        statusErr("BAKE FAILED"); return false;
+      }
+      for (const [f, v] of Object.entries(prov)) {
+        const inp = el("b-" + f);
+        if (inp) inp.value = v;
+      }
+      item = { kind: "build-fields", id: ident, before, after: prov };
+    }
+  } else if (kind === "manual") {
+    const entry = state.manual.find((e) => String(e.id) === ident);
+    if (!entry) { statusErr("SMART CHECK :: entry not loaded"); return false; }
+    label = label || entry.title || "";
+    prov = scProvFields(target, (f) => entry[f]);
+    if (prov && Object.keys(prov).length) {
+      const before = {};
+      for (const f of Object.keys(prov)) before[f] = String(entry[f] || "");
+      if (!(await patchManualFields(ident, prov))) {
+        statusErr("BAKE FAILED"); return false;
+      }
+      item = { kind: "manual-fields", id: ident, before, after: prov };
+    }
+  } else {   // checked
+    const entry = state.checked.get(ident);
+    if (!entry) { statusErr("SMART CHECK :: row not loaded"); return false; }
+    label = label || (entry.book || {}).title || "";
+    prov = scProvFields(target, (f) => (entry.book || {})[f]);
+    if (prov && Object.keys(prov).length) {
+      const before = snapshotChecked(ident);
+      entry.book = Object.assign({}, entry.book, prov);
+      entry.edited = true;
+      entry.checks = null;
+      entry.scans = null;
+      entry.verify = null;
+      queueScan(ident);
+      saveChecked();
+      item = { kind: "checked", key: ident, before, after: prov };
+    }
+  }
+  if (item) scGroupLog(item, label);
+  await scResolve(target, "baked", prov || {});
+  delete scChecks[target];
+  scRerender();
+  status(item
+    ? `BAKED :: ${label} — ${Object.keys(prov).length} field(s) updated`
+    : `SMART CHECK :: ${label} — matches, nothing to change`);
+  return true;
+}
+
+// -- keyboard: TAB toggles the view, SPACE over a row bakes it --------------------
+
+function scHoverTarget() {
+  const tr = document.querySelector("#whltop-rows tr:hover, #checked-rows tr:hover");
+  if (tr) {
+    if (tr.dataset.widx !== undefined) return "whl:" + tr.dataset.widx;
+    if (tr.dataset.rowId) {
+      const row = state.rowsById.get(String(tr.dataset.rowId));
+      if (row) return scTargetForRow(row);
+    }
+    return null;
+  }
+  if (document.querySelector("#build-editor:hover")) {
+    const b = currentBuild();
+    if (b) return "build:" + b.id;
+  }
+  return null;
+}
+
+function onSmartKey(ev) {
+  if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.repeat) return;
+  const t = ev.target;
+  if (/^(INPUT|TEXTAREA|SELECT|BUTTON|A)$/.test(t.tagName) || t.isContentEditable) return;
+  // never fight a modal (settings, wizard, viewers all use .overlay)
+  if (document.querySelector(".overlay:not([hidden])")) return;
+  if (ev.key === "Tab") {
+    if (!scHasPending()) return;      // nothing provisional: TAB moves focus
+    ev.preventDefault();
+    scShow = !scShow;
+    scRerender();
+    status(scShow
+      ? "SMART CHECK :: extracted values shown — SPACE over a row bakes them in"
+      : "SMART CHECK :: original values shown — TAB switches back");
+    return;
+  }
+  if (ev.key === " ") {
+    const target = scHoverTarget();
+    if (!target || !scChecks[target]) return;   // plain space scrolls as usual
+    ev.preventDefault();
+    if (!scShow) {
+      // never bake values the user can't see
+      status("SMART CHECK :: extracted values are hidden — TAB shows them first");
+      return;
+    }
+    scBakeTarget(target);
+  }
+}
+
+function initSmartCheck() {
+  loadSmartChecks().then(scRerender);
+  document.addEventListener("keydown", onSmartKey);
+  // capture phase: a wand click must not double as a row click
+  for (const id of ["whltop-rows", "checked-rows"]) {
+    el(id).addEventListener("click", (ev) => {
+      const w = ev.target.closest("[data-sc-run]");
+      if (!w) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      scWandClick(w.dataset.scRun, ev);
+    }, true);
+  }
+  el("b-smartcheck").addEventListener("click", (ev) => {
+    // drop focus so SPACE stays the bake key, not a button re-click
+    ev.currentTarget.blur();
+    const b = currentBuild();
+    if (b) scWandClick("build:" + b.id, ev);
+  });
+  el("status-smart").addEventListener("click", async (ev) => {
+    // Shift+click = dismiss everything held — the escape hatch for records
+    // whose row is gone (an unchecked book has no wand left to click)
+    if (ev.shiftKey) {
+      const targets = Object.keys(scChecks);
+      if (!targets.length) return;
+      if (!window.confirm(`Dismiss all ${targets.length} held smart-check ` +
+        "result(s)? Nothing already baked is affected.")) return;
+      for (const t of targets) {
+        await scResolve(t, "dismissed", {});
+        delete scChecks[t];
+      }
+      scRerender();
+      status("SMART CHECK :: all held results dismissed");
+      return;
+    }
+    scShow = !scShow;
+    scRerender();
+  });
+}
+
 // --- menu bar ---------------------------------------------------------------
 
 // publish the master list (plus manual entries) to the configured Google
@@ -15682,11 +16828,14 @@ function init() {
   boot("theme", applyTheme);
   boot("ui scale", applyUiScale);
   boot("font", applyFont);
+  boot("exp sharpen", applyExpSharpen);
   boot("checked books", loadChecked);
   boot("icons", injectIcons);
   boot("confirm dialog", initConfirmDialog);
+  boot("overlay modals", initOverlayModals);
   boot("tabs", initTabs);
   boot("jobs", initJobs);
+  boot("smart check", initSmartCheck);
   boot("tooltips", initTooltips);
   boot("pane tabs", initPaneTabs);
   boot("actor header", installActorHeader);   // before any write goes out
@@ -15751,6 +16900,12 @@ function init() {
       closePopup();
     }
   });
+  // Escape dismisses it (every sibling surface does), and a resize orphans its
+  // fixed position (it is placed once in openPopup) — close it either way.
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && !el("popup-menu").hidden) closePopup();
+  });
+  addEventListener("resize", () => { if (!el("popup-menu").hidden) closePopup(); });
   syncFilterBtn();
   syncSrcFilterBtn();
   el("ol-clear").addEventListener("click", clearSearchForm);
@@ -15770,26 +16925,41 @@ function init() {
   // checked-tab find bar
   el("sync-master-btn").addEventListener("click", syncMasterList);
   el("cloud-sync-btn").addEventListener("click", runCloudSync);
+  // Debounce the render: update state synchronously so the box stays live, but
+  // rebuild the (potentially thousands-of-node) tables only ~150ms after typing
+  // pauses, instead of tearing them down on every keystroke.
+  let _searchDebounce = null;
   el("checked-search").addEventListener("input", () => {
     state.checkedFilter = el("checked-search").value.trim();
     state.olOverride = null;
-    renderTop();
-    renderBottomRows();
-    scheduleOlRealtime();
+    clearTimeout(_searchDebounce);
+    _searchDebounce = setTimeout(() => {
+      renderTop();
+      // renderChecked already rebuilds the bottom pane in checked mode — the
+      // direct call was doubling that work. Only the WHL top table leaves the
+      // bottom stale (renderWhlTop doesn't touch it), and only when the
+      // catalog pane is actually shown (mirrors renderBottomPane's guard).
+      if (state.settings.topTable === "whl" && state.settings.showCatalog)
+        renderBottomRows();
+      scheduleOlRealtime();
+    }, 150);
   });
   el("checked-rows").addEventListener("click", onCheckedClick);
 
-  // year-range filter (applies to whichever top table is shown)
+  // year-range filter (applies to whichever top table is shown) — same debounce,
+  // which also collapses the per-keystroke saveSettings() client_state PUT.
+  let _yearDebounce = null;
   const onYearFilter = () => {
     const num = (v) => { const n = parseInt(v, 10); return Number.isFinite(n) ? n : null; };
     state.settings.yearFrom = num(el("year-from").value);
     state.settings.yearTo = num(el("year-to").value);
-    saveSettings();
-    renderTop();
+    clearTimeout(_yearDebounce);
+    _yearDebounce = setTimeout(() => { saveSettings(); renderTop(); }, 150);
   };
   el("year-from").addEventListener("input", onYearFilter);
   el("year-to").addEventListener("input", onYearFilter);
   el("year-clear").addEventListener("click", () => {
+    clearTimeout(_yearDebounce);           // cancel a pending trailing render
     el("year-from").value = "";
     el("year-to").value = "";
     state.settings.yearFrom = state.settings.yearTo = null;
@@ -15937,7 +17107,7 @@ function init() {
     const rec = state.bottomRecords[parseInt(tr.dataset.bi, 10)];
     if (!rec) return;
     if (rec._src === "manual") {
-      status("Already a manual entry in the checked-books table");
+      status("ALREADY A MANUAL ENTRY IN CHECKED-BOOKS");
       return;
     }
     if (ev.ctrlKey || ev.metaKey) {
@@ -16368,12 +17538,22 @@ function init() {
     }, 120);
   });
 
+  // Paint immediately from the localStorage cache: loadSettings/loadChecked
+  // already ran synchronously in init(), so the data to render is in memory.
+  // This shows the window's content without waiting on the ~1MB client_state
+  // network round-trip below. pushClientState self-guards on clientStateReady
+  // (still false here), so this early paint can never write back to the server
+  // before the sync reconciles.
+  switchTopTable(state.settings.topTable === "whl" ? "whl" : "checked");
+  renderBottomPane();
+  renderHome();
+
   // Adopt the authoritative server copy of checked / settings / attention
-  // (or seed it from localStorage on first run), THEN boot the views so the
-  // first render reflects whatever the server holds.
+  // (or seed it from localStorage on first run), THEN re-render so the views
+  // reflect whatever the server holds (the merge may differ from the cache).
   syncClientStateOnLoad().then((adopted) => {
     hydrateSecrets();      // warm credentials without delaying the initial UI
-    if (adopted) { applyTheme(); applyFont(); }
+    if (adopted) { applyTheme(); applyFont(); applyExpSharpen(); }
     maybeWizard();       // first desktop launch: the guide covers sign-in too
     maybeAuthPrompt();   // needs the adopted settings: authPromptDismissed
     loadDownloads();
