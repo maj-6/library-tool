@@ -2861,6 +2861,9 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   flex-direction: column;
   flex: 1;
   min-height: 0;
+  /* Record's #upload-split min-height floor can exceed the phase when the
+     jobs drawer is open — clip rather than paint over what sits below */
+  overflow: hidden;
 }
 #wb-source-body {
   flex: 1;
@@ -2879,8 +2882,18 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 #phase-publish .an-pane[hidden] { display: none; }
 #wb-publish-actions { margin: 0; }
 #wb-publish-actions[hidden] { display: none; }
-/* the jobs drawer: a one-line bar when collapsed, bar + queue when open */
-#wb-jobs { flex: none; display: flex; flex-direction: column; gap: 4px; }
+/* the jobs drawer: a one-line bar when collapsed, bar + queue when open.
+   Opaque and stacked above the phases so overflowing phase content (the
+   Record floor, see .wb-phase.active) can never bleed through the queue. */
+#wb-jobs {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  position: relative;
+  z-index: 2;
+  background: var(--face);
+}
 #wb-jobs-body { display: flex; flex-direction: column; gap: 4px; min-height: 0; }
 #wb-jobs-body[hidden] { display: none; }
 .ocr-workpane {
@@ -2888,7 +2901,10 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   min-width: 0;
   min-height: 0;
 }
-.ocr-workpane[hidden] { display: none; }
+/* !important is deliberate: the draft gate sets [hidden], but the id-based
+   .active rules below out-specify this class+attribute selector — a locked
+   workspace (and its own empty-state placeholder) must never render */
+.ocr-workpane[hidden] { display: none !important; }
 #ocr-analysis-workspace.active {
   display: flex;
   align-items: stretch;
@@ -2929,6 +2945,11 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   overflow: hidden;
 }
 #an-integrated-host #an-main { width: 100%; min-height: 0; }
+/* the Workbench header already shows title · author · year — the transplanted
+   an-head keeps only its provider/status side (renderAnMain still writes the
+   hidden nodes; nothing reads them back) */
+#an-integrated-host #an-title,
+#an-integrated-host #an-sub { display: none; }
 
 /* Read-only page-shaped OCR facsimiles in the Analysis workspace. */
 .an-fac-page, .an-facsimile-page {
@@ -3014,7 +3035,11 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   min-height: 0;
 }
 #ocr-mainpane .pane-bar { flex-wrap: wrap; }
-#ocr-find, #ocr-replace { width: 130px; }
+/* wrapping breaks lines on the flex base size, and an input's automatic
+   minimum is its ~130px intrinsic width — the explicit 60px floor + basis let
+   both inputs give ground so the trailing save button stays on the row at
+   1280px; grow restores the full 130px whenever the bar has room */
+#ocr-find, #ocr-replace { flex: 1 1 60px; min-width: 60px; max-width: 130px; }
 .ocr-pagenav { display: inline-flex; align-items: center; gap: 4px; }
 #ocr-page-jump { width: 3.6em; text-align: center; }
 .ocr-keymap {
