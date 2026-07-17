@@ -705,6 +705,55 @@ def test_replica_import_roundtrip(client, data_root):
     assert r.status_code == 400
 
 
+def test_rework_figure_endpoint(client, data_root, monkeypatch):
+    import libcommon as lib
+    import server
+    bid = "4e4012345678"
+    builds = lib.load_json(server.BUILDS_PATH, {})
+    builds[bid] = {"id": bid, "title": "T"}
+    lib.save_json(server.BUILDS_PATH, builds)
+    img_dir = server._entry_dir(bid) / "ocr" / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    (img_dir / "p3-fig.jpeg").write_bytes(b"\xff\xd8orig")
+    mp = server._entry_dir(bid) / "ocr" / "layout.json"
+    meta = lib.load_json(mp, {})
+    meta.setdefault("images", {})["p3-fig.jpeg"] = {
+        "x": 0.3, "y": 0.8, "w": 0.4, "h": 0.1, "page": 3,
+        "src_key": "primary"}
+    lib.save_json(mp, meta)
+
+    # no key configured -> a pointed 400, no provider call
+    r = client.post(f"/api/builds/{bid}/rework-figure",
+                    json={"figure": "p3-fig.jpeg"})
+    assert r.status_code == 400 and "key" in r.get_json()["error"]
+
+    calls = {}
+
+    def fake_gen(cfg, image, mime, prompt, timeout=180.0):
+        calls.update(cfg=cfg, mime=mime, prompt=prompt, image=image)
+        return b"\x89PNGgenerated"
+
+    monkeypatch.setattr(server, "_img_gen", fake_gen)
+    monkeypatch.setattr(server, "_img_gen_cfg", lambda: {
+        "provider": "openai", "model": "gpt-image-1", "key": "k"})
+    r = client.post(f"/api/builds/{bid}/rework-figure",
+                    json={"figure": "p3-fig.jpeg",
+                          "prompt": "keep the caption lettering"}).get_json()
+    assert r["ok"] and r["name"] == "rework-p3-fig.png"
+    assert calls["mime"] == "image/jpeg" and calls["image"] == b"\xff\xd8orig"
+    assert "keep the caption lettering" in calls["prompt"]
+    assert (img_dir / "rework-p3-fig.png").read_bytes() == b"\x89PNGgenerated"
+    entry = lib.load_json(mp, {})["images"]["rework-p3-fig.png"]
+    assert entry["rework_of"] == "p3-fig.jpeg" and entry["page"] == 3
+    assert entry["x"] == 0.3 and entry["src_key"] == "primary"
+
+    # unknown figure and hostile names refuse
+    assert client.post(f"/api/builds/{bid}/rework-figure",
+                       json={"figure": "nope.png"}).status_code == 400
+    assert client.post(f"/api/builds/{bid}/rework-figure",
+                       json={"figure": "../x"}).status_code == 400
+
+
 def test_replica_export_defends_hostile_sidecar(client, data_root):
     import io
     import zipfile

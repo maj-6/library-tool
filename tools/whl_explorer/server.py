@@ -36,6 +36,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -2852,6 +2853,134 @@ def api_build_replica_export(build_id: str):
                       or build_id)).strip("-").lower()[:60] or build_id
     return send_file(buf, mimetype="application/zip", as_attachment=True,
                      download_name=f"{stem}.lib")
+
+
+# --- illustration rework: image generation over the figure crops -----------------
+
+_IMG_GEN_PROMPT = (
+    "Redraw this illustration from an old printed book as a clean modern "
+    "edition illustration. Preserve the composition, subject, and period "
+    "character; render as crisp line art suitable for print, free of paper "
+    "texture, stains, and show-through.")
+
+
+def _img_gen_cfg() -> dict:
+    """BYO-key image generation settings (Settings > OCR & AI). Providers:
+    "openai" (images/edits, default model gpt-image-1) or "gemini"
+    (generateContent with an inline image, default gemini-2.5-flash-image)."""
+    s = _client_settings()
+    provider = str(s.get("imgGenProvider") or "openai").strip().lower()
+    if provider not in ("openai", "gemini"):
+        provider = "openai"
+    model = str(s.get("imgGenModel") or "").strip() or (
+        "gpt-image-1" if provider == "openai" else "gemini-2.5-flash-image")
+    return {"provider": provider, "model": model,
+            "key": str(s.get("imgGenKey") or "").strip()}
+
+
+def _img_gen(cfg: dict, image: bytes, mime: str, prompt: str,
+             timeout: float = 180.0) -> bytes:
+    """One image in, one generated image out, or RuntimeError. NOTE: written
+    to the providers' documented shapes but not yet exercised against live
+    keys — same standing as the cloud OCR processor before its key existed."""
+    import base64
+    if cfg["provider"] == "gemini":
+        payload = {"contents": [{"parts": [
+            {"text": prompt},
+            {"inline_data": {"mime_type": mime,
+                             "data": base64.b64encode(image).decode("ascii")}},
+        ]}]}
+        req = urllib.request.Request(
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{urllib.parse.quote(cfg['model'])}:generateContent",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     "x-goog-api-key": cfg["key"]})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        for cand in data.get("candidates") or []:
+            for part in ((cand.get("content") or {}).get("parts") or []):
+                blob = part.get("inline_data") or part.get("inlineData")
+                if blob and blob.get("data"):
+                    return base64.b64decode(blob["data"])
+        raise RuntimeError("the model returned no image")
+    # openai images/edits: multipart with the source image
+    boundary = "whl-" + uuid.uuid4().hex
+    ext = "jpg" if mime == "image/jpeg" else "png"
+    parts = []
+    for k, v in (("model", cfg["model"]), ("prompt", prompt), ("n", "1")):
+        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; "
+                     f"name=\"{k}\"\r\n\r\n{v}\r\n".encode("utf-8"))
+    parts.append(
+        (f"--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; "
+         f"filename=\"figure.{ext}\"\r\nContent-Type: {mime}\r\n\r\n")
+        .encode("utf-8") + image + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/images/edits", data=b"".join(parts),
+        headers={"Authorization": f"Bearer {cfg['key']}",
+                 "Content-Type": f"multipart/form-data; boundary={boundary}"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8", "replace"))
+    import base64 as _b64
+    for item in data.get("data") or []:
+        if item.get("b64_json"):
+            return _b64.b64decode(item["b64_json"])
+    raise RuntimeError("the model returned no image")
+
+
+@app.route("/api/builds/<build_id>/rework-figure", methods=["POST"])
+def api_build_rework_figure(build_id: str):
+    """Rework one extracted figure through the configured image model:
+    {src?, figure: <name>, prompt?: extra art direction}. The generated
+    image saves beside the original as rework-<name>.png with the same
+    page/bbox and a rework_of pointer — the re-typeset preview prefers it,
+    the original is never touched. Works on any figure region, including a
+    hand-drawn box over an initial to commission an illuminated capital."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    p = request.get_json(silent=True) or {}
+    src = _valid_src_key(b, p.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    name = str(p.get("figure") or "")
+    if not re.fullmatch(r"[\w.\-]{1,120}", name):
+        return jsonify({"ok": False, "error": "bad figure name"}), 400
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    info = (lib.load_json(meta_path, {}).get("images") or {}).get(name)
+    if not isinstance(info, dict) or \
+            str(info.get("src_key") or "primary") != src:
+        return jsonify({"ok": False, "error": "unknown figure"}), 400
+    f = _entry_dir(build_id) / "ocr" / "images" / name
+    if not f.is_file():
+        return jsonify({"ok": False, "error": "figure file missing"}), 400
+    cfg = _img_gen_cfg()
+    if not cfg["key"]:
+        return jsonify({"ok": False, "error":
+                        "no image-generation key configured "
+                        "(Settings > OCR & AI > Illustration rework)"}), 400
+    prompt = _IMG_GEN_PROMPT
+    extra = str(p.get("prompt") or "").strip()[:2000]
+    if extra:
+        prompt += " " + extra
+    raw = f.read_bytes()
+    mime = "image/jpeg" if f.suffix.lower() in (".jpg", ".jpeg") \
+        else "image/png"
+    try:
+        out = _img_gen(cfg, raw, mime, prompt)
+    except Exception as exc:
+        return jsonify({"ok": False, "error":
+                        f"image generation failed: {exc}"}), 502
+    out_name = "rework-" + re.sub(r"\.[A-Za-z0-9]+$", "", name) + ".png"
+    with _ocr_merge_lock:
+        (f.parent / out_name).write_bytes(out)
+        meta = lib.load_json(meta_path, {})
+        entry = {k: info.get(k) for k in ("page", "x", "y", "w", "h")}
+        entry.update({"src_key": src, "rework_of": name})
+        meta.setdefault("images", {})[out_name] = entry
+        lib.save_json(meta_path, meta)
+    return jsonify({"ok": True, "name": out_name, "bytes": len(out)})
 
 
 _LIB_MAX_BYTES = 250 * 1024 * 1024

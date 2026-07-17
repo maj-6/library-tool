@@ -1237,6 +1237,8 @@
                     data-tip="Propose a normalization of the diplomatic text (ſ→s, ligatures, dehyphenate) — then edit it">Propose</button>
             <button id="rw-clip" class="cad-btn tiny" type="button" disabled
                     data-tip="Replace this region's diplomatic text with the word boxes inside it (Tesseract/Textract or the PDF text layer)">Clip words</button>
+            <button id="rw-rework" class="cad-btn tiny" type="button" hidden
+                    data-tip="Rework this figure through the configured image model (Settings > OCR & AI) — the generated art saves beside the original, the preview prefers it, and the original is never touched">Rework art</button>
           </div>
           <textarea id="rw-text" class="cad-input" spellcheck="false" disabled
                     placeholder="Select a region"></textarea>
@@ -1838,6 +1840,15 @@
             </div>
             <div class="settings-subhead" style="margin-top:16px">OCR</div>
             <div class="settings-rows">
+              <label class="tool-label" for="set-imggen-provider">Illustration rework provider</label>
+              <select id="set-imggen-provider" class="cad-input">
+                <option value="openai">OpenAI (gpt-image-1)</option>
+                <option value="gemini">Google (gemini-2.5-flash-image)</option>
+              </select>
+              <label class="tool-label" for="set-imggen-key">Illustration rework API key</label>
+              <input id="set-imggen-key" class="cad-input" type="password" spellcheck="false" />
+              <label class="tool-label" for="set-imggen-model">Illustration rework model (blank = provider default)</label>
+              <input id="set-imggen-model" class="cad-input" type="text" spellcheck="false" />
               <label class="tool-label" for="set-mistral-key">Mistral API key</label>
               <input id="set-mistral-key" class="cad-input" type="password" spellcheck="false"
                      data-tip="Used by the Mistral OCR service, and by the phone-capture pipeline" />

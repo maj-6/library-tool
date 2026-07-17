@@ -2940,7 +2940,10 @@ function renderSettings() {
                          ["set-sb-url", "supabaseUrl"],
                          ["set-sb-key", "supabaseKey"],
                          ["set-sb-anon", "supabaseAnonKey"],
-                         ["set-mistral-key", "mistralKey"]]) {
+                         ["set-mistral-key", "mistralKey"],
+                         ["set-imggen-provider", "imgGenProvider"],
+                         ["set-imggen-key", "imgGenKey"],
+                         ["set-imggen-model", "imgGenModel"]]) {
     const n = el(id);
     n.value = state.settings[k] || "";
     n.onchange = () => {
@@ -15129,6 +15132,8 @@ function rwSyncBar() {
   }
   el("rw-clip").disabled = !a;
   el("rw-normalize").disabled = !a;
+  el("rw-rework").hidden = !(a && a.role === "figure" &&
+                             /!\[[^\]\n]*\]\([\w.\- ]+\)/.test(a.text || ""));
 }
 
 function rwDirty() { rwState.dirty = true; rwSyncBar(); }
@@ -15404,6 +15409,34 @@ async function rwClipWords() {
   rwSetLayer("text");
   rwDirty(); rwSyncBar();
   status(`CLIP :: ${out.length} line(s) from word boxes`);
+}
+
+async function rwReworkFigure() {
+  const a = rwActive();
+  const m = a && String(a.text || "").match(/!\[[^\]\n]*\]\(([\w.\- ]+)\)/);
+  if (!m || a.role !== "figure") return;
+  const extra = await rwPrompt(
+    "Extra art direction (optional — the base prompt already asks for a " +
+    "clean modern re-drawing that preserves the composition):", "");
+  if (extra === null) return;
+  status("REWORK :: generating…");
+  let r;
+  try {
+    r = await (await fetch(
+      `/api/builds/${encodeURIComponent(rwState.book)}/rework-figure`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ src: rwState.src, figure: m[1],
+                               prompt: extra.trim() }),
+      })).json();
+    if (!r.ok) throw new Error(r.error || "rework failed");
+  } catch (e) {
+    status("REWORK :: " + e.message);
+    return;
+  }
+  delete ocrState.layoutMeta[rwState.book];   // the new asset must be seen
+  status(`REWORK :: ${r.name} — the preview now prefers it`);
+  if (rwState.mode === "preview") rwRenderPreview();
 }
 
 async function rwSave() {
@@ -15735,8 +15768,15 @@ async function rwRenderPreview() {
     `&page=${rwState.page}&w=1100`;
   const items = [...rwState.items].sort((a, b) => a.order - b.order);
   const texts = await rwPreviewTexts(items);
+  const meta = rwState.book ? await ocrLayoutMeta(rwState.book)
+                            : { images: {} };
   if (seq !== rwState.seq || render !== rwRenderSeq ||
       rwState.mode !== "preview") return;
+  // reworked art shadows its original in the modern edition
+  const rework = {};
+  for (const [name, info] of Object.entries(meta.images || {})) {
+    if (info && info.rework_of) rework[info.rework_of] = name;
+  }
   const pane = el("rw-preview");
   pane.innerHTML = "";
   const styles = rwState.styles || {};
@@ -15770,7 +15810,7 @@ async function rwRenderPreview() {
       img.loading = "lazy";
       img.alt = fig[1];
       img.src = `/api/builds/${encodeURIComponent(rwState.book)}` +
-        `/ocr/images/${encodeURIComponent(fig[1])}`;
+        `/ocr/images/${encodeURIComponent(rework[fig[1]] || fig[1])}`;
       e.appendChild(img);
     } else {
       const st = styles[it.role] || styles.body || {};
@@ -15978,6 +16018,7 @@ function initReplica() {
     rwDirty();
   });
   el("rw-clip").addEventListener("click", rwClipWords);
+  el("rw-rework").addEventListener("click", rwReworkFigure);
   el("rw-save").addEventListener("click", rwSave);
   el("rw-recompile").addEventListener("click", rwRecompile);
   el("rw-export").addEventListener("click", () => {
