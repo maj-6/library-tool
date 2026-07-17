@@ -217,11 +217,13 @@ def compose_text(regions: list[dict], layer: str = "text") -> str:
         if not t:
             continue
         # a drop capital is the first letter of the paragraph it opens —
-        # it joins the NEXT region's text seamlessly, never stands alone
+        # it joins the NEXT text region seamlessly, never stands alone.
+        # Figures pass through untouched: prefixing a letter onto an
+        # ![id](id) placeholder would corrupt the reference
         if r["role"] == "drop-capital":
             pending_cap += t
             continue
-        if pending_cap:
+        if pending_cap and r["role"] != "figure":
             t = pending_cap + t
             pending_cap = ""
         parts.append(t)

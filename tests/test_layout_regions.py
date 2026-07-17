@@ -432,6 +432,17 @@ def test_clip_words_to_box_and_iou():
     assert layout_roles.template_score(tpl, []) == 0.0
 
 
+def test_compose_text_never_prefixes_a_capital_onto_a_figure():
+    regions = [
+        {"role": "drop-capital", "order": 0, "text": "Q"},
+        {"role": "figure", "order": 1, "text": "![f.png](f.png)"},
+        {"role": "body", "order": 2, "text": "uare, why the herb heals."},
+    ]
+    out = layout_roles.compose_text(regions)
+    assert "![f.png](f.png)" in out          # the reference stays intact
+    assert "Quare, why the herb heals." in out
+
+
 def test_compose_text_joins_drop_capitals_into_the_flow():
     regions = [
         {"role": "header", "order": 0, "text": "RUNNING HEAD"},
@@ -739,11 +750,12 @@ def test_rework_figure_endpoint(client, data_root, monkeypatch):
     r = client.post(f"/api/builds/{bid}/rework-figure",
                     json={"figure": "p3-fig.jpeg",
                           "prompt": "keep the caption lettering"}).get_json()
-    assert r["ok"] and r["name"] == "rework-p3-fig.png"
+    assert r["ok"] and r["name"] == "rework-p3-fig.jpeg.png"
     assert calls["mime"] == "image/jpeg" and calls["image"] == b"\xff\xd8orig"
     assert "keep the caption lettering" in calls["prompt"]
-    assert (img_dir / "rework-p3-fig.png").read_bytes() == b"\x89PNGgenerated"
-    entry = lib.load_json(mp, {})["images"]["rework-p3-fig.png"]
+    assert (img_dir / "rework-p3-fig.jpeg.png").read_bytes() == \
+        b"\x89PNGgenerated"
+    entry = lib.load_json(mp, {})["images"]["rework-p3-fig.jpeg.png"]
     assert entry["rework_of"] == "p3-fig.jpeg" and entry["page"] == 3
     assert entry["x"] == 0.3 and entry["src_key"] == "primary"
 
@@ -752,6 +764,61 @@ def test_rework_figure_endpoint(client, data_root, monkeypatch):
                        json={"figure": "nope.png"}).status_code == 400
     assert client.post(f"/api/builds/{bid}/rework-figure",
                        json={"figure": "../x"}).status_code == 400
+    # reworking a rework refuses: no paid rework-rework- chains
+    r = client.post(f"/api/builds/{bid}/rework-figure",
+                    json={"figure": "rework-p3-fig.jpeg.png"})
+    assert r.status_code == 400 and "original" in r.get_json()["error"]
+
+
+def test_replica_import_rejects_declared_zip_bombs(client, data_root):
+    import io
+    import zipfile
+    import libcommon as lib
+    import server
+    bid = "b03b12345678"
+    builds = lib.load_json(server.BUILDS_PATH, {})
+    builds[bid] = {"id": bid, "title": "T"}
+    lib.save_json(server.BUILDS_PATH, builds)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        # a tiny archive DECLARING a huge book.json: the declared size is
+        # what zipfile allocates, so it must be rejected before the read
+        z.writestr("book.json", b" " * (server._LIB_MAX_JSON + 1))
+    buf.seek(0)
+    r = client.post(f"/api/builds/{bid}/replica-import",
+                    data={"lib": (buf, "bomb.lib")},
+                    content_type="multipart/form-data")
+    assert r.status_code == 400
+    assert "large" in r.get_json()["error"]
+
+
+def test_replica_import_survives_malformed_book_sections(client, data_root):
+    import io
+    import zipfile
+    import libcommon as lib
+    import server
+    bid = "bad512345678"
+    builds = lib.load_json(server.BUILDS_PATH, {})
+    builds[bid] = {"id": bid, "title": "T"}
+    lib.save_json(server.BUILDS_PATH, builds)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("book.json", json.dumps({
+            "format": "lib/1",
+            "templates": ["not", "a", "dict"],
+            "figures": "nor this",
+            "stylesheet": ["nope"],
+        }))
+        z.writestr("pages/1.json", json.dumps({"items": [
+            {"role": "body", "order": 0,
+             "box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}, "text": "ok"}]}))
+    buf.seek(0)
+    r = client.post(f"/api/builds/{bid}/replica-import",
+                    data={"lib": (buf, "odd.lib")},
+                    content_type="multipart/form-data").get_json()
+    # the good page lands; the malformed sections degrade to nothing, not 500
+    assert r["ok"] and r["pages_applied"] == [1]
+    assert r["templates_added"] == [] and r["stylesheet"] == "none"
 
 
 def test_replica_export_defends_hostile_sidecar(client, data_root):

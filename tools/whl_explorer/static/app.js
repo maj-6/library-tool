@@ -2963,7 +2963,7 @@ function renderSettings() {
       ["set-ocr-aws-key", "ocrAwsKey"], ["set-ocr-aws-secret", "ocrAwsSecret"],
       ["set-sb-key", "supabaseKey"], ["set-sb-anon", "supabaseAnonKey"],
       ["set-r2-key", "r2KeyId"], ["set-r2-secret", "r2Secret"],
-      ["set-gs-keyfile", "gsKeyFile"],
+      ["set-gs-keyfile", "gsKeyFile"], ["set-imggen-key", "imgGenKey"],
     ];
     const secrets = await hydrateSecrets();
     for (const [id, k] of SECRET_FIELDS) {
@@ -15419,24 +15419,26 @@ async function rwReworkFigure() {
     "Extra art direction (optional — the base prompt already asks for a " +
     "clean modern re-drawing that preserves the composition):", "");
   if (extra === null) return;
+  // generation can run minutes and the UI stays live: everything after the
+  // await must speak about THIS book, not wherever the user wandered
+  const book = rwState.book, src = rwState.src, seq = rwState.seq;
   status("REWORK :: generating…");
   let r;
   try {
     r = await (await fetch(
-      `/api/builds/${encodeURIComponent(rwState.book)}/rework-figure`, {
+      `/api/builds/${encodeURIComponent(book)}/rework-figure`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ src: rwState.src, figure: m[1],
-                               prompt: extra.trim() }),
+        body: JSON.stringify({ src, figure: m[1], prompt: extra.trim() }),
       })).json();
     if (!r.ok) throw new Error(r.error || "rework failed");
   } catch (e) {
     status("REWORK :: " + e.message);
     return;
   }
-  delete ocrState.layoutMeta[rwState.book];   // the new asset must be seen
+  delete ocrState.layoutMeta[book];   // the new asset must be seen
   status(`REWORK :: ${r.name} — the preview now prefers it`);
-  if (rwState.mode === "preview") rwRenderPreview();
+  if (seq === rwState.seq && rwState.mode === "preview") rwRenderPreview();
 }
 
 async function rwSave() {

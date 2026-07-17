@@ -2754,7 +2754,8 @@ def api_build_replica_style(build_id: str):
         styles, custom = _replica_styles(build_id)
         return jsonify({"ok": True, "styles": styles, "custom": custom})
     if request.method == "DELETE":
-        path.unlink(missing_ok=True)
+        with _ocr_merge_lock:
+            path.unlink(missing_ok=True)
         return jsonify({"ok": True})
     p = request.get_json(silent=True) or {}
     raw = p.get("styles")
@@ -2763,8 +2764,11 @@ def api_build_replica_style(build_id: str):
     styles = _rw_sanitize_styles(raw)
     if not styles:
         return jsonify({"ok": False, "error": "no valid styles"}), 400
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lib.save_json(path, {"version": 1, "styles": styles})
+    # under the merge lock like every other sidecar write: the .lib import's
+    # check-and-write shares it, so neither side clobbers the other
+    with _ocr_merge_lock:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lib.save_json(path, {"version": 1, "styles": styles})
     return jsonify({"ok": True, "count": len(styles)})
 
 
@@ -2811,6 +2815,10 @@ def api_build_replica_export(build_id: str):
         if not safe or safe != str(name):
             continue
         figures[safe] = {k: info.get(k) for k in ("page", "x", "y", "w", "h")}
+        # rework linkage must survive the round trip, or an imported book's
+        # modern edition silently loses its re-drawn art
+        if info.get("rework_of"):
+            figures[safe]["rework_of"] = str(info["rework_of"])
     book = {
         "format": "lib/1",
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -2952,6 +2960,11 @@ def api_build_rework_figure(build_id: str):
     if not isinstance(info, dict) or \
             str(info.get("src_key") or "primary") != src:
         return jsonify({"ok": False, "error": "unknown figure"}), 400
+    # rework the ORIGINAL, never a rework: chains would mint paid calls the
+    # preview can't even show (its shadow map is one level deep)
+    if info.get("rework_of") or name.startswith("rework-"):
+        return jsonify({"ok": False, "error":
+                        "that is already a rework — rework the original"}), 400
     f = _entry_dir(build_id) / "ocr" / "images" / name
     if not f.is_file():
         return jsonify({"ok": False, "error": "figure file missing"}), 400
@@ -2972,7 +2985,11 @@ def api_build_rework_figure(build_id: str):
     except Exception as exc:
         return jsonify({"ok": False, "error":
                         f"image generation failed: {exc}"}), 502
-    out_name = "rework-" + re.sub(r"\.[A-Za-z0-9]+$", "", name) + ".png"
+    # the FULL original name (extension included) keys the rework, so
+    # p3-fig.jpeg and p3-fig.png can never collide onto one output
+    out_name = f"rework-{name}.png"
+    if len(out_name) > 120:
+        return jsonify({"ok": False, "error": "figure name too long"}), 400
     with _ocr_merge_lock:
         (f.parent / out_name).write_bytes(out)
         meta = lib.load_json(meta_path, {})
@@ -2986,6 +3003,8 @@ def api_build_rework_figure(build_id: str):
 _LIB_MAX_BYTES = 250 * 1024 * 1024
 _LIB_MAX_FIGURE = 15 * 1024 * 1024
 _LIB_MAX_PAGES = 2000
+_LIB_MAX_JSON = 10 * 1024 * 1024          # per JSON member, decompressed
+_LIB_MAX_INFLATED = 300 * 1024 * 1024     # total page-JSON budget
 
 
 @app.route("/api/builds/<build_id>/replica-import", methods=["POST"])
@@ -3014,8 +3033,13 @@ def api_build_replica_import(build_id: str):
     raw = f.read(_LIB_MAX_BYTES + 1)
     if len(raw) > _LIB_MAX_BYTES:
         return jsonify({"ok": False, "error": "file too large"}), 400
+    # Every JSON member is read at its DECLARED decompressed size, which
+    # zipfile also truncates to — so rejecting large declarations is a real
+    # cap, and a small .lib cannot deflate-bomb the sidecar into an OOM.
     try:
         z = zipfile.ZipFile(io.BytesIO(raw))
+        if z.getinfo("book.json").file_size > _LIB_MAX_JSON:
+            return jsonify({"ok": False, "error": "book.json too large"}), 400
         book = json.loads(z.read("book.json"))
     except (zipfile.BadZipFile, KeyError, ValueError):
         return jsonify({"ok": False, "error": "not a .lib archive"}), 400
@@ -3025,6 +3049,7 @@ def api_build_replica_import(build_id: str):
 
     # pages: every well-formed pages/N.json, sanitized like a live PUT
     incoming: dict[int, dict] = {}
+    budget = _LIB_MAX_INFLATED
     for name in z.namelist():
         m = re.fullmatch(r"pages/(\d{1,5})\.json", name)
         if not m:
@@ -3032,6 +3057,10 @@ def api_build_replica_import(build_id: str):
         n = int(m.group(1))
         if not 1 <= n <= 99999 or len(incoming) >= _LIB_MAX_PAGES:
             continue
+        declared = z.getinfo(name).file_size
+        if declared > _LIB_MAX_JSON or declared > budget:
+            continue
+        budget -= declared
         try:
             rec = json.loads(z.read(name))
         except (ValueError, KeyError):
@@ -3052,22 +3081,58 @@ def api_build_replica_import(build_id: str):
     if not incoming:
         return jsonify({"ok": False, "error": "no usable pages"}), 400
 
+    # book.json's sections are attacker-shaped: coerce every one before
+    # touching disk, so a malformed archive fails clean instead of 500ing
+    # halfway through a commit
+    tpl_src = book.get("templates")
     tpl_in = {}
-    for name, t in (book.get("templates") or {}).items():
-        name = str(name).strip()
-        if not _RW_TPL_RE.match(name) or not isinstance(t, dict):
-            continue
-        items = _rw_sanitize_items(t.get("items") or [], src_type="template")
-        if not items:
-            continue
-        tpl_in[name] = {"from_page": 0, "doc": _ocr_name(
-            str(t.get("doc") or "compiled.txt")),
-            "dims": _rw_sanitize_dims(t.get("dims")) or {},
-            "items": [{"role": i["role"], "order": i["order"],
-                       "box": i["box"]} for i in items]}
+    if isinstance(tpl_src, dict):
+        for name, t in tpl_src.items():
+            name = str(name).strip()
+            if not _RW_TPL_RE.match(name) or not isinstance(t, dict):
+                continue
+            items = _rw_sanitize_items(t.get("items") or [],
+                                       src_type="template")
+            if not items:
+                continue
+            tpl_in[name] = {"from_page": 0, "doc": _ocr_name(
+                str(t.get("doc") or "compiled.txt")),
+                "dims": _rw_sanitize_dims(t.get("dims")) or {},
+                "items": [{"role": i["role"], "order": i["order"],
+                           "box": i["box"]} for i in items]}
+
+    def fig_entry(fig):
+        # bbox values ride into layout.json, which /ocr-layout serializes —
+        # a NaN or a nested object here would break every layout fetch
+        out = {"src_key": src}
+        if not isinstance(fig, dict):
+            return out
+        try:
+            pg = int(fig.get("page"))
+            if 1 <= pg <= 99999:
+                out["page"] = pg
+        except (TypeError, ValueError, OverflowError):
+            pass
+        for k in ("x", "y", "w", "h"):
+            try:
+                v = float(fig.get(k))
+            except (TypeError, ValueError):
+                continue
+            if v == v and 0.0 <= v <= 1.0:      # finite, in the page
+                out[k] = round(v, 5)
+        ro = str(fig.get("rework_of") or "")
+        if re.fullmatch(r"[\w.\-]{1,120}", ro):
+            out["rework_of"] = ro
+        return out
+
+    figures_src = book.get("figures") if isinstance(book.get("figures"),
+                                                    dict) else {}
+    raw_styles = book.get("stylesheet")
+    styles = _rw_sanitize_styles(raw_styles)         if isinstance(raw_styles, dict) and len(raw_styles) <= 40 else {}
 
     meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
     applied, skipped, tpls_added = [], [], []
+    sheet = "none"
     with _ocr_merge_lock:
         meta = lib.load_json(meta_path, {})
         pmap = meta.setdefault("regions", {}).setdefault(src, {})
@@ -3097,26 +3162,21 @@ def api_build_replica_import(build_id: str):
             info = z.getinfo(name)
             if info.file_size > _LIB_MAX_FIGURE:
                 continue
-            fig = (book.get("figures") or {}).get(safe)
             img_dir.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(z.read(name))
-            entry = {"src_key": src}
-            if isinstance(fig, dict):
-                entry.update({k: fig.get(k)
-                              for k in ("page", "x", "y", "w", "h")})
-            imap[safe] = entry
+            imap[safe] = fig_entry(figures_src.get(safe))
             figures_added += 1
         lib.save_json(meta_path, meta)
-
-    sheet = "none"
-    styles = _rw_sanitize_styles(book.get("stylesheet") or {})
-    if styles:
-        if overwrite or not _replica_styles(build_id)[1]:
-            lib.save_json(_replica_style_path(build_id),
-                          {"version": 1, "styles": styles})
-            sheet = "imported"
-        else:
-            sheet = "kept"
+        # the stylesheet check-and-write shares the lock: a style-board Save
+        # landing between "no custom sheet" and this save must not be
+        # silently clobbered
+        if styles:
+            if overwrite or not _replica_styles(build_id)[1]:
+                lib.save_json(_replica_style_path(build_id),
+                              {"version": 1, "styles": styles})
+                sheet = "imported"
+            else:
+                sheet = "kept"
     return jsonify({"ok": True, "pages_applied": applied,
                     "pages_skipped": skipped, "templates_added": tpls_added,
                     "figures_added": figures_added, "stylesheet": sheet})
@@ -5467,7 +5527,7 @@ def api_ia_downloads():
 _SECRET_KEYS = frozenset({
     "aiKey", "embedKey", "mistralKey", "ocrClaudeKey", "ocrAzureKey",
     "ocrAwsKey", "ocrAwsSecret", "supabaseKey", "supabaseAnonKey", "r2KeyId",
-    "r2Secret", "gsKeyFile",
+    "r2Secret", "gsKeyFile", "imgGenKey",
 })
 _SECRETS_PATH = lib.DATA_ROOT / "output" / "secrets.json"
 _MISTRAL_PENDING = "_mistralCloudPending"
