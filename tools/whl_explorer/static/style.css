@@ -3923,3 +3923,105 @@ button.publish-tree-label { cursor: pointer; }
   font-size: 12px;
   padding: 3px 0;
 }
+
+/* ===================== Process mode ===================== */
+
+.foot-tag.tag-process { color: var(--blue2); }
+
+/* Search / Edit / Process segmented control (replaces the old single button) */
+.modeseg { display: inline-flex; border: 1px solid var(--face-sh2); border-radius: 4px; overflow: hidden; }
+.modeseg[hidden] { display: none; }
+.modeseg-btn {
+  font: 11px/1 var(--ui);
+  letter-spacing: .3px;
+  padding: 3px 9px;
+  border: 0;
+  border-right: 1px solid var(--face-sh2);
+  background: var(--face);
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+.modeseg-btn:last-child { border-right: 0; }
+.modeseg-btn:hover { background: var(--face-hi); color: var(--ink); }
+.modeseg-btn.active { background: var(--blue); color: #fff; }
+
+/* Process action bar */
+.proc-bar { display: inline-flex; align-items: center; gap: 6px; }
+.proc-bar[hidden] { display: none; }
+.proc-count { font: 11px var(--mono); color: var(--ink-soft); min-width: 60px; }
+
+/* Row select box + expand arrow, tucked into the row's first cell */
+.proc-firstcell { white-space: nowrap; }
+.proc-box {
+  display: inline-block;
+  width: 12px; height: 12px;
+  vertical-align: middle;
+  margin-right: 4px;
+  border: 1px solid var(--face-sh2);
+  border-radius: 2px;
+  background: var(--input-bg);
+  cursor: pointer;
+  position: relative;
+}
+.proc-box.on { background: var(--blue); border-color: var(--blue); }
+.proc-box.on::after {
+  content: "";
+  position: absolute; left: 3px; top: 0;
+  width: 4px; height: 8px;
+  border: solid #fff; border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+.proc-arrow {
+  display: inline-block;
+  width: 10px;
+  margin-right: 3px;
+  color: var(--ink-soft);
+  font-size: 10px;
+  cursor: pointer;
+  vertical-align: middle;
+}
+.proc-arrow-none { visibility: hidden; }
+
+/* Selected parent rows */
+tr.proc-selected > td { background: var(--row-checked); }
+
+/* Alternative / diff rows nested under their parent — light gray, and a
+   green/red field-level diff. Superseded (swapped-out) originals are struck. */
+tr.proc-alt > td {
+  background: var(--face-sh);
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+tr.proc-alt-old > td { color: var(--ink-faint); text-decoration: line-through; }
+/* Diff tints must out-specify the alt-row and selected-row backgrounds above. */
+tr.proc-alt > td.proc-diff-new {
+  background: color-mix(in srgb, var(--green) 24%, var(--face-sh));
+  color: var(--ink);
+}
+tr.proc-row > td.proc-diff-old { background: color-mix(in srgb, var(--red) 22%, transparent); }
+.proc-altsrc { text-align: right; }
+.proc-srctag {
+  font: 9px/1 var(--mono);
+  letter-spacing: .5px;
+  padding: 1px 3px;
+  border: 1px solid var(--face-sh2);
+  border-radius: 2px;
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+tr.proc-alt-old .proc-srctag { text-decoration: none; }
+
+/* Right-click context menu items (reusing #popup-menu) */
+.pm-btn {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  padding: 5px 12px;
+  font: 12px var(--ui);
+  color: var(--ink);
+  cursor: pointer;
+}
+.pm-btn:hover { background: var(--face-hi); }
+.pm-btn.pm-danger { color: var(--red); }

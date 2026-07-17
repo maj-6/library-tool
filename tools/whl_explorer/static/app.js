@@ -163,6 +163,11 @@ const state = {
   prov: {},                   // manual-form field provenance
   msrcTarget: null,
   mdTarget: null,             // markdown overlay target textarea
+  stagedAlts: {},             // Process mode: target -> {kind,label,alts[]} (server /api/staged)
+  procSelWhl: new Set(),      // Process mode: selected WHL row idxs
+  procSelChecked: new Set(),  // Process mode: selected checked/manual row ids
+  procExpanded: new Set(),    // Process mode: targets whose alternative rows are shown
+  procActionBusy: false,      // a Process action (job) is running
   settings: {
     checkedCols: {}, showCatalog: true,
     markFilter: "ALL", srcFilter: "ALL", dlFilter: "ALL",
@@ -4991,25 +4996,47 @@ function renderChecked() {
   // flatten sets (a header + its expanded volumes) into one ordered list so the
   // streamer can chunk across set boundaries.
   const items = [];
+  const proc = cmode === "process";
+  const pushAlts = (row) => {
+    if (!proc) return;
+    const target = rowTarget(row);
+    if (stagedFor(target) && state.procExpanded.has(target)) {
+      const pf = checkedParentFields(row);
+      for (const alt of stagedFor(target).alts) items.push({ alt, target, pf });
+    }
+  };
   for (const item of groupSets(rows)) {
     if (item.type === "set") {
       items.push({ set: item });
       if (item.expanded) {
-        item.vols.forEach((vr, i) =>
-          items.push({ vr, setKey: item.key, last: i === item.vols.length - 1 }));
+        item.vols.forEach((vr, i) => {
+          items.push({ vr, setKey: item.key, last: i === item.vols.length - 1 });
+          pushAlts(vr);
+        });
       }
     } else {
       items.push({ row: item.row });
+      pushAlts(item.row);
     }
   }
   streamRows(tbody, items, (d) => {
+    if (d.alt) return procAltTr(d.target, d.alt, d.pf, "checked");
     if (d.set) return checkedSetHeaderTr(d.set, cmode);
+    let tr, row;
     if (d.vr) {
-      const tr = checkedRowTr(d.vr, cmode, { isVol: true, setKey: d.setKey });
+      tr = checkedRowTr(d.vr, cmode, { isVol: true, setKey: d.setKey });
       if (d.last) tr.classList.add("set-last");
-      return tr;
+      row = d.vr;
+    } else {
+      tr = checkedRowTr(d.row, cmode, {});
+      row = d.row;
     }
-    return checkedRowTr(d.row, cmode, {});
+    if (proc) {
+      const target = rowTarget(row), e = stagedFor(target);
+      decorateProcParent(tr, target, "checked", !!e, procSel("checked").has(String(row.id)));
+      if (e) markParentDiff(tr, target, checkedParentFields(row), "checked");
+    }
+    return tr;
   });
 
   applyTableChrome("checked");
@@ -5032,6 +5059,8 @@ function onCheckedClick(ev) {
   }
   // plain click anywhere on a set header (arrow, tag, title) expands/collapses it
   if (setHdr) { toggleSet(setHdr.dataset.setKey); return; }
+  // Process mode owns plain clicks: checkbox / expand arrow / row selection
+  if (procTableClick(ev, "checked")) return;
   const mark = ev.target.closest(".vmark");
   if (mark) {
     const unit = mark.closest("[data-vsrc]");
@@ -5954,8 +5983,8 @@ function addChBook(idx) {
 
 // --- top pane: WHL catalog view (modes, corrections, scrape) ---------------------
 
-function whlMode() { return state.settings.whlMode === "search" ? "search" : "edit"; }
-function checkedMode() { return state.settings.checkedMode === "search" ? "search" : "edit"; }
+function whlMode() { const m = state.settings.whlMode; return m === "search" || m === "process" ? m : "edit"; }
+function checkedMode() { const m = state.settings.checkedMode; return m === "search" || m === "process" ? m : "edit"; }
 
 // the active top table's EDIT / SEARCH mode
 function topMode() {
@@ -5969,7 +5998,8 @@ function updateModeTag() {
   const m = topMode();
   const name = state.settings.topTable === "whl" ? "WHL" : "Checked";
   tag.textContent = `${name} mode: ${m}`;
-  tag.className = "foot-tag " + (m === "edit" ? "tag-edit" : "tag-search");
+  tag.className = "foot-tag " +
+    (m === "edit" ? "tag-edit" : m === "process" ? "tag-process" : "tag-search");
 }
 
 function setTopMode(m) {
@@ -5986,10 +6016,18 @@ function setTopMode(m) {
 }
 
 function renderModeBar() {
-  const btn = el("whl-mode");
-  btn.hidden = false;
-  btn.textContent = `Mode: ${topMode()}`;
-  el("whl-cons").hidden = topMode() !== "search";
+  const m = topMode();
+  const seg = el("whl-modeseg");
+  if (seg) {
+    seg.hidden = false;
+    seg.querySelectorAll(".modeseg-btn").forEach((b) =>
+      b.classList.toggle("active", b.dataset.mode === m));
+  }
+  el("whl-cons").hidden = m !== "search";
+  const pb = el("proc-bar");
+  if (pb) pb.hidden = m !== "process";
+  document.body.classList.toggle("top-process", m === "process");
+  if (m === "process") renderProcBar();
 }
 
 function switchTopTable(t) {
@@ -6023,6 +6061,382 @@ async function renderTop() {
   }
 }
 
+// =====================================================================
+// Process mode: stage alternative field-sets, review them as a nested
+// diff, and Mark Primary to swap one in. Every Process action (Normalize
+// now; DeepSeek / rescan / Smart Scan later) funnels its output into the
+// same staged-alternatives store and the same review surface.
+// =====================================================================
+
+// Alt/diff rows mirror the parent table's columns 1:1 so cells line up.
+// "_src" = the leading source-flag cell, "_whl" = a trailing badge cell;
+// everything else is a comparable field key (in the parent's own vocab).
+const WHL_ALT_COLS = ["_src", "title", "subtitle", "authors", "year",
+  "publisher", "pages", "language", "subject", "description", "_whl", "_whl"];
+const CHECKED_ALT_COLS = ["_src", ...BOOK_COLS, "_whl", "_whl", "_whl", "_whl", "_whl", "_whl"];
+
+const PROC_SRC_SHORT = { normalize: "NORM", deepseek: "AI", rescan: "SCAN",
+  smartscan: "SMART", superseded: "OLD" };
+const PROC_SRC_NAME = { normalize: "Normalized", deepseek: "DeepSeek",
+  rescan: "Rescan", smartscan: "Smart Scan", superseded: "Previous (superseded)" };
+function procSourceShort(s) { return PROC_SRC_SHORT[s] || (s || "ALT").slice(0, 4).toUpperCase(); }
+function procSourceLabel(alt) {
+  const n = PROC_SRC_NAME[alt.source] || alt.source || "Alternative";
+  return alt.note ? `${n} — ${alt.note}` : n;
+}
+
+function targetKind(target) {
+  const t = String(target || "");
+  if (t.startsWith("whl:")) return "whl";
+  if (t.startsWith("build:")) return "build";
+  if (t.startsWith("manual:")) return "manual";
+  if (t.startsWith("checked:")) return "checked";
+  return "";
+}
+function whlTarget(r) { return "whl:" + r.idx; }
+function rowTarget(row) { return (row.kind === "manual" ? "manual:" : "checked:") + row.id; }
+
+function stagedFor(target) {
+  const e = state.stagedAlts[target];
+  return e && Array.isArray(e.alts) && e.alts.length ? e : null;
+}
+
+async function loadStaged() {
+  try {
+    const r = await (await fetch("/api/staged")).json();
+    state.stagedAlts = (r && r.entries) || {};
+  } catch (e) { /* keep whatever we had */ }
+}
+
+// current field values of a parent row, keyed the way that table's cells are
+function whlParentFields(r) {
+  return { title: r.title || "", subtitle: r.subtitle || "", authors: r.authors || "",
+    year: r.year || "", publisher: r.publisher || "", pages: r.pages || "",
+    language: r.language || "", subject: r.subject || "", description: r.description || "" };
+}
+function checkedParentFields(row) {
+  const b = row.book || {}, out = {};
+  for (const f of BOOK_COLS) out[f] = f === "categories" ? bookCatsText(b) : String(b[f] || "");
+  return out;
+}
+function parentFieldsFor(target) {
+  const kind = targetKind(target);
+  if (kind === "whl") { const r = whlRowByIdx(parseInt(target.slice(4), 10)); return r ? whlParentFields(r) : {}; }
+  const row = state.rowsById.get(String(target.slice(target.indexOf(":") + 1)));
+  return row ? checkedParentFields(row) : {};
+}
+
+// --- selection ------------------------------------------------------------------
+function procSel(table) { return table === "whl" ? state.procSelWhl : state.procSelChecked; }
+function procKeyForRow(table, tr) {
+  return table === "whl" ? parseInt(tr.dataset.widx, 10) : String(tr.dataset.rowId || "");
+}
+function procToggleRow(table, tr) {
+  const key = procKeyForRow(table, tr);
+  if (table === "whl" ? isNaN(key) : !key) return;
+  const s = procSel(table), on = !s.has(key);
+  if (on) s.add(key); else s.delete(key);
+  tr.classList.toggle("proc-selected", on);
+  const box = tr.querySelector(".proc-box");
+  if (box) box.classList.toggle("on", on);
+  renderProcBar();
+}
+function procToggleExpand(target) {
+  if (state.procExpanded.has(target)) state.procExpanded.delete(target);
+  else state.procExpanded.add(target);
+  reRenderTop();
+}
+function currentWhlRows() {
+  const q = findQuery();
+  return (state.whlRows || [])
+    .filter((r) => matchesFind(q, `${r.title} ${r.subtitle || ""}`, r.authors, r.year))
+    .filter((r) => yearInRange(r.year));
+}
+function procSelectAll() {
+  const table = state.settings.topTable, s = procSel(table);
+  s.clear();
+  if (table === "whl") for (const r of currentWhlRows()) s.add(r.idx);
+  else for (const row of filteredCheckedRows()) if (row.id != null) s.add(String(row.id));
+  reRenderTop();
+  renderProcBar();
+}
+function procSelectNone() {
+  procSel(state.settings.topTable).clear();
+  reRenderTop();
+  renderProcBar();
+}
+function reRenderTop() {
+  if (state.settings.topTable === "whl") renderWhlTop();
+  else renderChecked();
+}
+
+function renderProcBar() {
+  const table = state.settings.topTable, n = procSel(table).size;
+  const cnt = el("proc-count");
+  if (cnt) cnt.textContent = `${n} selected`;
+  const run = el("proc-run");
+  if (run) run.disabled = n === 0 || state.procActionBusy;
+  for (const id of ["proc-all", "proc-none", "proc-action"]) {
+    const e = el(id);
+    if (e) e.disabled = state.procActionBusy;
+  }
+}
+
+// --- rendering: decorate parent rows, build alt rows ----------------------------
+function decorateProcParent(tr, target, table, hasAlts, selected) {
+  tr.classList.add("proc-row");
+  tr.dataset.target = target;
+  if (selected) tr.classList.add("proc-selected");
+  const first = tr.children[0];
+  if (!first) return;
+  first.classList.add("proc-firstcell");
+  const expanded = state.procExpanded.has(target);
+  const arrow = hasAlts
+    ? `<span class="proc-arrow" data-tip="${expanded ? "Hide" : "Show"} alternatives">${expanded ? "▾" : "▸"}</span>`
+    : `<span class="proc-arrow proc-arrow-none"></span>`;
+  first.insertAdjacentHTML("afterbegin",
+    `<span class="proc-box${selected ? " on" : ""}" data-tip="Select for processing"></span>${arrow}`);
+}
+
+// which parent column indices differ from a pending (non-superseded) alt
+function procParentDiffCols(target, parentFields, table) {
+  const e = stagedFor(target);
+  if (!e) return null;
+  const cols = table === "whl" ? WHL_ALT_COLS : CHECKED_ALT_COLS;
+  const changed = new Set();
+  for (const alt of e.alts) {
+    if (alt.source === "superseded") continue;
+    cols.forEach((key, i) => {
+      if (key === "_src" || key === "_whl") return;
+      if (Object.prototype.hasOwnProperty.call(alt.fields, key)) {
+        const av = String(alt.fields[key]).trim();
+        const pv = String(parentFields[key] != null ? parentFields[key] : "").trim();
+        if (av !== pv) changed.add(i);
+      }
+    });
+  }
+  return changed;
+}
+function markParentDiff(tr, target, parentFields, table) {
+  if (!state.procExpanded.has(target)) return;
+  const changed = procParentDiffCols(target, parentFields, table);
+  if (!changed || !changed.size) return;
+  [...tr.children].forEach((td, i) => { if (changed.has(i)) td.classList.add("proc-diff-old"); });
+}
+
+function procAltTr(target, alt, parentFields, table) {
+  const cols = table === "whl" ? WHL_ALT_COLS : CHECKED_ALT_COLS;
+  const tr = document.createElement("tr");
+  tr.className = "proc-alt" + (alt.source === "superseded" ? " proc-alt-old" : "");
+  tr.dataset.target = target;
+  tr.dataset.altId = alt.id;
+  tr.dataset.tip = "Right-click for Mark Primary";
+  tr.innerHTML = cols.map((key) => {
+    if (key === "_src")
+      return `<td class="col-src proc-altsrc"><span class="proc-srctag" ` +
+        `data-tip="${esc(procSourceLabel(alt))}">${esc(procSourceShort(alt.source))}</span></td>`;
+    if (key === "_whl") return `<td class="col-whl"></td>`;
+    const pv = String(parentFields[key] != null ? parentFields[key] : "");
+    const has = Object.prototype.hasOwnProperty.call(alt.fields, key);
+    const av = has ? String(alt.fields[key]) : pv;
+    const changed = has && av.trim() !== pv.trim();
+    return `<td${changed ? ' class="proc-diff-new"' : ""}>${esc(av)}</td>`;
+  }).join("");
+  return tr;
+}
+
+// --- actions --------------------------------------------------------------------
+// Compute normalized candidate values; only return the fields that change.
+function normalizeFieldSet(kind, cur) {
+  const out = {}, nameKey = kind === "whl" ? "authors" : "author";
+  const put = (k, v) => {
+    const nv = String(v == null ? "" : v);
+    if (nv.trim() && nv !== String(cur[k] == null ? "" : cur[k])) out[k] = nv;
+  };
+  if (String(cur.title || "").trim()) put("title", titleCase(cur.title));
+  if (String(cur.subtitle || "").trim()) put("subtitle", titleCase(cur.subtitle));
+  if (String(cur[nameKey] || "").trim()) put(nameKey, titleCase(flipName(cur[nameKey])));
+  if (String(cur.publisher || "").trim()) put("publisher", titleCase(cur.publisher));
+  if (kind !== "whl" && String(cur.city || "").trim()) put("city", titleCase(cur.city));
+  return out;
+}
+
+async function procStageAlt(target, kind, label, alt) {
+  const res = await fetch("/api/staged/add", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target, kind, label, alts: [alt] }),
+  });
+  if (!res.ok) return false;
+  const d = await res.json().catch(() => ({}));
+  if (d && d.entry) { state.stagedAlts[target] = d.entry; state.procExpanded.add(target); return true; }
+  return false;
+}
+
+async function procRun() {
+  const table = state.settings.topTable;
+  const action = el("proc-action").value;
+  const keys = [...procSel(table)];
+  if (!keys.length) { status("PROCESS: select one or more rows first"); return; }
+  if (action !== "normalize") { status("PROCESS: that action arrives in a later step"); return; }
+  const jobs = [];
+  if (table === "whl") {
+    for (const idx of keys) {
+      const r = whlRowByIdx(idx);
+      if (!r) continue;
+      const fields = normalizeFieldSet("whl", whlParentFields(r));
+      if (Object.keys(fields).length) jobs.push({ target: whlTarget(r), kind: "whl",
+        label: r.title || "", alt: { source: "normalize", fields } });
+    }
+  } else {
+    for (const id of keys) {
+      const row = state.rowsById.get(String(id));
+      if (!row) continue;
+      const fields = normalizeFieldSet("checked", checkedParentFields(row));
+      if (Object.keys(fields).length) jobs.push({ target: rowTarget(row),
+        kind: row.kind === "manual" ? "manual" : "checked",
+        label: (row.book && row.book.title) || "", alt: { source: "normalize", fields } });
+    }
+  }
+  if (!jobs.length) { status("NORMALIZE: nothing to change in the selection"); return; }
+  state.procActionBusy = true; renderProcBar();
+  let ok = 0;
+  for (const j of jobs) { if (await procStageAlt(j.target, j.kind, j.label, j.alt)) ok++; }
+  state.procActionBusy = false;
+  reRenderTop();
+  statusFlash(`NORMALIZE :: staged ${ok} alternative${ok === 1 ? "" : "s"} for review`);
+}
+
+// Mark Primary: apply an alt to the real record through the normal edit path,
+// then swap the store so the displaced original survives as a "superseded" alt
+// (right-click it to swap back).
+async function procMarkPrimary(target, altId) {
+  const e = state.stagedAlts[target];
+  const alt = e && (e.alts || []).find((a) => a.id === altId);
+  if (!alt) return;
+  const fields = alt.fields || {}, keys = Object.keys(fields);
+  if (!keys.length) return;
+  const kind = e.kind || targetKind(target);
+  const displaced = {};
+  let applied = false;
+  if (kind === "whl") {
+    const idx = parseInt(target.slice(4), 10);
+    const r = whlRowByIdx(idx);
+    if (!r) return;
+    for (const k of keys) displaced[k] = String(r[k] || "");
+    const before = whlFieldSnaps(r, keys);
+    if (await whlPost({ idx, fields })) {
+      pushWhlFieldsOp(`mark primary WHL ${String(r.title || idx).slice(0, 24)}`, idx, before, fields);
+      applied = true;
+    }
+  } else {
+    const row = state.rowsById.get(String(target.slice(target.indexOf(":") + 1)));
+    if (!row) return;
+    for (const k of keys) displaced[k] = String((row.book || {})[k] || "");
+    applied = await applyEditPatch(row, fields);
+  }
+  if (!applied) { statusErr("MARK PRIMARY FAILED"); return; }
+  try {
+    const res = await fetch("/api/staged/swap", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target, altId,
+        displaced: { source: "superseded", label: e.label || "", fields: displaced,
+          note: `was ${PROC_SRC_NAME[alt.source] || alt.source || "alternative"}` } }),
+    });
+    const d = await res.json().catch(() => ({}));
+    if (d && Object.prototype.hasOwnProperty.call(d, "entry")) {
+      if (d.entry) state.stagedAlts[target] = d.entry; else delete state.stagedAlts[target];
+    }
+  } catch (err) { /* store swap best-effort; field change already applied */ }
+  reRenderTop();
+  statusFlash("MARKED PRIMARY :: swapped in");
+}
+
+async function procDismiss(target, altId) {
+  try {
+    const res = await fetch("/api/staged/remove", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(altId ? { target, altId } : { target }),
+    });
+    const d = await res.json().catch(() => ({}));
+    if (d && Object.prototype.hasOwnProperty.call(d, "entry") && d.entry)
+      state.stagedAlts[target] = d.entry;
+    else delete state.stagedAlts[target];
+  } catch (e) { delete state.stagedAlts[target]; }
+  reRenderTop();
+}
+
+// --- shared click + right-click handling for both tables ------------------------
+function procTableClick(ev, table) {
+  if (topMode() !== "process") return false;
+  const arrow = ev.target.closest(".proc-arrow:not(.proc-arrow-none)");
+  if (arrow) {
+    const tr = arrow.closest("tr");
+    if (tr && tr.dataset.target) procToggleExpand(tr.dataset.target);
+    return true;
+  }
+  const box = ev.target.closest(".proc-box");
+  if (box) {
+    const tr = box.closest("tr");
+    if (tr) procToggleRow(table, tr);
+    return true;
+  }
+  if (ev.target.closest("tr.proc-alt")) return true;   // left-click on an alt: Mark Primary is right-click
+  // a plain click on a parent row toggles its selection, unless a real control was hit
+  if (ev.target.closest("a, button, input, select, .badge, .vmark, .set-arrow, " +
+      "[data-scanattach], [data-imginfo], [data-mdel], [data-unchk], [data-pdfm]")) return false;
+  const row = ev.target.closest("tr.proc-row");
+  if (row) { procToggleRow(table, row); return true; }
+  return false;
+}
+
+function onProcContextMenu(ev) {
+  if (topMode() !== "process") return;
+  const altTr = ev.target.closest("tr.proc-alt");
+  if (altTr && altTr.dataset.target && altTr.dataset.altId) {
+    ev.preventDefault();
+    const target = altTr.dataset.target, altId = altTr.dataset.altId;
+    const e = state.stagedAlts[target];
+    const alt = e && (e.alts || []).find((a) => a.id === altId);
+    const isOld = alt && alt.source === "superseded";
+    openProcMenu(ev.clientX, ev.clientY, [
+      { label: isOld ? "Mark Primary (restore original)" : "Mark Primary",
+        fn: () => procMarkPrimary(target, altId) },
+      { label: "Dismiss this alternative", danger: true, fn: () => procDismiss(target, altId) },
+    ]);
+    return;
+  }
+  const row = ev.target.closest("tr.proc-row");
+  if (row && row.dataset.target && stagedFor(row.dataset.target)) {
+    ev.preventDefault();
+    const target = row.dataset.target;
+    openProcMenu(ev.clientX, ev.clientY, [
+      { label: state.procExpanded.has(target) ? "Collapse alternatives" : "Expand alternatives",
+        fn: () => procToggleExpand(target) },
+      { label: "Clear all alternatives", danger: true, fn: () => procDismiss(target, null) },
+    ]);
+  }
+}
+
+// A cursor-positioned context menu, reusing the shared #popup-menu element.
+function openProcMenu(x, y, items) {
+  const pop = el("popup-menu");
+  pop.innerHTML = items.map((it, i) =>
+    `<button type="button" class="pm-item pm-btn${it.danger ? " pm-danger" : ""}" data-i="${i}">${esc(it.label)}</button>`).join("");
+  pop.hidden = false;
+  popupAnchor = pop;
+  pop.style.top = Math.max(8, Math.min(y, innerHeight - pop.offsetHeight - 8)) + "px";
+  pop.style.left = Math.max(8, Math.min(x, innerWidth - pop.offsetWidth - 8)) + "px";
+  pop.querySelectorAll(".pm-btn").forEach((b) => b.addEventListener("click", () => {
+    const it = items[+b.dataset.i];
+    closePopup();
+    if (it && it.fn) it.fn();
+  }));
+  const off = (e) => {
+    if (!pop.contains(e.target)) { closePopup(); document.removeEventListener("mousedown", off, true); }
+  };
+  setTimeout(() => document.addEventListener("mousedown", off, true), 0);
+}
+
 function renderWhlTop() {
   // the WHL table owns the top pane only when selected there — a save from
   // the EDIT tab (reachable from the bottom pane) must not repaint it or
@@ -6042,7 +6456,27 @@ function renderWhlTop() {
   const so = state.sort.whl;
   if (so) rows = sortRowsBy(rows, (r) => whlSortVal(r, so.key), so.dir);
   origRowShown = null;
-  streamRows(el("whltop-rows"), rows, (r) => whlRowTr(r, mode));
+  if (mode === "process") {
+    const items = [];
+    for (const r of rows) {
+      items.push({ r });
+      const target = whlTarget(r);
+      if (stagedFor(target) && state.procExpanded.has(target)) {
+        const pf = whlParentFields(r);
+        for (const alt of stagedFor(target).alts) items.push({ alt, target, pf });
+      }
+    }
+    streamRows(el("whltop-rows"), items, (it) => {
+      if (it.alt) return procAltTr(it.target, it.alt, it.pf, "whl");
+      const r = it.r, target = whlTarget(r), e = stagedFor(target);
+      const tr = whlRowTr(r, "process");
+      decorateProcParent(tr, target, "whl", !!e, procSel("whl").has(r.idx));
+      if (e) markParentDiff(tr, target, whlParentFields(r), "whl");
+      return tr;
+    });
+  } else {
+    streamRows(el("whltop-rows"), rows, (r) => whlRowTr(r, mode));
+  }
   el("whltop-empty").hidden = rows.length !== 0;
   el("top-count").textContent = `${rows.length} WHL rows`;
   applyTableChrome("whl");
@@ -15019,8 +15453,17 @@ function init() {
 
   // top pane: table selector + WHL interactions
   el("top-table").addEventListener("change", () => switchTopTable(el("top-table").value));
-  el("whl-mode").addEventListener("click", () =>
-    setTopMode(topMode() === "edit" ? "search" : "edit"));
+  el("whl-modeseg").addEventListener("click", (ev) => {
+    const b = ev.target.closest(".modeseg-btn");
+    if (b && b.dataset.mode) setTopMode(b.dataset.mode);
+  });
+  // Process mode: action bar + right-click Mark Primary on both tables
+  el("proc-all").addEventListener("click", procSelectAll);
+  el("proc-none").addEventListener("click", procSelectNone);
+  el("proc-run").addEventListener("click", procRun);
+  el("checked-rows").addEventListener("contextmenu", onProcContextMenu);
+  el("whltop-rows").addEventListener("contextmenu", onProcContextMenu);
+  loadStaged().then(() => { if (topMode() === "process") reRenderTop(); });
   document.addEventListener("keydown", (ev) => {
     if (!(ev.ctrlKey || ev.metaKey) || ev.key.toLowerCase() !== "e") return;
     const t = ev.target;
@@ -15043,6 +15486,7 @@ function init() {
     const idx = parseInt(tr.dataset.widx, 10);
     // Ctrl+click opens the record in the EDIT tab from either mode
     if (ev.ctrlKey || ev.metaKey) { openWhlEditTab(idx); return; }
+    if (procTableClick(ev, "whl")) return;
     if (whlMode() === "search") {
       if (ev.target.closest("td[data-wsearch]")) selectWhlSearchRow(idx);
       return;

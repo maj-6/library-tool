@@ -1055,6 +1055,212 @@ def api_builds_restore():
     return jsonify({"ok": True, "build": build})
 
 
+# --- staged alternatives: Process-mode candidate field-sets ------------------------
+# Process mode stages ALTERNATIVE field values for a catalog entry — produced by
+# Normalize, a DeepSeek pass, a rescan, or Smart Scan — for side-by-side review
+# before any is applied. Each store entry keys a parent record by ``target``
+# ("whl:<idx>", "build:<id>", "manual:<id>", "checked:<source>:<idx>") and holds
+# an ordered list of alternative field-sets. Nothing here mutates the real
+# record: the client applies a chosen alt through the normal edit endpoints
+# ("Mark Primary") and posts the displaced original back here as a "superseded"
+# alt, so the swap stays reversible. Device-local — provisional data never syncs
+# — and guarded by one lock like the other JSON stores.
+STAGED_PATH = lib.OUTPUT_DIR / "staged_alts.json"
+_staged_lock = threading.Lock()
+
+_STAGED_SOURCES = ("normalize", "deepseek", "rescan", "smartscan", "superseded")
+_STAGED_MAX_ENTRIES = 2000
+_STAGED_MAX_ALTS = 12
+
+
+def _staged_ts() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _clean_staged_fields(raw) -> dict:
+    """A flat {field: value} candidate map: string keys, scalar values coerced
+    to trimmed strings, capped in count and length so an untrusted client (or a
+    chatty model reply routed through here) can't bloat staged_alts.json."""
+    out = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if not isinstance(k, str) or len(out) >= 40:
+                continue
+            if isinstance(v, bool) or v is None:
+                continue
+            if isinstance(v, (str, int, float)):
+                out[k[:40]] = str(v)[:2000]
+    return out
+
+
+def _clean_staged_alt(raw) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    fields = _clean_staged_fields(raw.get("fields"))
+    if not fields:
+        return None
+    src = str(raw.get("source") or "").strip().lower()
+    if src not in _STAGED_SOURCES:
+        src = "normalize"
+    return {
+        "id": str(raw.get("id") or lib.gen_id()),
+        "source": src,
+        "label": str(raw.get("label") or "")[:200],
+        "fields": fields,
+        "note": str(raw.get("note") or "")[:4000],
+        "created_at": str(raw.get("created_at") or _staged_ts()),
+    }
+
+
+def _staged_entry(doc, target, kind="", label=""):
+    ents = doc.setdefault("entries", {})
+    e = ents.get(target)
+    if not isinstance(e, dict):
+        e = ents[target] = {"target": target, "kind": kind or _target_kind(target),
+                            "label": label, "alts": [], "created_at": _staged_ts()}
+    if kind:
+        e["kind"] = kind
+    if label:
+        e["label"] = label
+    if not isinstance(e.get("alts"), list):
+        e["alts"] = []
+    return e
+
+
+def _target_kind(target: str) -> str:
+    t = str(target or "")
+    if t.startswith("whl:"):
+        return "whl"
+    if t.startswith("build:"):
+        return "build"
+    if t.startswith("manual:"):
+        return "manual"
+    if t.startswith("checked:"):
+        return "checked"
+    return ""
+
+
+def _staged_prune(doc):
+    ents = doc.get("entries")
+    if not isinstance(ents, dict):
+        doc["entries"] = {}
+        return
+    for k in [k for k, e in ents.items()
+              if not (isinstance(e, dict) and e.get("alts"))]:
+        del ents[k]
+    if len(ents) > _STAGED_MAX_ENTRIES:
+        keep = sorted(ents.items(),
+                      key=lambda kv: str(kv[1].get("updated_at") or kv[1].get("created_at") or ""),
+                      reverse=True)[:_STAGED_MAX_ENTRIES]
+        doc["entries"] = dict(keep)
+
+
+@app.route("/api/staged")
+def api_staged_list():
+    doc = lib.load_json(STAGED_PATH, {"entries": {}})
+    ents = doc.get("entries") if isinstance(doc.get("entries"), dict) else {}
+    return jsonify({"entries": ents})
+
+
+@app.route("/api/staged/add", methods=["POST"])
+def api_staged_add():
+    """Stage one or more alternative field-sets on a target. Body:
+    {target, kind?, label?, alts:[{source,label?,fields,note?}]} (or a single
+    `alt`). A new alt whose (source, fields) duplicates an existing one is
+    skipped so re-running Normalize doesn't pile up identical candidates."""
+    p = request.get_json(silent=True) or {}
+    target = str(p.get("target") or "").strip()
+    if not target:
+        abort(400)
+    raw_alts = p.get("alts")
+    if raw_alts is None and p.get("alt") is not None:
+        raw_alts = [p.get("alt")]
+    if not isinstance(raw_alts, list):
+        abort(400)
+    cleaned = [a for a in (_clean_staged_alt(x) for x in raw_alts) if a]
+    if not cleaned:
+        return jsonify({"ok": False, "error": "no valid alternatives"}), 400
+
+    def apply(doc):
+        e = _staged_entry(doc, target, kind=str(p.get("kind") or ""),
+                          label=str(p.get("label") or ""))
+        seen = {(a.get("source"), json.dumps(a.get("fields"), sort_keys=True))
+                for a in e["alts"]}
+        for a in cleaned:
+            key = (a["source"], json.dumps(a["fields"], sort_keys=True))
+            if key in seen:
+                continue
+            seen.add(key)
+            e["alts"].append(a)
+        if len(e["alts"]) > _STAGED_MAX_ALTS:      # keep the most recent
+            del e["alts"][:-_STAGED_MAX_ALTS]
+        e["updated_at"] = _staged_ts()
+        _staged_prune(doc)
+        return doc.get("entries", {}).get(target)
+    entry = _mutate_json(STAGED_PATH, _staged_lock, {"entries": {}}, apply)
+    return jsonify({"ok": True, "entry": entry})
+
+
+@app.route("/api/staged/swap", methods=["POST"])
+def api_staged_swap():
+    """Mark Primary: the client has already applied alt <altId> to the real
+    record through the normal edit endpoints. Here we remove that alt and, if a
+    ``displaced`` field-set is supplied, re-file it as a "superseded" alt so the
+    swap is reversible. Body: {target, altId, displaced?:{label?,fields,note?}}."""
+    p = request.get_json(silent=True) or {}
+    target = str(p.get("target") or "").strip()
+    alt_id = str(p.get("altId") or "").strip()
+    if not target or not alt_id:
+        abort(400)
+    displaced = p.get("displaced")
+    disp_alt = None
+    if isinstance(displaced, dict):
+        d = dict(displaced)
+        d["source"] = "superseded"
+        disp_alt = _clean_staged_alt(d)
+
+    def apply(doc):
+        ents = doc.get("entries")
+        if not isinstance(ents, dict) or target not in ents:
+            return None
+        e = ents[target]
+        alts = e.get("alts") if isinstance(e.get("alts"), list) else []
+        e["alts"] = [a for a in alts if a.get("id") != alt_id]
+        if disp_alt:
+            e["alts"].append(disp_alt)
+        e["updated_at"] = _staged_ts()
+        _staged_prune(doc)
+        return ents.get(target)
+    entry = _mutate_json(STAGED_PATH, _staged_lock, {"entries": {}}, apply)
+    return jsonify({"ok": True, "entry": entry})
+
+
+@app.route("/api/staged/remove", methods=["POST"])
+def api_staged_remove():
+    """Dismiss a single alt ({target, altId}) or clear a whole entry ({target})."""
+    p = request.get_json(silent=True) or {}
+    target = str(p.get("target") or "").strip()
+    alt_id = str(p.get("altId") or "").strip()
+    if not target:
+        abort(400)
+
+    def apply(doc):
+        ents = doc.get("entries")
+        if not isinstance(ents, dict) or target not in ents:
+            return None
+        if not alt_id:
+            del ents[target]
+            return None
+        e = ents[target]
+        if isinstance(e.get("alts"), list):
+            e["alts"] = [a for a in e["alts"] if a.get("id") != alt_id]
+        e["updated_at"] = _staged_ts()
+        _staged_prune(doc)
+        return ents.get(target)
+    entry = _mutate_json(STAGED_PATH, _staged_lock, {"entries": {}}, apply)
+    return jsonify({"ok": True, "entry": entry})
+
+
 # --- category taxonomy -------------------------------------------------------------
 # The vocabulary behind every record's category_ids: a tree of {name, parent}
 # nodes in output/categories.json (see docs/library-analyze-design.md §1). The

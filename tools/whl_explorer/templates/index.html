@@ -474,8 +474,12 @@
               <option value="checked">Checked books + manual</option>
               <option value="whl">WHL</option>
             </select>
-            <button id="whl-mode" class="cad-btn tiny" type="button" hidden
-                    data-tip="Ctrl+E toggles EDIT / SEARCH mode"></button>
+            <span id="whl-modeseg" class="modeseg" role="group" hidden
+                  data-tip="Search / Edit / Process mode  (Ctrl+E toggles Search/Edit)">
+              <button type="button" class="modeseg-btn" data-mode="search">Search</button>
+              <button type="button" class="modeseg-btn" data-mode="edit">Edit</button>
+              <button type="button" class="modeseg-btn" data-mode="process">Process</button>
+            </span>
             <span id="whl-cons" class="whl-cons" hidden
                   data-tip="Constrain the Open Library search to these fields (Title = verbatim phrase). Ctrl+click any column header toggles a field too.">
               <span class="icon-label" data-icon="target"></span>
@@ -484,6 +488,23 @@
                 <label><input type="checkbox" id="wc-author" /> Author</label>
                 <label><input type="checkbox" id="wc-year" /> Year</label>
               </span>
+            </span>
+            <span id="proc-bar" class="proc-bar" hidden
+                  data-tip="Process mode — select rows, pick an action, Run">
+              <span id="proc-count" class="proc-count">0 selected</span>
+              <button id="proc-all" class="cad-btn tiny" type="button"
+                      data-tip="Select every row">All</button>
+              <button id="proc-none" class="cad-btn tiny" type="button"
+                      data-tip="Clear the selection">None</button>
+              <select id="proc-action" class="cad-input tiny"
+                      data-tip="Action to run on the selected rows">
+                <option value="normalize">Normalize names / caps</option>
+                <option value="rescan" disabled>Rescan (soon)</option>
+                <option value="deepseek" disabled>DeepSeek… (soon)</option>
+                <option value="smartscan" disabled>Smart Scan (soon)</option>
+              </select>
+              <button id="proc-run" class="cad-btn tiny" type="button"
+                      data-tip="Run the action on the selected rows">Run</button>
             </span>
             <span class="bar-spacer"></span>
             <span class="year-filter" data-tip="Show only rows within this year range (inclusive)">
