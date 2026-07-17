@@ -591,11 +591,35 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 20px;
-  margin-bottom: 24px;
-  padding-bottom: 14px;
-  border-bottom: 3px double var(--face-sh2);
+  margin-bottom: 20px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--face-sh2);   /* flat 1px chrome, like every other rule */
 }
 #home-titletext { min-width: 0; }
+/* state-of-the-archive line: catalogued / verified / published, as a quiet
+   readout under the wordmark. Numerals monospace, each figure a jump to where
+   it lives. Under-styled per the CAD ethos — no tiles, no meter. */
+.home-stats {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 14px;
+  margin-top: 7px;
+  font-size: 12px;
+  color: var(--face-sh2);
+}
+.hs-item {
+  border: 0;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+.hs-item:hover .hs-l { color: var(--cyan); }
+.hs-item:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; border-radius: 2px; }
+.hs-n { font-family: var(--mono); font-weight: bold; color: var(--ink); margin-right: 4px; }
+.home-stats .hs-sep { color: var(--face-sh); }
 #home-title h1 {
   margin: 0;
   font-family: "Roboto Slab", Georgia, "Times New Roman", serif;
@@ -616,8 +640,8 @@ body {
   color: var(--face-sh2);
   margin-left: 2px;
 }
-#home-icon { flex: 0 0 auto; display: block; width: 64px; height: 64px; }
-@media (max-width: 560px) { #home-icon { width: 52px; height: 52px; } }
+#home-icon { flex: 0 0 auto; display: block; width: 48px; height: 48px; }
+@media (max-width: 560px) { #home-icon { width: 42px; height: 42px; } }
 #home-cols {
   display: grid;
   grid-template-columns: minmax(0, 1.15fr) minmax(0, 1.4fr) minmax(0, 0.85fr);
@@ -676,6 +700,19 @@ body {
   cursor: pointer;
 }
 .home-row:hover .hr-l { color: var(--cyan); }
+/* a zero count is a status fact, not a destination: keep the text, drop the
+   click affordance so it can't lead into an empty tab */
+.home-row-empty { cursor: default; color: var(--face-sh2); }
+.home-row-empty .hr-n { color: var(--face-sh2); font-weight: normal; }
+.home-row-empty:hover .hr-l { color: var(--face-sh2); }
+/* fresh/cleared queue: the acquire front door, in the same terse row idiom */
+.home-start-hint {
+  margin-top: 7px;
+  padding: 0 2px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--face-sh2);
+}
 .hr-n { flex: 0 0 auto; min-width: 22px; text-align: right; font-family: var(--mono); font-weight: bold; }
 .hr-l { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hr-d { flex: 0 0 auto; margin-left: auto; color: var(--face-sh2); font-size: 10.5px; white-space: nowrap; }

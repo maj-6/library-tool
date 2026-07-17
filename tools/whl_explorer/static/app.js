@@ -1757,7 +1757,15 @@ function progressSummary() {
   const attnEd = builds.filter((b) => b.attention && b.status !== "uploaded").length;
   const openReviews = Object.values(reviewsState.items || {})
     .filter((r) => r.status === "open").length;
-  return { drafts, ready, srcPending, attnCat, attnEd, openReviews };
+  // cumulative archive facts (the mission, not the churn): what has been
+  // catalogued at all, verified (ready to publish), and actually published.
+  // Driven off local `uploaded` builds — the cloud publish count is loaded
+  // lazily only when the Published tab opens, so it is 0 on a cold Home.
+  const published = builds.filter((b) => b.status === "uploaded").length;
+  const catalogued = (state.checked ? state.checked.size : 0) +
+                     (state.manual || []).length;
+  return { drafts, ready, srcPending, attnCat, attnEd, openReviews,
+           published, catalogued };
 }
 
 // --- contributor identity: micro-avatars + profile popup -----------------------
@@ -1970,27 +1978,68 @@ function renderHome() {
   if (!prog || !feed) return;
 
   const p = progressSummary();
+
+  // State of the archive, in the masthead: the mission as a quiet fact
+  // (catalogued -> verified -> published), each figure a jump to where that
+  // stage lives. Under-styled per the CAD ethos — a readout, not tiles.
+  const statsEl = el("home-stats");
+  if (statsEl) {
+    const TAB_FOR = { catalogued: "checked", verified: "workbench", published: "publish" };
+    const stat = (n, label) =>
+      `<button class="hs-item" type="button" data-gotab="${TAB_FOR[label]}">` +
+        `<span class="hs-n">${n}</span><span class="hs-l">${label}</span></button>`;
+    const sep = `<span class="hs-sep">·</span>`;
+    statsEl.innerHTML =
+      stat(p.catalogued, "catalogued") + sep +
+      stat(p.ready, "verified") + sep +
+      stat(p.published, "published");
+  }
+
   // one line per metric, count first, breakdown right-aligned and muted —
-  // a status readout in the app's row idiom, not a dashboard of tiles
-  const row = (n, label, act, detail) =>
-    `<button class="home-row" ${act}>` +
+  // a status readout in the app's row idiom, not a dashboard of tiles. A zero
+  // count stays as text but drops its click affordance, so it can't lead into
+  // an empty tab.
+  const row = (n, label, act, detail) => {
+    const empty = !n;
+    const tag = empty ? "div" : "button";
+    return `<${tag} class="home-row${empty ? " home-row-empty" : ""}"` +
+      (empty ? "" : ` type="button" ${act}`) + `>` +
       `<span class="hr-n">${n}</span>` +
       `<span class="hr-l">${esc(label)}</span>` +
       (detail ? `<span class="hr-d">${esc(detail)}</span>` : "") +
-    `</button>`;
+    `</${tag}>`;
+  };
   const inEditor = p.drafts.length + p.ready;
   const attn = p.attnCat + p.attnEd;
-  let html =
-    row(inEditor, inEditor === 1 ? "entry in the workbench" : "entries in the workbench",
-        `data-gotab="workbench"`, inEditor ? `${p.drafts.length} draft · ${p.ready} to publish` : "") +
-    row(p.srcPending, p.srcPending === 1 ? "PDF source pending verification"
-        : "PDF sources pending verification", `data-gotab="workbench"`) +
-    row(attn, attn === 1 ? "item marked for attention"
-        : "items marked for attention",
-        `data-gotab="${p.attnCat || !p.attnEd ? "checked" : "workbench"}"`,
-        p.attnCat && p.attnEd ? `${p.attnCat} catalog · ${p.attnEd} workbench` : "") +
-    row(p.openReviews, p.openReviews === 1 ? "item awaiting review"
-        : "items awaiting review", `data-review="1"`);
+  let html;
+  if (!inEditor && !p.srcPending && !attn && !p.openReviews) {
+    // Nothing in flight: offer the front of the pipeline instead of four dead
+    // zeros. Reuses the real New-entry / Scrape commands (MENU_CMDS), so this
+    // is the workbench's front door — distinct from the one-time setup wizard.
+    const startRow = (glyph, label, desc, cmd) =>
+      `<button class="home-row" type="button" data-cmd="${cmd}">` +
+        `<span class="hr-n">${glyph}</span>` +
+        `<span class="hr-l">${esc(label)}</span>` +
+        `<span class="hr-d">${esc(desc)}</span></button>`;
+    html =
+      `<div class="home-h home-h-sub">Start here</div>` +
+      startRow("+", "New entry", "a catalogue record from scratch", "new-entry") +
+      startRow("↓", "Scrape WHL", "pull the source list to work from", "scrape") +
+      `<div class="home-start-hint">…or capture pages from the Book Capture phone ` +
+      `app, or auto-download scans from the Internet Archive.</div>`;
+  } else {
+    html =
+      row(inEditor, inEditor === 1 ? "entry in the workbench" : "entries in the workbench",
+          `data-gotab="workbench"`, inEditor ? `${p.drafts.length} draft · ${p.ready} to publish` : "") +
+      row(p.srcPending, p.srcPending === 1 ? "PDF source pending verification"
+          : "PDF sources pending verification", `data-gotab="workbench"`) +
+      row(attn, attn === 1 ? "item marked for attention"
+          : "items marked for attention",
+          `data-gotab="${p.attnCat || !p.attnEd ? "checked" : "workbench"}"`,
+          p.attnCat && p.attnEd ? `${p.attnCat} catalog · ${p.attnEd} workbench` : "") +
+      row(p.openReviews, p.openReviews === 1 ? "item awaiting review"
+          : "items awaiting review", `data-review="1"`);
+  }
 
   // the freshest few drafts, so unfinished work is one click away
   const drafts = p.drafts.slice()
@@ -2074,6 +2123,13 @@ function initHome() {
   // the version number is stated once, in the title bar markup; the home
   // page wordmark mirrors it so the two can never disagree
   el("home-ver").textContent = el("tb-meta").textContent;
+  // every workbench-bound row advertises pending work, so land on the Pending
+  // queue even if the book list was left on Uploaded
+  const homeGoToTab = (name) => {
+    if (name === "workbench") state.buildsTab = "pending";
+    const t = document.querySelector(`#tabs .tab[data-tab="${name}"]`);
+    if (t) t.click();
+  };
   el("home-progress").addEventListener("click", (ev) => {
     const d = ev.target.closest("[data-draft]");
     if (d) {
@@ -2083,14 +2139,24 @@ function initHome() {
       selectWorkbenchBook(d.dataset.draft, "record");
       return;
     }
-    if (ev.target.closest("[data-review]")) { openReviewWin(); return; }
-    const b = ev.target.closest("[data-gotab]");
-    if (b) {
-      // every workbench-bound row advertises pending work, so land on the
-      // Pending queue even if the book list was left on Uploaded
-      if (b.dataset.gotab === "workbench") state.buildsTab = "pending";
-      document.querySelector(`#tabs .tab[data-tab="${b.dataset.gotab}"]`).click();
+    // "Start here" rows run the real New-entry / Scrape commands directly
+    const cmd = ev.target.closest("[data-cmd]");
+    if (cmd) { const f = MENU_CMDS[cmd.dataset.cmd]; if (f) f(); return; }
+    // the review queue is already inline below — focus it, don't open the
+    // redundant overlay window
+    if (ev.target.closest("[data-review]")) {
+      const pane = el("home-reviews");
+      if (pane) pane.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      return;
     }
+    const b = ev.target.closest("[data-gotab]");
+    if (b) homeGoToTab(b.dataset.gotab);
+  });
+  // the state-of-archive figures jump to the tab that stage lives on
+  const statsEl = el("home-stats");
+  if (statsEl) statsEl.addEventListener("click", (ev) => {
+    const b = ev.target.closest("[data-gotab]");
+    if (b) homeGoToTab(b.dataset.gotab);
   });
   // an activity row toggles its per-event detail
   el("home-activity").addEventListener("click", (ev) => {
