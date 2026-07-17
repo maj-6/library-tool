@@ -5252,7 +5252,8 @@ function cellCopyValue(td) {
     if (row && row.book && row.book[td.dataset.edit] != null) return String(row.book[td.dataset.edit]);
   }
   const clone = td.cloneNode(true);
-  clone.querySelectorAll(".sc-wand, .set-arrow, .icon-label, [data-icon], svg, button, .cell-edit")
+  clone.querySelectorAll(".sc-wand, .set-arrow, .icon-label, [data-icon], svg, button, " +
+    ".cell-edit, .src-mark, .src-edited, .proc-box, .proc-arrow, .proc-srctag")
     .forEach((n) => n.remove());
   return clone.textContent.replace(/\s+/g, " ").trim();
 }
@@ -6180,6 +6181,8 @@ function renderProcBar() {
     const e = el(id);
     if (e) e.disabled = state.procActionBusy;
   }
+  const act = el("proc-action"), inp = el("proc-ai-instr");
+  if (inp) { inp.hidden = !act || act.value !== "deepseek"; inp.disabled = state.procActionBusy; }
 }
 
 // --- rendering: decorate parent rows, build alt rows ----------------------------
@@ -6272,38 +6275,103 @@ async function procStageAlt(target, kind, label, alt) {
   return false;
 }
 
+// The selected rows resolved to {target, kind, label, cur} (cur = its field map).
+function procSelectedRows(table, keys) {
+  const out = [];
+  if (table === "whl") {
+    for (const idx of keys) {
+      const r = whlRowByIdx(idx);
+      if (r) out.push({ target: whlTarget(r), kind: "whl", label: r.title || "", cur: whlParentFields(r) });
+    }
+  } else {
+    for (const id of keys) {
+      const row = state.rowsById.get(String(id));
+      if (row) out.push({ target: rowTarget(row), kind: row.kind === "manual" ? "manual" : "checked",
+        label: (row.book && row.book.title) || "", cur: checkedParentFields(row) });
+    }
+  }
+  return out;
+}
+
+async function procStageBatch(items, label) {
+  state.procActionBusy = true; renderProcBar();
+  let ok = 0;
+  for (const it of items) { if (await procStageAlt(it.target, it.kind, it.label, it.alt)) ok++; }
+  state.procActionBusy = false;
+  reRenderTop();
+  statusFlash(`${label} :: staged ${ok} alternative${ok === 1 ? "" : "s"} for review`);
+  return ok;
+}
+
 async function procRun() {
   const table = state.settings.topTable;
   const action = el("proc-action").value;
   const keys = [...procSel(table)];
   if (!keys.length) { status("PROCESS: select one or more rows first"); return; }
-  if (action !== "normalize") { status("PROCESS: that action arrives in a later step"); return; }
-  const jobs = [];
-  if (table === "whl") {
-    for (const idx of keys) {
-      const r = whlRowByIdx(idx);
-      if (!r) continue;
-      const fields = normalizeFieldSet("whl", whlParentFields(r));
-      if (Object.keys(fields).length) jobs.push({ target: whlTarget(r), kind: "whl",
-        label: r.title || "", alt: { source: "normalize", fields } });
-    }
-  } else {
-    for (const id of keys) {
-      const row = state.rowsById.get(String(id));
-      if (!row) continue;
-      const fields = normalizeFieldSet("checked", checkedParentFields(row));
-      if (Object.keys(fields).length) jobs.push({ target: rowTarget(row),
-        kind: row.kind === "manual" ? "manual" : "checked",
-        label: (row.book && row.book.title) || "", alt: { source: "normalize", fields } });
-    }
+  if (action === "normalize") return procRunNormalize(table, keys);
+  if (action === "deepseek") return procRunDeepseek(table, keys);
+  if (action === "rescan") return procRunRescan(table, keys);
+  if (action === "smartscan") { status("SMART SCAN :: arrives in the next stage"); return; }
+}
+
+async function procRunNormalize(table, keys) {
+  const items = [];
+  for (const it of procSelectedRows(table, keys)) {
+    const fields = normalizeFieldSet(it.kind === "whl" ? "whl" : "checked", it.cur);
+    if (Object.keys(fields).length)
+      items.push({ target: it.target, kind: it.kind, label: it.label, alt: { source: "normalize", fields } });
   }
-  if (!jobs.length) { status("NORMALIZE: nothing to change in the selection"); return; }
+  if (!items.length) { status("NORMALIZE :: nothing to change in the selection"); return; }
+  await procStageBatch(items, "NORMALIZE");
+}
+
+// DeepSeek over each selected record with the user's instructions. One request
+// per row (the client loops); the server returns only the fields to change.
+async function procRunDeepseek(table, keys) {
+  const rows = procSelectedRows(table, keys);
+  if (!rows.length) return;
+  const instr = (el("proc-ai-instr").value || state.settings.aiInstructions || "").trim();
+  const ok0 = await confirmDialog({
+    title: "Run DeepSeek",
+    message: `Send ${rows.length} record${rows.length === 1 ? "" : "s"} to DeepSeek for review?`,
+    detail: instr ? "Instructions: " + instr : "Using your Settings › AI instructions.",
+    cost: `~${rows.length} API call${rows.length === 1 ? "" : "s"}`,
+    confirmLabel: "Run",
+  });
+  if (!ok0) return;
   state.procActionBusy = true; renderProcBar();
-  let ok = 0;
-  for (const j of jobs) { if (await procStageAlt(j.target, j.kind, j.label, j.alt)) ok++; }
+  let ok = 0, failed = 0, errored = "";
+  for (const it of rows) {
+    status(`DEEPSEEK :: ${ok + failed + 1}/${rows.length} …`);
+    try {
+      const res = await fetch("/api/process/deepseek", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fields: it.cur, instructions: instr, kind: it.kind }),
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.ok === false) { failed++; errored = d.error || "AI error"; continue; }
+      if (d.fields && Object.keys(d.fields).length &&
+          await procStageAlt(it.target, it.kind, it.label,
+            { source: "deepseek", fields: d.fields, note: instr.slice(0, 80) })) ok++;
+    } catch (e) { failed++; errored = "request failed"; }
+  }
   state.procActionBusy = false;
   reRenderTop();
-  statusFlash(`NORMALIZE :: staged ${ok} alternative${ok === 1 ? "" : "s"} for review`);
+  if (!ok && errored) statusErr("DEEPSEEK :: " + errored);
+  else statusFlash(`DEEPSEEK :: staged ${ok} alternative${ok === 1 ? "" : "s"}` +
+    (failed ? ` (${failed} failed)` : ""));
+}
+
+// Rescan re-runs the source scan for the selected checked/manual books (WHL
+// rows are the catalogue itself and aren't scanned against sources).
+function procRunRescan(table, keys) {
+  if (table === "whl") { status("RESCAN :: applies to checked / manual books, not WHL rows"); return; }
+  let n = 0;
+  for (const id of keys) {
+    const row = state.rowsById.get(String(id));
+    if (row) { queueScan(String(id)); n++; }
+  }
+  status(`RESCAN :: queued ${n} book${n === 1 ? "" : "s"} for a fresh source scan`);
 }
 
 // Mark Primary: apply an alt to the real record through the normal edit path,
@@ -6435,6 +6503,76 @@ function openProcMenu(x, y, items) {
     if (!pop.contains(e.target)) { closePopup(); document.removeEventListener("mousedown", off, true); }
   };
   setTimeout(() => document.addEventListener("mousedown", off, true), 0);
+}
+
+// --- general row context menu (Search / Edit modes) -----------------------------
+// A right-click on any catalog row offers convenient row actions. Process mode
+// keeps its own menu (Mark Primary); this is the everywhere-else menu, built to
+// grow — add entries to generalRowMenu as more actions earn a shortcut.
+function openExternal(url) {
+  if (!url) return;
+  const a = document.createElement("a");
+  a.href = url; a.target = "_blank"; a.rel = "noopener";
+  a.click();
+}
+
+function copyRecordText(fields) {
+  const lines = Object.entries(fields)
+    .filter(([, v]) => String(v == null ? "" : v).trim())
+    .map(([k, v]) => `${k}: ${v}`);
+  copyText(lines.join("\n"));
+  statusFlash(`COPIED RECORD :: ${lines.length} field${lines.length === 1 ? "" : "s"}`);
+}
+
+function generalRowMenu(ev, table) {
+  const tr = ev.target.closest("tr");
+  if (!tr) return null;
+  const items = [];
+  const td = ev.target.closest("td");
+  // structural columns (source flag, trailing badges) aren't fields to copy
+  const structural = td && (td.classList.contains("col-src") || td.classList.contains("col-whl") ||
+    td.classList.contains("set-src") || td.classList.contains("set-title-cell"));
+  if (td && !structural) {
+    const val = cellCopyValue(td);
+    if (val) items.push({ label: "Copy field", fn: () => {
+      copyText(val); flashCell(td, "cell-copied");
+      const f = cellFieldName(td);
+      statusFlash(f ? `COPIED ${f.toUpperCase()}: ${clipNote(val)}` : `COPIED: ${clipNote(val)}`);
+    } });
+  }
+  if (table === "whl") {
+    const idx = parseInt(tr.dataset.widx, 10);
+    if (isNaN(idx)) return items.length ? items : null;
+    const r = whlRowByIdx(idx);
+    items.push({ label: "Copy record", fn: () => copyRecordText(whlParentFields(r || {})) });
+    items.push({ label: "Edit record", fn: () => openWhlEditTab(idx) });
+    if (r && r.permalink) items.push({ label: "Open WHL page", fn: () => openExternal(r.permalink) });
+    if (r && r.file && /^https?:/i.test(r.file))
+      items.push({ label: "Open publication PDF", fn: () => openExternal(r.file) });
+  } else {
+    const setHdr = ev.target.closest("tr.set-header");
+    if (setHdr && setHdr.dataset.setKey) {
+      items.push({ label: "Edit set", fn: () => openSetEditTab(setHdr.dataset.setKey) });
+      return items;
+    }
+    const id = tr.dataset.rowId;
+    if (!id) return items.length ? items : null;
+    const row = state.rowsById.get(String(id));
+    items.push({ label: "Copy record", fn: () => copyRecordText(checkedParentFields(row || { book: {} })) });
+    items.push({ label: "Edit record", fn: () => openBookEditTab(id) });
+    if (row && row.kind === "manual")
+      items.push({ label: "Delete entry", danger: true, fn: () => deleteManual(id) });
+    else
+      items.push({ label: "Remove from checked", danger: true, fn: () => uncheckRow(id) });
+  }
+  return items;
+}
+
+function onRowContextMenu(ev) {
+  if (topMode() === "process") { onProcContextMenu(ev); return; }
+  const table = ev.target.closest("#whltop-rows") ? "whl" : "checked";
+  const items = generalRowMenu(ev, table);
+  if (items && items.length) { ev.preventDefault(); openProcMenu(ev.clientX, ev.clientY, items); }
 }
 
 function renderWhlTop() {
@@ -15461,8 +15599,14 @@ function init() {
   el("proc-all").addEventListener("click", procSelectAll);
   el("proc-none").addEventListener("click", procSelectNone);
   el("proc-run").addEventListener("click", procRun);
-  el("checked-rows").addEventListener("contextmenu", onProcContextMenu);
-  el("whltop-rows").addEventListener("contextmenu", onProcContextMenu);
+  el("proc-action").addEventListener("change", () => {
+    const inp = el("proc-ai-instr");
+    if (el("proc-action").value === "deepseek" && inp && !inp.value && state.settings.aiInstructions)
+      inp.value = state.settings.aiInstructions;
+    renderProcBar();
+  });
+  el("checked-rows").addEventListener("contextmenu", onRowContextMenu);
+  el("whltop-rows").addEventListener("contextmenu", onRowContextMenu);
   loadStaged().then(() => { if (topMode() === "process") reRenderTop(); });
   document.addEventListener("keydown", (ev) => {
     if (!(ev.ctrlKey || ev.metaKey) || ev.key.toLowerCase() !== "e") return;

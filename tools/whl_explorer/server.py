@@ -5615,6 +5615,58 @@ def _ai_json(cfg: dict, messages: list, temperature: float = 0.2) -> dict:
         return {}
 
 
+# The catalogue fields a Process/DeepSeek pass is allowed to touch — so the
+# model can't slip arbitrary keys into a staged alternative.
+_PROC_FIELD_KEYS = frozenset((
+    "title", "subtitle", "author", "authors", "year", "publisher",
+    "publisher_city", "city", "edition", "volume", "language", "pages",
+    "description", "subject", "categories"))
+
+
+@app.route("/api/process/deepseek", methods=["POST"])
+def api_process_deepseek():
+    """Process-mode "DeepSeek custom instructions" for ONE record: given its
+    current fields and the user's instructions, return ONLY the fields that
+    should change (same names), for staging as an alternative. The client loops
+    this over the selection. Human-in-the-loop: nothing is applied here."""
+    p = request.get_json(silent=True) or {}
+    fields = p.get("fields")
+    if not isinstance(fields, dict):
+        abort(400)
+    cfg = _ai_cfg()
+    if not cfg["key"]:
+        return jsonify({"ok": False, "error": "No AI key — set one in Settings > AI"}), 400
+    cur = {k: str(v)[:600] for k, v in fields.items()
+           if isinstance(k, str) and k in _PROC_FIELD_KEYS
+           and isinstance(v, (str, int, float)) and str(v).strip()}
+    if not cur:
+        return jsonify({"ok": True, "fields": {}})
+    sys = ("You are a meticulous bibliographic metadata editor. You are given one "
+           "book catalogue record as JSON. Apply the user's instructions and "
+           "return ONLY a JSON object of the fields that should CHANGE, using the "
+           "exact same field names. Omit unchanged fields. Do not invent facts you "
+           "cannot derive from the given values; when unsure, omit the field. "
+           "Return {} if nothing should change.")
+    run_instr = str(p.get("instructions") or "").strip()
+    if cfg["instructions"]:
+        sys += "\n\nStanding instructions: " + cfg["instructions"]
+    if run_instr:
+        sys += "\n\nThis run's instructions: " + run_instr[:2000]
+    try:
+        out = _ai_json(cfg, [{"role": "system", "content": sys},
+                             {"role": "user", "content": "Record:\n" + json.dumps(cur, ensure_ascii=False)}],
+                       temperature=0.1)
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "error": str(exc)[:200]}), 502
+    changed = {}
+    for k, v in (out.items() if isinstance(out, dict) else []):
+        if isinstance(k, str) and k in _PROC_FIELD_KEYS and isinstance(v, (str, int, float)):
+            nv = str(v).strip()
+            if nv and nv != str(cur.get(k, "")).strip():
+                changed[k] = nv[:2000]
+    return jsonify({"ok": True, "fields": changed})
+
+
 _PAGE_MARK = re.compile(r"^--- page (\d+) ---$", re.M)
 
 

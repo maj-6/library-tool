@@ -3949,6 +3949,8 @@ button.publish-tree-label { cursor: pointer; }
 .proc-bar { display: inline-flex; align-items: center; gap: 6px; }
 .proc-bar[hidden] { display: none; }
 .proc-count { font: 11px var(--mono); color: var(--ink-soft); min-width: 60px; }
+.proc-ai-instr { width: 170px; }
+.proc-ai-instr[hidden] { display: none; }
 
 /* Row select box + expand arrow, tucked into the row's first cell */
 .proc-firstcell { white-space: nowrap; }

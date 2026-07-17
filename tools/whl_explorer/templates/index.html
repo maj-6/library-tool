@@ -499,10 +499,13 @@
               <select id="proc-action" class="cad-input tiny"
                       data-tip="Action to run on the selected rows">
                 <option value="normalize">Normalize names / caps</option>
-                <option value="rescan" disabled>Rescan (soon)</option>
-                <option value="deepseek" disabled>DeepSeek… (soon)</option>
+                <option value="deepseek">DeepSeek…</option>
+                <option value="rescan">Rescan</option>
                 <option value="smartscan" disabled>Smart Scan (soon)</option>
               </select>
+              <input id="proc-ai-instr" class="cad-input tiny proc-ai-instr" hidden
+                     placeholder="DeepSeek instructions…"
+                     data-tip="What DeepSeek should do to each selected record (blank uses your Settings › AI instructions)" />
               <button id="proc-run" class="cad-btn tiny" type="button"
                       data-tip="Run the action on the selected rows">Run</button>
             </span>
