@@ -30,6 +30,31 @@ def test_release_tag_version_preflight_gates_every_publish_path():
     assert "needs: [preflight, android, desktop]" in publish
 
 
+def test_release_requires_persistent_android_signing_for_tags():
+    android = _job("android", "desktop")
+    publish = WORKFLOW[WORKFLOW.index("  publish:\n") :]
+
+    # A tagged build with no keystore must FAIL the android job rather than
+    # silently fall back to the runner's debug key (issue #119).
+    assert "IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}" in android
+    assert 'elif [ "$IS_TAG" = "true" ]; then' in android
+    assert "Tagged Android release requires the persistent signing keystore" in android
+
+    # A workflow_dispatch dry run may still debug-sign, but the artifact is
+    # clearly labelled as non-publishable.
+    assert "WHL_DEBUG_SIGNED=true" in android
+    assert "BookCapture-$V-debug-DONOTPUBLISH.apk" in android
+
+    # The signer is verified before upload; a debug-signed tagged APK is refused.
+    assert "apksigner" in android
+    assert "verify --print-certs" in android
+    assert "Android Debug" in android
+
+    # The android job exposes the verified signer and the publish job reports it.
+    assert "signer: ${{ steps.signer.outputs.signer }}" in android
+    assert "needs.android.outputs.signer" in publish
+
+
 def test_release_source_versions_are_internally_consistent():
     package = json.loads((ROOT / "desktop" / "package.json").read_text(encoding="utf-8"))
     lock = json.loads(

@@ -58,9 +58,14 @@ Two ways a row gets there:
 `.github/workflows/release.yml` runs on the public repo when a `v*` tag is
 pushed:
 
-1. **android** builds `android/BookCapture` (`assembleRelease`, signed with the
-   keystore secret if present, the runner's debug key if not) and names the APK
-   after its gradle `versionName`.
+1. **android** builds `android/BookCapture` (`assembleRelease`) and names the APK
+   after its gradle `versionName`. A tag push **requires** the release keystore
+   secret: without it the android job fails before the APK is uploaded, because a
+   debug-signed build can't update an existing install. The desktop release is
+   independent and still ships. The job then verifies the APK's signer (via
+   `apksigner`) and refuses a debug-signed tagged build. A `workflow_dispatch`
+   dry run without the secret still builds, debug-signed and suffixed
+   `-debug-DONOTPUBLISH.apk` so it can't be mistaken for a release.
 2. **desktop** freezes the Flask sidecar with PyInstaller and runs
    electron-builder on a Windows runner, producing the NSIS installer
    `LibraryTool-Setup-<package.json version>.exe` **plus `latest.yml` and the
@@ -91,13 +96,41 @@ and the artifacts are inspectable, nothing is published.
 |---|---|---|
 | `SUPABASE_URL` | variable | already set for the pages workflow |
 | `SUPABASE_SERVICE_ROLE_KEY` | secret | writes to `releases` (anon is read-only by RLS). Without it the GitHub Release still happens; the register step warns and skips. |
-| `ANDROID_KEYSTORE_B64` | secret | base64 of the signing keystore. Local copy: `~/.whl-release/bookcapture.jks(.b64)`, password in `bookcapture-keystore-info.txt` next to it. |
+| `ANDROID_KEYSTORE_B64` | secret | **required to publish Android on a tag.** base64 of the signing keystore. Local copy: `~/.whl-release/bookcapture.jks(.b64)`, password in `bookcapture-keystore-info.txt` next to it. |
 | `ANDROID_KEYSTORE_PASSWORD` | secret | its password |
 | `ANDROID_KEY_ALIAS` | secret | `bookcapture` |
 
-Keep one keystore forever: Android refuses to update an installed app whose
-signing key changed — users would have to uninstall first (settings and the
-capture queue survive an update, not an uninstall).
+A tagged release without these three fails the android job before upload; a
+`workflow_dispatch` dry run may omit them and gets a debug-signed
+`-debug-DONOTPUBLISH.apk` for inspection only.
+
+### Keystore continuity, backup, and recovery
+
+The signing keystore is the app's identity. **Keep one keystore forever:**
+Android refuses to update an installed app whose signing key changed — users
+would have to uninstall first (settings and the capture queue survive an update,
+not an uninstall). If the keystore or its password is ever lost, every existing
+BookCapture install is stranded: the only path forward is a new keystore, a new
+`applicationId`, and a fresh install for everyone.
+
+So treat it as unrecoverable-if-lost and back it up accordingly:
+
+- **The canonical copy** lives at `~/.whl-release/bookcapture.jks`, with its
+  password/alias in `bookcapture-keystore-info.txt` beside it. Both are outside
+  the repo and never committed.
+- **Keep at least one off-machine backup** of `bookcapture.jks` **and** its
+  password, stored together (a password without the keystore, or vice versa, is
+  useless). A password manager entry plus an encrypted copy in separate storage
+  is enough; the file is a few KB.
+- **CI holds only a copy, not the source of truth.** `ANDROID_KEYSTORE_B64` is
+  base64 of the same `.jks`; regenerate it from the local file with
+  `base64 -w0 ~/.whl-release/bookcapture.jks` (or `certutil -encode` on Windows)
+  if the secret is ever cleared. Losing the GitHub secret is recoverable from
+  the local keystore; losing the local keystore is not.
+- **Verify recoverability periodically:** `keytool -list -keystore
+  ~/.whl-release/bookcapture.jks -alias bookcapture` should list the key with the
+  stored password. The release pipeline also prints the published APK's signer
+  DN in its run summary, so a signer regression is visible on every release.
 
 ## By hand (no CI)
 

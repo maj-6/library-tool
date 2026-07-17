@@ -18,11 +18,16 @@ name: release
 #                                      so registering rows needs this. Without
 #                                      it the GitHub Release still happens and
 #                                      the register step says what is missing.
-#   secrets.ANDROID_KEYSTORE_B64       optional but recommended: base64 of the
-#   secrets.ANDROID_KEYSTORE_PASSWORD  signing keystore. Without them each APK
-#   secrets.ANDROID_KEY_ALIAS          is signed with the runner's throwaway
-#                                      debug key, and Android refuses to update
-#                                      an install whose key changed.
+#   secrets.ANDROID_KEYSTORE_B64       required to publish Android on a tag:
+#   secrets.ANDROID_KEYSTORE_PASSWORD  base64 of the signing keystore, its
+#   secrets.ANDROID_KEY_ALIAS          password, and the key alias. A tagged
+#                                      release without them FAILS the android job
+#                                      (Android refuses to update an install
+#                                      whose signing key changed, so a debug-
+#                                      signed APK is unpublishable) — the desktop
+#                                      release is independent and still ships. A
+#                                      workflow_dispatch dry run may omit them and
+#                                      gets a clearly-labelled debug-signed APK.
 
 on:
   push:
@@ -67,6 +72,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
+      signer: ${{ steps.signer.outputs.signer }}
     defaults:
       run:
         working-directory: android/BookCapture
@@ -80,11 +86,12 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Signing key (persistent if the secret is set, debug otherwise)
+      - name: Signing key (persistent release key required for tagged builds)
         env:
           KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
           KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
         run: |
           if [ -n "$KS_B64" ]; then
             # strip any CR/LF/space first: a secret uploaded from a Windows
@@ -97,10 +104,20 @@ jobs:
               echo "WHL_KEYSTORE_PASSWORD=$(printf '%s' "$KS_PASS" | tr -d '\r\n')"
               echo "WHL_KEY_ALIAS=$(printf '%s' "${KS_ALIAS:-bookcapture}" | tr -d '\r\n')"
             } >> "$GITHUB_ENV"
+          elif [ "$IS_TAG" = "true" ]; then
+            # A tagged build is published and must stay updatable. The debug key
+            # is ephemeral and Android rejects updates whose signer changed, so
+            # refuse to build a debug-signed release here — before it can be
+            # uploaded. Failing this job drops only Android; the desktop release
+            # is independent and still ships (see the publish job's guard).
+            echo "::error::Tagged Android release requires the persistent signing keystore, but ANDROID_KEYSTORE_B64 is not set. Refusing to build a debug-signed APK that cannot update installs. Add the ANDROID_KEYSTORE_* secrets (docs/releasing.md) and re-run."
+            exit 1
           else
-            echo "::warning::No ANDROID_KEYSTORE_B64 secret: signing with the \
-          runner's debug key, so installing this build over one signed with a \
-          different key needs an uninstall first."
+            # workflow_dispatch dry run: a debug-signed APK is fine to inspect,
+            # but must be clearly labelled as non-publishable (see the naming
+            # step, which appends a DONOTPUBLISH suffix when this is set).
+            echo "WHL_DEBUG_SIGNED=true" >> "$GITHUB_ENV"
+            echo "::warning::No ANDROID_KEYSTORE_B64 secret: this dry-run APK is signed with the runner's debug key. It is NOT publishable and cannot update installs signed with a different key."
           fi
 
       # The anon key is public by design (the website ships it to every
@@ -119,8 +136,40 @@ jobs:
         run: |
           V=$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -1)
           test -n "$V" || { echo "::error::no versionName in app/build.gradle.kts"; exit 1; }
-          mv app/build/outputs/apk/release/app-release.apk "BookCapture-$V.apk"
+          # A dry-run debug build is suffixed so the artifact can never be
+          # mistaken for a publishable release. Tagged builds keep the clean name.
+          if [ "${WHL_DEBUG_SIGNED:-}" = "true" ]; then
+            NAME="BookCapture-$V-debug-DONOTPUBLISH.apk"
+          else
+            NAME="BookCapture-$V.apk"
+          fi
+          mv app/build/outputs/apk/release/app-release.apk "$NAME"
           echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      # Report the signer, and — behind the keystore gate above — refuse a
+      # tagged APK that somehow carries the debug key before it is uploaded.
+      # apksigner ships with the Android build-tools the runner already used to
+      # build; the debug key's distinctive DN is "CN=Android Debug, O=Android".
+      - name: Verify the APK signer
+        id: signer
+        env:
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          APK=$(ls BookCapture-*.apk | head -1)
+          APKSIGNER=$(ls "${ANDROID_SDK_ROOT:-$ANDROID_HOME}"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1 || true)
+          [ -n "$APKSIGNER" ] || APKSIGNER=$(command -v apksigner || true)
+          if [ -z "$APKSIGNER" ]; then
+            echo "::error::apksigner not found on the runner; cannot verify the APK signer before publishing."
+            exit 1
+          fi
+          "$APKSIGNER" verify --print-certs "$APK" | tee signer.txt
+          DN=$(sed -n 's/^Signer #1 certificate DN: //p' signer.txt | head -1)
+          echo "signer=$DN" >> "$GITHUB_OUTPUT"
+          echo "- Android APK \`$APK\` signer: \`${DN:-unknown}\`" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$IS_TAG" = "true" ] && printf '%s' "$DN" | grep -qi "Android Debug"; then
+            echo "::error::Tagged APK is signed with the debug key; refusing to publish a non-updatable build."
+            exit 1
+          fi
 
       - name: Keep the APK
         uses: actions/upload-artifact@v4
@@ -232,6 +281,14 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      # The android job verifies the signer and fails before upload if a tagged
+      # APK is debug-signed, so anything reaching here is release-signed. Surface
+      # which key it was for the release record.
+      - name: Report the Android signer
+        if: needs.android.result == 'success' && needs.android.outputs.signer != ''
+        run: |
+          echo "- Published Android BookCapture signer: \`${{ needs.android.outputs.signer }}\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: GitHub Release
         env:
