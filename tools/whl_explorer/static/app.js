@@ -1189,6 +1189,7 @@ function normalizeSettings() {
 let clientStateReady = false;   // gates write-through until the load-sync ran
 const _csPending = {};          // kind -> true, coalesced
 let _csTimer = null;
+let _csBulk = 0;                // >0 during a bulk op: accumulate, flush once at end
 
 function clientStateBlob(kind) {
   if (kind === "checked") return checkedArray();
@@ -1201,8 +1202,25 @@ function clientStateBlob(kind) {
 function pushClientState(kind) {
   if (!clientStateReady) return;   // never clobber the server before load-sync
   _csPending[kind] = true;
+  // During a bulk op (e.g. a multi-book scan) each item mutates the checked map;
+  // without this a whole ~1MB client_state PUT would fire per item whenever the
+  // 700ms debounce lands between items. Accumulate here and flush once when the
+  // batch ends (withBulkClientState), collapsing N PUTs into one.
+  if (_csBulk > 0) return;
   clearTimeout(_csTimer);
   _csTimer = setTimeout(flushClientState, 700);
+}
+
+// Run an async op with per-item client_state pushes suppressed, flushing a
+// single coalesced PUT when it finishes (even if it throws). Safe to nest.
+async function withBulkClientState(fn) {
+  _csBulk++;
+  try {
+    return await fn();
+  } finally {
+    _csBulk--;
+    if (_csBulk === 0 && Object.keys(_csPending).length) flushClientState();
+  }
 }
 
 async function flushClientState() {
@@ -2174,7 +2192,16 @@ function applyTableChrome(key) {
     table.style.width = "";
   }
   table.dataset.ck = key;
-  applyColHide(table, table.querySelectorAll("tbody tr"));
+  // Re-masking every cell is O(rows*cols). On a width-only refresh (splitter
+  // drag, window resize, zoom) the hidden-column set is unchanged, so skip it —
+  // the rows already carry the right mask. Freshly built rows are masked by
+  // streamRows per chunk (and renderHistoryRows resets this signature so its
+  // direct-built rows are re-masked), so a skip here never strands a new row.
+  const hideSig = hide.join(",");
+  if (table.dataset.hideSig !== hideSig) {
+    applyColHide(table, table.querySelectorAll("tbody tr"));
+    table.dataset.hideSig = hideSig;
+  }
 }
 
 // Column hiding is per-<td> (there is no colgroup): set display:none on each
@@ -5055,6 +5082,14 @@ function renderChecked() {
       !state.rowsById.has(String(state.checkedSelected))) {
     state.checkedSelected = null;
   }
+  // Skip the expensive DOM teardown+rebuild while the checked table is not
+  // visible — a background download/scan re-render fired while the user is on
+  // another tab, or while the WHL table is shown. state.rowsById (above) stays
+  // fresh so lookups remain correct; every path that reveals the table
+  // (tab click -> renderChecked at initTabs, switchTopTable -> renderTop)
+  // re-renders it, so nothing is left stale.
+  if (!el("checked").classList.contains("active") || el("checked-pane").hidden)
+    return;
   const cmode = checkedMode();
   let rows = filteredCheckedRows();
   const so = state.sort.checked;
@@ -5090,6 +5125,20 @@ function renderChecked() {
   markSortHeaders("checked");
   refreshInfoIfActive();
   renderBottomPane();
+}
+
+// rAF-coalesced renderChecked for high-frequency BACKGROUND callers (the IA
+// download and auto-scan pollers): repeated calls in one frame collapse to a
+// single rebuild, and while the window is hidden the frame never fires at all.
+// User-action callers keep calling renderChecked() directly — some read
+// state.rowsById synchronously right afterwards, so they must not be deferred.
+let _renderCheckedFrame = null;
+function scheduleRenderChecked() {
+  if (_renderCheckedFrame !== null) return;
+  _renderCheckedFrame = requestAnimationFrame(() => {
+    _renderCheckedFrame = null;
+    renderChecked();
+  });
 }
 
 // One delegated handler covers verify markers / delete / uncheck / edit clicks.
@@ -5654,6 +5703,10 @@ function renderHistoryRows() {
   if (!rows.length) el("bottom-empty").textContent = "No actions recorded yet";
   el("bottom-count").textContent =
     `${log.length} action${log.length === 1 ? "" : "s"}` + (q ? ` (${rows.length} shown)` : "");
+  // History rows are built directly (not via streamRows' per-chunk mask), so
+  // force applyTableChrome's guarded mask to re-run on these fresh rows.
+  const histTable = el("bottom-rows").closest("table");
+  if (histTable) histTable.dataset.hideSig = "";
   applyTableChrome("b-history");
 }
 
@@ -7731,7 +7784,7 @@ async function startDownload(identifier, book) {
     pumpAutoDl();
   }
   updateDlProgress();
-  renderChecked();
+  scheduleRenderChecked();
 }
 
 function pollDownload(identifier) {
@@ -7757,7 +7810,7 @@ function pollDownload(identifier) {
         pumpAutoDl();                             // start the next queued download
       }
       updateDlProgress();
-      renderChecked();
+      scheduleRenderChecked();
     } catch (e) {
       failures += 1;
       if (failures >= 8) {
@@ -7888,22 +7941,25 @@ function queueScan(id, autoDownload = true) {
 async function processScanQueue() {
   if (scanQueueRunning) return;
   scanQueueRunning = true;
-  while (scanQueue.length) {
-    const task = scanQueue.shift();
-    const { id } = task;
-    const row = rowById(id);
-    if (!row || !(row.book.title || "").trim()) continue;
-    status(`AUTO SCAN :: ${row.book.title}`);
-    try {
-      const scans = await runRowScans(row);
-      status(`AUTO SCAN DONE :: ${row.book.title} :: ${scanStatusLine(scans)}`);
-      // rowById()'s row has no scans field — pass the freshly-fetched ones
-      if (task.autoDownload) maybeAutoDownloadIa({ ...row, scans });
-    } catch (e) {
-      statusErr(`AUTO SCAN FAILED :: ${row.book.title}`);
+  // One coalesced client_state PUT for the whole batch instead of one per book.
+  await withBulkClientState(async () => {
+    while (scanQueue.length) {
+      const task = scanQueue.shift();
+      const { id } = task;
+      const row = rowById(id);
+      if (!row || !(row.book.title || "").trim()) continue;
+      status(`AUTO SCAN :: ${row.book.title}`);
+      try {
+        const scans = await runRowScans(row);
+        status(`AUTO SCAN DONE :: ${row.book.title} :: ${scanStatusLine(scans)}`);
+        // rowById()'s row has no scans field — pass the freshly-fetched ones
+        if (task.autoDownload) maybeAutoDownloadIa({ ...row, scans });
+      } catch (e) {
+        statusErr(`AUTO SCAN FAILED :: ${row.book.title}`);
+      }
+      scheduleRenderChecked();
     }
-    renderChecked();
-  }
+  });
   scanQueueRunning = false;
 }
 
@@ -14907,26 +14963,36 @@ function init() {
   // checked-tab find bar
   el("sync-master-btn").addEventListener("click", syncMasterList);
   el("cloud-sync-btn").addEventListener("click", runCloudSync);
+  // Debounce the render: update state synchronously so the box stays live, but
+  // rebuild the (potentially thousands-of-node) tables only ~150ms after typing
+  // pauses, instead of tearing them down on every keystroke.
+  let _searchDebounce = null;
   el("checked-search").addEventListener("input", () => {
     state.checkedFilter = el("checked-search").value.trim();
     state.olOverride = null;
-    renderTop();
-    renderBottomRows();
-    scheduleOlRealtime();
+    clearTimeout(_searchDebounce);
+    _searchDebounce = setTimeout(() => {
+      renderTop();
+      renderBottomRows();
+      scheduleOlRealtime();
+    }, 150);
   });
   el("checked-rows").addEventListener("click", onCheckedClick);
 
-  // year-range filter (applies to whichever top table is shown)
+  // year-range filter (applies to whichever top table is shown) — same debounce,
+  // which also collapses the per-keystroke saveSettings() client_state PUT.
+  let _yearDebounce = null;
   const onYearFilter = () => {
     const num = (v) => { const n = parseInt(v, 10); return Number.isFinite(n) ? n : null; };
     state.settings.yearFrom = num(el("year-from").value);
     state.settings.yearTo = num(el("year-to").value);
-    saveSettings();
-    renderTop();
+    clearTimeout(_yearDebounce);
+    _yearDebounce = setTimeout(() => { saveSettings(); renderTop(); }, 150);
   };
   el("year-from").addEventListener("input", onYearFilter);
   el("year-to").addEventListener("input", onYearFilter);
   el("year-clear").addEventListener("click", () => {
+    clearTimeout(_yearDebounce);           // cancel a pending trailing render
     el("year-from").value = "";
     el("year-to").value = "";
     state.settings.yearFrom = state.settings.yearTo = null;
@@ -15480,9 +15546,19 @@ function init() {
     }, 120);
   });
 
+  // Paint immediately from the localStorage cache: loadSettings/loadChecked
+  // already ran synchronously in init(), so the data to render is in memory.
+  // This shows the window's content without waiting on the ~1MB client_state
+  // network round-trip below. pushClientState self-guards on clientStateReady
+  // (still false here), so this early paint can never write back to the server
+  // before the sync reconciles.
+  switchTopTable(state.settings.topTable === "whl" ? "whl" : "checked");
+  renderBottomPane();
+  renderHome();
+
   // Adopt the authoritative server copy of checked / settings / attention
-  // (or seed it from localStorage on first run), THEN boot the views so the
-  // first render reflects whatever the server holds.
+  // (or seed it from localStorage on first run), THEN re-render so the views
+  // reflect whatever the server holds (the merge may differ from the cache).
   syncClientStateOnLoad().then((adopted) => {
     hydrateSecrets();      // warm credentials without delaying the initial UI
     if (adopted) { applyTheme(); applyFont(); applyExpSharpen(); }
