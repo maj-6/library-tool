@@ -205,8 +205,27 @@ adopting the geometric variant; a diff view can come with real usage).
   translations distribute across body regions by paragraph, weighted by each
   region's diplomatic length; furniture keeps its diplomatic text.
 
-Remaining for Phase 4: `.lib` import (validated), print/PDF export (the
-preview renderer, paginated — mind Chromium's partial paged-media support).
+- **`.lib` import** (shipped): the other half of interchange — pages,
+  templates, figures, and the stylesheet unpack through the SAME sanitizers
+  as the live endpoints; skip-unless-overwrite; the stylesheet lands only
+  when the book has no custom sheet.
+- **Large/illuminated capitals** (shipped): `drop-capital` role (D key; F
+  readies `footnote`), box-height rendering in both renderers, seamless
+  compose join, rubricated seed color, ink + ground swatches on the style
+  board. **Adjustable page colors**: the stylesheet's `page` pseudo-role
+  (paper + ink) drives the preview and travels in the `.lib`.
+- **Better auto-detection** (shipped): drop capitals (letter block with body
+  at its right shoulder), chapter headings (single line >1.35× the band's
+  body line height), footnotes (band text <0.75× the line height, low on the
+  page) — all against a line-height yardstick that headings can't pollute.
+- **Illustration rework** (shipped, providers not yet live-tested): figure
+  crops re-drawn through OpenAI gpt-image-1 or Gemini image models (BYO key,
+  Settings > OCR & AI); reworked art saves beside the original with a
+  `rework_of` pointer — the preview prefers it, the facsimile stays faithful.
+
+Remaining for Phase 4: print/PDF export (the preview renderer, paginated —
+mind Chromium's partial paged-media support); live-verify the image
+providers once keys exist.
 
 ## Phase 4 — `.lib` export and the modernized edition
 
