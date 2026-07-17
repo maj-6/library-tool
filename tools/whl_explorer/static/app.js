@@ -581,6 +581,9 @@ function status(msg, level) {
   n.textContent = msg;
   n.classList.toggle("err", level === "error");
   n.classList.toggle("crit", level === "critical");
+  // #status-msg is role="status" aria-live in the template; a critical failure
+  // (data did not persist, backend gone) interrupts, everything else is polite.
+  n.setAttribute("aria-live", level === "critical" ? "assertive" : "polite");
   conPut(level === "critical" ? "error" : level === "error" ? "warn" : "info", msg, "app");
 }
 const statusErr = (msg) => status(msg, "error");
@@ -1411,6 +1414,10 @@ function initAuth() {
   el("auth-win").addEventListener("submit", (ev) => { ev.preventDefault(); submitAuth(); });
   el("auth-mode").onclick = () => { setAuthMode(!authSignup); authMsg(""); };
   el("auth-close").onclick = hideAuthOverlay;
+  // backdrop click dismisses, like every other form modal (same as the close X)
+  el("auth-overlay").addEventListener("mousedown", (ev) => {
+    if (ev.target === el("auth-overlay")) hideAuthOverlay();
+  });
   el("auth-skip").onclick = () => {
     state.settings.authPromptDismissed = true;
     saveSettings();
@@ -3859,7 +3866,7 @@ async function setRowLocalPdf(id, path) {
   if (row.kind === "manual") {
     const entry = state.manual.find((x) => x.id === id) || {};
     const prior = entry.local_pdf || "";
-    if (!await patchManualLocalPdf(id, path)) { statusErr("Attach failed"); return; }
+    if (!await patchManualLocalPdf(id, path)) { statusErr("ATTACH FAILED"); return; }
     pushOp(`${verb} ${(row.book.title || "").slice(0, 36)}`,
       () => patchManualLocalPdf(id, prior),
       () => patchManualLocalPdf(id, path),
@@ -4311,11 +4318,11 @@ function saveAttnPop() {
       if (res.ok) {
         await loadReviews();
         renderHome();
-        status("Added to the review queue");
+        status("ADDED TO REVIEW QUEUE");
       } else {
-        status("Review request failed — not queued");
+        status("REVIEW REQUEST FAILED :: NOT QUEUED");
       }
-    }).catch(() => status("Review request failed — not queued"));
+    }).catch(() => status("REVIEW REQUEST FAILED :: NOT QUEUED"));
   }
   closeAttnPop();
 }
@@ -4544,7 +4551,7 @@ async function onReviewClick(ev) {
       await loadReviews();
       renderReviewList();
     } else {
-      status("Comment failed — not saved");
+      status("COMMENT FAILED :: NOT SAVED");
     }
   }
 }
@@ -16113,6 +16120,12 @@ function init() {
       closePopup();
     }
   });
+  // Escape dismisses it (every sibling surface does), and a resize orphans its
+  // fixed position (it is placed once in openPopup) — close it either way.
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && !el("popup-menu").hidden) closePopup();
+  });
+  addEventListener("resize", () => { if (!el("popup-menu").hidden) closePopup(); });
   syncFilterBtn();
   syncSrcFilterBtn();
   el("ol-clear").addEventListener("click", clearSearchForm);
@@ -16276,7 +16289,7 @@ function init() {
     const rec = state.bottomRecords[parseInt(tr.dataset.bi, 10)];
     if (!rec) return;
     if (rec._src === "manual") {
-      status("Already a manual entry in the checked-books table");
+      status("ALREADY A MANUAL ENTRY IN CHECKED-BOOKS");
       return;
     }
     if (ev.ctrlKey || ev.metaKey) {
