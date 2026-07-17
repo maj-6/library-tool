@@ -14864,8 +14864,18 @@ function renderReplicaBooks() {
   }
 }
 
+// the dirty-page guard, house dialog chrome. Await-safe before the seq
+// bump: while the dialog is open the context has not switched yet, so an
+// in-flight fetch that resolves paints the still-current page — correct.
+function rwConfirmDiscard(detail) {
+  return confirmDialog({
+    title: "Discard edits", danger: true, confirmLabel: "Discard",
+    message: "This page has unsaved region edits.", detail });
+}
+
 async function selectReplicaBook(bid) {
-  if (rwState.dirty && !confirm("Discard unsaved region edits?")) return;
+  if (rwState.dirty &&
+      !(await rwConfirmDiscard("Switching books discards them."))) return;
   // one shared sequence for book, source, AND page context: any in-flight
   // fetch from before this click resolves into a dead sequence number and
   // must not install its data (two quick book clicks used to interleave —
@@ -14958,7 +14968,8 @@ async function renderReplicaPages(seq) {
 }
 
 async function selectReplicaPage(n) {
-  if (rwState.dirty && !confirm("Discard unsaved region edits?")) return;
+  if (rwState.dirty &&
+      !(await rwConfirmDiscard("Switching pages discards them."))) return;
   rwState.page = n; rwState.sel = []; rwState.dirty = false;
   const seq = ++rwState.seq;
   for (const b of el("rw-pages").querySelectorAll(".rw-pagebtn")) {
@@ -15569,7 +15580,8 @@ function initReplica() {
     if (b) selectReplicaPage(+b.dataset.page);
   });
   el("rw-src").addEventListener("change", async () => {
-    if (rwState.dirty && !confirm("Discard unsaved region edits?")) {
+    if (rwState.dirty &&
+        !(await rwConfirmDiscard("Switching sources discards them."))) {
       el("rw-src").value = rwState.src;
       return;
     }
@@ -15603,14 +15615,18 @@ function initReplica() {
   el("rw-recompile").addEventListener("click", rwRecompile);
   el("rw-layer-dipl").addEventListener("click", () => rwSetLayer("text"));
   el("rw-layer-norm").addEventListener("click", () => rwSetLayer("norm"));
-  el("rw-normalize").addEventListener("click", () => {
+  el("rw-normalize").addEventListener("click", async () => {
     const a = rwActive();
     if (!a) return;
     const proposal = rwNormalize(a.text);
     // a differing existing norm is human judgement — never silently replace
-    if (a.norm && a.norm !== proposal &&
-        !confirm("This region already has a normalized reading. Replace it " +
-                 "with a fresh mechanical proposal?")) return;
+    if (a.norm && a.norm !== proposal && !(await confirmDialog({
+      title: "Replace normalization", danger: true, confirmLabel: "Replace",
+      message: "This region already has a normalized reading.",
+      detail: "Replace it with a fresh mechanical proposal?" }))) return;
+    // the region can vanish while the dialog is open (page switch has its
+    // own guard, but Del does not) — re-check before writing
+    if (!rwState.items.includes(a)) return;
     a.norm = proposal;
     rwSetLayer("norm");
     rwDirty();
