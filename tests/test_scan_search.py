@@ -255,6 +255,28 @@ def test_ia_all_results_restricted(monkeypatch):
     assert out["no_download"] is True
 
 
+def test_ia_view_only_result_excluded(monkeypatch):
+    # archive.org marks view-only, borrow-only, lending and restricted copies
+    # with the same access-restricted-item flag, so a view-only match is not
+    # downloadable and must never surface as available (issue #78) — it shows as
+    # the ND ("no download") tag instead.
+    view_only = {
+        "identifier": "americanmedicin05view",
+        "title": "American medicinal plants",
+        "creator": "Millspaugh, Charles Frederick, 1854-1923",
+        "year": "1887",
+        "access-restricted-item": "true",
+    }
+    calls = _install_fake_get(monkeypatch, lambda url: _ia_response([view_only]))
+    out = scan_search.search_internet_archive(QUERY_TITLE, QUERY_AUTHOR, QUERY_YEAR)
+
+    assert len(calls) == 1  # the exact hit ranks 1.0 and breaks the query ladder
+    assert out["matches"] == []
+    assert out["best_match"] is None
+    assert out["available"] is False
+    assert out["no_download"] is True
+
+
 def test_ia_empty_response_runs_whole_ladder(monkeypatch):
     calls = _install_fake_get(monkeypatch, lambda url: {})
     out = scan_search.search_internet_archive(QUERY_TITLE, QUERY_AUTHOR, QUERY_YEAR)
