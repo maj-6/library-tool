@@ -2119,25 +2119,65 @@ function fitTitleBar() {
   el("tb-title").hidden = bar.clientWidth - 2 * inset < 56;
 }
 
+// Parse and defang a tab icon file. The folder is documented as user-
+// swappable, and raw innerHTML would happily install <svg onload=...>
+// handlers — event-handler attributes fire on insertion even though
+// <script> tags don't. Treat the file as an IMAGE: scripts, foreignObject,
+// external references, and every on* attribute are stripped. DOMParser
+// also accepts the XML prolog most editors write, which a bare
+// starts-with-<svg test silently rejected. Returns an <svg> node or null.
+function sanitizeTabIcon(text) {
+  let doc;
+  try {
+    doc = new DOMParser().parseFromString(text, "image/svg+xml");
+  } catch (e) { return null; }
+  const root = doc.documentElement;
+  if (!root || root.nodeName.toLowerCase() !== "svg" ||
+      doc.querySelector("parsererror")) return null;
+  for (const bad of root.querySelectorAll("script, foreignObject, use")) {
+    bad.remove();
+  }
+  for (const node of [root, ...root.querySelectorAll("*")]) {
+    for (const attr of [...node.attributes]) {
+      const n = attr.name.toLowerCase();
+      if (n.startsWith("on") ||
+          ((n === "href" || n === "xlink:href") &&
+           !attr.value.trim().startsWith("#"))) {
+        node.removeAttribute(attr.name);
+      }
+    }
+  }
+  root.removeAttribute("width");   // the rail's CSS sizes the icon
+  root.removeAttribute("height");
+  return document.importNode(root, true);
+}
+
 // The activity bar's tab icons live as FILES (static/icons/tabs/<id>.svg,
 // user-swappable) and are inlined so stroke:currentColor picks up the
 // theme's per-tab colors. The button's original text becomes its tooltip
-// and aria-label; a tab with no icon file falls back to a two-letter label.
+// and aria-label; a tab with no usable icon falls back to a two-letter
+// label (with a console note, so a rejected file isn't a silent mystery).
 function initActivityIcons() {
   const tabs = [...document.querySelectorAll("#tabs .tab")];
   return Promise.all(tabs.map(async (tab) => {
     const label = tab.textContent.trim() || tab.dataset.tab;
     tab.dataset.tip = label;
     tab.setAttribute("aria-label", label);
-    let svg = "";
+    let icon = null;
     try {
+      // no-cache: revalidate so a swapped file shows on the next launch
+      // instead of after the static route's day-long max-age
       const r = await fetch("/static/icons/tabs/" +
-                            encodeURIComponent(tab.dataset.tab) + ".svg");
-      if (r.ok) svg = await r.text();
+                            encodeURIComponent(tab.dataset.tab) + ".svg",
+                            { cache: "no-cache" });
+      if (r.ok) icon = sanitizeTabIcon(await r.text());
     } catch (e) { /* fallback below */ }
-    if (/^\s*<svg[\s>]/i.test(svg)) {
-      tab.innerHTML = svg;
+    if (icon) {
+      tab.textContent = "";
+      tab.appendChild(icon);
     } else {
+      console.warn(`activity bar: icons/tabs/${tab.dataset.tab}.svg ` +
+                   "missing or not a usable SVG — showing a text fallback");
       tab.innerHTML =
         `<span class="tab-fallback">${esc(label.slice(0, 2))}</span>`;
     }

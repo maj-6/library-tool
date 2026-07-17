@@ -991,7 +991,14 @@ body.desktop .win-controls { display: inline-flex; }
   /* a hair deeper than the face, so the rail reads as its own band */
   background: color-mix(in srgb, var(--face) 90%, var(--face-sh2) 10%);
   border-right: 1px solid var(--face-sh);
+  /* short windows (or a 2x UI zoom): the rail scrolls rather than
+     shrinking its hit targets or burying Settings under the statusbar */
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: none;
 }
+#tabs::-webkit-scrollbar { display: none; }
+#tabs > *, #tabs .tb-group > * { flex: none; }
 .tab {
   width: 36px;
   height: 34px;
@@ -1068,6 +1075,10 @@ body.desktop .win-controls { display: inline-flex; }
 main {
   flex: 1;
   min-height: 0;
+  /* a #shell ROW item: without this, wide panels set the
+     min-content width and push the layout past the window
+     with no scrollbar (html/body overflow is hidden) */
+  min-width: 0;
   padding: 6px;
   background: var(--face);
 }
