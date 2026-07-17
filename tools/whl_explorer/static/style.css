@@ -2665,6 +2665,40 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   margin-bottom: 10px;
 }
 #theme-select, #font-select, #font-ui-select { max-width: 280px; }
+/* labelled slider (Experimental › sharpening amount) */
+.set-slider-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 280px;
+}
+.set-slider {
+  flex: 1 1 auto;
+  min-width: 0;
+  accent-color: var(--cyan);
+  cursor: pointer;
+}
+.set-slider:disabled { cursor: default; opacity: 0.5; }
+.set-slider-val {
+  flex: 0 0 auto;
+  min-width: 34px;
+  text-align: right;
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+  color: var(--ink);
+  opacity: 0.85;
+  font-variant-numeric: tabular-nums;
+}
+/* Interface sharpening overlay: a purely visual, click-through layer painted
+   above the entire application. backdrop-filter (the SVG convolution) is set
+   from JS; kept off the DOM (hidden) unless the feature is on. */
+#exp-sharpen-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483000;   /* above every modal/tooltip so the whole UI sharpens */
+  pointer-events: none;
+}
+#exp-sharpen-layer[hidden] { display: none; }
 .settings-cols {
   display: grid;
   grid-template-columns: repeat(4, 1fr);

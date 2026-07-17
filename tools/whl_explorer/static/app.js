@@ -564,6 +564,42 @@ function applyFont() {
   else document.body.style.removeProperty("--mono2");
 }
 
+// --- Experimental: interface sharpening ---------------------------------------
+// An opt-in unsharp filter drawn over the whole UI. A click-through overlay
+// (#exp-sharpen-layer) carries a backdrop-filter that runs an SVG convolution
+// over everything painted behind it, so text and hairlines crispen without any
+// change to the DOM beneath. The kernel is the identity plus a scaled cross
+// Laplacian; it sums to 1, so overall brightness is preserved. When the feature
+// is off (or amount 0) the layer is hidden and carries no filter, costing
+// nothing. Confirmed to render in the desktop shell's Chromium.
+const EXP_SHARPEN_MAX = 1.4;        // convolution strength at 100%
+
+function expSharpenAmount() {
+  let a = parseInt(state.settings.expSharpenAmount, 10);
+  if (!Number.isFinite(a)) a = 0;
+  return Math.max(0, Math.min(100, a));
+}
+
+function applyExpSharpen() {
+  const layer = el("exp-sharpen-layer");
+  const kernel = el("exp-sharpen-kernel");
+  if (!layer || !kernel) return;             // markup absent in this build
+  const pct = expSharpenAmount();
+  const on = !!state.settings.expSharpen && pct > 0;
+  if (!on) {
+    layer.hidden = true;
+    layer.style.backdropFilter = "";
+    layer.style.webkitBackdropFilter = "";
+    return;
+  }
+  const a = (pct / 100) * EXP_SHARPEN_MAX;
+  const c = 1 + 4 * a, e = -a;
+  kernel.setAttribute("kernelMatrix", `0 ${e} 0  ${e} ${c} ${e}  0 ${e} 0`);
+  layer.hidden = false;
+  layer.style.backdropFilter = "url(#exp-sharpen-filter)";
+  layer.style.webkitBackdropFilter = "url(#exp-sharpen-filter)";
+}
+
 const el = (id) => document.getElementById(id);
 const esc = (s) =>
   String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
@@ -1118,6 +1154,11 @@ function normalizeSettings() {
   let _srm = parseInt(state.settings.scanRecentMin, 10);
   if (!Number.isFinite(_srm)) _srm = 30;         // 0 = no recency filter
   state.settings.scanRecentMin = Math.max(0, Math.min(1440, _srm));
+  // Experimental: interface sharpening (off by default; amount is a 0-100 %)
+  state.settings.expSharpen = !!state.settings.expSharpen;
+  let _esa = parseInt(state.settings.expSharpenAmount, 10);
+  if (!Number.isFinite(_esa)) _esa = 35;         // a gentle default once enabled
+  state.settings.expSharpenAmount = Math.max(0, Math.min(100, _esa));
   // v2.6 inserted Subtitle/Vol/Ed into the master-list bottom table; its
   // saved column settings are keyed by index (c0..cN), so pre-v2.6 keys
   // must shift to keep pointing at the same columns
@@ -2927,6 +2968,39 @@ function renderSettings() {
       state.settings.verboseLogging = vl.checked;
       saveSettings();
       flushClientState();
+    };
+  }
+  // EXPERIMENTAL: interface sharpening (toggle + amount slider, live preview)
+  const esOn = el("set-exp-sharpen");
+  const esAmt = el("set-exp-sharpen-amt");
+  const esVal = el("set-exp-sharpen-val");
+  if (esOn && esAmt && esVal) {
+    const paintEs = () => {
+      esVal.textContent = expSharpenAmount() + "%";
+      esAmt.disabled = !esOn.checked;      // amount only bites while it is on
+    };
+    esOn.checked = !!state.settings.expSharpen;
+    esAmt.value = String(expSharpenAmount());
+    paintEs();
+    esOn.onchange = () => {
+      state.settings.expSharpen = esOn.checked;
+      paintEs();
+      applyExpSharpen();
+      saveSettings();
+    };
+    const readAmt = () => {
+      state.settings.expSharpenAmount =
+        Math.max(0, Math.min(100, parseInt(esAmt.value, 10) || 0));
+    };
+    esAmt.oninput = () => {          // drag: update the readout + preview live
+      readAmt();
+      esVal.textContent = expSharpenAmount() + "%";
+      applyExpSharpen();
+    };
+    esAmt.onchange = () => {         // release: persist
+      readAmt();
+      applyExpSharpen();
+      saveSettings();
     };
   }
   // UPDATES (desktop shell reads these off client_state at launch)
@@ -14744,6 +14818,7 @@ function init() {
   boot("theme", applyTheme);
   boot("ui scale", applyUiScale);
   boot("font", applyFont);
+  boot("exp sharpen", applyExpSharpen);
   boot("checked books", loadChecked);
   boot("icons", injectIcons);
   boot("confirm dialog", initConfirmDialog);
@@ -15410,7 +15485,7 @@ function init() {
   // first render reflects whatever the server holds.
   syncClientStateOnLoad().then((adopted) => {
     hydrateSecrets();      // warm credentials without delaying the initial UI
-    if (adopted) { applyTheme(); applyFont(); }
+    if (adopted) { applyTheme(); applyFont(); applyExpSharpen(); }
     maybeWizard();       // first desktop launch: the guide covers sign-in too
     maybeAuthPrompt();   // needs the adopted settings: authPromptDismissed
     loadDownloads();

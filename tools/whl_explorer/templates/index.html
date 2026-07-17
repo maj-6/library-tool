@@ -1363,6 +1363,7 @@
           <button class="snav" data-sec="sec-credentials" type="button">Credentials</button>
           <button class="snav" data-sec="sec-updates" type="button">Updates</button>
           <button class="snav" data-sec="sec-advanced" type="button">Advanced</button>
+          <button class="snav" data-sec="sec-experimental" type="button">Experimental</button>
         </div>
         <div id="settings-content">
           <div id="sec-general" class="settings-sec active">
@@ -1725,10 +1726,45 @@
             <p class="settings-note">Your library and settings live in the app's per-user data
               folder. Verbose logging helps diagnose failures — leave it off for normal use.</p>
           </div>
+          <div id="sec-experimental" class="settings-sec">
+            <div class="settings-head">Experimental features</div>
+            <p class="settings-note">Opt-in features still being built. They may be rough,
+              change, or disappear between builds — turn one off if it misbehaves.</p>
+            <div class="settings-subhead">Display sharpening</div>
+            <p class="settings-note">Overlays an unsharp filter across the whole interface to
+              crispen text and thin lines. Purely visual — it sits over the UI and never
+              touches your data. Strong settings can halo edges and cost a little GPU while on.</p>
+            <div class="settings-rows">
+              <label class="tool-label" for="set-exp-sharpen">Sharpen the interface</label>
+              <input id="set-exp-sharpen" type="checkbox"
+                     data-tip="Draw an adjustable sharpening layer over the entire interface" />
+              <label class="tool-label" for="set-exp-sharpen-amt">Amount</label>
+              <span class="set-slider-row">
+                <input id="set-exp-sharpen-amt" class="set-slider" type="range"
+                       min="0" max="100" step="1" />
+                <span id="set-exp-sharpen-val" class="set-slider-val">0%</span>
+              </span>
+            </div>
+          </div>
         </div>
       </div>
     </div>
   </div>
+
+  <!-- Adjustable interface sharpening (Settings › Experimental). The layer sits
+       above everything and sharpens whatever is painted behind it; the SVG
+       convolution kernel is rebuilt from the Amount slider. pointer-events:none
+       keeps it purely visual. Both hidden/inert until the feature is turned on. -->
+  <svg id="exp-sharpen-def" width="0" height="0" aria-hidden="true"
+       style="position:absolute;width:0;height:0;overflow:hidden">
+    <filter id="exp-sharpen-filter" x="0" y="0" width="100%" height="100%"
+            color-interpolation-filters="sRGB">
+      <feConvolveMatrix id="exp-sharpen-kernel" order="3" preserveAlpha="true"
+                        edgeMode="duplicate"
+                        kernelMatrix="0 0 0  0 1 0  0 0 0" />
+    </filter>
+  </svg>
+  <div id="exp-sharpen-layer" aria-hidden="true" hidden></div>
 
   <!-- ABOUT -->
   <div id="about-overlay" class="overlay" hidden>
