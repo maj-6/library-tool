@@ -578,8 +578,7 @@ body {
    selection so scanned/transcribed text can still be selected and copied. */
 body { user-select: none; -webkit-user-select: none; }
 input, textarea, [contenteditable="true"], .cell-edit,
-.an-fac-page-text, .an-facsimile-page-text, .ocr-pglayout.doctext,
-#con-lines {
+.an-text, .ocr-pglayout, .ppub-record-page, #con-lines {
   user-select: text;
   -webkit-user-select: text;
 }

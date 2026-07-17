@@ -4843,7 +4843,8 @@ function checkedRowTr(row, cmode, opts) {
     const val = f === "title" && hideTitle ? ""
       : f === "categories" ? bookCatsText(b) : b[f];
     const classes = [], attrs = [];
-    if (cmode !== "search" && !(row.kind === "manual" && f === "acquired")) {
+    // editable only in Edit mode (Process mode is review-only, like the WHL table)
+    if (cmode === "edit" && !(row.kind === "manual" && f === "acquired")) {
       classes.push("editable");
       attrs.push(`data-edit="${f}"`);
     }
@@ -4997,6 +4998,13 @@ function renderChecked() {
   // streamer can chunk across set boundaries.
   const items = [];
   const proc = cmode === "process";
+  if (proc) {
+    // drop selections for rows the current filter no longer shows
+    const visible = new Set(rows.map((r) => String(r.id)));
+    const before = state.procSelChecked.size;
+    for (const k of [...state.procSelChecked]) if (!visible.has(k)) state.procSelChecked.delete(k);
+    if (state.procSelChecked.size !== before) renderProcBar();
+  }
   const pushAlts = (row) => {
     if (!proc) return;
     const target = rowTarget(row);
@@ -5300,6 +5308,14 @@ function statusFlash(msg) {
   _copyFlashTimer = setTimeout(() => n.classList.remove("copy-flash"), 1000);
 }
 
+// A floating popup (context menu, advanced-search) is open — like the Delete
+// shortcut, hovered-field copy/paste must not act underneath it.
+function floatingPopupOpen() {
+  const pm = el("popup-menu"), asp = el("adv-search-pop");
+  return (pm && !pm.hidden) || (asp && !asp.hidden);
+}
+let _fieldPasteBusy = false;
+
 function onFieldCopyKey(ev) {
   if (ev.key !== "c" && ev.key !== "C") return;
   if (!(ev.ctrlKey || ev.metaKey) || ev.altKey) return;
@@ -5307,6 +5323,7 @@ function onFieldCopyKey(ev) {
   if (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable)) return; // native copy
   const sel = window.getSelection && window.getSelection();
   if (sel && String(sel).length) return;   // a real selection (e.g. an OCR pane) — native copy
+  if (floatingPopupOpen()) return;
   const td = hoveredCell();
   if (!td) return;
   const val = cellCopyValue(td);
@@ -5339,28 +5356,33 @@ async function pasteIntoCell(td, field, text) {
   if (!row) return false;
   if (text === String(row.book[field] || "").trim()) return false;
   // title/volume carry the volume-designator magic, so route those through commitEdit
-  if (field === "title" || field === "volume") { await commitEdit(row, field, text); return true; }
+  if (field === "title" || field === "volume") return !!(await commitEdit(row, field, text));
   return await applyEditPatch(row, { [field]: text });
 }
 
 async function onFieldPasteKey(ev) {
   if (ev.key !== "v" && ev.key !== "V") return;
-  if (!(ev.ctrlKey || ev.metaKey) || ev.altKey) return;
+  if (!(ev.ctrlKey || ev.metaKey) || ev.altKey || ev.repeat) return;   // ignore key auto-repeat
   const t = ev.target;
   if (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable)) return; // native paste
+  if (floatingPopupOpen()) return;
   const td = hoveredCell();
   if (!td) return;
   const field = cellFieldName(td);
   if (!field) { ev.preventDefault(); statusErr("PASTE: hover an editable field (Edit mode)"); return; }
   ev.preventDefault();
-  let text = "";
-  try { text = await navigator.clipboard.readText(); } catch (e) { text = ""; }
-  text = String(text || "").replace(/\s+/g, " ").trim();
-  if (!text) { statusErr("PASTE: clipboard empty or unavailable"); return; }
-  if (await pasteIntoCell(td, field, text)) {
-    flashCell(td, "cell-pasted");
-    statusFlash(`PASTED ${field.toUpperCase()}: ${clipNote(text)}`);
-  }
+  if (_fieldPasteBusy) return;             // one in-flight paste at a time
+  _fieldPasteBusy = true;
+  try {
+    let text = "";
+    try { text = await navigator.clipboard.readText(); } catch (e) { text = ""; }
+    text = String(text || "").replace(/\s+/g, " ").trim();
+    if (!text) { statusErr("PASTE: clipboard empty or unavailable"); return; }
+    if (await pasteIntoCell(td, field, text)) {
+      flashCell(td, "cell-pasted");
+      statusFlash(`PASTED ${field.toUpperCase()}: ${clipNote(text)}`);
+    }
+  } finally { _fieldPasteBusy = false; }
 }
 
 // --- click-to-edit cells --------------------------------------------------------
@@ -5486,6 +5508,7 @@ async function commitEdit(row, field, value) {
     }
   }
   renderChecked();
+  return ok;
 }
 
 // --- generalized top / bottom panes ----------------------------------------------
@@ -6013,7 +6036,7 @@ function setTopMode(m) {
     state.olOverride = null;
   }
   renderTop();
-  status(m === "search" ? "SEARCH MODE" : "EDIT MODE");
+  status(`${String(m).toUpperCase()} MODE`);
 }
 
 function renderModeBar() {
@@ -6299,6 +6322,7 @@ async function procStageBatch(items, label) {
   for (const it of items) { if (await procStageAlt(it.target, it.kind, it.label, it.alt)) ok++; }
   state.procActionBusy = false;
   reRenderTop();
+  renderProcBar();   // reRenderTop only repaints the bar for the WHL table
   statusFlash(`${label} :: staged ${ok} alternative${ok === 1 ? "" : "s"} for review`);
   return ok;
 }
@@ -6357,6 +6381,7 @@ async function procRunDeepseek(table, keys) {
   }
   state.procActionBusy = false;
   reRenderTop();
+  renderProcBar();
   if (!ok && errored) statusErr("DEEPSEEK :: " + errored);
   else statusFlash(`DEEPSEEK :: staged ${ok} alternative${ok === 1 ? "" : "s"}` +
     (failed ? ` (${failed} failed)` : ""));
@@ -6437,13 +6462,15 @@ function procPollSmartScan(jobs) {
       if (!pending.has(j.id)) continue;
       try {
         const r = await (await fetch("/api/process/smartscan/job/" + j.id)).json();
-        if (/done|error|cancel/.test(String(r.status || r.state || ""))) {
+        j.fails = 0;
+        // terminal states incl. a server restart's "interrupted" and "failed"
+        if (/done|error|cancel|interrupt|fail/.test(String(r.status || r.state || ""))) {
           pending.delete(j.id);
           await loadStaged();
           if (stagedFor(j.target)) state.procExpanded.add(j.target);
           reRenderTop();
         }
-      } catch (e) { pending.delete(j.id); }
+      } catch (e) { j.fails = (j.fails || 0) + 1; if (j.fails >= 5) pending.delete(j.id); }
     }
     status(`SMART SCAN :: ${jobs.length - pending.size}/${jobs.length} done`);
     if (pending.size) { setTimeout(tick, 1600); return; }
@@ -6460,7 +6487,11 @@ async function procMarkPrimary(target, altId) {
   const e = state.stagedAlts[target];
   const alt = e && (e.alts || []).find((a) => a.id === altId);
   if (!alt) return;
-  const fields = alt.fields || {}, keys = Object.keys(fields);
+  // categories is a structured field (chip picker); a staged text value would
+  // apply to the deprecated flat column and never show — drop it defensively
+  const fields = {};
+  for (const [k, v] of Object.entries(alt.fields || {})) if (k !== "categories") fields[k] = v;
+  const keys = Object.keys(fields);
   if (!keys.length) return;
   const kind = e.kind || targetKind(target);
   const displaced = {};
@@ -6754,6 +6785,8 @@ function onHeaderContextMenu(ev, key, rerender) {
 }
 
 function onRowContextMenu(ev) {
+  // leave the native clipboard menu inside an inline cell editor / text field
+  if (ev.target.closest("input, textarea, [contenteditable]")) return;
   if (topMode() === "process") { onProcContextMenu(ev); return; }
   const table = ev.target.closest("#whltop-rows") ? "whl" : "checked";
   const items = generalRowMenu(ev, table);
@@ -6780,6 +6813,11 @@ function renderWhlTop() {
   if (so) rows = sortRowsBy(rows, (r) => whlSortVal(r, so.key), so.dir);
   origRowShown = null;
   if (mode === "process") {
+    // drop selections for rows the current filter/sort no longer shows
+    const visible = new Set(rows.map((r) => r.idx));
+    const before = state.procSelWhl.size;
+    for (const k of [...state.procSelWhl]) if (!visible.has(k)) state.procSelWhl.delete(k);
+    if (state.procSelWhl.size !== before) renderProcBar();
     const items = [];
     for (const r of rows) {
       items.push({ r });

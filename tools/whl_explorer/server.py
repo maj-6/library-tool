@@ -1103,13 +1103,27 @@ def _clean_staged_alt(raw) -> dict | None:
     if src not in _STAGED_SOURCES:
         src = "normalize"
     return {
-        "id": str(raw.get("id") or lib.gen_id()),
+        "id": str(raw.get("id") or lib.gen_id())[:40],
         "source": src,
         "label": str(raw.get("label") or "")[:200],
         "fields": fields,
         "note": str(raw.get("note") or "")[:4000],
-        "created_at": str(raw.get("created_at") or _staged_ts()),
+        "created_at": str(raw.get("created_at") or _staged_ts())[:40],
     }
+
+
+def _staged_alt_key(a) -> tuple:
+    return (a.get("source"), json.dumps(a.get("fields"), sort_keys=True))
+
+
+def _staged_append(e, alt) -> None:
+    """Append an alt to an entry with the same dedupe + cap as /api/staged/add."""
+    key = _staged_alt_key(alt)
+    if any(_staged_alt_key(x) == key for x in e["alts"]):
+        return
+    e["alts"].append(alt)
+    if len(e["alts"]) > _STAGED_MAX_ALTS:
+        del e["alts"][:-_STAGED_MAX_ALTS]
 
 
 def _staged_entry(doc, target, kind="", label=""):
@@ -1247,7 +1261,7 @@ def api_staged_swap():
         alts = e.get("alts") if isinstance(e.get("alts"), list) else []
         e["alts"] = [a for a in alts if a.get("id") != alt_id]
         if disp_alt:
-            e["alts"].append(disp_alt)
+            _staged_append(e, disp_alt)   # dedupe + cap, like the add paths
         e["updated_at"] = _staged_ts()
         _staged_prune(doc)
         return ents.get(target)
@@ -1641,6 +1655,22 @@ def _ssrf_guard(url: str) -> None:
             raise ValueError("blocked non-public address")
 
 
+class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-run the SSRF guard on every redirect hop: without this a public URL
+    can 3xx-bounce the fetch to an internal address, since urllib follows
+    redirects with no host re-check."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not str(newurl).lower().startswith(("http://", "https://")):
+            raise urllib.error.HTTPError(
+                newurl, code, "redirect to a non-http(s) URL blocked", headers, fp)
+        _ssrf_guard(newurl)   # raises ValueError on a blocked hop
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_pdf_opener = urllib.request.build_opener(_GuardedRedirectHandler())
+
+
 def _remote_pdf_cache(url: str) -> Path:
     """Fetch a remote PDF once into downloads/cache/ and return the path.
     Browsers can't iframe third-party PDFs (X-Frame-Options), so remote
@@ -1665,7 +1695,7 @@ def _remote_pdf_cache(url: str) -> Path:
         try:
             req = urllib.request.Request(
                 url, headers={"User-Agent": whl_client.USER_AGENT})
-            with urllib.request.urlopen(req, timeout=90) as resp, \
+            with _pdf_opener.open(req, timeout=90) as resp, \
                     open(tmp, "wb") as fh:
                 total = 0
                 while True:
@@ -5669,11 +5699,14 @@ def _ai_json(cfg: dict, messages: list, temperature: float = 0.2) -> dict:
 
 
 # The catalogue fields a Process/DeepSeek pass is allowed to touch — so the
-# model can't slip arbitrary keys into a staged alternative.
+# model can't slip arbitrary keys into a staged alternative. "categories" is
+# deliberately excluded: it is a structured field edited through the chip
+# picker, and a free-text value staged here would apply to the deprecated flat
+# column, never showing in the UI (the diff would never clear).
 _PROC_FIELD_KEYS = frozenset((
     "title", "subtitle", "author", "authors", "year", "publisher",
     "publisher_city", "city", "edition", "volume", "language", "pages",
-    "description", "subject", "categories"))
+    "description", "subject"))
 
 
 @app.route("/api/process/deepseek", methods=["POST"])
