@@ -902,6 +902,110 @@ function initConfirmDialog() {
   }, true);
 }
 
+// --- shared modal behaviour for .overlay > .win windows ----------------------
+// The confirm dialog (#confirm-overlay) and the image lightbox (#img-lightbox)
+// carry their own modal role + focus handling; EVERY OTHER overlay window gets
+// it here, stamped once at boot and driven by the overlay's `hidden` attribute,
+// so none of the scattered open/close call sites has to change. Each window then
+// gets: role="dialog" + aria-modal + aria-labelledby (a screen reader announces
+// it, by name, as modal), initial focus, a Tab focus-trap, focus restored to the
+// opener on close, and `inert` on the app chrome behind it.
+const _modalStack = [];
+const _SELF_MANAGED_OVERLAYS = new Set(["confirm-overlay", "img-lightbox"]);
+// The observer below runs a microtask after a dialog opens -- too late to read
+// the opener from document.activeElement once a dialog has self-focused (e.g.
+// auth -> email). So we remember the focus that PRECEDED the current one and use
+// it as the opener when the dialog has already moved focus into itself.
+let _priorFocus = null, _activeFocus = null;
+
+function _overlayWin(overlay) { return overlay.querySelector(".win"); }
+
+function _focusables(root) {
+  return [...root.querySelectorAll(
+    'a[href],button:not([disabled]),input:not([disabled]):not([type=hidden]),' +
+    'select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])')]
+    .filter((e) => e.getClientRects().length > 0);
+}
+
+// Disable everything behind the dialog: every top-level app section except the
+// overlays themselves and the floating tooltip/popover.
+function _setAppInert(on) {
+  for (const c of document.body.children) {
+    // keep #statusbar interactive so its role="status" aria-live region still
+    // announces to a screen reader while a modal is open (it sits behind the
+    // backdrop and the Tab-trap, so it is not reachable by mouse or keyboard).
+    if (c.classList.contains("overlay") || c.id === "cad-tooltip"
+        || c.id === "attn-pop" || c.id === "statusbar" || c.tagName === "SCRIPT") continue;
+    if (on) c.setAttribute("inert", "");
+    else c.removeAttribute("inert");
+  }
+}
+
+function _overlayShown(overlay) {
+  const win = _overlayWin(overlay);
+  if (!win) return;                       // not a .win dialog (e.g. md-live-overlay)
+  // if the dialog already grabbed focus, the true opener is the prior focus
+  overlay._opener = win.contains(document.activeElement) ? _priorFocus : document.activeElement;
+  _modalStack.push(overlay);
+  _setAppInert(true);
+  // Respect a dialog that already placed its own focus (e.g. auth -> email);
+  // otherwise land on the first field, else the first non-close control.
+  if (!win.contains(document.activeElement)) {
+    const f = _focusables(win);
+    const field = f.find((e) => /^(INPUT|SELECT|TEXTAREA)$/.test(e.tagName));
+    const target = field || f.find((e) => !e.classList.contains("win-close")) || f[0];
+    (target || win).focus?.();
+  }
+}
+
+function _overlayHidden(overlay) {
+  const i = _modalStack.indexOf(overlay);
+  if (i < 0) return;                      // wasn't tracked as an open .win modal
+  _modalStack.splice(i, 1);
+  if (!_modalStack.length) _setAppInert(false);
+  const op = overlay._opener; overlay._opener = null;
+  if (op && op.isConnected && op.offsetParent !== null) op.focus?.();
+}
+
+function initOverlayModals() {
+  // remember the previous focus target so _overlayShown can recover the real
+  // opener even after a dialog synchronously self-focuses
+  document.addEventListener("focusin", (ev) => {
+    _priorFocus = _activeFocus; _activeFocus = ev.target;
+  }, true);
+  for (const overlay of document.querySelectorAll(".overlay")) {
+    if (_SELF_MANAGED_OVERLAYS.has(overlay.id)) continue;
+    const win = _overlayWin(overlay);
+    if (!win) continue;
+    if (!win.getAttribute("role")) win.setAttribute("role", "dialog");
+    win.setAttribute("aria-modal", "true");
+    const title = win.querySelector(".win-titlebar span, .ia-title");
+    if (title) {
+      if (!title.id) title.id = `${overlay.id}-arialabel`;
+      win.setAttribute("aria-labelledby", title.id);
+    }
+    new MutationObserver(() => {
+      if (overlay.hidden) _overlayHidden(overlay);
+      else _overlayShown(overlay);
+    }).observe(overlay, { attributes: true, attributeFilter: ["hidden"] });
+  }
+  // Tab focus-trap for the topmost tracked modal. Defer to the confirm dialog
+  // and the lightbox when either is open -- they trap their own focus.
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Tab" || !_modalStack.length) return;
+    if (!el("confirm-overlay").hidden) return;
+    const lb = document.getElementById("img-lightbox");
+    if (lb && !lb.hidden) return;
+    const win = _overlayWin(_modalStack[_modalStack.length - 1]);
+    const f = win ? _focusables(win) : [];
+    if (!f.length) return;
+    const first = f[0], last = f[f.length - 1];
+    if (!win.contains(document.activeElement)) { ev.preventDefault(); first.focus(); }
+    else if (ev.shiftKey && document.activeElement === first) { ev.preventDefault(); last.focus(); }
+    else if (!ev.shiftKey && document.activeElement === last) { ev.preventDefault(); first.focus(); }
+  }, true);
+}
+
 // --- undo / redo -------------------------------------------------------------
 // Every mutating action pushes an operation with its inverse. Client-side
 // state (the checked map) is snapshot-restored; server-backed changes run
@@ -15790,6 +15894,7 @@ function init() {
   boot("checked books", loadChecked);
   boot("icons", injectIcons);
   boot("confirm dialog", initConfirmDialog);
+  boot("overlay modals", initOverlayModals);
   boot("tabs", initTabs);
   boot("jobs", initJobs);
   boot("smart check", initSmartCheck);
