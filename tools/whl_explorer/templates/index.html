@@ -82,7 +82,10 @@
     </span>
   </div>
 
-  <!-- tab strip with the action icons inline, right side -->
+  <!-- the activity bar (VS Code style): tab icons top, actions bottom.
+       Icons come from static/icons/tabs/<data-tab>.svg (user-swappable);
+       initActivityIcons inlines them so theme tab colors apply. -->
+  <div id="shell">
   <div id="tabs">
     <button class="tab active" data-tab="home">Home</button>
     <button class="tab" data-tab="checked">Catalogs</button>
@@ -1208,6 +1211,7 @@
       <div id="con-lines"></div>
     </section>
   </main>
+  </div><!-- /#shell -->
 
   <!-- DEFAULT ENGINES WINDOW: shared by OCR and text-analysis staging -->
   <div id="engine-overlay" class="overlay" hidden>

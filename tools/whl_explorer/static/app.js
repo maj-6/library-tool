@@ -2119,6 +2119,31 @@ function fitTitleBar() {
   el("tb-title").hidden = bar.clientWidth - 2 * inset < 56;
 }
 
+// The activity bar's tab icons live as FILES (static/icons/tabs/<id>.svg,
+// user-swappable) and are inlined so stroke:currentColor picks up the
+// theme's per-tab colors. The button's original text becomes its tooltip
+// and aria-label; a tab with no icon file falls back to a two-letter label.
+function initActivityIcons() {
+  const tabs = [...document.querySelectorAll("#tabs .tab")];
+  return Promise.all(tabs.map(async (tab) => {
+    const label = tab.textContent.trim() || tab.dataset.tab;
+    tab.dataset.tip = label;
+    tab.setAttribute("aria-label", label);
+    let svg = "";
+    try {
+      const r = await fetch("/static/icons/tabs/" +
+                            encodeURIComponent(tab.dataset.tab) + ".svg");
+      if (r.ok) svg = await r.text();
+    } catch (e) { /* fallback below */ }
+    if (/^\s*<svg[\s>]/i.test(svg)) {
+      tab.innerHTML = svg;
+    } else {
+      tab.innerHTML =
+        `<span class="tab-fallback">${esc(label.slice(0, 2))}</span>`;
+    }
+  }));
+}
+
 function initTabs() {
   for (const tab of document.querySelectorAll("#tabs .tab")) {
     tab.addEventListener("click", () => {
@@ -15896,6 +15921,7 @@ function init() {
   boot("confirm dialog", initConfirmDialog);
   boot("overlay modals", initOverlayModals);
   boot("tabs", initTabs);
+  boot("activity icons", initActivityIcons);
   boot("jobs", initJobs);
   boot("smart check", initSmartCheck);
   boot("tooltips", initTooltips);
