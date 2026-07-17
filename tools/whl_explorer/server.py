@@ -450,7 +450,7 @@ def api_auth_status():
 def api_auth_login():
     cfg = _auth_cfg()
     if not cfg:
-        return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Sync)"}), 400
+        return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Integrations)"}), 400
     p = request.get_json(silent=True) or {}
     email = str(p.get("email") or "").strip()
     password = str(p.get("password") or "")
@@ -472,7 +472,7 @@ def api_auth_login():
 def api_auth_signup():
     cfg = _auth_cfg()
     if not cfg:
-        return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Sync)"}), 400
+        return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Integrations)"}), 400
     p = request.get_json(silent=True) or {}
     email = str(p.get("email") or "").strip()
     password = str(p.get("password") or "")
@@ -4983,7 +4983,8 @@ def api_master_sync():
     if not sheet_id or not keyfile:
         return jsonify({"ok": False,
                         "error": "Spreadsheet ID and service-account key file "
-                                 "are required (Settings > Sync)"})
+                                 "are required (Settings > Integrations; key "
+                                 "file under Credentials)"})
     kf = _resolve_local(keyfile)
     if kf is None or not kf.is_file():
         return jsonify({"ok": False, "error": f"key file not found: {keyfile}"})
@@ -8585,7 +8586,7 @@ def _publish_run(bid: str, actor: str, job: dict | None = None) -> None:
             raise RuntimeError("this entry has no local PDF attached")
         cloud = _cloud_cfg()
         if not cloud:
-            raise RuntimeError("Supabase is not configured (Settings > Sync)")
+            raise RuntimeError("Supabase is not configured (Settings > Credentials)")
 
         size = pdf.stat().st_size
         slug = _publish_slug(cloud, b)
@@ -8774,7 +8775,7 @@ def api_volumes_publish():
         return jsonify({"ok": False, "error": "no rights decision — set Rights in "
                         "the Editor before publishing"}), 400
     if not _cloud_cfg():
-        return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Sync)"}), 400
+        return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Credentials)"}), 400
     with _publish_lock:
         if _publish["running"]:
             return jsonify({"ok": False, "error": "a publish is already running"}), 409
@@ -9242,7 +9243,7 @@ def api_knowledge_index_publish():
     cloud = _cloud_cfg()
     if not cloud:
         return jsonify({"ok": False, "error":
-                        "Supabase is not configured (Settings > Sync)"}), 400
+                        "Supabase is not configured (Settings > Credentials)"}), 400
     doc_name, text, source_revision = _analyze_doc_snapshot(bid, b)
     pages = _an_pages(text)
     if not pages:
@@ -9392,7 +9393,7 @@ def api_knowledge_index_rollback():
     cloud = _cloud_cfg()
     if not cloud:
         return jsonify({"ok": False, "error":
-                        "Supabase is not configured (Settings > Sync)"}), 400
+                        "Supabase is not configured (Settings > Credentials)"}), 400
     q = urllib.parse.quote(slug, safe="")
     try:
         rows = sbase._rest(
@@ -9421,10 +9422,11 @@ def api_knowledge_index_status():
         abort(404)
     slug = str(b.get("published_slug") or "").strip()
     versions, warning = [], ""
+    # Passive status must not nag about cloud config: only publishing needs the
+    # owner service key, and the publish action reports that itself. Here we just
+    # list any already-published versions, warning only if that lookup fails.
     cloud = _cloud_cfg()
-    if not cloud:
-        warning = "Supabase is not configured (Settings > Sync)"
-    elif slug:
+    if slug and cloud:
         q = urllib.parse.quote(slug, safe="")
         try:
             versions = [v for v in (sbase._rest(

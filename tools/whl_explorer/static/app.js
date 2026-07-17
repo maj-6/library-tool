@@ -202,9 +202,9 @@ const state = {
                                 // tune to see how shrinking affects quality
     // page-view digit shortcuts: press N over a page to queue it
     ocrKeyMap: { 1: "tesseract", 2: "claude", 3: "textract", 4: "azure", 5: "openai" },
-    // master list -> Google Sheets publishing (Settings > Sync)
+    // master list -> Google Sheets publishing (Settings > Integrations)
     gsSpreadsheetId: "", gsKeyFile: "", gsSheetName: "Master list",
-    // cloud search + downloadable databases (Settings > Sync)
+    // cloud search + downloadable databases (Settings > Integrations)
     cloudSearchUrl: "",         // remote instance of this app; used when no local index
     dbUrls: {},                 // per-database download URLs (name -> url)
     uploadSplitH: null, pdfBrowseDir: "",
@@ -2829,7 +2829,7 @@ function fillFontSelect(id, list, settingKey, apply) {
   };
 }
 
-// --- Settings > Sync: downloadable databases --------------------------------
+// --- Settings > Integrations: downloadable databases ------------------------
 
 let _dbPollTimer = null;
 
