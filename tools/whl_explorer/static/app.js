@@ -672,8 +672,17 @@ function renderConsole() {
   if (conState.follow) box.scrollTop = box.scrollHeight;
 }
 
+let _conPollBusy = false;
 async function pollConsoleLog() {
   if (document.hidden) return;
+  // Skip the round-trip while the Info tab isn't showing: the `since` cursor
+  // catches the client up in one request when the tab opens (activation fires
+  // an immediate poll), and the server keeps its own ring meanwhile.
+  if (!conVisible()) return;
+  // Single flight: tab activation and the 3s interval can overlap; two polls
+  // reading the same cursor would append every returned line twice.
+  if (_conPollBusy) return;
+  _conPollBusy = true;
   try {
     const r = await (await fetch("/api/log?since=" + conState.since)).json();
     if (!r.ok) return;
@@ -681,6 +690,7 @@ async function pollConsoleLog() {
     conState.since = r.next;
     for (const e of r.entries) conPut(e.level, e.msg, e.src);
   } catch (e) { /* the server going away is itself reported by the caller */ }
+  finally { _conPollBusy = false; }
 }
 
 function initConsole() {
@@ -1994,7 +2004,7 @@ function initTabs() {
       setHeader(tab.dataset.tab);
       if (tab.dataset.tab === "home") loadActivity();   // refresh on every visit
       if (tab.dataset.tab === "checked") { renderChecked(); loadOlStatus(); }
-      if (tab.dataset.tab === "infotab") renderConsole();
+      if (tab.dataset.tab === "infotab") { pollConsoleLog(); renderConsole(); }
       // refresh builds and entry folders on every visit — either may have
       // changed elsewhere meanwhile
       if (tab.dataset.tab === "workbench") {
@@ -4897,8 +4907,10 @@ function syncYearFilterInputs() {
   if (t) t.value = state.settings.yearTo != null ? state.settings.yearTo : "";
 }
 
-function filteredCheckedRows() {
-  let rows = combinedRows();
+function filteredCheckedRows(prebuilt) {
+  // prebuilt lets renderChecked reuse the combinedRows() array it already
+  // built for rowsById, instead of rescanning all entries a second time.
+  let rows = prebuilt || combinedRows();
   const q = findQuery();
   if (!q.empty)
     rows = rows.filter((r) => matchesFind(
@@ -5076,7 +5088,8 @@ function renderChecked() {
   if (active && active.classList && active.classList.contains("cell-edit")) return;
   updateCheckedCount();
   const tbody = el("checked-rows");
-  state.rowsById = new Map(combinedRows().map((r) => [String(r.id), r]));
+  const allRows = combinedRows();           // one scan, reused by the filter below
+  state.rowsById = new Map(allRows.map((r) => [String(r.id), r]));
   // a deleted/unchecked row can no longer be the repopulation target
   if (state.checkedSelected != null &&
       !state.rowsById.has(String(state.checkedSelected))) {
@@ -5091,7 +5104,7 @@ function renderChecked() {
   if (!el("checked").classList.contains("active") || el("checked-pane").hidden)
     return;
   const cmode = checkedMode();
-  let rows = filteredCheckedRows();
+  let rows = filteredCheckedRows(allRows);
   const so = state.sort.checked;
   if (so) rows = sortRowsBy(rows, (r) => checkedSortVal(r, so.key), so.dir);
 
@@ -14973,7 +14986,12 @@ function init() {
     clearTimeout(_searchDebounce);
     _searchDebounce = setTimeout(() => {
       renderTop();
-      renderBottomRows();
+      // renderChecked already rebuilds the bottom pane in checked mode — the
+      // direct call was doubling that work. Only the WHL top table leaves the
+      // bottom stale (renderWhlTop doesn't touch it), and only when the
+      // catalog pane is actually shown (mirrors renderBottomPane's guard).
+      if (state.settings.topTable === "whl" && state.settings.showCatalog)
+        renderBottomRows();
       scheduleOlRealtime();
     }, 150);
   });

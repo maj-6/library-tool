@@ -101,6 +101,30 @@ def _reject_untrusted_host():
         abort(403)
 
 
+@app.after_request
+def _static_cache_headers(resp):
+    """Long-lived caching for /static so the desktop shell's Chromium keeps its
+    HTTP cache — and, for app.js, the V8 compiled-code cache — across launches
+    (the shell now reuses a stable sidecar port, so the origin persists).
+
+    Only URLs carrying the ?v= mtime token get `immutable`: their URL changes
+    whenever the content does, so a year is safe. Un-tokened static files
+    (fonts, the favicon) get a day, so an app update can still refresh them.
+
+    Success responses only: a transient failure (e.g. antivirus briefly locking
+    a freshly installed app.js) must not become a year-long cached error for a
+    URL whose ?v= token won't change on retry.
+    """
+    if resp.status_code not in (200, 304):
+        return resp
+    if request.path.startswith("/static/"):
+        if request.args.get("v"):
+            resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
 # --- application log ------------------------------------------------------------
 # The app had no logging at all: a failing background job left its reason in a
 # job dict that only one poller ever read. Everything now lands in a bounded
@@ -700,7 +724,11 @@ def api_log():
     with _log_lock:
         rows = [r for r in _log_ring if r["seq"] > since]
         last = _log_seq
-        dropped = since > 0 and _log_ring and _log_ring[0]["seq"] > since + 1
+        # seq starts at 1, so this also flags a since=0 catch-up (the client now
+        # polls only while the Info tab is open) whenever the ring has already
+        # evicted early lines — the console shows "(truncated)" instead of
+        # silently presenting the newest window as the whole log.
+        dropped = _log_ring and _log_ring[0]["seq"] > since + 1
     return jsonify({"ok": True, "entries": rows, "next": last, "dropped": bool(dropped)})
 
 
@@ -7634,12 +7662,16 @@ if __name__ == "__main__":
     _migrate_stored_paths()
     # Warm the offline check indexes (the renewals CSV is ~40 MB) so the first
     # manual-entry submission doesn't stall while they load, and the drive
-    # list so the first file-browser open is instant.
-    threading.Thread(
-        target=lambda: (checks.get_renewals(), checks.get_whl_catalog(),
-                        _drives()),
-        daemon=True,
-    ).start()
+    # list so the first file-browser open is instant. Deferred a few seconds:
+    # the CSV parse is CPU-bound and would otherwise contend (GIL) with the
+    # first page load + client_state GET exactly when the window is opening.
+    # The getters stay lazy, so an early submission just loads inline as before.
+    def _warm_slow_indexes():
+        time.sleep(6)
+        checks.get_renewals()
+        checks.get_whl_catalog()
+        _drives()
+    threading.Thread(target=_warm_slow_indexes, daemon=True).start()
     # Cloud capture autosync (interval read from settings each tick; 0 = off).
     threading.Thread(target=_cloud_autosync_loop, daemon=True).start()
     # LAN capture listener (offline phone -> desktop); off unless opted in.

@@ -89,6 +89,50 @@ function freePort() {
   });
 }
 
+// The sidecar's origin (http://127.0.0.1:<port>) keys the renderer's
+// localStorage, HTTP cache, and V8 compiled-code cache. A fresh ephemeral port
+// every launch silently discarded all three: the ~620 KB app.js re-parsed from
+// cold and the localStorage fast-path started empty on every run. Persist the
+// first port we pick and reuse it on later launches; if another process holds
+// it we fall back to a new free one and persist that instead. Still
+// loopback-only, and the server Host-guards against DNS rebinding.
+//
+// Dev and the installed app share userData (%APPDATA%\Library Tool) and dev is
+// exempt from the single-instance lock, so they can run side by side — a
+// SHARED port file would make them steal each other's port (churning the
+// packaged origin and defeating this cache exactly on a dev machine). Each
+// kind therefore persists its own file.
+function portFilePath() {
+  return path.join(app.getPath("userData"),
+    isDev ? "sidecar-port-dev.json" : "sidecar-port.json");
+}
+function readPreferredPort() {
+  try {
+    const p = JSON.parse(fs.readFileSync(portFilePath(), "utf8")).port;
+    return Number.isInteger(p) && p >= 1024 && p <= 65535 ? p : null;
+  } catch (e) {
+    return null;                            // first run / unreadable
+  }
+}
+function writePreferredPort(port) {
+  try { fs.writeFileSync(portFilePath(), JSON.stringify({ port })); } catch (e) {}
+}
+function portIsFree(port) {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.unref();
+    srv.on("error", () => resolve(false));
+    srv.listen(port, "127.0.0.1", () => srv.close(() => resolve(true)));
+  });
+}
+async function choosePort() {
+  const preferred = readPreferredPort();
+  if (preferred && await portIsFree(preferred)) return preferred;
+  const p = await freePort();
+  writePreferredPort(p);
+  return p;
+}
+
 function sidecarCommand(port, dataRoot) {
   const env = Object.assign({}, process.env, {
     WHL_PORT: String(port),
@@ -247,9 +291,12 @@ function waitForServer(port, timeoutMs) {
 async function startSidecar() {
   const dataRoot = app.getPath("userData");   // %APPDATA%\Library Tool
   fs.mkdirSync(dataRoot, { recursive: true });
-  sidecarPort = await freePort();
+  sidecarPort = await choosePort();
   const { cmd, args, opts } = sidecarCommand(sidecarPort, dataRoot);
   sidecar = spawn(cmd, args, opts);
+  // The update gate may commit to installing while we were awaiting the port:
+  // before-quit has already run (nothing to kill then), so reap the child here.
+  if (app.isQuitting) { try { sidecar.kill(); } catch (e) { /* already gone */ } }
   sidecar.stdout.on("data", (d) => process.stdout.write(`[sidecar] ${d}`));
   sidecar.stderr.on("data", (d) => process.stderr.write(`[sidecar] ${d}`));
   await superviseChildProcess(sidecar, waitForServer(sidecarPort, 45000), (end) => {
@@ -565,7 +612,16 @@ app.whenReady().then(async () => {
   if (!gotSingleInstanceLock) return;   // a second instance — it is already quitting
   createStartupWindow(readActiveTheme());
   sendStartupStatus(isDev ? "Preparing local services" : "Checking for updates");
-  // Update first: if one is installing, we quit into NSIS and never launch here.
+  // The two slowest startup steps — the GitHub update check (up to its 8s cap
+  // on a bad network) and the PyInstaller sidecar cold start (multi-second) —
+  // are independent, so run them CONCURRENTLY instead of serially. If the gate
+  // resolves 'installing', the young sidecar is reaped (before-quit kills it,
+  // and startSidecar reaps a spawn that lands after that), so NSIS never races
+  // a running exe. The catch below keeps a sidecar failure during the check
+  // from becoming an unhandled rejection; the launch branch still awaits the
+  // same promise, so the existing failure dialog is preserved.
+  const sidecarPromise = startSidecar();
+  sidecarPromise.catch(() => { /* surfaced via the await below on launch */ });
   let outcome = "launch";
   try {
     outcome = await runUpdateGate();
@@ -576,7 +632,7 @@ app.whenReady().then(async () => {
 
   try {
     sendStartupStatus("Loading library service");
-    await startSidecar();
+    await sidecarPromise;
   } catch (e) {
     closeStartupWindow();
     dialog.showErrorBox("Library Tool", "The local backend failed to start.\n" + e.message +
