@@ -1199,9 +1199,11 @@
         <button id="con-follow" class="cad-btn tiny active" type="button"
                 data-tip="Scroll to follow new lines">Follow</button>
         <button id="con-copy" class="cad-btn tiny icon-btn" type="button"
-                data-icon="export" data-tip="Copy the visible lines"></button>
+                data-icon="export" data-tip="Copy the visible lines"
+                aria-label="Copy the visible lines"></button>
         <button id="con-clear" class="cad-btn tiny icon-btn danger" type="button"
-                data-icon="remove" data-tip="Clear the console (the server keeps its own ring)"></button>
+                data-icon="remove" data-tip="Clear the console (the server keeps its own ring)"
+                aria-label="Clear the console"></button>
       </div>
       <div id="con-lines"></div>
     </section>
@@ -1287,7 +1289,8 @@
         <div class="fb-path-row">
           <input id="fb-path" class="cad-input" spellcheck="false" />
           <button id="fb-go" class="cad-btn icon-btn" type="button"
-                  data-icon="go" data-tip="Open this folder"></button>
+                  data-icon="go" data-tip="Open this folder"
+                  aria-label="Open this folder"></button>
         </div>
         <div id="fb-drives"></div>
         <div id="fb-list"></div>
@@ -1306,9 +1309,11 @@
         <input id="attn-pop-review" type="checkbox" /> Needs review
       </label>
       <button id="attn-pop-save" class="cad-btn icon-btn" type="button"
-              data-icon="save" data-tip="Save reason &#183; Enter&#10;Esc keeps the mark without one"></button>
+              data-icon="save" data-tip="Save reason &#183; Enter&#10;Esc keeps the mark without one"
+              aria-label="Save reason"></button>
       <button id="attn-pop-clear" class="cad-btn icon-btn danger" type="button"
-              data-icon="remove" data-tip="Remove the mark"></button>
+              data-icon="remove" data-tip="Remove the mark"
+              aria-label="Remove the mark"></button>
     </div>
   </div>
 
@@ -1811,7 +1816,7 @@
   </div>
 
   <div id="statusbar">
-    <span id="status-msg">READY</span>
+    <span id="status-msg" role="status" aria-live="polite">READY</span>
     <span class="foot-right">
       <span id="status-smart" class="foot-jobs" hidden
             data-tip="Smart-check results held for review — TAB (or click here) toggles extracted vs original values, SPACE over a row bakes, Shift+click here dismisses all"></span>
@@ -1833,7 +1838,7 @@
       <div class="win-titlebar ia-bar">
         <span id="ia-title" class="ia-title">Internet Archive</span>
         <button id="ia-external" class="cad-btn tiny" type="button"
-                data-tip="Open on archive.org">&#8599;</button>
+                data-tip="Open on archive.org" aria-label="Open on archive.org">&#8599;</button>
         <button id="ia-close" class="win-close" type="button" aria-label="Close" data-icon="close"></button>
       </div>
       <div class="ia-body">
@@ -2030,9 +2035,9 @@
     <div id="webview-window" class="win webview-win">
       <div class="win-titlebar webview-bar">
         <button id="webview-external" class="cad-btn tiny" type="button"
-                data-tip="Open in your browser">&#8599;</button>
+                data-tip="Open in your browser" aria-label="Open in your browser">&#8599;</button>
         <button id="webview-reload" class="cad-btn tiny" type="button"
-                data-tip="Reload">&#8635;</button>
+                data-tip="Reload" aria-label="Reload">&#8635;</button>
         <span id="webview-url" class="webview-url"></span>
         <button id="webview-close" class="win-close" type="button" aria-label="Close" data-icon="close"></button>
       </div>

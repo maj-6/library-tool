@@ -24,6 +24,9 @@
   --canvas-line: #2b2f36;
   --ink: #23272e;
   --ink-light: #d9dce1;
+  /* muted secondary text (labels, meta, dialog detail lines). Tuned to >=4.5:1
+     on --face per theme -- do NOT use --face-sh2 (a border colour) for text. */
+  --ink-mut: #62656b;
   --input-bg: #ffffff;
   --input-ink: #22262c;
   --row-hover: #262b33;
@@ -89,6 +92,7 @@ body[data-theme="sage"] {
   --canvas-line: #ece4d5;
   --ink: #2b2720;          /* warm brown-black */
   --ink-light: #2b2720;
+  --ink-mut: #656158;
   --input-bg: #fffdf6;
   --input-ink: #2b2720;
   --row-hover: #f1ebdd;
@@ -177,6 +181,7 @@ body[data-theme="ledger"] {
   --canvas-line: #e8e6df;
   --ink: #26241f;
   --ink-light: #2e2c26;
+  --ink-mut: #66645f;
   --input-bg: #fffefc;
   --input-ink: #26241f;
   --row-hover: #efeee6;
@@ -253,6 +258,7 @@ body[data-theme="foolscap"] {
   --canvas-line: #e6e2d9;
   --ink: #221c14;
   --ink-light: #262019;
+  --ink-mut: #67625a;
   --input-bg: #faf8f3;
   --input-ink: #221c14;
   --row-hover: #ece8df;
@@ -374,6 +380,7 @@ body[data-theme="vellum"] {
   --canvas-line: #ece7db;
   --ink: #2a2620;
   --ink-light: #2e2921;
+  --ink-mut: #67635b;
   --input-bg: #fdfbf5;
   --input-ink: #2a2620;
   --row-hover: #f0ebde;
@@ -462,6 +469,7 @@ body[data-theme="linen"] {
   --canvas-line: #e2dfd5;
   --ink: #2c2a24;
   --ink-light: #302e28;
+  --ink-mut: #605e56;
   --input-bg: #faf8f2;
   --input-ink: #2c2a24;
   --row-hover: #e9e6dd;
@@ -1592,7 +1600,7 @@ td .sc-wand { float: right; }
   margin: 8px 0 0;
   font-size: 12px;
   line-height: 1.45;
-  color: var(--face-sh2);
+  color: var(--ink-mut);
   overflow-wrap: anywhere;
   white-space: pre-line;
 }
@@ -1645,7 +1653,7 @@ td .sc-wand { float: right; }
 .ia-meta { width: 100%; border-collapse: collapse; font-size: 12px; }
 .ia-meta th {
   text-align: left; vertical-align: top; white-space: nowrap;
-  padding: 2px 8px 2px 0; color: var(--face-sh2); font-weight: bold;
+  padding: 2px 8px 2px 0; color: var(--ink-mut); font-weight: bold;
 }
 .ia-meta td { padding: 2px 0; word-break: break-word; }
 .ia-dl-head {
@@ -1707,10 +1715,10 @@ td .sc-wand { float: right; }
 .wiz-points { margin: 12px 0; padding-left: 22px; color: var(--ink-light); }
 .wiz-points li { margin: 0 0 7px; line-height: 1.4; }
 .wiz-footnote { margin-top: 16px !important; }
-.wiz-opt { color: var(--ink-faint); font-weight: normal; }
+.wiz-opt { color: var(--ink-mut); font-weight: normal; }
 .wiz-detect { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
 .wiz-tess-ok { color: var(--green); }
-.wiz-tess-no { color: var(--ink-soft); }
+.wiz-tess-no { color: var(--ink-mut); }
 .wiz-service-grid {
   display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px; margin-top: 14px;
@@ -1721,7 +1729,7 @@ td .sc-wand { float: right; }
   background: var(--canvas);
 }
 .wiz-service-card p {
-  min-height: 32px; margin: 0; color: var(--ink-soft);
+  min-height: 32px; margin: 0; color: var(--ink-mut);
   font-size: 11px; line-height: 1.45;
 }
 .wiz-service-local { grid-column: 1 / -1; }
@@ -1729,7 +1737,7 @@ td .sc-wand { float: right; }
 .wiz-service-head { display: flex; align-items: center; gap: 7px; color: var(--ink); }
 .wiz-badge {
   padding: 1px 5px; border: 1px solid var(--face-sh2); border-radius: 10px;
-  color: var(--ink-soft); font: 9px var(--mono); letter-spacing: 0.5px;
+  color: var(--ink-mut); font: 9px var(--mono); letter-spacing: 0.5px;
 }
 .wiz-keys-msg { min-height: 16px; margin: 8px 0 0 !important; }
 .wiz-keys-msg.err { color: var(--red); }
@@ -1802,8 +1810,9 @@ td .sc-wand { float: right; }
 }
 #pdfm-body .pdf-viewer { flex: 1; min-width: 0; }
 
-/* the needs-attention reason popover: a tooltip that you can type into, so it
-   sits above #cad-tooltip (z 60) and, unlike it, takes pointer events */
+/* the needs-attention reason popover: a popover you can type into (unlike the
+   hover tooltip, it takes pointer events). The hover tooltip renders above it
+   (z 63) so tips on its own buttons aren't clipped. */
 #attn-pop {
   position: fixed;
   z-index: 61;
@@ -1998,13 +2007,13 @@ td .sc-wand { float: right; }
   margin-bottom: 8px;
   font-size: 11px;
   letter-spacing: 0.5px;
-  color: var(--face-sh2);
+  color: var(--ink-mut);
 }
 .adv-pop-title { font-weight: bold; color: var(--ink); }
 
 /* Info tab: read-only inspector of the selected / open row */
 .info-body { font-size: 12px; }
-.info-empty { color: var(--face-sh2); font-size: 11px; padding: 6px 2px; }
+.info-empty { color: var(--ink-mut); font-size: 11px; padding: 6px 2px; }
 .info-head {
   font-weight: bold; color: var(--blue); font-size: 12px;
   padding-bottom: 4px; margin-bottom: 6px; border-bottom: 1px solid var(--face-sh);
@@ -2016,7 +2025,7 @@ td .sc-wand { float: right; }
   color: var(--face-sh2); margin-bottom: 3px;
 }
 .info-row { display: flex; gap: 8px; padding: 1px 0; align-items: baseline; }
-.info-k { flex: 0 0 88px; color: var(--face-sh2); font-size: 11px; }
+.info-k { flex: 0 0 88px; color: var(--ink-mut); font-size: 11px; }
 .info-v {
   flex: 1 1 auto; min-width: 0; color: var(--ink);
   font-family: var(--mono); word-break: break-word; white-space: pre-wrap;
@@ -2543,7 +2552,9 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 /* --- tooltip --- */
 #cad-tooltip {
   position: fixed;
-  z-index: 60;
+  /* above every windowed overlay (ia 61, auth 62, webview 60, attn-pop 61) so
+     hover tips shown inside them aren't clipped; still below the confirm modal (90) */
+  z-index: 63;
   max-width: 440px;
   padding: 6px 8px;
   background: var(--canvas);
@@ -2750,7 +2761,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 /* background IA download progress bar (footer) */
 .dl-progress { display: inline-flex; align-items: center; gap: 6px; }
 .dl-progress[hidden] { display: none; }
-.dl-progtext { color: var(--face-sh2); font-size: 10.5px; letter-spacing: 0.3px; white-space: nowrap; }
+.dl-progtext { color: var(--ink-mut); font-size: 10.5px; letter-spacing: 0.3px; white-space: nowrap; }
 .dl-progtrack {
   display: inline-block; width: 80px; height: 6px;
   background: var(--face-sh); border-radius: 3px; overflow: hidden;
@@ -2758,7 +2769,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 .dl-progbar { display: block; height: 100%; width: 0; background: var(--cyan); transition: width 0.3s ease; }
 /* quiet background-jobs marker (deliberately under-styled: dim text, thin rule) */
 .foot-jobs {
-  color: var(--face-sh2);
+  color: var(--ink-mut);
   font-size: 10.5px;
   letter-spacing: 0.3px;
   padding-left: 8px;
