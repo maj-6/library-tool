@@ -78,7 +78,15 @@ class MainActivity : AppCompatActivity() {
     private var pendingCommand: String? = null   // "done"/"cancel" said mid-shot
     private var sharpenBound = false             // the sharpen mode the camera is bound with
 
-    private val permissions = arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
+    // Camera is the only hard requirement; the mic is requested separately, and
+    // only when the user opts into voice control — denying it never blocks
+    // capture. REQ_CAMERA / REQ_MIC tag the two runtime-permission requests.
+    private val REQ_CAMERA = 1
+    private val REQ_MIC = 2
+    private var micRequested = false          // request the mic once per opt-in
+
+    private fun granted(perm: String) =
+        ContextCompat.checkSelfPermission(this, perm) == PackageManager.PERMISSION_GRANTED
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -120,12 +128,14 @@ class MainActivity : AppCompatActivity() {
             return
         }
         if (!initialized) {
-            if (permissions.all {
-                    ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
-                }) initAfterPermissions()
-            else ActivityCompat.requestPermissions(this, permissions, 1)
+            // The camera is the only hard requirement; voice asks for the mic
+            // separately (see syncVoice), so a denied mic never blocks capture.
+            if (granted(Manifest.permission.CAMERA)) initCapture()
+            else ActivityCompat.requestPermissions(
+                this, arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
+        } else {
+            syncVoice()                       // re-adopt / resume voice if opted in
         }
-        voice?.setPaused(false)               // mic live only while on screen
         if (session.pendingUploads().isNotEmpty()) UploadWorker.kick(this)
         restoreThumbnailsIfNeeded()           // an entry re-adopted after recreation
         // a viewfinder-sharpen toggle in Settings needs a fresh camera bind (the
@@ -161,17 +171,54 @@ class MainActivity : AppCompatActivity() {
     override fun onRequestPermissionsResult(
         requestCode: Int, perms: Array<out String>, results: IntArray) {
         super.onRequestPermissionsResult(requestCode, perms, results)
-        if (results.isNotEmpty() && results.all { it == PackageManager.PERMISSION_GRANTED })
-            initAfterPermissions()
-        else setStatus(getString(R.string.need_permissions))
+        when (requestCode) {
+            REQ_CAMERA ->
+                if (granted(Manifest.permission.CAMERA)) initCapture()
+                else setStatus(getString(R.string.need_camera))
+            REQ_MIC ->
+                if (granted(Manifest.permission.RECORD_AUDIO)) syncVoice()
+                else {
+                    // Denied: keep capturing by touch and turn voice back off so
+                    // we don't re-prompt every resume — re-enable it in Settings.
+                    Prefs.setVoiceControl(this, false)
+                    setStatus(getString(R.string.voice_needs_mic))
+                }
+        }
     }
 
-    private fun initAfterPermissions() {
+    private fun initCapture() {
         if (initialized) return
         initialized = true
         startCamera()
         UploadWorker.enqueue(this)                 // drain anything left from last time
         ProcessWorker.enqueue(this)
+        syncVoice()                                // start voice only if opted in
+        updateUi()
+    }
+
+    /** Bring voice into line with the opt-in preference and the mic permission.
+     *  Runs on every resume and after a mic-permission result:
+     *   - opted out            -> release the recorder if it was running;
+     *   - opted in, no mic yet  -> request it once (a denial won't loop);
+     *   - opted in, mic granted -> create + start (downloads the ~40 MB model
+     *     the first time) or just resume.
+     *  Capture never depends on any of this — the buttons work regardless. */
+    private fun syncVoice() {
+        if (!initialized) return
+        if (!Prefs.voiceControl(this)) {
+            voice?.stop(); voice = null
+            micRequested = false                   // a later opt-in may re-ask
+            return
+        }
+        if (!granted(Manifest.permission.RECORD_AUDIO)) {
+            if (!micRequested) {
+                micRequested = true
+                ActivityCompat.requestPermissions(
+                    this, arrayOf(Manifest.permission.RECORD_AUDIO), REQ_MIC)
+            }
+            return
+        }
+        voice?.let { it.setPaused(false); return }
         val v = VoiceController(this,
             onCommand = { word -> runOnUiThread { command(word) } },
             onState = { msg -> runOnUiThread { setStatus(msg) } })
@@ -190,7 +237,6 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
-        updateUi()
     }
 
     private fun startCamera() {

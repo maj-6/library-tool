@@ -89,6 +89,22 @@
                 android:textSize="11sp"
                 android:textColor="@color/whl_ink_dim"
                 android:text="@string/set_sharpen_note" />
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/voiceControl"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:fontFamily="monospace"
+                android:textSize="13sp"
+                android:textColor="@color/whl_ink"
+                android:text="@string/set_voice" />
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:fontFamily="monospace"
+                android:textSize="11sp"
+                android:textColor="@color/whl_ink_dim"
+                android:text="@string/set_voice_note" />
         </LinearLayout>
 
         <!-- transport / LAN pairing -->

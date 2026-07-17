@@ -25,6 +25,8 @@ import java.util.zip.ZipInputStream
  * row is just as trustworthy under this grammar and arrives while the word is
  * barely off the tongue. The final result still fires (covers a word the
  * partial stream only surfaced once) — the debounce swallows the duplicate.
+ * Exception: a DESTRUCTIVE command (discard) fires only from the FINAL result,
+ * so a mis-heard partial can never void a capture.
  *
  * Cues are plain tones now, so no suppression window is needed: a beep can't
  * spell "photo".
@@ -47,6 +49,9 @@ class VoiceController(
             "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
         const val MODEL_DIR = "vosk-model-small-en-us-0.15"
         val COMMANDS = listOf("start", "photo", "done", "cancel")
+        // Destructive commands never fire from a partial hypothesis (see
+        // handlePartial): only an endpointed FINAL result can void a capture.
+        val DESTRUCTIVE = setOf("cancel")
         // long enough to swallow the final result that trails a partial-fired
         // command; page-flipping cadence never repeats a word this fast
         private const val DEBOUNCE_MS = 1500L
@@ -207,6 +212,10 @@ class VoiceController(
         if (hypothesis.isNullOrBlank()) return
         val text = try { JSONObject(hypothesis).optString("partial") } catch (_: Exception) { "" }
         val word = text.split(" ").lastOrNull { it in COMMANDS } ?: return
+        // A destructive command waits for the FINAL result: an endpointed
+        // utterance is far less likely to be a stray partial, so a mis-heard
+        // "cancel" can't void a capture. Others keep the low-latency fast path.
+        if (word in DESTRUCTIVE) { pendingPartial = ""; return }
         if (word == pendingPartial) {
             pendingPartial = ""
             fire(word)
