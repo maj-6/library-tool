@@ -579,6 +579,74 @@ def test_replica_style_roundtrip_and_export(client, data_root):
     assert r["custom"] is False
 
 
+def test_replica_import_roundtrip(client, data_root):
+    import io
+    import zipfile
+    import libcommon as lib
+    import server
+    src_bid, dst_bid = "a11112345678", "b22212345678"
+    builds = lib.load_json(server.BUILDS_PATH, {})
+    for bid in (src_bid, dst_bid):
+        builds[bid] = {"id": bid, "title": "T " + bid}
+    lib.save_json(server.BUILDS_PATH, builds)
+
+    # source book: a verified page with both layers, a template, a figure
+    _put(client, src_bid, {"page": 7, "doc": "compiled.txt",
+                           "state": "verified", "items": [
+        {"role": "body", "order": 0,
+         "box": {"x": 0.2, "y": 0.1, "w": 0.6, "h": 0.7},
+         "text": "diplomatic", "norm": "normalized"},
+        {"role": "marginalia", "order": 1,
+         "box": {"x": 0.03, "y": 0.3, "w": 0.12, "h": 0.06}, "text": "gloss"},
+    ]})
+    client.put(f"/api/builds/{src_bid}/ocr-templates",
+               json={"name": "recto", "from_page": 7})
+    img_dir = server._entry_dir(src_bid) / "ocr" / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    (img_dir / "p7-fig.jpeg").write_bytes(b"\xff\xd8fig")
+    mp = server._entry_dir(src_bid) / "ocr" / "layout.json"
+    meta = lib.load_json(mp, {})
+    meta.setdefault("images", {})["p7-fig.jpeg"] = {
+        "x": 0.3, "y": 0.8, "w": 0.4, "h": 0.1, "page": 7,
+        "src_key": "primary"}
+    lib.save_json(mp, meta)
+    exported = client.get(f"/api/builds/{src_bid}/replica-export").data
+
+    # destination already has page 7 -> skipped; page 7 verified stays theirs
+    _put(client, dst_bid, {"page": 7, "items": [
+        {"role": "body", "order": 0,
+         "box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}, "text": "mine"}]})
+    r = client.post(f"/api/builds/{dst_bid}/replica-import",
+                    data={"lib": (io.BytesIO(exported), "book.lib")},
+                    content_type="multipart/form-data").get_json()
+    assert r["ok"]
+    assert r["pages_applied"] == [] and r["pages_skipped"] == [7]
+    assert r["templates_added"] == ["recto"]
+    assert r["figures_added"] == 1
+    assert r["stylesheet"] == "imported"   # dst had no custom sheet
+    mine = client.get(f"/api/builds/{dst_bid}/ocr-regions?page=7").get_json()
+    assert mine["items"][0]["text"] == "mine"
+
+    # with overwrite the page lands, layers and state intact
+    r = client.post(f"/api/builds/{dst_bid}/replica-import?overwrite=1",
+                    data={"lib": (io.BytesIO(exported), "book.lib")},
+                    content_type="multipart/form-data").get_json()
+    assert r["ok"] and r["pages_applied"] == [7]
+    got = client.get(f"/api/builds/{dst_bid}/ocr-regions?page=7").get_json()
+    assert got["state"] == "verified"
+    roles = {i["role"]: i for i in got["items"]}
+    assert roles["body"]["norm"] == "normalized"
+    assert roles["body"]["src_type"] == "import"
+    assert (server._entry_dir(dst_bid) / "ocr" / "images" /
+            "p7-fig.jpeg").is_file()
+
+    # garbage refuses cleanly
+    r = client.post(f"/api/builds/{dst_bid}/replica-import",
+                    data={"lib": (io.BytesIO(b"not a zip"), "x.lib")},
+                    content_type="multipart/form-data")
+    assert r.status_code == 400
+
+
 def test_replica_export_defends_hostile_sidecar(client, data_root):
     import io
     import zipfile

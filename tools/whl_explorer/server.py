@@ -2296,6 +2296,54 @@ _RW_MAX_ITEMS = 800
 _RW_ROLE_RE = re.compile(r"^[a-z][a-z-]{0,23}$")
 
 
+def _rw_sanitize_items(raw: list, src_type: str = "human") -> list:
+    """One page's region items scrubbed for storage: roles kebab-case,
+    boxes clamped into the page, text layers capped, everything re-ordered
+    and re-idd. Shared by the workbench PUT and the .lib import — anything
+    that writes items the sidecar will trust must come through here."""
+    def order_of(it):
+        o = it.get("order")
+        return float(o) if isinstance(o, (int, float)) \
+            and not isinstance(o, bool) else 0.0
+
+    items = []
+    for it in sorted((x for x in raw if isinstance(x, dict)), key=order_of):
+        box = it.get("box") or {}
+        try:
+            x = min(1.0, max(0.0, float(box.get("x") or 0)))
+            y = min(1.0, max(0.0, float(box.get("y") or 0)))
+            w = min(1.0 - x, max(0.0, float(box.get("w") or 0)))
+            h = min(1.0 - y, max(0.0, float(box.get("h") or 0)))
+        except (TypeError, ValueError):
+            continue
+        if w < 0.001 or h < 0.001:
+            continue
+        role = str(it.get("role") or "body").lower()
+        if not _RW_ROLE_RE.match(role):
+            role = "body"
+        rec = {"id": f"r{len(items)}", "role": role,
+               "src_type": src_type, "order": len(items),
+               "box": {"x": round(x, 5), "y": round(y, 5),
+                       "w": round(w, 5), "h": round(h, 5)},
+               "text": str(it.get("text") or "")[:20000]}
+        # the normalized reading layer (long-s resolved, dehyphenated…),
+        # stored only when it exists — compose_text falls back per region
+        norm = str(it.get("norm") or "")[:20000]
+        if norm:
+            rec["norm"] = norm
+        items.append(rec)
+    return items
+
+
+def _rw_sanitize_dims(dims):
+    if not isinstance(dims, dict):
+        return None
+    try:
+        return {k: int(dims.get(k) or 0) for k in ("w", "h", "dpi")}
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 @app.route("/api/builds/<build_id>/ocr-regions", methods=["PUT"])
 def api_build_ocr_regions_put(build_id: str):
     """Replace one page's typed regions with the Replica workbench's edited
@@ -2322,44 +2370,8 @@ def api_build_ocr_regions_put(build_id: str):
     raw = p.get("items")
     if not isinstance(raw, list) or len(raw) > _RW_MAX_ITEMS:
         return jsonify({"ok": False, "error": "bad items"}), 400
-
-    def order_of(it):
-        o = it.get("order")
-        return float(o) if isinstance(o, (int, float)) \
-            and not isinstance(o, bool) else 0.0
-
-    items = []
-    for it in sorted((x for x in raw if isinstance(x, dict)), key=order_of):
-        box = it.get("box") or {}
-        try:
-            x = min(1.0, max(0.0, float(box.get("x") or 0)))
-            y = min(1.0, max(0.0, float(box.get("y") or 0)))
-            w = min(1.0 - x, max(0.0, float(box.get("w") or 0)))
-            h = min(1.0 - y, max(0.0, float(box.get("h") or 0)))
-        except (TypeError, ValueError):
-            continue
-        if w < 0.001 or h < 0.001:
-            continue
-        role = str(it.get("role") or "body").lower()
-        if not _RW_ROLE_RE.match(role):
-            role = "body"
-        rec = {"id": f"r{len(items)}", "role": role,
-               "src_type": "human", "order": len(items),
-               "box": {"x": round(x, 5), "y": round(y, 5),
-                       "w": round(w, 5), "h": round(h, 5)},
-               "text": str(it.get("text") or "")[:20000]}
-        # the normalized reading layer (long-s resolved, dehyphenated…),
-        # stored only when it exists — compose_text falls back per region
-        norm = str(it.get("norm") or "")[:20000]
-        if norm:
-            rec["norm"] = norm
-        items.append(rec)
-    dims = p.get("dims") if isinstance(p.get("dims"), dict) else None
-    if dims:
-        try:
-            dims = {k: int(dims.get(k) or 0) for k in ("w", "h", "dpi")}
-        except (TypeError, ValueError, OverflowError):
-            dims = None
+    items = _rw_sanitize_items(raw, src_type="human")
+    dims = _rw_sanitize_dims(p.get("dims"))
     state = "verified" if p.get("state") == "verified" else ""
     _ocr_save_page_regions(build_id, src, page, items, dims,
                            doc=_ocr_name(str(p.get("doc") or "compiled.txt")),
@@ -2670,6 +2682,43 @@ _LIB_META_FIELDS = ("published_slug", "title", "subtitle", "authors", "year",
                     "language", "pages", "source_url")
 
 
+_RW_HEX_RE = re.compile(r"^#[0-9a-fA-F]{3,8}$")
+
+
+def _rw_sanitize_styles(raw: dict) -> dict:
+    """A role->style mapping scrubbed for storage. Shared by the style-board
+    PUT and the .lib import — a .lib is somebody else's file."""
+    styles = {}
+    for role, st in raw.items():
+        role = str(role).lower()
+        if not _RW_ROLE_RE.match(role) or not isinstance(st, dict):
+            continue
+        out = {}
+        family = str(st.get("family") or "").strip()[:60]
+        if family:
+            out["family"] = family
+        for k, lo, hi in (("size_em", 0.3, 4.0), ("leading", 0.8, 3.0)):
+            try:
+                v = float(st.get(k))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if lo <= v <= hi:
+                out[k] = round(v, 2)
+        if st.get("style") in ("italic", "normal"):
+            out["style"] = st["style"]
+        if st.get("variant") in ("small-caps", "normal"):
+            out["variant"] = st["variant"]
+        if st.get("align") in ("left", "right", "center", "justify"):
+            out["align"] = st["align"]
+        for k in ("color", "bg"):
+            v = str(st.get(k) or "")
+            if _RW_HEX_RE.match(v):
+                out[k] = v
+        if out:
+            styles[role] = out
+    return styles
+
+
 def _replica_style_path(build_id: str):
     return _entry_dir(build_id) / "ocr" / "replica-style.json"
 
@@ -2705,30 +2754,7 @@ def api_build_replica_style(build_id: str):
     raw = p.get("styles")
     if not isinstance(raw, dict) or not raw or len(raw) > 40:
         return jsonify({"ok": False, "error": "bad styles"}), 400
-    styles = {}
-    for role, st in raw.items():
-        role = str(role).lower()
-        if not _RW_ROLE_RE.match(role) or not isinstance(st, dict):
-            continue
-        out = {}
-        family = str(st.get("family") or "").strip()[:60]
-        if family:
-            out["family"] = family
-        for k, lo, hi in (("size_em", 0.3, 4.0), ("leading", 0.8, 3.0)):
-            try:
-                v = float(st.get(k))
-            except (TypeError, ValueError, OverflowError):
-                continue
-            if lo <= v <= hi:
-                out[k] = round(v, 2)
-        if st.get("style") in ("italic", "normal"):
-            out["style"] = st["style"]
-        if st.get("variant") in ("small-caps", "normal"):
-            out["variant"] = st["variant"]
-        if st.get("align") in ("left", "right", "center", "justify"):
-            out["align"] = st["align"]
-        if out:
-            styles[role] = out
+    styles = _rw_sanitize_styles(raw)
     if not styles:
         return jsonify({"ok": False, "error": "no valid styles"}), 400
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2821,6 +2847,145 @@ def api_build_replica_export(build_id: str):
                       or build_id)).strip("-").lower()[:60] or build_id
     return send_file(buf, mimetype="application/zip", as_attachment=True,
                      download_name=f"{stem}.lib")
+
+
+_LIB_MAX_BYTES = 250 * 1024 * 1024
+_LIB_MAX_FIGURE = 15 * 1024 * 1024
+_LIB_MAX_PAGES = 2000
+
+
+@app.route("/api/builds/<build_id>/replica-import", methods=["POST"])
+def api_build_replica_import(build_id: str):
+    """The other half of .lib interchange: unpack an exported archive into
+    this build's working store. Multipart field "lib"; ?src= picks the scan
+    the pages land under, ?overwrite=1 lets imported pages/templates replace
+    existing ones (default: skip, like template apply). Everything passes the
+    same sanitizers as the live endpoints — a .lib is somebody else's file.
+    The stylesheet imports only when the book has no custom sheet (or with
+    overwrite); figures only when the name is free."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    src = _valid_src_key(b, request.args.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    overwrite = str(request.args.get("overwrite") or "") in ("1", "true")
+    f = request.files.get("lib")
+    if f is None:
+        return jsonify({"ok": False, "error": "no file"}), 400
+    if request.content_length and request.content_length > _LIB_MAX_BYTES:
+        return jsonify({"ok": False, "error": "file too large"}), 400
+    import io
+    import zipfile
+    raw = f.read(_LIB_MAX_BYTES + 1)
+    if len(raw) > _LIB_MAX_BYTES:
+        return jsonify({"ok": False, "error": "file too large"}), 400
+    try:
+        z = zipfile.ZipFile(io.BytesIO(raw))
+        book = json.loads(z.read("book.json"))
+    except (zipfile.BadZipFile, KeyError, ValueError):
+        return jsonify({"ok": False, "error": "not a .lib archive"}), 400
+    if not isinstance(book, dict) or book.get("format") != "lib/1":
+        return jsonify({"ok": False, "error":
+                        "unsupported .lib format"}), 400
+
+    # pages: every well-formed pages/N.json, sanitized like a live PUT
+    incoming: dict[int, dict] = {}
+    for name in z.namelist():
+        m = re.fullmatch(r"pages/(\d{1,5})\.json", name)
+        if not m:
+            continue
+        n = int(m.group(1))
+        if not 1 <= n <= 99999 or len(incoming) >= _LIB_MAX_PAGES:
+            continue
+        try:
+            rec = json.loads(z.read(name))
+        except (ValueError, KeyError):
+            continue
+        if not isinstance(rec, dict) or not isinstance(rec.get("items"), list):
+            continue
+        items = _rw_sanitize_items(rec["items"][:_RW_MAX_ITEMS],
+                                   src_type="import")
+        if not items:
+            continue
+        incoming[n] = {
+            "doc": _ocr_name(str(rec.get("doc") or "compiled.txt")),
+            "dims": _rw_sanitize_dims(rec.get("dims")) or {},
+            "items": items,
+        }
+        if rec.get("state") == "verified":
+            incoming[n]["state"] = "verified"
+    if not incoming:
+        return jsonify({"ok": False, "error": "no usable pages"}), 400
+
+    tpl_in = {}
+    for name, t in (book.get("templates") or {}).items():
+        name = str(name).strip()
+        if not _RW_TPL_RE.match(name) or not isinstance(t, dict):
+            continue
+        items = _rw_sanitize_items(t.get("items") or [], src_type="template")
+        if not items:
+            continue
+        tpl_in[name] = {"from_page": 0, "doc": _ocr_name(
+            str(t.get("doc") or "compiled.txt")),
+            "dims": _rw_sanitize_dims(t.get("dims")) or {},
+            "items": [{"role": i["role"], "order": i["order"],
+                       "box": i["box"]} for i in items]}
+
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    applied, skipped, tpls_added = [], [], []
+    with _ocr_merge_lock:
+        meta = lib.load_json(meta_path, {})
+        pmap = meta.setdefault("regions", {}).setdefault(src, {})
+        for n, rec in sorted(incoming.items()):
+            if not overwrite and str(n) in pmap:
+                skipped.append(n)
+                continue
+            pmap[str(n)] = rec
+            applied.append(n)
+        tmap = meta.setdefault("templates", {}).setdefault(src, {})
+        for name, t in tpl_in.items():
+            if not overwrite and name in tmap:
+                continue
+            tmap[name] = t
+            tpls_added.append(name)
+        imap = meta.setdefault("images", {})
+        figures_added = 0
+        img_dir = _entry_dir(build_id) / "ocr" / "images"
+        for name in z.namelist():
+            m = re.fullmatch(r"assets/img/([\w.\-]{1,120})", name)
+            if not m:
+                continue
+            safe = m.group(1)
+            dest = img_dir / safe
+            if dest.exists() or safe in imap:
+                continue
+            info = z.getinfo(name)
+            if info.file_size > _LIB_MAX_FIGURE:
+                continue
+            fig = (book.get("figures") or {}).get(safe)
+            img_dir.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(z.read(name))
+            entry = {"src_key": src}
+            if isinstance(fig, dict):
+                entry.update({k: fig.get(k)
+                              for k in ("page", "x", "y", "w", "h")})
+            imap[safe] = entry
+            figures_added += 1
+        lib.save_json(meta_path, meta)
+
+    sheet = "none"
+    styles = _rw_sanitize_styles(book.get("stylesheet") or {})
+    if styles:
+        if overwrite or not _replica_styles(build_id)[1]:
+            lib.save_json(_replica_style_path(build_id),
+                          {"version": 1, "styles": styles})
+            sheet = "imported"
+        else:
+            sheet = "kept"
+    return jsonify({"ok": True, "pages_applied": applied,
+                    "pages_skipped": skipped, "templates_added": tpls_added,
+                    "figures_added": figures_added, "stylesheet": sheet})
 
 
 # --- PDF page rasterization (the OCR tab's side-by-side page view) ---------------

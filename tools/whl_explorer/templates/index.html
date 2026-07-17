@@ -1193,6 +1193,9 @@
                     data-tip="Rewrite compiled text from every saved region page of this source — furniture stays out of the flow. The toggled layer compiles: diplomatic into each record's doc, normalized into normalized.txt">Recompile</button>
             <button id="rw-export" class="cad-btn tiny" type="button" disabled
                     data-tip="Export this source's region pages as a .lib — book metadata, role stylesheet, templates, per-page regions with both text layers, and the figure crops, sealed in one portable file">Export .lib</button>
+            <button id="rw-import" class="cad-btn tiny" type="button" disabled
+                    data-tip="Import a .lib archive into this source — pages that already have regions are skipped, and the stylesheet only lands if the book has none of its own">Import</button>
+            <input id="rw-import-file" type="file" accept=".lib,.zip" hidden>
           </div>
           <div id="rw-canvas-wrap" class="drafting">
             <div id="rw-canvas" hidden>

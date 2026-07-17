@@ -15108,6 +15108,7 @@ function rwSyncBar() {
   el("rw-save").disabled = !rwState.dirty || !rwState.page;
   el("rw-recompile").disabled = !rwState.book || !rwState.regionPages.length;
   el("rw-export").disabled = !rwState.book || !rwState.regionPages.length;
+  el("rw-import").disabled = !rwState.book;
   el("rw-tpl-save").disabled = !rwState.page;
   el("rw-tpl-apply").disabled = !el("rw-tpl").value;
   el("rw-tpl-outliers").disabled = !el("rw-tpl").value;
@@ -15927,6 +15928,45 @@ function initReplica() {
     document.body.appendChild(a);
     a.click();
     a.remove();
+  });
+  el("rw-import").addEventListener("click", () => {
+    if (rwState.book) el("rw-import-file").click();
+  });
+  el("rw-import-file").addEventListener("change", async () => {
+    const input = el("rw-import-file");
+    const file = input.files && input.files[0];
+    input.value = "";
+    if (!file || !rwState.book) return;
+    const fd = new FormData();
+    fd.append("lib", file);
+    let r;
+    try {
+      r = await (await fetch(
+        `/api/builds/${encodeURIComponent(rwState.book)}` +
+        `/replica-import?src=${encodeURIComponent(rwState.src)}`,
+        { method: "POST", body: fd })).json();
+      if (!r.ok) throw new Error(r.error || "import failed");
+    } catch (e) {
+      status("IMPORT :: " + e.message);
+      return;
+    }
+    status(`IMPORT :: ${r.pages_applied.length} page(s)` +
+           (r.pages_skipped.length ? ` · skipped ${r.pages_skipped.length}` : "") +
+           (r.templates_added.length ? ` · templates ${r.templates_added.join(", ")}` : "") +
+           (r.figures_added ? ` · ${r.figures_added} figure(s)` : "") +
+           ` · stylesheet ${r.stylesheet}`);
+    // the sidecar changed under every cache
+    ocrState.regionsCache.clear();
+    delete ocrState.layoutMeta[rwState.book];
+    const seq = ++rwState.seq;
+    await renderReplicaPages(seq);
+    if (seq !== rwState.seq) return;
+    await rwLoadTemplates(seq);
+    if (seq !== rwState.seq) return;
+    await rwLoadStyles(seq);
+    if (seq !== rwState.seq) return;
+    if (rwState.page) selectReplicaPage(rwState.page);
+    rwSyncBar();
   });
   el("rw-layer-dipl").addEventListener("click", () => rwSetLayer("text"));
   el("rw-layer-norm").addEventListener("click", () => rwSetLayer("norm"));
