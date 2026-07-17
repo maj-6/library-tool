@@ -258,6 +258,29 @@ def template_score(tpl_items: list[dict], page_items: list[dict]) -> float:
     return sum(best) / len(best)
 
 
+def distribute_text(text: str, weights: list) -> list:
+    """Split page-aligned text across body regions, weighted by each
+    region's diplomatic length, breaking only at paragraph boundaries — the
+    server-side twin of the workbench preview's distribution, used by the
+    print renderer for translated editions."""
+    if not weights:
+        return []
+    paras = [p for p in str(text or "").split("\n\n") if p.strip()]
+    out = [[] for _ in weights]
+    if not paras:
+        return ["" for _ in weights]
+    total = sum(weights) or 1
+    total_chars = sum(len(p) for p in paras) or 1
+    wi, acc = 0, 0
+    for p in paras:
+        out[min(wi, len(out) - 1)].append(p)
+        acc += len(p)
+        filled = sum(weights[:wi + 1]) / total
+        while wi < len(weights) - 1 and acc / total_chars >= filled:
+            wi += 1
+    return ["\n\n".join(chunk) for chunk in out]
+
+
 def clip_words_to_box(words: list, box: dict) -> str:
     """The text of every word box whose centre falls inside `box`, rebuilt
     into lines: grouped by the OCR engine's line id when present, else by

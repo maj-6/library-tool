@@ -15120,6 +15120,7 @@ function rwSyncBar() {
   el("rw-recompile").disabled = !rwState.book || !rwState.regionPages.length;
   el("rw-export").disabled = !rwState.book || !rwState.regionPages.length;
   el("rw-import").disabled = !rwState.book;
+  el("rw-print").disabled = !rwState.book || !rwState.regionPages.length;
   el("rw-tpl-save").disabled = !rwState.page;
   el("rw-tpl-apply").disabled = !el("rw-tpl").value;
   el("rw-tpl-outliers").disabled = !el("rw-tpl").value;
@@ -16036,6 +16037,15 @@ function initReplica() {
   });
   el("rw-import").addEventListener("click", () => {
     if (rwState.book) el("rw-import-file").click();
+  });
+  el("rw-print").addEventListener("click", () => {
+    if (!rwState.book || !rwState.regionPages.length) return;
+    // the preview's layer selector decides which text prints
+    const layer = rwState.previewLang;
+    window.open(
+      `/api/builds/${encodeURIComponent(rwState.book)}/replica-print` +
+      `?src=${encodeURIComponent(rwState.src)}` +
+      (layer ? `&layer=${encodeURIComponent(layer)}` : ""), "_blank");
   });
   el("rw-import-file").addEventListener("change", async () => {
     const input = el("rw-import-file");

@@ -223,9 +223,15 @@ adopting the geometric variant; a diff view can come with real usage).
   Settings > OCR & AI); reworked art saves beside the original with a
   `rework_of` pointer — the preview prefers it, the facsimile stays faithful.
 
-Remaining for Phase 4: print/PDF export (the preview renderer, paginated —
-mind Chromium's partial paged-media support); live-verify the image
-providers once keys exist.
+- **Print/PDF export** (shipped): `/replica-print` renders every region page
+  as one A4-fit sheet — server-computed mm geometry, the book's styles, the
+  layer selector's text (diplomatic/normalized/translation), reworked art
+  preferred, page-break-after per sheet (no deep paged-media machinery, so
+  it prints faithfully in any browser). The Print button opens it; Ctrl+P
+  makes the PDF.
+
+Remaining for Phase 4: live-verify the image providers once keys exist.
+Phase 4 is otherwise COMPLETE — the branch is ready for an alpha prerelease.
 
 ## Phase 4 — `.lib` export and the modernized edition
 

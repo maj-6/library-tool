@@ -648,6 +648,59 @@ def test_replica_style_roundtrip_and_export(client, data_root):
     assert r["custom"] is False
 
 
+def test_distribute_text_matches_the_preview_semantics():
+    assert layout_roles.distribute_text("anything", []) == []
+    assert layout_roles.distribute_text("", [3, 1]) == ["", ""]
+    out = layout_roles.distribute_text("aaa\n\nbbb\n\nc", [2, 1])
+    assert len(out) == 2 and "\n\n".join(out) == "aaa\n\nbbb\n\nc"
+
+
+def test_replica_print_renders_sheets(client, data_root):
+    import libcommon as lib
+    import server
+    bid = "9c1n12345678"
+    builds = lib.load_json(server.BUILDS_PATH, {})
+    builds[bid] = {"id": bid, "title": "Haven <of> Health"}
+    lib.save_json(server.BUILDS_PATH, builds)
+
+    assert client.get(f"/api/builds/{bid}/replica-print").status_code == 400
+
+    _put(client, bid, {"page": 2, "doc": "compiled.txt", "items": [
+        {"role": "drop-capital", "order": 0,
+         "box": {"x": 0.2, "y": 0.1, "w": 0.05, "h": 0.05}, "text": "O"},
+        {"role": "body", "order": 1,
+         "box": {"x": 0.26, "y": 0.1, "w": 0.55, "h": 0.6},
+         "text": "liues <b>are</b> ripe\nsecond line",
+         "norm": "lives are ripe\nsecond line"},
+        {"role": "marginalia", "order": 2,
+         "box": {"x": 0.03, "y": 0.3, "w": 0.12, "h": 0.06}, "text": "gloss"},
+    ]})
+    # a translation for the translated-edition path
+    tdir = server._entry_dir(bid) / "translations"
+    tdir.mkdir(parents=True, exist_ok=True)
+    (tdir / "en.txt").write_text("--- page 2 ---\nthe lives are ripe\n",
+                                 encoding="utf-8")
+
+    r = client.get(f"/api/builds/{bid}/replica-print")
+    assert r.status_code == 200 and r.mimetype == "text/html"
+    doc = r.get_data(as_text=True)
+    assert doc.count('class="sheet"') == 1
+    assert "Haven &lt;of&gt; Health" in doc          # title escaped
+    assert "liues &lt;b&gt;are&lt;/b&gt; ripe" in doc  # region text escaped
+    assert "page-break-after: always" in doc
+    assert "font-family:'EB Garamond',serif" in doc  # seed styles applied
+    assert "gloss" in doc                            # furniture prints too
+
+    norm = client.get(
+        f"/api/builds/{bid}/replica-print?layer=norm").get_data(as_text=True)
+    assert "lives are ripe" in norm
+
+    trans = client.get(
+        f"/api/builds/{bid}/replica-print?layer=en").get_data(as_text=True)
+    assert "the lives are ripe" in trans     # body flows the translation
+    assert "gloss" in trans                  # furniture keeps diplomatic
+
+
 def test_replica_import_roundtrip(client, data_root):
     import io
     import zipfile

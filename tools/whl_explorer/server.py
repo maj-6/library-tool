@@ -3000,6 +3000,174 @@ def api_build_rework_figure(build_id: str):
     return jsonify({"ok": True, "name": out_name, "bytes": len(out)})
 
 
+# --- print / PDF export: the re-typeset preview, paginated ----------------------
+
+# A4 printable area at 12mm margins; a page box scales to fit, ratio kept
+_PRINT_W_MM = 186.0
+_PRINT_H_MM = 273.0
+
+
+@app.route("/api/builds/<build_id>/replica-print")
+def api_build_replica_print(build_id: str):
+    """The modernized facsimile as a print document: every region page of
+    the source re-typeset at the book's styles, one sheet per page, sized
+    for A4 — open it and print to PDF (Chromium's fuller paged-media
+    machinery isn't needed: each sheet is one absolutely-positioned box
+    with a page break after it, which prints faithfully everywhere).
+    ?src= picks the scan; ?layer= flows the diplomatic text (default),
+    "norm", or a page-aligned translation language."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    src = _valid_src_key(b, request.args.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    layer = str(request.args.get("layer") or "").strip()[:12]
+    meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
+    pages = (meta.get("regions") or {}).get(src) or {}
+    page_nums = sorted(int(k) for k in pages
+                       if str(k).isdigit() and isinstance(pages[k], dict))
+    if not page_nums:
+        return jsonify({"ok": False, "error": "no region pages to print"}), 400
+    styles, _custom = _replica_styles(build_id)
+    pg_style = styles.get("page") or {}
+    paper = pg_style.get("bg") or "#fdfcf8"
+    ink = pg_style.get("color") or "#1c1a17"
+    # reworked art shadows its original, exactly like the preview
+    rework = {str(i.get("rework_of")): n
+              for n, i in (meta.get("images") or {}).items()
+              if isinstance(i, dict) and i.get("rework_of")}
+    trans_pages = None
+    if layer and layer != "norm":
+        lang = _lang_code(layer)
+        trans_pages = _an_pages(_read_entry_text(
+            build_id, f"translations/{lang}.txt")) if lang else {}
+
+    import html as _html
+
+    def esc(s):
+        return _html.escape(str(s or ""), quote=True)
+
+    def css_color(v, fallback):
+        return v if isinstance(v, str) and _RW_HEX_RE.match(v) else fallback
+
+    sheets = []
+    for n in page_nums:
+        rec = pages[str(n)]
+        items = sorted((i for i in rec.get("items") or []
+                        if isinstance(i, dict)),
+                       key=lambda i: i.get("order") or 0)
+        dims = rec.get("dims") or {}
+        try:
+            ratio = float(dims.get("w") or 0) / float(dims.get("h") or 0)
+        except (TypeError, ValueError, ZeroDivisionError):
+            ratio = 0.0
+        if not 0.1 < ratio < 10:
+            ratio = 0.72
+        sheet_w = min(_PRINT_W_MM, _PRINT_H_MM * ratio)
+        sheet_h = sheet_w / ratio
+        # the base type size: median content-fit of the body regions, so
+        # size_em ratios play against the page's own scale (same rule as
+        # the on-screen preview)
+        fits = []
+        for it in items:
+            if it.get("role") != "body" or not str(it.get("text") or "").strip():
+                continue
+            lines = max(1, len([ln for ln in str(it["text"]).split("\n")
+                                if ln.strip()]))
+            fits.append((it.get("box") or {}).get("h", 0) * sheet_h
+                        / lines * 0.78)
+        fits.sort()
+        base = fits[len(fits) // 2] if fits else sheet_h * 0.018
+        texts = {}
+        if trans_pages is not None:
+            bodies = [it for it in items if it.get("role") == "body"]
+            dist = layout_roles.distribute_text(
+                trans_pages.get(n) or "",
+                [max(1, len(str(it.get("text") or ""))) for it in bodies])
+            for it, t in zip(bodies, dist):
+                texts[id(it)] = t
+        cells = []
+        for it in items:
+            box = it.get("box") or {}
+            try:
+                x = float(box.get("x") or 0) * sheet_w
+                y = float(box.get("y") or 0) * sheet_h
+                w = float(box.get("w") or 0) * sheet_w
+                h = float(box.get("h") or 0) * sheet_h
+            except (TypeError, ValueError):
+                continue
+            role = str(it.get("role") or "body")
+            st = styles.get(role) or styles.get("body") or {}
+            pos = (f"left:{x:.2f}mm;top:{y:.2f}mm;"
+                   f"width:{w:.2f}mm;height:{h:.2f}mm;")
+            text = str(it.get("text") or "")
+            fig = role == "figure" and re.search(
+                r"!\[[^\]\n]*\]\(([\w.\- ]+)\)", text)
+            if fig:
+                name = rework.get(fig.group(1)) or fig.group(1)
+                cells.append(
+                    f'<div class="rg" style="{pos}">'
+                    f'<img src="/api/builds/{urllib.parse.quote(build_id)}'
+                    f'/ocr/images/{urllib.parse.quote(name)}" alt=""></div>')
+                continue
+            if layer == "norm":
+                shown = str(it.get("norm") or "").strip() or text
+            elif trans_pages is not None and id(it) in texts:
+                shown = texts[id(it)]
+            else:
+                shown = text
+            decl = [pos]
+            # single-quoted in CSS: the style attribute itself is double-
+            # quoted, and a double quote inside would terminate it
+            fam = str(st.get("family") or "").replace('"', "").replace("'", "")
+            decl.append(f"font-family:'{fam}',serif;" if fam
+                        else "font-family:serif;")
+            if role == "drop-capital":
+                decl.append(f"font-size:{max(2.0, h * 0.9):.2f}mm;"
+                            "line-height:1;text-align:center;")
+            else:
+                size = base * float(st.get("size_em") or 1)
+                decl.append(f"font-size:{max(1.5, size):.2f}mm;")
+                decl.append(f"line-height:{st.get('leading') or 1.25};")
+            if st.get("style") == "italic":
+                decl.append("font-style:italic;")
+            if st.get("variant") == "small-caps":
+                decl.append("font-variant:small-caps;")
+            if st.get("align"):
+                decl.append(f"text-align:{st['align']};")
+            if st.get("color"):
+                decl.append(f"color:{css_color(st['color'], ink)};")
+            if st.get("bg"):
+                decl.append(f"background:{css_color(st['bg'], 'none')};")
+            cells.append(f'<div class="rg" style="{"".join(decl)}">'
+                         f"{esc(shown)}</div>")
+        sheets.append(
+            f'<div class="sheet" style="width:{sheet_w:.1f}mm;'
+            f'height:{sheet_h:.1f}mm;">{"".join(cells)}'
+            f'<div class="folio">{n}</div></div>')
+
+    title = esc(b.get("title") or build_id)
+    doc = (
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        f"<title>{title} — replica</title><style>"
+        "@page { size: A4; margin: 12mm; }"
+        "html, body { margin: 0; padding: 0; }"
+        f"body {{ background: #666; color: {css_color(ink, '#1c1a17')}; }}"
+        ".sheet { position: relative; overflow: hidden; margin: 4mm auto;"
+        f" background: {css_color(paper, '#fdfcf8')};"
+        " page-break-after: always; break-after: page; }"
+        ".rg { position: absolute; overflow: hidden;"
+        " white-space: pre-wrap; }"
+        ".rg img { width: 100%; height: 100%; object-fit: contain; }"
+        ".folio { position: absolute; right: 2mm; bottom: 1mm;"
+        " font: 2.4mm sans-serif; opacity: .35; }"
+        "@media print { body { background: none; }"
+        " .sheet { margin: 0 auto; } .folio { display: none; } }"
+        f"</style></head><body>{''.join(sheets)}</body></html>")
+    return Response(doc, mimetype="text/html")
+
+
 _LIB_MAX_BYTES = 250 * 1024 * 1024
 _LIB_MAX_FIGURE = 15 * 1024 * 1024
 _LIB_MAX_PAGES = 2000
