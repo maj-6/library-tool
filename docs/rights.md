@@ -7,9 +7,9 @@ publication-rights decision, set in the desktop Editor (Entry pane, with a
 
 | Decision | Site shows | What may publish |
 | --- | --- | --- |
-| `public-domain` | Public domain | Full page text, translations, notes, and (future) search index |
+| `public-domain` | Public domain | Full page text, translations, notes, and the search index |
 | `cleared` | Cleared | Same as public-domain — rights were cleared some other way |
-| `searchable-only` | Search only | No public page text, translations, or notes; snippets only in a future search index (#140) |
+| `searchable-only` | Search only | No public page text, translations, or notes. The search index (#140) MAY publish: passage bodies are never anonymously readable (RPC-only, no read policy) and the search RPC returns only snippets |
 | `no-public-text` | Restricted | Record, PDF and About article only; nothing text-indexed |
 | `""` (undecided) | — | Cannot publish at all |
 
@@ -28,6 +28,8 @@ count as the book's text.
 - **Status publication**: `_volume_row` maps `rights` to the display strings
   above; `tools/backfill_rights.py` backfills rows published before this
   existed.
-- **Search index**: the future index build (#140) must filter on
-  `volumes.copyright_status` — full text only for "Public domain"/"Cleared",
-  snippets for "Search only", nothing for "Restricted".
+- **Search index**: `POST /api/knowledge/index/publish` gates on the build's
+  decision — "Public domain", "Cleared", and "Search only" may build and
+  publish an index version (the `passages` table has no anon read policy, so
+  even for "Search only" nothing beyond RPC snippets is ever exposed);
+  "Restricted" and undecided are refused.
