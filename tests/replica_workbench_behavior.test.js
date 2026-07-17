@@ -17,6 +17,20 @@ function fn(name) {
 
 const rwNormalize = fn("rwNormalize");
 const rwParsePages = fn("rwParsePages");
+const rwDistribute = fn("rwDistribute");
+
+test("rwDistribute splits by weight at paragraph bounds and survives edges", () => {
+  // a body-less page (title, plate) used to crash the translation preview
+  assert.deepEqual(rwDistribute("some text", []), []);
+  assert.deepEqual(rwDistribute("", [3, 1]), ["", ""]);
+  const out = rwDistribute("aaa\n\nbbb\n\nc", [2, 1]);
+  assert.equal(out.length, 2);
+  assert.equal(out.join("\n\n"), "aaa\n\nbbb\n\nc");   // nothing lost
+  // one paragraph, many regions: everything lands somewhere, none undefined
+  const one = rwDistribute("only", [1, 1, 1]);
+  assert.equal(one.filter((s) => s === "only").length, 1);
+  assert.ok(one.every((s) => typeof s === "string"));
+});
 
 test("rwNormalize resolves long s, ligatures, and hyphenation to a fixpoint", () => {
   // three-line hyphenation was the review's regression: a single global

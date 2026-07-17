@@ -2772,7 +2772,13 @@ def api_build_replica_export(build_id: str):
             continue
         if str(info.get("src_key") or "primary") != src:
             continue
-        figures[name] = {k: info.get(k) for k in ("page", "x", "y", "w", "h")}
+        # the writer sanitizes names, but the sidecar is a hand-editable
+        # file: re-sanitize like the serving route, or a crafted key walks
+        # out of ocr/images/ on read AND plants a zip-slip member name
+        safe = re.sub(r"[^\w.\-]", "_", str(name))
+        if not safe or safe != str(name):
+            continue
+        figures[safe] = {k: info.get(k) for k in ("page", "x", "y", "w", "h")}
     book = {
         "format": "lib/1",
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -2784,21 +2790,31 @@ def api_build_replica_export(build_id: str):
         "pages": page_nums,
     }
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("book.json", json.dumps(book, indent=1, ensure_ascii=False))
-        for n in page_nums:
-            rec = pages[str(n)]
-            z.writestr(f"pages/{n}.json", json.dumps({
-                "page": n,
-                "doc": rec.get("doc") or "",
-                "dims": rec.get("dims") or {},
-                "state": rec.get("state") or "",
-                "items": rec.get("items") or [],
-            }, indent=1, ensure_ascii=False))
-        for name in figures:
-            f = img_dir / name
-            if f.is_file():
-                z.writestr(f"assets/img/{name}", f.read_bytes())
+    try:
+        # allow_nan=False: a hand-edited sidecar smuggling NaN/Infinity
+        # through load_json must fail HERE, loudly — not export an archive
+        # whose pages/N.json no strict parser will read
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("book.json", json.dumps(book, indent=1,
+                                               ensure_ascii=False,
+                                               allow_nan=False))
+            for n in page_nums:
+                rec = pages[str(n)]
+                z.writestr(f"pages/{n}.json", json.dumps({
+                    "page": n,
+                    "doc": rec.get("doc") or "",
+                    "dims": rec.get("dims") or {},
+                    "state": rec.get("state") or "",
+                    "items": rec.get("items") or [],
+                }, indent=1, ensure_ascii=False, allow_nan=False))
+            for name in figures:
+                f = img_dir / name
+                if f.is_file():
+                    z.writestr(f"assets/img/{name}", f.read_bytes())
+    except ValueError:
+        return jsonify({"ok": False, "error":
+                        "the layout sidecar contains non-finite numbers — "
+                        "re-save the affected pages first"}), 400
     buf.seek(0)
     stem = re.sub(r"[^\w\-]+", "-",
                   str(b.get("published_slug") or b.get("title")

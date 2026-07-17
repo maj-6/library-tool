@@ -579,6 +579,41 @@ def test_replica_style_roundtrip_and_export(client, data_root):
     assert r["custom"] is False
 
 
+def test_replica_export_defends_hostile_sidecar(client, data_root):
+    import io
+    import zipfile
+    import libcommon as lib
+    import server
+    bid = "0b5c12345678"
+    builds = lib.load_json(server.BUILDS_PATH, {})
+    builds[bid] = {"id": bid, "title": "T"}
+    lib.save_json(server.BUILDS_PATH, builds)
+    _put(client, bid, {"page": 1, "items": [
+        {"role": "body", "order": 0,
+         "box": {"x": 0.2, "y": 0.1, "w": 0.6, "h": 0.7}, "text": "t"}]})
+
+    # a hand-edited sidecar with a path-walking figure key must neither read
+    # outside ocr/images/ nor plant a zip-slip member name
+    meta_path = server._entry_dir(bid) / "ocr" / "layout.json"
+    meta = lib.load_json(meta_path, {})
+    meta.setdefault("images", {})["../../../whl_builds.json"] = {
+        "x": 0, "y": 0, "w": 1, "h": 1, "page": 1, "src_key": "primary"}
+    lib.save_json(meta_path, meta)
+    z = zipfile.ZipFile(io.BytesIO(
+        client.get(f"/api/builds/{bid}/replica-export").data))
+    assert all(".." not in n for n in z.namelist())
+    assert "../../../whl_builds.json" not in json.loads(
+        z.read("book.json"))["figures"]
+
+    # non-finite numbers smuggled through the sidecar fail loudly at export
+    meta = lib.load_json(meta_path, {})
+    meta["regions"]["primary"]["1"]["dims"] = {"w": float("inf")}
+    lib.save_json(meta_path, meta)
+    r = client.get(f"/api/builds/{bid}/replica-export")
+    assert r.status_code == 400
+    assert "non-finite" in r.get_json()["error"]
+
+
 def test_norm_recompile_target_is_per_source(client, data_root):
     import libcommon as lib
     import server

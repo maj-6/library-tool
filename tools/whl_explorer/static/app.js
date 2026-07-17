@@ -14987,7 +14987,10 @@ async function selectReplicaPage(n) {
     b.classList.toggle("active", +b.dataset.page === n);
   }
   el("rw-page-img").src = `/api/pdf/pageimg?path=${encodeURIComponent(rwState.pdf)}&page=${n}&w=1100`;
-  el("rw-canvas").hidden = false;
+  // only edit mode reveals the canvas here — in preview, showing it now
+  // would flash the previous page's overlay under the new page's image
+  // until the region fetch lands (rwSetMode below re-syncs everything)
+  el("rw-canvas").hidden = rwState.mode !== "edit";
   el("rw-empty").hidden = true;
   // always fetched fresh — this is the editor, never a cached copy
   let rec = { found: false };
@@ -15620,9 +15623,12 @@ async function rwLoadStyles(seq) {
     const r = await (await fetch(
       `/api/builds/${encodeURIComponent(rwState.book)}/replica-style`)).json();
     if (r.ok) { styles = r.styles; custom = !!r.custom; }
-  } catch (e) { /* seed styles render regardless */ }
+  } catch (e) { /* handled below: null disables the board */ }
   if (seq !== rwState.seq) return;
-  rwState.styles = styles || {};
+  // a failed GET must NOT degrade to an empty sheet: the first row edit
+  // would build a one-role sheet and Save would store it wholesale,
+  // silently dropping every seed role. null keeps the board read-only.
+  rwState.styles = styles;
   rwState.stylesCustom = custom;
 }
 
@@ -15647,6 +15653,7 @@ async function rwLoadTranslations(seq) {
 // diplomatic length, breaking only at paragraph boundaries — page-aligned
 // translations have no region grain of their own
 function rwDistribute(text, weights) {
+  if (!weights.length) return [];   // a body-less page: nothing to fill
   const paras = String(text || "").split(/\n{2,}/).filter((s) => s.trim());
   const out = weights.map(() => []);
   if (!paras.length) return out.map(() => "");
@@ -15675,13 +15682,20 @@ async function rwPreviewTexts(items) {
   }
   let sec = rwState.transCache[lang];
   if (sec === undefined) {
+    let ok = false;
     try {
       const r = await (await fetch(
         `/api/builds/${encodeURIComponent(rwState.book)}` +
         `/translations/${encodeURIComponent(lang)}`)).json();
-      sec = r.ok ? ocrPageSections(r.text || "") : null;
-    } catch (e) { sec = null; }
-    rwState.transCache[lang] = sec;
+      if (r.ok) {
+        // a marker-less translation is a one-page doc, like _an_pages
+        sec = ocrPageSections(r.text || "") ||
+              { pre: "", map: new Map(r.text ? [[1, r.text]] : []) };
+        ok = true;
+      }
+    } catch (e) { /* transient — retry on the next render */ }
+    if (ok) rwState.transCache[lang] = sec;   // failures are never cached
+    else sec = null;
   }
   const t = sec && sec.map ? sec.map.get(rwState.page) || "" : "";
   const bodies = items.filter((i) => i.role === "body");
@@ -15692,9 +15706,15 @@ async function rwPreviewTexts(items) {
   return map;
 }
 
+let rwRenderSeq = 0;
+
 async function rwRenderPreview() {
   if (rwState.mode !== "preview" || !rwState.page) return;
   const seq = rwState.seq;
+  // the context seq only moves on book/src/page switches; layer flips and
+  // styleboard keystrokes race through it — an uncached translation fetch
+  // resolving late must not paint over a newer render
+  const render = ++rwRenderSeq;
   el("rw-preview-orig").style.aspectRatio = rwState.ratio;
   el("rw-preview").style.aspectRatio = rwState.ratio;
   el("rw-preview-orig-img").src =
@@ -15702,7 +15722,8 @@ async function rwRenderPreview() {
     `&page=${rwState.page}&w=1100`;
   const items = [...rwState.items].sort((a, b) => a.order - b.order);
   const texts = await rwPreviewTexts(items);
-  if (seq !== rwState.seq || rwState.mode !== "preview") return;
+  if (seq !== rwState.seq || render !== rwRenderSeq ||
+      rwState.mode !== "preview") return;
   const pane = el("rw-preview");
   pane.innerHTML = "";
   const styles = rwState.styles || {};
@@ -15761,6 +15782,12 @@ function rwStyleRoles() {
 function rwRenderStyleboard() {
   const box = el("rw-styleboard");
   box.innerHTML = "";
+  if (!rwState.styles) {
+    box.innerHTML = '<p class="empty">Type styles unavailable — reselect ' +
+                    "the book to retry.</p>";
+    el("rw-style-state").textContent = "";
+    return;
+  }
   if (!document.getElementById("rw-fonts")) {
     const dl = document.createElement("datalist");
     dl.id = "rw-fonts";
@@ -15796,8 +15823,9 @@ function rwRenderStyleboard() {
 
 // read one row back into rwState.styles and re-render the preview live
 function rwStyleRowChanged(row) {
+  if (!rwState.styles) return;   // board is read-only until a sheet loads
   const role = row.dataset.role;
-  const styles = rwState.styles || (rwState.styles = {});
+  const styles = rwState.styles;
   const st = styles[role] || (styles[role] = {});
   const family = row.querySelector(".rw-st-family").value.trim();
   if (family) st.family = family; else delete st.family;
@@ -15832,14 +15860,18 @@ async function rwStyleSave() {
 
 async function rwStyleReset() {
   if (!rwState.book) return;
+  let ok = false;
   try {
-    await fetch(`/api/builds/${encodeURIComponent(rwState.book)}/replica-style`,
-                { method: "DELETE" });
+    const res = await fetch(
+      `/api/builds/${encodeURIComponent(rwState.book)}/replica-style`,
+      { method: "DELETE" });
+    ok = res.ok;
   } catch (e) { /* reload below shows the truth either way */ }
   await rwLoadStyles(rwState.seq);
   rwRenderStyleboard();
   rwRenderPreview();
-  status("TYPE STYLES :: reset to default");
+  status(ok ? "TYPE STYLES :: reset to default"
+            : "TYPE STYLES :: reset failed — showing the stored sheet");
 }
 
 function initReplica() {
