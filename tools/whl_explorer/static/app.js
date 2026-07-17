@@ -14830,6 +14830,13 @@ const rwState = {
   templates: [],    // this source's template names
   layer: "text",    // which text layer the panel edits: "text" | "norm"
   pageState: "",    // this page's review flag
+  mode: "edit",     // "edit" (region overlay) | "preview" (re-typeset)
+  ratio: "",        // the page's aspect ratio, shared by canvas + preview
+  styles: null,     // role -> type mapping (replica-style endpoint)
+  stylesCustom: false,
+  previewLang: "",  // "" diplomatic | "norm" | a translation lang code
+  transLangs: [],   // this book's page-aligned translation languages
+  transCache: {},   // lang -> parsed page sections
   drag: null,       // {kind: move|resize|draw, id, corner, start, box0, moved}
   lastPos: null,    // pointer in page fractions — the split guide
   seq: 0, idSeq: 0,
@@ -14899,6 +14906,10 @@ async function selectReplicaBook(bid) {
   await renderReplicaPages(seq);
   if (seq !== rwState.seq) return;
   await rwLoadTemplates(seq);
+  if (seq !== rwState.seq) return;
+  await rwLoadStyles(seq);
+  if (seq !== rwState.seq) return;
+  await rwLoadTranslations(seq);
   if (seq !== rwState.seq) return;
   rwSyncBar();
 }
@@ -15006,8 +15017,10 @@ async function selectReplicaPage(n) {
     const d = info && info.dims && info.dims[n - 1];
     if (d && d[0] > 0) ratio = `${d[0]} / ${d[1]}`;
   }
-  el("rw-canvas").style.aspectRatio = ratio || "3 / 4";
+  rwState.ratio = ratio || "3 / 4";
+  el("rw-canvas").style.aspectRatio = rwState.ratio;
   rwRenderOverlay();
+  rwSetMode(rwState.mode);   // preview follows the page; also fixes hidden flags
   rwSyncBar();
 }
 
@@ -15302,6 +15315,8 @@ function rwKeyDown(ev) {
   // every command below is a BARE key: Ctrl+V is a paste reflex, not a
   // request to flip the review flag, and Ctrl+digit belongs to the shell
   if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+  // the preview is read-only: region commands belong to edit mode
+  if (rwState.mode === "preview") return;
   const a = rwActive();
   if (/^[0-9]$/.test(ev.key) && rwState.sel.length) {
     const role = RW_ROLES[(parseInt(ev.key, 10) + 9) % 10];
@@ -15571,6 +15586,262 @@ async function rwTplOutliers() {
   }
 }
 
+// --- re-typeset preview + style board (facsimile plan, Phase 4) --------------
+// The preview IS the modernized-facsimile engine: the page rebuilt from its
+// regions — real text flowed inside each region box at the mapped styles,
+// figures in place — beside the original scan. Print export will be this
+// same renderer, paginated.
+
+const RW_FONT_SUGGESTIONS = [
+  "EB Garamond", "IM Fell English", "IM Fell DW Pica", "IM Fell Double Pica",
+  "Junicode", "Georgia", "Palatino Linotype", "Book Antiqua",
+  "Times New Roman"];
+
+function rwSetMode(mode) {
+  rwState.mode = mode === "preview" ? "preview" : "edit";
+  const pv = rwState.mode === "preview";
+  el("rw-mode-edit").classList.toggle("active", !pv);
+  el("rw-mode-preview").classList.toggle("active", pv);
+  el("rw-canvas").hidden = pv || !rwState.page;
+  el("rw-preview-row").hidden = !pv || !rwState.page;
+  el("rw-empty").hidden = !!rwState.page;
+  el("rw-preview-lang").hidden = !pv;
+  el("rw-edit-panel").hidden = pv;
+  el("rw-style-panel").hidden = !pv;
+  if (pv) {
+    rwRenderStyleboard();
+    rwRenderPreview();
+  }
+}
+
+async function rwLoadStyles(seq) {
+  let styles = null, custom = false;
+  try {
+    const r = await (await fetch(
+      `/api/builds/${encodeURIComponent(rwState.book)}/replica-style`)).json();
+    if (r.ok) { styles = r.styles; custom = !!r.custom; }
+  } catch (e) { /* seed styles render regardless */ }
+  if (seq !== rwState.seq) return;
+  rwState.styles = styles || {};
+  rwState.stylesCustom = custom;
+}
+
+async function rwLoadTranslations(seq) {
+  let langs = [];
+  try {
+    const r = await (await fetch(
+      `/api/builds/${encodeURIComponent(rwState.book)}/translations`)).json();
+    if (r.ok) langs = (r.translations || []).map((t) => t.lang);
+  } catch (e) { /* no translations */ }
+  if (seq !== rwState.seq) return;
+  rwState.transLangs = langs;
+  rwState.transCache = {};
+  rwState.previewLang = "";
+  el("rw-preview-lang").innerHTML =
+    ['<option value="">diplomatic</option>',
+     '<option value="norm">normalized</option>',
+     ...langs.map((l) => `<option value="${esc(l)}">${esc(l)}</option>`)].join("");
+}
+
+// split translated text across the page's body regions, weighted by their
+// diplomatic length, breaking only at paragraph boundaries — page-aligned
+// translations have no region grain of their own
+function rwDistribute(text, weights) {
+  const paras = String(text || "").split(/\n{2,}/).filter((s) => s.trim());
+  const out = weights.map(() => []);
+  if (!paras.length) return out.map(() => "");
+  const total = weights.reduce((a, b) => a + b, 0) || 1;
+  const totalChars = paras.reduce((a, p) => a + p.length, 0) || 1;
+  let wi = 0, acc = 0;
+  for (const p of paras) {
+    out[Math.min(wi, out.length - 1)].push(p);
+    acc += p.length;
+    const filled = weights.slice(0, wi + 1).reduce((a, b) => a + b, 0) / total;
+    while (wi < weights.length - 1 && acc / totalChars >= filled) wi++;
+  }
+  return out.map((a) => a.join("\n\n"));
+}
+
+async function rwPreviewTexts(items) {
+  const map = new Map();
+  const lang = rwState.previewLang;
+  if (lang === "norm") {
+    items.forEach((i) => map.set(i.id, i.norm || i.text));
+    return map;
+  }
+  if (!lang) {
+    items.forEach((i) => map.set(i.id, i.text));
+    return map;
+  }
+  let sec = rwState.transCache[lang];
+  if (sec === undefined) {
+    try {
+      const r = await (await fetch(
+        `/api/builds/${encodeURIComponent(rwState.book)}` +
+        `/translations/${encodeURIComponent(lang)}`)).json();
+      sec = r.ok ? ocrPageSections(r.text || "") : null;
+    } catch (e) { sec = null; }
+    rwState.transCache[lang] = sec;
+  }
+  const t = sec && sec.map ? sec.map.get(rwState.page) || "" : "";
+  const bodies = items.filter((i) => i.role === "body");
+  const dist = rwDistribute(t, bodies.map((b) => Math.max(1, b.text.length)));
+  bodies.forEach((b, i) => map.set(b.id, dist[i]));
+  // furniture keeps its diplomatic text — translations don't carry it
+  items.forEach((i) => { if (!map.has(i.id)) map.set(i.id, i.text); });
+  return map;
+}
+
+async function rwRenderPreview() {
+  if (rwState.mode !== "preview" || !rwState.page) return;
+  const seq = rwState.seq;
+  el("rw-preview-orig").style.aspectRatio = rwState.ratio;
+  el("rw-preview").style.aspectRatio = rwState.ratio;
+  el("rw-preview-orig-img").src =
+    `/api/pdf/pageimg?path=${encodeURIComponent(rwState.pdf)}` +
+    `&page=${rwState.page}&w=1100`;
+  const items = [...rwState.items].sort((a, b) => a.order - b.order);
+  const texts = await rwPreviewTexts(items);
+  if (seq !== rwState.seq || rwState.mode !== "preview") return;
+  const pane = el("rw-preview");
+  pane.innerHTML = "";
+  const styles = rwState.styles || {};
+  const paneW = pane.clientWidth || 500;
+  const paneH = pane.clientHeight || paneW * 1.35;
+  // the base type size: median content-fit of the body regions, so the
+  // stylesheet's size_em ratios play out against the page's own scale
+  const fits = items
+    .filter((i) => i.role === "body" && i.text.trim())
+    .map((i) => (i.box.h * paneH) /
+                Math.max(1, i.text.split("\n").length) * 0.78)
+    .sort((a, b) => a - b);
+  const base = fits.length ? fits[Math.floor(fits.length / 2)]
+                           : paneH * 0.018;
+  const frag = document.createDocumentFragment();
+  for (const it of items) {
+    const e = document.createElement("div");
+    e.className = "rw-prevregion";
+    e.style.left = it.box.x * 100 + "%";
+    e.style.top = it.box.y * 100 + "%";
+    e.style.width = it.box.w * 100 + "%";
+    e.style.height = it.box.h * 100 + "%";
+    const fig = it.role === "figure" &&
+      String(it.text || "").match(/!\[[^\]\n]*\]\(([\w.\- ]+)\)/);
+    if (fig) {
+      const img = document.createElement("img");
+      img.loading = "lazy";
+      img.alt = fig[1];
+      img.src = `/api/builds/${encodeURIComponent(rwState.book)}` +
+        `/ocr/images/${encodeURIComponent(fig[1])}`;
+      e.appendChild(img);
+    } else {
+      const st = styles[it.role] || styles.body || {};
+      e.style.fontFamily = (st.family ? `"${st.family}", ` : "") + "serif";
+      e.style.fontSize = Math.max(6, base * (st.size_em || 1)) + "px";
+      e.style.lineHeight = String(st.leading || 1.25);
+      if (st.style === "italic") e.style.fontStyle = "italic";
+      if (st.variant === "small-caps") e.style.fontVariant = "small-caps";
+      if (st.align) e.style.textAlign = st.align;
+      e.textContent = texts.get(it.id) || "";
+    }
+    frag.appendChild(e);
+  }
+  pane.appendChild(frag);
+}
+
+// the roles worth a style row: every role in use on this page plus the core
+// set — a role never seen stays out of the way
+function rwStyleRoles() {
+  const core = ["body", "marginalia", "title", "header", "caption"];
+  const used = new Set(rwState.items.map((i) => i.role));
+  return [...new Set([...core, ...RW_ROLES.filter((r) => used.has(r))])]
+    .filter((r) => r !== "figure");
+}
+
+function rwRenderStyleboard() {
+  const box = el("rw-styleboard");
+  box.innerHTML = "";
+  if (!document.getElementById("rw-fonts")) {
+    const dl = document.createElement("datalist");
+    dl.id = "rw-fonts";
+    dl.innerHTML = RW_FONT_SUGGESTIONS
+      .map((f) => `<option value="${esc(f)}">`).join("");
+    document.body.appendChild(dl);
+  }
+  el("rw-style-state").textContent = rwState.stylesCustom ? "custom" : "default";
+  const styles = rwState.styles || {};
+  for (const role of rwStyleRoles()) {
+    const st = styles[role] || {};
+    const row = document.createElement("div");
+    row.className = "rw-stylerow role-" + role;
+    row.dataset.role = role;
+    row.innerHTML = `
+      <span class="rw-stylerole">${esc(role)}</span>
+      <input class="cad-input rw-st-family" list="rw-fonts" placeholder="serif"
+             value="${esc(st.family || "")}" data-tip="Typeface family">
+      <input class="cad-input rw-st-size" type="number" step="0.05" min="0.3"
+             max="4" value="${st.size_em != null ? st.size_em : 1}"
+             data-tip="Size relative to body">
+      <button class="cad-btn tiny rw-st-italic${st.style === "italic" ? " active" : ""}"
+              type="button" data-tip="Italic">I</button>
+      <button class="cad-btn tiny rw-st-sc${st.variant === "small-caps" ? " active" : ""}"
+              type="button" data-tip="Small caps">ᴀ</button>
+      <select class="cad-input rw-st-align" data-tip="Alignment">
+        ${["", "left", "center", "right", "justify"].map((a) =>
+          `<option value="${a}"${(st.align || "") === a ? " selected" : ""}>${a || "·"}</option>`).join("")}
+      </select>`;
+    box.appendChild(row);
+  }
+}
+
+// read one row back into rwState.styles and re-render the preview live
+function rwStyleRowChanged(row) {
+  const role = row.dataset.role;
+  const styles = rwState.styles || (rwState.styles = {});
+  const st = styles[role] || (styles[role] = {});
+  const family = row.querySelector(".rw-st-family").value.trim();
+  if (family) st.family = family; else delete st.family;
+  const size = parseFloat(row.querySelector(".rw-st-size").value);
+  if (size >= 0.3 && size <= 4) st.size_em = size;
+  st.style = row.querySelector(".rw-st-italic").classList.contains("active")
+    ? "italic" : "normal";
+  st.variant = row.querySelector(".rw-st-sc").classList.contains("active")
+    ? "small-caps" : "normal";
+  const align = row.querySelector(".rw-st-align").value;
+  if (align) st.align = align; else delete st.align;
+  rwRenderPreview();
+}
+
+async function rwStyleSave() {
+  if (!rwState.book || !rwState.styles) return;
+  try {
+    const r = await (await fetch(
+      `/api/builds/${encodeURIComponent(rwState.book)}/replica-style`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ styles: rwState.styles }),
+      })).json();
+    if (!r.ok) throw new Error(r.error || "save failed");
+    rwState.stylesCustom = true;
+    el("rw-style-state").textContent = "custom";
+    status(`TYPE STYLES SAVED :: ${r.count} role(s)`);
+  } catch (e) {
+    status("TYPE STYLES :: " + e.message);
+  }
+}
+
+async function rwStyleReset() {
+  if (!rwState.book) return;
+  try {
+    await fetch(`/api/builds/${encodeURIComponent(rwState.book)}/replica-style`,
+                { method: "DELETE" });
+  } catch (e) { /* reload below shows the truth either way */ }
+  await rwLoadStyles(rwState.seq);
+  rwRenderStyleboard();
+  rwRenderPreview();
+  status("TYPE STYLES :: reset to default");
+}
+
 function initReplica() {
   el("rw-books").addEventListener("click", (ev) => {
     const li = ev.target.closest("[data-bid]");
@@ -15647,6 +15918,25 @@ function initReplica() {
   el("rw-tpl-save").addEventListener("click", rwTplSave);
   el("rw-tpl-apply").addEventListener("click", rwTplApply);
   el("rw-tpl-outliers").addEventListener("click", rwTplOutliers);
+  el("rw-mode-edit").addEventListener("click", () => rwSetMode("edit"));
+  el("rw-mode-preview").addEventListener("click", () => rwSetMode("preview"));
+  el("rw-preview-lang").addEventListener("change", () => {
+    rwState.previewLang = el("rw-preview-lang").value;
+    rwRenderPreview();
+  });
+  el("rw-styleboard").addEventListener("input", (ev) => {
+    const row = ev.target.closest(".rw-stylerow");
+    if (row) rwStyleRowChanged(row);
+  });
+  el("rw-styleboard").addEventListener("click", (ev) => {
+    const btn = ev.target.closest(".rw-st-italic, .rw-st-sc");
+    if (!btn) return;
+    btn.classList.toggle("active");
+    const row = ev.target.closest(".rw-stylerow");
+    if (row) rwStyleRowChanged(row);
+  });
+  el("rw-style-save").addEventListener("click", rwStyleSave);
+  el("rw-style-reset").addEventListener("click", rwStyleReset);
   el("rw-legend").innerHTML = RW_ROLES.map((r, i) =>
     `<span class="rw-key role-${esc(r)}" data-tip="${esc(r)}">${(i + 1) % 10}</span>`).join("");
 }

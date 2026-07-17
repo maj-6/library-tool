@@ -187,6 +187,27 @@ Deliberately NOT built: the 5-state review machine (verified is the one flag
 that earns its keep pre-1.0) and per-region source-compare (Clip words covers
 adopting the geometric variant; a diff view can come with real usage).
 
+## Phase 4 — SHIPPING on this branch
+
+- **`.lib` export** (shipped): Export .lib in the Replica bar seals one
+  source's working store — book.json (format `lib/1`, bibliographic snapshot,
+  role stylesheet, templates, figure inventory), pages/N.json per region page
+  (both text layers, review state), figure crops under assets/img/.
+- **Style board + re-typeset preview** (shipped): the Replica tab's
+  Edit/Preview toggle renders the page from its regions at the mapped styles
+  beside the original scan — the modernized-facsimile engine. Role → {family,
+  size_em, style, variant, align} rows edit live; fonts are picker
+  suggestions (OFL revivals first), never embedded; the sheet stores at
+  `ocr/replica-style.json` (GET/PUT/DELETE `/replica-style`) and the export
+  carries it. The base type size is the median content-fit of the body
+  regions, so `size_em` ratios play against the page's own scale. The layer
+  selector flows diplomatic, normalized, or a page-aligned translation —
+  translations distribute across body regions by paragraph, weighted by each
+  region's diplomatic length; furniture keeps its diplomatic text.
+
+Remaining for Phase 4: `.lib` import (validated), print/PDF export (the
+preview renderer, paginated — mind Chromium's partial paged-media support).
+
 ## Phase 4 — `.lib` export and the modernized edition
 
 `.lib` is a **sealed zip export serialized from the working store** — not a

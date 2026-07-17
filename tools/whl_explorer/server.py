@@ -2670,6 +2670,72 @@ _LIB_META_FIELDS = ("published_slug", "title", "subtitle", "authors", "year",
                     "language", "pages", "source_url")
 
 
+def _replica_style_path(build_id: str):
+    return _entry_dir(build_id) / "ocr" / "replica-style.json"
+
+
+def _replica_styles(build_id: str) -> tuple[dict, bool]:
+    """The book's role->type stylesheet: (styles, custom). Falls back to the
+    OFL seed when the style board has never saved one."""
+    doc = lib.load_json(_replica_style_path(build_id), None)
+    if isinstance(doc, dict) and isinstance(doc.get("styles"), dict) \
+            and doc["styles"]:
+        return doc["styles"], True
+    return _LIB_STYLESHEET, False
+
+
+@app.route("/api/builds/<build_id>/replica-style",
+           methods=["GET", "PUT", "DELETE"])
+def api_build_replica_style(build_id: str):
+    """The book-level role -> modern-type mapping the re-typeset preview and
+    the .lib export use. GET returns the stored sheet (custom: true) or the
+    OFL seed (custom: false); PUT {styles: {role: {family, size_em, leading,
+    style, variant, align}}} validates and stores; DELETE resets to the
+    seed. Typography belongs to the BOOK, not a scan, so there is no src."""
+    if build_id not in lib.load_json(BUILDS_PATH, {}):
+        abort(404)
+    path = _replica_style_path(build_id)
+    if request.method == "GET":
+        styles, custom = _replica_styles(build_id)
+        return jsonify({"ok": True, "styles": styles, "custom": custom})
+    if request.method == "DELETE":
+        path.unlink(missing_ok=True)
+        return jsonify({"ok": True})
+    p = request.get_json(silent=True) or {}
+    raw = p.get("styles")
+    if not isinstance(raw, dict) or not raw or len(raw) > 40:
+        return jsonify({"ok": False, "error": "bad styles"}), 400
+    styles = {}
+    for role, st in raw.items():
+        role = str(role).lower()
+        if not _RW_ROLE_RE.match(role) or not isinstance(st, dict):
+            continue
+        out = {}
+        family = str(st.get("family") or "").strip()[:60]
+        if family:
+            out["family"] = family
+        for k, lo, hi in (("size_em", 0.3, 4.0), ("leading", 0.8, 3.0)):
+            try:
+                v = float(st.get(k))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if lo <= v <= hi:
+                out[k] = round(v, 2)
+        if st.get("style") in ("italic", "normal"):
+            out["style"] = st["style"]
+        if st.get("variant") in ("small-caps", "normal"):
+            out["variant"] = st["variant"]
+        if st.get("align") in ("left", "right", "center", "justify"):
+            out["align"] = st["align"]
+        if out:
+            styles[role] = out
+    if not styles:
+        return jsonify({"ok": False, "error": "no valid styles"}), 400
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lib.save_json(path, {"version": 1, "styles": styles})
+    return jsonify({"ok": True, "count": len(styles)})
+
+
 @app.route("/api/builds/<build_id>/replica-export")
 def api_build_replica_export(build_id: str):
     """Seal one source's Replica working store into a .lib — a plain zip:
@@ -2712,7 +2778,7 @@ def api_build_replica_export(build_id: str):
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "source": src,
         "meta": {k: b.get(k) for k in _LIB_META_FIELDS if b.get(k)},
-        "stylesheet": _LIB_STYLESHEET,
+        "stylesheet": _replica_styles(build_id)[0],
         "templates": (meta.get("templates") or {}).get(src) or {},
         "figures": figures,
         "pages": page_nums,

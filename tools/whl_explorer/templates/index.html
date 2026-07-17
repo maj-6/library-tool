@@ -1169,7 +1169,12 @@
         </aside>
         <div id="rw-main">
           <div class="pane-bar">
-            <span class="tool-label">Regions</span>
+            <button id="rw-mode-edit" class="cad-btn tiny active" type="button"
+                    data-tip="Edit the page's regions">Edit</button>
+            <button id="rw-mode-preview" class="cad-btn tiny" type="button"
+                    data-tip="Re-typeset preview: the page rendered from its regions at the mapped styles, beside the original — the modernized facsimile">Preview</button>
+            <select id="rw-preview-lang" class="cad-input" hidden
+                    data-tip="Which text layer the preview flows: the diplomatic transcription, the normalized reading, or a page-aligned translation"></select>
             <span class="tool-count" id="rw-status"></span>
             <span class="bar-spacer"></span>
             <span id="rw-legend" class="tool-label"></span>
@@ -1194,10 +1199,29 @@
               <img id="rw-page-img" alt="" draggable="false">
               <div id="rw-overlay"></div>
             </div>
+            <div id="rw-preview-row" hidden>
+              <div id="rw-preview-orig" class="rw-prevpane">
+                <img id="rw-preview-orig-img" alt="" draggable="false">
+              </div>
+              <div id="rw-preview" class="rw-prevpane"></div>
+            </div>
             <p id="rw-empty" class="empty">Pick a book, then a page. Pages marked ● already have machine-proposed regions (run Mistral OCR to seed them); on any other page, drag to draw regions from scratch.</p>
           </div>
         </div>
         <aside id="rw-textpanel">
+          <div id="rw-style-panel" hidden>
+            <div class="pane-bar">
+              <span class="tool-label">Type styles</span>
+              <span class="tool-count" id="rw-style-state"></span>
+              <span class="bar-spacer"></span>
+              <button id="rw-style-save" class="cad-btn tiny" type="button"
+                      data-tip="Store this mapping with the book — the .lib export carries it">Save</button>
+              <button id="rw-style-reset" class="cad-btn tiny" type="button"
+                      data-tip="Back to the default OFL mapping">Reset</button>
+            </div>
+            <div id="rw-styleboard" class="drafting"></div>
+          </div>
+          <div id="rw-edit-panel">
           <div class="pane-bar">
             <span class="tool-label">Region</span>
             <span class="tool-count" id="rw-region-info"></span>
@@ -1215,6 +1239,7 @@
                     placeholder="Select a region"></textarea>
           <div class="pane-bar">
             <span id="rw-keys" class="tool-label">draw: drag &nbsp; move/resize: drag box/corner &nbsp; roles: 1–9,0 &nbsp; split: S / Shift+S &nbsp; merge: M &nbsp; verify page: V &nbsp; del: Del &nbsp; order: [ ] &nbsp; walk: Tab</span>
+          </div>
           </div>
         </aside>
       </div>

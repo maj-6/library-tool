@@ -536,6 +536,49 @@ def test_replica_export_lib(client, data_root):
     assert roles["body"]["norm"] == "Canna foliis ovatis"
 
 
+def test_replica_style_roundtrip_and_export(client, data_root):
+    import io
+    import zipfile
+    import libcommon as lib
+    import server
+    bid = "57e112345678"
+    builds = lib.load_json(server.BUILDS_PATH, {})
+    builds[bid] = {"id": bid, "title": "T"}
+    lib.save_json(server.BUILDS_PATH, builds)
+
+    r = client.get(f"/api/builds/{bid}/replica-style").get_json()
+    assert r["ok"] and r["custom"] is False
+    assert r["styles"]["body"]["family"] == "EB Garamond"
+
+    r = client.put(f"/api/builds/{bid}/replica-style", json={"styles": {
+        "body": {"family": "IM Fell English", "size_em": 1.1,
+                 "align": "justify"},
+        "marginalia": {"family": "IM Fell English", "size_em": 99,  # out of range
+                       "style": "italic"},
+        "bad role!!": {"family": "X"},                              # dropped
+    }}).get_json()
+    assert r["ok"] and r["count"] == 2
+
+    r = client.get(f"/api/builds/{bid}/replica-style").get_json()
+    assert r["custom"] is True
+    assert r["styles"]["body"]["family"] == "IM Fell English"
+    assert "size_em" not in r["styles"]["marginalia"]
+    assert "bad role!!" not in r["styles"]
+
+    # the export carries the stored sheet, not the seed
+    _put(client, bid, {"page": 1, "items": [
+        {"role": "body", "order": 0,
+         "box": {"x": 0.2, "y": 0.1, "w": 0.6, "h": 0.7}, "text": "t"}]})
+    z = zipfile.ZipFile(io.BytesIO(
+        client.get(f"/api/builds/{bid}/replica-export").data))
+    book = json.loads(z.read("book.json"))
+    assert book["stylesheet"]["body"]["family"] == "IM Fell English"
+
+    client.delete(f"/api/builds/{bid}/replica-style")
+    r = client.get(f"/api/builds/{bid}/replica-style").get_json()
+    assert r["custom"] is False
+
+
 def test_norm_recompile_target_is_per_source(client, data_root):
     import libcommon as lib
     import server
