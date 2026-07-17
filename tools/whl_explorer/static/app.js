@@ -11790,16 +11790,20 @@ async function refreshSourceTab() {
   renderOcrChips(b);
   renderPdfSources(b);
   const textSrc = buildTextSrc(b);
-  if (localPath) {
+  // no attached file? fall back to the entry folder's own primary.pdf /
+  // preview.pdf, exactly as the Source chip and the Text phase (ocrBookPdf)
+  // do — the viewer and the chip must agree. The attach row stays empty.
+  const viewPath = localPath || ocrBookPdf(b.id);
+  if (viewPath) {
     // an entry folder's preview.pdf is already a derivative — serve it as-is
-    const entryPrev = /^output[\/\\]entries[\/\\]/i.test(localPath);
+    const entryPrev = /^output[\/\\]entries[\/\\]/i.test(viewPath);
     const derived = !state.settings.previewOriginal && !entryPrev;
     buildPdfViewer.show(
-      derived ? pdfViewSrc(localPath) : pdfLocalSrc(localPath),
-      localPath + (derived || entryPrev ? "  (preview)" : ""), {
+      derived ? pdfViewSrc(viewPath) : pdfLocalSrc(viewPath),
+      viewPath + (derived || entryPrev ? "  (preview)" : ""), {
         textSrc,
         // page-aligned OCR view (like the OCR tab), editable + savable
-        pagesPdf: localPath,
+        pagesPdf: viewPath,
         pagesSaveTo: { buildId: b.id, name: buildActiveOcrName(b) },
       });
   } else if (/^https?:\/\//i.test((b.pdf_source || "").trim())) {
@@ -13176,7 +13180,8 @@ function renderOcrQueue() {
   el("ocr-queue-empty").hidden = total !== 0;
   const staged = (ocrState.book ? stagedCountFor(ocrState.book) : 0) +
     (ocrState.book ? analysisStagedCount(ocrState.book) : 0);
-  el("ocr-queue-count").textContent = `${total} jobs${staged ? ` · ${staged} staged` : ""}`;
+  el("ocr-queue-count").textContent =
+    `${total} job${total === 1 ? "" : "s"}${staged ? ` · ${staged} staged` : ""}`;
 }
 
 async function cancelOcrJob(jobId) {
