@@ -6603,6 +6603,45 @@ function copyRecordText(fields) {
   statusFlash(`COPIED RECORD :: ${lines.length} field${lines.length === 1 ? "" : "s"}`);
 }
 
+// Start a Smart Scan for one row from outside Process mode (right-click). The
+// staged result appears when the user next looks at Process mode.
+async function smartScanOneRow(table, key) {
+  const ref = procPdfForRow(table, key);
+  if (!ref) { statusErr("SMART SCAN :: this row has no PDF source"); return; }
+  const ok0 = await confirmDialog({
+    title: "Smart Scan",
+    message: "Download & OCR this book's PDF and extract its metadata?",
+    detail: ref.label || "",
+    cost: "~1 download + OCR + AI pass",
+    confirmLabel: "Run",
+  });
+  if (!ok0) return;
+  try {
+    const body = { target: ref.target, label: ref.label };
+    if (ref.pdf) body.pdf = ref.pdf; else body.url = ref.url;
+    const res = await fetch("/api/process/smartscan/run", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    const d = await res.json().catch(() => ({}));
+    if (res.ok && d.ok && d.job) procPollSmartScan([{ id: d.job.id, target: ref.target }]);
+    else statusErr("SMART SCAN :: " + (d.error || "could not start"));
+  } catch (e) { statusErr("SMART SCAN :: request failed"); }
+}
+
+// Paste the clipboard into an editable cell (menu twin of Ctrl+V-over-cell).
+async function pasteIntoCellFromMenu(td) {
+  const field = cellFieldName(td);
+  if (!field) return;
+  let text = "";
+  try { text = await navigator.clipboard.readText(); } catch (e) { text = ""; }
+  text = String(text || "").replace(/\s+/g, " ").trim();
+  if (!text) { statusErr("PASTE: clipboard empty or unavailable"); return; }
+  if (await pasteIntoCell(td, field, text)) {
+    flashCell(td, "cell-pasted");
+    statusFlash(`PASTED ${field.toUpperCase()}: ${clipNote(text)}`);
+  }
+}
+
 function generalRowMenu(ev, table) {
   const tr = ev.target.closest("tr");
   if (!tr) return null;
@@ -6618,7 +6657,12 @@ function generalRowMenu(ev, table) {
       const f = cellFieldName(td);
       statusFlash(f ? `COPIED ${f.toUpperCase()}: ${clipNote(val)}` : `COPIED: ${clipNote(val)}`);
     } });
+    if (cellFieldName(td)) items.push({ label: "Paste into field", fn: () => pasteIntoCellFromMenu(td) });
   }
+  // :hover-derived targets must be captured NOW — once the menu opens the row
+  // is no longer hovered, so resolving inside a menu item's fn comes up empty.
+  const attnTarget = attnTargetAtHover();
+  const book = bookAtHover();
   if (table === "whl") {
     const idx = parseInt(tr.dataset.widx, 10);
     if (isNaN(idx)) return items.length ? items : null;
@@ -6626,8 +6670,14 @@ function generalRowMenu(ev, table) {
     items.push({ label: "Copy record", fn: () => copyRecordText(whlParentFields(r || {})) });
     items.push({ label: "Edit record", fn: () => openWhlEditTab(idx) });
     if (r && r.permalink) items.push({ label: "Open WHL page", fn: () => openExternal(r.permalink) });
-    if (r && r.file && /^https?:/i.test(r.file))
+    if (r && r.file && /^https?:/i.test(r.file)) {
       items.push({ label: "Open publication PDF", fn: () => openExternal(r.file) });
+      items.push({ label: "Copy PDF link", fn: () => {
+        copyText(r.file); statusFlash(`COPIED PDF LINK: ${clipNote(r.file)}`);
+      } });
+    }
+    if (procPdfForRow("whl", idx))
+      items.push({ label: "Smart Scan", fn: () => smartScanOneRow("whl", idx) });
   } else {
     const setHdr = ev.target.closest("tr.set-header");
     if (setHdr && setHdr.dataset.setKey) {
@@ -6639,12 +6689,68 @@ function generalRowMenu(ev, table) {
     const row = state.rowsById.get(String(id));
     items.push({ label: "Copy record", fn: () => copyRecordText(checkedParentFields(row || { book: {} })) });
     items.push({ label: "Edit record", fn: () => openBookEditTab(id) });
+    items.push({ label: "Rescan sources", fn: () => {
+      queueScan(String(id));
+      status("RESCAN :: queued for a fresh source scan");
+    } });
+    const pdfRef = procPdfForRow("checked", id);
+    if (pdfRef) {
+      items.push({ label: "Smart Scan", fn: () => smartScanOneRow("checked", id) });
+      const link = pdfRef.url || pdfRef.pdf;
+      items.push({ label: "Copy PDF link", fn: () => {
+        copyText(link); statusFlash(`COPIED PDF LINK: ${clipNote(link)}`);
+      } });
+    }
     if (row && row.kind === "manual")
       items.push({ label: "Delete entry", danger: true, fn: () => deleteManual(id) });
     else
       items.push({ label: "Remove from checked", danger: true, fn: () => uncheckRow(id) });
   }
+  if (book && book.title) {
+    items.push({ label: "Search Google", fn: () => {
+      const q = [book.title, book.author, book.year].map((x) => String(x || "").trim())
+        .filter(Boolean).join(" ");
+      window.open("https://www.google.com/search?q=" + encodeURIComponent(q), "_blank", "noopener");
+      status("SEARCH :: " + q.slice(0, 60));
+    } });
+  }
+  if (attnTarget) {
+    // mirror the Q shortcut: mark at once (rect captured first — apply()
+    // re-renders and detaches the row), then offer the reason popover
+    const rect = attnTarget.node ? attnTarget.node.getBoundingClientRect() : null;
+    if (attnTarget.current) {
+      items.push({ label: "Clear attention mark", fn: () => attnTarget.apply("") });
+    } else {
+      items.push({ label: "Mark needs attention…", fn: () => {
+        attnTarget.apply("1");
+        openAttnPop(attnTarget, rect);
+      } });
+    }
+  }
   return items;
+}
+
+// Right-click a column header: hide that column, or open the full picker.
+function onHeaderContextMenu(ev, key, rerender) {
+  const th = ev.target.closest("th");
+  if (!th) return;
+  const def = tableDef(key);
+  if (!def) return;
+  const ths = [...th.closest("thead").querySelectorAll("th")];
+  const i = ths.indexOf(th);
+  const colKey = colKeyAt(def, i);
+  const label = def.cols[i] ? def.cols[i][1] : colKey;
+  ev.preventDefault();
+  const vis = () => state.settings.colVis[key] = state.settings.colVis[key] || {};
+  const items = [
+    { label: `Hide "${label}"`, fn: () => { vis()[colKey] = false; saveSettings(); rerender(); } },
+  ];
+  if (Object.values(state.settings.colVis[key] || {}).some((v) => v === false))
+    items.push({ label: "Show all columns", fn: () => {
+      state.settings.colVis[key] = {}; saveSettings(); rerender();
+    } });
+  items.push({ label: "Columns…", fn: () => openColumnMenu(th, key, rerender) });
+  openProcMenu(ev.clientX, ev.clientY, items);
 }
 
 function onRowContextMenu(ev) {
@@ -15686,6 +15792,13 @@ function init() {
   });
   el("checked-rows").addEventListener("contextmenu", onRowContextMenu);
   el("whltop-rows").addEventListener("contextmenu", onRowContextMenu);
+  // right-click a column header: hide / show-all / full picker
+  const checkedHead = el("checked-table").querySelector("thead");
+  if (checkedHead) checkedHead.addEventListener("contextmenu",
+    (ev) => onHeaderContextMenu(ev, "checked", renderChecked));
+  const whlHead = el("whltop-table").querySelector("thead");
+  if (whlHead) whlHead.addEventListener("contextmenu",
+    (ev) => onHeaderContextMenu(ev, "whl", renderWhlTop));
   loadStaged().then(() => { if (topMode() === "process") reRenderTop(); });
   document.addEventListener("keydown", (ev) => {
     if (!(ev.ctrlKey || ev.metaKey) || ev.key.toLowerCase() !== "e") return;
