@@ -2641,6 +2641,106 @@ def api_build_ocr_templates_outliers(build_id: str):
     return jsonify({"ok": True, "scores": scores, "outliers": outliers})
 
 
+# --- .lib export: the Replica working store, sealed ------------------------------
+
+# The default role -> modern-type mapping a .lib carries until the style
+# board exists to edit one. OFL faces only — a .lib may someday embed its
+# fonts, and only open-licensed families can travel. Sizes are relative to
+# the body (em), which the region boxes then scale to the page.
+_LIB_STYLESHEET = {
+    "body": {"family": "EB Garamond", "size_em": 1.0, "align": "justify"},
+    "marginalia": {"family": "EB Garamond", "size_em": 0.78, "style": "italic"},
+    "footnote": {"family": "EB Garamond", "size_em": 0.82},
+    "title": {"family": "EB Garamond", "size_em": 1.25,
+              "variant": "small-caps"},
+    "header": {"family": "EB Garamond", "size_em": 0.85,
+               "variant": "small-caps", "align": "center"},
+    "footer": {"family": "EB Garamond", "size_em": 0.85, "align": "center"},
+    "caption": {"family": "EB Garamond", "size_em": 0.85, "style": "italic",
+                "align": "center"},
+    "page-number": {"family": "EB Garamond", "size_em": 0.85},
+    "catch-word": {"family": "EB Garamond", "size_em": 0.85,
+                   "align": "right"},
+    "signature-mark": {"family": "EB Garamond", "size_em": 0.85,
+                       "align": "center"},
+}
+
+_LIB_META_FIELDS = ("published_slug", "title", "subtitle", "authors", "year",
+                    "publisher", "publisher_city", "edition", "volume",
+                    "language", "pages", "source_url")
+
+
+@app.route("/api/builds/<build_id>/replica-export")
+def api_build_replica_export(build_id: str):
+    """Seal one source's Replica working store into a .lib — a plain zip:
+
+        book.json      format tag, bibliographic snapshot, role stylesheet,
+                       layout templates, figure inventory, page list
+        pages/N.json   one file per region page: doc, dims, review state,
+                       items with diplomatic text + normalized layer
+        assets/img/*   the extracted figure crops the regions reference
+
+    The entry folder stays the working store — this is its portable,
+    diffable snapshot for interchange and the coming re-typeset tooling.
+    ?src= picks the scan (default primary)."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    src = _valid_src_key(b, request.args.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
+    pages = (meta.get("regions") or {}).get(src) or {}
+    page_nums = sorted(int(k) for k in pages
+                       if str(k).isdigit() and isinstance(pages[k], dict))
+    if not page_nums:
+        return jsonify({"ok": False, "error":
+                        "no region pages to export — seed or draw some in"
+                        " the Replica tab first"}), 400
+    import io
+    import zipfile
+    figures = {}
+    img_dir = _entry_dir(build_id) / "ocr" / "images"
+    for name, info in (meta.get("images") or {}).items():
+        if not isinstance(info, dict):
+            continue
+        if str(info.get("src_key") or "primary") != src:
+            continue
+        figures[name] = {k: info.get(k) for k in ("page", "x", "y", "w", "h")}
+    book = {
+        "format": "lib/1",
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "source": src,
+        "meta": {k: b.get(k) for k in _LIB_META_FIELDS if b.get(k)},
+        "stylesheet": _LIB_STYLESHEET,
+        "templates": (meta.get("templates") or {}).get(src) or {},
+        "figures": figures,
+        "pages": page_nums,
+    }
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("book.json", json.dumps(book, indent=1, ensure_ascii=False))
+        for n in page_nums:
+            rec = pages[str(n)]
+            z.writestr(f"pages/{n}.json", json.dumps({
+                "page": n,
+                "doc": rec.get("doc") or "",
+                "dims": rec.get("dims") or {},
+                "state": rec.get("state") or "",
+                "items": rec.get("items") or [],
+            }, indent=1, ensure_ascii=False))
+        for name in figures:
+            f = img_dir / name
+            if f.is_file():
+                z.writestr(f"assets/img/{name}", f.read_bytes())
+    buf.seek(0)
+    stem = re.sub(r"[^\w\-]+", "-",
+                  str(b.get("published_slug") or b.get("title")
+                      or build_id)).strip("-").lower()[:60] or build_id
+    return send_file(buf, mimetype="application/zip", as_attachment=True,
+                     download_name=f"{stem}.lib")
+
+
 # --- PDF page rasterization (the OCR tab's side-by-side page view) ---------------
 
 def _pageimg_pdf(raw: str) -> Path:

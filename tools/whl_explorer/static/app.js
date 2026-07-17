@@ -15091,6 +15091,7 @@ function rwSyncBar() {
     : "";
   el("rw-save").disabled = !rwState.dirty || !rwState.page;
   el("rw-recompile").disabled = !rwState.book || !rwState.regionPages.length;
+  el("rw-export").disabled = !rwState.book || !rwState.regionPages.length;
   el("rw-tpl-save").disabled = !rwState.page;
   el("rw-tpl-apply").disabled = !el("rw-tpl").value;
   el("rw-tpl-outliers").disabled = !el("rw-tpl").value;
@@ -15613,6 +15614,17 @@ function initReplica() {
   el("rw-clip").addEventListener("click", rwClipWords);
   el("rw-save").addEventListener("click", rwSave);
   el("rw-recompile").addEventListener("click", rwRecompile);
+  el("rw-export").addEventListener("click", () => {
+    if (!rwState.book || !rwState.regionPages.length) return;
+    // server-generated zip; Content-Disposition names the file
+    const a = document.createElement("a");
+    a.href = `/api/builds/${encodeURIComponent(rwState.book)}` +
+             `/replica-export?src=${encodeURIComponent(rwState.src)}`;
+    a.download = "";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  });
   el("rw-layer-dipl").addEventListener("click", () => rwSetLayer("text"));
   el("rw-layer-norm").addEventListener("click", () => rwSetLayer("norm"));
   el("rw-normalize").addEventListener("click", async () => {

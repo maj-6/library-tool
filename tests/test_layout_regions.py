@@ -480,6 +480,62 @@ def test_templates_apply_and_outliers(client, data_root):
                       json={"name": "../x", "from_page": 10}).status_code == 400
 
 
+def test_replica_export_lib(client, data_root):
+    import io
+    import zipfile
+    import libcommon as lib
+    import server
+    bid = "11b012345678"
+    builds = lib.load_json(server.BUILDS_PATH, {})
+    builds[bid] = {"id": bid, "title": "Species Plantarum", "year": "1753",
+                   "published_slug": "species-plantarum"}
+    lib.save_json(server.BUILDS_PATH, builds)
+
+    # nothing to export yet
+    assert client.get(f"/api/builds/{bid}/replica-export").status_code == 400
+
+    _put(client, bid, {"page": 3, "doc": "compiled.txt", "state": "verified",
+                       "items": [
+        {"role": "body", "order": 0,
+         "box": {"x": 0.2, "y": 0.1, "w": 0.6, "h": 0.7},
+         "text": "CANNA foliis ovatis", "norm": "Canna foliis ovatis"},
+        {"role": "marginalia", "order": 1,
+         "box": {"x": 0.03, "y": 0.3, "w": 0.12, "h": 0.06},
+         "text": "Habitat in Indiis."},
+    ]})
+    client.put(f"/api/builds/{bid}/ocr-templates",
+               json={"name": "recto", "from_page": 3})
+    # a figure crop for this source
+    img_dir = server._entry_dir(bid) / "ocr" / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    (img_dir / "p3-fig.jpeg").write_bytes(b"\xff\xd8jpegish")
+    meta_path = server._entry_dir(bid) / "ocr" / "layout.json"
+    meta = lib.load_json(meta_path, {})
+    meta.setdefault("images", {})["p3-fig.jpeg"] = {
+        "x": 0.3, "y": 0.8, "w": 0.4, "h": 0.1, "page": 3, "src_key": "primary"}
+    lib.save_json(meta_path, meta)
+
+    r = client.get(f"/api/builds/{bid}/replica-export")
+    assert r.status_code == 200
+    assert r.mimetype == "application/zip"
+    assert "species-plantarum.lib" in r.headers.get("Content-Disposition", "")
+    z = zipfile.ZipFile(io.BytesIO(r.data))
+    names = set(z.namelist())
+    assert {"book.json", "pages/3.json", "assets/img/p3-fig.jpeg"} <= names
+    book = json.loads(z.read("book.json"))
+    assert book["format"] == "lib/1"
+    assert book["meta"]["title"] == "Species Plantarum"
+    assert book["pages"] == [3]
+    assert "recto" in book["templates"]
+    assert book["figures"]["p3-fig.jpeg"]["page"] == 3
+    assert book["stylesheet"]["marginalia"]["style"] == "italic"
+    page = json.loads(z.read("pages/3.json"))
+    assert page["state"] == "verified"
+    roles = {i["role"]: i for i in page["items"]}
+    assert roles["marginalia"]["text"] == "Habitat in Indiis."
+    assert roles["body"]["norm"] == "Canna foliis ovatis"
+
+
 def test_norm_recompile_target_is_per_source(client, data_root):
     import libcommon as lib
     import server
