@@ -13397,7 +13397,7 @@ function renderOcrQueue() {
     tr.dataset.analysisJob = id;
     const artifact = j.artifact || (j.pages && j.pages.length
       ? `Pages ${j.pages.join(", ")}` : j.kind);
-    tr.innerHTML = `<td>${esc(jobTypeLabel(j.kind))}</td><td>${esc(j.book || j.buildId)}</td>` +
+    tr.innerHTML = `<td>Text analysis</td><td>${esc(j.book || j.buildId)}</td>` +
       `<td>${esc(artifact)}</td>` +
       `<td>${esc(TEXT_ANALYSIS_LABELS[j.engine] || j.engine || "Configured AI")}</td>` +
       `<td>${esc(j.status || "Starting...")}</td><td>${esc(j.at || "")}</td><td></td>`;
