@@ -1323,7 +1323,10 @@ function renderAccountState() {
   const s = el("set-account-state"), b = el("set-account-btn");
   if (!s || !b) return;
   if (authState.signedIn) {
-    s.textContent = `${authState.displayName || authState.email} (${authState.email})`;
+    const nm = authState.displayName || authState.email;
+    s.innerHTML = userAvatar(nm) +
+      ` <span class="set-acct-name">${esc(nm)}</span> ` +
+      `<span class="set-acct-email">(${esc(authState.email)})</span>`;
     b.textContent = "Sign out";
   } else {
     s.textContent = authState.cloud ? "Not signed in"
@@ -1757,6 +1760,184 @@ function progressSummary() {
   return { drafts, ready, srcPending, attnCat, attnEd, openReviews };
 }
 
+// --- contributor identity: micro-avatars + profile popup -----------------------
+// Every contributor name in the app renders as a compact chip: a tiny generated
+// "micro avatar" (a deterministic symbol on a deterministic colour) followed by
+// the name, on a faint wash of the same hue. The mark is derived only from the
+// name, so one person looks identical everywhere and across sessions, with no
+// stored per-user data. Clicking a chip opens a read-only profile popup built
+// from the activity feed the client already holds.
+
+// A curated categorical palette. Each colour is mid-dark enough for a white
+// symbol to stay legible on it, and desaturated enough to sit on the light
+// paper stocks every theme uses. Index is chosen by a hash of the name.
+const AVATAR_COLORS = [
+  "#3d7dab", "#c26a3d", "#4f9d69", "#a8543f", "#7a6cc4", "#c99a2e",
+  "#4aa5a0", "#b3577f", "#6b8f3a", "#8a6d4b", "#5a86c9", "#9c5bb0",
+];
+
+// Twelve simple, symmetric vector marks in a 24x24 box, kept bold and low
+// detail so they still read at ~13px. Filled shapes inherit the group's white
+// fill; the ring opts out with its own fill/stroke. Index chosen independently
+// of the colour, so colour x glyph gives 144 distinct looks.
+const AVATAR_GLYPHS = [
+  '<circle cx="12" cy="12" r="6.6"/>',                               // disc
+  '<rect x="5.6" y="5.6" width="12.8" height="12.8" rx="2.6"/>',     // rounded square
+  '<path d="M12 4 L20 12 L12 20 L4 12 Z"/>',                         // diamond
+  '<path d="M12 4 L20 19 L4 19 Z"/>',                                // triangle up
+  '<path d="M4 5 L20 5 L12 20 Z"/>',                                 // triangle down
+  '<path d="M12 3 L14.7 9.3 L21 12 L14.7 14.7 L12 21 L9.3 14.7 L3 12 L9.3 9.3 Z"/>', // 4-point star
+  '<path d="M9.2 4 h5.6 v4.6 h4.6 v5.6 h-4.6 v4.6 h-5.6 v-4.6 h-4.6 v-5.6 h4.6 Z"/>', // plus
+  '<circle cx="12" cy="12" r="6.6" fill="none" stroke="#fff" stroke-width="3.4"/>',   // ring
+  '<path d="M12 3 L20 7.5 V16.5 L12 21 L4 16.5 V7.5 Z"/>',           // hexagon
+  '<path d="M12 3 L20.6 9.3 L17.3 19.4 H6.7 L3.4 9.3 Z"/>',          // pentagon
+  '<path d="M12 4 C7 9.2 7 13.4 12 20 C17 13.4 17 9.2 12 4 Z"/>',    // leaf / droplet
+  '<path d="M3.6 12 L10 5.6 V9.6 H20.4 V14.4 H10 V18.4 Z"/>',        // arrow
+];
+
+// FNV-1a over an NFKC-folded, lowercased name: small, stable, dependency-free,
+// so trivial display differences collapse to one identity.
+function userHash(name) {
+  const s = String(name == null ? "" : name).normalize("NFKC").trim().toLowerCase() || "?";
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+  }
+  return h >>> 0;
+}
+
+// Deterministic colour + glyph for a name.
+function userLook(name) {
+  const h = userHash(name);
+  return {
+    color: AVATAR_COLORS[h % AVATAR_COLORS.length],
+    glyph: AVATAR_GLYPHS[(h >>> 8) % AVATAR_GLYPHS.length],
+  };
+}
+
+// The micro avatar on its own: an inline SVG sized in em so it never adds line
+// height. Coloured tile, white mark. `cls` adds a size modifier (e.g. big).
+function userAvatar(name, cls) {
+  const { color, glyph } = userLook(name);
+  return `<svg class="uav${cls ? " " + cls : ""}" viewBox="0 0 24 24" aria-hidden="true">` +
+    `<rect width="24" height="24" rx="6" fill="${color}"/>` +
+    `<g fill="#fff">${glyph}</g></svg>`;
+}
+
+// Full chip: avatar + name on a faint wash of the user's colour, as one
+// clickable target that opens the profile popup. Inline, so it drops into any
+// row without changing its height. `opts.you` adds a tiny self marker.
+function userChip(name, opts) {
+  const o = opts || {};
+  const display = String(name == null ? "" : name).trim() || "Unnamed user";
+  const { color } = userLook(display);
+  // aria-label carries the action (the avatar is decorative / aria-hidden and
+  // data-tip is a mouse-only visual tooltip); the visible name is contained in
+  // it, so the accessible name still includes the label text.
+  return `<button type="button" class="uchip${o.cls ? " " + o.cls : ""}" ` +
+    `data-user="${esc(display)}" style="--uav-c:${color}" ` +
+    `aria-label="View ${esc(display)}’s profile" ` +
+    `data-tip="View ${esc(display)}’s profile">` +
+    userAvatar(display) +
+    `<span class="uchip-name">${esc(display)}</span>` +
+    (o.you ? `<span class="uchip-you">you</span>` : "") +
+    `</button>`;
+}
+
+// Is this name the person using the app right now?
+function isSelfName(name) {
+  const me = (authState.displayName || state.settings.userName || "").normalize("NFKC").trim().toLowerCase();
+  return !!me && me === String(name == null ? "" : name).normalize("NFKC").trim().toLowerCase();
+}
+
+// Everything a profile shows is derived from the activity feed already in
+// memory (newest-first), so no per-user record or extra request is needed.
+function userProfileData(name) {
+  const target = String(name == null ? "" : name).normalize("NFKC").trim().toLowerCase();
+  let total = 0, last = 0, first = 0;
+  const recent = [];
+  for (const e of homeState.events) {
+    if (String(e.actor || "").normalize("NFKC").trim().toLowerCase() !== target) continue;
+    const at = Date.parse(e.ts) || 0;
+    total += e.n || 1;
+    if (at > last) last = at;
+    if (at && (!first || at < first)) first = at;
+    if (recent.length < 8) recent.push(e);   // events are newest-first already
+  }
+  return { total, last, first, recent };
+}
+
+let _uprofOpener = null;   // the chip clicked, so focus returns there on close
+
+function openUserProfile(name) {
+  const display = String(name == null ? "" : name).trim() || "Unnamed user";
+  const d = userProfileData(display);
+  const isMe = isSelfName(display);
+  if (el("uprof-overlay").hidden) _uprofOpener = document.activeElement;
+
+  el("uprof-avatar").innerHTML = userAvatar(display, "uav-lg");
+  el("uprof-name").textContent = display;
+  el("uprof-you").hidden = !isMe;
+  const emailEl = el("uprof-email");
+  if (isMe && authState.signedIn && authState.email) {
+    emailEl.textContent = authState.email;
+    emailEl.hidden = false;
+  } else emailEl.hidden = true;
+
+  const stats = [d.total ? `${d.total} ${d.total === 1 ? "change" : "changes"}` : "no changes yet"];
+  if (d.last) stats.push(`active ${relTime(d.last)}`);
+  // earliest activity still in the loaded feed — a local date, labelled plainly
+  // so it never reads as an account-creation date it isn't
+  if (d.first && d.first !== d.last) stats.push(`first seen ${exactTime(d.first).slice(0, 10)}`);
+  el("uprof-stats").textContent = stats.join(" · ");
+
+  el("uprof-recent").innerHTML = d.recent.length
+    ? d.recent.map((e) => `<div class="uprof-ev">` +
+        `<span class="uprof-ev-txt">${esc(e.detail ||
+          activityPhrase({ verb: e.verb, subject: e.subject, n: e.n || 1 }))}</span>` +
+        `<span class="uprof-ev-when">${esc(relIso(e.ts))}</span></div>`).join("")
+    : `<div class="empty">No recorded activity yet</div>`;
+
+  el("uprof-overlay").hidden = false;
+  el("uprof-close").focus();
+}
+
+function closeUserProfile() {
+  el("uprof-overlay").hidden = true;
+  // return focus to the chip that opened it, if it's still on screen
+  const op = _uprofOpener;
+  _uprofOpener = null;
+  if (op && op.focus && op.isConnected && op.offsetParent !== null) op.focus();
+}
+
+function initUserProfile() {
+  el("uprof-close").addEventListener("click", closeUserProfile);
+  el("uprof-overlay").addEventListener("mousedown", (ev) => {
+    if (ev.target === el("uprof-overlay")) closeUserProfile();
+  });
+  // One capture-phase delegate for every chip in the app: it opens the profile
+  // and stops the click before an enclosing row handler (e.g. the activity
+  // feed's expand toggle) can also fire.
+  document.addEventListener("click", (ev) => {
+    const chip = ev.target.closest(".uchip");
+    if (!chip) return;
+    ev.stopPropagation();
+    openUserProfile(chip.dataset.user || "");
+  }, true);
+  // aria-modal must actually trap focus: keep Tab / Shift+Tab cycling within the
+  // dialog's focusable controls (the close button and the scrollable list), so
+  // focus can't slip onto the background content the dialog declares inert.
+  document.addEventListener("keydown", (ev) => {
+    if (el("uprof-overlay").hidden || ev.key !== "Tab") return;
+    const ring = [el("uprof-close"), el("uprof-recent")].filter((n) => n && n.offsetParent !== null);
+    if (!ring.length) return;
+    ev.preventDefault();
+    const i = ring.indexOf(document.activeElement);
+    ring[(i + (ev.shiftKey ? -1 : 1) + ring.length) % ring.length].focus();
+  });
+}
+
 const HOME_DRAFTS_SHOWN = 4;
 
 function renderHome() {
@@ -1826,15 +2007,17 @@ function renderHome() {
             `</div>`).join("") + `</div>`;
         return `<div class="home-act${open ? " open" : ""}" data-gk="${esc(k)}">` +
           `<span class="home-act-arrow">${open ? "&#9662;" : "&#9656;"}</span>` +
-          `<span class="home-who">${esc(g.actor)}</span> ` +
+          `${userChip(g.actor, { cls: "home-who" })} ` +
           `<span class="home-what">${esc(activityPhrase(g))}</span>` +
           `<span class="home-when">${esc(relTime(g.at))}</span></div>` + det;
       }).join("")
     : `<div class="empty">No activity recorded yet</div>`;
 
-  // everyone the feed has seen, newest first; your own name is always present
+  // everyone the feed has seen, newest first; your own name is always present.
+  // Seed under the same identity your writes are attributed with (see
+  // installActorHeader), so the self row matches the actor the feed records.
   if (users) {
-    const me = (state.settings.userName || "").trim();
+    const me = (authState.displayName || state.settings.userName || "").trim();
     const seen = new Map();
     for (const e of homeState.events) {
       const who = String(e.actor || "").trim() || "Unnamed user";
@@ -1848,8 +2031,7 @@ function renderHome() {
     const list = [...seen.entries()].sort((a, b) => b[1].last - a[1].last);
     users.innerHTML = list.length
       ? list.map(([who, m]) => `<div class="home-user">` +
-          `<span class="hu-name">${esc(who)}</span>` +
-          (who === me ? `<span class="hu-you">you</span>` : "") +
+          userChip(who, { cls: "hu-chip", you: isSelfName(who) }) +
           `<span class="hu-meta">${m.n
             ? `${m.n} ${m.n === 1 ? "change" : "changes"}`
             : "no changes yet"}</span>` +
@@ -4377,15 +4559,15 @@ function reviewItemHtml(r) {
     `<div class="ri-head">` +
       `<span class="ri-label">${esc(r.label) || "(unlabelled item)"}</span>` +
       `<span class="ri-meta">${resolved
-        ? `resolved by ${esc(r.resolved_by || "?")} &middot; ${esc(relIso(r.resolved_at))}`
-        : `${esc(r.created_by || "?")} &middot; ${esc(relIso(r.created_at))}`}</span>` +
+        ? `resolved by ${r.resolved_by ? userChip(r.resolved_by, { cls: "ri-who" }) : "?"} &middot; ${esc(relIso(r.resolved_at))}`
+        : `${r.created_by ? userChip(r.created_by, { cls: "ri-who" }) : "?"} &middot; ${esc(relIso(r.created_at))}`}</span>` +
       `<button class="cad-btn tiny" type="button" data-rv-resolve="${resolved ? "0" : "1"}" ` +
         `data-tip="${resolved ? "Reopen this item"
           : "Mark resolved (also clears the attention mark)"}">${resolved ? "Reopen" : "Resolve"}</button>` +
     `</div>` +
     (r.reason ? `<div class="ri-reason">${esc(r.reason)}</div>` : "") +
     (r.comments || []).map((c) => `<div class="ri-comment">` +
-      `<span class="ric-author">${esc(c.author || "?")}</span>` +
+      `${c.author ? userChip(c.author, { cls: "ric-chip" }) : `<span class="ric-author">?</span>`}` +
       `<span class="ric-when">${esc(relIso(c.ts))}</span>` +
       `<div class="ric-text">${esc(c.text)}</div></div>`).join("") +
     `<div class="ri-add">` +
@@ -14754,6 +14936,7 @@ function init() {
   boot("actor header", installActorHeader);   // before any write goes out
   boot("menu bar", initMenubar);
   boot("home", initHome);
+  boot("user profiles", initUserProfile);
   boot("account", initAuth);
   boot("setup wizard", initWizard);
   boot("title bar", fitTitleBar);   // after the menus exist: their width sets the clamp
@@ -15378,6 +15561,7 @@ function init() {
   document.addEventListener("keydown", (ev) => {
     if (ev.key !== "Escape") return;
     if (!el("auth-overlay").hidden) hideAuthOverlay();   // topmost (z 62)
+    else if (!el("uprof-overlay").hidden) closeUserProfile();
     else if (!el("wizard-overlay").hidden) {
       // Esc = set up later. Keep anything typed before recording completion.
       wizCommit().finally(() => closeWizard(true));

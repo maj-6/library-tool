@@ -1965,6 +1965,34 @@
     </div>
   </div>
 
+  <!-- CONTRIBUTOR PROFILE (opened by clicking any user chip) -->
+  <div id="uprof-overlay" class="overlay" hidden>
+    <div id="uprof-window" class="win win-sm" role="dialog" aria-modal="true"
+         aria-labelledby="uprof-name">
+      <div class="win-titlebar">
+        <span>Contributor</span>
+        <button id="uprof-close" class="win-close" type="button"
+                aria-label="Close" data-icon="close"></button>
+      </div>
+      <div id="uprof-body">
+        <div class="uprof-head">
+          <span id="uprof-avatar" class="uprof-avatar"></span>
+          <div class="uprof-idwrap">
+            <div class="uprof-nameline">
+              <span id="uprof-name" class="uprof-name"></span>
+              <span id="uprof-you" class="uprof-you" hidden>you</span>
+            </div>
+            <div id="uprof-email" class="uprof-email" hidden></div>
+            <div id="uprof-stats" class="uprof-stats"></div>
+          </div>
+        </div>
+        <div class="uprof-h" id="uprof-recent-h">Recent activity</div>
+        <div id="uprof-recent" class="uprof-recent" tabindex="0" role="region"
+             aria-labelledby="uprof-recent-h"></div>
+      </div>
+    </div>
+  </div>
+
   <!-- EMBEDDED WEB VIEW (links open here instead of a new tab) -->
   <div id="webview-overlay" class="overlay" hidden>
     <div id="webview-window" class="win webview-win">

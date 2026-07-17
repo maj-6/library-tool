@@ -726,7 +726,7 @@ body {
 .home-more:hover { color: var(--cyan); }
 .home-act {
   display: flex;
-  align-items: baseline;
+  align-items: center;   /* center so an inline user chip adds no row height */
   gap: 6px;
   padding: 3px 2px;
   font-size: 12px;
@@ -748,24 +748,15 @@ body {
 /* --- Home: contributors --- */
 .home-user {
   display: flex;
-  align-items: baseline;
+  align-items: center;   /* center so an inline user chip adds no row height */
   gap: 6px;
   padding: 3px 2px;
   font-size: 12px;
   border-bottom: 1px solid var(--canvas-line);
 }
 .home-user:last-child { border-bottom: 0; }
-.hu-name { font-weight: bold; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.hu-you {
-  flex: 0 0 auto;
-  color: var(--face-sh2);
-  font-size: 9px;
-  letter-spacing: 0.5px;
-  text-transform: uppercase;
-  border: 1px solid var(--face-sh);
-  border-radius: var(--radius);
-  padding: 0 3px;
-}
+/* .hu-name / .hu-you are now folded into the user chip (.uchip) rendered in
+   their place; the meta columns stay. */
 .hu-meta { flex: 1 1 auto; text-align: right; color: var(--face-sh2); font-size: 10.5px; white-space: nowrap; }
 .hu-when { flex: 0 0 auto; color: var(--face-sh2); font-size: 10.5px; white-space: nowrap; }
 
@@ -796,6 +787,107 @@ body {
 .ric-text { font-size: 11.5px; overflow-wrap: anywhere; }
 .ri-add { display: flex; gap: 6px; margin-top: 8px; }
 .ri-add .ri-comment-input { flex: 1 1 auto; min-width: 0; }
+
+/* --- contributor identity: micro-avatars + name chips ---
+   A chip is one clickable target: a tiny generated avatar + the name on a
+   faint wash of the user's colour. Sized in em with no vertical padding, so it
+   drops into any row that already shows a name without adding line height. */
+.uav {
+  width: 1.05em;
+  height: 1.05em;
+  flex: 0 0 auto;
+  vertical-align: -0.19em;   /* centre on text without lifting the line box */
+  border-radius: 3px;
+  pointer-events: none;      /* clicks fall through to the chip button */
+}
+.uav.uav-lg { width: 40px; height: 40px; border-radius: 9px; vertical-align: middle; }
+.uchip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.34em;
+  max-width: 100%;
+  min-width: 0;
+  padding: 0 0.42em 0 0.22em;
+  border: 0;
+  border-radius: 0.85em;
+  background: color-mix(in srgb, var(--uav-c) 12%, transparent);
+  color: inherit;
+  font: inherit;
+  line-height: 1.25;
+  text-align: left;
+  vertical-align: -0.28em;   /* sit inline (ri-meta, comments) without lifting the line */
+  cursor: pointer;
+}
+.uchip:hover { background: color-mix(in srgb, var(--uav-c) 22%, transparent); }
+.uchip:focus-visible { outline: 2px solid var(--uav-c); outline-offset: 1px; }
+.uchip .uav { vertical-align: middle; }
+.uchip-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+.uchip-you {
+  flex: 0 0 auto;
+  font-size: 0.78em;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--face-sh2);
+}
+/* per-context sizing: let the chip shrink, never let it crowd the row */
+.uchip.home-who { flex: 0 1 auto; max-width: 46%; }
+.uchip.hu-chip { flex: 0 1 auto; }
+/* review comments set no font-size on any ancestor, so the chip would inherit
+   the 13px body base; pin it to the 11px the old .ric-author label used */
+.uchip.ric-chip { font-size: 11px; }
+
+/* --- contributor profile popup --- */
+#uprof-overlay { z-index: 58; }   /* above home/review, below auth (62)/confirm (90) */
+#uprof-body { padding: var(--dlg-pad-y) var(--dlg-pad-x) var(--dlg-pad-x); }
+.uprof-head { display: flex; gap: 12px; align-items: center; }
+.uprof-avatar { flex: 0 0 auto; display: inline-flex; }
+.uprof-idwrap { min-width: 0; }
+.uprof-nameline { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.uprof-name { font-size: 16px; font-weight: 700; color: var(--ink); overflow-wrap: anywhere; }
+.uprof-you {
+  flex: 0 0 auto;
+  font-size: 9px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--face-sh2);
+  border: 1px solid var(--face-sh);
+  border-radius: var(--radius);
+  padding: 0 3px;
+}
+.uprof-email { margin-top: 2px; font-size: 12px; color: var(--face-sh2); font-family: var(--mono); overflow-wrap: anywhere; }
+.uprof-stats { margin-top: 4px; font-size: 12px; color: var(--face-sh2); }
+.uprof-h {
+  margin: 14px 0 6px;
+  padding-bottom: 3px;
+  font-size: 11px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--face-sh2);
+  border-bottom: 1px solid var(--canvas-line);
+}
+.uprof-recent { max-height: 240px; overflow: auto; }
+.uprof-recent:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; border-radius: var(--radius); }
+.uprof-ev {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 3px 0;
+  font-size: 12px;
+  border-bottom: 1px solid var(--canvas-line);
+}
+.uprof-ev:last-child { border-bottom: 0; }
+.uprof-ev-txt { flex: 1 1 auto; min-width: 0; color: var(--ink); overflow-wrap: anywhere; }
+.uprof-ev-when { flex: 0 0 auto; color: var(--face-sh2); font-size: 10.5px; white-space: nowrap; }
+
+/* settings account readout: quiet identity line */
+.set-acct-name { font-weight: 600; }
+.set-acct-email { color: var(--face-sh2); }
 
 /* --- Info tab: the console --- */
 #infotab { flex-direction: column; gap: 0; padding: 6px; }
