@@ -6311,7 +6311,7 @@ async function procRun() {
   if (action === "normalize") return procRunNormalize(table, keys);
   if (action === "deepseek") return procRunDeepseek(table, keys);
   if (action === "rescan") return procRunRescan(table, keys);
-  if (action === "smartscan") { status("SMART SCAN :: arrives in the next stage"); return; }
+  if (action === "smartscan") return procRunSmartScan(table, keys);
 }
 
 async function procRunNormalize(table, keys) {
@@ -6372,6 +6372,85 @@ function procRunRescan(table, keys) {
     if (row) { queueScan(String(id)); n++; }
   }
   status(`RESCAN :: queued ${n} book${n === 1 ? "" : "s"} for a fresh source scan`);
+}
+
+// Resolve a selected row to its PDF source (local path or remote URL) + target.
+function procPdfForRow(table, key) {
+  if (table === "whl") {
+    const r = whlRowByIdx(key);
+    if (r && !r.added && r.file && /^https?:\/\//i.test(r.file))
+      return { target: whlTarget(r), url: r.file, label: r.title || "" };
+    return null;
+  }
+  const row = state.rowsById.get(String(key));
+  if (!row) return null;
+  const b = row.book || {};
+  const target = rowTarget(row);
+  const lp = row.localPdf || b.localPdf || b.local_pdf;
+  if (lp) return { target, pdf: lp, label: b.title || "" };
+  const ident = (typeof iaIdentifierForRow === "function") ? iaIdentifierForRow(row) : null;
+  if (ident) {
+    if (typeof dlState === "function" && dlState(row) === "done")
+      return { target, pdf: "downloads/ia/" + ident + ".pdf", label: b.title || "" };
+    return { target, url: `https://archive.org/download/${ident}/${ident}.pdf`, label: b.title || "" };
+  }
+  return null;
+}
+
+// Smart Scan: one background job per selected row (download -> OCR -> extract);
+// each staged smartscan alternative appears in the diff as its job finishes.
+async function procRunSmartScan(table, keys) {
+  const refs = [];
+  for (const k of keys) { const ref = procPdfForRow(table, k); if (ref) refs.push(ref); }
+  if (!refs.length) { status("SMART SCAN :: none of the selected rows has a PDF source"); return; }
+  const skipped = keys.length - refs.length;
+  const ok0 = await confirmDialog({
+    title: "Smart Scan",
+    message: `Download & OCR ${refs.length} PDF${refs.length === 1 ? "" : "s"} and extract metadata?`,
+    detail: skipped ? `${skipped} selected row${skipped === 1 ? "" : "s"} without a PDF source will be skipped.` : "",
+    cost: `~${refs.length} download + OCR + AI pass${refs.length === 1 ? "" : "es"}`,
+    confirmLabel: "Run",
+  });
+  if (!ok0) return;
+  state.procActionBusy = true; renderProcBar();
+  const jobs = [];
+  for (const ref of refs) {
+    try {
+      const body = { target: ref.target, label: ref.label };
+      if (ref.pdf) body.pdf = ref.pdf; else body.url = ref.url;
+      const res = await fetch("/api/process/smartscan/run", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      });
+      const d = await res.json().catch(() => ({}));
+      if (res.ok && d.ok && d.job) jobs.push({ id: d.job.id, target: ref.target });
+      else statusErr("SMART SCAN :: " + (d.error || "could not start") + " — " + (ref.label || ref.target));
+    } catch (e) { /* keep launching the rest */ }
+  }
+  if (!jobs.length) { state.procActionBusy = false; renderProcBar(); return; }
+  procPollSmartScan(jobs);
+}
+
+function procPollSmartScan(jobs) {
+  const pending = new Set(jobs.map((j) => j.id));
+  const tick = async () => {
+    for (const j of jobs) {
+      if (!pending.has(j.id)) continue;
+      try {
+        const r = await (await fetch("/api/process/smartscan/job/" + j.id)).json();
+        if (/done|error|cancel/.test(String(r.status || r.state || ""))) {
+          pending.delete(j.id);
+          await loadStaged();
+          if (stagedFor(j.target)) state.procExpanded.add(j.target);
+          reRenderTop();
+        }
+      } catch (e) { pending.delete(j.id); }
+    }
+    status(`SMART SCAN :: ${jobs.length - pending.size}/${jobs.length} done`);
+    if (pending.size) { setTimeout(tick, 1600); return; }
+    state.procActionBusy = false; renderProcBar();
+    statusFlash(`SMART SCAN :: ${jobs.length} complete — review the staged results`);
+  };
+  setTimeout(tick, 1200);
 }
 
 // Mark Primary: apply an alt to the real record through the normal edit path,

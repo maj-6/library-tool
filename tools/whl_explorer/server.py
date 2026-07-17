@@ -1155,6 +1155,26 @@ def _staged_prune(doc):
         doc["entries"] = dict(keep)
 
 
+def _staged_add(target: str, kind: str, label: str, alt) -> None:
+    """Stage one alternative from server-side code (background producers such as
+    Smart Scan). Mirrors /api/staged/add's dedupe + per-entry cap."""
+    a = _clean_staged_alt(alt)
+    if not a:
+        return
+
+    def apply(doc):
+        e = _staged_entry(doc, target, kind=kind, label=label)
+        key = (a["source"], json.dumps(a["fields"], sort_keys=True))
+        if not any((x.get("source"), json.dumps(x.get("fields"), sort_keys=True)) == key
+                   for x in e["alts"]):
+            e["alts"].append(a)
+            if len(e["alts"]) > _STAGED_MAX_ALTS:
+                del e["alts"][:-_STAGED_MAX_ALTS]
+        e["updated_at"] = _staged_ts()
+        _staged_prune(doc)
+    _mutate_json(STAGED_PATH, _staged_lock, {"entries": {}}, apply)
+
+
 @app.route("/api/staged")
 def api_staged_list():
     doc = lib.load_json(STAGED_PATH, {"entries": {}})
@@ -1594,6 +1614,31 @@ def _resolve_local(raw: str) -> Path | None:
 
 
 _remote_pdf_lock = threading.Lock()
+_REMOTE_PDF_MAX_BYTES = 300 * 1024 * 1024   # size cap on a fetched remote PDF
+
+
+def _ssrf_guard(url: str) -> None:
+    """Refuse URLs whose host resolves to a private / loopback / link-local /
+    reserved address, so a client- or data-supplied PDF URL can't make the
+    sidecar fetch internal services (SSRF). Not DNS-rebinding-proof — adequate
+    for a localhost tool, and the gate before this runs on shared infra."""
+    import ipaddress
+    import socket
+    host = urllib.parse.urlparse(url).hostname or ""
+    if not host:
+        raise ValueError("no host in URL")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError as exc:
+        raise ValueError(f"cannot resolve host: {exc}")
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+            raise ValueError("blocked non-public address")
 
 
 def _remote_pdf_cache(url: str) -> Path:
@@ -1615,14 +1660,22 @@ def _remote_pdf_cache(url: str) -> Path:
     with _remote_pdf_lock:
         if p.exists():
             return p
+        _ssrf_guard(url)   # only on an actual fetch — cached hits skip the DNS lookup
         tmp = p.with_suffix(".fetch.tmp")
         try:
             req = urllib.request.Request(
                 url, headers={"User-Agent": whl_client.USER_AGENT})
             with urllib.request.urlopen(req, timeout=90) as resp, \
                     open(tmp, "wb") as fh:
-                import shutil
-                shutil.copyfileobj(resp, fh)
+                total = 0
+                while True:
+                    chunk = resp.read(1 << 16)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > _REMOTE_PDF_MAX_BYTES:
+                        raise ValueError("remote PDF exceeds the size cap")
+                    fh.write(chunk)
             with open(tmp, "rb") as fh:
                 if fh.read(5) != b"%PDF-":
                     raise ValueError("response is not a PDF")
@@ -5665,6 +5718,254 @@ def api_process_deepseek():
             if nv and nv != str(cur.get(k, "")).strip():
                 changed[k] = nv[:2000]
     return jsonify({"ok": True, "fields": changed})
+
+
+# --- Smart Scan (Process action) -------------------------------------------------
+# Reuses the smart-check engine: locate/download a book's own PDF, skip visually
+# blank front matter, OCR the first pages with Mistral until a title/imprint page
+# and a copyright page have both been seen, then extract fields with DeepSeek.
+# The result is staged as a "smartscan" alternative for review — the real record
+# is never touched here. Runs on a daemon thread against the unified job registry.
+_SS_SCAN_CAP = 15        # pages considered from the front (blanks included)
+_SS_OCR_CAP = 8          # pages actually sent to OCR
+_SS_WIDTH = 1400         # render width (the OCR queue's default)
+_SS_JOBS_KEEP = 20
+
+# extraction vocabulary (capture.FIELDS) -> each record store's field names
+_SS_FIELD_MAPS = {
+    "whl": {"title": "title", "subtitle": "subtitle", "author": "authors",
+            "year": "year", "publisher": "publisher", "language": "language"},
+    "build": {"title": "title", "subtitle": "subtitle", "author": "authors",
+              "year": "year", "publisher": "publisher", "city": "publisher_city",
+              "edition": "edition", "volume": "volume", "language": "language"},
+    "checked": {f: f for f in ("title", "subtitle", "author", "publisher",
+                               "city", "year", "edition", "volume", "language")},
+}
+_SS_FIELD_MAPS["manual"] = _SS_FIELD_MAPS["checked"]
+
+# derived (not copied) from the capture prompt so the JSON field contract can't
+# drift; a no-op replace still leaves a valid prompt.
+_SS_PROMPT = capture._EXTRACT_PROMPT.replace(
+    "OCR text from photos of a book's title page and/or copyright page",
+    "OCR text from the first pages of a digitized copy of a book "
+    "(cover, title page, copyright page, other front matter)")
+
+_SS_COPYRIGHT_RE = re.compile(
+    r"copyright|©|all rights reserved|printed in|first published"
+    r"|impression|printing|entered according to act", re.I)
+_SS_YEAR_RE = re.compile(r"\b(1[4-9]\d{2}|20\d{2})\b")
+_SS_IMPRINT_RE = re.compile(
+    r"publish|press\b|verlag|editore|editions?\b|librair|imprim"
+    r"|printed for|book (?:co|company)|& ?co\b|and company|sons\b|brothers\b", re.I)
+
+_ss_jobs: dict = {}
+_ss_jobs_lock = threading.Lock()
+_ss_start_lock = threading.Lock()
+
+
+def _ss_target_kind(target) -> str:
+    kind = str(target or "").partition(":")[0]
+    return kind if kind in _SS_FIELD_MAPS else ""
+
+
+def _ss_scan_pages(pdf: Path) -> list[int]:
+    """1-based front-matter candidates: the first _SS_SCAN_CAP pages minus
+    visually blank ones (ink + text-layer test), so OCR isn't spent on versos."""
+    import fitz
+    pages = []
+    doc = fitz.open(str(pdf))
+    try:
+        for i in range(min(doc.page_count, _SS_SCAN_CAP)):
+            pg = doc[i]
+            zoom = 160 / max(1.0, pg.rect.width)
+            pix = pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace="gray")
+            samples = pix.samples
+            inked = sum(1 for v in samples if v < 200)
+            if inked / max(1, len(samples)) >= 0.003 or (pg.get_text() or "").strip():
+                pages.append(i + 1)
+    finally:
+        doc.close()
+    return pages
+
+
+def _ss_ocr_page(pdf: Path, page: int, key: str) -> str:
+    png = _ocr_page_png(pdf, page, _SS_WIDTH)
+    pages = capture.mistral_ocr_pages(png, key)
+    return "\n\n".join(p.get("markdown", "") for p in pages).strip()
+
+
+def _ss_extract(ocr_text: str) -> tuple[dict, str]:
+    """OCR text -> extracted bibliographic dict + the model name. DeepSeek when a
+    Settings > AI key is set (the phone app's default), else Mistral extraction."""
+    cfg = _ai_cfg()
+    if cfg["key"]:
+        obj = _ai_json(cfg, [{"role": "user", "content": _SS_PROMPT + ocr_text[:12000]}],
+                       temperature=0.0)
+        return (obj if isinstance(obj, dict) else {}), cfg["model"]
+    mkey = str(_client_settings().get("mistralKey") or "").strip()
+    if not mkey:
+        raise RuntimeError("no AI key and no Mistral key — set one in "
+                           "Settings > AI or Settings > OCR")
+    return capture.extract_bibliography(ocr_text, mkey), capture.EXTRACT_MODEL
+
+
+def _ss_map_fields(kind: str, fields: dict) -> dict:
+    """Extraction vocabulary -> the target store's names; blanks never map (a
+    scan may fill or correct a field, never erase one)."""
+    out = {}
+    for src, dst in _SS_FIELD_MAPS.get(kind, {}).items():
+        v = str(fields.get(src) or "").strip()
+        if v:
+            out[dst] = v
+    return out
+
+
+def _ss_job_new(target: str, label: str) -> dict:
+    job = {"id": lib.gen_id(set(_ss_jobs) | set(_jobs)), "target": target,
+           "kind": "smartscan", "done": 0, "total": 0, "errors": 0,
+           "status": "running", "error": "", "note": ""}
+    with _ss_jobs_lock:
+        _ss_jobs[job["id"]] = job
+    _job_track(job, "smartscan", label=label)
+    return job
+
+
+def _ss_job_start(target: str, label: str, run) -> dict:
+    job = _ss_job_new(target, label)
+    threading.Thread(target=run, args=(job,), daemon=True).start()
+    return job
+
+
+def _ss_finish(job: dict, error: str = "") -> None:
+    with _ss_jobs_lock:
+        job["error"] = error
+        status = "error" if error else ("done (with errors)" if job["errors"] else "done")
+    _job_transition(job, status)
+    with _ss_jobs_lock:
+        done = sorted((j for j in _ss_jobs.values() if j.get("state") not in _JOB_ACTIVE),
+                      key=lambda j: str(j.get("finished_at") or ""), reverse=True)
+        for old in done[_SS_JOBS_KEEP:]:
+            _ss_jobs.pop(str(old.get("id")), None)
+
+
+def _ss_run(job: dict, spec: dict) -> None:
+    target = spec["target"]
+    kind = _ss_target_kind(target)
+    try:
+        mkey = str(_client_settings().get("mistralKey") or "").strip()
+        if not mkey:
+            raise RuntimeError("Mistral API key not configured (Settings > OCR)")
+        pdf = spec.get("pdf_path")
+        if pdf is None:
+            with _ss_jobs_lock:
+                job["note"] = "downloading PDF"
+            _job_checkpoint(job, force=True)
+            pdf = _remote_pdf_cache(spec["url"])   # ValueError on SSRF / size / non-PDF
+            with _ss_jobs_lock:
+                job["note"] = ""
+        pdf = Path(pdf)
+        candidates = _ss_scan_pages(pdf)
+        if not candidates:
+            raise RuntimeError(f"no readable pages in the first {_SS_SCAN_CAP} pages")
+        planned = candidates[:_SS_OCR_CAP]
+        with _ss_jobs_lock:
+            job["total"] = len(planned) + 1        # +1 = the extraction step
+        texts: dict[int, str] = {}
+        titleish = copyrightish = False
+        for i, n in enumerate(planned):
+            if _an_cancel_check(job, "cancelled — nothing was written"):
+                return
+            try:
+                text = _ss_ocr_page(pdf, n, mkey)
+            except Exception as exc:
+                text = ""
+                with _ss_jobs_lock:
+                    job["errors"] += 1
+                    job["note"] = f"page {n}: {type(exc).__name__}"
+            if text:
+                texts[n] = text
+                titleish = titleish or bool(_SS_YEAR_RE.search(text) or _SS_IMPRINT_RE.search(text))
+                copyrightish = copyrightish or bool(_SS_COPYRIGHT_RE.search(text))
+            with _ss_jobs_lock:
+                job["done"] = i + 1
+            _job_checkpoint(job)
+            # both signals in hand: stop. Also cap the copyright hunt for books
+            # that never print "copyright" (pre-1900 / non-English) so we don't
+            # burn all _SS_OCR_CAP pages chasing a signal that never fires.
+            if titleish and copyrightish and len(texts) >= 2:
+                break
+            if titleish and len(texts) >= 4:
+                break
+        ocr_text = "\n\n".join(f"--- page {n} ---\n{texts[n]}" for n in sorted(texts))
+        if not ocr_text.strip():
+            raise RuntimeError("OCR produced no text from the front matter")
+        if _an_cancel_check(job, "cancelled — nothing was written"):
+            return
+        got, model = _ss_extract(ocr_text)
+        got = got if isinstance(got, dict) else {}
+        got.pop("extra", None)
+        mapped = _ss_map_fields(kind, got)
+        # an all-blank extraction must fail, not stage a "nothing changed" record
+        if not mapped:
+            raise RuntimeError("extraction returned no usable fields — retry")
+        if _an_cancel_check(job, "cancelled — nothing was written"):
+            return
+        _staged_add(target, kind, str(spec.get("label") or ""),
+                    {"source": "smartscan", "fields": mapped,
+                     "note": f"pages {sorted(texts)} · {model}"})
+        with _ss_jobs_lock:
+            job["done"] = job["total"]
+        activity("smart-scanned", "Book metadata", detail=str(spec.get("label") or target))
+        _ss_finish(job)
+    except Exception as exc:
+        log.error("smart scan failed for %s", target, exc_info=exc)
+        _ss_finish(job, f"{type(exc).__name__}: {exc}")
+
+
+@app.route("/api/process/smartscan/run", methods=["POST"])
+def api_process_smartscan_run():
+    """Start a Smart Scan for one record. Body: {target, pdf?|url?, label?}.
+    Returns the job to poll; a duplicate while one is running joins it."""
+    p = request.get_json(silent=True) or {}
+    target = str(p.get("target") or "").strip()
+    kind = _ss_target_kind(target)
+    if not kind or ":" not in target:
+        return jsonify({"ok": False, "error": "bad target"}), 400
+    label = str(p.get("label") or "").strip()[:120]
+    raw_pdf = str(p.get("pdf") or "").strip()
+    url = str(p.get("url") or "").strip()
+    spec = {"target": target, "label": label, "pdf_path": None, "url": url}
+    if raw_pdf:
+        lp = _resolve_local(raw_pdf)
+        if lp is None or lp.suffix.lower() != ".pdf" or not lp.is_file():
+            return jsonify({"ok": False, "error": "PDF not found"}), 404
+        spec["pdf_path"] = lp
+    elif url:
+        if not url.lower().startswith(("http://", "https://")):
+            return jsonify({"ok": False, "error": "not an http(s) URL"}), 400
+    else:
+        return jsonify({"ok": False, "error": "pdf or url required"}), 400
+    with _ss_start_lock:
+        with _jobs_lock:
+            for j in _jobs.values():
+                if (j.get("kind") == "smartscan" and j.get("target") == target
+                        and j.get("state") in _JOB_ACTIVE):
+                    return jsonify({"ok": True, "already": True, "job": _job_public(j)})
+        job = _ss_job_start(target, label, lambda jb: _ss_run(jb, spec))
+    return jsonify({"ok": True, "job": dict(job)})
+
+
+@app.route("/api/process/smartscan/job/<job_id>")
+def api_process_smartscan_job(job_id: str):
+    with _ss_jobs_lock:
+        job = _ss_jobs.get(job_id)
+        if job is not None:
+            return jsonify(dict(job))
+    with _jobs_lock:
+        gone = _jobs.get(job_id)
+    if gone is None:
+        abort(404)
+    return jsonify(_job_public(gone))
 
 
 _PAGE_MARK = re.compile(r"^--- page (\d+) ---$", re.M)
