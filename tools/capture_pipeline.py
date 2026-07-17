@@ -228,25 +228,21 @@ OCR TEXT:
 """
 
 
-def extract_bibliography(ocr_text: str, api_key: str, timeout: float = 60.0) -> dict:
-    """OCR text -> {fields..., extra:{}} via a structured Mistral chat call."""
-    empty = {k: "" for k in FIELDS}
+def empty_bibliography() -> dict:
+    empty: dict = {k: "" for k in FIELDS}
     empty["extra"] = {}
-    text = str(ocr_text or "").strip()
-    if not text:
-        return empty
-    data = _mistral_post(MISTRAL_CHAT_URL, {
-        "model": EXTRACT_MODEL,
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-        "messages": [{"role": "user", "content": _EXTRACT_PROMPT + text[:12000]}],
-    }, api_key, timeout)
-    raw = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-    raw = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.M).strip()
-    try:
-        obj = json.loads(raw)
-    except json.JSONDecodeError:
-        return empty
+    return empty
+
+
+def normalize_bibliography(obj) -> dict:
+    """Coerce a model's JSON reply to the strict {fields..., extra:{}} shape.
+
+    Shared by every extraction path (Mistral here, DeepSeek in the explorer's
+    smart check) so a record looks the same regardless of which model wrote it.
+    Anything that isn't a dict normalizes to the empty record.
+    """
+    if not isinstance(obj, dict):
+        return empty_bibliography()
     out = {k: str(obj.get(k) or "").strip() for k in FIELDS}
     extra = obj.get("extra")
 
@@ -262,6 +258,26 @@ def extract_bibliography(ocr_text: str, api_key: str, timeout: float = 60.0) -> 
     out["extra"] = ({str(k): _flat(v) for k, v in extra.items() if _keep(v)}
                     if isinstance(extra, dict) else {})
     return out
+
+
+def extract_bibliography(ocr_text: str, api_key: str, timeout: float = 60.0) -> dict:
+    """OCR text -> {fields..., extra:{}} via a structured Mistral chat call."""
+    text = str(ocr_text or "").strip()
+    if not text:
+        return empty_bibliography()
+    data = _mistral_post(MISTRAL_CHAT_URL, {
+        "model": EXTRACT_MODEL,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [{"role": "user", "content": _EXTRACT_PROMPT + text[:12000]}],
+    }, api_key, timeout)
+    raw = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    raw = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.M).strip()
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return empty_bibliography()
+    return normalize_bibliography(obj)
 
 
 # --- the whole chain ---------------------------------------------------------------

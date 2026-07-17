@@ -1475,6 +1475,40 @@ form.orig-view .cad-input {
   color: #6d675b;
 }
 
+/* --- smart check: provisional metadata overlay --- */
+/* Extracted-but-unbaked values: light yellow with a dotted black border.
+   outline (not border) so column widths never shift. */
+td.sc-prov,
+.cad-input.sc-prov {
+  background: #fff3b8 !important;
+  color: #2b2417;
+  outline: 1px dotted #1a1a1a;
+  outline-offset: -2px;
+}
+/* the wand: an under-styled inline trigger, not a big button.
+   State colours follow the badge convention — amber = in progress,
+   cyan = results waiting, green = verified match. */
+.sc-wand {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+  margin-left: 4px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--face-sh2);
+  cursor: pointer;
+  line-height: 1;
+}
+.sc-wand svg { width: 12px; height: 12px; }
+.sc-wand:hover { color: var(--cyan); }
+.sc-wand.sc-running { color: var(--amber); }
+.sc-wand.sc-ready { color: var(--cyan); }
+.sc-wand.sc-match { color: var(--green); }
+/* in a table cell the wand keeps to the right edge of the title */
+td .sc-wand { float: right; }
+.sc-form-wand svg { width: 13px; height: 13px; }
+
 /* --- generic window chrome (shared by every overlay window) --- */
 .overlay {
   position: fixed;
