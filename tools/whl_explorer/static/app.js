@@ -6782,18 +6782,46 @@ async function procMarkPrimary(target, altId) {
     applied = await applyEditPatch(row, fields);
   }
   if (!applied) { statusErr("MARK PRIMARY FAILED"); return; }
-  try {
-    const res = await fetch("/api/staged/swap", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ target, altId,
-        displaced: { source: "superseded", label: e.label || "", fields: displaced,
-          note: `was ${PROC_SRC_NAME[alt.source] || alt.source || "alternative"}` } }),
-    });
-    const d = await res.json().catch(() => ({}));
-    if (d && Object.prototype.hasOwnProperty.call(d, "entry")) {
-      if (d.entry) state.stagedAlts[target] = d.entry; else delete state.stagedAlts[target];
-    }
-  } catch (err) { /* store swap best-effort; field change already applied */ }
+  // Swap the store: the applied alt leaves, the displaced original is re-filed
+  // as "superseded". Both alts keep stable ids so the history wrap below can
+  // swap back and forth (undo re-files the applied alt under its own source).
+  const appliedAlt = { id: alt.id, source: alt.source, label: e.label || "",
+    fields, note: alt.note || "" };
+  const displacedAlt = { id: (alt.id || "alt").slice(0, 34) + "~prev",
+    source: "superseded", label: e.label || "", fields: displaced,
+    note: `was ${PROC_SRC_NAME[alt.source] || alt.source || "alternative"}` };
+  const storeSwap = async (removeId, refile) => {
+    try {
+      const res = await fetch("/api/staged/swap", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ target, altId: removeId, displaced: refile }),
+      });
+      const d = await res.json().catch(() => ({}));
+      if (d && Object.prototype.hasOwnProperty.call(d, "entry")) {
+        if (d.entry) state.stagedAlts[target] = d.entry; else delete state.stagedAlts[target];
+      }
+    } catch (err) { /* store swap best-effort; the field change is what's undoable */ }
+  };
+  await storeSwap(altId, displacedAlt);
+  // Fold the store swap into the field change's undo op (the apply above just
+  // pushed it) so one Ctrl+Z reverts BOTH — the commitEdit set-declaration
+  // pattern. Undo restores the alt as pending; redo re-supersedes it.
+  const top = history.stack[history.ptr - 1];
+  if (top) {
+    const baseUndo = top.undoFn, baseRedo = top.redoFn;
+    top.undoFn = async () => {
+      const r = await baseUndo();
+      await storeSwap(displacedAlt.id, appliedAlt);
+      reRenderTop();
+      return r;
+    };
+    top.redoFn = async () => {
+      const r = await baseRedo();
+      await storeSwap(appliedAlt.id, displacedAlt);
+      reRenderTop();
+      return r;
+    };
+  }
   reRenderTop();
   statusFlash("MARKED PRIMARY :: swapped in");
 }

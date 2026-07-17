@@ -1267,8 +1267,11 @@ def api_staged_add():
 def api_staged_swap():
     """Mark Primary: the client has already applied alt <altId> to the real
     record through the normal edit endpoints. Here we remove that alt and, if a
-    ``displaced`` field-set is supplied, re-file it as a "superseded" alt so the
-    swap is reversible. Body: {target, altId, displaced?:{label?,fields,note?}}."""
+    ``displaced`` field-set is supplied, re-file it so the swap is reversible.
+    Body: {target, altId, displaced?:{id?,source?,label?,fields,note?}} —
+    displaced.source defaults to "superseded"; a valid source passes through so
+    Ctrl+Z can re-file the un-applied alt under its original source, and a
+    supplied id is kept so undo/redo address stable alt ids across swaps."""
     p = request.get_json(silent=True) or {}
     target = str(p.get("target") or "").strip()
     alt_id = str(p.get("altId") or "").strip()
@@ -1278,7 +1281,8 @@ def api_staged_swap():
     disp_alt = None
     if isinstance(displaced, dict):
         d = dict(displaced)
-        d["source"] = "superseded"
+        if str(d.get("source") or "") not in _STAGED_SOURCES:
+            d["source"] = "superseded"
         disp_alt = _clean_staged_alt(d)
 
     def apply(doc):
