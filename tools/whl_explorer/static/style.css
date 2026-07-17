@@ -571,6 +571,18 @@ body {
   height: calc(100vh / var(--ui-scale, 1));
 }
 
+/* --- text-selection policy ---------------------------------------------------
+   UI text is not selectable by click-drag. To copy a table field the user
+   hovers it and presses Ctrl+C (onFieldCopyKey); Ctrl+V pastes the same way.
+   Editable fields and the OCR / facsimile transcription panes keep native
+   selection so scanned/transcribed text can still be selected and copied. */
+body { user-select: none; -webkit-user-select: none; }
+input, textarea, [contenteditable="true"], .cell-edit,
+.an-fac-page-text, .an-facsimile-page-text, .ocr-pglayout.doctext {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
 /* --- Home tab --- */
 #home { overflow: auto; padding: 22px 18px; }
 /* the page is one framed sheet on the panel face; wide enough that titles,
@@ -1241,6 +1253,17 @@ body .cad-btn.quiet:active {
   outline: none;
 }
 .cell-edit:focus { border-color: var(--cyan); box-shadow: inset 0 0 0 1px var(--cyan); }
+
+/* Ctrl+C / Ctrl+V field copy: a brief ring flash on the affected cell —
+   cyan for a copy, green for a paste (see flashCell). */
+.grid tbody td.cell-copied { --cell-flash: var(--cyan); }
+.grid tbody td.cell-pasted { --cell-flash: var(--green); }
+.grid tbody td.cell-copied,
+.grid tbody td.cell-pasted { animation: cell-flash 0.55s ease-out; }
+@keyframes cell-flash {
+  0%, 60% { box-shadow: inset 0 0 0 2px var(--cell-flash); }
+  100%    { box-shadow: inset 0 0 0 0 transparent; }
+}
 .col-whl, .col-act { text-align: center; overflow: visible; max-width: none; }
 .grid td.col-whl, .grid th.col-whl { padding-left: 2px; padding-right: 2px; }
 /* narrow (tag/action) column headers stay centred over their tags */
@@ -2746,6 +2769,14 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 .foot-tag.tag-edit { color: var(--cyan); }
 .foot-tag.tag-search { color: var(--amber); }
 .foot-tag.tag-verified { color: var(--green); font-weight: bold; }
+
+/* Footer note flash: the status line briefly glows green when a field is
+   copied or pasted, so the copy registers even without watching the cell. */
+#status-msg.copy-flash { animation: status-copy-flash 0.9s ease-out; }
+@keyframes status-copy-flash {
+  0%, 70% { color: var(--green); text-shadow: 0 0 6px var(--green); }
+  100%    { color: inherit; text-shadow: none; }
+}
 
 /* --- Workbench shell (#133 stage 1): shared split, phase rail, phases --- */
 #wb-split {

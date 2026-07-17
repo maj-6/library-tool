@@ -5190,6 +5190,149 @@ function onRowDeleteKey(ev) {
   else uncheckRow(row.id);
 }
 
+// --- Ctrl+C / Ctrl+V field copy & paste ----------------------------------------
+// UI text isn't selectable by click-drag (see the user-select policy in
+// style.css). Instead you hover a table cell and press Ctrl+C to copy that one
+// field, or Ctrl+V to paste into it (Edit mode). A real text selection inside an
+// editable field or the OCR/facsimile panes still copies/pastes the native way.
+
+// The table cell currently under the mouse, across every catalog table.
+function hoveredCell() {
+  return document.querySelector(
+    "#checked-rows td:hover, #whltop-rows td:hover, " +
+    "#upload-rows td:hover, #bottom-rows td:hover");
+}
+
+// The field name a cell edits (data-edit for checked/manual, data-wedit for
+// WHL), or "" in search/process mode where cells aren't tagged for editing.
+function cellFieldName(td) {
+  return td.dataset.edit || td.dataset.wedit || "";
+}
+
+// The value to copy: prefer the row model's clean value when the field is known,
+// else the cell's visible text with decorative glyphs (wands, arrows, icons)
+// stripped so a copied title never carries the smart-scan wand or a set arrow.
+function cellCopyValue(td) {
+  const tr = td.closest("tr");
+  if (td.dataset.wedit && tr && tr.dataset.widx != null) {
+    const row = whlRowByIdx(parseInt(tr.dataset.widx, 10));
+    if (row && row[td.dataset.wedit] != null) return String(row[td.dataset.wedit]);
+  }
+  if (td.dataset.edit && tr && tr.dataset.rowId) {
+    const row = state.rowsById.get(String(tr.dataset.rowId));
+    if (row && row.book && row.book[td.dataset.edit] != null) return String(row.book[td.dataset.edit]);
+  }
+  const clone = td.cloneNode(true);
+  clone.querySelectorAll(".sc-wand, .set-arrow, .icon-label, [data-icon], svg, button, .cell-edit")
+    .forEach((n) => n.remove());
+  return clone.textContent.replace(/\s+/g, " ").trim();
+}
+
+// Trim a value for the one-line footer note.
+function clipNote(v) {
+  v = String(v);
+  return v.length > 60 ? v.slice(0, 57) + "…" : v;
+}
+
+// Copy text to the clipboard (async API, with an execCommand fallback).
+function copyText(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(text);
+  } catch (e) { /* fall through */ }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.cssText = "position:fixed;top:0;left:0;opacity:0";
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  try { document.execCommand("copy"); } catch (e) { /* ignore */ }
+  ta.remove();
+  return Promise.resolve();
+}
+
+// Restart-safe flash: re-trigger the CSS animation even on a repeated copy.
+function flashCell(td, cls) {
+  td.classList.remove(cls);
+  void td.offsetWidth;
+  td.classList.add(cls);
+  setTimeout(() => td.classList.remove(cls), 650);
+}
+
+// Set the footer note and make it glow briefly, so a copy/paste registers.
+let _copyFlashTimer = null;
+function statusFlash(msg) {
+  status(msg);
+  const n = el("status-msg");
+  n.classList.remove("copy-flash");
+  void n.offsetWidth;
+  n.classList.add("copy-flash");
+  clearTimeout(_copyFlashTimer);
+  _copyFlashTimer = setTimeout(() => n.classList.remove("copy-flash"), 1000);
+}
+
+function onFieldCopyKey(ev) {
+  if (ev.key !== "c" && ev.key !== "C") return;
+  if (!(ev.ctrlKey || ev.metaKey) || ev.altKey) return;
+  const t = ev.target;
+  if (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable)) return; // native copy
+  const sel = window.getSelection && window.getSelection();
+  if (sel && String(sel).length) return;   // a real selection (e.g. an OCR pane) — native copy
+  const td = hoveredCell();
+  if (!td) return;
+  const val = cellCopyValue(td);
+  ev.preventDefault();
+  copyText(val);
+  flashCell(td, "cell-copied");
+  const f = cellFieldName(td);
+  statusFlash(f ? `COPIED ${f.toUpperCase()}: ${clipNote(val)}` : `COPIED: ${clipNote(val)}`);
+}
+
+// Write a pasted value into a hovered editable cell through the same persisted,
+// undoable path the inline editor uses. Returns true on a real change.
+async function pasteIntoCell(td, field, text) {
+  const tr = td.closest("tr");
+  if (td.dataset.wedit) {
+    const idx = parseInt(tr.dataset.widx, 10);
+    const row = whlRowByIdx(idx);
+    if (!row) return false;
+    if (text === String(row[field] || "").trim()) return false;
+    const before = whlFieldSnaps(row, [field]);
+    if (await whlPost({ idx, fields: { [field]: text } })) {
+      pushWhlFieldsOp(`paste WHL ${field} of ${row.title.slice(0, 28)}`, idx, before, { [field]: text });
+      return true;
+    }
+    statusErr("WHL PASTE FAILED");
+    return false;
+  }
+  if (field === "categories") { statusErr("PASTE: categories edit through the picker"); return false; }
+  const row = state.rowsById.get(String(tr.dataset.rowId));
+  if (!row) return false;
+  if (text === String(row.book[field] || "").trim()) return false;
+  // title/volume carry the volume-designator magic, so route those through commitEdit
+  if (field === "title" || field === "volume") { await commitEdit(row, field, text); return true; }
+  return await applyEditPatch(row, { [field]: text });
+}
+
+async function onFieldPasteKey(ev) {
+  if (ev.key !== "v" && ev.key !== "V") return;
+  if (!(ev.ctrlKey || ev.metaKey) || ev.altKey) return;
+  const t = ev.target;
+  if (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable)) return; // native paste
+  const td = hoveredCell();
+  if (!td) return;
+  const field = cellFieldName(td);
+  if (!field) { ev.preventDefault(); statusErr("PASTE: hover an editable field (Edit mode)"); return; }
+  ev.preventDefault();
+  let text = "";
+  try { text = await navigator.clipboard.readText(); } catch (e) { text = ""; }
+  text = String(text || "").replace(/\s+/g, " ").trim();
+  if (!text) { statusErr("PASTE: clipboard empty or unavailable"); return; }
+  if (await pasteIntoCell(td, field, text)) {
+    flashCell(td, "cell-pasted");
+    statusFlash(`PASTED ${field.toUpperCase()}: ${clipNote(text)}`);
+  }
+}
+
 // --- click-to-edit cells --------------------------------------------------------
 
 function startEdit(td) {
@@ -15315,6 +15458,8 @@ function init() {
   document.addEventListener("keydown", onSearchKey);
   document.addEventListener("keydown", onRowDeleteKey);
   document.addEventListener("keydown", onUiScaleKey);
+  document.addEventListener("keydown", onFieldCopyKey);
+  document.addEventListener("keydown", onFieldPasteKey);
   boot("attention popover", initAttnPop);
   boot("review queue", initReviewWin);
   boot("categories", initCategories);
