@@ -941,14 +941,32 @@
                       data-icon="export" data-tip="Publish to the Library Tool cloud — uploads the PDF and lists the volume on the website"></button>
             </div>
             <p id="wb-publish-locked" class="empty" hidden></p>
-            <div class="an-pane active" id="an-bundle">
-              <p class="pane-note">What publishes with this book beyond the PDF.
-                Everything unchecked — and the relevance assessment, always —
-                stays on this machine. Applied on the next publish.</p>
-              <div id="an-bundle-opts"></div>
-              <div class="mf-actions">
-                <button id="an-bundle-save" class="cad-btn tiny" type="button">Save bundle</button>
-                <span class="tool-label" id="an-bundle-msg"></span>
+            <div id="wb-publish-cards" hidden>
+              <div class="an-pane active wb-pub-card" id="an-bundle">
+                <div class="pane-bar"><span class="tool-label">Archive entry</span></div>
+                <p class="pane-note">What publishes with this book beyond the PDF.
+                  Everything unchecked — and the relevance assessment, always —
+                  stays on this machine. Applied on the next publish.</p>
+                <div id="an-bundle-opts"></div>
+                <div class="mf-actions">
+                  <button id="an-bundle-save" class="cad-btn tiny" type="button">Save bundle</button>
+                  <span class="tool-label" id="an-bundle-msg"></span>
+                </div>
+              </div>
+              <!-- SEARCH INDEX: versioned, independent of the archive entry
+                   (#140) — corrected text re-indexes without republishing -->
+              <div class="an-pane active wb-pub-card" id="an-index">
+                <div class="pane-bar">
+                  <span class="tool-label">Search index</span>
+                  <span id="an-index-state" class="tool-label"></span>
+                  <span class="bar-spacer"></span>
+                  <button id="an-index-publish" class="cad-btn tiny" type="button"
+                          data-tip="Segment (if needed), embed when a provider is configured, and publish a new index version">Build &amp; publish index</button>
+                  <button id="an-index-rollback" class="cad-btn tiny danger" type="button" hidden
+                          data-tip="Remove the newest index version — the previous one becomes current">Roll back</button>
+                </div>
+                <p class="pane-note" id="an-index-note"></p>
+                <div id="an-index-versions"></div>
               </div>
             </div>
           </div>
@@ -1020,6 +1038,7 @@
               <button class="pane-tab" data-antab="an-cats" type="button">Categories</button>
               <button class="pane-tab" data-antab="an-trans" type="button">Translations</button>
               <button class="pane-tab" data-antab="an-notes" type="button">Annotations</button>
+              <button class="pane-tab" data-antab="an-passages" type="button">Passages</button>
               <button class="pane-tab" data-antab="an-rel" type="button">Relevance</button>
             </div>
 
@@ -1083,6 +1102,31 @@
                 <span class="tool-label" id="an-notes-count"></span>
               </div>
               <div id="an-notes-list" class="drafting"></div>
+            </div>
+
+            <div class="an-pane" id="an-passages">
+              <div class="pane-bar">
+                <span class="tool-label">Passages</span>
+                <span id="an-psg-count" class="tool-count"></span>
+                <span id="an-psg-recipe" class="tool-label"></span>
+                <span class="bar-spacer"></span>
+                <span id="an-psg-msg" class="tool-label"></span>
+                <button id="an-psg-generate" class="cad-btn tiny" type="button"
+                        data-tip="Split the OCR text into search passages — structure first, token bounds second; sentences never break">Generate</button>
+              </div>
+              <p id="an-psg-stale" class="an-stale-note" hidden>Text changed
+                since these passages were generated &mdash; regenerate
+                (publishing the index also re-segments).</p>
+              <div class="drafting" id="an-psg-wrap">
+                <table class="grid" id="an-psg-table">
+                  <thead><tr><th>Pages</th><th>Opening words</th><th>~Tokens</th><th></th></tr></thead>
+                  <tbody id="an-psg-rows"></tbody>
+                </table>
+                <p id="an-psg-empty" class="empty">No passages yet &mdash;
+                  generate them from the OCR text.</p>
+                <p id="an-psg-more" class="pane-note" hidden></p>
+              </div>
+              <pre id="an-psg-view" class="an-text" hidden></pre>
             </div>
 
             <div class="an-pane" id="an-rel">
@@ -1507,6 +1551,14 @@
               <label class="tool-label" for="set-ai-timeout">Request timeout (seconds)</label>
               <input id="set-ai-timeout" class="cad-input" type="number" min="10" max="1200" step="10"
                      data-tip="How long an Analyze request may run before it is abandoned. Raise it for big summaries on slow or self-hosted endpoints." />
+              <label class="tool-label" for="set-embed-base">Embeddings API base URL</label>
+              <input id="set-embed-base" class="cad-input" spellcheck="false"
+                     placeholder="https://api.openai.com/v1"
+                     data-tip="Any OpenAI-compatible /embeddings endpoint. Used only when a search index publishes; blank keeps indexes lexical-only." />
+              <label class="tool-label" for="set-embed-model">Embeddings model</label>
+              <input id="set-embed-model" class="cad-input" spellcheck="false"
+                     placeholder="text-embedding-3-small"
+                     data-tip="Recorded on each index version, so the provider can change without breaking older versions. The key lives under Credentials." />
             </div>
           </div>
           <div id="sec-ocr" class="settings-sec">
@@ -1670,6 +1722,9 @@
             <div class="settings-rows">
               <label class="tool-label" for="set-ai-key">DeepSeek / AI provider API key</label>
               <input id="set-ai-key" class="cad-input" type="password" spellcheck="false" />
+              <label class="tool-label" for="set-embed-key">Embeddings provider API key</label>
+              <input id="set-embed-key" class="cad-input" type="password" spellcheck="false"
+                     data-tip="Optional — self-hosted embeddings endpoints work without one" />
             </div>
             <div class="settings-subhead" style="margin-top:16px">OCR</div>
             <div class="settings-rows">

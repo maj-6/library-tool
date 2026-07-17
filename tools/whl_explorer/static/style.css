@@ -3879,6 +3879,45 @@ button.publish-tree-label { cursor: pointer; }
   color: var(--amber);
   margin: 3px 0 5px;
 }
+/* Passages (#140): compact curation table + the Publish phase cards */
+#an-psg-wrap { flex: 1; min-height: 0; overflow: auto; }
+#an-psg-table th:nth-child(3) { text-align: right; }
+.psg-pages, .psg-toks { font-family: var(--mono); white-space: nowrap; }
+.psg-toks { text-align: right; }
+.psg-row { cursor: pointer; }
+.psg-row:hover td { background: var(--row-hover); }
+.psg-open {
+  max-width: 0;
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.psg-acts { white-space: nowrap; }
+.psg-acts .cad-btn { margin-right: 3px; }
+.psg-excluded td { opacity: 0.45; }
+/* a thin rule where a new parent section begins — a marker, not a pill */
+.psg-sep td { padding: 0; border-bottom: 2px solid var(--face-sh2); }
+#an-psg-view { flex: none; max-height: 34%; }
+/* Publish phase: two peer cards — the archive entry and the search index */
+#wb-publish-cards { display: flex; gap: 10px; align-items: flex-start; }
+#wb-publish-cards[hidden] { display: none; }
+#wb-publish-cards .wb-pub-card {
+  flex: 1 1 0;
+  min-width: 0;
+  border: 1px solid var(--canvas-line);
+  background: var(--face);
+}
+#an-index-state { color: var(--face-sh2); }
+.an-index-ver {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--canvas-line);
+  font-family: var(--ui);
+  font-size: 12px;
+}
 .an-note {
   border: 1px solid var(--canvas-line);
   border-left: 3px solid var(--face-sh2);

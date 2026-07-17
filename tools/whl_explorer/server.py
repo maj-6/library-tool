@@ -4433,9 +4433,9 @@ def api_ia_downloads():
 # /api/secrets (Host-guarded); every server-side credential read goes through
 # _client_settings, which overlays these on top of the synced preferences. ------
 _SECRET_KEYS = frozenset({
-    "aiKey", "mistralKey", "ocrClaudeKey", "ocrAzureKey", "ocrAwsKey",
-    "ocrAwsSecret", "supabaseKey", "supabaseAnonKey", "r2KeyId", "r2Secret",
-    "gsKeyFile",
+    "aiKey", "embedKey", "mistralKey", "ocrClaudeKey", "ocrAzureKey",
+    "ocrAwsKey", "ocrAwsSecret", "supabaseKey", "supabaseAnonKey", "r2KeyId",
+    "r2Secret", "gsKeyFile",
 })
 _SECRETS_PATH = lib.DATA_ROOT / "output" / "secrets.json"
 _MISTRAL_PENDING = "_mistralCloudPending"
@@ -7533,6 +7533,642 @@ def api_volumes_publish():
 def api_volumes_publish_status():
     with _publish_lock:
         return jsonify(dict(_publish, store="r2" if r2.configured(_r2_cfg()) else "supabase"))
+
+
+# --- Knowledge passages: segmentation, curation, and the search index (#140) -----
+# Structure-aware child passages over the OCR text, curated in the Workbench
+# Knowledge phase and published as versioned index rows beside — never inside —
+# the archive entry (docs/search-design.md D5/D6/D7). The artifact is
+# entries/<bid>/passages.json; the cloud side is index_versions + passages in
+# docs/cloud/migrations/004_passages_index.sql.
+
+# The starting recipe (#142 benchmarks it, docs/search-design.md §7): child
+# passages of ~150-350 whitespace tokens, grouped into parent sections of
+# ~600-1200. Token counts are a whitespace approximation on purpose — the
+# corpus predates every tokenizer, and the bounds are targets, not truth.
+_PASSAGE_RECIPE = {"child_min": 150, "child_max": 350,
+                   "parent_min": 600, "parent_max": 1200}
+_INDEX_RIGHTS_OK = ("public-domain", "cleared", "searchable-only")
+_EMBED_BATCH = 64          # passages per /embeddings call
+_INDEX_CHUNK = 100         # passage rows per cloud insert (cancel checkpoints)
+_passages_lock = threading.Lock()
+
+# Sentence boundaries: [.!?] (optionally followed by ONE closing quote or
+# bracket), whitespace, then something that opens a sentence — a capital, a
+# digit, or an opening quote/bracket. A simple heuristic on purpose:
+# abbreviations and initials will over-split occasionally, which merely
+# places a passage boundary early — it never corrupts text, because
+# segmentation only chooses cut points and every slice comes verbatim from
+# the source (D8: the stored layers are sacred). Only the whitespace is
+# consumed, so slicing at match ends loses no characters.
+_SENTENCE_BOUND = re.compile(
+    "(?:(?<=[.!?])|(?<=[.!?][\"')\\]»”]))\\s+"
+    "(?=[(\\[\"'«“]*[A-Z0-9])")
+
+
+def _sentence_spans(text: str) -> list[tuple[int, int]]:
+    """[start, end) sentence slices of `text`, separators attached left, so
+    text[a:b].strip() is the verbatim sentence."""
+    cuts = [m.end() for m in _SENTENCE_BOUND.finditer(text)]
+    spans, start = [], 0
+    for c in cuts:
+        spans.append((start, c))
+        start = c
+    if start < len(text):
+        spans.append((start, len(text)))
+    return [s for s in spans if text[s[0]:s[1]].strip()]
+
+
+def _passage_id(seed: str, text: str) -> str:
+    """Stable, slug-independent passage identity: sha1 of the content plus a
+    seed (the generation ordinal, or the source ids of a manual split or
+    merge), so identical input yields identical ids on any machine."""
+    return hashlib.sha1(f"{seed}\n{text}".encode("utf-8")).hexdigest()[:16]
+
+
+def _passage_recipe(raw) -> dict:
+    """A sanitized recipe: the defaults overlaid with any sane integers."""
+    r = dict(_PASSAGE_RECIPE)
+    if isinstance(raw, dict):
+        for k in r:
+            try:
+                r[k] = max(20, min(5000, int(raw.get(k, r[k]))))
+            except (TypeError, ValueError):
+                continue
+    r["child_max"] = max(r["child_max"], r["child_min"])
+    r["parent_max"] = max(r["parent_max"], r["parent_min"])
+    return r
+
+
+def _segment_passages(pages: dict[int, str], recipe: dict) -> list[dict]:
+    """Structure-aware segmentation: page text -> child passages.
+
+    Structure before size: paragraphs (blank-line blocks) are the atoms;
+    they pack into child passages within the recipe's token bounds and may
+    span page boundaries (that is the point — pages split sentences). A
+    sentence is never broken: a paragraph that alone exceeds child_max
+    splits into sentence runs first, and a single oversized sentence stays
+    whole. Deterministic for identical input.
+
+    Each passage: {id, parent_id, page_from, page_to, text (verbatim
+    excerpt, blocks joined by blank lines), body (=_search_normalize(text))}.
+    """
+    r = _passage_recipe(recipe)
+    paras: list[tuple[int, str]] = []
+    for n in sorted(pages):
+        for block in re.split(r"\n\s*\n", str(pages[n] or "")):
+            block = block.strip()
+            if block:
+                paras.append((n, block))
+
+    # atomic units: (page, text, tokens) — paragraphs, or sentence runs of an
+    # oversized paragraph, sliced verbatim at sentence boundaries
+    units: list[tuple[int, str, int]] = []
+    for page, text in paras:
+        toks = len(text.split())
+        if toks <= r["child_max"]:
+            units.append((page, text, toks))
+            continue
+        spans = _sentence_spans(text)
+        run_from = None
+        run_toks = 0
+        for a, bnd in spans:
+            st = len(text[a:bnd].split())
+            if run_from is not None and run_toks + st > r["child_max"]:
+                piece = text[run_from:a].strip()
+                units.append((page, piece, run_toks))
+                run_from, run_toks = None, 0
+            if run_from is None:
+                run_from = a
+            run_toks += st
+        if run_from is not None:
+            piece = text[run_from:].strip()
+            units.append((page, piece, run_toks))
+
+    # pack units into children: child_max is a hard cap, child_min a target —
+    # a passage flushes when the next unit would push past the cap, so only a
+    # trailing passage (or a single oversized sentence) may sit outside the
+    # bounds
+    children: list[dict] = []
+    cur: list[tuple[int, str, int]] = []
+    cur_toks = 0
+
+    def flush() -> None:
+        nonlocal cur, cur_toks
+        if cur:
+            children.append({"page_from": cur[0][0], "page_to": cur[-1][0],
+                             "text": "\n\n".join(u[1] for u in cur)})
+        cur, cur_toks = [], 0
+
+    for u in units:
+        if cur and cur_toks + u[2] > r["child_max"]:
+            flush()
+        cur.append(u)
+        cur_toks += u[2]
+    flush()
+
+    for i, c in enumerate(children):
+        c["id"] = _passage_id(str(i), c["text"])
+        c["body"] = _search_normalize(c["text"])
+
+    # parent sections: consecutive children grouped to the parent bounds
+    # (same rule — hard cap, a trailing group may run small); parent_id is
+    # derived from the group's first child so it is just as deterministic
+    start, ptoks = 0, 0
+    for i, c in enumerate(children):
+        ct = len(c["text"].split())
+        if i > start and ptoks + ct > r["parent_max"]:
+            for x in children[start:i]:
+                x["parent_id"] = "p" + children[start]["id"]
+            start, ptoks = i, 0
+        ptoks += ct
+    for x in children[start:]:
+        x["parent_id"] = "p" + children[start]["id"]
+
+    return [{"id": c["id"], "parent_id": c["parent_id"],
+             "page_from": c["page_from"], "page_to": c["page_to"],
+             "text": c["text"], "body": c["body"]} for c in children]
+
+
+def _passages_path(bid: str) -> Path:
+    return _entry_dir(bid) / "passages.json"
+
+
+def _load_passages(bid: str) -> dict | None:
+    doc = lib.load_json(_passages_path(bid), None)
+    if not isinstance(doc, dict) or not isinstance(doc.get("passages"), list):
+        return None
+    return doc
+
+
+def _write_passages(bid: str, doc_name: str, src_input: dict, recipe: dict,
+                    pages: dict[int, str]) -> dict:
+    """Segment and write entries/<bid>/passages.json, keeping still-valid
+    exclusions (ids are content-based, so unchanged passages keep theirs),
+    and record provenance — produced_by kind "segment", input = the OCR doc
+    fingerprinted at job start — so #135 staleness covers the artifact."""
+    passages = _segment_passages(pages, recipe)
+    keep = {p["id"] for p in passages}
+    with _passages_lock:
+        old = _load_passages(bid) or {}
+        doc = {"version": 1, "recipe": _passage_recipe(recipe),
+               "generated_from": {"doc": doc_name,
+                                  "sha256": str(src_input.get("sha256") or "")},
+               "passages": passages,
+               "excluded": [i for i in old.get("excluded") or [] if i in keep]}
+        lib.save_json(_passages_path(bid), doc)
+    _manifest_record(bid, "passages.json",
+                     {"kind": "segment", "recipe": _passage_recipe(recipe)},
+                     [src_input])
+    return doc
+
+
+def _passages_state(bid: str, b: dict) -> dict:
+    """The honest Passages state: {exists, count, excluded, stale, doc,
+    sha256, recipe}. Stale is manifest staleness (#135) OR the current OCR
+    doc's hash differing from generated_from — the direct comparison also
+    covers artifacts without a manifest row and a switched active document."""
+    name, _text = _analyze_doc(bid, b)
+    cur = ""
+    if name and (_entry_dir(bid) / "ocr" / name).is_file():
+        cur = _file_sha256(_entry_dir(bid) / "ocr" / name)
+    with _passages_lock:
+        doc = _load_passages(bid)
+    if doc is None:
+        return {"exists": False, "count": 0, "excluded": 0, "stale": False,
+                "doc": name, "sha256": cur, "recipe": _passage_recipe(None)}
+    gen = doc.get("generated_from") or {}
+    stale = bool(_manifest_inputs_stale(bid, "passages.json")) or \
+        bool(cur and str(gen.get("sha256") or "") != cur)
+    return {"exists": True, "count": len(doc.get("passages") or []),
+            "excluded": len(doc.get("excluded") or []), "stale": stale,
+            "doc": name, "sha256": cur,
+            "recipe": _passage_recipe(doc.get("recipe"))}
+
+
+def _apply_passage_edits(doc: dict, p: dict) -> str:
+    """Apply {exclude, include, split, merge} to a passages doc in place;
+    returns an error string, or ''. Split and merge recompute ids from their
+    source ids + content, so curation stays deterministic too."""
+    passages = doc.get("passages") or []
+    ids = {str(x.get("id")): i for i, x in enumerate(passages)}
+    excluded = set(str(i) for i in doc.get("excluded") or [])
+
+    for pid in p.get("exclude") or []:
+        if str(pid) not in ids:
+            return f"unknown passage id: {pid}"
+        excluded.add(str(pid))
+    for pid in p.get("include") or []:
+        excluded.discard(str(pid))
+
+    split = p.get("split") or {}
+    if split.get("id"):
+        i = ids.get(str(split["id"]))
+        if i is None:
+            return "unknown passage id: " + str(split["id"])
+        orig = passages[i]
+        spans = _sentence_spans(orig["text"])
+        if len(spans) < 2:
+            return "cannot split — the passage is a single sentence"
+        cut = spans[len(spans) // 2][0]        # the middle sentence boundary
+        halves = []
+        for tag, text in (("a", orig["text"][:cut].strip()),
+                          ("b", orig["text"][cut:].strip())):
+            halves.append({
+                "id": _passage_id(f"{orig['id']}:{tag}", text),
+                "parent_id": orig.get("parent_id") or "",
+                # without an offset map the cut's page is unknowable (D2),
+                # so both halves keep the honest full range
+                "page_from": orig.get("page_from"),
+                "page_to": orig.get("page_to"),
+                "text": text, "body": _search_normalize(text)})
+        passages[i:i + 1] = halves
+        if orig["id"] in excluded:             # an excluded passage splits excluded
+            excluded.discard(orig["id"])
+            excluded.update(h["id"] for h in halves)
+
+    merge = p.get("merge") or {}
+    if merge.get("id"):
+        ids = {str(x.get("id")): i for i, x in enumerate(passages)}
+        i = ids.get(str(merge["id"]))
+        if i is None:
+            return "unknown passage id: " + str(merge["id"])
+        if (i + 1 >= len(passages)
+                or (passages[i + 1].get("parent_id") or "")
+                != (passages[i].get("parent_id") or "")):
+            return "cannot merge — no next passage in the same section"
+        a, nxt = passages[i], passages[i + 1]
+        text = a["text"].rstrip() + "\n\n" + nxt["text"].lstrip()
+        merged = {"id": _passage_id(f"{a['id']}+{nxt['id']}", text),
+                  "parent_id": a.get("parent_id") or "",
+                  "page_from": a.get("page_from"),
+                  "page_to": nxt.get("page_to"),
+                  "text": text, "body": _search_normalize(text)}
+        passages[i:i + 2] = [merged]
+        both = a["id"] in excluded and nxt["id"] in excluded
+        excluded.discard(a["id"])
+        excluded.discard(nxt["id"])
+        if both:                               # merged stays out only if both were
+            excluded.add(merged["id"])
+
+    doc["passages"] = passages
+    doc["excluded"] = sorted(excluded)
+    return ""
+
+
+@app.route("/api/knowledge/segment", methods=["POST"])
+def api_knowledge_segment():
+    """Segment the OCR text into passages. Body: {build_id, recipe?}. A
+    tracked job — the work is fast, but the registry gives progress and the
+    jobs drawer a row like every other background step."""
+    p = request.get_json(silent=True) or {}
+    bid = str(p.get("build_id") or "").strip()
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    recipe = _passage_recipe(p.get("recipe"))
+    doc_name, text, source_revision = _analyze_doc_snapshot(bid, b)
+    pages = _an_pages(text)
+    if not pages:
+        return jsonify({"ok": False, "error":
+                        "no OCR text for this entry — extract or run OCR first"}), 400
+    src_input = _manifest_input(bid, f"ocr/{doc_name}")   # hashed at job start
+
+    def run(job):
+        try:
+            if _an_cancel_check(job, "cancelled — passages not written"):
+                return
+            doc = _write_passages(bid, doc_name, src_input, recipe, pages)
+            with _an_jobs_lock:
+                job["done"] = 1
+                job["note"] = f"{len(doc['passages'])} passages"
+            activity("segmented passages", "book", detail=b.get("title", ""))
+            _an_finish(job)
+        except Exception as exc:
+            log.error("segmentation failed for %s", bid, exc_info=exc)
+            _an_finish(job, f"{type(exc).__name__}: {exc}")
+
+    try:
+        job = _an_job_start_guarded(bid, source_revision, "segment", 1, run)
+    except _AnalyzeSourceChanged:
+        return jsonify({"ok": False, "error":
+                        "page numbering changed — review the pages and retry"}), 409
+    return jsonify({"ok": True, "job": job["id"], "doc": doc_name})
+
+
+@app.route("/api/builds/<bid>/passages", methods=["GET", "PATCH"])
+def api_build_passages(bid: str):
+    """GET: the artifact plus its state line. PATCH {exclude, include,
+    split, merge}: curation — a manual edit, re-recorded as such so the
+    recorded inputs (and staleness) stay judgeable."""
+    if request.method == "GET":
+        b = lib.load_json(BUILDS_PATH, {}).get(bid) or {}
+        with _passages_lock:
+            doc = _load_passages(bid)
+        return jsonify({"ok": True, "doc": doc,
+                        "state": _passages_state(bid, b)})
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    p = request.get_json(silent=True) or {}
+    with _passages_lock:
+        doc = _load_passages(bid)
+        if doc is None:
+            return jsonify({"ok": False, "error":
+                            "no passages yet — generate them first"}), 404
+        problem = _apply_passage_edits(doc, p)
+        if problem:
+            return jsonify({"ok": False, "error": problem}), 400
+        lib.save_json(_passages_path(bid), doc)
+    _manifest_record(bid, "passages.json", {"kind": "manual-edit"})
+    return jsonify({"ok": True, "doc": doc,
+                    "state": _passages_state(bid, b)})
+
+
+def _embed_cfg() -> dict:
+    """The embeddings provider (Settings > AI): any OpenAI-compatible POST
+    /embeddings endpoint. Configured = base AND model set; the key is
+    optional so self-hosted endpoints work. Absent -> lexical-only indexes
+    with model '' (docs/search-design.md D7)."""
+    s = _client_settings()
+    return {"base": str(s.get("embedBase") or "").strip(),
+            "model": str(s.get("embedModel") or "").strip(),
+            "key": str(s.get("embedKey") or "").strip()}
+
+
+def _embed_texts(cfg: dict, texts: list[str]) -> list[list[float]]:
+    """One /embeddings call for a batch; returns vectors in input order.
+    Same error convention as _ai_chat: RuntimeError with the body truncated."""
+    headers = {"Content-Type": "application/json"}
+    if cfg["key"]:
+        headers["Authorization"] = f"Bearer {cfg['key']}"
+    req = urllib.request.Request(
+        cfg["base"].rstrip("/") + "/embeddings",
+        data=json.dumps({"model": cfg["model"], "input": texts}).encode("utf-8"),
+        headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=120.0) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
+    rows = data.get("data")
+    if not isinstance(rows, list) or len(rows) != len(texts):
+        raise RuntimeError("malformed embeddings response")
+    rows = sorted(rows, key=lambda r: int(r.get("index") or 0))
+    return [list(r.get("embedding") or []) for r in rows]
+
+
+def _vector_literal(vec: list) -> str:
+    """pgvector input as a string ('[0.1,0.2,...]') so PostgREST casts
+    text -> vector at any dimension."""
+    return "[" + ",".join(repr(float(x)) for x in vec) + "]"
+
+
+def _index_sync_error(exc) -> str:
+    """A SyncError message, naming the migration when the tables are absent
+    (the _publish_bundle degradation convention)."""
+    msg = str(exc)
+    if "index_versions" in msg or "passages" in msg:
+        return ("index tables missing on the cloud project — apply "
+                "docs/cloud/migrations/004_passages_index.sql")
+    return msg
+
+
+def _index_version_delete(cloud: dict, version_id: str) -> None:
+    """Best-effort removal of a version row; the FK cascade removes whatever
+    passages already landed. A half version must never survive."""
+    if not version_id:
+        return
+    try:
+        sbase.delete_rows(cloud, "index_versions",
+                          "id=eq." + urllib.parse.quote(str(version_id)))
+    except Exception as exc:
+        log.error("could not remove index version %s: %s", version_id, exc)
+
+
+@app.route("/api/knowledge/index/publish", methods=["POST"])
+def api_knowledge_index_publish():
+    """Build and publish a search-index version. Body: {build_id}.
+
+    Requires the archive entry published first (the index attaches to its
+    catalogue row) and a permitting rights decision. searchable-only IS
+    permitting here (docs/rights.md): passage bodies are never anon-readable
+    and the RPC returns only snippets. Segments first when passages.json is
+    missing or outdated; embeds through the configured provider or degrades
+    to lexical-only. Cancellable between batches; a cancelled or failed
+    build deletes its partial index_versions row (cascade cleans passages).
+    """
+    p = request.get_json(silent=True) or {}
+    bid = str(p.get("build_id") or "").strip()
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    slug = str(b.get("published_slug") or "").strip()
+    if b.get("status") != "uploaded" or not slug:
+        return jsonify({"ok": False, "error":
+                        "publish the archive entry first — the search index "
+                        "attaches to its catalogue row"}), 400
+    rights = str(b.get("rights") or "")
+    if rights not in _INDEX_RIGHTS_OK:
+        msg = ("no rights decision — set Rights in the Editor first"
+               if not rights else
+               "the rights decision “No public text” blocks a "
+               "search index (docs/rights.md)")
+        return jsonify({"ok": False, "error": msg}), 400
+    cloud = _cloud_cfg()
+    if not cloud:
+        return jsonify({"ok": False, "error":
+                        "Supabase is not configured (Settings > Sync)"}), 400
+    doc_name, text, source_revision = _analyze_doc_snapshot(bid, b)
+    pages = _an_pages(text)
+    if not pages:
+        return jsonify({"ok": False, "error":
+                        "no OCR text for this entry — extract or run OCR first"}), 400
+    ecfg = _embed_cfg()
+    embed = bool(ecfg["base"] and ecfg["model"])
+    src_input = _manifest_input(bid, f"ocr/{doc_name}")   # hashed at job start
+    src_sha = str(src_input.get("sha256") or "")
+
+    def run(job):
+        version_id = ""
+        try:
+            if _an_cancel_check(job, "cancelled — nothing published"):
+                return
+            # 1. passages: reuse the artifact when it matches the OCR doc as
+            # it stands, (re)segment otherwise — corrected text re-indexes
+            # without republishing the PDF
+            with _passages_lock:
+                doc = _load_passages(bid)
+            gen = (doc or {}).get("generated_from") or {}
+            if doc is None or str(gen.get("sha256") or "") != src_sha:
+                doc = _write_passages(
+                    bid, doc_name, src_input,
+                    _passage_recipe((doc or {}).get("recipe")), pages)
+            excluded = set(doc.get("excluded") or [])
+            included = [x for x in doc.get("passages") or []
+                        if x.get("id") not in excluded]
+            if not included:
+                raise RuntimeError("every passage is excluded — nothing to index")
+            batches = ((len(included) + _EMBED_BATCH - 1) // _EMBED_BATCH
+                       if embed else 0)
+            chunks = (len(included) + _INDEX_CHUNK - 1) // _INDEX_CHUNK
+            with _an_jobs_lock:
+                job["total"] = 1 + batches + chunks
+                job["done"] = 1
+            _job_checkpoint(job, force=True)
+
+            # 2. embeddings (optional): the normalized body is what the index
+            # searches, so it is what embeds
+            vectors: dict[str, str] = {}
+            if embed:
+                for i in range(0, len(included), _EMBED_BATCH):
+                    if _an_cancel_check(job, "cancelled — nothing published"):
+                        return
+                    batch = included[i:i + _EMBED_BATCH]
+                    embs = _embed_texts(
+                        ecfg, [x.get("body") or x.get("text") or ""
+                               for x in batch])
+                    for x, e in zip(batch, embs):
+                        vectors[x["id"]] = _vector_literal(e)
+                    with _an_jobs_lock:
+                        job["done"] += 1
+                    _job_checkpoint(job)
+
+            # 3. the version row first (its passages reference it), the
+            # passages in bounded chunks after. Cancel checks sit between
+            # chunks; _JobCancelled or any failure past this point deletes
+            # the row so a half version never serves. (A hard process kill
+            # can still strand one — Roll back removes it.)
+            config = {"recipe": doc.get("recipe") or {}, "normalize": 1,
+                      "model": ecfg["model"] if embed else ""}
+            stats = {"passages": len(included), "embedded": len(vectors),
+                     "excluded": len(excluded)}
+            rows = sbase._rest(
+                cloud, "POST", "index_versions",
+                [{"slug": slug, "channel": "stable", "config": config,
+                  "source_hash": src_sha, "stats": stats}],
+                prefer="return=representation")
+            if not (isinstance(rows, list) and rows
+                    and isinstance(rows[0], dict) and rows[0].get("id")):
+                raise RuntimeError("index_versions insert returned no row")
+            version_id = str(rows[0]["id"])
+            prows = [{"index_id": version_id, "slug": slug,
+                      "passage_id": x["id"],
+                      "parent_id": x.get("parent_id") or "",
+                      "page_from": x.get("page_from"),
+                      "page_to": x.get("page_to"),
+                      "body": x.get("body") or "",
+                      "embedding": vectors.get(x["id"])}
+                     for x in included]
+            for i in range(0, len(prows), _INDEX_CHUNK):
+                if _job_cancelled(job):
+                    raise _JobCancelled()
+                sbase.upsert_rows(cloud, "passages",
+                                  "index_id,slug,passage_id",
+                                  prows[i:i + _INDEX_CHUNK])
+                with _an_jobs_lock:
+                    job["done"] += 1
+                _job_checkpoint(job)
+            with _an_jobs_lock:
+                job["note"] = (f"{len(included)} passages"
+                               + (f", {len(vectors)} embedded" if vectors
+                                  else " (lexical-only)"))
+            activity("published search index", "book",
+                     detail=b.get("title", ""))
+            log.info("published index version %s for %s (%d passages, "
+                     "%d embedded)", version_id, slug, len(included),
+                     len(vectors))
+            _an_finish(job)
+        except _JobCancelled:
+            _index_version_delete(cloud, version_id)
+            _job_transition(job, "cancelled", note="cancelled — the partial "
+                            "index version was removed; the previous one "
+                            "still serves")
+        except sbase.SyncError as exc:
+            _index_version_delete(cloud, version_id)
+            log.error("index publish failed for %s: %s", bid, exc)
+            _an_finish(job, _index_sync_error(exc))
+        except Exception as exc:
+            _index_version_delete(cloud, version_id)
+            log.error("index publish failed for %s", bid, exc_info=exc)
+            _an_finish(job, f"{type(exc).__name__}: {exc}")
+
+    try:
+        job = _an_job_start_guarded(bid, source_revision, "index-publish",
+                                    1, run)
+    except _AnalyzeSourceChanged:
+        return jsonify({"ok": False, "error":
+                        "page numbering changed — review the pages and retry"}), 409
+    return jsonify({"ok": True, "job": job["id"], "slug": slug,
+                    "model": ecfg["model"] if embed else ""})
+
+
+@app.route("/api/knowledge/index/rollback", methods=["POST"])
+def api_knowledge_index_rollback():
+    """Delete the newest index version for the build's slug; the previous
+    one becomes latest by built_at (the releases pattern — archive rows are
+    never touched). Body: {build_id}."""
+    p = request.get_json(silent=True) or {}
+    bid = str(p.get("build_id") or "").strip()
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    slug = str(b.get("published_slug") or "").strip()
+    if not slug:
+        return jsonify({"ok": False, "error":
+                        "this entry has never published"}), 400
+    cloud = _cloud_cfg()
+    if not cloud:
+        return jsonify({"ok": False, "error":
+                        "Supabase is not configured (Settings > Sync)"}), 400
+    q = urllib.parse.quote(slug, safe="")
+    try:
+        rows = sbase._rest(
+            cloud, "GET", f"index_versions?slug=eq.{q}"
+            "&select=id,built_at&order=built_at.desc,id.desc&limit=2") or []
+        if not rows:
+            return jsonify({"ok": False, "error":
+                            "no index versions to roll back"}), 400
+        newest = str(rows[0].get("id") or "")
+        sbase.delete_rows(cloud, "index_versions",
+                          "id=eq." + urllib.parse.quote(newest))
+    except sbase.SyncError as exc:
+        return jsonify({"ok": False, "error": _index_sync_error(exc)}), 502
+    activity("rolled back search index", "book", detail=b.get("title", ""))
+    return jsonify({"ok": True, "removed": newest,
+                    "remaining": max(0, len(rows) - 1)})
+
+
+@app.route("/api/knowledge/index/status")
+def api_knowledge_index_status():
+    """Everything the Publish phase's Search index card needs in one call:
+    the local passages state plus the slug's version list, newest first."""
+    bid = str(request.args.get("build_id") or "").strip()
+    b = lib.load_json(BUILDS_PATH, {}).get(bid)
+    if not b:
+        abort(404)
+    slug = str(b.get("published_slug") or "").strip()
+    versions, warning = [], ""
+    cloud = _cloud_cfg()
+    if not cloud:
+        warning = "Supabase is not configured (Settings > Sync)"
+    elif slug:
+        q = urllib.parse.quote(slug, safe="")
+        try:
+            versions = [v for v in (sbase._rest(
+                cloud, "GET", f"index_versions?slug=eq.{q}"
+                "&select=id,channel,config,stats,source_hash,built_at"
+                "&order=built_at.desc,id.desc") or []) if isinstance(v, dict)]
+        except sbase.SyncError as exc:
+            warning = _index_sync_error(exc)
+    return jsonify({"ok": True, "state": _passages_state(bid, b),
+                    "versions": versions, "slug": slug,
+                    "published": b.get("status") == "uploaded",
+                    "rights": str(b.get("rights") or ""), "warning": warning})
+
 
 def _capture_note(cap: dict, errors: list[str]) -> str:
     bits = ["Captured via phone"]
