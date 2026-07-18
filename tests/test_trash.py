@@ -419,3 +419,64 @@ def test_restore_brings_a_deleted_pages_figure_back(data_root, client):
     assert (images / "p2-fig.jpeg").read_bytes() == b"\xff\xd8fig"
     back = server.lib.load_json(server._entry_dir(bid) / "ocr" / "layout.json", {})
     assert back["images"]["p2-fig.jpeg"]["page"] == 2     # metadata agrees again
+
+
+def test_a_failing_tail_still_leaves_an_honest_row(data_root, client, monkeypatch):
+    """The pages are gone from disk the moment the PDF is rewritten, so the row
+    must describe everything the payload holds even if the collateral tail dies
+    partway. A row frozen at the early commit made restore iterate a short
+    files list, write nothing back, and report ok with an EMPTY skipped list —
+    a book with its pages back and its OCR still renumbered, presented as a
+    working undo."""
+    bid = "trash015"
+    pdf = _seed(bid, data_root)
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+
+    def boom(*a, **k):
+        raise RuntimeError("sidecar is corrupt")
+
+    monkeypatch.setattr(server, "_manifest_after_renumber", boom)
+    with pytest.raises(RuntimeError):
+        server._apply_page_deletion(bid, builds, pdf, [2])
+
+    index = server.lib.load_json(server.TRASH_PATH, {})
+    tid = next(k for k, v in index["items"].items()
+               if (v.get("origin") or {}).get("build_id") == bid)
+    rec = index["items"][tid]
+    # the snapshots taken before the failure are ON the row, not just on disk
+    assert "ocr/compiled.txt" in rec["files"]
+    assert "ocr/layout.json" in rec["files"]
+    # and the OCR guard sees the shorter PDF even though the call raised
+    assert server._page_structure_revision.get(bid, 0) > 0
+
+    ocr = server._entry_dir(bid) / "ocr" / "compiled.txt"
+    assert ocr.read_text(encoding="utf-8") != T3        # renumbered by the delete
+    body = client.post("/api/trash/restore", json={"id": tid}).get_json()
+    assert body["ok"], body
+    assert _page_count(pdf) == 3
+    assert ocr.read_text(encoding="utf-8") == T3        # and put back, not stranded
+
+
+def test_restore_will_not_overwrite_a_figure_added_after_the_delete(
+        data_root, client):
+    """A figure the delete REMOVED gets an empty stamp, which means 'absent at
+    delete time'. If something now occupies that path it arrived afterwards —
+    a re-run of figure extraction, say — and must be reported, not clobbered."""
+    bid = "trash016"
+    pdf = _seed(bid, data_root)
+    images = server._entry_dir(bid) / "ocr" / "images"
+    images.mkdir(parents=True, exist_ok=True)
+    (images / "p2-fig.jpeg").write_bytes(b"\xff\xd8original")
+    lp = server._entry_dir(bid) / "ocr" / "layout.json"
+    layout = server.lib.load_json(lp, {})
+    layout["images"] = {"p2-fig.jpeg": {"page": 2}}
+    server.lib.save_json(lp, layout)
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+
+    tid = server._apply_page_deletion(bid, builds, pdf, [2])["trash_id"]
+    (images / "p2-fig.jpeg").write_bytes(b"\xff\xd8a DIFFERENT figure")
+
+    body = client.post("/api/trash/restore", json={"id": tid}).get_json()
+    assert body["ok"]
+    assert (images / "p2-fig.jpeg").read_bytes() == b"\xff\xd8a DIFFERENT figure"
+    assert any(s["file"] == "ocr/images/p2-fig.jpeg" for s in body["skipped"])

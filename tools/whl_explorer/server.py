@@ -5479,6 +5479,10 @@ def _trash_amend(tid: str, files: list[str], stamps: dict,
         rec.setdefault("restore", {})["stamps"] = stamps
         rec["restore"].update(restore or {})
         rec["bytes"] = _trash_dir_bytes(TRASH_DIR / tid)
+        # the commit priced this row before its collateral existed, so the cap
+        # was tested against an undercount — re-test it now that the real size
+        # is known. The freshness floor keeps this from pruning the row itself.
+        _trash_prune_locked(doc)
 
     _mutate_json(TRASH_PATH, _trash_lock, {"version": 1, "items": {}}, apply)
 
@@ -5664,6 +5668,12 @@ def _trash_restore_pdf_pages(item: dict) -> tuple[dict, int]:
             live = _entry_dir(build_id) / rel
             if src is None:
                 skipped.append({"file": rel, "reason": "payload missing"}); continue
+            # `want` is [size, mtime] for a file the delete left in place, or
+            # [] for one it removed outright (a deleted page's figure). The
+            # empty list is a real signal, not a missing stamp: if something
+            # now occupies that path, it arrived AFTER the delete — a re-run of
+            # figure extraction, say — and writing over it would be exactly the
+            # silent clobber this guard exists to prevent.
             want = stamps.get(rel)
             try:
                 st = live.stat()
@@ -5671,7 +5681,7 @@ def _trash_restore_pdf_pages(item: dict) -> tuple[dict, int]:
                     abs(float(want[1]) - st.st_mtime) < 0.001
             except OSError:
                 same = not want          # absent now, absent then -> safe to write
-            if want and not same:
+            if want is not None and not same:
                 skipped.append({"file": rel, "reason": "edited since the delete"})
                 continue
             try:
@@ -6091,10 +6101,10 @@ def _apply_page_deletion(build_id: str, builds: dict, pdf: Path,
     with _page_structure_lock:
         if _page_job_blockers(build_id):
             raise ValueError("a page-processing job is running for this book")
-        result = _apply_page_deletion_locked(build_id, builds, pdf, pages)
-        _page_structure_revision[build_id] = (
-            _page_structure_revision.get(build_id, 0) + 1)
-        return result
+        # the bump lives INSIDE the locked function, right after the rewrite:
+        # doing it here would skip it whenever the collateral tail raises,
+        # leaving a shorter PDF that the OCR guard still thinks is current
+        return _apply_page_deletion_locked(build_id, builds, pdf, pages)
 
 
 def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
@@ -6158,6 +6168,12 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
                 src_path = str(s.get("path"))
                 break
     tmp.replace(pdf)
+    # The page structure has genuinely changed as of the line above, so the OCR
+    # guard must see it even if everything below fails — a job that snapshotted
+    # the old revision would otherwise start and write page-keyed results
+    # against the pre-delete numbering.
+    _page_structure_revision[build_id] = (
+        _page_structure_revision.get(build_id, 0) + 1)
     # REGISTER NOW, not at the end. The pages are gone from disk as of the line
     # above; if anything in the collateral tail below raises, the row must
     # already exist or the payload becomes an unregistered orphan that the next
@@ -6172,105 +6188,115 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
          "title_pages_before": str(b.get("title_pages") or ""),
          "thumbnail_source_before": str(b.get("thumbnail_source") or "")},
         payload_kind, list(tfiles))
-    # keep the build's OCR files and title pages aligned with the new
-    # numbering (under the merge lock: a job finishing this instant must
-    # not interleave with the renumber writes). Only the files that came
-    # FROM this PDF renumber — a secondary scan's OCR has its own page
-    # numbering and must not shift with the primary's deletions.
-    srcmap = _ocr_sources(build_id)
-    ocr_dir = _entry_dir(build_id) / "ocr"
-    renumbered = []
-    with _ocr_merge_lock:
-        if ocr_dir.is_dir():
-            for f in ocr_dir.glob("*.txt"):
-                if (srcmap.get(f.name) or "primary") != src_key:
+    # EVERYTHING below is collateral alignment, and the pages are already
+    # gone from disk. If any of it raises, the row must still learn about
+    # the snapshots taken so far — otherwise restore iterates a files list
+    # frozen at the early commit, writes back nothing, and reports ok with
+    # an EMPTY skipped list: a book with its pages back and its OCR still
+    # renumbered, presented as a working undo.
+    renumbered: list[str] = []
+    changed: dict = {}
+    stamps: dict = {}
+    try:
+        # keep the build's OCR files and title pages aligned with the new
+        # numbering (under the merge lock: a job finishing this instant must
+        # not interleave with the renumber writes). Only the files that came
+        # FROM this PDF renumber — a secondary scan's OCR has its own page
+        # numbering and must not shift with the primary's deletions.
+        srcmap = _ocr_sources(build_id)
+        ocr_dir = _entry_dir(build_id) / "ocr"
+        renumbered = []
+        with _ocr_merge_lock:
+            if ocr_dir.is_dir():
+                for f in ocr_dir.glob("*.txt"):
+                    if (srcmap.get(f.name) or "primary") != src_key:
+                        continue
+                    try:
+                        raw = f.read_text(encoding="utf-8", errors="replace")
+                        # the renumbering is destructive too — snapshot the WHOLE
+                        # pre-edit text into the same trash item, so restoring is a
+                        # verbatim write-back and never an inverse renumber
+                        snap = tdir / "ocr" / f.name
+                        snap.parent.mkdir(parents=True, exist_ok=True)
+                        snap.write_text(raw, encoding="utf-8", errors="replace")
+                        tfiles.append(f"ocr/{f.name}")
+                        out = _renumber_marked_text(raw, pages)
+                        f.write_text(out, encoding="utf-8", errors="replace")
+                        renumbered.append(f.name)
+                    except OSError:
+                        continue
+        # the OCR word-box sidecar is page-keyed per source like the compiled
+        # files; keep THIS source's boxes aligned so the placed facsimile never
+        # shows a deleted page's words. This is the ONE leg of the flow that had
+        # no backup of any kind before the trash — snapshot it whole first.
+        layout_path = ocr_dir / "layout.json"
+        if layout_path.is_file():
+            try:
+                snap = tdir / "ocr" / "layout.json"
+                snap.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(layout_path, snap)
+                tfiles.append("ocr/layout.json")
+            except OSError:
+                pass
+        _renumber_layout_words(build_id, src_key, pages,
+                               snapshot=tdir, snapshot_out=tfiles)
+        # Translations use the same page-marker convention, and their provenance
+        # sidecars key each source hash by page. Move both in one protected pass so
+        # stale detection and eventual publication never retain an obsolete tail.
+        # Each affected file is snapshotted WHOLE on its way through: without this
+        # a restore rebuilt the PDF and the OCR but left every translated page past
+        # the deletion point shifted by one, and said "ok" with nothing in `skipped`.
+        moved = _renumber_translation_artifacts(build_id, src_key, pages,
+                                                snapshot=tdir, snapshot_out=tfiles)
+        _manifest_after_renumber(
+            build_id, [f"ocr/{n}" for n in renumbered] + ["ocr/layout.json"],
+            moved)
+        # title pages are counted on the PRIMARY PDF; a secondary's deletions
+        # don't move them. The pre-remap values are already in the row committed
+        # above (b hasn't been rewritten yet at this point).
+        titles = [] if src_key != "primary" else \
+            [int(x) for x in str(b.get("title_pages") or "").split(",")
+             if x.strip().isdigit()]
+        changed = {}
+        if titles:
+            remapped = []
+            for t in titles:
+                if t in set(pages):
                     continue
-                try:
-                    raw = f.read_text(encoding="utf-8", errors="replace")
-                    # the renumbering is destructive too — snapshot the WHOLE
-                    # pre-edit text into the same trash item, so restoring is a
-                    # verbatim write-back and never an inverse renumber
-                    snap = tdir / "ocr" / f.name
-                    snap.parent.mkdir(parents=True, exist_ok=True)
-                    snap.write_text(raw, encoding="utf-8", errors="replace")
-                    tfiles.append(f"ocr/{f.name}")
-                    out = _renumber_marked_text(raw, pages)
-                    f.write_text(out, encoding="utf-8", errors="replace")
-                    renumbered.append(f.name)
-                except OSError:
-                    continue
-    # the OCR word-box sidecar is page-keyed per source like the compiled
-    # files; keep THIS source's boxes aligned so the placed facsimile never
-    # shows a deleted page's words. This is the ONE leg of the flow that had
-    # no backup of any kind before the trash — snapshot it whole first.
-    layout_path = ocr_dir / "layout.json"
-    if layout_path.is_file():
-        try:
-            snap = tdir / "ocr" / "layout.json"
-            snap.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(layout_path, snap)
-            tfiles.append("ocr/layout.json")
-        except OSError:
-            pass
-    _renumber_layout_words(build_id, src_key, pages,
-                           snapshot=tdir, snapshot_out=tfiles)
-    # Translations use the same page-marker convention, and their provenance
-    # sidecars key each source hash by page. Move both in one protected pass so
-    # stale detection and eventual publication never retain an obsolete tail.
-    # Each affected file is snapshotted WHOLE on its way through: without this
-    # a restore rebuilt the PDF and the OCR but left every translated page past
-    # the deletion point shifted by one, and said "ok" with nothing in `skipped`.
-    moved = _renumber_translation_artifacts(build_id, src_key, pages,
-                                            snapshot=tdir, snapshot_out=tfiles)
-    _manifest_after_renumber(
-        build_id, [f"ocr/{n}" for n in renumbered] + ["ocr/layout.json"],
-        moved)
-    # title pages are counted on the PRIMARY PDF; a secondary's deletions
-    # don't move them. The pre-remap values are already in the row committed
-    # above (b hasn't been rewritten yet at this point).
-    titles = [] if src_key != "primary" else \
-        [int(x) for x in str(b.get("title_pages") or "").split(",")
-         if x.strip().isdigit()]
-    changed = {}
-    if titles:
-        remapped = []
-        for t in titles:
-            if t in set(pages):
+                remapped.append(t - sum(1 for r in pages if r < t))
+            changed["title_pages"] = ",".join(str(t) for t in remapped)
+        # thumbnail_source references a primary-PDF page the same way title_pages
+        # does ("page:<n>") — remap it the same way, or clear it if the referenced
+        # page was itself deleted. An "image:<name>" source points at an OCR-
+        # extracted figure, not a PDF page, so page deletion never touches it.
+        if src_key == "primary":
+            m = re.match(r"^page:(\d+)$", str(b.get("thumbnail_source") or ""))
+            if m:
+                t = int(m.group(1))
+                changed["thumbnail_source"] = "" if t in set(pages) else \
+                    f"page:{t - sum(1 for r in pages if r < t)}"
+        if changed:
+            # the caller's snapshot predates the slow PDF rewrite above — apply
+            # the remap to a fresh read, and keep the returned record in step
+            b.update(changed)
+            b["updated_at"] = _builds_apply(build_id, changed)
+    finally:
+        # Fold the collateral snapshots into the row registered above, stamping
+        # each written-back-able one with the POST-delete (size, mtime) of its
+        # live file so restore can tell "untouched since" from "the user edited
+        # this afterwards". Same idea for the build fields via `changed`. In the
+        # finally so a row is never left describing less than the payload holds.
+        for rel in tfiles:
+            if not rel.startswith(_TRASH_WRITEBACK):
                 continue
-            remapped.append(t - sum(1 for r in pages if r < t))
-        changed["title_pages"] = ",".join(str(t) for t in remapped)
-    # thumbnail_source references a primary-PDF page the same way title_pages
-    # does ("page:<n>") — remap it the same way, or clear it if the referenced
-    # page was itself deleted. An "image:<name>" source points at an OCR-
-    # extracted figure, not a PDF page, so page deletion never touches it.
-    if src_key == "primary":
-        m = re.match(r"^page:(\d+)$", str(b.get("thumbnail_source") or ""))
-        if m:
-            t = int(m.group(1))
-            changed["thumbnail_source"] = "" if t in set(pages) else \
-                f"page:{t - sum(1 for r in pages if r < t)}"
-    if changed:
-        # the caller's snapshot predates the slow PDF rewrite above — apply
-        # the remap to a fresh read, and keep the returned record in step
-        b.update(changed)
-        b["updated_at"] = _builds_apply(build_id, changed)
-    # Fold the collateral snapshots into the row registered above. Stamp each
-    # written-back-able snapshot with the POST-delete (size, mtime) of its live
-    # file, so restore can tell "untouched since" from "the user edited this
-    # afterwards". Same idea for the build fields: record what the delete LEFT
-    # so restore can decline to clobber a later hand edit.
-    stamps = {}
-    for rel in tfiles:
-        if not rel.startswith(_TRASH_WRITEBACK):
-            continue
-        live = _entry_dir(build_id) / rel
-        try:
-            st = live.stat()
-            stamps[rel] = [st.st_size, st.st_mtime]
-        except OSError:
-            continue
-    _trash_amend(tid, tfiles, stamps,
-                 {f"{k}_after": v for k, v in changed.items()})
+            live = _entry_dir(build_id) / rel
+            try:
+                st = live.stat()
+                stamps[rel] = [st.st_size, st.st_mtime]
+            except OSError:
+                stamps[rel] = []      # absent now: see restore's guard
+        _trash_amend(tid, tfiles, stamps,
+                     {f"{k}_after": v for k, v in changed.items()})
     return {"deleted": pages, "pages": len(keep),
             "renumbered": renumbered,
             "trash_id": tid,
