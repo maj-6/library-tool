@@ -54,7 +54,8 @@ def test_release_requires_persistent_android_signing_for_tags():
     assert 'if ! "$APKSIGNER" verify --print-certs "$APK" > signer.txt; then' in android
     assert 'if [ -z "$DN" ] || [ -z "$SHA256" ]; then' in android
     assert "Android Debug" in android
-    assert "Signer #1 certificate SHA-256 digest" in android
+    # matches ANY signer block — newer build-tools drop the "Signer #1" prefix
+    assert "certificate SHA-256 digest: " in android
 
     # The android job exposes the verified signer and the publish job reports it.
     assert "signer: ${{ steps.signer.outputs.signer }}" in android
