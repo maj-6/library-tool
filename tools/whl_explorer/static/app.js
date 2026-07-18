@@ -2577,33 +2577,34 @@ function initUserProfile() {
 
 const HOME_DRAFTS_SHOWN = 4;
 
-function renderHome() {
-  const prog = el("home-progress");
-  const feed = el("home-activity");
-  if (!prog || !feed) return;
+// Home is four independent panes over one summary. Each renders into its own
+// host, in the manner of renderReviewsInto, so a change to one cannot disturb
+// the others; renderHome below is just the order they run in.
 
-  const p = progressSummary();
-
-  // State of the archive, in the masthead: the mission as a quiet fact
-  // (catalogued -> verified -> published), each figure a jump to where that
-  // stage lives. Under-styled per the CAD ethos — a readout, not tiles.
+// State of the archive, in the masthead: the mission as a quiet fact
+// (catalogued -> verified -> published), each figure a jump to where that
+// stage lives. Under-styled per the CAD ethos — a readout, not tiles.
+function renderHomeStats(p) {
   const statsEl = el("home-stats");
-  if (statsEl) {
-    const TAB_FOR = { catalogued: "checked", verified: "workbench", published: "publish" };
-    const stat = (n, label) =>
-      `<button class="hs-item" type="button" data-gotab="${TAB_FOR[label]}">` +
-        `<span class="hs-n">${n}</span><span class="hs-l">${label}</span></button>`;
-    const sep = `<span class="hs-sep">·</span>`;
-    statsEl.innerHTML =
-      stat(p.catalogued, "catalogued") + sep +
-      stat(p.ready, "verified") + sep +
-      stat(p.published, "published");
-  }
+  if (!statsEl) return;
+  const TAB_FOR = { catalogued: "checked", verified: "workbench", published: "publish" };
+  const stat = (n, label) =>
+    `<button class="hs-item" type="button" data-gotab="${TAB_FOR[label]}">` +
+      `<span class="hs-n">${n}</span><span class="hs-l">${label}</span></button>`;
+  const sep = `<span class="hs-sep">·</span>`;
+  statsEl.innerHTML =
+    stat(p.catalogued, "catalogued") + sep +
+    stat(p.ready, "verified") + sep +
+    stat(p.published, "published");
+}
 
-  // one line per metric, count first, breakdown right-aligned and muted —
-  // a status readout in the app's row idiom, not a dashboard of tiles. A zero
-  // count stays as text but drops its click affordance, so it can't lead into
-  // an empty tab.
+// one line per metric, count first, breakdown right-aligned and muted —
+// a status readout in the app's row idiom, not a dashboard of tiles. A zero
+// count stays as text but drops its click affordance, so it can't lead into
+// an empty tab. The freshest few drafts follow, so unfinished work is one
+// click away.
+function renderHomeProgress(host, p) {
+  if (!host) return;
   const row = (n, label, act, detail) => {
     const empty = !n;
     const tag = empty ? "div" : "button";
@@ -2628,7 +2629,6 @@ function renderHome() {
     row(p.openReviews, p.openReviews === 1 ? "item awaiting review"
         : "items awaiting review", `data-review="1"`);
 
-  // the freshest few drafts, so unfinished work is one click away
   const drafts = p.drafts.slice()
     .sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
   const shown = drafts.slice(0, HOME_DRAFTS_SHOWN);
@@ -2643,19 +2643,15 @@ function renderHome() {
       html += `<button class="home-more" data-gotab="workbench">` +
         `${drafts.length - shown.length} more in the workbench…</button>`;
   }
-  prog.innerHTML = html;
+  host.innerHTML = html;
+}
 
-  const users = el("home-users");
-  if (!homeState.loaded) {
-    feed.innerHTML = `<div class="empty">Loading …</div>`;
-    if (users) users.innerHTML = `<div class="empty">Loading …</div>`;
-    return;
-  }
-
-  // a group expands into its member events: exact local time + what exactly
+// a group expands into its member events: exact local time + what exactly
+function renderHomeActivity(host) {
+  if (!host) return;
   const groups = groupActivity(homeState.events).slice(0, 12);
   const gkey = (g) => `${g.actor}|${g.verb}|${g.subject}|${g.at}`;
-  feed.innerHTML = groups.length
+  host.innerHTML = groups.length
     ? groups.map((g) => {
         const k = gkey(g);
         const open = homeState.expanded.has(k);
@@ -2677,38 +2673,64 @@ function renderHome() {
           `<span class="home-when">${esc(relTime(g.at))}</span></div>` + det;
       }).join("")
     : `<div class="empty">No activity recorded yet</div>`;
+}
 
-  // everyone the feed has seen, newest first; your own name is always present.
-  // Seed under the same identity your writes are attributed with (see
-  // installActorHeader), so the self row matches the actor the feed records.
-  if (users) {
-    const me = (authState.displayName || state.settings.userName || "").trim();
-    const seen = new Map();
-    for (const e of homeState.events) {
-      const who = String(e.actor || "").trim() || "Unnamed user";
-      const at = Date.parse(e.ts) || 0;
-      const m = seen.get(who) || { n: 0, last: 0 };
-      m.n += e.n || 1;
-      if (at > m.last) m.last = at;
-      seen.set(who, m);
-    }
-    if (me && !seen.has(me)) seen.set(me, { n: 0, last: 0 });
-    const list = [...seen.entries()].sort((a, b) => b[1].last - a[1].last);
-    users.innerHTML = list.length
-      ? list.map(([who, m]) => `<div class="home-user">` +
-          userChip(who, { cls: "hu-chip", you: isSelfName(who) }) +
-          `<span class="hu-meta">${m.n
-            ? `${m.n} ${m.n === 1 ? "change" : "changes"}`
-            : "no changes yet"}</span>` +
-          `<span class="hu-when">${m.last ? esc(relTime(m.last)) : ""}</span>` +
-          `</div>`).join("")
-      : `<div class="empty">No contributors recorded yet</div>`;
+// everyone the feed has seen, newest first; your own name is always present.
+// Seed under the same identity your writes are attributed with (see
+// installActorHeader), so the self row matches the actor the feed records.
+function renderHomeContributors(host) {
+  if (!host) return;
+  const me = (authState.displayName || state.settings.userName || "").trim();
+  const seen = new Map();
+  for (const e of homeState.events) {
+    const who = String(e.actor || "").trim() || "Unnamed user";
+    const at = Date.parse(e.ts) || 0;
+    const m = seen.get(who) || { n: 0, last: 0 };
+    m.n += e.n || 1;
+    if (at > m.last) m.last = at;
+    seen.set(who, m);
   }
+  if (me && !seen.has(me)) seen.set(me, { n: 0, last: 0 });
+  const list = [...seen.entries()].sort((a, b) => b[1].last - a[1].last);
+  host.innerHTML = list.length
+    ? list.map(([who, m]) => `<div class="home-user">` +
+        userChip(who, { cls: "hu-chip", you: isSelfName(who) }) +
+        `<span class="hu-meta">${m.n
+          ? `${m.n} ${m.n === 1 ? "change" : "changes"}`
+          : "no changes yet"}</span>` +
+        `<span class="hu-when">${m.last ? esc(relTime(m.last)) : ""}</span>` +
+        `</div>`).join("")
+    : `<div class="empty">No contributors recorded yet</div>`;
+}
 
-  // the review queue as an inline pane (the overlay window still exists too)
+// the review queue as an inline pane (the overlay window still exists too)
+function renderHomeReviews() {
   const hcb = el("home-review-resolved");
   if (hcb) hcb.checked = reviewsState.showResolved;
   renderReviewsInto(el("home-reviews"));
+}
+
+function renderHome() {
+  const prog = el("home-progress");
+  const feed = el("home-activity");
+  if (!prog || !feed) return;
+
+  const p = progressSummary();
+  renderHomeStats(p);
+  renderHomeProgress(prog, p);
+
+  // Until the feed has loaded there is nothing to say about activity, who has
+  // been active, or the queue — the panes below stay as they are.
+  const users = el("home-users");
+  if (!homeState.loaded) {
+    feed.innerHTML = `<div class="empty">Loading …</div>`;
+    if (users) users.innerHTML = `<div class="empty">Loading …</div>`;
+    return;
+  }
+
+  renderHomeActivity(feed);
+  renderHomeContributors(users);
+  renderHomeReviews();
 }
 
 function initHome() {
