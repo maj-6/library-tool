@@ -1073,8 +1073,14 @@ def api_builds_delete(build_id: str):
         builds = lib.load_json(BUILDS_PATH, {})
         if build_id not in builds:
             abort(404)
+        record = builds[build_id]
         del builds[build_id]
         lib.save_json(BUILDS_PATH, builds)
+    # a few KB of JSON, so this never troubles the byte cap. The client's undo
+    # covers the next few seconds; this is the backstop for the next few days.
+    _trash_put("build", f"Entry: {record.get('title') or build_id}",
+               {"build_id": build_id}, {},
+               {"record.json": json.dumps(record, ensure_ascii=False)})
     return jsonify({"ok": True})
 
 
@@ -5611,16 +5617,74 @@ def _trash_restore_pdf_pages(item: dict) -> tuple[dict, int]:
         _page_structure_revision[build_id] = (
             _page_structure_revision.get(build_id, 0) + 1)
 
-    def mark(doc):
-        rec = (doc.get("items") or {}).get(str(item.get("id") or ""))
-        if rec is not None:
-            rec["restored_at"] = datetime.now(timezone.utc).isoformat(
-                timespec="seconds")
-            if skipped:
-                rec["note"] = f"{len(skipped)} file(s) kept as they were"
-    _mutate_json(TRASH_PATH, _trash_lock, {"version": 1, "items": {}}, mark)
+    # the caller (api_trash_restore) owns marking the row restored
     return {"ok": True, "restored": restored, "skipped": skipped,
             "pages": int(rest.get("pages_before") or 0)}, 200
+
+
+def _trash_restore_record(item: dict) -> tuple[dict, int]:
+    """Put a deleted build / manual entry back. Refuses rather than clobbers if
+    something now occupies the id — the user may have re-created it by hand."""
+    kind = str(item.get("kind") or "")
+    origin = item.get("origin") or {}
+    src = _trash_payload_path(str(item.get("id") or ""), "record.json")
+    if src is None:
+        return {"ok": False, "error": "the trashed record is gone"}, 410
+    try:
+        record = json.loads(src.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"ok": False, "error": "the trashed record is unreadable"}, 410
+    if kind == "build":
+        rid, path, lock = str(origin.get("build_id") or ""), BUILDS_PATH, _builds_lock
+    else:
+        rid, path, lock = (str(origin.get("entry_id") or ""),
+                           lib.MANUAL_ENTRIES_PATH, _manual_lock)
+    if not rid:
+        return {"ok": False, "error": "the trashed record has no id"}, 410
+
+    def apply(doc):
+        if rid in doc:
+            return False
+        doc[rid] = record
+        return True
+
+    if not _mutate_json(path, lock, {}, apply):
+        return {"ok": False,
+                "error": "something with that id exists again — restoring would "
+                         "overwrite it"}, 409
+    return {"ok": True, "restored": ["record.json"], "skipped": []}, 200
+
+
+def _trash_restore_translation(item: dict) -> tuple[dict, int]:
+    """Write a deleted translation (and its provenance sidecar) back, unless a
+    newer one is already there."""
+    origin = item.get("origin") or {}
+    bid = str(origin.get("build_id") or "")
+    lang = str(origin.get("lang") or "")
+    if not bid or not lang:
+        return {"ok": False, "error": "the trashed translation has no target"}, 410
+    dest_dir = _entry_dir(bid) / "translations"
+    restored, skipped = [], []
+    with _an_write_lock:
+        for rel in (item.get("files") or []):
+            src = _trash_payload_path(str(item.get("id") or ""), rel)
+            if src is None:
+                skipped.append({"file": rel, "reason": "payload missing"}); continue
+            dest = dest_dir / Path(rel).name
+            if dest.exists():
+                skipped.append({"file": rel, "reason": "a newer translation is there"})
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+            restored.append(rel)
+    if not restored:
+        # restoring nothing is not a success — either something newer is in the
+        # way, or the payload is gone. Saying "ok" would be a silent no-op.
+        blocked = any(s.get("reason", "").startswith("a newer") for s in skipped)
+        return {"ok": False, "error":
+                "a newer translation is already in place" if blocked
+                else "nothing left to restore"}, 409 if blocked else 410
+    return {"ok": True, "restored": restored, "skipped": skipped}, 200
 
 
 @app.route("/api/trash/restore", methods=["POST"])
@@ -5636,10 +5700,28 @@ def api_trash_restore():
     if not item:
         return jsonify({"ok": False, "error": "no such item"}), 404
     kind = str(item.get("kind") or "")
-    if kind != "pdf_pages":
+    if kind == "pdf_pages":
+        body, code = _trash_restore_pdf_pages(item)
+    elif kind in ("build", "manual_entry"):
+        body, code = _trash_restore_record(item)
+    elif kind == "translation":
+        body, code = _trash_restore_translation(item)
+    else:
         return jsonify({"ok": False,
                         "error": f"restoring '{kind}' is not supported yet"}), 501
-    body, code = _trash_restore_pdf_pages(item)
+    if body.get("ok"):
+        # one owner for the row update, whatever the kind: the pane greys a
+        # restored item rather than dropping it, so the restore stays visible
+        def mark(doc):
+            rec = (doc.get("items") or {}).get(tid)
+            if rec is None:
+                return
+            rec["restored_at"] = datetime.now(timezone.utc).isoformat(
+                timespec="seconds")
+            kept = len(body.get("skipped") or [])
+            if kept:
+                rec["note"] = f"{kept} file(s) kept as they were"
+        _mutate_json(TRASH_PATH, _trash_lock, {"version": 1, "items": {}}, mark)
     return jsonify(body), code
 
 
@@ -6551,9 +6633,13 @@ def api_manual_delete(entry_id: str):
         entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
         if entry_id not in entries:
             abort(404)
-        title = entries[entry_id].get("title", "")
+        record = entries[entry_id]
+        title = record.get("title", "")
         del entries[entry_id]
         lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+    _trash_put("manual_entry", f"Manual entry: {title or entry_id}",
+               {"entry_id": entry_id}, {},
+               {"record.json": json.dumps(record, ensure_ascii=False)})
     activity("deleted", "manual entry", detail=title)
     return jsonify({"ok": True})
 
@@ -8472,11 +8558,23 @@ def api_build_translation(bid: str, lang: str):
     if err:
         return err
     with _an_write_lock:
+        # regenerating a translation means re-running a paid model over the
+        # whole book, so keep the text (and its provenance) recoverable
+        payload = {}
         if p.is_file():
-            p.unlink()
+            payload[f"{lang}.txt"] = p.read_text(encoding="utf-8", errors="replace")
         m = _translation_meta_path(bid, lang)
         if m.is_file():
+            payload[m.name] = m.read_text(encoding="utf-8", errors="replace")
+        if p.is_file():
+            p.unlink()
+        if m.is_file():
             m.unlink()
+    if payload:
+        _trash_put("translation",
+                   f"{lang} translation of {b.get('title') or bid}",
+                   {"build_id": bid, "lang": lang}, {},
+                   payload)
     return jsonify({"ok": True})
 
 

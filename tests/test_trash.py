@@ -207,3 +207,77 @@ def test_prune_drops_old_items_but_never_the_fresh_one(data_root):
     server._trash_prune_locked(doc)
     assert "aaa" not in doc["items"]          # past the age cap
     assert "bbb" in doc["items"]              # inside the floor, kept regardless
+
+
+# --- other adopters: records and translations --------------------------------
+
+def test_build_delete_is_recoverable(data_root, client):
+    """Deleting an entry trashes its record; restoring reinserts it verbatim,
+    and refuses if something has taken the id back."""
+    bid = "trashb01"
+    server.BUILDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    server.BUILDS_PATH.write_text(
+        json.dumps({bid: {"id": bid, "title": "Doomed", "rights": "public-domain"}}),
+        encoding="utf-8")
+
+    assert client.delete(f"/api/builds/{bid}").status_code == 200
+    assert bid not in server.lib.load_json(server.BUILDS_PATH, {})
+
+    items = client.get("/api/trash").get_json()["items"]
+    rec = next(i for i in items
+               if i["kind"] == "build" and i["origin"].get("build_id") == bid)
+    assert "Doomed" in rec["label"]
+
+    r = client.post("/api/trash/restore", json={"id": rec["id"]})
+    assert r.status_code == 200, r.get_json()
+    back = server.lib.load_json(server.BUILDS_PATH, {})[bid]
+    assert back["title"] == "Doomed" and back["rights"] == "public-domain"
+
+    # a second restore must not overwrite the entry now living at that id
+    again = client.post("/api/trash/restore", json={"id": rec["id"]})
+    assert again.status_code == 409
+    assert "exists again" in again.get_json()["error"]
+
+
+def test_manual_delete_is_recoverable(data_root, client):
+    eid = "trashm01"
+    server.lib.MANUAL_ENTRIES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    server.lib.save_json(server.lib.MANUAL_ENTRIES_PATH,
+                         {eid: {"id": eid, "title": "Hand typed"}})
+
+    assert client.delete(f"/api/manual/{eid}").status_code == 200
+    rec = next(i for i in client.get("/api/trash").get_json()["items"]
+               if i["kind"] == "manual_entry"
+               and i["origin"].get("entry_id") == eid)
+    assert client.post("/api/trash/restore", json={"id": rec["id"]}).status_code == 200
+    assert server.lib.load_json(server.lib.MANUAL_ENTRIES_PATH, {})[eid]["title"] \
+        == "Hand typed"
+
+
+def test_translation_delete_is_recoverable(data_root, client):
+    """A translation costs a paid model run to regenerate, so deleting one
+    keeps the text; restore refuses to overwrite a newer translation."""
+    bid = "trasht01"
+    server.BUILDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    server.BUILDS_PATH.write_text(
+        # _an_gate only lets verified entries through
+        json.dumps({bid: {"id": bid, "title": "Translated", "status": "ready"}}),
+        encoding="utf-8")
+    tdir = server._entry_dir(bid) / "translations"
+    tdir.mkdir(parents=True, exist_ok=True)
+    (tdir / "fr.txt").write_text("--- page 1 ---\nbonjour", encoding="utf-8")
+
+    assert client.delete(f"/api/builds/{bid}/translations/fr").status_code == 200
+    assert not (tdir / "fr.txt").exists()
+
+    rec = next(i for i in client.get("/api/trash").get_json()["items"]
+               if i["kind"] == "translation"
+               and i["origin"].get("build_id") == bid)
+    assert client.post("/api/trash/restore", json={"id": rec["id"]}).status_code == 200
+    assert (tdir / "fr.txt").read_text(encoding="utf-8") == "--- page 1 ---\nbonjour"
+
+    # a newer translation in place is never clobbered
+    (tdir / "fr.txt").write_text("newer", encoding="utf-8")
+    again = client.post("/api/trash/restore", json={"id": rec["id"]})
+    assert again.status_code == 409
+    assert (tdir / "fr.txt").read_text(encoding="utf-8") == "newer"
