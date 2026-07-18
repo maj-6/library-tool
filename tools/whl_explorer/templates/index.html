@@ -483,8 +483,12 @@
               <option value="checked">Checked books + manual</option>
               <option value="whl">WHL</option>
             </select>
-            <button id="whl-mode" class="cad-btn tiny" type="button" hidden
-                    data-tip="Ctrl+E toggles EDIT / SEARCH mode"></button>
+            <span id="whl-modeseg" class="modeseg" role="group" hidden
+                  data-tip="Search / Edit / Process mode  (Ctrl+E toggles Search/Edit)">
+              <button type="button" class="modeseg-btn" data-mode="search">Search</button>
+              <button type="button" class="modeseg-btn" data-mode="edit">Edit</button>
+              <button type="button" class="modeseg-btn" data-mode="process">Process</button>
+            </span>
             <span id="whl-cons" class="whl-cons" hidden
                   data-tip="Constrain the Open Library search to these fields (Title = verbatim phrase). Ctrl+click any column header toggles a field too.">
               <span class="icon-label" data-icon="target"></span>
@@ -493,6 +497,26 @@
                 <label><input type="checkbox" id="wc-author" /> Author</label>
                 <label><input type="checkbox" id="wc-year" /> Year</label>
               </span>
+            </span>
+            <span id="proc-bar" class="proc-bar" hidden
+                  data-tip="Process mode — select rows, pick an action, Run">
+              <span id="proc-count" class="proc-count">0 selected</span>
+              <button id="proc-all" class="cad-btn tiny" type="button"
+                      data-tip="Select every row">All</button>
+              <button id="proc-none" class="cad-btn tiny" type="button"
+                      data-tip="Clear the selection">None</button>
+              <select id="proc-action" class="cad-input tiny"
+                      data-tip="Action to run on the selected rows">
+                <option value="normalize">Normalize names / caps</option>
+                <option value="deepseek">DeepSeek…</option>
+                <option value="rescan">Rescan</option>
+                <option value="smartscan">Smart Scan</option>
+              </select>
+              <input id="proc-ai-instr" class="cad-input tiny proc-ai-instr" hidden
+                     placeholder="DeepSeek instructions…"
+                     data-tip="What DeepSeek should do to each selected record (blank uses your Settings › AI instructions)" />
+              <button id="proc-run" class="cad-btn tiny" type="button"
+                      data-tip="Run the action on the selected rows">Run</button>
             </span>
             <span class="bar-spacer"></span>
             <span class="year-filter" data-tip="Show only rows within this year range (inclusive)">
@@ -610,13 +634,15 @@
             <span class="bar-spacer"></span>
             <button id="ocr-filter-verified" class="cad-btn tiny icon-btn toggle" type="button"
                     data-icon="check" data-tip="Show verified books only"></button>
+            <button id="ocr-side-toggle" class="cad-btn tiny" type="button"
+                    aria-expanded="true" data-tip="Collapse the entries &amp; artifacts sidebar">&#9664;</button>
           </div>
           <div class="drafting" id="ocr-books-wrap">
             <ul id="ocr-books"></ul>
             <p id="ocr-books-empty" class="empty">No entries yet</p>
           </div>
           <div id="ocr-side-splitter"></div>
-          <div class="pane-bar"><span class="tool-label">Artifacts</span>
+          <div class="pane-bar" id="ocr-artifacts-bar"><span class="tool-label">Artifacts</span>
             <span class="bar-spacer"></span>
             <button id="ocr-load-file" class="cad-btn tiny icon-btn" type="button"
                     data-icon="fileup" data-tip="Load OCR text files"></button>
@@ -720,9 +746,6 @@
                   <div class="mf-field mf-full">
                     <label class="tool-label" for="b-pdf_source">PDF source (URL)
                       <a id="b-pdf-open" class="mini-link" href="#" target="_blank" rel="noopener" hidden>Open</a>
-                      <button id="b-smartcheck" class="sc-wand sc-form-wand" type="button"
-                              data-icon="wand"
-                              data-tip="Smart check — extract real metadata from this book's PDF (Mistral OCR, then DeepSeek). Extracted values overlay the form until baked: TAB compares, SPACE over the form bakes them in."></button>
                     </label>
                     <input id="b-pdf_source" class="cad-input" />
                   </div>
@@ -1059,6 +1082,8 @@
               <button class="pane-tab" data-antab="an-trans" type="button">Translations</button>
               <button class="pane-tab" data-antab="an-notes" type="button">Annotations</button>
               <button class="pane-tab" data-antab="an-passages" type="button">Passages</button>
+              <button class="pane-tab" data-antab="an-test" type="button">Test</button>
+              <button class="pane-tab" data-antab="an-ask" type="button">Ask</button>
               <button class="pane-tab" data-antab="an-rel" type="button">Relevance</button>
             </div>
 
@@ -1156,6 +1181,68 @@
                 <p id="an-psg-more" class="pane-note" hidden></p>
               </div>
               <pre id="an-psg-view" class="an-text" hidden></pre>
+            </div>
+
+            <!-- TEST (#142): the per-volume evaluation set — judged queries,
+                 Recall/nDCG/MRR, working passages vs the published index -->
+            <div class="an-pane" id="an-test">
+              <div class="pane-bar">
+                <span class="tool-label">Evaluation queries</span>
+                <span id="an-ev-metrics" class="tool-label"
+                      data-tip="Overall metrics from the last full run — judged queries only; unanswerable and unjudged counted apart"></span>
+                <span class="bar-spacer"></span>
+                <span id="an-ev-msg" class="tool-label"></span>
+                <button id="an-ev-run" class="cad-btn tiny" type="button"
+                        data-tip="Score every query against the working passages (and the published index when the cloud is configured)">Run all</button>
+              </div>
+              <div class="pane-bar">
+                <input id="an-ev-text" class="cad-input" type="text"
+                       placeholder="a query this book should answer&hellip;" spellcheck="false" />
+                <select id="an-ev-kind" class="cad-input"
+                        data-tip="What the query exercises — cover all kinds over time">
+                  <option value="exact-phrase">exact phrase</option>
+                  <option value="archaic-modern">archaic&#8596;modern</option>
+                  <option value="factual" selected>factual</option>
+                  <option value="thematic">thematic</option>
+                  <option value="tables">tables</option>
+                  <option value="cross-page">cross-page</option>
+                  <option value="multilingual">multilingual</option>
+                  <option value="unanswerable">unanswerable</option>
+                </select>
+                <button id="an-ev-add" class="cad-btn tiny" type="button">Add</button>
+                <button id="an-ev-cancel" class="cad-btn tiny" type="button" hidden>Cancel</button>
+              </div>
+              <div id="an-ev-split">
+                <div id="an-ev-queries" class="drafting"></div>
+                <div id="an-ev-results" class="drafting">
+                  <p id="an-ev-hint" class="empty">Select a query to run it
+                    against the working passages.</p>
+                </div>
+              </div>
+            </div>
+
+            <!-- ASK (#143): evidence first, then an optional cited answer.
+                 Answers are transient — derived AI claims never publish. -->
+            <div class="an-pane" id="an-ask">
+              <div class="pane-bar">
+                <span class="tool-label">Ask this book</span>
+                <span class="bar-spacer"></span>
+                <span id="an-ask-msg" class="tool-label"></span>
+              </div>
+              <div class="pane-bar">
+                <input id="an-ask-q" class="cad-input" type="text"
+                       placeholder="What does this book say about&hellip;" spellcheck="false" />
+                <button id="an-ask-go" class="cad-btn tiny" type="button"
+                        data-tip="Rank the passages for this question — the evidence, before any answer">Ask</button>
+                <button id="an-ask-draft" class="cad-btn tiny" type="button" hidden
+                        data-tip="Draft an answer from the evidence below — cited, abstaining, never medical advice">Draft answer</button>
+              </div>
+              <div id="an-ask-answer" hidden></div>
+              <p id="an-ask-note" class="pane-note" hidden>Model-generated
+                from the passages above &mdash; not the book&rsquo;s text,
+                not medical advice.</p>
+              <div id="an-ask-evidence" class="drafting"></div>
+              <pre id="an-ask-view" class="an-text" hidden></pre>
             </div>
 
             <div class="an-pane" id="an-rel">
@@ -1258,6 +1345,15 @@
                       data-tip="Back to the default OFL mapping">Reset</button>
             </div>
             <div id="rw-styleboard" class="drafting"></div>
+            <div class="pane-bar">
+              <span class="tool-label">Instructions for editors / AI</span>
+              <span class="tool-count" id="rw-instr-state"></span>
+              <span class="bar-spacer"></span>
+              <button id="rw-instr-save" class="cad-btn tiny" type="button"
+                      data-tip="Store this note with the book — every .lib export embeds it for external editors and AI assistants">Save</button>
+            </div>
+            <textarea id="rw-instr" class="cad-input" rows="3" spellcheck="false"
+                      placeholder="Per-book guidance that travels inside the exported .lib — e.g. &quot;Latin plant names stay untranslated&quot;"></textarea>
           </div>
           <div id="rw-edit-panel">
           <div class="pane-bar">
@@ -1553,6 +1649,7 @@
         <div id="settings-nav">
           <button class="snav active" data-sec="sec-general" type="button">General</button>
           <button class="snav" data-sec="sec-appearance" type="button">Appearance</button>
+          <button class="snav" data-sec="sec-theme" type="button">Theme editor</button>
           <button class="snav" data-sec="sec-tables" type="button">Table view</button>
           <button class="snav" data-sec="sec-library" type="button">Library &amp; data</button>
           <button class="snav" data-sec="sec-editing" type="button">Editing</button>
@@ -1625,6 +1722,51 @@
               <label class="tool-label" for="font-mono2-select">Tag / marker font</label>
               <select id="font-mono2-select" class="cad-input"></select>
             </div>
+          </div>
+          <div id="sec-theme" class="settings-sec">
+            <div class="settings-head">Theme editor</div>
+            <p class="settings-note">Fine-tune the colours, corners, line weight,
+               text weight and fonts of the selected theme. Edits are saved per theme
+               and layer over the built-in look — reset any single control, or the
+               whole theme, at any time. A font left on <b>Default</b> follows the
+               global choice under <b>Appearance</b>. <b>Duplicate</b> any theme to make
+               your own editable copy: custom themes appear in the theme list in
+               <i>italics</i> and can be renamed, deleted, exported or imported.</p>
+            <div class="te-topbar">
+              <label for="te-theme">Theme</label>
+              <select id="te-theme" class="cad-input"></select>
+              <span id="te-count" class="te-count">No changes</span>
+              <button id="te-reset-theme" class="cad-btn danger te-reset-theme" type="button">Reset this theme</button>
+            </div>
+            <div class="te-savebar">
+              <input id="te-save-name" class="cad-input" placeholder="New name…" spellcheck="false" maxlength="60" />
+              <button id="te-duplicate" class="cad-btn" type="button">Duplicate</button>
+              <button id="te-rename" class="cad-btn" type="button">Rename</button>
+              <button id="te-delete" class="cad-btn" type="button">Delete</button>
+              <span class="te-savebar-sep"></span>
+              <button id="te-export" class="cad-btn" type="button">Export</button>
+              <button id="te-import" class="cad-btn" type="button">Import</button>
+              <input id="te-import-file" type="file" accept=".json,.whltheme,application/json" hidden />
+            </div>
+            <div class="te-preview" aria-hidden="true" inert>
+              <div class="te-pv-bar"><span>Preview</span><span class="te-pv-file">herbarium.pdf</span></div>
+              <div class="te-pv-body">
+                <div class="te-pv-ctl">
+                  <button class="cad-btn" type="button" tabindex="-1">Button</button>
+                  <input class="cad-input" style="width:84px" value="Field" readonly tabindex="-1" />
+                  <span class="te-pv-link">Accent link</span>
+                  <span class="te-pv-link sec">Secondary</span>
+                </div>
+                <div class="te-pv-rows">
+                  <span class="te-pv-row hover">Hover</span>
+                  <span class="te-pv-row checked">Checked</span>
+                  <span class="te-pv-row manual">Manual</span>
+                </div>
+                <div class="te-pv-chips"><span class="ok">&#9679; Success</span><span class="warn">&#9679; Warning</span><span class="err">&#9679; Error</span></div>
+                <div class="te-pv-note">Body ink with <span class="muted">secondary / muted text</span>.</div>
+              </div>
+            </div>
+            <div id="te-rows" class="te-rows"></div>
           </div>
           <div id="sec-tables" class="settings-sec">
             <div class="settings-head">Table view</div>
@@ -2011,8 +2153,6 @@
   <div id="statusbar">
     <span id="status-msg" role="status" aria-live="polite">READY</span>
     <span class="foot-right">
-      <span id="status-smart" class="foot-jobs" hidden
-            data-tip="Smart-check results held for review — TAB (or click here) toggles extracted vs original values, SPACE over a row bakes, Shift+click here dismisses all"></span>
       <span id="status-jobs" class="foot-jobs" hidden
             data-tip="Background jobs running — click for the Workbench jobs drawer"></span>
       <span id="dl-progress" class="dl-progress" hidden

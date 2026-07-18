@@ -25,6 +25,8 @@ import java.util.zip.ZipInputStream
  * row is just as trustworthy under this grammar and arrives while the word is
  * barely off the tongue. The final result still fires (covers a word the
  * partial stream only surfaced once) — the debounce swallows the duplicate.
+ * Exception: a DESTRUCTIVE command (discard) fires only from the FINAL result,
+ * so a mis-heard partial can never void a capture.
  *
  * Cues are plain tones now, so no suppression window is needed: a beep can't
  * spell "photo".
@@ -47,6 +49,9 @@ class VoiceController(
             "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
         const val MODEL_DIR = "vosk-model-small-en-us-0.15"
         val COMMANDS = listOf("start", "photo", "done", "cancel")
+        // Destructive commands never fire from a partial hypothesis (see
+        // handlePartial): only an endpointed FINAL result can void a capture.
+        val DESTRUCTIVE = setOf("cancel")
         // long enough to swallow the final result that trails a partial-fired
         // command; page-flipping cadence never repeats a word this fast
         private const val DEBOUNCE_MS = 1500L
@@ -60,6 +65,7 @@ class VoiceController(
     private val main = Handler(Looper.getMainLooper())
     @Volatile private var stopped = false
     @Volatile private var pausedRequested = false
+    @Volatile private var recognitionGeneration = 0L
     private var errorRestarts = 0
     private var pendingPartial = ""
     private var lastCommand = ""
@@ -141,16 +147,6 @@ class VoiceController(
         // "[unk]" absorbs everything that is not a command word
         val grammar = COMMANDS.joinToString("\", \"", "[\"", "\", \"[unk]\"]")
         val svc = SpeechService(Recognizer(m, 16000.0f, grammar), 16000.0f)
-        val lst = object : RecognitionListener {
-            override fun onResult(hypothesis: String?) = handleFinal(hypothesis)
-            override fun onFinalResult(hypothesis: String?) = handleFinal(hypothesis)
-            override fun onPartialResult(hypothesis: String?) = handlePartial(hypothesis)
-            override fun onError(exception: Exception?) {
-                onState("Voice error: ${exception?.message ?: "?"}")
-                scheduleRestart()   // one dead recognizer must not end hands-free
-            }
-            override fun onTimeout() { /* keeps listening */ }
-        }
         synchronized(this) {
             // a stop/pause (or a second start) landed during the load: discard
             // this service rather than leave the mic on for a dead activity
@@ -160,14 +156,46 @@ class VoiceController(
                 return
             }
             speechService = svc
-            listener = lst
             model = m
             if (!pausedRequested) {
-                svc.startListening(lst)
-                onState("Listening")
+                startListeningLocked(svc)
             }
         }
     }
+
+    /** Start one recognition generation. SpeechService.stop() emits a final
+     *  callback for buffered audio, so every listener carries the generation it
+     *  belongs to; pause, resume, restart, and stop invalidate older callbacks. */
+    private fun startListeningLocked(svc: SpeechService): Boolean {
+        recognitionGeneration += 1
+        pendingPartial = ""
+        val generation = recognitionGeneration
+        val lst = object : RecognitionListener {
+            override fun onResult(hypothesis: String?) = handleFinal(generation, hypothesis)
+            override fun onFinalResult(hypothesis: String?) = handleFinal(generation, hypothesis)
+            override fun onPartialResult(hypothesis: String?) =
+                handlePartial(generation, hypothesis)
+
+            override fun onError(exception: Exception?) {
+                if (!accepts(generation)) return
+                onState("Voice error: ${exception?.message ?: "?"}")
+                scheduleRestart(generation) // one dead recognizer must not end hands-free
+            }
+
+            override fun onTimeout() { /* keeps listening */ }
+        }
+        listener = lst
+        val started = svc.startListening(lst)
+        if (started) onState("Listening")
+        return started
+    }
+
+    private fun accepts(generation: Long): Boolean = recognitionCallbackIsCurrent(
+        callbackGeneration = generation,
+        currentGeneration = recognitionGeneration,
+        paused = pausedRequested,
+        stopped = stopped,
+    )
 
     /** Backgrounded / settings open: actually stop the recorder, not just the
      *  results — SpeechService.setPause keeps AudioRecord running and the OS
@@ -177,54 +205,67 @@ class VoiceController(
      *  can't stall. Main thread only. */
     @Synchronized
     fun setPaused(paused: Boolean) {
+        val wasPaused = pausedRequested
         pausedRequested = paused
         val svc = speechService ?: return    // start() honors the flag instead
         if (paused) {
-            svc.stop()
-        } else {
-            listener?.let { if (svc.startListening(it)) onState("Listening") }
+            if (!wasPaused) {
+                recognitionGeneration += 1  // invalidate before stop() posts final
+                pendingPartial = ""
+                listener = null
+                svc.stop()
+            }
+        } else if (wasPaused || listener == null) {
+            startListeningLocked(svc)
         }
     }
 
     /** A recognizer that died on error gets a few delayed restarts; a clean
      *  result resets the budget, so only a hard-broken mic stays down. */
-    private fun scheduleRestart() {
-        if (stopped || pausedRequested || errorRestarts >= ERROR_RESTART_MAX) return
+    private fun scheduleRestart(generation: Long) {
+        if (!accepts(generation) || errorRestarts >= ERROR_RESTART_MAX) return
         errorRestarts += 1
         main.postDelayed({
             synchronized(this) {
-                if (stopped || pausedRequested) return@postDelayed
+                if (!accepts(generation)) return@postDelayed
                 val svc = speechService ?: return@postDelayed
-                listener?.let { if (svc.startListening(it)) onState("Listening") }
+                startListeningLocked(svc)
             }
         }, ERROR_RESTART_MS * errorRestarts)
     }
 
     /** Same command word in two consecutive partials -> fire now, don't wait
      *  for the endpointer's silence window. */
-    private fun handlePartial(hypothesis: String?) {
+    private fun handlePartial(generation: Long, hypothesis: String?) {
+        if (!accepts(generation)) { pendingPartial = ""; return }
         errorRestarts = 0
         if (hypothesis.isNullOrBlank()) return
         val text = try { JSONObject(hypothesis).optString("partial") } catch (_: Exception) { "" }
         val word = text.split(" ").lastOrNull { it in COMMANDS } ?: return
+        // A destructive command waits for the FINAL result: an endpointed
+        // utterance is far less likely to be a stray partial, so a mis-heard
+        // "cancel" can't void a capture. Others keep the low-latency fast path.
+        if (word in DESTRUCTIVE) { pendingPartial = ""; return }
         if (word == pendingPartial) {
             pendingPartial = ""
-            fire(word)
+            fire(generation, word)
         } else {
             pendingPartial = word
         }
     }
 
-    private fun handleFinal(hypothesis: String?) {
+    private fun handleFinal(generation: Long, hypothesis: String?) {
+        if (!accepts(generation)) { pendingPartial = ""; return }
         errorRestarts = 0
         pendingPartial = ""
         if (hypothesis.isNullOrBlank()) return
         val text = try { JSONObject(hypothesis).optString("text") } catch (_: Exception) { "" }
         val word = text.split(" ").lastOrNull { it in COMMANDS } ?: return
-        fire(word)
+        fire(generation, word)
     }
 
-    private fun fire(word: String) {
+    private fun fire(generation: Long, word: String) {
+        if (!accepts(generation)) return // pause/stop may land after parsing
         val now = System.currentTimeMillis()
         if (word == lastCommand && now - lastCommandAt < DEBOUNCE_MS) return
         lastCommand = word
@@ -236,10 +277,12 @@ class VoiceController(
         stopped = true          // volatile, set BEFORE the lock: a start() whose
         main.removeCallbacksAndMessages(null)   // load is mid-flight reads this
         synchronized(this) {                     // in its final block and bails
+            recognitionGeneration += 1           // invalidate before stop() posts final
+            pendingPartial = ""
+            listener = null
             speechService?.stop()
             speechService?.shutdown()
             speechService = null
-            listener = null
             model?.close()
             model = null
         }

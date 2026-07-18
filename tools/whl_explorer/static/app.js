@@ -37,6 +37,7 @@ const VIEW_STATE_KEYS = new Set([
   "topTable", "bottomActive", "whlMode", "checkedMode", "showCatalog",
   "paneWidth", "uploadSplitH", "publishSidebarCollapsed", "workbenchPhase",
   "jobsDrawerOpen", "authPromptDismissed", "checkedCols",
+  "collapsed", "wbSideCollapsed",
 ]);
 // Credentials are never persisted client-side. They live in the server's
 // Host-guarded secrets store (/api/secrets); Mistral additionally syncs through
@@ -163,6 +164,11 @@ const state = {
   prov: {},                   // manual-form field provenance
   msrcTarget: null,
   mdTarget: null,             // markdown overlay target textarea
+  stagedAlts: {},             // Process mode: target -> {kind,label,alts[]} (server /api/staged)
+  procSelWhl: new Set(),      // Process mode: selected WHL row idxs
+  procSelChecked: new Set(),  // Process mode: selected checked/manual row ids
+  procExpanded: new Set(),    // Process mode: targets whose alternative rows are shown
+  procActionBusy: false,      // a Process action (job) is running
   settings: {
     checkedCols: {}, showCatalog: true,
     markFilter: "ALL", srcFilter: "ALL", dlFilter: "ALL",
@@ -202,9 +208,9 @@ const state = {
                                 // tune to see how shrinking affects quality
     // page-view digit shortcuts: press N over a page to queue it
     ocrKeyMap: { 1: "tesseract", 2: "claude", 3: "textract", 4: "azure", 5: "openai" },
-    // master list -> Google Sheets publishing (Settings > Sync)
+    // master list -> Google Sheets publishing (Settings > Integrations)
     gsSpreadsheetId: "", gsKeyFile: "", gsSheetName: "Master list",
-    // cloud search + downloadable databases (Settings > Sync)
+    // cloud search + downloadable databases (Settings > Integrations)
     cloudSearchUrl: "",         // remote instance of this app; used when no local index
     dbUrls: {},                 // per-database download URLs (name -> url)
     uploadSplitH: null, pdfBrowseDir: "",
@@ -231,6 +237,12 @@ const state = {
     includePrereleaseUpdates: false, // desktop: allow alpha/beta/rc auto-updates
     publishGroup: "sets",           // organization of the Publish file tree
     publishSidebarCollapsed: false,
+    collapsed: {},                  // per-key collapsed state for makeCollapsible sections
+    wbSideCollapsed: false,         // Workbench entries/artifacts sidebar folded away
+    // Settings > Theme editor: per-theme chrome token overrides,
+    // shape { [themeId]: { "--var": "value", … } }. Applied as inline body vars.
+    themeOverrides: {},
+    savedThemes: [],            // saved {name, base, overrides} snapshots (Theme editor)
   },
   editTarget: null,             // record open in the EDIT tab
   sort: { checked: null, whl: null },  // {key, dir} per top table
@@ -538,18 +550,22 @@ function bookParseChanged(a, b) {
 }
 
 function applyTheme() {
-  let t = state.settings.theme || "";
-  // migrate a retired id, and clamp anything unrecognised: an orphan id would
-  // otherwise stick in localStorage, sync to the server, and silently render
-  // the bare :root fallback while the picker showed nothing
-  if (t in LEGACY_THEMES) t = LEGACY_THEMES[t];
-  if (!THEMES.some(([id]) => id === t)) t = DEFAULT_THEME;
-  if (t !== state.settings.theme) {
-    state.settings.theme = t;
-    saveSettings();
+  let id = state.settings.theme || "";
+  // resolve the active theme: a custom theme keeps its id and renders on its
+  // base built-in's chrome; a legacy/unknown built-in id clamps to a survivor
+  // (an orphan id would otherwise stick in localStorage and render the bare
+  // :root fallback while the picker showed nothing)
+  if (!findCustom(id)) {
+    let t = id in LEGACY_THEMES ? LEGACY_THEMES[id] : id;
+    if (!THEMES.some(([x]) => x === t)) t = DEFAULT_THEME;
+    if (t !== state.settings.theme) { state.settings.theme = t; saveSettings(); }
+    id = t;
   }
-  document.body.dataset.theme = t;
-  // a theme can carry its own activity-bar icon set (--icon-style)
+  document.body.dataset.theme = themeBase(id);   // base built-in supplies the CSS chrome
+  applyThemeOverrides();   // this theme's edits (custom.overrides or the built-in's), inline
+  applyFont();             // fonts too: a per-theme override, else the global default
+  // a theme can carry its own activity-bar icon set (--icon-style); runs
+  // after the chrome + overrides land so the computed value is current
   refreshActivityIcons();
 }
 
@@ -561,18 +577,106 @@ function setTheme(id) {
   applyTheme();
   const sel = el("theme-select");
   if (sel) sel.value = id;
+  const te = el("te-theme");
+  if (te) te.value = id;
+  // keep the Theme editor in step when it is open (it edits the active theme)
+  if (el("te-rows") && el("settings-overlay") && !el("settings-overlay").hidden)
+    renderThemeEditor();
 }
 
+// --- theme editor: per-theme chrome token overrides --------------------------
+// The editor writes CSS custom properties as inline styles on <body>. Inline
+// styles beat the body[data-theme] attribute selector, so an override wins over
+// the theme's own value -- the same mechanism applyFont() uses for --mono/--ui.
+// Overrides are keyed by theme id, so each theme carries its own edits and
+// switching theme swaps the whole set.
+
+// font vars are owned by applyFont(); the token editor must never touch them
+const THEME_FONT_VARS = new Set(["--mono", "--mono2", "--ui"]);
+// the vars currently applied inline -- tracked so the next apply can remove the
+// ones no longer overridden (a reset must clear the stale inline value)
+let _appliedThemeVars = [];
+
+function applyThemeOverrides() {
+  for (const name of _appliedThemeVars) document.body.style.removeProperty(name);
+  _appliedThemeVars = [];
+  const ov = activeOverrides();
+  for (const [name, val] of Object.entries(ov)) {
+    if (THEME_FONT_VARS.has(name) || val == null || val === "") continue;
+    document.body.style.setProperty(name, val);
+    _appliedThemeVars.push(name);
+  }
+}
+
+// fonts resolve per-theme-override first, then the global Appearance setting,
+// then the :root default. Kept out of applyThemeOverrides() (which owns the
+// non-font tokens) so the two never fight over the same inline body vars.
+const FONT_SETTING_VARS = [["fontUi", "--ui"], ["font", "--mono"], ["fontMono2", "--mono2"]];
 function applyFont() {
-  const f = state.settings.font || "";
-  if (f) document.body.style.setProperty("--mono", f);
-  else document.body.style.removeProperty("--mono");
-  const u = state.settings.fontUi || "";
-  if (u) document.body.style.setProperty("--ui", u);
-  else document.body.style.removeProperty("--ui");
-  const m2 = state.settings.fontMono2 || "";
-  if (m2) document.body.style.setProperty("--mono2", m2);
-  else document.body.style.removeProperty("--mono2");
+  const ov = activeOverrides();
+  for (const [key, cssVar] of FONT_SETTING_VARS) {
+    const val = ov[cssVar] || state.settings[key] || "";   // per-theme, else global, else default
+    if (val) document.body.style.setProperty(cssVar, val);
+    else document.body.style.removeProperty(cssVar);
+  }
+}
+
+// --- theme model: built-in themes (THEMES + CSS body[data-theme]) plus user
+// "custom" themes (settings.savedThemes: {id, name, base, overrides}). A custom
+// theme renders as its base built-in's chrome with its own overrides layered on
+// top, so it reuses the whole override/font machinery; only the pickers and the
+// Settings menu need to know custom themes exist.
+function customThemes() { return state.settings.savedThemes || []; }
+function findCustom(id) { return customThemes().find((t) => t && t.id === id); }
+// the built-in id whose CSS chrome a theme uses (a custom's base, else itself,
+// normalized through the legacy map and clamped to a real built-in)
+function themeBase(id) {
+  const c = findCustom(id);
+  let b = c ? c.base : id;
+  if (b in LEGACY_THEMES) b = LEGACY_THEMES[b];
+  return THEMES.some(([x]) => x === b) ? b : DEFAULT_THEME;
+}
+// the override map that IS a theme's edits (custom.overrides, or the built-in's
+// themeOverrides[base]); created on demand only when `create` is set
+function themeOverrideMap(id, create) {
+  const c = findCustom(id);
+  if (c) return c.overrides || (create ? (c.overrides = {}) : {});
+  const base = themeBase(id), o = state.settings.themeOverrides;
+  return o[base] || (create ? (o[base] = {}) : {});
+}
+function activeOverrides() { return themeOverrideMap(state.settings.theme, false); }
+function themeLabelOf(id) {
+  const c = findCustom(id);
+  return c ? c.name : (THEMES.find(([x]) => x === id) || [, id])[1];
+}
+// [id, label, isCustom] for every selectable theme (built-ins, then customs)
+function allThemes() {
+  return THEMES.map(([id, label]) => [id, label, false])
+    .concat(customThemes().map((t) => [t.id, t.name, true]));
+}
+function newThemeId() {
+  const used = new Set(customThemes().map((t) => t.id));
+  let n = 1; while (used.has("custom-" + n)) n++;
+  return "custom-" + n;
+}
+// fill a <select> with built-ins + custom themes (custom shown italic)
+function fillThemeSelect(sel) {
+  if (!sel) return;
+  sel.innerHTML = "";
+  for (const [id, label, custom] of allThemes()) {
+    const o = document.createElement("option");
+    o.value = id; o.textContent = label;
+    if (custom) o.style.fontStyle = "italic";
+    sel.appendChild(o);
+  }
+  sel.value = state.settings.theme;
+}
+// rebuild everywhere the theme list appears, after a custom theme is added,
+// renamed or removed
+function refreshThemePickers() {
+  fillThemeSelect(el("theme-select"));
+  fillThemeSelect(el("te-theme"));
+  buildThemeMenu();
 }
 
 // --- Experimental: interface sharpening ---------------------------------------
@@ -1278,6 +1382,9 @@ function normalizeSettings() {
   if (!["sets", "author", "category", "date"].includes(state.settings.publishGroup))
     state.settings.publishGroup = "sets";
   state.settings.publishSidebarCollapsed = !!state.settings.publishSidebarCollapsed;
+  if (!state.settings.collapsed || typeof state.settings.collapsed !== "object")
+    state.settings.collapsed = {};
+  state.settings.wbSideCollapsed = !!state.settings.wbSideCollapsed;
   if (!["tesseract", "mistral", "claude", "textract"].includes(state.settings.ocrService))
     state.settings.ocrService = "tesseract";
   state.settings.textAnalysisService = "configured";
@@ -1290,6 +1397,25 @@ function normalizeSettings() {
   if (!state.settings.dbUrls || typeof state.settings.dbUrls !== "object")
     state.settings.dbUrls = {};
   state.settings.colVis = state.settings.colVis || {};
+  if (!state.settings.themeOverrides || typeof state.settings.themeOverrides !== "object")
+    state.settings.themeOverrides = {};
+  if (!Array.isArray(state.settings.savedThemes)) state.settings.savedThemes = [];
+  // custom themes need a stable unique id + a well-formed shape (older snapshots
+  // predate the id; a duplicate/missing id would collide in the picker)
+  state.settings.savedThemes = state.settings.savedThemes.filter((t) => t && typeof t === "object");
+  {
+    const used = new Set();
+    for (const t of state.settings.savedThemes) {
+      if (typeof t.id !== "string" || !t.id || used.has(t.id)) {
+        let n = 1; while (used.has("custom-" + n)) n++;
+        t.id = "custom-" + n;
+      }
+      used.add(t.id);
+      if (typeof t.name !== "string" || !t.name) t.name = "Custom";
+      if (typeof t.base !== "string") t.base = DEFAULT_THEME;
+      if (!t.overrides || typeof t.overrides !== "object") t.overrides = {};
+    }
+  }
   state.settings.colWidths = state.settings.colWidths || {};
   // migrate the old single-table column setting
   if (Object.keys(state.settings.checkedCols).length &&
@@ -2773,7 +2899,7 @@ function fillFontSelect(id, list, settingKey, apply) {
   };
 }
 
-// --- Settings > Sync: downloadable databases --------------------------------
+// --- Settings > Integrations: downloadable databases ------------------------
 
 let _dbPollTimer = null;
 
@@ -3001,14 +3127,7 @@ function renderSettings() {
 
   // APPEARANCE
   const themeSel = el("theme-select");
-  themeSel.innerHTML = "";
-  for (const [id, label] of THEMES) {
-    const o = document.createElement("option");
-    o.value = id;
-    o.textContent = label;
-    themeSel.appendChild(o);
-  }
-  themeSel.value = state.settings.theme;   // applyTheme() has already normalized it
+  fillThemeSelect(themeSel);               // built-ins + custom themes (custom italic)
   themeSel.onchange = () => setTheme(themeSel.value);
   const scaleSel = el("ui-scale-select");
   if (scaleSel) {
@@ -3020,6 +3139,7 @@ function renderSettings() {
   fillFontSelect("font-ui-select", FONT_CHOICES, "fontUi", applyFont);
   fillFontSelect("font-select", FONT_CHOICES, "font", applyFont);
   fillFontSelect("font-mono2-select", FONT_CHOICES, "fontMono2", applyFont);
+  renderThemeEditor();
 
   // AI
   for (const [id, k] of [["set-r2-account", "r2Account"], ["set-r2-bucket", "r2Bucket"],
@@ -3324,6 +3444,377 @@ function renderSettings() {
     };
   }
   syncPrereleaseEnabled();
+}
+
+// --- Settings > Theme editor --------------------------------------------------
+// The chrome tokens the editor exposes, grouped for the panel. Colours are
+// #rrggbb via the native <input type=color>; --radius/--border-w are px lengths
+// (slider + number); weights are a fixed dropdown. Font-family vars are
+// deliberately excluded -- they are global and stay under Appearance.
+const THEME_TOKENS = [
+  ["Accent & primary", [
+    { v: "--cyan",  l: "Accent (focus, links)", t: "color" },
+    { v: "--blue",  l: "Primary (title bar, tabs)", t: "color" },
+    { v: "--blue2", l: "Secondary", t: "color" },
+  ]],
+  ["Surfaces", [
+    { v: "--canvas",      l: "Canvas / paper", t: "color" },
+    { v: "--face",        l: "Panel face", t: "color" },
+    { v: "--face-hi",     l: "Panel raised", t: "color" },
+    { v: "--face-active", l: "Panel active", t: "color" },
+    { v: "--input-bg",    l: "Field background", t: "color" },
+  ]],
+  ["Text", [
+    { v: "--ink",       l: "Text", t: "color" },
+    { v: "--ink-light", l: "Text secondary", t: "color" },
+    { v: "--input-ink", l: "Field text", t: "color" },
+  ]],
+  ["Borders & rules", [
+    { v: "--face-sh",     l: "Border — light", t: "color" },
+    { v: "--face-sh2",    l: "Border — strong / muted text", t: "color" },
+    { v: "--canvas-line", l: "Table rules", t: "color" },
+  ]],
+  ["Rows", [
+    { v: "--row-hover",   l: "Row — hover", t: "color" },
+    { v: "--row-checked", l: "Row — checked", t: "color" },
+    { v: "--row-manual",  l: "Row — manual", t: "color" },
+  ]],
+  ["Status", [
+    { v: "--green", l: "Success", t: "color" },
+    { v: "--amber", l: "Warning", t: "color" },
+    { v: "--red",   l: "Error", t: "color" },
+  ]],
+  ["Geometry", [
+    { v: "--radius",   l: "Corner rounding", t: "len", min: 0, max: 14, step: 1, unit: "px", def: "4px" },
+    { v: "--border-w", l: "Border weight",   t: "len", min: 1, max: 3,  step: 1, unit: "px", def: "1px" },
+  ]],
+  ["Typography", [
+    { v: "--wt-ui",     l: "Interface weight", t: "wt", def: "400",
+      opts: [["400", "Regular"], ["500", "Medium"], ["600", "Semibold"]] },
+    { v: "--wt-strong", l: "Heading weight",   t: "wt", def: "700",
+      opts: [["400", "Regular"], ["500", "Medium"], ["600", "Semibold"], ["700", "Bold"]] },
+  ]],
+  // fonts are per-theme here; "Default" falls back to the global Appearance font
+  ["Fonts", [
+    { v: "--ui",    l: "Interface font", t: "font" },
+    { v: "--mono",  l: "Data / table font", t: "font" },
+    { v: "--mono2", l: "Tag / marker font", t: "font" },
+  ]],
+];
+
+// the exact set of tokens the editor owns -- the allowlist for imports
+const THEME_TOKEN_VARS = new Set(THEME_TOKENS.flatMap(([, toks]) => toks.map((t) => t.v)));
+// keep only known "--token": "safe value" pairs -- defends applyThemeOverrides and
+// the font path against a hand-edited or hostile imported theme file: reject
+// unknown keys, non-strings, empty/oversized values, and anything with CSS
+// punctuation (a url(...) in a token consumed by background: would phone home).
+function sanitizeOverrides(o) {
+  const out = {};
+  if (o && typeof o === "object" && !Array.isArray(o)) {
+    for (const [k, v] of Object.entries(o)) {
+      if (!THEME_TOKEN_VARS.has(k) || typeof v !== "string") continue;
+      const val = v.trim();
+      if (!val || val.length > 200) continue;
+      if (/[();]|url\(|@import|expression|javascript:/i.test(val)) continue;
+      out[k] = val;
+    }
+  }
+  return out;
+}
+
+// coerce a colour token to #rrggbb for <input type=color> (theme values are
+// authored as 6-digit hex, but be defensive about #rgb and stray whitespace)
+function themeHex(v) {
+  v = String(v == null ? "" : v).trim();
+  const m3 = /^#([0-9a-f])([0-9a-f])([0-9a-f])$/i.exec(v);
+  if (m3) return ("#" + m3[1] + m3[1] + m3[2] + m3[2] + m3[3] + m3[3]).toLowerCase();
+  return /^#[0-9a-f]{6}$/i.test(v) ? v.toLowerCase() : "#000000";
+}
+
+// Build the Theme editor panel for the active theme. Rebuilt whenever the
+// dialog opens or the theme changes; seeds each control from the effective
+// value (override if set, else the theme's own resolved value).
+function renderThemeEditor() {
+  const host = el("te-rows");
+  if (!host) return;
+  const activeId = state.settings.theme;
+  const custom = findCustom(activeId);
+  const base = themeBase(activeId);        // = document.body.dataset.theme; the base chrome
+
+  // theme picker: rebuilt each render (custom themes change); switching switches
+  // both the active theme and what the editor edits
+  const tsel = el("te-theme");
+  if (tsel) {
+    fillThemeSelect(tsel);
+    tsel.onchange = () => setTheme(tsel.value);
+  }
+
+  const cs = getComputedStyle(document.body);
+  const getOv = () => themeOverrideMap(activeId, true);    // create-on-demand edit target
+  const ov = themeOverrideMap(activeId, false);
+  // effective value: the override if present, else the theme's own value
+  // (resolved from CSS; synthetic tokens with no CSS value fall back to def)
+  const eff = (tok) => {
+    if (ov[tok.v] != null) return ov[tok.v];
+    const c = cs.getPropertyValue(tok.v).trim();
+    return c || tok.def || "";
+  };
+
+  function updateCount() {
+    const n = Object.keys(themeOverrideMap(activeId, false)).length;
+    const c = el("te-count");
+    if (c) {
+      c.textContent = n ? `${n} override${n === 1 ? "" : "s"}` : "No changes";
+      c.classList.toggle("dirty", n > 0);
+    }
+    const rb = el("te-reset-theme");
+    if (rb) rb.disabled = n === 0;
+  }
+
+  const setTok = (tok, val) => {
+    getOv()[tok.v] = val;
+    document.body.style.setProperty(tok.v, val);          // live preview
+    if (!_appliedThemeVars.includes(tok.v)) _appliedThemeVars.push(tok.v);
+    updateCount();
+  };
+  const resetTok = (tok) => {
+    delete themeOverrideMap(activeId, false)[tok.v];
+    // built-in: drop the now-empty override object. A custom theme is kept even
+    // with no overrides -- it is still a distinct theme (identical to its base).
+    if (!custom) {
+      const bm = state.settings.themeOverrides[base];
+      if (bm && !Object.keys(bm).length) delete state.settings.themeOverrides[base];
+    }
+    saveSettings();
+    applyThemeOverrides();
+    applyFont();               // a reset font token falls back to the global default
+    renderThemeEditor();
+  };
+
+  host.innerHTML = "";
+  for (const [group, toks] of THEME_TOKENS) {
+    const h = document.createElement("div");
+    h.className = "settings-subhead";
+    h.textContent = group;
+    host.appendChild(h);
+
+    for (const tok of toks) {
+      const lab = document.createElement("label");
+      lab.textContent = tok.l;
+      const ctl = document.createElement("div");
+      ctl.className = "te-ctl";
+
+      const rev = document.createElement("button");
+      rev.type = "button";
+      rev.className = "te-revert" + (ov[tok.v] != null ? " on" : "");
+      rev.textContent = "↺";                          // reset arrow
+      rev.title = "Reset to theme default";
+      rev.addEventListener("click", () => resetTok(tok));
+      const markDirty = () => rev.classList.add("on");
+
+      if (tok.t === "color") {
+        const hex = themeHex(eff(tok));
+        const sw = document.createElement("input");
+        sw.type = "color"; sw.className = "te-swatch"; sw.value = hex;
+        const tx = document.createElement("input");
+        tx.className = "cad-input te-hex"; tx.value = hex.toUpperCase();
+        tx.spellcheck = false; tx.maxLength = 7;
+        sw.addEventListener("input", () => {
+          tx.value = sw.value.toUpperCase(); tx.classList.remove("bad");
+          setTok(tok, sw.value); markDirty();
+        });
+        sw.addEventListener("change", saveSettings);
+        tx.addEventListener("input", () => {
+          const val = tx.value.trim();
+          if (/^#[0-9a-fA-F]{6}$/.test(val)) {
+            sw.value = val.toLowerCase(); tx.classList.remove("bad");
+            setTok(tok, val.toLowerCase()); markDirty();
+          } else {
+            tx.classList.add("bad");
+          }
+        });
+        tx.addEventListener("change", () => {
+          tx.value = sw.value.toUpperCase();   // snap back to the last valid colour
+          tx.classList.remove("bad"); saveSettings();
+        });
+        ctl.append(sw, tx);
+      } else if (tok.t === "len") {
+        const cur = parseInt(eff(tok), 10) || 0;
+        const rng = document.createElement("input");
+        rng.type = "range"; rng.className = "te-range";
+        rng.min = tok.min; rng.max = tok.max; rng.step = tok.step; rng.value = cur;
+        const num = document.createElement("input");
+        num.type = "number"; num.className = "cad-input te-num";
+        num.min = tok.min; num.max = tok.max; num.step = tok.step; num.value = cur;
+        const unit = document.createElement("span");
+        unit.className = "te-unit"; unit.textContent = tok.unit;
+        const apply = (raw, persist) => {
+          const n = Math.max(tok.min, Math.min(tok.max, parseInt(raw, 10) || 0));
+          rng.value = n; num.value = n;
+          setTok(tok, n + tok.unit); markDirty();
+          if (persist) saveSettings();
+        };
+        rng.addEventListener("input", () => apply(rng.value, false));
+        rng.addEventListener("change", () => apply(rng.value, true));
+        num.addEventListener("change", () => apply(num.value, true));
+        ctl.append(rng, num, unit);
+      } else if (tok.t === "font") {
+        const sel = document.createElement("select");
+        sel.className = "cad-input te-fontsel";
+        const def = document.createElement("option");
+        def.value = ""; def.textContent = "Default (Appearance)";
+        sel.appendChild(def);
+        for (const [val, name] of FONT_CHOICES) {
+          if (!val) continue;                              // skip FONT_CHOICES' own "Default"
+          const o = document.createElement("option");
+          o.value = val; o.textContent = name;
+          sel.appendChild(o);
+        }
+        const stored = ov[tok.v] || "";
+        sel.value = stored;
+        if (sel.value !== stored) {                        // an imported/custom stack: keep it
+          const o = document.createElement("option");
+          o.value = stored; o.textContent = "Custom";
+          sel.appendChild(o); sel.value = stored;
+        }
+        sel.addEventListener("change", () => {
+          if (sel.value) { getOv()[tok.v] = sel.value; markDirty(); }
+          else {
+            delete themeOverrideMap(activeId, false)[tok.v];
+            if (!custom) {
+              const bm = state.settings.themeOverrides[base];
+              if (bm && !Object.keys(bm).length) delete state.settings.themeOverrides[base];
+            }
+            rev.classList.remove("on");
+          }
+          applyFont(); saveSettings(); updateCount();      // fonts: applyFont, not setTok
+        });
+        ctl.append(sel);
+      } else {                                             // weight dropdown
+        const sel = document.createElement("select");
+        sel.className = "cad-input te-wsel";
+        for (const [val, name] of tok.opts) {
+          const o = document.createElement("option");
+          o.value = val; o.textContent = `${name} (${val})`;
+          sel.appendChild(o);
+        }
+        sel.value = String(parseInt(eff(tok), 10) || tok.def);
+        sel.addEventListener("change", () => {
+          setTok(tok, sel.value); markDirty(); saveSettings();
+        });
+        ctl.append(sel);
+      }
+
+      ctl.appendChild(rev);
+      host.append(lab, ctl);
+    }
+  }
+  updateCount();
+
+  const resetBtn = el("te-reset-theme");
+  if (resetBtn) resetBtn.onclick = () => {
+    if (custom) {
+      if (!custom.overrides || !Object.keys(custom.overrides).length) return;
+      custom.overrides = {};
+    } else {
+      const bm = state.settings.themeOverrides[base];
+      if (!bm || !Object.keys(bm).length) return;
+      delete state.settings.themeOverrides[base];
+    }
+    saveSettings();
+    applyThemeOverrides();
+    applyFont();
+    renderThemeEditor();
+  };
+
+  // --- custom themes: Duplicate (copy any theme into a new editable one),
+  // Rename / Delete (custom only), and file Export / Import ---
+  const clone = (o) => JSON.parse(JSON.stringify(o || {}));
+  const normBase = (id) => {
+    const b = id in LEGACY_THEMES ? LEGACY_THEMES[id] : id;
+    return THEMES.some(([x]) => x === b) ? b : DEFAULT_THEME;
+  };
+  const nameEl = el("te-save-name");
+  const onClick = (id, fn) => { const b = el(id); if (b) b.onclick = fn; };
+  const setDisabled = (id, v) => { const b = el(id); if (b) b.disabled = v; };
+  setDisabled("te-rename", !custom);   // built-in themes can't be renamed or deleted
+  setDisabled("te-delete", !custom);
+
+  onClick("te-duplicate", () => {
+    const nid = newThemeId();
+    const typed = nameEl && nameEl.value.trim();
+    const name = (typed || `${themeLabelOf(activeId)} copy`).slice(0, 60);
+    customThemes().push({ id: nid, name, base, overrides: clone(themeOverrideMap(activeId, false)) });
+    if (nameEl) nameEl.value = "";
+    saveSettings();
+    refreshThemePickers();
+    setTheme(nid);           // switch to (and edit) the new copy
+    status(`CREATED THEME "${name}"`);
+  });
+  onClick("te-rename", () => {
+    if (!custom) { statusErr("RENAME :: duplicate a built-in theme first"); return; }
+    const typed = nameEl && nameEl.value.trim();
+    if (!typed) { statusErr("RENAME :: type a name first"); return; }
+    custom.name = typed.slice(0, 60);
+    if (nameEl) nameEl.value = "";
+    saveSettings();
+    refreshThemePickers();
+    renderThemeEditor();
+    status(`RENAMED THEME "${custom.name}"`);
+  });
+  onClick("te-delete", () => {
+    if (!custom) return;
+    const i = customThemes().indexOf(custom);
+    const nm = custom.name;
+    if (i >= 0) customThemes().splice(i, 1);
+    saveSettings();
+    refreshThemePickers();
+    setTheme(base);          // fall back to the base built-in
+    status(`DELETED THEME "${nm}"`);
+  });
+  onClick("te-export", () => {
+    const payload = {
+      app: "whl-theme", version: 1,
+      name: themeLabelOf(activeId), base,
+      overrides: clone(themeOverrideMap(activeId, false)),
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${(custom ? custom.name : base).replace(/[^\w.-]+/g, "-").toLowerCase()}.whltheme.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    status("EXPORTED THEME");
+  });
+  onClick("te-import", () => { const f = el("te-import-file"); if (f) f.click(); });
+  const fileEl = el("te-import-file");
+  if (fileEl) fileEl.onchange = () => {
+    const f = fileEl.files && fileEl.files[0];
+    fileEl.value = "";
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      let obj;
+      try { obj = JSON.parse(reader.result); }
+      catch (e) { statusErr("IMPORT FAILED :: not valid JSON"); return; }
+      // require the export handshake so a stray .json can't masquerade as a theme
+      if (!obj || typeof obj !== "object" || obj.app !== "whl-theme" ||
+          typeof obj.base !== "string" || !obj.overrides || typeof obj.overrides !== "object") {
+        statusErr("IMPORT FAILED :: not a Library Tool theme file");
+        return;
+      }
+      const b = normBase(obj.base);
+      const overrides = sanitizeOverrides(obj.overrides);
+      const name = ((typeof obj.name === "string" && obj.name.trim()) || `${themeLabelOf(b)} import`).slice(0, 60);
+      const nid = newThemeId();
+      customThemes().push({ id: nid, name, base: b, overrides });   // import creates a new custom theme
+      saveSettings();
+      refreshThemePickers();
+      setTheme(nid);
+      status(`IMPORTED THEME "${name}"`);
+    };
+    reader.readAsText(f);
+  };
 }
 
 function initSettingsNav() {
@@ -5216,7 +5707,8 @@ function checkedRowTr(row, cmode, opts) {
     const val = f === "title" && hideTitle ? ""
       : f === "categories" ? bookCatsText(b) : b[f];
     const classes = [], attrs = [];
-    if (cmode !== "search" && !(row.kind === "manual" && f === "acquired")) {
+    // editable only in Edit mode (Process mode is review-only, like the WHL table)
+    if (cmode === "edit" && !(row.kind === "manual" && f === "acquired")) {
       classes.push("editable");
       attrs.push(`data-edit="${f}"`);
     }
@@ -5238,7 +5730,6 @@ function checkedRowTr(row, cmode, opts) {
     <td class="col-whl">${iaCell(row)}</td>
     <td class="col-whl">${scanBadge(row, "hathitrust")}</td>
     <td class="col-whl">${markCell(row)}</td>`;
-  scDecorateCheckedRow(tr, row);
   return tr;
 }
 
@@ -5379,25 +5870,54 @@ function renderChecked() {
   // flatten sets (a header + its expanded volumes) into one ordered list so the
   // streamer can chunk across set boundaries.
   const items = [];
+  const proc = cmode === "process";
+  if (proc) {
+    // drop selections for rows the current filter no longer shows
+    const visible = new Set(rows.map((r) => String(r.id)));
+    const before = state.procSelChecked.size;
+    for (const k of [...state.procSelChecked]) if (!visible.has(k)) state.procSelChecked.delete(k);
+    if (state.procSelChecked.size !== before) renderProcBar();
+  }
+  const pushAlts = (row) => {
+    if (!proc) return;
+    const target = rowTarget(row);
+    if (stagedFor(target) && state.procExpanded.has(target)) {
+      const pf = checkedParentFields(row);
+      for (const alt of stagedFor(target).alts) items.push({ alt, target, pf });
+    }
+  };
   for (const item of groupSets(rows)) {
     if (item.type === "set") {
       items.push({ set: item });
       if (item.expanded) {
-        item.vols.forEach((vr, i) =>
-          items.push({ vr, setKey: item.key, last: i === item.vols.length - 1 }));
+        item.vols.forEach((vr, i) => {
+          items.push({ vr, setKey: item.key, last: i === item.vols.length - 1 });
+          pushAlts(vr);
+        });
       }
     } else {
       items.push({ row: item.row });
+      pushAlts(item.row);
     }
   }
   streamRows(tbody, items, (d) => {
+    if (d.alt) return procAltTr(d.target, d.alt, d.pf, "checked");
     if (d.set) return checkedSetHeaderTr(d.set, cmode);
+    let tr, row;
     if (d.vr) {
-      const tr = checkedRowTr(d.vr, cmode, { isVol: true, setKey: d.setKey });
+      tr = checkedRowTr(d.vr, cmode, { isVol: true, setKey: d.setKey });
       if (d.last) tr.classList.add("set-last");
-      return tr;
+      row = d.vr;
+    } else {
+      tr = checkedRowTr(d.row, cmode, {});
+      row = d.row;
     }
-    return checkedRowTr(d.row, cmode, {});
+    if (proc) {
+      const target = rowTarget(row), e = stagedFor(target);
+      decorateProcParent(tr, target, "checked", !!e, procSel("checked").has(String(row.id)));
+      if (e) markParentDiff(tr, target, checkedParentFields(row), "checked");
+    }
+    return tr;
   });
 
   applyTableChrome("checked");
@@ -5434,6 +5954,8 @@ function onCheckedClick(ev) {
   }
   // plain click anywhere on a set header (arrow, tag, title) expands/collapses it
   if (setHdr) { toggleSet(setHdr.dataset.setKey); return; }
+  // Process mode owns plain clicks: checkbox / expand arrow / row selection
+  if (procTableClick(ev, "checked")) return;
   const mark = ev.target.closest(".vmark");
   if (mark) {
     const unit = mark.closest("[data-vsrc]");
@@ -5592,6 +6114,164 @@ function onRowDeleteKey(ev) {
   else uncheckRow(row.id);
 }
 
+// --- Ctrl+C / Ctrl+V field copy & paste ----------------------------------------
+// UI text isn't selectable by click-drag (see the user-select policy in
+// style.css). Instead you hover a table cell and press Ctrl+C to copy that one
+// field, or Ctrl+V to paste into it (Edit mode). A real text selection inside an
+// editable field or the OCR/facsimile panes still copies/pastes the native way.
+
+// The table cell currently under the mouse, across every catalog table.
+function hoveredCell() {
+  return document.querySelector(
+    "#checked-rows td:hover, #whltop-rows td:hover, " +
+    "#upload-rows td:hover, #bottom-rows td:hover");
+}
+
+// The field name a cell edits (data-edit for checked/manual, data-wedit for
+// WHL), or "" in search/process mode where cells aren't tagged for editing.
+function cellFieldName(td) {
+  return td.dataset.edit || td.dataset.wedit || "";
+}
+
+// The value to copy: prefer the row model's clean value when the field is known,
+// else the cell's visible text with decorative glyphs (wands, arrows, icons)
+// stripped so a copied title never carries the smart-scan wand or a set arrow.
+function cellCopyValue(td) {
+  const tr = td.closest("tr");
+  if (td.dataset.wedit && tr && tr.dataset.widx != null) {
+    const row = whlRowByIdx(parseInt(tr.dataset.widx, 10));
+    if (row && row[td.dataset.wedit] != null) return String(row[td.dataset.wedit]);
+  }
+  if (td.dataset.edit && tr && tr.dataset.rowId) {
+    const row = state.rowsById.get(String(tr.dataset.rowId));
+    if (row && row.book && row.book[td.dataset.edit] != null) return String(row.book[td.dataset.edit]);
+  }
+  const clone = td.cloneNode(true);
+  clone.querySelectorAll(".sc-wand, .set-arrow, .icon-label, [data-icon], svg, button, " +
+    ".cell-edit, .src-mark, .src-edited, .proc-box, .proc-arrow, .proc-srctag")
+    .forEach((n) => n.remove());
+  return clone.textContent.replace(/\s+/g, " ").trim();
+}
+
+// Trim a value for the one-line footer note.
+function clipNote(v) {
+  v = String(v);
+  return v.length > 60 ? v.slice(0, 57) + "…" : v;
+}
+
+// Copy text to the clipboard (async API, with an execCommand fallback).
+function copyText(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(text);
+  } catch (e) { /* fall through */ }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.cssText = "position:fixed;top:0;left:0;opacity:0";
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  try { document.execCommand("copy"); } catch (e) { /* ignore */ }
+  ta.remove();
+  return Promise.resolve();
+}
+
+// Restart-safe flash: re-trigger the CSS animation even on a repeated copy.
+function flashCell(td, cls) {
+  td.classList.remove(cls);
+  void td.offsetWidth;
+  td.classList.add(cls);
+  setTimeout(() => td.classList.remove(cls), 650);
+}
+
+// Set the footer note and make it glow briefly, so a copy/paste registers.
+let _copyFlashTimer = null;
+function statusFlash(msg) {
+  status(msg);
+  const n = el("status-msg");
+  n.classList.remove("copy-flash");
+  void n.offsetWidth;
+  n.classList.add("copy-flash");
+  clearTimeout(_copyFlashTimer);
+  _copyFlashTimer = setTimeout(() => n.classList.remove("copy-flash"), 1000);
+}
+
+// A floating popup (context menu, advanced-search) is open — like the Delete
+// shortcut, hovered-field copy/paste must not act underneath it.
+function floatingPopupOpen() {
+  const pm = el("popup-menu"), asp = el("adv-search-pop");
+  return (pm && !pm.hidden) || (asp && !asp.hidden);
+}
+let _fieldPasteBusy = false;
+
+function onFieldCopyKey(ev) {
+  if (ev.key !== "c" && ev.key !== "C") return;
+  if (!(ev.ctrlKey || ev.metaKey) || ev.altKey) return;
+  const t = ev.target;
+  if (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable)) return; // native copy
+  const sel = window.getSelection && window.getSelection();
+  if (sel && String(sel).length) return;   // a real selection (e.g. an OCR pane) — native copy
+  if (floatingPopupOpen()) return;
+  const td = hoveredCell();
+  if (!td) return;
+  const val = cellCopyValue(td);
+  ev.preventDefault();
+  copyText(val);
+  flashCell(td, "cell-copied");
+  const f = cellFieldName(td);
+  statusFlash(f ? `COPIED ${f.toUpperCase()}: ${clipNote(val)}` : `COPIED: ${clipNote(val)}`);
+}
+
+// Write a pasted value into a hovered editable cell through the same persisted,
+// undoable path the inline editor uses. Returns true on a real change.
+async function pasteIntoCell(td, field, text) {
+  const tr = td.closest("tr");
+  if (td.dataset.wedit) {
+    const idx = parseInt(tr.dataset.widx, 10);
+    const row = whlRowByIdx(idx);
+    if (!row) return false;
+    if (text === String(row[field] || "").trim()) return false;
+    const before = whlFieldSnaps(row, [field]);
+    if (await whlPost({ idx, fields: { [field]: text } })) {
+      pushWhlFieldsOp(`paste WHL ${field} of ${row.title.slice(0, 28)}`, idx, before, { [field]: text });
+      return true;
+    }
+    statusErr("WHL PASTE FAILED");
+    return false;
+  }
+  if (field === "categories") { statusErr("PASTE: categories edit through the picker"); return false; }
+  const row = state.rowsById.get(String(tr.dataset.rowId));
+  if (!row) return false;
+  if (text === String(row.book[field] || "").trim()) return false;
+  // title/volume carry the volume-designator magic, so route those through commitEdit
+  if (field === "title" || field === "volume") return !!(await commitEdit(row, field, text));
+  return await applyEditPatch(row, { [field]: text });
+}
+
+async function onFieldPasteKey(ev) {
+  if (ev.key !== "v" && ev.key !== "V") return;
+  if (!(ev.ctrlKey || ev.metaKey) || ev.altKey || ev.repeat) return;   // ignore key auto-repeat
+  const t = ev.target;
+  if (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable)) return; // native paste
+  if (floatingPopupOpen()) return;
+  const td = hoveredCell();
+  if (!td) return;
+  const field = cellFieldName(td);
+  if (!field) { ev.preventDefault(); statusErr("PASTE: hover an editable field (Edit mode)"); return; }
+  ev.preventDefault();
+  if (_fieldPasteBusy) return;             // one in-flight paste at a time
+  _fieldPasteBusy = true;
+  try {
+    let text = "";
+    try { text = await navigator.clipboard.readText(); } catch (e) { text = ""; }
+    text = String(text || "").replace(/\s+/g, " ").trim();
+    if (!text) { statusErr("PASTE: clipboard empty or unavailable"); return; }
+    if (await pasteIntoCell(td, field, text)) {
+      flashCell(td, "cell-pasted");
+      statusFlash(`PASTED ${field.toUpperCase()}: ${clipNote(text)}`);
+    }
+  } finally { _fieldPasteBusy = false; }
+}
+
 // --- click-to-edit cells --------------------------------------------------------
 
 function startEdit(td) {
@@ -5715,6 +6395,7 @@ async function commitEdit(row, field, value) {
     }
   }
   renderChecked();
+  return ok;
 }
 
 // --- generalized top / bottom panes ----------------------------------------------
@@ -6218,8 +6899,8 @@ function addChBook(idx) {
 
 // --- top pane: WHL catalog view (modes, corrections, scrape) ---------------------
 
-function whlMode() { return state.settings.whlMode === "search" ? "search" : "edit"; }
-function checkedMode() { return state.settings.checkedMode === "search" ? "search" : "edit"; }
+function whlMode() { const m = state.settings.whlMode; return m === "search" || m === "process" ? m : "edit"; }
+function checkedMode() { const m = state.settings.checkedMode; return m === "search" || m === "process" ? m : "edit"; }
 
 // the active top table's EDIT / SEARCH mode
 function topMode() {
@@ -6233,7 +6914,8 @@ function updateModeTag() {
   const m = topMode();
   const name = state.settings.topTable === "whl" ? "WHL" : "Checked";
   tag.textContent = `${name} mode: ${m}`;
-  tag.className = "foot-tag " + (m === "edit" ? "tag-edit" : "tag-search");
+  tag.className = "foot-tag " +
+    (m === "edit" ? "tag-edit" : m === "process" ? "tag-process" : "tag-search");
 }
 
 function setTopMode(m) {
@@ -6246,14 +6928,22 @@ function setTopMode(m) {
     state.olOverride = null;
   }
   renderTop();
-  status(m === "search" ? "SEARCH MODE" : "EDIT MODE");
+  status(`${String(m).toUpperCase()} MODE`);
 }
 
 function renderModeBar() {
-  const btn = el("whl-mode");
-  btn.hidden = false;
-  btn.textContent = `Mode: ${topMode()}`;
-  el("whl-cons").hidden = topMode() !== "search";
+  const m = topMode();
+  const seg = el("whl-modeseg");
+  if (seg) {
+    seg.hidden = false;
+    seg.querySelectorAll(".modeseg-btn").forEach((b) =>
+      b.classList.toggle("active", b.dataset.mode === m));
+  }
+  el("whl-cons").hidden = m !== "search";
+  const pb = el("proc-bar");
+  if (pb) pb.hidden = m !== "process";
+  document.body.classList.toggle("top-process", m === "process");
+  if (m === "process") renderProcBar();
 }
 
 function switchTopTable(t) {
@@ -6287,6 +6977,801 @@ async function renderTop() {
   }
 }
 
+// =====================================================================
+// Process mode: stage alternative field-sets, review them as a nested
+// diff, and Mark Primary to swap one in. Every Process action (Normalize
+// now; DeepSeek / rescan / Smart Scan later) funnels its output into the
+// same staged-alternatives store and the same review surface.
+// =====================================================================
+
+// Alt/diff rows mirror the parent table's columns 1:1 so cells line up.
+// "_src" = the leading source-flag cell, "_whl" = a trailing badge cell;
+// everything else is a comparable field key (in the parent's own vocab).
+const WHL_ALT_COLS = ["_src", "title", "subtitle", "authors", "year",
+  "publisher", "pages", "language", "subject", "description", "_whl", "_whl"];
+const CHECKED_ALT_COLS = ["_src", ...BOOK_COLS, "_whl", "_whl", "_whl", "_whl", "_whl", "_whl"];
+
+const PROC_SRC_SHORT = { normalize: "NORM", deepseek: "AI", rescan: "SCAN",
+  smartscan: "SMART", superseded: "OLD" };
+const PROC_SRC_NAME = { normalize: "Normalized", deepseek: "DeepSeek",
+  rescan: "Rescan", smartscan: "Smart Scan", superseded: "Previous (superseded)" };
+function procSourceShort(s) { return PROC_SRC_SHORT[s] || (s || "ALT").slice(0, 4).toUpperCase(); }
+function procSourceLabel(alt) {
+  const n = PROC_SRC_NAME[alt.source] || alt.source || "Alternative";
+  return alt.note ? `${n} — ${alt.note}` : n;
+}
+
+function targetKind(target) {
+  const t = String(target || "");
+  if (t.startsWith("whl:")) return "whl";
+  if (t.startsWith("build:")) return "build";
+  if (t.startsWith("manual:")) return "manual";
+  if (t.startsWith("checked:")) return "checked";
+  return "";
+}
+function whlTarget(r) { return "whl:" + r.idx; }
+function rowTarget(row) { return (row.kind === "manual" ? "manual:" : "checked:") + row.id; }
+
+function stagedFor(target) {
+  const e = state.stagedAlts[target];
+  return e && Array.isArray(e.alts) && e.alts.length ? e : null;
+}
+
+async function loadStaged() {
+  try {
+    const r = await (await fetch("/api/staged")).json();
+    state.stagedAlts = (r && r.entries) || {};
+  } catch (e) { /* keep whatever we had */ }
+}
+
+// current field values of a parent row, keyed the way that table's cells are
+function whlParentFields(r) {
+  return { title: r.title || "", subtitle: r.subtitle || "", authors: r.authors || "",
+    year: r.year || "", publisher: r.publisher || "", pages: r.pages || "",
+    language: r.language || "", subject: r.subject || "", description: r.description || "" };
+}
+function checkedParentFields(row) {
+  const b = row.book || {}, out = {};
+  for (const f of BOOK_COLS) out[f] = f === "categories" ? bookCatsText(b) : String(b[f] || "");
+  return out;
+}
+function parentFieldsFor(target) {
+  const kind = targetKind(target);
+  if (kind === "whl") { const r = whlRowByIdx(parseInt(target.slice(4), 10)); return r ? whlParentFields(r) : {}; }
+  const row = state.rowsById.get(String(target.slice(target.indexOf(":") + 1)));
+  return row ? checkedParentFields(row) : {};
+}
+
+// --- selection ------------------------------------------------------------------
+function procSel(table) { return table === "whl" ? state.procSelWhl : state.procSelChecked; }
+function procKeyForRow(table, tr) {
+  return table === "whl" ? parseInt(tr.dataset.widx, 10) : String(tr.dataset.rowId || "");
+}
+function procToggleRow(table, tr) {
+  const key = procKeyForRow(table, tr);
+  if (table === "whl" ? isNaN(key) : !key) return;
+  const s = procSel(table), on = !s.has(key);
+  if (on) s.add(key); else s.delete(key);
+  tr.classList.toggle("proc-selected", on);
+  const box = tr.querySelector(".proc-box");
+  if (box) box.classList.toggle("on", on);
+  renderProcBar();
+}
+function procToggleExpand(target) {
+  if (state.procExpanded.has(target)) state.procExpanded.delete(target);
+  else state.procExpanded.add(target);
+  reRenderTop();
+}
+function currentWhlRows() {
+  const q = findQuery();
+  return (state.whlRows || [])
+    .filter((r) => matchesFind(q, `${r.title} ${r.subtitle || ""}`, r.authors, r.year))
+    .filter((r) => yearInRange(r.year));
+}
+function procSelectAll() {
+  const table = state.settings.topTable, s = procSel(table);
+  s.clear();
+  if (table === "whl") for (const r of currentWhlRows()) s.add(r.idx);
+  else for (const row of filteredCheckedRows()) if (row.id != null) s.add(String(row.id));
+  reRenderTop();
+  renderProcBar();
+}
+function procSelectNone() {
+  procSel(state.settings.topTable).clear();
+  reRenderTop();
+  renderProcBar();
+}
+function reRenderTop() {
+  if (state.settings.topTable === "whl") renderWhlTop();
+  else renderChecked();
+}
+
+function renderProcBar() {
+  const table = state.settings.topTable, n = procSel(table).size;
+  const cnt = el("proc-count");
+  if (cnt) cnt.textContent = `${n} selected`;
+  const run = el("proc-run");
+  if (run) run.disabled = n === 0 || state.procActionBusy;
+  for (const id of ["proc-all", "proc-none", "proc-action"]) {
+    const e = el(id);
+    if (e) e.disabled = state.procActionBusy;
+  }
+  const act = el("proc-action"), inp = el("proc-ai-instr");
+  if (inp) { inp.hidden = !act || act.value !== "deepseek"; inp.disabled = state.procActionBusy; }
+}
+
+// --- rendering: decorate parent rows, build alt rows ----------------------------
+function decorateProcParent(tr, target, table, hasAlts, selected) {
+  tr.classList.add("proc-row");
+  tr.dataset.target = target;
+  if (selected) tr.classList.add("proc-selected");
+  const first = tr.children[0];
+  if (!first) return;
+  first.classList.add("proc-firstcell");
+  const expanded = state.procExpanded.has(target);
+  const arrow = hasAlts
+    ? `<span class="proc-arrow" data-tip="${expanded ? "Hide" : "Show"} alternatives">${expanded ? "▾" : "▸"}</span>`
+    : `<span class="proc-arrow proc-arrow-none"></span>`;
+  first.insertAdjacentHTML("afterbegin",
+    `<span class="proc-box${selected ? " on" : ""}" data-tip="Select for processing"></span>${arrow}`);
+}
+
+// which parent column indices differ from a pending (non-superseded) alt
+function procParentDiffCols(target, parentFields, table) {
+  const e = stagedFor(target);
+  if (!e) return null;
+  const cols = table === "whl" ? WHL_ALT_COLS : CHECKED_ALT_COLS;
+  const changed = new Set();
+  for (const alt of e.alts) {
+    if (alt.source === "superseded") continue;
+    cols.forEach((key, i) => {
+      if (key === "_src" || key === "_whl") return;
+      if (Object.prototype.hasOwnProperty.call(alt.fields, key)) {
+        const av = String(alt.fields[key]).trim();
+        const pv = String(parentFields[key] != null ? parentFields[key] : "").trim();
+        if (av !== pv) changed.add(i);
+      }
+    });
+  }
+  return changed;
+}
+function markParentDiff(tr, target, parentFields, table) {
+  if (!state.procExpanded.has(target)) return;
+  const changed = procParentDiffCols(target, parentFields, table);
+  if (!changed || !changed.size) return;
+  [...tr.children].forEach((td, i) => { if (changed.has(i)) td.classList.add("proc-diff-old"); });
+}
+
+function procAltTr(target, alt, parentFields, table) {
+  const cols = table === "whl" ? WHL_ALT_COLS : CHECKED_ALT_COLS;
+  const tr = document.createElement("tr");
+  tr.className = "proc-alt" + (alt.source === "superseded" ? " proc-alt-old" : "");
+  tr.dataset.target = target;
+  tr.dataset.altId = alt.id;
+  tr.dataset.tip = "Right-click for Mark Primary";
+  tr.innerHTML = cols.map((key) => {
+    if (key === "_src")
+      return `<td class="col-src proc-altsrc"><span class="proc-srctag" ` +
+        `data-tip="${esc(procSourceLabel(alt))}">${esc(procSourceShort(alt.source))}</span></td>`;
+    if (key === "_whl") return `<td class="col-whl"></td>`;
+    const pv = String(parentFields[key] != null ? parentFields[key] : "");
+    const has = Object.prototype.hasOwnProperty.call(alt.fields, key);
+    const av = has ? String(alt.fields[key]) : pv;
+    const changed = has && av.trim() !== pv.trim();
+    return `<td${changed ? ' class="proc-diff-new"' : ""}>${esc(av)}</td>`;
+  }).join("");
+  return tr;
+}
+
+// --- actions --------------------------------------------------------------------
+// Compute normalized candidate values; only return the fields that change.
+function normalizeFieldSet(kind, cur) {
+  const out = {}, nameKey = kind === "whl" ? "authors" : "author";
+  const put = (k, v) => {
+    const nv = String(v == null ? "" : v);
+    if (nv.trim() && nv !== String(cur[k] == null ? "" : cur[k])) out[k] = nv;
+  };
+  if (String(cur.title || "").trim()) put("title", titleCase(cur.title));
+  if (String(cur.subtitle || "").trim()) put("subtitle", titleCase(cur.subtitle));
+  if (String(cur[nameKey] || "").trim()) put(nameKey, titleCase(flipName(cur[nameKey])));
+  if (String(cur.publisher || "").trim()) put("publisher", titleCase(cur.publisher));
+  if (kind !== "whl" && String(cur.city || "").trim()) put("city", titleCase(cur.city));
+  return out;
+}
+
+async function procStageAlt(target, kind, label, alt) {
+  const res = await fetch("/api/staged/add", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target, kind, label, alts: [alt] }),
+  });
+  if (!res.ok) return false;
+  const d = await res.json().catch(() => ({}));
+  if (d && d.entry) { state.stagedAlts[target] = d.entry; state.procExpanded.add(target); return true; }
+  return false;
+}
+
+// The selected rows resolved to {target, kind, label, cur} (cur = its field map).
+function procSelectedRows(table, keys) {
+  const out = [];
+  if (table === "whl") {
+    for (const idx of keys) {
+      const r = whlRowByIdx(idx);
+      if (r) out.push({ target: whlTarget(r), kind: "whl", label: r.title || "", cur: whlParentFields(r) });
+    }
+  } else {
+    for (const id of keys) {
+      const row = state.rowsById.get(String(id));
+      if (row) out.push({ target: rowTarget(row), kind: row.kind === "manual" ? "manual" : "checked",
+        label: (row.book && row.book.title) || "", cur: checkedParentFields(row) });
+    }
+  }
+  return out;
+}
+
+async function procStageBatch(items, label) {
+  state.procActionBusy = true; renderProcBar();
+  let ok = 0;
+  for (const it of items) { if (await procStageAlt(it.target, it.kind, it.label, it.alt)) ok++; }
+  state.procActionBusy = false;
+  reRenderTop();
+  renderProcBar();   // reRenderTop only repaints the bar for the WHL table
+  statusFlash(`${label} :: staged ${ok} alternative${ok === 1 ? "" : "s"} for review`);
+  return ok;
+}
+
+async function procRun() {
+  const table = state.settings.topTable;
+  const action = el("proc-action").value;
+  const keys = [...procSel(table)];
+  if (!keys.length) { status("PROCESS: select one or more rows first"); return; }
+  if (action === "normalize") return procRunNormalize(table, keys);
+  if (action === "deepseek") return procRunDeepseek(table, keys);
+  if (action === "rescan") return procRunRescan(table, keys);
+  if (action === "smartscan") return procRunSmartScan(table, keys);
+}
+
+async function procRunNormalize(table, keys) {
+  const items = [];
+  for (const it of procSelectedRows(table, keys)) {
+    const fields = normalizeFieldSet(it.kind === "whl" ? "whl" : "checked", it.cur);
+    if (Object.keys(fields).length)
+      items.push({ target: it.target, kind: it.kind, label: it.label, alt: { source: "normalize", fields } });
+  }
+  if (!items.length) { status("NORMALIZE :: nothing to change in the selection"); return; }
+  await procStageBatch(items, "NORMALIZE");
+}
+
+// DeepSeek over each selected record with the user's instructions. One request
+// per row (the client loops); the server returns only the fields to change.
+async function procRunDeepseek(table, keys) {
+  const rows = procSelectedRows(table, keys);
+  if (!rows.length) return;
+  const instr = (el("proc-ai-instr").value || state.settings.aiInstructions || "").trim();
+  const ok0 = await confirmDialog({
+    title: "Run DeepSeek",
+    message: `Send ${rows.length} record${rows.length === 1 ? "" : "s"} to DeepSeek for review?`,
+    detail: instr ? "Instructions: " + instr : "Using your Settings › AI instructions.",
+    cost: `~${rows.length} API call${rows.length === 1 ? "" : "s"}`,
+    confirmLabel: "Run",
+  });
+  if (!ok0) return;
+  state.procActionBusy = true; renderProcBar();
+  let ok = 0, failed = 0, errored = "";
+  for (const it of rows) {
+    status(`DEEPSEEK :: ${ok + failed + 1}/${rows.length} …`);
+    try {
+      const res = await fetch("/api/process/deepseek", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fields: it.cur, instructions: instr, kind: it.kind }),
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.ok === false) { failed++; errored = d.error || "AI error"; continue; }
+      if (d.fields && Object.keys(d.fields).length &&
+          await procStageAlt(it.target, it.kind, it.label,
+            { source: "deepseek", fields: d.fields, note: instr.slice(0, 80) })) ok++;
+    } catch (e) { failed++; errored = "request failed"; }
+  }
+  state.procActionBusy = false;
+  reRenderTop();
+  renderProcBar();
+  if (!ok && errored) statusErr("DEEPSEEK :: " + errored);
+  else statusFlash(`DEEPSEEK :: staged ${ok} alternative${ok === 1 ? "" : "s"}` +
+    (failed ? ` (${failed} failed)` : ""));
+}
+
+// Rescan re-runs the source scan for the selected checked/manual books (WHL
+// rows are the catalogue itself and aren't scanned against sources).
+function procRunRescan(table, keys) {
+  if (table === "whl") { status("RESCAN :: applies to checked / manual books, not WHL rows"); return; }
+  let n = 0;
+  for (const id of keys) {
+    const row = state.rowsById.get(String(id));
+    if (row) { queueScan(String(id)); n++; }
+  }
+  status(`RESCAN :: queued ${n} book${n === 1 ? "" : "s"} for a fresh source scan`);
+}
+
+// Resolve a selected row to its PDF source (local path or remote URL) + target.
+function procPdfForRow(table, key) {
+  if (table === "whl") {
+    const r = whlRowByIdx(key);
+    if (r && !r.added && r.file && /^https?:\/\//i.test(r.file))
+      return { target: whlTarget(r), url: r.file, label: r.title || "" };
+    return null;
+  }
+  const row = state.rowsById.get(String(key));
+  if (!row) return null;
+  const b = row.book || {};
+  const target = rowTarget(row);
+  const lp = row.localPdf || b.localPdf || b.local_pdf;
+  if (lp) return { target, pdf: lp, label: b.title || "" };
+  const ident = (typeof iaIdentifierForRow === "function") ? iaIdentifierForRow(row) : null;
+  if (ident) {
+    if (typeof dlState === "function" && dlState(row) === "done")
+      return { target, pdf: "downloads/ia/" + ident + ".pdf", label: b.title || "" };
+    return { target, url: `https://archive.org/download/${ident}/${ident}.pdf`, label: b.title || "" };
+  }
+  return null;
+}
+
+// Smart Scan: one background job per selected row (download -> OCR -> extract);
+// each staged smartscan alternative appears in the diff as its job finishes.
+async function procRunSmartScan(table, keys) {
+  const refs = [];
+  for (const k of keys) { const ref = procPdfForRow(table, k); if (ref) refs.push(ref); }
+  if (!refs.length) { status("SMART SCAN :: none of the selected rows has a PDF source"); return; }
+  const skipped = keys.length - refs.length;
+  const ok0 = await confirmDialog({
+    title: "Smart Scan",
+    message: `Download & OCR ${refs.length} PDF${refs.length === 1 ? "" : "s"} and extract metadata?`,
+    detail: skipped ? `${skipped} selected row${skipped === 1 ? "" : "s"} without a PDF source will be skipped.` : "",
+    cost: `~${refs.length} download + OCR + AI pass${refs.length === 1 ? "" : "es"}`,
+    confirmLabel: "Run",
+  });
+  if (!ok0) return;
+  state.procActionBusy = true; renderProcBar();
+  const jobs = [];
+  for (const ref of refs) {
+    try {
+      const body = { target: ref.target, label: ref.label };
+      if (ref.pdf) body.pdf = ref.pdf; else body.url = ref.url;
+      const res = await fetch("/api/process/smartscan/run", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      });
+      const d = await res.json().catch(() => ({}));
+      if (res.ok && d.ok && d.job) jobs.push({ id: d.job.id, target: ref.target });
+      else statusErr("SMART SCAN :: " + (d.error || "could not start") + " — " + (ref.label || ref.target));
+    } catch (e) { /* keep launching the rest */ }
+  }
+  if (!jobs.length) { state.procActionBusy = false; renderProcBar(); return; }
+  procPollSmartScan(jobs);
+}
+
+function procPollSmartScan(jobs) {
+  const pending = new Set(jobs.map((j) => j.id));
+  const tick = async () => {
+    for (const j of jobs) {
+      if (!pending.has(j.id)) continue;
+      try {
+        const r = await (await fetch("/api/process/smartscan/job/" + j.id)).json();
+        j.fails = 0;
+        // terminal states incl. a server restart's "interrupted" and "failed"
+        if (/done|error|cancel|interrupt|fail/.test(String(r.status || r.state || ""))) {
+          pending.delete(j.id);
+          await loadStaged();
+          if (stagedFor(j.target)) state.procExpanded.add(j.target);
+          reRenderTop();
+        }
+      } catch (e) { j.fails = (j.fails || 0) + 1; if (j.fails >= 5) pending.delete(j.id); }
+    }
+    status(`SMART SCAN :: ${jobs.length - pending.size}/${jobs.length} done`);
+    if (pending.size) { setTimeout(tick, 1600); return; }
+    state.procActionBusy = false; renderProcBar();
+    statusFlash(`SMART SCAN :: ${jobs.length} complete — review the staged results`);
+  };
+  setTimeout(tick, 1200);
+}
+
+// Mark Primary: apply an alt to the real record through the normal edit path,
+// then swap the store so the displaced original survives as a "superseded" alt
+// (right-click it to swap back).
+async function procMarkPrimary(target, altId) {
+  const e = state.stagedAlts[target];
+  const alt = e && (e.alts || []).find((a) => a.id === altId);
+  if (!alt) return;
+  // categories is a structured field (chip picker); a staged text value would
+  // apply to the deprecated flat column and never show — drop it defensively
+  const fields = {};
+  for (const [k, v] of Object.entries(alt.fields || {})) if (k !== "categories") fields[k] = v;
+  const keys = Object.keys(fields);
+  if (!keys.length) return;
+  const kind = e.kind || targetKind(target);
+  const displaced = {};
+  let applied = false;
+  if (kind === "whl") {
+    const idx = parseInt(target.slice(4), 10);
+    const r = whlRowByIdx(idx);
+    if (!r) return;
+    for (const k of keys) displaced[k] = String(r[k] || "");
+    // A value that matches the CSV base is a correction CLEARED, not a new
+    // correction — otherwise restoring a superseded original would re-flag
+    // untouched fields and the row would read EDITED forever. (Added rows,
+    // idx < 0, have no CSV base — everything is a set.)
+    const setFields = {}, clear = [];
+    for (const k of keys) {
+      const base = (r.edited_fields || []).includes(k)
+        ? String((r.orig || {})[k] || "") : String(r[k] || "");
+      if (idx >= 0 && !r.added && String(fields[k]) === base) clear.push(k);
+      else setFields[k] = fields[k];
+    }
+    const body = { idx };
+    if (Object.keys(setFields).length) body.fields = setFields;
+    if (clear.length) body.clear_fields = clear;
+    const before = whlFieldSnaps(r, keys);
+    if (await whlPost(body)) {
+      pushOp(`mark primary WHL ${String(r.title || idx).slice(0, 24)}`,
+        () => whlApplySnaps(idx, before),
+        () => whlPost(body),
+        { kind: "whl", idx, beforeSnaps: before });
+      applied = true;
+    }
+  } else {
+    const row = state.rowsById.get(String(target.slice(target.indexOf(":") + 1)));
+    if (!row) return;
+    for (const k of keys) displaced[k] = String((row.book || {})[k] || "");
+    applied = await applyEditPatch(row, fields);
+  }
+  if (!applied) { statusErr("MARK PRIMARY FAILED"); return; }
+  // Swap the store: the applied alt leaves, the displaced original is re-filed
+  // as "superseded". Both alts keep stable ids so the history wrap below can
+  // swap back and forth (undo re-files the applied alt under its own source).
+  const appliedAlt = { id: alt.id, source: alt.source, label: e.label || "",
+    fields, note: alt.note || "" };
+  const displacedAlt = { id: (alt.id || "alt").slice(0, 34) + "~prev",
+    source: "superseded", label: e.label || "", fields: displaced,
+    note: `was ${PROC_SRC_NAME[alt.source] || alt.source || "alternative"}` };
+  const storeSwap = async (removeId, refile) => {
+    try {
+      const res = await fetch("/api/staged/swap", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ target, altId: removeId, displaced: refile }),
+      });
+      const d = await res.json().catch(() => ({}));
+      if (d && Object.prototype.hasOwnProperty.call(d, "entry")) {
+        if (d.entry) state.stagedAlts[target] = d.entry; else delete state.stagedAlts[target];
+      }
+    } catch (err) { /* store swap best-effort; the field change is what's undoable */ }
+  };
+  await storeSwap(altId, displacedAlt);
+  // Fold the store swap into the field change's undo op (the apply above just
+  // pushed it) so one Ctrl+Z reverts BOTH — the commitEdit set-declaration
+  // pattern. Undo restores the alt as pending; redo re-supersedes it.
+  const top = history.stack[history.ptr - 1];
+  if (top) {
+    const baseUndo = top.undoFn, baseRedo = top.redoFn;
+    top.undoFn = async () => {
+      const r = await baseUndo();
+      await storeSwap(displacedAlt.id, appliedAlt);
+      reRenderTop();
+      return r;
+    };
+    top.redoFn = async () => {
+      const r = await baseRedo();
+      await storeSwap(appliedAlt.id, displacedAlt);
+      reRenderTop();
+      return r;
+    };
+  }
+  reRenderTop();
+  statusFlash("MARKED PRIMARY :: swapped in");
+}
+
+async function procDismiss(target, altId) {
+  try {
+    const res = await fetch("/api/staged/remove", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(altId ? { target, altId } : { target }),
+    });
+    const d = await res.json().catch(() => ({}));
+    if (d && Object.prototype.hasOwnProperty.call(d, "entry") && d.entry)
+      state.stagedAlts[target] = d.entry;
+    else delete state.stagedAlts[target];
+  } catch (e) { delete state.stagedAlts[target]; }
+  reRenderTop();
+}
+
+// --- shared click + right-click handling for both tables ------------------------
+function procTableClick(ev, table) {
+  if (topMode() !== "process") return false;
+  const arrow = ev.target.closest(".proc-arrow:not(.proc-arrow-none)");
+  if (arrow) {
+    const tr = arrow.closest("tr");
+    if (tr && tr.dataset.target) procToggleExpand(tr.dataset.target);
+    return true;
+  }
+  const box = ev.target.closest(".proc-box");
+  if (box) {
+    const tr = box.closest("tr");
+    if (tr) procToggleRow(table, tr);
+    return true;
+  }
+  if (ev.target.closest("tr.proc-alt")) return true;   // left-click on an alt: Mark Primary is right-click
+  // a plain click on a parent row toggles its selection, unless a real control was hit
+  if (ev.target.closest("a, button, input, select, .badge, .vmark, .set-arrow, " +
+      "[data-scanattach], [data-imginfo], [data-mdel], [data-unchk], [data-pdfm]")) return false;
+  const row = ev.target.closest("tr.proc-row");
+  if (row) { procToggleRow(table, row); return true; }
+  return false;
+}
+
+function onProcContextMenu(ev) {
+  if (topMode() !== "process") return;
+  const altTr = ev.target.closest("tr.proc-alt");
+  if (altTr && altTr.dataset.target && altTr.dataset.altId) {
+    ev.preventDefault();
+    const target = altTr.dataset.target, altId = altTr.dataset.altId;
+    const e = state.stagedAlts[target];
+    const alt = e && (e.alts || []).find((a) => a.id === altId);
+    const isOld = alt && alt.source === "superseded";
+    openProcMenu(ev.clientX, ev.clientY, [
+      { label: isOld ? "Mark Primary (restore original)" : "Mark Primary",
+        fn: () => procMarkPrimary(target, altId) },
+      { label: "Dismiss this alternative", danger: true, fn: () => procDismiss(target, altId) },
+    ]);
+    return;
+  }
+  const row = ev.target.closest("tr.proc-row");
+  if (row && row.dataset.target && stagedFor(row.dataset.target)) {
+    ev.preventDefault();
+    const target = row.dataset.target;
+    openProcMenu(ev.clientX, ev.clientY, [
+      { label: state.procExpanded.has(target) ? "Collapse alternatives" : "Expand alternatives",
+        fn: () => procToggleExpand(target) },
+      { label: "Clear all alternatives", danger: true, fn: () => procDismiss(target, null) },
+    ]);
+  }
+}
+
+// A cursor-positioned context menu, reusing the shared #popup-menu element.
+function openProcMenu(x, y, items) {
+  const pop = el("popup-menu");
+  pop.innerHTML = items.map((it, i) =>
+    `<button type="button" class="pm-item pm-btn${it.danger ? " pm-danger" : ""}" data-i="${i}">${esc(it.label)}</button>`).join("");
+  pop.hidden = false;
+  popupAnchor = pop;
+  pop.style.top = Math.max(8, Math.min(y, innerHeight - pop.offsetHeight - 8)) + "px";
+  pop.style.left = Math.max(8, Math.min(x, innerWidth - pop.offsetWidth - 8)) + "px";
+  pop.querySelectorAll(".pm-btn").forEach((b) => b.addEventListener("click", () => {
+    const it = items[+b.dataset.i];
+    closePopup();
+    if (it && it.fn) it.fn();
+  }));
+  const off = (e) => {
+    if (!pop.contains(e.target)) { closePopup(); document.removeEventListener("mousedown", off, true); }
+  };
+  setTimeout(() => document.addEventListener("mousedown", off, true), 0);
+}
+
+// --- general row context menu (Search / Edit modes) -----------------------------
+// A right-click on any catalog row offers convenient row actions. Process mode
+// keeps its own menu (Mark Primary); this is the everywhere-else menu, built to
+// grow — add entries to generalRowMenu as more actions earn a shortcut.
+function openExternal(url) {
+  if (!url) return;
+  const a = document.createElement("a");
+  a.href = url; a.target = "_blank"; a.rel = "noopener";
+  a.click();
+}
+
+function copyRecordText(fields) {
+  const lines = Object.entries(fields)
+    .filter(([, v]) => String(v == null ? "" : v).trim())
+    .map(([k, v]) => `${k}: ${v}`);
+  copyText(lines.join("\n"));
+  statusFlash(`COPIED RECORD :: ${lines.length} field${lines.length === 1 ? "" : "s"}`);
+}
+
+// Start a Smart Scan for one row from outside Process mode (right-click). The
+// staged result appears when the user next looks at Process mode.
+async function smartScanOneRow(table, key) {
+  const ref = procPdfForRow(table, key);
+  if (!ref) { statusErr("SMART SCAN :: this row has no PDF source"); return; }
+  const ok0 = await confirmDialog({
+    title: "Smart Scan",
+    message: "Download & OCR this book's PDF and extract its metadata?",
+    detail: ref.label || "",
+    cost: "~1 download + OCR + AI pass",
+    confirmLabel: "Run",
+  });
+  if (!ok0) return;
+  try {
+    const body = { target: ref.target, label: ref.label };
+    if (ref.pdf) body.pdf = ref.pdf; else body.url = ref.url;
+    const res = await fetch("/api/process/smartscan/run", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    const d = await res.json().catch(() => ({}));
+    if (res.ok && d.ok && d.job) procPollSmartScan([{ id: d.job.id, target: ref.target }]);
+    else statusErr("SMART SCAN :: " + (d.error || "could not start"));
+  } catch (e) { statusErr("SMART SCAN :: request failed"); }
+}
+
+// Paste the clipboard into an editable cell (menu twin of Ctrl+V-over-cell).
+async function pasteIntoCellFromMenu(td) {
+  const field = cellFieldName(td);
+  if (!field) return;
+  let text = "";
+  try { text = await navigator.clipboard.readText(); } catch (e) { text = ""; }
+  text = String(text || "").replace(/\s+/g, " ").trim();
+  if (!text) { statusErr("PASTE: clipboard empty or unavailable"); return; }
+  if (await pasteIntoCell(td, field, text)) {
+    flashCell(td, "cell-pasted");
+    statusFlash(`PASTED ${field.toUpperCase()}: ${clipNote(text)}`);
+  }
+}
+
+function generalRowMenu(ev, table) {
+  const tr = ev.target.closest("tr");
+  if (!tr) return null;
+  const items = [];
+  const td = ev.target.closest("td");
+  // structural columns (source flag, trailing badges) aren't fields to copy
+  const structural = td && (td.classList.contains("col-src") || td.classList.contains("col-whl") ||
+    td.classList.contains("set-src") || td.classList.contains("set-title-cell"));
+  if (td && !structural) {
+    const val = cellCopyValue(td);
+    if (val) items.push({ label: "Copy field", fn: () => {
+      copyText(val); flashCell(td, "cell-copied");
+      const f = cellFieldName(td);
+      statusFlash(f ? `COPIED ${f.toUpperCase()}: ${clipNote(val)}` : `COPIED: ${clipNote(val)}`);
+    } });
+    if (cellFieldName(td)) items.push({ label: "Paste into field", fn: () => pasteIntoCellFromMenu(td) });
+  }
+  // :hover-derived targets must be captured NOW — once the menu opens the row
+  // is no longer hovered, so resolving inside a menu item's fn comes up empty.
+  const attnTarget = attnTargetAtHover();
+  const book = bookAtHover();
+  if (table === "whl") {
+    const idx = parseInt(tr.dataset.widx, 10);
+    if (isNaN(idx)) return items.length ? items : null;
+    const r = whlRowByIdx(idx);
+    items.push({ label: "Copy record", fn: () => copyRecordText(whlParentFields(r || {})) });
+    items.push({ label: "Edit record", fn: () => openWhlEditTab(idx) });
+    if (r && r.permalink) items.push({ label: "Open WHL page", fn: () => openExternal(r.permalink) });
+    if (r && r.file && /^https?:/i.test(r.file)) {
+      items.push({ label: "Open publication PDF", fn: () => openExternal(r.file) });
+      items.push({ label: "Copy PDF link", fn: () => {
+        copyText(r.file); statusFlash(`COPIED PDF LINK: ${clipNote(r.file)}`);
+      } });
+    }
+    if (procPdfForRow("whl", idx))
+      items.push({ label: "Smart Scan", fn: () => smartScanOneRow("whl", idx) });
+  } else {
+    const setHdr = ev.target.closest("tr.set-header");
+    if (setHdr && setHdr.dataset.setKey) {
+      items.push({ label: "Edit set", fn: () => openSetEditTab(setHdr.dataset.setKey) });
+      return items;
+    }
+    const id = tr.dataset.rowId;
+    if (!id) return items.length ? items : null;
+    const row = state.rowsById.get(String(id));
+    items.push({ label: "Copy record", fn: () => copyRecordText(checkedParentFields(row || { book: {} })) });
+    items.push({ label: "Edit record", fn: () => openBookEditTab(id) });
+    items.push({ label: "Rescan sources", fn: () => {
+      queueScan(String(id));
+      status("RESCAN :: queued for a fresh source scan");
+    } });
+    const pdfRef = procPdfForRow("checked", id);
+    if (pdfRef) {
+      items.push({ label: "Smart Scan", fn: () => smartScanOneRow("checked", id) });
+      const link = pdfRef.url || pdfRef.pdf;
+      items.push({ label: "Copy PDF link", fn: () => {
+        copyText(link); statusFlash(`COPIED PDF LINK: ${clipNote(link)}`);
+      } });
+    }
+    if (row && row.kind === "manual")
+      items.push({ label: "Delete entry", danger: true, fn: () => deleteManual(id) });
+    else
+      items.push({ label: "Remove from checked", danger: true, fn: () => uncheckRow(id) });
+  }
+  if (book && book.title) {
+    items.push({ label: "Search Google", fn: () => {
+      const q = [book.title, book.author, book.year].map((x) => String(x || "").trim())
+        .filter(Boolean).join(" ");
+      window.open("https://www.google.com/search?q=" + encodeURIComponent(q), "_blank", "noopener");
+      status("SEARCH :: " + q.slice(0, 60));
+    } });
+  }
+  if (attnTarget) {
+    // mirror the Q shortcut: mark at once (rect captured first — apply()
+    // re-renders and detaches the row), then offer the reason popover
+    const rect = attnTarget.node ? attnTarget.node.getBoundingClientRect() : null;
+    if (attnTarget.current) {
+      items.push({ label: "Clear attention mark", fn: () => attnTarget.apply("") });
+    } else {
+      items.push({ label: "Mark needs attention…", fn: () => {
+        attnTarget.apply("1");
+        openAttnPop(attnTarget, rect);
+      } });
+    }
+  }
+  return items;
+}
+
+// Right-click a column header: hide that column, or open the full picker.
+function onHeaderContextMenu(ev, key, rerender) {
+  const th = ev.target.closest("th");
+  if (!th) return;
+  const def = tableDef(key);
+  if (!def) return;
+  const ths = [...th.closest("thead").querySelectorAll("th")];
+  const i = ths.indexOf(th);
+  const colKey = colKeyAt(def, i);
+  const label = def.cols[i] ? def.cols[i][1] : colKey;
+  ev.preventDefault();
+  const vis = () => state.settings.colVis[key] = state.settings.colVis[key] || {};
+  const items = [
+    { label: `Hide "${label}"`, fn: () => { vis()[colKey] = false; saveSettings(); rerender(); } },
+  ];
+  if (Object.values(state.settings.colVis[key] || {}).some((v) => v === false))
+    items.push({ label: "Show all columns", fn: () => {
+      state.settings.colVis[key] = {}; saveSettings(); rerender();
+    } });
+  items.push({ label: "Columns…", fn: () => openColumnMenu(th, key, rerender) });
+  openProcMenu(ev.clientX, ev.clientY, items);
+}
+
+function onRowContextMenu(ev) {
+  // leave the native clipboard menu inside an inline cell editor / text field
+  if (ev.target.closest("input, textarea, [contenteditable]")) return;
+  if (topMode() === "process") { onProcContextMenu(ev); return; }
+  const table = ev.target.closest("#whltop-rows") ? "whl" : "checked";
+  const items = generalRowMenu(ev, table);
+  if (items && items.length) { ev.preventDefault(); openProcMenu(ev.clientX, ev.clientY, items); }
+}
+
+// Right-click a Workbench book (the #ocr-books list): record actions for
+// builds. (No Smart Scan here yet — a build's staged alternatives have no
+// review surface in the Process tables; that lands with the build form's
+// alternatives panel.)
+function onBuildListContextMenu(ev) {
+  if (ev.target.closest("input, textarea, [contenteditable]")) return;
+  const li = ev.target.closest("li.build-item");
+  if (!li || !li.dataset.bid) return;
+  const bid = li.dataset.bid, b = state.builds[bid];
+  if (!b) return;
+  ev.preventDefault();
+  const attnTarget = attnTargetAtHover();   // resolves the hovered build item
+  const items = [
+    { label: "Copy record", fn: () => copyRecordText({
+      title: b.title || "", subtitle: b.subtitle || "", authors: b.authors || "",
+      year: b.year || "", publisher: b.publisher || "", city: b.publisher_city || "",
+      edition: b.edition || "", volume: b.volume || "", language: b.language || "" }) },
+  ];
+  const pdf = String(b.pdf_file || "").trim();
+  const src = String(b.pdf_source || "").trim();
+  const link = pdf || (/^https?:\/\//i.test(src) ? src : "");
+  if (link) items.push({ label: "Copy PDF link", fn: () => {
+    copyText(link); statusFlash(`COPIED PDF LINK: ${clipNote(link)}`);
+  } });
+  if (attnTarget) {
+    if (attnTarget.current)
+      items.push({ label: "Clear attention mark", fn: () => attnTarget.apply("") });
+    else {
+      const rect = attnTarget.node ? attnTarget.node.getBoundingClientRect() : null;
+      items.push({ label: "Mark needs attention…", fn: () => {
+        attnTarget.apply("1");
+        openAttnPop(attnTarget, rect);
+      } });
+    }
+  }
+  items.push({ label: "Delete book", danger: true, fn: () => {
+    selectWorkbenchBook(bid);   // deleteBuild acts on the selection; undoable
+    deleteBuild();
+  } });
+  openProcMenu(ev.clientX, ev.clientY, items);
+}
+
 function renderWhlTop() {
   // the WHL table owns the top pane only when selected there — a save from
   // the EDIT tab (reachable from the bottom pane) must not repaint it or
@@ -6306,7 +7791,32 @@ function renderWhlTop() {
   const so = state.sort.whl;
   if (so) rows = sortRowsBy(rows, (r) => whlSortVal(r, so.key), so.dir);
   origRowShown = null;
-  streamRows(el("whltop-rows"), rows, (r) => whlRowTr(r, mode));
+  if (mode === "process") {
+    // drop selections for rows the current filter/sort no longer shows
+    const visible = new Set(rows.map((r) => r.idx));
+    const before = state.procSelWhl.size;
+    for (const k of [...state.procSelWhl]) if (!visible.has(k)) state.procSelWhl.delete(k);
+    if (state.procSelWhl.size !== before) renderProcBar();
+    const items = [];
+    for (const r of rows) {
+      items.push({ r });
+      const target = whlTarget(r);
+      if (stagedFor(target) && state.procExpanded.has(target)) {
+        const pf = whlParentFields(r);
+        for (const alt of stagedFor(target).alts) items.push({ alt, target, pf });
+      }
+    }
+    streamRows(el("whltop-rows"), items, (it) => {
+      if (it.alt) return procAltTr(it.target, it.alt, it.pf, "whl");
+      const r = it.r, target = whlTarget(r), e = stagedFor(target);
+      const tr = whlRowTr(r, "process");
+      decorateProcParent(tr, target, "whl", !!e, procSel("whl").has(r.idx));
+      if (e) markParentDiff(tr, target, whlParentFields(r), "whl");
+      return tr;
+    });
+  } else {
+    streamRows(el("whltop-rows"), rows, (r) => whlRowTr(r, mode));
+  }
   el("whltop-empty").hidden = rows.length !== 0;
   el("top-count").textContent = `${rows.length} WHL rows`;
   applyTableChrome("whl");
@@ -6330,7 +7840,6 @@ function whlRowTr(r, mode) {
   const whlWhy = attnReason((state.attn || {})["whl:" + r.idx]);
   if (whlWhy) tr.dataset.tip += "\nNeeds attention: " + whlWhy;
   tr.innerHTML = whlRowCells(r, mode);
-  scDecorateWhlRow(tr, r, mode);
   return tr;
 }
 
@@ -8877,6 +10386,8 @@ function renderAnPane(id) {
   else if (id === "an-trans") loadAnTranslations(b);
   else if (id === "an-notes") loadAnNotes(b);
   else if (id === "an-passages") loadAnPassages(b);
+  else if (id === "an-test") loadAnTest(b);
+  else if (id === "an-ask") renderAnAsk(b);
   else if (id === "an-rel") renderAnRelevance(b);
   else if (id === "an-bundle") renderAnBundle(b);
 }
@@ -9384,6 +10895,382 @@ function onAnPsgClick(ev) {
   }
 }
 
+// --- Test (#142): the per-volume evaluation set over the passages ----------------
+
+const EV_KINDS = ["exact-phrase", "archaic-modern", "factual", "thematic",
+  "tables", "cross-page", "multilingual", "unanswerable"];
+let anEval = null;       // {queries, last_run} for the selected book
+let anEvalSel = "";      // selected query id — the live-run target
+let anEvalEdit = "";     // query id loaded into the add/edit bar
+let anEvalRes = null;    // live results for the selected query
+let anAskHasKey = false; // "an AI key exists" — gates Ask's Draft action
+
+async function loadAnTest(b) {
+  try {
+    const data = await (await fetch(`/api/builds/${b.id}/eval`)).json();
+    if (state.anSel !== b.id) return;   // stale response
+    anEval = data.ok ? data.doc : null;
+  } catch (e) { anEval = null; }
+  if (!anEval || !(anEval.queries || []).some((q) => q.id === anEvalSel)) {
+    anEvalSel = "";
+    anEvalRes = null;
+  }
+  renderAnEval();
+}
+
+function evFmt(x) { return x == null ? "–" : Number(x).toFixed(2); }
+
+function evOverallLine(o) {
+  if (!o) return "";
+  const bits = [];
+  if (o.judged) {
+    bits.push(`R@10 ${evFmt(o.recall)} · nDCG ${evFmt(o.ndcg)} · ` +
+      `MRR ${evFmt(o.mrr)} (${o.judged} judged)`);
+  }
+  if (o.unanswerable) bits.push(`unanswerable ${o.unanswerable_pass}/${o.unanswerable}`);
+  if (o.unjudged) bits.push(`${o.unjudged} unjudged`);
+  return bits.join(" · ");
+}
+
+function renderAnEval() {
+  const host = el("an-ev-queries");
+  if (!host) return;
+  const queries = (anEval && anEval.queries) || [];
+  const run = (anEval && anEval.last_run) || null;
+  const localQ = (run && run.local && run.local.queries) || {};
+  let line = run ? evOverallLine(run.local && run.local.overall) : "";
+  if (run && run.published) {
+    line += ` — published v${Number(run.published.version) || "?"}: ` +
+      evOverallLine(run.published.overall);
+  }
+  el("an-ev-metrics").textContent = line;
+  el("an-ev-run").disabled = !queries.length;
+  host.innerHTML = EV_KINDS.map((kind) => {
+    const group = queries.filter((q) => q.kind === kind);
+    if (!group.length) return "";
+    // a thin group label per kind — a marker, not a pill
+    return `<div class="ev-kind">${esc(kind)}</div>` + group.map((q) => {
+      const judged = Object.keys(q.judgments || {}).length;
+      const r = localQ[q.id];
+      let m = "";
+      if (r && "recall" in r) m = `R ${evFmt(r.recall)} · nDCG ${evFmt(r.ndcg)}`;
+      else if (r && r.kind === "unanswerable") m = r.pass ? "pass" : "fail";
+      const meta = [judged ? `${judged} judged` : "", m].filter(Boolean).join(" · ");
+      return `<div class="ev-q${q.id === anEvalSel ? " active" : ""}" data-ev="${esc(q.id)}">
+        <span class="ev-q-text">${esc(q.text)}</span>
+        <span class="ev-q-meta">${esc(meta)}</span>
+        <span class="ev-q-acts">
+          <button class="cad-btn tiny" data-ev-edit="${esc(q.id)}" type="button">Edit</button>
+          <button class="cad-btn tiny danger" data-ev-del="${esc(q.id)}" type="button">Delete</button>
+        </span></div>`;
+    }).join("");
+  }).join("") || `<p class="empty">No queries yet — add the first above.</p>`;
+  renderAnEvalResults();
+}
+
+// «»-marked snippets arrive from both arms (the local scorer mirrors the
+// RPC's ts_headline delimiters); escape first, then surface the marks —
+// server text never reaches the DOM as HTML
+function evSnippetHtml(s) {
+  return esc(s).replace(/«([^«»]*)»/g, '<span class="ev-mark">$1</span>');
+}
+
+function evPageLabel(r) {
+  return r.page_from === r.page_to
+    ? `p${r.page_from ?? "?"}` : `p${r.page_from}–${r.page_to}`;
+}
+
+// one evidence-row idiom for Test and Ask; `q` (an eval query) adds the
+// judgment toggles, null (Ask) leaves the row plain
+function evRowHtml(r, q) {
+  const j = q ? (q.judgments || {})[r.passage_id] : undefined;
+  const acts = q ? `<span class="ev-row-acts">
+      <button class="cad-btn tiny${j === 1 ? " active" : ""}" data-ev-rel="1"
+              data-ev-pid="${esc(r.passage_id)}" type="button"
+              data-tip="Mark relevant — click again to clear">Relevant</button>
+      <button class="cad-btn tiny${j === 0 ? " active" : ""}" data-ev-rel="0"
+              data-ev-pid="${esc(r.passage_id)}" type="button"
+              data-tip="Mark not relevant — click again to clear">Not relevant</button>
+    </span>` : "";
+  return `<div class="ev-row" data-ev-row="${esc(r.passage_id)}">
+    <span class="psg-pages">${esc(evPageLabel(r))}</span>
+    <span class="ev-snip">${evSnippetHtml(r.snippet || "")}</span>
+    <span class="ev-score">${Number(r.score || 0).toFixed(2)}</span>
+    ${acts}</div>`;
+}
+
+function renderAnEvalResults() {
+  const host = el("an-ev-results");
+  if (!host) return;
+  const q = ((anEval && anEval.queries) || []).find((x) => x.id === anEvalSel);
+  if (!q || !anEvalRes) {
+    host.innerHTML = `<p class="empty">Select a query to run it against
+      the working passages.</p>`;
+    return;
+  }
+  // working passages always; the published index beside them when the RPC
+  // arm ran — two clearly labelled result sets, never mixed
+  const cols = [`<div class="ev-col"><div class="ev-col-label">Working passages</div>` +
+    (((anEvalRes.results || []).map((r) => evRowHtml(r, q)).join("")) ||
+      `<p class="empty">No matches.</p>`) + `</div>`];
+  if (anEvalRes.published) {
+    cols.push(`<div class="ev-col"><div class="ev-col-label">Published index
+      v${Number(anEvalRes.published.version) || "?"}</div>` +
+      (((anEvalRes.published.results || []).map((r) => evRowHtml(r, q)).join("")) ||
+        `<p class="empty">No matches.</p>`) + `</div>`);
+  }
+  host.innerHTML = cols.join("");
+}
+
+async function selectEvalQuery(id) {
+  anEvalSel = id;
+  anEvalRes = null;
+  renderAnEval();
+  const b = anSelected();
+  const q = ((anEval && anEval.queries) || []).find((x) => x.id === id);
+  if (!b || !q) return;
+  try {
+    const res = await fetch("/api/knowledge/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ build_id: b.id, question: q.text, published: true }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (state.anSel !== b.id || anEvalSel !== id) return;   // stale
+    if (!res.ok || !data.ok) {
+      el("an-ev-msg").textContent = data.error || "run failed";
+      return;
+    }
+    el("an-ev-msg").textContent = data.warning || "";
+    anEvalRes = data;
+    renderAnEvalResults();
+  } catch (e) { el("an-ev-msg").textContent = "request failed"; }
+}
+
+async function evPut(body) {
+  const b = anSelected();
+  if (!b) return null;
+  try {
+    const res = await fetch(`/api/builds/${b.id}/eval`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      el("an-ev-msg").textContent = data.error || "save failed";
+      return null;
+    }
+    el("an-ev-msg").textContent = "";
+    anEval = Object.assign({}, anEval, data.doc);
+    return data.doc;
+  } catch (e) {
+    el("an-ev-msg").textContent = "request failed";
+    return null;
+  }
+}
+
+function evEditReset() {
+  anEvalEdit = "";
+  el("an-ev-text").value = "";
+  el("an-ev-add").textContent = "Add";
+  el("an-ev-cancel").hidden = true;
+}
+
+async function onEvSubmit() {
+  const text = el("an-ev-text").value.trim();
+  const kind = el("an-ev-kind").value;
+  if (!text) { el("an-ev-msg").textContent = "a query needs text"; return; }
+  const doc = await evPut(anEvalEdit
+    ? { update: { id: anEvalEdit, text, kind } }
+    : { add: { text, kind } });
+  if (doc) { evEditReset(); renderAnEval(); }
+}
+
+async function onEvQueriesClick(ev) {
+  const e = ev.target.closest("[data-ev-edit]");
+  if (e) {
+    const q = ((anEval && anEval.queries) || []).find((x) => x.id === e.dataset.evEdit);
+    if (!q) return;
+    anEvalEdit = q.id;
+    el("an-ev-text").value = q.text;
+    el("an-ev-kind").value = q.kind;
+    el("an-ev-add").textContent = "Save";
+    el("an-ev-cancel").hidden = false;
+    el("an-ev-text").focus();
+    return;
+  }
+  const d = ev.target.closest("[data-ev-del]");
+  if (d) {
+    const q = ((anEval && anEval.queries) || []).find((x) => x.id === d.dataset.evDel);
+    const judged = q ? Object.keys(q.judgments || {}).length : 0;
+    if (!(await confirmDialog({
+      title: "Delete query",
+      message: "Delete this evaluation query?",
+      detail: judged ? `Its ${judged} judgments are deleted with it.`
+        : "It has no judgments yet.",
+      confirmLabel: "Delete",
+      danger: true,
+    }))) return;
+    if (anEvalEdit === d.dataset.evDel) evEditReset();
+    if (anEvalSel === d.dataset.evDel) { anEvalSel = ""; anEvalRes = null; }
+    if (await evPut({ remove: d.dataset.evDel })) renderAnEval();
+    return;
+  }
+  const row = ev.target.closest(".ev-q");
+  if (row && row.dataset.ev !== anEvalSel) selectEvalQuery(row.dataset.ev);
+}
+
+async function onEvResultsClick(ev) {
+  const btn = ev.target.closest("[data-ev-rel]");
+  if (!btn) return;
+  const q = ((anEval && anEval.queries) || []).find((x) => x.id === anEvalSel);
+  if (!q) return;
+  const want = Number(btn.dataset.evRel);
+  const cur = (q.judgments || {})[btn.dataset.evPid];
+  // clicking the active judgment clears it (rel: null)
+  const rel = cur === want ? null : want;
+  if (await evPut({ judge: { id: q.id, passage_id: btn.dataset.evPid, rel } })) {
+    renderAnEval();
+  }
+}
+
+function onEvRunAll() {
+  const b = anSelected();
+  if (b) {
+    anStartJob("/api/knowledge/eval/run", { build_id: b.id }, "eval-run",
+               el("an-ev-run"));
+  }
+}
+
+// --- Ask this book (#143): evidence first, then an optional cited answer ---------
+
+// Transient on purpose: the answer lives in this variable and the pane,
+// never on disk — AI-derived claims stay visibly derived and never publish
+// (docs/search-design.md §7)
+let anAsk = null;   // {buildId, question, results}
+
+const ASK_ABSTAIN = "The archive does not contain enough evidence to answer this.";
+
+async function renderAnAsk(b) {
+  if (anAsk && anAsk.buildId !== b.id) anAsk = null;
+  if (!anAsk) {
+    el("an-ask-evidence").innerHTML = "";
+    el("an-ask-answer").hidden = true;
+    el("an-ask-note").hidden = true;
+    el("an-ask-view").hidden = true;
+    el("an-ask-msg").textContent = "";
+    el("an-ask-draft").hidden = true;
+  }
+  try {
+    const sec = await (await fetch("/api/secrets")).json();
+    anAskHasKey = !!String(sec.aiKey || "").trim();
+  } catch (e) { anAskHasKey = false; }
+  if (anAsk && anAsk.results.length) el("an-ask-draft").hidden = !anAskHasKey;
+}
+
+async function onAskGo() {
+  const b = anSelected();
+  if (!b) return;
+  const question = el("an-ask-q").value.trim();
+  if (!question) { el("an-ask-msg").textContent = "ask a question first"; return; }
+  el("an-ask-msg").textContent = "";
+  el("an-ask-answer").hidden = true;
+  el("an-ask-note").hidden = true;
+  el("an-ask-view").hidden = true;
+  try {
+    const res = await fetch("/api/knowledge/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ build_id: b.id, question }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (state.anSel !== b.id) return;
+    if (!res.ok || !data.ok) {
+      el("an-ask-msg").textContent = data.error || "failed";
+      return;
+    }
+    anAsk = { buildId: b.id, question, results: data.results || [] };
+    renderAskEvidence();
+  } catch (e) { el("an-ask-msg").textContent = "request failed"; }
+}
+
+function renderAskEvidence() {
+  const rows = (anAsk && anAsk.results) || [];
+  el("an-ask-evidence").innerHTML = rows.map((r) => evRowHtml(r, null)).join("")
+    || `<p class="empty">No passages match this question.</p>`;
+  // the Draft action appears only over evidence, and only with a provider
+  el("an-ask-draft").hidden = !(rows.length && anAskHasKey);
+}
+
+function onAskEvidenceClick(ev) {
+  const row = ev.target.closest("[data-ev-row]");
+  if (!row || !anAsk) return;
+  const r = anAsk.results.find((x) => x.passage_id === row.dataset.evRow);
+  if (r && r.text) {
+    el("an-ask-view").textContent = r.text;   // the verbatim reading
+    el("an-ask-view").hidden = false;
+  }
+}
+
+async function onAskDraft() {
+  const b = anSelected();
+  if (!b || !anAsk || !anAsk.results.length) return;
+  const btn = el("an-ask-draft");
+  btn.disabled = true;
+  el("an-ask-msg").textContent = "drafting…";
+  try {
+    const res = await fetch("/api/knowledge/ask/answer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        build_id: b.id, question: anAsk.question,
+        passage_ids: anAsk.results.map((r) => r.passage_id),
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      el("an-ask-msg").textContent = data.error || "failed";
+      return;
+    }
+    el("an-ask-msg").textContent = "";
+    renderAskAnswer(data.answer || "");
+  } catch (e) {
+    el("an-ask-msg").textContent = "request failed";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderAskAnswer(text) {
+  const host = el("an-ask-answer");
+  const abstained = text.trim() === ASK_ABSTAIN;
+  // escape FIRST, then linkify the [pN] citations — model text never
+  // reaches the DOM as HTML
+  host.innerHTML = esc(text).replace(/\[p(\d+)\]/g,
+    '<a href="#" class="ask-cite" data-cite="$1">[p$1]</a>');
+  // abstention is an outcome, not an error: the plain sentence, note-styled
+  host.classList.toggle("ask-abstain", abstained);
+  host.hidden = false;
+  el("an-ask-note").hidden = false;   // the permanent provenance note
+}
+
+function onAskAnswerClick(ev) {
+  const a = ev.target.closest(".ask-cite");
+  if (!a || !anAsk) return;
+  ev.preventDefault();
+  const page = Number(a.dataset.cite);
+  const rows = [...el("an-ask-evidence").querySelectorAll("[data-ev-row]")];
+  const hit = rows.find((row) => {
+    const r = anAsk.results.find((x) => x.passage_id === row.dataset.evRow);
+    return r && Number(r.page_from) <= page && page <= Number(r.page_to);
+  });
+  if (!hit) return;
+  hit.scrollIntoView({ block: "nearest" });
+  hit.classList.add("ev-flash");
+  setTimeout(() => hit.classList.remove("ev-flash"), 1200);
+}
+
 // --- Publish phase: the Search index card (#140) ---------------------------------
 
 async function renderAnIndexCard(b) {
@@ -9420,12 +11307,24 @@ async function renderAnIndexCard(b) {
   el("an-index-versions").innerHTML = versions.slice(0, 6).map((v, i) => {
     const s = v.stats || {};
     const model = (v.config || {}).model;
+    // #142: the evaluation results recorded at publish time, visible where
+    // promotion (publish / roll back) is decided
+    const ev = s.eval || null;
+    const evBits = [];
+    if (ev && ev.judged) {
+      evBits.push(`R@10 ${evFmt(ev.recall)} · nDCG ${evFmt(ev.ndcg)} · ` +
+        `MRR ${evFmt(ev.mrr)}`);
+    }
+    if (ev && ev.unanswerable) {
+      evBits.push(`unans ${ev.unanswerable_pass}/${ev.unanswerable}`);
+    }
     return `<div class="an-index-ver">
       <span class="psg-pages">v${versions.length - i}</span>
       <span>${esc(v.channel || "stable")}</span>
       <span>${v.built_at ? esc(new Date(v.built_at).toLocaleString()) : ""}</span>
       <span>${Number(s.passages) || 0} passages</span>
       <span>${model ? esc(model) : "lexical"}</span>
+      <span class="ev-verstats">${esc(evBits.join(" · ") || (ev ? "" : "not evaluated"))}</span>
     </div>`;
   }).join("");
 }
@@ -9713,6 +11612,23 @@ function initAnalyze() {
   el("an-psg-wrap").addEventListener("click", onAnPsgClick);
   el("an-index-publish").addEventListener("click", anIndexPublish);
   el("an-index-rollback").addEventListener("click", anIndexRollback);
+
+  // Test (#142) + Ask (#143)
+  el("an-ev-run").addEventListener("click", onEvRunAll);
+  el("an-ev-add").addEventListener("click", onEvSubmit);
+  el("an-ev-cancel").addEventListener("click", evEditReset);
+  el("an-ev-text").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") onEvSubmit();
+  });
+  el("an-ev-queries").addEventListener("click", onEvQueriesClick);
+  el("an-ev-results").addEventListener("click", onEvResultsClick);
+  el("an-ask-go").addEventListener("click", onAskGo);
+  el("an-ask-q").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") onAskGo();
+  });
+  el("an-ask-draft").addEventListener("click", onAskDraft);
+  el("an-ask-evidence").addEventListener("click", onAskEvidenceClick);
+  el("an-ask-answer").addEventListener("click", onAskAnswerClick);
 
   // Record -> Knowledge jump for the open book (same Workbench selection)
   el("b-analyze").addEventListener("click", () => {
@@ -10555,6 +12471,72 @@ function setPublishSidebarCollapsed(on, persist) {
     state.settings.publishSidebarCollapsed = collapsed;
     saveSettings();
   }
+}
+
+// --- Reusable collapsible section (VS Code-style vertical collapse) -----------
+// Fold a titled panel away vertically. `head` is the clickable header row
+// (typically a .pane-bar); `body` is the element beneath it; `key` names the
+// persisted state under settings.collapsed. A ▾/▸ caret is injected at the head
+// start. Interactive controls inside the head (buttons, tabs, inputs) keep
+// working — only the caret or the header's own chrome toggles. onToggle(collapsed)
+// fires after every change, including the initial restore. Returns a small
+// handle. Drop this on any stacked panel that should fold; see the CSS block
+// ".collapse-caret / .collapse-head / .collapse-body" for the styling contract.
+function makeCollapsible(head, body, key, onToggle) {
+  if (!head || !body) return null;
+  head.classList.add("collapse-head");
+  body.classList.add("collapse-body");
+  let caret = head.querySelector(":scope > .collapse-caret");
+  if (!caret) {
+    caret = document.createElement("button");
+    caret.type = "button";
+    caret.className = "collapse-caret";
+    caret.setAttribute("aria-label", "Collapse or expand this section");
+    head.insertBefore(caret, head.firstChild);
+  }
+  const store = () => (state.settings.collapsed = state.settings.collapsed || {});
+  const isCollapsed = () => body.classList.contains("sec-collapsed");
+  const apply = (collapsed) => {
+    body.classList.toggle("sec-collapsed", collapsed);
+    caret.textContent = collapsed ? "▸" : "▾";   // ▸ collapsed / ▾ open
+    caret.setAttribute("aria-expanded", String(!collapsed));
+    head.setAttribute("aria-expanded", String(!collapsed));
+    if (onToggle) onToggle(collapsed);
+  };
+  const toggle = () => { apply(!isCollapsed()); store()[key] = isCollapsed(); saveSettings(); };
+  head.addEventListener("click", (ev) => {
+    // The caret is the toggle affordance; if it's hidden (e.g. an enclosing
+    // sidebar is horizontally collapsed to a strip, where only an expand button
+    // remains), a stray click on the head's leftover padding must NOT toggle the
+    // now-invisible body. Requiring a visible caret keeps this generic.
+    if (caret.offsetParent === null) return;
+    if (ev.target.closest(".collapse-caret")) { toggle(); return; }
+    // real controls (tabs, buttons, inputs) do their own thing; the header's
+    // remaining chrome (title, spacer, padding) toggles the section
+    if (ev.target.closest("button, input, select, textarea, a, label, .pane-tab, [role='tab']"))
+      return;
+    toggle();
+  });
+  apply(!!store()[key]);   // restore persisted state without re-saving
+  return { toggle, set: apply, isCollapsed };
+}
+
+// Whole entries/artifacts sidebar horizontal collapse (mirrors the Publish
+// sidebar): #wb-split.wb-side-collapsed shrinks #ocr-side to a 34px strip whose
+// only control is the expand toggle.
+function setOcrSideCollapsed(on, persist) {
+  const collapsed = !!on;
+  const split = el("wb-split");
+  if (split) split.classList.toggle("wb-side-collapsed", collapsed);
+  const btn = el("ocr-side-toggle");
+  if (btn) {
+    btn.textContent = collapsed ? "▶" : "◀";   // ▶ expand / ◀ collapse
+    btn.setAttribute("aria-expanded", String(!collapsed));
+    btn.dataset.tip = collapsed
+      ? "Expand the entries & artifacts sidebar"
+      : "Collapse the entries & artifacts sidebar";
+  }
+  if (persist) { state.settings.wbSideCollapsed = collapsed; saveSettings(); }
 }
 
 function loadPublishCatalog() {
@@ -11927,7 +13909,6 @@ function renderBuildEditor() {
   el("b-src-open").href = src;
   el("build-msg").textContent = "";
   buildDirty = false;   // a freshly loaded form is clean
-  scApplyBuildOverlay();
   if (wbActivePhase() === "source" && activeBuildTab() === "btab-source") {
     refreshSourceTab();
   }
@@ -12039,8 +14020,6 @@ async function saveBuildFields(ev) {
   if (ev) ev.preventDefault();
   const id = state.buildSel;
   if (!id) return false;
-  // a smart-check overlay must never ride into a save — baking is explicit
-  scClearBuildOverlay();
   const fields = {};
   for (const f of BUILD_FIELDS) {
     const input = el("b-" + f);
@@ -14992,6 +16971,8 @@ const rwState = {
   drag: null,       // {kind: move|resize|draw, id, corner, start, box0, moved}
   lastPos: null,    // pointer in page fractions — the split guide
   seq: 0, idSeq: 0,
+  instrLoaded: false, // did the per-book instructions GET succeed this book?
+  instrDirty: false,  // unsaved edits in the instructions field
 };
 
 function rwActiveId() { return rwState.sel[rwState.sel.length - 1] || ""; }
@@ -15033,7 +17014,9 @@ function rwConfirmDiscard(detail) {
 }
 
 async function selectReplicaBook(bid) {
-  if (rwState.dirty &&
+  // instructions edits are per-book and only reloaded on a book switch, so the
+  // discard gate must cover them too — page/source switches don't reload them
+  if ((rwState.dirty || rwState.instrDirty) &&
       !(await rwConfirmDiscard("Switching books discards them."))) return;
   // one shared sequence for book, source, AND page context: any in-flight
   // fetch from before this click resolves into a dead sequence number and
@@ -15041,7 +17024,7 @@ async function selectReplicaBook(bid) {
   // book A's page strip and PDF under book B's regions)
   const seq = ++rwState.seq;
   rwState.book = bid; rwState.page = 0; rwState.items = [];
-  rwState.sel = []; rwState.dirty = false;
+  rwState.sel = []; rwState.dirty = false; rwState.instrDirty = false;
   rwState.outliers = [];   // the last scan flagged ANOTHER book's pages
   el("rw-canvas").hidden = true;
   el("rw-empty").hidden = false;
@@ -15062,6 +17045,8 @@ async function selectReplicaBook(bid) {
   await rwLoadStyles(seq);
   if (seq !== rwState.seq) return;
   await rwLoadTranslations(seq);
+  if (seq !== rwState.seq) return;
+  await rwLoadInstructions(seq);
   if (seq !== rwState.seq) return;
   rwSyncBar();
 }
@@ -15153,7 +17138,12 @@ async function selectReplicaPage(n) {
   } catch (e) { /* a bare page: draw from scratch */ }
   if (seq !== rwState.seq) return;
   rwState.items = (rec.found ? rec.items || [] : []).map((it, i) => ({
-    id: "r" + i, role: it.role || "body",
+    id: "r" + i,
+    // carry the stable region id and any third-party ext through the workbench
+    // round-trip: a nudge-and-save must not re-mint rids or erase imported
+    // region ext (the server sanitizer preserves a valid incoming rid)
+    rid: it.rid, ext: it.ext,
+    role: it.role || "body",
     order: it.order != null ? +it.order : i,
     box: { x: +((it.box || {}).x) || 0, y: +((it.box || {}).y) || 0,
            w: +((it.box || {}).w) || 0, h: +((it.box || {}).h) || 0 },
@@ -15592,8 +17582,11 @@ async function rwSave() {
   const seq = rwState.seq;
   const pageState = rwState.pageState;
   const items = [...rwState.items].sort((a, b) => a.order - b.order)
-    .map((it, i) => ({ role: it.role, order: i, box: it.box,
-                       text: it.text, norm: it.norm || "" }));
+    // rid + ext ride through so a save preserves the region's stable id and any
+    // imported third-party namespace (JSON.stringify drops the undefined keys
+    // of a legacy region, and the server mints a rid only for those)
+    .map((it, i) => ({ rid: it.rid, ext: it.ext, role: it.role, order: i,
+                       box: it.box, text: it.text, norm: it.norm || "" }));
   try {
     const r = await (await fetch(
       `/api/builds/${encodeURIComponent(book)}/ocr-regions`, {
@@ -16108,6 +18101,52 @@ async function rwStyleSave() {
   }
 }
 
+// the per-book "instructions for editors / AI" note (ocr/lib-instructions.md):
+// free guidance every .lib export embeds for external tools and assistants
+async function rwLoadInstructions(seq) {
+  // track load success: a failed GET must not render an empty field that Save
+  // then persists as a wipe. On failure the field is disabled and Save refuses.
+  let text = "", loaded = false;
+  try {
+    const r = await (await fetch(
+      `/api/builds/${encodeURIComponent(rwState.book)}/replica-instructions`)).json();
+    if (r.ok) { text = r.text || ""; loaded = true; }
+  } catch (e) { /* load failed — leave the field disabled, don't arm Save */ }
+  if (seq !== rwState.seq) return;
+  rwState.instrLoaded = loaded;
+  rwState.instrDirty = false;
+  el("rw-instr").value = text;
+  el("rw-instr").disabled = !loaded;
+  el("rw-instr-state").textContent =
+    loaded ? (text.trim() ? "set" : "") : "load failed";
+}
+
+async function rwInstrSave() {
+  if (!rwState.book) return;
+  // a load that failed leaves the field empty and unknown — refuse to save,
+  // or an empty PUT would delete the book's real stored instructions
+  if (!rwState.instrLoaded) {
+    status("BOOK INSTRUCTIONS :: not loaded — reselect the book");
+    return;
+  }
+  const text = el("rw-instr").value;
+  try {
+    const r = await (await fetch(
+      `/api/builds/${encodeURIComponent(rwState.book)}/replica-instructions`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      })).json();
+    if (!r.ok) throw new Error(r.error || "save failed");
+    rwState.instrDirty = false;
+    el("rw-instr-state").textContent = text.trim() ? "set" : "";
+    status(text.trim() ? `BOOK INSTRUCTIONS SAVED :: ${r.chars} chars`
+                       : "BOOK INSTRUCTIONS CLEARED");
+  } catch (e) {
+    status("BOOK INSTRUCTIONS :: " + e.message);
+  }
+}
+
 async function rwStyleReset() {
   if (!rwState.book) return;
   let ok = false;
@@ -16275,6 +18314,11 @@ function initReplica() {
   });
   el("rw-style-save").addEventListener("click", rwStyleSave);
   el("rw-style-reset").addEventListener("click", rwStyleReset);
+  el("rw-instr-save").addEventListener("click", rwInstrSave);
+  el("rw-instr").addEventListener("input", () => {
+    rwState.instrDirty = true;
+    el("rw-instr-state").textContent = "edited";
+  });
   el("rw-legend").innerHTML = RW_ROLES.map((r, i) =>
     `<span class="rw-key role-${esc(r)}" data-tip="${esc(r)}">${(i + 1) % 10}</span>`).join("");
 }
@@ -16444,365 +18488,10 @@ function initOcrTab() {
   });
 }
 
-// --- smart check: extract real metadata from the book's own PDF -------------------
-// Any record with a reachable PDF gets a magic-wand button. It asks the server
-// to OCR the PDF's front matter (Mistral) and extract bibliographic fields
-// (DeepSeek — the phone capture's exact chain), then holds the result as a
-// PENDING overlay: extracted values render in light yellow with a dotted
-// border, TAB flips the view back to the originals, and SPACE over a hovered
-// row bakes the fields into the record. Bakes are logged in History with full
-// before-snapshots (revertible), and consecutive bakes within SC_GROUP_MS fold
-// into ONE grouped history entry — bulk cleanups revert as a unit.
-
-let scChecks = {};          // target -> pending record (server: smart_checks.json)
-let scShow = true;          // TAB view: true = extracted values visible
-const scJobs = new Map();   // target -> { id } while a check runs
-let scPollTimer = null;
-let scGroup = null;         // open bake fold: { opId, ts0, items }
-const SC_GROUP_MS = 5 * 60 * 1000;
-
-async function loadSmartChecks() {
-  try {
-    const r = await (await fetch("/api/smartcheck")).json();
-    scChecks = (r && r.pending) || {};
-  } catch (e) { scChecks = {}; }
-}
-
-function scHasPending() {
-  // records only — a still-running job has nothing to toggle yet, and must
-  // not make TAB stop moving focus
-  return Object.keys(scChecks).length > 0;
-}
-
-// -- targets and their PDFs ---------------------------------------------------
-// A target names one book record ("whl:12", "build:<id>", "manual:<id>",
-// "checked:<key>"); the PDF reference is resolved fresh at click time.
-
-function scTargetForRow(row) {
-  return (row.kind === "manual" ? "manual:" : "checked:") + row.id;
-}
-
-function scPdfForRow(row) {
-  if (row.localPdf) return { pdf: row.localPdf };
-  const ident = iaIdentifierForRow(row);
-  if (ident && dlState(row) === "done")
-    return { pdf: "downloads/ia/" + ident + ".pdf" };
-  if (ident) return { url: `https://archive.org/download/${ident}/${ident}.pdf` };
-  return null;
-}
-
-function scPdfForWhl(r) {
-  return !r.added && r.file ? { url: r.file } : null;
-}
-
-function scPdfForBuild(b) {
-  const f = String(b.pdf_file || "").trim();
-  if (f) return { pdf: f };
-  const u = String(b.pdf_source || "").trim();
-  if (/^https?:\/\//i.test(u)) return { url: u };
-  return null;
-}
-
-// the fields of a pending record that actually differ from the current values
-// ({} = record matches the book; null = no pending record at all)
-function scProvFields(target, cur) {
-  const rec = scChecks[target];
-  if (!rec) return null;
-  const out = {};
-  for (const [f, v] of Object.entries(rec.mapped || {})) {
-    const val = String(v == null ? "" : v).trim();
-    if (!val) continue;
-    const c = cur(f);
-    if (String(c == null ? "" : c).trim() !== val) out[f] = val;
-  }
-  return out;
-}
-
-// -- the wand -----------------------------------------------------------------
-
-// what/when/how of a pending record, for the wand tooltip — the audit data
-// the server stores is surfaced right where the user decides to bake
-function scProvenanceTip(rec) {
-  const eng = rec.engine || {};
-  const lines = [`Extracted by ${eng.ocr || "?"} + ${eng.extract || "?"}` +
-    (rec.pages_ocred && rec.pages_ocred.length
-      ? ` from PDF page(s) ${rec.pages_ocred.join(", ")}` : "") +
-    (rec.created_at ? ` · ${rec.created_at}` : "")];
-  const extra = Object.entries(rec.extra || {}).slice(0, 4);
-  if (extra.length) {
-    lines.push("Also found: " + extra.map(([k, v]) =>
-      `${k}: ${String(v).slice(0, 40)}`).join(" · "));
-  }
-  return lines.join("\n");
-}
-
-function scWandHtml(target, pdfref, prov) {
-  const rec = scChecks[target];
-  if (!pdfref && !rec && !scJobs.has(target)) return "";
-  let cls = "";
-  let tip = "Smart check — extract real metadata from this book's PDF\n" +
-    "(Mistral OCR, then DeepSeek). Results overlay the row until baked.";
-  if (scJobs.has(target)) {
-    cls = " sc-running";
-    tip = "Smart check running — reading the PDF's front matter…";
-  } else if (rec && prov && Object.keys(prov).length) {
-    cls = " sc-ready";
-    tip = `Smart check: ${Object.keys(prov).length} field(s) differ — ` +
-      "the light-yellow dotted cells are extracted values\n" +
-      scProvenanceTip(rec) + "\n" +
-      "TAB compares with the original · SPACE over the row bakes them in\n" +
-      "Shift+click dismisses · click re-runs";
-  } else if (rec) {
-    cls = " sc-match";
-    tip = "Smart check: the PDF agrees with this record\n" +
-      scProvenanceTip(rec) + "\n" +
-      "Shift+click dismisses · click re-runs";
-  }
-  return `<span class="sc-wand${cls}" data-sc-run="${esc(target)}"` +
-    ` data-tip="${esc(tip)}">${ICONS.wand}</span>`;
-}
-
-// -- row decoration (runs inside the row builders on every render) -------------
-
-// whlRowCells' fixed cell order (src, ...fields..., status, copyright)
-const SC_WHL_CELL = { title: 1, subtitle: 2, authors: 3, year: 4, publisher: 5,
-                      pages: 6, language: 7, subject: 8, description: 9 };
-
-function scDecorateWhlRow(tr, r, mode) {
-  if (mode === "orig") return;         // Alt view shows the pre-correction record
-  const target = "whl:" + r.idx;
-  const pdfref = scPdfForWhl(r);
-  const prov = scProvFields(target, (f) => r[f]);
-  const wand = scWandHtml(target, pdfref, prov);
-  if (wand) {
-    // the title cell: the badge columns are width-locked and cannot take it
-    const td = tr.children[1];
-    if (td) td.insertAdjacentHTML("beforeend", wand);
-  }
-  if (!scShow || !prov) return;
-  for (const [f, v] of Object.entries(prov)) {
-    const td = tr.children[SC_WHL_CELL[f]];
-    if (!td) continue;
-    const keep = f === "title" ? td.querySelector(".sc-wand") : null;
-    td.textContent = v;
-    if (keep) td.appendChild(keep);
-    td.classList.add("sc-prov");
-    td.classList.remove("missing-core");
-    td.dataset.tip = "Smart check — original: " +
-      (String(r[f] || "").trim() || "(blank)");
-  }
-}
-
-function scDecorateCheckedRow(tr, row) {
-  const target = scTargetForRow(row);
-  const pdfref = scPdfForRow(row);
-  const prov = scProvFields(target, (f) => (row.book || {})[f]);
-  const wand = scWandHtml(target, pdfref, prov);
-  if (wand) {
-    // the title cell: the badge columns are width-locked and cannot take it
-    const td = tr.children[1];
-    if (td) td.insertAdjacentHTML("beforeend", wand);
-  }
-  if (!scShow || !prov) return;
-  for (const [f, v] of Object.entries(prov)) {
-    const i = BOOK_COLS.indexOf(f);
-    const td = i >= 0 ? tr.children[1 + i] : null;
-    if (!td) continue;
-    const keep = f === "title" ? td.querySelector(".sc-wand") : null;
-    td.textContent = v;
-    if (keep) td.appendChild(keep);
-    td.classList.add("sc-prov");
-    td.classList.remove("missing-core");
-    td.dataset.tip = "Smart check — original: " +
-      (String((row.book || {})[f] || "").trim() || "(blank)");
-  }
-}
-
-// -- Editor form overlay --------------------------------------------------------
-// Overlaid inputs go readOnly (bake or TAB back to edit); scBuildOrig remembers
-// what we wrote so the overlay never survives into a save or another build.
-
-let scBuildOrig = null;    // { id, vals: {f: original}, set: {f: provisional} }
-
-function scClearBuildOverlay() {
-  const saved = scBuildOrig;
-  scBuildOrig = null;
-  for (const f of BUILD_FIELDS) {
-    const inp = el("b-" + f);
-    if (!inp || !inp.classList.contains("sc-prov")) continue;
-    inp.classList.remove("sc-prov");
-    inp.readOnly = false;
-    delete inp.dataset.tip;
-    // restore only what we wrote — a re-rendered or re-selected form keeps
-    // its own fresh values
-    if (saved && saved.id === state.buildSel && inp.value === saved.set[f]) {
-      inp.value = saved.vals[f];
-    }
-  }
-}
-
-function scApplyBuildOverlay() {
-  scClearBuildOverlay();
-  const btn = el("b-smartcheck");
-  if (btn) btn.classList.remove("sc-running", "sc-ready", "sc-match");
-  const b = currentBuild();
-  if (!b) return;
-  const target = "build:" + b.id;
-  const prov = scProvFields(target, (f) => b[f]);
-  if (btn) {
-    if (scJobs.has(target)) btn.classList.add("sc-running");
-    else if (prov && Object.keys(prov).length) btn.classList.add("sc-ready");
-    else if (scChecks[target]) btn.classList.add("sc-match");
-  }
-  if (!scShow || !prov || !Object.keys(prov).length) return;
-  scBuildOrig = { id: b.id, vals: {}, set: {} };
-  for (const [f, v] of Object.entries(prov)) {
-    const inp = el("b-" + f);
-    if (!inp) continue;
-    scBuildOrig.vals[f] = inp.value;
-    scBuildOrig.set[f] = v;
-    inp.value = v;
-    inp.classList.add("sc-prov");
-    inp.readOnly = true;
-    inp.dataset.tip = "Smart check — original: " +
-      (String(b[f] || "").trim() || "(blank)") +
-      "\nSPACE over the form bakes · TAB shows the original";
-  }
-}
-
-function scRerender() {
-  if (state.whlRows) renderWhlTop();
-  renderChecked();
-  scApplyBuildOverlay();
-  // the footer tag is the persistent "provisional data exists" indicator
-  const n = Object.keys(scChecks).length;
-  const foot = el("status-smart");
-  if (foot) {
-    foot.hidden = !n && !scJobs.size;
-    foot.textContent = scJobs.size
-      ? `SMART CHECK: ${scJobs.size} running`
-      : `SMART CHECK: ${n} held (${scShow ? "shown" : "hidden"})`;
-  }
-}
-
-// -- running a check ------------------------------------------------------------
-
-function scRunInfo(target) {
-  const kind = target.split(":")[0];
-  const ident = target.slice(kind.length + 1);
-  if (kind === "whl") {
-    const row = whlRowByIdx(parseInt(ident, 10));
-    return row ? { pdfref: scPdfForWhl(row), label: row.title || "" } : null;
-  }
-  if (kind === "build") {
-    const b = state.builds[ident];
-    return b ? { pdfref: scPdfForBuild(b), label: b.title || "" } : null;
-  }
-  const row = state.rowsById.get(String(ident));
-  if (row) return { pdfref: scPdfForRow(row), label: (row.book || {}).title || "" };
-  return null;
-}
-
-async function startSmartCheck(target, pdfref, label) {
-  const body = Object.assign({ target, label }, pdfref);
-  let data;
-  try {
-    const res = await fetch("/api/smartcheck/run", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.ok) throw new Error(data.error || "HTTP " + res.status);
-  } catch (e) {
-    statusErr(`SMART CHECK FAILED :: ${e.message || e}`);
-    return;
-  }
-  scJobs.set(target, { id: data.job.id });
-  scEnsurePolling();
-  scRerender();
-  status(`SMART CHECK :: ${label || target} — reading the PDF`);
-}
-
-function scEnsurePolling() {
-  if (scPollTimer) return;
-  scPollTimer = setInterval(async () => {
-    if (document.hidden || !scJobs.size) {
-      if (!scJobs.size) { clearInterval(scPollTimer); scPollTimer = null; }
-      return;
-    }
-    for (const [target, j] of [...scJobs]) {
-      let r;
-      try {
-        const res = await fetch("/api/smartcheck/job/" + j.id);
-        if (res.status === 404) {   // gone from both registries: give up now
-          scJobs.delete(target);
-          statusErr("SMART CHECK LOST :: the server no longer knows this job");
-          scRerender();
-          continue;
-        }
-        r = await res.json();
-        j.bad = 0;
-      } catch (e) {
-        // a restarting/unreachable server: retry a few times, then let go
-        j.bad = (j.bad || 0) + 1;
-        if (j.bad >= 8) {
-          scJobs.delete(target);
-          statusErr("SMART CHECK LOST :: no answer from the server");
-          scRerender();
-        }
-        continue;
-      }
-      const state2 = r.state || "";
-      if (state2 === "queued" || state2 === "running" || state2 === "cancelling") continue;
-      scJobs.delete(target);
-      if (String(r.status || "").startsWith("done")) {
-        await loadSmartChecks();
-        scShow = true;
-        status(`SMART CHECK DONE :: ${r.label || target} — ` +
-          "TAB compares, SPACE over the row bakes");
-      } else if (r.status === "cancelled") {
-        status(`SMART CHECK CANCELLED :: ${r.label || target}`);
-      } else {
-        statusErr(`SMART CHECK FAILED :: ${r.error || r.status || "lost"}`);
-      }
-      scRerender();
-    }
-  }, 1500);
-}
-
-async function scResolve(target, action, applied) {
-  try {
-    await fetch("/api/smartcheck/resolve", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ target, action, applied: applied || {} }),
-    });
-  } catch (e) { /* the pending record just stays; harmless */ }
-}
-
-async function scWandClick(target, ev) {
-  if (ev.shiftKey && scChecks[target]) {
-    await scResolve(target, "dismissed", {});
-    delete scChecks[target];
-    scRerender();
-    status("SMART CHECK :: dismissed");
-    return;
-  }
-  if (scJobs.has(target)) { status("SMART CHECK :: already running"); return; }
-  // a re-run replaces the held result and spends OCR/AI calls — make sure
-  if (scChecks[target] && state.settings.confirmDiscard !== false &&
-      !window.confirm("Re-run the smart check for this book? " +
-        "The held result will be replaced.")) return;
-  const info = scRunInfo(target);
-  if (!info || !info.pdfref) {
-    statusErr("SMART CHECK :: no reachable PDF for this book");
-    return;
-  }
-  await startSmartCheck(target, info.pdfref, info.label);
-}
-
-// -- baking: provisional fields -> the record, grouped + revertible ---------------
+// -- smart-check bake reverts (History compatibility) -----------------------------
+// The wand-overlay smart-check UI is retired — Process mode's Smart Scan is the
+// one surface now — but History entries from baked smart checks persist in the
+// action log, so their grouped revert must keep working.
 
 async function scRevertItem(it) {
   switch (it.kind) {
@@ -16819,249 +18508,6 @@ async function scRevertItems(items) {
   for (const it of [...items].reverse()) ok = (await scRevertItem(it)) && ok;
   renderChecked();
   return ok;
-}
-
-async function scReplayItem(it) {
-  switch (it.kind) {
-    case "whl": return !!(await whlPost({ idx: it.idx, fields: it.after }));
-    case "build-fields": return !!(await patchBuildRaw(it.id, it.after));
-    case "manual-fields": return !!(await patchManualFields(it.id, it.after));
-    case "checked": {
-      const entry = state.checked.get(it.key);
-      if (!entry) return false;
-      // mirror the original bake exactly: merged fields invalidate the
-      // stale checks/scans/verify and requeue the scan
-      entry.book = Object.assign({}, entry.book, it.after);
-      entry.edited = true;
-      entry.checks = null;
-      entry.scans = null;
-      entry.verify = null;
-      queueScan(it.key);
-      saveChecked();
-      return true;
-    }
-    default: return false;
-  }
-}
-
-async function scReplayItems(items) {
-  let ok = true;
-  for (const it of items) ok = (await scReplayItem(it)) && ok;
-  renderChecked();
-  return ok;
-}
-
-// One bake = one history entry; bakes landing within SC_GROUP_MS of the group's
-// start fold into it (same pattern commitEdit uses for set declarations), so
-// "cleaned up 30 books" is ONE revertible History row.
-function scGroupLog(item, label) {
-  const now = Date.now();
-  const lr = actionLog();
-  const top = history.stack[history.ptr - 1];
-  const last = lr.length ? lr[lr.length - 1] : null;
-  const open = scGroup && top && top.id === scGroup.opId &&
-    last && last.id === scGroup.opId && !last.reverted &&
-    last.revert && now - scGroup.ts0 < SC_GROUP_MS;
-  if (open) {
-    scGroup.items.push(item);
-    last.revert.items = scGroup.items;   // re-link (logAction may have re-parsed)
-    last.label = `bake smart check into ${scGroup.items.length} books`;
-    last.tkey = "";   // a grown group spans records; no single conflict key
-    saveActionLog();
-    const items = scGroup.items;
-    top.label = last.label;
-    top.undoFn = () => scRevertItems(items);
-    top.redoFn = () => scReplayItems(items);
-    updateHistoryButtons();
-    if (activeBottomTable() === "history") renderBottomRows();
-    return;
-  }
-  const items = [item];
-  const opId = pushOp(`bake smart check into ${String(label || "").slice(0, 40)}`,
-    () => scRevertItems(items),
-    () => scReplayItems(items),
-    { kind: "smartbake", items });
-  scGroup = { opId, ts0: now, items };
-}
-
-let scBaking = false;   // re-entry guard: a held SPACE must not double-bake
-
-async function scBakeTarget(target) {
-  const rec = scChecks[target];
-  if (!rec || scBaking) return false;
-  scBaking = true;
-  try {
-    return await scBakeTargetInner(target, rec);
-  } finally {
-    scBaking = false;
-  }
-}
-
-async function scBakeTargetInner(target, rec) {
-  const kind = target.split(":")[0];
-  const ident = target.slice(kind.length + 1);
-  let prov = null;
-  let item = null;
-  let label = rec.label || "";
-  if (kind === "whl") {
-    const idx = parseInt(ident, 10);
-    const row = whlRowByIdx(idx);
-    if (!row) { statusErr("SMART CHECK :: row not loaded"); return false; }
-    label = label || row.title || "";
-    prov = scProvFields(target, (f) => row[f]);
-    if (prov && Object.keys(prov).length) {
-      const snaps = whlFieldSnaps(row, Object.keys(prov));
-      if (!(await whlPost({ idx, fields: prov }))) {
-        statusErr("BAKE FAILED"); return false;
-      }
-      item = { kind: "whl", idx, beforeSnaps: snaps, after: prov };
-    }
-  } else if (kind === "build") {
-    const b = state.builds[ident];
-    if (!b) { statusErr("SMART CHECK :: entry not loaded"); return false; }
-    label = label || b.title || ident;
-    prov = scProvFields(target, (f) => b[f]);
-    if (prov && Object.keys(prov).length) {
-      const before = {};
-      for (const f of Object.keys(prov)) before[f] = b[f] || "";
-      scClearBuildOverlay();   // the form must not hold overlay values through a patch
-      // quiet: a full renderUpload/renderBuildEditor would wipe the user's
-      // unsaved edits in OTHER fields — refresh only the inputs we baked
-      if (!(await patchBuildRaw(ident, prov, true))) {
-        statusErr("BAKE FAILED"); return false;
-      }
-      for (const [f, v] of Object.entries(prov)) {
-        const inp = el("b-" + f);
-        if (inp) inp.value = v;
-      }
-      item = { kind: "build-fields", id: ident, before, after: prov };
-    }
-  } else if (kind === "manual") {
-    const entry = state.manual.find((e) => String(e.id) === ident);
-    if (!entry) { statusErr("SMART CHECK :: entry not loaded"); return false; }
-    label = label || entry.title || "";
-    prov = scProvFields(target, (f) => entry[f]);
-    if (prov && Object.keys(prov).length) {
-      const before = {};
-      for (const f of Object.keys(prov)) before[f] = String(entry[f] || "");
-      if (!(await patchManualFields(ident, prov))) {
-        statusErr("BAKE FAILED"); return false;
-      }
-      item = { kind: "manual-fields", id: ident, before, after: prov };
-    }
-  } else {   // checked
-    const entry = state.checked.get(ident);
-    if (!entry) { statusErr("SMART CHECK :: row not loaded"); return false; }
-    label = label || (entry.book || {}).title || "";
-    prov = scProvFields(target, (f) => (entry.book || {})[f]);
-    if (prov && Object.keys(prov).length) {
-      const before = snapshotChecked(ident);
-      entry.book = Object.assign({}, entry.book, prov);
-      entry.edited = true;
-      entry.checks = null;
-      entry.scans = null;
-      entry.verify = null;
-      queueScan(ident);
-      saveChecked();
-      item = { kind: "checked", key: ident, before, after: prov };
-    }
-  }
-  if (item) scGroupLog(item, label);
-  await scResolve(target, "baked", prov || {});
-  delete scChecks[target];
-  scRerender();
-  status(item
-    ? `BAKED :: ${label} — ${Object.keys(prov).length} field(s) updated`
-    : `SMART CHECK :: ${label} — matches, nothing to change`);
-  return true;
-}
-
-// -- keyboard: TAB toggles the view, SPACE over a row bakes it --------------------
-
-function scHoverTarget() {
-  const tr = document.querySelector("#whltop-rows tr:hover, #checked-rows tr:hover");
-  if (tr) {
-    if (tr.dataset.widx !== undefined) return "whl:" + tr.dataset.widx;
-    if (tr.dataset.rowId) {
-      const row = state.rowsById.get(String(tr.dataset.rowId));
-      if (row) return scTargetForRow(row);
-    }
-    return null;
-  }
-  if (document.querySelector("#build-editor:hover")) {
-    const b = currentBuild();
-    if (b) return "build:" + b.id;
-  }
-  return null;
-}
-
-function onSmartKey(ev) {
-  if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.repeat) return;
-  const t = ev.target;
-  if (/^(INPUT|TEXTAREA|SELECT|BUTTON|A)$/.test(t.tagName) || t.isContentEditable) return;
-  // never fight a modal (settings, wizard, viewers all use .overlay)
-  if (document.querySelector(".overlay:not([hidden])")) return;
-  if (ev.key === "Tab") {
-    if (!scHasPending()) return;      // nothing provisional: TAB moves focus
-    ev.preventDefault();
-    scShow = !scShow;
-    scRerender();
-    status(scShow
-      ? "SMART CHECK :: extracted values shown — SPACE over a row bakes them in"
-      : "SMART CHECK :: original values shown — TAB switches back");
-    return;
-  }
-  if (ev.key === " ") {
-    const target = scHoverTarget();
-    if (!target || !scChecks[target]) return;   // plain space scrolls as usual
-    ev.preventDefault();
-    if (!scShow) {
-      // never bake values the user can't see
-      status("SMART CHECK :: extracted values are hidden — TAB shows them first");
-      return;
-    }
-    scBakeTarget(target);
-  }
-}
-
-function initSmartCheck() {
-  loadSmartChecks().then(scRerender);
-  document.addEventListener("keydown", onSmartKey);
-  // capture phase: a wand click must not double as a row click
-  for (const id of ["whltop-rows", "checked-rows"]) {
-    el(id).addEventListener("click", (ev) => {
-      const w = ev.target.closest("[data-sc-run]");
-      if (!w) return;
-      ev.preventDefault();
-      ev.stopPropagation();
-      scWandClick(w.dataset.scRun, ev);
-    }, true);
-  }
-  el("b-smartcheck").addEventListener("click", (ev) => {
-    // drop focus so SPACE stays the bake key, not a button re-click
-    ev.currentTarget.blur();
-    const b = currentBuild();
-    if (b) scWandClick("build:" + b.id, ev);
-  });
-  el("status-smart").addEventListener("click", async (ev) => {
-    // Shift+click = dismiss everything held — the escape hatch for records
-    // whose row is gone (an unchecked book has no wand left to click)
-    if (ev.shiftKey) {
-      const targets = Object.keys(scChecks);
-      if (!targets.length) return;
-      if (!window.confirm(`Dismiss all ${targets.length} held smart-check ` +
-        "result(s)? Nothing already baked is affected.")) return;
-      for (const t of targets) {
-        await scResolve(t, "dismissed", {});
-        delete scChecks[t];
-      }
-      scRerender();
-      status("SMART CHECK :: all held results dismissed");
-      return;
-    }
-    scShow = !scShow;
-    scRerender();
-  });
 }
 
 // --- menu bar ---------------------------------------------------------------
@@ -17134,12 +18580,12 @@ function buildThemeMenu() {
   const host = el("menu-themes");
   if (!host) return;
   host.innerHTML = "";
-  for (const [id, label] of THEMES) {
+  for (const [id, label, custom] of allThemes()) {
     const cmd = "theme:" + id;
     MENU_CMDS[cmd] = () => setTheme(id);
     const b = document.createElement("button");
     b.type = "button";
-    b.className = "menu-item";
+    b.className = "menu-item" + (custom ? " menu-item-custom" : "");
     b.dataset.cmd = cmd;
     b.innerHTML = `<span class="menu-check"></span>${esc(label)}`;
     host.appendChild(b);
@@ -17193,7 +18639,7 @@ function updateMenuState() {
   check("table-whl", !onChecked);
   check("opt-auto-ia", state.settings.autoIaDownload !== false);   // default-on
   check("opt-expand-sets", !!state.settings.expandSets);
-  for (const [id] of THEMES) check("theme:" + id, id === state.settings.theme);
+  for (const [id] of allThemes()) check("theme:" + id, id === state.settings.theme);
   const svc = state.settings.ocrService || "tesseract";
   for (const [id] of OCR_SERVICES) check("ocrsvc:" + id, id === svc);
 }
@@ -17501,6 +18947,60 @@ function initDesktopChrome() {
   });
 }
 
+// A .lib the user double-clicked in the OS (desktop shell only): the main
+// process forwards its path once we signal ready; we offer to mint a new book
+// from it, run the import, and land on that book in the Workbench.
+// TODO: an "Import into an existing book…" picker alongside create-new; until
+// then the Replica tab's Import button covers that path.
+function initLibOpen() {
+  const d = window.whlDesktop;
+  if (!d || !d.lib) return;                   // browser / older shell: no flow
+  // multi-select delivers several lib:open events back-to-back; serialize them
+  // so each file's confirm dialog runs to completion before the next opens —
+  // otherwise a follow-up dialog auto-cancels the one in front of it and only
+  // the last file is ever offered
+  const handleOne = async (p) => {
+    if (!p) return;
+    const name = p.split(/[\\/]/).pop();
+    if (!(await confirmDialog({
+      title: "Open book archive",
+      message: `Create a new book from ${name}?`,
+      detail: "Its pages, figures, type styles and translations land in a " +
+              "fresh Workbench entry. To bring pages into a book you already " +
+              "have, use the Replica tab's Import instead.",
+      confirmLabel: "Create book" }))) return;
+    let r;
+    try {
+      r = await (await fetch("/api/lib/open", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: p }),
+      })).json();
+      if (!r.ok) throw new Error(r.error || "open failed");
+    } catch (e) {
+      statusCrit("OPEN .LIB :: " + e.message);
+      return;
+    }
+    const rec = r.receipt || {};
+    // every named drop goes to the Info console; the status line just counts
+    for (const w of rec.warnings || []) {
+      conPut("warn", `lib import: ${w.loc}: ${w.msg}`, "app");
+    }
+    await loadBuilds();
+    document.querySelector('#tabs .tab[data-tab="workbench"]').click();
+    selectBuild(r.build_id);
+    status(`LIB OPEN :: ${(rec.pages_applied || []).length} page(s)` +
+           (rec.figures_added ? ` · ${rec.figures_added} figure(s)` : "") +
+           ((rec.translations_added || []).length
+             ? ` · translations ${rec.translations_added.join(", ")}` : "") +
+           ((rec.warnings || []).length
+             ? ` · ${rec.warnings.length} warning(s) (see the Info tab)` : ""));
+  };
+  let chain = Promise.resolve();
+  d.lib.onOpen((p) => { chain = chain.then(() => handleOne(p)).catch(() => {}); });
+  d.lib.ready();
+}
+
 // One init step must not be able to take out the ones after it. A missing
 // element used to throw here and silently disable everything downstream -- an
 // old template plus a new app.js killed the OCR page handlers that way, and the
@@ -17527,11 +19027,11 @@ function init() {
   boot("checked books", loadChecked);
   boot("icons", injectIcons);
   boot("confirm dialog", initConfirmDialog);
+  boot("lib open", initLibOpen);   // after the dialog it drives is wired
   boot("overlay modals", initOverlayModals);
   boot("tabs", initTabs);
   boot("activity icons", initActivityIcons);
   boot("jobs", initJobs);
-  boot("smart check", initSmartCheck);
   boot("tooltips", initTooltips);
   boot("pane tabs", initPaneTabs);
   boot("actor header", installActorHeader);   // before any write goes out
@@ -17680,8 +19180,31 @@ function init() {
 
   // top pane: table selector + WHL interactions
   el("top-table").addEventListener("change", () => switchTopTable(el("top-table").value));
-  el("whl-mode").addEventListener("click", () =>
-    setTopMode(topMode() === "edit" ? "search" : "edit"));
+  el("whl-modeseg").addEventListener("click", (ev) => {
+    const b = ev.target.closest(".modeseg-btn");
+    if (b && b.dataset.mode) setTopMode(b.dataset.mode);
+  });
+  // Process mode: action bar + right-click Mark Primary on both tables
+  el("proc-all").addEventListener("click", procSelectAll);
+  el("proc-none").addEventListener("click", procSelectNone);
+  el("proc-run").addEventListener("click", procRun);
+  el("proc-action").addEventListener("change", () => {
+    const inp = el("proc-ai-instr");
+    if (el("proc-action").value === "deepseek" && inp && !inp.value && state.settings.aiInstructions)
+      inp.value = state.settings.aiInstructions;
+    renderProcBar();
+  });
+  el("checked-rows").addEventListener("contextmenu", onRowContextMenu);
+  el("whltop-rows").addEventListener("contextmenu", onRowContextMenu);
+  el("ocr-books").addEventListener("contextmenu", onBuildListContextMenu);
+  // right-click a column header: hide / show-all / full picker
+  const checkedHead = el("checked-table").querySelector("thead");
+  if (checkedHead) checkedHead.addEventListener("contextmenu",
+    (ev) => onHeaderContextMenu(ev, "checked", renderChecked));
+  const whlHead = el("whltop-table").querySelector("thead");
+  if (whlHead) whlHead.addEventListener("contextmenu",
+    (ev) => onHeaderContextMenu(ev, "whl", renderWhlTop));
+  loadStaged().then(() => { if (topMode() === "process") reRenderTop(); });
   document.addEventListener("keydown", (ev) => {
     if (!(ev.ctrlKey || ev.metaKey) || ev.key.toLowerCase() !== "e") return;
     const t = ev.target;
@@ -17704,6 +19227,7 @@ function init() {
     const idx = parseInt(tr.dataset.widx, 10);
     // Ctrl+click opens the record in the EDIT tab from either mode
     if (ev.ctrlKey || ev.metaKey) { openWhlEditTab(idx); return; }
+    if (procTableClick(ev, "whl")) return;
     if (whlMode() === "search") {
       if (ev.target.closest("td[data-wsearch]")) selectWhlSearchRow(idx);
       return;
@@ -17939,6 +19463,22 @@ function init() {
     reset: () => { el("ocr-queue-wrap").style.flex = ""; },
   });
 
+  // Workbench sidebar collapse: each section folds vertically (VS Code-style),
+  // and the whole sidebar folds horizontally. The inter-section splitter only
+  // makes sense while both sections are open, so hide it otherwise.
+  const syncOcrSideSplitter = () => {
+    const sp = el("ocr-side-splitter");
+    if (!sp) return;
+    sp.hidden = el("ocr-books-wrap").classList.contains("sec-collapsed") ||
+                el("ocr-doc-wrap").classList.contains("sec-collapsed");
+  };
+  makeCollapsible(el("builds-tabs"), el("ocr-books-wrap"), "wbEntries", syncOcrSideSplitter);
+  makeCollapsible(el("ocr-artifacts-bar"), el("ocr-doc-wrap"), "wbArtifacts", syncOcrSideSplitter);
+  syncOcrSideSplitter();
+  el("ocr-side-toggle").addEventListener("click", () =>
+    setOcrSideCollapsed(!state.settings.wbSideCollapsed, true));
+  setOcrSideCollapsed(state.settings.wbSideCollapsed, false);
+
   // markdown: the builder's live editor + the overlay window (WHL pencil)
   buildDescMd = createMdEditor(el("b-desc-editor"));
   overlayMd = createMdEditor(el("md-live-overlay"));
@@ -18119,6 +19659,8 @@ function init() {
   document.addEventListener("keydown", onSearchKey);
   document.addEventListener("keydown", onRowDeleteKey);
   document.addEventListener("keydown", onUiScaleKey);
+  document.addEventListener("keydown", onFieldCopyKey);
+  document.addEventListener("keydown", onFieldPasteKey);
   boot("attention popover", initAttnPop);
   boot("review queue", initReviewWin);
   boot("categories", initCategories);
@@ -18225,7 +19767,11 @@ function init() {
   // reflect whatever the server holds (the merge may differ from the cache).
   syncClientStateOnLoad().then((adopted) => {
     hydrateSecrets();      // warm credentials without delaying the initial UI
-    if (adopted) { applyTheme(); applyFont(); applyExpSharpen(); }
+    // adopted server settings can carry a different set of custom themes, so
+    // rebuild the pickers/menu before re-applying (else the menubar Theme
+    // submenu keeps the pre-sync list); applyExpSharpen re-applies the
+    // experimental UI-sharpen overlay against the adopted state.
+    if (adopted) { refreshThemePickers(); applyTheme(); applyFont(); applyExpSharpen(); }
     maybeWizard();       // first desktop launch: the guide covers sign-in too
     maybeAuthPrompt();   // needs the adopted settings: authPromptDismissed
     loadDownloads();

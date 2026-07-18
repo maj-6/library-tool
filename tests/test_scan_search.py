@@ -246,13 +246,48 @@ def test_ia_all_results_restricted(monkeypatch):
     calls = _install_fake_get(monkeypatch, lambda url: _ia_response(restricted))
     out = scan_search.search_internet_archive(QUERY_TITLE, QUERY_AUTHOR, QUERY_YEAR)
 
-    # the restricted hit still ranks 1.0 and breaks the ladder, but only
-    # downloadable matches are reported
-    assert len(calls) == 1
+    # A restricted hit never stops the ladder: a looser query could still find
+    # a downloadable edition. Only downloadable matches are reported.
+    assert len(calls) == 4
     assert out["matches"] == []
     assert out["best_match"] is None
     assert out["available"] is False
     assert out["no_download"] is True
+
+
+def test_ia_view_only_exact_hit_does_not_hide_downloadable_edition(monkeypatch):
+    # archive.org marks view-only, borrow-only, lending and restricted copies
+    # with the same access-restricted-item flag, so a view-only match is not
+    # downloadable and must never surface as available (issue #78).
+    view_only = {
+        "identifier": "americanmedicin05view",
+        "title": "American medicinal plants",
+        "creator": "Millspaugh, Charles Frederick, 1854-1923",
+        "year": "1887",
+        "access-restricted-item": "true",
+    }
+    downloadable = {
+        "identifier": "americanmedicin05download",
+        "title": "American medicinal plants",
+        "creator": "Millspaugh, Charles Frederick, 1854-1923",
+        "year": "1887",
+    }
+    responses = iter([
+        _ia_response([view_only]),
+        _ia_response([downloadable]),
+    ])
+    calls = _install_fake_get(monkeypatch, lambda url: next(responses))
+    out = scan_search.search_internet_archive(QUERY_TITLE, QUERY_AUTHOR, QUERY_YEAR)
+
+    # The restricted exact hit does not stop the ladder; the next query finds
+    # an equally accurate edition that users can actually download.
+    assert len(calls) == 2
+    assert [m["identifier"] for m in out["matches"]] == [
+        "americanmedicin05download"
+    ]
+    assert out["best_match"]["identifier"] == "americanmedicin05download"
+    assert out["available"] is True
+    assert out["no_download"] is False
 
 
 def test_ia_empty_response_runs_whole_ladder(monkeypatch):

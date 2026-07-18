@@ -26,6 +26,7 @@ import hashlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -49,6 +50,7 @@ import capture_pipeline as capture  # noqa: E402
 import catalog_checks as checks  # noqa: E402
 import cloud_defaults  # noqa: E402
 import layout_roles  # noqa: E402
+import libformat  # noqa: E402
 import copyright_registration as copyreg  # noqa: E402
 import libcommon as lib  # noqa: E402
 import r2_store as r2  # noqa: E402
@@ -449,7 +451,7 @@ def api_auth_status():
 def api_auth_login():
     cfg = _auth_cfg()
     if not cfg:
-        return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Sync)"}), 400
+        return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Integrations)"}), 400
     p = request.get_json(silent=True) or {}
     email = str(p.get("email") or "").strip()
     password = str(p.get("password") or "")
@@ -471,7 +473,7 @@ def api_auth_login():
 def api_auth_signup():
     cfg = _auth_cfg()
     if not cfg:
-        return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Sync)"}), 400
+        return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Integrations)"}), 400
     p = request.get_json(silent=True) or {}
     email = str(p.get("email") or "").strip()
     password = str(p.get("password") or "")
@@ -980,10 +982,11 @@ def api_builds():
     return jsonify({"builds": lib.load_json(BUILDS_PATH, {})})
 
 
-@app.route("/api/builds", methods=["POST"])
-def api_builds_create():
-    payload = request.get_json(silent=True) or {}
-    seed = payload.get("build") or {}
+def _create_build(seed: dict) -> tuple[dict | None, str]:
+    """Mint one build record from a seed through the standard field cleaning:
+    (build, "") on success, (None, error) on refusal. The core of POST
+    /api/builds, shared with the .lib open flow so a book minted from a
+    manifest passes exactly the same scrubbing as a hand-created one."""
     with _builds_lock:
         builds = lib.load_json(BUILDS_PATH, {})
         build = {f: str(seed.get(f, "") or "").strip() for f in _BUILD_FIELDS
@@ -998,14 +1001,22 @@ def api_builds_create():
         if build["status"] not in _BUILD_STATUSES:
             build["status"] = "draft"
         if build["rights"] not in _BUILD_RIGHTS:
-            return jsonify({"ok": False,
-                            "error": f"unknown rights value {build['rights']!r}"}), 400
+            return None, f"unknown rights value {build['rights']!r}"
         build["id"] = lib.gen_id(set(builds))
         build["created_at"] = _build_updated_at()
         build["updated_at"] = build["created_at"]
         builds[build["id"]] = build
         lib.save_json(BUILDS_PATH, builds)
     activity("created", "draft entry", detail=build.get("title", ""))
+    return build, ""
+
+
+@app.route("/api/builds", methods=["POST"])
+def api_builds_create():
+    payload = request.get_json(silent=True) or {}
+    build, err = _create_build(payload.get("build") or {})
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
     return jsonify({"ok": True, "build": build})
 
 
@@ -1083,6 +1094,250 @@ def api_builds_restore():
         builds[bid] = build
     _mutate_json(BUILDS_PATH, _builds_lock, {}, reinsert)
     return jsonify({"ok": True, "build": build})
+
+
+# --- staged alternatives: Process-mode candidate field-sets ------------------------
+# Process mode stages ALTERNATIVE field values for a catalog entry — produced by
+# Normalize, a DeepSeek pass, a rescan, or Smart Scan — for side-by-side review
+# before any is applied. Each store entry keys a parent record by ``target``
+# ("whl:<idx>", "build:<id>", "manual:<id>", "checked:<source>:<idx>") and holds
+# an ordered list of alternative field-sets. Nothing here mutates the real
+# record: the client applies a chosen alt through the normal edit endpoints
+# ("Mark Primary") and posts the displaced original back here as a "superseded"
+# alt, so the swap stays reversible. Device-local — provisional data never syncs
+# — and guarded by one lock like the other JSON stores.
+STAGED_PATH = lib.OUTPUT_DIR / "staged_alts.json"
+_staged_lock = threading.Lock()
+
+_STAGED_SOURCES = ("normalize", "deepseek", "rescan", "smartscan", "superseded")
+_STAGED_MAX_ENTRIES = 2000
+_STAGED_MAX_ALTS = 12
+
+
+def _staged_ts() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _clean_staged_fields(raw) -> dict:
+    """A flat {field: value} candidate map: string keys, scalar values coerced
+    to trimmed strings, capped in count and length so an untrusted client (or a
+    chatty model reply routed through here) can't bloat staged_alts.json."""
+    out = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if not isinstance(k, str) or len(out) >= 40:
+                continue
+            if isinstance(v, bool) or v is None:
+                continue
+            if isinstance(v, (str, int, float)):
+                out[k[:40]] = str(v)[:2000]
+    return out
+
+
+def _clean_staged_alt(raw) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    fields = _clean_staged_fields(raw.get("fields"))
+    if not fields:
+        return None
+    src = str(raw.get("source") or "").strip().lower()
+    if src not in _STAGED_SOURCES:
+        src = "normalize"
+    return {
+        "id": str(raw.get("id") or lib.gen_id())[:40],
+        "source": src,
+        "label": str(raw.get("label") or "")[:200],
+        "fields": fields,
+        "note": str(raw.get("note") or "")[:4000],
+        "created_at": str(raw.get("created_at") or _staged_ts())[:40],
+    }
+
+
+def _staged_alt_key(a) -> tuple:
+    return (a.get("source"), json.dumps(a.get("fields"), sort_keys=True))
+
+
+def _staged_append(e, alt) -> None:
+    """Append an alt to an entry with the same dedupe + cap as /api/staged/add."""
+    key = _staged_alt_key(alt)
+    if any(_staged_alt_key(x) == key for x in e["alts"]):
+        return
+    e["alts"].append(alt)
+    if len(e["alts"]) > _STAGED_MAX_ALTS:
+        del e["alts"][:-_STAGED_MAX_ALTS]
+
+
+def _staged_entry(doc, target, kind="", label=""):
+    ents = doc.setdefault("entries", {})
+    e = ents.get(target)
+    if not isinstance(e, dict):
+        e = ents[target] = {"target": target, "kind": kind or _target_kind(target),
+                            "label": label, "alts": [], "created_at": _staged_ts()}
+    if kind:
+        e["kind"] = kind
+    if label:
+        e["label"] = label
+    if not isinstance(e.get("alts"), list):
+        e["alts"] = []
+    return e
+
+
+def _target_kind(target: str) -> str:
+    t = str(target or "")
+    if t.startswith("whl:"):
+        return "whl"
+    if t.startswith("build:"):
+        return "build"
+    if t.startswith("manual:"):
+        return "manual"
+    if t.startswith("checked:"):
+        return "checked"
+    return ""
+
+
+def _staged_prune(doc):
+    ents = doc.get("entries")
+    if not isinstance(ents, dict):
+        doc["entries"] = {}
+        return
+    for k in [k for k, e in ents.items()
+              if not (isinstance(e, dict) and e.get("alts"))]:
+        del ents[k]
+    if len(ents) > _STAGED_MAX_ENTRIES:
+        keep = sorted(ents.items(),
+                      key=lambda kv: str(kv[1].get("updated_at") or kv[1].get("created_at") or ""),
+                      reverse=True)[:_STAGED_MAX_ENTRIES]
+        doc["entries"] = dict(keep)
+
+
+def _staged_add(target: str, kind: str, label: str, alt) -> None:
+    """Stage one alternative from server-side code (background producers such as
+    Smart Scan). Mirrors /api/staged/add's dedupe + per-entry cap."""
+    a = _clean_staged_alt(alt)
+    if not a:
+        return
+
+    def apply(doc):
+        e = _staged_entry(doc, target, kind=kind, label=label)
+        key = (a["source"], json.dumps(a["fields"], sort_keys=True))
+        if not any((x.get("source"), json.dumps(x.get("fields"), sort_keys=True)) == key
+                   for x in e["alts"]):
+            e["alts"].append(a)
+            if len(e["alts"]) > _STAGED_MAX_ALTS:
+                del e["alts"][:-_STAGED_MAX_ALTS]
+        e["updated_at"] = _staged_ts()
+        _staged_prune(doc)
+    _mutate_json(STAGED_PATH, _staged_lock, {"entries": {}}, apply)
+
+
+@app.route("/api/staged")
+def api_staged_list():
+    doc = lib.load_json(STAGED_PATH, {"entries": {}})
+    ents = doc.get("entries") if isinstance(doc.get("entries"), dict) else {}
+    return jsonify({"entries": ents})
+
+
+@app.route("/api/staged/add", methods=["POST"])
+def api_staged_add():
+    """Stage one or more alternative field-sets on a target. Body:
+    {target, kind?, label?, alts:[{source,label?,fields,note?}]} (or a single
+    `alt`). A new alt whose (source, fields) duplicates an existing one is
+    skipped so re-running Normalize doesn't pile up identical candidates."""
+    p = request.get_json(silent=True) or {}
+    target = str(p.get("target") or "").strip()
+    if not target:
+        abort(400)
+    raw_alts = p.get("alts")
+    if raw_alts is None and p.get("alt") is not None:
+        raw_alts = [p.get("alt")]
+    if not isinstance(raw_alts, list):
+        abort(400)
+    cleaned = [a for a in (_clean_staged_alt(x) for x in raw_alts) if a]
+    if not cleaned:
+        return jsonify({"ok": False, "error": "no valid alternatives"}), 400
+
+    def apply(doc):
+        e = _staged_entry(doc, target, kind=str(p.get("kind") or ""),
+                          label=str(p.get("label") or ""))
+        seen = {(a.get("source"), json.dumps(a.get("fields"), sort_keys=True))
+                for a in e["alts"]}
+        for a in cleaned:
+            key = (a["source"], json.dumps(a["fields"], sort_keys=True))
+            if key in seen:
+                continue
+            seen.add(key)
+            e["alts"].append(a)
+        if len(e["alts"]) > _STAGED_MAX_ALTS:      # keep the most recent
+            del e["alts"][:-_STAGED_MAX_ALTS]
+        e["updated_at"] = _staged_ts()
+        _staged_prune(doc)
+        return doc.get("entries", {}).get(target)
+    entry = _mutate_json(STAGED_PATH, _staged_lock, {"entries": {}}, apply)
+    return jsonify({"ok": True, "entry": entry})
+
+
+@app.route("/api/staged/swap", methods=["POST"])
+def api_staged_swap():
+    """Mark Primary: the client has already applied alt <altId> to the real
+    record through the normal edit endpoints. Here we remove that alt and, if a
+    ``displaced`` field-set is supplied, re-file it so the swap is reversible.
+    Body: {target, altId, displaced?:{id?,source?,label?,fields,note?}} —
+    displaced.source defaults to "superseded"; a valid source passes through so
+    Ctrl+Z can re-file the un-applied alt under its original source, and a
+    supplied id is kept so undo/redo address stable alt ids across swaps."""
+    p = request.get_json(silent=True) or {}
+    target = str(p.get("target") or "").strip()
+    alt_id = str(p.get("altId") or "").strip()
+    if not target or not alt_id:
+        abort(400)
+    displaced = p.get("displaced")
+    disp_alt = None
+    if isinstance(displaced, dict):
+        d = dict(displaced)
+        if str(d.get("source") or "") not in _STAGED_SOURCES:
+            d["source"] = "superseded"
+        disp_alt = _clean_staged_alt(d)
+
+    def apply(doc):
+        ents = doc.get("entries")
+        if not isinstance(ents, dict) or target not in ents:
+            return None
+        e = ents[target]
+        alts = e.get("alts") if isinstance(e.get("alts"), list) else []
+        e["alts"] = [a for a in alts if a.get("id") != alt_id]
+        if disp_alt:
+            _staged_append(e, disp_alt)   # dedupe + cap, like the add paths
+        e["updated_at"] = _staged_ts()
+        _staged_prune(doc)
+        return ents.get(target)
+    entry = _mutate_json(STAGED_PATH, _staged_lock, {"entries": {}}, apply)
+    return jsonify({"ok": True, "entry": entry})
+
+
+@app.route("/api/staged/remove", methods=["POST"])
+def api_staged_remove():
+    """Dismiss a single alt ({target, altId}) or clear a whole entry ({target})."""
+    p = request.get_json(silent=True) or {}
+    target = str(p.get("target") or "").strip()
+    alt_id = str(p.get("altId") or "").strip()
+    if not target:
+        abort(400)
+
+    def apply(doc):
+        ents = doc.get("entries")
+        if not isinstance(ents, dict) or target not in ents:
+            return None
+        if not alt_id:
+            del ents[target]
+            return None
+        e = ents[target]
+        if isinstance(e.get("alts"), list):
+            e["alts"] = [a for a in e["alts"] if a.get("id") != alt_id]
+        e["updated_at"] = _staged_ts()
+        _staged_prune(doc)
+        return ents.get(target)
+    entry = _mutate_json(STAGED_PATH, _staged_lock, {"entries": {}}, apply)
+    return jsonify({"ok": True, "entry": entry})
 
 
 # --- category taxonomy -------------------------------------------------------------
@@ -1419,6 +1674,47 @@ def _resolve_local(raw: str) -> Path | None:
 
 _remote_pdf_lock = threading.Lock()              # guards the per-URL lock map
 _remote_pdf_url_locks: dict[str, threading.Lock] = {}
+_REMOTE_PDF_MAX_BYTES = 300 * 1024 * 1024   # size cap on a fetched remote PDF
+
+
+def _ssrf_guard(url: str) -> None:
+    """Refuse URLs whose host resolves to a private / loopback / link-local /
+    reserved address, so a client- or data-supplied PDF URL can't make the
+    sidecar fetch internal services (SSRF). Not DNS-rebinding-proof — adequate
+    for a localhost tool, and the gate before this runs on shared infra."""
+    import ipaddress
+    import socket
+    host = urllib.parse.urlparse(url).hostname or ""
+    if not host:
+        raise ValueError("no host in URL")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError as exc:
+        raise ValueError(f"cannot resolve host: {exc}")
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+            raise ValueError("blocked non-public address")
+
+
+class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-run the SSRF guard on every redirect hop: without this a public URL
+    can 3xx-bounce the fetch to an internal address, since urllib follows
+    redirects with no host re-check."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not str(newurl).lower().startswith(("http://", "https://")):
+            raise urllib.error.HTTPError(
+                newurl, code, "redirect to a non-http(s) URL blocked", headers, fp)
+        _ssrf_guard(newurl)   # raises ValueError on a blocked hop
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_pdf_opener = urllib.request.build_opener(_GuardedRedirectHandler())
 
 
 def _remote_pdf_cache(url: str) -> Path:
@@ -1445,14 +1741,22 @@ def _remote_pdf_cache(url: str) -> Path:
     with url_lock:
         if p.exists():
             return p
+        _ssrf_guard(url)   # only on an actual fetch — cached hits skip the DNS lookup
         tmp = p.with_suffix(".fetch.tmp")
         try:
             req = urllib.request.Request(
                 url, headers={"User-Agent": whl_client.USER_AGENT})
-            with urllib.request.urlopen(req, timeout=90) as resp, \
+            with _pdf_opener.open(req, timeout=90) as resp, \
                     open(tmp, "wb") as fh:
-                import shutil
-                shutil.copyfileobj(resp, fh)
+                total = 0
+                while True:
+                    chunk = resp.read(1 << 16)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > _REMOTE_PDF_MAX_BYTES:
+                        raise ValueError("remote PDF exceeds the size cap")
+                    fh.write(chunk)
             with open(tmp, "rb") as fh:
                 if fh.read(5) != b"%PDF-":
                     raise ValueError("response is not a PDF")
@@ -2293,56 +2597,14 @@ def api_build_ocr_regions(build_id: str):
                     "items": rec.get("items") or []})
 
 
-_RW_MAX_ITEMS = 800
-_RW_ROLE_RE = re.compile(r"^[a-z][a-z-]{0,23}$")
-
-
-def _rw_sanitize_items(raw: list, src_type: str = "human") -> list:
-    """One page's region items scrubbed for storage: roles kebab-case,
-    boxes clamped into the page, text layers capped, everything re-ordered
-    and re-idd. Shared by the workbench PUT and the .lib import — anything
-    that writes items the sidecar will trust must come through here."""
-    def order_of(it):
-        o = it.get("order")
-        return float(o) if isinstance(o, (int, float)) \
-            and not isinstance(o, bool) else 0.0
-
-    items = []
-    for it in sorted((x for x in raw if isinstance(x, dict)), key=order_of):
-        box = it.get("box") or {}
-        try:
-            x = min(1.0, max(0.0, float(box.get("x") or 0)))
-            y = min(1.0, max(0.0, float(box.get("y") or 0)))
-            w = min(1.0 - x, max(0.0, float(box.get("w") or 0)))
-            h = min(1.0 - y, max(0.0, float(box.get("h") or 0)))
-        except (TypeError, ValueError):
-            continue
-        if w < 0.001 or h < 0.001:
-            continue
-        role = str(it.get("role") or "body").lower()
-        if not _RW_ROLE_RE.match(role):
-            role = "body"
-        rec = {"id": f"r{len(items)}", "role": role,
-               "src_type": src_type, "order": len(items),
-               "box": {"x": round(x, 5), "y": round(y, 5),
-                       "w": round(w, 5), "h": round(h, 5)},
-               "text": str(it.get("text") or "")[:20000]}
-        # the normalized reading layer (long-s resolved, dehyphenated…),
-        # stored only when it exists — compose_text falls back per region
-        norm = str(it.get("norm") or "")[:20000]
-        if norm:
-            rec["norm"] = norm
-        items.append(rec)
-    return items
-
-
-def _rw_sanitize_dims(dims):
-    if not isinstance(dims, dict):
-        return None
-    try:
-        return {k: int(dims.get(k) or 0) for k in ("w", "h", "dpi")}
-    except (TypeError, ValueError, OverflowError):
-        return None
+# The sanitizers live in tools/libformat.py now — the single implementation
+# the .lib Python API and these routes share, so a file that round-trips
+# through the API can never come out a shape the app rejects. These aliases
+# keep the in-module names (and their exact call sites) unchanged.
+_RW_MAX_ITEMS = libformat.MAX_ITEMS
+_RW_ROLE_RE = libformat.ROLE_RE
+_rw_sanitize_items = libformat.sanitize_page_items
+_rw_sanitize_dims = libformat.sanitize_dims
 
 
 @app.route("/api/builds/<build_id>/ocr-regions", methods=["PUT"])
@@ -2688,41 +2950,8 @@ _LIB_META_FIELDS = ("published_slug", "title", "subtitle", "authors", "year",
                     "language", "pages", "source_url")
 
 
-_RW_HEX_RE = re.compile(r"^#[0-9a-fA-F]{3,8}$")
-
-
-def _rw_sanitize_styles(raw: dict) -> dict:
-    """A role->style mapping scrubbed for storage. Shared by the style-board
-    PUT and the .lib import — a .lib is somebody else's file."""
-    styles = {}
-    for role, st in raw.items():
-        role = str(role).lower()
-        if not _RW_ROLE_RE.match(role) or not isinstance(st, dict):
-            continue
-        out = {}
-        family = str(st.get("family") or "").strip()[:60]
-        if family:
-            out["family"] = family
-        for k, lo, hi in (("size_em", 0.3, 4.0), ("leading", 0.8, 3.0)):
-            try:
-                v = float(st.get(k))
-            except (TypeError, ValueError, OverflowError):
-                continue
-            if lo <= v <= hi:
-                out[k] = round(v, 2)
-        if st.get("style") in ("italic", "normal"):
-            out["style"] = st["style"]
-        if st.get("variant") in ("small-caps", "normal"):
-            out["variant"] = st["variant"]
-        if st.get("align") in ("left", "right", "center", "justify"):
-            out["align"] = st["align"]
-        for k in ("color", "bg"):
-            v = str(st.get(k) or "")
-            if _RW_HEX_RE.match(v):
-                out[k] = v
-        if out:
-            styles[role] = out
-    return styles
+_RW_HEX_RE = libformat.HEX_RE
+_rw_sanitize_styles = libformat.sanitize_styles
 
 
 def _replica_style_path(build_id: str):
@@ -2737,6 +2966,154 @@ def _replica_styles(build_id: str) -> tuple[dict, bool]:
             and doc["styles"]:
         return doc["styles"], True
     return _LIB_STYLESHEET, False
+
+
+# lib/2 identity + self-description sidecars, all under ocr/ beside layout.json.
+# book_id is minted once and persisted so re-exports of the same book carry the
+# same id; the per-book instructions and manifest ext travel with every export
+# (the Replica-tab editor for the instructions field is a later step).
+def _lib_id_path(build_id: str):
+    return _entry_dir(build_id) / "ocr" / "lib-id.json"
+
+
+def _lib_book_id(build_id: str) -> str:
+    """The book's stable UUID (docs/lib-format.md §2.4), minted on first
+    export and persisted. Written under the merge lock the other ocr/ sidecars
+    share, so a concurrent export mints exactly one id."""
+    with _ocr_merge_lock:
+        doc = lib.load_json(_lib_id_path(build_id), None)
+        if isinstance(doc, dict) and re.fullmatch(
+                r"b-[0-9a-f]{32}", str(doc.get("book_id") or "")):
+            return str(doc["book_id"])
+        book_id = "b-" + uuid.uuid4().hex
+        _lib_id_path(build_id).parent.mkdir(parents=True, exist_ok=True)
+        lib.save_json(_lib_id_path(build_id), {"book_id": book_id})
+        return book_id
+
+
+def _lib_book_instructions(build_id: str) -> str:
+    """The per-book "instructions for editors/AI" text that travels in every
+    export (§2.2). An optional sidecar for now — the Replica-tab field that
+    edits it is a later step; absent means an empty string."""
+    p = _entry_dir(build_id) / "ocr" / "lib-instructions.md"
+    if p.is_file():
+        return p.read_text(encoding="utf-8", errors="replace")[:20000]
+    return ""
+
+
+def _lib_manifest_ext_path(build_id: str):
+    return _entry_dir(build_id) / "ocr" / "lib-ext.json"
+
+
+def _lib_manifest_ext(build_id: str) -> dict:
+    """The manifest-level `ext` passthrough (§2.4). An importer stores whatever
+    third-party namespace a `.lib` carried here; export re-emits it verbatim."""
+    doc = lib.load_json(_lib_manifest_ext_path(build_id), None)
+    return libformat.sanitize_ext(doc) if isinstance(doc, dict) else {}
+
+
+def _lib_translation_members(build_id: str, page_nums) -> dict:
+    """Each stored translation as a translations/<bcp47>.json member: page-
+    aligned text keyed by page (docs/lib-format.md §2.5). The app stores
+    page-level translations, so the per-page rid map carries one reserved
+    "_page" key holding the whole page's text — a shape that stays valid if
+    per-region translations arrive later. Only the exported pages are
+    included, so the member lines up with pages/."""
+    out = {}
+    tdir = _entry_dir(build_id) / "translations"
+    if not tdir.is_dir():
+        return out
+    keep = set(page_nums)
+    for f in sorted(tdir.glob("*.txt")):
+        lang = _lang_code(f.stem)
+        if not lang:
+            continue
+        pages = _an_pages(f.read_text(encoding="utf-8", errors="replace"))
+        pmap = {str(n): {"_page": pages[n]} for n in sorted(pages)
+                if n in keep and pages[n].strip()}
+        if pmap:
+            out[lang] = {"lang": lang, "pages": pmap}
+    return out
+
+
+def _lib_read_translation_members(z, warn) -> dict:
+    """Parse each translations/<bcp47>.json member into {lang: {page: text}}.
+    A page value is either the whole-page string (our reserved "_page" key) or
+    a rid->text map, which we join in key order — so a per-region translation
+    written by an external tool still lands as page text in the store."""
+    out: dict = {}
+    for name in z.namelist():
+        # one shared member grammar with export/read_lib/validate; a
+        # translations/ member that misses it is warned, not silently dropped
+        if not name.startswith("translations/") or name.endswith("/"):
+            continue
+        tm = libformat._TRANS_MEMBER.fullmatch(name)
+        if not tm:
+            warn(name, "translation skipped: member name is not a "
+                       "translations/<bcp47>.json tag")
+            continue
+        lang = tm.group(1).lower()
+        if z.getinfo(name).file_size > _LIB_MAX_JSON:
+            warn(name, "translation skipped: JSON member exceeds the size cap")
+            continue
+        try:
+            td = json.loads(z.read(name))
+        except (ValueError, KeyError):
+            warn(name, "translation skipped: not valid JSON")
+            continue
+        pages_in = td.get("pages") if isinstance(td, dict) else None
+        if not isinstance(pages_in, dict):
+            warn(name, "translation skipped: no pages map")
+            continue
+        collected: dict = {}
+        for pk, pv in pages_in.items():
+            try:
+                pn = int(pk)
+            except (TypeError, ValueError):
+                continue
+            if not 1 <= pn <= 99999:
+                continue
+            if isinstance(pv, str):
+                text = pv
+            elif isinstance(pv, dict):
+                if isinstance(pv.get("_page"), str):
+                    text = pv["_page"]
+                else:
+                    text = "\n\n".join(str(pv[k]) for k in sorted(pv)
+                                       if isinstance(pv[k], str) and pv[k].strip())
+            else:
+                text = ""
+            text = text.strip()[:20000]
+            if text:
+                collected[pn] = text
+        if collected:
+            out.setdefault(lang, {}).update(collected)
+    return out
+
+
+def _lib_apply_translations(build_id: str, trans_in: dict,
+                            overwrite: bool) -> list:
+    """Merge imported translations into the entry's page-marked .txt store,
+    page by page — a page already translated is kept unless overwrite. Returns
+    the languages touched. Written under the analyze store's lock, the same one
+    the live translate job holds."""
+    added = []
+    for lang, pmap in trans_in.items():
+        rel = f"translations/{lang}.txt"
+        touched = False
+        with _an_write_lock:
+            cur = _an_pages(_read_entry_text(build_id, rel))
+            for pn, text in pmap.items():
+                if overwrite or not cur.get(pn, "").strip():
+                    cur[pn] = text
+                    touched = True
+            if touched:
+                doc = "\n\n".join(f"--- page {k} ---\n{cur[k]}"
+                                  for k in sorted(cur))
+                _write_entry_text(build_id, rel, doc + "\n")
+        if touched:
+            added.append(lang)
+    return added
 
 
 @app.route("/api/builds/<build_id>/replica-style",
@@ -2772,6 +3149,30 @@ def api_build_replica_style(build_id: str):
     return jsonify({"ok": True, "count": len(styles)})
 
 
+@app.route("/api/builds/<build_id>/replica-instructions",
+           methods=["GET", "PUT"])
+def api_build_replica_instructions(build_id: str):
+    """The per-book "instructions for editors / AI" text (docs/lib-format.md
+    §2.2) — free guidance that every .lib export embeds in its manifest and
+    INSTRUCTIONS.md, e.g. "Latin plant names stay untranslated". Stored as
+    ocr/lib-instructions.md beside the other book-level sidecars. GET returns
+    {text}; PUT {text} stores it, and an empty text removes the sidecar."""
+    if build_id not in lib.load_json(BUILDS_PATH, {}):
+        abort(404)
+    if request.method == "GET":
+        return jsonify({"ok": True, "text": _lib_book_instructions(build_id)})
+    p = request.get_json(silent=True) or {}
+    text = str(p.get("text") or "")[:20000]
+    dest = _entry_dir(build_id) / "ocr" / "lib-instructions.md"
+    with _ocr_merge_lock:
+        if text.strip():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(text, encoding="utf-8")
+        else:
+            dest.unlink(missing_ok=True)
+    return jsonify({"ok": True, "chars": len(text) if text.strip() else 0})
+
+
 @app.route("/api/builds/<build_id>/replica-export")
 def api_build_replica_export(build_id: str):
     """Seal one source's Replica working store into a .lib — a plain zip:
@@ -2799,6 +3200,26 @@ def api_build_replica_export(build_id: str):
         return jsonify({"ok": False, "error":
                         "no region pages to export — seed or draw some in"
                         " the Replica tab first"}), 400
+    # persist minted rids on first export, mirroring _lib_book_id's mint-and-
+    # persist: a legacy book's rid-less regions get their rids stamped into
+    # layout.json now, so a second export of the same unchanged book carries
+    # identical rids and external rid-keyed annotations line up across round-
+    # trips. Read-modify-write under the sidecar lock every other write shares.
+    layout_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    with _ocr_merge_lock:
+        meta = lib.load_json(layout_path, {})
+        pages = (meta.get("regions") or {}).get(src) or {}
+        changed = False
+        for n in page_nums:
+            rec = pages.get(str(n))
+            if not isinstance(rec, dict):
+                continue
+            ensured = libformat.ensure_rids(rec.get("items") or [])
+            if ensured != (rec.get("items") or []):
+                rec["items"] = ensured
+                changed = True
+        if changed:
+            lib.save_json(layout_path, meta)
     import io
     import zipfile
     figures = {}
@@ -2819,16 +3240,28 @@ def api_build_replica_export(build_id: str):
         # modern edition silently loses its re-drawn art
         if info.get("rework_of"):
             figures[safe]["rework_of"] = str(info["rework_of"])
+        # a figure may carry its own third-party ext namespace
+        fext = libformat.sanitize_ext(info.get("ext"))
+        if fext:
+            figures[safe]["ext"] = fext
+    per_book = _lib_book_instructions(build_id)
     book = {
-        "format": "lib/1",
+        "format_version": libformat.FORMAT_VERSION,
+        "generator": f"library-tool/{_app_version()}",
+        "book_id": _lib_book_id(build_id),
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "source": src,
         "meta": {k: b.get(k) for k in _LIB_META_FIELDS if b.get(k)},
+        "capabilities": list(libformat.CAPABILITIES),
+        "roles": libformat.ROLE_VOCAB,          # the vocabulary AS DATA
+        "instructions": {"general_ref": "INSTRUCTIONS.md", "book": per_book},
         "stylesheet": _replica_styles(build_id)[0],
         "templates": (meta.get("templates") or {}).get(src) or {},
         "figures": figures,
         "pages": page_nums,
+        "ext": _lib_manifest_ext(build_id),
     }
+    translations = _lib_translation_members(build_id, page_nums)
     buf = io.BytesIO()
     try:
         # allow_nan=False: a hand-edited sidecar smuggling NaN/Infinity
@@ -2838,15 +3271,33 @@ def api_build_replica_export(build_id: str):
             z.writestr("book.json", json.dumps(book, indent=1,
                                                ensure_ascii=False,
                                                allow_nan=False))
+            # the self-description a lib/2 file ships: the LLM contract and a
+            # machine-checkable schema, both generated from the live vocabulary
+            z.writestr("INSTRUCTIONS.md",
+                       libformat.render_instructions(book["meta"], per_book))
+            z.writestr("schema.json", json.dumps(libformat.SCHEMA, indent=1))
             for n in page_nums:
-                rec = pages[str(n)]
-                z.writestr(f"pages/{n}.json", json.dumps({
+                rec = pages.get(str(n))
+                if not isinstance(rec, dict):
+                    continue
+                page_obj = {
                     "page": n,
                     "doc": rec.get("doc") or "",
                     "dims": rec.get("dims") or {},
                     "state": rec.get("state") or "",
+                    # rids were persisted into layout.json above, so emit the
+                    # stored items directly — a second export of the same book
+                    # carries the same rids external tools annotate against
                     "items": rec.get("items") or [],
-                }, indent=1, ensure_ascii=False, allow_nan=False))
+                }
+                pext = libformat.sanitize_ext(rec.get("ext"))
+                if pext:
+                    page_obj["ext"] = pext
+                z.writestr(f"pages/{n}.json", json.dumps(
+                    page_obj, indent=1, ensure_ascii=False, allow_nan=False))
+            for lang, member in translations.items():
+                z.writestr(f"translations/{lang}.json", json.dumps(
+                    member, ensure_ascii=False, allow_nan=False))
             for name in figures:
                 f = img_dir / name
                 if f.is_file():
@@ -3168,11 +3619,234 @@ def api_build_replica_print(build_id: str):
     return Response(doc, mimetype="text/html")
 
 
-_LIB_MAX_BYTES = 250 * 1024 * 1024
-_LIB_MAX_FIGURE = 15 * 1024 * 1024
-_LIB_MAX_PAGES = 2000
-_LIB_MAX_JSON = 10 * 1024 * 1024          # per JSON member, decompressed
-_LIB_MAX_INFLATED = 300 * 1024 * 1024     # total page-JSON budget
+# the .lib size caps live in libformat now (one place both the API and this
+# route enforce); the aliases keep the call sites below unchanged
+_LIB_MAX_BYTES = libformat.MAX_BYTES
+_LIB_MAX_FIGURE = libformat.MAX_FIGURE
+_LIB_MAX_PAGES = libformat.MAX_PAGES
+_LIB_MAX_JSON = libformat.MAX_JSON            # per JSON member, decompressed
+_LIB_MAX_INFLATED = libformat.MAX_INFLATED    # total page-JSON budget
+
+
+def _lib_import_archive(build_id: str, src: str, raw: bytes,
+                        overwrite: bool) -> tuple[dict, int]:
+    """The .lib import core: unpack an archive's pages/templates/figures/
+    stylesheet/translations into a build's working store, returning
+    (receipt, http_status). Everything passes the same sanitizers as the
+    live endpoints — a .lib is somebody else's file. Shared by the
+    replica-import route and the desktop "open a .lib" flow."""
+    import io
+    import zipfile
+    # Every JSON member is read at its DECLARED decompressed size, which
+    # zipfile also truncates to — so rejecting large declarations is a real
+    # cap, and a small .lib cannot deflate-bomb the sidecar into an OOM.
+    try:
+        z = zipfile.ZipFile(io.BytesIO(raw))
+        if z.getinfo("book.json").file_size > _LIB_MAX_JSON:
+            return {"ok": False, "error": "book.json too large"}, 400
+        book = json.loads(z.read("book.json"))
+    except (zipfile.BadZipFile, KeyError, ValueError):
+        return {"ok": False, "error": "not a .lib archive"}, 400
+    # lib/1 (the bare "format": "lib/1" marker) and lib/2 (format_version
+    # "2.x") both import; lib/1 upgrades on ingest (rids minted, defaults
+    # filled). A higher MAJOR breaks — refuse it with a clear message rather
+    # than silently dropping everything the newer format added.
+    fmt = libformat.parse_format(book)
+    if fmt is None:
+        return {"ok": False, "error": "unsupported .lib format"}, 400
+    if fmt[0] > libformat.SUPPORTED_MAJOR:
+        return {"ok": False, "error":
+                f"this .lib needs a newer Library Tool "
+                f"(format {fmt[0]}.{fmt[1]})"}, 400
+
+    # Nothing is dropped silently: every coercion and skip below is named in
+    # the receipt's warnings[] with its location and reason (§2.6).
+    warnings: list = []
+
+    def warn(loc, msg):
+        warnings.append({"loc": loc, "msg": msg})
+
+    # pages: every well-formed pages/N.json, sanitized like a live PUT
+    incoming: dict[int, dict] = {}
+    budget = _LIB_MAX_INFLATED
+    for name in z.namelist():
+        m = re.fullmatch(r"pages/(\d{1,5})\.json", name)
+        if not m:
+            continue
+        n = int(m.group(1))
+        if not 1 <= n <= 99999:
+            warn(name, "page skipped: page number out of range")
+            continue
+        if len(incoming) >= _LIB_MAX_PAGES:
+            warn(name, f"page skipped: over the {_LIB_MAX_PAGES}-page cap")
+            continue
+        declared = z.getinfo(name).file_size
+        if declared > _LIB_MAX_JSON or declared > budget:
+            warn(name, "page skipped: JSON member exceeds the size cap")
+            continue
+        budget -= declared
+        try:
+            rec = json.loads(z.read(name))
+        except (ValueError, KeyError):
+            warn(name, "page skipped: not valid JSON")
+            continue
+        if not isinstance(rec, dict) or not isinstance(rec.get("items"), list):
+            warn(name, "page skipped: no items array")
+            continue
+        raw_items = rec["items"]
+        if len(raw_items) > _RW_MAX_ITEMS:
+            warn(name, f"page had more than {_RW_MAX_ITEMS} regions; "
+                       "the surplus was dropped")
+        items = _rw_sanitize_items(raw_items[:_RW_MAX_ITEMS],
+                                   src_type="import", warn=warn, loc=name)
+        if not items:
+            warn(name, "page skipped: no usable regions")
+            continue
+        incoming[n] = {
+            "doc": _ocr_name(str(rec.get("doc") or "compiled.txt")),
+            "dims": _rw_sanitize_dims(rec.get("dims")) or {},
+            "items": items,
+        }
+        pext = libformat.sanitize_ext(rec.get("ext"), f"{name}.ext", warn)
+        if pext:
+            incoming[n]["ext"] = pext
+        st = rec.get("state")
+        if st == "verified":
+            incoming[n]["state"] = "verified"
+        elif st:
+            warn(name, f"state {st!r} dropped: only 'verified' is recognized")
+    if not incoming:
+        return {"ok": False, "error": "no usable pages",
+                "warnings": warnings}, 400
+
+    # book.json's sections are attacker-shaped: coerce every one before
+    # touching disk, so a malformed archive fails clean instead of 500ing
+    # halfway through a commit
+    tpl_src = book.get("templates")
+    tpl_in = {}
+    if isinstance(tpl_src, dict):
+        for name, t in tpl_src.items():
+            name = str(name).strip()
+            loc = f"templates/{name}"
+            if not _RW_TPL_RE.match(name):
+                warn("book.json/templates",
+                     f"template {name!r} dropped: not a valid template name")
+                continue
+            if not isinstance(t, dict):
+                warn(loc, "template dropped: not an object")
+                continue
+            items = _rw_sanitize_items(t.get("items") or [],
+                                       src_type="template", warn=warn, loc=loc)
+            if not items:
+                warn(loc, "template dropped: no usable regions after sanitize")
+                continue
+            tpl_in[name] = {"from_page": 0, "doc": _ocr_name(
+                str(t.get("doc") or "compiled.txt")),
+                "dims": _rw_sanitize_dims(t.get("dims")) or {},
+                "items": [{"role": i["role"], "order": i["order"],
+                           "box": i["box"]} for i in items]}
+
+    figures_src = book.get("figures") if isinstance(book.get("figures"),
+                                                    dict) else {}
+    raw_styles = book.get("stylesheet")
+    if isinstance(raw_styles, dict) and len(raw_styles) > 40:
+        warn("book.json/stylesheet", "stylesheet dropped: more than 40 roles")
+    styles = _rw_sanitize_styles(raw_styles) \
+        if isinstance(raw_styles, dict) and len(raw_styles) <= 40 else {}
+    manifest_ext = libformat.sanitize_ext(book.get("ext"), "book.json.ext", warn)
+    # translations/<bcp47>.json members route into the entry's translation
+    # store (page-marked .txt), additive — never touching text or norm
+    trans_in = _lib_read_translation_members(z, warn)
+
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    applied, skipped, tpls_added = [], [], []
+    sheet = "none"
+    with _ocr_merge_lock:
+        meta = lib.load_json(meta_path, {})
+        pmap = meta.setdefault("regions", {}).setdefault(src, {})
+        for n, rec in sorted(incoming.items()):
+            if not overwrite and str(n) in pmap:
+                skipped.append(n)
+                warn(f"pages/{n}.json", "page skipped: the destination "
+                     "already has this page (import with overwrite to replace)")
+                continue
+            pmap[str(n)] = rec
+            applied.append(n)
+        tmap = meta.setdefault("templates", {}).setdefault(src, {})
+        for name, t in tpl_in.items():
+            if not overwrite and name in tmap:
+                warn(f"templates/{name}", "template skipped: the destination "
+                     "already has this template (import with overwrite to "
+                     "replace)")
+                continue
+            tmap[name] = t
+            tpls_added.append(name)
+        imap = meta.setdefault("images", {})
+        figures_added = 0
+        img_dir = _entry_dir(build_id) / "ocr" / "images"
+        for name in z.namelist():
+            # the shared hardened pattern rejects dot-only names ("."/".."):
+            # a bare ".." member resolves to a directory and dest.write_bytes
+            # on it would raise mid-commit, orphaning the figures already written
+            m = libformat._ASSET_MEMBER.fullmatch(name)
+            if not m:
+                continue
+            safe = m.group(1)
+            dest = img_dir / safe
+            entry = libformat.sanitize_figure(figures_src.get(safe), src,
+                                              warn=warn, loc=f"assets/img/{safe}")
+            if dest.exists() or safe in imap:
+                # §2.6: a colliding figure is replaced only when the incoming
+                # entry deliberately reworks it — rework_of must NAME the
+                # colliding member ("the original member or itself", both ==
+                # safe); an accidental collision always skips, now with a warning
+                if overwrite and entry.get("rework_of") == safe:
+                    pass
+                elif overwrite:
+                    warn(f"assets/img/{safe}", "figure skipped: name collides "
+                         "and the entry carries no rework_of")
+                    continue
+                else:
+                    warn(f"assets/img/{safe}",
+                         "figure skipped: a figure by that name already exists")
+                    continue
+            info = z.getinfo(name)
+            if info.file_size > _LIB_MAX_FIGURE:
+                warn(f"assets/img/{safe}",
+                     "figure skipped: image exceeds the size cap")
+                continue
+            img_dir.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(z.read(name))
+            imap[safe] = entry
+            figures_added += 1
+        lib.save_json(meta_path, meta)
+        # the stylesheet check-and-write shares the lock: a style-board Save
+        # landing between "no custom sheet" and this save must not be
+        # silently clobbered
+        if styles:
+            if overwrite or not _replica_styles(build_id)[1]:
+                lib.save_json(_replica_style_path(build_id),
+                              {"version": 1, "styles": styles})
+                sheet = "imported"
+            else:
+                sheet = "kept"
+        # the manifest ext passthrough persists so a later export re-emits it
+        if manifest_ext:
+            if overwrite or not _lib_manifest_ext(build_id):
+                lib.save_json(_lib_manifest_ext_path(build_id), manifest_ext)
+            else:
+                warn("book.json/ext", "ext kept: destination already has one "
+                     "(import with overwrite to replace)")
+
+    # translations write under their own lock (the analyze store), so they
+    # land after the region commit rather than nesting the two locks
+    trans_added = _lib_apply_translations(build_id, trans_in, overwrite)
+
+    return {"ok": True, "format_version": "%d.%d" % fmt,
+            "pages_applied": applied, "pages_skipped": skipped,
+            "templates_added": tpls_added,
+            "figures_added": figures_added, "stylesheet": sheet,
+            "translations_added": trans_added, "warnings": warnings}, 200
 
 
 @app.route("/api/builds/<build_id>/replica-import", methods=["POST"])
@@ -3180,8 +3854,8 @@ def api_build_replica_import(build_id: str):
     """The other half of .lib interchange: unpack an exported archive into
     this build's working store. Multipart field "lib"; ?src= picks the scan
     the pages land under, ?overwrite=1 lets imported pages/templates replace
-    existing ones (default: skip, like template apply). Everything passes the
-    same sanitizers as the live endpoints — a .lib is somebody else's file.
+    existing ones (default: skip, like template apply). The core lives in
+    _lib_import_archive; this route only validates the request shape.
     The stylesheet imports only when the book has no custom sheet (or with
     overwrite); figures only when the name is free."""
     b = lib.load_json(BUILDS_PATH, {}).get(build_id)
@@ -3196,158 +3870,101 @@ def api_build_replica_import(build_id: str):
         return jsonify({"ok": False, "error": "no file"}), 400
     if request.content_length and request.content_length > _LIB_MAX_BYTES:
         return jsonify({"ok": False, "error": "file too large"}), 400
-    import io
-    import zipfile
     raw = f.read(_LIB_MAX_BYTES + 1)
     if len(raw) > _LIB_MAX_BYTES:
         return jsonify({"ok": False, "error": "file too large"}), 400
-    # Every JSON member is read at its DECLARED decompressed size, which
-    # zipfile also truncates to — so rejecting large declarations is a real
-    # cap, and a small .lib cannot deflate-bomb the sidecar into an OOM.
+    payload, code = _lib_import_archive(build_id, src, raw, overwrite)
+    return jsonify(payload), code
+
+
+@app.route("/api/lib/open", methods=["POST"])
+def api_lib_open():
+    """Create a new book from a local .lib — the desktop shell's double-click
+    flow. Body {path}: an ABSOLUTE path on this machine (the server is
+    loopback-only and serves a single local user; local paths are already how
+    attached scans arrive). The manifest's meta seeds a fresh build through
+    the normal create path, then the archive imports into it under the
+    primary source. Returns {ok, build_id, receipt}; a refused import removes
+    the just-minted build again rather than stranding an empty shell."""
+    p = request.get_json(silent=True) or {}
+    raw_path = str(p.get("path") or "")
+    fp = Path(raw_path) if raw_path else None
+    if fp is None or not fp.is_absolute():
+        return jsonify({"ok": False, "error": "path must be absolute"}), 400
+    if fp.suffix.lower() not in (".lib", ".zip") or not fp.is_file():
+        return jsonify({"ok": False, "error": "not a .lib file"}), 400
     try:
-        z = zipfile.ZipFile(io.BytesIO(raw))
-        if z.getinfo("book.json").file_size > _LIB_MAX_JSON:
-            return jsonify({"ok": False, "error": "book.json too large"}), 400
-        book = json.loads(z.read("book.json"))
-    except (zipfile.BadZipFile, KeyError, ValueError):
-        return jsonify({"ok": False, "error": "not a .lib archive"}), 400
-    if not isinstance(book, dict) or book.get("format") != "lib/1":
-        return jsonify({"ok": False, "error":
-                        "unsupported .lib format"}), 400
+        if fp.stat().st_size > libformat.MAX_BYTES:
+            return jsonify({"ok": False, "error": "file too large"}), 400
+        raw = fp.read_bytes()
+    except OSError as exc:
+        return jsonify({"ok": False,
+                        "error": f"could not read the file: {exc}"}), 400
+    # parse up front for the meta seed; import re-validates through the same
+    # module, so nothing minted here can outrun the format gate below
+    try:
+        doc = libformat.read_lib(raw)
+    except libformat.LibError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    # seed the build from the bibliographic tuple the exporter writes — NOT the
+    # whole manifest meta. A foreign .lib must not pre-set operational fields
+    # (rights, status, pdf_sources, ocr_*): rights defaults to undecided and
+    # status to draft, and an unrecognized rights string can't fail the open.
+    build, err = _create_build({k: doc.meta.get(k) for k in _LIB_META_FIELDS})
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
 
-    # pages: every well-formed pages/N.json, sanitized like a live PUT
-    incoming: dict[int, dict] = {}
-    budget = _LIB_MAX_INFLATED
-    for name in z.namelist():
-        m = re.fullmatch(r"pages/(\d{1,5})\.json", name)
-        if not m:
-            continue
-        n = int(m.group(1))
-        if not 1 <= n <= 99999 or len(incoming) >= _LIB_MAX_PAGES:
-            continue
-        declared = z.getinfo(name).file_size
-        if declared > _LIB_MAX_JSON or declared > budget:
-            continue
-        budget -= declared
-        try:
-            rec = json.loads(z.read(name))
-        except (ValueError, KeyError):
-            continue
-        if not isinstance(rec, dict) or not isinstance(rec.get("items"), list):
-            continue
-        items = _rw_sanitize_items(rec["items"][:_RW_MAX_ITEMS],
-                                   src_type="import")
-        if not items:
-            continue
-        incoming[n] = {
-            "doc": _ocr_name(str(rec.get("doc") or "compiled.txt")),
-            "dims": _rw_sanitize_dims(rec.get("dims")) or {},
-            "items": items,
-        }
-        if rec.get("state") == "verified":
-            incoming[n]["state"] = "verified"
-    if not incoming:
-        return jsonify({"ok": False, "error": "no usable pages"}), 400
+    def _rollback():
+        with _builds_lock:
+            builds = lib.load_json(BUILDS_PATH, {})
+            builds.pop(build["id"], None)
+            lib.save_json(BUILDS_PATH, builds)
 
-    # book.json's sections are attacker-shaped: coerce every one before
-    # touching disk, so a malformed archive fails clean instead of 500ing
-    # halfway through a commit
-    tpl_src = book.get("templates")
-    tpl_in = {}
-    if isinstance(tpl_src, dict):
-        for name, t in tpl_src.items():
-            name = str(name).strip()
-            if not _RW_TPL_RE.match(name) or not isinstance(t, dict):
-                continue
-            items = _rw_sanitize_items(t.get("items") or [],
-                                       src_type="template")
-            if not items:
-                continue
-            tpl_in[name] = {"from_page": 0, "doc": _ocr_name(
-                str(t.get("doc") or "compiled.txt")),
-                "dims": _rw_sanitize_dims(t.get("dims")) or {},
-                "items": [{"role": i["role"], "order": i["order"],
-                           "box": i["box"]} for i in items]}
+    # a crafted member can make the import RAISE (not just return != 200); the
+    # rollback must cover that too, or the minted build is stranded on a 500
+    try:
+        receipt, code = _lib_import_archive(build["id"], "primary", raw,
+                                            overwrite=False)
+    except Exception as exc:
+        _rollback()
+        return jsonify({"ok": False, "error": f"import failed: {exc}"}), 500
+    if code != 200:
+        _rollback()
+        return jsonify(receipt), code
+    # persist the archive's book_id when well-formed, so an open + re-export
+    # round trip keeps the same identity the exporter minted (§2.4); a malformed
+    # or absent id keeps today's mint-on-first-export behavior
+    if re.fullmatch(r"b-[0-9a-f]{32}", doc.book_id):
+        _lib_id_path(build["id"]).parent.mkdir(parents=True, exist_ok=True)
+        lib.save_json(_lib_id_path(build["id"]), {"book_id": doc.book_id})
+    return jsonify({"ok": True, "build_id": build["id"], "receipt": receipt})
 
-    def fig_entry(fig):
-        # bbox values ride into layout.json, which /ocr-layout serializes —
-        # a NaN or a nested object here would break every layout fetch
-        out = {"src_key": src}
-        if not isinstance(fig, dict):
-            return out
-        try:
-            pg = int(fig.get("page"))
-            if 1 <= pg <= 99999:
-                out["page"] = pg
-        except (TypeError, ValueError, OverflowError):
-            pass
-        for k in ("x", "y", "w", "h"):
-            try:
-                v = float(fig.get(k))
-            except (TypeError, ValueError):
-                continue
-            if v == v and 0.0 <= v <= 1.0:      # finite, in the page
-                out[k] = round(v, 5)
-        ro = str(fig.get("rework_of") or "")
-        if re.fullmatch(r"[\w.\-]{1,120}", ro):
-            out["rework_of"] = ro
-        return out
 
-    figures_src = book.get("figures") if isinstance(book.get("figures"),
-                                                    dict) else {}
-    raw_styles = book.get("stylesheet")
-    styles = _rw_sanitize_styles(raw_styles)         if isinstance(raw_styles, dict) and len(raw_styles) <= 40 else {}
-
-    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
-    applied, skipped, tpls_added = [], [], []
-    sheet = "none"
-    with _ocr_merge_lock:
-        meta = lib.load_json(meta_path, {})
-        pmap = meta.setdefault("regions", {}).setdefault(src, {})
-        for n, rec in sorted(incoming.items()):
-            if not overwrite and str(n) in pmap:
-                skipped.append(n)
-                continue
-            pmap[str(n)] = rec
-            applied.append(n)
-        tmap = meta.setdefault("templates", {}).setdefault(src, {})
-        for name, t in tpl_in.items():
-            if not overwrite and name in tmap:
-                continue
-            tmap[name] = t
-            tpls_added.append(name)
-        imap = meta.setdefault("images", {})
-        figures_added = 0
-        img_dir = _entry_dir(build_id) / "ocr" / "images"
-        for name in z.namelist():
-            m = re.fullmatch(r"assets/img/([\w.\-]{1,120})", name)
-            if not m:
-                continue
-            safe = m.group(1)
-            dest = img_dir / safe
-            if dest.exists() or safe in imap:
-                continue
-            info = z.getinfo(name)
-            if info.file_size > _LIB_MAX_FIGURE:
-                continue
-            img_dir.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(z.read(name))
-            imap[safe] = fig_entry(figures_src.get(safe))
-            figures_added += 1
-        lib.save_json(meta_path, meta)
-        # the stylesheet check-and-write shares the lock: a style-board Save
-        # landing between "no custom sheet" and this save must not be
-        # silently clobbered
-        if styles:
-            if overwrite or not _replica_styles(build_id)[1]:
-                lib.save_json(_replica_style_path(build_id),
-                              {"version": 1, "styles": styles})
-                sheet = "imported"
-            else:
-                sheet = "kept"
-    return jsonify({"ok": True, "pages_applied": applied,
-                    "pages_skipped": skipped, "templates_added": tpls_added,
-                    "figures_added": figures_added, "stylesheet": sheet})
+@app.route("/api/lib/validate", methods=["POST"])
+def api_lib_validate():
+    """Lint a .lib with no side effects — the same sanitize/lint pass the
+    import runs, but nothing is written. Multipart field "lib"; not tied to any
+    build. External tools and CI check a file here before shipping it. Returns
+    {ok, format_version, pages, warnings[], errors[]}; ok is true when there
+    are no errors (warnings are advisory)."""
+    f = request.files.get("lib")
+    if f is None:
+        return jsonify({"ok": False, "error": "no file"}), 400
+    if request.content_length and request.content_length > libformat.MAX_BYTES:
+        return jsonify({"ok": False, "error": "file too large"}), 400
+    raw = f.read(libformat.MAX_BYTES + 1)
+    if len(raw) > libformat.MAX_BYTES:
+        return jsonify({"ok": False, "error": "file too large"}), 400
+    try:
+        doc = libformat.read_lib(raw)
+    except libformat.LibError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    issues = libformat.validate(doc)
+    errors = [i.as_dict() for i in issues if i.level == "error"]
+    warnings = [i.as_dict() for i in issues if i.level == "warning"]
+    return jsonify({"ok": not errors, "format_version": doc.format_version,
+                    "pages": len(doc.pages), "warnings": warnings,
+                    "errors": errors})
 
 
 # --- PDF page rasterization (the OCR tab's side-by-side page view) ---------------
@@ -4982,7 +5599,8 @@ def api_master_sync():
     if not sheet_id or not keyfile:
         return jsonify({"ok": False,
                         "error": "Spreadsheet ID and service-account key file "
-                                 "are required (Settings > Sync)"})
+                                 "are required (Settings > Integrations; key "
+                                 "file under Credentials)"})
     kf = _resolve_local(keyfile)
     if kf is None or not kf.is_file():
         return jsonify({"ok": False, "error": f"key file not found: {keyfile}"})
@@ -6675,6 +7293,231 @@ def _ai_json(cfg: dict, messages: list, temperature: float = 0.2) -> dict:
         return {}
 
 
+# The catalogue fields a Process/DeepSeek pass is allowed to touch — so the
+# model can't slip arbitrary keys into a staged alternative. "categories" is
+# deliberately excluded: it is a structured field edited through the chip
+# picker, and a free-text value staged here would apply to the deprecated flat
+# column, never showing in the UI (the diff would never clear).
+_PROC_FIELD_KEYS = frozenset((
+    "title", "subtitle", "author", "authors", "year", "publisher",
+    "publisher_city", "city", "edition", "volume", "language", "pages",
+    "description", "subject"))
+
+
+@app.route("/api/process/deepseek", methods=["POST"])
+def api_process_deepseek():
+    """Process-mode "DeepSeek custom instructions" for ONE record: given its
+    current fields and the user's instructions, return ONLY the fields that
+    should change (same names), for staging as an alternative. The client loops
+    this over the selection. Human-in-the-loop: nothing is applied here."""
+    p = request.get_json(silent=True) or {}
+    fields = p.get("fields")
+    if not isinstance(fields, dict):
+        abort(400)
+    cfg = _ai_cfg()
+    if not cfg["key"]:
+        return jsonify({"ok": False, "error": "No AI key — set one in Settings > AI"}), 400
+    cur = {k: str(v)[:600] for k, v in fields.items()
+           if isinstance(k, str) and k in _PROC_FIELD_KEYS
+           and isinstance(v, (str, int, float)) and str(v).strip()}
+    if not cur:
+        return jsonify({"ok": True, "fields": {}})
+    sys = ("You are a meticulous bibliographic metadata editor. You are given one "
+           "book catalogue record as JSON. Apply the user's instructions and "
+           "return ONLY a JSON object of the fields that should CHANGE, using the "
+           "exact same field names. Omit unchanged fields. Do not invent facts you "
+           "cannot derive from the given values; when unsure, omit the field. "
+           "Return {} if nothing should change.")
+    run_instr = str(p.get("instructions") or "").strip()
+    if cfg["instructions"]:
+        sys += "\n\nStanding instructions: " + cfg["instructions"]
+    if run_instr:
+        sys += "\n\nThis run's instructions: " + run_instr[:2000]
+    try:
+        out = _ai_json(cfg, [{"role": "system", "content": sys},
+                             {"role": "user", "content": "Record:\n" + json.dumps(cur, ensure_ascii=False)}],
+                       temperature=0.1)
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "error": str(exc)[:200]}), 502
+    changed = {}
+    for k, v in (out.items() if isinstance(out, dict) else []):
+        if isinstance(k, str) and k in _PROC_FIELD_KEYS and isinstance(v, (str, int, float)):
+            nv = str(v).strip()
+            if nv and nv != str(cur.get(k, "")).strip():
+                changed[k] = nv[:2000]
+    return jsonify({"ok": True, "fields": changed})
+
+
+# --- Smart Scan (Process action) -------------------------------------------------
+# The Process-mode surface over the smart-check ENGINE (the pure pipeline
+# helpers below: _sc_scan_pages / _sc_ocr_page / _sc_extract / _sc_map_fields):
+# locate/download a book's own PDF, skip visually blank front matter, OCR the
+# first pages with Mistral until a title/imprint page and a copyright page have
+# both been seen, then extract fields with DeepSeek. The result is staged as a
+# "smartscan" alternative for review — the real record is never touched here.
+# Runs on a daemon thread against the unified job registry. (The wand-overlay
+# smart-check UI this engine originally shipped with is retired; Process mode
+# is the one front-end.)
+_SS_JOBS_KEEP = 20
+
+_ss_jobs: dict = {}
+_ss_jobs_lock = threading.Lock()
+_ss_start_lock = threading.Lock()
+
+
+def _ss_target_kind(target) -> str:
+    kind = str(target or "").partition(":")[0]
+    return kind if kind in _SC_FIELD_MAPS else ""
+
+
+def _ss_job_new(target: str, label: str) -> dict:
+    job = {"id": lib.gen_id(set(_ss_jobs) | set(_jobs)), "target": target,
+           "kind": "smartscan", "done": 0, "total": 0, "errors": 0,
+           "status": "running", "error": "", "note": ""}
+    with _ss_jobs_lock:
+        _ss_jobs[job["id"]] = job
+    _job_track(job, "smartscan", label=label)
+    return job
+
+
+def _ss_job_start(target: str, label: str, run) -> dict:
+    job = _ss_job_new(target, label)
+    threading.Thread(target=run, args=(job,), daemon=True).start()
+    return job
+
+
+def _ss_finish(job: dict, error: str = "") -> None:
+    with _ss_jobs_lock:
+        job["error"] = error
+        status = "error" if error else ("done (with errors)" if job["errors"] else "done")
+    _job_transition(job, status)
+    with _ss_jobs_lock:
+        done = sorted((j for j in _ss_jobs.values() if j.get("state") not in _JOB_ACTIVE),
+                      key=lambda j: str(j.get("finished_at") or ""), reverse=True)
+        for old in done[_SS_JOBS_KEEP:]:
+            _ss_jobs.pop(str(old.get("id")), None)
+
+
+def _ss_run(job: dict, spec: dict) -> None:
+    target = spec["target"]
+    kind = _ss_target_kind(target)
+    try:
+        mkey = str(_client_settings().get("mistralKey") or "").strip()
+        if not mkey:
+            raise RuntimeError("Mistral API key not configured (Settings > OCR)")
+        pdf = spec.get("pdf_path")
+        if pdf is None:
+            with _ss_jobs_lock:
+                job["note"] = "downloading PDF"
+            _job_checkpoint(job, force=True)
+            pdf = _remote_pdf_cache(spec["url"])   # ValueError on SSRF / size / non-PDF
+            with _ss_jobs_lock:
+                job["note"] = ""
+        pdf = Path(pdf)
+        candidates = _sc_scan_pages(pdf)
+        if not candidates:
+            raise RuntimeError(f"no readable pages in the first {_SC_SCAN_CAP} pages")
+        planned = candidates[:_SC_OCR_CAP]
+        with _ss_jobs_lock:
+            job["total"] = len(planned) + 1        # +1 = the extraction step
+        texts: dict[int, str] = {}
+        titleish = copyrightish = False
+        for i, n in enumerate(planned):
+            if _an_cancel_check(job, "cancelled — nothing was written"):
+                return
+            try:
+                text = _sc_ocr_page(pdf, n, mkey)
+            except Exception as exc:
+                text = ""
+                with _ss_jobs_lock:
+                    job["errors"] += 1
+                    job["note"] = f"page {n}: {type(exc).__name__}"
+            if text:
+                texts[n] = text
+                titleish = titleish or bool(_SC_YEAR_RE.search(text) or _SC_IMPRINT_RE.search(text))
+                copyrightish = copyrightish or bool(_SC_COPYRIGHT_RE.search(text))
+            with _ss_jobs_lock:
+                job["done"] = i + 1
+            _job_checkpoint(job)
+            # both signals in hand: stop. Also cap the copyright hunt for books
+            # that never print "copyright" (pre-1900 / non-English) so we don't
+            # burn all _SC_OCR_CAP pages chasing a signal that never fires.
+            if titleish and copyrightish and len(texts) >= 2:
+                break
+            if titleish and len(texts) >= 4:
+                break
+        ocr_text = "\n\n".join(f"--- page {n} ---\n{texts[n]}" for n in sorted(texts))
+        if not ocr_text.strip():
+            raise RuntimeError("OCR produced no text from the front matter")
+        if _an_cancel_check(job, "cancelled — nothing was written"):
+            return
+        got, model = _sc_extract(ocr_text)
+        got = got if isinstance(got, dict) else {}
+        got.pop("extra", None)
+        mapped = _sc_map_fields(kind, got)
+        # an all-blank extraction must fail, not stage a "nothing changed" record
+        if not mapped:
+            raise RuntimeError("extraction returned no usable fields — retry")
+        if _an_cancel_check(job, "cancelled — nothing was written"):
+            return
+        _staged_add(target, kind, str(spec.get("label") or ""),
+                    {"source": "smartscan", "fields": mapped,
+                     "note": f"pages {sorted(texts)} · {model}"})
+        with _ss_jobs_lock:
+            job["done"] = job["total"]
+        activity("smart-scanned", "Book metadata", detail=str(spec.get("label") or target))
+        _ss_finish(job)
+    except Exception as exc:
+        log.error("smart scan failed for %s", target, exc_info=exc)
+        _ss_finish(job, f"{type(exc).__name__}: {exc}")
+
+
+@app.route("/api/process/smartscan/run", methods=["POST"])
+def api_process_smartscan_run():
+    """Start a Smart Scan for one record. Body: {target, pdf?|url?, label?}.
+    Returns the job to poll; a duplicate while one is running joins it."""
+    p = request.get_json(silent=True) or {}
+    target = str(p.get("target") or "").strip()
+    kind = _ss_target_kind(target)
+    if not kind or ":" not in target:
+        return jsonify({"ok": False, "error": "bad target"}), 400
+    label = str(p.get("label") or "").strip()[:120]
+    raw_pdf = str(p.get("pdf") or "").strip()
+    url = str(p.get("url") or "").strip()
+    spec = {"target": target, "label": label, "pdf_path": None, "url": url}
+    if raw_pdf:
+        lp = _resolve_local(raw_pdf)
+        if lp is None or lp.suffix.lower() != ".pdf" or not lp.is_file():
+            return jsonify({"ok": False, "error": "PDF not found"}), 404
+        spec["pdf_path"] = lp
+    elif url:
+        if not url.lower().startswith(("http://", "https://")):
+            return jsonify({"ok": False, "error": "not an http(s) URL"}), 400
+    else:
+        return jsonify({"ok": False, "error": "pdf or url required"}), 400
+    with _ss_start_lock:
+        with _jobs_lock:
+            for j in _jobs.values():
+                if (j.get("kind") == "smartscan" and j.get("target") == target
+                        and j.get("state") in _JOB_ACTIVE):
+                    return jsonify({"ok": True, "already": True, "job": _job_public(j)})
+        job = _ss_job_start(target, label, lambda jb: _ss_run(jb, spec))
+    return jsonify({"ok": True, "job": dict(job)})
+
+
+@app.route("/api/process/smartscan/job/<job_id>")
+def api_process_smartscan_job(job_id: str):
+    with _ss_jobs_lock:
+        job = _ss_jobs.get(job_id)
+        if job is not None:
+            return jsonify(dict(job))
+    with _jobs_lock:
+        gone = _jobs.get(job_id)
+    if gone is None:
+        abort(404)
+    return jsonify(_job_public(gone))
+
+
 _PAGE_MARK = re.compile(r"^--- page (\d+) ---$", re.M)
 
 
@@ -7661,31 +8504,19 @@ def api_analyze_relevance():
     return jsonify({"ok": True, "job": job["id"]})
 
 
-# --- smart check: extract real metadata from a book's own PDF --------------------
-# Any book record with a reachable PDF can be "smart checked": the PDF is
-# fetched (remote URLs land in the downloads/cache temp store), its front
-# matter is OCRed page by page with Mistral until a title page and a copyright
-# page have been seen, and the OCR text goes to the configured AI provider
-# (DeepSeek by default — the same Mistral -> DeepSeek chain as a phone
-# capture) for strict-JSON bibliographic extraction. The result is held as a
-# PENDING overlay in output/smart_checks.json: nothing touches the book's real
-# metadata until the client explicitly bakes it in, and retired records move
-# to a capped `resolved` list so every extraction stays auditable. The store
-# is deliberately device-local (not in the store_sync map) — provisional data
-# has no business syncing; bakes travel through the normal record stores.
-
-SMART_CHECKS_PATH = lib.OUTPUT_DIR / "smart_checks.json"
-_sc_lock = threading.Lock()          # every smart_checks.json read-modify-write
-_sc_jobs: dict = {}
-_sc_jobs_lock = threading.Lock()
-_sc_start_lock = threading.Lock()    # dedupe-scan + job insert, atomically
+# --- smart-check engine: extract real metadata from a book's own PDF -------------
+# The pure pipeline behind Process mode's Smart Scan (see _ss_run above): scan
+# the PDF's front matter skipping visually blank pages, OCR page by page with
+# Mistral until a title page and a copyright page have been seen, and send the
+# OCR text to the configured AI provider (DeepSeek by default — the same
+# Mistral -> DeepSeek chain as a phone capture) for strict-JSON bibliographic
+# extraction. Only stateless helpers live here; results are staged as Process
+# alternatives (staged_alts.json), and the retired wand-overlay UI's own
+# store/endpoints are gone.
 
 _SC_SCAN_CAP = 15        # pages considered from the front (blanks included)
 _SC_OCR_CAP = 8          # pages actually sent to OCR
 _SC_WIDTH = 1400         # render width; the OCR queue's default
-_SC_RESOLVED_KEEP = 400  # audit-trail records kept after bake/dismiss
-_SC_PENDING_CAP = 200    # un-baked overlays kept; oldest are dropped first
-_SC_JOBS_KEEP = 20       # finished entries kept in the per-kind registry
 
 # extraction vocabulary (capture.FIELDS) -> each record store's field names
 _SC_FIELD_MAPS = {
@@ -7790,317 +8621,6 @@ def _sc_map_fields(kind: str, fields: dict) -> dict:
     return out
 
 
-def _sc_store_locked() -> dict:
-    doc = lib.load_json(SMART_CHECKS_PATH, {})
-    if not isinstance(doc, dict):
-        doc = {}
-    if not isinstance(doc.get("pending"), dict):
-        doc["pending"] = {}
-    if not isinstance(doc.get("resolved"), list):
-        doc["resolved"] = []
-    return doc
-
-
-def _sc_mutate(fn):
-    with _sc_lock:
-        doc = _sc_store_locked()
-        out = fn(doc)
-        lib.save_json(SMART_CHECKS_PATH, doc)
-    return out
-
-
-def _sc_job_new(target: str, label: str) -> dict:
-    job = {"id": lib.gen_id(set(_sc_jobs) | set(_jobs)), "target": target,
-           "build_id": "", "kind": "smartcheck", "done": 0, "total": 0,
-           "errors": 0, "status": "running", "error": "", "note": ""}
-    kind, ident = _sc_parse_target(target)
-    if kind == "build":
-        job["build_id"] = ident
-    with _sc_jobs_lock:
-        _sc_jobs[job["id"]] = job
-    _job_track(job, "smartcheck", label=label)
-    return job
-
-
-def _sc_job_start(target: str, label: str, run) -> dict:
-    """Create and start a smart-check job (a seam tests replace to run the
-    worker inline)."""
-    job = _sc_job_new(target, label)
-    threading.Thread(target=run, args=(job,), daemon=True).start()
-    return job
-
-
-def _sc_finish(job: dict, error: str = "") -> None:
-    with _sc_jobs_lock:
-        job["error"] = error
-        status = "error" if error else (
-            "done (with errors)" if job["errors"] else "done")
-    _job_transition(job, status)
-    # drop older finished entries from the per-kind registry — the unified
-    # registry keeps the durable snapshot, and polls fall back to it
-    with _sc_jobs_lock:
-        done = sorted((j for j in _sc_jobs.values()
-                       if j.get("state") not in _JOB_ACTIVE),
-                      key=lambda j: str(j.get("finished_at") or ""),
-                      reverse=True)
-        for old in done[_SC_JOBS_KEEP:]:
-            _sc_jobs.pop(str(old.get("id")), None)
-
-
-def _sc_run(job: dict, spec: dict) -> None:
-    """The whole smart check for one book on its own daemon thread: resolve
-    the PDF -> OCR front-matter pages until both a title-page signal and a
-    copyright signal have been seen -> extract fields -> file the result as
-    a PENDING record. The book's real metadata is never touched here."""
-    target = spec["target"]
-    kind, _ident = _sc_parse_target(target)
-    try:
-        mkey = str(_client_settings().get("mistralKey") or "").strip()
-        if not mkey:
-            raise RuntimeError("Mistral API key not configured (Settings > OCR)")
-        pdf = spec.get("pdf_path")
-        if pdf is None:
-            # note only — a transition would clobber a 'cancelling' status
-            with _sc_jobs_lock:
-                job["note"] = "downloading PDF"
-            _job_checkpoint(job, force=True)
-            pdf = _remote_pdf_cache(spec["url"])   # ValueError on failure
-            with _sc_jobs_lock:
-                job["note"] = ""
-        pdf = Path(pdf)
-        candidates = _sc_scan_pages(pdf)
-        if not candidates:
-            raise RuntimeError(
-                f"no readable pages in the first {_SC_SCAN_CAP} pages")
-        planned = candidates[:_SC_OCR_CAP]
-        with _sc_jobs_lock:
-            job["total"] = len(planned) + 1        # +1 = the extraction step
-            job["note"] = ""
-        texts: dict[int, str] = {}
-        titleish = copyrightish = False
-        for i, n in enumerate(planned):
-            if _an_cancel_check(job, "cancelled — nothing was written"):
-                return
-            try:
-                text = _sc_ocr_page(pdf, n, mkey)
-            except Exception as exc:
-                text = ""
-                with _sc_jobs_lock:
-                    job["errors"] += 1
-                    job["note"] = f"page {n}: {type(exc).__name__}"
-            if text:
-                texts[n] = text
-                titleish = titleish or bool(_SC_YEAR_RE.search(text)
-                                            or _SC_IMPRINT_RE.search(text))
-                copyrightish = copyrightish or bool(
-                    _SC_COPYRIGHT_RE.search(text))
-            with _sc_jobs_lock:
-                job["done"] = i + 1
-            _job_checkpoint(job)
-            # both signals in hand: the imprint is covered, stop spending
-            if titleish and copyrightish and len(texts) >= 2:
-                break
-        ocr_text = "\n\n".join(f"--- page {n} ---\n{texts[n]}"
-                               for n in sorted(texts))
-        if not ocr_text.strip():
-            raise RuntimeError("OCR produced no text from the front matter")
-        if _an_cancel_check(job, "cancelled — nothing was written"):
-            return
-        got, model = _sc_extract(ocr_text)
-        extra = got.pop("extra", {}) or {}
-        # an unparseable/empty AI reply must fail loudly — filing an all-blank
-        # record would render as "the PDF agrees with this record"
-        if not extra and not any(str(v or "").strip() for v in got.values()):
-            raise RuntimeError("extraction returned no fields — the AI reply "
-                               "could not be parsed; try again")
-        if _an_cancel_check(job, "cancelled — nothing was written"):
-            return
-        record = {
-            "target": target, "kind": kind,
-            "label": str(spec.get("label") or ""),
-            "fields": got, "extra": extra,
-            "mapped": _sc_map_fields(kind, got),
-            "ocr_text": ocr_text[:60000],
-            "pages_ocred": sorted(texts),
-            "pdf": spec.get("pdf_ref") or {},
-            "engine": {"ocr": capture.OCR_MODEL, "extract": model},
-            "created_at": datetime.now(timezone.utc)
-                          .isoformat(timespec="seconds"),
-            "job_id": job["id"],
-        }
-        def put(doc):
-            pend = doc["pending"]
-            pend[target] = record
-            if len(pend) > _SC_PENDING_CAP:      # oldest overlays age out
-                for k in sorted(pend, key=lambda k: str(
-                        (pend[k] or {}).get("created_at") or ""))[
-                        :len(pend) - _SC_PENDING_CAP]:
-                    pend.pop(k, None)
-        _sc_mutate(put)
-        with _sc_jobs_lock:
-            job["done"] = job["total"]
-        activity("smart-checked", "Book metadata",
-                 detail=record["label"] or target)
-        _sc_finish(job)
-    except Exception as exc:
-        log.error("smart check failed for %s", target, exc_info=exc)
-        _sc_finish(job, f"{type(exc).__name__}: {exc}")
-
-
-@app.route("/api/smartcheck/run", methods=["POST"])
-def api_smartcheck_run():
-    """Start a smart check for one book record.
-
-    Body: ``{target, pdf?, url?, label?}`` — ``target`` is
-    ``whl:<idx> | build:<id> | manual:<id> | checked:<key>``; ``pdf`` is a
-    local path (DATA_ROOT-relative or absolute), ``url`` a remote PDF.
-    Returns the job to poll; a second request for a book whose check is
-    still running returns that same job (``already: true``).
-    """
-    p = request.get_json(silent=True) or {}
-    try:
-        kind, ident = _sc_parse_target(p.get("target"))
-    except ValueError:
-        return jsonify({"ok": False, "error": "bad target"}), 400
-    target = f"{kind}:{ident}"
-    label = str(p.get("label") or "").strip()[:120]
-    # server-owned targets must exist; checked books live in client_state
-    if kind == "build":
-        b = lib.load_json(BUILDS_PATH, {}).get(ident)
-        if not isinstance(b, dict):
-            return jsonify({"ok": False, "error": "unknown build"}), 404
-        label = label or str(b.get("title") or "")
-    elif kind == "manual":
-        entry = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}).get(ident)
-        if not isinstance(entry, dict):
-            return jsonify({"ok": False, "error": "unknown manual entry"}), 404
-        label = label or str(entry.get("title") or "")
-    elif kind == "whl":
-        try:
-            widx = int(ident)
-        except ValueError:
-            return jsonify({"ok": False, "error": "bad WHL index"}), 400
-        if widx >= 0 and widx >= len(_load_whl_base()):
-            return jsonify({"ok": False, "error": "unknown WHL row"}), 404
-        if widx < 0:      # negative idx = a row added through corrections
-            corr = lib.load_json(WHL_CORRECTIONS_PATH, {})
-            if -widx > len(corr.get("added") or []):
-                return jsonify({"ok": False, "error": "unknown WHL row"}), 404
-    elif kind == "checked" and ":" not in ident:
-        return jsonify({"ok": False, "error": "bad checked key"}), 400
-    raw_pdf = str(p.get("pdf") or "").strip()
-    url = str(p.get("url") or "").strip()
-    spec = {"target": target, "label": label, "pdf_path": None, "url": url,
-            "pdf_ref": {}}
-    if raw_pdf:
-        lp = _resolve_local(raw_pdf)
-        if lp is None or lp.suffix.lower() != ".pdf" or not lp.is_file():
-            return jsonify({"ok": False, "error": "PDF not found"}), 404
-        spec["pdf_path"] = lp
-        spec["pdf_ref"] = {"path": raw_pdf}
-    elif url:
-        if not url.lower().startswith(("http://", "https://")):
-            return jsonify({"ok": False, "error": "not an http(s) URL"}), 400
-        spec["pdf_ref"] = {"url": url}     # fetched on the worker thread
-    else:
-        return jsonify({"ok": False, "error": "pdf or url required"}), 400
-    # one live job per book — a duplicate click joins the running check.
-    # _sc_start_lock makes the scan-then-insert atomic against a concurrent
-    # POST for the same target (the insert re-takes _jobs_lock internally).
-    with _sc_start_lock:
-        with _jobs_lock:
-            for j in _jobs.values():
-                if (j.get("kind") == "smartcheck" and j.get("target") == target
-                        and j.get("state") in _JOB_ACTIVE):
-                    return jsonify({"ok": True, "already": True,
-                                    "job": dict(_job_public(j), target=target)})
-        job = _sc_job_start(target, label, lambda jb: _sc_run(jb, spec))
-    return jsonify({"ok": True, "job": dict(job)})
-
-
-@app.route("/api/smartcheck/job/<job_id>")
-def api_smartcheck_job(job_id: str):
-    with _sc_jobs_lock:
-        job = _sc_jobs.get(job_id)
-        if job is not None:
-            return jsonify(dict(job))
-    # a restart dropped the worker: the persisted registry still knows it
-    with _jobs_lock:
-        gone = _jobs.get(job_id)
-    if gone is None:
-        abort(404)
-    return jsonify(_job_public(gone))
-
-
-@app.route("/api/smartcheck")
-def api_smartcheck_list():
-    """Every pending (un-baked) smart-check record, keyed by target.
-
-    Records whose build/manual target no longer exists are retired here as
-    ``orphaned`` — a deleted book must not leave an immortal overlay behind
-    (its wand is the only dismiss surface, and it's gone with the row)."""
-    builds = manuals = None
-
-    def prune(doc):
-        nonlocal builds, manuals
-        dead = []
-        for t in doc["pending"]:
-            k, _, ident = str(t).partition(":")
-            if k == "build":
-                if builds is None:
-                    builds = lib.load_json(BUILDS_PATH, {})
-                if ident not in builds:
-                    dead.append(t)
-            elif k == "manual":
-                if manuals is None:
-                    manuals = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
-                if ident not in manuals:
-                    dead.append(t)
-        for t in dead:
-            rec = doc["pending"].pop(t)
-            if isinstance(rec, dict):
-                rec["resolved"] = {
-                    "action": "orphaned", "applied": {},
-                    "at": datetime.now(timezone.utc)
-                          .isoformat(timespec="seconds")}
-                doc["resolved"].append(rec)
-        del doc["resolved"][:-_SC_RESOLVED_KEEP]
-        return dict(doc["pending"])
-
-    return jsonify({"ok": True, "pending": _sc_mutate(prune)})
-
-
-@app.route("/api/smartcheck/resolve", methods=["POST"])
-def api_smartcheck_resolve():
-    """Retire a pending record: ``baked`` (the client applied it to the book
-    through the normal edit endpoints) or ``dismissed``. Retired records move
-    to the store's capped ``resolved`` list — the audit trail of what was
-    extracted, what was applied, and when."""
-    p = request.get_json(silent=True) or {}
-    target = str(p.get("target") or "").strip()
-    action = str(p.get("action") or "").strip()
-    if action not in ("baked", "dismissed"):
-        return jsonify({"ok": False, "error": "bad action"}), 400
-    applied = p.get("applied") if isinstance(p.get("applied"), dict) else {}
-
-    def fn(doc):
-        rec = doc["pending"].pop(target, None)
-        if rec is None:
-            return None
-        rec["resolved"] = {
-            "action": action, "applied": applied,
-            "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-        doc["resolved"].append(rec)
-        del doc["resolved"][:-_SC_RESOLVED_KEEP]
-        return rec
-
-    rec = _sc_mutate(fn)
-    if rec is None:
-        return jsonify({"ok": False, "error": "no pending smart check"}), 404
-    if action == "baked":
-        activity("baked", "Smart check",
-                 detail=str(rec.get("label") or target))
-    return jsonify({"ok": True})
 
 
 # --- publishing a volume to the cloud library ---------------------------------
@@ -8584,7 +9104,7 @@ def _publish_run(bid: str, actor: str, job: dict | None = None) -> None:
             raise RuntimeError("this entry has no local PDF attached")
         cloud = _cloud_cfg()
         if not cloud:
-            raise RuntimeError("Supabase is not configured (Settings > Sync)")
+            raise RuntimeError("Supabase is not configured (Settings > Credentials)")
 
         size = pdf.stat().st_size
         slug = _publish_slug(cloud, b)
@@ -8773,7 +9293,7 @@ def api_volumes_publish():
         return jsonify({"ok": False, "error": "no rights decision — set Rights in "
                         "the Editor before publishing"}), 400
     if not _cloud_cfg():
-        return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Sync)"}), 400
+        return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Credentials)"}), 400
     with _publish_lock:
         if _publish["running"]:
             return jsonify({"ok": False, "error": "a publish is already running"}), 409
@@ -9241,7 +9761,7 @@ def api_knowledge_index_publish():
     cloud = _cloud_cfg()
     if not cloud:
         return jsonify({"ok": False, "error":
-                        "Supabase is not configured (Settings > Sync)"}), 400
+                        "Supabase is not configured (Settings > Credentials)"}), 400
     doc_name, text, source_revision = _analyze_doc_snapshot(bid, b)
     pages = _an_pages(text)
     if not pages:
@@ -9306,6 +9826,14 @@ def api_knowledge_index_publish():
                       "model": ecfg["model"] if embed else ""}
             stats = {"passages": len(included), "embedded": len(vectors),
                      "excluded": len(excluded)}
+            # #142 promotion visibility: the latest evaluation results ride
+            # on the version row, so the Search-index card shows them where
+            # promotion (publish / roll back) is decided
+            with _eval_lock:
+                ev = _load_eval(bid).get("last_run") or {}
+            overall = (ev.get("local") or {}).get("overall") or {}
+            if overall.get("judged") or overall.get("unanswerable"):
+                stats["eval"] = dict(overall, at=str(ev.get("at") or ""))
             rows = sbase._rest(
                 cloud, "POST", "index_versions",
                 [{"slug": slug, "channel": "stable", "config": config,
@@ -9383,7 +9911,7 @@ def api_knowledge_index_rollback():
     cloud = _cloud_cfg()
     if not cloud:
         return jsonify({"ok": False, "error":
-                        "Supabase is not configured (Settings > Sync)"}), 400
+                        "Supabase is not configured (Settings > Credentials)"}), 400
     q = urllib.parse.quote(slug, safe="")
     try:
         rows = sbase._rest(
@@ -9412,10 +9940,11 @@ def api_knowledge_index_status():
         abort(404)
     slug = str(b.get("published_slug") or "").strip()
     versions, warning = [], ""
+    # Passive status must not nag about cloud config: only publishing needs the
+    # owner service key, and the publish action reports that itself. Here we just
+    # list any already-published versions, warning only if that lookup fails.
     cloud = _cloud_cfg()
-    if not cloud:
-        warning = "Supabase is not configured (Settings > Sync)"
-    elif slug:
+    if slug and cloud:
         q = urllib.parse.quote(slug, safe="")
         try:
             versions = [v for v in (sbase._rest(
@@ -9428,6 +9957,509 @@ def api_knowledge_index_status():
                     "versions": versions, "slug": slug,
                     "published": b.get("status") == "uploaded",
                     "rights": str(b.get("rights") or ""), "warning": warning})
+
+
+# --- Knowledge: Test + Ask (#142/#143) -------------------------------------------
+# One retrieval core serves both: the Test view judges it (per-volume
+# evaluation sets, metrics that gate index promotion — docs/search-design.md
+# D9), and Ask builds on it (evidence first, then an optional cited answer).
+# Both are curator-side desktop surfaces; the public site gets nothing here
+# until an execution point with quotas exists (D7).
+
+_EVAL_KINDS = ("exact-phrase", "archaic-modern", "factual", "thematic",
+               "tables", "cross-page", "multilingual", "unanswerable")
+_EVAL_K = 10               # the metrics cutoff: Recall@10 / nDCG@10 / MRR
+# An unanswerable query PASSES when no passage scores ABOVE this floor.
+# 1.0 is the score of one query term found exactly once at full coverage
+# (see _score_passages): genuine coverage of a multi-term query lands well
+# above it, incidental partial overlap lands below. The known edge: a
+# single-term query whose term appears exactly once scores exactly 1.0 and
+# still passes — repeats push it over.
+_EVAL_UNANSWERABLE_FLOOR = 1.0
+_SNIPPET_WORDS = 24        # ts_headline's MaxWords, so both arms read alike
+_ASK_K = 10                # evidence rows behind an answer
+_eval_lock = threading.Lock()
+
+_SCORE_WORD = re.compile(r"[a-z0-9]+")
+
+
+def _score_terms(text: str) -> list[str]:
+    """Folded search words of arbitrary text: _search_normalize (the exact
+    layer the index searches — long s, ligatures, diacritics), then the
+    alphanumeric runs, so 'phyſick,' and 'physick' meet as one term."""
+    return _SCORE_WORD.findall(_search_normalize(text))
+
+
+def _evidence_snippet(body: str, qterms: list[str]) -> str:
+    """A «»-marked window of the normalized body around the densest cluster
+    of query-term hits — the local counterpart of the RPC's ts_headline
+    (StartSel=«, StopSel=», MaxWords=24), shared by Test and Ask so every
+    evidence row reads the same."""
+    words = body.split()
+    qset = set(qterms)
+    hits = [any(w in qset for w in _SCORE_WORD.findall(tok)) for tok in words]
+    if any(hits):
+        # densest fixed-size window by prefix sums; ties keep the earliest
+        ps = [0]
+        for h in hits:
+            ps.append(ps[-1] + int(h))
+        best, best_n = 0, -1
+        for i in range(max(1, len(words) - _SNIPPET_WORDS + 1)):
+            n = ps[min(i + _SNIPPET_WORDS, len(words))] - ps[i]
+            if n > best_n:
+                best, best_n = i, n
+    else:
+        best = 0
+    seg = words[best:best + _SNIPPET_WORDS]
+    mark = lambda m: f"«{m.group(0)}»" if m.group(0) in qset else m.group(0)  # noqa: E731
+    out = " ".join(_SCORE_WORD.sub(mark, tok) for tok in seg)
+    if best > 0:
+        out = "… " + out
+    if best + _SNIPPET_WORDS < len(words):
+        out += " …"
+    return out
+
+
+def _score_passages(passages: list[dict], query: str, k: int = _EVAL_K,
+                    excluded=None) -> list[dict]:
+    """Rank non-excluded passages for a query with a transparent lexical
+    scorer, over the same folded layer as the published index.
+
+    Scoring is deliberately simple and inspectable: per query term found,
+    1 + ln(tf) (repeats help, with diminishing returns), the sum weighted
+    by query coverage (matched terms / query terms) so passages containing
+    the whole query outrank scattered partial hits, doubled when the exact
+    folded phrase occurs. This APPROXIMATES the cloud FTS (websearch +
+    ts_rank over the same normalized bodies); it does not replicate
+    ts_rank's proximity weighting — which is exactly why the Test view can
+    show both arms side by side and judge them by the same metrics.
+
+    Returns [{passage_id, page_from, page_to, score, snippet, text}],
+    best first, ties broken by passage id for a stable order.
+    """
+    qterms = list(dict.fromkeys(_score_terms(query)))
+    if not qterms:
+        return []
+    phrase = " ".join(_score_terms(query))     # order + repeats kept
+    skip = set(excluded or ())
+    scored = []
+    for p in passages:
+        if p.get("id") in skip:
+            continue
+        body = p.get("body") or _search_normalize(p.get("text"))
+        words = _SCORE_WORD.findall(body)
+        if not words:
+            continue
+        counts = collections.Counter(words)
+        hit = [t for t in qterms if counts[t]]
+        if not hit:
+            continue
+        score = (sum(1.0 + math.log(counts[t]) for t in hit)
+                 * (len(hit) / len(qterms)))
+        if len(qterms) > 1 and f" {phrase} " in f" {' '.join(words)} ":
+            score *= 2.0                       # exact-phrase boost
+        scored.append((score, p, body))
+    scored.sort(key=lambda s: (-s[0], s[1]["id"]))
+    return [{"passage_id": p["id"], "page_from": p.get("page_from"),
+             "page_to": p.get("page_to"), "score": round(score, 4),
+             "snippet": _evidence_snippet(body, qterms),
+             "text": p.get("text") or ""}
+            for score, p, body in scored[:max(1, int(k))]]
+
+
+def _rpc_search_passages(cloud: dict, slug: str, query: str,
+                         k: int = _EVAL_K) -> list[dict]:
+    """The published arm: the same search_passages RPC the website calls,
+    over the LATEST stable index version — so the curator compares the
+    working passages against what actually serves."""
+    rows = sbase._rest(cloud, "POST", "rpc/search_passages",
+                       {"p_slug": slug, "p_query": query,
+                        "p_limit": max(1, int(k))})
+    out = []
+    for r in rows if isinstance(rows, list) else []:
+        if isinstance(r, dict) and r.get("passage_id"):
+            out.append({"passage_id": str(r["passage_id"]),
+                        "page_from": r.get("page_from"),
+                        "page_to": r.get("page_to"),
+                        "score": float(r.get("rank") or 0.0),
+                        "snippet": str(r.get("snippet") or "")})
+    return out
+
+
+def _index_version_count(cloud: dict, slug: str) -> int:
+    rows = sbase._rest(
+        cloud, "GET", "index_versions?slug=eq."
+        + urllib.parse.quote(slug, safe="") + "&select=id")
+    return len(rows) if isinstance(rows, list) else 0
+
+
+# --- the per-volume evaluation set: entries/<bid>/eval.json (#142) ----------------
+
+def _eval_path(bid: str) -> Path:
+    return _entry_dir(bid) / "eval.json"
+
+
+def _load_eval(bid: str) -> dict:
+    doc = lib.load_json(_eval_path(bid), None)
+    if not isinstance(doc, dict) or not isinstance(doc.get("queries"), list):
+        return {"version": 1, "queries": []}
+    return doc
+
+
+def _eval_metrics(ranked: list[str], relevant: set[str], k: int) -> dict:
+    """Recall@k, nDCG@k, MRR@k against binary judgments. Results the curator
+    never judged count as not relevant — the standard convention, and the
+    honest one: an unjudged hit earns credit only after someone looks at it.
+    nDCG uses binary gains 1/log2(pos+1); the ideal ranking is all relevant
+    passages first."""
+    hits = [1 if pid in relevant else 0 for pid in ranked[:k]]
+    recall = round(sum(hits) / len(relevant), 4) if relevant else 0.0
+    dcg = sum(h / math.log2(i + 2) for i, h in enumerate(hits))
+    idcg = sum(1 / math.log2(i + 2) for i in range(min(len(relevant), k)))
+    mrr = 0.0
+    for i, h in enumerate(hits):
+        if h:
+            mrr = round(1.0 / (i + 1), 4)
+            break
+    return {"recall": recall, "ndcg": round(dcg / idcg, 4) if idcg else 0.0,
+            "mrr": mrr}
+
+
+def _eval_query_run(q: dict, results: list[dict], k: int,
+                    floor: float | None) -> dict:
+    """One query's scored outcome. Judged queries (>= 1 relevant judgment)
+    get the three metrics; unanswerable queries pass/fail on the floor
+    (floor=None means the published arm, where rank scales differ across
+    ts_rank and RRF — there, returning nothing at all is the only honest
+    pass); everything else reports unjudged and stays out of the means."""
+    top = float(results[0]["score"]) if results else 0.0
+    if q.get("kind") == "unanswerable":
+        ok = (not results) if floor is None else (top <= floor)
+        return {"kind": "unanswerable", "pass": bool(ok),
+                "top": round(top, 4)}
+    relevant = {pid for pid, v in (q.get("judgments") or {}).items() if v}
+    if not relevant:
+        return {"judged": False}
+    out = _eval_metrics([r["passage_id"] for r in results], relevant, k)
+    out["relevant"] = len(relevant)
+    return out
+
+
+def _eval_overall(per_query: dict) -> dict:
+    """Means over the judged queries plus the separate tallies: unanswerable
+    pass counts and the unjudged remainder. No judged queries -> null
+    metrics, never a fake zero."""
+    judged = [r for r in per_query.values() if "recall" in r]
+    un = [r for r in per_query.values() if r.get("kind") == "unanswerable"]
+    mean = lambda key: round(sum(r[key] for r in judged) / len(judged), 4)  # noqa: E731
+    return {"recall": mean("recall") if judged else None,
+            "ndcg": mean("ndcg") if judged else None,
+            "mrr": mean("mrr") if judged else None,
+            "judged": len(judged),
+            "unanswerable_pass": sum(1 for r in un if r["pass"]),
+            "unanswerable": len(un),
+            "unjudged": sum(1 for r in per_query.values()
+                            if r.get("judged") is False)}
+
+
+def _eval_summary_note(overall: dict) -> str:
+    bits = []
+    if overall.get("judged"):
+        bits.append(f"R@{_EVAL_K} {overall['recall']:.2f} · "
+                    f"nDCG {overall['ndcg']:.2f} · MRR {overall['mrr']:.2f} "
+                    f"({overall['judged']} judged)")
+    if overall.get("unanswerable"):
+        bits.append(f"unanswerable {overall['unanswerable_pass']}"
+                    f"/{overall['unanswerable']}")
+    if overall.get("unjudged"):
+        bits.append(f"{overall['unjudged']} unjudged")
+    return " · ".join(bits) or "no queries scored"
+
+
+@app.route("/api/builds/<bid>/eval", methods=["GET", "PUT"])
+def api_build_eval(bid: str):
+    """GET the evaluation set; PUT curation, one operation at a time (the
+    annotations idiom): {add: {text, kind}}, {update: {id, text?, kind?}},
+    {remove: id}, {judge: {id, passage_id, rel: 1|0|null}} (null clears).
+
+    Judgments are keyed by content-hash passage ids, so they survive
+    regeneration for every passage whose text did not change; a judged id
+    the current set no longer contains simply never surfaces in results —
+    and a positive one honestly drags Recall down until re-judged, which
+    is exactly the re-score-against-new-versions semantics of #142."""
+    if request.method == "GET":
+        with _eval_lock:
+            return jsonify({"ok": True, "doc": _load_eval(bid)})
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    p = request.get_json(silent=True) or {}
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    judged = False
+    with _eval_lock:
+        doc = _load_eval(bid)
+        queries = doc["queries"]
+        by_id = {str(q.get("id")): q for q in queries}
+
+        add = p.get("add") or {}
+        if add:
+            text = str(add.get("text") or "").strip()[:500]
+            kind = str(add.get("kind") or "").strip()
+            if not text:
+                return jsonify({"ok": False, "error": "a query needs text"}), 400
+            if kind not in _EVAL_KINDS:
+                return jsonify({"ok": False, "error": "unknown query kind"}), 400
+            queries.append({"id": lib.gen_id(set(by_id)), "text": text,
+                            "kind": kind, "judgments": {}, "updated_at": now})
+
+        if p.get("remove"):
+            doc["queries"] = queries = [
+                q for q in queries if q.get("id") != p["remove"]]
+        by_id = {str(q.get("id")): q for q in queries}
+
+        upd = p.get("update") or {}
+        if upd.get("id"):
+            q = by_id.get(str(upd["id"]))
+            if q is None:
+                return jsonify({"ok": False, "error": "unknown query id"}), 400
+            if "text" in upd:
+                text = str(upd.get("text") or "").strip()[:500]
+                if not text:
+                    return jsonify({"ok": False,
+                                    "error": "a query needs text"}), 400
+                q["text"] = text
+            if "kind" in upd:
+                if upd["kind"] not in _EVAL_KINDS:
+                    return jsonify({"ok": False,
+                                    "error": "unknown query kind"}), 400
+                q["kind"] = upd["kind"]
+            q["updated_at"] = now
+
+        j = p.get("judge") or {}
+        if j.get("id"):
+            q = by_id.get(str(j["id"]))
+            if q is None:
+                return jsonify({"ok": False, "error": "unknown query id"}), 400
+            pid = str(j.get("passage_id") or "").strip()
+            if not pid:
+                return jsonify({"ok": False, "error": "no passage id"}), 400
+            rel = j.get("rel")
+            marks = q.setdefault("judgments", {})
+            if rel is None:
+                marks.pop(pid, None)
+            elif rel in (0, 1, False, True):
+                marks[pid] = 1 if rel else 0
+            else:
+                return jsonify({"ok": False,
+                                "error": "rel must be 1, 0 or null"}), 400
+            q["updated_at"] = now
+            judged = True
+
+        lib.save_json(_eval_path(bid), doc)
+    # provenance (#135): judging binds the set to the passages as they stand,
+    # so the input is passages.json fingerprinted at judgment time; query
+    # edits keep the recorded inputs (they change intent, not derivation)
+    _manifest_record(bid, "eval.json", {"kind": "eval"},
+                     [_manifest_input(bid, "passages.json")] if judged else None)
+    return jsonify({"ok": True, "doc": doc})
+
+
+@app.route("/api/knowledge/eval/run", methods=["POST"])
+def api_knowledge_eval_run():
+    """Score every evaluation query and cache the results. Body: {build_id}.
+    A tracked job (one tick per query): the local arm always runs; when the
+    cloud is configured and the book has published, the search_passages RPC
+    runs beside it so working passages and the published index get separate,
+    comparable metrics. Results land in eval.json under last_run."""
+    p = request.get_json(silent=True) or {}
+    bid = str(p.get("build_id") or "").strip()
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    with _eval_lock:
+        queries = [dict(q) for q in _load_eval(bid)["queries"]]
+    if not queries:
+        return jsonify({"ok": False, "error":
+                        "no evaluation queries yet — add some first"}), 400
+    with _passages_lock:
+        doc = _load_passages(bid)
+    if doc is None:
+        return jsonify({"ok": False, "error":
+                        "no passages yet — generate them first"}), 400
+    passages = doc.get("passages") or []
+    excluded = doc.get("excluded") or []
+    cloud = _cloud_cfg()
+    slug = str(b.get("published_slug") or "").strip()
+    psg_input = _manifest_input(bid, "passages.json")   # hashed at job start
+
+    def run(job):
+        try:
+            local_q: dict = {}
+            pub_q: dict = {}
+            warning = ""
+            version = 0
+            if cloud and slug:
+                try:
+                    version = _index_version_count(cloud, slug)
+                except sbase.SyncError as exc:
+                    warning = _index_sync_error(exc)
+            for q in queries:
+                if _an_cancel_check(job, "cancelled — metrics not saved"):
+                    return
+                results = _score_passages(passages, q["text"], _EVAL_K,
+                                          excluded)
+                local_q[q["id"]] = _eval_query_run(
+                    q, results, _EVAL_K, _EVAL_UNANSWERABLE_FLOOR)
+                if version and not warning:
+                    try:
+                        rows = _rpc_search_passages(cloud, slug, q["text"],
+                                                    _EVAL_K)
+                        pub_q[q["id"]] = _eval_query_run(q, rows, _EVAL_K,
+                                                         None)
+                    except sbase.SyncError as exc:
+                        warning = _index_sync_error(exc)
+                with _an_jobs_lock:
+                    job["done"] += 1
+                _job_checkpoint(job)
+            overall = _eval_overall(local_q)
+            last_run = {"at": datetime.now(timezone.utc).isoformat(
+                            timespec="seconds"),
+                        "k": _EVAL_K, "floor": _EVAL_UNANSWERABLE_FLOOR,
+                        "local": {"overall": overall, "queries": local_q}}
+            if pub_q:
+                last_run["published"] = {"version": version,
+                                         "overall": _eval_overall(pub_q),
+                                         "queries": pub_q}
+            if warning:
+                last_run["warning"] = warning
+            with _eval_lock:
+                cur = _load_eval(bid)
+                cur["last_run"] = last_run
+                lib.save_json(_eval_path(bid), cur)
+            _manifest_record(bid, "eval.json", {"kind": "eval"}, [psg_input])
+            with _an_jobs_lock:
+                job["note"] = _eval_summary_note(overall)
+            activity("ran retrieval evaluation", "book",
+                     detail=b.get("title", ""))
+            _an_finish(job)
+        except Exception as exc:
+            log.error("eval run failed for %s", bid, exc_info=exc)
+            _an_finish(job, f"{type(exc).__name__}: {exc}")
+
+    job = _an_job_start(bid, "eval-run", len(queries), run)
+    return jsonify({"ok": True, "job": job["id"]})
+
+
+# --- Ask this book (#143): evidence first, then an optional cited answer ----------
+
+_ASK_ABSTAIN = "The archive does not contain enough evidence to answer this."
+_ASK_NOTE = ("Model-generated from the passages above — not the book's "
+             "text, not medical advice.")
+
+
+def _ask_system_prompt(year) -> str:
+    """The fixed Ask contract: grounded, cited, abstaining, historically
+    framed, never medical advice. The edition year is the only variable."""
+    edition = f"this {year} edition" if str(year or "").strip() else \
+        "this edition"
+    return (
+        "You answer questions about one historical book using ONLY the "
+        "numbered passages supplied below — no outside knowledge, no "
+        "guesses. After each claim, cite the page of the passage that "
+        "supports it inline as [p<page>], for example [p12]. If the "
+        f"passages do not support an answer, reply exactly "
+        f"\"{_ASK_ABSTAIN}\" and nothing else. Frame every historical "
+        f"claim as the edition's statement — \"{edition} states…\" — "
+        "never as present-day fact. The book's remedies are historical "
+        "text: never present them as modern medical advice, and if the "
+        "question asks how to use a remedy today, refuse that framing "
+        "and describe only what the edition says.")
+
+
+@app.route("/api/knowledge/ask", methods=["POST"])
+def api_knowledge_ask():
+    """Retrieval for Ask and for the Test view's live query runs. Body:
+    {build_id, question, published?}. Synchronous — this is a local rank
+    over passages.json, plus (published: true) the RPC arm for the
+    working-vs-published comparison."""
+    p = request.get_json(silent=True) or {}
+    bid = str(p.get("build_id") or "").strip()
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    question = str(p.get("question") or "").strip()
+    if not question:
+        return jsonify({"ok": False, "error": "ask a question first"}), 400
+    with _passages_lock:
+        doc = _load_passages(bid)
+    if doc is None:
+        return jsonify({"ok": False, "error":
+                        "no passages yet — generate them first"}), 404
+    results = _score_passages(doc.get("passages") or [], question, _ASK_K,
+                              doc.get("excluded") or [])
+    out = {"ok": True, "results": results,
+           "floor": _EVAL_UNANSWERABLE_FLOOR, "published": None,
+           "warning": ""}
+    if p.get("published"):
+        cloud = _cloud_cfg()
+        slug = str(b.get("published_slug") or "").strip()
+        if cloud and slug:
+            try:
+                out["published"] = {
+                    "version": _index_version_count(cloud, slug),
+                    "results": _rpc_search_passages(cloud, slug, question,
+                                                    _ASK_K)}
+            except sbase.SyncError as exc:
+                out["warning"] = _index_sync_error(exc)
+    return jsonify(out)
+
+
+@app.route("/api/knowledge/ask/answer", methods=["POST"])
+def api_knowledge_ask_answer():
+    """Draft a cited answer from already-retrieved passages. Body:
+    {build_id, question, passage_ids}. The answer is TRANSIENT by design —
+    it is returned, rendered, and never written to disk: AI-derived claims
+    stay visibly derived and never publish (docs/search-design.md §7), and
+    a stored answer would rot silently as the text is corrected."""
+    p = request.get_json(silent=True) or {}
+    bid = str(p.get("build_id") or "").strip()
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    question = str(p.get("question") or "").strip()
+    if not question:
+        return jsonify({"ok": False, "error": "ask a question first"}), 400
+    cfg = _ai_cfg()
+    if not cfg["key"]:
+        # the _ai_chat no-key message, surfaced before any work happens
+        return jsonify({"ok": False, "error":
+                        "no AI key — set one in Settings > AI "
+                        "(DeepSeek is the default provider)"}), 409
+    with _passages_lock:
+        doc = _load_passages(bid)
+    by_id = {str(x.get("id")): x for x in (doc or {}).get("passages") or []}
+    wanted = [str(i) for i in p.get("passage_ids") or []]
+    picked = [by_id[i] for i in wanted if i in by_id][:12]
+    if not picked:
+        return jsonify({"ok": False, "error":
+                        "no known passages to answer from — run the "
+                        "question first"}), 400
+    lines = []
+    for i, x in enumerate(picked, 1):
+        a, z = x.get("page_from"), x.get("page_to")
+        label = f"page {a}" if a == z else f"pages {a}–{z}"
+        lines.append(f"[{i}] ({label})\n{x.get('text') or ''}")
+    user = (f"Question: {question}\n\nPassages from "
+            f"{_an_meta_line(b)}:\n\n" + "\n\n".join(lines))
+    try:
+        answer = _ai_chat(cfg, [
+            {"role": "system", "content": _ask_system_prompt(b.get("year"))},
+            {"role": "user", "content": user},
+        ], temperature=0.2)
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 502
+    return jsonify({"ok": True, "answer": answer.strip(),
+                    "abstained": answer.strip() == _ASK_ABSTAIN})
 
 
 def _capture_note(cap: dict, errors: list[str]) -> str:

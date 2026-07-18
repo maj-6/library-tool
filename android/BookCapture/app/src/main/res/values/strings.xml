@@ -34,9 +34,15 @@
     <string name="uploads_stuck">%1$d entr(ies) stuck — %2$s — check settings (⚙)</string>
     <string name="not_signed_in">Signed out — captures stay on the phone until you sign in (⚙)</string>
     <string name="need_permissions">Camera + microphone permissions are required</string>
+    <string name="need_camera">Camera permission is required to capture.</string>
+    <string name="voice_needs_mic">Voice control needs the microphone. Buttons still work — re-enable voice in Settings to try again.</string>
     <string name="model_download_failed">Voice model download failed: %1$s (buttons still work)</string>
 
     <!-- Capture controls; the words live in the content descriptions. -->
+    <string name="discarded">Entry discarded</string>
+    <string name="undo">UNDO</string>
+    <string name="undo_unavailable">Too late to undo — the discard was already cleared.</string>
+
     <string name="cmd_start">New capture</string>
     <string name="cmd_photo">Take capture</string>
     <string name="cmd_done">Seal entry</string>
@@ -59,6 +65,8 @@
     <string name="set_capture">Capture</string>
     <string name="set_sharpen">Sharpen viewfinder</string>
     <string name="set_sharpen_note">A crisper live preview. Android 13+ only.</string>
+    <string name="set_voice">Hands-free voice control</string>
+    <string name="set_voice_note">Say “start / photo / done / cancel” instead of tapping. Off by default; turning it on asks for the microphone and downloads a ~40 MB voice model once over your data connection.</string>
     <string name="set_transport">Transport</string>
     <string name="transport_cloud">Cloud</string>
     <string name="transport_lan">LAN</string>

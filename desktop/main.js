@@ -28,6 +28,65 @@ let mainReady = false;        // gates window-all-closed: don't quit mid-startup
 
 const isDev = !app.isPackaged;
 
+// --- .lib open flow ------------------------------------------------------------
+// A double-clicked .lib (the NSIS file association) arrives as an argv entry on
+// first launch, through second-instance argv when the app is already running,
+// or through open-file on macOS. The path is queued until the renderer says it
+// has registered its handler ("lib:ready", sent from app.js init), then
+// delivered over "lib:open" — the renderer owns the create-vs-import dialog.
+let pendingLibPaths = [];    // a QUEUE: multi-select + Enter opens one per file
+let libReadySender = null;   // the webContents that last signalled lib:ready
+
+function libPathFromArgv(argv, cwd) {
+  // Electron/Chromium switches ride the same array; a .lib path is the only
+  // argument shape we accept, resolved against the caller's cwd (a shell
+  // passes a relative path when launched from the file's own folder).
+  for (let i = argv.length - 1; i >= 1; i--) {
+    const a = argv[i];
+    if (typeof a !== "string" || !/\.lib$/i.test(a) || a.startsWith("--")) continue;
+    const p = path.resolve(cwd || process.cwd(), a);
+    try { if (fs.statSync(p).isFile()) return p; } catch (e) { /* not a file */ }
+  }
+  return null;
+}
+
+function flushLibOpen() {
+  if (!libReadySender || libReadySender.isDestroyed()) return;
+  while (pendingLibPaths.length) {
+    libReadySender.send("lib:open", pendingLibPaths.shift());
+  }
+}
+
+function sendLibOpen(p) {
+  if (!p) return;
+  pendingLibPaths.push(p);
+  flushLibOpen();
+}
+
+ipcMain.on("lib:ready", (event) => {
+  libReadySender = event.sender;   // re-set on reload, so delivery stays live
+  // a webContents survives navigation/reload, so isDestroyed() alone can't tell
+  // that the listener's isolated world is gone. Drop the sender when it starts
+  // loading, so a mid-reload flush keeps the path QUEUED for the next lib:ready
+  // rather than sending into a page whose handler is not yet registered.
+  event.sender.once("did-start-loading", () => {
+    if (libReadySender === event.sender) libReadySender = null;
+  });
+  flushLibOpen();
+});
+
+// macOS delivers opened files as an event, not argv; register before ready.
+app.on("open-file", (event, p) => {
+  event.preventDefault();
+  if (/\.lib$/i.test(p)) sendLibOpen(p);
+});
+
+// the file the user double-clicked to launch us, if any
+{
+  const p0 = libPathFromArgv(process.argv, process.cwd());
+  if (p0) pendingLibPaths.push(p0);
+}
+
 // Only one packaged instance may run at a time. A second launch hands off to
 // the first (focusing its window) and exits immediately. This is what makes an
 // in-place update safe: NSIS cannot replace a running .exe, so a second
@@ -38,7 +97,10 @@ const gotSingleInstanceLock = isDev || app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
   app.quit();
 } else {
-  app.on("second-instance", () => {
+  app.on("second-instance", (_event, argv, workingDirectory) => {
+    // a second launch may BE a double-clicked .lib — hand its path over
+    const p = libPathFromArgv(argv || [], workingDirectory);
+    if (p) sendLibOpen(p);
     const win = mainWindow || startupWin || updaterWin;
     if (!win) return;
     if (win.isMinimized()) win.restore();

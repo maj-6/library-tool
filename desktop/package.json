@@ -1,7 +1,7 @@
 {
   "name": "whl-library-tool",
   "productName": "Library Tool",
-  "version": "0.8.0-alpha.7",
+  "version": "0.8.0-alpha.10",
   "description": "Desktop shell for Library Tool — a World Herb Library companion (Flask sidecar + Electron)",
   "author": "Andrew James Miller",
   "license": "UNLICENSED",
@@ -50,6 +50,15 @@
       {
         "from": "../tools/whl_explorer/static/fonts/roboto-slab-var.woff2",
         "to": "startup-assets/roboto-slab-var.woff2"
+      }
+    ],
+    "fileAssociations": [
+      {
+        "ext": "lib",
+        "name": "Library Tool Book",
+        "description": "Library Tool book archive",
+        "icon": "build/lib-file.ico",
+        "role": "Editor"
       }
     ],
     "win": {
