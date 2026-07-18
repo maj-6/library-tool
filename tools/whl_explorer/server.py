@@ -5870,6 +5870,18 @@ def _trash_restore_pdf_pages(item: dict) -> tuple[dict, int]:
                 continue
             restored.append(rel)
 
+        # Put the page marks and review threads back on their original pages.
+        # The delete moved them; a restore that rebuilt the pages and the text
+        # but left these one page off would be a half-restore reported as a
+        # success. Dropped marks come from the payload, threads from their own
+        # tombstones.
+        att = _trash_payload_path(str(item.get("id") or ""), "attention.json")
+        for note in _unremap_page_attention_references(
+                build_id, str(origin.get("src_key") or "primary"), pages,
+                int(rest.get("pages_before") or 0),
+                lib.load_json(att, {}) if att else {}):
+            skipped.append({"file": "page marks", "reason": note})
+
         # Build fields get the same edited-since guard as the snapshots. Only
         # the keys the delete actually rewrote carry an "_after" value, so a
         # field it never touched is never written — and one the user has since
@@ -5884,12 +5896,19 @@ def _trash_restore_pdf_pages(item: dict) -> tuple[dict, int]:
                 skipped.append({"file": key, "reason": "edited since the delete"})
                 continue
             changed[key] = str(rest.get(f"{key}_before") or "")
-        if changed:
-            try:
-                _builds_apply(build_id, changed)
-            except OSError:
-                skipped.append({"file": "entry record",
-                                "reason": "could not be written back"})
+        # ALWAYS advance the build revision, even with nothing to write. A
+        # restore changes the page grid exactly as a delete does, and the grid
+        # is what page_revision guards — leaving the token untouched (which it
+        # was whenever `changed` came out empty: a secondary source, or a
+        # primary with no title pages) let a client holding the post-delete
+        # token delete against numbering that had silently reverted, hitting a
+        # different physical page with no conflict raised. The delete path
+        # carries the same invariant via `if changed or build_persisted`.
+        try:
+            _builds_apply(build_id, changed)
+        except OSError:
+            skipped.append({"file": "entry record",
+                            "reason": "could not be written back"})
 
     # the caller (api_trash_restore) owns marking the row restored
     return {"ok": True, "restored": restored, "skipped": skipped,
@@ -6333,12 +6352,19 @@ def _remapped_page_remark_value(value, old_page: int, new_page: int):
 
 
 def _remap_page_attention_references(build_id: str, source_id: str,
-                                     removed: list[int]) -> list[str]:
+                                     removed: list[int],
+                                     dropped: dict | None = None) -> list[str]:
     """Keep personal page marks and shared threads bound to physical pages.
 
     Deleted personal marks disappear with their target. Deleted shared threads
     become unique, unroutable tombstones so their comments remain reachable
     without ever attaching to the page that shifted into the old number.
+
+    ``dropped`` collects the personal marks this drops, keyed by bucket, so a
+    restore can put them back: a surviving mark can be shifted back
+    arithmetically, but one whose page was deleted is popped with no record and
+    would be gone for good. Threads need no snapshot — the tombstone carries
+    its own original ref (see _unremap_page_attention_references).
     """
     removed = sorted({int(page) for page in removed if int(page) > 0})
     if not removed:
@@ -6353,7 +6379,7 @@ def _remap_page_attention_references(build_id: str, source_id: str,
             meta = settings.get("remarksMeta") if isinstance(settings, dict) else None
             dirty = False
 
-            def remap_map(values: dict | None) -> bool:
+            def remap_map(values: dict | None, bucket: str = "") -> bool:
                 if not isinstance(values, dict):
                     return False
                 moves: list[tuple[str, str | None, object]] = []
@@ -6368,15 +6394,20 @@ def _remap_page_attention_references(build_id: str, source_id: str,
                                 value = _remapped_page_remark_value(
                                     value, old_parts[2], new_parts[2])
                         moves.append((key, new_key, value))
-                for old_key, _, _ in moves:
+                for old_key, new_key, value in moves:
+                    # a mark whose page is going away is popped with no record;
+                    # keep a copy so the trash can put it back
+                    if new_key is None and dropped is not None and bucket:
+                        dropped.setdefault(bucket, {})[old_key] = \
+                            values.get(old_key)
                     values.pop(old_key, None)
                 for _, new_key, value in moves:
                     if new_key:
                         values[new_key] = value
                 return bool(moves)
 
-            dirty = remap_map(attention) or dirty
-            dirty = remap_map(meta) or dirty
+            dirty = remap_map(attention, "attention") or dirty
+            dirty = remap_map(meta, "meta") or dirty
             if dirty:
                 client["updated_at"] = datetime.now(timezone.utc).isoformat(
                     timespec="seconds")
@@ -6421,6 +6452,118 @@ def _remap_page_attention_references(build_id: str, source_id: str,
     except Exception as exc:
         log.warning("could not remap page review references: %s", exc)
         warnings.append("shared review threads could not be renumbered")
+    return warnings
+
+
+def _unremap_page_attention_references(build_id: str, source_id: str,
+                                       removed: list[int], pages_before: int,
+                                       dropped: dict | None = None) -> list[str]:
+    """Undo _remap_page_attention_references after a page restore.
+
+    Without this a restore rebuilt the PDF and its text but left every mark and
+    thread past the deletion point one page off, and reported full success.
+
+    Two halves. A reference that SURVIVED the delete shifts back
+    arithmetically: the page now numbered N was originally the Nth survivor, so
+    the map is just the survivor list. A reference whose page was DELETED needs
+    its pre-delete form — for a personal mark that comes from the trash payload
+    (it was popped with no record), and for a thread from the tombstone itself,
+    which was built as "page-deleted:<original ref tail>|<review id>".
+    """
+    removed_set = {int(p) for p in removed if int(p) > 0}
+    survivors = [p for p in range(1, int(pages_before) + 1)
+                 if p not in removed_set]
+    warnings: list[str] = []
+
+    def original(page: int) -> int | None:
+        return survivors[page - 1] if 1 <= page <= len(survivors) else None
+
+    try:
+        with _client_state_lock:
+            client = lib.load_json(lib.CLIENT_STATE_PATH, {})
+            settings = client.get("settings")
+            buckets = {
+                "attention": client.get("attention"),
+                "meta": settings.get("remarksMeta")
+                if isinstance(settings, dict) else None,
+            }
+            dirty = False
+            for name, values in buckets.items():
+                if not isinstance(values, dict):
+                    continue
+                moves = []
+                for key, value in list(values.items()):
+                    parts = _page_remark_ref_parts(key)
+                    if not parts or parts[:2] != (str(build_id),
+                                                  str(source_id or "primary")):
+                        continue
+                    was = original(parts[2])
+                    if was is None or was == parts[2]:
+                        continue
+                    moves.append((key, f"page:{parts[3]}|{parts[4]}|{was}",
+                                  _remapped_page_remark_value(
+                                      value, parts[2], was)))
+                for old_key, _, _ in moves:
+                    values.pop(old_key, None)
+                for _, new_key, value in moves:
+                    values[new_key] = value
+                # then the marks the delete dropped outright, straight back at
+                # their original keys — they were never shifted, just removed
+                for key, value in ((dropped or {}).get(name) or {}).items():
+                    values.setdefault(key, value)
+                    dirty = True
+                dirty = bool(moves) or dirty
+            if dirty:
+                client["updated_at"] = datetime.now(timezone.utc).isoformat(
+                    timespec="seconds")
+                lib.save_json(lib.CLIENT_STATE_PATH, client)
+    except Exception as exc:
+        log.warning("could not restore page attention state: %s", exc)
+        warnings.append("personal attention marks could not be put back")
+
+    try:
+        with _reviews_lock:
+            reviews = lib.load_json(REVIEWS_PATH, {})
+            dirty = False
+            for review in reviews.values():
+                if not isinstance(review, dict) or review.get("kind") != "key":
+                    continue
+                ref = str(review.get("ref") or "")
+                new_ref = None
+                if ref.startswith("page-deleted:"):
+                    # "page-deleted:<build>|<source>|<page>|<quoted review id>"
+                    tail = ref[len("page-deleted:"):].rsplit("|", 1)[0]
+                    cand = "page:" + tail
+                    parts = _page_remark_ref_parts(cand)
+                    if parts and parts[:2] == (str(build_id),
+                                               str(source_id or "primary")) \
+                            and parts[2] in removed_set:
+                        new_ref = cand
+                        label = str(review.get("label") or "")
+                        if label.endswith(" · removed"):
+                            review["label"] = label[:-len(" · removed")]
+                else:
+                    parts = _page_remark_ref_parts(ref)
+                    if parts and parts[:2] == (str(build_id),
+                                               str(source_id or "primary")):
+                        was = original(parts[2])
+                        if was is not None and was != parts[2]:
+                            new_ref = f"page:{parts[3]}|{parts[4]}|{was}"
+                            review["label"] = re.sub(
+                                r"(\s·\s[Pp]age\s+)" + str(parts[2]) +
+                                r"(?=\s·\sSource\b|$)",
+                                lambda m: m.group(1) + str(was),
+                                str(review.get("label") or ""))
+                if not new_ref:
+                    continue
+                review["ref"] = new_ref
+                review["key"] = "key:" + new_ref
+                dirty = True
+            if dirty:
+                lib.save_json(REVIEWS_PATH, reviews)
+    except Exception as exc:
+        log.warning("could not restore page review references: %s", exc)
+        warnings.append("shared review threads could not be put back")
     return warnings
 
 
@@ -6567,12 +6710,6 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
     tmp = pdf.with_suffix(".del.tmp")
     with open(tmp, "wb") as fh:
         writer.write(fh)
-    writer = PdfWriter()
-    for i in keep:
-        writer.add_page(reader.pages[i])
-    tmp = pdf.with_suffix(".del.tmp")
-    with open(tmp, "wb") as fh:
-        writer.write(fh)
     # Record the PDF that is actually being edited. "primary" is also
     # _src_key_for_path's catch-all for a resolve error or no match at all, so
     # verify rather than assume: pointing the row at pdf_file for a file that
@@ -6706,8 +6843,16 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
         # try/except of its own, so going last means a failure here cannot leave
         # the others half-done, and everything snapshotted before it is already
         # in the trash row by the time the finally folds it in.
+        att_dropped: dict = {}
         warnings.extend(_remap_page_attention_references(
-            build_id, src_key, actual_pages))
+            build_id, src_key, actual_pages, dropped=att_dropped))
+        if att_dropped:
+            # marks the remap popped outright; restore cannot derive these
+            try:
+                lib.save_json(tdir / "attention.json", att_dropped)
+                tfiles.append("attention.json")
+            except OSError:
+                warnings.append("attention marks could not be kept for undo")
         # title pages are counted on the PRIMARY PDF; a secondary's deletions
         # don't move them. The pre-remap values are already in the row committed
         # above (b has not been rewritten yet at this point).
@@ -6742,10 +6887,17 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
                     b["updated_at"] = revision
                 else:
                     warnings.append("build metadata could not be saved")
+                    changed = {}
             except Exception as exc:
                 log.warning("could not persist build metadata after page deletion: %s",
                             exc)
                 warnings.append("build metadata could not be saved")
+                # the *_after values recorded from `changed` are restore's
+                # "is this still what the delete left?" test. If the save never
+                # landed, the live field still holds the PRE-delete value, so
+                # recording an _after that only ever existed in memory would
+                # make every restore report a phantom "edited since the delete".
+                changed = {}
     finally:
         # Fold the collateral snapshots into the row registered above, stamping
         # each written-back-able one with the POST-delete (size, mtime) of its

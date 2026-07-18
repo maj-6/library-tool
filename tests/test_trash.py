@@ -503,3 +503,77 @@ def test_delete_refuses_a_pdf_from_another_entry(data_root, client):
     assert r.status_code == 409
     assert r.get_json()["conflict"] == "pdf_not_attached"
     assert _page_count(pdf_a) == 3 and _page_count(pdf_b) == 5   # both untouched
+
+
+def _ref(bid, page, source="primary"):
+    return f"page:{bid}|{source}|{page}"
+
+
+def test_restore_puts_page_marks_and_threads_back(data_root, client):
+    """The delete shifts attention marks and review threads onto the new
+    numbering and tombstones the ones whose page went away. A restore that
+    rebuilt the pages and the text but left these one page off would be a
+    half-restore reported as a success."""
+    bid = "trash018"
+    pdf = _seed(bid, data_root)
+    server.lib.save_json(server.lib.CLIENT_STATE_PATH, {"attention": {
+        _ref(bid, 1): {"label": "kept · page 1"},
+        _ref(bid, 2): {"label": "doomed · page 2"},
+        _ref(bid, 3): {"label": "shifts · page 3"},
+    }})
+    server.lib.save_json(server.REVIEWS_PATH, {
+        "r-keep": {"id": "r-keep", "kind": "key", "ref": _ref(bid, 3),
+                   "label": "Thread · Page 3"},
+        "r-gone": {"id": "r-gone", "kind": "key", "ref": _ref(bid, 2),
+                   "label": "Thread · Page 2"},
+    })
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+
+    tid = server._apply_page_deletion(bid, builds, pdf, [2])["trash_id"]
+    att = server.lib.load_json(server.lib.CLIENT_STATE_PATH, {})["attention"]
+    # page 2's mark is dropped and page 3's shifts INTO key 2 behind it
+    assert set(att) == {_ref(bid, 1), _ref(bid, 2)}
+    assert att[_ref(bid, 2)]["label"].startswith("shifts")
+    reviews = server.lib.load_json(server.REVIEWS_PATH, {})
+    assert reviews["r-keep"]["ref"] == _ref(bid, 2)      # 3 -> 2
+    assert reviews["r-gone"]["ref"].startswith("page-deleted:")
+
+    assert client.post("/api/trash/restore", json={"id": tid}).get_json()["ok"]
+
+    att = server.lib.load_json(server.lib.CLIENT_STATE_PATH, {})["attention"]
+    assert att[_ref(bid, 1)]["label"] == "kept · page 1"
+    assert att[_ref(bid, 3)]["label"].endswith("page 3")   # shifted back
+    assert att[_ref(bid, 2)]["label"] == "doomed · page 2"  # dropped, restored
+    reviews = server.lib.load_json(server.REVIEWS_PATH, {})
+    assert reviews["r-keep"]["ref"] == _ref(bid, 3)        # back to 3
+    assert reviews["r-gone"]["ref"] == _ref(bid, 2)        # un-tombstoned
+    assert not reviews["r-gone"]["label"].endswith(" · removed")
+
+
+def test_restore_advances_the_page_revision_token(data_root, client):
+    """A restore changes the page grid exactly as a delete does, and the grid
+    is what page_revision guards. Leaving the token untouched let a client
+    holding the post-delete token delete against numbering that had silently
+    reverted — hitting a different physical page with no conflict raised."""
+    bid = "trash019"
+    pdf = _seed(bid, data_root)
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+    builds[bid].pop("title_pages", None)     # so the delete's `changed` is {}
+    server.BUILDS_PATH.write_text(json.dumps(builds), encoding="utf-8")
+
+    tid = server._apply_page_deletion(bid, builds, pdf, [2])["trash_id"]
+    after_delete = server.lib.load_json(
+        server.BUILDS_PATH, {})[bid].get("updated_at")
+
+    assert client.post("/api/trash/restore", json={"id": tid}).get_json()["ok"]
+    after_restore = server.lib.load_json(
+        server.BUILDS_PATH, {})[bid].get("updated_at")
+    assert after_restore and after_restore != after_delete
+
+    # a client still holding the post-delete token must now be refused
+    r = client.post("/api/pdf/pages/delete",
+                    json={"build_id": bid, "pdf": str(pdf), "pages": [2],
+                          "page_revision": str(after_delete or "")})
+    assert r.status_code == 409
+    assert r.get_json()["conflict"] == "stale_page_revision"
+    assert _page_count(pdf) == 3                      # nothing deleted

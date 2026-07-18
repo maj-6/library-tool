@@ -398,7 +398,7 @@ def test_page_deletion_returns_reference_remap_warnings(data_root, monkeypatch):
     server.BUILDS_PATH.write_text(json.dumps(builds), encoding="utf-8")
     monkeypatch.setattr(
         server, "_remap_page_attention_references",
-        lambda *_args: ["shared review threads could not be renumbered"])
+        lambda *_args, **_kw: ["shared review threads could not be renumbered"])
 
     result = server._apply_page_deletion(bid, builds, pdf, [2])
 
