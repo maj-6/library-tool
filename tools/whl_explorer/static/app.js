@@ -6770,9 +6770,26 @@ async function procMarkPrimary(target, altId) {
     const r = whlRowByIdx(idx);
     if (!r) return;
     for (const k of keys) displaced[k] = String(r[k] || "");
+    // A value that matches the CSV base is a correction CLEARED, not a new
+    // correction — otherwise restoring a superseded original would re-flag
+    // untouched fields and the row would read EDITED forever. (Added rows,
+    // idx < 0, have no CSV base — everything is a set.)
+    const setFields = {}, clear = [];
+    for (const k of keys) {
+      const base = (r.edited_fields || []).includes(k)
+        ? String((r.orig || {})[k] || "") : String(r[k] || "");
+      if (idx >= 0 && !r.added && String(fields[k]) === base) clear.push(k);
+      else setFields[k] = fields[k];
+    }
+    const body = { idx };
+    if (Object.keys(setFields).length) body.fields = setFields;
+    if (clear.length) body.clear_fields = clear;
     const before = whlFieldSnaps(r, keys);
-    if (await whlPost({ idx, fields })) {
-      pushWhlFieldsOp(`mark primary WHL ${String(r.title || idx).slice(0, 24)}`, idx, before, fields);
+    if (await whlPost(body)) {
+      pushOp(`mark primary WHL ${String(r.title || idx).slice(0, 24)}`,
+        () => whlApplySnaps(idx, before),
+        () => whlPost(body),
+        { kind: "whl", idx, beforeSnaps: before });
       applied = true;
     }
   } else {
