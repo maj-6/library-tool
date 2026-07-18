@@ -282,8 +282,21 @@ def test_client_and_server_agree_on_local_only_secret_keys():
     server = SERVER.split("_SECRET_KEYS = frozenset({", 1)[1].split("})", 1)[0]
     assert set(re.findall(r'"([A-Za-z0-9_]+)"', client)) == set(
         re.findall(r'"([A-Za-z0-9_]+)"', server))
-    assert {"embedKey", "imgGenKey"} <= set(re.findall(
+    assert {"embedKey", "imgGenKey", "ocrAzureKey"} <= set(re.findall(
         r'"([A-Za-z0-9_]+)"', client))
+
+
+def test_page_deletion_surfaces_reference_remap_warnings():
+    delete_flow = _function("deleteSelectedPages", "titlePageSet")
+    assert "data.warnings" in delete_flow
+    assert "REVIEW WARNING" in delete_flow
+    assert "data.backup" in delete_flow
+    assert "Review those links before continuing" in delete_flow
+
+    folder_sync = SERVER.split("def api_build_folder_sync", 1)[1].split(
+        "@app.route", 1)[0]
+    assert 'deletion.get("warnings")' in folder_sync
+    assert "page deletion warning" in folder_sync
 
 
 def test_shared_popup_geometry_uses_visual_pixels_at_non_default_scale():

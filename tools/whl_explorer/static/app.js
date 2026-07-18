@@ -47,9 +47,9 @@ const VIEW_STATE_KEYS = new Set([
 // while the server accepted them, so persistSecrets filtered them out of a
 // save and partitionSettings let imgGenKey leak into localStorage/client_state.
 const SECRET_KEYS = new Set([
-  "aiKey", "embedKey", "mistralKey", "ocrClaudeKey", "ocrAwsKey",
-  "ocrAwsSecret", "supabaseKey", "supabaseAnonKey", "r2KeyId", "r2Secret",
-  "gsKeyFile", "imgGenKey",
+  "aiKey", "embedKey", "mistralKey", "ocrClaudeKey", "ocrAzureKey",
+  "ocrAwsKey", "ocrAwsSecret", "supabaseKey", "supabaseAnonKey", "r2KeyId",
+  "r2Secret", "gsKeyFile", "imgGenKey",
 ]);
 function partitionSettings(s) {
   const prefs = {}, view = {};
@@ -3778,6 +3778,12 @@ function pollDbStatus() {
 
 async function resetSettingsToDefaults() {
   const fresh = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
+  // Attention is a separate top-level client-state field, but the durable
+  // labels/categories for keyed page, source, and publication remarks live in
+  // settings. Preserve that metadata so resetting interface preferences does
+  // not turn otherwise intact marks into anonymous or stale-looking entries.
+  fresh.remarksMeta = JSON.parse(JSON.stringify(
+    (state.settings && state.settings.remarksMeta) || {}));
   const { prefs } = partitionSettings(fresh);
   // Replace only the settings blob. Checked books and attention marks are
   // separate top-level client-state fields and must survive an interface reset.
@@ -9661,6 +9667,12 @@ async function markSmartScanPdfs(refs) {
 
 function onSmartScanMarkerKey(ev) {
   if (el("smartscan-mark-overlay").hidden) return;
+  // Space and Enter belong to the focused control first. The marker explicitly
+  // focuses Cancel while loading and Mark page when ready; stealing those keys
+  // here would toggle/confirm a different action than the button names.
+  const nativeAction = ev.target && typeof ev.target.closest === "function"
+    ? ev.target.closest("button, a[href], input, select, textarea") : null;
+  if (nativeAction && (ev.key === " " || ev.key === "Enter")) return;
   if (ev.key === "ArrowLeft") {
     ev.preventDefault(); smartScanMarkerGo(smartScanMarker.page - 1);
   } else if (ev.key === "ArrowRight") {
@@ -19691,6 +19703,9 @@ async function deleteSelectedPages() {
       el("ocr-msg").textContent = data.error || "Page deletion failed";
       return;
     }
+    const remapWarnings = Array.isArray(data.warnings)
+      ? data.warnings.map((warning) => String(warning || "").trim()).filter(Boolean)
+      : [];
     if (data.build) state.builds[bid] = data.build;
     if (data.page_remap && Array.isArray(data.page_remap.deleted)) {
       remapPageRemarkKeys(bid, data.page_remap.source,
@@ -19707,8 +19722,13 @@ async function deleteSelectedPages() {
     for (const k of [...ocrState.analysisTags.keys()]) {
       if (k.startsWith(bid + ":")) ocrState.analysisTags.delete(k);
     }
-    status(`PAGES DELETED :: ${pages.length} (backup: ${data.backup})`);
-    el("ocr-msg").textContent = "";
+    status(`PAGES DELETED :: ${pages.length} (backup: ${data.backup})` +
+      (data.partial || remapWarnings.length ? " :: PARTIAL — REVIEW WARNING" : ""));
+    el("ocr-msg").textContent = remapWarnings.length
+      ? `Pages were deleted (backup: ${data.backup}), but ` +
+        `${remapWarnings.join("; ")}. ` +
+        "Review those links before continuing."
+      : "";
     // the PDF changed on disk: page counts, dims, word boxes, and the
     // renumbered region records are all stale — a cache hit here would
     // paint the deleted page's regions beside the shifted page image

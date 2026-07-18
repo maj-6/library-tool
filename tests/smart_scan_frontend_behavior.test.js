@@ -91,3 +91,39 @@ test("manual marker is keyboard-driven and saves a compact PDF before run", () =
   );
   assert.ok(run.includes("markSmartScanPdfs(refs)"));
 });
+
+test("manual marker preserves native Space and Enter on focused controls", () => {
+  const calls = [];
+  const keyContext = vm.createContext({
+    el: () => ({ hidden: false }),
+    smartScanMarker: { page: 3, busy: false },
+    smartScanMarkerGo: (page) => calls.push(["go", page]),
+    smartScanMarkerToggle: () => calls.push(["toggle"]),
+    confirmSmartScanMarker: () => calls.push(["confirm"]),
+    closeSmartScanMarker: () => calls.push(["close"]),
+  });
+  vm.runInContext([
+    declaration("onSmartScanMarkerKey"),
+    "this.onKey = onSmartScanMarkerKey;",
+  ].join("\n"), keyContext);
+
+  let prevented = false;
+  const focusedButton = { closest: () => ({ tagName: "BUTTON" }) };
+  keyContext.onKey({
+    key: " ", target: focusedButton,
+    preventDefault: () => { prevented = true; },
+  });
+  keyContext.onKey({
+    key: "Enter", target: focusedButton,
+    preventDefault: () => { prevented = true; },
+  });
+  assert.equal(prevented, false);
+  assert.deepEqual(calls, []);
+
+  keyContext.onKey({
+    key: " ", target: { closest: () => null },
+    preventDefault: () => { prevented = true; },
+  });
+  assert.equal(prevented, true);
+  assert.deepEqual(calls, [["toggle"]]);
+});

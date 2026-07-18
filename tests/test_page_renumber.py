@@ -179,6 +179,8 @@ def test_apply_page_deletion_end_to_end(data_root):
     result = server._apply_page_deletion(bid, builds, pdf, [2])
 
     assert result["deleted"] == [2]
+    assert "partial" not in result
+    assert "warnings" not in result
     assert result["pages"] == 2
     assert result["backup"] == "book.bak.pdf"
     assert result["build"]["title"] == "Test"
@@ -337,6 +339,88 @@ def test_page_deletion_remaps_attention_metadata_and_review_threads(data_root):
     assert reviews["survivor"]["id"] == "survivor"
     assert reviews["survivor"]["status"] == "open"
     assert reviews["survivor"]["comments"] == comments
+
+
+def test_page_remap_reports_attention_and_review_save_failures(
+        data_root, monkeypatch):
+    """A rewritten PDF must not hide a failed reference-remap write."""
+    bid = "remark-save-failure"
+    key = f"page:{bid}|primary|2"
+    server.lib.save_json(server.lib.CLIENT_STATE_PATH, {
+        "attention": {key: "keep visible"},
+        "settings": {"remarksMeta": {key: {"label": "Page 2"}}},
+    })
+    server.lib.save_json(server.REVIEWS_PATH, {
+        "thread": {
+            "id": "thread", "kind": "key", "ref": key,
+            "key": "key:" + key, "label": "Page 2", "comments": [],
+        },
+    })
+    real_save = server.lib.save_json
+    failed = {server.lib.CLIENT_STATE_PATH, server.REVIEWS_PATH}
+
+    def refuse_remap(path, value):
+        if Path(path) in failed:
+            raise OSError("read-only test store")
+        return real_save(path, value)
+
+    monkeypatch.setattr(server.lib, "save_json", refuse_remap)
+    warnings = server._remap_page_attention_references(
+        bid, "primary", [1])
+
+    assert warnings == [
+        "personal attention marks could not be renumbered",
+        "shared review threads could not be renumbered",
+    ]
+    assert server.lib.load_json(server.lib.CLIENT_STATE_PATH, {})[
+        "attention"] == {key: "keep visible"}
+    assert server.lib.load_json(server.REVIEWS_PATH, {})["thread"]["ref"] == key
+
+
+def test_page_deletion_returns_reference_remap_warnings(data_root, monkeypatch):
+    bid = "remark-warning-result"
+    pdf = data_root / "remark-warning-result.pdf"
+    _make_pdf(pdf, 2)
+    builds = {bid: {"title": "Warning Herbal"}}
+    server.BUILDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    server.BUILDS_PATH.write_text(json.dumps(builds), encoding="utf-8")
+    monkeypatch.setattr(
+        server, "_remap_page_attention_references",
+        lambda *_args: ["shared review threads could not be renumbered"])
+
+    result = server._apply_page_deletion(bid, builds, pdf, [2])
+
+    assert result["warnings"] == [
+        "shared review threads could not be renumbered"]
+    assert result["partial"] is True
+    assert _page_count(pdf) == 1
+
+
+def test_page_delete_endpoint_returns_partial_after_post_commit_failure(
+        data_root, client, monkeypatch):
+    bid = "layout-warning-result"
+    pdf = data_root / "layout-warning-result.pdf"
+    _make_pdf(pdf, 2)
+    builds = {bid: {"id": bid, "title": "Layout Herbal",
+                    "pdf_file": str(pdf)}}
+    server.lib.save_json(server.BUILDS_PATH, builds)
+
+    def fail_layout(*_args):
+        raise OSError("read-only layout")
+
+    monkeypatch.setattr(server, "_renumber_layout_words", fail_layout)
+    response = client.post("/api/pdf/pages/delete", json={
+        "build_id": bid, "pdf": str(pdf), "pages": [2],
+    })
+    data = response.get_json()
+
+    assert response.status_code == 200
+    assert data["ok"] is True
+    assert data["partial"] is True
+    assert data["warnings"] == ["OCR page layout could not be renumbered"]
+    assert data["page_remap"] == {"source": "primary", "deleted": [2]}
+    assert _page_count(pdf) == 1
+    assert _page_count(pdf.with_suffix(".bak.pdf")) == 2
 
 
 def test_page_review_rejects_a_revision_from_before_deletion(

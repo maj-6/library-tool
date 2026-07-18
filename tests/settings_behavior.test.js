@@ -70,7 +70,7 @@ test("fixed popups convert visual cursor coordinates through root zoom", () => {
   assert.ok(visualTop + 120 <= 600 - 12);
 });
 
-test("settings partition keeps embedding and image-generation keys out of storage", () => {
+test("settings partition keeps current and retired keys out of storage", () => {
   const context = vm.createContext({});
   vm.runInContext([
     block("const VIEW_STATE_KEYS", "function partitionSettings"),
@@ -83,6 +83,7 @@ test("settings partition keeps embedding and image-generation keys out of storag
     topTable: "whl",
     embedKey: "embedding-secret",
     imgGenKey: "image-secret",
+    ocrAzureKey: "retired-secret",
   }));
   assert.deepEqual(result.prefs, { theme: "sage" });
   assert.deepEqual(result.view, { topTable: "whl" });
@@ -143,9 +144,13 @@ test("reset replaces server preferences before clearing cache and reloading", as
     DEFAULT_SETTINGS: {
       theme: "",
       topTable: "checked",
+      remarksMeta: {},
       embedKey: "",
       imgGenKey: "",
     },
+    state: { settings: { remarksMeta: {
+      "page:book%3Aa:primary:2": { label: "Herbal · page 2", category: "OCR" },
+    } } },
     SETTINGS_KEY: "settings",
     VIEWSTATE_KEY: "view",
     localStorage: { removeItem: (key) => removed.push(key) },
@@ -166,7 +171,12 @@ test("reset replaces server preferences before clearing cache and reloading", as
   assert.equal(calls.length, 1);
   assert.equal(calls[0][0], "/api/client_state");
   assert.equal(calls[0][1].method, "PUT");
-  assert.deepEqual(JSON.parse(calls[0][1].body), { settings: { theme: "" } });
+  assert.deepEqual(JSON.parse(calls[0][1].body), { settings: {
+    theme: "",
+    remarksMeta: {
+      "page:book%3Aa:primary:2": { label: "Herbal · page 2", category: "OCR" },
+    },
+  } });
   assert.deepEqual(removed, ["settings", "view"]);
   assert.equal(reloaded, true);
 });
