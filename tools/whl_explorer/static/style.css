@@ -601,8 +601,8 @@ body[data-theme="porcelain"] {
   --row-checked: #dfeaf0;
   --row-manual: #e5efe3;
   --cyan: #21707e;        /* glaze teal (focus / links) */
-  --green: #34795c;
-  --amber: #8f6c26;
+  --green: #2f6f54;       /* both hold >=4.5 as text on --face */
+  --amber: #7c5d1e;
   --red: #a63d33;
   --blue: #3a5f8a;        /* cobalt band */
   --blue2: #5c7ea6;
@@ -694,10 +694,11 @@ body[data-theme="slate"] {
   --row-hover: #2e333a;
   --row-checked: #253540;
   --row-manual: #2b3529;
-  --cyan: #79c2ba;         /* accents brightened to hold >=4.5 as text on --face */
-  --green: #7db36e;
+  --cyan: #8bcdc5;         /* accents brightened to hold >=4.5 as text even on
+                              --face-hi (chips, pane bars carry accent text) */
+  --green: #98c989;
   --amber: #cfa95e;
-  --red: #dd9184;
+  --red: #e8a396;
   --blue: #97aecb;         /* chalk-blue accent for tabs and bands */
   --blue2: #8fa5c0;
   --radius: 4px;
@@ -710,11 +711,15 @@ body[data-theme="slate"] .cad-btn {
 }
 body[data-theme="slate"] .cad-btn:hover { background: #4a525c; border-color: #626b76; }
 body[data-theme="slate"] .cad-btn:active { background: #383f47; }
-/* danger text needs an extra step of light on the dim button face (4.5:1) */
-body[data-theme="slate"] .cad-btn.danger { color: #eaa89b; }
+/* danger text needs an extra step of light on the dim button face — enough
+   to hold 4.5:1 even on the lighter :hover face */
+body[data-theme="slate"] .cad-btn.danger { color: #f2b9ae; }
+/* the primary danger fill is the light --red; its label takes dark ink */
+body[data-theme="slate"] .cad-btn.primary.danger,
+body[data-theme="slate"] .cad-btn.primary.danger:hover { color: #2a1511; }
 body[data-theme="slate"] .cad-input,
 body[data-theme="slate"] .cell-edit,
-body[data-theme="slate"] .md-live { border: 1px solid #4f575f; }
+body[data-theme="slate"] .md-live { border: 1px solid #8a94a2; }  /* 3.4:1 vs --face — the border locates the field */
 body[data-theme="slate"] .cad-input:focus,
 body[data-theme="slate"] .cell-edit:focus { border-color: var(--cyan); }
 body[data-theme="slate"] .pane-tab {
@@ -774,6 +779,30 @@ body[data-theme="slate"] ::-webkit-scrollbar-thumb {
   background: #4c545e; border-radius: 5px; border: 2px solid #262a30;
 }
 body[data-theme="slate"] ::-webkit-scrollbar-thumb:hover { background: #5a636e; }
+/* hover rows paint the light chalk-blue behind them — white text (the base
+   rules' assumption of a dark accent) washes out; take dark ink instead */
+body[data-theme="slate"] .menu-item:hover:not(:disabled),
+body[data-theme="slate"] .fb-row:hover,
+body[data-theme="slate"] .ol-item:hover { color: #1d2226; }
+/* severity washes must DARKEN under the light ink, not lighten as the
+   translucent base mixes do over a light face */
+body[data-theme="slate"] #status-msg.err,
+body[data-theme="slate"] #auth-msg {
+  background: color-mix(in srgb, var(--amber) 24%, #23262b);
+}
+body[data-theme="slate"] #status-msg.crit {
+  background: color-mix(in srgb, var(--red) 26%, #23262b);
+}
+body[data-theme="slate"] #auth-msg.ok {
+  background: color-mix(in srgb, var(--green) 22%, #23262b);
+}
+/* the cross-theme --cr-* fills stay (semantic palette); on the dark canvas
+   the chip's BORDER carries the 1.4.11 boundary, so it steps up */
+body[data-theme="slate"] .cr-tag { border-color: #8a92a0; }
+/* resting bottom-tabs dim via color, not element opacity — the opacity
+   trick composites below 4.5:1 on the dim chrome */
+body[data-theme="slate"] .bottom-tab { opacity: 1; color: #b4bbc5; }
+body[data-theme="slate"] .bottom-tab:hover { color: var(--ink); }
 
 /* ===================== base ===================== */
 
@@ -1109,8 +1138,10 @@ body.desktop .win-controls { display: inline-flex; }
 .win-btn svg { width: 10px; height: 10px; display: block; }
 .win-btn svg rect, .win-btn svg path { stroke: currentColor; }
 .win-btn svg rect[fill]:not([fill="none"]) { fill: currentColor; }
-.win-btn:hover { background: rgba(20, 24, 28, 0.08); }
-.win-btn:active { background: rgba(20, 24, 28, 0.16); }
+/* ghost washes mix from --ink (not a hardcoded dark) so they stay
+   visible on Slate's dim chrome, where a near-black wash vanishes */
+.win-btn:hover { background: color-mix(in srgb, var(--ink) 8%, transparent); }
+.win-btn:active { background: color-mix(in srgb, var(--ink) 16%, transparent); }
 
 /* The frameless main-window controls sit directly on the title band, so they
    must read as part of it -- never as discrete faced buttons. The generic
@@ -1128,8 +1159,8 @@ body.desktop .win-controls { display: inline-flex; }
   border-radius: 0;
   color: inherit;
 }
-#titlebar .win-btn:hover { background: rgba(20, 24, 28, 0.08); }
-#titlebar .win-btn:active { background: rgba(20, 24, 28, 0.16); }
+#titlebar .win-btn:hover { background: color-mix(in srgb, var(--ink) 8%, transparent); }
+#titlebar .win-btn:active { background: color-mix(in srgb, var(--ink) 16%, transparent); }
 #titlebar .win-btn svg { width: 10px; height: 10px; }
 #titlebar .win-btn.win-close:hover { background: #e81123; color: #fff; }
 #titlebar .win-btn.win-close:active { background: #c50e1f; color: #fff; }
@@ -1160,7 +1191,10 @@ body.desktop .win-controls { display: inline-flex; }
    the #titlebar id beats the per-theme `.menu-btn` accent-colour overrides */
 #titlebar .menu-btn { color: var(--ink); }
 #titlebar .menu-btn:hover,
-#titlebar .menu-btn.active { background: rgba(20, 24, 28, 0.09); color: var(--ink); }
+#titlebar .menu-btn.active {
+  background: color-mix(in srgb, var(--ink) 9%, transparent);
+  color: var(--ink);
+}
 .menu-drop {
   position: absolute;
   top: 100%;
@@ -1268,6 +1302,9 @@ body.desktop .win-controls { display: inline-flex; }
   font: bold 10px var(--ui);
   letter-spacing: 0.5px;
   text-transform: uppercase;
+  /* the fallback letters are TEXT (4.5:1), not a glyph — dim less than
+     the inherited 62% icon color */
+  color: color-mix(in srgb, var(--ink) 85%, transparent);
 }
 #tabs .bar-spacer { flex: 1; }
 #tabs .tb-group {
@@ -1434,6 +1471,18 @@ body .cad-btn.primary.danger {
   align-items: center;
   justify-content: center;
 }
+/* the display rule above would otherwise defeat the UA's [hidden] —
+   state-hidden bar buttons (index rollback, assign-all, rework) must
+   stay gone; the #checked-toolbar arm outranks its id-weight sibling */
+.pane-bar > .cad-btn[hidden],
+.pane-bar .year-filter .cad-btn[hidden],
+#checked-toolbar > .cad-btn[hidden],
+.src-row > .cad-btn[hidden],
+.desc-label-row > .cad-btn[hidden],
+.mf-actions > .cad-btn[hidden],
+.ctl-join > .cad-btn[hidden] {
+  display: none;
+}
 
 /* --- joined field+button groups (.ctl-join) ------------------------------
    Wraps a text field and its action button(s) into one visual control:
@@ -1480,12 +1529,12 @@ body .cad-btn.quiet {
   box-shadow: none;
 }
 body .cad-btn.quiet:hover {
-  background: rgba(20, 24, 28, 0.07);
+  background: color-mix(in srgb, var(--ink) 7%, transparent);
   border-color: transparent;
   box-shadow: none;
 }
 body .cad-btn.quiet:active {
-  background: rgba(20, 24, 28, 0.14);
+  background: color-mix(in srgb, var(--ink) 14%, transparent);
   border-color: transparent;
   box-shadow: none;
   transform: none;
@@ -1904,8 +1953,8 @@ td .sc-wand { float: right; }
   cursor: pointer;
 }
 .win-close svg { width: 14px; height: 14px; display: block; }
-.win-close:hover { background: rgba(20, 24, 28, 0.09); }
-.win-close:active { background: rgba(20, 24, 28, 0.18); }
+.win-close:hover { background: color-mix(in srgb, var(--ink) 9%, transparent); }
+.win-close:active { background: color-mix(in srgb, var(--ink) 18%, transparent); }
 .win-close:focus-visible { outline: 2px solid var(--cyan); outline-offset: -2px; }
 /* footer shared by dialog windows: quiet actions left, primary rightmost */
 .dlg-actions {
@@ -3117,9 +3166,11 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 }
 #status-msg.err  { background: color-mix(in srgb, var(--amber) 34%, transparent); }
 #status-msg.crit { background: color-mix(in srgb, var(--red) 38%, transparent); }
-/* two ids: a theme may recolour the "> " prompt, and severity must outrank it */
-#statusbar #status-msg.err::before  { color: var(--amber); }
-#statusbar #status-msg.crit::before { color: var(--red); }
+/* two ids: a theme may recolour the "> " prompt, and severity must outrank
+   it. The prompt stays --ink — the tint alone carries severity; an
+   accent-on-its-own-wash prompt bottomed out near 2.7:1 in every theme. */
+#statusbar #status-msg.err::before,
+#statusbar #status-msg.crit::before { color: var(--ink); }
 
 .foot-right { display: flex; align-items: center; gap: 10px; }
 
@@ -3414,8 +3465,15 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 /* wrapping breaks lines on the flex base size, and an input's automatic
    minimum is its ~130px intrinsic width — the explicit 60px floor + basis let
    both inputs give ground so the trailing save button stays on the row at
-   1280px; grow restores the full 130px whenever the bar has room */
+   1280px; grow restores the full 130px whenever the bar has room. The
+   .ctl-join wrappers are the bar's flex items now, so the same contract
+   lives on them (basis = input floor + the joined icon button). */
 #ocr-find, #ocr-replace { flex: 1 1 60px; min-width: 60px; max-width: 130px; }
+#ocr-mainpane .pane-bar .ctl-join {
+  flex: 1 1 84px;
+  min-width: 84px;
+  max-width: 156px;
+}
 .ocr-pagenav { display: inline-flex; align-items: center; gap: 4px; }
 #ocr-page-jump { width: 3.6em; text-align: center; }
 .ocr-keymap {

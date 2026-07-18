@@ -9283,7 +9283,13 @@ function renderAnPassages() {
   const st = (anPassages && anPassages.state) || {};
   const passages = (doc && doc.passages) || [];
   const excluded = new Set((doc && doc.excluded) || []);
-  el("an-psg-generate").textContent = doc ? "Regenerate" : "Generate";
+  // the button is icon-only (sparkle) — a textContent write would delete
+  // the injected SVG; the generate/regenerate state lives in the words
+  const gen = el("an-psg-generate");
+  gen.setAttribute("aria-label", doc ? "Regenerate passages" : "Generate passages");
+  gen.dataset.tip = doc
+    ? "Regenerate the search passages (the current split is replaced)"
+    : "Split the OCR text into search passages — structure first, token bounds second; sentences never break";
   const r = st.recipe || {};
   el("an-psg-recipe").textContent = r.child_min
     ? `${r.child_min}–${r.child_max} / ${r.parent_min}–${r.parent_max} tokens`
@@ -9319,10 +9325,10 @@ function renderAnPassages() {
       <td class="psg-toks">${toks}</td>
       <td class="psg-acts">
         <button class="cad-btn tiny icon-btn" data-psg-x="${esc(p.id)}" type="button"
-                aria-label="${out ? "Include" : "Exclude"}"
-                data-tip="${out ? "Include the passage in the corpus"
-                               : "Exclude the passage from the corpus"}">${
-          out ? ICONS.eye : ICONS.eyeoff}</button>
+                aria-label="${out ? "Excluded — include" : "Included — exclude"}"
+                data-tip="${out ? "Excluded from the corpus — click to include"
+                               : "In the corpus — click to exclude"}">${
+          out ? ICONS.eyeoff : ICONS.eye}</button>
         <button class="cad-btn tiny icon-btn" data-psg-split="${esc(p.id)}" type="button"
                 aria-label="Split"
                 data-tip="Split at the middle sentence boundary">${ICONS.scissors}</button>
