@@ -177,6 +177,41 @@ def test_copyright_tag_uses_independent_semantic_halves_and_accessible_text():
     assert "registration evidence (upper-left) / copyright status (lower-right)" in TEMPLATE
 
 
+def test_knowledge_gains_test_and_ask_tabs_with_their_contracts():
+    # the two new Knowledge views (#142/#143) sit between Passages and
+    # Relevance in the an-tabs strip
+    tabs = TEMPLATE.split('id="an-tabs"', 1)[1].split("</div>", 1)[0]
+    order = [t.split('"')[0] for t in tabs.split('data-antab="')[1:]]
+    assert order == ["an-overview", "an-cats", "an-trans", "an-notes",
+                     "an-passages", "an-test", "an-ask", "an-rel"]
+    # every evaluation-set kind is offered (D9's coverage list)
+    for kind in ("exact-phrase", "archaic-modern", "factual", "thematic",
+                 "tables", "cross-page", "multilingual", "unanswerable"):
+        assert f'value="{kind}"' in TEMPLATE
+    # the permanent provenance note under a drafted answer
+    assert "not medical advice" in TEMPLATE
+    assert 'id="an-ask-note"' in TEMPLATE
+
+
+def test_ask_answer_escapes_before_linkifying_citations():
+    body = _function("renderAskAnswer", "onAskAnswerClick")
+    # escape FIRST, then linkify [pN] — model text never lands as HTML
+    assert body.index("esc(text)") < body.index("replace(/\\[p(\\d+)\\]/g")
+    assert 'class="ask-cite"' in body
+    # abstention renders as a note, not an error
+    assert 'classList.toggle("ask-abstain", abstained)' in body
+
+
+def test_test_and_ask_share_one_evidence_row_idiom():
+    row = _function("evRowHtml", "renderAnEvalResults")
+    assert "data-ev-rel=" in row          # judgment toggles (Test)
+    assert "data-ev-row=" in row          # row identity (citation jumps)
+    snip = _function("evSnippetHtml", "evPageLabel")
+    assert snip.index("esc(s)") < snip.index("ev-mark")   # escape, then mark
+    ask = _function("renderAskEvidence", "onAskEvidenceClick")
+    assert "evRowHtml(r, null)" in ask    # same rows, no toggles
+
+
 def test_registration_client_cache_is_versioned_year_aware_and_retries_errors():
     assert 'const REG_KEY = "whl_reg_cache_v2"' in APP
     key = _function("regKey", "queueReg")

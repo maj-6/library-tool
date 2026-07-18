@@ -203,9 +203,9 @@ const state = {
                                 // tune to see how shrinking affects quality
     // page-view digit shortcuts: press N over a page to queue it
     ocrKeyMap: { 1: "tesseract", 2: "claude", 3: "textract", 4: "azure", 5: "openai" },
-    // master list -> Google Sheets publishing (Settings > Sync)
+    // master list -> Google Sheets publishing (Settings > Integrations)
     gsSpreadsheetId: "", gsKeyFile: "", gsSheetName: "Master list",
-    // cloud search + downloadable databases (Settings > Sync)
+    // cloud search + downloadable databases (Settings > Integrations)
     cloudSearchUrl: "",         // remote instance of this app; used when no local index
     dbUrls: {},                 // per-database download URLs (name -> url)
     uploadSplitH: null, pdfBrowseDir: "",
@@ -234,6 +234,10 @@ const state = {
     publishSidebarCollapsed: false,
     collapsed: {},                  // per-key collapsed state for makeCollapsible sections
     wbSideCollapsed: false,         // Workbench entries/artifacts sidebar folded away
+    // Settings > Theme editor: per-theme chrome token overrides,
+    // shape { [themeId]: { "--var": "value", … } }. Applied as inline body vars.
+    themeOverrides: {},
+    savedThemes: [],            // saved {name, base, overrides} snapshots (Theme editor)
   },
   editTarget: null,             // record open in the EDIT tab
   sort: { checked: null, whl: null },  // {key, dir} per top table
@@ -535,17 +539,20 @@ function bookParseChanged(a, b) {
 }
 
 function applyTheme() {
-  let t = state.settings.theme || "";
-  // migrate a retired id, and clamp anything unrecognised: an orphan id would
-  // otherwise stick in localStorage, sync to the server, and silently render
-  // the bare :root fallback while the picker showed nothing
-  if (t in LEGACY_THEMES) t = LEGACY_THEMES[t];
-  if (!THEMES.some(([id]) => id === t)) t = DEFAULT_THEME;
-  if (t !== state.settings.theme) {
-    state.settings.theme = t;
-    saveSettings();
+  let id = state.settings.theme || "";
+  // resolve the active theme: a custom theme keeps its id and renders on its
+  // base built-in's chrome; a legacy/unknown built-in id clamps to a survivor
+  // (an orphan id would otherwise stick in localStorage and render the bare
+  // :root fallback while the picker showed nothing)
+  if (!findCustom(id)) {
+    let t = id in LEGACY_THEMES ? LEGACY_THEMES[id] : id;
+    if (!THEMES.some(([x]) => x === t)) t = DEFAULT_THEME;
+    if (t !== state.settings.theme) { state.settings.theme = t; saveSettings(); }
+    id = t;
   }
-  document.body.dataset.theme = t;
+  document.body.dataset.theme = themeBase(id);   // base built-in supplies the CSS chrome
+  applyThemeOverrides();   // this theme's edits (custom.overrides or the built-in's), inline
+  applyFont();             // fonts too: a per-theme override, else the global default
 }
 
 // the one way to change theme: the Settings menu and the Appearance select
@@ -556,18 +563,106 @@ function setTheme(id) {
   applyTheme();
   const sel = el("theme-select");
   if (sel) sel.value = id;
+  const te = el("te-theme");
+  if (te) te.value = id;
+  // keep the Theme editor in step when it is open (it edits the active theme)
+  if (el("te-rows") && el("settings-overlay") && !el("settings-overlay").hidden)
+    renderThemeEditor();
 }
 
+// --- theme editor: per-theme chrome token overrides --------------------------
+// The editor writes CSS custom properties as inline styles on <body>. Inline
+// styles beat the body[data-theme] attribute selector, so an override wins over
+// the theme's own value -- the same mechanism applyFont() uses for --mono/--ui.
+// Overrides are keyed by theme id, so each theme carries its own edits and
+// switching theme swaps the whole set.
+
+// font vars are owned by applyFont(); the token editor must never touch them
+const THEME_FONT_VARS = new Set(["--mono", "--mono2", "--ui"]);
+// the vars currently applied inline -- tracked so the next apply can remove the
+// ones no longer overridden (a reset must clear the stale inline value)
+let _appliedThemeVars = [];
+
+function applyThemeOverrides() {
+  for (const name of _appliedThemeVars) document.body.style.removeProperty(name);
+  _appliedThemeVars = [];
+  const ov = activeOverrides();
+  for (const [name, val] of Object.entries(ov)) {
+    if (THEME_FONT_VARS.has(name) || val == null || val === "") continue;
+    document.body.style.setProperty(name, val);
+    _appliedThemeVars.push(name);
+  }
+}
+
+// fonts resolve per-theme-override first, then the global Appearance setting,
+// then the :root default. Kept out of applyThemeOverrides() (which owns the
+// non-font tokens) so the two never fight over the same inline body vars.
+const FONT_SETTING_VARS = [["fontUi", "--ui"], ["font", "--mono"], ["fontMono2", "--mono2"]];
 function applyFont() {
-  const f = state.settings.font || "";
-  if (f) document.body.style.setProperty("--mono", f);
-  else document.body.style.removeProperty("--mono");
-  const u = state.settings.fontUi || "";
-  if (u) document.body.style.setProperty("--ui", u);
-  else document.body.style.removeProperty("--ui");
-  const m2 = state.settings.fontMono2 || "";
-  if (m2) document.body.style.setProperty("--mono2", m2);
-  else document.body.style.removeProperty("--mono2");
+  const ov = activeOverrides();
+  for (const [key, cssVar] of FONT_SETTING_VARS) {
+    const val = ov[cssVar] || state.settings[key] || "";   // per-theme, else global, else default
+    if (val) document.body.style.setProperty(cssVar, val);
+    else document.body.style.removeProperty(cssVar);
+  }
+}
+
+// --- theme model: built-in themes (THEMES + CSS body[data-theme]) plus user
+// "custom" themes (settings.savedThemes: {id, name, base, overrides}). A custom
+// theme renders as its base built-in's chrome with its own overrides layered on
+// top, so it reuses the whole override/font machinery; only the pickers and the
+// Settings menu need to know custom themes exist.
+function customThemes() { return state.settings.savedThemes || []; }
+function findCustom(id) { return customThemes().find((t) => t && t.id === id); }
+// the built-in id whose CSS chrome a theme uses (a custom's base, else itself,
+// normalized through the legacy map and clamped to a real built-in)
+function themeBase(id) {
+  const c = findCustom(id);
+  let b = c ? c.base : id;
+  if (b in LEGACY_THEMES) b = LEGACY_THEMES[b];
+  return THEMES.some(([x]) => x === b) ? b : DEFAULT_THEME;
+}
+// the override map that IS a theme's edits (custom.overrides, or the built-in's
+// themeOverrides[base]); created on demand only when `create` is set
+function themeOverrideMap(id, create) {
+  const c = findCustom(id);
+  if (c) return c.overrides || (create ? (c.overrides = {}) : {});
+  const base = themeBase(id), o = state.settings.themeOverrides;
+  return o[base] || (create ? (o[base] = {}) : {});
+}
+function activeOverrides() { return themeOverrideMap(state.settings.theme, false); }
+function themeLabelOf(id) {
+  const c = findCustom(id);
+  return c ? c.name : (THEMES.find(([x]) => x === id) || [, id])[1];
+}
+// [id, label, isCustom] for every selectable theme (built-ins, then customs)
+function allThemes() {
+  return THEMES.map(([id, label]) => [id, label, false])
+    .concat(customThemes().map((t) => [t.id, t.name, true]));
+}
+function newThemeId() {
+  const used = new Set(customThemes().map((t) => t.id));
+  let n = 1; while (used.has("custom-" + n)) n++;
+  return "custom-" + n;
+}
+// fill a <select> with built-ins + custom themes (custom shown italic)
+function fillThemeSelect(sel) {
+  if (!sel) return;
+  sel.innerHTML = "";
+  for (const [id, label, custom] of allThemes()) {
+    const o = document.createElement("option");
+    o.value = id; o.textContent = label;
+    if (custom) o.style.fontStyle = "italic";
+    sel.appendChild(o);
+  }
+  sel.value = state.settings.theme;
+}
+// rebuild everywhere the theme list appears, after a custom theme is added,
+// renamed or removed
+function refreshThemePickers() {
+  fillThemeSelect(el("theme-select"));
+  fillThemeSelect(el("te-theme"));
+  buildThemeMenu();
 }
 
 // --- Experimental: interface sharpening ---------------------------------------
@@ -1271,6 +1366,25 @@ function normalizeSettings() {
   if (!state.settings.dbUrls || typeof state.settings.dbUrls !== "object")
     state.settings.dbUrls = {};
   state.settings.colVis = state.settings.colVis || {};
+  if (!state.settings.themeOverrides || typeof state.settings.themeOverrides !== "object")
+    state.settings.themeOverrides = {};
+  if (!Array.isArray(state.settings.savedThemes)) state.settings.savedThemes = [];
+  // custom themes need a stable unique id + a well-formed shape (older snapshots
+  // predate the id; a duplicate/missing id would collide in the picker)
+  state.settings.savedThemes = state.settings.savedThemes.filter((t) => t && typeof t === "object");
+  {
+    const used = new Set();
+    for (const t of state.settings.savedThemes) {
+      if (typeof t.id !== "string" || !t.id || used.has(t.id)) {
+        let n = 1; while (used.has("custom-" + n)) n++;
+        t.id = "custom-" + n;
+      }
+      used.add(t.id);
+      if (typeof t.name !== "string" || !t.name) t.name = "Custom";
+      if (typeof t.base !== "string") t.base = DEFAULT_THEME;
+      if (!t.overrides || typeof t.overrides !== "object") t.overrides = {};
+    }
+  }
   state.settings.colWidths = state.settings.colWidths || {};
   // migrate the old single-table column setting
   if (Object.keys(state.settings.checkedCols).length &&
@@ -2721,7 +2835,7 @@ function fillFontSelect(id, list, settingKey, apply) {
   };
 }
 
-// --- Settings > Sync: downloadable databases --------------------------------
+// --- Settings > Integrations: downloadable databases ------------------------
 
 let _dbPollTimer = null;
 
@@ -2949,14 +3063,7 @@ function renderSettings() {
 
   // APPEARANCE
   const themeSel = el("theme-select");
-  themeSel.innerHTML = "";
-  for (const [id, label] of THEMES) {
-    const o = document.createElement("option");
-    o.value = id;
-    o.textContent = label;
-    themeSel.appendChild(o);
-  }
-  themeSel.value = state.settings.theme;   // applyTheme() has already normalized it
+  fillThemeSelect(themeSel);               // built-ins + custom themes (custom italic)
   themeSel.onchange = () => setTheme(themeSel.value);
   const scaleSel = el("ui-scale-select");
   if (scaleSel) {
@@ -2968,6 +3075,7 @@ function renderSettings() {
   fillFontSelect("font-ui-select", FONT_CHOICES, "fontUi", applyFont);
   fillFontSelect("font-select", FONT_CHOICES, "font", applyFont);
   fillFontSelect("font-mono2-select", FONT_CHOICES, "fontMono2", applyFont);
+  renderThemeEditor();
 
   // AI
   for (const [id, k] of [["set-r2-account", "r2Account"], ["set-r2-bucket", "r2Bucket"],
@@ -3272,6 +3380,377 @@ function renderSettings() {
     };
   }
   syncPrereleaseEnabled();
+}
+
+// --- Settings > Theme editor --------------------------------------------------
+// The chrome tokens the editor exposes, grouped for the panel. Colours are
+// #rrggbb via the native <input type=color>; --radius/--border-w are px lengths
+// (slider + number); weights are a fixed dropdown. Font-family vars are
+// deliberately excluded -- they are global and stay under Appearance.
+const THEME_TOKENS = [
+  ["Accent & primary", [
+    { v: "--cyan",  l: "Accent (focus, links)", t: "color" },
+    { v: "--blue",  l: "Primary (title bar, tabs)", t: "color" },
+    { v: "--blue2", l: "Secondary", t: "color" },
+  ]],
+  ["Surfaces", [
+    { v: "--canvas",      l: "Canvas / paper", t: "color" },
+    { v: "--face",        l: "Panel face", t: "color" },
+    { v: "--face-hi",     l: "Panel raised", t: "color" },
+    { v: "--face-active", l: "Panel active", t: "color" },
+    { v: "--input-bg",    l: "Field background", t: "color" },
+  ]],
+  ["Text", [
+    { v: "--ink",       l: "Text", t: "color" },
+    { v: "--ink-light", l: "Text secondary", t: "color" },
+    { v: "--input-ink", l: "Field text", t: "color" },
+  ]],
+  ["Borders & rules", [
+    { v: "--face-sh",     l: "Border — light", t: "color" },
+    { v: "--face-sh2",    l: "Border — strong / muted text", t: "color" },
+    { v: "--canvas-line", l: "Table rules", t: "color" },
+  ]],
+  ["Rows", [
+    { v: "--row-hover",   l: "Row — hover", t: "color" },
+    { v: "--row-checked", l: "Row — checked", t: "color" },
+    { v: "--row-manual",  l: "Row — manual", t: "color" },
+  ]],
+  ["Status", [
+    { v: "--green", l: "Success", t: "color" },
+    { v: "--amber", l: "Warning", t: "color" },
+    { v: "--red",   l: "Error", t: "color" },
+  ]],
+  ["Geometry", [
+    { v: "--radius",   l: "Corner rounding", t: "len", min: 0, max: 14, step: 1, unit: "px", def: "4px" },
+    { v: "--border-w", l: "Border weight",   t: "len", min: 1, max: 3,  step: 1, unit: "px", def: "1px" },
+  ]],
+  ["Typography", [
+    { v: "--wt-ui",     l: "Interface weight", t: "wt", def: "400",
+      opts: [["400", "Regular"], ["500", "Medium"], ["600", "Semibold"]] },
+    { v: "--wt-strong", l: "Heading weight",   t: "wt", def: "700",
+      opts: [["400", "Regular"], ["500", "Medium"], ["600", "Semibold"], ["700", "Bold"]] },
+  ]],
+  // fonts are per-theme here; "Default" falls back to the global Appearance font
+  ["Fonts", [
+    { v: "--ui",    l: "Interface font", t: "font" },
+    { v: "--mono",  l: "Data / table font", t: "font" },
+    { v: "--mono2", l: "Tag / marker font", t: "font" },
+  ]],
+];
+
+// the exact set of tokens the editor owns -- the allowlist for imports
+const THEME_TOKEN_VARS = new Set(THEME_TOKENS.flatMap(([, toks]) => toks.map((t) => t.v)));
+// keep only known "--token": "safe value" pairs -- defends applyThemeOverrides and
+// the font path against a hand-edited or hostile imported theme file: reject
+// unknown keys, non-strings, empty/oversized values, and anything with CSS
+// punctuation (a url(...) in a token consumed by background: would phone home).
+function sanitizeOverrides(o) {
+  const out = {};
+  if (o && typeof o === "object" && !Array.isArray(o)) {
+    for (const [k, v] of Object.entries(o)) {
+      if (!THEME_TOKEN_VARS.has(k) || typeof v !== "string") continue;
+      const val = v.trim();
+      if (!val || val.length > 200) continue;
+      if (/[();]|url\(|@import|expression|javascript:/i.test(val)) continue;
+      out[k] = val;
+    }
+  }
+  return out;
+}
+
+// coerce a colour token to #rrggbb for <input type=color> (theme values are
+// authored as 6-digit hex, but be defensive about #rgb and stray whitespace)
+function themeHex(v) {
+  v = String(v == null ? "" : v).trim();
+  const m3 = /^#([0-9a-f])([0-9a-f])([0-9a-f])$/i.exec(v);
+  if (m3) return ("#" + m3[1] + m3[1] + m3[2] + m3[2] + m3[3] + m3[3]).toLowerCase();
+  return /^#[0-9a-f]{6}$/i.test(v) ? v.toLowerCase() : "#000000";
+}
+
+// Build the Theme editor panel for the active theme. Rebuilt whenever the
+// dialog opens or the theme changes; seeds each control from the effective
+// value (override if set, else the theme's own resolved value).
+function renderThemeEditor() {
+  const host = el("te-rows");
+  if (!host) return;
+  const activeId = state.settings.theme;
+  const custom = findCustom(activeId);
+  const base = themeBase(activeId);        // = document.body.dataset.theme; the base chrome
+
+  // theme picker: rebuilt each render (custom themes change); switching switches
+  // both the active theme and what the editor edits
+  const tsel = el("te-theme");
+  if (tsel) {
+    fillThemeSelect(tsel);
+    tsel.onchange = () => setTheme(tsel.value);
+  }
+
+  const cs = getComputedStyle(document.body);
+  const getOv = () => themeOverrideMap(activeId, true);    // create-on-demand edit target
+  const ov = themeOverrideMap(activeId, false);
+  // effective value: the override if present, else the theme's own value
+  // (resolved from CSS; synthetic tokens with no CSS value fall back to def)
+  const eff = (tok) => {
+    if (ov[tok.v] != null) return ov[tok.v];
+    const c = cs.getPropertyValue(tok.v).trim();
+    return c || tok.def || "";
+  };
+
+  function updateCount() {
+    const n = Object.keys(themeOverrideMap(activeId, false)).length;
+    const c = el("te-count");
+    if (c) {
+      c.textContent = n ? `${n} override${n === 1 ? "" : "s"}` : "No changes";
+      c.classList.toggle("dirty", n > 0);
+    }
+    const rb = el("te-reset-theme");
+    if (rb) rb.disabled = n === 0;
+  }
+
+  const setTok = (tok, val) => {
+    getOv()[tok.v] = val;
+    document.body.style.setProperty(tok.v, val);          // live preview
+    if (!_appliedThemeVars.includes(tok.v)) _appliedThemeVars.push(tok.v);
+    updateCount();
+  };
+  const resetTok = (tok) => {
+    delete themeOverrideMap(activeId, false)[tok.v];
+    // built-in: drop the now-empty override object. A custom theme is kept even
+    // with no overrides -- it is still a distinct theme (identical to its base).
+    if (!custom) {
+      const bm = state.settings.themeOverrides[base];
+      if (bm && !Object.keys(bm).length) delete state.settings.themeOverrides[base];
+    }
+    saveSettings();
+    applyThemeOverrides();
+    applyFont();               // a reset font token falls back to the global default
+    renderThemeEditor();
+  };
+
+  host.innerHTML = "";
+  for (const [group, toks] of THEME_TOKENS) {
+    const h = document.createElement("div");
+    h.className = "settings-subhead";
+    h.textContent = group;
+    host.appendChild(h);
+
+    for (const tok of toks) {
+      const lab = document.createElement("label");
+      lab.textContent = tok.l;
+      const ctl = document.createElement("div");
+      ctl.className = "te-ctl";
+
+      const rev = document.createElement("button");
+      rev.type = "button";
+      rev.className = "te-revert" + (ov[tok.v] != null ? " on" : "");
+      rev.textContent = "↺";                          // reset arrow
+      rev.title = "Reset to theme default";
+      rev.addEventListener("click", () => resetTok(tok));
+      const markDirty = () => rev.classList.add("on");
+
+      if (tok.t === "color") {
+        const hex = themeHex(eff(tok));
+        const sw = document.createElement("input");
+        sw.type = "color"; sw.className = "te-swatch"; sw.value = hex;
+        const tx = document.createElement("input");
+        tx.className = "cad-input te-hex"; tx.value = hex.toUpperCase();
+        tx.spellcheck = false; tx.maxLength = 7;
+        sw.addEventListener("input", () => {
+          tx.value = sw.value.toUpperCase(); tx.classList.remove("bad");
+          setTok(tok, sw.value); markDirty();
+        });
+        sw.addEventListener("change", saveSettings);
+        tx.addEventListener("input", () => {
+          const val = tx.value.trim();
+          if (/^#[0-9a-fA-F]{6}$/.test(val)) {
+            sw.value = val.toLowerCase(); tx.classList.remove("bad");
+            setTok(tok, val.toLowerCase()); markDirty();
+          } else {
+            tx.classList.add("bad");
+          }
+        });
+        tx.addEventListener("change", () => {
+          tx.value = sw.value.toUpperCase();   // snap back to the last valid colour
+          tx.classList.remove("bad"); saveSettings();
+        });
+        ctl.append(sw, tx);
+      } else if (tok.t === "len") {
+        const cur = parseInt(eff(tok), 10) || 0;
+        const rng = document.createElement("input");
+        rng.type = "range"; rng.className = "te-range";
+        rng.min = tok.min; rng.max = tok.max; rng.step = tok.step; rng.value = cur;
+        const num = document.createElement("input");
+        num.type = "number"; num.className = "cad-input te-num";
+        num.min = tok.min; num.max = tok.max; num.step = tok.step; num.value = cur;
+        const unit = document.createElement("span");
+        unit.className = "te-unit"; unit.textContent = tok.unit;
+        const apply = (raw, persist) => {
+          const n = Math.max(tok.min, Math.min(tok.max, parseInt(raw, 10) || 0));
+          rng.value = n; num.value = n;
+          setTok(tok, n + tok.unit); markDirty();
+          if (persist) saveSettings();
+        };
+        rng.addEventListener("input", () => apply(rng.value, false));
+        rng.addEventListener("change", () => apply(rng.value, true));
+        num.addEventListener("change", () => apply(num.value, true));
+        ctl.append(rng, num, unit);
+      } else if (tok.t === "font") {
+        const sel = document.createElement("select");
+        sel.className = "cad-input te-fontsel";
+        const def = document.createElement("option");
+        def.value = ""; def.textContent = "Default (Appearance)";
+        sel.appendChild(def);
+        for (const [val, name] of FONT_CHOICES) {
+          if (!val) continue;                              // skip FONT_CHOICES' own "Default"
+          const o = document.createElement("option");
+          o.value = val; o.textContent = name;
+          sel.appendChild(o);
+        }
+        const stored = ov[tok.v] || "";
+        sel.value = stored;
+        if (sel.value !== stored) {                        // an imported/custom stack: keep it
+          const o = document.createElement("option");
+          o.value = stored; o.textContent = "Custom";
+          sel.appendChild(o); sel.value = stored;
+        }
+        sel.addEventListener("change", () => {
+          if (sel.value) { getOv()[tok.v] = sel.value; markDirty(); }
+          else {
+            delete themeOverrideMap(activeId, false)[tok.v];
+            if (!custom) {
+              const bm = state.settings.themeOverrides[base];
+              if (bm && !Object.keys(bm).length) delete state.settings.themeOverrides[base];
+            }
+            rev.classList.remove("on");
+          }
+          applyFont(); saveSettings(); updateCount();      // fonts: applyFont, not setTok
+        });
+        ctl.append(sel);
+      } else {                                             // weight dropdown
+        const sel = document.createElement("select");
+        sel.className = "cad-input te-wsel";
+        for (const [val, name] of tok.opts) {
+          const o = document.createElement("option");
+          o.value = val; o.textContent = `${name} (${val})`;
+          sel.appendChild(o);
+        }
+        sel.value = String(parseInt(eff(tok), 10) || tok.def);
+        sel.addEventListener("change", () => {
+          setTok(tok, sel.value); markDirty(); saveSettings();
+        });
+        ctl.append(sel);
+      }
+
+      ctl.appendChild(rev);
+      host.append(lab, ctl);
+    }
+  }
+  updateCount();
+
+  const resetBtn = el("te-reset-theme");
+  if (resetBtn) resetBtn.onclick = () => {
+    if (custom) {
+      if (!custom.overrides || !Object.keys(custom.overrides).length) return;
+      custom.overrides = {};
+    } else {
+      const bm = state.settings.themeOverrides[base];
+      if (!bm || !Object.keys(bm).length) return;
+      delete state.settings.themeOverrides[base];
+    }
+    saveSettings();
+    applyThemeOverrides();
+    applyFont();
+    renderThemeEditor();
+  };
+
+  // --- custom themes: Duplicate (copy any theme into a new editable one),
+  // Rename / Delete (custom only), and file Export / Import ---
+  const clone = (o) => JSON.parse(JSON.stringify(o || {}));
+  const normBase = (id) => {
+    const b = id in LEGACY_THEMES ? LEGACY_THEMES[id] : id;
+    return THEMES.some(([x]) => x === b) ? b : DEFAULT_THEME;
+  };
+  const nameEl = el("te-save-name");
+  const onClick = (id, fn) => { const b = el(id); if (b) b.onclick = fn; };
+  const setDisabled = (id, v) => { const b = el(id); if (b) b.disabled = v; };
+  setDisabled("te-rename", !custom);   // built-in themes can't be renamed or deleted
+  setDisabled("te-delete", !custom);
+
+  onClick("te-duplicate", () => {
+    const nid = newThemeId();
+    const typed = nameEl && nameEl.value.trim();
+    const name = (typed || `${themeLabelOf(activeId)} copy`).slice(0, 60);
+    customThemes().push({ id: nid, name, base, overrides: clone(themeOverrideMap(activeId, false)) });
+    if (nameEl) nameEl.value = "";
+    saveSettings();
+    refreshThemePickers();
+    setTheme(nid);           // switch to (and edit) the new copy
+    status(`CREATED THEME "${name}"`);
+  });
+  onClick("te-rename", () => {
+    if (!custom) { statusErr("RENAME :: duplicate a built-in theme first"); return; }
+    const typed = nameEl && nameEl.value.trim();
+    if (!typed) { statusErr("RENAME :: type a name first"); return; }
+    custom.name = typed.slice(0, 60);
+    if (nameEl) nameEl.value = "";
+    saveSettings();
+    refreshThemePickers();
+    renderThemeEditor();
+    status(`RENAMED THEME "${custom.name}"`);
+  });
+  onClick("te-delete", () => {
+    if (!custom) return;
+    const i = customThemes().indexOf(custom);
+    const nm = custom.name;
+    if (i >= 0) customThemes().splice(i, 1);
+    saveSettings();
+    refreshThemePickers();
+    setTheme(base);          // fall back to the base built-in
+    status(`DELETED THEME "${nm}"`);
+  });
+  onClick("te-export", () => {
+    const payload = {
+      app: "whl-theme", version: 1,
+      name: themeLabelOf(activeId), base,
+      overrides: clone(themeOverrideMap(activeId, false)),
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${(custom ? custom.name : base).replace(/[^\w.-]+/g, "-").toLowerCase()}.whltheme.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    status("EXPORTED THEME");
+  });
+  onClick("te-import", () => { const f = el("te-import-file"); if (f) f.click(); });
+  const fileEl = el("te-import-file");
+  if (fileEl) fileEl.onchange = () => {
+    const f = fileEl.files && fileEl.files[0];
+    fileEl.value = "";
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      let obj;
+      try { obj = JSON.parse(reader.result); }
+      catch (e) { statusErr("IMPORT FAILED :: not valid JSON"); return; }
+      // require the export handshake so a stray .json can't masquerade as a theme
+      if (!obj || typeof obj !== "object" || obj.app !== "whl-theme" ||
+          typeof obj.base !== "string" || !obj.overrides || typeof obj.overrides !== "object") {
+        statusErr("IMPORT FAILED :: not a Library Tool theme file");
+        return;
+      }
+      const b = normBase(obj.base);
+      const overrides = sanitizeOverrides(obj.overrides);
+      const name = ((typeof obj.name === "string" && obj.name.trim()) || `${themeLabelOf(b)} import`).slice(0, 60);
+      const nid = newThemeId();
+      customThemes().push({ id: nid, name, base: b, overrides });   // import creates a new custom theme
+      saveSettings();
+      refreshThemePickers();
+      setTheme(nid);
+      status(`IMPORTED THEME "${name}"`);
+    };
+    reader.readAsText(f);
+  };
 }
 
 function initSettingsNav() {
@@ -8821,6 +9300,8 @@ function renderAnPane(id) {
   else if (id === "an-trans") loadAnTranslations(b);
   else if (id === "an-notes") loadAnNotes(b);
   else if (id === "an-passages") loadAnPassages(b);
+  else if (id === "an-test") loadAnTest(b);
+  else if (id === "an-ask") renderAnAsk(b);
   else if (id === "an-rel") renderAnRelevance(b);
   else if (id === "an-bundle") renderAnBundle(b);
 }
@@ -9315,6 +9796,382 @@ function onAnPsgClick(ev) {
   }
 }
 
+// --- Test (#142): the per-volume evaluation set over the passages ----------------
+
+const EV_KINDS = ["exact-phrase", "archaic-modern", "factual", "thematic",
+  "tables", "cross-page", "multilingual", "unanswerable"];
+let anEval = null;       // {queries, last_run} for the selected book
+let anEvalSel = "";      // selected query id — the live-run target
+let anEvalEdit = "";     // query id loaded into the add/edit bar
+let anEvalRes = null;    // live results for the selected query
+let anAskHasKey = false; // "an AI key exists" — gates Ask's Draft action
+
+async function loadAnTest(b) {
+  try {
+    const data = await (await fetch(`/api/builds/${b.id}/eval`)).json();
+    if (state.anSel !== b.id) return;   // stale response
+    anEval = data.ok ? data.doc : null;
+  } catch (e) { anEval = null; }
+  if (!anEval || !(anEval.queries || []).some((q) => q.id === anEvalSel)) {
+    anEvalSel = "";
+    anEvalRes = null;
+  }
+  renderAnEval();
+}
+
+function evFmt(x) { return x == null ? "–" : Number(x).toFixed(2); }
+
+function evOverallLine(o) {
+  if (!o) return "";
+  const bits = [];
+  if (o.judged) {
+    bits.push(`R@10 ${evFmt(o.recall)} · nDCG ${evFmt(o.ndcg)} · ` +
+      `MRR ${evFmt(o.mrr)} (${o.judged} judged)`);
+  }
+  if (o.unanswerable) bits.push(`unanswerable ${o.unanswerable_pass}/${o.unanswerable}`);
+  if (o.unjudged) bits.push(`${o.unjudged} unjudged`);
+  return bits.join(" · ");
+}
+
+function renderAnEval() {
+  const host = el("an-ev-queries");
+  if (!host) return;
+  const queries = (anEval && anEval.queries) || [];
+  const run = (anEval && anEval.last_run) || null;
+  const localQ = (run && run.local && run.local.queries) || {};
+  let line = run ? evOverallLine(run.local && run.local.overall) : "";
+  if (run && run.published) {
+    line += ` — published v${Number(run.published.version) || "?"}: ` +
+      evOverallLine(run.published.overall);
+  }
+  el("an-ev-metrics").textContent = line;
+  el("an-ev-run").disabled = !queries.length;
+  host.innerHTML = EV_KINDS.map((kind) => {
+    const group = queries.filter((q) => q.kind === kind);
+    if (!group.length) return "";
+    // a thin group label per kind — a marker, not a pill
+    return `<div class="ev-kind">${esc(kind)}</div>` + group.map((q) => {
+      const judged = Object.keys(q.judgments || {}).length;
+      const r = localQ[q.id];
+      let m = "";
+      if (r && "recall" in r) m = `R ${evFmt(r.recall)} · nDCG ${evFmt(r.ndcg)}`;
+      else if (r && r.kind === "unanswerable") m = r.pass ? "pass" : "fail";
+      const meta = [judged ? `${judged} judged` : "", m].filter(Boolean).join(" · ");
+      return `<div class="ev-q${q.id === anEvalSel ? " active" : ""}" data-ev="${esc(q.id)}">
+        <span class="ev-q-text">${esc(q.text)}</span>
+        <span class="ev-q-meta">${esc(meta)}</span>
+        <span class="ev-q-acts">
+          <button class="cad-btn tiny" data-ev-edit="${esc(q.id)}" type="button">Edit</button>
+          <button class="cad-btn tiny danger" data-ev-del="${esc(q.id)}" type="button">Delete</button>
+        </span></div>`;
+    }).join("");
+  }).join("") || `<p class="empty">No queries yet — add the first above.</p>`;
+  renderAnEvalResults();
+}
+
+// «»-marked snippets arrive from both arms (the local scorer mirrors the
+// RPC's ts_headline delimiters); escape first, then surface the marks —
+// server text never reaches the DOM as HTML
+function evSnippetHtml(s) {
+  return esc(s).replace(/«([^«»]*)»/g, '<span class="ev-mark">$1</span>');
+}
+
+function evPageLabel(r) {
+  return r.page_from === r.page_to
+    ? `p${r.page_from ?? "?"}` : `p${r.page_from}–${r.page_to}`;
+}
+
+// one evidence-row idiom for Test and Ask; `q` (an eval query) adds the
+// judgment toggles, null (Ask) leaves the row plain
+function evRowHtml(r, q) {
+  const j = q ? (q.judgments || {})[r.passage_id] : undefined;
+  const acts = q ? `<span class="ev-row-acts">
+      <button class="cad-btn tiny${j === 1 ? " active" : ""}" data-ev-rel="1"
+              data-ev-pid="${esc(r.passage_id)}" type="button"
+              data-tip="Mark relevant — click again to clear">Relevant</button>
+      <button class="cad-btn tiny${j === 0 ? " active" : ""}" data-ev-rel="0"
+              data-ev-pid="${esc(r.passage_id)}" type="button"
+              data-tip="Mark not relevant — click again to clear">Not relevant</button>
+    </span>` : "";
+  return `<div class="ev-row" data-ev-row="${esc(r.passage_id)}">
+    <span class="psg-pages">${esc(evPageLabel(r))}</span>
+    <span class="ev-snip">${evSnippetHtml(r.snippet || "")}</span>
+    <span class="ev-score">${Number(r.score || 0).toFixed(2)}</span>
+    ${acts}</div>`;
+}
+
+function renderAnEvalResults() {
+  const host = el("an-ev-results");
+  if (!host) return;
+  const q = ((anEval && anEval.queries) || []).find((x) => x.id === anEvalSel);
+  if (!q || !anEvalRes) {
+    host.innerHTML = `<p class="empty">Select a query to run it against
+      the working passages.</p>`;
+    return;
+  }
+  // working passages always; the published index beside them when the RPC
+  // arm ran — two clearly labelled result sets, never mixed
+  const cols = [`<div class="ev-col"><div class="ev-col-label">Working passages</div>` +
+    (((anEvalRes.results || []).map((r) => evRowHtml(r, q)).join("")) ||
+      `<p class="empty">No matches.</p>`) + `</div>`];
+  if (anEvalRes.published) {
+    cols.push(`<div class="ev-col"><div class="ev-col-label">Published index
+      v${Number(anEvalRes.published.version) || "?"}</div>` +
+      (((anEvalRes.published.results || []).map((r) => evRowHtml(r, q)).join("")) ||
+        `<p class="empty">No matches.</p>`) + `</div>`);
+  }
+  host.innerHTML = cols.join("");
+}
+
+async function selectEvalQuery(id) {
+  anEvalSel = id;
+  anEvalRes = null;
+  renderAnEval();
+  const b = anSelected();
+  const q = ((anEval && anEval.queries) || []).find((x) => x.id === id);
+  if (!b || !q) return;
+  try {
+    const res = await fetch("/api/knowledge/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ build_id: b.id, question: q.text, published: true }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (state.anSel !== b.id || anEvalSel !== id) return;   // stale
+    if (!res.ok || !data.ok) {
+      el("an-ev-msg").textContent = data.error || "run failed";
+      return;
+    }
+    el("an-ev-msg").textContent = data.warning || "";
+    anEvalRes = data;
+    renderAnEvalResults();
+  } catch (e) { el("an-ev-msg").textContent = "request failed"; }
+}
+
+async function evPut(body) {
+  const b = anSelected();
+  if (!b) return null;
+  try {
+    const res = await fetch(`/api/builds/${b.id}/eval`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      el("an-ev-msg").textContent = data.error || "save failed";
+      return null;
+    }
+    el("an-ev-msg").textContent = "";
+    anEval = Object.assign({}, anEval, data.doc);
+    return data.doc;
+  } catch (e) {
+    el("an-ev-msg").textContent = "request failed";
+    return null;
+  }
+}
+
+function evEditReset() {
+  anEvalEdit = "";
+  el("an-ev-text").value = "";
+  el("an-ev-add").textContent = "Add";
+  el("an-ev-cancel").hidden = true;
+}
+
+async function onEvSubmit() {
+  const text = el("an-ev-text").value.trim();
+  const kind = el("an-ev-kind").value;
+  if (!text) { el("an-ev-msg").textContent = "a query needs text"; return; }
+  const doc = await evPut(anEvalEdit
+    ? { update: { id: anEvalEdit, text, kind } }
+    : { add: { text, kind } });
+  if (doc) { evEditReset(); renderAnEval(); }
+}
+
+async function onEvQueriesClick(ev) {
+  const e = ev.target.closest("[data-ev-edit]");
+  if (e) {
+    const q = ((anEval && anEval.queries) || []).find((x) => x.id === e.dataset.evEdit);
+    if (!q) return;
+    anEvalEdit = q.id;
+    el("an-ev-text").value = q.text;
+    el("an-ev-kind").value = q.kind;
+    el("an-ev-add").textContent = "Save";
+    el("an-ev-cancel").hidden = false;
+    el("an-ev-text").focus();
+    return;
+  }
+  const d = ev.target.closest("[data-ev-del]");
+  if (d) {
+    const q = ((anEval && anEval.queries) || []).find((x) => x.id === d.dataset.evDel);
+    const judged = q ? Object.keys(q.judgments || {}).length : 0;
+    if (!(await confirmDialog({
+      title: "Delete query",
+      message: "Delete this evaluation query?",
+      detail: judged ? `Its ${judged} judgments are deleted with it.`
+        : "It has no judgments yet.",
+      confirmLabel: "Delete",
+      danger: true,
+    }))) return;
+    if (anEvalEdit === d.dataset.evDel) evEditReset();
+    if (anEvalSel === d.dataset.evDel) { anEvalSel = ""; anEvalRes = null; }
+    if (await evPut({ remove: d.dataset.evDel })) renderAnEval();
+    return;
+  }
+  const row = ev.target.closest(".ev-q");
+  if (row && row.dataset.ev !== anEvalSel) selectEvalQuery(row.dataset.ev);
+}
+
+async function onEvResultsClick(ev) {
+  const btn = ev.target.closest("[data-ev-rel]");
+  if (!btn) return;
+  const q = ((anEval && anEval.queries) || []).find((x) => x.id === anEvalSel);
+  if (!q) return;
+  const want = Number(btn.dataset.evRel);
+  const cur = (q.judgments || {})[btn.dataset.evPid];
+  // clicking the active judgment clears it (rel: null)
+  const rel = cur === want ? null : want;
+  if (await evPut({ judge: { id: q.id, passage_id: btn.dataset.evPid, rel } })) {
+    renderAnEval();
+  }
+}
+
+function onEvRunAll() {
+  const b = anSelected();
+  if (b) {
+    anStartJob("/api/knowledge/eval/run", { build_id: b.id }, "eval-run",
+               el("an-ev-run"));
+  }
+}
+
+// --- Ask this book (#143): evidence first, then an optional cited answer ---------
+
+// Transient on purpose: the answer lives in this variable and the pane,
+// never on disk — AI-derived claims stay visibly derived and never publish
+// (docs/search-design.md §7)
+let anAsk = null;   // {buildId, question, results}
+
+const ASK_ABSTAIN = "The archive does not contain enough evidence to answer this.";
+
+async function renderAnAsk(b) {
+  if (anAsk && anAsk.buildId !== b.id) anAsk = null;
+  if (!anAsk) {
+    el("an-ask-evidence").innerHTML = "";
+    el("an-ask-answer").hidden = true;
+    el("an-ask-note").hidden = true;
+    el("an-ask-view").hidden = true;
+    el("an-ask-msg").textContent = "";
+    el("an-ask-draft").hidden = true;
+  }
+  try {
+    const sec = await (await fetch("/api/secrets")).json();
+    anAskHasKey = !!String(sec.aiKey || "").trim();
+  } catch (e) { anAskHasKey = false; }
+  if (anAsk && anAsk.results.length) el("an-ask-draft").hidden = !anAskHasKey;
+}
+
+async function onAskGo() {
+  const b = anSelected();
+  if (!b) return;
+  const question = el("an-ask-q").value.trim();
+  if (!question) { el("an-ask-msg").textContent = "ask a question first"; return; }
+  el("an-ask-msg").textContent = "";
+  el("an-ask-answer").hidden = true;
+  el("an-ask-note").hidden = true;
+  el("an-ask-view").hidden = true;
+  try {
+    const res = await fetch("/api/knowledge/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ build_id: b.id, question }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (state.anSel !== b.id) return;
+    if (!res.ok || !data.ok) {
+      el("an-ask-msg").textContent = data.error || "failed";
+      return;
+    }
+    anAsk = { buildId: b.id, question, results: data.results || [] };
+    renderAskEvidence();
+  } catch (e) { el("an-ask-msg").textContent = "request failed"; }
+}
+
+function renderAskEvidence() {
+  const rows = (anAsk && anAsk.results) || [];
+  el("an-ask-evidence").innerHTML = rows.map((r) => evRowHtml(r, null)).join("")
+    || `<p class="empty">No passages match this question.</p>`;
+  // the Draft action appears only over evidence, and only with a provider
+  el("an-ask-draft").hidden = !(rows.length && anAskHasKey);
+}
+
+function onAskEvidenceClick(ev) {
+  const row = ev.target.closest("[data-ev-row]");
+  if (!row || !anAsk) return;
+  const r = anAsk.results.find((x) => x.passage_id === row.dataset.evRow);
+  if (r && r.text) {
+    el("an-ask-view").textContent = r.text;   // the verbatim reading
+    el("an-ask-view").hidden = false;
+  }
+}
+
+async function onAskDraft() {
+  const b = anSelected();
+  if (!b || !anAsk || !anAsk.results.length) return;
+  const btn = el("an-ask-draft");
+  btn.disabled = true;
+  el("an-ask-msg").textContent = "drafting…";
+  try {
+    const res = await fetch("/api/knowledge/ask/answer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        build_id: b.id, question: anAsk.question,
+        passage_ids: anAsk.results.map((r) => r.passage_id),
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      el("an-ask-msg").textContent = data.error || "failed";
+      return;
+    }
+    el("an-ask-msg").textContent = "";
+    renderAskAnswer(data.answer || "");
+  } catch (e) {
+    el("an-ask-msg").textContent = "request failed";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderAskAnswer(text) {
+  const host = el("an-ask-answer");
+  const abstained = text.trim() === ASK_ABSTAIN;
+  // escape FIRST, then linkify the [pN] citations — model text never
+  // reaches the DOM as HTML
+  host.innerHTML = esc(text).replace(/\[p(\d+)\]/g,
+    '<a href="#" class="ask-cite" data-cite="$1">[p$1]</a>');
+  // abstention is an outcome, not an error: the plain sentence, note-styled
+  host.classList.toggle("ask-abstain", abstained);
+  host.hidden = false;
+  el("an-ask-note").hidden = false;   // the permanent provenance note
+}
+
+function onAskAnswerClick(ev) {
+  const a = ev.target.closest(".ask-cite");
+  if (!a || !anAsk) return;
+  ev.preventDefault();
+  const page = Number(a.dataset.cite);
+  const rows = [...el("an-ask-evidence").querySelectorAll("[data-ev-row]")];
+  const hit = rows.find((row) => {
+    const r = anAsk.results.find((x) => x.passage_id === row.dataset.evRow);
+    return r && Number(r.page_from) <= page && page <= Number(r.page_to);
+  });
+  if (!hit) return;
+  hit.scrollIntoView({ block: "nearest" });
+  hit.classList.add("ev-flash");
+  setTimeout(() => hit.classList.remove("ev-flash"), 1200);
+}
+
 // --- Publish phase: the Search index card (#140) ---------------------------------
 
 async function renderAnIndexCard(b) {
@@ -9351,12 +10208,24 @@ async function renderAnIndexCard(b) {
   el("an-index-versions").innerHTML = versions.slice(0, 6).map((v, i) => {
     const s = v.stats || {};
     const model = (v.config || {}).model;
+    // #142: the evaluation results recorded at publish time, visible where
+    // promotion (publish / roll back) is decided
+    const ev = s.eval || null;
+    const evBits = [];
+    if (ev && ev.judged) {
+      evBits.push(`R@10 ${evFmt(ev.recall)} · nDCG ${evFmt(ev.ndcg)} · ` +
+        `MRR ${evFmt(ev.mrr)}`);
+    }
+    if (ev && ev.unanswerable) {
+      evBits.push(`unans ${ev.unanswerable_pass}/${ev.unanswerable}`);
+    }
     return `<div class="an-index-ver">
       <span class="psg-pages">v${versions.length - i}</span>
       <span>${esc(v.channel || "stable")}</span>
       <span>${v.built_at ? esc(new Date(v.built_at).toLocaleString()) : ""}</span>
       <span>${Number(s.passages) || 0} passages</span>
       <span>${model ? esc(model) : "lexical"}</span>
+      <span class="ev-verstats">${esc(evBits.join(" · ") || (ev ? "" : "not evaluated"))}</span>
     </div>`;
   }).join("");
 }
@@ -9644,6 +10513,23 @@ function initAnalyze() {
   el("an-psg-wrap").addEventListener("click", onAnPsgClick);
   el("an-index-publish").addEventListener("click", anIndexPublish);
   el("an-index-rollback").addEventListener("click", anIndexRollback);
+
+  // Test (#142) + Ask (#143)
+  el("an-ev-run").addEventListener("click", onEvRunAll);
+  el("an-ev-add").addEventListener("click", onEvSubmit);
+  el("an-ev-cancel").addEventListener("click", evEditReset);
+  el("an-ev-text").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") onEvSubmit();
+  });
+  el("an-ev-queries").addEventListener("click", onEvQueriesClick);
+  el("an-ev-results").addEventListener("click", onEvResultsClick);
+  el("an-ask-go").addEventListener("click", onAskGo);
+  el("an-ask-q").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") onAskGo();
+  });
+  el("an-ask-draft").addEventListener("click", onAskDraft);
+  el("an-ask-evidence").addEventListener("click", onAskEvidenceClick);
+  el("an-ask-answer").addEventListener("click", onAskAnswerClick);
 
   // Record -> Knowledge jump for the open book (same Workbench selection)
   el("b-analyze").addEventListener("click", () => {
@@ -17130,12 +18016,12 @@ function buildThemeMenu() {
   const host = el("menu-themes");
   if (!host) return;
   host.innerHTML = "";
-  for (const [id, label] of THEMES) {
+  for (const [id, label, custom] of allThemes()) {
     const cmd = "theme:" + id;
     MENU_CMDS[cmd] = () => setTheme(id);
     const b = document.createElement("button");
     b.type = "button";
-    b.className = "menu-item";
+    b.className = "menu-item" + (custom ? " menu-item-custom" : "");
     b.dataset.cmd = cmd;
     b.innerHTML = `<span class="menu-check"></span>${esc(label)}`;
     host.appendChild(b);
@@ -17189,7 +18075,7 @@ function updateMenuState() {
   check("table-whl", !onChecked);
   check("opt-auto-ia", state.settings.autoIaDownload !== false);   // default-on
   check("opt-expand-sets", !!state.settings.expandSets);
-  for (const [id] of THEMES) check("theme:" + id, id === state.settings.theme);
+  for (const [id] of allThemes()) check("theme:" + id, id === state.settings.theme);
   const svc = state.settings.ocrService || "tesseract";
   for (const [id] of OCR_SERVICES) check("ocrsvc:" + id, id === svc);
 }
@@ -18237,7 +19123,11 @@ function init() {
   // reflect whatever the server holds (the merge may differ from the cache).
   syncClientStateOnLoad().then((adopted) => {
     hydrateSecrets();      // warm credentials without delaying the initial UI
-    if (adopted) { applyTheme(); applyFont(); applyExpSharpen(); }
+    // adopted server settings can carry a different set of custom themes, so
+    // rebuild the pickers/menu before re-applying (else the menubar Theme
+    // submenu keeps the pre-sync list); applyExpSharpen re-applies the
+    // experimental UI-sharpen overlay against the adopted state.
+    if (adopted) { refreshThemePickers(); applyTheme(); applyFont(); applyExpSharpen(); }
     maybeWizard();       // first desktop launch: the guide covers sign-in too
     maybeAuthPrompt();   // needs the adopted settings: authPromptDismissed
     loadDownloads();
