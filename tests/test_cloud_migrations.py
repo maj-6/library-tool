@@ -27,6 +27,8 @@ SECRETS_REVISION_FLAT = " ".join(SECRETS_REVISION.split())
 MEMBER_LEDGER = SQL["005_member_roles_approval"]
 MEMBER_HOLDBACK = SQL["007_unreleased_member_gate_holdback"]
 MEMBER_HOLDBACK_FLAT = " ".join(MEMBER_HOLDBACK.split())
+TRIGGER_GRANTS = SQL["008_profile_secrets_trigger_grants"]
+TRIGGER_GRANTS_FLAT = " ".join(TRIGGER_GRANTS.split())
 
 
 # --- the migration files themselves ----------------------------------------------
@@ -128,6 +130,12 @@ def test_profile_secrets_revision_advances_for_every_client_version():
     assert ("revoke all on function public.touch_profile_secrets_updated_at() "
             "from public;" in SECRETS_REVISION_FLAT)
     assert "security definer" not in SECRETS_REVISION_FLAT.lower()
+
+
+def test_profile_secrets_trigger_is_not_callable_through_api_roles():
+    assert "touch_profile_secrets_updated_at()" in TRIGGER_GRANTS_FLAT
+    assert ("from public, anon, authenticated, service_role;" in
+            TRIGGER_GRANTS_FLAT)
 
 
 def test_unreleased_member_gate_is_recorded_but_not_replayed():
