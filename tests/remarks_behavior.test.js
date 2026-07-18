@@ -1,0 +1,495 @@
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const test = require("node:test");
+const vm = require("node:vm");
+
+
+const appPath = path.join(
+  __dirname, "..", "tools", "whl_explorer", "static", "app.js");
+const source = fs.readFileSync(appPath, "utf8");
+
+function block(startMarker, endMarker) {
+  const start = source.indexOf(startMarker);
+  const end = source.indexOf(endMarker, start);
+  assert.ok(start >= 0 && end > start, `${startMarker} block is present`);
+  return source.slice(start, end);
+}
+
+function declaration(name) {
+  const plain = `function ${name}(`;
+  const async = `async function ${name}(`;
+  let start = source.indexOf(async);
+  if (start < 0) start = source.indexOf(plain);
+  assert.ok(start >= 0, `${name} declaration is present`);
+  const end = /^}\r?$/m.exec(source.slice(start));
+  assert.ok(end, `${name} declaration has a closing brace`);
+  return source.slice(start, start + end.index + end[0].length);
+}
+
+function plain(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+const modelSource = [
+  declaration("homeAttentionDestination"),
+  block("const REMARK_CATEGORIES = [", "const remarksState ="),
+  declaration("attnHas"),
+  declaration("attnValue"),
+  declaration("attnReason"),
+  declaration("attnMeta"),
+  declaration("remarkKeyParts"),
+  declaration("remarkCategoryForKey"),
+  declaration("sourceRemarkKeys"),
+  declaration("activeSourceRemarkKey"),
+  declaration("sourceMatchesRemark"),
+  declaration("setAttnKey"),
+  declaration("remarksDefaultFilter"),
+  declaration("remarksFilterForTab"),
+  declaration("setRemarksFilterForTab"),
+  declaration("remarkSecondary"),
+  declaration("keyedRemarkDescriptor"),
+  declaration("remarksItems"),
+  declaration("remarkRoute"),
+].join("\n");
+
+function remarksHarness({ state: stateSeed, rows = [], sources = [] } = {}) {
+  const state = Object.assign({
+    settings: { remarksFilters: {} },
+    builds: {},
+    attn: {},
+    whlRows: [],
+    chBooks: [],
+    olRows: [],
+    rowsById: new Map(),
+  }, stateSeed || {});
+  const saves = [];
+  const context = vm.createContext({
+    state,
+    combinedRows: () => rows,
+    approvedSources: () => sources,
+    saveSettings: () => saves.push(plain(state.settings.remarksFilters)),
+  });
+  vm.runInContext(`${modelSource}
+this.api = {
+  homeAttentionDestination,
+  REMARK_CATEGORIES, REMARK_TAB_DEFAULTS,
+  attnValue, attnReason, remarkKeyParts, remarkCategoryForKey,
+  sourceRemarkKeys, activeSourceRemarkKey, sourceMatchesRemark, setAttnKey,
+  remarksDefaultFilter, remarksFilterForTab, setRemarksFilterForTab,
+  remarksItems, remarkRoute,
+};`, context);
+  return { api: context.api, saves, state };
+}
+
+test("attention values and keyed references preserve legacy marks and URL colons", () => {
+  const { api } = remarksHarness();
+
+  assert.equal(api.attnValue(true), "1");
+  assert.equal(api.attnValue({ value: "Check the date" }), "Check the date");
+  assert.equal(api.attnValue({ reason: "Legacy object" }), "Legacy object");
+  assert.equal(api.attnReason("1"), "");
+  assert.equal(api.attnReason({ value: "Check the date" }), "Check the date");
+
+  const sourceKey = "src:https://archive.example:443/item/a:b.pdf";
+  assert.deepEqual(plain(api.remarkKeyParts(sourceKey)), {
+    prefix: "src",
+    ref: "https://archive.example:443/item/a:b.pdf",
+  });
+  assert.deepEqual(plain(api.remarkKeyParts("unprefixed")), {
+    prefix: "",
+    ref: "unprefixed",
+  });
+  assert.equal(api.remarkCategoryForKey(sourceKey), "sources");
+  assert.equal(api.remarkCategoryForKey("src2:row|archive|item"), "sources");
+  assert.equal(api.remarkCategoryForKey("whl:17"), "catalogs");
+});
+
+test("new source identities distinguish catalog owners while legacy keys still resolve", () => {
+  const { api, state } = remarksHarness();
+  const first = {
+    _rowId: "manual-1", archive: "Internet Archive",
+    identifier: "shared-scan", url: "https://archive.example/shared",
+    title: "First catalog title",
+  };
+  const second = { ...first, _rowId: "manual-2", title: "Second catalog title" };
+  const firstKeys = plain(api.sourceRemarkKeys(first));
+  const secondKeys = plain(api.sourceRemarkKeys(second));
+
+  assert.equal(firstKeys.legacy, secondKeys.legacy);
+  assert.notEqual(firstKeys.stable, secondKeys.stable);
+  assert.equal(api.sourceMatchesRemark(first, firstKeys.stable), true);
+  assert.equal(api.sourceMatchesRemark(first, firstKeys.legacy), true);
+
+  state.attn[firstKeys.legacy] = "Old mark";
+  assert.equal(api.activeSourceRemarkKey(first), firstKeys.legacy);
+  delete state.attn[firstKeys.legacy];
+  assert.equal(api.activeSourceRemarkKey(first), firstKeys.stable);
+});
+
+test("keyed marks keep the legacy string format and sync metadata separately", () => {
+  const writes = [];
+  const state = {
+    attn: {},
+    settings: { remarksMeta: {} },
+  };
+  const context = vm.createContext({
+    state,
+    localStorage: { setItem: (key, value) => writes.push([key, value]) },
+    saveSettings: () => writes.push(["settings"]),
+    pushClientState: (kind) => writes.push(["push", kind]),
+    status: () => {},
+    renderRemarks: () => {},
+    renderHome: () => {},
+  });
+  vm.runInContext(`${modelSource}
+this.api = { setAttnKey };`, context);
+
+  assert.equal(context.api.setAttnKey("src:https://example.test/scan", "Check pages", {
+    label: "Example scan", category: "sources",
+  }), true);
+  assert.equal(state.attn["src:https://example.test/scan"], "Check pages");
+  assert.deepEqual(plain(state.settings.remarksMeta), {
+    "src:https://example.test/scan": {
+      label: "Example scan", category: "sources",
+    },
+  });
+  assert.ok(writes.some(([kind, value]) => kind === "push" && value === "attention"));
+
+  context.api.setAttnKey("src:https://example.test/scan", "");
+  assert.equal("src:https://example.test/scan" in state.attn, false);
+  assert.equal("src:https://example.test/scan" in state.settings.remarksMeta, false);
+});
+
+test("whole-blob attention writes serialize so stale state cannot finish last", async () => {
+  const requests = [];
+  const removals = [];
+  const state = { attn: { first: "old" }, settings: {} };
+  const deferred = () => {
+    let resolve;
+    const promise = new Promise((done) => { resolve = done; });
+    return { promise, resolve };
+  };
+  const context = vm.createContext({
+    state,
+    checkedArray: () => [],
+    partitionSettings: (settings) => ({ prefs: settings }),
+    fetch: (_url, opts) => {
+      const wait = deferred();
+      requests.push({ body: JSON.parse(opts.body), wait });
+      return wait.promise;
+    },
+    localStorage: { removeItem: (key) => removals.push(key) },
+    setTimeout: () => 1,
+    clearTimeout: () => {},
+    ATTN_DIRTY_KEY: "attention-dirty",
+  });
+  const sync = block(
+    "let clientStateReady = false;",
+    "// When the same book is checked",
+  );
+  vm.runInContext(`${sync}\nclientStateReady = true;
+this.api = { pushClientState, flushClientState };`, context);
+
+  context.api.pushClientState("attention");
+  const first = context.api.flushClientState();
+  await Promise.resolve();
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0].body.attention, { first: "old" });
+
+  state.attn = { first: "new", second: "mark" };
+  context.api.pushClientState("attention");
+  const joined = context.api.flushClientState();
+  assert.equal(joined, first, "a second flush joins the in-flight drain");
+  await Promise.resolve();
+  assert.equal(requests.length, 1, "the replacement PUT is not concurrent");
+
+  requests[0].wait.resolve({ ok: true, status: 200 });
+  for (let i = 0; i < 4 && requests.length < 2; i++) await Promise.resolve();
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests[1].body.attention, { first: "new", second: "mark" });
+  assert.deepEqual(removals, [], "dirty state remains until the newest PUT wins");
+
+  requests[1].wait.resolve({ ok: true, status: 200 });
+  assert.equal(await first, true);
+  assert.equal(await joined, true);
+  assert.deepEqual(removals, ["attention-dirty"]);
+});
+
+test("failed client-state writes keep the dirty bit and honor backoff", async () => {
+  const delays = [];
+  const removals = [];
+  const state = { attn: { first: "keep" }, settings: {} };
+  const context = vm.createContext({
+    state,
+    checkedArray: () => [],
+    partitionSettings: (settings) => ({ prefs: settings }),
+    fetch: async () => ({ ok: false, status: 503 }),
+    localStorage: { removeItem: (key) => removals.push(key) },
+    setTimeout: (_fn, delay) => { delays.push(delay); return delays.length; },
+    clearTimeout: () => {},
+    ATTN_DIRTY_KEY: "attention-dirty",
+  });
+  const sync = block(
+    "let clientStateReady = false;",
+    "// When the same book is checked",
+  );
+  vm.runInContext(`${sync}\nclientStateReady = true;
+this.api = { pushClientState, flushClientState };`, context);
+
+  context.api.pushClientState("attention");
+  assert.equal(await context.api.flushClientState(), false);
+  assert.deepEqual(removals, [], "failure must preserve the durable dirty bit");
+  assert.ok(delays.includes(2000), "the first retry uses bounded backoff");
+  assert.equal(delays.at(-1), 2000, "settlement must not replace backoff with 0ms");
+});
+
+test("each top-level tab has a primary default and retains an independent filter", () => {
+  const { api, saves, state } = remarksHarness({
+    state: {
+      settings: {
+        remarksFilters: { checked: "sources", workbench: "not-a-category" },
+      },
+    },
+  });
+
+  assert.deepEqual(plain(api.REMARK_CATEGORIES), [
+    ["catalogs", "Catalogs"],
+    ["sources", "Sources"],
+    ["entries", "Entries"],
+    ["pages", "Pages"],
+    ["publications", "Publications"],
+  ]);
+  assert.deepEqual(plain(api.REMARK_TAB_DEFAULTS), {
+    home: "all",
+    checked: "catalogs",
+    workbench: "entries",
+    replica: "pages",
+    publish: "publications",
+    infotab: "all",
+  });
+
+  assert.equal(api.remarksFilterForTab("checked"), "sources");
+  assert.equal(api.remarksFilterForTab("workbench"), "entries");
+  assert.equal(api.remarksFilterForTab("replica"), "pages");
+  assert.equal(api.remarksDefaultFilter("future-tab"), "all");
+
+  assert.equal(api.setRemarksFilterForTab("workbench", "pages", true), "pages");
+  assert.equal(state.settings.remarksFilters.checked, "sources");
+  assert.equal(state.settings.remarksFilters.workbench, "pages");
+  assert.equal(saves.length, 1);
+
+  assert.equal(api.setRemarksFilterForTab("replica", "invalid", false), "pages");
+  assert.equal(state.settings.remarksFilters.replica, "pages");
+  assert.equal(saves.length, 1);
+});
+
+test("Home opens the remarks category represented by its attention count", () => {
+  const { api } = remarksHarness();
+  assert.deepEqual(plain(api.homeAttentionDestination({
+    attnCat: 0, attnEntries: 0, attnSources: 3,
+  })), { tab: "workbench", filter: "sources" });
+  assert.deepEqual(plain(api.homeAttentionDestination({
+    attnCat: 0, attnEntries: 2, attnSources: 1,
+  })), { tab: "workbench", filter: "all" });
+  assert.deepEqual(plain(api.homeAttentionDestination({
+    attnCat: 1, attnEntries: 0, attnSources: 0,
+  })), { tab: "checked", filter: "catalogs" });
+  assert.deepEqual(plain(api.homeAttentionDestination({
+    attnCat: 1, attnEntries: 0, attnSources: 1,
+  })), { tab: "checked", filter: "all" });
+});
+
+test("remarks aggregate canonical rows, builds, and keyed marks exactly once", () => {
+  const sourceKey = "src:https://archive.example/item:a";
+  const rows = [
+    { id: "checked-1", kind: "checked", attention: "Verify year",
+      book: { title: "A Checked Herbal", author: "Ada", year: "1901" } },
+    { id: "manual-1", kind: "manual", attention: true,
+      book: { title: "Manual Herbal", author: "Bea", year: "1902" } },
+    { id: "capture-1", kind: "manual", captured: true, attention: "Retake photo",
+      book: { title: "Phone Capture", author: "Cal", year: "1903" } },
+    { id: "clean", kind: "checked", attention: "",
+      book: { title: "No Mark" } },
+  ];
+  const sources = [{
+    url: "https://archive.example/item:a",
+    title: "Archive Scan",
+    archive: "Internet Archive",
+    author: "Dana",
+    year: "1874",
+  }];
+  const { api } = remarksHarness({
+    rows,
+    sources,
+    state: {
+      rowsById: new Map(rows.map((row) => [row.id, row])),
+      builds: {
+        draft: { id: "draft", status: "draft", attention: "Add rights",
+          title: "Draft Entry", authors: "Eli", year: "1880" },
+        published: { id: "published", status: "uploaded",
+          attention: { reason: "Replace cover" }, title: "Published Entry" },
+        clean: { id: "clean-build", status: "ready", attention: "", title: "Clean" },
+      },
+      attn: {
+        [sourceKey]: { value: "1", label: "Stored source", category: "sources" },
+        "whl:7": "Check WHL metadata",
+        "ch:12": { value: "Confirm edition", label: "Stored master row" },
+        "ol:work:key": { value: "Recover result", label: "Historical OL hit" },
+      },
+      whlRows: [{ idx: 7, title: "WHL Herbal", authors: "Fay", year: "1770" }],
+      chBooks: [{ idx: 12, title: "Master Herbal", author: "Gia", year: "1760" }],
+      olRows: [],
+    },
+  });
+
+  const items = plain(api.remarksItems());
+  assert.equal(items.length, 9);
+  assert.equal(new Set(items.map((item) => item.id)).size, items.length);
+  assert.deepEqual(
+    Object.fromEntries(["catalogs", "sources", "entries"].map((category) => [
+      category, items.filter((item) => item.category === category).length,
+    ])),
+    { catalogs: 6, sources: 1, entries: 2 },
+  );
+
+  assert.equal(items.find((item) => item.id === "row:checked-1").subtype, "Checked book");
+  assert.equal(items.find((item) => item.id === "row:manual-1").subtype, "Manual entry");
+  assert.equal(items.find((item) => item.id === "row:capture-1").subtype, "Phone capture");
+  assert.equal(items.find((item) => item.id === "build:published").subtype, "Published entry");
+
+  const source = items.find((item) => item.id === `key:${sourceKey}`);
+  assert.equal(source.label, "Archive Scan");
+  assert.equal(source.reason, "");
+  assert.equal(source.canOpen, true);
+
+  const stale = items.find((item) => item.id === "key:ol:work:key");
+  assert.equal(stale.label, "Historical OL hit");
+  assert.equal(stale.reason, "Recover result");
+  assert.equal(stale.canOpen, false);
+});
+
+test("remark routes cover every supported target without mutating sidebar state", () => {
+  const { api, state } = remarksHarness();
+  const before = plain(state.settings);
+
+  assert.deepEqual(plain(api.remarkRoute({ kind: "build", ref: "b-1" })),
+    { tab: "workbench", phase: "record", buildId: "b-1" });
+  assert.deepEqual(plain(api.remarkRoute({
+    kind: "key", ref: "src:https://example.test/a:b",
+  })), {
+    tab: "workbench", phase: "record", sourceKey: "src:https://example.test/a:b",
+  });
+  assert.deepEqual(plain(api.remarkRoute({
+    kind: "key", ref: "src2:row-1|Internet%20Archive|item-1",
+  })), {
+    tab: "workbench", phase: "record",
+    sourceKey: "src2:row-1|Internet%20Archive|item-1",
+  });
+  assert.deepEqual(plain(api.remarkRoute({ kind: "row", ref: "row-1" })),
+    { tab: "checked", table: "checked", rowId: "row-1" });
+  assert.deepEqual(plain(api.remarkRoute({ kind: "key", ref: "whl:-1" })),
+    { tab: "checked", table: "whl", whlIdx: "-1" });
+  assert.deepEqual(plain(api.remarkRoute({ kind: "key", ref: "ch:17" })),
+    { tab: "checked", bottom: "ch", recordRef: "17" });
+  assert.deepEqual(plain(api.remarkRoute({ kind: "key", ref: "ol:work:key" })),
+    { tab: "checked", bottom: "ol", recordRef: "work:key" });
+  assert.equal(api.remarkRoute({ kind: "key", ref: "unknown:1" }), null);
+  assert.equal(api.remarkRoute(null), null);
+  assert.deepEqual(plain(state.settings), before);
+});
+
+function applyHarness({ keyResult = true, buildResult = true, rowResult = true,
+  buildThrows = false } = {}) {
+  const calls = { key: [], build: [], row: [], refresh: [], remarks: 0, home: 0 };
+  const state = { rowsById: new Map() };
+  const remarksState = { error: "old error" };
+  const rows = [{ id: "row-1", attention: "Keep me" }];
+  const context = vm.createContext({
+    state,
+    remarksState,
+    combinedRows: () => rows,
+    setAttnKey: (...args) => { calls.key.push(plain(args)); return keyResult; },
+    refreshRemarkTarget: (item) => calls.refresh.push(plain(item)),
+    patchBuildRaw: async (...args) => {
+      calls.build.push(plain(args));
+      if (buildThrows) throw new Error("offline");
+      return buildResult;
+    },
+    setRowAttention: async (...args) => {
+      calls.row.push({ args: plain(args), lookupReady: state.rowsById.has("row-1") });
+      return rowResult;
+    },
+    renderRemarks: () => { calls.remarks += 1; },
+    renderHome: () => { calls.home += 1; },
+  });
+  vm.runInContext(`${declaration("applyRemarkValue")}
+this.api = { applyRemarkValue };`, context);
+  return { api: context.api, calls, remarksState, state };
+}
+
+test("removing marks dispatches by target kind and refreshes only after success", async () => {
+  const { api, calls, remarksState } = applyHarness();
+
+  assert.equal(await api.applyRemarkValue({
+    kind: "key", ref: "whl:7", label: "WHL row", category: "catalogs",
+  }, ""), true);
+  assert.deepEqual(calls.key, [["whl:7", "", {
+    label: "WHL row", category: "catalogs",
+  }]]);
+  assert.equal(calls.refresh.length, 1);
+
+  assert.equal(await api.applyRemarkValue({ kind: "build", ref: "build-1" }, ""), true);
+  assert.deepEqual(calls.build, [["build-1", { attention: "" }]]);
+
+  assert.equal(await api.applyRemarkValue({ kind: "row", ref: "row-1" }, ""), true);
+  assert.deepEqual(calls.row, [{ args: ["row-1", ""], lookupReady: true }]);
+  assert.equal(calls.remarks, 3);
+  assert.equal(calls.home, 3);
+  assert.equal(remarksState.error, "");
+});
+
+test("failed mark removal keeps the remark and exposes a retryable error", async () => {
+  for (const options of [{ buildResult: false }, { buildThrows: true }]) {
+    const { api, calls, remarksState } = applyHarness(options);
+    assert.equal(await api.applyRemarkValue({
+      kind: "build", ref: "build-1", label: "Draft Entry",
+    }, ""), false);
+    assert.equal(calls.home, 0);
+    assert.equal(calls.remarks, 1);
+    assert.equal(remarksState.error,
+      "Could not save this remark. The mark was kept.");
+  }
+});
+
+test("streamed tables can reveal a keyed row beyond the initial chunk", () => {
+  const pane = {
+    clientHeight: 0, scrollTop: 0, scrollHeight: 0,
+    addEventListener() {}, removeEventListener() {},
+  };
+  const tbody = {
+    rows: [],
+    closest(selector) { return selector === ".drafting" ? pane : {}; },
+    set innerHTML(value) { if (value === "") this.rows = []; },
+    appendChild(fragment) { this.rows.push(...fragment.rows); },
+  };
+  const context = vm.createContext({
+    document: { createDocumentFragment: () => ({
+      rows: [], appendChild(row) { this.rows.push(row); },
+    }) },
+    applyColHide() {},
+  });
+  vm.runInContext(`const STREAM_CHUNK = 200;
+${declaration("streamRows")}
+this.api = { streamRows };`, context);
+
+  const items = Array.from({ length: 450 }, (_, index) => ({ id: `row:${index}` }));
+  context.api.streamRows(tbody, items, (item) => item, (item) => item.id);
+  assert.equal(tbody.rows.length, 200);
+  assert.equal(tbody._streamReveal("row:350"), true);
+  assert.equal(tbody.rows.length, 400);
+  assert.equal(tbody._streamReveal("missing"), false);
+  assert.equal(tbody.rows.length, 400);
+  tbody._streamCleanup();
+  assert.equal(tbody._streamReveal, null);
+});

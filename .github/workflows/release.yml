@@ -325,9 +325,15 @@ jobs:
           # prereleases follow the prerelease line, and stable installs can opt in.
           pre=""
           case "$GITHUB_REF_NAME" in *-alpha*|*-beta*|*-rc*) pre="--prerelease" ;; esac
+          notes_file="docs/releases/$GITHUB_REF_NAME.md"
+          if [ -f "$notes_file" ]; then
+            notes_args=(--notes-file "$notes_file")
+          else
+            notes_args=(--notes "$notes")
+          fi
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag $pre \
-              --title "Library Tool $GITHUB_REF_NAME" --notes "$notes"
+              --title "Library Tool $GITHUB_REF_NAME" "${notes_args[@]}"
           gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
 
       # The step the website actually sees. release_publish.py gets the local

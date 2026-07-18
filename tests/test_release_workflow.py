@@ -87,3 +87,10 @@ def test_release_source_versions_are_internally_consistent():
     )
     assert re.search(r"\bversionCode\s*=\s*[1-9]\d*", gradle)
     assert re.search(r'\bversionName\s*=\s*"\d+\.\d+\.\d+[^\"]*"', gradle)
+
+
+def test_tagged_release_uses_its_committed_release_notes_when_present():
+    publish = WORKFLOW[WORKFLOW.index("  publish:\n") :]
+    assert 'notes_file="docs/releases/$GITHUB_REF_NAME.md"' in publish
+    assert 'notes_args=(--notes-file "$notes_file")' in publish
+    assert '"${notes_args[@]}"' in publish

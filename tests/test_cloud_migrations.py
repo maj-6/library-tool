@@ -22,6 +22,11 @@ BASELINE = SQL["001_baseline"]
 BASELINE_FLAT = " ".join(BASELINE.split())
 HARDENING = SQL["002_capture_owner_hardening"]
 HARDENING_FLAT = " ".join(HARDENING.split())
+SECRETS_REVISION = SQL["006_profile_secrets_revision"]
+SECRETS_REVISION_FLAT = " ".join(SECRETS_REVISION.split())
+MEMBER_LEDGER = SQL["005_member_roles_approval"]
+MEMBER_HOLDBACK = SQL["007_unreleased_member_gate_holdback"]
+MEMBER_HOLDBACK_FLAT = " ".join(MEMBER_HOLDBACK.split())
 
 
 # --- the migration files themselves ----------------------------------------------
@@ -111,6 +116,44 @@ def test_capture_storage_policies_bind_object_owner_to_capture_owner():
             policy = " ".join(match.group(0).split())
             assert "storage.objects.owner_id = c.created_by::text" in policy
             assert "grant_row.contributor_id = c.created_by" in policy
+
+
+def test_profile_secrets_revision_advances_for_every_client_version():
+    """CAS remains sound when an older client omits updated_at on UPDATE."""
+    assert "before update on public.profile_secrets" in SECRETS_REVISION_FLAT
+    assert "for each row" in SECRETS_REVISION_FLAT
+    assert "new.updated_at = greatest(" in SECRETS_REVISION_FLAT
+    assert "old.updated_at + interval '1 microsecond'" in SECRETS_REVISION_FLAT
+    assert "clock_timestamp()" in SECRETS_REVISION_FLAT
+    assert ("revoke all on function public.touch_profile_secrets_updated_at() "
+            "from public;" in SECRETS_REVISION_FLAT)
+    assert "security definer" not in SECRETS_REVISION_FLAT.lower()
+
+
+def test_unreleased_member_gate_is_recorded_but_not_replayed():
+    """005 exists in production history, but clean projects must not enable it."""
+    body = re.sub(r"--[^\n]*", "", MEMBER_LEDGER).lower()
+    assert "create policy" not in body
+    assert "create function" not in body
+    assert "alter table" not in body
+    assert "update profiles" not in body
+
+
+def test_member_holdback_restores_released_authorization_and_hides_helpers():
+    assert ("with check (actor_id = (select auth.uid()))" in
+            MEMBER_HOLDBACK_FLAT)
+    assert ("with check (created_by = (select auth.uid()))" in
+            MEMBER_HOLDBACK_FLAT)
+    assert "captures_update_authorized" in MEMBER_HOLDBACK_FLAT
+    assert "capture_ingest_grants" in MEMBER_HOLDBACK_FLAT
+    assert ("for insert to authenticated with check (bucket_id = 'captures')"
+            in MEMBER_HOLDBACK_FLAT)
+    for function in ("handle_new_user", "assert_maintainer",
+                     "is_active_member", "member_directory",
+                     "set_member_role", "set_member_status"):
+        assert f"public.{function}" in MEMBER_HOLDBACK
+    assert "from public, anon, authenticated" in MEMBER_HOLDBACK_FLAT
+    assert "update profiles" not in re.sub(r"--[^\n]*", "", MEMBER_HOLDBACK).lower()
 
 
 def test_migrations_lint_clean():

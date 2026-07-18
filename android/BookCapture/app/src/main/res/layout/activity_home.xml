@@ -40,24 +40,21 @@
             android:textColor="@color/whl_ink"
             android:text="@string/home_title" />
 
-        <TextView
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btnSelect"
+            style="@style/WhlToolbarAction"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:fontFamily="monospace"
             android:textSize="11sp"
-            android:textColor="@color/whl_ink"
-            android:padding="8dp"
             android:text="@string/home_select" />
 
-        <TextView
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btnSettings"
+            style="@style/WhlToolbarAction"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:fontFamily="monospace"
+            android:contentDescription="@string/open_settings"
             android:textSize="18sp"
-            android:textColor="@color/whl_ink"
-            android:padding="8dp"
             android:text="@string/gear" />
     </LinearLayout>
 
@@ -101,24 +98,21 @@
             android:textSize="12sp"
             android:textColor="@color/whl_ink" />
 
-        <TextView
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/deleteSelected"
+            style="@style/WhlToolbarAction"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:padding="8dp"
-            android:fontFamily="monospace"
             android:textSize="11sp"
             android:textColor="@color/whl_red"
             android:text="@string/home_delete_selected" />
 
-        <TextView
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/cancelSelection"
+            style="@style/WhlToolbarAction"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:padding="8dp"
-            android:fontFamily="monospace"
             android:textSize="11sp"
-            android:textColor="@color/whl_ink"
             android:text="@string/home_cancel_select" />
     </LinearLayout>
 

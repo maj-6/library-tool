@@ -1,8 +1,28 @@
 <?xml version="1.0" encoding="utf-8"?>
-<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="@color/whl_canvas">
+    android:background="@color/whl_canvas"
+    android:orientation="vertical">
+
+    <com.google.android.material.appbar.MaterialToolbar
+        android:id="@+id/toolbar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:minHeight="56dp"
+        android:background="@drawable/whl_panel"
+        android:elevation="2dp"
+        app:navigationContentDescription="@string/navigate_up"
+        app:navigationIcon="@drawable/ic_arrow_back"
+        app:navigationIconTint="@color/whl_ink"
+        app:title="@string/settings_title"
+        app:titleTextColor="@color/whl_ink" />
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
 
     <LinearLayout
         android:layout_width="match_parent"
@@ -66,18 +86,51 @@
                 android:importantForAutofill="no" />
         </LinearLayout>
 
-        <!-- capture -->
+        <!-- camera -->
         <LinearLayout style="@style/WhlPanelSection"
             android:layout_width="match_parent" android:layout_height="wrap_content"
             android:orientation="vertical">
             <TextView style="@style/WhlLabel"
                 android:layout_width="wrap_content" android:layout_height="wrap_content"
-                android:text="@string/set_capture" />
+                android:text="@string/set_camera" />
+            <TextView style="@style/WhlLabel"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="@string/set_capture_profile" />
+            <RadioGroup
+                android:id="@+id/cameraProfileGroup"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical">
+                <RadioButton
+                    android:id="@+id/cameraProfileFast"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:minHeight="48dp"
+                    android:text="@string/set_camera_fast"
+                    android:textColor="@color/whl_ink" />
+                <RadioButton
+                    android:id="@+id/cameraProfileDetail"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:minHeight="48dp"
+                    android:text="@string/set_camera_detail"
+                    android:textColor="@color/whl_ink" />
+            </RadioGroup>
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/continuousLight"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:minHeight="48dp"
+                android:text="@string/set_continuous_light"
+                android:textColor="@color/whl_ink" />
             <com.google.android.material.materialswitch.MaterialSwitch
                 android:id="@+id/sharpenPreview"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="4dp"
+                android:minHeight="48dp"
                 android:fontFamily="monospace"
                 android:textSize="13sp"
                 android:textColor="@color/whl_ink"
@@ -89,15 +142,45 @@
                 android:textSize="11sp"
                 android:textColor="@color/whl_ink_dim"
                 android:text="@string/set_sharpen_note" />
+            <Button
+                android:id="@+id/resetCamera"
+                style="@style/WhlButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:paddingStart="14dp"
+                android:paddingEnd="14dp"
+                android:text="@string/set_camera_reset"
+                android:textSize="12sp" />
+            <TextView style="@style/WhlLabel"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="@string/set_camera_diagnostics" />
+            <TextView
+                android:id="@+id/cameraDiagnostics"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="3dp"
+                android:fontFamily="monospace"
+                android:textSize="11sp"
+                android:textColor="@color/whl_ink_dim" />
+        </LinearLayout>
+
+        <!-- voice is optional and downloads its model only after opt-in -->
+        <LinearLayout style="@style/WhlPanelSection"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="vertical">
+            <TextView style="@style/WhlLabel"
+                android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:text="@string/set_voice" />
             <com.google.android.material.materialswitch.MaterialSwitch
                 android:id="@+id/voiceControl"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="10dp"
-                android:fontFamily="monospace"
-                android:textSize="13sp"
-                android:textColor="@color/whl_ink"
-                android:text="@string/set_voice" />
+                android:minHeight="48dp"
+                android:text="@string/set_voice_enable"
+                android:textColor="@color/whl_ink" />
             <TextView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -180,6 +263,7 @@
                 android:layout_width="wrap_content" android:layout_height="wrap_content"
                 android:text="@string/set_api_keys" />
             <TextView
+                android:id="@+id/apiKeysNote"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="2dp"
@@ -246,4 +330,5 @@
             android:textSize="12sp"
             android:textColor="@color/whl_ink_light" />
     </LinearLayout>
-</ScrollView>
+    </ScrollView>
+</LinearLayout>
