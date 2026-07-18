@@ -81,8 +81,8 @@
    heads. LINEN sits between (one soft gradient, nothing else).
 
    A theme may also set --ui to give itself a default interface face
-   (Segoe UI otherwise) — the user's explicit font pick, applied inline by
-   applyFont(), still beats it — and --icon-style to pick an activity-bar
+   (Segoe UI otherwise). Theme-editor font overrides are applied inline by
+   applyFont(); --icon-style picks an activity-bar
    icon set (see static/icons/tabs/).
 
    SAGE           - warm, earthy, bookish neutral: cream paper, taupe chrome,
@@ -2265,6 +2265,28 @@ a.badge:hover { text-decoration: underline; }
   background: rgba(155, 89, 182, 0.26);
   box-shadow: inset 3px 0 0 #9b59b6;
 }
+.ocr-book.attention { background: rgba(155, 89, 182, 0.16); }
+.ocr-book.attention.active {
+  background: rgba(155, 89, 182, 0.26);
+  box-shadow: inset 3px 0 0 #9b59b6;
+}
+.rw-pagebtn.attention {
+  background: rgba(155, 89, 182, 0.2);
+  border-color: #9b59b6;
+  box-shadow: inset 3px 0 0 #9b59b6;
+}
+.rw-pagebtn.attention.active { background: rgba(155, 89, 182, 0.3); }
+.ocr-pgrow.attention,
+.an-fac-page.attention { background: rgba(155, 89, 182, 0.12); }
+.ocr-pgrow.attention { box-shadow: inset 3px 0 0 #9b59b6; }
+.an-fac-page.attention { box-shadow: inset 3px 0 0 #9b59b6; }
+.publish-tree-node.attention > .publish-tree-row {
+  background: rgba(155, 89, 182, 0.16);
+  box-shadow: inset 3px 0 0 #9b59b6;
+}
+.publish-tree-node.attention.selected > .publish-tree-row {
+  background: rgba(155, 89, 182, 0.26);
+}
 
 /* verified-source status: yellow = draft entry in the editor, green = done */
 tr.src-draft { background: rgba(216, 160, 0, 0.12); }
@@ -3530,7 +3552,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   align-items: center;
   margin-bottom: 10px;
 }
-#theme-select, #font-select, #font-ui-select { max-width: 280px; }
+#ui-scale-select { max-width: 280px; }
 /* labelled slider (Experimental › sharpening amount) */
 .set-slider-row {
   display: flex;
@@ -5616,7 +5638,7 @@ body[data-theme="slate"] {
 .build-item.volume-member { padding-left: 18px; }
 .tree-ico svg { width: 11px; height: 11px; }
 .publish-tree-row {
-  min-height: 20px;
-  padding: 0 5px 0 calc(3px + var(--tree-depth) * 12px);
+  min-height: 19px;
+  padding: 0 5px 0 calc(3px + var(--tree-depth) * 11px);
 }
-#publish-tree { font-size: 11.5px; }
+#publish-tree { font-size: 11px; }

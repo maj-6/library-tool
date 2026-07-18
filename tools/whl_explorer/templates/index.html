@@ -45,7 +45,7 @@
           <button class="menu-item" data-cmd="table-whl" type="button"><span class="menu-check"></span>WHL table</button>
           <div class="menu-sep"></div>
           <!-- Theme picker as a hover submenu; #menu-themes is filled from THEMES
-               by buildThemeMenu(). Appearance is a View concern. -->
+               by buildThemeMenu(). Theme selection is a View concern. -->
           <div class="menu-item menu-sub">Theme<span class="menu-caret">&#9656;</span>
             <div class="menu-drop menu-sub-drop"><div id="menu-themes"></div></div>
           </div>
@@ -1044,7 +1044,7 @@
         <div id="wb-jobs-body" hidden>
           <div class="pane-bar">
             <button id="engine-defaults-open" class="cad-btn tiny" type="button"
-                    data-tip="Choose the default OCR and text-analysis engines">Default Engine:</button>
+                    data-tip="Choose the default OCR engine">Default OCR:</button>
             <span id="engine-defaults-summary" class="tool-label"></span>
             <button id="ocr-queue-add" class="cad-btn tiny icon-btn" type="button"
                     data-icon="plus" data-tip="Stage every page with the default OCR engine (nothing runs until Submit)"></button>
@@ -1421,7 +1421,7 @@
         <div id="publish-splitter"></div>
         <div id="publish-main">
           <div id="publish-preview-bar" class="pane-bar">
-            <span id="publish-preview-label" class="tool-label">World Herb Library preview</span>
+            <span id="publish-preview-label" class="tool-label">Archive Browser preview</span>
             <span class="bar-spacer"></span>
             <span id="publish-source" class="tool-label"></span>
             <button id="publish-open-live" class="cad-btn tiny icon-btn" type="button" hidden
@@ -1544,12 +1544,12 @@
   <div id="engine-overlay" class="overlay" hidden>
     <div id="engine-window" class="win">
       <div class="win-titlebar">
-        <span>Default engines</span>
+        <span>Default OCR engine</span>
         <button id="engine-close" class="win-close" type="button"
                 aria-label="Close" data-icon="close"></button>
       </div>
       <div id="engine-body">
-        <p class="pane-note">These engines are used when pages are staged. Cloud engines
+        <p class="pane-note">This engine is used when OCR pages are staged. Cloud engines
           remain unavailable until their API keys are configured.</p>
         <div class="engine-defaults-fields">
           <label class="tool-label" for="ocr-service">OCR</label>
@@ -1561,12 +1561,6 @@
           </select>
           <span></span>
           <span id="ocr-engine-note" class="tool-label"></span>
-          <label class="tool-label" for="analysis-service">Text Analysis</label>
-          <select id="analysis-service" class="cad-input">
-            <option value="configured">Configured AI provider</option>
-          </select>
-          <span></span>
-          <span id="analysis-engine-note" class="tool-label"></span>
         </div>
         <div class="dlg-actions">
           <button id="engine-settings" class="cad-btn quiet" type="button">Open settings&hellip;</button>
@@ -1737,7 +1731,7 @@
       <div id="settings-body">
         <div id="settings-nav">
           <button class="snav active" data-sec="sec-general" type="button">General</button>
-          <button class="snav" data-sec="sec-appearance" type="button">Appearance</button>
+          <button class="snav" data-sec="sec-appearance" type="button">Display</button>
           <button class="snav" data-sec="sec-theme" type="button">Theme editor</button>
           <button class="snav" data-sec="sec-tables" type="button">Table view</button>
           <button class="snav" data-sec="sec-library" type="button">Library &amp; data</button>
@@ -1798,18 +1792,10 @@
             <p class="settings-note" id="set-lan-note"></p>
           </div>
           <div id="sec-appearance" class="settings-sec">
-            <div class="settings-head">Appearance</div>
+            <div class="settings-head">Display</div>
             <div class="settings-rows">
-              <label class="tool-label" for="theme-select">Theme</label>
-              <select id="theme-select" class="cad-input"></select>
               <label class="tool-label" for="ui-scale-select">UI scale (Ctrl +/−, Ctrl 0)</label>
               <select id="ui-scale-select" class="cad-input"></select>
-              <label class="tool-label" for="font-ui-select">Interface font</label>
-              <select id="font-ui-select" class="cad-input"></select>
-              <label class="tool-label" for="font-select">Data / table font</label>
-              <select id="font-select" class="cad-input"></select>
-              <label class="tool-label" for="font-mono2-select">Tag / marker font</label>
-              <select id="font-mono2-select" class="cad-input"></select>
             </div>
           </div>
           <div id="sec-theme" class="settings-sec">
@@ -1817,8 +1803,8 @@
             <p class="settings-note">Fine-tune the colours, corners, line weight,
                text weight and fonts of the selected theme. Edits are saved per theme
                and layer over the built-in look — reset any single control, or the
-               whole theme, at any time. A font left on <b>Default</b> follows the
-               global choice under <b>Appearance</b>. <b>Duplicate</b> any theme to make
+               whole theme, at any time. A font left on <b>Theme default</b> follows
+               the selected theme&rsquo;s built-in typography. <b>Duplicate</b> any theme to make
                your own editable copy: custom themes appear in the theme list in
                <i>italics</i> and can be renamed, deleted, exported or imported.</p>
             <div class="te-topbar">
@@ -1955,7 +1941,7 @@
           <div id="sec-ocr" class="settings-sec">
             <div class="settings-head">OCR</div>
             <p class="settings-note">Engine selection and parameters. API keys live under
-              Credentials; OpenAI vision reuses the AI key.</p>
+              Credentials.</p>
             <div class="settings-rows">
               <label class="tool-label" for="set-ocr-service">Default service</label>
               <select id="set-ocr-service" class="cad-input">
@@ -1963,12 +1949,7 @@
                 <option value="mistral">Mistral OCR</option>
                 <option value="claude">Claude</option>
                 <option value="textract">Amazon Textract</option>
-                <option value="azure">Azure Document Intelligence</option>
-                <option value="openai">OpenAI vision</option>
               </select>
-              <label class="tool-label" for="set-ocr-azure-endpoint">Azure endpoint</label>
-              <input id="set-ocr-azure-endpoint" class="cad-input" spellcheck="false"
-                     placeholder="https://&lt;resource&gt;.cognitiveservices.azure.com/" />
               <label class="tool-label" for="set-ocr-tesseract">Tesseract executable</label>
               <input id="set-ocr-tesseract" class="cad-input" spellcheck="false"
                      placeholder="C:\Program Files\Tesseract-OCR\tesseract.exe" />
@@ -1997,8 +1978,6 @@
                 <option value="mistral">Mistral OCR</option>
                 <option value="claude">Claude</option>
                 <option value="textract">Amazon Textract</option>
-                <option value="azure">Azure Document Intelligence</option>
-                <option value="openai">OpenAI vision</option>
               </select>
               <label class="tool-label" for="set-ocr-key2">Page-view key 2</label>
               <select id="set-ocr-key2" class="cad-input">
@@ -2007,8 +1986,6 @@
                 <option value="mistral">Mistral OCR</option>
                 <option value="claude">Claude</option>
                 <option value="textract">Amazon Textract</option>
-                <option value="azure">Azure Document Intelligence</option>
-                <option value="openai">OpenAI vision</option>
               </select>
               <label class="tool-label" for="set-ocr-key3">Page-view key 3</label>
               <select id="set-ocr-key3" class="cad-input">
@@ -2017,8 +1994,6 @@
                 <option value="mistral">Mistral OCR</option>
                 <option value="claude">Claude</option>
                 <option value="textract">Amazon Textract</option>
-                <option value="azure">Azure Document Intelligence</option>
-                <option value="openai">OpenAI vision</option>
               </select>
               <label class="tool-label" for="set-ocr-key4">Page-view key 4</label>
               <select id="set-ocr-key4" class="cad-input">
@@ -2027,8 +2002,6 @@
                 <option value="mistral">Mistral OCR</option>
                 <option value="claude">Claude</option>
                 <option value="textract">Amazon Textract</option>
-                <option value="azure">Azure Document Intelligence</option>
-                <option value="openai">OpenAI vision</option>
               </select>
               <label class="tool-label" for="set-ocr-key5">Page-view key 5</label>
               <select id="set-ocr-key5" class="cad-input">
@@ -2037,8 +2010,6 @@
                 <option value="mistral">Mistral OCR</option>
                 <option value="claude">Claude</option>
                 <option value="textract">Amazon Textract</option>
-                <option value="azure">Azure Document Intelligence</option>
-                <option value="openai">OpenAI vision</option>
               </select>
             </div>
             <p class="settings-note">Page-view keys: hover a PDF page (or select pages by
@@ -2139,8 +2110,6 @@
                      data-tip="Used by the Mistral OCR service, and by the phone-capture pipeline" />
               <label class="tool-label" for="set-ocr-claude-key">Anthropic API key</label>
               <input id="set-ocr-claude-key" class="cad-input" type="password" spellcheck="false" />
-              <label class="tool-label" for="set-ocr-azure-key">Azure API key</label>
-              <input id="set-ocr-azure-key" class="cad-input" type="password" spellcheck="false" />
               <label class="tool-label" for="set-ocr-aws-key">AWS access key (Textract)</label>
               <input id="set-ocr-aws-key" class="cad-input" spellcheck="false" />
               <label class="tool-label" for="set-ocr-aws-secret">AWS secret key</label>

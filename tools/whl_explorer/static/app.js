@@ -186,9 +186,8 @@ const state = {
     smartScanInstructions: "", smartScanManualPages: false,
     // embeddings provider for search-index publishing (#140); blank = lexical-only
     embedBase: "", embedModel: "", embedKey: "",
-    // OCR services (Settings > OCR). Tesseract runs locally; Claude /
-    // Textract / Azure / OpenAI need credentials — cloud processing is
-    // TODO-verify until the user has API keys.
+    // OCR services (Settings > OCR). Tesseract runs locally; Mistral, Claude,
+    // and Textract use credentials from Settings > Credentials.
     // Cloud capture (phone -> Supabase -> manual entries) + Mistral key,
     // shared by the capture pipeline and the Mistral OCR service
     supabaseUrl: "", supabaseKey: "", supabaseAnonKey: "", mistralKey: "",
@@ -562,14 +561,14 @@ function applyTheme() {
   }
   document.body.dataset.theme = themeBase(id);   // base built-in supplies the CSS chrome
   applyThemeOverrides();   // this theme's edits (custom.overrides or the built-in's), inline
-  applyFont();             // fonts too: a per-theme override, else the global default
+  applyFont();             // fonts too: a per-theme override, else that theme's CSS default
   // a theme can carry its own activity-bar icon set (--icon-style); runs
   // after the chrome + overrides land so the computed value is current
   refreshActivityIcons();
 }
 
-// the one way to change theme: the Settings menu and the Appearance select
-// both come through here, so the menu ticks and the <select> never disagree
+// Both theme pickers -- View > Theme and the Theme editor -- come through
+// here, so the menu ticks and the editor <select> never disagree.
 function setTheme(id) {
   state.settings.theme = id;
   saveSettings();
@@ -1515,7 +1514,7 @@ function saveSettings() {
 }
 
 // --- UI scale (whole-interface zoom) -----------------------------------------
-// A Settings > Appearance control and Ctrl/Cmd +/- (reset with Ctrl/Cmd 0).
+// A Settings > Display control and Ctrl/Cmd +/- (reset with Ctrl/Cmd 0).
 // Applied as a CSS zoom on the root, so it scales the custom chrome too and
 // works both in Electron and the dev browser. The native menu is removed
 // (main.js), so there is no built-in zoom to fight.
@@ -1672,6 +1671,7 @@ function normalizeSettings() {
   const keyMap = state.settings.ocrKeyMap;
   if (!keyMap || typeof keyMap !== "object" || Array.isArray(keyMap)) {
     state.settings.ocrKeyMap = {};
+    migrated = true;
   } else {
     const supported = new Set(["tesseract", "mistral", "claude", "textract"]);
     for (const key of Object.keys(keyMap)) {
@@ -2405,9 +2405,13 @@ function progressSummary() {
   const attnCat = remarkItems.filter((item) => item.category === "catalogs").length;
   const attnEntries = remarkItems.filter((item) => item.category === "entries").length;
   const attnSources = remarkItems.filter((item) => item.category === "sources").length;
+  const attnPages = remarkItems.filter((item) => item.category === "pages").length;
+  const attnPublications = remarkItems.filter(
+    (item) => item.category === "publications").length;
   const attnEd = attnEntries + attnSources;
   return {
     drafts, ready, srcPending, attnCat, attnEd, attnEntries, attnSources,
+    attnPages, attnPublications,
   };
 }
 
@@ -2415,6 +2419,20 @@ function homeAttentionDestination(summary) {
   const catalogs = Number(summary.attnCat || 0);
   const entries = Number(summary.attnEntries || 0);
   const sources = Number(summary.attnSources || 0);
+  const pages = Number(summary.attnPages || 0);
+  const publications = Number(summary.attnPublications || 0);
+  // Preserve the established Catalogs/Workbench destinations. Page and
+  // publication marks have their own natural homes when they are the only
+  // class present; a mixed cross-tab set stays on Home and opens the shared
+  // sidebar's All filter instead of choosing an arbitrary tab.
+  if (pages || publications) {
+    const other = catalogs + entries + sources;
+    if (pages && !publications && !other)
+      return { tab: "replica", filter: "pages" };
+    if (publications && !pages && !other)
+      return { tab: "publish", filter: "publications" };
+    return { tab: "home", filter: "all" };
+  }
   if (catalogs) {
     return { tab: "checked", filter: entries || sources ? "all" : "catalogs" };
   }
@@ -2439,8 +2457,15 @@ function renderHome() {
       (detail ? `<span class="hr-d">${esc(detail)}</span>` : "") +
     `</button>`;
   const inEditor = p.drafts.length + p.ready;
-  const attn = p.attnCat + p.attnEd;
+  const attn = p.attnCat + p.attnEd + p.attnPages + p.attnPublications;
   const attnDest = homeAttentionDestination(p);
+  const attnBreakdown = [
+    p.attnCat ? `${p.attnCat} catalog` : "",
+    p.attnEd ? `${p.attnEd} workbench` : "",
+    p.attnPages ? `${p.attnPages} page${p.attnPages === 1 ? "" : "s"}` : "",
+    p.attnPublications
+      ? `${p.attnPublications} publication${p.attnPublications === 1 ? "" : "s"}` : "",
+  ].filter(Boolean);
   let html =
     row(inEditor, inEditor === 1 ? "entry in the workbench" : "entries in the workbench",
         `data-gotab="workbench"`, inEditor ? `${p.drafts.length} draft · ${p.ready} to publish` : "") +
@@ -2450,7 +2475,7 @@ function renderHome() {
         : "items marked for attention",
         `data-remarks="1" data-remarks-filter="${attnDest.filter}" ` +
         `data-gotab="${attnDest.tab}"`,
-        p.attnCat && p.attnEd ? `${p.attnCat} catalog · ${p.attnEd} workbench` : "");
+        attnBreakdown.length > 1 ? attnBreakdown.join(" · ") : "");
 
   // the freshest few drafts, so unfinished work is one click away
   const drafts = p.drafts.slice()
@@ -2717,6 +2742,28 @@ function initTabs() {
 }
 
 // --- tooltip (match info + overflowed cells) ---------------------------------
+
+// Root CSS zoom scales fixed-position offsets, but pointer coordinates,
+// getBoundingClientRect(), and viewport bounds are reported in visual pixels.
+// Measure/collide in that visual space, then convert the final offsets back to
+// the root's pre-zoom coordinate space before assigning CSS left/top.
+function fixedPopupMetrics(node) {
+  node.style.left = "0px";
+  node.style.top = "0px";
+  return {
+    rect: node.getBoundingClientRect(),
+    scale: Math.max(0.01, Number(state.settings.uiScale) || 1),
+  };
+}
+
+function positionFixedPopup(node, left, top, metrics = fixedPopupMetrics(node)) {
+  const { rect, scale } = metrics;
+  const edge = 8 * scale;
+  left = Math.max(edge, Math.min(left, innerWidth - rect.width - edge));
+  top = Math.max(edge, Math.min(top, innerHeight - rect.height - edge));
+  node.style.left = (left / scale) + "px";
+  node.style.top = (top / scale) + "px";
+}
 
 function showTip(text, x, y) {
   const tip = el("cad-tooltip");
@@ -3132,9 +3179,9 @@ function openPopup(anchor, html, wire) {
   pop.innerHTML = html;
   pop.hidden = false;
   const r = anchor.getBoundingClientRect();
-  pop.style.top = Math.min(r.bottom + 4, innerHeight - pop.offsetHeight - 8) + "px";
-  pop.style.left = Math.max(8, Math.min(r.right - pop.offsetWidth,
-    innerWidth - pop.offsetWidth - 8)) + "px";
+  const box = fixedPopupMetrics(pop);
+  positionFixedPopup(pop, r.right - box.rect.width,
+    r.bottom + 4 * box.scale, box);
   if (wire) wire(pop);
 }
 
@@ -3196,26 +3243,6 @@ function openFilterMenu(anchor) {
 }
 
 // --- settings window -----------------------------------------------------------
-
-function fillFontSelect(id, list, settingKey, apply) {
-  const sel = el(id);
-  sel.innerHTML = "";
-  for (const [val, label] of list) {
-    const o = document.createElement("option");
-    o.value = val;
-    // the interface face has per-theme defaults now (a theme may set --ui),
-    // so its empty choice means "whatever the theme picks", not one fixed font
-    o.textContent = (!val && settingKey === "fontUi") ? "Theme default" : label;
-    sel.appendChild(o);
-  }
-  sel.value = state.settings[settingKey] || "";
-  if (sel.value !== (state.settings[settingKey] || "")) sel.value = "";
-  sel.onchange = () => {
-    state.settings[settingKey] = sel.value;
-    saveSettings();
-    apply();
-  };
-}
 
 // --- Settings > Integrations: downloadable databases ------------------------
 
@@ -3337,6 +3364,24 @@ function pollDbStatus() {
   }, 1000);
 }
 
+async function resetSettingsToDefaults() {
+  const fresh = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
+  const { prefs } = partitionSettings(fresh);
+  // Replace only the settings blob. Checked books and attention marks are
+  // separate top-level client-state fields and must survive an interface reset.
+  const res = await fetch("/api/client_state", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ settings: prefs }),
+  });
+  if (!res.ok) throw new Error(`settings reset failed (HTTP ${res.status})`);
+  try {
+    localStorage.removeItem(SETTINGS_KEY);
+    localStorage.removeItem(VIEWSTATE_KEY);
+  } catch (e) {}
+  location.reload();
+}
+
 function renderSettings() {
   // GENERAL
   el("gen-info").textContent =
@@ -3350,11 +3395,8 @@ function renderSettings() {
       confirmLabel: "Reset settings",
       danger: true,
     }))) return;
-    try {
-      localStorage.removeItem(SETTINGS_KEY);
-      localStorage.removeItem(VIEWSTATE_KEY);
-    } catch (e) {}
-    location.reload();
+    try { await resetSettingsToDefaults(); }
+    catch (e) { statusErr("SETTINGS RESET :: " + (e.message || "server unavailable")); }
   };
   el("clear-history-btn").onclick = async () => {
     if (!(await confirmDialog({
@@ -3442,10 +3484,7 @@ function renderSettings() {
   }
   renderLanSettings();
 
-  // APPEARANCE
-  const themeSel = el("theme-select");
-  fillThemeSelect(themeSel);               // built-ins + custom themes (custom italic)
-  themeSel.onchange = () => setTheme(themeSel.value);
+  // DISPLAY
   const scaleSel = el("ui-scale-select");
   if (scaleSel) {
     scaleSel.innerHTML = UI_SCALES.map((v) =>
@@ -3453,17 +3492,12 @@ function renderSettings() {
     scaleSel.value = String(state.settings.uiScale || 1);
     scaleSel.onchange = () => setUiScale(Number(scaleSel.value));
   }
-  fillFontSelect("font-ui-select", FONT_CHOICES, "fontUi", applyFont);
-  fillFontSelect("font-select", FONT_CHOICES, "font", applyFont);
-  fillFontSelect("font-mono2-select", FONT_CHOICES, "fontMono2", applyFont);
   renderThemeEditor();
 
   // AI
   for (const [id, k] of [["set-r2-account", "r2Account"], ["set-r2-bucket", "r2Bucket"],
-                        ["set-r2-key", "r2KeyId"], ["set-r2-secret", "r2Secret"],
                         ["set-r2-public", "r2PublicBase"],
                         ["set-ai-base", "aiBase"], ["set-ai-model", "aiModel"],
-                         ["set-ai-key", "aiKey"],
                          ["set-embed-base", "embedBase"],
                          ["set-embed-model", "embedModel"],
                          ["set-ai-instructions", "aiInstructions"],
@@ -3494,24 +3528,14 @@ function renderSettings() {
     saveSettings();
     updateDefaultEngineSummary();
   };
-  for (const [id, k] of [["set-ocr-azure-endpoint", "ocrAzureEndpoint"],
-                         ["set-ocr-azure-key", "ocrAzureKey"],
-                         ["set-ocr-tesseract", "ocrTesseract"],
-                         ["set-ocr-claude-key", "ocrClaudeKey"],
+  for (const [id, k] of [["set-ocr-tesseract", "ocrTesseract"],
                          ["set-ocr-claude-model", "ocrClaudeModel"],
-                         ["set-ocr-aws-key", "ocrAwsKey"],
-                         ["set-ocr-aws-secret", "ocrAwsSecret"],
                          ["set-ocr-aws-region", "ocrAwsRegion"],
                          ["set-gs-sheet-id", "gsSpreadsheetId"],
-                         ["set-gs-keyfile", "gsKeyFile"],
                          ["set-gs-sheet-name", "gsSheetName"],
                          ["set-cloud-url", "cloudSearchUrl"],
                          ["set-sb-url", "supabaseUrl"],
-                         ["set-sb-key", "supabaseKey"],
-                         ["set-sb-anon", "supabaseAnonKey"],
-                         ["set-mistral-key", "mistralKey"],
                          ["set-imggen-provider", "imgGenProvider"],
-                         ["set-imggen-key", "imgGenKey"],
                          ["set-imggen-model", "imgGenModel"]]) {
     const n = el(id);
     n.value = state.settings[k] || "";
@@ -3520,15 +3544,14 @@ function renderSettings() {
       saveSettings();
     };
   }
-  // Credentials: re-wire the secret fields the generic loops above touched so
-  // their values load from and save to the server's Host-guarded secrets API.
+  // Credentials load from and save to the server's Host-guarded secrets API.
   // Mistral is cached there and synchronized with the private cloud profile;
   // the others remain device-local.
   (async () => {
     const SECRET_FIELDS = [
       ["set-ai-key", "aiKey"], ["set-embed-key", "embedKey"],
       ["set-mistral-key", "mistralKey"],
-      ["set-ocr-claude-key", "ocrClaudeKey"], ["set-ocr-azure-key", "ocrAzureKey"],
+      ["set-ocr-claude-key", "ocrClaudeKey"],
       ["set-ocr-aws-key", "ocrAwsKey"], ["set-ocr-aws-secret", "ocrAwsSecret"],
       ["set-sb-key", "supabaseKey"], ["set-sb-anon", "supabaseAnonKey"],
       ["set-r2-key", "r2KeyId"], ["set-r2-secret", "r2Secret"],
@@ -3799,8 +3822,7 @@ function renderSettings() {
 // --- Settings > Theme editor --------------------------------------------------
 // The chrome tokens the editor exposes, grouped for the panel. Colours are
 // #rrggbb via the native <input type=color>; --radius/--border-w are px lengths
-// (slider + number); weights are a fixed dropdown. Font-family vars are
-// deliberately excluded -- they are global and stay under Appearance.
+// (slider + number); weights and per-theme font families use fixed dropdowns.
 const THEME_TOKENS = [
   ["Accent & primary", [
     { v: "--cyan",  l: "Accent (focus, links)", t: "color" },
@@ -3844,7 +3866,7 @@ const THEME_TOKENS = [
     { v: "--wt-strong", l: "Heading weight",   t: "wt", def: "700",
       opts: [["400", "Regular"], ["500", "Medium"], ["600", "Semibold"], ["700", "Bold"]] },
   ]],
-  // fonts are per-theme here; "Default" falls back to the global Appearance font
+  // Fonts are per-theme here; an empty override falls back to theme CSS.
   ["Fonts", [
     { v: "--ui",    l: "Interface font", t: "font" },
     { v: "--mono",  l: "Data / table font", t: "font" },
@@ -3937,7 +3959,7 @@ function renderThemeEditor() {
     }
     saveSettings();
     applyThemeOverrides();
-    applyFont();               // a reset font token falls back to the global default
+    applyFont();               // a reset font token falls back to that theme's CSS default
     renderThemeEditor();
   };
 
@@ -4012,7 +4034,7 @@ function renderThemeEditor() {
         const sel = document.createElement("select");
         sel.className = "cad-input te-fontsel";
         const def = document.createElement("option");
-        def.value = ""; def.textContent = "Default (Appearance)";
+        def.value = ""; def.textContent = "Theme default";
         sel.appendChild(def);
         for (const [val, name] of FONT_CHOICES) {
           if (!val) continue;                              // skip FONT_CHOICES' own "Default"
@@ -5275,9 +5297,9 @@ const ATTN_KEY = "whl_cad_attention_v1";
 const ATTN_DIRTY_KEY = "whl_cad_attention_dirty_v1";
 
 // Remarks is the shared presentation of every needs-attention mark. Categories
-// describe the target object, not the tab currently showing the sidebar. Pages
-// and publications are reserved now so their owning tabs already have the right
-// default when those target classes become markable.
+// describe the target object, not the tab currently showing the sidebar. Page
+// and publication marks use keyed identities because those read-only objects do
+// not carry the mutable attention field used by rows and editor builds.
 const REMARK_CATEGORIES = [
   ["catalogs", "Catalogs"], ["sources", "Sources"], ["entries", "Entries"],
   ["pages", "Pages"], ["publications", "Publications"],
@@ -5327,8 +5349,64 @@ function remarkKeyParts(key) {
     : { prefix: raw.slice(0, colon), ref: raw.slice(colon + 1) };
 }
 
+function remarkDecodePart(value) {
+  try { return decodeURIComponent(String(value || "")); }
+  catch (e) { return null; }
+}
+
+// A Replica page is source-scoped: page 12 of a secondary scan is unrelated
+// to page 12 of the primary PDF. Encode every identity component so separators
+// in imported build/source ids cannot make two pages share a mark.
+function replicaPageRemarkKey(buildId, sourceId, page) {
+  const n = Number(page);
+  if (!String(buildId || "") || !Number.isSafeInteger(n) || n < 1) return "";
+  return "page:" + [buildId, sourceId || "primary", n]
+    .map((part) => encodeURIComponent(String(part))).join("|");
+}
+
+function replicaPageRemarkParts(key) {
+  const { prefix, ref } = remarkKeyParts(key);
+  if (prefix !== "page" && prefix !== "page-deleted") return null;
+  const parts = ref.split("|");
+  if (parts.length !== 3 && !(prefix === "page-deleted" && parts.length === 4))
+    return null;
+  const buildId = remarkDecodePart(parts[0]);
+  const sourceId = remarkDecodePart(parts[1]);
+  const pagePart = remarkDecodePart(parts[2]);
+  const tombstone = parts.length === 4 ? remarkDecodePart(parts[3]) : "";
+  const page = Number(pagePart);
+  if (buildId == null || sourceId == null || pagePart == null ||
+      tombstone == null || (parts.length === 4 && !tombstone) ||
+      !buildId || !sourceId || !/^[1-9]\d*$/.test(pagePart) ||
+      !Number.isSafeInteger(page)) return null;
+  return {
+    buildId, sourceId, page, deleted: prefix === "page-deleted",
+    encodedBuild: parts[0], encodedSource: parts[1],
+  };
+}
+
+// Published-tree aliases (author/category/date) all carry the same selection
+// key. Persist that key rather than a rendered node id so one publication has
+// exactly one mark regardless of the current grouping.
+function publicationRemarkKey(selectionKey) {
+  const selection = String(selectionKey || "");
+  return /^(book|set):.+/.test(selection)
+    ? "pub:" + encodeURIComponent(selection) : "";
+}
+
+function publicationRemarkSelection(key) {
+  const { prefix, ref } = remarkKeyParts(key);
+  if (prefix !== "pub") return "";
+  const selection = remarkDecodePart(ref);
+  return selection != null && /^(book|set):.+/.test(selection) ? selection : "";
+}
+
 function remarkCategoryForKey(key) {
-  return remarkKeyParts(key).prefix.startsWith("src") ? "sources" : "catalogs";
+  const { prefix } = remarkKeyParts(key);
+  if (prefix.startsWith("src")) return "sources";
+  if (prefix === "page" || prefix === "page-deleted") return "pages";
+  if (prefix === "pub") return "publications";
+  return "catalogs";
 }
 
 // Legacy source marks used only URL/path/title and could merge two catalog
@@ -5387,6 +5465,72 @@ function setAttnKey(k, val, meta) {
   return true;
 }
 
+function remappedPageRemarkValue(value, oldPage, newPage) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const label = String(value.label || "");
+  const match = label.match(/(\s+\u00b7\s*page\s+)(\d+)$/i);
+  if (!match || Number(match[2]) !== oldPage) return value;
+  return Object.assign({}, value, {
+    label: label.slice(0, match.index) + match[1] + newPage,
+  });
+}
+
+// PDF deletion renumbers every higher page. Move page marks in the same
+// transaction-like pass: delete all old keys first, then install shifted keys,
+// so a mark from page N+1 cannot collide with the deleted page N's old key.
+// Shared review refs and the server-side client-state copy are remapped by the
+// deletion endpoint; this keeps the live browser copy in lock-step with them.
+function remapPageRemarkKeys(buildId, sourceId, removedPages) {
+  const removed = [...new Set((removedPages || []).map(Number)
+    .filter((n) => Number.isSafeInteger(n) && n > 0))].sort((a, b) => a - b);
+  if (!String(buildId || "") || !removed.length) return false;
+  const removedSet = new Set(removed);
+  const attn = state.attn && typeof state.attn === "object" && !Array.isArray(state.attn)
+    ? state.attn : (state.attn = {});
+  const settings = state.settings || (state.settings = {});
+  const meta = settings.remarksMeta && typeof settings.remarksMeta === "object" &&
+      !Array.isArray(settings.remarksMeta)
+    ? settings.remarksMeta : (settings.remarksMeta = {});
+  const moves = [];
+
+  for (const key of new Set([...Object.keys(attn), ...Object.keys(meta)])) {
+    const page = replicaPageRemarkParts(key);
+    if (!page || page.deleted || page.buildId !== String(buildId) ||
+        page.sourceId !== String(sourceId || "primary")) continue;
+    const shifted = page.page - removed.filter((n) => n < page.page).length;
+    const next = removedSet.has(page.page) ? ""
+      : `page:${page.encodedBuild}|${page.encodedSource}|${shifted}`;
+    moves.push({
+      key, next, oldPage: page.page, newPage: shifted,
+      hasValue: Object.prototype.hasOwnProperty.call(attn, key), value: attn[key],
+      hasMeta: Object.prototype.hasOwnProperty.call(meta, key), meta: meta[key],
+    });
+  }
+  if (!moves.length) return false;
+
+  for (const move of moves) {
+    delete attn[move.key];
+    delete meta[move.key];
+  }
+  for (const move of moves) {
+    if (!move.next) continue; // the marked physical page was deleted
+    if (move.hasValue) attn[move.next] = remappedPageRemarkValue(
+      move.value, move.oldPage, move.newPage);
+    if (move.hasMeta) meta[move.next] = remappedPageRemarkValue(
+      move.meta, move.oldPage, move.newPage);
+  }
+  try { localStorage.setItem(ATTN_KEY, JSON.stringify(attn)); } catch (e) {}
+  try { localStorage.setItem(ATTN_DIRTY_KEY, "1"); } catch (e) {}
+  saveSettings();
+  pushClientState("attention");
+  renderReplicaAttentionMarks();
+  decorateOcrPages();
+  decorateAnFacsimile();
+  renderRemarks();
+  renderHome();
+  return true;
+}
+
 function activeRemarksTab() {
   const tab = document.querySelector("#tabs .tab.active");
   return tab ? tab.dataset.tab : "home";
@@ -5416,12 +5560,54 @@ function remarkSecondary(parts) {
   return parts.filter((x) => String(x || "").trim()).join(" \u00b7 ");
 }
 
+function replicaPageSourceAvailable(build, source) {
+  if (!build) return false;
+  source = String(source || "primary");
+  if (source === "primary") return true;
+  return (build.pdf_sources || []).some((item) => String(item.id) === source);
+}
+
+function replicaPageBuildRevision(ref) {
+  const page = replicaPageRemarkParts(ref);
+  const build = page && !page.deleted && (state.builds || {})[page.buildId];
+  return build ? String(build.updated_at || "unversioned") : "";
+}
+
 function keyedRemarkDescriptor(key, stored, sourceByKey) {
   const { prefix, ref } = remarkKeyParts(key);
   const meta = Object.assign({}, attnMeta(stored),
     (state.settings.remarksMeta || {})[key] || {});
   let label = "", volume = "", subtype = "Catalog record", secondary = "", canOpen = false;
-  if (prefix === "src" || prefix === "src2") {
+  if (prefix === "page" || prefix === "page-deleted") {
+    const page = replicaPageRemarkParts(key);
+    const build = page && (state.builds || {})[page.buildId];
+    label = build ? (build.title || page.buildId) : "";
+    volume = build ? bookVolumeValue(build) : "";
+    subtype = page && page.deleted ? "Removed replica page" : "Replica page";
+    secondary = page ? remarkSecondary([
+      `Page ${page.page}`,
+      page.sourceId !== "primary" ? `Source ${page.sourceId}` : "",
+    ]) : "";
+    canOpen = !!(page && !page.deleted &&
+      replicaPageSourceAvailable(build, page.sourceId));
+  } else if (prefix === "pub") {
+    const selection = publicationRemarkSelection(key);
+    const entity = selection ? publishFindEntity(selection) : null;
+    const entry = entity && entity.kind === "book" ? entity.entries[0] : null;
+    label = entity ? entity.label : "";
+    volume = entry ? bookVolumeValue(entry) : "";
+    subtype = (entity ? entity.kind === "set" : selection.startsWith("set:"))
+      ? "Published set" : "Published volume";
+    secondary = entity
+      ? (entity.kind === "set"
+        ? `${entity.entries.length} published volume${entity.entries.length === 1 ? "" : "s"}`
+        : remarkSecondary([entry.authors, entry.year]))
+      : "";
+    // The catalogue loads lazily. A syntactically valid saved publication can
+    // open that loader; once a complete catalogue is present, a missing entity
+    // is correctly treated as stale instead of routing to the first item.
+    canOpen = !!selection && (!state.publishLoaded || !!entity);
+  } else if (prefix === "src" || prefix === "src2") {
     const source = sourceByKey
       ? sourceByKey.get(key)
       : approvedSources().find((s) =>
@@ -5485,9 +5671,16 @@ function reviewOnlyRemarkDescriptor(review, rows, sourceByKey) {
   let item = null;
   if (kind === "key") {
     item = keyedRemarkDescriptor(ref, review.reason || "1", sourceByKey);
-    const saved = reviewLabelBook(review, item.label);
-    if (review.label) item.label = saved.title;
-    if (saved.volume) item.volume = saved.volume;
+    const page = replicaPageRemarkParts(ref);
+    const savedReview = page && review.label
+      ? Object.assign({}, review, { label: String(review.label).replace(
+        /\s·\s[Pp]age\s+\d+(?:\s·\sSource\s+.*?)?(?:\s·\sremoved)?$/, "") })
+      : review;
+    const saved = reviewLabelBook(savedReview, item.label);
+    if (review.label && (!page || !(state.builds || {})[page.buildId]))
+      item.label = saved.title;
+    if (saved.volume && (!page || !(state.builds || {})[page.buildId]))
+      item.volume = saved.volume;
   } else if (kind === "build") {
     const build = (state.builds || {})[ref];
     const saved = reviewLabelBook(review, ref);
@@ -5600,6 +5793,17 @@ function remarkRoute(item) {
   // persisted kind/ref pair.
   if (prefix.startsWith("src"))
     return { tab: "workbench", phase: "record", sourceKey: String(item.ref) };
+  if (prefix === "page") {
+    const page = replicaPageRemarkParts(item.ref);
+    return page ? {
+      tab: "replica", replicaBookId: page.buildId,
+      replicaSource: page.sourceId, replicaPage: page.page,
+    } : null;
+  }
+  if (prefix === "pub") {
+    const selection = publicationRemarkSelection(item.ref);
+    return selection ? { tab: "publish", publicationSelection: selection } : null;
+  }
   if (prefix === "whl") return { tab: "checked", table: "whl", whlIdx: ref };
   if (prefix === "ch" || prefix === "ol")
     return { tab: "checked", bottom: prefix, recordRef: ref };
@@ -5756,7 +5960,8 @@ function renderRemarks() {
   const selEnd = editorHadFocus ? document.activeElement.selectionEnd : null;
   if (!n) {
     list.innerHTML = `<div class="remarks-empty">No remarks or open discussions. ` +
-      `Press Q while hovering a catalog row, verified source, or entry to add a mark.</div>`;
+      `Press Q while hovering a catalog row, verified source, entry, page, ` +
+      `or publication to add a mark.</div>`;
     return;
   }
   if (filter === "all") {
@@ -5812,12 +6017,23 @@ function remarksItemById(id) {
   return remarksItems().find((item) => item.id === id) || null;
 }
 
-function refreshRemarkTarget(item) {
-  if (!item || item.kind !== "key") return;
-  const { prefix } = remarkKeyParts(item.ref);
+function refreshKeyedRemarkTarget(key) {
+  const { prefix } = remarkKeyParts(key);
   if (prefix === "whl" && state.whlRows) renderWhlTop();
   else if (prefix.startsWith("src")) renderUpload();
+  else if (prefix === "page") {
+    renderReplicaAttentionMarks();
+    decorateOcrPages();
+    decorateAnFacsimile();
+  } else if (prefix === "pub") {
+    if (state.publishLoaded) renderPublishTree();
+  }
   else if (state.settings.showCatalog) renderBottomRows();
+}
+
+function refreshRemarkTarget(item) {
+  if (!item || item.kind !== "key") return;
+  refreshKeyedRemarkTarget(item.ref);
 }
 
 async function applyRemarkValue(item, value) {
@@ -5895,13 +6111,17 @@ async function clearRemarkEditor(id) {
 async function ensureRemarkReview(item) {
   const existing = remarkReviewForItem(item);
   if (existing && existing.status === "open") return existing;
+  const title = bookTitleText({ title: item.label, volume: item.volume }, item.label);
   const res = await fetch("/api/reviews", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       kind: item.kind, ref: String(item.ref),
-      label: bookTitleText({ title: item.label, volume: item.volume }, item.label),
+      label: item.category === "pages"
+        ? remarkSecondary([title, item.secondary]) : title,
       reason: item.reason || "",
+      page_revision: item.category === "pages"
+        ? replicaPageBuildRevision(item.ref) : "",
     }),
   }).catch(() => null);
   const data = res ? await res.json().catch(() => ({})) : {};
@@ -6063,6 +6283,12 @@ async function openRoutedItem(item) {
       await selectWorkbenchBook(route.buildId, route.phase);
       if (state.buildSel !== route.buildId) return; // discard guard cancelled
     }
+    const build = (state.builds || {})[route.buildId];
+    const groupId = String((build && build.group_id) || "").trim();
+    if (groupId && !setExpanded(groupId)) {
+      setSetExpanded(groupId, true);
+      renderOcrBooks();
+    }
     activateTopTab(route.tab, { preserveWorkbenchEdit: preserveEdit });
     requestAnimationFrame(() =>
       flashRemarkTarget(document.querySelector(`#ocr-books .build-item[data-bid="${CSS.escape(route.buildId)}"]`)));
@@ -6088,6 +6314,59 @@ async function openRoutedItem(item) {
       const shown = index >= 0 && flashRemarkTarget(
         document.querySelector(`#upload-rows tr[data-si="${index}"]`));
       if (!shown) status("SOURCE IS HIDDEN BY THE CURRENT WORKBENCH FILTER");
+    });
+    return;
+  }
+  if (route.replicaBookId) {
+    const bid = String(route.replicaBookId);
+    const source = String(route.replicaSource || "primary");
+    const page = Number(route.replicaPage);
+    const build = (state.builds || {})[bid];
+    // Reject stale secondary-source remarks before selectReplicaBook can ask
+    // the user to discard unrelated edits or change any Replica context.
+    if (!replicaPageSourceAvailable(build, source) ||
+        !Number.isSafeInteger(page) || page < 1) {
+      status("REPLICA PAGE IS NO LONGER AVAILABLE");
+      return;
+    }
+    if (rwState.book !== bid) {
+      await selectReplicaBook(bid);
+      if (rwState.book !== bid) return; // discard guard cancelled
+    }
+    // Validate even an apparently unchanged source: a saved secondary source
+    // may have been removed while its old page state is still in memory.
+    if (!(await selectReplicaSource(source)) || rwState.src !== source) return;
+    if (page > rwState.pageCount) {
+      status("REPLICA PAGE IS NO LONGER AVAILABLE");
+      return;
+    }
+    // Reopening the current dirty page must only reveal it; fetching it again
+    // would silently replace the user's unsaved region edits.
+    if (rwState.page !== page) {
+      await selectReplicaPage(page);
+      if (rwState.page !== page) return; // discard guard cancelled
+    }
+    activateTopTab(route.tab);
+    requestAnimationFrame(() => flashRemarkTarget(
+      el("rw-pages").querySelector(`.rw-pagebtn[data-page="${page}"]`)));
+    return;
+  }
+  if (route.publicationSelection) {
+    if (!state.publishLoaded) await loadPublishCatalog();
+    const entity = publishFindEntity(route.publicationSelection);
+    if (!entity) {
+      status("PUBLICATION IS NO LONGER IN THE CATALOGUE");
+      renderRemarks();
+      return;
+    }
+    state.publishSel = route.publicationSelection;
+    activateTopTab(route.tab);
+    renderPublishTree(true);
+    await renderPublishPreview();
+    requestAnimationFrame(() => {
+      const pick = [...el("publish-tree").querySelectorAll("[data-publish-select]")]
+        .find((node) => node.dataset.publishSelect === route.publicationSelection);
+      flashRemarkTarget(pick && pick.closest(".publish-tree-row"));
     });
     return;
   }
@@ -6256,18 +6535,80 @@ function initRemarksSidebar() {
 // an attention target: {label, current, apply(value)}. Q marks it and opens
 // the reason popover on it.
 function attnTargetAtHover() {
-  const bi = document.querySelector("#ocr-books .build-item:hover");
-  if (bi) {
-    const b = state.builds[bi.dataset.bid];
+  const buildTarget = (node, bid, rerender) => {
+    const b = (state.builds || {})[bid];
     if (!b) return null;
     return {
-      node: bi,
-      kind: "build", ref: bi.dataset.bid,
-      label: b.title || bi.dataset.bid,
+      node, kind: "build", ref: String(bid), label: b.title || String(bid),
       current: String(b.attention || ""),
-      apply: (v) => patchBuildRaw(bi.dataset.bid, { attention: v })
-        .then(() => status(v ? "Marked: needs attention" : "Attention mark cleared")),
+      apply: (v) => patchBuildRaw(bid, { attention: v }).then((ok) => {
+        if (rerender) rerender();
+        status(v ? "Marked: needs attention" : "Attention mark cleared");
+        return ok;
+      }),
     };
+  };
+  const keyTarget = (node, key, label, rerender, category) => ({
+    node, kind: "key", ref: key, label,
+    current: attnValue((state.attn || {})[key]),
+    apply: (v) => {
+      setAttnKey(key, v, { label, category: category || remarkCategoryForKey(key) });
+      rerender();
+    },
+  });
+  const pageTarget = (node, bid, source, page, rerender) => {
+    const b = (state.builds || {})[bid];
+    const key = replicaPageRemarkKey(bid, source, page);
+    // OCR may still render historical documents for a removed secondary scan.
+    // Those pages are useful evidence, but they cannot be reopened in Replica,
+    // so do not create a navigation-backed mark that is stale from birth.
+    if (!replicaPageSourceAvailable(b, source) || !key) return null;
+    const target = keyTarget(node, key,
+      `${bookTitleText(b, b.title || bid)} · page ${page}`,
+      rerender, "pages");
+    // Snapshot the build revision with the page the user actually marked.
+    // Review creation validates it so a concurrent page deletion cannot bind
+    // the new thread to whichever physical page shifted into this number.
+    target.pageRevision = String(b.updated_at || "unversioned");
+    return target;
+  };
+
+  const bi = document.querySelector("#ocr-books .build-item:hover");
+  if (bi) {
+    return buildTarget(bi, bi.dataset.bid);
+  }
+  const replicaBook = document.querySelector("#rw-books .ocr-book:hover");
+  if (replicaBook) {
+    return buildTarget(replicaBook, replicaBook.dataset.bid, renderReplicaBooks);
+  }
+  const replicaPage = document.querySelector("#rw-pages .rw-pagebtn:hover");
+  if (replicaPage) {
+    return pageTarget(replicaPage, rwState.book, rwState.src,
+      +replicaPage.dataset.page, renderReplicaAttentionMarks);
+  }
+  const ocrPage = document.querySelector("#ocr-pages .ocr-pgrow:hover");
+  if (ocrPage) {
+    const doc = ocrSelDoc();
+    if (doc && doc.buildId) return pageTarget(ocrPage, doc.buildId,
+      ocrState.pagesSrc || docSrcKey(doc), +ocrPage.dataset.page, decorateOcrPages);
+  }
+  const facsimilePage = document.querySelector("#an-facsimile .an-fac-page:hover");
+  if (facsimilePage) {
+    const doc = ocrSelDoc();
+    if (doc && doc.buildId) return pageTarget(facsimilePage, doc.buildId,
+      docSrcKey(doc), +facsimilePage.dataset.page, decorateAnFacsimile);
+  }
+  const publicationRow = document.querySelector("#publish-tree .publish-tree-row:hover");
+  if (publicationRow) {
+    const pick = publicationRow.querySelector("[data-publish-select]");
+    const selection = pick && pick.dataset.publishSelect;
+    const entity = selection && publishFindEntity(selection);
+    const key = publicationRemarkKey(selection);
+    if (!entity || !key) return null; // grouping folders are not domain items
+    const label = entity.kind === "set"
+      ? `${entity.label} · published set`
+      : bookTitleText(entity.entries[0], entity.label);
+    return keyTarget(publicationRow, key, label, renderPublishTree, "publications");
   }
   const tr = document.querySelector(
     "#checked-rows tr:hover, #whltop-rows tr:hover, " +
@@ -6285,25 +6626,15 @@ function attnTargetAtHover() {
       apply: (v) => setRowAttention(tr.dataset.rowId, v),
     };
   }
-  const keyTarget = (k, label, rerender, category) => ({
-    node: tr,
-    kind: "key", ref: k,
-    label,
-    current: attnValue((state.attn || {})[k]),
-    apply: (v) => {
-      setAttnKey(k, v, { label, category: category || remarkCategoryForKey(k) });
-      rerender();
-    },
-  });
   if (host === "whltop-rows" && tr.dataset.widx != null) {
-    return keyTarget("whl:" + tr.dataset.widx,
+    return keyTarget(tr, "whl:" + tr.dataset.widx,
       tr.children[1] ? tr.children[1].textContent : "WHL row", renderWhlTop,
       "catalogs");
   }
   if (host === "upload-rows" && tr.dataset.si != null) {
     const s = (state.uploadSources || [])[+tr.dataset.si];
     if (!s) return null;
-    return keyTarget(activeSourceRemarkKey(s),
+    return keyTarget(tr, activeSourceRemarkKey(s),
       s.title || "source", renderUpload, "sources");
   }
   if (host === "bottom-rows" && tr.dataset.bi != null) {
@@ -6320,7 +6651,7 @@ function attnTargetAtHover() {
         apply: (v) => setRowAttention(rec._mid, v).then(renderBottomRows),
       };
     }
-    return keyTarget(`${rec._src}:${rec._idx}`, rec.title || "row", renderBottomRows,
+    return keyTarget(tr, `${rec._src}:${rec._idx}`, rec.title || "row", renderBottomRows,
       "catalogs");
   }
   return null;
@@ -6464,15 +6795,14 @@ function openAttnPop(target, rect) {
 // pin below the anchor row, flipping up / clamping in at the viewport edges
 function positionAttnPop() {
   const pop = el("attn-pop");
-  const p = pop.getBoundingClientRect();
+  const box = fixedPopupMetrics(pop), p = box.rect;
   const r = attnPopRect ||
     { left: innerWidth / 2, top: innerHeight / 2, bottom: innerHeight / 2 };
   let left = r.left;
-  let top = r.bottom + 4;
-  if (left + p.width > innerWidth - 8) left = Math.max(8, innerWidth - p.width - 8);
-  if (top + p.height > innerHeight - 8) top = Math.max(8, r.top - p.height - 4);
-  pop.style.left = Math.max(8, left) + "px";
-  pop.style.top = top + "px";
+  let top = r.bottom + 4 * box.scale;
+  if (top + p.height > innerHeight - 8 * box.scale)
+    top = r.top - p.height - 4 * box.scale;
+  positionFixedPopup(pop, left, top, box);
 }
 
 // Escape / click-away / scroll leave the mark as it stands: the row was marked
@@ -6495,7 +6825,8 @@ function saveAttnPop() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ kind: t.kind, ref: String(t.ref),
-                             label: t.label || "", reason }),
+                             label: t.label || "", reason,
+                             page_revision: t.pageRevision || "" }),
     }).then(async (res) => {
       if (res.ok) {
         await loadReviews();
@@ -6652,11 +6983,9 @@ function renderReviewList() {
 async function clearMark(kind, ref) {
   if (kind === "key") {
     setAttnKey(ref, "");
-    // repaint whichever table bakes this mark into its rows (the tab-switch
-    // renders only cover the checked/upload tables)
-    if (ref.startsWith("whl:")) renderWhlTop();
-    else if (remarkKeyParts(ref).prefix.startsWith("src")) renderUpload();
-    else renderBottomRows();
+    // Repaint whichever surface bakes this keyed mark into its rows. The
+    // helper also handles Replica/OCR pages and aliased publication nodes.
+    refreshKeyedRemarkTarget(ref);
     return;
   }
   if (kind === "build") {
@@ -9166,8 +9495,7 @@ function openProcMenu(x, y, items) {
     `<button type="button" class="pm-item pm-btn${it.danger ? " pm-danger" : ""}" data-i="${i}">${esc(it.label)}</button>`).join("");
   pop.hidden = false;
   popupAnchor = pop;
-  pop.style.top = Math.max(8, Math.min(y, innerHeight - pop.offsetHeight - 8)) + "px";
-  pop.style.left = Math.max(8, Math.min(x, innerWidth - pop.offsetWidth - 8)) + "px";
+  positionFixedPopup(pop, x, y);
   pop.querySelectorAll(".pm-btn").forEach((b) => b.addEventListener("click", () => {
     const it = items[+b.dataset.i];
     closePopup();
@@ -11921,7 +12249,11 @@ function decorateAnFacsimile() {
   const bid = d && d.buildId;
   for (const row of box.querySelectorAll(".an-fac-page")) {
     const page = +row.dataset.page;
-    const key = `${bid}:${docSrcKey(d)}:${page}`;
+    const source = docSrcKey(d);
+    const key = `${bid}:${source}:${page}`;
+    const attentionKey = bid ? replicaPageRemarkKey(bid, source, page) : "";
+    const attention = attentionKey ? (state.attn || {})[attentionKey] : "";
+    const attentionWhy = attnReason(attention);
     const staged = bid ? ocrState.analysisTags.get(key) : null;
     const running = [...anJobs.values()].some((job) => !job.finished &&
       job.buildId === bid && (job.src || "primary") === docSrcKey(d) &&
@@ -11929,6 +12261,9 @@ function decorateAnFacsimile() {
     row.classList.toggle("pg-sel", ocrState.pageSel.has(page));
     row.classList.toggle("pg-analysis-staged", !!staged);
     row.classList.toggle("pg-analysis-running", running);
+    row.classList.toggle("attention", !!attnValue(attention));
+    if (attentionWhy) row.dataset.tip = "Needs attention: " + attentionWhy;
+    else delete row.dataset.tip;
     const badge = row.querySelector(".an-fac-badge");
     if (badge) {
       badge.hidden = !staged && !running;
@@ -12110,7 +12445,7 @@ async function anStartJob(path, body, label, btn) {
     }
   }
   el("an-msg").textContent = "";
-  body.engine = body.engine || state.settings.textAnalysisService || "configured";
+  body.engine = body.engine || "configured";
   if (btn) btn.disabled = true;
   try {
     const res = await fetch(path, {
@@ -13534,10 +13869,10 @@ function startEditCategories(td, row) {
   holder.innerHTML = `<div id="catcell-picker"></div>`;
   document.body.appendChild(holder);
   const r = td.getBoundingClientRect();
-  holder.style.left = `${Math.min(r.left, window.innerWidth - 340)}px`;
-  holder.style.top = `${r.bottom + 2}px`;
   const picker = makeCatPicker("catcell-picker");
   picker.set(before);
+  const box = fixedPopupMetrics(holder);
+  positionFixedPopup(holder, r.left, r.bottom + 2 * box.scale, box);
   holder.querySelector(".cat-input").focus();
 
   let done = false;
@@ -13845,6 +14180,9 @@ function publishTreeNodeHtml(node, depth) {
   const open = folder && publishNodeOpen(node, depth);
   const selected = !!node.selectKey && node.selectKey === state.publishSel;
   const selectable = node.kind === "book" || node.kind === "set";
+  const attentionKey = selectable ? publicationRemarkKey(node.selectKey) : "";
+  const attention = attentionKey ? (state.attn || {})[attentionKey] : "";
+  const attentionWhy = attnReason(attention);
   const count = node.kind === "set" ? `${node.entries.length}` : "";
   const caret = folder
     ? `<button class="publish-caret" type="button" data-publish-toggle="${esc(node.nodeId)}"
@@ -13860,9 +14198,10 @@ function publishTreeNodeHtml(node, depth) {
   const children = open && node.children.length
     ? `<div class="publish-tree-children">${node.children
       .map((child) => publishTreeNodeHtml(child, depth + 1)).join("")}</div>` : "";
-  return `<div class="publish-tree-node ${node.kind}${selected ? " selected" : ""}"
+  return `<div class="publish-tree-node ${node.kind}${selected ? " selected" : ""}${attention ? " attention" : ""}"
       data-publish-node="${esc(node.nodeId)}">
-    <div class="publish-tree-row" style="--tree-depth:${depth}">${caret}
+    <div class="publish-tree-row" style="--tree-depth:${depth}"${attentionWhy
+      ? ` data-tip="Needs attention: ${esc(attentionWhy)}"` : ""}>${caret}
       <span class="publish-tree-icon" aria-hidden="true">${node.kind === "book" ? "□" : "▣"}</span>
       ${label}${count ? `<span class="publish-tree-count">${count}</span>` : ""}</div>${children}</div>`;
 }
@@ -13875,6 +14214,57 @@ function publishFindEntity(key) {
       label: String(entry.title || "Untitled"), entries: [entry] };
   }
   return publishEntities().find((entity) => entity.key === key) || null;
+}
+
+function publishWorkbenchBuildId(entry) {
+  const builds = state.builds || {};
+  const direct = String((entry && entry.local_build_id) || "").trim();
+  if (direct && builds[direct]) return direct;
+  const slug = publishSlug(entry);
+  if (!slug) return "";
+  const matches = Object.entries(builds).filter(([, build]) =>
+    build && String(build.published_slug || "").trim() === slug);
+  return matches.length === 1 ? String(matches[0][0]) : "";
+}
+
+async function openPublishedWorkbenchEntry(entry) {
+  let bid = publishWorkbenchBuildId(entry);
+  // Builds and the public catalogue load independently during startup. Refresh
+  // only when the catalogue supplied a link before the initial build list
+  // arrived. A general refresh here could replace a dirty editor's backing
+  // state before openRoutedItem gets a chance to run its discard guard.
+  const hinted = String((entry && entry.local_build_id) || "").trim();
+  if (!bid && hinted && !Object.keys(state.builds || {}).length) {
+    await loadBuilds();
+    bid = publishWorkbenchBuildId(entry);
+  }
+  if (!bid) {
+    status("PUBLISHED VOLUME HAS NO UNIQUE LOCAL WORKBENCH ENTRY");
+    return false;
+  }
+  await openRoutedItem({ kind: "build", ref: bid });
+  return state.buildSel === bid;
+}
+
+function publishContextMenuItems(selection) {
+  const entity = publishFindEntity(selection);
+  // A set is an organizational view over several Workbench builds. Its book
+  // children each have an unambiguous destination; choosing one for the set
+  // itself would be surprising.
+  if (!entity || entity.kind !== "book") return [];
+  return [{ label: "Open in Workbench",
+    fn: () => openPublishedWorkbenchEntry(entity.entries[0]) }];
+}
+
+function onPublishContextMenu(ev) {
+  if (ev.target.closest("input, textarea, [contenteditable]")) return;
+  const row = ev.target.closest(".publish-tree-row");
+  if (!row) return;
+  const pick = row.querySelector("[data-publish-select]");
+  const items = publishContextMenuItems(pick && pick.dataset.publishSelect);
+  if (!items.length) return;
+  ev.preventDefault();
+  openProcMenu(ev.clientX, ev.clientY, items);
 }
 
 function renderPublishTree(revealSelection = false) {
@@ -14079,8 +14469,7 @@ function publishActions(v) {
 
 function publishMasthead(body) {
   return `<div class="ppub-masthead"><img src="/static/icon.png" width="40" height="40" alt="">
-    <div><div class="ppub-wordmark">World Herb Library</div>
-      <div class="ppub-sub">An archival collection of botanical &amp; medical works</div></div></div>
+    <div class="ppub-wordmark">Archive Browser</div></div>
     <div class="ppub-shell">${body}</div>`;
 }
 
@@ -14273,6 +14662,7 @@ function loadPublishCatalog() {
       el("publish-source").title = state.publishWarning;
       renderPublishTree(true);
       renderPublishPreview();
+      renderRemarks();
     } catch (e) {
       if (mine !== state.publishCatalogSeq) return;
       el("publish-source").textContent = "Could not load catalogue";
@@ -14593,9 +14983,9 @@ function switchPaneTab(id) {
 // --- Advanced Search popup (the form lives outside the left pane now) ---------
 function openAdvSearch() {
   const pop = el("adv-search-pop"), r = el("adv-search-btn").getBoundingClientRect();
-  pop.style.top = (r.bottom + 4) + "px";
-  pop.style.left = r.left + "px";
   pop.hidden = false;
+  const box = fixedPopupMetrics(pop);
+  positionFixedPopup(pop, r.left, r.bottom + 4 * box.scale, box);
   el("s-title").focus();
 }
 function closeAdvSearch() {
@@ -16310,6 +16700,14 @@ async function syncBuildFolder() {
   el("b-src-msg").textContent = "Building folder ...";
   el("b-folder").disabled = true;
   try {
+    if (state.settings.trimBlank) {
+      // The server may renumber page-keyed marks during this request. Drain
+      // older whole-blob writes first so none can land afterward and resurrect
+      // the pre-trim page identities.
+      pushClientState("attention");
+      pushClientState("settings");
+      await flushClientState();
+    }
     const res = await fetch(`/api/builds/${encodeURIComponent(b.id)}/folder`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -16325,6 +16723,13 @@ async function syncBuildFolder() {
       // the sync may have retired the IA original and repointed pdf_file
       // at the folder's preview.pdf
       if (data.build) state.builds[b.id] = data.build;
+      if (data.page_remap && Array.isArray(data.page_remap.deleted)) {
+        remapPageRemarkKeys(b.id, data.page_remap.source,
+          data.page_remap.deleted);
+        await loadReviews();
+        renderRemarks();
+        renderHome();
+      }
       // a blank-page trim rewrites the PDF: cached counts/dims are stale,
       // and the trim renumbers the word/region sidecars server-side
       ocrState.pdfInfo = {};
@@ -16408,10 +16813,8 @@ async function attachPdfFile(path) {
 
 // --- OCR tab: load, review, compare, and correct OCR text -------------------------
 // OCR targets are the books' PDFs. The sidebar lists every book folder;
-// selecting one loads its OCR text files as documents. Cloud/local OCR
-// processing (Azure Document Intelligence, OpenAI vision, Tesseract) plugs
-// into the queue once service credentials exist (Settings > OCR) — TODO:
-// verify against a live service when the user has an API key.
+// selecting one loads its OCR text files as documents. Cloud/local OCR plugs
+// into the queue once its service credentials exist.
 
 const ocrState = {
   docs: [], sel: null, view: "pdf", jobs: [], seq: 0,   // page view is home
@@ -17045,7 +17448,7 @@ function buildOcrKeymapLegend() {
   if (!host) return;
   const map = state.settings.ocrKeyMap || {};
   const SHORT = { tesseract: "Tesseract", mistral: "Mistral", claude: "Claude",
-                  textract: "Textract", azure: "Azure", openai: "OpenAI" };
+                  textract: "Textract" };
   const parts = [];
   for (const k of ["1", "2", "3", "4", "5"]) {
     if (map[k]) parts.push(`<b>${k}</b> ${esc(SHORT[map[k]] || map[k])}`);
@@ -18039,14 +18442,12 @@ async function ocrSetQuality(v) {
   }
 }
 
-// is the chosen OCR service configured? (Settings > OCR)
-// services the server can actually run today; azure/openai queue as stubs
-// (their processors are TODO until credentials exist)
+// Is the chosen OCR service configured? Only processors the server can run are
+// exposed; provider credentials live under Settings > Credentials.
 const OCR_RUNNABLE = { tesseract: true, mistral: true, claude: true, textract: true };
 const OCR_SERVICE_LABELS = {
   tesseract: "Tesseract (local)", mistral: "Mistral OCR", claude: "Claude",
   textract: "Amazon Textract",
-  azure: "Azure Document Intelligence", openai: "OpenAI vision",
 };
 
 function ocrServiceReady(svc) {
@@ -18055,24 +18456,20 @@ function ocrServiceReady(svc) {
   if (svc === "mistral") return !!s.mistralKey;   // shared with the capture pipeline
   if (svc === "claude") return !!s.ocrClaudeKey;
   if (svc === "textract") return !!(s.ocrAwsKey && s.ocrAwsSecret);
-  if (svc === "azure") return !!(s.ocrAzureEndpoint && s.ocrAzureKey);
-  if (svc === "openai") return !!s.aiKey;         // reuses the AI credentials
   return false;
 }
 
 const TEXT_ANALYSIS_LABELS = { configured: "Configured AI provider" };
 
-function analysisServiceReady(engine) {
-  return engine === "configured" && !!String(state.settings.aiKey || "").trim();
+function analysisServiceReady() {
+  return !!String(state.settings.aiKey || "").trim();
 }
 
 function updateDefaultEngineSummary() {
   const host = el("engine-defaults-summary");
   if (!host) return;
   const ocr = OCR_SERVICE_LABELS[state.settings.ocrService] || "Tesseract (local)";
-  const analysis = TEXT_ANALYSIS_LABELS[state.settings.textAnalysisService] ||
-    "Configured AI provider";
-  host.textContent = `${ocr} / ${analysis}`;
+  host.textContent = ocr;
   // the drawer is Workbench-global but its stage-all acts on the CURRENT
   // book's selected source — name the target where the button lives,
   // and refuse (disabled) rather than error after the click
@@ -18100,22 +18497,11 @@ function refreshDefaultEngineOptions() {
   for (const option of ocr.options) {
     const ready = ocrServiceReady(option.value);
     option.disabled = !ready;
-    option.title = ready ? "" : "Add this engine's API key in Settings > OCR";
+    option.title = ready ? "" : "Add this engine's API key in Settings > Credentials";
   }
   ocr.value = state.settings.ocrService || "tesseract";
-  const analysis = el("analysis-service");
-  const ready = analysisServiceReady("configured");
-  analysis.value = "configured";
-  analysis.disabled = !ready;
-  analysis.options[0].disabled = !ready;
-  const model = String(state.settings.aiModel || "").trim() || "deepseek-chat";
-  analysis.options[0].textContent = ready
-    ? `Configured AI provider - ${model}`
-    : `Configured AI provider - API key required`;
   el("ocr-engine-note").textContent = [...ocr.options].some((o) => o.disabled)
     ? "Cloud engines without credentials are unavailable." : "";
-  el("analysis-engine-note").textContent = ready
-    ? "" : "Add an AI API key in Settings > AI.";
   updateDefaultEngineSummary();
 }
 
@@ -18159,11 +18545,11 @@ async function stageSelectedAnalysisPages() {
     el("an-page-msg").textContent = "Select one or more facsimile pages first.";
     return;
   }
-  const engine = state.settings.textAnalysisService || "configured";
-  if (!analysisServiceReady(engine)) await hydrateSecrets();
-  if (!analysisServiceReady(engine)) {
-    el("an-page-msg").textContent = "Text Analysis needs an API key.";
-    await openDefaultEngines();
+  const engine = "configured";
+  if (!analysisServiceReady()) await hydrateSecrets();
+  if (!analysisServiceReady()) {
+    el("an-page-msg").textContent =
+      "Text Analysis needs an API key in Settings > Credentials.";
     return;
   }
   const src = docSrcKey(d);
@@ -18179,10 +18565,10 @@ async function stageSelectedAnalysisPages() {
 async function submitAnalysisStaged(bid) {
   const groups = stagedAnalysisPagesFor(bid);
   if (!groups.size) return { submitted: false, failed: false };
-  if (!analysisServiceReady(state.settings.textAnalysisService || "configured"))
-    await hydrateSecrets();
-  if (!analysisServiceReady(state.settings.textAnalysisService || "configured")) {
-    el("an-page-msg").textContent = "Text Analysis needs an API key.";
+  if (!analysisServiceReady()) await hydrateSecrets();
+  if (!analysisServiceReady()) {
+    el("an-page-msg").textContent =
+      "Text Analysis needs an API key in Settings > Credentials.";
     return { submitted: false, failed: true };
   }
   let submitted = false;
@@ -18218,19 +18604,13 @@ async function ocrQueuePages(bid, srcKey, pages) {
   const pdf = ocrSrcPdf(bid, srcKey);
   const target = srcCompiledName(srcKey);
   if (!b || !pdf || !pages.length) return;
-  const bad = pages.find((x) => !OCR_RUNNABLE[x.service]);
-  if (bad) {
-    // azure/openai: keep the honest stub row — no processor yet
-    ocrState.jobs.push({
-      buildId: bid, book: b.title || bid, volume: bookVolumeValue(b), pdf,
-      service: OCR_SERVICE_LABELS[bad.service] || bad.service,
-      status: ocrServiceReady(bad.service)
-        ? "Queued — processing not implemented yet"
-        : "Queued — service not configured (Settings > OCR)",
-      at: new Date().toLocaleTimeString(),
-    });
-    renderOcrQueue();
-    return;
+  const unavailable = pages.filter((x) => !OCR_RUNNABLE[x.service]);
+  if (unavailable.length) {
+    for (const x of unavailable)
+      ocrState.pageTags.delete(`${bid}:${srcKey}:${x.page}`);
+    pages = pages.filter((x) => OCR_RUNNABLE[x.service]);
+    el("ocr-msg").textContent = "Removed staged pages for an unavailable OCR service.";
+    if (!pages.length) { renderOcrQueue(); return; }
   }
   // Opening Settings is not a prerequisite for cloud-backed credentials.
   // Refresh on demand before deciding that a selected service is unavailable.
@@ -18239,7 +18619,7 @@ async function ocrQueuePages(bid, srcKey, pages) {
   const missing = pages.find((x) => !ocrServiceReady(x.service));
   if (missing) {
     el("ocr-msg").textContent =
-      `${OCR_SERVICE_LABELS[missing.service]} is not configured (Settings > OCR)`;
+      `${OCR_SERVICE_LABELS[missing.service]} is not configured (Settings > Credentials)`;
     return;
   }
   const s = state.settings;
@@ -18766,6 +19146,12 @@ async function deleteSelectedPages() {
       });
     } catch (e) { /* the renumber then works from the last saved version */ }
   }
+  // The delete endpoint remaps its server-side attention/settings blobs. Wait
+  // out any older whole-blob client write so it cannot finish afterward and
+  // put the old page numbers back.
+  pushClientState("attention");
+  pushClientState("settings");
+  await flushClientState();
   try {
     const res = await fetch("/api/pdf/pages/delete", {
       method: "POST",
@@ -18778,6 +19164,13 @@ async function deleteSelectedPages() {
       return;
     }
     if (data.build) state.builds[bid] = data.build;
+    if (data.page_remap && Array.isArray(data.page_remap.deleted)) {
+      remapPageRemarkKeys(bid, data.page_remap.source,
+        data.page_remap.deleted);
+      await loadReviews();
+      renderRemarks();
+      renderHome();
+    }
     clearOcrPageSel();
     // staged/running markers no longer match the new numbering
     for (const k of [...ocrState.pageTags.keys()]) {
@@ -18840,6 +19233,10 @@ function decorateOcrPages() {
   box.querySelectorAll(".ocr-pgrow").forEach((row) => {
     const n = +row.dataset.page;
     const k = `${d && d.buildId}:${ocrState.pagesSrc}:${n}`;
+    const attentionKey = d && d.buildId
+      ? replicaPageRemarkKey(d.buildId, ocrState.pagesSrc, n) : "";
+    const attention = attentionKey ? (state.attn || {})[attentionKey] : "";
+    const attentionWhy = attnReason(attention);
     const staged = b ? ocrState.pageTags.get(k) : undefined;
     const running = b ? ocrState.pageRunning.get(k) : undefined;
     const title = titles.has(n);
@@ -18847,6 +19244,9 @@ function decorateOcrPages() {
     row.classList.toggle("pg-staged", !!staged);
     row.classList.toggle("pg-queued", !!running);
     row.classList.toggle("pg-sel", ocrState.pageSel.has(n));
+    row.classList.toggle("attention", !!attnValue(attention));
+    if (attentionWhy) row.dataset.tip = "Needs attention: " + attentionWhy;
+    else delete row.dataset.tip;
     // The chip HTML depends only on title/staged/running. Rebuild it only when
     // one of those changed, so the 1.5s job poller doesn't rewrite every row's
     // innerHTML every tick — on a long book only the handful of pages that just
@@ -18952,8 +19352,11 @@ function renderReplicaBooks() {
   el("rw-book-count").textContent = books.length || "";
   for (const b of books) {
     const li = document.createElement("li");
-    li.className = "ocr-book" + (b.id === rwState.book ? " active" : "");
+    li.className = "ocr-book" + (b.id === rwState.book ? " active" : "") +
+      (b.attention ? " attention" : "");
     li.dataset.bid = b.id;
+    const why = attnReason(b.attention);
+    if (why) li.dataset.tip = "Needs attention: " + why;
     li.innerHTML = `<span class="bi-title">${bookTitleHtml(b)}</span>
       <span class="bi-meta">${esc(b.authors || "")}${b.authors && b.year ? " &middot; " : ""}${esc(b.year || "")}</span>`;
     list.appendChild(li);
@@ -19007,6 +19410,42 @@ async function selectReplicaBook(bid) {
   rwSyncBar();
 }
 
+async function selectReplicaSource(source) {
+  source = String(source || "primary");
+  const b = (state.builds || {})[rwState.book] || {};
+  const sources = ["primary", ...(b.pdf_sources || []).map((item) => String(item.id))];
+  const select = el("rw-src");
+  if (!sources.includes(source)) {
+    if (select) select.value = rwState.src;
+    status("REPLICA SOURCE IS NO LONGER AVAILABLE");
+    return false;
+  }
+  if (source === rwState.src) {
+    if (select) select.value = source;
+    return true;
+  }
+  if (rwState.dirty &&
+      !(await rwConfirmDiscard("Switching sources discards them."))) {
+    if (select) select.value = rwState.src;
+    return false;
+  }
+  const seq = ++rwState.seq; // kill any in-flight fetch of the old source
+  rwState.src = source;
+  if (select) select.value = source;
+  rwState.page = 0; rwState.items = []; rwState.sel = [];
+  rwState.dirty = false;
+  rwState.outliers = []; // scores belong to the old source's grid
+  el("rw-canvas").hidden = true;
+  el("rw-empty").hidden = false;
+  await renderReplicaPages(seq);
+  if (seq !== rwState.seq) return false;
+  // Templates are per source too: source A's names must not stamp source B.
+  await rwLoadTemplates(seq);
+  if (seq !== rwState.seq) return false;
+  rwSyncBar();
+  return true;
+}
+
 async function rwLoadTemplates(seq) {
   let names = [];
   try {
@@ -19030,6 +19469,27 @@ function rwPageChip(n) {
     return '<span class="rw-check">✓</span>';
   }
   return rwState.regionPages.includes(n) ? '<span class="rw-dot">●</span>' : "";
+}
+
+function syncReplicaPageAttention(button, page) {
+  if (!button) return;
+  const key = replicaPageRemarkKey(rwState.book, rwState.src, page);
+  const value = key ? (state.attn || {})[key] : "";
+  const marked = !!attnValue(value);
+  const why = attnReason(value);
+  button.classList.toggle("attention", marked);
+  button.setAttribute("aria-label", marked
+    ? `Page ${page}, needs attention${why ? `: ${why}` : ""}`
+    : `Page ${page}`);
+  if (why) button.dataset.tip = "Needs attention: " + why;
+  else delete button.dataset.tip;
+}
+
+function renderReplicaAttentionMarks() {
+  const box = el("rw-pages");
+  if (!box) return;
+  for (const button of box.querySelectorAll(".rw-pagebtn[data-page]"))
+    syncReplicaPageAttention(button, +button.dataset.page);
 }
 
 async function renderReplicaPages(seq) {
@@ -19065,6 +19525,7 @@ async function renderReplicaPages(seq) {
     d.className = "rw-pagebtn" + (n === rwState.page ? " active" : "");
     d.dataset.page = n;
     d.innerHTML = `${n}` + rwPageChip(n);
+    syncReplicaPageAttention(d, n);
     frag.appendChild(d);
   }
   box.appendChild(frag);
@@ -20128,26 +20589,8 @@ function initReplica() {
     const b = ev.target.closest(".rw-pagebtn");
     if (b) selectReplicaPage(+b.dataset.page);
   });
-  el("rw-src").addEventListener("change", async () => {
-    if (rwState.dirty &&
-        !(await rwConfirmDiscard("Switching sources discards them."))) {
-      el("rw-src").value = rwState.src;
-      return;
-    }
-    const seq = ++rwState.seq;   // kill any in-flight fetch of the old source
-    rwState.src = el("rw-src").value;
-    rwState.page = 0; rwState.items = []; rwState.sel = [];
-    rwState.dirty = false;
-    rwState.outliers = [];       // scores belong to the OLD source's grid
-    el("rw-canvas").hidden = true;
-    el("rw-empty").hidden = false;
-    await renderReplicaPages(seq);
-    if (seq !== rwState.seq) return;
-    // templates are per source too — source A's names must not stamp B
-    await rwLoadTemplates(seq);
-    if (seq !== rwState.seq) return;
-    rwSyncBar();
-  });
+  el("rw-src").addEventListener("change", () =>
+    selectReplicaSource(el("rw-src").value));
   el("rw-overlay").addEventListener("mousedown", rwMouseDown);
   document.addEventListener("mousemove", rwMouseMove);
   document.addEventListener("mouseup", rwMouseUp);
@@ -20414,12 +20857,6 @@ function initOcrTab() {
     saveSettings();
     updateDefaultEngineSummary();
   });
-  el("analysis-service").value = state.settings.textAnalysisService || "configured";
-  el("analysis-service").addEventListener("change", () => {
-    state.settings.textAnalysisService = el("analysis-service").value;
-    saveSettings();
-    updateDefaultEngineSummary();
-  });
   el("engine-defaults-open").addEventListener("click", openDefaultEngines);
   el("engine-close").addEventListener("click", closeDefaultEngines);
   el("engine-done").addEventListener("click", closeDefaultEngines);
@@ -20554,32 +20991,6 @@ function buildThemeMenu() {
   }
 }
 
-// Settings > OCR engine: the same generated-picker pattern as themes. The value
-// lives in TWO <select>s (the OCR toolbar + the Settings dialog); keep both in
-// step, exactly as the dialog's onchange does.
-function setOcrService(id) {
-  state.settings.ocrService = id;
-  saveSettings();
-  const q = el("ocr-service"); if (q) q.value = id;
-  const s = el("set-ocr-service"); if (s) s.value = id;
-  updateDefaultEngineSummary();
-}
-function buildOcrMenu() {
-  const host = el("menu-ocr-service");
-  if (!host) return;
-  host.innerHTML = "";
-  for (const [id, label] of OCR_SERVICES) {
-    const cmd = "ocrsvc:" + id;
-    MENU_CMDS[cmd] = () => setOcrService(id);
-    const b = document.createElement("button");
-    b.type = "button";
-    b.className = "menu-item";
-    b.dataset.cmd = cmd;
-    b.innerHTML = `<span class="menu-check"></span>${esc(label)}`;
-    host.appendChild(b);
-  }
-}
-
 function updateMenuState() {
   const onChecked = state.settings.topTable === "checked";
   const history = historyForTab();
@@ -20604,13 +21015,10 @@ function updateMenuState() {
   check("opt-auto-ia", state.settings.autoIaDownload !== false);   // default-on
   check("opt-expand-sets", !!state.settings.expandSets);
   for (const [id] of allThemes()) check("theme:" + id, id === state.settings.theme);
-  const svc = state.settings.ocrService || "tesseract";
-  for (const [id] of OCR_SERVICES) check("ocrsvc:" + id, id === svc);
 }
 
 function initMenubar() {
   buildThemeMenu();
-  buildOcrMenu();
   const menus = [...document.querySelectorAll("#menubar .menu")];
   let openMenu = null;
   const closeAll = () => {
@@ -20987,7 +21395,6 @@ function init() {
   boot("settings", loadSettings);
   boot("theme", applyTheme);
   boot("ui scale", applyUiScale);
-  boot("font", applyFont);
   boot("exp sharpen", applyExpSharpen);
   boot("checked books", loadChecked);
   boot("icons", injectIcons);
@@ -21505,6 +21912,7 @@ function init() {
     renderPublishPreview();
   });
   el("publish-refresh").addEventListener("click", loadPublishCatalog);
+  el("publish-tree").addEventListener("contextmenu", onPublishContextMenu);
   el("publish-tree").addEventListener("click", (ev) => {
     const toggle = ev.target.closest("[data-publish-toggle]");
     if (toggle) {
@@ -21734,7 +22142,7 @@ function init() {
     // rebuild the pickers/menu before re-applying (else the menubar Theme
     // submenu keeps the pre-sync list); applyExpSharpen re-applies the
     // experimental UI-sharpen overlay against the adopted state.
-    if (adopted) { refreshThemePickers(); applyTheme(); applyFont(); applyExpSharpen(); }
+    if (adopted) { refreshThemePickers(); applyTheme(); applyExpSharpen(); }
     maybeWizard();       // first desktop launch: the guide covers sign-in too
     maybeAuthPrompt();   // needs the adopted settings: authPromptDismissed
     loadDownloads();

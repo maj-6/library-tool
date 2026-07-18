@@ -233,6 +233,163 @@ def test_apply_page_deletion_end_to_end(data_root):
     assert on_disk[bid]["updated_at"] == result["build"]["updated_at"]
 
 
+def test_page_deletion_remaps_attention_metadata_and_review_threads(data_root):
+    """Page remarks follow kept physical pages and deleted threads tombstone."""
+    bid = "remark-pages"
+    pdf = data_root / "downloads" / "ia" / "remarks" / "book.pdf"
+    _make_pdf(pdf, 6)
+    builds = {bid: {"title": "Remarked Herbal"}}
+    server.BUILDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    server.BUILDS_PATH.write_text(json.dumps(builds), encoding="utf-8")
+
+    key = lambda page, source="primary", book=bid: \
+        f"page:{book}|{source}|{page}"  # noqa: E731
+    server.lib.save_json(server.lib.CLIENT_STATE_PATH, {
+        "attention": {
+            key(1): "keep one",
+            key(2): "delete two",
+            key(3): "shift three",
+            key(5): "shift five",
+            key(5, "secondary"): "leave secondary",
+            key(5, "primary", "other-book"): "leave other book",
+            "pub:book%3Apublic": "leave publication",
+        },
+        "settings": {"remarksMeta": {
+            key(2): {"label": "deleted", "category": "pages"},
+            key(3): {"label": "Remarked Herbal \u00b7 page 3", "category": "pages"},
+            key(5): {"label": "Remarked Herbal \u00b7 page 5", "category": "pages"},
+            key(6): {"label": "Remarked Herbal \u00b7 page 6", "category": "pages"},
+            key(5, "secondary"): {"label": "secondary", "category": "pages"},
+        }},
+    })
+    comments = [{"author": "Ada", "text": "Keep this history"}]
+    server.lib.save_json(server.REVIEWS_PATH, {
+        "survivor": {
+            "id": "survivor", "kind": "key", "ref": key(3),
+            "key": "key:" + key(3), "label": "Remarked Herbal · Page 3",
+            "status": "open", "comments": comments,
+        },
+        "later": {
+            "id": "later", "kind": "key", "ref": key(5),
+            "key": "key:" + key(5), "label": "Remarked Herbal · page 5",
+            "status": "resolved", "comments": [],
+        },
+        "deleted": {
+            "id": "deleted", "kind": "key", "ref": key(2),
+            "key": "key:" + key(2), "label": "Remarked Herbal · Page 2",
+            "status": "open", "comments": [{"text": "Do not lose me"}],
+        },
+        "secondary": {
+            "id": "secondary", "kind": "key", "ref": key(5, "secondary"),
+            "key": "key:" + key(5, "secondary"), "label": "Secondary · Page 5",
+            "status": "open", "comments": [],
+        },
+        "catalog": {
+            "id": "catalog", "kind": "key", "ref": "whl:7",
+            "key": "key:whl:7", "label": "Catalog", "status": "open",
+            "comments": [],
+        },
+    })
+
+    result = server._apply_page_deletion(bid, builds, pdf, [2, 4])
+
+    assert result["page_remap"] == {"source": "primary", "deleted": [2, 4]}
+    client_state = server.lib.load_json(server.lib.CLIENT_STATE_PATH, {})
+    assert client_state["attention"] == {
+        key(1): "keep one",
+        key(2): "shift three",
+        key(3): "shift five",
+        key(5, "secondary"): "leave secondary",
+        key(5, "primary", "other-book"): "leave other book",
+        "pub:book%3Apublic": "leave publication",
+    }
+    meta = client_state["settings"]["remarksMeta"]
+    assert meta[key(2)]["label"] == "Remarked Herbal \u00b7 page 2"
+    assert meta[key(3)]["label"] == "Remarked Herbal \u00b7 page 3"
+    assert meta[key(4)]["label"] == "Remarked Herbal \u00b7 page 4"
+    assert meta[key(5, "secondary")]["label"] == "secondary"
+    assert all(item["label"] != "deleted" for item in meta.values())
+
+    reviews = server.lib.load_json(server.REVIEWS_PATH, {})
+    assert reviews["survivor"]["ref"] == key(2)
+    assert reviews["survivor"]["key"] == "key:" + key(2)
+    assert reviews["survivor"]["label"] == "Remarked Herbal · Page 2"
+    assert reviews["survivor"]["comments"] == comments
+    assert reviews["later"]["ref"] == key(3)
+    assert reviews["later"]["label"] == "Remarked Herbal · page 3"
+    assert reviews["later"]["status"] == "resolved"
+    deleted_ref = reviews["deleted"]["ref"]
+    assert deleted_ref == "page-deleted:remark-pages|primary|2|deleted"
+    assert reviews["deleted"]["key"] == "key:" + deleted_ref
+    assert reviews["deleted"]["label"].endswith(" · removed")
+    assert reviews["deleted"]["comments"] == [{"text": "Do not lose me"}]
+    assert reviews["secondary"]["ref"] == key(5, "secondary")
+    assert reviews["catalog"]["ref"] == "whl:7"
+
+    # Deleting current page 2 again removes a different physical page. Its
+    # thread receives a different tombstone rather than merging with the first.
+    second = server._apply_page_deletion(bid, builds, pdf, [2])
+    assert second["page_remap"] == {"source": "primary", "deleted": [2]}
+    reviews = server.lib.load_json(server.REVIEWS_PATH, {})
+    survivor_ref = reviews["survivor"]["ref"]
+    assert survivor_ref == "page-deleted:remark-pages|primary|2|survivor"
+    assert survivor_ref != deleted_ref
+    assert reviews["survivor"]["id"] == "survivor"
+    assert reviews["survivor"]["status"] == "open"
+    assert reviews["survivor"]["comments"] == comments
+
+
+def test_page_review_rejects_a_revision_from_before_deletion(
+        data_root, client):
+    """A late Q popover cannot attach its thread to the shifted-in page."""
+    bid = "review-revision"
+    pdf = data_root / "review-revision.pdf"
+    _make_pdf(pdf, 3)
+    before = "2026-07-18T00:00:00+00:00"
+    build = {
+        "id": bid, "title": "Revision Herbal", "pdf_file": str(pdf),
+        "pdf_sources": [], "updated_at": before,
+    }
+    server.lib.save_json(server.BUILDS_PATH, {bid: build})
+    server.lib.save_json(server.REVIEWS_PATH, {})
+
+    live = {bid: dict(build)}
+    result = server._apply_page_deletion(bid, live, pdf, [1])
+    after = result["build"]["updated_at"]
+    assert after != before
+
+    stale = client.post("/api/reviews", json={
+        "kind": "key", "ref": f"page:{bid}|primary|2",
+        "label": "Revision Herbal \u00b7 page 2", "page_revision": before,
+    })
+    assert stale.status_code == 409
+    assert server.lib.load_json(server.REVIEWS_PATH, {}) == {}
+
+    current = client.post("/api/reviews", json={
+        "kind": "key", "ref": f"page:{bid}|primary|1",
+        "label": "Revision Herbal \u00b7 page 1", "page_revision": after,
+    })
+    assert current.status_code == 200
+    assert current.get_json()["review"]["ref"] == f"page:{bid}|primary|1"
+
+
+def test_page_review_accepts_an_unversioned_legacy_build(client):
+    bid = "legacy-page-review"
+    server.lib.save_json(server.BUILDS_PATH, {
+        bid: {"id": bid, "title": "Legacy Herbal", "pdf_sources": []},
+    })
+    server.lib.save_json(server.REVIEWS_PATH, {})
+
+    response = client.post("/api/reviews", json={
+        "kind": "key", "ref": f"page:{bid}|primary|1",
+        "label": "Legacy Herbal \u00b7 page 1",
+        "page_revision": "unversioned",
+    })
+
+    assert response.status_code == 200
+    assert response.get_json()["review"]["ref"] == f"page:{bid}|primary|1"
+
+
 def test_apply_page_deletion_refusals_leave_pdf_untouched(data_root):
     """Delete-all and out-of-range-only raise ValueError BEFORE any write:
     no backup appears and the PDF keeps its pages."""
@@ -265,6 +422,7 @@ def test_apply_page_deletion_mixed_out_of_range_succeeds(data_root):
     result = server._apply_page_deletion(bid, builds, pdf, [2, 99])
 
     assert result["deleted"] == [2, 99]
+    assert result["page_remap"] == {"source": "primary", "deleted": [2]}
     assert result["pages"] == 1
     assert _page_count(pdf) == 1
     assert (ocr_dir / "compiled.txt").read_text(encoding="utf-8") == \
@@ -287,6 +445,7 @@ def test_apply_page_deletion_no_titles_no_ocr(data_root):
 
     assert result == {"deleted": [1], "pages": 1, "renumbered": [],
                       "backup": "book.bak.pdf",
+                      "page_remap": {"source": "primary", "deleted": [1]},
                       "build": {"title": "NoTitles"}}
     assert "title_pages" not in builds[bid]
     # save_json is skipped entirely when there are no title pages

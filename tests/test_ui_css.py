@@ -104,3 +104,13 @@ def test_remarks_items_are_collapsible_threads_with_icon_actions():
     assert "overflow-wrap: anywhere" in thread
     actions = _rule(".remarks-item-actions")
     assert "display: flex" in actions
+
+
+def test_attention_cues_survive_page_and_publication_selection_states():
+    assert ".rw-pagebtn.attention {" in STYLE
+    assert ".rw-pagebtn.attention.active {" in STYLE
+    assert ".ocr-pgrow.attention," in STYLE
+    assert ".an-fac-page.attention {" in STYLE
+    assert ".publish-tree-node.attention > .publish-tree-row {" in STYLE
+    assert ".publish-tree-node.attention.selected > .publish-tree-row {" in STYLE
+    assert "box-shadow: inset 3px 0 0 #9b59b6" in STYLE

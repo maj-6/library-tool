@@ -11,14 +11,27 @@ const end = source.indexOf("function publishSafeUrl(", start);
 assert.ok(start >= 0 && end > start, "Publish tree function block is present");
 
 const state = {
+  builds: {},
   publishEntries: [],
   publishOpen: new Set(),
   publishClosed: new Set(),
   publishSel: null,
+  attn: {},
   settings: { publishGroup: "sets" },
 };
+const routes = [];
+const statuses = [];
 const context = vm.createContext({
   state,
+  openRoutedItem: async (item) => {
+    routes.push({ kind: item.kind, ref: item.ref });
+    state.buildSel = item.ref;
+  },
+  loadBuilds: async () => {},
+  status: (message) => statuses.push(message),
+  publicationRemarkKey: (selection) => /^(book|set):.+/.test(String(selection || ""))
+    ? "pub:" + encodeURIComponent(String(selection)) : "",
+  attnReason: (value) => value && String(value) !== "1" ? String(value) : "",
   setBaseTitle: (book) => String(book.title || "").trim(),
   bookTitleText: (book, fallback = "Untitled") => {
     const title = String(book.title || fallback);
@@ -42,15 +55,23 @@ this.publishTreeApi = {
   publishNodeOpen,
   publishRevealSelected,
   publishTreeNodeHtml,
+  publishWorkbenchBuildId,
+  openPublishedWorkbenchEntry,
+  publishContextMenuItems,
 };`, context);
 const api = context.publishTreeApi;
 
 function reset(entries, group = "sets") {
+  state.builds = {};
+  state.buildSel = null;
   state.publishEntries = entries;
   state.settings.publishGroup = group;
   state.publishOpen.clear();
   state.publishClosed.clear();
   state.publishSel = null;
+  state.attn = {};
+  routes.length = 0;
+  statuses.length = 0;
 }
 
 function modelFingerprint(nodes) {
@@ -161,4 +182,62 @@ test("published volume nodes prefix their titles with the volume tag", () => {
   const setNode = api.publishTreeModel()[0];
   const html = api.publishTreeNodeHtml(setNode.children[0], 1);
   assert.match(html, /class="volume-title-tag">Vol\. 1<\/span>Work/);
+});
+
+test("published volume menus route by slug identity to the guarded Workbench path", async () => {
+  const cloudEntry = { slug: "herbal-1801", title: "A Herbal" };
+  reset([cloudEntry]);
+  state.builds = {
+    "title-decoy": { id: "title-decoy", title: "A Herbal", published_slug: "other" },
+    "local-draft": { id: "stale-inner-id", status: "draft",
+      title: "Different local title", published_slug: "herbal-1801" },
+  };
+
+  assert.equal(api.publishWorkbenchBuildId(cloudEntry), "local-draft");
+  const items = api.publishContextMenuItems("book:herbal-1801");
+  assert.deepEqual(Array.from(items, (item) => item.label), ["Open in Workbench"]);
+  assert.equal(await items[0].fn(), true);
+  assert.deepEqual(routes, [{ kind: "build", ref: "local-draft" }]);
+  assert.equal(statuses.length, 0);
+  assert.deepEqual(Array.from(api.publishContextMenuItems("")), []);
+});
+
+test("catalogue build hints win while duplicate slug fallbacks never guess", async () => {
+  const hinted = { slug: "same", title: "Same", local_build_id: "canonical" };
+  reset([hinted]);
+  state.builds = {
+    canonical: { published_slug: "same" },
+    duplicate: { published_slug: "same" },
+  };
+  assert.equal(api.publishWorkbenchBuildId(hinted), "canonical");
+
+  const unhinted = { slug: "same", title: "Same" };
+  assert.equal(api.publishWorkbenchBuildId(unhinted), "");
+  state.publishEntries = [unhinted];
+  const items = api.publishContextMenuItems("book:same");
+  assert.equal(await items[0].fn(), false);
+  assert.deepEqual(statuses, ["PUBLISHED VOLUME HAS NO UNIQUE LOCAL WORKBENCH ENTRY"]);
+});
+
+test("publication aliases share one attention identity and folders stay unmarked", () => {
+  reset([
+    { slug: "work-1", title: "Work", group_id: "work", volume: "1", authors: "Alpha" },
+    { slug: "work-2", title: "Work", group_id: "work", volume: "2", authors: "Beta" },
+  ], "author");
+  const model = api.publishTreeModel();
+  const aliases = findNodes(model, (node) => node.selectKey === "set:work");
+  state.attn[context.publicationRemarkKey("set:work")] = 'Check <rights> & "links"';
+
+  assert.equal(aliases.length, 2);
+  for (const alias of aliases) {
+    const html = api.publishTreeNodeHtml(alias, 1);
+    assert.match(html, /publish-tree-node set attention/);
+    assert.match(html, /Needs attention: Check &lt;rights&gt; &amp; &quot;links&quot;/);
+  }
+  const folderHtml = api.publishTreeNodeHtml(model[0], 0);
+  assert.doesNotMatch(folderHtml.split("publish-tree-children", 1)[0],
+    /publish-tree-node group attention/);
+  assert.notEqual(context.publicationRemarkKey("set:work"),
+    context.publicationRemarkKey("book:work-1"));
+  assert.equal(context.publicationRemarkKey(""), "");
 });

@@ -647,26 +647,49 @@ def api_reviews_create():
     label = str(payload.get("label") or "").strip()[:120]
     reason = str(payload.get("reason") or "").strip()[:500]
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    created = False
-    with _reviews_lock:
-        reviews = lib.load_json(REVIEWS_PATH, {})
-        # one OPEN review per item -- flagging again refreshes label/reason
-        r = next((x for x in reviews.values()
-                  if x.get("key") == key and x.get("status") == "open"), None)
-        if r:
-            r["label"] = label or r.get("label", "")
-            if reason:
-                r["reason"] = reason
-        else:
-            rid = lib.gen_id(set(reviews))
-            r = reviews[rid] = {
-                "id": rid, "key": key, "kind": kind, "ref": ref,
-                "label": label, "reason": reason, "status": "open",
-                "created_by": _actor(), "created_at": now,
-                "resolved_by": "", "resolved_at": "", "comments": [],
-            }
-            created = True
-        lib.save_json(REVIEWS_PATH, reviews)
+
+    def write_review():
+        created = False
+        with _reviews_lock:
+            reviews = lib.load_json(REVIEWS_PATH, {})
+            # one OPEN review per item -- flagging again refreshes label/reason
+            review = next((x for x in reviews.values()
+                           if x.get("key") == key and x.get("status") == "open"),
+                          None)
+            if review:
+                review["label"] = label or review.get("label", "")
+                if reason:
+                    review["reason"] = reason
+            else:
+                rid = lib.gen_id(set(reviews))
+                review = reviews[rid] = {
+                    "id": rid, "key": key, "kind": kind, "ref": ref,
+                    "label": label, "reason": reason, "status": "open",
+                    "created_by": _actor(), "created_at": now,
+                    "resolved_by": "", "resolved_at": "", "comments": [],
+                }
+                created = True
+            lib.save_json(REVIEWS_PATH, reviews)
+        return review, created
+
+    page_ref = _page_remark_ref_parts(ref) if kind == "key" else None
+    if page_ref:
+        # Serialize with page deletion, then reject a popover/sidebar created
+        # against an older page grid. Otherwise a late review could attach to
+        # the physical page that shifted into the saved number.
+        with _page_structure_lock:
+            build = lib.load_json(BUILDS_PATH, {}).get(page_ref[0])
+            revision = str(payload.get("page_revision") or "")
+            current_revision = str(build.get("updated_at") or "unversioned") \
+                if build else ""
+            if (not build or not revision or
+                    revision != current_revision or
+                    not _valid_src_key(build, page_ref[1])):
+                return jsonify({"ok": False,
+                                "error": "page changed; reopen it before review"}), 409
+            r, created = write_review()
+    else:
+        r, created = write_review()
     if created:
         activity("opened", "review", detail=label)
     return jsonify({"ok": True, "review": r})
@@ -2370,6 +2393,7 @@ def api_build_folder_sync(build_id: str):
     notes = []
     src = None
     preview_ok = False  # THIS sync produced a fresh preview.pdf
+    page_remap = None
     pf = (b.get("pdf_file") or "").strip()
     if pf:
         sp = _resolve_local(pf)
@@ -2397,7 +2421,8 @@ def api_build_folder_sync(build_id: str):
             try:
                 blanks = _blank_pages(src)
                 if blanks:
-                    _apply_page_deletion(build_id, builds, src, blanks)
+                    deletion = _apply_page_deletion(build_id, builds, src, blanks)
+                    page_remap = deletion.get("page_remap")
                     b = builds[build_id]
                     # the folder metadata must reflect the remapped
                     # title_pages, not the pre-trim snapshot
@@ -2473,6 +2498,8 @@ def api_build_folder_sync(build_id: str):
                 notes.append(f"original cleanup failed: {exc}")
     out = _entry_folder_info(build_id)
     out.update({"ok": True, "notes": notes, "build": b})
+    if page_remap:
+        out["page_remap"] = page_remap
     return jsonify(out)
 
 
@@ -5559,6 +5586,146 @@ def _renumber_marked_text(text: str, removed: list[int]) -> str:
     return "\n\n".join(parts)
 
 
+def _page_remark_ref_parts(ref: str) -> tuple[str, str, int, str, str] | None:
+    """Decode a JS ``page:`` remark ref while retaining its exact encoding."""
+    raw = str(ref or "")
+    if not raw.startswith("page:"):
+        return None
+    parts = raw[5:].split("|")
+    if len(parts) != 3:
+        return None
+    if any(re.search(r"%(?![0-9A-Fa-f]{2})", part) for part in parts):
+        return None
+    try:
+        build_id = urllib.parse.unquote(parts[0], errors="strict")
+        source_id = urllib.parse.unquote(parts[1], errors="strict")
+        page_text = urllib.parse.unquote(parts[2], errors="strict")
+        page = int(page_text)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not build_id or not source_id or page < 1 or str(page) != page_text:
+        return None
+    return build_id, source_id, page, parts[0], parts[1]
+
+
+def _remapped_page_remark_ref(ref: str, build_id: str, source_id: str,
+                              removed: list[int]) -> tuple[bool, str | None]:
+    """Return (matched, shifted-ref); ``None`` means its page was deleted."""
+    parsed = _page_remark_ref_parts(ref)
+    if not parsed or parsed[:2] != (str(build_id), str(source_id or "primary")):
+        return False, ref
+    _, _, page, encoded_build, encoded_source = parsed
+    removed_set = set(removed)
+    if page in removed_set:
+        return True, None
+    shifted = page - sum(1 for old in removed if old < page)
+    return True, f"page:{encoded_build}|{encoded_source}|{shifted}"
+
+
+_PAGE_REMARK_LABEL_RE = re.compile(r"(\s+\u00b7\s*page\s+)(\d+)$", re.IGNORECASE)
+
+
+def _remapped_page_remark_value(value, old_page: int, new_page: int):
+    """Keep a generated fallback label aligned with its remapped page key."""
+    if not isinstance(value, dict) or not isinstance(value.get("label"), str):
+        return value
+    label = value["label"]
+    match = _PAGE_REMARK_LABEL_RE.search(label)
+    if not match or int(match.group(2)) != old_page:
+        return value
+    updated = dict(value)
+    updated["label"] = label[:match.start(2)] + str(new_page)
+    return updated
+
+
+def _remap_page_attention_references(build_id: str, source_id: str,
+                                     removed: list[int]) -> None:
+    """Keep personal page marks and shared threads bound to physical pages.
+
+    Deleted personal marks disappear with their target. Deleted shared threads
+    become unique, unroutable tombstones so their comments remain reachable
+    without ever attaching to the page that shifted into the old number.
+    """
+    removed = sorted({int(page) for page in removed if int(page) > 0})
+    if not removed:
+        return
+
+    try:
+        with _client_state_lock:
+            client = lib.load_json(lib.CLIENT_STATE_PATH, {})
+            attention = client.get("attention")
+            settings = client.get("settings")
+            meta = settings.get("remarksMeta") if isinstance(settings, dict) else None
+            dirty = False
+
+            def remap_map(values: dict | None) -> bool:
+                if not isinstance(values, dict):
+                    return False
+                moves: list[tuple[str, str | None, object]] = []
+                for key, value in list(values.items()):
+                    old_parts = _page_remark_ref_parts(key)
+                    matched, new_key = _remapped_page_remark_ref(
+                        key, build_id, source_id, removed)
+                    if matched and new_key != key:
+                        if old_parts and new_key:
+                            new_parts = _page_remark_ref_parts(new_key)
+                            if new_parts:
+                                value = _remapped_page_remark_value(
+                                    value, old_parts[2], new_parts[2])
+                        moves.append((key, new_key, value))
+                for old_key, _, _ in moves:
+                    values.pop(old_key, None)
+                for _, new_key, value in moves:
+                    if new_key:
+                        values[new_key] = value
+                return bool(moves)
+
+            dirty = remap_map(attention) or dirty
+            dirty = remap_map(meta) or dirty
+            if dirty:
+                client["updated_at"] = datetime.now(timezone.utc).isoformat(
+                    timespec="seconds")
+                lib.save_json(lib.CLIENT_STATE_PATH, client)
+    except Exception as exc:
+        log.warning("could not remap page attention state: %s", exc)
+
+    try:
+        with _reviews_lock:
+            reviews = lib.load_json(REVIEWS_PATH, {})
+            dirty = False
+            for review in reviews.values():
+                if not isinstance(review, dict) or review.get("kind") != "key":
+                    continue
+                old_ref = str(review.get("ref") or "")
+                parsed = _page_remark_ref_parts(old_ref)
+                matched, new_ref = _remapped_page_remark_ref(
+                    old_ref, build_id, source_id, removed)
+                if not matched or new_ref == old_ref:
+                    continue
+                old_page = parsed[2] if parsed else 0
+                if new_ref is None:
+                    # Include the immutable review id so deleting page N again
+                    # later cannot merge two unrelated historical threads.
+                    new_ref = "page-deleted:" + old_ref[5:] + "|" + \
+                        urllib.parse.quote(str(review.get("id") or uuid.uuid4()), safe="")
+                    if not str(review.get("label") or "").endswith(" · removed"):
+                        review["label"] = str(review.get("label") or "") + " · removed"
+                else:
+                    new_page = _page_remark_ref_parts(new_ref)[2]
+                    label = str(review.get("label") or "")
+                    review["label"] = re.sub(
+                        r"(\s·\s[Pp]age\s+)" + str(old_page) +
+                        r"(?=\s·\sSource\b|$)",
+                        lambda match: match.group(1) + str(new_page), label)
+                review["ref"] = new_ref
+                review["key"] = "key:" + new_ref
+                dirty = True
+            if dirty:
+                lib.save_json(REVIEWS_PATH, reviews)
+    except Exception as exc:
+        log.warning("could not remap page review references: %s", exc)
+
+
 @app.route("/api/pdf/pages/delete", methods=["POST"])
 def api_pdf_pages_delete():
     """Delete pages from a build's PDF — the real file, not a preview.
@@ -5651,6 +5818,11 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
     # numbering and must not shift with the primary's deletions.
     b = builds[build_id]
     src_key = _src_key_for_path(b, pdf)
+    # ``pages`` historically reports the caller's request (including a mixed
+    # out-of-range number). Structural references must use only pages that
+    # actually existed, or a stale high page mark could shift spuriously.
+    actual_pages = [page for page in pages if page <= total]
+    _remap_page_attention_references(build_id, src_key, actual_pages)
     srcmap = _ocr_sources(build_id)
     ocr_dir = _entry_dir(build_id) / "ocr"
     renumbered = []
@@ -5704,14 +5876,18 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
             t = int(m.group(1))
             changed["thumbnail_source"] = "" if t in set(pages) else \
                 f"page:{t - sum(1 for r in pages if r < t)}"
-    if changed:
-        # the caller's snapshot predates the slow PDF rewrite above — apply
-        # the remap to a fresh read, and keep the returned record in step
-        b.update(changed)
-        b["updated_at"] = _builds_apply(build_id, changed)
+    # A page-grid change is itself a build revision even when no title-page or
+    # thumbnail field moved. Page review creation uses this token to reject a
+    # stale popover that finishes after the deletion remap.
+    b.update(changed)
+    if changed or build_id in lib.load_json(BUILDS_PATH, {}):
+        revision = _builds_apply(build_id, changed)
+        if revision:
+            b["updated_at"] = revision
     return {"deleted": pages, "pages": len(keep),
             "renumbered": renumbered,
             "backup": pdf.with_suffix(".bak.pdf").name,
+            "page_remap": {"source": src_key, "deleted": actual_pages},
             "build": b}
 
 
@@ -6498,9 +6674,9 @@ def api_ia_downloads():
 # /api/secrets (Host-guarded); every server-side credential read goes through
 # _client_settings, which overlays these on top of the synced preferences. ------
 _SECRET_KEYS = frozenset({
-    "aiKey", "embedKey", "mistralKey", "ocrClaudeKey", "ocrAzureKey",
+    "aiKey", "embedKey", "imgGenKey", "mistralKey", "ocrClaudeKey",
     "ocrAwsKey", "ocrAwsSecret", "supabaseKey", "supabaseAnonKey", "r2KeyId",
-    "r2Secret", "gsKeyFile", "imgGenKey",
+    "r2Secret", "gsKeyFile",
 })
 _SECRETS_PATH = lib.DATA_ROOT / "output" / "secrets.json"
 _MISTRAL_PENDING = "_mistralCloudPending"
@@ -9447,6 +9623,34 @@ def _public_preview_urls(cfg: dict, row: dict) -> dict:
     return item
 
 
+def _catalogue_workbench_links(rows: list[dict], builds: dict) -> list[dict]:
+    """Attach the local Workbench identity without changing public metadata.
+
+    ``volumes.slug`` and a build's ``published_slug`` are the current identity
+    spine.  A slug must resolve to exactly one local build: silently choosing
+    between duplicates could open the wrong editable record.
+    """
+    by_slug: dict[str, list[str]] = {}
+    for bid, build in builds.items():
+        if not isinstance(build, dict):
+            continue
+        slug = str(build.get("published_slug") or "").strip()
+        if slug:
+            by_slug.setdefault(slug, []).append(str(bid))
+
+    linked = []
+    for source in rows:
+        row = dict(source)
+        # Never trust or preserve a similarly named public column: this value
+        # describes this checkout and comes only from its local build store.
+        row.pop("local_build_id", None)
+        matches = by_slug.get(str(row.get("slug") or "").strip(), [])
+        if len(matches) == 1:
+            row["local_build_id"] = matches[0]
+        linked.append(row)
+    return linked
+
+
 @app.route("/api/publish/catalog")
 def api_publish_catalog():
     """The website catalogue, or local uploads when it cannot be reached.
@@ -9474,9 +9678,13 @@ def api_publish_catalog():
         warning = "Online catalogue unavailable; showing local uploads."
 
     # A successful public read is authoritative, including an empty result.
-    # Mixing in local builds here could preview stale edits or an upload that
-    # has since been unpublished. Local rows are strictly an offline fallback.
-    entries = cloud_rows if cloud_ok else _local_publish_rows()
+    # Never fill its catalogue metadata from local edits or add a local-only
+    # volume that may since have been unpublished.  The one local sidecar is
+    # local_build_id: a navigation link back through slug identity, not public
+    # catalogue data. Local rows remain strictly an offline fallback.
+    builds = lib.load_json(BUILDS_PATH, {})
+    entries = (_catalogue_workbench_links(cloud_rows, builds) if cloud_ok
+               else _local_publish_rows(builds))
     entries = [row for row in entries if str(row.get("slug") or "").strip()]
     entries.sort(key=lambda r: (str(r.get("title") or "").casefold(),
                                 str(r.get("volume") or ""),

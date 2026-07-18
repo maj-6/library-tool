@@ -44,7 +44,7 @@ def test_publish_catalog_treats_successful_cloud_read_as_authoritative(
         client, tmp_path, monkeypatch):
     _build_file(tmp_path, monkeypatch, {
         "local02": {
-            "id": "local02", "status": "uploaded", "published_slug": "same-slug",
+            "id": "local02", "status": "draft", "published_slug": "same-slug",
             "title": "Cloud Work", "volume": "2", "group_id": "cloud-set",
             "categories": "", "category_ids": [], "bundle": {},
         },
@@ -74,12 +74,36 @@ def test_publish_catalog_treats_successful_cloud_read_as_authoritative(
     assert [row["slug"] for row in data["entries"]] == ["same-slug"]
     assert data["entries"][0]["group_id"] == ""
     assert "volume" not in data["entries"][0]
-    assert "local_build_id" not in data["entries"][0]
+    # The cloud remains authoritative for the catalogue fields and membership,
+    # while slug identity supplies the navigation-only Workbench link. Status
+    # is not identity: cloud setup can seed published slugs on draft builds.
+    assert data["entries"][0]["local_build_id"] == "local02"
     assert data["entries"][0]["pdf_url"] == (
         "https://public/storage/v1/object/public/volumes/"
         "same-slug/book%20file.pdf")
     assert data["entries"][0]["thumbnail_url"].endswith(
         "/volumes/same-slug/cover.jpg")
+
+
+def test_catalogue_workbench_links_require_one_exact_local_slug():
+    rows = [
+        {"slug": "unique", "title": "Remote", "local_build_id": "untrusted"},
+        {"slug": "duplicate", "title": "Duplicate"},
+        {"slug": "Unique", "title": "Case differs"},
+        {"slug": "remote-only", "title": "Remote only"},
+    ]
+    builds = {
+        "unique-id": {"id": "stale-inner", "status": "draft",
+                      "published_slug": "unique"},
+        "duplicate-a": {"status": "uploaded", "published_slug": "duplicate"},
+        "duplicate-b": {"status": "draft", "published_slug": "duplicate"},
+    }
+
+    linked = server._catalogue_workbench_links(rows, builds)
+
+    assert linked[0]["local_build_id"] == "unique-id"
+    assert all("local_build_id" not in row for row in linked[1:])
+    assert rows[0]["local_build_id"] == "untrusted"  # input was not mutated
 
 
 def test_publish_preview_does_not_fill_successful_cloud_read_from_local_bundle(

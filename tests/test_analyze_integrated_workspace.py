@@ -193,8 +193,8 @@ def test_captured_provenance_flows_into_builds_and_artifact_images():
     assert "f.artifact || f.name" in artifacts
 
 
-def test_jobs_drawer_and_default_engine_modal_cover_ocr_and_text_analysis():
-    # the queue + Default Engine bar live in a collapsible drawer at the
+def test_jobs_drawer_and_default_ocr_modal_cover_runnable_engines():
+    # the queue + Default OCR bar live in a collapsible drawer at the
     # Workbench bottom, visible from every phase, collapsed by default
     assert 'id="wb-jobs"' in TEMPLATE
     assert 'id="wb-jobs-toggle"' in TEMPLATE
@@ -210,7 +210,7 @@ def test_jobs_drawer_and_default_engine_modal_cover_ocr_and_text_analysis():
     assert "z-index: 2;" in drawer_css
     assert "overflow: hidden;" in _between(STYLE, ".wb-phase.active {", "}")
     assert '<span class="tool-label">Jobs</span>' in TEMPLATE
-    assert '>Default Engine:</button>' in TEMPLATE
+    assert '>Default OCR:</button>' in TEMPLATE
     assert "<th>Type</th>" in TEMPLATE
     assert "<th>Artifact</th>" in TEMPLATE
     assert "<th>Engine</th>" in TEMPLATE
@@ -230,19 +230,18 @@ def test_jobs_drawer_and_default_engine_modal_cover_ocr_and_text_analysis():
         "engine-settings",
         "engine-done",
         "ocr-service",
-        "analysis-service",
     ):
         assert f'id="{element_id}"' in TEMPLATE
     assert '<label class="tool-label" for="ocr-service">OCR</label>' in TEMPLATE
-    assert '<label class="tool-label" for="analysis-service">Text Analysis</label>' in TEMPLATE
-    for engine in ("mistral", "claude", "textract", "configured"):
+    assert 'id="analysis-service"' not in TEMPLATE
+    for engine in ("mistral", "claude", "textract"):
         assert f'<option value="{engine}">' in TEMPLATE
 
     readiness = _between(
         APP, "function refreshDefaultEngineOptions()", "async function openDefaultEngines")
     assert "option.disabled = !ready" in readiness
-    assert "analysis.options[0].disabled = !ready" in readiness
-    assert "API key required" in readiness
+    assert "Settings > Credentials" in readiness
+    assert "analysis.options" not in readiness
 
 
 def test_page_analysis_staging_and_unified_job_rows_are_wired():
