@@ -2870,6 +2870,8 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   flex-direction: column;
   gap: 4px;
   min-height: 0;
+  overflow: hidden;         /* clean clip when collapsed to the 34px strip */
+  background: var(--face);  /* a solid full-height rail, like #publish-side */
 }
 /* the phase rail: a compact vertical strip of quiet buttons */
 #wb-rail {
@@ -3580,11 +3582,50 @@ body[data-theme] .drafting::-webkit-scrollbar {
   background: transparent;
   border-top: 1px solid var(--face-sh);
 }
-#ocr-queue-splitter[hidden] { display: none; }
+#ocr-queue-splitter[hidden], #ocr-side-splitter[hidden] { display: none; }
 #ocr-splitter:hover, #form-splitter:hover,
 #ocr-side-splitter:hover, #ocr-queue-splitter:hover {
   background: var(--face-active);
 }
+
+/* --- Reusable collapsible section (VS Code-style vertical collapse) ----------
+   A titled panel that folds away vertically. Markup: a header row
+   (.collapse-head — typically a .pane-bar) carrying a leading .collapse-caret
+   button (▾ open / ▸ collapsed), and the body element (.collapse-body) right
+   after it. makeCollapsible(head, body, key) in app.js injects the caret, wires
+   the toggle, and persists per-key in settings.collapsed. The only visual state
+   is .sec-collapsed, added to the body (and the caret's glyph). Interactive
+   controls inside the head keep working — only the caret / empty header toggles.
+   Reuse anywhere a stacked panel should be foldable. */
+.collapse-caret {
+  flex: none;
+  width: 15px;
+  height: 18px;
+  margin-right: -1px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink-mut);
+  font: 10px/18px var(--ui);
+  text-align: center;
+  cursor: pointer;
+}
+.collapse-caret:hover { color: var(--ink); }
+.collapse-head { cursor: pointer; user-select: none; }
+.collapse-body.sec-collapsed { display: none; }
+/* When one stacked section is collapsed, the sibling must fill the freed space
+   even if a splitter drag pinned it to a fixed `flex: 0 0 Npx` inline basis
+   (!important outranks the inline style). Restores the drag size once both open. */
+#ocr-side:has(#ocr-doc-wrap.sec-collapsed) #ocr-books-wrap,
+#ocr-side:has(#ocr-books-wrap.sec-collapsed) #ocr-doc-wrap { flex: 1 1 auto !important; }
+
+/* --- Workbench sidebar: whole-sidebar horizontal collapse (mirrors Publish) -- */
+#ocr-side-toggle { flex: none; width: 22px; padding-left: 0; padding-right: 0; }
+#wb-split.wb-side-collapsed #ocr-side { width: 34px !important; }
+#wb-split.wb-side-collapsed #ocr-side > :not(#builds-tabs),
+#wb-split.wb-side-collapsed #builds-tabs > :not(#ocr-side-toggle),
+#wb-split.wb-side-collapsed #ocr-splitter { display: none; }
+#wb-split.wb-side-collapsed #builds-tabs { padding: 4px; }
 
 /* --- documents tree: one node per PDF source, its OCR files beneath ------- */
 .ocr-src {

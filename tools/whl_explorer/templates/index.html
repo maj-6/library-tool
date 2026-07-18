@@ -605,13 +605,15 @@
             <span class="bar-spacer"></span>
             <button id="ocr-filter-verified" class="cad-btn tiny icon-btn toggle" type="button"
                     data-icon="check" data-tip="Show verified books only"></button>
+            <button id="ocr-side-toggle" class="cad-btn tiny" type="button"
+                    aria-expanded="true" data-tip="Collapse the entries &amp; artifacts sidebar">&#9664;</button>
           </div>
           <div class="drafting" id="ocr-books-wrap">
             <ul id="ocr-books"></ul>
             <p id="ocr-books-empty" class="empty">No entries yet</p>
           </div>
           <div id="ocr-side-splitter"></div>
-          <div class="pane-bar"><span class="tool-label">Artifacts</span>
+          <div class="pane-bar" id="ocr-artifacts-bar"><span class="tool-label">Artifacts</span>
             <span class="bar-spacer"></span>
             <button id="ocr-load-file" class="cad-btn tiny icon-btn" type="button"
                     data-icon="fileup" data-tip="Load OCR text files"></button>

@@ -37,6 +37,7 @@ const VIEW_STATE_KEYS = new Set([
   "topTable", "bottomActive", "whlMode", "checkedMode", "showCatalog",
   "paneWidth", "uploadSplitH", "publishSidebarCollapsed", "workbenchPhase",
   "jobsDrawerOpen", "authPromptDismissed", "checkedCols",
+  "collapsed", "wbSideCollapsed",
 ]);
 // Credentials are never persisted client-side. They live in the server's
 // Host-guarded secrets store (/api/secrets); Mistral additionally syncs through
@@ -231,6 +232,8 @@ const state = {
     includePrereleaseUpdates: false, // desktop: allow alpha/beta/rc auto-updates
     publishGroup: "sets",           // organization of the Publish file tree
     publishSidebarCollapsed: false,
+    collapsed: {},                  // per-key collapsed state for makeCollapsible sections
+    wbSideCollapsed: false,         // Workbench entries/artifacts sidebar folded away
   },
   editTarget: null,             // record open in the EDIT tab
   sort: { checked: null, whl: null },  // {key, dir} per top table
@@ -1253,6 +1256,9 @@ function normalizeSettings() {
   if (!["sets", "author", "category", "date"].includes(state.settings.publishGroup))
     state.settings.publishGroup = "sets";
   state.settings.publishSidebarCollapsed = !!state.settings.publishSidebarCollapsed;
+  if (!state.settings.collapsed || typeof state.settings.collapsed !== "object")
+    state.settings.collapsed = {};
+  state.settings.wbSideCollapsed = !!state.settings.wbSideCollapsed;
   if (!["tesseract", "mistral", "claude", "textract"].includes(state.settings.ocrService))
     state.settings.ocrService = "tesseract";
   state.settings.textAnalysisService = "configured";
@@ -10482,6 +10488,72 @@ function setPublishSidebarCollapsed(on, persist) {
   }
 }
 
+// --- Reusable collapsible section (VS Code-style vertical collapse) -----------
+// Fold a titled panel away vertically. `head` is the clickable header row
+// (typically a .pane-bar); `body` is the element beneath it; `key` names the
+// persisted state under settings.collapsed. A ▾/▸ caret is injected at the head
+// start. Interactive controls inside the head (buttons, tabs, inputs) keep
+// working — only the caret or the header's own chrome toggles. onToggle(collapsed)
+// fires after every change, including the initial restore. Returns a small
+// handle. Drop this on any stacked panel that should fold; see the CSS block
+// ".collapse-caret / .collapse-head / .collapse-body" for the styling contract.
+function makeCollapsible(head, body, key, onToggle) {
+  if (!head || !body) return null;
+  head.classList.add("collapse-head");
+  body.classList.add("collapse-body");
+  let caret = head.querySelector(":scope > .collapse-caret");
+  if (!caret) {
+    caret = document.createElement("button");
+    caret.type = "button";
+    caret.className = "collapse-caret";
+    caret.setAttribute("aria-label", "Collapse or expand this section");
+    head.insertBefore(caret, head.firstChild);
+  }
+  const store = () => (state.settings.collapsed = state.settings.collapsed || {});
+  const isCollapsed = () => body.classList.contains("sec-collapsed");
+  const apply = (collapsed) => {
+    body.classList.toggle("sec-collapsed", collapsed);
+    caret.textContent = collapsed ? "▸" : "▾";   // ▸ collapsed / ▾ open
+    caret.setAttribute("aria-expanded", String(!collapsed));
+    head.setAttribute("aria-expanded", String(!collapsed));
+    if (onToggle) onToggle(collapsed);
+  };
+  const toggle = () => { apply(!isCollapsed()); store()[key] = isCollapsed(); saveSettings(); };
+  head.addEventListener("click", (ev) => {
+    // The caret is the toggle affordance; if it's hidden (e.g. an enclosing
+    // sidebar is horizontally collapsed to a strip, where only an expand button
+    // remains), a stray click on the head's leftover padding must NOT toggle the
+    // now-invisible body. Requiring a visible caret keeps this generic.
+    if (caret.offsetParent === null) return;
+    if (ev.target.closest(".collapse-caret")) { toggle(); return; }
+    // real controls (tabs, buttons, inputs) do their own thing; the header's
+    // remaining chrome (title, spacer, padding) toggles the section
+    if (ev.target.closest("button, input, select, textarea, a, label, .pane-tab, [role='tab']"))
+      return;
+    toggle();
+  });
+  apply(!!store()[key]);   // restore persisted state without re-saving
+  return { toggle, set: apply, isCollapsed };
+}
+
+// Whole entries/artifacts sidebar horizontal collapse (mirrors the Publish
+// sidebar): #wb-split.wb-side-collapsed shrinks #ocr-side to a 34px strip whose
+// only control is the expand toggle.
+function setOcrSideCollapsed(on, persist) {
+  const collapsed = !!on;
+  const split = el("wb-split");
+  if (split) split.classList.toggle("wb-side-collapsed", collapsed);
+  const btn = el("ocr-side-toggle");
+  if (btn) {
+    btn.textContent = collapsed ? "▶" : "◀";   // ▶ expand / ◀ collapse
+    btn.setAttribute("aria-expanded", String(!collapsed));
+    btn.dataset.tip = collapsed
+      ? "Expand the entries & artifacts sidebar"
+      : "Collapse the entries & artifacts sidebar";
+  }
+  if (persist) { state.settings.wbSideCollapsed = collapsed; saveSettings(); }
+}
+
 function loadPublishCatalog() {
   if (state.publishCatalogLoading) return state.publishCatalogLoading;
   const mine = ++state.publishCatalogSeq;
@@ -17862,6 +17934,22 @@ function init() {
     value: () => el("ocr-queue-wrap").offsetHeight,
     reset: () => { el("ocr-queue-wrap").style.flex = ""; },
   });
+
+  // Workbench sidebar collapse: each section folds vertically (VS Code-style),
+  // and the whole sidebar folds horizontally. The inter-section splitter only
+  // makes sense while both sections are open, so hide it otherwise.
+  const syncOcrSideSplitter = () => {
+    const sp = el("ocr-side-splitter");
+    if (!sp) return;
+    sp.hidden = el("ocr-books-wrap").classList.contains("sec-collapsed") ||
+                el("ocr-doc-wrap").classList.contains("sec-collapsed");
+  };
+  makeCollapsible(el("builds-tabs"), el("ocr-books-wrap"), "wbEntries", syncOcrSideSplitter);
+  makeCollapsible(el("ocr-artifacts-bar"), el("ocr-doc-wrap"), "wbArtifacts", syncOcrSideSplitter);
+  syncOcrSideSplitter();
+  el("ocr-side-toggle").addEventListener("click", () =>
+    setOcrSideCollapsed(!state.settings.wbSideCollapsed, true));
+  setOcrSideCollapsed(state.settings.wbSideCollapsed, false);
 
   // markdown: the builder's live editor + the overlay window (WHL pencil)
   buildDescMd = createMdEditor(el("b-desc-editor"));
