@@ -86,7 +86,7 @@ def test_remarks_long_text_focus_and_narrow_window_contracts():
     assert "#remarks-sidebar summary:focus-visible" in STYLE
     assert "outline: 2px solid var(--blue)" in STYLE
 
-    assert "@media (max-width: 980px)" in STYLE
+    assert "@media (max-width: 1100px)" in STYLE
     narrow = _rule("#remarks-sidebar:not(.collapsed)")
     assert "position: absolute" in narrow
     assert "right: 0" in narrow

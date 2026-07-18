@@ -27,9 +27,13 @@ manual entries, builds, downloads — under `DATA_ROOT`, which defaults to the
 repo root. Two servers writing one `output/` is how this project lost its
 checked-book set once: `client_state` is server-authoritative on load, so the
 emptier instance wins. Each worktree therefore runs against `.wt/data`, its own
-empty state. Read-only assets (`copyright_renewals.csv`, `whl_catalog.csv`,
-`output/ch_library.json`) still resolve through `APP_ROOT` to that worktree's
-checkout, so the app works — it just starts with no books.
+empty state. `output/ch_library.json` still resolves through `APP_ROOT` to
+that worktree's checkout, so the app works — it just starts with no books.
+The databases — the 40 MB renewals CSV, the Open Library indexes, and
+`whl_catalog.csv` too — resolve most-accessible-first from the shared
+`~/.library-tool` drop-in folder, then `DATA_ROOT`, then the checkout (see
+`find_db` in `tools/libcommon.py`), so every worktree uses the one copy;
+for the WHL catalogue the checkout's own CSV is the usual fallback.
 
 `--seed` copies the main checkout's books and settings into the new
 `DATA_ROOT`. It is a copy: the main checkout is never touched. Note that
@@ -41,10 +45,15 @@ never reads `PORT`, so `autoPort` cannot help. Each worktree is assigned 5101,
 `WHL_PORT` and `WHL_DATA_ROOT` before starting the server. `preview_start` then
 works in every session at once.
 
-**A smaller checkout.** The full tree is ~330 MB, of which `photo/` and
-`books/` are 273 MB of capture images no code reads. Worktrees exclude them by
-sparse-checkout, landing at ~57 MB (mostly the 40 MB renewals CSV, which the
-copyright tag needs). `--full` keeps everything.
+**A smaller checkout.** Mostly history now: the corpus images — `photo/` and
+the `books/` scans, 273 MB no code reads — left git entirely and sync through
+R2 via `tools/corpus_sync.py`, so any checkout of a current commit is ~20 MB.
+The sparse-checkout exclusion survives as a safety net for worktrees based on
+older commits that still track the images. Note the pattern covers all of
+`books/`, so a default worktree also omits the 34 tracked
+`books/*/transcript.txt` OCR transcripts; `--full` restores those on any
+base — the images it can only bring back on a pre-corpus-sync base, since a
+current tree no longer holds them.
 
 Sparse-checkout has a sharp edge that cost this repo its `photo/` directory
 once. `git sparse-checkout init` writes `core.sparseCheckout` to the **shared**
@@ -60,6 +69,9 @@ new worktree, restores the main checkout, and refuses.
 
 ## Things worth knowing
 
+- **`add` forks from `master` by default**, which may be stale or absent in
+  your clone. Pass the line you actually want: `add ocr-boxes --base main`.
+  `--port` likewise overrides the assigned port.
 - **A branch can only be checked out once.** `git worktree add` refuses a branch
   that another worktree holds, which is what stops two sessions committing to
   the same branch.
@@ -70,8 +82,10 @@ new worktree, restores the main checkout, and refuses.
   copy it around.
 - **Merging back:** the worktree is an ordinary branch. `git -C . merge <name>`
   from the main checkout, then `rm -d`.
-- **`output/*.json` are tracked** (builds, manual entries, corrections). A
-  worktree's server writes to `.wt/data` instead, so those stay clean — but if
-  you seed and then edit through the UI, you are editing the copy, not the repo.
+- **Some `output/*.json` are still tracked** (`manual_entries.json`,
+  `ch_library.json`, the books indexes); builds and corrections left git. A
+  worktree's server writes to `.wt/data` either way, so the checkout stays
+  clean — but if you seed and then edit through the UI, you are editing the
+  copy, not the repo.
 - The five Google/DLI scans have no text layer; unrelated to worktrees, but it
   will bite anyone testing the OCR Layout view against them.

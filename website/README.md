@@ -2,14 +2,19 @@
 
 Two designs under one roof, sharing a data layer but not a stylesheet:
 
-- **The tool's own pages** — `index.html` (About), `docs.html`,
-  `downloads.html`, `404.html` — use `assets/site.css`: a calm, prose-width,
-  sidebar layout.
-- **The World Herb Library** — `browse.html`, `book.html`, `read.html` — use
-  `assets/library.css`: a denser, application-like archival catalogue in the
-  manner of archive.org collections and the HathiTrust catalogue. It has its own
-  masthead ("World Herb Library", with a quiet link back to the About page) and
-  is light-only. The two stylesheets are deliberately independent — the
+- **The tool's own pages** — `index.html` (About), `docs.html` (an
+  illustrated user manual; its screenshots live in `assets/docs/`),
+  `downloads.html`, `releases.html` (Release notes) — use `assets/site.css`:
+  a calm, prose-width, sidebar layout. Two more are deliberately
+  self-contained with inline styles — `404.html` (Pages serves it for a miss
+  at any depth, where a relative stylesheet path would break) and
+  `confirmed.html` (the Supabase email-confirmation landing).
+- **The Archive Browser** — `browse.html`, `book.html`, `author.html`,
+  `read.html` — use `assets/library.css`: a denser, application-like archival
+  catalogue in the manner of archive.org collections and the HathiTrust
+  catalogue. It has its own masthead ("Archive Browser", with a quiet "part
+  of Library Tool" link back to the About page) and is light-only. The two
+  stylesheets are deliberately independent — the
   `@font-face` blocks and the Manuscript/letterpress palette (quiet galley
   paper, near-black ink, a single hairline masthead rule, debossed controls)
   are duplicated into `library.css`, so the catalogue pages stand on their own
@@ -47,19 +52,27 @@ python3 tools/cloud_setup.py fixture
 
 ## The library pages
 
-- **`browse.html`** — the faceted catalogue. A search box and sort in the
-  toolbar; a left facet rail with a Categories tree (counts, click to filter a
-  whole subtree), a Year range, and Languages (counts); catalogue records
-  linking to their item pages. Every view deep-links: the query, category,
-  language, year range, sort, and page all live in the URL
-  (`browse.html?q=…&cat=…&lang=…&from=…&to=…&sort=…`), so the back button and
-  shared links work without a router.
+- **`browse.html`** — the faceted catalogue. A search box (with title and
+  author suggestions as you type — a title goes straight to its record, an
+  author to their bibliography) and sort in the toolbar; a left facet rail
+  with a Categories tree (counts, click to filter a whole subtree), a Year
+  range, and Languages (counts); catalogue records — cover thumbnail included
+  when the volume carries one — linking to their item pages. Browsing a
+  single author adds an About-card (first paragraph of the bio, link to the
+  author page) above the results. Every view deep-links: the query, category,
+  language, year range, author, sort, and page all live in the URL
+  (`browse.html?q=…&cat=…&lang=…&from=…&to=…&author=…&sort=…`), so the back
+  button and shared links work without a router.
 - **`book.html?slug=…`** — the item record. A title block, the rendered About
   article (Markdown from `volume_texts`, via the escaping-first renderer in
-  `assets/markdown.js`), and an annotations preview; a formal metadata table and
-  Read / Download actions in the side column, with availability affordances
-  driven by `volumes.assets`. An unknown slug renders an in-page not-found
-  state (the HTTP status is still 200).
+  `assets/markdown.js`), and an annotations preview; a cover thumbnail, a
+  formal metadata table, and Read / Download actions in the side column, with
+  availability affordances driven by `volumes.assets`. An unknown slug renders
+  an in-page not-found state (the HTTP status is still 200).
+- **`author.html?author=…`** — the author record: the full bibliography, with
+  a Markdown bio (from `author_pages`, once one has been curated) filling in
+  after the works list. An unknown name gets the same in-page not-found
+  treatment.
 - **`read.html?slug=…`** — the reader (see below).
 
 ## The reader and vendored pdf.js
@@ -95,9 +108,11 @@ Alongside it:
 - `fixtures/texts.json` — `{ "<slug>": { "about": "<markdown>" } }`
 - `fixtures/notes.json` — `{ "<slug>": [ { note_id, page, quote, kind, body } ] }`
 - `fixtures/pages.json` — `{ "<slug>": { "": { "1": "…" }, "es": { … } } }`
+- `fixtures/authors.json` — `{ "<author>": { "bio": "<markdown>" } }`
 - `fixtures/sample.pdf` — a small public-domain-style sample scan. In fixture
   mode any volume whose assets declare a text layer (`assets.pages`) is served
-  this file, so the reader is fully exercisable offline. The
+  this file, so the reader is fully exercisable offline; `sample-thumb.jpg`
+  stands in for the cover the same way (`assets.thumbnail`). The
   `flora-rustica-1792` entry has the richest fixtures (About, ten pages of text,
   a Spanish translation, and annotations).
 
@@ -109,14 +124,25 @@ python3 tools/cloud_setup.py anon-key      # prints the snippet
 
 Write it to `assets/config.js` — gitignored, because the project reference is
 yours. The **anon** key belongs here, never the service_role key. Row-level
-security is what protects the project: `docs/cloud/migrations/` grants anon
-only the published library reads (`volumes` and its artifact tables,
-`releases`) and nothing else.
+security is what protects the project: `docs/cloud/migrations/` grant anon
+seven published-library reads — `volumes`, `volume_texts`, `volume_pages`,
+`volume_notes`, `author_pages`, the `author_index` view, and `releases` —
+plus the `schema_migrations` ledger, and nothing else.
+
+## Downloads and release notes
+
+`downloads.html` shows the newest build per platform *and channel* from the
+`releases` table. Rows on a non-stable channel (alpha/beta/rc) drop into a
+separate "Pre-release builds" section, badged with their channel and never
+tinted as the primary download. `releases.html` is the full history: it
+fetches `changelog.md` from the site root — the same file the desktop app
+bundles — and parses it client-side (`parseChangelog` in `assets/data.js`),
+grouped by major version.
 
 ## Publishing
 
-Any static host. The site is plain files; `browse.html?q=…&year=…` keeps its
-query in the URL, so deep links and the back button work without a router.
+Any static host. The site is plain files; `browse.html?q=…&from=…&to=…` keeps
+its query in the URL, so deep links and the back button work without a router.
 
 Two things to decide before uploading volumes:
 

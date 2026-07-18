@@ -36,6 +36,10 @@ function historyHarness() {
     logAction: () => ++nextId,
     status: (message) => messages.push(message),
     statusErr: (message) => messages.push(message),
+    // updateHistoryButtons now routes tooltips through setTip (the icon-only
+    // buttons derive their accessible name from it). These stubs carry no
+    // dataset.tipNamed, so mirroring just the data-tip write is faithful.
+    setTip: (node, text) => { if (node) node.dataset.tip = text; },
   });
   vm.runInContext(`${source.slice(start, end)}
 this.api = { pushOp, undo, redo, updateHistoryButtons, historyForTab,

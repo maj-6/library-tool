@@ -43,10 +43,13 @@ const VIEW_STATE_KEYS = new Set([
 // Credentials are never persisted client-side. They live in the server's
 // Host-guarded secrets store (/api/secrets); Mistral additionally syncs through
 // the signed-in user's private cloud profile so Book Capture can share it.
+// Must mirror server.py's _SECRET_KEYS. embedKey/imgGenKey were missing here
+// while the server accepted them, so persistSecrets filtered them out of a
+// save and partitionSettings let imgGenKey leak into localStorage/client_state.
 const SECRET_KEYS = new Set([
-  "aiKey", "embedKey", "imgGenKey", "mistralKey", "ocrClaudeKey", "ocrAwsKey",
+  "aiKey", "embedKey", "mistralKey", "ocrClaudeKey", "ocrAwsKey",
   "ocrAwsSecret", "supabaseKey", "supabaseAnonKey", "r2KeyId", "r2Secret",
-  "gsKeyFile",
+  "gsKeyFile", "imgGenKey",
 ]);
 function partitionSettings(s) {
   const prefs = {}, view = {};
@@ -60,15 +63,18 @@ function partitionSettings(s) {
 // Hydrate the renderer's ephemeral credential cache. Mistral may arrive from
 // the signed-in user's private cloud profile; partitionSettings keeps every
 // value here out of localStorage and client_state.
+// Returns null when the store could not be READ — distinct from "read fine,
+// nothing stored" ({}). Callers that paint fields must not treat a failed read
+// as a set of empty keys, or a sidecar restart blanks every credential field.
 async function hydrateSecrets() {
   try {
     const res = await fetch("/api/secrets");
-    if (!res.ok) return {};
+    if (!res.ok) return null;
     const secrets = await res.json();
     for (const k of SECRET_KEYS) state.settings[k] = secrets[k] || "";
     return secrets;
   } catch (e) {
-    return {};
+    return null;
   }
 }
 
@@ -150,6 +156,7 @@ const state = {
   publishClosed: new Set(),   // organizational folders closed from default-open
   publishDetails: new Map(),  // slug -> {about, notes} preview cache
   publishLoaded: false,
+  publishError: "",             // catalogue load failure, survives re-renders
   publishSource: "",
   publishWarning: "",
   publishSiteUrl: "",
@@ -1109,11 +1116,55 @@ const BICONS = {
   download: _SVGB('<path d="M8 2.4 V9.6 M4.6 6.4 L8 9.8 L11.4 6.4 M3.8 13.4 H12.2"/>'),  // file on disk
 };
 
+// --- accessible names for icon-only controls ---------------------------------
+// An icon button carries its meaning in data-tip, which is a HOVER affordance:
+// to a screen reader (and to Windows Narrator on the always-visible activity
+// bar) undo/redo/new-entry/export/settings all announced as a bare "button".
+// Derive the name from the tip's FIRST clause — later clauses explain
+// consequences and make a poor label. Authored aria-labels and real visible
+// text always win; a glyph like ◀ or ✓ is not real text, so those get named too.
+function tipLabel(tip) {
+  const clause = String(tip || "").split(/\s+—\s+|\.\s+|\n/)[0].trim();
+  if (clause.length <= 80) return clause;
+  // cut on a word boundary: a mid-word fragment is a worse name than a long one
+  return clause.slice(0, 80).replace(/\s+\S*$/, "") + "…";
+}
+function nameFromTip(node) {
+  if (!node || node.getAttribute("aria-label")) return;   // authored name wins
+  const tag = node.tagName;
+  if (tag !== "BUTTON" && tag !== "A" && tag !== "INPUT" &&
+      node.getAttribute("role") !== "button") return;
+  // A form control's <label for> IS its accessible name, and aria-label would
+  // outrank it — naming these would REPLACE "Verbose logging (diagnostics)"
+  // with a truncated description. Only genuinely unlabelled controls qualify.
+  if (node.labels && node.labels.length) return;
+  // letters/digits mean the control already reads as something; punctuation and
+  // geometric glyphs (◀ ▶ ▾ ✓ ↶) do not
+  if (/[\p{L}\p{N}]/u.test((node.textContent || "").trim())) return;
+  const label = tipLabel(node.dataset.tip);
+  if (!label) return;
+  node.setAttribute("aria-label", label);
+  node.dataset.tipNamed = "1";      // derived, so setTip() may refresh it
+}
+// Change a control's tip and keep any DERIVED accessible name in step. Never
+// touches an authored aria-label (no data-tipNamed marker).
+function setTip(node, text) {
+  if (!node) return;
+  node.dataset.tip = text;
+  if (node.dataset.tipNamed === "1") {
+    const label = tipLabel(text);
+    if (label) node.setAttribute("aria-label", label);
+  }
+}
+
 function injectIcons() {
   for (const node of document.querySelectorAll("[data-icon]")) {
     const svg = ICONS[node.dataset.icon];
     if (svg) node.innerHTML = svg;
   }
+  // after the glyphs land: the injected <svg> is aria-hidden and contributes no
+  // text, so the "has visible text" test above still reads correctly
+  for (const node of document.querySelectorAll("[data-tip]")) nameFromTip(node);
 }
 
 // --- confirmation dialog -------------------------------------------------------
@@ -1354,10 +1405,10 @@ function updateHistoryButtons() {
   const u = el("undo-btn"), r = el("redo-btn");
   u.disabled = history.ptr === 0;
   r.disabled = history.ptr >= history.stack.length;
-  u.dataset.tip = history.ptr
-    ? `Undo (Ctrl+Z): ${history.stack[history.ptr - 1].label}` : "Undo (Ctrl+Z)";
-  r.dataset.tip = history.ptr < history.stack.length
-    ? `Redo (Ctrl+Y): ${history.stack[history.ptr].label}` : "Redo (Ctrl+Y)";
+  setTip(u, history.ptr
+    ? `Undo (Ctrl+Z): ${history.stack[history.ptr - 1].label}` : "Undo (Ctrl+Z)");
+  setTip(r, history.ptr < history.stack.length
+    ? `Redo (Ctrl+Y): ${history.stack[history.ptr].label}` : "Redo (Ctrl+Y)");
 }
 
 let historyBusy = false;
@@ -1876,7 +1927,7 @@ async function syncClientStateOnLoad() {
           Object.keys(state.settings.colWidths || {}).length > 0) {
         migratePersistentView = true;
       }
-      syncYearFilterInputs();   // reflect the (local) year-range into the toolbar
+      syncFilterBtn();          // reflect local filters into the toolbar affordance
       syncSearchConsCheckboxes();
       try {
         const { prefs, view } = partitionSettings(state.settings);
@@ -2182,6 +2233,7 @@ function wizRender() {
     // typing. The input listener in initWizard marks touched fields.
     (wizSecretsLoad || hydrateSecrets()).then((secrets) => {
       if (WIZ_STEPS[wizStep][0] !== "services") return;
+      if (!secrets) return;   // failed READ: leave the fields as the user left them
       for (const [id, key] of fields) {
         const input = el(id);
         if (!input.dataset.edited) input.value = secrets[key] || "";
@@ -2450,8 +2502,10 @@ function renderHome() {
   const p = progressSummary();
   // one line per metric, count first, breakdown right-aligned and muted —
   // a status readout in the app's row idiom, not a dashboard of tiles
+  // a zero metric has nowhere to go — navigating to an empty queue (or opening
+  // the remarks sidebar onto nothing) is a dead end, so say so up front
   const row = (n, label, act, detail) =>
-    `<button class="home-row" ${act}>` +
+    `<button class="home-row" ${act}${n ? "" : " disabled"}>` +
       `<span class="hr-n">${n}</span>` +
       `<span class="hr-l">${esc(label)}</span>` +
       (detail ? `<span class="hr-d">${esc(detail)}</span>` : "") +
@@ -2514,11 +2568,15 @@ function renderHome() {
             `<span class="had-txt">${esc(e.detail ||
               activityPhrase({ verb: e.verb, subject: e.subject, n: e.n || 1 }))}</span>` +
             `</div>`).join("") + `</div>`;
-        return `<div class="home-act${open ? " open" : ""}" data-gk="${esc(k)}">` +
-          `<span class="home-act-arrow">${open ? "&#9662;" : "&#9656;"}</span>` +
+        // a real button: this discloses the group's events, and was the only
+        // click target on Home with no keyboard path (the detail block is a
+        // SIBLING, so nesting stays valid)
+        return `<button type="button" class="home-act${open ? " open" : ""}" ` +
+          `data-gk="${esc(k)}" aria-expanded="${open}">` +
+          `<span class="home-act-arrow" aria-hidden="true">${open ? "&#9662;" : "&#9656;"}</span>` +
           `<span class="home-who">${esc(g.actor)}</span> ` +
           `<span class="home-what">${esc(activityPhrase(g))}</span>` +
-          `<span class="home-when">${esc(relTime(g.at))}</span></div>` + det;
+          `<span class="home-when">${esc(relTime(g.at))}</span></button>` + det;
       }).join("")
     : `<div class="empty">No activity recorded yet</div>`;
 
@@ -2578,7 +2636,17 @@ function initHome() {
     const k = row.dataset.gk;
     if (homeState.expanded.has(k)) homeState.expanded.delete(k);
     else homeState.expanded.add(k);
+    const hadFocus = document.activeElement === row;
     renderHome();
+    // renderHome rebuilds the feed's innerHTML, destroying the row that was
+    // just activated — without this a keyboard user is dropped to <body> and
+    // the next Tab restarts at the top of the document. Same pattern as
+    // renderReviewsInto / setRemarksCollapsed.
+    if (hadFocus) {
+      const again = el("home-activity")
+        .querySelector(`.home-act[data-gk="${CSS.escape(k)}"]`);
+      if (again) again.focus();
+    }
   });
   loadActivity();
 }
@@ -3169,6 +3237,8 @@ let popupAnchor = null;
 
 function closePopup() {
   el("popup-menu").hidden = true;
+  if (popupAnchor && popupAnchor !== el("popup-menu"))
+    popupAnchor.setAttribute("aria-expanded", "false");
   popupAnchor = null;
 }
 
@@ -3178,6 +3248,9 @@ function openPopup(anchor, html, wire) {
   popupAnchor = anchor;
   pop.innerHTML = html;
   pop.hidden = false;
+  if (anchor.hasAttribute("aria-haspopup"))
+    anchor.setAttribute("aria-expanded", "true");
+  pop.setAttribute("aria-label", anchor.getAttribute("aria-label") || "Toolbar options");
   const r = anchor.getBoundingClientRect();
   const box = fixedPopupMetrics(pop);
   positionFixedPopup(pop, r.right - box.rect.width,
@@ -3216,20 +3289,39 @@ const FILTER_GROUPS = [
 ];
 
 function filtersActive() {
-  return FILTER_GROUPS.some(([k]) => (state.settings[k] || "ALL") !== "ALL");
+  const checkedActive = state.settings.topTable === "checked" &&
+    FILTER_GROUPS.some(([k]) => (state.settings[k] || "ALL") !== "ALL");
+  return checkedActive ||
+    state.settings.yearFrom != null || state.settings.yearTo != null;
 }
 
 function syncFilterBtn() {
-  el("filter-btn").classList.toggle("active", filtersActive());
+  const active = filtersActive();
+  el("filter-btn").classList.toggle("active", active);
+  el("filter-btn").setAttribute("aria-pressed", String(active));
 }
 
 function openFilterMenu(anchor) {
-  const html = FILTER_GROUPS.map(([k, head, opts]) =>
+  // Mark/source/download filters apply to the checked-books table. The year
+  // range applies to either top table, so it remains available in WHL mode.
+  const groups = state.settings.topTable === "checked" ? FILTER_GROUPS.map(([k, head, opts]) =>
     `<div class="pm-head">${head}</div>` +
     opts.map(([v, label]) => `
       <label class="pm-item"><input type="radio" name="pm-${k}" value="${v}"
         ${(state.settings[k] || "ALL") === v ? "checked" : ""} /> ${label}</label>`).join("")
-  ).join("");
+  ).join("") : "";
+  const from = state.settings.yearFrom == null ? "" : String(state.settings.yearFrom);
+  const to = state.settings.yearTo == null ? "" : String(state.settings.yearTo);
+  const html = groups + `<div class="pm-head">Year range</div>
+    <div class="pm-year" data-tip="Show only rows within this inclusive year range">
+      <label for="pm-year-from">From</label>
+      <input id="pm-year-from" class="cad-input yr-input" type="number"
+             inputmode="numeric" placeholder="from" value="${esc(from)}" />
+      <label for="pm-year-to">To</label>
+      <input id="pm-year-to" class="cad-input yr-input" type="number"
+             inputmode="numeric" placeholder="to" value="${esc(to)}" />
+      <button id="pm-year-clear" class="cad-btn tiny" type="button">Clear</button>
+    </div>`;
   openPopup(anchor, html, (pop) => {
     pop.querySelectorAll("input[type=radio]").forEach((rb) => {
       rb.addEventListener("change", () => {
@@ -3238,6 +3330,29 @@ function openFilterMenu(anchor) {
         syncFilterBtn();
         renderChecked();
       });
+    });
+    let yearDebounce = null;
+    const yearInput = () => {
+      const num = (v) => {
+        const n = parseInt(v, 10);
+        return Number.isFinite(n) ? n : null;
+      };
+      state.settings.yearFrom = num(pop.querySelector("#pm-year-from").value);
+      state.settings.yearTo = num(pop.querySelector("#pm-year-to").value);
+      syncFilterBtn();
+      clearTimeout(yearDebounce);
+      yearDebounce = setTimeout(() => { saveSettings(); renderTop(); }, 150);
+    };
+    pop.querySelector("#pm-year-from").addEventListener("input", yearInput);
+    pop.querySelector("#pm-year-to").addEventListener("input", yearInput);
+    pop.querySelector("#pm-year-clear").addEventListener("click", () => {
+      clearTimeout(yearDebounce);
+      pop.querySelector("#pm-year-from").value = "";
+      pop.querySelector("#pm-year-to").value = "";
+      state.settings.yearFrom = state.settings.yearTo = null;
+      syncFilterBtn();
+      saveSettings();
+      renderTop();
     });
   });
 }
@@ -3536,6 +3651,8 @@ function renderSettings() {
                          ["set-cloud-url", "cloudSearchUrl"],
                          ["set-sb-url", "supabaseUrl"],
                          ["set-imggen-provider", "imgGenProvider"],
+                         // set-imggen-key is a SECRET: the credentials loop below
+                         // owns it. Two handlers on one field would race.
                          ["set-imggen-model", "imgGenModel"]]) {
     const n = el(id);
     n.value = state.settings[k] || "";
@@ -3557,22 +3674,53 @@ function renderSettings() {
       ["set-r2-key", "r2KeyId"], ["set-r2-secret", "r2Secret"],
       ["set-gs-keyfile", "gsKeyFile"], ["set-imggen-key", "imgGenKey"],
     ];
+    const note = el("cred-note");
     const secrets = await hydrateSecrets();
+    const setNote = (text) => {
+      if (!note) return;
+      note.textContent = text || "";
+      note.hidden = !text;
+    };
+    // Only the PAINTING depends on a successful read. The handlers must be
+    // bound either way: leaving these fields on the generic settings onchange
+    // would write a typed key into state.settings + localStorage instead of
+    // the secrets store — losing it, and leaking it out of the server-only path.
     for (const [id, k] of SECRET_FIELDS) {
       const n = el(id);
       if (!n) continue;
-      const v = secrets[k] || "";
-      n.value = v;
-      state.settings[k] = v;                 // in-memory only (client-side uses, e.g. master sync)
-      n.onchange = () => {
+      if (secrets) {
+        n.value = secrets[k] || "";
+        state.settings[k] = secrets[k] || "";   // in-memory only (e.g. master sync)
+        n.classList.remove("cred-bad");         // a fresh read supersedes an old failure
+      }
+      n.onchange = async () => {
         const val = n.value.trim();
-        state.settings[k] = val;
-        fetch("/api/secrets", {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ updates: { [k]: val } }),
-        }).catch(() => {});
+        // was fire-and-forget: a 500 or a restarting sidecar silently discarded
+        // a pasted key on a field where nothing is visible to contradict it.
+        // persistSecrets sets state.settings[k] only on success.
+        try {
+          await persistSecrets({ [k]: val });
+          n.classList.remove("cred-bad");
+          // the note is shared, so only retract it once nothing is still failing
+          if (!document.querySelector(".cad-input.cred-bad")) setNote("");
+        } catch (e) {
+          n.classList.add("cred-bad");
+          const field = (document.querySelector(`label[for="${id}"]`) || {}).textContent;
+          setNote(`${(field || "That credential").trim()} was NOT saved ` +
+            `(${e.message || "the local service refused it"}). It is still only in this box.`);
+          statusErr("CREDENTIAL NOT SAVED :: " + (e.message || "write failed"));
+        }
       };
+    }
+    if (secrets === null) {
+      // A failed READ must not blank 13 password-dotted fields — with nothing
+      // visible in them that reads as "all my keys are gone". Leave what is on
+      // screen alone (the handlers above still save) and say what happened.
+      setNote("Could not read stored credentials — the local service may still be " +
+        "starting. The fields below may be out of date; saving still works.");
+      statusErr("CREDENTIALS :: could not be read");
+    } else if (!document.querySelector(".cad-input.cred-bad")) {
+      setNote("");
     }
   })();
   // Phone capture uses the signed-in account + built-in public project key;
@@ -7336,14 +7484,6 @@ function yearInRange(y) {
   return true;
 }
 
-// reflect the persisted year-range into the toolbar inputs (init + after the
-// server copy of settings is adopted)
-function syncYearFilterInputs() {
-  const f = el("year-from"), t = el("year-to");
-  if (f) f.value = state.settings.yearFrom != null ? state.settings.yearFrom : "";
-  if (t) t.value = state.settings.yearTo != null ? state.settings.yearTo : "";
-}
-
 function filteredCheckedRows(prebuilt) {
   // prebuilt lets renderChecked reuse the combinedRows() array it already
   // built for rowsById, instead of rescanning all entries a second time.
@@ -7565,7 +7705,17 @@ function renderChecked() {
   const so = state.sort.checked;
   if (so) rows = sortRowsBy(rows, (r) => checkedSortVal(r, so.key), so.dir);
 
+  // "nothing here" and "nothing MATCHED" are different facts: with a library
+  // of 253 and a filter that matches none, "No books checked" reads as data loss.
+  el("checked-empty").textContent = allRows.length
+    ? "No rows match the current filter" : "No books checked";
   el("checked-empty").hidden = rows.length !== 0;
+  // What is actually on screen. The WHL table alongside has always had a count;
+  // this one only had the unfiltered "N checked / M manual" totals.
+  el("top-count").textContent = !allRows.length ? ""
+    : rows.length === allRows.length
+      ? `${rows.length} row${rows.length === 1 ? "" : "s"}`
+      : `${rows.length} of ${allRows.length} rows`;
 
   // flatten sets (a header + its expanded volumes) into one ordered list so the
   // streamer can chunk across set boundaries.
@@ -8373,7 +8523,11 @@ function renderHistoryRows() {
     tbody.appendChild(tr);
   }
   el("bottom-empty").hidden = rows.length !== 0;
-  if (!rows.length) el("bottom-empty").textContent = "No actions recorded yet";
+  // don't claim an empty log while the count beside it reads "12 actions (0 shown)"
+  if (!rows.length) {
+    el("bottom-empty").textContent = log.length
+      ? "No actions match the current filter" : "No actions recorded yet";
+  }
   el("bottom-count").textContent =
     `${log.length} action${log.length === 1 ? "" : "s"}` + (q ? ` (${rows.length} shown)` : "");
   // History rows are built directly (not via streamRows' per-chunk mask), so
@@ -8661,9 +8815,7 @@ function switchTopTable(t) {
   el("top-table").value = t;
   el("checked-pane").hidden = t !== "checked";
   el("whltop-pane").hidden = t !== "whl";
-  for (const id of ["dl-approved", "export-json", "filter-btn"]) {
-    el(id).disabled = t !== "checked";
-  }
+  syncFilterBtn();
   renderTop();
 }
 
@@ -8673,8 +8825,10 @@ async function renderTop() {
     await loadWhlRows();
     renderWhlTop();
   } else {
-    renderChecked();
+    // clear the WHL table's count FIRST — renderChecked writes the real one,
+    // and early-returns when the pane is hidden, which must not leave WHL's
     el("top-count").textContent = "";
+    renderChecked();
   }
 }
 
@@ -9774,8 +9928,12 @@ function renderWhlTop() {
     streamRows(el("whltop-rows"), rows, (r) => whlRowTr(r, mode),
       (r) => `whl:${r.idx}`);
   }
+  const whlTotal = (state.whlRows || []).length;
+  el("whltop-empty").textContent = whlTotal
+    ? "No rows match the current filter" : "No WHL rows";
   el("whltop-empty").hidden = rows.length !== 0;
-  el("top-count").textContent = `${rows.length} WHL rows`;
+  el("top-count").textContent = rows.length === whlTotal
+    ? `${rows.length} WHL rows` : `${rows.length} of ${whlTotal} WHL rows`;
   applyTableChrome("whl");
   markSortHeaders("whl");
   refreshInfoIfActive();
@@ -12064,6 +12222,10 @@ async function setVerified(on) {
     const verified = cur && (cur.status === "ready" || cur.status === "uploaded");
     el("b-ready").classList.toggle("active", !!verified);
     el("b-verified-tag").hidden = !verified;
+    // saveBuildFields reports into build-msg in the head bar; when this ran
+    // from a locked phase's inline button that corner is far from the click
+    // (and #b-ready is in the hidden Publish phase), so say it out loud too
+    statusErr("VERIFY :: " + (el("build-msg").textContent || "save failed"));
   }
   renderBuildsList();
   renderWorkbench();      // gates + chips follow the new status immediately
@@ -12075,6 +12237,11 @@ async function setVerified(on) {
 function renderLockNote(id, note) {
   const host = el(id);
   host.hidden = !note;
+  // rewrite only when the text actually changed: applyWorkbenchGates runs on
+  // every renderWorkbench, and blowing the node away mid-render would steal
+  // focus from the very button it just drew
+  if (host.dataset.note === note) return;
+  host.dataset.note = note;
   if (!note) { host.textContent = ""; return; }
   host.innerHTML = esc(note) +
     ` <button class="cad-btn tiny wb-verify-here" type="button" ` +
@@ -12220,7 +12387,7 @@ function setJobsDrawer(open, persist) {
   el("ocr-queue-splitter").hidden = !open;
   const t = el("wb-jobs-toggle");
   t.innerHTML = open ? "&#9662;" : "&#9656;";
-  t.dataset.tip = open ? "Hide the jobs queue" : "Show the jobs queue";
+  setTip(t, open ? "Hide the jobs queue" : "Show the jobs queue");
   t.setAttribute("aria-expanded", String(open));
   if (persist) {
     state.settings.jobsDrawerOpen = !!open;
@@ -12367,7 +12534,7 @@ async function updateAnProvider() {
   host.classList.toggle("an-warn", !hasKey);
   host.textContent = hasKey
     ? `${provider} · ${model}`
-    : "No AI key — set one in Settings > AI";
+    : "No AI key — set one in Settings > Credentials";
 }
 
 function renderAnList() {
@@ -14278,6 +14445,11 @@ function renderPublishTree(revealSelection = false) {
   const tree = el("publish-tree");
   tree.removeAttribute("role");
   tree.innerHTML = model.map((node) => publishTreeNodeHtml(node, 0)).join("");
+  // own all three states here: the markup's "Loading…" used to survive a
+  // successful-but-empty load, so an unpublished library read as still loading
+  el("publish-tree-empty").textContent = state.publishError
+    ? state.publishError
+    : state.publishLoaded ? "Nothing published yet" : "Loading published books…";
   el("publish-tree-empty").hidden = entities.length > 0;
   el("publish-count").textContent = `${state.publishEntries.length} volume${
     state.publishEntries.length === 1 ? "" : "s"}`;
@@ -14562,8 +14734,12 @@ function setPublishSidebarCollapsed(on, persist) {
   el("publish-layout").classList.toggle("sidebar-collapsed", collapsed);
   el("publish-side-toggle").textContent = collapsed ? "▶" : "◀";
   el("publish-side-toggle").setAttribute("aria-expanded", String(!collapsed));
-  el("publish-side-toggle").dataset.tip = collapsed
-    ? "Expand published books sidebar" : "Collapse published books sidebar";
+  // when collapsed this bare ◀/▶ is the strip's ONLY operable control, so it
+  // needs a real name, not just a hover tip (matches the Workbench sidebar)
+  const pubTip = collapsed
+    ? "Expand the published books sidebar" : "Collapse the published books sidebar";
+  el("publish-side-toggle").dataset.tip = pubTip;
+  el("publish-side-toggle").setAttribute("aria-label", pubTip);
   if (persist) {
     state.settings.publishSidebarCollapsed = collapsed;
     saveSettings();
@@ -14639,9 +14815,14 @@ function setOcrSideCollapsed(on, persist) {
   if (persist) { state.settings.wbSideCollapsed = collapsed; saveSettings(); }
 }
 
-function loadPublishCatalog() {
-  if (state.publishCatalogLoading) return state.publishCatalogLoading;
+// force: start a FRESH fetch instead of coalescing onto one already in flight.
+// After publishing, an in-flight request was issued before the volume existed,
+// so joining it would resolve a catalogue missing the new book AND clear the
+// staleness flag. The seq guards below then discard the superseded response.
+function loadPublishCatalog(force) {
+  if (!force && state.publishCatalogLoading) return state.publishCatalogLoading;
   const mine = ++state.publishCatalogSeq;
+  state.publishError = "";
   const refresh = el("publish-refresh");
   refresh.disabled = true;
   el("publish-source").textContent = state.publishEntries.length ? "Refreshing…" : "Loading…";
@@ -14666,8 +14847,10 @@ function loadPublishCatalog() {
     } catch (e) {
       if (mine !== state.publishCatalogSeq) return;
       el("publish-source").textContent = "Could not load catalogue";
-      el("publish-tree-empty").textContent = e.message;
-      el("publish-tree-empty").hidden = state.publishEntries.length > 0;
+      // hold the error in state so any later re-render (Group by, a tree
+      // refresh) doesn't replace it with a "Loading…" claim
+      state.publishError = "Could not load the catalogue — " + e.message;
+      renderPublishTree();
       statusErr("PUBLISH CATALOGUE :: " + e.message);
     } finally {
       if (mine === state.publishCatalogSeq) state.publishCatalogLoading = null;
@@ -15133,7 +15316,8 @@ function renderInfoPane() {
   if (!body) return;
   const t = currentInfoTarget();
   if (!t) {
-    body.innerHTML = `<div class="info-empty">Select a row to see its details.</div>`;
+    body.innerHTML = `<div class="info-empty">Select a row to see its details` +
+      ` — click a cell, or Ctrl+click to open the editor.</div>`;
     return;
   }
   if (t.whl) {                                        // a WHL catalogue row
@@ -15945,8 +16129,11 @@ async function uploadBuild() {
   const rightsLabel = (el("b-rights").selectedOptions[0] || {}).textContent || b.rights;
   if (!(await confirmDialog({
     title: "Publish to the library",
-    message: `Publish "${b.title || b.id}"?\nRights: ${rightsLabel}\n` +
-             `PDF: ${b.pdf_file}`,
+    message: `Publish "${b.title || b.id}"?`,
+    // the detail slot is the multi-line one — #confirm-msg is written with
+    // textContent and has no white-space:pre-line, so newlines packed into
+    // `message` collapse into one run-on sentence
+    detail: `Rights: ${rightsLabel}\nPDF: ${b.pdf_file}`,
     confirmLabel: "Publish",
     cancelLabel: "Not yet",
   }))) return;
@@ -16014,6 +16201,13 @@ function pollPublish(buildId = null) {
         renderUpload();
       }
       renderHome();
+      // The Published Library now has one more volume than its cached copy —
+      // without this, opening that tab shows a catalogue missing the book just
+      // published, with no staleness signal. Dropping the flag is enough:
+      // renderPublish() re-fetches whenever it is not loaded, and publishing
+      // starts from the Workbench, so reaching Publish always goes through it.
+      // (Deliberately no DOM call here — pollPublish stays free of collaborators.)
+      state.publishLoaded = false;
       status(`PUBLISHED :: ${st.slug}${st.note ? " :: " + st.note : ""}`);
     }
   }, 700);
@@ -16342,6 +16536,9 @@ async function generateAiSummary() {
   if (!b) return;
   const s = state.settings;
   const msg = el("b-ai-msg");
+  // Only the key is required: the model falls back to deepseek-chat just below,
+  // so main's "model must be set" guard would block a request that works. The
+  // message names the provider instead of pointing at a model setting.
   const provider = descriptionProviderLabel(s);
   if (!(s.aiKey || "").trim()) {
     msg.textContent = provider === "DeepSeek"
@@ -16968,6 +17165,7 @@ async function selectOcrBook(bid) {
   }
   renderWorkbench();
   clearOcrPageSel();   // selections don't carry across books
+  baselineStagedEdge(bid);   // this book's staged count is the new baseline
   let folder = (ocrState.books || {})[bid];
   // A selection can arrive before the folder list has ever loaded (the Home
   // jump selects immediately after switching tabs) — fetch it, don't give up.
@@ -17455,11 +17653,13 @@ function buildOcrKeymapLegend() {
   }
   // the one on-surface home for the page view's whole hidden keyboard layer:
   // selection, ranges, staging, title, delete, clear all live here
-  host.innerHTML = parts.length
-    ? `click select · <b>Ctrl</b>+click range · digit stages selection (else hover) — ` +
-      `${parts.join(" · ")} · <b>T</b> title · <b>Del</b> delete pages · ` +
-      `<b>Esc</b> clear`
-    : "";
+  // The gestures are documented NOWHERE else, so they must not ride on whether
+  // any digit slot happens to be mapped — clearing all five in Settings used to
+  // erase click-select, Ctrl+click, T, Del and Esc along with them.
+  const gestures = `click select · <b>Ctrl</b>+click range · <b>T</b> title · ` +
+    `<b>Del</b> delete pages · <b>Esc</b> clear`;
+  host.innerHTML = gestures + (parts.length
+    ? ` — digit stages selection (else hover): ${parts.join(" · ")}` : "");
 }
 
 function setOcrView(v) {
@@ -18465,29 +18665,41 @@ function analysisServiceReady() {
   return !!String(state.settings.aiKey || "").trim();
 }
 
+// renderOcrQueue runs this on every 1.5s job-poll tick, so it follows the
+// house sig-guard pattern (cf. applyColHide): compute the strings, write only
+// when something actually changed — rewriting data-tip under an open tooltip
+// would otherwise churn the DOM and the tooltip alike.
+let _engineSummarySig = null;
 function updateDefaultEngineSummary() {
   const host = el("engine-defaults-summary");
   if (!host) return;
   const ocr = OCR_SERVICE_LABELS[state.settings.ocrService] || "Tesseract (local)";
-  host.textContent = ocr;
+  // No analysis label here: the always-"configured" analysis-engine picker was
+  // removed as a fake choice, so the summary names the OCR engine alone.
   // the drawer is Workbench-global but its stage-all acts on the CURRENT
   // book's selected source — name the target where the button lives,
   // and refuse (disabled) rather than error after the click
   const add = el("ocr-queue-add");
-  if (!add) return;
   const bid = ocrState.book;
   const b = bid ? state.builds[bid] : null;
+  let scope = "";
+  let tip = "Pick a book first — stage-all acts on the current book";
   if (b) {
     const d = ocrSelDoc();
     const src = d && d.buildId === bid ? docSrcKey(d) : "primary";
+    // bookTitleText carries the volume tag, so allow a few more characters
     const title = bookTitleText(b, bid).slice(0, 48);
-    host.textContent += ` · stages: ${title} / ${src}`;
-    add.dataset.tip =
-      `Stage every page of "${title}" (${src}) with ${ocr} — nothing runs until Submit`;
-    add.disabled = false;
-  } else {
-    add.dataset.tip = "Pick a book first — stage-all acts on the current book";
-    add.disabled = true;
+    scope = ` · stages: ${title} / ${src}`;
+    tip = `Stage every page of "${title}" (${src}) with ${ocr} — ` +
+          "nothing runs until Submit";
+  }
+  const sig = `${ocr}|${scope}|${tip}`;
+  if (sig === _engineSummarySig) return;
+  _engineSummarySig = sig;
+  host.textContent = `${ocr}${scope}`;
+  if (add) {
+    setTip(add, tip);          // icon-only: keeps its derived accessible name in step
+    add.disabled = !b;
   }
 }
 
@@ -18502,6 +18714,9 @@ function refreshDefaultEngineOptions() {
   ocr.value = state.settings.ocrService || "tesseract";
   el("ocr-engine-note").textContent = [...ocr.options].some((o) => o.disabled)
     ? "Cloud engines without credentials are unavailable." : "";
+  // No analysis-engine note: that picker (and its #analysis-engine-note
+  // element) were removed with the fake analysis-engine choice, and `ready`
+  // is scoped to the OCR loop above.
   updateDefaultEngineSummary();
 }
 
@@ -18604,6 +18819,9 @@ async function ocrQueuePages(bid, srcKey, pages) {
   const pdf = ocrSrcPdf(bid, srcKey);
   const target = srcCompiledName(srcKey);
   if (!b || !pdf || !pages.length) return;
+  // A retired engine (e.g. azure) can still be referenced by pages staged
+  // before it was removed: drop those rather than queue a stub job for a
+  // processor that no longer exists, and carry on with the runnable ones.
   const unavailable = pages.filter((x) => !OCR_RUNNABLE[x.service]);
   if (unavailable.length) {
     for (const x of unavailable)
@@ -18689,7 +18907,18 @@ function stagedCountFor(bid) {
   return n;
 }
 
-let _lastStagedTotal = 0;
+// The "first staged page opens the drawer" edge is PER BOOK: a plain global
+// misses the edge when book B's first page is staged while A still holds a
+// count, and pops the drawer open on merely returning to an already-staged
+// book. selectOcrBook re-baselines (arriving somewhere staged is not a
+// staging action), so the edge below only ever compares like books.
+let _stagedEdge = { book: null, total: 0 };
+function stagedTotalFor(bid) {
+  return bid ? stagedCountFor(bid) + analysisStagedCount(bid) : 0;
+}
+function baselineStagedEdge(bid) {
+  _stagedEdge = { book: bid, total: stagedTotalFor(bid) };
+}
 function updateOcrStagedMsg() {
   const bid = ocrState.book;
   const n = bid ? stagedCountFor(bid) : 0;
@@ -18706,8 +18935,10 @@ function updateOcrStagedMsg() {
   // drawer — the first staged page opens it (without persisting the state,
   // so the user's preferred drawer default survives)
   const total = n + analysis;
-  if (total && !_lastStagedTotal) setJobsDrawer(true, false);
-  _lastStagedTotal = total;
+  if (_stagedEdge.book === bid && total && !_stagedEdge.total) {
+    setJobsDrawer(true, false);
+  }
+  _stagedEdge = { book: bid, total };
   renderOcrQueue();
 }
 
@@ -19357,6 +19588,9 @@ function renderReplicaBooks() {
     li.dataset.bid = b.id;
     const why = attnReason(b.attention);
     if (why) li.dataset.tip = "Needs attention: " + why;
+    li.tabIndex = 0;
+    li.setAttribute("role", "button");
+    if (b.id === rwState.book) li.setAttribute("aria-current", "true");
     li.innerHTML = `<span class="bi-title">${bookTitleHtml(b)}</span>
       <span class="bi-meta">${esc(b.authors || "")}${b.authors && b.year ? " &middot; " : ""}${esc(b.year || "")}</span>`;
     list.appendChild(li);
@@ -19665,11 +19899,11 @@ function rwSyncBar() {
       (rwState.dirty ? " · unsaved" : "")
     : "";
   el("rw-save").disabled = !rwState.dirty || !rwState.page;
-  el("rw-recompile").disabled = !rwState.book || !rwState.regionPages.length;
+  el("rw-recompile").disabled = !rwState.book || !rwState.regionPages.length || rwState.dirty;
   el("rw-export").disabled = !rwState.book || !rwState.regionPages.length;
   el("rw-import").disabled = !rwState.book;
   el("rw-print").disabled = !rwState.book || !rwState.regionPages.length;
-  el("rw-tpl-save").disabled = !rwState.page;
+  el("rw-tpl-save").disabled = !rwState.page || rwState.dirty;
   el("rw-tpl-apply").disabled = !el("rw-tpl").value;
   el("rw-tpl-outliers").disabled = !el("rw-tpl").value;
   const a = rwActive();
@@ -20208,6 +20442,8 @@ function rwSetMode(mode) {
   const pv = rwState.mode === "preview";
   el("rw-mode-edit").classList.toggle("active", !pv);
   el("rw-mode-preview").classList.toggle("active", pv);
+  el("rw-mode-edit").setAttribute("aria-pressed", String(!pv));
+  el("rw-mode-preview").setAttribute("aria-pressed", String(pv));
   el("rw-canvas").hidden = pv || !rwState.page;
   el("rw-preview-row").hidden = !pv || !rwState.page;
   el("rw-empty").hidden = !!rwState.page;
@@ -20585,6 +20821,37 @@ function initReplica() {
     const li = ev.target.closest("[data-bid]");
     if (li) selectReplicaBook(li.dataset.bid);
   });
+  el("rw-books").addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter" && ev.key !== " ") return;
+    const li = ev.target.closest("[data-bid]");
+    if (!li) return;
+    ev.preventDefault();
+    li.click();
+  });
+
+  const toolbarMenus = [...document.querySelectorAll(".replica-toolbar .toolbar-popover")];
+  for (const menu of toolbarMenus) {
+    menu.addEventListener("toggle", () => {
+      if (!menu.open) return;
+      for (const other of toolbarMenus) if (other !== menu) other.open = false;
+    });
+    menu.addEventListener("click", (ev) => {
+      const button = ev.target.closest("button");
+      if (button && !button.disabled) menu.open = false;
+    });
+  }
+  document.addEventListener("mousedown", (ev) => {
+    for (const menu of toolbarMenus) {
+      if (menu.open && !menu.contains(ev.target)) menu.open = false;
+    }
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Escape") return;
+    const menu = toolbarMenus.find((item) => item.open);
+    if (!menu) return;
+    menu.open = false;
+    menu.querySelector("summary").focus();
+  });
   el("rw-pages").addEventListener("click", (ev) => {
     const b = ev.target.closest(".rw-pagebtn");
     if (b) selectReplicaPage(+b.dataset.page);
@@ -20953,11 +21220,12 @@ const MENU_CMDS = {
   "about": () => openAbout(),
   // File > New entry: same flow as the Workbench toolbar's + button, but
   // reachable from anywhere — land on the Record phase so the form is visible.
-  "new-entry": () => {
+  "new-entry": async () => {
     const t = document.querySelector('#tabs .tab[data-tab="workbench"]');
     if (t) t.click();
     setWorkbenchPhase("record", false);
-    createBuild({}, "(blank)");
+    const b = await createBuild({}, "(blank)");
+    if (b) { const title = el("b-title"); if (title) title.focus(); }
   },
   // quick settings (mirror the Settings-dialog handlers, side effects and all)
   "opt-auto-ia": () => {
@@ -21061,7 +21329,7 @@ function initMenubar() {
   });
   document.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape" && openMenu) closeAll();
-    // Ctrl/Cmd+, opens Preferences (the desktop convention)
+    // Ctrl/Cmd+, opens Settings (the desktop convention)
     if ((ev.ctrlKey || ev.metaKey) && ev.key === ",") {
       ev.preventDefault();
       openSettings();
@@ -21444,9 +21712,7 @@ function init() {
     else if (k === "y" || (k === "z" && ev.shiftKey)) { ev.preventDefault(); redo(); }
   });
 
-  // table-bar commands (run-scans / scrape / search-pane are menu items)
-  el("dl-approved").addEventListener("click", downloadApproved);
-  el("export-json").addEventListener("click", exportJson);
+  // table-bar commands (download, export, scans, scrape, and search are menu items)
   initSortHeaders();
 
   // filter + column-visibility popups
@@ -21513,28 +21779,6 @@ function init() {
     }, 150);
   });
   el("checked-rows").addEventListener("click", onCheckedClick);
-
-  // year-range filter (applies to whichever top table is shown) — same debounce,
-  // which also collapses the per-keystroke saveSettings() client_state PUT.
-  let _yearDebounce = null;
-  const onYearFilter = () => {
-    const num = (v) => { const n = parseInt(v, 10); return Number.isFinite(n) ? n : null; };
-    state.settings.yearFrom = num(el("year-from").value);
-    state.settings.yearTo = num(el("year-to").value);
-    clearTimeout(_yearDebounce);
-    _yearDebounce = setTimeout(() => { saveSettings(); renderTop(); }, 150);
-  };
-  el("year-from").addEventListener("input", onYearFilter);
-  el("year-to").addEventListener("input", onYearFilter);
-  el("year-clear").addEventListener("click", () => {
-    clearTimeout(_yearDebounce);           // cancel a pending trailing render
-    el("year-from").value = "";
-    el("year-to").value = "";
-    state.settings.yearFrom = state.settings.yearTo = null;
-    saveSettings();
-    renderTop();
-  });
-  syncYearFilterInputs();
 
   // Open Library search constraint checkboxes (Title/Author/Year) — the same
   // persistent searchCons set toggled by Ctrl+click on a column header
@@ -21889,9 +22133,14 @@ function init() {
   // Two doors to the same blank entry: the activity bar for repeat use and
   // the empty-state prompt for first use. A third copy in the narrow list bar
   // clipped its collapse control without adding a distinct path.
-  const newBlankEntry = () => {
+  const newBlankEntry = async () => {
     setWorkbenchPhase("record", false);   // the blank form is the next step
-    createBuild({}, "(blank)");
+    // land the caret in Title: from the empty-state door the clicked button's
+    // container is hidden by the re-render, dropping focus to <body> so the
+    // next Tab restarts at the top of the document. Guarded — a failed POST
+    // leaves #build-editor hidden. Matches es-title / w-title / e-title.
+    const b = await createBuild({}, "(blank)");
+    if (b) { const t = el("b-title"); if (t) t.focus(); }
   };
   el("build-new").addEventListener("click", newBlankEntry);
   const emptyNew = el("build-new-empty");
@@ -21911,7 +22160,9 @@ function init() {
     renderPublishTree(true);
     renderPublishPreview();
   });
-  el("publish-refresh").addEventListener("click", loadPublishCatalog);
+  // wrapped: a bare listener would pass the click Event as `force` by accident.
+  // Refresh SHOULD force a fresh fetch — that is what the user is asking for.
+  el("publish-refresh").addEventListener("click", () => loadPublishCatalog(true));
   el("publish-tree").addEventListener("contextmenu", onPublishContextMenu);
   el("publish-tree").addEventListener("click", (ev) => {
     const toggle = ev.target.closest("[data-publish-toggle]");
