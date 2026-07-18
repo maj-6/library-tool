@@ -74,6 +74,25 @@ def test_workbench_phase_gating_locks_analyze_derived_phases_for_drafts():
     assert 'el("ocr-analysis-workspace").hidden = !!knowNote' in gates
     # the Publish action bar stays reachable for drafts: verify lives there
     assert 'el("wb-publish-actions").hidden = !b' in gates
+    # [hidden] must beat the id-based .active display rules, or the locked
+    # workspace (and its own placeholder) renders under the lock note
+    assert ".ocr-workpane[hidden] { display: none !important; }" in STYLE
+
+
+def test_source_viewer_agrees_with_the_chip_and_workbench_hides_dup_chrome():
+    # the Source chip and the Text phase fall back to the entry folder's own
+    # PDF via ocrBookPdf — the Source viewer must use the same fallback
+    source = _between(APP, "async function refreshSourceTab()",
+                      "// create/refresh the entry folder")
+    assert "localPath || ocrBookPdf(b.id)" in source
+    assert "pagesPdf: viewPath" in source
+    # the transplanted an-head must not repeat title · author · year under the
+    # Workbench header (the provider/status side of the bar stays)
+    assert "#an-integrated-host #an-title" in STYLE
+    assert "#an-integrated-host #an-sub { display: none; }" in STYLE
+    # the Text toolbar's find/replace give ground before the save button wraps
+    assert ("#ocr-find, #ocr-replace "
+            "{ flex: 1 1 60px; min-width: 60px; max-width: 130px; }") in STYLE
 
 
 def test_workbench_readiness_chips_compute_client_side_per_phase():
@@ -147,6 +166,15 @@ def test_jobs_drawer_and_default_engine_modal_cover_ocr_and_text_analysis():
     assert 'id="wb-jobs-toggle"' in TEMPLATE
     assert 'id="wb-jobs-summary"' in TEMPLATE
     assert 'id="wb-jobs-body" hidden' in TEMPLATE
+    # the glyph-only toggle carries an accessible name
+    toggle = _between(TEMPLATE, 'id="wb-jobs-toggle"', "</button>")
+    assert 'aria-label="Jobs"' in toggle
+    assert 'aria-expanded="false"' in toggle
+    # the open drawer occludes phase content: opaque, stacked, phases clipped
+    drawer_css = _between(STYLE, "#wb-jobs {", "}")
+    assert "background: var(--face);" in drawer_css
+    assert "z-index: 2;" in drawer_css
+    assert "overflow: hidden;" in _between(STYLE, ".wb-phase.active {", "}")
     assert '<span class="tool-label">Jobs</span>' in TEMPLATE
     assert '>Default Engine:</button>' in TEMPLATE
     assert "<th>Type</th>" in TEMPLATE
@@ -201,6 +229,8 @@ def test_page_analysis_staging_and_unified_job_rows_are_wired():
     assert "anJobs.entries()" in jobs
     assert "<td>OCR</td>" in jobs
     assert "<td>Text analysis</td>" in jobs
+    # the drawer count singularizes like the summary line ("1 job", not "1 jobs")
+    assert '${total} job${total === 1 ? "" : "s"}' in jobs
 
 
 def test_manual_about_save_populates_editor_description(client):

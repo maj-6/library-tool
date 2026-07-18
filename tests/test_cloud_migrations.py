@@ -123,6 +123,56 @@ def test_migrations_lint_clean():
         assert sql.rstrip().endswith(";"), f"{mid}: missing final semicolon"
 
 
+# --- 004: passages + index versions (issue #140) ----------------------------------
+
+PASSAGES_MIG = SQL["004_passages_index"]
+PASSAGES_FLAT = " ".join(PASSAGES_MIG.split())
+
+
+def test_passages_index_declares_tables_and_the_vector_extension():
+    assert "create extension if not exists vector;" in PASSAGES_MIG
+    sch = cloud_setup.expected_schema(PASSAGES_MIG)
+    assert sch["index_versions"] == {"id", "slug", "channel", "config",
+                                     "source_hash", "stats", "built_at"}
+    assert sch["passages"] == {"index_id", "slug", "passage_id", "parent_id",
+                               "page_from", "page_to", "body", "fts",
+                               "embedding"}
+    # dimension-free on purpose: the model and its dims live in config, so
+    # a typed/indexed column stays a deliberate later migration
+    assert re.search(r"^\s*embedding\s+vector,", PASSAGES_MIG, re.M)
+
+
+def test_passage_corpus_is_rpc_only_and_version_metadata_is_readable():
+    """docs/search-design.md D6: no anon path to the corpus but the RPC."""
+    body = re.sub(r"--[^\n]*", "", PASSAGES_MIG)
+    assert "alter table passages enable row level security;" in PASSAGES_FLAT
+    assert ("revoke all on public.passages from anon, authenticated;"
+            in PASSAGES_FLAT)
+    assert not re.search(r"create policy \w+ on passages\b", body)
+    assert ("grant select on public.index_versions to anon, authenticated;"
+            in PASSAGES_FLAT)
+    assert PASSAGES_MIG.count("create policy index_versions_read_all") == 1
+    # the check's anon smoke tests carry the same contract
+    assert "index_versions" in cloud_setup.ANON_CAN
+    assert "passages" in cloud_setup.ANON_CANNOT
+
+
+def test_search_passages_rpc_is_definer_with_pinned_path_and_rank_fusion():
+    fn = " ".join(PASSAGES_MIG.split(
+        "create or replace function search_passages", 1)[1].split())
+    assert "security definer" in fn          # passages carries no anon read
+    assert "set search_path = public, extensions" in fn
+    assert "channel = 'stable'" in fn        # latest stable serves
+    assert "order by iv.built_at desc" in fn
+    assert "websearch_to_tsquery('simple', p_query)" in fn
+    assert "websearch_to_tsquery('english', p_query)" in fn
+    assert "StartSel=«, StopSel=», MaxWords=24, MinWords=12" in fn
+    assert "p.embedding <=> p_embedding" in fn
+    assert fn.count("1.0 / (60 + ") == 2     # reciprocal-rank fusion, both arms
+    assert ("grant execute on function search_passages(text, text, vector, int)"
+            " to anon, authenticated, service_role;" in PASSAGES_FLAT)
+
+
 # --- the pure check logic ---------------------------------------------------------
 
 def test_expected_schema_parses_a_synthetic_snippet():
