@@ -2852,6 +2852,30 @@ def api_build_replica_style(build_id: str):
     return jsonify({"ok": True, "count": len(styles)})
 
 
+@app.route("/api/builds/<build_id>/replica-instructions",
+           methods=["GET", "PUT"])
+def api_build_replica_instructions(build_id: str):
+    """The per-book "instructions for editors / AI" text (docs/lib-format.md
+    §2.2) — free guidance that every .lib export embeds in its manifest and
+    INSTRUCTIONS.md, e.g. "Latin plant names stay untranslated". Stored as
+    ocr/lib-instructions.md beside the other book-level sidecars. GET returns
+    {text}; PUT {text} stores it, and an empty text removes the sidecar."""
+    if build_id not in lib.load_json(BUILDS_PATH, {}):
+        abort(404)
+    if request.method == "GET":
+        return jsonify({"ok": True, "text": _lib_book_instructions(build_id)})
+    p = request.get_json(silent=True) or {}
+    text = str(p.get("text") or "")[:20000]
+    dest = _entry_dir(build_id) / "ocr" / "lib-instructions.md"
+    with _ocr_merge_lock:
+        if text.strip():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(text, encoding="utf-8")
+        else:
+            dest.unlink(missing_ok=True)
+    return jsonify({"ok": True, "chars": len(text) if text.strip() else 0})
+
+
 @app.route("/api/builds/<build_id>/replica-export")
 def api_build_replica_export(build_id: str):
     """Seal one source's Replica working store into a .lib — a plain zip:

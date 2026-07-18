@@ -1225,6 +1225,15 @@
                       data-tip="Back to the default OFL mapping">Reset</button>
             </div>
             <div id="rw-styleboard" class="drafting"></div>
+            <div class="pane-bar">
+              <span class="tool-label">Instructions for editors / AI</span>
+              <span class="tool-count" id="rw-instr-state"></span>
+              <span class="bar-spacer"></span>
+              <button id="rw-instr-save" class="cad-btn tiny" type="button"
+                      data-tip="Store this note with the book — every .lib export embeds it for external editors and AI assistants">Save</button>
+            </div>
+            <textarea id="rw-instr" class="cad-input" rows="3" spellcheck="false"
+                      placeholder="Per-book guidance that travels inside the exported .lib — e.g. &quot;Latin plant names stay untranslated&quot;"></textarea>
           </div>
           <div id="rw-edit-panel">
           <div class="pane-bar">

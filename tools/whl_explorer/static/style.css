@@ -3338,6 +3338,15 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 .rw-prevregion img { width: 100%; height: 100%; object-fit: contain; }
 /* style board: one compact row per role */
 #rw-styleboard { padding: 4px; overflow-y: auto; }
+/* the per-book "instructions for editors / AI" note the .lib export embeds */
+#rw-instr {
+  display: block;
+  width: calc(100% - 8px);
+  margin: 4px;
+  resize: vertical;
+  font-size: 11px;
+  line-height: 1.4;
+}
 .rw-stylerow {
   display: flex;
   gap: 3px;

@@ -413,6 +413,41 @@ def test_python_api_read_write_validate(client, data_root, tmp_path):
         pass
 
 
+# --- the per-book instructions field -----------------------------------------
+
+def test_replica_instructions_roundtrip_and_export(client, data_root):
+    import server
+    bid = "e2b012340013"
+    _seed_build(bid)
+    assert client.get("/api/builds/nope/replica-instructions").status_code == 404
+    r = client.get(f"/api/builds/{bid}/replica-instructions").get_json()
+    assert r["ok"] and r["text"] == ""
+
+    note = "Latin names stay untranslated."
+    r = client.put(f"/api/builds/{bid}/replica-instructions",
+                   json={"text": note}).get_json()
+    assert r["ok"] and r["chars"] == len(note)
+    assert client.get(
+        f"/api/builds/{bid}/replica-instructions").get_json()["text"] == note
+
+    # the export embeds it: the manifest key AND the generated contract
+    _put(client, bid, {"page": 1, "items": [
+        {"role": "body", "order": 0,
+         "box": {"x": 0.2, "y": 0.1, "w": 0.6, "h": 0.7}, "text": "t"}]})
+    z = zipfile.ZipFile(io.BytesIO(
+        client.get(f"/api/builds/{bid}/replica-export").data))
+    assert json.loads(z.read("book.json"))["instructions"]["book"] == note
+    assert note in z.read("INSTRUCTIONS.md").decode("utf-8")
+
+    # blank clears: the sidecar goes away rather than storing whitespace
+    r = client.put(f"/api/builds/{bid}/replica-instructions",
+                   json={"text": "   "}).get_json()
+    assert r["ok"] and r["chars"] == 0
+    assert client.get(
+        f"/api/builds/{bid}/replica-instructions").get_json()["text"] == ""
+    assert not (server._entry_dir(bid) / "ocr" / "lib-instructions.md").exists()
+
+
 # --- POST /api/lib/open: the desktop "double-clicked a .lib" flow ------------
 
 def _fixture_lib(tmp_path, title="Fixture Herbal"):

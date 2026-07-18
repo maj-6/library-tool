@@ -14922,6 +14922,8 @@ async function selectReplicaBook(bid) {
   if (seq !== rwState.seq) return;
   await rwLoadTranslations(seq);
   if (seq !== rwState.seq) return;
+  await rwLoadInstructions(seq);
+  if (seq !== rwState.seq) return;
   rwSyncBar();
 }
 
@@ -15967,6 +15969,39 @@ async function rwStyleSave() {
   }
 }
 
+// the per-book "instructions for editors / AI" note (ocr/lib-instructions.md):
+// free guidance every .lib export embeds for external tools and assistants
+async function rwLoadInstructions(seq) {
+  let text = "";
+  try {
+    const r = await (await fetch(
+      `/api/builds/${encodeURIComponent(rwState.book)}/replica-instructions`)).json();
+    if (r.ok) text = r.text || "";
+  } catch (e) { /* absent = empty; the field still saves */ }
+  if (seq !== rwState.seq) return;
+  el("rw-instr").value = text;
+  el("rw-instr-state").textContent = text.trim() ? "set" : "";
+}
+
+async function rwInstrSave() {
+  if (!rwState.book) return;
+  const text = el("rw-instr").value;
+  try {
+    const r = await (await fetch(
+      `/api/builds/${encodeURIComponent(rwState.book)}/replica-instructions`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      })).json();
+    if (!r.ok) throw new Error(r.error || "save failed");
+    el("rw-instr-state").textContent = text.trim() ? "set" : "";
+    status(text.trim() ? `BOOK INSTRUCTIONS SAVED :: ${r.chars} chars`
+                       : "BOOK INSTRUCTIONS CLEARED");
+  } catch (e) {
+    status("BOOK INSTRUCTIONS :: " + e.message);
+  }
+}
+
 async function rwStyleReset() {
   if (!rwState.book) return;
   let ok = false;
@@ -16134,6 +16169,10 @@ function initReplica() {
   });
   el("rw-style-save").addEventListener("click", rwStyleSave);
   el("rw-style-reset").addEventListener("click", rwStyleReset);
+  el("rw-instr-save").addEventListener("click", rwInstrSave);
+  el("rw-instr").addEventListener("input", () => {
+    el("rw-instr-state").textContent = "edited";
+  });
   el("rw-legend").innerHTML = RW_ROLES.map((r, i) =>
     `<span class="rw-key role-${esc(r)}" data-tip="${esc(r)}">${(i + 1) % 10}</span>`).join("");
 }
