@@ -36,8 +36,11 @@ def test_release_requires_persistent_android_signing_for_tags():
 
     # A tagged build with no keystore must FAIL the android job rather than
     # silently fall back to the runner's debug key (issue #119).
-    assert "IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}" in android
-    assert 'elif [ "$IS_TAG" = "true" ]; then' in android
+    release_event = (
+        "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')"
+    )
+    assert f"IS_RELEASE: ${{{{ {release_event} }}}}" in android
+    assert 'elif [ "$IS_RELEASE" = "true" ]; then' in android
     assert "Tagged Android release requires the persistent signing keystore" in android
 
     # A workflow_dispatch dry run may still debug-sign, but the artifact is
@@ -47,12 +50,28 @@ def test_release_requires_persistent_android_signing_for_tags():
 
     # The signer is verified before upload; a debug-signed tagged APK is refused.
     assert "apksigner" in android
-    assert "verify --print-certs" in android
+    assert "shell: bash" in android
+    assert 'if ! "$APKSIGNER" verify --print-certs "$APK" > signer.txt; then' in android
+    assert 'if [ -z "$DN" ] || [ -z "$SHA256" ]; then' in android
     assert "Android Debug" in android
+    assert "Signer #1 certificate SHA-256 digest" in android
 
     # The android job exposes the verified signer and the publish job reports it.
     assert "signer: ${{ steps.signer.outputs.signer }}" in android
+    assert "signer_sha256: ${{ steps.signer.outputs.sha256 }}" in android
     assert "needs.android.outputs.signer" in publish
+
+    # Manual dispatches are dry runs even when dispatched against a tag ref.
+    assert release_event in publish
+    preflight = _job("preflight", "android")
+    assert release_event in preflight
+
+
+def test_release_docs_use_raw_windows_base64_not_certutil_pem():
+    docs = (ROOT / "docs" / "releasing.md").read_text(encoding="utf-8")
+    assert "[Convert]::ToBase64String" in docs
+    assert "Do not use `certutil -encode`" in docs
+    assert "(or `certutil -encode` on Windows)" not in docs
 
 
 def test_release_source_versions_are_internally_consistent():

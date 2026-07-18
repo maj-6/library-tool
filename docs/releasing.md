@@ -124,13 +124,17 @@ So treat it as unrecoverable-if-lost and back it up accordingly:
   is enough; the file is a few KB.
 - **CI holds only a copy, not the source of truth.** `ANDROID_KEYSTORE_B64` is
   base64 of the same `.jks`; regenerate it from the local file with
-  `base64 -w0 ~/.whl-release/bookcapture.jks` (or `certutil -encode` on Windows)
-  if the secret is ever cleared. Losing the GitHub secret is recoverable from
-  the local keystore; losing the local keystore is not.
+  `base64 -w0 ~/.whl-release/bookcapture.jks` on Linux, or this raw-base64
+  PowerShell command on Windows:
+  `[Convert]::ToBase64String([IO.File]::ReadAllBytes("$HOME/.whl-release/bookcapture.jks"))`.
+  Do not use `certutil -encode`, which adds PEM headers that the workflow's
+  decoder does not accept. Losing the GitHub secret is recoverable from the
+  local keystore; losing the local keystore is not.
 - **Verify recoverability periodically:** `keytool -list -keystore
   ~/.whl-release/bookcapture.jks -alias bookcapture` should list the key with the
   stored password. The release pipeline also prints the published APK's signer
-  DN in its run summary, so a signer regression is visible on every release.
+  DN and certificate SHA-256 digest in its run summary, so the exact signing
+  certificate can be compared across releases.
 
 ## By hand (no CI)
 
