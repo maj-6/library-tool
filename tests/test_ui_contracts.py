@@ -44,7 +44,7 @@ def test_verified_toggle_saves_the_whole_editor_form():
     body = APP.split("async function setVerified", 1)[1].split(
         "function renderLockNote", 1)[0]
     assert "await saveBuildFields()" in body
-    assert "patchBuildRaw" not in body
+    assert "patchBuildRaw(" not in body   # the call, not the prose
 
 
 def test_locked_phases_offer_the_verify_unlock_inline():

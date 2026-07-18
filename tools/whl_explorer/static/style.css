@@ -1473,7 +1473,6 @@ body .cad-btn.primary.danger {
 .ctl-join > select.cad-input,
 .ctl-join > .cad-btn,
 .bar-cluster > .cad-input:not(textarea),
-.bar-cluster > select.cad-input,
 .bar-cluster > .cad-btn {
   height: var(--ctl-h);
 }
@@ -1499,8 +1498,7 @@ body .cad-btn.primary.danger {
 .desc-label-row > .cad-btn[hidden],
 .mf-actions > .cad-btn[hidden],
 .ctl-join > .cad-btn[hidden],
-.bar-cluster > .cad-btn[hidden],
-.bar-cluster > select.cad-input[hidden] {
+.bar-cluster > .cad-btn[hidden] {
   display: none;
 }
 

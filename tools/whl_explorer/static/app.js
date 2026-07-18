@@ -10078,9 +10078,14 @@ async function setVerified(on) {
     const verified = cur && (cur.status === "ready" || cur.status === "uploaded");
     el("b-ready").classList.toggle("active", !!verified);
     el("b-verified-tag").hidden = !verified;
+    // saveBuildFields reports into build-msg in the head bar; when this ran
+    // from a locked phase's inline button that corner is far from the click
+    // (and #b-ready is in the hidden Publish phase), so say it out loud too
+    statusErr("VERIFY :: " + (el("build-msg").textContent || "save failed"));
   }
-  renderBuildsList();
-  renderWorkbench();      // gates + chips follow the new status immediately
+  // saveBuildFields -> patchBuildRaw -> renderUpload already rebuilt the
+  // list and the editor; only the gates and chips still need the new status
+  renderWorkbench();
   return saved;
 }
 
@@ -10089,6 +10094,11 @@ async function setVerified(on) {
 function renderLockNote(id, note) {
   const host = el(id);
   host.hidden = !note;
+  // rewrite only when the text actually changed: applyWorkbenchGates runs on
+  // every renderWorkbench, and blowing the node away mid-render would steal
+  // focus from the very button it just drew
+  if (host.dataset.note === note) return;
+  host.dataset.note = note;
   if (!note) { host.textContent = ""; return; }
   host.innerHTML = esc(note) +
     ` <button class="cad-btn tiny wb-verify-here" type="button" ` +
@@ -13828,6 +13838,9 @@ function appendBuildListItem(list, b, grouped) {
 // nothing anywhere -- there was no WHL write API to call.
 async function uploadBuild() {
   if (!currentBuild()) return;
+  // clear last attempt's guard echo before anything can return early, so a
+  // stale reason never sits beside the button describing a fixed problem
+  if (el("publish-msg")) el("publish-msg").textContent = "";
   // Publishing is a decision about the record AS SHOWN, but the guards and
   // the upload read SAVED state — flush unsaved edits first, or picking
   // Rights and clicking publish either falsely blocks ("Set Rights before
@@ -13862,8 +13875,9 @@ async function uploadBuild() {
   const rightsLabel = (el("b-rights").selectedOptions[0] || {}).textContent || b.rights;
   if (!(await confirmDialog({
     title: "Publish to the library",
-    message: `Publish "${b.title || b.id}"?\nRights: ${rightsLabel}\n` +
-             `PDF: ${b.pdf_file}`,
+    message: `Publish "${b.title || b.id}"?`,
+    // the detail slot is the multi-line one (message is a single run)
+    detail: `Rights: ${rightsLabel}\nPDF: ${b.pdf_file}`,
     confirmLabel: "Publish",
     cancelLabel: "Not yet",
   }))) return;
@@ -13955,6 +13969,11 @@ function renderBuildEditor() {
   const b = currentBuild();
   ed.hidden = !b;
   el("build-empty").hidden = !!b;
+  // the publish guards' echo shares build-msg's lifecycle: a re-render means
+  // the record changed under it, so a stale "Set Rights before publishing"
+  // must not outlive the state it described — including when the record went
+  // away entirely, which is why this sits above the no-selection return
+  if (el("publish-msg")) el("publish-msg").textContent = "";
   if (!b) return;
   for (const f of BUILD_FIELDS) {
     const input = el("b-" + f);
@@ -14796,6 +14815,7 @@ async function selectOcrBook(bid) {
   }
   renderWorkbench();
   clearOcrPageSel();   // selections don't carry across books
+  baselineStagedEdge(bid);   // this book's staged count is the new baseline
   let folder = (ocrState.books || {})[bid];
   // A selection can arrive before the folder list has ever loaded (the Home
   // jump selects immediately after switching tabs) — fetch it, don't give up.
@@ -16233,31 +16253,40 @@ function analysisServiceReady(engine) {
   return engine === "configured" && !!String(state.settings.aiKey || "").trim();
 }
 
+// renderOcrQueue runs this on every 1.5s job-poll tick, so it follows the
+// house sig-guard pattern (cf. applyColHide): compute the strings, write
+// only when something actually changed — rewriting data-tip under an open
+// tooltip would otherwise churn the DOM and the tooltip alike.
+let _engineSummarySig = null;
 function updateDefaultEngineSummary() {
   const host = el("engine-defaults-summary");
   if (!host) return;
   const ocr = OCR_SERVICE_LABELS[state.settings.ocrService] || "Tesseract (local)";
   const analysis = TEXT_ANALYSIS_LABELS[state.settings.textAnalysisService] ||
     "Configured AI provider";
-  host.textContent = `${ocr} / ${analysis}`;
   // the drawer is Workbench-global but its stage-all acts on the CURRENT
   // book's selected source — name the target where the button lives,
   // and refuse (disabled) rather than error after the click
   const add = el("ocr-queue-add");
-  if (!add) return;
   const bid = ocrState.book;
   const b = bid ? state.builds[bid] : null;
+  let scope = "";
+  let tip = "Pick a book first — stage-all acts on the current book";
   if (b) {
     const d = ocrSelDoc();
     const src = d && d.buildId === bid ? docSrcKey(d) : "primary";
     const title = (b.title || bid).slice(0, 40);
-    host.textContent += ` · stages: ${title} / ${src}`;
-    add.dataset.tip =
-      `Stage every page of "${title}" (${src}) with ${ocr} — nothing runs until Submit`;
-    add.disabled = false;
-  } else {
-    add.dataset.tip = "Pick a book first — stage-all acts on the current book";
-    add.disabled = true;
+    scope = ` · stages: ${title} / ${src}`;
+    tip = `Stage every page of "${title}" (${src}) with ${ocr} — ` +
+          "nothing runs until Submit";
+  }
+  const sig = `${ocr}|${analysis}|${scope}|${tip}`;
+  if (sig === _engineSummarySig) return;
+  _engineSummarySig = sig;
+  host.textContent = `${ocr} / ${analysis}${scope}`;
+  if (add) {
+    add.dataset.tip = tip;
+    add.disabled = !b;
   }
 }
 
@@ -16475,7 +16504,18 @@ function stagedCountFor(bid) {
   return n;
 }
 
-let _lastStagedTotal = 0;
+// The "first staged page opens the drawer" edge is PER BOOK: a plain global
+// would miss the edge when book B's first page is staged while A still holds
+// a count, and would pop the drawer open on merely returning to a book that
+// was already staged. selectOcrBook re-baselines (arriving at a staged book
+// is not a staging action), so the edge below only ever compares like books.
+let _stagedEdge = { book: null, total: 0 };
+function stagedTotalFor(bid) {
+  return bid ? stagedCountFor(bid) + analysisStagedCount(bid) : 0;
+}
+function baselineStagedEdge(bid) {
+  _stagedEdge = { book: bid, total: stagedTotalFor(bid) };
+}
 function updateOcrStagedMsg() {
   const bid = ocrState.book;
   const n = bid ? stagedCountFor(bid) : 0;
@@ -16492,8 +16532,10 @@ function updateOcrStagedMsg() {
   // drawer — the first staged page opens it (without persisting the state,
   // so the user's preferred drawer default survives)
   const total = n + analysis;
-  if (total && !_lastStagedTotal) setJobsDrawer(true, false);
-  _lastStagedTotal = total;
+  if (_stagedEdge.book === bid && total && !_stagedEdge.total) {
+    setJobsDrawer(true, false);
+  }
+  _stagedEdge = { book: bid, total };
   renderOcrQueue();
 }
 
@@ -19639,11 +19681,9 @@ function init() {
     setWorkbenchPhase("record", false);   // the blank form is the next step
     createBuild({}, "(blank)");
   };
-  el("build-new").addEventListener("click", newBlankEntry);
-  const sideNew = el("build-new-side");
-  if (sideNew) sideNew.addEventListener("click", newBlankEntry);
-  const emptyNew = el("build-new-empty");
-  if (emptyNew) emptyNew.addEventListener("click", newBlankEntry);
+  for (const id of ["build-new", "build-new-side", "build-new-empty"]) {
+    el(id).addEventListener("click", newBlankEntry);
+  }
   el("export-builds").addEventListener("click", exportBuilds);
   el("download-upload-list").addEventListener("click", downloadUploadList);
   for (const t of document.querySelectorAll("#builds-tabs .pane-tab")) {
