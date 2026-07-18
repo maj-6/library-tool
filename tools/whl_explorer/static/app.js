@@ -37,6 +37,7 @@ const VIEW_STATE_KEYS = new Set([
   "topTable", "bottomActive", "whlMode", "checkedMode", "showCatalog",
   "paneWidth", "uploadSplitH", "publishSidebarCollapsed", "workbenchPhase",
   "jobsDrawerOpen", "authPromptDismissed", "checkedCols",
+  "collapsed", "wbSideCollapsed",
 ]);
 // Credentials are never persisted client-side. They live in the server's
 // Host-guarded secrets store (/api/secrets); Mistral additionally syncs through
@@ -207,9 +208,9 @@ const state = {
                                 // tune to see how shrinking affects quality
     // page-view digit shortcuts: press N over a page to queue it
     ocrKeyMap: { 1: "tesseract", 2: "claude", 3: "textract", 4: "azure", 5: "openai" },
-    // master list -> Google Sheets publishing (Settings > Sync)
+    // master list -> Google Sheets publishing (Settings > Integrations)
     gsSpreadsheetId: "", gsKeyFile: "", gsSheetName: "Master list",
-    // cloud search + downloadable databases (Settings > Sync)
+    // cloud search + downloadable databases (Settings > Integrations)
     cloudSearchUrl: "",         // remote instance of this app; used when no local index
     dbUrls: {},                 // per-database download URLs (name -> url)
     uploadSplitH: null, pdfBrowseDir: "",
@@ -236,6 +237,12 @@ const state = {
     includePrereleaseUpdates: false, // desktop: allow alpha/beta/rc auto-updates
     publishGroup: "sets",           // organization of the Publish file tree
     publishSidebarCollapsed: false,
+    collapsed: {},                  // per-key collapsed state for makeCollapsible sections
+    wbSideCollapsed: false,         // Workbench entries/artifacts sidebar folded away
+    // Settings > Theme editor: per-theme chrome token overrides,
+    // shape { [themeId]: { "--var": "value", … } }. Applied as inline body vars.
+    themeOverrides: {},
+    savedThemes: [],            // saved {name, base, overrides} snapshots (Theme editor)
   },
   editTarget: null,             // record open in the EDIT tab
   sort: { checked: null, whl: null },  // {key, dir} per top table
@@ -537,17 +544,20 @@ function bookParseChanged(a, b) {
 }
 
 function applyTheme() {
-  let t = state.settings.theme || "";
-  // migrate a retired id, and clamp anything unrecognised: an orphan id would
-  // otherwise stick in localStorage, sync to the server, and silently render
-  // the bare :root fallback while the picker showed nothing
-  if (t in LEGACY_THEMES) t = LEGACY_THEMES[t];
-  if (!THEMES.some(([id]) => id === t)) t = DEFAULT_THEME;
-  if (t !== state.settings.theme) {
-    state.settings.theme = t;
-    saveSettings();
+  let id = state.settings.theme || "";
+  // resolve the active theme: a custom theme keeps its id and renders on its
+  // base built-in's chrome; a legacy/unknown built-in id clamps to a survivor
+  // (an orphan id would otherwise stick in localStorage and render the bare
+  // :root fallback while the picker showed nothing)
+  if (!findCustom(id)) {
+    let t = id in LEGACY_THEMES ? LEGACY_THEMES[id] : id;
+    if (!THEMES.some(([x]) => x === t)) t = DEFAULT_THEME;
+    if (t !== state.settings.theme) { state.settings.theme = t; saveSettings(); }
+    id = t;
   }
-  document.body.dataset.theme = t;
+  document.body.dataset.theme = themeBase(id);   // base built-in supplies the CSS chrome
+  applyThemeOverrides();   // this theme's edits (custom.overrides or the built-in's), inline
+  applyFont();             // fonts too: a per-theme override, else the global default
 }
 
 // the one way to change theme: the Settings menu and the Appearance select
@@ -558,18 +568,106 @@ function setTheme(id) {
   applyTheme();
   const sel = el("theme-select");
   if (sel) sel.value = id;
+  const te = el("te-theme");
+  if (te) te.value = id;
+  // keep the Theme editor in step when it is open (it edits the active theme)
+  if (el("te-rows") && el("settings-overlay") && !el("settings-overlay").hidden)
+    renderThemeEditor();
 }
 
+// --- theme editor: per-theme chrome token overrides --------------------------
+// The editor writes CSS custom properties as inline styles on <body>. Inline
+// styles beat the body[data-theme] attribute selector, so an override wins over
+// the theme's own value -- the same mechanism applyFont() uses for --mono/--ui.
+// Overrides are keyed by theme id, so each theme carries its own edits and
+// switching theme swaps the whole set.
+
+// font vars are owned by applyFont(); the token editor must never touch them
+const THEME_FONT_VARS = new Set(["--mono", "--mono2", "--ui"]);
+// the vars currently applied inline -- tracked so the next apply can remove the
+// ones no longer overridden (a reset must clear the stale inline value)
+let _appliedThemeVars = [];
+
+function applyThemeOverrides() {
+  for (const name of _appliedThemeVars) document.body.style.removeProperty(name);
+  _appliedThemeVars = [];
+  const ov = activeOverrides();
+  for (const [name, val] of Object.entries(ov)) {
+    if (THEME_FONT_VARS.has(name) || val == null || val === "") continue;
+    document.body.style.setProperty(name, val);
+    _appliedThemeVars.push(name);
+  }
+}
+
+// fonts resolve per-theme-override first, then the global Appearance setting,
+// then the :root default. Kept out of applyThemeOverrides() (which owns the
+// non-font tokens) so the two never fight over the same inline body vars.
+const FONT_SETTING_VARS = [["fontUi", "--ui"], ["font", "--mono"], ["fontMono2", "--mono2"]];
 function applyFont() {
-  const f = state.settings.font || "";
-  if (f) document.body.style.setProperty("--mono", f);
-  else document.body.style.removeProperty("--mono");
-  const u = state.settings.fontUi || "";
-  if (u) document.body.style.setProperty("--ui", u);
-  else document.body.style.removeProperty("--ui");
-  const m2 = state.settings.fontMono2 || "";
-  if (m2) document.body.style.setProperty("--mono2", m2);
-  else document.body.style.removeProperty("--mono2");
+  const ov = activeOverrides();
+  for (const [key, cssVar] of FONT_SETTING_VARS) {
+    const val = ov[cssVar] || state.settings[key] || "";   // per-theme, else global, else default
+    if (val) document.body.style.setProperty(cssVar, val);
+    else document.body.style.removeProperty(cssVar);
+  }
+}
+
+// --- theme model: built-in themes (THEMES + CSS body[data-theme]) plus user
+// "custom" themes (settings.savedThemes: {id, name, base, overrides}). A custom
+// theme renders as its base built-in's chrome with its own overrides layered on
+// top, so it reuses the whole override/font machinery; only the pickers and the
+// Settings menu need to know custom themes exist.
+function customThemes() { return state.settings.savedThemes || []; }
+function findCustom(id) { return customThemes().find((t) => t && t.id === id); }
+// the built-in id whose CSS chrome a theme uses (a custom's base, else itself,
+// normalized through the legacy map and clamped to a real built-in)
+function themeBase(id) {
+  const c = findCustom(id);
+  let b = c ? c.base : id;
+  if (b in LEGACY_THEMES) b = LEGACY_THEMES[b];
+  return THEMES.some(([x]) => x === b) ? b : DEFAULT_THEME;
+}
+// the override map that IS a theme's edits (custom.overrides, or the built-in's
+// themeOverrides[base]); created on demand only when `create` is set
+function themeOverrideMap(id, create) {
+  const c = findCustom(id);
+  if (c) return c.overrides || (create ? (c.overrides = {}) : {});
+  const base = themeBase(id), o = state.settings.themeOverrides;
+  return o[base] || (create ? (o[base] = {}) : {});
+}
+function activeOverrides() { return themeOverrideMap(state.settings.theme, false); }
+function themeLabelOf(id) {
+  const c = findCustom(id);
+  return c ? c.name : (THEMES.find(([x]) => x === id) || [, id])[1];
+}
+// [id, label, isCustom] for every selectable theme (built-ins, then customs)
+function allThemes() {
+  return THEMES.map(([id, label]) => [id, label, false])
+    .concat(customThemes().map((t) => [t.id, t.name, true]));
+}
+function newThemeId() {
+  const used = new Set(customThemes().map((t) => t.id));
+  let n = 1; while (used.has("custom-" + n)) n++;
+  return "custom-" + n;
+}
+// fill a <select> with built-ins + custom themes (custom shown italic)
+function fillThemeSelect(sel) {
+  if (!sel) return;
+  sel.innerHTML = "";
+  for (const [id, label, custom] of allThemes()) {
+    const o = document.createElement("option");
+    o.value = id; o.textContent = label;
+    if (custom) o.style.fontStyle = "italic";
+    sel.appendChild(o);
+  }
+  sel.value = state.settings.theme;
+}
+// rebuild everywhere the theme list appears, after a custom theme is added,
+// renamed or removed
+function refreshThemePickers() {
+  fillThemeSelect(el("theme-select"));
+  fillThemeSelect(el("te-theme"));
+  buildThemeMenu();
 }
 
 // --- Experimental: interface sharpening ---------------------------------------
@@ -1258,6 +1356,9 @@ function normalizeSettings() {
   if (!["sets", "author", "category", "date"].includes(state.settings.publishGroup))
     state.settings.publishGroup = "sets";
   state.settings.publishSidebarCollapsed = !!state.settings.publishSidebarCollapsed;
+  if (!state.settings.collapsed || typeof state.settings.collapsed !== "object")
+    state.settings.collapsed = {};
+  state.settings.wbSideCollapsed = !!state.settings.wbSideCollapsed;
   if (!["tesseract", "mistral", "claude", "textract"].includes(state.settings.ocrService))
     state.settings.ocrService = "tesseract";
   state.settings.textAnalysisService = "configured";
@@ -1270,6 +1371,25 @@ function normalizeSettings() {
   if (!state.settings.dbUrls || typeof state.settings.dbUrls !== "object")
     state.settings.dbUrls = {};
   state.settings.colVis = state.settings.colVis || {};
+  if (!state.settings.themeOverrides || typeof state.settings.themeOverrides !== "object")
+    state.settings.themeOverrides = {};
+  if (!Array.isArray(state.settings.savedThemes)) state.settings.savedThemes = [];
+  // custom themes need a stable unique id + a well-formed shape (older snapshots
+  // predate the id; a duplicate/missing id would collide in the picker)
+  state.settings.savedThemes = state.settings.savedThemes.filter((t) => t && typeof t === "object");
+  {
+    const used = new Set();
+    for (const t of state.settings.savedThemes) {
+      if (typeof t.id !== "string" || !t.id || used.has(t.id)) {
+        let n = 1; while (used.has("custom-" + n)) n++;
+        t.id = "custom-" + n;
+      }
+      used.add(t.id);
+      if (typeof t.name !== "string" || !t.name) t.name = "Custom";
+      if (typeof t.base !== "string") t.base = DEFAULT_THEME;
+      if (!t.overrides || typeof t.overrides !== "object") t.overrides = {};
+    }
+  }
   state.settings.colWidths = state.settings.colWidths || {};
   // migrate the old single-table column setting
   if (Object.keys(state.settings.checkedCols).length &&
@@ -2720,7 +2840,7 @@ function fillFontSelect(id, list, settingKey, apply) {
   };
 }
 
-// --- Settings > Sync: downloadable databases --------------------------------
+// --- Settings > Integrations: downloadable databases ------------------------
 
 let _dbPollTimer = null;
 
@@ -2948,14 +3068,7 @@ function renderSettings() {
 
   // APPEARANCE
   const themeSel = el("theme-select");
-  themeSel.innerHTML = "";
-  for (const [id, label] of THEMES) {
-    const o = document.createElement("option");
-    o.value = id;
-    o.textContent = label;
-    themeSel.appendChild(o);
-  }
-  themeSel.value = state.settings.theme;   // applyTheme() has already normalized it
+  fillThemeSelect(themeSel);               // built-ins + custom themes (custom italic)
   themeSel.onchange = () => setTheme(themeSel.value);
   const scaleSel = el("ui-scale-select");
   if (scaleSel) {
@@ -2967,6 +3080,7 @@ function renderSettings() {
   fillFontSelect("font-ui-select", FONT_CHOICES, "fontUi", applyFont);
   fillFontSelect("font-select", FONT_CHOICES, "font", applyFont);
   fillFontSelect("font-mono2-select", FONT_CHOICES, "fontMono2", applyFont);
+  renderThemeEditor();
 
   // AI
   for (const [id, k] of [["set-r2-account", "r2Account"], ["set-r2-bucket", "r2Bucket"],
@@ -3271,6 +3385,377 @@ function renderSettings() {
     };
   }
   syncPrereleaseEnabled();
+}
+
+// --- Settings > Theme editor --------------------------------------------------
+// The chrome tokens the editor exposes, grouped for the panel. Colours are
+// #rrggbb via the native <input type=color>; --radius/--border-w are px lengths
+// (slider + number); weights are a fixed dropdown. Font-family vars are
+// deliberately excluded -- they are global and stay under Appearance.
+const THEME_TOKENS = [
+  ["Accent & primary", [
+    { v: "--cyan",  l: "Accent (focus, links)", t: "color" },
+    { v: "--blue",  l: "Primary (title bar, tabs)", t: "color" },
+    { v: "--blue2", l: "Secondary", t: "color" },
+  ]],
+  ["Surfaces", [
+    { v: "--canvas",      l: "Canvas / paper", t: "color" },
+    { v: "--face",        l: "Panel face", t: "color" },
+    { v: "--face-hi",     l: "Panel raised", t: "color" },
+    { v: "--face-active", l: "Panel active", t: "color" },
+    { v: "--input-bg",    l: "Field background", t: "color" },
+  ]],
+  ["Text", [
+    { v: "--ink",       l: "Text", t: "color" },
+    { v: "--ink-light", l: "Text secondary", t: "color" },
+    { v: "--input-ink", l: "Field text", t: "color" },
+  ]],
+  ["Borders & rules", [
+    { v: "--face-sh",     l: "Border — light", t: "color" },
+    { v: "--face-sh2",    l: "Border — strong / muted text", t: "color" },
+    { v: "--canvas-line", l: "Table rules", t: "color" },
+  ]],
+  ["Rows", [
+    { v: "--row-hover",   l: "Row — hover", t: "color" },
+    { v: "--row-checked", l: "Row — checked", t: "color" },
+    { v: "--row-manual",  l: "Row — manual", t: "color" },
+  ]],
+  ["Status", [
+    { v: "--green", l: "Success", t: "color" },
+    { v: "--amber", l: "Warning", t: "color" },
+    { v: "--red",   l: "Error", t: "color" },
+  ]],
+  ["Geometry", [
+    { v: "--radius",   l: "Corner rounding", t: "len", min: 0, max: 14, step: 1, unit: "px", def: "4px" },
+    { v: "--border-w", l: "Border weight",   t: "len", min: 1, max: 3,  step: 1, unit: "px", def: "1px" },
+  ]],
+  ["Typography", [
+    { v: "--wt-ui",     l: "Interface weight", t: "wt", def: "400",
+      opts: [["400", "Regular"], ["500", "Medium"], ["600", "Semibold"]] },
+    { v: "--wt-strong", l: "Heading weight",   t: "wt", def: "700",
+      opts: [["400", "Regular"], ["500", "Medium"], ["600", "Semibold"], ["700", "Bold"]] },
+  ]],
+  // fonts are per-theme here; "Default" falls back to the global Appearance font
+  ["Fonts", [
+    { v: "--ui",    l: "Interface font", t: "font" },
+    { v: "--mono",  l: "Data / table font", t: "font" },
+    { v: "--mono2", l: "Tag / marker font", t: "font" },
+  ]],
+];
+
+// the exact set of tokens the editor owns -- the allowlist for imports
+const THEME_TOKEN_VARS = new Set(THEME_TOKENS.flatMap(([, toks]) => toks.map((t) => t.v)));
+// keep only known "--token": "safe value" pairs -- defends applyThemeOverrides and
+// the font path against a hand-edited or hostile imported theme file: reject
+// unknown keys, non-strings, empty/oversized values, and anything with CSS
+// punctuation (a url(...) in a token consumed by background: would phone home).
+function sanitizeOverrides(o) {
+  const out = {};
+  if (o && typeof o === "object" && !Array.isArray(o)) {
+    for (const [k, v] of Object.entries(o)) {
+      if (!THEME_TOKEN_VARS.has(k) || typeof v !== "string") continue;
+      const val = v.trim();
+      if (!val || val.length > 200) continue;
+      if (/[();]|url\(|@import|expression|javascript:/i.test(val)) continue;
+      out[k] = val;
+    }
+  }
+  return out;
+}
+
+// coerce a colour token to #rrggbb for <input type=color> (theme values are
+// authored as 6-digit hex, but be defensive about #rgb and stray whitespace)
+function themeHex(v) {
+  v = String(v == null ? "" : v).trim();
+  const m3 = /^#([0-9a-f])([0-9a-f])([0-9a-f])$/i.exec(v);
+  if (m3) return ("#" + m3[1] + m3[1] + m3[2] + m3[2] + m3[3] + m3[3]).toLowerCase();
+  return /^#[0-9a-f]{6}$/i.test(v) ? v.toLowerCase() : "#000000";
+}
+
+// Build the Theme editor panel for the active theme. Rebuilt whenever the
+// dialog opens or the theme changes; seeds each control from the effective
+// value (override if set, else the theme's own resolved value).
+function renderThemeEditor() {
+  const host = el("te-rows");
+  if (!host) return;
+  const activeId = state.settings.theme;
+  const custom = findCustom(activeId);
+  const base = themeBase(activeId);        // = document.body.dataset.theme; the base chrome
+
+  // theme picker: rebuilt each render (custom themes change); switching switches
+  // both the active theme and what the editor edits
+  const tsel = el("te-theme");
+  if (tsel) {
+    fillThemeSelect(tsel);
+    tsel.onchange = () => setTheme(tsel.value);
+  }
+
+  const cs = getComputedStyle(document.body);
+  const getOv = () => themeOverrideMap(activeId, true);    // create-on-demand edit target
+  const ov = themeOverrideMap(activeId, false);
+  // effective value: the override if present, else the theme's own value
+  // (resolved from CSS; synthetic tokens with no CSS value fall back to def)
+  const eff = (tok) => {
+    if (ov[tok.v] != null) return ov[tok.v];
+    const c = cs.getPropertyValue(tok.v).trim();
+    return c || tok.def || "";
+  };
+
+  function updateCount() {
+    const n = Object.keys(themeOverrideMap(activeId, false)).length;
+    const c = el("te-count");
+    if (c) {
+      c.textContent = n ? `${n} override${n === 1 ? "" : "s"}` : "No changes";
+      c.classList.toggle("dirty", n > 0);
+    }
+    const rb = el("te-reset-theme");
+    if (rb) rb.disabled = n === 0;
+  }
+
+  const setTok = (tok, val) => {
+    getOv()[tok.v] = val;
+    document.body.style.setProperty(tok.v, val);          // live preview
+    if (!_appliedThemeVars.includes(tok.v)) _appliedThemeVars.push(tok.v);
+    updateCount();
+  };
+  const resetTok = (tok) => {
+    delete themeOverrideMap(activeId, false)[tok.v];
+    // built-in: drop the now-empty override object. A custom theme is kept even
+    // with no overrides -- it is still a distinct theme (identical to its base).
+    if (!custom) {
+      const bm = state.settings.themeOverrides[base];
+      if (bm && !Object.keys(bm).length) delete state.settings.themeOverrides[base];
+    }
+    saveSettings();
+    applyThemeOverrides();
+    applyFont();               // a reset font token falls back to the global default
+    renderThemeEditor();
+  };
+
+  host.innerHTML = "";
+  for (const [group, toks] of THEME_TOKENS) {
+    const h = document.createElement("div");
+    h.className = "settings-subhead";
+    h.textContent = group;
+    host.appendChild(h);
+
+    for (const tok of toks) {
+      const lab = document.createElement("label");
+      lab.textContent = tok.l;
+      const ctl = document.createElement("div");
+      ctl.className = "te-ctl";
+
+      const rev = document.createElement("button");
+      rev.type = "button";
+      rev.className = "te-revert" + (ov[tok.v] != null ? " on" : "");
+      rev.textContent = "↺";                          // reset arrow
+      rev.title = "Reset to theme default";
+      rev.addEventListener("click", () => resetTok(tok));
+      const markDirty = () => rev.classList.add("on");
+
+      if (tok.t === "color") {
+        const hex = themeHex(eff(tok));
+        const sw = document.createElement("input");
+        sw.type = "color"; sw.className = "te-swatch"; sw.value = hex;
+        const tx = document.createElement("input");
+        tx.className = "cad-input te-hex"; tx.value = hex.toUpperCase();
+        tx.spellcheck = false; tx.maxLength = 7;
+        sw.addEventListener("input", () => {
+          tx.value = sw.value.toUpperCase(); tx.classList.remove("bad");
+          setTok(tok, sw.value); markDirty();
+        });
+        sw.addEventListener("change", saveSettings);
+        tx.addEventListener("input", () => {
+          const val = tx.value.trim();
+          if (/^#[0-9a-fA-F]{6}$/.test(val)) {
+            sw.value = val.toLowerCase(); tx.classList.remove("bad");
+            setTok(tok, val.toLowerCase()); markDirty();
+          } else {
+            tx.classList.add("bad");
+          }
+        });
+        tx.addEventListener("change", () => {
+          tx.value = sw.value.toUpperCase();   // snap back to the last valid colour
+          tx.classList.remove("bad"); saveSettings();
+        });
+        ctl.append(sw, tx);
+      } else if (tok.t === "len") {
+        const cur = parseInt(eff(tok), 10) || 0;
+        const rng = document.createElement("input");
+        rng.type = "range"; rng.className = "te-range";
+        rng.min = tok.min; rng.max = tok.max; rng.step = tok.step; rng.value = cur;
+        const num = document.createElement("input");
+        num.type = "number"; num.className = "cad-input te-num";
+        num.min = tok.min; num.max = tok.max; num.step = tok.step; num.value = cur;
+        const unit = document.createElement("span");
+        unit.className = "te-unit"; unit.textContent = tok.unit;
+        const apply = (raw, persist) => {
+          const n = Math.max(tok.min, Math.min(tok.max, parseInt(raw, 10) || 0));
+          rng.value = n; num.value = n;
+          setTok(tok, n + tok.unit); markDirty();
+          if (persist) saveSettings();
+        };
+        rng.addEventListener("input", () => apply(rng.value, false));
+        rng.addEventListener("change", () => apply(rng.value, true));
+        num.addEventListener("change", () => apply(num.value, true));
+        ctl.append(rng, num, unit);
+      } else if (tok.t === "font") {
+        const sel = document.createElement("select");
+        sel.className = "cad-input te-fontsel";
+        const def = document.createElement("option");
+        def.value = ""; def.textContent = "Default (Appearance)";
+        sel.appendChild(def);
+        for (const [val, name] of FONT_CHOICES) {
+          if (!val) continue;                              // skip FONT_CHOICES' own "Default"
+          const o = document.createElement("option");
+          o.value = val; o.textContent = name;
+          sel.appendChild(o);
+        }
+        const stored = ov[tok.v] || "";
+        sel.value = stored;
+        if (sel.value !== stored) {                        // an imported/custom stack: keep it
+          const o = document.createElement("option");
+          o.value = stored; o.textContent = "Custom";
+          sel.appendChild(o); sel.value = stored;
+        }
+        sel.addEventListener("change", () => {
+          if (sel.value) { getOv()[tok.v] = sel.value; markDirty(); }
+          else {
+            delete themeOverrideMap(activeId, false)[tok.v];
+            if (!custom) {
+              const bm = state.settings.themeOverrides[base];
+              if (bm && !Object.keys(bm).length) delete state.settings.themeOverrides[base];
+            }
+            rev.classList.remove("on");
+          }
+          applyFont(); saveSettings(); updateCount();      // fonts: applyFont, not setTok
+        });
+        ctl.append(sel);
+      } else {                                             // weight dropdown
+        const sel = document.createElement("select");
+        sel.className = "cad-input te-wsel";
+        for (const [val, name] of tok.opts) {
+          const o = document.createElement("option");
+          o.value = val; o.textContent = `${name} (${val})`;
+          sel.appendChild(o);
+        }
+        sel.value = String(parseInt(eff(tok), 10) || tok.def);
+        sel.addEventListener("change", () => {
+          setTok(tok, sel.value); markDirty(); saveSettings();
+        });
+        ctl.append(sel);
+      }
+
+      ctl.appendChild(rev);
+      host.append(lab, ctl);
+    }
+  }
+  updateCount();
+
+  const resetBtn = el("te-reset-theme");
+  if (resetBtn) resetBtn.onclick = () => {
+    if (custom) {
+      if (!custom.overrides || !Object.keys(custom.overrides).length) return;
+      custom.overrides = {};
+    } else {
+      const bm = state.settings.themeOverrides[base];
+      if (!bm || !Object.keys(bm).length) return;
+      delete state.settings.themeOverrides[base];
+    }
+    saveSettings();
+    applyThemeOverrides();
+    applyFont();
+    renderThemeEditor();
+  };
+
+  // --- custom themes: Duplicate (copy any theme into a new editable one),
+  // Rename / Delete (custom only), and file Export / Import ---
+  const clone = (o) => JSON.parse(JSON.stringify(o || {}));
+  const normBase = (id) => {
+    const b = id in LEGACY_THEMES ? LEGACY_THEMES[id] : id;
+    return THEMES.some(([x]) => x === b) ? b : DEFAULT_THEME;
+  };
+  const nameEl = el("te-save-name");
+  const onClick = (id, fn) => { const b = el(id); if (b) b.onclick = fn; };
+  const setDisabled = (id, v) => { const b = el(id); if (b) b.disabled = v; };
+  setDisabled("te-rename", !custom);   // built-in themes can't be renamed or deleted
+  setDisabled("te-delete", !custom);
+
+  onClick("te-duplicate", () => {
+    const nid = newThemeId();
+    const typed = nameEl && nameEl.value.trim();
+    const name = (typed || `${themeLabelOf(activeId)} copy`).slice(0, 60);
+    customThemes().push({ id: nid, name, base, overrides: clone(themeOverrideMap(activeId, false)) });
+    if (nameEl) nameEl.value = "";
+    saveSettings();
+    refreshThemePickers();
+    setTheme(nid);           // switch to (and edit) the new copy
+    status(`CREATED THEME "${name}"`);
+  });
+  onClick("te-rename", () => {
+    if (!custom) { statusErr("RENAME :: duplicate a built-in theme first"); return; }
+    const typed = nameEl && nameEl.value.trim();
+    if (!typed) { statusErr("RENAME :: type a name first"); return; }
+    custom.name = typed.slice(0, 60);
+    if (nameEl) nameEl.value = "";
+    saveSettings();
+    refreshThemePickers();
+    renderThemeEditor();
+    status(`RENAMED THEME "${custom.name}"`);
+  });
+  onClick("te-delete", () => {
+    if (!custom) return;
+    const i = customThemes().indexOf(custom);
+    const nm = custom.name;
+    if (i >= 0) customThemes().splice(i, 1);
+    saveSettings();
+    refreshThemePickers();
+    setTheme(base);          // fall back to the base built-in
+    status(`DELETED THEME "${nm}"`);
+  });
+  onClick("te-export", () => {
+    const payload = {
+      app: "whl-theme", version: 1,
+      name: themeLabelOf(activeId), base,
+      overrides: clone(themeOverrideMap(activeId, false)),
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${(custom ? custom.name : base).replace(/[^\w.-]+/g, "-").toLowerCase()}.whltheme.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    status("EXPORTED THEME");
+  });
+  onClick("te-import", () => { const f = el("te-import-file"); if (f) f.click(); });
+  const fileEl = el("te-import-file");
+  if (fileEl) fileEl.onchange = () => {
+    const f = fileEl.files && fileEl.files[0];
+    fileEl.value = "";
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      let obj;
+      try { obj = JSON.parse(reader.result); }
+      catch (e) { statusErr("IMPORT FAILED :: not valid JSON"); return; }
+      // require the export handshake so a stray .json can't masquerade as a theme
+      if (!obj || typeof obj !== "object" || obj.app !== "whl-theme" ||
+          typeof obj.base !== "string" || !obj.overrides || typeof obj.overrides !== "object") {
+        statusErr("IMPORT FAILED :: not a Library Tool theme file");
+        return;
+      }
+      const b = normBase(obj.base);
+      const overrides = sanitizeOverrides(obj.overrides);
+      const name = ((typeof obj.name === "string" && obj.name.trim()) || `${themeLabelOf(b)} import`).slice(0, 60);
+      const nid = newThemeId();
+      customThemes().push({ id: nid, name, base: b, overrides });   // import creates a new custom theme
+      saveSettings();
+      refreshThemePickers();
+      setTheme(nid);
+      status(`IMPORTED THEME "${name}"`);
+    };
+    reader.readAsText(f);
+  };
 }
 
 function initSettingsNav() {
@@ -11912,6 +12397,72 @@ function setPublishSidebarCollapsed(on, persist) {
   }
 }
 
+// --- Reusable collapsible section (VS Code-style vertical collapse) -----------
+// Fold a titled panel away vertically. `head` is the clickable header row
+// (typically a .pane-bar); `body` is the element beneath it; `key` names the
+// persisted state under settings.collapsed. A ▾/▸ caret is injected at the head
+// start. Interactive controls inside the head (buttons, tabs, inputs) keep
+// working — only the caret or the header's own chrome toggles. onToggle(collapsed)
+// fires after every change, including the initial restore. Returns a small
+// handle. Drop this on any stacked panel that should fold; see the CSS block
+// ".collapse-caret / .collapse-head / .collapse-body" for the styling contract.
+function makeCollapsible(head, body, key, onToggle) {
+  if (!head || !body) return null;
+  head.classList.add("collapse-head");
+  body.classList.add("collapse-body");
+  let caret = head.querySelector(":scope > .collapse-caret");
+  if (!caret) {
+    caret = document.createElement("button");
+    caret.type = "button";
+    caret.className = "collapse-caret";
+    caret.setAttribute("aria-label", "Collapse or expand this section");
+    head.insertBefore(caret, head.firstChild);
+  }
+  const store = () => (state.settings.collapsed = state.settings.collapsed || {});
+  const isCollapsed = () => body.classList.contains("sec-collapsed");
+  const apply = (collapsed) => {
+    body.classList.toggle("sec-collapsed", collapsed);
+    caret.textContent = collapsed ? "▸" : "▾";   // ▸ collapsed / ▾ open
+    caret.setAttribute("aria-expanded", String(!collapsed));
+    head.setAttribute("aria-expanded", String(!collapsed));
+    if (onToggle) onToggle(collapsed);
+  };
+  const toggle = () => { apply(!isCollapsed()); store()[key] = isCollapsed(); saveSettings(); };
+  head.addEventListener("click", (ev) => {
+    // The caret is the toggle affordance; if it's hidden (e.g. an enclosing
+    // sidebar is horizontally collapsed to a strip, where only an expand button
+    // remains), a stray click on the head's leftover padding must NOT toggle the
+    // now-invisible body. Requiring a visible caret keeps this generic.
+    if (caret.offsetParent === null) return;
+    if (ev.target.closest(".collapse-caret")) { toggle(); return; }
+    // real controls (tabs, buttons, inputs) do their own thing; the header's
+    // remaining chrome (title, spacer, padding) toggles the section
+    if (ev.target.closest("button, input, select, textarea, a, label, .pane-tab, [role='tab']"))
+      return;
+    toggle();
+  });
+  apply(!!store()[key]);   // restore persisted state without re-saving
+  return { toggle, set: apply, isCollapsed };
+}
+
+// Whole entries/artifacts sidebar horizontal collapse (mirrors the Publish
+// sidebar): #wb-split.wb-side-collapsed shrinks #ocr-side to a 34px strip whose
+// only control is the expand toggle.
+function setOcrSideCollapsed(on, persist) {
+  const collapsed = !!on;
+  const split = el("wb-split");
+  if (split) split.classList.toggle("wb-side-collapsed", collapsed);
+  const btn = el("ocr-side-toggle");
+  if (btn) {
+    btn.textContent = collapsed ? "▶" : "◀";   // ▶ expand / ◀ collapse
+    btn.setAttribute("aria-expanded", String(!collapsed));
+    btn.dataset.tip = collapsed
+      ? "Expand the entries & artifacts sidebar"
+      : "Collapse the entries & artifacts sidebar";
+  }
+  if (persist) { state.settings.wbSideCollapsed = collapsed; saveSettings(); }
+}
+
 function loadPublishCatalog() {
   if (state.publishCatalogLoading) return state.publishCatalogLoading;
   const mine = ++state.publishCatalogSeq;
@@ -17952,12 +18503,12 @@ function buildThemeMenu() {
   const host = el("menu-themes");
   if (!host) return;
   host.innerHTML = "";
-  for (const [id, label] of THEMES) {
+  for (const [id, label, custom] of allThemes()) {
     const cmd = "theme:" + id;
     MENU_CMDS[cmd] = () => setTheme(id);
     const b = document.createElement("button");
     b.type = "button";
-    b.className = "menu-item";
+    b.className = "menu-item" + (custom ? " menu-item-custom" : "");
     b.dataset.cmd = cmd;
     b.innerHTML = `<span class="menu-check"></span>${esc(label)}`;
     host.appendChild(b);
@@ -18011,7 +18562,7 @@ function updateMenuState() {
   check("table-whl", !onChecked);
   check("opt-auto-ia", state.settings.autoIaDownload !== false);   // default-on
   check("opt-expand-sets", !!state.settings.expandSets);
-  for (const [id] of THEMES) check("theme:" + id, id === state.settings.theme);
+  for (const [id] of allThemes()) check("theme:" + id, id === state.settings.theme);
   const svc = state.settings.ocrService || "tesseract";
   for (const [id] of OCR_SERVICES) check("ocrsvc:" + id, id === svc);
 }
@@ -18835,6 +19386,22 @@ function init() {
     reset: () => { el("ocr-queue-wrap").style.flex = ""; },
   });
 
+  // Workbench sidebar collapse: each section folds vertically (VS Code-style),
+  // and the whole sidebar folds horizontally. The inter-section splitter only
+  // makes sense while both sections are open, so hide it otherwise.
+  const syncOcrSideSplitter = () => {
+    const sp = el("ocr-side-splitter");
+    if (!sp) return;
+    sp.hidden = el("ocr-books-wrap").classList.contains("sec-collapsed") ||
+                el("ocr-doc-wrap").classList.contains("sec-collapsed");
+  };
+  makeCollapsible(el("builds-tabs"), el("ocr-books-wrap"), "wbEntries", syncOcrSideSplitter);
+  makeCollapsible(el("ocr-artifacts-bar"), el("ocr-doc-wrap"), "wbArtifacts", syncOcrSideSplitter);
+  syncOcrSideSplitter();
+  el("ocr-side-toggle").addEventListener("click", () =>
+    setOcrSideCollapsed(!state.settings.wbSideCollapsed, true));
+  setOcrSideCollapsed(state.settings.wbSideCollapsed, false);
+
   // markdown: the builder's live editor + the overlay window (WHL pencil)
   buildDescMd = createMdEditor(el("b-desc-editor"));
   overlayMd = createMdEditor(el("md-live-overlay"));
@@ -19123,7 +19690,11 @@ function init() {
   // reflect whatever the server holds (the merge may differ from the cache).
   syncClientStateOnLoad().then((adopted) => {
     hydrateSecrets();      // warm credentials without delaying the initial UI
-    if (adopted) { applyTheme(); applyFont(); applyExpSharpen(); }
+    // adopted server settings can carry a different set of custom themes, so
+    // rebuild the pickers/menu before re-applying (else the menubar Theme
+    // submenu keeps the pre-sync list); applyExpSharpen re-applies the
+    // experimental UI-sharpen overlay against the adopted state.
+    if (adopted) { refreshThemePickers(); applyTheme(); applyFont(); applyExpSharpen(); }
     maybeWizard();       // first desktop launch: the guide covers sign-in too
     maybeAuthPrompt();   // needs the adopted settings: authPromptDismissed
     loadDownloads();
