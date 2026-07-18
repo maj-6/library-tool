@@ -1104,9 +1104,11 @@ async function trashDownload(id) {
   // pair), so it comes from the row rather than a hardcoded path. Fetched
   // rather than <a href>-clicked because a bare anchor swallows a 404 in
   // silence — the user would just see nothing happen.
+  // Prefer what the row's LABEL promises: "2 pages from X" must hand back
+  // those two pages, not the whole pre-image kept beside them for restore.
   const it = ((trashState.data || {}).items || []).find((i) => i.id === id);
   const files = (it && it.files) || [];
-  const rel = files.includes("original.pdf") ? "original.pdf" : files[0];
+  const rel = files.includes("pages.pdf") ? "pages.pdf" : files[0];
   if (!rel) { statusErr("TRASH :: nothing to download for that item"); return; }
   let url = "";
   try {

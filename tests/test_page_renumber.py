@@ -231,7 +231,11 @@ def test_apply_page_deletion_end_to_end(data_root):
     assert "p2-b.jpeg" not in layout["images"]
     assert layout["images"]["p3-c.jpeg"]["page"] == 2
     assert not (images_dir / "p2-b.jpeg").exists()
-    assert (images_dir / ".page-delete-backup" / "p2-b.jpeg").is_file()
+    # the figure moves into the trash item at its own relative path, which is
+    # what lets restore write it back with no special case; the old
+    # .page-delete-backup dead-drop (which nothing ever read) is retired
+    assert not (images_dir / ".page-delete-backup").exists()
+    assert (tdir / "ocr" / "images" / "p2-b.jpeg").is_file()
     assert (images_dir / "p1-a.jpeg").is_file()
     assert (images_dir / "p3-c.jpeg").is_file()
 

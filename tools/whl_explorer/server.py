@@ -5863,13 +5863,20 @@ def _page_job_blockers(build_id: str) -> list[dict]:
     return ocr + analyze
 
 
-def _renumber_layout_words(build_id: str, src_key: str, removed: list[int]) -> None:
+def _renumber_layout_words(build_id: str, src_key: str, removed: list[int],
+                           snapshot: Path | None = None,
+                           snapshot_out: list[str] | None = None) -> None:
     """Remap page-keyed word boxes and extracted-image layout metadata.
 
     Word boxes are source-scoped. Extracted figures belong to the OCR document
     recorded in ``sources.json``; only figures for the PDF being edited move.
-    Deleted-page image files stay on disk as recovery artifacts, but disappear
-    from layout metadata so they cannot be placed on the wrong page.
+    A deleted page's figures leave the layout metadata (so they cannot be
+    placed on the wrong page) and their files go to the trash item under
+    ``ocr/images/`` — the same relative path they live at, which is what lets
+    restore write them back with no special case. They used to be copied to an
+    ``ocr/images/.page-delete-backup`` dead-drop that nothing ever read: after
+    a restore put layout.json back, every figure it named was still sitting in
+    there, so the facsimile drew a page of missing images.
     """
     meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
     if not meta_path.is_file():
@@ -5918,12 +5925,19 @@ def _renumber_layout_words(build_id: str, src_key: str, removed: list[int]) -> N
                 if n in removed_set:
                     images.pop(name, None)
                     image = _entry_dir(build_id) / "ocr" / "images" / name
-                    if image.is_file():
-                        import shutil
-                        backup = image.parent / ".page-delete-backup"
-                        backup.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(image, backup / name)
-                        image.unlink()
+                    if image.is_file() and snapshot is not None:
+                        # unlink only once the copy is safely in the trash —
+                        # a figure left in place is a harmless orphan, one
+                        # deleted without a snapshot is gone
+                        try:
+                            dst = snapshot / "ocr" / "images" / name
+                            dst.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(image, dst)
+                        except OSError:
+                            continue
+                        if snapshot_out is not None:
+                            snapshot_out.append(f"ocr/images/{name}")
+                        image.unlink(missing_ok=True)
                 else:
                     info["page"] = n - sum(1 for r in removed if r < n)
                 dirty = True
@@ -6198,7 +6212,8 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
             tfiles.append("ocr/layout.json")
         except OSError:
             pass
-    _renumber_layout_words(build_id, src_key, pages)
+    _renumber_layout_words(build_id, src_key, pages,
+                           snapshot=tdir, snapshot_out=tfiles)
     # Translations use the same page-marker convention, and their provenance
     # sidecars key each source hash by page. Move both in one protected pass so
     # stale detection and eventual publication never retain an obsolete tail.

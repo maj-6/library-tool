@@ -390,3 +390,32 @@ def test_forget_leaves_an_in_flight_restore_alone(data_root, client):
     assert body["busy"] >= 1
     assert (server.TRASH_DIR / tid / "pages.pdf").is_file()
     assert tid in server.lib.load_json(server.TRASH_PATH, {})["items"]
+
+
+def test_restore_brings_a_deleted_pages_figure_back(data_root, client):
+    """A figure extracted from a deleted page must come back WITH the layout
+    metadata that names it. It used to be copied to an ocr/images/
+    .page-delete-backup dead-drop nothing read, so a restore put layout.json
+    back pointing at a file that was no longer there."""
+    bid = "trash014"
+    pdf = _seed(bid, data_root)
+    images = server._entry_dir(bid) / "ocr" / "images"
+    images.mkdir(parents=True, exist_ok=True)
+    (images / "p2-fig.jpeg").write_bytes(b"\xff\xd8fig")
+    (images / "p3-fig.jpeg").write_bytes(b"\xff\xd8keep")
+    layout = server.lib.load_json(server._entry_dir(bid) / "ocr" / "layout.json", {})
+    layout["images"] = {"p2-fig.jpeg": {"page": 2}, "p3-fig.jpeg": {"page": 3}}
+    server.lib.save_json(server._entry_dir(bid) / "ocr" / "layout.json", layout)
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+
+    tid = server._apply_page_deletion(bid, builds, pdf, [2])["trash_id"]
+    assert not (images / "p2-fig.jpeg").exists()
+    assert (server.TRASH_DIR / tid / "ocr" / "images" / "p2-fig.jpeg").is_file()
+    after = server.lib.load_json(server._entry_dir(bid) / "ocr" / "layout.json", {})
+    assert "p2-fig.jpeg" not in after["images"]
+    assert after["images"]["p3-fig.jpeg"]["page"] == 2
+
+    assert client.post("/api/trash/restore", json={"id": tid}).get_json()["ok"]
+    assert (images / "p2-fig.jpeg").read_bytes() == b"\xff\xd8fig"
+    back = server.lib.load_json(server._entry_dir(bid) / "ocr" / "layout.json", {})
+    assert back["images"]["p2-fig.jpeg"]["page"] == 2     # metadata agrees again
