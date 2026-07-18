@@ -36,6 +36,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -47,6 +48,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import capture_pipeline as capture  # noqa: E402
 import catalog_checks as checks  # noqa: E402
 import cloud_defaults  # noqa: E402
+import layout_roles  # noqa: E402
 import copyright_registration as copyreg  # noqa: E402
 import libcommon as lib  # noqa: E402
 import r2_store as r2  # noqa: E402
@@ -99,6 +101,30 @@ def _reject_untrusted_host():
     host = (request.host or "").partition(":")[0].lower().rstrip(".")
     if host not in _TRUSTED_LOOPBACK_HOSTS:
         abort(403)
+
+
+@app.after_request
+def _static_cache_headers(resp):
+    """Long-lived caching for /static so the desktop shell's Chromium keeps its
+    HTTP cache — and, for app.js, the V8 compiled-code cache — across launches
+    (the shell now reuses a stable sidecar port, so the origin persists).
+
+    Only URLs carrying the ?v= mtime token get `immutable`: their URL changes
+    whenever the content does, so a year is safe. Un-tokened static files
+    (fonts, the favicon) get a day, so an app update can still refresh them.
+
+    Success responses only: a transient failure (e.g. antivirus briefly locking
+    a freshly installed app.js) must not become a year-long cached error for a
+    URL whose ?v= token won't change on retry.
+    """
+    if resp.status_code not in (200, 304):
+        return resp
+    if request.path.startswith("/static/"):
+        if request.args.get("v"):
+            resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
 
 
 # --- application log ------------------------------------------------------------
@@ -700,7 +726,11 @@ def api_log():
     with _log_lock:
         rows = [r for r in _log_ring if r["seq"] > since]
         last = _log_seq
-        dropped = since > 0 and _log_ring and _log_ring[0]["seq"] > since + 1
+        # seq starts at 1, so this also flags a since=0 catch-up (the client now
+        # polls only while the Info tab is open) whenever the ring has already
+        # evicted early lines — the console shows "(truncated)" instead of
+        # silently presenting the newest window as the whole log.
+        dropped = _log_ring and _log_ring[0]["seq"] > since + 1
     return jsonify({"ok": True, "entries": rows, "next": last, "dropped": bool(dropped)})
 
 
@@ -1387,7 +1417,8 @@ def _resolve_local(raw: str) -> Path | None:
         return None
 
 
-_remote_pdf_lock = threading.Lock()
+_remote_pdf_lock = threading.Lock()              # guards the per-URL lock map
+_remote_pdf_url_locks: dict[str, threading.Lock] = {}
 
 
 def _remote_pdf_cache(url: str) -> Path:
@@ -1395,18 +1426,23 @@ def _remote_pdf_cache(url: str) -> Path:
     Browsers can't iframe third-party PDFs (X-Frame-Options), so remote
     sources are proxied through here. Raises ValueError on fetch failure.
 
-    Downloads land in a temp file and are renamed into place under a lock:
-    the viewer fires several concurrent requests for the same URL (iframe
-    GET + HEAD size probe + OCR text fetch), and none of them may see a
-    half-written file. A response that isn't a PDF is rejected instead of
-    being cached forever."""
+    Downloads land in a temp file and are renamed into place under a
+    PER-URL lock: the viewer fires several concurrent requests for the same
+    URL (iframe GET + HEAD size probe + OCR text fetch), and none of them
+    may see a half-written file or download it twice — but a long fetch of
+    one book (a background smart check pulling a full scan) must not block
+    every other remote PDF. A response that isn't a PDF is rejected instead
+    of being cached forever."""
     if not url.lower().startswith(("http://", "https://")):
         raise ValueError("not an http(s) URL")
     import hashlib
     cache_dir = lib.DATA_ROOT / "downloads" / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    p = cache_dir / (hashlib.sha1(url.encode("utf-8")).hexdigest()[:16] + ".pdf")
+    name = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16] + ".pdf"
+    p = cache_dir / name
     with _remote_pdf_lock:
+        url_lock = _remote_pdf_url_locks.setdefault(name, threading.Lock())
+    with url_lock:
         if p.exists():
             return p
         tmp = p.with_suffix(".fetch.tmp")
@@ -2211,12 +2247,1107 @@ def api_build_ocr_layout(build_id: str):
         abort(404)
     meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
     # word_pages is per source: {"<src>": [pages...]}, so the client places a
-    # facsimile only for the source whose boxes it actually has
+    # facsimile only for the source whose boxes it actually has; word_docs
+    # ({"<src>": {"<page>": name}}) says which compiled file each page's box
+    # text came from, so viewing any OTHER doc flows that doc's text instead
     word_pages = {src: sorted(int(k) for k in pages if str(k).isdigit())
                   for src, pages in (meta.get("words") or {}).items()
                   if isinstance(pages, dict)}
+    # region_pages mirrors word_pages: which pages have a typed-region record
+    # (fetched individually via /ocr-regions — the records carry full text);
+    # region_states carries each page's review flag for the workbench strip
+    region_pages = {src: sorted(int(k) for k in pages if str(k).isdigit())
+                    for src, pages in (meta.get("regions") or {}).items()
+                    if isinstance(pages, dict)}
+    region_states = {
+        src: {k: rec.get("state") for k, rec in pages.items()
+              if isinstance(rec, dict) and rec.get("state")}
+        for src, pages in (meta.get("regions") or {}).items()
+        if isinstance(pages, dict)}
     return jsonify({"ok": True, "images": meta.get("images") or {},
-                    "word_pages": word_pages})
+                    "word_pages": word_pages,
+                    "word_docs": meta.get("words_doc") or {},
+                    "region_pages": region_pages,
+                    "region_states": {k: v for k, v in region_states.items() if v}})
+
+
+@app.route("/api/builds/<build_id>/ocr-regions")
+def api_build_ocr_regions(build_id: str):
+    """One page's typed regions — the Phase 1 substrate the region facsimile
+    and the Replica workbench read: {ok, found, doc, dims, items: [{id, role,
+    box, order, text}]}. ?src= and ?page= select the record."""
+    if build_id not in lib.load_json(BUILDS_PATH, {}):
+        abort(404)
+    src = request.args.get("src") or "primary"
+    try:
+        page = int(request.args.get("page") or 0)
+    except (TypeError, ValueError):
+        page = 0
+    meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
+    rec = ((meta.get("regions") or {}).get(src) or {}).get(str(page))
+    if not isinstance(rec, dict):
+        return jsonify({"ok": True, "found": False})
+    return jsonify({"ok": True, "found": True, "doc": rec.get("doc") or "",
+                    "dims": rec.get("dims") or {},
+                    "state": rec.get("state") or "",
+                    "items": rec.get("items") or []})
+
+
+_RW_MAX_ITEMS = 800
+_RW_ROLE_RE = re.compile(r"^[a-z][a-z-]{0,23}$")
+
+
+def _rw_sanitize_items(raw: list, src_type: str = "human") -> list:
+    """One page's region items scrubbed for storage: roles kebab-case,
+    boxes clamped into the page, text layers capped, everything re-ordered
+    and re-idd. Shared by the workbench PUT and the .lib import — anything
+    that writes items the sidecar will trust must come through here."""
+    def order_of(it):
+        o = it.get("order")
+        return float(o) if isinstance(o, (int, float)) \
+            and not isinstance(o, bool) else 0.0
+
+    items = []
+    for it in sorted((x for x in raw if isinstance(x, dict)), key=order_of):
+        box = it.get("box") or {}
+        try:
+            x = min(1.0, max(0.0, float(box.get("x") or 0)))
+            y = min(1.0, max(0.0, float(box.get("y") or 0)))
+            w = min(1.0 - x, max(0.0, float(box.get("w") or 0)))
+            h = min(1.0 - y, max(0.0, float(box.get("h") or 0)))
+        except (TypeError, ValueError):
+            continue
+        if w < 0.001 or h < 0.001:
+            continue
+        role = str(it.get("role") or "body").lower()
+        if not _RW_ROLE_RE.match(role):
+            role = "body"
+        rec = {"id": f"r{len(items)}", "role": role,
+               "src_type": src_type, "order": len(items),
+               "box": {"x": round(x, 5), "y": round(y, 5),
+                       "w": round(w, 5), "h": round(h, 5)},
+               "text": str(it.get("text") or "")[:20000]}
+        # the normalized reading layer (long-s resolved, dehyphenated…),
+        # stored only when it exists — compose_text falls back per region
+        norm = str(it.get("norm") or "")[:20000]
+        if norm:
+            rec["norm"] = norm
+        items.append(rec)
+    return items
+
+
+def _rw_sanitize_dims(dims):
+    if not isinstance(dims, dict):
+        return None
+    try:
+        return {k: int(dims.get(k) or 0) for k in ("w", "h", "dpi")}
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+@app.route("/api/builds/<build_id>/ocr-regions", methods=["PUT"])
+def api_build_ocr_regions_put(build_id: str):
+    """Replace one page's typed regions with the Replica workbench's edited
+    set. Body: {src?, page, doc?, dims?, items: [{role, box{x,y,w,h}, order,
+    text}]}. Items are sanitized (roles kebab-case, boxes clamped to the
+    page, text capped), re-ordered, and re-idd; an empty list drops the
+    page's record. src_type becomes "human" — the set is human-curated from
+    here on."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    p = request.get_json(silent=True) or {}
+    src = _valid_src_key(b, p.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    try:
+        # OverflowError: json.loads accepts the non-standard Infinity
+        # literal, and int(inf) raises it rather than ValueError
+        page = int(p.get("page") or 0)
+    except (TypeError, ValueError, OverflowError):
+        page = 0
+    if page < 1:
+        return jsonify({"ok": False, "error": "bad page"}), 400
+    raw = p.get("items")
+    if not isinstance(raw, list) or len(raw) > _RW_MAX_ITEMS:
+        return jsonify({"ok": False, "error": "bad items"}), 400
+    items = _rw_sanitize_items(raw, src_type="human")
+    dims = _rw_sanitize_dims(p.get("dims"))
+    state = "verified" if p.get("state") == "verified" else ""
+    _ocr_save_page_regions(build_id, src, page, items, dims,
+                           doc=_ocr_name(str(p.get("doc") or "compiled.txt")),
+                           state=state)
+    return jsonify({"ok": True, "count": len(items)})
+
+
+@app.route("/api/builds/<build_id>/ocr-regions/recompile", methods=["POST"])
+def api_build_ocr_regions_recompile(build_id: str):
+    """Rewrite compiled body text from the saved regions. Every region page
+    of the source (or just ?page) recomposes — furniture (marginalia, heads,
+    catchwords) stays out of the flow, figure refs stay in — and merges into
+    the compiled file its record names. The merge is per page, so pages
+    without regions keep their existing text."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    p = request.get_json(silent=True) or {}
+    src = _valid_src_key(b, p.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    # an absent page means "every region page"; a PRESENT but garbage page
+    # must refuse — mapping it to the no-filter case would rewrite the whole
+    # compiled file when the caller asked to touch exactly one page
+    only = None
+    if "page" in p:
+        try:
+            only = int(p["page"])
+        except (TypeError, ValueError, OverflowError):
+            only = 0
+        if only < 1:
+            return jsonify({"ok": False, "error": "bad page"}), 400
+    # layer "norm" composes the normalized reading into one explicit target —
+    # the modern-edition text; the default layer writes each page's
+    # diplomatic body into the file its record names. The default target is
+    # per SOURCE (normalized.txt / normalized-<src>.txt): both sources of a
+    # two-scan build merge by bare page number, so sharing one file would
+    # silently interleave two different books' pages into a chimera.
+    layer = "norm" if str(p.get("layer") or "") in ("norm", "normalized") \
+        else "text"
+    target = ""
+    if layer == "norm":
+        default_norm = "normalized.txt" if src == "primary" \
+            else f"normalized-{src}.txt"
+        target = _ocr_name(str(p.get("target") or default_norm))
+    meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
+    pages = (meta.get("regions") or {}).get(src) or {}
+    done, docs = 0, set()
+    for k in sorted((k for k in pages if str(k).isdigit()), key=int):
+        rec = pages[k]
+        n = int(k)
+        if not isinstance(rec, dict) or (only is not None and n != only):
+            continue
+        doc = target or _ocr_name(str(rec.get("doc") or "compiled.txt"))
+        _ocr_merge_page(build_id, doc, n,
+                        layout_roles.compose_text(rec.get("items") or [],
+                                                  layer=layer))
+        docs.add(doc)
+        done += 1
+    # a secondary source's normalized file must map back to its scan, like
+    # every other per-source OCR doc, or the UI pairs it with the wrong PDF
+    if layer == "norm" and done and src != "primary":
+        _ocr_set_source(build_id, target, src)
+    return jsonify({"ok": True, "pages": done, "docs": sorted(docs)})
+
+
+# --- layout templates: recto/verso grids applied across a book -------------------
+
+_RW_TPL_RE = re.compile(r"^[\w\- ]{1,24}$")
+
+
+def _pdf_layer_words(pdf, page: int) -> list:
+    """One page's text-layer words via fitz (pixel corners -> 0..1 fractions,
+    block/line -> a line id), shaped like the stored OCR word boxes. Best-
+    effort — no text layer just means empty regions to fill by hand."""
+    if pdf is None or importlib.util.find_spec("fitz") is None:
+        return []
+    try:
+        with _pdf_doc(pdf) as doc:
+            if page > doc.page_count:
+                return []
+            pg = doc[page - 1]
+            pw, ph = float(pg.rect.width), float(pg.rect.height)
+            if pw <= 0 or ph <= 0:
+                return []
+            out = []
+            lids: dict = {}
+            for x0, y0, x1, y1, text, blk, ln, _wn in pg.get_text("words"):
+                lid = lids.setdefault((blk, ln), len(lids))
+                out.append({"t": text, "l": lid,
+                            "x": x0 / pw, "y": y0 / ph,
+                            "w": max(0.0, (x1 - x0) / pw),
+                            "h": max(0.0, (y1 - y0) / ph)})
+            return out
+    except Exception:
+        return []
+
+
+@app.route("/api/builds/<build_id>/ocr-templates", methods=["GET", "PUT", "DELETE"])
+def api_build_ocr_templates(build_id: str):
+    """Layout templates — hand-press books are grid-stable, so one corrected
+    exemplar page (a recto, a verso) becomes a reusable region grid.
+    GET ?src= lists them; PUT {src?, name, from_page} snapshots the SAVED
+    region record of from_page (geometry + roles, no text); DELETE {src?,
+    name} removes one. Stored in layout.json under templates.<src>.<name>."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    if request.method == "GET":
+        src = _valid_src_key(b, request.args.get("src"))
+        tpls = ((lib.load_json(meta_path, {}).get("templates") or {})
+                .get(src or "primary") or {})
+        return jsonify({"ok": True, "templates": [
+            {"name": name, "items": len(t.get("items") or []),
+             "from_page": t.get("from_page")}
+            for name, t in sorted(tpls.items()) if isinstance(t, dict)]})
+    p = request.get_json(silent=True) or {}
+    src = _valid_src_key(b, p.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    name = str(p.get("name") or "").strip()
+    if not _RW_TPL_RE.match(name):
+        return jsonify({"ok": False, "error": "bad template name"}), 400
+    with _ocr_merge_lock:
+        meta = lib.load_json(meta_path, {})
+        tmap = meta.setdefault("templates", {}).setdefault(src, {})
+        if request.method == "DELETE":
+            tmap.pop(name, None)
+            if not tmap:
+                meta["templates"].pop(src, None)
+            if not meta["templates"]:
+                meta.pop("templates", None)
+            lib.save_json(meta_path, meta)
+            return jsonify({"ok": True})
+        try:
+            from_page = int(p.get("from_page") or 0)
+        except (TypeError, ValueError, OverflowError):
+            from_page = 0
+        rec = ((meta.get("regions") or {}).get(src) or {}).get(str(from_page))
+        if not isinstance(rec, dict) or not rec.get("items"):
+            return jsonify({"ok": False, "error":
+                            "that page has no saved regions"}), 400
+        tmap[name] = {
+            "from_page": from_page,
+            "doc": rec.get("doc") or "",
+            "dims": rec.get("dims") or {},
+            "items": [{"role": it.get("role") or "body",
+                       "order": it.get("order") or i,
+                       "box": it.get("box") or {}}
+                      for i, it in enumerate(rec.get("items") or [])],
+        }
+        lib.save_json(meta_path, meta)
+    return jsonify({"ok": True, "items": len(tmap[name]["items"])})
+
+
+@app.route("/api/builds/<build_id>/ocr-templates/apply", methods=["POST"])
+def api_build_ocr_templates_apply(build_id: str):
+    """Stamp a template's region grid onto a page range. Body: {src?, name,
+    pages: [ints], overwrite?: bool, clip?: bool (default true)}. Pages that
+    already carry a region record are skipped unless overwrite. With clip,
+    each stamped region's text pre-fills from the word boxes inside it
+    (stored OCR boxes, else the PDF text layer) — a template plus word
+    geometry drafts the whole page; the human corrects instead of typing."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    p = request.get_json(silent=True) or {}
+    src = _valid_src_key(b, p.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    name = str(p.get("name") or "").strip()
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    meta = lib.load_json(meta_path, {})
+    tpl = ((meta.get("templates") or {}).get(src) or {}).get(name)
+    if not isinstance(tpl, dict) or not tpl.get("items"):
+        return jsonify({"ok": False, "error": "unknown template"}), 400
+    raw_pages = p.get("pages")
+    if not isinstance(raw_pages, list) or not raw_pages or len(raw_pages) > 500:
+        return jsonify({"ok": False, "error": "bad pages"}), 400
+    pages = []
+    for x in raw_pages:
+        try:
+            n = int(x)
+        except (TypeError, ValueError, OverflowError):
+            return jsonify({"ok": False, "error": "bad pages"}), 400
+        if n < 1:
+            return jsonify({"ok": False, "error": "bad pages"}), 400
+        pages.append(n)
+    overwrite = bool(p.get("overwrite"))
+    clip = p.get("clip") is not False
+    pdf = None
+    if clip:
+        raw = str(b.get("pdf_file") or "") if src == "primary" else next(
+            (s.get("path") for s in (b.get("pdf_sources") or [])
+             if s.get("id") == src), "")
+        pdf = _resolve_local(raw or "")
+    # Two phases. Preparation runs UNLOCKED — text-layer clipping opens the
+    # PDF and must not stall OCR jobs — against a words snapshot read once
+    # (the old shape re-parsed the whole sidecar per page, 500 times). The
+    # skip-unless-overwrite decision is then re-made under the merge lock
+    # against FRESH state in one read-modify-write: a page the user saved
+    # while the loop ran must not get stamped over, and a snapshot-based
+    # skip check could do exactly that.
+    words_map = (meta.get("words") or {}).get(src) or {}
+    existing0 = (meta.get("regions") or {}).get(src) or {}
+    tpl_items = sorted(tpl["items"], key=lambda x: x.get("order") or 0)
+    doc = _ocr_name(str(tpl.get("doc") or "compiled.txt"))
+    prepared: dict[int, list] = {}
+    pre_skipped, clipped = [], []
+    for n in sorted(set(pages)):
+        if not overwrite and str(n) in existing0:
+            pre_skipped.append(n)
+            continue
+        words = []
+        if clip:
+            words = words_map.get(str(n))
+            if not (isinstance(words, list) and words):
+                words = _pdf_layer_words(pdf, n)
+        items = []
+        for i, t in enumerate(tpl_items):
+            box = t.get("box") or {}
+            text = layout_roles.clip_words_to_box(words, box) if words else ""
+            items.append({"id": f"r{i}", "role": t.get("role") or "body",
+                          "src_type": "template", "order": i,
+                          "box": box, "text": text})
+        if any(it["text"] for it in items):
+            clipped.append(n)
+        prepared[n] = items
+    applied, skipped = [], list(pre_skipped)
+    with _ocr_merge_lock:
+        cur = lib.load_json(meta_path, {})
+        pmap = cur.setdefault("regions", {}).setdefault(src, {})
+        for n, items in prepared.items():
+            if not overwrite and str(n) in pmap:
+                skipped.append(n)
+                continue
+            pmap[str(n)] = {"doc": doc, "dims": tpl.get("dims") or {},
+                            "items": items}
+            applied.append(n)
+        lib.save_json(meta_path, cur)
+    clipped = [n for n in clipped if n in applied]
+    return jsonify({"ok": True, "applied": sorted(applied),
+                    "skipped": sorted(skipped), "clipped": sorted(clipped)})
+
+
+@app.route("/api/builds/<build_id>/ocr-templates/outliers", methods=["POST"])
+def api_build_ocr_templates_outliers(build_id: str):
+    """Score every region page of the source against a template: the pages
+    where the grid broke (plates, chapter openings, errata) are the ones
+    worth a human look. Body: {src?, name, threshold?: 0.5}. Returns {scores:
+    {page: 0..1}, outliers: [pages below threshold]}."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    p = request.get_json(silent=True) or {}
+    src = _valid_src_key(b, p.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    name = str(p.get("name") or "").strip()
+    meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
+    tpl = ((meta.get("templates") or {}).get(src) or {}).get(name)
+    if not isinstance(tpl, dict) or not tpl.get("items"):
+        return jsonify({"ok": False, "error": "unknown template"}), 400
+    try:
+        threshold = min(1.0, max(0.0, float(p.get("threshold") or 0.5)))
+    except (TypeError, ValueError, OverflowError):
+        threshold = 0.5
+    pages = (meta.get("regions") or {}).get(src) or {}
+    scores, outliers = {}, []
+    for k in sorted((k for k in pages if str(k).isdigit()), key=int):
+        rec = pages[k]
+        if not isinstance(rec, dict):
+            continue
+        s = layout_roles.template_score(tpl["items"], rec.get("items") or [])
+        scores[k] = round(s, 3)
+        if s < threshold:
+            outliers.append(int(k))
+    return jsonify({"ok": True, "scores": scores, "outliers": outliers})
+
+
+# --- .lib export: the Replica working store, sealed ------------------------------
+
+# The default role -> modern-type mapping a .lib carries until the style
+# board exists to edit one. OFL faces only — a .lib may someday embed its
+# fonts, and only open-licensed families can travel. Sizes are relative to
+# the body (em), which the region boxes then scale to the page.
+_LIB_STYLESHEET = {
+    "body": {"family": "EB Garamond", "size_em": 1.0, "align": "justify"},
+    "marginalia": {"family": "EB Garamond", "size_em": 0.78, "style": "italic"},
+    "footnote": {"family": "EB Garamond", "size_em": 0.82},
+    "title": {"family": "EB Garamond", "size_em": 1.25,
+              "variant": "small-caps"},
+    "header": {"family": "EB Garamond", "size_em": 0.85,
+               "variant": "small-caps", "align": "center"},
+    "footer": {"family": "EB Garamond", "size_em": 0.85, "align": "center"},
+    "caption": {"family": "EB Garamond", "size_em": 0.85, "style": "italic",
+                "align": "center"},
+    "page-number": {"family": "EB Garamond", "size_em": 0.85},
+    "catch-word": {"family": "EB Garamond", "size_em": 0.85,
+                   "align": "right"},
+    "signature-mark": {"family": "EB Garamond", "size_em": 0.85,
+                       "align": "center"},
+    # large capitals render at their box height; rubricated red by default —
+    # an illuminated look the style board's color/bg fields can build on
+    "drop-capital": {"family": "EB Garamond", "color": "#8b1a1a"},
+    # the "page" pseudo-role: the facsimile's paper and ink
+    "page": {"bg": "#fdfcf8", "color": "#1c1a17"},
+}
+
+_LIB_META_FIELDS = ("published_slug", "title", "subtitle", "authors", "year",
+                    "publisher", "publisher_city", "edition", "volume",
+                    "language", "pages", "source_url")
+
+
+_RW_HEX_RE = re.compile(r"^#[0-9a-fA-F]{3,8}$")
+
+
+def _rw_sanitize_styles(raw: dict) -> dict:
+    """A role->style mapping scrubbed for storage. Shared by the style-board
+    PUT and the .lib import — a .lib is somebody else's file."""
+    styles = {}
+    for role, st in raw.items():
+        role = str(role).lower()
+        if not _RW_ROLE_RE.match(role) or not isinstance(st, dict):
+            continue
+        out = {}
+        family = str(st.get("family") or "").strip()[:60]
+        if family:
+            out["family"] = family
+        for k, lo, hi in (("size_em", 0.3, 4.0), ("leading", 0.8, 3.0)):
+            try:
+                v = float(st.get(k))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if lo <= v <= hi:
+                out[k] = round(v, 2)
+        if st.get("style") in ("italic", "normal"):
+            out["style"] = st["style"]
+        if st.get("variant") in ("small-caps", "normal"):
+            out["variant"] = st["variant"]
+        if st.get("align") in ("left", "right", "center", "justify"):
+            out["align"] = st["align"]
+        for k in ("color", "bg"):
+            v = str(st.get(k) or "")
+            if _RW_HEX_RE.match(v):
+                out[k] = v
+        if out:
+            styles[role] = out
+    return styles
+
+
+def _replica_style_path(build_id: str):
+    return _entry_dir(build_id) / "ocr" / "replica-style.json"
+
+
+def _replica_styles(build_id: str) -> tuple[dict, bool]:
+    """The book's role->type stylesheet: (styles, custom). Falls back to the
+    OFL seed when the style board has never saved one."""
+    doc = lib.load_json(_replica_style_path(build_id), None)
+    if isinstance(doc, dict) and isinstance(doc.get("styles"), dict) \
+            and doc["styles"]:
+        return doc["styles"], True
+    return _LIB_STYLESHEET, False
+
+
+@app.route("/api/builds/<build_id>/replica-style",
+           methods=["GET", "PUT", "DELETE"])
+def api_build_replica_style(build_id: str):
+    """The book-level role -> modern-type mapping the re-typeset preview and
+    the .lib export use. GET returns the stored sheet (custom: true) or the
+    OFL seed (custom: false); PUT {styles: {role: {family, size_em, leading,
+    style, variant, align}}} validates and stores; DELETE resets to the
+    seed. Typography belongs to the BOOK, not a scan, so there is no src."""
+    if build_id not in lib.load_json(BUILDS_PATH, {}):
+        abort(404)
+    path = _replica_style_path(build_id)
+    if request.method == "GET":
+        styles, custom = _replica_styles(build_id)
+        return jsonify({"ok": True, "styles": styles, "custom": custom})
+    if request.method == "DELETE":
+        with _ocr_merge_lock:
+            path.unlink(missing_ok=True)
+        return jsonify({"ok": True})
+    p = request.get_json(silent=True) or {}
+    raw = p.get("styles")
+    if not isinstance(raw, dict) or not raw or len(raw) > 40:
+        return jsonify({"ok": False, "error": "bad styles"}), 400
+    styles = _rw_sanitize_styles(raw)
+    if not styles:
+        return jsonify({"ok": False, "error": "no valid styles"}), 400
+    # under the merge lock like every other sidecar write: the .lib import's
+    # check-and-write shares it, so neither side clobbers the other
+    with _ocr_merge_lock:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lib.save_json(path, {"version": 1, "styles": styles})
+    return jsonify({"ok": True, "count": len(styles)})
+
+
+@app.route("/api/builds/<build_id>/replica-export")
+def api_build_replica_export(build_id: str):
+    """Seal one source's Replica working store into a .lib — a plain zip:
+
+        book.json      format tag, bibliographic snapshot, role stylesheet,
+                       layout templates, figure inventory, page list
+        pages/N.json   one file per region page: doc, dims, review state,
+                       items with diplomatic text + normalized layer
+        assets/img/*   the extracted figure crops the regions reference
+
+    The entry folder stays the working store — this is its portable,
+    diffable snapshot for interchange and the coming re-typeset tooling.
+    ?src= picks the scan (default primary)."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    src = _valid_src_key(b, request.args.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
+    pages = (meta.get("regions") or {}).get(src) or {}
+    page_nums = sorted(int(k) for k in pages
+                       if str(k).isdigit() and isinstance(pages[k], dict))
+    if not page_nums:
+        return jsonify({"ok": False, "error":
+                        "no region pages to export — seed or draw some in"
+                        " the Replica tab first"}), 400
+    import io
+    import zipfile
+    figures = {}
+    img_dir = _entry_dir(build_id) / "ocr" / "images"
+    for name, info in (meta.get("images") or {}).items():
+        if not isinstance(info, dict):
+            continue
+        if str(info.get("src_key") or "primary") != src:
+            continue
+        # the writer sanitizes names, but the sidecar is a hand-editable
+        # file: re-sanitize like the serving route, or a crafted key walks
+        # out of ocr/images/ on read AND plants a zip-slip member name
+        safe = re.sub(r"[^\w.\-]", "_", str(name))
+        if not safe or safe != str(name):
+            continue
+        figures[safe] = {k: info.get(k) for k in ("page", "x", "y", "w", "h")}
+        # rework linkage must survive the round trip, or an imported book's
+        # modern edition silently loses its re-drawn art
+        if info.get("rework_of"):
+            figures[safe]["rework_of"] = str(info["rework_of"])
+    book = {
+        "format": "lib/1",
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "source": src,
+        "meta": {k: b.get(k) for k in _LIB_META_FIELDS if b.get(k)},
+        "stylesheet": _replica_styles(build_id)[0],
+        "templates": (meta.get("templates") or {}).get(src) or {},
+        "figures": figures,
+        "pages": page_nums,
+    }
+    buf = io.BytesIO()
+    try:
+        # allow_nan=False: a hand-edited sidecar smuggling NaN/Infinity
+        # through load_json must fail HERE, loudly — not export an archive
+        # whose pages/N.json no strict parser will read
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("book.json", json.dumps(book, indent=1,
+                                               ensure_ascii=False,
+                                               allow_nan=False))
+            for n in page_nums:
+                rec = pages[str(n)]
+                z.writestr(f"pages/{n}.json", json.dumps({
+                    "page": n,
+                    "doc": rec.get("doc") or "",
+                    "dims": rec.get("dims") or {},
+                    "state": rec.get("state") or "",
+                    "items": rec.get("items") or [],
+                }, indent=1, ensure_ascii=False, allow_nan=False))
+            for name in figures:
+                f = img_dir / name
+                if f.is_file():
+                    z.writestr(f"assets/img/{name}", f.read_bytes())
+    except ValueError:
+        return jsonify({"ok": False, "error":
+                        "the layout sidecar contains non-finite numbers — "
+                        "re-save the affected pages first"}), 400
+    buf.seek(0)
+    stem = re.sub(r"[^\w\-]+", "-",
+                  str(b.get("published_slug") or b.get("title")
+                      or build_id)).strip("-").lower()[:60] or build_id
+    return send_file(buf, mimetype="application/zip", as_attachment=True,
+                     download_name=f"{stem}.lib")
+
+
+# --- illustration rework: image generation over the figure crops -----------------
+
+_IMG_GEN_PROMPT = (
+    "Redraw this illustration from an old printed book as a clean modern "
+    "edition illustration. Preserve the composition, subject, and period "
+    "character; render as crisp line art suitable for print, free of paper "
+    "texture, stains, and show-through.")
+
+
+def _img_gen_cfg() -> dict:
+    """BYO-key image generation settings (Settings > OCR & AI). Providers:
+    "openai" (images/edits, default model gpt-image-1) or "gemini"
+    (generateContent with an inline image, default gemini-2.5-flash-image)."""
+    s = _client_settings()
+    provider = str(s.get("imgGenProvider") or "openai").strip().lower()
+    if provider not in ("openai", "gemini"):
+        provider = "openai"
+    model = str(s.get("imgGenModel") or "").strip() or (
+        "gpt-image-1" if provider == "openai" else "gemini-2.5-flash-image")
+    return {"provider": provider, "model": model,
+            "key": str(s.get("imgGenKey") or "").strip()}
+
+
+def _img_gen(cfg: dict, image: bytes, mime: str, prompt: str,
+             timeout: float = 180.0) -> bytes:
+    """One image in, one generated image out, or RuntimeError. NOTE: written
+    to the providers' documented shapes but not yet exercised against live
+    keys — same standing as the cloud OCR processor before its key existed."""
+    import base64
+    if cfg["provider"] == "gemini":
+        payload = {"contents": [{"parts": [
+            {"text": prompt},
+            {"inline_data": {"mime_type": mime,
+                             "data": base64.b64encode(image).decode("ascii")}},
+        ]}]}
+        req = urllib.request.Request(
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{urllib.parse.quote(cfg['model'])}:generateContent",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     "x-goog-api-key": cfg["key"]})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        for cand in data.get("candidates") or []:
+            for part in ((cand.get("content") or {}).get("parts") or []):
+                blob = part.get("inline_data") or part.get("inlineData")
+                if blob and blob.get("data"):
+                    return base64.b64decode(blob["data"])
+        raise RuntimeError("the model returned no image")
+    # openai images/edits: multipart with the source image
+    boundary = "whl-" + uuid.uuid4().hex
+    ext = "jpg" if mime == "image/jpeg" else "png"
+    parts = []
+    for k, v in (("model", cfg["model"]), ("prompt", prompt), ("n", "1")):
+        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; "
+                     f"name=\"{k}\"\r\n\r\n{v}\r\n".encode("utf-8"))
+    parts.append(
+        (f"--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; "
+         f"filename=\"figure.{ext}\"\r\nContent-Type: {mime}\r\n\r\n")
+        .encode("utf-8") + image + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/images/edits", data=b"".join(parts),
+        headers={"Authorization": f"Bearer {cfg['key']}",
+                 "Content-Type": f"multipart/form-data; boundary={boundary}"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8", "replace"))
+    import base64 as _b64
+    for item in data.get("data") or []:
+        if item.get("b64_json"):
+            return _b64.b64decode(item["b64_json"])
+    raise RuntimeError("the model returned no image")
+
+
+@app.route("/api/builds/<build_id>/rework-figure", methods=["POST"])
+def api_build_rework_figure(build_id: str):
+    """Rework one extracted figure through the configured image model:
+    {src?, figure: <name>, prompt?: extra art direction}. The generated
+    image saves beside the original as rework-<name>.png with the same
+    page/bbox and a rework_of pointer — the re-typeset preview prefers it,
+    the original is never touched. Works on any figure region, including a
+    hand-drawn box over an initial to commission an illuminated capital."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    p = request.get_json(silent=True) or {}
+    src = _valid_src_key(b, p.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    name = str(p.get("figure") or "")
+    if not re.fullmatch(r"[\w.\-]{1,120}", name):
+        return jsonify({"ok": False, "error": "bad figure name"}), 400
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    info = (lib.load_json(meta_path, {}).get("images") or {}).get(name)
+    if not isinstance(info, dict) or \
+            str(info.get("src_key") or "primary") != src:
+        return jsonify({"ok": False, "error": "unknown figure"}), 400
+    # rework the ORIGINAL, never a rework: chains would mint paid calls the
+    # preview can't even show (its shadow map is one level deep)
+    if info.get("rework_of") or name.startswith("rework-"):
+        return jsonify({"ok": False, "error":
+                        "that is already a rework — rework the original"}), 400
+    f = _entry_dir(build_id) / "ocr" / "images" / name
+    if not f.is_file():
+        return jsonify({"ok": False, "error": "figure file missing"}), 400
+    cfg = _img_gen_cfg()
+    if not cfg["key"]:
+        return jsonify({"ok": False, "error":
+                        "no image-generation key configured "
+                        "(Settings > OCR & AI > Illustration rework)"}), 400
+    prompt = _IMG_GEN_PROMPT
+    extra = str(p.get("prompt") or "").strip()[:2000]
+    if extra:
+        prompt += " " + extra
+    raw = f.read_bytes()
+    mime = "image/jpeg" if f.suffix.lower() in (".jpg", ".jpeg") \
+        else "image/png"
+    try:
+        out = _img_gen(cfg, raw, mime, prompt)
+    except Exception as exc:
+        return jsonify({"ok": False, "error":
+                        f"image generation failed: {exc}"}), 502
+    # the FULL original name (extension included) keys the rework, so
+    # p3-fig.jpeg and p3-fig.png can never collide onto one output
+    out_name = f"rework-{name}.png"
+    if len(out_name) > 120:
+        return jsonify({"ok": False, "error": "figure name too long"}), 400
+    with _ocr_merge_lock:
+        (f.parent / out_name).write_bytes(out)
+        meta = lib.load_json(meta_path, {})
+        entry = {k: info.get(k) for k in ("page", "x", "y", "w", "h")}
+        entry.update({"src_key": src, "rework_of": name})
+        meta.setdefault("images", {})[out_name] = entry
+        lib.save_json(meta_path, meta)
+    return jsonify({"ok": True, "name": out_name, "bytes": len(out)})
+
+
+# --- print / PDF export: the re-typeset preview, paginated ----------------------
+
+# A4 printable area at 12mm margins; a page box scales to fit, ratio kept
+_PRINT_W_MM = 186.0
+_PRINT_H_MM = 273.0
+
+
+@app.route("/api/builds/<build_id>/replica-print")
+def api_build_replica_print(build_id: str):
+    """The modernized facsimile as a print document: every region page of
+    the source re-typeset at the book's styles, one sheet per page, sized
+    for A4 — open it and print to PDF (Chromium's fuller paged-media
+    machinery isn't needed: each sheet is one absolutely-positioned box
+    with a page break after it, which prints faithfully everywhere).
+    ?src= picks the scan; ?layer= flows the diplomatic text (default),
+    "norm", or a page-aligned translation language."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    src = _valid_src_key(b, request.args.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    layer = str(request.args.get("layer") or "").strip()[:12]
+    meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
+    pages = (meta.get("regions") or {}).get(src) or {}
+    page_nums = sorted(int(k) for k in pages
+                       if str(k).isdigit() and isinstance(pages[k], dict))
+    if not page_nums:
+        return jsonify({"ok": False, "error": "no region pages to print"}), 400
+    styles, _custom = _replica_styles(build_id)
+    pg_style = styles.get("page") or {}
+    paper = pg_style.get("bg") or "#fdfcf8"
+    ink = pg_style.get("color") or "#1c1a17"
+    # reworked art shadows its original, exactly like the preview
+    rework = {str(i.get("rework_of")): n
+              for n, i in (meta.get("images") or {}).items()
+              if isinstance(i, dict) and i.get("rework_of")}
+    trans_pages = None
+    if layer and layer != "norm":
+        lang = _lang_code(layer)
+        trans_pages = _an_pages(_read_entry_text(
+            build_id, f"translations/{lang}.txt")) if lang else {}
+
+    import html as _html
+
+    def esc(s):
+        return _html.escape(str(s or ""), quote=True)
+
+    def css_color(v, fallback):
+        return v if isinstance(v, str) and _RW_HEX_RE.match(v) else fallback
+
+    sheets = []
+    for n in page_nums:
+        rec = pages[str(n)]
+        items = sorted((i for i in rec.get("items") or []
+                        if isinstance(i, dict)),
+                       key=lambda i: i.get("order") or 0)
+        dims = rec.get("dims") or {}
+        try:
+            ratio = float(dims.get("w") or 0) / float(dims.get("h") or 0)
+        except (TypeError, ValueError, ZeroDivisionError):
+            ratio = 0.0
+        if not 0.1 < ratio < 10:
+            ratio = 0.72
+        sheet_w = min(_PRINT_W_MM, _PRINT_H_MM * ratio)
+        sheet_h = sheet_w / ratio
+        # the base type size: median content-fit of the body regions, so
+        # size_em ratios play against the page's own scale (same rule as
+        # the on-screen preview)
+        fits = []
+        for it in items:
+            if it.get("role") != "body" or not str(it.get("text") or "").strip():
+                continue
+            lines = max(1, len([ln for ln in str(it["text"]).split("\n")
+                                if ln.strip()]))
+            fits.append((it.get("box") or {}).get("h", 0) * sheet_h
+                        / lines * 0.78)
+        fits.sort()
+        base = fits[len(fits) // 2] if fits else sheet_h * 0.018
+        texts = {}
+        if trans_pages is not None:
+            bodies = [it for it in items if it.get("role") == "body"]
+            dist = layout_roles.distribute_text(
+                trans_pages.get(n) or "",
+                [max(1, len(str(it.get("text") or ""))) for it in bodies])
+            for it, t in zip(bodies, dist):
+                texts[id(it)] = t
+        cells = []
+        for it in items:
+            box = it.get("box") or {}
+            try:
+                x = float(box.get("x") or 0) * sheet_w
+                y = float(box.get("y") or 0) * sheet_h
+                w = float(box.get("w") or 0) * sheet_w
+                h = float(box.get("h") or 0) * sheet_h
+            except (TypeError, ValueError):
+                continue
+            role = str(it.get("role") or "body")
+            st = styles.get(role) or styles.get("body") or {}
+            pos = (f"left:{x:.2f}mm;top:{y:.2f}mm;"
+                   f"width:{w:.2f}mm;height:{h:.2f}mm;")
+            text = str(it.get("text") or "")
+            fig = role == "figure" and re.search(
+                r"!\[[^\]\n]*\]\(([\w.\- ]+)\)", text)
+            if fig:
+                name = rework.get(fig.group(1)) or fig.group(1)
+                cells.append(
+                    f'<div class="rg" style="{pos}">'
+                    f'<img src="/api/builds/{urllib.parse.quote(build_id)}'
+                    f'/ocr/images/{urllib.parse.quote(name)}" alt=""></div>')
+                continue
+            if layer == "norm":
+                shown = str(it.get("norm") or "").strip() or text
+            elif trans_pages is not None and id(it) in texts:
+                shown = texts[id(it)]
+            else:
+                shown = text
+            decl = [pos]
+            # single-quoted in CSS: the style attribute itself is double-
+            # quoted, and a double quote inside would terminate it
+            fam = str(st.get("family") or "").replace('"', "").replace("'", "")
+            decl.append(f"font-family:'{fam}',serif;" if fam
+                        else "font-family:serif;")
+            if role == "drop-capital":
+                decl.append(f"font-size:{max(2.0, h * 0.9):.2f}mm;"
+                            "line-height:1;text-align:center;")
+            else:
+                size = base * float(st.get("size_em") or 1)
+                decl.append(f"font-size:{max(1.5, size):.2f}mm;")
+                decl.append(f"line-height:{st.get('leading') or 1.25};")
+            if st.get("style") == "italic":
+                decl.append("font-style:italic;")
+            if st.get("variant") == "small-caps":
+                decl.append("font-variant:small-caps;")
+            if st.get("align"):
+                decl.append(f"text-align:{st['align']};")
+            if st.get("color"):
+                decl.append(f"color:{css_color(st['color'], ink)};")
+            if st.get("bg"):
+                decl.append(f"background:{css_color(st['bg'], 'none')};")
+            cells.append(f'<div class="rg" style="{"".join(decl)}">'
+                         f"{esc(shown)}</div>")
+        sheets.append(
+            f'<div class="sheet" style="width:{sheet_w:.1f}mm;'
+            f'height:{sheet_h:.1f}mm;">{"".join(cells)}'
+            f'<div class="folio">{n}</div></div>')
+
+    title = esc(b.get("title") or build_id)
+    doc = (
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        f"<title>{title} — replica</title><style>"
+        "@page { size: A4; margin: 12mm; }"
+        "html, body { margin: 0; padding: 0; }"
+        f"body {{ background: #666; color: {css_color(ink, '#1c1a17')}; }}"
+        ".sheet { position: relative; overflow: hidden; margin: 4mm auto;"
+        f" background: {css_color(paper, '#fdfcf8')};"
+        " page-break-after: always; break-after: page; }"
+        ".rg { position: absolute; overflow: hidden;"
+        " white-space: pre-wrap; }"
+        ".rg img { width: 100%; height: 100%; object-fit: contain; }"
+        ".folio { position: absolute; right: 2mm; bottom: 1mm;"
+        " font: 2.4mm sans-serif; opacity: .35; }"
+        "@media print { body { background: none; }"
+        " .sheet { margin: 0 auto; } .folio { display: none; } }"
+        f"</style></head><body>{''.join(sheets)}</body></html>")
+    return Response(doc, mimetype="text/html")
+
+
+_LIB_MAX_BYTES = 250 * 1024 * 1024
+_LIB_MAX_FIGURE = 15 * 1024 * 1024
+_LIB_MAX_PAGES = 2000
+_LIB_MAX_JSON = 10 * 1024 * 1024          # per JSON member, decompressed
+_LIB_MAX_INFLATED = 300 * 1024 * 1024     # total page-JSON budget
+
+
+@app.route("/api/builds/<build_id>/replica-import", methods=["POST"])
+def api_build_replica_import(build_id: str):
+    """The other half of .lib interchange: unpack an exported archive into
+    this build's working store. Multipart field "lib"; ?src= picks the scan
+    the pages land under, ?overwrite=1 lets imported pages/templates replace
+    existing ones (default: skip, like template apply). Everything passes the
+    same sanitizers as the live endpoints — a .lib is somebody else's file.
+    The stylesheet imports only when the book has no custom sheet (or with
+    overwrite); figures only when the name is free."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    src = _valid_src_key(b, request.args.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    overwrite = str(request.args.get("overwrite") or "") in ("1", "true")
+    f = request.files.get("lib")
+    if f is None:
+        return jsonify({"ok": False, "error": "no file"}), 400
+    if request.content_length and request.content_length > _LIB_MAX_BYTES:
+        return jsonify({"ok": False, "error": "file too large"}), 400
+    import io
+    import zipfile
+    raw = f.read(_LIB_MAX_BYTES + 1)
+    if len(raw) > _LIB_MAX_BYTES:
+        return jsonify({"ok": False, "error": "file too large"}), 400
+    # Every JSON member is read at its DECLARED decompressed size, which
+    # zipfile also truncates to — so rejecting large declarations is a real
+    # cap, and a small .lib cannot deflate-bomb the sidecar into an OOM.
+    try:
+        z = zipfile.ZipFile(io.BytesIO(raw))
+        if z.getinfo("book.json").file_size > _LIB_MAX_JSON:
+            return jsonify({"ok": False, "error": "book.json too large"}), 400
+        book = json.loads(z.read("book.json"))
+    except (zipfile.BadZipFile, KeyError, ValueError):
+        return jsonify({"ok": False, "error": "not a .lib archive"}), 400
+    if not isinstance(book, dict) or book.get("format") != "lib/1":
+        return jsonify({"ok": False, "error":
+                        "unsupported .lib format"}), 400
+
+    # pages: every well-formed pages/N.json, sanitized like a live PUT
+    incoming: dict[int, dict] = {}
+    budget = _LIB_MAX_INFLATED
+    for name in z.namelist():
+        m = re.fullmatch(r"pages/(\d{1,5})\.json", name)
+        if not m:
+            continue
+        n = int(m.group(1))
+        if not 1 <= n <= 99999 or len(incoming) >= _LIB_MAX_PAGES:
+            continue
+        declared = z.getinfo(name).file_size
+        if declared > _LIB_MAX_JSON or declared > budget:
+            continue
+        budget -= declared
+        try:
+            rec = json.loads(z.read(name))
+        except (ValueError, KeyError):
+            continue
+        if not isinstance(rec, dict) or not isinstance(rec.get("items"), list):
+            continue
+        items = _rw_sanitize_items(rec["items"][:_RW_MAX_ITEMS],
+                                   src_type="import")
+        if not items:
+            continue
+        incoming[n] = {
+            "doc": _ocr_name(str(rec.get("doc") or "compiled.txt")),
+            "dims": _rw_sanitize_dims(rec.get("dims")) or {},
+            "items": items,
+        }
+        if rec.get("state") == "verified":
+            incoming[n]["state"] = "verified"
+    if not incoming:
+        return jsonify({"ok": False, "error": "no usable pages"}), 400
+
+    # book.json's sections are attacker-shaped: coerce every one before
+    # touching disk, so a malformed archive fails clean instead of 500ing
+    # halfway through a commit
+    tpl_src = book.get("templates")
+    tpl_in = {}
+    if isinstance(tpl_src, dict):
+        for name, t in tpl_src.items():
+            name = str(name).strip()
+            if not _RW_TPL_RE.match(name) or not isinstance(t, dict):
+                continue
+            items = _rw_sanitize_items(t.get("items") or [],
+                                       src_type="template")
+            if not items:
+                continue
+            tpl_in[name] = {"from_page": 0, "doc": _ocr_name(
+                str(t.get("doc") or "compiled.txt")),
+                "dims": _rw_sanitize_dims(t.get("dims")) or {},
+                "items": [{"role": i["role"], "order": i["order"],
+                           "box": i["box"]} for i in items]}
+
+    def fig_entry(fig):
+        # bbox values ride into layout.json, which /ocr-layout serializes —
+        # a NaN or a nested object here would break every layout fetch
+        out = {"src_key": src}
+        if not isinstance(fig, dict):
+            return out
+        try:
+            pg = int(fig.get("page"))
+            if 1 <= pg <= 99999:
+                out["page"] = pg
+        except (TypeError, ValueError, OverflowError):
+            pass
+        for k in ("x", "y", "w", "h"):
+            try:
+                v = float(fig.get(k))
+            except (TypeError, ValueError):
+                continue
+            if v == v and 0.0 <= v <= 1.0:      # finite, in the page
+                out[k] = round(v, 5)
+        ro = str(fig.get("rework_of") or "")
+        if re.fullmatch(r"[\w.\-]{1,120}", ro):
+            out["rework_of"] = ro
+        return out
+
+    figures_src = book.get("figures") if isinstance(book.get("figures"),
+                                                    dict) else {}
+    raw_styles = book.get("stylesheet")
+    styles = _rw_sanitize_styles(raw_styles)         if isinstance(raw_styles, dict) and len(raw_styles) <= 40 else {}
+
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    applied, skipped, tpls_added = [], [], []
+    sheet = "none"
+    with _ocr_merge_lock:
+        meta = lib.load_json(meta_path, {})
+        pmap = meta.setdefault("regions", {}).setdefault(src, {})
+        for n, rec in sorted(incoming.items()):
+            if not overwrite and str(n) in pmap:
+                skipped.append(n)
+                continue
+            pmap[str(n)] = rec
+            applied.append(n)
+        tmap = meta.setdefault("templates", {}).setdefault(src, {})
+        for name, t in tpl_in.items():
+            if not overwrite and name in tmap:
+                continue
+            tmap[name] = t
+            tpls_added.append(name)
+        imap = meta.setdefault("images", {})
+        figures_added = 0
+        img_dir = _entry_dir(build_id) / "ocr" / "images"
+        for name in z.namelist():
+            m = re.fullmatch(r"assets/img/([\w.\-]{1,120})", name)
+            if not m:
+                continue
+            safe = m.group(1)
+            dest = img_dir / safe
+            if dest.exists() or safe in imap:
+                continue
+            info = z.getinfo(name)
+            if info.file_size > _LIB_MAX_FIGURE:
+                continue
+            img_dir.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(z.read(name))
+            imap[safe] = fig_entry(figures_src.get(safe))
+            figures_added += 1
+        lib.save_json(meta_path, meta)
+        # the stylesheet check-and-write shares the lock: a style-board Save
+        # landing between "no custom sheet" and this save must not be
+        # silently clobbered
+        if styles:
+            if overwrite or not _replica_styles(build_id)[1]:
+                lib.save_json(_replica_style_path(build_id),
+                              {"version": 1, "styles": styles})
+                sheet = "imported"
+            else:
+                sheet = "kept"
+    return jsonify({"ok": True, "pages_applied": applied,
+                    "pages_skipped": skipped, "templates_added": tpls_added,
+                    "figures_added": figures_added, "stylesheet": sheet})
 
 
 # --- PDF page rasterization (the OCR tab's side-by-side page view) ---------------
@@ -3024,19 +4155,34 @@ def _ocr_textract(png: bytes, cfg: dict) -> str:
 
 
 def _ocr_mistral(png: bytes, cfg: dict) -> dict:
-    """Mistral returns markdown plus the figures it cut out of the page.
-    The result dict carries the text and the decoded images with their
-    boxes normalised to 0..1 of the page, ready for _ocr_save_page_images."""
+    """Mistral returns markdown, the figures it cut out of the page, and
+    (OCR-4, include_blocks) typed text blocks in reading order. The result
+    carries: `text` — the body flow composed from role-classified regions,
+    with page furniture (marginalia, running heads, catchwords…) lifted out
+    so compiled text, translations, and volume_pages stay clean; `images` —
+    decoded figures with 0..1 boxes for _ocr_save_page_images; `regions` —
+    the typed-region sidecar records; `dims` — the raster size/dpi the API
+    reported (NOT the physical page — it describes our own rasterization).
+    When blocks are missing or carry under 70% of the markdown's characters
+    (a segmentation failure), the text falls back to the full markdown so
+    nothing is silently lost."""
     key = (cfg.get("mistral_key") or "").strip()
     if not key:
         raise RuntimeError("Mistral API key not configured (Settings > OCR)")
     import base64
-    pages = capture.mistral_ocr_pages(png, key, want_images=True)
-    text = "\n\n".join(p.get("markdown", "") for p in pages).strip()
+    pages = capture.mistral_ocr_pages(png, key, want_images=True,
+                                      want_blocks=True)
+    markdown = "\n\n".join(p.get("markdown", "") for p in pages).strip()
+    regions: list[dict] = []
+    dims = None
     images = []
     for pg in pages:
         dim = pg.get("dimensions") or {}
         pw, ph = float(dim.get("width") or 0), float(dim.get("height") or 0)
+        if dims is None and (pw > 0 or ph > 0):
+            dims = {"w": int(pw), "h": int(ph),
+                    "dpi": int(dim.get("dpi") or 0)}
+        regions.extend(layout_roles.regions_from_blocks(pg.get("blocks"), dim))
         for im in pg.get("images") or []:
             b64 = str(im.get("image_base64") or "")
             if "," in b64[:64]:                 # strip a data: URL prefix
@@ -3058,7 +4204,11 @@ def _ocr_mistral(png: bytes, cfg: dict) -> dict:
                         "h": round(max(0.0, y1 - y0) / ph, 5)}
             images.append({"id": str(im.get("id") or f"img-{len(images)}.jpeg"),
                            "data": raw, "bbox": bbox})
-    return {"text": text, "images": images}
+    if regions and layout_roles.coverage(regions, markdown) >= 0.7:
+        text = layout_roles.compose_text(regions)
+    else:
+        text = markdown
+    return {"text": text, "images": images, "regions": regions, "dims": dims}
 
 
 _OCR_SERVICES = {
@@ -3092,13 +4242,16 @@ def _ocr_merge_page(build_id: str, target: str, page: int, text: str) -> None:
 
 
 def _ocr_save_page_images(build_id: str, page: int, images: list[dict],
-                          text: str, src_key: str = "primary") -> str:
+                          text: str, src_key: str = "primary",
+                          regions: list | None = None) -> str:
     """Persist the figures an OCR service cut out of one page.
 
     Files land in the entry folder (ocr/images/p<page>-<id>), their boxes in
     ocr/layout.json, and the markdown's ![id](id) references are rewritten to
     the saved names so every reference stays unique across the compiled file.
-    Returns the rewritten text."""
+    Returns the rewritten text. `regions` get the same rewrite in place —
+    their text fields carry the same raw ids, and a region record that names
+    figures the compiled doc calls something else is a record that lies."""
     if not images:
         return text
     d = _entry_dir(build_id) / "ocr" / "images"
@@ -3116,33 +4269,117 @@ def _ocr_save_page_images(build_id: str, page: int, images: list[dict],
             meta["images"][name] = dict(
                 im["bbox"] or {}, page=page, src_key=src_key or "primary")
             # every ![id](id) in this page's markdown points at the saved file
-            text = re.sub(r"(!\[[^\]]*\]\()" + re.escape(im["id"]) + r"(\))",
-                          r"\g<1>" + name + r"\g<2>", text)
+            pat = re.compile(r"(!\[[^\]]*\]\()" + re.escape(im["id"]) + r"(\))")
+            text = pat.sub(r"\g<1>" + name + r"\g<2>", text)
+            for reg in regions or []:
+                if reg.get("text"):
+                    reg["text"] = pat.sub(r"\g<1>" + name + r"\g<2>",
+                                          reg["text"])
         lib.save_json(meta_path, meta)
     return text
 
 
-def _ocr_save_page_words(build_id: str, src_key: str, page: int, words: list) -> None:
+def _ocr_save_page_words(build_id: str, src_key: str, page: int, words: list,
+                         doc: str = "") -> None:
     """Persist one page's OCR word boxes to the sidecar (ocr/layout.json,
     {words: {"<src>": {"<page>": [{t,x,y,w,h,l}, ...]}}}). /api/pdf/words reads
     these back for a scan with no text layer, so the Layout facsimile works on
     it too. Keyed by SOURCE like the compiled .txt files, so a secondary scan's
-    boxes never clobber the primary's. An empty list DROPS the page — a re-OCR
-    with a service that has no boxes (Claude, Mistral) must not leave a stale
-    facsimile behind the new transcription."""
+    boxes never clobber the primary's. An empty list DROPS the page — the
+    engine that owns the geometry saw a blank page. Only geometry-speaking
+    engines may call this (see _ocr_job_run): a text-only re-OCR must not
+    destroy boxes another engine paid to produce — the box positions stay
+    valid for the unchanged page image even when the transcription moves on,
+    and cross-engine work (clip-from-words, region seeding) depends on them
+    surviving.
+
+    `doc` records WHICH compiled file's transcription the boxes carry
+    (words_doc, same src/page keying): the words' `t` values are that run's
+    text, and the client only places the facsimile when the doc being viewed
+    is the one the boxes belong to — any other doc flows its own text."""
     src_key = src_key or "primary"
     meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
     with _ocr_merge_lock:
         meta_path.parent.mkdir(parents=True, exist_ok=True)
         meta = lib.load_json(meta_path, {})
         wmap = meta.setdefault("words", {})
+        dmap = meta.setdefault("words_doc", {})
         pages = wmap.setdefault(src_key, {})
+        docs = dmap.setdefault(src_key, {})
         if words:
             pages[str(int(page))] = words
+            if doc:
+                docs[str(int(page))] = doc
+        else:
+            pages.pop(str(int(page)), None)
+            docs.pop(str(int(page)), None)
+            if not pages:
+                wmap.pop(src_key, None)
+        if not docs:
+            dmap.pop(src_key, None)
+        if not dmap:
+            meta.pop("words_doc", None)
+        lib.save_json(meta_path, meta)
+
+
+def _ocr_save_page_regions(build_id: str, src_key: str, page: int,
+                           regions: list, dims: dict | None,
+                           doc: str = "", state: str = "") -> None:
+    """Persist one page's typed regions (ocr/layout.json, {regions: {"<src>":
+    {"<page>": {doc, dims, items: [{id, role, box, order, text}]}}}}), boxes
+    0..1 like the word sidecar. Unlike word boxes, regions CARRY their run's
+    text, so a re-OCR through the region-producing path replaces them and an
+    empty list drops the page — stale region text must not outlive its
+    transcription. `doc` names the compiled file that run's text landed in;
+    `dims` is the API-reported raster size/dpi (not physical page size);
+    `state` is the review flag ("verified" once a human signed the page off —
+    a machine re-seed writes none, so re-OCR naturally un-verifies)."""
+    src_key = src_key or "primary"
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    with _ocr_merge_lock:
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta = lib.load_json(meta_path, {})
+        rmap = meta.setdefault("regions", {})
+        pages = rmap.setdefault(src_key, {})
+        if regions:
+            rec = {"doc": doc, "dims": dims or {}, "items": regions}
+            if state:
+                rec["state"] = state
+            pages[str(int(page))] = rec
         else:
             pages.pop(str(int(page)), None)
             if not pages:
-                wmap.pop(src_key, None)
+                rmap.pop(src_key, None)
+        if not rmap:
+            meta.pop("regions", None)
+        lib.save_json(meta_path, meta)
+
+
+def _ocr_drop_page_regions_for_doc(build_id: str, src_key: str, page: int,
+                                   doc: str) -> None:
+    """Drop a page's region record IF it claims to carry `doc`'s text.
+
+    A run without region output (Tesseract/Textract/Claude) that rewrites a
+    compiled page supersedes the text of any region record pointing at that
+    same file — serving the old transcription tagged with the current doc
+    would defeat the staleness contract. A run into a DIFFERENT target
+    leaves the record alone: the doc it describes is unchanged."""
+    src_key = src_key or "primary"
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    with _ocr_merge_lock:
+        meta = lib.load_json(meta_path, {})
+        rmap = meta.get("regions")
+        if not isinstance(rmap, dict):
+            return
+        pages = rmap.get(src_key)
+        rec = pages.get(str(int(page))) if isinstance(pages, dict) else None
+        if not (isinstance(rec, dict) and rec.get("doc") == doc):
+            return
+        pages.pop(str(int(page)), None)
+        if not pages:
+            rmap.pop(src_key, None)
+        if not rmap:
+            meta.pop("regions", None)
         lib.save_json(meta_path, meta)
 
 
@@ -3177,14 +4414,35 @@ def _ocr_job_run(job_id: str) -> None:
                 text = str(result.get("text") or "")
                 if result.get("images"):
                     text = _ocr_save_page_images(
-                        job["build_id"], n, result["images"], text, src_key)
-                # save boxes when the service produced them, else clear this
-                # page's stale boxes (a figures-only or text-only re-OCR)
-                _ocr_save_page_words(job["build_id"], src_key, n,
-                                     result.get("words") or [])
+                        job["build_id"], n, result["images"], text,
+                        src_key, regions=result.get("regions"))
+                # a "words" key marks a geometry-speaking engine, and its
+                # value is authoritative ([] = blank page). Engines without
+                # one (Mistral, Claude) replace the text but must leave the
+                # boxes alone — Tesseract geometry stays valid for the same
+                # page image no matter which engine wrote the transcription.
+                if "words" in result:
+                    _ocr_save_page_words(job["build_id"], src_key, n,
+                                         result.get("words") or [],
+                                         doc=_ocr_name(job["target"]))
+                # likewise a "regions" key marks the region-producing path
+                # (Mistral blocks); its value is authoritative — [] clears
+                # the page's regions along with the transcription they held.
+                # Region-silent engines instead DROP a record claiming this
+                # target's text: unlike word geometry, region text is
+                # superseded by the new transcription.
+                if "regions" in result:
+                    _ocr_save_page_regions(job["build_id"], src_key, n,
+                                           result.get("regions") or [],
+                                           result.get("dims"),
+                                           doc=_ocr_name(job["target"]))
+                else:
+                    _ocr_drop_page_regions_for_doc(job["build_id"], src_key,
+                                                   n, _ocr_name(job["target"]))
             else:
                 text = result
-                _ocr_save_page_words(job["build_id"], src_key, n, [])
+                _ocr_drop_page_regions_for_doc(job["build_id"], src_key,
+                                               n, _ocr_name(job["target"]))
             _ocr_merge_page(job["build_id"], job["target"], n, text)
             item["status"] = "ok"
         except Exception as exc:
@@ -3375,24 +4633,32 @@ def _renumber_layout_words(build_id: str, src_key: str, removed: list[int]) -> N
     if not meta_path.is_file():
         return
     removed_set = set(removed)
+
+    def remap(pages: dict) -> dict:
+        out = {}
+        for k, v in pages.items():
+            try:
+                n = int(k)
+            except (TypeError, ValueError):
+                continue
+            if n in removed_set:
+                continue
+            out[str(n - sum(1 for r in removed if r < n))] = v
+        return out
+
     with _ocr_merge_lock:
         meta = lib.load_json(meta_path, {})
         dirty = False
-        wmap = meta.get("words")
-        if isinstance(wmap, dict):
+        # words, words_doc, and regions share the src/page keying; shift all
+        for key in ("words", "words_doc", "regions"):
+            wmap = meta.get(key)
+            if not isinstance(wmap, dict):
+                continue
             pages = wmap.get(src_key or "primary")
-            if isinstance(pages, dict):
-                remapped = {}
-                for k, v in pages.items():
-                    try:
-                        n = int(k)
-                    except (TypeError, ValueError):
-                        continue
-                    if n in removed_set:
-                        continue
-                    remapped[str(n - sum(1 for r in removed if r < n))] = v
-                wmap[src_key or "primary"] = remapped
-                dirty = True
+            if not isinstance(pages, dict):
+                continue
+            wmap[src_key or "primary"] = remap(pages)
+            dirty = True
 
         images = meta.get("images")
         if isinstance(images, dict):
@@ -4427,9 +5693,9 @@ def api_ia_downloads():
 # /api/secrets (Host-guarded); every server-side credential read goes through
 # _client_settings, which overlays these on top of the synced preferences. ------
 _SECRET_KEYS = frozenset({
-    "aiKey", "mistralKey", "ocrClaudeKey", "ocrAzureKey", "ocrAwsKey",
-    "ocrAwsSecret", "supabaseKey", "supabaseAnonKey", "r2KeyId", "r2Secret",
-    "gsKeyFile",
+    "aiKey", "embedKey", "mistralKey", "ocrClaudeKey", "ocrAzureKey",
+    "ocrAwsKey", "ocrAwsSecret", "supabaseKey", "supabaseAnonKey", "r2KeyId",
+    "r2Secret", "gsKeyFile", "imgGenKey",
 })
 _SECRETS_PATH = lib.DATA_ROOT / "output" / "secrets.json"
 _MISTRAL_PENDING = "_mistralCloudPending"
@@ -6395,6 +7661,448 @@ def api_analyze_relevance():
     return jsonify({"ok": True, "job": job["id"]})
 
 
+# --- smart check: extract real metadata from a book's own PDF --------------------
+# Any book record with a reachable PDF can be "smart checked": the PDF is
+# fetched (remote URLs land in the downloads/cache temp store), its front
+# matter is OCRed page by page with Mistral until a title page and a copyright
+# page have been seen, and the OCR text goes to the configured AI provider
+# (DeepSeek by default — the same Mistral -> DeepSeek chain as a phone
+# capture) for strict-JSON bibliographic extraction. The result is held as a
+# PENDING overlay in output/smart_checks.json: nothing touches the book's real
+# metadata until the client explicitly bakes it in, and retired records move
+# to a capped `resolved` list so every extraction stays auditable. The store
+# is deliberately device-local (not in the store_sync map) — provisional data
+# has no business syncing; bakes travel through the normal record stores.
+
+SMART_CHECKS_PATH = lib.OUTPUT_DIR / "smart_checks.json"
+_sc_lock = threading.Lock()          # every smart_checks.json read-modify-write
+_sc_jobs: dict = {}
+_sc_jobs_lock = threading.Lock()
+_sc_start_lock = threading.Lock()    # dedupe-scan + job insert, atomically
+
+_SC_SCAN_CAP = 15        # pages considered from the front (blanks included)
+_SC_OCR_CAP = 8          # pages actually sent to OCR
+_SC_WIDTH = 1400         # render width; the OCR queue's default
+_SC_RESOLVED_KEEP = 400  # audit-trail records kept after bake/dismiss
+_SC_PENDING_CAP = 200    # un-baked overlays kept; oldest are dropped first
+_SC_JOBS_KEEP = 20       # finished entries kept in the per-kind registry
+
+# extraction vocabulary (capture.FIELDS) -> each record store's field names
+_SC_FIELD_MAPS = {
+    "whl": {"title": "title", "subtitle": "subtitle", "author": "authors",
+            "year": "year", "publisher": "publisher", "language": "language"},
+    "build": {"title": "title", "subtitle": "subtitle", "author": "authors",
+              "year": "year", "publisher": "publisher",
+              "city": "publisher_city", "edition": "edition",
+              "volume": "volume", "language": "language"},
+    "checked": {f: f for f in ("title", "subtitle", "author", "publisher",
+                               "city", "year", "edition", "volume",
+                               "language")},
+}
+_SC_FIELD_MAPS["manual"] = _SC_FIELD_MAPS["checked"]
+
+# The phone capture's extraction prompt, reframed for digitized front matter.
+# Derived (not copied) so the strict-JSON field contract can never drift from
+# capture_pipeline / the Android app; if the upstream wording changes, the
+# replace no-ops and the prompt is still valid.
+_SC_PROMPT = capture._EXTRACT_PROMPT.replace(
+    "OCR text from photos of a book's title page and/or copyright page",
+    "OCR text from the first pages of a digitized copy of a book "
+    "(cover, title page, copyright page, other front matter)")
+
+# cheap textual signals deciding when the front-matter scan can stop early
+_SC_COPYRIGHT_RE = re.compile(
+    r"copyright|©|all rights reserved|printed in|first published"
+    r"|impression|printing|entered according to act", re.I)
+_SC_YEAR_RE = re.compile(r"\b(1[4-9]\d{2}|20\d{2})\b")
+_SC_IMPRINT_RE = re.compile(
+    r"publish|press\b|verlag|editore|editions?\b|librair|imprim"
+    r"|printed for|book (?:co|company)|& ?co\b|and company|sons\b|brothers\b",
+    re.I)
+
+
+def _sc_parse_target(raw) -> tuple[str, str]:
+    """A target names one book record: '<kind>:<ident>' where kind is one of
+    whl / build / manual / checked (idents may themselves contain colons —
+    checked keys are 'source:idx'). Raises ValueError on anything else."""
+    t = str(raw or "").strip()
+    kind, _, ident = t.partition(":")
+    if kind not in _SC_FIELD_MAPS or not ident:
+        raise ValueError("bad target")
+    return kind, ident
+
+
+def _sc_scan_pages(pdf: Path) -> list[int]:
+    """1-based front-matter candidates: the first _SC_SCAN_CAP pages minus
+    visually blank ones (_blank_pages' ink + text-layer test), so OCR calls
+    aren't spent on empty versos."""
+    import fitz
+    pages = []
+    doc = fitz.open(str(pdf))
+    try:
+        for i in range(min(doc.page_count, _SC_SCAN_CAP)):
+            pg = doc[i]
+            zoom = 160 / max(1.0, pg.rect.width)
+            pix = pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom),
+                                colorspace="gray")
+            samples = pix.samples
+            inked = sum(1 for v in samples if v < 200)
+            if (inked / max(1, len(samples)) >= 0.003
+                    or (pg.get_text() or "").strip()):
+                pages.append(i + 1)
+    finally:
+        doc.close()
+    return pages
+
+
+def _sc_ocr_page(pdf: Path, page: int, key: str) -> str:
+    """Render one page and OCR it with Mistral — the OCR queue's exact chain."""
+    png = _ocr_page_png(pdf, page, _SC_WIDTH)
+    pages = capture.mistral_ocr_pages(png, key)
+    return "\n\n".join(p.get("markdown", "") for p in pages).strip()
+
+
+def _sc_extract(ocr_text: str) -> tuple[dict, str]:
+    """OCR text -> normalized bibliography + the model that produced it.
+    DeepSeek (Settings > AI) when a key is set — mirroring the phone app's
+    'DeepSeek by default' — else Mistral's own extraction."""
+    cfg = _ai_cfg()
+    if cfg["key"]:
+        obj = _ai_json(cfg, [{"role": "user",
+                              "content": _SC_PROMPT + ocr_text[:12000]}],
+                       temperature=0.0)
+        return capture.normalize_bibliography(obj), cfg["model"]
+    mkey = str(_client_settings().get("mistralKey") or "").strip()
+    if not mkey:
+        raise RuntimeError("no AI key and no Mistral key — set one in "
+                           "Settings > AI or Settings > OCR")
+    return capture.extract_bibliography(ocr_text, mkey), capture.EXTRACT_MODEL
+
+
+def _sc_map_fields(kind: str, fields: dict) -> dict:
+    """Extraction vocabulary -> the target store's. Blank values never map:
+    a smart check may fill or correct a field, never erase one."""
+    out = {}
+    for src, dst in _SC_FIELD_MAPS[kind].items():
+        v = str(fields.get(src) or "").strip()
+        if v:
+            out[dst] = v
+    return out
+
+
+def _sc_store_locked() -> dict:
+    doc = lib.load_json(SMART_CHECKS_PATH, {})
+    if not isinstance(doc, dict):
+        doc = {}
+    if not isinstance(doc.get("pending"), dict):
+        doc["pending"] = {}
+    if not isinstance(doc.get("resolved"), list):
+        doc["resolved"] = []
+    return doc
+
+
+def _sc_mutate(fn):
+    with _sc_lock:
+        doc = _sc_store_locked()
+        out = fn(doc)
+        lib.save_json(SMART_CHECKS_PATH, doc)
+    return out
+
+
+def _sc_job_new(target: str, label: str) -> dict:
+    job = {"id": lib.gen_id(set(_sc_jobs) | set(_jobs)), "target": target,
+           "build_id": "", "kind": "smartcheck", "done": 0, "total": 0,
+           "errors": 0, "status": "running", "error": "", "note": ""}
+    kind, ident = _sc_parse_target(target)
+    if kind == "build":
+        job["build_id"] = ident
+    with _sc_jobs_lock:
+        _sc_jobs[job["id"]] = job
+    _job_track(job, "smartcheck", label=label)
+    return job
+
+
+def _sc_job_start(target: str, label: str, run) -> dict:
+    """Create and start a smart-check job (a seam tests replace to run the
+    worker inline)."""
+    job = _sc_job_new(target, label)
+    threading.Thread(target=run, args=(job,), daemon=True).start()
+    return job
+
+
+def _sc_finish(job: dict, error: str = "") -> None:
+    with _sc_jobs_lock:
+        job["error"] = error
+        status = "error" if error else (
+            "done (with errors)" if job["errors"] else "done")
+    _job_transition(job, status)
+    # drop older finished entries from the per-kind registry — the unified
+    # registry keeps the durable snapshot, and polls fall back to it
+    with _sc_jobs_lock:
+        done = sorted((j for j in _sc_jobs.values()
+                       if j.get("state") not in _JOB_ACTIVE),
+                      key=lambda j: str(j.get("finished_at") or ""),
+                      reverse=True)
+        for old in done[_SC_JOBS_KEEP:]:
+            _sc_jobs.pop(str(old.get("id")), None)
+
+
+def _sc_run(job: dict, spec: dict) -> None:
+    """The whole smart check for one book on its own daemon thread: resolve
+    the PDF -> OCR front-matter pages until both a title-page signal and a
+    copyright signal have been seen -> extract fields -> file the result as
+    a PENDING record. The book's real metadata is never touched here."""
+    target = spec["target"]
+    kind, _ident = _sc_parse_target(target)
+    try:
+        mkey = str(_client_settings().get("mistralKey") or "").strip()
+        if not mkey:
+            raise RuntimeError("Mistral API key not configured (Settings > OCR)")
+        pdf = spec.get("pdf_path")
+        if pdf is None:
+            # note only — a transition would clobber a 'cancelling' status
+            with _sc_jobs_lock:
+                job["note"] = "downloading PDF"
+            _job_checkpoint(job, force=True)
+            pdf = _remote_pdf_cache(spec["url"])   # ValueError on failure
+            with _sc_jobs_lock:
+                job["note"] = ""
+        pdf = Path(pdf)
+        candidates = _sc_scan_pages(pdf)
+        if not candidates:
+            raise RuntimeError(
+                f"no readable pages in the first {_SC_SCAN_CAP} pages")
+        planned = candidates[:_SC_OCR_CAP]
+        with _sc_jobs_lock:
+            job["total"] = len(planned) + 1        # +1 = the extraction step
+            job["note"] = ""
+        texts: dict[int, str] = {}
+        titleish = copyrightish = False
+        for i, n in enumerate(planned):
+            if _an_cancel_check(job, "cancelled — nothing was written"):
+                return
+            try:
+                text = _sc_ocr_page(pdf, n, mkey)
+            except Exception as exc:
+                text = ""
+                with _sc_jobs_lock:
+                    job["errors"] += 1
+                    job["note"] = f"page {n}: {type(exc).__name__}"
+            if text:
+                texts[n] = text
+                titleish = titleish or bool(_SC_YEAR_RE.search(text)
+                                            or _SC_IMPRINT_RE.search(text))
+                copyrightish = copyrightish or bool(
+                    _SC_COPYRIGHT_RE.search(text))
+            with _sc_jobs_lock:
+                job["done"] = i + 1
+            _job_checkpoint(job)
+            # both signals in hand: the imprint is covered, stop spending
+            if titleish and copyrightish and len(texts) >= 2:
+                break
+        ocr_text = "\n\n".join(f"--- page {n} ---\n{texts[n]}"
+                               for n in sorted(texts))
+        if not ocr_text.strip():
+            raise RuntimeError("OCR produced no text from the front matter")
+        if _an_cancel_check(job, "cancelled — nothing was written"):
+            return
+        got, model = _sc_extract(ocr_text)
+        extra = got.pop("extra", {}) or {}
+        # an unparseable/empty AI reply must fail loudly — filing an all-blank
+        # record would render as "the PDF agrees with this record"
+        if not extra and not any(str(v or "").strip() for v in got.values()):
+            raise RuntimeError("extraction returned no fields — the AI reply "
+                               "could not be parsed; try again")
+        if _an_cancel_check(job, "cancelled — nothing was written"):
+            return
+        record = {
+            "target": target, "kind": kind,
+            "label": str(spec.get("label") or ""),
+            "fields": got, "extra": extra,
+            "mapped": _sc_map_fields(kind, got),
+            "ocr_text": ocr_text[:60000],
+            "pages_ocred": sorted(texts),
+            "pdf": spec.get("pdf_ref") or {},
+            "engine": {"ocr": capture.OCR_MODEL, "extract": model},
+            "created_at": datetime.now(timezone.utc)
+                          .isoformat(timespec="seconds"),
+            "job_id": job["id"],
+        }
+        def put(doc):
+            pend = doc["pending"]
+            pend[target] = record
+            if len(pend) > _SC_PENDING_CAP:      # oldest overlays age out
+                for k in sorted(pend, key=lambda k: str(
+                        (pend[k] or {}).get("created_at") or ""))[
+                        :len(pend) - _SC_PENDING_CAP]:
+                    pend.pop(k, None)
+        _sc_mutate(put)
+        with _sc_jobs_lock:
+            job["done"] = job["total"]
+        activity("smart-checked", "Book metadata",
+                 detail=record["label"] or target)
+        _sc_finish(job)
+    except Exception as exc:
+        log.error("smart check failed for %s", target, exc_info=exc)
+        _sc_finish(job, f"{type(exc).__name__}: {exc}")
+
+
+@app.route("/api/smartcheck/run", methods=["POST"])
+def api_smartcheck_run():
+    """Start a smart check for one book record.
+
+    Body: ``{target, pdf?, url?, label?}`` — ``target`` is
+    ``whl:<idx> | build:<id> | manual:<id> | checked:<key>``; ``pdf`` is a
+    local path (DATA_ROOT-relative or absolute), ``url`` a remote PDF.
+    Returns the job to poll; a second request for a book whose check is
+    still running returns that same job (``already: true``).
+    """
+    p = request.get_json(silent=True) or {}
+    try:
+        kind, ident = _sc_parse_target(p.get("target"))
+    except ValueError:
+        return jsonify({"ok": False, "error": "bad target"}), 400
+    target = f"{kind}:{ident}"
+    label = str(p.get("label") or "").strip()[:120]
+    # server-owned targets must exist; checked books live in client_state
+    if kind == "build":
+        b = lib.load_json(BUILDS_PATH, {}).get(ident)
+        if not isinstance(b, dict):
+            return jsonify({"ok": False, "error": "unknown build"}), 404
+        label = label or str(b.get("title") or "")
+    elif kind == "manual":
+        entry = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}).get(ident)
+        if not isinstance(entry, dict):
+            return jsonify({"ok": False, "error": "unknown manual entry"}), 404
+        label = label or str(entry.get("title") or "")
+    elif kind == "whl":
+        try:
+            widx = int(ident)
+        except ValueError:
+            return jsonify({"ok": False, "error": "bad WHL index"}), 400
+        if widx >= 0 and widx >= len(_load_whl_base()):
+            return jsonify({"ok": False, "error": "unknown WHL row"}), 404
+        if widx < 0:      # negative idx = a row added through corrections
+            corr = lib.load_json(WHL_CORRECTIONS_PATH, {})
+            if -widx > len(corr.get("added") or []):
+                return jsonify({"ok": False, "error": "unknown WHL row"}), 404
+    elif kind == "checked" and ":" not in ident:
+        return jsonify({"ok": False, "error": "bad checked key"}), 400
+    raw_pdf = str(p.get("pdf") or "").strip()
+    url = str(p.get("url") or "").strip()
+    spec = {"target": target, "label": label, "pdf_path": None, "url": url,
+            "pdf_ref": {}}
+    if raw_pdf:
+        lp = _resolve_local(raw_pdf)
+        if lp is None or lp.suffix.lower() != ".pdf" or not lp.is_file():
+            return jsonify({"ok": False, "error": "PDF not found"}), 404
+        spec["pdf_path"] = lp
+        spec["pdf_ref"] = {"path": raw_pdf}
+    elif url:
+        if not url.lower().startswith(("http://", "https://")):
+            return jsonify({"ok": False, "error": "not an http(s) URL"}), 400
+        spec["pdf_ref"] = {"url": url}     # fetched on the worker thread
+    else:
+        return jsonify({"ok": False, "error": "pdf or url required"}), 400
+    # one live job per book — a duplicate click joins the running check.
+    # _sc_start_lock makes the scan-then-insert atomic against a concurrent
+    # POST for the same target (the insert re-takes _jobs_lock internally).
+    with _sc_start_lock:
+        with _jobs_lock:
+            for j in _jobs.values():
+                if (j.get("kind") == "smartcheck" and j.get("target") == target
+                        and j.get("state") in _JOB_ACTIVE):
+                    return jsonify({"ok": True, "already": True,
+                                    "job": dict(_job_public(j), target=target)})
+        job = _sc_job_start(target, label, lambda jb: _sc_run(jb, spec))
+    return jsonify({"ok": True, "job": dict(job)})
+
+
+@app.route("/api/smartcheck/job/<job_id>")
+def api_smartcheck_job(job_id: str):
+    with _sc_jobs_lock:
+        job = _sc_jobs.get(job_id)
+        if job is not None:
+            return jsonify(dict(job))
+    # a restart dropped the worker: the persisted registry still knows it
+    with _jobs_lock:
+        gone = _jobs.get(job_id)
+    if gone is None:
+        abort(404)
+    return jsonify(_job_public(gone))
+
+
+@app.route("/api/smartcheck")
+def api_smartcheck_list():
+    """Every pending (un-baked) smart-check record, keyed by target.
+
+    Records whose build/manual target no longer exists are retired here as
+    ``orphaned`` — a deleted book must not leave an immortal overlay behind
+    (its wand is the only dismiss surface, and it's gone with the row)."""
+    builds = manuals = None
+
+    def prune(doc):
+        nonlocal builds, manuals
+        dead = []
+        for t in doc["pending"]:
+            k, _, ident = str(t).partition(":")
+            if k == "build":
+                if builds is None:
+                    builds = lib.load_json(BUILDS_PATH, {})
+                if ident not in builds:
+                    dead.append(t)
+            elif k == "manual":
+                if manuals is None:
+                    manuals = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
+                if ident not in manuals:
+                    dead.append(t)
+        for t in dead:
+            rec = doc["pending"].pop(t)
+            if isinstance(rec, dict):
+                rec["resolved"] = {
+                    "action": "orphaned", "applied": {},
+                    "at": datetime.now(timezone.utc)
+                          .isoformat(timespec="seconds")}
+                doc["resolved"].append(rec)
+        del doc["resolved"][:-_SC_RESOLVED_KEEP]
+        return dict(doc["pending"])
+
+    return jsonify({"ok": True, "pending": _sc_mutate(prune)})
+
+
+@app.route("/api/smartcheck/resolve", methods=["POST"])
+def api_smartcheck_resolve():
+    """Retire a pending record: ``baked`` (the client applied it to the book
+    through the normal edit endpoints) or ``dismissed``. Retired records move
+    to the store's capped ``resolved`` list — the audit trail of what was
+    extracted, what was applied, and when."""
+    p = request.get_json(silent=True) or {}
+    target = str(p.get("target") or "").strip()
+    action = str(p.get("action") or "").strip()
+    if action not in ("baked", "dismissed"):
+        return jsonify({"ok": False, "error": "bad action"}), 400
+    applied = p.get("applied") if isinstance(p.get("applied"), dict) else {}
+
+    def fn(doc):
+        rec = doc["pending"].pop(target, None)
+        if rec is None:
+            return None
+        rec["resolved"] = {
+            "action": action, "applied": applied,
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        doc["resolved"].append(rec)
+        del doc["resolved"][:-_SC_RESOLVED_KEEP]
+        return rec
+
+    rec = _sc_mutate(fn)
+    if rec is None:
+        return jsonify({"ok": False, "error": "no pending smart check"}), 404
+    if action == "baked":
+        activity("baked", "Smart check",
+                 detail=str(rec.get("label") or target))
+    return jsonify({"ok": True})
+
+
 # --- publishing a volume to the cloud library ---------------------------------
 # The Editor's old "Upload to WHL" only flipped a status field; there was no WHL
 # write API and nothing ever left the machine. A volume now goes to object
@@ -7086,6 +8794,642 @@ def api_volumes_publish_status():
     with _publish_lock:
         return jsonify(dict(_publish, store="r2" if r2.configured(_r2_cfg()) else "supabase"))
 
+
+# --- Knowledge passages: segmentation, curation, and the search index (#140) -----
+# Structure-aware child passages over the OCR text, curated in the Workbench
+# Knowledge phase and published as versioned index rows beside — never inside —
+# the archive entry (docs/search-design.md D5/D6/D7). The artifact is
+# entries/<bid>/passages.json; the cloud side is index_versions + passages in
+# docs/cloud/migrations/004_passages_index.sql.
+
+# The starting recipe (#142 benchmarks it, docs/search-design.md §7): child
+# passages of ~150-350 whitespace tokens, grouped into parent sections of
+# ~600-1200. Token counts are a whitespace approximation on purpose — the
+# corpus predates every tokenizer, and the bounds are targets, not truth.
+_PASSAGE_RECIPE = {"child_min": 150, "child_max": 350,
+                   "parent_min": 600, "parent_max": 1200}
+_INDEX_RIGHTS_OK = ("public-domain", "cleared", "searchable-only")
+_EMBED_BATCH = 64          # passages per /embeddings call
+_INDEX_CHUNK = 100         # passage rows per cloud insert (cancel checkpoints)
+_passages_lock = threading.Lock()
+
+# Sentence boundaries: [.!?] (optionally followed by ONE closing quote or
+# bracket), whitespace, then something that opens a sentence — a capital, a
+# digit, or an opening quote/bracket. A simple heuristic on purpose:
+# abbreviations and initials will over-split occasionally, which merely
+# places a passage boundary early — it never corrupts text, because
+# segmentation only chooses cut points and every slice comes verbatim from
+# the source (D8: the stored layers are sacred). Only the whitespace is
+# consumed, so slicing at match ends loses no characters.
+_SENTENCE_BOUND = re.compile(
+    "(?:(?<=[.!?])|(?<=[.!?][\"')\\]»”]))\\s+"
+    "(?=[(\\[\"'«“]*[A-Z0-9])")
+
+
+def _sentence_spans(text: str) -> list[tuple[int, int]]:
+    """[start, end) sentence slices of `text`, separators attached left, so
+    text[a:b].strip() is the verbatim sentence."""
+    cuts = [m.end() for m in _SENTENCE_BOUND.finditer(text)]
+    spans, start = [], 0
+    for c in cuts:
+        spans.append((start, c))
+        start = c
+    if start < len(text):
+        spans.append((start, len(text)))
+    return [s for s in spans if text[s[0]:s[1]].strip()]
+
+
+def _passage_id(seed: str, text: str) -> str:
+    """Stable, slug-independent passage identity: sha1 of the content plus a
+    seed (the generation ordinal, or the source ids of a manual split or
+    merge), so identical input yields identical ids on any machine."""
+    return hashlib.sha1(f"{seed}\n{text}".encode("utf-8")).hexdigest()[:16]
+
+
+def _passage_recipe(raw) -> dict:
+    """A sanitized recipe: the defaults overlaid with any sane integers."""
+    r = dict(_PASSAGE_RECIPE)
+    if isinstance(raw, dict):
+        for k in r:
+            try:
+                r[k] = max(20, min(5000, int(raw.get(k, r[k]))))
+            except (TypeError, ValueError):
+                continue
+    r["child_max"] = max(r["child_max"], r["child_min"])
+    r["parent_max"] = max(r["parent_max"], r["parent_min"])
+    return r
+
+
+def _segment_passages(pages: dict[int, str], recipe: dict) -> list[dict]:
+    """Structure-aware segmentation: page text -> child passages.
+
+    Structure before size: paragraphs (blank-line blocks) are the atoms;
+    they pack into child passages within the recipe's token bounds and may
+    span page boundaries (that is the point — pages split sentences). A
+    sentence is never broken: a paragraph that alone exceeds child_max
+    splits into sentence runs first, and a single oversized sentence stays
+    whole. Deterministic for identical input.
+
+    Each passage: {id, parent_id, page_from, page_to, text (verbatim
+    excerpt, blocks joined by blank lines), body (=_search_normalize(text))}.
+    """
+    r = _passage_recipe(recipe)
+    paras: list[tuple[int, str]] = []
+    for n in sorted(pages):
+        for block in re.split(r"\n\s*\n", str(pages[n] or "")):
+            block = block.strip()
+            if block:
+                paras.append((n, block))
+
+    # atomic units: (page, text, tokens) — paragraphs, or sentence runs of an
+    # oversized paragraph, sliced verbatim at sentence boundaries
+    units: list[tuple[int, str, int]] = []
+    for page, text in paras:
+        toks = len(text.split())
+        if toks <= r["child_max"]:
+            units.append((page, text, toks))
+            continue
+        spans = _sentence_spans(text)
+        run_from = None
+        run_toks = 0
+        for a, bnd in spans:
+            st = len(text[a:bnd].split())
+            if run_from is not None and run_toks + st > r["child_max"]:
+                piece = text[run_from:a].strip()
+                units.append((page, piece, run_toks))
+                run_from, run_toks = None, 0
+            if run_from is None:
+                run_from = a
+            run_toks += st
+        if run_from is not None:
+            piece = text[run_from:].strip()
+            units.append((page, piece, run_toks))
+
+    # pack units into children: child_max is a hard cap, child_min a target —
+    # a passage flushes when the next unit would push past the cap, so only a
+    # trailing passage (or a single oversized sentence) may sit outside the
+    # bounds
+    children: list[dict] = []
+    cur: list[tuple[int, str, int]] = []
+    cur_toks = 0
+
+    def flush() -> None:
+        nonlocal cur, cur_toks
+        if cur:
+            children.append({"page_from": cur[0][0], "page_to": cur[-1][0],
+                             "text": "\n\n".join(u[1] for u in cur)})
+        cur, cur_toks = [], 0
+
+    for u in units:
+        if cur and cur_toks + u[2] > r["child_max"]:
+            flush()
+        cur.append(u)
+        cur_toks += u[2]
+    flush()
+
+    for i, c in enumerate(children):
+        c["id"] = _passage_id(str(i), c["text"])
+        c["body"] = _search_normalize(c["text"])
+
+    # parent sections: consecutive children grouped to the parent bounds
+    # (same rule — hard cap, a trailing group may run small); parent_id is
+    # derived from the group's first child so it is just as deterministic
+    start, ptoks = 0, 0
+    for i, c in enumerate(children):
+        ct = len(c["text"].split())
+        if i > start and ptoks + ct > r["parent_max"]:
+            for x in children[start:i]:
+                x["parent_id"] = "p" + children[start]["id"]
+            start, ptoks = i, 0
+        ptoks += ct
+    for x in children[start:]:
+        x["parent_id"] = "p" + children[start]["id"]
+
+    return [{"id": c["id"], "parent_id": c["parent_id"],
+             "page_from": c["page_from"], "page_to": c["page_to"],
+             "text": c["text"], "body": c["body"]} for c in children]
+
+
+def _passages_path(bid: str) -> Path:
+    return _entry_dir(bid) / "passages.json"
+
+
+def _load_passages(bid: str) -> dict | None:
+    doc = lib.load_json(_passages_path(bid), None)
+    if not isinstance(doc, dict) or not isinstance(doc.get("passages"), list):
+        return None
+    return doc
+
+
+def _write_passages(bid: str, doc_name: str, src_input: dict, recipe: dict,
+                    pages: dict[int, str]) -> dict:
+    """Segment and write entries/<bid>/passages.json, keeping still-valid
+    exclusions (ids are content-based, so unchanged passages keep theirs),
+    and record provenance — produced_by kind "segment", input = the OCR doc
+    fingerprinted at job start — so #135 staleness covers the artifact."""
+    passages = _segment_passages(pages, recipe)
+    keep = {p["id"] for p in passages}
+    with _passages_lock:
+        old = _load_passages(bid) or {}
+        doc = {"version": 1, "recipe": _passage_recipe(recipe),
+               "generated_from": {"doc": doc_name,
+                                  "sha256": str(src_input.get("sha256") or "")},
+               "passages": passages,
+               "excluded": [i for i in old.get("excluded") or [] if i in keep]}
+        lib.save_json(_passages_path(bid), doc)
+    _manifest_record(bid, "passages.json",
+                     {"kind": "segment", "recipe": _passage_recipe(recipe)},
+                     [src_input])
+    return doc
+
+
+def _passages_state(bid: str, b: dict) -> dict:
+    """The honest Passages state: {exists, count, excluded, stale, doc,
+    sha256, recipe}. Stale is manifest staleness (#135) OR the current OCR
+    doc's hash differing from generated_from — the direct comparison also
+    covers artifacts without a manifest row and a switched active document."""
+    name, _text = _analyze_doc(bid, b)
+    cur = ""
+    if name and (_entry_dir(bid) / "ocr" / name).is_file():
+        cur = _file_sha256(_entry_dir(bid) / "ocr" / name)
+    with _passages_lock:
+        doc = _load_passages(bid)
+    if doc is None:
+        return {"exists": False, "count": 0, "excluded": 0, "stale": False,
+                "doc": name, "sha256": cur, "recipe": _passage_recipe(None)}
+    gen = doc.get("generated_from") or {}
+    stale = bool(_manifest_inputs_stale(bid, "passages.json")) or \
+        bool(cur and str(gen.get("sha256") or "") != cur)
+    return {"exists": True, "count": len(doc.get("passages") or []),
+            "excluded": len(doc.get("excluded") or []), "stale": stale,
+            "doc": name, "sha256": cur,
+            "recipe": _passage_recipe(doc.get("recipe"))}
+
+
+def _apply_passage_edits(doc: dict, p: dict) -> str:
+    """Apply {exclude, include, split, merge} to a passages doc in place;
+    returns an error string, or ''. Split and merge recompute ids from their
+    source ids + content, so curation stays deterministic too."""
+    passages = doc.get("passages") or []
+    ids = {str(x.get("id")): i for i, x in enumerate(passages)}
+    excluded = set(str(i) for i in doc.get("excluded") or [])
+
+    for pid in p.get("exclude") or []:
+        if str(pid) not in ids:
+            return f"unknown passage id: {pid}"
+        excluded.add(str(pid))
+    for pid in p.get("include") or []:
+        excluded.discard(str(pid))
+
+    split = p.get("split") or {}
+    if split.get("id"):
+        i = ids.get(str(split["id"]))
+        if i is None:
+            return "unknown passage id: " + str(split["id"])
+        orig = passages[i]
+        spans = _sentence_spans(orig["text"])
+        if len(spans) < 2:
+            return "cannot split — the passage is a single sentence"
+        cut = spans[len(spans) // 2][0]        # the middle sentence boundary
+        halves = []
+        for tag, text in (("a", orig["text"][:cut].strip()),
+                          ("b", orig["text"][cut:].strip())):
+            halves.append({
+                "id": _passage_id(f"{orig['id']}:{tag}", text),
+                "parent_id": orig.get("parent_id") or "",
+                # without an offset map the cut's page is unknowable (D2),
+                # so both halves keep the honest full range
+                "page_from": orig.get("page_from"),
+                "page_to": orig.get("page_to"),
+                "text": text, "body": _search_normalize(text)})
+        passages[i:i + 1] = halves
+        if orig["id"] in excluded:             # an excluded passage splits excluded
+            excluded.discard(orig["id"])
+            excluded.update(h["id"] for h in halves)
+
+    merge = p.get("merge") or {}
+    if merge.get("id"):
+        ids = {str(x.get("id")): i for i, x in enumerate(passages)}
+        i = ids.get(str(merge["id"]))
+        if i is None:
+            return "unknown passage id: " + str(merge["id"])
+        if (i + 1 >= len(passages)
+                or (passages[i + 1].get("parent_id") or "")
+                != (passages[i].get("parent_id") or "")):
+            return "cannot merge — no next passage in the same section"
+        a, nxt = passages[i], passages[i + 1]
+        text = a["text"].rstrip() + "\n\n" + nxt["text"].lstrip()
+        merged = {"id": _passage_id(f"{a['id']}+{nxt['id']}", text),
+                  "parent_id": a.get("parent_id") or "",
+                  "page_from": a.get("page_from"),
+                  "page_to": nxt.get("page_to"),
+                  "text": text, "body": _search_normalize(text)}
+        passages[i:i + 2] = [merged]
+        both = a["id"] in excluded and nxt["id"] in excluded
+        excluded.discard(a["id"])
+        excluded.discard(nxt["id"])
+        if both:                               # merged stays out only if both were
+            excluded.add(merged["id"])
+
+    doc["passages"] = passages
+    doc["excluded"] = sorted(excluded)
+    return ""
+
+
+@app.route("/api/knowledge/segment", methods=["POST"])
+def api_knowledge_segment():
+    """Segment the OCR text into passages. Body: {build_id, recipe?}. A
+    tracked job — the work is fast, but the registry gives progress and the
+    jobs drawer a row like every other background step."""
+    p = request.get_json(silent=True) or {}
+    bid = str(p.get("build_id") or "").strip()
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    recipe = _passage_recipe(p.get("recipe"))
+    doc_name, text, source_revision = _analyze_doc_snapshot(bid, b)
+    pages = _an_pages(text)
+    if not pages:
+        return jsonify({"ok": False, "error":
+                        "no OCR text for this entry — extract or run OCR first"}), 400
+    src_input = _manifest_input(bid, f"ocr/{doc_name}")   # hashed at job start
+
+    def run(job):
+        try:
+            if _an_cancel_check(job, "cancelled — passages not written"):
+                return
+            doc = _write_passages(bid, doc_name, src_input, recipe, pages)
+            with _an_jobs_lock:
+                job["done"] = 1
+                job["note"] = f"{len(doc['passages'])} passages"
+            activity("segmented passages", "book", detail=b.get("title", ""))
+            _an_finish(job)
+        except Exception as exc:
+            log.error("segmentation failed for %s", bid, exc_info=exc)
+            _an_finish(job, f"{type(exc).__name__}: {exc}")
+
+    try:
+        job = _an_job_start_guarded(bid, source_revision, "segment", 1, run)
+    except _AnalyzeSourceChanged:
+        return jsonify({"ok": False, "error":
+                        "page numbering changed — review the pages and retry"}), 409
+    return jsonify({"ok": True, "job": job["id"], "doc": doc_name})
+
+
+@app.route("/api/builds/<bid>/passages", methods=["GET", "PATCH"])
+def api_build_passages(bid: str):
+    """GET: the artifact plus its state line. PATCH {exclude, include,
+    split, merge}: curation — a manual edit, re-recorded as such so the
+    recorded inputs (and staleness) stay judgeable."""
+    if request.method == "GET":
+        b = lib.load_json(BUILDS_PATH, {}).get(bid) or {}
+        with _passages_lock:
+            doc = _load_passages(bid)
+        return jsonify({"ok": True, "doc": doc,
+                        "state": _passages_state(bid, b)})
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    p = request.get_json(silent=True) or {}
+    with _passages_lock:
+        doc = _load_passages(bid)
+        if doc is None:
+            return jsonify({"ok": False, "error":
+                            "no passages yet — generate them first"}), 404
+        problem = _apply_passage_edits(doc, p)
+        if problem:
+            return jsonify({"ok": False, "error": problem}), 400
+        lib.save_json(_passages_path(bid), doc)
+    _manifest_record(bid, "passages.json", {"kind": "manual-edit"})
+    return jsonify({"ok": True, "doc": doc,
+                    "state": _passages_state(bid, b)})
+
+
+def _embed_cfg() -> dict:
+    """The embeddings provider (Settings > AI): any OpenAI-compatible POST
+    /embeddings endpoint. Configured = base AND model set; the key is
+    optional so self-hosted endpoints work. Absent -> lexical-only indexes
+    with model '' (docs/search-design.md D7)."""
+    s = _client_settings()
+    return {"base": str(s.get("embedBase") or "").strip(),
+            "model": str(s.get("embedModel") or "").strip(),
+            "key": str(s.get("embedKey") or "").strip()}
+
+
+def _embed_texts(cfg: dict, texts: list[str]) -> list[list[float]]:
+    """One /embeddings call for a batch; returns vectors in input order.
+    Same error convention as _ai_chat: RuntimeError with the body truncated."""
+    headers = {"Content-Type": "application/json"}
+    if cfg["key"]:
+        headers["Authorization"] = f"Bearer {cfg['key']}"
+    req = urllib.request.Request(
+        cfg["base"].rstrip("/") + "/embeddings",
+        data=json.dumps({"model": cfg["model"], "input": texts}).encode("utf-8"),
+        headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=120.0) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
+    rows = data.get("data")
+    if not isinstance(rows, list) or len(rows) != len(texts):
+        raise RuntimeError("malformed embeddings response")
+    rows = sorted(rows, key=lambda r: int(r.get("index") or 0))
+    return [list(r.get("embedding") or []) for r in rows]
+
+
+def _vector_literal(vec: list) -> str:
+    """pgvector input as a string ('[0.1,0.2,...]') so PostgREST casts
+    text -> vector at any dimension."""
+    return "[" + ",".join(repr(float(x)) for x in vec) + "]"
+
+
+def _index_sync_error(exc) -> str:
+    """A SyncError message, naming the migration when the tables are absent
+    (the _publish_bundle degradation convention)."""
+    msg = str(exc)
+    if "index_versions" in msg or "passages" in msg:
+        return ("index tables missing on the cloud project — apply "
+                "docs/cloud/migrations/004_passages_index.sql")
+    return msg
+
+
+def _index_version_delete(cloud: dict, version_id: str) -> None:
+    """Best-effort removal of a version row; the FK cascade removes whatever
+    passages already landed. A half version must never survive."""
+    if not version_id:
+        return
+    try:
+        sbase.delete_rows(cloud, "index_versions",
+                          "id=eq." + urllib.parse.quote(str(version_id)))
+    except Exception as exc:
+        log.error("could not remove index version %s: %s", version_id, exc)
+
+
+@app.route("/api/knowledge/index/publish", methods=["POST"])
+def api_knowledge_index_publish():
+    """Build and publish a search-index version. Body: {build_id}.
+
+    Requires the archive entry published first (the index attaches to its
+    catalogue row) and a permitting rights decision. searchable-only IS
+    permitting here (docs/rights.md): passage bodies are never anon-readable
+    and the RPC returns only snippets. Segments first when passages.json is
+    missing or outdated; embeds through the configured provider or degrades
+    to lexical-only. Cancellable between batches; a cancelled or failed
+    build deletes its partial index_versions row (cascade cleans passages).
+    """
+    p = request.get_json(silent=True) or {}
+    bid = str(p.get("build_id") or "").strip()
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    slug = str(b.get("published_slug") or "").strip()
+    if b.get("status") != "uploaded" or not slug:
+        return jsonify({"ok": False, "error":
+                        "publish the archive entry first — the search index "
+                        "attaches to its catalogue row"}), 400
+    rights = str(b.get("rights") or "")
+    if rights not in _INDEX_RIGHTS_OK:
+        msg = ("no rights decision — set Rights in the Editor first"
+               if not rights else
+               "the rights decision “No public text” blocks a "
+               "search index (docs/rights.md)")
+        return jsonify({"ok": False, "error": msg}), 400
+    cloud = _cloud_cfg()
+    if not cloud:
+        return jsonify({"ok": False, "error":
+                        "Supabase is not configured (Settings > Sync)"}), 400
+    doc_name, text, source_revision = _analyze_doc_snapshot(bid, b)
+    pages = _an_pages(text)
+    if not pages:
+        return jsonify({"ok": False, "error":
+                        "no OCR text for this entry — extract or run OCR first"}), 400
+    ecfg = _embed_cfg()
+    embed = bool(ecfg["base"] and ecfg["model"])
+    src_input = _manifest_input(bid, f"ocr/{doc_name}")   # hashed at job start
+    src_sha = str(src_input.get("sha256") or "")
+
+    def run(job):
+        version_id = ""
+        try:
+            if _an_cancel_check(job, "cancelled — nothing published"):
+                return
+            # 1. passages: reuse the artifact when it matches the OCR doc as
+            # it stands, (re)segment otherwise — corrected text re-indexes
+            # without republishing the PDF
+            with _passages_lock:
+                doc = _load_passages(bid)
+            gen = (doc or {}).get("generated_from") or {}
+            if doc is None or str(gen.get("sha256") or "") != src_sha:
+                doc = _write_passages(
+                    bid, doc_name, src_input,
+                    _passage_recipe((doc or {}).get("recipe")), pages)
+            excluded = set(doc.get("excluded") or [])
+            included = [x for x in doc.get("passages") or []
+                        if x.get("id") not in excluded]
+            if not included:
+                raise RuntimeError("every passage is excluded — nothing to index")
+            batches = ((len(included) + _EMBED_BATCH - 1) // _EMBED_BATCH
+                       if embed else 0)
+            chunks = (len(included) + _INDEX_CHUNK - 1) // _INDEX_CHUNK
+            with _an_jobs_lock:
+                job["total"] = 1 + batches + chunks
+                job["done"] = 1
+            _job_checkpoint(job, force=True)
+
+            # 2. embeddings (optional): the normalized body is what the index
+            # searches, so it is what embeds
+            vectors: dict[str, str] = {}
+            if embed:
+                for i in range(0, len(included), _EMBED_BATCH):
+                    if _an_cancel_check(job, "cancelled — nothing published"):
+                        return
+                    batch = included[i:i + _EMBED_BATCH]
+                    embs = _embed_texts(
+                        ecfg, [x.get("body") or x.get("text") or ""
+                               for x in batch])
+                    for x, e in zip(batch, embs):
+                        vectors[x["id"]] = _vector_literal(e)
+                    with _an_jobs_lock:
+                        job["done"] += 1
+                    _job_checkpoint(job)
+
+            # 3. the version row first (its passages reference it), the
+            # passages in bounded chunks after. Cancel checks sit between
+            # chunks; _JobCancelled or any failure past this point deletes
+            # the row so a half version never serves. (A hard process kill
+            # can still strand one — Roll back removes it.)
+            config = {"recipe": doc.get("recipe") or {}, "normalize": 1,
+                      "model": ecfg["model"] if embed else ""}
+            stats = {"passages": len(included), "embedded": len(vectors),
+                     "excluded": len(excluded)}
+            rows = sbase._rest(
+                cloud, "POST", "index_versions",
+                [{"slug": slug, "channel": "stable", "config": config,
+                  "source_hash": src_sha, "stats": stats}],
+                prefer="return=representation")
+            if not (isinstance(rows, list) and rows
+                    and isinstance(rows[0], dict) and rows[0].get("id")):
+                raise RuntimeError("index_versions insert returned no row")
+            version_id = str(rows[0]["id"])
+            prows = [{"index_id": version_id, "slug": slug,
+                      "passage_id": x["id"],
+                      "parent_id": x.get("parent_id") or "",
+                      "page_from": x.get("page_from"),
+                      "page_to": x.get("page_to"),
+                      "body": x.get("body") or "",
+                      "embedding": vectors.get(x["id"])}
+                     for x in included]
+            for i in range(0, len(prows), _INDEX_CHUNK):
+                if _job_cancelled(job):
+                    raise _JobCancelled()
+                sbase.upsert_rows(cloud, "passages",
+                                  "index_id,slug,passage_id",
+                                  prows[i:i + _INDEX_CHUNK])
+                with _an_jobs_lock:
+                    job["done"] += 1
+                _job_checkpoint(job)
+            with _an_jobs_lock:
+                job["note"] = (f"{len(included)} passages"
+                               + (f", {len(vectors)} embedded" if vectors
+                                  else " (lexical-only)"))
+            activity("published search index", "book",
+                     detail=b.get("title", ""))
+            log.info("published index version %s for %s (%d passages, "
+                     "%d embedded)", version_id, slug, len(included),
+                     len(vectors))
+            _an_finish(job)
+        except _JobCancelled:
+            _index_version_delete(cloud, version_id)
+            _job_transition(job, "cancelled", note="cancelled — the partial "
+                            "index version was removed; the previous one "
+                            "still serves")
+        except sbase.SyncError as exc:
+            _index_version_delete(cloud, version_id)
+            log.error("index publish failed for %s: %s", bid, exc)
+            _an_finish(job, _index_sync_error(exc))
+        except Exception as exc:
+            _index_version_delete(cloud, version_id)
+            log.error("index publish failed for %s", bid, exc_info=exc)
+            _an_finish(job, f"{type(exc).__name__}: {exc}")
+
+    try:
+        job = _an_job_start_guarded(bid, source_revision, "index-publish",
+                                    1, run)
+    except _AnalyzeSourceChanged:
+        return jsonify({"ok": False, "error":
+                        "page numbering changed — review the pages and retry"}), 409
+    return jsonify({"ok": True, "job": job["id"], "slug": slug,
+                    "model": ecfg["model"] if embed else ""})
+
+
+@app.route("/api/knowledge/index/rollback", methods=["POST"])
+def api_knowledge_index_rollback():
+    """Delete the newest index version for the build's slug; the previous
+    one becomes latest by built_at (the releases pattern — archive rows are
+    never touched). Body: {build_id}."""
+    p = request.get_json(silent=True) or {}
+    bid = str(p.get("build_id") or "").strip()
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    slug = str(b.get("published_slug") or "").strip()
+    if not slug:
+        return jsonify({"ok": False, "error":
+                        "this entry has never published"}), 400
+    cloud = _cloud_cfg()
+    if not cloud:
+        return jsonify({"ok": False, "error":
+                        "Supabase is not configured (Settings > Sync)"}), 400
+    q = urllib.parse.quote(slug, safe="")
+    try:
+        rows = sbase._rest(
+            cloud, "GET", f"index_versions?slug=eq.{q}"
+            "&select=id,built_at&order=built_at.desc,id.desc&limit=2") or []
+        if not rows:
+            return jsonify({"ok": False, "error":
+                            "no index versions to roll back"}), 400
+        newest = str(rows[0].get("id") or "")
+        sbase.delete_rows(cloud, "index_versions",
+                          "id=eq." + urllib.parse.quote(newest))
+    except sbase.SyncError as exc:
+        return jsonify({"ok": False, "error": _index_sync_error(exc)}), 502
+    activity("rolled back search index", "book", detail=b.get("title", ""))
+    return jsonify({"ok": True, "removed": newest,
+                    "remaining": max(0, len(rows) - 1)})
+
+
+@app.route("/api/knowledge/index/status")
+def api_knowledge_index_status():
+    """Everything the Publish phase's Search index card needs in one call:
+    the local passages state plus the slug's version list, newest first."""
+    bid = str(request.args.get("build_id") or "").strip()
+    b = lib.load_json(BUILDS_PATH, {}).get(bid)
+    if not b:
+        abort(404)
+    slug = str(b.get("published_slug") or "").strip()
+    versions, warning = [], ""
+    cloud = _cloud_cfg()
+    if not cloud:
+        warning = "Supabase is not configured (Settings > Sync)"
+    elif slug:
+        q = urllib.parse.quote(slug, safe="")
+        try:
+            versions = [v for v in (sbase._rest(
+                cloud, "GET", f"index_versions?slug=eq.{q}"
+                "&select=id,channel,config,stats,source_hash,built_at"
+                "&order=built_at.desc,id.desc") or []) if isinstance(v, dict)]
+        except sbase.SyncError as exc:
+            warning = _index_sync_error(exc)
+    return jsonify({"ok": True, "state": _passages_state(bid, b),
+                    "versions": versions, "slug": slug,
+                    "published": b.get("status") == "uploaded",
+                    "rights": str(b.get("rights") or ""), "warning": warning})
+
+
 def _capture_note(cap: dict, errors: list[str]) -> str:
     bits = ["Captured via phone"]
     if cap.get("device"):
@@ -7634,12 +9978,16 @@ if __name__ == "__main__":
     _migrate_stored_paths()
     # Warm the offline check indexes (the renewals CSV is ~40 MB) so the first
     # manual-entry submission doesn't stall while they load, and the drive
-    # list so the first file-browser open is instant.
-    threading.Thread(
-        target=lambda: (checks.get_renewals(), checks.get_whl_catalog(),
-                        _drives()),
-        daemon=True,
-    ).start()
+    # list so the first file-browser open is instant. Deferred a few seconds:
+    # the CSV parse is CPU-bound and would otherwise contend (GIL) with the
+    # first page load + client_state GET exactly when the window is opening.
+    # The getters stay lazy, so an early submission just loads inline as before.
+    def _warm_slow_indexes():
+        time.sleep(6)
+        checks.get_renewals()
+        checks.get_whl_catalog()
+        _drives()
+    threading.Thread(target=_warm_slow_indexes, daemon=True).start()
     # Cloud capture autosync (interval read from settings each tick; 0 = off).
     threading.Thread(target=_cloud_autosync_loop, daemon=True).start()
     # LAN capture listener (offline phone -> desktop); off unless opted in.

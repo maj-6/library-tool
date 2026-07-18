@@ -37,6 +37,13 @@ class SettingsActivity : AppCompatActivity() {
             Prefs.setSharpenPreview(this, on)
         }
 
+        // Voice control is opt-in: enabling it here is what makes the capture
+        // screen ask for the mic and download the model on its next resume.
+        binding.voiceControl.isChecked = Prefs.voiceControl(this)
+        binding.voiceControl.setOnCheckedChangeListener { _, on ->
+            Prefs.setVoiceControl(this, on)
+        }
+
         // transport (Cloud / LAN / Auto) + LAN pairing
         when (Prefs.transport(this)) {
             "lan" -> binding.transportLan.isChecked = true
