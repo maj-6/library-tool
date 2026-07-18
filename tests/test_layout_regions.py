@@ -590,9 +590,10 @@ def test_replica_export_lib(client, data_root):
     assert "species-plantarum.lib" in r.headers.get("Content-Disposition", "")
     z = zipfile.ZipFile(io.BytesIO(r.data))
     names = set(z.namelist())
-    assert {"book.json", "pages/3.json", "assets/img/p3-fig.jpeg"} <= names
+    assert {"book.json", "pages/3.json", "assets/img/p3-fig.jpeg",
+            "INSTRUCTIONS.md", "schema.json"} <= names
     book = json.loads(z.read("book.json"))
-    assert book["format"] == "lib/1"
+    assert book["format_version"] == "2.0"
     assert book["meta"]["title"] == "Species Plantarum"
     assert book["pages"] == [3]
     assert "recto" in book["templates"]

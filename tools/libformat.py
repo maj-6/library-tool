@@ -125,6 +125,22 @@ def clean_rid(raw) -> str:
     return r if RID_RE.match(r) else ""
 
 
+def ensure_rids(items: list) -> list:
+    """Return `items` with every region carrying a rid — preserved where valid,
+    minted where absent. Non-destructive to all other fields (unlike a full
+    sanitize, which rewrites src_type/order): used at export to guarantee a
+    stable id on every region, even ones saved before rids existed."""
+    out = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        rec = dict(it)
+        if not clean_rid(rec.get("rid")):
+            rec["rid"] = new_rid()
+        out.append(rec)
+    return out
+
+
 # --- sanitizers (shared by the server routes and the Python API) -----------
 
 def sanitize_ext(raw, loc: str = "ext", warn=None) -> dict:
