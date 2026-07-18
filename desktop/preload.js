@@ -20,4 +20,11 @@ contextBridge.exposeInMainWorld("whlDesktop", {
       ipcRenderer.send("win:open-external", url);
     }
   },
+  // A .lib opened through the OS (double-click / Open With / second launch).
+  // The renderer registers its handler then signals ready; the main process
+  // queues any path that arrived earlier and delivers it once signalled.
+  lib: {
+    onOpen: (cb) => ipcRenderer.on("lib:open", (_e, p) => cb(String(p || ""))),
+    ready: () => ipcRenderer.send("lib:ready"),
+  },
 });

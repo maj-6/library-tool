@@ -52,6 +52,15 @@
         "to": "startup-assets/roboto-slab-var.woff2"
       }
     ],
+    "fileAssociations": [
+      {
+        "ext": "lib",
+        "name": "Library Tool Book",
+        "description": "Library Tool book archive",
+        "icon": "build/lib-file.ico",
+        "role": "Editor"
+      }
+    ],
     "win": {
       "target": [
         { "target": "nsis", "arch": ["x64"] }

@@ -1,6 +1,8 @@
 // The reader. Self-hosted pdf.js (vendored under assets/vendor/pdfjs/, keeping
-// the no-CDN promise) streams the PDF by HTTP Range — disableAutoFetch means a
-// big scan loads lazily as you scroll. Pages render into a virtualized vertical
+// the no-CDN promise) loads the PDF strictly by HTTP Range — disableAutoFetch +
+// disableStream mean a big scan loads lazily as you scroll, with pdf.js falling
+// back to a single full fetch when the host doesn't support Range/CORS. Pages
+// render into a virtualized vertical
 // scroll: only pages near the viewport hold a canvas; the rest keep a
 // pre-sized placeholder so the scrollbar never jumps. Margin annotations come
 // from volume_notes; a page-aligned text/translation panel from volume_pages.
@@ -486,13 +488,14 @@ async function main() {
   try {
     pdf = await pdfjsLib.getDocument({
       url,
-      disableAutoFetch: true,     // stream lazily by range instead of pulling the whole file
-      disableStream: false,
+      disableAutoFetch: true,     // load lazily by range; don't prefetch the rest after a hit
+      disableStream: true,        // and don't open a background full-file stream in parallel
       rangeChunkSize: 65536,
     }).promise;
   } catch (e) {
-    const msg = /fetch|network|CORS|Failed/i.test(String(e && e.message))
-      ? "The scan could not be fetched — it may be offline, or blocked by cross-origin rules."
+    const msg = /fetch|network|CORS|range|206|Failed/i.test(String(e && e.message))
+      ? "The scan could not be fetched. The host must serve it with CORS and HTTP Range " +
+        "(Accept-Ranges) enabled — it may also be offline or blocked by cross-origin rules."
       : `The PDF could not be opened (${esc(e && e.message || "unknown error")}).`;
     message("Cannot open", msg);
     return;

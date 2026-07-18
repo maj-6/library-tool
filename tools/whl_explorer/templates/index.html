@@ -82,11 +82,15 @@
     </span>
   </div>
 
-  <!-- tab strip with the action icons inline, right side -->
+  <!-- the activity bar (VS Code style): tab icons top, actions bottom.
+       Icons come from static/icons/tabs/<data-tab>.svg (user-swappable);
+       initActivityIcons inlines them so theme tab colors apply. -->
+  <div id="shell">
   <div id="tabs">
     <button class="tab active" data-tab="home">Home</button>
     <button class="tab" data-tab="checked">Catalogs</button>
     <button class="tab" data-tab="workbench">Workbench</button>
+    <button class="tab" data-tab="replica">Replica</button>
     <button class="tab" data-tab="publish">Published Library</button>
     <button class="tab" data-tab="infotab">Info</button>
     <span class="bar-spacer"></span>
@@ -898,6 +902,9 @@
             <button id="ocr-layout" class="cad-btn tiny icon-btn" type="button"
                     data-icon="layout"
                     data-tip="Facsimile layout: the document's text at the position and scale it occupies on the page (read-only)"></button>
+            <button id="ocr-furniture" class="cad-btn tiny icon-btn active" type="button"
+                    data-icon="margins"
+                    data-tip="Page furniture in the facsimile: margin notes, running heads, page numbers, catchwords"></button>
             <button id="ocr-del-pages" class="cad-btn tiny icon-btn danger" type="button"
                     data-icon="trash" data-tip="Delete the selected pages from the PDF itself (a .bak.pdf backup is kept; OCR files are renumbered)"></button>
             <span id="ocr-pagenav" class="ocr-pagenav" hidden>
@@ -1060,6 +1067,8 @@
               <button class="pane-tab" data-antab="an-trans" type="button">Translations</button>
               <button class="pane-tab" data-antab="an-notes" type="button">Annotations</button>
               <button class="pane-tab" data-antab="an-passages" type="button">Passages</button>
+              <button class="pane-tab" data-antab="an-test" type="button">Test</button>
+              <button class="pane-tab" data-antab="an-ask" type="button">Ask</button>
               <button class="pane-tab" data-antab="an-rel" type="button">Relevance</button>
             </div>
 
@@ -1150,6 +1159,68 @@
               <pre id="an-psg-view" class="an-text" hidden></pre>
             </div>
 
+            <!-- TEST (#142): the per-volume evaluation set — judged queries,
+                 Recall/nDCG/MRR, working passages vs the published index -->
+            <div class="an-pane" id="an-test">
+              <div class="pane-bar">
+                <span class="tool-label">Evaluation queries</span>
+                <span id="an-ev-metrics" class="tool-label"
+                      data-tip="Overall metrics from the last full run — judged queries only; unanswerable and unjudged counted apart"></span>
+                <span class="bar-spacer"></span>
+                <span id="an-ev-msg" class="tool-label"></span>
+                <button id="an-ev-run" class="cad-btn tiny" type="button"
+                        data-tip="Score every query against the working passages (and the published index when the cloud is configured)">Run all</button>
+              </div>
+              <div class="pane-bar">
+                <input id="an-ev-text" class="cad-input" type="text"
+                       placeholder="a query this book should answer&hellip;" spellcheck="false" />
+                <select id="an-ev-kind" class="cad-input"
+                        data-tip="What the query exercises — cover all kinds over time">
+                  <option value="exact-phrase">exact phrase</option>
+                  <option value="archaic-modern">archaic&#8596;modern</option>
+                  <option value="factual" selected>factual</option>
+                  <option value="thematic">thematic</option>
+                  <option value="tables">tables</option>
+                  <option value="cross-page">cross-page</option>
+                  <option value="multilingual">multilingual</option>
+                  <option value="unanswerable">unanswerable</option>
+                </select>
+                <button id="an-ev-add" class="cad-btn tiny" type="button">Add</button>
+                <button id="an-ev-cancel" class="cad-btn tiny" type="button" hidden>Cancel</button>
+              </div>
+              <div id="an-ev-split">
+                <div id="an-ev-queries" class="drafting"></div>
+                <div id="an-ev-results" class="drafting">
+                  <p id="an-ev-hint" class="empty">Select a query to run it
+                    against the working passages.</p>
+                </div>
+              </div>
+            </div>
+
+            <!-- ASK (#143): evidence first, then an optional cited answer.
+                 Answers are transient — derived AI claims never publish. -->
+            <div class="an-pane" id="an-ask">
+              <div class="pane-bar">
+                <span class="tool-label">Ask this book</span>
+                <span class="bar-spacer"></span>
+                <span id="an-ask-msg" class="tool-label"></span>
+              </div>
+              <div class="pane-bar">
+                <input id="an-ask-q" class="cad-input" type="text"
+                       placeholder="What does this book say about&hellip;" spellcheck="false" />
+                <button id="an-ask-go" class="cad-btn tiny" type="button"
+                        data-tip="Rank the passages for this question — the evidence, before any answer">Ask</button>
+                <button id="an-ask-draft" class="cad-btn tiny" type="button" hidden
+                        data-tip="Draft an answer from the evidence below — cited, abstaining, never medical advice">Draft answer</button>
+              </div>
+              <div id="an-ask-answer" hidden></div>
+              <p id="an-ask-note" class="pane-note" hidden>Model-generated
+                from the passages above &mdash; not the book&rsquo;s text,
+                not medical advice.</p>
+              <div id="an-ask-evidence" class="drafting"></div>
+              <pre id="an-ask-view" class="an-text" hidden></pre>
+            </div>
+
             <div class="an-pane" id="an-rel">
               <div class="pane-bar">
                 <span class="tool-label">Relevance criteria (yours; internal only)</span>
@@ -1162,6 +1233,119 @@
             </div>
           </div>
         </div>
+      </div>
+    </section>
+
+    <!-- REPLICA: the facsimile workbench — correct machine-proposed page
+         regions (draw / split / merge / role keys), then recompile clean
+         body text. docs/facsimile-workbench-plan.md, Phase 3. -->
+    <section id="replica" class="panel-view">
+      <div id="rw-split">
+        <aside id="rw-side">
+          <div class="pane-bar">
+            <span class="tool-label">Books</span>
+            <span class="tool-count" id="rw-book-count"></span>
+          </div>
+          <ul id="rw-books" class="drafting"></ul>
+          <div class="pane-bar">
+            <span class="tool-label">Pages</span>
+            <span class="tool-count" id="rw-page-count"></span>
+            <span class="bar-spacer"></span>
+            <select id="rw-src" class="cad-input" hidden></select>
+          </div>
+          <div id="rw-pages" class="drafting"></div>
+        </aside>
+        <div id="rw-main">
+          <div class="pane-bar">
+            <button id="rw-mode-edit" class="cad-btn tiny active" type="button"
+                    data-tip="Edit the page's regions">Edit</button>
+            <button id="rw-mode-preview" class="cad-btn tiny" type="button"
+                    data-tip="Re-typeset preview: the page rendered from its regions at the mapped styles, beside the original — the modernized facsimile">Preview</button>
+            <select id="rw-preview-lang" class="cad-input" hidden
+                    data-tip="Which text layer the preview flows: the diplomatic transcription, the normalized reading, or a page-aligned translation"></select>
+            <span class="tool-count" id="rw-status"></span>
+            <span class="bar-spacer"></span>
+            <span id="rw-legend" class="tool-label"></span>
+            <span class="bar-spacer"></span>
+            <select id="rw-tpl" class="cad-input" data-tip="Layout template — one corrected recto/verso page becomes a reusable grid"></select>
+            <button id="rw-tpl-save" class="cad-btn tiny" type="button" disabled
+                    data-tip="Save this page's SAVED regions as a template (geometry + roles, no text)">Tpl+</button>
+            <button id="rw-tpl-apply" class="cad-btn tiny" type="button" disabled
+                    data-tip="Stamp the template onto a page range; each region pre-fills its text from the word boxes inside it">Apply</button>
+            <button id="rw-tpl-outliers" class="cad-btn tiny" type="button" disabled
+                    data-tip="Flag region pages that break the template's grid — plates, chapter openings, errata">Outliers</button>
+            <span class="bar-spacer"></span>
+            <button id="rw-save" class="cad-btn tiny" type="button" disabled
+                    data-tip="Save this page's regions (Ctrl+S)">Save</button>
+            <button id="rw-recompile" class="cad-btn tiny" type="button" disabled
+                    data-tip="Rewrite compiled text from every saved region page of this source — furniture stays out of the flow. The toggled layer compiles: diplomatic into each record's doc, normalized into normalized.txt">Recompile</button>
+            <button id="rw-export" class="cad-btn tiny" type="button" disabled
+                    data-tip="Export this source's region pages as a .lib — book metadata, role stylesheet, templates, per-page regions with both text layers, and the figure crops, sealed in one portable file">Export .lib</button>
+            <button id="rw-import" class="cad-btn tiny" type="button" disabled
+                    data-tip="Import a .lib archive into this source — pages that already have regions are skipped, and the stylesheet only lands if the book has none of its own">Import</button>
+            <button id="rw-print" class="cad-btn tiny" type="button" disabled
+                    data-tip="Open the modernized facsimile as a print document (one A4 sheet per region page, the preview's layer selector picks the text) — print it to PDF from the browser">Print</button>
+            <input id="rw-import-file" type="file" accept=".lib,.zip" hidden>
+          </div>
+          <div id="rw-canvas-wrap" class="drafting">
+            <div id="rw-canvas" hidden>
+              <img id="rw-page-img" alt="" draggable="false">
+              <div id="rw-overlay"></div>
+            </div>
+            <div id="rw-preview-row" hidden>
+              <div id="rw-preview-orig" class="rw-prevpane">
+                <img id="rw-preview-orig-img" alt="" draggable="false">
+              </div>
+              <div id="rw-preview" class="rw-prevpane"></div>
+            </div>
+            <p id="rw-empty" class="empty">Pick a book, then a page. Pages marked ● already have machine-proposed regions (run Mistral OCR to seed them); on any other page, drag to draw regions from scratch.</p>
+          </div>
+        </div>
+        <aside id="rw-textpanel">
+          <div id="rw-style-panel" hidden>
+            <div class="pane-bar">
+              <span class="tool-label">Type styles</span>
+              <span class="tool-count" id="rw-style-state"></span>
+              <span class="bar-spacer"></span>
+              <button id="rw-style-save" class="cad-btn tiny" type="button"
+                      data-tip="Store this mapping with the book — the .lib export carries it">Save</button>
+              <button id="rw-style-reset" class="cad-btn tiny" type="button"
+                      data-tip="Back to the default OFL mapping">Reset</button>
+            </div>
+            <div id="rw-styleboard" class="drafting"></div>
+            <div class="pane-bar">
+              <span class="tool-label">Instructions for editors / AI</span>
+              <span class="tool-count" id="rw-instr-state"></span>
+              <span class="bar-spacer"></span>
+              <button id="rw-instr-save" class="cad-btn tiny" type="button"
+                      data-tip="Store this note with the book — every .lib export embeds it for external editors and AI assistants">Save</button>
+            </div>
+            <textarea id="rw-instr" class="cad-input" rows="3" spellcheck="false"
+                      placeholder="Per-book guidance that travels inside the exported .lib — e.g. &quot;Latin plant names stay untranslated&quot;"></textarea>
+          </div>
+          <div id="rw-edit-panel">
+          <div class="pane-bar">
+            <span class="tool-label">Region</span>
+            <span class="tool-count" id="rw-region-info"></span>
+            <span class="bar-spacer"></span>
+            <button id="rw-layer-dipl" class="cad-btn tiny active" type="button"
+                    data-tip="Diplomatic layer: the text as printed (long ſ, ligatures, line-end hyphens)">Dipl</button>
+            <button id="rw-layer-norm" class="cad-btn tiny" type="button"
+                    data-tip="Normalized layer: the modern reading">Norm</button>
+            <button id="rw-normalize" class="cad-btn tiny" type="button" disabled
+                    data-tip="Propose a normalization of the diplomatic text (ſ→s, ligatures, dehyphenate) — then edit it">Propose</button>
+            <button id="rw-clip" class="cad-btn tiny" type="button" disabled
+                    data-tip="Replace this region's diplomatic text with the word boxes inside it (Tesseract/Textract or the PDF text layer)">Clip words</button>
+            <button id="rw-rework" class="cad-btn tiny" type="button" hidden
+                    data-tip="Rework this figure through the configured image model (Settings > OCR & AI) — the generated art saves beside the original, the preview prefers it, and the original is never touched">Rework art</button>
+          </div>
+          <textarea id="rw-text" class="cad-input" spellcheck="false" disabled
+                    placeholder="Select a region"></textarea>
+          <div class="pane-bar">
+            <span id="rw-keys" class="tool-label">draw: drag &nbsp; move/resize: drag box/corner &nbsp; roles: 1–9,0 + D drop-cap / F footnote &nbsp; split: S / Shift+S &nbsp; merge: M &nbsp; verify page: V &nbsp; del: Del &nbsp; order: [ ] &nbsp; walk: Tab</span>
+          </div>
+          </div>
+        </aside>
       </div>
     </section>
 
@@ -1229,6 +1413,7 @@
       <div id="con-lines"></div>
     </section>
   </main>
+  </div><!-- /#shell -->
 
   <!-- DEFAULT ENGINES WINDOW: shared by OCR and text-analysis staging -->
   <div id="engine-overlay" class="overlay" hidden>
@@ -1755,6 +1940,15 @@
             </div>
             <div class="settings-subhead" style="margin-top:16px">OCR</div>
             <div class="settings-rows">
+              <label class="tool-label" for="set-imggen-provider">Illustration rework provider</label>
+              <select id="set-imggen-provider" class="cad-input">
+                <option value="openai">OpenAI (gpt-image-1)</option>
+                <option value="gemini">Google (gemini-2.5-flash-image)</option>
+              </select>
+              <label class="tool-label" for="set-imggen-key">Illustration rework API key</label>
+              <input id="set-imggen-key" class="cad-input" type="password" spellcheck="false" />
+              <label class="tool-label" for="set-imggen-model">Illustration rework model (blank = provider default)</label>
+              <input id="set-imggen-model" class="cad-input" type="text" spellcheck="false" />
               <label class="tool-label" for="set-mistral-key">Mistral API key</label>
               <input id="set-mistral-key" class="cad-input" type="password" spellcheck="false"
                      data-tip="Used by the Mistral OCR service, and by the phone-capture pipeline" />
