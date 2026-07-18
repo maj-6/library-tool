@@ -1150,6 +1150,14 @@ async function trashAct(id, what) {
       // draws the restored book with stale words, regions and tags.
       const row = ((trashState.data || {}).items || []).find((i) => i.id === id);
       const bid = ((row || {}).origin || {}).build_id || "";
+      // A manual entry carries no build_id, and a restored BUILD is by
+      // definition not the selected book — so neither is reached by the
+      // page-cache path below. Without these the server restores the record
+      // and nothing on screen changes until a restart, which reads as a failed
+      // undo and invites a second click (now a 409: the id is occupied again).
+      const kind = (row || {}).kind || "";
+      if (kind === "manual_entry") await loadManual();
+      if (kind === "build") { await loadBuilds(); renderBuildsList(); }
       if (bid) {
         ocrState.pdfInfo = {};
         ocrState.wordsCache.clear();
@@ -1164,6 +1172,8 @@ async function trashAct(id, what) {
         // is what makes those visible without waiting for a tab switch
         await loadBuilds();
         await loadOcrBooks();
+        renderBuildsList();      // the sidebar's counts moved even if this
+                                 // book isn't the one currently open
         ocrState.bookLoading = null;
         ocrState.docs = ocrState.docs.filter((x) => x.buildId !== bid);
         if (ocrState.book === bid) await selectOcrBook(bid);

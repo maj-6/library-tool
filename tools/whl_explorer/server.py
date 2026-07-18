@@ -6069,6 +6069,15 @@ def api_pdf_pages_delete():
     pdf = _resolve_local(str(p.get("pdf") or ""))
     if pdf is None or pdf.suffix.lower() != ".pdf" or not pdf.is_file():
         return jsonify({"ok": False, "error": "PDF not found"})
+    # The PDF has to BELONG to the build. Nothing checked this before, so a
+    # request pairing build A's id with build B's scan renumbered A's OCR
+    # against B's pages — and the trash row it wrote pointed at A's primary,
+    # so restoring it spliced B's held pages into A and overwrote it.
+    if _src_key_for_path(builds[build_id], pdf) == "primary":
+        primary = _resolve_local(str(builds[build_id].get("pdf_file") or ""))
+        if primary is None or primary.resolve() != pdf.resolve():
+            return jsonify({"ok": False,
+                            "error": "that PDF is not attached to this entry"})
     # the entry-folder preview is a TRUNCATED derivative: deleting pages
     # there would desync the (full-length) OCR renumbering
     try:
@@ -6160,9 +6169,18 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
     # and pointing the row at the build's PRIMARY would make restore splice a
     # secondary's pages into the primary — silent corruption. Prefer the STORED
     # path string so the row survives a DATA_ROOT move.
-    src_path = str(b.get("pdf_file") or "")
-    if src_key != "primary":
-        src_path = str(pdf)
+    # "primary" is also _src_key_for_path's catch-all for a resolve error or no
+    # match at all, so verify rather than assume: recording pdf_file for a file
+    # that isn't it is the same wrong-target splice as the secondary case.
+    src_path = str(pdf)
+    if src_key == "primary":
+        prim = _resolve_local(str(b.get("pdf_file") or ""))
+        try:
+            if prim is not None and prim.resolve() == pdf.resolve():
+                src_path = str(b.get("pdf_file") or "")
+        except OSError:
+            pass
+    else:
         for s in (b.get("pdf_sources") or []):
             if str(s.get("id") or "") == src_key and s.get("path"):
                 src_path = str(s.get("path"))

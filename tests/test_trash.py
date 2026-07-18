@@ -480,3 +480,22 @@ def test_restore_will_not_overwrite_a_figure_added_after_the_delete(
     assert body["ok"]
     assert (images / "p2-fig.jpeg").read_bytes() == b"\xff\xd8a DIFFERENT figure"
     assert any(s["file"] == "ocr/images/p2-fig.jpeg" for s in body["skipped"])
+
+
+def test_delete_refuses_a_pdf_from_another_entry(data_root, client):
+    """Nothing checked that the posted PDF belongs to the posted entry, so a
+    mismatched pair renumbered A's OCR against B's pages and wrote a trash row
+    pointing at A's primary — restoring it spliced B's pages into A."""
+    a, b = "trash017a", "trash017b"
+    pdf_a = _seed(a, data_root)
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+    pdf_b = data_root / "downloads" / "ia" / b / "book.pdf"
+    _make_pdf(pdf_b, 5)
+    builds[b] = {"title": "Other", "pdf_file": str(pdf_b)}
+    server.BUILDS_PATH.write_text(json.dumps(builds), encoding="utf-8")
+
+    r = client.post("/api/pdf/pages/delete",
+                    json={"build_id": a, "pdf": str(pdf_b), "pages": [2]})
+    assert r.get_json()["ok"] is False
+    assert "not attached" in r.get_json()["error"]
+    assert _page_count(pdf_a) == 3 and _page_count(pdf_b) == 5   # both untouched
