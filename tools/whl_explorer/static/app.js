@@ -2339,15 +2339,9 @@ function progressSummary() {
   const builds = Object.values(state.builds || {});
   const drafts = builds.filter((b) => b.status === "draft");
   const ready = builds.filter((b) => b.status === "ready").length;
-  // A source is settled once a verified entry has been built from it. Keep the
-  // list, not just the count, so Home can name the first few and jump straight
-  // to them. Sources carry no timestamp, so this is catalogue order, not recency.
-  const srcPend = approvedSources()
-    .filter((s) => sourceBuildStatus(s) !== "done")
-    .map((s) => ({ key: sourceKey(s),
-                   title: s.title || s.matched_title || "(untitled)",
-                   archive: s.archive || "" }));
-  const srcPending = srcPend.length;
+  // a source is settled once a verified entry has been built from it
+  const srcPending = approvedSources()
+    .filter((s) => sourceBuildStatus(s) !== "done").length;
   // Use the same normalized model as the shared Remarks sidebar. In
   // particular, src:* marks belong to Workbench Sources, and published builds
   // still count until their mark is explicitly cleared.
