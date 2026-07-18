@@ -789,6 +789,23 @@ const ICONS = {
   replace: _SVG('<path d="M2.5 5.5 h8 M8.2 3.2 L10.5 5.5 L8.2 7.8"/><path d="M13.5 10.5 h-8 M7.8 8.2 L5.5 10.5 L7.8 12.8"/>'),
   star: _SVG('<path d="M8 2 L9.8 6 L14 6.4 L10.8 9.2 L11.8 13.4 L8 11.2 L4.2 13.4 L5.2 9.2 L2 6.4 L6.2 6 Z"/>'),
   go: _SVG('<path d="M2.5 8 h9 M8.2 4.5 L11.8 8 L8.2 11.5"/>'),
+  // letter A beside a small globe: translation
+  translate: _SVG('<path d="M2.2 11 L4.8 3.8 L7.4 11 M3.1 8.6 h3.4"/><circle cx="11.4" cy="9" r="3"/><path d="M8.4 9 h6 M11.4 6 a4.6 4.6 0 0 1 0 6 M11.4 6 a4.6 4.6 0 0 0 0 6"/>'),
+  printer: _SVG('<path d="M4.5 5.2 V2.5 h7 v2.7"/><path d="M2.5 5.2 h11 v5 h-2.5 M5 10.2 H2.5 v-5"/><path d="M5 8.6 h6 v4.9 H5 Z"/>'),
+  eye: _SVG('<path d="M1.8 8 C3.4 4.9 5.8 3.3 8 3.3 s4.6 1.6 6.2 4.7 C12.6 11.1 10.2 12.7 8 12.7 s-4.6-1.6-6.2-4.7 Z"/><circle cx="8" cy="8" r="2"/>'),
+  eyeoff: _SVG('<path d="M1.8 8 C3.4 4.9 5.8 3.3 8 3.3 s4.6 1.6 6.2 4.7 C12.6 11.1 10.2 12.7 8 12.7 s-4.6-1.6-6.2-4.7 Z"/><circle cx="8" cy="8" r="2"/><path d="M2.8 13.2 L13.2 2.8"/>'),
+  refresh: _SVG('<path d="M13.2 8 a5.2 5.2 0 1 1-1.6-3.75"/><path d="M13.4 2.6 v2.5 h-2.5"/>'),
+  external: _SVG('<path d="M6.8 3.8 H3 v9.2 h9.2 V9.2"/><path d="M9.2 2.6 h4.2 v4.2 M13.2 2.8 L7.8 8.2"/>'),
+  cloudsync: _SVG('<path d="M4.6 11.5 a2.9 2.9 0 1 1 .5-5.75 A3.7 3.7 0 0 1 12.3 7 a2.5 2.5 0 0 1-.6 4.5"/><path d="M6.4 11.4 L8 9.8 L9.6 11.4 M8 10 v4"/>'),
+  // a magnifier over slider rails: search by field
+  sliders: _SVG('<path d="M2.5 4.5 h11 M2.5 8 h6.6 M12.6 8 h.9 M2.5 11.5 h3.2 M11 11.5 h2.5"/><circle cx="6" cy="4.5" r="1.4"/><circle cx="10.6" cy="9.8" r="2.4"/><path d="M12.4 11.6 L14.2 13.4"/>'),
+  send: _SVG('<path d="M13.8 2.2 L2.2 7.3 l4.3 1.7 1.5 4.4 2.3-3.5 Z"/><path d="M6.5 9 L13.8 2.2"/>'),
+  scissors: _SVG('<circle cx="4" cy="4.4" r="1.7"/><circle cx="4" cy="11.6" r="1.7"/><path d="M5.4 5.5 L13.6 12.6 M5.4 10.5 L13.6 3.4"/>'),
+  merge: _SVG('<path d="M2.5 3.5 h3 L9 8 h4.5 M2.5 12.5 h3 L9 8"/><path d="M11.2 5.8 L13.5 8 L11.2 10.2"/>'),
+  // saved-template grid gaining a cell
+  gridplus: _SVG('<rect x="2.5" y="2.5" width="4.6" height="4.6"/><rect x="2.5" y="8.9" width="4.6" height="4.6"/><rect x="8.9" y="2.5" width="4.6" height="4.6"/><path d="M11.2 9.2 v4.2 M9.1 11.3 h4.2"/>'),
+  // arrow settling onto the latest line: follow the log tail
+  follow: _SVG('<path d="M8 2.5 v7 M4.8 6.3 L8 9.5 L11.2 6.3"/><path d="M2.8 12.6 h10.4"/>'),
   // a page with a figure block above flowing text: the facsimile layout view
   layout: _SVG('<rect x="3" y="2" width="10" height="12" rx="1"/><rect x="5" y="4" width="6" height="3.4"/><path d="M5 9.6 h6 M5 11.8 h4.2"/>'),
   // a page with a note block in the margin beside the text column: the
@@ -2737,7 +2754,9 @@ function fillFontSelect(id, list, settingKey, apply) {
   for (const [val, label] of list) {
     const o = document.createElement("option");
     o.value = val;
-    o.textContent = label;
+    // the interface face has per-theme defaults now (a theme may set --ui),
+    // so its empty choice means "whatever the theme picks", not one fixed font
+    o.textContent = (!val && settingKey === "fontUi") ? "Theme default" : label;
     sel.appendChild(o);
   }
   sel.value = state.settings[settingKey] || "";
@@ -4738,8 +4757,11 @@ function reviewItemHtml(r) {
       `<span class="ric-when">${esc(relIso(c.ts))}</span>` +
       `<div class="ric-text">${esc(c.text)}</div></div>`).join("") +
     `<div class="ri-add">` +
+      `<span class="ctl-join">` +
       `<input class="cad-input ri-comment-input" placeholder="Add a comment&hellip;" spellcheck="false" />` +
-      `<button class="cad-btn tiny" type="button" data-rv-comment>Comment</button>` +
+      `<button class="cad-btn tiny icon-btn" type="button" data-rv-comment ` +
+        `aria-label="Comment" data-tip="Add the comment">${ICONS.send}</button>` +
+      `</span>` +
     `</div></div>`;
 }
 
@@ -7539,7 +7561,8 @@ function createPdfViewer() {
               data-tip="Save the page-view edits to the OCR file" hidden>${ICONS.save}</button>
       <button class="cad-btn tiny icon-btn pdf-ocr" type="button"
               data-tip="OCR text" hidden>${ICONS.text}</button>
-      <a class="cad-btn tiny pdf-open" target="_blank" rel="noopener" hidden>OPEN IN TAB</a>
+      <a class="cad-btn tiny icon-btn pdf-open" target="_blank" rel="noopener" hidden
+         aria-label="Open in tab" data-tip="Open the PDF in a browser tab">${ICONS.external}</a>
     </div>
     <div class="pdf-body">
       <div class="pdf-framewrap" hidden><iframe class="pdf-frame" title="PDF preview"></iframe></div>
@@ -9075,10 +9098,12 @@ async function loadAnTranslations(b) {
           <span class="mono">${esc(t.lang)}</span>
           <span class="tool-label">${t.pages} pages</span>
           ${t.stale ? `<span class="an-trans-stale">${t.stale} outdated</span>
-          <button class="cad-btn tiny" data-tstale="${esc(t.lang)}" type="button"
-            data-tip="Re-translate the pages whose OCR text changed since">Update</button>` : ""}
-          <button class="cad-btn tiny" data-tview="${esc(t.lang)}" type="button">View</button>
-          <button class="cad-btn tiny danger" data-tdel="${esc(t.lang)}" type="button">Delete</button>
+          <button class="cad-btn tiny icon-btn" data-tstale="${esc(t.lang)}" type="button"
+            aria-label="Update" data-tip="Re-translate the pages whose OCR text changed since">${ICONS.refresh}</button>` : ""}
+          <button class="cad-btn tiny icon-btn" data-tview="${esc(t.lang)}" type="button"
+            aria-label="View" data-tip="View this translation">${ICONS.eye}</button>
+          <button class="cad-btn tiny icon-btn danger" data-tdel="${esc(t.lang)}" type="button"
+            aria-label="Delete" data-tip="Delete this translation">${ICONS.trash}</button>
         </div>`).join("")
       : `<p class="pane-note">No translations yet. Pages translate one by one and
          partial runs resume where they stopped.</p>`;
@@ -9288,13 +9313,18 @@ function renderAnPassages() {
       <td class="psg-open">${esc(open)}${toks > 9 ? "…" : ""}</td>
       <td class="psg-toks">${toks}</td>
       <td class="psg-acts">
-        <button class="cad-btn tiny" data-psg-x="${esc(p.id)}" type="button">${
-          out ? "Include" : "Exclude"}</button>
-        <button class="cad-btn tiny" data-psg-split="${esc(p.id)}" type="button"
-                data-tip="Split at the middle sentence boundary">Split</button>
-        <button class="cad-btn tiny" data-psg-merge="${esc(p.id)}" type="button"${
+        <button class="cad-btn tiny icon-btn" data-psg-x="${esc(p.id)}" type="button"
+                aria-label="${out ? "Include" : "Exclude"}"
+                data-tip="${out ? "Include the passage in the corpus"
+                               : "Exclude the passage from the corpus"}">${
+          out ? ICONS.eye : ICONS.eyeoff}</button>
+        <button class="cad-btn tiny icon-btn" data-psg-split="${esc(p.id)}" type="button"
+                aria-label="Split"
+                data-tip="Split at the middle sentence boundary">${ICONS.scissors}</button>
+        <button class="cad-btn tiny icon-btn" data-psg-merge="${esc(p.id)}" type="button"${
           canMerge ? "" : " disabled"}
-                data-tip="Merge with the next passage in the same section">Merge</button>
+                aria-label="Merge"
+                data-tip="Merge with the next passage in the same section">${ICONS.merge}</button>
       </td></tr>`;
   }).join("");
 }
@@ -12944,8 +12974,8 @@ function renderOcrDocs() {
       (d.fileName || d.name) === srcExtractedName(s.key));
     li.innerHTML = `<span class="tree-ico">${ICONS.pdf}</span>` +
       `<span class="bi-title">${esc(s.label)}</span>` +
-      (s.path ? `<button class="cad-btn tiny artifact-open-pdf" type="button" ` +
-        `data-pdf="${esc(s.path)}">Open</button>` : `<span class="bi-meta">missing</span>`) +
+      (s.path ? `<button class="cad-btn tiny icon-btn artifact-open-pdf" type="button" ` +
+        `data-pdf="${esc(s.path)}" aria-label="Open" data-tip="Open in the PDF viewer">${ICONS.external}</button>` : `<span class="bi-meta">missing</span>`) +
       (canExtract ? `<button class="cad-btn tiny icon-btn src-extract" type="button" ` +
         `data-src="${esc(s.key)}" data-tip="Extract this PDF's text layer">${ICONS.text}</button>` : "");
     list.appendChild(li);
@@ -12956,7 +12986,8 @@ function renderOcrDocs() {
     li.className = "artifact-pdf-row";
     li.innerHTML = `<span class="tree-ico">${ICONS.pdf}</span>` +
       `<span class="bi-title">Processed PDF</span>` +
-      `<button class="cad-btn tiny artifact-open-pdf" type="button" data-pdf="${esc(processed)}">Open</button>`;
+      `<button class="cad-btn tiny icon-btn artifact-open-pdf" type="button" data-pdf="${esc(processed)}" ` +
+      `aria-label="Open" data-tip="Open in the PDF viewer">${ICONS.external}</button>`;
     list.appendChild(li);
   } else {
     placeholder("Processed PDF - not generated (preprocessing is coming later)");

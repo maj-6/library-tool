@@ -46,6 +46,9 @@
   --cr-inconclusive: #9b6a24;
   --cr-unknown: #7d817c;
   --radius: 4px;
+  /* the one height for single-line controls (inputs, selects, buttons)
+     wherever they share a bar — see the control-height section */
+  --ctl-h: 24px;
   /* dialog shell spacing: every overlay window shares these so headers,
      bodies, and footers line up across dialogs (see .win-titlebar) */
   --dlg-pad-x: 14px;
@@ -1386,6 +1389,71 @@ body .cad-btn.primary.danger {
   background: var(--red);
   border-color: var(--red);
   color: #fff;
+}
+
+/* --- one control height in mixed bars (--ctl-h) --------------------------
+   Fields, selects, and buttons historically carried three independent
+   height recipes (13px/3px input, 12px/4px button, 10px/1px tiny) that
+   only lined up by font-metric luck — and visibly didn't in centered
+   bars. Every bar that mixes fields with buttons pins its single-line
+   controls to --ctl-h; dense in-table/in-row controls (.col-act, .md-btn,
+   list-row tinies) keep their compact sizes. The explicit height also
+   absorbs ledger's 2px bottom border and survives user font changes.
+   inline-flex centers the label/glyph inside the pinned height. */
+.pane-bar > .cad-input:not(textarea),
+.pane-bar > select.cad-input,
+.pane-bar > .cad-btn,
+.pane-bar .year-filter .yr-input,
+.pane-bar .year-filter .cad-btn,
+#checked-toolbar > .cad-input,
+#checked-toolbar > .cad-btn,
+.src-row > .cad-input,
+.src-row > .cad-btn,
+.desc-label-row > .cad-btn,
+.mf-actions > .cad-btn,
+.ctl-join > .cad-input,
+.ctl-join > select.cad-input,
+.ctl-join > .cad-btn {
+  height: var(--ctl-h);
+}
+.pane-bar > .cad-btn,
+.pane-bar .year-filter .cad-btn,
+#checked-toolbar > .cad-btn,
+.src-row > .cad-btn,
+.desc-label-row > .cad-btn,
+.mf-actions > .cad-btn,
+.ctl-join > .cad-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* --- joined field+button groups (.ctl-join) ------------------------------
+   Wraps a text field and its action button(s) into one visual control:
+   flush edges, shared outline, rounding only on the outer corners. The
+   focused member raises itself so its accent border wins the overlap. */
+.ctl-join { display: inline-flex; align-items: stretch; }
+.ctl-join > .cad-input { flex: 1 1 auto; min-width: 0; }
+.ctl-join > :not(:first-child) {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  margin-left: -1px;
+}
+.ctl-join > :not(:last-child) {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.ctl-join > :focus,
+.ctl-join > .cad-btn:hover {
+  position: relative;
+  z-index: 1;
+}
+/* joins that replace a row-filling field inherit its flex */
+.src-row .ctl-join,
+.fb-path-row .ctl-join,
+.ri-add .ctl-join {
+  flex: 1;
+  min-width: 0;
 }
 body .cad-btn.primary.danger:hover {
   background: color-mix(in srgb, var(--red) 84%, #fff);
@@ -3378,7 +3446,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 .d-add { background: rgba(35, 176, 57, 0.16); color: var(--green); }
 .d-skip { opacity: 0.5; font-style: italic; padding: 2px 0; }
 #ocr-queue-wrap { flex: 0 0 140px; min-height: 90px; }
-.pane-bar select.cad-input { height: 22px; padding: 1px 4px; }
+.pane-bar select.cad-input { height: var(--ctl-h); padding: 1px 4px; }
 
 /* page-view marks: title pages, queued-for-OCR pages, range start */
 .ocr-pgimg { position: relative; background: #fff center / cover no-repeat; }
