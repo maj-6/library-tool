@@ -114,13 +114,21 @@ the whole record", explicit status lines on verify/unverify, and a
 build-msg note when a save transitions ready→draft. The stale-rights
 guard from issue 1 removes the worst trap.
 
-### 9. Page deletion has a .bak but no in-app undo — M, high
-Delete/Backspace both trigger it (app.js:14704-14709); recovery means
-finding the `.bak.pdf` by hand, while `deleteBuild` already shows the
+### 9. Page deletion has a .bak but no in-app undo — M, high — DONE
+Delete/Backspace both trigger it (app.js:14704-14709); recovery meant
+finding the `.bak.pdf` by hand, while `deleteBuild` already showed the
 house pattern (no-confirm + `pushOp` undo, app.js:12068-12094).
-**Fix:** a small restore endpoint that swaps the .bak back and inverts
-the OCR renumber, then `pushOp` with status "PAGES DELETED — Ctrl+Z
-restores". Keep the confirm until undo is proven.
+
+**Shipped instead of the proposed .bak swap:** a trash store. The
+removed pages and a whole copy of every collateral file the renumbering
+rewrites go to `output/trash/<id>/`, listed and restorable from
+**Info › Trash** for 30 days. Restore is a verbatim write-back rather
+than an inverse renumber — inverting a lossy transform is the part that
+would have been hard to get right — and it declines to overwrite
+anything edited since the delete, reporting it instead. The `.bak.pdf`,
+`.txt.bak` and `.page-delete-backup` siblings this item was written
+about are retired: the trash holds the same pre-images with an expiry
+policy and a UI. The confirm stays, per the note below.
 
 ### 10. OCR finishes silently — S, med
 The poll loop surfaces only errors (app.js:14536-14548); the footer
