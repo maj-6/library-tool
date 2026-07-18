@@ -2191,6 +2191,7 @@ function sanitizeTabIcon(text) {
 // icon falls back to a two-letter label (with a console note, so a
 // rejected file isn't a silent mystery).
 let activityIconStyle = null;   // the style the rail currently shows
+let activityIconRun = 0;        // stale-run guard for overlapping loads
 
 function currentIconStyle() {
   const v = getComputedStyle(document.body)
@@ -2202,6 +2203,7 @@ function currentIconStyle() {
 function initActivityIcons() {
   const style = currentIconStyle();
   activityIconStyle = style;
+  const run = ++activityIconRun;
   const tabs = [...document.querySelectorAll("#tabs .tab")];
   return Promise.all(tabs.map(async (tab) => {
     // dataset.tip survives re-runs (theme switches); textContent only
@@ -2221,6 +2223,9 @@ function initActivityIcons() {
       } catch (e) { /* try the next location */ }
       if (icon) break;
     }
+    // a newer run superseded this one mid-fetch (rapid theme switches):
+    // let it own the rail — mixed icon sets are worse than a lost update
+    if (run !== activityIconRun) return;
     if (icon) {
       tab.textContent = "";
       tab.appendChild(icon);

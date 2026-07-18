@@ -688,17 +688,17 @@ body[data-theme="slate"] {
   --canvas-line: #31363d;
   --ink: #d3d7dd;
   --ink-light: #d3d7dd;
-  --ink-mut: #a6adb8;      /* >=4.5:1 on --face */
+  --ink-mut: #b4bbc5;      /* >=4.5:1 on --face AND --face-hi (pane bars) */
   --input-bg: #21252a;
   --input-ink: #d7dbe1;
   --row-hover: #2e333a;
   --row-checked: #253540;
   --row-manual: #2b3529;
-  --cyan: #62b0a8;
+  --cyan: #79c2ba;         /* accents brightened to hold >=4.5 as text on --face */
   --green: #7db36e;
   --amber: #cfa95e;
-  --red: #cf7364;
-  --blue: #7d97b8;         /* chalk-blue accent for tabs and bands */
+  --red: #dd9184;
+  --blue: #97aecb;         /* chalk-blue accent for tabs and bands */
   --blue2: #8fa5c0;
   --radius: 4px;
 }
@@ -710,7 +710,8 @@ body[data-theme="slate"] .cad-btn {
 }
 body[data-theme="slate"] .cad-btn:hover { background: #4a525c; border-color: #626b76; }
 body[data-theme="slate"] .cad-btn:active { background: #383f47; }
-body[data-theme="slate"] .cad-btn.danger { color: var(--red); }
+/* danger text needs an extra step of light on the dim button face (4.5:1) */
+body[data-theme="slate"] .cad-btn.danger { color: #eaa89b; }
 body[data-theme="slate"] .cad-input,
 body[data-theme="slate"] .cell-edit,
 body[data-theme="slate"] .md-live { border: 1px solid #4f575f; }
@@ -720,13 +721,19 @@ body[data-theme="slate"] .pane-tab {
   border: none;
   border-radius: 0;
   background: transparent;
-  color: #9aa2ad;
+  color: #abb3be;
 }
 body[data-theme="slate"] .pane-tab.active {
   background: transparent;
   color: var(--ink);
   box-shadow: inset 0 -2px 0 var(--blue);
   font-weight: 600;
+}
+/* the chalk-blue is a glyph color on the dim ground; active bottom-tab
+   labels are TEXT, so they take full ink and keep the blue as a rule */
+body[data-theme="slate"] .bottom-tab.active {
+  color: var(--ink);
+  box-shadow: inset 0 2px 0 var(--blue);
 }
 body[data-theme="slate"] .pane-tabs { border-bottom: 1px solid #4a515b; }
 body[data-theme="slate"] #titlebar,
