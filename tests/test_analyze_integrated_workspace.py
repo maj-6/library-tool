@@ -119,13 +119,15 @@ def test_workbench_readiness_lives_on_the_single_phase_rail():
 
 def test_workbench_sidebar_controls_are_named_and_keyboard_operable():
     toolbar = _between(TEMPLATE, '<div class="pane-bar" id="builds-tabs">', "</div>")
-    assert 'aria-label="Show verified books only"' in toolbar
-    assert 'aria-pressed="false"' in toolbar
+    assert '<span class="tool-label">Entries</span>' in toolbar
+    assert 'data-bstab=' not in toolbar
+    assert 'Show verified books only' not in toolbar
     assert 'aria-label="Collapse the entries and artifacts sidebar"' in toolbar
     assert 'aria-controls="ocr-side"' in toolbar
 
     render = _between(APP, "function renderOcrBooks", "async function selectOcrBook")
-    assert 'verifiedFilter.setAttribute("aria-pressed"' in render
+    assert "allBuildsSorted()" in render
+    assert "verifiedOnly" not in render
     assert 'li.setAttribute("role", "button")' in render
     assert 'li.setAttribute("aria-expanded"' in render
     row = _between(APP, "function appendBuildListItem", "// Publish a verified entry")
@@ -136,6 +138,8 @@ def test_workbench_sidebar_controls_are_named_and_keyboard_operable():
     assert 'ev.key !== "Enter" && ev.key !== " "' in keyboard
     assert "row.click()" in keyboard
     assert ".build-item:focus-visible" in STYLE
+    assert "min-width: 260px" in _between(STYLE, "#ocr-side {", "}")
+    assert 'widthSplit("ocr-splitter", "ocrSide", "ocr-side", 260, 620)' in APP
 
 
 def test_analyze_facsimile_and_artifact_tree_contracts():
@@ -189,8 +193,8 @@ def test_captured_provenance_flows_into_builds_and_artifact_images():
     assert "f.artifact || f.name" in artifacts
 
 
-def test_jobs_drawer_and_default_engine_modal_cover_ocr_and_text_analysis():
-    # the queue + Default Engine bar live in a collapsible drawer at the
+def test_jobs_drawer_and_default_ocr_modal_cover_runnable_engines():
+    # the queue + Default OCR bar live in a collapsible drawer at the
     # Workbench bottom, visible from every phase, collapsed by default
     assert 'id="wb-jobs"' in TEMPLATE
     assert 'id="wb-jobs-toggle"' in TEMPLATE
@@ -206,7 +210,7 @@ def test_jobs_drawer_and_default_engine_modal_cover_ocr_and_text_analysis():
     assert "z-index: 2;" in drawer_css
     assert "overflow: hidden;" in _between(STYLE, ".wb-phase.active {", "}")
     assert '<span class="tool-label">Jobs</span>' in TEMPLATE
-    assert '>Default Engine:</button>' in TEMPLATE
+    assert '>Default OCR:</button>' in TEMPLATE
     assert "<th>Type</th>" in TEMPLATE
     assert "<th>Artifact</th>" in TEMPLATE
     assert "<th>Engine</th>" in TEMPLATE
@@ -226,19 +230,18 @@ def test_jobs_drawer_and_default_engine_modal_cover_ocr_and_text_analysis():
         "engine-settings",
         "engine-done",
         "ocr-service",
-        "analysis-service",
     ):
         assert f'id="{element_id}"' in TEMPLATE
     assert '<label class="tool-label" for="ocr-service">OCR</label>' in TEMPLATE
-    assert '<label class="tool-label" for="analysis-service">Text Analysis</label>' in TEMPLATE
-    for engine in ("mistral", "claude", "textract", "configured"):
+    assert 'id="analysis-service"' not in TEMPLATE
+    for engine in ("mistral", "claude", "textract"):
         assert f'<option value="{engine}">' in TEMPLATE
 
     readiness = _between(
         APP, "function refreshDefaultEngineOptions()", "async function openDefaultEngines")
     assert "option.disabled = !ready" in readiness
-    assert "analysis.options[0].disabled = !ready" in readiness
-    assert "API key required" in readiness
+    assert "Settings > Credentials" in readiness
+    assert "analysis.options" not in readiness
 
 
 def test_page_analysis_staging_and_unified_job_rows_are_wired():

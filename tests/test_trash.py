@@ -435,7 +435,10 @@ def test_a_failing_tail_still_leaves_an_honest_row(data_root, client, monkeypatc
     def boom(*a, **k):
         raise RuntimeError("sidecar is corrupt")
 
-    monkeypatch.setattr(server, "_manifest_after_renumber", boom)
+    # the attention remap is the one derivative step with no try/except of its
+    # own, and it runs last — so this is the failure that actually escapes,
+    # after every snapshot has been taken
+    monkeypatch.setattr(server, "_remap_page_attention_references", boom)
     with pytest.raises(RuntimeError):
         server._apply_page_deletion(bid, builds, pdf, [2])
 
@@ -495,7 +498,8 @@ def test_delete_refuses_a_pdf_from_another_entry(data_root, client):
     server.BUILDS_PATH.write_text(json.dumps(builds), encoding="utf-8")
 
     r = client.post("/api/pdf/pages/delete",
-                    json={"build_id": a, "pdf": str(pdf_b), "pages": [2]})
-    assert r.get_json()["ok"] is False
-    assert "not attached" in r.get_json()["error"]
+                    json={"build_id": a, "pdf": str(pdf_b), "pages": [2],
+                          "page_revision": "unversioned"})
+    assert r.status_code == 409
+    assert r.get_json()["conflict"] == "pdf_not_attached"
     assert _page_count(pdf_a) == 3 and _page_count(pdf_b) == 5   # both untouched

@@ -81,8 +81,8 @@
    heads. LINEN sits between (one soft gradient, nothing else).
 
    A theme may also set --ui to give itself a default interface face
-   (Segoe UI otherwise) — the user's explicit font pick, applied inline by
-   applyFont(), still beats it — and --icon-style to pick an activity-bar
+   (Segoe UI otherwise). Theme-editor font overrides are applied inline by
+   applyFont(); --icon-style picks an activity-bar
    icon set (see static/icons/tabs/).
 
    SAGE           - warm, earthy, bookish neutral: cream paper, taupe chrome,
@@ -873,11 +873,35 @@ input, textarea, [contenteditable="true"], .cell-edit,
   align-items: center;
   justify-content: space-between;
   gap: 20px;
-  margin-bottom: 24px;
-  padding-bottom: 14px;
-  border-bottom: 3px double var(--face-sh2);
+  margin-bottom: 20px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--face-sh2);   /* flat 1px chrome, like every other rule */
 }
 #home-titletext { min-width: 0; }
+/* state-of-the-archive line: catalogued / verified / published, as a quiet
+   readout under the wordmark. Numerals monospace, each figure a jump to where
+   it lives. Under-styled per the CAD ethos — no tiles, no meter. */
+.home-stats {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 14px;
+  margin-top: 7px;
+  font-size: 12px;
+  color: var(--face-sh2);
+}
+.hs-item {
+  border: 0;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+.hs-item:hover .hs-l { color: var(--cyan); }
+.hs-item:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; border-radius: 2px; }
+.hs-n { font-family: var(--mono); font-weight: bold; color: var(--ink); margin-right: 4px; }
+.home-stats .hs-sep { color: var(--face-sh); }
 #home-title h1 {
   margin: 0;
   font-family: "Roboto Slab", Georgia, "Times New Roman", serif;
@@ -898,8 +922,8 @@ input, textarea, [contenteditable="true"], .cell-edit,
   color: var(--ink-mut);
   margin-left: 2px;
 }
-#home-icon { flex: 0 0 auto; display: block; width: 64px; height: 64px; }
-@media (max-width: 560px) { #home-icon { width: 52px; height: 52px; } }
+#home-icon { flex: 0 0 auto; display: block; width: 48px; height: 48px; }
+@media (max-width: 560px) { #home-icon { width: 42px; height: 42px; } }
 #home-cols {
   display: grid;
   grid-template-columns: minmax(0, 1.15fr) minmax(0, 1.4fr) minmax(0, 0.85fr);
@@ -929,18 +953,6 @@ input, textarea, [contenteditable="true"], .cell-edit,
   padding-bottom: 5px;
   margin-bottom: 7px;
 }
-/* the review queue as an inline home pane, full width under the three columns */
-.home-reviews-card { margin-top: 16px; }
-.home-reviews-h { display: flex; align-items: center; justify-content: space-between; }
-.home-rv-resolved {
-  text-transform: none;
-  letter-spacing: 0;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  cursor: pointer;
-}
-#home-reviews { max-height: 360px; overflow: auto; }
 /* In-progress panel: a terse status readout over the freshest drafts —
    count column, label, muted breakdown on the right. Rows, not tiles. */
 .home-row {
@@ -1011,7 +1023,7 @@ input, textarea, [contenteditable="true"], .cell-edit,
 .home-more:hover { color: var(--cyan); }
 .home-act {
   display: flex;
-  align-items: baseline;
+  align-items: center;   /* center so an inline user chip adds no row height */
   gap: 6px;
   padding: 3px 2px;
   font-size: 12px;
@@ -1028,8 +1040,20 @@ input, textarea, [contenteditable="true"], .cell-edit,
 .home-act:focus-visible { outline: 2px solid var(--cyan); outline-offset: -2px; }
 .home-act:last-child { border-bottom: 0; }
 .home-who { font-weight: bold; color: var(--ink); white-space: nowrap; }
-.home-what { flex: 1 1 auto; min-width: 0; color: var(--ink); }
-.home-when { flex: 0 0 auto; color: var(--ink-mut); font-size: 10.5px; white-space: nowrap; }
+/* the phrase never shrinks (a clipped verb is unreadable); the item name below
+   absorbs the slack instead */
+.home-what { flex: 0 0 auto; color: var(--ink); white-space: nowrap; }
+/* the item acted on — title or review label; takes the slack and ellipsizes */
+.home-det {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-mut);
+}
+/* margin-left:auto keeps the time hard right even on rows with no item name */
+.home-when { flex: 0 0 auto; margin-left: auto; color: var(--ink-mut); font-size: 10.5px; white-space: nowrap; }
 /* a feed row discloses its member events: exact times, exact items */
 .home-act { cursor: pointer; }
 .home-act-arrow { flex: 0 0 10px; color: var(--ink-mut); font-size: 9px; }
@@ -1042,24 +1066,15 @@ input, textarea, [contenteditable="true"], .cell-edit,
 /* --- Home: contributors --- */
 .home-user {
   display: flex;
-  align-items: baseline;
+  align-items: center;   /* center so an inline user chip adds no row height */
   gap: 6px;
   padding: 3px 2px;
   font-size: 12px;
   border-bottom: var(--border-w, 1px) solid var(--canvas-line);
 }
 .home-user:last-child { border-bottom: 0; }
-.hu-name { font-weight: bold; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.hu-you {
-  flex: 0 0 auto;
-  color: var(--ink-mut);
-  font-size: 9px;
-  letter-spacing: 0.5px;
-  text-transform: uppercase;
-  border: var(--border-w, 1px) solid var(--face-sh);
-  border-radius: var(--radius);
-  padding: 0 3px;
-}
+/* .hu-name / .hu-you are now folded into the user chip (.uchip) rendered in
+   their place; the meta columns stay. */
 .hu-meta { flex: 1 1 auto; text-align: right; color: var(--ink-mut); font-size: 10.5px; white-space: nowrap; }
 .hu-when { flex: 0 0 auto; color: var(--ink-mut); font-size: 10.5px; white-space: nowrap; }
 
@@ -1102,6 +1117,113 @@ button.ri-label:focus-visible { outline: 2px solid var(--blue); outline-offset: 
 .ric-text { font-size: 11.5px; overflow-wrap: anywhere; }
 .ri-add { display: flex; gap: 6px; margin-top: 8px; }
 .ri-add .ri-comment-input { flex: 1 1 auto; min-width: 0; }
+
+/* --- contributor identity: micro-avatars + name chips ---
+   A chip is one clickable target: a tiny generated avatar + the name on a
+   faint wash of the user's colour. Sized in em with no vertical padding, so it
+   drops into any row that already shows a name without adding line height. */
+.uav {
+  width: 1.05em;
+  height: 1.05em;
+  flex: 0 0 auto;
+  vertical-align: -0.19em;   /* centre on text without lifting the line box */
+  border-radius: 3px;
+  pointer-events: none;      /* clicks fall through to the chip button */
+}
+.uav.uav-lg { width: 40px; height: 40px; border-radius: 9px; vertical-align: middle; }
+.uchip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.34em;
+  max-width: 100%;
+  min-width: 0;
+  padding: 0 0.42em 0 0.22em;
+  border: 0;
+  border-radius: 0.85em;
+  background: color-mix(in srgb, var(--uav-c) 12%, transparent);
+  color: inherit;
+  font: inherit;
+  line-height: 1.25;
+  text-align: left;
+  vertical-align: -0.28em;   /* sit inline (ri-meta, comments) without lifting the line */
+  cursor: pointer;
+}
+.uchip:hover { background: color-mix(in srgb, var(--uav-c) 22%, transparent); }
+.uchip:focus-visible { outline: 2px solid var(--uav-c); outline-offset: 1px; }
+/* the inert variant sits inside an already-clickable row, so it neither claims
+   its own hover nor fights the row's cursor */
+.uchip-plain { cursor: inherit; }
+.uchip-plain:hover { background: color-mix(in srgb, var(--uav-c) 12%, transparent); }
+.uchip .uav { vertical-align: middle; }
+.uchip-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+.uchip-you {
+  flex: 0 0 auto;
+  font-size: 0.78em;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--face-sh2);
+}
+/* per-context sizing: let the chip shrink, never let it crowd the row */
+.uchip.home-who { flex: 0 0 auto; max-width: 34%; }
+.uchip.hu-chip { flex: 0 1 auto; }
+/* review comments set no font-size on any ancestor, so the chip would inherit
+   the 13px body base; pin it to the 11px the old .ric-author label used */
+.uchip.ric-chip { font-size: 11px; }
+
+/* --- contributor profile popup --- */
+#uprof-overlay { z-index: 58; }   /* above home/review, below auth (62)/confirm (90) */
+#uprof-body { padding: var(--dlg-pad-y) var(--dlg-pad-x) var(--dlg-pad-x); }
+.uprof-head { display: flex; gap: 12px; align-items: center; }
+.uprof-avatar { flex: 0 0 auto; display: inline-flex; }
+.uprof-idwrap { min-width: 0; }
+.uprof-nameline { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.uprof-name { font-size: 16px; font-weight: 700; color: var(--ink); overflow-wrap: anywhere; }
+.uprof-you {
+  flex: 0 0 auto;
+  font-size: 9px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--face-sh2);
+  border: 1px solid var(--face-sh);
+  border-radius: var(--radius);
+  padding: 0 3px;
+}
+.uprof-email { margin-top: 2px; font-size: 12px; color: var(--face-sh2); font-family: var(--mono); overflow-wrap: anywhere; }
+.uprof-stats { margin-top: 4px; font-size: 12px; color: var(--face-sh2); }
+.uprof-h {
+  margin: 14px 0 6px;
+  padding-bottom: 3px;
+  font-size: 11px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--face-sh2);
+  border-bottom: 1px solid var(--canvas-line);
+}
+.uprof-recent { max-height: 240px; overflow: auto; }
+.uprof-recent:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; border-radius: var(--radius); }
+.uprof-ev {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 3px 0;
+  font-size: 12px;
+  border-bottom: 1px solid var(--canvas-line);
+}
+.uprof-ev:last-child { border-bottom: 0; }
+.uprof-ev-txt { flex: 1 1 auto; min-width: 0; color: var(--ink); overflow-wrap: anywhere; }
+.uprof-ev-when { flex: 0 0 auto; color: var(--face-sh2); font-size: 10.5px; white-space: nowrap; }
+
+/* settings account readout: quiet identity line */
+.set-acct-name { font-weight: 600; }
+.set-acct-email { color: var(--face-sh2); }
+
+/* --- Info tab: the console --- */
 
 /* --- Info tab: console + database resources --- */
 #infotab { flex-direction: column; gap: 0; padding: 6px; }
@@ -1626,13 +1748,10 @@ main {
   font: 11px var(--ui);
 }
 .remarks-rail-toggle:hover { background: var(--face-active); }
-.remarks-rail-arrow { color: var(--remarks-accent); font-size: 10px; }
-.remarks-rail-label {
-  writing-mode: vertical-rl;
-  text-orientation: mixed;
-  letter-spacing: 1.2px;
-  font-weight: 600;
-}
+.remarks-rail-arrow { color: var(--remarks-accent); }
+.remarks-rail-arrow svg { width: 12px; height: 12px; }
+.remarks-rail-icon { color: var(--ink); }
+.remarks-rail-icon svg { width: 18px; height: 18px; }
 .remarks-count {
   min-width: 19px;
   height: 19px;
@@ -1659,15 +1778,11 @@ main {
   min-width: 0;
   flex: 1;
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
 }
-#remarks-heading {
-  margin: 0;
-  color: var(--ink);
-  font: 600 13px/1.2 var(--ui);
-  letter-spacing: 0.5px;
-}
+.remarks-heading-icon { display: inline-flex; color: var(--remarks-accent); }
+.remarks-heading-icon svg { width: 17px; height: 17px; }
 #remarks-total { margin-left: 0; }
 .remarks-collapse { width: 25px; padding-left: 0; padding-right: 0; flex: none; }
 .remarks-filter-row {
@@ -1700,6 +1815,7 @@ main {
   text-transform: uppercase;
 }
 .remarks-group-count { margin-left: auto; font-weight: normal; }
+.remarks-items { margin: 0; padding: 0; list-style: none; }
 .remarks-item {
   margin: 5px 0 0;
   border: 1px solid var(--face-sh);
@@ -1708,27 +1824,46 @@ main {
   background: var(--face-hi);
   overflow: hidden;
 }
-.remarks-open-item {
-  width: 100%;
+.remarks-disclosure { display: block; }
+.remarks-item-summary {
+  position: relative;
   display: block;
-  padding: 8px 9px 6px;
-  border: 0;
-  background: transparent;
+  padding: 8px 9px 6px 25px;
   color: var(--ink);
-  text-align: left;
   cursor: pointer;
   font-family: var(--ui);
+  list-style: none;
 }
-.remarks-open-item:hover:not(:disabled) { background: var(--face-active); }
-.remarks-open-item:disabled { cursor: default; opacity: 0.78; }
+.remarks-item-summary::-webkit-details-marker { display: none; }
+.remarks-item-summary::before {
+  content: "";
+  position: absolute;
+  top: 12px;
+  left: 10px;
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid var(--remarks-accent);
+  border-bottom: 1.5px solid var(--remarks-accent);
+  transform: rotate(-45deg);
+  transition: transform 100ms ease;
+}
+.remarks-disclosure[open] > .remarks-item-summary::before { transform: rotate(45deg); }
+.remarks-item-summary:hover { background: var(--face-active); }
+.remarks-summary-title { display: flex; align-items: baseline; gap: 5px; min-width: 0; }
 .remarks-item-title {
-  display: block;
+  display: inline-block;
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 12px;
   font-weight: 600;
+}
+.remarks-comment-count {
+  flex: 0 0 auto;
+  color: var(--ink-mut);
+  font: 10px/1.2 var(--mono);
 }
 .remarks-item-meta {
   display: block;
@@ -1737,6 +1872,7 @@ main {
   font-size: 10px;
   line-height: 1.35;
 }
+.remarks-item-body { padding: 0 9px 7px 25px; }
 .remarks-reason {
   display: block;
   margin-top: 6px;
@@ -1746,20 +1882,27 @@ main {
   overflow-wrap: anywhere;
 }
 .remarks-reason.empty { padding: 0; text-align: left; letter-spacing: 0; font-style: italic; color: var(--ink-mut); }
+.remarks-thread { margin-top: 7px; }
+.remarks-comment {
+  margin-top: 5px;
+  padding: 3px 0 3px 8px;
+  border-left: 2px solid var(--face-sh);
+}
+.remarks-comment-author { font-size: 10.5px; font-weight: 600; }
+.remarks-comment-when { margin-left: 6px; color: var(--ink-mut); font-size: 9.5px; }
+.remarks-comment-text { margin-top: 1px; font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
+.remarks-no-comments { margin-top: 7px; color: var(--ink-mut); font-size: 10.5px; font-style: italic; }
+.remarks-reply { display: flex; align-items: center; gap: 4px; margin-top: 7px; }
+.remarks-reply-input { min-width: 0; flex: 1 1 auto; }
 .remarks-item-actions {
   min-height: 28px;
   display: flex;
   align-items: center;
   gap: 5px;
-  padding: 3px 6px 5px 9px;
+  padding: 4px 6px 5px 25px;
+  border-top: 1px solid color-mix(in srgb, var(--face-sh) 65%, transparent);
 }
-.remarks-review-tag {
-  color: var(--remarks-accent);
-  font-size: 9px;
-  letter-spacing: 0.5px;
-  text-transform: uppercase;
-}
-.remarks-item-actions .remarks-edit { margin-left: auto; }
+.remarks-item-actions .remarks-resolve { margin-left: auto; }
 .remarks-editor { padding: 8px 9px 9px; }
 .remarks-editor label { display: block; margin-bottom: 5px; }
 .remarks-editor textarea {
@@ -1781,7 +1924,9 @@ main {
 }
 #remarks-sidebar button:focus-visible,
 #remarks-sidebar select:focus-visible,
-#remarks-sidebar textarea:focus-visible {
+#remarks-sidebar textarea:focus-visible,
+#remarks-sidebar input:focus-visible,
+#remarks-sidebar summary:focus-visible {
   outline: 2px solid var(--blue);
   outline-offset: 1px;
 }
@@ -2277,6 +2422,28 @@ a.badge:hover { text-decoration: underline; }
 .build-item.attention.active {
   background: rgba(155, 89, 182, 0.26);
   box-shadow: inset 3px 0 0 #9b59b6;
+}
+.ocr-book.attention { background: rgba(155, 89, 182, 0.16); }
+.ocr-book.attention.active {
+  background: rgba(155, 89, 182, 0.26);
+  box-shadow: inset 3px 0 0 #9b59b6;
+}
+.rw-pagebtn.attention {
+  background: rgba(155, 89, 182, 0.2);
+  border-color: #9b59b6;
+  box-shadow: inset 3px 0 0 #9b59b6;
+}
+.rw-pagebtn.attention.active { background: rgba(155, 89, 182, 0.3); }
+.ocr-pgrow.attention,
+.an-fac-page.attention { background: rgba(155, 89, 182, 0.12); }
+.ocr-pgrow.attention { box-shadow: inset 3px 0 0 #9b59b6; }
+.an-fac-page.attention { box-shadow: inset 3px 0 0 #9b59b6; }
+.publish-tree-node.attention > .publish-tree-row {
+  background: rgba(155, 89, 182, 0.16);
+  box-shadow: inset 3px 0 0 #9b59b6;
+}
+.publish-tree-node.attention.selected > .publish-tree-row {
+  background: rgba(155, 89, 182, 0.26);
 }
 
 /* verified-source status: yellow = draft entry in the editor, green = done */
@@ -3586,7 +3753,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   align-items: center;
   margin-bottom: 10px;
 }
-#theme-select, #font-select, #font-ui-select { max-width: 280px; }
+#ui-scale-select { max-width: 280px; }
 /* labelled slider (Experimental › sharpening amount) */
 .set-slider-row {
   display: flex;
@@ -3849,6 +4016,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 }
 #ocr-side {
   width: 280px;
+  min-width: 260px;
   flex: none;
   display: flex;
   flex-direction: column;
@@ -4202,8 +4370,33 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   box-shadow: 0 0 0 1px var(--amber);
 }
 
-/* builds sidebar tabs (Pending / Uploaded) */
-#builds-tabs .pane-tab { padding: 2px 8px; }
+/* Volume metadata is a title prefix everywhere, but stays visually separate
+   so it can never be mistaken for part of the stored title. */
+.book-title-display {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+  max-width: 100%;
+  vertical-align: baseline;
+}
+.book-title-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.volume-title-tag {
+  flex: none;
+  display: inline-block;
+  padding: 0 4px;
+  border: var(--border-w, 1px) solid currentColor;
+  border-radius: var(--radius);
+  color: var(--cyan);
+  background: var(--face-hi);
+  font: 600 0.72em/1.4 var(--ui);
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
 
 #ocr-pages {
   flex: 1;
@@ -4715,7 +4908,10 @@ body[data-theme] .drafting::-webkit-scrollbar {
 
 /* --- Workbench sidebar: whole-sidebar horizontal collapse (mirrors Publish) -- */
 #ocr-side-toggle { flex: none; width: 22px; padding-left: 0; padding-right: 0; }
-#wb-split.wb-side-collapsed #ocr-side { width: 34px !important; }
+#wb-split.wb-side-collapsed #ocr-side {
+  width: 34px !important;
+  min-width: 34px;
+}
 #wb-split.wb-side-collapsed #ocr-side > :not(#builds-tabs),
 #wb-split.wb-side-collapsed #builds-tabs > :not(#ocr-side-toggle),
 #wb-split.wb-side-collapsed #ocr-splitter { display: none; }
@@ -5591,6 +5787,81 @@ tr.proc-row > td.proc-diff-old { background: color-mix(in srgb, var(--red) 22%, 
 }
 tr.proc-alt-old .proc-srctag { text-decoration: none; }
 
+.proc-manual-pages {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+  color: var(--ink-soft);
+  font-size: 11px;
+}
+
+/* Keyboard-first Smart Scan title-page picker. */
+.smartscan-mark-win {
+  width: min(1120px, calc(100vw - 34px));
+  height: min(820px, calc(100vh - 34px));
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+.smartscan-mark-bar { gap: 10px; }
+.smartscan-mark-left {
+  margin-left: auto;
+  color: var(--ink-soft);
+  font: 11px var(--mono);
+}
+.smartscan-mark-body {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 280px;
+  background: var(--face-sh);
+}
+.smartscan-mark-preview {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: color-mix(in srgb, var(--ink) 9%, var(--face-sh));
+}
+.smartscan-mark-preview img {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  background: #fff;
+  box-shadow: 0 3px 18px color-mix(in srgb, #000 28%, transparent);
+}
+.smartscan-mark-preview img.marked {
+  outline: 4px solid var(--amber);
+  outline-offset: 3px;
+}
+.smartscan-mark-controls {
+  min-width: 0;
+  padding: 16px;
+  border-left: 1px solid var(--line);
+  background: var(--face);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.smartscan-mark-book { font-weight: 600; overflow-wrap: anywhere; }
+.smartscan-mark-page { color: var(--ink-soft); font: 11px var(--mono); }
+.smartscan-mark-nav { display: grid; grid-template-columns: auto 1fr auto; gap: 6px; }
+.smartscan-mark-help { color: var(--ink-soft); font-size: 11px; line-height: 1.5; }
+.smartscan-mark-help kbd { font: 10px var(--mono); border: 1px solid var(--line); padding: 1px 4px; }
+.smartscan-mark-selected-head { margin-top: 4px; font-weight: 600; }
+.smartscan-mark-selected { min-height: 28px; color: var(--ink-soft); overflow-wrap: anywhere; }
+.smartscan-mark-error { color: var(--red); font-size: 11px; }
+.smartscan-mark-actions { margin-top: auto; }
+@media (max-width: 720px) {
+  .smartscan-mark-body {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(260px, 1fr) auto;
+  }
+  .smartscan-mark-controls { border-left: 0; border-top: 1px solid var(--line); }
+}
+
 /* Right-click context menu items (reusing #popup-menu) */
 .pm-btn {
   display: block;
@@ -5655,7 +5926,7 @@ body[data-theme="slate"] {
 .build-item.volume-member { padding-left: 18px; }
 .tree-ico svg { width: 11px; height: 11px; }
 .publish-tree-row {
-  min-height: 20px;
-  padding: 0 5px 0 calc(3px + var(--tree-depth) * 12px);
+  min-height: 19px;
+  padding: 0 5px 0 calc(3px + var(--tree-depth) * 11px);
 }
-#publish-tree { font-size: 11.5px; }
+#publish-tree { font-size: 11px; }

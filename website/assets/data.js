@@ -13,6 +13,35 @@
 const CFG = window.WHL_CONFIG || {};
 export const usingCloud = Boolean(CFG.supabaseUrl && CFG.supabaseAnonKey);
 
+// Presentation-only volume title formatting shared by every public-library
+// view. The volume remains metadata; this helper only emits escaped display
+// markup and never rewrites the stored title.
+const titleEsc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
+
+export function bookVolumeValue(volume) {
+  if (!volume) return "";
+  for (const value of [volume.volume, volume.volume_number]) {
+    const number = String(value ?? "").trim();
+    if (number) return number;
+  }
+  return "";
+}
+
+export function bookTitleText(volume, fallback = "Untitled") {
+  const title = String((volume && volume.title) || fallback || "").trim();
+  const number = bookVolumeValue(volume);
+  return number ? `Vol. ${number} ${title}` : title;
+}
+
+export function bookTitleHtml(volume, fallback = "Untitled") {
+  const title = String((volume && volume.title) || fallback || "").trim();
+  const number = bookVolumeValue(volume);
+  return `<span class="book-title-display">${number
+    ? `<span class="volume-title-tag">Vol. ${titleEsc(number)}</span>`
+    : ""}<span class="book-title-text">${titleEsc(title)}</span></span>`;
+}
+
 // The separator used to render a category path (root -> leaf) as one string.
 // It matches the desktop publish step. Category filtering is a path-prefix
 // test over `category_paths` (rowInCat below) in both modes, so selecting
@@ -334,17 +363,18 @@ export async function facetSource() {
   return _facetRows;
 }
 
-/** Title matches for the search-box autocomplete: [{slug, title, authors, year}]. */
+/** Title matches for autocomplete: [{slug, title, volume, authors, year}]. */
 export async function suggestTitles(q, limit = 6) {
   const words = norm(q);
   if (!words) return [];
   if (!usingCloud) {
     const rows = (await fixture()).filter((v) => norm(v.title).includes(words));
     return sortRows(rows, "title").slice(0, limit)
-      .map((v) => ({ slug: v.slug, title: v.title, authors: v.authors, year: v.year }));
+      .map((v) => ({ slug: v.slug, title: v.title, volume: v.volume,
+        authors: v.authors, year: v.year }));
   }
   return rest(
-    `volumes?select=slug,title,authors,year&title=ilike.*${encodeURIComponent(likeEscape(q))}*` +
+    `volumes?select=slug,title,volume,authors,year&title=ilike.*${encodeURIComponent(likeEscape(q))}*` +
     `&order=title.asc&limit=${limit}`
   );
 }

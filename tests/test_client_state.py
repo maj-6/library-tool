@@ -98,6 +98,48 @@ def test_put_round_trip_whitelists_keys_and_stamps_updated_at(client, data_root)
     assert on_disk == state
 
 
+def test_legacy_azure_key_never_leaves_client_state_api(client, data_root):
+    """Retiring a provider must not reclassify its stored credential as a pref."""
+    _reset(data_root)
+    path = _state_path(data_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "settings": {"theme": "dark", "ocrAzureKey": "legacy-secret"},
+    }), encoding="utf-8")
+
+    # GET is safe even before the startup migration repairs the legacy file.
+    assert client.get(URL).get_json()["settings"] == {"theme": "dark"}
+
+    # A normal write strips the retired secret from the persisted blob too.
+    response = client.put(URL, json={"settings": {
+        "theme": "light", "ocrAzureKey": "must-not-persist",
+    }})
+    assert response.status_code == 200
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["settings"] == {"theme": "light"}
+
+
+def test_legacy_azure_key_migrates_to_local_secret_store(data_root):
+    import server
+
+    _reset(data_root)
+    server._SECRETS_PATH.unlink(missing_ok=True)
+    path = _state_path(data_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "settings": {"theme": "dark", "ocrAzureKey": "legacy-secret"},
+    }), encoding="utf-8")
+
+    server._migrate_secrets_from_client_state()
+
+    assert json.loads(path.read_text(encoding="utf-8"))["settings"] == {
+        "theme": "dark",
+    }
+    assert json.loads(server._SECRETS_PATH.read_text(encoding="utf-8"))[
+        "ocrAzureKey"] == "legacy-secret"
+    server._SECRETS_PATH.unlink(missing_ok=True)
+
+
 def test_partial_put_replaces_only_the_sent_top_level_key(client, data_root):
     _reset(data_root)
     client.put(

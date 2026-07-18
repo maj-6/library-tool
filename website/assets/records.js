@@ -1,7 +1,7 @@
 // Shared catalogue-record markup, used by both browse.js (the results list)
 // and author.js (an author's bibliography) so the two never drift apart.
 
-import { pdfHref, thumbHref, catText } from "./data.js";
+import { pdfHref, thumbHref, catText, bookTitleHtml } from "./data.js";
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -54,7 +54,7 @@ export function renderRecord(v) {
   return `<li class="record">
     ${thumbImg}
     <div class="rec-body">
-      <h3 class="rec-title"><a href="book.html?slug=${slug}">${esc(v.title)}</a></h3>
+      <h3 class="rec-title"><a href="book.html?slug=${slug}">${bookTitleHtml(v)}</a></h3>
       ${v.subtitle ? `<div class="rec-author">${esc(v.subtitle)}</div>` : ""}
       ${v.authors ? `<div class="rec-author">${esc(v.authors)}</div>` : ""}
       ${imprint ? `<div class="rec-imprint">${imprint}</div>` : ""}
