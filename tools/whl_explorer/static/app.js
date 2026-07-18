@@ -1098,6 +1098,8 @@ const ICONS = {
   // a magic wand with a star tip: the smart-check trigger
   wand: _SVG('<path d="M2.4 13.6 L9.4 6.6"/><path d="M12 1.6 L12.7 3.3 L14.4 4 L12.7 4.7 L12 6.4 L11.3 4.7 L9.6 4 L11.3 3.3 Z"/><path d="M13.4 7.8 v1.8 M12.5 8.7 h1.8"/>'),
   close: _SVG('<path d="M4.2 4.2 L11.8 11.8 M11.8 4.2 L4.2 11.8"/>'),
+  // a square: halt running work (distinct from `remove`, which un-stages)
+  stop: _SVG('<rect x="4.4" y="4.4" width="7.2" height="7.2"/>'),
 };
 
 // Glyphs that stand in for a tag's text label. Sized to sit inside a 15px
@@ -10983,6 +10985,7 @@ function setWorkbenchPhase(phase, persist) {
     saveSettings();
   }
   applyWorkbenchGates();
+  renderWorkbenchChips();   // the chips' current-phase marker follows
   // entering a phase refreshes its panes, as its old tab switch did
   if (phase === "record") renderBuildEditor();
   else if (phase === "source") {
@@ -11007,19 +11010,52 @@ function wbLockNote(phase) {
     return "This entry is a draft — mark it verified (the check above) to " +
       "enable publishing and the bundle.";
   }
-  return "This entry is a draft — verify it in the Publish phase to unlock " +
+  return "This entry is a draft — mark it verified to unlock " +
     (phase === "text" ? "text work." : "analysis.");
+}
+
+// Verification is a save action: it persists every field and the description,
+// not just the badge, and removing it relocks Text/Knowledge — both said out
+// loud in the status line, since the side effects were previously silent.
+async function setVerified(on) {
+  const b = currentBuild();
+  if (!b) return false;
+  el("b-ready").classList.toggle("active", !!on);
+  el("b-verified-tag").hidden = !on;
+  const saved = await saveBuildFields();
+  if (saved) {
+    status(on ? "VERIFIED — RECORD SAVED"
+              : "VERIFICATION REMOVED — Text and Knowledge relock");
+  } else {
+    const cur = currentBuild();
+    const verified = cur && (cur.status === "ready" || cur.status === "uploaded");
+    el("b-ready").classList.toggle("active", !!verified);
+    el("b-verified-tag").hidden = !verified;
+  }
+  renderBuildsList();
+  renderWorkbench();      // gates + chips follow the new status immediately
+  return saved;
+}
+
+// a locked phase offers the unlock where the user hits the wall, instead of
+// sending them on the Publish detour (two phase switches per book)
+function renderLockNote(id, note) {
+  const host = el(id);
+  host.hidden = !note;
+  if (!note) { host.textContent = ""; return; }
+  host.innerHTML = esc(note) +
+    ` <button class="cad-btn tiny wb-verify-here" type="button" ` +
+    `data-tip="Same action as the Publish-phase check — saves the whole ` +
+    `record and unlocks Text and Knowledge">Mark verified</button>`;
 }
 
 function applyWorkbenchGates() {
   const b = currentBuild();
   const textNote = wbLockNote("text");
-  el("wb-text-locked").hidden = !textNote;
-  el("wb-text-locked").textContent = textNote;
+  renderLockNote("wb-text-locked", textNote);
   el("ocr-document-workspace").hidden = !!textNote;
   const knowNote = wbLockNote("knowledge");
-  el("wb-knowledge-locked").hidden = !knowNote;
-  el("wb-knowledge-locked").textContent = knowNote;
+  renderLockNote("wb-knowledge-locked", knowNote);
   el("ocr-analysis-workspace").hidden = !!knowNote;
   const pubNote = b ? wbLockNote("publish") : "Select a book on the left.";
   el("wb-publish-locked").hidden = !pubNote;
@@ -11083,11 +11119,21 @@ function renderWorkbenchChips() {
   const b = currentBuild();
   if (!b) { host.innerHTML = ""; return; }
   const r = wbReadiness(b);
+  // the chips are the fastest phase navigation but read as pure status:
+  // the tooltip names the destination, and the first unfinished phase
+  // carries a quiet "next" underline so "what now?" resolves at a glance
+  const next = WB_PHASES.find((p) => {
+    const s = (r[p] || {}).state;
+    return s === "todo" || s === "warn";
+  });
+  const cur = wbActivePhase();
   host.innerHTML = WB_PHASES.map((p) => {
     const c = r[p] || { state: "todo", note: "" };
-    return `<button class="wb-chip ${c.state}" type="button" data-phase="${p}" ` +
-      `data-tip="${esc(c.note || "")}">${p[0].toUpperCase()}${p.slice(1)}${
-      c.badge ? ` ${c.badge}` : ""}</button>`;
+    const label = p[0].toUpperCase() + p.slice(1);
+    const tip = c.note ? `${c.note} — open ${label}` : `Open ${label}`;
+    return `<button class="wb-chip ${c.state}${p === next ? " next" : ""}${
+      p === cur ? " cur" : ""}" type="button" data-phase="${p}" ` +
+      `data-tip="${esc(tip)}">${label}${c.badge ? ` ${c.badge}` : ""}</button>`;
   }).join("");
 }
 
@@ -12587,12 +12633,10 @@ function initAnalyze() {
   el("b-analyze").addEventListener("click", () => {
     const b = currentBuild();
     if (!b) return;
-    if (!anAnalyzable(b)) {
-      el("build-msg").textContent = "mark it verified first";
-      return;
-    }
     state.anSel = b.id;
     if (ocrState.book !== b.id) selectOcrBook(b.id);
+    // drafts land on the locked note, which now carries its own
+    // "Mark verified" unlock — no dead-end message, no Publish detour
     setWorkbenchPhase("knowledge", true);
   });
 }
@@ -14730,21 +14774,46 @@ function appendBuildListItem(list, b, grouped) {
 // it. This used to be "Upload to WHL", which flipped a status field and sent
 // nothing anywhere -- there was no WHL write API to call.
 async function uploadBuild() {
+  if (!currentBuild()) return;
+  // Publishing is a decision about the record AS SHOWN, but the guards and
+  // the upload read SAVED state — flush unsaved edits first, or picking
+  // Rights and clicking publish either falsely blocks ("Set Rights before
+  // publishing" under a visible selection) or silently publishes the old
+  // value. Same rationale as the verify toggle: publish decisions are saves.
+  if (buildIsDirty() && !(await saveBuildFields())) return;
   const b = currentBuild();
   if (!b) return;
+  // guards report beside the button that was clicked, not only in the head
+  // bar at the opposite corner
+  const guard = (msg) => {
+    el("build-msg").textContent = msg;
+    const pm = el("publish-msg");
+    if (pm) pm.textContent = msg;
+  };
   if (b.status !== "ready") {
-    el("build-msg").textContent = "Only verified entries can be published";
+    guard("Only verified entries can be published");
     return;
   }
   if (!(b.pdf_file || "").trim()) {
-    el("build-msg").textContent = "Attach the PDF before publishing";
+    guard("Attach the PDF before publishing");
     return;
   }
   // convenience only — the publish route enforces this server-side
   if (!(b.rights || "").trim()) {
-    el("build-msg").textContent = "Set Rights before publishing";
+    guard("Set Rights before publishing");
     return;
   }
+  guard("");
+  // a public, hard-to-reverse action gets one look at what it ships —
+  // this is not the quick-single-delete case the no-confirm preference covers
+  const rightsLabel = (el("b-rights").selectedOptions[0] || {}).textContent || b.rights;
+  if (!(await confirmDialog({
+    title: "Publish to the library",
+    message: `Publish "${b.title || b.id}"?\nRights: ${rightsLabel}\n` +
+             `PDF: ${b.pdf_file}`,
+    confirmLabel: "Publish",
+    cancelLabel: "Not yet",
+  }))) return;
   let res;
   try {
     res = await (await fetch("/api/volumes/publish", {
@@ -14998,7 +15067,12 @@ async function saveBuildFields(ev) {
     descState.id = id;
     descState.val = fields.description;
     buildDirty = false;
-    el("build-msg").textContent = "Saved";
+    // a save that demotes ready->draft relocks Text/Knowledge — say so
+    // instead of a generic Saved (the toggle-off + Save path was silent)
+    el("build-msg").textContent =
+      cur0 && cur0.status === "ready" && fields.status === "draft"
+        ? "Saved — verification removed; Text and Knowledge relock"
+        : "Saved";
     status(`BUILD SAVED :: ${fields.title}`);
     return true;
   } else {
@@ -16161,9 +16235,12 @@ function buildOcrKeymapLegend() {
   for (const k of ["1", "2", "3", "4", "5"]) {
     if (map[k]) parts.push(`<b>${k}</b> ${esc(SHORT[map[k]] || map[k])}`);
   }
+  // the one on-surface home for the page view's whole hidden keyboard layer:
+  // selection, ranges, staging, title, delete, clear all live here
   host.innerHTML = parts.length
-    ? `Hover a page and press a digit to stage its engine — ${parts.join(" · ")}` +
-      ` · <b>T</b> title page`
+    ? `click select · <b>Ctrl</b>+click range · digit stages selection (else hover) — ` +
+      `${parts.join(" · ")} · <b>T</b> title · <b>Del</b> delete pages · ` +
+      `<b>Esc</b> clear`
     : "";
 }
 
@@ -16180,6 +16257,11 @@ function setOcrView(v) {
   el("ocr-furniture").hidden = v !== "pdf";    // …as is the furniture toggle
   el("ocr-pagenav").hidden = v !== "pdf";      // page jump/nav is page-view only
   el("ocr-keymap").hidden = v !== "pdf";       // digit->engine legend, page-view only
+  // page deletion acts on the page selection, which only exists in the page
+  // view — elsewhere the destructive button was a dead control
+  el("ocr-del-pages").hidden = v !== "pdf";
+  // the diff target only feeds the diff view; elsewhere it read as mystery state
+  el("ocr-diff-with").hidden = v !== "diff";
   if (v === "pdf") buildOcrKeymapLegend();
   el("ocr-layout").classList.toggle("active", ocrState.layout);
   el("ocr-furniture").classList.toggle("active", !!state.settings.ocrFurniture);
@@ -16904,6 +16986,9 @@ async function cancelJob(jobId) {
 }
 
 function renderOcrQueue() {
+  // the stage-all target follows the selection; the queue re-renders on
+  // every selection/staging change, so the scope line stays truthful
+  updateDefaultEngineSummary();
   const tbody = el("ocr-queue-rows");
   tbody.innerHTML = "";
   // Server registry rows first, enriched with the richer presentation this
@@ -17154,6 +17239,25 @@ function updateDefaultEngineSummary() {
   const analysis = TEXT_ANALYSIS_LABELS[state.settings.textAnalysisService] ||
     "Configured AI provider";
   host.textContent = `${ocr} / ${analysis}`;
+  // the drawer is Workbench-global but its stage-all acts on the CURRENT
+  // book's selected source — name the target where the button lives,
+  // and refuse (disabled) rather than error after the click
+  const add = el("ocr-queue-add");
+  if (!add) return;
+  const bid = ocrState.book;
+  const b = bid ? state.builds[bid] : null;
+  if (b) {
+    const d = ocrSelDoc();
+    const src = d && d.buildId === bid ? docSrcKey(d) : "primary";
+    const title = (b.title || bid).slice(0, 40);
+    host.textContent += ` · stages: ${title} / ${src}`;
+    add.dataset.tip =
+      `Stage every page of "${title}" (${src}) with ${ocr} — nothing runs until Submit`;
+    add.disabled = false;
+  } else {
+    add.dataset.tip = "Pick a book first — stage-all acts on the current book";
+    add.disabled = true;
+  }
 }
 
 function refreshDefaultEngineOptions() {
@@ -17370,6 +17474,7 @@ function stagedCountFor(bid) {
   return n;
 }
 
+let _lastStagedTotal = 0;
 function updateOcrStagedMsg() {
   const bid = ocrState.book;
   const n = bid ? stagedCountFor(bid) : 0;
@@ -17382,6 +17487,12 @@ function updateOcrStagedMsg() {
   const message = bits.join(" · ") + ((n || analysis) ? " — press Submit" : "");
   el("ocr-msg").textContent = message;
   if (el("an-page-msg")) el("an-page-msg").textContent = message;
+  // "press Submit" is an empty promise while Submit sits in the collapsed
+  // drawer — the first staged page opens it (without persisting the state,
+  // so the user's preferred drawer default survives)
+  const total = n + analysis;
+  if (total && !_lastStagedTotal) setJobsDrawer(true, false);
+  _lastStagedTotal = total;
   renderOcrQueue();
 }
 
@@ -17530,6 +17641,12 @@ function pollOcrJobs() {
             // statusErr already tees this into Info; keep the OCR pane useful
             // without requiring a tab switch as well.
             el("ocr-msg").textContent = errorDetail;
+          } else if (job.status === "done") {
+            // success was silent — the footer jobs chip disappears exactly
+            // when the news matters; say where the work goes next
+            status(`OCR COMPLETE :: ${j.book} — review in Text`);
+            el("ocr-msg").textContent = "OCR complete — review the text";
+            renderWorkbenchChips();   // the Text chip flips to Needs review
           }
           // finished pages (ok or errored) are no longer running
           for (const x of job.pages) {
@@ -17769,7 +17886,12 @@ function onOcrPagesClick(ev) {
 async function deleteSelectedPages() {
   const d = ocrSelDoc();
   const bid = d && d.buildId;
-  if (!bid || !ocrState.pageSel.size) return;
+  if (!bid) return;
+  if (!ocrState.pageSel.size) {
+    // a dead click on a danger button must say why, not silently no-op
+    el("ocr-msg").textContent = "Select pages first — click / Ctrl+click in the page view";
+    return;
+  }
   // the deletion hits the PDF the page view shows — the doc's own source;
   // the server renumbers only that source's OCR files
   const pdf = docPdf(d);
@@ -19386,8 +19508,9 @@ function initOcrTab() {
   });
   el("ocr-view-edit").addEventListener("click", () => setOcrView("edit"));
   el("ocr-view-diff").addEventListener("click", () => setOcrView("diff"));
-  el("ocr-view-pdf").addEventListener("click", () =>
-    setOcrView(ocrState.view === "pdf" ? "edit" : "pdf"));
+  // the segmented view control makes re-clicking the current mode a no-op
+  // expectation — the old pdf<->edit re-click toggle was a hidden behavior
+  el("ocr-view-pdf").addEventListener("click", () => setOcrView("pdf"));
   el("ocr-pages").addEventListener("input", onOcrPageInput);
   // page-view shortcuts: click selects, Ctrl+click extends the range,
   // digits STAGE the selection/hovered page, T marks a title page,
@@ -20505,26 +20628,24 @@ function init() {
   el("pdfm-overlay").addEventListener("mousedown", (ev) => {
     if (ev.target === el("pdfm-overlay")) closePdfModal();
   });
-  el("b-ready").addEventListener("click", async () => {
-    const b = currentBuild();
-    if (!b) return;
-    const on = el("b-ready").classList.toggle("active");
-    el("b-verified-tag").hidden = !on;
-    // Verification is a save action: persist every field and the description,
-    // not just the badge. This also records the active OCR file as verified.
-    const saved = await saveBuildFields();
-    if (!saved) {
-      const cur = currentBuild();
-      const verified = cur && (cur.status === "ready" || cur.status === "uploaded");
-      el("b-ready").classList.toggle("active", !!verified);
-      el("b-verified-tag").hidden = !verified;
-    }
-    renderBuildsList();
+  el("b-ready").addEventListener("click", () => {
+    setVerified(!el("b-ready").classList.contains("active"));
   });
-  el("build-new").addEventListener("click", () => {
+  // the locked-phase notes carry their own unlock (rendered per-gate)
+  document.getElementById("workbench").addEventListener("click", (ev) => {
+    if (ev.target.closest(".wb-verify-here")) setVerified(true);
+  });
+  // three doors to the same blank entry: the activity bar (muscle memory),
+  // the book-list bar (next to the list it feeds), and the empty state
+  const newBlankEntry = () => {
     setWorkbenchPhase("record", false);   // the blank form is the next step
     createBuild({}, "(blank)");
-  });
+  };
+  el("build-new").addEventListener("click", newBlankEntry);
+  const sideNew = el("build-new-side");
+  if (sideNew) sideNew.addEventListener("click", newBlankEntry);
+  const emptyNew = el("build-new-empty");
+  if (emptyNew) emptyNew.addEventListener("click", newBlankEntry);
   el("export-builds").addEventListener("click", exportBuilds);
   el("download-upload-list").addEventListener("click", downloadUploadList);
   for (const t of document.querySelectorAll("#builds-tabs .pane-tab")) {
@@ -20612,16 +20733,20 @@ function init() {
   el("build-form").addEventListener("input", () => { buildDirty = true; });
   el("build-save").addEventListener("click", saveBuildFields);
   el("build-delete").addEventListener("click", deleteBuild);
-  // Ctrl/Cmd+S saves the open entry (only on the Workbench's editor-derived
-  // phases — the Text phase keeps the OCR editor's own save flow)
+  // Ctrl/Cmd+S saves the open entry on the editor-derived phases, and the
+  // OCR document in the Text phase — the phase with the most typing had the
+  // reflex keystroke falling through to the browser's Save dialog
   document.addEventListener("keydown", (ev) => {
     if (!((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "s")) return;
     const tab = document.querySelector("#tabs .tab.active");
-    if (tab && tab.dataset.tab === "workbench" &&
-        ["record", "source", "publish"].includes(wbActivePhase()) &&
+    if (!tab || tab.dataset.tab !== "workbench") return;
+    if (["record", "source", "publish"].includes(wbActivePhase()) &&
         !el("build-editor").hidden) {
       ev.preventDefault();
       saveBuildFields();
+    } else if (wbActivePhase() === "text" && !el("ocr-save").disabled) {
+      ev.preventDefault();
+      ocrSaveDoc();
     }
   });
   el("upload-rows").addEventListener("click", (ev) => {

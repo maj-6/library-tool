@@ -633,6 +633,9 @@
                     data-tip="Already published to WHL">Uploaded</button>
             <span class="tool-count" id="upload-count"></span>
             <span class="bar-spacer"></span>
+            <button id="build-new-side" class="cad-btn tiny icon-btn" type="button"
+                    data-icon="plus" aria-label="New entry"
+                    data-tip="New blank entry"></button>
             <button id="ocr-filter-verified" class="cad-btn tiny icon-btn toggle" type="button"
                     data-icon="check" data-tip="Show verified books only"></button>
             <button id="ocr-side-toggle" class="cad-btn tiny" type="button"
@@ -679,7 +682,11 @@
           <!-- RECORD: the former Editor Entry pane + the verified-sources table -->
           <div class="wb-phase active" id="phase-record">
             <div id="upload-split">
-              <div id="build-empty" class="empty build-empty" hidden><span>Select a book on the left, or press <b>+</b> to create one.</span></div>
+              <div id="build-empty" class="empty build-empty" hidden><span>
+                Select a book on the left, or
+                <button id="build-new-empty" class="cad-btn tiny" type="button">New blank entry</button>
+                — or build one from a Verified source in the table below.
+              </span></div>
               <div id="build-editor" hidden>
                 <div class="mf-actions build-actions">
                   <button id="build-save" class="cad-btn icon-btn" type="button"
@@ -688,7 +695,7 @@
                           data-icon="trash" data-tip="Delete"></button>
                   <span class="act-sep"></span>
                   <button id="b-analyze" class="cad-btn tiny" type="button"
-                          data-tip="Open the Knowledge phase (verified entries only)">Analyze</button>
+                          data-tip="Open the Knowledge phase (verified entries only)">Knowledge</button>
                 </div>
 
                 <div id="btab-entry" class="pane-sub active">
@@ -902,53 +909,65 @@
             <p id="wb-text-locked" class="empty" hidden></p>
             <div id="ocr-document-workspace" class="ocr-workpane active">
             <div id="ocr-mainpane">
+          <!-- clustered so narrow windows wrap at cluster boundaries, never
+               between a label and its control: [view modes + pdf options]
+               [page nav + delete] [find/replace] | [doc disposition] -->
           <div class="pane-bar">
-            <button id="ocr-view-edit" class="cad-btn tiny icon-btn" type="button"
-                    data-icon="pencil" data-tip="Edit the OCR text"></button>
-            <button id="ocr-view-diff" class="cad-btn tiny icon-btn" type="button"
-                    data-icon="diff" data-tip="Compare against another document"></button>
-            <button id="ocr-view-pdf" class="cad-btn tiny icon-btn active" type="button"
-                    data-icon="pdfpage" data-tip="Show the PDF beside the text, page by page"></button>
-            <button id="ocr-layout" class="cad-btn tiny icon-btn" type="button"
-                    data-icon="layout"
-                    data-tip="Facsimile layout: the document's text at the position and scale it occupies on the page (read-only)"></button>
-            <button id="ocr-furniture" class="cad-btn tiny icon-btn active" type="button"
-                    data-icon="margins"
-                    data-tip="Page furniture in the facsimile: margin notes, running heads, page numbers, catchwords"></button>
-            <button id="ocr-del-pages" class="cad-btn tiny icon-btn danger" type="button"
-                    data-icon="trash" data-tip="Delete the selected pages from the PDF itself (a .bak.pdf backup is kept; OCR files are renumbered)"></button>
-            <span id="ocr-pagenav" class="ocr-pagenav" hidden>
-              <label class="tool-label" for="ocr-page-jump">Page</label>
-              <input id="ocr-page-jump" class="cad-input" type="text" inputmode="numeric"
-                     data-tip="Go to page — PageUp / PageDown / Home / End also navigate" />
-              <span class="tool-label" id="ocr-page-total"></span>
+            <span class="bar-cluster">
+              <span class="ctl-join">
+                <button id="ocr-view-edit" class="cad-btn tiny icon-btn" type="button"
+                        data-icon="pencil" data-tip="Edit the OCR text"></button>
+                <button id="ocr-view-diff" class="cad-btn tiny icon-btn" type="button"
+                        data-icon="diff" data-tip="Compare against another document"></button>
+                <button id="ocr-view-pdf" class="cad-btn tiny icon-btn active" type="button"
+                        data-icon="pdfpage" data-tip="Show the PDF beside the text, page by page"></button>
+              </span>
+              <select id="ocr-diff-with" class="cad-input" hidden data-tip="Compare against"></select>
+              <button id="ocr-layout" class="cad-btn tiny icon-btn" type="button"
+                      data-icon="layout"
+                      data-tip="Facsimile layout: the document's text at the position and scale it occupies on the page (read-only)"></button>
+              <button id="ocr-furniture" class="cad-btn tiny icon-btn active" type="button"
+                      data-icon="margins"
+                      data-tip="Page furniture in the facsimile: margin notes, running heads, page numbers, catchwords"></button>
             </span>
-            <select id="ocr-diff-with" class="cad-input" data-tip="Compare against"></select>
-            <span class="tb-sep"></span>
-            <span class="ctl-join">
-              <input id="ocr-find" class="cad-input" placeholder="find" />
-              <button id="ocr-find-next" class="cad-btn tiny icon-btn" type="button"
-                      data-icon="search" data-tip="Find next"></button>
+            <span class="bar-cluster">
+              <span id="ocr-pagenav" class="ocr-pagenav" hidden>
+                <label class="tool-label" for="ocr-page-jump">Page</label>
+                <input id="ocr-page-jump" class="cad-input" type="text" inputmode="numeric"
+                       data-tip="Go to page — PageUp / PageDown / Home / End also navigate" />
+                <span class="tool-label" id="ocr-page-total"></span>
+              </span>
+              <button id="ocr-del-pages" class="cad-btn tiny icon-btn danger" type="button"
+                      data-icon="trash" data-tip="Delete the selected pages from the PDF itself (a .bak.pdf backup is kept; OCR files are renumbered)"></button>
             </span>
-            <span class="ctl-join">
-              <input id="ocr-replace" class="cad-input" placeholder="replace" />
-              <button id="ocr-replace-all" class="cad-btn tiny icon-btn" type="button"
-                      data-icon="replace" data-tip="Replace all"></button>
+            <span class="act-sep"></span>
+            <span class="bar-cluster bar-cluster-find">
+              <span class="ctl-join">
+                <input id="ocr-find" class="cad-input" placeholder="find" />
+                <button id="ocr-find-next" class="cad-btn tiny icon-btn" type="button"
+                        data-icon="search" data-tip="Find next"></button>
+              </span>
+              <span class="ctl-join">
+                <input id="ocr-replace" class="cad-input" placeholder="replace" />
+                <button id="ocr-replace-all" class="cad-btn tiny icon-btn" type="button"
+                        data-icon="replace" data-tip="Replace all"></button>
+              </span>
             </span>
-            <span class="tb-sep"></span>
-            <label class="tool-label" for="ocr-quality">Quality</label>
-            <select id="ocr-quality" class="cad-input">
-              <option value="">&mdash;</option>
-              <option value="excellent">Excellent</option>
-              <option value="good">Good</option>
-              <option value="fair">Fair</option>
-              <option value="poor">Poor</option>
-            </select>
             <span class="bar-spacer"></span>
-            <button id="ocr-set-active" class="cad-btn tiny icon-btn" type="button"
-                    data-icon="star" data-tip="Set as the entry's active OCR"></button>
-            <button id="ocr-save" class="cad-btn tiny icon-btn" type="button"
-                    data-icon="save" data-tip="Save to the entry folder"></button>
+            <span class="bar-cluster">
+              <label class="tool-label" for="ocr-quality">Quality</label>
+              <select id="ocr-quality" class="cad-input">
+                <option value="">&mdash;</option>
+                <option value="excellent">Excellent</option>
+                <option value="good">Good</option>
+                <option value="fair">Fair</option>
+                <option value="poor">Poor</option>
+              </select>
+              <button id="ocr-set-active" class="cad-btn tiny icon-btn" type="button"
+                      data-icon="star" data-tip="Set as the entry's active OCR"></button>
+              <button id="ocr-save" class="cad-btn tiny icon-btn" type="button"
+                      data-icon="save" data-tip="Save to the entry folder"></button>
+            </span>
             <span class="tool-label" id="ocr-msg"></span>
           </div>
           <textarea id="ocr-editor" class="cad-input" spellcheck="false" hidden></textarea>
@@ -964,7 +983,7 @@
           <div class="wb-phase" id="phase-publish">
             <div class="mf-actions build-actions" id="wb-publish-actions" hidden>
               <button id="b-ready" class="cad-btn icon-btn toggle" type="button"
-                      data-icon="check" data-tip="Mark verified — the metadata is confirmed and the entry can be published (distinct from a verified source, which is a good scan matched to a record)"></button>
+                      data-icon="check" data-tip="Mark verified — the metadata is confirmed and the entry can be published (distinct from a verified source, which is a good scan matched to a record). Also saves the whole record."></button>
               <span id="b-verified-tag" class="foot-tag tag-verified" hidden>Verified</span>
               <span class="act-sep"></span>
               <label class="tool-label" for="b-rights">Rights
@@ -979,8 +998,11 @@
                 <option value="no-public-text">No public text</option>
               </select>
               <span class="act-sep"></span>
-              <button id="build-upload" class="cad-btn icon-btn" type="button"
-                      data-icon="export" data-tip="Publish to the Library Tool cloud — uploads the PDF and lists the volume on the website"></button>
+              <!-- the tab's one public, hard-to-reverse action earns a word,
+                   not just a glyph, and reports its guards right here -->
+              <button id="build-upload" class="cad-btn" type="button"
+                      data-tip="Publish to the Library Tool cloud — uploads the PDF and lists the volume on the website">Publish</button>
+              <span class="tool-label" id="publish-msg"></span>
             </div>
             <p id="wb-publish-locked" class="empty" hidden></p>
             <div id="wb-publish-cards" hidden>
@@ -1038,12 +1060,12 @@
                     data-icon="plus" data-tip="Stage every page with the default OCR engine (nothing runs until Submit)"></button>
             <button id="ocr-queue-clear" class="cad-btn tiny icon-btn" type="button"
                     data-icon="remove" data-tip="Un-stage all staged pages"></button>
-            <span class="tb-sep"></span>
+            <span class="act-sep"></span>
             <button id="ocr-submit" class="cad-btn tiny icon-btn" type="button"
                     data-icon="go" data-tip="Submit all staged pages — each runs the engine it was staged with"></button>
             <span class="bar-spacer"></span>
             <button id="ocr-queue-stop" class="cad-btn tiny icon-btn danger" type="button"
-                    data-icon="remove" data-tip="Stop all running OCR jobs after their current pages finish"></button>
+                    data-icon="stop" data-tip="Stop all running OCR jobs after their current pages finish"></button>
           </div>
           <div class="drafting" id="ocr-queue-wrap">
             <table class="grid" id="ocr-queue-table">
