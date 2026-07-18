@@ -7107,6 +7107,48 @@ function onRowContextMenu(ev) {
   if (items && items.length) { ev.preventDefault(); openProcMenu(ev.clientX, ev.clientY, items); }
 }
 
+// Right-click a Workbench book (the #ocr-books list): record actions for
+// builds. (No Smart Scan here yet — a build's staged alternatives have no
+// review surface in the Process tables; that lands with the build form's
+// alternatives panel.)
+function onBuildListContextMenu(ev) {
+  if (ev.target.closest("input, textarea, [contenteditable]")) return;
+  const li = ev.target.closest("li.build-item");
+  if (!li || !li.dataset.bid) return;
+  const bid = li.dataset.bid, b = state.builds[bid];
+  if (!b) return;
+  ev.preventDefault();
+  const attnTarget = attnTargetAtHover();   // resolves the hovered build item
+  const items = [
+    { label: "Copy record", fn: () => copyRecordText({
+      title: b.title || "", subtitle: b.subtitle || "", authors: b.authors || "",
+      year: b.year || "", publisher: b.publisher || "", city: b.publisher_city || "",
+      edition: b.edition || "", volume: b.volume || "", language: b.language || "" }) },
+  ];
+  const pdf = String(b.pdf_file || "").trim();
+  const src = String(b.pdf_source || "").trim();
+  const link = pdf || (/^https?:\/\//i.test(src) ? src : "");
+  if (link) items.push({ label: "Copy PDF link", fn: () => {
+    copyText(link); statusFlash(`COPIED PDF LINK: ${clipNote(link)}`);
+  } });
+  if (attnTarget) {
+    if (attnTarget.current)
+      items.push({ label: "Clear attention mark", fn: () => attnTarget.apply("") });
+    else {
+      const rect = attnTarget.node ? attnTarget.node.getBoundingClientRect() : null;
+      items.push({ label: "Mark needs attention…", fn: () => {
+        attnTarget.apply("1");
+        openAttnPop(attnTarget, rect);
+      } });
+    }
+  }
+  items.push({ label: "Delete book", danger: true, fn: () => {
+    selectWorkbenchBook(bid);   // deleteBuild acts on the selection; undoable
+    deleteBuild();
+  } });
+  openProcMenu(ev.clientX, ev.clientY, items);
+}
+
 function renderWhlTop() {
   // the WHL table owns the top pane only when selected there — a save from
   // the EDIT tab (reachable from the bottom pane) must not repaint it or
@@ -16441,6 +16483,7 @@ function init() {
   });
   el("checked-rows").addEventListener("contextmenu", onRowContextMenu);
   el("whltop-rows").addEventListener("contextmenu", onRowContextMenu);
+  el("ocr-books").addEventListener("contextmenu", onBuildListContextMenu);
   // right-click a column header: hide / show-all / full picker
   const checkedHead = el("checked-table").querySelector("thead");
   if (checkedHead) checkedHead.addEventListener("contextmenu",
