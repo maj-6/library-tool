@@ -8887,7 +8887,7 @@ def _sc_extract(ocr_text: str) -> tuple[dict, str]:
     mkey = str(_client_settings().get("mistralKey") or "").strip()
     if not mkey:
         raise RuntimeError("no AI key and no Mistral key — set one in "
-                           "Settings > AI or Settings > OCR")
+                           "Settings > Credentials")
     return capture.extract_bibliography(ocr_text, mkey), capture.EXTRACT_MODEL
 
 

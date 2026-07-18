@@ -27,13 +27,6 @@
   /* muted secondary text (labels, meta, dialog detail lines). Tuned to >=4.5:1
      on --face per theme -- do NOT use --face-sh2 (a border colour) for text. */
   --ink-mut: #62656b;
-  /* Two softer tiers, DERIVED so each theme's own --ink-mut drives them:
-     --ink-soft is the muted tier, --ink-faint one step fainter (mixed toward
-     the pane face) for superseded / struck-through text. Process mode used
-     both before they were ever defined, so those colours were dropped as
-     invalid and its three-tier reading order rendered flat. */
-  --ink-soft: var(--ink-mut);
-  --ink-faint: color-mix(in srgb, var(--ink-mut) 65%, var(--face));
   --input-bg: #ffffff;
   --input-ink: #22262c;
   --row-hover: #262b33;
@@ -844,6 +837,16 @@ body {
    Editable fields and the OCR / facsimile transcription panes keep native
    selection so scanned/transcribed text can still be selected and copied. */
 body { user-select: none; -webkit-user-select: none; }
+/* Two softer ink tiers, DERIVED from --ink-mut. Declared on BODY, not :root:
+   a custom property is substituted where it is DECLARED, and every theme sets
+   --ink-mut/--face on body[data-theme] — so deriving these in :root (= html)
+   would freeze them at the default palette and leave them illegible on the
+   dark themes. Process mode used both tokens before either was declared, so
+   those colours were dropped as invalid and its reading order rendered flat. */
+body {
+  --ink-soft: var(--ink-mut);
+  --ink-faint: color-mix(in srgb, var(--ink-mut) 65%, var(--face));
+}
 input, textarea, [contenteditable="true"], .cell-edit,
 .an-text, .ocr-pglayout, .ppub-record-page, #con-lines {
   user-select: text;

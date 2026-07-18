@@ -43,10 +43,13 @@ const VIEW_STATE_KEYS = new Set([
 // Credentials are never persisted client-side. They live in the server's
 // Host-guarded secrets store (/api/secrets); Mistral additionally syncs through
 // the signed-in user's private cloud profile so Book Capture can share it.
+// Must mirror server.py's _SECRET_KEYS. embedKey/imgGenKey were missing here
+// while the server accepted them, so persistSecrets filtered them out of a
+// save and partitionSettings let imgGenKey leak into localStorage/client_state.
 const SECRET_KEYS = new Set([
-  "aiKey", "mistralKey", "ocrClaudeKey", "ocrAzureKey", "ocrAwsKey",
+  "aiKey", "embedKey", "mistralKey", "ocrClaudeKey", "ocrAzureKey", "ocrAwsKey",
   "ocrAwsSecret", "supabaseKey", "supabaseAnonKey", "r2KeyId", "r2Secret",
-  "gsKeyFile",
+  "gsKeyFile", "imgGenKey",
 ]);
 function partitionSettings(s) {
   const prefs = {}, view = {};
@@ -153,6 +156,7 @@ const state = {
   publishClosed: new Set(),   // organizational folders closed from default-open
   publishDetails: new Map(),  // slug -> {about, notes} preview cache
   publishLoaded: false,
+  publishError: "",             // catalogue load failure, survives re-renders
   publishSource: "",
   publishWarning: "",
   publishSiteUrl: "",
@@ -1128,13 +1132,20 @@ const BICONS = {
 // consequences and make a poor label. Authored aria-labels and real visible
 // text always win; a glyph like ◀ or ✓ is not real text, so those get named too.
 function tipLabel(tip) {
-  return String(tip || "").split(/\s+—\s+|\.\s+|\n/)[0].trim().slice(0, 80);
+  const clause = String(tip || "").split(/\s+—\s+|\.\s+|\n/)[0].trim();
+  if (clause.length <= 80) return clause;
+  // cut on a word boundary: a mid-word fragment is a worse name than a long one
+  return clause.slice(0, 80).replace(/\s+\S*$/, "") + "…";
 }
 function nameFromTip(node) {
   if (!node || node.getAttribute("aria-label")) return;   // authored name wins
   const tag = node.tagName;
   if (tag !== "BUTTON" && tag !== "A" && tag !== "INPUT" &&
       node.getAttribute("role") !== "button") return;
+  // A form control's <label for> IS its accessible name, and aria-label would
+  // outrank it — naming these would REPLACE "Verbose logging (diagnostics)"
+  // with a truncated description. Only genuinely unlabelled controls qualify.
+  if (node.labels && node.labels.length) return;
   // letters/digits mean the control already reads as something; punctuation and
   // geometric glyphs (◀ ▶ ▾ ✓ ↶) do not
   if (/[\p{L}\p{N}]/u.test((node.textContent || "").trim())) return;
@@ -2555,7 +2566,17 @@ function initHome() {
     const k = row.dataset.gk;
     if (homeState.expanded.has(k)) homeState.expanded.delete(k);
     else homeState.expanded.add(k);
+    const hadFocus = document.activeElement === row;
     renderHome();
+    // renderHome rebuilds the feed's innerHTML, destroying the row that was
+    // just activated — without this a keyboard user is dropped to <body> and
+    // the next Tab restarts at the top of the document. Same pattern as
+    // renderReviewsInto / setRemarksCollapsed.
+    if (hadFocus) {
+      const again = el("home-activity")
+        .querySelector(`.home-act[data-gk="${CSS.escape(k)}"]`);
+      if (again) again.focus();
+    }
   });
   loadActivity();
 }
@@ -3550,7 +3571,8 @@ function renderSettings() {
                          ["set-sb-anon", "supabaseAnonKey"],
                          ["set-mistral-key", "mistralKey"],
                          ["set-imggen-provider", "imgGenProvider"],
-                         ["set-imggen-key", "imgGenKey"],
+                         // set-imggen-key is a SECRET: the credentials loop below
+                         // owns it. Two handlers on one field would race.
                          ["set-imggen-model", "imgGenModel"]]) {
     const n = el(id);
     n.value = state.settings[k] || "";
@@ -3575,25 +3597,23 @@ function renderSettings() {
     ];
     const note = el("cred-note");
     const secrets = await hydrateSecrets();
-    if (secrets === null) {
-      // A failed READ must not blank 13 password-dotted fields — with nothing
-      // visible in them that reads as "all my keys are gone". Leave whatever is
-      // on screen alone and say what actually happened.
-      if (note) {
-        note.textContent = "Could not read stored credentials — the local service " +
-          "may still be starting. Nothing was changed; reopen Settings to retry.";
-        note.hidden = false;
-      }
-      statusErr("CREDENTIALS :: could not be read");
-      return;
-    }
-    if (note) { note.hidden = true; note.textContent = ""; }
+    const setNote = (text) => {
+      if (!note) return;
+      note.textContent = text || "";
+      note.hidden = !text;
+    };
+    // Only the PAINTING depends on a successful read. The handlers must be
+    // bound either way: leaving these fields on the generic settings onchange
+    // would write a typed key into state.settings + localStorage instead of
+    // the secrets store — losing it, and leaking it out of the server-only path.
     for (const [id, k] of SECRET_FIELDS) {
       const n = el(id);
       if (!n) continue;
-      const v = secrets[k] || "";
-      n.value = v;
-      state.settings[k] = v;                 // in-memory only (client-side uses, e.g. master sync)
+      if (secrets) {
+        n.value = secrets[k] || "";
+        state.settings[k] = secrets[k] || "";   // in-memory only (e.g. master sync)
+        n.classList.remove("cred-bad");         // a fresh read supersedes an old failure
+      }
       n.onchange = async () => {
         const val = n.value.trim();
         // was fire-and-forget: a 500 or a restarting sidecar silently discarded
@@ -3602,16 +3622,26 @@ function renderSettings() {
         try {
           await persistSecrets({ [k]: val });
           n.classList.remove("cred-bad");
-          if (note) { note.hidden = true; note.textContent = ""; }
+          // the note is shared, so only retract it once nothing is still failing
+          if (!document.querySelector(".cad-input.cred-bad")) setNote("");
         } catch (e) {
           n.classList.add("cred-bad");
-          if (note) {
-            note.textContent = `That credential was NOT saved (${e.message || "the local service refused it"}). It is still only in this box.`;
-            note.hidden = false;
-          }
+          const field = (document.querySelector(`label[for="${id}"]`) || {}).textContent;
+          setNote(`${(field || "That credential").trim()} was NOT saved ` +
+            `(${e.message || "the local service refused it"}). It is still only in this box.`);
           statusErr("CREDENTIAL NOT SAVED :: " + (e.message || "write failed"));
         }
       };
+    }
+    if (secrets === null) {
+      // A failed READ must not blank 13 password-dotted fields — with nothing
+      // visible in them that reads as "all my keys are gone". Leave what is on
+      // screen alone (the handlers above still save) and say what happened.
+      setNote("Could not read stored credentials — the local service may still be " +
+        "starting. The fields below may be out of date; saving still works.");
+      statusErr("CREDENTIALS :: could not be read");
+    } else if (!document.querySelector(".cad-input.cred-bad")) {
+      setNote("");
     }
   })();
   // Phone capture uses the signed-in account + built-in public project key;
@@ -13313,8 +13343,9 @@ function renderPublishTree(revealSelection = false) {
   tree.innerHTML = model.map((node) => publishTreeNodeHtml(node, 0)).join("");
   // own all three states here: the markup's "Loading…" used to survive a
   // successful-but-empty load, so an unpublished library read as still loading
-  el("publish-tree-empty").textContent = state.publishLoaded
-    ? "Nothing published yet" : "Loading published books…";
+  el("publish-tree-empty").textContent = state.publishError
+    ? state.publishError
+    : state.publishLoaded ? "Nothing published yet" : "Loading published books…";
   el("publish-tree-empty").hidden = entities.length > 0;
   el("publish-count").textContent = `${state.publishEntries.length} volume${
     state.publishEntries.length === 1 ? "" : "s"}`;
@@ -13681,9 +13712,14 @@ function setOcrSideCollapsed(on, persist) {
   if (persist) { state.settings.wbSideCollapsed = collapsed; saveSettings(); }
 }
 
-function loadPublishCatalog() {
-  if (state.publishCatalogLoading) return state.publishCatalogLoading;
+// force: start a FRESH fetch instead of coalescing onto one already in flight.
+// After publishing, an in-flight request was issued before the volume existed,
+// so joining it would resolve a catalogue missing the new book AND clear the
+// staleness flag. The seq guards below then discard the superseded response.
+function loadPublishCatalog(force) {
+  if (!force && state.publishCatalogLoading) return state.publishCatalogLoading;
   const mine = ++state.publishCatalogSeq;
+  state.publishError = "";
   const refresh = el("publish-refresh");
   refresh.disabled = true;
   el("publish-source").textContent = state.publishEntries.length ? "Refreshing…" : "Loading…";
@@ -13707,8 +13743,10 @@ function loadPublishCatalog() {
     } catch (e) {
       if (mine !== state.publishCatalogSeq) return;
       el("publish-source").textContent = "Could not load catalogue";
-      el("publish-tree-empty").textContent = "Could not load the catalogue — " + e.message;
-      el("publish-tree-empty").hidden = state.publishEntries.length > 0;
+      // hold the error in state so any later re-render (Group by, a tree
+      // refresh) doesn't replace it with a "Loading…" claim
+      state.publishError = "Could not load the catalogue — " + e.message;
+      renderPublishTree();
       statusErr("PUBLISH CATALOGUE :: " + e.message);
     } finally {
       if (mine === state.publishCatalogSeq) state.publishCatalogLoading = null;
@@ -15063,11 +15101,13 @@ function pollPublish(buildId = null) {
         renderUpload();
       }
       renderHome();
-      // the Published Library now has one more volume than its cached copy —
-      // without this, switching to that tab shows a catalogue missing the book
-      // that was just published, with no staleness signal
+      // The Published Library now has one more volume than its cached copy —
+      // without this, opening that tab shows a catalogue missing the book just
+      // published, with no staleness signal. Dropping the flag is enough:
+      // renderPublish() re-fetches whenever it is not loaded, and publishing
+      // starts from the Workbench, so reaching Publish always goes through it.
+      // (Deliberately no DOM call here — pollPublish stays free of collaborators.)
       state.publishLoaded = false;
-      if (el("publish").classList.contains("active")) loadPublishCatalog();
       status(`PUBLISHED :: ${st.slug}${st.note ? " :: " + st.note : ""}`);
     }
   }, 700);
@@ -20945,7 +20985,9 @@ function init() {
     renderPublishTree(true);
     renderPublishPreview();
   });
-  el("publish-refresh").addEventListener("click", loadPublishCatalog);
+  // wrapped: a bare listener would pass the click Event as `force` by accident.
+  // Refresh SHOULD force a fresh fetch — that is what the user is asking for.
+  el("publish-refresh").addEventListener("click", () => loadPublishCatalog(true));
   el("publish-tree").addEventListener("click", (ev) => {
     const toggle = ev.target.closest("[data-publish-toggle]");
     if (toggle) {
