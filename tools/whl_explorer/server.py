@@ -29,6 +29,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -5325,6 +5326,323 @@ def api_ocr_job_cancel(job_id: str):
                     "job": {k: v for k, v in snapshot.items() if k != "cfg"}})
 
 
+# --- trash (recoverable deletes) ------------------------------------------------------
+# A delete that can be undone days later, not just seconds later. The client's
+# pushOp undo covers the immediate mistake; this covers "I noticed on Tuesday".
+#
+# An item is a self-contained PAYLOAD (one directory) plus enough hints to put it
+# back. There is deliberately no operation log, no journal and no inverse-of-a-
+# renumber function anywhere: collateral files are snapshotted WHOLE, so writing
+# them back is automatically correct. An item that cannot be restored cleanly
+# says so and offers its payload as a download instead of guessing.
+#
+# Placement matters: output/trash/ sits beside output/backups/ and NOT under
+# output/entries/, because store_sync mirrors that tree to R2 file-by-file — a
+# trash inside it would upload the very bytes the user just deleted.
+TRASH_DIR = lib.OUTPUT_DIR / "trash"
+TRASH_PATH = TRASH_DIR / "index.json"
+_trash_lock = threading.Lock()
+
+_TRASH_KEEP = 200                    # items
+_TRASH_KEEP_DAYS = 30
+_TRASH_MAX_BYTES = 2 << 30           # 2 GiB
+_TRASH_FLOOR_MINUTES = 60            # never prune something this fresh
+_TRASH_FULL_COPY_MAX = 64 << 20      # PDFs at/under this also keep a full pre-image
+
+
+def _trash_dir_bytes(d: Path) -> int:
+    total = 0
+    for p in d.rglob("*"):
+        try:
+            if p.is_file():
+                total += p.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _trash_open() -> tuple[str, Path]:
+    """Reserve an item id + its payload directory WITHOUT touching the index.
+
+    Split from the commit because a payload accrues across a long destructive
+    function (the PDF rewrite, then the OCR snapshots under another lock) and
+    the index row must be written LAST — a crash then leaves an orphan
+    directory the next prune sweeps, never a row pointing at nothing.
+    """
+    TRASH_DIR.mkdir(parents=True, exist_ok=True)
+    index = lib.load_json(TRASH_PATH, {"version": 1, "items": {}})
+    tid = lib.gen_id(set(index.get("items") or {}))
+    (TRASH_DIR / tid).mkdir(parents=True, exist_ok=True)
+    return tid, TRASH_DIR / tid
+
+
+def _trash_prune_locked(doc: dict) -> None:
+    """Enforce the caps, newest-first, inside the caller's index mutation.
+
+    Pruned synchronously by the inserter (the pattern _jobs_prune_locked uses):
+    this project has no scheduler, and a background sweeper would be machinery
+    out of proportion to the problem.
+    """
+    items = doc.get("items") or {}
+    now = datetime.now(timezone.utc)
+    floor = now - timedelta(minutes=_TRASH_FLOOR_MINUTES)
+    cutoff = now - timedelta(days=_TRASH_KEEP_DAYS)
+
+    def created(rec):
+        try:
+            return datetime.fromisoformat(str(rec.get("created") or ""))
+        except ValueError:
+            return now
+
+    ordered = sorted(items.values(), key=created, reverse=True)
+    running = 0
+    doomed = []
+    for i, rec in enumerate(ordered):
+        when = created(rec)
+        running += int(rec.get("bytes") or 0)
+        if when > floor:
+            continue                      # too fresh to prune, whatever the caps
+        if (i >= _TRASH_KEEP or when < cutoff or running > _TRASH_MAX_BYTES):
+            doomed.append(str(rec.get("id") or ""))
+    for tid in doomed:
+        shutil.rmtree(TRASH_DIR / tid, ignore_errors=True)
+        items.pop(tid, None)
+    # orphan sweep: directories whose row never landed (the crash window above)
+    try:
+        for d in TRASH_DIR.iterdir():
+            if not d.is_dir() or d.name in items:
+                continue
+            if datetime.fromtimestamp(d.stat().st_mtime, timezone.utc) > floor:
+                continue                  # may be a commit still in flight
+            shutil.rmtree(d, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _trash_commit(tid: str, kind: str, label: str, origin: dict,
+                  restore: dict, payload_kind: str, files: list[str]) -> str:
+    """Register a payload written by _trash_open. Innermost lock, held only
+    for the index write — never while copying payload bytes."""
+    rec = {
+        "id": tid, "kind": kind, "label": label,
+        "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "origin": origin, "payload_kind": payload_kind,
+        "bytes": _trash_dir_bytes(TRASH_DIR / tid),
+        "files": files, "restore": restore, "restored_at": "", "note": "",
+    }
+
+    def apply(doc):
+        doc.setdefault("version", 1)
+        doc.setdefault("items", {})[tid] = rec
+        _trash_prune_locked(doc)
+        return tid
+
+    return _mutate_json(TRASH_PATH, _trash_lock, {"version": 1, "items": {}}, apply)
+
+
+def _trash_rel_ok(rel: str) -> bool:
+    """Cheap string screen before any path join — a hand-edited index.json
+    must not be able to walk out of the payload directory."""
+    r = str(rel or "")
+    return bool(r) and ".." not in r and ":" not in r and "\\" not in r \
+        and not r.startswith("/")
+
+
+def _trash_payload_path(tid: str, rel: str) -> Path | None:
+    """Resolve a payload file, or None. Containment is checked twice: the
+    string screen above, then the resolved is_relative_to test the rest of the
+    server uses for entry files."""
+    if not _trash_rel_ok(tid) or not _trash_rel_ok(rel):
+        return None
+    root = (TRASH_DIR / tid).resolve()
+    cand = (root / rel).resolve()
+    if not cand.is_relative_to(root) or not cand.is_file():
+        return None
+    return cand
+
+
+def _trash_put(kind: str, label: str, origin: dict, restore: dict,
+               files: dict[str, bytes | str]) -> str:
+    """One-shot helper for adopters whose payload is small and known up front:
+    _trash_put("build", "Entry: Herbal", {...}, {}, {"record.json": blob}).
+    The page-delete path uses open/commit instead because its payload accrues."""
+    tid, d = _trash_open()
+    written = []
+    for rel, data in files.items():
+        if not _trash_rel_ok(rel):
+            continue
+        target = d / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(data, bytes):
+            target.write_bytes(data)
+        else:
+            target.write_text(str(data), encoding="utf-8")
+        written.append(rel)
+    return _trash_commit(tid, kind, label, origin, restore, "json", written)
+
+
+@app.route("/api/trash")
+def api_trash():
+    """List trashed items, newest first, plus the retention summary the Info
+    tab footer shows. Plain read: save_json is atomic tmp+replace, so a reader
+    never sees a torn document and needs no lock."""
+    doc = lib.load_json(TRASH_PATH, {"version": 1, "items": {}})
+    items = sorted((doc.get("items") or {}).values(),
+                   key=lambda r: str(r.get("created") or ""), reverse=True)
+    return jsonify({"ok": True, "items": items, "summary": {
+        "count": len(items),
+        "bytes": sum(int(r.get("bytes") or 0) for r in items),
+        "cap_bytes": _TRASH_MAX_BYTES, "keep_days": _TRASH_KEEP_DAYS,
+        "keep": _TRASH_KEEP,
+    }})
+
+
+@app.route("/api/trash/<tid>/payload/<path:rel>")
+def api_trash_payload(tid: str, rel: str):
+    """Download one payload file — the fallback when a restore is refused, so
+    the user still gets their pages back by hand."""
+    src = _trash_payload_path(tid, rel)
+    if src is None:
+        abort(404)
+    return send_file(str(src), as_attachment=True, download_name=Path(rel).name)
+
+
+@app.route("/api/trash/forget", methods=["POST"])
+def api_trash_forget():
+    """Discard one item, or everything. The payload is the safety net, so the
+    client confirms only the bulk case."""
+    p = request.get_json(silent=True) or {}
+    wipe_all = bool(p.get("all"))
+    tid = str(p.get("id") or "")
+    if not wipe_all and not _trash_rel_ok(tid):
+        return jsonify({"ok": False, "error": "bad id"}), 400
+
+    def apply(doc):
+        items = doc.setdefault("items", {})
+        targets = list(items) if wipe_all else ([tid] if tid in items else [])
+        for t in targets:
+            shutil.rmtree(TRASH_DIR / t, ignore_errors=True)
+            items.pop(t, None)
+        return len(targets)
+
+    n = _mutate_json(TRASH_PATH, _trash_lock, {"version": 1, "items": {}}, apply)
+    return jsonify({"ok": True, "forgotten": n})
+
+
+def _trash_restore_pdf_pages(item: dict) -> tuple[dict, int]:
+    """Put deleted pages back. Refuses rather than guesses: the recorded page
+    numbers are only meaningful against the exact post-delete page count, and
+    appending them to the end would not be a restore at all."""
+    from pypdf import PdfReader, PdfWriter
+    origin = item.get("origin") or {}
+    rest = item.get("restore") or {}
+    build_id = str(origin.get("build_id") or "")
+    builds = lib.load_json(BUILDS_PATH, {})
+    if build_id not in builds:
+        return {"ok": False, "error": "that entry no longer exists"}, 409
+    pdf = _resolve_local(str(origin.get("pdf") or ""))
+    if pdf is None or not pdf.is_file() or pdf.suffix.lower() != ".pdf":
+        return {"ok": False, "error": "the original PDF is no longer there"}, 409
+    # restoring into the truncated preview would desync OCR the same way
+    # deleting from it would — the deletion path refuses it too
+    if pdf.resolve().is_relative_to(ENTRIES_DIR.resolve()):
+        return {"ok": False,
+                "error": "this book now points at the truncated preview"}, 409
+    payload = _trash_payload_path(str(item.get("id") or ""), "pages.pdf")
+    if payload is None:
+        return {"ok": False, "error": "the trashed pages are gone"}, 410
+
+    pages = [int(x) for x in (rest.get("pages") or [])]
+    with _page_structure_lock:
+        blockers = _page_job_blockers(build_id)
+        if blockers:
+            return {"ok": False, "error": "an OCR job is running for this book"}, 409
+        current = PdfReader(str(pdf))
+        if len(current.pages) != int(rest.get("pages_after") or -1):
+            return {"ok": False, "error":
+                    "this PDF has changed since the delete — download the pages "
+                    "instead and re-insert them by hand"}, 409
+        held = PdfReader(str(payload))
+        # walk the ORIGINAL positions: take a held page whenever the counter
+        # lands on a recorded number, otherwise the next surviving page
+        writer = PdfWriter()
+        held_i = cur_i = 0
+        for n in range(1, int(rest.get("pages_before") or 0) + 1):
+            if n in set(pages) and held_i < len(held.pages):
+                writer.add_page(held.pages[held_i]); held_i += 1
+            elif cur_i < len(current.pages):
+                writer.add_page(current.pages[cur_i]); cur_i += 1
+        tmp = pdf.with_suffix(".restore.tmp")
+        with open(tmp, "wb") as fh:
+            writer.write(fh)
+        tmp.replace(pdf)
+
+        # write back only the snapshots whose live file is untouched since the
+        # delete — silently overwriting an edit would be its own data loss
+        restored, skipped = ["pages.pdf"], []
+        stamps = rest.get("stamps") or {}
+        for rel in (item.get("files") or []):
+            if not rel.startswith("ocr/"):
+                continue
+            src = _trash_payload_path(str(item.get("id") or ""), rel)
+            live = _entry_dir(build_id) / rel
+            if src is None:
+                skipped.append({"file": rel, "reason": "payload missing"}); continue
+            want = stamps.get(rel)
+            try:
+                st = live.stat()
+                same = bool(want) and int(want[0]) == st.st_size and \
+                    abs(float(want[1]) - st.st_mtime) < 0.001
+            except OSError:
+                same = not want          # absent now, absent then -> safe to write
+            if want and not same:
+                skipped.append({"file": rel, "reason": "edited since the delete"})
+                continue
+            live.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, live)
+            restored.append(rel)
+
+        changed = {}
+        if str(origin.get("src_key") or "") == "primary":
+            changed["title_pages"] = str(rest.get("title_pages_before") or "")
+            changed["thumbnail_source"] = str(rest.get("thumbnail_source_before") or "")
+        if changed:
+            _builds_apply(build_id, changed)
+        _page_structure_revision[build_id] = (
+            _page_structure_revision.get(build_id, 0) + 1)
+
+    def mark(doc):
+        rec = (doc.get("items") or {}).get(str(item.get("id") or ""))
+        if rec is not None:
+            rec["restored_at"] = datetime.now(timezone.utc).isoformat(
+                timespec="seconds")
+            if skipped:
+                rec["note"] = f"{len(skipped)} file(s) kept as they were"
+    _mutate_json(TRASH_PATH, _trash_lock, {"version": 1, "items": {}}, mark)
+    return {"ok": True, "restored": restored, "skipped": skipped,
+            "pages": int(rest.get("pages_before") or 0)}, 200
+
+
+@app.route("/api/trash/restore", methods=["POST"])
+def api_trash_restore():
+    """Restore one item. The body carries ONLY an id — never a path, never a
+    destination; everything else is derived from the stored row."""
+    p = request.get_json(silent=True) or {}
+    tid = str(p.get("id") or "")
+    if not _trash_rel_ok(tid):
+        return jsonify({"ok": False, "error": "bad id"}), 400
+    doc = lib.load_json(TRASH_PATH, {"version": 1, "items": {}})
+    item = (doc.get("items") or {}).get(tid)
+    if not item:
+        return jsonify({"ok": False, "error": "no such item"}), 404
+    kind = str(item.get("kind") or "")
+    if kind != "pdf_pages":
+        return jsonify({"ok": False,
+                        "error": f"restoring '{kind}' is not supported yet"}), 501
+    body, code = _trash_restore_pdf_pages(item)
+    return jsonify(body), code
+
+
 # --- PDF page deletion ---------------------------------------------------------------
 
 _page_structure_lock = threading.RLock()
@@ -5505,10 +5823,11 @@ def api_pdf_pages_delete():
     """Delete pages from a build's PDF — the real file, not a preview.
     Body: {build_id, pdf, pages: [1-based numbers]}.
 
-    The pre-deletion file is kept next to the PDF as <name>.bak.pdf
-    (overwritten by the next deletion), the build's OCR files get their
-    page markers renumbered, and title_pages is remapped, so everything
-    stays aligned with the new page numbering."""
+    The removed pages (plus whole copies of every collateral file the
+    renumbering rewrites) go to the trash under output/trash/, listed and
+    restorable from the Info tab. The build's OCR files get their page
+    markers renumbered and title_pages is remapped, so everything stays
+    aligned with the new page numbering."""
     p = request.get_json(silent=True) or {}
     build_id = str(p.get("build_id") or "")
     builds = lib.load_json(BUILDS_PATH, {})
@@ -5564,11 +5883,16 @@ def _apply_page_deletion(build_id: str, builds: dict, pdf: Path,
 
 def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
                                 pages: list[int]) -> dict:
-    """Rewrite the PDF without the given pages (backup kept), renumber the
-    build's OCR files, and remap title_pages. Shared by the deletion
-    endpoint and blank-page trimming. Raises ValueError on refusal."""
+    """Rewrite the PDF without the given pages, renumber the build's OCR
+    files, and remap title_pages. Shared by the deletion endpoint and
+    blank-page trimming. Raises ValueError on refusal.
+
+    Everything this destroys goes to the trash first (see _trash_open): the
+    dropped pages as their own small PDF, plus WHOLE copies of each collateral
+    file the renumbering rewrites. Whole copies are what let restore be a
+    verbatim write-back instead of an inverse-renumber function.
+    """
     from pypdf import PdfReader, PdfWriter
-    import shutil
     reader = PdfReader(str(pdf))
     total = len(reader.pages)
     keep = [i for i in range(total) if (i + 1) not in set(pages)]
@@ -5576,8 +5900,27 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
         raise ValueError("cannot delete every page")
     if len(keep) == total:
         raise ValueError("pages out of range")
-    # safety net: the previous version stays recoverable
-    shutil.copy2(pdf, pdf.with_suffix(".bak.pdf"))
+    # Trash the pre-image BEFORE the rewrite. The payload is the DROPPED pages
+    # (the exact complement of `keep`), so a 130MB scan losing 3 pages costs a
+    # few MB — that is what makes a 30-day window affordable. Small PDFs also
+    # keep a byte-identical original.
+    tid, tdir = _trash_open()
+    tfiles: list[str] = []
+    drop_writer = PdfWriter()
+    for i in range(total):
+        if (i + 1) in set(pages):
+            drop_writer.add_page(reader.pages[i])
+    with open(tdir / "pages.pdf", "wb") as fh:
+        drop_writer.write(fh)
+    tfiles.append("pages.pdf")
+    payload_kind = "pages"
+    try:
+        if pdf.stat().st_size <= _TRASH_FULL_COPY_MAX:
+            shutil.copy2(pdf, tdir / "original.pdf")
+            tfiles.append("original.pdf")
+            payload_kind = "full"
+    except OSError:
+        pass
     writer = PdfWriter()
     for i in keep:
         writer.add_page(reader.pages[i])
@@ -5602,10 +5945,13 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
                     continue
                 try:
                     raw = f.read_text(encoding="utf-8", errors="replace")
-                    # the renumbering is destructive too — a misfired trim
-                    # must be recoverable for the text, not just the PDF
-                    f.with_name(f.name + ".bak").write_text(
-                        raw, encoding="utf-8", errors="replace")
+                    # the renumbering is destructive too — snapshot the WHOLE
+                    # pre-edit text into the same trash item, so restoring is a
+                    # verbatim write-back and never an inverse renumber
+                    snap = tdir / "ocr" / f.name
+                    snap.parent.mkdir(parents=True, exist_ok=True)
+                    snap.write_text(raw, encoding="utf-8", errors="replace")
+                    tfiles.append(f"ocr/{f.name}")
                     out = _renumber_marked_text(raw, pages)
                     f.write_text(out, encoding="utf-8", errors="replace")
                     renumbered.append(f.name)
@@ -5613,7 +5959,17 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
                     continue
     # the OCR word-box sidecar is page-keyed per source like the compiled
     # files; keep THIS source's boxes aligned so the placed facsimile never
-    # shows a deleted page's words.
+    # shows a deleted page's words. This is the ONE leg of the flow that had
+    # no backup of any kind before the trash — snapshot it whole first.
+    layout_path = ocr_dir / "layout.json"
+    if layout_path.is_file():
+        try:
+            snap = tdir / "ocr" / "layout.json"
+            snap.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(layout_path, snap)
+            tfiles.append("ocr/layout.json")
+        except OSError:
+            pass
     _renumber_layout_words(build_id, src_key, pages)
     # Translations use the same page-marker convention, and their provenance
     # sidecars key each source hash by page. Move both in one protected pass so
@@ -5624,6 +5980,9 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
         moved)
     # title pages are counted on the PRIMARY PDF; a secondary's deletions
     # don't move them
+    # capture the pre-remap values for the trash BEFORE they are rewritten
+    title_pages_before = str(b.get("title_pages") or "")
+    thumbnail_source_before = str(b.get("thumbnail_source") or "")
     titles = [] if src_key != "primary" else \
         [int(x) for x in str(b.get("title_pages") or "").split(",")
          if x.strip().isdigit()]
@@ -5650,9 +6009,35 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
         # the remap to a fresh read, and keep the returned record in step
         b.update(changed)
         b["updated_at"] = _builds_apply(build_id, changed)
+    # Register LAST: every payload byte is on disk by now, so a crash before
+    # this point leaves a sweepable orphan rather than a row pointing at
+    # nothing. Stamp each written-back-able snapshot with the POST-delete
+    # (size, mtime) of its live file, so restore can tell "untouched since"
+    # from "the user edited this afterwards".
+    stamps = {}
+    for rel in tfiles:
+        if not rel.startswith("ocr/"):
+            continue
+        live = _entry_dir(build_id) / rel
+        try:
+            st = live.stat()
+            stamps[rel] = [st.st_size, st.st_mtime]
+        except OSError:
+            continue
+    label = (f"{len(pages)} page{'' if len(pages) == 1 else 's'} from "
+             f"{b.get('title') or build_id}")
+    _trash_commit(
+        tid, "pdf_pages", label,
+        {"build_id": build_id, "pdf": str(b.get("pdf_file") or ""),
+         "src_key": src_key},
+        {"pages": pages, "pages_before": total, "pages_after": len(keep),
+         "title_pages_before": title_pages_before,
+         "thumbnail_source_before": thumbnail_source_before,
+         "stamps": stamps},
+        payload_kind, tfiles)
     return {"deleted": pages, "pages": len(keep),
             "renumbered": renumbered,
-            "backup": pdf.with_suffix(".bak.pdf").name,
+            "trash_id": tid,
             "build": b}
 
 

@@ -1010,19 +1010,119 @@ async function loadDatabaseResources(force) {
 }
 
 function refreshInfoTabSection() {
-  if (activeInfoSection() === "info-resources") loadDatabaseResources(false);
+  const sec = activeInfoSection();
+  if (sec === "info-resources") loadDatabaseResources(false);
+  else if (sec === "info-trash") loadTrash(false);
   else { pollConsoleLog(); renderConsole(); }
 }
 
-function switchInfoSection(id) {
-  document.querySelectorAll("#info-section-tabs [data-info-section]").forEach((tab) => {
-    const active = tab.dataset.infoSection === id;
-    tab.classList.toggle("active", active);
-    tab.setAttribute("aria-selected", String(active));
-  });
-  document.querySelectorAll("#infotab .info-section").forEach((section) =>
-    section.classList.toggle("active", section.id === id));
-  refreshInfoTabSection();
+// --- Trash: deletions that can still be undone --------------------------------
+// The store is server-side, so clearing history or resetting settings cannot
+// take the safety net with it. This pane only lists and acts; every decision
+// about what is restorable lives on the server.
+const trashState = { data: null, loading: false, error: "", loadedAt: 0 };
+
+async function loadTrash(force) {
+  if (trashState.loading) return;
+  if (!force && trashState.data && Date.now() - trashState.loadedAt < 15000) {
+    renderTrash();
+    return;
+  }
+  trashState.loading = true;
+  trashState.error = "";
+  renderTrash();
+  try {
+    const res = await fetch("/api/trash");
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    trashState.data = data;
+    trashState.loadedAt = Date.now();
+  } catch (e) {
+    trashState.error = e.message || "could not be read";
+  } finally {
+    trashState.loading = false;
+    renderTrash();
+  }
+}
+
+function trashSize(n) {
+  const b = Number(n) || 0;
+  if (b >= 1 << 30) return (b / (1 << 30)).toFixed(1) + " GB";
+  if (b >= 1 << 20) return (b / (1 << 20)).toFixed(1) + " MB";
+  return Math.max(1, Math.round(b / 1024)) + " KB";
+}
+
+function renderTrash() {
+  const host = el("trash-list");
+  const sum = el("trash-summary");
+  if (!host || !sum) return;
+  if (trashState.loading && !trashState.data) {
+    sum.textContent = "Loading…";
+    host.innerHTML = `<p class="empty">Loading…</p>`;
+    return;
+  }
+  if (trashState.error) {
+    sum.textContent = "Could not be read";
+    host.innerHTML = `<p class="empty">Could not read the trash — ${esc(trashState.error)}</p>`;
+    return;
+  }
+  const data = trashState.data || { items: [], summary: {} };
+  const items = data.items || [];
+  const s = data.summary || {};
+  sum.textContent = items.length
+    ? `${items.length} item${items.length === 1 ? "" : "s"} · ${trashSize(s.bytes)}`
+    : "Empty";
+  el("trash-empty").disabled = !items.length;
+  if (!items.length) {
+    // the honest empty state: nothing has ever been trashed
+    host.innerHTML = `<p class="empty">Nothing here. Deletions that can be undone are kept in this list.</p>`;
+    return;
+  }
+  host.innerHTML = items.map((it) => {
+    const done = !!it.restored_at;
+    return `<div class="trash-row${done ? " restored" : ""}">` +
+      `<span class="trash-label">${esc(it.label || it.kind || "item")}</span>` +
+      `<span class="trash-meta">${esc(relIso(it.created))} · ${esc(trashSize(it.bytes))}` +
+        `${done ? " · restored" : ""}${it.note ? " · " + esc(it.note) : ""}</span>` +
+      `<span class="trash-acts">` +
+        (done ? "" : `<button class="cad-btn tiny" type="button" data-trash-restore="${esc(it.id)}">Restore</button>`) +
+        `<button class="cad-btn tiny" type="button" data-trash-download="${esc(it.id)}" ` +
+          `data-tip="Download the trashed payload">Download</button>` +
+        `<button class="cad-btn tiny danger" type="button" data-trash-forget="${esc(it.id)}" ` +
+          `data-tip="Discard this item for good">Forget</button>` +
+      `</span></div>`;
+  }).join("") +
+    `<p class="trash-policy">Kept for ${esc(String(s.keep_days || 30))} days or ` +
+    `${esc(trashSize(s.cap_bytes))}, whichever comes first.</p>`;
+}
+
+async function trashAct(id, what) {
+  try {
+    if (what === "restore") {
+      const res = await fetch("/api/trash/restore", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      const kept = (data.skipped || []).length;
+      status(`RESTORED :: ${(data.restored || []).length} file(s)` +
+        (kept ? ` — ${kept} left as edited since` : "") +
+        " — reopen the book to see the pages");
+      // the PDF changed under the workbench's feet; re-render what we can
+      renderWorkbench();
+    } else {
+      const res = await fetch("/api/trash/forget", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(id === "*" ? { all: true } : { id }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      status(id === "*" ? "TRASH EMPTIED" : "ITEM FORGOTTEN");
+    }
+  } catch (e) {
+    statusErr("TRASH :: " + (e.message || "failed"));
+  }
+  loadTrash(true);
 }
 
 function initInfoSections() {
@@ -1036,7 +1136,49 @@ function initInfoSections() {
     dbResourceState.selected = button.dataset.dbResource;
     renderDatabaseResources();
   });
+  el("trash-refresh").addEventListener("click", () => loadTrash(true));
+  el("trash-empty").addEventListener("click", async () => {
+    // the ONE place a confirm is warranted: wiping the safety net itself is
+    // the opposite of the quick single-item delete the no-confirm rule covers
+    if (!(await confirmDialog({
+      title: "Empty trash",
+      message: "Discard every recoverable deletion?",
+      detail: "Their payloads are deleted for good. Nothing currently in your library changes.",
+      confirmLabel: "Empty trash",
+      danger: true,
+    }))) return;
+    trashAct("*", "forget");
+  });
+  el("trash-list").addEventListener("click", (ev) => {
+    const r = ev.target.closest("[data-trash-restore]");
+    if (r) { trashAct(r.dataset.trashRestore, "restore"); return; }
+    const f = ev.target.closest("[data-trash-forget]");
+    if (f) { trashAct(f.dataset.trashForget, "forget"); return; }
+    const d = ev.target.closest("[data-trash-download]");
+    if (d) {
+      // the server sends it as an attachment, so a plain anchor click is the
+      // download — openExternal() would hand it to the OS browser instead
+      const a = document.createElement("a");
+      a.href = `/api/trash/${encodeURIComponent(d.dataset.trashDownload)}/payload/pages.pdf`;
+      a.download = "trashed-pages.pdf";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }
+  });
 }
+
+function switchInfoSection(id) {
+  document.querySelectorAll("#info-section-tabs [data-info-section]").forEach((tab) => {
+    const active = tab.dataset.infoSection === id;
+    tab.classList.toggle("active", active);
+    tab.setAttribute("aria-selected", String(active));
+  });
+  document.querySelectorAll("#infotab .info-section").forEach((section) =>
+    section.classList.toggle("active", section.id === id));
+  refreshInfoTabSection();
+}
+
 
 function ckey(source, idx) { return `${source}:${idx}`; }
 
@@ -18204,7 +18346,7 @@ function onOcrPagesClick(ev) {
 }
 
 // delete the selected pages from the build's ACTUAL PDF (never the
-// truncated preview derivative); the server keeps a .bak.pdf and renumbers
+// truncated preview derivative); the server trashes what it removes and renumbers
 // the OCR files + title pages
 async function deleteSelectedPages() {
   const d = ocrSelDoc();
@@ -18233,8 +18375,8 @@ async function deleteSelectedPages() {
   if (!(await confirmDialog({
       title: "Delete PDF pages",
       message: `Delete ${pages.length} page(s) [${pages.join(", ")}] from the PDF?`,
-      detail: `${pdf}\n\nThe previous version is kept as a .bak.pdf next to ` +
-        "it; OCR files and title pages are renumbered to match.",
+      detail: `${pdf}\n\nThe removed pages are kept in Trash (Info tab) and ` +
+        "can be restored; OCR files and title pages are renumbered to match.",
       confirmLabel: "Delete pages",
       danger: true,
     }))) {
@@ -18274,7 +18416,7 @@ async function deleteSelectedPages() {
     for (const k of [...ocrState.analysisTags.keys()]) {
       if (k.startsWith(bid + ":")) ocrState.analysisTags.delete(k);
     }
-    status(`PAGES DELETED :: ${pages.length} (backup: ${data.backup})`);
+    status(`PAGES DELETED :: ${pages.length} — restorable from Info > Trash`);
     el("ocr-msg").textContent = "";
     // the PDF changed on disk: page counts, dims, word boxes, and the
     // renumbered region records are all stale — a cache hit here would

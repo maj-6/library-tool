@@ -1,0 +1,209 @@
+"""Trash store: page deletion writes a recoverable item, restore puts it back.
+
+conftest.py points WHL_DATA_ROOT at a throwaway directory before any tools
+module is imported, so importing server never touches live data.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+import server
+
+
+T3 = "--- page 1 ---\nalpha\n\n--- page 2 ---\nbravo\n\n--- page 3 ---\ncharlie"
+
+
+def _make_pdf(path: Path, n_pages: int) -> None:
+    import fitz
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc = fitz.open()
+    for i in range(n_pages):
+        pg = doc.new_page(width=200, height=200)
+        pg.insert_text((50, 100), f"PAGE {i + 1}")
+    doc.save(str(path))
+    doc.close()
+
+
+def _page_count(path: Path) -> int:
+    from pypdf import PdfReader
+
+    return len(PdfReader(str(path)).pages)
+
+
+def _page_text(path: Path, index: int) -> str:
+    import fitz
+
+    doc = fitz.open(str(path))
+    try:
+        return doc[index].get_text().strip()
+    finally:
+        doc.close()
+
+
+def _seed(bid: str, data_root: Path, n_pages: int = 3) -> Path:
+    """A book with a PDF, OCR text and a layout sidecar, registered on disk."""
+    pdf = data_root / "downloads" / "ia" / bid / "book.pdf"
+    _make_pdf(pdf, n_pages)
+    ocr_dir = server._entry_dir(bid) / "ocr"
+    ocr_dir.mkdir(parents=True, exist_ok=True)
+    (ocr_dir / "compiled.txt").write_text(T3, encoding="utf-8")
+    server.lib.save_json(ocr_dir / "layout.json", {
+        "words": {"primary": {"1": ["one"], "2": ["two"], "3": ["three"]}},
+    })
+    builds = {bid: {"title": "Trashy", "title_pages": "1,3",
+                    "pdf_file": str(pdf)}}
+    server.BUILDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    server.BUILDS_PATH.write_text(json.dumps(builds), encoding="utf-8")
+    return pdf
+
+
+@pytest.fixture()
+def client():
+    server.app.config["TESTING"] = True
+    with server.app.test_client() as c:
+        yield c
+
+
+def test_delete_writes_a_restorable_item(data_root):
+    """The deleted page, a full pre-image and whole copies of every rewritten
+    collateral file land in ONE trash item, and the legacy .bak siblings are
+    gone rather than duplicated."""
+    bid = "trash001"
+    pdf = _seed(bid, data_root)
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+
+    result = server._apply_page_deletion(bid, builds, pdf, [2])
+    tid = result["trash_id"]
+    tdir = server.TRASH_DIR / tid
+
+    assert _page_count(pdf) == 2
+    assert _page_count(tdir / "pages.pdf") == 1
+    assert "PAGE 2" in _page_text(tdir / "pages.pdf", 0)
+    assert _page_count(tdir / "original.pdf") == 3
+    assert (tdir / "ocr" / "compiled.txt").read_text(encoding="utf-8") == T3
+    assert (tdir / "ocr" / "layout.json").is_file()
+    # the five ad-hoc backups are RETIRED, not supplemented
+    assert not pdf.with_suffix(".bak.pdf").exists()
+    assert not (server._entry_dir(bid) / "ocr" / "compiled.txt.bak").exists()
+
+    index = server.lib.load_json(server.TRASH_PATH, {})
+    rec = index["items"][tid]
+    assert rec["kind"] == "pdf_pages"
+    assert rec["restore"]["pages"] == [2]
+    assert rec["restore"]["pages_before"] == 3
+    assert rec["restore"]["pages_after"] == 2
+    assert rec["restore"]["title_pages_before"] == "1,3"
+    assert rec["bytes"] > 0
+    assert "2 page" not in rec["label"] and "1 page" in rec["label"]
+
+
+def test_restore_puts_the_page_back_in_position(data_root, client):
+    """Restore reinserts at the ORIGINAL index (not appended at the end) and
+    writes the collateral snapshots back verbatim."""
+    bid = "trash002"
+    pdf = _seed(bid, data_root)
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+    tid = server._apply_page_deletion(bid, builds, pdf, [2])["trash_id"]
+
+    ocr = server._entry_dir(bid) / "ocr" / "compiled.txt"
+    assert ocr.read_text(encoding="utf-8") != T3          # renumbered by delete
+
+    r = client.post("/api/trash/restore", json={"id": tid})
+    assert r.status_code == 200, r.get_json()
+    body = r.get_json()
+    assert body["ok"] and body["pages"] == 3
+
+    assert _page_count(pdf) == 3
+    assert "PAGE 2" in _page_text(pdf, 1)                 # back in the MIDDLE
+    assert ocr.read_text(encoding="utf-8") == T3          # verbatim write-back
+    assert server.lib.load_json(server.BUILDS_PATH, {})[bid]["title_pages"] == "1,3"
+
+    index = server.lib.load_json(server.TRASH_PATH, {})
+    assert index["items"][tid]["restored_at"]             # row kept, marked
+
+
+def test_restore_refuses_when_the_pdf_moved_on(data_root, client):
+    """The recorded indices only mean anything against the exact post-delete
+    page count — a second delete must make restore refuse, not scramble."""
+    bid = "trash003"
+    pdf = _seed(bid, data_root)
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+    tid = server._apply_page_deletion(bid, builds, pdf, [2])["trash_id"]
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+    server._apply_page_deletion(bid, builds, pdf, [1])     # now 1 page, not 2
+
+    r = client.post("/api/trash/restore", json={"id": tid})
+    assert r.status_code == 409
+    assert "changed since" in r.get_json()["error"]
+    assert _page_count(pdf) == 1                           # untouched by refusal
+    # the payload is still downloadable so the pages are not lost
+    d = client.get(f"/api/trash/{tid}/payload/pages.pdf")
+    assert d.status_code == 200 and d.data[:4] == b"%PDF"
+
+
+def test_restore_keeps_a_file_edited_since_the_delete(data_root, client):
+    """A snapshot is written back only when the live file is untouched;
+    otherwise it is reported as skipped rather than silently overwritten."""
+    bid = "trash004"
+    pdf = _seed(bid, data_root)
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+    tid = server._apply_page_deletion(bid, builds, pdf, [2])["trash_id"]
+
+    ocr = server._entry_dir(bid) / "ocr" / "compiled.txt"
+    ocr.write_text("my later edit", encoding="utf-8")
+
+    body = client.post("/api/trash/restore", json={"id": tid}).get_json()
+    assert body["ok"]
+    assert ocr.read_text(encoding="utf-8") == "my later edit"    # NOT clobbered
+    assert any(s["file"] == "ocr/compiled.txt" for s in body["skipped"])
+
+
+def test_payload_download_refuses_traversal(data_root, client):
+    bid = "trash005"
+    pdf = _seed(bid, data_root)
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+    tid = server._apply_page_deletion(bid, builds, pdf, [2])["trash_id"]
+
+    for rel in ("../../whl_builds.json", "..%2F..%2Fwhl_builds.json",
+                "../index.json"):
+        assert client.get(f"/api/trash/{tid}/payload/{rel}").status_code == 404
+    assert client.post("/api/trash/restore",
+                       json={"id": "../../etc"}).status_code == 400
+
+
+def test_list_and_forget(data_root, client):
+    bid = "trash006"
+    pdf = _seed(bid, data_root)
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+    tid = server._apply_page_deletion(bid, builds, pdf, [2])["trash_id"]
+
+    listing = client.get("/api/trash").get_json()
+    assert listing["ok"] and any(i["id"] == tid for i in listing["items"])
+    assert listing["summary"]["count"] >= 1
+    assert listing["summary"]["keep_days"] == server._TRASH_KEEP_DAYS
+
+    assert client.post("/api/trash/forget", json={"id": tid}).get_json()["ok"]
+    assert not (server.TRASH_DIR / tid).exists()
+    assert tid not in server.lib.load_json(server.TRASH_PATH, {})["items"]
+
+
+def test_prune_drops_old_items_but_never_the_fresh_one(data_root):
+    """Age/count caps prune, but an item younger than the floor survives even
+    when it alone blows a cap — the 'oh no' undo must always work."""
+    from datetime import datetime, timedelta, timezone
+
+    old = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat(
+        timespec="seconds")
+    fresh = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    doc = {"version": 1, "items": {
+        "aaa": {"id": "aaa", "created": old, "bytes": 10},
+        "bbb": {"id": "bbb", "created": fresh, "bytes": 5 << 30},   # > cap alone
+    }}
+    server.TRASH_DIR.mkdir(parents=True, exist_ok=True)
+    server._trash_prune_locked(doc)
+    assert "aaa" not in doc["items"]          # past the age cap
+    assert "bbb" in doc["items"]              # inside the floor, kept regardless

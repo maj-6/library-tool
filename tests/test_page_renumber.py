@@ -132,9 +132,9 @@ def _page_count(path: Path) -> int:
 
 
 def test_apply_page_deletion_end_to_end(data_root):
-    """Delete the middle page of a 3-page book: PDF rewritten with backup,
-    OCR markers renumbered (with .txt.bak safety copies), title_pages
-    remapped and persisted to whl_builds.json."""
+    """Delete the middle page of a 3-page book: PDF rewritten, the removed
+    page and whole copies of the rewritten OCR files kept in the trash,
+    markers renumbered, title_pages remapped and persisted."""
     bid = "testdel001"
     pdf = data_root / "downloads" / "ia" / "testbook" / "book.pdf"
     _make_pdf(pdf, 3)
@@ -180,7 +180,7 @@ def test_apply_page_deletion_end_to_end(data_root):
 
     assert result["deleted"] == [2]
     assert result["pages"] == 2
-    assert result["backup"] == "book.bak.pdf"
+    assert result["trash_id"]
     assert result["build"]["title"] == "Test"
     assert result["build"]["title_pages"] == "1,2"
     assert result["build"]["updated_at"]
@@ -188,20 +188,25 @@ def test_apply_page_deletion_end_to_end(data_root):
     # result["build"] is the same dict object mutated in place
     assert result["build"] is builds[bid]
 
-    # PDF rewritten in place; .bak.pdf keeps the original; temp file gone
+    # PDF rewritten in place; the trash keeps what was removed; temp gone
     assert _page_count(pdf) == 2
-    assert _page_count(pdf.with_suffix(".bak.pdf")) == 3
+    assert not pdf.with_suffix(".bak.pdf").exists()   # retired by the trash
     assert not pdf.with_suffix(".del.tmp").exists()
+    tdir = server.TRASH_DIR / result["trash_id"]
+    assert _page_count(tdir / "pages.pdf") == 1       # the deleted page itself
+    assert _page_count(tdir / "original.pdf") == 3    # small PDF -> full pre-image
 
     # OCR renumbering + pre-deletion backups
     assert (ocr_dir / "compiled.txt").read_text(encoding="utf-8") == \
         "--- page 1 ---\nalpha\n\n--- page 2 ---\ncharlie"
-    assert (ocr_dir / "compiled.txt.bak").read_text(encoding="utf-8") == T3
-    # A marker-less file is still listed in "renumbered" and still gets a
-    # .bak, even though its content is unchanged. Pinned as-is.
+    assert not (ocr_dir / "compiled.txt.bak").exists()   # now in the trash item
+    assert (tdir / "ocr" / "compiled.txt").read_text(encoding="utf-8") == T3
+    # A marker-less file is still listed in "renumbered" and is still
+    # snapshotted, even though its content is unchanged. Pinned as-is.
     assert (ocr_dir / "extracted.txt").read_text(encoding="utf-8") == \
         "no markers at all"
-    assert (ocr_dir / "extracted.txt.bak").read_text(encoding="utf-8") == \
+    assert not (ocr_dir / "extracted.txt.bak").exists()
+    assert (tdir / "ocr" / "extracted.txt").read_text(encoding="utf-8") == \
         "no markers at all"
 
     # Translation text and its source hashes shift together; deleted-page
@@ -285,8 +290,9 @@ def test_apply_page_deletion_no_titles_no_ocr(data_root):
 
     result = server._apply_page_deletion(bid, builds, pdf, [1])
 
+    trash_id = result.pop("trash_id")
+    assert trash_id and (server.TRASH_DIR / trash_id / "pages.pdf").is_file()
     assert result == {"deleted": [1], "pages": 1, "renumbered": [],
-                      "backup": "book.bak.pdf",
                       "build": {"title": "NoTitles"}}
     assert "title_pages" not in builds[bid]
     # save_json is skipped entirely when there are no title pages

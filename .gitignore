@@ -14,6 +14,8 @@ output/client_state.json
 # automatic pre-shrink snapshots of client_state + ad-hoc recovery artifacts
 # (also device-local, and can hold the same checked-book data)
 output/backups/
+# recoverable deletes (deleted scan pages, OCR snapshots) — device-local only
+output/trash/
 # append-only feed behind the Home tab; grows per machine, merges badly
 output/activity.jsonl
 # the signed-in Supabase session (user tokens) + the activity push cursor

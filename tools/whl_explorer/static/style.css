@@ -1108,7 +1108,9 @@ button.ri-label:focus-visible { outline: 2px solid var(--blue); outline-offset: 
 #info-section-tabs { flex: none; margin-bottom: 6px; }
 .info-section { display: none; flex: 1; min-height: 0; }
 .info-section.active { display: flex; }
-#info-console, #info-resources { flex-direction: column; }
+/* every Info pane stacks its bar over its body — enumerated, so a new pane
+   that forgets to opt in silently lays out sideways */
+#info-console, #info-resources, #info-trash { flex-direction: column; }
 #con-lines {
   flex: 1;
   min-height: 0;
@@ -3555,6 +3557,24 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   opacity: 0.85;
   margin: 0 0 10px;
 }
+/* --- Trash pane (Info tab): recoverable deletions ------------------------- */
+.trash-list { flex: 1; min-height: 0; overflow: auto; padding: 4px; }
+.trash-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 4px;
+  font-size: 12px;
+  border-bottom: var(--border-w, 1px) solid var(--canvas-line);
+}
+.trash-row:last-of-type { border-bottom: 0; }
+.trash-row.restored { opacity: 0.6; }
+.trash-label { flex: 1 1 auto; min-width: 0; color: var(--ink); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.trash-meta { flex: 0 0 auto; color: var(--ink-mut); font-size: 10.5px; white-space: nowrap; }
+.trash-acts { flex: 0 0 auto; display: inline-flex; gap: 4px; }
+.trash-policy { margin: 8px 4px 2px; color: var(--ink-mut); font-size: 10.5px; }
+
 /* a credential that did not reach the store, and the field that holds it */
 .cred-note { color: var(--red); opacity: 1; }
 .cred-note[hidden] { display: none; }
