@@ -1080,12 +1080,15 @@ function renderTrash() {
   }
   host.innerHTML = items.map((it) => {
     const done = !!it.restored_at;
+    // an item the server has retired (its target is gone) is download-only —
+    // offering Restore would promise something that can only 409
+    const canRestore = !done && it.restorable !== false;
     return `<div class="trash-row${done ? " restored" : ""}">` +
       `<span class="trash-label">${esc(it.label || it.kind || "item")}</span>` +
       `<span class="trash-meta">${esc(relIso(it.created))} · ${esc(trashSize(it.bytes))}` +
         `${done ? " · restored" : ""}${it.note ? " · " + esc(it.note) : ""}</span>` +
       `<span class="trash-acts">` +
-        (done ? "" : `<button class="cad-btn tiny" type="button" data-trash-restore="${esc(it.id)}">Restore</button>`) +
+        (canRestore ? `<button class="cad-btn tiny" type="button" data-trash-restore="${esc(it.id)}">Restore</button>` : "") +
         `<button class="cad-btn tiny" type="button" data-trash-download="${esc(it.id)}" ` +
           `data-tip="Download the trashed payload">Download</button>` +
         `<button class="cad-btn tiny danger" type="button" data-trash-forget="${esc(it.id)}" ` +
@@ -1094,6 +1097,34 @@ function renderTrash() {
   }).join("") +
     `<p class="trash-policy">Kept for ${esc(String(s.keep_days || 30))} days or ` +
     `${esc(trashSize(s.cap_bytes))}, whichever comes first.</p>`;
+}
+
+async function trashDownload(id) {
+  // The payload's name varies by kind (pages.pdf, original.pdf, a translation
+  // pair), so it comes from the row rather than a hardcoded path. Fetched
+  // rather than <a href>-clicked because a bare anchor swallows a 404 in
+  // silence — the user would just see nothing happen.
+  const it = ((trashState.data || {}).items || []).find((i) => i.id === id);
+  const files = (it && it.files) || [];
+  const rel = files.includes("original.pdf") ? "original.pdf" : files[0];
+  if (!rel) { statusErr("TRASH :: nothing to download for that item"); return; }
+  let url = "";
+  try {
+    const res = await fetch(
+      `/api/trash/${encodeURIComponent(id)}/payload/${rel.split("/").map(encodeURIComponent).join("/")}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    url = URL.createObjectURL(await res.blob());
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = rel.split("/").pop();
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  } catch (e) {
+    statusErr("TRASH :: download failed — " + (e.message || "error"));
+  } finally {
+    if (url) setTimeout(() => URL.revokeObjectURL(url), 30000);
+  }
 }
 
 async function trashAct(id, what) {
@@ -1105,11 +1136,36 @@ async function trashAct(id, what) {
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
-      const kept = (data.skipped || []).length;
+      const skipped = data.skipped || [];
+      const edited = skipped.filter((s) => s.reason === "edited since the delete").length;
       status(`RESTORED :: ${(data.restored || []).length} file(s)` +
-        (kept ? ` — ${kept} left as edited since` : "") +
-        " — reopen the book to see the pages");
-      // the PDF changed under the workbench's feet; re-render what we can
+        (edited ? ` — ${edited} left as edited since` : "") +
+        (skipped.length > edited
+          ? ` — ${skipped.length - edited} could not be written back` : ""));
+      // The PDF's page structure changed under the workbench's feet. Mirror
+      // what deleteSelectedPages invalidates: every page-keyed cache below is
+      // now indexed against the OLD numbering, so re-rendering without this
+      // draws the restored book with stale words, regions and tags.
+      const row = ((trashState.data || {}).items || []).find((i) => i.id === id);
+      const bid = ((row || {}).origin || {}).build_id || "";
+      if (bid) {
+        ocrState.pdfInfo = {};
+        ocrState.wordsCache.clear();
+        ocrState.regionsCache.clear();
+        delete ocrState.layoutMeta[bid];
+        for (const store of [ocrState.pageTags, ocrState.analysisTags]) {
+          for (const k of [...store.keys()]) {
+            if (k.startsWith(bid + ":")) store.delete(k);
+          }
+        }
+        // the server rewrote title_pages / thumbnail_source back; loadBuilds
+        // is what makes those visible without waiting for a tab switch
+        await loadBuilds();
+        await loadOcrBooks();
+        ocrState.bookLoading = null;
+        ocrState.docs = ocrState.docs.filter((x) => x.buildId !== bid);
+        if (ocrState.book === bid) await selectOcrBook(bid);
+      }
       renderWorkbench();
     } else {
       const res = await fetch("/api/trash/forget", {
@@ -1155,16 +1211,7 @@ function initInfoSections() {
     const f = ev.target.closest("[data-trash-forget]");
     if (f) { trashAct(f.dataset.trashForget, "forget"); return; }
     const d = ev.target.closest("[data-trash-download]");
-    if (d) {
-      // the server sends it as an attachment, so a plain anchor click is the
-      // download — openExternal() would hand it to the OS browser instead
-      const a = document.createElement("a");
-      a.href = `/api/trash/${encodeURIComponent(d.dataset.trashDownload)}/payload/pages.pdf`;
-      a.download = "trashed-pages.pdf";
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-    }
+    if (d) trashDownload(d.dataset.trashDownload);
   });
 }
 
@@ -18425,6 +18472,10 @@ async function deleteSelectedPages() {
     ocrState.wordsCache.clear();
     ocrState.regionsCache.clear();
     delete ocrState.layoutMeta[bid];
+    // the delete just added a row the Trash pane's short cache doesn't know
+    // about; zeroing loadedAt keeps the last paint but forces the next fetch
+    trashState.loadedAt = 0;
+    if (activeInfoSection() === "info-trash") loadTrash(true);
     // reload the renumbered OCR docs and the shrunken PDF
     await loadOcrBooks();
     ocrState.bookLoading = null;

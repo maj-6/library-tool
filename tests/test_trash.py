@@ -281,3 +281,112 @@ def test_translation_delete_is_recoverable(data_root, client):
     again = client.post("/api/trash/restore", json={"id": rec["id"]})
     assert again.status_code == 409
     assert (tdir / "fr.txt").read_text(encoding="utf-8") == "newer"
+
+
+def test_secondary_source_deletion_targets_that_source(data_root, client):
+    """A deletion applied to a SECONDARY scan must record that scan, not the
+    build's primary. Recording the primary made restore splice the secondary's
+    held pages into the primary and write the result over it — silent
+    corruption of the file the user never touched."""
+    bid = "trash009"
+    primary = _seed(bid, data_root)
+    secondary = data_root / "downloads" / "ia" / bid / "second.pdf"
+    _make_pdf(secondary, 4)
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+    builds[bid]["pdf_sources"] = [{"id": "s2", "path": str(secondary)}]
+    server.BUILDS_PATH.write_text(json.dumps(builds), encoding="utf-8")
+
+    result = server._apply_page_deletion(bid, builds, secondary, [2])
+    tid = result["trash_id"]
+    item = server.lib.load_json(server.TRASH_PATH, {})["items"][tid]
+    assert item["origin"]["src_key"] == "s2"
+    assert Path(item["origin"]["pdf"]).resolve() == secondary.resolve()
+
+    # the primary is untouched by both the delete and the restore
+    assert _page_count(primary) == 3
+    assert _page_count(secondary) == 3
+    assert client.post("/api/trash/restore", json={"id": tid}).get_json()["ok"]
+    assert _page_count(primary) == 3
+    assert _page_count(secondary) == 4
+    assert "PAGE 2" in _page_text(secondary, 1)
+
+
+def test_restore_puts_translations_back(data_root, client):
+    """Translations renumber with the PDF, so they must round-trip with it.
+    Without a snapshot the restore rebuilt the pages and left every translated
+    page past the deletion shifted by one, reporting ok with nothing skipped."""
+    bid = "trash010"
+    pdf = _seed(bid, data_root)
+    tdir = server._entry_dir(bid) / "translations"
+    tdir.mkdir(parents=True, exist_ok=True)
+    before = "--- page 1 ---\nuno\n\n--- page 2 ---\ndos\n\n--- page 3 ---\ntres"
+    (tdir / "es.txt").write_text(before, encoding="utf-8")
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+
+    tid = server._apply_page_deletion(bid, builds, pdf, [2])["trash_id"]
+    assert (tdir / "es.txt").read_text(encoding="utf-8") == \
+        "--- page 1 ---\nuno\n\n--- page 2 ---\ntres"
+
+    body = client.post("/api/trash/restore", json={"id": tid}).get_json()
+    assert body["ok"], body
+    assert "translations/es.txt" in body["restored"]
+    assert (tdir / "es.txt").read_text(encoding="utf-8") == before
+
+
+def test_restore_does_not_clobber_a_later_title_page_edit(data_root, client):
+    """title_pages is only written back when it still holds what the delete
+    left. A hand edit afterwards is reported, not overwritten."""
+    bid = "trash011"
+    pdf = _seed(bid, data_root)          # title_pages "1,3"
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+    tid = server._apply_page_deletion(bid, builds, pdf, [2])["trash_id"]
+    assert server.lib.load_json(server.BUILDS_PATH, {})[bid]["title_pages"] == "1,2"
+
+    server._builds_apply(bid, {"title_pages": "2"})
+    body = client.post("/api/trash/restore", json={"id": tid}).get_json()
+    assert body["ok"]
+    assert server.lib.load_json(server.BUILDS_PATH, {})[bid]["title_pages"] == "2"
+    assert any(s["file"] == "title_pages" for s in body["skipped"])
+
+
+def test_retired_item_is_download_only(data_root, client):
+    """When the file a row would restore INTO is gone, the row keeps the
+    deleted pages but drops the pre-image and refuses to restore, rather than
+    sitting there promising an undo that can only fail."""
+    bid = "trash012"
+    pdf = _seed(bid, data_root)
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+    tid = server._apply_page_deletion(bid, builds, pdf, [2])["trash_id"]
+    assert (server.TRASH_DIR / tid / "original.pdf").is_file()
+
+    server._trash_retire(tid, "the original was a temporary download")
+    item = server.lib.load_json(server.TRASH_PATH, {})["items"][tid]
+    assert item["restorable"] is False
+    assert "original.pdf" not in item["files"]
+    assert not (server.TRASH_DIR / tid / "original.pdf").exists()
+    # bytes re-summed, so a dead row stops holding the cap hostage
+    assert item["bytes"] == server._trash_dir_bytes(server.TRASH_DIR / tid)
+
+    res = client.post("/api/trash/restore", json={"id": tid})
+    assert res.status_code == 409
+    # the pages themselves are still there to download
+    assert client.get(f"/api/trash/{tid}/payload/pages.pdf").status_code == 200
+
+
+def test_forget_leaves_an_in_flight_restore_alone(data_root, client):
+    """Empty-trash must not pull a payload out from under a restore that is
+    mid-rewrite — that leaves the PDF restored but the OCR still renumbered,
+    reported as a success."""
+    bid = "trash013"
+    pdf = _seed(bid, data_root)
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+    tid = server._apply_page_deletion(bid, builds, pdf, [2])["trash_id"]
+
+    server._trash_restoring.add(tid)
+    try:
+        body = client.post("/api/trash/forget", json={"all": True}).get_json()
+    finally:
+        server._trash_restoring.discard(tid)
+    assert body["busy"] >= 1
+    assert (server.TRASH_DIR / tid / "pages.pdf").is_file()
+    assert tid in server.lib.load_json(server.TRASH_PATH, {})["items"]

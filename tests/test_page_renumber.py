@@ -213,12 +213,15 @@ def test_apply_page_deletion_end_to_end(data_root):
     # content is gone rather than surviving as an obsolete trailing page.
     assert (translations / "es.txt").read_text(encoding="utf-8") == \
         "--- page 1 ---\nuno\n\n--- page 2 ---\ntres"
-    assert (translations / "es.txt.bak").read_text(encoding="utf-8") == \
+    # the pre-image lives in the trash item now, not as a .bak sibling
+    assert not (translations / "es.txt.bak").exists()
+    assert (tdir / "translations" / "es.txt").read_text(encoding="utf-8") == \
         translated_before
     meta = json.loads((translations / "es.meta.json").read_text(encoding="utf-8"))
     assert set(meta["pages"]) == {"1", "2"}
     assert meta["pages"]["2"]["sha1"] == server._page_sha("charlie")
-    assert (translations / "es.meta.json.bak").is_file()
+    assert not (translations / "es.meta.json.bak").exists()
+    assert (tdir / "translations" / "es.meta.json").is_file()
 
     # Word boxes and extracted figures use the same remap. A figure from the
     # deleted page is removed from layout metadata; the kept page 3 moves to 2.

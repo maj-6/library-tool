@@ -2342,6 +2342,7 @@ def api_build_folder_sync(build_id: str):
     notes = []
     src = None
     preview_ok = False  # THIS sync produced a fresh preview.pdf
+    trim_tid = ""       # trash row for a blank-page trim done by THIS sync
     pf = (b.get("pdf_file") or "").strip()
     if pf:
         sp = _resolve_local(pf)
@@ -2350,7 +2351,7 @@ def api_build_folder_sync(build_id: str):
         else:
             notes.append("pdf_file not found")
     # blank pages are trimmed from the REAL PDF before the preview and
-    # extraction are built (backup kept, OCR files renumbered) — skipped
+    # extraction are built (removed pages go to the trash, OCR renumbered) — skipped
     # for the truncated preview derivative and while an OCR job runs
     if trim_blank and src is not None:
         running = [j for j in _ocr_jobs.values()
@@ -2369,7 +2370,8 @@ def api_build_folder_sync(build_id: str):
             try:
                 blanks = _blank_pages(src)
                 if blanks:
-                    _apply_page_deletion(build_id, builds, src, blanks)
+                    trim_tid = str(_apply_page_deletion(
+                        build_id, builds, src, blanks).get("trash_id") or "")
                     b = builds[build_id]
                     # the folder metadata must reflect the remapped
                     # title_pages, not the pre-trim snapshot
@@ -2422,10 +2424,13 @@ def api_build_folder_sync(build_id: str):
                 srcr = src.resolve()
                 if srcr.is_relative_to(lib.IA_DOWNLOADS_DIR.resolve()):
                     src.unlink()
-                    # a trim in this same sync left a full-size backup of
-                    # the original — pointless once the original itself is
-                    # a disposed temporary artifact
-                    src.with_suffix(".bak.pdf").unlink(missing_ok=True)
+                    # a trim in this same sync trashed the pages it removed,
+                    # and the row points at the file just deleted. The pages
+                    # themselves are still worth keeping (download-only), but
+                    # the full pre-image is now dead weight against the cap.
+                    if trim_tid:
+                        _trash_retire(trim_tid, "the original was a temporary "
+                                      "download and has been removed")
                     notes.append("original removed (temporary artifact)")
                     # nothing may keep pointing at the deleted file: the
                     # entry folder's own PDF becomes the build's PDF, and
@@ -5354,6 +5359,15 @@ _TRASH_KEEP_DAYS = 30
 _TRASH_MAX_BYTES = 2 << 30           # 2 GiB
 _TRASH_FLOOR_MINUTES = 60            # never prune something this fresh
 _TRASH_FULL_COPY_MAX = 64 << 20      # PDFs at/under this also keep a full pre-image
+# payload prefixes that restore writes back over the live file. Anything
+# outside this set is download-only, so both sides must agree on it: a snapshot
+# stamped here but not written back (or vice versa) is a silent half-restore.
+_TRASH_WRITEBACK = ("ocr/", "translations/")
+# ids with a restore in flight. A restore does its file work OUTSIDE the index
+# lock (it rewrites a whole PDF), so without this a concurrent Empty-trash could
+# delete the payload mid-read and leave the book with restored pages but
+# still-renumbered OCR — reported as a success. Guarded by _trash_lock.
+_trash_restoring: set[str] = set()
 
 
 def _trash_dir_bytes(d: Path) -> int:
@@ -5408,6 +5422,8 @@ def _trash_prune_locked(doc: dict) -> None:
         running += int(rec.get("bytes") or 0)
         if when > floor:
             continue                      # too fresh to prune, whatever the caps
+        if str(rec.get("id") or "") in _trash_restoring:
+            continue                      # a restore is reading this payload
         if (i >= _TRASH_KEEP or when < cutoff or running > _TRASH_MAX_BYTES):
             doomed.append(str(rec.get("id") or ""))
     for tid in doomed:
@@ -5416,7 +5432,7 @@ def _trash_prune_locked(doc: dict) -> None:
     # orphan sweep: directories whose row never landed (the crash window above)
     try:
         for d in TRASH_DIR.iterdir():
-            if not d.is_dir() or d.name in items:
+            if not d.is_dir() or d.name in items or d.name in _trash_restoring:
                 continue
             if datetime.fromtimestamp(d.stat().st_mtime, timezone.utc) > floor:
                 continue                  # may be a commit still in flight
@@ -5444,6 +5460,46 @@ def _trash_commit(tid: str, kind: str, label: str, origin: dict,
         return tid
 
     return _mutate_json(TRASH_PATH, _trash_lock, {"version": 1, "items": {}}, apply)
+
+
+def _trash_amend(tid: str, files: list[str], stamps: dict,
+                 restore: dict | None = None) -> None:
+    """Enrich an already-registered row with payload written after the commit.
+
+    The row is registered the moment the destructive step lands, so it can
+    never be missing while the user's data is already gone; the collateral
+    snapshots taken afterwards are folded in here. Re-sums bytes so the caps
+    stay honest.
+    """
+    def apply(doc):
+        rec = (doc.get("items") or {}).get(tid)
+        if rec is None:
+            return
+        rec["files"] = list(files)
+        rec.setdefault("restore", {})["stamps"] = stamps
+        rec["restore"].update(restore or {})
+        rec["bytes"] = _trash_dir_bytes(TRASH_DIR / tid)
+
+    _mutate_json(TRASH_PATH, _trash_lock, {"version": 1, "items": {}}, apply)
+
+
+def _trash_retire(tid: str, why: str) -> None:
+    """Downgrade a row to download-only: the thing it would restore INTO is
+    gone, so keep the payload the user might still want (the pages) and drop
+    the pre-image that only restore could have used. Re-sums bytes so a dead
+    row stops holding the cap hostage."""
+    def apply(doc):
+        rec = (doc.get("items") or {}).get(tid)
+        if rec is None:
+            return
+        (TRASH_DIR / tid / "original.pdf").unlink(missing_ok=True)
+        rec["files"] = [f for f in (rec.get("files") or []) if f != "original.pdf"]
+        rec["payload_kind"] = "pages"
+        rec["restorable"] = False
+        rec["note"] = why
+        rec["bytes"] = _trash_dir_bytes(TRASH_DIR / tid)
+
+    _mutate_json(TRASH_PATH, _trash_lock, {"version": 1, "items": {}}, apply)
 
 
 def _trash_rel_ok(rel: str) -> bool:
@@ -5523,16 +5579,22 @@ def api_trash_forget():
     if not wipe_all and not _trash_rel_ok(tid):
         return jsonify({"ok": False, "error": "bad id"}), 400
 
+    busy = []
+
     def apply(doc):
         items = doc.setdefault("items", {})
-        targets = list(items) if wipe_all else ([tid] if tid in items else [])
+        found = list(items) if wipe_all else ([tid] if tid in items else [])
+        # never pull a payload out from under a restore that is mid-rewrite
+        targets = []
+        for t in found:
+            (busy if t in _trash_restoring else targets).append(t)
         for t in targets:
             shutil.rmtree(TRASH_DIR / t, ignore_errors=True)
             items.pop(t, None)
         return len(targets)
 
     n = _mutate_json(TRASH_PATH, _trash_lock, {"version": 1, "items": {}}, apply)
-    return jsonify({"ok": True, "forgotten": n})
+    return jsonify({"ok": True, "forgotten": n, "busy": len(busy)})
 
 
 def _trash_restore_pdf_pages(item: dict) -> tuple[dict, int]:
@@ -5582,13 +5644,21 @@ def _trash_restore_pdf_pages(item: dict) -> tuple[dict, int]:
         with open(tmp, "wb") as fh:
             writer.write(fh)
         tmp.replace(pdf)
+        # Bump BEFORE the collateral work. The page structure genuinely changed
+        # as of the line above, so the OCR guard has to see it even if every
+        # step below fails. Everything after this point is best-effort and
+        # reports through `skipped`: raising instead would leave the book
+        # half-restored AND permanently unrestorable, because the page-count
+        # guard above would reject every retry.
+        _page_structure_revision[build_id] = (
+            _page_structure_revision.get(build_id, 0) + 1)
 
         # write back only the snapshots whose live file is untouched since the
         # delete — silently overwriting an edit would be its own data loss
         restored, skipped = ["pages.pdf"], []
         stamps = rest.get("stamps") or {}
         for rel in (item.get("files") or []):
-            if not rel.startswith("ocr/"):
+            if not rel.startswith(_TRASH_WRITEBACK):
                 continue
             src = _trash_payload_path(str(item.get("id") or ""), rel)
             live = _entry_dir(build_id) / rel
@@ -5604,18 +5674,34 @@ def _trash_restore_pdf_pages(item: dict) -> tuple[dict, int]:
             if want and not same:
                 skipped.append({"file": rel, "reason": "edited since the delete"})
                 continue
-            live.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, live)
+            try:
+                live.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, live)
+            except OSError:
+                skipped.append({"file": rel, "reason": "could not be written back"})
+                continue
             restored.append(rel)
 
+        # Build fields get the same edited-since guard as the snapshots. Only
+        # the keys the delete actually rewrote carry an "_after" value, so a
+        # field it never touched is never written — and one the user has since
+        # changed by hand is reported rather than clobbered.
+        live_b = lib.load_json(BUILDS_PATH, {}).get(build_id) or {}
         changed = {}
-        if str(origin.get("src_key") or "") == "primary":
-            changed["title_pages"] = str(rest.get("title_pages_before") or "")
-            changed["thumbnail_source"] = str(rest.get("thumbnail_source_before") or "")
+        for key in ("title_pages", "thumbnail_source"):
+            after = rest.get(f"{key}_after")
+            if after is None:
+                continue
+            if str(live_b.get(key) or "") != str(after):
+                skipped.append({"file": key, "reason": "edited since the delete"})
+                continue
+            changed[key] = str(rest.get(f"{key}_before") or "")
         if changed:
-            _builds_apply(build_id, changed)
-        _page_structure_revision[build_id] = (
-            _page_structure_revision.get(build_id, 0) + 1)
+            try:
+                _builds_apply(build_id, changed)
+            except OSError:
+                skipped.append({"file": "entry record",
+                                "reason": "could not be written back"})
 
     # the caller (api_trash_restore) owns marking the row restored
     return {"ok": True, "restored": restored, "skipped": skipped,
@@ -5699,16 +5785,27 @@ def api_trash_restore():
     item = (doc.get("items") or {}).get(tid)
     if not item:
         return jsonify({"ok": False, "error": "no such item"}), 404
+    if item.get("restorable") is False:
+        return jsonify({"ok": False, "error": str(item.get("note") or "")
+                        or "this item can no longer be restored"}), 409
     kind = str(item.get("kind") or "")
-    if kind == "pdf_pages":
-        body, code = _trash_restore_pdf_pages(item)
-    elif kind in ("build", "manual_entry"):
-        body, code = _trash_restore_record(item)
-    elif kind == "translation":
-        body, code = _trash_restore_translation(item)
-    else:
+    if kind not in ("pdf_pages", "build", "manual_entry", "translation"):
         return jsonify({"ok": False,
                         "error": f"restoring '{kind}' is not supported yet"}), 501
+    # claim the payload for the duration: a concurrent forget/prune would
+    # otherwise be free to delete it out from under the read below
+    with _trash_lock:
+        _trash_restoring.add(tid)
+    try:
+        if kind == "pdf_pages":
+            body, code = _trash_restore_pdf_pages(item)
+        elif kind == "translation":
+            body, code = _trash_restore_translation(item)
+        else:
+            body, code = _trash_restore_record(item)
+    finally:
+        with _trash_lock:
+            _trash_restoring.discard(tid)
     if body.get("ok"):
         # one owner for the row update, whatever the kind: the pane greys a
         # restored item rather than dropping it, so the restore stays visible
@@ -5835,15 +5932,41 @@ def _renumber_layout_words(build_id: str, src_key: str, removed: list[int]) -> N
 
 
 def _renumber_translation_artifacts(build_id: str, src_key: str,
-                                    removed: list[int]) -> list[str]:
+                                    removed: list[int],
+                                    snapshot: Path | None = None,
+                                    snapshot_out: list[str] | None = None
+                                    ) -> list[str]:
     """Keep translated text and its source-hash sidecars page-aligned.
-    Returns the entry-relative paths of the renumbered translations."""
+    Returns the entry-relative paths of the renumbered translations.
+
+    `snapshot` is a trash payload directory: each file is copied there VERBATIM
+    before it is rewritten, and its "translations/<name>" key appended to
+    `snapshot_out`. The copy happens here rather than in the caller because
+    only this function knows which translations belong to `src_key` — a
+    translation of a different source doesn't renumber and must not be
+    snapshotted, or restore would write back a file the delete never touched.
+    """
     d = _entry_dir(build_id) / "translations"
     renumbered: list[str] = []
     if not d.is_dir():
         return renumbered
     srcmap = _ocr_sources(build_id)
     removed_set = set(removed)
+
+    def _snap(p: Path) -> None:
+        """Verbatim pre-image into the trash payload. Best-effort: a snapshot
+        that can't be written must not abort the alignment pass — restore just
+        reports that file as skipped instead."""
+        if snapshot is None:
+            return
+        try:
+            (snapshot / "translations").mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, snapshot / "translations" / p.name)
+            if snapshot_out is not None:
+                snapshot_out.append(f"translations/{p.name}")
+        except OSError:
+            pass
+
     with _an_write_lock:
         for text_path in sorted(d.glob("*.txt")):
             lang = text_path.stem
@@ -5854,18 +5977,15 @@ def _renumber_translation_artifacts(build_id: str, src_key: str,
             if source_key != src_key:
                 continue
             renumbered.append(f"translations/{text_path.name}")
+            _snap(text_path)
 
             raw = text_path.read_text(encoding="utf-8", errors="replace")
-            text_path.with_name(text_path.name + ".bak").write_text(
-                raw, encoding="utf-8", errors="replace")
             text_path.write_text(_renumber_marked_text(raw, removed),
                                  encoding="utf-8", errors="replace")
 
             if not meta_path.is_file():
                 continue
-            meta_path.with_name(meta_path.name + ".bak").write_text(
-                meta_path.read_text(encoding="utf-8", errors="replace"),
-                encoding="utf-8", errors="replace")
+            _snap(meta_path)
             remapped = {}
             for key, rec in meta.get("pages", {}).items():
                 try:
@@ -6009,14 +6129,40 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
     tmp = pdf.with_suffix(".del.tmp")
     with open(tmp, "wb") as fh:
         writer.write(fh)
+    b = builds[build_id]
+    src_key = _src_key_for_path(b, pdf)
+    # Record the PDF that is actually being edited. A secondary source is a
+    # first-class case here (the whole src_key branching below exists for it),
+    # and pointing the row at the build's PRIMARY would make restore splice a
+    # secondary's pages into the primary — silent corruption. Prefer the STORED
+    # path string so the row survives a DATA_ROOT move.
+    src_path = str(b.get("pdf_file") or "")
+    if src_key != "primary":
+        src_path = str(pdf)
+        for s in (b.get("pdf_sources") or []):
+            if str(s.get("id") or "") == src_key and s.get("path"):
+                src_path = str(s.get("path"))
+                break
     tmp.replace(pdf)
+    # REGISTER NOW, not at the end. The pages are gone from disk as of the line
+    # above; if anything in the collateral tail below raises, the row must
+    # already exist or the payload becomes an unregistered orphan that the next
+    # prune silently removes — losing the very pages this feature exists to keep.
+    # The tail's snapshots are folded in by _trash_amend once they are written.
+    label = (f"{len(pages)} page{'' if len(pages) == 1 else 's'} from "
+             f"{b.get('title') or build_id}")
+    _trash_commit(
+        tid, "pdf_pages", label,
+        {"build_id": build_id, "pdf": src_path, "src_key": src_key},
+        {"pages": pages, "pages_before": total, "pages_after": len(keep),
+         "title_pages_before": str(b.get("title_pages") or ""),
+         "thumbnail_source_before": str(b.get("thumbnail_source") or "")},
+        payload_kind, list(tfiles))
     # keep the build's OCR files and title pages aligned with the new
     # numbering (under the merge lock: a job finishing this instant must
     # not interleave with the renumber writes). Only the files that came
     # FROM this PDF renumber — a secondary scan's OCR has its own page
     # numbering and must not shift with the primary's deletions.
-    b = builds[build_id]
-    src_key = _src_key_for_path(b, pdf)
     srcmap = _ocr_sources(build_id)
     ocr_dir = _entry_dir(build_id) / "ocr"
     renumbered = []
@@ -6056,15 +6202,17 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
     # Translations use the same page-marker convention, and their provenance
     # sidecars key each source hash by page. Move both in one protected pass so
     # stale detection and eventual publication never retain an obsolete tail.
-    moved = _renumber_translation_artifacts(build_id, src_key, pages)
+    # Each affected file is snapshotted WHOLE on its way through: without this
+    # a restore rebuilt the PDF and the OCR but left every translated page past
+    # the deletion point shifted by one, and said "ok" with nothing in `skipped`.
+    moved = _renumber_translation_artifacts(build_id, src_key, pages,
+                                            snapshot=tdir, snapshot_out=tfiles)
     _manifest_after_renumber(
         build_id, [f"ocr/{n}" for n in renumbered] + ["ocr/layout.json"],
         moved)
     # title pages are counted on the PRIMARY PDF; a secondary's deletions
-    # don't move them
-    # capture the pre-remap values for the trash BEFORE they are rewritten
-    title_pages_before = str(b.get("title_pages") or "")
-    thumbnail_source_before = str(b.get("thumbnail_source") or "")
+    # don't move them. The pre-remap values are already in the row committed
+    # above (b hasn't been rewritten yet at this point).
     titles = [] if src_key != "primary" else \
         [int(x) for x in str(b.get("title_pages") or "").split(",")
          if x.strip().isdigit()]
@@ -6091,14 +6239,14 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
         # the remap to a fresh read, and keep the returned record in step
         b.update(changed)
         b["updated_at"] = _builds_apply(build_id, changed)
-    # Register LAST: every payload byte is on disk by now, so a crash before
-    # this point leaves a sweepable orphan rather than a row pointing at
-    # nothing. Stamp each written-back-able snapshot with the POST-delete
-    # (size, mtime) of its live file, so restore can tell "untouched since"
-    # from "the user edited this afterwards".
+    # Fold the collateral snapshots into the row registered above. Stamp each
+    # written-back-able snapshot with the POST-delete (size, mtime) of its live
+    # file, so restore can tell "untouched since" from "the user edited this
+    # afterwards". Same idea for the build fields: record what the delete LEFT
+    # so restore can decline to clobber a later hand edit.
     stamps = {}
     for rel in tfiles:
-        if not rel.startswith("ocr/"):
+        if not rel.startswith(_TRASH_WRITEBACK):
             continue
         live = _entry_dir(build_id) / rel
         try:
@@ -6106,17 +6254,8 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
             stamps[rel] = [st.st_size, st.st_mtime]
         except OSError:
             continue
-    label = (f"{len(pages)} page{'' if len(pages) == 1 else 's'} from "
-             f"{b.get('title') or build_id}")
-    _trash_commit(
-        tid, "pdf_pages", label,
-        {"build_id": build_id, "pdf": str(b.get("pdf_file") or ""),
-         "src_key": src_key},
-        {"pages": pages, "pages_before": total, "pages_after": len(keep),
-         "title_pages_before": title_pages_before,
-         "thumbnail_source_before": thumbnail_source_before,
-         "stamps": stamps},
-        payload_kind, tfiles)
+    _trash_amend(tid, tfiles, stamps,
+                 {f"{k}_after": v for k, v in changed.items()})
     return {"deleted": pages, "pages": len(keep),
             "renumbered": renumbered,
             "trash_id": tid,

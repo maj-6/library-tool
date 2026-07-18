@@ -357,8 +357,8 @@ is decided by a tolerant composite rather than exact strings:
   processes until the submit button sends them — processing is always
   prompted manually. Clicking a page image selects it, Ctrl+click
   selects a range; a digit stages the selection; the trash button (or
-  Delete) removes selected pages from the actual PDF (pypdf rewrite
-  with a .bak.pdf backup) and renumbers the entry's OCR files and
+  Delete) removes selected pages from the actual PDF (pypdf rewrite;
+  the removed pages go to Info > Trash) and renumbers the entry's OCR files and
   title pages to match. The OCR documents list is scoped to the
   current book (loose local files stay visible). Attention marks moved
   from Shift+click (which fought text selection) to pressing Q while

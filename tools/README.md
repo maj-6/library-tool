@@ -510,7 +510,8 @@ Two parts, separated by a **drag-to-resize splitter**:
     (`output/entries/<id>/`): `metadata.json`, `preview.pdf`, and
     `ocr/extracted.txt`. With **Trim blank pages automatically** on
     (Library & data settings), visually blank pages are removed from the
-    actual PDF first — backup kept as `.bak.pdf`, OCR files renumbered — before
+    actual PDF first — removed pages go to Info > Trash, OCR files renumbered
+    — before
     the preview and extraction are built. When KEEP IA ORIGINALS is off, the downloaded
     original is treated as a temporary artifact and removed after the
     preview is built — the entry's PDF is repointed at the folder's
@@ -587,8 +588,8 @@ until the **submit** button sends the staged pages. **Clicking a page
 image selects it; Ctrl+click selects the range** from the last click
 (3px amber outline); a digit stages the whole selection, and the
 **trash button (or Delete) removes the selected pages from the actual
-PDF** — not just the preview: the file is rewritten (the previous
-version stays next to it as `.bak.pdf`) and the entry's OCR files and
+PDF** — not just the preview: the file is rewritten (the removed pages
+go to **Info > Trash**, restorable for 30 days) and the entry's OCR files and
 title pages are **renumbered to match**. **Pressing T over a page marks
 it as a title page** (purple T chip; stored on the entry as
 `title_pages` — it feeds the Editor's Resources tab).
