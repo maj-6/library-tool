@@ -37,6 +37,7 @@ const VIEW_STATE_KEYS = new Set([
   "topTable", "bottomActive", "whlMode", "checkedMode", "showCatalog",
   "paneWidth", "uploadSplitH", "publishSidebarCollapsed", "workbenchPhase",
   "jobsDrawerOpen", "authPromptDismissed", "checkedCols",
+  "remarksSidebarCollapsed", "remarksFilters",
 ]);
 // Credentials are never persisted client-side. They live in the server's
 // Host-guarded secrets store (/api/secrets); Mistral additionally syncs through
@@ -194,6 +195,8 @@ const state = {
     ocrAwsKey: "", ocrAwsSecret: "", ocrAwsRegion: "",
     ocrImageWidth: 1400,
     ocrLayout: true,    // page view: place words where they sit on the page
+    ocrPaperColor: false,   // tint facsimile paper from sampled PDF margins
+    ocrPaperLighten: 20,    // percent mixed toward white after sampling
     ocrFurniture: true, // region facsimile: show marginalia/headers/catchwords
     textAnalysisService: "configured",
     workbenchPhase: "record",   // last phase open on the Workbench
@@ -209,7 +212,7 @@ const state = {
     dbUrls: {},                 // per-database download URLs (name -> url)
     uploadSplitH: null, pdfBrowseDir: "",
     scanRecentMin: 30,          // scan-attach picker: show only PDFs this new
-    whlModalOcr: false,         // OCR panel in the WHL publication viewer
+    whlModalOcr: true,          // OCR panel in the WHL publication viewer
     previewPages: 20,           // page cap for PDF preview derivatives
     previewOriginal: false,     // view the original PDF instead of a preview
     keepOriginals: true,        // keep IA originals after a folder build
@@ -231,6 +234,9 @@ const state = {
     includePrereleaseUpdates: false, // desktop: allow alpha/beta/rc auto-updates
     publishGroup: "sets",           // organization of the Publish file tree
     publishSidebarCollapsed: false,
+    remarksSidebarCollapsed: true,  // visible rail by default; category choice is per tab
+    remarksFilters: {},
+    remarksMeta: {},                // synced labels/categories for keyed marks
   },
   editTarget: null,             // record open in the EDIT tab
   sort: { checked: null, whl: null },  // {key, dir} per top table
@@ -644,7 +650,9 @@ function conPut(level, msg, src) {
 
 function conVisible() {
   const p = el("infotab");
-  return !!p && p.classList.contains("active");
+  const consolePane = el("info-console");
+  return !!p && p.classList.contains("active") && !!consolePane &&
+    consolePane.classList.contains("active");
 }
 
 let _conTimer = null;
@@ -740,6 +748,177 @@ function initConsole() {
   pollConsoleLog();
   setInterval(pollConsoleLog, 3000);
 }
+
+// --- Info tab: Console / Resources and database inventory -------------------
+
+const dbResourceState = {
+  data: null, selected: "", loadedAt: 0, loading: false, error: "",
+};
+
+function activeInfoSection() {
+  const tab = document.querySelector("#info-section-tabs .pane-tab.active");
+  return tab ? tab.dataset.infoSection : "info-console";
+}
+
+function dbResourceDate(value) {
+  if (!value) return "Never";
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return String(value);
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium", timeStyle: "short",
+  }).format(date);
+}
+
+function dbResourceEntries(target) {
+  if (!target || target.entries == null) return "Not available";
+  const count = Number(target && target.entries);
+  if (!Number.isFinite(count)) return "Not available";
+  return `${count.toLocaleString()} ${target.entry_unit || "entries"}`;
+}
+
+function dbResourceStatus(target) {
+  const job = target.job || {};
+  if (job.status === "downloading") {
+    const pct = job.total ? Math.round(100 * (job.downloaded || 0) / job.total) : 0;
+    return { label: `Syncing ${pct}%`, cls: "syncing" };
+  }
+  if (job.status === "error") return { label: "Sync failed", cls: "error" };
+  return target.present
+    ? { label: "Loaded", cls: "loaded" }
+    : { label: "Not loaded", cls: "missing" };
+}
+
+function dbResourceLink(url, label) {
+  const safe = /^https?:\/\//i.test(String(url || ""));
+  return safe
+    ? `<a href="${esc(url)}" target="_blank" rel="noopener">${esc(label || url)}</a>`
+    : esc(label || url || "Not specified");
+}
+
+function dbResourceDetailRow(label, valueHtml) {
+  return `<div class="db-resource-row"><dt>${esc(label)}</dt><dd>${valueHtml}</dd></div>`;
+}
+
+function renderDatabaseResources() {
+  const menu = el("db-resource-menu");
+  const detail = el("db-resource-detail");
+  const summary = el("db-resource-summary");
+  if (!menu || !detail || !summary) return;
+
+  if (dbResourceState.error) {
+    summary.textContent = "Database status unavailable";
+    menu.innerHTML = "";
+    detail.innerHTML = `<div class="db-resource-error">${esc(dbResourceState.error)}</div>`;
+    return;
+  }
+  const targets = Object.entries((dbResourceState.data || {}).targets || {});
+  if (!targets.length) {
+    summary.textContent = dbResourceState.loading ? "Loading…" : "No databases reported";
+    menu.innerHTML = "";
+    detail.innerHTML = `<div class="empty">${dbResourceState.loading
+      ? "Reading database metadata…" : "No database resources were reported."}</div>`;
+    return;
+  }
+
+  const loaded = targets.filter(([, target]) => target.present);
+  const totalSize = loaded.reduce((sum, [, target]) => sum + Number(target.size || 0), 0);
+  summary.textContent = `${loaded.length} of ${targets.length} loaded` +
+    (totalSize ? ` · ${dbFmtBytes(totalSize)}` : "") +
+    (dbResourceState.loading ? " · refreshing…" : "");
+  if (!targets.some(([name]) => name === dbResourceState.selected)) {
+    dbResourceState.selected = (loaded[0] || targets[0])[0];
+  }
+
+  menu.innerHTML = targets.map(([name, target]) => {
+    const status = dbResourceStatus(target);
+    const selected = name === dbResourceState.selected;
+    const meta = target.present
+      ? [dbFmtBytes(target.size), dbResourceEntries(target)].filter(Boolean).join(" · ")
+      : "File not found";
+    return `<button class="db-resource-menu-item${selected ? " active" : ""}" ` +
+      `type="button" aria-pressed="${selected}" data-db-resource="${esc(name)}">` +
+      `<span class="db-resource-menu-line"><span class="db-resource-menu-name">${esc(target.label || name)}</span>` +
+      `<span class="db-resource-state ${esc(status.cls)}">${esc(status.label)}</span></span>` +
+      `<span class="db-resource-menu-meta">${esc(meta)}</span></button>`;
+  }).join("");
+
+  const target = (dbResourceState.data.targets || {})[dbResourceState.selected];
+  if (!target) return;
+  const status = dbResourceStatus(target);
+  let rows = "";
+  rows += dbResourceDetailRow("Format", esc(target.format || "Unknown"));
+  rows += dbResourceDetailRow("Size", target.present ? esc(dbFmtBytes(target.size)) : "Not available");
+  rows += dbResourceDetailRow("Entries", esc(dbResourceEntries(target)));
+  rows += dbResourceDetailRow("Origin", dbResourceLink(target.origin_url, target.origin));
+  rows += dbResourceDetailRow("Last updated / synced", esc(dbResourceDate(target.updated_at)));
+  rows += dbResourceDetailRow("Local source", esc(target.location || "Not loaded"));
+  rows += dbResourceDetailRow("File", esc(target.resolved_path || target.filename || "Not found"));
+  if (target.url) rows += dbResourceDetailRow("Download source",
+    dbResourceLink(target.url, target.url));
+  if (target.metadata_error) rows += dbResourceDetailRow("Metadata note",
+    `<span class="db-resource-warn">${esc(target.metadata_error)}</span>`);
+  if (target.job && target.job.status === "error") rows += dbResourceDetailRow("Sync error",
+    `<span class="db-resource-warn">${esc(target.job.error || "Unknown error")}</span>`);
+
+  detail.innerHTML = `<div class="db-resource-detail-head">` +
+    `<div><h2>${esc(target.label || dbResourceState.selected)}</h2>` +
+    `<div class="db-resource-file">${esc(target.filename || target.path || "")}</div></div>` +
+    `<span class="db-resource-state ${esc(status.cls)}">${esc(status.label)}</span></div>` +
+    `<p class="db-resource-description">${esc(target.description || "No description available.")}</p>` +
+    `<dl class="db-resource-details">${rows}</dl>`;
+}
+
+async function loadDatabaseResources(force) {
+  if (dbResourceState.loading) return;
+  if (!force && dbResourceState.data && Date.now() - dbResourceState.loadedAt < 15000) {
+    renderDatabaseResources();
+    return;
+  }
+  dbResourceState.loading = true;
+  dbResourceState.error = "";
+  renderDatabaseResources();
+  try {
+    const response = await fetch("/api/db/status");
+    if (!response.ok) throw new Error(`Database status returned ${response.status}`);
+    dbResourceState.data = await response.json();
+    dbResourceState.loadedAt = Date.now();
+  } catch (error) {
+    dbResourceState.error = "Could not read database metadata from the local service.";
+  } finally {
+    dbResourceState.loading = false;
+    renderDatabaseResources();
+  }
+}
+
+function refreshInfoTabSection() {
+  if (activeInfoSection() === "info-resources") loadDatabaseResources(false);
+  else { pollConsoleLog(); renderConsole(); }
+}
+
+function switchInfoSection(id) {
+  document.querySelectorAll("#info-section-tabs [data-info-section]").forEach((tab) => {
+    const active = tab.dataset.infoSection === id;
+    tab.classList.toggle("active", active);
+    tab.setAttribute("aria-selected", String(active));
+  });
+  document.querySelectorAll("#infotab .info-section").forEach((section) =>
+    section.classList.toggle("active", section.id === id));
+  refreshInfoTabSection();
+}
+
+function initInfoSections() {
+  for (const tab of document.querySelectorAll("#info-section-tabs [data-info-section]")) {
+    tab.addEventListener("click", () => switchInfoSection(tab.dataset.infoSection));
+  }
+  el("db-resource-refresh").addEventListener("click", () => loadDatabaseResources(true));
+  el("db-resource-menu").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-db-resource]");
+    if (!button) return;
+    dbResourceState.selected = button.dataset.dbResource;
+    renderDatabaseResources();
+  });
+}
+
 function ckey(source, idx) { return `${source}:${idx}`; }
 
 // --- icon set (inline SVG, stroke = currentColor) ------------------------------
@@ -1253,8 +1432,17 @@ function normalizeSettings() {
   if (!["sets", "author", "category", "date"].includes(state.settings.publishGroup))
     state.settings.publishGroup = "sets";
   state.settings.publishSidebarCollapsed = !!state.settings.publishSidebarCollapsed;
+  state.settings.remarksSidebarCollapsed = !!state.settings.remarksSidebarCollapsed;
+  if (!state.settings.remarksFilters || typeof state.settings.remarksFilters !== "object" ||
+      Array.isArray(state.settings.remarksFilters)) state.settings.remarksFilters = {};
+  if (!state.settings.remarksMeta || typeof state.settings.remarksMeta !== "object" ||
+      Array.isArray(state.settings.remarksMeta)) state.settings.remarksMeta = {};
   if (!["tesseract", "mistral", "claude", "textract"].includes(state.settings.ocrService))
     state.settings.ocrService = "tesseract";
+  state.settings.ocrPaperColor = !!state.settings.ocrPaperColor;
+  let _opl = parseInt(state.settings.ocrPaperLighten, 10);
+  if (!Number.isFinite(_opl)) _opl = 20;
+  state.settings.ocrPaperLighten = Math.max(0, Math.min(100, _opl));
   state.settings.textAnalysisService = "configured";
   if (!WB_PHASES.includes(state.settings.workbenchPhase))
     state.settings.workbenchPhase = "record";
@@ -1325,6 +1513,8 @@ let clientStateReady = false;   // gates write-through until the load-sync ran
 const _csPending = {};          // kind -> true, coalesced
 let _csTimer = null;
 let _csBulk = 0;                // >0 during a bulk op: accumulate, flush once at end
+let _csRetryMs = 2000;
+let _csFlushPromise = null;     // serialize whole-blob PUTs; newest state writes last
 
 function clientStateBlob(kind) {
   if (kind === "checked") return checkedArray();
@@ -1358,19 +1548,52 @@ async function withBulkClientState(fn) {
   }
 }
 
-async function flushClientState() {
-  const kinds = Object.keys(_csPending);
-  if (!kinds.length) return;
-  for (const k of kinds) delete _csPending[k];
-  const body = {};
-  for (const k of kinds) body[k] = clientStateBlob(k);
-  try {
-    await fetch("/api/client_state", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-  } catch (e) { /* offline: the localStorage cache still holds it */ }
+function flushClientState() {
+  if (_csFlushPromise) return _csFlushPromise;
+  let retryScheduled = false;
+  _csFlushPromise = (async () => {
+    // A mark can change while a PUT is in flight. Drain that newly pending
+    // snapshot only after the first response, so two whole-blob replacements
+    // can never complete out of order and resurrect stale attention state.
+    while (_csBulk === 0 && Object.keys(_csPending).length) {
+      const kinds = Object.keys(_csPending);
+      for (const k of kinds) delete _csPending[k];
+      const body = {};
+      for (const k of kinds) body[k] = clientStateBlob(k);
+      try {
+        const res = await fetch("/api/client_state", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) throw new Error(`client state ${res.status}`);
+        if (kinds.includes("attention") && !_csPending.attention) {
+          try { localStorage.removeItem(ATTN_DIRTY_KEY); } catch (e) {}
+        }
+        _csRetryMs = 2000;
+      } catch (e) {
+        // Keep failed blobs pending and retry with a bounded backoff. Attention
+        // also carries a durable dirty bit so a restart cannot resurrect a mark
+        // that was cleared locally while the sidecar write was unavailable.
+        for (const k of kinds) _csPending[k] = true;
+        clearTimeout(_csTimer);
+        _csTimer = setTimeout(flushClientState, _csRetryMs);
+        _csRetryMs = Math.min(30000, _csRetryMs * 2);
+        retryScheduled = true;
+        return false;
+      }
+    }
+    return true;
+  })().finally(() => {
+    _csFlushPromise = null;
+    // A bulk operation can finish in the narrow gap while the prior drain is
+    // settling. Its pushes intentionally had no timer, so hand them a new turn.
+    if (!retryScheduled && _csBulk === 0 && Object.keys(_csPending).length) {
+      clearTimeout(_csTimer);
+      _csTimer = setTimeout(flushClientState, 0);
+    }
+  });
+  return _csFlushPromise;
 }
 
 // When the same book is checked in both the local cache and the server copy,
@@ -1392,6 +1615,10 @@ function richerEntry(a, b) {
 // caller re-applies theme/fonts and re-renders).
 async function syncClientStateOnLoad() {
   let server = null;
+  let attentionDirty = false;
+  const localRemarksMeta = state.settings.remarksMeta;
+  try { attentionDirty = localStorage.getItem(ATTN_DIRTY_KEY) === "1"; }
+  catch (e) {}
   try { server = await (await fetch("/api/client_state")).json(); }
   catch (e) { clientStateReady = true; return false; }   // offline: keep local
   const hasServer = server &&
@@ -1422,6 +1649,7 @@ async function syncClientStateOnLoad() {
       for (const k of Object.keys(server.settings))
         if (!VIEW_STATE_KEYS.has(k)) incoming[k] = server.settings[k];
       state.settings = Object.assign(state.settings, incoming);
+      if (attentionDirty) state.settings.remarksMeta = localRemarksMeta;
       normalizeSettings();
       // wizardDone and colWidths used to be browser-origin view state. Existing
       // settings prove this is not a first launch, even if the old origin-local
@@ -1444,21 +1672,29 @@ async function syncClientStateOnLoad() {
         localStorage.setItem(VIEWSTATE_KEY, JSON.stringify(view));
       } catch (e) {}
     }
-    if (server.attention && typeof server.attention === "object") {
+    let healAttention = attentionDirty;
+    if (!attentionDirty && server.attention && typeof server.attention === "object" &&
+        !Array.isArray(server.attention)) {
       // Attention marks (unlike checked books) are a low-stakes set that
       // supports removal, so the server copy is authoritative on load — a
       // union would resurrect marks the user deliberately cleared.
       state.attn = server.attention;
       try { localStorage.setItem(ATTN_KEY, JSON.stringify(state.attn)); } catch (e) {}
+    } else if (attentionDirty) {
+      healAttention = true;
     }
     clientStateReady = true;
     if (healChecked) pushClientState("checked");
     if (migratePersistentView) pushClientState("settings");
+    if (healAttention) {
+      pushClientState("settings");  // includes keyed remark labels/categories
+      pushClientState("attention");
+    }
     return true;
   }
   // seed the server from local, then allow write-through
   try {
-    await fetch("/api/client_state", {
+    const res = await fetch("/api/client_state", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1467,6 +1703,9 @@ async function syncClientStateOnLoad() {
         attention: state.attn || {},
       }),
     });
+    if (res.ok) {
+      try { localStorage.removeItem(ATTN_DIRTY_KEY); } catch (e) {}
+    }
   } catch (e) { /* will retry on the next change */ }
   clientStateReady = true;
   return false;
@@ -1865,7 +2104,10 @@ function maybeWizard() {
 const homeState = { events: [], loaded: false, expanded: new Set() };
 
 async function loadActivity() {
-  loadReviews().then(renderHome);   // the review count rides the same visit
+  loadReviews().then(() => {
+    renderHome();                  // the review count rides the same visit
+    renderRemarks();               // "Awaiting review" badges share that state
+  });
   try {
     const r = await (await fetch(
       "/api/activity?limit=" + (state.settings.historyLimit || 300))).json();
@@ -1944,15 +2186,31 @@ function progressSummary() {
   // a source is settled once a verified entry has been built from it
   const srcPending = approvedSources()
     .filter((s) => sourceBuildStatus(s) !== "done").length;
-  // catalog-side marks (rows + the attn map) live in the Catalogs tab;
-  // marked builds live in the Editor's Pending queue — kept apart so the
-  // attention tile can land where its items actually are
-  const attnCat = Object.keys(state.attn || {}).length +
-    [...(state.rowsById || new Map()).values()].filter((r) => r.attention).length;
-  const attnEd = builds.filter((b) => b.attention && b.status !== "uploaded").length;
+  // Use the same normalized model as the shared Remarks sidebar. In
+  // particular, src:* marks belong to Workbench Sources, and published builds
+  // still count until their mark is explicitly cleared.
+  const remarkItems = remarksItems();
+  const attnCat = remarkItems.filter((item) => item.category === "catalogs").length;
+  const attnEntries = remarkItems.filter((item) => item.category === "entries").length;
+  const attnSources = remarkItems.filter((item) => item.category === "sources").length;
+  const attnEd = attnEntries + attnSources;
   const openReviews = Object.values(reviewsState.items || {})
     .filter((r) => r.status === "open").length;
-  return { drafts, ready, srcPending, attnCat, attnEd, openReviews };
+  return {
+    drafts, ready, srcPending, attnCat, attnEd, attnEntries, attnSources,
+    openReviews,
+  };
+}
+
+function homeAttentionDestination(summary) {
+  const catalogs = Number(summary.attnCat || 0);
+  const entries = Number(summary.attnEntries || 0);
+  const sources = Number(summary.attnSources || 0);
+  if (catalogs) {
+    return { tab: "checked", filter: entries || sources ? "all" : "catalogs" };
+  }
+  const filter = entries && sources ? "all" : (sources ? "sources" : "entries");
+  return { tab: "workbench", filter };
 }
 
 const HOME_DRAFTS_SHOWN = 4;
@@ -1973,6 +2231,7 @@ function renderHome() {
     `</button>`;
   const inEditor = p.drafts.length + p.ready;
   const attn = p.attnCat + p.attnEd;
+  const attnDest = homeAttentionDestination(p);
   let html =
     row(inEditor, inEditor === 1 ? "entry in the workbench" : "entries in the workbench",
         `data-gotab="workbench"`, inEditor ? `${p.drafts.length} draft · ${p.ready} to publish` : "") +
@@ -1980,7 +2239,8 @@ function renderHome() {
         : "PDF sources pending verification", `data-gotab="workbench"`) +
     row(attn, attn === 1 ? "item marked for attention"
         : "items marked for attention",
-        `data-gotab="${p.attnCat || !p.attnEd ? "checked" : "workbench"}"`,
+        `data-remarks="1" data-remarks-filter="${attnDest.filter}" ` +
+        `data-gotab="${attnDest.tab}"`,
         p.attnCat && p.attnEd ? `${p.attnCat} catalog · ${p.attnEd} workbench` : "") +
     row(p.openReviews, p.openReviews === 1 ? "item awaiting review"
         : "items awaiting review", `data-review="1"`);
@@ -2081,7 +2341,11 @@ function initHome() {
       // every workbench-bound row advertises pending work, so land on the
       // Pending queue even if the book list was left on Uploaded
       if (b.dataset.gotab === "workbench") state.buildsTab = "pending";
+      if (b.dataset.remarks && b.dataset.remarksFilter) {
+        setRemarksFilterForTab(b.dataset.gotab, b.dataset.remarksFilter, true);
+      }
       document.querySelector(`#tabs .tab[data-tab="${b.dataset.gotab}"]`).click();
+      if (b.dataset.remarks) setRemarksCollapsed(false, true);
     }
   });
   // an activity row toggles its per-event detail
@@ -2189,6 +2453,8 @@ function initActivityIcons() {
   }));
 }
 
+let preserveWorkbenchEditOnActivate = false;
+
 function initTabs() {
   for (const tab of document.querySelectorAll("#tabs .tab")) {
     tab.addEventListener("click", () => {
@@ -2197,14 +2463,19 @@ function initTabs() {
       tab.classList.add("active");
       el(tab.dataset.tab).classList.add("active");
       setHeader(tab.dataset.tab);
+      syncRemarksForTab();
       if (tab.dataset.tab === "home") loadActivity();   // refresh on every visit
-      if (tab.dataset.tab === "checked") { renderChecked(); loadOlStatus(); }
-      if (tab.dataset.tab === "infotab") { pollConsoleLog(); renderConsole(); }
+      if (tab.dataset.tab === "checked") renderChecked();
+      if (tab.dataset.tab === "infotab") refreshInfoTabSection();
       // refresh builds and entry folders on every visit — either may have
       // changed elsewhere meanwhile
       if (tab.dataset.tab === "workbench") {
-        renderUpload();
-        loadOcrBooks().then(() => { renderOcrTab(); renderAnalyze(); renderWorkbench(); });
+        if (!preserveWorkbenchEditOnActivate) {
+          renderUpload();
+          loadOcrBooks().then(() => { renderOcrTab(); renderAnalyze(); renderWorkbench(); });
+        } else {
+          renderWorkbench();
+        }
         pollJobs();       // paint the jobs drawer now, not next tick
       }
       if (tab.dataset.tab === "replica") {
@@ -2839,8 +3110,7 @@ function renderSettings() {
   // GENERAL
   el("gen-info").textContent =
     `Library Tool ${el("tb-meta").textContent} — ` +
-    `${state.manual.length} manual entries / ${state.checked.size} checked books. ` +
-    (el("status-right").textContent || "");
+    `${state.manual.length} manual entries / ${state.checked.size} checked books.`;
   el("reset-settings").onclick = async () => {
     if (!(await confirmDialog({
       title: "Reset interface settings",
@@ -3087,6 +3357,30 @@ function renderSettings() {
     iw.value = state.settings.ocrImageWidth;
     saveSettings();
   };
+  // Facsimile paper tint: the server samples clean margin bands from five
+  // representative interior pages; this setting controls the final white mix.
+  const opc = el("set-ocr-paper-color");
+  const opl = el("set-ocr-paper-lighten");
+  const syncPaperControls = () => {
+    opl.disabled = !opc.checked;
+    opl.setAttribute("aria-disabled", String(opl.disabled));
+  };
+  opc.checked = !!state.settings.ocrPaperColor;
+  opl.value = state.settings.ocrPaperLighten;
+  syncPaperControls();
+  opc.onchange = () => {
+    state.settings.ocrPaperColor = opc.checked;
+    syncPaperControls();
+    saveSettings();
+    refreshOcrPaperColors();
+  };
+  opl.onchange = () => {
+    state.settings.ocrPaperLighten =
+      Math.max(0, Math.min(100, parseInt(opl.value, 10) || 0));
+    opl.value = state.settings.ocrPaperLighten;
+    saveSettings();
+    refreshOcrPaperColors();
+  };
   // digit -> service shortcut mapping for the page view
   for (const key of ["1", "2", "3", "4", "5"]) {
     const n = el("set-ocr-key" + key);
@@ -3315,10 +3609,9 @@ function renderLanSettings() {
 function openSettings() { renderSettings(); el("settings-overlay").hidden = false; }
 function closeSettings() {
   el("settings-overlay").hidden = true;
-  // The Databases panel lives in Settings; a file dropped into ~/.library-tool
-  // (or a finished download) leaves the OL-index badge stale, and closing a
-  // modal fires no window-focus event to refresh it — so refresh on the way out.
-  loadOlStatus();
+  // Settings can download or replace a database; refresh its Info metadata the
+  // next time Resources is opened without doing work while that pane is hidden.
+  dbResourceState.loadedAt = 0;
 }
 
 function openAbout() { const o = el("about-overlay"); if (o) o.hidden = false; }
@@ -4344,6 +4637,24 @@ function groupSets(rows) {
 // every other table keeps a lightweight browser-side mark keyed per row.
 
 const ATTN_KEY = "whl_cad_attention_v1";
+const ATTN_DIRTY_KEY = "whl_cad_attention_dirty_v1";
+
+// Remarks is the shared presentation of every needs-attention mark. Categories
+// describe the target object, not the tab currently showing the sidebar. Pages
+// and publications are reserved now so their owning tabs already have the right
+// default when those target classes become markable.
+const REMARK_CATEGORIES = [
+  ["catalogs", "Catalogs"], ["sources", "Sources"], ["entries", "Entries"],
+  ["pages", "Pages"], ["publications", "Publications"],
+];
+const REMARK_CATEGORY_IDS = new Set(REMARK_CATEGORIES.map(([id]) => id));
+const REMARK_TAB_DEFAULTS = {
+  home: "all", checked: "catalogs", workbench: "entries",
+  replica: "pages", publish: "publications", infotab: "all",
+};
+const remarksState = {
+  editing: null, draft: "", error: "", saving: false,
+};
 
 function loadAttn() {
   try { state.attn = JSON.parse(localStorage.getItem(ATTN_KEY) || "{}"); }
@@ -4352,18 +4663,616 @@ function loadAttn() {
 
 function attnHas(k) { return !!(state.attn || {})[k]; }
 
-// a mark's value is "" (unmarked), "1" (plain mark), or the reason text
-function attnReason(v) {
-  return typeof v === "string" && v && v !== "1" ? v : "";
+// Keyed marks remain strings: "1" (plain) or the reason, preserving the format
+// understood by older clients. A provisional object shape is still accepted on
+// read; mark-time labels/categories now live separately in settings.remarksMeta.
+function attnValue(v) {
+  if (!v) return "";
+  if (typeof v === "object") return String(v.value || v.reason || "1");
+  if (v === true) return "1";
+  return String(v);
 }
 
-function setAttnKey(k, val) {
-  state.attn = state.attn || {};
-  if (val) state.attn[k] = val;
-  else delete state.attn[k];
+function attnReason(v) {
+  const s = attnValue(v);
+  return s && s !== "1" ? s : "";
+}
+
+function attnMeta(v) {
+  return v && typeof v === "object" ? v : {};
+}
+
+function remarkKeyParts(key) {
+  const raw = String(key || "");
+  const colon = raw.indexOf(":");
+  return colon < 0
+    ? { prefix: "", ref: raw }
+    : { prefix: raw.slice(0, colon), ref: raw.slice(colon + 1) };
+}
+
+function remarkCategoryForKey(key) {
+  return remarkKeyParts(key).prefix.startsWith("src") ? "sources" : "catalogs";
+}
+
+// Legacy source marks used only URL/path/title and could merge two catalog
+// objects that happened to share a scan. New marks include the owning row and
+// source class; readers continue resolving both keys so old marks remain usable.
+function sourceRemarkKeys(source) {
+  source = source || {};
+  const legacy = "src:" + (source.url || source.local_pdf || source.title || "");
+  const parent = source._rowId || "";
+  const sourceClass = source.archive || "source";
+  const identity = source.identifier || source.local_pdf || source.url || source.title || "";
+  const stable = "src2:" + [parent, sourceClass, identity]
+    .map((part) => encodeURIComponent(String(part))).join("|");
+  return { stable, legacy };
+}
+
+function activeSourceRemarkKey(source) {
+  const keys = sourceRemarkKeys(source);
+  if (attnHas(keys.stable)) return keys.stable;
+  if (attnHas(keys.legacy)) return keys.legacy;
+  return keys.stable;
+}
+
+function sourceMatchesRemark(source, key) {
+  const keys = sourceRemarkKeys(source);
+  return key === keys.stable || key === keys.legacy;
+}
+
+function setAttnKey(k, val, meta) {
+  if (!state.attn || typeof state.attn !== "object" || Array.isArray(state.attn))
+    state.attn = {};
+  if (!state.settings.remarksMeta || typeof state.settings.remarksMeta !== "object" ||
+      Array.isArray(state.settings.remarksMeta)) state.settings.remarksMeta = {};
+  if (val) {
+    const prior = Object.assign({}, attnMeta(state.attn[k]),
+      state.settings.remarksMeta[k] || {});
+    const next = Object.assign({}, prior, meta || {});
+    next.label = String(next.label || "").slice(0, 300);
+    next.category = REMARK_CATEGORY_IDS.has(next.category)
+      ? next.category : remarkCategoryForKey(k);
+    state.attn[k] = String(val || "1");
+    state.settings.remarksMeta[k] = {
+      label: next.label, category: next.category,
+    };
+  } else {
+    delete state.attn[k];
+    delete state.settings.remarksMeta[k];
+  }
   try { localStorage.setItem(ATTN_KEY, JSON.stringify(state.attn)); } catch (e) {}
+  try { localStorage.setItem(ATTN_DIRTY_KEY, "1"); } catch (e) {}
+  saveSettings();
   pushClientState("attention");
   status(val ? "Marked: needs attention" : "Attention mark cleared");
+  renderRemarks();
+  renderHome();
+  return true;
+}
+
+function activeRemarksTab() {
+  const tab = document.querySelector("#tabs .tab.active");
+  return tab ? tab.dataset.tab : "home";
+}
+
+function remarksDefaultFilter(tabId) {
+  return REMARK_TAB_DEFAULTS[tabId] || "all";
+}
+
+function remarksFilterForTab(tabId) {
+  const filters = state.settings.remarksFilters || {};
+  const value = filters[tabId];
+  return value === "all" || REMARK_CATEGORY_IDS.has(value)
+    ? value : remarksDefaultFilter(tabId);
+}
+
+function setRemarksFilterForTab(tabId, value, persist) {
+  const clean = value === "all" || REMARK_CATEGORY_IDS.has(value)
+    ? value : remarksDefaultFilter(tabId);
+  state.settings.remarksFilters = state.settings.remarksFilters || {};
+  state.settings.remarksFilters[tabId] = clean;
+  if (persist) saveSettings();
+  return clean;
+}
+
+function remarkSecondary(parts) {
+  return parts.filter((x) => String(x || "").trim()).join(" \u00b7 ");
+}
+
+function keyedRemarkDescriptor(key, stored, sourceByKey) {
+  const { prefix, ref } = remarkKeyParts(key);
+  const meta = Object.assign({}, attnMeta(stored),
+    (state.settings.remarksMeta || {})[key] || {});
+  let label = "", subtype = "Catalog record", secondary = "", canOpen = false;
+  if (prefix === "src" || prefix === "src2") {
+    const source = sourceByKey
+      ? sourceByKey.get(key)
+      : approvedSources().find((s) =>
+          sourceMatchesRemark(s, key));
+    label = source ? source.title : "";
+    subtype = "Verified source";
+    secondary = source ? remarkSecondary([source.archive, source.author, source.year]) : "";
+    canOpen = !!source;
+  } else if (prefix === "whl") {
+    const row = (state.whlRows || []).find((r) => String(r.idx) === ref);
+    label = row ? row.title : "";
+    subtype = "WHL catalog";
+    secondary = row ? remarkSecondary([row.authors, row.year]) : "";
+    canOpen = /^-?\d+$/.test(ref);
+  } else if (prefix === "ch") {
+    const row = (state.chBooks || []).find((r) => String(r.idx) === ref);
+    label = row ? row.title : "";
+    subtype = "Master list";
+    secondary = row ? remarkSecondary([row.author, row.year]) : "";
+    canOpen = /^\d+$/.test(ref);
+  } else if (prefix === "ol") {
+    const row = (state.olRows || []).find((r) => String(r.key) === ref);
+    label = row ? row.title : "";
+    subtype = "Open Library";
+    secondary = row ? remarkSecondary([(row.authors || []).join("; "), row.year || row.first_year]) : "";
+    canOpen = !!row;
+  } else {
+    subtype = prefix ? `${prefix} record` : "Catalog record";
+  }
+  label = label || String(meta.label || "") || `${subtype} (${ref || key})`;
+  const category = REMARK_CATEGORY_IDS.has(meta.category)
+    ? meta.category : remarkCategoryForKey(key);
+  return {
+    id: "key:" + key, kind: "key", ref: key, category, subtype,
+    label, secondary, reason: attnReason(stored), canOpen,
+  };
+}
+
+// Normalize the three canonical stores (checked/manual rows, builds, keyed
+// marks) into one sidebar model. Never scrape rendered rows: filters and
+// streaming mean the DOM is intentionally incomplete.
+function remarksItems() {
+  const items = [];
+  for (const row of combinedRows()) {
+    if (!row.attention) continue;
+    const subtype = row.captured ? "Phone capture"
+      : row.kind === "manual" ? "Manual entry" : "Checked book";
+    items.push({
+      id: "row:" + row.id, kind: "row", ref: String(row.id),
+      category: "catalogs", subtype,
+      label: row.book.title || String(row.id),
+      secondary: remarkSecondary([row.book.author, row.book.year]),
+      reason: attnReason(row.attention), canOpen: true,
+    });
+  }
+  for (const b of Object.values(state.builds || {})) {
+    if (!b.attention) continue;
+    const statusLabel = b.status === "uploaded" ? "Published entry"
+      : b.status === "ready" ? "Verified entry" : "Draft entry";
+    items.push({
+      id: "build:" + b.id, kind: "build", ref: String(b.id),
+      category: "entries", subtype: statusLabel,
+      label: b.title || String(b.id),
+      secondary: remarkSecondary([b.authors, b.year]),
+      reason: attnReason(b.attention), canOpen: true,
+    });
+  }
+  const keyed = Object.entries(state.attn || {}).filter(([, stored]) => !!stored);
+  let sourceByKey = null;
+  if (keyed.some(([key]) => remarkKeyParts(key).prefix.startsWith("src"))) {
+    sourceByKey = new Map();
+    for (const source of approvedSources()) {
+      const keys = sourceRemarkKeys(source);
+      sourceByKey.set(keys.stable, source);
+      if (!sourceByKey.has(keys.legacy)) sourceByKey.set(keys.legacy, source);
+    }
+  }
+  for (const [key, stored] of keyed) {
+    items.push(keyedRemarkDescriptor(key, stored, sourceByKey));
+  }
+  return items.sort((a, b) => {
+    const ai = REMARK_CATEGORIES.findIndex(([id]) => id === a.category);
+    const bi = REMARK_CATEGORIES.findIndex(([id]) => id === b.category);
+    return ai - bi || a.label.localeCompare(b.label, undefined, { sensitivity: "base" }) ||
+      a.id.localeCompare(b.id);
+  });
+}
+
+function remarkRoute(item) {
+  if (!item) return null;
+  if (item.kind === "build")
+    return { tab: "workbench", phase: "record", buildId: String(item.ref) };
+  if (item.kind === "row")
+    return { tab: "checked", table: "checked", rowId: String(item.ref) };
+  if (item.kind !== "key") return null;
+  const { prefix, ref } = remarkKeyParts(item.ref);
+  // The typed key is authoritative. Review records predate the Remarks
+  // category metadata, so a source must still route correctly with only its
+  // persisted kind/ref pair.
+  if (prefix.startsWith("src"))
+    return { tab: "workbench", phase: "record", sourceKey: String(item.ref) };
+  if (prefix === "whl") return { tab: "checked", table: "whl", whlIdx: ref };
+  if (prefix === "ch" || prefix === "ol")
+    return { tab: "checked", bottom: prefix, recordRef: ref };
+  return null;
+}
+
+function remarkItemHtml(item) {
+  const editing = remarksState.editing === item.id;
+  const saving = editing && remarksState.saving;
+  if (editing) {
+    return `<article class="remarks-item" data-remark-id="${esc(item.id)}">` +
+      `<div class="remarks-editor">` +
+        `<label class="tool-label" for="remarks-editor-text">Remark for ${esc(item.label)}</label>` +
+        `<textarea id="remarks-editor-text" class="cad-input" spellcheck="false" ` +
+          `aria-invalid="${remarksState.error ? "true" : "false"}" ${saving ? "disabled" : ""}>${esc(remarksState.draft)}</textarea>` +
+        `<div class="remarks-editor-error" role="status">${esc(remarksState.error)}</div>` +
+        `<div class="remarks-editor-actions">` +
+          `<button class="cad-btn tiny danger" type="button" data-remark-clear="${esc(item.id)}" ${saving ? "disabled" : ""}>Remove mark</button>` +
+          `<button class="cad-btn tiny" type="button" data-remark-cancel ${saving ? "disabled" : ""}>Cancel</button>` +
+          `<button class="cad-btn tiny primary remarks-save" type="button" data-remark-save="${esc(item.id)}" ${saving ? "disabled" : ""}>Save</button>` +
+        `</div></div></article>`;
+  }
+  const reviewKey = `${item.kind}:${item.ref}`;
+  const inReview = Object.values(reviewsState.items || {})
+    .some((r) => r.key === reviewKey && r.status === "open");
+  const unavailable = !item.canOpen ? "Original item is not loaded in this session" : "";
+  const meta = remarkSecondary([item.subtype, item.secondary, unavailable]);
+  return `<article class="remarks-item" data-remark-id="${esc(item.id)}">` +
+    `<button class="remarks-open-item" type="button" data-remark-open="${esc(item.id)}" ` +
+      `${item.canOpen ? "" : "disabled aria-disabled=\"true\""} ` +
+      `aria-label="Open ${esc(item.label)}">` +
+      `<span class="remarks-item-title" title="${esc(item.label)}">${esc(item.label)}</span>` +
+      `<span class="remarks-item-meta">${esc(meta)}</span>` +
+      `<span class="remarks-reason${item.reason ? "" : " empty"}">${item.reason
+        ? esc(item.reason) : "No remark added"}</span>` +
+    `</button><div class="remarks-item-actions">` +
+      (inReview ? `<span class="remarks-review-tag">Awaiting review</span>` : "") +
+      `<button class="cad-btn tiny remarks-edit" type="button" ` +
+        `data-remark-edit="${esc(item.id)}">${item.reason ? "Edit" : "Add remark"}</button>` +
+    `</div></article>`;
+}
+
+function remarksGroupHtml(category, items) {
+  const label = (REMARK_CATEGORIES.find(([id]) => id === category) || ["", category])[1];
+  return `<section class="remarks-group" data-remarks-category="${esc(category)}">` +
+    `<h3 class="remarks-group-head"><span>${esc(label)}</span>` +
+      `<span class="remarks-group-count">${items.length}</span></h3>` +
+    items.map(remarkItemHtml).join("") + `</section>`;
+}
+
+function renderRemarks() {
+  const list = el("remarks-list");
+  if (!list) return;
+  const items = remarksItems();
+  const countBy = Object.fromEntries(REMARK_CATEGORIES.map(([id]) => [id, 0]));
+  for (const item of items) countBy[item.category] = (countBy[item.category] || 0) + 1;
+  const n = items.length;
+  el("remarks-total").textContent = `${n} ${n === 1 ? "item" : "items"}`;
+  el("remarks-rail-count").textContent = n ? String(n) : "";
+  el("remarks-open").setAttribute("aria-label", n
+    ? `Open Remarks sidebar, ${n} ${n === 1 ? "item needs" : "items need"} attention`
+    : "Open Remarks sidebar, no items need attention");
+
+  const tabId = activeRemarksTab();
+  const filter = remarksFilterForTab(tabId);
+  const select = el("remarks-filter");
+  select.value = filter;
+  for (const option of select.options) {
+    const def = option.value === "all" ? "All"
+      : (REMARK_CATEGORIES.find(([id]) => id === option.value) || ["", option.value])[1];
+    const c = option.value === "all" ? n : (countBy[option.value] || 0);
+    option.textContent = `${def} (${c})`;
+  }
+
+  const editorHadFocus = document.activeElement &&
+    document.activeElement.id === "remarks-editor-text";
+  const selStart = editorHadFocus ? document.activeElement.selectionStart : null;
+  const selEnd = editorHadFocus ? document.activeElement.selectionEnd : null;
+  if (!n) {
+    list.innerHTML = `<div class="remarks-empty">Nothing needs attention. ` +
+      `Press Q while hovering a catalog row, verified source, or entry to add a mark.</div>`;
+    return;
+  }
+  if (filter === "all") {
+    list.innerHTML = REMARK_CATEGORIES.map(([category]) => {
+      const group = items.filter((item) => item.category === category);
+      return group.length ? remarksGroupHtml(category, group) : "";
+    }).join("");
+  } else {
+    const group = items.filter((item) => item.category === filter);
+    if (group.length) list.innerHTML = remarksGroupHtml(filter, group);
+    else {
+      const label = (REMARK_CATEGORIES.find(([id]) => id === filter) || ["", filter])[1];
+      list.innerHTML = `<div class="remarks-empty">No ${esc(label.toLowerCase())} need attention. ` +
+        `Choose another category to see the other ${n === 1 ? "remark" : "remarks"}.</div>`;
+    }
+  }
+  if (editorHadFocus) {
+    const ta = el("remarks-editor-text");
+    if (ta) {
+      ta.focus();
+      ta.setSelectionRange(Math.min(selStart, ta.value.length), Math.min(selEnd, ta.value.length));
+    }
+  }
+}
+
+function setRemarksCollapsed(collapsed, persist) {
+  const aside = el("remarks-sidebar");
+  if (!aside) return;
+  const moveFocus = aside.contains(document.activeElement);
+  collapsed = !!collapsed;
+  state.settings.remarksSidebarCollapsed = collapsed;
+  aside.classList.toggle("collapsed", collapsed);
+  el("remarks-open").hidden = !collapsed;
+  el("remarks-expanded").hidden = collapsed;
+  el("remarks-open").setAttribute("aria-expanded", String(!collapsed));
+  el("remarks-close").setAttribute("aria-expanded", String(!collapsed));
+  if (persist) saveSettings();
+  if (!collapsed) renderRemarks();
+  scheduleTableChromeRefresh();
+  if (moveFocus) requestAnimationFrame(() => {
+    const target = collapsed ? el("remarks-open") : el("remarks-filter");
+    if (target && !target.hidden) target.focus();
+  });
+}
+
+function syncRemarksForTab() {
+  remarksState.error = "";
+  renderRemarks();
+}
+
+function remarksItemById(id) {
+  return remarksItems().find((item) => item.id === id) || null;
+}
+
+function refreshRemarkTarget(item) {
+  if (!item || item.kind !== "key") return;
+  const { prefix } = remarkKeyParts(item.ref);
+  if (prefix === "whl" && state.whlRows) renderWhlTop();
+  else if (prefix.startsWith("src")) renderUpload();
+  else if (state.settings.showCatalog) renderBottomRows();
+}
+
+async function applyRemarkValue(item, value) {
+  if (!item) return false;
+  try {
+    let ok = false;
+    if (item.kind === "key") {
+      ok = setAttnKey(item.ref, value, { label: item.label, category: item.category });
+      refreshRemarkTarget(item);
+    } else if (item.kind === "build") {
+      ok = await patchBuildRaw(item.ref, { attention: value });
+    } else if (item.kind === "row") {
+      // rowsById is render-owned and can be stale while Home is active; rebuild
+      // its lookup before dispatching to the existing persistence path.
+      state.rowsById = new Map(combinedRows().map((row) => [String(row.id), row]));
+      ok = await setRowAttention(item.ref, value);
+    }
+    if (ok) {
+      remarksState.error = "";
+      renderRemarks();
+      renderHome();
+      return true;
+    }
+  } catch (e) { /* surfaced below without dropping the item */ }
+  remarksState.error = "Could not save this remark. The mark was kept.";
+  renderRemarks();
+  return false;
+}
+
+async function saveRemarkEditor(id) {
+  const item = remarksItemById(id);
+  if (!item || remarksState.saving) return;
+  remarksState.saving = true;
+  remarksState.error = "";
+  renderRemarks();
+  const ok = await applyRemarkValue(item, remarksState.draft.trim() || "1");
+  remarksState.saving = false;
+  if (ok) {
+    remarksState.editing = null;
+    remarksState.draft = "";
+    status("REMARK SAVED");
+  }
+  renderRemarks();
+}
+
+async function clearRemarkEditor(id) {
+  const item = remarksItemById(id);
+  if (!item || remarksState.saving) return;
+  if (!(await confirmDialog({
+    title: "Remove Needs Attention mark",
+    message: `Remove the mark from “${item.label}”?`,
+    detail: item.reason ? "Its saved remark will also be removed." : "",
+    confirmLabel: "Remove mark", danger: true,
+  }))) return;
+  remarksState.saving = true;
+  renderRemarks();
+  const ok = await applyRemarkValue(item, "");
+  remarksState.saving = false;
+  if (ok) {
+    remarksState.editing = null;
+    remarksState.draft = "";
+    status("ATTENTION MARK CLEARED");
+  }
+  renderRemarks();
+}
+
+function activateTopTab(tabId, options) {
+  const tab = document.querySelector(`#tabs .tab[data-tab="${tabId}"]`);
+  if (!tab || tab.classList.contains("active")) return;
+  const prior = preserveWorkbenchEditOnActivate;
+  preserveWorkbenchEditOnActivate = tabId === "workbench" &&
+    !!(options && options.preserveWorkbenchEdit);
+  tab.click();
+  preserveWorkbenchEditOnActivate = prior;
+}
+
+function flashRemarkTarget(node) {
+  if (!node) return false;
+  node.scrollIntoView({ block: "center", behavior: "smooth" });
+  node.classList.remove("remarks-target");
+  void node.offsetWidth;
+  node.classList.add("remarks-target");
+  setTimeout(() => node.classList.remove("remarks-target"), 1600);
+  return true;
+}
+
+// The large catalog tables render in chunks. Ask the active stream to append
+// through the target before looking it up, so navigation works beyond the first
+// rendered chunk without materializing every later row.
+function flashStreamedTarget(tbody, key, selector) {
+  if (!tbody) return false;
+  let node = tbody.querySelector(selector);
+  if (!node && typeof tbody._streamReveal === "function") {
+    tbody._streamReveal(key);
+    node = tbody.querySelector(selector);
+  }
+  return flashRemarkTarget(node);
+}
+
+async function openRoutedItem(item) {
+  const route = remarkRoute(item);
+  if (!item || !route) return;
+  if (route.buildId) {
+    // Selecting a different entry runs the existing discard guard before the
+    // Workbench tab can repaint its editor. For the current dirty entry, the
+    // list item can be revealed without rebuilding (and losing) the form.
+    const preserveEdit = state.buildSel === route.buildId && buildIsDirty();
+    if (!preserveEdit) {
+      await selectWorkbenchBook(route.buildId, route.phase);
+      if (state.buildSel !== route.buildId) return; // discard guard cancelled
+    }
+    activateTopTab(route.tab, { preserveWorkbenchEdit: preserveEdit });
+    requestAnimationFrame(() =>
+      flashRemarkTarget(document.querySelector(`#ocr-books .build-item[data-bid="${CSS.escape(route.buildId)}"]`)));
+    return;
+  }
+  if (route.sourceKey) {
+    // Revealing the source repaints the Record phase, so protect a dirty entry
+    // before either tab activation or phase selection can reset its form.
+    if (buildIsDirty() && state.settings.confirmDiscard !== false &&
+        !(await confirmDialog({
+          title: "Discard entry changes",
+          message: "Discard unsaved changes to open this source?",
+          confirmLabel: "Discard changes",
+          cancelLabel: "Keep editing",
+          danger: true,
+        }))) return;
+    activateTopTab(route.tab);
+    setWorkbenchPhase("record", false);
+    renderUpload();
+    const index = approvedSources().findIndex((s) =>
+      sourceMatchesRemark(s, route.sourceKey));
+    requestAnimationFrame(() => {
+      const shown = index >= 0 && flashRemarkTarget(
+        document.querySelector(`#upload-rows tr[data-si="${index}"]`));
+      if (!shown) status("SOURCE IS HIDDEN BY THE CURRENT WORKBENCH FILTER");
+    });
+    return;
+  }
+  activateTopTab(route.tab);
+  if (route.rowId) {
+    const row = state.rowsById.get(String(route.rowId)) ||
+      combinedRows().find((candidate) => String(candidate.id) === route.rowId);
+    const setKey = row && volNum(row.book) > 0 ? groupIdOf(row.book) : "";
+    if (setKey && !setExpanded(setKey)) setSetExpanded(setKey, true);
+    switchTopTable("checked");
+    state.editTarget = { kind: "row", id: route.rowId };
+    switchPaneTab("pane-info");
+    requestAnimationFrame(() => {
+      const shown = flashStreamedTarget(el("checked-rows"), `row:${route.rowId}`,
+        `tr[data-row-id="${CSS.escape(route.rowId)}"]`);
+      if (!shown) status("CATALOG ITEM IS HIDDEN BY THE CURRENT FILTERS");
+    });
+    return;
+  }
+  if (route.whlIdx != null) {
+    await loadWhlRows();
+    switchTopTable("whl");
+    const idx = parseInt(route.whlIdx, 10);
+    state.editTarget = { kind: "whl", idx };
+    switchPaneTab("pane-info");
+    requestAnimationFrame(() => {
+      const shown = flashStreamedTarget(el("whltop-rows"), `whl:${idx}`,
+        `tr[data-widx="${idx}"]`);
+      if (!shown) status("CATALOG ITEM IS HIDDEN BY THE CURRENT FILTERS");
+    });
+    return;
+  }
+  if (route.bottom) {
+    setSearchPane(true);
+    const tabs = bottomTabs();
+    state.settings.bottomActive = Math.max(0, tabs.indexOf(route.bottom));
+    saveSettings();
+    if (route.bottom === "ch") await loadChBooks();
+    await renderBottomPane();
+    if (route.bottom === "ch" || route.bottom === "ol") {
+      state.editTarget = route.bottom === "ch"
+        ? { kind: "ch", idx: parseInt(route.recordRef, 10) }
+        : { kind: "ol", ref: route.recordRef };
+      switchPaneTab("pane-info");
+    }
+    const index = state.bottomRecords.findIndex((record) =>
+      String(record._src) === route.bottom && String(record._idx) === route.recordRef);
+    requestAnimationFrame(() => {
+      const shown = index >= 0 && flashStreamedTarget(el("bottom-rows"),
+        `${route.bottom}:${route.recordRef}`, `tr[data-bi="${index}"]`);
+      if (!shown) status("CATALOG ITEM IS HIDDEN BY THE CURRENT FILTERS");
+    });
+  }
+}
+
+async function openRemarkItem(id) {
+  return openRoutedItem(remarksItemById(id));
+}
+
+function initRemarksSidebar() {
+  el("remarks-open").addEventListener("click", () => setRemarksCollapsed(false, true));
+  el("remarks-close").addEventListener("click", () => setRemarksCollapsed(true, true));
+  el("remarks-filter").addEventListener("change", () => {
+    setRemarksFilterForTab(activeRemarksTab(), el("remarks-filter").value, true);
+    renderRemarks();
+  });
+  el("remarks-list").addEventListener("input", (ev) => {
+    if (ev.target.id !== "remarks-editor-text") return;
+    remarksState.draft = ev.target.value;
+    remarksState.error = "";
+  });
+  el("remarks-list").addEventListener("keydown", (ev) => {
+    if (ev.target.id !== "remarks-editor-text") return;
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      remarksState.editing = null; remarksState.draft = ""; remarksState.error = "";
+      renderRemarks();
+    } else if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
+      ev.preventDefault();
+      saveRemarkEditor(remarksState.editing);
+    }
+  });
+  el("remarks-list").addEventListener("click", (ev) => {
+    const edit = ev.target.closest("[data-remark-edit]");
+    if (edit) {
+      const item = remarksItemById(edit.dataset.remarkEdit);
+      if (!item) return;
+      remarksState.editing = item.id;
+      remarksState.draft = item.reason;
+      remarksState.error = "";
+      renderRemarks();
+      const ta = el("remarks-editor-text");
+      if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }
+      return;
+    }
+    if (ev.target.closest("[data-remark-cancel]")) {
+      remarksState.editing = null; remarksState.draft = ""; remarksState.error = "";
+      renderRemarks();
+      return;
+    }
+    const save = ev.target.closest("[data-remark-save]");
+    if (save) { saveRemarkEditor(save.dataset.remarkSave); return; }
+    const clear = ev.target.closest("[data-remark-clear]");
+    if (clear) { clearRemarkEditor(clear.dataset.remarkClear); return; }
+    const open = ev.target.closest("[data-remark-open]");
+    if (open) openRemarkItem(open.dataset.remarkOpen);
+  });
+  setRemarksCollapsed(state.settings.remarksSidebarCollapsed, false);
+  renderRemarks();
 }
 
 // Resolve whatever row (any table) or builder entry the mouse is over into
@@ -4399,22 +5308,26 @@ function attnTargetAtHover() {
       apply: (v) => setRowAttention(tr.dataset.rowId, v),
     };
   }
-  const keyTarget = (k, label, rerender) => ({
+  const keyTarget = (k, label, rerender, category) => ({
     node: tr,
     kind: "key", ref: k,
     label,
-    current: String((state.attn || {})[k] || ""),
-    apply: (v) => { setAttnKey(k, v); rerender(); },
+    current: attnValue((state.attn || {})[k]),
+    apply: (v) => {
+      setAttnKey(k, v, { label, category: category || remarkCategoryForKey(k) });
+      rerender();
+    },
   });
   if (host === "whltop-rows" && tr.dataset.widx != null) {
     return keyTarget("whl:" + tr.dataset.widx,
-      tr.children[1] ? tr.children[1].textContent : "WHL row", renderWhlTop);
+      tr.children[1] ? tr.children[1].textContent : "WHL row", renderWhlTop,
+      "catalogs");
   }
   if (host === "upload-rows" && tr.dataset.si != null) {
     const s = (state.uploadSources || [])[+tr.dataset.si];
     if (!s) return null;
-    return keyTarget("src:" + (s.url || s.local_pdf || s.title),
-      s.title || "source", renderUpload);
+    return keyTarget(activeSourceRemarkKey(s),
+      s.title || "source", renderUpload, "sources");
   }
   if (host === "bottom-rows" && tr.dataset.bi != null) {
     const rec = (state.bottomRecords || [])[+tr.dataset.bi];
@@ -4430,7 +5343,8 @@ function attnTargetAtHover() {
         apply: (v) => setRowAttention(rec._mid, v).then(renderBottomRows),
       };
     }
-    return keyTarget(`${rec._src}:${rec._idx}`, rec.title || "row", renderBottomRows);
+    return keyTarget(`${rec._src}:${rec._idx}`, rec.title || "row", renderBottomRows,
+      "catalogs");
   }
   return null;
 }
@@ -4609,6 +5523,7 @@ function saveAttnPop() {
       if (res.ok) {
         await loadReviews();
         renderHome();
+        renderRemarks();
         status("ADDED TO REVIEW QUEUE");
       } else {
         status("REVIEW REQUEST FAILED :: NOT QUEUED");
@@ -4688,9 +5603,14 @@ function reviewsSorted() {
 
 function reviewItemHtml(r) {
   const resolved = r.status !== "open";
+  const label = esc(r.label) || "(unlabelled item)";
+  const labelHtml = remarkRoute(r)
+    ? `<button class="ri-label" type="button" data-rv-open ` +
+      `aria-label="Open ${esc(r.label) || "review item"}">${label}</button>`
+    : `<span class="ri-label">${label}</span>`;
   return `<div class="review-item${resolved ? " resolved" : ""}" data-rid="${esc(r.id)}">` +
     `<div class="ri-head">` +
-      `<span class="ri-label">${esc(r.label) || "(unlabelled item)"}</span>` +
+      labelHtml +
       `<span class="ri-meta">${resolved
         ? `resolved by ${esc(r.resolved_by || "?")} &middot; ${esc(relIso(r.resolved_at))}`
         : `${esc(r.created_by || "?")} &middot; ${esc(relIso(r.created_at))}`}</span>` +
@@ -4758,7 +5678,7 @@ async function clearMark(kind, ref) {
     // repaint whichever table bakes this mark into its rows (the tab-switch
     // renders only cover the checked/upload tables)
     if (ref.startsWith("whl:")) renderWhlTop();
-    else if (ref.startsWith("src:")) renderUpload();
+    else if (remarkKeyParts(ref).prefix.startsWith("src")) renderUpload();
     else renderBottomRows();
     return;
   }
@@ -4800,6 +5720,14 @@ async function onReviewClick(ev) {
   const item = ev.target.closest(".review-item");
   if (!item) return;
   const rid = item.dataset.rid;
+  if (ev.target.closest("[data-rv-open]")) {
+    const review = (reviewsState.items || {})[rid];
+    if (review) {
+      closeReviewWin();
+      await openRoutedItem(review);
+    }
+    return;
+  }
   const rbtn = ev.target.closest("[data-rv-resolve]");
   if (rbtn) {
     const resolved = rbtn.dataset.rvResolve === "1";
@@ -4825,6 +5753,7 @@ async function onReviewClick(ev) {
     await loadReviews();
     renderReviewList();
     renderHome();
+    renderRemarks();
     status(note);
     return;
   }
@@ -4841,6 +5770,7 @@ async function onReviewClick(ev) {
       input.value = "";   // posted — the draft is a comment now
       await loadReviews();
       renderReviewList();
+      renderRemarks();
     } else {
       status("COMMENT FAILED :: NOT SAVED");
     }
@@ -4869,7 +5799,7 @@ function initReviewWin() {
 
 async function setRowAttention(id, value) {
   const row = state.rowsById.get(String(id));
-  if (!row) return;
+  if (!row) return false;
   if (row.kind === "manual") {
     const res = await fetch(`/api/manual/${encodeURIComponent(id)}`, {
       method: "PATCH",
@@ -4877,7 +5807,7 @@ async function setRowAttention(id, value) {
       body: JSON.stringify({ attention: value, _preserve: true }),
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.ok) return;
+    if (!res.ok || !data.ok) return false;
     const i = state.manual.findIndex((x) => x.id === id);
     if (i >= 0) state.manual[i] = data.entry;
   } else {
@@ -4887,7 +5817,10 @@ async function setRowAttention(id, value) {
     saveChecked();
   }
   renderChecked();
+  renderRemarks();
+  renderHome();
   status(value ? "Marked: needs attention" : "Attention mark cleared");
+  return true;
 }
 
 // one-time (idempotent) migration: volume / edition / subtitle indicators in
@@ -5250,11 +6183,18 @@ function checkedSetHeaderTr(item, cmode) {
 // <tr>. The delegated table click/edit handlers are unaffected — they read
 // dataset off whatever rows are currently in the DOM.
 const STREAM_CHUNK = 200;
-function streamRows(tbody, items, renderItem) {
+function streamRows(tbody, items, renderItem, keyOf) {
   const pane = tbody.closest(".drafting");   // the scroll container
   if (tbody._streamCleanup) tbody._streamCleanup();   // detach the previous render's listener
   tbody.innerHTML = "";
   let rendered = 0;
+  const keyIndexes = new Map();
+  if (keyOf) {
+    items.forEach((item, index) => {
+      const key = keyOf(item, index);
+      if (key != null && !keyIndexes.has(String(key))) keyIndexes.set(String(key), index);
+    });
+  }
   const appendChunk = () => {
     const end = Math.min(rendered + STREAM_CHUNK, items.length);
     const frag = document.createDocumentFragment();
@@ -5279,8 +6219,15 @@ function streamRows(tbody, items, renderItem) {
     (pane.clientHeight > 0 && pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 800);
   const fill = () => { while (rendered < items.length && nearBottom()) appendChunk(); };
   if (pane) pane.addEventListener("scroll", fill, { passive: true });
+  tbody._streamReveal = (key) => {
+    const index = keyIndexes.get(String(key));
+    if (index == null) return false;
+    while (rendered <= index) appendChunk();
+    return true;
+  };
   tbody._streamCleanup = () => {
     if (pane) pane.removeEventListener("scroll", fill);
+    tbody._streamReveal = null;
     tbody._streamCleanup = null;
   };
   appendChunk();   // first chunk now
@@ -5337,6 +6284,9 @@ function renderChecked() {
       return tr;
     }
     return checkedRowTr(d.row, cmode, {});
+  }, (d) => {
+    const row = d.row || d.vr;
+    return row ? `row:${row.id}` : (d.set ? `set:${d.set.key}` : null);
   });
 
   applyTableChrome("checked");
@@ -5664,6 +6614,7 @@ async function loadChBooks() {
     const res = await fetch("/api/books");
     state.chBooks = res.ok ? (await res.json()).books || [] : [];
   } catch (e) { state.chBooks = []; }
+  renderRemarks();
 }
 
 async function loadWhlRows(force) {
@@ -5672,6 +6623,7 @@ async function loadWhlRows(force) {
     const res = await fetch("/api/whl_catalog");
     state.whlRows = res.ok ? (await res.json()).rows || [] : [];
   } catch (e) { state.whlRows = []; }
+  renderRemarks();
 }
 
 function chToRecord(b) {
@@ -5841,12 +6793,14 @@ function renderBottomRows() {
   }
 
   state.bottomRecords = records;
-  streamRows(tbody, records, (rec, i) => bottomRecordTr(rec, i, t, def));
+  streamRows(tbody, records, (rec, i) => bottomRecordTr(rec, i, t, def),
+    (rec) => `${rec._src}:${rec._src === "manual" ? rec._mid : rec._idx}`);
   el("bottom-empty").textContent = "No matches";   // reset from the History tab's message
   el("bottom-empty").hidden = records.length !== 0;
   el("bottom-count").textContent =
     `${records.length} rows` + (t === "ol" && state.olNote ? ` — ${state.olNote}` : "");
   applyTableChrome("b-" + t);
+  renderRemarks();
 }
 
 // build one bottom-pane row <tr>; `i` is the absolute index into
@@ -6165,16 +7119,6 @@ function topMode() {
   return state.settings.topTable === "whl" ? whlMode() : checkedMode();
 }
 
-// the current mode is shown as a tag in the footer
-function updateModeTag() {
-  const tag = el("mode-tag");
-  tag.hidden = false;
-  const m = topMode();
-  const name = state.settings.topTable === "whl" ? "WHL" : "Checked";
-  tag.textContent = `${name} mode: ${m}`;
-  tag.className = "foot-tag " + (m === "edit" ? "tag-edit" : "tag-search");
-}
-
 function setTopMode(m) {
   if (state.settings.topTable === "whl") state.settings.whlMode = m;
   else state.settings.checkedMode = m;
@@ -6210,13 +7154,11 @@ function switchTopTable(t) {
   for (const id of ["dl-approved", "export-json", "filter-btn"]) {
     el(id).disabled = t !== "checked";
   }
-  updateModeTag();
   renderTop();
 }
 
 async function renderTop() {
   renderModeBar();
-  updateModeTag();
   if (state.settings.topTable === "whl") {
     await loadWhlRows();
     renderWhlTop();
@@ -6237,7 +7179,6 @@ function renderWhlTop() {
   if (active && active.classList && active.classList.contains("cell-edit")) return;
   const mode = whlMode();
   renderModeBar();
-  updateModeTag();
   const q = findQuery();
   let rows = (state.whlRows || [])
     .filter((r) => matchesFind(q, `${r.title} ${r.subtitle || ""}`, r.authors, r.year))
@@ -6245,7 +7186,8 @@ function renderWhlTop() {
   const so = state.sort.whl;
   if (so) rows = sortRowsBy(rows, (r) => whlSortVal(r, so.key), so.dir);
   origRowShown = null;
-  streamRows(el("whltop-rows"), rows, (r) => whlRowTr(r, mode));
+  streamRows(el("whltop-rows"), rows, (r) => whlRowTr(r, mode),
+    (r) => `whl:${r.idx}`);
   el("whltop-empty").hidden = rows.length !== 0;
   el("top-count").textContent = `${rows.length} WHL rows`;
   applyTableChrome("whl");
@@ -7490,6 +8432,11 @@ function fmtBytes(n) {
   return Math.max(1, Math.round(n / 1e3)) + " KB";
 }
 
+function pdfOcrMode(wanted, requested, hasText) {
+  const nextWanted = requested == null ? !!wanted : !!requested;
+  return { wanted: nextWanted, on: nextWanted && !!hasText };
+}
+
 function createPdfViewer() {
   const root = document.createElement("div");
   root.className = "pdf-viewer";
@@ -7527,6 +8474,10 @@ function createPdfViewer() {
   const pagesBox = root.querySelector(".pdf-pagesbox");
   let sizeSeq = 0;
   let textSrc = "";
+  // A PDF with OCR opens in the useful comparison view. Each viewer still
+  // remembers an explicit toggle for the rest of the session, and callers may
+  // override this with opts.ocr (the WHL modal uses its persisted setting).
+  let ocrWanted = true;
   let ocrOn = false;
   let ocrLoadedFor = "";
   let pagesOn = false;
@@ -7653,6 +8604,8 @@ function createPdfViewer() {
   // not the pdf's own text layer.
   async function fillViewerLayout(pane) {
     const page = +pane.dataset.lay;
+    pane.dataset.paperPdf = pagesPdf || "";
+    paintOcrPaper(pane, pagesPdf);
     const name = ((pagesSaveTo && pagesSaveTo.name) || "").toLowerCase();
     const bid = (pagesSaveTo && pagesSaveTo.buildId) || "";
     const src = (pagesSaveTo && pagesSaveTo.src) || "primary";
@@ -7730,7 +8683,7 @@ function createPdfViewer() {
       pagesDirty = false;
       pagesBox.innerHTML = "";
       delete pagesBox.dataset.pdf;
-      setOcr(ocrOn);
+      setOcr(ocrWanted);
     }
   }
   const confirmDiscardPages = async () =>
@@ -7774,7 +8727,9 @@ function createPdfViewer() {
   }
 
   function setOcr(on) {
-    ocrOn = !!on && !!textSrc;
+    const mode = pdfOcrMode(ocrWanted, on, !!textSrc);
+    ocrWanted = mode.wanted;
+    ocrOn = mode.on;
     ocrBtn.classList.toggle("active", ocrOn);
     ocrPane.hidden = !ocrOn || pagesOn;
     if (ocrOn && !pagesOn) loadOcr();
@@ -7787,7 +8742,7 @@ function createPdfViewer() {
       setOcr(true);
       return;
     }
-    setOcr(!ocrOn);
+    setOcr(!ocrWanted);
   });
 
   return {
@@ -7824,7 +8779,7 @@ function createPdfViewer() {
       // re-showing (build switch) re-renders or leaves the page view
       setPages(pagesOn && !!pagesPdf);
       frameWrap.hidden = pagesOn;
-      setOcr(opts.ocr != null ? opts.ocr : ocrOn);
+      setOcr(opts.ocr != null ? opts.ocr : ocrWanted);
       const seq = ++sizeSeq;
       if (src.startsWith("/api/pdf")) {
         fetch(src, { method: "HEAD" }).then((r) => {
@@ -10861,6 +11816,9 @@ function currentInfoTarget() {
         return { label: "Master list #" + et.idx,
                  book: ex ? ex.book : parseBook(b), row: ex || null };
       }
+    } else if (et.kind === "ol") {
+      const r = (state.olRows || []).find((x) => String(x.key) === String(et.ref));
+      if (r) return { label: "Open Library", book: olToRecord(r), row: null };
     } else if (et.kind === "whl") {
       const w = whlRowByIdx(et.idx);
       if (w) return { label: "WHL catalog", whl: w };
@@ -11062,16 +12020,6 @@ function renderInfoPane() {
 
 function refreshInfoIfActive() {
   if (document.querySelector("#pane-info.active")) renderInfoPane();
-}
-
-async function loadOlStatus() {
-  try {
-    const st = await (await fetch("/api/ol/status")).json();
-    const ed = st.editions || {};
-    el("status-right").textContent = ed.available
-      ? `OL INDEX: ${(ed.editions / 1e6).toFixed(1)}M EDITIONS`
-      : (st.available ? `OL WORKS INDEX: ${(st.works / 1e6).toFixed(1)}M` : "No OL index");
-  } catch (e) { /* leave empty */ }
 }
 
 let olTimer = null;
@@ -11502,7 +12450,7 @@ function renderUpload() {
     // yellow = a draft entry exists in the editor; green = its entry is done
     if (st === "draft") tr.classList.add("src-draft");
     else if (st === "done") tr.classList.add("src-done");
-    const srcAttn = (state.attn || {})["src:" + (s.url || s.local_pdf || s.title)];
+    const srcAttn = (state.attn || {})[activeSourceRemarkKey(s)];
     if (srcAttn) {
       tr.classList.add("attention");
       if (attnReason(srcAttn)) tr.dataset.tip = "Needs attention: " + attnReason(srcAttn);
@@ -11532,6 +12480,7 @@ function renderUpload() {
     `${Object.values(state.builds).filter((b) => b.status === "uploaded").length} published`;
   applyTableChrome("upload");
   renderWorkbench();   // head, chips and gates track every builds re-render
+  renderRemarks();
 }
 
 // which build (if any) was seeded from this verified source, and how far
@@ -11935,6 +12884,10 @@ async function patchBuildRaw(id, fields, quiet) {
     // quiet: background patches (auto-attach) must not re-render the form
     // and wipe unsaved field edits
     if (!quiet) renderUpload();
+    if (Object.prototype.hasOwnProperty.call(fields || {}, "attention")) {
+      renderRemarks();
+      renderHome();
+    }
     return true;
   }
   if (res.status === 409 && data.build) {
@@ -11942,6 +12895,8 @@ async function patchBuildRaw(id, fields, quiet) {
     buildPatchConflict = true;
     state.builds[id] = data.build;
     renderUpload();
+    if (Object.prototype.hasOwnProperty.call(fields || {}, "attention"))
+      renderRemarks();
   }
   return false;
 }
@@ -12539,6 +13494,7 @@ const ocrState = {
   layoutMeta: {},          // build id -> extracted-figure boxes (ocr-layout)
   wordsCache: new Map(),   // "pdf|page" -> /api/pdf/words result
   regionsCache: new Map(), // "bid|src|page" -> /ocr-regions record
+  paperCache: new Map(),   // "pdf|lighten" -> sampled paper-color request
   treeCollapsed: new Set(),// "bid:srckey" — collapsed nodes of the docs tree
 };
 
@@ -13428,6 +14384,50 @@ function observeOcrLayout(pdf) {
     (pane) => fillOcrLayout(pane, pdf));
 }
 
+// A single sampled tint follows the source PDF across every facsimile surface.
+// Sampling is server-side: PyMuPDF already owns PDF rasterization, and the
+// browser need not load or canvas-decode pages that are outside the viewport.
+const OCR_PAPER_SAMPLE_PAGES = 5;
+
+async function paintOcrPaper(pane, pdf) {
+  if (!pane) return;
+  const lighten = state.settings.ocrPaperLighten;
+  const key = `${pdf || ""}|${lighten}`;
+  pane.dataset.paperPdf = pdf || "";
+  pane.dataset.paperKey = key;
+  if (!state.settings.ocrPaperColor || !pdf) {
+    pane.style.removeProperty("--ocr-paper-color");
+    return;
+  }
+  let req = ocrState.paperCache.get(key);
+  if (!req) {
+    req = (async () => {
+      try {
+        const data = await (await fetch(
+          "/api/pdf/paper-color?path=" + encodeURIComponent(pdf) +
+          `&samples=${OCR_PAPER_SAMPLE_PAGES}&lighten=${lighten}`)).json();
+        return data.ok ? data.color || "" : "";
+      } catch (e) {
+        ocrState.paperCache.delete(key);   // a transient failure may be retried
+        return "";
+      }
+    })();
+    if (ocrState.paperCache.size > 64) ocrState.paperCache.clear();
+    ocrState.paperCache.set(key, req);
+  }
+  const color = await req;
+  if (!pane.isConnected || pane.dataset.paperKey !== key ||
+      !state.settings.ocrPaperColor) return;
+  if (color) pane.style.setProperty("--ocr-paper-color", color);
+  else pane.style.removeProperty("--ocr-paper-color");
+}
+
+function refreshOcrPaperColors() {
+  for (const pane of document.querySelectorAll(".ocr-pglayout")) {
+    paintOcrPaper(pane, pane.dataset.paperPdf || "");
+  }
+}
+
 // the OCR sidecar for a book (ocr/layout.json), fetched once: the extracted-
 // figure boxes AND, per source, the pages that carry OCR word boxes (so Layout
 // knows which pages to place as a facsimile rather than flow as text)
@@ -13600,6 +14600,7 @@ function fillDocLayout(pane, text, bid, meta) {
 
 async function fillOcrLayout(pane, pdf) {
   const page = +pane.dataset.lay;
+  paintOcrPaper(pane, pdf);
   const d = ocrSelDoc();
   // The PDF's own text-layer extraction always shows the placed facsimile. Any
   // other doc (an OCR result) shows ITS content, so switching docs swaps what
@@ -17021,6 +18022,8 @@ const MENU_CMDS = {
   "undo": () => undo(),
   "redo": () => redo(),
   "search-pane": () => setSearchPane(!state.settings.showCatalog),
+  "remarks-sidebar": () =>
+    setRemarksCollapsed(!state.settings.remarksSidebarCollapsed, true),
   "table-checked": () => switchTopTable("checked"),
   "table-whl": () => switchTopTable("whl"),
   "run-scans": () => runScansBatch(),
@@ -17113,6 +18116,7 @@ function updateMenuState() {
   dis("undo", history.ptr === 0);
   dis("redo", history.ptr >= history.stack.length);
   check("search-pane", state.settings.showCatalog);
+  check("remarks-sidebar", !state.settings.remarksSidebarCollapsed);
   check("table-checked", onChecked);
   check("table-whl", !onChecked);
   check("opt-auto-ia", state.settings.autoIaDownload !== false);   // default-on
@@ -17441,6 +18445,7 @@ function boot(name, fn) {
 
 function init() {
   initConsole();          // first: it is where every later failure is reported
+  boot("info sections", initInfoSections);
   boot("desktop chrome", initDesktopChrome);
   boot("web view", initWebView);
   boot("settings", loadSettings);
@@ -17467,22 +18472,21 @@ function init() {
   boot("settings nav", initSettingsNav);
   boot("about", initAbout);
   boot("column resize", initColResize);
-  boot("open library status", loadOlStatus);
   // A database dropped into ~/.library-tool while the app is open should
-  // register without a restart: the backend already resolves it live, so just
-  // re-read the offline-index status whenever the window regains focus (e.g.
-  // after dropping files in the file manager). Throttled so a focus/blur storm
-  // can't hammer the endpoint.
-  let _olStatusAt = 0;
-  const refreshOlStatusOnReturn = () => {
+  // register without a restart. Invalidate the cached Resources inventory when
+  // focus returns, and refresh immediately only when that view is on screen.
+  let _dbResourceFocusAt = 0;
+  const refreshDbResourcesOnReturn = () => {
     if (document.visibilityState !== "visible") return;
     const now = Date.now();
-    if (now - _olStatusAt < 2000) return;
-    _olStatusAt = now;
-    loadOlStatus();
+    if (now - _dbResourceFocusAt < 2000) return;
+    _dbResourceFocusAt = now;
+    dbResourceState.loadedAt = 0;
+    if (el("infotab").classList.contains("active") &&
+        activeInfoSection() === "info-resources") loadDatabaseResources(true);
   };
-  document.addEventListener("visibilitychange", refreshOlStatusOnReturn);
-  window.addEventListener("focus", refreshOlStatusOnReturn);
+  document.addEventListener("visibilitychange", refreshDbResourcesOnReturn);
+  window.addEventListener("focus", refreshDbResourcesOnReturn);
 
   // undo / redo (toolbar)
   el("undo-btn").addEventListener("click", undo);
@@ -18039,6 +19043,7 @@ function init() {
   // Q while hovering a row (any table) or a builder entry: mark it as needing
   // attention, and offer a reason
   loadAttn();
+  boot("remarks sidebar", initRemarksSidebar);
   document.addEventListener("keydown", onAttentionKey);
   document.addEventListener("keydown", onSearchKey);
   document.addEventListener("keydown", onRowDeleteKey);
@@ -18122,6 +19127,7 @@ function init() {
     else if (!el("settings-overlay").hidden) closeSettings();
     else if (!el("engine-overlay").hidden) closeDefaultEngines();
     else if (!el("about-overlay").hidden) closeAbout();
+    else if (!state.settings.remarksSidebarCollapsed) setRemarksCollapsed(true, true);
   });
 
   // keep sized tables filling their panes when the window or panes resize
@@ -18155,11 +19161,15 @@ function init() {
     loadDownloads();
     // Home's pending tasks are derived from these, so it re-renders once the
     // data it counts has actually arrived
-    loadManual().then(migrateParsedEntries).then(renderHome);
+    loadManual().then(migrateParsedEntries).then(() => {
+      renderHome();
+      renderRemarks();
+    });
     loadBuilds().then(renderUpload).then(renderHome);
     switchTopTable(state.settings.topTable === "whl" ? "whl" : "checked");
     renderBottomPane();
     renderHome();
+    renderRemarks();
   });
 }
 

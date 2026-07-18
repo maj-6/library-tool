@@ -3490,6 +3490,134 @@ def _warm_pages_async(path: Path) -> None:
     threading.Thread(target=run, daemon=True, name="pdf-warm").start()
 
 
+_pdf_paper_cache: dict[tuple[str, float, int], dict] = {}
+
+
+def _paper_sample_pages(page_count: int, sample_count: int) -> list[int]:
+    """Zero-based, evenly-spaced pages for paper sampling.
+
+    Covers and endpapers are poor representatives of the book's paper, so omit
+    the first and last page when the document is long enough to do so without
+    crowding the requested sample count.
+    """
+    if page_count <= 0:
+        return []
+    sample_count = max(1, min(sample_count, page_count))
+    if page_count <= sample_count:
+        return list(range(page_count))
+    if sample_count == 1:
+        return [page_count // 2]
+    omit_ends = page_count >= sample_count + 2
+    lo, hi = (1, page_count - 2) if omit_ends else (0, page_count - 1)
+    return [round(lo + i * (hi - lo) / (sample_count - 1))
+            for i in range(sample_count)]
+
+
+def _pixmap_margin_rgb(pix) -> tuple[int, int, int] | None:
+    """Median RGB in a clean ring just inside a rasterized page's margins.
+
+    The outermost few percent are skipped because scanned books often carry a
+    black scanner border there. Channel medians ignore the small amount of ink,
+    foxing, page numbers, and marginalia that can remain in the ring.
+    """
+    from statistics import median
+
+    w, h, n = int(pix.width), int(pix.height), int(pix.n)
+    if w < 8 or h < 8 or n < 3:
+        return None
+    inset_x, inset_y = max(1, round(w * 0.035)), max(1, round(h * 0.035))
+    band_x, band_y = max(inset_x + 1, round(w * 0.14)), \
+        max(inset_y + 1, round(h * 0.14))
+    step = max(1, min(w, h) // 100)
+    raw = pix.samples
+    stride = int(pix.stride)
+    channels = ([], [], [])
+    for y in range(inset_y, h - inset_y, step):
+        in_y_band = y < band_y or y >= h - band_y
+        row = y * stride
+        for x in range(inset_x, w - inset_x, step):
+            if not in_y_band and band_x <= x < w - band_x:
+                continue
+            off = row + x * n
+            r, g, b = raw[off], raw[off + 1], raw[off + 2]
+            if max(r, g, b) < 64:     # scanner border or ink, not paper
+                continue
+            channels[0].append(r)
+            channels[1].append(g)
+            channels[2].append(b)
+    if not channels[0]:
+        return None
+    return tuple(round(median(values)) for values in channels)
+
+
+def _lighten_pdf_paper_color(color: str, amount: float) -> str:
+    """Mix a #rrggbb paper sample toward white by ``amount`` percent."""
+    amount = max(0.0, min(100.0, float(amount))) / 100.0
+    vals = [int(color[i:i + 2], 16) for i in (1, 3, 5)]
+    mixed = [round(v + (255 - v) * amount) for v in vals]
+    return "#" + "".join(f"{v:02x}" for v in mixed)
+
+
+def _sample_pdf_paper_color(path: Path, sample_count: int) -> dict:
+    """Return a cached representative margin color for a local PDF."""
+    import fitz
+    from statistics import median
+
+    mtime = path.stat().st_mtime
+    key = (str(path), mtime, sample_count)
+    hit = _pdf_paper_cache.get(key)
+    if hit is not None:
+        return hit
+    colors: list[tuple[int, int, int]] = []
+    sampled: list[int] = []
+    with _pdf_doc(path) as doc:
+        page_indexes = _paper_sample_pages(doc.page_count, sample_count)
+        for index in page_indexes:
+            pg = doc[index]
+            zoom = 160 / max(1.0, float(pg.rect.width))
+            pix = pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom),
+                                colorspace=fitz.csRGB, alpha=False)
+            color = _pixmap_margin_rgb(pix)
+            if color is not None:
+                colors.append(color)
+                sampled.append(index + 1)
+    if not colors:
+        raise ValueError("No paper-colored margin pixels found")
+    rgb = tuple(round(median([c[i] for c in colors])) for i in range(3))
+    out = {"base_color": "#" + "".join(f"{v:02x}" for v in rgb),
+           "sampled_pages": sampled}
+    if len(_pdf_paper_cache) > 64:
+        _pdf_paper_cache.clear()
+    _pdf_paper_cache[key] = out
+    return out
+
+
+@app.route("/api/pdf/paper-color")
+def api_pdf_paper_color():
+    """Representative paper color sampled from several PDF page margins."""
+    p = _pageimg_pdf(request.args.get("path"))
+    try:
+        samples = max(1, min(12, int(request.args.get("samples") or 5)))
+    except ValueError:
+        samples = 5
+    try:
+        lighten = max(0.0, min(100.0,
+                               float(request.args.get("lighten") or 0)))
+    except ValueError:
+        lighten = 0.0
+    if importlib.util.find_spec("fitz") is None:
+        return jsonify({"ok": False, "error": "PyMuPDF is not installed"}), 501
+    try:
+        sampled = _sample_pdf_paper_color(p, samples)
+        return jsonify({"ok": True, **sampled,
+                        "color": _lighten_pdf_paper_color(
+                            sampled["base_color"], lighten),
+                        "lighten": lighten})
+    except Exception as exc:
+        return jsonify({"ok": False,
+                        "error": f"{type(exc).__name__}: {exc}"}), 500
+
+
 @app.route("/api/pdf/words")
 def api_pdf_words():
     """Word boxes of one page of a local PDF (?path=&page=N).
@@ -5777,32 +5905,62 @@ def _sync_profile_mistral_key() -> str | None:
     local = str(secrets.get("mistralKey") or "").strip()
     pending = bool(secrets.get(_MISTRAL_PENDING))
     try:
-        rows = sauth.rest(
-            cfg, ses["access_token"], "GET",
-            f"profile_secrets?id=eq.{ses['user_id']}&select=api_keys",
-        ) or []
-        keys = dict(rows[0].get("api_keys") or {}) if rows else {}
-        if pending or "mistral" not in keys:
+        adopt = None
+        for _attempt in range(4):
+            rows = sauth.rest(
+                cfg, ses["access_token"], "GET",
+                f"profile_secrets?id=eq.{ses['user_id']}"
+                "&select=api_keys,updated_at",
+            ) or []
+            keys = dict(rows[0].get("api_keys") or {}) if rows else {}
+            if not pending and "mistral" in keys:
+                local = adopt = str(keys.get("mistral") or "").strip()
+                break
+
+            # Every writer updates the same revision token. If Android wins
+            # between this GET and PATCH, the empty response forces a re-read
+            # and re-merge so its DeepSeek/Mistral edits are not erased.
             keys["mistral"] = local
-            sauth.rest(
-                cfg, ses["access_token"], "POST",
-                "profile_secrets?on_conflict=id",
-                [{"id": ses["user_id"], "api_keys": keys}],
-                prefer="resolution=merge-duplicates,return=minimal",
-            )
-            adopt = None                   # local value pushed; only the flag clears
+            written_at = datetime.now(timezone.utc).isoformat()
+            if rows:
+                previous = str(rows[0].get("updated_at") or "").strip()
+                revision = ("updated_at=eq." + urllib.parse.quote(previous, safe="")
+                            if previous else "updated_at=is.null")
+                wrote = sauth.rest(
+                    cfg, ses["access_token"], "PATCH",
+                    f"profile_secrets?id=eq.{ses['user_id']}&{revision}",
+                    {"api_keys": keys, "updated_at": written_at},
+                    prefer="return=representation",
+                ) or []
+            else:
+                wrote = sauth.rest(
+                    cfg, ses["access_token"], "POST",
+                    "profile_secrets?on_conflict=id",
+                    [{"id": ses["user_id"], "api_keys": keys,
+                      "updated_at": written_at}],
+                    prefer="resolution=ignore-duplicates,return=representation",
+                ) or []
+            if wrote:
+                break
         else:
-            local = adopt = str(keys.get("mistral") or "").strip()
+            raise sauth.AuthError("profile changed on another device; retrying")
         # the REST round-trips above took time: apply the outcome to a fresh
         # read under the lock, not to the pre-network snapshot
         with _secrets_lock:
             secrets = _load_secrets()
+            fresh_local = str(secrets.get("mistralKey") or "").strip()
+            fresh_pending = bool(secrets.get(_MISTRAL_PENDING))
             if adopt is None:
-                secrets.pop(_MISTRAL_PENDING, None)
-            elif adopt:
-                secrets["mistralKey"] = adopt
-            else:
-                secrets.pop("mistralKey", None)
+                # Clear only the edit that was actually written. A Settings
+                # save may have produced a newer pending value while the REST
+                # request was in flight.
+                if not fresh_pending or fresh_local == local:
+                    secrets.pop(_MISTRAL_PENDING, None)
+            elif not fresh_pending:
+                if adopt:
+                    secrets["mistralKey"] = adopt
+                else:
+                    secrets.pop("mistralKey", None)
             _save_secrets(secrets)
         return local
     except sauth.AuthError as exc:
@@ -5934,8 +6092,53 @@ _DB_TARGETS = {
     "copyright_renewals": ("copyright_renewals.csv", "Copyright renewals"),
     "whl_catalog": ("whl_catalog.csv", "WHL catalog"),
 }
+_DB_METADATA = {
+    "ol_search": {
+        "description": (
+            "Edition-level offline search over titles, authors, publishers, "
+            "places, dates, editions, and volumes."
+        ),
+        "format": "SQLite 3 with FTS5",
+        "origin": "Open Library editions, authors, and works data dumps",
+        "origin_url": "https://openlibrary.org/developers/dumps",
+        "entry_unit": "editions",
+        "count_table": "ed",
+    },
+    "ol_works": {
+        "description": (
+            "Work-level offline title index used as the fallback when the "
+            "edition search index is unavailable."
+        ),
+        "format": "SQLite 3 with FTS5",
+        "origin": "Open Library works data dump",
+        "origin_url": "https://openlibrary.org/developers/dumps",
+        "entry_unit": "works",
+        "count_table": "works",
+    },
+    "copyright_renewals": {
+        "description": (
+            "Offline renewal records used to estimate United States copyright "
+            "status for works from the renewal era."
+        ),
+        "format": "UTF-8 CSV",
+        "origin": "Catalog of Copyright Entries renewal records",
+        "origin_url": "https://exhibits.stanford.edu/copyrightrenewals",
+        "entry_unit": "renewal records",
+    },
+    "whl_catalog": {
+        "description": (
+            "World Herb Library catalog export used to identify books that are "
+            "already published or awaiting publication."
+        ),
+        "format": "UTF-8 CSV",
+        "origin": "World Herb Library catalog export",
+        "origin_url": "https://worldherblibrary.org/catalog/",
+        "entry_unit": "catalog entries",
+    },
+}
 _db_jobs = {}          # name -> {status, downloaded, total, error}
 _db_lock = threading.Lock()
+_db_count_cache: dict[tuple[str, str, int, int], int] = {}
 
 
 def _db_local(rel):
@@ -5945,6 +6148,59 @@ def _db_local(rel):
     download is offered."""
     p = lib.find_db(rel.split("/")[-1], rel)
     return p if p.exists() else None
+
+
+def _db_entry_count(name: str, path: Path) -> int:
+    """Count a resource once per file revision.
+
+    The Open Library builders assign contiguous integer primary keys, so
+    ``max(id)`` is their exact record count and avoids scanning multi-gigabyte
+    tables. CSV files need one real parse because quoted fields may contain
+    newlines; the path/size/mtime cache makes later status polls constant-time.
+    """
+    stat = path.stat()
+    key = (name, str(path.resolve()), stat.st_mtime_ns, stat.st_size)
+    cached = _db_count_cache.get(key)
+    if cached is not None:
+        return cached
+
+    meta = _DB_METADATA.get(name) or {}
+    table = meta.get("count_table")
+    if table:
+        import sqlite3
+
+        con = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        try:
+            count = int(con.execute(f"SELECT max(id) FROM {table}").fetchone()[0] or 0)
+        finally:
+            con.close()
+    else:
+        import csv
+
+        encoding = "utf-8-sig" if name == "whl_catalog" else "utf-8"
+        with open(path, "r", encoding=encoding, errors="replace", newline="") as fh:
+            count = sum(1 for _ in csv.reader(fh))
+        count = max(0, count - 1)       # exclude the header row
+
+    if len(_db_count_cache) > 32:
+        _db_count_cache.clear()
+    _db_count_cache[key] = count
+    return count
+
+
+def _db_location(path: Path, rel: str) -> str:
+    """Human-readable provenance for the resolved local copy."""
+    resolved = path.resolve()
+    if resolved.parent == lib.DB_DIR.expanduser().resolve():
+        return "User database folder"
+    bundled = [lib.APP_ROOT / rel, lib.APP_ROOT / rel.split("/")[-1]]
+    if any(resolved == candidate.resolve() for candidate in bundled):
+        return "Bundled with Library Tool"
+    try:
+        resolved.relative_to(lib.DATA_ROOT.resolve())
+        return "Library Tool data folder"
+    except ValueError:
+        return "Local file"
 
 
 def _db_urls():
@@ -6047,14 +6303,39 @@ def api_db_status():
     out = {}
     for name, (rel, label) in _DB_TARGETS.items():
         p = _db_local(rel)
-        out[name] = {
+        meta = _DB_METADATA.get(name) or {}
+        item = {
             "label": label, "path": rel,
             "filename": rel.split("/")[-1],
             "present": p is not None,
+            "loaded": p is not None,
             "size": p.stat().st_size if p else 0,
             "url": str(urls.get(name) or ""),
             "job": _db_jobs.get(name),
+            "description": str(meta.get("description") or ""),
+            "format": str(meta.get("format") or ""),
+            "origin": str(meta.get("origin") or ""),
+            "origin_url": str(meta.get("origin_url") or ""),
+            "entry_unit": str(meta.get("entry_unit") or "entries"),
+            "entries": None,
+            "updated_at": "",
+            "resolved_path": "",
+            "location": "",
         }
+        if p:
+            stat = p.stat()
+            item.update({
+                "updated_at": datetime.fromtimestamp(
+                    stat.st_mtime, timezone.utc).isoformat(timespec="seconds"),
+                "resolved_path": str(p),
+                "location": _db_location(p, rel),
+            })
+            try:
+                item["entries"] = _db_entry_count(name, p)
+            except Exception as exc:
+                item["metadata_error"] = f"{type(exc).__name__}: {exc}"
+                log.warning("database metadata failed for %s: %s", name, exc)
+        out[name] = item
     return jsonify({"data_root": str(lib.DATA_ROOT), "db_dir": str(lib.DB_DIR),
                     "targets": out})
 
@@ -9901,6 +10182,21 @@ def _lan_ping():
     return jsonify(app="whl-capture", device=socket.gethostname() or "desktop")
 
 
+@lan_app.post("/lan/pair")
+def _lan_pair():
+    """Authenticated, side-effect-free proof that the configured token opens
+    the capture service. Echoing a caller nonce prevents a cached/replayed
+    liveness response from being mistaken for successful pairing."""
+    import hmac
+    if not hmac.compare_digest(request.headers.get("X-WHL-Token", ""), _lan_token()):
+        abort(401)
+    payload = request.get_json(silent=True) or {}
+    nonce = str(payload.get("nonce") or "")
+    if not (16 <= len(nonce) <= 128):
+        abort(400)
+    return jsonify(app="whl-capture", authorized=True, nonce=nonce)
+
+
 @lan_app.post("/lan/capture")
 def _lan_capture():
     import hmac
@@ -9924,9 +10220,17 @@ def _lan_capture():
     except Exception as exc:                       # noqa: BLE001 — report, don't 500-crash
         log.exception("LAN capture ingest failed")
         return jsonify(error=str(exc)[:200]), 500
+    capture_id = str(cap.get("id") or "")
     if entry_id is None:
-        return jsonify(status="duplicate"), 200    # idempotent: a retried POST
-    return jsonify(status="imported", id=entry_id), 200
+        # Idempotent retry. Echo the submitted capture id so Android can prove
+        # that this receipt belongs to the entry it is about to move to sent/.
+        return jsonify(app="whl-capture", status="duplicate",
+                       id=capture_id), 200
+    # ``ingest_capture`` returns the desktop's generated manual-entry id, but
+    # Android's delivery contract is keyed by the phone capture id. Echo that
+    # submitted id in ``id`` and expose the local id separately for diagnostics.
+    return jsonify(app="whl-capture", status="imported", id=capture_id,
+                   entry_id=entry_id), 200
 
 
 @app.get("/api/lan_info")

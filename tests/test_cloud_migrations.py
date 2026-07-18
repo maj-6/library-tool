@@ -22,6 +22,8 @@ BASELINE = SQL["001_baseline"]
 BASELINE_FLAT = " ".join(BASELINE.split())
 HARDENING = SQL["002_capture_owner_hardening"]
 HARDENING_FLAT = " ".join(HARDENING.split())
+SECRETS_REVISION = SQL["005_profile_secrets_revision"]
+SECRETS_REVISION_FLAT = " ".join(SECRETS_REVISION.split())
 
 
 # --- the migration files themselves ----------------------------------------------
@@ -111,6 +113,18 @@ def test_capture_storage_policies_bind_object_owner_to_capture_owner():
             policy = " ".join(match.group(0).split())
             assert "storage.objects.owner_id = c.created_by::text" in policy
             assert "grant_row.contributor_id = c.created_by" in policy
+
+
+def test_profile_secrets_revision_advances_for_every_client_version():
+    """CAS remains sound when an older client omits updated_at on UPDATE."""
+    assert "before update on public.profile_secrets" in SECRETS_REVISION_FLAT
+    assert "for each row" in SECRETS_REVISION_FLAT
+    assert "new.updated_at = greatest(" in SECRETS_REVISION_FLAT
+    assert "old.updated_at + interval '1 microsecond'" in SECRETS_REVISION_FLAT
+    assert "clock_timestamp()" in SECRETS_REVISION_FLAT
+    assert ("revoke all on function public.touch_profile_secrets_updated_at() "
+            "from public;" in SECRETS_REVISION_FLAT)
+    assert "security definer" not in SECRETS_REVISION_FLAT.lower()
 
 
 def test_migrations_lint_clean():

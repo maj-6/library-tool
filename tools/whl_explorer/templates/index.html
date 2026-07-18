@@ -39,6 +39,7 @@
         <button class="menu-btn" type="button">View</button>
         <div class="menu-drop" hidden>
           <button class="menu-item" data-cmd="search-pane" type="button"><span class="menu-check"></span>Search pane</button>
+          <button class="menu-item" data-cmd="remarks-sidebar" type="button"><span class="menu-check"></span>Remarks sidebar</button>
           <div class="menu-sep"></div>
           <button class="menu-item" data-cmd="table-checked" type="button"><span class="menu-check"></span>Checked books table</button>
           <button class="menu-item" data-cmd="table-whl" type="button"><span class="menu-check"></span>WHL table</button>
@@ -1294,31 +1295,104 @@
       </div>
     </section>
 
-    <!-- INFO: the console, for now; more lands here later -->
+    <!-- INFO: diagnostic messages and the local database inventory -->
     <section id="infotab" class="panel-view">
-      <div class="pane-bar">
-        <span class="tool-label">Console</span>
-        <select id="con-level" class="cad-input" data-tip="Lowest level to show">
-          <option value="info">Info and above</option>
-          <option value="warn">Warnings and errors</option>
-          <option value="error">Errors only</option>
-          <option value="debug">Everything (with HTTP)</option>
-        </select>
-        <input id="con-find" class="cad-input" placeholder="filter" spellcheck="false" />
-        <span class="bar-spacer"></span>
-        <span id="con-count" class="tool-label"></span>
-        <button id="con-follow" class="cad-btn tiny active" type="button"
-                data-tip="Scroll to follow new lines">Follow</button>
-        <button id="con-copy" class="cad-btn tiny icon-btn" type="button"
-                data-icon="export" data-tip="Copy the visible lines"
-                aria-label="Copy the visible lines"></button>
-        <button id="con-clear" class="cad-btn tiny icon-btn danger" type="button"
-                data-icon="remove" data-tip="Clear the console (the server keeps its own ring)"
-                aria-label="Clear the console"></button>
+      <div id="info-section-tabs" class="pane-tabs" role="tablist"
+           aria-label="Info sections">
+        <button class="pane-tab active" id="info-console-tab" type="button"
+                role="tab" aria-selected="true" aria-controls="info-console"
+                data-info-section="info-console">Console</button>
+        <button class="pane-tab" id="info-resources-tab" type="button"
+                role="tab" aria-selected="false" aria-controls="info-resources"
+                data-info-section="info-resources">Resources</button>
       </div>
-      <div id="con-lines"></div>
+
+      <div id="info-console" class="info-section active" role="tabpanel"
+           aria-labelledby="info-console-tab">
+        <div class="pane-bar">
+          <span class="tool-label">Debug / message console</span>
+          <select id="con-level" class="cad-input" data-tip="Lowest level to show">
+            <option value="info">Info and above</option>
+            <option value="warn">Warnings and errors</option>
+            <option value="error">Errors only</option>
+            <option value="debug">Everything (with HTTP)</option>
+          </select>
+          <input id="con-find" class="cad-input" placeholder="filter" spellcheck="false" />
+          <span class="bar-spacer"></span>
+          <span id="con-count" class="tool-label"></span>
+          <button id="con-follow" class="cad-btn tiny active" type="button"
+                  data-tip="Scroll to follow new lines">Follow</button>
+          <button id="con-copy" class="cad-btn tiny icon-btn" type="button"
+                  data-icon="export" data-tip="Copy the visible lines"
+                  aria-label="Copy the visible lines"></button>
+          <button id="con-clear" class="cad-btn tiny icon-btn danger" type="button"
+                  data-icon="remove" data-tip="Clear the console (the server keeps its own ring)"
+                  aria-label="Clear the console"></button>
+        </div>
+        <div id="con-lines"></div>
+      </div>
+
+      <div id="info-resources" class="info-section" role="tabpanel"
+           aria-labelledby="info-resources-tab">
+        <div class="db-resource-overview">
+          <div>
+            <div class="db-resource-title">Loaded databases</div>
+            <p class="settings-note">Local indexes and reference catalogs currently available
+              to Library Tool. Choose a database below for its source and file details.</p>
+          </div>
+          <span id="db-resource-summary" class="tool-label" role="status"
+                aria-live="polite">Not loaded</span>
+          <button id="db-resource-refresh" class="cad-btn tiny" type="button">Refresh</button>
+        </div>
+        <div class="db-resource-layout">
+          <nav id="db-resource-menu" class="db-resource-menu"
+               aria-label="Database resources"></nav>
+          <article id="db-resource-detail" class="db-resource-detail"
+                   aria-live="polite">
+            <div class="empty">Open Resources to inspect the local databases.</div>
+          </article>
+        </div>
+      </div>
     </section>
   </main>
+
+  <!-- REMARKS: one shared needs-attention sidebar for every top-level tab.
+       The selected category is remembered per tab; collapse state is shared. -->
+  <aside id="remarks-sidebar" class="collapsed" aria-labelledby="remarks-heading">
+    <button id="remarks-open" class="remarks-rail-toggle" type="button"
+            aria-controls="remarks-expanded" aria-expanded="false"
+            aria-label="Open Remarks sidebar">
+      <span class="remarks-rail-arrow" aria-hidden="true">&#9664;</span>
+      <span class="remarks-rail-label">Remarks</span>
+      <span id="remarks-rail-count" class="remarks-count" aria-hidden="true"></span>
+    </button>
+
+    <div id="remarks-expanded" hidden>
+      <div class="remarks-head">
+        <div class="remarks-heading-wrap">
+          <h2 id="remarks-heading">Remarks</h2>
+          <span id="remarks-total" class="tool-count" role="status"
+                aria-live="polite"></span>
+        </div>
+        <button id="remarks-close" class="cad-btn tiny remarks-collapse" type="button"
+                aria-controls="remarks-expanded" aria-expanded="true"
+                aria-label="Collapse Remarks sidebar"
+                data-tip="Collapse Remarks sidebar">&#9654;</button>
+      </div>
+      <div class="remarks-filter-row">
+        <label class="tool-label" for="remarks-filter">Show</label>
+        <select id="remarks-filter" class="cad-input">
+          <option value="all">All</option>
+          <option value="catalogs">Catalogs</option>
+          <option value="sources">Sources</option>
+          <option value="entries">Entries</option>
+          <option value="pages">Pages</option>
+          <option value="publications">Publications</option>
+        </select>
+      </div>
+      <div id="remarks-list"></div>
+    </div>
+  </aside>
   </div><!-- /#shell -->
 
   <!-- DEFAULT ENGINES WINDOW: shared by OCR and text-analysis staging -->
@@ -1711,6 +1785,12 @@
               <label class="tool-label" for="set-ocr-maxtokens">Vision OCR max output tokens</label>
               <input id="set-ocr-maxtokens" class="cad-input" type="number" min="1024" max="32000" step="512"
                      data-tip="Output cap for Claude / vision OCR. Raise it if dense, small-type pages get truncated mid-transcription." />
+              <label class="tool-label" for="set-ocr-paper-color">Use the PDF's paper color in facsimile layout</label>
+              <input id="set-ocr-paper-color" type="checkbox"
+                     data-tip="Sample the clear margin bands of five representative PDF pages and tint the OCR facsimile with their median paper color" />
+              <label class="tool-label" for="set-ocr-paper-lighten">Facsimile paper lightening (%)</label>
+              <input id="set-ocr-paper-lighten" class="cad-input" type="number" min="0" max="100" step="5"
+                     data-tip="Mix the sampled paper color toward white: 0 keeps the original color; 100 makes it white" />
               <label class="tool-label" for="set-ocr-key1">Page-view key 1</label>
               <select id="set-ocr-key1" class="cad-input">
                 <option value="">&mdash;</option>
@@ -1984,7 +2064,6 @@
         <span id="dl-progtext" class="dl-progtext"></span>
         <span class="dl-progtrack"><span id="dl-progbar" class="dl-progbar"></span></span>
       </span>
-      <span id="mode-tag" class="foot-tag" hidden></span>
       <span id="status-right"></span>
     </span>
   </div>
