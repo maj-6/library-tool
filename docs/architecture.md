@@ -33,8 +33,11 @@ Per-component detail lives in each part's own README (map at the end).
   It owns nothing; everything it shows was published from the desktop.
 - **Cloud** — Supabase (Postgres + Auth + Storage) plus a Cloudflare R2
   bucket for large objects (published PDFs, the `entries/` and `corpus/`
-  mirrors). The whole schema is one idempotent script,
-  `docs/cloud/schema.sql`. The cloud is authoritative only for what is
+  mirrors). The schema ships as ordered, append-only migrations under
+  `docs/cloud/migrations/` (`schema.sql` is the entry point that explains
+  the flow); each is idempotent and records itself, and
+  `tools/cloud_setup.py check` diffs the `schema_migrations` table against
+  that directory to name what is still pending. The cloud is authoritative only for what is
   born there or published to it: accounts, the `captures` queue, the
   shared `events` feed, and the published `volumes` catalogue + its
   artifacts; the working-store tables (`builds`, `ia_catalog`,
@@ -65,15 +68,23 @@ ingest as cloud sync — no internet on that leg.
 
 ## Trust boundaries
 
-Four tiers, enforced by RLS + explicit grants in `docs/cloud/schema.sql`.
-The website ships the anon key on purpose; RLS is what protects the
-project.
+Four tiers, enforced by RLS + explicit grants in the migrations under
+`docs/cloud/migrations/`, which follow a revoke-then-grant convention so
+every anon reach is deliberate. The website ships the anon key on purpose;
+RLS is what protects the project.
 
 **PUBLIC** (anon-readable — this data is intentionally a public library):
 
-- Exactly seven reads are granted to `anon`: `volumes`, `volume_texts`,
+- `anon` gets `select` on exactly these: `volumes`, `volume_texts`,
   `volume_pages`, `volume_notes`, `author_pages`, the `author_index`
-  view, and `releases`. Nothing else.
+  view, `releases`, `index_versions` (search-index metadata — counts,
+  model id, hashes, never text), and `schema_migrations`. Nothing else.
+- Two functions are `execute`-able by `anon`, and they are the *only*
+  path to the corpus: `search_volume(...)` (page search) and
+  `search_passages(...)`. The `passages` table itself is explicitly
+  revoked from `anon`/`authenticated` with no read policy, so passage
+  text and embeddings are reachable through the RPC alone, never by a
+  direct table read.
 - The `volumes` storage bucket and the R2-hosted published PDFs are
   world-readable — that is the point. The CH catalogue data shipped with
   the app is likewise public by design.
@@ -121,7 +132,8 @@ project.
 - The release pipeline secrets on the public repo:
   `SUPABASE_SERVICE_ROLE_KEY`, the Android keystore set, and
   `WIN_CSC_LINK_B64`/`WIN_CSC_KEY_PASSWORD` (see `docs/releasing.md`).
-- The Supabase dashboard / SQL editor, where `schema.sql` is applied.
+- The Supabase dashboard / SQL editor, where the migrations are applied,
+  in order.
 
 ## Account model
 
@@ -152,8 +164,9 @@ writes down); invite-only contributor enforcement is TODO (#98).
   the anon-key grant list.
 - `docs/releasing.md` — versioning, release standards, the pipeline,
   its secrets.
-- `docs/cloud/` — `schema.sql` (the authority on grants + RLS),
-  `auth_setup.md`, `r2_cors_setup.md`; `docs/cloud_capture_setup.md`
+- `docs/cloud/` — `migrations/` (the authority on grants + RLS; run in
+  order, `schema.sql` is the entry point), `auth_setup.md`,
+  `r2_cors_setup.md`; `docs/cloud_capture_setup.md`
   for the phone→desktop pipeline.
 - The website's Documentation page (`website/docs.html`,
   <https://maj-6.github.io/library-tool/docs.html>) — the illustrated
