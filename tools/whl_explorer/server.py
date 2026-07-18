@@ -36,6 +36,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -47,6 +48,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import capture_pipeline as capture  # noqa: E402
 import catalog_checks as checks  # noqa: E402
 import cloud_defaults  # noqa: E402
+import layout_roles  # noqa: E402
 import copyright_registration as copyreg  # noqa: E402
 import libcommon as lib  # noqa: E402
 import r2_store as r2  # noqa: E402
@@ -2245,12 +2247,1107 @@ def api_build_ocr_layout(build_id: str):
         abort(404)
     meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
     # word_pages is per source: {"<src>": [pages...]}, so the client places a
-    # facsimile only for the source whose boxes it actually has
+    # facsimile only for the source whose boxes it actually has; word_docs
+    # ({"<src>": {"<page>": name}}) says which compiled file each page's box
+    # text came from, so viewing any OTHER doc flows that doc's text instead
     word_pages = {src: sorted(int(k) for k in pages if str(k).isdigit())
                   for src, pages in (meta.get("words") or {}).items()
                   if isinstance(pages, dict)}
+    # region_pages mirrors word_pages: which pages have a typed-region record
+    # (fetched individually via /ocr-regions — the records carry full text);
+    # region_states carries each page's review flag for the workbench strip
+    region_pages = {src: sorted(int(k) for k in pages if str(k).isdigit())
+                    for src, pages in (meta.get("regions") or {}).items()
+                    if isinstance(pages, dict)}
+    region_states = {
+        src: {k: rec.get("state") for k, rec in pages.items()
+              if isinstance(rec, dict) and rec.get("state")}
+        for src, pages in (meta.get("regions") or {}).items()
+        if isinstance(pages, dict)}
     return jsonify({"ok": True, "images": meta.get("images") or {},
-                    "word_pages": word_pages})
+                    "word_pages": word_pages,
+                    "word_docs": meta.get("words_doc") or {},
+                    "region_pages": region_pages,
+                    "region_states": {k: v for k, v in region_states.items() if v}})
+
+
+@app.route("/api/builds/<build_id>/ocr-regions")
+def api_build_ocr_regions(build_id: str):
+    """One page's typed regions — the Phase 1 substrate the region facsimile
+    and the Replica workbench read: {ok, found, doc, dims, items: [{id, role,
+    box, order, text}]}. ?src= and ?page= select the record."""
+    if build_id not in lib.load_json(BUILDS_PATH, {}):
+        abort(404)
+    src = request.args.get("src") or "primary"
+    try:
+        page = int(request.args.get("page") or 0)
+    except (TypeError, ValueError):
+        page = 0
+    meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
+    rec = ((meta.get("regions") or {}).get(src) or {}).get(str(page))
+    if not isinstance(rec, dict):
+        return jsonify({"ok": True, "found": False})
+    return jsonify({"ok": True, "found": True, "doc": rec.get("doc") or "",
+                    "dims": rec.get("dims") or {},
+                    "state": rec.get("state") or "",
+                    "items": rec.get("items") or []})
+
+
+_RW_MAX_ITEMS = 800
+_RW_ROLE_RE = re.compile(r"^[a-z][a-z-]{0,23}$")
+
+
+def _rw_sanitize_items(raw: list, src_type: str = "human") -> list:
+    """One page's region items scrubbed for storage: roles kebab-case,
+    boxes clamped into the page, text layers capped, everything re-ordered
+    and re-idd. Shared by the workbench PUT and the .lib import — anything
+    that writes items the sidecar will trust must come through here."""
+    def order_of(it):
+        o = it.get("order")
+        return float(o) if isinstance(o, (int, float)) \
+            and not isinstance(o, bool) else 0.0
+
+    items = []
+    for it in sorted((x for x in raw if isinstance(x, dict)), key=order_of):
+        box = it.get("box") or {}
+        try:
+            x = min(1.0, max(0.0, float(box.get("x") or 0)))
+            y = min(1.0, max(0.0, float(box.get("y") or 0)))
+            w = min(1.0 - x, max(0.0, float(box.get("w") or 0)))
+            h = min(1.0 - y, max(0.0, float(box.get("h") or 0)))
+        except (TypeError, ValueError):
+            continue
+        if w < 0.001 or h < 0.001:
+            continue
+        role = str(it.get("role") or "body").lower()
+        if not _RW_ROLE_RE.match(role):
+            role = "body"
+        rec = {"id": f"r{len(items)}", "role": role,
+               "src_type": src_type, "order": len(items),
+               "box": {"x": round(x, 5), "y": round(y, 5),
+                       "w": round(w, 5), "h": round(h, 5)},
+               "text": str(it.get("text") or "")[:20000]}
+        # the normalized reading layer (long-s resolved, dehyphenated…),
+        # stored only when it exists — compose_text falls back per region
+        norm = str(it.get("norm") or "")[:20000]
+        if norm:
+            rec["norm"] = norm
+        items.append(rec)
+    return items
+
+
+def _rw_sanitize_dims(dims):
+    if not isinstance(dims, dict):
+        return None
+    try:
+        return {k: int(dims.get(k) or 0) for k in ("w", "h", "dpi")}
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+@app.route("/api/builds/<build_id>/ocr-regions", methods=["PUT"])
+def api_build_ocr_regions_put(build_id: str):
+    """Replace one page's typed regions with the Replica workbench's edited
+    set. Body: {src?, page, doc?, dims?, items: [{role, box{x,y,w,h}, order,
+    text}]}. Items are sanitized (roles kebab-case, boxes clamped to the
+    page, text capped), re-ordered, and re-idd; an empty list drops the
+    page's record. src_type becomes "human" — the set is human-curated from
+    here on."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    p = request.get_json(silent=True) or {}
+    src = _valid_src_key(b, p.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    try:
+        # OverflowError: json.loads accepts the non-standard Infinity
+        # literal, and int(inf) raises it rather than ValueError
+        page = int(p.get("page") or 0)
+    except (TypeError, ValueError, OverflowError):
+        page = 0
+    if page < 1:
+        return jsonify({"ok": False, "error": "bad page"}), 400
+    raw = p.get("items")
+    if not isinstance(raw, list) or len(raw) > _RW_MAX_ITEMS:
+        return jsonify({"ok": False, "error": "bad items"}), 400
+    items = _rw_sanitize_items(raw, src_type="human")
+    dims = _rw_sanitize_dims(p.get("dims"))
+    state = "verified" if p.get("state") == "verified" else ""
+    _ocr_save_page_regions(build_id, src, page, items, dims,
+                           doc=_ocr_name(str(p.get("doc") or "compiled.txt")),
+                           state=state)
+    return jsonify({"ok": True, "count": len(items)})
+
+
+@app.route("/api/builds/<build_id>/ocr-regions/recompile", methods=["POST"])
+def api_build_ocr_regions_recompile(build_id: str):
+    """Rewrite compiled body text from the saved regions. Every region page
+    of the source (or just ?page) recomposes — furniture (marginalia, heads,
+    catchwords) stays out of the flow, figure refs stay in — and merges into
+    the compiled file its record names. The merge is per page, so pages
+    without regions keep their existing text."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    p = request.get_json(silent=True) or {}
+    src = _valid_src_key(b, p.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    # an absent page means "every region page"; a PRESENT but garbage page
+    # must refuse — mapping it to the no-filter case would rewrite the whole
+    # compiled file when the caller asked to touch exactly one page
+    only = None
+    if "page" in p:
+        try:
+            only = int(p["page"])
+        except (TypeError, ValueError, OverflowError):
+            only = 0
+        if only < 1:
+            return jsonify({"ok": False, "error": "bad page"}), 400
+    # layer "norm" composes the normalized reading into one explicit target —
+    # the modern-edition text; the default layer writes each page's
+    # diplomatic body into the file its record names. The default target is
+    # per SOURCE (normalized.txt / normalized-<src>.txt): both sources of a
+    # two-scan build merge by bare page number, so sharing one file would
+    # silently interleave two different books' pages into a chimera.
+    layer = "norm" if str(p.get("layer") or "") in ("norm", "normalized") \
+        else "text"
+    target = ""
+    if layer == "norm":
+        default_norm = "normalized.txt" if src == "primary" \
+            else f"normalized-{src}.txt"
+        target = _ocr_name(str(p.get("target") or default_norm))
+    meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
+    pages = (meta.get("regions") or {}).get(src) or {}
+    done, docs = 0, set()
+    for k in sorted((k for k in pages if str(k).isdigit()), key=int):
+        rec = pages[k]
+        n = int(k)
+        if not isinstance(rec, dict) or (only is not None and n != only):
+            continue
+        doc = target or _ocr_name(str(rec.get("doc") or "compiled.txt"))
+        _ocr_merge_page(build_id, doc, n,
+                        layout_roles.compose_text(rec.get("items") or [],
+                                                  layer=layer))
+        docs.add(doc)
+        done += 1
+    # a secondary source's normalized file must map back to its scan, like
+    # every other per-source OCR doc, or the UI pairs it with the wrong PDF
+    if layer == "norm" and done and src != "primary":
+        _ocr_set_source(build_id, target, src)
+    return jsonify({"ok": True, "pages": done, "docs": sorted(docs)})
+
+
+# --- layout templates: recto/verso grids applied across a book -------------------
+
+_RW_TPL_RE = re.compile(r"^[\w\- ]{1,24}$")
+
+
+def _pdf_layer_words(pdf, page: int) -> list:
+    """One page's text-layer words via fitz (pixel corners -> 0..1 fractions,
+    block/line -> a line id), shaped like the stored OCR word boxes. Best-
+    effort — no text layer just means empty regions to fill by hand."""
+    if pdf is None or importlib.util.find_spec("fitz") is None:
+        return []
+    try:
+        with _pdf_doc(pdf) as doc:
+            if page > doc.page_count:
+                return []
+            pg = doc[page - 1]
+            pw, ph = float(pg.rect.width), float(pg.rect.height)
+            if pw <= 0 or ph <= 0:
+                return []
+            out = []
+            lids: dict = {}
+            for x0, y0, x1, y1, text, blk, ln, _wn in pg.get_text("words"):
+                lid = lids.setdefault((blk, ln), len(lids))
+                out.append({"t": text, "l": lid,
+                            "x": x0 / pw, "y": y0 / ph,
+                            "w": max(0.0, (x1 - x0) / pw),
+                            "h": max(0.0, (y1 - y0) / ph)})
+            return out
+    except Exception:
+        return []
+
+
+@app.route("/api/builds/<build_id>/ocr-templates", methods=["GET", "PUT", "DELETE"])
+def api_build_ocr_templates(build_id: str):
+    """Layout templates — hand-press books are grid-stable, so one corrected
+    exemplar page (a recto, a verso) becomes a reusable region grid.
+    GET ?src= lists them; PUT {src?, name, from_page} snapshots the SAVED
+    region record of from_page (geometry + roles, no text); DELETE {src?,
+    name} removes one. Stored in layout.json under templates.<src>.<name>."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    if request.method == "GET":
+        src = _valid_src_key(b, request.args.get("src"))
+        tpls = ((lib.load_json(meta_path, {}).get("templates") or {})
+                .get(src or "primary") or {})
+        return jsonify({"ok": True, "templates": [
+            {"name": name, "items": len(t.get("items") or []),
+             "from_page": t.get("from_page")}
+            for name, t in sorted(tpls.items()) if isinstance(t, dict)]})
+    p = request.get_json(silent=True) or {}
+    src = _valid_src_key(b, p.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    name = str(p.get("name") or "").strip()
+    if not _RW_TPL_RE.match(name):
+        return jsonify({"ok": False, "error": "bad template name"}), 400
+    with _ocr_merge_lock:
+        meta = lib.load_json(meta_path, {})
+        tmap = meta.setdefault("templates", {}).setdefault(src, {})
+        if request.method == "DELETE":
+            tmap.pop(name, None)
+            if not tmap:
+                meta["templates"].pop(src, None)
+            if not meta["templates"]:
+                meta.pop("templates", None)
+            lib.save_json(meta_path, meta)
+            return jsonify({"ok": True})
+        try:
+            from_page = int(p.get("from_page") or 0)
+        except (TypeError, ValueError, OverflowError):
+            from_page = 0
+        rec = ((meta.get("regions") or {}).get(src) or {}).get(str(from_page))
+        if not isinstance(rec, dict) or not rec.get("items"):
+            return jsonify({"ok": False, "error":
+                            "that page has no saved regions"}), 400
+        tmap[name] = {
+            "from_page": from_page,
+            "doc": rec.get("doc") or "",
+            "dims": rec.get("dims") or {},
+            "items": [{"role": it.get("role") or "body",
+                       "order": it.get("order") or i,
+                       "box": it.get("box") or {}}
+                      for i, it in enumerate(rec.get("items") or [])],
+        }
+        lib.save_json(meta_path, meta)
+    return jsonify({"ok": True, "items": len(tmap[name]["items"])})
+
+
+@app.route("/api/builds/<build_id>/ocr-templates/apply", methods=["POST"])
+def api_build_ocr_templates_apply(build_id: str):
+    """Stamp a template's region grid onto a page range. Body: {src?, name,
+    pages: [ints], overwrite?: bool, clip?: bool (default true)}. Pages that
+    already carry a region record are skipped unless overwrite. With clip,
+    each stamped region's text pre-fills from the word boxes inside it
+    (stored OCR boxes, else the PDF text layer) — a template plus word
+    geometry drafts the whole page; the human corrects instead of typing."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    p = request.get_json(silent=True) or {}
+    src = _valid_src_key(b, p.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    name = str(p.get("name") or "").strip()
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    meta = lib.load_json(meta_path, {})
+    tpl = ((meta.get("templates") or {}).get(src) or {}).get(name)
+    if not isinstance(tpl, dict) or not tpl.get("items"):
+        return jsonify({"ok": False, "error": "unknown template"}), 400
+    raw_pages = p.get("pages")
+    if not isinstance(raw_pages, list) or not raw_pages or len(raw_pages) > 500:
+        return jsonify({"ok": False, "error": "bad pages"}), 400
+    pages = []
+    for x in raw_pages:
+        try:
+            n = int(x)
+        except (TypeError, ValueError, OverflowError):
+            return jsonify({"ok": False, "error": "bad pages"}), 400
+        if n < 1:
+            return jsonify({"ok": False, "error": "bad pages"}), 400
+        pages.append(n)
+    overwrite = bool(p.get("overwrite"))
+    clip = p.get("clip") is not False
+    pdf = None
+    if clip:
+        raw = str(b.get("pdf_file") or "") if src == "primary" else next(
+            (s.get("path") for s in (b.get("pdf_sources") or [])
+             if s.get("id") == src), "")
+        pdf = _resolve_local(raw or "")
+    # Two phases. Preparation runs UNLOCKED — text-layer clipping opens the
+    # PDF and must not stall OCR jobs — against a words snapshot read once
+    # (the old shape re-parsed the whole sidecar per page, 500 times). The
+    # skip-unless-overwrite decision is then re-made under the merge lock
+    # against FRESH state in one read-modify-write: a page the user saved
+    # while the loop ran must not get stamped over, and a snapshot-based
+    # skip check could do exactly that.
+    words_map = (meta.get("words") or {}).get(src) or {}
+    existing0 = (meta.get("regions") or {}).get(src) or {}
+    tpl_items = sorted(tpl["items"], key=lambda x: x.get("order") or 0)
+    doc = _ocr_name(str(tpl.get("doc") or "compiled.txt"))
+    prepared: dict[int, list] = {}
+    pre_skipped, clipped = [], []
+    for n in sorted(set(pages)):
+        if not overwrite and str(n) in existing0:
+            pre_skipped.append(n)
+            continue
+        words = []
+        if clip:
+            words = words_map.get(str(n))
+            if not (isinstance(words, list) and words):
+                words = _pdf_layer_words(pdf, n)
+        items = []
+        for i, t in enumerate(tpl_items):
+            box = t.get("box") or {}
+            text = layout_roles.clip_words_to_box(words, box) if words else ""
+            items.append({"id": f"r{i}", "role": t.get("role") or "body",
+                          "src_type": "template", "order": i,
+                          "box": box, "text": text})
+        if any(it["text"] for it in items):
+            clipped.append(n)
+        prepared[n] = items
+    applied, skipped = [], list(pre_skipped)
+    with _ocr_merge_lock:
+        cur = lib.load_json(meta_path, {})
+        pmap = cur.setdefault("regions", {}).setdefault(src, {})
+        for n, items in prepared.items():
+            if not overwrite and str(n) in pmap:
+                skipped.append(n)
+                continue
+            pmap[str(n)] = {"doc": doc, "dims": tpl.get("dims") or {},
+                            "items": items}
+            applied.append(n)
+        lib.save_json(meta_path, cur)
+    clipped = [n for n in clipped if n in applied]
+    return jsonify({"ok": True, "applied": sorted(applied),
+                    "skipped": sorted(skipped), "clipped": sorted(clipped)})
+
+
+@app.route("/api/builds/<build_id>/ocr-templates/outliers", methods=["POST"])
+def api_build_ocr_templates_outliers(build_id: str):
+    """Score every region page of the source against a template: the pages
+    where the grid broke (plates, chapter openings, errata) are the ones
+    worth a human look. Body: {src?, name, threshold?: 0.5}. Returns {scores:
+    {page: 0..1}, outliers: [pages below threshold]}."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    p = request.get_json(silent=True) or {}
+    src = _valid_src_key(b, p.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    name = str(p.get("name") or "").strip()
+    meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
+    tpl = ((meta.get("templates") or {}).get(src) or {}).get(name)
+    if not isinstance(tpl, dict) or not tpl.get("items"):
+        return jsonify({"ok": False, "error": "unknown template"}), 400
+    try:
+        threshold = min(1.0, max(0.0, float(p.get("threshold") or 0.5)))
+    except (TypeError, ValueError, OverflowError):
+        threshold = 0.5
+    pages = (meta.get("regions") or {}).get(src) or {}
+    scores, outliers = {}, []
+    for k in sorted((k for k in pages if str(k).isdigit()), key=int):
+        rec = pages[k]
+        if not isinstance(rec, dict):
+            continue
+        s = layout_roles.template_score(tpl["items"], rec.get("items") or [])
+        scores[k] = round(s, 3)
+        if s < threshold:
+            outliers.append(int(k))
+    return jsonify({"ok": True, "scores": scores, "outliers": outliers})
+
+
+# --- .lib export: the Replica working store, sealed ------------------------------
+
+# The default role -> modern-type mapping a .lib carries until the style
+# board exists to edit one. OFL faces only — a .lib may someday embed its
+# fonts, and only open-licensed families can travel. Sizes are relative to
+# the body (em), which the region boxes then scale to the page.
+_LIB_STYLESHEET = {
+    "body": {"family": "EB Garamond", "size_em": 1.0, "align": "justify"},
+    "marginalia": {"family": "EB Garamond", "size_em": 0.78, "style": "italic"},
+    "footnote": {"family": "EB Garamond", "size_em": 0.82},
+    "title": {"family": "EB Garamond", "size_em": 1.25,
+              "variant": "small-caps"},
+    "header": {"family": "EB Garamond", "size_em": 0.85,
+               "variant": "small-caps", "align": "center"},
+    "footer": {"family": "EB Garamond", "size_em": 0.85, "align": "center"},
+    "caption": {"family": "EB Garamond", "size_em": 0.85, "style": "italic",
+                "align": "center"},
+    "page-number": {"family": "EB Garamond", "size_em": 0.85},
+    "catch-word": {"family": "EB Garamond", "size_em": 0.85,
+                   "align": "right"},
+    "signature-mark": {"family": "EB Garamond", "size_em": 0.85,
+                       "align": "center"},
+    # large capitals render at their box height; rubricated red by default —
+    # an illuminated look the style board's color/bg fields can build on
+    "drop-capital": {"family": "EB Garamond", "color": "#8b1a1a"},
+    # the "page" pseudo-role: the facsimile's paper and ink
+    "page": {"bg": "#fdfcf8", "color": "#1c1a17"},
+}
+
+_LIB_META_FIELDS = ("published_slug", "title", "subtitle", "authors", "year",
+                    "publisher", "publisher_city", "edition", "volume",
+                    "language", "pages", "source_url")
+
+
+_RW_HEX_RE = re.compile(r"^#[0-9a-fA-F]{3,8}$")
+
+
+def _rw_sanitize_styles(raw: dict) -> dict:
+    """A role->style mapping scrubbed for storage. Shared by the style-board
+    PUT and the .lib import — a .lib is somebody else's file."""
+    styles = {}
+    for role, st in raw.items():
+        role = str(role).lower()
+        if not _RW_ROLE_RE.match(role) or not isinstance(st, dict):
+            continue
+        out = {}
+        family = str(st.get("family") or "").strip()[:60]
+        if family:
+            out["family"] = family
+        for k, lo, hi in (("size_em", 0.3, 4.0), ("leading", 0.8, 3.0)):
+            try:
+                v = float(st.get(k))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if lo <= v <= hi:
+                out[k] = round(v, 2)
+        if st.get("style") in ("italic", "normal"):
+            out["style"] = st["style"]
+        if st.get("variant") in ("small-caps", "normal"):
+            out["variant"] = st["variant"]
+        if st.get("align") in ("left", "right", "center", "justify"):
+            out["align"] = st["align"]
+        for k in ("color", "bg"):
+            v = str(st.get(k) or "")
+            if _RW_HEX_RE.match(v):
+                out[k] = v
+        if out:
+            styles[role] = out
+    return styles
+
+
+def _replica_style_path(build_id: str):
+    return _entry_dir(build_id) / "ocr" / "replica-style.json"
+
+
+def _replica_styles(build_id: str) -> tuple[dict, bool]:
+    """The book's role->type stylesheet: (styles, custom). Falls back to the
+    OFL seed when the style board has never saved one."""
+    doc = lib.load_json(_replica_style_path(build_id), None)
+    if isinstance(doc, dict) and isinstance(doc.get("styles"), dict) \
+            and doc["styles"]:
+        return doc["styles"], True
+    return _LIB_STYLESHEET, False
+
+
+@app.route("/api/builds/<build_id>/replica-style",
+           methods=["GET", "PUT", "DELETE"])
+def api_build_replica_style(build_id: str):
+    """The book-level role -> modern-type mapping the re-typeset preview and
+    the .lib export use. GET returns the stored sheet (custom: true) or the
+    OFL seed (custom: false); PUT {styles: {role: {family, size_em, leading,
+    style, variant, align}}} validates and stores; DELETE resets to the
+    seed. Typography belongs to the BOOK, not a scan, so there is no src."""
+    if build_id not in lib.load_json(BUILDS_PATH, {}):
+        abort(404)
+    path = _replica_style_path(build_id)
+    if request.method == "GET":
+        styles, custom = _replica_styles(build_id)
+        return jsonify({"ok": True, "styles": styles, "custom": custom})
+    if request.method == "DELETE":
+        with _ocr_merge_lock:
+            path.unlink(missing_ok=True)
+        return jsonify({"ok": True})
+    p = request.get_json(silent=True) or {}
+    raw = p.get("styles")
+    if not isinstance(raw, dict) or not raw or len(raw) > 40:
+        return jsonify({"ok": False, "error": "bad styles"}), 400
+    styles = _rw_sanitize_styles(raw)
+    if not styles:
+        return jsonify({"ok": False, "error": "no valid styles"}), 400
+    # under the merge lock like every other sidecar write: the .lib import's
+    # check-and-write shares it, so neither side clobbers the other
+    with _ocr_merge_lock:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lib.save_json(path, {"version": 1, "styles": styles})
+    return jsonify({"ok": True, "count": len(styles)})
+
+
+@app.route("/api/builds/<build_id>/replica-export")
+def api_build_replica_export(build_id: str):
+    """Seal one source's Replica working store into a .lib — a plain zip:
+
+        book.json      format tag, bibliographic snapshot, role stylesheet,
+                       layout templates, figure inventory, page list
+        pages/N.json   one file per region page: doc, dims, review state,
+                       items with diplomatic text + normalized layer
+        assets/img/*   the extracted figure crops the regions reference
+
+    The entry folder stays the working store — this is its portable,
+    diffable snapshot for interchange and the coming re-typeset tooling.
+    ?src= picks the scan (default primary)."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    src = _valid_src_key(b, request.args.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
+    pages = (meta.get("regions") or {}).get(src) or {}
+    page_nums = sorted(int(k) for k in pages
+                       if str(k).isdigit() and isinstance(pages[k], dict))
+    if not page_nums:
+        return jsonify({"ok": False, "error":
+                        "no region pages to export — seed or draw some in"
+                        " the Replica tab first"}), 400
+    import io
+    import zipfile
+    figures = {}
+    img_dir = _entry_dir(build_id) / "ocr" / "images"
+    for name, info in (meta.get("images") or {}).items():
+        if not isinstance(info, dict):
+            continue
+        if str(info.get("src_key") or "primary") != src:
+            continue
+        # the writer sanitizes names, but the sidecar is a hand-editable
+        # file: re-sanitize like the serving route, or a crafted key walks
+        # out of ocr/images/ on read AND plants a zip-slip member name
+        safe = re.sub(r"[^\w.\-]", "_", str(name))
+        if not safe or safe != str(name):
+            continue
+        figures[safe] = {k: info.get(k) for k in ("page", "x", "y", "w", "h")}
+        # rework linkage must survive the round trip, or an imported book's
+        # modern edition silently loses its re-drawn art
+        if info.get("rework_of"):
+            figures[safe]["rework_of"] = str(info["rework_of"])
+    book = {
+        "format": "lib/1",
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "source": src,
+        "meta": {k: b.get(k) for k in _LIB_META_FIELDS if b.get(k)},
+        "stylesheet": _replica_styles(build_id)[0],
+        "templates": (meta.get("templates") or {}).get(src) or {},
+        "figures": figures,
+        "pages": page_nums,
+    }
+    buf = io.BytesIO()
+    try:
+        # allow_nan=False: a hand-edited sidecar smuggling NaN/Infinity
+        # through load_json must fail HERE, loudly — not export an archive
+        # whose pages/N.json no strict parser will read
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("book.json", json.dumps(book, indent=1,
+                                               ensure_ascii=False,
+                                               allow_nan=False))
+            for n in page_nums:
+                rec = pages[str(n)]
+                z.writestr(f"pages/{n}.json", json.dumps({
+                    "page": n,
+                    "doc": rec.get("doc") or "",
+                    "dims": rec.get("dims") or {},
+                    "state": rec.get("state") or "",
+                    "items": rec.get("items") or [],
+                }, indent=1, ensure_ascii=False, allow_nan=False))
+            for name in figures:
+                f = img_dir / name
+                if f.is_file():
+                    z.writestr(f"assets/img/{name}", f.read_bytes())
+    except ValueError:
+        return jsonify({"ok": False, "error":
+                        "the layout sidecar contains non-finite numbers — "
+                        "re-save the affected pages first"}), 400
+    buf.seek(0)
+    stem = re.sub(r"[^\w\-]+", "-",
+                  str(b.get("published_slug") or b.get("title")
+                      or build_id)).strip("-").lower()[:60] or build_id
+    return send_file(buf, mimetype="application/zip", as_attachment=True,
+                     download_name=f"{stem}.lib")
+
+
+# --- illustration rework: image generation over the figure crops -----------------
+
+_IMG_GEN_PROMPT = (
+    "Redraw this illustration from an old printed book as a clean modern "
+    "edition illustration. Preserve the composition, subject, and period "
+    "character; render as crisp line art suitable for print, free of paper "
+    "texture, stains, and show-through.")
+
+
+def _img_gen_cfg() -> dict:
+    """BYO-key image generation settings (Settings > OCR & AI). Providers:
+    "openai" (images/edits, default model gpt-image-1) or "gemini"
+    (generateContent with an inline image, default gemini-2.5-flash-image)."""
+    s = _client_settings()
+    provider = str(s.get("imgGenProvider") or "openai").strip().lower()
+    if provider not in ("openai", "gemini"):
+        provider = "openai"
+    model = str(s.get("imgGenModel") or "").strip() or (
+        "gpt-image-1" if provider == "openai" else "gemini-2.5-flash-image")
+    return {"provider": provider, "model": model,
+            "key": str(s.get("imgGenKey") or "").strip()}
+
+
+def _img_gen(cfg: dict, image: bytes, mime: str, prompt: str,
+             timeout: float = 180.0) -> bytes:
+    """One image in, one generated image out, or RuntimeError. NOTE: written
+    to the providers' documented shapes but not yet exercised against live
+    keys — same standing as the cloud OCR processor before its key existed."""
+    import base64
+    if cfg["provider"] == "gemini":
+        payload = {"contents": [{"parts": [
+            {"text": prompt},
+            {"inline_data": {"mime_type": mime,
+                             "data": base64.b64encode(image).decode("ascii")}},
+        ]}]}
+        req = urllib.request.Request(
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{urllib.parse.quote(cfg['model'])}:generateContent",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     "x-goog-api-key": cfg["key"]})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        for cand in data.get("candidates") or []:
+            for part in ((cand.get("content") or {}).get("parts") or []):
+                blob = part.get("inline_data") or part.get("inlineData")
+                if blob and blob.get("data"):
+                    return base64.b64decode(blob["data"])
+        raise RuntimeError("the model returned no image")
+    # openai images/edits: multipart with the source image
+    boundary = "whl-" + uuid.uuid4().hex
+    ext = "jpg" if mime == "image/jpeg" else "png"
+    parts = []
+    for k, v in (("model", cfg["model"]), ("prompt", prompt), ("n", "1")):
+        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; "
+                     f"name=\"{k}\"\r\n\r\n{v}\r\n".encode("utf-8"))
+    parts.append(
+        (f"--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; "
+         f"filename=\"figure.{ext}\"\r\nContent-Type: {mime}\r\n\r\n")
+        .encode("utf-8") + image + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/images/edits", data=b"".join(parts),
+        headers={"Authorization": f"Bearer {cfg['key']}",
+                 "Content-Type": f"multipart/form-data; boundary={boundary}"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8", "replace"))
+    import base64 as _b64
+    for item in data.get("data") or []:
+        if item.get("b64_json"):
+            return _b64.b64decode(item["b64_json"])
+    raise RuntimeError("the model returned no image")
+
+
+@app.route("/api/builds/<build_id>/rework-figure", methods=["POST"])
+def api_build_rework_figure(build_id: str):
+    """Rework one extracted figure through the configured image model:
+    {src?, figure: <name>, prompt?: extra art direction}. The generated
+    image saves beside the original as rework-<name>.png with the same
+    page/bbox and a rework_of pointer — the re-typeset preview prefers it,
+    the original is never touched. Works on any figure region, including a
+    hand-drawn box over an initial to commission an illuminated capital."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    p = request.get_json(silent=True) or {}
+    src = _valid_src_key(b, p.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    name = str(p.get("figure") or "")
+    if not re.fullmatch(r"[\w.\-]{1,120}", name):
+        return jsonify({"ok": False, "error": "bad figure name"}), 400
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    info = (lib.load_json(meta_path, {}).get("images") or {}).get(name)
+    if not isinstance(info, dict) or \
+            str(info.get("src_key") or "primary") != src:
+        return jsonify({"ok": False, "error": "unknown figure"}), 400
+    # rework the ORIGINAL, never a rework: chains would mint paid calls the
+    # preview can't even show (its shadow map is one level deep)
+    if info.get("rework_of") or name.startswith("rework-"):
+        return jsonify({"ok": False, "error":
+                        "that is already a rework — rework the original"}), 400
+    f = _entry_dir(build_id) / "ocr" / "images" / name
+    if not f.is_file():
+        return jsonify({"ok": False, "error": "figure file missing"}), 400
+    cfg = _img_gen_cfg()
+    if not cfg["key"]:
+        return jsonify({"ok": False, "error":
+                        "no image-generation key configured "
+                        "(Settings > OCR & AI > Illustration rework)"}), 400
+    prompt = _IMG_GEN_PROMPT
+    extra = str(p.get("prompt") or "").strip()[:2000]
+    if extra:
+        prompt += " " + extra
+    raw = f.read_bytes()
+    mime = "image/jpeg" if f.suffix.lower() in (".jpg", ".jpeg") \
+        else "image/png"
+    try:
+        out = _img_gen(cfg, raw, mime, prompt)
+    except Exception as exc:
+        return jsonify({"ok": False, "error":
+                        f"image generation failed: {exc}"}), 502
+    # the FULL original name (extension included) keys the rework, so
+    # p3-fig.jpeg and p3-fig.png can never collide onto one output
+    out_name = f"rework-{name}.png"
+    if len(out_name) > 120:
+        return jsonify({"ok": False, "error": "figure name too long"}), 400
+    with _ocr_merge_lock:
+        (f.parent / out_name).write_bytes(out)
+        meta = lib.load_json(meta_path, {})
+        entry = {k: info.get(k) for k in ("page", "x", "y", "w", "h")}
+        entry.update({"src_key": src, "rework_of": name})
+        meta.setdefault("images", {})[out_name] = entry
+        lib.save_json(meta_path, meta)
+    return jsonify({"ok": True, "name": out_name, "bytes": len(out)})
+
+
+# --- print / PDF export: the re-typeset preview, paginated ----------------------
+
+# A4 printable area at 12mm margins; a page box scales to fit, ratio kept
+_PRINT_W_MM = 186.0
+_PRINT_H_MM = 273.0
+
+
+@app.route("/api/builds/<build_id>/replica-print")
+def api_build_replica_print(build_id: str):
+    """The modernized facsimile as a print document: every region page of
+    the source re-typeset at the book's styles, one sheet per page, sized
+    for A4 — open it and print to PDF (Chromium's fuller paged-media
+    machinery isn't needed: each sheet is one absolutely-positioned box
+    with a page break after it, which prints faithfully everywhere).
+    ?src= picks the scan; ?layer= flows the diplomatic text (default),
+    "norm", or a page-aligned translation language."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    src = _valid_src_key(b, request.args.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    layer = str(request.args.get("layer") or "").strip()[:12]
+    meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
+    pages = (meta.get("regions") or {}).get(src) or {}
+    page_nums = sorted(int(k) for k in pages
+                       if str(k).isdigit() and isinstance(pages[k], dict))
+    if not page_nums:
+        return jsonify({"ok": False, "error": "no region pages to print"}), 400
+    styles, _custom = _replica_styles(build_id)
+    pg_style = styles.get("page") or {}
+    paper = pg_style.get("bg") or "#fdfcf8"
+    ink = pg_style.get("color") or "#1c1a17"
+    # reworked art shadows its original, exactly like the preview
+    rework = {str(i.get("rework_of")): n
+              for n, i in (meta.get("images") or {}).items()
+              if isinstance(i, dict) and i.get("rework_of")}
+    trans_pages = None
+    if layer and layer != "norm":
+        lang = _lang_code(layer)
+        trans_pages = _an_pages(_read_entry_text(
+            build_id, f"translations/{lang}.txt")) if lang else {}
+
+    import html as _html
+
+    def esc(s):
+        return _html.escape(str(s or ""), quote=True)
+
+    def css_color(v, fallback):
+        return v if isinstance(v, str) and _RW_HEX_RE.match(v) else fallback
+
+    sheets = []
+    for n in page_nums:
+        rec = pages[str(n)]
+        items = sorted((i for i in rec.get("items") or []
+                        if isinstance(i, dict)),
+                       key=lambda i: i.get("order") or 0)
+        dims = rec.get("dims") or {}
+        try:
+            ratio = float(dims.get("w") or 0) / float(dims.get("h") or 0)
+        except (TypeError, ValueError, ZeroDivisionError):
+            ratio = 0.0
+        if not 0.1 < ratio < 10:
+            ratio = 0.72
+        sheet_w = min(_PRINT_W_MM, _PRINT_H_MM * ratio)
+        sheet_h = sheet_w / ratio
+        # the base type size: median content-fit of the body regions, so
+        # size_em ratios play against the page's own scale (same rule as
+        # the on-screen preview)
+        fits = []
+        for it in items:
+            if it.get("role") != "body" or not str(it.get("text") or "").strip():
+                continue
+            lines = max(1, len([ln for ln in str(it["text"]).split("\n")
+                                if ln.strip()]))
+            fits.append((it.get("box") or {}).get("h", 0) * sheet_h
+                        / lines * 0.78)
+        fits.sort()
+        base = fits[len(fits) // 2] if fits else sheet_h * 0.018
+        texts = {}
+        if trans_pages is not None:
+            bodies = [it for it in items if it.get("role") == "body"]
+            dist = layout_roles.distribute_text(
+                trans_pages.get(n) or "",
+                [max(1, len(str(it.get("text") or ""))) for it in bodies])
+            for it, t in zip(bodies, dist):
+                texts[id(it)] = t
+        cells = []
+        for it in items:
+            box = it.get("box") or {}
+            try:
+                x = float(box.get("x") or 0) * sheet_w
+                y = float(box.get("y") or 0) * sheet_h
+                w = float(box.get("w") or 0) * sheet_w
+                h = float(box.get("h") or 0) * sheet_h
+            except (TypeError, ValueError):
+                continue
+            role = str(it.get("role") or "body")
+            st = styles.get(role) or styles.get("body") or {}
+            pos = (f"left:{x:.2f}mm;top:{y:.2f}mm;"
+                   f"width:{w:.2f}mm;height:{h:.2f}mm;")
+            text = str(it.get("text") or "")
+            fig = role == "figure" and re.search(
+                r"!\[[^\]\n]*\]\(([\w.\- ]+)\)", text)
+            if fig:
+                name = rework.get(fig.group(1)) or fig.group(1)
+                cells.append(
+                    f'<div class="rg" style="{pos}">'
+                    f'<img src="/api/builds/{urllib.parse.quote(build_id)}'
+                    f'/ocr/images/{urllib.parse.quote(name)}" alt=""></div>')
+                continue
+            if layer == "norm":
+                shown = str(it.get("norm") or "").strip() or text
+            elif trans_pages is not None and id(it) in texts:
+                shown = texts[id(it)]
+            else:
+                shown = text
+            decl = [pos]
+            # single-quoted in CSS: the style attribute itself is double-
+            # quoted, and a double quote inside would terminate it
+            fam = str(st.get("family") or "").replace('"', "").replace("'", "")
+            decl.append(f"font-family:'{fam}',serif;" if fam
+                        else "font-family:serif;")
+            if role == "drop-capital":
+                decl.append(f"font-size:{max(2.0, h * 0.9):.2f}mm;"
+                            "line-height:1;text-align:center;")
+            else:
+                size = base * float(st.get("size_em") or 1)
+                decl.append(f"font-size:{max(1.5, size):.2f}mm;")
+                decl.append(f"line-height:{st.get('leading') or 1.25};")
+            if st.get("style") == "italic":
+                decl.append("font-style:italic;")
+            if st.get("variant") == "small-caps":
+                decl.append("font-variant:small-caps;")
+            if st.get("align"):
+                decl.append(f"text-align:{st['align']};")
+            if st.get("color"):
+                decl.append(f"color:{css_color(st['color'], ink)};")
+            if st.get("bg"):
+                decl.append(f"background:{css_color(st['bg'], 'none')};")
+            cells.append(f'<div class="rg" style="{"".join(decl)}">'
+                         f"{esc(shown)}</div>")
+        sheets.append(
+            f'<div class="sheet" style="width:{sheet_w:.1f}mm;'
+            f'height:{sheet_h:.1f}mm;">{"".join(cells)}'
+            f'<div class="folio">{n}</div></div>')
+
+    title = esc(b.get("title") or build_id)
+    doc = (
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        f"<title>{title} — replica</title><style>"
+        "@page { size: A4; margin: 12mm; }"
+        "html, body { margin: 0; padding: 0; }"
+        f"body {{ background: #666; color: {css_color(ink, '#1c1a17')}; }}"
+        ".sheet { position: relative; overflow: hidden; margin: 4mm auto;"
+        f" background: {css_color(paper, '#fdfcf8')};"
+        " page-break-after: always; break-after: page; }"
+        ".rg { position: absolute; overflow: hidden;"
+        " white-space: pre-wrap; }"
+        ".rg img { width: 100%; height: 100%; object-fit: contain; }"
+        ".folio { position: absolute; right: 2mm; bottom: 1mm;"
+        " font: 2.4mm sans-serif; opacity: .35; }"
+        "@media print { body { background: none; }"
+        " .sheet { margin: 0 auto; } .folio { display: none; } }"
+        f"</style></head><body>{''.join(sheets)}</body></html>")
+    return Response(doc, mimetype="text/html")
+
+
+_LIB_MAX_BYTES = 250 * 1024 * 1024
+_LIB_MAX_FIGURE = 15 * 1024 * 1024
+_LIB_MAX_PAGES = 2000
+_LIB_MAX_JSON = 10 * 1024 * 1024          # per JSON member, decompressed
+_LIB_MAX_INFLATED = 300 * 1024 * 1024     # total page-JSON budget
+
+
+@app.route("/api/builds/<build_id>/replica-import", methods=["POST"])
+def api_build_replica_import(build_id: str):
+    """The other half of .lib interchange: unpack an exported archive into
+    this build's working store. Multipart field "lib"; ?src= picks the scan
+    the pages land under, ?overwrite=1 lets imported pages/templates replace
+    existing ones (default: skip, like template apply). Everything passes the
+    same sanitizers as the live endpoints — a .lib is somebody else's file.
+    The stylesheet imports only when the book has no custom sheet (or with
+    overwrite); figures only when the name is free."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    src = _valid_src_key(b, request.args.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    overwrite = str(request.args.get("overwrite") or "") in ("1", "true")
+    f = request.files.get("lib")
+    if f is None:
+        return jsonify({"ok": False, "error": "no file"}), 400
+    if request.content_length and request.content_length > _LIB_MAX_BYTES:
+        return jsonify({"ok": False, "error": "file too large"}), 400
+    import io
+    import zipfile
+    raw = f.read(_LIB_MAX_BYTES + 1)
+    if len(raw) > _LIB_MAX_BYTES:
+        return jsonify({"ok": False, "error": "file too large"}), 400
+    # Every JSON member is read at its DECLARED decompressed size, which
+    # zipfile also truncates to — so rejecting large declarations is a real
+    # cap, and a small .lib cannot deflate-bomb the sidecar into an OOM.
+    try:
+        z = zipfile.ZipFile(io.BytesIO(raw))
+        if z.getinfo("book.json").file_size > _LIB_MAX_JSON:
+            return jsonify({"ok": False, "error": "book.json too large"}), 400
+        book = json.loads(z.read("book.json"))
+    except (zipfile.BadZipFile, KeyError, ValueError):
+        return jsonify({"ok": False, "error": "not a .lib archive"}), 400
+    if not isinstance(book, dict) or book.get("format") != "lib/1":
+        return jsonify({"ok": False, "error":
+                        "unsupported .lib format"}), 400
+
+    # pages: every well-formed pages/N.json, sanitized like a live PUT
+    incoming: dict[int, dict] = {}
+    budget = _LIB_MAX_INFLATED
+    for name in z.namelist():
+        m = re.fullmatch(r"pages/(\d{1,5})\.json", name)
+        if not m:
+            continue
+        n = int(m.group(1))
+        if not 1 <= n <= 99999 or len(incoming) >= _LIB_MAX_PAGES:
+            continue
+        declared = z.getinfo(name).file_size
+        if declared > _LIB_MAX_JSON or declared > budget:
+            continue
+        budget -= declared
+        try:
+            rec = json.loads(z.read(name))
+        except (ValueError, KeyError):
+            continue
+        if not isinstance(rec, dict) or not isinstance(rec.get("items"), list):
+            continue
+        items = _rw_sanitize_items(rec["items"][:_RW_MAX_ITEMS],
+                                   src_type="import")
+        if not items:
+            continue
+        incoming[n] = {
+            "doc": _ocr_name(str(rec.get("doc") or "compiled.txt")),
+            "dims": _rw_sanitize_dims(rec.get("dims")) or {},
+            "items": items,
+        }
+        if rec.get("state") == "verified":
+            incoming[n]["state"] = "verified"
+    if not incoming:
+        return jsonify({"ok": False, "error": "no usable pages"}), 400
+
+    # book.json's sections are attacker-shaped: coerce every one before
+    # touching disk, so a malformed archive fails clean instead of 500ing
+    # halfway through a commit
+    tpl_src = book.get("templates")
+    tpl_in = {}
+    if isinstance(tpl_src, dict):
+        for name, t in tpl_src.items():
+            name = str(name).strip()
+            if not _RW_TPL_RE.match(name) or not isinstance(t, dict):
+                continue
+            items = _rw_sanitize_items(t.get("items") or [],
+                                       src_type="template")
+            if not items:
+                continue
+            tpl_in[name] = {"from_page": 0, "doc": _ocr_name(
+                str(t.get("doc") or "compiled.txt")),
+                "dims": _rw_sanitize_dims(t.get("dims")) or {},
+                "items": [{"role": i["role"], "order": i["order"],
+                           "box": i["box"]} for i in items]}
+
+    def fig_entry(fig):
+        # bbox values ride into layout.json, which /ocr-layout serializes —
+        # a NaN or a nested object here would break every layout fetch
+        out = {"src_key": src}
+        if not isinstance(fig, dict):
+            return out
+        try:
+            pg = int(fig.get("page"))
+            if 1 <= pg <= 99999:
+                out["page"] = pg
+        except (TypeError, ValueError, OverflowError):
+            pass
+        for k in ("x", "y", "w", "h"):
+            try:
+                v = float(fig.get(k))
+            except (TypeError, ValueError):
+                continue
+            if v == v and 0.0 <= v <= 1.0:      # finite, in the page
+                out[k] = round(v, 5)
+        ro = str(fig.get("rework_of") or "")
+        if re.fullmatch(r"[\w.\-]{1,120}", ro):
+            out["rework_of"] = ro
+        return out
+
+    figures_src = book.get("figures") if isinstance(book.get("figures"),
+                                                    dict) else {}
+    raw_styles = book.get("stylesheet")
+    styles = _rw_sanitize_styles(raw_styles)         if isinstance(raw_styles, dict) and len(raw_styles) <= 40 else {}
+
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    applied, skipped, tpls_added = [], [], []
+    sheet = "none"
+    with _ocr_merge_lock:
+        meta = lib.load_json(meta_path, {})
+        pmap = meta.setdefault("regions", {}).setdefault(src, {})
+        for n, rec in sorted(incoming.items()):
+            if not overwrite and str(n) in pmap:
+                skipped.append(n)
+                continue
+            pmap[str(n)] = rec
+            applied.append(n)
+        tmap = meta.setdefault("templates", {}).setdefault(src, {})
+        for name, t in tpl_in.items():
+            if not overwrite and name in tmap:
+                continue
+            tmap[name] = t
+            tpls_added.append(name)
+        imap = meta.setdefault("images", {})
+        figures_added = 0
+        img_dir = _entry_dir(build_id) / "ocr" / "images"
+        for name in z.namelist():
+            m = re.fullmatch(r"assets/img/([\w.\-]{1,120})", name)
+            if not m:
+                continue
+            safe = m.group(1)
+            dest = img_dir / safe
+            if dest.exists() or safe in imap:
+                continue
+            info = z.getinfo(name)
+            if info.file_size > _LIB_MAX_FIGURE:
+                continue
+            img_dir.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(z.read(name))
+            imap[safe] = fig_entry(figures_src.get(safe))
+            figures_added += 1
+        lib.save_json(meta_path, meta)
+        # the stylesheet check-and-write shares the lock: a style-board Save
+        # landing between "no custom sheet" and this save must not be
+        # silently clobbered
+        if styles:
+            if overwrite or not _replica_styles(build_id)[1]:
+                lib.save_json(_replica_style_path(build_id),
+                              {"version": 1, "styles": styles})
+                sheet = "imported"
+            else:
+                sheet = "kept"
+    return jsonify({"ok": True, "pages_applied": applied,
+                    "pages_skipped": skipped, "templates_added": tpls_added,
+                    "figures_added": figures_added, "stylesheet": sheet})
 
 
 # --- PDF page rasterization (the OCR tab's side-by-side page view) ---------------
@@ -3058,19 +4155,34 @@ def _ocr_textract(png: bytes, cfg: dict) -> str:
 
 
 def _ocr_mistral(png: bytes, cfg: dict) -> dict:
-    """Mistral returns markdown plus the figures it cut out of the page.
-    The result dict carries the text and the decoded images with their
-    boxes normalised to 0..1 of the page, ready for _ocr_save_page_images."""
+    """Mistral returns markdown, the figures it cut out of the page, and
+    (OCR-4, include_blocks) typed text blocks in reading order. The result
+    carries: `text` — the body flow composed from role-classified regions,
+    with page furniture (marginalia, running heads, catchwords…) lifted out
+    so compiled text, translations, and volume_pages stay clean; `images` —
+    decoded figures with 0..1 boxes for _ocr_save_page_images; `regions` —
+    the typed-region sidecar records; `dims` — the raster size/dpi the API
+    reported (NOT the physical page — it describes our own rasterization).
+    When blocks are missing or carry under 70% of the markdown's characters
+    (a segmentation failure), the text falls back to the full markdown so
+    nothing is silently lost."""
     key = (cfg.get("mistral_key") or "").strip()
     if not key:
         raise RuntimeError("Mistral API key not configured (Settings > OCR)")
     import base64
-    pages = capture.mistral_ocr_pages(png, key, want_images=True)
-    text = "\n\n".join(p.get("markdown", "") for p in pages).strip()
+    pages = capture.mistral_ocr_pages(png, key, want_images=True,
+                                      want_blocks=True)
+    markdown = "\n\n".join(p.get("markdown", "") for p in pages).strip()
+    regions: list[dict] = []
+    dims = None
     images = []
     for pg in pages:
         dim = pg.get("dimensions") or {}
         pw, ph = float(dim.get("width") or 0), float(dim.get("height") or 0)
+        if dims is None and (pw > 0 or ph > 0):
+            dims = {"w": int(pw), "h": int(ph),
+                    "dpi": int(dim.get("dpi") or 0)}
+        regions.extend(layout_roles.regions_from_blocks(pg.get("blocks"), dim))
         for im in pg.get("images") or []:
             b64 = str(im.get("image_base64") or "")
             if "," in b64[:64]:                 # strip a data: URL prefix
@@ -3092,7 +4204,11 @@ def _ocr_mistral(png: bytes, cfg: dict) -> dict:
                         "h": round(max(0.0, y1 - y0) / ph, 5)}
             images.append({"id": str(im.get("id") or f"img-{len(images)}.jpeg"),
                            "data": raw, "bbox": bbox})
-    return {"text": text, "images": images}
+    if regions and layout_roles.coverage(regions, markdown) >= 0.7:
+        text = layout_roles.compose_text(regions)
+    else:
+        text = markdown
+    return {"text": text, "images": images, "regions": regions, "dims": dims}
 
 
 _OCR_SERVICES = {
@@ -3126,13 +4242,16 @@ def _ocr_merge_page(build_id: str, target: str, page: int, text: str) -> None:
 
 
 def _ocr_save_page_images(build_id: str, page: int, images: list[dict],
-                          text: str, src_key: str = "primary") -> str:
+                          text: str, src_key: str = "primary",
+                          regions: list | None = None) -> str:
     """Persist the figures an OCR service cut out of one page.
 
     Files land in the entry folder (ocr/images/p<page>-<id>), their boxes in
     ocr/layout.json, and the markdown's ![id](id) references are rewritten to
     the saved names so every reference stays unique across the compiled file.
-    Returns the rewritten text."""
+    Returns the rewritten text. `regions` get the same rewrite in place —
+    their text fields carry the same raw ids, and a region record that names
+    figures the compiled doc calls something else is a record that lies."""
     if not images:
         return text
     d = _entry_dir(build_id) / "ocr" / "images"
@@ -3150,33 +4269,117 @@ def _ocr_save_page_images(build_id: str, page: int, images: list[dict],
             meta["images"][name] = dict(
                 im["bbox"] or {}, page=page, src_key=src_key or "primary")
             # every ![id](id) in this page's markdown points at the saved file
-            text = re.sub(r"(!\[[^\]]*\]\()" + re.escape(im["id"]) + r"(\))",
-                          r"\g<1>" + name + r"\g<2>", text)
+            pat = re.compile(r"(!\[[^\]]*\]\()" + re.escape(im["id"]) + r"(\))")
+            text = pat.sub(r"\g<1>" + name + r"\g<2>", text)
+            for reg in regions or []:
+                if reg.get("text"):
+                    reg["text"] = pat.sub(r"\g<1>" + name + r"\g<2>",
+                                          reg["text"])
         lib.save_json(meta_path, meta)
     return text
 
 
-def _ocr_save_page_words(build_id: str, src_key: str, page: int, words: list) -> None:
+def _ocr_save_page_words(build_id: str, src_key: str, page: int, words: list,
+                         doc: str = "") -> None:
     """Persist one page's OCR word boxes to the sidecar (ocr/layout.json,
     {words: {"<src>": {"<page>": [{t,x,y,w,h,l}, ...]}}}). /api/pdf/words reads
     these back for a scan with no text layer, so the Layout facsimile works on
     it too. Keyed by SOURCE like the compiled .txt files, so a secondary scan's
-    boxes never clobber the primary's. An empty list DROPS the page — a re-OCR
-    with a service that has no boxes (Claude, Mistral) must not leave a stale
-    facsimile behind the new transcription."""
+    boxes never clobber the primary's. An empty list DROPS the page — the
+    engine that owns the geometry saw a blank page. Only geometry-speaking
+    engines may call this (see _ocr_job_run): a text-only re-OCR must not
+    destroy boxes another engine paid to produce — the box positions stay
+    valid for the unchanged page image even when the transcription moves on,
+    and cross-engine work (clip-from-words, region seeding) depends on them
+    surviving.
+
+    `doc` records WHICH compiled file's transcription the boxes carry
+    (words_doc, same src/page keying): the words' `t` values are that run's
+    text, and the client only places the facsimile when the doc being viewed
+    is the one the boxes belong to — any other doc flows its own text."""
     src_key = src_key or "primary"
     meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
     with _ocr_merge_lock:
         meta_path.parent.mkdir(parents=True, exist_ok=True)
         meta = lib.load_json(meta_path, {})
         wmap = meta.setdefault("words", {})
+        dmap = meta.setdefault("words_doc", {})
         pages = wmap.setdefault(src_key, {})
+        docs = dmap.setdefault(src_key, {})
         if words:
             pages[str(int(page))] = words
+            if doc:
+                docs[str(int(page))] = doc
+        else:
+            pages.pop(str(int(page)), None)
+            docs.pop(str(int(page)), None)
+            if not pages:
+                wmap.pop(src_key, None)
+        if not docs:
+            dmap.pop(src_key, None)
+        if not dmap:
+            meta.pop("words_doc", None)
+        lib.save_json(meta_path, meta)
+
+
+def _ocr_save_page_regions(build_id: str, src_key: str, page: int,
+                           regions: list, dims: dict | None,
+                           doc: str = "", state: str = "") -> None:
+    """Persist one page's typed regions (ocr/layout.json, {regions: {"<src>":
+    {"<page>": {doc, dims, items: [{id, role, box, order, text}]}}}}), boxes
+    0..1 like the word sidecar. Unlike word boxes, regions CARRY their run's
+    text, so a re-OCR through the region-producing path replaces them and an
+    empty list drops the page — stale region text must not outlive its
+    transcription. `doc` names the compiled file that run's text landed in;
+    `dims` is the API-reported raster size/dpi (not physical page size);
+    `state` is the review flag ("verified" once a human signed the page off —
+    a machine re-seed writes none, so re-OCR naturally un-verifies)."""
+    src_key = src_key or "primary"
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    with _ocr_merge_lock:
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta = lib.load_json(meta_path, {})
+        rmap = meta.setdefault("regions", {})
+        pages = rmap.setdefault(src_key, {})
+        if regions:
+            rec = {"doc": doc, "dims": dims or {}, "items": regions}
+            if state:
+                rec["state"] = state
+            pages[str(int(page))] = rec
         else:
             pages.pop(str(int(page)), None)
             if not pages:
-                wmap.pop(src_key, None)
+                rmap.pop(src_key, None)
+        if not rmap:
+            meta.pop("regions", None)
+        lib.save_json(meta_path, meta)
+
+
+def _ocr_drop_page_regions_for_doc(build_id: str, src_key: str, page: int,
+                                   doc: str) -> None:
+    """Drop a page's region record IF it claims to carry `doc`'s text.
+
+    A run without region output (Tesseract/Textract/Claude) that rewrites a
+    compiled page supersedes the text of any region record pointing at that
+    same file — serving the old transcription tagged with the current doc
+    would defeat the staleness contract. A run into a DIFFERENT target
+    leaves the record alone: the doc it describes is unchanged."""
+    src_key = src_key or "primary"
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    with _ocr_merge_lock:
+        meta = lib.load_json(meta_path, {})
+        rmap = meta.get("regions")
+        if not isinstance(rmap, dict):
+            return
+        pages = rmap.get(src_key)
+        rec = pages.get(str(int(page))) if isinstance(pages, dict) else None
+        if not (isinstance(rec, dict) and rec.get("doc") == doc):
+            return
+        pages.pop(str(int(page)), None)
+        if not pages:
+            rmap.pop(src_key, None)
+        if not rmap:
+            meta.pop("regions", None)
         lib.save_json(meta_path, meta)
 
 
@@ -3211,14 +4414,35 @@ def _ocr_job_run(job_id: str) -> None:
                 text = str(result.get("text") or "")
                 if result.get("images"):
                     text = _ocr_save_page_images(
-                        job["build_id"], n, result["images"], text, src_key)
-                # save boxes when the service produced them, else clear this
-                # page's stale boxes (a figures-only or text-only re-OCR)
-                _ocr_save_page_words(job["build_id"], src_key, n,
-                                     result.get("words") or [])
+                        job["build_id"], n, result["images"], text,
+                        src_key, regions=result.get("regions"))
+                # a "words" key marks a geometry-speaking engine, and its
+                # value is authoritative ([] = blank page). Engines without
+                # one (Mistral, Claude) replace the text but must leave the
+                # boxes alone — Tesseract geometry stays valid for the same
+                # page image no matter which engine wrote the transcription.
+                if "words" in result:
+                    _ocr_save_page_words(job["build_id"], src_key, n,
+                                         result.get("words") or [],
+                                         doc=_ocr_name(job["target"]))
+                # likewise a "regions" key marks the region-producing path
+                # (Mistral blocks); its value is authoritative — [] clears
+                # the page's regions along with the transcription they held.
+                # Region-silent engines instead DROP a record claiming this
+                # target's text: unlike word geometry, region text is
+                # superseded by the new transcription.
+                if "regions" in result:
+                    _ocr_save_page_regions(job["build_id"], src_key, n,
+                                           result.get("regions") or [],
+                                           result.get("dims"),
+                                           doc=_ocr_name(job["target"]))
+                else:
+                    _ocr_drop_page_regions_for_doc(job["build_id"], src_key,
+                                                   n, _ocr_name(job["target"]))
             else:
                 text = result
-                _ocr_save_page_words(job["build_id"], src_key, n, [])
+                _ocr_drop_page_regions_for_doc(job["build_id"], src_key,
+                                               n, _ocr_name(job["target"]))
             _ocr_merge_page(job["build_id"], job["target"], n, text)
             item["status"] = "ok"
         except Exception as exc:
@@ -3409,24 +4633,32 @@ def _renumber_layout_words(build_id: str, src_key: str, removed: list[int]) -> N
     if not meta_path.is_file():
         return
     removed_set = set(removed)
+
+    def remap(pages: dict) -> dict:
+        out = {}
+        for k, v in pages.items():
+            try:
+                n = int(k)
+            except (TypeError, ValueError):
+                continue
+            if n in removed_set:
+                continue
+            out[str(n - sum(1 for r in removed if r < n))] = v
+        return out
+
     with _ocr_merge_lock:
         meta = lib.load_json(meta_path, {})
         dirty = False
-        wmap = meta.get("words")
-        if isinstance(wmap, dict):
+        # words, words_doc, and regions share the src/page keying; shift all
+        for key in ("words", "words_doc", "regions"):
+            wmap = meta.get(key)
+            if not isinstance(wmap, dict):
+                continue
             pages = wmap.get(src_key or "primary")
-            if isinstance(pages, dict):
-                remapped = {}
-                for k, v in pages.items():
-                    try:
-                        n = int(k)
-                    except (TypeError, ValueError):
-                        continue
-                    if n in removed_set:
-                        continue
-                    remapped[str(n - sum(1 for r in removed if r < n))] = v
-                wmap[src_key or "primary"] = remapped
-                dirty = True
+            if not isinstance(pages, dict):
+                continue
+            wmap[src_key or "primary"] = remap(pages)
+            dirty = True
 
         images = meta.get("images")
         if isinstance(images, dict):
@@ -4463,7 +5695,7 @@ def api_ia_downloads():
 _SECRET_KEYS = frozenset({
     "aiKey", "embedKey", "mistralKey", "ocrClaudeKey", "ocrAzureKey",
     "ocrAwsKey", "ocrAwsSecret", "supabaseKey", "supabaseAnonKey", "r2KeyId",
-    "r2Secret", "gsKeyFile",
+    "r2Secret", "gsKeyFile", "imgGenKey",
 })
 _SECRETS_PATH = lib.DATA_ROOT / "output" / "secrets.json"
 _MISTRAL_PENDING = "_mistralCloudPending"

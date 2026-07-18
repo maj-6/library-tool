@@ -3235,6 +3235,223 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   border: 1px solid var(--canvas-line);
   background: #fff;
 }
+/* Region facsimile: typed blocks (Mistral OCR-4) placed on the page. Under-
+   styled on purpose — roles read through type treatment, not chrome. */
+.ocr-region {
+  position: absolute;
+  overflow: hidden;
+  white-space: pre-wrap;
+  line-height: 1.12;
+  color: var(--input-ink);
+  font-family: var(--mono);
+}
+.ocr-region[data-role="marginalia"] { font-style: italic; opacity: 0.78; }
+.ocr-region[data-role="header"],
+.ocr-region[data-role="footer"],
+.ocr-region[data-role="page-number"],
+.ocr-region[data-role="catch-word"],
+.ocr-region[data-role="signature-mark"] { opacity: 0.55; }
+.ocr-region[data-role="title"] { font-weight: 600; }
+.ocr-region[data-role="caption"] { font-style: italic; }
+.ocr-region img.ocr-regimg {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+.ocr-hidefurn .ocr-region[data-furniture="1"] { display: none; }
+
+/* --- Replica workbench (facsimile plan, Phase 3) --------------------------
+   CAD-dense three-column screen: books+pages rail | raster with the
+   editable region overlay | region text panel. Role identity is a thin
+   1px colored border + a tiny corner label on the selected region only. */
+#replica { flex-direction: column; }
+#rw-split { display: flex; flex: 1; min-height: 0; }
+#rw-side {
+  width: 216px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--canvas-line);
+  min-height: 0;
+}
+#rw-books {
+  flex: 0 1 38%;
+  overflow-y: auto;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-bottom: 1px solid var(--canvas-line);
+}
+#rw-pages {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  gap: 2px;
+  padding: 4px;
+}
+.rw-pagebtn {
+  position: relative;
+  width: 38px;
+  height: 22px;
+  font: inherit;
+  font-size: 10px;
+  color: var(--input-ink);
+  background: var(--input-bg);
+  border: 1px solid var(--canvas-line);
+  cursor: pointer;
+  padding: 0;
+}
+.rw-pagebtn:hover { background: var(--row-hover); }
+.rw-pagebtn.active { border-color: var(--accent, #4a7fd4); }
+.rw-pagebtn .rw-dot,
+.rw-pagebtn .rw-check,
+.rw-pagebtn .rw-warn {
+  position: absolute;
+  right: 1px;
+  top: -2px;
+  font-size: 7px;
+  color: var(--accent, #4a7fd4);
+}
+.rw-pagebtn .rw-check { font-size: 9px; color: #3d9e6a; }
+.rw-pagebtn .rw-warn { font-size: 9px; color: #ce7c33; }
+#rw-tpl { max-width: 92px; font-size: 10px; }
+/* re-typeset preview: original scan | rebuilt page, side by side */
+#rw-preview-row { display: flex; gap: 8px; align-items: flex-start; }
+.rw-prevpane {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--canvas-line);
+  background: #fdfcf8;      /* paper, both themes — this is a page proof */
+  overflow: hidden;
+}
+.rw-prevpane img { width: 100%; height: 100%; display: block; }
+.rw-prevregion {
+  position: absolute;
+  overflow: hidden;
+  white-space: pre-wrap;
+  color: #1c1a17;
+}
+.rw-prevregion img { width: 100%; height: 100%; object-fit: contain; }
+/* style board: one compact row per role */
+#rw-styleboard { padding: 4px; overflow-y: auto; }
+.rw-stylerow {
+  display: flex;
+  gap: 3px;
+  align-items: center;
+  padding: 2px 0;
+  border-bottom: 1px solid var(--canvas-line);
+}
+.rw-stylerole {
+  width: 74px;
+  flex: none;
+  font-size: 9px;
+  border-left: 2px solid var(--rw-c, var(--canvas-line));
+  padding-left: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rw-st-family { flex: 1; min-width: 0; font-size: 10px; }
+.rw-st-size { width: 44px; flex: none; font-size: 10px; }
+.rw-st-align { width: 52px; flex: none; font-size: 10px; }
+.rw-prompt { max-width: 380px; padding: 10px 12px; }
+.rw-prompt p { margin: 0 0 8px; font-size: 11px; white-space: pre-line; }
+.rw-prompt input { width: 100%; }
+.rw-prompt-btns { margin-top: 8px; display: flex; gap: 6px; justify-content: flex-end; }
+#rw-main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+#rw-canvas-wrap { flex: 1; overflow: auto; padding: 8px; }
+#rw-canvas {
+  position: relative;
+  width: min(100%, 980px);
+  margin: 0 auto;
+  border: 1px solid var(--canvas-line);
+  background: var(--input-bg);
+}
+#rw-page-img { width: 100%; height: 100%; display: block; user-select: none; }
+#rw-overlay { position: absolute; inset: 0; cursor: crosshair; }
+#rw-canvas-wrap .empty { font-size: 11px; color: var(--face-sh2); padding: 24px; text-align: center; }
+#rw-textpanel {
+  width: 264px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--canvas-line);
+  min-height: 0;
+}
+#rw-text {
+  flex: 1;
+  resize: none;
+  margin: 4px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+#rw-keys { font-size: 9px; white-space: normal; line-height: 1.5; }
+/* role colors — one hue per role, shared by regions and the digit legend */
+.role-body { --rw-c: #4a7fd4; }
+.role-marginalia { --rw-c: #cf4a55; }
+.role-header, .role-footer { --rw-c: #b89a2e; }
+.role-title { --rw-c: #9a4ac0; }
+.role-caption { --rw-c: #3d9e6a; }
+.role-figure { --rw-c: #8a8a8a; }
+.role-page-number, .role-catch-word, .role-signature-mark { --rw-c: #ce7c33; }
+.role-drop-capital { --rw-c: #8b1a1a; }
+.role-footnote { --rw-c: #3a8ea0; }
+.role-page { --rw-c: #777; }
+/* facsimile drop caps render as one box-height letter */
+.ocr-region[data-role="drop-capital"] { overflow: visible; }
+.rw-st-lab { font-size: 9px; color: var(--face-sh2); flex: none; }
+.rw-stylerow input[type="color"] {
+  width: 22px;
+  height: 18px;
+  flex: none;
+  padding: 0;
+  border: 1px solid var(--canvas-line);
+  background: none;
+}
+.rw-region {
+  position: absolute;
+  border: 1px solid var(--rw-c, #4a7fd4);
+  cursor: move;
+}
+.rw-region.sel { background: color-mix(in srgb, var(--rw-c) 12%, transparent); }
+.rw-region .rw-lab {
+  display: none;
+  position: absolute;
+  top: -13px;
+  left: -1px;
+  font-size: 8px;
+  line-height: 12px;
+  padding: 0 3px;
+  background: var(--rw-c);
+  color: #fff;
+  white-space: nowrap;
+}
+.rw-region.sel .rw-lab, .rw-region:hover .rw-lab { display: block; }
+.rw-handle {
+  position: absolute;
+  width: 7px;
+  height: 7px;
+  background: var(--rw-c);
+  z-index: 2;
+}
+.rw-nw { left: -4px; top: -4px; cursor: nw-resize; }
+.rw-ne { right: -4px; top: -4px; cursor: ne-resize; }
+.rw-sw { left: -4px; bottom: -4px; cursor: sw-resize; }
+.rw-se { right: -4px; bottom: -4px; cursor: se-resize; }
+.rw-key {
+  display: inline-block;
+  min-width: 12px;
+  text-align: center;
+  font-size: 9px;
+  border: 1px solid var(--rw-c);
+  border-bottom-width: 2px;
+  margin: 0 1px;
+  padding: 0 2px;
+  color: var(--input-ink);
+}
 
 .ocr-pgtext {
   resize: none;

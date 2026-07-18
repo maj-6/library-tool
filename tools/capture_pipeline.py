@@ -175,13 +175,17 @@ def _mistral_post(url: str, payload: dict, api_key: str, timeout: float) -> dict
 
 
 def mistral_ocr_pages(img_bytes: bytes, api_key: str, timeout: float = 90.0,
-                      want_images: bool = False) -> list[dict]:
+                      want_images: bool = False,
+                      want_blocks: bool = False) -> list[dict]:
     """OCR one image via Mistral; returns the raw page dicts.
 
     Each page carries `markdown`, `dimensions` {width, height, dpi}, and —
     with want_images — `images` [{id, top_left_x/y, bottom_right_x/y,
     image_base64}] for every figure the model cut out of the page. The
-    markdown references those figures as ![id](id).
+    markdown references those figures as ![id](id). With want_blocks (OCR 4)
+    each page also carries `blocks` [{type, top_left_x/y, bottom_right_x/y,
+    content}] — typed text regions in reading order, pixel coords like the
+    figure boxes.
     """
     mime = "image/png" if img_bytes[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
     b64 = base64.b64encode(img_bytes).decode("ascii")
@@ -192,6 +196,8 @@ def mistral_ocr_pages(img_bytes: bytes, api_key: str, timeout: float = 90.0,
     }
     if want_images:
         payload["include_image_base64"] = True
+    if want_blocks:
+        payload["include_blocks"] = True
     data = _mistral_post(MISTRAL_OCR_URL, payload, api_key, timeout)
     return data.get("pages") or []
 
