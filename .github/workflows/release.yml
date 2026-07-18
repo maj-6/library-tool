@@ -147,15 +147,15 @@ jobs:
           mv app/build/outputs/apk/release/app-release.apk "$NAME"
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
-      # Report the signer, and — behind the keystore gate above — refuse a
-      # tagged APK that somehow carries the debug key before it is uploaded.
+      # Report the signer, and — behind the keystore gate above — refuse any
+      # release-signed APK whose certificate differs from the one already used
+      # in production. Explicitly debug-signed dispatch artifacts remain valid
+      # dry runs, but are labelled DONOTPUBLISH by the naming step above.
       # apksigner ships with the Android build-tools the runner already used to
       # build; the debug key's distinctive DN is "CN=Android Debug, O=Android".
       - name: Verify the APK signer
         id: signer
         shell: bash
-        env:
-          IS_RELEASE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         run: |
           APK=$(ls BookCapture-*.apk | head -1)
           APKSIGNER=$(ls "${ANDROID_SDK_ROOT:-$ANDROID_HOME}"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1 || true)
@@ -181,14 +181,41 @@ jobs:
             echo "::error::apksigner did not report a signer DN and SHA-256 certificate digest; refusing to upload an unverifiable APK."
             exit 1
           fi
-          echo "signer=$DN" >> "$GITHUB_OUTPUT"
-          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
-          echo "- Android APK \`$APK\` signer: \`$DN\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Android APK certificate SHA-256: \`$SHA256\`" >> "$GITHUB_STEP_SUMMARY"
-          if [ "$IS_RELEASE" = "true" ] && printf '%s' "$DN" | grep -qi "Android Debug"; then
-            echo "::error::Tagged APK is signed with the debug key; refusing to publish a non-updatable build."
-            exit 1
+          ACTUAL_SHA256=$(printf '%s' "$SHA256" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+          IS_DEBUG=false
+          if printf '%s' "$DN" | grep -qi "Android Debug"; then
+            IS_DEBUG=true
           fi
+          if [ "${WHL_DEBUG_SIGNED:-}" = "true" ]; then
+            if [ "$IS_DEBUG" != "true" ]; then
+              echo "::error::The dry run was marked debug-signed, but apksigner reported a non-debug certificate. Refusing an ambiguously labelled artifact."
+              exit 1
+            fi
+            echo "::warning::Verified the explicitly debug-signed DONOTPUBLISH dry-run APK."
+          else
+            if [ "$IS_DEBUG" = "true" ]; then
+              echo "::error::APK is signed with the debug key outside the explicitly labelled dry-run path; refusing to upload it."
+              exit 1
+            fi
+            EXPECTED_FILE="release-signing-cert.sha256"
+            if [ ! -f "$EXPECTED_FILE" ]; then
+              echo "::error::$EXPECTED_FILE is missing; refusing to publish without the pinned Android signing identity."
+              exit 1
+            fi
+            EXPECTED_SHA256=$(tr -d '[:space:]' < "$EXPECTED_FILE" | tr '[:upper:]' '[:lower:]')
+            if ! printf '%s' "$EXPECTED_SHA256" | grep -Eq '^[0-9a-f]{64}$'; then
+              echo "::error::$EXPECTED_FILE must contain exactly one SHA-256 certificate fingerprint."
+              exit 1
+            fi
+            if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+              echo "::error::Android signing certificate mismatch: expected $EXPECTED_SHA256, got $ACTUAL_SHA256. Refusing an APK that cannot update existing installs."
+              exit 1
+            fi
+          fi
+          echo "signer=$DN" >> "$GITHUB_OUTPUT"
+          echo "sha256=$ACTUAL_SHA256" >> "$GITHUB_OUTPUT"
+          echo "- Android APK \`$APK\` signer: \`$DN\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Android APK certificate SHA-256: \`$ACTUAL_SHA256\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep the APK
         uses: actions/upload-artifact@v4
@@ -261,6 +288,33 @@ jobs:
         shell: bash
         run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
 
+      # upload-artifact's if-no-files-found check applies to the path list as a
+      # whole. Verify each updater component explicitly so a lone installer
+      # cannot make this job look successful while installed clients receive an
+      # incomplete update channel.
+      - name: Verify the desktop release set
+        shell: bash
+        run: |
+          V=$(node -p "require('./package.json').version")
+          for FILE in \
+            "release/LibraryTool-Setup-$V.exe" \
+            "release/LibraryTool-Setup-$V.exe.blockmap" \
+            "release/latest.yml"
+          do
+            if [ ! -s "$FILE" ]; then
+              echo "::error::Missing or empty desktop release artifact: $FILE"
+              exit 1
+            fi
+          done
+          if ! grep -Fq "version: $V" release/latest.yml; then
+            echo "::error::release/latest.yml does not describe desktop version $V"
+            exit 1
+          fi
+          if ! grep -Fq "LibraryTool-Setup-$V.exe" release/latest.yml; then
+            echo "::error::release/latest.yml does not reference the expected installer"
+            exit 1
+          fi
+
       # The NSIS exe is the download; latest.yml + the blockmap are the
       # auto-update channel (electron-updater reads them off the GitHub Release).
       # electron-builder writes latest.yml even for a prerelease version (it
@@ -301,9 +355,9 @@ jobs:
           path: dist
           merge-multiple: true
 
-      # The android job verifies the signer and fails before upload if a tagged
-      # APK is debug-signed, so anything reaching here is release-signed. Surface
-      # which key it was for the release record.
+      # The android job verifies the signer against the tracked production
+      # fingerprint before upload, so anything reaching a tagged publish has the
+      # established release identity. Surface which key it was for the record.
       - name: Report the Android signer
         if: needs.android.result == 'success' && needs.android.outputs.signer != ''
         run: |
@@ -316,24 +370,55 @@ jobs:
           APK_V: ${{ needs.android.outputs.version }}
           EXE_V: ${{ needs.desktop.outputs.version }}
         run: |
-          # a failed job leaves its version output empty, so name only what shipped
+          # Derive the public title and preamble from the files actually
+          # collected. The jobs intentionally release independently, so a
+          # one-sided release must never look like both apps shipped.
+          desktop_asset=$(find dist -maxdepth 1 -type f -name 'LibraryTool-Setup-*.exe' -print -quit)
+          android_asset=$(find dist -maxdepth 1 -type f -name 'BookCapture-*.apk' -print -quit)
+          if [ -z "$desktop_asset" ] && [ -z "$android_asset" ]; then
+            echo "::error::No releasable desktop or Android artifact was collected."
+            exit 1
+          fi
           notes=""
-          [ -n "$EXE_V" ] && notes="Desktop $EXE_V"
-          [ -n "$APK_V" ] && notes="${notes:+$notes · }Android BookCapture $APK_V"
+          partial_message=""
+          if [ -n "$desktop_asset" ] && [ -n "$android_asset" ]; then
+            release_title="Library Tool $GITHUB_REF_NAME"
+            notes="Desktop $EXE_V · Android BookCapture $APK_V"
+          elif [ -n "$desktop_asset" ]; then
+            release_title="Library Tool $GITHUB_REF_NAME (desktop only)"
+            notes="Desktop $EXE_V"
+            partial_message="Only Library Tool Desktop \`$EXE_V\` (\`$(basename "$desktop_asset")\`) is attached. Android Book Capture did not build successfully, so this release contains no Android APK."
+          else
+            release_title="Android Book Capture $APK_V ($GITHUB_REF_NAME; Android only)"
+            notes="Android BookCapture $APK_V"
+            partial_message="Only Android Book Capture \`$APK_V\` (\`$(basename "$android_asset")\`) is attached. Library Tool Desktop did not build successfully, so this release contains no Windows installer or updater files."
+          fi
           # A prerelease tag (v0.8.0-alpha.1 / -beta / -rc) is flagged prerelease
           # on GitHub. Stable installs remain on the stable channel; installed
           # prereleases follow the prerelease line, and stable installs can opt in.
-          pre=""
-          case "$GITHUB_REF_NAME" in *-alpha*|*-beta*|*-rc*) pre="--prerelease" ;; esac
+          pre_args=()
+          case "$GITHUB_REF_NAME" in *-alpha*|*-beta*|*-rc*) pre_args=(--prerelease) ;; esac
           notes_file="docs/releases/$GITHUB_REF_NAME.md"
-          if [ -f "$notes_file" ]; then
-            notes_args=(--notes-file "$notes_file")
-          else
-            notes_args=(--notes "$notes")
+          effective_notes="$RUNNER_TEMP/release-notes.md"
+          : > "$effective_notes"
+          if [ -n "$partial_message" ]; then
+            printf '> [!WARNING]\n> **Partial release:** %s\n\n---\n\n' "$partial_message" >> "$effective_notes"
+            echo "## Partial release" >> "$GITHUB_STEP_SUMMARY"
+            echo "$partial_message" >> "$GITHUB_STEP_SUMMARY"
           fi
-          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
-            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag $pre \
-              --title "Library Tool $GITHUB_REF_NAME" "${notes_args[@]}"
+          if [ -f "$notes_file" ]; then
+            cat "$notes_file" >> "$effective_notes"
+          else
+            printf '%s\n' "$notes" >> "$effective_notes"
+          fi
+          notes_args=(--notes-file "$effective_notes")
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --title "$release_title" "${notes_args[@]}" "${pre_args[@]}"
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              "${pre_args[@]}" --title "$release_title" "${notes_args[@]}"
+          fi
           gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
 
       # The step the website actually sees. release_publish.py gets the local

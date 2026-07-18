@@ -2484,7 +2484,10 @@ def api_build_folder_sync(build_id: str):
             try:
                 blanks = _blank_pages(src)
                 if blanks:
-                    deletion = _apply_page_deletion(build_id, builds, src, blanks)
+                    deletion = _apply_page_deletion(
+                        build_id, builds, src, blanks,
+                        expected_revision=str(
+                            b.get("updated_at") or "unversioned"))
                     page_remap = deletion.get("page_remap")
                     notes.extend(
                         f"page deletion warning: {warning}"
@@ -4477,21 +4480,44 @@ def api_pdf_words():
                     "source": source, "lines": lines})
 
 
-def _src_key_for_path(build: dict, pdf: Path) -> str:
-    """Which source a resolved PDF path is for this build: 'primary' (its
-    pdf_file) or a secondary id from pdf_sources. The primary claims the file
-    first, so a scan attached as both still counts as primary."""
+def _attached_src_key_for_path(build: dict, pdf: Path) -> str:
+    """Return the exact attached source for ``pdf``, or ``""`` if unmatched.
+
+    Destructive page operations must use this strict form: treating an
+    arbitrary local PDF as the primary source would delete that unrelated file
+    while renumbering this build's OCR and remarks.
+    """
     try:
         pdfr = pdf.resolve()
     except OSError:
-        return "primary"
+        return ""
     primary = _resolve_local(str(build.get("pdf_file") or ""))
-    if primary is not None and primary.resolve() == pdfr:
-        return "primary"
+    try:
+        if primary is not None and primary.resolve() == pdfr:
+            return "primary"
+    except OSError:
+        pass
     for s in (build.get("pdf_sources") or []):
+        if not isinstance(s, dict):
+            continue
         sp = _resolve_local(str(s.get("path") or ""))
-        if sp is not None and sp.resolve() == pdfr:
-            return s.get("id") or "primary"
+        try:
+            if sp is not None and sp.resolve() == pdfr:
+                return str(s.get("id") or "")
+        except OSError:
+            continue
+    return ""
+
+
+def _src_key_for_path(build: dict, pdf: Path) -> str:
+    """Which source a resolved PDF path is for this build.
+
+    Legacy read-only callers treat an unmatched path as primary. Destructive
+    callers use ``_attached_src_key_for_path`` and reject an unmatched path.
+    """
+    attached = _attached_src_key_for_path(build, pdf)
+    if attached:
+        return attached
     return "primary"
 
 
@@ -5483,6 +5509,64 @@ _page_structure_lock = threading.RLock()
 _page_structure_revision: dict[str, int] = {}
 
 
+class _PageStructureConflict(ValueError):
+    """A destructive request targets a stale page grid or detached PDF."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def _page_deletion_target(build_id: str, pdf: Path,
+                          expected_revision: str,
+                          reserve: bool) -> tuple[dict, str]:
+    """Validate the current grid/source and optionally reserve its next token."""
+    expected_revision = str(expected_revision or "")
+    with _builds_lock:
+        current = lib.load_json(BUILDS_PATH, {})
+        build = current.get(build_id)
+        if not isinstance(build, dict):
+            raise _PageStructureConflict(
+                "stale_page_revision",
+                "book changed; reopen it before deleting pages")
+        revision = str(build.get("updated_at") or "unversioned")
+        if not expected_revision or expected_revision != revision:
+            raise _PageStructureConflict(
+                "stale_page_revision",
+                "page changed; reopen it before deleting pages")
+        src_key = _attached_src_key_for_path(build, pdf)
+        if not src_key:
+            raise _PageStructureConflict(
+                "pdf_not_attached",
+                "PDF attachment changed; reopen the book before deleting pages")
+        if reserve:
+            build["updated_at"] = _build_updated_at(build.get("updated_at"))
+            lib.save_json(BUILDS_PATH, current)
+        return build, src_key
+
+
+def _validate_page_deletion(build_id: str, pdf: Path,
+                            expected_revision: str) -> tuple[dict, str]:
+    """Reject stale revisions and detached paths before inspecting the PDF."""
+    return _page_deletion_target(
+        build_id, pdf, expected_revision, reserve=False)
+
+
+def _reserve_page_deletion(build_id: str, pdf: Path,
+                           expected_revision: str) -> tuple[dict, str]:
+    """Revalidate and durably advance the page-grid token before PDF commit.
+
+    This runs while ``_page_structure_lock`` is held. The compare-and-bump is
+    one ``_builds_lock`` transaction, so a concurrent metadata save cannot
+    slip between validation and reservation. Advancing before ``replace`` is
+    deliberately conservative: a later pre-commit failure may force the user
+    to reopen the page, but a committed deletion can never leave an old review
+    token valid merely because the post-commit metadata merge failed.
+    """
+    return _page_deletion_target(
+        build_id, pdf, expected_revision, reserve=True)
+
+
 def _ocr_job_start_guarded(job: dict, source_revision: int,
                            record_source: bool = False) -> bool:
     """Register/start OCR atomically against page deletion."""
@@ -5799,7 +5883,7 @@ def _remap_page_attention_references(build_id: str, source_id: str,
 @app.route("/api/pdf/pages/delete", methods=["POST"])
 def api_pdf_pages_delete():
     """Delete pages from a build's PDF — the real file, not a preview.
-    Body: {build_id, pdf, pages: [1-based numbers]}.
+    Body: {build_id, pdf, pages: [1-based numbers], page_revision}.
 
     The pre-deletion file is kept next to the PDF as <name>.bak.pdf
     (overwritten by the next deletion), the build's OCR files get their
@@ -5807,6 +5891,7 @@ def api_pdf_pages_delete():
     stays aligned with the new page numbering."""
     p = request.get_json(silent=True) or {}
     build_id = str(p.get("build_id") or "")
+    expected_revision = str(p.get("page_revision") or "")
     builds = lib.load_json(BUILDS_PATH, {})
     if build_id not in builds:
         abort(404)
@@ -5837,7 +5922,12 @@ def api_pdf_pages_delete():
     if not pages:
         return jsonify({"ok": False, "error": "no pages selected"})
     try:
-        result = _apply_page_deletion(build_id, builds, pdf, pages)
+        result = _apply_page_deletion(
+            build_id, builds, pdf, pages,
+            expected_revision=expected_revision)
+    except _PageStructureConflict as exc:
+        return jsonify({"ok": False, "error": str(exc),
+                        "conflict": exc.code}), 409
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)})
     except Exception as exc:
@@ -5847,19 +5937,26 @@ def api_pdf_pages_delete():
 
 
 def _apply_page_deletion(build_id: str, builds: dict, pdf: Path,
-                         pages: list[int]) -> dict:
+                         pages: list[int],
+                         expected_revision: str | None = None) -> dict:
     """Guard the page structure while every page-keyed derivative is remapped."""
     with _page_structure_lock:
+        if expected_revision is not None:
+            # Reject a stale grid or detached path before even inspecting a
+            # caller-selected file. The reservation inside the locked rewrite
+            # rechecks both after PDF validation, closing the metadata-race gap.
+            _validate_page_deletion(
+                build_id, pdf, expected_revision)
         if _page_job_blockers(build_id):
             raise ValueError("a page-processing job is running for this book")
-        result = _apply_page_deletion_locked(build_id, builds, pdf, pages)
-        _page_structure_revision[build_id] = (
-            _page_structure_revision.get(build_id, 0) + 1)
-        return result
+        return _apply_page_deletion_locked(
+            build_id, builds, pdf, pages,
+            expected_revision=expected_revision)
 
 
 def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
-                                pages: list[int]) -> dict:
+                                pages: list[int],
+                                expected_revision: str | None = None) -> dict:
     """Rewrite the PDF without the given pages (backup kept), renumber the
     build's OCR files, and remap title_pages. Shared by the deletion
     endpoint and blank-page trimming. Raises ValueError only before the live
@@ -5876,12 +5973,21 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
     # Resolve every source-scoped input before the live PDF changes. Failures
     # here remain ordinary refusals; after tmp.replace(pdf), the deletion has
     # committed and derivative failures must be reported as partial success.
-    b = builds[build_id]
-    src_key = _src_key_for_path(b, pdf)
+    if expected_revision is None:
+        # Direct helper callers predate the HTTP concurrency contract. Keep
+        # their in-memory/test behavior, while every destructive request path
+        # supplies a revision and takes the strict reservation path below.
+        b = builds[build_id]
+        src_key = _src_key_for_path(b, pdf)
+        build_persisted = build_id in lib.load_json(BUILDS_PATH, {})
+    else:
+        b, src_key = _reserve_page_deletion(
+            build_id, pdf, expected_revision)
+        builds[build_id] = b
+        build_persisted = True
     actual_pages = [page for page in pages if page <= total]
     srcmap = _ocr_sources(build_id)
     ocr_dir = _entry_dir(build_id) / "ocr"
-    build_persisted = build_id in lib.load_json(BUILDS_PATH, {})
     # safety net: the previous version stays recoverable
     shutil.copy2(pdf, pdf.with_suffix(".bak.pdf"))
     writer = PdfWriter()
@@ -5891,6 +5997,11 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
     with open(tmp, "wb") as fh:
         writer.write(fh)
     tmp.replace(pdf)
+    # The live page grid has committed. Advance the process-local job token
+    # immediately, before any best-effort derivative work can fail, so a job
+    # prepared against the old numbering can never start afterward.
+    _page_structure_revision[build_id] = (
+        _page_structure_revision.get(build_id, 0) + 1)
     # keep the build's OCR files and title pages aligned with the new
     # numbering (under the merge lock: a job finishing this instant must
     # not interleave with the renumber writes). Only the files that came
@@ -5986,6 +6097,8 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
             revision = _builds_apply(build_id, changed)
             if revision:
                 b["updated_at"] = revision
+            else:
+                warnings.append("build metadata could not be saved")
         except Exception as exc:
             log.warning("could not persist build metadata after page deletion: %s", exc)
             warnings.append("build metadata could not be saved")

@@ -287,11 +287,20 @@ def test_client_and_server_agree_on_local_only_secret_keys():
 
 
 def test_page_deletion_surfaces_reference_remap_warnings():
+    save_flow = _function(
+        "saveOcrDocumentsBeforePageDelete", "deleteSelectedPages")
+    assert "!res.ok || !data || !data.ok" in save_flow
+    assert "ocrSyncEditor()" in save_flow
+
     delete_flow = _function("deleteSelectedPages", "titlePageSet")
     assert "data.warnings" in delete_flow
     assert "REVIEW WARNING" in delete_flow
     assert "data.backup" in delete_flow
-    assert "Review those links before continuing" in delete_flow
+    assert "page_revision" in delete_flow
+    assert '"unversioned"' in delete_flow
+    assert "COMMITTED — REFRESH FAILED" in delete_flow
+    assert "Review the affected references/artifacts" in delete_flow
+    assert "Review those links" not in delete_flow
 
     folder_sync = SERVER.split("def api_build_folder_sync", 1)[1].split(
         "@app.route", 1)[0]
