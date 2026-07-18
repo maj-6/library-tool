@@ -705,14 +705,6 @@ body {
 .home-row-empty { cursor: default; color: var(--face-sh2); }
 .home-row-empty .hr-n { color: var(--face-sh2); font-weight: normal; }
 .home-row-empty:hover .hr-l { color: var(--face-sh2); }
-/* fresh/cleared queue: the acquire front door, in the same terse row idiom */
-.home-start-hint {
-  margin-top: 7px;
-  padding: 0 2px;
-  font-size: 11px;
-  line-height: 1.5;
-  color: var(--face-sh2);
-}
 .hr-n { flex: 0 0 auto; min-width: 22px; text-align: right; font-family: var(--mono); font-weight: bold; }
 .hr-l { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hr-d { flex: 0 0 auto; margin-left: auto; color: var(--face-sh2); font-size: 10.5px; white-space: nowrap; }
@@ -771,8 +763,20 @@ body {
 }
 .home-act:last-child { border-bottom: 0; }
 .home-who { font-weight: bold; color: var(--ink); white-space: nowrap; }
-.home-what { flex: 1 1 auto; min-width: 0; color: var(--ink); }
-.home-when { flex: 0 0 auto; color: var(--face-sh2); font-size: 10.5px; white-space: nowrap; }
+/* the phrase never shrinks (a clipped verb is unreadable); the item name below
+   absorbs the slack instead */
+.home-what { flex: 0 0 auto; color: var(--ink); white-space: nowrap; }
+/* the item acted on — title or review label; takes the slack and ellipsizes */
+.home-det {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--face-sh2);
+}
+/* margin-left:auto keeps the time hard right even on rows with no item name */
+.home-when { flex: 0 0 auto; margin-left: auto; color: var(--face-sh2); font-size: 10.5px; white-space: nowrap; }
 /* a feed row discloses its member events: exact times, exact items */
 .home-act { cursor: pointer; }
 .home-act-arrow { flex: 0 0 10px; color: var(--face-sh2); font-size: 9px; }
@@ -873,7 +877,7 @@ body {
   color: var(--face-sh2);
 }
 /* per-context sizing: let the chip shrink, never let it crowd the row */
-.uchip.home-who { flex: 0 1 auto; max-width: 46%; }
+.uchip.home-who { flex: 0 0 auto; max-width: 34%; }
 .uchip.hu-chip { flex: 0 1 auto; }
 /* review comments set no font-size on any ancestor, so the chip would inherit
    the 13px body base; pin it to the 11px the old .ric-author label used */

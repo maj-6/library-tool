@@ -2011,35 +2011,17 @@ function renderHome() {
   };
   const inEditor = p.drafts.length + p.ready;
   const attn = p.attnCat + p.attnEd;
-  let html;
-  if (!inEditor && !p.srcPending && !attn && !p.openReviews) {
-    // Nothing in flight: offer the front of the pipeline instead of four dead
-    // zeros. Reuses the real New-entry / Scrape commands (MENU_CMDS), so this
-    // is the workbench's front door — distinct from the one-time setup wizard.
-    const startRow = (glyph, label, desc, cmd) =>
-      `<button class="home-row" type="button" data-cmd="${cmd}">` +
-        `<span class="hr-n">${glyph}</span>` +
-        `<span class="hr-l">${esc(label)}</span>` +
-        `<span class="hr-d">${esc(desc)}</span></button>`;
-    html =
-      `<div class="home-h home-h-sub">Start here</div>` +
-      startRow("+", "New entry", "a catalogue record from scratch", "new-entry") +
-      startRow("↓", "Scrape WHL", "pull the source list to work from", "scrape") +
-      `<div class="home-start-hint">…or capture pages from the Book Capture phone ` +
-      `app, or auto-download scans from the Internet Archive.</div>`;
-  } else {
-    html =
-      row(inEditor, inEditor === 1 ? "entry in the workbench" : "entries in the workbench",
-          `data-gotab="workbench"`, inEditor ? `${p.drafts.length} draft · ${p.ready} to publish` : "") +
-      row(p.srcPending, p.srcPending === 1 ? "PDF source pending verification"
-          : "PDF sources pending verification", `data-gotab="workbench"`) +
-      row(attn, attn === 1 ? "item marked for attention"
-          : "items marked for attention",
-          `data-gotab="${p.attnCat || !p.attnEd ? "checked" : "workbench"}"`,
-          p.attnCat && p.attnEd ? `${p.attnCat} catalog · ${p.attnEd} workbench` : "") +
-      row(p.openReviews, p.openReviews === 1 ? "item awaiting review"
-          : "items awaiting review", `data-review="1"`);
-  }
+  let html =
+    row(inEditor, inEditor === 1 ? "entry in the workbench" : "entries in the workbench",
+        `data-gotab="workbench"`, inEditor ? `${p.drafts.length} draft · ${p.ready} to publish` : "") +
+    row(p.srcPending, p.srcPending === 1 ? "PDF source pending verification"
+        : "PDF sources pending verification", `data-gotab="workbench"`) +
+    row(attn, attn === 1 ? "item marked for attention"
+        : "items marked for attention",
+        `data-gotab="${p.attnCat || !p.attnEd ? "checked" : "workbench"}"`,
+        p.attnCat && p.attnEd ? `${p.attnCat} catalog · ${p.attnEd} workbench` : "") +
+    row(p.openReviews, p.openReviews === 1 ? "item awaiting review"
+        : "items awaiting review", `data-review="1"`);
 
   // the freshest few drafts, so unfinished work is one click away
   const drafts = p.drafts.slice()
@@ -2078,10 +2060,15 @@ function renderHome() {
             `<span class="had-txt">${esc(e.detail ||
               activityPhrase({ verb: e.verb, subject: e.subject, n: e.n || 1 }))}</span>` +
             `</div>`).join("") + `</div>`;
+        // what was acted on (book title / review label) rides the row itself,
+        // so the feed says who did what to which item without expanding. The
+        // phrase already carries the count, so no "+N" is needed here.
+        const named = g.items.find((e) => e.detail);
         return `<div class="home-act${open ? " open" : ""}" data-gk="${esc(k)}">` +
           `<span class="home-act-arrow">${open ? "&#9662;" : "&#9656;"}</span>` +
           `${userChip(g.actor, { cls: "home-who" })} ` +
           `<span class="home-what">${esc(activityPhrase(g))}</span>` +
+          (named ? `<span class="home-det">${esc(named.detail)}</span>` : "") +
           `<span class="home-when">${esc(relTime(g.at))}</span></div>` + det;
       }).join("")
     : `<div class="empty">No activity recorded yet</div>`;
@@ -2139,9 +2126,6 @@ function initHome() {
       selectWorkbenchBook(d.dataset.draft, "record");
       return;
     }
-    // "Start here" rows run the real New-entry / Scrape commands directly
-    const cmd = ev.target.closest("[data-cmd]");
-    if (cmd) { const f = MENU_CMDS[cmd.dataset.cmd]; if (f) f(); return; }
     // the review queue is already inline below — focus it, don't open the
     // redundant overlay window
     if (ev.target.closest("[data-review]")) {

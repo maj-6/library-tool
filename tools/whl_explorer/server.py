@@ -7088,7 +7088,7 @@ def _publish_run(bid: str, actor: str, job: dict | None = None) -> None:
                 row["published_slug"] = slug
                 row["updated_at"] = _build_updated_at(row.get("updated_at"))
                 lib.save_json(BUILDS_PATH, fresh)
-        activity("published", "book", actor=actor or None)
+        activity("published", "book", actor=actor or None, detail=b.get("title", ""))
         log.info("published volume %s (%.0f MB) -> %s", slug, size / 1e6, url)
         if withheld:
             log.info("text withheld for %s (rights: %s)", slug, b.get("rights"))
