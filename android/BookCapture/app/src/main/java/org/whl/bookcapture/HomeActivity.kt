@@ -9,6 +9,7 @@ import android.view.View
 import android.widget.CheckBox
 import android.widget.ImageView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
@@ -26,8 +27,8 @@ import org.whl.bookcapture.databinding.ActivityHomeBinding
  * uploaded, imported). Tapping a scan opens the full detail (all photos, OCR
  * text, every field). "New scan" is the way into capture.
  *
- * This screen also owns the sign-in gate (it is the entry point) and nudges the
- * upload queue so returning to it drains anything waiting.
+ * This screen is the local-first entry point and nudges whichever configured
+ * delivery path is available; cloud-only actions remain account-gated.
  */
 class HomeActivity : AppCompatActivity() {
 
@@ -47,6 +48,9 @@ class HomeActivity : AppCompatActivity() {
         binding.btnSettings.setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
+        binding.configWarning.setOnClickListener {
+            startActivity(Intent(this, LoginActivity::class.java))
+        }
         binding.btnSelect.setOnClickListener {
             selectionMode = true
             updateSelectionUi()
@@ -55,25 +59,26 @@ class HomeActivity : AppCompatActivity() {
         binding.cancelSelection.setOnClickListener { leaveSelectionMode() }
         binding.deleteSelected.setOnClickListener { confirmDeleteSelected() }
         // when background OCR / upload lands, the list re-renders itself
-        for (name in listOf("capture-process", "capture-upload"))
+        for (name in listOf(
+            ProcessWorker.UNIQUE_WORK_NAME,
+            ProcessWorker.BACKLOG_WORK_NAME,
+            "capture-upload",
+        ))
             WorkManager.getInstance(this)
                 .getWorkInfosForUniqueWorkLiveData(name)
-                .observe(this) { if (Auth.signedIn(this)) refreshHome() }
+                .observe(this) { refreshHome() }
     }
 
     override fun onResume() {
         super.onResume()
-        if (!Auth.signedIn(this)) {
-            // the entry point gates sign-in; finishing means backing out of the
-            // login form exits the app instead of looping back here
-            startActivity(Intent(this, LoginActivity::class.java))
-            finish()
-            return
-        }
-        binding.configWarning.visibility = View.GONE
+        val signedIn = Auth.signedIn(this)
+        binding.configWarning.visibility = if (signedIn) View.GONE else View.VISIBLE
         // returning to Home is a good moment to drain the queue and process
         // anything a previous run left un-OCR'd
-        if (CaptureSession(this).pendingUploads().isNotEmpty()) UploadWorker.kick(this)
+        if (CaptureSession(this).pendingUploads().isNotEmpty() &&
+            (signedIn || Prefs.transport(this) != "cloud")) {
+            UploadWorker.kick(this)
+        }
         ProcessWorker.enqueue(this)
         refreshHome()
     }
@@ -177,21 +182,41 @@ class HomeActivity : AppCompatActivity() {
                 R.plurals.home_delete_message, count, count))
             .setNegativeButton(android.R.string.cancel, null)
             .setPositiveButton(R.string.home_delete_selected) { _, _ ->
-                Entries.recent(this)
-                    .filter { it.id in selectedIds }
-                    .forEach { Entries.deleteLocal(this, it) }
-                selectionMode = false
-                selectedIds.clear()
-                refreshHome()
+                val ids = selectedIds.toList()
+                lifecycleScope.launch {
+                    val results = withContext(Dispatchers.IO) {
+                        ids.map {
+                            Entries.deleteLocalSafely(
+                                this@HomeActivity,
+                                it,
+                                allowUploaded = true,
+                            )
+                        }
+                    }
+                    if (Entries.DeleteResult.ACTIVE_CAPTURE in results) {
+                        Toast.makeText(
+                            this@HomeActivity,
+                            R.string.home_delete_active_skipped,
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                    selectionMode = false
+                    selectedIds.clear()
+                    refreshHome()
+                }
             }
             .show()
     }
 
-    private fun markerColor(state: String): Int = when (state) {
-        "capturing" -> R.color.whl_green
-        "pending upload" -> R.color.whl_amber
-        "uploaded" -> R.color.whl_blue
-        "imported" -> R.color.whl_cyan
+    private fun markerColor(state: String): Int = when {
+        state.startsWith("capturing") -> R.color.whl_green
+        state == "failed" -> R.color.whl_red
+        state == "waiting" || state == "processing" || state == "partial" ||
+            state.endsWith("pending upload") || state.endsWith("pending delivery") ||
+            state.endsWith("claim for cloud") -> R.color.whl_amber
+        state.endsWith("different account") -> R.color.whl_red
+        state.endsWith("uploaded") -> R.color.whl_blue
+        state.endsWith("imported") -> R.color.whl_cyan
         else -> R.color.whl_face_sh2
     }
 }

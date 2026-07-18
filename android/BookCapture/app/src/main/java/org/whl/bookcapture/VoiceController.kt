@@ -19,7 +19,7 @@ import java.util.zip.ZipInputStream
  * grammar so recognition is fast and hard to false-trigger. The small English
  * model (~40 MB) is downloaded once on first run into filesDir/model.
  *
- * Latency: commands fire from PARTIAL results, not utterance finalization.
+ * Latency: non-destructive commands can fire from PARTIAL results.
  * Waiting for the final result means waiting for Vosk's endpointer to hear
  * ~0.5-1s of silence; a partial that shows the same command word twice in a
  * row is just as trustworthy under this grammar and arrives while the word is
@@ -47,6 +47,11 @@ class VoiceController(
             "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
         const val MODEL_DIR = "vosk-model-small-en-us-0.15"
         val COMMANDS = listOf("start", "photo", "done", "cancel")
+        private val PARTIAL_COMMANDS = setOf("start", "photo")
+
+        /** Final recognition is required for actions that seal or delete work. */
+        internal fun commandFromPartial(text: String): String? =
+            text.split(" ").lastOrNull { it in PARTIAL_COMMANDS }
         // long enough to swallow the final result that trails a partial-fired
         // command; page-flipping cadence never repeats a word this fast
         private const val DEBOUNCE_MS = 1500L
@@ -200,13 +205,13 @@ class VoiceController(
         }, ERROR_RESTART_MS * errorRestarts)
     }
 
-    /** Same command word in two consecutive partials -> fire now, don't wait
-     *  for the endpointer's silence window. */
+    /** Same safe command in two consecutive partials -> fire now. Commands
+     *  that seal or delete work are accepted only from a final result. */
     private fun handlePartial(hypothesis: String?) {
         errorRestarts = 0
         if (hypothesis.isNullOrBlank()) return
         val text = try { JSONObject(hypothesis).optString("partial") } catch (_: Exception) { "" }
-        val word = text.split(" ").lastOrNull { it in COMMANDS } ?: return
+        val word = commandFromPartial(text) ?: return
         if (word == pendingPartial) {
             pendingPartial = ""
             fire(word)

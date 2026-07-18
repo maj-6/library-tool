@@ -7,7 +7,7 @@
     <uses-permission android:name="android.permission.VIBRATE" />
 
     <uses-feature android:name="android.hardware.camera" android:required="true" />
-    <uses-feature android:name="android.hardware.microphone" android:required="true" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
 
     <application
         android:allowBackup="false"
@@ -35,6 +35,7 @@
              flag set in MainActivity.onCreate. -->
         <activity
             android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|uiMode"
             android:exported="false"
             android:parentActivityName=".HomeActivity"
             android:screenOrientation="portrait" />

@@ -21,7 +21,9 @@ fun env(name: String) = (System.getenv(name)?.trim() ?: "")
 
 android {
     namespace = "org.whl.bookcapture"
-    compileSdk = 34
+    // CameraX 1.5.x publishes API-35 AAR metadata. compileSdk changes build
+    // visibility only; targetSdk stays at 34 until runtime changes are audited.
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "org.whl.bookcapture"
@@ -76,7 +78,9 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
     implementation("androidx.exifinterface:exifinterface:1.3.7")
 
-    val camerax = "1.3.4"
+    // 1.6.x requires compileSdk 36 + AGP 8.9.1, but API 36 is not installed in
+    // the supported local toolchain. 1.5.3 is the newest compatible stable.
+    val camerax = "1.5.3"
     implementation("androidx.camera:camera-core:$camerax")
     implementation("androidx.camera:camera-camera2:$camerax")
     implementation("androidx.camera:camera-lifecycle:$camerax")

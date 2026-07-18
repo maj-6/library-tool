@@ -55,6 +55,113 @@ class ResourceContractTest {
     }
 
     @Test
+    fun singleEntryDiscardRequiresExplicitConfirmation() {
+        val source = File("src/main/java/org/whl/bookcapture/EntryDetailActivity.kt").readText()
+
+        assertTrue(source.contains("binding.discard.setOnClickListener { showDiscardConfirmation(entry) }"))
+        assertTrue(source.contains("MaterialAlertDialogBuilder(this)"))
+        assertTrue(source.contains("setNegativeButton(android.R.string.cancel, null)"))
+        assertTrue(source.contains("setPositiveButton(R.string.detail_discard_confirm)"))
+        assertTrue(source.contains("setTextColor(getColor(R.color.whl_red))"))
+    }
+
+    @Test
+    fun secondaryScreensExposeVisibleUpNavigation() {
+        for (path in listOf(
+            "src/main/res/layout/activity_settings.xml",
+            "src/main/res/layout/activity_entry_detail.xml",
+        )) {
+            val toolbar = elementById(xml(path), "toolbar")
+            assertEquals(
+                "com.google.android.material.appbar.MaterialToolbar",
+                toolbar.tagName,
+            )
+            assertEquals(
+                "@drawable/ic_arrow_back",
+                toolbar.getAttributeNS(appNs, "navigationIcon"),
+            )
+            assertEquals(
+                "@string/navigate_up",
+                toolbar.getAttributeNS(appNs, "navigationContentDescription"),
+            )
+        }
+    }
+
+    @Test
+    fun chromeTextActionsUseSemanticMaterialButtons() {
+        val expected = mapOf(
+            "src/main/res/layout/activity_home.xml" to
+                listOf("btnSelect", "btnSettings", "deleteSelected", "cancelSelection"),
+            "src/main/res/layout/activity_main.xml" to
+                listOf("queueChip", "btnSettings"),
+        )
+        for ((path, ids) in expected) {
+            val layout = xml(path)
+            for (id in ids) {
+                val action = elementById(layout, id)
+                assertEquals(
+                    "com.google.android.material.button.MaterialButton",
+                    action.tagName,
+                )
+                assertEquals("@style/WhlToolbarAction", action.getAttribute("style"))
+            }
+        }
+    }
+
+    @Test
+    fun voiceIsOptionalAndDiscardRequiresConfirmation() {
+        val manifest = xml("src/main/AndroidManifest.xml")
+        val features = manifest.getElementsByTagName("uses-feature")
+        val microphone = (0 until features.length)
+            .map { features.item(it) as Element }
+            .first { it.getAttributeNS(androidNs, "name") == "android.hardware.microphone" }
+        assertEquals("false", microphone.getAttributeNS(androidNs, "required"))
+
+        val settings = xml("src/main/res/layout/activity_settings.xml")
+        assertNotNull(elementById(settings, "voiceControl"))
+
+        val source = File("src/main/java/org/whl/bookcapture/MainActivity.kt").readText()
+        assertTrue(source.contains("arrayOf(Manifest.permission.CAMERA)"))
+        assertTrue(source.contains("arrayOf(Manifest.permission.RECORD_AUDIO)"))
+        assertTrue(source.contains("if (word == \"cancel\" && session.active && !discardConfirmed)"))
+        assertTrue(source.contains("MaterialAlertDialogBuilder(this)"))
+    }
+
+    @Test
+    fun localCaptureIsAvailableWithoutPublicSignup() {
+        val login = xml("src/main/res/layout/activity_login.xml")
+        assertNotNull(elementById(login, "continueLocal"))
+        assertFalse(hasElementWithId(login, "register"))
+
+        val home = File("src/main/java/org/whl/bookcapture/HomeActivity.kt").readText()
+        val capture = File("src/main/java/org/whl/bookcapture/MainActivity.kt").readText()
+        val auth = File("src/main/java/org/whl/bookcapture/Auth.kt").readText()
+        assertFalse(home.contains("if (!Auth.signedIn(this))"))
+        assertFalse(capture.contains("if (!Auth.signedIn(this))"))
+        assertFalse(auth.contains("session(ctx, \"signup\""))
+        assertTrue(home.contains("Prefs.transport(this) != \"cloud\""))
+        assertTrue(capture.contains("Prefs.transport(this) != \"cloud\""))
+    }
+
+    @Test
+    fun acceptedCameraWritesSurviveActivityRecreation() {
+        val main = File("src/main/java/org/whl/bookcapture/MainActivity.kt").readText()
+        val session = File("src/main/java/org/whl/bookcapture/CaptureSession.kt").readText()
+        assertTrue(main.contains("if (!captureQueue.busy) discardAllCaptureRequests()"))
+        assertTrue(main.contains("finishAfterAcceptedCaptures"))
+        assertTrue(session.contains("ActiveCaptureWrites.register"))
+        assertTrue(session.contains("filterNot(ActiveCaptureWrites::isActive)"))
+        assertTrue(session.contains("fun refreshPhotoCount()"))
+
+        val manifest = xml("src/main/AndroidManifest.xml")
+        val activities = manifest.getElementsByTagName("activity")
+        val camera = (0 until activities.length)
+            .map { activities.item(it) as Element }
+            .first { it.getAttributeNS(androidNs, "name") == ".MainActivity" }
+        assertTrue(camera.getAttributeNS(androidNs, "configChanges").contains("uiMode"))
+    }
+
+    @Test
     fun launcherArtworkUsesTheSameInsetSafeLayerForEveryPresentation() {
         val safeLayer = xml("src/main/res/drawable/ic_launcher_safe_fg.xml").documentElement
         assertEquals("inset", safeLayer.tagName)

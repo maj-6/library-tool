@@ -42,6 +42,16 @@ object Pipeline {
     /** A 4xx from an API: retrying won't fix it (bad key, bad request). */
     class PermanentError(message: String) : IOException(message)
 
+    /** A successful HTTP response that cannot be trusted as an extraction.
+     *  Retrying is safe because callers do not replace the last good metadata. */
+    class InvalidExtractionError(message: String) : IOException(message)
+
+    data class ExtractionResult(
+        val metadata: JSONObject,
+        val complete: Boolean,
+        val warning: String? = null,
+    )
+
     // --- 1. standardize -----------------------------------------------------------
 
     /** Scale the photo to the standard width and recompress, in place, honoring
@@ -133,7 +143,7 @@ OCR TEXT:
     /** OCR text -> {title, ..., extra:{}}. DeepSeek when its key is set, else
      *  Mistral (whose extraction the desktop has verified live). */
     fun extract(ocrText: String, deepseekKey: String, mistralKey: String,
-                customInstructions: String = ""): JSONObject {
+                customInstructions: String = ""): ExtractionResult {
         val (url, model, key) =
             if (deepseekKey.isNotEmpty()) Triple(DEEPSEEK_CHAT_URL, DEEPSEEK_EXTRACT_MODEL, deepseekKey)
             else Triple(MISTRAL_CHAT_URL, MISTRAL_EXTRACT_MODEL, mistralKey)
@@ -158,14 +168,114 @@ OCR TEXT:
         val data = post(url, payload, key, 60_000)
         val raw = data.optJSONArray("choices")?.optJSONObject(0)
             ?.optJSONObject("message")?.optString("content") ?: ""
+        return parseExtraction(raw)
+    }
+
+    /** Validate and normalize a model response without silently turning bad JSON
+     *  into a completed empty record. A response with usable fields but an
+     *  incomplete schema is retained as partial so those fields stay visible. */
+    internal fun parseExtraction(raw: String): ExtractionResult {
+        val cleaned = raw.trim().removePrefix("```json").removePrefix("```")
+            .removeSuffix("```").trim()
+        if (cleaned.isEmpty()) throw InvalidExtractionError("Extraction returned an empty response")
         val obj = try {
-            JSONObject(raw.trim().removePrefix("```json").removePrefix("```")
-                          .removeSuffix("```").trim())
-        } catch (_: Exception) { JSONObject() }
+            JSONObject(cleaned)
+        } catch (e: Exception) {
+            throw InvalidExtractionError("Extraction returned invalid JSON")
+        }
         val out = JSONObject()
-        for (k in FIELDS) out.put(k, obj.optString(k).trim())
-        out.put("extra", obj.optJSONObject("extra") ?: JSONObject())
+        val problems = mutableListOf<String>()
+        var populated = false
+        for (k in FIELDS) {
+            val value = when {
+                !obj.has(k) -> {
+                    problems += "$k is missing"
+                    ""
+                }
+                obj.opt(k) == JSONObject.NULL -> {
+                    problems += "$k is not a string"
+                    ""
+                }
+                obj.opt(k) is String -> obj.optString(k).trim()
+                else -> {
+                    problems += "$k is not a string"
+                    obj.opt(k)?.toString()?.trim().orEmpty()
+                }
+            }
+            if (value.isNotEmpty()) populated = true
+            out.put(k, value)
+        }
+
+        val extraOut = JSONObject()
+        val extra = obj.opt("extra")
+        if (extra is JSONObject) {
+            for (key in extra.keys()) {
+                val rawValue = extra.opt(key)
+                val value = when {
+                    rawValue == null || rawValue == JSONObject.NULL -> ""
+                    rawValue is String -> rawValue.trim()
+                    else -> {
+                        problems += "extra.$key is not a string"
+                        rawValue.toString().trim()
+                    }
+                }
+                if (value.isNotEmpty()) {
+                    extraOut.put(key, value)
+                    populated = true
+                }
+            }
+        } else {
+            problems += "extra is missing or is not an object"
+        }
+        out.put("extra", extraOut)
+
+        if (!populated)
+            throw InvalidExtractionError("Extraction returned no bibliographic fields")
+        val warning = problems.distinct().takeIf { it.isNotEmpty() }?.let {
+            val shown = it.take(3).joinToString(", ")
+            if (it.size > 3) "Partial extraction response: $shown (+${it.size - 3} more)"
+            else "Partial extraction response: $shown"
+        }
+        return ExtractionResult(out, complete = warning == null, warning = warning)
+    }
+
+    /** Merge an accepted response over the prior record without ever erasing a
+     *  populated field. Automatic retries only fill gaps; an explicit user
+     *  reprocess may replace values, but still cannot replace one with blank. */
+    internal fun mergeExtraction(
+        existing: JSONObject?,
+        incoming: JSONObject,
+        replaceExisting: Boolean = false,
+    ): JSONObject {
+        val out = JSONObject()
+        for (key in FIELDS) {
+            val old = existing?.optString(key)?.trim().orEmpty()
+            val fresh = incoming.optString(key).trim()
+            out.put(key, when {
+                old.isEmpty() -> fresh
+                fresh.isEmpty() -> old
+                replaceExisting -> fresh
+                else -> old
+            })
+        }
+        val extraOut = JSONObject()
+        fun addExtra(source: JSONObject?, replace: Boolean) {
+            if (source == null) return
+            for (key in source.keys()) {
+                val value = source.optString(key).trim()
+                if (value.isNotEmpty() && (replace || !extraOut.has(key))) extraOut.put(key, value)
+            }
+        }
+        addExtra(existing?.optJSONObject("extra"), replace = false)
+        addExtra(incoming.optJSONObject("extra"), replace = replaceExisting)
+        out.put("extra", extraOut)
         return out
+    }
+
+    internal fun hasPopulatedMetadata(metadata: JSONObject): Boolean {
+        if (FIELDS.any { metadata.optString(it).trim().isNotEmpty() }) return true
+        val extra = metadata.optJSONObject("extra") ?: return false
+        return extra.keys().asSequence().any { extra.optString(it).trim().isNotEmpty() }
     }
 
     // --- HTTP -------------------------------------------------------------------------
