@@ -478,12 +478,15 @@
         <div id="pane-splitter"></div>
 
         <div id="checked-right">
-          <div class="pane-bar">
-            <label class="tool-label" for="top-table">Table</label>
-            <select id="top-table" class="cad-input">
-              <option value="checked">Checked books + manual</option>
-              <option value="whl">WHL</option>
-            </select>
+          <div id="catalog-toolbar" class="pane-bar catalog-toolbar"
+               role="toolbar" aria-label="Catalog table tools">
+            <span class="catalog-table-picker">
+              <label class="tool-label" for="top-table">Table</label>
+              <select id="top-table" class="cad-input">
+                <option value="checked">Checked books + manual</option>
+                <option value="whl">WHL</option>
+              </select>
+            </span>
             <span id="whl-modeseg" class="modeseg" role="group" hidden
                   data-tip="Search / Edit / Process mode  (Ctrl+E toggles Search/Edit)">
               <button type="button" class="modeseg-btn" data-mode="search">Search</button>
@@ -520,24 +523,14 @@
                       data-tip="Run the action on the selected rows">Run</button>
             </span>
             <span class="bar-spacer"></span>
-            <span class="year-filter" data-tip="Show only rows within this year range (inclusive)">
-              <span class="tool-label">Year</span>
-              <input id="year-from" class="cad-input yr-input" type="number"
-                     inputmode="numeric" placeholder="from" />
-              <span class="yr-dash">–</span>
-              <input id="year-to" class="cad-input yr-input" type="number"
-                     inputmode="numeric" placeholder="to" />
-              <button id="year-clear" class="cad-btn tiny icon-btn" type="button"
-                      data-icon="remove" data-tip="Clear the year range"></button>
-            </span>
-            <button id="export-json" class="cad-btn tiny icon-btn" type="button"
-                    data-icon="export" data-tip="Export the table as JSON (respects the active filters)"></button>
-            <button id="dl-approved" class="cad-btn tiny icon-btn" type="button"
-                    data-icon="download" data-tip="Download all verified sources"></button>
             <button id="filter-btn" class="cad-btn tiny icon-btn" type="button"
-                    data-icon="filter" data-tip="Filter rows"></button>
+                    data-icon="filter" aria-label="Filter rows"
+                    aria-haspopup="dialog" aria-expanded="false" aria-pressed="false"
+                    data-tip="Filter rows"></button>
             <button id="colvis-top" class="cad-btn tiny icon-btn" type="button"
-                    data-icon="columns" data-tip="Visible columns"></button>
+                    data-icon="columns" aria-label="Visible columns"
+                    aria-haspopup="dialog" aria-expanded="false"
+                    data-tip="Visible columns"></button>
             <span class="tool-count" id="top-count"></span>
           </div>
 
@@ -1299,45 +1292,53 @@
             <span class="tool-label">Pages</span>
             <span class="tool-count" id="rw-page-count"></span>
             <span class="bar-spacer"></span>
-            <select id="rw-src" class="cad-input" hidden></select>
+            <select id="rw-src" class="cad-input" aria-label="Replica source" hidden></select>
           </div>
           <div id="rw-pages" class="drafting"></div>
         </aside>
         <div id="rw-main">
-          <div class="pane-bar">
+          <div class="pane-bar replica-toolbar" role="toolbar" aria-label="Replica page tools">
             <button id="rw-mode-edit" class="cad-btn tiny icon-btn active" type="button"
-                    data-icon="pencil" aria-label="Edit regions"
+                    data-icon="pencil" aria-label="Edit regions" aria-pressed="true"
                     data-tip="Edit the page's regions"></button>
             <button id="rw-mode-preview" class="cad-btn tiny icon-btn" type="button"
-                    data-icon="eye" aria-label="Preview"
+                    data-icon="eye" aria-label="Preview" aria-pressed="false"
                     data-tip="Re-typeset preview: the page rendered from its regions at the mapped styles, beside the original — the modernized facsimile"></button>
-            <select id="rw-preview-lang" class="cad-input" hidden
+            <select id="rw-preview-lang" class="cad-input" aria-label="Preview text layer" hidden
                     data-tip="Which text layer the preview flows: the diplomatic transcription, the normalized reading, or a page-aligned translation"></select>
             <span class="tool-count" id="rw-status"></span>
-            <span class="bar-spacer"></span>
-            <span id="rw-legend" class="tool-label"></span>
-            <span class="bar-spacer"></span>
-            <select id="rw-tpl" class="cad-input" data-tip="Layout template — one corrected recto/verso page becomes a reusable grid"></select>
-            <button id="rw-tpl-save" class="cad-btn tiny icon-btn" type="button" disabled
-                    data-icon="gridplus" aria-label="Save as template"
-                    data-tip="Save this page's SAVED regions as a template (geometry + roles, no text)"></button>
-            <button id="rw-tpl-apply" class="cad-btn tiny" type="button" disabled
-                    data-tip="Stamp the template onto a page range; each region pre-fills its text from the word boxes inside it">Apply</button>
-            <button id="rw-tpl-outliers" class="cad-btn tiny" type="button" disabled
-                    data-tip="Flag region pages that break the template's grid — plates, chapter openings, errata">Outliers</button>
             <span class="bar-spacer"></span>
             <button id="rw-save" class="cad-btn tiny icon-btn" type="button" disabled
                     data-icon="save" aria-label="Save regions"
                     data-tip="Save this page's regions (Ctrl+S)"></button>
-            <button id="rw-recompile" class="cad-btn tiny" type="button" disabled
-                    data-tip="Rewrite compiled text from every saved region page of this source — furniture stays out of the flow. The toggled layer compiles: diplomatic into each record's doc, normalized into normalized.txt">Recompile</button>
-            <button id="rw-export" class="cad-btn tiny" type="button" disabled
-                    data-tip="Export this source's region pages as a .lib — book metadata, role stylesheet, templates, per-page regions with both text layers, and the figure crops, sealed in one portable file">Export .lib</button>
-            <button id="rw-import" class="cad-btn tiny" type="button" disabled
-                    data-tip="Import a .lib archive into this source — pages that already have regions are skipped, and the stylesheet only lands if the book has none of its own">Import</button>
-            <button id="rw-print" class="cad-btn tiny icon-btn" type="button" disabled
-                    data-icon="printer" aria-label="Print"
-                    data-tip="Open the modernized facsimile as a print document (one A4 sheet per region page, the preview's layer selector picks the text) — print it to PDF from the browser"></button>
+            <details id="rw-template-menu" class="toolbar-popover">
+              <summary class="cad-btn tiny"
+                       data-tip="Choose, save, apply, or inspect layout templates">Templates</summary>
+              <div class="toolbar-popover-panel" role="group" aria-label="Template actions">
+                <label class="toolbar-popover-field" for="rw-tpl">Layout template</label>
+                <select id="rw-tpl" class="cad-input"
+                        data-tip="One corrected recto or verso page becomes a reusable grid"></select>
+                <button id="rw-tpl-save" class="cad-btn tiny" type="button" disabled
+                        data-tip="Save this page's saved regions as a template (geometry and roles, no text)">Save current page</button>
+                <button id="rw-tpl-apply" class="cad-btn tiny" type="button" disabled
+                        data-tip="Stamp the template onto a page range; each region pre-fills its text from the word boxes inside it">Apply to pages…</button>
+                <button id="rw-tpl-outliers" class="cad-btn tiny" type="button" disabled
+                        data-tip="Flag region pages that break the template's grid — plates, chapter openings, errata">Find outliers</button>
+              </div>
+            </details>
+            <details id="rw-actions-menu" class="toolbar-popover">
+              <summary class="cad-btn tiny" data-tip="Recompile, import, export, or print this replica">Book actions</summary>
+              <div class="toolbar-popover-panel" role="group" aria-label="Replica actions">
+                <button id="rw-recompile" class="cad-btn tiny" type="button" disabled
+                        data-tip="Rewrite compiled text from every saved region page of this source — furniture stays out of the flow. The toggled layer compiles: diplomatic into each record's doc, normalized into normalized.txt">Recompile text</button>
+                <button id="rw-export" class="cad-btn tiny" type="button" disabled
+                        data-tip="Export this source's region pages as a .lib — book metadata, role stylesheet, templates, per-page regions with both text layers, and the figure crops, sealed in one portable file">Export .lib</button>
+                <button id="rw-import" class="cad-btn tiny" type="button" disabled
+                        data-tip="Import a .lib archive into this source — pages that already have regions are skipped, and the stylesheet only lands if the book has none of its own">Import .lib…</button>
+                <button id="rw-print" class="cad-btn tiny" type="button" disabled
+                        data-tip="Open the modernized facsimile as a print document (one A4 sheet per region page, the preview's layer selector picks the text) — print it to PDF from the browser">Print…</button>
+              </div>
+            </details>
             <input id="rw-import-file" type="file" accept=".lib,.zip" hidden>
           </div>
           <div id="rw-canvas-wrap" class="drafting">
@@ -1395,8 +1396,10 @@
           </div>
           <textarea id="rw-text" class="cad-input" spellcheck="false" disabled
                     placeholder="Select a region"></textarea>
-          <div class="pane-bar">
+          <div class="pane-bar rw-keybar">
             <span id="rw-keys" class="tool-label">draw: drag &nbsp; move/resize: drag box/corner &nbsp; roles: 1–9,0 + D drop-cap / F footnote &nbsp; split: S / Shift+S &nbsp; merge: M &nbsp; verify page: V &nbsp; del: Del &nbsp; order: [ ] &nbsp; walk: Tab</span>
+            <span class="bar-spacer"></span>
+            <span id="rw-legend" class="tool-label" aria-label="Region role shortcuts"></span>
           </div>
           </div>
         </aside>
@@ -1584,7 +1587,7 @@
   </div>
 
   <div id="cad-tooltip" hidden></div>
-  <div id="popup-menu" hidden></div>
+  <div id="popup-menu" role="dialog" aria-label="Toolbar options" hidden></div>
 
   <!-- MARKDOWN EDITOR WINDOW -->
   <div id="md-overlay" class="overlay" hidden>
