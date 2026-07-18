@@ -6,6 +6,9 @@ import org.json.JSONObject
 import java.io.File
 import java.util.UUID
 
+private const val TRASH_STAMP = ".trashed_at"
+private const val TRASH_TTL_MS = 7L * 24 * 60 * 60 * 1000   // ~7 days
+
 /**
  * The voice-driven entry state machine.
  *
@@ -33,7 +36,7 @@ class CaptureSession(private val ctx: Context) {
     var photoCount: Int = 0
         private set
 
-    init { restore() }
+    init { restore(); purgeTrash() }
 
     val active: Boolean get() = entryId != null
 
@@ -94,13 +97,63 @@ class CaptureSession(private val ctx: Context) {
         return id
     }
 
-    fun cancel(): Boolean {
-        val id = entryId ?: return false
+    /** Discard the open entry — but to the TRASH, not straight to deletion, so a
+     *  mis-fired "cancel" stays recoverable (see [restoreFromTrash]). Returns the
+     *  discarded entry id for an Undo, or null if nothing was open. */
+    fun cancel(): String? {
+        val id = entryId ?: return null
         entryId = null
         photoCount = 0
-        entryDir(id).deleteRecursively()
+        moveToTrash(id)
         Prefs.setCurrentEntryId(ctx, null)
+        return id
+    }
+
+    // --- trash: a discard is recoverable for a while -------------------------
+
+    private fun trashRoot(): File = File(ctx.filesDir, "trash").apply { mkdirs() }
+
+    /** Move an entry folder into the trash, stamped so [purgeTrash] can age it
+     *  out. Any same-id folder already in the trash is replaced. */
+    private fun moveToTrash(id: String) {
+        val src = entryDir(id)
+        if (!src.exists()) return
+        val dst = File(trashRoot(), id)
+        dst.deleteRecursively()
+        if (!src.renameTo(dst)) {              // across mount points: copy + delete
+            src.copyRecursively(dst, overwrite = true)
+            src.deleteRecursively()
+        }
+        File(dst, TRASH_STAMP).writeText(System.currentTimeMillis().toString())
+    }
+
+    /** Undo a [cancel]: bring a trashed entry back as the live open entry.
+     *  No-op (false) if another entry is already open or the trash copy is gone. */
+    fun restoreFromTrash(id: String): Boolean {
+        if (active) return false
+        val src = File(trashRoot(), id)
+        if (!src.isDirectory) return false
+        val dst = entryDir(id)
+        dst.deleteRecursively()
+        if (!src.renameTo(dst)) {
+            src.copyRecursively(dst, overwrite = true)
+            src.deleteRecursively()
+        }
+        File(dst, TRASH_STAMP).delete()
+        entryId = id
+        photoCount = dst.listFiles { f -> f.isFile && f.name.matches(PHOTO_NAME) }?.size ?: 0
+        Prefs.setCurrentEntryId(ctx, id)
         return true
+    }
+
+    /** Delete trashed entries past the retention window; runs at construction so
+     *  an abandoned discard can't linger forever. */
+    fun purgeTrash(now: Long = System.currentTimeMillis()) {
+        for (dir in trashRoot().listFiles { f -> f.isDirectory } ?: return) {
+            val stamp = File(dir, TRASH_STAMP).takeIf { it.isFile }
+                ?.readText()?.trim()?.toLongOrNull()
+            if (now - (stamp ?: dir.lastModified()) >= TRASH_TTL_MS) dir.deleteRecursively()
+        }
     }
 
     /** Entry folders sealed with a manifest and not yet uploaded. */

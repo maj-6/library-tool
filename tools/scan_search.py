@@ -163,8 +163,12 @@ def search_internet_archive(
                 }
                 m["accuracy"], m["_rank"] = _score(query, m["title"], m["author"], m["year"])
                 by_id[ident] = m
-            # A well-corroborated hit is enough; skip the looser queries.
-            if by_id and max(m["_rank"] for m in by_id.values()) >= 0.8:
+            # A well-corroborated *downloadable* hit is enough; skip the looser
+            # queries. A restricted/view-only exact hit must not stop the
+            # ladder, because a later query may find another edition that can
+            # actually be downloaded.
+            if any(m["downloadable"] and m["_rank"] >= 0.8
+                   for m in by_id.values()):
                 break
     except Exception as exc:
         out["error"] = f"{type(exc).__name__}: {exc}"

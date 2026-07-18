@@ -116,14 +116,12 @@ body[data-theme="sage"] .cad-input,
 body[data-theme="sage"] .cell-edit,
 body[data-theme="sage"] .md-live { border: 1px solid #b4ab97; }
 body[data-theme="sage"] .cad-input:focus { border-color: var(--cyan); }
-body[data-theme="sage"] .tab,
 body[data-theme="sage"] .pane-tab {
   border: none;
   border-radius: 0;
   background: transparent;
   color: #6a6152;
 }
-body[data-theme="sage"] .tab.active,
 body[data-theme="sage"] .pane-tab.active {
   background: transparent;
   color: var(--ink);
@@ -205,14 +203,12 @@ body[data-theme="ledger"] .cad-btn:active {
   transform: translateY(1px);
   background: #e4e2d8;
 }
-body[data-theme="ledger"] .tab,
 body[data-theme="ledger"] .pane-tab {
   border: 1px solid #a5a296;
   border-bottom: none;
   border-radius: 0;
   background: #dedcd2;
 }
-body[data-theme="ledger"] .tab.active,
 body[data-theme="ledger"] .pane-tab.active {
   background: var(--canvas);
   box-shadow: inset 0 3px 0 var(--blue);
@@ -306,7 +302,6 @@ body[data-theme="foolscap"] .cell-edit:focus {
   box-shadow: inset 0 0 0 1px var(--cyan);
 }
 /* square proof tabs; active tab freshly pressed with a deep-ink registration rule */
-body[data-theme="foolscap"] .tab,
 body[data-theme="foolscap"] .pane-tab {
   border: 1px solid #b0a99a;
   border-bottom: none;
@@ -314,7 +309,6 @@ body[data-theme="foolscap"] .pane-tab {
   background: #ddd9cf;
   color: #565043;
 }
-body[data-theme="foolscap"] .tab.active,
 body[data-theme="foolscap"] .pane-tab.active {
   background: var(--face-hi);
   color: var(--ink);
@@ -404,14 +398,12 @@ body[data-theme="vellum"] .cad-input,
 body[data-theme="vellum"] .cell-edit,
 body[data-theme="vellum"] .md-live { border: 1px solid #c1baa8; }
 body[data-theme="vellum"] .cad-input:focus { border-color: #2f6a63; }
-body[data-theme="vellum"] .tab,
 body[data-theme="vellum"] .pane-tab {
   border: none;
   border-radius: 0;
   background: transparent;
   color: #6a6252;
 }
-body[data-theme="vellum"] .tab.active,
 body[data-theme="vellum"] .pane-tab.active {
   background: transparent;
   color: var(--ink);
@@ -500,14 +492,12 @@ body[data-theme="linen"] .md-live { border: 1px solid #b8b2a3; }
 body[data-theme="linen"] .cad-input:focus,
 body[data-theme="linen"] .cell-edit:focus { border-color: #356a60; }
 /* tabs: flat, marked by a soft slate underline when active */
-body[data-theme="linen"] .tab,
 body[data-theme="linen"] .pane-tab {
   border: none;
   border-radius: 0;
   background: transparent;
   color: #5f5a4f;
 }
-body[data-theme="linen"] .tab.active,
 body[data-theme="linen"] .pane-tab.active {
   background: transparent;
   color: var(--ink);
@@ -985,41 +975,76 @@ body.desktop .win-controls { display: inline-flex; }
 .menu-sub-drop { top: -4px; left: 100%; min-width: 160px; display: none; }
 .menu-sub:hover > .menu-sub-drop { display: block; }
 
-/* --- tab strip with inline actions --- */
+/* --- the activity bar: tab icons in a VS Code-style left rail ------------
+   Tab colors come from the theme's --tabc-* palette (uniform in the plain
+   themes, varied in the decorated ones); the active tab shows its color
+   and a left indicator. Action groups sit at the bar's bottom. --- */
+#shell { display: flex; flex: 1; min-height: 0; }
 #tabs {
   display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: 6px 0 4px;
+  width: 44px;
+  flex: none;
+  /* a hair deeper than the face, so the rail reads as its own band */
+  background: color-mix(in srgb, var(--face) 90%, var(--face-sh2) 10%);
+  border-right: 1px solid var(--face-sh);
+  /* short windows (or a 2x UI zoom): the rail scrolls rather than
+     shrinking its hit targets or burying Settings under the statusbar */
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: none;
+}
+#tabs::-webkit-scrollbar { display: none; }
+#tabs > *, #tabs .tb-group > * { flex: none; }
+.tab {
+  width: 36px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: var(--ink);
+  opacity: 0.55;
+  cursor: pointer;
+  border: none;
+  border-left: 2px solid transparent;
+  border-radius: var(--radius);
+}
+.tab svg { width: 18px; height: 18px; display: block; }
+.tab:hover { opacity: 0.9; background: var(--face-hi); }
+.tab.active {
+  opacity: 1;
+  color: var(--tabc, var(--blue));
+  border-left-color: var(--tabc, var(--blue));
+  background: var(--face-active);
+}
+.tab[data-tab="home"] { --tabc: var(--tabc-home, var(--blue)); }
+.tab[data-tab="checked"] { --tabc: var(--tabc-checked, var(--blue)); }
+.tab[data-tab="workbench"] { --tabc: var(--tabc-workbench, var(--blue)); }
+.tab[data-tab="replica"] { --tabc: var(--tabc-replica, var(--blue)); }
+.tab[data-tab="publish"] { --tabc: var(--tabc-publish, var(--blue)); }
+.tab[data-tab="infotab"] { --tabc: var(--tabc-infotab, var(--blue)); }
+.tab-fallback {
+  font: bold 10px var(--ui);
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+#tabs .bar-spacer { flex: 1; }
+#tabs .tb-group {
+  display: flex;
+  flex-direction: column;
   align-items: center;
   gap: 2px;
-  padding: 4px 6px 0 4px;
-  /* a hair deeper than the face, so the tab strip reads as its own band */
-  background: color-mix(in srgb, var(--face) 90%, var(--face-sh2) 10%);
-  border-bottom: 1px solid var(--face-sh);
 }
-.tab {
-  font-family: var(--ui);
-  font-size: 12.5px;
-  padding: 4px 14px;
-  background: var(--face-hi);
-  color: var(--ink);
-  cursor: pointer;
-  white-space: nowrap;
-  border: 1px solid var(--face-sh);
-  border-bottom: none;
-  border-radius: 5px 5px 0 0;
-  letter-spacing: 0.3px;
-}
-.tab.active {
-  background: var(--face-active);
-  color: var(--blue);
-  font-weight: bold;
-}
-#tabs .tb-group { display: flex; align-items: center; gap: 2px; padding-bottom: 3px; }
 #tabs .tb-group[hidden] { display: none; }
 .tb-sep {
   align-self: center;
-  height: 16px;
-  margin: 0 6px 3px;
-  border-left: 1px solid var(--face-sh);
+  width: 18px;
+  margin: 4px 0;
+  border-top: 1px solid var(--face-sh);
 }
 /* .tb-spacer folded into .bar-spacer (identical) */
 .tool-btn {
@@ -1050,6 +1075,10 @@ body.desktop .win-controls { display: inline-flex; }
 main {
   flex: 1;
   min-height: 0;
+  /* a #shell ROW item: without this, wide panels set the
+     min-content width and push the layout past the window
+     with no scrollbar (html/body overflow is hidden) */
+  min-width: 0;
   padding: 6px;
   background: var(--face);
 }
@@ -4170,6 +4199,84 @@ button.publish-tree-label { cursor: pointer; }
 /* a thin rule where a new parent section begins — a marker, not a pill */
 .psg-sep td { padding: 0; border-bottom: 2px solid var(--face-sh2); }
 #an-psg-view { flex: none; max-height: 34%; }
+/* Test (#142) + Ask (#143): evaluation queries and evidence rows — the
+   incidental data (kinds, scores, metrics) stays whisper-styled */
+#an-ev-split { display: flex; flex: 1; min-height: 0; gap: 8px; }
+#an-ev-queries { flex: 0 0 36%; min-width: 0; overflow: auto; }
+#an-ev-results { flex: 1; min-width: 0; overflow: auto; display: flex; gap: 10px; align-items: flex-start; }
+#an-ev-text { flex: 1; min-width: 0; }
+.ev-kind {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--face-sh2);
+  border-bottom: 1px solid var(--canvas-line);
+  margin: 6px 0 2px;
+  padding-bottom: 1px;
+}
+.ev-q {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  font-family: var(--ui);
+  font-size: 12px;
+}
+.ev-q:hover { background: var(--row-hover); }
+.ev-q.active { background: var(--row-checked); border-color: var(--face-sh); }
+/* the query text always keeps a readable share; the metrics whisper yields */
+.ev-q-text { flex: 1 1 auto; min-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ev-q-meta { flex: 0 1 auto; min-width: 0; font-size: 10px; color: var(--face-sh2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ev-q-acts { flex: none; white-space: nowrap; }
+.ev-q-acts .cad-btn { margin-left: 3px; }
+.ev-col { flex: 1 1 0; min-width: 0; }
+.ev-col-label {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--face-sh2);
+  border-bottom: 1px solid var(--canvas-line);
+  margin-bottom: 2px;
+  padding-bottom: 1px;
+}
+.ev-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 4px;
+  border-bottom: 1px solid var(--canvas-line);
+  font-family: var(--ui);
+  font-size: 12px;
+}
+.ev-row:hover { background: var(--row-hover); }
+.ev-snip { flex: 1 1 auto; min-width: 0; }
+.ev-mark { background: var(--row-checked); border-bottom: 1px solid var(--cyan); }
+.ev-score { flex: none; font-family: var(--mono); font-size: 11px; color: var(--face-sh2); }
+.ev-row-acts { flex: none; white-space: nowrap; }
+.ev-row-acts .cad-btn { margin-left: 3px; }
+.ev-flash { outline: 1px solid var(--cyan); background: var(--row-checked); }
+.ev-verstats { font-size: 11px; color: var(--face-sh2); }
+/* Ask: the answer block; abstention is a note, never an error */
+#an-ask-answer {
+  border: 1px solid var(--canvas-line);
+  border-left: 3px solid var(--face-sh2);
+  background: var(--canvas);
+  padding: 8px 10px;
+  font-family: var(--ui);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+#an-ask-answer.ask-abstain { color: var(--face-sh2); font-style: italic; border-left-color: var(--canvas-line); }
+.ask-cite { color: var(--cyan); text-decoration: none; font-family: var(--mono); font-size: 11px; }
+.ask-cite:hover { text-decoration: underline; }
+#an-ask-note { margin: 0 0 4px; }
+/* long provider errors stay one quiet line, not a ballooned bar */
+#an-ask-msg { min-width: 0; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#an-ask-evidence { flex: 1; min-height: 0; overflow: auto; }
+#an-ask-view { flex: none; max-height: 34%; }
 /* Publish phase: two peer cards — the archive entry and the search index */
 #wb-publish-cards { display: flex; gap: 10px; align-items: flex-start; }
 #wb-publish-cards[hidden] { display: none; }
@@ -4260,3 +4367,43 @@ button.publish-tree-label { cursor: pointer; }
   font-size: 12px;
   padding: 3px 0;
 }
+
+/* --- theme tab palettes --------------------------------------------------
+   Each theme may color the activity-bar tabs from its own accent set; a
+   theme that defines none stays uniform (every tab falls back to --blue).
+   Sage and Manuscript vary; Ledger, Vellum, and Linen stay uniform. */
+body[data-theme="sage"] {
+  --tabc-home: var(--blue);
+  --tabc-checked: var(--amber);
+  --tabc-workbench: var(--green);
+  --tabc-replica: var(--red);
+  --tabc-publish: var(--cyan);
+  --tabc-infotab: var(--blue2);
+}
+body[data-theme="foolscap"] {
+  --tabc-home: var(--blue);
+  --tabc-checked: var(--amber);
+  --tabc-workbench: var(--green);
+  --tabc-replica: var(--red);
+  --tabc-publish: var(--cyan);
+  --tabc-infotab: var(--ink-mut);
+}
+
+/* --- compact tree/list density (Visual Studio style) ---------------------
+   One place tunes every sidebar tree and list: tighter vertical rhythm,
+   smaller metadata line, shallower indents. Rows land at ~19-20px like
+   VS's solution explorer instead of the old ~26px. */
+.build-item,
+.ocr-doc,
+.ocr-src { padding-top: 1px; padding-bottom: 1px; line-height: 1.25; }
+#ocr-books .build-item { padding: 1px 8px; line-height: 1.2; }
+.bi-meta { font-size: 9.5px; line-height: 1.25; opacity: 0.7; }
+.bi-title { font-size: 11.5px; }
+.ocr-doc.tree-doc { padding-left: 18px; }
+.build-item.volume-member { padding-left: 18px; }
+.tree-ico svg { width: 11px; height: 11px; }
+.publish-tree-row {
+  min-height: 20px;
+  padding: 0 5px 0 calc(3px + var(--tree-depth) * 12px);
+}
+#publish-tree { font-size: 11.5px; }
