@@ -981,10 +981,11 @@ def api_builds():
     return jsonify({"builds": lib.load_json(BUILDS_PATH, {})})
 
 
-@app.route("/api/builds", methods=["POST"])
-def api_builds_create():
-    payload = request.get_json(silent=True) or {}
-    seed = payload.get("build") or {}
+def _create_build(seed: dict) -> tuple[dict | None, str]:
+    """Mint one build record from a seed through the standard field cleaning:
+    (build, "") on success, (None, error) on refusal. The core of POST
+    /api/builds, shared with the .lib open flow so a book minted from a
+    manifest passes exactly the same scrubbing as a hand-created one."""
     with _builds_lock:
         builds = lib.load_json(BUILDS_PATH, {})
         build = {f: str(seed.get(f, "") or "").strip() for f in _BUILD_FIELDS
@@ -999,14 +1000,22 @@ def api_builds_create():
         if build["status"] not in _BUILD_STATUSES:
             build["status"] = "draft"
         if build["rights"] not in _BUILD_RIGHTS:
-            return jsonify({"ok": False,
-                            "error": f"unknown rights value {build['rights']!r}"}), 400
+            return None, f"unknown rights value {build['rights']!r}"
         build["id"] = lib.gen_id(set(builds))
         build["created_at"] = _build_updated_at()
         build["updated_at"] = build["created_at"]
         builds[build["id"]] = build
         lib.save_json(BUILDS_PATH, builds)
     activity("created", "draft entry", detail=build.get("title", ""))
+    return build, ""
+
+
+@app.route("/api/builds", methods=["POST"])
+def api_builds_create():
+    payload = request.get_json(silent=True) or {}
+    build, err = _create_build(payload.get("build") or {})
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
     return jsonify({"ok": True, "build": build})
 
 
@@ -3276,53 +3285,36 @@ _LIB_MAX_JSON = libformat.MAX_JSON            # per JSON member, decompressed
 _LIB_MAX_INFLATED = libformat.MAX_INFLATED    # total page-JSON budget
 
 
-@app.route("/api/builds/<build_id>/replica-import", methods=["POST"])
-def api_build_replica_import(build_id: str):
-    """The other half of .lib interchange: unpack an exported archive into
-    this build's working store. Multipart field "lib"; ?src= picks the scan
-    the pages land under, ?overwrite=1 lets imported pages/templates replace
-    existing ones (default: skip, like template apply). Everything passes the
-    same sanitizers as the live endpoints — a .lib is somebody else's file.
-    The stylesheet imports only when the book has no custom sheet (or with
-    overwrite); figures only when the name is free."""
-    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
-    if b is None:
-        abort(404)
-    src = _valid_src_key(b, request.args.get("src"))
-    if not src:
-        return jsonify({"ok": False, "error": "unknown source"}), 400
-    overwrite = str(request.args.get("overwrite") or "") in ("1", "true")
-    f = request.files.get("lib")
-    if f is None:
-        return jsonify({"ok": False, "error": "no file"}), 400
-    if request.content_length and request.content_length > _LIB_MAX_BYTES:
-        return jsonify({"ok": False, "error": "file too large"}), 400
+def _lib_import_archive(build_id: str, src: str, raw: bytes,
+                        overwrite: bool) -> tuple[dict, int]:
+    """The .lib import core: unpack an archive's pages/templates/figures/
+    stylesheet/translations into a build's working store, returning
+    (receipt, http_status). Everything passes the same sanitizers as the
+    live endpoints — a .lib is somebody else's file. Shared by the
+    replica-import route and the desktop "open a .lib" flow."""
     import io
     import zipfile
-    raw = f.read(_LIB_MAX_BYTES + 1)
-    if len(raw) > _LIB_MAX_BYTES:
-        return jsonify({"ok": False, "error": "file too large"}), 400
     # Every JSON member is read at its DECLARED decompressed size, which
     # zipfile also truncates to — so rejecting large declarations is a real
     # cap, and a small .lib cannot deflate-bomb the sidecar into an OOM.
     try:
         z = zipfile.ZipFile(io.BytesIO(raw))
         if z.getinfo("book.json").file_size > _LIB_MAX_JSON:
-            return jsonify({"ok": False, "error": "book.json too large"}), 400
+            return {"ok": False, "error": "book.json too large"}, 400
         book = json.loads(z.read("book.json"))
     except (zipfile.BadZipFile, KeyError, ValueError):
-        return jsonify({"ok": False, "error": "not a .lib archive"}), 400
+        return {"ok": False, "error": "not a .lib archive"}, 400
     # lib/1 (the bare "format": "lib/1" marker) and lib/2 (format_version
     # "2.x") both import; lib/1 upgrades on ingest (rids minted, defaults
     # filled). A higher MAJOR breaks — refuse it with a clear message rather
     # than silently dropping everything the newer format added.
     fmt = libformat.parse_format(book)
     if fmt is None:
-        return jsonify({"ok": False, "error": "unsupported .lib format"}), 400
+        return {"ok": False, "error": "unsupported .lib format"}, 400
     if fmt[0] > libformat.SUPPORTED_MAJOR:
-        return jsonify({"ok": False, "error":
-                        f"this .lib needs a newer Library Tool "
-                        f"(format {fmt[0]}.{fmt[1]})"}), 400
+        return {"ok": False, "error":
+                f"this .lib needs a newer Library Tool "
+                f"(format {fmt[0]}.{fmt[1]})"}, 400
 
     # Nothing is dropped silently: every coercion and skip below is named in
     # the receipt's warnings[] with its location and reason (§2.6).
@@ -3374,8 +3366,8 @@ def api_build_replica_import(build_id: str):
         if rec.get("state") == "verified":
             incoming[n]["state"] = "verified"
     if not incoming:
-        return jsonify({"ok": False, "error": "no usable pages",
-                        "warnings": warnings}), 400
+        return {"ok": False, "error": "no usable pages",
+                "warnings": warnings}, 400
 
     # book.json's sections are attacker-shaped: coerce every one before
     # touching disk, so a malformed archive fails clean instead of 500ing
@@ -3479,11 +3471,82 @@ def api_build_replica_import(build_id: str):
     # land after the region commit rather than nesting the two locks
     trans_added = _lib_apply_translations(build_id, trans_in, overwrite)
 
-    return jsonify({"ok": True, "format_version": "%d.%d" % fmt,
-                    "pages_applied": applied, "pages_skipped": skipped,
-                    "templates_added": tpls_added,
-                    "figures_added": figures_added, "stylesheet": sheet,
-                    "translations_added": trans_added, "warnings": warnings})
+    return {"ok": True, "format_version": "%d.%d" % fmt,
+            "pages_applied": applied, "pages_skipped": skipped,
+            "templates_added": tpls_added,
+            "figures_added": figures_added, "stylesheet": sheet,
+            "translations_added": trans_added, "warnings": warnings}, 200
+
+
+@app.route("/api/builds/<build_id>/replica-import", methods=["POST"])
+def api_build_replica_import(build_id: str):
+    """The other half of .lib interchange: unpack an exported archive into
+    this build's working store. Multipart field "lib"; ?src= picks the scan
+    the pages land under, ?overwrite=1 lets imported pages/templates replace
+    existing ones (default: skip, like template apply). The core lives in
+    _lib_import_archive; this route only validates the request shape.
+    The stylesheet imports only when the book has no custom sheet (or with
+    overwrite); figures only when the name is free."""
+    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    if b is None:
+        abort(404)
+    src = _valid_src_key(b, request.args.get("src"))
+    if not src:
+        return jsonify({"ok": False, "error": "unknown source"}), 400
+    overwrite = str(request.args.get("overwrite") or "") in ("1", "true")
+    f = request.files.get("lib")
+    if f is None:
+        return jsonify({"ok": False, "error": "no file"}), 400
+    if request.content_length and request.content_length > _LIB_MAX_BYTES:
+        return jsonify({"ok": False, "error": "file too large"}), 400
+    raw = f.read(_LIB_MAX_BYTES + 1)
+    if len(raw) > _LIB_MAX_BYTES:
+        return jsonify({"ok": False, "error": "file too large"}), 400
+    payload, code = _lib_import_archive(build_id, src, raw, overwrite)
+    return jsonify(payload), code
+
+
+@app.route("/api/lib/open", methods=["POST"])
+def api_lib_open():
+    """Create a new book from a local .lib — the desktop shell's double-click
+    flow. Body {path}: an ABSOLUTE path on this machine (the server is
+    loopback-only and serves a single local user; local paths are already how
+    attached scans arrive). The manifest's meta seeds a fresh build through
+    the normal create path, then the archive imports into it under the
+    primary source. Returns {ok, build_id, receipt}; a refused import removes
+    the just-minted build again rather than stranding an empty shell."""
+    p = request.get_json(silent=True) or {}
+    raw_path = str(p.get("path") or "")
+    fp = Path(raw_path) if raw_path else None
+    if fp is None or not fp.is_absolute():
+        return jsonify({"ok": False, "error": "path must be absolute"}), 400
+    if fp.suffix.lower() not in (".lib", ".zip") or not fp.is_file():
+        return jsonify({"ok": False, "error": "not a .lib file"}), 400
+    try:
+        if fp.stat().st_size > libformat.MAX_BYTES:
+            return jsonify({"ok": False, "error": "file too large"}), 400
+        raw = fp.read_bytes()
+    except OSError as exc:
+        return jsonify({"ok": False,
+                        "error": f"could not read the file: {exc}"}), 400
+    # parse up front for the meta seed; import re-validates through the same
+    # module, so nothing minted here can outrun the format gate below
+    try:
+        doc = libformat.read_lib(raw)
+    except libformat.LibError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    build, err = _create_build(doc.meta)
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    receipt, code = _lib_import_archive(build["id"], "primary", raw,
+                                        overwrite=False)
+    if code != 200:
+        with _builds_lock:
+            builds = lib.load_json(BUILDS_PATH, {})
+            builds.pop(build["id"], None)
+            lib.save_json(BUILDS_PATH, builds)
+        return jsonify(receipt), code
+    return jsonify({"ok": True, "build_id": build["id"], "receipt": receipt})
 
 
 @app.route("/api/lib/validate", methods=["POST"])

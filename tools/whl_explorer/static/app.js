@@ -17360,6 +17360,54 @@ function initDesktopChrome() {
   });
 }
 
+// A .lib the user double-clicked in the OS (desktop shell only): the main
+// process forwards its path once we signal ready; we offer to mint a new book
+// from it, run the import, and land on that book in the Workbench.
+// TODO: an "Import into an existing book…" picker alongside create-new; until
+// then the Replica tab's Import button covers that path.
+function initLibOpen() {
+  const d = window.whlDesktop;
+  if (!d || !d.lib) return;                   // browser / older shell: no flow
+  d.lib.onOpen(async (p) => {
+    if (!p) return;
+    const name = p.split(/[\\/]/).pop();
+    if (!(await confirmDialog({
+      title: "Open book archive",
+      message: `Create a new book from ${name}?`,
+      detail: "Its pages, figures, type styles and translations land in a " +
+              "fresh Workbench entry. To bring pages into a book you already " +
+              "have, use the Replica tab's Import instead.",
+      confirmLabel: "Create book" }))) return;
+    let r;
+    try {
+      r = await (await fetch("/api/lib/open", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: p }),
+      })).json();
+      if (!r.ok) throw new Error(r.error || "open failed");
+    } catch (e) {
+      statusCrit("OPEN .LIB :: " + e.message);
+      return;
+    }
+    const rec = r.receipt || {};
+    // every named drop goes to the Info console; the status line just counts
+    for (const w of rec.warnings || []) {
+      conPut("warn", `lib import: ${w.loc}: ${w.msg}`, "app");
+    }
+    await loadBuilds();
+    document.querySelector('#tabs .tab[data-tab="workbench"]').click();
+    selectBuild(r.build_id);
+    status(`LIB OPEN :: ${(rec.pages_applied || []).length} page(s)` +
+           (rec.figures_added ? ` · ${rec.figures_added} figure(s)` : "") +
+           ((rec.translations_added || []).length
+             ? ` · translations ${rec.translations_added.join(", ")}` : "") +
+           ((rec.warnings || []).length
+             ? ` · ${rec.warnings.length} warning(s) (see the Info tab)` : ""));
+  });
+  d.lib.ready();
+}
+
 // One init step must not be able to take out the ones after it. A missing
 // element used to throw here and silently disable everything downstream -- an
 // old template plus a new app.js killed the OCR page handlers that way, and the
@@ -17386,6 +17434,7 @@ function init() {
   boot("checked books", loadChecked);
   boot("icons", injectIcons);
   boot("confirm dialog", initConfirmDialog);
+  boot("lib open", initLibOpen);   // after the dialog it drives is wired
   boot("overlay modals", initOverlayModals);
   boot("tabs", initTabs);
   boot("jobs", initJobs);

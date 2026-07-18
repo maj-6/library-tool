@@ -411,3 +411,81 @@ def test_python_api_read_write_validate(client, data_root, tmp_path):
         assert False, "expected LibError"
     except libformat.LibError:
         pass
+
+
+# --- POST /api/lib/open: the desktop "double-clicked a .lib" flow ------------
+
+def _fixture_lib(tmp_path, title="Fixture Herbal"):
+    """A small valid lib/2 file on disk, sealed through the Python API."""
+    doc = libformat.LibDocument(
+        format=(2, 0),
+        book={"format_version": "2.0", "source": "primary",
+              "meta": {"title": title, "authors": "A. Author", "year": "1700"},
+              "figures": {"fig.png": {"page": 1}}},
+        pages=[libformat.LibPage(page=1, items=[
+            {"role": "body", "order": 0,
+             "box": {"x": 0.2, "y": 0.1, "w": 0.6, "h": 0.7},
+             "text": "fixture text"}])],
+        assets={"fig.png": b"\x89PNGfix"})
+    p = tmp_path / "fixture.lib"
+    libformat.write_lib(doc, p)
+    return p
+
+
+def test_lib_open_creates_book_and_imports(client, data_root, tmp_path):
+    import libcommon as lib
+    import server
+    p = _fixture_lib(tmp_path)
+    r = client.post("/api/lib/open", json={"path": str(p)}).get_json()
+    assert r["ok"] and r["build_id"]
+    rec = r["receipt"]
+    assert rec["pages_applied"] == [1] and rec["figures_added"] == 1
+    # the manifest's meta seeded the new entry through the normal create path
+    b = lib.load_json(server.BUILDS_PATH, {})[r["build_id"]]
+    assert b["title"] == "Fixture Herbal" and b["year"] == "1700"
+    assert b["status"] == "draft"
+    got = client.get(
+        f"/api/builds/{r['build_id']}/ocr-regions?page=1").get_json()
+    assert got["found"] and got["items"][0]["text"] == "fixture text"
+
+
+def test_lib_open_refuses_bad_paths(client, data_root, tmp_path):
+    # missing / relative / nonexistent / wrong suffix all refuse cleanly
+    assert client.post("/api/lib/open", json={}).status_code == 400
+    assert client.post("/api/lib/open",
+                       json={"path": "relative.lib"}).status_code == 400
+    assert client.post("/api/lib/open",
+                       json={"path": str(tmp_path / "nope.lib")}).status_code == 400
+    txt = tmp_path / "notes.txt"
+    txt.write_text("not an archive", encoding="utf-8")
+    r = client.post("/api/lib/open", json={"path": str(txt)})
+    assert r.status_code == 400 and "not a .lib" in r.get_json()["error"]
+    # right suffix, wrong bytes
+    junk = tmp_path / "junk.lib"
+    junk.write_bytes(b"not a zip")
+    assert client.post("/api/lib/open",
+                       json={"path": str(junk)}).status_code == 400
+
+
+def test_lib_open_respects_size_cap(client, data_root, tmp_path, monkeypatch):
+    p = _fixture_lib(tmp_path)
+    monkeypatch.setattr(libformat, "MAX_BYTES", 16)
+    r = client.post("/api/lib/open", json={"path": str(p)})
+    assert r.status_code == 400 and "large" in r.get_json()["error"]
+
+
+def test_lib_open_failed_import_leaves_no_shell_build(client, data_root,
+                                                      tmp_path):
+    import libcommon as lib
+    import server
+    # a well-formed archive with no usable pages: the import refuses, and the
+    # build minted for it must be rolled back rather than stranded empty
+    buf = tmp_path / "empty.lib"
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("book.json", json.dumps({
+            "format_version": "2.0", "meta": {"title": "Shell"}}))
+    before = set(lib.load_json(server.BUILDS_PATH, {}))
+    r = client.post("/api/lib/open", json={"path": str(buf)})
+    assert r.status_code == 400
+    assert "no usable pages" in r.get_json()["error"]
+    assert set(lib.load_json(server.BUILDS_PATH, {})) == before
