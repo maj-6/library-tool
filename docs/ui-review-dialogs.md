@@ -12,14 +12,21 @@ issue adversarially re-verified against the source (2 candidate findings were
 refuted, 2 downgraded as overstated — those are recorded below, not in the
 issue list).
 
-> **Status (2026-07-17):** the **quick wins** below — items 2, 4, 5, 6, 7, 8, 9,
-> 10 — have been implemented (`aria-label`s, a WCAG-tuned `--ink-mut` token, the
-> status-bar live region, toast-copy normalization, the popup Escape/resize, the
-> tooltip z-index, and the auth backdrop dismiss), live-verified with zero
-> console errors and the confirm-detail contrast raised from ~2.4:1 to 4.77:1.
-> Still open: the **shared-overlay refactor** (items 1 & 3 — modal ARIA + focus
-> trap), and an app-wide repoint of the other `--face-sh2`-as-text spots (the
-> same contrast issue outside the dialog scope).
+> **Status (2026-07-17): every item in this review is now implemented.**
+> - **Quick wins** (items 2, 4, 5, 6, 7, 8, 9, 10) — shipped in `v0.8.0-alpha.5`.
+> - **Shared-overlay refactor** (items 1 & 3) — one `initOverlayModals()` helper
+>   stamps `role="dialog"` + `aria-modal` + `aria-labelledby` on all 14
+>   non-confirm windows and, driven by each overlay's `hidden` attribute, sets
+>   initial focus, traps Tab, restores focus to the opener, and makes the app
+>   chrome `inert`. Verified 15/15 (ARIA on every overlay, Tab never escapes,
+>   focus restore incl. self-focusing dialogs, `inert` on/off) + an adversarial
+>   edge-case pass (2 bugs found and fixed: opener captured too late; the
+>   `aria-live` statusbar was being inert-ed).
+> - **App-wide contrast** — every `--face-sh2`-as-text usage now points at
+>   `--ink-mut` (borders and disabled controls excepted); audited ≥5.2:1 in all
+>   five themes.
+>
+> Both larger pieces are committed on the branch, pending a prerelease build.
 
 ---
 
