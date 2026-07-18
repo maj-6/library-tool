@@ -6437,6 +6437,14 @@ def _remap_page_attention_references(build_id: str, source_id: str,
                         urllib.parse.quote(str(review.get("id") or uuid.uuid4()), safe="")
                     if not str(review.get("label") or "").endswith(" · removed"):
                         review["label"] = str(review.get("label") or "") + " · removed"
+                    # Record WHICH threads this particular delete tombstoned.
+                    # A tombstone is identified only by (build, source, page),
+                    # so without this a restore would resurrect every thread
+                    # ever tombstoned on that page number — undoing the very
+                    # separation the review id above exists to create.
+                    if dropped is not None:
+                        dropped.setdefault("reviews", []).append(
+                            str(review.get("id") or ""))
                 else:
                     new_page = _page_remark_ref_parts(new_ref)[2]
                     label = str(review.get("label") or "")
@@ -6473,6 +6481,7 @@ def _unremap_page_attention_references(build_id: str, source_id: str,
     removed_set = {int(p) for p in removed if int(p) > 0}
     survivors = [p for p in range(1, int(pages_before) + 1)
                  if p not in removed_set]
+    mine = {str(x) for x in ((dropped or {}).get("reviews") or [])}
     warnings: list[str] = []
 
     def original(page: int) -> int | None:
@@ -6490,7 +6499,21 @@ def _unremap_page_attention_references(build_id: str, source_id: str,
             dirty = False
             for name, values in buckets.items():
                 if not isinstance(values, dict):
-                    continue
+                    # the live map can vanish (a client PUT replaces `settings`
+                    # wholesale). Skipping here silently discarded the payload
+                    # and still reported success, so materialize it instead —
+                    # but only when there is something of ours to put back.
+                    if not ((dropped or {}).get(name) or {}):
+                        continue
+                    values = {}
+                    if name == "attention":
+                        client["attention"] = values
+                    elif isinstance(settings, dict):
+                        settings["remarksMeta"] = values
+                    else:
+                        warnings.append(
+                            "personal attention marks could not be put back")
+                        continue
                 moves = []
                 for key, value in list(values.items()):
                     parts = _page_remark_ref_parts(key)
@@ -6503,6 +6526,19 @@ def _unremap_page_attention_references(build_id: str, source_id: str,
                     moves.append((key, f"page:{parts[3]}|{parts[4]}|{was}",
                                   _remapped_page_remark_value(
                                       value, parts[2], was)))
+                # A key ABOVE the post-delete page count has no pre-delete
+                # original, so it is never moved — but it is still a valid
+                # TARGET for another mark shifting back, and writing over it
+                # would delete a mark while reporting success. (Reachable when
+                # a stale client flushes a pre-delete attention map, since the
+                # PUT replaces the whole blob.) Leave both alone and say so.
+                staying = set(values) - {old for old, _, _ in moves}
+                blocked = [m for m in moves if m[1] in staying]
+                if blocked:
+                    moves = [m for m in moves if m[1] not in staying]
+                    warnings.append(
+                        f"{len(blocked)} attention mark(s) kept their current "
+                        "page — something else already sits where they belong")
                 for old_key, _, _ in moves:
                     values.pop(old_key, None)
                 for _, new_key, value in moves:
@@ -6535,9 +6571,17 @@ def _unremap_page_attention_references(build_id: str, source_id: str,
                     tail = ref[len("page-deleted:"):].rsplit("|", 1)[0]
                     cand = "page:" + tail
                     parts = _page_remark_ref_parts(cand)
+                    # Only the threads THIS delete tombstoned. A tombstone is
+                    # otherwise identified just by (build, source, page), so
+                    # deleting page 3 twice and restoring the second row would
+                    # also resurrect the first row's thread — stranding it on
+                    # another page's content and leaving two threads sharing a
+                    # key, where re-flagging the page silently edits whichever
+                    # one dict order happens to yield.
                     if parts and parts[:2] == (str(build_id),
                                                str(source_id or "primary")) \
-                            and parts[2] in removed_set:
+                            and parts[2] in removed_set \
+                            and str(review.get("id") or "") in mine:
                         new_ref = cand
                         label = str(review.get("label") or "")
                         if label.endswith(" · removed"):

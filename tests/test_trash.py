@@ -577,3 +577,77 @@ def test_restore_advances_the_page_revision_token(data_root, client):
     assert r.status_code == 409
     assert r.get_json()["conflict"] == "stale_page_revision"
     assert _page_count(pdf) == 3                      # nothing deleted
+
+
+def test_restore_only_revives_its_own_tombstoned_threads(data_root, client):
+    """A tombstone is identified only by (build, source, page), so restoring
+    one delete used to resurrect every thread ever tombstoned on that page
+    number — stranding an older thread on another page's content and leaving
+    two threads sharing a key, where re-flagging the page silently edits
+    whichever one dict order happens to yield."""
+    bid = "trash020"
+    pdf = _seed(bid, data_root, n_pages=6)
+    server.lib.save_json(server.REVIEWS_PATH, {
+        "r-old": {"id": "r-old", "kind": "key", "ref": _ref(bid, 3),
+                  "label": "Old thread · Page 3"},
+        "r-new": {"id": "r-new", "kind": "key", "ref": _ref(bid, 4),
+                  "label": "New thread · Page 4"},
+    })
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+
+    server._apply_page_deletion(bid, builds, pdf, [3])       # r-old tombstoned
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+    second = server._apply_page_deletion(bid, builds, pdf, [3])  # r-new likewise
+    reviews = server.lib.load_json(server.REVIEWS_PATH, {})
+    assert reviews["r-old"]["ref"].startswith("page-deleted:")
+    assert reviews["r-new"]["ref"].startswith("page-deleted:")
+
+    body = client.post("/api/trash/restore",
+                       json={"id": second["trash_id"]}).get_json()
+    assert body["ok"], body
+    reviews = server.lib.load_json(server.REVIEWS_PATH, {})
+    assert reviews["r-new"]["ref"] == _ref(bid, 3)           # this row's thread
+    assert reviews["r-old"]["ref"].startswith("page-deleted:")  # NOT this one's
+    assert reviews["r-old"]["label"].endswith(" · removed")
+
+
+def test_restore_will_not_overwrite_a_mark_already_in_the_way(data_root, client):
+    """A key above the post-delete page count has no pre-delete original, so it
+    never moves — but it is a valid TARGET for a mark shifting back, and
+    writing over it would delete a mark while reporting success."""
+    bid = "trash021"
+    pdf = _seed(bid, data_root, n_pages=4)
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+    tid = server._apply_page_deletion(bid, builds, pdf, [1])["trash_id"]
+
+    # a stale client flushes a pre-delete map: page 4 exists again in the blob
+    server.lib.save_json(server.lib.CLIENT_STATE_PATH, {"attention": {
+        _ref(bid, 3): {"label": "shifts back to 4"},
+        _ref(bid, 4): {"label": "already sitting at 4"},
+    }})
+
+    body = client.post("/api/trash/restore", json={"id": tid}).get_json()
+    assert body["ok"]
+    att = server.lib.load_json(server.lib.CLIENT_STATE_PATH, {})["attention"]
+    assert att[_ref(bid, 4)]["label"] == "already sitting at 4"   # NOT clobbered
+    assert any("attention mark" in str(s.get("reason") or "")
+               for s in body["skipped"])
+
+
+def test_restore_recreates_a_vanished_attention_map(data_root, client):
+    """The live map can disappear entirely (a client PUT replaces `settings`
+    wholesale). Skipping the bucket silently discarded the payload and still
+    reported success, and the row was then marked restored — so the mark was
+    gone for good."""
+    bid = "trash022"
+    pdf = _seed(bid, data_root)
+    server.lib.save_json(server.lib.CLIENT_STATE_PATH, {"attention": {
+        _ref(bid, 2): {"label": "doomed"}}})
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+    tid = server._apply_page_deletion(bid, builds, pdf, [2])["trash_id"]
+
+    server.lib.save_json(server.lib.CLIENT_STATE_PATH, {})   # map vanishes
+
+    assert client.post("/api/trash/restore", json={"id": tid}).get_json()["ok"]
+    att = server.lib.load_json(server.lib.CLIENT_STATE_PATH, {}).get("attention")
+    assert att and att[_ref(bid, 2)]["label"] == "doomed"
