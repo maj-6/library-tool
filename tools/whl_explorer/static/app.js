@@ -14852,6 +14852,10 @@ async function uploadBuild() {
     cancelLabel: "Not yet",
   }))) return;
   if (state.buildSel !== buildId) return;
+  if (buildIsDirty()) {
+    setPublishGuard(buildId, "Newer edits are not saved yet");
+    return;
+  }
   let res;
   try {
     res = await (await fetch("/api/volumes/publish", {
@@ -14895,12 +14899,13 @@ function pollPublish(buildId = null) {
       return;
     }
     if (st.stage === "done") {
+      const editorWasDirty = buildIsDirty();
       await loadBuilds();
       // Clear only the book this poll belongs to. A publish can take minutes,
       // and the curator may have opened or edited another book meanwhile. A
       // full render would also overwrite that editor from the saved snapshot.
       const publishedId = buildId || st.build || null;
-      if (buildIsDirty()) {
+      if (editorWasDirty || buildIsDirty()) {
         renderBuildsList();
         renderWorkbench();
       } else {

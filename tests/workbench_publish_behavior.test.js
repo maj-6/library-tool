@@ -38,7 +38,11 @@ function elements() {
   };
 }
 
-function uploadHarness(saveBuildFields, isDirty = () => true) {
+function uploadHarness(
+  saveBuildFields,
+  isDirty = () => true,
+  confirmImpl = async () => true,
+) {
   const els = elements();
   const calls = { confirms: 0, fetches: 0, polls: 0 };
   const state = {
@@ -55,7 +59,10 @@ function uploadHarness(saveBuildFields, isDirty = () => true) {
     el: (id) => els[id],
     buildIsDirty: isDirty,
     saveBuildFields,
-    confirmDialog: async () => { calls.confirms += 1; return true; },
+    confirmDialog: async (...args) => {
+      calls.confirms += 1;
+      return confirmImpl(...args);
+    },
     fetch: async () => {
       calls.fetches += 1;
       return { json: async () => ({ ok: true }) };
@@ -120,6 +127,24 @@ test("a completed current save can publish the captured book id", async () => {
   assert.equal(calls.confirms, 1);
   assert.equal(calls.fetches, 1);
   assert.equal(calls.polls, 1);
+});
+
+test("an edit made while confirmation is open blocks the stale publish", async () => {
+  const wait = deferred();
+  let dirty = true;
+  const { api, calls, els } = uploadHarness(async () => {
+    dirty = false;
+    return true;
+  }, () => dirty, () => {
+    dirty = true;
+    return wait.promise;
+  });
+  const publishing = api.uploadBuild();
+  wait.resolve(true);
+  await publishing;
+  assert.equal(els["publish-msg"].textContent, "Newer edits are not saved yet");
+  assert.equal(calls.confirms, 1);
+  assert.equal(calls.fetches, 0);
 });
 
 test("publish guard text belongs only to the selected book", () => {
@@ -236,6 +261,7 @@ test("publish completion preserves a different book's dirty editor", async () =>
   const ocrState = { book: "B" };
   const calls = { upload: 0, list: 0, workbench: 0, home: 0 };
   let callback;
+  let dirty = true;
   const context = vm.createContext({
     state,
     ocrState,
@@ -244,8 +270,13 @@ test("publish completion preserves a different book's dirty editor", async () =>
     fetch: async () => ({ json: async () => ({
       running: false, stage: "done", build: "A", slug: "alpha",
     }) }),
-    loadBuilds: async () => {},
-    buildIsDirty: () => true,
+    loadBuilds: async () => {
+      // Even a failed reload that drops the in-memory record must not erase
+      // the dirty editor that existed before the request.
+      state.builds = {};
+      dirty = false;
+    },
+    buildIsDirty: () => dirty,
     renderUpload: () => { calls.upload += 1; },
     renderBuildsList: () => { calls.list += 1; },
     renderWorkbench: () => { calls.workbench += 1; },
