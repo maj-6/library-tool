@@ -1474,9 +1474,13 @@ async function syncClientStateOnLoad() {
 
 // Every write carries who made it. A signed-in account's display name wins
 // (the server also knows the session and prefers it); the Settings name covers
-// working locally.
+// legacy local mode. The same wrapper watches every API answer for the account
+// gate flipping mid-session — signed out elsewhere, approval revoked, demoted
+// to guest — and routes the app back to the door instead of surfacing dozens
+// of failed fetches.
 function installActorHeader() {
   const raw = window.fetch.bind(window);
+  let roToastAt = 0;
   window.fetch = (input, init) => {
     const method = String((init && init.method) ||
       (input && input.method) || "GET").toUpperCase();
@@ -1486,143 +1490,377 @@ function installActorHeader() {
       init.headers = new Headers(init.headers || (input && input.headers) || {});
       init.headers.set("X-WHL-Actor", who);
     }
-    return raw(input, init);
+    const p = raw(input, init);
+    const url = String((input && input.url) || input || "");
+    if (url.startsWith("/api/") && !url.startsWith("/api/auth/")) {
+      p.then((res) => {
+        if (res.status !== 401 && res.status !== 403) return;
+        res.clone().json().then((j) => {
+          const e = j && j.error;
+          if (e === "signin_required" || e === "approval_pending") {
+            location.reload();   // boots straight into the gate
+          } else if (e === "read_only" && Date.now() - roToastAt > 4000) {
+            roToastAt = Date.now();
+            statusErr("GUEST ACCOUNT :: READ-ONLY — ask a maintainer for contributor access");
+          }
+        }).catch(() => {});
+      }).catch(() => {});
+    }
+    return p;
   };
 }
 
-// --- cloud account -------------------------------------------------------------
+// --- cloud account + the front door ----------------------------------------------
 // A real Supabase user. The server owns the session (tokens never reach the
-// browser); this side only asks who is signed in and shows the door.
+// browser); this side asks who is signed in and holds the door. The workbench
+// is account-first: with no stored session it shows the sign-in gate and boots
+// nothing else; a pending or rejected account waits at the door; approved
+// members go through — and keep working offline, because the gate decision is
+// made from the stored session, never the network.
 
-const authState = { cloud: false, signedIn: false, email: "", displayName: "" };
+const authState = { cloud: false, signedIn: false, email: "", displayName: "",
+                    role: "", status: "", gate: "ok", memberSince: "" };
 
-async function refreshAuthStatus() {
+async function refreshAuthStatus(recheck) {
+  // recheck=true additionally asks the server to re-read the cloud profile
+  // (rate-limited there), so approvals and role changes land without a restart
   try {
-    const r = await (await fetch("/api/auth/status")).json();
+    const r = await (await fetch("/api/auth/status" +
+      (recheck ? "?refresh=1" : ""))).json();
     authState.cloud = !!r.cloud;
     authState.signedIn = !!r.signed_in;
     authState.email = r.email || "";
     authState.displayName = r.display_name || "";
+    authState.role = r.role || "";
+    authState.status = r.status || "";
+    authState.gate = r.gate || (r.signed_in || !r.cloud ? "ok" : "signin");
+    authState.memberSince = r.member_since || "";
   } catch (e) { /* server unreachable; keep whatever we knew */ }
   renderAccountState();
+  return authState;
 }
 
 function renderAccountState() {
-  // the wizard's account step mirrors the same signed-in state
+  // the wizard's account step and the Profile tab mirror the same state
   if (typeof wizAccountState === "function" && !el("wizard-overlay").hidden) wizAccountState();
-  const s = el("set-account-state"), b = el("set-account-btn");
-  if (!s || !b) return;
-  if (authState.signedIn) {
-    s.textContent = `${authState.displayName || authState.email} (${authState.email})`;
-    b.textContent = "Sign out";
-  } else {
-    s.textContent = authState.cloud ? "Not signed in"
-      : "Not signed in — set the Supabase URL and anon key under Sync first";
-    b.textContent = "Sign in…";
-  }
+  renderProfileTab();
 }
 
-function authMsg(text, ok) {
-  const m = el("auth-msg");
+const ROLE_LABELS = { maintainer: "Maintainer", contributor: "Contributor",
+                      guest: "Guest" };
+const ROLE_NOTES = {
+  maintainer: "approves members and assigns roles",
+  contributor: "full workbench access",
+  guest: "read-only: browse and watch activity",
+};
+const roleLabel = (r) => ROLE_LABELS[r] || "Contributor";
+
+// --- the gate itself --------------------------------------------------------------
+// Not dismissible: no close X, no backdrop click, no Escape. Signing in
+// reloads the page so the workbench takes the ordinary full boot path.
+
+let gateSignup = false;
+let gatePollTimer = null;
+
+function gateMsg(text, ok) {
+  const m = el("gate-msg");
   m.textContent = text || "";
   m.hidden = !text;
   m.classList.toggle("ok", !!ok);
 }
 
-function showAuthOverlay() {
-  setAuthMode(false);
-  authMsg("");
-  el("auth-overlay").hidden = false;
-  el("auth-email").focus();
+function setGateMode(signup) {
+  gateSignup = signup;
+  el("gate-title").textContent = signup ? "Request an account" : "Sign in";
+  el("gate-submit").textContent = signup ? "Request an account" : "Sign in";
+  el("gate-mode").textContent = signup ? "I have an account…" : "Request an account…";
+  el("gate-pass").autocomplete = signup ? "new-password" : "current-password";
+  for (const n of document.querySelectorAll(".gate-signup-only")) n.hidden = !signup;
 }
 
-function hideAuthOverlay() {
-  el("auth-overlay").hidden = true;
+function showGate() {
+  const g = authState.gate;
+  const wait = g === "pending" || g === "rejected";
+  el("gate-overlay").hidden = false;
+  el("gate-form").hidden = wait;
+  el("gate-wait").hidden = !wait;
+  clearTimeout(gatePollTimer);
+  gatePollTimer = null;
+  if (!wait) {
+    setGateMode(gateSignup);
+    el("gate-email").focus();
+    return;
+  }
+  const who = authState.displayName || authState.email;
+  el("gate-title").textContent =
+    g === "pending" ? "Awaiting approval" : "Request declined";
+  el("gate-wait-blurb").innerHTML = g === "pending"
+    ? `Signed in as <b>${esc(who)}</b>. A maintainer approves new accounts ` +
+      `before the workbench opens — this screen lets you in the moment that happens.`
+    : `Signed in as <b>${esc(who)}</b>, but this account&rsquo;s request was ` +
+      `declined. If that seems wrong, ask a maintainer.`;
+  if (g === "pending") gatePollTimer = setTimeout(gatePoll, 45000);
+  el("gate-check").focus();
 }
 
-// one dialog, two modes: sign in, or create an account (adds a name field)
-let authSignup = false;
-function setAuthMode(signup) {
-  authSignup = signup;
-  el("auth-title").textContent = signup ? "Create account" : "Sign in";
-  el("auth-submit").textContent = signup ? "Create account" : "Sign in";
-  el("auth-mode").textContent = signup ? "I have an account…" : "Create account…";
-  el("auth-pass").autocomplete = signup ? "new-password" : "current-password";
-  for (const n of document.querySelectorAll(".auth-signup-only")) n.hidden = !signup;
+async function gatePoll() {
+  await refreshAuthStatus(true);
+  if (authState.gate === "ok") { location.reload(); return; }
+  showGate();                    // re-render; pending may have become rejected
 }
 
-async function submitAuth() {
-  const email = el("auth-email").value.trim();
-  const password = el("auth-pass").value;
-  if (!email || !password) { authMsg("email and password are both required"); return; }
-  el("auth-submit").disabled = true;
-  authMsg(authSignup ? "Creating account…" : "Signing in…", true);
+async function gateCheckNow() {
+  el("gate-wait-msg").textContent = "Checking…";
+  await refreshAuthStatus(true);
+  if (authState.gate === "ok") { location.reload(); return; }
+  el("gate-wait-msg").textContent =
+    authState.gate === "pending" ? "Still waiting for a maintainer." : "";
+  showGate();
+}
+
+async function submitGate() {
+  const email = el("gate-email").value.trim();
+  const password = el("gate-pass").value;
+  if (!email || !password) { gateMsg("email and password are both required"); return; }
+  el("gate-submit").disabled = true;
+  gateMsg(gateSignup ? "Requesting an account…" : "Signing in…", true);
   try {
     const body = { email, password };
-    if (authSignup) body.display_name = el("auth-name").value.trim();
-    const r = await fetch(authSignup ? "/api/auth/signup" : "/api/auth/login", {
+    if (gateSignup) body.display_name = el("gate-name").value.trim();
+    const r = await fetch(gateSignup ? "/api/auth/signup" : "/api/auth/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
     const j = await r.json().catch(() => ({}));
-    if (!r.ok || !j.ok) { authMsg(j.error || `sign-in failed (HTTP ${r.status})`); return; }
-    if (j.confirm) {   // account made; the project wants the email link clicked first
-      setAuthMode(false);
-      authMsg("Account created — click the link in your email, then sign in here.", true);
+    if (!r.ok || !j.ok) { gateMsg(j.error || `sign-in failed (HTTP ${r.status})`); return; }
+    if (j.confirm) {   // account made; the email link comes before the queue
+      setGateMode(false);
+      gateMsg("Request sent — click the link in your email, then sign in here. " +
+              "A maintainer approves new accounts before the workbench opens.", true);
       return;
     }
-    hideAuthOverlay();
     await refreshAuthStatus();
-    status(`SIGNED IN :: ${j.display_name || j.email}`);
-    loadActivity();          // the feed switches to the shared cloud view
+    if (authState.gate === "ok") { location.reload(); return; }
+    showGate();        // signed in but pending/rejected: the waiting pane
   } catch (e) {
-    authMsg("could not reach the server");
+    gateMsg("could not reach the server");
   } finally {
-    el("auth-submit").disabled = false;
+    el("gate-submit").disabled = false;
   }
 }
 
-function initAuth() {
-  el("auth-win").addEventListener("submit", (ev) => { ev.preventDefault(); submitAuth(); });
-  el("auth-mode").onclick = () => { setAuthMode(!authSignup); authMsg(""); };
-  el("auth-close").onclick = hideAuthOverlay;
-  // backdrop click dismisses, like every other form modal (same as the close X)
-  el("auth-overlay").addEventListener("mousedown", (ev) => {
-    if (ev.target === el("auth-overlay")) hideAuthOverlay();
-  });
-  el("auth-skip").onclick = () => {
-    state.settings.authPromptDismissed = true;
-    saveSettings();
-    hideAuthOverlay();
+function initGate() {
+  el("gate-win").addEventListener("submit", (ev) => { ev.preventDefault(); submitGate(); });
+  el("gate-mode").onclick = () => { setGateMode(!gateSignup); gateMsg(""); };
+  el("gate-check").onclick = gateCheckNow;
+  el("gate-signout").onclick = async () => {
+    try { await fetch("/api/auth/logout", { method: "POST" }); } catch (e) {}
+    location.reload();
   };
-  // Escape lives in init()'s exclusive overlay chain — a handler here would
-  // also close the Settings window underneath in the same keypress.
-  el("set-account-btn").onclick = async () => {
-    if (authState.signedIn) {
-      try { await fetch("/api/auth/logout", { method: "POST" }); } catch (e) {}
-      await refreshAuthStatus();
-      status("SIGNED OUT");
-      loadActivity();        // back to the local feed
-    } else {
-      showAuthOverlay();
-    }
-  };
-  refreshAuthStatus();
 }
 
-// Ask once at startup, and only when it could work: cloud configured, no
-// session, and the user hasn't said "work locally". Called AFTER the server's
-// client_state has been adopted: before that, authPromptDismissed is a local
-// default, and a "Work locally" click would be dropped by the write-through
-// gate and then overwritten by the sync.
-function maybeAuthPrompt() {
-  refreshAuthStatus().then(() => {
-    if (!el("wizard-overlay").hidden) return;   // the wizard's account step covers it
-    if (authState.cloud && !authState.signedIn && !state.settings.authPromptDismissed) {
-      showAuthOverlay();
-    }
+// --- Settings > Profile ------------------------------------------------------------
+
+const membersState = { me: "", rows: [] };
+
+function profMsg(text, err) {
+  const m = el("prof-msg");
+  if (!m) return;
+  m.textContent = text || "";
+  m.classList.toggle("err", !!err);
+}
+
+function renderProfileTab() {
+  const nameIn = el("prof-name");
+  if (!nameIn) return;
+  if (document.activeElement !== nameIn) nameIn.value = authState.displayName || "";
+  el("prof-email").textContent = authState.email || "—";
+  el("prof-role").textContent = roleLabel(authState.role);
+  el("prof-role").dataset.role = authState.role || "contributor";
+  el("prof-role-note").textContent = ROLE_NOTES[authState.role] || ROLE_NOTES.contributor;
+  el("prof-since").textContent = authState.memberSince
+    ? new Date(authState.memberSince).toLocaleDateString(undefined,
+        { year: "numeric", month: "long", day: "numeric" })
+    : "—";
+  el("prof-members").hidden = authState.role !== "maintainer";
+}
+
+async function saveProfileName() {
+  const name = el("prof-name").value.trim();
+  if (!name) { profMsg("display name cannot be empty", true); return; }
+  try {
+    const r = await fetch("/api/profile/me", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ display_name: name }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) { profMsg(j.error || `rename failed (HTTP ${r.status})`, true); return; }
+    profMsg("Display name saved.");
+    await refreshAuthStatus();
+    renderHome();              // the feed labels your events with the new name
+  } catch (e) {
+    profMsg("could not reach the server", true);
+  }
+}
+
+async function changeProfilePassword() {
+  const cur = el("prof-pass-cur"), nw = el("prof-pass-new");
+  if (!cur.value || !nw.value) {
+    profMsg("enter the current password and the new one", true);
+    return;
+  }
+  el("prof-pass-btn").disabled = true;
+  try {
+    const r = await fetch("/api/profile/password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ current_password: cur.value, new_password: nw.value }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) { profMsg(j.error || `change failed (HTTP ${r.status})`, true); return; }
+    cur.value = nw.value = "";
+    profMsg("Password changed.");
+  } catch (e) {
+    profMsg("could not reach the server", true);
+  } finally {
+    el("prof-pass-btn").disabled = false;
+  }
+}
+
+async function signOutFromProfile() {
+  if (!(await confirmDialog({
+    title: "Sign out",
+    message: "Sign out of this computer?",
+    detail: "The workbench stays locked until someone signs in again, and " +
+            "signing in needs a connection.",
+    confirmLabel: "Sign out",
+    danger: true,
+  }))) return;
+  try { await fetch("/api/auth/logout", { method: "POST" }); } catch (e) {}
+  location.reload();           // straight to the gate
+}
+
+// --- Members (maintainers): approvals + role assignment ----------------------------
+
+async function loadMembers() {
+  const box = el("members-list");
+  if (!box || authState.role !== "maintainer") return;
+  let j;
+  try {
+    const r = await fetch("/api/members");
+    j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || `HTTP ${r.status}`);
+  } catch (e) {
+    box.innerHTML = `<span class="tool-label">${esc(e.message || "could not load members")}</span>`;
+    return;
+  }
+  membersState.me = j.me || "";
+  membersState.rows = j.members || [];
+  renderMembers();
+}
+
+function renderMembers() {
+  const box = el("members-list");
+  const rows = membersState.rows;
+  if (!rows.length) {
+    box.innerHTML = `<div class="empty">No members yet</div>`;
+    return;
+  }
+  box.innerHTML = rows.map((m) => {
+    const self = m.id === membersState.me;
+    // a pending signup defaults to guest in the database; approving them as a
+    // contributor is the common case, so preselect that
+    const selRole = m.status === "pending" && m.role === "guest" ? "contributor" : m.role;
+    const sel = `<select class="cad-input mem-role" data-mid="${esc(m.id)}"` +
+      (self ? ` disabled data-tip="Ask another maintainer to change your role"` : "") + `>` +
+      ["maintainer", "contributor", "guest"].map((r) =>
+        `<option value="${r}"${r === selRole ? " selected" : ""}>${roleLabel(r)}</option>`).join("") +
+      `</select>`;
+    const acts = m.status === "pending"
+      ? `<button class="cad-btn mem-act" data-mid="${esc(m.id)}" data-act="approved" type="button">Approve</button>` +
+        `<button class="cad-btn quiet mem-act" data-mid="${esc(m.id)}" data-act="rejected" type="button">Decline</button>`
+      : m.status === "rejected"
+        ? `<button class="cad-btn mem-act" data-mid="${esc(m.id)}" data-act="approved" type="button">Approve</button>`
+        : self ? "" :
+          `<button class="cad-btn quiet mem-act" data-mid="${esc(m.id)}" data-act="pending" type="button"` +
+          ` data-tip="Back to pending: they lose access until re-approved">Suspend</button>`;
+    return `<div class="member-row${m.status === "pending" ? " pending" : ""}">` +
+      `<span class="mem-name">${esc(m.display_name || "—")}` +
+      (self ? ` <span class="hu-you">you</span>` : "") + `</span>` +
+      `<span class="mem-email">${esc(m.email || "")}</span>` +
+      sel +
+      `<span class="mem-status" data-status="${esc(m.status || "")}">${esc(m.status || "")}</span>` +
+      `<span class="mem-acts">${acts}</span>` +
+      `</div>`;
+  }).join("");
+}
+
+function _memberLabel(id) {
+  const m = membersState.rows.find((x) => x.id === id);
+  return m ? (m.display_name || m.email || "") : "";
+}
+
+async function _memberCall(id, path, body) {
+  const r = await fetch(`/api/members/${encodeURIComponent(id)}/${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...body, label: _memberLabel(id) }),
   });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.ok) throw new Error(j.error || `HTTP ${r.status}`);
+}
+
+function initProfileTab() {
+  if (!el("prof-name")) return;
+  el("prof-name-save").onclick = saveProfileName;
+  el("prof-name").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); saveProfileName(); }
+  });
+  el("prof-pass-btn").onclick = changeProfilePassword;
+  el("prof-signout").onclick = signOutFromProfile;
+  el("members-list").addEventListener("click", async (ev) => {
+    const b = ev.target.closest(".mem-act");
+    if (!b) return;
+    const id = b.dataset.mid, act = b.dataset.act;
+    b.disabled = true;
+    try {
+      await _memberCall(id, "status", { status: act });
+      if (act === "approved") {
+        // approval applies the role shown in the row's selector
+        const sel = el("members-list").querySelector(`.mem-role[data-mid="${CSS.escape(id)}"]`);
+        const m = membersState.rows.find((x) => x.id === id);
+        if (sel && m && sel.value !== m.role) {
+          await _memberCall(id, "role", { role: sel.value });
+        }
+      }
+      status(`MEMBERS :: ${act.toUpperCase()} :: ${_memberLabel(id)}`);
+    } catch (e) {
+      statusErr(`MEMBERS :: ${e.message || e}`);
+    }
+    loadMembers();
+  });
+  el("members-list").addEventListener("change", async (ev) => {
+    const sel = ev.target.closest(".mem-role");
+    if (!sel) return;
+    const id = sel.dataset.mid;
+    const m = membersState.rows.find((x) => x.id === id);
+    if (m && m.status === "pending") return;   // applied on Approve instead
+    sel.disabled = true;
+    try {
+      await _memberCall(id, "role", { role: sel.value });
+      status(`MEMBERS :: ${_memberLabel(id)} → ${roleLabel(sel.value).toUpperCase()}`);
+    } catch (e) {
+      statusErr(`MEMBERS :: ${e.message || e}`);
+    }
+    loadMembers();
+  });
+}
+
+function initAuth() {
+  initGate();
+  initProfileTab();
 }
 
 // --- first-run setup wizard ------------------------------------------------------
@@ -1636,7 +1874,7 @@ function maybeAuthPrompt() {
 // key is an owner concern and stays out of this normal-user flow.
 const WIZ_STEPS = [
   ["welcome", "Welcome"],
-  ["account", "Profile"],
+  ["account", "Account"],
   ["services", "Text tools"],
   ["db", "Offline search"],
   ["done", "Ready"],
@@ -1668,12 +1906,7 @@ function closeWizard(markDone) {
 // Credentials use /api/secrets; saveSettings intentionally strips them.
 async function wizCommit() {
   const step = WIZ_STEPS[wizStep][0];
-  if (step === "account") {
-    state.settings.userName = el("wiz-name").value.trim().slice(0, 60);
-    const un = el("set-user-name");
-    if (un) un.value = state.settings.userName;
-    saveSettings();
-  } else if (step === "services") {
+  if (step === "services") {
     const fields = [["wiz-mistral", "mistralKey"], ["wiz-deepseek", "aiKey"]];
     const updates = {};
     for (const [id, key] of fields) {
@@ -1713,7 +1946,6 @@ function wizRender() {
   clearTimeout(wizDbTimer);
   wizDbTimer = null;
   if (step === "account") {
-    el("wiz-name").value = state.settings.userName || "";
     wizAccountState();
   } else if (step === "services") {
     const fields = [["wiz-mistral", "mistralKey"], ["wiz-deepseek", "aiKey"]];
@@ -1739,16 +1971,16 @@ function wizRender() {
 }
 
 function wizAccountState() {
-  const s = el("wiz-account-state"), b = el("wiz-signin");
-  if (authState.signedIn) {
-    s.textContent = `${authState.displayName || authState.email}`;
-    b.textContent = "Signed in";
-    b.disabled = true;
-  } else {
-    s.textContent = "Not signed in";
-    b.textContent = "Sign in…";
-    b.disabled = false;
-  }
+  // the gate guarantees a signed-in member by the time the wizard can show;
+  // this pane just confirms who that is
+  const s = el("wiz-account-state"), r = el("wiz-account-role");
+  if (!s) return;
+  s.textContent = authState.signedIn
+    ? `${authState.displayName || authState.email} (${authState.email})`
+    : "Not signed in";
+  if (r) r.textContent = authState.signedIn
+    ? `${roleLabel(authState.role)} — ${ROLE_NOTES[authState.role] || ROLE_NOTES.contributor}`
+    : "";
 }
 
 async function wizCheckTesseract() {
@@ -1832,7 +2064,6 @@ function initWizard() {
     }
   };
   el("wizard-skip").onclick = async () => { await wizCommit(); closeWizard(true); };
-  el("wiz-signin").onclick = () => showAuthOverlay();   // z 62, above the wizard
   for (const id of ["wiz-mistral", "wiz-deepseek"])
     el(id).addEventListener("input", () => { el(id).dataset.edited = "1"; });
   el("wiz-db-list").addEventListener("click", async (ev) => {
@@ -2028,7 +2259,7 @@ function renderHome() {
 
   // everyone the feed has seen, newest first; your own name is always present
   if (users) {
-    const me = (state.settings.userName || "").trim();
+    const me = (authState.displayName || state.settings.userName || "").trim();
     const seen = new Map();
     for (const e of homeState.events) {
       const who = String(e.actor || "").trim() || "Unnamed user";
@@ -2795,13 +3026,11 @@ function renderSettings() {
     if (activeBottomTable() === "history") renderBottomRows();
     status("HISTORY CLEARED");
   };
-  const un = el("set-user-name");
-  un.value = state.settings.userName || "";
-  un.onchange = () => {
-    state.settings.userName = un.value.trim().slice(0, 60);
-    saveSettings();
-    renderHome();          // the feed labels your own past events too
-  };
+  // PROFILE — identity comes from the account, refreshed on open so a role
+  // change made elsewhere shows without a restart; the member list rides along
+  renderProfileTab();
+  refreshAuthStatus(true).then(() => { renderProfileTab(); loadMembers(); });
+  profMsg("");
   const ocr = el("set-whl-ocr");
   ocr.checked = !!state.settings.whlModalOcr;
   ocr.onchange = () => {
@@ -15882,28 +16111,56 @@ function boot(name, fn) {
   }
 }
 
-function init() {
+async function init() {
   initConsole();          // first: it is where every later failure is reported
+  // Chrome-level pieces boot unconditionally — they are what render the door.
   boot("desktop chrome", initDesktopChrome);
-  boot("web view", initWebView);
   boot("settings", loadSettings);
   boot("theme", applyTheme);
   boot("ui scale", applyUiScale);
   boot("font", applyFont);
   boot("exp sharpen", applyExpSharpen);
-  boot("checked books", loadChecked);
   boot("icons", injectIcons);
-  boot("confirm dialog", initConfirmDialog);
   boot("overlay modals", initOverlayModals);
+  boot("tooltips", initTooltips);
+  boot("account", initAuth);
+
+  // The front door: the workbench is account-first, so who is signed in
+  // decides whether anything else boots. The answer comes from the stored
+  // session (instant, offline-safe); a signed-in member starts immediately
+  // and the cloud re-check below lands approvals/role changes moments later.
+  await refreshAuthStatus();
+  if (authState.gate !== "ok") {
+    document.body.classList.add("gated");
+    boot("title bar", fitTitleBar);
+    showGate();
+    if (authState.gate === "pending" || authState.gate === "rejected") {
+      // an approval may already be waiting in the cloud — check right away
+      refreshAuthStatus(true).then(() => {
+        if (authState.gate === "ok") location.reload();
+        else showGate();
+      });
+    }
+    return;   // nothing else loads; signing in reloads into a full boot
+  }
+  refreshAuthStatus(true);   // background; never delays the boot
+  initApp();
+}
+
+// The full workbench boot — everything below runs only for an approved,
+// signed-in member. (NOT named initWorkbench: that is the Workbench TAB's
+// initializer further up, which boots here like every other tab.)
+function initApp() {
+  boot("web view", initWebView);
+  boot("checked books", loadChecked);
+  boot("confirm dialog", initConfirmDialog);
   boot("tabs", initTabs);
   boot("jobs", initJobs);
   boot("smart check", initSmartCheck);
-  boot("tooltips", initTooltips);
   boot("pane tabs", initPaneTabs);
   boot("actor header", installActorHeader);   // before any write goes out
   boot("menu bar", initMenubar);
   boot("home", initHome);
-  boot("account", initAuth);
   boot("setup wizard", initWizard);
   boot("title bar", fitTitleBar);   // after the menus exist: their width sets the clamp
   boot("settings nav", initSettingsNav);
@@ -16547,8 +16804,8 @@ function init() {
   });
   document.addEventListener("keydown", (ev) => {
     if (ev.key !== "Escape") return;
-    if (!el("auth-overlay").hidden) hideAuthOverlay();   // topmost (z 62)
-    else if (!el("wizard-overlay").hidden) {
+    // the account gate is deliberately absent here: it is not dismissible
+    if (!el("wizard-overlay").hidden) {
       // Esc = set up later. Keep anything typed before recording completion.
       wizCommit().finally(() => closeWizard(true));
     }
@@ -16591,8 +16848,7 @@ function init() {
   syncClientStateOnLoad().then((adopted) => {
     hydrateSecrets();      // warm credentials without delaying the initial UI
     if (adopted) { applyTheme(); applyFont(); applyExpSharpen(); }
-    maybeWizard();       // first desktop launch: the guide covers sign-in too
-    maybeAuthPrompt();   // needs the adopted settings: authPromptDismissed
+    maybeWizard();       // first desktop launch (the gate has already run)
     loadDownloads();
     // Home's pending tasks are derived from these, so it re-renders once the
     // data it counts has actually arrived

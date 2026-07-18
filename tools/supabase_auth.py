@@ -49,13 +49,14 @@ def _cfg(cfg: dict) -> tuple[str, dict]:
     return url, {"apikey": key, "Content-Type": "application/json"}
 
 
-def _post(cfg: dict, path: str, payload: dict, bearer: str = "") -> dict:
+def _post(cfg: dict, path: str, payload: dict, bearer: str = "",
+          method: str = "POST") -> dict:
     url, headers = _cfg(cfg)
     if bearer:
         headers["Authorization"] = f"Bearer {bearer}"
     req = urllib.request.Request(f"{url}/auth/v1/{path}",
                                  data=json.dumps(payload).encode("utf-8"),
-                                 headers=headers, method="POST")
+                                 headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
             raw = resp.read()
@@ -141,6 +142,13 @@ def refresh(cfg: dict, refresh_token: str) -> dict:
     if not body.get("access_token"):
         raise AuthError("refresh returned no session")
     return _session(body)
+
+
+def update_user(cfg: dict, access_token: str, changes: dict) -> dict:
+    """PUT /auth/v1/user as the signed-in user — password changes and the
+    like. GoTrue trusts the bearer token; callers wanting a current-password
+    check do their own sign_in() first."""
+    return _post(cfg, "user", changes, bearer=access_token, method="PUT")
 
 
 def sign_out(cfg: dict, access_token: str) -> None:

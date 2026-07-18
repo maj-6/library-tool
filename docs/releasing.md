@@ -122,6 +122,12 @@ same platform/version/channel replaces the row, so corrections are safe.
 
 - The installer is unsigned (no code-signing cert), so SmartScreen will warn
   on first run.
+- Member roles + signup approval (the account gate) need
+  `docs/cloud/migrations/005_member_roles_approval.sql` run on the live
+  Supabase project (`python3 tools/cloud_setup.py check` names it while
+  pending). Until it runs, the desktop still gates on sign-in, but every
+  account behaves as an approved contributor and the Members panel errors —
+  release builds are safe to ship either way.
 - The 40 MB `copyright_renewals.csv` is deliberately absent from the public
   mirror; the sidecar spec skips missing data files, so the CI build simply
   ships without that dataset — the in-app setup guide offers it (and the other

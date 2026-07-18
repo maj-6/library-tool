@@ -197,7 +197,8 @@ def test_expected_schema_reads_the_real_migrations():
             "category_paths", "volume", "group_id",
             "uploaded_by"} <= sch["volumes"]
     assert sch["schema_migrations"] == {"id", "applied_at"}
-    assert sch["profiles"] == {"id", "display_name", "created_at"}
+    assert sch["profiles"] == {"id", "display_name", "created_at",
+                               "role", "status"}
     assert {"created_by", "contributor", "ocr", "meta"} <= sch["captures"]
     assert "author_index" not in sch                 # views are not tables
     ident = re.compile(r"[a-z_][a-z0-9_]*")

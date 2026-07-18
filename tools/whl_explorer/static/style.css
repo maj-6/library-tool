@@ -1757,8 +1757,12 @@ td .sc-wand { float: right; }
   .wiz-service-local { grid-column: auto; }
 }
 
-/* sign-in window (cloud account) */
-#auth-overlay { z-index: 62; }
+/* the account gate (sign in / awaiting approval) — not dismissible, and the
+   scrim is near-opaque: the shell behind is shut, not merely dimmed */
+#gate-overlay {
+  z-index: 62;
+  background: color-mix(in srgb, var(--canvas) 90%, black);
+}
 .auth-win { width: min(430px, 92vw); }
 .auth-body {
   display: flex;
@@ -1768,18 +1772,73 @@ td .sc-wand { float: right; }
 }
 .auth-body .settings-note { margin: 0; }
 .auth-body .dlg-actions { margin-top: 2px; }
-.auth-spacer { flex: 1 1 auto; }
-#auth-msg {
+#gate-form, #gate-wait { display: flex; flex-direction: column; gap: 8px; }
+#gate-form[hidden], #gate-wait[hidden] { display: none; }
+#gate-msg {
   padding: 2px 6px;
   border-radius: var(--radius);
   font-size: 12px;
   color: var(--ink);
   background: color-mix(in srgb, var(--amber) 34%, transparent);
 }
-#auth-msg.ok { background: color-mix(in srgb, var(--green) 26%, transparent); }
-/* the account row in Settings > General */
-.set-account { display: flex; align-items: center; gap: 10px; }
-#set-account-state { font-style: normal; }
+#gate-msg.ok { background: color-mix(in srgb, var(--green) 26%, transparent); }
+#gate-wait-msg:empty { display: none; }
+
+/* Settings > Profile */
+.prof-inline { display: flex; align-items: center; gap: 8px; }
+.prof-inline .cad-input { flex: 1 1 auto; min-width: 0; max-width: 280px; }
+.prof-value { display: flex; align-items: center; gap: 8px; font-style: normal; }
+.role-badge {
+  font-size: 10px;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  padding: 1px 6px;
+  border: 1px solid var(--face-sh2);
+  border-radius: var(--radius);
+  color: var(--ink);
+}
+.role-badge[data-role="maintainer"] { border-color: color-mix(in srgb, var(--cyan) 55%, var(--face-sh2)); }
+.role-badge[data-role="guest"] { opacity: 0.75; }
+.prof-msg:empty { display: none; }
+.prof-msg.err { color: var(--red); }
+
+/* Settings > Profile > Members (maintainers) */
+.members-list { display: flex; flex-direction: column; }
+.member-row {
+  display: grid;
+  grid-template-columns: minmax(90px, 1fr) minmax(120px, 1.2fr) auto auto minmax(64px, auto);
+  gap: 4px 10px;
+  align-items: center;
+  padding: 4px 6px;
+  border-bottom: 1px solid color-mix(in srgb, var(--face-sh) 70%, transparent);
+  font-size: 12px;
+}
+.member-row:last-child { border-bottom: 0; }
+.member-row.pending {
+  background: color-mix(in srgb, var(--amber) 10%, transparent);
+}
+.mem-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mem-email {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.85;
+}
+.mem-role { max-width: 130px; }
+.mem-status {
+  font-size: 10px;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  opacity: 0.85;
+}
+.mem-status[data-status="pending"] {
+  /* raw --amber sits under 4.5:1 on --face; pull it toward ink for AA */
+  color: color-mix(in srgb, var(--amber) 55%, var(--ink));
+  opacity: 1;
+}
+.mem-status[data-status="rejected"] { color: var(--red); opacity: 1; }
+.mem-acts { display: flex; gap: 6px; justify-content: flex-end; }
 #msrc-body { padding: var(--dlg-pad-y) var(--dlg-pad-x) var(--dlg-pad-x); }
 #msrc-body .cad-input { width: 100%; }
 #msrc-msg { color: var(--red); font-weight: bold; }

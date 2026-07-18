@@ -1403,7 +1403,8 @@
       </div>
       <div id="settings-body">
         <div id="settings-nav">
-          <button class="snav active" data-sec="sec-general" type="button">General</button>
+          <button class="snav active" data-sec="sec-profile" type="button">Profile</button>
+          <button class="snav" data-sec="sec-general" type="button">General</button>
           <button class="snav" data-sec="sec-appearance" type="button">Appearance</button>
           <button class="snav" data-sec="sec-tables" type="button">Table view</button>
           <button class="snav" data-sec="sec-library" type="button">Library &amp; data</button>
@@ -1418,19 +1419,56 @@
           <button class="snav" data-sec="sec-experimental" type="button">Experimental</button>
         </div>
         <div id="settings-content">
-          <div id="sec-general" class="settings-sec active">
+          <div id="sec-profile" class="settings-sec active">
+            <div class="settings-head">Profile</div>
+            <p class="settings-note">Your account identifies everything you do here —
+               activity, captures, and published work are recorded under it and
+               shared with the other members.</p>
+            <div class="settings-rows">
+              <label class="tool-label" for="prof-name">Display name</label>
+              <span class="prof-inline">
+                <input id="prof-name" class="cad-input" spellcheck="false" maxlength="60"
+                       data-tip="Shown to every member in the activity feed" />
+                <button id="prof-name-save" class="cad-btn" type="button">Save</button>
+              </span>
+              <label class="tool-label">Email</label>
+              <span id="prof-email" class="tool-label prof-value"></span>
+              <label class="tool-label">Role</label>
+              <span class="prof-value">
+                <span id="prof-role" class="role-badge"></span>
+                <span id="prof-role-note" class="tool-label"></span>
+              </span>
+              <label class="tool-label">Member since</label>
+              <span id="prof-since" class="tool-label prof-value"></span>
+            </div>
+            <div class="settings-subhead" style="margin-top:16px">Password</div>
+            <div class="settings-rows">
+              <label class="tool-label" for="prof-pass-cur">Current password</label>
+              <input id="prof-pass-cur" class="cad-input" type="password"
+                     autocomplete="current-password" />
+              <label class="tool-label" for="prof-pass-new">New password</label>
+              <input id="prof-pass-new" class="cad-input" type="password"
+                     autocomplete="new-password" />
+            </div>
+            <p class="tool-label prof-msg" id="prof-msg" aria-live="polite"></p>
+            <div class="mf-actions">
+              <button id="prof-pass-btn" class="cad-btn" type="button">Change password</button>
+              <button id="prof-signout" class="cad-btn danger" type="button"
+                      data-tip="The workbench stays locked until someone signs in again, and signing in needs a connection">Sign out</button>
+            </div>
+            <div id="prof-members" hidden>
+              <div class="settings-subhead" style="margin-top:18px">Members</div>
+              <p class="settings-note">New signups wait here until a maintainer approves
+                 them. Contributors get the full workbench; guests are read-only.</p>
+              <div id="members-list" class="members-list">
+                <span class="tool-label">Loading&hellip;</span>
+              </div>
+            </div>
+          </div>
+          <div id="sec-general" class="settings-sec">
             <div class="settings-head">General</div>
             <p class="settings-note" id="gen-info"></p>
             <div class="settings-rows">
-              <label class="tool-label" for="set-user-name">Your name</label>
-              <input id="set-user-name" class="cad-input" spellcheck="false"
-                     placeholder="Andrew Miller"
-                     data-tip="Attributed to your changes when you are not signed in; a signed-in account's display name takes precedence" />
-              <label class="tool-label">Cloud account</label>
-              <span class="set-account">
-                <span id="set-account-state" class="tool-label">Not signed in</span>
-                <button id="set-account-btn" class="cad-btn" type="button">Sign in&hellip;</button>
-              </span>
               <label class="tool-label" for="set-whl-ocr">OCR panel in the WHL PDF viewer</label>
               <input id="set-whl-ocr" type="checkbox" />
               <label class="tool-label" for="set-preview-pages">PDF preview page limit</label>
@@ -1929,22 +1967,18 @@
         </div>
 
         <div class="wiz-pane" data-step="account" hidden>
-          <p class="wiz-lead">Choose how your work is identified.</p>
-          <p class="settings-note">A display name labels your local activity. Sign in to use
-             phone capture and share contributor activity. Local cataloging does not require
-             an account.</p>
+          <p class="wiz-lead">You&rsquo;re signed in.</p>
+          <p class="settings-note">Library Tool is a shared workbench: cataloguing,
+             captures, and publishing are recorded under your account and visible to
+             the other members.</p>
           <div class="settings-rows">
-            <label class="tool-label" for="wiz-name">Display name <span class="wiz-opt">(optional)</span></label>
-            <input id="wiz-name" class="cad-input" spellcheck="false"
-                   placeholder="Name shown in activity" />
-            <label class="tool-label">Library Tool account</label>
-            <span class="set-account">
-              <span id="wiz-account-state" class="tool-label">Not signed in</span>
-              <button id="wiz-signin" class="cad-btn" type="button">Sign in&hellip;</button>
-            </span>
+            <label class="tool-label">Account</label>
+            <span id="wiz-account-state" class="tool-label"></span>
+            <label class="tool-label">Role</label>
+            <span id="wiz-account-role" class="tool-label"></span>
           </div>
-          <p class="settings-note wiz-footnote">To work locally, leave this as it is and
-             choose <b>Next</b>. You can sign in later from Settings.</p>
+          <p class="settings-note wiz-footnote">Change your display name or password any
+             time in <b>Settings &gt; Profile</b>.</p>
         </div>
 
         <div class="wiz-pane" data-step="services" hidden>
@@ -2009,34 +2043,44 @@
     </div>
   </div>
 
-  <!-- SIGN IN (Library Tool cloud account; shown at startup, or from Settings) -->
-  <div id="auth-overlay" class="overlay" hidden>
-    <form id="auth-win" class="win auth-win">
+  <!-- ACCOUNT GATE (the workbench is account-first: sign in, or wait for a
+       maintainer's approval; not dismissible — the shell behind it stays shut) -->
+  <div id="gate-overlay" class="overlay gate-overlay" hidden>
+    <form id="gate-win" class="win auth-win">
       <div class="win-titlebar">
-        <span id="auth-title">Sign in</span>
-        <button id="auth-close" class="win-close" type="button" aria-label="Close" data-icon="close"></button>
+        <span id="gate-title">Sign in</span>
       </div>
       <div class="auth-body">
-        <p class="settings-note" id="auth-blurb">Contributions are recorded under your
-          account. Everything else works without one.</p>
-        <div class="settings-rows">
-          <label class="tool-label" for="auth-email">Email</label>
-          <input id="auth-email" class="cad-input" type="email" spellcheck="false"
-                 autocomplete="username" />
-          <label class="tool-label" for="auth-pass">Password</label>
-          <input id="auth-pass" class="cad-input" type="password"
-                 autocomplete="current-password" />
-          <label class="tool-label auth-signup-only" for="auth-name" hidden>Display name</label>
-          <input id="auth-name" class="cad-input auth-signup-only" spellcheck="false"
-                 placeholder="shown in the activity feed" hidden />
+        <div id="gate-form">
+          <p class="settings-note" id="gate-blurb">Library Tool is a shared cataloguing
+            workbench: everything here is done by a member, so sign in comes first.
+            Once signed in, this computer keeps working offline.</p>
+          <div class="settings-rows">
+            <label class="tool-label" for="gate-email">Email</label>
+            <input id="gate-email" class="cad-input" type="email" spellcheck="false"
+                   autocomplete="username" />
+            <label class="tool-label" for="gate-pass">Password</label>
+            <input id="gate-pass" class="cad-input" type="password"
+                   autocomplete="current-password" />
+            <label class="tool-label gate-signup-only" for="gate-name" hidden>Display name</label>
+            <input id="gate-name" class="cad-input gate-signup-only" spellcheck="false"
+                   placeholder="shown to other members" hidden />
+          </div>
+          <div id="gate-msg" hidden></div>
+          <div class="dlg-actions">
+            <button id="gate-mode" class="cad-btn quiet" type="button">Request an account&hellip;</button>
+            <span class="dlg-spacer"></span>
+            <button id="gate-submit" class="cad-btn primary" type="submit">Sign in</button>
+          </div>
         </div>
-        <div id="auth-msg" hidden></div>
-        <div class="dlg-actions">
-          <button id="auth-mode" class="cad-btn quiet" type="button">Create account&hellip;</button>
-          <span class="dlg-spacer"></span>
-          <button id="auth-skip" class="cad-btn quiet" type="button"
-                  data-tip="Use the app without an account; won't ask again at startup">Work locally</button>
-          <button id="auth-submit" class="cad-btn primary" type="submit">Sign in</button>
+        <div id="gate-wait" hidden>
+          <p class="settings-note" id="gate-wait-blurb"></p>
+          <p class="tool-label" id="gate-wait-msg" aria-live="polite"></p>
+          <div class="dlg-actions">
+            <button id="gate-signout" class="cad-btn quiet" type="button">Sign out</button>
+            <span class="dlg-spacer"></span>
+            <button id="gate-check" class="cad-btn primary" type="button">Check again</button>
+          </div>
         </div>
       </div>
     </form>

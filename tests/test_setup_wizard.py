@@ -9,7 +9,7 @@ APP = (ROOT / "tools" / "whl_explorer" / "static" / "app.js").read_text(
 TEMPLATE = (ROOT / "tools" / "whl_explorer" / "templates" / "index.html").read_text(
     encoding="utf-8")
 WIZARD = TEMPLATE.split("<!-- FIRST-RUN SETUP WIZARD", 1)[1].split(
-    "<!-- SIGN IN", 1)[0]
+    "<!-- ACCOUNT GATE", 1)[0]
 
 
 def _function(name: str, next_name: str) -> str:
@@ -55,7 +55,12 @@ def test_setup_guide_preserves_skip_local_and_durable_completion_paths():
     init = _function("initWizard", "maybeWizard")
     assert 'el("wizard-skip").onclick' in init
     assert "closeWizard(true)" in init
-    assert 'el("wiz-signin").onclick' in init
+
+    # the wizard no longer offers its own sign-in: the account gate guarantees
+    # a signed-in member before the wizard can show, and the account pane just
+    # reflects who that is
+    assert 'id="wiz-account-state"' in WIZARD
+    assert "wiz-signin" not in WIZARD
 
     maybe = _function("maybeWizard", "loadActivity")
     assert "d && d.isDesktop && !state.settings.wizardDone" in maybe

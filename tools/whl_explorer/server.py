@@ -319,10 +319,27 @@ def api_activity():
 # the authenticated user, so row-level security applies and no policy has to
 # trust a plain-text name. The Mistral key is the one account-level credential:
 # it syncs through the private profile_secrets row shared with Book Capture.
+#
+# The workbench is account-first: it is a shared tool, and every action must
+# belong to a member. Each profile carries a role and an approval status
+# (docs/cloud/migrations/005_member_roles_approval.sql):
+#
+#   maintainer   approves signups, assigns roles, full workbench
+#   contributor  full workbench (granted on approval)
+#   guest        read-only — may browse and watch, never write
+#
+# A new signup is a PENDING request until a maintainer approves it. The gate
+# below (_require_member) enforces all of this at the API boundary; the cloud
+# policies enforce it again server-side, so a patched client gains nothing.
+# Offline still works — for members: the stored session is the identity, and
+# no gate decision ever needs the network. No stored session, no workbench.
 
 AUTH_SESSION_PATH = lib.DATA_ROOT / "output" / "auth_session.json"
 _auth_lock = threading.RLock()
 _push_wake = threading.Event()
+
+MEMBER_ROLES = ("maintainer", "contributor", "guest")
+MEMBER_STATUSES = ("pending", "approved", "rejected")
 
 
 def _auth_doc() -> dict:
@@ -396,24 +413,184 @@ def _auth_session() -> dict | None:
         return fresh
 
 
-def _adopt_profile(cfg: dict, ses: dict) -> dict:
-    """The profiles row is the shared display name. Prefer it; seed it from
-    signup metadata or the email when it does not exist yet."""
-    name = ses.get("display_name") or ""
+def _fetch_member_profile(cfg: dict, ses: dict) -> dict | None:
+    """The signed-in user's profiles row, membership columns included. A cloud
+    that predates migration 005 rejects the role/status select with a 400 —
+    fall back to the old shape rather than failing the sign-in."""
+    base = f"profiles?id=eq.{ses['user_id']}&select="
     try:
         rows = sauth.rest(cfg, ses["access_token"], "GET",
-                          f"profiles?id=eq.{ses['user_id']}&select=display_name") or []
-        if rows and str(rows[0].get("display_name") or "").strip():
-            name = str(rows[0]["display_name"]).strip()
-        else:
+                          base + "display_name,role,status,created_at",
+                          timeout=8.0) or []
+    except sauth.AuthError as exc:
+        if exc.status != 400:
+            raise
+        rows = sauth.rest(cfg, ses["access_token"], "GET",
+                          base + "display_name,created_at", timeout=8.0) or []
+    return rows[0] if rows else None
+
+
+def _adopt_profile(cfg: dict, ses: dict) -> dict:
+    """The profiles row carries the shared display name AND the membership
+    (role + approval status). Prefer it; seed it when missing (accounts made
+    before the cloud's signup trigger existed — the insert can only produce a
+    default pending-guest row, so it grants nothing). When the cloud has no
+    membership columns yet, or the lookup fails outright, default to an
+    approved contributor: exactly what every account was before roles
+    existed, so a not-yet-migrated project keeps working."""
+    name = ses.get("display_name") or ""
+    role = status_v = member_since = ""
+    try:
+        row = _fetch_member_profile(cfg, ses)
+        if row is None:
             name = name or ses.get("email", "").split("@")[0]
-            sauth.rest(cfg, ses["access_token"], "POST", "profiles?on_conflict=id",
+            sauth.rest(cfg, ses["access_token"], "POST", "profiles",
                        [{"id": ses["user_id"], "display_name": name}],
-                       prefer="resolution=merge-duplicates,return=minimal")
+                       prefer="resolution=ignore-duplicates,return=minimal")
+            row = _fetch_member_profile(cfg, ses) or {}
+        if str(row.get("display_name") or "").strip():
+            name = str(row["display_name"]).strip()
+        role = str(row.get("role") or "").strip()
+        status_v = str(row.get("status") or "").strip()
+        member_since = str(row.get("created_at") or "").strip()
     except sauth.AuthError as exc:
         log.warning("profile lookup failed: %s", exc)
         name = name or ses.get("email", "").split("@")[0]
-    return dict(ses, display_name=name[:60])
+    return dict(ses, display_name=name[:60],
+                role=role or "contributor", status=status_v or "approved",
+                member_since=member_since)
+
+
+def _member_info(ses: dict) -> tuple[str, str]:
+    """(role, status) for a stored session. Sessions written before roles
+    existed carry neither key; they count as approved contributors — the
+    standing every account had then. Unknown values normalize the same way."""
+    role = str(ses.get("role") or "").strip()
+    status_v = str(ses.get("status") or "").strip()
+    if role not in MEMBER_ROLES:
+        role = "contributor"
+    if status_v not in MEMBER_STATUSES:
+        status_v = "approved"
+    return role, status_v
+
+
+_profile_refresh_at = 0.0
+
+
+def _refresh_member_profile(min_interval: float = 15.0) -> None:
+    """Re-adopt display name + membership from the cloud onto the stored
+    session, so an approval or a role change lands without a restart. Cheap
+    to call anywhere: rate-limited, and quiet on failure — an offline boot
+    must not stall or sign anyone out over it."""
+    global _profile_refresh_at
+    now = time.time()
+    if now - _profile_refresh_at < min_interval:
+        return
+    _profile_refresh_at = now
+    cfg = _auth_cfg()
+    ses = _auth_session() if cfg else None
+    if not cfg or not ses:
+        return
+    try:
+        row = _fetch_member_profile(cfg, ses)
+    except sauth.AuthError as exc:
+        log.warning("membership refresh unavailable: %s", exc)
+        return
+    if not row:
+        return
+    with _auth_lock:
+        doc = _auth_doc()
+        cur = doc.get("session")
+        if not cur or cur.get("user_id") != ses.get("user_id"):
+            return
+        if str(row.get("display_name") or "").strip():
+            cur["display_name"] = str(row["display_name"]).strip()[:60]
+        cur["role"] = str(row.get("role") or "").strip() or "contributor"
+        cur["status"] = str(row.get("status") or "").strip() or "approved"
+        if row.get("created_at"):
+            cur["member_since"] = str(row["created_at"])
+        lib.save_json(AUTH_SESSION_PATH, doc)
+
+
+def _gate_mtime(p: Path) -> int:
+    try:
+        return p.stat().st_mtime_ns
+    except OSError:
+        return -1
+
+
+_gate_memo: dict = {"key": None, "value": None}
+
+
+def _account_gate() -> dict:
+    """The app's front door, decided purely from disk (offline-safe).
+    gate 'ok' opens the workbench; 'signin' means no stored session;
+    'pending' / 'rejected' hold a signed-in but unapproved account at the
+    door. A configuration with no cloud at all (a fork pointed at its own,
+    unset project) runs ungated as a single-user local tool.
+
+    This runs on every API request, so the decision is memoized against the
+    mtimes of the three files it derives from — client_state can be ~1MB and
+    must not be re-parsed per page-image fetch."""
+    key = (_gate_mtime(AUTH_SESSION_PATH), _gate_mtime(lib.CLIENT_STATE_PATH),
+           _gate_mtime(_SECRETS_PATH))
+    if _gate_memo["key"] == key:
+        return dict(_gate_memo["value"])
+    cfg = _auth_cfg()
+    if not cfg:
+        out = {"gate": "ok", "cloud": False, "signed_in": False,
+               "role": "", "status": ""}
+    else:
+        ses = _auth_doc().get("session") or {}
+        if not ses.get("refresh_token"):
+            out = {"gate": "signin", "cloud": True, "signed_in": False,
+                   "role": "", "status": ""}
+        else:
+            role, status_v = _member_info(ses)
+            gate = "ok" if status_v == "approved" else (
+                "rejected" if status_v == "rejected" else "pending")
+            out = {"gate": gate, "cloud": True, "signed_in": True,
+                   "role": role, "status": status_v}
+    _gate_memo.update(key=key, value=dict(out))
+    return out
+
+
+# What stays reachable without an approved member: the sign-in surface itself,
+# and the local console feed (the gate screen's failures must be diagnosable).
+# Everything non-/api/ — the page shell, /static — always passes: it is what
+# renders the door.
+_GATE_OPEN_PREFIXES = ("/api/auth/",)
+_GATE_OPEN_PATHS = frozenset({"/api/log"})
+# Writes a read-only guest may still make: device-local UI preferences and
+# their own account details. Library data stays off this list.
+_GUEST_WRITE_PATHS = frozenset({"/api/client_state", "/api/profile/me",
+                                "/api/profile/password"})
+
+
+@app.before_request
+def _require_member():
+    """Working requires a signed-in, approved member. The check reads only the
+    stored session, so a member who signed in earlier keeps working offline
+    (their changes queue and sync like before) — but with no stored session,
+    or an unapproved one, the workbench stays shut. Guests get the read side
+    only. The cloud's row-level security enforces the same rules server-side;
+    this gate is what makes the app honest about them."""
+    p = request.path
+    if (not p.startswith("/api/") or p.startswith(_GATE_OPEN_PREFIXES)
+            or p in _GATE_OPEN_PATHS):
+        return None
+    g = _account_gate()
+    if g["gate"] == "signin":
+        return jsonify({"ok": False, "error": "signin_required",
+                        "gate": "signin"}), 401
+    if g["gate"] in ("pending", "rejected"):
+        return jsonify({"ok": False, "error": "approval_pending",
+                        "gate": g["gate"]}), 403
+    if (g["role"] == "guest" and request.method not in ("GET", "HEAD", "OPTIONS")
+            and p not in _GUEST_WRITE_PATHS):
+        return jsonify({"ok": False, "error": "read_only", "gate": "ok",
+                        "role": "guest"}), 403
+    return None
 
 
 def _store_session(ses: dict) -> None:
@@ -432,15 +609,22 @@ def _store_session(ses: dict) -> None:
 
 @app.route("/api/auth/status")
 def api_auth_status():
-    """Who is signed in, from the stored session — no refresh, no network.
-    Offline must not read as signed-out: the tokens are still on disk and the
-    pusher refreshes them when it actually needs them."""
-    cfg = _auth_cfg()
-    ses = (_auth_doc().get("session") or {}) if cfg else {}
-    return jsonify({"ok": True, "cloud": bool(cfg),
-                    "signed_in": bool(ses.get("refresh_token")),
+    """Who is signed in and whether the workbench opens, from the stored
+    session — no network by default, so offline must not read as signed-out:
+    the tokens are still on disk and the pusher refreshes them when it
+    actually needs them. ?refresh=1 additionally re-checks the cloud profile
+    (rate-limited, quiet offline) so an approval, a role change, or a rename
+    made elsewhere lands without a restart."""
+    if request.args.get("refresh"):
+        _refresh_member_profile()
+    g = _account_gate()
+    ses = (_auth_doc().get("session") or {}) if g["cloud"] else {}
+    return jsonify({"ok": True, "cloud": g["cloud"],
+                    "signed_in": g["signed_in"], "gate": g["gate"],
+                    "role": g["role"], "status": g["status"],
                     "email": ses.get("email", ""),
-                    "display_name": ses.get("display_name", "")})
+                    "display_name": ses.get("display_name", ""),
+                    "member_since": ses.get("member_since", "")})
 
 
 @app.route("/api/auth/login", methods=["POST"])
@@ -456,13 +640,20 @@ def api_auth_login():
     try:
         ses = sauth.sign_in(cfg, email, password)
     except sauth.AuthError as exc:
+        if exc.status is None:   # transport, not a rejection: say so plainly
+            return jsonify({"ok": False, "error":
+                            "cannot reach the cloud — signing in needs a "
+                            "connection (once signed in, offline is fine)"}), 503
         return jsonify({"ok": False, "error": str(exc)}), 401
     ses = _adopt_profile(cfg, ses)
     _store_session(ses)
     _sync_profile_mistral_key()
-    activity("signed in to", "the cloud", actor=ses["display_name"] or email)
+    activity("signed in to", "the workbench", actor=ses["display_name"] or email)
+    g = _account_gate()
     return jsonify({"ok": True, "email": ses["email"],
-                    "display_name": ses["display_name"]})
+                    "display_name": ses["display_name"],
+                    "gate": g["gate"], "role": g["role"],
+                    "status": g["status"]})
 
 
 @app.route("/api/auth/signup", methods=["POST"])
@@ -482,15 +673,22 @@ def api_auth_signup():
         ses = sauth.sign_up(cfg, email, password, name,
                             redirect_to=_email_confirm_redirect())
     except sauth.AuthError as exc:
+        if exc.status is None:
+            return jsonify({"ok": False, "error":
+                            "cannot reach the cloud — requesting an account "
+                            "needs a connection"}), 503
         return jsonify({"ok": False, "error": str(exc)}), 400
     if ses is None:     # project requires email confirmation (the default)
-        return jsonify({"ok": True, "confirm": True})
+        return jsonify({"ok": True, "confirm": True, "approval": True})
     ses = _adopt_profile(cfg, ses)
     _store_session(ses)
     _sync_profile_mistral_key()
-    activity("signed in to", "the cloud", actor=ses["display_name"] or email)
+    activity("signed in to", "the workbench", actor=ses["display_name"] or email)
+    g = _account_gate()
     return jsonify({"ok": True, "email": ses["email"],
-                    "display_name": ses["display_name"]})
+                    "display_name": ses["display_name"],
+                    "gate": g["gate"], "role": g["role"],
+                    "status": g["status"]})
 
 
 @app.route("/api/auth/logout", methods=["POST"])
@@ -506,6 +704,179 @@ def api_auth_logout():
     return jsonify({"ok": True})
 
 
+# --- the profile tab: own account details ----------------------------------------
+
+@app.route("/api/profile/me")
+def api_profile_me():
+    """The signed-in member's own account card. Served from the stored
+    session so it works offline; ?refresh=1 re-checks the cloud first."""
+    cfg = _auth_cfg()
+    ses = (_auth_doc().get("session") or {}) if cfg else {}
+    if not ses.get("refresh_token"):
+        return jsonify({"ok": False, "error": "not signed in"}), 401
+    if request.args.get("refresh"):
+        _refresh_member_profile(min_interval=5.0)
+        ses = _auth_doc().get("session") or ses
+    role, status_v = _member_info(ses)
+    return jsonify({"ok": True, "user_id": ses.get("user_id", ""),
+                    "email": ses.get("email", ""),
+                    "display_name": ses.get("display_name", ""),
+                    "role": role, "status": status_v,
+                    "member_since": ses.get("member_since", "")})
+
+
+@app.route("/api/profile/me", methods=["PUT"])
+def api_profile_me_update():
+    """Rename the signed-in member. The display name is shared state (it
+    labels the activity feed for everyone), so the cloud row is the write
+    that counts — offline, the request fails honestly instead of diverging."""
+    cfg = _auth_cfg()
+    ses = _auth_session() if cfg else None
+    if not cfg or not ses:
+        return jsonify({"ok": False, "error": "not signed in"}), 401
+    p = request.get_json(silent=True) or {}
+    name = str(p.get("display_name") or "").strip()[:60]
+    if not name:
+        return jsonify({"ok": False, "error": "display name cannot be empty"}), 400
+    try:
+        sauth.rest(cfg, ses["access_token"], "PATCH",
+                   f"profiles?id=eq.{ses['user_id']}", {"display_name": name},
+                   prefer="return=minimal", timeout=8.0)
+    except sauth.AuthError as exc:
+        code = 400 if exc.status else 503
+        msg = str(exc) if exc.status else \
+            "cloud unreachable — try again when you are online"
+        return jsonify({"ok": False, "error": msg}), code
+    with _auth_lock:
+        doc = _auth_doc()
+        cur = doc.get("session")
+        if cur and cur.get("user_id") == ses["user_id"]:
+            cur["display_name"] = name
+            lib.save_json(AUTH_SESSION_PATH, doc)
+    activity("renamed themselves", "in the member directory", actor=name,
+             detail=name)
+    return jsonify({"ok": True, "display_name": name})
+
+
+@app.route("/api/profile/password", methods=["POST"])
+def api_profile_password():
+    """Change the account password. The current password is re-verified with
+    a throwaway sign-in first — a walked-away-from machine must not be enough
+    to take the account over."""
+    cfg = _auth_cfg()
+    ses = _auth_session() if cfg else None
+    if not cfg or not ses:
+        return jsonify({"ok": False, "error": "not signed in"}), 401
+    p = request.get_json(silent=True) or {}
+    current = str(p.get("current_password") or "")
+    new = str(p.get("new_password") or "")
+    if not current or not new:
+        return jsonify({"ok": False,
+                        "error": "current and new password are both required"}), 400
+    if len(new) < 6:            # mirror the signup rule
+        return jsonify({"ok": False,
+                        "error": "password must be at least 6 characters"}), 400
+    try:
+        check = sauth.sign_in(cfg, ses.get("email", ""), current)
+    except sauth.AuthError as exc:
+        if exc.status:
+            return jsonify({"ok": False,
+                            "error": "current password is incorrect"}), 403
+        return jsonify({"ok": False,
+                        "error": "cloud unreachable — try again when you are online"}), 503
+    try:
+        sauth.update_user(cfg, ses["access_token"], {"password": new})
+    except sauth.AuthError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400 if exc.status else 503
+    finally:
+        sauth.sign_out(cfg, check.get("access_token", ""))
+    return jsonify({"ok": True})
+
+
+# --- membership management (maintainers) -----------------------------------------
+# Thin passthroughs to the security-definer RPCs from migration 005. The RPCs
+# re-verify that the CALLER is an approved maintainer, so the local role check
+# here is a courtesy (fast, offline-honest errors), not the enforcement.
+
+def _maintainer_session():
+    cfg = _auth_cfg()
+    ses = _auth_session() if cfg else None
+    if not cfg or not ses:
+        return None, None, (jsonify({"ok": False, "error": "not signed in"}), 401)
+    role, _status = _member_info(ses)
+    if role != "maintainer":
+        return None, None, (jsonify({"ok": False,
+                                     "error": "maintainer role required"}), 403)
+    return cfg, ses, None
+
+
+def _rpc_error(exc: sauth.AuthError):
+    """RPC failures land in the members dialog verbatim; keep them honest.
+    Transport problems are 'you are offline', not 'forbidden'."""
+    if exc.status is None:
+        return jsonify({"ok": False,
+                        "error": "cloud unreachable — member management needs a connection"}), 503
+    return jsonify({"ok": False, "error": str(exc)}), 403 if exc.status in (401, 403) else 400
+
+
+@app.route("/api/members")
+def api_members():
+    """Every member, pending requests first — maintainer only. Emails appear
+    here and nowhere else: profiles are email-free, but a maintainer deciding
+    on a request has to know who is asking."""
+    cfg, ses, err = _maintainer_session()
+    if err:
+        return err
+    try:
+        rows = sauth.rest(cfg, ses["access_token"], "POST",
+                          "rpc/member_directory", {}, timeout=10.0) or []
+    except sauth.AuthError as exc:
+        return _rpc_error(exc)
+    return jsonify({"ok": True, "me": ses.get("user_id", ""), "members": rows})
+
+
+@app.route("/api/members/<member_id>/status", methods=["POST"])
+def api_members_status(member_id: str):
+    """Approve, decline, or suspend a membership request."""
+    cfg, ses, err = _maintainer_session()
+    if err:
+        return err
+    p = request.get_json(silent=True) or {}
+    status_v = str(p.get("status") or "").strip()
+    label = str(p.get("label") or "").strip()[:80]
+    if status_v not in MEMBER_STATUSES:
+        return jsonify({"ok": False, "error": f"unknown status: {status_v}"}), 400
+    try:
+        sauth.rest(cfg, ses["access_token"], "POST", "rpc/set_member_status",
+                   {"target": member_id, "new_status": status_v}, timeout=10.0)
+    except sauth.AuthError as exc:
+        return _rpc_error(exc)
+    verb = {"approved": "approved", "rejected": "declined",
+            "pending": "suspended"}[status_v]
+    activity(verb, "a membership", detail=label)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/members/<member_id>/role", methods=["POST"])
+def api_members_role(member_id: str):
+    """Assign a member's role."""
+    cfg, ses, err = _maintainer_session()
+    if err:
+        return err
+    p = request.get_json(silent=True) or {}
+    role = str(p.get("role") or "").strip()
+    label = str(p.get("label") or "").strip()[:80]
+    if role not in MEMBER_ROLES:
+        return jsonify({"ok": False, "error": f"unknown role: {role}"}), 400
+    try:
+        sauth.rest(cfg, ses["access_token"], "POST", "rpc/set_member_role",
+                   {"target": member_id, "new_role": role}, timeout=10.0)
+    except sauth.AuthError as exc:
+        return _rpc_error(exc)
+    activity("assigned", f"the {role} role", detail=label)
+    return jsonify({"ok": True})
+
+
 # --- the activity mirror: local jsonl -> cloud events table ----------------------
 # The local file is the source of truth; the cursor in auth_session.json marks
 # how much of it the cloud already has. Push failures leave the cursor alone,
@@ -517,6 +888,10 @@ def _push_events_once() -> None:
     ses = _auth_session() if cfg else None
     if not cfg or not ses:
         return
+    role, status_v = _member_info(ses)
+    if status_v != "approved" or role == "guest":
+        return   # the cloud's RLS would refuse anyway; the cursor stays put,
+        # so an approval releases the (tiny) backlog on the next wake
     with _auth_lock:
         cursor = int(_auth_doc().get("push_cursor") or 0)
     lines = _activity_lines()
@@ -4482,7 +4857,12 @@ def _save_secrets(d: dict) -> None:
 
 
 def _client_settings():
-    s = dict((lib.load_json(lib.CLIENT_STATE_PATH, {}) or {}).get("settings") or {})
+    # client_state persists whatever the PUT carried, verbatim (pinned by
+    # tests) — so `settings` may legitimately be garbage here. The account
+    # gate consults this on every request; a non-dict must read as defaults,
+    # not take the whole API down.
+    raw = (lib.load_json(lib.CLIENT_STATE_PATH, {}) or {}).get("settings")
+    s = dict(raw) if isinstance(raw, dict) else {}
     for k, v in _load_secrets().items():
         if v:
             s[k] = v                     # secrets override; they never persist here

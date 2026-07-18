@@ -155,11 +155,13 @@ def test_phone_sync_does_not_run_owner_pipelines(monkeypatch):
     assert out["stores"] == {}
 
 
-def test_auth_status_reports_cloud_without_any_settings(settings, client):
+def test_auth_status_reports_cloud_without_any_settings(settings, client, data_root):
     settings(supabaseUrl="", supabaseAnonKey="", supabaseKey="")
+    (data_root / "output" / "auth_session.json").unlink()   # nobody signed in
     r = client.get("/api/auth/status").get_json()
     assert r["cloud"] is True
     assert r["signed_in"] is False
+    assert r["gate"] == "signin"
 
 
 # --- signup confirmation redirect (the ERR_CONNECTION_REFUSED fix) --------------
@@ -208,5 +210,5 @@ def test_signup_endpoint_passes_the_confirmation_redirect(settings, client, monk
     monkeypatch.setattr(server.sauth, "sign_up", fake_sign_up)
     r = client.post("/api/auth/signup",
                     json={"email": "a@b.co", "password": "secret"}).get_json()
-    assert r == {"ok": True, "confirm": True}
+    assert r == {"ok": True, "confirm": True, "approval": True}
     assert seen["redirect_to"] == cloud_defaults.WEBSITE_URL + "/confirmed.html"
