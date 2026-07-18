@@ -1581,6 +1581,7 @@
         <div id="settings-nav">
           <button class="snav active" data-sec="sec-general" type="button">General</button>
           <button class="snav" data-sec="sec-appearance" type="button">Appearance</button>
+          <button class="snav" data-sec="sec-theme" type="button">Theme editor</button>
           <button class="snav" data-sec="sec-tables" type="button">Table view</button>
           <button class="snav" data-sec="sec-library" type="button">Library &amp; data</button>
           <button class="snav" data-sec="sec-editing" type="button">Editing</button>
@@ -1653,6 +1654,51 @@
               <label class="tool-label" for="font-mono2-select">Tag / marker font</label>
               <select id="font-mono2-select" class="cad-input"></select>
             </div>
+          </div>
+          <div id="sec-theme" class="settings-sec">
+            <div class="settings-head">Theme editor</div>
+            <p class="settings-note">Fine-tune the colours, corners, line weight,
+               text weight and fonts of the selected theme. Edits are saved per theme
+               and layer over the built-in look — reset any single control, or the
+               whole theme, at any time. A font left on <b>Default</b> follows the
+               global choice under <b>Appearance</b>. <b>Duplicate</b> any theme to make
+               your own editable copy: custom themes appear in the theme list in
+               <i>italics</i> and can be renamed, deleted, exported or imported.</p>
+            <div class="te-topbar">
+              <label for="te-theme">Theme</label>
+              <select id="te-theme" class="cad-input"></select>
+              <span id="te-count" class="te-count">No changes</span>
+              <button id="te-reset-theme" class="cad-btn danger te-reset-theme" type="button">Reset this theme</button>
+            </div>
+            <div class="te-savebar">
+              <input id="te-save-name" class="cad-input" placeholder="New name…" spellcheck="false" maxlength="60" />
+              <button id="te-duplicate" class="cad-btn" type="button">Duplicate</button>
+              <button id="te-rename" class="cad-btn" type="button">Rename</button>
+              <button id="te-delete" class="cad-btn" type="button">Delete</button>
+              <span class="te-savebar-sep"></span>
+              <button id="te-export" class="cad-btn" type="button">Export</button>
+              <button id="te-import" class="cad-btn" type="button">Import</button>
+              <input id="te-import-file" type="file" accept=".json,.whltheme,application/json" hidden />
+            </div>
+            <div class="te-preview" aria-hidden="true" inert>
+              <div class="te-pv-bar"><span>Preview</span><span class="te-pv-file">herbarium.pdf</span></div>
+              <div class="te-pv-body">
+                <div class="te-pv-ctl">
+                  <button class="cad-btn" type="button" tabindex="-1">Button</button>
+                  <input class="cad-input" style="width:84px" value="Field" readonly tabindex="-1" />
+                  <span class="te-pv-link">Accent link</span>
+                  <span class="te-pv-link sec">Secondary</span>
+                </div>
+                <div class="te-pv-rows">
+                  <span class="te-pv-row hover">Hover</span>
+                  <span class="te-pv-row checked">Checked</span>
+                  <span class="te-pv-row manual">Manual</span>
+                </div>
+                <div class="te-pv-chips"><span class="ok">&#9679; Success</span><span class="warn">&#9679; Warning</span><span class="err">&#9679; Error</span></div>
+                <div class="te-pv-note">Body ink with <span class="muted">secondary / muted text</span>.</div>
+              </div>
+            </div>
+            <div id="te-rows" class="te-rows"></div>
           </div>
           <div id="sec-tables" class="settings-sec">
             <div class="settings-head">Table view</div>
