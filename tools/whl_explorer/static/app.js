@@ -60,15 +60,18 @@ function partitionSettings(s) {
 // Hydrate the renderer's ephemeral credential cache. Mistral may arrive from
 // the signed-in user's private cloud profile; partitionSettings keeps every
 // value here out of localStorage and client_state.
+// Returns null when the store could not be READ — distinct from "read fine,
+// nothing stored" ({}). Callers that paint fields must not treat a failed read
+// as a set of empty keys, or a sidecar restart blanks every credential field.
 async function hydrateSecrets() {
   try {
     const res = await fetch("/api/secrets");
-    if (!res.ok) return {};
+    if (!res.ok) return null;
     const secrets = await res.json();
     for (const k of SECRET_KEYS) state.settings[k] = secrets[k] || "";
     return secrets;
   } catch (e) {
-    return {};
+    return null;
   }
 }
 
@@ -1117,11 +1120,48 @@ const BICONS = {
   download: _SVGB('<path d="M8 2.4 V9.6 M4.6 6.4 L8 9.8 L11.4 6.4 M3.8 13.4 H12.2"/>'),  // file on disk
 };
 
+// --- accessible names for icon-only controls ---------------------------------
+// An icon button carries its meaning in data-tip, which is a HOVER affordance:
+// to a screen reader (and to Windows Narrator on the always-visible activity
+// bar) undo/redo/new-entry/export/settings all announced as a bare "button".
+// Derive the name from the tip's FIRST clause — later clauses explain
+// consequences and make a poor label. Authored aria-labels and real visible
+// text always win; a glyph like ◀ or ✓ is not real text, so those get named too.
+function tipLabel(tip) {
+  return String(tip || "").split(/\s+—\s+|\.\s+|\n/)[0].trim().slice(0, 80);
+}
+function nameFromTip(node) {
+  if (!node || node.getAttribute("aria-label")) return;   // authored name wins
+  const tag = node.tagName;
+  if (tag !== "BUTTON" && tag !== "A" && tag !== "INPUT" &&
+      node.getAttribute("role") !== "button") return;
+  // letters/digits mean the control already reads as something; punctuation and
+  // geometric glyphs (◀ ▶ ▾ ✓ ↶) do not
+  if (/[\p{L}\p{N}]/u.test((node.textContent || "").trim())) return;
+  const label = tipLabel(node.dataset.tip);
+  if (!label) return;
+  node.setAttribute("aria-label", label);
+  node.dataset.tipNamed = "1";      // derived, so setTip() may refresh it
+}
+// Change a control's tip and keep any DERIVED accessible name in step. Never
+// touches an authored aria-label (no data-tipNamed marker).
+function setTip(node, text) {
+  if (!node) return;
+  node.dataset.tip = text;
+  if (node.dataset.tipNamed === "1") {
+    const label = tipLabel(text);
+    if (label) node.setAttribute("aria-label", label);
+  }
+}
+
 function injectIcons() {
   for (const node of document.querySelectorAll("[data-icon]")) {
     const svg = ICONS[node.dataset.icon];
     if (svg) node.innerHTML = svg;
   }
+  // after the glyphs land: the injected <svg> is aria-hidden and contributes no
+  // text, so the "has visible text" test above still reads correctly
+  for (const node of document.querySelectorAll("[data-tip]")) nameFromTip(node);
 }
 
 // --- confirmation dialog -------------------------------------------------------
@@ -1341,10 +1381,10 @@ function updateHistoryButtons() {
   const u = el("undo-btn"), r = el("redo-btn");
   u.disabled = history.ptr === 0;
   r.disabled = history.ptr >= history.stack.length;
-  u.dataset.tip = history.ptr
-    ? `Undo (Ctrl+Z): ${history.stack[history.ptr - 1].label}` : "Undo (Ctrl+Z)";
-  r.dataset.tip = history.ptr < history.stack.length
-    ? `Redo (Ctrl+Y): ${history.stack[history.ptr].label}` : "Redo (Ctrl+Y)";
+  setTip(u, history.ptr
+    ? `Undo (Ctrl+Z): ${history.stack[history.ptr - 1].label}` : "Undo (Ctrl+Z)");
+  setTip(r, history.ptr < history.stack.length
+    ? `Redo (Ctrl+Y): ${history.stack[history.ptr].label}` : "Redo (Ctrl+Y)");
 }
 
 let historyBusy = false;
@@ -2123,6 +2163,7 @@ function wizRender() {
     // typing. The input listener in initWizard marks touched fields.
     (wizSecretsLoad || hydrateSecrets()).then((secrets) => {
       if (WIZ_STEPS[wizStep][0] !== "services") return;
+      if (!secrets) return;   // failed READ: leave the fields as the user left them
       for (const [id, key] of fields) {
         const input = el(id);
         if (!input.dataset.edited) input.value = secrets[key] || "";
@@ -2376,8 +2417,10 @@ function renderHome() {
   const p = progressSummary();
   // one line per metric, count first, breakdown right-aligned and muted —
   // a status readout in the app's row idiom, not a dashboard of tiles
+  // a zero metric has nowhere to go — navigating to an empty queue (or opening
+  // the remarks sidebar onto nothing) is a dead end, so say so up front
   const row = (n, label, act, detail) =>
-    `<button class="home-row" ${act}>` +
+    `<button class="home-row" ${act}${n ? "" : " disabled"}>` +
       `<span class="hr-n">${n}</span>` +
       `<span class="hr-l">${esc(label)}</span>` +
       (detail ? `<span class="hr-d">${esc(detail)}</span>` : "") +
@@ -2435,11 +2478,15 @@ function renderHome() {
             `<span class="had-txt">${esc(e.detail ||
               activityPhrase({ verb: e.verb, subject: e.subject, n: e.n || 1 }))}</span>` +
             `</div>`).join("") + `</div>`;
-        return `<div class="home-act${open ? " open" : ""}" data-gk="${esc(k)}">` +
-          `<span class="home-act-arrow">${open ? "&#9662;" : "&#9656;"}</span>` +
+        // a real button: this discloses the group's events, and was the only
+        // click target on Home with no keyboard path (the detail block is a
+        // SIBLING, so nesting stays valid)
+        return `<button type="button" class="home-act${open ? " open" : ""}" ` +
+          `data-gk="${esc(k)}" aria-expanded="${open}">` +
+          `<span class="home-act-arrow" aria-hidden="true">${open ? "&#9662;" : "&#9656;"}</span>` +
           `<span class="home-who">${esc(g.actor)}</span> ` +
           `<span class="home-what">${esc(activityPhrase(g))}</span>` +
-          `<span class="home-when">${esc(relTime(g.at))}</span></div>` + det;
+          `<span class="home-when">${esc(relTime(g.at))}</span></button>` + det;
       }).join("")
     : `<div class="empty">No activity recorded yet</div>`;
 
@@ -3526,21 +3573,44 @@ function renderSettings() {
       ["set-r2-key", "r2KeyId"], ["set-r2-secret", "r2Secret"],
       ["set-gs-keyfile", "gsKeyFile"], ["set-imggen-key", "imgGenKey"],
     ];
+    const note = el("cred-note");
     const secrets = await hydrateSecrets();
+    if (secrets === null) {
+      // A failed READ must not blank 13 password-dotted fields — with nothing
+      // visible in them that reads as "all my keys are gone". Leave whatever is
+      // on screen alone and say what actually happened.
+      if (note) {
+        note.textContent = "Could not read stored credentials — the local service " +
+          "may still be starting. Nothing was changed; reopen Settings to retry.";
+        note.hidden = false;
+      }
+      statusErr("CREDENTIALS :: could not be read");
+      return;
+    }
+    if (note) { note.hidden = true; note.textContent = ""; }
     for (const [id, k] of SECRET_FIELDS) {
       const n = el(id);
       if (!n) continue;
       const v = secrets[k] || "";
       n.value = v;
       state.settings[k] = v;                 // in-memory only (client-side uses, e.g. master sync)
-      n.onchange = () => {
+      n.onchange = async () => {
         const val = n.value.trim();
-        state.settings[k] = val;
-        fetch("/api/secrets", {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ updates: { [k]: val } }),
-        }).catch(() => {});
+        // was fire-and-forget: a 500 or a restarting sidecar silently discarded
+        // a pasted key on a field where nothing is visible to contradict it.
+        // persistSecrets sets state.settings[k] only on success.
+        try {
+          await persistSecrets({ [k]: val });
+          n.classList.remove("cred-bad");
+          if (note) { note.hidden = true; note.textContent = ""; }
+        } catch (e) {
+          n.classList.add("cred-bad");
+          if (note) {
+            note.textContent = `That credential was NOT saved (${e.message || "the local service refused it"}). It is still only in this box.`;
+            note.hidden = false;
+          }
+          statusErr("CREDENTIAL NOT SAVED :: " + (e.message || "write failed"));
+        }
       };
     }
   })();
@@ -6852,7 +6922,17 @@ function renderChecked() {
   const so = state.sort.checked;
   if (so) rows = sortRowsBy(rows, (r) => checkedSortVal(r, so.key), so.dir);
 
+  // "nothing here" and "nothing MATCHED" are different facts: with a library
+  // of 253 and a filter that matches none, "No books checked" reads as data loss.
+  el("checked-empty").textContent = allRows.length
+    ? "No rows match the current filter" : "No books checked";
   el("checked-empty").hidden = rows.length !== 0;
+  // What is actually on screen. The WHL table alongside has always had a count;
+  // this one only had the unfiltered "N checked / M manual" totals.
+  el("top-count").textContent = !allRows.length ? ""
+    : rows.length === allRows.length
+      ? `${rows.length} row${rows.length === 1 ? "" : "s"}`
+      : `${rows.length} of ${allRows.length} rows`;
 
   // flatten sets (a header + its expanded volumes) into one ordered list so the
   // streamer can chunk across set boundaries.
@@ -7654,7 +7734,11 @@ function renderHistoryRows() {
     tbody.appendChild(tr);
   }
   el("bottom-empty").hidden = rows.length !== 0;
-  if (!rows.length) el("bottom-empty").textContent = "No actions recorded yet";
+  // don't claim an empty log while the count beside it reads "12 actions (0 shown)"
+  if (!rows.length) {
+    el("bottom-empty").textContent = log.length
+      ? "No actions match the current filter" : "No actions recorded yet";
+  }
   el("bottom-count").textContent =
     `${log.length} action${log.length === 1 ? "" : "s"}` + (q ? ` (${rows.length} shown)` : "");
   // History rows are built directly (not via streamRows' per-chunk mask), so
@@ -7951,8 +8035,10 @@ async function renderTop() {
     await loadWhlRows();
     renderWhlTop();
   } else {
-    renderChecked();
+    // clear the WHL table's count FIRST — renderChecked writes the real one,
+    // and early-returns when the pane is hidden, which must not leave WHL's
     el("top-count").textContent = "";
+    renderChecked();
   }
 }
 
@@ -8796,8 +8882,12 @@ function renderWhlTop() {
     streamRows(el("whltop-rows"), rows, (r) => whlRowTr(r, mode),
       (r) => `whl:${r.idx}`);
   }
+  const whlTotal = (state.whlRows || []).length;
+  el("whltop-empty").textContent = whlTotal
+    ? "No rows match the current filter" : "No WHL rows";
   el("whltop-empty").hidden = rows.length !== 0;
-  el("top-count").textContent = `${rows.length} WHL rows`;
+  el("top-count").textContent = rows.length === whlTotal
+    ? `${rows.length} WHL rows` : `${rows.length} of ${whlTotal} WHL rows`;
   applyTableChrome("whl");
   markSortHeaders("whl");
   refreshInfoIfActive();
@@ -11230,7 +11320,7 @@ function setJobsDrawer(open, persist) {
   el("ocr-queue-splitter").hidden = !open;
   const t = el("wb-jobs-toggle");
   t.innerHTML = open ? "&#9662;" : "&#9656;";
-  t.dataset.tip = open ? "Hide the jobs queue" : "Show the jobs queue";
+  setTip(t, open ? "Hide the jobs queue" : "Show the jobs queue");
   t.setAttribute("aria-expanded", String(open));
   if (persist) {
     state.settings.jobsDrawerOpen = !!open;
@@ -11370,7 +11460,7 @@ async function updateAnProvider() {
   host.classList.toggle("an-warn", !hasKey);
   host.textContent = hasKey
     ? `${provider} · ${model}`
-    : "No AI key — set one in Settings > AI";
+    : "No AI key — set one in Settings > Credentials";
 }
 
 function renderAnList() {
@@ -13221,6 +13311,10 @@ function renderPublishTree(revealSelection = false) {
   const tree = el("publish-tree");
   tree.removeAttribute("role");
   tree.innerHTML = model.map((node) => publishTreeNodeHtml(node, 0)).join("");
+  // own all three states here: the markup's "Loading…" used to survive a
+  // successful-but-empty load, so an unpublished library read as still loading
+  el("publish-tree-empty").textContent = state.publishLoaded
+    ? "Nothing published yet" : "Loading published books…";
   el("publish-tree-empty").hidden = entities.length > 0;
   el("publish-count").textContent = `${state.publishEntries.length} volume${
     state.publishEntries.length === 1 ? "" : "s"}`;
@@ -13506,8 +13600,12 @@ function setPublishSidebarCollapsed(on, persist) {
   el("publish-layout").classList.toggle("sidebar-collapsed", collapsed);
   el("publish-side-toggle").textContent = collapsed ? "▶" : "◀";
   el("publish-side-toggle").setAttribute("aria-expanded", String(!collapsed));
-  el("publish-side-toggle").dataset.tip = collapsed
-    ? "Expand published books sidebar" : "Collapse published books sidebar";
+  // when collapsed this bare ◀/▶ is the strip's ONLY operable control, so it
+  // needs a real name, not just a hover tip (matches the Workbench sidebar)
+  const pubTip = collapsed
+    ? "Expand the published books sidebar" : "Collapse the published books sidebar";
+  el("publish-side-toggle").dataset.tip = pubTip;
+  el("publish-side-toggle").setAttribute("aria-label", pubTip);
   if (persist) {
     state.settings.publishSidebarCollapsed = collapsed;
     saveSettings();
@@ -13609,7 +13707,7 @@ function loadPublishCatalog() {
     } catch (e) {
       if (mine !== state.publishCatalogSeq) return;
       el("publish-source").textContent = "Could not load catalogue";
-      el("publish-tree-empty").textContent = e.message;
+      el("publish-tree-empty").textContent = "Could not load the catalogue — " + e.message;
       el("publish-tree-empty").hidden = state.publishEntries.length > 0;
       statusErr("PUBLISH CATALOGUE :: " + e.message);
     } finally {
@@ -14076,7 +14174,8 @@ function renderInfoPane() {
   if (!body) return;
   const t = currentInfoTarget();
   if (!t) {
-    body.innerHTML = `<div class="info-empty">Select a row to see its details.</div>`;
+    body.innerHTML = `<div class="info-empty">Select a row to see its details` +
+      ` — click a cell, or Ctrl+click to open the editor.</div>`;
     return;
   }
   if (t.whl) {                                        // a WHL catalogue row
@@ -14892,8 +14991,11 @@ async function uploadBuild() {
   const rightsLabel = (el("b-rights").selectedOptions[0] || {}).textContent || b.rights;
   if (!(await confirmDialog({
     title: "Publish to the library",
-    message: `Publish "${b.title || b.id}"?\nRights: ${rightsLabel}\n` +
-             `PDF: ${b.pdf_file}`,
+    // the facts belong in the detail slot (pre-line, and already in the
+    // dialog's aria-describedby) — inside message they wrap into one sentence
+    // where "Public domain PDF" reads as a single noun phrase
+    message: `Publish "${b.title || b.id}"?`,
+    detail: `Rights: ${rightsLabel}\nPDF: ${b.pdf_file}`,
     confirmLabel: "Publish",
     cancelLabel: "Not yet",
   }))) return;
@@ -14961,6 +15063,11 @@ function pollPublish(buildId = null) {
         renderUpload();
       }
       renderHome();
+      // the Published Library now has one more volume than its cached copy —
+      // without this, switching to that tab shows a catalogue missing the book
+      // that was just published, with no staleness signal
+      state.publishLoaded = false;
+      if (el("publish").classList.contains("active")) loadPublishCatalog();
       status(`PUBLISHED :: ${st.slug}${st.note ? " :: " + st.note : ""}`);
     }
   }, 700);
@@ -15279,7 +15386,8 @@ async function generateAiSummary() {
   const s = state.settings;
   const msg = el("b-ai-msg");
   if (!(s.aiKey || "").trim() || !(s.aiModel || "").trim()) {
-    msg.textContent = "Configure the model + API key (Settings > AI)";
+    msg.textContent =
+      "Configure the model in Settings > AI and the key in Settings > Credentials";
     return;
   }
   const localPath = (b.pdf_file || "").trim();
@@ -16378,11 +16486,13 @@ function buildOcrKeymapLegend() {
   }
   // the one on-surface home for the page view's whole hidden keyboard layer:
   // selection, ranges, staging, title, delete, clear all live here
-  host.innerHTML = parts.length
-    ? `click select · <b>Ctrl</b>+click range · digit stages selection (else hover) — ` +
-      `${parts.join(" · ")} · <b>T</b> title · <b>Del</b> delete pages · ` +
-      `<b>Esc</b> clear`
-    : "";
+  // The gestures are documented NOWHERE else, so they must not ride on whether
+  // any digit slot happens to be mapped — clearing all five in Settings used to
+  // erase click-select, Ctrl+click, T, Del and Esc along with them.
+  const gestures = `click select · <b>Ctrl</b>+click range · <b>T</b> title · ` +
+    `<b>Del</b> delete pages · <b>Esc</b> clear`;
+  host.innerHTML = gestures + (parts.length
+    ? ` — digit stages selection (else hover): ${parts.join(" · ")}` : "");
 }
 
 function setOcrView(v) {
@@ -17392,11 +17502,11 @@ function updateDefaultEngineSummary() {
     const src = d && d.buildId === bid ? docSrcKey(d) : "primary";
     const title = (b.title || bid).slice(0, 40);
     host.textContent += ` · stages: ${title} / ${src}`;
-    add.dataset.tip =
-      `Stage every page of "${title}" (${src}) with ${ocr} — nothing runs until Submit`;
+    setTip(add,
+      `Stage every page of "${title}" (${src}) with ${ocr} — nothing runs until Submit`);
     add.disabled = false;
   } else {
-    add.dataset.tip = "Pick a book first — stage-all acts on the current book";
+    setTip(add, "Pick a book first — stage-all acts on the current book");
     add.disabled = true;
   }
 }
@@ -17407,7 +17517,7 @@ function refreshDefaultEngineOptions() {
   for (const option of ocr.options) {
     const ready = ocrServiceReady(option.value);
     option.disabled = !ready;
-    option.title = ready ? "" : "Add this engine's API key in Settings > OCR";
+    option.title = ready ? "" : "Add this engine's API key in Settings > Credentials";
   }
   ocr.value = state.settings.ocrService || "tesseract";
   const analysis = el("analysis-service");
@@ -17422,7 +17532,7 @@ function refreshDefaultEngineOptions() {
   el("ocr-engine-note").textContent = [...ocr.options].some((o) => o.disabled)
     ? "Cloud engines without credentials are unavailable." : "";
   el("analysis-engine-note").textContent = ready
-    ? "" : "Add an AI API key in Settings > AI.";
+    ? "" : "Add an AI API key in Settings > Credentials.";
   updateDefaultEngineSummary();
 }
 
@@ -17533,7 +17643,7 @@ async function ocrQueuePages(bid, srcKey, pages) {
       service: OCR_SERVICE_LABELS[bad.service] || bad.service,
       status: ocrServiceReady(bad.service)
         ? "Queued — processing not implemented yet"
-        : "Queued — service not configured (Settings > OCR)",
+        : "Queued — service not configured (Settings > Credentials)",
       at: new Date().toLocaleTimeString(),
     });
     renderOcrQueue();
@@ -17546,7 +17656,7 @@ async function ocrQueuePages(bid, srcKey, pages) {
   const missing = pages.find((x) => !ocrServiceReady(x.service));
   if (missing) {
     el("ocr-msg").textContent =
-      `${OCR_SERVICE_LABELS[missing.service]} is not configured (Settings > OCR)`;
+      `${OCR_SERVICE_LABELS[missing.service]} is not configured (Settings > Credentials)`;
     return;
   }
   const s = state.settings;
@@ -19862,11 +19972,12 @@ const MENU_CMDS = {
   "about": () => openAbout(),
   // File > New entry: same flow as the Workbench toolbar's + button, but
   // reachable from anywhere — land on the Record phase so the form is visible.
-  "new-entry": () => {
+  "new-entry": async () => {
     const t = document.querySelector('#tabs .tab[data-tab="workbench"]');
     if (t) t.click();
     setWorkbenchPhase("record", false);
-    createBuild({}, "(blank)");
+    const b = await createBuild({}, "(blank)");
+    if (b) { const title = el("b-title"); if (title) title.focus(); }
   },
   // quick settings (mirror the Settings-dialog handlers, side effects and all)
   "opt-auto-ia": () => {
@@ -19998,7 +20109,7 @@ function initMenubar() {
   });
   document.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape" && openMenu) closeAll();
-    // Ctrl/Cmd+, opens Preferences (the desktop convention)
+    // Ctrl/Cmd+, opens Settings (the desktop convention)
     if ((ev.ctrlKey || ev.metaKey) && ev.key === ",") {
       ev.preventDefault();
       openSettings();
@@ -20798,9 +20909,14 @@ function init() {
   // Two doors to the same blank entry: the activity bar for repeat use and
   // the empty-state prompt for first use. A third copy in the narrow list bar
   // clipped its collapse control without adding a distinct path.
-  const newBlankEntry = () => {
+  const newBlankEntry = async () => {
     setWorkbenchPhase("record", false);   // the blank form is the next step
-    createBuild({}, "(blank)");
+    // land the caret in Title: from the empty-state door the clicked button's
+    // container is hidden by the re-render, dropping focus to <body> so the
+    // next Tab restarts at the top of the document. Guarded — a failed POST
+    // leaves #build-editor hidden. Matches es-title / w-title / e-title.
+    const b = await createBuild({}, "(blank)");
+    if (b) { const t = el("b-title"); if (t) t.focus(); }
   };
   el("build-new").addEventListener("click", newBlankEntry);
   const emptyNew = el("build-new-empty");

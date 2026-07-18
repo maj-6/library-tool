@@ -27,6 +27,13 @@
   /* muted secondary text (labels, meta, dialog detail lines). Tuned to >=4.5:1
      on --face per theme -- do NOT use --face-sh2 (a border colour) for text. */
   --ink-mut: #62656b;
+  /* Two softer tiers, DERIVED so each theme's own --ink-mut drives them:
+     --ink-soft is the muted tier, --ink-faint one step fainter (mixed toward
+     the pane face) for superseded / struck-through text. Process mode used
+     both before they were ever defined, so those colours were dropped as
+     invalid and its three-tier reading order rendered flat. */
+  --ink-soft: var(--ink-mut);
+  --ink-faint: color-mix(in srgb, var(--ink-mut) 65%, var(--face));
   --input-bg: #ffffff;
   --input-ink: #22262c;
   --row-hover: #262b33;
@@ -947,7 +954,10 @@ input, textarea, [contenteditable="true"], .cell-edit,
   color: var(--ink);
   cursor: pointer;
 }
-.home-row:hover .hr-l { color: var(--cyan); }
+.home-row:hover:not(:disabled) .hr-l { color: var(--cyan); }
+/* a caught-up (zero) metric is a dead end, not a destination */
+.home-row:disabled { cursor: default; opacity: 0.55; }
+.home-row:focus-visible { outline: 2px solid var(--cyan); outline-offset: -2px; }
 .hr-n { flex: 0 0 auto; min-width: 22px; text-align: right; font-family: var(--mono); font-weight: bold; }
 .hr-l { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hr-d { flex: 0 0 auto; margin-left: auto; color: var(--ink-mut); font-size: 10.5px; white-space: nowrap; }
@@ -1002,8 +1012,17 @@ input, textarea, [contenteditable="true"], .cell-edit,
   gap: 6px;
   padding: 3px 2px;
   font-size: 12px;
+  /* keep the row separator: a blanket border:0 button reset would wipe the
+     whole feed's rules. Only the box/typography defaults are neutralised. */
+  border: 0;
   border-bottom: var(--border-w, 1px) solid var(--canvas-line);
+  width: 100%;
+  text-align: left;
+  background: none;
+  font-family: inherit;
+  color: inherit;
 }
+.home-act:focus-visible { outline: 2px solid var(--cyan); outline-offset: -2px; }
 .home-act:last-child { border-bottom: 0; }
 .home-who { font-weight: bold; color: var(--ink); white-space: nowrap; }
 .home-what { flex: 1 1 auto; min-width: 0; color: var(--ink); }
@@ -1906,7 +1925,11 @@ body .cad-btn.primary.danger {
 .mf-actions > .cad-btn[hidden],
 .ctl-join > .cad-btn[hidden],
 .bar-cluster > .cad-btn[hidden],
-.bar-cluster > select.cad-input[hidden] {
+.bar-cluster > select.cad-input[hidden],
+/* same trap one level up: these wrappers set their own display, so the UA's
+   [hidden] loses and the whole cluster stays on screen in views it can't act on */
+.ocr-pagenav[hidden],
+.bar-cluster[hidden] {
   display: none;
 }
 
@@ -3529,6 +3552,10 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   opacity: 0.85;
   margin: 0 0 10px;
 }
+/* a credential that did not reach the store, and the field that holds it */
+.cred-note { color: var(--red); opacity: 1; }
+.cred-note[hidden] { display: none; }
+.cad-input.cred-bad { border-color: var(--red); }
 .settings-rows {
   display: grid;
   grid-template-columns: auto 1fr;

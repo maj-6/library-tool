@@ -1813,7 +1813,7 @@ def api_ai_summarize():
     text = (p.get("text") or "").strip()
     if not key or not model:
         return jsonify({"ok": False,
-                        "error": "AI model / API key not configured (Settings > AI)"})
+                        "error": "AI model not configured (Settings > AI); API key (Settings > Credentials)"})
     if not text:
         return jsonify({"ok": False, "error": "no source text"})
     system = instructions or (
@@ -3324,7 +3324,7 @@ _IMG_GEN_PROMPT = (
 
 
 def _img_gen_cfg() -> dict:
-    """BYO-key image generation settings (Settings > OCR & AI). Providers:
+    """BYO-key image generation settings (key: Settings > Credentials). Providers:
     "openai" (images/edits, default model gpt-image-1) or "gemini"
     (generateContent with an inline image, default gemini-2.5-flash-image)."""
     s = _client_settings()
@@ -3423,7 +3423,7 @@ def api_build_rework_figure(build_id: str):
     if not cfg["key"]:
         return jsonify({"ok": False, "error":
                         "no image-generation key configured "
-                        "(Settings > OCR & AI > Illustration rework)"}), 400
+                        "(image model key: Settings > Credentials)"}), 400
     prompt = _IMG_GEN_PROMPT
     extra = str(p.get("prompt") or "").strip()[:2000]
     if extra:
@@ -4828,7 +4828,7 @@ def _ocr_max_tokens() -> int:
 def _ocr_claude(png: bytes, cfg: dict) -> str:
     key = (cfg.get("claude_key") or "").strip()
     if not key:
-        raise RuntimeError("Anthropic API key not configured (Settings > OCR)")
+        raise RuntimeError("Anthropic API key not configured (Settings > Credentials)")
     import base64
     model = (cfg.get("claude_model") or "").strip() or "claude-haiku-4-5-20251001"
     body = json.dumps({
@@ -4859,7 +4859,7 @@ def _ocr_textract(png: bytes, cfg: dict) -> str:
     key = (cfg.get("aws_key") or "").strip()
     secret = (cfg.get("aws_secret") or "").strip()
     if not (key and secret):
-        raise RuntimeError("AWS credentials not configured (Settings > OCR)")
+        raise RuntimeError("AWS credentials not configured (Settings > Credentials)")
     try:
         import boto3
     except ImportError:
@@ -4913,7 +4913,7 @@ def _ocr_mistral(png: bytes, cfg: dict) -> dict:
     nothing is silently lost."""
     key = (cfg.get("mistral_key") or "").strip()
     if not key:
-        raise RuntimeError("Mistral API key not configured (Settings > OCR)")
+        raise RuntimeError("Mistral API key not configured (Settings > Credentials)")
     import base64
     pages = capture.mistral_ocr_pages(png, key, want_images=True,
                                       want_blocks=True)
@@ -7524,7 +7524,7 @@ def _ai_chat(cfg: dict, messages: list, json_mode: bool = False,
     RuntimeError with the HTTP body truncated to 300 chars, the same error
     convention every other integration here uses."""
     if not cfg["key"]:
-        raise RuntimeError("no AI key — set one in Settings > AI "
+        raise RuntimeError("no AI key — set one in Settings > Credentials "
                            "(DeepSeek is the default provider)")
     # a set temperature/timeout in Settings > AI overrides the per-call defaults
     _t = cfg.get("temperature")
@@ -7597,7 +7597,7 @@ def api_process_deepseek():
         abort(400)
     cfg = _ai_cfg()
     if not cfg["key"]:
-        return jsonify({"ok": False, "error": "No AI key — set one in Settings > AI"}), 400
+        return jsonify({"ok": False, "error": "No AI key — set one in Settings > Credentials"}), 400
     cur = {k: str(v)[:600] for k, v in fields.items()
            if isinstance(k, str) and k in _PROC_FIELD_KEYS
            and isinstance(v, (str, int, float)) and str(v).strip()}
@@ -7685,7 +7685,7 @@ def _ss_run(job: dict, spec: dict) -> None:
     try:
         mkey = str(_client_settings().get("mistralKey") or "").strip()
         if not mkey:
-            raise RuntimeError("Mistral API key not configured (Settings > OCR)")
+            raise RuntimeError("Mistral API key not configured (Settings > Credentials)")
         pdf = spec.get("pdf_path")
         if pdf is None:
             with _ss_jobs_lock:
@@ -10714,7 +10714,7 @@ def api_knowledge_ask_answer():
     if not cfg["key"]:
         # the _ai_chat no-key message, surfaced before any work happens
         return jsonify({"ok": False, "error":
-                        "no AI key — set one in Settings > AI "
+                        "no AI key — set one in Settings > Credentials "
                         "(DeepSeek is the default provider)"}), 409
     with _passages_lock:
         doc = _load_passages(bid)
