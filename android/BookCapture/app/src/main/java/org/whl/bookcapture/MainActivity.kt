@@ -10,6 +10,7 @@ import android.graphics.RuntimeShader
 import android.os.Build
 import android.os.Bundle
 import android.transition.TransitionManager
+import android.util.Log
 import android.util.Size
 import android.view.LayoutInflater
 import android.view.View
@@ -22,6 +23,7 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -52,6 +54,8 @@ half4 main(float2 coord) {
 }
 """
 
+private const val TAG = "BookCapture"
+
 /**
  * Hands-free book capture:
  *
@@ -78,7 +82,15 @@ class MainActivity : AppCompatActivity() {
     private var pendingCommand: String? = null   // "done"/"cancel" said mid-shot
     private var sharpenBound = false             // the sharpen mode the camera is bound with
 
-    private val permissions = arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
+    // Camera is the only hard requirement; the mic is requested separately, and
+    // only when the user opts into voice control — denying it never blocks
+    // capture. REQ_CAMERA / REQ_MIC tag the two runtime-permission requests.
+    private val REQ_CAMERA = 1
+    private val REQ_MIC = 2
+    private var micRequested = false          // request the mic once per opt-in
+
+    private fun granted(perm: String) =
+        ContextCompat.checkSelfPermission(this, perm) == PackageManager.PERMISSION_GRANTED
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -120,12 +132,14 @@ class MainActivity : AppCompatActivity() {
             return
         }
         if (!initialized) {
-            if (permissions.all {
-                    ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
-                }) initAfterPermissions()
-            else ActivityCompat.requestPermissions(this, permissions, 1)
+            // The camera is the only hard requirement; voice asks for the mic
+            // separately (see syncVoice), so a denied mic never blocks capture.
+            if (granted(Manifest.permission.CAMERA)) initCapture()
+            else ActivityCompat.requestPermissions(
+                this, arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
+        } else {
+            syncVoice()                       // re-adopt / resume voice if opted in
         }
-        voice?.setPaused(false)               // mic live only while on screen
         if (session.pendingUploads().isNotEmpty()) UploadWorker.kick(this)
         restoreThumbnailsIfNeeded()           // an entry re-adopted after recreation
         // a viewfinder-sharpen toggle in Settings needs a fresh camera bind (the
@@ -161,17 +175,54 @@ class MainActivity : AppCompatActivity() {
     override fun onRequestPermissionsResult(
         requestCode: Int, perms: Array<out String>, results: IntArray) {
         super.onRequestPermissionsResult(requestCode, perms, results)
-        if (results.isNotEmpty() && results.all { it == PackageManager.PERMISSION_GRANTED })
-            initAfterPermissions()
-        else setStatus(getString(R.string.need_permissions))
+        when (requestCode) {
+            REQ_CAMERA ->
+                if (granted(Manifest.permission.CAMERA)) initCapture()
+                else setStatus(getString(R.string.need_camera))
+            REQ_MIC ->
+                if (granted(Manifest.permission.RECORD_AUDIO)) syncVoice()
+                else {
+                    // Denied: keep capturing by touch and turn voice back off so
+                    // we don't re-prompt every resume — re-enable it in Settings.
+                    Prefs.setVoiceControl(this, false)
+                    setStatus(getString(R.string.voice_needs_mic))
+                }
+        }
     }
 
-    private fun initAfterPermissions() {
+    private fun initCapture() {
         if (initialized) return
         initialized = true
         startCamera()
         UploadWorker.enqueue(this)                 // drain anything left from last time
         ProcessWorker.enqueue(this)
+        syncVoice()                                // start voice only if opted in
+        updateUi()
+    }
+
+    /** Bring voice into line with the opt-in preference and the mic permission.
+     *  Runs on every resume and after a mic-permission result:
+     *   - opted out            -> release the recorder if it was running;
+     *   - opted in, no mic yet  -> request it once (a denial won't loop);
+     *   - opted in, mic granted -> create + start (downloads the ~40 MB model
+     *     the first time) or just resume.
+     *  Capture never depends on any of this — the buttons work regardless. */
+    private fun syncVoice() {
+        if (!initialized) return
+        if (!Prefs.voiceControl(this)) {
+            voice?.stop(); voice = null
+            micRequested = false                   // a later opt-in may re-ask
+            return
+        }
+        if (!granted(Manifest.permission.RECORD_AUDIO)) {
+            if (!micRequested) {
+                micRequested = true
+                ActivityCompat.requestPermissions(
+                    this, arrayOf(Manifest.permission.RECORD_AUDIO), REQ_MIC)
+            }
+            return
+        }
+        voice?.let { it.setPaused(false); return }
         val v = VoiceController(this,
             onCommand = { word -> runOnUiThread { command(word) } },
             onState = { msg -> runOnUiThread { setStatus(msg) } })
@@ -190,7 +241,6 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
-        updateUi()
     }
 
     private fun startCamera() {
@@ -209,30 +259,70 @@ class MainActivity : AppCompatActivity() {
             val preview = Preview.Builder().build().also {
                 it.setSurfaceProvider(binding.preview.surfaceProvider)
             }
-            // Book pages are flat, lit text, so MINIMIZE_LATENCY (no multi-frame
-            // quality merge) is the biggest shutter-lag win. The pipeline
-            // downscales to ~1600px anyway, so capping the capture near there
-            // drops JPEG encode + disk-write time with no OCR loss. Flash pinned
-            // off so there's no per-shot AE-flash metering step.
-            val capture = ImageCapture.Builder()
-                .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-                .setFlashMode(ImageCapture.FLASH_MODE_OFF)
-                .setJpegQuality(85)
-                .setResolutionSelector(
-                    ResolutionSelector.Builder()
-                        .setResolutionStrategy(
-                            ResolutionStrategy(
-                                Size(1600, 2133),
-                                ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER))
-                        .build())
-                .build()
+            val capture = buildImageCapture(capNearTarget = true)
             imageCapture = capture
-            provider.unbindAll()
-            provider.bindToLifecycle(
-                this, CameraSelector.DEFAULT_BACK_CAMERA, preview, capture)
+            if (!bindCamera(provider, preview, capture)) {
+                // A device that can't satisfy the constrained selector still
+                // needs a working camera: retry with CameraX defaults before
+                // giving up, so a bad size choice never bricks capture.
+                val fallback = buildImageCapture(capNearTarget = false)
+                imageCapture = fallback
+                if (!bindCamera(provider, preview, fallback)) {
+                    imageCapture = null
+                    setStatus("Camera unavailable on this device.")
+                    return@addListener
+                }
+            }
+            // Record what CameraX actually resolved to, for capture diagnostics.
+            Log.i(TAG, "capture resolution: ${imageCapture?.resolutionInfo?.resolution}")
             applyPreviewSharpen(sharpen)
             sharpenBound = sharpen
         }, ContextCompat.getMainExecutor(this))
+    }
+
+    /**
+     * The photo use case. Book pages are flat, lit text, so MINIMIZE_LATENCY (no
+     * multi-frame merge) is the biggest shutter-lag win, and flash stays off so
+     * there is no per-shot AE-flash metering step.
+     *
+     * When [capNearTarget], cap the output near the pipeline's ~1600px standard
+     * with a 4:3, sensor-oriented (landscape) bound and a LOWER-first fallback:
+     * a device whose 4:3 outputs are 1600x1200 / 1920x1440 then stays near 2 MP
+     * instead of jumping to an 8-12 MP frame the pipeline only downscales again
+     * (the old 1600x2133 CLOSEST_HIGHER bound matched no common 4:3 output). When
+     * false, CameraX picks its own default — the safe fallback if the constrained
+     * selector can't bind on some device.
+     */
+    private fun buildImageCapture(capNearTarget: Boolean): ImageCapture {
+        val builder = ImageCapture.Builder()
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+            .setFlashMode(ImageCapture.FLASH_MODE_OFF)
+            .setJpegQuality(85)
+        if (capNearTarget) {
+            builder.setResolutionSelector(
+                ResolutionSelector.Builder()
+                    .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                    .setResolutionStrategy(
+                        ResolutionStrategy(
+                            Size(1600, 1200),
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER))
+                    .build())
+        }
+        return builder.build()
+    }
+
+    /** Bind preview + capture; returns false (not a crash) if it can't bind. */
+    private fun bindCamera(
+        provider: ProcessCameraProvider,
+        preview: Preview,
+        capture: ImageCapture,
+    ): Boolean = try {
+        provider.unbindAll()
+        provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, capture)
+        true
+    } catch (e: Exception) {
+        Log.w(TAG, "camera bind failed", e)
+        false
     }
 
     /** Set or clear the AGSL sharpen RenderEffect on the preview (Android 13+). */
@@ -312,6 +402,11 @@ class MainActivity : AppCompatActivity() {
                 }
                 override fun onError(e: ImageCaptureException) {
                     busy = false
+                    // A failed capture can leave a truncated photo_N.jpg. The
+                    // shot was never counted (photoSaved() runs only on success),
+                    // so the reserved file is safe to drop — and must be, or
+                    // restore()/recoverOrphans() would later seal it as a page.
+                    if (file.exists()) file.delete()
                     cues.error("capture failed")
                     setStatus("Capture error: ${e.message}")
                     runPending()

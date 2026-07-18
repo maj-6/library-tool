@@ -59,6 +59,13 @@ object Prefs {
     fun setSharpenPreview(ctx: Context, on: Boolean) =
         sp(ctx).edit().putBoolean("sharpen_preview", on).apply()
 
+    /** Hands-free voice control (Vosk). Opt-in and OFF by default: enabling it is
+     *  what triggers the mic-permission request and the one-time model download,
+     *  so the camera never depends on the microphone. */
+    fun voiceControl(ctx: Context): Boolean = sp(ctx).getBoolean("voice_control", false)
+    fun setVoiceControl(ctx: Context, on: Boolean) =
+        sp(ctx).edit().putBoolean("voice_control", on).apply()
+
     // --- device --------------------------------------------------------------
 
     fun deviceName(ctx: Context): String =

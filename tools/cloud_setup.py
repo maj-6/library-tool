@@ -36,9 +36,11 @@ VIEWS = {"author_index": ["author", "work_count"]}
 BUCKETS = {"captures": False, "volumes": True}       # name -> public?
 # Role smoke tests: the website reads ANON_CAN with the anon key; ANON_CANNOT
 # holds user data behind revoked grants — an anon read succeeding on any of
-# them means the revoke/RLS blocks were not applied.
-ANON_CAN = ["volumes", "volume_pages", "releases"]
-ANON_CANNOT = ["profiles", "events", "captures"]
+# them means the revoke/RLS blocks were not applied. passages is RPC-only by
+# design (docs/search-design.md D6): anon reaches it through search_passages,
+# never a table read.
+ANON_CAN = ["volumes", "volume_pages", "releases", "index_versions"]
+ANON_CANNOT = ["profiles", "events", "captures", "passages"]
 
 
 def config() -> dict:
