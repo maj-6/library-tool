@@ -56,4 +56,4 @@ jobs:
           node --experimental-default-type=module --check website/assets/releases.js
           node --experimental-default-type=module --check website/assets/textsearch.js
           node --experimental-default-type=module --check website/assets/read.js
-          node --test tests/changelog_behavior.test.js tests/publish_tree_behavior.test.js tests/desktop_issue_fixes_behavior.test.js tests/electron_lifecycle_behavior.test.js tests/copyright_cache_behavior.test.js tests/textsearch.test.js tests/rpcsearch.test.js tests/facets_behavior.test.js tests/remarks_behavior.test.js tests/pdf_viewer_behavior.test.js
+          node --test tests/changelog_behavior.test.js tests/publish_tree_behavior.test.js tests/desktop_issue_fixes_behavior.test.js tests/electron_lifecycle_behavior.test.js tests/copyright_cache_behavior.test.js tests/textsearch.test.js tests/rpcsearch.test.js tests/facets_behavior.test.js tests/lib_open_behavior.test.js tests/remarks_behavior.test.js tests/pdf_viewer_behavior.test.js

@@ -35,7 +35,9 @@ class CaptureOwnershipTest {
     @Test
     fun captureSidecarPrecedesActiveStateAndFeedsEveryManifestPath() {
         val session = source("CaptureSession")
-        val writeCreator = session.indexOf("writeCreator(dir, captureCreator)")
+        val writeCreator = session.indexOf(
+            "writeCreator(dir, captureCreator, Prefs.cameraProfile(ctx))",
+        )
         val publishActive = session.indexOf("Prefs.setCurrentEntryId(ctx, id)", writeCreator)
 
         assertTrue(writeCreator >= 0)

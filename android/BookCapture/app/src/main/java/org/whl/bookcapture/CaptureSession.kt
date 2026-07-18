@@ -4,8 +4,12 @@ import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.nio.file.Files
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+
+private const val TRASH_STAMP = ".trashed_at"
+private const val TRASH_TTL_MS = 7L * 24 * 60 * 60 * 1000   // ~7 days
 
 /**
  * The voice-driven entry state machine.
@@ -43,7 +47,7 @@ class CaptureSession(private val ctx: Context) {
     internal var creator: CaptureCreator? = null
         private set
 
-    init { restore() }
+    init { restore(); purgeTrash() }
 
     val active: Boolean get() = entryId != null
 
@@ -70,12 +74,14 @@ class CaptureSession(private val ctx: Context) {
     }
 
     fun start(): String {
-        cancel()                                  // an unfinished entry is voided
+        if (active && cancel() == null) {
+            error("Could not discard the current capture")
+        }
         val id = UUID.randomUUID().toString()
         val dir = entryDir(id)
         check(dir.mkdirs() || dir.isDirectory) { "Could not create capture directory" }
         val captureCreator = Prefs.captureCreator(ctx)
-        if (!writeCreator(dir, captureCreator)) {
+        if (!writeCreator(dir, captureCreator, Prefs.cameraProfile(ctx))) {
             dir.deleteRecursively()
             error("Could not persist capture creator")
         }
@@ -172,14 +178,68 @@ class CaptureSession(private val ctx: Context) {
         return id
     }
 
-    fun cancel(): Boolean {
-        val id = entryId ?: return false
+    /** Discard the open entry — but to the TRASH, not straight to deletion, so a
+     *  mis-fired "cancel" stays recoverable (see [restoreFromTrash]). Returns the
+     *  discarded entry id for an Undo, or null if nothing was open. */
+    fun cancel(): String? {
+        val id = entryId ?: return null
+        // Do not clear the persisted live-entry pointer until its directory is
+        // verifiably outside the upload queue. Otherwise a failed delete/move
+        // becomes an orphan that recoverOrphans() can seal and upload later.
+        if (!moveToTrash(id)) return null
         entryId = null
         creator = null
         photoCount = 0
-        entryDir(id).deleteRecursively()
         Prefs.setCurrentEntryId(ctx, null)
+        return id
+    }
+
+    // --- trash: a discard is recoverable for a while -------------------------
+
+    private fun trashRoot(): File = File(ctx.filesDir, "trash").apply { mkdirs() }
+
+    /** Move an entry folder into the trash, stamped so [purgeTrash] can age it
+     *  out. Any same-id folder already in the trash is replaced. */
+    private fun moveToTrash(id: String): Boolean {
+        val src = entryDir(id)
+        if (!src.exists()) return true
+        val dst = File(trashRoot(), id)
+        if (dst.exists() && !dst.deleteRecursively()) return false
+        if (!moveDirectoryWithoutCopy(src, dst)) return false
+        // A missing stamp only delays cleanup until the directory timestamp;
+        // the important invariant is that the entry has left the upload queue.
+        runCatching {
+            File(dst, TRASH_STAMP).writeText(System.currentTimeMillis().toString())
+        }
         return true
+    }
+
+    /** Undo a [cancel]: bring a trashed entry back as the live open entry.
+     *  No-op (false) if another entry is already open or the trash copy is gone. */
+    fun restoreFromTrash(id: String): Boolean {
+        if (active) return false
+        val src = File(trashRoot(), id)
+        if (!src.isDirectory) return false
+        val dst = entryDir(id)
+        // Never destroy a same-id queue folder to satisfy Undo. If a folder is
+        // already there, keep the trash copy recoverable for a later attempt.
+        if (dst.exists() || !moveDirectoryWithoutCopy(src, dst)) return false
+        File(dst, TRASH_STAMP).delete()
+        entryId = id
+        creator = creatorFor(dst)
+        photoCount = dst.listFiles { f -> f.isFile && f.name.matches(PHOTO_NAME) }?.size ?: 0
+        Prefs.setCurrentEntryId(ctx, id)
+        return true
+    }
+
+    /** Delete trashed entries past the retention window; runs at construction so
+     *  an abandoned discard can't linger forever. */
+    fun purgeTrash(now: Long = System.currentTimeMillis()) {
+        for (dir in trashRoot().listFiles { f -> f.isDirectory } ?: return) {
+            val stamp = File(dir, TRASH_STAMP).takeIf { it.isFile }
+                ?.readText()?.trim()?.toLongOrNull()
+            if (now - (stamp ?: dir.lastModified()) >= TRASH_TTL_MS) dir.deleteRecursively()
+        }
     }
 
     /** Entry folders sealed with a manifest and not yet uploaded. */
@@ -217,10 +277,10 @@ class CaptureSession(private val ctx: Context) {
     private fun creatorFor(dir: File): CaptureCreator = readCreator(dir) ?: CaptureCreator(
         Prefs.CREATOR_LOCAL,
         Prefs.anonymousCreatorId(ctx),
-    ).also { writeCreator(dir, it) }
+    ).also { writeCreator(dir, it, null) }
 
     private fun readCreator(dir: File): CaptureCreator? = try {
-        val data = JSONObject(File(dir, CAPTURE_CREATOR_FILE).readText())
+        val data = JSONObject(File(dir, CAPTURE_METADATA_FILE).readText())
         val kind = data.getString("kind").trim()
         val id = data.getString("id").trim()
         if (kind !in setOf(Prefs.CREATOR_ACCOUNT, Prefs.CREATOR_LOCAL) || id.isEmpty()) null
@@ -229,10 +289,20 @@ class CaptureSession(private val ctx: Context) {
         null
     }
 
-    private fun writeCreator(dir: File, creator: CaptureCreator): Boolean = try {
+    private fun writeCreator(
+        dir: File,
+        creator: CaptureCreator,
+        cameraProfile: String?,
+    ): Boolean = try {
         Entries.atomicWrite(
-            File(dir, CAPTURE_CREATOR_FILE),
-            JSONObject().put("kind", creator.kind).put("id", creator.id).toString(),
+            File(dir, CAPTURE_METADATA_FILE),
+            JSONObject()
+                .put("kind", creator.kind)
+                .put("id", creator.id)
+                // Legacy or repaired captures have no reliable profile. Keep
+                // their page pixels conservatively instead of downsampling.
+                .put("camera_profile", cameraProfile ?: Prefs.CAMERA_PROFILE_DETAIL)
+                .toString(),
         )
         true
     } catch (_: Exception) {
@@ -271,8 +341,31 @@ class CaptureSession(private val ctx: Context) {
         }
 }
 
-private const val CAPTURE_CREATOR_FILE = "capture.json"
+internal const val CAPTURE_METADATA_FILE = "capture.json"
 private val CAPTURE_TEMP_NAME = Regex("\\.capture_\\d+_[0-9a-f-]+\\.pending\\.jpg")
+
+/** Move an entry atomically enough that failure leaves the queue copy intact.
+ * Queue and trash both live under filesDir, so a directory move is supported;
+ * deliberately avoid copy-then-delete because a failed delete leaves an
+ * uploadable orphan behind. The injectable mover keeps failure behavior JVM
+ * testable without relying on platform-specific file permissions. */
+internal fun moveDirectoryWithoutCopy(
+    src: File,
+    dst: File,
+    mover: (File, File) -> Boolean = { from, to ->
+        if (from.renameTo(to)) true
+        else try {
+            Files.move(from.toPath(), to.toPath())
+            true
+        } catch (_: Exception) {
+            false
+        }
+    },
+): Boolean {
+    if (!src.isDirectory || dst.exists()) return false
+    if (!mover(src, dst)) return false
+    return !src.exists() && dst.isDirectory
+}
 
 /** Same-process ownership for CameraX files. The callback owns its temporary
  * across Activity recreation; a short expiry prevents a lost OEM callback

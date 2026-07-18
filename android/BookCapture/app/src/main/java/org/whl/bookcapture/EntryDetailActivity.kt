@@ -241,6 +241,11 @@ class EntryDetailActivity : AppCompatActivity() {
                     ).show()
                     render()
                 }
+                Entries.DeleteResult.DELETE_FAILED -> Toast.makeText(
+                    this@EntryDetailActivity,
+                    R.string.detail_delete_failed,
+                    Toast.LENGTH_LONG,
+                ).show()
             }
         }
     }

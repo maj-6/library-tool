@@ -104,10 +104,35 @@ object Prefs {
             .apply()
     }
 
-    /** Voice is opt-in: permission and model download follow this local choice. */
-    fun voiceEnabled(ctx: Context): Boolean = sp(ctx).getBoolean("voice_enabled", false)
-    fun setVoiceEnabled(ctx: Context, on: Boolean) =
-        sp(ctx).edit().putBoolean("voice_enabled", on).apply()
+    /** Hands-free voice control (Vosk). Opt-in and OFF by default: enabling it is
+     *  what triggers the mic-permission request and the one-time model download,
+     *  so the camera never depends on the microphone. `voice_enabled` was used
+     *  by an unpublished build; migrate it into the upstream preference name. */
+    fun voiceControl(ctx: Context): Boolean {
+        val prefs = sp(ctx)
+        if (prefs.contains("voice_control")) {
+            return prefs.getBoolean("voice_control", false)
+        }
+        val legacy = prefs.getBoolean("voice_enabled", false)
+        if (prefs.contains("voice_enabled")) {
+            prefs.edit()
+                .putBoolean("voice_control", legacy)
+                .remove("voice_enabled")
+                .apply()
+        }
+        return legacy
+    }
+
+    fun setVoiceControl(ctx: Context, on: Boolean) {
+        sp(ctx).edit()
+            .putBoolean("voice_control", on)
+            .remove("voice_enabled")
+            .apply()
+    }
+
+    /** Compatibility aliases for the local camera work merged into this branch. */
+    fun voiceEnabled(ctx: Context): Boolean = voiceControl(ctx)
+    fun setVoiceEnabled(ctx: Context, on: Boolean) = setVoiceControl(ctx, on)
 
     // --- device --------------------------------------------------------------
 

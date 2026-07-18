@@ -502,5 +502,10 @@ def test_index_status_reports_state_versions_and_unconfigured_cloud(
     assert data["state"]["exists"] is True
 
     monkeypatch.setattr(server, "_cloud_cfg", lambda: None)
+    # a passive status view never nags about cloud config — only the actions
+    # that actually need Supabase (publish / rollback) fail loudly
     data = client.get(f"/api/knowledge/index/status?build_id={bid}").get_json()
-    assert "Supabase is not configured" in data["warning"]
+    assert data["warning"] == ""
+    r = client.post("/api/knowledge/index/publish", json={"build_id": bid})
+    assert r.status_code == 400
+    assert "Supabase is not configured" in r.get_json()["error"]

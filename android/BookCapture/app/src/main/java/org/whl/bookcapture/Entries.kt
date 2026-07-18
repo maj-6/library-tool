@@ -46,7 +46,13 @@ object Entries {
         COMPLETE("complete"),
     }
 
-    enum class DeleteResult { DELETED, ACTIVE_CAPTURE, ALREADY_UPLOADED, MISSING }
+    enum class DeleteResult {
+        DELETED,
+        ACTIVE_CAPTURE,
+        ALREADY_UPLOADED,
+        MISSING,
+        DELETE_FAILED,
+    }
 
     data class ProcessingState(
         val status: ProcessingStatus,
@@ -250,7 +256,7 @@ object Entries {
         if (Prefs.currentEntryId(ctx) == entryId) return@withLock DeleteResult.ACTIVE_CAPTURE
         val entry = find(ctx, entryId) ?: return@withLock DeleteResult.MISSING
         if (entry.uploaded && !allowUploaded) return@withLock DeleteResult.ALREADY_UPLOADED
-        if (entry.dir.deleteRecursively()) DeleteResult.DELETED else DeleteResult.MISSING
+        deleteDirectoryResult(entry.dir)
     }
 
     private fun load(dir: File): Entry? {
@@ -377,3 +383,15 @@ object Entries {
 internal val PHOTO_NAME = Regex("photo_\\d+\\.jpg")
 internal fun photoNumber(name: String): Int =
     name.removePrefix("photo_").removeSuffix(".jpg").toIntOrNull() ?: 0
+
+/** Keep "already gone" distinct from an attempted deletion that left files
+ * behind. Callers must not dismiss a book as deleted after a storage failure. */
+internal fun deleteDirectoryResult(
+    dir: File,
+    delete: (File) -> Boolean = { it.deleteRecursively() },
+): Entries.DeleteResult {
+    if (!dir.exists()) return Entries.DeleteResult.MISSING
+    val reportedSuccess = try { delete(dir) } catch (_: Exception) { false }
+    return if (reportedSuccess && !dir.exists()) Entries.DeleteResult.DELETED
+    else Entries.DeleteResult.DELETE_FAILED
+}

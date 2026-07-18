@@ -46,6 +46,9 @@
   --cr-inconclusive: #9b6a24;
   --cr-unknown: #7d817c;
   --radius: 4px;
+  /* the one height for single-line controls (inputs, selects, buttons)
+     wherever they share a bar — see the control-height section */
+  --ctl-h: 24px;
   /* dialog shell spacing: every overlay window shares these so headers,
      bodies, and footers line up across dialogs (see .win-titlebar) */
   --dlg-pad-x: 14px;
@@ -59,14 +62,28 @@
 /* =====================================================================
    THEMES
 
-   A theme is a body[data-theme] block defining the same 21 custom
-   properties, plus whatever chrome rules its paper stock needs. The :root
+   A theme is a body[data-theme] block defining the same 22 custom
+   properties (21 colors + --radius), plus whatever chrome rules its
+   paper stock needs. The :root
    block above is NOT a selectable theme -- it is the variable fallback and
-   the sole home of the font vars (--mono/--mono2/--ui).
+   the baseline home of the font vars (--mono/--mono2/--ui); a theme may
+   override --ui with its own default face.
 
-   All themes are light: this is a scholarly tool, read for hours. --canvas
-   (behind the tables, the PDF pane and the OCR pane) never drops below 0.85
-   relative luminance, accents stay desaturated, radius <= 3px.
+   Nearly all themes are light: this is a scholarly tool, read for hours.
+   Accents stay desaturated. SLATE is the one deliberate exception — a dim
+   (not dark) chalkboard for low-light sessions; if another dim theme is
+   ever added, keep its surfaces at or above Slate's luminance.
+
+   The set spans two styling philosophies on the same fixed geometry:
+   FLAT (sage, porcelain, slate) — solid fills, hairline borders, no
+   gradients or relief; TACTILE (ledger, foolscap, vellum) — paper with
+   physical depth: raised or debossed controls, press-down :active, ruled
+   heads. LINEN sits between (one soft gradient, nothing else).
+
+   A theme may also set --ui to give itself a default interface face
+   (Segoe UI otherwise) — the user's explicit font pick, applied inline by
+   applyFont(), still beats it — and --icon-style to pick an activity-bar
+   icon set (see static/icons/tabs/).
 
    SAGE           - warm, earthy, bookish neutral: cream paper, taupe chrome,
                     brown-black ink, a muted sage-teal accent (the default).
@@ -76,9 +93,16 @@
    MANUSCRIPT     - letterpress galley proof on daylight paper: debossed controls,
                     a single ink rule under the statusbar, low chroma.
                     (id "foolscap"; the label was "Foolscap".)
-   VELLUM         - warm off-white vellum, near-zero chroma, warm brown-black ink.
-   LINEN          - neutral warm-grey linen board; the lowest-contrast chrome of the
-                    set, for long sessions.
+   VELLUM         - warm off-white vellum, near-zero chroma, warm brown-black ink;
+                    gently raised controls.
+   LINEN          - neutral warm-grey linen board; the lowest-contrast light
+                    chrome of the set, for long sessions.
+   PORCELAIN      - cool glazed white: blue-grey hairlines, cobalt accents,
+                    the flattest chrome of the set. Segoe UI Variable when the
+                    system has it.
+   SLATE          - dim school slate: soft graphite-blue surfaces, chalk-light
+                    ink, brightened accents. Easier on the eyes at night
+                    without being a black theme.
    ==================================================================== */
 
 /* ---------- SAGE (muted green-gray light) ---------- */
@@ -107,14 +131,14 @@ body[data-theme="sage"] {
   --radius: 6px;
 }
 body[data-theme="sage"] .cad-btn {
-  border: 1px solid #b4ab97;
+  border: var(--border-w, 1px) solid #b4ab97;
   background: #fdfbf5;
 }
 body[data-theme="sage"] .cad-btn:hover { background: #f5f0e6; border-color: #9c9280; }
 body[data-theme="sage"] .cad-btn:active { background: #ece5d6; }
 body[data-theme="sage"] .cad-input,
 body[data-theme="sage"] .cell-edit,
-body[data-theme="sage"] .md-live { border: 1px solid #b4ab97; }
+body[data-theme="sage"] .md-live { border: var(--border-w, 1px) solid #b4ab97; }
 body[data-theme="sage"] .cad-input:focus { border-color: var(--cyan); }
 body[data-theme="sage"] .pane-tab {
   border: none;
@@ -128,22 +152,22 @@ body[data-theme="sage"] .pane-tab.active {
   box-shadow: inset 0 -2px 0 var(--blue);
   font-weight: 600;
 }
-body[data-theme="sage"] .pane-tabs { border-bottom: 1px solid #cec6b4; }
+body[data-theme="sage"] .pane-tabs { border-bottom: var(--border-w, 1px) solid #cec6b4; }
 body[data-theme="sage"] #titlebar,
 body[data-theme="sage"] .win-titlebar {
   background: #9c9482;      /* a darker warm band so the menu bar reads as chrome */
   color: #201c15;
-  border-bottom: 1px solid #b2a88f;
+  border-bottom: var(--border-w, 1px) solid #b2a88f;
 }
 body[data-theme="sage"] .grid thead th {
   background: #f0ebdd;
   color: #4d473a;
   border-right: none;
-  border-bottom: 1px solid #b8ae9a;
+  border-bottom: var(--border-w, 1px) solid #b8ae9a;
 }
 body[data-theme="sage"] .grid tbody td {
   border-right: none;
-  border-bottom: 1px solid #ece4d5;
+  border-bottom: var(--border-w, 1px) solid #ece4d5;
 }
 body[data-theme="sage"] .badge { background: #efe9db; }
 body[data-theme="sage"] #cad-tooltip,
@@ -192,11 +216,13 @@ body[data-theme="ledger"] {
   --blue: #3d443e;
   --blue2: #59635a;
   --radius: 0;             /* Archive Ledger is square-cornered */
+  --icon-style: solid;     /* stamped activity-bar glyphs (icons/tabs/solid/) */
 }
 body[data-theme="ledger"] .cad-btn {
-  border: 1px solid #a5a296;
-  border-bottom-width: 2px;
+  border: var(--border-w, 1px) solid #a5a296;
+  border-bottom-width: calc(var(--border-w, 1px) + 1px);  /* letterpress heavy edge, tracks the weight control */
   background: linear-gradient(#f6f5ef, #eae8e0);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.55);
 }
 body[data-theme="ledger"] .cad-btn:hover { background: linear-gradient(#faf9f4, #efeee6); }
 body[data-theme="ledger"] .cad-btn:active {
@@ -204,7 +230,7 @@ body[data-theme="ledger"] .cad-btn:active {
   background: #e4e2d8;
 }
 body[data-theme="ledger"] .pane-tab {
-  border: 1px solid #a5a296;
+  border: var(--border-w, 1px) solid #a5a296;
   border-bottom: none;
   border-radius: 0;
   background: #dedcd2;
@@ -226,14 +252,14 @@ body[data-theme="ledger"] .grid thead th {
 }
 body[data-theme="ledger"] .grid tbody td {
   border-right: none;
-  border-bottom: 1px solid #e6e4db;
+  border-bottom: var(--border-w, 1px) solid #e6e4db;
 }
 body[data-theme="ledger"] .badge { background: rgba(143, 141, 132, 0.09); }
 body[data-theme="ledger"] #cad-tooltip,
 body[data-theme="ledger"] #attn-pop {
   background: #fffef6;
   color: var(--ink);
-  border: 1px solid #8f8d84;
+  border: var(--border-w, 1px) solid #8f8d84;
 }
 body[data-theme="ledger"] #statusbar { border-top: 3px double #8f8d84; }
 body[data-theme="ledger"] ::-webkit-scrollbar { width: 12px; height: 12px; }
@@ -267,10 +293,14 @@ body[data-theme="foolscap"] {
   --blue: #2f3a4a;
   --blue2: #45566b;
   --radius: 1px;
+  /* the galley proof sets its chrome in old-style serifs; the user's own
+     font pick (applied inline by applyFont) still overrides this */
+  --ui: "Palatino Linotype", "Book Antiqua", Georgia, serif;
+  --icon-style: solid;     /* stamped activity-bar glyphs (icons/tabs/solid/) */
 }
 /* letterpress buttons: type debossed into the sheet */
 body[data-theme="foolscap"] .cad-btn {
-  border: 1px solid #a49d8e;
+  border: var(--border-w, 1px) solid #a49d8e;
   background: #f2f0e9;
   box-shadow: inset 1px 1px 1px rgba(50, 44, 34, 0.14),
               inset -1px -1px 0 rgba(255, 254, 250, 0.7);
@@ -292,7 +322,7 @@ body[data-theme="foolscap"] .cad-btn.active {
 body[data-theme="foolscap"] .cad-input,
 body[data-theme="foolscap"] .cell-edit,
 body[data-theme="foolscap"] .md-live {
-  border: 1px solid #a8a192;
+  border: var(--border-w, 1px) solid #a8a192;
   box-shadow: inset 1px 1px 2px rgba(50, 44, 34, 0.12);
 }
 body[data-theme="foolscap"] .cad-input:focus { border-color: var(--cyan); }
@@ -303,7 +333,7 @@ body[data-theme="foolscap"] .cell-edit:focus {
 }
 /* square proof tabs; active tab freshly pressed with a deep-ink registration rule */
 body[data-theme="foolscap"] .pane-tab {
-  border: 1px solid #b0a99a;
+  border: var(--border-w, 1px) solid #b0a99a;
   border-bottom: none;
   border-radius: 0;
   background: #ddd9cf;
@@ -315,13 +345,13 @@ body[data-theme="foolscap"] .pane-tab.active {
   box-shadow: inset 0 2px 0 var(--blue);
   font-weight: 600;
 }
-body[data-theme="foolscap"] .pane-tabs { border-bottom: 1px solid #b0a99a; }
+body[data-theme="foolscap"] .pane-tabs { border-bottom: var(--border-w, 1px) solid #b0a99a; }
 /* titlebar: a light galley band closed off by the sheet's single ink rule */
 body[data-theme="foolscap"] #titlebar,
 body[data-theme="foolscap"] .win-titlebar {
   background: #a8a59c;
   color: #1c1810;
-  border-bottom: 1px solid #6f665a;
+  border-bottom: var(--border-w, 1px) solid #6f665a;
 }
 /* the wide galley tracking stays on the application band only; dialog
    titles share the one cross-theme type treatment (#156) */
@@ -331,11 +361,11 @@ body[data-theme="foolscap"] .grid thead th {
   background: #ece6da;
   color: #3a3226;
   border-right: none;
-  border-bottom: 1px solid #8a8070;
+  border-bottom: var(--border-w, 1px) solid #8a8070;
 }
 body[data-theme="foolscap"] .grid tbody td {
   border-right: none;
-  border-bottom: 1px solid rgba(50, 44, 34, 0.14);
+  border-bottom: var(--border-w, 1px) solid rgba(50, 44, 34, 0.14);
 }
 body[data-theme="foolscap"] .badge { background: rgba(60, 50, 35, 0.05); }
 /* light proof-slip tooltip with dark ink */
@@ -343,11 +373,11 @@ body[data-theme="foolscap"] #cad-tooltip,
 body[data-theme="foolscap"] #attn-pop {
   background: #f6f2e9;
   color: var(--ink);
-  border: 1px solid #a49d8e;
+  border: var(--border-w, 1px) solid #a49d8e;
   border-radius: 1px;
 }
 /* the single rule that separates the workspace from the statusbar */
-body[data-theme="foolscap"] #statusbar { border-top: 1px solid #b0a99a; }
+body[data-theme="foolscap"] #statusbar { border-top: var(--border-w, 1px) solid #b0a99a; }
 body[data-theme="foolscap"] .win {
   border-radius: 1px;
   overflow: hidden;
@@ -388,15 +418,25 @@ body[data-theme="vellum"] {
   --blue2: #4c6683;
   --radius: 2px;
 }
+/* gently raised controls: the sheet lifts under the fingertip, one press down */
 body[data-theme="vellum"] .cad-btn {
-  border: 1px solid #c1baa8;
-  background: #f6f2ea;
+  border: var(--border-w, 1px) solid #c1baa8;
+  background: linear-gradient(#f8f4ec, #efe9dc);
+  box-shadow: inset 0 1px 0 rgba(255, 253, 246, 0.8),
+              0 1px 1px rgba(60, 52, 36, 0.08);
 }
-body[data-theme="vellum"] .cad-btn:hover { background: #efeadd; border-color: #a49a86; }
-body[data-theme="vellum"] .cad-btn:active { background: #e6e0d1; }
+body[data-theme="vellum"] .cad-btn:hover {
+  background: linear-gradient(#fbf8f1, #f2ecdf);
+  border-color: #a49a86;
+}
+body[data-theme="vellum"] .cad-btn:active {
+  background: #e6e0d1;
+  box-shadow: inset 0 1px 2px rgba(60, 52, 36, 0.14);
+  transform: translateY(1px);
+}
 body[data-theme="vellum"] .cad-input,
 body[data-theme="vellum"] .cell-edit,
-body[data-theme="vellum"] .md-live { border: 1px solid #c1baa8; }
+body[data-theme="vellum"] .md-live { border: var(--border-w, 1px) solid #c1baa8; }
 body[data-theme="vellum"] .cad-input:focus { border-color: #2f6a63; }
 body[data-theme="vellum"] .pane-tab {
   border: none;
@@ -410,29 +450,29 @@ body[data-theme="vellum"] .pane-tab.active {
   box-shadow: inset 0 -2px 0 #3a556e;
   font-weight: 600;
 }
-body[data-theme="vellum"] .pane-tabs { border-bottom: 1px solid #cdc7b8; }
+body[data-theme="vellum"] .pane-tabs { border-bottom: var(--border-w, 1px) solid #cdc7b8; }
 body[data-theme="vellum"] #titlebar,
 body[data-theme="vellum"] .win-titlebar {
   background: #a6a298;
   color: #201c17;
-  border-bottom: 1px solid #7c7364;
+  border-bottom: var(--border-w, 1px) solid #7c7364;
 }
 body[data-theme="vellum"] .grid thead th {
   background: #f0ebde;
   color: #4c463a;
   border-right: none;
-  border-bottom: 1px solid #cdc7ba;
+  border-bottom: var(--border-w, 1px) solid #cdc7ba;
 }
 body[data-theme="vellum"] .grid tbody td {
   border-right: none;
-  border-bottom: 1px solid #ece7db;
+  border-bottom: var(--border-w, 1px) solid #ece7db;
 }
 body[data-theme="vellum"] .badge { background: #f0ebde; }
 body[data-theme="vellum"] #cad-tooltip,
 body[data-theme="vellum"] #attn-pop {
   background: #f7f3ea;
   color: #2a2620;
-  border: 1px solid #c1baa8;
+  border: var(--border-w, 1px) solid #c1baa8;
   border-radius: 2px;
   box-shadow: 0 6px 18px rgba(60, 52, 36, 0.18);
 }
@@ -477,7 +517,7 @@ body[data-theme="linen"] {
 }
 /* linen chrome: soft flax board, hairline rules, no hard black */
 body[data-theme="linen"] .cad-btn {
-  border: 1px solid #b8b2a3;
+  border: var(--border-w, 1px) solid #b8b2a3;
   background: linear-gradient(#f1eee6, #e9e5db);
 }
 body[data-theme="linen"] .cad-btn:hover { background: #f4f1ea; border-color: #a39c8b; }
@@ -488,7 +528,7 @@ body[data-theme="linen"] .cad-btn:active {
 body[data-theme="linen"] .cad-btn.danger { color: #9a3a2a; }
 body[data-theme="linen"] .cad-input,
 body[data-theme="linen"] .cell-edit,
-body[data-theme="linen"] .md-live { border: 1px solid #b8b2a3; }
+body[data-theme="linen"] .md-live { border: var(--border-w, 1px) solid #b8b2a3; }
 body[data-theme="linen"] .cad-input:focus,
 body[data-theme="linen"] .cell-edit:focus { border-color: #356a60; }
 /* tabs: flat, marked by a soft slate underline when active */
@@ -504,32 +544,32 @@ body[data-theme="linen"] .pane-tab.active {
   box-shadow: inset 0 -2px 0 #3c5570;
   font-weight: 600;
 }
-body[data-theme="linen"] .pane-tabs { border-bottom: 1px solid #c3beb1; }
+body[data-theme="linen"] .pane-tabs { border-bottom: var(--border-w, 1px) solid #c3beb1; }
 /* a light flax band under a single warm rule */
 body[data-theme="linen"] #titlebar,
 body[data-theme="linen"] .win-titlebar {
   background: #9e9b91;
   color: #201e18;
-  border-bottom: 1px solid #6e6a5e;
+  border-bottom: var(--border-w, 1px) solid #6e6a5e;
 }
 /* ruled catalogue table: single hairlines, no vertical rules */
 body[data-theme="linen"] .grid thead th {
   background: #e7e3da;
   color: #4c4739;
   border-right: none;
-  border-bottom: 1px solid #a39c8b;
+  border-bottom: var(--border-w, 1px) solid #a39c8b;
 }
 body[data-theme="linen"] .grid tbody td {
   border-right: none;
-  border-bottom: 1px solid #e5e1d7;
+  border-bottom: var(--border-w, 1px) solid #e5e1d7;
 }
 body[data-theme="linen"] .badge { background: rgba(148, 142, 126, 0.08); }
-body[data-theme="linen"] #statusbar { border-top: 1px solid #c3beb1; }
+body[data-theme="linen"] #statusbar { border-top: var(--border-w, 1px) solid #c3beb1; }
 body[data-theme="linen"] #cad-tooltip,
 body[data-theme="linen"] #attn-pop {
   background: #faf8f2;
   color: var(--ink);
-  border: 1px solid #948e7e;
+  border: var(--border-w, 1px) solid #948e7e;
   border-radius: 2px;
 }
 body[data-theme="linen"] .win {
@@ -542,6 +582,227 @@ body[data-theme="linen"] ::-webkit-scrollbar-track { background: #e7e3da; }
 body[data-theme="linen"] ::-webkit-scrollbar-thumb {
   background: #cdc8bc; border: 2px solid #e7e3da; border-radius: 2px;
 }
+
+/* ---------- PORCELAIN (cool glazed white, flat) ---------- */
+body[data-theme="porcelain"] {
+  --face: #e9edf0;
+  --face-hi: #f8fafb;
+  --face-sh: #d3dade;
+  --face-sh2: #9fabb3;
+  --face-active: #fbfcfd;
+  --canvas: #fbfcfd;
+  --canvas-line: #e9eef1;
+  --ink: #24292e;
+  --ink-light: #272c31;
+  --ink-mut: #5f6b73;
+  --input-bg: #ffffff;
+  --input-ink: #24292e;
+  --row-hover: #eff3f5;
+  --row-checked: #dfeaf0;
+  --row-manual: #e5efe3;
+  --cyan: #21707e;        /* glaze teal (focus / links) */
+  --green: #2f6f54;       /* both hold >=4.5 as text on --face */
+  --amber: #7c5d1e;
+  --red: #a63d33;
+  --blue: #3a5f8a;        /* cobalt band */
+  --blue2: #5c7ea6;
+  --radius: 5px;
+  /* Segoe UI Variable where Windows 11 provides it; plain Segoe elsewhere */
+  --ui: "Segoe UI Variable Text", "Segoe UI", Tahoma, Verdana, sans-serif;
+}
+/* the flattest chrome of the set: solid fills and hairlines only */
+body[data-theme="porcelain"] .cad-btn {
+  border: var(--border-w, 1px) solid #c6cfd4;
+  background: #fbfcfd;
+}
+body[data-theme="porcelain"] .cad-btn:hover { background: #f0f4f6; border-color: #a9b5bc; }
+body[data-theme="porcelain"] .cad-btn:active { background: #e4eaee; }
+body[data-theme="porcelain"] .cad-input,
+body[data-theme="porcelain"] .cell-edit,
+body[data-theme="porcelain"] .md-live { border: var(--border-w, 1px) solid #c6cfd4; }
+body[data-theme="porcelain"] .cad-input:focus,
+body[data-theme="porcelain"] .cell-edit:focus { border-color: var(--cyan); }
+body[data-theme="porcelain"] .pane-tab {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: #5d686f;
+}
+body[data-theme="porcelain"] .pane-tab.active {
+  background: transparent;
+  color: var(--ink);
+  box-shadow: inset 0 -2px 0 var(--blue);
+  font-weight: 600;
+}
+body[data-theme="porcelain"] .pane-tabs { border-bottom: var(--border-w, 1px) solid #d3dade; }
+body[data-theme="porcelain"] #titlebar,
+body[data-theme="porcelain"] .win-titlebar {
+  background: #9aa7af;
+  color: #1d2226;
+  border-bottom: var(--border-w, 1px) solid #77858e;
+}
+body[data-theme="porcelain"] .grid thead th {
+  background: #eef2f4;
+  color: #46525a;
+  border-right: none;
+  border-bottom: var(--border-w, 1px) solid #b9c4ca;
+}
+body[data-theme="porcelain"] .grid tbody td {
+  border-right: none;
+  border-bottom: var(--border-w, 1px) solid #ebeff2;
+}
+body[data-theme="porcelain"] .badge { background: rgba(159, 171, 179, 0.12); }
+body[data-theme="porcelain"] #statusbar { border-top: var(--border-w, 1px) solid #d3dade; }
+body[data-theme="porcelain"] #cad-tooltip,
+body[data-theme="porcelain"] #attn-pop {
+  background: #ffffff;
+  color: var(--ink);
+  border: var(--border-w, 1px) solid #9fabb3;
+  border-radius: 4px;
+}
+body[data-theme="porcelain"] .win {
+  border-radius: 5px;
+  overflow: hidden;
+  box-shadow: 0 12px 36px rgba(36, 48, 56, 0.18);
+}
+body[data-theme="porcelain"] .menu-drop,
+body[data-theme="porcelain"] #popup-menu { border-radius: 5px; }
+body[data-theme="porcelain"] ::-webkit-scrollbar { width: 9px; height: 9px; }
+body[data-theme="porcelain"] ::-webkit-scrollbar-track { background: transparent; }
+body[data-theme="porcelain"] ::-webkit-scrollbar-thumb {
+  background: #c6cfd4; border-radius: 5px; border: 2px solid #fbfcfd;
+}
+body[data-theme="porcelain"] ::-webkit-scrollbar-thumb:hover { background: #aab7be; }
+
+/* ---------- SLATE (dim school slate; the set's one non-light theme) ---------- */
+/* Dim, not dark: chrome sits near #3a4048 and the canvas near #262a30, well
+   above black-theme territory, with chalk-light ink and accents brightened
+   just enough to hold their meaning on the darker ground. */
+body[data-theme="slate"] {
+  --face: #3a4048;
+  --face-hi: #444b55;
+  --face-sh: #4a515b;      /* rules read lighter than the face in the dim theme */
+  --face-sh2: #5d6570;
+  --face-active: #4a525c;
+  --canvas: #262a30;
+  --canvas-line: #31363d;
+  --ink: #d3d7dd;
+  --ink-light: #d3d7dd;
+  --ink-mut: #b4bbc5;      /* >=4.5:1 on --face AND --face-hi (pane bars) */
+  --input-bg: #21252a;
+  --input-ink: #d7dbe1;
+  --row-hover: #2e333a;
+  --row-checked: #253540;
+  --row-manual: #2b3529;
+  --cyan: #8bcdc5;         /* accents brightened to hold >=4.5 as text even on
+                              --face-hi (chips, pane bars carry accent text) */
+  --green: #98c989;
+  --amber: #cfa95e;
+  --red: #e8a396;
+  --blue: #97aecb;         /* chalk-blue accent for tabs and bands */
+  --blue2: #8fa5c0;
+  --radius: 4px;
+}
+/* flat philosophy at night: solid fills, no relief, slightly lighter on hover */
+body[data-theme="slate"] .cad-btn {
+  border: var(--border-w, 1px) solid #545c66;
+  background: #424953;
+  color: var(--ink);
+}
+body[data-theme="slate"] .cad-btn:hover { background: #4a525c; border-color: #626b76; }
+body[data-theme="slate"] .cad-btn:active { background: #383f47; }
+/* danger text needs an extra step of light on the dim button face — enough
+   to hold 4.5:1 even on the lighter :hover face */
+body[data-theme="slate"] .cad-btn.danger { color: #f2b9ae; }
+/* the primary danger fill is the light --red; its label takes dark ink */
+body[data-theme="slate"] .cad-btn.primary.danger,
+body[data-theme="slate"] .cad-btn.primary.danger:hover { color: #2a1511; }
+body[data-theme="slate"] .cad-input,
+body[data-theme="slate"] .cell-edit,
+body[data-theme="slate"] .md-live { border: var(--border-w, 1px) solid #8a94a2; }  /* 3.4:1 vs --face — the border locates the field */
+body[data-theme="slate"] .cad-input:focus,
+body[data-theme="slate"] .cell-edit:focus { border-color: var(--cyan); }
+body[data-theme="slate"] .pane-tab {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: #abb3be;
+}
+body[data-theme="slate"] .pane-tab.active {
+  background: transparent;
+  color: var(--ink);
+  box-shadow: inset 0 -2px 0 var(--blue);
+  font-weight: 600;
+}
+/* the chalk-blue is a glyph color on the dim ground; active bottom-tab
+   labels are TEXT, so they take full ink and keep the blue as a rule */
+body[data-theme="slate"] .bottom-tab.active {
+  color: var(--ink);
+  box-shadow: inset 0 2px 0 var(--blue);
+}
+body[data-theme="slate"] .pane-tabs { border-bottom: var(--border-w, 1px) solid #4a515b; }
+body[data-theme="slate"] #titlebar,
+body[data-theme="slate"] .win-titlebar {
+  background: #2d3237;
+  color: #ced3da;
+  border-bottom: var(--border-w, 1px) solid #21252a;
+}
+body[data-theme="slate"] .grid thead th {
+  background: #30353c;
+  color: #b8bec7;
+  border-right: none;
+  border-bottom: var(--border-w, 1px) solid #4a515b;
+}
+body[data-theme="slate"] .grid tbody td {
+  border-right: none;
+  border-bottom: var(--border-w, 1px) solid #31363d;
+}
+body[data-theme="slate"] .badge { background: rgba(125, 151, 184, 0.14); }
+body[data-theme="slate"] #statusbar { border-top: var(--border-w, 1px) solid #4a515b; }
+body[data-theme="slate"] #cad-tooltip,
+body[data-theme="slate"] #attn-pop {
+  background: #2b3036;
+  color: var(--ink);
+  border: var(--border-w, 1px) solid #5d6570;
+  border-radius: 4px;
+}
+body[data-theme="slate"] .win {
+  border-radius: 4px;
+  overflow: hidden;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.5);
+}
+body[data-theme="slate"] .menu-drop,
+body[data-theme="slate"] #popup-menu { border-radius: 4px; }
+body[data-theme="slate"] ::-webkit-scrollbar { width: 10px; height: 10px; }
+body[data-theme="slate"] ::-webkit-scrollbar-track { background: transparent; }
+body[data-theme="slate"] ::-webkit-scrollbar-thumb {
+  background: #4c545e; border-radius: 5px; border: 2px solid #262a30;
+}
+body[data-theme="slate"] ::-webkit-scrollbar-thumb:hover { background: #5a636e; }
+/* hover rows paint the light chalk-blue behind them — white text (the base
+   rules' assumption of a dark accent) washes out; take dark ink instead */
+body[data-theme="slate"] .menu-item:hover:not(:disabled),
+body[data-theme="slate"] .fb-row:hover,
+body[data-theme="slate"] .ol-item:hover { color: #1d2226; }
+/* severity washes must DARKEN under the light ink, not lighten as the
+   translucent base mixes do over a light face */
+body[data-theme="slate"] #status-msg.err,
+body[data-theme="slate"] #auth-msg {
+  background: color-mix(in srgb, var(--amber) 24%, #23262b);
+}
+body[data-theme="slate"] #status-msg.crit {
+  background: color-mix(in srgb, var(--red) 26%, #23262b);
+}
+body[data-theme="slate"] #auth-msg.ok {
+  background: color-mix(in srgb, var(--green) 22%, #23262b);
+}
+/* the cross-theme --cr-* fills stay (semantic palette); on the dark canvas
+   the chip's BORDER carries the 1.4.11 boundary, so it steps up */
+body[data-theme="slate"] .cr-tag { border-color: #8a92a0; }
+/* resting bottom-tabs dim via color, not element opacity — the opacity
+   trick composites below 4.5:1 on the dim chrome */
+body[data-theme="slate"] .bottom-tab { opacity: 1; color: #b4bbc5; }
+body[data-theme="slate"] .bottom-tab:hover { color: var(--ink); }
 
 /* ===================== base ===================== */
 
@@ -567,6 +828,19 @@ body {
      instead of 100vh * scale — otherwise zooming in raises a page scrollbar
      and pushes the status bar off-screen. --ui-scale is set by applyUiScale. */
   height: calc(100vh / var(--ui-scale, 1));
+  font-weight: var(--wt-ui, 400);
+}
+
+/* --- text-selection policy ---------------------------------------------------
+   UI text is not selectable by click-drag. To copy a table field the user
+   hovers it and presses Ctrl+C (onFieldCopyKey); Ctrl+V pastes the same way.
+   Editable fields and the OCR / facsimile transcription panes keep native
+   selection so scanned/transcribed text can still be selected and copied. */
+body { user-select: none; -webkit-user-select: none; }
+input, textarea, [contenteditable="true"], .cell-edit,
+.an-text, .ocr-pglayout, .ppub-record-page, #con-lines {
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 /* --- Home tab --- */
@@ -579,7 +853,7 @@ body {
   padding: 26px 30px 24px;
   width: 100%;
   background: var(--face-hi);
-  border: 1px solid var(--face-sh);
+  border: var(--border-w, 1px) solid var(--face-sh);
   border-radius: var(--radius);
 }
 /* title on the left, mark on the right, and a printer's rule closing the head
@@ -632,7 +906,7 @@ body {
 /* cards sit on the sheet, so they carry only a hairline — no second fill */
 .home-card {
   background: none;
-  border: 1px solid var(--face-sh);
+  border: var(--border-w, 1px) solid var(--face-sh);
   border-radius: var(--radius);
   padding: 10px 12px 12px;
 }
@@ -641,7 +915,7 @@ body {
   letter-spacing: 1px;
   text-transform: uppercase;
   color: var(--ink-mut);
-  border-bottom: 1px solid var(--face-sh);
+  border-bottom: var(--border-w, 1px) solid var(--face-sh);
   padding-bottom: 5px;
   margin-bottom: 7px;
 }
@@ -728,7 +1002,7 @@ body {
   gap: 6px;
   padding: 3px 2px;
   font-size: 12px;
-  border-bottom: 1px solid var(--canvas-line);
+  border-bottom: var(--border-w, 1px) solid var(--canvas-line);
 }
 .home-act:last-child { border-bottom: 0; }
 .home-who { font-weight: bold; color: var(--ink); white-space: nowrap; }
@@ -738,7 +1012,7 @@ body {
 .home-act { cursor: pointer; }
 .home-act-arrow { flex: 0 0 10px; color: var(--ink-mut); font-size: 9px; }
 .home-act:hover .home-act-arrow { color: var(--cyan); }
-.home-act-det { padding: 2px 2px 5px 20px; border-bottom: 1px solid var(--canvas-line); }
+.home-act-det { padding: 2px 2px 5px 20px; border-bottom: var(--border-w, 1px) solid var(--canvas-line); }
 .had-row { display: flex; gap: 8px; align-items: baseline; padding: 1px 0; }
 .had-ts { flex: 0 0 auto; font-family: var(--mono); font-size: 10px; color: var(--ink-mut); }
 .had-txt { flex: 1 1 auto; min-width: 0; font-size: 11.5px; color: var(--ink); overflow-wrap: anywhere; }
@@ -750,7 +1024,7 @@ body {
   gap: 6px;
   padding: 3px 2px;
   font-size: 12px;
-  border-bottom: 1px solid var(--canvas-line);
+  border-bottom: var(--border-w, 1px) solid var(--canvas-line);
 }
 .home-user:last-child { border-bottom: 0; }
 .hu-name { font-weight: bold; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -760,7 +1034,7 @@ body {
   font-size: 9px;
   letter-spacing: 0.5px;
   text-transform: uppercase;
-  border: 1px solid var(--face-sh);
+  border: var(--border-w, 1px) solid var(--face-sh);
   border-radius: var(--radius);
   padding: 0 3px;
 }
@@ -775,7 +1049,7 @@ body {
 #review-show-resolved-row { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
 #review-list { flex: 1; min-height: 0; overflow: auto; padding: 4px 12px 12px; }
 .review-item {
-  border: 1px solid var(--face-sh);
+  border: var(--border-w, 1px) solid var(--face-sh);
   border-radius: var(--radius);
   background: var(--face-hi);
   padding: 8px 10px;
@@ -820,7 +1094,7 @@ button.ri-label:focus-visible { outline: 2px solid var(--blue); outline-offset: 
   margin-top: 6px;
   padding: 4px 6px;
   background: var(--canvas);
-  border: 1px solid var(--canvas-line);
+  border: var(--border-w, 1px) solid var(--canvas-line);
   border-radius: var(--radius);
   font-family: var(--mono);
   font-size: 11px;
@@ -1019,7 +1293,7 @@ button.ri-label:focus-visible { outline: 2px solid var(--blue); outline-offset: 
   padding: 0;
   display: flex;
   align-items: stretch;
-  border-bottom: 1px solid var(--face-sh2);
+  border-bottom: var(--border-w, 1px) solid var(--face-sh2);
   position: relative;
   z-index: 50;                 /* keep menu dropdowns above the content */
 }
@@ -1034,7 +1308,7 @@ button.ri-label:focus-visible { outline: 2px solid var(--blue); outline-offset: 
   transform: translate(-50%, -50%);
   max-width: calc(100% - 2 * var(--tb-inset, 280px));
   letter-spacing: 1px;
-  font-weight: bold;
+  font-weight: var(--wt-strong, bold);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1066,8 +1340,10 @@ body.desktop .win-controls { display: inline-flex; }
 .win-btn svg { width: 10px; height: 10px; display: block; }
 .win-btn svg rect, .win-btn svg path { stroke: currentColor; }
 .win-btn svg rect[fill]:not([fill="none"]) { fill: currentColor; }
-.win-btn:hover { background: rgba(20, 24, 28, 0.08); }
-.win-btn:active { background: rgba(20, 24, 28, 0.16); }
+/* ghost washes mix from --ink (not a hardcoded dark) so they stay
+   visible on Slate's dim chrome, where a near-black wash vanishes */
+.win-btn:hover { background: color-mix(in srgb, var(--ink) 8%, transparent); }
+.win-btn:active { background: color-mix(in srgb, var(--ink) 16%, transparent); }
 
 /* The frameless main-window controls sit directly on the title band, so they
    must read as part of it -- never as discrete faced buttons. The generic
@@ -1085,8 +1361,8 @@ body.desktop .win-controls { display: inline-flex; }
   border-radius: 0;
   color: inherit;
 }
-#titlebar .win-btn:hover { background: rgba(20, 24, 28, 0.08); }
-#titlebar .win-btn:active { background: rgba(20, 24, 28, 0.16); }
+#titlebar .win-btn:hover { background: color-mix(in srgb, var(--ink) 8%, transparent); }
+#titlebar .win-btn:active { background: color-mix(in srgb, var(--ink) 16%, transparent); }
 #titlebar .win-btn svg { width: 10px; height: 10px; }
 #titlebar .win-btn.win-close:hover { background: #e81123; color: #fff; }
 #titlebar .win-btn.win-close:active { background: #c50e1f; color: #fff; }
@@ -1117,7 +1393,10 @@ body.desktop .win-controls { display: inline-flex; }
    the #titlebar id beats the per-theme `.menu-btn` accent-colour overrides */
 #titlebar .menu-btn { color: var(--ink); }
 #titlebar .menu-btn:hover,
-#titlebar .menu-btn.active { background: rgba(20, 24, 28, 0.09); color: var(--ink); }
+#titlebar .menu-btn.active {
+  background: color-mix(in srgb, var(--ink) 9%, transparent);
+  color: var(--ink);
+}
 .menu-drop {
   position: absolute;
   top: 100%;
@@ -1126,7 +1405,7 @@ body.desktop .win-controls { display: inline-flex; }
   min-width: 230px;
   padding: 3px;
   background: var(--face-hi);
-  border: 1px solid var(--face-sh2);
+  border: var(--border-w, 1px) solid var(--face-sh2);
   border-radius: var(--radius);
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25);
 }
@@ -1153,7 +1432,8 @@ body.desktop .win-controls { display: inline-flex; }
 .menu-key { margin-left: auto; opacity: 0.6; font-size: 10px; padding-left: 18px; }
 .menu-check { display: inline-block; width: 12px; }
 .menu-check.on::before { content: "\2713"; }
-.menu-sep { margin: 3px 6px; border-top: 1px solid var(--face-sh); }
+.menu-item-custom { font-style: italic; }   /* user-made themes, set apart from the built-ins */
+.menu-sep { margin: 3px 6px; border-top: var(--border-w, 1px) solid var(--face-sh); }
 
 /* Theme / OCR-engine hover submenus. The parent is a .menu-item (no data-cmd —
    the click handler skips .menu-sub); its child .menu-drop reuses the dropdown
@@ -1194,18 +1474,23 @@ body.desktop .win-controls { display: inline-flex; }
   display: flex;
   align-items: center;
   justify-content: center;
-  background: transparent;
-  color: var(--ink);
-  opacity: 0.55;
+  /* a theme that sets --tab-tint washes each resting tab with its own
+     palette color; plain themes leave it at 0% (fully transparent). The
+     dimming lives in the icon color, not element opacity, so the wash
+     keeps its strength on the dimmed resting state. */
+  background: color-mix(in srgb, var(--tabc, var(--blue)) var(--tab-tint, 0%), transparent);
+  color: color-mix(in srgb, var(--ink) 62%, transparent);
   cursor: pointer;
   border: none;
   border-left: 2px solid transparent;
   border-radius: var(--radius);
 }
 .tab svg { width: 18px; height: 18px; display: block; }
-.tab:hover { opacity: 0.9; background: var(--face-hi); }
+.tab:hover {
+  color: color-mix(in srgb, var(--ink) 92%, transparent);
+  background: color-mix(in srgb, var(--tabc, var(--blue)) var(--tab-tint, 0%), var(--face-hi));
+}
 .tab.active {
-  opacity: 1;
   color: var(--tabc, var(--blue));
   border-left-color: var(--tabc, var(--blue));
   background: var(--face-active);
@@ -1220,6 +1505,9 @@ body.desktop .win-controls { display: inline-flex; }
   font: bold 10px var(--ui);
   letter-spacing: 0.5px;
   text-transform: uppercase;
+  /* the fallback letters are TEXT (4.5:1), not a glyph — dim less than
+     the inherited 62% icon color */
+  color: color-mix(in srgb, var(--ink) 85%, transparent);
 }
 #tabs .bar-spacer { flex: 1; }
 #tabs .tb-group {
@@ -1233,7 +1521,7 @@ body.desktop .win-controls { display: inline-flex; }
   align-self: center;
   width: 18px;
   margin: 4px 0;
-  border-top: 1px solid var(--face-sh);
+  border-top: var(--border-w, 1px) solid var(--face-sh);
 }
 /* .tb-spacer folded into .bar-spacer (identical) */
 .tool-btn {
@@ -1243,7 +1531,7 @@ body.desktop .win-controls { display: inline-flex; }
   padding: 3px 8px;
   background: transparent;
   color: var(--ink);
-  border: 1px solid transparent;
+  border: var(--border-w, 1px) solid transparent;
   border-radius: var(--radius);
   cursor: pointer;
   white-space: nowrap;
@@ -1503,7 +1791,7 @@ main {
   padding: 5px 8px;
   margin-bottom: 6px;
   background: var(--face-hi);
-  border: 1px solid var(--face-sh);
+  border: var(--border-w, 1px) solid var(--face-sh);
   border-radius: var(--radius);
 }
 
@@ -1520,7 +1808,7 @@ main {
   padding: 3px 6px;
   background: var(--input-bg);
   color: var(--input-ink);
-  border: 1px solid var(--face-sh2);
+  border: var(--border-w, 1px) solid var(--face-sh2);
   border-radius: var(--radius);
   outline: none;
 }
@@ -1534,7 +1822,7 @@ main {
   background: var(--face-hi);
   color: var(--ink);
   cursor: pointer;
-  border: 1px solid var(--face-sh2);
+  border: var(--border-w, 1px) solid var(--face-sh2);
   border-radius: var(--radius);
 }
 .cad-btn:hover { background: var(--face-active); }
@@ -1570,6 +1858,83 @@ body .cad-btn.primary.danger {
   border-color: var(--red);
   color: #fff;
 }
+
+/* --- one control height in mixed bars (--ctl-h) --------------------------
+   Fields, selects, and buttons historically carried three independent
+   height recipes (13px/3px input, 12px/4px button, 10px/1px tiny) that
+   only lined up by font-metric luck — and visibly didn't in centered
+   bars. Every bar that mixes fields with buttons pins its single-line
+   controls to --ctl-h; dense in-table/in-row controls (.col-act, .md-btn,
+   list-row tinies) keep their compact sizes. The explicit height also
+   absorbs ledger's 2px bottom border and survives user font changes.
+   inline-flex centers the label/glyph inside the pinned height. */
+.pane-bar > .cad-input:not(textarea),
+.pane-bar > select.cad-input,
+.pane-bar > .cad-btn,
+.pane-bar .year-filter .yr-input,
+.pane-bar .year-filter .cad-btn,
+#checked-toolbar > .cad-input,
+#checked-toolbar > .cad-btn,
+.src-row > .cad-input,
+.src-row > .cad-btn,
+.desc-label-row > .cad-btn,
+.mf-actions > .cad-btn,
+.ctl-join > .cad-input,
+.ctl-join > select.cad-input,
+.ctl-join > .cad-btn {
+  height: var(--ctl-h);
+}
+.pane-bar > .cad-btn,
+.pane-bar .year-filter .cad-btn,
+#checked-toolbar > .cad-btn,
+.src-row > .cad-btn,
+.desc-label-row > .cad-btn,
+.mf-actions > .cad-btn,
+.ctl-join > .cad-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+/* the display rule above would otherwise defeat the UA's [hidden] —
+   state-hidden bar buttons (index rollback, assign-all, rework) must
+   stay gone; the #checked-toolbar arm outranks its id-weight sibling */
+.pane-bar > .cad-btn[hidden],
+.pane-bar .year-filter .cad-btn[hidden],
+#checked-toolbar > .cad-btn[hidden],
+.src-row > .cad-btn[hidden],
+.desc-label-row > .cad-btn[hidden],
+.mf-actions > .cad-btn[hidden],
+.ctl-join > .cad-btn[hidden] {
+  display: none;
+}
+
+/* --- joined field+button groups (.ctl-join) ------------------------------
+   Wraps a text field and its action button(s) into one visual control:
+   flush edges, shared outline, rounding only on the outer corners. The
+   focused member raises itself so its accent border wins the overlap. */
+.ctl-join { display: inline-flex; align-items: stretch; }
+.ctl-join > .cad-input { flex: 1 1 auto; min-width: 0; }
+.ctl-join > :not(:first-child) {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  margin-left: -1px;
+}
+.ctl-join > :not(:last-child) {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.ctl-join > :focus,
+.ctl-join > .cad-btn:hover {
+  position: relative;
+  z-index: 1;
+}
+/* joins that replace a row-filling field inherit its flex */
+.src-row .ctl-join,
+.fb-path-row .ctl-join,
+.ri-add .ctl-join {
+  flex: 1;
+  min-width: 0;
+}
 body .cad-btn.primary.danger:hover {
   background: color-mix(in srgb, var(--red) 84%, #fff);
   border-color: var(--red);
@@ -1588,12 +1953,12 @@ body .cad-btn.quiet {
   box-shadow: none;
 }
 body .cad-btn.quiet:hover {
-  background: rgba(20, 24, 28, 0.07);
+  background: color-mix(in srgb, var(--ink) 7%, transparent);
   border-color: transparent;
   box-shadow: none;
 }
 body .cad-btn.quiet:active {
-  background: rgba(20, 24, 28, 0.14);
+  background: color-mix(in srgb, var(--ink) 14%, transparent);
   border-color: transparent;
   box-shadow: none;
   transform: none;
@@ -1605,7 +1970,7 @@ body .cad-btn.quiet:active {
   min-height: 0;
   overflow: auto;
   background: var(--canvas);
-  border: 1px solid var(--face-sh2);
+  border: var(--border-w, 1px) solid var(--face-sh2);
   border-radius: var(--radius);
 }
 
@@ -1625,8 +1990,8 @@ body .cad-btn.quiet:active {
   text-align: left;
   padding: 4px 6px;
   letter-spacing: 1px;
-  border-right: 1px solid var(--face-sh);
-  border-bottom: 1px solid var(--face-sh2);
+  border-right: var(--border-w, 1px) solid var(--face-sh);
+  border-bottom: var(--border-w, 1px) solid var(--face-sh2);
   white-space: nowrap;
   cursor: pointer;
 }
@@ -1638,8 +2003,8 @@ body .cad-btn.quiet:active {
 .grid thead th.mark-search { box-shadow: inset 0 -3px 0 var(--amber); color: var(--amber); }
 .grid tbody td {
   padding: 3px 6px;
-  border-right: 1px solid var(--canvas-line);
-  border-bottom: 1px solid var(--canvas-line);
+  border-right: var(--border-w, 1px) solid var(--canvas-line);
+  border-bottom: var(--border-w, 1px) solid var(--canvas-line);
   vertical-align: top;
   /* never wrap: overflow is hidden; the full text lives in the tooltip */
   white-space: nowrap;
@@ -1683,11 +2048,22 @@ body .cad-btn.quiet:active {
   margin: 0;
   background: var(--input-bg);
   color: var(--input-ink);
-  border: 1px solid var(--blue);
+  border: var(--border-w, 1px) solid var(--blue);
   border-radius: 3px;
   outline: none;
 }
 .cell-edit:focus { border-color: var(--cyan); box-shadow: inset 0 0 0 1px var(--cyan); }
+
+/* Ctrl+C / Ctrl+V field copy: a brief ring flash on the affected cell —
+   cyan for a copy, green for a paste (see flashCell). */
+.grid tbody td.cell-copied { --cell-flash: var(--cyan); }
+.grid tbody td.cell-pasted { --cell-flash: var(--green); }
+.grid tbody td.cell-copied,
+.grid tbody td.cell-pasted { animation: cell-flash 0.55s ease-out; }
+@keyframes cell-flash {
+  0%, 60% { box-shadow: inset 0 0 0 2px var(--cell-flash); }
+  100%    { box-shadow: inset 0 0 0 0 transparent; }
+}
 .col-whl, .col-act { text-align: center; overflow: visible; max-width: none; }
 .grid td.col-whl, .grid th.col-whl { padding-left: 2px; padding-right: 2px; }
 /* narrow (tag/action) column headers stay centred over their tags */
@@ -1705,7 +2081,7 @@ body .cad-btn.quiet:active {
   width: 15px;
   height: 15px;
   overflow: hidden;
-  border: 1px solid var(--face-sh2);
+  border: var(--border-w, 1px) solid var(--face-sh2);
   vertical-align: middle;
 }
 .cr-tag.cr-split .cr-left, .cr-tag.cr-split .cr-right { position: absolute; inset: 0; }
@@ -1874,7 +2250,7 @@ tr.whl-row-added.whl-row-draft td:first-child {
   box-shadow: inset 3px 0 0 var(--green), inset 6px 0 0 var(--amber);
 }
 tr.whl-selected {
-  outline: 1px solid var(--cyan);
+  outline: var(--border-w, 1px) solid var(--cyan);
   outline-offset: -1px;
   background: var(--row-checked);
 }
@@ -1922,40 +2298,6 @@ form.orig-view .cad-input {
   color: #6d675b;
 }
 
-/* --- smart check: provisional metadata overlay --- */
-/* Extracted-but-unbaked values: light yellow with a dotted black border.
-   outline (not border) so column widths never shift. */
-td.sc-prov,
-.cad-input.sc-prov {
-  background: #fff3b8 !important;
-  color: #2b2417;
-  outline: 1px dotted #1a1a1a;
-  outline-offset: -2px;
-}
-/* the wand: an under-styled inline trigger, not a big button.
-   State colours follow the badge convention — amber = in progress,
-   cyan = results waiting, green = verified match. */
-.sc-wand {
-  display: inline-flex;
-  align-items: center;
-  vertical-align: middle;
-  margin-left: 4px;
-  padding: 0;
-  border: 0;
-  background: none;
-  color: var(--ink-mut);
-  cursor: pointer;
-  line-height: 1;
-}
-.sc-wand svg { width: 12px; height: 12px; }
-.sc-wand:hover { color: var(--cyan); }
-.sc-wand.sc-running { color: var(--amber); }
-.sc-wand.sc-ready { color: var(--cyan); }
-.sc-wand.sc-match { color: var(--green); }
-/* in a table cell the wand keeps to the right edge of the title */
-td .sc-wand { float: right; }
-.sc-form-wand svg { width: 13px; height: 13px; }
-
 /* --- generic window chrome (shared by every overlay window) --- */
 .overlay {
   position: fixed;
@@ -1975,7 +2317,7 @@ td .sc-wand { float: right; }
   display: flex;
   flex-direction: column;
   background: var(--face);
-  border: 1px solid var(--face-sh2);
+  border: var(--border-w, 1px) solid var(--face-sh2);
   border-radius: var(--radius);
   box-shadow: 0 12px 34px rgba(0, 0, 0, 0.35);
 }
@@ -1989,9 +2331,9 @@ td .sc-wand { float: right; }
   padding: 4px 4px 4px var(--dlg-pad-x);
   background: var(--face-hi);
   color: var(--ink);
-  border-bottom: 1px solid var(--face-sh2);
+  border-bottom: var(--border-w, 1px) solid var(--face-sh2);
   letter-spacing: 0.2px;
-  font-weight: 600;
+  font-weight: var(--wt-strong, 600);
   font-size: 13px;
 }
 /* Dialog close: one quiet 32x32 ghost icon button. Only the application
@@ -2012,8 +2354,8 @@ td .sc-wand { float: right; }
   cursor: pointer;
 }
 .win-close svg { width: 14px; height: 14px; display: block; }
-.win-close:hover { background: rgba(20, 24, 28, 0.09); }
-.win-close:active { background: rgba(20, 24, 28, 0.18); }
+.win-close:hover { background: color-mix(in srgb, var(--ink) 9%, transparent); }
+.win-close:active { background: color-mix(in srgb, var(--ink) 18%, transparent); }
 .win-close:focus-visible { outline: 2px solid var(--cyan); outline-offset: -2px; }
 /* footer shared by dialog windows: quiet actions left, primary rightmost */
 .dlg-actions {
@@ -2087,7 +2429,7 @@ td .sc-wand { float: right; }
 .ia-pgrow.ia-pgcur { outline: 3px solid var(--cyan); outline-offset: 2px; }
 .ia-side {
   flex: 0 0 320px; overflow: auto; padding: 8px 10px;
-  border-left: 1px solid var(--face-sh2); background: var(--face);
+  border-left: var(--border-w, 1px) solid var(--face-sh2); background: var(--face);
 }
 .ia-meta { width: 100%; border-collapse: collapse; font-size: 12px; }
 .ia-meta th {
@@ -2097,7 +2439,7 @@ td .sc-wand { float: right; }
 .ia-meta td { padding: 2px 0; word-break: break-word; }
 .ia-dl-head {
   margin-top: 12px; padding-top: 8px; font-weight: bold; font-size: 12px;
-  border-top: 1px solid var(--face-sh2);
+  border-top: var(--border-w, 1px) solid var(--face-sh2);
 }
 .ia-downloads { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .ia-dl { cursor: pointer; }
@@ -2164,7 +2506,7 @@ td .sc-wand { float: right; }
 }
 .wiz-service-card {
   display: flex; flex-direction: column; gap: 6px; min-width: 0;
-  padding: 10px; border: 1px solid var(--face-sh); border-radius: var(--radius);
+  padding: 10px; border: var(--border-w, 1px) solid var(--face-sh); border-radius: var(--radius);
   background: var(--canvas);
 }
 .wiz-service-card p {
@@ -2175,7 +2517,7 @@ td .sc-wand { float: right; }
 .wiz-service-local p { min-height: 0; }
 .wiz-service-head { display: flex; align-items: center; gap: 7px; color: var(--ink); }
 .wiz-badge {
-  padding: 1px 5px; border: 1px solid var(--face-sh2); border-radius: 10px;
+  padding: 1px 5px; border: var(--border-w, 1px) solid var(--face-sh2); border-radius: 10px;
   color: var(--ink-mut); font: 9px var(--mono); letter-spacing: 0.5px;
 }
 .wiz-keys-msg { min-height: 16px; margin: 8px 0 0 !important; }
@@ -2188,7 +2530,7 @@ td .sc-wand { float: right; }
 .wiz-db-bar { height: 100%; width: 0; background: var(--blue); }
 .wizard-nav {
   display: flex; align-items: center; gap: 8px;
-  padding: 8px 12px; border-top: 1px solid var(--face-sh2);
+  padding: 8px 12px; border-top: var(--border-w, 1px) solid var(--face-sh2);
 }
 .wizard-spacer { flex: 1 1 auto; }
 @media (max-width: 520px) {
@@ -2262,7 +2604,7 @@ td .sc-wand { float: right; }
   gap: 5px;
   background: var(--canvas);
   color: var(--ink-light);
-  border: 1px solid var(--cyan);
+  border: var(--border-w, 1px) solid var(--cyan);
   border-radius: var(--radius);
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
 }
@@ -2285,7 +2627,7 @@ td .sc-wand { float: right; }
   padding: 4px 5px;
   background: var(--input-bg);
   color: var(--input-ink);
-  border: 1px solid var(--face-sh2);
+  border: var(--border-w, 1px) solid var(--face-sh2);
   border-radius: var(--radius);
   font-family: var(--mono);
   font-size: 11px;
@@ -2338,7 +2680,7 @@ td .sc-wand { float: right; }
   overflow-y: auto;
   background: var(--input-bg);
   color: var(--input-ink);
-  border: 1px solid var(--face-sh2);
+  border: var(--border-w, 1px) solid var(--face-sh2);
   border-radius: var(--radius);
 }
 .fb-row {
@@ -2383,7 +2725,7 @@ td .sc-wand { float: right; }
   overflow-y: auto;
   padding: 8px;
   background: var(--face-hi);
-  border: 1px solid var(--face-sh);
+  border: var(--border-w, 1px) solid var(--face-sh);
   border-radius: var(--radius);
 }
 #checked-right {
@@ -2399,7 +2741,7 @@ td .sc-wand { float: right; }
   display: flex;
   gap: 2px;
   margin-bottom: 6px;
-  border-bottom: 1px solid var(--face-sh);
+  border-bottom: var(--border-w, 1px) solid var(--face-sh);
   overflow-x: auto;
 }
 .pane-tab {
@@ -2411,7 +2753,7 @@ td .sc-wand { float: right; }
   color: var(--ink);
   cursor: pointer;
   white-space: nowrap;
-  border: 1px solid var(--face-sh);
+  border: var(--border-w, 1px) solid var(--face-sh);
   border-bottom: none;
   border-radius: 4px 4px 0 0;
 }
@@ -2433,7 +2775,7 @@ td .sc-wand { float: right; }
   max-height: 70vh;
   overflow: auto;
   background: var(--face);
-  border: 1px solid var(--face-sh2);
+  border: var(--border-w, 1px) solid var(--face-sh2);
   border-radius: var(--radius);
   box-shadow: 0 6px 22px rgba(0, 0, 0, 0.28);
   padding: 8px 10px 10px;
@@ -2455,7 +2797,7 @@ td .sc-wand { float: right; }
 .info-empty { color: var(--ink-mut); font-size: 11px; padding: 6px 2px; }
 .info-head {
   font-weight: bold; color: var(--blue); font-size: 12px;
-  padding-bottom: 4px; margin-bottom: 6px; border-bottom: 1px solid var(--face-sh);
+  padding-bottom: 4px; margin-bottom: 6px; border-bottom: var(--border-w, 1px) solid var(--face-sh);
   word-break: break-word;
 }
 .info-sec { margin-bottom: 8px; }
@@ -2487,7 +2829,7 @@ td .sc-wand { float: right; }
 .info-imgs { display: flex; flex-wrap: wrap; gap: 6px; }
 .info-thumb {
   width: 76px; height: 100px; object-fit: cover; cursor: zoom-in;
-  border: 1px solid var(--face-sh2); background: var(--face-hi);
+  border: var(--border-w, 1px) solid var(--face-sh2); background: var(--face-hi);
 }
 .info-thumb:hover { outline: 2px solid var(--cyan); }
 /* Image viewer (#158): recognizable chrome — a caption/close bar over the
@@ -2559,7 +2901,7 @@ td .sc-wand { float: right; }
   overflow-y: auto;
   background: var(--input-bg);
   color: var(--input-ink);
-  border: 1px solid var(--face-sh2);
+  border: var(--border-w, 1px) solid var(--face-sh2);
   border-radius: var(--radius);
   box-shadow: 0 6px 16px rgba(0, 0, 0, 0.2);
 }
@@ -2583,7 +2925,7 @@ td .sc-wand { float: right; }
   flex: 0 0 6px;
   cursor: col-resize;
   background: transparent;
-  border-left: 1px solid var(--face-sh);
+  border-left: var(--border-w, 1px) solid var(--face-sh);
 }
 #pane-splitter:hover { background: var(--face-active); }
 
@@ -2623,7 +2965,7 @@ td .sc-wand { float: right; }
   gap: 6px;
   padding: 3px 6px;
   background: var(--face-hi);
-  border: 1px solid var(--face-sh);
+  border: var(--border-w, 1px) solid var(--face-sh);
   border-radius: var(--radius);
 }
 #bottom-tabs { display: flex; align-items: flex-end; gap: 3px; }
@@ -2635,7 +2977,7 @@ td .sc-wand { float: right; }
   color: var(--ink);
   cursor: pointer;
   white-space: nowrap;
-  border: 1px solid var(--face-sh);
+  border: var(--border-w, 1px) solid var(--face-sh);
   border-bottom: none;
   border-radius: 5px 5px 0 0;
   opacity: 0.72;
@@ -2709,7 +3051,7 @@ tr.bottom-row:hover { background: var(--row-hover) !important; }
   overflow-y: auto;
   padding: 4px;
   background: var(--face-hi);
-  border: 1px solid var(--face-sh2);
+  border: var(--border-w, 1px) solid var(--face-sh2);
   border-radius: var(--radius);
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25);
   font-family: var(--ui);
@@ -2721,7 +3063,7 @@ tr.bottom-row:hover { background: var(--row-hover) !important; }
   letter-spacing: 1px;
   color: var(--blue);
   padding: 5px 8px 2px;
-  border-bottom: 1px solid var(--face-sh);
+  border-bottom: var(--border-w, 1px) solid var(--face-sh);
   margin-bottom: 2px;
 }
 .pm-head + .pm-head, .pm-item + .pm-head { margin-top: 6px; }
@@ -2753,7 +3095,7 @@ tr.bottom-row:hover { background: var(--row-hover) !important; }
   flex: 0 0 6px;
   cursor: row-resize;
   background: transparent;
-  border-top: 1px solid var(--face-sh);
+  border-top: var(--border-w, 1px) solid var(--face-sh);
   margin: 6px 0 0;
 }
 #upload-splitter:hover { background: var(--face-active); }
@@ -2769,7 +3111,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 
 .build-item {
   padding: 3px 8px;
-  border-bottom: 1px solid var(--canvas-line);
+  border-bottom: var(--border-w, 1px) solid var(--canvas-line);
   cursor: pointer;
   color: var(--ink-light);
 }
@@ -2825,7 +3167,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   flex-direction: column;
   padding: 8px;
   background: var(--face-hi);
-  border: 1px solid var(--face-sh);
+  border: var(--border-w, 1px) solid var(--face-sh);
   border-radius: var(--radius);
 }
 #build-editor[hidden] { display: none; }
@@ -2836,7 +3178,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 .act-sep {
   align-self: stretch;
   margin: 2px 6px;
-  border-left: 1px solid var(--face-sh);
+  border-left: var(--border-w, 1px) solid var(--face-sh);
 }
 #build-tabs { flex: none; }
 #build-editor .pane-sub.active {
@@ -2893,7 +3235,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   cursor: text;
-  border: 1px solid var(--face-sh2);
+  border: var(--border-w, 1px) solid var(--face-sh2);
   border-radius: var(--radius);
 }
 .md-live .md-line { min-height: 1.6em; }
@@ -2911,7 +3253,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 .md-live .mtok { color: var(--ink-mut); opacity: 0.75; }
 .md-live .md-hr .md-hrline {
   display: block;
-  border-top: 1px solid var(--face-sh);
+  border-top: var(--border-w, 1px) solid var(--face-sh);
   margin: 0.7em 0;
 }
 
@@ -2943,7 +3285,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   display: flex;
   gap: 6px;
   background: var(--canvas);
-  border: 1px solid var(--face-sh2);
+  border: var(--border-w, 1px) solid var(--face-sh2);
   border-radius: var(--radius);
   overflow: hidden;
 }
@@ -2976,7 +3318,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   overflow-wrap: anywhere;
   color: var(--ink-light);
   background: var(--canvas);
-  border-left: 1px solid var(--canvas-line);
+  border-left: var(--border-w, 1px) solid var(--canvas-line);
 }
 .pdf-ocrpane[hidden] { display: none; }
 .pdf-note {
@@ -2998,7 +3340,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   padding: 6px 8px;
   background: var(--canvas);
   color: var(--ink-light);
-  border: 1px solid var(--cyan);
+  border: var(--border-w, 1px) solid var(--cyan);
   border-radius: var(--radius);
   font-family: var(--mono);
   font-size: 11px;
@@ -3027,7 +3369,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   font-size: 14px;
   font-weight: 600;
   color: var(--ink);
-  border-bottom: 1px solid var(--face-sh);
+  border-bottom: var(--border-w, 1px) solid var(--face-sh);
   padding-bottom: 4px;
 }
 .cl-date {
@@ -3088,7 +3430,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   gap: 2px;
   padding: 10px 6px;
   background: var(--face);
-  border-right: 1px solid var(--face-sh);
+  border-right: var(--border-w, 1px) solid var(--face-sh);
 }
 .snav {
   font-family: var(--ui);
@@ -3106,7 +3448,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 .snav.active {
   background: var(--face-active);
   color: var(--blue);
-  font-weight: bold;
+  font-weight: var(--wt-strong, bold);
   box-shadow: inset 2px 0 0 var(--blue);
 }
 #settings-content {
@@ -3120,16 +3462,16 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 .settings-sec.active { display: block; }
 .settings-head {
   font-size: 11px;
-  font-weight: bold;
+  font-weight: var(--wt-strong, bold);
   letter-spacing: 1px;
   color: var(--blue);
-  border-bottom: 1px solid var(--face-sh);
+  border-bottom: var(--border-w, 1px) solid var(--face-sh);
   padding-bottom: 3px;
   margin-bottom: 10px;
 }
 .settings-subhead {
   font-size: 10px;
-  font-weight: bold;
+  font-weight: var(--wt-strong, bold);
   letter-spacing: 1px;
   color: var(--ink);
   opacity: 0.8;
@@ -3199,6 +3541,134 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 }
 .settings-col input { accent-color: var(--green); }
 
+/* --- theme editor (Settings > Theme editor) ---------------------------------
+   Per-theme token overrides. Controls are the app's own .cad-input/.cad-btn;
+   swatches, hex fields and sliders stay compact (22px / monospace) so the
+   editor reads as one of the CAD panels, not a settings splash. */
+.te-topbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.te-topbar label { font-size: 11px; letter-spacing: 1px; color: var(--ink); }
+.te-topbar select { max-width: 170px; }
+.te-count {
+  font-size: 11px;
+  letter-spacing: 0.5px;
+  color: var(--face-sh2);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.te-count::before {
+  content: "";
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  border: 1px solid var(--face-sh2);
+  box-sizing: border-box;
+}
+.te-count.dirty { color: var(--ink); }
+.te-count.dirty::before { background: var(--amber); border-color: var(--amber); }
+.te-topbar .te-reset-theme { margin-left: auto; }
+
+/* save / load / export / import bar */
+.te-savebar {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--face-sh);
+}
+.te-savebar label { font-size: 11px; letter-spacing: 1px; color: var(--ink); }
+.te-savebar select { max-width: 160px; }
+.te-savebar #te-save-name { width: 120px; }
+.te-savebar-sep { width: 1px; align-self: stretch; margin: 1px 3px; background: var(--face-sh); }
+
+/* live specimen: real classes so it reflects edits (colours, radius, weight) */
+.te-preview {
+  border: 1px solid var(--face-sh);
+  border-radius: var(--radius);
+  overflow: hidden;
+  margin-bottom: 14px;
+}
+.te-pv-bar {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 4px 9px;
+  background: var(--blue);
+  color: var(--face-hi);
+  font-size: 11px; letter-spacing: 1px;
+  font-weight: var(--wt-strong, bold);
+}
+.te-pv-bar .te-pv-file { font-family: var(--mono2); opacity: 0.8; letter-spacing: 0.5px; font-weight: 400; }
+.te-pv-body {
+  padding: 10px;
+  background: var(--canvas);
+  color: var(--ink);
+  display: flex; flex-direction: column; gap: 9px;
+}
+.te-pv-ctl { display: flex; align-items: center; gap: 10px; }
+.te-pv-link { color: var(--cyan); font-size: 12px; text-decoration: underline; cursor: default; }
+.te-pv-link.sec { color: var(--blue2); }
+.te-pv-rows { display: flex; gap: 6px; }
+.te-pv-row {
+  flex: 1; text-align: center;
+  font-size: 10px; letter-spacing: 0.5px;
+  padding: 4px 6px;
+  border-radius: var(--radius);
+  color: var(--ink);
+  border: var(--border-w, 1px) solid var(--canvas-line);
+}
+.te-pv-row.hover { background: var(--row-hover); }
+.te-pv-row.checked { background: var(--row-checked); }
+.te-pv-row.manual { background: var(--row-manual); }
+.te-pv-chips { display: flex; gap: 14px; font-size: 11px; letter-spacing: 0.5px; font-family: var(--mono); }
+.te-pv-chips .ok { color: var(--green); }
+.te-pv-chips .warn { color: var(--amber); }
+.te-pv-chips .err { color: var(--red); }
+.te-pv-note { font-size: 11px; color: var(--ink-light); }
+.te-pv-note .muted { color: var(--face-sh2); }
+
+/* token grid: label | control cluster, matching .settings-rows density */
+.te-rows {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 7px 12px;
+  align-items: center;
+}
+.te-rows .settings-subhead { grid-column: 1 / -1; margin: 12px 0 0; }
+.te-rows .settings-subhead:first-child { margin-top: 0; }
+.te-rows > label { font-size: 11px; letter-spacing: 1px; color: var(--ink); }
+.te-ctl { display: flex; align-items: center; gap: 8px; }
+.te-swatch {
+  width: 22px; height: 22px; flex: 0 0 auto;
+  padding: 0; cursor: pointer;
+  border: 1px solid var(--face-sh2);
+  border-radius: 3px;                /* fixed: the swatch must not restyle as you edit --radius */
+  background: transparent;
+}
+.te-swatch::-webkit-color-swatch-wrapper { padding: 2px; }
+.te-swatch::-webkit-color-swatch { border: none; border-radius: 2px; }
+.te-hex { width: 90px; font-family: var(--mono); text-transform: uppercase; }
+.te-hex.bad { border-color: var(--red); }
+.te-range { flex: 0 0 150px; accent-color: var(--cyan); }
+.te-num { width: 52px; font-family: var(--mono); }
+.te-unit { font-size: 11px; letter-spacing: 1px; color: var(--face-sh2); }
+.te-wsel { max-width: 160px; }
+.te-fontsel { max-width: 190px; }
+.te-revert {
+  visibility: hidden;                /* reserves space so rows never reflow */
+  width: 18px; height: 18px; flex: 0 0 auto;
+  padding: 0; font-size: 12px; line-height: 1;
+  border: 1px solid transparent; border-radius: 3px;
+  background: transparent; color: var(--face-sh2); cursor: pointer;
+}
+.te-revert.on { visibility: visible; }
+.te-revert:hover { color: var(--ink); border-color: var(--face-sh2); }
+
 /* --- status bar --- */
 #statusbar {
   display: flex;
@@ -3208,7 +3678,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   font-size: 11px;
   letter-spacing: 1px;
   color: var(--ink);
-  border-top: 1px solid var(--face-sh);
+  border-top: var(--border-w, 1px) solid var(--face-sh);
 }
 #status-msg::before { content: "> "; color: var(--blue); }
 
@@ -3225,9 +3695,11 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 }
 #status-msg.err  { background: color-mix(in srgb, var(--amber) 34%, transparent); }
 #status-msg.crit { background: color-mix(in srgb, var(--red) 38%, transparent); }
-/* two ids: a theme may recolour the "> " prompt, and severity must outrank it */
-#statusbar #status-msg.err::before  { color: var(--amber); }
-#statusbar #status-msg.crit::before { color: var(--red); }
+/* two ids: a theme may recolour the "> " prompt, and severity must outrank
+   it. The prompt stays --ink — the tint alone carries severity; an
+   accent-on-its-own-wash prompt bottomed out near 2.7:1 in every theme. */
+#statusbar #status-msg.err::before,
+#statusbar #status-msg.crit::before { color: var(--ink); }
 
 .foot-right { display: flex; align-items: center; gap: 10px; }
 
@@ -3246,7 +3718,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   font-size: 10.5px;
   letter-spacing: 0.3px;
   padding-left: 8px;
-  border-left: 1px solid var(--face-sh);
+  border-left: var(--border-w, 1px) solid var(--face-sh);
   cursor: pointer;
   white-space: nowrap;
 }
@@ -3263,6 +3735,14 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 .foot-tag[hidden] { display: none; }
 .foot-tag.tag-verified { color: var(--green); font-weight: bold; }
 
+/* Footer note flash: the status line briefly glows green when a field is
+   copied or pasted, so the copy registers even without watching the cell. */
+#status-msg.copy-flash { animation: status-copy-flash 0.9s ease-out; }
+@keyframes status-copy-flash {
+  0%, 70% { color: var(--green); text-shadow: 0 0 6px var(--green); }
+  100%    { color: inherit; text-shadow: none; }
+}
+
 /* --- Workbench shell (#133 stage 1): shared split, phase rail, phases --- */
 #wb-split {
   flex: 1.6;
@@ -3278,6 +3758,8 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   flex-direction: column;
   gap: 4px;
   min-height: 0;
+  overflow: hidden;         /* clean clip when collapsed to the 34px strip */
+  background: var(--face);  /* a solid full-height rail, like #publish-side */
 }
 /* the phase rail: a compact vertical strip of quiet buttons */
 #wb-rail {
@@ -3296,7 +3778,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   padding: 4px 9px;
   color: var(--ink-light);
   background: transparent;
-  border: 1px solid transparent;
+  border: var(--border-w, 1px) solid transparent;
   border-radius: var(--radius);
   cursor: pointer;
   white-space: nowrap;
@@ -3328,7 +3810,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   padding: 0 6px;
   color: var(--ink-light);
   background: transparent;
-  border: 1px solid var(--face-sh);
+  border: var(--border-w, 1px) solid var(--face-sh);
   border-radius: var(--radius);
   cursor: pointer;
   white-space: nowrap;
@@ -3416,7 +3898,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   flex: 0 0 6px;
   cursor: col-resize;
   background: transparent;
-  border-left: 1px solid var(--face-sh);
+  border-left: var(--border-w, 1px) solid var(--face-sh);
 }
 #an-facsimile-splitter:hover { background: var(--face-active); }
 #an-integrated-host {
@@ -3439,7 +3921,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   margin: 0 auto 12px;
   color: var(--input-ink);
   background: var(--input-bg);
-  border: 1px solid var(--canvas-line);
+  border: var(--border-w, 1px) solid var(--canvas-line);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
   cursor: pointer;
 }
@@ -3457,7 +3939,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   padding: 3px 7px;
   color: var(--ink-mut);
   background: var(--face-hi);
-  border-bottom: 1px solid var(--canvas-line);
+  border-bottom: var(--border-w, 1px) solid var(--canvas-line);
   font: 10px var(--ui);
 }
 .an-fac-pagebar {
@@ -3472,7 +3954,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   margin-left: auto;
   padding: 0 4px;
   color: var(--ink-light);
-  border: 1px solid var(--face-sh2);
+  border: var(--border-w, 1px) solid var(--face-sh2);
   border-radius: var(--radius);
   font: 9px var(--ui);
   letter-spacing: 0.4px;
@@ -3499,7 +3981,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 #ocr-docs { list-style: none; margin: 0; padding: 0; font-family: var(--mono); }
 .ocr-doc {
   padding: 3px 8px;
-  border-bottom: 1px solid var(--canvas-line);
+  border-bottom: var(--border-w, 1px) solid var(--canvas-line);
   cursor: pointer;
   color: var(--ink-light);
 }
@@ -3520,8 +4002,15 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 /* wrapping breaks lines on the flex base size, and an input's automatic
    minimum is its ~130px intrinsic width — the explicit 60px floor + basis let
    both inputs give ground so the trailing save button stays on the row at
-   1280px; grow restores the full 130px whenever the bar has room */
+   1280px; grow restores the full 130px whenever the bar has room. The
+   .ctl-join wrappers are the bar's flex items now, so the same contract
+   lives on them (basis = input floor + the joined icon button). */
 #ocr-find, #ocr-replace { flex: 1 1 60px; min-width: 60px; max-width: 130px; }
+#ocr-mainpane .pane-bar .ctl-join {
+  flex: 1 1 84px;
+  min-width: 84px;
+  max-width: 156px;
+}
 .ocr-pagenav { display: inline-flex; align-items: center; gap: 4px; }
 #ocr-page-jump { width: 3.6em; text-align: center; }
 .ocr-keymap {
@@ -3531,7 +4020,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   color: var(--ink-mut);
   padding: 4px 9px;
   background: var(--face-hi);
-  border: 1px solid var(--face-sh);
+  border: var(--border-w, 1px) solid var(--face-sh);
   border-radius: var(--radius);
 }
 .ocr-keymap b { color: var(--ink); font-weight: 600; letter-spacing: 0; }
@@ -3559,7 +4048,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 .d-add { background: rgba(35, 176, 57, 0.16); color: var(--green); }
 .d-skip { opacity: 0.5; font-style: italic; padding: 2px 0; }
 #ocr-queue-wrap { flex: 0 0 140px; min-height: 90px; }
-.pane-bar select.cad-input { height: 22px; padding: 1px 4px; }
+.pane-bar select.cad-input { height: var(--ctl-h); padding: 1px 4px; }
 
 /* page-view marks: title pages, queued-for-OCR pages, range start */
 .ocr-pgimg { position: relative; background: #fff center / cover no-repeat; }
@@ -3569,7 +4058,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   font-size: 10px;
   letter-spacing: 0.5px;
   padding: 0 4px;
-  border: 1px solid var(--face-sh2);
+  border: var(--border-w, 1px) solid var(--face-sh2);
   border-radius: var(--radius);
   background: var(--face-hi);
   color: var(--ink-light);
@@ -3621,7 +4110,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 .ocr-pgimg img {
   display: block;
   width: 100%;
-  border: 1px solid var(--canvas-line);
+  border: var(--border-w, 1px) solid var(--canvas-line);
   background: transparent;   /* the blur-up thumbnail on .ocr-pgimg shows through */
 }
 /* layout mode: a facsimile pane the same shape as the page, holding the page's
@@ -3630,7 +4119,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   position: relative;
   width: 100%;
   background: var(--ocr-paper-color, var(--input-bg));
-  border: 1px solid var(--canvas-line);
+  border: var(--border-w, 1px) solid var(--canvas-line);
   overflow: hidden;
 }
 .ocr-pglayout.empty {
@@ -3669,7 +4158,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   display: block;
   max-width: 100%;
   margin: 0.5em auto;
-  border: 1px solid var(--canvas-line);
+  border: var(--border-w, 1px) solid var(--canvas-line);
   background: #fff;
 }
 /* Region facsimile: typed blocks (Mistral OCR-4) placed on the page. Under-
@@ -3775,6 +4264,15 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 .rw-prevregion img { width: 100%; height: 100%; object-fit: contain; }
 /* style board: one compact row per role */
 #rw-styleboard { padding: 4px; overflow-y: auto; }
+/* the per-book "instructions for editors / AI" note the .lib export embeds */
+#rw-instr {
+  display: block;
+  width: calc(100% - 8px);
+  margin: 4px;
+  resize: vertical;
+  font-size: 11px;
+  line-height: 1.4;
+}
 .rw-stylerow {
   display: flex;
   gap: 3px;
@@ -3914,7 +4412,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   font-size: 10px;
   letter-spacing: 0.5px;
   padding: 1px 8px;
-  border: 1px solid var(--face-sh2);
+  border: var(--border-w, 1px) solid var(--face-sh2);
   border-radius: var(--radius);
   background: var(--face-hi);
   cursor: pointer;
@@ -3942,13 +4440,13 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   display: block;
   width: 140px;
   height: auto;
-  border: 1px solid var(--face-sh2);
+  border: var(--border-w, 1px) solid var(--face-sh2);
   background: #fff;
 }
 .res-gallery { display: flex; flex-wrap: wrap; gap: 10px; }
 .res-card {
   width: 110px;
-  border: 1px solid var(--face-sh2);
+  border: var(--border-w, 1px) solid var(--face-sh2);
   background: var(--face-hi);
   padding: 5px;
   text-align: center;
@@ -3958,7 +4456,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   width: 100%;
   height: 130px;
   object-fit: cover;
-  border: 1px solid var(--canvas-line);
+  border: var(--border-w, 1px) solid var(--canvas-line);
   background: #fff;
   margin-bottom: 4px;
 }
@@ -3980,19 +4478,58 @@ body[data-theme] .drafting::-webkit-scrollbar {
   flex: 0 0 6px;
   cursor: col-resize;
   background: transparent;
-  border-left: 1px solid var(--face-sh);
+  border-left: var(--border-w, 1px) solid var(--face-sh);
 }
 #ocr-side-splitter, #ocr-queue-splitter {
   flex: 0 0 6px;
   cursor: row-resize;
   background: transparent;
-  border-top: 1px solid var(--face-sh);
+  border-top: var(--border-w, 1px) solid var(--face-sh);
 }
-#ocr-queue-splitter[hidden] { display: none; }
+#ocr-queue-splitter[hidden], #ocr-side-splitter[hidden] { display: none; }
 #ocr-splitter:hover, #form-splitter:hover,
 #ocr-side-splitter:hover, #ocr-queue-splitter:hover {
   background: var(--face-active);
 }
+
+/* --- Reusable collapsible section (VS Code-style vertical collapse) ----------
+   A titled panel that folds away vertically. Markup: a header row
+   (.collapse-head — typically a .pane-bar) carrying a leading .collapse-caret
+   button (▾ open / ▸ collapsed), and the body element (.collapse-body) right
+   after it. makeCollapsible(head, body, key) in app.js injects the caret, wires
+   the toggle, and persists per-key in settings.collapsed. The only visual state
+   is .sec-collapsed, added to the body (and the caret's glyph). Interactive
+   controls inside the head keep working — only the caret / empty header toggles.
+   Reuse anywhere a stacked panel should be foldable. */
+.collapse-caret {
+  flex: none;
+  width: 15px;
+  height: 18px;
+  margin-right: -1px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink-mut);
+  font: 10px/18px var(--ui);
+  text-align: center;
+  cursor: pointer;
+}
+.collapse-caret:hover { color: var(--ink); }
+.collapse-head { cursor: pointer; user-select: none; }
+.collapse-body.sec-collapsed { display: none; }
+/* When one stacked section is collapsed, the sibling must fill the freed space
+   even if a splitter drag pinned it to a fixed `flex: 0 0 Npx` inline basis
+   (!important outranks the inline style). Restores the drag size once both open. */
+#ocr-side:has(#ocr-doc-wrap.sec-collapsed) #ocr-books-wrap,
+#ocr-side:has(#ocr-books-wrap.sec-collapsed) #ocr-doc-wrap { flex: 1 1 auto !important; }
+
+/* --- Workbench sidebar: whole-sidebar horizontal collapse (mirrors Publish) -- */
+#ocr-side-toggle { flex: none; width: 22px; padding-left: 0; padding-right: 0; }
+#wb-split.wb-side-collapsed #ocr-side { width: 34px !important; }
+#wb-split.wb-side-collapsed #ocr-side > :not(#builds-tabs),
+#wb-split.wb-side-collapsed #builds-tabs > :not(#ocr-side-toggle),
+#wb-split.wb-side-collapsed #ocr-splitter { display: none; }
+#wb-split.wb-side-collapsed #builds-tabs { padding: 4px; }
 
 /* --- documents tree: one node per PDF source, its OCR files beneath ------- */
 .ocr-src {
@@ -4000,7 +4537,7 @@ body[data-theme] .drafting::-webkit-scrollbar {
   align-items: center;
   gap: 5px;
   padding: 3px 6px;
-  border-bottom: 1px solid var(--canvas-line);
+  border-bottom: var(--border-w, 1px) solid var(--canvas-line);
   cursor: pointer;
   font-family: var(--mono);
   color: var(--ink-light);
@@ -4035,8 +4572,8 @@ body[data-theme] .drafting::-webkit-scrollbar {
   padding: 3px 6px;
   color: var(--ink-mut);
   background: var(--face-hi);
-  border-top: 1px solid var(--canvas-line);
-  border-bottom: 1px solid var(--canvas-line);
+  border-top: var(--border-w, 1px) solid var(--canvas-line);
+  border-bottom: var(--border-w, 1px) solid var(--canvas-line);
   font: 10px var(--ui);
   font-weight: 600;
   letter-spacing: 0.7px;
@@ -4051,7 +4588,7 @@ body[data-theme] .drafting::-webkit-scrollbar {
   min-height: 23px;
   padding: 3px 8px 3px 20px;
   color: var(--ink-light);
-  border-bottom: 1px solid var(--canvas-line);
+  border-bottom: var(--border-w, 1px) solid var(--canvas-line);
   font-family: var(--mono);
   cursor: pointer;
 }
@@ -4088,7 +4625,7 @@ body[data-theme] .drafting::-webkit-scrollbar {
   width: 22px;
   height: 28px;
   object-fit: cover;
-  border: 1px solid var(--face-sh2);
+  border: var(--border-w, 1px) solid var(--face-sh2);
   background: #fff;
   flex: none;
 }
@@ -4123,7 +4660,7 @@ body[data-theme] .drafting::-webkit-scrollbar {
   min-height: 24px;
   padding: 2px 4px;
   background: var(--input-bg);
-  border: 1px solid var(--face-sh2);
+  border: var(--border-w, 1px) solid var(--face-sh2);
   border-radius: var(--radius);
 }
 .cat-picker:focus-within { border-color: var(--cyan); }
@@ -4138,7 +4675,7 @@ body[data-theme] .drafting::-webkit-scrollbar {
   padding: 0 2px 0 6px;
   color: var(--ink);
   background: var(--row-checked);
-  border: 1px solid var(--face-sh);
+  border: var(--border-w, 1px) solid var(--face-sh);
   border-radius: var(--radius);
   white-space: nowrap;
 }
@@ -4173,7 +4710,7 @@ body[data-theme] .drafting::-webkit-scrollbar {
   max-height: 220px;
   overflow-y: auto;
   background: var(--input-bg);
-  border: 1px solid var(--face-sh2);
+  border: var(--border-w, 1px) solid var(--face-sh2);
   border-radius: 0 0 var(--radius) var(--radius);
   box-shadow: 0 3px 10px rgba(0, 0, 0, 0.18);
 }
@@ -4194,7 +4731,7 @@ body[data-theme] .drafting::-webkit-scrollbar {
   width: 330px;
   padding: 6px;
   background: var(--face);
-  border: 1px solid var(--face-sh2);
+  border: var(--border-w, 1px) solid var(--face-sh2);
   border-radius: var(--radius);
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
 }
@@ -4212,7 +4749,7 @@ body[data-theme] .drafting::-webkit-scrollbar {
 #cat-tree {
   height: 340px;
   overflow-y: auto;
-  border: 1px solid var(--canvas-line);
+  border: var(--border-w, 1px) solid var(--canvas-line);
 }
 .cat-row {
   display: flex;
@@ -4221,7 +4758,7 @@ body[data-theme] .drafting::-webkit-scrollbar {
   padding: 2px 8px;
   font-family: var(--ui);
   font-size: 12px;
-  border-bottom: 1px solid var(--canvas-line);
+  border-bottom: var(--border-w, 1px) solid var(--canvas-line);
 }
 .cat-row:hover { background: var(--row-hover); }
 .cat-row.merge-src { background: var(--row-manual); }
@@ -4256,7 +4793,7 @@ body[data-theme] .drafting::-webkit-scrollbar {
   flex: none;
   display: flex;
   flex-direction: column;
-  border-right: 1px solid var(--face-sh);
+  border-right: var(--border-w, 1px) solid var(--face-sh);
   background: var(--face);
 }
 #an-list-wrap { margin: 4px; }
@@ -4288,7 +4825,7 @@ body[data-theme] .drafting::-webkit-scrollbar {
   line-height: 1.5;
   white-space: pre-wrap;
   background: var(--canvas);
-  border: 1px solid var(--canvas-line);
+  border: var(--border-w, 1px) solid var(--canvas-line);
   padding: 10px;
   margin: 0;
   overflow-y: auto;
@@ -4341,7 +4878,7 @@ body[data-theme] .drafting::-webkit-scrollbar {
   min-height: 25px;
   gap: 3px;
   padding: 1px 5px 1px calc(3px + var(--tree-depth) * 15px);
-  border: 1px solid transparent;
+  border: var(--border-w, 1px) solid transparent;
 }
 .publish-tree-row:hover { background: var(--row-hover); }
 .publish-tree-node.selected > .publish-tree-row {
@@ -4383,8 +4920,8 @@ button.publish-tree-label { cursor: pointer; }
   flex: none;
   cursor: col-resize;
   background: var(--face-sh);
-  border-left: 1px solid var(--face-sh2);
-  border-right: 1px solid var(--face-hi);
+  border-left: var(--border-w, 1px) solid var(--face-sh2);
+  border-right: var(--border-w, 1px) solid var(--face-hi);
 }
 #publish-splitter:hover { background: var(--face-active); }
 #publish-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
@@ -4422,7 +4959,7 @@ button.publish-tree-label { cursor: pointer; }
   gap: 14px;
   padding: 15px 26px 14px;
   background: var(--pp-chrome);
-  border-bottom: 1px solid var(--pp-rule);
+  border-bottom: var(--border-w, 1px) solid var(--pp-rule);
 }
 .ppub-masthead img { display: block; flex: none; }
 .ppub-wordmark { font-size: 25px; line-height: 1.15; font-weight: 700; letter-spacing: 0.4px; }
@@ -4440,7 +4977,7 @@ button.publish-tree-label { cursor: pointer; }
 .ppub-chip {
   display: inline-block;
   padding: 2px 8px;
-  border: 1px solid var(--pp-rule-soft);
+  border: var(--border-w, 1px) solid var(--pp-rule-soft);
   color: var(--pp-ink-soft);
   background: #ebe5d8;
   font-size: 11px;
@@ -4462,15 +4999,15 @@ button.publish-tree-label { cursor: pointer; }
 .ppub-prose ul, .ppub-prose ol { margin: 0 0 14px; padding-left: 28px; }
 .ppub-prose li { margin: 3px 0; }
 .ppub-prose blockquote { margin: 14px 0; padding: 4px 16px; border-left: 3px solid var(--pp-rule-mid); color: var(--pp-ink-soft); font-style: italic; }
-.ppub-prose hr { border: 0; border-top: 1px solid var(--pp-rule-soft); margin: 20px 0; }
-.ppub-prose pre { overflow: auto; margin: 14px 0; padding: 12px 14px; border: 1px solid var(--pp-rule-soft); background: var(--pp-card); }
+.ppub-prose hr { border: 0; border-top: var(--border-w, 1px) solid var(--pp-rule-soft); margin: 20px 0; }
+.ppub-prose pre { overflow: auto; margin: 14px 0; padding: 12px 14px; border: var(--border-w, 1px) solid var(--pp-rule-soft); background: var(--pp-card); }
 .ppub-prose code { font: 0.9em/1.45 Consolas, "Courier New", monospace; }
 .ppub-loading, .ppub-faint, .ppub-note-more { color: var(--pp-ink-faint); }
-.ppub-preview-warning { margin: 0 0 18px; padding: 9px 11px; border: 1px solid #927b55; background: #eee5d3; color: #51462f; font-size: 12px; }
+.ppub-preview-warning { margin: 0 0 18px; padding: 9px 11px; border: var(--border-w, 1px) solid #927b55; background: #eee5d3; color: #51462f; font-size: 12px; }
 .ppub-book-side { align-self: start; position: sticky; top: 18px; }
-.ppub-thumb { display: block; width: 100%; max-width: 200px; height: auto; aspect-ratio: 3/4; object-fit: cover; border: 1px solid var(--pp-rule-soft); background: #fff; margin: 0 0 18px; }
+.ppub-thumb { display: block; width: 100%; max-width: 200px; height: auto; aspect-ratio: 3/4; object-fit: cover; border: var(--border-w, 1px) solid var(--pp-rule-soft); background: #fff; margin: 0 0 18px; }
 .ppub-meta { width: 100%; border-collapse: collapse; margin-bottom: 22px; font-size: 13.5px; }
-.ppub-meta th, .ppub-meta td { padding: 8px 0; border-bottom: 1px solid var(--pp-rule-soft); text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+.ppub-meta th, .ppub-meta td { padding: 8px 0; border-bottom: var(--border-w, 1px) solid var(--pp-rule-soft); text-align: left; vertical-align: top; overflow-wrap: anywhere; }
 .ppub-meta tr:first-child th, .ppub-meta tr:first-child td { border-top: 3px double var(--pp-rule); }
 .ppub-meta th { width: 38%; padding-right: 12px; color: var(--pp-ink-faint); font-size: 10.5px; font-weight: 600; letter-spacing: 1px; text-transform: uppercase; }
 .ppub-meta a, .ppub-cat-link { color: var(--pp-link); text-decoration: none; }
@@ -4478,7 +5015,7 @@ button.publish-tree-label { cursor: pointer; }
 .ppub-btn {
   display: inline-block;
   padding: 9px 13px;
-  border: 1px solid var(--pp-rule-mid);
+  border: var(--border-w, 1px) solid var(--pp-rule-mid);
   color: var(--pp-ink);
   background: var(--pp-card);
   font: 12px "Roboto Slab", Georgia, serif;
@@ -4491,7 +5028,7 @@ button.publish-tree-label { cursor: pointer; }
 .ppub-btn.disabled { color: var(--pp-ink-faint); cursor: default; }
 .ppub-avail { margin-top: 16px; color: var(--pp-ink-soft); font-size: 12px; line-height: 1.7; }
 .ppub-label { display: block; margin-bottom: 6px; color: var(--pp-ink-faint); font-size: 11px; font-weight: 600; letter-spacing: 1.4px; text-transform: uppercase; }
-.ppub-note { margin: 0 0 12px; padding: 12px 14px; border: 1px solid var(--pp-rule-soft); border-left: 3px solid var(--pp-rule-mid); background: var(--pp-card); }
+.ppub-note { margin: 0 0 12px; padding: 12px 14px; border: var(--border-w, 1px) solid var(--pp-rule-soft); border-left: 3px solid var(--pp-rule-mid); background: var(--pp-card); }
 .ppub-note p { margin: 0 0 6px; }
 .ppub-note-page { float: right; color: var(--pp-ink-faint); font-size: 11px; }
 .ppub-note-kind { color: var(--pp-ink-faint); font-size: 10px; letter-spacing: 1px; text-transform: uppercase; }
@@ -4499,10 +5036,10 @@ button.publish-tree-label { cursor: pointer; }
 .ppub-set-head { padding-bottom: 22px; border-bottom: 3px double var(--pp-rule); }
 .ppub-set-head p { color: var(--pp-ink-soft); }
 .ppub-catalog-list { margin: 0; padding: 0; list-style: none; }
-.ppub-catalog-row { display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; padding: 22px 0; border-bottom: 1px solid var(--pp-rule-soft); }
+.ppub-catalog-row { display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; padding: 22px 0; border-bottom: var(--border-w, 1px) solid var(--pp-rule-soft); }
 .ppub-catalog-row.has-thumb { grid-template-columns: 84px minmax(0, 1fr); }
 .ppub-catalog-row:first-child { border-top: 0; }
-.ppub-catalog-row > img { width: 84px; height: 112px; object-fit: cover; border: 1px solid var(--pp-rule-soft); background: #fff; }
+.ppub-catalog-row > img { width: 84px; height: 112px; object-fit: cover; border: var(--border-w, 1px) solid var(--pp-rule-soft); background: #fff; }
 .ppub-row-title { display: block; margin: 0 0 3px; padding: 0; border: 0; color: var(--pp-ink); background: transparent; font: 600 17px "Roboto Slab", Georgia, serif; text-align: left; cursor: pointer; }
 .ppub-row-title:hover { color: var(--pp-link); text-decoration: underline; }
 .ppub-row-author { color: var(--pp-ink-soft); font-size: 14px; font-style: italic; }
@@ -4529,7 +5066,7 @@ button.publish-tree-label { cursor: pointer; }
   min-height: 120px;
   overflow-y: auto;
   background: var(--input-bg);
-  border: 1px solid var(--face-sh2);
+  border: var(--border-w, 1px) solid var(--face-sh2);
   border-radius: var(--radius);
 }
 #an-cat-picker { max-width: 640px; }
@@ -4538,7 +5075,7 @@ button.publish-tree-label { cursor: pointer; }
   align-items: baseline;
   gap: 8px;
   padding: 4px 0;
-  border-bottom: 1px solid var(--canvas-line);
+  border-bottom: var(--border-w, 1px) solid var(--canvas-line);
   font-family: var(--ui);
   font-size: 12px;
 }
@@ -4556,7 +5093,7 @@ button.publish-tree-label { cursor: pointer; }
   align-items: center;
   gap: 10px;
   padding: 4px 0;
-  border-bottom: 1px solid var(--canvas-line);
+  border-bottom: var(--border-w, 1px) solid var(--canvas-line);
 }
 .an-trans-stale {
   font-size: 9px;
@@ -4598,13 +5135,91 @@ button.publish-tree-label { cursor: pointer; }
 /* a thin rule where a new parent section begins — a marker, not a pill */
 .psg-sep td { padding: 0; border-bottom: 2px solid var(--face-sh2); }
 #an-psg-view { flex: none; max-height: 34%; }
+/* Test (#142) + Ask (#143): evaluation queries and evidence rows — the
+   incidental data (kinds, scores, metrics) stays whisper-styled */
+#an-ev-split { display: flex; flex: 1; min-height: 0; gap: 8px; }
+#an-ev-queries { flex: 0 0 36%; min-width: 0; overflow: auto; }
+#an-ev-results { flex: 1; min-width: 0; overflow: auto; display: flex; gap: 10px; align-items: flex-start; }
+#an-ev-text { flex: 1; min-width: 0; }
+.ev-kind {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--face-sh2);
+  border-bottom: 1px solid var(--canvas-line);
+  margin: 6px 0 2px;
+  padding-bottom: 1px;
+}
+.ev-q {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  font-family: var(--ui);
+  font-size: 12px;
+}
+.ev-q:hover { background: var(--row-hover); }
+.ev-q.active { background: var(--row-checked); border-color: var(--face-sh); }
+/* the query text always keeps a readable share; the metrics whisper yields */
+.ev-q-text { flex: 1 1 auto; min-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ev-q-meta { flex: 0 1 auto; min-width: 0; font-size: 10px; color: var(--face-sh2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ev-q-acts { flex: none; white-space: nowrap; }
+.ev-q-acts .cad-btn { margin-left: 3px; }
+.ev-col { flex: 1 1 0; min-width: 0; }
+.ev-col-label {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--face-sh2);
+  border-bottom: 1px solid var(--canvas-line);
+  margin-bottom: 2px;
+  padding-bottom: 1px;
+}
+.ev-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 4px;
+  border-bottom: 1px solid var(--canvas-line);
+  font-family: var(--ui);
+  font-size: 12px;
+}
+.ev-row:hover { background: var(--row-hover); }
+.ev-snip { flex: 1 1 auto; min-width: 0; }
+.ev-mark { background: var(--row-checked); border-bottom: 1px solid var(--cyan); }
+.ev-score { flex: none; font-family: var(--mono); font-size: 11px; color: var(--face-sh2); }
+.ev-row-acts { flex: none; white-space: nowrap; }
+.ev-row-acts .cad-btn { margin-left: 3px; }
+.ev-flash { outline: 1px solid var(--cyan); background: var(--row-checked); }
+.ev-verstats { font-size: 11px; color: var(--face-sh2); }
+/* Ask: the answer block; abstention is a note, never an error */
+#an-ask-answer {
+  border: 1px solid var(--canvas-line);
+  border-left: 3px solid var(--face-sh2);
+  background: var(--canvas);
+  padding: 8px 10px;
+  font-family: var(--ui);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+#an-ask-answer.ask-abstain { color: var(--face-sh2); font-style: italic; border-left-color: var(--canvas-line); }
+.ask-cite { color: var(--cyan); text-decoration: none; font-family: var(--mono); font-size: 11px; }
+.ask-cite:hover { text-decoration: underline; }
+#an-ask-note { margin: 0 0 4px; }
+/* long provider errors stay one quiet line, not a ballooned bar */
+#an-ask-msg { min-width: 0; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#an-ask-evidence { flex: 1; min-height: 0; overflow: auto; }
+#an-ask-view { flex: none; max-height: 34%; }
 /* Publish phase: two peer cards — the archive entry and the search index */
 #wb-publish-cards { display: flex; gap: 10px; align-items: flex-start; }
 #wb-publish-cards[hidden] { display: none; }
 #wb-publish-cards .wb-pub-card {
   flex: 1 1 0;
   min-width: 0;
-  border: 1px solid var(--canvas-line);
+  border: var(--border-w, 1px) solid var(--canvas-line);
   background: var(--face);
 }
 #an-index-state { color: var(--ink-mut); }
@@ -4613,12 +5228,12 @@ button.publish-tree-label { cursor: pointer; }
   gap: 10px;
   align-items: baseline;
   padding: 3px 0;
-  border-bottom: 1px solid var(--canvas-line);
+  border-bottom: var(--border-w, 1px) solid var(--canvas-line);
   font-family: var(--ui);
   font-size: 12px;
 }
 .an-note {
-  border: 1px solid var(--canvas-line);
+  border: var(--border-w, 1px) solid var(--canvas-line);
   border-left: 3px solid var(--face-sh2);
   padding: 6px 9px;
   margin-bottom: 6px;
@@ -4635,7 +5250,7 @@ button.publish-tree-label { cursor: pointer; }
   text-transform: uppercase;
   letter-spacing: 0.5px;
   color: var(--ink-light);
-  border: 1px solid var(--face-sh);
+  border: var(--border-w, 1px) solid var(--face-sh);
   padding: 0 4px;
   border-radius: var(--radius);
 }
@@ -4668,7 +5283,7 @@ button.publish-tree-label { cursor: pointer; }
   gap: 8px;
   align-items: center;
   padding: 4px 0;
-  border-bottom: 1px solid var(--canvas-line);
+  border-bottom: var(--border-w, 1px) solid var(--canvas-line);
   font-family: var(--ui);
   font-size: 12px;
 }
@@ -4677,7 +5292,7 @@ button.publish-tree-label { cursor: pointer; }
   display: block;
   height: 7px;
   background: var(--canvas);
-  border: 1px solid var(--face-sh);
+  border: var(--border-w, 1px) solid var(--face-sh);
   border-radius: var(--radius);
   overflow: hidden;
 }
@@ -4689,10 +5304,117 @@ button.publish-tree-label { cursor: pointer; }
   padding: 3px 0;
 }
 
+/* ===================== Process mode ===================== */
+
+.foot-tag.tag-process { color: var(--blue2); }
+
+/* Search / Edit / Process segmented control (replaces the old single button) */
+.modeseg { display: inline-flex; border: 1px solid var(--face-sh2); border-radius: 4px; overflow: hidden; }
+.modeseg[hidden] { display: none; }
+.modeseg-btn {
+  font: 11px/1 var(--ui);
+  letter-spacing: .3px;
+  padding: 3px 9px;
+  border: 0;
+  border-right: 1px solid var(--face-sh2);
+  background: var(--face);
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+.modeseg-btn:last-child { border-right: 0; }
+.modeseg-btn:hover { background: var(--face-hi); color: var(--ink); }
+.modeseg-btn.active { background: var(--blue); color: #fff; }
+
+/* Process action bar */
+.proc-bar { display: inline-flex; align-items: center; gap: 6px; }
+.proc-bar[hidden] { display: none; }
+.proc-count { font: 11px var(--mono); color: var(--ink-soft); min-width: 60px; }
+.proc-ai-instr { width: 170px; }
+.proc-ai-instr[hidden] { display: none; }
+
+/* Row select box + expand arrow, tucked into the row's first cell */
+.proc-firstcell { white-space: nowrap; }
+.proc-box {
+  display: inline-block;
+  width: 12px; height: 12px;
+  vertical-align: middle;
+  margin-right: 4px;
+  border: 1px solid var(--face-sh2);
+  border-radius: 2px;
+  background: var(--input-bg);
+  cursor: pointer;
+  position: relative;
+}
+.proc-box.on { background: var(--blue); border-color: var(--blue); }
+.proc-box.on::after {
+  content: "";
+  position: absolute; left: 3px; top: 0;
+  width: 4px; height: 8px;
+  border: solid #fff; border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+.proc-arrow {
+  display: inline-block;
+  width: 10px;
+  margin-right: 3px;
+  color: var(--ink-soft);
+  font-size: 10px;
+  cursor: pointer;
+  vertical-align: middle;
+}
+.proc-arrow-none { visibility: hidden; }
+
+/* Selected parent rows */
+tr.proc-selected > td { background: var(--row-checked); }
+
+/* Alternative / diff rows nested under their parent — light gray, and a
+   green/red field-level diff. Superseded (swapped-out) originals are struck. */
+tr.proc-alt > td {
+  background: var(--face-sh);
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+tr.proc-alt-old > td { color: var(--ink-faint); text-decoration: line-through; }
+/* Diff tints must out-specify the alt-row and selected-row backgrounds above. */
+tr.proc-alt > td.proc-diff-new {
+  background: color-mix(in srgb, var(--green) 24%, var(--face-sh));
+  color: var(--ink);
+}
+tr.proc-row > td.proc-diff-old { background: color-mix(in srgb, var(--red) 22%, transparent); }
+.proc-altsrc { text-align: right; }
+.proc-srctag {
+  font: 9px/1 var(--mono);
+  letter-spacing: .5px;
+  padding: 1px 3px;
+  border: 1px solid var(--face-sh2);
+  border-radius: 2px;
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+tr.proc-alt-old .proc-srctag { text-decoration: none; }
+
+/* Right-click context menu items (reusing #popup-menu) */
+.pm-btn {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  padding: 5px 12px;
+  font: 12px var(--ui);
+  color: var(--ink);
+  cursor: pointer;
+}
+.pm-btn:hover { background: var(--face-hi); }
+.pm-btn.pm-danger { color: var(--red); }
+
 /* --- theme tab palettes --------------------------------------------------
    Each theme may color the activity-bar tabs from its own accent set; a
    theme that defines none stays uniform (every tab falls back to --blue).
-   Sage and Manuscript vary; Ledger, Vellum, and Linen stay uniform. */
+   Sage, Manuscript, and Slate vary; Ledger, Vellum, Linen, and Porcelain
+   stay uniform. A varied theme may also set --tab-tint to wash each
+   resting tab with its color (see .tab); Slate needs a stronger wash than
+   the paper themes for the same perceived weight. */
 body[data-theme="sage"] {
   --tabc-home: var(--blue);
   --tabc-checked: var(--amber);
@@ -4700,6 +5422,7 @@ body[data-theme="sage"] {
   --tabc-replica: var(--red);
   --tabc-publish: var(--cyan);
   --tabc-infotab: var(--blue2);
+  --tab-tint: 12%;
 }
 body[data-theme="foolscap"] {
   --tabc-home: var(--blue);
@@ -4708,6 +5431,16 @@ body[data-theme="foolscap"] {
   --tabc-replica: var(--red);
   --tabc-publish: var(--cyan);
   --tabc-infotab: var(--ink-mut);
+  --tab-tint: 12%;
+}
+body[data-theme="slate"] {
+  --tabc-home: var(--blue);
+  --tabc-checked: var(--amber);
+  --tabc-workbench: var(--green);
+  --tabc-replica: var(--red);
+  --tabc-publish: var(--cyan);
+  --tabc-infotab: var(--blue2);
+  --tab-tint: 16%;
 }
 
 /* --- compact tree/list density (Visual Studio style) ---------------------

@@ -200,6 +200,13 @@ class HomeActivity : AppCompatActivity() {
                             Toast.LENGTH_LONG,
                         ).show()
                     }
+                    if (Entries.DeleteResult.DELETE_FAILED in results) {
+                        Toast.makeText(
+                            this@HomeActivity,
+                            R.string.home_delete_failed,
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
                     selectionMode = false
                     selectedIds.clear()
                     refreshHome()

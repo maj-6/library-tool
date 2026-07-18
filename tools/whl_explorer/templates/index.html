@@ -85,6 +85,7 @@
 
   <!-- the activity bar (VS Code style): tab icons top, actions bottom.
        Icons come from static/icons/tabs/<data-tab>.svg (user-swappable);
+       a theme may pick a style subfolder via --icon-style (e.g. solid/).
        initActivityIcons inlines them so theme tab colors apply. -->
   <div id="shell">
   <div id="tabs">
@@ -157,14 +158,18 @@
     <section id="checked" class="panel-view">
       <div id="checked-toolbar">
         <span class="icon-label" id="find-icon" data-icon="search"></span>
-        <input id="checked-search" class="cad-input" type="text"
-               placeholder="[title] @author #year" autocomplete="off" />
-        <button id="adv-search-btn" class="cad-btn tiny" type="button"
-                data-tip="Advanced Open Library search (by field)">Advanced Search</button>
+        <span class="ctl-join">
+          <input id="checked-search" class="cad-input" type="text"
+                 placeholder="[title] @author #year" autocomplete="off" />
+          <button id="adv-search-btn" class="cad-btn tiny icon-btn" type="button"
+                  data-icon="sliders" aria-label="Advanced Search"
+                  data-tip="Advanced Open Library search (by field)"></button>
+        </span>
         <span class="bar-spacer"></span>
         <span class="tool-count" id="checked-count"></span>
-        <button id="cloud-sync-btn" class="cad-btn tiny" type="button"
-                data-tip="Pull phone captures from the cloud now and push the catalog mirror (also runs automatically on the Settings interval)">Sync Cloud</button>
+        <button id="cloud-sync-btn" class="cad-btn tiny icon-btn" type="button"
+                data-icon="cloudsync" aria-label="Sync Cloud"
+                data-tip="Pull phone captures from the cloud now and push the catalog mirror (also runs automatically on the Settings interval)"></button>
         <button id="sync-master-btn" class="cad-btn tiny" type="button"
                 data-tip="Sync the master list to Google Sheets">Sync Master List</button>
       </div>
@@ -479,8 +484,12 @@
               <option value="checked">Checked books + manual</option>
               <option value="whl">WHL</option>
             </select>
-            <button id="whl-mode" class="cad-btn tiny" type="button" hidden
-                    data-tip="Ctrl+E toggles EDIT / SEARCH mode"></button>
+            <span id="whl-modeseg" class="modeseg" role="group" hidden
+                  data-tip="Search / Edit / Process mode  (Ctrl+E toggles Search/Edit)">
+              <button type="button" class="modeseg-btn" data-mode="search">Search</button>
+              <button type="button" class="modeseg-btn" data-mode="edit">Edit</button>
+              <button type="button" class="modeseg-btn" data-mode="process">Process</button>
+            </span>
             <span id="whl-cons" class="whl-cons" hidden
                   data-tip="Constrain the Open Library search to these fields (Title = verbatim phrase). Ctrl+click any column header toggles a field too.">
               <span class="icon-label" data-icon="target"></span>
@@ -489,6 +498,26 @@
                 <label><input type="checkbox" id="wc-author" /> Author</label>
                 <label><input type="checkbox" id="wc-year" /> Year</label>
               </span>
+            </span>
+            <span id="proc-bar" class="proc-bar" hidden
+                  data-tip="Process mode — select rows, pick an action, Run">
+              <span id="proc-count" class="proc-count">0 selected</span>
+              <button id="proc-all" class="cad-btn tiny" type="button"
+                      data-tip="Select every row">All</button>
+              <button id="proc-none" class="cad-btn tiny" type="button"
+                      data-tip="Clear the selection">None</button>
+              <select id="proc-action" class="cad-input tiny"
+                      data-tip="Action to run on the selected rows">
+                <option value="normalize">Normalize names / caps</option>
+                <option value="deepseek">DeepSeek…</option>
+                <option value="rescan">Rescan</option>
+                <option value="smartscan">Smart Scan</option>
+              </select>
+              <input id="proc-ai-instr" class="cad-input tiny proc-ai-instr" hidden
+                     placeholder="DeepSeek instructions…"
+                     data-tip="What DeepSeek should do to each selected record (blank uses your Settings › AI instructions)" />
+              <button id="proc-run" class="cad-btn tiny" type="button"
+                      data-tip="Run the action on the selected rows">Run</button>
             </span>
             <span class="bar-spacer"></span>
             <span class="year-filter" data-tip="Show only rows within this year range (inclusive)">
@@ -606,13 +635,15 @@
             <span class="bar-spacer"></span>
             <button id="ocr-filter-verified" class="cad-btn tiny icon-btn toggle" type="button"
                     data-icon="check" data-tip="Show verified books only"></button>
+            <button id="ocr-side-toggle" class="cad-btn tiny" type="button"
+                    aria-expanded="true" data-tip="Collapse the entries &amp; artifacts sidebar">&#9664;</button>
           </div>
           <div class="drafting" id="ocr-books-wrap">
             <ul id="ocr-books"></ul>
             <p id="ocr-books-empty" class="empty">No entries yet</p>
           </div>
           <div id="ocr-side-splitter"></div>
-          <div class="pane-bar"><span class="tool-label">Artifacts</span>
+          <div class="pane-bar" id="ocr-artifacts-bar"><span class="tool-label">Artifacts</span>
             <span class="bar-spacer"></span>
             <button id="ocr-load-file" class="cad-btn tiny icon-btn" type="button"
                     data-icon="fileup" data-tip="Load OCR text files"></button>
@@ -716,9 +747,6 @@
                   <div class="mf-field mf-full">
                     <label class="tool-label" for="b-pdf_source">PDF source (URL)
                       <a id="b-pdf-open" class="mini-link" href="#" target="_blank" rel="noopener" hidden>Open</a>
-                      <button id="b-smartcheck" class="sc-wand sc-form-wand" type="button"
-                              data-icon="wand"
-                              data-tip="Smart check — extract real metadata from this book's PDF (Mistral OCR, then DeepSeek). Extracted values overlay the form until baked: TAB compares, SPACE over the form bakes them in."></button>
                     </label>
                     <input id="b-pdf_source" class="cad-input" />
                   </div>
@@ -797,11 +825,13 @@
               <div id="btab-source" class="pane-sub active">
                 <div class="src-row">
                   <label class="tool-label" for="b-pdf_file">Primary PDF source</label>
-                  <input id="b-pdf_file" class="cad-input" spellcheck="false" />
-                  <button id="b-pdf-browse" class="cad-btn icon-btn" type="button"
-                          data-icon="folder" data-tip="Browse"></button>
-                  <button id="b-pdf-attach" class="cad-btn icon-btn" type="button"
-                          data-icon="attach" data-tip="Attach as the primary PDF source"></button>
+                  <span class="ctl-join">
+                    <input id="b-pdf_file" class="cad-input" spellcheck="false" />
+                    <button id="b-pdf-browse" class="cad-btn icon-btn" type="button"
+                            data-icon="folder" data-tip="Browse"></button>
+                    <button id="b-pdf-attach" class="cad-btn icon-btn" type="button"
+                            data-icon="attach" data-tip="Attach as the primary PDF source"></button>
+                  </span>
                   <span class="tool-label" id="b-src-msg"></span>
                 </div>
                 <div class="src-row">
@@ -895,12 +925,16 @@
             </span>
             <select id="ocr-diff-with" class="cad-input" data-tip="Compare against"></select>
             <span class="tb-sep"></span>
-            <input id="ocr-find" class="cad-input" placeholder="find" />
-            <input id="ocr-replace" class="cad-input" placeholder="replace" />
-            <button id="ocr-find-next" class="cad-btn tiny icon-btn" type="button"
-                    data-icon="search" data-tip="Find next"></button>
-            <button id="ocr-replace-all" class="cad-btn tiny icon-btn" type="button"
-                    data-icon="replace" data-tip="Replace all"></button>
+            <span class="ctl-join">
+              <input id="ocr-find" class="cad-input" placeholder="find" />
+              <button id="ocr-find-next" class="cad-btn tiny icon-btn" type="button"
+                      data-icon="search" data-tip="Find next"></button>
+            </span>
+            <span class="ctl-join">
+              <input id="ocr-replace" class="cad-input" placeholder="replace" />
+              <button id="ocr-replace-all" class="cad-btn tiny icon-btn" type="button"
+                      data-icon="replace" data-tip="Replace all"></button>
+            </span>
             <span class="tb-sep"></span>
             <label class="tool-label" for="ocr-quality">Quality</label>
             <select id="ocr-quality" class="cad-input">
@@ -957,7 +991,9 @@
                   stays on this machine. Applied on the next publish.</p>
                 <div id="an-bundle-opts"></div>
                 <div class="mf-actions">
-                  <button id="an-bundle-save" class="cad-btn tiny" type="button">Save bundle</button>
+                  <button id="an-bundle-save" class="cad-btn tiny icon-btn" type="button"
+                          data-icon="save" aria-label="Save bundle"
+                          data-tip="Save the bundle choices"></button>
                   <span class="tool-label" id="an-bundle-msg"></span>
                 </div>
               </div>
@@ -1047,6 +1083,8 @@
               <button class="pane-tab" data-antab="an-trans" type="button">Translations</button>
               <button class="pane-tab" data-antab="an-notes" type="button">Annotations</button>
               <button class="pane-tab" data-antab="an-passages" type="button">Passages</button>
+              <button class="pane-tab" data-antab="an-test" type="button">Test</button>
+              <button class="pane-tab" data-antab="an-ask" type="button">Ask</button>
               <button class="pane-tab" data-antab="an-rel" type="button">Relevance</button>
             </div>
 
@@ -1054,8 +1092,9 @@
               <div class="an-col">
                 <div class="pane-bar">
                   <span class="tool-label">Summary (internal)</span>
-                  <button id="an-summarize" class="cad-btn tiny" type="button"
-                          data-tip="Generate a cataloguer's summary from the OCR text">Generate</button>
+                  <button id="an-summarize" class="cad-btn tiny icon-btn" type="button"
+                          data-icon="sparkle" aria-label="Generate summary"
+                          data-tip="Generate a cataloguer's summary from the OCR text"></button>
                 </div>
                 <p id="an-summary-stale" class="an-stale-note" hidden>Text
                   changed since this summary was generated &mdash; regenerate.</p>
@@ -1066,8 +1105,9 @@
                   <span class="tool-label">About article (publishable)</span>
                   <button id="an-about-draft" class="cad-btn tiny" type="button"
                           data-tip="Draft the About article from the summary">Draft from summary</button>
-                  <button id="an-about-save" class="cad-btn tiny" type="button"
-                          data-tip="Save the article to the entry folder">Save</button>
+                  <button id="an-about-save" class="cad-btn tiny icon-btn" type="button"
+                          data-icon="save" aria-label="Save article"
+                          data-tip="Save the article to the entry folder"></button>
                 </div>
                 <p id="an-about-stale" class="an-stale-note" hidden>The summary
                   changed since this article was drafted &mdash; redraft.</p>
@@ -1082,8 +1122,9 @@
               <div id="an-cat-picker" class="cat-picker"></div>
               <div class="pane-bar">
                 <span class="tool-label">Suggestions</span>
-                <button id="an-suggest" class="cad-btn tiny" type="button"
-                        data-tip="Ask the model to classify this work against the taxonomy">Suggest</button>
+                <button id="an-suggest" class="cad-btn tiny icon-btn" type="button"
+                        data-icon="sparkle" aria-label="Suggest categories"
+                        data-tip="Ask the model to classify this work against the taxonomy"></button>
                 <button id="an-sugg-all" class="cad-btn tiny" type="button" hidden
                         data-tip="Assign every suggestion that matches an existing category">Assign all existing</button>
               </div>
@@ -1093,9 +1134,13 @@
             <div class="an-pane" id="an-trans">
               <div class="pane-bar">
                 <span class="tool-label">Translate to</span>
-                <input id="an-lang" class="cad-input" type="text" size="6"
-                       placeholder="es" data-tip="A language code: es, de, fr, la…" />
-                <button id="an-translate" class="cad-btn tiny" type="button">Translate</button>
+                <span class="ctl-join">
+                  <input id="an-lang" class="cad-input" type="text" size="6"
+                         placeholder="es" data-tip="A language code: es, de, fr, la…" />
+                  <button id="an-translate" class="cad-btn tiny icon-btn" type="button"
+                          data-icon="translate" aria-label="Translate"
+                          data-tip="Translate the OCR text to this language"></button>
+                </span>
                 <span class="tool-label" id="an-trans-msg"></span>
               </div>
               <div id="an-trans-list"></div>
@@ -1105,8 +1150,9 @@
             <div class="an-pane" id="an-notes">
               <div class="pane-bar">
                 <span class="tool-label">Anchored notes</span>
-                <button id="an-annotate" class="cad-btn tiny" type="button"
-                        data-tip="Propose margin notes anchored to passages">Generate</button>
+                <button id="an-annotate" class="cad-btn tiny icon-btn" type="button"
+                        data-icon="sparkle" aria-label="Generate notes"
+                        data-tip="Propose margin notes anchored to passages"></button>
                 <span class="tool-label" id="an-notes-count"></span>
               </div>
               <div id="an-notes-list" class="drafting"></div>
@@ -1119,8 +1165,9 @@
                 <span id="an-psg-recipe" class="tool-label"></span>
                 <span class="bar-spacer"></span>
                 <span id="an-psg-msg" class="tool-label"></span>
-                <button id="an-psg-generate" class="cad-btn tiny" type="button"
-                        data-tip="Split the OCR text into search passages — structure first, token bounds second; sentences never break">Generate</button>
+                <button id="an-psg-generate" class="cad-btn tiny icon-btn" type="button"
+                        data-icon="sparkle" aria-label="Generate passages"
+                        data-tip="Split the OCR text into search passages — structure first, token bounds second; sentences never break"></button>
               </div>
               <p id="an-psg-stale" class="an-stale-note" hidden>Text changed
                 since these passages were generated &mdash; regenerate
@@ -1137,10 +1184,74 @@
               <pre id="an-psg-view" class="an-text" hidden></pre>
             </div>
 
+            <!-- TEST (#142): the per-volume evaluation set — judged queries,
+                 Recall/nDCG/MRR, working passages vs the published index -->
+            <div class="an-pane" id="an-test">
+              <div class="pane-bar">
+                <span class="tool-label">Evaluation queries</span>
+                <span id="an-ev-metrics" class="tool-label"
+                      data-tip="Overall metrics from the last full run — judged queries only; unanswerable and unjudged counted apart"></span>
+                <span class="bar-spacer"></span>
+                <span id="an-ev-msg" class="tool-label"></span>
+                <button id="an-ev-run" class="cad-btn tiny" type="button"
+                        data-tip="Score every query against the working passages (and the published index when the cloud is configured)">Run all</button>
+              </div>
+              <div class="pane-bar">
+                <input id="an-ev-text" class="cad-input" type="text"
+                       placeholder="a query this book should answer&hellip;" spellcheck="false" />
+                <select id="an-ev-kind" class="cad-input"
+                        data-tip="What the query exercises — cover all kinds over time">
+                  <option value="exact-phrase">exact phrase</option>
+                  <option value="archaic-modern">archaic&#8596;modern</option>
+                  <option value="factual" selected>factual</option>
+                  <option value="thematic">thematic</option>
+                  <option value="tables">tables</option>
+                  <option value="cross-page">cross-page</option>
+                  <option value="multilingual">multilingual</option>
+                  <option value="unanswerable">unanswerable</option>
+                </select>
+                <button id="an-ev-add" class="cad-btn tiny" type="button">Add</button>
+                <button id="an-ev-cancel" class="cad-btn tiny" type="button" hidden>Cancel</button>
+              </div>
+              <div id="an-ev-split">
+                <div id="an-ev-queries" class="drafting"></div>
+                <div id="an-ev-results" class="drafting">
+                  <p id="an-ev-hint" class="empty">Select a query to run it
+                    against the working passages.</p>
+                </div>
+              </div>
+            </div>
+
+            <!-- ASK (#143): evidence first, then an optional cited answer.
+                 Answers are transient — derived AI claims never publish. -->
+            <div class="an-pane" id="an-ask">
+              <div class="pane-bar">
+                <span class="tool-label">Ask this book</span>
+                <span class="bar-spacer"></span>
+                <span id="an-ask-msg" class="tool-label"></span>
+              </div>
+              <div class="pane-bar">
+                <input id="an-ask-q" class="cad-input" type="text"
+                       placeholder="What does this book say about&hellip;" spellcheck="false" />
+                <button id="an-ask-go" class="cad-btn tiny" type="button"
+                        data-tip="Rank the passages for this question — the evidence, before any answer">Ask</button>
+                <button id="an-ask-draft" class="cad-btn tiny" type="button" hidden
+                        data-tip="Draft an answer from the evidence below — cited, abstaining, never medical advice">Draft answer</button>
+              </div>
+              <div id="an-ask-answer" hidden></div>
+              <p id="an-ask-note" class="pane-note" hidden>Model-generated
+                from the passages above &mdash; not the book&rsquo;s text,
+                not medical advice.</p>
+              <div id="an-ask-evidence" class="drafting"></div>
+              <pre id="an-ask-view" class="an-text" hidden></pre>
+            </div>
+
             <div class="an-pane" id="an-rel">
               <div class="pane-bar">
                 <span class="tool-label">Relevance criteria (yours; internal only)</span>
-                <button id="an-crit-add" class="cad-btn tiny" type="button">Add criterion</button>
+                <button id="an-crit-add" class="cad-btn tiny icon-btn" type="button"
+                        data-icon="plus" aria-label="Add criterion"
+                        data-tip="Add a relevance criterion"></button>
                 <button id="an-assess" class="cad-btn tiny" type="button"
                         data-tip="Score this work against the criteria">Assess</button>
               </div>
@@ -1173,10 +1284,12 @@
         </aside>
         <div id="rw-main">
           <div class="pane-bar">
-            <button id="rw-mode-edit" class="cad-btn tiny active" type="button"
-                    data-tip="Edit the page's regions">Edit</button>
-            <button id="rw-mode-preview" class="cad-btn tiny" type="button"
-                    data-tip="Re-typeset preview: the page rendered from its regions at the mapped styles, beside the original — the modernized facsimile">Preview</button>
+            <button id="rw-mode-edit" class="cad-btn tiny icon-btn active" type="button"
+                    data-icon="pencil" aria-label="Edit regions"
+                    data-tip="Edit the page's regions"></button>
+            <button id="rw-mode-preview" class="cad-btn tiny icon-btn" type="button"
+                    data-icon="eye" aria-label="Preview"
+                    data-tip="Re-typeset preview: the page rendered from its regions at the mapped styles, beside the original — the modernized facsimile"></button>
             <select id="rw-preview-lang" class="cad-input" hidden
                     data-tip="Which text layer the preview flows: the diplomatic transcription, the normalized reading, or a page-aligned translation"></select>
             <span class="tool-count" id="rw-status"></span>
@@ -1184,23 +1297,26 @@
             <span id="rw-legend" class="tool-label"></span>
             <span class="bar-spacer"></span>
             <select id="rw-tpl" class="cad-input" data-tip="Layout template — one corrected recto/verso page becomes a reusable grid"></select>
-            <button id="rw-tpl-save" class="cad-btn tiny" type="button" disabled
-                    data-tip="Save this page's SAVED regions as a template (geometry + roles, no text)">Tpl+</button>
+            <button id="rw-tpl-save" class="cad-btn tiny icon-btn" type="button" disabled
+                    data-icon="gridplus" aria-label="Save as template"
+                    data-tip="Save this page's SAVED regions as a template (geometry + roles, no text)"></button>
             <button id="rw-tpl-apply" class="cad-btn tiny" type="button" disabled
                     data-tip="Stamp the template onto a page range; each region pre-fills its text from the word boxes inside it">Apply</button>
             <button id="rw-tpl-outliers" class="cad-btn tiny" type="button" disabled
                     data-tip="Flag region pages that break the template's grid — plates, chapter openings, errata">Outliers</button>
             <span class="bar-spacer"></span>
-            <button id="rw-save" class="cad-btn tiny" type="button" disabled
-                    data-tip="Save this page's regions (Ctrl+S)">Save</button>
+            <button id="rw-save" class="cad-btn tiny icon-btn" type="button" disabled
+                    data-icon="save" aria-label="Save regions"
+                    data-tip="Save this page's regions (Ctrl+S)"></button>
             <button id="rw-recompile" class="cad-btn tiny" type="button" disabled
                     data-tip="Rewrite compiled text from every saved region page of this source — furniture stays out of the flow. The toggled layer compiles: diplomatic into each record's doc, normalized into normalized.txt">Recompile</button>
             <button id="rw-export" class="cad-btn tiny" type="button" disabled
                     data-tip="Export this source's region pages as a .lib — book metadata, role stylesheet, templates, per-page regions with both text layers, and the figure crops, sealed in one portable file">Export .lib</button>
             <button id="rw-import" class="cad-btn tiny" type="button" disabled
                     data-tip="Import a .lib archive into this source — pages that already have regions are skipped, and the stylesheet only lands if the book has none of its own">Import</button>
-            <button id="rw-print" class="cad-btn tiny" type="button" disabled
-                    data-tip="Open the modernized facsimile as a print document (one A4 sheet per region page, the preview's layer selector picks the text) — print it to PDF from the browser">Print</button>
+            <button id="rw-print" class="cad-btn tiny icon-btn" type="button" disabled
+                    data-icon="printer" aria-label="Print"
+                    data-tip="Open the modernized facsimile as a print document (one A4 sheet per region page, the preview's layer selector picks the text) — print it to PDF from the browser"></button>
             <input id="rw-import-file" type="file" accept=".lib,.zip" hidden>
           </div>
           <div id="rw-canvas-wrap" class="drafting">
@@ -1223,12 +1339,22 @@
               <span class="tool-label">Type styles</span>
               <span class="tool-count" id="rw-style-state"></span>
               <span class="bar-spacer"></span>
-              <button id="rw-style-save" class="cad-btn tiny" type="button"
-                      data-tip="Store this mapping with the book — the .lib export carries it">Save</button>
+              <button id="rw-style-save" class="cad-btn tiny icon-btn" type="button"
+                      data-icon="save" aria-label="Save styles"
+                      data-tip="Store this mapping with the book — the .lib export carries it"></button>
               <button id="rw-style-reset" class="cad-btn tiny" type="button"
                       data-tip="Back to the default OFL mapping">Reset</button>
             </div>
             <div id="rw-styleboard" class="drafting"></div>
+            <div class="pane-bar">
+              <span class="tool-label">Instructions for editors / AI</span>
+              <span class="tool-count" id="rw-instr-state"></span>
+              <span class="bar-spacer"></span>
+              <button id="rw-instr-save" class="cad-btn tiny" type="button"
+                      data-tip="Store this note with the book — every .lib export embeds it for external editors and AI assistants">Save</button>
+            </div>
+            <textarea id="rw-instr" class="cad-input" rows="3" spellcheck="false"
+                      placeholder="Per-book guidance that travels inside the exported .lib — e.g. &quot;Latin plant names stay untranslated&quot;"></textarea>
           </div>
           <div id="rw-edit-panel">
           <div class="pane-bar">
@@ -1270,8 +1396,9 @@
               <option value="category">Categories</option>
               <option value="date">Date range</option>
             </select>
-            <button id="publish-refresh" class="cad-btn tiny" type="button"
-                    data-tip="Refresh the online catalogue">Refresh</button>
+            <button id="publish-refresh" class="cad-btn tiny icon-btn" type="button"
+                    data-icon="refresh" aria-label="Refresh"
+                    data-tip="Refresh the online catalogue"></button>
             <span id="publish-count" class="tool-count"></span>
           </div>
           <div id="publish-tree-wrap" class="drafting">
@@ -1285,7 +1412,9 @@
             <span id="publish-preview-label" class="tool-label">World Herb Library preview</span>
             <span class="bar-spacer"></span>
             <span id="publish-source" class="tool-label"></span>
-            <button id="publish-open-live" class="cad-btn tiny" type="button" hidden>Open live page</button>
+            <button id="publish-open-live" class="cad-btn tiny icon-btn" type="button" hidden
+                    data-icon="external" aria-label="Open live page"
+                    data-tip="Open this book's live website page"></button>
           </div>
           <div id="publish-preview" class="publish-preview">
             <div id="publish-empty" class="empty">Select a published book or book set.</div>
@@ -1320,8 +1449,9 @@
           <input id="con-find" class="cad-input" placeholder="filter" spellcheck="false" />
           <span class="bar-spacer"></span>
           <span id="con-count" class="tool-label"></span>
-          <button id="con-follow" class="cad-btn tiny active" type="button"
-                  data-tip="Scroll to follow new lines">Follow</button>
+          <button id="con-follow" class="cad-btn tiny icon-btn active" type="button"
+                  data-icon="follow" aria-label="Follow"
+                  data-tip="Scroll to follow new lines"></button>
           <button id="con-copy" class="cad-btn tiny icon-btn" type="button"
                   data-icon="export" data-tip="Copy the visible lines"
                   aria-label="Copy the visible lines"></button>
@@ -1473,10 +1603,12 @@
       </div>
       <div id="fb-body">
         <div class="fb-path-row">
-          <input id="fb-path" class="cad-input" spellcheck="false" />
-          <button id="fb-go" class="cad-btn icon-btn" type="button"
-                  data-icon="go" data-tip="Open this folder"
-                  aria-label="Open this folder"></button>
+          <span class="ctl-join">
+            <input id="fb-path" class="cad-input" spellcheck="false" />
+            <button id="fb-go" class="cad-btn icon-btn" type="button"
+                    data-icon="go" data-tip="Open this folder"
+                    aria-label="Open this folder"></button>
+          </span>
         </div>
         <div id="fb-drives"></div>
         <div id="fb-list"></div>
@@ -1591,6 +1723,7 @@
         <div id="settings-nav">
           <button class="snav active" data-sec="sec-general" type="button">General</button>
           <button class="snav" data-sec="sec-appearance" type="button">Appearance</button>
+          <button class="snav" data-sec="sec-theme" type="button">Theme editor</button>
           <button class="snav" data-sec="sec-tables" type="button">Table view</button>
           <button class="snav" data-sec="sec-library" type="button">Library &amp; data</button>
           <button class="snav" data-sec="sec-editing" type="button">Editing</button>
@@ -1663,6 +1796,51 @@
               <label class="tool-label" for="font-mono2-select">Tag / marker font</label>
               <select id="font-mono2-select" class="cad-input"></select>
             </div>
+          </div>
+          <div id="sec-theme" class="settings-sec">
+            <div class="settings-head">Theme editor</div>
+            <p class="settings-note">Fine-tune the colours, corners, line weight,
+               text weight and fonts of the selected theme. Edits are saved per theme
+               and layer over the built-in look — reset any single control, or the
+               whole theme, at any time. A font left on <b>Default</b> follows the
+               global choice under <b>Appearance</b>. <b>Duplicate</b> any theme to make
+               your own editable copy: custom themes appear in the theme list in
+               <i>italics</i> and can be renamed, deleted, exported or imported.</p>
+            <div class="te-topbar">
+              <label for="te-theme">Theme</label>
+              <select id="te-theme" class="cad-input"></select>
+              <span id="te-count" class="te-count">No changes</span>
+              <button id="te-reset-theme" class="cad-btn danger te-reset-theme" type="button">Reset this theme</button>
+            </div>
+            <div class="te-savebar">
+              <input id="te-save-name" class="cad-input" placeholder="New name…" spellcheck="false" maxlength="60" />
+              <button id="te-duplicate" class="cad-btn" type="button">Duplicate</button>
+              <button id="te-rename" class="cad-btn" type="button">Rename</button>
+              <button id="te-delete" class="cad-btn" type="button">Delete</button>
+              <span class="te-savebar-sep"></span>
+              <button id="te-export" class="cad-btn" type="button">Export</button>
+              <button id="te-import" class="cad-btn" type="button">Import</button>
+              <input id="te-import-file" type="file" accept=".json,.whltheme,application/json" hidden />
+            </div>
+            <div class="te-preview" aria-hidden="true" inert>
+              <div class="te-pv-bar"><span>Preview</span><span class="te-pv-file">herbarium.pdf</span></div>
+              <div class="te-pv-body">
+                <div class="te-pv-ctl">
+                  <button class="cad-btn" type="button" tabindex="-1">Button</button>
+                  <input class="cad-input" style="width:84px" value="Field" readonly tabindex="-1" />
+                  <span class="te-pv-link">Accent link</span>
+                  <span class="te-pv-link sec">Secondary</span>
+                </div>
+                <div class="te-pv-rows">
+                  <span class="te-pv-row hover">Hover</span>
+                  <span class="te-pv-row checked">Checked</span>
+                  <span class="te-pv-row manual">Manual</span>
+                </div>
+                <div class="te-pv-chips"><span class="ok">&#9679; Success</span><span class="warn">&#9679; Warning</span><span class="err">&#9679; Error</span></div>
+                <div class="te-pv-note">Body ink with <span class="muted">secondary / muted text</span>.</div>
+              </div>
+            </div>
+            <div id="te-rows" class="te-rows"></div>
           </div>
           <div id="sec-tables" class="settings-sec">
             <div class="settings-head">Table view</div>
@@ -2055,8 +2233,6 @@
   <div id="statusbar">
     <span id="status-msg" role="status" aria-live="polite">READY</span>
     <span class="foot-right">
-      <span id="status-smart" class="foot-jobs" hidden
-            data-tip="Smart-check results held for review — TAB (or click here) toggles extracted vs original values, SPACE over a row bakes, Shift+click here dismisses all"></span>
       <span id="status-jobs" class="foot-jobs" hidden
             data-tip="Background jobs running — click for the Workbench jobs drawer"></span>
       <span id="dl-progress" class="dl-progress" hidden

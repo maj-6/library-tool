@@ -18,15 +18,17 @@ import java.util.Base64
  *   standardize -> Mistral OCR -> bibliographic fields (DeepSeek by default,
  *                                 Mistral when only its key is configured)
  *
- * It mirrors tools/capture_pipeline.py — same 1600px/q82 standard, same OCR
- * endpoint, the SAME extraction prompt (keep them in sync) — so the desktop
- * can trust `meta` from either side. Perspective correction stays on the
+ * Fast capture mirrors tools/capture_pipeline.py at 1600px/q82; the explicit
+ * More Detail profile preserves up to 2048px. The OCR endpoint and extraction
+ * prompt stay shared so the desktop can trust `meta` from either side.
+ * Perspective correction stays on the
  * desktop: it needs OpenCV, which would triple the APK for a correction
  * Mistral's OCR mostly shrugs at anyway.
  */
 object Pipeline {
 
-    private const val STANDARD_WIDTH = 1600
+    private const val FAST_STANDARD_WIDTH = 1600
+    private const val DETAIL_STANDARD_WIDTH = 2048
     private const val STANDARD_QUALITY = 82
 
     private const val MISTRAL_OCR_URL = "https://api.mistral.ai/v1/ocr"
@@ -54,22 +56,23 @@ object Pipeline {
 
     // --- 1. standardize -----------------------------------------------------------
 
-    /** Scale the photo to the standard width and recompress, in place, honoring
-     *  the EXIF rotation CameraX recorded. A file already at or under the
-     *  standard width is left alone, so this is idempotent — and a ~4 MB
-     *  camera JPEG becomes a ~400 KB upload. */
+    /** Scale the photo to its capture profile's standard width and recompress,
+     *  in place, honoring the EXIF rotation CameraX recorded. A file already at
+     *  or under that width is left alone, so this is idempotent. Legacy files
+     *  without frozen profile metadata conservatively keep up to 2048px. */
     fun standardizeInPlace(file: File) {
+        val standardWidth = standardWidthForCaptureProfile(readCaptureProfile(file.parentFile))
         val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(file.absolutePath, opts)
-        if (opts.outWidth <= 0 || opts.outWidth <= STANDARD_WIDTH) return
+        if (opts.outWidth <= 0 || opts.outWidth <= standardWidth) return
         // rough power-of-two pre-shrink keeps peak memory at ~4x target size
         var sample = 1
-        while (opts.outWidth / (sample * 2) >= STANDARD_WIDTH) sample *= 2
+        while (opts.outWidth / (sample * 2) >= standardWidth) sample *= 2
         val decode = BitmapFactory.Options().apply { inSampleSize = sample }
         var bmp = BitmapFactory.decodeFile(file.absolutePath, decode) ?: return
-        if (bmp.width > STANDARD_WIDTH) {
-            val h = (bmp.height.toLong() * STANDARD_WIDTH / bmp.width).toInt()
-            val scaled = Bitmap.createScaledBitmap(bmp, STANDARD_WIDTH, h, true)
+        if (bmp.width > standardWidth) {
+            val h = (bmp.height.toLong() * standardWidth / bmp.width).toInt()
+            val scaled = Bitmap.createScaledBitmap(bmp, standardWidth, h, true)
             if (scaled !== bmp) bmp.recycle()
             bmp = scaled
         }
@@ -92,6 +95,21 @@ object Pipeline {
         bmp.recycle()
         if (!tmp.renameTo(file)) tmp.delete()      // keep the original over a torn write
     }
+
+    private fun readCaptureProfile(dir: File?): String? = try {
+        dir?.let { JSONObject(File(it, CAPTURE_METADATA_FILE).readText()) }
+            ?.optString("camera_profile")
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+    } catch (_: Exception) {
+        null
+    }
+
+    /** Missing/unknown metadata comes from an older capture and must not be
+     * destructively reduced when its original camera profile is unknowable. */
+    internal fun standardWidthForCaptureProfile(storedProfile: String?): Int =
+        if (storedProfile?.trim() == Prefs.CAMERA_PROFILE_FAST) FAST_STANDARD_WIDTH
+        else DETAIL_STANDARD_WIDTH
 
     // --- 2. OCR -----------------------------------------------------------------
 

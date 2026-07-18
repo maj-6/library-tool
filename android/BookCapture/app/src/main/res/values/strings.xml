@@ -18,6 +18,7 @@
     <string name="home_cancel_select">CANCEL</string>
     <string name="home_delete_title">Delete selected book scans?</string>
     <string name="home_delete_active_skipped">The active book scan was kept. Discard it from the camera screen.</string>
+    <string name="home_delete_failed">Some book scans could not be deleted and remain on this device. Free storage and try again.</string>
     <plurals name="home_delete_message">
         <item quantity="one">Deletes %1$d local book scan. Uploaded and imported cloud copies are not deleted.</item>
         <item quantity="other">Deletes %1$d local book scans. Uploaded and imported cloud copies are not deleted.</item>
@@ -47,8 +48,11 @@
     <string name="cmd_done">Finish book scan</string>
     <string name="cmd_cancel">Discard book scan</string>
     <string name="capture_discard_title">Discard this book scan?</string>
-    <string name="capture_discard_message">This permanently deletes the current local scan and its page photos. Accepted photos finish or are safely removed first.</string>
+    <string name="capture_discard_message">This removes the current local scan and its page photos from the capture queue. You can undo immediately after discarding.</string>
     <string name="capture_discard_confirm">DISCARD</string>
+    <string name="discarded">Book scan discarded</string>
+    <string name="undo">UNDO</string>
+    <string name="undo_unavailable">Too late to undo — the discard was already cleared.</string>
     <string name="open_settings">Open settings</string>
     <string name="open_recent">Show recent book scans</string>
     <string name="gear">⚙</string>
@@ -81,7 +85,7 @@
     <string name="set_camera_diagnostics_unavailable">Available after the camera starts.</string>
     <string name="set_voice">Voice control</string>
     <string name="set_voice_enable">Enable hands-free commands</string>
-    <string name="set_voice_note">Optional. Enabling requests microphone access and downloads an offline voice model of about 40 MB. “Finish” and “Discard” require a completed recognition result.</string>
+    <string name="set_voice_note">Optional. Say “start / photo / done / cancel” instead of tapping. Enabling requests microphone access and downloads an offline voice model of about 40 MB; “done” and “cancel” require a completed recognition result.</string>
     <string name="set_transport">Transport</string>
     <string name="transport_cloud">Cloud</string>
     <string name="transport_lan">LAN</string>
@@ -120,6 +124,7 @@
     <string name="detail_discard_confirm">DISCARD</string>
     <string name="detail_discard_active">Return to the camera to discard the active book scan.</string>
     <string name="detail_discard_uploaded">This book finished uploading while the dialog was open. Its cloud copy was preserved.</string>
+    <string name="detail_delete_failed">Could not delete this book scan. It remains on this device; free storage and try again.</string>
     <string name="detail_claim_cloud">CLAIM FOR CLOUD</string>
     <string name="detail_local_claim_available">This local book can use paired LAN now, or be explicitly claimed by your signed-in account for cloud upload.</string>
     <string name="detail_local_sign_in_to_claim">This local book can use paired LAN. Sign in before claiming it for cloud upload.</string>

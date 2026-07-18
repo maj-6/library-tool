@@ -37,6 +37,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.work.WorkManager
+import com.google.android.material.snackbar.Snackbar
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -750,8 +751,15 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             "cancel" -> {
-                if (session.cancel()) cues.cancelled()
-                else cues.error("nothing to discard")
+                val discarded = session.cancel()
+                if (discarded != null) {
+                    cues.cancelled()
+                    showUndoDiscard(discarded)
+                } else if (session.active) {
+                    cues.error("could not discard, still open")
+                } else {
+                    cues.error("nothing to discard")
+                }
             }
         }
         updateUi()
@@ -1046,6 +1054,22 @@ class MainActivity : AppCompatActivity() {
         if (!finishAfterAcceptedCaptures || captureQueue.busy || pendingCommand != null) return
         finishAfterAcceptedCaptures = false
         finish()
+    }
+
+    /** After a confirmed discard, offer an UNDO that pulls the entry back out
+     *  of the trash. Undo is unavailable once another entry is open because
+     *  restoreFromTrash deliberately refuses to clobber it. */
+    private fun showUndoDiscard(entryId: String) {
+        Snackbar.make(binding.root, getString(R.string.discarded), Snackbar.LENGTH_LONG)
+            .setAction(getString(R.string.undo)) {
+                if (session.restoreFromTrash(entryId)) {
+                    restoreThumbnailsIfNeeded()
+                    updateUi()
+                } else {
+                    setStatus(getString(R.string.undo_unavailable))
+                }
+            }
+            .show()
     }
 
     // --- UI ---------------------------------------------------------------------

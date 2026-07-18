@@ -22,7 +22,7 @@ BASELINE = SQL["001_baseline"]
 BASELINE_FLAT = " ".join(BASELINE.split())
 HARDENING = SQL["002_capture_owner_hardening"]
 HARDENING_FLAT = " ".join(HARDENING.split())
-SECRETS_REVISION = SQL["005_profile_secrets_revision"]
+SECRETS_REVISION = SQL["006_profile_secrets_revision"]
 SECRETS_REVISION_FLAT = " ".join(SECRETS_REVISION.split())
 
 

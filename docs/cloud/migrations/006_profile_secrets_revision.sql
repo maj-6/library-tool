@@ -1,4 +1,4 @@
--- 005_profile_secrets_revision — make the profile-secrets revision token
+-- 006_profile_secrets_revision — make the profile-secrets revision token
 -- advance for every update, including writes from older clients that do not
 -- send updated_at themselves.  New clients use this value for compare-and-set
 -- conflict detection, so the guarantee belongs in the database.
@@ -28,4 +28,4 @@ create trigger profile_secrets_touch_updated_at
   for each row
   execute function public.touch_profile_secrets_updated_at();
 
-insert into schema_migrations (id) values ('005_profile_secrets_revision') on conflict do nothing;
+insert into schema_migrations (id) values ('006_profile_secrets_revision') on conflict do nothing;
