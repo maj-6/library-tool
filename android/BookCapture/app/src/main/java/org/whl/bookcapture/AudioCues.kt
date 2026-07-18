@@ -13,10 +13,10 @@ import android.os.VibratorManager
  * each command already has a visible consequence on screen; the cue only
  * confirms the mic heard it.
  *
- * Photo capture is deliberately SPLIT: [photoHeard] plays a SOUND ONLY the
- * instant the "photo" cue is committed to (the shutter is firing), and
- * [photoCaptured] fires a VIBRATION ONLY once the frame is actually written.
- * So you hear "heard you", then feel "got it" — the two are separated in time.
+ * Photo capture is deliberately SPLIT: [photoHeard] plays a SOUND ONLY when
+ * the request is accepted (or queued), and [photoStarted] fires a VIBRATION
+ * ONLY from CameraX's exposure-start callback. File-saved confirmation remains
+ * a separate visible state.
  */
 class AudioCues(context: Context) {
 
@@ -46,11 +46,11 @@ class AudioCues(context: Context) {
     fun cancelled() { tone(ToneGenerator.TONE_PROP_NACK, 150); buzz() }
     fun error(@Suppress("UNUSED_PARAMETER") message: String) { tone(ToneGenerator.TONE_SUP_ERROR, 200); buzz(40) }
 
-    /** "photo" cue heard, shutter firing — SOUND ONLY. */
+    /** Capture input accepted or queued — SOUND ONLY. */
     fun photoHeard() = tone(ToneGenerator.TONE_PROP_BEEP2, 120)
 
-    /** frame actually captured — VIBRATION ONLY. */
-    fun photoCaptured() = buzz()
+    /** CameraX reported exposure start — VIBRATION ONLY. */
+    fun photoStarted() = buzz()
 
     fun shutdown() {
         released = true       // a voice command racing destroy cues nothing

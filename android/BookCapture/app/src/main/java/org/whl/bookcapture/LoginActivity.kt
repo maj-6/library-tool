@@ -22,11 +22,11 @@ class LoginActivity : AppCompatActivity() {
         setContentView(binding.root)
         binding.email.setText(Prefs.email(this))
 
-        binding.signIn.setOnClickListener { submit(register = false) }
-        binding.register.setOnClickListener { submit(register = true) }
+        binding.signIn.setOnClickListener { submit() }
+        binding.continueLocal.setOnClickListener { goToMain(signedIn = false) }
     }
 
-    private fun submit(register: Boolean) {
+    private fun submit() {
         val email = binding.email.text.toString().trim()
         val password = binding.password.text.toString()
         if (email.isEmpty() || password.isEmpty()) {
@@ -34,24 +34,22 @@ class LoginActivity : AppCompatActivity() {
             return
         }
         binding.signIn.isEnabled = false
-        binding.register.isEnabled = false
+        binding.continueLocal.isEnabled = false
         binding.msg.text = getString(R.string.login_working)
         lifecycleScope.launch {
             val err = withContext(Dispatchers.IO) {
-                if (register) Auth.register(this@LoginActivity, email, password)
-                else Auth.signIn(this@LoginActivity, email, password)
+                Auth.signIn(this@LoginActivity, email, password)
             }
             binding.signIn.isEnabled = true
-            binding.register.isEnabled = true
-            if (err == null && Auth.signedIn(this@LoginActivity)) goToMain()
+            binding.continueLocal.isEnabled = true
+            if (err == null && Auth.signedIn(this@LoginActivity)) goToMain(signedIn = true)
             else binding.msg.text = err ?: getString(R.string.login_failed)
         }
     }
 
     /** Lands on Home (the recent-scans list), not the camera. */
-    private fun goToMain() {
-        // the queue may hold captures made while signed out
-        UploadWorker.enqueue(this)
+    private fun goToMain(signedIn: Boolean) {
+        if (signedIn) UploadWorker.enqueue(this)
         // reset the task to a single clean Home
         startActivity(Intent(this, HomeActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))

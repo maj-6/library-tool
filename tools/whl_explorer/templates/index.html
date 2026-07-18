@@ -39,6 +39,7 @@
         <button class="menu-btn" type="button">View</button>
         <div class="menu-drop" hidden>
           <button class="menu-item" data-cmd="search-pane" type="button"><span class="menu-check"></span>Search pane</button>
+          <button class="menu-item" data-cmd="remarks-sidebar" type="button"><span class="menu-check"></span>Remarks sidebar</button>
           <div class="menu-sep"></div>
           <button class="menu-item" data-cmd="table-checked" type="button"><span class="menu-check"></span>Checked books table</button>
           <button class="menu-item" data-cmd="table-whl" type="button"><span class="menu-check"></span>WHL table</button>
@@ -477,12 +478,15 @@
         <div id="pane-splitter"></div>
 
         <div id="checked-right">
-          <div class="pane-bar">
-            <label class="tool-label" for="top-table">Table</label>
-            <select id="top-table" class="cad-input">
-              <option value="checked">Checked books + manual</option>
-              <option value="whl">WHL</option>
-            </select>
+          <div id="catalog-toolbar" class="pane-bar catalog-toolbar"
+               role="toolbar" aria-label="Catalog table tools">
+            <span class="catalog-table-picker">
+              <label class="tool-label" for="top-table">Table</label>
+              <select id="top-table" class="cad-input">
+                <option value="checked">Checked books + manual</option>
+                <option value="whl">WHL</option>
+              </select>
+            </span>
             <span id="whl-modeseg" class="modeseg" role="group" hidden
                   data-tip="Search / Edit / Process mode  (Ctrl+E toggles Search/Edit)">
               <button type="button" class="modeseg-btn" data-mode="search">Search</button>
@@ -519,24 +523,14 @@
                       data-tip="Run the action on the selected rows">Run</button>
             </span>
             <span class="bar-spacer"></span>
-            <span class="year-filter" data-tip="Show only rows within this year range (inclusive)">
-              <span class="tool-label">Year</span>
-              <input id="year-from" class="cad-input yr-input" type="number"
-                     inputmode="numeric" placeholder="from" />
-              <span class="yr-dash">–</span>
-              <input id="year-to" class="cad-input yr-input" type="number"
-                     inputmode="numeric" placeholder="to" />
-              <button id="year-clear" class="cad-btn tiny icon-btn" type="button"
-                      data-icon="remove" data-tip="Clear the year range"></button>
-            </span>
-            <button id="export-json" class="cad-btn tiny icon-btn" type="button"
-                    data-icon="export" data-tip="Export the table as JSON (respects the active filters)"></button>
-            <button id="dl-approved" class="cad-btn tiny icon-btn" type="button"
-                    data-icon="download" data-tip="Download all verified sources"></button>
             <button id="filter-btn" class="cad-btn tiny icon-btn" type="button"
-                    data-icon="filter" data-tip="Filter rows"></button>
+                    data-icon="filter" aria-label="Filter rows"
+                    aria-haspopup="dialog" aria-expanded="false" aria-pressed="false"
+                    data-tip="Filter rows"></button>
             <button id="colvis-top" class="cad-btn tiny icon-btn" type="button"
-                    data-icon="columns" data-tip="Visible columns"></button>
+                    data-icon="columns" aria-label="Visible columns"
+                    aria-haspopup="dialog" aria-expanded="false"
+                    data-tip="Visible columns"></button>
             <span class="tool-count" id="top-count"></span>
           </div>
 
@@ -632,13 +626,13 @@
                     data-tip="Already published to WHL">Uploaded</button>
             <span class="tool-count" id="upload-count"></span>
             <span class="bar-spacer"></span>
-            <button id="build-new-side" class="cad-btn tiny icon-btn" type="button"
-                    data-icon="plus" aria-label="New entry"
-                    data-tip="New blank entry"></button>
             <button id="ocr-filter-verified" class="cad-btn tiny icon-btn toggle" type="button"
-                    data-icon="check" data-tip="Show verified books only"></button>
+                    data-icon="check" aria-label="Show verified books only" aria-pressed="false"
+                    data-tip="Show verified books only"></button>
             <button id="ocr-side-toggle" class="cad-btn tiny" type="button"
-                    aria-expanded="true" data-tip="Collapse the entries &amp; artifacts sidebar">&#9664;</button>
+                    aria-label="Collapse the entries and artifacts sidebar"
+                    aria-controls="ocr-side" aria-expanded="true"
+                    data-tip="Collapse the entries &amp; artifacts sidebar">&#9664;</button>
           </div>
           <div class="drafting" id="ocr-books-wrap">
             <ul id="ocr-books"></ul>
@@ -673,7 +667,6 @@
           <div class="pane-bar" id="wb-head">
             <span id="wb-title"></span>
             <span id="wb-sub" class="tool-label"></span>
-            <span id="wb-chips"></span>
             <span class="bar-spacer"></span>
             <span class="tool-label" id="build-msg"></span>
           </div>
@@ -1083,7 +1076,7 @@
       <div id="an-split">
         <aside id="an-books">
           <div class="pane-bar"><span class="tool-label"
-                data-tip="Only verified, available entries are listed (mark drafts verified in the Editor first)">Entries</span>
+                data-tip="Only verified, available entries are listed (verify drafts in Workbench › Publish first)">Entries</span>
             <span class="tool-count" id="an-count"></span></div>
           <div class="drafting" id="an-list-wrap"><ul id="an-list"></ul></div>
         </aside>
@@ -1299,45 +1292,53 @@
             <span class="tool-label">Pages</span>
             <span class="tool-count" id="rw-page-count"></span>
             <span class="bar-spacer"></span>
-            <select id="rw-src" class="cad-input" hidden></select>
+            <select id="rw-src" class="cad-input" aria-label="Replica source" hidden></select>
           </div>
           <div id="rw-pages" class="drafting"></div>
         </aside>
         <div id="rw-main">
-          <div class="pane-bar">
+          <div class="pane-bar replica-toolbar" role="toolbar" aria-label="Replica page tools">
             <button id="rw-mode-edit" class="cad-btn tiny icon-btn active" type="button"
-                    data-icon="pencil" aria-label="Edit regions"
+                    data-icon="pencil" aria-label="Edit regions" aria-pressed="true"
                     data-tip="Edit the page's regions"></button>
             <button id="rw-mode-preview" class="cad-btn tiny icon-btn" type="button"
-                    data-icon="eye" aria-label="Preview"
+                    data-icon="eye" aria-label="Preview" aria-pressed="false"
                     data-tip="Re-typeset preview: the page rendered from its regions at the mapped styles, beside the original — the modernized facsimile"></button>
-            <select id="rw-preview-lang" class="cad-input" hidden
+            <select id="rw-preview-lang" class="cad-input" aria-label="Preview text layer" hidden
                     data-tip="Which text layer the preview flows: the diplomatic transcription, the normalized reading, or a page-aligned translation"></select>
             <span class="tool-count" id="rw-status"></span>
-            <span class="bar-spacer"></span>
-            <span id="rw-legend" class="tool-label"></span>
-            <span class="bar-spacer"></span>
-            <select id="rw-tpl" class="cad-input" data-tip="Layout template — one corrected recto/verso page becomes a reusable grid"></select>
-            <button id="rw-tpl-save" class="cad-btn tiny icon-btn" type="button" disabled
-                    data-icon="gridplus" aria-label="Save as template"
-                    data-tip="Save this page's SAVED regions as a template (geometry + roles, no text)"></button>
-            <button id="rw-tpl-apply" class="cad-btn tiny" type="button" disabled
-                    data-tip="Stamp the template onto a page range; each region pre-fills its text from the word boxes inside it">Apply</button>
-            <button id="rw-tpl-outliers" class="cad-btn tiny" type="button" disabled
-                    data-tip="Flag region pages that break the template's grid — plates, chapter openings, errata">Outliers</button>
             <span class="bar-spacer"></span>
             <button id="rw-save" class="cad-btn tiny icon-btn" type="button" disabled
                     data-icon="save" aria-label="Save regions"
                     data-tip="Save this page's regions (Ctrl+S)"></button>
-            <button id="rw-recompile" class="cad-btn tiny" type="button" disabled
-                    data-tip="Rewrite compiled text from every saved region page of this source — furniture stays out of the flow. The toggled layer compiles: diplomatic into each record's doc, normalized into normalized.txt">Recompile</button>
-            <button id="rw-export" class="cad-btn tiny" type="button" disabled
-                    data-tip="Export this source's region pages as a .lib — book metadata, role stylesheet, templates, per-page regions with both text layers, and the figure crops, sealed in one portable file">Export .lib</button>
-            <button id="rw-import" class="cad-btn tiny" type="button" disabled
-                    data-tip="Import a .lib archive into this source — pages that already have regions are skipped, and the stylesheet only lands if the book has none of its own">Import</button>
-            <button id="rw-print" class="cad-btn tiny icon-btn" type="button" disabled
-                    data-icon="printer" aria-label="Print"
-                    data-tip="Open the modernized facsimile as a print document (one A4 sheet per region page, the preview's layer selector picks the text) — print it to PDF from the browser"></button>
+            <details id="rw-template-menu" class="toolbar-popover">
+              <summary class="cad-btn tiny"
+                       data-tip="Choose, save, apply, or inspect layout templates">Templates</summary>
+              <div class="toolbar-popover-panel" role="group" aria-label="Template actions">
+                <label class="toolbar-popover-field" for="rw-tpl">Layout template</label>
+                <select id="rw-tpl" class="cad-input"
+                        data-tip="One corrected recto or verso page becomes a reusable grid"></select>
+                <button id="rw-tpl-save" class="cad-btn tiny" type="button" disabled
+                        data-tip="Save this page's saved regions as a template (geometry and roles, no text)">Save current page</button>
+                <button id="rw-tpl-apply" class="cad-btn tiny" type="button" disabled
+                        data-tip="Stamp the template onto a page range; each region pre-fills its text from the word boxes inside it">Apply to pages…</button>
+                <button id="rw-tpl-outliers" class="cad-btn tiny" type="button" disabled
+                        data-tip="Flag region pages that break the template's grid — plates, chapter openings, errata">Find outliers</button>
+              </div>
+            </details>
+            <details id="rw-actions-menu" class="toolbar-popover">
+              <summary class="cad-btn tiny" data-tip="Recompile, import, export, or print this replica">Book actions</summary>
+              <div class="toolbar-popover-panel" role="group" aria-label="Replica actions">
+                <button id="rw-recompile" class="cad-btn tiny" type="button" disabled
+                        data-tip="Rewrite compiled text from every saved region page of this source — furniture stays out of the flow. The toggled layer compiles: diplomatic into each record's doc, normalized into normalized.txt">Recompile text</button>
+                <button id="rw-export" class="cad-btn tiny" type="button" disabled
+                        data-tip="Export this source's region pages as a .lib — book metadata, role stylesheet, templates, per-page regions with both text layers, and the figure crops, sealed in one portable file">Export .lib</button>
+                <button id="rw-import" class="cad-btn tiny" type="button" disabled
+                        data-tip="Import a .lib archive into this source — pages that already have regions are skipped, and the stylesheet only lands if the book has none of its own">Import .lib…</button>
+                <button id="rw-print" class="cad-btn tiny" type="button" disabled
+                        data-tip="Open the modernized facsimile as a print document (one A4 sheet per region page, the preview's layer selector picks the text) — print it to PDF from the browser">Print…</button>
+              </div>
+            </details>
             <input id="rw-import-file" type="file" accept=".lib,.zip" hidden>
           </div>
           <div id="rw-canvas-wrap" class="drafting">
@@ -1395,8 +1396,10 @@
           </div>
           <textarea id="rw-text" class="cad-input" spellcheck="false" disabled
                     placeholder="Select a region"></textarea>
-          <div class="pane-bar">
+          <div class="pane-bar rw-keybar">
             <span id="rw-keys" class="tool-label">draw: drag &nbsp; move/resize: drag box/corner &nbsp; roles: 1–9,0 + D drop-cap / F footnote &nbsp; split: S / Shift+S &nbsp; merge: M &nbsp; verify page: V &nbsp; del: Del &nbsp; order: [ ] &nbsp; walk: Tab</span>
+            <span class="bar-spacer"></span>
+            <span id="rw-legend" class="tool-label" aria-label="Region role shortcuts"></span>
           </div>
           </div>
         </aside>
@@ -1445,32 +1448,105 @@
       </div>
     </section>
 
-    <!-- INFO: the console, for now; more lands here later -->
+    <!-- INFO: diagnostic messages and the local database inventory -->
     <section id="infotab" class="panel-view">
-      <div class="pane-bar">
-        <span class="tool-label">Console</span>
-        <select id="con-level" class="cad-input" data-tip="Lowest level to show">
-          <option value="info">Info and above</option>
-          <option value="warn">Warnings and errors</option>
-          <option value="error">Errors only</option>
-          <option value="debug">Everything (with HTTP)</option>
-        </select>
-        <input id="con-find" class="cad-input" placeholder="filter" spellcheck="false" />
-        <span class="bar-spacer"></span>
-        <span id="con-count" class="tool-label"></span>
-        <button id="con-follow" class="cad-btn tiny icon-btn active" type="button"
-                data-icon="follow" aria-label="Follow"
-                data-tip="Scroll to follow new lines"></button>
-        <button id="con-copy" class="cad-btn tiny icon-btn" type="button"
-                data-icon="export" data-tip="Copy the visible lines"
-                aria-label="Copy the visible lines"></button>
-        <button id="con-clear" class="cad-btn tiny icon-btn danger" type="button"
-                data-icon="remove" data-tip="Clear the console (the server keeps its own ring)"
-                aria-label="Clear the console"></button>
+      <div id="info-section-tabs" class="pane-tabs" role="tablist"
+           aria-label="Info sections">
+        <button class="pane-tab active" id="info-console-tab" type="button"
+                role="tab" aria-selected="true" aria-controls="info-console"
+                data-info-section="info-console">Console</button>
+        <button class="pane-tab" id="info-resources-tab" type="button"
+                role="tab" aria-selected="false" aria-controls="info-resources"
+                data-info-section="info-resources">Resources</button>
       </div>
-      <div id="con-lines"></div>
+
+      <div id="info-console" class="info-section active" role="tabpanel"
+           aria-labelledby="info-console-tab">
+        <div class="pane-bar">
+          <span class="tool-label">Debug / message console</span>
+          <select id="con-level" class="cad-input" data-tip="Lowest level to show">
+            <option value="info">Info and above</option>
+            <option value="warn">Warnings and errors</option>
+            <option value="error">Errors only</option>
+            <option value="debug">Everything (with HTTP)</option>
+          </select>
+          <input id="con-find" class="cad-input" placeholder="filter" spellcheck="false" />
+          <span class="bar-spacer"></span>
+          <span id="con-count" class="tool-label"></span>
+          <button id="con-follow" class="cad-btn tiny icon-btn active" type="button"
+                  data-icon="follow" aria-label="Follow"
+                  data-tip="Scroll to follow new lines"></button>
+          <button id="con-copy" class="cad-btn tiny icon-btn" type="button"
+                  data-icon="export" data-tip="Copy the visible lines"
+                  aria-label="Copy the visible lines"></button>
+          <button id="con-clear" class="cad-btn tiny icon-btn danger" type="button"
+                  data-icon="remove" data-tip="Clear the console (the server keeps its own ring)"
+                  aria-label="Clear the console"></button>
+        </div>
+        <div id="con-lines"></div>
+      </div>
+
+      <div id="info-resources" class="info-section" role="tabpanel"
+           aria-labelledby="info-resources-tab">
+        <div class="db-resource-overview">
+          <div>
+            <div class="db-resource-title">Loaded databases</div>
+            <p class="settings-note">Local indexes and reference catalogs currently available
+              to Library Tool. Choose a database below for its source and file details.</p>
+          </div>
+          <span id="db-resource-summary" class="tool-label" role="status"
+                aria-live="polite">Not loaded</span>
+          <button id="db-resource-refresh" class="cad-btn tiny" type="button">Refresh</button>
+        </div>
+        <div class="db-resource-layout">
+          <nav id="db-resource-menu" class="db-resource-menu"
+               aria-label="Database resources"></nav>
+          <article id="db-resource-detail" class="db-resource-detail"
+                   aria-live="polite">
+            <div class="empty">Open Resources to inspect the local databases.</div>
+          </article>
+        </div>
+      </div>
     </section>
   </main>
+
+  <!-- REMARKS: one shared needs-attention sidebar for every top-level tab.
+       The selected category is remembered per tab; collapse state is shared. -->
+  <aside id="remarks-sidebar" class="collapsed" aria-labelledby="remarks-heading">
+    <button id="remarks-open" class="remarks-rail-toggle" type="button"
+            aria-controls="remarks-expanded" aria-expanded="false"
+            aria-label="Open Remarks sidebar">
+      <span class="remarks-rail-arrow" aria-hidden="true">&#9664;</span>
+      <span class="remarks-rail-label">Remarks</span>
+      <span id="remarks-rail-count" class="remarks-count" aria-hidden="true"></span>
+    </button>
+
+    <div id="remarks-expanded" hidden>
+      <div class="remarks-head">
+        <div class="remarks-heading-wrap">
+          <h2 id="remarks-heading">Remarks</h2>
+          <span id="remarks-total" class="tool-count" role="status"
+                aria-live="polite"></span>
+        </div>
+        <button id="remarks-close" class="cad-btn tiny remarks-collapse" type="button"
+                aria-controls="remarks-expanded" aria-expanded="true"
+                aria-label="Collapse Remarks sidebar"
+                data-tip="Collapse Remarks sidebar">&#9654;</button>
+      </div>
+      <div class="remarks-filter-row">
+        <label class="tool-label" for="remarks-filter">Show</label>
+        <select id="remarks-filter" class="cad-input">
+          <option value="all">All</option>
+          <option value="catalogs">Catalogs</option>
+          <option value="sources">Sources</option>
+          <option value="entries">Entries</option>
+          <option value="pages">Pages</option>
+          <option value="publications">Publications</option>
+        </select>
+      </div>
+      <div id="remarks-list"></div>
+    </div>
+  </aside>
   </div><!-- /#shell -->
 
   <!-- DEFAULT ENGINES WINDOW: shared by OCR and text-analysis staging -->
@@ -1511,7 +1587,7 @@
   </div>
 
   <div id="cad-tooltip" hidden></div>
-  <div id="popup-menu" hidden></div>
+  <div id="popup-menu" role="dialog" aria-label="Toolbar options" hidden></div>
 
   <!-- MARKDOWN EDITOR WINDOW -->
   <div id="md-overlay" class="overlay" hidden>
@@ -1850,7 +1926,7 @@
           </div>
           <div id="sec-ai" class="settings-sec">
             <div class="settings-head">AI</div>
-            <p class="settings-note">The Analyze tab's provider. DeepSeek is the
+            <p class="settings-note">The Workbench Knowledge phase's provider. DeepSeek is the
               default — leave base and model blank and paste a key. Any
               OpenAI-compatible endpoint works.</p>
             <div class="settings-rows">
@@ -1865,10 +1941,10 @@
               <label class="tool-label" for="set-ai-temp">Temperature (blank = per-task default)</label>
               <input id="set-ai-temp" class="cad-input" type="number" min="0" max="2" step="0.1"
                      placeholder="0.3"
-                     data-tip="Lower is more deterministic. Blank keeps each task's own default (summaries 0.4, translation 0.2); set a value to override every Analyze call — 0 for reproducible output." />
+                     data-tip="Lower is more deterministic. Blank keeps each task's own default (summaries 0.4, translation 0.2); set a value to override every Knowledge request — 0 for reproducible output." />
               <label class="tool-label" for="set-ai-timeout">Request timeout (seconds)</label>
               <input id="set-ai-timeout" class="cad-input" type="number" min="10" max="1200" step="10"
-                     data-tip="How long an Analyze request may run before it is abandoned. Raise it for big summaries on slow or self-hosted endpoints." />
+                     data-tip="How long a Knowledge request may run before it is abandoned. Raise it for big summaries on slow or self-hosted endpoints." />
               <label class="tool-label" for="set-embed-base">Embeddings API base URL</label>
               <input id="set-embed-base" class="cad-input" spellcheck="false"
                      placeholder="https://api.openai.com/v1"
@@ -1911,6 +1987,12 @@
               <label class="tool-label" for="set-ocr-maxtokens">Vision OCR max output tokens</label>
               <input id="set-ocr-maxtokens" class="cad-input" type="number" min="1024" max="32000" step="512"
                      data-tip="Output cap for Claude / vision OCR. Raise it if dense, small-type pages get truncated mid-transcription." />
+              <label class="tool-label" for="set-ocr-paper-color">Use the PDF's paper color in facsimile layout</label>
+              <input id="set-ocr-paper-color" type="checkbox"
+                     data-tip="Sample the clear margin bands of five representative PDF pages and tint the OCR facsimile with their median paper color" />
+              <label class="tool-label" for="set-ocr-paper-lighten">Facsimile paper lightening (%)</label>
+              <input id="set-ocr-paper-lighten" class="cad-input" type="number" min="0" max="100" step="5"
+                     data-tip="Mix the sampled paper color toward white: 0 keeps the original color; 100 makes it white" />
               <label class="tool-label" for="set-ocr-key1">Page-view key 1</label>
               <select id="set-ocr-key1" class="cad-input">
                 <option value="">&mdash;</option>
@@ -2036,7 +2118,7 @@
             <p class="settings-note">Optional service credentials. A Library Tool account
               uses the built-in public cloud configuration and never needs an owner key.
               Mistral follows your signed-in profile; other provider keys stay on this machine.</p>
-            <div class="settings-subhead">AI (Analyze)</div>
+            <div class="settings-subhead">AI (Knowledge)</div>
             <div class="settings-rows">
               <label class="tool-label" for="set-ai-key">DeepSeek / AI provider API key</label>
               <input id="set-ai-key" class="cad-input" type="password" spellcheck="false" />
@@ -2182,7 +2264,6 @@
         <span id="dl-progtext" class="dl-progtext"></span>
         <span class="dl-progtrack"><span id="dl-progbar" class="dl-progbar"></span></span>
       </span>
-      <span id="mode-tag" class="foot-tag" hidden></span>
       <span id="status-right"></span>
     </span>
   </div>
@@ -2240,8 +2321,8 @@
              source availability, and turn verified scans into readable volumes.</p>
           <ul class="wiz-points">
             <li><b>Catalogs</b> is where you search, compare, and verify books.</li>
-            <li><b>Editor</b> organizes sources and publication details.</li>
-            <li><b>Analyze</b> handles OCR and optional AI-assisted text work.</li>
+            <li><b>Workbench</b> moves each book through Record, Source, Text, Knowledge, and Publish.</li>
+            <li><b>Published Library</b> previews what readers can browse online.</li>
           </ul>
           <p class="settings-note">Setup takes about a minute. Every choice is optional
              and remains available in <b>Settings</b>.</p>
@@ -2289,7 +2370,7 @@
             </section>
             <section class="wiz-service-card">
               <div class="wiz-service-head"><b>DeepSeek</b><span class="wiz-badge">ANALYSIS</span></div>
-              <p>Powers summaries, translation, and other Analyze tools.</p>
+              <p>Powers summaries, translation, and other Knowledge tools.</p>
               <label class="tool-label" for="wiz-deepseek">API key <span class="wiz-opt">(optional)</span></label>
               <input id="wiz-deepseek" class="cad-input" type="password" spellcheck="false"
                      autocomplete="off" placeholder="Leave blank to skip" />
@@ -2310,7 +2391,7 @@
           <p class="wiz-lead">You’re ready.</p>
           <ul class="wiz-points wiz-ready-list">
             <li>Use <b>Catalogs</b> to find a book and compare source records.</li>
-            <li>Use <b>Editor</b> after a source is verified and downloaded.</li>
+            <li>Use <b>Workbench</b> to move a verified source through Record, Source, Text, Knowledge, and Publish.</li>
             <li>Check <b>Home</b> for running work, reviews, and recent activity.</li>
           </ul>
           <p class="settings-note">Anything you skipped can be added later in

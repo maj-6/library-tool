@@ -5,6 +5,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
+import java.net.InetAddress
 import java.net.URL
 import java.util.UUID
 
@@ -19,6 +20,7 @@ class LanClient(ctx: Context) {
 
     class HttpException(val code: Int, message: String) : IOException(message)
     class NotConfigured : IOException("no paired desktop")
+    class UnsafeEndpoint : IOException("cleartext LAN address is not private")
 
     private val base: String = run {
         val h = Prefs.lanHost(ctx)
@@ -27,12 +29,52 @@ class LanClient(ctx: Context) {
     }
     private val token = Prefs.lanToken(ctx)
 
-    /** True if the paired desktop answers /lan/ping. Cheap reachability probe. */
+    private fun open(path: String): HttpURLConnection {
+        val url = URL("$base$path")
+        if (url.protocol != "http" && url.protocol != "https") throw UnsafeEndpoint()
+        // Cleartext hostnames would be resolved a second time by URLConnection
+        // and permit DNS rebinding after this check. Require a private literal
+        // address (the pairing UI advertises one) or loopback.
+        if (url.protocol == "http" && !isPrivateLanHost(url.host)) throw UnsafeEndpoint()
+        return url.openConnection() as HttpURLConnection
+    }
+
+    /** Confirm both branded liveness and token authorization. The paired
+     * desktop must echo a fresh nonce from its side-effect-free pair route. */
     fun ping(): Boolean = try {
-        val c = URL("$base/lan/ping").openConnection() as HttpURLConnection
-        c.connectTimeout = 3_000; c.readTimeout = 3_000
-        val ok = c.responseCode == 200
-        c.disconnect(); ok
+        if (token.isBlank()) false else {
+            val c = open("/lan/ping")
+            c.connectTimeout = 3_000; c.readTimeout = 3_000
+            val branded = c.responseCode == 200 && try {
+                JSONObject(c.inputStream.bufferedReader().use { it.readText() })
+                    .optString("app") == "whl-capture"
+            } catch (_: Exception) { false }
+            c.disconnect()
+            if (!branded) false else {
+                val nonce = UUID.randomUUID().toString()
+                val probe = open("/lan/pair")
+                probe.requestMethod = "POST"
+                probe.connectTimeout = 3_000; probe.readTimeout = 3_000
+                probe.doOutput = true
+                probe.setRequestProperty("X-WHL-Token", token)
+                probe.setRequestProperty("Content-Type", "application/json")
+                probe.outputStream.use {
+                    it.write(JSONObject().put("nonce", nonce).toString().toByteArray())
+                }
+                val code = probe.responseCode
+                val response = if (code in 200..299) try {
+                    JSONObject(probe.inputStream.bufferedReader().use { it.readText() })
+                } catch (_: Exception) { JSONObject() } else JSONObject()
+                val authorized = isValidPairingResponse(
+                    nonce,
+                    code,
+                    response.optString("app"),
+                    response.optString("nonce"),
+                )
+                probe.disconnect()
+                authorized
+            }
+        }
     } catch (_: Exception) { false }
 
     /** One capture -> the desktop: a "meta" JSON field + N "photo" file parts. */
@@ -43,7 +85,7 @@ class LanClient(ctx: Context) {
             .put("created_at", createdAt).put("ocr", ocr).put("meta", meta)
         val boundary = "whl" + UUID.randomUUID().toString().replace("-", "")
         val crlf = "\r\n"; val dash = "--"
-        val c = URL("$base/lan/capture").openConnection() as HttpURLConnection
+        val c = open("/lan/capture")
         c.requestMethod = "POST"
         c.connectTimeout = 20_000
         c.readTimeout = 120_000
@@ -69,7 +111,51 @@ class LanClient(ctx: Context) {
             val body = try { c.errorStream?.readBytes()?.decodeToString() ?: "" } catch (_: Exception) { "" }
             throw HttpException(code, "HTTP $code: ${body.take(200)}")
         }
-        try { c.inputStream.use { it.readBytes() } } catch (_: Exception) { }   // drain + close
+        val response = try {
+            JSONObject(c.inputStream.bufferedReader().use { it.readText() })
+        } catch (e: Exception) {
+            c.disconnect()
+            throw IOException("desktop returned an unreadable capture receipt", e)
+        }
         c.disconnect()
+        if (!isValidCaptureReceipt(
+                expectedId = id,
+                responseCode = code,
+                app = response.optString("app"),
+                status = response.optString("status"),
+                returnedId = response.optString("id"),
+            )
+        ) throw IOException("desktop did not confirm capture $id")
     }
 }
+
+internal fun isPrivateLanAddress(address: InetAddress): Boolean =
+    address.isSiteLocalAddress || address.isLinkLocalAddress || address.isLoopbackAddress ||
+        (address.address.size == 16 && (address.address[0].toInt() and 0xfe) == 0xfc)
+
+internal fun isPrivateLanHost(host: String): Boolean {
+    val value = host.trim().removePrefix("[").removeSuffix("]")
+    if (value.equals("localhost", ignoreCase = true)) return true
+    val looksLiteral = value.contains(':') || value.matches(Regex("[0-9.]+"))
+    if (!looksLiteral) return false
+    return try { isPrivateLanAddress(InetAddress.getByName(value)) }
+        catch (_: Exception) { false }
+}
+
+internal fun isValidPairingResponse(
+    expectedNonce: String,
+    responseCode: Int,
+    app: String,
+    returnedNonce: String,
+): Boolean = responseCode in 200..299 && app == "whl-capture" &&
+    expectedNonce.isNotEmpty() && returnedNonce == expectedNonce
+
+internal fun isValidCaptureReceipt(
+    expectedId: String,
+    responseCode: Int,
+    app: String,
+    status: String,
+    returnedId: String,
+): Boolean = responseCode in 200..299 && app == "whl-capture" &&
+    status in setOf("imported", "duplicate") && expectedId.isNotEmpty() &&
+    returnedId == expectedId

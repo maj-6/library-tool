@@ -72,6 +72,7 @@ pushed:
    `.blockmap`** — those two are the auto-update channel: installed apps check
    the newest GitHub Release at startup and read them to fetch the update.
 3. **publish** attaches everything to a GitHub Release named after the tag,
+   using `docs/releases/<tag>.md` as its release notes when that file exists,
    then registers the APK and the installer in the `releases` table via
    `tools/release_publish.py` (URL → the GitHub Release asset). The Downloads
    page shows them immediately, and existing installs pick the update up on
@@ -80,6 +81,7 @@ pushed:
 So cutting a release is:
 
 ```
+# draft docs/releases/v0.4.0.md before tagging
 # bump versions first if warranted:
 #   android/BookCapture/app/build.gradle.kts   versionCode + versionName
 #   desktop/package.json                       version
@@ -157,8 +159,9 @@ same platform/version/channel replaces the row, so corrections are safe.
 
 ## Known caveats
 
-- The installer is unsigned (no code-signing cert), so SmartScreen will warn
-  on first run.
+- The installer is signed only when `WIN_CSC_LINK_B64` and its password are
+  configured for the release workflow. Otherwise SmartScreen may warn on first
+  run.
 - The 40 MB `copyright_renewals.csv` is deliberately absent from the public
   mirror; the sidecar spec skips missing data files, so the CI build simply
   ships without that dataset — the in-app setup guide offers it (and the other

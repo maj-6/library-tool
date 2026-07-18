@@ -50,26 +50,22 @@
                 android:layout_height="1dp"
                 android:layout_weight="1" />
 
-            <TextView
+            <com.google.android.material.button.MaterialButton
                 android:id="@+id/queueChip"
+                style="@style/WhlToolbarAction"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:background="?attr/selectableItemBackgroundBorderless"
-                android:fontFamily="monospace"
+                android:contentDescription="@string/open_recent"
                 android:textSize="12sp"
-                android:textColor="@color/whl_ink"
-                android:padding="8dp"
                 android:text="@string/recent_chip" />
 
-            <TextView
+            <com.google.android.material.button.MaterialButton
                 android:id="@+id/btnSettings"
+                style="@style/WhlToolbarAction"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:background="?attr/selectableItemBackgroundBorderless"
-                android:fontFamily="monospace"
+                android:contentDescription="@string/open_settings"
                 android:textSize="16sp"
-                android:textColor="@color/whl_ink"
-                android:padding="8dp"
                 android:text="@string/gear" />
         </LinearLayout>
 

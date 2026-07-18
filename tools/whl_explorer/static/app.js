@@ -37,6 +37,7 @@ const VIEW_STATE_KEYS = new Set([
   "topTable", "bottomActive", "whlMode", "checkedMode", "showCatalog",
   "paneWidth", "uploadSplitH", "publishSidebarCollapsed", "workbenchPhase",
   "jobsDrawerOpen", "authPromptDismissed", "checkedCols",
+  "remarksSidebarCollapsed", "remarksFilters",
   "collapsed", "wbSideCollapsed",
 ]);
 // Credentials are never persisted client-side. They live in the server's
@@ -200,6 +201,8 @@ const state = {
     ocrAwsKey: "", ocrAwsSecret: "", ocrAwsRegion: "",
     ocrImageWidth: 1400,
     ocrLayout: true,    // page view: place words where they sit on the page
+    ocrPaperColor: false,   // tint facsimile paper from sampled PDF margins
+    ocrPaperLighten: 20,    // percent mixed toward white after sampling
     ocrFurniture: true, // region facsimile: show marginalia/headers/catchwords
     textAnalysisService: "configured",
     workbenchPhase: "record",   // last phase open on the Workbench
@@ -215,7 +218,7 @@ const state = {
     dbUrls: {},                 // per-database download URLs (name -> url)
     uploadSplitH: null, pdfBrowseDir: "",
     scanRecentMin: 30,          // scan-attach picker: show only PDFs this new
-    whlModalOcr: false,         // OCR panel in the WHL publication viewer
+    whlModalOcr: true,          // OCR panel in the WHL publication viewer
     previewPages: 20,           // page cap for PDF preview derivatives
     previewOriginal: false,     // view the original PDF instead of a preview
     keepOriginals: true,        // keep IA originals after a folder build
@@ -237,6 +240,9 @@ const state = {
     includePrereleaseUpdates: false, // desktop: allow alpha/beta/rc auto-updates
     publishGroup: "sets",           // organization of the Publish file tree
     publishSidebarCollapsed: false,
+    remarksSidebarCollapsed: true,  // visible rail by default; category choice is per tab
+    remarksFilters: {},
+    remarksMeta: {},                // synced labels/categories for keyed marks
     collapsed: {},                  // per-key collapsed state for makeCollapsible sections
     wbSideCollapsed: false,         // Workbench entries/artifacts sidebar folded away
     // Settings > Theme editor: per-theme chrome token overrides,
@@ -756,7 +762,9 @@ function conPut(level, msg, src) {
 
 function conVisible() {
   const p = el("infotab");
-  return !!p && p.classList.contains("active");
+  const consolePane = el("info-console");
+  return !!p && p.classList.contains("active") && !!consolePane &&
+    consolePane.classList.contains("active");
 }
 
 let _conTimer = null;
@@ -852,6 +860,177 @@ function initConsole() {
   pollConsoleLog();
   setInterval(pollConsoleLog, 3000);
 }
+
+// --- Info tab: Console / Resources and database inventory -------------------
+
+const dbResourceState = {
+  data: null, selected: "", loadedAt: 0, loading: false, error: "",
+};
+
+function activeInfoSection() {
+  const tab = document.querySelector("#info-section-tabs .pane-tab.active");
+  return tab ? tab.dataset.infoSection : "info-console";
+}
+
+function dbResourceDate(value) {
+  if (!value) return "Never";
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return String(value);
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium", timeStyle: "short",
+  }).format(date);
+}
+
+function dbResourceEntries(target) {
+  if (!target || target.entries == null) return "Not available";
+  const count = Number(target && target.entries);
+  if (!Number.isFinite(count)) return "Not available";
+  return `${count.toLocaleString()} ${target.entry_unit || "entries"}`;
+}
+
+function dbResourceStatus(target) {
+  const job = target.job || {};
+  if (job.status === "downloading") {
+    const pct = job.total ? Math.round(100 * (job.downloaded || 0) / job.total) : 0;
+    return { label: `Syncing ${pct}%`, cls: "syncing" };
+  }
+  if (job.status === "error") return { label: "Sync failed", cls: "error" };
+  return target.present
+    ? { label: "Loaded", cls: "loaded" }
+    : { label: "Not loaded", cls: "missing" };
+}
+
+function dbResourceLink(url, label) {
+  const safe = /^https?:\/\//i.test(String(url || ""));
+  return safe
+    ? `<a href="${esc(url)}" target="_blank" rel="noopener">${esc(label || url)}</a>`
+    : esc(label || url || "Not specified");
+}
+
+function dbResourceDetailRow(label, valueHtml) {
+  return `<div class="db-resource-row"><dt>${esc(label)}</dt><dd>${valueHtml}</dd></div>`;
+}
+
+function renderDatabaseResources() {
+  const menu = el("db-resource-menu");
+  const detail = el("db-resource-detail");
+  const summary = el("db-resource-summary");
+  if (!menu || !detail || !summary) return;
+
+  if (dbResourceState.error) {
+    summary.textContent = "Database status unavailable";
+    menu.innerHTML = "";
+    detail.innerHTML = `<div class="db-resource-error">${esc(dbResourceState.error)}</div>`;
+    return;
+  }
+  const targets = Object.entries((dbResourceState.data || {}).targets || {});
+  if (!targets.length) {
+    summary.textContent = dbResourceState.loading ? "Loading…" : "No databases reported";
+    menu.innerHTML = "";
+    detail.innerHTML = `<div class="empty">${dbResourceState.loading
+      ? "Reading database metadata…" : "No database resources were reported."}</div>`;
+    return;
+  }
+
+  const loaded = targets.filter(([, target]) => target.present);
+  const totalSize = loaded.reduce((sum, [, target]) => sum + Number(target.size || 0), 0);
+  summary.textContent = `${loaded.length} of ${targets.length} loaded` +
+    (totalSize ? ` · ${dbFmtBytes(totalSize)}` : "") +
+    (dbResourceState.loading ? " · refreshing…" : "");
+  if (!targets.some(([name]) => name === dbResourceState.selected)) {
+    dbResourceState.selected = (loaded[0] || targets[0])[0];
+  }
+
+  menu.innerHTML = targets.map(([name, target]) => {
+    const status = dbResourceStatus(target);
+    const selected = name === dbResourceState.selected;
+    const meta = target.present
+      ? [dbFmtBytes(target.size), dbResourceEntries(target)].filter(Boolean).join(" · ")
+      : "File not found";
+    return `<button class="db-resource-menu-item${selected ? " active" : ""}" ` +
+      `type="button" aria-pressed="${selected}" data-db-resource="${esc(name)}">` +
+      `<span class="db-resource-menu-line"><span class="db-resource-menu-name">${esc(target.label || name)}</span>` +
+      `<span class="db-resource-state ${esc(status.cls)}">${esc(status.label)}</span></span>` +
+      `<span class="db-resource-menu-meta">${esc(meta)}</span></button>`;
+  }).join("");
+
+  const target = (dbResourceState.data.targets || {})[dbResourceState.selected];
+  if (!target) return;
+  const status = dbResourceStatus(target);
+  let rows = "";
+  rows += dbResourceDetailRow("Format", esc(target.format || "Unknown"));
+  rows += dbResourceDetailRow("Size", target.present ? esc(dbFmtBytes(target.size)) : "Not available");
+  rows += dbResourceDetailRow("Entries", esc(dbResourceEntries(target)));
+  rows += dbResourceDetailRow("Origin", dbResourceLink(target.origin_url, target.origin));
+  rows += dbResourceDetailRow("Last updated / synced", esc(dbResourceDate(target.updated_at)));
+  rows += dbResourceDetailRow("Local source", esc(target.location || "Not loaded"));
+  rows += dbResourceDetailRow("File", esc(target.resolved_path || target.filename || "Not found"));
+  if (target.url) rows += dbResourceDetailRow("Download source",
+    dbResourceLink(target.url, target.url));
+  if (target.metadata_error) rows += dbResourceDetailRow("Metadata note",
+    `<span class="db-resource-warn">${esc(target.metadata_error)}</span>`);
+  if (target.job && target.job.status === "error") rows += dbResourceDetailRow("Sync error",
+    `<span class="db-resource-warn">${esc(target.job.error || "Unknown error")}</span>`);
+
+  detail.innerHTML = `<div class="db-resource-detail-head">` +
+    `<div><h2>${esc(target.label || dbResourceState.selected)}</h2>` +
+    `<div class="db-resource-file">${esc(target.filename || target.path || "")}</div></div>` +
+    `<span class="db-resource-state ${esc(status.cls)}">${esc(status.label)}</span></div>` +
+    `<p class="db-resource-description">${esc(target.description || "No description available.")}</p>` +
+    `<dl class="db-resource-details">${rows}</dl>`;
+}
+
+async function loadDatabaseResources(force) {
+  if (dbResourceState.loading) return;
+  if (!force && dbResourceState.data && Date.now() - dbResourceState.loadedAt < 15000) {
+    renderDatabaseResources();
+    return;
+  }
+  dbResourceState.loading = true;
+  dbResourceState.error = "";
+  renderDatabaseResources();
+  try {
+    const response = await fetch("/api/db/status");
+    if (!response.ok) throw new Error(`Database status returned ${response.status}`);
+    dbResourceState.data = await response.json();
+    dbResourceState.loadedAt = Date.now();
+  } catch (error) {
+    dbResourceState.error = "Could not read database metadata from the local service.";
+  } finally {
+    dbResourceState.loading = false;
+    renderDatabaseResources();
+  }
+}
+
+function refreshInfoTabSection() {
+  if (activeInfoSection() === "info-resources") loadDatabaseResources(false);
+  else { pollConsoleLog(); renderConsole(); }
+}
+
+function switchInfoSection(id) {
+  document.querySelectorAll("#info-section-tabs [data-info-section]").forEach((tab) => {
+    const active = tab.dataset.infoSection === id;
+    tab.classList.toggle("active", active);
+    tab.setAttribute("aria-selected", String(active));
+  });
+  document.querySelectorAll("#infotab .info-section").forEach((section) =>
+    section.classList.toggle("active", section.id === id));
+  refreshInfoTabSection();
+}
+
+function initInfoSections() {
+  for (const tab of document.querySelectorAll("#info-section-tabs [data-info-section]")) {
+    tab.addEventListener("click", () => switchInfoSection(tab.dataset.infoSection));
+  }
+  el("db-resource-refresh").addEventListener("click", () => loadDatabaseResources(true));
+  el("db-resource-menu").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-db-resource]");
+    if (!button) return;
+    dbResourceState.selected = button.dataset.dbResource;
+    renderDatabaseResources();
+  });
+}
+
 function ckey(source, idx) { return `${source}:${idx}`; }
 
 // --- icon set (inline SVG, stroke = currentColor) ------------------------------
@@ -1384,11 +1563,20 @@ function normalizeSettings() {
   if (!["sets", "author", "category", "date"].includes(state.settings.publishGroup))
     state.settings.publishGroup = "sets";
   state.settings.publishSidebarCollapsed = !!state.settings.publishSidebarCollapsed;
+  state.settings.remarksSidebarCollapsed = !!state.settings.remarksSidebarCollapsed;
+  if (!state.settings.remarksFilters || typeof state.settings.remarksFilters !== "object" ||
+      Array.isArray(state.settings.remarksFilters)) state.settings.remarksFilters = {};
+  if (!state.settings.remarksMeta || typeof state.settings.remarksMeta !== "object" ||
+      Array.isArray(state.settings.remarksMeta)) state.settings.remarksMeta = {};
   if (!state.settings.collapsed || typeof state.settings.collapsed !== "object")
     state.settings.collapsed = {};
   state.settings.wbSideCollapsed = !!state.settings.wbSideCollapsed;
   if (!["tesseract", "mistral", "claude", "textract"].includes(state.settings.ocrService))
     state.settings.ocrService = "tesseract";
+  state.settings.ocrPaperColor = !!state.settings.ocrPaperColor;
+  let _opl = parseInt(state.settings.ocrPaperLighten, 10);
+  if (!Number.isFinite(_opl)) _opl = 20;
+  state.settings.ocrPaperLighten = Math.max(0, Math.min(100, _opl));
   state.settings.textAnalysisService = "configured";
   if (!WB_PHASES.includes(state.settings.workbenchPhase))
     state.settings.workbenchPhase = "record";
@@ -1478,6 +1666,8 @@ let clientStateReady = false;   // gates write-through until the load-sync ran
 const _csPending = {};          // kind -> true, coalesced
 let _csTimer = null;
 let _csBulk = 0;                // >0 during a bulk op: accumulate, flush once at end
+let _csRetryMs = 2000;
+let _csFlushPromise = null;     // serialize whole-blob PUTs; newest state writes last
 
 function clientStateBlob(kind) {
   if (kind === "checked") return checkedArray();
@@ -1511,19 +1701,52 @@ async function withBulkClientState(fn) {
   }
 }
 
-async function flushClientState() {
-  const kinds = Object.keys(_csPending);
-  if (!kinds.length) return;
-  for (const k of kinds) delete _csPending[k];
-  const body = {};
-  for (const k of kinds) body[k] = clientStateBlob(k);
-  try {
-    await fetch("/api/client_state", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-  } catch (e) { /* offline: the localStorage cache still holds it */ }
+function flushClientState() {
+  if (_csFlushPromise) return _csFlushPromise;
+  let retryScheduled = false;
+  _csFlushPromise = (async () => {
+    // A mark can change while a PUT is in flight. Drain that newly pending
+    // snapshot only after the first response, so two whole-blob replacements
+    // can never complete out of order and resurrect stale attention state.
+    while (_csBulk === 0 && Object.keys(_csPending).length) {
+      const kinds = Object.keys(_csPending);
+      for (const k of kinds) delete _csPending[k];
+      const body = {};
+      for (const k of kinds) body[k] = clientStateBlob(k);
+      try {
+        const res = await fetch("/api/client_state", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) throw new Error(`client state ${res.status}`);
+        if (kinds.includes("attention") && !_csPending.attention) {
+          try { localStorage.removeItem(ATTN_DIRTY_KEY); } catch (e) {}
+        }
+        _csRetryMs = 2000;
+      } catch (e) {
+        // Keep failed blobs pending and retry with a bounded backoff. Attention
+        // also carries a durable dirty bit so a restart cannot resurrect a mark
+        // that was cleared locally while the sidecar write was unavailable.
+        for (const k of kinds) _csPending[k] = true;
+        clearTimeout(_csTimer);
+        _csTimer = setTimeout(flushClientState, _csRetryMs);
+        _csRetryMs = Math.min(30000, _csRetryMs * 2);
+        retryScheduled = true;
+        return false;
+      }
+    }
+    return true;
+  })().finally(() => {
+    _csFlushPromise = null;
+    // A bulk operation can finish in the narrow gap while the prior drain is
+    // settling. Its pushes intentionally had no timer, so hand them a new turn.
+    if (!retryScheduled && _csBulk === 0 && Object.keys(_csPending).length) {
+      clearTimeout(_csTimer);
+      _csTimer = setTimeout(flushClientState, 0);
+    }
+  });
+  return _csFlushPromise;
 }
 
 // When the same book is checked in both the local cache and the server copy,
@@ -1545,6 +1768,10 @@ function richerEntry(a, b) {
 // caller re-applies theme/fonts and re-renders).
 async function syncClientStateOnLoad() {
   let server = null;
+  let attentionDirty = false;
+  const localRemarksMeta = state.settings.remarksMeta;
+  try { attentionDirty = localStorage.getItem(ATTN_DIRTY_KEY) === "1"; }
+  catch (e) {}
   try { server = await (await fetch("/api/client_state")).json(); }
   catch (e) { clientStateReady = true; return false; }   // offline: keep local
   const hasServer = server &&
@@ -1575,6 +1802,7 @@ async function syncClientStateOnLoad() {
       for (const k of Object.keys(server.settings))
         if (!VIEW_STATE_KEYS.has(k)) incoming[k] = server.settings[k];
       state.settings = Object.assign(state.settings, incoming);
+      if (attentionDirty) state.settings.remarksMeta = localRemarksMeta;
       normalizeSettings();
       // wizardDone and colWidths used to be browser-origin view state. Existing
       // settings prove this is not a first launch, even if the old origin-local
@@ -1589,7 +1817,7 @@ async function syncClientStateOnLoad() {
           Object.keys(state.settings.colWidths || {}).length > 0) {
         migratePersistentView = true;
       }
-      syncYearFilterInputs();   // reflect the (local) year-range into the toolbar
+      syncFilterBtn();          // reflect local filters into the toolbar affordance
       syncSearchConsCheckboxes();
       try {
         const { prefs, view } = partitionSettings(state.settings);
@@ -1597,21 +1825,29 @@ async function syncClientStateOnLoad() {
         localStorage.setItem(VIEWSTATE_KEY, JSON.stringify(view));
       } catch (e) {}
     }
-    if (server.attention && typeof server.attention === "object") {
+    let healAttention = attentionDirty;
+    if (!attentionDirty && server.attention && typeof server.attention === "object" &&
+        !Array.isArray(server.attention)) {
       // Attention marks (unlike checked books) are a low-stakes set that
       // supports removal, so the server copy is authoritative on load — a
       // union would resurrect marks the user deliberately cleared.
       state.attn = server.attention;
       try { localStorage.setItem(ATTN_KEY, JSON.stringify(state.attn)); } catch (e) {}
+    } else if (attentionDirty) {
+      healAttention = true;
     }
     clientStateReady = true;
     if (healChecked) pushClientState("checked");
     if (migratePersistentView) pushClientState("settings");
+    if (healAttention) {
+      pushClientState("settings");  // includes keyed remark labels/categories
+      pushClientState("attention");
+    }
     return true;
   }
   // seed the server from local, then allow write-through
   try {
-    await fetch("/api/client_state", {
+    const res = await fetch("/api/client_state", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1620,6 +1856,9 @@ async function syncClientStateOnLoad() {
         attention: state.attn || {},
       }),
     });
+    if (res.ok) {
+      try { localStorage.removeItem(ATTN_DIRTY_KEY); } catch (e) {}
+    }
   } catch (e) { /* will retry on the next change */ }
   clientStateReady = true;
   return false;
@@ -2018,7 +2257,10 @@ function maybeWizard() {
 const homeState = { events: [], loaded: false, expanded: new Set() };
 
 async function loadActivity() {
-  loadReviews().then(renderHome);   // the review count rides the same visit
+  loadReviews().then(() => {
+    renderHome();                  // the review count rides the same visit
+    renderRemarks();               // "Awaiting review" badges share that state
+  });
   try {
     const r = await (await fetch(
       "/api/activity?limit=" + (state.settings.historyLimit || 300))).json();
@@ -2097,15 +2339,31 @@ function progressSummary() {
   // a source is settled once a verified entry has been built from it
   const srcPending = approvedSources()
     .filter((s) => sourceBuildStatus(s) !== "done").length;
-  // catalog-side marks (rows + the attn map) live in the Catalogs tab;
-  // marked builds live in the Editor's Pending queue — kept apart so the
-  // attention tile can land where its items actually are
-  const attnCat = Object.keys(state.attn || {}).length +
-    [...(state.rowsById || new Map()).values()].filter((r) => r.attention).length;
-  const attnEd = builds.filter((b) => b.attention && b.status !== "uploaded").length;
+  // Use the same normalized model as the shared Remarks sidebar. In
+  // particular, src:* marks belong to Workbench Sources, and published builds
+  // still count until their mark is explicitly cleared.
+  const remarkItems = remarksItems();
+  const attnCat = remarkItems.filter((item) => item.category === "catalogs").length;
+  const attnEntries = remarkItems.filter((item) => item.category === "entries").length;
+  const attnSources = remarkItems.filter((item) => item.category === "sources").length;
+  const attnEd = attnEntries + attnSources;
   const openReviews = Object.values(reviewsState.items || {})
     .filter((r) => r.status === "open").length;
-  return { drafts, ready, srcPending, attnCat, attnEd, openReviews };
+  return {
+    drafts, ready, srcPending, attnCat, attnEd, attnEntries, attnSources,
+    openReviews,
+  };
+}
+
+function homeAttentionDestination(summary) {
+  const catalogs = Number(summary.attnCat || 0);
+  const entries = Number(summary.attnEntries || 0);
+  const sources = Number(summary.attnSources || 0);
+  if (catalogs) {
+    return { tab: "checked", filter: entries || sources ? "all" : "catalogs" };
+  }
+  const filter = entries && sources ? "all" : (sources ? "sources" : "entries");
+  return { tab: "workbench", filter };
 }
 
 const HOME_DRAFTS_SHOWN = 4;
@@ -2126,6 +2384,7 @@ function renderHome() {
     `</button>`;
   const inEditor = p.drafts.length + p.ready;
   const attn = p.attnCat + p.attnEd;
+  const attnDest = homeAttentionDestination(p);
   let html =
     row(inEditor, inEditor === 1 ? "entry in the workbench" : "entries in the workbench",
         `data-gotab="workbench"`, inEditor ? `${p.drafts.length} draft · ${p.ready} to publish` : "") +
@@ -2133,7 +2392,8 @@ function renderHome() {
         : "PDF sources pending verification", `data-gotab="workbench"`) +
     row(attn, attn === 1 ? "item marked for attention"
         : "items marked for attention",
-        `data-gotab="${p.attnCat || !p.attnEd ? "checked" : "workbench"}"`,
+        `data-remarks="1" data-remarks-filter="${attnDest.filter}" ` +
+        `data-gotab="${attnDest.tab}"`,
         p.attnCat && p.attnEd ? `${p.attnCat} catalog · ${p.attnEd} workbench` : "") +
     row(p.openReviews, p.openReviews === 1 ? "item awaiting review"
         : "items awaiting review", `data-review="1"`);
@@ -2234,7 +2494,11 @@ function initHome() {
       // every workbench-bound row advertises pending work, so land on the
       // Pending queue even if the book list was left on Uploaded
       if (b.dataset.gotab === "workbench") state.buildsTab = "pending";
+      if (b.dataset.remarks && b.dataset.remarksFilter) {
+        setRemarksFilterForTab(b.dataset.gotab, b.dataset.remarksFilter, true);
+      }
       document.querySelector(`#tabs .tab[data-tab="${b.dataset.gotab}"]`).click();
+      if (b.dataset.remarks) setRemarksCollapsed(false, true);
     }
   });
   // an activity row toggles its per-event detail
@@ -2366,6 +2630,7 @@ function initActivityIcons() {
   }));
 }
 
+let preserveWorkbenchEditOnActivate = false;
 // theme switches re-resolve --icon-style; reload only on a real change
 // (null = the first pass hasn't run yet, so there is nothing to refresh)
 function refreshActivityIcons() {
@@ -2381,14 +2646,19 @@ function initTabs() {
       tab.classList.add("active");
       el(tab.dataset.tab).classList.add("active");
       setHeader(tab.dataset.tab);
+      syncRemarksForTab();
       if (tab.dataset.tab === "home") loadActivity();   // refresh on every visit
-      if (tab.dataset.tab === "checked") { renderChecked(); loadOlStatus(); }
-      if (tab.dataset.tab === "infotab") { pollConsoleLog(); renderConsole(); }
+      if (tab.dataset.tab === "checked") renderChecked();
+      if (tab.dataset.tab === "infotab") refreshInfoTabSection();
       // refresh builds and entry folders on every visit — either may have
       // changed elsewhere meanwhile
       if (tab.dataset.tab === "workbench") {
-        renderUpload();
-        loadOcrBooks().then(() => { renderOcrTab(); renderAnalyze(); renderWorkbench(); });
+        if (!preserveWorkbenchEditOnActivate) {
+          renderUpload();
+          loadOcrBooks().then(() => { renderOcrTab(); renderAnalyze(); renderWorkbench(); });
+        } else {
+          renderWorkbench();
+        }
         pollJobs();       // paint the jobs drawer now, not next tick
       }
       if (tab.dataset.tab === "replica") {
@@ -2806,6 +3076,8 @@ let popupAnchor = null;
 
 function closePopup() {
   el("popup-menu").hidden = true;
+  if (popupAnchor && popupAnchor !== el("popup-menu"))
+    popupAnchor.setAttribute("aria-expanded", "false");
   popupAnchor = null;
 }
 
@@ -2815,6 +3087,9 @@ function openPopup(anchor, html, wire) {
   popupAnchor = anchor;
   pop.innerHTML = html;
   pop.hidden = false;
+  if (anchor.hasAttribute("aria-haspopup"))
+    anchor.setAttribute("aria-expanded", "true");
+  pop.setAttribute("aria-label", anchor.getAttribute("aria-label") || "Toolbar options");
   const r = anchor.getBoundingClientRect();
   pop.style.top = Math.min(r.bottom + 4, innerHeight - pop.offsetHeight - 8) + "px";
   pop.style.left = Math.max(8, Math.min(r.right - pop.offsetWidth,
@@ -2853,20 +3128,39 @@ const FILTER_GROUPS = [
 ];
 
 function filtersActive() {
-  return FILTER_GROUPS.some(([k]) => (state.settings[k] || "ALL") !== "ALL");
+  const checkedActive = state.settings.topTable === "checked" &&
+    FILTER_GROUPS.some(([k]) => (state.settings[k] || "ALL") !== "ALL");
+  return checkedActive ||
+    state.settings.yearFrom != null || state.settings.yearTo != null;
 }
 
 function syncFilterBtn() {
-  el("filter-btn").classList.toggle("active", filtersActive());
+  const active = filtersActive();
+  el("filter-btn").classList.toggle("active", active);
+  el("filter-btn").setAttribute("aria-pressed", String(active));
 }
 
 function openFilterMenu(anchor) {
-  const html = FILTER_GROUPS.map(([k, head, opts]) =>
+  // Mark/source/download filters apply to the checked-books table. The year
+  // range applies to either top table, so it remains available in WHL mode.
+  const groups = state.settings.topTable === "checked" ? FILTER_GROUPS.map(([k, head, opts]) =>
     `<div class="pm-head">${head}</div>` +
     opts.map(([v, label]) => `
       <label class="pm-item"><input type="radio" name="pm-${k}" value="${v}"
         ${(state.settings[k] || "ALL") === v ? "checked" : ""} /> ${label}</label>`).join("")
-  ).join("");
+  ).join("") : "";
+  const from = state.settings.yearFrom == null ? "" : String(state.settings.yearFrom);
+  const to = state.settings.yearTo == null ? "" : String(state.settings.yearTo);
+  const html = groups + `<div class="pm-head">Year range</div>
+    <div class="pm-year" data-tip="Show only rows within this inclusive year range">
+      <label for="pm-year-from">From</label>
+      <input id="pm-year-from" class="cad-input yr-input" type="number"
+             inputmode="numeric" placeholder="from" value="${esc(from)}" />
+      <label for="pm-year-to">To</label>
+      <input id="pm-year-to" class="cad-input yr-input" type="number"
+             inputmode="numeric" placeholder="to" value="${esc(to)}" />
+      <button id="pm-year-clear" class="cad-btn tiny" type="button">Clear</button>
+    </div>`;
   openPopup(anchor, html, (pop) => {
     pop.querySelectorAll("input[type=radio]").forEach((rb) => {
       rb.addEventListener("change", () => {
@@ -2875,6 +3169,29 @@ function openFilterMenu(anchor) {
         syncFilterBtn();
         renderChecked();
       });
+    });
+    let yearDebounce = null;
+    const yearInput = () => {
+      const num = (v) => {
+        const n = parseInt(v, 10);
+        return Number.isFinite(n) ? n : null;
+      };
+      state.settings.yearFrom = num(pop.querySelector("#pm-year-from").value);
+      state.settings.yearTo = num(pop.querySelector("#pm-year-to").value);
+      syncFilterBtn();
+      clearTimeout(yearDebounce);
+      yearDebounce = setTimeout(() => { saveSettings(); renderTop(); }, 150);
+    };
+    pop.querySelector("#pm-year-from").addEventListener("input", yearInput);
+    pop.querySelector("#pm-year-to").addEventListener("input", yearInput);
+    pop.querySelector("#pm-year-clear").addEventListener("click", () => {
+      clearTimeout(yearDebounce);
+      pop.querySelector("#pm-year-from").value = "";
+      pop.querySelector("#pm-year-to").value = "";
+      state.settings.yearFrom = state.settings.yearTo = null;
+      syncFilterBtn();
+      saveSettings();
+      renderTop();
     });
   });
 }
@@ -3025,8 +3342,7 @@ function renderSettings() {
   // GENERAL
   el("gen-info").textContent =
     `Library Tool ${el("tb-meta").textContent} — ` +
-    `${state.manual.length} manual entries / ${state.checked.size} checked books. ` +
-    (el("status-right").textContent || "");
+    `${state.manual.length} manual entries / ${state.checked.size} checked books.`;
   el("reset-settings").onclick = async () => {
     if (!(await confirmDialog({
       title: "Reset interface settings",
@@ -3266,6 +3582,30 @@ function renderSettings() {
       Math.max(600, Math.min(3000, parseInt(iw.value, 10) || 1400));
     iw.value = state.settings.ocrImageWidth;
     saveSettings();
+  };
+  // Facsimile paper tint: the server samples clean margin bands from five
+  // representative interior pages; this setting controls the final white mix.
+  const opc = el("set-ocr-paper-color");
+  const opl = el("set-ocr-paper-lighten");
+  const syncPaperControls = () => {
+    opl.disabled = !opc.checked;
+    opl.setAttribute("aria-disabled", String(opl.disabled));
+  };
+  opc.checked = !!state.settings.ocrPaperColor;
+  opl.value = state.settings.ocrPaperLighten;
+  syncPaperControls();
+  opc.onchange = () => {
+    state.settings.ocrPaperColor = opc.checked;
+    syncPaperControls();
+    saveSettings();
+    refreshOcrPaperColors();
+  };
+  opl.onchange = () => {
+    state.settings.ocrPaperLighten =
+      Math.max(0, Math.min(100, parseInt(opl.value, 10) || 0));
+    opl.value = state.settings.ocrPaperLighten;
+    saveSettings();
+    refreshOcrPaperColors();
   };
   // digit -> service shortcut mapping for the page view
   for (const key of ["1", "2", "3", "4", "5"]) {
@@ -3866,10 +4206,9 @@ function renderLanSettings() {
 function openSettings() { renderSettings(); el("settings-overlay").hidden = false; }
 function closeSettings() {
   el("settings-overlay").hidden = true;
-  // The Databases panel lives in Settings; a file dropped into ~/.library-tool
-  // (or a finished download) leaves the OL-index badge stale, and closing a
-  // modal fires no window-focus event to refresh it — so refresh on the way out.
-  loadOlStatus();
+  // Settings can download or replace a database; refresh its Info metadata the
+  // next time Resources is opened without doing work while that pane is hidden.
+  dbResourceState.loadedAt = 0;
 }
 
 function openAbout() { const o = el("about-overlay"); if (o) o.hidden = false; }
@@ -4614,7 +4953,7 @@ function computeMark(row) {
   if (ia === true || ht === true)
     return {
       mark: "UPLOAD",
-      reason: "Not in WHL; a scan exists in an online archive.\nVerify each found source (click its marker); approved sources land in the EDITOR tab.",
+      reason: "Not in WHL; a scan exists in an online archive.\nVerify each found source (click its marker); approved sources become available in Workbench › Record.",
     };
   const pd = c && (c.copyright_status || "").startsWith("Public domain");
   if (!pd)
@@ -4660,7 +4999,7 @@ function markCell(row) {
   } else if (mark === "UPLOAD") {
     const ready = anyApprovedSource(row);
     cls = attached || ready ? "approved" : "upload"; label = BICONS.upload;
-    base = ready ? "Verified source(s) ready — see the Editor tab" : reason;
+    base = ready ? "Verified source(s) ready — open Workbench" : reason;
   } else if (attached) {
     // no computed mark, but an attached scan keeps the row clickable/detachable
     cls = "approved"; label = "NF"; base = reason;
@@ -4673,7 +5012,7 @@ function markCell(row) {
 }
 
 // attach a local PDF scan to a SCAN-marked row: it becomes a verified
-// source, ready to seed a new WHL entry in the Editor tab
+// source, ready to seed a new WHL entry in the Workbench Record phase
 function attachRowScan(id) {
   const row = state.rowsById.get(String(id));
   if (!row) return;
@@ -4895,6 +5234,24 @@ function groupSets(rows) {
 // every other table keeps a lightweight browser-side mark keyed per row.
 
 const ATTN_KEY = "whl_cad_attention_v1";
+const ATTN_DIRTY_KEY = "whl_cad_attention_dirty_v1";
+
+// Remarks is the shared presentation of every needs-attention mark. Categories
+// describe the target object, not the tab currently showing the sidebar. Pages
+// and publications are reserved now so their owning tabs already have the right
+// default when those target classes become markable.
+const REMARK_CATEGORIES = [
+  ["catalogs", "Catalogs"], ["sources", "Sources"], ["entries", "Entries"],
+  ["pages", "Pages"], ["publications", "Publications"],
+];
+const REMARK_CATEGORY_IDS = new Set(REMARK_CATEGORIES.map(([id]) => id));
+const REMARK_TAB_DEFAULTS = {
+  home: "all", checked: "catalogs", workbench: "entries",
+  replica: "pages", publish: "publications", infotab: "all",
+};
+const remarksState = {
+  editing: null, draft: "", error: "", saving: false,
+};
 
 function loadAttn() {
   try { state.attn = JSON.parse(localStorage.getItem(ATTN_KEY) || "{}"); }
@@ -4903,18 +5260,616 @@ function loadAttn() {
 
 function attnHas(k) { return !!(state.attn || {})[k]; }
 
-// a mark's value is "" (unmarked), "1" (plain mark), or the reason text
-function attnReason(v) {
-  return typeof v === "string" && v && v !== "1" ? v : "";
+// Keyed marks remain strings: "1" (plain) or the reason, preserving the format
+// understood by older clients. A provisional object shape is still accepted on
+// read; mark-time labels/categories now live separately in settings.remarksMeta.
+function attnValue(v) {
+  if (!v) return "";
+  if (typeof v === "object") return String(v.value || v.reason || "1");
+  if (v === true) return "1";
+  return String(v);
 }
 
-function setAttnKey(k, val) {
-  state.attn = state.attn || {};
-  if (val) state.attn[k] = val;
-  else delete state.attn[k];
+function attnReason(v) {
+  const s = attnValue(v);
+  return s && s !== "1" ? s : "";
+}
+
+function attnMeta(v) {
+  return v && typeof v === "object" ? v : {};
+}
+
+function remarkKeyParts(key) {
+  const raw = String(key || "");
+  const colon = raw.indexOf(":");
+  return colon < 0
+    ? { prefix: "", ref: raw }
+    : { prefix: raw.slice(0, colon), ref: raw.slice(colon + 1) };
+}
+
+function remarkCategoryForKey(key) {
+  return remarkKeyParts(key).prefix.startsWith("src") ? "sources" : "catalogs";
+}
+
+// Legacy source marks used only URL/path/title and could merge two catalog
+// objects that happened to share a scan. New marks include the owning row and
+// source class; readers continue resolving both keys so old marks remain usable.
+function sourceRemarkKeys(source) {
+  source = source || {};
+  const legacy = "src:" + (source.url || source.local_pdf || source.title || "");
+  const parent = source._rowId || "";
+  const sourceClass = source.archive || "source";
+  const identity = source.identifier || source.local_pdf || source.url || source.title || "";
+  const stable = "src2:" + [parent, sourceClass, identity]
+    .map((part) => encodeURIComponent(String(part))).join("|");
+  return { stable, legacy };
+}
+
+function activeSourceRemarkKey(source) {
+  const keys = sourceRemarkKeys(source);
+  if (attnHas(keys.stable)) return keys.stable;
+  if (attnHas(keys.legacy)) return keys.legacy;
+  return keys.stable;
+}
+
+function sourceMatchesRemark(source, key) {
+  const keys = sourceRemarkKeys(source);
+  return key === keys.stable || key === keys.legacy;
+}
+
+function setAttnKey(k, val, meta) {
+  if (!state.attn || typeof state.attn !== "object" || Array.isArray(state.attn))
+    state.attn = {};
+  if (!state.settings.remarksMeta || typeof state.settings.remarksMeta !== "object" ||
+      Array.isArray(state.settings.remarksMeta)) state.settings.remarksMeta = {};
+  if (val) {
+    const prior = Object.assign({}, attnMeta(state.attn[k]),
+      state.settings.remarksMeta[k] || {});
+    const next = Object.assign({}, prior, meta || {});
+    next.label = String(next.label || "").slice(0, 300);
+    next.category = REMARK_CATEGORY_IDS.has(next.category)
+      ? next.category : remarkCategoryForKey(k);
+    state.attn[k] = String(val || "1");
+    state.settings.remarksMeta[k] = {
+      label: next.label, category: next.category,
+    };
+  } else {
+    delete state.attn[k];
+    delete state.settings.remarksMeta[k];
+  }
   try { localStorage.setItem(ATTN_KEY, JSON.stringify(state.attn)); } catch (e) {}
+  try { localStorage.setItem(ATTN_DIRTY_KEY, "1"); } catch (e) {}
+  saveSettings();
   pushClientState("attention");
   status(val ? "Marked: needs attention" : "Attention mark cleared");
+  renderRemarks();
+  renderHome();
+  return true;
+}
+
+function activeRemarksTab() {
+  const tab = document.querySelector("#tabs .tab.active");
+  return tab ? tab.dataset.tab : "home";
+}
+
+function remarksDefaultFilter(tabId) {
+  return REMARK_TAB_DEFAULTS[tabId] || "all";
+}
+
+function remarksFilterForTab(tabId) {
+  const filters = state.settings.remarksFilters || {};
+  const value = filters[tabId];
+  return value === "all" || REMARK_CATEGORY_IDS.has(value)
+    ? value : remarksDefaultFilter(tabId);
+}
+
+function setRemarksFilterForTab(tabId, value, persist) {
+  const clean = value === "all" || REMARK_CATEGORY_IDS.has(value)
+    ? value : remarksDefaultFilter(tabId);
+  state.settings.remarksFilters = state.settings.remarksFilters || {};
+  state.settings.remarksFilters[tabId] = clean;
+  if (persist) saveSettings();
+  return clean;
+}
+
+function remarkSecondary(parts) {
+  return parts.filter((x) => String(x || "").trim()).join(" \u00b7 ");
+}
+
+function keyedRemarkDescriptor(key, stored, sourceByKey) {
+  const { prefix, ref } = remarkKeyParts(key);
+  const meta = Object.assign({}, attnMeta(stored),
+    (state.settings.remarksMeta || {})[key] || {});
+  let label = "", subtype = "Catalog record", secondary = "", canOpen = false;
+  if (prefix === "src" || prefix === "src2") {
+    const source = sourceByKey
+      ? sourceByKey.get(key)
+      : approvedSources().find((s) =>
+          sourceMatchesRemark(s, key));
+    label = source ? source.title : "";
+    subtype = "Verified source";
+    secondary = source ? remarkSecondary([source.archive, source.author, source.year]) : "";
+    canOpen = !!source;
+  } else if (prefix === "whl") {
+    const row = (state.whlRows || []).find((r) => String(r.idx) === ref);
+    label = row ? row.title : "";
+    subtype = "WHL catalog";
+    secondary = row ? remarkSecondary([row.authors, row.year]) : "";
+    canOpen = /^-?\d+$/.test(ref);
+  } else if (prefix === "ch") {
+    const row = (state.chBooks || []).find((r) => String(r.idx) === ref);
+    label = row ? row.title : "";
+    subtype = "Master list";
+    secondary = row ? remarkSecondary([row.author, row.year]) : "";
+    canOpen = /^\d+$/.test(ref);
+  } else if (prefix === "ol") {
+    const row = (state.olRows || []).find((r) => String(r.key) === ref);
+    label = row ? row.title : "";
+    subtype = "Open Library";
+    secondary = row ? remarkSecondary([(row.authors || []).join("; "), row.year || row.first_year]) : "";
+    canOpen = !!row;
+  } else {
+    subtype = prefix ? `${prefix} record` : "Catalog record";
+  }
+  label = label || String(meta.label || "") || `${subtype} (${ref || key})`;
+  const category = REMARK_CATEGORY_IDS.has(meta.category)
+    ? meta.category : remarkCategoryForKey(key);
+  return {
+    id: "key:" + key, kind: "key", ref: key, category, subtype,
+    label, secondary, reason: attnReason(stored), canOpen,
+  };
+}
+
+// Normalize the three canonical stores (checked/manual rows, builds, keyed
+// marks) into one sidebar model. Never scrape rendered rows: filters and
+// streaming mean the DOM is intentionally incomplete.
+function remarksItems() {
+  const items = [];
+  for (const row of combinedRows()) {
+    if (!row.attention) continue;
+    const subtype = row.captured ? "Phone capture"
+      : row.kind === "manual" ? "Manual entry" : "Checked book";
+    items.push({
+      id: "row:" + row.id, kind: "row", ref: String(row.id),
+      category: "catalogs", subtype,
+      label: row.book.title || String(row.id),
+      secondary: remarkSecondary([row.book.author, row.book.year]),
+      reason: attnReason(row.attention), canOpen: true,
+    });
+  }
+  for (const b of Object.values(state.builds || {})) {
+    if (!b.attention) continue;
+    const statusLabel = b.status === "uploaded" ? "Published entry"
+      : b.status === "ready" ? "Verified entry" : "Draft entry";
+    items.push({
+      id: "build:" + b.id, kind: "build", ref: String(b.id),
+      category: "entries", subtype: statusLabel,
+      label: b.title || String(b.id),
+      secondary: remarkSecondary([b.authors, b.year]),
+      reason: attnReason(b.attention), canOpen: true,
+    });
+  }
+  const keyed = Object.entries(state.attn || {}).filter(([, stored]) => !!stored);
+  let sourceByKey = null;
+  if (keyed.some(([key]) => remarkKeyParts(key).prefix.startsWith("src"))) {
+    sourceByKey = new Map();
+    for (const source of approvedSources()) {
+      const keys = sourceRemarkKeys(source);
+      sourceByKey.set(keys.stable, source);
+      if (!sourceByKey.has(keys.legacy)) sourceByKey.set(keys.legacy, source);
+    }
+  }
+  for (const [key, stored] of keyed) {
+    items.push(keyedRemarkDescriptor(key, stored, sourceByKey));
+  }
+  return items.sort((a, b) => {
+    const ai = REMARK_CATEGORIES.findIndex(([id]) => id === a.category);
+    const bi = REMARK_CATEGORIES.findIndex(([id]) => id === b.category);
+    return ai - bi || a.label.localeCompare(b.label, undefined, { sensitivity: "base" }) ||
+      a.id.localeCompare(b.id);
+  });
+}
+
+function remarkRoute(item) {
+  if (!item) return null;
+  if (item.kind === "build")
+    return { tab: "workbench", phase: "record", buildId: String(item.ref) };
+  if (item.kind === "row")
+    return { tab: "checked", table: "checked", rowId: String(item.ref) };
+  if (item.kind !== "key") return null;
+  const { prefix, ref } = remarkKeyParts(item.ref);
+  // The typed key is authoritative. Review records predate the Remarks
+  // category metadata, so a source must still route correctly with only its
+  // persisted kind/ref pair.
+  if (prefix.startsWith("src"))
+    return { tab: "workbench", phase: "record", sourceKey: String(item.ref) };
+  if (prefix === "whl") return { tab: "checked", table: "whl", whlIdx: ref };
+  if (prefix === "ch" || prefix === "ol")
+    return { tab: "checked", bottom: prefix, recordRef: ref };
+  return null;
+}
+
+function remarkItemHtml(item) {
+  const editing = remarksState.editing === item.id;
+  const saving = editing && remarksState.saving;
+  if (editing) {
+    return `<article class="remarks-item" data-remark-id="${esc(item.id)}">` +
+      `<div class="remarks-editor">` +
+        `<label class="tool-label" for="remarks-editor-text">Remark for ${esc(item.label)}</label>` +
+        `<textarea id="remarks-editor-text" class="cad-input" spellcheck="false" ` +
+          `aria-invalid="${remarksState.error ? "true" : "false"}" ${saving ? "disabled" : ""}>${esc(remarksState.draft)}</textarea>` +
+        `<div class="remarks-editor-error" role="status">${esc(remarksState.error)}</div>` +
+        `<div class="remarks-editor-actions">` +
+          `<button class="cad-btn tiny danger" type="button" data-remark-clear="${esc(item.id)}" ${saving ? "disabled" : ""}>Remove mark</button>` +
+          `<button class="cad-btn tiny" type="button" data-remark-cancel ${saving ? "disabled" : ""}>Cancel</button>` +
+          `<button class="cad-btn tiny primary remarks-save" type="button" data-remark-save="${esc(item.id)}" ${saving ? "disabled" : ""}>Save</button>` +
+        `</div></div></article>`;
+  }
+  const reviewKey = `${item.kind}:${item.ref}`;
+  const inReview = Object.values(reviewsState.items || {})
+    .some((r) => r.key === reviewKey && r.status === "open");
+  const unavailable = !item.canOpen ? "Original item is not loaded in this session" : "";
+  const meta = remarkSecondary([item.subtype, item.secondary, unavailable]);
+  return `<article class="remarks-item" data-remark-id="${esc(item.id)}">` +
+    `<button class="remarks-open-item" type="button" data-remark-open="${esc(item.id)}" ` +
+      `${item.canOpen ? "" : "disabled aria-disabled=\"true\""} ` +
+      `aria-label="Open ${esc(item.label)}">` +
+      `<span class="remarks-item-title" title="${esc(item.label)}">${esc(item.label)}</span>` +
+      `<span class="remarks-item-meta">${esc(meta)}</span>` +
+      `<span class="remarks-reason${item.reason ? "" : " empty"}">${item.reason
+        ? esc(item.reason) : "No remark added"}</span>` +
+    `</button><div class="remarks-item-actions">` +
+      (inReview ? `<span class="remarks-review-tag">Awaiting review</span>` : "") +
+      `<button class="cad-btn tiny remarks-edit" type="button" ` +
+        `data-remark-edit="${esc(item.id)}">${item.reason ? "Edit" : "Add remark"}</button>` +
+    `</div></article>`;
+}
+
+function remarksGroupHtml(category, items) {
+  const label = (REMARK_CATEGORIES.find(([id]) => id === category) || ["", category])[1];
+  return `<section class="remarks-group" data-remarks-category="${esc(category)}">` +
+    `<h3 class="remarks-group-head"><span>${esc(label)}</span>` +
+      `<span class="remarks-group-count">${items.length}</span></h3>` +
+    items.map(remarkItemHtml).join("") + `</section>`;
+}
+
+function renderRemarks() {
+  const list = el("remarks-list");
+  if (!list) return;
+  const items = remarksItems();
+  const countBy = Object.fromEntries(REMARK_CATEGORIES.map(([id]) => [id, 0]));
+  for (const item of items) countBy[item.category] = (countBy[item.category] || 0) + 1;
+  const n = items.length;
+  el("remarks-total").textContent = `${n} ${n === 1 ? "item" : "items"}`;
+  el("remarks-rail-count").textContent = n ? String(n) : "";
+  el("remarks-open").setAttribute("aria-label", n
+    ? `Open Remarks sidebar, ${n} ${n === 1 ? "item needs" : "items need"} attention`
+    : "Open Remarks sidebar, no items need attention");
+
+  const tabId = activeRemarksTab();
+  const filter = remarksFilterForTab(tabId);
+  const select = el("remarks-filter");
+  select.value = filter;
+  for (const option of select.options) {
+    const def = option.value === "all" ? "All"
+      : (REMARK_CATEGORIES.find(([id]) => id === option.value) || ["", option.value])[1];
+    const c = option.value === "all" ? n : (countBy[option.value] || 0);
+    option.textContent = `${def} (${c})`;
+  }
+
+  const editorHadFocus = document.activeElement &&
+    document.activeElement.id === "remarks-editor-text";
+  const selStart = editorHadFocus ? document.activeElement.selectionStart : null;
+  const selEnd = editorHadFocus ? document.activeElement.selectionEnd : null;
+  if (!n) {
+    list.innerHTML = `<div class="remarks-empty">Nothing needs attention. ` +
+      `Press Q while hovering a catalog row, verified source, or entry to add a mark.</div>`;
+    return;
+  }
+  if (filter === "all") {
+    list.innerHTML = REMARK_CATEGORIES.map(([category]) => {
+      const group = items.filter((item) => item.category === category);
+      return group.length ? remarksGroupHtml(category, group) : "";
+    }).join("");
+  } else {
+    const group = items.filter((item) => item.category === filter);
+    if (group.length) list.innerHTML = remarksGroupHtml(filter, group);
+    else {
+      const label = (REMARK_CATEGORIES.find(([id]) => id === filter) || ["", filter])[1];
+      list.innerHTML = `<div class="remarks-empty">No ${esc(label.toLowerCase())} need attention. ` +
+        `Choose another category to see the other ${n === 1 ? "remark" : "remarks"}.</div>`;
+    }
+  }
+  if (editorHadFocus) {
+    const ta = el("remarks-editor-text");
+    if (ta) {
+      ta.focus();
+      ta.setSelectionRange(Math.min(selStart, ta.value.length), Math.min(selEnd, ta.value.length));
+    }
+  }
+}
+
+function setRemarksCollapsed(collapsed, persist) {
+  const aside = el("remarks-sidebar");
+  if (!aside) return;
+  const moveFocus = aside.contains(document.activeElement);
+  collapsed = !!collapsed;
+  state.settings.remarksSidebarCollapsed = collapsed;
+  aside.classList.toggle("collapsed", collapsed);
+  el("remarks-open").hidden = !collapsed;
+  el("remarks-expanded").hidden = collapsed;
+  el("remarks-open").setAttribute("aria-expanded", String(!collapsed));
+  el("remarks-close").setAttribute("aria-expanded", String(!collapsed));
+  if (persist) saveSettings();
+  if (!collapsed) renderRemarks();
+  scheduleTableChromeRefresh();
+  if (moveFocus) requestAnimationFrame(() => {
+    const target = collapsed ? el("remarks-open") : el("remarks-filter");
+    if (target && !target.hidden) target.focus();
+  });
+}
+
+function syncRemarksForTab() {
+  remarksState.error = "";
+  renderRemarks();
+}
+
+function remarksItemById(id) {
+  return remarksItems().find((item) => item.id === id) || null;
+}
+
+function refreshRemarkTarget(item) {
+  if (!item || item.kind !== "key") return;
+  const { prefix } = remarkKeyParts(item.ref);
+  if (prefix === "whl" && state.whlRows) renderWhlTop();
+  else if (prefix.startsWith("src")) renderUpload();
+  else if (state.settings.showCatalog) renderBottomRows();
+}
+
+async function applyRemarkValue(item, value) {
+  if (!item) return false;
+  try {
+    let ok = false;
+    if (item.kind === "key") {
+      ok = setAttnKey(item.ref, value, { label: item.label, category: item.category });
+      refreshRemarkTarget(item);
+    } else if (item.kind === "build") {
+      ok = await patchBuildRaw(item.ref, { attention: value });
+    } else if (item.kind === "row") {
+      // rowsById is render-owned and can be stale while Home is active; rebuild
+      // its lookup before dispatching to the existing persistence path.
+      state.rowsById = new Map(combinedRows().map((row) => [String(row.id), row]));
+      ok = await setRowAttention(item.ref, value);
+    }
+    if (ok) {
+      remarksState.error = "";
+      renderRemarks();
+      renderHome();
+      return true;
+    }
+  } catch (e) { /* surfaced below without dropping the item */ }
+  remarksState.error = "Could not save this remark. The mark was kept.";
+  renderRemarks();
+  return false;
+}
+
+async function saveRemarkEditor(id) {
+  const item = remarksItemById(id);
+  if (!item || remarksState.saving) return;
+  remarksState.saving = true;
+  remarksState.error = "";
+  renderRemarks();
+  const ok = await applyRemarkValue(item, remarksState.draft.trim() || "1");
+  remarksState.saving = false;
+  if (ok) {
+    remarksState.editing = null;
+    remarksState.draft = "";
+    status("REMARK SAVED");
+  }
+  renderRemarks();
+}
+
+async function clearRemarkEditor(id) {
+  const item = remarksItemById(id);
+  if (!item || remarksState.saving) return;
+  if (!(await confirmDialog({
+    title: "Remove Needs Attention mark",
+    message: `Remove the mark from “${item.label}”?`,
+    detail: item.reason ? "Its saved remark will also be removed." : "",
+    confirmLabel: "Remove mark", danger: true,
+  }))) return;
+  remarksState.saving = true;
+  renderRemarks();
+  const ok = await applyRemarkValue(item, "");
+  remarksState.saving = false;
+  if (ok) {
+    remarksState.editing = null;
+    remarksState.draft = "";
+    status("ATTENTION MARK CLEARED");
+  }
+  renderRemarks();
+}
+
+function activateTopTab(tabId, options) {
+  const tab = document.querySelector(`#tabs .tab[data-tab="${tabId}"]`);
+  if (!tab || tab.classList.contains("active")) return;
+  const prior = preserveWorkbenchEditOnActivate;
+  preserveWorkbenchEditOnActivate = tabId === "workbench" &&
+    !!(options && options.preserveWorkbenchEdit);
+  tab.click();
+  preserveWorkbenchEditOnActivate = prior;
+}
+
+function flashRemarkTarget(node) {
+  if (!node) return false;
+  node.scrollIntoView({ block: "center", behavior: "smooth" });
+  node.classList.remove("remarks-target");
+  void node.offsetWidth;
+  node.classList.add("remarks-target");
+  setTimeout(() => node.classList.remove("remarks-target"), 1600);
+  return true;
+}
+
+// The large catalog tables render in chunks. Ask the active stream to append
+// through the target before looking it up, so navigation works beyond the first
+// rendered chunk without materializing every later row.
+function flashStreamedTarget(tbody, key, selector) {
+  if (!tbody) return false;
+  let node = tbody.querySelector(selector);
+  if (!node && typeof tbody._streamReveal === "function") {
+    tbody._streamReveal(key);
+    node = tbody.querySelector(selector);
+  }
+  return flashRemarkTarget(node);
+}
+
+async function openRoutedItem(item) {
+  const route = remarkRoute(item);
+  if (!item || !route) return;
+  if (route.buildId) {
+    // Selecting a different entry runs the existing discard guard before the
+    // Workbench tab can repaint its editor. For the current dirty entry, the
+    // list item can be revealed without rebuilding (and losing) the form.
+    const preserveEdit = state.buildSel === route.buildId && buildIsDirty();
+    if (!preserveEdit) {
+      await selectWorkbenchBook(route.buildId, route.phase);
+      if (state.buildSel !== route.buildId) return; // discard guard cancelled
+    }
+    activateTopTab(route.tab, { preserveWorkbenchEdit: preserveEdit });
+    requestAnimationFrame(() =>
+      flashRemarkTarget(document.querySelector(`#ocr-books .build-item[data-bid="${CSS.escape(route.buildId)}"]`)));
+    return;
+  }
+  if (route.sourceKey) {
+    // Revealing the source repaints the Record phase, so protect a dirty entry
+    // before either tab activation or phase selection can reset its form.
+    if (buildIsDirty() && state.settings.confirmDiscard !== false &&
+        !(await confirmDialog({
+          title: "Discard entry changes",
+          message: "Discard unsaved changes to open this source?",
+          confirmLabel: "Discard changes",
+          cancelLabel: "Keep editing",
+          danger: true,
+        }))) return;
+    activateTopTab(route.tab);
+    setWorkbenchPhase("record", false);
+    renderUpload();
+    const index = approvedSources().findIndex((s) =>
+      sourceMatchesRemark(s, route.sourceKey));
+    requestAnimationFrame(() => {
+      const shown = index >= 0 && flashRemarkTarget(
+        document.querySelector(`#upload-rows tr[data-si="${index}"]`));
+      if (!shown) status("SOURCE IS HIDDEN BY THE CURRENT WORKBENCH FILTER");
+    });
+    return;
+  }
+  activateTopTab(route.tab);
+  if (route.rowId) {
+    const row = state.rowsById.get(String(route.rowId)) ||
+      combinedRows().find((candidate) => String(candidate.id) === route.rowId);
+    const setKey = row && volNum(row.book) > 0 ? groupIdOf(row.book) : "";
+    if (setKey && !setExpanded(setKey)) setSetExpanded(setKey, true);
+    switchTopTable("checked");
+    state.editTarget = { kind: "row", id: route.rowId };
+    switchPaneTab("pane-info");
+    requestAnimationFrame(() => {
+      const shown = flashStreamedTarget(el("checked-rows"), `row:${route.rowId}`,
+        `tr[data-row-id="${CSS.escape(route.rowId)}"]`);
+      if (!shown) status("CATALOG ITEM IS HIDDEN BY THE CURRENT FILTERS");
+    });
+    return;
+  }
+  if (route.whlIdx != null) {
+    await loadWhlRows();
+    switchTopTable("whl");
+    const idx = parseInt(route.whlIdx, 10);
+    state.editTarget = { kind: "whl", idx };
+    switchPaneTab("pane-info");
+    requestAnimationFrame(() => {
+      const shown = flashStreamedTarget(el("whltop-rows"), `whl:${idx}`,
+        `tr[data-widx="${idx}"]`);
+      if (!shown) status("CATALOG ITEM IS HIDDEN BY THE CURRENT FILTERS");
+    });
+    return;
+  }
+  if (route.bottom) {
+    setSearchPane(true);
+    const tabs = bottomTabs();
+    state.settings.bottomActive = Math.max(0, tabs.indexOf(route.bottom));
+    saveSettings();
+    if (route.bottom === "ch") await loadChBooks();
+    await renderBottomPane();
+    if (route.bottom === "ch" || route.bottom === "ol") {
+      state.editTarget = route.bottom === "ch"
+        ? { kind: "ch", idx: parseInt(route.recordRef, 10) }
+        : { kind: "ol", ref: route.recordRef };
+      switchPaneTab("pane-info");
+    }
+    const index = state.bottomRecords.findIndex((record) =>
+      String(record._src) === route.bottom && String(record._idx) === route.recordRef);
+    requestAnimationFrame(() => {
+      const shown = index >= 0 && flashStreamedTarget(el("bottom-rows"),
+        `${route.bottom}:${route.recordRef}`, `tr[data-bi="${index}"]`);
+      if (!shown) status("CATALOG ITEM IS HIDDEN BY THE CURRENT FILTERS");
+    });
+  }
+}
+
+async function openRemarkItem(id) {
+  return openRoutedItem(remarksItemById(id));
+}
+
+function initRemarksSidebar() {
+  el("remarks-open").addEventListener("click", () => setRemarksCollapsed(false, true));
+  el("remarks-close").addEventListener("click", () => setRemarksCollapsed(true, true));
+  el("remarks-filter").addEventListener("change", () => {
+    setRemarksFilterForTab(activeRemarksTab(), el("remarks-filter").value, true);
+    renderRemarks();
+  });
+  el("remarks-list").addEventListener("input", (ev) => {
+    if (ev.target.id !== "remarks-editor-text") return;
+    remarksState.draft = ev.target.value;
+    remarksState.error = "";
+  });
+  el("remarks-list").addEventListener("keydown", (ev) => {
+    if (ev.target.id !== "remarks-editor-text") return;
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      remarksState.editing = null; remarksState.draft = ""; remarksState.error = "";
+      renderRemarks();
+    } else if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
+      ev.preventDefault();
+      saveRemarkEditor(remarksState.editing);
+    }
+  });
+  el("remarks-list").addEventListener("click", (ev) => {
+    const edit = ev.target.closest("[data-remark-edit]");
+    if (edit) {
+      const item = remarksItemById(edit.dataset.remarkEdit);
+      if (!item) return;
+      remarksState.editing = item.id;
+      remarksState.draft = item.reason;
+      remarksState.error = "";
+      renderRemarks();
+      const ta = el("remarks-editor-text");
+      if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }
+      return;
+    }
+    if (ev.target.closest("[data-remark-cancel]")) {
+      remarksState.editing = null; remarksState.draft = ""; remarksState.error = "";
+      renderRemarks();
+      return;
+    }
+    const save = ev.target.closest("[data-remark-save]");
+    if (save) { saveRemarkEditor(save.dataset.remarkSave); return; }
+    const clear = ev.target.closest("[data-remark-clear]");
+    if (clear) { clearRemarkEditor(clear.dataset.remarkClear); return; }
+    const open = ev.target.closest("[data-remark-open]");
+    if (open) openRemarkItem(open.dataset.remarkOpen);
+  });
+  setRemarksCollapsed(state.settings.remarksSidebarCollapsed, false);
+  renderRemarks();
 }
 
 // Resolve whatever row (any table) or builder entry the mouse is over into
@@ -4950,22 +5905,26 @@ function attnTargetAtHover() {
       apply: (v) => setRowAttention(tr.dataset.rowId, v),
     };
   }
-  const keyTarget = (k, label, rerender) => ({
+  const keyTarget = (k, label, rerender, category) => ({
     node: tr,
     kind: "key", ref: k,
     label,
-    current: String((state.attn || {})[k] || ""),
-    apply: (v) => { setAttnKey(k, v); rerender(); },
+    current: attnValue((state.attn || {})[k]),
+    apply: (v) => {
+      setAttnKey(k, v, { label, category: category || remarkCategoryForKey(k) });
+      rerender();
+    },
   });
   if (host === "whltop-rows" && tr.dataset.widx != null) {
     return keyTarget("whl:" + tr.dataset.widx,
-      tr.children[1] ? tr.children[1].textContent : "WHL row", renderWhlTop);
+      tr.children[1] ? tr.children[1].textContent : "WHL row", renderWhlTop,
+      "catalogs");
   }
   if (host === "upload-rows" && tr.dataset.si != null) {
     const s = (state.uploadSources || [])[+tr.dataset.si];
     if (!s) return null;
-    return keyTarget("src:" + (s.url || s.local_pdf || s.title),
-      s.title || "source", renderUpload);
+    return keyTarget(activeSourceRemarkKey(s),
+      s.title || "source", renderUpload, "sources");
   }
   if (host === "bottom-rows" && tr.dataset.bi != null) {
     const rec = (state.bottomRecords || [])[+tr.dataset.bi];
@@ -4981,7 +5940,8 @@ function attnTargetAtHover() {
         apply: (v) => setRowAttention(rec._mid, v).then(renderBottomRows),
       };
     }
-    return keyTarget(`${rec._src}:${rec._idx}`, rec.title || "row", renderBottomRows);
+    return keyTarget(`${rec._src}:${rec._idx}`, rec.title || "row", renderBottomRows,
+      "catalogs");
   }
   return null;
 }
@@ -5160,6 +6120,7 @@ function saveAttnPop() {
       if (res.ok) {
         await loadReviews();
         renderHome();
+        renderRemarks();
         status("ADDED TO REVIEW QUEUE");
       } else {
         status("REVIEW REQUEST FAILED :: NOT QUEUED");
@@ -5239,9 +6200,14 @@ function reviewsSorted() {
 
 function reviewItemHtml(r) {
   const resolved = r.status !== "open";
+  const label = esc(r.label) || "(unlabelled item)";
+  const labelHtml = remarkRoute(r)
+    ? `<button class="ri-label" type="button" data-rv-open ` +
+      `aria-label="Open ${esc(r.label) || "review item"}">${label}</button>`
+    : `<span class="ri-label">${label}</span>`;
   return `<div class="review-item${resolved ? " resolved" : ""}" data-rid="${esc(r.id)}">` +
     `<div class="ri-head">` +
-      `<span class="ri-label">${esc(r.label) || "(unlabelled item)"}</span>` +
+      labelHtml +
       `<span class="ri-meta">${resolved
         ? `resolved by ${esc(r.resolved_by || "?")} &middot; ${esc(relIso(r.resolved_at))}`
         : `${esc(r.created_by || "?")} &middot; ${esc(relIso(r.created_at))}`}</span>` +
@@ -5312,7 +6278,7 @@ async function clearMark(kind, ref) {
     // repaint whichever table bakes this mark into its rows (the tab-switch
     // renders only cover the checked/upload tables)
     if (ref.startsWith("whl:")) renderWhlTop();
-    else if (ref.startsWith("src:")) renderUpload();
+    else if (remarkKeyParts(ref).prefix.startsWith("src")) renderUpload();
     else renderBottomRows();
     return;
   }
@@ -5354,6 +6320,14 @@ async function onReviewClick(ev) {
   const item = ev.target.closest(".review-item");
   if (!item) return;
   const rid = item.dataset.rid;
+  if (ev.target.closest("[data-rv-open]")) {
+    const review = (reviewsState.items || {})[rid];
+    if (review) {
+      closeReviewWin();
+      await openRoutedItem(review);
+    }
+    return;
+  }
   const rbtn = ev.target.closest("[data-rv-resolve]");
   if (rbtn) {
     const resolved = rbtn.dataset.rvResolve === "1";
@@ -5379,6 +6353,7 @@ async function onReviewClick(ev) {
     await loadReviews();
     renderReviewList();
     renderHome();
+    renderRemarks();
     status(note);
     return;
   }
@@ -5395,6 +6370,7 @@ async function onReviewClick(ev) {
       input.value = "";   // posted — the draft is a comment now
       await loadReviews();
       renderReviewList();
+      renderRemarks();
     } else {
       status("COMMENT FAILED :: NOT SAVED");
     }
@@ -5423,7 +6399,7 @@ function initReviewWin() {
 
 async function setRowAttention(id, value) {
   const row = state.rowsById.get(String(id));
-  if (!row) return;
+  if (!row) return false;
   if (row.kind === "manual") {
     const res = await fetch(`/api/manual/${encodeURIComponent(id)}`, {
       method: "PATCH",
@@ -5431,7 +6407,7 @@ async function setRowAttention(id, value) {
       body: JSON.stringify({ attention: value, _preserve: true }),
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.ok) return;
+    if (!res.ok || !data.ok) return false;
     const i = state.manual.findIndex((x) => x.id === id);
     if (i >= 0) state.manual[i] = data.entry;
   } else {
@@ -5441,7 +6417,10 @@ async function setRowAttention(id, value) {
     saveChecked();
   }
   renderChecked();
+  renderRemarks();
+  renderHome();
   status(value ? "Marked: needs attention" : "Attention mark cleared");
+  return true;
 }
 
 // one-time (idempotent) migration: volume / edition / subtitle indicators in
@@ -5657,14 +6636,6 @@ function yearInRange(y) {
   return true;
 }
 
-// reflect the persisted year-range into the toolbar inputs (init + after the
-// server copy of settings is adopted)
-function syncYearFilterInputs() {
-  const f = el("year-from"), t = el("year-to");
-  if (f) f.value = state.settings.yearFrom != null ? state.settings.yearFrom : "";
-  if (t) t.value = state.settings.yearTo != null ? state.settings.yearTo : "";
-}
-
 function filteredCheckedRows(prebuilt) {
   // prebuilt lets renderChecked reuse the combinedRows() array it already
   // built for rowsById, instead of rescanning all entries a second time.
@@ -5804,11 +6775,18 @@ function checkedSetHeaderTr(item, cmode) {
 // <tr>. The delegated table click/edit handlers are unaffected — they read
 // dataset off whatever rows are currently in the DOM.
 const STREAM_CHUNK = 200;
-function streamRows(tbody, items, renderItem) {
+function streamRows(tbody, items, renderItem, keyOf) {
   const pane = tbody.closest(".drafting");   // the scroll container
   if (tbody._streamCleanup) tbody._streamCleanup();   // detach the previous render's listener
   tbody.innerHTML = "";
   let rendered = 0;
+  const keyIndexes = new Map();
+  if (keyOf) {
+    items.forEach((item, index) => {
+      const key = keyOf(item, index);
+      if (key != null && !keyIndexes.has(String(key))) keyIndexes.set(String(key), index);
+    });
+  }
   const appendChunk = () => {
     const end = Math.min(rendered + STREAM_CHUNK, items.length);
     const frag = document.createDocumentFragment();
@@ -5833,8 +6811,15 @@ function streamRows(tbody, items, renderItem) {
     (pane.clientHeight > 0 && pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 800);
   const fill = () => { while (rendered < items.length && nearBottom()) appendChunk(); };
   if (pane) pane.addEventListener("scroll", fill, { passive: true });
+  tbody._streamReveal = (key) => {
+    const index = keyIndexes.get(String(key));
+    if (index == null) return false;
+    while (rendered <= index) appendChunk();
+    return true;
+  };
   tbody._streamCleanup = () => {
     if (pane) pane.removeEventListener("scroll", fill);
+    tbody._streamReveal = null;
     tbody._streamCleanup = null;
   };
   appendChunk();   // first chunk now
@@ -5920,6 +6905,9 @@ function renderChecked() {
       if (e) markParentDiff(tr, target, checkedParentFields(row), "checked");
     }
     return tr;
+  }, (d) => {
+    const row = d.row || d.vr;
+    return row ? `row:${row.id}` : (d.set ? `set:${d.set.key}` : null);
   });
 
   applyTableChrome("checked");
@@ -6408,6 +7396,7 @@ async function loadChBooks() {
     const res = await fetch("/api/books");
     state.chBooks = res.ok ? (await res.json()).books || [] : [];
   } catch (e) { state.chBooks = []; }
+  renderRemarks();
 }
 
 async function loadWhlRows(force) {
@@ -6416,6 +7405,7 @@ async function loadWhlRows(force) {
     const res = await fetch("/api/whl_catalog");
     state.whlRows = res.ok ? (await res.json()).rows || [] : [];
   } catch (e) { state.whlRows = []; }
+  renderRemarks();
 }
 
 function chToRecord(b) {
@@ -6585,12 +7575,14 @@ function renderBottomRows() {
   }
 
   state.bottomRecords = records;
-  streamRows(tbody, records, (rec, i) => bottomRecordTr(rec, i, t, def));
+  streamRows(tbody, records, (rec, i) => bottomRecordTr(rec, i, t, def),
+    (rec) => `${rec._src}:${rec._src === "manual" ? rec._mid : rec._idx}`);
   el("bottom-empty").textContent = "No matches";   // reset from the History tab's message
   el("bottom-empty").hidden = records.length !== 0;
   el("bottom-count").textContent =
     `${records.length} rows` + (t === "ol" && state.olNote ? ` — ${state.olNote}` : "");
   applyTableChrome("b-" + t);
+  renderRemarks();
 }
 
 // build one bottom-pane row <tr>; `i` is the absolute index into
@@ -6909,17 +7901,6 @@ function topMode() {
   return state.settings.topTable === "whl" ? whlMode() : checkedMode();
 }
 
-// the current mode is shown as a tag in the footer
-function updateModeTag() {
-  const tag = el("mode-tag");
-  tag.hidden = false;
-  const m = topMode();
-  const name = state.settings.topTable === "whl" ? "WHL" : "Checked";
-  tag.textContent = `${name} mode: ${m}`;
-  tag.className = "foot-tag " +
-    (m === "edit" ? "tag-edit" : m === "process" ? "tag-process" : "tag-search");
-}
-
 function setTopMode(m) {
   if (state.settings.topTable === "whl") state.settings.whlMode = m;
   else state.settings.checkedMode = m;
@@ -6960,16 +7941,12 @@ function switchTopTable(t) {
   el("top-table").value = t;
   el("checked-pane").hidden = t !== "checked";
   el("whltop-pane").hidden = t !== "whl";
-  for (const id of ["dl-approved", "export-json", "filter-btn"]) {
-    el(id).disabled = t !== "checked";
-  }
-  updateModeTag();
+  syncFilterBtn();
   renderTop();
 }
 
 async function renderTop() {
   renderModeBar();
-  updateModeTag();
   if (state.settings.topTable === "whl") {
     await loadWhlRows();
     renderWhlTop();
@@ -7785,7 +8762,6 @@ function renderWhlTop() {
   if (active && active.classList && active.classList.contains("cell-edit")) return;
   const mode = whlMode();
   renderModeBar();
-  updateModeTag();
   const q = findQuery();
   let rows = (state.whlRows || [])
     .filter((r) => matchesFind(q, `${r.title} ${r.subtitle || ""}`, r.authors, r.year))
@@ -7815,9 +8791,10 @@ function renderWhlTop() {
       decorateProcParent(tr, target, "whl", !!e, procSel("whl").has(r.idx));
       if (e) markParentDiff(tr, target, whlParentFields(r), "whl");
       return tr;
-    });
+    }, (it) => it.r ? `whl:${it.r.idx}` : null);
   } else {
-    streamRows(el("whltop-rows"), rows, (r) => whlRowTr(r, mode));
+    streamRows(el("whltop-rows"), rows, (r) => whlRowTr(r, mode),
+      (r) => `whl:${r.idx}`);
   }
   el("whltop-empty").hidden = rows.length !== 0;
   el("top-count").textContent = `${rows.length} WHL rows`;
@@ -9062,6 +10039,11 @@ function fmtBytes(n) {
   return Math.max(1, Math.round(n / 1e3)) + " KB";
 }
 
+function pdfOcrMode(wanted, requested, hasText) {
+  const nextWanted = requested == null ? !!wanted : !!requested;
+  return { wanted: nextWanted, on: nextWanted && !!hasText };
+}
+
 function createPdfViewer() {
   const root = document.createElement("div");
   root.className = "pdf-viewer";
@@ -9100,6 +10082,10 @@ function createPdfViewer() {
   const pagesBox = root.querySelector(".pdf-pagesbox");
   let sizeSeq = 0;
   let textSrc = "";
+  // A PDF with OCR opens in the useful comparison view. Each viewer still
+  // remembers an explicit toggle for the rest of the session, and callers may
+  // override this with opts.ocr (the WHL modal uses its persisted setting).
+  let ocrWanted = true;
   let ocrOn = false;
   let ocrLoadedFor = "";
   let pagesOn = false;
@@ -9226,6 +10212,8 @@ function createPdfViewer() {
   // not the pdf's own text layer.
   async function fillViewerLayout(pane) {
     const page = +pane.dataset.lay;
+    pane.dataset.paperPdf = pagesPdf || "";
+    paintOcrPaper(pane, pagesPdf);
     const name = ((pagesSaveTo && pagesSaveTo.name) || "").toLowerCase();
     const bid = (pagesSaveTo && pagesSaveTo.buildId) || "";
     const src = (pagesSaveTo && pagesSaveTo.src) || "primary";
@@ -9303,7 +10291,7 @@ function createPdfViewer() {
       pagesDirty = false;
       pagesBox.innerHTML = "";
       delete pagesBox.dataset.pdf;
-      setOcr(ocrOn);
+      setOcr(ocrWanted);
     }
   }
   const confirmDiscardPages = async () =>
@@ -9347,7 +10335,9 @@ function createPdfViewer() {
   }
 
   function setOcr(on) {
-    ocrOn = !!on && !!textSrc;
+    const mode = pdfOcrMode(ocrWanted, on, !!textSrc);
+    ocrWanted = mode.wanted;
+    ocrOn = mode.on;
     ocrBtn.classList.toggle("active", ocrOn);
     ocrPane.hidden = !ocrOn || pagesOn;
     if (ocrOn && !pagesOn) loadOcr();
@@ -9360,7 +10350,7 @@ function createPdfViewer() {
       setOcr(true);
       return;
     }
-    setOcr(!ocrOn);
+    setOcr(!ocrWanted);
   });
 
   return {
@@ -9397,7 +10387,7 @@ function createPdfViewer() {
       // re-showing (build switch) re-renders or leaves the page view
       setPages(pagesOn && !!pagesPdf);
       frameWrap.hidden = pagesOn;
-      setOcr(opts.ocr != null ? opts.ocr : ocrOn);
+      setOcr(opts.ocr != null ? opts.ocr : ocrWanted);
       const seq = ++sizeSeq;
       if (src.startsWith("/api/pdf")) {
         fetch(src, { method: "HEAD" }).then((r) => {
@@ -10032,7 +11022,7 @@ function setWorkbenchPhase(phase, persist) {
     saveSettings();
   }
   applyWorkbenchGates();
-  renderWorkbenchChips();   // the chips' current-phase marker follows
+  renderWorkbenchRail();   // readiness and current phase share one authority
   // entering a phase refreshes its panes, as its old tab switch did
   if (phase === "record") renderBuildEditor();
   else if (phase === "source") {
@@ -10067,9 +11057,13 @@ function wbLockNote(phase) {
 async function setVerified(on) {
   const b = currentBuild();
   if (!b) return false;
+  const buildId = b.id;
   el("b-ready").classList.toggle("active", !!on);
   el("b-verified-tag").hidden = !on;
   const saved = await saveBuildFields();
+  // A save can finish after the user selected another book. Never let the old
+  // verification request repaint or relock the new editor.
+  if (state.buildSel !== buildId) return saved;
   if (saved) {
     status(on ? "VERIFIED — RECORD SAVED"
               : "VERIFICATION REMOVED — Text and Knowledge relock");
@@ -10083,9 +11077,8 @@ async function setVerified(on) {
     // (and #b-ready is in the hidden Publish phase), so say it out loud too
     statusErr("VERIFY :: " + (el("build-msg").textContent || "save failed"));
   }
-  // saveBuildFields -> patchBuildRaw -> renderUpload already rebuilt the
-  // list and the editor; only the gates and chips still need the new status
-  renderWorkbench();
+  renderBuildsList();
+  renderWorkbench();      // gates + chips follow the new status immediately
   return saved;
 }
 
@@ -10170,38 +11163,46 @@ function wbReadiness(b) {
   return r;
 }
 
-function renderWorkbenchChips() {
-  const host = el("wb-chips");
-  if (!host) return;
+function renderWorkbenchRail() {
   const b = currentBuild();
-  if (!b) { host.innerHTML = ""; return; }
-  const r = wbReadiness(b);
-  // the chips are the fastest phase navigation but read as pure status:
-  // the tooltip names the destination, and the first unfinished phase
-  // carries a quiet "next" underline so "what now?" resolves at a glance
-  const next = WB_PHASES.find((p) => {
+  const r = b ? wbReadiness(b) : {};
+  // The rail is both navigation and readiness. Keeping those signals on the
+  // same five buttons avoids a duplicate header row that clipped at narrower
+  // widths and made it unclear which phase control was authoritative.
+  const next = b && WB_PHASES.find((p) => {
     const s = (r[p] || {}).state;
     return s === "todo" || s === "warn";
   });
   const cur = wbActivePhase();
-  host.innerHTML = WB_PHASES.map((p) => {
-    const c = r[p] || { state: "todo", note: "" };
+  for (const btn of document.querySelectorAll("#wb-rail .wb-phase-btn")) {
+    const p = btn.dataset.phase;
+    const c = r[p] || null;
     const label = p[0].toUpperCase() + p.slice(1);
-    const tip = c.note ? `${c.note} — open ${label}` : `Open ${label}`;
-    return `<button class="wb-chip ${c.state}${p === next ? " next" : ""}${
-      p === cur ? " cur" : ""}" type="button" data-phase="${p}" ` +
-      `data-tip="${esc(tip)}">${label}${c.badge ? ` ${c.badge}` : ""}</button>`;
-  }).join("");
+    if (!btn.dataset.phaseTip) btn.dataset.phaseTip = btn.dataset.tip || `Open ${label}`;
+    for (const stateName of ["ok", "warn", "todo"]) {
+      btn.classList.toggle(stateName, !!c && c.state === stateName);
+    }
+    btn.classList.toggle("next", p === next);
+    if (p === cur) btn.setAttribute("aria-current", "step");
+    else btn.removeAttribute("aria-current");
+    const badge = c && c.badge ? String(c.badge) : "";
+    btn.innerHTML = label + (badge
+      ? `<span class="wb-phase-badge" aria-hidden="true">${badge}</span>`
+      : "");
+    const tip = c && c.note ? `${label}: ${c.note}` : btn.dataset.phaseTip;
+    btn.dataset.tip = tip;
+    btn.setAttribute("aria-label", tip);
+  }
 }
 
-// head + chips + gates: everything that tracks the shared selection
+// head + rail readiness + gates: everything that tracks the shared selection
 function renderWorkbench() {
   const b = currentBuild();
   el("wb-title").textContent = b ? (b.title || "(untitled)") : "No book selected";
   el("wb-sub").textContent = b
     ? `${b.authors || ""}${b.authors && b.year ? " · " : ""}${b.year || ""}`
     : "";
-  renderWorkbenchChips();
+  renderWorkbenchRail();
   applyWorkbenchGates();
 }
 
@@ -10251,17 +11252,12 @@ function initWorkbench() {
   for (const btn of document.querySelectorAll("#wb-rail .wb-phase-btn")) {
     btn.addEventListener("click", () => setWorkbenchPhase(btn.dataset.phase, true));
   }
-  // a readiness chip is also a jump to its phase
-  el("wb-chips").addEventListener("click", (ev) => {
-    const chip = ev.target.closest("[data-phase]");
-    if (chip) setWorkbenchPhase(chip.dataset.phase, true);
-  });
   el("wb-jobs-toggle").addEventListener("click", () =>
     setJobsDrawer(el("wb-jobs-body").hidden, true));
   setJobsDrawer(!!state.settings.jobsDrawerOpen, false);
   // the rights select left the entry form (it lives in the Publish phase) but
   // still saves with the form — keep the dirty flag in step
-  el("b-rights").addEventListener("change", () => { buildDirty = true; });
+  el("b-rights").addEventListener("change", markBuildDirty);
   renderWorkbench();
 }
 
@@ -10473,7 +11469,7 @@ async function anStartJob(path, body, label, btn) {
     if (!res.ok || !data.ok) {
       if (btn) btn.disabled = false;
       el("an-msg").textContent = data.error || "failed";
-      statusErr(`ANALYZE :: ${(data.error || "FAILED").toUpperCase()}`);
+      statusErr(`WORKBENCH :: ${(data.error || "FAILED").toUpperCase()}`);
       return null;
     }
     const build = state.builds[body.build_id] || {};
@@ -10486,7 +11482,7 @@ async function anStartJob(path, body, label, btn) {
       status: "Starting...", at: new Date().toLocaleTimeString(), finished: false,
     });
     el("an-msg").textContent = `${label} — starting…`;
-    status(`ANALYZE :: ${label.toUpperCase()} STARTED`);
+    status(`WORKBENCH :: ${label.toUpperCase()} STARTED`);
     renderOcrQueue();
     decorateAnFacsimile();
     anEnsurePolling();
@@ -10519,7 +11515,7 @@ function anEnsurePolling() {
         ? `Running - ${job.done}/${job.total}` : String(job.status || "Running");
       meta.pages = job.pages || meta.pages;
       meta.artifact = job.artifact || meta.artifact;
-      status(`ANALYZE :: ${meta.kind.toUpperCase()} :: ${job.done}/${job.total} (${pct}%)` +
+      status(`WORKBENCH :: ${meta.kind.toUpperCase()} :: ${job.done}/${job.total} (${pct}%)` +
         (job.errors ? ` :: ${job.errors} ERRORS` : ""));
       // in-pane progress (only while the user is on that entry)
       if (state.anSel === meta.buildId && !job.status.startsWith("done") &&
@@ -10535,10 +11531,10 @@ function anEnsurePolling() {
           : `${job.status}${job.note ? ` - ${job.note}` : ""}`;
         if (meta.btn) meta.btn.disabled = false;
         if (job.status === "error") {
-          statusErr(`ANALYZE :: ${meta.kind.toUpperCase()} FAILED :: ${job.error}`);
+          statusErr(`WORKBENCH :: ${meta.kind.toUpperCase()} FAILED :: ${job.error}`);
           if (state.anSel === meta.buildId) el("an-msg").textContent = job.error;
         } else {
-          status(`ANALYZE :: ${meta.kind.toUpperCase()} ${job.status.toUpperCase()}` +
+          status(`WORKBENCH :: ${meta.kind.toUpperCase()} ${job.status.toUpperCase()}` +
             (job.note ? ` :: ${job.note}` : ""));
           if (["relevance", "summarize", "about"].includes(meta.kind)) {
             await loadBuilds();
@@ -12589,6 +13585,9 @@ function setOcrSideCollapsed(on, persist) {
     btn.dataset.tip = collapsed
       ? "Expand the entries & artifacts sidebar"
       : "Collapse the entries & artifacts sidebar";
+    btn.setAttribute("aria-label", collapsed
+      ? "Expand the entries and artifacts sidebar"
+      : "Collapse the entries and artifacts sidebar");
   }
   if (persist) { state.settings.wbSideCollapsed = collapsed; saveSettings(); }
 }
@@ -12745,7 +13744,7 @@ function catInlineRename(rowEl, id) {
 function initCategories() {
   makeCatPicker("m-categories");
   makeCatPicker("e-categories");
-  makeCatPicker("b-categories");
+  makeCatPicker("b-categories", markBuildDirty);
   MENU_CMDS["categories"] = () => openCategories();
   el("cat-close").addEventListener("click", closeCategories);
   el("cat-overlay").addEventListener("mousedown", (ev) => {
@@ -12972,6 +13971,9 @@ function currentInfoTarget() {
         return { label: "Master list #" + et.idx,
                  book: ex ? ex.book : parseBook(b), row: ex || null };
       }
+    } else if (et.kind === "ol") {
+      const r = (state.olRows || []).find((x) => String(x.key) === String(et.ref));
+      if (r) return { label: "Open Library", book: olToRecord(r), row: null };
     } else if (et.kind === "whl") {
       const w = whlRowByIdx(et.idx);
       if (w) return { label: "WHL catalog", whl: w };
@@ -13173,16 +14175,6 @@ function renderInfoPane() {
 
 function refreshInfoIfActive() {
   if (document.querySelector("#pane-info.active")) renderInfoPane();
-}
-
-async function loadOlStatus() {
-  try {
-    const st = await (await fetch("/api/ol/status")).json();
-    const ed = st.editions || {};
-    el("status-right").textContent = ed.available
-      ? `OL INDEX: ${(ed.editions / 1e6).toFixed(1)}M EDITIONS`
-      : (st.available ? `OL WORKS INDEX: ${(st.works / 1e6).toFixed(1)}M` : "No OL index");
-  } catch (e) { /* leave empty */ }
 }
 
 let olTimer = null;
@@ -13613,7 +14605,7 @@ function renderUpload() {
     // yellow = a draft entry exists in the editor; green = its entry is done
     if (st === "draft") tr.classList.add("src-draft");
     else if (st === "done") tr.classList.add("src-done");
-    const srcAttn = (state.attn || {})["src:" + (s.url || s.local_pdf || s.title)];
+    const srcAttn = (state.attn || {})[activeSourceRemarkKey(s)];
     if (srcAttn) {
       tr.classList.add("attention");
       if (attnReason(srcAttn)) tr.dataset.tip = "Needs attention: " + attnReason(srcAttn);
@@ -13629,7 +14621,7 @@ function renderUpload() {
         ? `<a href="${esc(s.url)}" target="_blank" rel="noopener" data-tip="${esc(s.url)}">${esc(s.matched_title) || "(record)"}</a>`
         : esc(s.matched_title)}</td>
       <td class="col-whl">${st === "done" ? badge("approved", "DONE", { tip: "The entry built from this source is verified" })
-          : st === "draft" ? badge("upload", BICONS.pencil, { tip: "An entry built from this source is in the editor" })
+          : st === "draft" ? badge("upload", BICONS.pencil, { tip: "This source has a draft entry in Workbench" })
           : ""}</td>
       <td class="col-act"><button class="cad-btn tiny icon-btn" data-build-src="${i}"
         data-tip="Build a catalog entry prefilled from this source">${ICONS.docplus}</button></td>`;
@@ -13643,6 +14635,7 @@ function renderUpload() {
     `${Object.values(state.builds).filter((b) => b.status === "uploaded").length} published`;
   applyTableChrome("upload");
   renderWorkbench();   // head, chips and gates track every builds re-render
+  renderRemarks();
 }
 
 // which build (if any) was seeded from this verified source, and how far
@@ -13657,7 +14650,7 @@ function sourceBuildStatus(s) {
 }
 
 const SRC_STATUS_LABELS = [
-  ["unstarted", "Unstarted"], ["draft", "Draft (in the editor)"],
+  ["unstarted", "Unstarted"], ["draft", "Draft (in Workbench)"],
   ["done", "Done (entry verified)"],
 ];
 
@@ -13706,6 +14699,11 @@ let buildDescMd = null;      // live markdown editor in the ENTRY tab
 let buildPdfViewer = null;   // PDF viewer in the SOURCE tab
 const descState = { id: null, val: null };  // last value set into the editor
 let buildDirty = false;      // the entry form has unsaved metadata edits
+let buildEditGeneration = 0; // distinguishes edits made while a save is in flight
+function markBuildDirty() {
+  buildDirty = true;
+  buildEditGeneration += 1;
+}
 function buildIsDirty() {
   // The markdown editor exists before any entry is selected; its initial empty
   // value differs from descState.val=null, but that is not an unsaved draft.
@@ -13809,6 +14807,9 @@ function appendBuildListItem(list, b, grouped) {
       (ready ? " ready" : "") + (b.attention ? " attention" : "") +
       (grouped ? " volume-member" : "");
     li.dataset.bid = b.id;
+    li.tabIndex = 0;
+    li.setAttribute("role", "button");
+    if (b.id === state.buildSel) li.setAttribute("aria-current", "true");
     li.dataset.tip = `${b.title || "(untitled)"}\n` +
       `${b.authors ? "Authors: " + b.authors + "\n" : ""}` +
       `${b.year ? "Year: " + b.year + "\n" : ""}` +
@@ -13836,56 +14837,88 @@ function appendBuildListItem(list, b, grouped) {
 // storage, its metadata to Supabase, where the website's library browser reads
 // it. This used to be "Upload to WHL", which flipped a status field and sent
 // nothing anywhere -- there was no WHL write API to call.
+let _publishMsgBuildId = null;
+function setPublishGuard(buildId, msg) {
+  if (state.buildSel !== buildId) return;
+  el("build-msg").textContent = msg;
+  const pm = el("publish-msg");
+  if (pm) pm.textContent = msg;
+  _publishMsgBuildId = msg ? buildId : null;
+}
+
+function syncPublishGuard(buildId) {
+  if (_publishMsgBuildId === buildId) return;
+  const pm = el("publish-msg");
+  if (pm) pm.textContent = "";
+  _publishMsgBuildId = null;
+}
+
 async function uploadBuild() {
-  if (!currentBuild()) return;
-  // clear last attempt's guard echo before anything can return early, so a
-  // stale reason never sits beside the button describing a fixed problem
-  if (el("publish-msg")) el("publish-msg").textContent = "";
+  const buildId = state.buildSel;
+  if (!buildId || !state.builds[buildId]) return;
+  setPublishGuard(buildId, "");
   // Publishing is a decision about the record AS SHOWN, but the guards and
-  // the upload read SAVED state — flush unsaved edits first, or picking
-  // Rights and clicking publish either falsely blocks ("Set Rights before
-  // publishing" under a visible selection) or silently publishes the old
-  // value. Same rationale as the verify toggle: publish decisions are saves.
-  if (buildIsDirty() && !(await saveBuildFields())) return;
-  const b = currentBuild();
+  // upload consume saved state. Flush the selected record first, while keeping
+  // its identity stable across every await.
+  if (buildIsDirty()) {
+    let saved = false;
+    try {
+      saved = await saveBuildFields();
+    } catch (e) {
+      saved = false;
+    }
+    if (!saved) {
+      setPublishGuard(buildId, "Save failed");
+      return;
+    }
+  }
+  if (state.buildSel !== buildId) return;
+  // The save may have finished after the curator made another edit to this
+  // same book. That newer draft is not in the saved snapshot the server will
+  // publish, so require another deliberate click after it is saved.
+  if (buildIsDirty()) {
+    setPublishGuard(buildId, "Newer edits are not saved yet");
+    return;
+  }
+  const b = state.builds[buildId];
   if (!b) return;
-  // guards report beside the button that was clicked, not only in the head
-  // bar at the opposite corner
-  const guard = (msg) => {
-    el("build-msg").textContent = msg;
-    const pm = el("publish-msg");
-    if (pm) pm.textContent = msg;
-  };
   if (b.status !== "ready") {
-    guard("Only verified entries can be published");
+    setPublishGuard(buildId, "Only verified entries can be published");
     return;
   }
   if (!(b.pdf_file || "").trim()) {
-    guard("Attach the PDF before publishing");
+    setPublishGuard(buildId, "Attach the PDF before publishing");
     return;
   }
   // convenience only — the publish route enforces this server-side
   if (!(b.rights || "").trim()) {
-    guard("Set Rights before publishing");
+    setPublishGuard(buildId, "Set Rights before publishing");
     return;
   }
-  guard("");
+  setPublishGuard(buildId, "");
   // a public, hard-to-reverse action gets one look at what it ships —
   // this is not the quick-single-delete case the no-confirm preference covers
   const rightsLabel = (el("b-rights").selectedOptions[0] || {}).textContent || b.rights;
   if (!(await confirmDialog({
     title: "Publish to the library",
     message: `Publish "${b.title || b.id}"?`,
-    // the detail slot is the multi-line one (message is a single run)
+    // the detail slot is the multi-line one — #confirm-msg is written with
+    // textContent and has no white-space:pre-line, so newlines packed into
+    // `message` collapse into one run-on sentence
     detail: `Rights: ${rightsLabel}\nPDF: ${b.pdf_file}`,
     confirmLabel: "Publish",
     cancelLabel: "Not yet",
   }))) return;
+  if (state.buildSel !== buildId) return;
+  if (buildIsDirty()) {
+    setPublishGuard(buildId, "Newer edits are not saved yet");
+    return;
+  }
   let res;
   try {
     res = await (await fetch("/api/volumes/publish", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ build_id: b.id }),
+      body: JSON.stringify({ build_id: buildId }),
     })).json();
   } catch (e) {
     statusCrit("PUBLISH :: server unreachable");
@@ -13893,13 +14926,13 @@ async function uploadBuild() {
   }
   if (!res.ok) { statusErr("PUBLISH :: " + (res.error || "failed to start")); return; }
   status(`PUBLISHING :: ${b.title || b.id}`);
-  pollPublish();
+  pollPublish(buildId);
 }
 
 // A 129 MB volume is minutes, not seconds, so the upload runs server-side and
 // the footer carries its progress.
 let _publishTimer = null;
-function pollPublish() {
+function pollPublish(buildId = null) {
   clearInterval(_publishTimer);
   _publishTimer = setInterval(async () => {
     let st;
@@ -13924,12 +14957,21 @@ function pollPublish() {
       return;
     }
     if (st.stage === "done") {
+      const editorWasDirty = buildIsDirty();
       await loadBuilds();
-      // clear the (now published) selection in all three aliases
-      state.buildSel = null;
-      state.anSel = null;
-      ocrState.book = null;
-      renderUpload();
+      // Clear only the book this poll belongs to. A publish can take minutes,
+      // and the curator may have opened or edited another book meanwhile. A
+      // full render would also overwrite that editor from the saved snapshot.
+      const publishedId = buildId || st.build || null;
+      if (editorWasDirty || buildIsDirty()) {
+        renderBuildsList();
+        renderWorkbench();
+      } else {
+        if (state.buildSel === publishedId) state.buildSel = null;
+        if (state.anSel === publishedId) state.anSel = null;
+        if (ocrState.book === publishedId) ocrState.book = null;
+        renderUpload();
+      }
       renderHome();
       status(`PUBLISHED :: ${st.slug}${st.note ? " :: " + st.note : ""}`);
     }
@@ -13953,7 +14995,7 @@ async function suggestRights() {
   const s = res.copyright_status || "";
   if (s.startsWith("Public domain")) {
     el("b-rights").value = "public-domain";
-    buildDirty = true;
+    markBuildDirty();
   }
   msg.textContent = s || "No determination";
 }
@@ -13967,14 +15009,13 @@ function activeBuildTab() {
 function renderBuildEditor() {
   const ed = el("build-editor");
   const b = currentBuild();
+  syncPublishGuard(b ? b.id : null);
   ed.hidden = !b;
   el("build-empty").hidden = !!b;
-  // the publish guards' echo shares build-msg's lifecycle: a re-render means
-  // the record changed under it, so a stale "Set Rights before publishing"
-  // must not outlive the state it described — including when the record went
-  // away entirely, which is why this sits above the no-selection return
-  if (el("publish-msg")) el("publish-msg").textContent = "";
-  if (!b) return;
+  if (!b) {
+    el("build-msg").textContent = "";
+    return;
+  }
   for (const f of BUILD_FIELDS) {
     const input = el("b-" + f);
     if (input) input.value = b[f] || "";
@@ -14068,24 +15109,48 @@ let buildPatchConflict = false;  // last patch came back 409 (record reloaded)
 
 async function patchBuildRaw(id, fields, quiet) {
   buildPatchConflict = false;
-  const res = await fetch(`/api/builds/${encodeURIComponent(id)}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(fields),
-  });
+  let res;
+  try {
+    res = await fetch(`/api/builds/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(fields),
+    });
+  } catch (e) {
+    return false;
+  }
   const data = await res.json().catch(() => ({}));
   if (res.ok && data.ok) {
     state.builds[id] = data.build;
     // quiet: background patches (auto-attach) must not re-render the form
-    // and wipe unsaved field edits
-    if (!quiet) renderUpload();
+    // and wipe unsaved field edits. The same rule applies when a PATCH for A
+    // resolves after the user started editing A or B.
+    if (!quiet) {
+      if (buildIsDirty()) {
+        renderBuildsList();
+        renderWorkbench();
+      } else {
+        renderUpload();
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(fields || {}, "attention")) {
+      renderRemarks();
+      renderHome();
+    }
     return true;
   }
   if (res.status === 409 && data.build) {
     // another writer (analysis, sync) got there first: adopt its record
     buildPatchConflict = true;
     state.builds[id] = data.build;
-    renderUpload();
+    if (buildIsDirty()) {
+      renderBuildsList();
+      renderWorkbench();
+    } else {
+      renderUpload();
+    }
+    if (Object.prototype.hasOwnProperty.call(fields || {}, "attention"))
+      renderRemarks();
   }
   return false;
 }
@@ -14129,21 +15194,37 @@ async function saveBuildFields(ev) {
   // optimistic concurrency: a save over a record another writer already
   // bumped comes back 409 and reloads instead of clobbering it
   fields.expect_updated_at = (state.builds[id] || {}).updated_at || "";
+  const editGeneration = buildEditGeneration;
   if (await patchBuild(id, fields, `edit build ${fields.title.slice(0, 30)}`)) {
-    descState.id = id;
-    descState.val = fields.description;
-    buildDirty = false;
-    // a save that demotes ready->draft relocks Text/Knowledge — say so
-    // instead of a generic Saved (the toggle-off + Save path was silent)
-    el("build-msg").textContent =
-      cur0 && cur0.status === "ready" && fields.status === "draft"
-        ? "Saved — verification removed; Text and Knowledge relock"
-        : "Saved";
+    const stillOwnsEditor = state.buildSel === id &&
+      buildEditGeneration === editGeneration &&
+      (!buildDescMd || buildDescMd.get() === fields.description);
+    if (stillOwnsEditor) {
+      descState.id = id;
+      descState.val = fields.description;
+      buildDirty = false;
+      // a save that demotes ready->draft relocks Text/Knowledge — say so
+      // instead of a generic Saved (the toggle-off + Save path was silent)
+      el("build-msg").textContent =
+        cur0 && cur0.status === "ready" && fields.status === "draft"
+          ? "Saved — verification removed; Text and Knowledge relock"
+          : "Saved";
+    }
     status(`BUILD SAVED :: ${fields.title}`);
     return true;
   } else {
-    el("build-msg").textContent = buildPatchConflict
-      ? "changed elsewhere — reloaded" : "Save failed";
+    if (state.buildSel === id) {
+      const canReload = buildPatchConflict &&
+        buildEditGeneration === editGeneration &&
+        (!buildDescMd || buildDescMd.get() === fields.description);
+      if (canReload) {
+        renderBuildEditor();
+      }
+      el("build-msg").textContent = buildPatchConflict
+        ? canReload ? "changed elsewhere — reloaded"
+                    : "changed elsewhere — your newer edits are still here; save again"
+        : "Save failed";
+    }
     return false;
   }
 }
@@ -14686,6 +15767,7 @@ const ocrState = {
   layoutMeta: {},          // build id -> extracted-figure boxes (ocr-layout)
   wordsCache: new Map(),   // "pdf|page" -> /api/pdf/words result
   regionsCache: new Map(), // "bid|src|page" -> /ocr-regions record
+  paperCache: new Map(),   // "pdf|lighten" -> sampled paper-color request
   treeCollapsed: new Set(),// "bid:srckey" — collapsed nodes of the docs tree
 };
 
@@ -14776,7 +15858,9 @@ function renderOcrBooks() {
   list.innerHTML = "";
   document.querySelectorAll("#builds-tabs .pane-tab").forEach((t) =>
     t.classList.toggle("active", t.dataset.bstab === buildsTab()));
-  el("ocr-filter-verified").classList.toggle("active", ocrState.verifiedOnly);
+  const verifiedFilter = el("ocr-filter-verified");
+  verifiedFilter.classList.toggle("active", ocrState.verifiedOnly);
+  verifiedFilter.setAttribute("aria-pressed", String(ocrState.verifiedOnly));
   const builds = buildsSorted().filter((b) =>
     !ocrState.verifiedOnly || anAnalyzable(b));
   el("ocr-books-empty").hidden = builds.length !== 0;
@@ -14787,6 +15871,10 @@ function renderOcrBooks() {
       const li = document.createElement("li");
       li.className = "build-group";
       li.dataset.gid = item.id;
+      li.tabIndex = 0;
+      li.setAttribute("role", "button");
+      li.setAttribute("aria-expanded", String(item.expanded));
+      li.setAttribute("aria-label", `${item.expanded ? "Collapse" : "Expand"} ${item.title}`);
       li.innerHTML = `<span class="bi-row"><span class="bi-title">${
         item.expanded ? "&#9662;" : "&#9656;"} ${esc(item.title)}</span></span>
         <span class="bi-meta">${item.total} volume${item.total === 1 ? "" : "s"}${
@@ -14873,7 +15961,7 @@ async function selectOcrBook(bid) {
     renderOcrTab();
     renderAnList();
     renderAnMain();
-    renderWorkbench();   // the folder manifest feeds the readiness chips
+    renderWorkbench();   // the folder manifest feeds readiness on the rail
     status(folder.ocr.length
       ? `Loaded ${folder.ocr.length} OCR file(s)`
       : "No OCR files for this book yet (attach a PDF in the Source phase)");
@@ -15421,7 +16509,7 @@ async function renderOcrPages() {
   // numbers pointed at the previous scan (Delete would hit the wrong file)
   if (ocrState.pagesPdf !== pdf && ocrState.pageSel.size) clearOcrPageSel();
   if (!pdf) {
-    box.innerHTML = `<p class="empty">No PDF for this document — attach one in the Editor tab</p>`;
+    box.innerHTML = `<p class="empty">No PDF for this document — attach one in the Workbench Source phase</p>`;
     ocrState.pagesPdf = "";
     return;
   }
@@ -15583,6 +16671,50 @@ function observeOcrLayout(pdf) {
   if (ocrLayoutObs) ocrLayoutObs.disconnect();
   ocrLayoutObs = makeLayoutObserver(el("ocr-pages"),
     (pane) => fillOcrLayout(pane, pdf));
+}
+
+// A single sampled tint follows the source PDF across every facsimile surface.
+// Sampling is server-side: PyMuPDF already owns PDF rasterization, and the
+// browser need not load or canvas-decode pages that are outside the viewport.
+const OCR_PAPER_SAMPLE_PAGES = 5;
+
+async function paintOcrPaper(pane, pdf) {
+  if (!pane) return;
+  const lighten = state.settings.ocrPaperLighten;
+  const key = `${pdf || ""}|${lighten}`;
+  pane.dataset.paperPdf = pdf || "";
+  pane.dataset.paperKey = key;
+  if (!state.settings.ocrPaperColor || !pdf) {
+    pane.style.removeProperty("--ocr-paper-color");
+    return;
+  }
+  let req = ocrState.paperCache.get(key);
+  if (!req) {
+    req = (async () => {
+      try {
+        const data = await (await fetch(
+          "/api/pdf/paper-color?path=" + encodeURIComponent(pdf) +
+          `&samples=${OCR_PAPER_SAMPLE_PAGES}&lighten=${lighten}`)).json();
+        return data.ok ? data.color || "" : "";
+      } catch (e) {
+        ocrState.paperCache.delete(key);   // a transient failure may be retried
+        return "";
+      }
+    })();
+    if (ocrState.paperCache.size > 64) ocrState.paperCache.clear();
+    ocrState.paperCache.set(key, req);
+  }
+  const color = await req;
+  if (!pane.isConnected || pane.dataset.paperKey !== key ||
+      !state.settings.ocrPaperColor) return;
+  if (color) pane.style.setProperty("--ocr-paper-color", color);
+  else pane.style.removeProperty("--ocr-paper-color");
+}
+
+function refreshOcrPaperColors() {
+  for (const pane of document.querySelectorAll(".ocr-pglayout")) {
+    paintOcrPaper(pane, pane.dataset.paperPdf || "");
+  }
 }
 
 // the OCR sidecar for a book (ocr/layout.json), fetched once: the extracted-
@@ -15757,6 +16889,7 @@ function fillDocLayout(pane, text, bid, meta) {
 
 async function fillOcrLayout(pane, pdf) {
   const page = +pane.dataset.lay;
+  paintOcrPaper(pane, pdf);
   const d = ocrSelDoc();
   // The PDF's own text-layer extraction always shows the placed facsimile. Any
   // other doc (an OCR result) shows ITS content, so switching docs swaps what
@@ -16254,9 +17387,9 @@ function analysisServiceReady(engine) {
 }
 
 // renderOcrQueue runs this on every 1.5s job-poll tick, so it follows the
-// house sig-guard pattern (cf. applyColHide): compute the strings, write
-// only when something actually changed — rewriting data-tip under an open
-// tooltip would otherwise churn the DOM and the tooltip alike.
+// house sig-guard pattern (cf. applyColHide): compute the strings, write only
+// when something actually changed — rewriting data-tip under an open tooltip
+// would otherwise churn the DOM and the tooltip alike.
 let _engineSummarySig = null;
 function updateDefaultEngineSummary() {
   const host = el("engine-defaults-summary");
@@ -16505,10 +17638,10 @@ function stagedCountFor(bid) {
 }
 
 // The "first staged page opens the drawer" edge is PER BOOK: a plain global
-// would miss the edge when book B's first page is staged while A still holds
-// a count, and would pop the drawer open on merely returning to a book that
-// was already staged. selectOcrBook re-baselines (arriving at a staged book
-// is not a staging action), so the edge below only ever compares like books.
+// misses the edge when book B's first page is staged while A still holds a
+// count, and pops the drawer open on merely returning to an already-staged
+// book. selectOcrBook re-baselines (arriving somewhere staged is not a
+// staging action), so the edge below only ever compares like books.
 let _stagedEdge = { book: null, total: 0 };
 function stagedTotalFor(bid) {
   return bid ? stagedCountFor(bid) + analysisStagedCount(bid) : 0;
@@ -16689,7 +17822,7 @@ function pollOcrJobs() {
             // when the news matters; say where the work goes next
             status(`OCR COMPLETE :: ${j.book} — review in Text`);
             el("ocr-msg").textContent = "OCR complete — review the text";
-            renderWorkbenchChips();   // the Text chip flips to Needs review
+            renderWorkbenchRail();   // Text readiness flips to Needs review
           }
           // finished pages (ok or errored) are no longer running
           for (const x of job.pages) {
@@ -17162,6 +18295,9 @@ function renderReplicaBooks() {
     const li = document.createElement("li");
     li.className = "ocr-book" + (b.id === rwState.book ? " active" : "");
     li.dataset.bid = b.id;
+    li.tabIndex = 0;
+    li.setAttribute("role", "button");
+    if (b.id === rwState.book) li.setAttribute("aria-current", "true");
     li.innerHTML = `<span class="bi-title">${esc(b.title) || "<em>(untitled)</em>"}</span>
       <span class="bi-meta">${esc(b.authors || "")}${b.authors && b.year ? " &middot; " : ""}${esc(b.year || "")}</span>`;
     list.appendChild(li);
@@ -17412,11 +18548,11 @@ function rwSyncBar() {
       (rwState.dirty ? " · unsaved" : "")
     : "";
   el("rw-save").disabled = !rwState.dirty || !rwState.page;
-  el("rw-recompile").disabled = !rwState.book || !rwState.regionPages.length;
+  el("rw-recompile").disabled = !rwState.book || !rwState.regionPages.length || rwState.dirty;
   el("rw-export").disabled = !rwState.book || !rwState.regionPages.length;
   el("rw-import").disabled = !rwState.book;
   el("rw-print").disabled = !rwState.book || !rwState.regionPages.length;
-  el("rw-tpl-save").disabled = !rwState.page;
+  el("rw-tpl-save").disabled = !rwState.page || rwState.dirty;
   el("rw-tpl-apply").disabled = !el("rw-tpl").value;
   el("rw-tpl-outliers").disabled = !el("rw-tpl").value;
   const a = rwActive();
@@ -17955,6 +19091,8 @@ function rwSetMode(mode) {
   const pv = rwState.mode === "preview";
   el("rw-mode-edit").classList.toggle("active", !pv);
   el("rw-mode-preview").classList.toggle("active", pv);
+  el("rw-mode-edit").setAttribute("aria-pressed", String(!pv));
+  el("rw-mode-preview").setAttribute("aria-pressed", String(pv));
   el("rw-canvas").hidden = pv || !rwState.page;
   el("rw-preview-row").hidden = !pv || !rwState.page;
   el("rw-empty").hidden = !!rwState.page;
@@ -18332,6 +19470,37 @@ function initReplica() {
     const li = ev.target.closest("[data-bid]");
     if (li) selectReplicaBook(li.dataset.bid);
   });
+  el("rw-books").addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter" && ev.key !== " ") return;
+    const li = ev.target.closest("[data-bid]");
+    if (!li) return;
+    ev.preventDefault();
+    li.click();
+  });
+
+  const toolbarMenus = [...document.querySelectorAll(".replica-toolbar .toolbar-popover")];
+  for (const menu of toolbarMenus) {
+    menu.addEventListener("toggle", () => {
+      if (!menu.open) return;
+      for (const other of toolbarMenus) if (other !== menu) other.open = false;
+    });
+    menu.addEventListener("click", (ev) => {
+      const button = ev.target.closest("button");
+      if (button && !button.disabled) menu.open = false;
+    });
+  }
+  document.addEventListener("mousedown", (ev) => {
+    for (const menu of toolbarMenus) {
+      if (menu.open && !menu.contains(ev.target)) menu.open = false;
+    }
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Escape") return;
+    const menu = toolbarMenus.find((item) => item.open);
+    if (!menu) return;
+    menu.open = false;
+    menu.querySelector("summary").focus();
+  });
   el("rw-pages").addEventListener("click", (ev) => {
     const b = ev.target.closest(".rw-pagebtn");
     if (b) selectReplicaPage(+b.dataset.page);
@@ -18510,6 +19679,13 @@ function initOcrTab() {
     }
     const li = ev.target.closest("li.build-item");
     if (li) selectWorkbenchBook(li.dataset.bid);
+  });
+  el("ocr-books").addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter" && ev.key !== " ") return;
+    const row = ev.target.closest("li.build-group, li.build-item");
+    if (!row) return;
+    ev.preventDefault();
+    row.click();
   });
   el("ocr-docs").addEventListener("click", (ev) => {
     // tree chrome first: extract-text action, then node collapse/expand
@@ -18708,6 +19884,8 @@ const MENU_CMDS = {
   "undo": () => undo(),
   "redo": () => redo(),
   "search-pane": () => setSearchPane(!state.settings.showCatalog),
+  "remarks-sidebar": () =>
+    setRemarksCollapsed(!state.settings.remarksSidebarCollapsed, true),
   "table-checked": () => switchTopTable("checked"),
   "table-whl": () => switchTopTable("whl"),
   "run-scans": () => runScansBatch(),
@@ -18800,6 +19978,7 @@ function updateMenuState() {
   dis("undo", history.ptr === 0);
   dis("redo", history.ptr >= history.stack.length);
   check("search-pane", state.settings.showCatalog);
+  check("remarks-sidebar", !state.settings.remarksSidebarCollapsed);
   check("table-checked", onChecked);
   check("table-whl", !onChecked);
   check("opt-auto-ia", state.settings.autoIaDownload !== false);   // default-on
@@ -19182,6 +20361,7 @@ function boot(name, fn) {
 
 function init() {
   initConsole();          // first: it is where every later failure is reported
+  boot("info sections", initInfoSections);
   boot("desktop chrome", initDesktopChrome);
   boot("web view", initWebView);
   boot("settings", loadSettings);
@@ -19208,22 +20388,21 @@ function init() {
   boot("settings nav", initSettingsNav);
   boot("about", initAbout);
   boot("column resize", initColResize);
-  boot("open library status", loadOlStatus);
   // A database dropped into ~/.library-tool while the app is open should
-  // register without a restart: the backend already resolves it live, so just
-  // re-read the offline-index status whenever the window regains focus (e.g.
-  // after dropping files in the file manager). Throttled so a focus/blur storm
-  // can't hammer the endpoint.
-  let _olStatusAt = 0;
-  const refreshOlStatusOnReturn = () => {
+  // register without a restart. Invalidate the cached Resources inventory when
+  // focus returns, and refresh immediately only when that view is on screen.
+  let _dbResourceFocusAt = 0;
+  const refreshDbResourcesOnReturn = () => {
     if (document.visibilityState !== "visible") return;
     const now = Date.now();
-    if (now - _olStatusAt < 2000) return;
-    _olStatusAt = now;
-    loadOlStatus();
+    if (now - _dbResourceFocusAt < 2000) return;
+    _dbResourceFocusAt = now;
+    dbResourceState.loadedAt = 0;
+    if (el("infotab").classList.contains("active") &&
+        activeInfoSection() === "info-resources") loadDatabaseResources(true);
   };
-  document.addEventListener("visibilitychange", refreshOlStatusOnReturn);
-  window.addEventListener("focus", refreshOlStatusOnReturn);
+  document.addEventListener("visibilitychange", refreshDbResourcesOnReturn);
+  window.addEventListener("focus", refreshDbResourcesOnReturn);
 
   // undo / redo (toolbar)
   el("undo-btn").addEventListener("click", undo);
@@ -19237,9 +20416,7 @@ function init() {
     else if (k === "y" || (k === "z" && ev.shiftKey)) { ev.preventDefault(); redo(); }
   });
 
-  // table-bar commands (run-scans / scrape / search-pane are menu items)
-  el("dl-approved").addEventListener("click", downloadApproved);
-  el("export-json").addEventListener("click", exportJson);
+  // table-bar commands (download, export, scans, scrape, and search are menu items)
   initSortHeaders();
 
   // filter + column-visibility popups
@@ -19306,28 +20483,6 @@ function init() {
     }, 150);
   });
   el("checked-rows").addEventListener("click", onCheckedClick);
-
-  // year-range filter (applies to whichever top table is shown) — same debounce,
-  // which also collapses the per-keystroke saveSettings() client_state PUT.
-  let _yearDebounce = null;
-  const onYearFilter = () => {
-    const num = (v) => { const n = parseInt(v, 10); return Number.isFinite(n) ? n : null; };
-    state.settings.yearFrom = num(el("year-from").value);
-    state.settings.yearTo = num(el("year-to").value);
-    clearTimeout(_yearDebounce);
-    _yearDebounce = setTimeout(() => { saveSettings(); renderTop(); }, 150);
-  };
-  el("year-from").addEventListener("input", onYearFilter);
-  el("year-to").addEventListener("input", onYearFilter);
-  el("year-clear").addEventListener("click", () => {
-    clearTimeout(_yearDebounce);           // cancel a pending trailing render
-    el("year-from").value = "";
-    el("year-to").value = "";
-    state.settings.yearFrom = state.settings.yearTo = null;
-    saveSettings();
-    renderTop();
-  });
-  syncYearFilterInputs();
 
   // Open Library search constraint checkboxes (Title/Author/Year) — the same
   // persistent searchCons set toggled by Ctrl+click on a column header
@@ -19476,7 +20631,7 @@ function init() {
       // Ctrl+click: open the record in the EDIT tab instead of adding it
       if (rec._src === "ch") openChEditTab(rec._idx);
       else if (rec._src === "whl") openWhlEditTab(rec._idx);
-      else status("OPEN LIBRARY ROWS HAVE NO EDITOR — click to add instead");
+      else status("OPEN LIBRARY ROWS MUST BE ADDED BEFORE EDITING");
       return;
     }
     addToTop(rec);
@@ -19675,15 +20830,16 @@ function init() {
   document.getElementById("workbench").addEventListener("click", (ev) => {
     if (ev.target.closest(".wb-verify-here")) setVerified(true);
   });
-  // three doors to the same blank entry: the activity bar (muscle memory),
-  // the book-list bar (next to the list it feeds), and the empty state
+  // Two doors to the same blank entry: the activity bar for repeat use and
+  // the empty-state prompt for first use. A third copy in the narrow list bar
+  // clipped its collapse control without adding a distinct path.
   const newBlankEntry = () => {
     setWorkbenchPhase("record", false);   // the blank form is the next step
     createBuild({}, "(blank)");
   };
-  for (const id of ["build-new", "build-new-side", "build-new-empty"]) {
-    el(id).addEventListener("click", newBlankEntry);
-  }
+  el("build-new").addEventListener("click", newBlankEntry);
+  const emptyNew = el("build-new-empty");
+  if (emptyNew) emptyNew.addEventListener("click", newBlankEntry);
   el("export-builds").addEventListener("click", exportBuilds);
   el("download-upload-list").addEventListener("click", downloadUploadList);
   for (const t of document.querySelectorAll("#builds-tabs .pane-tab")) {
@@ -19768,7 +20924,7 @@ function init() {
     setThumbnailSource(b.id, card.dataset.source);
   });
   el("build-form").addEventListener("submit", saveBuildFields);
-  el("build-form").addEventListener("input", () => { buildDirty = true; });
+  el("build-form").addEventListener("input", markBuildDirty);
   el("build-save").addEventListener("click", saveBuildFields);
   el("build-delete").addEventListener("click", deleteBuild);
   // Ctrl/Cmd+S saves the open entry on the editor-derived phases, and the
@@ -19820,6 +20976,7 @@ function init() {
   // Q while hovering a row (any table) or a builder entry: mark it as needing
   // attention, and offer a reason
   loadAttn();
+  boot("remarks sidebar", initRemarksSidebar);
   document.addEventListener("keydown", onAttentionKey);
   document.addEventListener("keydown", onSearchKey);
   document.addEventListener("keydown", onRowDeleteKey);
@@ -19905,6 +21062,7 @@ function init() {
     else if (!el("settings-overlay").hidden) closeSettings();
     else if (!el("engine-overlay").hidden) closeDefaultEngines();
     else if (!el("about-overlay").hidden) closeAbout();
+    else if (!state.settings.remarksSidebarCollapsed) setRemarksCollapsed(true, true);
   });
 
   // keep sized tables filling their panes when the window or panes resize
@@ -19942,11 +21100,15 @@ function init() {
     loadDownloads();
     // Home's pending tasks are derived from these, so it re-renders once the
     // data it counts has actually arrived
-    loadManual().then(migrateParsedEntries).then(renderHome);
+    loadManual().then(migrateParsedEntries).then(() => {
+      renderHome();
+      renderRemarks();
+    });
     loadBuilds().then(renderUpload).then(renderHome);
     switchTopTable(state.settings.topTable === "whl" ? "whl" : "checked");
     renderBottomPane();
     renderHome();
+    renderRemarks();
   });
 }
 
