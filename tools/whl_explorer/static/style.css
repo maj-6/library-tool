@@ -4190,6 +4190,84 @@ button.publish-tree-label { cursor: pointer; }
 /* a thin rule where a new parent section begins — a marker, not a pill */
 .psg-sep td { padding: 0; border-bottom: 2px solid var(--face-sh2); }
 #an-psg-view { flex: none; max-height: 34%; }
+/* Test (#142) + Ask (#143): evaluation queries and evidence rows — the
+   incidental data (kinds, scores, metrics) stays whisper-styled */
+#an-ev-split { display: flex; flex: 1; min-height: 0; gap: 8px; }
+#an-ev-queries { flex: 0 0 36%; min-width: 0; overflow: auto; }
+#an-ev-results { flex: 1; min-width: 0; overflow: auto; display: flex; gap: 10px; align-items: flex-start; }
+#an-ev-text { flex: 1; min-width: 0; }
+.ev-kind {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--face-sh2);
+  border-bottom: 1px solid var(--canvas-line);
+  margin: 6px 0 2px;
+  padding-bottom: 1px;
+}
+.ev-q {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  font-family: var(--ui);
+  font-size: 12px;
+}
+.ev-q:hover { background: var(--row-hover); }
+.ev-q.active { background: var(--row-checked); border-color: var(--face-sh); }
+/* the query text always keeps a readable share; the metrics whisper yields */
+.ev-q-text { flex: 1 1 auto; min-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ev-q-meta { flex: 0 1 auto; min-width: 0; font-size: 10px; color: var(--face-sh2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ev-q-acts { flex: none; white-space: nowrap; }
+.ev-q-acts .cad-btn { margin-left: 3px; }
+.ev-col { flex: 1 1 0; min-width: 0; }
+.ev-col-label {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--face-sh2);
+  border-bottom: 1px solid var(--canvas-line);
+  margin-bottom: 2px;
+  padding-bottom: 1px;
+}
+.ev-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 4px;
+  border-bottom: 1px solid var(--canvas-line);
+  font-family: var(--ui);
+  font-size: 12px;
+}
+.ev-row:hover { background: var(--row-hover); }
+.ev-snip { flex: 1 1 auto; min-width: 0; }
+.ev-mark { background: var(--row-checked); border-bottom: 1px solid var(--cyan); }
+.ev-score { flex: none; font-family: var(--mono); font-size: 11px; color: var(--face-sh2); }
+.ev-row-acts { flex: none; white-space: nowrap; }
+.ev-row-acts .cad-btn { margin-left: 3px; }
+.ev-flash { outline: 1px solid var(--cyan); background: var(--row-checked); }
+.ev-verstats { font-size: 11px; color: var(--face-sh2); }
+/* Ask: the answer block; abstention is a note, never an error */
+#an-ask-answer {
+  border: 1px solid var(--canvas-line);
+  border-left: 3px solid var(--face-sh2);
+  background: var(--canvas);
+  padding: 8px 10px;
+  font-family: var(--ui);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+#an-ask-answer.ask-abstain { color: var(--face-sh2); font-style: italic; border-left-color: var(--canvas-line); }
+.ask-cite { color: var(--cyan); text-decoration: none; font-family: var(--mono); font-size: 11px; }
+.ask-cite:hover { text-decoration: underline; }
+#an-ask-note { margin: 0 0 4px; }
+/* long provider errors stay one quiet line, not a ballooned bar */
+#an-ask-msg { min-width: 0; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#an-ask-evidence { flex: 1; min-height: 0; overflow: auto; }
+#an-ask-view { flex: none; max-height: 34%; }
 /* Publish phase: two peer cards — the archive entry and the search index */
 #wb-publish-cards { display: flex; gap: 10px; align-items: flex-start; }
 #wb-publish-cards[hidden] { display: none; }

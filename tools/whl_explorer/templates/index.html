@@ -1046,6 +1046,8 @@
               <button class="pane-tab" data-antab="an-trans" type="button">Translations</button>
               <button class="pane-tab" data-antab="an-notes" type="button">Annotations</button>
               <button class="pane-tab" data-antab="an-passages" type="button">Passages</button>
+              <button class="pane-tab" data-antab="an-test" type="button">Test</button>
+              <button class="pane-tab" data-antab="an-ask" type="button">Ask</button>
               <button class="pane-tab" data-antab="an-rel" type="button">Relevance</button>
             </div>
 
@@ -1134,6 +1136,68 @@
                 <p id="an-psg-more" class="pane-note" hidden></p>
               </div>
               <pre id="an-psg-view" class="an-text" hidden></pre>
+            </div>
+
+            <!-- TEST (#142): the per-volume evaluation set — judged queries,
+                 Recall/nDCG/MRR, working passages vs the published index -->
+            <div class="an-pane" id="an-test">
+              <div class="pane-bar">
+                <span class="tool-label">Evaluation queries</span>
+                <span id="an-ev-metrics" class="tool-label"
+                      data-tip="Overall metrics from the last full run — judged queries only; unanswerable and unjudged counted apart"></span>
+                <span class="bar-spacer"></span>
+                <span id="an-ev-msg" class="tool-label"></span>
+                <button id="an-ev-run" class="cad-btn tiny" type="button"
+                        data-tip="Score every query against the working passages (and the published index when the cloud is configured)">Run all</button>
+              </div>
+              <div class="pane-bar">
+                <input id="an-ev-text" class="cad-input" type="text"
+                       placeholder="a query this book should answer&hellip;" spellcheck="false" />
+                <select id="an-ev-kind" class="cad-input"
+                        data-tip="What the query exercises — cover all kinds over time">
+                  <option value="exact-phrase">exact phrase</option>
+                  <option value="archaic-modern">archaic&#8596;modern</option>
+                  <option value="factual" selected>factual</option>
+                  <option value="thematic">thematic</option>
+                  <option value="tables">tables</option>
+                  <option value="cross-page">cross-page</option>
+                  <option value="multilingual">multilingual</option>
+                  <option value="unanswerable">unanswerable</option>
+                </select>
+                <button id="an-ev-add" class="cad-btn tiny" type="button">Add</button>
+                <button id="an-ev-cancel" class="cad-btn tiny" type="button" hidden>Cancel</button>
+              </div>
+              <div id="an-ev-split">
+                <div id="an-ev-queries" class="drafting"></div>
+                <div id="an-ev-results" class="drafting">
+                  <p id="an-ev-hint" class="empty">Select a query to run it
+                    against the working passages.</p>
+                </div>
+              </div>
+            </div>
+
+            <!-- ASK (#143): evidence first, then an optional cited answer.
+                 Answers are transient — derived AI claims never publish. -->
+            <div class="an-pane" id="an-ask">
+              <div class="pane-bar">
+                <span class="tool-label">Ask this book</span>
+                <span class="bar-spacer"></span>
+                <span id="an-ask-msg" class="tool-label"></span>
+              </div>
+              <div class="pane-bar">
+                <input id="an-ask-q" class="cad-input" type="text"
+                       placeholder="What does this book say about&hellip;" spellcheck="false" />
+                <button id="an-ask-go" class="cad-btn tiny" type="button"
+                        data-tip="Rank the passages for this question — the evidence, before any answer">Ask</button>
+                <button id="an-ask-draft" class="cad-btn tiny" type="button" hidden
+                        data-tip="Draft an answer from the evidence below — cited, abstaining, never medical advice">Draft answer</button>
+              </div>
+              <div id="an-ask-answer" hidden></div>
+              <p id="an-ask-note" class="pane-note" hidden>Model-generated
+                from the passages above &mdash; not the book&rsquo;s text,
+                not medical advice.</p>
+              <div id="an-ask-evidence" class="drafting"></div>
+              <pre id="an-ask-view" class="an-text" hidden></pre>
             </div>
 
             <div class="an-pane" id="an-rel">

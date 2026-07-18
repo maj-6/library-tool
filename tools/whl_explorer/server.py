@@ -26,6 +26,7 @@ import hashlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -9306,6 +9307,14 @@ def api_knowledge_index_publish():
                       "model": ecfg["model"] if embed else ""}
             stats = {"passages": len(included), "embedded": len(vectors),
                      "excluded": len(excluded)}
+            # #142 promotion visibility: the latest evaluation results ride
+            # on the version row, so the Search-index card shows them where
+            # promotion (publish / roll back) is decided
+            with _eval_lock:
+                ev = _load_eval(bid).get("last_run") or {}
+            overall = (ev.get("local") or {}).get("overall") or {}
+            if overall.get("judged") or overall.get("unanswerable"):
+                stats["eval"] = dict(overall, at=str(ev.get("at") or ""))
             rows = sbase._rest(
                 cloud, "POST", "index_versions",
                 [{"slug": slug, "channel": "stable", "config": config,
@@ -9428,6 +9437,509 @@ def api_knowledge_index_status():
                     "versions": versions, "slug": slug,
                     "published": b.get("status") == "uploaded",
                     "rights": str(b.get("rights") or ""), "warning": warning})
+
+
+# --- Knowledge: Test + Ask (#142/#143) -------------------------------------------
+# One retrieval core serves both: the Test view judges it (per-volume
+# evaluation sets, metrics that gate index promotion — docs/search-design.md
+# D9), and Ask builds on it (evidence first, then an optional cited answer).
+# Both are curator-side desktop surfaces; the public site gets nothing here
+# until an execution point with quotas exists (D7).
+
+_EVAL_KINDS = ("exact-phrase", "archaic-modern", "factual", "thematic",
+               "tables", "cross-page", "multilingual", "unanswerable")
+_EVAL_K = 10               # the metrics cutoff: Recall@10 / nDCG@10 / MRR
+# An unanswerable query PASSES when no passage scores ABOVE this floor.
+# 1.0 is the score of one query term found exactly once at full coverage
+# (see _score_passages): genuine coverage of a multi-term query lands well
+# above it, incidental partial overlap lands below. The known edge: a
+# single-term query whose term appears exactly once scores exactly 1.0 and
+# still passes — repeats push it over.
+_EVAL_UNANSWERABLE_FLOOR = 1.0
+_SNIPPET_WORDS = 24        # ts_headline's MaxWords, so both arms read alike
+_ASK_K = 10                # evidence rows behind an answer
+_eval_lock = threading.Lock()
+
+_SCORE_WORD = re.compile(r"[a-z0-9]+")
+
+
+def _score_terms(text: str) -> list[str]:
+    """Folded search words of arbitrary text: _search_normalize (the exact
+    layer the index searches — long s, ligatures, diacritics), then the
+    alphanumeric runs, so 'phyſick,' and 'physick' meet as one term."""
+    return _SCORE_WORD.findall(_search_normalize(text))
+
+
+def _evidence_snippet(body: str, qterms: list[str]) -> str:
+    """A «»-marked window of the normalized body around the densest cluster
+    of query-term hits — the local counterpart of the RPC's ts_headline
+    (StartSel=«, StopSel=», MaxWords=24), shared by Test and Ask so every
+    evidence row reads the same."""
+    words = body.split()
+    qset = set(qterms)
+    hits = [any(w in qset for w in _SCORE_WORD.findall(tok)) for tok in words]
+    if any(hits):
+        # densest fixed-size window by prefix sums; ties keep the earliest
+        ps = [0]
+        for h in hits:
+            ps.append(ps[-1] + int(h))
+        best, best_n = 0, -1
+        for i in range(max(1, len(words) - _SNIPPET_WORDS + 1)):
+            n = ps[min(i + _SNIPPET_WORDS, len(words))] - ps[i]
+            if n > best_n:
+                best, best_n = i, n
+    else:
+        best = 0
+    seg = words[best:best + _SNIPPET_WORDS]
+    mark = lambda m: f"«{m.group(0)}»" if m.group(0) in qset else m.group(0)  # noqa: E731
+    out = " ".join(_SCORE_WORD.sub(mark, tok) for tok in seg)
+    if best > 0:
+        out = "… " + out
+    if best + _SNIPPET_WORDS < len(words):
+        out += " …"
+    return out
+
+
+def _score_passages(passages: list[dict], query: str, k: int = _EVAL_K,
+                    excluded=None) -> list[dict]:
+    """Rank non-excluded passages for a query with a transparent lexical
+    scorer, over the same folded layer as the published index.
+
+    Scoring is deliberately simple and inspectable: per query term found,
+    1 + ln(tf) (repeats help, with diminishing returns), the sum weighted
+    by query coverage (matched terms / query terms) so passages containing
+    the whole query outrank scattered partial hits, doubled when the exact
+    folded phrase occurs. This APPROXIMATES the cloud FTS (websearch +
+    ts_rank over the same normalized bodies); it does not replicate
+    ts_rank's proximity weighting — which is exactly why the Test view can
+    show both arms side by side and judge them by the same metrics.
+
+    Returns [{passage_id, page_from, page_to, score, snippet, text}],
+    best first, ties broken by passage id for a stable order.
+    """
+    qterms = list(dict.fromkeys(_score_terms(query)))
+    if not qterms:
+        return []
+    phrase = " ".join(_score_terms(query))     # order + repeats kept
+    skip = set(excluded or ())
+    scored = []
+    for p in passages:
+        if p.get("id") in skip:
+            continue
+        body = p.get("body") or _search_normalize(p.get("text"))
+        words = _SCORE_WORD.findall(body)
+        if not words:
+            continue
+        counts = collections.Counter(words)
+        hit = [t for t in qterms if counts[t]]
+        if not hit:
+            continue
+        score = (sum(1.0 + math.log(counts[t]) for t in hit)
+                 * (len(hit) / len(qterms)))
+        if len(qterms) > 1 and f" {phrase} " in f" {' '.join(words)} ":
+            score *= 2.0                       # exact-phrase boost
+        scored.append((score, p, body))
+    scored.sort(key=lambda s: (-s[0], s[1]["id"]))
+    return [{"passage_id": p["id"], "page_from": p.get("page_from"),
+             "page_to": p.get("page_to"), "score": round(score, 4),
+             "snippet": _evidence_snippet(body, qterms),
+             "text": p.get("text") or ""}
+            for score, p, body in scored[:max(1, int(k))]]
+
+
+def _rpc_search_passages(cloud: dict, slug: str, query: str,
+                         k: int = _EVAL_K) -> list[dict]:
+    """The published arm: the same search_passages RPC the website calls,
+    over the LATEST stable index version — so the curator compares the
+    working passages against what actually serves."""
+    rows = sbase._rest(cloud, "POST", "rpc/search_passages",
+                       {"p_slug": slug, "p_query": query,
+                        "p_limit": max(1, int(k))})
+    out = []
+    for r in rows if isinstance(rows, list) else []:
+        if isinstance(r, dict) and r.get("passage_id"):
+            out.append({"passage_id": str(r["passage_id"]),
+                        "page_from": r.get("page_from"),
+                        "page_to": r.get("page_to"),
+                        "score": float(r.get("rank") or 0.0),
+                        "snippet": str(r.get("snippet") or "")})
+    return out
+
+
+def _index_version_count(cloud: dict, slug: str) -> int:
+    rows = sbase._rest(
+        cloud, "GET", "index_versions?slug=eq."
+        + urllib.parse.quote(slug, safe="") + "&select=id")
+    return len(rows) if isinstance(rows, list) else 0
+
+
+# --- the per-volume evaluation set: entries/<bid>/eval.json (#142) ----------------
+
+def _eval_path(bid: str) -> Path:
+    return _entry_dir(bid) / "eval.json"
+
+
+def _load_eval(bid: str) -> dict:
+    doc = lib.load_json(_eval_path(bid), None)
+    if not isinstance(doc, dict) or not isinstance(doc.get("queries"), list):
+        return {"version": 1, "queries": []}
+    return doc
+
+
+def _eval_metrics(ranked: list[str], relevant: set[str], k: int) -> dict:
+    """Recall@k, nDCG@k, MRR@k against binary judgments. Results the curator
+    never judged count as not relevant — the standard convention, and the
+    honest one: an unjudged hit earns credit only after someone looks at it.
+    nDCG uses binary gains 1/log2(pos+1); the ideal ranking is all relevant
+    passages first."""
+    hits = [1 if pid in relevant else 0 for pid in ranked[:k]]
+    recall = round(sum(hits) / len(relevant), 4) if relevant else 0.0
+    dcg = sum(h / math.log2(i + 2) for i, h in enumerate(hits))
+    idcg = sum(1 / math.log2(i + 2) for i in range(min(len(relevant), k)))
+    mrr = 0.0
+    for i, h in enumerate(hits):
+        if h:
+            mrr = round(1.0 / (i + 1), 4)
+            break
+    return {"recall": recall, "ndcg": round(dcg / idcg, 4) if idcg else 0.0,
+            "mrr": mrr}
+
+
+def _eval_query_run(q: dict, results: list[dict], k: int,
+                    floor: float | None) -> dict:
+    """One query's scored outcome. Judged queries (>= 1 relevant judgment)
+    get the three metrics; unanswerable queries pass/fail on the floor
+    (floor=None means the published arm, where rank scales differ across
+    ts_rank and RRF — there, returning nothing at all is the only honest
+    pass); everything else reports unjudged and stays out of the means."""
+    top = float(results[0]["score"]) if results else 0.0
+    if q.get("kind") == "unanswerable":
+        ok = (not results) if floor is None else (top <= floor)
+        return {"kind": "unanswerable", "pass": bool(ok),
+                "top": round(top, 4)}
+    relevant = {pid for pid, v in (q.get("judgments") or {}).items() if v}
+    if not relevant:
+        return {"judged": False}
+    out = _eval_metrics([r["passage_id"] for r in results], relevant, k)
+    out["relevant"] = len(relevant)
+    return out
+
+
+def _eval_overall(per_query: dict) -> dict:
+    """Means over the judged queries plus the separate tallies: unanswerable
+    pass counts and the unjudged remainder. No judged queries -> null
+    metrics, never a fake zero."""
+    judged = [r for r in per_query.values() if "recall" in r]
+    un = [r for r in per_query.values() if r.get("kind") == "unanswerable"]
+    mean = lambda key: round(sum(r[key] for r in judged) / len(judged), 4)  # noqa: E731
+    return {"recall": mean("recall") if judged else None,
+            "ndcg": mean("ndcg") if judged else None,
+            "mrr": mean("mrr") if judged else None,
+            "judged": len(judged),
+            "unanswerable_pass": sum(1 for r in un if r["pass"]),
+            "unanswerable": len(un),
+            "unjudged": sum(1 for r in per_query.values()
+                            if r.get("judged") is False)}
+
+
+def _eval_summary_note(overall: dict) -> str:
+    bits = []
+    if overall.get("judged"):
+        bits.append(f"R@{_EVAL_K} {overall['recall']:.2f} · "
+                    f"nDCG {overall['ndcg']:.2f} · MRR {overall['mrr']:.2f} "
+                    f"({overall['judged']} judged)")
+    if overall.get("unanswerable"):
+        bits.append(f"unanswerable {overall['unanswerable_pass']}"
+                    f"/{overall['unanswerable']}")
+    if overall.get("unjudged"):
+        bits.append(f"{overall['unjudged']} unjudged")
+    return " · ".join(bits) or "no queries scored"
+
+
+@app.route("/api/builds/<bid>/eval", methods=["GET", "PUT"])
+def api_build_eval(bid: str):
+    """GET the evaluation set; PUT curation, one operation at a time (the
+    annotations idiom): {add: {text, kind}}, {update: {id, text?, kind?}},
+    {remove: id}, {judge: {id, passage_id, rel: 1|0|null}} (null clears).
+
+    Judgments are keyed by content-hash passage ids, so they survive
+    regeneration for every passage whose text did not change; a judged id
+    the current set no longer contains simply never surfaces in results —
+    and a positive one honestly drags Recall down until re-judged, which
+    is exactly the re-score-against-new-versions semantics of #142."""
+    if request.method == "GET":
+        with _eval_lock:
+            return jsonify({"ok": True, "doc": _load_eval(bid)})
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    p = request.get_json(silent=True) or {}
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    judged = False
+    with _eval_lock:
+        doc = _load_eval(bid)
+        queries = doc["queries"]
+        by_id = {str(q.get("id")): q for q in queries}
+
+        add = p.get("add") or {}
+        if add:
+            text = str(add.get("text") or "").strip()[:500]
+            kind = str(add.get("kind") or "").strip()
+            if not text:
+                return jsonify({"ok": False, "error": "a query needs text"}), 400
+            if kind not in _EVAL_KINDS:
+                return jsonify({"ok": False, "error": "unknown query kind"}), 400
+            queries.append({"id": lib.gen_id(set(by_id)), "text": text,
+                            "kind": kind, "judgments": {}, "updated_at": now})
+
+        if p.get("remove"):
+            doc["queries"] = queries = [
+                q for q in queries if q.get("id") != p["remove"]]
+        by_id = {str(q.get("id")): q for q in queries}
+
+        upd = p.get("update") or {}
+        if upd.get("id"):
+            q = by_id.get(str(upd["id"]))
+            if q is None:
+                return jsonify({"ok": False, "error": "unknown query id"}), 400
+            if "text" in upd:
+                text = str(upd.get("text") or "").strip()[:500]
+                if not text:
+                    return jsonify({"ok": False,
+                                    "error": "a query needs text"}), 400
+                q["text"] = text
+            if "kind" in upd:
+                if upd["kind"] not in _EVAL_KINDS:
+                    return jsonify({"ok": False,
+                                    "error": "unknown query kind"}), 400
+                q["kind"] = upd["kind"]
+            q["updated_at"] = now
+
+        j = p.get("judge") or {}
+        if j.get("id"):
+            q = by_id.get(str(j["id"]))
+            if q is None:
+                return jsonify({"ok": False, "error": "unknown query id"}), 400
+            pid = str(j.get("passage_id") or "").strip()
+            if not pid:
+                return jsonify({"ok": False, "error": "no passage id"}), 400
+            rel = j.get("rel")
+            marks = q.setdefault("judgments", {})
+            if rel is None:
+                marks.pop(pid, None)
+            elif rel in (0, 1, False, True):
+                marks[pid] = 1 if rel else 0
+            else:
+                return jsonify({"ok": False,
+                                "error": "rel must be 1, 0 or null"}), 400
+            q["updated_at"] = now
+            judged = True
+
+        lib.save_json(_eval_path(bid), doc)
+    # provenance (#135): judging binds the set to the passages as they stand,
+    # so the input is passages.json fingerprinted at judgment time; query
+    # edits keep the recorded inputs (they change intent, not derivation)
+    _manifest_record(bid, "eval.json", {"kind": "eval"},
+                     [_manifest_input(bid, "passages.json")] if judged else None)
+    return jsonify({"ok": True, "doc": doc})
+
+
+@app.route("/api/knowledge/eval/run", methods=["POST"])
+def api_knowledge_eval_run():
+    """Score every evaluation query and cache the results. Body: {build_id}.
+    A tracked job (one tick per query): the local arm always runs; when the
+    cloud is configured and the book has published, the search_passages RPC
+    runs beside it so working passages and the published index get separate,
+    comparable metrics. Results land in eval.json under last_run."""
+    p = request.get_json(silent=True) or {}
+    bid = str(p.get("build_id") or "").strip()
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    with _eval_lock:
+        queries = [dict(q) for q in _load_eval(bid)["queries"]]
+    if not queries:
+        return jsonify({"ok": False, "error":
+                        "no evaluation queries yet — add some first"}), 400
+    with _passages_lock:
+        doc = _load_passages(bid)
+    if doc is None:
+        return jsonify({"ok": False, "error":
+                        "no passages yet — generate them first"}), 400
+    passages = doc.get("passages") or []
+    excluded = doc.get("excluded") or []
+    cloud = _cloud_cfg()
+    slug = str(b.get("published_slug") or "").strip()
+    psg_input = _manifest_input(bid, "passages.json")   # hashed at job start
+
+    def run(job):
+        try:
+            local_q: dict = {}
+            pub_q: dict = {}
+            warning = ""
+            version = 0
+            if cloud and slug:
+                try:
+                    version = _index_version_count(cloud, slug)
+                except sbase.SyncError as exc:
+                    warning = _index_sync_error(exc)
+            for q in queries:
+                if _an_cancel_check(job, "cancelled — metrics not saved"):
+                    return
+                results = _score_passages(passages, q["text"], _EVAL_K,
+                                          excluded)
+                local_q[q["id"]] = _eval_query_run(
+                    q, results, _EVAL_K, _EVAL_UNANSWERABLE_FLOOR)
+                if version and not warning:
+                    try:
+                        rows = _rpc_search_passages(cloud, slug, q["text"],
+                                                    _EVAL_K)
+                        pub_q[q["id"]] = _eval_query_run(q, rows, _EVAL_K,
+                                                         None)
+                    except sbase.SyncError as exc:
+                        warning = _index_sync_error(exc)
+                with _an_jobs_lock:
+                    job["done"] += 1
+                _job_checkpoint(job)
+            overall = _eval_overall(local_q)
+            last_run = {"at": datetime.now(timezone.utc).isoformat(
+                            timespec="seconds"),
+                        "k": _EVAL_K, "floor": _EVAL_UNANSWERABLE_FLOOR,
+                        "local": {"overall": overall, "queries": local_q}}
+            if pub_q:
+                last_run["published"] = {"version": version,
+                                         "overall": _eval_overall(pub_q),
+                                         "queries": pub_q}
+            if warning:
+                last_run["warning"] = warning
+            with _eval_lock:
+                cur = _load_eval(bid)
+                cur["last_run"] = last_run
+                lib.save_json(_eval_path(bid), cur)
+            _manifest_record(bid, "eval.json", {"kind": "eval"}, [psg_input])
+            with _an_jobs_lock:
+                job["note"] = _eval_summary_note(overall)
+            activity("ran retrieval evaluation", "book",
+                     detail=b.get("title", ""))
+            _an_finish(job)
+        except Exception as exc:
+            log.error("eval run failed for %s", bid, exc_info=exc)
+            _an_finish(job, f"{type(exc).__name__}: {exc}")
+
+    job = _an_job_start(bid, "eval-run", len(queries), run)
+    return jsonify({"ok": True, "job": job["id"]})
+
+
+# --- Ask this book (#143): evidence first, then an optional cited answer ----------
+
+_ASK_ABSTAIN = "The archive does not contain enough evidence to answer this."
+_ASK_NOTE = ("Model-generated from the passages above — not the book's "
+             "text, not medical advice.")
+
+
+def _ask_system_prompt(year) -> str:
+    """The fixed Ask contract: grounded, cited, abstaining, historically
+    framed, never medical advice. The edition year is the only variable."""
+    edition = f"this {year} edition" if str(year or "").strip() else \
+        "this edition"
+    return (
+        "You answer questions about one historical book using ONLY the "
+        "numbered passages supplied below — no outside knowledge, no "
+        "guesses. After each claim, cite the page of the passage that "
+        "supports it inline as [p<page>], for example [p12]. If the "
+        f"passages do not support an answer, reply exactly "
+        f"\"{_ASK_ABSTAIN}\" and nothing else. Frame every historical "
+        f"claim as the edition's statement — \"{edition} states…\" — "
+        "never as present-day fact. The book's remedies are historical "
+        "text: never present them as modern medical advice, and if the "
+        "question asks how to use a remedy today, refuse that framing "
+        "and describe only what the edition says.")
+
+
+@app.route("/api/knowledge/ask", methods=["POST"])
+def api_knowledge_ask():
+    """Retrieval for Ask and for the Test view's live query runs. Body:
+    {build_id, question, published?}. Synchronous — this is a local rank
+    over passages.json, plus (published: true) the RPC arm for the
+    working-vs-published comparison."""
+    p = request.get_json(silent=True) or {}
+    bid = str(p.get("build_id") or "").strip()
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    question = str(p.get("question") or "").strip()
+    if not question:
+        return jsonify({"ok": False, "error": "ask a question first"}), 400
+    with _passages_lock:
+        doc = _load_passages(bid)
+    if doc is None:
+        return jsonify({"ok": False, "error":
+                        "no passages yet — generate them first"}), 404
+    results = _score_passages(doc.get("passages") or [], question, _ASK_K,
+                              doc.get("excluded") or [])
+    out = {"ok": True, "results": results,
+           "floor": _EVAL_UNANSWERABLE_FLOOR, "published": None,
+           "warning": ""}
+    if p.get("published"):
+        cloud = _cloud_cfg()
+        slug = str(b.get("published_slug") or "").strip()
+        if cloud and slug:
+            try:
+                out["published"] = {
+                    "version": _index_version_count(cloud, slug),
+                    "results": _rpc_search_passages(cloud, slug, question,
+                                                    _ASK_K)}
+            except sbase.SyncError as exc:
+                out["warning"] = _index_sync_error(exc)
+    return jsonify(out)
+
+
+@app.route("/api/knowledge/ask/answer", methods=["POST"])
+def api_knowledge_ask_answer():
+    """Draft a cited answer from already-retrieved passages. Body:
+    {build_id, question, passage_ids}. The answer is TRANSIENT by design —
+    it is returned, rendered, and never written to disk: AI-derived claims
+    stay visibly derived and never publish (docs/search-design.md §7), and
+    a stored answer would rot silently as the text is corrected."""
+    p = request.get_json(silent=True) or {}
+    bid = str(p.get("build_id") or "").strip()
+    b, err = _an_gate(bid)
+    if err:
+        return err
+    question = str(p.get("question") or "").strip()
+    if not question:
+        return jsonify({"ok": False, "error": "ask a question first"}), 400
+    cfg = _ai_cfg()
+    if not cfg["key"]:
+        # the _ai_chat no-key message, surfaced before any work happens
+        return jsonify({"ok": False, "error":
+                        "no AI key — set one in Settings > AI "
+                        "(DeepSeek is the default provider)"}), 409
+    with _passages_lock:
+        doc = _load_passages(bid)
+    by_id = {str(x.get("id")): x for x in (doc or {}).get("passages") or []}
+    wanted = [str(i) for i in p.get("passage_ids") or []]
+    picked = [by_id[i] for i in wanted if i in by_id][:12]
+    if not picked:
+        return jsonify({"ok": False, "error":
+                        "no known passages to answer from — run the "
+                        "question first"}), 400
+    lines = []
+    for i, x in enumerate(picked, 1):
+        a, z = x.get("page_from"), x.get("page_to")
+        label = f"page {a}" if a == z else f"pages {a}–{z}"
+        lines.append(f"[{i}] ({label})\n{x.get('text') or ''}")
+    user = (f"Question: {question}\n\nPassages from "
+            f"{_an_meta_line(b)}:\n\n" + "\n\n".join(lines))
+    try:
+        answer = _ai_chat(cfg, [
+            {"role": "system", "content": _ask_system_prompt(b.get("year"))},
+            {"role": "user", "content": user},
+        ], temperature=0.2)
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 502
+    return jsonify({"ok": True, "answer": answer.strip(),
+                    "abstained": answer.strip() == _ASK_ABSTAIN})
 
 
 def _capture_note(cap: dict, errors: list[str]) -> str:

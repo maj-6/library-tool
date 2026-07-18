@@ -8815,6 +8815,8 @@ function renderAnPane(id) {
   else if (id === "an-trans") loadAnTranslations(b);
   else if (id === "an-notes") loadAnNotes(b);
   else if (id === "an-passages") loadAnPassages(b);
+  else if (id === "an-test") loadAnTest(b);
+  else if (id === "an-ask") renderAnAsk(b);
   else if (id === "an-rel") renderAnRelevance(b);
   else if (id === "an-bundle") renderAnBundle(b);
 }
@@ -9309,6 +9311,382 @@ function onAnPsgClick(ev) {
   }
 }
 
+// --- Test (#142): the per-volume evaluation set over the passages ----------------
+
+const EV_KINDS = ["exact-phrase", "archaic-modern", "factual", "thematic",
+  "tables", "cross-page", "multilingual", "unanswerable"];
+let anEval = null;       // {queries, last_run} for the selected book
+let anEvalSel = "";      // selected query id — the live-run target
+let anEvalEdit = "";     // query id loaded into the add/edit bar
+let anEvalRes = null;    // live results for the selected query
+let anAskHasKey = false; // "an AI key exists" — gates Ask's Draft action
+
+async function loadAnTest(b) {
+  try {
+    const data = await (await fetch(`/api/builds/${b.id}/eval`)).json();
+    if (state.anSel !== b.id) return;   // stale response
+    anEval = data.ok ? data.doc : null;
+  } catch (e) { anEval = null; }
+  if (!anEval || !(anEval.queries || []).some((q) => q.id === anEvalSel)) {
+    anEvalSel = "";
+    anEvalRes = null;
+  }
+  renderAnEval();
+}
+
+function evFmt(x) { return x == null ? "–" : Number(x).toFixed(2); }
+
+function evOverallLine(o) {
+  if (!o) return "";
+  const bits = [];
+  if (o.judged) {
+    bits.push(`R@10 ${evFmt(o.recall)} · nDCG ${evFmt(o.ndcg)} · ` +
+      `MRR ${evFmt(o.mrr)} (${o.judged} judged)`);
+  }
+  if (o.unanswerable) bits.push(`unanswerable ${o.unanswerable_pass}/${o.unanswerable}`);
+  if (o.unjudged) bits.push(`${o.unjudged} unjudged`);
+  return bits.join(" · ");
+}
+
+function renderAnEval() {
+  const host = el("an-ev-queries");
+  if (!host) return;
+  const queries = (anEval && anEval.queries) || [];
+  const run = (anEval && anEval.last_run) || null;
+  const localQ = (run && run.local && run.local.queries) || {};
+  let line = run ? evOverallLine(run.local && run.local.overall) : "";
+  if (run && run.published) {
+    line += ` — published v${Number(run.published.version) || "?"}: ` +
+      evOverallLine(run.published.overall);
+  }
+  el("an-ev-metrics").textContent = line;
+  el("an-ev-run").disabled = !queries.length;
+  host.innerHTML = EV_KINDS.map((kind) => {
+    const group = queries.filter((q) => q.kind === kind);
+    if (!group.length) return "";
+    // a thin group label per kind — a marker, not a pill
+    return `<div class="ev-kind">${esc(kind)}</div>` + group.map((q) => {
+      const judged = Object.keys(q.judgments || {}).length;
+      const r = localQ[q.id];
+      let m = "";
+      if (r && "recall" in r) m = `R ${evFmt(r.recall)} · nDCG ${evFmt(r.ndcg)}`;
+      else if (r && r.kind === "unanswerable") m = r.pass ? "pass" : "fail";
+      const meta = [judged ? `${judged} judged` : "", m].filter(Boolean).join(" · ");
+      return `<div class="ev-q${q.id === anEvalSel ? " active" : ""}" data-ev="${esc(q.id)}">
+        <span class="ev-q-text">${esc(q.text)}</span>
+        <span class="ev-q-meta">${esc(meta)}</span>
+        <span class="ev-q-acts">
+          <button class="cad-btn tiny" data-ev-edit="${esc(q.id)}" type="button">Edit</button>
+          <button class="cad-btn tiny danger" data-ev-del="${esc(q.id)}" type="button">Delete</button>
+        </span></div>`;
+    }).join("");
+  }).join("") || `<p class="empty">No queries yet — add the first above.</p>`;
+  renderAnEvalResults();
+}
+
+// «»-marked snippets arrive from both arms (the local scorer mirrors the
+// RPC's ts_headline delimiters); escape first, then surface the marks —
+// server text never reaches the DOM as HTML
+function evSnippetHtml(s) {
+  return esc(s).replace(/«([^«»]*)»/g, '<span class="ev-mark">$1</span>');
+}
+
+function evPageLabel(r) {
+  return r.page_from === r.page_to
+    ? `p${r.page_from ?? "?"}` : `p${r.page_from}–${r.page_to}`;
+}
+
+// one evidence-row idiom for Test and Ask; `q` (an eval query) adds the
+// judgment toggles, null (Ask) leaves the row plain
+function evRowHtml(r, q) {
+  const j = q ? (q.judgments || {})[r.passage_id] : undefined;
+  const acts = q ? `<span class="ev-row-acts">
+      <button class="cad-btn tiny${j === 1 ? " active" : ""}" data-ev-rel="1"
+              data-ev-pid="${esc(r.passage_id)}" type="button"
+              data-tip="Mark relevant — click again to clear">Relevant</button>
+      <button class="cad-btn tiny${j === 0 ? " active" : ""}" data-ev-rel="0"
+              data-ev-pid="${esc(r.passage_id)}" type="button"
+              data-tip="Mark not relevant — click again to clear">Not relevant</button>
+    </span>` : "";
+  return `<div class="ev-row" data-ev-row="${esc(r.passage_id)}">
+    <span class="psg-pages">${esc(evPageLabel(r))}</span>
+    <span class="ev-snip">${evSnippetHtml(r.snippet || "")}</span>
+    <span class="ev-score">${Number(r.score || 0).toFixed(2)}</span>
+    ${acts}</div>`;
+}
+
+function renderAnEvalResults() {
+  const host = el("an-ev-results");
+  if (!host) return;
+  const q = ((anEval && anEval.queries) || []).find((x) => x.id === anEvalSel);
+  if (!q || !anEvalRes) {
+    host.innerHTML = `<p class="empty">Select a query to run it against
+      the working passages.</p>`;
+    return;
+  }
+  // working passages always; the published index beside them when the RPC
+  // arm ran — two clearly labelled result sets, never mixed
+  const cols = [`<div class="ev-col"><div class="ev-col-label">Working passages</div>` +
+    (((anEvalRes.results || []).map((r) => evRowHtml(r, q)).join("")) ||
+      `<p class="empty">No matches.</p>`) + `</div>`];
+  if (anEvalRes.published) {
+    cols.push(`<div class="ev-col"><div class="ev-col-label">Published index
+      v${Number(anEvalRes.published.version) || "?"}</div>` +
+      (((anEvalRes.published.results || []).map((r) => evRowHtml(r, q)).join("")) ||
+        `<p class="empty">No matches.</p>`) + `</div>`);
+  }
+  host.innerHTML = cols.join("");
+}
+
+async function selectEvalQuery(id) {
+  anEvalSel = id;
+  anEvalRes = null;
+  renderAnEval();
+  const b = anSelected();
+  const q = ((anEval && anEval.queries) || []).find((x) => x.id === id);
+  if (!b || !q) return;
+  try {
+    const res = await fetch("/api/knowledge/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ build_id: b.id, question: q.text, published: true }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (state.anSel !== b.id || anEvalSel !== id) return;   // stale
+    if (!res.ok || !data.ok) {
+      el("an-ev-msg").textContent = data.error || "run failed";
+      return;
+    }
+    el("an-ev-msg").textContent = data.warning || "";
+    anEvalRes = data;
+    renderAnEvalResults();
+  } catch (e) { el("an-ev-msg").textContent = "request failed"; }
+}
+
+async function evPut(body) {
+  const b = anSelected();
+  if (!b) return null;
+  try {
+    const res = await fetch(`/api/builds/${b.id}/eval`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      el("an-ev-msg").textContent = data.error || "save failed";
+      return null;
+    }
+    el("an-ev-msg").textContent = "";
+    anEval = Object.assign({}, anEval, data.doc);
+    return data.doc;
+  } catch (e) {
+    el("an-ev-msg").textContent = "request failed";
+    return null;
+  }
+}
+
+function evEditReset() {
+  anEvalEdit = "";
+  el("an-ev-text").value = "";
+  el("an-ev-add").textContent = "Add";
+  el("an-ev-cancel").hidden = true;
+}
+
+async function onEvSubmit() {
+  const text = el("an-ev-text").value.trim();
+  const kind = el("an-ev-kind").value;
+  if (!text) { el("an-ev-msg").textContent = "a query needs text"; return; }
+  const doc = await evPut(anEvalEdit
+    ? { update: { id: anEvalEdit, text, kind } }
+    : { add: { text, kind } });
+  if (doc) { evEditReset(); renderAnEval(); }
+}
+
+async function onEvQueriesClick(ev) {
+  const e = ev.target.closest("[data-ev-edit]");
+  if (e) {
+    const q = ((anEval && anEval.queries) || []).find((x) => x.id === e.dataset.evEdit);
+    if (!q) return;
+    anEvalEdit = q.id;
+    el("an-ev-text").value = q.text;
+    el("an-ev-kind").value = q.kind;
+    el("an-ev-add").textContent = "Save";
+    el("an-ev-cancel").hidden = false;
+    el("an-ev-text").focus();
+    return;
+  }
+  const d = ev.target.closest("[data-ev-del]");
+  if (d) {
+    const q = ((anEval && anEval.queries) || []).find((x) => x.id === d.dataset.evDel);
+    const judged = q ? Object.keys(q.judgments || {}).length : 0;
+    if (!(await confirmDialog({
+      title: "Delete query",
+      message: "Delete this evaluation query?",
+      detail: judged ? `Its ${judged} judgments are deleted with it.`
+        : "It has no judgments yet.",
+      confirmLabel: "Delete",
+      danger: true,
+    }))) return;
+    if (anEvalEdit === d.dataset.evDel) evEditReset();
+    if (anEvalSel === d.dataset.evDel) { anEvalSel = ""; anEvalRes = null; }
+    if (await evPut({ remove: d.dataset.evDel })) renderAnEval();
+    return;
+  }
+  const row = ev.target.closest(".ev-q");
+  if (row && row.dataset.ev !== anEvalSel) selectEvalQuery(row.dataset.ev);
+}
+
+async function onEvResultsClick(ev) {
+  const btn = ev.target.closest("[data-ev-rel]");
+  if (!btn) return;
+  const q = ((anEval && anEval.queries) || []).find((x) => x.id === anEvalSel);
+  if (!q) return;
+  const want = Number(btn.dataset.evRel);
+  const cur = (q.judgments || {})[btn.dataset.evPid];
+  // clicking the active judgment clears it (rel: null)
+  const rel = cur === want ? null : want;
+  if (await evPut({ judge: { id: q.id, passage_id: btn.dataset.evPid, rel } })) {
+    renderAnEval();
+  }
+}
+
+function onEvRunAll() {
+  const b = anSelected();
+  if (b) {
+    anStartJob("/api/knowledge/eval/run", { build_id: b.id }, "eval-run",
+               el("an-ev-run"));
+  }
+}
+
+// --- Ask this book (#143): evidence first, then an optional cited answer ---------
+
+// Transient on purpose: the answer lives in this variable and the pane,
+// never on disk — AI-derived claims stay visibly derived and never publish
+// (docs/search-design.md §7)
+let anAsk = null;   // {buildId, question, results}
+
+const ASK_ABSTAIN = "The archive does not contain enough evidence to answer this.";
+
+async function renderAnAsk(b) {
+  if (anAsk && anAsk.buildId !== b.id) anAsk = null;
+  if (!anAsk) {
+    el("an-ask-evidence").innerHTML = "";
+    el("an-ask-answer").hidden = true;
+    el("an-ask-note").hidden = true;
+    el("an-ask-view").hidden = true;
+    el("an-ask-msg").textContent = "";
+    el("an-ask-draft").hidden = true;
+  }
+  try {
+    const sec = await (await fetch("/api/secrets")).json();
+    anAskHasKey = !!String(sec.aiKey || "").trim();
+  } catch (e) { anAskHasKey = false; }
+  if (anAsk && anAsk.results.length) el("an-ask-draft").hidden = !anAskHasKey;
+}
+
+async function onAskGo() {
+  const b = anSelected();
+  if (!b) return;
+  const question = el("an-ask-q").value.trim();
+  if (!question) { el("an-ask-msg").textContent = "ask a question first"; return; }
+  el("an-ask-msg").textContent = "";
+  el("an-ask-answer").hidden = true;
+  el("an-ask-note").hidden = true;
+  el("an-ask-view").hidden = true;
+  try {
+    const res = await fetch("/api/knowledge/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ build_id: b.id, question }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (state.anSel !== b.id) return;
+    if (!res.ok || !data.ok) {
+      el("an-ask-msg").textContent = data.error || "failed";
+      return;
+    }
+    anAsk = { buildId: b.id, question, results: data.results || [] };
+    renderAskEvidence();
+  } catch (e) { el("an-ask-msg").textContent = "request failed"; }
+}
+
+function renderAskEvidence() {
+  const rows = (anAsk && anAsk.results) || [];
+  el("an-ask-evidence").innerHTML = rows.map((r) => evRowHtml(r, null)).join("")
+    || `<p class="empty">No passages match this question.</p>`;
+  // the Draft action appears only over evidence, and only with a provider
+  el("an-ask-draft").hidden = !(rows.length && anAskHasKey);
+}
+
+function onAskEvidenceClick(ev) {
+  const row = ev.target.closest("[data-ev-row]");
+  if (!row || !anAsk) return;
+  const r = anAsk.results.find((x) => x.passage_id === row.dataset.evRow);
+  if (r && r.text) {
+    el("an-ask-view").textContent = r.text;   // the verbatim reading
+    el("an-ask-view").hidden = false;
+  }
+}
+
+async function onAskDraft() {
+  const b = anSelected();
+  if (!b || !anAsk || !anAsk.results.length) return;
+  const btn = el("an-ask-draft");
+  btn.disabled = true;
+  el("an-ask-msg").textContent = "drafting…";
+  try {
+    const res = await fetch("/api/knowledge/ask/answer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        build_id: b.id, question: anAsk.question,
+        passage_ids: anAsk.results.map((r) => r.passage_id),
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      el("an-ask-msg").textContent = data.error || "failed";
+      return;
+    }
+    el("an-ask-msg").textContent = "";
+    renderAskAnswer(data.answer || "");
+  } catch (e) {
+    el("an-ask-msg").textContent = "request failed";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderAskAnswer(text) {
+  const host = el("an-ask-answer");
+  const abstained = text.trim() === ASK_ABSTAIN;
+  // escape FIRST, then linkify the [pN] citations — model text never
+  // reaches the DOM as HTML
+  host.innerHTML = esc(text).replace(/\[p(\d+)\]/g,
+    '<a href="#" class="ask-cite" data-cite="$1">[p$1]</a>');
+  // abstention is an outcome, not an error: the plain sentence, note-styled
+  host.classList.toggle("ask-abstain", abstained);
+  host.hidden = false;
+  el("an-ask-note").hidden = false;   // the permanent provenance note
+}
+
+function onAskAnswerClick(ev) {
+  const a = ev.target.closest(".ask-cite");
+  if (!a || !anAsk) return;
+  ev.preventDefault();
+  const page = Number(a.dataset.cite);
+  const rows = [...el("an-ask-evidence").querySelectorAll("[data-ev-row]")];
+  const hit = rows.find((row) => {
+    const r = anAsk.results.find((x) => x.passage_id === row.dataset.evRow);
+    return r && Number(r.page_from) <= page && page <= Number(r.page_to);
+  });
+  if (!hit) return;
+  hit.scrollIntoView({ block: "nearest" });
+  hit.classList.add("ev-flash");
+  setTimeout(() => hit.classList.remove("ev-flash"), 1200);
+}
+
 // --- Publish phase: the Search index card (#140) ---------------------------------
 
 async function renderAnIndexCard(b) {
@@ -9345,12 +9723,24 @@ async function renderAnIndexCard(b) {
   el("an-index-versions").innerHTML = versions.slice(0, 6).map((v, i) => {
     const s = v.stats || {};
     const model = (v.config || {}).model;
+    // #142: the evaluation results recorded at publish time, visible where
+    // promotion (publish / roll back) is decided
+    const ev = s.eval || null;
+    const evBits = [];
+    if (ev && ev.judged) {
+      evBits.push(`R@10 ${evFmt(ev.recall)} · nDCG ${evFmt(ev.ndcg)} · ` +
+        `MRR ${evFmt(ev.mrr)}`);
+    }
+    if (ev && ev.unanswerable) {
+      evBits.push(`unans ${ev.unanswerable_pass}/${ev.unanswerable}`);
+    }
     return `<div class="an-index-ver">
       <span class="psg-pages">v${versions.length - i}</span>
       <span>${esc(v.channel || "stable")}</span>
       <span>${v.built_at ? esc(new Date(v.built_at).toLocaleString()) : ""}</span>
       <span>${Number(s.passages) || 0} passages</span>
       <span>${model ? esc(model) : "lexical"}</span>
+      <span class="ev-verstats">${esc(evBits.join(" · ") || (ev ? "" : "not evaluated"))}</span>
     </div>`;
   }).join("");
 }
@@ -9638,6 +10028,23 @@ function initAnalyze() {
   el("an-psg-wrap").addEventListener("click", onAnPsgClick);
   el("an-index-publish").addEventListener("click", anIndexPublish);
   el("an-index-rollback").addEventListener("click", anIndexRollback);
+
+  // Test (#142) + Ask (#143)
+  el("an-ev-run").addEventListener("click", onEvRunAll);
+  el("an-ev-add").addEventListener("click", onEvSubmit);
+  el("an-ev-cancel").addEventListener("click", evEditReset);
+  el("an-ev-text").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") onEvSubmit();
+  });
+  el("an-ev-queries").addEventListener("click", onEvQueriesClick);
+  el("an-ev-results").addEventListener("click", onEvResultsClick);
+  el("an-ask-go").addEventListener("click", onAskGo);
+  el("an-ask-q").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") onAskGo();
+  });
+  el("an-ask-draft").addEventListener("click", onAskDraft);
+  el("an-ask-evidence").addEventListener("click", onAskEvidenceClick);
+  el("an-ask-answer").addEventListener("click", onAskAnswerClick);
 
   // Record -> Knowledge jump for the open book (same Workbench selection)
   el("b-analyze").addEventListener("click", () => {
