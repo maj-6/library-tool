@@ -60,10 +60,14 @@ def test_locked_phases_offer_the_verify_unlock_inline():
 
 
 def test_publish_flushes_unsaved_edits_first():
-    # picking Rights then publishing must not read the stale saved value
+    # Picking Rights then publishing must not read stale state or switch books
+    # while the save is in flight. Behavioral races live in the Node suite.
     body = APP.split("async function uploadBuild", 1)[1].split(
         "let _publishTimer", 1)[0]
-    assert "buildIsDirty() && !(await saveBuildFields())" in body
+    assert "const buildId = state.buildSel" in body
+    assert "saved = await saveBuildFields()" in body
+    assert "state.buildSel !== buildId" in body
+    assert "JSON.stringify({ build_id: buildId })" in body
 
 
 def test_workbench_selection_is_unified_and_refreshes_resources():

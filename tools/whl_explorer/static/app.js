@@ -11020,9 +11020,13 @@ function wbLockNote(phase) {
 async function setVerified(on) {
   const b = currentBuild();
   if (!b) return false;
+  const buildId = b.id;
   el("b-ready").classList.toggle("active", !!on);
   el("b-verified-tag").hidden = !on;
   const saved = await saveBuildFields();
+  // A save can finish after the user selected another book. Never let the old
+  // verification request repaint or relock the new editor.
+  if (state.buildSel !== buildId) return saved;
   if (saved) {
     status(on ? "VERIFIED — RECORD SAVED"
               : "VERIFICATION REMOVED — Text and Knowledge relock");
@@ -11204,7 +11208,7 @@ function initWorkbench() {
   setJobsDrawer(!!state.settings.jobsDrawerOpen, false);
   // the rights select left the entry form (it lives in the Publish phase) but
   // still saves with the form — keep the dirty flag in step
-  el("b-rights").addEventListener("change", () => { buildDirty = true; });
+  el("b-rights").addEventListener("change", markBuildDirty);
   renderWorkbench();
 }
 
@@ -13688,7 +13692,7 @@ function catInlineRename(rowEl, id) {
 function initCategories() {
   makeCatPicker("m-categories");
   makeCatPicker("e-categories");
-  makeCatPicker("b-categories");
+  makeCatPicker("b-categories", markBuildDirty);
   MENU_CMDS["categories"] = () => openCategories();
   el("cat-close").addEventListener("click", closeCategories);
   el("cat-overlay").addEventListener("mousedown", (ev) => {
@@ -14643,6 +14647,11 @@ let buildDescMd = null;      // live markdown editor in the ENTRY tab
 let buildPdfViewer = null;   // PDF viewer in the SOURCE tab
 const descState = { id: null, val: null };  // last value set into the editor
 let buildDirty = false;      // the entry form has unsaved metadata edits
+let buildEditGeneration = 0; // distinguishes edits made while a save is in flight
+function markBuildDirty() {
+  buildDirty = true;
+  buildEditGeneration += 1;
+}
 function buildIsDirty() {
   // The markdown editor exists before any entry is selected; its initial empty
   // value differs from descState.val=null, but that is not an unsaved draft.
@@ -14773,37 +14782,65 @@ function appendBuildListItem(list, b, grouped) {
 // storage, its metadata to Supabase, where the website's library browser reads
 // it. This used to be "Upload to WHL", which flipped a status field and sent
 // nothing anywhere -- there was no WHL write API to call.
+let _publishMsgBuildId = null;
+function setPublishGuard(buildId, msg) {
+  if (state.buildSel !== buildId) return;
+  el("build-msg").textContent = msg;
+  const pm = el("publish-msg");
+  if (pm) pm.textContent = msg;
+  _publishMsgBuildId = msg ? buildId : null;
+}
+
+function syncPublishGuard(buildId) {
+  if (_publishMsgBuildId === buildId) return;
+  const pm = el("publish-msg");
+  if (pm) pm.textContent = "";
+  _publishMsgBuildId = null;
+}
+
 async function uploadBuild() {
-  if (!currentBuild()) return;
+  const buildId = state.buildSel;
+  if (!buildId || !state.builds[buildId]) return;
+  setPublishGuard(buildId, "");
   // Publishing is a decision about the record AS SHOWN, but the guards and
-  // the upload read SAVED state — flush unsaved edits first, or picking
-  // Rights and clicking publish either falsely blocks ("Set Rights before
-  // publishing" under a visible selection) or silently publishes the old
-  // value. Same rationale as the verify toggle: publish decisions are saves.
-  if (buildIsDirty() && !(await saveBuildFields())) return;
-  const b = currentBuild();
+  // upload consume saved state. Flush the selected record first, while keeping
+  // its identity stable across every await.
+  if (buildIsDirty()) {
+    let saved = false;
+    try {
+      saved = await saveBuildFields();
+    } catch (e) {
+      saved = false;
+    }
+    if (!saved) {
+      setPublishGuard(buildId, "Save failed");
+      return;
+    }
+  }
+  if (state.buildSel !== buildId) return;
+  // The save may have finished after the curator made another edit to this
+  // same book. That newer draft is not in the saved snapshot the server will
+  // publish, so require another deliberate click after it is saved.
+  if (buildIsDirty()) {
+    setPublishGuard(buildId, "Newer edits are not saved yet");
+    return;
+  }
+  const b = state.builds[buildId];
   if (!b) return;
-  // guards report beside the button that was clicked, not only in the head
-  // bar at the opposite corner
-  const guard = (msg) => {
-    el("build-msg").textContent = msg;
-    const pm = el("publish-msg");
-    if (pm) pm.textContent = msg;
-  };
   if (b.status !== "ready") {
-    guard("Only verified entries can be published");
+    setPublishGuard(buildId, "Only verified entries can be published");
     return;
   }
   if (!(b.pdf_file || "").trim()) {
-    guard("Attach the PDF before publishing");
+    setPublishGuard(buildId, "Attach the PDF before publishing");
     return;
   }
   // convenience only — the publish route enforces this server-side
   if (!(b.rights || "").trim()) {
-    guard("Set Rights before publishing");
+    setPublishGuard(buildId, "Set Rights before publishing");
     return;
   }
-  guard("");
+  setPublishGuard(buildId, "");
   // a public, hard-to-reverse action gets one look at what it ships —
   // this is not the quick-single-delete case the no-confirm preference covers
   const rightsLabel = (el("b-rights").selectedOptions[0] || {}).textContent || b.rights;
@@ -14814,11 +14851,12 @@ async function uploadBuild() {
     confirmLabel: "Publish",
     cancelLabel: "Not yet",
   }))) return;
+  if (state.buildSel !== buildId) return;
   let res;
   try {
     res = await (await fetch("/api/volumes/publish", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ build_id: b.id }),
+      body: JSON.stringify({ build_id: buildId }),
     })).json();
   } catch (e) {
     statusCrit("PUBLISH :: server unreachable");
@@ -14826,13 +14864,13 @@ async function uploadBuild() {
   }
   if (!res.ok) { statusErr("PUBLISH :: " + (res.error || "failed to start")); return; }
   status(`PUBLISHING :: ${b.title || b.id}`);
-  pollPublish();
+  pollPublish(buildId);
 }
 
 // A 129 MB volume is minutes, not seconds, so the upload runs server-side and
 // the footer carries its progress.
 let _publishTimer = null;
-function pollPublish() {
+function pollPublish(buildId = null) {
   clearInterval(_publishTimer);
   _publishTimer = setInterval(async () => {
     let st;
@@ -14858,11 +14896,19 @@ function pollPublish() {
     }
     if (st.stage === "done") {
       await loadBuilds();
-      // clear the (now published) selection in all three aliases
-      state.buildSel = null;
-      state.anSel = null;
-      ocrState.book = null;
-      renderUpload();
+      // Clear only the book this poll belongs to. A publish can take minutes,
+      // and the curator may have opened or edited another book meanwhile. A
+      // full render would also overwrite that editor from the saved snapshot.
+      const publishedId = buildId || st.build || null;
+      if (buildIsDirty()) {
+        renderBuildsList();
+        renderWorkbench();
+      } else {
+        if (state.buildSel === publishedId) state.buildSel = null;
+        if (state.anSel === publishedId) state.anSel = null;
+        if (ocrState.book === publishedId) ocrState.book = null;
+        renderUpload();
+      }
       renderHome();
       status(`PUBLISHED :: ${st.slug}${st.note ? " :: " + st.note : ""}`);
     }
@@ -14886,7 +14932,7 @@ async function suggestRights() {
   const s = res.copyright_status || "";
   if (s.startsWith("Public domain")) {
     el("b-rights").value = "public-domain";
-    buildDirty = true;
+    markBuildDirty();
   }
   msg.textContent = s || "No determination";
 }
@@ -14900,9 +14946,13 @@ function activeBuildTab() {
 function renderBuildEditor() {
   const ed = el("build-editor");
   const b = currentBuild();
+  syncPublishGuard(b ? b.id : null);
   ed.hidden = !b;
   el("build-empty").hidden = !!b;
-  if (!b) return;
+  if (!b) {
+    el("build-msg").textContent = "";
+    return;
+  }
   for (const f of BUILD_FIELDS) {
     const input = el("b-" + f);
     if (input) input.value = b[f] || "";
@@ -14996,17 +15046,30 @@ let buildPatchConflict = false;  // last patch came back 409 (record reloaded)
 
 async function patchBuildRaw(id, fields, quiet) {
   buildPatchConflict = false;
-  const res = await fetch(`/api/builds/${encodeURIComponent(id)}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(fields),
-  });
+  let res;
+  try {
+    res = await fetch(`/api/builds/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(fields),
+    });
+  } catch (e) {
+    return false;
+  }
   const data = await res.json().catch(() => ({}));
   if (res.ok && data.ok) {
     state.builds[id] = data.build;
     // quiet: background patches (auto-attach) must not re-render the form
-    // and wipe unsaved field edits
-    if (!quiet) renderUpload();
+    // and wipe unsaved field edits. The same rule applies when a PATCH for A
+    // resolves after the user started editing A or B.
+    if (!quiet) {
+      if (buildIsDirty()) {
+        renderBuildsList();
+        renderWorkbench();
+      } else {
+        renderUpload();
+      }
+    }
     if (Object.prototype.hasOwnProperty.call(fields || {}, "attention")) {
       renderRemarks();
       renderHome();
@@ -15017,7 +15080,12 @@ async function patchBuildRaw(id, fields, quiet) {
     // another writer (analysis, sync) got there first: adopt its record
     buildPatchConflict = true;
     state.builds[id] = data.build;
-    renderUpload();
+    if (buildIsDirty()) {
+      renderBuildsList();
+      renderWorkbench();
+    } else {
+      renderUpload();
+    }
     if (Object.prototype.hasOwnProperty.call(fields || {}, "attention"))
       renderRemarks();
   }
@@ -15063,21 +15131,37 @@ async function saveBuildFields(ev) {
   // optimistic concurrency: a save over a record another writer already
   // bumped comes back 409 and reloads instead of clobbering it
   fields.expect_updated_at = (state.builds[id] || {}).updated_at || "";
+  const editGeneration = buildEditGeneration;
   if (await patchBuild(id, fields, `edit build ${fields.title.slice(0, 30)}`)) {
-    descState.id = id;
-    descState.val = fields.description;
-    buildDirty = false;
-    // a save that demotes ready->draft relocks Text/Knowledge — say so
-    // instead of a generic Saved (the toggle-off + Save path was silent)
-    el("build-msg").textContent =
-      cur0 && cur0.status === "ready" && fields.status === "draft"
-        ? "Saved — verification removed; Text and Knowledge relock"
-        : "Saved";
+    const stillOwnsEditor = state.buildSel === id &&
+      buildEditGeneration === editGeneration &&
+      (!buildDescMd || buildDescMd.get() === fields.description);
+    if (stillOwnsEditor) {
+      descState.id = id;
+      descState.val = fields.description;
+      buildDirty = false;
+      // a save that demotes ready->draft relocks Text/Knowledge — say so
+      // instead of a generic Saved (the toggle-off + Save path was silent)
+      el("build-msg").textContent =
+        cur0 && cur0.status === "ready" && fields.status === "draft"
+          ? "Saved — verification removed; Text and Knowledge relock"
+          : "Saved";
+    }
     status(`BUILD SAVED :: ${fields.title}`);
     return true;
   } else {
-    el("build-msg").textContent = buildPatchConflict
-      ? "changed elsewhere — reloaded" : "Save failed";
+    if (state.buildSel === id) {
+      const canReload = buildPatchConflict &&
+        buildEditGeneration === editGeneration &&
+        (!buildDescMd || buildDescMd.get() === fields.description);
+      if (canReload) {
+        renderBuildEditor();
+      }
+      el("build-msg").textContent = buildPatchConflict
+        ? canReload ? "changed elsewhere — reloaded"
+                    : "changed elsewhere — your newer edits are still here; save again"
+        : "Save failed";
+    }
     return false;
   }
 }
@@ -20730,7 +20814,7 @@ function init() {
     setThumbnailSource(b.id, card.dataset.source);
   });
   el("build-form").addEventListener("submit", saveBuildFields);
-  el("build-form").addEventListener("input", () => { buildDirty = true; });
+  el("build-form").addEventListener("input", markBuildDirty);
   el("build-save").addEventListener("click", saveBuildFields);
   el("build-delete").addEventListener("click", deleteBuild);
   // Ctrl/Cmd+S saves the open entry on the editor-derived phases, and the
