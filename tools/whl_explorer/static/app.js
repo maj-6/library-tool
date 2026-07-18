@@ -4906,7 +4906,7 @@ function computeMark(row) {
   if (ia === true || ht === true)
     return {
       mark: "UPLOAD",
-      reason: "Not in WHL; a scan exists in an online archive.\nVerify each found source (click its marker); approved sources land in the EDITOR tab.",
+      reason: "Not in WHL; a scan exists in an online archive.\nVerify each found source (click its marker); approved sources become available in Workbench › Record.",
     };
   const pd = c && (c.copyright_status || "").startsWith("Public domain");
   if (!pd)
@@ -4952,7 +4952,7 @@ function markCell(row) {
   } else if (mark === "UPLOAD") {
     const ready = anyApprovedSource(row);
     cls = attached || ready ? "approved" : "upload"; label = BICONS.upload;
-    base = ready ? "Verified source(s) ready — see the Editor tab" : reason;
+    base = ready ? "Verified source(s) ready — open Workbench" : reason;
   } else if (attached) {
     // no computed mark, but an attached scan keeps the row clickable/detachable
     cls = "approved"; label = "NF"; base = reason;
@@ -4965,7 +4965,7 @@ function markCell(row) {
 }
 
 // attach a local PDF scan to a SCAN-marked row: it becomes a verified
-// source, ready to seed a new WHL entry in the Editor tab
+// source, ready to seed a new WHL entry in the Workbench Record phase
 function attachRowScan(id) {
   const row = state.rowsById.get(String(id));
   if (!row) return;
@@ -10985,7 +10985,7 @@ function setWorkbenchPhase(phase, persist) {
     saveSettings();
   }
   applyWorkbenchGates();
-  renderWorkbenchChips();   // the chips' current-phase marker follows
+  renderWorkbenchRail();   // readiness and current phase share one authority
   // entering a phase refreshes its panes, as its old tab switch did
   if (phase === "record") renderBuildEditor();
   else if (phase === "source") {
@@ -11117,38 +11117,46 @@ function wbReadiness(b) {
   return r;
 }
 
-function renderWorkbenchChips() {
-  const host = el("wb-chips");
-  if (!host) return;
+function renderWorkbenchRail() {
   const b = currentBuild();
-  if (!b) { host.innerHTML = ""; return; }
-  const r = wbReadiness(b);
-  // the chips are the fastest phase navigation but read as pure status:
-  // the tooltip names the destination, and the first unfinished phase
-  // carries a quiet "next" underline so "what now?" resolves at a glance
-  const next = WB_PHASES.find((p) => {
+  const r = b ? wbReadiness(b) : {};
+  // The rail is both navigation and readiness. Keeping those signals on the
+  // same five buttons avoids a duplicate header row that clipped at narrower
+  // widths and made it unclear which phase control was authoritative.
+  const next = b && WB_PHASES.find((p) => {
     const s = (r[p] || {}).state;
     return s === "todo" || s === "warn";
   });
   const cur = wbActivePhase();
-  host.innerHTML = WB_PHASES.map((p) => {
-    const c = r[p] || { state: "todo", note: "" };
+  for (const btn of document.querySelectorAll("#wb-rail .wb-phase-btn")) {
+    const p = btn.dataset.phase;
+    const c = r[p] || null;
     const label = p[0].toUpperCase() + p.slice(1);
-    const tip = c.note ? `${c.note} — open ${label}` : `Open ${label}`;
-    return `<button class="wb-chip ${c.state}${p === next ? " next" : ""}${
-      p === cur ? " cur" : ""}" type="button" data-phase="${p}" ` +
-      `data-tip="${esc(tip)}">${label}${c.badge ? ` ${c.badge}` : ""}</button>`;
-  }).join("");
+    if (!btn.dataset.phaseTip) btn.dataset.phaseTip = btn.dataset.tip || `Open ${label}`;
+    for (const stateName of ["ok", "warn", "todo"]) {
+      btn.classList.toggle(stateName, !!c && c.state === stateName);
+    }
+    btn.classList.toggle("next", p === next);
+    if (p === cur) btn.setAttribute("aria-current", "step");
+    else btn.removeAttribute("aria-current");
+    const badge = c && c.badge ? String(c.badge) : "";
+    btn.innerHTML = label + (badge
+      ? `<span class="wb-phase-badge" aria-hidden="true">${badge}</span>`
+      : "");
+    const tip = c && c.note ? `${label}: ${c.note}` : btn.dataset.phaseTip;
+    btn.dataset.tip = tip;
+    btn.setAttribute("aria-label", tip);
+  }
 }
 
-// head + chips + gates: everything that tracks the shared selection
+// head + rail readiness + gates: everything that tracks the shared selection
 function renderWorkbench() {
   const b = currentBuild();
   el("wb-title").textContent = b ? (b.title || "(untitled)") : "No book selected";
   el("wb-sub").textContent = b
     ? `${b.authors || ""}${b.authors && b.year ? " · " : ""}${b.year || ""}`
     : "";
-  renderWorkbenchChips();
+  renderWorkbenchRail();
   applyWorkbenchGates();
 }
 
@@ -11198,11 +11206,6 @@ function initWorkbench() {
   for (const btn of document.querySelectorAll("#wb-rail .wb-phase-btn")) {
     btn.addEventListener("click", () => setWorkbenchPhase(btn.dataset.phase, true));
   }
-  // a readiness chip is also a jump to its phase
-  el("wb-chips").addEventListener("click", (ev) => {
-    const chip = ev.target.closest("[data-phase]");
-    if (chip) setWorkbenchPhase(chip.dataset.phase, true);
-  });
   el("wb-jobs-toggle").addEventListener("click", () =>
     setJobsDrawer(el("wb-jobs-body").hidden, true));
   setJobsDrawer(!!state.settings.jobsDrawerOpen, false);
@@ -11420,7 +11423,7 @@ async function anStartJob(path, body, label, btn) {
     if (!res.ok || !data.ok) {
       if (btn) btn.disabled = false;
       el("an-msg").textContent = data.error || "failed";
-      statusErr(`ANALYZE :: ${(data.error || "FAILED").toUpperCase()}`);
+      statusErr(`WORKBENCH :: ${(data.error || "FAILED").toUpperCase()}`);
       return null;
     }
     const build = state.builds[body.build_id] || {};
@@ -11433,7 +11436,7 @@ async function anStartJob(path, body, label, btn) {
       status: "Starting...", at: new Date().toLocaleTimeString(), finished: false,
     });
     el("an-msg").textContent = `${label} — starting…`;
-    status(`ANALYZE :: ${label.toUpperCase()} STARTED`);
+    status(`WORKBENCH :: ${label.toUpperCase()} STARTED`);
     renderOcrQueue();
     decorateAnFacsimile();
     anEnsurePolling();
@@ -11466,7 +11469,7 @@ function anEnsurePolling() {
         ? `Running - ${job.done}/${job.total}` : String(job.status || "Running");
       meta.pages = job.pages || meta.pages;
       meta.artifact = job.artifact || meta.artifact;
-      status(`ANALYZE :: ${meta.kind.toUpperCase()} :: ${job.done}/${job.total} (${pct}%)` +
+      status(`WORKBENCH :: ${meta.kind.toUpperCase()} :: ${job.done}/${job.total} (${pct}%)` +
         (job.errors ? ` :: ${job.errors} ERRORS` : ""));
       // in-pane progress (only while the user is on that entry)
       if (state.anSel === meta.buildId && !job.status.startsWith("done") &&
@@ -11482,10 +11485,10 @@ function anEnsurePolling() {
           : `${job.status}${job.note ? ` - ${job.note}` : ""}`;
         if (meta.btn) meta.btn.disabled = false;
         if (job.status === "error") {
-          statusErr(`ANALYZE :: ${meta.kind.toUpperCase()} FAILED :: ${job.error}`);
+          statusErr(`WORKBENCH :: ${meta.kind.toUpperCase()} FAILED :: ${job.error}`);
           if (state.anSel === meta.buildId) el("an-msg").textContent = job.error;
         } else {
-          status(`ANALYZE :: ${meta.kind.toUpperCase()} ${job.status.toUpperCase()}` +
+          status(`WORKBENCH :: ${meta.kind.toUpperCase()} ${job.status.toUpperCase()}` +
             (job.note ? ` :: ${job.note}` : ""));
           if (["relevance", "summarize", "about"].includes(meta.kind)) {
             await loadBuilds();
@@ -13536,6 +13539,9 @@ function setOcrSideCollapsed(on, persist) {
     btn.dataset.tip = collapsed
       ? "Expand the entries & artifacts sidebar"
       : "Collapse the entries & artifacts sidebar";
+    btn.setAttribute("aria-label", collapsed
+      ? "Expand the entries and artifacts sidebar"
+      : "Collapse the entries and artifacts sidebar");
   }
   if (persist) { state.settings.wbSideCollapsed = collapsed; saveSettings(); }
 }
@@ -14569,7 +14575,7 @@ function renderUpload() {
         ? `<a href="${esc(s.url)}" target="_blank" rel="noopener" data-tip="${esc(s.url)}">${esc(s.matched_title) || "(record)"}</a>`
         : esc(s.matched_title)}</td>
       <td class="col-whl">${st === "done" ? badge("approved", "DONE", { tip: "The entry built from this source is verified" })
-          : st === "draft" ? badge("upload", BICONS.pencil, { tip: "An entry built from this source is in the editor" })
+          : st === "draft" ? badge("upload", BICONS.pencil, { tip: "This source has a draft entry in Workbench" })
           : ""}</td>
       <td class="col-act"><button class="cad-btn tiny icon-btn" data-build-src="${i}"
         data-tip="Build a catalog entry prefilled from this source">${ICONS.docplus}</button></td>`;
@@ -14598,7 +14604,7 @@ function sourceBuildStatus(s) {
 }
 
 const SRC_STATUS_LABELS = [
-  ["unstarted", "Unstarted"], ["draft", "Draft (in the editor)"],
+  ["unstarted", "Unstarted"], ["draft", "Draft (in Workbench)"],
   ["done", "Done (entry verified)"],
 ];
 
@@ -14755,6 +14761,9 @@ function appendBuildListItem(list, b, grouped) {
       (ready ? " ready" : "") + (b.attention ? " attention" : "") +
       (grouped ? " volume-member" : "");
     li.dataset.bid = b.id;
+    li.tabIndex = 0;
+    li.setAttribute("role", "button");
+    if (b.id === state.buildSel) li.setAttribute("aria-current", "true");
     li.dataset.tip = `${b.title || "(untitled)"}\n` +
       `${b.authors ? "Authors: " + b.authors + "\n" : ""}` +
       `${b.year ? "Year: " + b.year + "\n" : ""}` +
@@ -15800,7 +15809,9 @@ function renderOcrBooks() {
   list.innerHTML = "";
   document.querySelectorAll("#builds-tabs .pane-tab").forEach((t) =>
     t.classList.toggle("active", t.dataset.bstab === buildsTab()));
-  el("ocr-filter-verified").classList.toggle("active", ocrState.verifiedOnly);
+  const verifiedFilter = el("ocr-filter-verified");
+  verifiedFilter.classList.toggle("active", ocrState.verifiedOnly);
+  verifiedFilter.setAttribute("aria-pressed", String(ocrState.verifiedOnly));
   const builds = buildsSorted().filter((b) =>
     !ocrState.verifiedOnly || anAnalyzable(b));
   el("ocr-books-empty").hidden = builds.length !== 0;
@@ -15811,6 +15822,10 @@ function renderOcrBooks() {
       const li = document.createElement("li");
       li.className = "build-group";
       li.dataset.gid = item.id;
+      li.tabIndex = 0;
+      li.setAttribute("role", "button");
+      li.setAttribute("aria-expanded", String(item.expanded));
+      li.setAttribute("aria-label", `${item.expanded ? "Collapse" : "Expand"} ${item.title}`);
       li.innerHTML = `<span class="bi-row"><span class="bi-title">${
         item.expanded ? "&#9662;" : "&#9656;"} ${esc(item.title)}</span></span>
         <span class="bi-meta">${item.total} volume${item.total === 1 ? "" : "s"}${
@@ -15896,7 +15911,7 @@ async function selectOcrBook(bid) {
     renderOcrTab();
     renderAnList();
     renderAnMain();
-    renderWorkbench();   // the folder manifest feeds the readiness chips
+    renderWorkbench();   // the folder manifest feeds readiness on the rail
     status(folder.ocr.length
       ? `Loaded ${folder.ocr.length} OCR file(s)`
       : "No OCR files for this book yet (attach a PDF in the Source phase)");
@@ -16444,7 +16459,7 @@ async function renderOcrPages() {
   // numbers pointed at the previous scan (Delete would hit the wrong file)
   if (ocrState.pagesPdf !== pdf && ocrState.pageSel.size) clearOcrPageSel();
   if (!pdf) {
-    box.innerHTML = `<p class="empty">No PDF for this document — attach one in the Editor tab</p>`;
+    box.innerHTML = `<p class="empty">No PDF for this document — attach one in the Workbench Source phase</p>`;
     ocrState.pagesPdf = "";
     return;
   }
@@ -17735,7 +17750,7 @@ function pollOcrJobs() {
             // when the news matters; say where the work goes next
             status(`OCR COMPLETE :: ${j.book} — review in Text`);
             el("ocr-msg").textContent = "OCR complete — review the text";
-            renderWorkbenchChips();   // the Text chip flips to Needs review
+            renderWorkbenchRail();   // Text readiness flips to Needs review
           }
           // finished pages (ok or errored) are no longer running
           for (const x of job.pages) {
@@ -19557,6 +19572,13 @@ function initOcrTab() {
     const li = ev.target.closest("li.build-item");
     if (li) selectWorkbenchBook(li.dataset.bid);
   });
+  el("ocr-books").addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter" && ev.key !== " ") return;
+    const row = ev.target.closest("li.build-group, li.build-item");
+    if (!row) return;
+    ev.preventDefault();
+    row.click();
+  });
   el("ocr-docs").addEventListener("click", (ev) => {
     // tree chrome first: extract-text action, then node collapse/expand
     const ex = ev.target.closest("button.src-extract");
@@ -20525,7 +20547,7 @@ function init() {
       // Ctrl+click: open the record in the EDIT tab instead of adding it
       if (rec._src === "ch") openChEditTab(rec._idx);
       else if (rec._src === "whl") openWhlEditTab(rec._idx);
-      else status("OPEN LIBRARY ROWS HAVE NO EDITOR — click to add instead");
+      else status("OPEN LIBRARY ROWS MUST BE ADDED BEFORE EDITING");
       return;
     }
     addToTop(rec);
@@ -20724,15 +20746,14 @@ function init() {
   document.getElementById("workbench").addEventListener("click", (ev) => {
     if (ev.target.closest(".wb-verify-here")) setVerified(true);
   });
-  // three doors to the same blank entry: the activity bar (muscle memory),
-  // the book-list bar (next to the list it feeds), and the empty state
+  // Two doors to the same blank entry: the activity bar for repeat use and
+  // the empty-state prompt for first use. A third copy in the narrow list bar
+  // clipped its collapse control without adding a distinct path.
   const newBlankEntry = () => {
     setWorkbenchPhase("record", false);   // the blank form is the next step
     createBuild({}, "(blank)");
   };
   el("build-new").addEventListener("click", newBlankEntry);
-  const sideNew = el("build-new-side");
-  if (sideNew) sideNew.addEventListener("click", newBlankEntry);
   const emptyNew = el("build-new-empty");
   if (emptyNew) emptyNew.addEventListener("click", newBlankEntry);
   el("export-builds").addEventListener("click", exportBuilds);

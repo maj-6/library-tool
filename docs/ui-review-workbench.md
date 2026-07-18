@@ -7,6 +7,16 @@ icon-conversion work landed. 35 raw findings deduplicated to 24.
 Line anchors reference `tools/whl_explorer/` (index.html = templates/,
 app.js + style.css = static/).
 
+**Follow-up, 2026-07-18:** the duplicate readiness-chip navigator has been
+retired. Readiness, badges, current phase, and the suggested next phase now
+live on the existing phase rail. The redundant New-entry icon was also removed
+from the fixed-width book-list bar; New entry remains in the activity bar and
+the empty-state prompt. Together these changes remove both clipped button rows
+without removing a distinct action. The same pass made book rows keyboard
+operable, named the narrow-sidebar controls for assistive technology, and
+updated setup and status copy that still routed people to the retired Editor
+and Analyze tabs.
+
 ## Verdict
 
 The Workbench's core geometry is right: books on the left, work in the

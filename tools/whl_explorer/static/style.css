@@ -3140,6 +3140,11 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   color: var(--ink-light);
 }
 .build-item:hover { background: var(--row-hover); }
+.build-item:focus-visible,
+.build-group:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: -2px;
+}
 .build-item.active {
   background: var(--row-checked);
   box-shadow: inset 3px 0 0 var(--cyan);
@@ -3795,6 +3800,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   padding-top: 28px;
 }
 .wb-phase-btn {
+  --wb-ready-color: transparent;
   font-family: var(--ui);
   font-size: 11px;
   letter-spacing: 1px;
@@ -3806,6 +3812,8 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   border-radius: var(--radius);
   cursor: pointer;
   white-space: nowrap;
+  position: relative;
+  box-shadow: inset 2px 0 0 var(--wb-ready-color);
 }
 .wb-phase-btn:hover { background: var(--row-hover); }
 .wb-phase-btn.active {
@@ -3813,6 +3821,33 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   border-color: var(--face-sh);
   color: var(--blue);
   font-weight: bold;
+}
+.wb-phase-btn.ok { --wb-ready-color: var(--green); }
+.wb-phase-btn.warn { --wb-ready-color: var(--amber); }
+.wb-phase-btn.todo { --wb-ready-color: var(--ink-mut); }
+.wb-phase-btn.todo:not(.active):not(.next) { opacity: 0.58; }
+/* The first unfinished phase is the next suggested stop. On a vertical rail,
+   a bottom rule stays distinct from the readiness line at the left edge. */
+.wb-phase-btn.next {
+  box-shadow: inset 2px 0 0 var(--wb-ready-color), inset 0 -2px 0 var(--blue);
+  opacity: 1;
+}
+.wb-phase-badge {
+  position: absolute;
+  top: -3px;
+  right: 2px;
+  min-width: 13px;
+  height: 13px;
+  padding: 0 3px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: var(--amber);
+  color: var(--face);
+  font-size: 8px;
+  line-height: 1;
+  letter-spacing: 0;
 }
 #wb-main {
   flex: 1;
@@ -3825,29 +3860,6 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 #wb-head { flex: none; }
 #wb-title { font-weight: bold; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #wb-sub { flex: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 30%; }
-/* per-phase readiness: tiny bordered chips, click jumps to the phase */
-#wb-chips { display: inline-flex; gap: 4px; }
-.wb-chip {
-  font-family: var(--ui);
-  font-size: 10px;
-  letter-spacing: 0.5px;
-  padding: 0 6px;
-  color: var(--ink-light);
-  background: transparent;
-  border: var(--border-w, 1px) solid var(--face-sh);
-  border-radius: var(--radius);
-  cursor: pointer;
-  white-space: nowrap;
-}
-.wb-chip:hover { background: var(--row-hover); text-decoration: underline; }
-.wb-chip.ok { color: var(--green); border-color: currentColor; }
-.wb-chip.warn { color: var(--amber); border-color: currentColor; }
-.wb-chip.todo { opacity: 0.55; }
-/* quiet pipeline cues, per the under-styling rule: the current phase is a
-   filled chip, the first unfinished phase carries a thin "go here next"
-   underline (and escapes the todo dim so the cue stays visible) */
-.wb-chip.cur { background: var(--row-hover); }
-.wb-chip.next { box-shadow: inset 0 -2px 0 var(--blue); opacity: 1; }
 /* the locked-phase note carries its own unlock */
 .empty .wb-verify-here { margin-left: 8px; vertical-align: middle; }
 .build-empty .cad-btn { vertical-align: middle; margin: 0 2px; }
