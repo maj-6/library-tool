@@ -32,7 +32,7 @@
           <div class="menu-sep"></div>
           <button class="menu-item" data-cmd="categories" type="button">Categories&hellip;</button>
           <div class="menu-sep"></div>
-          <button class="menu-item" data-cmd="settings" type="button">Preferences&hellip;<span class="menu-key">Ctrl+,</span></button>
+          <button class="menu-item" data-cmd="settings" type="button">Settings&hellip;<span class="menu-key">Ctrl+,</span></button>
         </div>
       </div>
       <div class="menu">
@@ -234,7 +234,8 @@
 
           <div id="pane-info" class="pane-sub active">
             <div id="info-body" class="info-body">
-              <div class="info-empty">Select a row to see its details.</div>
+              <div class="info-empty">Select a row to see its details — click a cell,
+                or Ctrl+click to open the editor.</div>
             </div>
           </div>
 
@@ -1394,7 +1395,7 @@
             <button id="rw-clip" class="cad-btn tiny" type="button" disabled
                     data-tip="Replace this region's diplomatic text with the word boxes inside it (Tesseract/Textract or the PDF text layer)">Clip words</button>
             <button id="rw-rework" class="cad-btn tiny" type="button" hidden
-                    data-tip="Rework this figure through the configured image model (Settings > OCR & AI) — the generated art saves beside the original, the preview prefers it, and the original is never touched">Rework art</button>
+                    data-tip="Rework this figure through the configured image model (key in Settings &gt; Credentials) — the generated art saves beside the original, the preview prefers it, and the original is never touched">Rework art</button>
           </div>
           <textarea id="rw-text" class="cad-input" spellcheck="false" disabled
                     placeholder="Select a region"></textarea>
@@ -1414,7 +1415,9 @@
         <aside id="publish-side" aria-label="Published books">
           <div class="pane-bar publish-side-bar">
             <button id="publish-side-toggle" class="cad-btn tiny" type="button"
-                    aria-expanded="true" data-tip="Collapse published books sidebar">&#9664;</button>
+                    aria-expanded="true" aria-controls="publish-side"
+                    aria-label="Collapse the published books sidebar"
+                    data-tip="Collapse the published books sidebar">&#9664;</button>
             <label class="tool-label" for="publish-group">Group by</label>
             <select id="publish-group" class="cad-input">
               <option value="sets">Book / set</option>
@@ -2052,10 +2055,11 @@
               button. The same digit untags.</p>
           </div>
           <div id="sec-integrations" class="settings-sec">
-            <div class="settings-head">Google Sheets</div>
+            <div class="settings-head">Integrations</div>
+            <div class="settings-subhead">Google Sheets</div>
             <p class="settings-note">Publishes the master list (plus manual entries) to a Google
-              Sheet — always triggered manually (Tools &gt; Sync master list). Requires a Google
-              service-account JSON key; not verified yet (no credentials).</p>
+              Sheet — always triggered manually (File &gt; Sync master list to Google Sheets).
+              Requires a Google service-account JSON key; not verified yet (no credentials).</p>
             <div class="settings-rows">
               <label class="tool-label" for="set-gs-sheet-id">Spreadsheet ID</label>
               <input id="set-gs-sheet-id" class="cad-input" spellcheck="false" />
@@ -2064,7 +2068,7 @@
                      placeholder="Master list" />
             </div>
 
-            <div class="settings-head" style="margin-top:16px">Search databases</div>
+            <div class="settings-subhead" style="margin-top:16px">Search databases</div>
             <p class="settings-note">Search is <b>local-first</b>: a database already in the
               database folder (shown below, in your home directory) is used offline — no download,
               no URL. Have copies (say, on a flash drive)? Open the folder, drop them in, and reopen
@@ -2085,7 +2089,7 @@
               <span class="tool-label" id="db-status-msg"></span>
             </div>
 
-            <div class="settings-head" style="margin-top:16px">Phone capture (Supabase)</div>
+            <div class="settings-subhead" style="margin-top:16px">Phone capture (Supabase)</div>
             <p class="settings-note">Phone photos land here; syncing runs the pipeline and files
               each capture as a manual entry. Sign in on the phone and desktop; the same account
               works automatically, and linked contributor accounts are also supported. The
@@ -2120,6 +2124,7 @@
             <p class="settings-note">Optional service credentials. A Library Tool account
               uses the built-in public cloud configuration and never needs an owner key.
               Mistral follows your signed-in profile; other provider keys stay on this machine.</p>
+            <p id="cred-note" class="settings-note cred-note" role="status" hidden></p>
             <div class="settings-subhead">AI (Knowledge)</div>
             <div class="settings-rows">
               <label class="tool-label" for="set-ai-key">DeepSeek / AI provider API key</label>

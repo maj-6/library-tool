@@ -837,6 +837,16 @@ body {
    Editable fields and the OCR / facsimile transcription panes keep native
    selection so scanned/transcribed text can still be selected and copied. */
 body { user-select: none; -webkit-user-select: none; }
+/* Two softer ink tiers, DERIVED from --ink-mut. Declared on BODY, not :root:
+   a custom property is substituted where it is DECLARED, and every theme sets
+   --ink-mut/--face on body[data-theme] — so deriving these in :root (= html)
+   would freeze them at the default palette and leave them illegible on the
+   dark themes. Process mode used both tokens before either was declared, so
+   those colours were dropped as invalid and its reading order rendered flat. */
+body {
+  --ink-soft: var(--ink-mut);
+  --ink-faint: color-mix(in srgb, var(--ink-mut) 65%, var(--face));
+}
 input, textarea, [contenteditable="true"], .cell-edit,
 .an-text, .ocr-pglayout, .ppub-record-page, #con-lines {
   user-select: text;
@@ -971,12 +981,10 @@ input, textarea, [contenteditable="true"], .cell-edit,
   color: var(--ink);
   cursor: pointer;
 }
-.home-row:hover .hr-l { color: var(--cyan); }
-/* a zero count is a status fact, not a destination: keep the text, drop the
-   click affordance so it can't lead into an empty tab */
-.home-row-empty { cursor: default; color: var(--face-sh2); }
-.home-row-empty .hr-n { color: var(--face-sh2); font-weight: normal; }
-.home-row-empty:hover .hr-l { color: var(--face-sh2); }
+.home-row:hover:not(:disabled) .hr-l { color: var(--cyan); }
+/* a caught-up (zero) metric is a dead end, not a destination */
+.home-row:disabled { cursor: default; opacity: 0.55; }
+.home-row:focus-visible { outline: 2px solid var(--cyan); outline-offset: -2px; }
 .hr-n { flex: 0 0 auto; min-width: 22px; text-align: right; font-family: var(--mono); font-weight: bold; }
 .hr-l { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hr-d { flex: 0 0 auto; margin-left: auto; color: var(--ink-mut); font-size: 10.5px; white-space: nowrap; }
@@ -1031,8 +1039,17 @@ input, textarea, [contenteditable="true"], .cell-edit,
   gap: 6px;
   padding: 3px 2px;
   font-size: 12px;
+  /* keep the row separator: a blanket border:0 button reset would wipe the
+     whole feed's rules. Only the box/typography defaults are neutralised. */
+  border: 0;
   border-bottom: var(--border-w, 1px) solid var(--canvas-line);
+  width: 100%;
+  text-align: left;
+  background: none;
+  font-family: inherit;
+  color: inherit;
 }
+.home-act:focus-visible { outline: 2px solid var(--cyan); outline-offset: -2px; }
 .home-act:last-child { border-bottom: 0; }
 .home-who { font-weight: bold; color: var(--ink); white-space: nowrap; }
 /* the phrase never shrinks (a clipped verb is unreadable); the item name below
@@ -1145,6 +1162,10 @@ button.ri-label:focus-visible { outline: 2px solid var(--blue); outline-offset: 
 }
 .uchip:hover { background: color-mix(in srgb, var(--uav-c) 22%, transparent); }
 .uchip:focus-visible { outline: 2px solid var(--uav-c); outline-offset: 1px; }
+/* the inert variant sits inside an already-clickable row, so it neither claims
+   its own hover nor fights the row's cursor */
+.uchip-plain { cursor: inherit; }
+.uchip-plain:hover { background: color-mix(in srgb, var(--uav-c) 12%, transparent); }
 .uchip .uav { vertical-align: middle; }
 .uchip-name {
   min-width: 0;
@@ -2041,7 +2062,11 @@ body .cad-btn.primary.danger {
 .mf-actions > .cad-btn[hidden],
 .ctl-join > .cad-btn[hidden],
 .bar-cluster > .cad-btn[hidden],
-.bar-cluster > select.cad-input[hidden] {
+.bar-cluster > select.cad-input[hidden],
+/* same trap one level up: these wrappers set their own display, so the UA's
+   [hidden] loses and the whole cluster stays on screen in views it can't act on */
+.ocr-pagenav[hidden],
+.bar-cluster[hidden] {
   display: none;
 }
 
@@ -3664,6 +3689,10 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   opacity: 0.85;
   margin: 0 0 10px;
 }
+/* a credential that did not reach the store, and the field that holds it */
+.cred-note { color: var(--red); opacity: 1; }
+.cred-note[hidden] { display: none; }
+.cad-input.cred-bad { border-color: var(--red); }
 .settings-rows {
   display: grid;
   grid-template-columns: auto 1fr;

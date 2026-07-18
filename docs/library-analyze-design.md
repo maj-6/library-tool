@@ -1,9 +1,10 @@
 # The library view, categories, and the Analyze tab
 
 Design contract for three features that land together. Frozen 2026-07-10;
-the schema half lives in `docs/cloud/migrations/` (taxonomy, volume_texts,
-volume_pages, volume_notes, volumes.category_paths + volumes.assets).
-
+touched up 2026-07-15 to match the code as built (marked *as built* where
+the shape changed). The schema half lives in `docs/cloud/migrations/`
+(taxonomy, volume_texts, volume_pages, volume_notes,
+author_pages/author_index, volumes.category_paths + volumes.assets).
 ## 1. Categories: a hierarchical taxonomy
 
 The comma-separated `categories` text fields (and the WHL rows' scraped
@@ -54,14 +55,20 @@ within a path, ", " between) so fts search keeps working.
 
 A new top-level tab, AI-driven, DeepSeek by default. It operates on **builds**
 opened from the Editor, and only builds whose status is `ready` or `uploaded`
-("verified"); drafts are listed but locked with an explanation.
+("verified"); drafts are hidden (the book list's verified-only filter, on by
+default), not shown locked. *As built* it did not become an extra tab: it
+merged with the former OCR tab into one top-level **Analyze** tab whose
+workspace switches between **Document** (the OCR facsimile and page staging)
+and **Analysis** (the AI panel described here), sharing one book list.
 
-**Provider**: the existing Settings → AI section (base URL / model / key /
-instructions) is the provider config. When base or model are blank the app
-uses `https://api.deepseek.com` and `deepseek-chat` — so pasting a DeepSeek
-key is the whole setup. All Analyze calls go server-side (`_ai_chat()`,
-urllib, OpenAI-compatible `/chat/completions`, credentials read via
-`_client_settings()` so background jobs survive the client closing).
+**Provider**: the existing Settings → AI section (base URL / model /
+instructions, plus optional temperature/timeout settings overriding the
+per-call defaults) plus the API key under Settings → Credentials is the
+provider config. When base or model are blank the
+app uses `https://api.deepseek.com` and `deepseek-chat` — so pasting a
+DeepSeek key is the whole setup. All Analyze calls go server-side
+(`_ai_chat()`, urllib, OpenAI-compatible `/chat/completions`, credentials
+read via `_client_settings()` so background jobs survive the client closing).
 
 **Artifacts** live in the entry folder (the established per-book bundle,
 mirrored to R2 by store_sync):
@@ -69,30 +76,43 @@ mirrored to R2 by store_sync):
 ```
 output/entries/<build_id>/
   about.md               the About article (Markdown, hand-edited or AI-seeded)
-  summary.md             working summary (internal)
+  summary.md             working summary
   annotations.json       {"version":1,"notes":[{id,page,quote,kind,body,
                           status:"suggested|approved|rejected",source,
                           created_at,updated_at}]}
+  analysis/page-analysis-<pages>-<job>.md
+                         per-page analyses ("Analyze pages" below)
   translations/<lang>.txt page-aligned, "--- page N ---" markers (the OCR
                           docs' exact convention, so the same parser reads it)
 ```
+
+Summarize and the About save both mirror their text into the build's Editor
+Description — the public catalog description in the volumes row — so Analyze
+output publishes without a second copy/paste step. The summary is a seed for
+public metadata, not an internal note; only relevance stays internal.
 
 **Operations** (long ones follow the OCR-job pattern — in-memory job dict,
 daemon thread, `GET /api/analyze/job/<id>` polling):
 
 - Summarize: map-reduce over the page sections of the build's OCR text
   (chunked to the model's context), writes `summary.md`.
+- Analyze pages: staged analysis of selected OCR pages (`POST
+  /api/analyze/pages`), one AI pass per chunk, saved to
+  `analysis/page-analysis-<pages>-<job>.md` in the entry folder.
 - About draft: writes `about.md` from summary + metadata; editable in a
   Markdown editor in the tab.
 - Suggest categories: metadata + summary + the current taxonomy → suggested
   paths (existing or new), each accept-able; "auto-assign" applies all
   existing-path suggestions.
-- Translate: per-page over the OCR text into `translations/<lang>.txt`.
+- Translate: per-page over the OCR text into `translations/<lang>.txt`;
+  saves as it goes and only translates still-untranslated pages, so an
+  interrupted job resumes on re-run.
 - Annotate: per-chunk pass proposing anchored notes (page + short quote +
   note); they arrive as `suggested` and are curated (approve/reject/edit) in
   a grid.
-- Relevance: scores the work against the custom criteria in Settings →
-  Analyze (`settings.relevanceCriteria = [{id,name,description}]`), writes
+- Relevance: scores the work against the custom criteria edited in the
+  Analyze tab's Relevance pane
+  (`settings.relevanceCriteria = [{id,name,description}]`), writes
   `build.relevance = {assessed_at, model, overall, criteria:[{id,name,score,
   rationale}]}`. **Internal only**: `relevance` never enters `_volume_row`,
   so it never reaches the anon-readable volumes table (it still syncs
@@ -110,7 +130,7 @@ about → `volume_texts`; original text pages (`pages_text`) and translations �
 
 The Library is a **separate design** from the About/Docs/Downloads pages — a
 serious archival catalogue (`library.css`; the marketing pages keep
-`site.css`). Three pages:
+`site.css`). Four pages:
 
 - `browse.html` — faceted catalogue: search, category facets (built from
   `volumes?select=slug,category_paths,language,year`), year range, language,
@@ -125,6 +145,11 @@ serious archival catalogue (`library.css`; the marketing pages keep
   HTTP Range from R2/Supabase; thumbnails, zoom/fit, keyboard nav, remembered
   position per slug; margin annotations from `volume_notes`; a page-aligned
   text/translation panel from `volume_pages`.
+- `author.html?author=…` — the author page (*as built*, after the freeze):
+  works grouped on the exact `volumes.authors` string (messy free text —
+  never split on delimiters) plus an optional curated bio from
+  `author_pages`; the `author_index` view (name + work count) feeds author
+  suggestions.
 
 Category filtering uses the flat text rendering:
 `categories=ilike.*<path text>*` — because a child path's text begins with
@@ -137,7 +162,9 @@ by a minimal, escaping-first renderer (no raw HTML pass-through).
 ## What stays private
 
 anon can read: volumes (+ category_paths, assets), volume_texts,
-volume_pages, volume_notes, releases. Everything else — taxonomy, builds
-(including `relevance` and `bundle`), books, ia_catalog, corrections,
-captures — is service_role only. The rule of thumb: *if it isn't in the
-bundle, it doesn't leave the desk.*
+volume_pages, volume_notes, author_pages (+ the author_index view),
+releases. Everything else — taxonomy, builds (including `relevance` and
+`bundle`), books, ia_catalog, corrections — is service_role only; captures
+is writable by signed-in apps but RLS-scoped to its owner, so it is still
+never anon-readable.
+The rule of thumb: *if it isn't in the bundle, it doesn't leave the desk.*

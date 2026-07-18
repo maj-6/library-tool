@@ -19,18 +19,23 @@ port), so the link must land on the **public website** instead.
   - `https://maj-6.github.io/library-tool/confirmed.html`
   - `https://maj-6.github.io/library-tool/**`
 
-The app already sends `redirect_to = …/confirmed.html` at signup
+The desktop already sends `redirect_to = …/confirmed.html` at signup
 (`tools/cloud_defaults.py` → `WEBSITE_URL`); GoTrue honours it only when it
-matches an allow-listed Redirect URL, otherwise it falls back to the Site URL.
-Setting **both** means the link works whichever path GoTrue takes.
+matches an allow-listed Redirect URL, otherwise it falls back to the Site
+URL. Book Capture sends no `redirect_to` at all, so links for phone-created
+accounts always land on the Site URL. Setting **both** fields means the link
+works whichever path GoTrue takes.
 
 `confirmed.html` (in `website/`) just tells the user the account is ready and
 to return to the app and sign in — the desktop holds its own session, so the
 browser can't hand it one. It also detects an expired/invalid link and says so.
 
 > Fork pointing at your own project + site? Set the same two fields to your
-> site, and put your site's base in **Settings → Sync → Cloud site URL**
-> (`cloudSiteUrl`) so signup redirects there.
+> site, and set `cloudSiteUrl` to your site's base so signup redirects
+> there. There's no Settings field for it yet — add the key to the
+> `settings` map in `DATA_ROOT/output/client_state.json`. (Your project's
+> URL and public key go in **Settings → Integrations → Phone capture
+> (Supabase)** and **Settings → Credentials**.)
 
 ## 2. Project-specific email copy
 
