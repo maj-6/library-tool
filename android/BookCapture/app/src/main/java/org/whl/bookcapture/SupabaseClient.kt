@@ -14,15 +14,23 @@ import java.net.URL
  * account's — row-level security does the rest (captures_insert_own,
  * captures bucket policies). The service_role key never touches the phone.
  */
-class SupabaseClient(private val ctx: Context) {
+class SupabaseClient(
+    private val ctx: Context,
+    expectedUserId: String? = null,
+) {
 
     class HttpException(val code: Int, message: String) : IOException(message)
     class SignedOut : IOException("signed out")
+    class AccountChanged : IOException("account changed during delivery")
 
     private val baseUrl = Prefs.supabaseUrl(ctx)
+    private val ownerId = expectedUserId?.trim().orEmpty().ifEmpty { Prefs.userId(ctx) }
+    private val contributor = Prefs.displayName(ctx).ifEmpty { Prefs.email(ctx) }
 
     private fun open(method: String, url: String, contentType: String?): HttpURLConnection {
+        if (ownerId.isEmpty() || Prefs.userId(ctx) != ownerId) throw AccountChanged()
         val token = Auth.accessToken(ctx) ?: throw SignedOut()
+        if (Prefs.userId(ctx) != ownerId) throw AccountChanged()
         val conn = URL(url).openConnection() as HttpURLConnection
         conn.requestMethod = method
         conn.connectTimeout = 20_000
@@ -63,8 +71,8 @@ class SupabaseClient(private val ctx: Context) {
             .put("status", "pending")
             .put("photos", JSONArray(photoPaths))
             .put("note", note)
-            .put("created_by", Prefs.userId(ctx))
-            .put("contributor", Prefs.displayName(ctx).ifEmpty { Prefs.email(ctx) })
+            .put("created_by", ownerId)
+            .put("contributor", contributor)
             .put("ocr", ocr)
             .put("meta", meta)
         if (createdAt.isNotEmpty()) body.put("created_at", createdAt)

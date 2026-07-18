@@ -6,9 +6,10 @@
     python3 tools/cloud_setup.py seed       publish local builds as volumes (metadata only)
     python3 tools/cloud_setup.py anon-key   print the website's config snippet
 
-Tables need DDL, and PostgREST cannot run DDL — paste docs/cloud/schema.sql into
-the Supabase SQL Editor once. Everything else this script does directly, because
-the Storage and REST APIs both accept the service_role key.
+Tables need DDL, and PostgREST cannot run DDL — paste the files under
+docs/cloud/migrations/ into the Supabase SQL Editor, in order; `check` names
+the pending ones. Everything else this script does directly, because the
+Storage and REST APIs both accept the service_role key.
 
 Credentials come from the desktop's settings (output/client_state.json), or from
 SUPABASE_URL / SUPABASE_KEY in the environment. They are never printed.
@@ -27,10 +28,19 @@ import cloud_defaults            # noqa: E402
 import libcommon as lib          # noqa: E402
 import supabase_sync as sb       # noqa: E402
 
-TABLES = ["captures", "books", "volumes", "releases", "profiles", "events",
-          "builds", "ia_catalog", "corrections", "taxonomy",
-          "volume_texts", "volume_pages", "volume_notes"]
+MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "docs" / "cloud" / "migrations"
+# The expected tables and their columns come out of the migrations' DDL
+# (expected_schema below) — one source of truth. Views are few enough to
+# name by hand: view -> the columns its consumers select.
+VIEWS = {"author_index": ["author", "work_count"]}
 BUCKETS = {"captures": False, "volumes": True}       # name -> public?
+# Role smoke tests: the website reads ANON_CAN with the anon key; ANON_CANNOT
+# holds user data behind revoked grants — an anon read succeeding on any of
+# them means the revoke/RLS blocks were not applied. passages is RPC-only by
+# design (docs/search-design.md D6): anon reaches it through search_passages,
+# never a table read.
+ANON_CAN = ["volumes", "volume_pages", "releases", "index_versions"]
+ANON_CANNOT = ["profiles", "events", "captures", "passages"]
 
 
 def config() -> dict:
@@ -58,12 +68,98 @@ def key_role(key: str) -> str:
         return "?"
 
 
-def existing_tables(cfg: dict) -> set[str]:
-    """PostgREST publishes an OpenAPI document naming every table it can see."""
+def migration_files() -> list[Path]:
+    """docs/cloud/migrations/*.sql, in apply order (NNN_ prefixes sort)."""
+    return sorted(MIGRATIONS_DIR.glob("*.sql"))
+
+
+_CREATE_RE = re.compile(r"^\s*create table if not exists (\w+)\s*\(")
+_ADD_RE = re.compile(r"^\s*alter table (\w+) add column (?:if not exists )?(\w+)")
+_DROP_RE = re.compile(r"^\s*alter table (\w+) drop column (?:if exists )?(\w+)")
+_IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]*")
+_CONSTRAINTS = {"primary", "unique", "check", "foreign", "constraint", "like"}
+
+
+def expected_schema(sql: str) -> dict[str, set[str]]:
+    """table -> columns, read straight out of the migrations' DDL.
+
+    Understands the schema conventions only: `create table if not exists`
+    blocks with one column per line, plus single-line
+    `alter table X add column [if not exists] C` / `drop column [if exists] C`
+    heads (the definition may continue on later lines).
+    """
+    tables: dict[str, set[str]] = {}
+    current: set[str] | None = None
+    depth = 0
+    for raw in sql.splitlines():
+        line = raw.split("--")[0].rstrip()
+        if current is None:
+            m = _CREATE_RE.match(line)
+            if m:
+                current = tables.setdefault(m.group(1), set())
+                depth = line.count("(") - line.count(")")
+                continue
+            m = _ADD_RE.match(line)
+            if m:
+                tables.setdefault(m.group(1), set()).add(m.group(2))
+                continue
+            m = _DROP_RE.match(line)
+            if m:
+                tables.setdefault(m.group(1), set()).discard(m.group(2))
+            continue
+        stripped = line.strip()
+        if stripped and depth == 1:
+            m = _IDENT_RE.match(stripped)
+            if m and m.group(0) not in _CONSTRAINTS:
+                current.add(m.group(0))
+        depth += line.count("(") - line.count(")")
+        if depth <= 0:
+            current = None
+    return tables
+
+
+def pending_migrations(local: list[str], applied: set[str]) -> list[str]:
+    """The migration ids not yet recorded on the project, in apply order."""
+    return [m for m in local if m not in applied]
+
+
+def openapi_definitions(cfg: dict) -> dict[str, set[str]]:
+    """PostgREST's OpenAPI document names every table and view it can see,
+    each with its columns under `properties`."""
     url, _, headers = sb._cfg(cfg)
     raw = sb._request("GET", f"{url}/rest/v1/", headers)
     spec = json.loads(raw.decode("utf-8", "replace"))
-    return set(spec.get("definitions", {}))
+    return {name: set(d.get("properties") or {})
+            for name, d in (spec.get("definitions") or {}).items()}
+
+
+def applied_migrations(cfg: dict) -> set[str] | None:
+    """Ids recorded in schema_migrations; None when the ledger is missing."""
+    try:
+        rows = sb._rest(cfg, "GET", "schema_migrations?select=id")
+    except sb.SyncError:
+        return None
+    return {r["id"] for r in rows or []}
+
+
+def anon_selects(cfg: dict, table: str) -> bool:
+    """Whether this (anon) credential can read the table at all."""
+    try:
+        sb._rest(cfg, "GET", f"{table}?select=*&limit=1")
+        return True
+    except sb.SyncError:
+        return False
+
+
+def anon_config(cfg: dict) -> dict | None:
+    """The anon-key twin of config(), for the role smoke tests."""
+    key = os.environ.get("SUPABASE_ANON_KEY", "")
+    if not key:
+        state = lib.load_json(lib.CLIENT_STATE_PATH, {}).get("settings", {})
+        key = str(state.get("supabaseAnonKey") or "")
+    if not key and cfg["url"] == cloud_defaults.SUPABASE_URL:
+        key = cloud_defaults.SUPABASE_ANON_KEY
+    return {"url": cfg["url"], "key": key} if key else None
 
 
 def existing_buckets(cfg: dict) -> dict[str, bool]:
@@ -79,40 +175,98 @@ def cmd_check(args) -> None:
     if key_role(cfg["key"]) != "service_role":
         print("  ! the desktop needs the service_role key, not the anon key")
 
+    bad: list[str] = []
     try:
-        tables = existing_tables(cfg)
+        live = openapi_definitions(cfg)
     except sb.SyncError as exc:
         sys.exit(f"cannot reach PostgREST: {exc}")
+    expected = expected_schema("\n".join(
+        p.read_text(encoding="utf-8") for p in migration_files()))
+
     print("\ntables")
-    missing = []
-    for t in TABLES:
-        ok = t in tables
-        missing += [] if ok else [t]
-        print(f"  {'ok  ' if ok else 'MISS'}  {t}")
+    for t in sorted(expected):
+        if t not in live:
+            bad.append(f"table {t} missing")
+            print(f"  MISS  {t}")
+        elif expected[t] - live[t]:
+            cols = ", ".join(sorted(expected[t] - live[t]))
+            bad.append(f"{t} lacks column(s): {cols}")
+            print(f"  COLS  {t}  missing: {cols}")
+        else:
+            print(f"  ok    {t}")
+
+    print("\nviews")
+    for v, want in VIEWS.items():
+        if v not in live:
+            bad.append(f"view {v} missing")
+            print(f"  MISS  {v}")
+        elif set(want) - live[v]:
+            cols = ", ".join(sorted(set(want) - live[v]))
+            bad.append(f"{v} lacks column(s): {cols}")
+            print(f"  COLS  {v}  missing: {cols}")
+        else:
+            print(f"  ok    {v}")
+
+    print("\nmigrations")
+    local = [p.stem for p in migration_files()]
+    applied = applied_migrations(cfg)
+    if applied is None:
+        pending = local
+        print("  no schema_migrations table — every migration is pending")
+    else:
+        pending = pending_migrations(local, applied)
+        for m in local:
+            print(f"  {'PEND' if m in pending else 'ok  '}  {m}")
+        unknown = sorted(applied - set(local))
+        if unknown:
+            print(f"  note: applied but not local: {', '.join(unknown)}")
+    if pending:
+        bad.append(f"{len(pending)} pending migration(s): {', '.join(pending)}")
 
     print("\nbuckets")
     try:
         buckets = existing_buckets(cfg)
     except sb.SyncError as exc:
         buckets = {}
+        bad.append(f"cannot list buckets: {exc}")
         print(f"  cannot list: {exc}")
     for name, public in BUCKETS.items():
         have = buckets.get(name)
         if have is None:
+            bad.append(f"bucket {name} missing")
             print(f"  MISS  {name}")
         elif have != public:
-            print(f"  WARN  {name}  public={have}, expected {public}")
+            bad.append(f"bucket {name} public={have}, expected {public}")
+            print(f"  FAIL  {name}  public={have}, expected {public}")
         else:
             print(f"  ok    {name}  {'public' if public else 'private'}")
 
-    if missing:
-        print(f"\n{len(missing)} table(s) missing. Paste docs/cloud/schema.sql into the")
-        print("Supabase SQL Editor and run it, then re-run this check.")
-    if any(b not in buckets for b in BUCKETS):
-        print("\nMissing buckets:  python3 tools/cloud_setup.py buckets")
-    if not missing and all(b in buckets for b in BUCKETS):
-        n = sb._rest(cfg, "GET", "volumes?select=id")
-        print(f"\nEverything is in place. volumes: {len(n or [])}")
+    print("\nanon role")
+    anon = anon_config(cfg)
+    if anon is None:
+        print("  skipped — no anon key (set SUPABASE_ANON_KEY, or Settings > Sync)")
+    else:
+        for t in ANON_CAN:
+            ok = anon_selects(anon, t)
+            bad += [] if ok else [f"anon cannot select {t}"]
+            print(f"  {'PASS' if ok else 'FAIL'}  anon can select {t}")
+        for t in ANON_CANNOT:
+            ok = not anon_selects(anon, t)
+            bad += [] if ok else [f"anon can select {t}"]
+            print(f"  {'PASS' if ok else 'FAIL'}  anon cannot select {t}")
+
+    if bad:
+        print(f"\n{len(bad)} problem(s)")
+        for b in bad:
+            print(f"  - {b}")
+        if pending:
+            print("\nPaste the pending docs/cloud/migrations/ files into the")
+            print("Supabase SQL Editor, in order, then re-run this check.")
+        if any(b.startswith("bucket ") for b in bad):
+            print("Missing buckets:  python3 tools/cloud_setup.py buckets --apply")
+        sys.exit(1)
+    n = sb._rest(cfg, "GET", "volumes?select=id")
+    print(f"\nEverything is in place. volumes: {len(n or [])}")
 
 
 def cmd_buckets(args) -> None:
@@ -208,7 +362,7 @@ def cmd_seed(args) -> None:
             raise
         # Older projects can publish while optional metadata awaits schema sync.
         print("note: optional volumes metadata is missing on the cloud project;"
-              " re-run docs/cloud/schema.sql")
+              " apply the pending docs/cloud/migrations (see `check`)")
         rows = [{k: v for k, v in r.items() if k not in optional}
                 for _b, r in pairs]
         sb._rest(cfg, "POST", "volumes?on_conflict=slug", rows,

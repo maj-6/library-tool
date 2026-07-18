@@ -66,6 +66,21 @@
         <item name="android:stateListAnimator">@null</item>
     </style>
 
+    <!-- Text actions in app chrome still need a real button role and a 48dp
+         target for switch access, TalkBack, and imprecise touch. -->
+    <style name="WhlToolbarAction" parent="Widget.Material3.Button.TextButton">
+        <item name="android:minWidth">48dp</item>
+        <item name="android:minHeight">48dp</item>
+        <item name="android:insetTop">0dp</item>
+        <item name="android:insetBottom">0dp</item>
+        <item name="android:paddingStart">10dp</item>
+        <item name="android:paddingEnd">10dp</item>
+        <item name="android:fontFamily">monospace</item>
+        <item name="android:textSize">12sp</item>
+        <item name="android:textColor">@color/whl_ink</item>
+        <item name="backgroundTint">@android:color/transparent</item>
+    </style>
+
     <!-- mono field label / small chrome text -->
     <style name="WhlLabel">
         <item name="android:fontFamily">monospace</item>

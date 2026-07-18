@@ -27,21 +27,115 @@ def _ready_build(client, title: str) -> dict:
     return response.get_json()["build"]
 
 
-def test_analyze_is_one_top_tab_with_integrated_analysis_and_document_workspaces():
+def test_workbench_is_one_top_tab_with_a_five_phase_rail():
     tabs = _between(TEMPLATE, '<div id="tabs">', "</div>")
-    assert tabs.count('data-tab="ocr"') == 1
-    assert 'data-tab="ocr">Analyze</button>' in tabs
-    assert 'data-tab="analyze"' not in tabs
+    assert tabs.count('data-tab="workbench"') == 1
+    assert 'data-tab="workbench">Workbench</button>' in tabs
+    # the Editor/Analyze split is gone; "Publish" now names the browser of
+    # already-published records (#125)
+    assert 'data-tab="upload"' not in tabs
+    assert 'data-tab="ocr"' not in tabs
+    assert 'data-tab="publish">Published Library</button>' in tabs
 
-    workspace_tabs = _between(
-        TEMPLATE, '<div class="pane-tabs" id="ocr-workspace-tabs">', "</div>")
-    assert 'data-worktab="analysis"' in workspace_tabs
-    assert '>Analysis</button>' in workspace_tabs
-    assert 'data-worktab="document"' in workspace_tabs
-    assert '>Document</button>' in workspace_tabs
+    rail = _between(TEMPLATE, '<nav id="wb-rail"', "</nav>")
+    for phase in ("record", "source", "text", "knowledge", "publish"):
+        assert f'data-phase="{phase}"' in rail
+    for pane in ("phase-record", "phase-source", "phase-text",
+                 "phase-knowledge", "phase-publish"):
+        assert f'id="{pane}"' in TEMPLATE
+
+    # the moved panes keep their element ids (DOM-transplant discipline)
     assert 'id="ocr-analysis-workspace"' in TEMPLATE
     assert 'id="ocr-document-workspace"' in TEMPLATE
+    assert 'id="an-integrated-host"' in TEMPLATE
+    assert 'id="btab-entry"' in TEMPLATE
+    assert 'id="btab-source"' in TEMPLATE
+    assert 'id="btab-resources"' in TEMPLATE
+    assert 'id="b-title"' in TEMPLATE
+    assert 'id="b-rights"' in TEMPLATE          # now in the Publish phase
+    assert 'id="b-ready"' in TEMPLATE
+    assert 'id="build-upload"' in TEMPLATE
+    assert 'id="an-bundle"' in TEMPLATE
     assert '<section id="analyze" hidden>' in TEMPLATE
+    assert 'id="ocr-workspace-tabs"' not in TEMPLATE
+
+    # the workspace toggle survives as a phase adapter for old callers
+    adapter = _between(APP, "function setAnalyzeWorkspace", "function wbActivePhase")
+    assert 'which === "document" ? "text" : "knowledge"' in adapter
+
+
+def test_workbench_phase_gating_locks_analyze_derived_phases_for_drafts():
+    for marker in ("wb-text-locked", "wb-knowledge-locked", "wb-publish-locked"):
+        assert f'id="{marker}"' in TEMPLATE
+    lock = _between(APP, "function wbLockNote", "function applyWorkbenchGates")
+    assert "anAnalyzable(b)" in lock
+    gates = _between(APP, "function applyWorkbenchGates", "function wbReadiness")
+    assert 'el("ocr-document-workspace").hidden = !!textNote' in gates
+    assert 'el("ocr-analysis-workspace").hidden = !!knowNote' in gates
+    # the Publish action bar stays reachable for drafts: verify lives there
+    assert 'el("wb-publish-actions").hidden = !b' in gates
+    # [hidden] must beat the id-based .active display rules, or the locked
+    # workspace (and its own placeholder) renders under the lock note
+    assert ".ocr-workpane[hidden] { display: none !important; }" in STYLE
+
+
+def test_source_viewer_agrees_with_the_chip_and_workbench_hides_dup_chrome():
+    # the Source chip and the Text phase fall back to the entry folder's own
+    # PDF via ocrBookPdf — the Source viewer must use the same fallback
+    source = _between(APP, "async function refreshSourceTab()",
+                      "// create/refresh the entry folder")
+    assert "localPath || ocrBookPdf(b.id)" in source
+    assert "pagesPdf: viewPath" in source
+    # the transplanted an-head must not repeat title · author · year under the
+    # Workbench header (the provider/status side of the bar stays)
+    assert "#an-integrated-host #an-title" in STYLE
+    assert "#an-integrated-host #an-sub { display: none; }" in STYLE
+    # the Text toolbar's find/replace give ground before the save button wraps
+    assert ("#ocr-find, #ocr-replace "
+            "{ flex: 1 1 60px; min-width: 60px; max-width: 130px; }") in STYLE
+
+
+def test_workbench_readiness_lives_on_the_single_phase_rail():
+    ready = _between(APP, "function wbReadiness", "function renderWorkbenchRail")
+    assert "ocrBookPdf(b.id)" in ready                       # source
+    assert "f.stale === true" in ready                       # text (#135 markers)
+    assert "b.ocr_verified" in ready
+    assert "summary.exists" in ready and "about.exists" in ready
+    assert "outdated" in ready
+    assert "b.published_slug" in ready                       # publish
+    rail = _between(APP, "function renderWorkbenchRail", "function renderWorkbench()")
+    assert '#wb-rail .wb-phase-btn' in rail
+    assert 'setAttribute("aria-current", "step")' in rail
+    assert "wb-phase-badge" in rail
+    assert "wb-chip" not in rail
+    assert 'id="wb-chips"' not in TEMPLATE
+    assert ".wb-chip" not in STYLE
+    # Entry creation remains available in the activity bar and the empty
+    # state, without a third copy that overflows the fixed-width sidebar.
+    assert 'id="build-new"' in TEMPLATE
+    assert 'id="build-new-empty"' in TEMPLATE
+    assert 'id="build-new-side"' not in TEMPLATE
+
+
+def test_workbench_sidebar_controls_are_named_and_keyboard_operable():
+    toolbar = _between(TEMPLATE, '<div class="pane-bar" id="builds-tabs">', "</div>")
+    assert 'aria-label="Show verified books only"' in toolbar
+    assert 'aria-pressed="false"' in toolbar
+    assert 'aria-label="Collapse the entries and artifacts sidebar"' in toolbar
+    assert 'aria-controls="ocr-side"' in toolbar
+
+    render = _between(APP, "function renderOcrBooks", "async function selectOcrBook")
+    assert 'verifiedFilter.setAttribute("aria-pressed"' in render
+    assert 'li.setAttribute("role", "button")' in render
+    assert 'li.setAttribute("aria-expanded"' in render
+    row = _between(APP, "function appendBuildListItem", "// Publish a verified entry")
+    assert 'li.tabIndex = 0' in row
+    assert 'li.setAttribute("aria-current", "true")' in row
+    keyboard = _between(APP, 'el("ocr-books").addEventListener("keydown"',
+                        'el("ocr-docs").addEventListener("click"')
+    assert 'ev.key !== "Enter" && ev.key !== " "' in keyboard
+    assert "row.click()" in keyboard
+    assert ".build-item:focus-visible" in STYLE
 
 
 def test_analyze_facsimile_and_artifact_tree_contracts():
@@ -95,13 +189,35 @@ def test_captured_provenance_flows_into_builds_and_artifact_images():
     assert "f.artifact || f.name" in artifacts
 
 
-def test_jobs_and_default_engine_modal_cover_ocr_and_text_analysis():
+def test_jobs_drawer_and_default_engine_modal_cover_ocr_and_text_analysis():
+    # the queue + Default Engine bar live in a collapsible drawer at the
+    # Workbench bottom, visible from every phase, collapsed by default
+    assert 'id="wb-jobs"' in TEMPLATE
+    assert 'id="wb-jobs-toggle"' in TEMPLATE
+    assert 'id="wb-jobs-summary"' in TEMPLATE
+    assert 'id="wb-jobs-body" hidden' in TEMPLATE
+    # the glyph-only toggle carries an accessible name
+    toggle = _between(TEMPLATE, 'id="wb-jobs-toggle"', "</button>")
+    assert 'aria-label="Jobs"' in toggle
+    assert 'aria-expanded="false"' in toggle
+    # the open drawer occludes phase content: opaque, stacked, phases clipped
+    drawer_css = _between(STYLE, "#wb-jobs {", "}")
+    assert "background: var(--face);" in drawer_css
+    assert "z-index: 2;" in drawer_css
+    assert "overflow: hidden;" in _between(STYLE, ".wb-phase.active {", "}")
     assert '<span class="tool-label">Jobs</span>' in TEMPLATE
     assert '>Default Engine:</button>' in TEMPLATE
     assert "<th>Type</th>" in TEMPLATE
     assert "<th>Artifact</th>" in TEMPLATE
     assert "<th>Engine</th>" in TEMPLATE
     assert 'id="ocr-queue-empty" class="empty">No jobs</p>' in TEMPLATE
+
+    drawer = _between(APP, "function setJobsDrawer", "function initWorkbench")
+    assert "body.hidden = !open" in drawer
+    assert "jobsDrawerOpen" in drawer
+    summary = _between(APP, "function renderJobsFooter", "function initJobs")
+    assert "wb-jobs-summary" in summary
+    assert 'tab.dataset.tab !== "workbench"' in summary
 
     for element_id in (
         "engine-overlay",
@@ -143,6 +259,8 @@ def test_page_analysis_staging_and_unified_job_rows_are_wired():
     assert "anJobs.entries()" in jobs
     assert "<td>OCR</td>" in jobs
     assert "<td>Text analysis</td>" in jobs
+    # the drawer count singularizes like the summary line ("1 job", not "1 jobs")
+    assert '${total} job${total === 1 ? "" : "s"}' in jobs
 
 
 def test_manual_about_save_populates_editor_description(client):

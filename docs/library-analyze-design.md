@@ -2,10 +2,9 @@
 
 Design contract for three features that land together. Frozen 2026-07-10;
 touched up 2026-07-15 to match the code as built (marked *as built* where
-the shape changed). The schema half lives in `docs/cloud/schema.sql`
+the shape changed). The schema half lives in `docs/cloud/migrations/`
 (taxonomy, volume_texts, volume_pages, volume_notes,
 author_pages/author_index, volumes.category_paths + volumes.assets).
-
 ## 1. Categories: a hierarchical taxonomy
 
 The comma-separated `categories` text fields (and the WHL rows' scraped

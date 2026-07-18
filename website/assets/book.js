@@ -89,6 +89,20 @@ function availability(v) {
   return `<div class="avail"><span class="label">Also available</span>${body}</div>`;
 }
 
+// Search inside the book: a plain GET form straight into the reader, which
+// picks the query up as its ?q= deep link. Only offered when page text exists.
+function searchForm(v) {
+  const a = (v && v.assets) || {};
+  if (!Number(a.pages)) return "";
+  return `
+    <form class="book-search" action="read.html" method="get">
+      <input type="hidden" name="slug" value="${esc(v.slug)}" />
+      <input type="search" name="q" placeholder="Search inside this book…"
+             aria-label="Search inside this book" required />
+      <button class="btn" type="submit">Search</button>
+    </form>`;
+}
+
 function actions(v) {
   const href = pdfHref(v);
   const slug = encodeURIComponent(v.slug);
@@ -98,9 +112,8 @@ function actions(v) {
       <a class="btn primary" href="read.html?slug=${slug}">Read online</a>
       <a class="btn" href="${esc(href)}" target="_blank" rel="noopener">Download PDF${size ? ` · ${size}` : ""}</a>`;
   }
-  return `
-    <a class="btn" aria-disabled="true" title="No scan yet">Read online</a>
-    <a class="btn" aria-disabled="true" title="No scan yet">PDF pending</a>`;
+  // no scan yet: say so in plain text rather than dead button-shaped controls
+  return `<span class="rec-noscan">Scan unavailable — no digitized copy yet</span>`;
 }
 
 function notFound(slug) {
@@ -169,6 +182,7 @@ async function main() {
         ${bookThumb(v)}
         ${metaTable(v)}
         <div class="side-actions">${actions(v)}</div>
+        ${searchForm(v)}
         ${availability(v)}
       </aside>
     </div>`;

@@ -58,7 +58,7 @@
             android:autofillHints="password"
             android:importantForAutofill="yes" />
 
-        <Button
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/signIn"
             style="@style/WhlButton"
             android:layout_width="match_parent"
@@ -66,14 +66,14 @@
             android:textSize="14sp"
             android:text="@string/login_sign_in" />
 
-        <Button
-            android:id="@+id/register"
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/continueLocal"
             style="@style/WhlButton"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
             android:textSize="12sp"
-            android:text="@string/login_register" />
+            android:text="@string/login_continue_local" />
 
         <TextView
             android:id="@+id/msg"

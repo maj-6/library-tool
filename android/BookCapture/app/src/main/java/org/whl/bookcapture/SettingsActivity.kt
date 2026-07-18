@@ -11,30 +11,59 @@ import kotlinx.coroutines.withContext
 import org.whl.bookcapture.databinding.ActivitySettingsBinding
 
 /**
- * Account, device label and API keys. The keys belong to the ACCOUNT, not the
- * device: saving pushes them to the cloud profile, so the desktop (and the
- * next phone) picks them up without pasting anything twice.
+ * Account, device label, transport, and processing keys. Local-mode values
+ * stay on this phone; signed-in edits are also queued to the account profile.
  */
 class SettingsActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivitySettingsBinding
+    private var baselineDisplayName = ""
+    private var baselineMistral = ""
+    private var baselineDeepseek = ""
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivitySettingsBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        binding.toolbar.setNavigationOnClickListener { finish() }
 
-        binding.accountEmail.text = Prefs.email(this)
+        val signedInAtOpen = Auth.signedIn(this)
+        binding.accountEmail.text = if (signedInAtOpen) Prefs.email(this)
+            else getString(R.string.set_local_mode)
+        binding.signOut.text = getString(
+            if (signedInAtOpen) R.string.set_sign_out else R.string.set_sign_in)
+        binding.apiKeysNote.text = getString(
+            if (signedInAtOpen) R.string.set_api_keys_note
+            else R.string.set_api_keys_note_local)
         binding.displayName.setText(Prefs.displayName(this))
         binding.device.setText(Prefs.deviceName(this))
         binding.mistralKey.setText(Prefs.mistralKey(this))
         binding.deepseekKey.setText(Prefs.deepseekKey(this))
+        rememberProfileBaseline()
 
         // viewfinder sharpen is a GPU shader on the preview — Android 13+ only
-        binding.sharpenPreview.isEnabled = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
-        binding.sharpenPreview.isChecked = Prefs.sharpenPreview(this)
+        renderCameraSettings()
+        binding.cameraProfileGroup.setOnCheckedChangeListener { _, checkedId ->
+            Prefs.setCameraProfile(this, if (checkedId == R.id.cameraProfileDetail)
+                Prefs.CAMERA_PROFILE_DETAIL else Prefs.CAMERA_PROFILE_FAST)
+        }
+        binding.continuousLight.setOnCheckedChangeListener { _, on ->
+            Prefs.setTorchEnabled(this, on)
+        }
         binding.sharpenPreview.setOnCheckedChangeListener { _, on ->
             Prefs.setSharpenPreview(this, on)
+        }
+        binding.resetCamera.setOnClickListener {
+            Prefs.resetCameraOptions(this)
+            renderCameraSettings()
+            binding.msg.text = getString(R.string.saved)
+        }
+
+        // Voice control is opt-in: enabling it here is what makes the capture
+        // screen ask for the mic and download the model on its next resume.
+        binding.voiceControl.isChecked = Prefs.voiceControl(this)
+        binding.voiceControl.setOnCheckedChangeListener { _, on ->
+            Prefs.setVoiceControl(this, on)
         }
 
         // transport (Cloud / LAN / Auto) + LAN pairing
@@ -59,50 +88,81 @@ class SettingsActivity : AppCompatActivity() {
         // freshen the cache; another device may have changed the keys. Only
         // overwrite a field the user has NOT touched since it was populated,
         // so a slow network pull can't wipe a key they are mid-typing.
-        val shown = mapOf(
-            binding.displayName to Prefs.displayName(this),
-            binding.mistralKey to Prefs.mistralKey(this),
-            binding.deepseekKey to Prefs.deepseekKey(this))
-        lifecycleScope.launch(Dispatchers.IO) {
+        val shownDisplayName = binding.displayName.text.toString()
+        val shownMistral = binding.mistralKey.text.toString()
+        val shownDeepseek = binding.deepseekKey.text.toString()
+        if (signedInAtOpen) lifecycleScope.launch(Dispatchers.IO) {
             try {
                 Auth.pullProfile(this@SettingsActivity)
                 withContext(Dispatchers.Main) {
-                    val fresh = mapOf(
-                        binding.displayName to Prefs.displayName(this@SettingsActivity),
-                        binding.mistralKey to Prefs.mistralKey(this@SettingsActivity),
-                        binding.deepseekKey to Prefs.deepseekKey(this@SettingsActivity))
-                    for ((field, was) in shown)
-                        if (field.text.toString() == was) field.setText(fresh[field])
+                    if (binding.displayName.text.toString() == shownDisplayName) {
+                        baselineDisplayName = Prefs.displayName(this@SettingsActivity)
+                        binding.displayName.setText(baselineDisplayName)
+                    }
+                    if (binding.mistralKey.text.toString() == shownMistral) {
+                        baselineMistral = Prefs.mistralKey(this@SettingsActivity)
+                        binding.mistralKey.setText(baselineMistral)
+                    }
+                    if (binding.deepseekKey.text.toString() == shownDeepseek) {
+                        baselineDeepseek = Prefs.deepseekKey(this@SettingsActivity)
+                        binding.deepseekKey.setText(baselineDeepseek)
+                    }
                 }
             } catch (_: Exception) { /* offline: the cache stands */ }
         }
 
+        Prefs.profileSyncError(this)?.takeIf { signedInAtOpen }?.let {
+            binding.msg.text = getString(R.string.saved_sync_error, it)
+        }
+        if (signedInAtOpen) ProfileSyncWorker.enqueue(this)
+
         binding.save.setOnClickListener {
             Prefs.setDeviceName(this, binding.device.text.toString())
-            Prefs.setTransport(this, when {
+            val transport = when {
                 binding.transportLan.isChecked -> "lan"
                 binding.transportAuto.isChecked -> "auto"
                 else -> "cloud"
-            })
-            Prefs.setLan(this, binding.lanHost.text.toString(), binding.lanToken.text.toString())
-            UploadWorker.enqueue(this)      // a transport change should drain now
-            binding.msg.text = getString(R.string.testing)
-            lifecycleScope.launch {
-                // pushing the profile needs a cloud sign-in; LAN-only users may
-                // not have one, so skip it rather than surfacing "signed out"
-                val err = if (Auth.signedIn(this@SettingsActivity))
-                    withContext(Dispatchers.IO) {
-                        Auth.pushProfile(this@SettingsActivity,
-                            binding.displayName.text.toString(),
-                            binding.mistralKey.text.toString(),
-                            binding.deepseekKey.text.toString())
-                    } else null
-                binding.msg.text = err ?: getString(R.string.saved)
-                if (err == null) ProcessWorker.enqueue(this@SettingsActivity)
             }
+            Prefs.setTransport(this, transport)
+            Prefs.setLan(this, binding.lanHost.text.toString(), binding.lanToken.text.toString())
+            val displayName = binding.displayName.text.toString()
+            val mistral = binding.mistralKey.text.toString()
+            val deepseek = binding.deepseekKey.text.toString()
+            val changed = buildSet {
+                if (displayName != baselineDisplayName) add(Prefs.PROFILE_DISPLAY_NAME)
+                if (mistral != baselineMistral) add(Prefs.PROFILE_MISTRAL)
+                if (deepseek != baselineDeepseek) add(Prefs.PROFILE_DEEPSEEK)
+            }
+            val cloudPending = changed.takeIf {
+                Auth.signedIn(this) && Prefs.userId(this).isNotEmpty()
+            }.orEmpty()
+            // Values and their pending flags are one local transaction, so a
+            // concurrent profile pull cannot replace a just-saved edit.
+            Prefs.saveProfileLocally(
+                this,
+                displayName = displayName,
+                mistral = mistral,
+                deepseek = deepseek,
+                pendingFields = cloudPending,
+            )
+            if (Auth.signedIn(this) || transport != "cloud") {
+                UploadWorker.enqueue(this)  // local LAN works without an account
+            }
+            if (cloudPending.isNotEmpty()) {
+                ProfileSyncWorker.enqueue(this)
+                binding.msg.text = getString(R.string.saved_sync_pending)
+            } else {
+                binding.msg.text = getString(R.string.saved_on_device)
+            }
+            rememberProfileBaseline()
+            ProcessWorker.enqueue(this)
         }
 
         binding.test.setOnClickListener {
+            if (!Auth.signedIn(this)) {
+                binding.msg.text = getString(R.string.connection_requires_sign_in)
+                return@setOnClickListener
+            }
             binding.msg.text = getString(R.string.testing)
             lifecycleScope.launch {
                 val err = withContext(Dispatchers.IO) {
@@ -114,9 +174,47 @@ class SettingsActivity : AppCompatActivity() {
         }
 
         binding.signOut.setOnClickListener {
-            Auth.signOut(this)
-            startActivity(Intent(this, LoginActivity::class.java))
-            finish()
+            if (!Auth.signedIn(this)) {
+                startActivity(Intent(this, LoginActivity::class.java))
+            } else {
+                binding.signOut.isEnabled = false
+                lifecycleScope.launch {
+                    val error = withContext(Dispatchers.IO) {
+                        Auth.signOut(this@SettingsActivity)
+                    }
+                    binding.signOut.isEnabled = true
+                    binding.accountEmail.text = getString(R.string.set_local_mode)
+                    binding.signOut.text = getString(R.string.set_sign_in)
+                    binding.apiKeysNote.text = getString(R.string.set_api_keys_note_local)
+                    binding.displayName.setText(Prefs.displayName(this@SettingsActivity))
+                    binding.mistralKey.setText(Prefs.mistralKey(this@SettingsActivity))
+                    binding.deepseekKey.setText(Prefs.deepseekKey(this@SettingsActivity))
+                    rememberProfileBaseline()
+                    binding.msg.text = error?.let {
+                        getString(R.string.signed_out_revoke_warning, it)
+                    } ?: getString(R.string.signed_out_local)
+                }
+            }
         }
+    }
+
+    private fun renderCameraSettings() {
+        binding.cameraProfileFast.isChecked =
+            Prefs.cameraProfile(this) == Prefs.CAMERA_PROFILE_FAST
+        binding.cameraProfileDetail.isChecked =
+            Prefs.cameraProfile(this) == Prefs.CAMERA_PROFILE_DETAIL
+        binding.continuousLight.isChecked = Prefs.torchEnabled(this)
+        binding.sharpenPreview.isEnabled =
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+        binding.sharpenPreview.isChecked = Prefs.sharpenPreview(this)
+        binding.cameraDiagnostics.text = Prefs.cameraDiagnostics(this).ifEmpty {
+            getString(R.string.set_camera_diagnostics_unavailable)
+        }
+    }
+
+    private fun rememberProfileBaseline() {
+        baselineDisplayName = binding.displayName.text.toString()
+        baselineMistral = binding.mistralKey.text.toString()
+        baselineDeepseek = binding.deepseekKey.text.toString()
     }
 }

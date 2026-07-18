@@ -424,7 +424,9 @@ a { color: var(--accent-ink); }
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
-.rec-actions { margin-top: 11px; display: flex; gap: 9px; }
+.rec-actions { margin-top: 11px; display: flex; gap: 9px; align-items: center; }
+/* records without a readable asset state it as quiet metadata, not a control */
+.rec-noscan { font-size: 12px; font-style: italic; color: var(--ink-faint); }
 
 /* ---- buttons (shared) ---- */
 .btn {
@@ -575,6 +577,22 @@ a { color: var(--accent-ink); }
 .avail .label { display: block; margin-bottom: 6px; }
 .avail-item::before { content: "› "; color: var(--ink-faint); }
 .avail-none { color: var(--ink-faint); }
+
+/* record page: search inside the book, a GET form straight into the reader */
+.book-search { display: flex; gap: 8px; margin-top: 14px; }
+.book-search input[type="search"] {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: 13px/1.4 inherit;
+  padding: 8px 9px;
+  border: 1px solid var(--rule-mid);
+  border-radius: 1px;
+  background: #fff;
+  color: var(--ink);
+  box-shadow: inset 1px 1px 1px rgba(50, 44, 34, 0.14),
+              inset -1px -1px 0 rgba(255, 254, 250, 0.7);
+}
+.book-search .btn { flex: none; cursor: pointer; }
 
 /* not-found state */
 .notfound { padding: 60px 0 100px; max-width: 560px; }
@@ -740,6 +758,53 @@ body.reader { display: flex; flex-direction: column; overflow: hidden; }
 }
 .tp-page .tp-body { white-space: pre-wrap; font-size: 13.5px; line-height: 1.6; }
 .tp-page.current .tp-pnum { color: var(--accent-ink); }
+
+/* in-book search: the input under the panel head, hits as quiet rows above
+   the page text, matches on a pale ochre band */
+.tp-search { margin: 0 0 12px; }
+.tp-search input {
+  width: 100%;
+  font: 13px/1.4 inherit;
+  padding: 7px 9px;
+  border: 1px solid var(--rule-mid);
+  border-radius: 1px;
+  background: #fff;
+  color: var(--ink);
+  box-shadow: inset 1px 1px 1px rgba(50, 44, 34, 0.14),
+              inset -1px -1px 0 rgba(255, 254, 250, 0.7);
+}
+.tp-hits { margin: 0 0 18px; padding-bottom: 10px; border-bottom: 3px double var(--rule); }
+.tp-hitcount {
+  font-size: 10px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  margin: 0 0 8px;
+}
+.tp-hit {
+  display: block;
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  font: 13px/1.5 inherit;
+  color: var(--ink);
+  background: transparent;
+  border: 1px solid var(--rule-soft);
+  border-left: 3px solid var(--rule-mid);
+  padding: 8px 10px;
+  margin: 0 0 8px;
+}
+.tp-hit:hover { border-left-color: var(--accent); }
+.tp-hit .tp-hit-page {
+  display: block;
+  font-size: 10px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  margin-bottom: 3px;
+}
+.tp-hit .tp-hit-more { display: block; font-size: 11px; color: var(--ink-faint); margin-top: 3px; }
+.textpanel mark { background: #ede0a8; color: inherit; padding: 0 1px; }
 
 .reader-msg {
   margin: 60px auto;

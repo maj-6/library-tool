@@ -87,9 +87,11 @@ committed: `build/pdf.min.mjs`, `build/pdf.worker.min.mjs`, and `LICENSE`
   bump this note. Nothing imports pdf.js except `assets/read.js`, which loads it
   as an ES module and points `GlobalWorkerOptions.workerSrc` at the worker via
   `new URL(…, import.meta.url)`.
-- **Streaming:** `getDocument({ disableAutoFetch: true })` uses HTTP Range
-  requests, so a large scan loads lazily as you scroll (the host must allow
-  Range and expose it via CORS — Supabase Storage and R2 both do).
+- **Streaming:** `getDocument({ disableAutoFetch: true, disableStream: true })`
+  loads strictly by HTTP Range, so a large scan loads lazily as you scroll and
+  no background full-file stream runs in parallel. The host must allow Range and
+  expose it via CORS (Supabase Storage and R2 both can); when it doesn't, pdf.js
+  falls back to a single full fetch.
 - **Virtualized scroll:** only pages near the viewport hold a canvas
   (IntersectionObserver); the rest keep a pre-sized placeholder so the scrollbar
   never jumps. Thumbnails, zoom / fit-width / fit-page, keyboard nav
@@ -122,10 +124,10 @@ python3 tools/cloud_setup.py anon-key      # prints the snippet
 
 Write it to `assets/config.js` — gitignored, because the project reference is
 yours. The **anon** key belongs here, never the service_role key. Row-level
-security is what protects the project: `docs/cloud/schema.sql` grants anon
-exactly seven reads — `volumes`, `volume_texts`, `volume_pages`,
-`volume_notes`, `author_pages`, the `author_index` view, and `releases` — and
-nothing else.
+security is what protects the project: `docs/cloud/migrations/` grant anon
+seven published-library reads — `volumes`, `volume_texts`, `volume_pages`,
+`volume_notes`, `author_pages`, the `author_index` view, and `releases` —
+plus the `schema_migrations` ledger, and nothing else.
 
 ## Downloads and release notes
 

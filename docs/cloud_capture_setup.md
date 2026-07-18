@@ -27,16 +27,23 @@ document covers the cloud route.
 
 ## 2. Create the tables
 
-Paste **`docs/cloud/schema.sql`** into the SQL Editor and run it. That one script
-is the whole backend — `captures`, `capture_ingest_grants` and `books` for
-this pipeline; `volumes` (with `volume_texts` / `volume_pages` /
-`volume_notes`), `author_pages`, `releases`, `profiles` and `events` for
-the website; `profile_secrets` for account-synced API keys; plus `builds`,
-`ia_catalog`, `corrections` and `taxonomy` for the working-store sync (the
-desktop's gitignored builds / IA-download catalog / WHL corrections /
-category taxonomy merge through these; see `tools/store_sync.py`). It is
-idempotent, so re-run it whenever the schema changes.
+The schema ships as ordered migrations in **`docs/cloud/migrations/`**. On a
+fresh project, paste each file into the SQL Editor and run it, in order
+(`001_baseline.sql` first). Together they are the whole backend — `captures`,
+`capture_ingest_grants` and `books` for this pipeline; `volumes` (with
+`volume_texts` / `volume_pages` / `volume_notes`), `author_pages`, `releases`,
+`profiles` and `events` for the website; `profile_secrets` for account-synced
+API keys; plus `builds`, `ia_catalog`, `corrections` and `taxonomy` for the
+working-store sync (the desktop's gitignored builds / IA-download catalog /
+WHL corrections / category taxonomy merge through these; see
+`tools/store_sync.py`).
 
+On an existing project, don't re-paste everything: `python3
+tools/cloud_setup.py check` diffs the `schema_migrations` table against the
+directory and names the files still pending — paste those, in order. Every
+migration is idempotent and records itself, so re-running one is harmless.
+Rollback follows the same rule: migrations are append-only, so never edit an
+applied file — ship a new migration that reverses the change.
 ## 3. Create the storage buckets
 
 ```
@@ -53,6 +60,11 @@ Then check the whole thing:
 ```
 python3 tools/cloud_setup.py check
 ```
+
+It verifies every expected table, view and column against the migrations,
+names pending migrations, checks bucket visibility, and smoke-tests the anon
+role (public reads work; profiles/events/captures refuse). Non-zero exit on
+any failure.
 
 ## 4. Wire up both ends
 
@@ -86,7 +98,7 @@ the project-specific confirmation email — both in **[docs/cloud/auth_setup.md]
 
 ## Notes
 
-- Keep RLS enabled. `schema.sql` lets an authenticated account insert its own
+- Keep RLS enabled. The schema lets an authenticated account insert its own
   captures, and lets a desktop process only its own or explicitly assigned
   contributors' captures. Storage follows the same rule; upload remains
   available to signed-in phones.

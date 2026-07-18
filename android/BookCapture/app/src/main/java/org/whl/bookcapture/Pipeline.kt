@@ -18,15 +18,17 @@ import java.util.Base64
  *   standardize -> Mistral OCR -> bibliographic fields (DeepSeek by default,
  *                                 Mistral when only its key is configured)
  *
- * It mirrors tools/capture_pipeline.py — same 1600px/q82 standard, same OCR
- * endpoint, the SAME extraction prompt (keep them in sync) — so the desktop
- * can trust `meta` from either side. Perspective correction stays on the
+ * Fast capture mirrors tools/capture_pipeline.py at 1600px/q82; the explicit
+ * More Detail profile preserves up to 2048px. The OCR endpoint and extraction
+ * prompt stay shared so the desktop can trust `meta` from either side.
+ * Perspective correction stays on the
  * desktop: it needs OpenCV, which would triple the APK for a correction
  * Mistral's OCR mostly shrugs at anyway.
  */
 object Pipeline {
 
-    private const val STANDARD_WIDTH = 1600
+    private const val FAST_STANDARD_WIDTH = 1600
+    private const val DETAIL_STANDARD_WIDTH = 2048
     private const val STANDARD_QUALITY = 82
 
     private const val MISTRAL_OCR_URL = "https://api.mistral.ai/v1/ocr"
@@ -42,24 +44,35 @@ object Pipeline {
     /** A 4xx from an API: retrying won't fix it (bad key, bad request). */
     class PermanentError(message: String) : IOException(message)
 
+    /** A successful HTTP response that cannot be trusted as an extraction.
+     *  Retrying is safe because callers do not replace the last good metadata. */
+    class InvalidExtractionError(message: String) : IOException(message)
+
+    data class ExtractionResult(
+        val metadata: JSONObject,
+        val complete: Boolean,
+        val warning: String? = null,
+    )
+
     // --- 1. standardize -----------------------------------------------------------
 
-    /** Scale the photo to the standard width and recompress, in place, honoring
-     *  the EXIF rotation CameraX recorded. A file already at or under the
-     *  standard width is left alone, so this is idempotent — and a ~4 MB
-     *  camera JPEG becomes a ~400 KB upload. */
+    /** Scale the photo to its capture profile's standard width and recompress,
+     *  in place, honoring the EXIF rotation CameraX recorded. A file already at
+     *  or under that width is left alone, so this is idempotent. Legacy files
+     *  without frozen profile metadata conservatively keep up to 2048px. */
     fun standardizeInPlace(file: File) {
+        val standardWidth = standardWidthForCaptureProfile(readCaptureProfile(file.parentFile))
         val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(file.absolutePath, opts)
-        if (opts.outWidth <= 0 || opts.outWidth <= STANDARD_WIDTH) return
+        if (opts.outWidth <= 0 || opts.outWidth <= standardWidth) return
         // rough power-of-two pre-shrink keeps peak memory at ~4x target size
         var sample = 1
-        while (opts.outWidth / (sample * 2) >= STANDARD_WIDTH) sample *= 2
+        while (opts.outWidth / (sample * 2) >= standardWidth) sample *= 2
         val decode = BitmapFactory.Options().apply { inSampleSize = sample }
         var bmp = BitmapFactory.decodeFile(file.absolutePath, decode) ?: return
-        if (bmp.width > STANDARD_WIDTH) {
-            val h = (bmp.height.toLong() * STANDARD_WIDTH / bmp.width).toInt()
-            val scaled = Bitmap.createScaledBitmap(bmp, STANDARD_WIDTH, h, true)
+        if (bmp.width > standardWidth) {
+            val h = (bmp.height.toLong() * standardWidth / bmp.width).toInt()
+            val scaled = Bitmap.createScaledBitmap(bmp, standardWidth, h, true)
             if (scaled !== bmp) bmp.recycle()
             bmp = scaled
         }
@@ -82,6 +95,21 @@ object Pipeline {
         bmp.recycle()
         if (!tmp.renameTo(file)) tmp.delete()      // keep the original over a torn write
     }
+
+    private fun readCaptureProfile(dir: File?): String? = try {
+        dir?.let { JSONObject(File(it, CAPTURE_METADATA_FILE).readText()) }
+            ?.optString("camera_profile")
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+    } catch (_: Exception) {
+        null
+    }
+
+    /** Missing/unknown metadata comes from an older capture and must not be
+     * destructively reduced when its original camera profile is unknowable. */
+    internal fun standardWidthForCaptureProfile(storedProfile: String?): Int =
+        if (storedProfile?.trim() == Prefs.CAMERA_PROFILE_FAST) FAST_STANDARD_WIDTH
+        else DETAIL_STANDARD_WIDTH
 
     // --- 2. OCR -----------------------------------------------------------------
 
@@ -133,7 +161,7 @@ OCR TEXT:
     /** OCR text -> {title, ..., extra:{}}. DeepSeek when its key is set, else
      *  Mistral (whose extraction the desktop has verified live). */
     fun extract(ocrText: String, deepseekKey: String, mistralKey: String,
-                customInstructions: String = ""): JSONObject {
+                customInstructions: String = ""): ExtractionResult {
         val (url, model, key) =
             if (deepseekKey.isNotEmpty()) Triple(DEEPSEEK_CHAT_URL, DEEPSEEK_EXTRACT_MODEL, deepseekKey)
             else Triple(MISTRAL_CHAT_URL, MISTRAL_EXTRACT_MODEL, mistralKey)
@@ -158,14 +186,114 @@ OCR TEXT:
         val data = post(url, payload, key, 60_000)
         val raw = data.optJSONArray("choices")?.optJSONObject(0)
             ?.optJSONObject("message")?.optString("content") ?: ""
+        return parseExtraction(raw)
+    }
+
+    /** Validate and normalize a model response without silently turning bad JSON
+     *  into a completed empty record. A response with usable fields but an
+     *  incomplete schema is retained as partial so those fields stay visible. */
+    internal fun parseExtraction(raw: String): ExtractionResult {
+        val cleaned = raw.trim().removePrefix("```json").removePrefix("```")
+            .removeSuffix("```").trim()
+        if (cleaned.isEmpty()) throw InvalidExtractionError("Extraction returned an empty response")
         val obj = try {
-            JSONObject(raw.trim().removePrefix("```json").removePrefix("```")
-                          .removeSuffix("```").trim())
-        } catch (_: Exception) { JSONObject() }
+            JSONObject(cleaned)
+        } catch (e: Exception) {
+            throw InvalidExtractionError("Extraction returned invalid JSON")
+        }
         val out = JSONObject()
-        for (k in FIELDS) out.put(k, obj.optString(k).trim())
-        out.put("extra", obj.optJSONObject("extra") ?: JSONObject())
+        val problems = mutableListOf<String>()
+        var populated = false
+        for (k in FIELDS) {
+            val value = when {
+                !obj.has(k) -> {
+                    problems += "$k is missing"
+                    ""
+                }
+                obj.opt(k) == JSONObject.NULL -> {
+                    problems += "$k is not a string"
+                    ""
+                }
+                obj.opt(k) is String -> obj.optString(k).trim()
+                else -> {
+                    problems += "$k is not a string"
+                    obj.opt(k)?.toString()?.trim().orEmpty()
+                }
+            }
+            if (value.isNotEmpty()) populated = true
+            out.put(k, value)
+        }
+
+        val extraOut = JSONObject()
+        val extra = obj.opt("extra")
+        if (extra is JSONObject) {
+            for (key in extra.keys()) {
+                val rawValue = extra.opt(key)
+                val value = when {
+                    rawValue == null || rawValue == JSONObject.NULL -> ""
+                    rawValue is String -> rawValue.trim()
+                    else -> {
+                        problems += "extra.$key is not a string"
+                        rawValue.toString().trim()
+                    }
+                }
+                if (value.isNotEmpty()) {
+                    extraOut.put(key, value)
+                    populated = true
+                }
+            }
+        } else {
+            problems += "extra is missing or is not an object"
+        }
+        out.put("extra", extraOut)
+
+        if (!populated)
+            throw InvalidExtractionError("Extraction returned no bibliographic fields")
+        val warning = problems.distinct().takeIf { it.isNotEmpty() }?.let {
+            val shown = it.take(3).joinToString(", ")
+            if (it.size > 3) "Partial extraction response: $shown (+${it.size - 3} more)"
+            else "Partial extraction response: $shown"
+        }
+        return ExtractionResult(out, complete = warning == null, warning = warning)
+    }
+
+    /** Merge an accepted response over the prior record without ever erasing a
+     *  populated field. Automatic retries only fill gaps; an explicit user
+     *  reprocess may replace values, but still cannot replace one with blank. */
+    internal fun mergeExtraction(
+        existing: JSONObject?,
+        incoming: JSONObject,
+        replaceExisting: Boolean = false,
+    ): JSONObject {
+        val out = JSONObject()
+        for (key in FIELDS) {
+            val old = existing?.optString(key)?.trim().orEmpty()
+            val fresh = incoming.optString(key).trim()
+            out.put(key, when {
+                old.isEmpty() -> fresh
+                fresh.isEmpty() -> old
+                replaceExisting -> fresh
+                else -> old
+            })
+        }
+        val extraOut = JSONObject()
+        fun addExtra(source: JSONObject?, replace: Boolean) {
+            if (source == null) return
+            for (key in source.keys()) {
+                val value = source.optString(key).trim()
+                if (value.isNotEmpty() && (replace || !extraOut.has(key))) extraOut.put(key, value)
+            }
+        }
+        addExtra(existing?.optJSONObject("extra"), replace = false)
+        addExtra(incoming.optJSONObject("extra"), replace = replaceExisting)
+        out.put("extra", extraOut)
         return out
+    }
+
+    internal fun hasPopulatedMetadata(metadata: JSONObject): Boolean {
+        if (FIELDS.any { metadata.optString(it).trim().isNotEmpty() }) return true
+        val extra = metadata.optJSONObject("extra") ?: return false
+        return extra.keys().asSequence().any { extra.optString(it).trim().isNotEmpty() }
     }
 
     // --- HTTP -------------------------------------------------------------------------

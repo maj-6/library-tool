@@ -267,7 +267,7 @@ ol.volumes { list-style: none; margin: 0; padding: 0; }
   transition: background 0.15s, color 0.15s;
 }
 .dl-btn:hover { background: var(--accent); color: #fff; }
-.dl-btn[aria-disabled="true"] { border-color: var(--rule-mid); color: var(--ink-faint); pointer-events: none; }
+.dl-unavail { font-size: 12px; font-style: italic; color: var(--ink-faint); white-space: nowrap; }
 .dl-arrow { width: 13px; height: 13px; flex: none; }
 
 /* Testing builds are supporting links, not headline download cards. */
@@ -294,11 +294,15 @@ ol.volumes { list-style: none; margin: 0; padding: 0; }
 .dl-list.is-compact .dl-arrow { width: 11px; height: 11px; }
 
 /* --- changelog / release notes --- */
+.release-rule {
+  border: 0;
+  border-top: 1px solid var(--rule-soft);
+  margin: 14px 0 2px;
+}
 .changelog { margin: 0; }
-.cl-rel { padding: 16px 0; border-top: 1px solid var(--rule-soft); }
-.cl-rel:first-child { border-top: none; padding-top: 2px; }
+.cl-rel { padding: 16px 0; }
 .cl-ver {
-  font-size: 18px;
+  font-size: 20px;
   font-weight: 600;
   margin: 0 0 8px;
   color: var(--ink);
@@ -314,22 +318,74 @@ ol.volumes { list-style: none; margin: 0; padding: 0; }
 .cl-category + .cl-category { margin-top: 14px; }
 .cl-category-name {
   margin: 0 0 4px;
-  font-size: 13px;
+  font-size: 14px;
   line-height: 1.4;
   font-weight: 600;
   color: var(--ink-soft);
 }
 .cl-list { margin: 0; padding-left: 20px; }
 .cl-list li { margin: 0 0 5px; color: var(--ink); }
-/* major-version group heading, with the release versions as subheadings */
-.cl-major-group + .cl-major-group { margin-top: 28px; }
-.cl-major {
-  margin: 0 0 4px;
-  font: 12px/1 var(--mono);
-  letter-spacing: 1px;
-  text-transform: uppercase;
-  color: var(--ink-faint);
+
+/* --- documentation --- */
+.docs h3 { font-size: 16px; margin: 24px 0 6px; }
+.toc {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  padding: 10px 14px;
+  background: var(--card);
+  border: 1px solid var(--rule-mid);
+  font-size: 14px;
+  margin-bottom: 4px;
 }
+.toc a { text-decoration: none; }
+.toc a:hover { text-decoration: underline; }
+.docs figure { margin: 14px 0 22px; }
+.docs figure img {
+  display: block;
+  width: 100%;
+  border: 1px solid var(--rule-mid);
+  box-shadow: 1px 2px 4px rgba(50, 44, 34, 0.08);
+}
+.docs figcaption {
+  font-size: 12px;
+  letter-spacing: 0.3px;
+  color: var(--ink-faint);
+  margin-top: 7px;
+}
+.docs kbd {
+  font: 13px/1 var(--mono);
+  background: var(--card);
+  border: 1px solid var(--rule-mid);
+  border-radius: 1px;
+  padding: 2px 5px;
+}
+/* code blocks + key tables (the API & file format page) */
+.docs pre {
+  font: 12.5px/1.55 var(--mono);
+  background: var(--card);
+  border: 1px solid var(--rule-mid);
+  padding: 10px 14px;
+  overflow-x: auto;
+  margin: 10px 0 16px;
+}
+.docs code { font: 13px/1.4 var(--mono); }
+.docs table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 14px;
+  margin: 10px 0 16px;
+}
+.docs th, .docs td {
+  text-align: left;
+  vertical-align: top;
+  padding: 5px 12px 5px 0;
+  border-bottom: 1px solid var(--rule-soft);
+}
+.docs th { font-weight: 600; color: var(--ink-soft); white-space: nowrap; }
+.docs td:first-child { font: 13px/1.5 var(--mono); white-space: nowrap; }
+.glossary dt { font-weight: 600; margin-top: 12px; }
+.glossary dd { margin: 2px 0 0 0; color: var(--ink-soft); }
 
 /* --- documentation --- */
 .docs h3 { font-size: 16px; margin: 24px 0 6px; }

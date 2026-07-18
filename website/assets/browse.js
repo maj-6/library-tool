@@ -165,7 +165,7 @@ function renderAuthorCard(author, total) {
   box.hidden = false;
   box.innerHTML = `
     <h2 class="author-card-name">${esc(author)}</h2>
-    <p class="author-stats">${total} work${total === 1 ? "" : "s"} in the catalogue ·
+    <p class="author-stats">${total == null ? "Works" : `${total} work${total === 1 ? "" : "s"}`} in the catalogue ·
       <a href="author.html?author=${encodeURIComponent(author)}">About this author →</a></p>
     <div class="author-card-bio" id="author-card-bio"></div>`;
   const mine = ++authorBioSeq;
@@ -177,6 +177,19 @@ function renderAuthorCard(author, total) {
 }
 
 // ---- render ----------------------------------------------------------------
+// The result-count line. total === null means the rows arrived but the exact
+// count did not (the API omitted or declined it): say so, in words -- an
+// invented "0 volumes" over a page of visible results is worse than honesty.
+function countLabel(total, shown, first) {
+  if (total == null) {
+    return shown ? `Showing ${first}–${first + shown - 1} · count unavailable`
+                 : "Count unavailable";
+  }
+  if (!total) return "0 volumes";
+  return `${total} volume${total === 1 ? "" : "s"}` +
+    (total > PAGE ? ` · showing ${first}–${Math.min(first + shown - 1, total)}` : "");
+}
+
 let seq = 0;
 async function render() {
   const mine = ++seq;                       // a slow query must not overwrite a fast one
@@ -199,11 +212,12 @@ async function render() {
   }
   if (mine !== seq) return;
 
-  const { rows, total } = res;
+  const { rows, total } = res;   // total === null: rows came, the exact count did not
 
   // a stale deep link can point past the last page; snap back to it once
-  if (!rows.length && total > 0 && state.page > 0) {
-    state.page = Math.max(0, Math.ceil(total / PAGE) - 1);
+  // (with no exact count "the last page" is unknowable, so go to the first)
+  if (!rows.length && state.page > 0 && (total == null || total > 0)) {
+    state.page = total == null ? 0 : Math.max(0, Math.ceil(total / PAGE) - 1);
     writeUrl(true);
     return render();
   }
@@ -214,17 +228,21 @@ async function render() {
     ? rows.map(renderRecord).join("")
     : `<li class="empty">${state.q ? `Nothing matches “${esc(state.q)}”.` : "No volumes match these filters."}</li>`;
 
-  const first = state.page * PAGE + 1;
-  el("count").textContent = total
-    ? `${total} volume${total === 1 ? "" : "s"}` +
-      (total > PAGE ? ` · showing ${first}–${Math.min(first + rows.length - 1, total)}` : "")
-    : "0 volumes";
+  el("count").textContent = countLabel(total, rows.length, state.page * PAGE + 1);
 
-  const pages = Math.max(1, Math.ceil(total / PAGE));
-  el("pager").hidden = pages <= 1;
-  el("page").textContent = `Page ${state.page + 1} of ${pages}`;
-  el("prev").disabled = state.page === 0;
-  el("next").disabled = state.page + 1 >= pages;
+  if (total == null) {
+    // still pageable, but the end is unknown: a full page may have a next one
+    el("pager").hidden = state.page === 0 && rows.length < PAGE;
+    el("page").textContent = `Page ${state.page + 1}`;
+    el("prev").disabled = state.page === 0;
+    el("next").disabled = rows.length < PAGE;
+  } else {
+    const pages = Math.max(1, Math.ceil(total / PAGE));
+    el("pager").hidden = pages <= 1;
+    el("page").textContent = `Page ${state.page + 1} of ${pages}`;
+    el("prev").disabled = state.page === 0;
+    el("next").disabled = state.page + 1 >= pages;
+  }
 }
 
 function go(replace) { writeUrl(replace); render(); }
@@ -414,4 +432,5 @@ facetSource()
   })
   .catch(() => {
     el("facet-cats").innerHTML = `<div class="note-more">Categories unavailable.</div>`;
+    el("facet-langs").innerHTML = `<div class="note-more">Languages unavailable.</div>`;
   });

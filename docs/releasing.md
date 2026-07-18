@@ -61,15 +61,21 @@ Two ways a row gets there:
 `.github/workflows/release.yml` runs on the public repo when a `v*` tag is
 pushed:
 
-1. **android** builds `android/BookCapture` (`assembleRelease`, signed with the
-   keystore secret if present, the runner's debug key if not) and names the APK
-   after its gradle `versionName`.
+1. **android** builds `android/BookCapture` (`assembleRelease`) and names the APK
+   after its gradle `versionName`. A tag push **requires** the release keystore
+   secret: without it the android job fails before the APK is uploaded, because a
+   debug-signed build can't update an existing install. The desktop release is
+   independent and still ships. The job then verifies the APK's signer (via
+   `apksigner`) and refuses a debug-signed tagged build. A `workflow_dispatch`
+   dry run without the secret still builds, debug-signed and suffixed
+   `-debug-DONOTPUBLISH.apk` so it can't be mistaken for a release.
 2. **desktop** freezes the Flask sidecar with PyInstaller and runs
    electron-builder on a Windows runner, producing the NSIS installer
    `LibraryTool-Setup-<package.json version>.exe` **plus `latest.yml` and the
    `.blockmap`** — those two are the auto-update channel: installed apps check
    the newest GitHub Release at startup and read them to fetch the update.
 3. **publish** attaches the builds to a GitHub Release named after the tag,
+   using `docs/releases/<tag>.md` as its release notes when that file exists,
    then registers them in the `releases` table via `tools/release_publish.py`
    (URL → the GitHub Release asset). The two apps release independently: the
    job runs when either build succeeded and registers only the artifact(s)
@@ -81,6 +87,7 @@ pushed:
 So cutting a release is:
 
 ```
+# draft docs/releases/v0.4.0.md before tagging
 # bump versions first if warranted:
 #   android/BookCapture/app/build.gradle.kts   versionCode + versionName
 #   desktop/package.json                       version
@@ -98,15 +105,47 @@ and the artifacts are inspectable, nothing is published.
 | `SUPABASE_URL` | variable | already set for the pages workflow |
 | `SUPABASE_ANON_KEY` | variable | baked into the APK at build time so first run needs no typing; blank falls back to the in-app Settings project |
 | `SUPABASE_SERVICE_ROLE_KEY` | secret | writes to `releases` (anon is read-only by RLS). Without it the GitHub Release still happens; the register step warns and skips. |
-| `ANDROID_KEYSTORE_B64` | secret | base64 of the signing keystore. Local copy: `~/.whl-release/bookcapture.jks(.b64)`, password in `bookcapture-keystore-info.txt` next to it. |
+| `ANDROID_KEYSTORE_B64` | secret | **required to publish Android on a tag.** base64 of the signing keystore. Local copy: `~/.whl-release/bookcapture.jks(.b64)`, password in `bookcapture-keystore-info.txt` next to it. |
 | `ANDROID_KEYSTORE_PASSWORD` | secret | its password |
 | `ANDROID_KEY_ALIAS` | secret | `bookcapture` |
 | `WIN_CSC_LINK_B64` | secret | base64 PFX for Windows code signing, passed to electron-builder as `CSC_LINK`. Without it the installer builds unsigned. |
 | `WIN_CSC_KEY_PASSWORD` | secret | its password |
 
-Keep one keystore forever: Android refuses to update an installed app whose
-signing key changed — users would have to uninstall first (settings and the
-capture queue survive an update, not an uninstall).
+A tagged release without these three fails the android job before upload; a
+`workflow_dispatch` dry run may omit them and gets a debug-signed
+`-debug-DONOTPUBLISH.apk` for inspection only.
+
+### Keystore continuity, backup, and recovery
+
+The signing keystore is the app's identity. **Keep one keystore forever:**
+Android refuses to update an installed app whose signing key changed — users
+would have to uninstall first (settings and the capture queue survive an update,
+not an uninstall). If the keystore or its password is ever lost, every existing
+BookCapture install is stranded: the only path forward is a new keystore, a new
+`applicationId`, and a fresh install for everyone.
+
+So treat it as unrecoverable-if-lost and back it up accordingly:
+
+- **The canonical copy** lives at `~/.whl-release/bookcapture.jks`, with its
+  password/alias in `bookcapture-keystore-info.txt` beside it. Both are outside
+  the repo and never committed.
+- **Keep at least one off-machine backup** of `bookcapture.jks` **and** its
+  password, stored together (a password without the keystore, or vice versa, is
+  useless). A password manager entry plus an encrypted copy in separate storage
+  is enough; the file is a few KB.
+- **CI holds only a copy, not the source of truth.** `ANDROID_KEYSTORE_B64` is
+  base64 of the same `.jks`; regenerate it from the local file with
+  `base64 -w0 ~/.whl-release/bookcapture.jks` on Linux, or this raw-base64
+  PowerShell command on Windows:
+  `[Convert]::ToBase64String([IO.File]::ReadAllBytes("$HOME/.whl-release/bookcapture.jks"))`.
+  Do not use `certutil -encode`, which adds PEM headers that the workflow's
+  decoder does not accept. Losing the GitHub secret is recoverable from the
+  local keystore; losing the local keystore is not.
+- **Verify recoverability periodically:** `keytool -list -keystore
+  ~/.whl-release/bookcapture.jks -alias bookcapture` should list the key with the
+  stored password. The release pipeline also prints the published APK's signer
+  DN and certificate SHA-256 digest in its run summary, so the exact signing
+  certificate can be compared across releases.
 
 ## By hand (no CI)
 

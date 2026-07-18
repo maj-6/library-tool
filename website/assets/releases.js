@@ -1,7 +1,6 @@
-// The full release history: every version from changelog.md, grouped by major
-// version (newest first). No cloud needed — the changelog is a static file the
-// site (and the desktop app) share.
-import { fetchChangelog, groupByMajor } from "./data.js";
+// The full release history from changelog.md. No cloud needed — the changelog
+// is a static file the site (and the desktop app) share.
+import { fetchChangelog } from "./data.js";
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -29,15 +28,8 @@ function release(v) {
   </section>`;
 }
 
-function group(g) {
-  return `<section class="cl-major-group">
-    <h2 class="cl-major">${esc(g.major)}.x</h2>
-    ${g.versions.map(release).join("")}
-  </section>`;
-}
-
 const box = document.getElementById("changelog");
 const versions = await fetchChangelog();
 box.innerHTML = versions.length
-  ? groupByMajor(versions).map(group).join("")
+  ? versions.map(release).join("")
   : `<div class="note">No release notes yet.</div>`;

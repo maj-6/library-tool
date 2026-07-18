@@ -2,12 +2,12 @@ name: release
 
 # Build both apps and put them on the website's Downloads page.
 #
-# Push a tag like v3.1 and this builds the Android APK and the Windows
+# Push a tag like v0.8.0-alpha.1 and this builds the Android APK and the Windows
 # installer, attaches them to a GitHub Release named after the tag, and
 # registers each in the Supabase `releases` table — which is the Downloads
 # page's data source, so the site shows the new builds immediately, no
-# redeploy. Each app keeps its own version (gradle versionName, package.json);
-# the tag only names the GitHub Release that hosts the files.
+# redeploy. Each app keeps its own version (gradle versionName, package.json),
+# and the tag must match the desktop version so the updater can order releases.
 #
 # workflow_dispatch runs the two builds as a dry run: artifacts to inspect,
 # nothing published.
@@ -18,11 +18,16 @@ name: release
 #                                      so registering rows needs this. Without
 #                                      it the GitHub Release still happens and
 #                                      the register step says what is missing.
-#   secrets.ANDROID_KEYSTORE_B64       optional but recommended: base64 of the
-#   secrets.ANDROID_KEYSTORE_PASSWORD  signing keystore. Without them each APK
-#   secrets.ANDROID_KEY_ALIAS          is signed with the runner's throwaway
-#                                      debug key, and Android refuses to update
-#                                      an install whose key changed.
+#   secrets.ANDROID_KEYSTORE_B64       required to publish Android on a tag:
+#   secrets.ANDROID_KEYSTORE_PASSWORD  base64 of the signing keystore, its
+#   secrets.ANDROID_KEY_ALIAS          password, and the key alias. A tagged
+#                                      release without them FAILS the android job
+#                                      (Android refuses to update an install
+#                                      whose signing key changed, so a debug-
+#                                      signed APK is unpublishable) — the desktop
+#                                      release is independent and still ships. A
+#                                      workflow_dispatch dry run may omit them and
+#                                      gets a clearly-labelled debug-signed APK.
 
 on:
   push:
@@ -37,10 +42,38 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # The tag drives the GitHub Release and updater channel, while the
+      # installer filename/version comes from package.json. Refuse the entire
+      # release when they disagree: a partial release would otherwise hide the
+      # failure while installed desktop clients never see a newer version.
+      - name: Verify tag matches the desktop version
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          version="$(node -p 'require("./desktop/package.json").version')"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match desktop/package.json v$version"
+            exit 1
+          fi
+
   android:
+    needs: preflight
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
+      signer: ${{ steps.signer.outputs.signer }}
+      signer_sha256: ${{ steps.signer.outputs.sha256 }}
     defaults:
       run:
         working-directory: android/BookCapture
@@ -54,11 +87,12 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Signing key (persistent if the secret is set, debug otherwise)
+      - name: Signing key (persistent release key required for tagged builds)
         env:
           KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
           KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          IS_RELEASE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         run: |
           if [ -n "$KS_B64" ]; then
             # strip any CR/LF/space first: a secret uploaded from a Windows
@@ -71,10 +105,20 @@ jobs:
               echo "WHL_KEYSTORE_PASSWORD=$(printf '%s' "$KS_PASS" | tr -d '\r\n')"
               echo "WHL_KEY_ALIAS=$(printf '%s' "${KS_ALIAS:-bookcapture}" | tr -d '\r\n')"
             } >> "$GITHUB_ENV"
+          elif [ "$IS_RELEASE" = "true" ]; then
+            # A tagged build is published and must stay updatable. The debug key
+            # is ephemeral and Android rejects updates whose signer changed, so
+            # refuse to build a debug-signed release here — before it can be
+            # uploaded. Failing this job drops only Android; the desktop release
+            # is independent and still ships (see the publish job's guard).
+            echo "::error::Tagged Android release requires the persistent signing keystore, but ANDROID_KEYSTORE_B64 is not set. Refusing to build a debug-signed APK that cannot update installs. Add the ANDROID_KEYSTORE_* secrets (docs/releasing.md) and re-run."
+            exit 1
           else
-            echo "::warning::No ANDROID_KEYSTORE_B64 secret: signing with the \
-          runner's debug key, so installing this build over one signed with a \
-          different key needs an uninstall first."
+            # workflow_dispatch dry run: a debug-signed APK is fine to inspect,
+            # but must be clearly labelled as non-publishable (see the naming
+            # step, which appends a DONOTPUBLISH suffix when this is set).
+            echo "WHL_DEBUG_SIGNED=true" >> "$GITHUB_ENV"
+            echo "::warning::No ANDROID_KEYSTORE_B64 secret: this dry-run APK is signed with the runner's debug key. It is NOT publishable and cannot update installs signed with a different key."
           fi
 
       # The anon key is public by design (the website ships it to every
@@ -93,8 +137,58 @@ jobs:
         run: |
           V=$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -1)
           test -n "$V" || { echo "::error::no versionName in app/build.gradle.kts"; exit 1; }
-          mv app/build/outputs/apk/release/app-release.apk "BookCapture-$V.apk"
+          # A dry-run debug build is suffixed so the artifact can never be
+          # mistaken for a publishable release. Tagged builds keep the clean name.
+          if [ "${WHL_DEBUG_SIGNED:-}" = "true" ]; then
+            NAME="BookCapture-$V-debug-DONOTPUBLISH.apk"
+          else
+            NAME="BookCapture-$V.apk"
+          fi
+          mv app/build/outputs/apk/release/app-release.apk "$NAME"
           echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      # Report the signer, and — behind the keystore gate above — refuse a
+      # tagged APK that somehow carries the debug key before it is uploaded.
+      # apksigner ships with the Android build-tools the runner already used to
+      # build; the debug key's distinctive DN is "CN=Android Debug, O=Android".
+      - name: Verify the APK signer
+        id: signer
+        shell: bash
+        env:
+          IS_RELEASE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          APK=$(ls BookCapture-*.apk | head -1)
+          APKSIGNER=$(ls "${ANDROID_SDK_ROOT:-$ANDROID_HOME}"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1 || true)
+          [ -n "$APKSIGNER" ] || APKSIGNER=$(command -v apksigner || true)
+          if [ -z "$APKSIGNER" ]; then
+            echo "::error::apksigner not found on the runner; cannot verify the APK signer before publishing."
+            exit 1
+          fi
+          # Capture first and print second: never let `tee` or another pipeline
+          # command mask apksigner's exit status.
+          if ! "$APKSIGNER" verify --print-certs "$APK" > signer.txt; then
+            cat signer.txt
+            echo "::error::apksigner rejected $APK; refusing to upload it."
+            exit 1
+          fi
+          cat signer.txt
+          # Match any signer block, not just "Signer #1": newer build-tools'
+          # apksigner labels the fields "V2 Signer: certificate DN:" etc., so the
+          # old anchored pattern found nothing and rejected a correctly-signed APK.
+          DN=$(sed -n 's/.*certificate DN: //p' signer.txt | head -1)
+          SHA256=$(sed -n 's/.*certificate SHA-256 digest: //p' signer.txt | head -1)
+          if [ -z "$DN" ] || [ -z "$SHA256" ]; then
+            echo "::error::apksigner did not report a signer DN and SHA-256 certificate digest; refusing to upload an unverifiable APK."
+            exit 1
+          fi
+          echo "signer=$DN" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "- Android APK \`$APK\` signer: \`$DN\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Android APK certificate SHA-256: \`$SHA256\`" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$IS_RELEASE" = "true" ] && printf '%s' "$DN" | grep -qi "Android Debug"; then
+            echo "::error::Tagged APK is signed with the debug key; refusing to publish a non-updatable build."
+            exit 1
+          fi
 
       - name: Keep the APK
         uses: actions/upload-artifact@v4
@@ -104,6 +198,7 @@ jobs:
           if-no-files-found: error
 
   desktop:
+    needs: preflight
     runs-on: windows-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
@@ -191,9 +286,10 @@ jobs:
   # each publish step below is guarded on its artifact being present.
   publish:
     if: |
-      always() && startsWith(github.ref, 'refs/tags/') &&
+      always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') &&
+      needs.preflight.result == 'success' &&
       (needs.desktop.result == 'success' || needs.android.result == 'success')
-    needs: [android, desktop]
+    needs: [preflight, android, desktop]
     runs-on: ubuntu-latest
     steps:
       - name: Check out
@@ -205,6 +301,15 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # The android job verifies the signer and fails before upload if a tagged
+      # APK is debug-signed, so anything reaching here is release-signed. Surface
+      # which key it was for the release record.
+      - name: Report the Android signer
+        if: needs.android.result == 'success' && needs.android.outputs.signer != ''
+        run: |
+          echo "- Published Android BookCapture signer: \`${{ needs.android.outputs.signer }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Published Android certificate SHA-256: \`${{ needs.android.outputs.signer_sha256 }}\`" >> "$GITHUB_STEP_SUMMARY"
+
       - name: GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -215,15 +320,20 @@ jobs:
           notes=""
           [ -n "$EXE_V" ] && notes="Desktop $EXE_V"
           [ -n "$APK_V" ] && notes="${notes:+$notes · }Android BookCapture $APK_V"
-          # A prerelease tag (v0.7.0-alpha.1 / -beta / -rc) is flagged prerelease
-          # on GitHub so the stable auto-updater (allowPrerelease stays false in
-          # desktop/main.js) never offers it — testers still grab it by hand from
-          # the Releases page and the Downloads-page "Other downloads" section.
+          # A prerelease tag (v0.8.0-alpha.1 / -beta / -rc) is flagged prerelease
+          # on GitHub. Stable installs remain on the stable channel; installed
+          # prereleases follow the prerelease line, and stable installs can opt in.
           pre=""
           case "$GITHUB_REF_NAME" in *-alpha*|*-beta*|*-rc*) pre="--prerelease" ;; esac
+          notes_file="docs/releases/$GITHUB_REF_NAME.md"
+          if [ -f "$notes_file" ]; then
+            notes_args=(--notes-file "$notes_file")
+          else
+            notes_args=(--notes "$notes")
+          fi
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag $pre \
-              --title "Library Tool $GITHUB_REF_NAME" --notes "$notes"
+              --title "Library Tool $GITHUB_REF_NAME" "${notes_args[@]}"
           gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
 
       # The step the website actually sees. release_publish.py gets the local

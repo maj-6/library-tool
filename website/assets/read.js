@@ -1,11 +1,14 @@
 // The reader. Self-hosted pdf.js (vendored under assets/vendor/pdfjs/, keeping
-// the no-CDN promise) streams the PDF by HTTP Range — disableAutoFetch means a
-// big scan loads lazily as you scroll. Pages render into a virtualized vertical
+// the no-CDN promise) loads the PDF strictly by HTTP Range — disableAutoFetch +
+// disableStream mean a big scan loads lazily as you scroll, with pdf.js falling
+// back to a single full fetch when the host doesn't support Range/CORS. Pages
+// render into a virtualized vertical
 // scroll: only pages near the viewport hold a canvas; the rest keep a
 // pre-sized placeholder so the scrollbar never jumps. Margin annotations come
 // from volume_notes; a page-aligned text/translation panel from volume_pages.
 
-import { getVolume, getNotes, getPages, pdfHref } from "./data.js";
+import { getVolume, getNotes, getPages, getAllPages, pdfHref, searchVolume, usingCloud } from "./data.js";
+import { normalizeSearchText, findMatchRanges, searchPages, rpcSnippetHtml, rpcHitsUsable } from "./textsearch.js";
 import * as pdfjsLib from "./vendor/pdfjs/build/pdf.min.mjs";
 
 // The worker is a sibling file; resolve it relative to THIS module so it works
@@ -39,6 +42,8 @@ const S = {
   showText: false,
   textLang: "",          // "" = original layer
   textCache: {},         // { lang: { page: text } }
+  searchQuery: "",       // the active in-book search; "" = none
+  searchCache: {},       // { lang: Promise<[{page, body}]> } — the whole text, once
   thumbsBuilt: false,
 };
 
@@ -253,11 +258,128 @@ async function refreshText() {
     if (!body) continue;
     parts.push(`<div class="tp-page ${n === S.current ? "current" : ""}">
         <div class="tp-pnum">Page ${n}</div>
-        <div class="tp-body">${esc(body)}</div>
+        <div class="tp-body">${bodyHtml(body)}</div>
       </div>`);
   }
   el("tp-body").innerHTML = parts.length ? parts.join("") :
     `<p class="note-more">No text for these pages.</p>`;
+}
+
+// A page body for the panel: escaped, with the active search's matches marked.
+// Escape each segment first, then splice the <mark>s between them — a page
+// body must never reach innerHTML raw.
+function bodyHtml(body) {
+  const ranges = S.searchQuery ? findMatchRanges(body, S.searchQuery) : [];
+  if (!ranges.length) return esc(body);
+  let html = "";
+  let at = 0;
+  for (const [s, e] of ranges) {
+    html += `${esc(body.slice(at, s))}<mark>${esc(body.slice(s, e))}</mark>`;
+    at = e;
+  }
+  return html + esc(body.slice(at));
+}
+
+// ---- in-book search ---------------------------------------------------------
+let searchSeq = 0;   // the same stale-response guard refreshText uses
+
+// The whole text layer, fetched once per language and kept as a promise so
+// two quick searches never fire two full fetches.
+function allPagesFor(lang) {
+  if (!S.searchCache[lang]) {
+    S.searchCache[lang] = getAllPages(slug, lang).catch((e) => {
+      delete S.searchCache[lang];    // a failed fetch must stay retryable
+      throw e;
+    });
+  }
+  return S.searchCache[lang];
+}
+
+async function runSearch() {
+  const q = el("tp-q").value.trim();
+  const seq = ++searchSeq;
+  const box = el("tp-results");
+  const nq = normalizeSearchText(q);
+  if (nq.length < 2) {                         // nothing (sensible) to search for
+    S.searchQuery = "";
+    box.hidden = true;
+    box.innerHTML = "";
+    refreshText();
+    return;
+  }
+  S.searchQuery = q;
+  const lang = S.textLang;
+  box.hidden = false;
+
+  // Cloud mode asks the database first: one search_volume round-trip, ranked
+  // by Postgres FTS with a trigram fallback, snippets cut server-side. The
+  // query goes over folded, matching the published search layer, so
+  // "phyſick" finds "physick" there too. Any failure (a live project still
+  // behind on migrations answers 404, or the network is down) or zero hits
+  // falls back silently to the client-side path below, whose own folding may
+  // still match. The panel's in-page highlighting stays local either way.
+  if (usingCloud) {
+    let rows = null;
+    try { rows = await searchVolume(slug, nq, lang); } catch { rows = null; }
+    if (seq !== searchSeq || lang !== S.textLang) return;
+    if (rpcHitsUsable(rows)) {
+      renderHits(rows.map((r) =>
+        ({ page: r.page, html: rpcSnippetHtml(r.snippet), more: 0 })));
+      refreshText();           // the visible pages pick up their <mark>s
+      return;
+    }
+  }
+
+  if (!S.searchCache[lang]) box.innerHTML = `<p class="note-more">Fetching the full text…</p>`;
+  let pages;
+  try {
+    pages = await allPagesFor(lang);
+  } catch {
+    if (seq !== searchSeq) return;
+    box.innerHTML = `<p class="note-more">The text could not be fetched.</p>`;
+    return;
+  }
+  if (seq !== searchSeq || lang !== S.textLang) return;
+  renderHits(searchPages(pages, q));
+  refreshText();               // the visible pages pick up their <mark>s
+}
+
+function snippetHtml(h) {
+  return esc(h.snippet.slice(0, h.matchStart)) +
+    `<mark>${esc(h.snippet.slice(h.matchStart, h.matchEnd))}</mark>` +
+    esc(h.snippet.slice(h.matchEnd));
+}
+
+// One hit row's snippet HTML. Client-side hits carry match offsets into a
+// verbatim snippet and are escaped-then-marked here; RPC hits arrive as
+// prebuilt safe HTML (rpcSnippetHtml) with the fragment ts_headline chose.
+function hitHtml(h) {
+  if (h.html !== undefined) return h.html;
+  return `${h.cutStart ? "…" : ""}${snippetHtml(h)}${h.cutEnd ? "…" : ""}`;
+}
+
+function renderHits(hits) {
+  const box = el("tp-results");
+  box.hidden = false;
+  if (!hits.length) {
+    box.innerHTML = `<p class="note-more">No matches in this text.</p>`;
+    return;
+  }
+  const pageCount = new Set(hits.map((h) => h.page)).size;
+  const total = hits.reduce((n, h) => n + 1 + (h.more || 0), 0);
+  const rows = hits.map((h) => `
+    <button type="button" class="tp-hit" data-page="${h.page}">
+      <span class="tp-hit-page">p. ${h.page}</span>
+      <span class="tp-hit-snip">${hitHtml(h)}</span>
+      ${h.more ? `<span class="tp-hit-more">+${h.more} more on this page</span>` : ""}
+    </button>`).join("");
+  box.innerHTML = `
+    <div class="tp-hits">
+      <div class="tp-hitcount">${total} match${total === 1 ? "" : "es"} · ${pageCount} page${pageCount === 1 ? "" : "s"}</div>
+      ${rows}
+    </div>`;
+  box.querySelectorAll(".tp-hit").forEach((b) =>
+    b.addEventListener("click", () => scrollToPage(Number(b.dataset.page))));
 }
 
 // ---- thumbnails ------------------------------------------------------------
@@ -366,13 +488,14 @@ async function main() {
   try {
     pdf = await pdfjsLib.getDocument({
       url,
-      disableAutoFetch: true,     // stream lazily by range instead of pulling the whole file
-      disableStream: false,
+      disableAutoFetch: true,     // load lazily by range; don't prefetch the rest after a hit
+      disableStream: true,        // and don't open a background full-file stream in parallel
       rangeChunkSize: 65536,
     }).promise;
   } catch (e) {
-    const msg = /fetch|network|CORS|Failed/i.test(String(e && e.message))
-      ? "The scan could not be fetched — it may be offline, or blocked by cross-origin rules."
+    const msg = /fetch|network|CORS|range|206|Failed/i.test(String(e && e.message))
+      ? "The scan could not be fetched. The host must serve it with CORS and HTTP Range " +
+        "(Accept-Ranges) enabled — it may also be offline or blocked by cross-origin rules."
       : `The PDF could not be opened (${esc(e && e.message || "unknown error")}).`;
     message("Cannot open", msg);
     return;
@@ -453,6 +576,14 @@ async function main() {
   }
 
   wireControls();
+
+  // Deep link: ?q= (book.html's search form) opens the panel and runs the search.
+  const deepQ = new URLSearchParams(location.search).get("q") || "";
+  if (deepQ && hasText) {
+    el("tp-q").value = deepQ;
+    if (!S.showText) setText(true);
+    runSearch();
+  }
 }
 
 function wireControls() {
@@ -478,6 +609,24 @@ function wireControls() {
     S.textLang = el("tp-lang").value;
     refreshText();
     savePrefs();
+    if (el("tp-q").value.trim()) runSearch();   // re-run against the new layer
+  });
+
+  let searchTimer;
+  el("tp-q").addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(runSearch, 300);
+  });
+  el("tp-q").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      clearTimeout(searchTimer);
+      runSearch();
+    } else if (ev.key === "Escape") {
+      el("tp-q").value = "";
+      clearTimeout(searchTimer);
+      runSearch();
+    }
   });
 
   let resizeTimer;

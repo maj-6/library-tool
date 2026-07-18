@@ -64,13 +64,14 @@ Updates** can switch the check off or opt a stable install into prereleases;
 an installed alpha/beta/rc always follows its own prerelease line.
 
 Publishing goes through CI (`../.github/workflows/release.yml`; full
-mechanics in `../docs/releasing.md`): bump `version` in package.json, tag
+mechanics in `../docs/releasing.md`): bump `version` in package.json (and the
+Android version when its APK rides along), commit the bumps, then tag
 `v<version>` — or `v<version>-alpha.N` for a testing build, which is flagged
 prerelease on GitHub so stable installs never auto-update to it — and push
 the tag. The workflow builds the sidecar + installer, signs when the signing
 secret is set, publishes the GitHub Release (exe + `.exe.blockmap` +
-`latest.yml`), and registers the row on the website's Downloads page. The
-manual fallback is: build, then
+`latest.yml`, plus the APK when it rides along), and registers the row on the
+website's Downloads page. The manual fallback is: build, then
 
 ```
 gh release create v<version> release/LibraryTool-Setup-<version>.exe release/LibraryTool-Setup-<version>.exe.blockmap release/latest.yml --title v<version>
@@ -78,7 +79,6 @@ gh release create v<version> release/LibraryTool-Setup-<version>.exe release/Lib
 
 `latest.yml` and the `.blockmap` are what electron-updater reads; without
 them the check is a no-op.
-
 ### Downloading the databases (offline search)
 
 The installer stays small on purpose: Tesseract, optional API keys, and the

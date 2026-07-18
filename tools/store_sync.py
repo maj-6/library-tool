@@ -5,7 +5,7 @@ whl_corrections.json and output/entries/ from version control on the promise
 that they would sync through the cloud instead; this module is that channel.
 
 The three JSON stores sync record-by-record against their Supabase tables
-(builds / ia_catalog / corrections — see docs/cloud/schema.sql), merged by
+(builds / ia_catalog / corrections — see docs/cloud/migrations/), merged by
 last-write-wins on updated_at. A local SHADOW LEDGER (output/cloud_shadow.json,
 what the cloud looked like after the last sync) is what tells "deleted here"
 apart from "added there", so no UI endpoint needs delete hooks. Deletes
@@ -56,8 +56,9 @@ SHADOW_PATH = lib.OUTPUT_DIR / "cloud_shadow.json"
 BACKUP_KEEP = 20
 _shadow_lock = threading.Lock()
 
-# corrections has no lock in server.py; syncing adds a second writer, so it
-# brings its own. builds/ia_catalog use the server's locks when run in-process.
+# In-process the server passes its own per-store locks into sync_stores, so
+# sync and route writes serialize on the same lock. This fallback only covers
+# the standalone CLI, where this module is the sole (single-threaded) writer.
 _corrections_lock = threading.Lock()
 
 

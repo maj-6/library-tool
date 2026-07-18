@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>API &amp; file format · Library Tool</title>
+<meta name="description" content="The .lib book archive format, the validate endpoint, and the libformat Python API — for tool authors and AI assistants." />
+<link rel="icon" href="assets/icon.png" />
+<link rel="stylesheet" href="assets/site.css" />
+</head>
+<body>
+<header class="site">
+  <div class="wrap">
+    <img src="assets/icon.png" alt="" />
+    <div class="name">Library Tool</div>
+    <a class="gh" href="https://github.com/maj-6/library-tool" target="_blank" rel="noopener" aria-label="Source on GitHub">
+      <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+    </a>
+  </div>
+</header>
+
+<div class="shell wrap">
+  <aside class="side">
+    <nav class="site">
+      <a href="index.html">About</a>
+      <a href="downloads.html">Downloads</a>
+      <a href="releases.html">Release notes</a>
+      <a href="docs.html">Documentation</a>
+      <a href="api.html" aria-current="page">API &amp; file format</a>
+      <a href="browse.html">Archive Browser</a>
+    </nav>
+  </aside>
+
+  <main class="docs">
+    <h1>API &amp; file format</h1>
+    <p class="lede">The <span class="mono">.lib</span> book archive, the
+      validate endpoint, and the <span class="mono">libformat</span> Python
+      API — for tool authors and AI assistants. User documentation lives on
+      the <a href="docs.html">Documentation</a> page.</p>
+
+    <nav class="toc" aria-label="On this page">
+      <a href="#container">The container</a>
+      <a href="#manifest">The manifest</a>
+      <a href="#regions">Pages and regions</a>
+      <a href="#rules">Editing rules</a>
+      <a href="#translations">Translations</a>
+      <a href="#receipt">Import receipt and validation</a>
+      <a href="#python">Python API</a>
+      <a href="#sample">Sample file</a>
+    </nav>
+
+    <h2 id="container">The container</h2>
+    <p>A <span class="mono">.lib</span> is a book from a Library Tool archive
+      sealed into a plain ZIP: everything an external tool — including an AI
+      assistant with no prior knowledge of Library Tool — needs to understand,
+      edit, and return it without breaking it. The file teaches its reader:
+      every archive ships its own instructions and schema.</p>
+<pre>herbal.lib
+├─ book.json            manifest: format version, identity, metadata,
+│                       roles, stylesheet, templates, figures, page list
+├─ INSTRUCTIONS.md      generated contract for humans and LLMs
+├─ schema.json          JSON Schema (draft 2020-12) for the JSON members
+├─ pages/&lt;N&gt;.json       one per page: dims, review state, regions
+├─ translations/&lt;lang&gt;.json   page-aligned translations (optional)
+└─ assets/img/&lt;name&gt;    figure crops referenced by figure regions</pre>
+    <p>The current revision is <span class="mono">format_version: "2.0"</span>
+      (“lib/2”). Versioning is <span class="mono">MAJOR.MINOR</span>: MINOR
+      additions are optional and ignorable, a higher MAJOR is rejected with a
+      clear error. Older <span class="mono">lib/1</span> files (the bare
+      <span class="mono">"format": "lib/1"</span> marker) import forever and
+      upgrade on ingest.</p>
+
+    <h2 id="manifest">The manifest (book.json)</h2>
+    <table>
+      <tr><th>key</th><th>meaning</th></tr>
+      <tr><td>format_version</td><td>"2.0". Do not touch.</td></tr>
+      <tr><td>generator</td><td>The writing tool, e.g. "library-tool/0.8.0".</td></tr>
+      <tr><td>book_id</td><td>Stable UUID, minted once per book and kept across
+        re-exports — track a book across revisions with it. Do not touch.</td></tr>
+      <tr><td>meta</td><td>Bibliographic snapshot: title, subtitle, authors,
+        year, publisher, edition, volume, language, pages, source_url.</td></tr>
+      <tr><td>capabilities</td><td>What the file carries, e.g.
+        ["norm-layer", "templates", "figures", "translations", "ext", "rid"].</td></tr>
+      <tr><td>roles</td><td>The full region-role vocabulary <em>as data</em>:
+        <span class="mono">{role: {furniture, note}}</span>. Furniture roles
+        (running heads, margin notes, catchwords…) stay out of the compiled
+        body text.</td></tr>
+      <tr><td>instructions</td><td><span class="mono">{general_ref:
+        "INSTRUCTIONS.md", book: "…"}</span> — the per-book free-text guidance
+        for editors and AI assistants.</td></tr>
+      <tr><td>stylesheet</td><td>Role → modern-type mapping (family, size_em,
+        style, variant, align, color, bg). Open-licensed faces only.</td></tr>
+      <tr><td>templates</td><td>Reusable layout grids (geometry + roles, no
+        text).</td></tr>
+      <tr><td>figures</td><td>Figure inventory: <span class="mono">{name:
+        {page, x, y, w, h, rework_of?}}</span>, one entry per
+        <span class="mono">assets/img/</span> member.</td></tr>
+      <tr><td>pages</td><td>The exported page numbers.</td></tr>
+      <tr><td>ext</td><td>Third-party namespace, round-tripped verbatim
+        (size-capped). Also allowed per page and per region. The sanctioned
+        home for custom data — everything else unknown is dropped.</td></tr>
+    </table>
+
+    <h2 id="regions">Pages and regions</h2>
+    <p>A page (<span class="mono">pages/&lt;N&gt;.json</span>) is a list of
+      typed boxes in reading order:</p>
+<pre>{ "page": 7, "doc": "compiled.txt", "dims": { "w": 1400, "h": 1798, "dpi": 200 },
+  "state": "verified",
+  "items": [
+    { "id": "r0", "rid": "k3f9a2", "role": "body", "src_type": "human",
+      "order": 0, "box": { "x": 0.2, "y": 0.1, "w": 0.6, "h": 0.7 },
+      "text": "diplomatic transcription…",
+      "norm": "the modern reading…" } ] }</pre>
+    <ul>
+      <li><strong>box</strong> — 0..1 fractions of the page (x, y top-left;
+        w, h size). Never pixels.</li>
+      <li><strong>text</strong> — the diplomatic transcription, faithful to the
+        scan (long ſ, original spelling). <strong>norm</strong> — the optional
+        modern-edition reading. Two layers of one region; keep both.</li>
+      <li><strong>rid</strong> — stable identity, preserved across round trips;
+        <strong>order</strong> — reading order; <strong>id</strong> —
+        positional, regenerated on save (kept for back-compat).</li>
+      <li>A <strong>figure</strong> region's text is its
+        <span class="mono">![id](id)</span> placeholder — leave it be.</li>
+    </ul>
+
+    <h2 id="rules">Editing rules</h2>
+    <p>The invariants, stated imperatively. A file that follows them imports
+      with zero warnings.</p>
+    <ol>
+      <li>Never renumber or rename <span class="mono">pages/&lt;N&gt;.json</span> —
+        the page number is the key.</li>
+      <li>Never invent roles; use the vocabulary in
+        <span class="mono">book.json.roles</span>. Custom data goes in
+        <span class="mono">ext</span>, never in new roles or new top-level
+        keys.</li>
+      <li>Translations and modernized text go in each region's
+        <span class="mono">norm</span> layer or a
+        <span class="mono">translations/&lt;lang&gt;.json</span> member — never
+        overwrite <span class="mono">text</span>.</li>
+      <li>Reworked or colorized images: write a <em>new</em> file under
+        <span class="mono">assets/img/</span> and add a figure entry with
+        <span class="mono">rework_of: "&lt;original&gt;"</span> — never replace
+        the original.</li>
+      <li>Do not touch <span class="mono">format_version</span>,
+        <span class="mono">book_id</span>, region <span class="mono">rid</span>s,
+        or the provenance fields (<span class="mono">src_type</span>,
+        <span class="mono">rework_of</span>).</li>
+    </ol>
+
+    <h2 id="translations">Translations</h2>
+    <p><span class="mono">translations/&lt;bcp47&gt;.json</span> carries
+      page-aligned translated text. The app's translation store is page-grained,
+      so each page's value is an object whose reserved
+      <span class="mono">_page</span> key holds the whole page's text — a shape
+      that stays valid if per-region (<span class="mono">rid</span>-keyed)
+      translations arrive in a later MINOR revision. Import also accepts a
+      plain string per page, or a rid → text map (joined in key order).</p>
+<pre>{ "lang": "ja", "pages": { "7": { "_page": "…翻訳されたテキスト…" } } }</pre>
+
+    <h2 id="receipt">Import receipt and validation</h2>
+    <p>Nothing is dropped silently. Every import returns a receipt naming what
+      landed and, in <span class="mono">warnings[]</span>, everything that was
+      coerced or skipped — with its location and reason. The same lint pass runs
+      with no side effects against the app's local API (the desktop app serves
+      it on loopback):</p>
+<pre>POST /api/lib/validate          multipart form, field "lib"
+
+{ "ok": true, "format_version": "2.0", "pages": 12,
+  "warnings": [ { "loc": "pages/3.json[1]",
+                  "msg": "role 'headline' coerced to 'body': …" } ],
+  "errors": [] }</pre>
+    <p>With <span class="mono">overwrite=1</span> on import, a figure whose
+      name collides is replaced only when the incoming entry carries
+      <span class="mono">rework_of</span> — deliberate rework wins, accidental
+      collision skips with a warning.</p>
+
+    <h2 id="python">Python API</h2>
+    <p><span class="mono">tools/libformat.py</span> is the format's single
+      implementation — standalone, no web framework, importable by external
+      scripts. The app's own import/export routes call the same code, so a file
+      that round-trips through it cannot come out a shape the app rejects.</p>
+<pre>import libformat
+
+doc = libformat.read_lib("herbal.lib")        # -> LibDocument
+issues = libformat.validate(doc)              # -> [Issue(level, loc, msg)]
+doc.pages[0].items[0]["norm"] = "the modern reading"
+libformat.write_lib(doc, "herbal-edited.lib") # seals + re-sanitizes
+
+libformat.ROLE_VOCAB          # role -> {furniture, note}
+libformat.FORMAT_VERSION      # "2.0"</pre>
+
+    <h2 id="sample">Sample file</h2>
+    <p>A tiny complete archive to test against — one page, two regions, one
+      figure, with its generated <span class="mono">INSTRUCTIONS.md</span> and
+      <span class="mono">schema.json</span>:
+      <a href="fixtures/sample.lib" download>sample.lib</a>.</p>
+
+    <p class="muted">Found something wrong or missing? Please
+      <a href="https://github.com/maj-6/library-tool/issues">open an issue</a>.</p>
+  </main>
+</div>
+</body>
+</html>

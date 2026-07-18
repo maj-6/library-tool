@@ -252,7 +252,11 @@ def main() -> None:
 
     a = sub.add_parser("add", help="create a worktree + branch")
     a.add_argument("name")
-    a.add_argument("--base", default="master", help="branch to fork from (default: master)")
+    # main, not master: local master is the STALE pre-inversion line (see the
+    # 2026-07-11 divergence note) — a worktree forked from it silently loses
+    # every feature landed since, and the loss only surfaces when a function
+    # you expect is missing.
+    a.add_argument("--base", default="main", help="branch to fork from (default: main)")
     a.add_argument("--port", type=int, help="override the assigned port")
     a.add_argument("--full", action="store_true", help="check out photo/ and books/ too (tracked transcripts; +273 MB of images on pre-corpus-sync bases)")
     a.add_argument("--seed", action="store_true",

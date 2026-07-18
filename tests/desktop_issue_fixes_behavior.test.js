@@ -16,6 +16,98 @@ function block(startMarker, endMarker) {
   return source.slice(start, end);
 }
 
+function declaration(name) {
+  const marker = `function ${name}(`;
+  const start = source.indexOf(marker);
+  assert.ok(start >= 0, `${name} declaration is present`);
+  const end = /^}\r?$/m.exec(source.slice(start));
+  assert.ok(end, `${name} declaration has a closing brace`);
+  return source.slice(start, start + end.index + end[0].length);
+}
+
+function copyrightSortHarness() {
+  const lookups = [];
+  const lookupStatuses = new Map();
+  const context = vm.createContext({
+    copyrightStatusForSort: (book) => {
+      lookups.push({
+        title: book.title,
+        author: book.author,
+        year: book.year,
+      });
+      return lookupStatuses.get(book.title) || "";
+    },
+  });
+  vm.runInContext([
+    declaration("sortRowsBy"),
+    declaration("copyrightState"),
+    declaration("copyrightSortRank"),
+    declaration("checkedSortVal"),
+    declaration("whlSortVal"),
+    "this.api = { sortRowsBy, copyrightState, copyrightSortRank, checkedSortVal, whlSortVal };",
+  ].join("\n"), context);
+  return { api: context.api, lookups, lookupStatuses };
+}
+
+test("copyright sort follows rights meaning instead of status label spelling", () => {
+  const { api } = copyrightSortHarness();
+  const rows = [
+    { id: "blank", status: "" },
+    { id: "copyright", status: "In copyright (renewal R12345)" },
+    { id: "unknown", status: "Unknown (renewals database missing)" },
+    { id: "public-renewal", status: "Public domain (no renewal found)" },
+    { id: "public-age", status: "Public domain (published 1928)" },
+  ];
+
+  const sorted = api.sortRowsBy(
+    rows, (row) => api.copyrightSortRank(row.status), 1);
+
+  assert.deepEqual(Array.from(sorted, (row) => row.id), [
+    "public-age",
+    "public-renewal",
+    "unknown",
+    "copyright",
+    "blank",
+  ]);
+});
+
+test("checked copyright sort values use semantic ranks", () => {
+  const { api } = copyrightSortHarness();
+  for (const status of [
+    "Public domain (published 1928)",
+    "Public domain (no renewal found)",
+    "Unknown (no year)",
+    "In copyright (auto-renewed)",
+    "",
+  ]) {
+    const row = { book: {}, checks: status ? { copyright_status: status } : null };
+    assert.equal(
+      api.checkedSortVal(row, "copyright"),
+      api.copyrightSortRank(status),
+    );
+  }
+});
+
+test("WHL copyright sorting looks up the displayed book identity", () => {
+  const { api, lookups, lookupStatuses } = copyrightSortHarness();
+  lookupStatuses.set("Fauna and Flora of the Bible", "In copyright");
+  const row = {
+    title: "Fauna and Flora of the Bible",
+    authors: "United Bible Societies",
+    year: "1980",
+  };
+
+  assert.equal(
+    api.whlSortVal(row, "copyright"),
+    api.copyrightSortRank("In copyright"),
+  );
+  assert.deepEqual(lookups, [{
+    title: "Fauna and Flora of the Bible",
+    author: "United Bible Societies",
+    year: "1980",
+  }]);
+});
+
 function downloadHarness() {
   const state = {
     settings: { autoIaDownload: true },

@@ -52,9 +52,10 @@ function card(r, opts = {}) {
     ? ` <span class="dl-tag is-pre">${esc(chan)}</span>`
     : (p.tag ? ` <span class="dl-tag">${esc(p.tag)}</span>` : "");
   const primary = !isPre && r.platform === "windows";
+  // no link = plain visible metadata, never a dead button-shaped control
   const action = href
     ? `<a class="dl-btn" href="${esc(href)}">${DL_ARROW}Download</a>`
-    : `<a class="dl-btn" aria-disabled="true" title="No download link">Unavailable</a>`;
+    : `<span class="dl-unavail">Unavailable</span>`;
   return `<div class="dl-row${primary ? " is-primary" : ""}">
     ${platIcon(r.platform)}
     <div class="dl-body">
