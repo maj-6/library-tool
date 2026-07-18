@@ -19,8 +19,12 @@ def _function(name: str, next_name: str) -> str:
 def test_setup_guide_covers_current_user_workflow_and_personal_keys():
     for step in ("welcome", "account", "services", "db", "done"):
         assert f'data-step="{step}"' in WIZARD
-    for tab in ("Catalogs", "Editor", "Analyze", "Home"):
+    for tab in ("Catalogs", "Workbench", "Published Library", "Home"):
         assert f"<b>{tab}</b>" in WIZARD
+    assert "Record, Source, Text, Knowledge, and Publish" in WIZARD
+    assert "<b>Editor</b>" not in WIZARD
+    assert "<b>Analyze</b>" not in WIZARD
+    assert "Analyze tools" not in WIZARD
     assert 'id="wiz-mistral"' in WIZARD
     assert 'id="wiz-deepseek"' in WIZARD
     assert WIZARD.count('type="password"') == 2
@@ -33,6 +37,21 @@ def test_setup_guide_does_not_request_owner_or_cloud_project_secrets():
     ):
         assert forbidden not in WIZARD
     assert "personal service keys" in WIZARD
+
+
+def test_current_workflow_copy_does_not_route_users_to_retired_tabs():
+    for retired in (
+        "approved sources land in the EDITOR tab",
+        "Verified source(s) ready — see the Editor tab",
+        "attach one in the Editor tab",
+        "Draft (in the editor)",
+        "OPEN LIBRARY ROWS HAVE NO EDITOR",
+        "ANALYZE ::",
+    ):
+        assert retired not in APP
+    assert "approved sources become available in Workbench › Record" in APP
+    assert "No PDF for this document — attach one in the Workbench Source phase" in APP
+    assert "WORKBENCH ::" in APP
 
 
 def test_setup_guide_persists_keys_through_the_secret_store():

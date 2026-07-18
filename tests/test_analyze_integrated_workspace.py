@@ -95,17 +95,47 @@ def test_source_viewer_agrees_with_the_chip_and_workbench_hides_dup_chrome():
             "{ flex: 1 1 60px; min-width: 60px; max-width: 130px; }") in STYLE
 
 
-def test_workbench_readiness_chips_compute_client_side_per_phase():
-    ready = _between(APP, "function wbReadiness", "function renderWorkbenchChips")
+def test_workbench_readiness_lives_on_the_single_phase_rail():
+    ready = _between(APP, "function wbReadiness", "function renderWorkbenchRail")
     assert "ocrBookPdf(b.id)" in ready                       # source
     assert "f.stale === true" in ready                       # text (#135 markers)
     assert "b.ocr_verified" in ready
     assert "summary.exists" in ready and "about.exists" in ready
     assert "outdated" in ready
     assert "b.published_slug" in ready                       # publish
-    chips = _between(APP, "function renderWorkbenchChips", "function renderWorkbench()")
-    assert 'data-phase="${p}"' in chips                      # chip click = jump
-    assert "wb-chip" in chips
+    rail = _between(APP, "function renderWorkbenchRail", "function renderWorkbench()")
+    assert '#wb-rail .wb-phase-btn' in rail
+    assert 'setAttribute("aria-current", "step")' in rail
+    assert "wb-phase-badge" in rail
+    assert "wb-chip" not in rail
+    assert 'id="wb-chips"' not in TEMPLATE
+    assert ".wb-chip" not in STYLE
+    # Entry creation remains available in the activity bar and the empty
+    # state, without a third copy that overflows the fixed-width sidebar.
+    assert 'id="build-new"' in TEMPLATE
+    assert 'id="build-new-empty"' in TEMPLATE
+    assert 'id="build-new-side"' not in TEMPLATE
+
+
+def test_workbench_sidebar_controls_are_named_and_keyboard_operable():
+    toolbar = _between(TEMPLATE, '<div class="pane-bar" id="builds-tabs">', "</div>")
+    assert 'aria-label="Show verified books only"' in toolbar
+    assert 'aria-pressed="false"' in toolbar
+    assert 'aria-label="Collapse the entries and artifacts sidebar"' in toolbar
+    assert 'aria-controls="ocr-side"' in toolbar
+
+    render = _between(APP, "function renderOcrBooks", "async function selectOcrBook")
+    assert 'verifiedFilter.setAttribute("aria-pressed"' in render
+    assert 'li.setAttribute("role", "button")' in render
+    assert 'li.setAttribute("aria-expanded"' in render
+    row = _between(APP, "function appendBuildListItem", "// Publish a verified entry")
+    assert 'li.tabIndex = 0' in row
+    assert 'li.setAttribute("aria-current", "true")' in row
+    keyboard = _between(APP, 'el("ocr-books").addEventListener("keydown"',
+                        'el("ocr-docs").addEventListener("click"')
+    assert 'ev.key !== "Enter" && ev.key !== " "' in keyboard
+    assert "row.click()" in keyboard
+    assert ".build-item:focus-visible" in STYLE
 
 
 def test_analyze_facsimile_and_artifact_tree_contracts():
