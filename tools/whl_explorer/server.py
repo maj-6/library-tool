@@ -2484,8 +2484,14 @@ def api_build_folder_sync(build_id: str):
             try:
                 blanks = _blank_pages(src)
                 if blanks:
-                    deletion = _apply_page_deletion(build_id, builds, src, blanks)
+                    deletion = _apply_page_deletion(
+                        build_id, builds, src, blanks,
+                        expected_revision=str(
+                            b.get("updated_at") or "unversioned"))
                     page_remap = deletion.get("page_remap")
+                    notes.extend(
+                        f"page deletion warning: {warning}"
+                        for warning in deletion.get("warnings") or [])
                     b = builds[build_id]
                     # the folder metadata must reflect the remapped
                     # title_pages, not the pre-trim snapshot
@@ -4474,21 +4480,44 @@ def api_pdf_words():
                     "source": source, "lines": lines})
 
 
-def _src_key_for_path(build: dict, pdf: Path) -> str:
-    """Which source a resolved PDF path is for this build: 'primary' (its
-    pdf_file) or a secondary id from pdf_sources. The primary claims the file
-    first, so a scan attached as both still counts as primary."""
+def _attached_src_key_for_path(build: dict, pdf: Path) -> str:
+    """Return the exact attached source for ``pdf``, or ``""`` if unmatched.
+
+    Destructive page operations must use this strict form: treating an
+    arbitrary local PDF as the primary source would delete that unrelated file
+    while renumbering this build's OCR and remarks.
+    """
     try:
         pdfr = pdf.resolve()
     except OSError:
-        return "primary"
+        return ""
     primary = _resolve_local(str(build.get("pdf_file") or ""))
-    if primary is not None and primary.resolve() == pdfr:
-        return "primary"
+    try:
+        if primary is not None and primary.resolve() == pdfr:
+            return "primary"
+    except OSError:
+        pass
     for s in (build.get("pdf_sources") or []):
+        if not isinstance(s, dict):
+            continue
         sp = _resolve_local(str(s.get("path") or ""))
-        if sp is not None and sp.resolve() == pdfr:
-            return s.get("id") or "primary"
+        try:
+            if sp is not None and sp.resolve() == pdfr:
+                return str(s.get("id") or "")
+        except OSError:
+            continue
+    return ""
+
+
+def _src_key_for_path(build: dict, pdf: Path) -> str:
+    """Which source a resolved PDF path is for this build.
+
+    Legacy read-only callers treat an unmatched path as primary. Destructive
+    callers use ``_attached_src_key_for_path`` and reject an unmatched path.
+    """
+    attached = _attached_src_key_for_path(build, pdf)
+    if attached:
+        return attached
     return "primary"
 
 
@@ -5480,6 +5509,64 @@ _page_structure_lock = threading.RLock()
 _page_structure_revision: dict[str, int] = {}
 
 
+class _PageStructureConflict(ValueError):
+    """A destructive request targets a stale page grid or detached PDF."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def _page_deletion_target(build_id: str, pdf: Path,
+                          expected_revision: str,
+                          reserve: bool) -> tuple[dict, str]:
+    """Validate the current grid/source and optionally reserve its next token."""
+    expected_revision = str(expected_revision or "")
+    with _builds_lock:
+        current = lib.load_json(BUILDS_PATH, {})
+        build = current.get(build_id)
+        if not isinstance(build, dict):
+            raise _PageStructureConflict(
+                "stale_page_revision",
+                "book changed; reopen it before deleting pages")
+        revision = str(build.get("updated_at") or "unversioned")
+        if not expected_revision or expected_revision != revision:
+            raise _PageStructureConflict(
+                "stale_page_revision",
+                "page changed; reopen it before deleting pages")
+        src_key = _attached_src_key_for_path(build, pdf)
+        if not src_key:
+            raise _PageStructureConflict(
+                "pdf_not_attached",
+                "PDF attachment changed; reopen the book before deleting pages")
+        if reserve:
+            build["updated_at"] = _build_updated_at(build.get("updated_at"))
+            lib.save_json(BUILDS_PATH, current)
+        return build, src_key
+
+
+def _validate_page_deletion(build_id: str, pdf: Path,
+                            expected_revision: str) -> tuple[dict, str]:
+    """Reject stale revisions and detached paths before inspecting the PDF."""
+    return _page_deletion_target(
+        build_id, pdf, expected_revision, reserve=False)
+
+
+def _reserve_page_deletion(build_id: str, pdf: Path,
+                           expected_revision: str) -> tuple[dict, str]:
+    """Revalidate and durably advance the page-grid token before PDF commit.
+
+    This runs while ``_page_structure_lock`` is held. The compare-and-bump is
+    one ``_builds_lock`` transaction, so a concurrent metadata save cannot
+    slip between validation and reservation. Advancing before ``replace`` is
+    deliberately conservative: a later pre-commit failure may force the user
+    to reopen the page, but a committed deletion can never leave an old review
+    token valid merely because the post-commit metadata merge failed.
+    """
+    return _page_deletion_target(
+        build_id, pdf, expected_revision, reserve=True)
+
+
 def _ocr_job_start_guarded(job: dict, source_revision: int,
                            record_source: bool = False) -> bool:
     """Register/start OCR atomically against page deletion."""
@@ -5702,7 +5789,7 @@ def _remapped_page_remark_value(value, old_page: int, new_page: int):
 
 
 def _remap_page_attention_references(build_id: str, source_id: str,
-                                     removed: list[int]) -> None:
+                                     removed: list[int]) -> list[str]:
     """Keep personal page marks and shared threads bound to physical pages.
 
     Deleted personal marks disappear with their target. Deleted shared threads
@@ -5711,7 +5798,8 @@ def _remap_page_attention_references(build_id: str, source_id: str,
     """
     removed = sorted({int(page) for page in removed if int(page) > 0})
     if not removed:
-        return
+        return []
+    warnings = []
 
     try:
         with _client_state_lock:
@@ -5751,6 +5839,7 @@ def _remap_page_attention_references(build_id: str, source_id: str,
                 lib.save_json(lib.CLIENT_STATE_PATH, client)
     except Exception as exc:
         log.warning("could not remap page attention state: %s", exc)
+        warnings.append("personal attention marks could not be renumbered")
 
     try:
         with _reviews_lock:
@@ -5787,12 +5876,14 @@ def _remap_page_attention_references(build_id: str, source_id: str,
                 lib.save_json(REVIEWS_PATH, reviews)
     except Exception as exc:
         log.warning("could not remap page review references: %s", exc)
+        warnings.append("shared review threads could not be renumbered")
+    return warnings
 
 
 @app.route("/api/pdf/pages/delete", methods=["POST"])
 def api_pdf_pages_delete():
     """Delete pages from a build's PDF — the real file, not a preview.
-    Body: {build_id, pdf, pages: [1-based numbers]}.
+    Body: {build_id, pdf, pages: [1-based numbers], page_revision}.
 
     The pre-deletion file is kept next to the PDF as <name>.bak.pdf
     (overwritten by the next deletion), the build's OCR files get their
@@ -5800,6 +5891,7 @@ def api_pdf_pages_delete():
     stays aligned with the new page numbering."""
     p = request.get_json(silent=True) or {}
     build_id = str(p.get("build_id") or "")
+    expected_revision = str(p.get("page_revision") or "")
     builds = lib.load_json(BUILDS_PATH, {})
     if build_id not in builds:
         abort(404)
@@ -5830,7 +5922,12 @@ def api_pdf_pages_delete():
     if not pages:
         return jsonify({"ok": False, "error": "no pages selected"})
     try:
-        result = _apply_page_deletion(build_id, builds, pdf, pages)
+        result = _apply_page_deletion(
+            build_id, builds, pdf, pages,
+            expected_revision=expected_revision)
+    except _PageStructureConflict as exc:
+        return jsonify({"ok": False, "error": str(exc),
+                        "conflict": exc.code}), 409
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)})
     except Exception as exc:
@@ -5840,22 +5937,30 @@ def api_pdf_pages_delete():
 
 
 def _apply_page_deletion(build_id: str, builds: dict, pdf: Path,
-                         pages: list[int]) -> dict:
+                         pages: list[int],
+                         expected_revision: str | None = None) -> dict:
     """Guard the page structure while every page-keyed derivative is remapped."""
     with _page_structure_lock:
+        if expected_revision is not None:
+            # Reject a stale grid or detached path before even inspecting a
+            # caller-selected file. The reservation inside the locked rewrite
+            # rechecks both after PDF validation, closing the metadata-race gap.
+            _validate_page_deletion(
+                build_id, pdf, expected_revision)
         if _page_job_blockers(build_id):
             raise ValueError("a page-processing job is running for this book")
-        result = _apply_page_deletion_locked(build_id, builds, pdf, pages)
-        _page_structure_revision[build_id] = (
-            _page_structure_revision.get(build_id, 0) + 1)
-        return result
+        return _apply_page_deletion_locked(
+            build_id, builds, pdf, pages,
+            expected_revision=expected_revision)
 
 
 def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
-                                pages: list[int]) -> dict:
+                                pages: list[int],
+                                expected_revision: str | None = None) -> dict:
     """Rewrite the PDF without the given pages (backup kept), renumber the
     build's OCR files, and remap title_pages. Shared by the deletion
-    endpoint and blank-page trimming. Raises ValueError on refusal."""
+    endpoint and blank-page trimming. Raises ValueError only before the live
+    PDF replacement; later derivative failures return partial warnings."""
     from pypdf import PdfReader, PdfWriter
     import shutil
     reader = PdfReader(str(pdf))
@@ -5865,6 +5970,24 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
         raise ValueError("cannot delete every page")
     if len(keep) == total:
         raise ValueError("pages out of range")
+    # Resolve every source-scoped input before the live PDF changes. Failures
+    # here remain ordinary refusals; after tmp.replace(pdf), the deletion has
+    # committed and derivative failures must be reported as partial success.
+    if expected_revision is None:
+        # Direct helper callers predate the HTTP concurrency contract. Keep
+        # their in-memory/test behavior, while every destructive request path
+        # supplies a revision and takes the strict reservation path below.
+        b = builds[build_id]
+        src_key = _src_key_for_path(b, pdf)
+        build_persisted = build_id in lib.load_json(BUILDS_PATH, {})
+    else:
+        b, src_key = _reserve_page_deletion(
+            build_id, pdf, expected_revision)
+        builds[build_id] = b
+        build_persisted = True
+    actual_pages = [page for page in pages if page <= total]
+    srcmap = _ocr_sources(build_id)
+    ocr_dir = _entry_dir(build_id) / "ocr"
     # safety net: the previous version stays recoverable
     shutil.copy2(pdf, pdf.with_suffix(".bak.pdf"))
     writer = PdfWriter()
@@ -5874,48 +5997,74 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
     with open(tmp, "wb") as fh:
         writer.write(fh)
     tmp.replace(pdf)
+    # The live page grid has committed. Advance the process-local job token
+    # immediately, before any best-effort derivative work can fail, so a job
+    # prepared against the old numbering can never start afterward.
+    _page_structure_revision[build_id] = (
+        _page_structure_revision.get(build_id, 0) + 1)
     # keep the build's OCR files and title pages aligned with the new
     # numbering (under the merge lock: a job finishing this instant must
     # not interleave with the renumber writes). Only the files that came
     # FROM this PDF renumber — a secondary scan's OCR has its own page
     # numbering and must not shift with the primary's deletions.
-    b = builds[build_id]
-    src_key = _src_key_for_path(b, pdf)
     # ``pages`` historically reports the caller's request (including a mixed
     # out-of-range number). Structural references must use only pages that
     # actually existed, or a stale high page mark could shift spuriously.
-    actual_pages = [page for page in pages if page <= total]
-    _remap_page_attention_references(build_id, src_key, actual_pages)
-    srcmap = _ocr_sources(build_id)
-    ocr_dir = _entry_dir(build_id) / "ocr"
+    warnings = _remap_page_attention_references(
+        build_id, src_key, actual_pages)
     renumbered = []
-    with _ocr_merge_lock:
-        if ocr_dir.is_dir():
-            for f in ocr_dir.glob("*.txt"):
-                if (srcmap.get(f.name) or "primary") != src_key:
-                    continue
-                try:
-                    raw = f.read_text(encoding="utf-8", errors="replace")
-                    # the renumbering is destructive too — a misfired trim
-                    # must be recoverable for the text, not just the PDF
-                    f.with_name(f.name + ".bak").write_text(
-                        raw, encoding="utf-8", errors="replace")
-                    out = _renumber_marked_text(raw, pages)
-                    f.write_text(out, encoding="utf-8", errors="replace")
-                    renumbered.append(f.name)
-                except OSError:
-                    continue
+    failed_ocr = []
+    try:
+        with _ocr_merge_lock:
+            if ocr_dir.is_dir():
+                for f in ocr_dir.glob("*.txt"):
+                    if (srcmap.get(f.name) or "primary") != src_key:
+                        continue
+                    try:
+                        raw = f.read_text(encoding="utf-8", errors="replace")
+                        # the renumbering is destructive too — a misfired trim
+                        # must be recoverable for the text, not just the PDF
+                        f.with_name(f.name + ".bak").write_text(
+                            raw, encoding="utf-8", errors="replace")
+                        out = _renumber_marked_text(raw, pages)
+                        f.write_text(out, encoding="utf-8", errors="replace")
+                        renumbered.append(f.name)
+                    except OSError as exc:
+                        log.warning("could not renumber OCR text %s: %s", f, exc)
+                        failed_ocr.append(f.name)
+    except Exception as exc:
+        log.warning("could not enumerate OCR text for page renumbering: %s", exc)
+        warnings.append("OCR text documents could not be checked for renumbering")
+    if failed_ocr:
+        warnings.append("OCR text could not be renumbered: " +
+                        ", ".join(sorted(failed_ocr)))
     # the OCR word-box sidecar is page-keyed per source like the compiled
     # files; keep THIS source's boxes aligned so the placed facsimile never
     # shows a deleted page's words.
-    _renumber_layout_words(build_id, src_key, pages)
+    layout_ok = False
+    try:
+        _renumber_layout_words(build_id, src_key, pages)
+        layout_ok = True
+    except Exception as exc:
+        log.warning("could not renumber OCR page layout: %s", exc)
+        warnings.append("OCR page layout could not be renumbered")
     # Translations use the same page-marker convention, and their provenance
     # sidecars key each source hash by page. Move both in one protected pass so
     # stale detection and eventual publication never retain an obsolete tail.
-    moved = _renumber_translation_artifacts(build_id, src_key, pages)
-    _manifest_after_renumber(
-        build_id, [f"ocr/{n}" for n in renumbered] + ["ocr/layout.json"],
-        moved)
+    moved = []
+    try:
+        moved = _renumber_translation_artifacts(build_id, src_key, pages)
+    except Exception as exc:
+        log.warning("could not renumber translation artifacts: %s", exc)
+        warnings.append("translations could not be fully renumbered")
+    edited = [f"ocr/{name}" for name in renumbered]
+    if layout_ok:
+        edited.append("ocr/layout.json")
+    try:
+        _manifest_after_renumber(build_id, edited, moved)
+    except Exception as exc:
+        log.warning("could not refresh artifact manifest after page deletion: %s", exc)
+        warnings.append("artifact provenance could not be refreshed")
     # title pages are counted on the PRIMARY PDF; a secondary's deletions
     # don't move them
     titles = [] if src_key != "primary" else \
@@ -5943,15 +6092,25 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
     # thumbnail field moved. Page review creation uses this token to reject a
     # stale popover that finishes after the deletion remap.
     b.update(changed)
-    if changed or build_id in lib.load_json(BUILDS_PATH, {}):
-        revision = _builds_apply(build_id, changed)
-        if revision:
-            b["updated_at"] = revision
-    return {"deleted": pages, "pages": len(keep),
-            "renumbered": renumbered,
-            "backup": pdf.with_suffix(".bak.pdf").name,
-            "page_remap": {"source": src_key, "deleted": actual_pages},
-            "build": b}
+    if changed or build_persisted:
+        try:
+            revision = _builds_apply(build_id, changed)
+            if revision:
+                b["updated_at"] = revision
+            else:
+                warnings.append("build metadata could not be saved")
+        except Exception as exc:
+            log.warning("could not persist build metadata after page deletion: %s", exc)
+            warnings.append("build metadata could not be saved")
+    result = {"deleted": pages, "pages": len(keep),
+              "renumbered": renumbered,
+              "backup": pdf.with_suffix(".bak.pdf").name,
+              "page_remap": {"source": src_key, "deleted": actual_pages},
+              "build": b}
+    if warnings:
+        result["partial"] = True
+        result["warnings"] = warnings
+    return result
 
 
 def _blank_pages(pdf: Path, ink_threshold: float = 0.003) -> list[int]:
@@ -6238,7 +6397,17 @@ def _backup_client_state(state, old_n, new_n):
 
 @app.route("/api/client_state")
 def api_client_state_get():
-    return jsonify(lib.load_json(lib.CLIENT_STATE_PATH, {}))
+    state = lib.load_json(lib.CLIENT_STATE_PATH, {})
+    # Startup normally migrates secrets out of this file, but keep GET safe for
+    # legacy state and non-standard server entry points that have not run that
+    # migration yet. Work on a detached copy; the migration remains responsible
+    # for repairing the file on disk.
+    if isinstance(state, dict) and isinstance(state.get("settings"), dict):
+        state = dict(state)
+        state["settings"] = dict(state["settings"])
+        for _sk in _SECRET_KEYS:
+            state["settings"].pop(_sk, None)
+    return jsonify(state)
 
 
 @app.route("/api/client_state", methods=["PUT"])
@@ -6738,8 +6907,11 @@ def api_ia_downloads():
 # _client_settings, which overlays these on top of the synced preferences. ------
 _SECRET_KEYS = frozenset({
     "aiKey", "embedKey", "imgGenKey", "mistralKey", "ocrClaudeKey",
-    "ocrAwsKey", "ocrAwsSecret", "supabaseKey", "supabaseAnonKey", "r2KeyId",
-    "r2Secret", "gsKeyFile",
+    # Azure OCR is retired, but an older client may still have its key in the
+    # synced settings blob. Keep classifying it as sensitive so GET/PUT and the
+    # startup migration cannot expose it merely because its UI was removed.
+    "ocrAzureKey", "ocrAwsKey", "ocrAwsSecret", "supabaseKey",
+    "supabaseAnonKey", "r2KeyId", "r2Secret", "gsKeyFile",
 })
 _SECRETS_PATH = lib.DATA_ROOT / "output" / "secrets.json"
 _MISTRAL_PENDING = "_mistralCloudPending"

@@ -70,7 +70,7 @@ test("fixed popups convert visual cursor coordinates through root zoom", () => {
   assert.ok(visualTop + 120 <= 600 - 12);
 });
 
-test("settings partition keeps embedding and image-generation keys out of storage", () => {
+test("settings partition keeps current and retired keys out of storage", () => {
   const context = vm.createContext({});
   vm.runInContext([
     block("const VIEW_STATE_KEYS", "function partitionSettings"),
@@ -83,6 +83,7 @@ test("settings partition keeps embedding and image-generation keys out of storag
     topTable: "whl",
     embedKey: "embedding-secret",
     imgGenKey: "image-secret",
+    ocrAzureKey: "retired-secret",
   }));
   assert.deepEqual(result.prefs, { theme: "sage" });
   assert.deepEqual(result.view, { topTable: "whl" });
@@ -135,21 +136,32 @@ test("normalization migrates legacy settings and removes unsupported OCR choices
   assert.deepEqual(got.ocrKeyMap, { 1: "tesseract" });
 });
 
-test("reset replaces server preferences before clearing cache and reloading", async () => {
+test("reset drains pending writes and caches preserved remark metadata", async () => {
   const calls = [];
   const removed = [];
+  const stored = {};
   let reloaded = false;
+  let releasePending;
+  const pending = new Promise((resolve) => { releasePending = resolve; });
   const context = vm.createContext({
     DEFAULT_SETTINGS: {
       theme: "",
       topTable: "checked",
+      remarksMeta: {},
       embedKey: "",
       imgGenKey: "",
     },
+    state: { settings: { remarksMeta: {
+      "page:book%3Aa:primary:2": { label: "Herbal · page 2", category: "OCR" },
+    } } },
     SETTINGS_KEY: "settings",
     VIEWSTATE_KEY: "view",
-    localStorage: { removeItem: (key) => removed.push(key) },
+    localStorage: {
+      setItem: (key, value) => { stored[key] = value; },
+      removeItem: (key) => { removed.push(key); delete stored[key]; },
+    },
     location: { reload: () => { reloaded = true; } },
+    flushClientState: () => { calls.push(["flush"]); return pending; },
     fetch: async (url, init) => {
       calls.push([url, init]);
       return { ok: true, status: 200 };
@@ -162,13 +174,105 @@ test("reset replaces server preferences before clearing cache and reloading", as
     "this.api = { resetSettingsToDefaults };",
   ].join("\n"), context);
 
-  await context.api.resetSettingsToDefaults();
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0][0], "/api/client_state");
-  assert.equal(calls[0][1].method, "PUT");
-  assert.deepEqual(JSON.parse(calls[0][1].body), { settings: { theme: "" } });
-  assert.deepEqual(removed, ["settings", "view"]);
+  const resetting = context.api.resetSettingsToDefaults();
+  await Promise.resolve();
+  assert.deepEqual(calls, [["flush"]], "replacement waits for the pending PUT");
+  releasePending(true);
+  await resetting;
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0], ["flush"]);
+  assert.equal(calls[1][0], "/api/client_state");
+  assert.equal(calls[1][1].method, "PUT");
+  assert.deepEqual(JSON.parse(calls[1][1].body), { settings: {
+    theme: "",
+    remarksMeta: {
+      "page:book%3Aa:primary:2": { label: "Herbal · page 2", category: "OCR" },
+    },
+  } });
+  assert.deepEqual(JSON.parse(stored.settings), {
+    theme: "",
+    remarksMeta: {
+      "page:book%3Aa:primary:2": { label: "Herbal · page 2", category: "OCR" },
+    },
+  });
+  assert.deepEqual(removed, ["view"]);
   assert.equal(reloaded, true);
+});
+
+test("reset aborts before replacement when pending client state cannot flush", async () => {
+  const calls = [];
+  let reloaded = false;
+  const context = vm.createContext({
+    DEFAULT_SETTINGS: { theme: "", remarksMeta: {} },
+    state: { settings: { remarksMeta: { "page:book|primary|1": {
+      label: "Herbal · page 1", category: "pages",
+    } } } },
+    SETTINGS_KEY: "settings",
+    VIEWSTATE_KEY: "view",
+    localStorage: {
+      setItem: (...args) => calls.push(["set", ...args]),
+      removeItem: (...args) => calls.push(["remove", ...args]),
+    },
+    location: { reload: () => { reloaded = true; } },
+    flushClientState: async () => false,
+    fetch: async (...args) => { calls.push(["fetch", ...args]); return { ok: true }; },
+  });
+  vm.runInContext([
+    block("const VIEW_STATE_KEYS", "function partitionSettings"),
+    declaration("partitionSettings"),
+    declaration("resetSettingsToDefaults"),
+    "this.api = { resetSettingsToDefaults };",
+  ].join("\n"), context);
+
+  await assert.rejects(context.api.resetSettingsToDefaults(),
+    /pending changes could not be saved/);
+  assert.deepEqual(calls, []);
+  assert.equal(reloaded, false);
+});
+
+test("dirty-attention reload keeps the reset cache's remark metadata", async () => {
+  const key = "page:book%3Aa|primary|2";
+  const meta = { [key]: { label: "Herbal · page 2", category: "pages" } };
+  const writes = [];
+  const state = {
+    settings: { theme: "", remarksMeta: plain(meta) },
+    checked: new Map(),
+    attn: { [key]: "Check transcription" },
+  };
+  const context = vm.createContext({
+    state,
+    clientStateReady: false,
+    VIEW_STATE_KEYS: new Set(),
+    LS_KEY: "checked",
+    SETTINGS_KEY: "settings",
+    VIEWSTATE_KEY: "view",
+    ATTN_KEY: "attention",
+    ATTN_DIRTY_KEY: "attention-dirty",
+    localStorage: {
+      getItem: (name) => name === "attention-dirty" ? "1" : null,
+      setItem: (name, value) => writes.push(["store", name, value]),
+    },
+    fetch: async () => ({ json: async () => ({
+      settings: { theme: "", remarksMeta: plain(meta) },
+      attention: {},
+    }) }),
+    checkedArray: () => [],
+    richerEntry: (a, b) => b || a,
+    normalizeSettings: () => false,
+    syncFilterBtn: () => {},
+    syncSearchConsCheckboxes: () => {},
+    partitionSettings: (settings) => ({ prefs: settings, view: {} }),
+    pushClientState: (kind) => writes.push(["push", kind]),
+  });
+  vm.runInContext([
+    declaration("syncClientStateOnLoad"),
+    "this.api = { syncClientStateOnLoad };",
+  ].join("\n"), context);
+
+  await context.api.syncClientStateOnLoad();
+  assert.deepEqual(plain(state.settings.remarksMeta), meta);
+  assert.ok(writes.some((entry) => entry[0] === "push" && entry[1] === "settings"));
+  assert.ok(writes.some((entry) => entry[0] === "push" && entry[1] === "attention"));
 });
 
 test("both cursor and anchored shared menus use zoom-aware popup geometry", () => {

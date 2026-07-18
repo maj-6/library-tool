@@ -129,6 +129,88 @@ this.api = {
   return { api: context.api, saves, state, writes };
 }
 
+function pageDeleteHarness({
+  saveResponses = [{ httpOk: true, data: { ok: true } }],
+  deleteData = { ok: true, backup: "book.bak.pdf" },
+  refreshError = null,
+} = {}) {
+  const bid = "book-a";
+  const messages = { "ocr-msg": { textContent: "" } };
+  const requests = [];
+  const events = [];
+  const docs = [
+    { id: "doc-1", buildId: bid, fileName: "compiled.txt", text: "saved text" },
+    { id: "doc-2", buildId: bid, fileName: "extracted.txt", text: "second text" },
+  ];
+  const state = { builds: { [bid]: { id: bid, updated_at: "revision-1" } } };
+  const ocrState = {
+    docs,
+    pageSel: new Set([2]),
+    pageRunning: new Map(),
+    pageTags: new Map([[`${bid}:primary:2`, "tesseract"]]),
+    analysisTags: new Map([[`${bid}:primary:2`, { engine: "test" }]]),
+    pdfInfo: { "source/book.pdf": { pages: 3 } },
+    wordsCache: new Map([["word", {}]]),
+    regionsCache: new Map([["region", {}]]),
+    layoutMeta: { [bid]: {} },
+    bookLoading: null,
+  };
+  let saveIndex = 0;
+  const response = (spec) => ({
+    ok: spec.httpOk !== false,
+    status: spec.status || (spec.httpOk === false ? 500 : 200),
+    json: async () => {
+      if (spec.jsonError) throw new Error("invalid json");
+      return spec.data;
+    },
+  });
+  const context = vm.createContext({
+    state,
+    ocrState,
+    el: (id) => messages[id],
+    ocrSelDoc: () => docs[0],
+    docPdf: () => "source/book.pdf",
+    confirmDialog: async () => true,
+    ocrSyncEditor: () => {
+      events.push("sync-editor");
+      docs[0].text = "unsaved editor text";
+    },
+    fetch: async (url, init) => {
+      requests.push({ url, init, body: JSON.parse(init.body) });
+      events.push(url);
+      if (url.endsWith("/ocr")) {
+        const spec = saveResponses[Math.min(saveIndex++, saveResponses.length - 1)];
+        if (spec.requestError) throw new Error(spec.requestError);
+        return response(spec);
+      }
+      if (url === "/api/pdf/pages/delete") return response({
+        httpOk: true, data: deleteData,
+      });
+      throw new Error(`unexpected request: ${url}`);
+    },
+    pushClientState: (kind) => events.push(`push-${kind}`),
+    flushClientState: async () => { events.push("flush-client-state"); return true; },
+    remapPageRemarkKeys: () => { events.push("remap-remarks"); return true; },
+    loadReviews: async () => { events.push("load-reviews"); },
+    renderRemarks: () => events.push("render-remarks"),
+    renderHome: () => events.push("render-home"),
+    clearOcrPageSel: () => ocrState.pageSel.clear(),
+    status: (message) => events.push(`status:${message}`),
+    loadOcrBooks: async () => {
+      events.push("load-ocr-books");
+      if (refreshError) throw refreshError;
+    },
+    selectOcrBook: async () => events.push("select-ocr-book"),
+    setOcrView: (view) => events.push(`view-${view}`),
+  });
+  vm.runInContext([
+    declaration("saveOcrDocumentsBeforePageDelete"),
+    declaration("deleteSelectedPages"),
+    "this.api = { deleteSelectedPages };",
+  ].join("\n"), context);
+  return { api: context.api, docs, events, messages, ocrState, requests, state };
+}
+
 test("attention values and keyed references preserve legacy marks and URL colons", () => {
   const { api } = remarksHarness();
 
@@ -289,6 +371,70 @@ test("page deletion remaps marks and metadata for only the exact book and source
   assert.ok(writes.some(([kind, value]) => kind === "push" && value === "attention"));
   assert.ok(writes.some(([kind]) => kind === "attention-dirty"));
   assert.equal(api.remapPageRemarkKeys("book!*'()", "primary", []), false);
+});
+
+test("page deletion requires both HTTP and JSON success from every OCR save", async () => {
+  const failures = [
+    { httpOk: false, status: 503, data: { ok: true } },
+    { httpOk: true, data: { ok: false, error: "disk is read-only" } },
+    { httpOk: true, jsonError: true },
+    { requestError: "sidecar unavailable" },
+  ];
+  for (const failure of failures) {
+    const run = pageDeleteHarness({ saveResponses: [failure] });
+    await run.api.deleteSelectedPages();
+    assert.equal(run.requests.some((request) =>
+      request.url === "/api/pdf/pages/delete"), false);
+    assert.equal(run.docs[0].text, "unsaved editor text");
+    assert.equal(run.ocrState.pageSel.has(2), true);
+    assert.match(run.messages["ocr-msg"].textContent,
+      /^Pages were not deleted .* OCR edits could not be saved/);
+  }
+
+  const laterFailure = pageDeleteHarness({ saveResponses: [
+    { httpOk: true, data: { ok: true } },
+    { httpOk: true, data: { ok: false, error: "second save failed" } },
+  ] });
+  await laterFailure.api.deleteSelectedPages();
+  assert.equal(laterFailure.requests.filter((request) =>
+    request.url.endsWith("/ocr")).length, 2);
+  assert.equal(laterFailure.requests.some((request) =>
+    request.url === "/api/pdf/pages/delete"), false);
+  assert.equal(laterFailure.docs[0].text, "unsaved editor text");
+  assert.equal(laterFailure.docs[1].text, "second text");
+});
+
+test("page deletion saves OCR first, sends the revision, and names refresh failure", async () => {
+  const run = pageDeleteHarness({
+    deleteData: {
+      ok: true,
+      backup: "book.bak.pdf",
+      partial: true,
+      warnings: ["OCR page layout could not be renumbered"],
+      build: { id: "book-a", updated_at: "revision-2" },
+    },
+    refreshError: new Error("entry list unavailable"),
+  });
+
+  await run.api.deleteSelectedPages();
+  const save = run.requests.find((request) => request.url.endsWith("/ocr"));
+  const deletion = run.requests.find((request) =>
+    request.url === "/api/pdf/pages/delete");
+  assert.ok(save);
+  assert.ok(deletion);
+  assert.equal(save.body.text, "unsaved editor text");
+  assert.equal(deletion.body.page_revision, "revision-1");
+  const saveEvents = run.events.filter((event) => event.endsWith("/ocr"));
+  assert.equal(saveEvents.length, 2);
+  assert.ok(run.events.lastIndexOf(save.url) < run.events.indexOf("flush-client-state"));
+  assert.ok(run.events.indexOf("flush-client-state") < run.events.indexOf(deletion.url));
+  const message = run.messages["ocr-msg"].textContent;
+  assert.match(message, /^Pages were deleted \(backup: book\.bak\.pdf\)/);
+  assert.match(message, /interface refresh failed: entry list unavailable/);
+  assert.match(message, /affected references\/artifacts/);
+  assert.doesNotMatch(message, /Page deletion failed/);
+  assert.ok(run.events.some((event) =>
+    event.includes("COMMITTED") && event.includes("REFRESH FAILED")));
 });
 
 test("whole-blob attention writes serialize so stale state cannot finish last", async () => {

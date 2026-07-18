@@ -47,9 +47,9 @@ const VIEW_STATE_KEYS = new Set([
 // while the server accepted them, so persistSecrets filtered them out of a
 // save and partitionSettings let imgGenKey leak into localStorage/client_state.
 const SECRET_KEYS = new Set([
-  "aiKey", "embedKey", "mistralKey", "ocrClaudeKey", "ocrAwsKey",
-  "ocrAwsSecret", "supabaseKey", "supabaseAnonKey", "r2KeyId", "r2Secret",
-  "gsKeyFile", "imgGenKey",
+  "aiKey", "embedKey", "mistralKey", "ocrClaudeKey", "ocrAzureKey",
+  "ocrAwsKey", "ocrAwsSecret", "supabaseKey", "supabaseAnonKey", "r2KeyId",
+  "r2Secret", "gsKeyFile", "imgGenKey",
 ]);
 function partitionSettings(s) {
   const prefs = {}, view = {};
@@ -3778,7 +3778,20 @@ function pollDbStatus() {
 
 async function resetSettingsToDefaults() {
   const fresh = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
+  // Attention is a separate top-level client-state field, but the durable
+  // labels/categories for keyed page, source, and publication remarks live in
+  // settings. Preserve that metadata so resetting interface preferences does
+  // not turn otherwise intact marks into anonymous or stale-looking entries.
+  fresh.remarksMeta = JSON.parse(JSON.stringify(
+    (state.settings && state.settings.remarksMeta) || {}));
   const { prefs } = partitionSettings(fresh);
+  // The reset is a direct whole-settings replacement. Drain older queued
+  // client-state writes first so a delayed PUT cannot land after this one and
+  // restore the preferences the user just reset.
+  const pendingSaved = await flushClientState();
+  if (pendingSaved === false) {
+    throw new Error("pending changes could not be saved before reset");
+  }
   // Replace only the settings blob. Checked books and attention marks are
   // separate top-level client-state fields and must survive an interface reset.
   const res = await fetch("/api/client_state", {
@@ -3788,7 +3801,11 @@ async function resetSettingsToDefaults() {
   });
   if (!res.ok) throw new Error(`settings reset failed (HTTP ${res.status})`);
   try {
-    localStorage.removeItem(SETTINGS_KEY);
+    // Keep the reset preferences in the local cache through the reload. In
+    // particular, an outstanding attention dirty bit makes startup prefer the
+    // local remarksMeta over the server copy; removing this cache would turn
+    // that preferred value into {} and erase the labels we preserved above.
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(prefs));
     localStorage.removeItem(VIEWSTATE_KEY);
   } catch (e) {}
   location.reload();
@@ -9661,6 +9678,12 @@ async function markSmartScanPdfs(refs) {
 
 function onSmartScanMarkerKey(ev) {
   if (el("smartscan-mark-overlay").hidden) return;
+  // Space and Enter belong to the focused control first. The marker explicitly
+  // focuses Cancel while loading and Mark page when ready; stealing those keys
+  // here would toggle/confirm a different action than the button names.
+  const nativeAction = ev.target && typeof ev.target.closest === "function"
+    ? ev.target.closest("button, a[href], input, select, textarea") : null;
+  if (nativeAction && (ev.key === " " || ev.key === "Enter")) return;
   if (ev.key === "ArrowLeft") {
     ev.preventDefault(); smartScanMarkerGo(smartScanMarker.page - 1);
   } else if (ev.key === "ArrowRight") {
@@ -19623,6 +19646,32 @@ function onOcrPagesClick(ev) {
   updateOcrStagedMsg();
 }
 
+async function saveOcrDocumentsBeforePageDelete(bid) {
+  // Land the textarea in its document object before serializing. A refused
+  // save leaves that in-memory edit intact so the user can retry or copy it.
+  ocrSyncEditor();
+  for (const doc of ocrState.docs) {
+    if (doc.buildId !== bid || !(doc.fileName || doc.name)) continue;
+    const name = doc.fileName || doc.name;
+    let res, data;
+    try {
+      res = await fetch(`/api/builds/${encodeURIComponent(bid)}/ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, text: doc.text }),
+      });
+      data = await res.json().catch(() => null);
+    } catch (error) {
+      throw new Error(`${name}: ${error.message || "request failed"}`);
+    }
+    if (!res.ok || !data || !data.ok) {
+      const detail = (data && data.error) ||
+        (!res.ok ? `HTTP ${res.status}` : "invalid save response");
+      throw new Error(`${name}: ${detail}`);
+    }
+  }
+}
+
 // delete the selected pages from the build's ACTUAL PDF (never the
 // truncated preview derivative); the server keeps a .bak.pdf and renumbers
 // the OCR files + title pages
@@ -19660,37 +19709,53 @@ async function deleteSelectedPages() {
     }))) {
     return;
   }
-  el("ocr-msg").textContent = "Deleting pages ...";
   // unsaved edits must survive: flush and save the book's folder docs so
   // the server renumbers the CURRENT text, not a stale file
-  ocrSyncEditor();
-  for (const doc of ocrState.docs) {
-    if (doc.buildId !== bid || !(doc.fileName || doc.name)) continue;
-    try {
-      await fetch(`/api/builds/${encodeURIComponent(bid)}/ocr`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: doc.fileName || doc.name, text: doc.text }),
-      });
-    } catch (e) { /* the renumber then works from the last saved version */ }
+  el("ocr-msg").textContent = "Saving OCR documents ...";
+  try {
+    await saveOcrDocumentsBeforePageDelete(bid);
+  } catch (error) {
+    el("ocr-msg").textContent =
+      `Pages were not deleted — OCR edits could not be saved (${error.message || error})`;
+    return;
   }
+  el("ocr-msg").textContent = "Deleting pages ...";
   // The delete endpoint remaps its server-side attention/settings blobs. Wait
   // out any older whole-blob client write so it cannot finish afterward and
   // put the old page numbers back.
   pushClientState("attention");
   pushClientState("settings");
   await flushClientState();
+  let data;
   try {
     const res = await fetch("/api/pdf/pages/delete", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ build_id: bid, pdf, pages }),
+      body: JSON.stringify({
+        build_id: bid, pdf, pages,
+        page_revision: (state.builds[bid] && state.builds[bid].updated_at) ||
+          "unversioned",
+      }),
     });
-    const data = await res.json().catch(() => ({}));
-    if (!data.ok) {
+    data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
       el("ocr-msg").textContent = data.error || "Page deletion failed";
       return;
     }
+  } catch (error) {
+    el("ocr-msg").textContent =
+      `Page deletion failed — ${error.message || "server unavailable"}`;
+    return;
+  }
+
+  // data.ok means the server has already replaced the live PDF. Everything
+  // below is a browser refresh; failure here must never claim the deletion
+  // itself failed or invite the user to retry the destructive operation.
+  const remapWarnings = Array.isArray(data.warnings)
+    ? data.warnings.map((warning) => String(warning || "").trim()).filter(Boolean)
+    : [];
+  const backup = data.backup || "unknown";
+  try {
     if (data.build) state.builds[bid] = data.build;
     if (data.page_remap && Array.isArray(data.page_remap.deleted)) {
       remapPageRemarkKeys(bid, data.page_remap.source,
@@ -19707,8 +19772,13 @@ async function deleteSelectedPages() {
     for (const k of [...ocrState.analysisTags.keys()]) {
       if (k.startsWith(bid + ":")) ocrState.analysisTags.delete(k);
     }
-    status(`PAGES DELETED :: ${pages.length} (backup: ${data.backup})`);
-    el("ocr-msg").textContent = "";
+    status(`PAGES DELETED :: ${pages.length} (backup: ${backup})` +
+      (data.partial || remapWarnings.length ? " :: PARTIAL — REVIEW WARNING" : ""));
+    el("ocr-msg").textContent = remapWarnings.length
+      ? `Pages were deleted (backup: ${backup}), but ` +
+        `${remapWarnings.join("; ")}. ` +
+        "Review the affected references/artifacts before continuing."
+      : "";
     // the PDF changed on disk: page counts, dims, word boxes, and the
     // renumbered region records are all stale — a cache hit here would
     // paint the deleted page's regions beside the shifted page image
@@ -19722,8 +19792,15 @@ async function deleteSelectedPages() {
     ocrState.docs = ocrState.docs.filter((x) => x.buildId !== bid);
     await selectOcrBook(bid);
     setOcrView("pdf");
-  } catch (e) {
-    el("ocr-msg").textContent = "Page deletion failed";
+  } catch (error) {
+    const detail = error.message || String(error) || "unknown refresh error";
+    status(`PAGES DELETED :: ${pages.length} (backup: ${backup})` +
+      " :: COMMITTED — REFRESH FAILED");
+    el("ocr-msg").textContent =
+      `Pages were deleted (backup: ${backup}), but the interface refresh failed: ` +
+      `${detail}. ` +
+      (remapWarnings.length ? `${remapWarnings.join("; ")}. ` : "") +
+      "Review the affected references/artifacts, then reload before continuing.";
   }
 }
 

@@ -66,21 +66,27 @@ pushed:
    secret: without it the android job fails before the APK is uploaded, because a
    debug-signed build can't update an existing install. The desktop release is
    independent and still ships. The job then verifies the APK's signer (via
-   `apksigner`) and refuses a debug-signed tagged build. A `workflow_dispatch`
-   dry run without the secret still builds, debug-signed and suffixed
-   `-debug-DONOTPUBLISH.apk` so it can't be mistaken for a release.
+   `apksigner`) and requires its normalized certificate SHA-256 to match
+   `android/BookCapture/release-signing-cert.sha256`. This also protects a
+   release-signed `workflow_dispatch` build. A dispatch without the secret still
+   builds with the debug key and is suffixed `-debug-DONOTPUBLISH.apk`; that is
+   the only signer-mismatch path the workflow permits.
 2. **desktop** freezes the Flask sidecar with PyInstaller and runs
    electron-builder on a Windows runner, producing the NSIS installer
    `LibraryTool-Setup-<package.json version>.exe` **plus `latest.yml` and the
    `.blockmap`** — those two are the auto-update channel: installed apps check
-   the newest GitHub Release at startup and read them to fetch the update.
+   the newest GitHub Release at startup and read them to fetch the update. The
+   job requires all three files and verifies that `latest.yml` names the expected
+   version and installer before uploading any of them.
 3. **publish** attaches the builds to a GitHub Release named after the tag,
    using `docs/releases/<tag>.md` as its release notes when that file exists,
    then registers them in the `releases` table via `tools/release_publish.py`
    (URL → the GitHub Release asset). The two apps release independently: the
    job runs when either build succeeded and registers only the artifact(s)
    present, so a broken Android build never blocks a desktop release (or vice
-   versa). The Downloads page shows the rows immediately, and existing
+   versa). When only one app builds, the GitHub Release title and a prominent
+   notes preamble identify the release as partial and name the missing artifact.
+   The Downloads page shows the rows immediately, and existing
    installs with auto-update on (the Settings > Updates default) pick the
    update up on their next launch.
 
@@ -141,11 +147,17 @@ So treat it as unrecoverable-if-lost and back it up accordingly:
   Do not use `certutil -encode`, which adds PEM headers that the workflow's
   decoder does not accept. Losing the GitHub secret is recoverable from the
   local keystore; losing the local keystore is not.
+- **The public certificate identity is pinned in the repo.**
+  `android/BookCapture/release-signing-cert.sha256` contains the SHA-256 digest
+  of the certificate used for existing installs. It is public metadata, not key
+  material. The workflow requires every non-debug APK, including a signed dry
+  run, to match it before upload. Do not change it unless intentionally ending
+  update compatibility with every existing BookCapture install.
 - **Verify recoverability periodically:** `keytool -list -keystore
   ~/.whl-release/bookcapture.jks -alias bookcapture` should list the key with the
   stored password. The release pipeline also prints the published APK's signer
-  DN and certificate SHA-256 digest in its run summary, so the exact signing
-  certificate can be compared across releases.
+  DN and certificate SHA-256 digest in its run summary after enforcing the
+  tracked fingerprint.
 
 ## By hand (no CI)
 
