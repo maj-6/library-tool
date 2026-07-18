@@ -1,7 +1,7 @@
 {
   "name": "whl-library-tool",
   "productName": "Library Tool",
-  "version": "0.8.0-alpha.12",
+  "version": "0.8.0-alpha.13",
   "description": "Desktop shell for Library Tool — a World Herb Library companion (Flask sidecar + Electron)",
   "author": "Andrew James Miller",
   "license": "UNLICENSED",
