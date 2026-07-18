@@ -33,27 +33,40 @@ function plain(value) {
 
 const modelSource = [
   declaration("homeAttentionDestination"),
+  declaration("bookVolumeValue"),
   block("const REMARK_CATEGORIES = [", "const remarksState ="),
   declaration("attnHas"),
   declaration("attnValue"),
   declaration("attnReason"),
   declaration("attnMeta"),
   declaration("remarkKeyParts"),
+  declaration("remarkDecodePart"),
+  declaration("replicaPageRemarkKey"),
+  declaration("replicaPageRemarkParts"),
+  declaration("publicationRemarkKey"),
+  declaration("publicationRemarkSelection"),
   declaration("remarkCategoryForKey"),
   declaration("sourceRemarkKeys"),
   declaration("activeSourceRemarkKey"),
   declaration("sourceMatchesRemark"),
   declaration("setAttnKey"),
+  declaration("remappedPageRemarkValue"),
+  declaration("remapPageRemarkKeys"),
   declaration("remarksDefaultFilter"),
   declaration("remarksFilterForTab"),
   declaration("setRemarksFilterForTab"),
   declaration("remarkSecondary"),
+  declaration("replicaPageSourceAvailable"),
   declaration("keyedRemarkDescriptor"),
+  declaration("reviewLabelBook"),
+  declaration("reviewOnlyRemarkDescriptor"),
   declaration("remarksItems"),
   declaration("remarkRoute"),
+  declaration("remarkReviewForItem"),
+  declaration("remarkCommentCount"),
 ].join("\n");
 
-function remarksHarness({ state: stateSeed, rows = [], sources = [] } = {}) {
+function remarksHarness({ state: stateSeed, rows = [], sources = [], reviews = {} } = {}) {
   const state = Object.assign({
     settings: { remarksFilters: {} },
     builds: {},
@@ -61,25 +74,59 @@ function remarksHarness({ state: stateSeed, rows = [], sources = [] } = {}) {
     whlRows: [],
     chBooks: [],
     olRows: [],
+    publishEntries: [],
+    publishLoaded: false,
     rowsById: new Map(),
   }, stateSeed || {});
   const saves = [];
+  const writes = [];
+  const publishFindEntity = (key) => {
+    if (String(key || "").startsWith("book:")) {
+      const slug = String(key).slice(5);
+      const entry = (state.publishEntries || []).find((item) => item.slug === slug);
+      return entry ? { kind: "book", key, label: entry.title || "Untitled", entries: [entry] }
+        : null;
+    }
+    if (String(key || "").startsWith("set:")) {
+      const groupId = String(key).slice(4);
+      const entries = (state.publishEntries || []).filter(
+        (item) => String(item.group_id || "") === groupId);
+      return entries.length
+        ? { kind: "set", key, label: entries[0].title || groupId, entries } : null;
+    }
+    return null;
+  };
   const context = vm.createContext({
     state,
+    reviewsState: { items: reviews },
     combinedRows: () => rows,
     approvedSources: () => sources,
+    publishFindEntity,
     saveSettings: () => saves.push(plain(state.settings.remarksFilters)),
+    localStorage: { setItem: (...args) => writes.push(args) },
+    pushClientState: (kind) => writes.push(["push", kind]),
+    renderReplicaAttentionMarks: () => {},
+    decorateOcrPages: () => {},
+    decorateAnFacsimile: () => {},
+    renderRemarks: () => {},
+    renderHome: () => {},
+    ATTN_KEY: "attention",
+    ATTN_DIRTY_KEY: "attention-dirty",
   });
   vm.runInContext(`${modelSource}
 this.api = {
   homeAttentionDestination,
   REMARK_CATEGORIES, REMARK_TAB_DEFAULTS,
   attnValue, attnReason, remarkKeyParts, remarkCategoryForKey,
+  replicaPageRemarkKey, replicaPageRemarkParts,
+  publicationRemarkKey, publicationRemarkSelection,
   sourceRemarkKeys, activeSourceRemarkKey, sourceMatchesRemark, setAttnKey,
+  remapPageRemarkKeys,
   remarksDefaultFilter, remarksFilterForTab, setRemarksFilterForTab,
-  remarksItems, remarkRoute,
+  reviewLabelBook, reviewOnlyRemarkDescriptor,
+  remarksItems, remarkRoute, remarkReviewForItem, remarkCommentCount,
 };`, context);
-  return { api: context.api, saves, state };
+  return { api: context.api, saves, state, writes };
 }
 
 test("attention values and keyed references preserve legacy marks and URL colons", () => {
@@ -103,6 +150,34 @@ test("attention values and keyed references preserve legacy marks and URL colons
   assert.equal(api.remarkCategoryForKey(sourceKey), "sources");
   assert.equal(api.remarkCategoryForKey("src2:row|archive|item"), "sources");
   assert.equal(api.remarkCategoryForKey("whl:17"), "catalogs");
+});
+
+test("page and publication keys are stable, source-scoped, and reject malformed refs", () => {
+  const { api } = remarksHarness();
+  const page = api.replicaPageRemarkKey("book|α:1", "scan!*'()|二", 12);
+  assert.equal(page,
+    "page:book%7C%CE%B1%3A1|scan!*'()%7C%E4%BA%8C|12");
+  assert.deepEqual(plain(api.replicaPageRemarkParts(page)), {
+    buildId: "book|α:1", sourceId: "scan!*'()|二", page: 12,
+    deleted: false,
+    encodedBuild: "book%7C%CE%B1%3A1",
+    encodedSource: "scan!*'()%7C%E4%BA%8C",
+  });
+  assert.equal(api.replicaPageRemarkParts("page:book|%E0%A4%A|3"), null);
+  assert.equal(api.replicaPageRemarkParts("page:book|primary|01"), null);
+  assert.equal(api.replicaPageRemarkParts("page:book|primary|1e0"), null);
+  assert.equal(api.replicaPageRemarkParts("page:book|primary"), null);
+  assert.equal(api.replicaPageRemarkKey("", "primary", 1), "");
+  assert.equal(api.remarkCategoryForKey(page), "pages");
+  assert.equal(api.remarkCategoryForKey("page-deleted:book|primary|2|review-1"), "pages");
+
+  assert.equal(api.publicationRemarkKey("book:herbal:one"),
+    "pub:book%3Aherbal%3Aone");
+  assert.equal(api.publicationRemarkSelection("pub:book%3Aherbal%3Aone"),
+    "book:herbal:one");
+  assert.equal(api.publicationRemarkKey("group:author"), "");
+  assert.equal(api.publicationRemarkSelection("pub:%E0%A4%A"), "");
+  assert.equal(api.remarkCategoryForKey("pub:set%3Aherbals"), "publications");
 });
 
 test("new source identities distinguish catalog owners while legacy keys still resolve", () => {
@@ -159,6 +234,61 @@ this.api = { setAttnKey };`, context);
   context.api.setAttnKey("src:https://example.test/scan", "");
   assert.equal("src:https://example.test/scan" in state.attn, false);
   assert.equal("src:https://example.test/scan" in state.settings.remarksMeta, false);
+});
+
+test("page deletion remaps marks and metadata for only the exact book and source", () => {
+  const seed = remarksHarness();
+  const key = (book, source, page) => seed.api.replicaPageRemarkKey(book, source, page);
+  const p1 = key("book!*'()", "primary", 1);
+  const p2 = key("book!*'()", "primary", 2);
+  const p3 = key("book!*'()", "primary", 3);
+  const p5 = key("book!*'()", "primary", 5);
+  const p6 = key("book!*'()", "primary", 6);
+  const secondary = key("book!*'()", "scan|two", 5);
+  const otherBook = key("other", "primary", 5);
+  const publication = seed.api.publicationRemarkKey("book:public");
+  const { api, state, writes } = remarksHarness({
+    state: {
+      settings: {
+        remarksFilters: {},
+        remarksMeta: {
+          [p1]: { label: "one", category: "pages" },
+          [p2]: { label: "deleted", category: "pages" },
+          [p3]: { label: "Herbal \u00b7 page 3", category: "pages" },
+          [p5]: { label: "Herbal \u00b7 page 5", category: "pages" },
+          [p6]: { label: "Herbal \u00b7 page 6", category: "pages" },
+          [secondary]: { label: "secondary", category: "pages" },
+        },
+      },
+      attn: {
+        [p1]: "keep one", [p2]: "remove two", [p3]: "move three",
+        [p5]: "move five", [secondary]: "leave secondary",
+        [otherBook]: "leave other", [publication]: "leave publication",
+      },
+    },
+  });
+
+  assert.equal(api.remapPageRemarkKeys("book!*'()", "primary", [4, 2, 2]), true);
+  const shifted2 = key("book!*'()", "primary", 2);
+  const shifted3 = key("book!*'()", "primary", 3);
+  const shifted4 = key("book!*'()", "primary", 4);
+  assert.deepEqual(plain(state.attn), {
+    [p1]: "keep one",
+    [secondary]: "leave secondary",
+    [otherBook]: "leave other",
+    [publication]: "leave publication",
+    [shifted2]: "move three",
+    [shifted3]: "move five",
+  });
+  assert.equal(state.settings.remarksMeta[p2].label, "Herbal \u00b7 page 2");
+  assert.equal(state.settings.remarksMeta[shifted3].label, "Herbal \u00b7 page 3");
+  assert.equal(state.settings.remarksMeta[shifted4].label, "Herbal \u00b7 page 4");
+  assert.equal(state.settings.remarksMeta[secondary].label, "secondary");
+  assert.equal(Object.values(state.settings.remarksMeta)
+    .some((meta) => meta.label === "deleted"), false);
+  assert.ok(writes.some(([kind, value]) => kind === "push" && value === "attention"));
+  assert.ok(writes.some(([kind]) => kind === "attention-dirty"));
+  assert.equal(api.remapPageRemarkKeys("book!*'()", "primary", []), false);
 });
 
 test("whole-blob attention writes serialize so stale state cannot finish last", async () => {
@@ -298,13 +428,25 @@ test("Home opens the remarks category represented by its attention count", () =>
   assert.deepEqual(plain(api.homeAttentionDestination({
     attnCat: 1, attnEntries: 0, attnSources: 1,
   })), { tab: "checked", filter: "all" });
+  assert.deepEqual(plain(api.homeAttentionDestination({
+    attnPages: 2,
+  })), { tab: "replica", filter: "pages" });
+  assert.deepEqual(plain(api.homeAttentionDestination({
+    attnPublications: 1,
+  })), { tab: "publish", filter: "publications" });
+  assert.deepEqual(plain(api.homeAttentionDestination({
+    attnPages: 1, attnPublications: 1,
+  })), { tab: "home", filter: "all" });
+  assert.deepEqual(plain(api.homeAttentionDestination({
+    attnCat: 1, attnPages: 1,
+  })), { tab: "home", filter: "all" });
 });
 
 test("remarks aggregate canonical rows, builds, and keyed marks exactly once", () => {
   const sourceKey = "src:https://archive.example/item:a";
   const rows = [
     { id: "checked-1", kind: "checked", attention: "Verify year",
-      book: { title: "A Checked Herbal", author: "Ada", year: "1901" } },
+      book: { title: "A Checked Herbal", volume: "2", author: "Ada", year: "1901" } },
     { id: "manual-1", kind: "manual", attention: true,
       book: { title: "Manual Herbal", author: "Bea", year: "1902" } },
     { id: "capture-1", kind: "manual", captured: true, attention: "Retake photo",
@@ -317,7 +459,7 @@ test("remarks aggregate canonical rows, builds, and keyed marks exactly once", (
     title: "Archive Scan",
     archive: "Internet Archive",
     author: "Dana",
-    year: "1874",
+    year: "1874", volume: "3",
   }];
   const { api } = remarksHarness({
     rows,
@@ -354,12 +496,14 @@ test("remarks aggregate canonical rows, builds, and keyed marks exactly once", (
   );
 
   assert.equal(items.find((item) => item.id === "row:checked-1").subtype, "Checked book");
+  assert.equal(items.find((item) => item.id === "row:checked-1").volume, "2");
   assert.equal(items.find((item) => item.id === "row:manual-1").subtype, "Manual entry");
   assert.equal(items.find((item) => item.id === "row:capture-1").subtype, "Phone capture");
   assert.equal(items.find((item) => item.id === "build:published").subtype, "Published entry");
 
   const source = items.find((item) => item.id === `key:${sourceKey}`);
   assert.equal(source.label, "Archive Scan");
+  assert.equal(source.volume, "3");
   assert.equal(source.reason, "");
   assert.equal(source.canOpen, true);
 
@@ -367,6 +511,273 @@ test("remarks aggregate canonical rows, builds, and keyed marks exactly once", (
   assert.equal(stale.label, "Historical OL hit");
   assert.equal(stale.reason, "Recover result");
   assert.equal(stale.canOpen, false);
+});
+
+test("remarks resolve page and publication descriptors without alias duplicates", () => {
+  const seed = remarksHarness();
+  const pageKey = seed.api.replicaPageRemarkKey("build-1", "secondary|scan", 7);
+  const pubBook = seed.api.publicationRemarkKey("book:herbal-one");
+  const pubSet = seed.api.publicationRemarkKey("set:works");
+  const staleSet = seed.api.publicationRemarkKey("set:retired");
+  const { api } = remarksHarness({
+    state: {
+      settings: {
+        remarksFilters: {},
+        remarksMeta: {
+          [pageKey]: { label: "Stored page", category: "pages" },
+          [staleSet]: { label: "Retired set", category: "publications" },
+        },
+      },
+      builds: {
+        "build-1": { id: "build-1", title: "Replica Herbal", volume: "2",
+          pdf_sources: [{ id: "secondary|scan", path: "scan.pdf" }] },
+      },
+      publishLoaded: true,
+      publishEntries: [
+        { slug: "herbal-one", title: "Published Herbal", volume: "3",
+          authors: "Ada", year: "1890" },
+        { slug: "works-1", title: "Collected Works", group_id: "works", volume: "1" },
+        { slug: "works-2", title: "Collected Works", group_id: "works", volume: "2" },
+      ],
+      attn: {
+        [pageKey]: "Check transcription",
+        [pubBook]: "Fix public description",
+        [pubSet]: "Check set order",
+        [staleSet]: "Confirm removal",
+      },
+    },
+  });
+
+  const items = plain(api.remarksItems());
+  assert.equal(items.length, 4);
+  assert.equal(new Set(items.map((item) => item.id)).size, 4);
+  const page = items.find((item) => item.id === `key:${pageKey}`);
+  assert.deepEqual({
+    category: page.category, subtype: page.subtype, label: page.label,
+    volume: page.volume, secondary: page.secondary, canOpen: page.canOpen,
+  }, {
+    category: "pages", subtype: "Replica page", label: "Replica Herbal",
+    volume: "2", secondary: "Page 7 · Source secondary|scan", canOpen: true,
+  });
+  const book = items.find((item) => item.id === `key:${pubBook}`);
+  assert.equal(book.category, "publications");
+  assert.equal(book.subtype, "Published volume");
+  assert.equal(book.volume, "3");
+  assert.equal(book.canOpen, true);
+  const set = items.find((item) => item.id === `key:${pubSet}`);
+  assert.equal(set.subtype, "Published set");
+  assert.equal(set.secondary, "2 published volumes");
+  const stale = items.find((item) => item.id === `key:${staleSet}`);
+  assert.equal(stale.label, "Retired set");
+  assert.equal(stale.subtype, "Published set");
+  assert.equal(stale.canOpen, false);
+});
+
+test("page remarks for removed secondary sources remain visible but are stale", () => {
+  const seed = remarksHarness();
+  const pageKey = seed.api.replicaPageRemarkKey("build-1", "removed-scan", 3);
+  const { api } = remarksHarness({
+    state: {
+      settings: { remarksFilters: {} },
+      builds: {
+        "build-1": { id: "build-1", title: "Replica Herbal",
+          pdf_sources: [{ id: "live-scan", path: "live.pdf" }] },
+      },
+      attn: { [pageKey]: "Historical page note" },
+    },
+  });
+
+  const page = plain(api.remarksItems())[0];
+  assert.equal(page.label, "Replica Herbal");
+  assert.equal(page.secondary, "Page 3 · Source removed-scan");
+  assert.equal(page.canOpen, false);
+});
+
+test("open review threads remain in Remarks after their attention mark is gone", () => {
+  const rows = [
+    { id: "marked", kind: "checked", attention: "Keep attention",
+      book: { title: "Marked Herbal" } },
+    { id: "clean", kind: "manual", attention: "",
+      book: { title: "Clean Herbal" } },
+  ];
+  const { api } = remarksHarness({
+    rows,
+    state: {
+      builds: {
+        draft: { id: "draft", status: "draft", attention: "",
+          title: "Draft Herbal", volume: "3", authors: "Ada", year: "1903" },
+      },
+    },
+    reviews: {
+      duplicate: {
+        id: "duplicate", key: "row:marked", kind: "row", ref: "marked",
+        status: "open", label: "Marked Herbal", reason: "Shared copy", comments: [],
+      },
+      orphan: {
+        id: "orphan", key: "row:missing", kind: "row", ref: "missing",
+        status: "open", label: "Vol. 4 Orphan Herbal", reason: "Still discuss this",
+        comments: [{ author: "Ada", text: "Keep reachable" }],
+      },
+      build: {
+        id: "build", key: "build:draft", kind: "build", ref: "draft",
+        status: "open", label: "Draft Herbal", reason: "Check rights", comments: [],
+      },
+      closed: {
+        id: "closed", key: "row:closed", kind: "row", ref: "closed",
+        status: "resolved", label: "Closed Herbal", reason: "Done", comments: [],
+      },
+    },
+  });
+
+  const items = plain(api.remarksItems());
+  assert.deepEqual(items.map((item) => item.id).sort(),
+    ["build:draft", "row:marked", "row:missing"]);
+  assert.equal(items.filter((item) => item.id === "row:marked").length, 1,
+    "an open review does not duplicate an existing attention item");
+  assert.equal(items.find((item) => item.id === "row:marked").hasAttention, true);
+
+  const orphan = items.find((item) => item.id === "row:missing");
+  assert.equal(orphan.hasAttention, false);
+  assert.equal(orphan.reviewOnly, true);
+  assert.equal(orphan.label, "Orphan Herbal");
+  assert.equal(orphan.volume, "4");
+  assert.equal(orphan.reason, "Still discuss this");
+  assert.equal(orphan.canOpen, false);
+  assert.equal(api.remarkCommentCount(orphan), 1);
+
+  const build = items.find((item) => item.id === "build:draft");
+  assert.equal(build.hasAttention, false);
+  assert.equal(build.canOpen, true);
+  assert.equal(build.volume, "3");
+});
+
+test("remarks prefer the open shared thread and report its comment count", () => {
+  const item = { kind: "build", ref: "draft-1" };
+  const { api } = remarksHarness({
+    reviews: {
+      old: {
+        id: "old", key: "build:draft-1", status: "resolved",
+        created_at: "2026-07-18T10:00:00Z",
+        comments: [{ text: "old" }, { text: "thread" }],
+      },
+      current: {
+        id: "current", key: "build:draft-1", status: "open",
+        created_at: "2026-07-18T09:00:00Z",
+        comments: [{ text: "current reply" }],
+      },
+      other: {
+        id: "other", key: "row:unrelated", status: "open",
+        created_at: "2026-07-18T11:00:00Z", comments: [],
+      },
+    },
+  });
+
+  assert.equal(api.remarkReviewForItem(item).id, "current");
+  assert.equal(api.remarkCommentCount(item), 1);
+  assert.equal(api.remarkReviewForItem({ kind: "row", ref: "missing" }), null);
+  assert.equal(api.remarkCommentCount({ kind: "row", ref: "missing" }), 0);
+});
+
+test("sidebar Reply posts to the shared review thread and clears only a saved draft", async () => {
+  const calls = [];
+  const item = { id: "build:draft-1", kind: "build", ref: "draft-1", label: "Draft" };
+  const review = { id: "review-1", key: "build:draft-1", status: "open", comments: [] };
+  const saved = { ...review, comments: [{ author: "Ada", text: "Please verify" }] };
+  const remarksState = {
+    replyDraft: "Please verify", replySaving: false, replying: item.id,
+    error: "", errorItem: null, expanded: new Set(),
+  };
+  const reviewsState = { items: {} };
+  const context = vm.createContext({
+    remarksState, reviewsState,
+    remarksItemById: () => item,
+    ensureRemarkReview: async () => review,
+    fetch: async (url, opts) => {
+      calls.push([url, JSON.parse(opts.body)]);
+      return { ok: true, json: async () => ({ review: saved }) };
+    },
+    renderRemarks() {}, renderReviewList() {}, status() {},
+  });
+  vm.runInContext(`${declaration("submitRemarkReply")}
+this.api = { submitRemarkReply };`, context);
+
+  assert.equal(await context.api.submitRemarkReply(item.id), true);
+  assert.deepEqual(calls, [["/api/reviews/review-1/comment", { text: "Please verify" }]]);
+  assert.equal(remarksState.replyDraft, "");
+  assert.equal(remarksState.replying, null);
+  assert.equal(remarksState.expanded.has(item.id), true);
+  assert.equal(reviewsState.items[review.id].comments.length, 1);
+});
+
+test("sidebar Resolve closes the shared review before clearing its attention mark", async () => {
+  const calls = [];
+  const item = { id: "row:checked-1", kind: "row", ref: "checked-1", label: "Herbal" };
+  const review = { id: "review-2", key: "row:checked-1", status: "open", comments: [] };
+  const remarksState = {
+    resolving: null, error: "", errorItem: null, expanded: new Set([item.id]),
+    editing: null, replying: null, replyDraft: "",
+  };
+  const reviewsState = { items: { [review.id]: review } };
+  const context = vm.createContext({
+    remarksState, reviewsState,
+    remarksItemById: () => item,
+    bookTitleText: (book) => book.title,
+    confirmDialog: async () => true,
+    remarkReviewForItem: () => review,
+    fetch: async (url, opts) => {
+      calls.push(["fetch", url, JSON.parse(opts.body)]);
+      return { ok: true, json: async () => ({ review: { ...review, status: "resolved" } }) };
+    },
+    applyRemarkValue: async (...args) => { calls.push(["clear", ...args]); return true; },
+    renderRemarks() {}, renderReviewList() {}, status() {},
+  });
+  vm.runInContext(`${declaration("resolveRemarkItem")}
+this.api = { resolveRemarkItem };`, context);
+
+  assert.equal(await context.api.resolveRemarkItem(item.id), true);
+  assert.deepEqual(plain(calls), [
+    ["fetch", "/api/reviews/review-2/resolve", { resolved: true }],
+    ["clear", item, ""],
+  ]);
+  assert.equal(reviewsState.items[review.id].status, "resolved");
+  assert.equal(remarksState.expanded.has(item.id), false);
+});
+
+test("resolving a review-only remark closes the thread without recreating a mark", async () => {
+  const calls = [];
+  let confirmCopy = null;
+  const item = {
+    id: "row:missing", kind: "row", ref: "missing", label: "Orphan Herbal",
+    hasAttention: false, reviewOnly: true,
+  };
+  const review = { id: "review-3", key: "row:missing", status: "open", comments: [] };
+  const remarksState = {
+    resolving: null, error: "", errorItem: null, expanded: new Set([item.id]),
+    editing: null, replying: null, replyDraft: "",
+  };
+  const reviewsState = { items: { [review.id]: review } };
+  const context = vm.createContext({
+    remarksState, reviewsState,
+    remarksItemById: () => item,
+    bookTitleText: (book) => book.title,
+    confirmDialog: async (copy) => { confirmCopy = copy; return true; },
+    remarkReviewForItem: () => review,
+    fetch: async (url, opts) => {
+      calls.push(["fetch", url, JSON.parse(opts.body)]);
+      return { ok: true, json: async () => ({ review: { ...review, status: "resolved" } }) };
+    },
+    applyRemarkValue: async (...args) => { calls.push(["unexpected-clear", ...args]); return true; },
+    renderRemarks() {}, renderReviewList() {}, status() {},
+  });
+  vm.runInContext(`${declaration("resolveRemarkItem")}
+this.api = { resolveRemarkItem };`, context);
+
+  assert.equal(await context.api.resolveRemarkItem(item.id), true);
+  assert.deepEqual(calls, [
+    ["fetch", "/api/reviews/review-3/resolve", { resolved: true }],
+  ]);
+  assert.equal(confirmCopy.detail, "This closes the shared discussion.");
+  assert.equal(reviewsState.items[review.id].status, "resolved");
 });
 
 test("remark routes cover every supported target without mutating sidebar state", () => {
@@ -394,9 +805,51 @@ test("remark routes cover every supported target without mutating sidebar state"
     { tab: "checked", bottom: "ch", recordRef: "17" });
   assert.deepEqual(plain(api.remarkRoute({ kind: "key", ref: "ol:work:key" })),
     { tab: "checked", bottom: "ol", recordRef: "work:key" });
+  const pageKey = api.replicaPageRemarkKey("build|1", "scan:two", 14);
+  assert.deepEqual(plain(api.remarkRoute({ kind: "key", ref: pageKey })), {
+    tab: "replica", replicaBookId: "build|1",
+    replicaSource: "scan:two", replicaPage: 14,
+  });
+  assert.deepEqual(plain(api.remarkRoute({
+    kind: "key", ref: api.publicationRemarkKey("set:herbals"),
+  })), { tab: "publish", publicationSelection: "set:herbals" });
+  assert.equal(api.remarkRoute({
+    kind: "key", ref: "page-deleted:build%7C1|scan%3Atwo|14|review-1",
+  }), null);
+  assert.equal(api.remarkRoute({ kind: "key", ref: "page:bad|primary|01" }), null);
   assert.equal(api.remarkRoute({ kind: "key", ref: "unknown:1" }), null);
   assert.equal(api.remarkRoute(null), null);
   assert.deepEqual(plain(state.settings), before);
+});
+
+test("stale Replica sources are rejected before dirty context can change", async () => {
+  const calls = [];
+  const state = {
+    builds: {
+      target: { id: "target", pdf_sources: [{ id: "live-scan", path: "live.pdf" }] },
+    },
+  };
+  const rwState = { book: "dirty-book", src: "primary", page: 4, dirty: true };
+  const context = vm.createContext({
+    state,
+    rwState,
+    remarkRoute: () => ({
+      tab: "replica", replicaBookId: "target",
+      replicaSource: "removed-scan", replicaPage: 2,
+    }),
+    status: (message) => calls.push(["status", message]),
+    selectReplicaBook: async (...args) => calls.push(["select-book", ...args]),
+  });
+  vm.runInContext(`${declaration("replicaPageSourceAvailable")}
+${declaration("openRoutedItem")}
+this.api = { openRoutedItem };`, context);
+
+  await context.api.openRoutedItem({ kind: "key", ref: "stale-page" });
+
+  assert.deepEqual(calls, [["status", "REPLICA PAGE IS NO LONGER AVAILABLE"]]);
+  assert.deepEqual(plain(rwState), {
+    book: "dirty-book", src: "primary", page: 4, dirty: true,
+  });
 });
 
 function applyHarness({ keyResult = true, buildResult = true, rowResult = true,

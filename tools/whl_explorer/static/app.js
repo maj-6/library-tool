@@ -36,7 +36,7 @@ const VIEW_STATE_KEYS = new Set([
   "markFilter", "srcFilter", "dlFilter", "yearFrom", "yearTo",
   "topTable", "bottomActive", "whlMode", "checkedMode", "showCatalog",
   "paneWidth", "uploadSplitH", "publishSidebarCollapsed", "workbenchPhase",
-  "jobsDrawerOpen", "authPromptDismissed", "checkedCols",
+  "jobsDrawerOpen", "authPromptDismissed",
   "remarksSidebarCollapsed", "remarksFilters",
   "collapsed", "wbSideCollapsed",
 ]);
@@ -47,7 +47,7 @@ const VIEW_STATE_KEYS = new Set([
 // while the server accepted them, so persistSecrets filtered them out of a
 // save and partitionSettings let imgGenKey leak into localStorage/client_state.
 const SECRET_KEYS = new Set([
-  "aiKey", "embedKey", "mistralKey", "ocrClaudeKey", "ocrAzureKey", "ocrAwsKey",
+  "aiKey", "embedKey", "mistralKey", "ocrClaudeKey", "ocrAwsKey",
   "ocrAwsSecret", "supabaseKey", "supabaseAnonKey", "r2KeyId", "r2Secret",
   "gsKeyFile", "imgGenKey",
 ]);
@@ -178,7 +178,7 @@ const state = {
   procExpanded: new Set(),    // Process mode: targets whose alternative rows are shown
   procActionBusy: false,      // a Process action (job) is running
   settings: {
-    checkedCols: {}, showCatalog: true,
+    showCatalog: true,
     markFilter: "ALL", srcFilter: "ALL", dlFilter: "ALL",
     yearFrom: null, yearTo: null,   // inclusive year-range filter (both tables)
     // Open Library search constraints (title=verbatim; also toggled by Ctrl+click
@@ -188,13 +188,13 @@ const state = {
     topTable: "checked", bottomActive: 0,
     whlMode: "search", checkedMode: "search",
     // "" is the retired Classic CAD id; applyTheme() migrates it to DEFAULT_THEME
-    paneWidth: null, theme: "", font: "", fontUi: "", fontMono2: "",
+    paneWidth: null, theme: "",
     aiBase: "", aiModel: "", aiKey: "", aiInstructions: "",
+    smartScanInstructions: "", smartScanManualPages: false,
     // embeddings provider for search-index publishing (#140); blank = lexical-only
     embedBase: "", embedModel: "", embedKey: "",
-    // OCR services (Settings > OCR). Tesseract runs locally; Claude /
-    // Textract / Azure / OpenAI need credentials — cloud processing is
-    // TODO-verify until the user has API keys.
+    // OCR services (Settings > OCR). Tesseract runs locally; Mistral, Claude,
+    // and Textract use credentials from Settings > Credentials.
     // Cloud capture (phone -> Supabase -> manual entries) + Mistral key,
     // shared by the capture pipeline and the Mistral OCR service
     supabaseUrl: "", supabaseKey: "", supabaseAnonKey: "", mistralKey: "",
@@ -203,7 +203,7 @@ const state = {
     // Cloudflare R2 for published PDFs (Supabase storage is 1 GB on free)
     r2Account: "", r2Bucket: "", r2KeyId: "", r2Secret: "", r2PublicBase: "",
     cloudSyncMinutes: 0, cloudDeleteRemote: true,
-    ocrService: "tesseract", ocrAzureEndpoint: "", ocrAzureKey: "",
+    ocrService: "tesseract",
     ocrTesseract: "", ocrClaudeKey: "", ocrClaudeModel: "",
     ocrAwsKey: "", ocrAwsSecret: "", ocrAwsRegion: "",
     ocrImageWidth: 1400,
@@ -211,13 +211,12 @@ const state = {
     ocrPaperColor: false,   // tint facsimile paper from sampled PDF margins
     ocrPaperLighten: 20,    // percent mixed toward white after sampling
     ocrFurniture: true, // region facsimile: show marginalia/headers/catchwords
-    textAnalysisService: "configured",
     workbenchPhase: "record",   // last phase open on the Workbench
     jobsDrawerOpen: false,      // the jobs drawer starts as a one-line summary
     userName: "",       // attributed to your changes in the activity feed        // rasterization width for OCR input —
                                 // tune to see how shrinking affects quality
     // page-view digit shortcuts: press N over a page to queue it
-    ocrKeyMap: { 1: "tesseract", 2: "claude", 3: "textract", 4: "azure", 5: "openai" },
+    ocrKeyMap: { 1: "tesseract", 2: "mistral", 3: "claude", 4: "textract" },
     // master list -> Google Sheets publishing (Settings > Integrations)
     gsSpreadsheetId: "", gsKeyFile: "", gsSheetName: "Master list",
     // cloud search + downloadable databases (Settings > Integrations)
@@ -262,6 +261,11 @@ const state = {
   olColMarks: {},               // OL column -> "copy" | "exclude" (repopulation)
 };
 
+// A pristine copy for the Settings reset action. `state.settings` is mutated in
+// place for the life of the renderer, so clearing localStorage alone cannot
+// recover defaults once the server-backed preferences document exists.
+const DEFAULT_SETTINGS = JSON.parse(JSON.stringify(state.settings));
+
 // --- appearance: themes are full chrome redesigns; fonts are user-selectable --
 
 // Nearly all light — this is a scholarly tool, read for hours — with Slate as
@@ -302,19 +306,7 @@ const LEGACY_THEMES = {
   graphite: "linen",
 };
 
-// OCR engines, mirrored from the two <select id="…ocr-service"> lists so the
-// Settings-menu picker stays in step with them (index.html).
-const OCR_SERVICES = [
-  ["tesseract", "Tesseract (local)"],
-  ["mistral", "Mistral OCR"],
-  ["claude", "Claude"],
-  ["textract", "Amazon Textract"],
-  ["azure", "Azure Document Intelligence"],
-  ["openai", "OpenAI vision"],
-];
-
-// One shared font list; the interface (--ui) and data/table (--mono) fonts
-// are chosen independently from it.
+// One shared font list for the per-theme typography controls.
 const FONT_CHOICES = [
   ["", "Default"],
   ['"Segoe UI", Tahoma, sans-serif', "Segoe UI"],
@@ -576,20 +568,18 @@ function applyTheme() {
   }
   document.body.dataset.theme = themeBase(id);   // base built-in supplies the CSS chrome
   applyThemeOverrides();   // this theme's edits (custom.overrides or the built-in's), inline
-  applyFont();             // fonts too: a per-theme override, else the global default
+  applyFont();             // fonts too: a per-theme override, else that theme's CSS default
   // a theme can carry its own activity-bar icon set (--icon-style); runs
   // after the chrome + overrides land so the computed value is current
   refreshActivityIcons();
 }
 
-// the one way to change theme: the Settings menu and the Appearance select
-// both come through here, so the menu ticks and the <select> never disagree
+// Both theme pickers -- View > Theme and the Theme editor -- come through
+// here, so the menu ticks and the editor <select> never disagree.
 function setTheme(id) {
   state.settings.theme = id;
   saveSettings();
   applyTheme();
-  const sel = el("theme-select");
-  if (sel) sel.value = id;
   const te = el("te-theme");
   if (te) te.value = id;
   // keep the Theme editor in step when it is open (it edits the active theme)
@@ -621,14 +611,13 @@ function applyThemeOverrides() {
   }
 }
 
-// fonts resolve per-theme-override first, then the global Appearance setting,
-// then the :root default. Kept out of applyThemeOverrides() (which owns the
-// non-font tokens) so the two never fight over the same inline body vars.
-const FONT_SETTING_VARS = [["fontUi", "--ui"], ["font", "--mono"], ["fontMono2", "--mono2"]];
+// Fonts belong to the selected theme. Keep them out of applyThemeOverrides()
+// (which owns the non-font tokens) so the two paths never fight over the same
+// inline body vars; an absent override falls back to that theme's CSS default.
 function applyFont() {
   const ov = activeOverrides();
-  for (const [key, cssVar] of FONT_SETTING_VARS) {
-    const val = ov[cssVar] || state.settings[key] || "";   // per-theme, else global, else default
+  for (const cssVar of THEME_FONT_VARS) {
+    const val = ov[cssVar] || "";
     if (val) document.body.style.setProperty(cssVar, val);
     else document.body.style.removeProperty(cssVar);
   }
@@ -687,7 +676,6 @@ function fillThemeSelect(sel) {
 // rebuild everywhere the theme list appears, after a custom theme is added,
 // renamed or removed
 function refreshThemePickers() {
-  fillThemeSelect(el("theme-select"));
   fillThemeSelect(el("te-theme"));
   buildThemeMenu();
 }
@@ -1090,6 +1078,10 @@ const ICONS = {
   // a magnifier over slider rails: search by field
   sliders: _SVG('<path d="M2.5 4.5 h11 M2.5 8 h6.6 M12.6 8 h.9 M2.5 11.5 h3.2 M11 11.5 h2.5"/><circle cx="6" cy="4.5" r="1.4"/><circle cx="10.6" cy="9.8" r="2.4"/><path d="M12.4 11.6 L14.2 13.4"/>'),
   send: _SVG('<path d="M13.8 2.2 L2.2 7.3 l4.3 1.7 1.5 4.4 2.3-3.5 Z"/><path d="M6.5 9 L13.8 2.2"/>'),
+  remarks: _SVG('<path d="M2.2 3.2 h11.6 v8.2 H7.3 L3.6 14 v-2.6 H2.2 Z"/><path d="M4.8 6.2 h6.4 M4.8 8.5 h4.4"/>'),
+  reply: _SVG('<path d="M6.2 4.2 L2.5 7.5 l3.7 3.3"/><path d="M3 7.5 h5.2 a4.8 4.8 0 0 1 4.8 4.3"/>'),
+  chevronleft: _SVG('<path d="M10.5 3 L5.5 8 l5 5"/>'),
+  chevronright: _SVG('<path d="M5.5 3 l5 5 -5 5"/>'),
   scissors: _SVG('<circle cx="4" cy="4.4" r="1.7"/><circle cx="4" cy="11.6" r="1.7"/><path d="M5.4 5.5 L13.6 12.6 M5.4 10.5 L13.6 3.4"/>'),
   merge: _SVG('<path d="M2.5 3.5 h3 L9 8 h4.5 M2.5 12.5 h3 L9 8"/><path d="M11.2 5.8 L13.5 8 L11.2 10.2"/>'),
   // saved-template grid gaining a cell
@@ -1376,9 +1368,29 @@ function initOverlayModals() {
 // state (the checked map) is snapshot-restored; server-backed changes run
 // their inverse call.
 
-const history = { stack: [], ptr: 0 };
+const histories = new Map();
 
-function pushOp(label, undoFn, redoFn, revert) {
+function activeHistoryTab() {
+  const tab = document.querySelector("#tabs .tab.active");
+  return (tab && tab.dataset.tab) || "home";
+}
+
+function historyForTab(tabId = activeHistoryTab()) {
+  const key = String(tabId || "home");
+  if (!histories.has(key)) histories.set(key, { stack: [], ptr: 0 });
+  return histories.get(key);
+}
+
+function findSessionHistoryOp(id) {
+  for (const tabHistory of histories.values()) {
+    const op = tabHistory.stack.find((item) => item.id === id);
+    if (op) return op;
+  }
+  return null;
+}
+
+function pushOp(label, undoFn, redoFn, revert, originTab = activeHistoryTab()) {
+  const history = historyForTab(originTab);
   const id = logAction(label, revert);   // logAction mints the id from the freshest max
   history.stack.length = history.ptr;
   history.stack.push({ id, label, undoFn, redoFn });
@@ -1389,6 +1401,7 @@ function pushOp(label, undoFn, redoFn, revert) {
 }
 
 function updateHistoryButtons() {
+  const history = historyForTab();
   const u = el("undo-btn"), r = el("redo-btn");
   u.disabled = history.ptr === 0;
   r.disabled = history.ptr >= history.stack.length;
@@ -1400,6 +1413,7 @@ function updateHistoryButtons() {
 
 let historyBusy = false;
 async function undo() {
+  const history = historyForTab();
   if (historyBusy || !history.ptr) { if (!history.ptr) status("NOTHING TO UNDO"); return; }
   historyBusy = true;
   const op = history.stack[--history.ptr];
@@ -1410,6 +1424,7 @@ async function undo() {
 }
 
 async function redo() {
+  const history = historyForTab();
   if (historyBusy || history.ptr >= history.stack.length) {
     if (history.ptr >= history.stack.length) status("NOTHING TO REDO");
     return;
@@ -1435,14 +1450,15 @@ function restoreChecked(key, snap) {
   updateCheckedCount();
 }
 
-function trackChecked(label, key, mutate) {
+function trackChecked(label, key, mutate, originTab = activeHistoryTab()) {
   const before = snapshotChecked(key);
   mutate();
   const after = snapshotChecked(key);
   pushOp(label,
     () => restoreChecked(key, before),
     () => restoreChecked(key, after),
-    { kind: "checked", key, before });   // full snapshot -> cross-session revert
+    { kind: "checked", key, before },
+    originTab);   // full snapshot -> cross-session revert
 }
 
 // --- persistent action log (History tab) -------------------------------------
@@ -1549,7 +1565,7 @@ function saveSettings() {
 }
 
 // --- UI scale (whole-interface zoom) -----------------------------------------
-// A Settings > Appearance control and Ctrl/Cmd +/- (reset with Ctrl/Cmd 0).
+// A Settings > Display control and Ctrl/Cmd +/- (reset with Ctrl/Cmd 0).
 // Applied as a CSS zoom on the root, so it scales the custom chrome too and
 // works both in Electron and the dev browser. The native menu is removed
 // (main.js), so there is no built-in zoom to fight.
@@ -1596,20 +1612,28 @@ function loadSettings() {
     // dedicated view-state store win. The next saveSettings re-partitions both.
     state.settings = Object.assign(state.settings, s, v);
   } catch (e) { /* keep defaults */ }
-  normalizeSettings();
+  if (normalizeSettings()) saveSettings();
 }
 
 // defaults + version migrations for the settings object, applied whether it
 // came from localStorage or the server
 function normalizeSettings() {
-  state.settings.checkedCols = state.settings.checkedCols || {};
+  let migrated = false;
+  // Retired preferences used to survive forever because the settings document
+  // accepts arbitrary keys. Prune values whose controls/consumers are gone.
+  for (const key of ["maxRows", "setsBackfilled", "textAnalysisService",
+                     "ocrAzureEndpoint", "ocrAzureKey"]) {
+    if (Object.prototype.hasOwnProperty.call(state.settings, key)) {
+      delete state.settings[key];
+      migrated = true;
+    }
+  }
   if (!state.settings.searchCons || typeof state.settings.searchCons !== "object")
     state.settings.searchCons = { author: true, year: true };
   if (!state.settings.sets || typeof state.settings.sets !== "object")
     state.settings.sets = {};
   state.settings.expandSets = !!state.settings.expandSets;
   state.settings.hideVolTitles = !!state.settings.hideVolTitles;
-  state.settings.setsBackfilled = !!state.settings.setsBackfilled;
   state.settings.groupMetadataBackfilled = !!state.settings.groupMetadataBackfilled;
   if (!["sets", "author", "category", "date"].includes(state.settings.publishGroup))
     state.settings.publishGroup = "sets";
@@ -1628,7 +1652,6 @@ function normalizeSettings() {
   let _opl = parseInt(state.settings.ocrPaperLighten, 10);
   if (!Number.isFinite(_opl)) _opl = 20;
   state.settings.ocrPaperLighten = Math.max(0, Math.min(100, _opl));
-  state.settings.textAnalysisService = "configured";
   if (!WB_PHASES.includes(state.settings.workbenchPhase))
     state.settings.workbenchPhase = "record";
   state.settings.jobsDrawerOpen = !!state.settings.jobsDrawerOpen;
@@ -1659,21 +1682,56 @@ function normalizeSettings() {
   }
   state.settings.colWidths = state.settings.colWidths || {};
   // migrate the old single-table column setting
-  if (Object.keys(state.settings.checkedCols).length &&
+  const legacyCheckedCols = state.settings.checkedCols;
+  if (legacyCheckedCols && typeof legacyCheckedCols === "object" &&
+      Object.keys(legacyCheckedCols).length &&
       !state.settings.colVis.checked) {
-    state.settings.colVis.checked = state.settings.checkedCols;
+    state.settings.colVis.checked = legacyCheckedCols;
+  }
+  if (Object.prototype.hasOwnProperty.call(state.settings, "checkedCols")) {
+    delete state.settings.checkedCols;
+    migrated = true;
   }
   state.settings.srcFilter = state.settings.srcFilter || "ALL";
   state.settings.dlFilter = state.settings.dlFilter || "ALL";
-  // v2.1 had a single font applied to the whole UI; migrate a saved sans
-  // value to the interface font
-  const f = state.settings.font || "";
-  if (/^(Tahoma|Verdana)/.test(f) && !state.settings.fontUi) {
-    state.settings.fontUi = f;
-    state.settings.font = "";
+  // Typography used to be a global Appearance preference. Preserve the
+  // current look by moving those values onto the active theme, then remove the
+  // hidden globals so Theme editor is the only font owner from now on.
+  if (["font", "fontUi", "fontMono2"].some((key) =>
+      Object.prototype.hasOwnProperty.call(state.settings, key))) {
+    let dataFont = state.settings.font || "";
+    let uiFont = state.settings.fontUi || "";
+    if (/^(Tahoma|Verdana)/.test(dataFont) && !uiFont) {
+      uiFont = dataFont;
+      dataFont = "";
+    }
+    const values = { "--ui": uiFont, "--mono": dataFont,
+      "--mono2": state.settings.fontMono2 || "" };
+    if (Object.values(values).some(Boolean)) {
+      const ov = themeOverrideMap(state.settings.theme, true);
+      for (const [cssVar, value] of Object.entries(values)) {
+        if (value && ov[cssVar] == null) ov[cssVar] = value;
+      }
+    }
+    delete state.settings.font;
+    delete state.settings.fontUi;
+    delete state.settings.fontMono2;
+    migrated = true;
   }
-  state.settings.maxRows =
-    Math.max(50, Math.min(5000, parseInt(state.settings.maxRows, 10) || 400));
+  // Remove shortcut values for OCR processors that were never implemented.
+  const keyMap = state.settings.ocrKeyMap;
+  if (!keyMap || typeof keyMap !== "object" || Array.isArray(keyMap)) {
+    state.settings.ocrKeyMap = {};
+    migrated = true;
+  } else {
+    const supported = new Set(["tesseract", "mistral", "claude", "textract"]);
+    for (const key of Object.keys(keyMap)) {
+      if (!supported.has(keyMap[key])) {
+        delete keyMap[key];
+        migrated = true;
+      }
+    }
+  }
   const _uisc = Number(state.settings.uiScale);
   state.settings.uiScale =
     (Number.isFinite(_uisc) && _uisc >= UI_SCALE_MIN && _uisc <= UI_SCALE_MAX)
@@ -1702,8 +1760,9 @@ function normalizeSettings() {
       }
     }
     state.settings.bchColsV26 = true;
-    saveSettings();
+    migrated = true;
   }
+  return migrated;
 }
 
 
@@ -1854,7 +1913,7 @@ async function syncClientStateOnLoad() {
         if (!VIEW_STATE_KEYS.has(k)) incoming[k] = server.settings[k];
       state.settings = Object.assign(state.settings, incoming);
       if (attentionDirty) state.settings.remarksMeta = localRemarksMeta;
-      normalizeSettings();
+      if (normalizeSettings()) migratePersistentView = true;
       // wizardDone and colWidths used to be browser-origin view state. Existing
       // settings prove this is not a first launch, even if the old origin-local
       // wizard flag is unavailable on today's sidecar port. Migrate both values
@@ -2313,8 +2372,8 @@ const homeState = { events: [], loaded: false, expanded: new Set() };
 
 async function loadActivity() {
   loadReviews().then(() => {
-    renderHome();                  // the review count rides the same visit
-    renderRemarks();               // "Awaiting review" badges share that state
+    renderHome();                  // activity and sidebar refresh on the same visit
+    renderRemarks();               // sidebar comment counts share that state
   });
   try {
     const r = await (await fetch(
@@ -2394,10 +2453,13 @@ function progressSummary() {
   // Use the same normalized model as the shared Remarks sidebar. In
   // particular, src:* marks belong to Workbench Sources, and published builds
   // still count until their mark is explicitly cleared.
-  const remarkItems = remarksItems();
+  const remarkItems = remarksItems().filter((item) => item.hasAttention !== false);
   const attnCat = remarkItems.filter((item) => item.category === "catalogs").length;
   const attnEntries = remarkItems.filter((item) => item.category === "entries").length;
   const attnSources = remarkItems.filter((item) => item.category === "sources").length;
+  const attnPages = remarkItems.filter((item) => item.category === "pages").length;
+  const attnPublications = remarkItems.filter(
+    (item) => item.category === "publications").length;
   const attnEd = attnEntries + attnSources;
   const openReviews = Object.values(reviewsState.items || {})
     .filter((r) => r.status === "open").length;
@@ -2408,8 +2470,11 @@ function progressSummary() {
   const published = builds.filter((b) => b.status === "uploaded").length;
   const catalogued = (state.checked ? state.checked.size : 0) +
                      (state.manual || []).length;
+  // srcPending is deliberately absent: the pending-sources row it fed was
+  // dropped from Home, and nothing consumes it any more.
   return {
     drafts, ready, attnCat, attnEd, attnEntries, attnSources,
+    attnPages, attnPublications,
     openReviews, published, catalogued,
   };
 }
@@ -2418,6 +2483,20 @@ function homeAttentionDestination(summary) {
   const catalogs = Number(summary.attnCat || 0);
   const entries = Number(summary.attnEntries || 0);
   const sources = Number(summary.attnSources || 0);
+  const pages = Number(summary.attnPages || 0);
+  const publications = Number(summary.attnPublications || 0);
+  // Preserve the established Catalogs/Workbench destinations. Page and
+  // publication marks have their own natural homes when they are the only
+  // class present; a mixed cross-tab set stays on Home and opens the shared
+  // sidebar's All filter instead of choosing an arbitrary tab.
+  if (pages || publications) {
+    const other = catalogs + entries + sources;
+    if (pages && !publications && !other)
+      return { tab: "replica", filter: "pages" };
+    if (publications && !pages && !other)
+      return { tab: "publish", filter: "publications" };
+    return { tab: "home", filter: "all" };
+  }
   if (catalogs) {
     return { tab: "checked", filter: entries || sources ? "all" : "catalogs" };
   }
@@ -2675,8 +2754,15 @@ function renderHomeProgress(host, p) {
       (detail ? `<span class="hr-d">${esc(detail)}</span>` : "") +
     `</button>`;
   const inEditor = p.drafts.length + p.ready;
-  const attn = p.attnCat + p.attnEd;
+  const attn = p.attnCat + p.attnEd + p.attnPages + p.attnPublications;
   const attnDest = homeAttentionDestination(p);
+  const attnBreakdown = [
+    p.attnCat ? `${p.attnCat} catalog` : "",
+    p.attnEd ? `${p.attnEd} workbench` : "",
+    p.attnPages ? `${p.attnPages} page${p.attnPages === 1 ? "" : "s"}` : "",
+    p.attnPublications
+      ? `${p.attnPublications} publication${p.attnPublications === 1 ? "" : "s"}` : "",
+  ].filter(Boolean);
   let html =
     row(inEditor, inEditor === 1 ? "entry in the workbench" : "entries in the workbench",
         `data-gotab="workbench"`, inEditor ? `${p.drafts.length} draft · ${p.ready} to publish` : "") +
@@ -2684,9 +2770,7 @@ function renderHomeProgress(host, p) {
         : "items marked for attention",
         `data-remarks="1" data-remarks-filter="${attnDest.filter}" ` +
         `data-gotab="${attnDest.tab}"`,
-        p.attnCat && p.attnEd ? `${p.attnCat} catalog · ${p.attnEd} workbench` : "") +
-    row(p.openReviews, p.openReviews === 1 ? "item awaiting review"
-        : "items awaiting review", `data-review="1"`);
+        attnBreakdown.length > 1 ? attnBreakdown.join(" · ") : "");
 
   const drafts = p.drafts.slice()
     .sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
@@ -2695,7 +2779,7 @@ function renderHomeProgress(host, p) {
     html += `<div class="home-h home-h-sub">Drafts</div>` +
       shown.map((b) => `<button class="home-draft" data-draft="${esc(b.id)}"
           data-tip="Open this draft in the Workbench">` +
-        `<span class="hd-t">${esc(b.title) || "<em>(untitled)</em>"}</span>` +
+        `<span class="hd-t">${bookTitleHtml(b)}</span>` +
         `<span class="hd-meta">${esc(b.authors || "")}${b.authors && b.year ? " · " : ""}${esc(b.year || "")}</span>` +
         `<span class="hd-when">${esc(relIso(b.updated_at))}</span></button>`).join("");
     if (drafts.length > shown.length)
@@ -2813,7 +2897,6 @@ function initHome() {
   el("home-progress").addEventListener("click", (ev) => {
     const d = ev.target.closest("[data-draft]");
     if (d) {
-      state.buildsTab = "pending";   // drafts live in the Pending queue
       document.querySelector(`#tabs .tab[data-tab="workbench"]`).click();
       // a draft's next step is its Record — land there with the book selected
       selectWorkbenchBook(d.dataset.draft, "record");
@@ -2830,9 +2913,6 @@ function initHome() {
     }
     const b = ev.target.closest("[data-gotab]");
     if (b) {
-      // every workbench-bound row advertises pending work, so land on the
-      // Pending queue even if the book list was left on Uploaded
-      if (b.dataset.gotab === "workbench") state.buildsTab = "pending";
       if (b.dataset.remarks && b.dataset.remarksFilter) {
         setRemarksFilterForTab(b.dataset.gotab, b.dataset.remarksFilter, true);
       }
@@ -3001,6 +3081,7 @@ function initTabs() {
       tab.classList.add("active");
       el(tab.dataset.tab).classList.add("active");
       setHeader(tab.dataset.tab);
+      updateHistoryButtons();
       syncRemarksForTab();
       if (tab.dataset.tab === "home") loadActivity();   // refresh on every visit
       if (tab.dataset.tab === "checked") renderChecked();
@@ -3026,6 +3107,28 @@ function initTabs() {
 }
 
 // --- tooltip (match info + overflowed cells) ---------------------------------
+
+// Root CSS zoom scales fixed-position offsets, but pointer coordinates,
+// getBoundingClientRect(), and viewport bounds are reported in visual pixels.
+// Measure/collide in that visual space, then convert the final offsets back to
+// the root's pre-zoom coordinate space before assigning CSS left/top.
+function fixedPopupMetrics(node) {
+  node.style.left = "0px";
+  node.style.top = "0px";
+  return {
+    rect: node.getBoundingClientRect(),
+    scale: Math.max(0.01, Number(state.settings.uiScale) || 1),
+  };
+}
+
+function positionFixedPopup(node, left, top, metrics = fixedPopupMetrics(node)) {
+  const { rect, scale } = metrics;
+  const edge = 8 * scale;
+  left = Math.max(edge, Math.min(left, innerWidth - rect.width - edge));
+  top = Math.max(edge, Math.min(top, innerHeight - rect.height - edge));
+  node.style.left = (left / scale) + "px";
+  node.style.top = (top / scale) + "px";
+}
 
 function showTip(text, x, y) {
   const tip = el("cad-tooltip");
@@ -3446,9 +3549,9 @@ function openPopup(anchor, html, wire) {
     anchor.setAttribute("aria-expanded", "true");
   pop.setAttribute("aria-label", anchor.getAttribute("aria-label") || "Toolbar options");
   const r = anchor.getBoundingClientRect();
-  pop.style.top = Math.min(r.bottom + 4, innerHeight - pop.offsetHeight - 8) + "px";
-  pop.style.left = Math.max(8, Math.min(r.right - pop.offsetWidth,
-    innerWidth - pop.offsetWidth - 8)) + "px";
+  const box = fixedPopupMetrics(pop);
+  positionFixedPopup(pop, r.right - box.rect.width,
+    r.bottom + 4 * box.scale, box);
   if (wire) wire(pop);
 }
 
@@ -3552,26 +3655,6 @@ function openFilterMenu(anchor) {
 }
 
 // --- settings window -----------------------------------------------------------
-
-function fillFontSelect(id, list, settingKey, apply) {
-  const sel = el(id);
-  sel.innerHTML = "";
-  for (const [val, label] of list) {
-    const o = document.createElement("option");
-    o.value = val;
-    // the interface face has per-theme defaults now (a theme may set --ui),
-    // so its empty choice means "whatever the theme picks", not one fixed font
-    o.textContent = (!val && settingKey === "fontUi") ? "Theme default" : label;
-    sel.appendChild(o);
-  }
-  sel.value = state.settings[settingKey] || "";
-  if (sel.value !== (state.settings[settingKey] || "")) sel.value = "";
-  sel.onchange = () => {
-    state.settings[settingKey] = sel.value;
-    saveSettings();
-    apply();
-  };
-}
 
 // --- Settings > Integrations: downloadable databases ------------------------
 
@@ -3693,6 +3776,24 @@ function pollDbStatus() {
   }, 1000);
 }
 
+async function resetSettingsToDefaults() {
+  const fresh = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
+  const { prefs } = partitionSettings(fresh);
+  // Replace only the settings blob. Checked books and attention marks are
+  // separate top-level client-state fields and must survive an interface reset.
+  const res = await fetch("/api/client_state", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ settings: prefs }),
+  });
+  if (!res.ok) throw new Error(`settings reset failed (HTTP ${res.status})`);
+  try {
+    localStorage.removeItem(SETTINGS_KEY);
+    localStorage.removeItem(VIEWSTATE_KEY);
+  } catch (e) {}
+  location.reload();
+}
+
 function renderSettings() {
   // GENERAL
   el("gen-info").textContent =
@@ -3706,11 +3807,8 @@ function renderSettings() {
       confirmLabel: "Reset settings",
       danger: true,
     }))) return;
-    try {
-      localStorage.removeItem(SETTINGS_KEY);
-      localStorage.removeItem(VIEWSTATE_KEY);
-    } catch (e) {}
-    location.reload();
+    try { await resetSettingsToDefaults(); }
+    catch (e) { statusErr("SETTINGS RESET :: " + (e.message || "server unavailable")); }
   };
   el("clear-history-btn").onclick = async () => {
     if (!(await confirmDialog({
@@ -3798,10 +3896,7 @@ function renderSettings() {
   }
   renderLanSettings();
 
-  // APPEARANCE
-  const themeSel = el("theme-select");
-  fillThemeSelect(themeSel);               // built-ins + custom themes (custom italic)
-  themeSel.onchange = () => setTheme(themeSel.value);
+  // DISPLAY
   const scaleSel = el("ui-scale-select");
   if (scaleSel) {
     scaleSel.innerHTML = UI_SCALES.map((v) =>
@@ -3809,20 +3904,16 @@ function renderSettings() {
     scaleSel.value = String(state.settings.uiScale || 1);
     scaleSel.onchange = () => setUiScale(Number(scaleSel.value));
   }
-  fillFontSelect("font-ui-select", FONT_CHOICES, "fontUi", applyFont);
-  fillFontSelect("font-select", FONT_CHOICES, "font", applyFont);
-  fillFontSelect("font-mono2-select", FONT_CHOICES, "fontMono2", applyFont);
   renderThemeEditor();
 
   // AI
   for (const [id, k] of [["set-r2-account", "r2Account"], ["set-r2-bucket", "r2Bucket"],
-                        ["set-r2-key", "r2KeyId"], ["set-r2-secret", "r2Secret"],
                         ["set-r2-public", "r2PublicBase"],
                         ["set-ai-base", "aiBase"], ["set-ai-model", "aiModel"],
-                         ["set-ai-key", "aiKey"],
                          ["set-embed-base", "embedBase"],
                          ["set-embed-model", "embedModel"],
-                         ["set-ai-instructions", "aiInstructions"]]) {
+                         ["set-ai-instructions", "aiInstructions"],
+                         ["set-smartscan-instructions", "smartScanInstructions"]]) {
     const n = el(id);
     n.value = state.settings[k] || "";
     n.onchange = () => {
@@ -3830,6 +3921,14 @@ function renderSettings() {
       saveSettings();
     };
   }
+  const smartScanManual = el("set-smartscan-manual-pages");
+  smartScanManual.checked = !!state.settings.smartScanManualPages;
+  smartScanManual.onchange = () => {
+    state.settings.smartScanManualPages = smartScanManual.checked;
+    const quick = el("proc-manual-pages");
+    if (quick) quick.checked = smartScanManual.checked;
+    saveSettings();
+  };
 
   // OCR services (Tesseract runs locally; cloud credentials are verified
   // once the user has API keys)
@@ -3841,22 +3940,13 @@ function renderSettings() {
     saveSettings();
     updateDefaultEngineSummary();
   };
-  for (const [id, k] of [["set-ocr-azure-endpoint", "ocrAzureEndpoint"],
-                         ["set-ocr-azure-key", "ocrAzureKey"],
-                         ["set-ocr-tesseract", "ocrTesseract"],
-                         ["set-ocr-claude-key", "ocrClaudeKey"],
+  for (const [id, k] of [["set-ocr-tesseract", "ocrTesseract"],
                          ["set-ocr-claude-model", "ocrClaudeModel"],
-                         ["set-ocr-aws-key", "ocrAwsKey"],
-                         ["set-ocr-aws-secret", "ocrAwsSecret"],
                          ["set-ocr-aws-region", "ocrAwsRegion"],
                          ["set-gs-sheet-id", "gsSpreadsheetId"],
-                         ["set-gs-keyfile", "gsKeyFile"],
                          ["set-gs-sheet-name", "gsSheetName"],
                          ["set-cloud-url", "cloudSearchUrl"],
                          ["set-sb-url", "supabaseUrl"],
-                         ["set-sb-key", "supabaseKey"],
-                         ["set-sb-anon", "supabaseAnonKey"],
-                         ["set-mistral-key", "mistralKey"],
                          ["set-imggen-provider", "imgGenProvider"],
                          // set-imggen-key is a SECRET: the credentials loop below
                          // owns it. Two handlers on one field would race.
@@ -3868,15 +3958,14 @@ function renderSettings() {
       saveSettings();
     };
   }
-  // Credentials: re-wire the secret fields the generic loops above touched so
-  // their values load from and save to the server's Host-guarded secrets API.
+  // Credentials load from and save to the server's Host-guarded secrets API.
   // Mistral is cached there and synchronized with the private cloud profile;
   // the others remain device-local.
   (async () => {
     const SECRET_FIELDS = [
       ["set-ai-key", "aiKey"], ["set-embed-key", "embedKey"],
       ["set-mistral-key", "mistralKey"],
-      ["set-ocr-claude-key", "ocrClaudeKey"], ["set-ocr-azure-key", "ocrAzureKey"],
+      ["set-ocr-claude-key", "ocrClaudeKey"],
       ["set-ocr-aws-key", "ocrAwsKey"], ["set-ocr-aws-secret", "ocrAwsSecret"],
       ["set-sb-key", "supabaseKey"], ["set-sb-anon", "supabaseAnonKey"],
       ["set-r2-key", "r2KeyId"], ["set-r2-secret", "r2Secret"],
@@ -4178,8 +4267,7 @@ function renderSettings() {
 // --- Settings > Theme editor --------------------------------------------------
 // The chrome tokens the editor exposes, grouped for the panel. Colours are
 // #rrggbb via the native <input type=color>; --radius/--border-w are px lengths
-// (slider + number); weights are a fixed dropdown. Font-family vars are
-// deliberately excluded -- they are global and stay under Appearance.
+// (slider + number); weights and per-theme font families use fixed dropdowns.
 const THEME_TOKENS = [
   ["Accent & primary", [
     { v: "--cyan",  l: "Accent (focus, links)", t: "color" },
@@ -4223,7 +4311,7 @@ const THEME_TOKENS = [
     { v: "--wt-strong", l: "Heading weight",   t: "wt", def: "700",
       opts: [["400", "Regular"], ["500", "Medium"], ["600", "Semibold"], ["700", "Bold"]] },
   ]],
-  // fonts are per-theme here; "Default" falls back to the global Appearance font
+  // Fonts are per-theme here; an empty override falls back to theme CSS.
   ["Fonts", [
     { v: "--ui",    l: "Interface font", t: "font" },
     { v: "--mono",  l: "Data / table font", t: "font" },
@@ -4316,7 +4404,7 @@ function renderThemeEditor() {
     }
     saveSettings();
     applyThemeOverrides();
-    applyFont();               // a reset font token falls back to the global default
+    applyFont();               // a reset font token falls back to that theme's CSS default
     renderThemeEditor();
   };
 
@@ -4391,7 +4479,7 @@ function renderThemeEditor() {
         const sel = document.createElement("select");
         sel.className = "cad-input te-fontsel";
         const def = document.createElement("option");
-        def.value = ""; def.textContent = "Default (Appearance)";
+        def.value = ""; def.textContent = "Theme default";
         sel.appendChild(def);
         for (const [val, name] of FONT_CHOICES) {
           if (!val) continue;                              // skip FONT_CHOICES' own "Default"
@@ -5403,10 +5491,11 @@ function markCell(row) {
 function attachRowScan(id) {
   const row = state.rowsById.get(String(id));
   if (!row) return;
+  const originTab = activeHistoryTab();
   // default to the Downloads folder filtered to recently downloaded PDFs; if
   // the row already has a scan, reopen at that file's folder (unfiltered)
   const start = row.localPdf ? row.localPdf.replace(/[\\/][^\\/]*$/, "") : "";
-  openFileBrowser(start, (path) => setRowLocalPdf(id, path),
+  openFileBrowser(start, (path) => setRowLocalPdf(id, path, originTab),
     { downloadsDefault: !start, recentMin: state.settings.scanRecentMin });
 }
 
@@ -5427,7 +5516,7 @@ async function patchManualLocalPdf(id, path) {
   return true;
 }
 
-async function setRowLocalPdf(id, path) {
+async function setRowLocalPdf(id, path, originTab = activeHistoryTab()) {
   const row = state.rowsById.get(String(id));
   if (!row) return;
   const verb = path ? "attach scan" : "detach scan";
@@ -5438,13 +5527,14 @@ async function setRowLocalPdf(id, path) {
     pushOp(`${verb} ${(row.book.title || "").slice(0, 36)}`,
       () => patchManualLocalPdf(id, prior),
       () => patchManualLocalPdf(id, path),
-      { kind: "manual-localpdf", id, before: prior });
+      { kind: "manual-localpdf", id, before: prior },
+      originTab);
   } else {
     const entry = state.checked.get(id);
     if (!entry) return;
     trackChecked(`${verb} ${(row.book.title || "").slice(0, 36)}`, id, () => {
       entry.local_pdf = path;
-    });
+    }, originTab);
     saveChecked();
   }
   renderChecked();
@@ -5528,6 +5618,34 @@ function setBaseTitle(book) {
   if (vt && vt.clean) t = vt.clean;
   else { const v = extractVolume(t); if (v && v.clean) t = v.clean; }  // "vol N"
   return t.trim();
+}
+
+// Canonical, presentation-only title formatter. Volume metadata remains a
+// separate stored field; every rendered book title gets the same escaped tag
+// without ever folding that tag back into `book.title`.
+function bookVolumeValue(book) {
+  if (!book) return "";
+  for (const value of [book.volume, book.volume_number]) {
+    const volume = String(value ?? "").trim();
+    if (volume) return volume;
+  }
+  return "";
+}
+
+function bookTitleText(book, fallback = "(untitled)") {
+  const volume = bookVolumeValue(book);
+  const rawTitle = String((book && book.title) || "").trim();
+  const title = (volume ? setBaseTitle(book) : rawTitle) || String(fallback || "");
+  return volume ? `Vol. ${volume} ${title}` : title;
+}
+
+function bookTitleHtml(book, fallback = "(untitled)") {
+  const volume = bookVolumeValue(book);
+  const rawTitle = String((book && book.title) || "").trim();
+  const title = (volume ? setBaseTitle(book) : rawTitle) || String(fallback || "");
+  return `<span class="book-title-display">${volume
+    ? `<span class="volume-title-tag">Vol. ${esc(volume)}</span>`
+    : ""}<span class="book-title-text">${esc(title)}</span></span>`;
 }
 
 // stable default association for newly detected legacy volume sets
@@ -5624,9 +5742,9 @@ const ATTN_KEY = "whl_cad_attention_v1";
 const ATTN_DIRTY_KEY = "whl_cad_attention_dirty_v1";
 
 // Remarks is the shared presentation of every needs-attention mark. Categories
-// describe the target object, not the tab currently showing the sidebar. Pages
-// and publications are reserved now so their owning tabs already have the right
-// default when those target classes become markable.
+// describe the target object, not the tab currently showing the sidebar. Page
+// and publication marks use keyed identities because those read-only objects do
+// not carry the mutable attention field used by rows and editor builds.
 const REMARK_CATEGORIES = [
   ["catalogs", "Catalogs"], ["sources", "Sources"], ["entries", "Entries"],
   ["pages", "Pages"], ["publications", "Publications"],
@@ -5637,7 +5755,9 @@ const REMARK_TAB_DEFAULTS = {
   replica: "pages", publish: "publications", infotab: "all",
 };
 const remarksState = {
-  editing: null, draft: "", error: "", saving: false,
+  editing: null, draft: "", error: "", errorItem: null, saving: false,
+  expanded: new Set(), replying: null, replyDraft: "", replySaving: false,
+  resolving: null,
 };
 
 function loadAttn() {
@@ -5674,8 +5794,64 @@ function remarkKeyParts(key) {
     : { prefix: raw.slice(0, colon), ref: raw.slice(colon + 1) };
 }
 
+function remarkDecodePart(value) {
+  try { return decodeURIComponent(String(value || "")); }
+  catch (e) { return null; }
+}
+
+// A Replica page is source-scoped: page 12 of a secondary scan is unrelated
+// to page 12 of the primary PDF. Encode every identity component so separators
+// in imported build/source ids cannot make two pages share a mark.
+function replicaPageRemarkKey(buildId, sourceId, page) {
+  const n = Number(page);
+  if (!String(buildId || "") || !Number.isSafeInteger(n) || n < 1) return "";
+  return "page:" + [buildId, sourceId || "primary", n]
+    .map((part) => encodeURIComponent(String(part))).join("|");
+}
+
+function replicaPageRemarkParts(key) {
+  const { prefix, ref } = remarkKeyParts(key);
+  if (prefix !== "page" && prefix !== "page-deleted") return null;
+  const parts = ref.split("|");
+  if (parts.length !== 3 && !(prefix === "page-deleted" && parts.length === 4))
+    return null;
+  const buildId = remarkDecodePart(parts[0]);
+  const sourceId = remarkDecodePart(parts[1]);
+  const pagePart = remarkDecodePart(parts[2]);
+  const tombstone = parts.length === 4 ? remarkDecodePart(parts[3]) : "";
+  const page = Number(pagePart);
+  if (buildId == null || sourceId == null || pagePart == null ||
+      tombstone == null || (parts.length === 4 && !tombstone) ||
+      !buildId || !sourceId || !/^[1-9]\d*$/.test(pagePart) ||
+      !Number.isSafeInteger(page)) return null;
+  return {
+    buildId, sourceId, page, deleted: prefix === "page-deleted",
+    encodedBuild: parts[0], encodedSource: parts[1],
+  };
+}
+
+// Published-tree aliases (author/category/date) all carry the same selection
+// key. Persist that key rather than a rendered node id so one publication has
+// exactly one mark regardless of the current grouping.
+function publicationRemarkKey(selectionKey) {
+  const selection = String(selectionKey || "");
+  return /^(book|set):.+/.test(selection)
+    ? "pub:" + encodeURIComponent(selection) : "";
+}
+
+function publicationRemarkSelection(key) {
+  const { prefix, ref } = remarkKeyParts(key);
+  if (prefix !== "pub") return "";
+  const selection = remarkDecodePart(ref);
+  return selection != null && /^(book|set):.+/.test(selection) ? selection : "";
+}
+
 function remarkCategoryForKey(key) {
-  return remarkKeyParts(key).prefix.startsWith("src") ? "sources" : "catalogs";
+  const { prefix } = remarkKeyParts(key);
+  if (prefix.startsWith("src")) return "sources";
+  if (prefix === "page" || prefix === "page-deleted") return "pages";
+  if (prefix === "pub") return "publications";
+  return "catalogs";
 }
 
 // Legacy source marks used only URL/path/title and could merge two catalog
@@ -5734,6 +5910,72 @@ function setAttnKey(k, val, meta) {
   return true;
 }
 
+function remappedPageRemarkValue(value, oldPage, newPage) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const label = String(value.label || "");
+  const match = label.match(/(\s+\u00b7\s*page\s+)(\d+)$/i);
+  if (!match || Number(match[2]) !== oldPage) return value;
+  return Object.assign({}, value, {
+    label: label.slice(0, match.index) + match[1] + newPage,
+  });
+}
+
+// PDF deletion renumbers every higher page. Move page marks in the same
+// transaction-like pass: delete all old keys first, then install shifted keys,
+// so a mark from page N+1 cannot collide with the deleted page N's old key.
+// Shared review refs and the server-side client-state copy are remapped by the
+// deletion endpoint; this keeps the live browser copy in lock-step with them.
+function remapPageRemarkKeys(buildId, sourceId, removedPages) {
+  const removed = [...new Set((removedPages || []).map(Number)
+    .filter((n) => Number.isSafeInteger(n) && n > 0))].sort((a, b) => a - b);
+  if (!String(buildId || "") || !removed.length) return false;
+  const removedSet = new Set(removed);
+  const attn = state.attn && typeof state.attn === "object" && !Array.isArray(state.attn)
+    ? state.attn : (state.attn = {});
+  const settings = state.settings || (state.settings = {});
+  const meta = settings.remarksMeta && typeof settings.remarksMeta === "object" &&
+      !Array.isArray(settings.remarksMeta)
+    ? settings.remarksMeta : (settings.remarksMeta = {});
+  const moves = [];
+
+  for (const key of new Set([...Object.keys(attn), ...Object.keys(meta)])) {
+    const page = replicaPageRemarkParts(key);
+    if (!page || page.deleted || page.buildId !== String(buildId) ||
+        page.sourceId !== String(sourceId || "primary")) continue;
+    const shifted = page.page - removed.filter((n) => n < page.page).length;
+    const next = removedSet.has(page.page) ? ""
+      : `page:${page.encodedBuild}|${page.encodedSource}|${shifted}`;
+    moves.push({
+      key, next, oldPage: page.page, newPage: shifted,
+      hasValue: Object.prototype.hasOwnProperty.call(attn, key), value: attn[key],
+      hasMeta: Object.prototype.hasOwnProperty.call(meta, key), meta: meta[key],
+    });
+  }
+  if (!moves.length) return false;
+
+  for (const move of moves) {
+    delete attn[move.key];
+    delete meta[move.key];
+  }
+  for (const move of moves) {
+    if (!move.next) continue; // the marked physical page was deleted
+    if (move.hasValue) attn[move.next] = remappedPageRemarkValue(
+      move.value, move.oldPage, move.newPage);
+    if (move.hasMeta) meta[move.next] = remappedPageRemarkValue(
+      move.meta, move.oldPage, move.newPage);
+  }
+  try { localStorage.setItem(ATTN_KEY, JSON.stringify(attn)); } catch (e) {}
+  try { localStorage.setItem(ATTN_DIRTY_KEY, "1"); } catch (e) {}
+  saveSettings();
+  pushClientState("attention");
+  renderReplicaAttentionMarks();
+  decorateOcrPages();
+  decorateAnFacsimile();
+  renderRemarks();
+  renderHome();
+  return true;
+}
+
 function activeRemarksTab() {
   const tab = document.querySelector("#tabs .tab.active");
   return tab ? tab.dataset.tab : "home";
@@ -5763,35 +6005,81 @@ function remarkSecondary(parts) {
   return parts.filter((x) => String(x || "").trim()).join(" \u00b7 ");
 }
 
+function replicaPageSourceAvailable(build, source) {
+  if (!build) return false;
+  source = String(source || "primary");
+  if (source === "primary") return true;
+  return (build.pdf_sources || []).some((item) => String(item.id) === source);
+}
+
+function replicaPageBuildRevision(ref) {
+  const page = replicaPageRemarkParts(ref);
+  const build = page && !page.deleted && (state.builds || {})[page.buildId];
+  return build ? String(build.updated_at || "unversioned") : "";
+}
+
 function keyedRemarkDescriptor(key, stored, sourceByKey) {
   const { prefix, ref } = remarkKeyParts(key);
   const meta = Object.assign({}, attnMeta(stored),
     (state.settings.remarksMeta || {})[key] || {});
-  let label = "", subtype = "Catalog record", secondary = "", canOpen = false;
-  if (prefix === "src" || prefix === "src2") {
+  let label = "", volume = "", subtype = "Catalog record", secondary = "", canOpen = false;
+  if (prefix === "page" || prefix === "page-deleted") {
+    const page = replicaPageRemarkParts(key);
+    const build = page && (state.builds || {})[page.buildId];
+    label = build ? (build.title || page.buildId) : "";
+    volume = build ? bookVolumeValue(build) : "";
+    subtype = page && page.deleted ? "Removed replica page" : "Replica page";
+    secondary = page ? remarkSecondary([
+      `Page ${page.page}`,
+      page.sourceId !== "primary" ? `Source ${page.sourceId}` : "",
+    ]) : "";
+    canOpen = !!(page && !page.deleted &&
+      replicaPageSourceAvailable(build, page.sourceId));
+  } else if (prefix === "pub") {
+    const selection = publicationRemarkSelection(key);
+    const entity = selection ? publishFindEntity(selection) : null;
+    const entry = entity && entity.kind === "book" ? entity.entries[0] : null;
+    label = entity ? entity.label : "";
+    volume = entry ? bookVolumeValue(entry) : "";
+    subtype = (entity ? entity.kind === "set" : selection.startsWith("set:"))
+      ? "Published set" : "Published volume";
+    secondary = entity
+      ? (entity.kind === "set"
+        ? `${entity.entries.length} published volume${entity.entries.length === 1 ? "" : "s"}`
+        : remarkSecondary([entry.authors, entry.year]))
+      : "";
+    // The catalogue loads lazily. A syntactically valid saved publication can
+    // open that loader; once a complete catalogue is present, a missing entity
+    // is correctly treated as stale instead of routing to the first item.
+    canOpen = !!selection && (!state.publishLoaded || !!entity);
+  } else if (prefix === "src" || prefix === "src2") {
     const source = sourceByKey
       ? sourceByKey.get(key)
       : approvedSources().find((s) =>
           sourceMatchesRemark(s, key));
     label = source ? source.title : "";
+    volume = source ? bookVolumeValue(source) : "";
     subtype = "Verified source";
     secondary = source ? remarkSecondary([source.archive, source.author, source.year]) : "";
     canOpen = !!source;
   } else if (prefix === "whl") {
     const row = (state.whlRows || []).find((r) => String(r.idx) === ref);
     label = row ? row.title : "";
+    volume = row ? bookVolumeValue(row) : "";
     subtype = "WHL catalog";
     secondary = row ? remarkSecondary([row.authors, row.year]) : "";
     canOpen = /^-?\d+$/.test(ref);
   } else if (prefix === "ch") {
     const row = (state.chBooks || []).find((r) => String(r.idx) === ref);
     label = row ? row.title : "";
+    volume = row ? bookVolumeValue(row) : "";
     subtype = "Master list";
     secondary = row ? remarkSecondary([row.author, row.year]) : "";
     canOpen = /^\d+$/.test(ref);
   } else if (prefix === "ol") {
     const row = (state.olRows || []).find((r) => String(r.key) === ref);
     label = row ? row.title : "";
+    volume = row ? bookVolumeValue(row) : "";
     subtype = "Open Library";
     secondary = row ? remarkSecondary([(row.authors || []).join("; "), row.year || row.first_year]) : "";
     canOpen = !!row;
@@ -5803,16 +6091,84 @@ function keyedRemarkDescriptor(key, stored, sourceByKey) {
     ? meta.category : remarkCategoryForKey(key);
   return {
     id: "key:" + key, kind: "key", ref: key, category, subtype,
-    label, secondary, reason: attnReason(stored), canOpen,
+    label, volume, secondary, reason: attnReason(stored), canOpen,
+    hasAttention: true,
   };
 }
 
-// Normalize the three canonical stores (checked/manual rows, builds, keyed
-// marks) into one sidebar model. Never scrape rendered rows: filters and
-// streaming mean the DOM is intentionally incomplete.
+function reviewLabelBook(review, fallback) {
+  const label = String((review && review.label) || fallback || "").trim();
+  const tagged = /^Vol\.\s+([^\s]+)\s+(.+)$/i.exec(label);
+  return tagged
+    ? { title: tagged[2].trim(), volume: tagged[1].trim() }
+    : { title: label, volume: "" };
+}
+
+// An open server review remains actionable even if its personal attention mark
+// was removed or is unavailable on this client. Build the same compact sidebar
+// descriptor, but record that resolution must close only the discussion rather
+// than recreating/clearing an attention mark that is not present.
+function reviewOnlyRemarkDescriptor(review, rows, sourceByKey) {
+  if (!review || review.status !== "open") return null;
+  const kind = String(review.kind || "");
+  const ref = String(review.ref || "");
+  if (!ref) return null;
+  let item = null;
+  if (kind === "key") {
+    item = keyedRemarkDescriptor(ref, review.reason || "1", sourceByKey);
+    const page = replicaPageRemarkParts(ref);
+    const savedReview = page && review.label
+      ? Object.assign({}, review, { label: String(review.label).replace(
+        /\s·\s[Pp]age\s+\d+(?:\s·\sSource\s+.*?)?(?:\s·\sremoved)?$/, "") })
+      : review;
+    const saved = reviewLabelBook(savedReview, item.label);
+    if (review.label && (!page || !(state.builds || {})[page.buildId]))
+      item.label = saved.title;
+    if (saved.volume && (!page || !(state.builds || {})[page.buildId]))
+      item.volume = saved.volume;
+  } else if (kind === "build") {
+    const build = (state.builds || {})[ref];
+    const saved = reviewLabelBook(review, ref);
+    const statusLabel = build
+      ? (build.status === "uploaded" ? "Published entry"
+        : build.status === "ready" ? "Verified entry" : "Draft entry")
+      : "Entry discussion";
+    item = {
+      id: "build:" + ref, kind, ref, category: "entries", subtype: statusLabel,
+      label: build ? (build.title || ref) : saved.title,
+      volume: build ? bookVolumeValue(build) : saved.volume,
+      secondary: build ? remarkSecondary([build.authors, build.year]) : "",
+      reason: String(review.reason || ""), canOpen: !!build,
+    };
+  } else if (kind === "row") {
+    const row = (rows || []).find((candidate) => String(candidate.id) === ref);
+    const saved = reviewLabelBook(review, ref);
+    const subtype = row
+      ? (row.captured ? "Phone capture"
+        : row.kind === "manual" ? "Manual entry" : "Checked book")
+      : "Catalog discussion";
+    item = {
+      id: "row:" + ref, kind, ref, category: "catalogs", subtype,
+      label: row ? (row.book.title || ref) : saved.title,
+      volume: row ? bookVolumeValue(row.book) : saved.volume,
+      secondary: row ? remarkSecondary([row.book.author, row.book.year]) : "",
+      reason: String(review.reason || ""), canOpen: !!row,
+    };
+  }
+  if (!item) return null;
+  item.hasAttention = false;
+  item.reviewOnly = true;
+  if (!item.reason) item.reason = String(review.reason || "");
+  return item;
+}
+
+// Normalize attention from the three canonical stores, then union unmatched
+// open review records. Never scrape rendered rows: filters and streaming mean
+// the DOM is intentionally incomplete.
 function remarksItems() {
   const items = [];
-  for (const row of combinedRows()) {
+  const rows = combinedRows();
+  for (const row of rows) {
     if (!row.attention) continue;
     const subtype = row.captured ? "Phone capture"
       : row.kind === "manual" ? "Manual entry" : "Checked book";
@@ -5820,8 +6176,9 @@ function remarksItems() {
       id: "row:" + row.id, kind: "row", ref: String(row.id),
       category: "catalogs", subtype,
       label: row.book.title || String(row.id),
+      volume: bookVolumeValue(row.book),
       secondary: remarkSecondary([row.book.author, row.book.year]),
-      reason: attnReason(row.attention), canOpen: true,
+      reason: attnReason(row.attention), canOpen: true, hasAttention: true,
     });
   }
   for (const b of Object.values(state.builds || {})) {
@@ -5832,8 +6189,9 @@ function remarksItems() {
       id: "build:" + b.id, kind: "build", ref: String(b.id),
       category: "entries", subtype: statusLabel,
       label: b.title || String(b.id),
+      volume: bookVolumeValue(b),
       secondary: remarkSecondary([b.authors, b.year]),
-      reason: attnReason(b.attention), canOpen: true,
+      reason: attnReason(b.attention), canOpen: true, hasAttention: true,
     });
   }
   const keyed = Object.entries(state.attn || {}).filter(([, stored]) => !!stored);
@@ -5848,6 +6206,16 @@ function remarksItems() {
   }
   for (const [key, stored] of keyed) {
     items.push(keyedRemarkDescriptor(key, stored, sourceByKey));
+  }
+  const ids = new Set(items.map((item) => item.id));
+  for (const review of Object.values(reviewsState.items || {})) {
+    if (!review || review.status !== "open") continue;
+    const id = `${review.kind}:${review.ref}`;
+    if (ids.has(id)) continue;
+    const item = reviewOnlyRemarkDescriptor(review, rows, sourceByKey);
+    if (!item || ids.has(item.id)) continue;
+    items.push(item);
+    ids.add(item.id);
   }
   return items.sort((a, b) => {
     const ai = REMARK_CATEGORIES.findIndex(([id]) => id === a.category);
@@ -5870,46 +6238,133 @@ function remarkRoute(item) {
   // persisted kind/ref pair.
   if (prefix.startsWith("src"))
     return { tab: "workbench", phase: "record", sourceKey: String(item.ref) };
+  if (prefix === "page") {
+    const page = replicaPageRemarkParts(item.ref);
+    return page ? {
+      tab: "replica", replicaBookId: page.buildId,
+      replicaSource: page.sourceId, replicaPage: page.page,
+    } : null;
+  }
+  if (prefix === "pub") {
+    const selection = publicationRemarkSelection(item.ref);
+    return selection ? { tab: "publish", publicationSelection: selection } : null;
+  }
   if (prefix === "whl") return { tab: "checked", table: "whl", whlIdx: ref };
   if (prefix === "ch" || prefix === "ol")
     return { tab: "checked", bottom: prefix, recordRef: ref };
   return null;
 }
 
+// A matching review record supplies the sidebar item's shared thread. Prefer
+// the open thread, falling back to the newest closed one only when an attention
+// mark remains visible after its review was resolved.
+function remarkReviewForItem(item) {
+  if (!item) return null;
+  const key = `${item.kind}:${item.ref}`;
+  return Object.values(reviewsState.items || {})
+    .filter((review) => review.key === key)
+    .sort((a, b) => Number(b.status === "open") - Number(a.status === "open") ||
+      (b.created_at || "").localeCompare(a.created_at || ""))[0] || null;
+}
+
+function remarkCommentCount(item) {
+  const review = remarkReviewForItem(item);
+  return review && Array.isArray(review.comments) ? review.comments.length : 0;
+}
+
+function remarkEditorHtml(item, saving) {
+  const error = remarksState.errorItem === item.id ? remarksState.error : "";
+  const title = bookTitleText({ title: item.label, volume: item.volume }, item.label);
+  return `<div class="remarks-editor">` +
+    `<label class="tool-label" for="remarks-editor-text">Remark for ${esc(title)}</label>` +
+    `<textarea id="remarks-editor-text" class="cad-input" spellcheck="false" ` +
+      `aria-invalid="${error ? "true" : "false"}" ${saving ? "disabled" : ""}>${esc(remarksState.draft)}</textarea>` +
+    `<div class="remarks-editor-error" role="status">${esc(error)}</div>` +
+    `<div class="remarks-editor-actions">` +
+      `<button class="cad-btn tiny icon-btn danger" type="button" ` +
+        `data-remark-clear="${esc(item.id)}" ${saving ? "disabled" : ""} ` +
+        `aria-label="Remove mark from ${esc(title)}" data-tip="Remove mark">${ICONS.trash}</button>` +
+      `<button class="cad-btn tiny icon-btn" type="button" data-remark-cancel ` +
+        `${saving ? "disabled" : ""} aria-label="Cancel editing" data-tip="Cancel">${ICONS.close}</button>` +
+      `<button class="cad-btn tiny icon-btn primary remarks-save" type="button" ` +
+        `data-remark-save="${esc(item.id)}" ${saving ? "disabled" : ""} ` +
+        `aria-label="Save remark" data-tip="Save remark">${ICONS.save}</button>` +
+    `</div></div>`;
+}
+
+function remarkReplyHtml(item) {
+  if (remarksState.replying !== item.id) return "";
+  const title = bookTitleText({ title: item.label, volume: item.volume }, item.label);
+  return `<div class="remarks-reply">` +
+    `<input class="cad-input remarks-reply-input" data-remark-reply-input="${esc(item.id)}" ` +
+      `value="${esc(remarksState.replyDraft)}" placeholder="Write a reply…" ` +
+      `aria-label="Reply to ${esc(title)}" spellcheck="false" ` +
+      `${remarksState.replySaving ? "disabled" : ""} />` +
+    `<button class="cad-btn tiny icon-btn" type="button" data-remark-reply-cancel ` +
+      `${remarksState.replySaving ? "disabled" : ""} aria-label="Cancel reply" ` +
+      `data-tip="Cancel reply">${ICONS.close}</button>` +
+    `<button class="cad-btn tiny icon-btn primary" type="button" ` +
+      `data-remark-reply-send="${esc(item.id)}" ${remarksState.replySaving ? "disabled" : ""} ` +
+      `aria-label="Send reply" data-tip="Send reply">${ICONS.send}</button>` +
+    `</div>`;
+}
+
 function remarkItemHtml(item) {
-  const editing = remarksState.editing === item.id;
+  const editing = item.hasAttention !== false && remarksState.editing === item.id;
   const saving = editing && remarksState.saving;
-  if (editing) {
-    return `<article class="remarks-item" data-remark-id="${esc(item.id)}">` +
-      `<div class="remarks-editor">` +
-        `<label class="tool-label" for="remarks-editor-text">Remark for ${esc(item.label)}</label>` +
-        `<textarea id="remarks-editor-text" class="cad-input" spellcheck="false" ` +
-          `aria-invalid="${remarksState.error ? "true" : "false"}" ${saving ? "disabled" : ""}>${esc(remarksState.draft)}</textarea>` +
-        `<div class="remarks-editor-error" role="status">${esc(remarksState.error)}</div>` +
-        `<div class="remarks-editor-actions">` +
-          `<button class="cad-btn tiny danger" type="button" data-remark-clear="${esc(item.id)}" ${saving ? "disabled" : ""}>Remove mark</button>` +
-          `<button class="cad-btn tiny" type="button" data-remark-cancel ${saving ? "disabled" : ""}>Cancel</button>` +
-          `<button class="cad-btn tiny primary remarks-save" type="button" data-remark-save="${esc(item.id)}" ${saving ? "disabled" : ""}>Save</button>` +
-        `</div></div></article>`;
-  }
-  const reviewKey = `${item.kind}:${item.ref}`;
-  const inReview = Object.values(reviewsState.items || {})
-    .some((r) => r.key === reviewKey && r.status === "open");
+  const review = remarkReviewForItem(item);
+  const comments = review && Array.isArray(review.comments) ? review.comments : [];
+  const commentCount = comments.length;
+  const expanded = editing || remarksState.replying === item.id ||
+    remarksState.expanded.has(item.id);
   const unavailable = !item.canOpen ? "Original item is not loaded in this session" : "";
   const meta = remarkSecondary([item.subtype, item.secondary, unavailable]);
-  return `<article class="remarks-item" data-remark-id="${esc(item.id)}">` +
-    `<button class="remarks-open-item" type="button" data-remark-open="${esc(item.id)}" ` +
-      `${item.canOpen ? "" : "disabled aria-disabled=\"true\""} ` +
-      `aria-label="Open ${esc(item.label)}">` +
-      `<span class="remarks-item-title" title="${esc(item.label)}">${esc(item.label)}</span>` +
-      `<span class="remarks-item-meta">${esc(meta)}</span>` +
+  const title = bookTitleText({ title: item.label, volume: item.volume }, item.label);
+  const thread = comments.length
+    ? `<div class="remarks-thread" aria-label="${commentCount} ${commentCount === 1 ? "comment" : "comments"}">` +
+      comments.map((comment) => `<div class="remarks-comment">` +
+        `<span class="remarks-comment-author">${esc(comment.author || "?")}</span>` +
+        `<span class="remarks-comment-when">${esc(relIso(comment.ts))}</span>` +
+        `<div class="remarks-comment-text">${esc(comment.text)}</div></div>`).join("") +
+      `</div>`
+    : `<div class="remarks-no-comments">No replies yet</div>`;
+  const body = editing ? remarkEditorHtml(item, saving) :
+    `<div class="remarks-item-body">` +
       `<span class="remarks-reason${item.reason ? "" : " empty"}">${item.reason
-        ? esc(item.reason) : "No remark added"}</span>` +
-    `</button><div class="remarks-item-actions">` +
-      (inReview ? `<span class="remarks-review-tag">Awaiting review</span>` : "") +
-      `<button class="cad-btn tiny remarks-edit" type="button" ` +
-        `data-remark-edit="${esc(item.id)}">${item.reason ? "Edit" : "Add remark"}</button>` +
-    `</div></article>`;
+        ? esc(item.reason) : "No remark added"}</span>` + thread + remarkReplyHtml(item) +
+      `<div class="remarks-editor-error" role="status">${esc(
+        remarksState.errorItem === item.id ? remarksState.error : "")}</div>` +
+    `</div>`;
+  const busy = (remarksState.replySaving && remarksState.replying === item.id) ||
+    remarksState.resolving === item.id;
+  return `<li class="remarks-item" data-remark-id="${esc(item.id)}">` +
+    `<details class="remarks-disclosure" data-remark-details="${esc(item.id)}" ${expanded ? "open" : ""}>` +
+      `<summary class="remarks-item-summary">` +
+        `<span class="remarks-summary-title">` +
+          `<span class="remarks-item-title" title="${esc(title)}">${bookTitleHtml({
+            title: item.label, volume: item.volume,
+          }, item.label)}</span>` +
+          `<span class="remarks-comment-count" aria-label="${commentCount} ${commentCount === 1 ? "comment" : "comments"}">(${commentCount})</span>` +
+        `</span>` +
+      `<span class="remarks-item-meta">${esc(meta)}</span>` +
+      `</summary>${body}</details>` +
+    (editing ? "" : `<div class="remarks-item-actions">` +
+      `<button class="cad-btn tiny icon-btn" type="button" data-remark-open="${esc(item.id)}" ` +
+        `${item.canOpen && !busy ? "" : "disabled aria-disabled=\"true\""} ` +
+        `aria-label="Open ${esc(title)}" data-tip="Open item">${ICONS.target}</button>` +
+      `<button class="cad-btn tiny icon-btn" type="button" data-remark-reply="${esc(item.id)}" ` +
+        `${busy ? "disabled" : ""} aria-label="Reply to ${esc(title)}" ` +
+        `data-tip="Reply">${ICONS.reply}</button>` +
+      (item.hasAttention === false ? "" :
+        `<button class="cad-btn tiny icon-btn remarks-edit" type="button" ` +
+          `data-remark-edit="${esc(item.id)}" ${busy ? "disabled" : ""} ` +
+          `aria-label="${item.reason ? "Edit" : "Add"} remark for ${esc(title)}" ` +
+          `data-tip="${item.reason ? "Edit remark" : "Add remark"}">${ICONS.pencil}</button>`) +
+      `<button class="cad-btn tiny icon-btn remarks-resolve" type="button" ` +
+        `data-remark-resolve="${esc(item.id)}" ${busy ? "disabled" : ""} ` +
+        `aria-label="Resolve remark for ${esc(title)}" ` +
+        `data-tip="Resolve remark">${ICONS.check}</button>` +
+    `</div>`) + `</li>`;
 }
 
 function remarksGroupHtml(category, items) {
@@ -5917,7 +6372,7 @@ function remarksGroupHtml(category, items) {
   return `<section class="remarks-group" data-remarks-category="${esc(category)}">` +
     `<h3 class="remarks-group-head"><span>${esc(label)}</span>` +
       `<span class="remarks-group-count">${items.length}</span></h3>` +
-    items.map(remarkItemHtml).join("") + `</section>`;
+    `<ul class="remarks-items">${items.map(remarkItemHtml).join("")}</ul></section>`;
 }
 
 function renderRemarks() {
@@ -5930,8 +6385,8 @@ function renderRemarks() {
   el("remarks-total").textContent = `${n} ${n === 1 ? "item" : "items"}`;
   el("remarks-rail-count").textContent = n ? String(n) : "";
   el("remarks-open").setAttribute("aria-label", n
-    ? `Open Remarks sidebar, ${n} ${n === 1 ? "item needs" : "items need"} attention`
-    : "Open Remarks sidebar, no items need attention");
+    ? `Open Remarks sidebar, ${n} ${n === 1 ? "item" : "items"}`
+    : "Open Remarks sidebar, no items");
 
   const tabId = activeRemarksTab();
   const filter = remarksFilterForTab(tabId);
@@ -5949,8 +6404,9 @@ function renderRemarks() {
   const selStart = editorHadFocus ? document.activeElement.selectionStart : null;
   const selEnd = editorHadFocus ? document.activeElement.selectionEnd : null;
   if (!n) {
-    list.innerHTML = `<div class="remarks-empty">Nothing needs attention. ` +
-      `Press Q while hovering a catalog row, verified source, or entry to add a mark.</div>`;
+    list.innerHTML = `<div class="remarks-empty">No remarks or open discussions. ` +
+      `Press Q while hovering a catalog row, verified source, entry, page, ` +
+      `or publication to add a mark.</div>`;
     return;
   }
   if (filter === "all") {
@@ -5963,7 +6419,7 @@ function renderRemarks() {
     if (group.length) list.innerHTML = remarksGroupHtml(filter, group);
     else {
       const label = (REMARK_CATEGORIES.find(([id]) => id === filter) || ["", filter])[1];
-      list.innerHTML = `<div class="remarks-empty">No ${esc(label.toLowerCase())} need attention. ` +
+      list.innerHTML = `<div class="remarks-empty">No ${esc(label.toLowerCase())} remarks or open discussions. ` +
         `Choose another category to see the other ${n === 1 ? "remark" : "remarks"}.</div>`;
     }
   }
@@ -5998,6 +6454,7 @@ function setRemarksCollapsed(collapsed, persist) {
 
 function syncRemarksForTab() {
   remarksState.error = "";
+  remarksState.errorItem = null;
   renderRemarks();
 }
 
@@ -6005,12 +6462,23 @@ function remarksItemById(id) {
   return remarksItems().find((item) => item.id === id) || null;
 }
 
-function refreshRemarkTarget(item) {
-  if (!item || item.kind !== "key") return;
-  const { prefix } = remarkKeyParts(item.ref);
+function refreshKeyedRemarkTarget(key) {
+  const { prefix } = remarkKeyParts(key);
   if (prefix === "whl" && state.whlRows) renderWhlTop();
   else if (prefix.startsWith("src")) renderUpload();
+  else if (prefix === "page") {
+    renderReplicaAttentionMarks();
+    decorateOcrPages();
+    decorateAnFacsimile();
+  } else if (prefix === "pub") {
+    if (state.publishLoaded) renderPublishTree();
+  }
   else if (state.settings.showCatalog) renderBottomRows();
+}
+
+function refreshRemarkTarget(item) {
+  if (!item || item.kind !== "key") return;
+  refreshKeyedRemarkTarget(item.ref);
 }
 
 async function applyRemarkValue(item, value) {
@@ -6030,12 +6498,14 @@ async function applyRemarkValue(item, value) {
     }
     if (ok) {
       remarksState.error = "";
+      remarksState.errorItem = null;
       renderRemarks();
       renderHome();
       return true;
     }
   } catch (e) { /* surfaced below without dropping the item */ }
   remarksState.error = "Could not save this remark. The mark was kept.";
+  remarksState.errorItem = item && item.id;
   renderRemarks();
   return false;
 }
@@ -6045,12 +6515,14 @@ async function saveRemarkEditor(id) {
   if (!item || remarksState.saving) return;
   remarksState.saving = true;
   remarksState.error = "";
+  remarksState.errorItem = id;
   renderRemarks();
   const ok = await applyRemarkValue(item, remarksState.draft.trim() || "1");
   remarksState.saving = false;
   if (ok) {
     remarksState.editing = null;
     remarksState.draft = "";
+    remarksState.errorItem = null;
     status("REMARK SAVED");
   }
   renderRemarks();
@@ -6059,22 +6531,156 @@ async function saveRemarkEditor(id) {
 async function clearRemarkEditor(id) {
   const item = remarksItemById(id);
   if (!item || remarksState.saving) return;
+  const title = bookTitleText({ title: item.label, volume: item.volume }, item.label);
   if (!(await confirmDialog({
     title: "Remove Needs Attention mark",
-    message: `Remove the mark from “${item.label}”?`,
+    message: `Remove the mark from “${title}”?`,
     detail: item.reason ? "Its saved remark will also be removed." : "",
     confirmLabel: "Remove mark", danger: true,
   }))) return;
   remarksState.saving = true;
+  remarksState.error = "";
+  remarksState.errorItem = id;
   renderRemarks();
   const ok = await applyRemarkValue(item, "");
   remarksState.saving = false;
   if (ok) {
     remarksState.editing = null;
     remarksState.draft = "";
+    remarksState.errorItem = null;
     status("ATTENTION MARK CLEARED");
   }
   renderRemarks();
+}
+
+async function ensureRemarkReview(item) {
+  const existing = remarkReviewForItem(item);
+  if (existing && existing.status === "open") return existing;
+  const title = bookTitleText({ title: item.label, volume: item.volume }, item.label);
+  const res = await fetch("/api/reviews", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      kind: item.kind, ref: String(item.ref),
+      label: item.category === "pages"
+        ? remarkSecondary([title, item.secondary]) : title,
+      reason: item.reason || "",
+      page_revision: item.category === "pages"
+        ? replicaPageBuildRevision(item.ref) : "",
+    }),
+  }).catch(() => null);
+  const data = res ? await res.json().catch(() => ({})) : {};
+  if (!res || !res.ok || !data.review) return null;
+  reviewsState.items[data.review.id] = data.review;
+  reviewsState.loaded = true;
+  return data.review;
+}
+
+async function submitRemarkReply(id) {
+  const item = remarksItemById(id);
+  const text = remarksState.replyDraft.trim();
+  if (!item || !text || remarksState.replySaving) return false;
+  remarksState.replySaving = true;
+  remarksState.error = "";
+  remarksState.errorItem = id;
+  renderRemarks();
+  const review = await ensureRemarkReview(item);
+  if (!review) {
+    remarksState.replySaving = false;
+    remarksState.error = "Could not start this reply. Your text was kept.";
+    renderRemarks();
+    return false;
+  }
+  const res = await fetch(`/api/reviews/${encodeURIComponent(review.id)}/comment`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  }).catch(() => null);
+  const data = res ? await res.json().catch(() => ({})) : {};
+  remarksState.replySaving = false;
+  if (!res || !res.ok || !data.review) {
+    remarksState.error = "Reply could not be saved. Your text was kept.";
+    renderRemarks();
+    return false;
+  }
+  reviewsState.items[data.review.id] = data.review;
+  remarksState.replying = null;
+  remarksState.replyDraft = "";
+  remarksState.error = "";
+  remarksState.errorItem = null;
+  remarksState.expanded.add(id);
+  renderReviewList();
+  renderRemarks();
+  status("REPLY ADDED");
+  return true;
+}
+
+async function resolveRemarkItem(id) {
+  const item = remarksItemById(id);
+  if (!item || remarksState.resolving) return false;
+  if (!(await confirmDialog({
+    title: "Resolve remark",
+    message: `Mark the remark for “${bookTitleText({
+      title: item.label, volume: item.volume,
+    }, item.label)}” as resolved?`,
+    detail: item.hasAttention === false
+      ? "This closes the shared discussion."
+      : "This closes the discussion and clears its Needs Attention mark.",
+    confirmLabel: "Resolve",
+  }))) return false;
+
+  remarksState.resolving = id;
+  remarksState.error = "";
+  remarksState.errorItem = id;
+  renderRemarks();
+  const review = remarkReviewForItem(item);
+  let reviewResolved = !!(review && review.status !== "open");
+  if (review && review.status === "open") {
+    const res = await fetch(`/api/reviews/${encodeURIComponent(review.id)}/resolve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ resolved: true }),
+    }).catch(() => null);
+    const data = res ? await res.json().catch(() => ({})) : {};
+    if (!res || !res.ok || !data.review) {
+      remarksState.resolving = null;
+      remarksState.error = item.hasAttention === false
+        ? "Could not resolve this discussion. It remains open."
+        : "Could not resolve this remark. The mark was kept.";
+      renderRemarks();
+      return false;
+    }
+    reviewsState.items[data.review.id] = data.review;
+    reviewResolved = true;
+  }
+
+  const cleared = item.hasAttention === false
+    ? true : await applyRemarkValue(item, "");
+  remarksState.resolving = null;
+  if (!cleared) {
+    if (reviewResolved) {
+      remarksState.error = "The discussion was resolved, but its attention mark could not be cleared.";
+      remarksState.errorItem = id;
+    }
+    renderReviewList();
+    renderRemarks();
+    status(reviewResolved
+      ? "REMARK RESOLVED :: ATTENTION MARK NOT CLEARED"
+      : "REMARK COULD NOT BE RESOLVED");
+    return false;
+  }
+  remarksState.expanded.delete(id);
+  if (remarksState.editing === id) remarksState.editing = null;
+  if (remarksState.replying === id) {
+    remarksState.replying = null;
+    remarksState.replyDraft = "";
+  }
+  remarksState.error = "";
+  remarksState.errorItem = null;
+  renderReviewList();
+  renderRemarks();
+  status("REMARK RESOLVED");
+  return true;
 }
 
 function activateTopTab(tabId, options) {
@@ -6122,6 +6728,12 @@ async function openRoutedItem(item) {
       await selectWorkbenchBook(route.buildId, route.phase);
       if (state.buildSel !== route.buildId) return; // discard guard cancelled
     }
+    const build = (state.builds || {})[route.buildId];
+    const groupId = String((build && build.group_id) || "").trim();
+    if (groupId && !setExpanded(groupId)) {
+      setSetExpanded(groupId, true);
+      renderOcrBooks();
+    }
     activateTopTab(route.tab, { preserveWorkbenchEdit: preserveEdit });
     requestAnimationFrame(() =>
       flashRemarkTarget(document.querySelector(`#ocr-books .build-item[data-bid="${CSS.escape(route.buildId)}"]`)));
@@ -6147,6 +6759,59 @@ async function openRoutedItem(item) {
       const shown = index >= 0 && flashRemarkTarget(
         document.querySelector(`#upload-rows tr[data-si="${index}"]`));
       if (!shown) status("SOURCE IS HIDDEN BY THE CURRENT WORKBENCH FILTER");
+    });
+    return;
+  }
+  if (route.replicaBookId) {
+    const bid = String(route.replicaBookId);
+    const source = String(route.replicaSource || "primary");
+    const page = Number(route.replicaPage);
+    const build = (state.builds || {})[bid];
+    // Reject stale secondary-source remarks before selectReplicaBook can ask
+    // the user to discard unrelated edits or change any Replica context.
+    if (!replicaPageSourceAvailable(build, source) ||
+        !Number.isSafeInteger(page) || page < 1) {
+      status("REPLICA PAGE IS NO LONGER AVAILABLE");
+      return;
+    }
+    if (rwState.book !== bid) {
+      await selectReplicaBook(bid);
+      if (rwState.book !== bid) return; // discard guard cancelled
+    }
+    // Validate even an apparently unchanged source: a saved secondary source
+    // may have been removed while its old page state is still in memory.
+    if (!(await selectReplicaSource(source)) || rwState.src !== source) return;
+    if (page > rwState.pageCount) {
+      status("REPLICA PAGE IS NO LONGER AVAILABLE");
+      return;
+    }
+    // Reopening the current dirty page must only reveal it; fetching it again
+    // would silently replace the user's unsaved region edits.
+    if (rwState.page !== page) {
+      await selectReplicaPage(page);
+      if (rwState.page !== page) return; // discard guard cancelled
+    }
+    activateTopTab(route.tab);
+    requestAnimationFrame(() => flashRemarkTarget(
+      el("rw-pages").querySelector(`.rw-pagebtn[data-page="${page}"]`)));
+    return;
+  }
+  if (route.publicationSelection) {
+    if (!state.publishLoaded) await loadPublishCatalog();
+    const entity = publishFindEntity(route.publicationSelection);
+    if (!entity) {
+      status("PUBLICATION IS NO LONGER IN THE CATALOGUE");
+      renderRemarks();
+      return;
+    }
+    state.publishSel = route.publicationSelection;
+    activateTopTab(route.tab);
+    renderPublishTree(true);
+    await renderPublishPreview();
+    requestAnimationFrame(() => {
+      const pick = [...el("publish-tree").querySelectorAll("[data-publish-select]")]
+        .find((node) => node.dataset.publishSelect === route.publicationSelection);
+      flashRemarkTarget(pick && pick.closest(".publish-tree-row"));
     });
     return;
   }
@@ -6214,30 +6879,80 @@ function initRemarksSidebar() {
     renderRemarks();
   });
   el("remarks-list").addEventListener("input", (ev) => {
-    if (ev.target.id !== "remarks-editor-text") return;
-    remarksState.draft = ev.target.value;
-    remarksState.error = "";
+    if (ev.target.id === "remarks-editor-text") {
+      remarksState.draft = ev.target.value;
+      remarksState.error = "";
+      remarksState.errorItem = null;
+    } else if (ev.target.matches("[data-remark-reply-input]")) {
+      remarksState.replyDraft = ev.target.value;
+      remarksState.error = "";
+      remarksState.errorItem = null;
+    }
   });
   el("remarks-list").addEventListener("keydown", (ev) => {
+    if (ev.target.matches("[data-remark-reply-input]")) {
+      ev.stopPropagation();
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        remarksState.replying = null; remarksState.replyDraft = "";
+        remarksState.error = ""; remarksState.errorItem = null;
+        renderRemarks();
+      } else if (ev.key === "Enter" && !ev.shiftKey) {
+        ev.preventDefault();
+        submitRemarkReply(ev.target.dataset.remarkReplyInput);
+      }
+      return;
+    }
     if (ev.target.id !== "remarks-editor-text") return;
     if (ev.key === "Escape") {
       ev.preventDefault();
       ev.stopPropagation();
       remarksState.editing = null; remarksState.draft = ""; remarksState.error = "";
+      remarksState.errorItem = null;
       renderRemarks();
     } else if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
       ev.preventDefault();
       saveRemarkEditor(remarksState.editing);
     }
   });
+  el("remarks-list").addEventListener("toggle", (ev) => {
+    const details = ev.target;
+    if (!details.matches || !details.matches("[data-remark-details]")) return;
+    if (details.open) remarksState.expanded.add(details.dataset.remarkDetails);
+    else remarksState.expanded.delete(details.dataset.remarkDetails);
+  }, true);
   el("remarks-list").addEventListener("click", (ev) => {
+    const reply = ev.target.closest("[data-remark-reply]");
+    if (reply) {
+      remarksState.replying = reply.dataset.remarkReply;
+      remarksState.replyDraft = "";
+      remarksState.error = "";
+      remarksState.errorItem = null;
+      remarksState.expanded.add(remarksState.replying);
+      renderRemarks();
+      const input = el("remarks-list").querySelector("[data-remark-reply-input]");
+      if (input) input.focus();
+      return;
+    }
+    if (ev.target.closest("[data-remark-reply-cancel]")) {
+      remarksState.replying = null; remarksState.replyDraft = "";
+      remarksState.error = ""; remarksState.errorItem = null;
+      renderRemarks();
+      return;
+    }
+    const replySend = ev.target.closest("[data-remark-reply-send]");
+    if (replySend) { submitRemarkReply(replySend.dataset.remarkReplySend); return; }
+    const resolve = ev.target.closest("[data-remark-resolve]");
+    if (resolve) { resolveRemarkItem(resolve.dataset.remarkResolve); return; }
     const edit = ev.target.closest("[data-remark-edit]");
     if (edit) {
       const item = remarksItemById(edit.dataset.remarkEdit);
-      if (!item) return;
+      if (!item || item.hasAttention === false) return;
       remarksState.editing = item.id;
       remarksState.draft = item.reason;
       remarksState.error = "";
+      remarksState.errorItem = null;
+      remarksState.expanded.add(item.id);
       renderRemarks();
       const ta = el("remarks-editor-text");
       if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }
@@ -6245,6 +6960,7 @@ function initRemarksSidebar() {
     }
     if (ev.target.closest("[data-remark-cancel]")) {
       remarksState.editing = null; remarksState.draft = ""; remarksState.error = "";
+      remarksState.errorItem = null;
       renderRemarks();
       return;
     }
@@ -6257,24 +6973,87 @@ function initRemarksSidebar() {
   });
   setRemarksCollapsed(state.settings.remarksSidebarCollapsed, false);
   renderRemarks();
+  loadReviews().then(renderRemarks);
 }
 
 // Resolve whatever row (any table) or builder entry the mouse is over into
 // an attention target: {label, current, apply(value)}. Q marks it and opens
 // the reason popover on it.
 function attnTargetAtHover() {
-  const bi = document.querySelector("#ocr-books .build-item:hover");
-  if (bi) {
-    const b = state.builds[bi.dataset.bid];
+  const buildTarget = (node, bid, rerender) => {
+    const b = (state.builds || {})[bid];
     if (!b) return null;
     return {
-      node: bi,
-      kind: "build", ref: bi.dataset.bid,
-      label: b.title || bi.dataset.bid,
+      node, kind: "build", ref: String(bid), label: b.title || String(bid),
       current: String(b.attention || ""),
-      apply: (v) => patchBuildRaw(bi.dataset.bid, { attention: v })
-        .then(() => status(v ? "Marked: needs attention" : "Attention mark cleared")),
+      apply: (v) => patchBuildRaw(bid, { attention: v }).then((ok) => {
+        if (rerender) rerender();
+        status(v ? "Marked: needs attention" : "Attention mark cleared");
+        return ok;
+      }),
     };
+  };
+  const keyTarget = (node, key, label, rerender, category) => ({
+    node, kind: "key", ref: key, label,
+    current: attnValue((state.attn || {})[key]),
+    apply: (v) => {
+      setAttnKey(key, v, { label, category: category || remarkCategoryForKey(key) });
+      rerender();
+    },
+  });
+  const pageTarget = (node, bid, source, page, rerender) => {
+    const b = (state.builds || {})[bid];
+    const key = replicaPageRemarkKey(bid, source, page);
+    // OCR may still render historical documents for a removed secondary scan.
+    // Those pages are useful evidence, but they cannot be reopened in Replica,
+    // so do not create a navigation-backed mark that is stale from birth.
+    if (!replicaPageSourceAvailable(b, source) || !key) return null;
+    const target = keyTarget(node, key,
+      `${bookTitleText(b, b.title || bid)} · page ${page}`,
+      rerender, "pages");
+    // Snapshot the build revision with the page the user actually marked.
+    // Review creation validates it so a concurrent page deletion cannot bind
+    // the new thread to whichever physical page shifted into this number.
+    target.pageRevision = String(b.updated_at || "unversioned");
+    return target;
+  };
+
+  const bi = document.querySelector("#ocr-books .build-item:hover");
+  if (bi) {
+    return buildTarget(bi, bi.dataset.bid);
+  }
+  const replicaBook = document.querySelector("#rw-books .ocr-book:hover");
+  if (replicaBook) {
+    return buildTarget(replicaBook, replicaBook.dataset.bid, renderReplicaBooks);
+  }
+  const replicaPage = document.querySelector("#rw-pages .rw-pagebtn:hover");
+  if (replicaPage) {
+    return pageTarget(replicaPage, rwState.book, rwState.src,
+      +replicaPage.dataset.page, renderReplicaAttentionMarks);
+  }
+  const ocrPage = document.querySelector("#ocr-pages .ocr-pgrow:hover");
+  if (ocrPage) {
+    const doc = ocrSelDoc();
+    if (doc && doc.buildId) return pageTarget(ocrPage, doc.buildId,
+      ocrState.pagesSrc || docSrcKey(doc), +ocrPage.dataset.page, decorateOcrPages);
+  }
+  const facsimilePage = document.querySelector("#an-facsimile .an-fac-page:hover");
+  if (facsimilePage) {
+    const doc = ocrSelDoc();
+    if (doc && doc.buildId) return pageTarget(facsimilePage, doc.buildId,
+      docSrcKey(doc), +facsimilePage.dataset.page, decorateAnFacsimile);
+  }
+  const publicationRow = document.querySelector("#publish-tree .publish-tree-row:hover");
+  if (publicationRow) {
+    const pick = publicationRow.querySelector("[data-publish-select]");
+    const selection = pick && pick.dataset.publishSelect;
+    const entity = selection && publishFindEntity(selection);
+    const key = publicationRemarkKey(selection);
+    if (!entity || !key) return null; // grouping folders are not domain items
+    const label = entity.kind === "set"
+      ? `${entity.label} · published set`
+      : bookTitleText(entity.entries[0], entity.label);
+    return keyTarget(publicationRow, key, label, renderPublishTree, "publications");
   }
   const tr = document.querySelector(
     "#checked-rows tr:hover, #whltop-rows tr:hover, " +
@@ -6292,25 +7071,15 @@ function attnTargetAtHover() {
       apply: (v) => setRowAttention(tr.dataset.rowId, v),
     };
   }
-  const keyTarget = (k, label, rerender, category) => ({
-    node: tr,
-    kind: "key", ref: k,
-    label,
-    current: attnValue((state.attn || {})[k]),
-    apply: (v) => {
-      setAttnKey(k, v, { label, category: category || remarkCategoryForKey(k) });
-      rerender();
-    },
-  });
   if (host === "whltop-rows" && tr.dataset.widx != null) {
-    return keyTarget("whl:" + tr.dataset.widx,
+    return keyTarget(tr, "whl:" + tr.dataset.widx,
       tr.children[1] ? tr.children[1].textContent : "WHL row", renderWhlTop,
       "catalogs");
   }
   if (host === "upload-rows" && tr.dataset.si != null) {
     const s = (state.uploadSources || [])[+tr.dataset.si];
     if (!s) return null;
-    return keyTarget(activeSourceRemarkKey(s),
+    return keyTarget(tr, activeSourceRemarkKey(s),
       s.title || "source", renderUpload, "sources");
   }
   if (host === "bottom-rows" && tr.dataset.bi != null) {
@@ -6327,7 +7096,7 @@ function attnTargetAtHover() {
         apply: (v) => setRowAttention(rec._mid, v).then(renderBottomRows),
       };
     }
-    return keyTarget(`${rec._src}:${rec._idx}`, rec.title || "row", renderBottomRows,
+    return keyTarget(tr, `${rec._src}:${rec._idx}`, rec.title || "row", renderBottomRows,
       "catalogs");
   }
   return null;
@@ -6471,15 +7240,14 @@ function openAttnPop(target, rect) {
 // pin below the anchor row, flipping up / clamping in at the viewport edges
 function positionAttnPop() {
   const pop = el("attn-pop");
-  const p = pop.getBoundingClientRect();
+  const box = fixedPopupMetrics(pop), p = box.rect;
   const r = attnPopRect ||
     { left: innerWidth / 2, top: innerHeight / 2, bottom: innerHeight / 2 };
   let left = r.left;
-  let top = r.bottom + 4;
-  if (left + p.width > innerWidth - 8) left = Math.max(8, innerWidth - p.width - 8);
-  if (top + p.height > innerHeight - 8) top = Math.max(8, r.top - p.height - 4);
-  pop.style.left = Math.max(8, left) + "px";
-  pop.style.top = top + "px";
+  let top = r.bottom + 4 * box.scale;
+  if (top + p.height > innerHeight - 8 * box.scale)
+    top = r.top - p.height - 4 * box.scale;
+  positionFixedPopup(pop, left, top, box);
 }
 
 // Escape / click-away / scroll leave the mark as it stands: the row was marked
@@ -6502,7 +7270,8 @@ function saveAttnPop() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ kind: t.kind, ref: String(t.ref),
-                             label: t.label || "", reason }),
+                             label: t.label || "", reason,
+                             page_revision: t.pageRevision || "" }),
     }).then(async (res) => {
       if (res.ok) {
         await loadReviews();
@@ -6646,15 +7415,12 @@ function renderReviewsInto(host) {
   }
 }
 
-// The queue lives in two places at once — the overlay window and the home
-// pane — so a change in either refreshes both.
+// The legacy queue window and the Remarks sidebar read the same review store;
+// the sidebar has its own compact thread renderer.
 function renderReviewList() {
   const cb = el("review-show-resolved");
   if (cb) cb.checked = reviewsState.showResolved;
-  const hcb = el("home-review-resolved");
-  if (hcb) hcb.checked = reviewsState.showResolved;
   renderReviewsInto(el("review-list"));
-  renderReviewsInto(el("home-reviews"));
 }
 
 // resolving a review also clears the underlying attention mark, wherever
@@ -6662,11 +7428,9 @@ function renderReviewList() {
 async function clearMark(kind, ref) {
   if (kind === "key") {
     setAttnKey(ref, "");
-    // repaint whichever table bakes this mark into its rows (the tab-switch
-    // renders only cover the checked/upload tables)
-    if (ref.startsWith("whl:")) renderWhlTop();
-    else if (remarkKeyParts(ref).prefix.startsWith("src")) renderUpload();
-    else renderBottomRows();
+    // Repaint whichever surface bakes this keyed mark into its rows. The
+    // helper also handles Replica/OCR pages and aliased publication nodes.
+    refreshKeyedRemarkTarget(ref);
     return;
   }
   if (kind === "build") {
@@ -6774,14 +7538,8 @@ function initReviewWin() {
     renderReviewList();
   };
   el("review-show-resolved").addEventListener("change", onShowResolved);
-  const hcb = el("home-review-resolved");
-  if (hcb) hcb.addEventListener("change", onShowResolved);
-  // the queue is interactive in both places, so bind both hosts
-  for (const host of [el("review-list"), el("home-reviews")]) {
-    if (!host) continue;
-    host.addEventListener("keydown", onReviewKeydown);
-    host.addEventListener("click", onReviewClick);
-  }
+  el("review-list").addEventListener("keydown", onReviewKeydown);
+  el("review-list").addEventListener("click", onReviewClick);
 }
 
 async function setRowAttention(id, value) {
@@ -7078,8 +7836,13 @@ function checkedRowTr(row, cmode, opts) {
       attrs.push(`data-tip="Missing ${coreLabel}"`);
     }
     if (f === "title" && cmode === "search") attrs.push('data-csearch="1"');
+    const rendered = f === "title"
+      ? (hideTitle
+          ? `<span class="book-title-display"><span class="volume-title-tag">Vol. ${esc(bookVolumeValue(b))}</span></span>`
+          : bookTitleHtml(b, ""))
+      : esc(val);
     return `<td${classes.length ? ` class="${classes.join(" ")}"` : ""}` +
-      `${attrs.length ? " " + attrs.join(" ") : ""}>${esc(val)}</td>`;
+      `${attrs.length ? " " + attrs.join(" ") : ""}>${rendered}</td>`;
   };
   tr.innerHTML = `
     <td class="col-src">${rowSourceMark(row)}</td>
@@ -7535,7 +8298,8 @@ function cellCopyValue(td) {
   }
   const clone = td.cloneNode(true);
   clone.querySelectorAll(".sc-wand, .set-arrow, .icon-label, [data-icon], svg, button, " +
-    ".cell-edit, .src-mark, .src-edited, .proc-box, .proc-arrow, .proc-srctag")
+    ".cell-edit, .src-mark, .src-edited, .proc-box, .proc-arrow, .proc-srctag, " +
+    ".volume-title-tag")
     .forEach((n) => n.remove());
   return clone.textContent.replace(/\s+/g, " ").trim();
 }
@@ -7610,7 +8374,7 @@ function onFieldCopyKey(ev) {
 
 // Write a pasted value into a hovered editable cell through the same persisted,
 // undoable path the inline editor uses. Returns true on a real change.
-async function pasteIntoCell(td, field, text) {
+async function pasteIntoCell(td, field, text, originTab = activeHistoryTab()) {
   const tr = td.closest("tr");
   if (td.dataset.wedit) {
     const idx = parseInt(tr.dataset.widx, 10);
@@ -7619,7 +8383,8 @@ async function pasteIntoCell(td, field, text) {
     if (text === String(row[field] || "").trim()) return false;
     const before = whlFieldSnaps(row, [field]);
     if (await whlPost({ idx, fields: { [field]: text } })) {
-      pushWhlFieldsOp(`paste WHL ${field} of ${row.title.slice(0, 28)}`, idx, before, { [field]: text });
+      pushWhlFieldsOp(`paste WHL ${field} of ${row.title.slice(0, 28)}`, idx, before,
+        { [field]: text }, originTab);
       return true;
     }
     statusErr("WHL PASTE FAILED");
@@ -7630,8 +8395,9 @@ async function pasteIntoCell(td, field, text) {
   if (!row) return false;
   if (text === String(row.book[field] || "").trim()) return false;
   // title/volume carry the volume-designator magic, so route those through commitEdit
-  if (field === "title" || field === "volume") return !!(await commitEdit(row, field, text));
-  return await applyEditPatch(row, { [field]: text });
+  if (field === "title" || field === "volume")
+    return !!(await commitEdit(row, field, text, originTab));
+  return await applyEditPatch(row, { [field]: text }, originTab);
 }
 
 async function onFieldPasteKey(ev) {
@@ -7646,13 +8412,14 @@ async function onFieldPasteKey(ev) {
   if (!field) { ev.preventDefault(); statusErr("PASTE: hover an editable field (Edit mode)"); return; }
   ev.preventDefault();
   if (_fieldPasteBusy) return;             // one in-flight paste at a time
+  const originTab = activeHistoryTab();
   _fieldPasteBusy = true;
   try {
     let text = "";
     try { text = await navigator.clipboard.readText(); } catch (e) { text = ""; }
     text = String(text || "").replace(/\s+/g, " ").trim();
     if (!text) { statusErr("PASTE: clipboard empty or unavailable"); return; }
-    if (await pasteIntoCell(td, field, text)) {
+    if (await pasteIntoCell(td, field, text, originTab)) {
       flashCell(td, "cell-pasted");
       statusFlash(`PASTED ${field.toUpperCase()}: ${clipNote(text)}`);
     }
@@ -7693,7 +8460,7 @@ function startEdit(td) {
 }
 
 // Apply a one-or-more-field patch to a checked/manual book, tracked for undo.
-async function applyEditPatch(row, patch) {
+async function applyEditPatch(row, patch, originTab = activeHistoryTab()) {
   const fields = Object.keys(patch);
   const label = `edit ${fields.join("+")} of ${String(row.book.title || "").slice(0, 32)}`;
   const tag = fields.join(", ").toUpperCase();
@@ -7704,7 +8471,8 @@ async function applyEditPatch(row, patch) {
       pushOp(label,
         () => patchManualFields(row.id, before),
         () => patchManualFields(row.id, patch),
-        { kind: "manual-fields", id: row.id, before });
+        { kind: "manual-fields", id: row.id, before },
+        originTab);
       status(`UPDATED ${tag} :: RESCANNING`);
       return true;
     }
@@ -7720,13 +8488,13 @@ async function applyEditPatch(row, patch) {
     entry.scans = null;
     entry.verify = null;
     queueScan(row.id);
-  });
+  }, originTab);
   saveChecked();
   status(`UPDATED ${tag} :: RESCANNING`);
   return true;
 }
 
-async function commitEdit(row, field, value) {
+async function commitEdit(row, field, value, originTab = activeHistoryTab()) {
   // Editing the title or the volume field with a volume designator — a title
   // like "Elements of Botany 2/5", or a volume of "2/5" / "3" — strips the
   // designator into the volume field and auto-declares a multi-volume set for
@@ -7750,7 +8518,7 @@ async function commitEdit(row, field, value) {
       count = g.count;
     }
   }
-  const ok = await applyEditPatch(row, patch);
+  const ok = await applyEditPatch(row, patch, originTab);
   if (ok && count >= 2) {
     // group_id is the durable association; the title may change independently
     const key = patch.group_id || groupIdOf(row.book);
@@ -7763,6 +8531,7 @@ async function commitEdit(row, field, value) {
       // Fold the set declaration into the edit's undo op (applyEditPatch just
       // pushed it) so a single Ctrl+Z reverts BOTH the fields and the set —
       // otherwise undo would leave an orphan set record in settings.
+      const history = historyForTab(originTab);
       const top = history.stack[history.ptr - 1];
       if (top) {
         const baseUndo = top.undoFn, baseRedo = top.redoFn;
@@ -7847,7 +8616,7 @@ const BOTTOM_TABLES = {
   ol: {
     label: "Open Library",
     cols: ["Title", "Author", "Year", "Publisher", "City", "Ed", "Vol", "Lang"],
-    cells: (r) => [linkCell(r.title, r.url), esc(r.author), esc(r.year),
+    cells: (r) => [bookLinkCell(r, r.url), esc(r.author), esc(r.year),
                    esc(r.publisher), esc(r.city), esc(r.edition),
                    esc(r.volume), esc(r.language)],
   },
@@ -7857,7 +8626,7 @@ const BOTTOM_TABLES = {
     // multi-volume sets stay distinguishable in the table
     cols: ["Title", "Subtitle", "Author", "Year", "Vol", "Ed", "Publisher",
            "City", "Categories"],
-    cells: (r) => [esc(r.title), esc(r.subtitle), esc(r.author), esc(r.year),
+    cells: (r) => [bookTitleHtml(r, ""), esc(r.subtitle), esc(r.author), esc(r.year),
                    esc(r.volume), esc(r.edition), esc(r.publisher),
                    esc(r.city), esc(r.categories)],
   },
@@ -8131,7 +8900,7 @@ async function revertHistoryAction(hid) {
     rec.reverted = true;
     saveActionLog();
     // neutralize the still-live in-session undo op so Ctrl+Z/Y won't re-apply it
-    const op = history.stack.find((o) => o.id === hid);
+    const op = findSessionHistoryOp(hid);
     if (op) { op.undoFn = op.redoFn = () => {}; }
     renderBottomRows();
     status("REVERTED :: " + rec.label.slice(0, 50));
@@ -8206,9 +8975,10 @@ async function olRealtime() {
 // --- adding a bottom-pane record to the top-pane table --
 
 async function addToTop(rec) {
+  const originTab = activeHistoryTab();
   if (state.settings.topTable === "whl") {
     if (whlMode() === "search" && state.whlSelected != null) {
-      await repopulateWhlRow(rec);
+      await repopulateWhlRow(rec, originTab);
       return;
     }
     const olSrc = rec._src === "ol";
@@ -8226,7 +8996,7 @@ async function addToTop(rec) {
         async () => {
           const d = await whlPost(addBody);
           if (d) curIdx = d.idx;
-        });
+        }, undefined, originTab);
       status(`ADDED TO WHL CATALOG (CORRECTIONS) :: ${rec.title}`);
     } else {
       statusErr("WHL ADD FAILED");
@@ -8235,7 +9005,7 @@ async function addToTop(rec) {
   }
   // top = checked books
   if (checkedMode() === "search" && state.checkedSelected != null) {
-    await repopulateCheckedRow(rec);
+    await repopulateCheckedRow(rec, originTab);
     return;
   }
   if (rec._src === "ch") { addChBook(rec._idx); return; }
@@ -8258,7 +9028,7 @@ async function addToTop(rec) {
     const data = await res.json().catch(() => ({}));
     if (res.ok && data.ok) {
       state.manual.unshift(data.entry);
-      pushManualCreateOp(data.entry);
+      pushManualCreateOp(data.entry, originTab);
       renderChecked();
       queueScan(data.entry.id);
       status(`ADDED TO CHECKED BOOKS :: ${rec.title}`);
@@ -8480,6 +9250,20 @@ function renderProcBar() {
   }
   const act = el("proc-action"), inp = el("proc-ai-instr");
   if (inp) { inp.hidden = !act || act.value !== "deepseek"; inp.disabled = state.procActionBusy; }
+  const manualWrap = el("proc-manual-pages-wrap");
+  const manual = el("proc-manual-pages");
+  if (manualWrap) manualWrap.hidden = !act || act.value !== "smartscan";
+  if (manual) {
+    manual.checked = !!state.settings.smartScanManualPages;
+    manual.disabled = state.procActionBusy;
+  }
+}
+
+function bookLinkCell(book, url) {
+  const title = bookTitleHtml(book);
+  return url
+    ? `<a href="${esc(url)}" target="_blank" rel="noopener" data-tip="${esc(url)}">${title}</a>`
+    : title;
 }
 
 // --- rendering: decorate parent rows, build alt rows ----------------------------
@@ -8686,44 +9470,283 @@ function procPdfForRow(table, key) {
   const b = row.book || {};
   const target = rowTarget(row);
   const lp = row.localPdf || b.localPdf || b.local_pdf;
-  if (lp) return { target, pdf: lp, label: b.title || "" };
+  if (lp) return {
+    target, pdf: lp, label: b.title || "", volume: bookVolumeValue(b),
+  };
   const ident = (typeof iaIdentifierForRow === "function") ? iaIdentifierForRow(row) : null;
   if (ident) {
     if (typeof dlState === "function" && dlState(row) === "done")
-      return { target, pdf: "downloads/ia/" + ident + ".pdf", label: b.title || "" };
-    return { target, url: `https://archive.org/download/${ident}/${ident}.pdf`, label: b.title || "" };
+      return { target, pdf: "downloads/ia/" + ident + ".pdf",
+        label: b.title || "", volume: bookVolumeValue(b) };
+    return { target, url: `https://archive.org/download/${ident}/${ident}.pdf`,
+      label: b.title || "", volume: bookVolumeValue(b) };
   }
   return null;
+}
+
+function smartScanRefBody(ref) {
+  const body = { target: ref.target, label: ref.label || "" };
+  if (ref.volume) body.volume = ref.volume;
+  if (ref.pdf) body.pdf = ref.pdf;
+  else if (ref.url) body.url = ref.url;
+  return body;
+}
+
+function smartScanRefTitle(ref, fallback = "PDF") {
+  const r = ref || {};
+  return bookTitleText({ title: r.label || r.target || "", volume: r.volume }, fallback);
+}
+
+function smartScanRemaining(index, total) {
+  const left = Math.max(0, Number(total) - Number(index));
+  return `${left} PDF${left === 1 ? "" : "s"} left to mark`;
+}
+
+function smartScanPageSummary(selected) {
+  const pages = [...selected].sort((a, b) => a - b);
+  return pages.length ? pages.join(", ") : "None marked";
+}
+
+const smartScanMarker = {
+  ref: null, index: 0, count: 0,
+  pdf: "", page: 1, pages: 0,
+  selected: new Set(), resolve: null,
+  busy: false, seq: 0,
+};
+
+function renderSmartScanMarker() {
+  const m = smartScanMarker;
+  const ready = !!m.pdf && m.pages > 0;
+  const marked = m.selected.has(m.page);
+  el("smartscan-mark-left").textContent = smartScanRemaining(m.index, m.count);
+  const ref = m.ref || {};
+  el("smartscan-mark-label").innerHTML = bookTitleHtml({
+    title: ref.label || ref.target || "", volume: ref.volume,
+  }, "PDF");
+  el("smartscan-mark-page").textContent = ready
+    ? `Page ${m.page} of ${m.pages}` : "Preparing page preview…";
+  el("smartscan-mark-selected").textContent = smartScanPageSummary(m.selected);
+  el("smartscan-mark-prev").disabled = !ready || m.busy || m.page <= 1;
+  el("smartscan-mark-next").disabled = !ready || m.busy || m.page >= m.pages;
+  el("smartscan-mark-toggle").disabled = !ready || m.busy;
+  el("smartscan-mark-toggle").textContent = marked ? "Unmark page" : "Mark page";
+  el("smartscan-mark-confirm").disabled = !ready || !m.selected.size || m.busy;
+  el("smartscan-mark-cancel").disabled = m.busy;
+  el("smartscan-mark-close").disabled = m.busy;
+  const image = el("smartscan-mark-image");
+  image.classList.toggle("marked", marked);
+  if (!ready) {
+    image.hidden = true;
+    el("smartscan-mark-loading").hidden = false;
+    return;
+  }
+  const src = `/api/pdf/pageimg?path=${encodeURIComponent(m.pdf)}` +
+    `&page=${m.page}&w=1200`;
+  if (image.dataset.src !== src) {
+    image.dataset.src = src;
+    image.hidden = true;
+    el("smartscan-mark-loading").textContent = "Loading page…";
+    el("smartscan-mark-loading").hidden = false;
+    image.src = src;
+  }
+}
+
+function smartScanMarkerGo(page) {
+  const m = smartScanMarker;
+  if (!m.pdf || m.busy) return;
+  m.page = Math.max(1, Math.min(m.pages, Number(page) || 1));
+  renderSmartScanMarker();
+}
+
+function smartScanMarkerToggle() {
+  const m = smartScanMarker;
+  if (!m.pdf || m.busy) return;
+  if (m.selected.has(m.page)) m.selected.delete(m.page);
+  else m.selected.add(m.page);
+  renderSmartScanMarker();
+}
+
+function closeSmartScanMarker(value) {
+  const resolve = smartScanMarker.resolve;
+  smartScanMarker.resolve = null;
+  smartScanMarker.seq++;
+  el("smartscan-mark-overlay").hidden = true;
+  const image = el("smartscan-mark-image");
+  image.removeAttribute("src");
+  delete image.dataset.src;
+  if (resolve) resolve(value);
+}
+
+async function confirmSmartScanMarker() {
+  const m = smartScanMarker;
+  if (!m.pdf || !m.selected.size || m.busy) return;
+  m.busy = true;
+  el("smartscan-mark-error").hidden = true;
+  renderSmartScanMarker();
+  try {
+    const res = await fetch("/api/process/smartscan/select-pages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        target: m.ref.target,
+        pdf: m.pdf,
+        pages: [...m.selected].sort((a, b) => a - b),
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok || !data.pdf) {
+      throw new Error(data.error || "could not save the selected pages");
+    }
+    closeSmartScanMarker(Object.assign({}, m.ref, { pdf: data.pdf, url: "" }));
+  } catch (error) {
+    m.busy = false;
+    const box = el("smartscan-mark-error");
+    box.textContent = error.message || "Could not save the selected pages";
+    box.hidden = false;
+    renderSmartScanMarker();
+  }
+}
+
+function markSmartScanPdf(ref, index, count) {
+  const m = smartScanMarker;
+  const seq = ++m.seq;
+  m.ref = ref;
+  m.index = index;
+  m.count = count;
+  m.pdf = "";
+  m.page = 1;
+  m.pages = 0;
+  m.selected = new Set();
+  m.busy = false;
+  el("smartscan-mark-error").hidden = true;
+  el("smartscan-mark-loading").textContent = "Preparing PDF…";
+  el("smartscan-mark-overlay").hidden = false;
+  renderSmartScanMarker();
+  el("smartscan-mark-cancel").focus();
+  const promise = new Promise((resolve) => { m.resolve = resolve; });
+  fetch("/api/process/smartscan/prepare", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(smartScanRefBody(ref)),
+  }).then(async (res) => {
+    const data = await res.json().catch(() => ({}));
+    if (seq !== m.seq || m.resolve == null) return;
+    if (!res.ok || !data.ok || !data.pdf || !data.pages) {
+      throw new Error(data.error || "could not prepare this PDF");
+    }
+    m.pdf = data.pdf;
+    m.pages = Number(data.pages) || 0;
+    renderSmartScanMarker();
+    el("smartscan-mark-toggle").focus();
+  }).catch((error) => {
+    if (seq !== m.seq || m.resolve == null) return;
+    const box = el("smartscan-mark-error");
+    box.textContent = error.message || "Could not prepare this PDF";
+    box.hidden = false;
+    el("smartscan-mark-loading").textContent = "Preview unavailable";
+    el("smartscan-mark-cancel").focus();
+  });
+  return promise;
+}
+
+async function markSmartScanPdfs(refs) {
+  const prepared = [];
+  for (let index = 0; index < refs.length; index++) {
+    const marked = await markSmartScanPdf(refs[index], index, refs.length);
+    if (!marked) return null;
+    prepared.push(marked);
+  }
+  return prepared;
+}
+
+function onSmartScanMarkerKey(ev) {
+  if (el("smartscan-mark-overlay").hidden) return;
+  if (ev.key === "ArrowLeft") {
+    ev.preventDefault(); smartScanMarkerGo(smartScanMarker.page - 1);
+  } else if (ev.key === "ArrowRight") {
+    ev.preventDefault(); smartScanMarkerGo(smartScanMarker.page + 1);
+  } else if (ev.key === " " || ev.key.toLowerCase() === "t") {
+    ev.preventDefault(); smartScanMarkerToggle();
+  } else if (ev.key === "Enter") {
+    ev.preventDefault(); confirmSmartScanMarker();
+  } else if (ev.key === "Escape" && !smartScanMarker.busy) {
+    ev.preventDefault(); closeSmartScanMarker(null);
+  }
+}
+
+function initSmartScanMarker() {
+  const image = el("smartscan-mark-image");
+  image.addEventListener("load", () => {
+    image.hidden = false;
+    el("smartscan-mark-loading").hidden = true;
+  });
+  image.addEventListener("error", () => {
+    image.hidden = true;
+    el("smartscan-mark-loading").textContent = "Could not render this page";
+    el("smartscan-mark-loading").hidden = false;
+  });
+  el("smartscan-mark-prev").addEventListener("click", () =>
+    smartScanMarkerGo(smartScanMarker.page - 1));
+  el("smartscan-mark-next").addEventListener("click", () =>
+    smartScanMarkerGo(smartScanMarker.page + 1));
+  el("smartscan-mark-toggle").addEventListener("click", smartScanMarkerToggle);
+  el("smartscan-mark-confirm").addEventListener("click", confirmSmartScanMarker);
+  for (const id of ["smartscan-mark-cancel", "smartscan-mark-close"]) {
+    el(id).addEventListener("click", () => {
+      if (!smartScanMarker.busy) closeSmartScanMarker(null);
+    });
+  }
+  el("smartscan-mark-overlay").addEventListener("mousedown", (ev) => {
+    if (ev.target === el("smartscan-mark-overlay") && !smartScanMarker.busy)
+      closeSmartScanMarker(null);
+  });
+  document.addEventListener("keydown", onSmartScanMarkerKey);
+}
+
+async function startSmartScanJob(ref) {
+  const body = smartScanRefBody(ref);
+  const instructions = String(state.settings.smartScanInstructions || "").trim();
+  if (instructions) body.instructions = instructions;
+  const res = await fetch("/api/process/smartscan/run", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok || !data.job)
+    throw new Error(data.error || "could not start");
+  return { id: data.job.id, target: ref.target };
 }
 
 // Smart Scan: one background job per selected row (download -> OCR -> extract);
 // each staged smartscan alternative appears in the diff as its job finishes.
 async function procRunSmartScan(table, keys) {
-  const refs = [];
+  let refs = [];
   for (const k of keys) { const ref = procPdfForRow(table, k); if (ref) refs.push(ref); }
   if (!refs.length) { status("SMART SCAN :: none of the selected rows has a PDF source"); return; }
   const skipped = keys.length - refs.length;
+  const manual = !!state.settings.smartScanManualPages;
   const ok0 = await confirmDialog({
     title: "Smart Scan",
-    message: `Download & OCR ${refs.length} PDF${refs.length === 1 ? "" : "s"} and extract metadata?`,
-    detail: skipped ? `${skipped} selected row${skipped === 1 ? "" : "s"} without a PDF source will be skipped.` : "",
-    cost: `~${refs.length} download + OCR + AI pass${refs.length === 1 ? "" : "es"}`,
+    message: `${manual ? "Review" : "OCR"} ${refs.length} PDF${refs.length === 1 ? "" : "s"} and extract metadata?`,
+    detail: (manual ? "You will mark the title pages in every PDF before scanning. " : "") +
+      (skipped ? `${skipped} selected row${skipped === 1 ? "" : "s"} without a PDF source will be skipped.` : ""),
+    cost: `~${refs.length} OCR + AI pass${refs.length === 1 ? "" : "es"}`,
     confirmLabel: "Run",
   });
   if (!ok0) return;
+  if (manual) {
+    refs = await markSmartScanPdfs(refs);
+    if (!refs) { status("SMART SCAN :: page marking cancelled"); return; }
+  }
   state.procActionBusy = true; renderProcBar();
   const jobs = [];
   for (const ref of refs) {
     try {
-      const body = { target: ref.target, label: ref.label };
-      if (ref.pdf) body.pdf = ref.pdf; else body.url = ref.url;
-      const res = await fetch("/api/process/smartscan/run", {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-      });
-      const d = await res.json().catch(() => ({}));
-      if (res.ok && d.ok && d.job) jobs.push({ id: d.job.id, target: ref.target });
-      else statusErr("SMART SCAN :: " + (d.error || "could not start") + " — " + (ref.label || ref.target));
-    } catch (e) { /* keep launching the rest */ }
+      jobs.push(await startSmartScanJob(ref));
+    } catch (e) {
+      statusErr("SMART SCAN :: " + (e.message || "could not start") +
+        " — " + smartScanRefTitle(ref));
+    }
   }
   if (!jobs.length) { state.procActionBusy = false; renderProcBar(); return; }
   procPollSmartScan(jobs);
@@ -8757,7 +9780,7 @@ function procPollSmartScan(jobs) {
 // Mark Primary: apply an alt to the real record through the normal edit path,
 // then swap the store so the displaced original survives as a "superseded" alt
 // (right-click it to swap back).
-async function procMarkPrimary(target, altId) {
+async function procMarkPrimary(target, altId, originTab = activeHistoryTab()) {
   const e = state.stagedAlts[target];
   const alt = e && (e.alts || []).find((a) => a.id === altId);
   if (!alt) return;
@@ -8794,14 +9817,15 @@ async function procMarkPrimary(target, altId) {
       pushOp(`mark primary WHL ${String(r.title || idx).slice(0, 24)}`,
         () => whlApplySnaps(idx, before),
         () => whlPost(body),
-        { kind: "whl", idx, beforeSnaps: before });
+        { kind: "whl", idx, beforeSnaps: before },
+        originTab);
       applied = true;
     }
   } else {
     const row = state.rowsById.get(String(target.slice(target.indexOf(":") + 1)));
     if (!row) return;
     for (const k of keys) displaced[k] = String((row.book || {})[k] || "");
-    applied = await applyEditPatch(row, fields);
+    applied = await applyEditPatch(row, fields, originTab);
   }
   if (!applied) { statusErr("MARK PRIMARY FAILED"); return; }
   // Swap the store: the applied alt leaves, the displaced original is re-filed
@@ -8828,6 +9852,7 @@ async function procMarkPrimary(target, altId) {
   // Fold the store swap into the field change's undo op (the apply above just
   // pushed it) so one Ctrl+Z reverts BOTH — the commitEdit set-declaration
   // pattern. Undo restores the alt as pending; redo re-supersedes it.
+  const history = historyForTab(originTab);
   const top = history.stack[history.ptr - 1];
   if (top) {
     const baseUndo = top.undoFn, baseRedo = top.redoFn;
@@ -8921,8 +9946,7 @@ function openProcMenu(x, y, items) {
     `<button type="button" class="pm-item pm-btn${it.danger ? " pm-danger" : ""}" data-i="${i}">${esc(it.label)}</button>`).join("");
   pop.hidden = false;
   popupAnchor = pop;
-  pop.style.top = Math.max(8, Math.min(y, innerHeight - pop.offsetHeight - 8)) + "px";
-  pop.style.left = Math.max(8, Math.min(x, innerWidth - pop.offsetWidth - 8)) + "px";
+  positionFixedPopup(pop, x, y);
   pop.querySelectorAll(".pm-btn").forEach((b) => b.addEventListener("click", () => {
     const it = items[+b.dataset.i];
     closePopup();
@@ -8956,37 +9980,39 @@ function copyRecordText(fields) {
 // Start a Smart Scan for one row from outside Process mode (right-click). The
 // staged result appears when the user next looks at Process mode.
 async function smartScanOneRow(table, key) {
-  const ref = procPdfForRow(table, key);
+  let ref = procPdfForRow(table, key);
   if (!ref) { statusErr("SMART SCAN :: this row has no PDF source"); return; }
+  const manual = !!state.settings.smartScanManualPages;
+  const refTitle = smartScanRefTitle(ref, "");
   const ok0 = await confirmDialog({
     title: "Smart Scan",
-    message: "Download & OCR this book's PDF and extract its metadata?",
-    detail: ref.label || "",
-    cost: "~1 download + OCR + AI pass",
+    message: `${manual ? "Review" : "OCR"} this book's PDF and extract its metadata?`,
+    detail: refTitle +
+      (manual ? `${refTitle ? "\n\n" : ""}Mark the title pages before scanning.` : ""),
+    cost: "~1 OCR + AI pass",
     confirmLabel: "Run",
   });
   if (!ok0) return;
+  if (manual) {
+    const prepared = await markSmartScanPdfs([ref]);
+    if (!prepared) { status("SMART SCAN :: page marking cancelled"); return; }
+    ref = prepared[0];
+  }
   try {
-    const body = { target: ref.target, label: ref.label };
-    if (ref.pdf) body.pdf = ref.pdf; else body.url = ref.url;
-    const res = await fetch("/api/process/smartscan/run", {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-    });
-    const d = await res.json().catch(() => ({}));
-    if (res.ok && d.ok && d.job) procPollSmartScan([{ id: d.job.id, target: ref.target }]);
-    else statusErr("SMART SCAN :: " + (d.error || "could not start"));
-  } catch (e) { statusErr("SMART SCAN :: request failed"); }
+    procPollSmartScan([await startSmartScanJob(ref)]);
+  } catch (e) { statusErr("SMART SCAN :: " + (e.message || "request failed")); }
 }
 
 // Paste the clipboard into an editable cell (menu twin of Ctrl+V-over-cell).
 async function pasteIntoCellFromMenu(td) {
   const field = cellFieldName(td);
   if (!field) return;
+  const originTab = activeHistoryTab();
   let text = "";
   try { text = await navigator.clipboard.readText(); } catch (e) { text = ""; }
   text = String(text || "").replace(/\s+/g, " ").trim();
   if (!text) { statusErr("PASTE: clipboard empty or unavailable"); return; }
-  if (await pasteIntoCell(td, field, text)) {
+  if (await pasteIntoCell(td, field, text, originTab)) {
     flashCell(td, "cell-pasted");
     statusFlash(`PASTED ${field.toUpperCase()}: ${clipNote(text)}`);
   }
@@ -9252,7 +10278,7 @@ function whlRowCells(r, mode) {
   }
   return `
       <td>${r.added ? "ADDED" : r.corrected ? "EDITED" : r.scraped ? "WEB" : "CSV"}</td>
-      <td${editable("title")}${mode === "search" ? ' data-wsearch="1"' : ""}>${esc(r.title)}</td>
+      <td${editable("title")}${mode === "search" ? ' data-wsearch="1"' : ""}>${bookTitleHtml(r, "")}</td>
       <td${editable("subtitle")}>${esc(r.subtitle || "")}</td>
       <td${editable("authors")}>${esc(r.authors)}</td>
       <td${editable("year")}>${esc(r.year)}</td>
@@ -9375,11 +10401,13 @@ async function whlApplySnaps(idx, snaps) {
   return whlPost(body);
 }
 
-function pushWhlFieldsOp(label, idx, beforeSnaps, afterFields) {
+function pushWhlFieldsOp(label, idx, beforeSnaps, afterFields,
+                         originTab = activeHistoryTab()) {
   pushOp(label,
     () => whlApplySnaps(idx, beforeSnaps),
     () => whlPost({ idx, fields: afterFields }),
-    { kind: "whl", idx, beforeSnaps });
+    { kind: "whl", idx, beforeSnaps },
+    originTab);
 }
 
 function selectWhlSearchRow(idx) {
@@ -9455,7 +10483,7 @@ function clearOlColMarks() {
   renderBottomRows();
 }
 
-async function repopulateCheckedRow(rec) {
+async function repopulateCheckedRow(rec, originTab = activeHistoryTab()) {
   const row = state.rowsById.get(String(state.checkedSelected));
   if (!row) return;
   const vals = repopBookFields(rec);
@@ -9467,7 +10495,8 @@ async function repopulateCheckedRow(rec) {
     if (await patchManualFields(row.id, vals)) {
       pushOp(label,
         () => patchManualFields(row.id, before),
-        () => patchManualFields(row.id, vals));
+        () => patchManualFields(row.id, vals),
+        undefined, originTab);
       status(`ROW REPOPULATED :: ${vals.title || row.book.title}`);
       clearOlColMarks();
     } else {
@@ -9484,7 +10513,7 @@ async function repopulateCheckedRow(rec) {
     entry.scans = null;
     entry.verify = null;
     queueScan(row.id);
-  });
+  }, originTab);
   saveChecked();
   renderChecked();
   status(`ROW REPOPULATED :: ${vals.title || row.book.title}`);
@@ -9509,7 +10538,7 @@ function repopFields(rec) {
   return fields;
 }
 
-async function repopulateWhlRow(rec) {
+async function repopulateWhlRow(rec, originTab = activeHistoryTab()) {
   const idx = state.whlSelected;
   const row = whlRowByIdx(idx);
   if (row == null) return;
@@ -9518,7 +10547,7 @@ async function repopulateWhlRow(rec) {
   const before = whlFieldSnaps(row, Object.keys(fields));
   if (await whlPost({ idx, fields })) {
     pushWhlFieldsOp(`repopulate WHL row ${(fields.title || row.title).slice(0, 30)}`,
-      idx, before, fields);
+      idx, before, fields, originTab);
     status(`WHL ROW REPOPULATED :: ${fields.title || row.title}`);
     clearOlColMarks();
   } else {
@@ -9543,6 +10572,7 @@ function startWhlEdit(td) {
   let done = false;
   const finish = async (commit) => {
     if (done) return;
+    const originTab = activeHistoryTab();
     done = true;
     input.blur();
     const val = input.value.trim();
@@ -9550,7 +10580,7 @@ function startWhlEdit(td) {
       const before = whlFieldSnaps(row, [field]);
       if (await whlPost({ idx, fields: { [field]: val } })) {
         pushWhlFieldsOp(`correct WHL ${field} of ${row.title.slice(0, 28)}`,
-          idx, before, { [field]: val });
+          idx, before, { [field]: val }, originTab);
         status(`WHL ${field.toUpperCase()} CORRECTED :: ${row.title}`);
         return;
       }
@@ -9601,7 +10631,7 @@ function toggleSet(key) {
 }
 
 // update a checked catalog book's metadata + queue a fresh check
-function updateCheckedBook(id, fields) {
+function updateCheckedBook(id, fields, originTab = activeHistoryTab()) {
   const entry = state.checked.get(id);
   if (!entry) return;
   trackChecked(`edit ${(fields.title || entry.book.title || "").slice(0, 36)}`, id, () => {
@@ -9609,7 +10639,7 @@ function updateCheckedBook(id, fields) {
     entry.edited = true;
     entry.checks = null; entry.scans = null; entry.verify = null;
     queueScan(id);
-  });
+  }, originTab);
   saveChecked();
 }
 
@@ -9695,14 +10725,14 @@ async function saveSetEditTab(ev) {
 }
 
 // promote a single book to an N-volume set from the book editor's "# volumes"
-async function promoteRowToSet(rowId, vals, count) {
+async function promoteRowToSet(rowId, vals, count, originTab = activeHistoryTab()) {
   const row = state.rowsById.get(String(rowId));
   if (!row) return;
   const key = setKeyOf({ title: vals.title });
   const fields = { group_id: key };
   if (volNum(row.book) <= 0) fields.volume = "1";   // the anchor becomes volume 1
   if (row.kind === "manual") await patchManualFields(rowId, fields);
-  else updateCheckedBook(rowId, fields);
+  else updateCheckedBook(rowId, fields, originTab);
   setSetCount(key, count);
   await ensureSetVolumes(key, count,
     { title: vals.title, author: vals.author, publisher: vals.publisher });
@@ -9792,6 +10822,7 @@ async function patchManualFields(id, fields) {
 
 async function saveBookEditTab(ev) {
   ev.preventDefault();
+  const originTab = activeHistoryTab();
   const t = state.editTarget;
   if (!t || t.kind === "whl") return;
   const vals = {};
@@ -9815,8 +10846,9 @@ async function saveBookEditTab(ev) {
         pushOp(`edit entry ${vals.title.slice(0, 32)}`,
           () => patchManualFields(t.id, before),
           () => patchManualFields(t.id, fields),
-          { kind: "manual-fields", id: t.id, before });
-        if (setCount >= 2) await promoteRowToSet(t.id, vals, setCount);
+          { kind: "manual-fields", id: t.id, before },
+          originTab);
+        if (setCount >= 2) await promoteRowToSet(t.id, vals, setCount, originTab);
         el("bookedit-msg").textContent = setCount >= 2 ? "Saved as set" : "Saved";
         status(`ENTRY SAVED :: ${vals.title} :: RESCANNING`);
       } else {
@@ -9835,10 +10867,10 @@ async function saveBookEditTab(ev) {
       entry.scans = null;
       entry.verify = null;
       queueScan(t.id);
-    });
+    }, originTab);
     saveChecked();
     renderChecked();
-    if (setCount >= 2) await promoteRowToSet(t.id, vals, setCount);
+    if (setCount >= 2) await promoteRowToSet(t.id, vals, setCount, originTab);
     el("bookedit-msg").textContent = setCount >= 2 ? "Saved as set" : "Saved";
     status(`BOOK SAVED :: ${vals.title} :: RESCANNING`);
     return;
@@ -9856,7 +10888,7 @@ async function saveBookEditTab(ev) {
       checks: null, scans: null, verify: null, manual_urls: null,
     });
     queueScan(key);
-  });
+  }, originTab);
   saveChecked();
   renderChecked();
   updateCheckedCount();
@@ -9866,6 +10898,7 @@ async function saveBookEditTab(ev) {
 
 async function saveWhlEditTab(ev) {
   ev.preventDefault();
+  const originTab = activeHistoryTab();
   // the form is showing the ORIGINAL record while Alt is held — saving
   // that would write the pre-correction values back as corrections
   if (editOrigShown) return;
@@ -9877,7 +10910,8 @@ async function saveWhlEditTab(ev) {
   if (!fields.title) { el("whledit-msg").textContent = "Title is required"; return; }
   const before = whlFieldSnaps(row, WHL_ROW_FIELDS);
   if (await whlPost({ idx, fields })) {
-    pushWhlFieldsOp(`edit WHL record ${fields.title.slice(0, 30)}`, idx, before, fields);
+    pushWhlFieldsOp(`edit WHL record ${fields.title.slice(0, 30)}`,
+      idx, before, fields, originTab);
     el("whledit-msg").textContent = "Saved";
     status(`WHL CORRECTIONS SAVED :: ${fields.title}`);
   } else {
@@ -10840,7 +11874,7 @@ let pdfmViewer = null;
 function openPdfModal(idx) {
   const r = whlRowByIdx(idx);
   if (!r || !r.file) return;
-  el("pdfm-title").textContent = (r.title || "Publication").slice(0, 90);
+  el("pdfm-title").innerHTML = bookTitleHtml(r, "Publication");
   el("pdfm-overlay").hidden = false;
   // proxied: worldherblibrary.org PDFs refuse to be iframed directly
   pdfmViewer.show(pdfProxySrc(r.file), r.file, {
@@ -11215,7 +12249,8 @@ function scanStatusLine(scans) {
 
 // --- per-source verification ------------------------------------------------------
 
-async function setVerify(id, source, verdict, track = true) {
+async function setVerify(id, source, verdict, track = true,
+                         originTab = activeHistoryTab()) {
   const row = state.rowsById.get(String(id));
   if (!row) return false;
   if (row.kind === "manual") {
@@ -11246,7 +12281,8 @@ async function setVerify(id, source, verdict, track = true) {
           if (priorUrl) await setManualUrl(id, source, priorUrl, false);
         },
         () => setVerify(id, source, verdict, false),
-        { kind: "manual-verify", id, source, before: prior, beforeUrl: priorUrl });
+        { kind: "manual-verify", id, source, before: prior, beforeUrl: priorUrl },
+        originTab);
     }
   } else {
     const entry = state.checked.get(id);
@@ -11260,7 +12296,7 @@ async function setVerify(id, source, verdict, track = true) {
     };
     if (track) {
       trackChecked(`verify ${source} ${verdict} on ${row.book.title.slice(0, 30)}`,
-        id, mutate);
+        id, mutate, originTab);
     } else {
       mutate();
     }
@@ -11287,7 +12323,8 @@ function cycleVerify(id, source) {
 
 // --- manually located sources ------------------------------------------------------
 
-async function setManualUrl(id, source, url, track = true) {
+async function setManualUrl(id, source, url, track = true,
+                            originTab = activeHistoryTab()) {
   const row = state.rowsById.get(String(id));
   if (!row) return;
   if (row.kind === "manual") {
@@ -11305,7 +12342,8 @@ async function setManualUrl(id, source, url, track = true) {
         pushOp(`manual source on ${row.book.title.slice(0, 32)}`,
           () => setManualUrl(id, source, prior, false),
           () => setManualUrl(id, source, url, false),
-          { kind: "manual-url", id, source, before: prior });
+          { kind: "manual-url", id, source, before: prior },
+          originTab);
       }
     }
   } else {
@@ -11317,7 +12355,8 @@ async function setManualUrl(id, source, url, track = true) {
       else delete entry.manual_urls[source];
     };
     if (track) {
-      trackChecked(`manual source on ${row.book.title.slice(0, 32)}`, id, mutate);
+      trackChecked(`manual source on ${row.book.title.slice(0, 32)}`,
+        id, mutate, originTab);
     } else {
       mutate();
     }
@@ -11360,6 +12399,7 @@ async function closeManualSource(force) {
 }
 
 async function saveManualSource(clear) {
+  const originTab = activeHistoryTab();
   const t = state.msrcTarget;
   if (!t) return;
   const url = clear ? "" : el("msrc-url").value.trim();
@@ -11367,7 +12407,7 @@ async function saveManualSource(clear) {
     el("msrc-msg").textContent = "URL must start with http(s)://";
     return;
   }
-  await setManualUrl(t.id, t.source, url);
+  await setManualUrl(t.id, t.source, url, true, originTab);
   closeManualSource(true);
 }
 
@@ -11605,7 +12645,7 @@ function renderWorkbenchRail() {
 // head + rail readiness + gates: everything that tracks the shared selection
 function renderWorkbench() {
   const b = currentBuild();
-  el("wb-title").textContent = b ? (b.title || "(untitled)") : "No book selected";
+  el("wb-title").innerHTML = b ? bookTitleHtml(b) : "No book selected";
   el("wb-sub").textContent = b
     ? `${b.authors || ""}${b.authors && b.year ? " · " : ""}${b.year || ""}`
     : "";
@@ -11628,8 +12668,6 @@ async function selectWorkbenchBook(bid, phase) {
       }))) return;
   state.buildSel = bid;
   const b = state.builds[bid];
-  // the queue view follows the book so the selection is always visible
-  if (b) state.buildsTab = b.status === "uploaded" ? "uploaded" : "pending";
   renderBuildEditor();
   if (wbActivePhase() === "source" && activeBuildTab() === "btab-resources") {
     refreshResourcesTab();
@@ -11675,7 +12713,11 @@ function decorateAnFacsimile() {
   const bid = d && d.buildId;
   for (const row of box.querySelectorAll(".an-fac-page")) {
     const page = +row.dataset.page;
-    const key = `${bid}:${docSrcKey(d)}:${page}`;
+    const source = docSrcKey(d);
+    const key = `${bid}:${source}:${page}`;
+    const attentionKey = bid ? replicaPageRemarkKey(bid, source, page) : "";
+    const attention = attentionKey ? (state.attn || {})[attentionKey] : "";
+    const attentionWhy = attnReason(attention);
     const staged = bid ? ocrState.analysisTags.get(key) : null;
     const running = [...anJobs.values()].some((job) => !job.finished &&
       job.buildId === bid && (job.src || "primary") === docSrcKey(d) &&
@@ -11683,6 +12725,9 @@ function decorateAnFacsimile() {
     row.classList.toggle("pg-sel", ocrState.pageSel.has(page));
     row.classList.toggle("pg-analysis-staged", !!staged);
     row.classList.toggle("pg-analysis-running", running);
+    row.classList.toggle("attention", !!attnValue(attention));
+    if (attentionWhy) row.dataset.tip = "Needs attention: " + attentionWhy;
+    else delete row.dataset.tip;
     const badge = row.querySelector(".an-fac-badge");
     if (badge) {
       badge.hidden = !staged && !running;
@@ -11798,7 +12843,7 @@ function renderAnList() {
     const sel = state.anSel === b.id;
     return `<li class="build-item an-item${sel ? " active" : ""}"
       data-id="${esc(b.id)}">
-      <div class="bi-title">${esc(b.title || "(untitled)")}</div>
+      <div class="bi-title">${bookTitleHtml(b)}</div>
       <div class="bi-meta">${esc(b.authors || "")}${b.year ? " · " + esc(b.year) : ""}
         · ${b.status === "uploaded" ? "published" : esc(b.status)}</div></li>`;
   }).join("") || `<li class="empty">No verified entries available.</li>`;
@@ -11830,7 +12875,7 @@ function renderAnMain() {
   el("an-empty").hidden = !!b;
   el("an-work").hidden = !b;
   if (!b) return;
-  el("an-title").textContent = b.title || "(untitled)";
+  el("an-title").innerHTML = bookTitleHtml(b);
   el("an-sub").textContent =
     `${b.authors || ""}${b.year ? " · " + b.year : ""} · ` +
     (b.status === "uploaded" ? "published" : "verified");
@@ -11864,7 +12909,7 @@ async function anStartJob(path, body, label, btn) {
     }
   }
   el("an-msg").textContent = "";
-  body.engine = body.engine || state.settings.textAnalysisService || "configured";
+  body.engine = body.engine || "configured";
   if (btn) btn.disabled = true;
   try {
     const res = await fetch(path, {
@@ -11883,6 +12928,7 @@ async function anStartJob(path, body, label, btn) {
     anJobs.set(data.job, {
       kind: label, buildId: body.build_id, btn, path,
       book: build.title || body.build_id,
+      volume: bookVolumeValue(build),
       engine: data.engine || body.engine || "configured",
       pages: data.pages || body.pages || [], src: body.src || "primary",
       doc: data.doc || body.doc || "", artifact: data.artifact || "",
@@ -12045,6 +13091,7 @@ async function anCreatePath(path) {
 }
 
 async function anAssignSuggestion(i) {
+  const originTab = activeHistoryTab();
   const b = anSelected();
   const s = anSuggestions[i];
   if (!b || !s || s.added) return;
@@ -12052,7 +13099,7 @@ async function anAssignSuggestion(i) {
   if (!nid) { el("an-msg").textContent = "could not create the category"; return; }
   const ids = (b.category_ids || []).slice();
   if (!ids.includes(nid)) ids.push(nid);
-  if (await patchBuild(b.id, { category_ids: ids }, "assign category")) {
+  if (await patchBuild(b.id, { category_ids: ids }, "assign category", originTab)) {
     s.added = true;
     await loadTaxonomy();
     renderAnCats(state.builds[b.id]);
@@ -12211,6 +13258,7 @@ async function renderAnBundle(b) {
 }
 
 async function anSaveBundle() {
+  const originTab = activeHistoryTab();
   const b = anSelected();
   if (!b) return;
   const bundle = {
@@ -12220,7 +13268,7 @@ async function anSaveBundle() {
     translations: [...document.querySelectorAll("[data-anb-lang]")]
       .filter((x) => x.checked).map((x) => x.dataset.anbLang),
   };
-  if (await patchBuild(b.id, { bundle }, "edit publish bundle")) {
+  if (await patchBuild(b.id, { bundle }, "edit publish bundle", originTab)) {
     el("an-bundle-msg").textContent = b.status === "uploaded"
       ? "Saved — republish to apply"
       : "Saved — applies when the entry publishes";
@@ -12809,7 +13857,8 @@ async function anIndexPublish() {
     anJobs.set(data.job, {
       kind: "index-publish", buildId: b.id, btn,
       path: "/api/knowledge/index/publish",
-      book: b.title || b.id, engine: data.model || "lexical",
+      book: b.title || b.id, volume: bookVolumeValue(b),
+      engine: data.model || "lexical",
       pages: [], doc: "", artifact: data.slug || "",
       status: "Starting...", at: new Date().toLocaleTimeString(),
       finished: false,
@@ -13284,10 +14333,10 @@ function startEditCategories(td, row) {
   holder.innerHTML = `<div id="catcell-picker"></div>`;
   document.body.appendChild(holder);
   const r = td.getBoundingClientRect();
-  holder.style.left = `${Math.min(r.left, window.innerWidth - 340)}px`;
-  holder.style.top = `${r.bottom + 2}px`;
   const picker = makeCatPicker("catcell-picker");
   picker.set(before);
+  const box = fixedPopupMetrics(holder);
+  positionFixedPopup(holder, r.left, r.bottom + 2 * box.scale, box);
   holder.querySelector(".cat-input").focus();
 
   let done = false;
@@ -13314,7 +14363,7 @@ function startEditCategories(td, row) {
   document.addEventListener("keydown", onKey, true);
 }
 
-async function applyCategoryEdit(row, before, after) {
+async function applyCategoryEdit(row, before, after, originTab = activeHistoryTab()) {
   const label = `edit categories of ${String(row.book.title || "").slice(0, 32)}`;
   if (row.kind === "manual") {
     // _preserve: assigning categories doesn't change the book's identity, so
@@ -13322,7 +14371,7 @@ async function applyCategoryEdit(row, before, after) {
     const patch = (ids) =>
       patchManualFields(row.id, { category_ids: ids, _preserve: true });
     if (await patch(after)) {
-      pushOp(label, () => patch(before), () => patch(after));
+      pushOp(label, () => patch(before), () => patch(after), undefined, originTab);
       status("CATEGORIES UPDATED");
     } else statusCrit("UPDATE FAILED");
     renderChecked();
@@ -13336,7 +14385,8 @@ async function applyCategoryEdit(row, before, after) {
   };
   pushOp(label,
     () => { setIds(before); saveChecked(); renderChecked(); },
-    () => { setIds(after); saveChecked(); renderChecked(); });
+    () => { setIds(after); saveChecked(); renderChecked(); },
+    undefined, originTab);
   setIds(after);
   saveChecked();
   renderChecked();
@@ -13415,10 +14465,8 @@ function publishEntities() {
 }
 
 function publishBookLabel(v, inSet) {
-  const title = String(v.title || "Untitled");
-  if (!inSet) return title;
-  const vol = String(v.volume || "").trim();
-  return (vol ? `Volume ${vol}` : "Volume") + (title ? ` — ${title}` : "");
+  const title = bookTitleText(v, "Untitled");
+  return title;
 }
 
 function publishAliasNodeId(parentNodeId, selectionKey) {
@@ -13596,22 +14644,28 @@ function publishTreeNodeHtml(node, depth) {
   const open = folder && publishNodeOpen(node, depth);
   const selected = !!node.selectKey && node.selectKey === state.publishSel;
   const selectable = node.kind === "book" || node.kind === "set";
+  const attentionKey = selectable ? publicationRemarkKey(node.selectKey) : "";
+  const attention = attentionKey ? (state.attn || {})[attentionKey] : "";
+  const attentionWhy = attnReason(attention);
   const count = node.kind === "set" ? `${node.entries.length}` : "";
   const caret = folder
     ? `<button class="publish-caret" type="button" data-publish-toggle="${esc(node.nodeId)}"
          aria-label="${open ? "Collapse" : "Expand"}" aria-expanded="${open}">${open ? "▾" : "▸"}</button>`
     : `<span class="publish-caret spacer"></span>`;
+  const renderedLabel = node.kind === "book" && node.entry
+    ? bookTitleHtml(node.entry, "Untitled") : esc(node.label);
   const label = selectable
-    ? `<button class="publish-tree-label" type="button" data-publish-select="${esc(node.selectKey)}" title="${esc(node.label)}">${esc(node.label)}</button>`
+    ? `<button class="publish-tree-label" type="button" data-publish-select="${esc(node.selectKey)}" title="${esc(node.label)}">${renderedLabel}</button>`
     : folder
       ? `<button class="publish-tree-label" type="button" data-publish-toggle="${esc(node.nodeId)}" aria-expanded="${open}" title="${esc(node.label)}">${esc(node.label)}</button>`
       : `<span class="publish-tree-label" title="${esc(node.label)}">${esc(node.label)}</span>`;
   const children = open && node.children.length
     ? `<div class="publish-tree-children">${node.children
       .map((child) => publishTreeNodeHtml(child, depth + 1)).join("")}</div>` : "";
-  return `<div class="publish-tree-node ${node.kind}${selected ? " selected" : ""}"
+  return `<div class="publish-tree-node ${node.kind}${selected ? " selected" : ""}${attention ? " attention" : ""}"
       data-publish-node="${esc(node.nodeId)}">
-    <div class="publish-tree-row" style="--tree-depth:${depth}">${caret}
+    <div class="publish-tree-row" style="--tree-depth:${depth}"${attentionWhy
+      ? ` data-tip="Needs attention: ${esc(attentionWhy)}"` : ""}>${caret}
       <span class="publish-tree-icon" aria-hidden="true">${node.kind === "book" ? "□" : "▣"}</span>
       ${label}${count ? `<span class="publish-tree-count">${count}</span>` : ""}</div>${children}</div>`;
 }
@@ -13624,6 +14678,57 @@ function publishFindEntity(key) {
       label: String(entry.title || "Untitled"), entries: [entry] };
   }
   return publishEntities().find((entity) => entity.key === key) || null;
+}
+
+function publishWorkbenchBuildId(entry) {
+  const builds = state.builds || {};
+  const direct = String((entry && entry.local_build_id) || "").trim();
+  if (direct && builds[direct]) return direct;
+  const slug = publishSlug(entry);
+  if (!slug) return "";
+  const matches = Object.entries(builds).filter(([, build]) =>
+    build && String(build.published_slug || "").trim() === slug);
+  return matches.length === 1 ? String(matches[0][0]) : "";
+}
+
+async function openPublishedWorkbenchEntry(entry) {
+  let bid = publishWorkbenchBuildId(entry);
+  // Builds and the public catalogue load independently during startup. Refresh
+  // only when the catalogue supplied a link before the initial build list
+  // arrived. A general refresh here could replace a dirty editor's backing
+  // state before openRoutedItem gets a chance to run its discard guard.
+  const hinted = String((entry && entry.local_build_id) || "").trim();
+  if (!bid && hinted && !Object.keys(state.builds || {}).length) {
+    await loadBuilds();
+    bid = publishWorkbenchBuildId(entry);
+  }
+  if (!bid) {
+    status("PUBLISHED VOLUME HAS NO UNIQUE LOCAL WORKBENCH ENTRY");
+    return false;
+  }
+  await openRoutedItem({ kind: "build", ref: bid });
+  return state.buildSel === bid;
+}
+
+function publishContextMenuItems(selection) {
+  const entity = publishFindEntity(selection);
+  // A set is an organizational view over several Workbench builds. Its book
+  // children each have an unambiguous destination; choosing one for the set
+  // itself would be surprising.
+  if (!entity || entity.kind !== "book") return [];
+  return [{ label: "Open in Workbench",
+    fn: () => openPublishedWorkbenchEntry(entity.entries[0]) }];
+}
+
+function onPublishContextMenu(ev) {
+  if (ev.target.closest("input, textarea, [contenteditable]")) return;
+  const row = ev.target.closest(".publish-tree-row");
+  if (!row) return;
+  const pick = row.querySelector("[data-publish-select]");
+  const items = publishContextMenuItems(pick && pick.dataset.publishSelect);
+  if (!items.length) return;
+  ev.preventDefault();
+  openProcMenu(ev.clientX, ev.clientY, items);
 }
 
 function renderPublishTree(revealSelection = false) {
@@ -13700,7 +14805,7 @@ function publishMetadata(v) {
 
 function publishImprint(v) {
   return [v.publisher, v.publisher_city, v.year, v.edition,
-    v.pages && `${v.pages} pp`, v.volume && `Volume ${v.volume}`]
+    v.pages && `${v.pages} pp`]
     .filter(Boolean).map((x) => `<span>${esc(x)}</span>`).join("");
 }
 
@@ -13833,8 +14938,7 @@ function publishActions(v) {
 
 function publishMasthead(body) {
   return `<div class="ppub-masthead"><img src="/static/icon.png" width="40" height="40" alt="">
-    <div><div class="ppub-wordmark">World Herb Library</div>
-      <div class="ppub-sub">An archival collection of botanical &amp; medical works</div></div></div>
+    <div class="ppub-wordmark">Archive Browser</div></div>
     <div class="ppub-shell">${body}</div>`;
 }
 
@@ -13850,9 +14954,9 @@ function publishBookHtml(v, details) {
   const fallback = details && details.source === "local" && details.warning
     ? `<div class="ppub-preview-warning" role="status" title="${esc(details.warning)}">Online article details are unavailable. Showing the last uploaded local copy.</div>`
     : "";
-  return publishMasthead(`<p class="ppub-crumb">Catalogue › ${esc(v.title || "Untitled")}</p>
+  return publishMasthead(`<p class="ppub-crumb">Catalogue › ${bookTitleHtml(v, "Untitled")}</p>
     <div class="ppub-record-page"><div class="ppub-book-main">
-      <h1 class="ppub-book-title">${esc(v.title || "Untitled")}</h1>
+      <h1 class="ppub-book-title">${bookTitleHtml(v, "Untitled")}</h1>
       ${v.subtitle ? `<p class="ppub-book-subtitle">${esc(v.subtitle)}</p>` : ""}
       ${v.authors ? `<p class="ppub-book-author">${esc(v.authors)}</p>` : ""}
       <p class="ppub-imprint">${publishImprint(v)}</p>
@@ -13875,7 +14979,7 @@ function publishCatalogRow(v) {
   const cats = publishCategoryHtml(v, false);
   return `<li class="ppub-catalog-row${thumb ? " has-thumb" : ""}">
     ${thumb ? `<img src="${esc(thumb)}" alt="" loading="lazy">` : ""}
-    <div><button class="ppub-row-title" type="button" data-publish-book="${esc(publishSlug(v))}">${esc(v.title || "Untitled")}</button>
+    <div><button class="ppub-row-title" type="button" data-publish-book="${esc(publishSlug(v))}">${bookTitleHtml(v, "Untitled")}</button>
       ${v.subtitle ? `<div class="ppub-row-author">${esc(v.subtitle)}</div>` : ""}
       ${v.authors ? `<div class="ppub-row-author">${esc(v.authors)}</div>` : ""}
       <div class="ppub-row-imprint">${publishImprint(v)}</div>
@@ -13906,7 +15010,7 @@ async function renderPublishPreview() {
     return;
   }
   const v = entity.entries[0], slug = publishSlug(v), mine = ++state.publishPreviewSeq;
-  el("publish-preview-label").textContent = `${v.title || "Untitled"} · catalog preview`;
+  el("publish-preview-label").textContent = `${bookTitleText(v, "Untitled")} · catalog preview`;
   const cached = state.publishDetails.get(slug);
   el("publish-record").innerHTML = publishBookHtml(v, cached || null);
   if (cached) return;
@@ -14036,6 +15140,7 @@ function loadPublishCatalog(force) {
       el("publish-source").title = state.publishWarning;
       renderPublishTree(true);
       renderPublishPreview();
+      renderRemarks();
     } catch (e) {
       if (mine !== state.publishCatalogSeq) return;
       el("publish-source").textContent = "Could not load catalogue";
@@ -14358,9 +15463,9 @@ function switchPaneTab(id) {
 // --- Advanced Search popup (the form lives outside the left pane now) ---------
 function openAdvSearch() {
   const pop = el("adv-search-pop"), r = el("adv-search-btn").getBoundingClientRect();
-  pop.style.top = (r.bottom + 4) + "px";
-  pop.style.left = r.left + "px";
   pop.hidden = false;
+  const box = fixedPopupMetrics(pop);
+  positionFixedPopup(pop, r.left, r.bottom + 4 * box.scale, box);
   el("s-title").focus();
 }
 function closeAdvSearch() {
@@ -14514,8 +15619,8 @@ function renderInfoPane() {
   }
   if (t.whl) {                                        // a WHL catalogue row
     const w = t.whl;
-    let h = `<div class="info-head">${esc(t.label)}</div><div class="info-sec">`;
-    h += infoRow("Title", esc(w.title));
+    let h = `<div class="info-head">${bookTitleHtml(w, t.label)}</div><div class="info-sec">`;
+    h += infoRow("Title", bookTitleHtml(w, ""));
     h += infoRow("Authors", esc(w.authors));
     h += infoRow("Year", esc(w.year));
     h += infoRow("Publisher", esc(w.publisher));
@@ -14536,18 +15641,18 @@ function renderInfoPane() {
     h += infoRow("Volumes present", esc(String(vols.length)));
     h += infoRow("Declared count", esc(String(setDefinedCount(t.set.key) || "?")));
     h += `</div><div class="info-sec"><div class="info-sec-h">Volumes</div>`;
-    for (const v of vols) h += infoRow("Vol " + (volNum(v.book) || "?"), esc(v.book.title));
+    for (const v of vols) h += infoRow("Volume", bookTitleHtml(v.book, ""));
     body.innerHTML = h + `</div>`;
     return;
   }
   const b = t.book || {};                             // a checked / manual / master book
   const row = t.row;
-  let h = `<div class="info-head">${esc(t.label)}</div>`;
+  let h = `<div class="info-head">${bookTitleHtml(b, t.label)}</div>`;
   h += `<div class="info-sec"><div class="info-sec-h">Fields</div>`;
   for (const [k, label] of TIP_FIELDS) {
     if (k === "url" || k === "status") continue;      // not book-owned in this table
     const v = (b[k] == null ? "" : String(b[k])).trim();
-    if (v) h += infoRow(label, esc(v));
+    if (v) h += infoRow(label, k === "title" ? bookTitleHtml(b, "") : esc(v));
   }
   h += `</div>`;
   // non-column metadata captured with the entry (phone captures etc.)
@@ -14643,7 +15748,7 @@ function renderOlSuggest(data) {
   if (!results.length) { hideOlSuggest(); return; }
   wrap.innerHTML = results.map((r, i) => `
     <div class="ol-item" data-i="${i}">
-      <span class="t">${esc(r.title)}${r.subtitle ? `: ${esc(r.subtitle)}` : ""}</span>
+      <span class="t">${bookTitleHtml(r, "")}${r.subtitle ? `: ${esc(r.subtitle)}` : ""}</span>
       <span class="m">${esc((r.authors || []).filter((a) => a && a !== "?").join("; ")) || "&mdash;"}${r.year ? ` [${r.year}]` : (r.first_year ? ` [${r.first_year}]` : "")}</span>
     </div>`).join("");
   wrap.querySelectorAll(".ol-item").forEach((item) =>
@@ -14740,6 +15845,7 @@ function onYearInput() {
 
 async function submitManual(ev) {
   ev.preventDefault();
+  const originTab = activeHistoryTab();
   let body = {};
   for (const f of MANUAL_FIELDS) body[f] = el("m-" + f).value;
   if (!body.title.trim()) { el("manual-msg").textContent = "Title is required"; return; }
@@ -14759,7 +15865,7 @@ async function submitManual(ev) {
     const data = await res.json().catch(() => ({}));
     if (res.ok && data.ok) {
       state.manual.unshift(data.entry);
-      pushManualCreateOp(data.entry);
+      pushManualCreateOp(data.entry, originTab);
       renderChecked();
       el("manual-form").reset();
       catPickers["m-categories"].set([]);   // pickers sit outside form.reset()
@@ -14864,15 +15970,16 @@ async function restoreManualEntry(snap) {
   return true;
 }
 
-function pushManualCreateOp(entry) {
+function pushManualCreateOp(entry, originTab = activeHistoryTab()) {
   const snap = JSON.parse(JSON.stringify(entry));
   pushOp(`create entry ${String(entry.title || "").slice(0, 36)}`,
     () => deleteManualById(snap.id),
     () => restoreManualEntry(snap),
-    { kind: "manual-create", id: snap.id });
+    { kind: "manual-create", id: snap.id },
+    originTab);
 }
 
-async function deleteManual(id) {
+async function deleteManual(id, originTab = activeHistoryTab()) {
   // no confirmation: deletion is undoable
   const e = state.manual.find((x) => x.id === id);
   const snap = e ? JSON.parse(JSON.stringify(e)) : null;
@@ -14881,7 +15988,8 @@ async function deleteManual(id) {
       pushOp(`delete entry ${String(snap.title || "").slice(0, 36)}`,
         () => restoreManualEntry(snap),
         () => deleteManualById(snap.id),
-        { kind: "manual-restore", snap });
+        { kind: "manual-restore", snap },
+        originTab);
     }
     status("MANUAL ENTRY DELETED");
   } else {
@@ -14944,6 +16052,8 @@ function approvedSources() {
         author: row.book.author || "",
         publisher: row.book.publisher || "",
         year: row.book.year || "",
+        volume: bookVolumeValue(row.book),
+        volume_number: String(row.book.volume_number || ""),
         category_ids: (row.book.category_ids || []).slice(),
         archive: "Local scan",
         url: "",
@@ -14960,6 +16070,8 @@ function approvedSources() {
         author: row.book.author || "",
         publisher: row.book.publisher || "",
         year: row.book.year || "",
+        volume: bookVolumeValue(row.book),
+        volume_number: String(row.book.volume_number || ""),
         category_ids: (row.book.category_ids || []).slice(),
         archive: ARCHIVE_NAMES[source],
       }, capturedSourceMeta(row));
@@ -15035,7 +16147,7 @@ function renderUpload() {
       if (attnReason(srcAttn)) tr.dataset.tip = "Needs attention: " + attnReason(srcAttn);
     }
     tr.innerHTML = `
-      <td>${esc(s.title)}</td>
+      <td>${bookTitleHtml(s, "")}</td>
       <td>${esc(s.subtitle)}</td>
       <td>${esc(s.author)}</td>
       <td>${esc(s.publisher)}</td>
@@ -15161,22 +16273,12 @@ async function loadBuilds() {
   } catch (e) { state.builds = {}; }
 }
 
-// the sidebar shows one queue at a time: Pending (awaiting upload to WHL)
-// or Uploaded (already sent)
-function buildsTab() {
-  return state.buildsTab === "uploaded" ? "uploaded" : "pending";
-}
-
+// Every build shares one Workbench tree.
 // every build, newest first — exports and the OCR tab's book list must not
 // depend on which Editor sidebar tab happens to be active
 function allBuildsSorted() {
   return Object.values(state.builds)
     .sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
-}
-
-function buildsSorted() {
-  const uploaded = buildsTab() === "uploaded";
-  return allBuildsSorted().filter((b) => (b.status === "uploaded") === uploaded);
 }
 
 function currentBuild() {
@@ -15234,7 +16336,7 @@ function appendBuildListItem(list, b, grouped) {
     li.tabIndex = 0;
     li.setAttribute("role", "button");
     if (b.id === state.buildSel) li.setAttribute("aria-current", "true");
-    li.dataset.tip = `${b.title || "(untitled)"}\n` +
+    li.dataset.tip = `${bookTitleText(b)}\n` +
       `${b.authors ? "Authors: " + b.authors + "\n" : ""}` +
       `${b.year ? "Year: " + b.year + "\n" : ""}` +
       `Status: ${uploaded ? "published" : ready ? "verified" : "draft"}\n` +
@@ -15246,13 +16348,12 @@ function appendBuildListItem(list, b, grouped) {
     // single author · year · OCR-count meta line
     li.innerHTML = `
       <span class="bi-row">
-        <span class="bi-title">${esc(b.title) || "<em>(untitled)</em>"}</span>
+        <span class="bi-title">${bookTitleHtml(b)}</span>
         <span class="bi-status ${ready || uploaded ? "ok" : ""}"
               data-tip="${uploaded ? "Published" : ready ? "Verified" : "Draft"}">${
                 uploaded ? ICONS.export : ready ? ICONS.check : ICONS.pencil}</span>
       </span>
-      <span class="bi-meta">${b.volume ? `Vol. ${esc(b.volume)} &middot; ` : ""}${
-        esc(b.authors || "")}${b.authors && b.year ? " &middot; " : ""}${esc(b.year || "")}${
+      <span class="bi-meta">${esc(b.authors || "")}${b.authors && b.year ? " &middot; " : ""}${esc(b.year || "")}${
         folder && folder.ocr.length ? ` &middot; ${folder.ocr.length} OCR` : ""}</span>`;
     list.appendChild(li);
 }
@@ -15479,7 +16580,7 @@ function selectBuild(id) {
   selectWorkbenchBook(id);
 }
 
-async function createBuild(seed, label) {
+async function createBuild(seed, label, originTab = activeHistoryTab()) {
   const res = await fetch("/api/builds", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -15504,7 +16605,7 @@ async function createBuild(seed, label) {
       });
       state.builds[snap.id] = snap;
       renderUpload();
-    });
+    }, undefined, originTab);
   selectBuild(data.build.id);
   renderUpload();
   return data.build;
@@ -15586,7 +16687,7 @@ async function patchBuildRaw(id, fields, quiet) {
   return false;
 }
 
-async function patchBuild(id, fields, label) {
+async function patchBuild(id, fields, label, originTab = activeHistoryTab()) {
   const b = state.builds[id];
   if (!b) return false;
   const before = {};
@@ -15594,7 +16695,8 @@ async function patchBuild(id, fields, label) {
   if (await patchBuildRaw(id, fields)) {
     pushOp(label || `edit build ${b.title || id}`,
       () => patchBuildRaw(id, before),
-      () => patchBuildRaw(id, fields));
+      () => patchBuildRaw(id, fields),
+      undefined, originTab);
     return true;
   }
   return false;
@@ -15602,6 +16704,7 @@ async function patchBuild(id, fields, label) {
 
 async function saveBuildFields(ev) {
   if (ev) ev.preventDefault();
+  const originTab = activeHistoryTab();
   const id = state.buildSel;
   if (!id) return false;
   const fields = {};
@@ -15626,7 +16729,8 @@ async function saveBuildFields(ev) {
   // bumped comes back 409 and reloads instead of clobbering it
   fields.expect_updated_at = (state.builds[id] || {}).updated_at || "";
   const editGeneration = buildEditGeneration;
-  if (await patchBuild(id, fields, `edit build ${fields.title.slice(0, 30)}`)) {
+  if (await patchBuild(id, fields, `edit build ${fields.title.slice(0, 30)}`,
+      originTab)) {
     const stillOwnsEditor = state.buildSel === id &&
       buildEditGeneration === editGeneration &&
       (!buildDescMd || buildDescMd.get() === fields.description);
@@ -15660,7 +16764,7 @@ async function saveBuildFields(ev) {
   }
 }
 
-async function deleteBuild() {
+async function deleteBuild(originTab = activeHistoryTab()) {
   // no confirmation: deletion is undoable
   const id = state.buildSel;
   const b = state.builds[id];
@@ -15684,7 +16788,7 @@ async function deleteBuild() {
         await fetch(`/api/builds/${snap.id}`, { method: "DELETE" });
         delete state.builds[snap.id];
         renderUpload();
-      });
+      }, undefined, originTab);
     renderUpload();
     status(`BUILD DELETED :: ${snap.title || id}`);
   } else {
@@ -15714,18 +16818,33 @@ function switchBuildTab(id) {
   if (id === "btab-resources") refreshResourcesTab();
 }
 
-// --- AI summary from the OCR text (OpenAI-compatible API via the server) --
+// --- AI description from OCR text (DeepSeek by default; endpoint overrideable) --
+
+function descriptionProviderLabel(settings = state.settings) {
+  const base = String((settings && settings.aiBase) || "").trim();
+  if (!base) return "DeepSeek";
+  const host = base.replace(/^https?:\/\//i, "").split(/[/?#]/)[0];
+  return /(^|\.)deepseek\.com(?::\d+)?$/i.test(host)
+    ? "DeepSeek" : (host || "configured AI provider");
+}
 
 async function generateAiSummary() {
   const b = currentBuild();
   if (!b) return;
   const s = state.settings;
   const msg = el("b-ai-msg");
-  if (!(s.aiKey || "").trim() || !(s.aiModel || "").trim()) {
-    msg.textContent =
-      "Configure the model in Settings > AI and the key in Settings > Credentials";
+  // Only the key is required: the model falls back to deepseek-chat just below,
+  // so main's "model must be set" guard would block a request that works. The
+  // message names the provider instead of pointing at a model setting.
+  const provider = descriptionProviderLabel(s);
+  if (!(s.aiKey || "").trim()) {
+    msg.textContent = provider === "DeepSeek"
+      ? "Add your DeepSeek API key (Settings > Credentials)"
+      : `Add an API key for ${provider} (Settings > Credentials)`;
     return;
   }
+  const baseUrl = (s.aiBase || "").trim() || "https://api.deepseek.com";
+  const model = (s.aiModel || "").trim() || "deepseek-chat";
   const localPath = (b.pdf_file || "").trim();
   const url = (b.pdf_source || "").trim();
   const textSrc = localPath
@@ -15741,14 +16860,14 @@ async function generateAiSummary() {
       msg.textContent = (ocr.error || "No text layer").slice(0, 80);
       return;
     }
-    msg.textContent = "Generating ...";
+    msg.textContent = `Generating with ${provider} (${model}) ...`;
     const res = await fetch("/api/ai/summarize", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        base_url: s.aiBase || "",
+        base_url: baseUrl,
         api_key: s.aiKey || "",
-        model: s.aiModel || "",
+        model,
         instructions: s.aiInstructions || "",
         text: ocr.text,
       }),
@@ -15904,6 +17023,7 @@ function renderPdfSources(b) {
 }
 
 async function addSecondaryPdf(path) {
+  const originTab = activeHistoryTab();
   const b = currentBuild();
   if (!b || !path) return;
   const p = path.trim();
@@ -15917,20 +17037,21 @@ async function addSecondaryPdf(path) {
   }
   const id = Math.random().toString(16).slice(2, 10);
   if (await patchBuild(b.id, { pdf_sources: [...cur, { id, path: p }] },
-      `add secondary PDF to ${b.title || b.id}`)) {
+      `add secondary PDF to ${b.title || b.id}`, originTab)) {
     el("b-src-msg").textContent = "Secondary source added";
     refreshSourceTab();
   }
 }
 
 async function removeSecondaryPdf(sid) {
+  const originTab = activeHistoryTab();
   const b = currentBuild();
   if (!b) return;
   const cur = b.pdf_sources || [];
   const next = cur.filter((s) => s.id !== sid);
   if (next.length === cur.length) return;
   if (await patchBuild(b.id, { pdf_sources: next },
-      `remove secondary PDF from ${b.title || b.id}`)) {
+      `remove secondary PDF from ${b.title || b.id}`, originTab)) {
     el("b-src-msg").textContent = "Secondary source removed";
     refreshSourceTab();
   }
@@ -16073,6 +17194,14 @@ async function syncBuildFolder() {
   el("b-src-msg").textContent = "Building folder ...";
   el("b-folder").disabled = true;
   try {
+    if (state.settings.trimBlank) {
+      // The server may renumber page-keyed marks during this request. Drain
+      // older whole-blob writes first so none can land afterward and resurrect
+      // the pre-trim page identities.
+      pushClientState("attention");
+      pushClientState("settings");
+      await flushClientState();
+    }
     const res = await fetch(`/api/builds/${encodeURIComponent(b.id)}/folder`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -16088,6 +17217,13 @@ async function syncBuildFolder() {
       // the sync may have retired the IA original and repointed pdf_file
       // at the folder's preview.pdf
       if (data.build) state.builds[b.id] = data.build;
+      if (data.page_remap && Array.isArray(data.page_remap.deleted)) {
+        remapPageRemarkKeys(b.id, data.page_remap.source,
+          data.page_remap.deleted);
+        await loadReviews();
+        renderRemarks();
+        renderHome();
+      }
       // a blank-page trim rewrites the PDF: cached counts/dims are stale,
       // and the trim renumbers the word/region sidecars server-side
       ocrState.pdfInfo = {};
@@ -16145,6 +17281,7 @@ async function setActiveOcr(name) {
 }
 
 async function attachPdfFile(path) {
+  const originTab = activeHistoryTab();
   const b = currentBuild();
   if (!b) return;
   const p = (path != null ? path : el("b-pdf_file").value).trim();
@@ -16159,7 +17296,8 @@ async function attachPdfFile(path) {
     }
   }
   if (await patchBuild(b.id, { pdf_file: p },
-      p ? `attach PDF to ${b.title || b.id}` : `detach PDF from ${b.title || b.id}`)) {
+      p ? `attach PDF to ${b.title || b.id}` : `detach PDF from ${b.title || b.id}`,
+      originTab)) {
     el("b-src-msg").textContent = p ? "Attached" : "Detached";
     refreshSourceTab();
   } else {
@@ -16169,10 +17307,8 @@ async function attachPdfFile(path) {
 
 // --- OCR tab: load, review, compare, and correct OCR text -------------------------
 // OCR targets are the books' PDFs. The sidebar lists every book folder;
-// selecting one loads its OCR text files as documents. Cloud/local OCR
-// processing (Azure Document Intelligence, OpenAI vision, Tesseract) plugs
-// into the queue once service credentials exist (Settings > OCR) — TODO:
-// verify against a live service when the user has an API key.
+// selecting one loads its OCR text files as documents. Cloud/local OCR plugs
+// into the queue once its service credentials exist.
 
 const ocrState = {
   docs: [], sel: null, view: "pdf", jobs: [], seq: 0,   // page view is home
@@ -16182,8 +17318,6 @@ const ocrState = {
   books: null,             // build id -> {ocr, preview} (entry folders)
   book: null,              // selected book (build id)
   bookLoading: null,       // build id currently loading (re-entrancy guard)
-  verifiedOnly: false,     // off by default: drafts must be reachable to edit
-                           // their Record (the filter remains a toggle)
   pages: null,             // {pre, map} sections for the side-by-side view
   pageTags: new Map(),     // "bid:src:page" -> service, STAGED (submit is manual)
   pageRunning: new Map(),  // "bid:src:page" -> service, submitted and processing
@@ -16283,21 +17417,14 @@ function srcExtractedName(key) {
 }
 
 // The ONE Workbench book list: every build — with or without an entry folder —
-// in the Editor's old Pending / Uploaded queues, grouped by volume set, with
+// grouped by volume set, with
 // the existing status icons and an OCR count where a folder exists.
 function renderOcrBooks() {
   const list = el("ocr-books");
   list.innerHTML = "";
-  document.querySelectorAll("#builds-tabs .pane-tab").forEach((t) =>
-    t.classList.toggle("active", t.dataset.bstab === buildsTab()));
-  const verifiedFilter = el("ocr-filter-verified");
-  verifiedFilter.classList.toggle("active", ocrState.verifiedOnly);
-  verifiedFilter.setAttribute("aria-pressed", String(ocrState.verifiedOnly));
-  const builds = buildsSorted().filter((b) =>
-    !ocrState.verifiedOnly || anAnalyzable(b));
+  const builds = allBuildsSorted();
   el("ocr-books-empty").hidden = builds.length !== 0;
-  el("ocr-books-empty").textContent =
-    buildsTab() === "uploaded" ? "Nothing published yet" : "No entries yet";
+  el("ocr-books-empty").textContent = "No entries yet";
   for (const item of editorBuildItems(builds)) {
     if (item.type === "group") {
       const li = document.createElement("li");
@@ -16816,7 +17943,7 @@ function buildOcrKeymapLegend() {
   if (!host) return;
   const map = state.settings.ocrKeyMap || {};
   const SHORT = { tesseract: "Tesseract", mistral: "Mistral", claude: "Claude",
-                  textract: "Textract", azure: "Azure", openai: "OpenAI" };
+                  textract: "Textract" };
   const parts = [];
   for (const k of ["1", "2", "3", "4", "5"]) {
     if (map[k]) parts.push(`<b>${k}</b> ${esc(SHORT[map[k]] || map[k])}`);
@@ -17573,6 +18700,23 @@ async function cancelJob(jobId) {
   }
 }
 
+// Job rows outlive their initiating editor render. Prefer the current build so
+// title/volume corrections appear immediately; session metadata is the fallback
+// while a freshly queued job has not reached the server registry yet.
+function jobBookRecord(job, buildId, fallback) {
+  const id = String(buildId || (job && job.buildId) || "");
+  const live = id && state.builds[id];
+  if (live) return live;
+  return {
+    title: String((job && job.book) || fallback || id || ""),
+    volume: String((job && job.volume) || ""),
+  };
+}
+
+function jobBookTitleHtml(job, buildId, fallback) {
+  return bookTitleHtml(jobBookRecord(job, buildId, fallback), fallback || buildId || "");
+}
+
 function renderOcrQueue() {
   // the stage-all target follows the selection; the queue re-renders on
   // every selection/staging change, so the scope line stays truthful
@@ -17593,7 +18737,8 @@ function renderOcrQueue() {
         `${r.state === "cancelling" ? " disabled" : ""}>` +
         `${r.state === "cancelling" ? "Stopping…" : "Stop"}</button>`
       : "";
-    const book = (m && m.book) || r.label || r.build_id || "";
+    const book = jobBookTitleHtml(m, (m && m.buildId) || r.build_id,
+      r.label || r.build_id || "");
     const artifact = m
       ? (m.target || m.artifact || (m.pages && m.pages.length
         ? `Pages ${m.pages.join(", ")}` : m.kind || r.kind))
@@ -17603,7 +18748,7 @@ function renderOcrQueue() {
     const at = (m && m.at) ||
       (r.created_at ? new Date(r.created_at).toLocaleTimeString() : "");
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td>${esc(jobTypeLabel(r.kind))}</td><td>${esc(book)}</td>` +
+    tr.innerHTML = `<td>${esc(jobTypeLabel(r.kind))}</td><td>${book}</td>` +
       `<td>${esc(artifact)}</td><td>${esc(engine)}</td>` +
       `<td>${esc(jobStatusText(r))}</td><td>${esc(at)}</td><td>${stop}</td>`;
     tbody.appendChild(tr);
@@ -17618,7 +18763,7 @@ function renderOcrQueue() {
         `${j.cancelling ? " disabled" : ""}>${j.cancelling ? "Stopping…" : "Stop"}</button>`
       : "";
     const artifact = j.target || String(j.pdf || "").replace(/\\/g, "/").split("/").pop();
-    tr.innerHTML = `<td>OCR</td><td>${esc(j.book)}</td>` +
+    tr.innerHTML = `<td>OCR</td><td>${jobBookTitleHtml(j, j.buildId, j.book)}</td>` +
       `<td data-tip="${esc(j.pdf)}">${esc(artifact)}</td>` +
       `<td>${esc(j.service)}</td><td>${esc(j.status)}</td><td>${esc(j.at)}</td><td>${stop}</td>`;
     tbody.appendChild(tr);
@@ -17629,7 +18774,8 @@ function renderOcrQueue() {
     tr.dataset.analysisJob = id;
     const artifact = j.artifact || (j.pages && j.pages.length
       ? `Pages ${j.pages.join(", ")}` : j.kind);
-    tr.innerHTML = `<td>Text analysis</td><td>${esc(j.book || j.buildId)}</td>` +
+    tr.innerHTML = `<td>Text analysis</td><td>${jobBookTitleHtml(j, j.buildId,
+      j.book || j.buildId)}</td>` +
       `<td>${esc(artifact)}</td>` +
       `<td>${esc(TEXT_ANALYSIS_LABELS[j.engine] || j.engine || "Configured AI")}</td>` +
       `<td>${esc(j.status || "Starting...")}</td><td>${esc(j.at || "")}</td><td></td>`;
@@ -17793,14 +18939,12 @@ async function ocrSetQuality(v) {
   }
 }
 
-// is the chosen OCR service configured? (Settings > OCR)
-// services the server can actually run today; azure/openai queue as stubs
-// (their processors are TODO until credentials exist)
+// Is the chosen OCR service configured? Only processors the server can run are
+// exposed; provider credentials live under Settings > Credentials.
 const OCR_RUNNABLE = { tesseract: true, mistral: true, claude: true, textract: true };
 const OCR_SERVICE_LABELS = {
   tesseract: "Tesseract (local)", mistral: "Mistral OCR", claude: "Claude",
   textract: "Amazon Textract",
-  azure: "Azure Document Intelligence", openai: "OpenAI vision",
 };
 
 function ocrServiceReady(svc) {
@@ -17809,15 +18953,13 @@ function ocrServiceReady(svc) {
   if (svc === "mistral") return !!s.mistralKey;   // shared with the capture pipeline
   if (svc === "claude") return !!s.ocrClaudeKey;
   if (svc === "textract") return !!(s.ocrAwsKey && s.ocrAwsSecret);
-  if (svc === "azure") return !!(s.ocrAzureEndpoint && s.ocrAzureKey);
-  if (svc === "openai") return !!s.aiKey;         // reuses the AI credentials
   return false;
 }
 
 const TEXT_ANALYSIS_LABELS = { configured: "Configured AI provider" };
 
-function analysisServiceReady(engine) {
-  return engine === "configured" && !!String(state.settings.aiKey || "").trim();
+function analysisServiceReady() {
+  return !!String(state.settings.aiKey || "").trim();
 }
 
 // renderOcrQueue runs this on every 1.5s job-poll tick, so it follows the
@@ -17829,8 +18971,8 @@ function updateDefaultEngineSummary() {
   const host = el("engine-defaults-summary");
   if (!host) return;
   const ocr = OCR_SERVICE_LABELS[state.settings.ocrService] || "Tesseract (local)";
-  const analysis = TEXT_ANALYSIS_LABELS[state.settings.textAnalysisService] ||
-    "Configured AI provider";
+  // No analysis label here: the always-"configured" analysis-engine picker was
+  // removed as a fake choice, so the summary names the OCR engine alone.
   // the drawer is Workbench-global but its stage-all acts on the CURRENT
   // book's selected source — name the target where the button lives,
   // and refuse (disabled) rather than error after the click
@@ -17842,15 +18984,16 @@ function updateDefaultEngineSummary() {
   if (b) {
     const d = ocrSelDoc();
     const src = d && d.buildId === bid ? docSrcKey(d) : "primary";
-    const title = (b.title || bid).slice(0, 40);
+    // bookTitleText carries the volume tag, so allow a few more characters
+    const title = bookTitleText(b, bid).slice(0, 48);
     scope = ` · stages: ${title} / ${src}`;
     tip = `Stage every page of "${title}" (${src}) with ${ocr} — ` +
           "nothing runs until Submit";
   }
-  const sig = `${ocr}|${analysis}|${scope}|${tip}`;
+  const sig = `${ocr}|${scope}|${tip}`;
   if (sig === _engineSummarySig) return;
   _engineSummarySig = sig;
-  host.textContent = `${ocr} / ${analysis}${scope}`;
+  host.textContent = `${ocr}${scope}`;
   if (add) {
     setTip(add, tip);          // icon-only: keeps its derived accessible name in step
     add.disabled = !b;
@@ -17866,19 +19009,11 @@ function refreshDefaultEngineOptions() {
     option.title = ready ? "" : "Add this engine's API key in Settings > Credentials";
   }
   ocr.value = state.settings.ocrService || "tesseract";
-  const analysis = el("analysis-service");
-  const ready = analysisServiceReady("configured");
-  analysis.value = "configured";
-  analysis.disabled = !ready;
-  analysis.options[0].disabled = !ready;
-  const model = String(state.settings.aiModel || "").trim() || "deepseek-chat";
-  analysis.options[0].textContent = ready
-    ? `Configured AI provider - ${model}`
-    : `Configured AI provider - API key required`;
   el("ocr-engine-note").textContent = [...ocr.options].some((o) => o.disabled)
     ? "Cloud engines without credentials are unavailable." : "";
-  el("analysis-engine-note").textContent = ready
-    ? "" : "Add an AI API key in Settings > Credentials.";
+  // No analysis-engine note: that picker (and its #analysis-engine-note
+  // element) were removed with the fake analysis-engine choice, and `ready`
+  // is scoped to the OCR loop above.
   updateDefaultEngineSummary();
 }
 
@@ -17922,11 +19057,11 @@ async function stageSelectedAnalysisPages() {
     el("an-page-msg").textContent = "Select one or more facsimile pages first.";
     return;
   }
-  const engine = state.settings.textAnalysisService || "configured";
-  if (!analysisServiceReady(engine)) await hydrateSecrets();
-  if (!analysisServiceReady(engine)) {
-    el("an-page-msg").textContent = "Text Analysis needs an API key.";
-    await openDefaultEngines();
+  const engine = "configured";
+  if (!analysisServiceReady()) await hydrateSecrets();
+  if (!analysisServiceReady()) {
+    el("an-page-msg").textContent =
+      "Text Analysis needs an API key in Settings > Credentials.";
     return;
   }
   const src = docSrcKey(d);
@@ -17942,10 +19077,10 @@ async function stageSelectedAnalysisPages() {
 async function submitAnalysisStaged(bid) {
   const groups = stagedAnalysisPagesFor(bid);
   if (!groups.size) return { submitted: false, failed: false };
-  if (!analysisServiceReady(state.settings.textAnalysisService || "configured"))
-    await hydrateSecrets();
-  if (!analysisServiceReady(state.settings.textAnalysisService || "configured")) {
-    el("an-page-msg").textContent = "Text Analysis needs an API key.";
+  if (!analysisServiceReady()) await hydrateSecrets();
+  if (!analysisServiceReady()) {
+    el("an-page-msg").textContent =
+      "Text Analysis needs an API key in Settings > Credentials.";
     return { submitted: false, failed: true };
   }
   let submitted = false;
@@ -17981,19 +19116,16 @@ async function ocrQueuePages(bid, srcKey, pages) {
   const pdf = ocrSrcPdf(bid, srcKey);
   const target = srcCompiledName(srcKey);
   if (!b || !pdf || !pages.length) return;
-  const bad = pages.find((x) => !OCR_RUNNABLE[x.service]);
-  if (bad) {
-    // azure/openai: keep the honest stub row — no processor yet
-    ocrState.jobs.push({
-      book: b.title || bid, pdf,
-      service: OCR_SERVICE_LABELS[bad.service] || bad.service,
-      status: ocrServiceReady(bad.service)
-        ? "Queued — processing not implemented yet"
-        : "Queued — service not configured (Settings > Credentials)",
-      at: new Date().toLocaleTimeString(),
-    });
-    renderOcrQueue();
-    return;
+  // A retired engine (e.g. azure) can still be referenced by pages staged
+  // before it was removed: drop those rather than queue a stub job for a
+  // processor that no longer exists, and carry on with the runnable ones.
+  const unavailable = pages.filter((x) => !OCR_RUNNABLE[x.service]);
+  if (unavailable.length) {
+    for (const x of unavailable)
+      ocrState.pageTags.delete(`${bid}:${srcKey}:${x.page}`);
+    pages = pages.filter((x) => OCR_RUNNABLE[x.service]);
+    el("ocr-msg").textContent = "Removed staged pages for an unavailable OCR service.";
+    if (!pages.length) { renderOcrQueue(); return; }
   }
   // Opening Settings is not a prerequisite for cloud-backed credentials.
   // Refresh on demand before deciding that a selected service is unavailable.
@@ -18027,7 +19159,8 @@ async function ocrQueuePages(bid, srcKey, pages) {
     }
     const job = data.job;
     ocrState.jobs.push({
-      id: job.id, buildId: bid, book: b.title || bid, pdf,
+      id: job.id, buildId: bid, book: b.title || bid,
+      volume: bookVolumeValue(b), pdf,
       target, src: srcKey,
       service: [...new Set(pages.map((x) => OCR_SERVICE_LABELS[x.service]))].join(", "),
       status: `Running — 0/${job.pages.length}`,
@@ -18541,6 +19674,12 @@ async function deleteSelectedPages() {
       });
     } catch (e) { /* the renumber then works from the last saved version */ }
   }
+  // The delete endpoint remaps its server-side attention/settings blobs. Wait
+  // out any older whole-blob client write so it cannot finish afterward and
+  // put the old page numbers back.
+  pushClientState("attention");
+  pushClientState("settings");
+  await flushClientState();
   try {
     const res = await fetch("/api/pdf/pages/delete", {
       method: "POST",
@@ -18553,6 +19692,13 @@ async function deleteSelectedPages() {
       return;
     }
     if (data.build) state.builds[bid] = data.build;
+    if (data.page_remap && Array.isArray(data.page_remap.deleted)) {
+      remapPageRemarkKeys(bid, data.page_remap.source,
+        data.page_remap.deleted);
+      await loadReviews();
+      renderRemarks();
+      renderHome();
+    }
     clearOcrPageSel();
     // staged/running markers no longer match the new numbering
     for (const k of [...ocrState.pageTags.keys()]) {
@@ -18615,6 +19761,10 @@ function decorateOcrPages() {
   box.querySelectorAll(".ocr-pgrow").forEach((row) => {
     const n = +row.dataset.page;
     const k = `${d && d.buildId}:${ocrState.pagesSrc}:${n}`;
+    const attentionKey = d && d.buildId
+      ? replicaPageRemarkKey(d.buildId, ocrState.pagesSrc, n) : "";
+    const attention = attentionKey ? (state.attn || {})[attentionKey] : "";
+    const attentionWhy = attnReason(attention);
     const staged = b ? ocrState.pageTags.get(k) : undefined;
     const running = b ? ocrState.pageRunning.get(k) : undefined;
     const title = titles.has(n);
@@ -18622,6 +19772,9 @@ function decorateOcrPages() {
     row.classList.toggle("pg-staged", !!staged);
     row.classList.toggle("pg-queued", !!running);
     row.classList.toggle("pg-sel", ocrState.pageSel.has(n));
+    row.classList.toggle("attention", !!attnValue(attention));
+    if (attentionWhy) row.dataset.tip = "Needs attention: " + attentionWhy;
+    else delete row.dataset.tip;
     // The chip HTML depends only on title/staged/running. Rebuild it only when
     // one of those changed, so the 1.5s job poller doesn't rewrite every row's
     // innerHTML every tick — on a long book only the handful of pages that just
@@ -18727,12 +19880,15 @@ function renderReplicaBooks() {
   el("rw-book-count").textContent = books.length || "";
   for (const b of books) {
     const li = document.createElement("li");
-    li.className = "ocr-book" + (b.id === rwState.book ? " active" : "");
+    li.className = "ocr-book" + (b.id === rwState.book ? " active" : "") +
+      (b.attention ? " attention" : "");
     li.dataset.bid = b.id;
+    const why = attnReason(b.attention);
+    if (why) li.dataset.tip = "Needs attention: " + why;
     li.tabIndex = 0;
     li.setAttribute("role", "button");
     if (b.id === rwState.book) li.setAttribute("aria-current", "true");
-    li.innerHTML = `<span class="bi-title">${esc(b.title) || "<em>(untitled)</em>"}</span>
+    li.innerHTML = `<span class="bi-title">${bookTitleHtml(b)}</span>
       <span class="bi-meta">${esc(b.authors || "")}${b.authors && b.year ? " &middot; " : ""}${esc(b.year || "")}</span>`;
     list.appendChild(li);
   }
@@ -18785,6 +19941,42 @@ async function selectReplicaBook(bid) {
   rwSyncBar();
 }
 
+async function selectReplicaSource(source) {
+  source = String(source || "primary");
+  const b = (state.builds || {})[rwState.book] || {};
+  const sources = ["primary", ...(b.pdf_sources || []).map((item) => String(item.id))];
+  const select = el("rw-src");
+  if (!sources.includes(source)) {
+    if (select) select.value = rwState.src;
+    status("REPLICA SOURCE IS NO LONGER AVAILABLE");
+    return false;
+  }
+  if (source === rwState.src) {
+    if (select) select.value = source;
+    return true;
+  }
+  if (rwState.dirty &&
+      !(await rwConfirmDiscard("Switching sources discards them."))) {
+    if (select) select.value = rwState.src;
+    return false;
+  }
+  const seq = ++rwState.seq; // kill any in-flight fetch of the old source
+  rwState.src = source;
+  if (select) select.value = source;
+  rwState.page = 0; rwState.items = []; rwState.sel = [];
+  rwState.dirty = false;
+  rwState.outliers = []; // scores belong to the old source's grid
+  el("rw-canvas").hidden = true;
+  el("rw-empty").hidden = false;
+  await renderReplicaPages(seq);
+  if (seq !== rwState.seq) return false;
+  // Templates are per source too: source A's names must not stamp source B.
+  await rwLoadTemplates(seq);
+  if (seq !== rwState.seq) return false;
+  rwSyncBar();
+  return true;
+}
+
 async function rwLoadTemplates(seq) {
   let names = [];
   try {
@@ -18808,6 +20000,27 @@ function rwPageChip(n) {
     return '<span class="rw-check">✓</span>';
   }
   return rwState.regionPages.includes(n) ? '<span class="rw-dot">●</span>' : "";
+}
+
+function syncReplicaPageAttention(button, page) {
+  if (!button) return;
+  const key = replicaPageRemarkKey(rwState.book, rwState.src, page);
+  const value = key ? (state.attn || {})[key] : "";
+  const marked = !!attnValue(value);
+  const why = attnReason(value);
+  button.classList.toggle("attention", marked);
+  button.setAttribute("aria-label", marked
+    ? `Page ${page}, needs attention${why ? `: ${why}` : ""}`
+    : `Page ${page}`);
+  if (why) button.dataset.tip = "Needs attention: " + why;
+  else delete button.dataset.tip;
+}
+
+function renderReplicaAttentionMarks() {
+  const box = el("rw-pages");
+  if (!box) return;
+  for (const button of box.querySelectorAll(".rw-pagebtn[data-page]"))
+    syncReplicaPageAttention(button, +button.dataset.page);
 }
 
 async function renderReplicaPages(seq) {
@@ -18843,6 +20056,7 @@ async function renderReplicaPages(seq) {
     d.className = "rw-pagebtn" + (n === rwState.page ? " active" : "");
     d.dataset.page = n;
     d.innerHTML = `${n}` + rwPageChip(n);
+    syncReplicaPageAttention(d, n);
     frag.appendChild(d);
   }
   box.appendChild(frag);
@@ -19939,26 +21153,8 @@ function initReplica() {
     const b = ev.target.closest(".rw-pagebtn");
     if (b) selectReplicaPage(+b.dataset.page);
   });
-  el("rw-src").addEventListener("change", async () => {
-    if (rwState.dirty &&
-        !(await rwConfirmDiscard("Switching sources discards them."))) {
-      el("rw-src").value = rwState.src;
-      return;
-    }
-    const seq = ++rwState.seq;   // kill any in-flight fetch of the old source
-    rwState.src = el("rw-src").value;
-    rwState.page = 0; rwState.items = []; rwState.sel = [];
-    rwState.dirty = false;
-    rwState.outliers = [];       // scores belong to the OLD source's grid
-    el("rw-canvas").hidden = true;
-    el("rw-empty").hidden = false;
-    await renderReplicaPages(seq);
-    if (seq !== rwState.seq) return;
-    // templates are per source too — source A's names must not stamp B
-    await rwLoadTemplates(seq);
-    if (seq !== rwState.seq) return;
-    rwSyncBar();
-  });
+  el("rw-src").addEventListener("change", () =>
+    selectReplicaSource(el("rw-src").value));
   el("rw-overlay").addEventListener("mousedown", rwMouseDown);
   document.addEventListener("mousemove", rwMouseMove);
   document.addEventListener("mouseup", rwMouseUp);
@@ -20100,10 +21296,6 @@ function initOcrTab() {
     }
     el("ocr-file-input").value = "";
   });
-  el("ocr-filter-verified").addEventListener("click", () => {
-    ocrState.verifiedOnly = !ocrState.verifiedOnly;
-    renderOcrBooks();
-  });
   el("ocr-books").addEventListener("click", (ev) => {
     const group = ev.target.closest("li.build-group");
     if (group) {
@@ -20226,12 +21418,6 @@ function initOcrTab() {
   el("ocr-service").value = state.settings.ocrService || "tesseract";
   el("ocr-service").addEventListener("change", () => {
     state.settings.ocrService = el("ocr-service").value;
-    saveSettings();
-    updateDefaultEngineSummary();
-  });
-  el("analysis-service").value = state.settings.textAnalysisService || "configured";
-  el("analysis-service").addEventListener("change", () => {
-    state.settings.textAnalysisService = el("analysis-service").value;
     saveSettings();
     updateDefaultEngineSummary();
   });
@@ -20370,34 +21556,9 @@ function buildThemeMenu() {
   }
 }
 
-// Settings > OCR engine: the same generated-picker pattern as themes. The value
-// lives in TWO <select>s (the OCR toolbar + the Settings dialog); keep both in
-// step, exactly as the dialog's onchange does.
-function setOcrService(id) {
-  state.settings.ocrService = id;
-  saveSettings();
-  const q = el("ocr-service"); if (q) q.value = id;
-  const s = el("set-ocr-service"); if (s) s.value = id;
-  updateDefaultEngineSummary();
-}
-function buildOcrMenu() {
-  const host = el("menu-ocr-service");
-  if (!host) return;
-  host.innerHTML = "";
-  for (const [id, label] of OCR_SERVICES) {
-    const cmd = "ocrsvc:" + id;
-    MENU_CMDS[cmd] = () => setOcrService(id);
-    const b = document.createElement("button");
-    b.type = "button";
-    b.className = "menu-item";
-    b.dataset.cmd = cmd;
-    b.innerHTML = `<span class="menu-check"></span>${esc(label)}`;
-    host.appendChild(b);
-  }
-}
-
 function updateMenuState() {
   const onChecked = state.settings.topTable === "checked";
+  const history = historyForTab();
   const dis = (cmd, v) => {
     const b = document.querySelector(`.menu-item[data-cmd="${cmd}"]`);
     if (b) b.disabled = !!v;
@@ -20419,13 +21580,10 @@ function updateMenuState() {
   check("opt-auto-ia", state.settings.autoIaDownload !== false);   // default-on
   check("opt-expand-sets", !!state.settings.expandSets);
   for (const [id] of allThemes()) check("theme:" + id, id === state.settings.theme);
-  const svc = state.settings.ocrService || "tesseract";
-  for (const [id] of OCR_SERVICES) check("ocrsvc:" + id, id === svc);
 }
 
 function initMenubar() {
   buildThemeMenu();
-  buildOcrMenu();
   const menus = [...document.querySelectorAll("#menubar .menu")];
   let openMenu = null;
   const closeAll = () => {
@@ -20802,11 +21960,11 @@ function init() {
   boot("settings", loadSettings);
   boot("theme", applyTheme);
   boot("ui scale", applyUiScale);
-  boot("font", applyFont);
   boot("exp sharpen", applyExpSharpen);
   boot("checked books", loadChecked);
   boot("icons", injectIcons);
   boot("confirm dialog", initConfirmDialog);
+  boot("smart scan marker", initSmartScanMarker);
   boot("lib open", initLibOpen);   // after the dialog it drives is wired
   boot("overlay modals", initOverlayModals);
   boot("tabs", initTabs);
@@ -20944,6 +22102,10 @@ function init() {
   el("proc-all").addEventListener("click", procSelectAll);
   el("proc-none").addEventListener("click", procSelectNone);
   el("proc-run").addEventListener("click", procRun);
+  el("proc-manual-pages").addEventListener("change", () => {
+    state.settings.smartScanManualPages = el("proc-manual-pages").checked;
+    saveSettings();
+  });
   el("proc-action").addEventListener("change", () => {
     const inp = el("proc-ai-instr");
     if (el("proc-action").value === "deepseek" && inp && !inp.value && state.settings.aiInstructions)
@@ -21197,7 +22359,7 @@ function init() {
       reset: () => { pane.style.width = ""; },
     });
   };
-  widthSplit("ocr-splitter", "ocrSide", "ocr-side", 200, 620);
+  widthSplit("ocr-splitter", "ocrSide", "ocr-side", 260, 620);
   widthSplit("an-facsimile-splitter", "anFacsimile", "an-facsimile-pane", 280, 900);
   widthSplit("form-splitter", "buildForm", "build-form", 280, 720);
   widthSplit("publish-splitter", "publishSide", "publish-side", 230, 620);
@@ -21283,15 +22445,6 @@ function init() {
   if (emptyNew) emptyNew.addEventListener("click", newBlankEntry);
   el("export-builds").addEventListener("click", exportBuilds);
   el("download-upload-list").addEventListener("click", downloadUploadList);
-  for (const t of document.querySelectorAll("#builds-tabs .pane-tab")) {
-    t.addEventListener("click", () => {
-      state.buildsTab = t.dataset.bstab;
-      if (currentBuild() && !buildsSorted().some((b) => b.id === state.buildSel)) {
-        state.buildSel = null;
-      }
-      renderUpload();
-    });
-  }
   el("build-upload").addEventListener("click", uploadBuild);
 
   // public catalogue tree + website-format publication preview
@@ -21308,6 +22461,7 @@ function init() {
   // wrapped: a bare listener would pass the click Event as `force` by accident.
   // Refresh SHOULD force a fresh fetch — that is what the user is asking for.
   el("publish-refresh").addEventListener("click", () => loadPublishCatalog(true));
+  el("publish-tree").addEventListener("contextmenu", onPublishContextMenu);
   el("publish-tree").addEventListener("click", (ev) => {
     const toggle = ev.target.closest("[data-publish-toggle]");
     if (toggle) {
@@ -21538,7 +22692,7 @@ function init() {
     // rebuild the pickers/menu before re-applying (else the menubar Theme
     // submenu keeps the pre-sync list); applyExpSharpen re-applies the
     // experimental UI-sharpen overlay against the adopted state.
-    if (adopted) { refreshThemePickers(); applyTheme(); applyFont(); applyExpSharpen(); }
+    if (adopted) { refreshThemePickers(); applyTheme(); applyExpSharpen(); }
     maybeWizard();       // first desktop launch: the guide covers sign-in too
     maybeAuthPrompt();   // needs the adopted settings: authPromptDismissed
     loadDownloads();

@@ -710,26 +710,49 @@ def api_reviews_create():
     label = str(payload.get("label") or "").strip()[:120]
     reason = str(payload.get("reason") or "").strip()[:500]
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    created = False
-    with _reviews_lock:
-        reviews = lib.load_json(REVIEWS_PATH, {})
-        # one OPEN review per item -- flagging again refreshes label/reason
-        r = next((x for x in reviews.values()
-                  if x.get("key") == key and x.get("status") == "open"), None)
-        if r:
-            r["label"] = label or r.get("label", "")
-            if reason:
-                r["reason"] = reason
-        else:
-            rid = lib.gen_id(set(reviews))
-            r = reviews[rid] = {
-                "id": rid, "key": key, "kind": kind, "ref": ref,
-                "label": label, "reason": reason, "status": "open",
-                "created_by": _actor(), "created_at": now,
-                "resolved_by": "", "resolved_at": "", "comments": [],
-            }
-            created = True
-        lib.save_json(REVIEWS_PATH, reviews)
+
+    def write_review():
+        created = False
+        with _reviews_lock:
+            reviews = lib.load_json(REVIEWS_PATH, {})
+            # one OPEN review per item -- flagging again refreshes label/reason
+            review = next((x for x in reviews.values()
+                           if x.get("key") == key and x.get("status") == "open"),
+                          None)
+            if review:
+                review["label"] = label or review.get("label", "")
+                if reason:
+                    review["reason"] = reason
+            else:
+                rid = lib.gen_id(set(reviews))
+                review = reviews[rid] = {
+                    "id": rid, "key": key, "kind": kind, "ref": ref,
+                    "label": label, "reason": reason, "status": "open",
+                    "created_by": _actor(), "created_at": now,
+                    "resolved_by": "", "resolved_at": "", "comments": [],
+                }
+                created = True
+            lib.save_json(REVIEWS_PATH, reviews)
+        return review, created
+
+    page_ref = _page_remark_ref_parts(ref) if kind == "key" else None
+    if page_ref:
+        # Serialize with page deletion, then reject a popover/sidebar created
+        # against an older page grid. Otherwise a late review could attach to
+        # the physical page that shifted into the saved number.
+        with _page_structure_lock:
+            build = lib.load_json(BUILDS_PATH, {}).get(page_ref[0])
+            revision = str(payload.get("page_revision") or "")
+            current_revision = str(build.get("updated_at") or "unversioned") \
+                if build else ""
+            if (not build or not revision or
+                    revision != current_revision or
+                    not _valid_src_key(build, page_ref[1])):
+                return jsonify({"ok": False,
+                                "error": "page changed; reopen it before review"}), 409
+            r, created = write_review()
+    else:
+        r, created = write_review()
     if created:
         activity("opened", "review", detail=label)
     return jsonify({"ok": True, "review": r})
@@ -1738,6 +1761,13 @@ def _resolve_local(raw: str) -> Path | None:
 _remote_pdf_lock = threading.Lock()              # guards the per-URL lock map
 _remote_pdf_url_locks: dict[str, threading.Lock] = {}
 _REMOTE_PDF_MAX_BYTES = 300 * 1024 * 1024   # size cap on a fetched remote PDF
+_REMOTE_PDF_FREE_RESERVE = 128 * 1024 * 1024
+
+
+def _remote_pdf_cache_path(url: str) -> Path:
+    """Stable on-disk cache name shared by the viewer and Smart Scan."""
+    name = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16] + ".pdf"
+    return lib.DATA_ROOT / "downloads" / "cache" / name
 
 
 def _ssrf_guard(url: str) -> None:
@@ -1780,6 +1810,51 @@ class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
 _pdf_opener = urllib.request.build_opener(_GuardedRedirectHandler())
 
 
+def _fetch_remote_pdf(url: str, dest: Path, max_bytes: int | None) -> None:
+    """Stream one remote PDF to ``dest`` and validate its signature.
+
+    ``max_bytes`` is used by the general viewer cache. Smart Scan passes
+    ``None`` because its working copy is short-lived; it still streams fixed
+    chunks rather than holding the response in memory, and preserves a disk
+    reserve so a bogus/unbounded response cannot fill the data drive.
+    """
+    import shutil
+    _ssrf_guard(url)
+    req = urllib.request.Request(url, headers={"User-Agent": whl_client.USER_AGENT})
+    try:
+        with _pdf_opener.open(req, timeout=90) as resp, open(dest, "wb") as fh:
+            try:
+                expected = int(resp.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                expected = 0
+            if max_bytes is not None and expected > max_bytes:
+                raise ValueError("remote PDF exceeds the size cap")
+            free = shutil.disk_usage(dest.parent).free
+            if expected and expected > max(0, free - _REMOTE_PDF_FREE_RESERVE):
+                raise ValueError("not enough disk space to stage remote PDF")
+            total = 0
+            next_disk_check = 16 * 1024 * 1024
+            while True:
+                chunk = resp.read(1 << 16)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if max_bytes is not None and total > max_bytes:
+                    raise ValueError("remote PDF exceeds the size cap")
+                if total >= next_disk_check:
+                    if shutil.disk_usage(dest.parent).free < _REMOTE_PDF_FREE_RESERVE:
+                        raise ValueError("not enough disk space to stage remote PDF")
+                    next_disk_check += 16 * 1024 * 1024
+                fh.write(chunk)
+        with open(dest, "rb") as fh:
+            if fh.read(5) != b"%PDF-":
+                raise ValueError("response is not a PDF")
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"fetch failed: {exc}") from exc
+
+
 def _remote_pdf_cache(url: str) -> Path:
     """Fetch a remote PDF once into downloads/cache/ and return the path.
     Browsers can't iframe third-party PDFs (X-Frame-Options), so remote
@@ -1794,11 +1869,9 @@ def _remote_pdf_cache(url: str) -> Path:
     of being cached forever."""
     if not url.lower().startswith(("http://", "https://")):
         raise ValueError("not an http(s) URL")
-    import hashlib
-    cache_dir = lib.DATA_ROOT / "downloads" / "cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    name = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16] + ".pdf"
-    p = cache_dir / name
+    p = _remote_pdf_cache_path(url)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    name = p.name
     with _remote_pdf_lock:
         url_lock = _remote_pdf_url_locks.setdefault(name, threading.Lock())
     with url_lock:
@@ -1807,22 +1880,7 @@ def _remote_pdf_cache(url: str) -> Path:
         _ssrf_guard(url)   # only on an actual fetch — cached hits skip the DNS lookup
         tmp = p.with_suffix(".fetch.tmp")
         try:
-            req = urllib.request.Request(
-                url, headers={"User-Agent": whl_client.USER_AGENT})
-            with _pdf_opener.open(req, timeout=90) as resp, \
-                    open(tmp, "wb") as fh:
-                total = 0
-                while True:
-                    chunk = resp.read(1 << 16)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > _REMOTE_PDF_MAX_BYTES:
-                        raise ValueError("remote PDF exceeds the size cap")
-                    fh.write(chunk)
-            with open(tmp, "rb") as fh:
-                if fh.read(5) != b"%PDF-":
-                    raise ValueError("response is not a PDF")
+            _fetch_remote_pdf(url, tmp, _REMOTE_PDF_MAX_BYTES)
             tmp.replace(p)
         except ValueError:
             tmp.unlink(missing_ok=True)
@@ -2398,6 +2456,7 @@ def api_build_folder_sync(build_id: str):
     notes = []
     src = None
     preview_ok = False  # THIS sync produced a fresh preview.pdf
+    page_remap = None
     pf = (b.get("pdf_file") or "").strip()
     if pf:
         sp = _resolve_local(pf)
@@ -2425,7 +2484,8 @@ def api_build_folder_sync(build_id: str):
             try:
                 blanks = _blank_pages(src)
                 if blanks:
-                    _apply_page_deletion(build_id, builds, src, blanks)
+                    deletion = _apply_page_deletion(build_id, builds, src, blanks)
+                    page_remap = deletion.get("page_remap")
                     b = builds[build_id]
                     # the folder metadata must reflect the remapped
                     # title_pages, not the pre-trim snapshot
@@ -2501,6 +2561,8 @@ def api_build_folder_sync(build_id: str):
                 notes.append(f"original cleanup failed: {exc}")
     out = _entry_folder_info(build_id)
     out.update({"ok": True, "notes": notes, "build": b})
+    if page_remap:
+        out["page_remap"] = page_remap
     return jsonify(out)
 
 
@@ -4051,6 +4113,30 @@ _doc_lock = threading.Lock()
 _DOC_CACHE_MAX = 4
 
 
+def _pdf_doc_cache_key(path: Path | str) -> str:
+    """Case-normalized absolute path used when evicting cached PDF handles."""
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def _evict_pdf_doc(path: Path | str) -> None:
+    """Close every cached PyMuPDF handle for ``path`` before it is replaced.
+
+    Windows refuses to unlink a PDF while MuPDF still has it open. Interactive
+    Smart Scan previews use this cache, so their disposable full-PDF source
+    must be evicted before cleanup rather than relying on Unix unlink semantics.
+    """
+    target = _pdf_doc_cache_key(path)
+    with _doc_lock:
+        for key in list(_doc_cache):
+            if _pdf_doc_cache_key(key[0]) != target:
+                continue
+            doc = _doc_cache.pop(key)
+            try:
+                doc.close()
+            except Exception:
+                pass
+
+
 @contextlib.contextmanager
 def _pdf_doc(path: Path):
     """Yield a shared, cached fitz.Document for `path`, opened at most once per
@@ -4569,7 +4655,7 @@ def api_pdf_pageimg():
 JOBS_PATH = lib.OUTPUT_DIR / "jobs.json"
 _JOBS_KEEP = 50                       # newest finished/interrupted entries kept
 _JOB_ACTIVE = ("queued", "running", "cancelling")
-_JOB_FIELDS = ("id", "kind", "build_id", "label", "state", "status", "done",
+_JOB_FIELDS = ("id", "kind", "build_id", "label", "volume", "state", "status", "done",
                "total", "errors", "error", "note", "created_at", "finished_at")
 _JOB_STATES = {"queued": "queued", "running": "running",
                "cancelling": "cancelling", "cancelled": "cancelled",
@@ -5563,6 +5649,146 @@ def _renumber_marked_text(text: str, removed: list[int]) -> str:
     return "\n\n".join(parts)
 
 
+def _page_remark_ref_parts(ref: str) -> tuple[str, str, int, str, str] | None:
+    """Decode a JS ``page:`` remark ref while retaining its exact encoding."""
+    raw = str(ref or "")
+    if not raw.startswith("page:"):
+        return None
+    parts = raw[5:].split("|")
+    if len(parts) != 3:
+        return None
+    if any(re.search(r"%(?![0-9A-Fa-f]{2})", part) for part in parts):
+        return None
+    try:
+        build_id = urllib.parse.unquote(parts[0], errors="strict")
+        source_id = urllib.parse.unquote(parts[1], errors="strict")
+        page_text = urllib.parse.unquote(parts[2], errors="strict")
+        page = int(page_text)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not build_id or not source_id or page < 1 or str(page) != page_text:
+        return None
+    return build_id, source_id, page, parts[0], parts[1]
+
+
+def _remapped_page_remark_ref(ref: str, build_id: str, source_id: str,
+                              removed: list[int]) -> tuple[bool, str | None]:
+    """Return (matched, shifted-ref); ``None`` means its page was deleted."""
+    parsed = _page_remark_ref_parts(ref)
+    if not parsed or parsed[:2] != (str(build_id), str(source_id or "primary")):
+        return False, ref
+    _, _, page, encoded_build, encoded_source = parsed
+    removed_set = set(removed)
+    if page in removed_set:
+        return True, None
+    shifted = page - sum(1 for old in removed if old < page)
+    return True, f"page:{encoded_build}|{encoded_source}|{shifted}"
+
+
+_PAGE_REMARK_LABEL_RE = re.compile(r"(\s+\u00b7\s*page\s+)(\d+)$", re.IGNORECASE)
+
+
+def _remapped_page_remark_value(value, old_page: int, new_page: int):
+    """Keep a generated fallback label aligned with its remapped page key."""
+    if not isinstance(value, dict) or not isinstance(value.get("label"), str):
+        return value
+    label = value["label"]
+    match = _PAGE_REMARK_LABEL_RE.search(label)
+    if not match or int(match.group(2)) != old_page:
+        return value
+    updated = dict(value)
+    updated["label"] = label[:match.start(2)] + str(new_page)
+    return updated
+
+
+def _remap_page_attention_references(build_id: str, source_id: str,
+                                     removed: list[int]) -> None:
+    """Keep personal page marks and shared threads bound to physical pages.
+
+    Deleted personal marks disappear with their target. Deleted shared threads
+    become unique, unroutable tombstones so their comments remain reachable
+    without ever attaching to the page that shifted into the old number.
+    """
+    removed = sorted({int(page) for page in removed if int(page) > 0})
+    if not removed:
+        return
+
+    try:
+        with _client_state_lock:
+            client = lib.load_json(lib.CLIENT_STATE_PATH, {})
+            attention = client.get("attention")
+            settings = client.get("settings")
+            meta = settings.get("remarksMeta") if isinstance(settings, dict) else None
+            dirty = False
+
+            def remap_map(values: dict | None) -> bool:
+                if not isinstance(values, dict):
+                    return False
+                moves: list[tuple[str, str | None, object]] = []
+                for key, value in list(values.items()):
+                    old_parts = _page_remark_ref_parts(key)
+                    matched, new_key = _remapped_page_remark_ref(
+                        key, build_id, source_id, removed)
+                    if matched and new_key != key:
+                        if old_parts and new_key:
+                            new_parts = _page_remark_ref_parts(new_key)
+                            if new_parts:
+                                value = _remapped_page_remark_value(
+                                    value, old_parts[2], new_parts[2])
+                        moves.append((key, new_key, value))
+                for old_key, _, _ in moves:
+                    values.pop(old_key, None)
+                for _, new_key, value in moves:
+                    if new_key:
+                        values[new_key] = value
+                return bool(moves)
+
+            dirty = remap_map(attention) or dirty
+            dirty = remap_map(meta) or dirty
+            if dirty:
+                client["updated_at"] = datetime.now(timezone.utc).isoformat(
+                    timespec="seconds")
+                lib.save_json(lib.CLIENT_STATE_PATH, client)
+    except Exception as exc:
+        log.warning("could not remap page attention state: %s", exc)
+
+    try:
+        with _reviews_lock:
+            reviews = lib.load_json(REVIEWS_PATH, {})
+            dirty = False
+            for review in reviews.values():
+                if not isinstance(review, dict) or review.get("kind") != "key":
+                    continue
+                old_ref = str(review.get("ref") or "")
+                parsed = _page_remark_ref_parts(old_ref)
+                matched, new_ref = _remapped_page_remark_ref(
+                    old_ref, build_id, source_id, removed)
+                if not matched or new_ref == old_ref:
+                    continue
+                old_page = parsed[2] if parsed else 0
+                if new_ref is None:
+                    # Include the immutable review id so deleting page N again
+                    # later cannot merge two unrelated historical threads.
+                    new_ref = "page-deleted:" + old_ref[5:] + "|" + \
+                        urllib.parse.quote(str(review.get("id") or uuid.uuid4()), safe="")
+                    if not str(review.get("label") or "").endswith(" · removed"):
+                        review["label"] = str(review.get("label") or "") + " · removed"
+                else:
+                    new_page = _page_remark_ref_parts(new_ref)[2]
+                    label = str(review.get("label") or "")
+                    review["label"] = re.sub(
+                        r"(\s·\s[Pp]age\s+)" + str(old_page) +
+                        r"(?=\s·\sSource\b|$)",
+                        lambda match: match.group(1) + str(new_page), label)
+                review["ref"] = new_ref
+                review["key"] = "key:" + new_ref
+                dirty = True
+            if dirty:
+                lib.save_json(REVIEWS_PATH, reviews)
+    except Exception as exc:
+        log.warning("could not remap page review references: %s", exc)
+
+
 @app.route("/api/pdf/pages/delete", methods=["POST"])
 def api_pdf_pages_delete():
     """Delete pages from a build's PDF — the real file, not a preview.
@@ -5655,6 +5881,11 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
     # numbering and must not shift with the primary's deletions.
     b = builds[build_id]
     src_key = _src_key_for_path(b, pdf)
+    # ``pages`` historically reports the caller's request (including a mixed
+    # out-of-range number). Structural references must use only pages that
+    # actually existed, or a stale high page mark could shift spuriously.
+    actual_pages = [page for page in pages if page <= total]
+    _remap_page_attention_references(build_id, src_key, actual_pages)
     srcmap = _ocr_sources(build_id)
     ocr_dir = _entry_dir(build_id) / "ocr"
     renumbered = []
@@ -5708,14 +5939,18 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
             t = int(m.group(1))
             changed["thumbnail_source"] = "" if t in set(pages) else \
                 f"page:{t - sum(1 for r in pages if r < t)}"
-    if changed:
-        # the caller's snapshot predates the slow PDF rewrite above — apply
-        # the remap to a fresh read, and keep the returned record in step
-        b.update(changed)
-        b["updated_at"] = _builds_apply(build_id, changed)
+    # A page-grid change is itself a build revision even when no title-page or
+    # thumbnail field moved. Page review creation uses this token to reject a
+    # stale popover that finishes after the deletion remap.
+    b.update(changed)
+    if changed or build_id in lib.load_json(BUILDS_PATH, {}):
+        revision = _builds_apply(build_id, changed)
+        if revision:
+            b["updated_at"] = revision
     return {"deleted": pages, "pages": len(keep),
             "renumbered": renumbered,
             "backup": pdf.with_suffix(".bak.pdf").name,
+            "page_remap": {"source": src_key, "deleted": actual_pages},
             "build": b}
 
 
@@ -6502,9 +6737,9 @@ def api_ia_downloads():
 # /api/secrets (Host-guarded); every server-side credential read goes through
 # _client_settings, which overlays these on top of the synced preferences. ------
 _SECRET_KEYS = frozenset({
-    "aiKey", "embedKey", "mistralKey", "ocrClaudeKey", "ocrAzureKey",
+    "aiKey", "embedKey", "imgGenKey", "mistralKey", "ocrClaudeKey",
     "ocrAwsKey", "ocrAwsSecret", "supabaseKey", "supabaseAnonKey", "r2KeyId",
-    "r2Secret", "gsKeyFile", "imgGenKey",
+    "r2Secret", "gsKeyFile",
 })
 _SECRETS_PATH = lib.DATA_ROOT / "output" / "secrets.json"
 _MISTRAL_PENDING = "_mistralCloudPending"
@@ -7576,6 +7811,8 @@ def _ai_cfg() -> dict:
             "model": str(s.get("aiModel") or "").strip() or _AI_DEFAULT_MODEL,
             "key": str(s.get("aiKey") or "").strip(),
             "instructions": str(s.get("aiInstructions") or "").strip(),
+            "smart_scan_instructions":
+                str(s.get("smartScanInstructions") or "").strip(),
             # user overrides (Settings > AI): blank temperature keeps each call's own default
             "temperature": s.get("aiTemperature"),
             "timeout": s.get("aiTimeout")}
@@ -7703,10 +7940,14 @@ def api_process_deepseek():
 # smart-check UI this engine originally shipped with is retired; Process mode
 # is the one front-end.)
 _SS_JOBS_KEEP = 20
+_SS_TEMP_DIR = lib.DATA_ROOT / "downloads" / "smartscan" / "temp"
+_SS_SELECTED_DIR = lib.DATA_ROOT / "downloads" / "smartscan" / "selected"
+_SS_TEMP_MAX_AGE = 24 * 60 * 60
 
 _ss_jobs: dict = {}
 _ss_jobs_lock = threading.Lock()
 _ss_start_lock = threading.Lock()
+_ss_pages_lock = threading.Lock()
 
 
 def _ss_target_kind(target) -> str:
@@ -7714,18 +7955,220 @@ def _ss_target_kind(target) -> str:
     return kind if kind in _SC_FIELD_MAPS else ""
 
 
-def _ss_job_new(target: str, label: str) -> dict:
+def _ss_local_pdf(raw) -> Path | None:
+    p = _resolve_local(str(raw or "").strip())
+    return (p if p is not None and p.suffix.lower() == ".pdf" and p.is_file()
+            else None)
+
+
+def _ss_target_local_pdf(target: str) -> Path | None:
+    """Best local PDF already attached to a Smart Scan target, if any.
+
+    The client normally sends this path, but resolving it again server-side
+    prevents a stale UI row from downloading a source that is already local.
+    """
+    kind, _, ident = str(target or "").partition(":")
+    candidates = []
+    if kind == "build":
+        rec = (lib.load_json(BUILDS_PATH, {}) or {}).get(ident) or {}
+        candidates.extend((rec.get("pdf_file"), rec.get("local_pdf")))
+    elif kind == "manual":
+        rec = (lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}).get(ident) or {}
+        candidates.extend((rec.get("local_pdf"), rec.get("pdf_file")))
+    elif kind == "checked":
+        checked = (lib.load_json(lib.CLIENT_STATE_PATH, {}) or {}).get("checked") or []
+        for pair in checked if isinstance(checked, list) else []:
+            if (isinstance(pair, (list, tuple)) and len(pair) == 2
+                    and str(pair[0]) == ident and isinstance(pair[1], dict)):
+                rec = pair[1]
+                book = rec.get("book") if isinstance(rec.get("book"), dict) else {}
+                candidates.extend((rec.get("local_pdf"), book.get("local_pdf"),
+                                   book.get("localPdf"), book.get("pdf_file")))
+                break
+    for raw in candidates:
+        p = _ss_local_pdf(raw)
+        if p is not None:
+            return p
+    return None
+
+
+def _ss_existing_remote_pdf(url: str) -> tuple[Path | None, str]:
+    """Find a reusable local copy for a remote URL without network access."""
+    cached = _remote_pdf_cache_path(url)
+    if cached.is_file():
+        return cached, "cache"
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    parts = [urllib.parse.unquote(p) for p in parsed.path.split("/") if p]
+    if (host == "archive.org" or host.endswith(".archive.org")) and len(parts) >= 2:
+        try:
+            marker = parts.index("download")
+            identifier = parts[marker + 1]
+        except (ValueError, IndexError):
+            identifier = ""
+        if identifier:
+            catalog = _read_ia_catalog()
+            saved = catalog.get(identifier) if isinstance(catalog, dict) else None
+            if isinstance(saved, dict):
+                p = _ss_local_pdf(saved.get("saved_as"))
+                if p is not None:
+                    return p, "internet-archive"
+            p = _ia_pdf_path(identifier)
+            if p.is_file():
+                return p, "internet-archive"
+    return None, ""
+
+
+def _ss_is_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _ss_is_temp_pdf(path: Path) -> bool:
+    return _ss_is_under(path, _SS_TEMP_DIR)
+
+
+def _ss_is_selected_pdf(path: Path) -> bool:
+    return _ss_is_under(path, _SS_SELECTED_DIR)
+
+
+def _ss_unlink_temp_pdf(path: Path | str) -> None:
+    """Delete only a Smart Scan temp PDF, closing any preview handle first."""
+    pdf = Path(path)
+    if not _ss_is_temp_pdf(pdf):
+        return
+    _evict_pdf_doc(pdf)
+    pdf.unlink(missing_ok=True)
+
+
+def _ss_cleanup_stale_temp() -> None:
+    """Best-effort cleanup for a manual-selection dialog abandoned mid-flow."""
+    if not _SS_TEMP_DIR.is_dir():
+        return
+    cutoff = time.time() - _SS_TEMP_MAX_AGE
+    for p in _SS_TEMP_DIR.glob("*.pdf"):
+        try:
+            if p.stat().st_mtime < cutoff:
+                _ss_unlink_temp_pdf(p)
+        except OSError:
+            pass
+
+
+def _ss_download_remote_temp(url: str) -> Path:
+    """Stream an uncapped Smart Scan source to a disposable local file."""
+    if not url.lower().startswith(("http://", "https://")):
+        raise ValueError("not an http(s) URL")
+    _SS_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    _ss_cleanup_stale_temp()
+    out = _SS_TEMP_DIR / f"{uuid.uuid4().hex}.pdf"
+    try:
+        _fetch_remote_pdf(url, out, None)
+        return out
+    except Exception:
+        _ss_unlink_temp_pdf(out)
+        raise
+
+
+def _ss_resolve_pdf(spec: dict) -> tuple[Path, bool, str]:
+    """Resolve local-first, returning (path, caller_must_delete, source)."""
+    explicit = _ss_local_pdf(spec.get("pdf_path"))
+    if explicit is not None:
+        return explicit, _ss_is_temp_pdf(explicit), (
+            "prepared" if _ss_is_temp_pdf(explicit) else "local")
+    attached = _ss_target_local_pdf(str(spec.get("target") or ""))
+    if attached is not None:
+        return attached, False, "local"
+    url = str(spec.get("url") or "").strip()
+    if not url:
+        raise ValueError("pdf or url required")
+    existing, source = _ss_existing_remote_pdf(url)
+    if existing is not None:
+        return existing, False, source
+    return _ss_download_remote_temp(url), True, "download"
+
+
+def _ss_pdf_page_count(pdf: Path) -> int:
+    import fitz
+    doc = fitz.open(str(pdf))
+    try:
+        return int(doc.page_count)
+    finally:
+        doc.close()
+
+
+def _ss_api_path(pdf: Path) -> str:
+    try:
+        return pdf.resolve().relative_to(lib.DATA_ROOT.resolve()).as_posix()
+    except (OSError, ValueError):
+        return str(pdf.resolve())
+
+
+def _ss_selected_pdf(source: Path, pages: list[int]) -> Path:
+    """Retain a compact PDF containing exactly the selected 1-based pages."""
+    _SS_SELECTED_DIR.mkdir(parents=True, exist_ok=True)
+    stat = source.stat()
+    key = hashlib.sha1(
+        f"{source.resolve()}|{stat.st_mtime_ns}|{stat.st_size}|{pages}".encode("utf-8")
+    ).hexdigest()[:20]
+    out = _SS_SELECTED_DIR / f"{key}.pdf"
+    with _ss_pages_lock:
+        if out.is_file():
+            return out
+        from pypdf import PdfReader, PdfWriter
+        reader = PdfReader(str(source))
+        writer = PdfWriter()
+        for n in pages:
+            page = reader.pages[n - 1]
+            try:
+                page.compress_content_streams()
+            except Exception:
+                pass
+            writer.add_page(page)
+        tmp = out.with_suffix(f".{uuid.uuid4().hex}.tmp")
+        try:
+            with open(tmp, "wb") as fh:
+                writer.write(fh)
+            tmp.replace(out)
+        finally:
+            tmp.unlink(missing_ok=True)
+    return out
+
+
+def _ss_request_spec(payload: dict) -> tuple[dict | None, tuple[dict, int] | None]:
+    target = str(payload.get("target") or "").strip()
+    if not _ss_target_kind(target) or ":" not in target:
+        return None, ({"ok": False, "error": "bad target"}, 400)
+    raw_pdf = str(payload.get("pdf") or "").strip()
+    url = str(payload.get("url") or "").strip()
+    if url and not url.lower().startswith(("http://", "https://")):
+        return None, ({"ok": False, "error": "not an http(s) URL"}, 400)
+    pdf = _ss_local_pdf(raw_pdf) if raw_pdf else None
+    if raw_pdf and pdf is None and not url:
+        return None, ({"ok": False, "error": "PDF not found"}, 404)
+    if pdf is None and not url and _ss_target_local_pdf(target) is None:
+        return None, ({"ok": False, "error": "pdf or url required"}, 400)
+    return {"target": target,
+            "label": str(payload.get("label") or "").strip()[:120],
+            "volume": str(payload.get("volume") or "").strip()[:40],
+            "pdf_path": pdf, "url": url,
+            "instructions": str(payload.get("instructions") or "").strip()[:4000]}, None
+
+
+def _ss_job_new(target: str, label: str, volume: str = "") -> dict:
     job = {"id": lib.gen_id(set(_ss_jobs) | set(_jobs)), "target": target,
            "kind": "smartscan", "done": 0, "total": 0, "errors": 0,
-           "status": "running", "error": "", "note": ""}
+           "status": "running", "error": "", "note": "", "volume": volume}
     with _ss_jobs_lock:
         _ss_jobs[job["id"]] = job
     _job_track(job, "smartscan", label=label)
     return job
 
 
-def _ss_job_start(target: str, label: str, run) -> dict:
-    job = _ss_job_new(target, label)
+def _ss_job_start(target: str, label: str, volume: str, run) -> dict:
+    job = _ss_job_new(target, label, volume)
     threading.Thread(target=run, args=(job,), daemon=True).start()
     return job
 
@@ -7745,6 +8188,8 @@ def _ss_finish(job: dict, error: str = "") -> None:
 def _ss_run(job: dict, spec: dict) -> None:
     target = spec["target"]
     kind = _ss_target_kind(target)
+    pdf = None
+    owned_pdf = False
     try:
         mkey = str(_client_settings().get("mistralKey") or "").strip()
         if not mkey:
@@ -7752,16 +8197,21 @@ def _ss_run(job: dict, spec: dict) -> None:
         pdf = spec.get("pdf_path")
         if pdf is None:
             with _ss_jobs_lock:
-                job["note"] = "downloading PDF"
+                job["note"] = "resolving PDF"
             _job_checkpoint(job, force=True)
-            pdf = _remote_pdf_cache(spec["url"])   # ValueError on SSRF / size / non-PDF
+        pdf, owned_pdf, _source = _ss_resolve_pdf(spec)
+        if spec.get("pdf_path") is None:
             with _ss_jobs_lock:
                 job["note"] = ""
         pdf = Path(pdf)
-        candidates = _sc_scan_pages(pdf)
+        selected_pdf = _ss_is_selected_pdf(pdf)
+        candidates = (list(range(1, _ss_pdf_page_count(pdf) + 1))
+                      if selected_pdf else _sc_scan_pages(pdf))
         if not candidates:
             raise RuntimeError(f"no readable pages in the first {_SC_SCAN_CAP} pages")
-        planned = candidates[:_SC_OCR_CAP]
+        # A user explicitly chose every page in a retained selection PDF, so
+        # honor all of them. Automatic scans keep the cost-bounded OCR cap.
+        planned = candidates if selected_pdf else candidates[:_SC_OCR_CAP]
         with _ss_jobs_lock:
             job["total"] = len(planned) + 1        # +1 = the extraction step
         texts: dict[int, str] = {}
@@ -7786,16 +8236,17 @@ def _ss_run(job: dict, spec: dict) -> None:
             # both signals in hand: stop. Also cap the copyright hunt for books
             # that never print "copyright" (pre-1900 / non-English) so we don't
             # burn all _SC_OCR_CAP pages chasing a signal that never fires.
-            if titleish and copyrightish and len(texts) >= 2:
-                break
-            if titleish and len(texts) >= 4:
-                break
+            if not selected_pdf:
+                if titleish and copyrightish and len(texts) >= 2:
+                    break
+                if titleish and len(texts) >= 4:
+                    break
         ocr_text = "\n\n".join(f"--- page {n} ---\n{texts[n]}" for n in sorted(texts))
         if not ocr_text.strip():
             raise RuntimeError("OCR produced no text from the front matter")
         if _an_cancel_check(job, "cancelled — nothing was written"):
             return
-        got, model = _sc_extract(ocr_text)
+        got, model = _sc_extract(ocr_text, spec.get("instructions") or None)
         got = got if isinstance(got, dict) else {}
         got.pop("extra", None)
         mapped = _sc_map_fields(kind, got)
@@ -7814,38 +8265,113 @@ def _ss_run(job: dict, spec: dict) -> None:
     except Exception as exc:
         log.error("smart scan failed for %s", target, exc_info=exc)
         _ss_finish(job, f"{type(exc).__name__}: {exc}")
+    finally:
+        if owned_pdf and pdf is not None:
+            try:
+                _ss_unlink_temp_pdf(pdf)
+            except OSError:
+                pass
+
+
+@app.route("/api/process/smartscan/prepare", methods=["POST"])
+def api_process_smartscan_prepare():
+    """Resolve one source for manual page marking and report its page count.
+
+    Body: ``{target, pdf?, url?, label?}``. Local/attached/cached copies win;
+    an uncached remote source is streamed to a disposable local PDF. The
+    returned ``pdf`` is directly usable by /api/pdf/pageimg and by the normal
+    Smart Scan run endpoint.
+    """
+    spec, error = _ss_request_spec(request.get_json(silent=True) or {})
+    if error:
+        body, status = error
+        return jsonify(body), status
+    pdf = None
+    owned = False
+    try:
+        pdf, owned, source = _ss_resolve_pdf(spec)
+        pages = _ss_pdf_page_count(pdf)
+        if pages < 1:
+            raise ValueError("PDF has no pages")
+        return jsonify({"ok": True, "pdf": _ss_api_path(pdf), "pages": pages,
+                        "temporary": owned, "reused": not owned,
+                        "source": source})
+    except Exception as exc:
+        if owned and pdf is not None:
+            _ss_unlink_temp_pdf(pdf)
+        return jsonify({"ok": False,
+                        "error": f"{type(exc).__name__}: {exc}"}), 400
+
+
+@app.route("/api/process/smartscan/select-pages", methods=["POST"])
+def api_process_smartscan_select_pages():
+    """Save exactly the chosen 1-based pages as a retained local Smart Scan PDF.
+
+    Body: ``{target, pdf?, url?, pages:[...]}``; ``pdf`` is normally the path
+    returned by /prepare. The response path can be passed unchanged as ``pdf``
+    to /run. A prepared full remote source is deleted after a successful save.
+    """
+    payload = request.get_json(silent=True) or {}
+    raw_pages = payload.get("pages")
+    if not isinstance(raw_pages, list):
+        return jsonify({"ok": False, "error": "pages must be a list"}), 400
+    try:
+        pages = sorted({int(n) for n in raw_pages})
+    except (TypeError, ValueError):
+        pages = []
+    if not pages or pages[0] < 1:
+        return jsonify({"ok": False, "error": "select at least one page"}), 400
+    spec, error = _ss_request_spec(payload)
+    if error:
+        body, status = error
+        return jsonify(body), status
+    pdf = None
+    owned = False
+    source = ""
+    success = False
+    try:
+        pdf, owned, source = _ss_resolve_pdf(spec)
+        total = _ss_pdf_page_count(pdf)
+        if pages[-1] > total:
+            return jsonify({"ok": False,
+                            "error": f"page {pages[-1]} exceeds PDF page count {total}"}), 400
+        out = _ss_selected_pdf(pdf, pages)
+        success = True
+        return jsonify({"ok": True, "pdf": _ss_api_path(out),
+                        "pages": pages, "page_count": len(pages),
+                        "source_pages": total})
+    except Exception as exc:
+        return jsonify({"ok": False,
+                        "error": f"{type(exc).__name__}: {exc}"}), 400
+    finally:
+        # A prepared path stays available after validation errors so the user
+        # can fix the selection. A direct remote attempt has no caller to reuse
+        # it, and every successful subset makes the full temp copy unnecessary.
+        if owned and pdf is not None and (success or source == "download"):
+            try:
+                _ss_unlink_temp_pdf(pdf)
+            except OSError:
+                pass
 
 
 @app.route("/api/process/smartscan/run", methods=["POST"])
 def api_process_smartscan_run():
     """Start a Smart Scan for one record. Body: {target, pdf?|url?, label?}.
     Returns the job to poll; a duplicate while one is running joins it."""
-    p = request.get_json(silent=True) or {}
-    target = str(p.get("target") or "").strip()
-    kind = _ss_target_kind(target)
-    if not kind or ":" not in target:
-        return jsonify({"ok": False, "error": "bad target"}), 400
-    label = str(p.get("label") or "").strip()[:120]
-    raw_pdf = str(p.get("pdf") or "").strip()
-    url = str(p.get("url") or "").strip()
-    spec = {"target": target, "label": label, "pdf_path": None, "url": url}
-    if raw_pdf:
-        lp = _resolve_local(raw_pdf)
-        if lp is None or lp.suffix.lower() != ".pdf" or not lp.is_file():
-            return jsonify({"ok": False, "error": "PDF not found"}), 404
-        spec["pdf_path"] = lp
-    elif url:
-        if not url.lower().startswith(("http://", "https://")):
-            return jsonify({"ok": False, "error": "not an http(s) URL"}), 400
-    else:
-        return jsonify({"ok": False, "error": "pdf or url required"}), 400
+    spec, error = _ss_request_spec(request.get_json(silent=True) or {})
+    if error:
+        body, status = error
+        return jsonify(body), status
+    target = spec["target"]
+    label = spec["label"]
     with _ss_start_lock:
         with _jobs_lock:
             for j in _jobs.values():
                 if (j.get("kind") == "smartscan" and j.get("target") == target
                         and j.get("state") in _JOB_ACTIVE):
                     return jsonify({"ok": True, "already": True, "job": _job_public(j)})
-        job = _ss_job_start(target, label, lambda jb: _ss_run(jb, spec))
+        job = _ss_job_start(target, label, spec["volume"],
+                            lambda jb: _ss_run(jb, spec))
     return jsonify({"ok": True, "job": dict(job)})
 
 
@@ -8937,14 +9463,20 @@ def _sc_ocr_page(pdf: Path, page: int, key: str) -> str:
     return "\n\n".join(p.get("markdown", "") for p in pages).strip()
 
 
-def _sc_extract(ocr_text: str) -> tuple[dict, str]:
+def _sc_extract(ocr_text: str, instructions: str | None = None) -> tuple[dict, str]:
     """OCR text -> normalized bibliography + the model that produced it.
     DeepSeek (Settings > AI) when a key is set — mirroring the phone app's
     'DeepSeek by default' — else Mistral's own extraction."""
     cfg = _ai_cfg()
     if cfg["key"]:
+        prompt = _SC_PROMPT
+        custom = str(instructions if instructions is not None else
+                     cfg.get("smart_scan_instructions") or "").strip()
+        if custom:
+            prompt += ("\n\nAdditional Smart Scan instructions from the user:\n"
+                       + custom[:4000])
         obj = _ai_json(cfg, [{"role": "user",
-                              "content": _SC_PROMPT + ocr_text[:12000]}],
+                              "content": prompt + "\n\n" + ocr_text[:12000]}],
                        temperature=0.0)
         return capture.normalize_bibliography(obj), cfg["model"]
     mkey = str(_client_settings().get("mistralKey") or "").strip()
@@ -9155,6 +9687,34 @@ def _public_preview_urls(cfg: dict, row: dict) -> dict:
     return item
 
 
+def _catalogue_workbench_links(rows: list[dict], builds: dict) -> list[dict]:
+    """Attach the local Workbench identity without changing public metadata.
+
+    ``volumes.slug`` and a build's ``published_slug`` are the current identity
+    spine.  A slug must resolve to exactly one local build: silently choosing
+    between duplicates could open the wrong editable record.
+    """
+    by_slug: dict[str, list[str]] = {}
+    for bid, build in builds.items():
+        if not isinstance(build, dict):
+            continue
+        slug = str(build.get("published_slug") or "").strip()
+        if slug:
+            by_slug.setdefault(slug, []).append(str(bid))
+
+    linked = []
+    for source in rows:
+        row = dict(source)
+        # Never trust or preserve a similarly named public column: this value
+        # describes this checkout and comes only from its local build store.
+        row.pop("local_build_id", None)
+        matches = by_slug.get(str(row.get("slug") or "").strip(), [])
+        if len(matches) == 1:
+            row["local_build_id"] = matches[0]
+        linked.append(row)
+    return linked
+
+
 @app.route("/api/publish/catalog")
 def api_publish_catalog():
     """The website catalogue, or local uploads when it cannot be reached.
@@ -9182,9 +9742,13 @@ def api_publish_catalog():
         warning = "Online catalogue unavailable; showing local uploads."
 
     # A successful public read is authoritative, including an empty result.
-    # Mixing in local builds here could preview stale edits or an upload that
-    # has since been unpublished. Local rows are strictly an offline fallback.
-    entries = cloud_rows if cloud_ok else _local_publish_rows()
+    # Never fill its catalogue metadata from local edits or add a local-only
+    # volume that may since have been unpublished.  The one local sidecar is
+    # local_build_id: a navigation link back through slug identity, not public
+    # catalogue data. Local rows remain strictly an offline fallback.
+    builds = lib.load_json(BUILDS_PATH, {})
+    entries = (_catalogue_workbench_links(cloud_rows, builds) if cloud_ok
+               else _local_publish_rows(builds))
     entries = [row for row in entries if str(row.get("slug") or "").strip()]
     entries.sort(key=lambda r: (str(r.get("title") or "").casefold(),
                                 str(r.get("volume") or ""),

@@ -45,7 +45,7 @@
           <button class="menu-item" data-cmd="table-whl" type="button"><span class="menu-check"></span>WHL table</button>
           <div class="menu-sep"></div>
           <!-- Theme picker as a hover submenu; #menu-themes is filled from THEMES
-               by buildThemeMenu(). Appearance is a View concern. -->
+               by buildThemeMenu(). Theme selection is a View concern. -->
           <div class="menu-item menu-sub">Theme<span class="menu-caret">&#9656;</span>
             <div class="menu-drop menu-sub-drop"><div id="menu-themes"></div></div>
           </div>
@@ -145,13 +145,6 @@
             <div class="home-h">Contributors</div>
             <div id="home-users"></div>
           </div>
-        </div>
-        <div class="home-card home-reviews-card">
-          <div class="home-h home-reviews-h">
-            <span>Awaiting review</span>
-            <label class="home-rv-resolved"><input id="home-review-resolved" type="checkbox" /> Show resolved</label>
-          </div>
-          <div id="home-reviews" class="review-host"></div>
         </div>
       </div>
     </section>
@@ -522,6 +515,10 @@
               <input id="proc-ai-instr" class="cad-input tiny proc-ai-instr" hidden
                      placeholder="DeepSeek instructions…"
                      data-tip="What DeepSeek should do to each selected record (blank uses your Settings › AI instructions)" />
+              <label id="proc-manual-pages-wrap" class="proc-manual-pages" hidden
+                     data-tip="Review each PDF and save only the title pages before Smart Scan">
+                <input id="proc-manual-pages" type="checkbox" /> Mark pages
+              </label>
               <button id="proc-run" class="cad-btn tiny" type="button"
                       data-tip="Run the action on the selected rows">Run</button>
             </span>
@@ -623,15 +620,9 @@
       <div id="wb-split">
         <div id="ocr-side">
           <div class="pane-bar" id="builds-tabs">
-            <button class="pane-tab active" data-bstab="pending" type="button"
-                    data-tip="Awaiting publication">Pending</button>
-            <button class="pane-tab" data-bstab="uploaded" type="button"
-                    data-tip="Already published to WHL">Uploaded</button>
+            <span class="tool-label">Entries</span>
             <span class="tool-count" id="upload-count"></span>
             <span class="bar-spacer"></span>
-            <button id="ocr-filter-verified" class="cad-btn tiny icon-btn toggle" type="button"
-                    data-icon="check" aria-label="Show verified books only" aria-pressed="false"
-                    data-tip="Show verified books only"></button>
             <button id="ocr-side-toggle" class="cad-btn tiny" type="button"
                     aria-label="Collapse the entries and artifacts sidebar"
                     aria-controls="ocr-side" aria-expanded="true"
@@ -769,7 +760,7 @@
                 <div class="desc-label-row">
                   <label class="tool-label">Description</label>
                   <button id="b-ai" class="cad-btn tiny icon-btn" type="button"
-                          data-icon="sparkle" data-tip="Generate a summary from the OCR text"></button>
+                          data-icon="sparkle" data-tip="Generate from OCR with DeepSeek by default, or your configured AI provider"></button>
                   <button id="b-desc-load" class="cad-btn tiny icon-btn" type="button"
                           data-icon="fileup" data-tip="Load from a text file"></button>
                   <input id="b-desc-file" type="file" accept=".txt,.md,.text" hidden />
@@ -1049,7 +1040,7 @@
         <div id="wb-jobs-body" hidden>
           <div class="pane-bar">
             <button id="engine-defaults-open" class="cad-btn tiny" type="button"
-                    data-tip="Choose the default OCR and text-analysis engines">Default Engine:</button>
+                    data-tip="Choose the default OCR engine">Default OCR:</button>
             <span id="engine-defaults-summary" class="tool-label"></span>
             <button id="ocr-queue-add" class="cad-btn tiny icon-btn" type="button"
                     data-icon="plus" data-tip="Stage every page with the default OCR engine (nothing runs until Submit)"></button>
@@ -1438,7 +1429,7 @@
         <div id="publish-splitter"></div>
         <div id="publish-main">
           <div id="publish-preview-bar" class="pane-bar">
-            <span id="publish-preview-label" class="tool-label">World Herb Library preview</span>
+            <span id="publish-preview-label" class="tool-label">Archive Browser preview</span>
             <span class="bar-spacer"></span>
             <span id="publish-source" class="tool-label"></span>
             <button id="publish-open-live" class="cad-btn tiny icon-btn" type="button" hidden
@@ -1517,26 +1508,29 @@
 
   <!-- REMARKS: one shared needs-attention sidebar for every top-level tab.
        The selected category is remembered per tab; collapse state is shared. -->
-  <aside id="remarks-sidebar" class="collapsed" aria-labelledby="remarks-heading">
+  <aside id="remarks-sidebar" class="collapsed" aria-label="Remarks">
     <button id="remarks-open" class="remarks-rail-toggle" type="button"
             aria-controls="remarks-expanded" aria-expanded="false"
             aria-label="Open Remarks sidebar">
-      <span class="remarks-rail-arrow" aria-hidden="true">&#9664;</span>
-      <span class="remarks-rail-label">Remarks</span>
+      <span class="remarks-rail-arrow" data-icon="chevronleft" aria-hidden="true"></span>
+      <span class="remarks-rail-icon" data-icon="remarks" aria-hidden="true"></span>
       <span id="remarks-rail-count" class="remarks-count" aria-hidden="true"></span>
     </button>
 
     <div id="remarks-expanded" hidden>
       <div class="remarks-head">
         <div class="remarks-heading-wrap">
-          <h2 id="remarks-heading">Remarks</h2>
+          <span id="remarks-heading" class="remarks-heading-icon" role="heading"
+                aria-level="2" aria-label="Remarks" data-icon="remarks"
+                data-tip="Remarks"></span>
           <span id="remarks-total" class="tool-count" role="status"
                 aria-live="polite"></span>
         </div>
-        <button id="remarks-close" class="cad-btn tiny remarks-collapse" type="button"
+        <button id="remarks-close" class="cad-btn tiny icon-btn remarks-collapse" type="button"
                 aria-controls="remarks-expanded" aria-expanded="true"
                 aria-label="Collapse Remarks sidebar"
-                data-tip="Collapse Remarks sidebar">&#9654;</button>
+                data-icon="chevronright"
+                data-tip="Collapse Remarks sidebar"></button>
       </div>
       <div class="remarks-filter-row">
         <label class="tool-label" for="remarks-filter">Show</label>
@@ -1558,12 +1552,12 @@
   <div id="engine-overlay" class="overlay" hidden>
     <div id="engine-window" class="win">
       <div class="win-titlebar">
-        <span>Default engines</span>
+        <span>Default OCR engine</span>
         <button id="engine-close" class="win-close" type="button"
                 aria-label="Close" data-icon="close"></button>
       </div>
       <div id="engine-body">
-        <p class="pane-note">These engines are used when pages are staged. Cloud engines
+        <p class="pane-note">This engine is used when OCR pages are staged. Cloud engines
           remain unavailable until their API keys are configured.</p>
         <div class="engine-defaults-fields">
           <label class="tool-label" for="ocr-service">OCR</label>
@@ -1575,12 +1569,6 @@
           </select>
           <span></span>
           <span id="ocr-engine-note" class="tool-label"></span>
-          <label class="tool-label" for="analysis-service">Text Analysis</label>
-          <select id="analysis-service" class="cad-input">
-            <option value="configured">Configured AI provider</option>
-          </select>
-          <span></span>
-          <span id="analysis-engine-note" class="tool-label"></span>
         </div>
         <div class="dlg-actions">
           <button id="engine-settings" class="cad-btn quiet" type="button">Open settings&hellip;</button>
@@ -1652,7 +1640,7 @@
               placeholder="Why? (optional)"></textarea>
     <div id="attn-pop-actions">
       <label id="attn-pop-review-row"
-             data-tip="Puts this item in the shared review queue (Home tab), where any contributor can comment and resolve it">
+             data-tip="Adds a shared discussion to this item in the Remarks sidebar, where any contributor can reply or resolve it">
         <input id="attn-pop-review" type="checkbox" /> Needs review
       </label>
       <button id="attn-pop-save" class="cad-btn icon-btn" type="button"
@@ -1751,7 +1739,7 @@
       <div id="settings-body">
         <div id="settings-nav">
           <button class="snav active" data-sec="sec-general" type="button">General</button>
-          <button class="snav" data-sec="sec-appearance" type="button">Appearance</button>
+          <button class="snav" data-sec="sec-appearance" type="button">Display</button>
           <button class="snav" data-sec="sec-theme" type="button">Theme editor</button>
           <button class="snav" data-sec="sec-tables" type="button">Table view</button>
           <button class="snav" data-sec="sec-library" type="button">Library &amp; data</button>
@@ -1812,18 +1800,10 @@
             <p class="settings-note" id="set-lan-note"></p>
           </div>
           <div id="sec-appearance" class="settings-sec">
-            <div class="settings-head">Appearance</div>
+            <div class="settings-head">Display</div>
             <div class="settings-rows">
-              <label class="tool-label" for="theme-select">Theme</label>
-              <select id="theme-select" class="cad-input"></select>
               <label class="tool-label" for="ui-scale-select">UI scale (Ctrl +/−, Ctrl 0)</label>
               <select id="ui-scale-select" class="cad-input"></select>
-              <label class="tool-label" for="font-ui-select">Interface font</label>
-              <select id="font-ui-select" class="cad-input"></select>
-              <label class="tool-label" for="font-select">Data / table font</label>
-              <select id="font-select" class="cad-input"></select>
-              <label class="tool-label" for="font-mono2-select">Tag / marker font</label>
-              <select id="font-mono2-select" class="cad-input"></select>
             </div>
           </div>
           <div id="sec-theme" class="settings-sec">
@@ -1831,8 +1811,8 @@
             <p class="settings-note">Fine-tune the colours, corners, line weight,
                text weight and fonts of the selected theme. Edits are saved per theme
                and layer over the built-in look — reset any single control, or the
-               whole theme, at any time. A font left on <b>Default</b> follows the
-               global choice under <b>Appearance</b>. <b>Duplicate</b> any theme to make
+               whole theme, at any time. A font left on <b>Theme default</b> follows
+               the selected theme&rsquo;s built-in typography. <b>Duplicate</b> any theme to make
                your own editable copy: custom themes appear in the theme list in
                <i>italics</i> and can be renamed, deleted, exported or imported.</p>
             <div class="te-topbar">
@@ -1950,6 +1930,12 @@
               <label class="tool-label" for="set-ai-timeout">Request timeout (seconds)</label>
               <input id="set-ai-timeout" class="cad-input" type="number" min="10" max="1200" step="10"
                      data-tip="How long a Knowledge request may run before it is abandoned. Raise it for big summaries on slow or self-hosted endpoints." />
+              <label class="tool-label" for="set-smartscan-instructions">Smart Scan instructions for DeepSeek</label>
+              <textarea id="set-smartscan-instructions" class="cad-input" rows="5"
+                        placeholder="Optional guidance for extracting title-page metadata"></textarea>
+              <label class="tool-label" for="set-smartscan-manual-pages">Mark Smart Scan title pages manually</label>
+              <input id="set-smartscan-manual-pages" type="checkbox"
+                     data-tip="Before Smart Scan, review every staged PDF and save a small local copy containing only the marked pages" />
               <label class="tool-label" for="set-embed-base">Embeddings API base URL</label>
               <input id="set-embed-base" class="cad-input" spellcheck="false"
                      placeholder="https://api.openai.com/v1"
@@ -1963,7 +1949,7 @@
           <div id="sec-ocr" class="settings-sec">
             <div class="settings-head">OCR</div>
             <p class="settings-note">Engine selection and parameters. API keys live under
-              Credentials; OpenAI vision reuses the AI key.</p>
+              Credentials.</p>
             <div class="settings-rows">
               <label class="tool-label" for="set-ocr-service">Default service</label>
               <select id="set-ocr-service" class="cad-input">
@@ -1971,12 +1957,7 @@
                 <option value="mistral">Mistral OCR</option>
                 <option value="claude">Claude</option>
                 <option value="textract">Amazon Textract</option>
-                <option value="azure">Azure Document Intelligence</option>
-                <option value="openai">OpenAI vision</option>
               </select>
-              <label class="tool-label" for="set-ocr-azure-endpoint">Azure endpoint</label>
-              <input id="set-ocr-azure-endpoint" class="cad-input" spellcheck="false"
-                     placeholder="https://&lt;resource&gt;.cognitiveservices.azure.com/" />
               <label class="tool-label" for="set-ocr-tesseract">Tesseract executable</label>
               <input id="set-ocr-tesseract" class="cad-input" spellcheck="false"
                      placeholder="C:\Program Files\Tesseract-OCR\tesseract.exe" />
@@ -2005,8 +1986,6 @@
                 <option value="mistral">Mistral OCR</option>
                 <option value="claude">Claude</option>
                 <option value="textract">Amazon Textract</option>
-                <option value="azure">Azure Document Intelligence</option>
-                <option value="openai">OpenAI vision</option>
               </select>
               <label class="tool-label" for="set-ocr-key2">Page-view key 2</label>
               <select id="set-ocr-key2" class="cad-input">
@@ -2015,8 +1994,6 @@
                 <option value="mistral">Mistral OCR</option>
                 <option value="claude">Claude</option>
                 <option value="textract">Amazon Textract</option>
-                <option value="azure">Azure Document Intelligence</option>
-                <option value="openai">OpenAI vision</option>
               </select>
               <label class="tool-label" for="set-ocr-key3">Page-view key 3</label>
               <select id="set-ocr-key3" class="cad-input">
@@ -2025,8 +2002,6 @@
                 <option value="mistral">Mistral OCR</option>
                 <option value="claude">Claude</option>
                 <option value="textract">Amazon Textract</option>
-                <option value="azure">Azure Document Intelligence</option>
-                <option value="openai">OpenAI vision</option>
               </select>
               <label class="tool-label" for="set-ocr-key4">Page-view key 4</label>
               <select id="set-ocr-key4" class="cad-input">
@@ -2035,8 +2010,6 @@
                 <option value="mistral">Mistral OCR</option>
                 <option value="claude">Claude</option>
                 <option value="textract">Amazon Textract</option>
-                <option value="azure">Azure Document Intelligence</option>
-                <option value="openai">OpenAI vision</option>
               </select>
               <label class="tool-label" for="set-ocr-key5">Page-view key 5</label>
               <select id="set-ocr-key5" class="cad-input">
@@ -2045,8 +2018,6 @@
                 <option value="mistral">Mistral OCR</option>
                 <option value="claude">Claude</option>
                 <option value="textract">Amazon Textract</option>
-                <option value="azure">Azure Document Intelligence</option>
-                <option value="openai">OpenAI vision</option>
               </select>
             </div>
             <p class="settings-note">Page-view keys: hover a PDF page (or select pages by
@@ -2149,8 +2120,6 @@
                      data-tip="Used by the Mistral OCR service, and by the phone-capture pipeline" />
               <label class="tool-label" for="set-ocr-claude-key">Anthropic API key</label>
               <input id="set-ocr-claude-key" class="cad-input" type="password" spellcheck="false" />
-              <label class="tool-label" for="set-ocr-azure-key">Azure API key</label>
-              <input id="set-ocr-azure-key" class="cad-input" type="password" spellcheck="false" />
               <label class="tool-label" for="set-ocr-aws-key">AWS access key (Textract)</label>
               <input id="set-ocr-aws-key" class="cad-input" spellcheck="false" />
               <label class="tool-label" for="set-ocr-aws-secret">AWS secret key</label>
@@ -2297,6 +2266,48 @@
     </div>
   </div>
 
+  <!-- SMART SCAN PAGE PICKER (keyboard-first, one PDF at a time) -->
+  <div id="smartscan-mark-overlay" class="overlay" hidden>
+    <div id="smartscan-mark-window" class="win smartscan-mark-win"
+         role="dialog" aria-modal="true" aria-labelledby="smartscan-mark-title">
+      <div class="win-titlebar smartscan-mark-bar">
+        <span id="smartscan-mark-title">Mark title pages</span>
+        <span id="smartscan-mark-left" class="smartscan-mark-left"></span>
+        <button id="smartscan-mark-close" class="win-close" type="button"
+                aria-label="Cancel page marking" data-icon="close"></button>
+      </div>
+      <div class="smartscan-mark-body">
+        <div class="smartscan-mark-preview">
+          <img id="smartscan-mark-image" alt="PDF page preview" />
+          <div id="smartscan-mark-loading" class="empty">Preparing PDF&hellip;</div>
+        </div>
+        <aside class="smartscan-mark-controls">
+          <div id="smartscan-mark-label" class="smartscan-mark-book"></div>
+          <div id="smartscan-mark-page" class="smartscan-mark-page">Page 1</div>
+          <div class="smartscan-mark-nav" role="group" aria-label="Page navigation">
+            <button id="smartscan-mark-prev" class="cad-btn icon-btn" type="button"
+                    aria-label="Previous page" data-tip="Previous page (Left arrow)">&#8592;</button>
+            <button id="smartscan-mark-toggle" class="cad-btn" type="button"
+                    data-tip="Mark or unmark this page (Space or T)">Mark page</button>
+            <button id="smartscan-mark-next" class="cad-btn icon-btn" type="button"
+                    aria-label="Next page" data-tip="Next page (Right arrow)">&#8594;</button>
+          </div>
+          <div class="smartscan-mark-help">Use <kbd>&larr;</kbd>/<kbd>&rarr;</kbd> to flip pages,
+            <kbd>Space</kbd> or <kbd>T</kbd> to mark, and <kbd>Enter</kbd> to confirm.</div>
+          <div class="smartscan-mark-selected-head">Pages to scan</div>
+          <div id="smartscan-mark-selected" class="smartscan-mark-selected">None marked</div>
+          <div id="smartscan-mark-error" class="smartscan-mark-error" role="alert" hidden></div>
+          <div class="dlg-actions smartscan-mark-actions">
+            <button id="smartscan-mark-cancel" class="cad-btn" type="button">Cancel run</button>
+            <button id="smartscan-mark-confirm" class="cad-btn primary" type="button" disabled>
+              Save pages &amp; continue
+            </button>
+          </div>
+        </aside>
+      </div>
+    </div>
+  </div>
+
   <!-- IMAGE VIEWER (entry photos from the Info panel; backdrop or the close
        button dismisses -- the image itself is inert) -->
   <div id="img-lightbox" class="overlay" hidden role="dialog" aria-modal="true"
@@ -2399,7 +2410,8 @@
           <ul class="wiz-points wiz-ready-list">
             <li>Use <b>Catalogs</b> to find a book and compare source records.</li>
             <li>Use <b>Workbench</b> to move a verified source through Record, Source, Text, Knowledge, and Publish.</li>
-            <li>Check <b>Home</b> for running work, reviews, and recent activity.</li>
+            <li>Check <b>Home</b> for running work and recent activity; use the
+                <b>Remarks</b> sidebar for reviews.</li>
           </ul>
           <p class="settings-note">Anything you skipped can be added later in
              <b>Settings</b>. Re-open this guide from <b>Help &gt; Setup guide</b>.</p>

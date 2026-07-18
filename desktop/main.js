@@ -503,15 +503,25 @@ function createWindow() {
 
 // The persisted UI theme, read straight off disk so the update splash matches
 // it before the sidecar (which owns client_state) is even running. Mirrors the
-// theme ids in tools/whl_explorer/static/app.js; anything unknown -> sage.
+// theme ids in tools/whl_explorer/static/app.js. Custom themes use their base
+// chrome here because the compact pre-launch windows do not apply token-level
+// overrides; anything else unknown falls back to sage.
 const KNOWN_THEMES = new Set([
-  "sage", "ledger", "foolscap", "vellum", "linen",
+  "sage", "ledger", "foolscap", "vellum", "linen", "porcelain", "slate",
 ]);
+function prelaunchTheme(settings) {
+  const t = settings && settings.theme;
+  if (KNOWN_THEMES.has(t)) return t;
+  const saved = Array.isArray(settings && settings.savedThemes)
+    ? settings.savedThemes : [];
+  const custom = saved.find((item) => item && item.id === t);
+  return custom && KNOWN_THEMES.has(custom.base) ? custom.base : "sage";
+}
 function readActiveTheme() {
   try {
     const p = path.join(app.getPath("userData"), "output", "client_state.json");
-    const t = JSON.parse(fs.readFileSync(p, "utf8"))?.settings?.theme;
-    return KNOWN_THEMES.has(t) ? t : "sage";
+    const settings = JSON.parse(fs.readFileSync(p, "utf8"))?.settings || {};
+    return prelaunchTheme(settings);
   } catch (e) {
     return "sage";                         // first run / unreadable -> default
   }

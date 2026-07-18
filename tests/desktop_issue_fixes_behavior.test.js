@@ -218,6 +218,7 @@ function verificationHarness({ kind = "checked", response, networkError } = {}) 
     },
     getVerify: () => "pending",
     getManualUrl: () => "",
+    activeHistoryTab: () => "checked",
     migrateVerify: (value) => value.verify || {},
     pushOp: () => {},
     setManualUrl: async () => {},
