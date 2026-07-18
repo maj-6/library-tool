@@ -172,8 +172,11 @@ jobs:
             exit 1
           fi
           cat signer.txt
-          DN=$(sed -n 's/^Signer #1 certificate DN: //p' signer.txt | head -1)
-          SHA256=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' signer.txt | head -1)
+          # Match any signer block, not just "Signer #1": newer build-tools'
+          # apksigner labels the fields "V2 Signer: certificate DN:" etc., so the
+          # old anchored pattern found nothing and rejected a correctly-signed APK.
+          DN=$(sed -n 's/.*certificate DN: //p' signer.txt | head -1)
+          SHA256=$(sed -n 's/.*certificate SHA-256 digest: //p' signer.txt | head -1)
           if [ -z "$DN" ] || [ -z "$SHA256" ]; then
             echo "::error::apksigner did not report a signer DN and SHA-256 certificate digest; refusing to upload an unverifiable APK."
             exit 1
