@@ -14,8 +14,9 @@ docs/lib-format.md). This module is that format's single source of truth:
     the live role vocabulary and `schema.json`, so the artifact teaches its
     reader.
 
-Depends only on the standard library + `libcommon` + `layout_roles`, so it is
-safe for external scripts and pip-installable later via the existing pyproject.
+Depends only on the standard library + `layout_roles` (the role vocabulary),
+so it is safe for external scripts and pip-installable later via the existing
+pyproject.
 """
 from __future__ import annotations
 
@@ -28,7 +29,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import layout_roles
-import libcommon as lib
 
 # --- the format's constants ------------------------------------------------
 

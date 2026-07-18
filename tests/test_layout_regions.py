@@ -704,7 +704,6 @@ def test_replica_print_renders_sheets(client, data_root):
 
 def test_replica_import_roundtrip(client, data_root):
     import io
-    import zipfile
     import libcommon as lib
     import server
     src_bid, dst_bid = "a11112345678", "b22212345678"

@@ -103,9 +103,9 @@ def test_sanitize_ext_caps_and_round_trips():
     seen = []
     assert libformat.sanitize_ext({"a": {"b": 1}}) == {"a": {"b": 1}}
     assert libformat.sanitize_ext(None) == {}
-    assert libformat.sanitize_ext(["nope"], warn=lambda l, m: seen.append(m)) == {}
+    assert libformat.sanitize_ext(["nope"], warn=lambda loc, m: seen.append(m)) == {}
     big = {"blob": "x" * (libformat.MAX_EXT + 10)}
-    assert libformat.sanitize_ext(big, warn=lambda l, m: seen.append(m)) == {}
+    assert libformat.sanitize_ext(big, warn=lambda loc, m: seen.append(m)) == {}
     assert any("exceeds" in m for m in seen) and any("not an object" in m
                                                      for m in seen)
     # non-finite numbers can't ride into a member no strict parser reads
