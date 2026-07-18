@@ -2339,9 +2339,6 @@ function progressSummary() {
   const builds = Object.values(state.builds || {});
   const drafts = builds.filter((b) => b.status === "draft");
   const ready = builds.filter((b) => b.status === "ready").length;
-  // a source is settled once a verified entry has been built from it
-  const srcPending = approvedSources()
-    .filter((s) => sourceBuildStatus(s) !== "done").length;
   // Use the same normalized model as the shared Remarks sidebar. In
   // particular, src:* marks belong to Workbench Sources, and published builds
   // still count until their mark is explicitly cleared.
@@ -2360,7 +2357,7 @@ function progressSummary() {
   const catalogued = (state.checked ? state.checked.size : 0) +
                      (state.manual || []).length;
   return {
-    drafts, ready, srcPending, attnCat, attnEd, attnEntries, attnSources,
+    drafts, ready, attnCat, attnEd, attnEntries, attnSources,
     openReviews, published, catalogued,
   };
 }
@@ -2623,8 +2620,6 @@ function renderHome() {
   let html =
     row(inEditor, inEditor === 1 ? "entry in the workbench" : "entries in the workbench",
         `data-gotab="workbench"`, inEditor ? `${p.drafts.length} draft · ${p.ready} to publish` : "") +
-    row(p.srcPending, p.srcPending === 1 ? "PDF source pending verification"
-        : "PDF sources pending verification", `data-gotab="workbench"`) +
     row(attn, attn === 1 ? "item marked for attention"
         : "items marked for attention",
         `data-remarks="1" data-remarks-filter="${attnDest.filter}" ` +
