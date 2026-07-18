@@ -1817,7 +1817,7 @@ async function syncClientStateOnLoad() {
           Object.keys(state.settings.colWidths || {}).length > 0) {
         migratePersistentView = true;
       }
-      syncYearFilterInputs();   // reflect the (local) year-range into the toolbar
+      syncFilterBtn();          // reflect local filters into the toolbar affordance
       syncSearchConsCheckboxes();
       try {
         const { prefs, view } = partitionSettings(state.settings);
@@ -3076,6 +3076,8 @@ let popupAnchor = null;
 
 function closePopup() {
   el("popup-menu").hidden = true;
+  if (popupAnchor && popupAnchor !== el("popup-menu"))
+    popupAnchor.setAttribute("aria-expanded", "false");
   popupAnchor = null;
 }
 
@@ -3085,6 +3087,9 @@ function openPopup(anchor, html, wire) {
   popupAnchor = anchor;
   pop.innerHTML = html;
   pop.hidden = false;
+  if (anchor.hasAttribute("aria-haspopup"))
+    anchor.setAttribute("aria-expanded", "true");
+  pop.setAttribute("aria-label", anchor.getAttribute("aria-label") || "Toolbar options");
   const r = anchor.getBoundingClientRect();
   pop.style.top = Math.min(r.bottom + 4, innerHeight - pop.offsetHeight - 8) + "px";
   pop.style.left = Math.max(8, Math.min(r.right - pop.offsetWidth,
@@ -3123,20 +3128,39 @@ const FILTER_GROUPS = [
 ];
 
 function filtersActive() {
-  return FILTER_GROUPS.some(([k]) => (state.settings[k] || "ALL") !== "ALL");
+  const checkedActive = state.settings.topTable === "checked" &&
+    FILTER_GROUPS.some(([k]) => (state.settings[k] || "ALL") !== "ALL");
+  return checkedActive ||
+    state.settings.yearFrom != null || state.settings.yearTo != null;
 }
 
 function syncFilterBtn() {
-  el("filter-btn").classList.toggle("active", filtersActive());
+  const active = filtersActive();
+  el("filter-btn").classList.toggle("active", active);
+  el("filter-btn").setAttribute("aria-pressed", String(active));
 }
 
 function openFilterMenu(anchor) {
-  const html = FILTER_GROUPS.map(([k, head, opts]) =>
+  // Mark/source/download filters apply to the checked-books table. The year
+  // range applies to either top table, so it remains available in WHL mode.
+  const groups = state.settings.topTable === "checked" ? FILTER_GROUPS.map(([k, head, opts]) =>
     `<div class="pm-head">${head}</div>` +
     opts.map(([v, label]) => `
       <label class="pm-item"><input type="radio" name="pm-${k}" value="${v}"
         ${(state.settings[k] || "ALL") === v ? "checked" : ""} /> ${label}</label>`).join("")
-  ).join("");
+  ).join("") : "";
+  const from = state.settings.yearFrom == null ? "" : String(state.settings.yearFrom);
+  const to = state.settings.yearTo == null ? "" : String(state.settings.yearTo);
+  const html = groups + `<div class="pm-head">Year range</div>
+    <div class="pm-year" data-tip="Show only rows within this inclusive year range">
+      <label for="pm-year-from">From</label>
+      <input id="pm-year-from" class="cad-input yr-input" type="number"
+             inputmode="numeric" placeholder="from" value="${esc(from)}" />
+      <label for="pm-year-to">To</label>
+      <input id="pm-year-to" class="cad-input yr-input" type="number"
+             inputmode="numeric" placeholder="to" value="${esc(to)}" />
+      <button id="pm-year-clear" class="cad-btn tiny" type="button">Clear</button>
+    </div>`;
   openPopup(anchor, html, (pop) => {
     pop.querySelectorAll("input[type=radio]").forEach((rb) => {
       rb.addEventListener("change", () => {
@@ -3145,6 +3169,29 @@ function openFilterMenu(anchor) {
         syncFilterBtn();
         renderChecked();
       });
+    });
+    let yearDebounce = null;
+    const yearInput = () => {
+      const num = (v) => {
+        const n = parseInt(v, 10);
+        return Number.isFinite(n) ? n : null;
+      };
+      state.settings.yearFrom = num(pop.querySelector("#pm-year-from").value);
+      state.settings.yearTo = num(pop.querySelector("#pm-year-to").value);
+      syncFilterBtn();
+      clearTimeout(yearDebounce);
+      yearDebounce = setTimeout(() => { saveSettings(); renderTop(); }, 150);
+    };
+    pop.querySelector("#pm-year-from").addEventListener("input", yearInput);
+    pop.querySelector("#pm-year-to").addEventListener("input", yearInput);
+    pop.querySelector("#pm-year-clear").addEventListener("click", () => {
+      clearTimeout(yearDebounce);
+      pop.querySelector("#pm-year-from").value = "";
+      pop.querySelector("#pm-year-to").value = "";
+      state.settings.yearFrom = state.settings.yearTo = null;
+      syncFilterBtn();
+      saveSettings();
+      renderTop();
     });
   });
 }
@@ -6589,14 +6636,6 @@ function yearInRange(y) {
   return true;
 }
 
-// reflect the persisted year-range into the toolbar inputs (init + after the
-// server copy of settings is adopted)
-function syncYearFilterInputs() {
-  const f = el("year-from"), t = el("year-to");
-  if (f) f.value = state.settings.yearFrom != null ? state.settings.yearFrom : "";
-  if (t) t.value = state.settings.yearTo != null ? state.settings.yearTo : "";
-}
-
 function filteredCheckedRows(prebuilt) {
   // prebuilt lets renderChecked reuse the combinedRows() array it already
   // built for rowsById, instead of rescanning all entries a second time.
@@ -7902,9 +7941,7 @@ function switchTopTable(t) {
   el("top-table").value = t;
   el("checked-pane").hidden = t !== "checked";
   el("whltop-pane").hidden = t !== "whl";
-  for (const id of ["dl-approved", "export-json", "filter-btn"]) {
-    el(id).disabled = t !== "checked";
-  }
+  syncFilterBtn();
   renderTop();
 }
 
@@ -18223,6 +18260,9 @@ function renderReplicaBooks() {
     const li = document.createElement("li");
     li.className = "ocr-book" + (b.id === rwState.book ? " active" : "");
     li.dataset.bid = b.id;
+    li.tabIndex = 0;
+    li.setAttribute("role", "button");
+    if (b.id === rwState.book) li.setAttribute("aria-current", "true");
     li.innerHTML = `<span class="bi-title">${esc(b.title) || "<em>(untitled)</em>"}</span>
       <span class="bi-meta">${esc(b.authors || "")}${b.authors && b.year ? " &middot; " : ""}${esc(b.year || "")}</span>`;
     list.appendChild(li);
@@ -18473,11 +18513,11 @@ function rwSyncBar() {
       (rwState.dirty ? " · unsaved" : "")
     : "";
   el("rw-save").disabled = !rwState.dirty || !rwState.page;
-  el("rw-recompile").disabled = !rwState.book || !rwState.regionPages.length;
+  el("rw-recompile").disabled = !rwState.book || !rwState.regionPages.length || rwState.dirty;
   el("rw-export").disabled = !rwState.book || !rwState.regionPages.length;
   el("rw-import").disabled = !rwState.book;
   el("rw-print").disabled = !rwState.book || !rwState.regionPages.length;
-  el("rw-tpl-save").disabled = !rwState.page;
+  el("rw-tpl-save").disabled = !rwState.page || rwState.dirty;
   el("rw-tpl-apply").disabled = !el("rw-tpl").value;
   el("rw-tpl-outliers").disabled = !el("rw-tpl").value;
   const a = rwActive();
@@ -19016,6 +19056,8 @@ function rwSetMode(mode) {
   const pv = rwState.mode === "preview";
   el("rw-mode-edit").classList.toggle("active", !pv);
   el("rw-mode-preview").classList.toggle("active", pv);
+  el("rw-mode-edit").setAttribute("aria-pressed", String(!pv));
+  el("rw-mode-preview").setAttribute("aria-pressed", String(pv));
   el("rw-canvas").hidden = pv || !rwState.page;
   el("rw-preview-row").hidden = !pv || !rwState.page;
   el("rw-empty").hidden = !!rwState.page;
@@ -19392,6 +19434,37 @@ function initReplica() {
   el("rw-books").addEventListener("click", (ev) => {
     const li = ev.target.closest("[data-bid]");
     if (li) selectReplicaBook(li.dataset.bid);
+  });
+  el("rw-books").addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter" && ev.key !== " ") return;
+    const li = ev.target.closest("[data-bid]");
+    if (!li) return;
+    ev.preventDefault();
+    li.click();
+  });
+
+  const toolbarMenus = [...document.querySelectorAll(".replica-toolbar .toolbar-popover")];
+  for (const menu of toolbarMenus) {
+    menu.addEventListener("toggle", () => {
+      if (!menu.open) return;
+      for (const other of toolbarMenus) if (other !== menu) other.open = false;
+    });
+    menu.addEventListener("click", (ev) => {
+      const button = ev.target.closest("button");
+      if (button && !button.disabled) menu.open = false;
+    });
+  }
+  document.addEventListener("mousedown", (ev) => {
+    for (const menu of toolbarMenus) {
+      if (menu.open && !menu.contains(ev.target)) menu.open = false;
+    }
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Escape") return;
+    const menu = toolbarMenus.find((item) => item.open);
+    if (!menu) return;
+    menu.open = false;
+    menu.querySelector("summary").focus();
   });
   el("rw-pages").addEventListener("click", (ev) => {
     const b = ev.target.closest(".rw-pagebtn");
@@ -20308,9 +20381,7 @@ function init() {
     else if (k === "y" || (k === "z" && ev.shiftKey)) { ev.preventDefault(); redo(); }
   });
 
-  // table-bar commands (run-scans / scrape / search-pane are menu items)
-  el("dl-approved").addEventListener("click", downloadApproved);
-  el("export-json").addEventListener("click", exportJson);
+  // table-bar commands (download, export, scans, scrape, and search are menu items)
   initSortHeaders();
 
   // filter + column-visibility popups
@@ -20377,28 +20448,6 @@ function init() {
     }, 150);
   });
   el("checked-rows").addEventListener("click", onCheckedClick);
-
-  // year-range filter (applies to whichever top table is shown) — same debounce,
-  // which also collapses the per-keystroke saveSettings() client_state PUT.
-  let _yearDebounce = null;
-  const onYearFilter = () => {
-    const num = (v) => { const n = parseInt(v, 10); return Number.isFinite(n) ? n : null; };
-    state.settings.yearFrom = num(el("year-from").value);
-    state.settings.yearTo = num(el("year-to").value);
-    clearTimeout(_yearDebounce);
-    _yearDebounce = setTimeout(() => { saveSettings(); renderTop(); }, 150);
-  };
-  el("year-from").addEventListener("input", onYearFilter);
-  el("year-to").addEventListener("input", onYearFilter);
-  el("year-clear").addEventListener("click", () => {
-    clearTimeout(_yearDebounce);           // cancel a pending trailing render
-    el("year-from").value = "";
-    el("year-to").value = "";
-    state.settings.yearFrom = state.settings.yearTo = null;
-    saveSettings();
-    renderTop();
-  });
-  syncYearFilterInputs();
 
   // Open Library search constraint checkboxes (Title/Author/Year) — the same
   // persistent searchCons set toggled by Ctrl+click on a column header
