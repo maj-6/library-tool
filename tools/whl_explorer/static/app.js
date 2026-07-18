@@ -2019,7 +2019,10 @@ function renderAccountState() {
   const s = el("set-account-state"), b = el("set-account-btn");
   if (!s || !b) return;
   if (authState.signedIn) {
-    s.textContent = `${authState.displayName || authState.email} (${authState.email})`;
+    const nm = authState.displayName || authState.email;
+    s.innerHTML = userAvatar(nm) +
+      ` <span class="set-acct-name">${esc(nm)}</span> ` +
+      `<span class="set-acct-email">(${esc(authState.email)})</span>`;
     b.textContent = "Sign out";
   } else {
     s.textContent = authState.cloud ? "Not signed in"
@@ -2447,9 +2450,6 @@ function progressSummary() {
   const builds = Object.values(state.builds || {});
   const drafts = builds.filter((b) => b.status === "draft");
   const ready = builds.filter((b) => b.status === "ready").length;
-  // a source is settled once a verified entry has been built from it
-  const srcPending = approvedSources()
-    .filter((s) => sourceBuildStatus(s) !== "done").length;
   // Use the same normalized model as the shared Remarks sidebar. In
   // particular, src:* marks belong to Workbench Sources, and published builds
   // still count until their mark is explicitly cleared.
@@ -2461,9 +2461,21 @@ function progressSummary() {
   const attnPublications = remarkItems.filter(
     (item) => item.category === "publications").length;
   const attnEd = attnEntries + attnSources;
+  const openReviews = Object.values(reviewsState.items || {})
+    .filter((r) => r.status === "open").length;
+  // cumulative archive facts (the mission, not the churn): what has been
+  // catalogued at all, verified (ready to publish), and actually published.
+  // Driven off local `uploaded` builds — the cloud publish count is loaded
+  // lazily only when the Published tab opens, so it is 0 on a cold Home.
+  const published = builds.filter((b) => b.status === "uploaded").length;
+  const catalogued = (state.checked ? state.checked.size : 0) +
+                     (state.manual || []).length;
+  // srcPending is deliberately absent: the pending-sources row it fed was
+  // dropped from Home, and nothing consumes it any more.
   return {
-    drafts, ready, srcPending, attnCat, attnEd, attnEntries, attnSources,
+    drafts, ready, attnCat, attnEd, attnEntries, attnSources,
     attnPages, attnPublications,
+    openReviews, published, catalogued,
   };
 }
 
@@ -2492,18 +2504,249 @@ function homeAttentionDestination(summary) {
   return { tab: "workbench", filter };
 }
 
+// --- contributor identity: micro-avatars + profile popup -----------------------
+// Every contributor name in the app renders as a compact chip: a tiny generated
+// "micro avatar" (a deterministic symbol on a deterministic colour) followed by
+// the name, on a faint wash of the same hue. The mark is derived only from the
+// name, so one person looks identical everywhere and across sessions, with no
+// stored per-user data. Clicking a chip opens a read-only profile popup built
+// from the activity feed the client already holds.
+
+// A curated categorical palette. Each colour is mid-dark enough for a white
+// symbol to stay legible on it, and desaturated enough to sit on the light
+// paper stocks every theme uses. Index is chosen by a hash of the name.
+const AVATAR_COLORS = [
+  "#3d7dab", "#c26a3d", "#4f9d69", "#a8543f", "#7a6cc4", "#c99a2e",
+  "#4aa5a0", "#b3577f", "#6b8f3a", "#8a6d4b", "#5a86c9", "#9c5bb0",
+];
+
+// Twelve simple, symmetric vector marks in a 24x24 box, kept bold and low
+// detail so they still read at ~13px. Filled shapes inherit the group's white
+// fill; the ring opts out with its own fill/stroke. Index chosen independently
+// of the colour, so colour x glyph gives 144 distinct looks.
+const AVATAR_GLYPHS = [
+  '<circle cx="12" cy="12" r="6.6"/>',                               // disc
+  '<rect x="5.6" y="5.6" width="12.8" height="12.8" rx="2.6"/>',     // rounded square
+  '<path d="M12 4 L20 12 L12 20 L4 12 Z"/>',                         // diamond
+  '<path d="M12 4 L20 19 L4 19 Z"/>',                                // triangle up
+  '<path d="M4 5 L20 5 L12 20 Z"/>',                                 // triangle down
+  '<path d="M12 3 L14.7 9.3 L21 12 L14.7 14.7 L12 21 L9.3 14.7 L3 12 L9.3 9.3 Z"/>', // 4-point star
+  '<path d="M9.2 4 h5.6 v4.6 h4.6 v5.6 h-4.6 v4.6 h-5.6 v-4.6 h-4.6 v-5.6 h4.6 Z"/>', // plus
+  '<circle cx="12" cy="12" r="6.6" fill="none" stroke="#fff" stroke-width="3.4"/>',   // ring
+  '<path d="M12 3 L20 7.5 V16.5 L12 21 L4 16.5 V7.5 Z"/>',           // hexagon
+  '<path d="M12 3 L20.6 9.3 L17.3 19.4 H6.7 L3.4 9.3 Z"/>',          // pentagon
+  '<path d="M12 4 C7 9.2 7 13.4 12 20 C17 13.4 17 9.2 12 4 Z"/>',    // leaf / droplet
+  '<path d="M3.6 12 L10 5.6 V9.6 H20.4 V14.4 H10 V18.4 Z"/>',        // arrow
+];
+
+// FNV-1a over an NFKC-folded, lowercased name: small, stable, dependency-free,
+// so trivial display differences collapse to one identity.
+function userHash(name) {
+  const s = String(name == null ? "" : name).normalize("NFKC").trim().toLowerCase() || "?";
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+  }
+  return h >>> 0;
+}
+
+// Deterministic colour + glyph for a name.
+function userLook(name) {
+  const h = userHash(name);
+  return {
+    color: AVATAR_COLORS[h % AVATAR_COLORS.length],
+    glyph: AVATAR_GLYPHS[(h >>> 8) % AVATAR_GLYPHS.length],
+  };
+}
+
+// The micro avatar on its own: an inline SVG sized in em so it never adds line
+// height. Coloured tile, white mark. `cls` adds a size modifier (e.g. big).
+function userAvatar(name, cls) {
+  const { color, glyph } = userLook(name);
+  return `<svg class="uav${cls ? " " + cls : ""}" viewBox="0 0 24 24" aria-hidden="true">` +
+    `<rect width="24" height="24" rx="6" fill="${color}"/>` +
+    `<g fill="#fff">${glyph}</g></svg>`;
+}
+
+// Full chip: avatar + name on a faint wash of the user's colour, as one
+// clickable target that opens the profile popup. Inline, so it drops into any
+// row without changing its height. `opts.you` adds a tiny self marker.
+function userChip(name, opts) {
+  const o = opts || {};
+  const display = String(name == null ? "" : name).trim() || "Unnamed user";
+  const { color } = userLook(display);
+  const body = userAvatar(display) +
+    `<span class="uchip-name">${esc(display)}</span>` +
+    (o.you ? `<span class="uchip-you">you</span>` : "");
+  // `plain` renders the identical chip as an inert span, for the one place that
+  // is already inside a button (the activity row): a button nested in a button
+  // is invalid HTML and the parser would hoist it straight back out.
+  if (o.plain) {
+    return `<span class="uchip uchip-plain${o.cls ? " " + o.cls : ""}" ` +
+      `style="--uav-c:${color}">` + body + `</span>`;
+  }
+  // aria-label carries the action (the avatar is decorative / aria-hidden and
+  // data-tip is a mouse-only visual tooltip); the visible name is contained in
+  // it, so the accessible name still includes the label text.
+  return `<button type="button" class="uchip${o.cls ? " " + o.cls : ""}" ` +
+    `data-user="${esc(display)}" style="--uav-c:${color}" ` +
+    `aria-label="View ${esc(display)}’s profile" ` +
+    `data-tip="View ${esc(display)}’s profile">` +
+    body +
+    `</button>`;
+}
+
+// Is this name the person using the app right now?
+function isSelfName(name) {
+  const me = (authState.displayName || state.settings.userName || "").normalize("NFKC").trim().toLowerCase();
+  return !!me && me === String(name == null ? "" : name).normalize("NFKC").trim().toLowerCase();
+}
+
+// Everything a profile shows is derived from the activity feed already in
+// memory (newest-first), so no per-user record or extra request is needed.
+function userProfileData(name) {
+  const target = String(name == null ? "" : name).normalize("NFKC").trim().toLowerCase();
+  let total = 0, last = 0, first = 0;
+  const recent = [];
+  for (const e of homeState.events) {
+    if (String(e.actor || "").normalize("NFKC").trim().toLowerCase() !== target) continue;
+    const at = Date.parse(e.ts) || 0;
+    total += e.n || 1;
+    if (at > last) last = at;
+    if (at && (!first || at < first)) first = at;
+    if (recent.length < 8) recent.push(e);   // events are newest-first already
+  }
+  return { total, last, first, recent };
+}
+
+let _uprofOpener = null;   // the chip clicked, so focus returns there on close
+let _profileName = null;   // whose profile is showing, so a slow /api/profile
+                           // response for a since-closed/replaced popup is dropped
+
+// The one-line stat readout. `srv` is the real account metadata from
+// /api/profile when the cloud can answer; without it we fall back to what the
+// loaded feed holds (clearly recent activity, never dressed up as account age).
+function renderProfileStats(d, srv) {
+  const stats = [d.total ? `${d.total} ${d.total === 1 ? "change" : "changes"}` : "no changes yet"];
+  const srvLast = srv ? Date.parse(srv.last_active || "") : NaN;
+  const lastMs = Math.max(d.last || 0, srvLast || 0);   // fresh local can beat cloud
+  if (lastMs) stats.push(`active ${relTime(lastMs)}`);
+  const since = srv ? Date.parse(srv.member_since || "") : NaN;
+  if (since) stats.push(`member since ${exactTime(since).slice(0, 10)}`);
+  else if (d.first && d.first !== d.last) stats.push(`first seen ${exactTime(d.first).slice(0, 10)}`);
+  el("uprof-stats").textContent = stats.join(" · ");
+}
+
+function openUserProfile(name) {
+  const display = String(name == null ? "" : name).trim() || "Unnamed user";
+  const d = userProfileData(display);
+  const isMe = isSelfName(display);
+  if (el("uprof-overlay").hidden) _uprofOpener = document.activeElement;
+  _profileName = display;
+
+  el("uprof-avatar").innerHTML = userAvatar(display, "uav-lg");
+  el("uprof-name").textContent = display;
+  el("uprof-you").hidden = !isMe;
+  const emailEl = el("uprof-email");
+  if (isMe && authState.signedIn && authState.email) {
+    emailEl.textContent = authState.email;
+    emailEl.hidden = false;
+  } else emailEl.hidden = true;
+
+  renderProfileStats(d, null);   // instant, from the feed; upgraded below
+
+  el("uprof-recent").innerHTML = d.recent.length
+    ? d.recent.map((e) => `<div class="uprof-ev">` +
+        `<span class="uprof-ev-txt">${esc(e.detail ||
+          activityPhrase({ verb: e.verb, subject: e.subject, n: e.n || 1 }))}</span>` +
+        `<span class="uprof-ev-when">${esc(relIso(e.ts))}</span></div>`).join("")
+    : `<div class="empty">No recorded activity yet</div>`;
+
+  el("uprof-overlay").hidden = false;
+  el("uprof-close").focus();
+
+  // Upgrade the stat line with real account metadata (member-since + true
+  // activity span) when the cloud can answer. Fire-and-forget; a stale response
+  // for a popup the user has since closed or replaced is dropped.
+  fetch("/api/profile?name=" + encodeURIComponent(display))
+    .then((r) => r.json())
+    .then((j) => {
+      if (_profileName !== display || el("uprof-overlay").hidden) return;
+      if (j && j.ok && j.cloud) renderProfileStats(d, j);
+    })
+    .catch(() => {});
+}
+
+function closeUserProfile() {
+  _profileName = null;
+  el("uprof-overlay").hidden = true;
+  // return focus to the chip that opened it, if it's still on screen
+  const op = _uprofOpener;
+  _uprofOpener = null;
+  if (op && op.focus && op.isConnected && op.offsetParent !== null) op.focus();
+}
+
+function initUserProfile() {
+  el("uprof-close").addEventListener("click", closeUserProfile);
+  el("uprof-overlay").addEventListener("mousedown", (ev) => {
+    if (ev.target === el("uprof-overlay")) closeUserProfile();
+  });
+  // One capture-phase delegate for every chip in the app: it opens the profile
+  // and stops the click before an enclosing row handler (e.g. the activity
+  // feed's expand toggle) can also fire. Match on data-user, not the class
+  // alone: the inert `plain` chip shares the class but carries no identity, and
+  // matching it would both open a blank profile and swallow the row's own click.
+  document.addEventListener("click", (ev) => {
+    const chip = ev.target.closest(".uchip[data-user]");
+    if (!chip) return;
+    ev.stopPropagation();
+    openUserProfile(chip.dataset.user);
+  }, true);
+  // aria-modal must actually trap focus: keep Tab / Shift+Tab cycling within the
+  // dialog's focusable controls (the close button and the scrollable list), so
+  // focus can't slip onto the background content the dialog declares inert.
+  document.addEventListener("keydown", (ev) => {
+    if (el("uprof-overlay").hidden || ev.key !== "Tab") return;
+    const ring = [el("uprof-close"), el("uprof-recent")].filter((n) => n && n.offsetParent !== null);
+    if (!ring.length) return;
+    ev.preventDefault();
+    const i = ring.indexOf(document.activeElement);
+    ring[(i + (ev.shiftKey ? -1 : 1) + ring.length) % ring.length].focus();
+  });
+}
+
 const HOME_DRAFTS_SHOWN = 4;
 
-function renderHome() {
-  const prog = el("home-progress");
-  const feed = el("home-activity");
-  if (!prog || !feed) return;
+// Home is four independent panes over one summary. Each renders into its own
+// host, in the manner of renderReviewsInto, so a change to one cannot disturb
+// the others; renderHome below is just the order they run in.
 
-  const p = progressSummary();
-  // one line per metric, count first, breakdown right-aligned and muted —
-  // a status readout in the app's row idiom, not a dashboard of tiles
-  // a zero metric has nowhere to go — navigating to an empty queue (or opening
-  // the remarks sidebar onto nothing) is a dead end, so say so up front
+// State of the archive, in the masthead: the mission as a quiet fact
+// (catalogued -> verified -> published), each figure a jump to where that
+// stage lives. Under-styled per the CAD ethos — a readout, not tiles.
+function renderHomeStats(p) {
+  const statsEl = el("home-stats");
+  if (!statsEl) return;
+  const TAB_FOR = { catalogued: "checked", verified: "workbench", published: "publish" };
+  const stat = (n, label) =>
+    `<button class="hs-item" type="button" data-gotab="${TAB_FOR[label]}">` +
+      `<span class="hs-n">${n}</span><span class="hs-l">${label}</span></button>`;
+  const sep = `<span class="hs-sep">·</span>`;
+  statsEl.innerHTML =
+    stat(p.catalogued, "catalogued") + sep +
+    stat(p.ready, "verified") + sep +
+    stat(p.published, "published");
+}
+
+// one line per metric, count first, breakdown right-aligned and muted —
+// a status readout in the app's row idiom, not a dashboard of tiles.
+// A zero metric has nowhere to go — navigating to an empty queue (or opening
+// the remarks sidebar onto nothing) is a dead end, so say so up front by
+// disabling the row rather than linking it. The freshest few drafts follow,
+// so unfinished work is one click away.
+function renderHomeProgress(host, p) {
+  if (!host) return;
   const row = (n, label, act, detail) =>
     `<button class="home-row" ${act}${n ? "" : " disabled"}>` +
       `<span class="hr-n">${n}</span>` +
@@ -2523,15 +2766,12 @@ function renderHome() {
   let html =
     row(inEditor, inEditor === 1 ? "entry in the workbench" : "entries in the workbench",
         `data-gotab="workbench"`, inEditor ? `${p.drafts.length} draft · ${p.ready} to publish` : "") +
-    row(p.srcPending, p.srcPending === 1 ? "PDF source pending verification"
-        : "PDF sources pending verification", `data-gotab="workbench"`) +
     row(attn, attn === 1 ? "item marked for attention"
         : "items marked for attention",
         `data-remarks="1" data-remarks-filter="${attnDest.filter}" ` +
         `data-gotab="${attnDest.tab}"`,
         attnBreakdown.length > 1 ? attnBreakdown.join(" · ") : "");
 
-  // the freshest few drafts, so unfinished work is one click away
   const drafts = p.drafts.slice()
     .sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
   const shown = drafts.slice(0, HOME_DRAFTS_SHOWN);
@@ -2546,19 +2786,15 @@ function renderHome() {
       html += `<button class="home-more" data-gotab="workbench">` +
         `${drafts.length - shown.length} more in the workbench…</button>`;
   }
-  prog.innerHTML = html;
+  host.innerHTML = html;
+}
 
-  const users = el("home-users");
-  if (!homeState.loaded) {
-    feed.innerHTML = `<div class="empty">Loading …</div>`;
-    if (users) users.innerHTML = `<div class="empty">Loading …</div>`;
-    return;
-  }
-
-  // a group expands into its member events: exact local time + what exactly
+// a group expands into its member events: exact local time + what exactly
+function renderHomeActivity(host) {
+  if (!host) return;
   const groups = groupActivity(homeState.events).slice(0, 12);
   const gkey = (g) => `${g.actor}|${g.verb}|${g.subject}|${g.at}`;
-  feed.innerHTML = groups.length
+  host.innerHTML = groups.length
     ? groups.map((g) => {
         const k = gkey(g);
         const open = homeState.expanded.has(k);
@@ -2568,56 +2804,111 @@ function renderHome() {
             `<span class="had-txt">${esc(e.detail ||
               activityPhrase({ verb: e.verb, subject: e.subject, n: e.n || 1 }))}</span>` +
             `</div>`).join("") + `</div>`;
-        // a real button: this discloses the group's events, and was the only
+        // A real button: this discloses the group's events, and was the only
         // click target on Home with no keyboard path (the detail block is a
-        // SIBLING, so nesting stays valid)
+        // SIBLING, so nesting stays valid). Because the row IS a button, the
+        // actor renders as a PLAIN chip — a button inside a button is invalid
+        // HTML and the parser would hoist it out — so the avatar still says who
+        // acted, and their profile stays one click away in Contributors.
+        // What was acted on (book title / review label) rides the row too, so
+        // the feed says who did what to which item without expanding; the
+        // phrase already carries the count, so no "+N" is needed here.
+        const named = g.items.find((e) => e.detail);
         return `<button type="button" class="home-act${open ? " open" : ""}" ` +
           `data-gk="${esc(k)}" aria-expanded="${open}">` +
           `<span class="home-act-arrow" aria-hidden="true">${open ? "&#9662;" : "&#9656;"}</span>` +
-          `<span class="home-who">${esc(g.actor)}</span> ` +
+          `${userChip(g.actor, { cls: "home-who", plain: true })} ` +
           `<span class="home-what">${esc(activityPhrase(g))}</span>` +
+          (named ? `<span class="home-det">${esc(named.detail)}</span>` : "") +
           `<span class="home-when">${esc(relTime(g.at))}</span></button>` + det;
       }).join("")
     : `<div class="empty">No activity recorded yet</div>`;
+}
 
-  // everyone the feed has seen, newest first; your own name is always present
-  if (users) {
-    const me = (state.settings.userName || "").trim();
-    const seen = new Map();
-    for (const e of homeState.events) {
-      const who = String(e.actor || "").trim() || "Unnamed user";
-      const at = Date.parse(e.ts) || 0;
-      const m = seen.get(who) || { n: 0, last: 0 };
-      m.n += e.n || 1;
-      if (at > m.last) m.last = at;
-      seen.set(who, m);
-    }
-    if (me && !seen.has(me)) seen.set(me, { n: 0, last: 0 });
-    const list = [...seen.entries()].sort((a, b) => b[1].last - a[1].last);
-    users.innerHTML = list.length
-      ? list.map(([who, m]) => `<div class="home-user">` +
-          `<span class="hu-name">${esc(who)}</span>` +
-          (who === me ? `<span class="hu-you">you</span>` : "") +
-          `<span class="hu-meta">${m.n
-            ? `${m.n} ${m.n === 1 ? "change" : "changes"}`
-            : "no changes yet"}</span>` +
-          `<span class="hu-when">${m.last ? esc(relTime(m.last)) : ""}</span>` +
-          `</div>`).join("")
-      : `<div class="empty">No contributors recorded yet</div>`;
+// everyone the feed has seen, newest first; your own name is always present.
+// Seed under the same identity your writes are attributed with (see
+// installActorHeader), so the self row matches the actor the feed records.
+function renderHomeContributors(host) {
+  if (!host) return;
+  const me = (authState.displayName || state.settings.userName || "").trim();
+  const seen = new Map();
+  for (const e of homeState.events) {
+    const who = String(e.actor || "").trim() || "Unnamed user";
+    const at = Date.parse(e.ts) || 0;
+    const m = seen.get(who) || { n: 0, last: 0 };
+    m.n += e.n || 1;
+    if (at > m.last) m.last = at;
+    seen.set(who, m);
+  }
+  if (me && !seen.has(me)) seen.set(me, { n: 0, last: 0 });
+  const list = [...seen.entries()].sort((a, b) => b[1].last - a[1].last);
+  host.innerHTML = list.length
+    ? list.map(([who, m]) => `<div class="home-user">` +
+        userChip(who, { cls: "hu-chip", you: isSelfName(who) }) +
+        `<span class="hu-meta">${m.n
+          ? `${m.n} ${m.n === 1 ? "change" : "changes"}`
+          : "no changes yet"}</span>` +
+        `<span class="hu-when">${m.last ? esc(relTime(m.last)) : ""}</span>` +
+        `</div>`).join("")
+    : `<div class="empty">No contributors recorded yet</div>`;
+}
+
+// the review queue as an inline pane (the overlay window still exists too)
+function renderHomeReviews() {
+  const hcb = el("home-review-resolved");
+  if (hcb) hcb.checked = reviewsState.showResolved;
+  renderReviewsInto(el("home-reviews"));
+}
+
+function renderHome() {
+  const prog = el("home-progress");
+  const feed = el("home-activity");
+  if (!prog || !feed) return;
+
+  const p = progressSummary();
+  renderHomeStats(p);
+  renderHomeProgress(prog, p);
+
+  // Until the feed has loaded there is nothing to say about activity, who has
+  // been active, or the queue — the panes below stay as they are.
+  const users = el("home-users");
+  if (!homeState.loaded) {
+    feed.innerHTML = `<div class="empty">Loading …</div>`;
+    if (users) users.innerHTML = `<div class="empty">Loading …</div>`;
+    return;
   }
 
+  renderHomeActivity(feed);
+  renderHomeContributors(users);
+  renderHomeReviews();
 }
 
 function initHome() {
   // the version number is stated once, in the title bar markup; the home
   // page wordmark mirrors it so the two can never disagree
   el("home-ver").textContent = el("tb-meta").textContent;
+  // every workbench-bound row advertises pending work, so land on the Pending
+  // queue even if the book list was left on Uploaded
+  const homeGoToTab = (name) => {
+    if (name === "workbench") state.buildsTab = "pending";
+    const t = document.querySelector(`#tabs .tab[data-tab="${name}"]`);
+    if (t) t.click();
+  };
   el("home-progress").addEventListener("click", (ev) => {
     const d = ev.target.closest("[data-draft]");
     if (d) {
       document.querySelector(`#tabs .tab[data-tab="workbench"]`).click();
       // a draft's next step is its Record — land there with the book selected
       selectWorkbenchBook(d.dataset.draft, "record");
+      return;
+    }
+    // this branch's Home renders the review queue inline: scroll to it rather
+    // than opening the redundant overlay. Falls back to the overlay when the
+    // inline pane isn't present.
+    if (ev.target.closest("[data-review]")) {
+      const pane = el("home-reviews");
+      if (pane) pane.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      else openReviewWin();
       return;
     }
     const b = ev.target.closest("[data-gotab]");
@@ -2628,6 +2919,12 @@ function initHome() {
       document.querySelector(`#tabs .tab[data-tab="${b.dataset.gotab}"]`).click();
       if (b.dataset.remarks) setRemarksCollapsed(false, true);
     }
+  });
+  // the state-of-archive figures jump to the tab that stage lives on
+  const statsEl = el("home-stats");
+  if (statsEl) statsEl.addEventListener("click", (ev) => {
+    const b = ev.target.closest("[data-gotab]");
+    if (b) homeGoToTab(b.dataset.gotab);
   });
   // an activity row toggles its per-event detail
   el("home-activity").addEventListener("click", (ev) => {
@@ -7068,15 +7365,15 @@ function reviewItemHtml(r) {
     `<div class="ri-head">` +
       labelHtml +
       `<span class="ri-meta">${resolved
-        ? `resolved by ${esc(r.resolved_by || "?")} &middot; ${esc(relIso(r.resolved_at))}`
-        : `${esc(r.created_by || "?")} &middot; ${esc(relIso(r.created_at))}`}</span>` +
+        ? `resolved by ${r.resolved_by ? userChip(r.resolved_by, { cls: "ri-who" }) : "?"} &middot; ${esc(relIso(r.resolved_at))}`
+        : `${r.created_by ? userChip(r.created_by, { cls: "ri-who" }) : "?"} &middot; ${esc(relIso(r.created_at))}`}</span>` +
       `<button class="cad-btn tiny" type="button" data-rv-resolve="${resolved ? "0" : "1"}" ` +
         `data-tip="${resolved ? "Reopen this item"
           : "Mark resolved (also clears the attention mark)"}">${resolved ? "Reopen" : "Resolve"}</button>` +
     `</div>` +
     (r.reason ? `<div class="ri-reason">${esc(r.reason)}</div>` : "") +
     (r.comments || []).map((c) => `<div class="ri-comment">` +
-      `<span class="ric-author">${esc(c.author || "?")}</span>` +
+      `${c.author ? userChip(c.author, { cls: "ric-chip" }) : `<span class="ric-author">?</span>`}` +
       `<span class="ric-when">${esc(relIso(c.ts))}</span>` +
       `<div class="ric-text">${esc(c.text)}</div></div>`).join("") +
     `<div class="ri-add">` +
@@ -21678,6 +21975,7 @@ function init() {
   boot("actor header", installActorHeader);   // before any write goes out
   boot("menu bar", initMenubar);
   boot("home", initHome);
+  boot("user profiles", initUserProfile);
   boot("account", initAuth);
   boot("setup wizard", initWizard);
   boot("title bar", fitTitleBar);   // after the menus exist: their width sets the clamp
@@ -22346,6 +22644,7 @@ function init() {
   document.addEventListener("keydown", (ev) => {
     if (ev.key !== "Escape") return;
     if (!el("auth-overlay").hidden) hideAuthOverlay();   // topmost (z 62)
+    else if (!el("uprof-overlay").hidden) closeUserProfile();
     else if (!el("wizard-overlay").hidden) {
       // Esc = set up later. Keep anything typed before recording completion.
       wizCommit().finally(() => closeWizard(true));

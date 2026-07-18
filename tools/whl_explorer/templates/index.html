@@ -126,9 +126,11 @@
           <div id="home-titletext">
             <!-- the version mirrors #tb-meta (initHome), so it is stated once -->
             <h1>Library Tool <span id="home-ver"></span></h1>
+            <!-- state of the archive: the mission stated as a quiet fact -->
+            <div id="home-stats" class="home-stats"></div>
           </div>
           <img id="home-icon" src="{{ url_for('static', filename='icon.png') }}"
-               width="64" height="64" alt="" />
+               width="48" height="48" alt="" />
         </div>
         <div id="home-cols">
           <div class="home-card">
@@ -2479,6 +2481,34 @@
           <button id="confirm-cancel" class="cad-btn" type="button">Cancel</button>
           <button id="confirm-ok" class="cad-btn primary" type="button">OK</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- CONTRIBUTOR PROFILE (opened by clicking any user chip) -->
+  <div id="uprof-overlay" class="overlay" hidden>
+    <div id="uprof-window" class="win win-sm" role="dialog" aria-modal="true"
+         aria-labelledby="uprof-name">
+      <div class="win-titlebar">
+        <span>Contributor</span>
+        <button id="uprof-close" class="win-close" type="button"
+                aria-label="Close" data-icon="close"></button>
+      </div>
+      <div id="uprof-body">
+        <div class="uprof-head">
+          <span id="uprof-avatar" class="uprof-avatar"></span>
+          <div class="uprof-idwrap">
+            <div class="uprof-nameline">
+              <span id="uprof-name" class="uprof-name"></span>
+              <span id="uprof-you" class="uprof-you" hidden>you</span>
+            </div>
+            <div id="uprof-email" class="uprof-email" hidden></div>
+            <div id="uprof-stats" class="uprof-stats"></div>
+          </div>
+        </div>
+        <div class="uprof-h" id="uprof-recent-h">Recent activity</div>
+        <div id="uprof-recent" class="uprof-recent" tabindex="0" role="region"
+             aria-labelledby="uprof-recent-h"></div>
       </div>
     </div>
   </div>
