@@ -144,15 +144,47 @@ def test_publish_preview_matches_online_record_shape_and_supports_sets():
     assert 'data-publish-book=' in preview
 
 
-def test_workbench_book_list_serves_all_builds_with_optional_verified_filter():
+def test_workbench_book_list_is_one_unfiltered_tree():
     body = _function("renderOcrBooks", "selectOcrBook")
-    # the unified list reuses the Editor's queue + volume grouping and filters
-    # to verified (ready OR published) only on demand
-    assert "buildsSorted()" in body
+    # Draft, verified, and published entries always share the same volume tree.
+    assert "allBuildsSorted()" in body
     assert "editorBuildItems" in body
-    assert "!ocrState.verifiedOnly || anAnalyzable(b)" in body
-    # drafts must be reachable to edit their Record: the filter defaults OFF
-    assert "verifiedOnly: false" in APP
+    assert "verifiedOnly" not in body
+    assert "buildsTab" not in body
+    assert 'data-bstab=' not in TEMPLATE
+    assert 'id="ocr-filter-verified"' not in TEMPLATE
+
+
+def test_volume_titles_use_one_non_mutating_tag_formatter_across_surfaces():
+    formatter = _function("bookTitleHtml", "applyTheme")
+    assert 'class="volume-title-tag">Vol.' in formatter
+    assert "esc(volume)" in formatter
+    assert "esc(title)" in formatter
+    assert "book.title =" not in formatter
+
+    for function_name, next_name in (
+        ("renderHome", "initHome"),
+        ("renderAnList", "anSelect"),
+        ("appendBuildListItem", "uploadBuild"),
+        ("renderWorkbench", "selectWorkbenchBook"),
+        ("renderReplicaBooks", "rwConfirmDiscard"),
+    ):
+        assert "bookTitleHtml" in _function(function_name, next_name)
+
+    root = Path(__file__).parents[1] / "website" / "assets"
+    for filename in ("records.js", "book.js", "read.js", "browse.js"):
+        assert "bookTitleHtml" in (root / filename).read_text(encoding="utf-8")
+
+
+def test_description_generation_defaults_explicitly_to_deepseek():
+    body = _function("generateAiSummary", "loadDescriptionFile")
+    assert '"https://api.deepseek.com"' in body
+    assert '"deepseek-chat"' in body
+    assert "Add your DeepSeek API key (Settings > Credentials)" in body
+    assert "Configure the model + API key" not in body
+    assert "descriptionProviderLabel(s)" in body
+    assert "Generating with ${provider}" in body
+    assert "DeepSeek by default, or your configured AI provider" in TEMPLATE
 
 
 def test_catalog_defaults_to_open_search_workspace_without_overwriting_saved_view():
@@ -273,7 +305,7 @@ def test_remarks_sidebar_is_one_shared_accessible_shell_region():
         "remarks-close", "remarks-filter", "remarks-list",
     ):
         assert remarks.count(f'id="{id_}"') == 1
-    assert 'aria-labelledby="remarks-heading"' in remarks
+    assert 'aria-label="Remarks"' in remarks
     assert 'aria-controls="remarks-expanded" aria-expanded="false"' in remarks
     assert 'aria-label="Open Remarks sidebar"' in remarks
     assert 'id="remarks-expanded" hidden' in remarks
@@ -281,6 +313,16 @@ def test_remarks_sidebar_is_one_shared_accessible_shell_region():
     assert 'aria-live="polite"' in remarks
     assert '<label class="tool-label" for="remarks-filter">Show</label>' in remarks
     assert 'aria-label="Collapse Remarks sidebar"' in remarks
+    assert 'class="remarks-rail-icon" data-icon="remarks"' in remarks
+    assert 'id="remarks-heading" class="remarks-heading-icon" role="heading"' in remarks
+    assert 'remarks-rail-label' not in remarks
+    assert '<h2 id="remarks-heading">Remarks</h2>' not in remarks
+
+
+def test_remarks_sidebar_replaces_the_home_awaiting_review_section():
+    assert 'class="home-card home-reviews-card"' not in TEMPLATE
+    assert 'id="home-review-resolved"' not in TEMPLATE
+    assert 'id="home-reviews"' not in TEMPLATE
 
 
 def test_remarks_filter_options_match_target_classes():
@@ -326,11 +368,22 @@ def test_remarks_view_state_and_tab_switch_wiring_are_explicit():
 
 def test_remarks_actions_are_accessible_and_failure_safe():
     item = _function("remarkItemHtml", "remarksGroupHtml")
+    assert '<li class="remarks-item"' in item
+    assert '<details class="remarks-disclosure"' in item
+    assert '<summary class="remarks-item-summary">' in item
+    assert 'class="remarks-comment-count"' in item
+    assert '>(${commentCount})</span>' in item
     assert 'type="button" data-remark-open=' in item
     assert 'aria-label="Open ' in item
     assert 'disabled aria-disabled=\\"true\\"' in item
-    assert 'class="cad-btn tiny remarks-edit" type="button"' in item
+    assert 'class="cad-btn tiny icon-btn remarks-edit" type="button"' in item
     assert 'data-remark-edit=' in item
+    assert 'data-remark-reply=' in item
+    assert 'aria-label="Reply to ' in item
+    assert 'data-remark-resolve=' in item
+    assert 'aria-label="Resolve remark for ' in item
+    assert '${ICONS.reply}' in item
+    assert '${ICONS.check}' in item
 
     apply = APP.split("async function applyRemarkValue", 1)[1].split(
         "async function saveRemarkEditor", 1)[0]
@@ -343,11 +396,41 @@ def test_remarks_actions_are_accessible_and_failure_safe():
     escape = init.split('if (ev.key === "Escape")', 1)[1].split(
         '} else if (ev.key === "Enter"', 1)[0]
     assert "ev.preventDefault()" in escape
-    assert "ev.stopPropagation()" in escape
+    assert "ev.stopPropagation()" in init
 
     collapse = _function("setRemarksCollapsed", "syncRemarksForTab")
     assert "aside.contains(document.activeElement)" in collapse
     assert 'collapsed ? el("remarks-open") : el("remarks-filter")' in collapse
+
+
+def test_remarks_reply_and_resolution_use_the_shared_review_api():
+    reply = _function("submitRemarkReply", "resolveRemarkItem")
+    assert "await ensureRemarkReview(item)" in reply
+    assert '/comment`' in reply
+    assert 'body: JSON.stringify({ text })' in reply
+    assert 'remarksState.replyDraft = ""' in reply
+
+    resolve = _function("resolveRemarkItem", "activateTopTab")
+    assert '/resolve`' in resolve
+    assert 'body: JSON.stringify({ resolved: true })' in resolve
+    assert 'await applyRemarkValue(item, "")' in resolve
+    assert "item.hasAttention === false" in resolve
+    assert "ATTENTION MARK NOT CLEARED" in resolve
+
+
+def test_remarks_keep_open_reviews_reachable_without_inflating_attention_counts():
+    items = _function("remarksItems", "remarkRoute")
+    assert "Object.values(reviewsState.items || {})" in items
+    assert 'review.status !== "open"' in items
+    assert "reviewOnlyRemarkDescriptor(review" in items
+    assert "ids.has(id)" in items
+
+    review_only = _function("reviewOnlyRemarkDescriptor", "remarksItems")
+    assert "item.hasAttention = false" in review_only
+    assert "item.reviewOnly = true" in review_only
+
+    progress = _function("progressSummary", "homeAttentionDestination")
+    assert ".filter((item) => item.hasAttention !== false)" in progress
 
 
 def test_remarks_navigation_guards_dirty_workbench_edits_before_repainting():

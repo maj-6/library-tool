@@ -82,6 +82,8 @@ def test_remarks_long_text_focus_and_narrow_window_contracts():
     assert "#remarks-sidebar button:focus-visible" in STYLE
     assert "#remarks-sidebar select:focus-visible" in STYLE
     assert "#remarks-sidebar textarea:focus-visible" in STYLE
+    assert "#remarks-sidebar input:focus-visible" in STYLE
+    assert "#remarks-sidebar summary:focus-visible" in STYLE
     assert "outline: 2px solid var(--blue)" in STYLE
 
     assert "@media (max-width: 980px)" in STYLE
@@ -90,3 +92,15 @@ def test_remarks_long_text_focus_and_narrow_window_contracts():
     assert "right: 0" in narrow
     assert "bottom: 0" in narrow
     assert "width: min(320px, calc(100% - 70px))" in narrow
+
+
+def test_remarks_items_are_collapsible_threads_with_icon_actions():
+    summary = _rule(".remarks-item-summary")
+    assert "cursor: pointer" in summary
+    assert "list-style: none" in summary
+    assert ".remarks-disclosure[open] > .remarks-item-summary::before" in STYLE
+
+    thread = _rule(".remarks-comment-text")
+    assert "overflow-wrap: anywhere" in thread
+    actions = _rule(".remarks-item-actions")
+    assert "display: flex" in actions

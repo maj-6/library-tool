@@ -21,8 +21,8 @@ import server
 
 def _install_inline_ss(monkeypatch):
     """Run Smart Scan workers synchronously on the calling thread."""
-    def start(target, label, run):
-        job = server._ss_job_new(target, label)
+    def start(target, label, volume, run):
+        job = server._ss_job_new(target, label, volume)
         run(job)
         return job
     monkeypatch.setattr(server, "_ss_job_start", start)
@@ -55,6 +55,18 @@ def _dummy_pdf(data_root: Path, name: str = "book.pdf") -> str:
     p = data_root / name
     p.write_bytes(b"%PDF-dummy")
     return name
+
+
+def _real_pdf(folder: Path, name: str = "book-real.pdf", pages: int = 4) -> Path:
+    from pypdf import PdfWriter
+    folder.mkdir(parents=True, exist_ok=True)
+    p = folder / name
+    writer = PdfWriter()
+    for _ in range(pages):
+        writer.add_blank_page(width=300, height=400)
+    with open(p, "wb") as fh:
+        writer.write(fh)
+    return p
 
 
 def _make_build(client, title="Untitled herbal") -> str:
@@ -95,17 +107,23 @@ def test_smart_scan_extracts_and_stages_an_alternative(client, data_root,
 
     r = client.post("/api/process/smartscan/run",
                     json={"target": f"build:{bid}", "pdf": pdf,
-                          "label": "Volunteer mess title"})
+                          "label": "Volunteer mess title",
+                          "volume": "IV",
+                          "instructions": "Prefer evidence on the title leaf."})
     assert r.status_code == 200
     job = r.get_json()["job"]
     assert job["status"] == "done" and job["state"] == "done"
     assert job["done"] == job["total"]
+    assert job["volume"] == "IV"
+    unified = client.get("/api/jobs").get_json()["jobs"]
+    assert next(j for j in unified if j["id"] == job["id"])["volume"] == "IV"
 
     # early stop: once a title-page signal AND a copyright signal are in hand
     # (pages 2 and 3), pages 4-5 are never OCRed
     assert calls["ocr"] == [1, 2, 3]
     # the extraction prompt carries the page-marked OCR text
     assert "--- page 2 ---" in calls["prompts"][0]
+    assert "Prefer evidence on the title leaf." in calls["prompts"][0]
 
     e = _staged_entry(client, f"build:{bid}")
     assert e and e["kind"] == "build" and e["label"] == "Volunteer mess title"
@@ -209,12 +227,13 @@ def test_smart_scan_remote_url_is_fetched_on_the_worker(client, data_root,
     _fake_pipeline(monkeypatch, _TEXTS, _AI_REPLY)
     fetched = {}
 
-    def fake_cache(url):
+    def fake_download(url):
         fetched["url"] = url
-        p = data_root / "cached.pdf"
+        server._SS_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        p = server._SS_TEMP_DIR / "worker.pdf"
         p.write_bytes(b"%PDF-dummy")
         return p
-    monkeypatch.setattr(server, "_remote_pdf_cache", fake_cache)
+    monkeypatch.setattr(server, "_ss_download_remote_temp", fake_download)
 
     bid = _make_build(client)
     url = "https://archive.org/download/x/x.pdf"
@@ -222,7 +241,197 @@ def test_smart_scan_remote_url_is_fetched_on_the_worker(client, data_root,
                     json={"target": f"build:{bid}", "url": url})
     assert r.get_json()["job"]["status"] == "done"
     assert fetched["url"] == url
+    assert not (server._SS_TEMP_DIR / "worker.pdf").exists()
     assert _staged_entry(client, f"build:{bid}") is not None
+
+
+def test_smart_scan_uses_target_local_pdf_instead_of_downloading(
+        client, data_root, monkeypatch):
+    """A stale client may send the source URL after the build got a local PDF;
+    the server must still prefer the attached copy."""
+    _install_inline_ss(monkeypatch)
+    _fake_pipeline(monkeypatch, _TEXTS, _AI_REPLY)
+    bid = _make_build(client)
+    local = _dummy_pdf(data_root, "already-local.pdf")
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+    builds[bid]["pdf_file"] = local
+    server.lib.save_json(server.BUILDS_PATH, builds)
+
+    def no_download(_url):
+        raise AssertionError("local PDF should win")
+    monkeypatch.setattr(server, "_ss_download_remote_temp", no_download)
+
+    r = client.post("/api/process/smartscan/run", json={
+        "target": f"build:{bid}",
+        "url": "https://archive.org/download/x/x.pdf"})
+    assert r.status_code == 200
+    assert r.get_json()["job"]["status"] == "done"
+
+
+def test_smart_scan_remote_temp_is_streamed_without_viewer_size_cap(
+        data_root, monkeypatch):
+    """Smart Scan's disposable copy is not subject to the persistent viewer
+    cache's byte cap, and the response is consumed in bounded chunks."""
+    chunks = [b"%PDF-", b"larger-than-the-test-cap", b""]
+
+    class Response:
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size):
+            return chunks.pop(0)
+
+    monkeypatch.setattr(server, "_ssrf_guard", lambda _url: None)
+    monkeypatch.setattr(server._pdf_opener, "open",
+                        lambda _req, timeout=90: Response())
+    monkeypatch.setattr(server, "_REMOTE_PDF_MAX_BYTES", 6)
+
+    out = server._ss_download_remote_temp("https://example.org/large.pdf")
+    try:
+        assert out.read_bytes() == b"%PDF-larger-than-the-test-cap"
+    finally:
+        out.unlink(missing_ok=True)
+
+
+def test_smart_scan_prepare_reuses_archive_download(client, data_root,
+                                                     monkeypatch):
+    local = server._ia_pdf_path("already-downloaded")
+    _real_pdf(local.parent, local.name, pages=3)
+
+    def no_download(_url):
+        raise AssertionError("existing IA download should win")
+    monkeypatch.setattr(server, "_ss_download_remote_temp", no_download)
+
+    r = client.post("/api/process/smartscan/prepare", json={
+        "target": "whl:42",
+        "url": ("https://archive.org/download/already-downloaded/"
+                "already-downloaded_text.pdf")})
+    assert r.status_code == 200
+    got = r.get_json()
+    assert got == {"ok": True, "pdf": "downloads/ia/already-downloaded.pdf",
+                   "pages": 3, "temporary": False, "reused": True,
+                   "source": "internet-archive"}
+
+
+def test_smart_scan_prepare_and_retain_selected_pages(client, data_root,
+                                                       monkeypatch):
+    prepared = _real_pdf(server._SS_TEMP_DIR, "prepared-source.pdf", pages=4)
+    monkeypatch.setattr(server, "_ss_download_remote_temp", lambda _url: prepared)
+
+    r = client.post("/api/process/smartscan/prepare", json={
+        "target": "whl:42", "url": "https://example.org/book.pdf"})
+    assert r.status_code == 200
+    info = r.get_json()
+    assert info["temporary"] is True and info["pages"] == 4
+    assert info["pdf"] == "downloads/smartscan/temp/prepared-source.pdf"
+
+    r = client.post("/api/process/smartscan/select-pages", json={
+        "target": "whl:42", "pdf": info["pdf"], "pages": [3, 1, 3]})
+    assert r.status_code == 200
+    selected = r.get_json()
+    assert selected["pages"] == [1, 3]
+    assert selected["page_count"] == 2
+    assert selected["source_pages"] == 4
+    out = data_root / selected["pdf"]
+    assert out.is_file()
+    from pypdf import PdfReader
+    assert len(PdfReader(str(out)).pages) == 2
+    # The full remote working copy is no longer needed once the small retained
+    # selection exists.
+    assert not prepared.exists()
+
+    preview_info = client.get("/api/pdf/info", query_string={
+        "path": selected["pdf"]}).get_json()
+    assert preview_info["ok"] and preview_info["pages"] == 2
+
+
+def test_smart_scan_selection_closes_preview_handle_before_temp_delete(
+        client, data_root, monkeypatch):
+    """The page picker caches an open MuPDF document; Windows cannot remove
+    the prepared full PDF until that handle is explicitly evicted."""
+    prepared = _real_pdf(server._SS_TEMP_DIR, "previewed-source.pdf", pages=2)
+    monkeypatch.setattr(server, "_ss_download_remote_temp", lambda _url: prepared)
+
+    r = client.post("/api/process/smartscan/prepare", json={
+        "target": "whl:42", "url": "https://example.org/previewed.pdf"})
+    assert r.status_code == 200
+    info = r.get_json()
+
+    preview = client.get("/api/pdf/pageimg", query_string={
+        "path": info["pdf"], "page": 1, "w": 600})
+    assert preview.status_code == 200
+    prepared_key = server._pdf_doc_cache_key(prepared)
+    with server._doc_lock:
+        assert any(server._pdf_doc_cache_key(key[0]) == prepared_key
+                   for key in server._doc_cache)
+
+    r = client.post("/api/process/smartscan/select-pages", json={
+        "target": "whl:42", "pdf": info["pdf"], "pages": [1]})
+    assert r.status_code == 200
+    assert not prepared.exists()
+    with server._doc_lock:
+        assert not any(server._pdf_doc_cache_key(key[0]) == prepared_key
+                       for key in server._doc_cache)
+
+
+def test_smart_scan_selected_pages_are_validated_before_subset(client):
+    prepared = _real_pdf(server._SS_TEMP_DIR, "retry-source.pdf", pages=2)
+    rel = server._ss_api_path(prepared)
+    r = client.post("/api/process/smartscan/select-pages", json={
+        "target": "whl:42", "pdf": rel, "pages": []})
+    assert r.status_code == 400 and "select at least one" in r.get_json()["error"]
+    r = client.post("/api/process/smartscan/select-pages", json={
+        "target": "whl:42", "pdf": rel, "pages": [3]})
+    assert r.status_code == 400 and "page count 2" in r.get_json()["error"]
+    # Keep a prepared source after a validation error so the marker can correct
+    # its selection without downloading the remote PDF again.
+    assert prepared.is_file()
+
+
+def test_smart_scan_selected_pdf_ocrs_every_marked_page(client, data_root,
+                                                         monkeypatch):
+    _install_inline_ss(monkeypatch)
+    texts = {n: ("Publisher 1900" if n == 1 else
+                 "Copyright 1900" if n == 2 else f"Selected page {n}")
+             for n in range(1, 11)}
+    calls = _fake_pipeline(monkeypatch, texts, _AI_REPLY)
+    original = _real_pdf(data_root, "ten-pages.pdf", pages=10)
+    selected = server._ss_selected_pdf(original, list(range(1, 11)))
+    bid = _make_build(client)
+
+    r = client.post("/api/process/smartscan/run", json={
+        "target": f"build:{bid}", "pdf": server._ss_api_path(selected)})
+    assert r.get_json()["job"]["status"] == "done"
+    # Explicit page choices bypass both the automatic eight-page cap and its
+    # early stop once title/copyright signals are found.
+    assert calls["ocr"] == list(range(1, 11))
+
+
+def test_smart_scan_deepseek_uses_dedicated_settings_instructions(monkeypatch):
+    monkeypatch.setattr(server, "_client_settings", lambda: {
+        "aiKey": "dk", "aiModel": "deepseek-chat",
+        "smartScanInstructions": "Prefer the printed imprint over cover text."})
+    cfg = server._ai_cfg()
+    assert cfg["smart_scan_instructions"] == (
+        "Prefer the printed imprint over cover text.")
+    seen = {}
+
+    def fake_ai_json(call_cfg, messages, temperature=0.2):
+        seen["cfg"] = call_cfg
+        seen["prompt"] = messages[0]["content"]
+        return {"title": "The Printed Title"}
+    monkeypatch.setattr(server, "_ai_json", fake_ai_json)
+
+    got, model = server._sc_extract("--- page 1 ---\nOCR")
+    assert got["title"] == "The Printed Title"
+    assert model == "deepseek-chat"
+    assert "Additional Smart Scan instructions" in seen["prompt"]
+    assert "Prefer the printed imprint over cover text." in seen["prompt"]
 
 
 def test_smart_scan_job_fails_cleanly_without_readable_pages(client, data_root,

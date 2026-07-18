@@ -3,7 +3,10 @@
 // preview; the side column carries a formal metadata table and the action
 // buttons, with availability affordances driven by volumes.assets.
 
-import { getVolume, getAbout, getNotes, pdfHref, thumbHref, safeHttpUrl, catText } from "./data.js";
+import {
+  getVolume, getAbout, getNotes, pdfHref, thumbHref, safeHttpUrl, catText,
+  bookTitleHtml, bookTitleText,
+} from "./data.js";
 import { renderMarkdown } from "./markdown.js";
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
@@ -129,7 +132,7 @@ function notFound(slug) {
 
 function titleBlock(v) {
   return `
-    <h1 class="book-title">${esc(v.title)}</h1>
+    <h1 class="book-title">${bookTitleHtml(v)}</h1>
     ${v.subtitle ? `<p class="book-subtitle">${esc(v.subtitle)}</p>` : ""}
     ${v.authors ? `<p class="book-author">${esc(v.authors)}</p>` : ""}
     <p class="book-imprint">
@@ -171,7 +174,7 @@ async function main() {
 
   // Frame first (metadata is already in hand); About and notes fill in after.
   box.innerHTML = `
-    <p class="crumb"><a href="browse.html">Catalogue</a> › ${esc(v.title)}</p>
+    <p class="crumb"><a href="browse.html">Catalogue</a> › ${bookTitleHtml(v)}</p>
     <div class="record-page">
       <div class="book-main">
         ${titleBlock(v)}
@@ -186,7 +189,7 @@ async function main() {
         ${availability(v)}
       </aside>
     </div>`;
-  document.title = `${v.title} · Archive Browser`;
+  document.title = `${bookTitleText(v)} · Archive Browser`;
 
   const a = (v && v.assets) || {};
   if (a.about) {

@@ -119,13 +119,15 @@ def test_workbench_readiness_lives_on_the_single_phase_rail():
 
 def test_workbench_sidebar_controls_are_named_and_keyboard_operable():
     toolbar = _between(TEMPLATE, '<div class="pane-bar" id="builds-tabs">', "</div>")
-    assert 'aria-label="Show verified books only"' in toolbar
-    assert 'aria-pressed="false"' in toolbar
+    assert '<span class="tool-label">Entries</span>' in toolbar
+    assert 'data-bstab=' not in toolbar
+    assert 'Show verified books only' not in toolbar
     assert 'aria-label="Collapse the entries and artifacts sidebar"' in toolbar
     assert 'aria-controls="ocr-side"' in toolbar
 
     render = _between(APP, "function renderOcrBooks", "async function selectOcrBook")
-    assert 'verifiedFilter.setAttribute("aria-pressed"' in render
+    assert "allBuildsSorted()" in render
+    assert "verifiedOnly" not in render
     assert 'li.setAttribute("role", "button")' in render
     assert 'li.setAttribute("aria-expanded"' in render
     row = _between(APP, "function appendBuildListItem", "// Publish a verified entry")
@@ -136,6 +138,8 @@ def test_workbench_sidebar_controls_are_named_and_keyboard_operable():
     assert 'ev.key !== "Enter" && ev.key !== " "' in keyboard
     assert "row.click()" in keyboard
     assert ".build-item:focus-visible" in STYLE
+    assert "min-width: 260px" in _between(STYLE, "#ocr-side {", "}")
+    assert 'widthSplit("ocr-splitter", "ocrSide", "ocr-side", 260, 620)' in APP
 
 
 def test_analyze_facsimile_and_artifact_tree_contracts():

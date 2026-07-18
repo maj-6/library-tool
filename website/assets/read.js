@@ -7,7 +7,10 @@
 // pre-sized placeholder so the scrollbar never jumps. Margin annotations come
 // from volume_notes; a page-aligned text/translation panel from volume_pages.
 
-import { getVolume, getNotes, getPages, getAllPages, pdfHref, searchVolume, usingCloud } from "./data.js";
+import {
+  getVolume, getNotes, getPages, getAllPages, pdfHref, searchVolume, usingCloud,
+  bookTitleHtml, bookTitleText,
+} from "./data.js";
 import { normalizeSearchText, findMatchRanges, searchPages, rpcSnippetHtml, rpcHitsUsable } from "./textsearch.js";
 import * as pdfjsLib from "./vendor/pdfjs/build/pdf.min.mjs";
 
@@ -468,8 +471,8 @@ async function main() {
   catch (e) { message("Error", `Could not load the record: ${e.message}`); return; }
   if (!v) { message("Not found", "No volume is filed under this slug."); return; }
 
-  el("title").textContent = v.title;
-  el("title").title = v.title;
+  el("title").innerHTML = bookTitleHtml(v);
+  el("title").title = bookTitleText(v);
   el("back").href = `book.html?slug=${encodeURIComponent(slug)}`;
 
   const url = pdfHref(v);

@@ -39,11 +39,25 @@ function dataApi({ cloud = true, fetch: fetchFn }) {
     fetch: fetchFn,
   });
   vm.runInContext(
-    `${dataSource}\nthis.api = { searchVolumes, facetSource, contentRangeTotal };`,
+    `${dataSource}\nthis.api = { searchVolumes, facetSource, contentRangeTotal,
+      bookTitleText, bookTitleHtml };`,
     context,
   );
   return context.api;
 }
+
+test("public title formatter prefixes escaped volume metadata without mutation", () => {
+  const api = dataApi({ cloud: false, fetch: fetchStub([]) });
+  const volume = { title: "Herbs <&>", volume: '3"' };
+  const before = JSON.stringify(volume);
+  assert.equal(api.bookTitleText(volume), 'Vol. 3" Herbs <&>');
+  assert.match(api.bookTitleHtml(volume),
+    /volume-title-tag">Vol\. 3&quot;<\/span>.*Herbs &lt;&amp;&gt;/);
+  assert.equal(api.bookTitleText({
+    title: "Legacy Herbs", volume: "", volume_number: "IV",
+  }), "Vol. IV Legacy Herbs");
+  assert.equal(JSON.stringify(volume), before);
+});
 
 // A recording fetch stub. Routes are [match(url, init), respond(url, init)]
 // pairs, first match wins; a responder returns {json, contentRange, fail}.

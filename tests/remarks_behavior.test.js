@@ -33,6 +33,7 @@ function plain(value) {
 
 const modelSource = [
   declaration("homeAttentionDestination"),
+  declaration("bookVolumeValue"),
   block("const REMARK_CATEGORIES = [", "const remarksState ="),
   declaration("attnHas"),
   declaration("attnValue"),
@@ -49,11 +50,15 @@ const modelSource = [
   declaration("setRemarksFilterForTab"),
   declaration("remarkSecondary"),
   declaration("keyedRemarkDescriptor"),
+  declaration("reviewLabelBook"),
+  declaration("reviewOnlyRemarkDescriptor"),
   declaration("remarksItems"),
   declaration("remarkRoute"),
+  declaration("remarkReviewForItem"),
+  declaration("remarkCommentCount"),
 ].join("\n");
 
-function remarksHarness({ state: stateSeed, rows = [], sources = [] } = {}) {
+function remarksHarness({ state: stateSeed, rows = [], sources = [], reviews = {} } = {}) {
   const state = Object.assign({
     settings: { remarksFilters: {} },
     builds: {},
@@ -66,6 +71,7 @@ function remarksHarness({ state: stateSeed, rows = [], sources = [] } = {}) {
   const saves = [];
   const context = vm.createContext({
     state,
+    reviewsState: { items: reviews },
     combinedRows: () => rows,
     approvedSources: () => sources,
     saveSettings: () => saves.push(plain(state.settings.remarksFilters)),
@@ -77,7 +83,8 @@ this.api = {
   attnValue, attnReason, remarkKeyParts, remarkCategoryForKey,
   sourceRemarkKeys, activeSourceRemarkKey, sourceMatchesRemark, setAttnKey,
   remarksDefaultFilter, remarksFilterForTab, setRemarksFilterForTab,
-  remarksItems, remarkRoute,
+  reviewLabelBook, reviewOnlyRemarkDescriptor,
+  remarksItems, remarkRoute, remarkReviewForItem, remarkCommentCount,
 };`, context);
   return { api: context.api, saves, state };
 }
@@ -304,7 +311,7 @@ test("remarks aggregate canonical rows, builds, and keyed marks exactly once", (
   const sourceKey = "src:https://archive.example/item:a";
   const rows = [
     { id: "checked-1", kind: "checked", attention: "Verify year",
-      book: { title: "A Checked Herbal", author: "Ada", year: "1901" } },
+      book: { title: "A Checked Herbal", volume: "2", author: "Ada", year: "1901" } },
     { id: "manual-1", kind: "manual", attention: true,
       book: { title: "Manual Herbal", author: "Bea", year: "1902" } },
     { id: "capture-1", kind: "manual", captured: true, attention: "Retake photo",
@@ -317,7 +324,7 @@ test("remarks aggregate canonical rows, builds, and keyed marks exactly once", (
     title: "Archive Scan",
     archive: "Internet Archive",
     author: "Dana",
-    year: "1874",
+    year: "1874", volume: "3",
   }];
   const { api } = remarksHarness({
     rows,
@@ -354,12 +361,14 @@ test("remarks aggregate canonical rows, builds, and keyed marks exactly once", (
   );
 
   assert.equal(items.find((item) => item.id === "row:checked-1").subtype, "Checked book");
+  assert.equal(items.find((item) => item.id === "row:checked-1").volume, "2");
   assert.equal(items.find((item) => item.id === "row:manual-1").subtype, "Manual entry");
   assert.equal(items.find((item) => item.id === "row:capture-1").subtype, "Phone capture");
   assert.equal(items.find((item) => item.id === "build:published").subtype, "Published entry");
 
   const source = items.find((item) => item.id === `key:${sourceKey}`);
   assert.equal(source.label, "Archive Scan");
+  assert.equal(source.volume, "3");
   assert.equal(source.reason, "");
   assert.equal(source.canOpen, true);
 
@@ -367,6 +376,193 @@ test("remarks aggregate canonical rows, builds, and keyed marks exactly once", (
   assert.equal(stale.label, "Historical OL hit");
   assert.equal(stale.reason, "Recover result");
   assert.equal(stale.canOpen, false);
+});
+
+test("open review threads remain in Remarks after their attention mark is gone", () => {
+  const rows = [
+    { id: "marked", kind: "checked", attention: "Keep attention",
+      book: { title: "Marked Herbal" } },
+    { id: "clean", kind: "manual", attention: "",
+      book: { title: "Clean Herbal" } },
+  ];
+  const { api } = remarksHarness({
+    rows,
+    state: {
+      builds: {
+        draft: { id: "draft", status: "draft", attention: "",
+          title: "Draft Herbal", volume: "3", authors: "Ada", year: "1903" },
+      },
+    },
+    reviews: {
+      duplicate: {
+        id: "duplicate", key: "row:marked", kind: "row", ref: "marked",
+        status: "open", label: "Marked Herbal", reason: "Shared copy", comments: [],
+      },
+      orphan: {
+        id: "orphan", key: "row:missing", kind: "row", ref: "missing",
+        status: "open", label: "Vol. 4 Orphan Herbal", reason: "Still discuss this",
+        comments: [{ author: "Ada", text: "Keep reachable" }],
+      },
+      build: {
+        id: "build", key: "build:draft", kind: "build", ref: "draft",
+        status: "open", label: "Draft Herbal", reason: "Check rights", comments: [],
+      },
+      closed: {
+        id: "closed", key: "row:closed", kind: "row", ref: "closed",
+        status: "resolved", label: "Closed Herbal", reason: "Done", comments: [],
+      },
+    },
+  });
+
+  const items = plain(api.remarksItems());
+  assert.deepEqual(items.map((item) => item.id).sort(),
+    ["build:draft", "row:marked", "row:missing"]);
+  assert.equal(items.filter((item) => item.id === "row:marked").length, 1,
+    "an open review does not duplicate an existing attention item");
+  assert.equal(items.find((item) => item.id === "row:marked").hasAttention, true);
+
+  const orphan = items.find((item) => item.id === "row:missing");
+  assert.equal(orphan.hasAttention, false);
+  assert.equal(orphan.reviewOnly, true);
+  assert.equal(orphan.label, "Orphan Herbal");
+  assert.equal(orphan.volume, "4");
+  assert.equal(orphan.reason, "Still discuss this");
+  assert.equal(orphan.canOpen, false);
+  assert.equal(api.remarkCommentCount(orphan), 1);
+
+  const build = items.find((item) => item.id === "build:draft");
+  assert.equal(build.hasAttention, false);
+  assert.equal(build.canOpen, true);
+  assert.equal(build.volume, "3");
+});
+
+test("remarks prefer the open shared thread and report its comment count", () => {
+  const item = { kind: "build", ref: "draft-1" };
+  const { api } = remarksHarness({
+    reviews: {
+      old: {
+        id: "old", key: "build:draft-1", status: "resolved",
+        created_at: "2026-07-18T10:00:00Z",
+        comments: [{ text: "old" }, { text: "thread" }],
+      },
+      current: {
+        id: "current", key: "build:draft-1", status: "open",
+        created_at: "2026-07-18T09:00:00Z",
+        comments: [{ text: "current reply" }],
+      },
+      other: {
+        id: "other", key: "row:unrelated", status: "open",
+        created_at: "2026-07-18T11:00:00Z", comments: [],
+      },
+    },
+  });
+
+  assert.equal(api.remarkReviewForItem(item).id, "current");
+  assert.equal(api.remarkCommentCount(item), 1);
+  assert.equal(api.remarkReviewForItem({ kind: "row", ref: "missing" }), null);
+  assert.equal(api.remarkCommentCount({ kind: "row", ref: "missing" }), 0);
+});
+
+test("sidebar Reply posts to the shared review thread and clears only a saved draft", async () => {
+  const calls = [];
+  const item = { id: "build:draft-1", kind: "build", ref: "draft-1", label: "Draft" };
+  const review = { id: "review-1", key: "build:draft-1", status: "open", comments: [] };
+  const saved = { ...review, comments: [{ author: "Ada", text: "Please verify" }] };
+  const remarksState = {
+    replyDraft: "Please verify", replySaving: false, replying: item.id,
+    error: "", errorItem: null, expanded: new Set(),
+  };
+  const reviewsState = { items: {} };
+  const context = vm.createContext({
+    remarksState, reviewsState,
+    remarksItemById: () => item,
+    ensureRemarkReview: async () => review,
+    fetch: async (url, opts) => {
+      calls.push([url, JSON.parse(opts.body)]);
+      return { ok: true, json: async () => ({ review: saved }) };
+    },
+    renderRemarks() {}, renderReviewList() {}, status() {},
+  });
+  vm.runInContext(`${declaration("submitRemarkReply")}
+this.api = { submitRemarkReply };`, context);
+
+  assert.equal(await context.api.submitRemarkReply(item.id), true);
+  assert.deepEqual(calls, [["/api/reviews/review-1/comment", { text: "Please verify" }]]);
+  assert.equal(remarksState.replyDraft, "");
+  assert.equal(remarksState.replying, null);
+  assert.equal(remarksState.expanded.has(item.id), true);
+  assert.equal(reviewsState.items[review.id].comments.length, 1);
+});
+
+test("sidebar Resolve closes the shared review before clearing its attention mark", async () => {
+  const calls = [];
+  const item = { id: "row:checked-1", kind: "row", ref: "checked-1", label: "Herbal" };
+  const review = { id: "review-2", key: "row:checked-1", status: "open", comments: [] };
+  const remarksState = {
+    resolving: null, error: "", errorItem: null, expanded: new Set([item.id]),
+    editing: null, replying: null, replyDraft: "",
+  };
+  const reviewsState = { items: { [review.id]: review } };
+  const context = vm.createContext({
+    remarksState, reviewsState,
+    remarksItemById: () => item,
+    bookTitleText: (book) => book.title,
+    confirmDialog: async () => true,
+    remarkReviewForItem: () => review,
+    fetch: async (url, opts) => {
+      calls.push(["fetch", url, JSON.parse(opts.body)]);
+      return { ok: true, json: async () => ({ review: { ...review, status: "resolved" } }) };
+    },
+    applyRemarkValue: async (...args) => { calls.push(["clear", ...args]); return true; },
+    renderRemarks() {}, renderReviewList() {}, status() {},
+  });
+  vm.runInContext(`${declaration("resolveRemarkItem")}
+this.api = { resolveRemarkItem };`, context);
+
+  assert.equal(await context.api.resolveRemarkItem(item.id), true);
+  assert.deepEqual(plain(calls), [
+    ["fetch", "/api/reviews/review-2/resolve", { resolved: true }],
+    ["clear", item, ""],
+  ]);
+  assert.equal(reviewsState.items[review.id].status, "resolved");
+  assert.equal(remarksState.expanded.has(item.id), false);
+});
+
+test("resolving a review-only remark closes the thread without recreating a mark", async () => {
+  const calls = [];
+  let confirmCopy = null;
+  const item = {
+    id: "row:missing", kind: "row", ref: "missing", label: "Orphan Herbal",
+    hasAttention: false, reviewOnly: true,
+  };
+  const review = { id: "review-3", key: "row:missing", status: "open", comments: [] };
+  const remarksState = {
+    resolving: null, error: "", errorItem: null, expanded: new Set([item.id]),
+    editing: null, replying: null, replyDraft: "",
+  };
+  const reviewsState = { items: { [review.id]: review } };
+  const context = vm.createContext({
+    remarksState, reviewsState,
+    remarksItemById: () => item,
+    bookTitleText: (book) => book.title,
+    confirmDialog: async (copy) => { confirmCopy = copy; return true; },
+    remarkReviewForItem: () => review,
+    fetch: async (url, opts) => {
+      calls.push(["fetch", url, JSON.parse(opts.body)]);
+      return { ok: true, json: async () => ({ review: { ...review, status: "resolved" } }) };
+    },
+    applyRemarkValue: async (...args) => { calls.push(["unexpected-clear", ...args]); return true; },
+    renderRemarks() {}, renderReviewList() {}, status() {},
+  });
+  vm.runInContext(`${declaration("resolveRemarkItem")}
+this.api = { resolveRemarkItem };`, context);
+
+  assert.equal(await context.api.resolveRemarkItem(item.id), true);
+  assert.deepEqual(calls, [
+    ["fetch", "/api/reviews/review-3/resolve", { resolved: true }],
+  ]);
+  assert.equal(confirmCopy.detail, "This closes the shared discussion.");
+  assert.equal(reviewsState.items[review.id].status, "resolved");
 });
 
 test("remark routes cover every supported target without mutating sidebar state", () => {

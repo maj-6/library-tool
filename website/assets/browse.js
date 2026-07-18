@@ -5,7 +5,7 @@
 
 import {
   searchVolumes, usingCloud, safeYear, facetSource, catText,
-  suggestTitles, suggestAuthors, getAuthorBio,
+  suggestTitles, suggestAuthors, getAuthorBio, bookTitleHtml,
 } from "./data.js";
 import { renderRecord } from "./records.js";
 
@@ -332,7 +332,7 @@ function renderSuggest(titles, authors) {
   if (!suggestItems.length) { closeSuggest(); return; }
   const titleRows = titles.map((t, i) =>
     `<li class="suggest-row" data-idx="${i}" role="option">
-       <span class="suggest-title">${esc(t.title)}</span>
+       <span class="suggest-title">${bookTitleHtml(t)}</span>
        ${t.authors ? `<span class="suggest-meta">${esc(t.authors)}</span>` : ""}
      </li>`).join("");
   const authorRows = authors.map((a, i) =>

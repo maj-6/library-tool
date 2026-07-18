@@ -20,6 +20,15 @@ const state = {
 const context = vm.createContext({
   state,
   setBaseTitle: (book) => String(book.title || "").trim(),
+  bookTitleText: (book, fallback = "Untitled") => {
+    const title = String(book.title || fallback);
+    return book.volume ? `Vol. ${book.volume} ${title}` : title;
+  },
+  bookTitleHtml: (book, fallback = "Untitled") => {
+    const title = String(book.title || fallback);
+    return book.volume
+      ? `<span class="volume-title-tag">Vol. ${book.volume}</span>${title}` : title;
+  },
   esc: (value) => String(value == null ? "" : value)
     .replace(/&/g, "&amp;").replace(/"/g, "&quot;")
     .replace(/</g, "&lt;").replace(/>/g, "&gt;"),
@@ -142,4 +151,14 @@ test("organizational labels are buttons without ARIA treeitem/group markup", () 
   const html = api.publishTreeNodeHtml(api.publishTreeModel()[0], 0);
   assert.match(html, /<button class="publish-tree-label"[^>]+data-publish-toggle=/);
   assert.doesNotMatch(html, /role="(?:treeitem|group)"/);
+});
+
+test("published volume nodes prefix their titles with the volume tag", () => {
+  reset([
+    { slug: "work-1", title: "Work", group_id: "work", volume: "1" },
+    { slug: "work-2", title: "Work", group_id: "work", volume: "2" },
+  ]);
+  const setNode = api.publishTreeModel()[0];
+  const html = api.publishTreeNodeHtml(setNode.children[0], 1);
+  assert.match(html, /class="volume-title-tag">Vol\. 1<\/span>Work/);
 });

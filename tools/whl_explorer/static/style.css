@@ -919,18 +919,6 @@ input, textarea, [contenteditable="true"], .cell-edit,
   padding-bottom: 5px;
   margin-bottom: 7px;
 }
-/* the review queue as an inline home pane, full width under the three columns */
-.home-reviews-card { margin-top: 16px; }
-.home-reviews-h { display: flex; align-items: center; justify-content: space-between; }
-.home-rv-resolved {
-  text-transform: none;
-  letter-spacing: 0;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  cursor: pointer;
-}
-#home-reviews { max-height: 360px; overflow: auto; }
 /* In-progress panel: a terse status readout over the freshest drafts —
    count column, label, muted breakdown on the right. Rows, not tiles. */
 .home-row {
@@ -1602,13 +1590,10 @@ main {
   font: 11px var(--ui);
 }
 .remarks-rail-toggle:hover { background: var(--face-active); }
-.remarks-rail-arrow { color: var(--remarks-accent); font-size: 10px; }
-.remarks-rail-label {
-  writing-mode: vertical-rl;
-  text-orientation: mixed;
-  letter-spacing: 1.2px;
-  font-weight: 600;
-}
+.remarks-rail-arrow { color: var(--remarks-accent); }
+.remarks-rail-arrow svg { width: 12px; height: 12px; }
+.remarks-rail-icon { color: var(--ink); }
+.remarks-rail-icon svg { width: 18px; height: 18px; }
 .remarks-count {
   min-width: 19px;
   height: 19px;
@@ -1635,15 +1620,11 @@ main {
   min-width: 0;
   flex: 1;
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
 }
-#remarks-heading {
-  margin: 0;
-  color: var(--ink);
-  font: 600 13px/1.2 var(--ui);
-  letter-spacing: 0.5px;
-}
+.remarks-heading-icon { display: inline-flex; color: var(--remarks-accent); }
+.remarks-heading-icon svg { width: 17px; height: 17px; }
 #remarks-total { margin-left: 0; }
 .remarks-collapse { width: 25px; padding-left: 0; padding-right: 0; flex: none; }
 .remarks-filter-row {
@@ -1676,6 +1657,7 @@ main {
   text-transform: uppercase;
 }
 .remarks-group-count { margin-left: auto; font-weight: normal; }
+.remarks-items { margin: 0; padding: 0; list-style: none; }
 .remarks-item {
   margin: 5px 0 0;
   border: 1px solid var(--face-sh);
@@ -1684,27 +1666,46 @@ main {
   background: var(--face-hi);
   overflow: hidden;
 }
-.remarks-open-item {
-  width: 100%;
+.remarks-disclosure { display: block; }
+.remarks-item-summary {
+  position: relative;
   display: block;
-  padding: 8px 9px 6px;
-  border: 0;
-  background: transparent;
+  padding: 8px 9px 6px 25px;
   color: var(--ink);
-  text-align: left;
   cursor: pointer;
   font-family: var(--ui);
+  list-style: none;
 }
-.remarks-open-item:hover:not(:disabled) { background: var(--face-active); }
-.remarks-open-item:disabled { cursor: default; opacity: 0.78; }
+.remarks-item-summary::-webkit-details-marker { display: none; }
+.remarks-item-summary::before {
+  content: "";
+  position: absolute;
+  top: 12px;
+  left: 10px;
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid var(--remarks-accent);
+  border-bottom: 1.5px solid var(--remarks-accent);
+  transform: rotate(-45deg);
+  transition: transform 100ms ease;
+}
+.remarks-disclosure[open] > .remarks-item-summary::before { transform: rotate(45deg); }
+.remarks-item-summary:hover { background: var(--face-active); }
+.remarks-summary-title { display: flex; align-items: baseline; gap: 5px; min-width: 0; }
 .remarks-item-title {
-  display: block;
+  display: inline-block;
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 12px;
   font-weight: 600;
+}
+.remarks-comment-count {
+  flex: 0 0 auto;
+  color: var(--ink-mut);
+  font: 10px/1.2 var(--mono);
 }
 .remarks-item-meta {
   display: block;
@@ -1713,6 +1714,7 @@ main {
   font-size: 10px;
   line-height: 1.35;
 }
+.remarks-item-body { padding: 0 9px 7px 25px; }
 .remarks-reason {
   display: block;
   margin-top: 6px;
@@ -1722,20 +1724,27 @@ main {
   overflow-wrap: anywhere;
 }
 .remarks-reason.empty { padding: 0; text-align: left; letter-spacing: 0; font-style: italic; color: var(--ink-mut); }
+.remarks-thread { margin-top: 7px; }
+.remarks-comment {
+  margin-top: 5px;
+  padding: 3px 0 3px 8px;
+  border-left: 2px solid var(--face-sh);
+}
+.remarks-comment-author { font-size: 10.5px; font-weight: 600; }
+.remarks-comment-when { margin-left: 6px; color: var(--ink-mut); font-size: 9.5px; }
+.remarks-comment-text { margin-top: 1px; font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
+.remarks-no-comments { margin-top: 7px; color: var(--ink-mut); font-size: 10.5px; font-style: italic; }
+.remarks-reply { display: flex; align-items: center; gap: 4px; margin-top: 7px; }
+.remarks-reply-input { min-width: 0; flex: 1 1 auto; }
 .remarks-item-actions {
   min-height: 28px;
   display: flex;
   align-items: center;
   gap: 5px;
-  padding: 3px 6px 5px 9px;
+  padding: 4px 6px 5px 25px;
+  border-top: 1px solid color-mix(in srgb, var(--face-sh) 65%, transparent);
 }
-.remarks-review-tag {
-  color: var(--remarks-accent);
-  font-size: 9px;
-  letter-spacing: 0.5px;
-  text-transform: uppercase;
-}
-.remarks-item-actions .remarks-edit { margin-left: auto; }
+.remarks-item-actions .remarks-resolve { margin-left: auto; }
 .remarks-editor { padding: 8px 9px 9px; }
 .remarks-editor label { display: block; margin-bottom: 5px; }
 .remarks-editor textarea {
@@ -1757,7 +1766,9 @@ main {
 }
 #remarks-sidebar button:focus-visible,
 #remarks-sidebar select:focus-visible,
-#remarks-sidebar textarea:focus-visible {
+#remarks-sidebar textarea:focus-visible,
+#remarks-sidebar input:focus-visible,
+#remarks-sidebar summary:focus-visible {
   outline: 2px solid var(--blue);
   outline-offset: 1px;
 }
@@ -3782,6 +3793,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 }
 #ocr-side {
   width: 280px;
+  min-width: 260px;
   flex: none;
   display: flex;
   flex-direction: column;
@@ -4135,8 +4147,33 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   box-shadow: 0 0 0 1px var(--amber);
 }
 
-/* builds sidebar tabs (Pending / Uploaded) */
-#builds-tabs .pane-tab { padding: 2px 8px; }
+/* Volume metadata is a title prefix everywhere, but stays visually separate
+   so it can never be mistaken for part of the stored title. */
+.book-title-display {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+  max-width: 100%;
+  vertical-align: baseline;
+}
+.book-title-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.volume-title-tag {
+  flex: none;
+  display: inline-block;
+  padding: 0 4px;
+  border: var(--border-w, 1px) solid currentColor;
+  border-radius: var(--radius);
+  color: var(--cyan);
+  background: var(--face-hi);
+  font: 600 0.72em/1.4 var(--ui);
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
 
 #ocr-pages {
   flex: 1;
@@ -4569,7 +4606,10 @@ body[data-theme] .drafting::-webkit-scrollbar {
 
 /* --- Workbench sidebar: whole-sidebar horizontal collapse (mirrors Publish) -- */
 #ocr-side-toggle { flex: none; width: 22px; padding-left: 0; padding-right: 0; }
-#wb-split.wb-side-collapsed #ocr-side { width: 34px !important; }
+#wb-split.wb-side-collapsed #ocr-side {
+  width: 34px !important;
+  min-width: 34px;
+}
 #wb-split.wb-side-collapsed #ocr-side > :not(#builds-tabs),
 #wb-split.wb-side-collapsed #builds-tabs > :not(#ocr-side-toggle),
 #wb-split.wb-side-collapsed #ocr-splitter { display: none; }
@@ -5436,6 +5476,81 @@ tr.proc-row > td.proc-diff-old { background: color-mix(in srgb, var(--red) 22%, 
   white-space: nowrap;
 }
 tr.proc-alt-old .proc-srctag { text-decoration: none; }
+
+.proc-manual-pages {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+  color: var(--ink-soft);
+  font-size: 11px;
+}
+
+/* Keyboard-first Smart Scan title-page picker. */
+.smartscan-mark-win {
+  width: min(1120px, calc(100vw - 34px));
+  height: min(820px, calc(100vh - 34px));
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+.smartscan-mark-bar { gap: 10px; }
+.smartscan-mark-left {
+  margin-left: auto;
+  color: var(--ink-soft);
+  font: 11px var(--mono);
+}
+.smartscan-mark-body {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 280px;
+  background: var(--face-sh);
+}
+.smartscan-mark-preview {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: color-mix(in srgb, var(--ink) 9%, var(--face-sh));
+}
+.smartscan-mark-preview img {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  background: #fff;
+  box-shadow: 0 3px 18px color-mix(in srgb, #000 28%, transparent);
+}
+.smartscan-mark-preview img.marked {
+  outline: 4px solid var(--amber);
+  outline-offset: 3px;
+}
+.smartscan-mark-controls {
+  min-width: 0;
+  padding: 16px;
+  border-left: 1px solid var(--line);
+  background: var(--face);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.smartscan-mark-book { font-weight: 600; overflow-wrap: anywhere; }
+.smartscan-mark-page { color: var(--ink-soft); font: 11px var(--mono); }
+.smartscan-mark-nav { display: grid; grid-template-columns: auto 1fr auto; gap: 6px; }
+.smartscan-mark-help { color: var(--ink-soft); font-size: 11px; line-height: 1.5; }
+.smartscan-mark-help kbd { font: 10px var(--mono); border: 1px solid var(--line); padding: 1px 4px; }
+.smartscan-mark-selected-head { margin-top: 4px; font-weight: 600; }
+.smartscan-mark-selected { min-height: 28px; color: var(--ink-soft); overflow-wrap: anywhere; }
+.smartscan-mark-error { color: var(--red); font-size: 11px; }
+.smartscan-mark-actions { margin-top: auto; }
+@media (max-width: 720px) {
+  .smartscan-mark-body {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(260px, 1fr) auto;
+  }
+  .smartscan-mark-controls { border-left: 0; border-top: 1px solid var(--line); }
+}
 
 /* Right-click context menu items (reusing #popup-menu) */
 .pm-btn {
