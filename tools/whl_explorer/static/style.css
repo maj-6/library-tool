@@ -1471,7 +1471,10 @@ body .cad-btn.primary.danger {
 .mf-actions > .cad-btn,
 .ctl-join > .cad-input,
 .ctl-join > select.cad-input,
-.ctl-join > .cad-btn {
+.ctl-join > .cad-btn,
+.bar-cluster > .cad-input:not(textarea),
+.bar-cluster > select.cad-input,
+.bar-cluster > .cad-btn {
   height: var(--ctl-h);
 }
 .pane-bar > .cad-btn,
@@ -1480,7 +1483,8 @@ body .cad-btn.primary.danger {
 .src-row > .cad-btn,
 .desc-label-row > .cad-btn,
 .mf-actions > .cad-btn,
-.ctl-join > .cad-btn {
+.ctl-join > .cad-btn,
+.bar-cluster > .cad-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1494,7 +1498,9 @@ body .cad-btn.primary.danger {
 .src-row > .cad-btn[hidden],
 .desc-label-row > .cad-btn[hidden],
 .mf-actions > .cad-btn[hidden],
-.ctl-join > .cad-btn[hidden] {
+.ctl-join > .cad-btn[hidden],
+.bar-cluster > .cad-btn[hidden],
+.bar-cluster > select.cad-input[hidden] {
   display: none;
 }
 
@@ -1518,6 +1524,24 @@ body .cad-btn.primary.danger {
   position: relative;
   z-index: 1;
 }
+/* --- toolbar clusters (.bar-cluster) --------------------------------------
+   A wrapping pane-bar breaks lines between its flex items; grouping
+   related controls in a cluster makes the CLUSTER the flex item, so wraps
+   land at cluster boundaries and a label can never separate from its
+   control. The find cluster stays shrinkable so the doc cluster keeps its
+   row at 1280px (the old 60px-basis contract, now one level up). */
+.bar-cluster {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+.bar-cluster-find {
+  flex: 1 1 174px;
+  min-width: 174px;
+  max-width: 320px;
+}
+
 /* joins that replace a row-filling field inherit its flex */
 .src-row .ctl-join,
 .fb-path-row .ctl-join,
@@ -3407,10 +3431,18 @@ body.resizing-v { cursor: row-resize; user-select: none; }
   cursor: pointer;
   white-space: nowrap;
 }
-.wb-chip:hover { background: var(--row-hover); }
+.wb-chip:hover { background: var(--row-hover); text-decoration: underline; }
 .wb-chip.ok { color: var(--green); border-color: currentColor; }
 .wb-chip.warn { color: var(--amber); border-color: currentColor; }
 .wb-chip.todo { opacity: 0.55; }
+/* quiet pipeline cues, per the under-styling rule: the current phase is a
+   filled chip, the first unfinished phase carries a thin "go here next"
+   underline (and escapes the todo dim so the cue stays visible) */
+.wb-chip.cur { background: var(--row-hover); }
+.wb-chip.next { box-shadow: inset 0 -2px 0 var(--blue); opacity: 1; }
+/* the locked-phase note carries its own unlock */
+.empty .wb-verify-here { margin-left: 8px; vertical-align: middle; }
+.build-empty .cad-btn { vertical-align: middle; margin: 0 2px; }
 .wb-phase { display: none; }
 .wb-phase.active {
   display: flex;
@@ -3598,7 +3630,7 @@ body.resizing-v { cursor: row-resize; user-select: none; }
    .ctl-join wrappers are the bar's flex items now, so the same contract
    lives on them (basis = input floor + the joined icon button). */
 #ocr-find, #ocr-replace { flex: 1 1 60px; min-width: 60px; max-width: 130px; }
-#ocr-mainpane .pane-bar .ctl-join {
+.bar-cluster-find .ctl-join {
   flex: 1 1 84px;
   min-width: 84px;
   max-width: 156px;

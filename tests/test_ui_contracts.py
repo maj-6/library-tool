@@ -35,10 +35,35 @@ def test_run_scans_batch_is_search_only():
 
 
 def test_verified_toggle_saves_the_whole_editor_form():
+    # the toggle routes through setVerified, which is the save action —
+    # verification must never be a bare status patch
     handler = APP.split('el("b-ready").addEventListener', 1)[1].split(
         'el("build-new")', 1)[0]
-    assert "await saveBuildFields()" in handler
+    assert "setVerified(" in handler
     assert "patchBuildRaw(b.id, { status:" not in handler
+    body = APP.split("async function setVerified", 1)[1].split(
+        "function renderLockNote", 1)[0]
+    assert "await saveBuildFields()" in body
+    assert "patchBuildRaw" not in body
+
+
+def test_locked_phases_offer_the_verify_unlock_inline():
+    # the draft gate renders its own "Mark verified" so Text/Knowledge don't
+    # require the Publish detour
+    body = APP.split("function renderLockNote", 1)[1].split(
+        "function applyWorkbenchGates", 1)[0]
+    assert "wb-verify-here" in body
+    gates = APP.split("function applyWorkbenchGates", 1)[1].split(
+        "// Per-phase readiness", 1)[0]
+    assert 'renderLockNote("wb-text-locked"' in gates
+    assert 'renderLockNote("wb-knowledge-locked"' in gates
+
+
+def test_publish_flushes_unsaved_edits_first():
+    # picking Rights then publishing must not read the stale saved value
+    body = APP.split("async function uploadBuild", 1)[1].split(
+        "let _publishTimer", 1)[0]
+    assert "buildIsDirty() && !(await saveBuildFields())" in body
 
 
 def test_workbench_selection_is_unified_and_refreshes_resources():
