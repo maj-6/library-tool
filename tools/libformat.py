@@ -59,7 +59,9 @@ HEX_RE = re.compile(r"^#[0-9a-fA-F]{3,8}$")
 # assigned, tight enough that it can never carry a path or markup
 RID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _TPL_RE = re.compile(r"^[\w\- ]{1,24}$")
-_FIG_RE = re.compile(r"^[\w.\-]{1,120}$")
+# the negative lookahead rejects dot-only names ("."/".."): matched as a bare
+# member name they resolve to a directory and a write on them raises mid-import
+_FIG_RE = re.compile(r"^(?!\.+$)[\w.\-]{1,120}$")
 
 # The role vocabulary AS DATA. The `furniture` flag is the load-bearing
 # semantic — layout_roles.compose_text lifts furniture out of the body flow —
@@ -122,7 +124,9 @@ def clean_rid(raw) -> str:
     Region identity must survive a round trip through a third-party tool, so the
     charset is permissive — but never a path or markup."""
     r = str(raw or "")
-    return r if RID_RE.match(r) else ""
+    # fullmatch, not match: `$` alone would accept a trailing newline lib/1's
+    # re.fullmatch rejected, and schema.json's anchored pattern would then fail
+    return r if RID_RE.fullmatch(r) else ""
 
 
 def ensure_rids(items: list) -> list:
@@ -303,7 +307,7 @@ def sanitize_figure(fig, src_key: str, warn=None, loc: str = "figures") -> dict:
         if v == v and 0.0 <= v <= 1.0:          # finite, in the page
             out[k] = round(v, 5)
     ro = str(fig.get("rework_of") or "")
-    if _FIG_RE.match(ro):
+    if _FIG_RE.fullmatch(ro):
         out["rework_of"] = ro
     elif ro and warn:
         warn(loc, f"rework_of {ro!r} ignored: not a valid member name")
@@ -358,6 +362,7 @@ class LibDocument:
     translations: dict = field(default_factory=dict)      # lang -> parsed member
     assets: dict = field(default_factory=dict)            # name -> bytes
     members: list = field(default_factory=list)           # every member name
+    skipped: list = field(default_factory=list)           # (member, reason) pairs
 
     @property
     def format_version(self) -> str:
@@ -374,7 +379,7 @@ class LibDocument:
 
 
 _PAGE_MEMBER = re.compile(r"pages/(\d{1,5})\.json")
-_ASSET_MEMBER = re.compile(r"assets/img/([\w.\-]{1,120})")
+_ASSET_MEMBER = re.compile(r"assets/img/((?!\.+$)[\w.\-]{1,120})")
 _TRANS_MEMBER = re.compile(r"translations/([a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*)\.json")
 _KNOWN_MEMBERS = {"book.json", "INSTRUCTIONS.md", "schema.json"}
 
@@ -409,22 +414,32 @@ def read_lib(path_or_bytes) -> LibDocument:
 
     doc = LibDocument(format=parse_format(book), book=book,
                       members=list(z.namelist()))
+    # pages, translations, and assets all draw down one running budget so a
+    # small deflate-bomb archive can't inflate GBs of members into memory —
+    # every silent drop is recorded on doc.skipped so validate() can name it
     budget = MAX_INFLATED
     for name in z.namelist():
         pm = _PAGE_MEMBER.fullmatch(name)
         if pm:
             n = int(pm.group(1))
-            if not 1 <= n <= 99999 or len(doc.pages) >= MAX_PAGES:
+            if not 1 <= n <= 99999:
+                doc.skipped.append((name, "page number out of range"))
+                continue
+            if len(doc.pages) >= MAX_PAGES:
+                doc.skipped.append((name, "beyond the page cap"))
                 continue
             declared = z.getinfo(name).file_size
             if declared > MAX_JSON or declared > budget:
+                doc.skipped.append((name, "exceeds the size cap"))
                 continue
             budget -= declared
             try:
                 rec = json.loads(z.read(name))
             except ValueError:
+                doc.skipped.append((name, "not valid JSON"))
                 continue
             if not isinstance(rec, dict):
+                doc.skipped.append((name, "not an object"))
                 continue
             doc.pages.append(LibPage(
                 page=n,
@@ -438,18 +453,29 @@ def read_lib(path_or_bytes) -> LibDocument:
             continue
         tm = _TRANS_MEMBER.fullmatch(name)
         if tm:
-            if z.getinfo(name).file_size > MAX_JSON:
+            declared = z.getinfo(name).file_size
+            if declared > MAX_JSON or declared > budget:
+                doc.skipped.append((name, "exceeds the size cap"))
                 continue
+            budget -= declared
             try:
                 td = json.loads(z.read(name))
             except ValueError:
+                doc.skipped.append((name, "not valid JSON"))
                 continue
             if isinstance(td, dict):
                 doc.translations[tm.group(1).lower()] = td
+            else:
+                doc.skipped.append((name, "not an object"))
             continue
         am = _ASSET_MEMBER.fullmatch(name)
-        if am and z.getinfo(name).file_size <= MAX_FIGURE:
-            doc.assets[am.group(1)] = z.read(name)
+        if am:
+            declared = z.getinfo(name).file_size
+            if declared <= MAX_FIGURE and declared <= budget:
+                budget -= declared
+                doc.assets[am.group(1)] = z.read(name)
+            else:
+                doc.skipped.append((name, "exceeds the size cap"))
     doc.pages.sort(key=lambda p: p.page)
     return doc
 
@@ -508,7 +534,9 @@ def write_lib(doc: LibDocument, path, *, generator: str = "library-tool/dev",
                                        per_book=instructions_book))
         z.writestr("schema.json", json.dumps(SCHEMA, indent=1))
         for p in sorted(doc.pages, key=lambda p: p.page):
-            items = sanitize_page_items(p.items, src_type="import")
+            # cap to MAX_ITEMS so a sealed page can't come out a shape the
+            # import (and schema.json's maxItems) then truncates
+            items = sanitize_page_items(p.items, src_type="import")[:MAX_ITEMS]
             body = {"page": p.page, "doc": p.doc, "dims": p.dims or {},
                     "state": "verified" if p.state == "verified" else "",
                     "items": items}
@@ -519,7 +547,7 @@ def write_lib(doc: LibDocument, path, *, generator: str = "library-tool/dev",
                        json.dumps(body, indent=1, ensure_ascii=False,
                                   allow_nan=False))
         for lang, td in doc.translations.items():
-            if RID_RE.match(lang) and isinstance(td, dict):
+            if RID_RE.fullmatch(lang) and isinstance(td, dict):
                 z.writestr(f"translations/{lang}.json",
                            json.dumps(td, ensure_ascii=False, allow_nan=False))
         for name in manifest["figures"]:
@@ -558,11 +586,25 @@ def validate(doc: LibDocument) -> list:
 
     sanitize_ext(doc.book.get("ext"), "book.json/ext", warn)
 
+    # members read_lib dropped are invisible in doc.pages/translations — name
+    # each so validate stays in lockstep with what the import receipt reports
+    for name, reason in doc.skipped:
+        warn(name, f"member skipped on read: {reason}")
+
+    # a stylesheet the import discards wholesale (>40 roles) must not validate
+    # clean; sanitize_styles has no per-role warn hook, so lint the count here
+    raw_styles = doc.book.get("stylesheet")
+    if isinstance(raw_styles, dict) and len(raw_styles) > 40:
+        warn("book.json/stylesheet", "stylesheet dropped: more than 40 roles")
+
     seen_rids: dict = {}
     for p in doc.pages:
         loc = f"pages/{p.page}.json"
         if not p.items:
             warn(loc, "page has no usable regions")
+        if len([x for x in p.items if isinstance(x, dict)]) > MAX_ITEMS:
+            warn(loc, f"page has more than {MAX_ITEMS} regions; "
+                      "the surplus is dropped on import")
         sanitize_page_items(p.items, warn=warn, loc=loc)
         sanitize_ext(p.ext, f"{loc}/ext", warn)
         for it in p.items:

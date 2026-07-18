@@ -34,7 +34,7 @@ const isDev = !app.isPackaged;
 // or through open-file on macOS. The path is queued until the renderer says it
 // has registered its handler ("lib:ready", sent from app.js init), then
 // delivered over "lib:open" — the renderer owns the create-vs-import dialog.
-let pendingLibPath = null;
+let pendingLibPaths = [];    // a QUEUE: multi-select + Enter opens one per file
 let libReadySender = null;   // the webContents that last signalled lib:ready
 
 function libPathFromArgv(argv, cwd) {
@@ -51,20 +51,27 @@ function libPathFromArgv(argv, cwd) {
 }
 
 function flushLibOpen() {
-  if (!pendingLibPath) return;
   if (!libReadySender || libReadySender.isDestroyed()) return;
-  libReadySender.send("lib:open", pendingLibPath);
-  pendingLibPath = null;
+  while (pendingLibPaths.length) {
+    libReadySender.send("lib:open", pendingLibPaths.shift());
+  }
 }
 
 function sendLibOpen(p) {
   if (!p) return;
-  pendingLibPath = p;
+  pendingLibPaths.push(p);
   flushLibOpen();
 }
 
 ipcMain.on("lib:ready", (event) => {
   libReadySender = event.sender;   // re-set on reload, so delivery stays live
+  // a webContents survives navigation/reload, so isDestroyed() alone can't tell
+  // that the listener's isolated world is gone. Drop the sender when it starts
+  // loading, so a mid-reload flush keeps the path QUEUED for the next lib:ready
+  // rather than sending into a page whose handler is not yet registered.
+  event.sender.once("did-start-loading", () => {
+    if (libReadySender === event.sender) libReadySender = null;
+  });
   flushLibOpen();
 });
 
@@ -75,7 +82,10 @@ app.on("open-file", (event, p) => {
 });
 
 // the file the user double-clicked to launch us, if any
-pendingLibPath = libPathFromArgv(process.argv, process.cwd());
+{
+  const p0 = libPathFromArgv(process.argv, process.cwd());
+  if (p0) pendingLibPaths.push(p0);
+}
 
 // Only one packaged instance may run at a time. A second launch hands off to
 // the first (focusing its window) and exits immediately. This is what makes an

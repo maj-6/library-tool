@@ -16343,6 +16343,8 @@ const rwState = {
   drag: null,       // {kind: move|resize|draw, id, corner, start, box0, moved}
   lastPos: null,    // pointer in page fractions — the split guide
   seq: 0, idSeq: 0,
+  instrLoaded: false, // did the per-book instructions GET succeed this book?
+  instrDirty: false,  // unsaved edits in the instructions field
 };
 
 function rwActiveId() { return rwState.sel[rwState.sel.length - 1] || ""; }
@@ -16384,7 +16386,9 @@ function rwConfirmDiscard(detail) {
 }
 
 async function selectReplicaBook(bid) {
-  if (rwState.dirty &&
+  // instructions edits are per-book and only reloaded on a book switch, so the
+  // discard gate must cover them too — page/source switches don't reload them
+  if ((rwState.dirty || rwState.instrDirty) &&
       !(await rwConfirmDiscard("Switching books discards them."))) return;
   // one shared sequence for book, source, AND page context: any in-flight
   // fetch from before this click resolves into a dead sequence number and
@@ -16392,7 +16396,7 @@ async function selectReplicaBook(bid) {
   // book A's page strip and PDF under book B's regions)
   const seq = ++rwState.seq;
   rwState.book = bid; rwState.page = 0; rwState.items = [];
-  rwState.sel = []; rwState.dirty = false;
+  rwState.sel = []; rwState.dirty = false; rwState.instrDirty = false;
   rwState.outliers = [];   // the last scan flagged ANOTHER book's pages
   el("rw-canvas").hidden = true;
   el("rw-empty").hidden = false;
@@ -16506,7 +16510,12 @@ async function selectReplicaPage(n) {
   } catch (e) { /* a bare page: draw from scratch */ }
   if (seq !== rwState.seq) return;
   rwState.items = (rec.found ? rec.items || [] : []).map((it, i) => ({
-    id: "r" + i, role: it.role || "body",
+    id: "r" + i,
+    // carry the stable region id and any third-party ext through the workbench
+    // round-trip: a nudge-and-save must not re-mint rids or erase imported
+    // region ext (the server sanitizer preserves a valid incoming rid)
+    rid: it.rid, ext: it.ext,
+    role: it.role || "body",
     order: it.order != null ? +it.order : i,
     box: { x: +((it.box || {}).x) || 0, y: +((it.box || {}).y) || 0,
            w: +((it.box || {}).w) || 0, h: +((it.box || {}).h) || 0 },
@@ -16945,8 +16954,11 @@ async function rwSave() {
   const seq = rwState.seq;
   const pageState = rwState.pageState;
   const items = [...rwState.items].sort((a, b) => a.order - b.order)
-    .map((it, i) => ({ role: it.role, order: i, box: it.box,
-                       text: it.text, norm: it.norm || "" }));
+    // rid + ext ride through so a save preserves the region's stable id and any
+    // imported third-party namespace (JSON.stringify drops the undefined keys
+    // of a legacy region, and the server mints a rid only for those)
+    .map((it, i) => ({ rid: it.rid, ext: it.ext, role: it.role, order: i,
+                       box: it.box, text: it.text, norm: it.norm || "" }));
   try {
     const r = await (await fetch(
       `/api/builds/${encodeURIComponent(book)}/ocr-regions`, {
@@ -17464,19 +17476,31 @@ async function rwStyleSave() {
 // the per-book "instructions for editors / AI" note (ocr/lib-instructions.md):
 // free guidance every .lib export embeds for external tools and assistants
 async function rwLoadInstructions(seq) {
-  let text = "";
+  // track load success: a failed GET must not render an empty field that Save
+  // then persists as a wipe. On failure the field is disabled and Save refuses.
+  let text = "", loaded = false;
   try {
     const r = await (await fetch(
       `/api/builds/${encodeURIComponent(rwState.book)}/replica-instructions`)).json();
-    if (r.ok) text = r.text || "";
-  } catch (e) { /* absent = empty; the field still saves */ }
+    if (r.ok) { text = r.text || ""; loaded = true; }
+  } catch (e) { /* load failed — leave the field disabled, don't arm Save */ }
   if (seq !== rwState.seq) return;
+  rwState.instrLoaded = loaded;
+  rwState.instrDirty = false;
   el("rw-instr").value = text;
-  el("rw-instr-state").textContent = text.trim() ? "set" : "";
+  el("rw-instr").disabled = !loaded;
+  el("rw-instr-state").textContent =
+    loaded ? (text.trim() ? "set" : "") : "load failed";
 }
 
 async function rwInstrSave() {
   if (!rwState.book) return;
+  // a load that failed leaves the field empty and unknown — refuse to save,
+  // or an empty PUT would delete the book's real stored instructions
+  if (!rwState.instrLoaded) {
+    status("BOOK INSTRUCTIONS :: not loaded — reselect the book");
+    return;
+  }
   const text = el("rw-instr").value;
   try {
     const r = await (await fetch(
@@ -17486,6 +17510,7 @@ async function rwInstrSave() {
         body: JSON.stringify({ text }),
       })).json();
     if (!r.ok) throw new Error(r.error || "save failed");
+    rwState.instrDirty = false;
     el("rw-instr-state").textContent = text.trim() ? "set" : "";
     status(text.trim() ? `BOOK INSTRUCTIONS SAVED :: ${r.chars} chars`
                        : "BOOK INSTRUCTIONS CLEARED");
@@ -17663,6 +17688,7 @@ function initReplica() {
   el("rw-style-reset").addEventListener("click", rwStyleReset);
   el("rw-instr-save").addEventListener("click", rwInstrSave);
   el("rw-instr").addEventListener("input", () => {
+    rwState.instrDirty = true;
     el("rw-instr-state").textContent = "edited";
   });
   el("rw-legend").innerHTML = RW_ROLES.map((r, i) =>
@@ -18301,7 +18327,11 @@ function initDesktopChrome() {
 function initLibOpen() {
   const d = window.whlDesktop;
   if (!d || !d.lib) return;                   // browser / older shell: no flow
-  d.lib.onOpen(async (p) => {
+  // multi-select delivers several lib:open events back-to-back; serialize them
+  // so each file's confirm dialog runs to completion before the next opens —
+  // otherwise a follow-up dialog auto-cancels the one in front of it and only
+  // the last file is ever offered
+  const handleOne = async (p) => {
     if (!p) return;
     const name = p.split(/[\\/]/).pop();
     if (!(await confirmDialog({
@@ -18337,7 +18367,9 @@ function initLibOpen() {
              ? ` · translations ${rec.translations_added.join(", ")}` : "") +
            ((rec.warnings || []).length
              ? ` · ${rec.warnings.length} warning(s) (see the Info tab)` : ""));
-  });
+  };
+  let chain = Promise.resolve();
+  d.lib.onOpen((p) => { chain = chain.then(() => handleOne(p)).catch(() => {}); });
   d.lib.ready();
 }
 

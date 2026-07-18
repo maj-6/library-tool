@@ -524,3 +524,128 @@ def test_lib_open_failed_import_leaves_no_shell_build(client, data_root,
     assert r.status_code == 400
     assert "no usable pages" in r.get_json()["error"]
     assert set(lib.load_json(server.BUILDS_PATH, {})) == before
+
+
+def test_lib_open_ignores_operational_meta_fields(client, data_root, tmp_path):
+    import libcommon as lib
+    import server
+    # a foreign .lib whose manifest meta smuggles operational fields must NOT
+    # pre-set them on the new build: rights stays undecided (the publication
+    # gate), status draft, no foreign pdf source — only the bibliographic tuple
+    # the exporter writes seeds the build. A bogus rights would also have failed
+    # the open before the filter; here a VALID-looking one must still not stick.
+    doc = libformat.LibDocument(
+        format=(2, 0),
+        book={"format_version": "2.0", "source": "primary",
+              "meta": {"title": "Crafted", "authors": "X. Author",
+                       "rights": "public-domain", "status": "ready",
+                       "pdf_sources": [{"id": "x",
+                                        "path": str(tmp_path / "secret.pdf")}],
+                       "ocr_verified": True}},
+        pages=[libformat.LibPage(page=1, items=[
+            {"role": "body", "order": 0,
+             "box": {"x": 0.2, "y": 0.1, "w": 0.6, "h": 0.7}, "text": "t"}])])
+    p = tmp_path / "crafted.lib"
+    libformat.write_lib(doc, p)
+    r = client.post("/api/lib/open", json={"path": str(p)}).get_json()
+    assert r["ok"]
+    b = lib.load_json(server.BUILDS_PATH, {})[r["build_id"]]
+    assert b["title"] == "Crafted" and b["authors"] == "X. Author"
+    assert b["rights"] == ""            # the rights gate stays undecided
+    assert b["status"] == "draft"
+    assert b["pdf_sources"] == []
+
+
+# --- IDX-verified review fixes -----------------------------------------------
+
+def test_read_lib_assets_share_the_inflation_budget(monkeypatch):
+    # a small deflate-bomb archive must not inflate GBs: assets draw down the
+    # SAME running budget as pages, so once it is spent the rest are skipped
+    # (and recorded), not read into memory. Shrink the budget so a few small
+    # highly-compressible members exercise the cap without a huge fixture.
+    monkeypatch.setattr(libformat, "MAX_INFLATED", 4096)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("book.json", json.dumps({"format_version": "2.0"}))
+        for i in range(8):
+            z.writestr(f"assets/img/z{i}.png", b"\0" * 2000)   # deflates tiny
+    buf.seek(0)
+    doc = libformat.read_lib(buf.getvalue())
+    # total inflated footprint is bounded by the budget, not by member count
+    assert sum(len(v) for v in doc.assets.values()) <= 4096
+    assert len(doc.assets) < 8
+    assert any("size cap" in reason for _, reason in doc.skipped)
+    # validate names every skipped member so CI/import stay in lockstep
+    msgs = [i.msg for i in libformat.validate(doc)]
+    assert any("member skipped on read" in m for m in msgs)
+
+
+def test_rework_of_must_name_the_colliding_member(client, data_root):
+    import libcommon as lib
+    import server
+    bid = "e2b012340020"
+    _seed_build(bid)
+    img_dir = server._entry_dir(bid) / "ocr" / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    (img_dir / "fig.png").write_bytes(b"\x89PNGoriginal")
+    mp = server._entry_dir(bid) / "ocr" / "layout.json"
+    meta = lib.load_json(mp, {})
+    meta.setdefault("images", {})["fig.png"] = {"page": 1, "src_key": "primary"}
+    lib.save_json(mp, meta)
+
+    # §2.6: overwrite=1 but rework_of names a DIFFERENT member is an accidental
+    # collision — it still skips; only rework_of == the colliding name replaces
+    r = client.post(f"/api/builds/{bid}/replica-import?overwrite=1",
+                    data={"lib": (_fig_lib(rework_of="unrelated.png"), "b.lib")},
+                    content_type="multipart/form-data").get_json()
+    assert r["figures_added"] == 0
+    assert any("no rework_of" in w["msg"] for w in r["warnings"])
+    assert (img_dir / "fig.png").read_bytes() == b"\x89PNGoriginal"
+
+
+def test_regions_put_preserves_incoming_rid_and_ext(client, data_root):
+    # the Replica workbench now sends rid + ext with every saved region, so a
+    # nudge-and-save must not re-mint rids or erase imported region ext: the PUT
+    # sanitizer preserves a valid incoming rid and re-stores ext
+    bid = "e2b012340021"
+    _seed_build(bid)
+    r = _put(client, bid, {"page": 6, "items": [
+        {"rid": "keep_ME-1", "ext": {"vendor": {"tag": "A"}},
+         "role": "body", "order": 0,
+         "box": {"x": 0.2, "y": 0.1, "w": 0.6, "h": 0.7}, "text": "t"}]})
+    assert r["ok"]
+    got = client.get(f"/api/builds/{bid}/ocr-regions?page=6").get_json()
+    assert got["items"][0]["rid"] == "keep_ME-1"
+    assert got["items"][0]["ext"] == {"vendor": {"tag": "A"}}
+
+
+def test_export_persists_rids_for_legacy_regions(client, data_root):
+    import libcommon as lib
+    import server
+    bid = "e2b012340022"
+    _seed_build(bid)
+    # a region record predating rids, written straight to the sidecar (NOT
+    # through the rid-minting PUT): the first export must mint AND PERSIST a rid,
+    # so a second export of the unchanged book carries the identical rid that an
+    # external tool would have annotated against
+    mp = server._entry_dir(bid) / "ocr" / "layout.json"
+    mp.parent.mkdir(parents=True, exist_ok=True)
+    lib.save_json(mp, {"regions": {"primary": {"4": {
+        "doc": "compiled.txt", "dims": {},
+        "items": [{"id": "r0", "role": "body", "order": 0,
+                   "box": {"x": 0.2, "y": 0.1, "w": 0.6, "h": 0.7},
+                   "text": "t"}]}}}})
+    assert "rid" not in lib.load_json(
+        mp, {})["regions"]["primary"]["4"]["items"][0]
+
+    z1 = zipfile.ZipFile(io.BytesIO(
+        client.get(f"/api/builds/{bid}/replica-export").data))
+    rid1 = json.loads(z1.read("pages/4.json"))["items"][0]["rid"]
+    # the mint was written back into layout.json on the first export
+    stored = lib.load_json(mp, {})["regions"]["primary"]["4"]["items"][0]["rid"]
+    assert stored == rid1
+
+    z2 = zipfile.ZipFile(io.BytesIO(
+        client.get(f"/api/builds/{bid}/replica-export").data))
+    rid2 = json.loads(z2.read("pages/4.json"))["items"][0]["rid"]
+    assert rid1 == rid2

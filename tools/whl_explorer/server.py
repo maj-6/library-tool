@@ -3043,13 +3043,16 @@ def _lib_read_translation_members(z, warn) -> dict:
     written by an external tool still lands as page text in the store."""
     out: dict = {}
     for name in z.namelist():
-        tm = re.fullmatch(r"translations/([A-Za-z0-9][A-Za-z0-9\-]{1,19})\.json",
-                          name)
+        # one shared member grammar with export/read_lib/validate; a
+        # translations/ member that misses it is warned, not silently dropped
+        if not name.startswith("translations/") or name.endswith("/"):
+            continue
+        tm = libformat._TRANS_MEMBER.fullmatch(name)
         if not tm:
+            warn(name, "translation skipped: member name is not a "
+                       "translations/<bcp47>.json tag")
             continue
-        lang = _lang_code(tm.group(1))
-        if not lang:
-            continue
+        lang = tm.group(1).lower()
         if z.getinfo(name).file_size > _LIB_MAX_JSON:
             warn(name, "translation skipped: JSON member exceeds the size cap")
             continue
@@ -3197,6 +3200,26 @@ def api_build_replica_export(build_id: str):
         return jsonify({"ok": False, "error":
                         "no region pages to export — seed or draw some in"
                         " the Replica tab first"}), 400
+    # persist minted rids on first export, mirroring _lib_book_id's mint-and-
+    # persist: a legacy book's rid-less regions get their rids stamped into
+    # layout.json now, so a second export of the same unchanged book carries
+    # identical rids and external rid-keyed annotations line up across round-
+    # trips. Read-modify-write under the sidecar lock every other write shares.
+    layout_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    with _ocr_merge_lock:
+        meta = lib.load_json(layout_path, {})
+        pages = (meta.get("regions") or {}).get(src) or {}
+        changed = False
+        for n in page_nums:
+            rec = pages.get(str(n))
+            if not isinstance(rec, dict):
+                continue
+            ensured = libformat.ensure_rids(rec.get("items") or [])
+            if ensured != (rec.get("items") or []):
+                rec["items"] = ensured
+                changed = True
+        if changed:
+            lib.save_json(layout_path, meta)
     import io
     import zipfile
     figures = {}
@@ -3254,16 +3277,18 @@ def api_build_replica_export(build_id: str):
                        libformat.render_instructions(book["meta"], per_book))
             z.writestr("schema.json", json.dumps(libformat.SCHEMA, indent=1))
             for n in page_nums:
-                rec = pages[str(n)]
+                rec = pages.get(str(n))
+                if not isinstance(rec, dict):
+                    continue
                 page_obj = {
                     "page": n,
                     "doc": rec.get("doc") or "",
                     "dims": rec.get("dims") or {},
                     "state": rec.get("state") or "",
-                    # every region carries a stable rid (minted for any legacy
-                    # region that predates them) so external tools can annotate
-                    # and diff across round-trips
-                    "items": libformat.ensure_rids(rec.get("items") or []),
+                    # rids were persisted into layout.json above, so emit the
+                    # stored items directly — a second export of the same book
+                    # carries the same rids external tools annotate against
+                    "items": rec.get("items") or [],
                 }
                 pext = libformat.sanitize_ext(rec.get("ext"))
                 if pext:
@@ -3649,7 +3674,11 @@ def _lib_import_archive(build_id: str, src: str, raw: bytes,
         if not m:
             continue
         n = int(m.group(1))
-        if not 1 <= n <= 99999 or len(incoming) >= _LIB_MAX_PAGES:
+        if not 1 <= n <= 99999:
+            warn(name, "page skipped: page number out of range")
+            continue
+        if len(incoming) >= _LIB_MAX_PAGES:
+            warn(name, f"page skipped: over the {_LIB_MAX_PAGES}-page cap")
             continue
         declared = z.getinfo(name).file_size
         if declared > _LIB_MAX_JSON or declared > budget:
@@ -3681,8 +3710,11 @@ def _lib_import_archive(build_id: str, src: str, raw: bytes,
         pext = libformat.sanitize_ext(rec.get("ext"), f"{name}.ext", warn)
         if pext:
             incoming[n]["ext"] = pext
-        if rec.get("state") == "verified":
+        st = rec.get("state")
+        if st == "verified":
             incoming[n]["state"] = "verified"
+        elif st:
+            warn(name, f"state {st!r} dropped: only 'verified' is recognized")
     if not incoming:
         return {"ok": False, "error": "no usable pages",
                 "warnings": warnings}, 400
@@ -3695,11 +3727,18 @@ def _lib_import_archive(build_id: str, src: str, raw: bytes,
     if isinstance(tpl_src, dict):
         for name, t in tpl_src.items():
             name = str(name).strip()
-            if not _RW_TPL_RE.match(name) or not isinstance(t, dict):
+            loc = f"templates/{name}"
+            if not _RW_TPL_RE.match(name):
+                warn("book.json/templates",
+                     f"template {name!r} dropped: not a valid template name")
+                continue
+            if not isinstance(t, dict):
+                warn(loc, "template dropped: not an object")
                 continue
             items = _rw_sanitize_items(t.get("items") or [],
-                                       src_type="template")
+                                       src_type="template", warn=warn, loc=loc)
             if not items:
+                warn(loc, "template dropped: no usable regions after sanitize")
                 continue
             tpl_in[name] = {"from_page": 0, "doc": _ocr_name(
                 str(t.get("doc") or "compiled.txt")),
@@ -3710,6 +3749,8 @@ def _lib_import_archive(build_id: str, src: str, raw: bytes,
     figures_src = book.get("figures") if isinstance(book.get("figures"),
                                                     dict) else {}
     raw_styles = book.get("stylesheet")
+    if isinstance(raw_styles, dict) and len(raw_styles) > 40:
+        warn("book.json/stylesheet", "stylesheet dropped: more than 40 roles")
     styles = _rw_sanitize_styles(raw_styles) \
         if isinstance(raw_styles, dict) and len(raw_styles) <= 40 else {}
     manifest_ext = libformat.sanitize_ext(book.get("ext"), "book.json.ext", warn)
@@ -3734,6 +3775,9 @@ def _lib_import_archive(build_id: str, src: str, raw: bytes,
         tmap = meta.setdefault("templates", {}).setdefault(src, {})
         for name, t in tpl_in.items():
             if not overwrite and name in tmap:
+                warn(f"templates/{name}", "template skipped: the destination "
+                     "already has this template (import with overwrite to "
+                     "replace)")
                 continue
             tmap[name] = t
             tpls_added.append(name)
@@ -3741,17 +3785,22 @@ def _lib_import_archive(build_id: str, src: str, raw: bytes,
         figures_added = 0
         img_dir = _entry_dir(build_id) / "ocr" / "images"
         for name in z.namelist():
-            m = re.fullmatch(r"assets/img/([\w.\-]{1,120})", name)
+            # the shared hardened pattern rejects dot-only names ("."/".."):
+            # a bare ".." member resolves to a directory and dest.write_bytes
+            # on it would raise mid-commit, orphaning the figures already written
+            m = libformat._ASSET_MEMBER.fullmatch(name)
             if not m:
                 continue
             safe = m.group(1)
             dest = img_dir / safe
-            entry = libformat.sanitize_figure(figures_src.get(safe), src)
+            entry = libformat.sanitize_figure(figures_src.get(safe), src,
+                                              warn=warn, loc=f"assets/img/{safe}")
             if dest.exists() or safe in imap:
                 # §2.6: a colliding figure is replaced only when the incoming
-                # entry deliberately reworks it (rework_of) under overwrite;
-                # an accidental collision always skips — now with a warning
-                if overwrite and entry.get("rework_of"):
+                # entry deliberately reworks it — rework_of must NAME the
+                # colliding member ("the original member or itself", both ==
+                # safe); an accidental collision always skips, now with a warning
+                if overwrite and entry.get("rework_of") == safe:
                     pass
                 elif overwrite:
                     warn(f"assets/img/{safe}", "figure skipped: name collides "
@@ -3782,8 +3831,12 @@ def _lib_import_archive(build_id: str, src: str, raw: bytes,
             else:
                 sheet = "kept"
         # the manifest ext passthrough persists so a later export re-emits it
-        if manifest_ext and (overwrite or not _lib_manifest_ext(build_id)):
-            lib.save_json(_lib_manifest_ext_path(build_id), manifest_ext)
+        if manifest_ext:
+            if overwrite or not _lib_manifest_ext(build_id):
+                lib.save_json(_lib_manifest_ext_path(build_id), manifest_ext)
+            else:
+                warn("book.json/ext", "ext kept: destination already has one "
+                     "(import with overwrite to replace)")
 
     # translations write under their own lock (the analyze store), so they
     # land after the region commit rather than nesting the two locks
@@ -3853,17 +3906,37 @@ def api_lib_open():
         doc = libformat.read_lib(raw)
     except libformat.LibError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
-    build, err = _create_build(doc.meta)
+    # seed the build from the bibliographic tuple the exporter writes — NOT the
+    # whole manifest meta. A foreign .lib must not pre-set operational fields
+    # (rights, status, pdf_sources, ocr_*): rights defaults to undecided and
+    # status to draft, and an unrecognized rights string can't fail the open.
+    build, err = _create_build({k: doc.meta.get(k) for k in _LIB_META_FIELDS})
     if err:
         return jsonify({"ok": False, "error": err}), 400
-    receipt, code = _lib_import_archive(build["id"], "primary", raw,
-                                        overwrite=False)
-    if code != 200:
+
+    def _rollback():
         with _builds_lock:
             builds = lib.load_json(BUILDS_PATH, {})
             builds.pop(build["id"], None)
             lib.save_json(BUILDS_PATH, builds)
+
+    # a crafted member can make the import RAISE (not just return != 200); the
+    # rollback must cover that too, or the minted build is stranded on a 500
+    try:
+        receipt, code = _lib_import_archive(build["id"], "primary", raw,
+                                            overwrite=False)
+    except Exception as exc:
+        _rollback()
+        return jsonify({"ok": False, "error": f"import failed: {exc}"}), 500
+    if code != 200:
+        _rollback()
         return jsonify(receipt), code
+    # persist the archive's book_id when well-formed, so an open + re-export
+    # round trip keeps the same identity the exporter minted (§2.4); a malformed
+    # or absent id keeps today's mint-on-first-export behavior
+    if re.fullmatch(r"b-[0-9a-f]{32}", doc.book_id):
+        _lib_id_path(build["id"]).parent.mkdir(parents=True, exist_ok=True)
+        lib.save_json(_lib_id_path(build["id"]), {"book_id": doc.book_id})
     return jsonify({"ok": True, "build_id": build["id"], "receipt": receipt})
 
 
