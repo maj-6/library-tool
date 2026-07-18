@@ -39,6 +39,10 @@
     <string name="model_download_failed">Voice model download failed: %1$s (buttons still work)</string>
 
     <!-- Capture controls; the words live in the content descriptions. -->
+    <string name="discarded">Entry discarded</string>
+    <string name="undo">UNDO</string>
+    <string name="undo_unavailable">Too late to undo — the discard was already cleared.</string>
+
     <string name="cmd_start">New capture</string>
     <string name="cmd_photo">Take capture</string>
     <string name="cmd_done">Seal entry</string>
