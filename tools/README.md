@@ -3,9 +3,12 @@
 Code for the cataloging workbench described in the [root README](../README.md):
 checking a private herbal library against the World Herb Library (WHL),
 locating existing scans, and preparing new catalog entries for WHL
-submission. The single application is the catalog explorer
-(`whl_explorer/`); everything else is a shared module, an index builder, or
-a standalone CLI.
+submission. The catalog explorer (`whl_explorer/`) is the application —
+on the desktop it runs inside the Electron shell
+([`desktop/`](../desktop/README.md)), with the Android "Book Capture" app
+(`android/`) as a companion; everything else here is a shared module, an
+index builder, or a standalone CLI. Feature design notes live in
+[`docs/`](../docs/).
 
 ## Layout
 
@@ -23,9 +26,23 @@ a standalone CLI.
   a wipe guard so an emptier side never clobbers a fuller one); the entry
   files mirror to the R2 bucket's `entries/` prefix. Runs inside the app's
   cloud-sync pass, and as a CLI (`status`, `sync --run`).
+- `capture_pipeline.py` — the photo → bibliography pipeline for
+  phone-captured pages (Mistral OCR + parsing); the server imports it for
+  the Catalogs tab's cloud-capture ingest.
+- `supabase_sync.py` / `supabase_auth.py` — thin Supabase REST client for
+  the capture sync, and desktop sign-in (session persisted under
+  `DATA_ROOT`, so cloud contributions carry the real user).
+- `r2_store.py` — Cloudflare R2 object storage over plain urllib (SigV4,
+  no boto3).
+- `cloud_setup.py` / `cloud_defaults.py` — set up + inspect the Supabase
+  project; the baked-in public cloud identifiers (URL + anon key) so a
+  fresh install needs zero configuration.
 - `convert_xlsx.py` — converts `ch_library.xlsx` to `output/ch_library.json`.
 - `catalog_checks.py` — offline copyright + WHL-catalogue checks (loaders,
   indexes, and the shared cross-database identity test).
+- `copyright_registration.py` — online copyright *registration* lookups
+  (CPRS, plus the NYPL Catalog of Copyright Entries dataset when present)
+  feeding the split © tag's registration half.
 - `scan_search.py` — Internet Archive + HathiTrust scan search + JSON CLI.
 - `whl_scrape.py` — scrapes complete metadata for every published WHL book
   (publisher, print length, subtitle, description, language, subject) via
@@ -43,6 +60,11 @@ a standalone CLI.
   normalization/accuracy helpers shared by the checks and scan search).
 - `build_catalog_report.py` — one-shot spreadsheet report over the whole
   CH library (see the last section).
+- `release_publish.py` — puts one app build on the website's Downloads page.
+- `fix_pdf_url_host.py` — repoints published `volumes.pdf_url` rows onto a
+  CORS-enabled host (the R2 reader fix).
+- `worktree.py` — git worktrees with their own port + `DATA_ROOT` per tree,
+  so several sessions can run at once (see `docs/worktrees.md`).
 
 ## Setup
 
@@ -66,6 +88,11 @@ table and year/volume are SQL columns — every query is local and answers in
 milliseconds, including search-as-you-type. While `ol_search.db` is absent
 the app falls back to the works index + live OL API (cached in
 `output/.ol_api_cache.json`).
+
+Building from the dumps is optional: **Settings > Integrations > Search
+databases** shows the database folder (drop copies in and reopen the app),
+downloads the databases from a source URL, and holds a cloud search URL as
+a remote fallback while no local database exists.
 
 ### App root vs data root (relocatable / packaging)
 
@@ -115,14 +142,18 @@ need per-key version/tombstone metadata in the cloud sync layer.
 python3 tools/whl_explorer/server.py
 ```
 
-Open http://127.0.0.1:5001. The chrome, top to bottom: title bar, **menu
-bar** (File / Edit / View / Tools — every common function lives here;
-Run scans, Scrape WHL, and the Search pane toggle live *only* here), and
-the **tab strip** — **Catalogs** (the working area), **Editor** (the
-book builder + verified sources), and **OCR** (OCR review tooling) on
-the left, with the action icons inline on the right: undo/redo, the
-active tab's commands (Editor: new entry, export builds, download
-sources), and the settings gear.
+Open http://127.0.0.1:5001 (`WHL_PORT` runs a second instance on another
+port; `WHL_LAN_PORT` moves the LAN-capture listener off its default 8899).
+The chrome, top to bottom: the title bar carrying the **menu bar** (File /
+Edit / View / Tools / Help — every common function lives here; Run scans,
+Scrape WHL, and the Search pane toggle live *only* here) and the
+frameless-window controls (minimize / maximize / close, wired to the
+desktop shell), then the **tab strip** — **Home** (startup dashboard),
+**Catalogs** (the working area), **Editor** (the book builder + verified
+sources), **Analyze** (OCR + AI analysis), **Publish** (the published
+cloud catalogue), and **Info** (the console) on the left, with the action
+icons inline on the right: undo/redo, the active tab's commands (Editor:
+new entry, export entries, download sources list), and the settings gear.
 
 UI conventions used everywhere:
 
@@ -165,14 +196,19 @@ UI conventions used everywhere:
   builder create/edit/delete/attach. Deletes never ask for confirmation —
   they are undoable. The last 100 actions are kept per session.
 - The settings gear opens a categorized window (sidebar: GENERAL /
-  APPEARANCE / TABLE VIEW / AI / FILE PATHS). Nine themes, each a full
-  rework of the interface chrome with element and text sizes preserved:
-  CLASSIC CAD (modernized flat chrome over the dark drafting canvas),
-  ARCHIVE LEDGER (neutral archival paper), PLATINUM, BLUEPRINT (warm
-  paper over a warm neutral-dark board), MODERN LIGHT, MODERN DARK,
-  STONE (warm-gray light), MIDNIGHT (deep blue-black), and SAGE (muted
-  green-gray). Status tags are square in every theme. Retired theme ids
-  migrate automatically.
+  APPEARANCE / TABLE VIEW / LIBRARY & DATA / EDITING / AI / OCR /
+  INTEGRATIONS / LAN / CREDENTIALS / UPDATES / ADVANCED). All API keys
+  live under CREDENTIALS. GENERAL holds the **cloud account** sign-in
+  (Supabase Auth) — cloud contributions are attributed to the signed-in
+  user, with the "Your name" field as the fallback. UPDATES governs the
+  desktop app's silent auto-update (with a prerelease opt-in); LAN lets
+  the phone send captures straight to this computer over the local
+  network, bypassing the cloud (pair via the phone's Settings ›
+  Transport). Help > Setup guide… reopens the first-run wizard.
+- Five themes, each a full rework of the interface chrome with element and
+  text sizes preserved: SAGE (the default, muted green-gray), LEDGER,
+  MANUSCRIPT, VELLUM, and LINEN. Status tags are square in every theme.
+  Retired theme ids migrate automatically.
 - Titles and subtitles filled from Open Library are converted to
   conventional title case; "Last, First" author names are flipped to
   "First Last" when repopulating WHL rows.
@@ -180,6 +216,12 @@ UI conventions used everywhere:
   Obsidian-style live Markdown editor), `createPdfViewer()` (embedded PDF
   viewer with an optional parallel OCR-text pane, fed by `/api/pdf/text`),
   and `openFileBrowser(start, onPick)` (local PDF picker).
+
+## HOME tab
+
+The startup dashboard: **In progress** (entries being worked), **Recent
+activity**, **Contributors**, and an **Awaiting review** card (with a
+show-resolved toggle).
 
 ## CATALOGS tab
 
@@ -190,10 +232,18 @@ for every published book from the WHL website's REST API — incremental and
 resumable; rows gain SRC `WEB`; scraped values sit under your corrections)
 are in the TOOLS menu; the SEARCH PANE toggle is in the VIEW menu.
 
-The bar above the table carries `EXPORT` (JSON of the table **as
-filtered**), a download icon ("Download all verified sources"), the
-**filter icon** (MARK / SOURCE / DOWNLOAD-status popup; highlighted while
-any filter is active), and the column-visibility icon.
+The toolbar carries the find bar, the **Advanced Search** button (see the
+left panel below), and — on the right — **Sync Cloud** (pull phone
+captures from the cloud now and push the catalog mirror; also runs on the
+Settings > Integrations auto-sync interval — the ingest pipeline is
+`capture_pipeline.py`, setup in `docs/cloud_capture_setup.md`) and **Sync
+Master List** (Google Sheets, below).
+
+The bar above the table carries a **Year from–to range filter** (with a
+clear button), the export icon (JSON of the table **as filtered**), a
+download icon ("Download all verified sources"), the **filter icon**
+(MARK / SOURCE / DOWNLOAD-status popup; highlighted while any filter is
+active), and the column-visibility icon.
 
 The find bar: the magnifier field filters every table on the tab live and
 drives the realtime Open Library query — `[title]` words, `@author`
@@ -201,14 +251,13 @@ drives the realtime Open Library query — `[title]` words, `@author`
 
 ### Left panel (three sub-tabs)
 
-- `SEARCH` — constrained Open Library search: title / author / publisher /
-  city / year / edition / volume fields act as live constraints; results
-  appear in the bottom pane's OPEN LIBRARY table as you type.
+- `INFO` — details of the selected row, including its photos; the archive
+  and copyright verdicts are spelled out in full here.
 - `MANUAL ENTRY` — the entry form (title, author, publisher, city, year,
   subtitle, edition, volume number, language, pages, condition, price,
   illustrations, categories, notes; title required). Entries are saved to
   `output/manual_entries.json` and checked automatically on submit.
-  **Categories are a hierarchical taxonomy** (Tools → Categories…): the
+  **Categories are a hierarchical taxonomy** (Edit → Categories…): the
   form's chip picker assigns nodes from `output/categories.json` (stored
   as `category_ids`, synced to the cloud like builds), and the manager
   window renames, nests, merges, and can adopt the deprecated
@@ -236,6 +285,11 @@ drives the realtime Open Library query — `[title]` words, `@author`
   manual entry or updates the checked copy and re-queues its checks); a
   master-list row from the bottom pane gets the book fields plus ACQUIRED,
   and SAVE checks the record into CHECKED BOOKS with the edits applied.
+
+The constrained Open Library search — title / author / publisher / city /
+year / edition / volume fields acting as live constraints, results in the
+bottom pane's OPEN LIBRARY table — is the **Advanced Search popup**,
+opened from the toolbar button.
 
 ### Top pane (dropdown selects the working table)
 
@@ -279,11 +333,12 @@ catalogue, with Subtitle, Vol, and Ed columns fed by the title parse /
 WHL catalog). The Master list doubles as the **Google Sheets publish
 preview**: manual entries appear as **light-yellow** rows (they would be
 appended to the sheet) and already-checked catalogue rows are **light
-blue**. **Tools > Sync master list to Google Sheets** publishes it —
-always a manual action; Settings > Sync holds the spreadsheet ID,
-service-account key file, and sheet name (no credentials yet, so the
-sync is TODO-verify). The search pane has a **clear button** and empties
-itself when you switch to another pane tab. All tabs
+blue**. **File > Sync master list to Google Sheets** (or the Catalogs
+toolbar's Sync Master List button) publishes it — always a manual action;
+Settings > Integrations holds the spreadsheet ID and sheet name, and
+Settings > Credentials the service-account key file (no credentials yet,
+so the sync is TODO-verify). The search pane has a **clear button** and
+empties itself when you switch to another pane tab. All tabs
 filter live from the find box (the Open Library tab queries the
 consolidated index server-side). Hovering a row shows a tooltip with every
 available field; clicking a row adds it to whatever table the top pane
@@ -318,9 +373,13 @@ indexes load once at server start):
   without one the renewal half stays blue. Both halves name their records in the
   tooltip, and the Info pane spells them out in full.
 
-  A registration record comes from either of two places: the Copyright Public
-  Records System online lookup (post-1978 registrations plus the historical
-  card records CPRS has digitized), or
+  A registration record comes from `copyright_registration.py`'s sources:
+  the Copyright Public Records System online lookup (post-1978
+  registrations plus the historical card records CPRS has digitized); the
+  NYPL Catalog of Copyright Entries dataset (books 1923–1964 — inert until
+  its parsed `xml/` tree sits under `DATA_ROOT/nypl_cce/` AND the "Also use
+  the NYPL registrations dataset" toggle is on — Settings > Library & data,
+  off by default); or
   the renewal record itself, which cites the registration it renews (`OREG` +
   `ODAT`). A renewal cannot exist without a registration, so that citation *is*
   a record — Hollingsworth's *Flower Chronicles* renews `A343340`, which no
@@ -392,19 +451,23 @@ runs.
 ## EDITOR tab
 
 The submission-preparation area. Its tab-strip icons: new entry, export
-builds (`whl_submission_entries.json` — the submission package), and
-download sources (`whl_upload_list.json`); the same commands are in the
-FILE menu.
+entries (`whl_submission_entries.json` — the submission package), and
+download sources list (`whl_upload_list.json`); the same commands are in
+the FILE menu.
 
 Two parts, separated by a **drag-to-resize splitter**:
 
 - **Pending / Uploaded** (the book builder) — catalog entries being
-  prepared for WHL submission, persisted in `output/whl_builds.json`.
-  **Pending means awaiting upload to WHL**; the upload icon in the entry
-  actions moves a verified entry to the **Uploaded** sidebar tab and out
-  of the queue (the actual WHL upload API call is a later feature — the
-  button currently just performs the queue transition, undoably). The
-  sidebar is compact: each entry shows its title with the **status icon
+  prepared for publication, persisted in `output/whl_builds.json`.
+  **Pending means awaiting publication**; the upload icon on a verified
+  entry **publishes it to the Library Tool cloud** (`POST
+  /api/volumes/publish`): the PDF goes to object storage — R2 when
+  configured, otherwise the Supabase `volumes` bucket — and the metadata
+  to a Supabase `volumes` row that the website's library browser reads.
+  The upload runs server-side (a 129 MB scan takes minutes) with progress
+  polled from `/api/volumes/publish/status` and shown in the footer; the
+  entry then moves to the **Uploaded** sidebar tab and out of the queue.
+  The sidebar is compact: each entry shows its title with the **status icon
   inline on the right** (pencil = draft, green check = verified, export
   arrow = uploaded) over an author · year line; verified entries are
   tinted green; **pressing Q while hovering marks an entry purple
@@ -414,42 +477,49 @@ Two parts, separated by a **drag-to-resize splitter**:
   the local `downloads/ia/<id>.pdf` path is attached automatically
   (locally attached scans arrive with the local path as the PDF).
   The editor puts the save and delete icons side by side at the top with
-  the VERIFIED toggle (a check icon; pressing it reveals a VERIFIED tag),
-  over two sub-tabs (their content scrolls):
-  - `ENTRY` — the metadata fields (their scrollbar is hidden) with the
+  the VERIFIED toggle (a check icon; pressing it reveals a VERIFIED tag)
+  and an **Analyze** button that opens the entry in the Analyze tab
+  (verified entries only), over three sub-tabs (their content scrolls):
+  - `ENTRY` — the metadata fields (their scrollbar is hidden), including a
+    **Volume group** field (the stable metadata association shared by
+    every volume in a set), with the
     **live Markdown description editor** occupying the space to their
     right (Obsidian-style — markers hide on rendered lines; the line under
     the caret shows its dimmed source). Next to the DESCRIPTION label: a
     **sparkle icon** generates an AI summary from the PDF's OCR text via
     the OpenAI-compatible endpoint configured under SETTINGS > AI (base
-    URL, model, API key, custom instructions), and a **file icon** loads
-    the description from a local text file. Both leave the result unsaved
-    until SAVE.
+    URL, model, custom instructions; the key under CREDENTIALS), and a
+    **file icon** loads the description from a local text file. Both
+    leave the result unsaved until SAVE.
   - `Source (PDF)` — an embedded, **undecorated PDF viewer** (no browser
     toolbar or scrollbars; the file size shows in the bar) with an **OCR
     icon** that opens the text layer in a parallel pane, and a **pages
-    icon** that switches to the OCR tab's side-by-side idiom: one row per
-    page, the page image beside that page's OCR text, scrolling together;
-    the text boxes are editable and the save icon writes them back to the
-    entry's active OCR file. Large scans load
+    icon** that switches to the Analyze tab's side-by-side idiom: one row
+    per page, the page image beside that page's OCR text, scrolling
+    together; the text boxes are editable and the save icon writes them
+    back to the entry's active OCR file. Large scans load
     fast because the viewer shows a **compressed, truncated preview
-    derivative** (page limit and a preview-the-original toggle live in
-    GENERAL settings). The PATH TO PDF field has folder (browse) and
-    attach icons. The **OCR row** lists the entry folder's OCR files as
-    chips — click one to make it the ACTIVE OCR (it feeds the OCR pane);
-    load additional OCR files for comparison with the file icon (PDFs
-    without a text layer get their OCR supplied this way). The
+    derivative** (the page limit lives in GENERAL settings, the
+    preview-the-original toggle in LIBRARY & DATA). The PRIMARY PDF
+    SOURCE field has folder (browse) and attach icons; a **Secondary** row collects additional scans of
+    the same book as chips. The **OCR row** lists the entry folder's OCR
+    files as chips — click one to make it the ACTIVE OCR (it feeds the
+    OCR pane); load additional OCR files for comparison with the file
+    icon (PDFs without a text layer get their OCR supplied this way). The
     **folder-sync icon builds the entry folder**
     (`output/entries/<id>/`): `metadata.json`, `preview.pdf`, and
     `ocr/extracted.txt`. With **Trim blank pages automatically** on
-    (General settings), visually blank pages are removed from the actual
-    PDF first — backup kept as `.bak.pdf`, OCR files renumbered — before
+    (Library & data settings), visually blank pages are removed from the
+    actual PDF first — backup kept as `.bak.pdf`, OCR files renumbered — before
     the preview and extraction are built. When KEEP IA ORIGINALS is off, the downloaded
     original is treated as a temporary artifact and removed after the
     preview is built — the entry's PDF is repointed at the folder's
     `preview.pdf` and the IA download catalog entry is retired (removal
     only happens when the sync just produced a fresh preview). **Saving
     the entry marks the active OCR file as verified** (`ocr_verified`).
+  - `Resources` — the entry's image assets, which feed publishing: the
+    current thumbnail, title pages, a cover candidate, and the images
+    Mistral OCR extracted from the pages.
 - **VERIFIED SOURCES** (bottom table) — every verified source across all
   rows: title, subtitle, author, publisher, year, the archive, the
   matched record (linked, with the URL in the tooltip), and a **Status**
@@ -458,37 +528,61 @@ Two parts, separated by a **drag-to-resize splitter**:
   icon** hides statuses (e.g. hide done sources). Each row's build icon
   starts a prefilled entry.
 
-## OCR tab
+## ANALYZE tab
 
-The OCR workbench. OCR **targets are the books' PDFs**; the sidebar
+The OCR + AI workbench. Targets are the books' PDFs; the sidebar
 lists every **book folder** (entries with `output/entries/<id>/`,
 author · year · OCR file count, status icon; the check icon in the pane
 bar filters to verified books only — built for working through a large
 queue of entries). Selecting a book loads its `ocr/*.txt` files into
-the **documents** list below (**a book without OCR files gets its PDF
+the **Artifacts** list below (**a book without OCR files gets its PDF
 text layer extracted and saved automatically** as `ocr/extracted.txt`);
-loose text files can still be loaded with the file icon.
+loose text files can still be loaded with the file icon. The Artifacts
+list shows only the current book's OCR files (plus any loose local
+files).
 
-Three views, toggled by the icon buttons (all controls are icons with
-tooltips):
+The workspace has two pane tabs:
 
-- **Edit** (pencil) — plain-text corrections with find / replace-all.
-- **Diff** (columns) — line-level comparison against any other loaded
-  document, unchanged runs collapsed.
-- **PDF pages** (page icon) — the PDF displayed **in parallel with the
-  OCR text**: one row per page, the page image (rendered server-side via
-  PyMuPDF, cached) beside that page's OCR text, the text box stretched
-  to the page's height. Both live in one scroll container, so they
-  scroll together. Page texts are editable; edits flow back into the
-  document. Files without `--- page N ---` markers show their full text
-  beside page 1.
+- **Analysis** (default) — the **facsimile page grid** (stage selected
+  pages for text analysis from its bar) beside the **AI panes**, which
+  run on the Settings > AI provider (DeepSeek by default; any
+  OpenAI-compatible endpoint):
+  - `Overview` — an internal cataloguer's summary generated from the OCR
+    text, and a publishable **About article** drafted from it (saved to
+    the entry folder).
+  - `Categories` — the assigned-category picker plus AI suggestions
+    classified against the taxonomy ("Assign all existing" applies every
+    suggestion that matches an existing category).
+  - `Translations` — page-aligned translations by language code.
+  - `Annotations` — proposed margin notes anchored to passages.
+  - `Relevance` — your own criteria, scored per work; **internal only**,
+    never published (the criteria are edited here in the pane).
+  - `Bundle` — what publishes with the book beyond the PDF; everything
+    unchecked (and the relevance assessment, always) stays local, and the
+    bundle is applied on the next publish from the Editor.
+- **Document** — the OCR review views, toggled by icon buttons:
+  - **Edit** (pencil) — plain-text corrections with find / replace-all.
+  - **Diff** (columns) — line-level comparison against any other loaded
+    document, unchanged runs collapsed.
+  - **PDF pages** (page icon) — the PDF displayed **in parallel with the
+    OCR text**: one row per page, the page image (rendered server-side via
+    PyMuPDF, cached) beside that page's OCR text, the text box stretched
+    to the page's height. Both live in one scroll container, so they
+    scroll together. Page texts are editable; edits flow back into the
+    document. Files without `--- page N ---` markers show their full text
+    beside page 1.
+  - **Layout** — a read-only facsimile: the document's text rendered at
+    the position and scale it occupies on the page, from the OCR word
+    boxes.
 
 In the page view, **pages are staged for OCR individually and processing
 is always prompted manually**: hover a page (or select several) and
 press a digit — the digit → service mapping is customizable (Settings >
 OCR, keys 1–5; key 1 defaults to Tesseract). Different digits build a
 **mixed batch across services** (amber chips = staged; the same digit
-untags); the queue-bar **plus** stages the whole book and nothing runs
+untags); the jobs bar's **Default Engine** picker sets the engines used
+by bulk staging (OCR and text analysis), its **plus** stages the whole
+book with the default engine, and nothing runs
 until the **submit** button sends the staged pages. **Clicking a page
 image selects it; Ctrl+click selects the range** from the last click
 (3px amber outline); a digit stages the whole selection, and the
@@ -497,27 +591,43 @@ PDF** — not just the preview: the file is rewritten (the previous
 version stays next to it as `.bak.pdf`) and the entry's OCR files and
 title pages are **renumbered to match**. **Pressing T over a page marks
 it as a title page** (purple T chip; stored on the entry as
-`title_pages` — intelligent metadata extraction will use these later).
-Escape clears the selection. The **documents list shows only the
-current book's OCR files** (plus any loose local files).
+`title_pages` — it feeds the Editor's Resources tab).
+Escape clears the selection.
 
 **OCR processing is live**: jobs rasterize each page server-side
 (PyMuPDF, width configurable in Settings > OCR — the knob for
 experimenting with how compression/shrinking affects OCR quality) and
 run it through the chosen service — **Tesseract (local, tested and
-working)**, **Claude**, or **Amazon Textract** (both TODO-verify: no
-API keys yet; Azure/OpenAI remain queue stubs). Every finished page is
-merged into **one compiled OCR document** (`ocr/compiled.txt`) and
+working)**, **Mistral OCR** (implemented; it also returns the figures it
+cuts out of each page, which land in the Editor's Resources tab),
+**Claude**, or **Amazon Textract** (both implemented but TODO-verify: no
+API keys yet; Azure/OpenAI remain UI-only options). Every finished page
+is merged into **one compiled OCR document** (`ocr/compiled.txt`) and
 saved immediately — results from different services land in the same
-single file, which appears in the documents list when the job ends.
+single file, which appears in the Artifacts list when the job ends.
 The queue table shows live progress (`Running — n/total`).
 
 Quality assessment persists on the entry (`ocr_quality`); the star icon
 sets the document as its entry's **active OCR**; save writes folder
-documents back (local documents download). Service credentials live in
-**Settings > OCR** (Tesseract path override, Anthropic key + model,
-AWS key/secret/region, Azure endpoint + key; OpenAI reuses the AI
-settings).
+documents back (local documents download). API keys live in **Settings >
+Credentials** (Mistral, Anthropic, Azure, AWS key/secret; OpenAI vision
+reuses the AI key); **Settings > OCR** keeps the non-secret knobs
+(default service, Azure endpoint, Tesseract path, Claude model, AWS
+region, OCR image width, vision max output tokens, page-view keys).
+
+## PUBLISH tab
+
+Browses the published cloud catalogue: a grouped sidebar tree (group by
+book/set, author, categories, or date range, with a refresh button) and,
+on the right, a **World Herb Library page preview** of the selected
+record with an **Open live page** button to the website.
+
+## INFO tab
+
+The in-app console: the server log with a level filter (info / warnings /
+errors / everything-with-HTTP), a text filter, a follow toggle, copy, and
+clear (the server keeps its own ring buffer). Settings > Advanced's
+verbose-logging switch raises the log to DEBUG.
 
 # Standalone CLIs
 
@@ -535,7 +645,7 @@ case-insensitive and ranked by a composite `accuracy` over title prefix
 python3 tools/whl_client.py --title "An Introduction to Botany" --author "Lindley" --date 1835
 ```
 
-WHL metadata scrape (also available from the explorer toolbar):
+WHL metadata scrape (also available from the explorer's Tools menu):
 
 ```
 python3 tools/whl_scrape.py

@@ -9,6 +9,7 @@ Electron (main.js)
   └─ spawns sidecar  ──  dev:      python ../tools/whl_explorer/server.py
                           packaged: resources/sidecar/whl-explorer-sidecar.exe
      with  WHL_PORT=<free port>   WHL_DATA_ROOT=%APPDATA%\Library Tool
+           WHL_APP_VERSION=<shell version — shown in the web UI>
   └─ BrowserWindow → http://127.0.0.1:<port>/
 ```
 
@@ -16,6 +17,14 @@ The backend already supports this: `WHL_PORT` picks the port, `WHL_DATA_ROOT`
 relocates all writable state, and when frozen (`sys.frozen`) `libcommon` reads
 shipped assets from the bundle (`APP_ROOT`) and writes state to the per-user
 dir (`DATA_ROOT`). See `../REQUIREMENTS.md`.
+
+The shell itself stays thin: a frameless main window (the web UI's title bar
+is the frame, wired over IPC), themed startup/updater splash windows while
+the sidecar and update check run, external links routed to the OS browser,
+and a single-instance lock in packaged builds — a second launch focuses the
+first. The lock is what makes in-place updates safe (NSIS cannot replace a
+running exe); dev is exempt, so a dev instance and the installed app run
+side by side.
 
 ## Run in dev
 
@@ -38,30 +47,38 @@ npm run build:sidecar     # PyInstaller → dist-sidecar/whl-explorer-sidecar/
 npm run dist              # electron-builder → release/LibraryTool-Setup-<version>.exe
 ```
 
-The installer is branded (the app icon + a Roboto Slab sidebar generated from
-the repo's own assets — regenerate with the script noted in build/), assisted
+The installer is branded (the app icon + the Roboto Slab sidebar bitmap,
+both checked-in assets in build/ — there is no in-repo generator), assisted
 (license-free, per-user, choose-your-directory), and creates desktop + start
 menu shortcuts. Uninstall keeps the data root: the catalogue outlives the app.
 
 ## Releasing an update
 
-The app checks GitHub Releases (`maj-6/library-tool`) once at startup and
-installs an eligible update before opening the main window. Releases are built
-by `.github/workflows/release.yml`: bump `version` in `package.json` (and the
-Android version when its APK rides along), commit the bumps, then push a tag
-matching the desktop version:
+Updates are a startup **gate**, not a background download: a packaged build
+checks GitHub Releases (`maj-6/library-tool`) once before launch. If an
+update is waiting, a small update splash shows the download, the NSIS
+installer runs silently, and the app relaunches on the new version — the
+main window never opens on the old one. No update, offline, a slow check, or
+any updater error just falls through to a normal launch. **Settings →
+Updates** can switch the check off or opt a stable install into prereleases;
+an installed alpha/beta/rc always follows its own prerelease line.
+
+Publishing goes through CI (`../.github/workflows/release.yml`; full
+mechanics in `../docs/releasing.md`): bump `version` in package.json (and the
+Android version when its APK rides along), commit the bumps, then tag
+`v<version>` — or `v<version>-alpha.N` for a testing build, which is flagged
+prerelease on GitHub so stable installs never auto-update to it — and push
+the tag. The workflow builds the sidecar + installer, signs when the signing
+secret is set, publishes the GitHub Release (exe + `.exe.blockmap` +
+`latest.yml`, plus the APK when it rides along), and registers the row on the
+website's Downloads page. The manual fallback is: build, then
 
 ```
-git tag v<version>
-git push origin main v<version>
+gh release create v<version> release/LibraryTool-Setup-<version>.exe release/LibraryTool-Setup-<version>.exe.blockmap release/latest.yml --title v<version>
 ```
 
-The workflow builds both applications, creates the GitHub Release, uploads the
-installer, its blockmap, `latest.yml`, and the APK, then registers the downloads
-for the website. `latest.yml` and the blockmap are both required for desktop
-auto-update. See `../docs/releasing.md` for prerelease channels, signing, and
-verification. Offline machines simply skip the update check.
-
+`latest.yml` and the `.blockmap` are what electron-updater reads; without
+them the check is a no-op.
 ### Downloading the databases (offline search)
 
 The installer stays small on purpose: Tesseract, optional API keys, and the
@@ -84,9 +101,11 @@ backend proxies the query to the configured **remote base URL**. Remote URLs
 
 ### Notes / caveats
 
-- Signing: `npm run dist` produces an **unsigned** installer unless you set
-  electron-builder's `CSC_LINK`/`CSC_KEY_PASSWORD`. Unsigned installers trip
-  SmartScreen.
+- Signing: CI signs when the `WIN_CSC_LINK_B64`/`WIN_CSC_KEY_PASSWORD`
+  secrets are set; a local `npm run dist` is unsigned unless
+  `CSC_LINK`/`CSC_KEY_PASSWORD` point at the cert. The current cert chains
+  to a self-managed root CA, trusted only on machines that install it, so
+  public downloads still trip SmartScreen — see `signing/README.md`.
 - Tesseract: local OCR needs the Tesseract binary. It is not bundled by
   default; install it on the target machine (or add it to the spec's binaries).
 - The multi-GB `ol_*.db` indexes are never bundled — they are downloaded on
