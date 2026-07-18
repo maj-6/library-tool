@@ -239,20 +239,26 @@ const state = {
 
 // --- appearance: themes are full chrome redesigns; fonts are user-selectable --
 
-// All light. This is a scholarly tool, read for hours: no dark modes, no loud
-// accents. The paper set differs by stock, rule weight and ink colour; the
-// classic set translates period desktop chrome (bevels, pinstripes, navy
-// bands) onto the same fixed geometry.
+// Nearly all light — this is a scholarly tool, read for hours — with Slate as
+// the one deliberate dim (not dark) exception for low-light sessions. No loud
+// accents anywhere. The set spans two philosophies on the same fixed geometry:
+// flat (sage, porcelain, slate) and tactile paper (ledger, foolscap, vellum),
+// with linen between; see the THEMES section of style.css.
 const THEMES = [
   ["sage", "Sage"],
   ["ledger", "Ledger"],
   ["foolscap", "Manuscript"],
   ["vellum", "Vellum"],
   ["linen", "Linen"],
+  ["porcelain", "Porcelain"],
+  ["slate", "Slate"],
 ];
 const DEFAULT_THEME = "sage";
 // Retired ids map to the survivor closest in spirit, so a stored theme never
 // falls through to the bare :root fallback. "" was Classic CAD, the old default.
+// porcelain and slate left this table 2026-07-17 when they returned as real
+// themes — anyone still carrying the retired id gets the new theme of the
+// same name, which is the intent.
 const LEGACY_THEMES = {
   "": DEFAULT_THEME,
   // platinum retired 2026-07-11 -> linen, the surviving neutral; every chrome
@@ -262,12 +268,12 @@ const LEGACY_THEMES = {
   redmond: "linen", motif: "linen",
   // the dark/loud round, retired earlier
   scope: "linen", "terminal-amber": "vellum", "blueprint-linen": "linen",
-  oxblood: "ledger", porcelain: "linen", herbarium: "vellum",
+  oxblood: "ledger", herbarium: "vellum",
   // the original classic-chrome set
   blueprint: "linen", modern: "linen",
   dark: "linen", stone: "linen", midnight: "linen",
   cde: "linen", xp2003: "linen", acad: "linen",
-  workstation: "linen", slate: "linen", mainframe: "vellum",
+  workstation: "linen", mainframe: "vellum",
   graphite: "linen",
 };
 
@@ -543,6 +549,8 @@ function applyTheme() {
     saveSettings();
   }
   document.body.dataset.theme = t;
+  // a theme can carry its own activity-bar icon set (--icon-style)
+  refreshActivityIcons();
 }
 
 // the one way to change theme: the Settings menu and the Appearance select
@@ -2159,24 +2167,43 @@ function sanitizeTabIcon(text) {
 
 // The activity bar's tab icons live as FILES (static/icons/tabs/<id>.svg,
 // user-swappable) and are inlined so stroke:currentColor picks up the
-// theme's per-tab colors. The button's original text becomes its tooltip
-// and aria-label; a tab with no usable icon falls back to a two-letter
-// label (with a console note, so a rejected file isn't a silent mystery).
+// theme's per-tab colors. A theme may declare --icon-style: <name> to use
+// the set in static/icons/tabs/<name>/ instead (missing files fall back to
+// the base set, so a partial style still shows every tab). The button's
+// original text becomes its tooltip and aria-label; a tab with no usable
+// icon falls back to a two-letter label (with a console note, so a
+// rejected file isn't a silent mystery).
+let activityIconStyle = null;   // the style the rail currently shows
+
+function currentIconStyle() {
+  const v = getComputedStyle(document.body)
+    .getPropertyValue("--icon-style").trim();
+  // folder names only — anything else must not become a path segment
+  return /^[a-z0-9-]{1,24}$/.test(v) ? v : "";
+}
+
 function initActivityIcons() {
+  const style = currentIconStyle();
+  activityIconStyle = style;
   const tabs = [...document.querySelectorAll("#tabs .tab")];
   return Promise.all(tabs.map(async (tab) => {
-    const label = tab.textContent.trim() || tab.dataset.tab;
+    // dataset.tip survives re-runs (theme switches); textContent only
+    // holds the label on the very first pass
+    const label = tab.dataset.tip || tab.textContent.trim() || tab.dataset.tab;
     tab.dataset.tip = label;
     tab.setAttribute("aria-label", label);
     let icon = null;
-    try {
-      // no-cache: revalidate so a swapped file shows on the next launch
-      // instead of after the static route's day-long max-age
-      const r = await fetch("/static/icons/tabs/" +
-                            encodeURIComponent(tab.dataset.tab) + ".svg",
-                            { cache: "no-cache" });
-      if (r.ok) icon = sanitizeTabIcon(await r.text());
-    } catch (e) { /* fallback below */ }
+    for (const dir of style ? [style + "/", ""] : [""]) {
+      try {
+        // no-cache: revalidate so a swapped file shows on the next launch
+        // instead of after the static route's day-long max-age
+        const r = await fetch("/static/icons/tabs/" + dir +
+                              encodeURIComponent(tab.dataset.tab) + ".svg",
+                              { cache: "no-cache" });
+        if (r.ok) icon = sanitizeTabIcon(await r.text());
+      } catch (e) { /* try the next location */ }
+      if (icon) break;
+    }
     if (icon) {
       tab.textContent = "";
       tab.appendChild(icon);
@@ -2187,6 +2214,13 @@ function initActivityIcons() {
         `<span class="tab-fallback">${esc(label.slice(0, 2))}</span>`;
     }
   }));
+}
+
+// theme switches re-resolve --icon-style; reload only on a real change
+// (null = the first pass hasn't run yet, so there is nothing to refresh)
+function refreshActivityIcons() {
+  if (activityIconStyle === null) return;
+  if (currentIconStyle() !== activityIconStyle) initActivityIcons();
 }
 
 function initTabs() {

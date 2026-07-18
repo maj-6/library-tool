@@ -59,14 +59,28 @@
 /* =====================================================================
    THEMES
 
-   A theme is a body[data-theme] block defining the same 21 custom
-   properties, plus whatever chrome rules its paper stock needs. The :root
+   A theme is a body[data-theme] block defining the same 22 custom
+   properties (21 colors + --radius), plus whatever chrome rules its
+   paper stock needs. The :root
    block above is NOT a selectable theme -- it is the variable fallback and
-   the sole home of the font vars (--mono/--mono2/--ui).
+   the baseline home of the font vars (--mono/--mono2/--ui); a theme may
+   override --ui with its own default face.
 
-   All themes are light: this is a scholarly tool, read for hours. --canvas
-   (behind the tables, the PDF pane and the OCR pane) never drops below 0.85
-   relative luminance, accents stay desaturated, radius <= 3px.
+   Nearly all themes are light: this is a scholarly tool, read for hours.
+   Accents stay desaturated. SLATE is the one deliberate exception — a dim
+   (not dark) chalkboard for low-light sessions; if another dim theme is
+   ever added, keep its surfaces at or above Slate's luminance.
+
+   The set spans two styling philosophies on the same fixed geometry:
+   FLAT (sage, porcelain, slate) — solid fills, hairline borders, no
+   gradients or relief; TACTILE (ledger, foolscap, vellum) — paper with
+   physical depth: raised or debossed controls, press-down :active, ruled
+   heads. LINEN sits between (one soft gradient, nothing else).
+
+   A theme may also set --ui to give itself a default interface face
+   (Segoe UI otherwise) — the user's explicit font pick, applied inline by
+   applyFont(), still beats it — and --icon-style to pick an activity-bar
+   icon set (see static/icons/tabs/).
 
    SAGE           - warm, earthy, bookish neutral: cream paper, taupe chrome,
                     brown-black ink, a muted sage-teal accent (the default).
@@ -76,9 +90,16 @@
    MANUSCRIPT     - letterpress galley proof on daylight paper: debossed controls,
                     a single ink rule under the statusbar, low chroma.
                     (id "foolscap"; the label was "Foolscap".)
-   VELLUM         - warm off-white vellum, near-zero chroma, warm brown-black ink.
-   LINEN          - neutral warm-grey linen board; the lowest-contrast chrome of the
-                    set, for long sessions.
+   VELLUM         - warm off-white vellum, near-zero chroma, warm brown-black ink;
+                    gently raised controls.
+   LINEN          - neutral warm-grey linen board; the lowest-contrast light
+                    chrome of the set, for long sessions.
+   PORCELAIN      - cool glazed white: blue-grey hairlines, cobalt accents,
+                    the flattest chrome of the set. Segoe UI Variable when the
+                    system has it.
+   SLATE          - dim school slate: soft graphite-blue surfaces, chalk-light
+                    ink, brightened accents. Easier on the eyes at night
+                    without being a black theme.
    ==================================================================== */
 
 /* ---------- SAGE (muted green-gray light) ---------- */
@@ -192,11 +213,13 @@ body[data-theme="ledger"] {
   --blue: #3d443e;
   --blue2: #59635a;
   --radius: 0;             /* Archive Ledger is square-cornered */
+  --icon-style: solid;     /* stamped activity-bar glyphs (icons/tabs/solid/) */
 }
 body[data-theme="ledger"] .cad-btn {
   border: 1px solid #a5a296;
   border-bottom-width: 2px;
   background: linear-gradient(#f6f5ef, #eae8e0);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.55);
 }
 body[data-theme="ledger"] .cad-btn:hover { background: linear-gradient(#faf9f4, #efeee6); }
 body[data-theme="ledger"] .cad-btn:active {
@@ -267,6 +290,10 @@ body[data-theme="foolscap"] {
   --blue: #2f3a4a;
   --blue2: #45566b;
   --radius: 1px;
+  /* the galley proof sets its chrome in old-style serifs; the user's own
+     font pick (applied inline by applyFont) still overrides this */
+  --ui: "Palatino Linotype", "Book Antiqua", Georgia, serif;
+  --icon-style: solid;     /* stamped activity-bar glyphs (icons/tabs/solid/) */
 }
 /* letterpress buttons: type debossed into the sheet */
 body[data-theme="foolscap"] .cad-btn {
@@ -388,12 +415,22 @@ body[data-theme="vellum"] {
   --blue2: #4c6683;
   --radius: 2px;
 }
+/* gently raised controls: the sheet lifts under the fingertip, one press down */
 body[data-theme="vellum"] .cad-btn {
   border: 1px solid #c1baa8;
-  background: #f6f2ea;
+  background: linear-gradient(#f8f4ec, #efe9dc);
+  box-shadow: inset 0 1px 0 rgba(255, 253, 246, 0.8),
+              0 1px 1px rgba(60, 52, 36, 0.08);
 }
-body[data-theme="vellum"] .cad-btn:hover { background: #efeadd; border-color: #a49a86; }
-body[data-theme="vellum"] .cad-btn:active { background: #e6e0d1; }
+body[data-theme="vellum"] .cad-btn:hover {
+  background: linear-gradient(#fbf8f1, #f2ecdf);
+  border-color: #a49a86;
+}
+body[data-theme="vellum"] .cad-btn:active {
+  background: #e6e0d1;
+  box-shadow: inset 0 1px 2px rgba(60, 52, 36, 0.14);
+  transform: translateY(1px);
+}
 body[data-theme="vellum"] .cad-input,
 body[data-theme="vellum"] .cell-edit,
 body[data-theme="vellum"] .md-live { border: 1px solid #c1baa8; }
@@ -542,6 +579,191 @@ body[data-theme="linen"] ::-webkit-scrollbar-track { background: #e7e3da; }
 body[data-theme="linen"] ::-webkit-scrollbar-thumb {
   background: #cdc8bc; border: 2px solid #e7e3da; border-radius: 2px;
 }
+
+/* ---------- PORCELAIN (cool glazed white, flat) ---------- */
+body[data-theme="porcelain"] {
+  --face: #e9edf0;
+  --face-hi: #f8fafb;
+  --face-sh: #d3dade;
+  --face-sh2: #9fabb3;
+  --face-active: #fbfcfd;
+  --canvas: #fbfcfd;
+  --canvas-line: #e9eef1;
+  --ink: #24292e;
+  --ink-light: #272c31;
+  --ink-mut: #5f6b73;
+  --input-bg: #ffffff;
+  --input-ink: #24292e;
+  --row-hover: #eff3f5;
+  --row-checked: #dfeaf0;
+  --row-manual: #e5efe3;
+  --cyan: #21707e;        /* glaze teal (focus / links) */
+  --green: #34795c;
+  --amber: #8f6c26;
+  --red: #a63d33;
+  --blue: #3a5f8a;        /* cobalt band */
+  --blue2: #5c7ea6;
+  --radius: 5px;
+  /* Segoe UI Variable where Windows 11 provides it; plain Segoe elsewhere */
+  --ui: "Segoe UI Variable Text", "Segoe UI", Tahoma, Verdana, sans-serif;
+}
+/* the flattest chrome of the set: solid fills and hairlines only */
+body[data-theme="porcelain"] .cad-btn {
+  border: 1px solid #c6cfd4;
+  background: #fbfcfd;
+}
+body[data-theme="porcelain"] .cad-btn:hover { background: #f0f4f6; border-color: #a9b5bc; }
+body[data-theme="porcelain"] .cad-btn:active { background: #e4eaee; }
+body[data-theme="porcelain"] .cad-input,
+body[data-theme="porcelain"] .cell-edit,
+body[data-theme="porcelain"] .md-live { border: 1px solid #c6cfd4; }
+body[data-theme="porcelain"] .cad-input:focus,
+body[data-theme="porcelain"] .cell-edit:focus { border-color: var(--cyan); }
+body[data-theme="porcelain"] .pane-tab {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: #5d686f;
+}
+body[data-theme="porcelain"] .pane-tab.active {
+  background: transparent;
+  color: var(--ink);
+  box-shadow: inset 0 -2px 0 var(--blue);
+  font-weight: 600;
+}
+body[data-theme="porcelain"] .pane-tabs { border-bottom: 1px solid #d3dade; }
+body[data-theme="porcelain"] #titlebar,
+body[data-theme="porcelain"] .win-titlebar {
+  background: #9aa7af;
+  color: #1d2226;
+  border-bottom: 1px solid #77858e;
+}
+body[data-theme="porcelain"] .grid thead th {
+  background: #eef2f4;
+  color: #46525a;
+  border-right: none;
+  border-bottom: 1px solid #b9c4ca;
+}
+body[data-theme="porcelain"] .grid tbody td {
+  border-right: none;
+  border-bottom: 1px solid #ebeff2;
+}
+body[data-theme="porcelain"] .badge { background: rgba(159, 171, 179, 0.12); }
+body[data-theme="porcelain"] #statusbar { border-top: 1px solid #d3dade; }
+body[data-theme="porcelain"] #cad-tooltip,
+body[data-theme="porcelain"] #attn-pop {
+  background: #ffffff;
+  color: var(--ink);
+  border: 1px solid #9fabb3;
+  border-radius: 4px;
+}
+body[data-theme="porcelain"] .win {
+  border-radius: 5px;
+  overflow: hidden;
+  box-shadow: 0 12px 36px rgba(36, 48, 56, 0.18);
+}
+body[data-theme="porcelain"] .menu-drop,
+body[data-theme="porcelain"] #popup-menu { border-radius: 5px; }
+body[data-theme="porcelain"] ::-webkit-scrollbar { width: 9px; height: 9px; }
+body[data-theme="porcelain"] ::-webkit-scrollbar-track { background: transparent; }
+body[data-theme="porcelain"] ::-webkit-scrollbar-thumb {
+  background: #c6cfd4; border-radius: 5px; border: 2px solid #fbfcfd;
+}
+body[data-theme="porcelain"] ::-webkit-scrollbar-thumb:hover { background: #aab7be; }
+
+/* ---------- SLATE (dim school slate; the set's one non-light theme) ---------- */
+/* Dim, not dark: chrome sits near #3a4048 and the canvas near #262a30, well
+   above black-theme territory, with chalk-light ink and accents brightened
+   just enough to hold their meaning on the darker ground. */
+body[data-theme="slate"] {
+  --face: #3a4048;
+  --face-hi: #444b55;
+  --face-sh: #4a515b;      /* rules read lighter than the face in the dim theme */
+  --face-sh2: #5d6570;
+  --face-active: #4a525c;
+  --canvas: #262a30;
+  --canvas-line: #31363d;
+  --ink: #d3d7dd;
+  --ink-light: #d3d7dd;
+  --ink-mut: #a6adb8;      /* >=4.5:1 on --face */
+  --input-bg: #21252a;
+  --input-ink: #d7dbe1;
+  --row-hover: #2e333a;
+  --row-checked: #253540;
+  --row-manual: #2b3529;
+  --cyan: #62b0a8;
+  --green: #7db36e;
+  --amber: #cfa95e;
+  --red: #cf7364;
+  --blue: #7d97b8;         /* chalk-blue accent for tabs and bands */
+  --blue2: #8fa5c0;
+  --radius: 4px;
+}
+/* flat philosophy at night: solid fills, no relief, slightly lighter on hover */
+body[data-theme="slate"] .cad-btn {
+  border: 1px solid #545c66;
+  background: #424953;
+  color: var(--ink);
+}
+body[data-theme="slate"] .cad-btn:hover { background: #4a525c; border-color: #626b76; }
+body[data-theme="slate"] .cad-btn:active { background: #383f47; }
+body[data-theme="slate"] .cad-btn.danger { color: var(--red); }
+body[data-theme="slate"] .cad-input,
+body[data-theme="slate"] .cell-edit,
+body[data-theme="slate"] .md-live { border: 1px solid #4f575f; }
+body[data-theme="slate"] .cad-input:focus,
+body[data-theme="slate"] .cell-edit:focus { border-color: var(--cyan); }
+body[data-theme="slate"] .pane-tab {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: #9aa2ad;
+}
+body[data-theme="slate"] .pane-tab.active {
+  background: transparent;
+  color: var(--ink);
+  box-shadow: inset 0 -2px 0 var(--blue);
+  font-weight: 600;
+}
+body[data-theme="slate"] .pane-tabs { border-bottom: 1px solid #4a515b; }
+body[data-theme="slate"] #titlebar,
+body[data-theme="slate"] .win-titlebar {
+  background: #2d3237;
+  color: #ced3da;
+  border-bottom: 1px solid #21252a;
+}
+body[data-theme="slate"] .grid thead th {
+  background: #30353c;
+  color: #b8bec7;
+  border-right: none;
+  border-bottom: 1px solid #4a515b;
+}
+body[data-theme="slate"] .grid tbody td {
+  border-right: none;
+  border-bottom: 1px solid #31363d;
+}
+body[data-theme="slate"] .badge { background: rgba(125, 151, 184, 0.14); }
+body[data-theme="slate"] #statusbar { border-top: 1px solid #4a515b; }
+body[data-theme="slate"] #cad-tooltip,
+body[data-theme="slate"] #attn-pop {
+  background: #2b3036;
+  color: var(--ink);
+  border: 1px solid #5d6570;
+  border-radius: 4px;
+}
+body[data-theme="slate"] .win {
+  border-radius: 4px;
+  overflow: hidden;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.5);
+}
+body[data-theme="slate"] .menu-drop,
+body[data-theme="slate"] #popup-menu { border-radius: 4px; }
+body[data-theme="slate"] ::-webkit-scrollbar { width: 10px; height: 10px; }
+body[data-theme="slate"] ::-webkit-scrollbar-track { background: transparent; }
+body[data-theme="slate"] ::-webkit-scrollbar-thumb {
+  background: #4c545e; border-radius: 5px; border: 2px solid #262a30;
+}
+body[data-theme="slate"] ::-webkit-scrollbar-thumb:hover { background: #5a636e; }
 
 /* ===================== base ===================== */
 
@@ -1005,18 +1227,23 @@ body.desktop .win-controls { display: inline-flex; }
   display: flex;
   align-items: center;
   justify-content: center;
-  background: transparent;
-  color: var(--ink);
-  opacity: 0.55;
+  /* a theme that sets --tab-tint washes each resting tab with its own
+     palette color; plain themes leave it at 0% (fully transparent). The
+     dimming lives in the icon color, not element opacity, so the wash
+     keeps its strength on the dimmed resting state. */
+  background: color-mix(in srgb, var(--tabc, var(--blue)) var(--tab-tint, 0%), transparent);
+  color: color-mix(in srgb, var(--ink) 62%, transparent);
   cursor: pointer;
   border: none;
   border-left: 2px solid transparent;
   border-radius: var(--radius);
 }
 .tab svg { width: 18px; height: 18px; display: block; }
-.tab:hover { opacity: 0.9; background: var(--face-hi); }
+.tab:hover {
+  color: color-mix(in srgb, var(--ink) 92%, transparent);
+  background: color-mix(in srgb, var(--tabc, var(--blue)) var(--tab-tint, 0%), var(--face-hi));
+}
 .tab.active {
-  opacity: 1;
   color: var(--tabc, var(--blue));
   border-left-color: var(--tabc, var(--blue));
   background: var(--face-active);
@@ -4284,7 +4511,10 @@ button.publish-tree-label { cursor: pointer; }
 /* --- theme tab palettes --------------------------------------------------
    Each theme may color the activity-bar tabs from its own accent set; a
    theme that defines none stays uniform (every tab falls back to --blue).
-   Sage and Manuscript vary; Ledger, Vellum, and Linen stay uniform. */
+   Sage, Manuscript, and Slate vary; Ledger, Vellum, Linen, and Porcelain
+   stay uniform. A varied theme may also set --tab-tint to wash each
+   resting tab with its color (see .tab); Slate needs a stronger wash than
+   the paper themes for the same perceived weight. */
 body[data-theme="sage"] {
   --tabc-home: var(--blue);
   --tabc-checked: var(--amber);
@@ -4292,6 +4522,7 @@ body[data-theme="sage"] {
   --tabc-replica: var(--red);
   --tabc-publish: var(--cyan);
   --tabc-infotab: var(--blue2);
+  --tab-tint: 12%;
 }
 body[data-theme="foolscap"] {
   --tabc-home: var(--blue);
@@ -4300,6 +4531,16 @@ body[data-theme="foolscap"] {
   --tabc-replica: var(--red);
   --tabc-publish: var(--cyan);
   --tabc-infotab: var(--ink-mut);
+  --tab-tint: 12%;
+}
+body[data-theme="slate"] {
+  --tabc-home: var(--blue);
+  --tabc-checked: var(--amber);
+  --tabc-workbench: var(--green);
+  --tabc-replica: var(--red);
+  --tabc-publish: var(--cyan);
+  --tabc-infotab: var(--blue2);
+  --tab-tint: 16%;
 }
 
 /* --- compact tree/list density (Visual Studio style) ---------------------
