@@ -74,19 +74,68 @@ def test_workbench_phase_gating_locks_analyze_derived_phases_for_drafts():
     assert 'el("ocr-analysis-workspace").hidden = !!knowNote' in gates
     # the Publish action bar stays reachable for drafts: verify lives there
     assert 'el("wb-publish-actions").hidden = !b' in gates
+    # [hidden] must beat the id-based .active display rules, or the locked
+    # workspace (and its own placeholder) renders under the lock note
+    assert ".ocr-workpane[hidden] { display: none !important; }" in STYLE
 
 
-def test_workbench_readiness_chips_compute_client_side_per_phase():
-    ready = _between(APP, "function wbReadiness", "function renderWorkbenchChips")
+def test_source_viewer_agrees_with_the_chip_and_workbench_hides_dup_chrome():
+    # the Source chip and the Text phase fall back to the entry folder's own
+    # PDF via ocrBookPdf — the Source viewer must use the same fallback
+    source = _between(APP, "async function refreshSourceTab()",
+                      "// create/refresh the entry folder")
+    assert "localPath || ocrBookPdf(b.id)" in source
+    assert "pagesPdf: viewPath" in source
+    # the transplanted an-head must not repeat title · author · year under the
+    # Workbench header (the provider/status side of the bar stays)
+    assert "#an-integrated-host #an-title" in STYLE
+    assert "#an-integrated-host #an-sub { display: none; }" in STYLE
+    # the Text toolbar's find/replace give ground before the save button wraps
+    assert ("#ocr-find, #ocr-replace "
+            "{ flex: 1 1 60px; min-width: 60px; max-width: 130px; }") in STYLE
+
+
+def test_workbench_readiness_lives_on_the_single_phase_rail():
+    ready = _between(APP, "function wbReadiness", "function renderWorkbenchRail")
     assert "ocrBookPdf(b.id)" in ready                       # source
     assert "f.stale === true" in ready                       # text (#135 markers)
     assert "b.ocr_verified" in ready
     assert "summary.exists" in ready and "about.exists" in ready
     assert "outdated" in ready
     assert "b.published_slug" in ready                       # publish
-    chips = _between(APP, "function renderWorkbenchChips", "function renderWorkbench()")
-    assert 'data-phase="${p}"' in chips                      # chip click = jump
-    assert "wb-chip" in chips
+    rail = _between(APP, "function renderWorkbenchRail", "function renderWorkbench()")
+    assert '#wb-rail .wb-phase-btn' in rail
+    assert 'setAttribute("aria-current", "step")' in rail
+    assert "wb-phase-badge" in rail
+    assert "wb-chip" not in rail
+    assert 'id="wb-chips"' not in TEMPLATE
+    assert ".wb-chip" not in STYLE
+    # Entry creation remains available in the activity bar and the empty
+    # state, without a third copy that overflows the fixed-width sidebar.
+    assert 'id="build-new"' in TEMPLATE
+    assert 'id="build-new-empty"' in TEMPLATE
+    assert 'id="build-new-side"' not in TEMPLATE
+
+
+def test_workbench_sidebar_controls_are_named_and_keyboard_operable():
+    toolbar = _between(TEMPLATE, '<div class="pane-bar" id="builds-tabs">', "</div>")
+    assert 'aria-label="Show verified books only"' in toolbar
+    assert 'aria-pressed="false"' in toolbar
+    assert 'aria-label="Collapse the entries and artifacts sidebar"' in toolbar
+    assert 'aria-controls="ocr-side"' in toolbar
+
+    render = _between(APP, "function renderOcrBooks", "async function selectOcrBook")
+    assert 'verifiedFilter.setAttribute("aria-pressed"' in render
+    assert 'li.setAttribute("role", "button")' in render
+    assert 'li.setAttribute("aria-expanded"' in render
+    row = _between(APP, "function appendBuildListItem", "// Publish a verified entry")
+    assert 'li.tabIndex = 0' in row
+    assert 'li.setAttribute("aria-current", "true")' in row
+    keyboard = _between(APP, 'el("ocr-books").addEventListener("keydown"',
+                        'el("ocr-docs").addEventListener("click"')
+    assert 'ev.key !== "Enter" && ev.key !== " "' in keyboard
+    assert "row.click()" in keyboard
+    assert ".build-item:focus-visible" in STYLE
 
 
 def test_analyze_facsimile_and_artifact_tree_contracts():
@@ -147,6 +196,15 @@ def test_jobs_drawer_and_default_engine_modal_cover_ocr_and_text_analysis():
     assert 'id="wb-jobs-toggle"' in TEMPLATE
     assert 'id="wb-jobs-summary"' in TEMPLATE
     assert 'id="wb-jobs-body" hidden' in TEMPLATE
+    # the glyph-only toggle carries an accessible name
+    toggle = _between(TEMPLATE, 'id="wb-jobs-toggle"', "</button>")
+    assert 'aria-label="Jobs"' in toggle
+    assert 'aria-expanded="false"' in toggle
+    # the open drawer occludes phase content: opaque, stacked, phases clipped
+    drawer_css = _between(STYLE, "#wb-jobs {", "}")
+    assert "background: var(--face);" in drawer_css
+    assert "z-index: 2;" in drawer_css
+    assert "overflow: hidden;" in _between(STYLE, ".wb-phase.active {", "}")
     assert '<span class="tool-label">Jobs</span>' in TEMPLATE
     assert '>Default Engine:</button>' in TEMPLATE
     assert "<th>Type</th>" in TEMPLATE
@@ -201,6 +259,8 @@ def test_page_analysis_staging_and_unified_job_rows_are_wired():
     assert "anJobs.entries()" in jobs
     assert "<td>OCR</td>" in jobs
     assert "<td>Text analysis</td>" in jobs
+    # the drawer count singularizes like the summary line ("1 job", not "1 jobs")
+    assert '${total} job${total === 1 ? "" : "s"}' in jobs
 
 
 def test_manual_about_save_populates_editor_description(client):

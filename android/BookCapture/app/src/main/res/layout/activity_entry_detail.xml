@@ -1,8 +1,28 @@
 <?xml version="1.0" encoding="utf-8"?>
-<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="@color/whl_canvas">
+    android:background="@color/whl_canvas"
+    android:orientation="vertical">
+
+    <com.google.android.material.appbar.MaterialToolbar
+        android:id="@+id/toolbar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:minHeight="56dp"
+        android:background="@drawable/whl_panel"
+        android:elevation="2dp"
+        app:navigationContentDescription="@string/navigate_up"
+        app:navigationIcon="@drawable/ic_arrow_back"
+        app:navigationIconTint="@color/whl_ink"
+        app:title="@string/detail_title"
+        app:titleTextColor="@color/whl_ink" />
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
 
     <LinearLayout
         android:layout_width="match_parent"
@@ -41,6 +61,27 @@
                 android:textAllCaps="true"
                 android:textColor="@color/whl_ink_dim" />
 
+            <TextView
+                android:id="@+id/ownershipNotice"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:fontFamily="monospace"
+                android:textSize="11sp"
+                android:textColor="@color/whl_amber"
+                android:visibility="gone" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/claimCloud"
+                style="@style/WhlButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="end"
+                android:layout_marginTop="8dp"
+                android:text="@string/detail_claim_cloud"
+                android:textSize="12sp"
+                android:visibility="gone" />
+
             <!-- extracted fields, one mono row each, added in code -->
             <LinearLayout
                 android:id="@+id/fields"
@@ -64,6 +105,16 @@
             android:paddingEnd="14dp"
             android:text="@string/detail_deepseek_action"
             android:textSize="12sp" />
+
+        <TextView
+            android:id="@+id/reprocessAvailability"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:fontFamily="monospace"
+            android:textSize="11sp"
+            android:textColor="@color/whl_ink_dim"
+            android:visibility="gone" />
 
         <LinearLayout style="@style/WhlPanelSection"
             android:layout_width="match_parent" android:layout_height="wrap_content"
@@ -108,10 +159,11 @@
             android:layout_marginTop="12dp"
             android:layout_gravity="end"
             android:textSize="12sp"
-            android:textColor="@color/whl_red"
+            android:textColor="@color/whl_button_text"
             android:paddingStart="14dp"
             android:paddingEnd="14dp"
             android:visibility="gone"
             android:text="@string/detail_discard" />
     </LinearLayout>
-</ScrollView>
+    </ScrollView>
+</LinearLayout>

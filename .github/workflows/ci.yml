@@ -56,4 +56,26 @@ jobs:
           node --experimental-default-type=module --check website/assets/releases.js
           node --experimental-default-type=module --check website/assets/textsearch.js
           node --experimental-default-type=module --check website/assets/read.js
-          node --test tests/changelog_behavior.test.js tests/publish_tree_behavior.test.js tests/desktop_issue_fixes_behavior.test.js tests/electron_lifecycle_behavior.test.js tests/copyright_cache_behavior.test.js tests/textsearch.test.js tests/rpcsearch.test.js tests/facets_behavior.test.js
+          node --test tests/changelog_behavior.test.js tests/publish_tree_behavior.test.js tests/desktop_issue_fixes_behavior.test.js tests/electron_lifecycle_behavior.test.js tests/copyright_cache_behavior.test.js tests/textsearch.test.js tests/rpcsearch.test.js tests/facets_behavior.test.js tests/lib_open_behavior.test.js tests/remarks_behavior.test.js tests/pdf_viewer_behavior.test.js tests/workbench_publish_behavior.test.js
+
+  android:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android/BookCapture
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+          cache-dependency-path: |
+            android/BookCapture/*.gradle.kts
+            android/BookCapture/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Unit tests, lint, and debug build
+        run: ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug

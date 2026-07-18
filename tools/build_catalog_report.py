@@ -43,6 +43,12 @@ ONLINE_CACHE = lib.OUTPUT_DIR / ".online_cache.json"
 
 ADDED_COLUMNS = ["In WHL", "Available online", "In local library", "Copyright status"]
 
+# Cached "yes"/"no" answers are stable and kept forever. A cached "error" is a
+# transient network failure, so it is only trusted for this long before the next
+# run is allowed to retry it (older bare-string caches, which have no timestamp,
+# are always retried).
+ERROR_RETRY_TTL = 6 * 3600  # seconds
+
 
 # --- CH Library title/author helpers ---------------------------------------
 
@@ -90,11 +96,47 @@ def in_local_library(row: dict, local: list[dict]) -> str:
 
 # --- online availability (opt-in) -------------------------------------------
 
-def check_online(title: str, author: str, cache: dict) -> str:
-    """Query the Internet Archive text collection for the book."""
+def _cache_entry(value) -> tuple[str, float | None]:
+    """Normalise a cached value to ``(status, ts)``.
+
+    New entries are ``{"status": ..., "ts": ...}`` dicts; legacy caches stored a
+    bare ``"yes"``/``"no"``/``"error"`` string with no timestamp. Anything
+    unrecognised coerces to a stale error so it will be re-checked.
+    """
+    if isinstance(value, dict):
+        status = value.get("status")
+        ts = value.get("ts")
+        if status in ("yes", "no", "error"):
+            return status, (ts if isinstance(ts, (int, float)) else None)
+        return "error", None
+    if value in ("yes", "no", "error"):
+        return value, None
+    return "error", None
+
+
+def check_online(title: str, author: str, cache: dict, allow_request: bool = True) -> tuple[str, bool]:
+    """Resolve Internet Archive availability for a book.
+
+    Returns ``(status, did_request)`` where ``status`` is ``"yes"``/``"no"``/
+    ``"error"``/``"not checked"`` and ``did_request`` is True only when a real
+    network call was made (the caller uses this to spend rate-limit budget and
+    sleep). A cached ``yes``/``no`` — or a cached ``error`` still inside
+    ``ERROR_RETRY_TTL`` — resolves for free and never spends budget, so a resumed
+    run advances past already-checked rows instead of re-spending on them. When
+    ``allow_request`` is False and the answer is not cached, returns
+    ``("not checked", False)`` without touching the network.
+    """
     key = whl._normalize(title) + "|" + whl._normalize(author)
     if key in cache:
-        return cache[key]
+        status, ts = _cache_entry(cache[key])
+        if status in ("yes", "no"):
+            return status, False
+        # A cached error is only trusted for a while, and legacy bare errors
+        # (no timestamp) are always retried; otherwise fall through to re-check.
+        if ts is not None and (time.time() - ts) < ERROR_RETRY_TTL:
+            return "error", False
+    if not allow_request:
+        return "not checked", False
     words = " ".join(whl._normalize(title).split()[:8])
     q = f'title:({words}) AND mediatype:texts'
     if author:
@@ -110,8 +152,32 @@ def check_online(title: str, author: str, cache: dict) -> str:
         value = "yes" if found > 0 else "no"
     except Exception:
         value = "error"
-    cache[key] = value
-    return value
+    cache[key] = {"status": value, "ts": time.time()}
+    return value, True
+
+
+def resolve_online(pairs, cache, *, limit, sleep_s=0.0, save=None) -> list[str]:
+    """Resolve online availability for a sequence of ``(title, author)`` pairs.
+
+    Spends at most ``limit`` network requests (``limit == 0`` means unlimited),
+    counting only genuine requests — cached rows resolve for free and never cost
+    budget or a sleep. After each real request the cache is flushed via ``save``
+    (if given) so an interrupted run keeps every lookup it completed. Returns the
+    per-pair status list in order.
+    """
+    budget = limit
+    out: list[str] = []
+    for title, author in pairs:
+        allow = (limit == 0 or budget > 0)
+        status, did_request = check_online(title, author, cache, allow_request=allow)
+        if did_request:
+            budget -= 1
+            if save is not None:
+                save(cache)
+            if sleep_s:
+                time.sleep(sleep_s)
+        out.append(status)
+    return out
 
 
 # --- report build -----------------------------------------------------------
@@ -137,7 +203,6 @@ def main() -> None:
     print(f"  {len(local)} local library books loaded")
 
     online_cache = lib.load_json(ONLINE_CACHE, {}) if args.online else {}
-    online_budget = args.limit
 
     src = openpyxl.load_workbook(lib.XLSX_PATH, read_only=True, data_only=True)
     ws = src.worksheets[0]
@@ -152,6 +217,8 @@ def main() -> None:
 
     status_counts: dict[str, int] = {}
     whl_counts: dict[str, int] = {}
+    pending: list[tuple[list, str, str, str]] = []  # input values + whl/local/copyright flags
+    pairs: list[tuple[str, str]] = []               # (title, author) for the online lookup
     n = 0
     for values in rows:
         if values is None or all(v is None for v in values):
@@ -170,17 +237,24 @@ def main() -> None:
         whl_flag = checks.whl_catalog_flag(title, author, year, whlcat)
         whl_counts[whl_flag] = whl_counts.get(whl_flag, 0) + 1
 
-        online_flag = "not checked"
-        if args.online and (args.limit == 0 or online_budget > 0):
-            online_flag = check_online(title, author, online_cache)
-            online_budget -= 1
-            time.sleep(args.sleep)
-
-        out_ws.append(
-            list(values) + [whl_flag, online_flag, local_flag, status]
-        )
+        pending.append((list(values), whl_flag, local_flag, status))
+        pairs.append((title, author))
         if n % 500 == 0:
             print(f"  processed {n} rows ...")
+
+    # Resolve online availability in a single pass: cached rows are free, only
+    # genuine lookups spend --limit budget, and the cache is flushed after each
+    # real request so an interrupted run keeps every lookup it completed.
+    if args.online:
+        online_flags = resolve_online(
+            pairs, online_cache, limit=args.limit, sleep_s=args.sleep,
+            save=lambda c: lib.save_json(ONLINE_CACHE, c),
+        )
+    else:
+        online_flags = ["not checked"] * len(pairs)
+
+    for (values, whl_flag, local_flag, status), online_flag in zip(pending, online_flags):
+        out_ws.append(list(values) + [whl_flag, online_flag, local_flag, status])
 
     lib.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_wb.save(REPORT_PATH)

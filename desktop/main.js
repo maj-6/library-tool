@@ -28,6 +28,65 @@ let mainReady = false;        // gates window-all-closed: don't quit mid-startup
 
 const isDev = !app.isPackaged;
 
+// --- .lib open flow ------------------------------------------------------------
+// A double-clicked .lib (the NSIS file association) arrives as an argv entry on
+// first launch, through second-instance argv when the app is already running,
+// or through open-file on macOS. The path is queued until the renderer says it
+// has registered its handler ("lib:ready", sent from app.js init), then
+// delivered over "lib:open" — the renderer owns the create-vs-import dialog.
+let pendingLibPaths = [];    // a QUEUE: multi-select + Enter opens one per file
+let libReadySender = null;   // the webContents that last signalled lib:ready
+
+function libPathFromArgv(argv, cwd) {
+  // Electron/Chromium switches ride the same array; a .lib path is the only
+  // argument shape we accept, resolved against the caller's cwd (a shell
+  // passes a relative path when launched from the file's own folder).
+  for (let i = argv.length - 1; i >= 1; i--) {
+    const a = argv[i];
+    if (typeof a !== "string" || !/\.lib$/i.test(a) || a.startsWith("--")) continue;
+    const p = path.resolve(cwd || process.cwd(), a);
+    try { if (fs.statSync(p).isFile()) return p; } catch (e) { /* not a file */ }
+  }
+  return null;
+}
+
+function flushLibOpen() {
+  if (!libReadySender || libReadySender.isDestroyed()) return;
+  while (pendingLibPaths.length) {
+    libReadySender.send("lib:open", pendingLibPaths.shift());
+  }
+}
+
+function sendLibOpen(p) {
+  if (!p) return;
+  pendingLibPaths.push(p);
+  flushLibOpen();
+}
+
+ipcMain.on("lib:ready", (event) => {
+  libReadySender = event.sender;   // re-set on reload, so delivery stays live
+  // a webContents survives navigation/reload, so isDestroyed() alone can't tell
+  // that the listener's isolated world is gone. Drop the sender when it starts
+  // loading, so a mid-reload flush keeps the path QUEUED for the next lib:ready
+  // rather than sending into a page whose handler is not yet registered.
+  event.sender.once("did-start-loading", () => {
+    if (libReadySender === event.sender) libReadySender = null;
+  });
+  flushLibOpen();
+});
+
+// macOS delivers opened files as an event, not argv; register before ready.
+app.on("open-file", (event, p) => {
+  event.preventDefault();
+  if (/\.lib$/i.test(p)) sendLibOpen(p);
+});
+
+// the file the user double-clicked to launch us, if any
+{
+  const p0 = libPathFromArgv(process.argv, process.cwd());
+  if (p0) pendingLibPaths.push(p0);
+}
+
 // Only one packaged instance may run at a time. A second launch hands off to
 // the first (focusing its window) and exits immediately. This is what makes an
 // in-place update safe: NSIS cannot replace a running .exe, so a second
@@ -38,7 +97,10 @@ const gotSingleInstanceLock = isDev || app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
   app.quit();
 } else {
-  app.on("second-instance", () => {
+  app.on("second-instance", (_event, argv, workingDirectory) => {
+    // a second launch may BE a double-clicked .lib — hand its path over
+    const p = libPathFromArgv(argv || [], workingDirectory);
+    if (p) sendLibOpen(p);
     const win = mainWindow || startupWin || updaterWin;
     if (!win) return;
     if (win.isMinimized()) win.restore();
@@ -87,6 +149,50 @@ function freePort() {
       srv.close(() => resolve(p));
     });
   });
+}
+
+// The sidecar's origin (http://127.0.0.1:<port>) keys the renderer's
+// localStorage, HTTP cache, and V8 compiled-code cache. A fresh ephemeral port
+// every launch silently discarded all three: the ~620 KB app.js re-parsed from
+// cold and the localStorage fast-path started empty on every run. Persist the
+// first port we pick and reuse it on later launches; if another process holds
+// it we fall back to a new free one and persist that instead. Still
+// loopback-only, and the server Host-guards against DNS rebinding.
+//
+// Dev and the installed app share userData (%APPDATA%\Library Tool) and dev is
+// exempt from the single-instance lock, so they can run side by side — a
+// SHARED port file would make them steal each other's port (churning the
+// packaged origin and defeating this cache exactly on a dev machine). Each
+// kind therefore persists its own file.
+function portFilePath() {
+  return path.join(app.getPath("userData"),
+    isDev ? "sidecar-port-dev.json" : "sidecar-port.json");
+}
+function readPreferredPort() {
+  try {
+    const p = JSON.parse(fs.readFileSync(portFilePath(), "utf8")).port;
+    return Number.isInteger(p) && p >= 1024 && p <= 65535 ? p : null;
+  } catch (e) {
+    return null;                            // first run / unreadable
+  }
+}
+function writePreferredPort(port) {
+  try { fs.writeFileSync(portFilePath(), JSON.stringify({ port })); } catch (e) {}
+}
+function portIsFree(port) {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.unref();
+    srv.on("error", () => resolve(false));
+    srv.listen(port, "127.0.0.1", () => srv.close(() => resolve(true)));
+  });
+}
+async function choosePort() {
+  const preferred = readPreferredPort();
+  if (preferred && await portIsFree(preferred)) return preferred;
+  const p = await freePort();
+  writePreferredPort(p);
+  return p;
 }
 
 function sidecarCommand(port, dataRoot) {
@@ -247,9 +353,12 @@ function waitForServer(port, timeoutMs) {
 async function startSidecar() {
   const dataRoot = app.getPath("userData");   // %APPDATA%\Library Tool
   fs.mkdirSync(dataRoot, { recursive: true });
-  sidecarPort = await freePort();
+  sidecarPort = await choosePort();
   const { cmd, args, opts } = sidecarCommand(sidecarPort, dataRoot);
   sidecar = spawn(cmd, args, opts);
+  // The update gate may commit to installing while we were awaiting the port:
+  // before-quit has already run (nothing to kill then), so reap the child here.
+  if (app.isQuitting) { try { sidecar.kill(); } catch (e) { /* already gone */ } }
   sidecar.stdout.on("data", (d) => process.stdout.write(`[sidecar] ${d}`));
   sidecar.stderr.on("data", (d) => process.stderr.write(`[sidecar] ${d}`));
   await superviseChildProcess(sidecar, waitForServer(sidecarPort, 45000), (end) => {
@@ -565,7 +674,16 @@ app.whenReady().then(async () => {
   if (!gotSingleInstanceLock) return;   // a second instance — it is already quitting
   createStartupWindow(readActiveTheme());
   sendStartupStatus(isDev ? "Preparing local services" : "Checking for updates");
-  // Update first: if one is installing, we quit into NSIS and never launch here.
+  // The two slowest startup steps — the GitHub update check (up to its 8s cap
+  // on a bad network) and the PyInstaller sidecar cold start (multi-second) —
+  // are independent, so run them CONCURRENTLY instead of serially. If the gate
+  // resolves 'installing', the young sidecar is reaped (before-quit kills it,
+  // and startSidecar reaps a spawn that lands after that), so NSIS never races
+  // a running exe. The catch below keeps a sidecar failure during the check
+  // from becoming an unhandled rejection; the launch branch still awaits the
+  // same promise, so the existing failure dialog is preserved.
+  const sidecarPromise = startSidecar();
+  sidecarPromise.catch(() => { /* surfaced via the await below on launch */ });
   let outcome = "launch";
   try {
     outcome = await runUpdateGate();
@@ -576,7 +694,7 @@ app.whenReady().then(async () => {
 
   try {
     sendStartupStatus("Loading library service");
-    await startSidecar();
+    await sidecarPromise;
   } catch (e) {
     closeStartupWindow();
     dialog.showErrorBox("Library Tool", "The local backend failed to start.\n" + e.message +

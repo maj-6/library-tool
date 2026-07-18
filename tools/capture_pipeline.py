@@ -175,13 +175,17 @@ def _mistral_post(url: str, payload: dict, api_key: str, timeout: float) -> dict
 
 
 def mistral_ocr_pages(img_bytes: bytes, api_key: str, timeout: float = 90.0,
-                      want_images: bool = False) -> list[dict]:
+                      want_images: bool = False,
+                      want_blocks: bool = False) -> list[dict]:
     """OCR one image via Mistral; returns the raw page dicts.
 
     Each page carries `markdown`, `dimensions` {width, height, dpi}, and —
     with want_images — `images` [{id, top_left_x/y, bottom_right_x/y,
     image_base64}] for every figure the model cut out of the page. The
-    markdown references those figures as ![id](id).
+    markdown references those figures as ![id](id). With want_blocks (OCR 4)
+    each page also carries `blocks` [{type, top_left_x/y, bottom_right_x/y,
+    content}] — typed text regions in reading order, pixel coords like the
+    figure boxes.
     """
     mime = "image/png" if img_bytes[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
     b64 = base64.b64encode(img_bytes).decode("ascii")
@@ -192,6 +196,8 @@ def mistral_ocr_pages(img_bytes: bytes, api_key: str, timeout: float = 90.0,
     }
     if want_images:
         payload["include_image_base64"] = True
+    if want_blocks:
+        payload["include_blocks"] = True
     data = _mistral_post(MISTRAL_OCR_URL, payload, api_key, timeout)
     return data.get("pages") or []
 
@@ -228,25 +234,21 @@ OCR TEXT:
 """
 
 
-def extract_bibliography(ocr_text: str, api_key: str, timeout: float = 60.0) -> dict:
-    """OCR text -> {fields..., extra:{}} via a structured Mistral chat call."""
-    empty = {k: "" for k in FIELDS}
+def empty_bibliography() -> dict:
+    empty: dict = {k: "" for k in FIELDS}
     empty["extra"] = {}
-    text = str(ocr_text or "").strip()
-    if not text:
-        return empty
-    data = _mistral_post(MISTRAL_CHAT_URL, {
-        "model": EXTRACT_MODEL,
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-        "messages": [{"role": "user", "content": _EXTRACT_PROMPT + text[:12000]}],
-    }, api_key, timeout)
-    raw = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-    raw = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.M).strip()
-    try:
-        obj = json.loads(raw)
-    except json.JSONDecodeError:
-        return empty
+    return empty
+
+
+def normalize_bibliography(obj) -> dict:
+    """Coerce a model's JSON reply to the strict {fields..., extra:{}} shape.
+
+    Shared by every extraction path (Mistral here, DeepSeek in the explorer's
+    smart check) so a record looks the same regardless of which model wrote it.
+    Anything that isn't a dict normalizes to the empty record.
+    """
+    if not isinstance(obj, dict):
+        return empty_bibliography()
     out = {k: str(obj.get(k) or "").strip() for k in FIELDS}
     extra = obj.get("extra")
 
@@ -262,6 +264,26 @@ def extract_bibliography(ocr_text: str, api_key: str, timeout: float = 60.0) -> 
     out["extra"] = ({str(k): _flat(v) for k, v in extra.items() if _keep(v)}
                     if isinstance(extra, dict) else {})
     return out
+
+
+def extract_bibliography(ocr_text: str, api_key: str, timeout: float = 60.0) -> dict:
+    """OCR text -> {fields..., extra:{}} via a structured Mistral chat call."""
+    text = str(ocr_text or "").strip()
+    if not text:
+        return empty_bibliography()
+    data = _mistral_post(MISTRAL_CHAT_URL, {
+        "model": EXTRACT_MODEL,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [{"role": "user", "content": _EXTRACT_PROMPT + text[:12000]}],
+    }, api_key, timeout)
+    raw = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    raw = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.M).strip()
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return empty_bibliography()
+    return normalize_bibliography(obj)
 
 
 # --- the whole chain ---------------------------------------------------------------

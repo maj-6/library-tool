@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <dimen name="detail_thumbnail_height">160dp</dimen>
+    <dimen name="detail_thumbnail_gap">10dp</dimen>
+    <dimen name="capture_thumbnail_height">80dp</dimen>
+    <dimen name="capture_thumbnail_gap">4dp</dimen>
+</resources>

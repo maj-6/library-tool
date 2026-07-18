@@ -360,6 +360,30 @@ ol.volumes { list-style: none; margin: 0; padding: 0; }
   border-radius: 1px;
   padding: 2px 5px;
 }
+/* code blocks + key tables (the API & file format page) */
+.docs pre {
+  font: 12.5px/1.55 var(--mono);
+  background: var(--card);
+  border: 1px solid var(--rule-mid);
+  padding: 10px 14px;
+  overflow-x: auto;
+  margin: 10px 0 16px;
+}
+.docs code { font: 13px/1.4 var(--mono); }
+.docs table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 14px;
+  margin: 10px 0 16px;
+}
+.docs th, .docs td {
+  text-align: left;
+  vertical-align: top;
+  padding: 5px 12px 5px 0;
+  border-bottom: 1px solid var(--rule-soft);
+}
+.docs th { font-weight: 600; color: var(--ink-soft); white-space: nowrap; }
+.docs td:first-child { font: 13px/1.5 var(--mono); white-space: nowrap; }
 .glossary dt { font-weight: 600; margin-top: 12px; }
 .glossary dd { margin: 2px 0 0 0; color: var(--ink-soft); }
 

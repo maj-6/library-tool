@@ -22,6 +22,13 @@ BASELINE = SQL["001_baseline"]
 BASELINE_FLAT = " ".join(BASELINE.split())
 HARDENING = SQL["002_capture_owner_hardening"]
 HARDENING_FLAT = " ".join(HARDENING.split())
+SECRETS_REVISION = SQL["006_profile_secrets_revision"]
+SECRETS_REVISION_FLAT = " ".join(SECRETS_REVISION.split())
+MEMBER_LEDGER = SQL["005_member_roles_approval"]
+MEMBER_HOLDBACK = SQL["007_unreleased_member_gate_holdback"]
+MEMBER_HOLDBACK_FLAT = " ".join(MEMBER_HOLDBACK.split())
+TRIGGER_GRANTS = SQL["008_profile_secrets_trigger_grants"]
+TRIGGER_GRANTS_FLAT = " ".join(TRIGGER_GRANTS.split())
 
 
 # --- the migration files themselves ----------------------------------------------
@@ -113,6 +120,50 @@ def test_capture_storage_policies_bind_object_owner_to_capture_owner():
             assert "grant_row.contributor_id = c.created_by" in policy
 
 
+def test_profile_secrets_revision_advances_for_every_client_version():
+    """CAS remains sound when an older client omits updated_at on UPDATE."""
+    assert "before update on public.profile_secrets" in SECRETS_REVISION_FLAT
+    assert "for each row" in SECRETS_REVISION_FLAT
+    assert "new.updated_at = greatest(" in SECRETS_REVISION_FLAT
+    assert "old.updated_at + interval '1 microsecond'" in SECRETS_REVISION_FLAT
+    assert "clock_timestamp()" in SECRETS_REVISION_FLAT
+    assert ("revoke all on function public.touch_profile_secrets_updated_at() "
+            "from public;" in SECRETS_REVISION_FLAT)
+    assert "security definer" not in SECRETS_REVISION_FLAT.lower()
+
+
+def test_profile_secrets_trigger_is_not_callable_through_api_roles():
+    assert "touch_profile_secrets_updated_at()" in TRIGGER_GRANTS_FLAT
+    assert ("from public, anon, authenticated, service_role;" in
+            TRIGGER_GRANTS_FLAT)
+
+
+def test_unreleased_member_gate_is_recorded_but_not_replayed():
+    """005 exists in production history, but clean projects must not enable it."""
+    body = re.sub(r"--[^\n]*", "", MEMBER_LEDGER).lower()
+    assert "create policy" not in body
+    assert "create function" not in body
+    assert "alter table" not in body
+    assert "update profiles" not in body
+
+
+def test_member_holdback_restores_released_authorization_and_hides_helpers():
+    assert ("with check (actor_id = (select auth.uid()))" in
+            MEMBER_HOLDBACK_FLAT)
+    assert ("with check (created_by = (select auth.uid()))" in
+            MEMBER_HOLDBACK_FLAT)
+    assert "captures_update_authorized" in MEMBER_HOLDBACK_FLAT
+    assert "capture_ingest_grants" in MEMBER_HOLDBACK_FLAT
+    assert ("for insert to authenticated with check (bucket_id = 'captures')"
+            in MEMBER_HOLDBACK_FLAT)
+    for function in ("handle_new_user", "assert_maintainer",
+                     "is_active_member", "member_directory",
+                     "set_member_role", "set_member_status"):
+        assert f"public.{function}" in MEMBER_HOLDBACK
+    assert "from public, anon, authenticated" in MEMBER_HOLDBACK_FLAT
+    assert "update profiles" not in re.sub(r"--[^\n]*", "", MEMBER_HOLDBACK).lower()
+
+
 def test_migrations_lint_clean():
     for mid, sql in SQL.items():
         body = re.sub(r"--[^\n]*", "", sql)          # comments carry apostrophes
@@ -121,6 +172,56 @@ def test_migrations_lint_clean():
         assert no_str.count("(") == no_str.count(")"), f"{mid}: unbalanced parens"
         assert sql.count("$$") % 2 == 0, f"{mid}: unbalanced dollar quoting"
         assert sql.rstrip().endswith(";"), f"{mid}: missing final semicolon"
+
+
+# --- 004: passages + index versions (issue #140) ----------------------------------
+
+PASSAGES_MIG = SQL["004_passages_index"]
+PASSAGES_FLAT = " ".join(PASSAGES_MIG.split())
+
+
+def test_passages_index_declares_tables_and_the_vector_extension():
+    assert "create extension if not exists vector;" in PASSAGES_MIG
+    sch = cloud_setup.expected_schema(PASSAGES_MIG)
+    assert sch["index_versions"] == {"id", "slug", "channel", "config",
+                                     "source_hash", "stats", "built_at"}
+    assert sch["passages"] == {"index_id", "slug", "passage_id", "parent_id",
+                               "page_from", "page_to", "body", "fts",
+                               "embedding"}
+    # dimension-free on purpose: the model and its dims live in config, so
+    # a typed/indexed column stays a deliberate later migration
+    assert re.search(r"^\s*embedding\s+vector,", PASSAGES_MIG, re.M)
+
+
+def test_passage_corpus_is_rpc_only_and_version_metadata_is_readable():
+    """docs/search-design.md D6: no anon path to the corpus but the RPC."""
+    body = re.sub(r"--[^\n]*", "", PASSAGES_MIG)
+    assert "alter table passages enable row level security;" in PASSAGES_FLAT
+    assert ("revoke all on public.passages from anon, authenticated;"
+            in PASSAGES_FLAT)
+    assert not re.search(r"create policy \w+ on passages\b", body)
+    assert ("grant select on public.index_versions to anon, authenticated;"
+            in PASSAGES_FLAT)
+    assert PASSAGES_MIG.count("create policy index_versions_read_all") == 1
+    # the check's anon smoke tests carry the same contract
+    assert "index_versions" in cloud_setup.ANON_CAN
+    assert "passages" in cloud_setup.ANON_CANNOT
+
+
+def test_search_passages_rpc_is_definer_with_pinned_path_and_rank_fusion():
+    fn = " ".join(PASSAGES_MIG.split(
+        "create or replace function search_passages", 1)[1].split())
+    assert "security definer" in fn          # passages carries no anon read
+    assert "set search_path = public, extensions" in fn
+    assert "channel = 'stable'" in fn        # latest stable serves
+    assert "order by iv.built_at desc" in fn
+    assert "websearch_to_tsquery('simple', p_query)" in fn
+    assert "websearch_to_tsquery('english', p_query)" in fn
+    assert "StartSel=«, StopSel=», MaxWords=24, MinWords=12" in fn
+    assert "p.embedding <=> p_embedding" in fn
+    assert fn.count("1.0 / (60 + ") == 2     # reciprocal-rank fusion, both arms
+    assert ("grant execute on function search_passages(text, text, vector, int)"
+            " to anon, authenticated, service_role;" in PASSAGES_FLAT)
 
 
 # --- the pure check logic ---------------------------------------------------------
