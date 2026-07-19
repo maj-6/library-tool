@@ -4,7 +4,6 @@ import copy
 import hashlib
 import json
 import re
-import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -12,10 +11,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-
-
-SRC = Path(__file__).resolve().parents[1] / "src"
-sys.path.insert(0, str(SRC))
 
 from librarytool.adapters.filesystem import FilesystemReplicaRepository
 from librarytool.engine.contracts import (
@@ -33,6 +28,9 @@ from librarytool.engine.text_layers import TextLayerService
 from librarytool.engine.translations import (
     TranslationProvenanceService,
 )
+
+
+SRC = Path(__file__).resolve().parents[1] / "src"
 
 
 class Items:

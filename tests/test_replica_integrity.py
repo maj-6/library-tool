@@ -11,7 +11,6 @@ import io
 import json
 import zipfile
 
-import libformat
 import pytest
 import server
 
