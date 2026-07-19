@@ -212,6 +212,8 @@ writes down); invite-only contributor enforcement is TODO (#98).
   the anon-key grant list.
 - `docs/releasing.md` — versioning, release standards, the pipeline,
   its secrets.
+- `docs/fonts.md` — the bundled faces: the manifest, `tools/fontman.py`,
+  and why the generated files are committed rather than built at run time.
 - `docs/cloud/` — `migrations/` (the authority on grants + RLS; run in
   order, `schema.sql` is the entry point), `auth_setup.md`,
   `r2_cors_setup.md`; `docs/cloud_capture_setup.md`

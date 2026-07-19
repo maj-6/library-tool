@@ -993,6 +993,7 @@ def home():
         app_v=_asset_v("app.js"),
         engine_v=_asset_v("engine-client.js"),
         css_v=_asset_v("style.css"),
+        fonts_v=_asset_v("fonts.css"),
         app_version=_app_version(),
     )
 

@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "note": "The bundled-font manifest: the single source of truth for the faces that ship with Library Tool. static/fonts.css, the font block in static/app.js, and this directory's README.md are all GENERATED from it and committed (the frozen sidecar serves static/ read-only and cannot generate them at run time). Edit with: python tools/fontman.py add|rm, then: python tools/fontman.py generate. See docs/fonts.md.",
+  "sections": {
+    "fonts": "Chrome faces -> BUNDLED_FONTS. Offered in the Settings font pickers.",
+    "typeset": "Typesetting faces -> TYPESET_FONTS. RESERVED for the Replica engine's facsimile pages; never offered as an interface font. Add with: fontman.py add --typeset"
+  },
+  "fonts": [
+    {
+      "id": "roboto-slab",
+      "family": "Roboto Slab",
+      "stack": "\"Roboto Slab\", Georgia, \"Times New Roman\", serif",
+      "kind": "serif",
+      "file": "roboto-slab-var.woff2",
+      "format": "woff2",
+      "weight": "100 900",
+      "style": "normal",
+      "display": "swap",
+      "bytes": 34236,
+      "sha256": "50cf7d32c18e1001749b51f1565ef745bc0687b0297b2b13465ed577cc20a8ff",
+      "source": "Google Fonts (fonts.gstatic.com), Roboto Slab variable v36, latin subset",
+      "license": "SIL Open Font License 1.1",
+      "license_url": "https://github.com/googlefonts/robotoslab"
+    }
+  ],
+  "typeset": []
+}

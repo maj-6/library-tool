@@ -4,15 +4,10 @@
    Themes below rework the chrome; geometry (text sizes, paddings, element
    sizes) is preserved. */
 
-/* Bundled wordmark face (see static/fonts/README.md); variable weight,
-   latin subset -- used only for the home-page title */
-@font-face {
-  font-family: "Roboto Slab";
-  src: url("fonts/roboto-slab-var.woff2") format("woff2");
-  font-weight: 100 900;
-  font-style: normal;
-  font-display: swap;
-}
+/* Bundled faces are declared in static/fonts.css, generated from
+   static/fonts/fonts.json by tools/fontman.py (see docs/fonts.md). Nothing
+   here declares an @font-face -- add a face with `fontman.py add`, not by
+   hand, or the font pickers in Settings will not know it exists. */
 
 :root {
   --face: #e7e9ec;       /* panel face */
