@@ -463,6 +463,46 @@ def test_tombstone_reads_take_the_broad_lifecycle_isolation_scope(tmp_path):
     assert events == ["enter", "exit"] * 3
 
 
+def test_deletion_index_guard_retains_isolation_and_preserves_body_errors(
+    tmp_path,
+):
+    root = tmp_path / "guarded-tombstone-index"
+    _write_catalogue(root)
+    _, deleting_repository = _repository(root)
+    _delete(ItemLifecycleService(deleting_repository))
+    held = False
+    events: list[str] = []
+
+    @contextmanager
+    def tracked_lock():
+        nonlocal held
+        assert held is False
+        held = True
+        events.append("enter")
+        try:
+            yield
+        finally:
+            held = False
+            events.append("exit")
+
+    _, repository = _repository(root, lock_context_for=tracked_lock)
+    service = ItemLifecycleService(repository)
+    with service.deletion_index_guard() as index:
+        assert held is True
+        assert index.active_item_ids == ("book-1",)
+        assert index.allows("book-1") is False
+        assert index.allows("BOOK-1") is False
+        assert index.allows("book-2") is True
+    assert held is False
+
+    with pytest.raises(RuntimeError, match="sync failed"):
+        with service.deletion_index_guard():
+            assert held is True
+            raise RuntimeError("sync failed")
+    assert held is False
+    assert events == ["enter", "exit"] * 2
+
+
 def test_tombstone_alias_lookup_and_noncanonical_envelope_fail_closed(
     tmp_path,
 ):

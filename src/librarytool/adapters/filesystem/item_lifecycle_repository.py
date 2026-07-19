@@ -217,6 +217,27 @@ class FilesystemItemLifecycleRepository:
                 unit.close()
 
     @contextmanager
+    def tombstone_read_guard(
+        self,
+    ) -> Iterator[tuple[ItemTombstoneSnapshot, ...]]:
+        """Yield one stable public index while lifecycle isolation is held.
+
+        Bulk writers use this scope to apply a tombstone policy without
+        re-entering the non-reentrant host catalogue lock for every item.
+        """
+
+        operation_id = "guard-tombstone-index"
+        with self._locked_item_unit(operation_id=operation_id) as item_unit:
+            unit = self._new_unit(
+                operation_id=operation_id, item_unit=item_unit
+            )
+            try:
+                tombstones = unit.list_tombstones()
+                yield tombstones
+            finally:
+                unit.close()
+
+    @contextmanager
     def unit_of_work(
         self, *, operation_id: str
     ) -> Iterator["FilesystemItemLifecycleUnitOfWork"]:
@@ -235,30 +256,36 @@ class FilesystemItemLifecycleRepository:
     ) -> Iterator[FilesystemItemCommandUnitOfWork]:
         """Take workspace, broad host, then item snapshot locks exactly once."""
 
+        stack = ExitStack()
+        unit: FilesystemItemCommandUnitOfWork | None = None
         try:
-            with self._write_set.workspace_lease():
-                with self._lock_context_for():
-                    unit = self._items.open_locked_unit(
-                        operation_id=operation_id
-                    )
-                    try:
-                        yield unit
-                    finally:
-                        unit.close()
-        except WriteSetError as exc:
-            raise _safe_cause(
-                exc,
-                code=exc.code,
-                message="the item lifecycle workspace is unavailable",
-            ) from exc
-        except EngineError:
-            raise
-        except Exception as exc:
-            raise _safe_cause(
-                exc,
-                code="item_lifecycle_isolation_failed",
-                message="the item lifecycle isolation scope failed",
-            ) from exc
+            try:
+                stack.enter_context(self._write_set.workspace_lease())
+                stack.enter_context(self._lock_context_for())
+                unit = self._items.open_locked_unit(
+                    operation_id=operation_id
+                )
+            except WriteSetError as exc:
+                raise _safe_cause(
+                    exc,
+                    code=exc.code,
+                    message="the item lifecycle workspace is unavailable",
+                ) from exc
+            except EngineError:
+                raise
+            except Exception as exc:
+                raise _safe_cause(
+                    exc,
+                    code="item_lifecycle_isolation_failed",
+                    message="the item lifecycle isolation scope failed",
+                ) from exc
+            yield unit
+        finally:
+            try:
+                if unit is not None:
+                    unit.close()
+            finally:
+                stack.close()
 
     def _new_unit(
         self,

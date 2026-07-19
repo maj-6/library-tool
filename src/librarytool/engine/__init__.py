@@ -83,6 +83,7 @@ from .item_commands import (
 from .item_lifecycle import (
     DeleteItemCommand as LifecycleDeleteItemCommand,
     ItemLifecycleAction,
+    ItemLifecycleDeletionIndex,
     ItemLifecycleReceipt,
     ItemLifecycleRepositoryPort,
     ItemLifecycleResult,
@@ -209,6 +210,7 @@ __all__ = [
     "ItemCommandService",
     "ItemCommandUnitOfWorkPort",
     "ItemLifecycleAction",
+    "ItemLifecycleDeletionIndex",
     "ItemLifecycleReceipt",
     "ItemLifecycleRepositoryPort",
     "ItemLifecycleResult",

@@ -21,8 +21,9 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import Any, ContextManager, Literal, Protocol, TypeAlias
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass, field
+from typing import Any, ContextManager, Iterator, Literal, Protocol, TypeAlias
 
 from .errors import (
     ConflictError,
@@ -286,6 +287,53 @@ class ItemTombstoneSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class ItemLifecycleDeletionIndex:
+    """Immutable deleted-item policy held inside a lifecycle read guard.
+
+    The snapshot remains authoritative only while the context returned by
+    :meth:`ItemLifecycleService.deletion_index_guard` is open.  Case aliases
+    are denied as well as exact identities because supported filesystem hosts
+    may resolve them to the same managed tree.
+    """
+
+    active_item_ids: tuple[str, ...]
+    _active_aliases: frozenset[str] = field(
+        init=False, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        if isinstance(self.active_item_ids, (str, bytes)):
+            raise TypeError("active_item_ids must contain item identities")
+        try:
+            values = tuple(self.active_item_ids)
+        except TypeError as exc:
+            raise TypeError(
+                "active_item_ids must contain item identities"
+            ) from exc
+        aliases: dict[str, str] = {}
+        for item_id in values:
+            _identifier(item_id, "item_id")
+            folded = item_id.casefold()
+            if folded in aliases:
+                raise ValueError(
+                    "active_item_ids contains aliased item identities"
+                )
+            aliases[folded] = item_id
+        object.__setattr__(
+            self,
+            "active_item_ids",
+            tuple(sorted(values, key=lambda value: (value.casefold(), value))),
+        )
+        object.__setattr__(self, "_active_aliases", frozenset(aliases))
+
+    def allows(self, item_id: str) -> bool:
+        """Return whether an exact, portable identity is not tombstoned."""
+
+        checked = _identifier(item_id, "item_id")
+        return checked.casefold() not in self._active_aliases
+
+
+@dataclass(frozen=True, slots=True)
 class StagedItemRestoration:
     """Repository-produced state staged by one restore operation."""
 
@@ -524,6 +572,12 @@ class ItemLifecycleRepositoryPort(Protocol):
         """Read every public tombstone under one lifecycle isolation scope."""
         ...
 
+    def tombstone_read_guard(
+        self,
+    ) -> ContextManager[tuple[ItemTombstoneSnapshot, ...]]:
+        """Hold lifecycle isolation around one stable tombstone index."""
+        ...
+
     def unit_of_work(
         self, *, operation_id: str
     ) -> ContextManager[ItemLifecycleUnitOfWorkPort]: ...
@@ -592,64 +646,8 @@ class ItemLifecycleService:
         """Return a validated, deterministic public tombstone index."""
 
         try:
-            values = self._repository.list_tombstones()
-            if isinstance(values, (str, bytes, Mapping)):
-                raise RepositoryError(
-                    "the lifecycle repository returned an invalid index",
-                    code="invalid_item_tombstone_index",
-                )
-            try:
-                tombstones = tuple(values)
-            except TypeError as exc:
-                raise RepositoryError(
-                    "the lifecycle repository returned an invalid index",
-                    code="invalid_item_tombstone_index",
-                ) from exc
-            tombstone_aliases: dict[str, str] = {}
-            active_item_aliases: dict[str, str] = {}
-            for tombstone in tombstones:
-                if not isinstance(tombstone, ItemTombstoneSnapshot):
-                    raise RepositoryError(
-                        "the lifecycle repository returned an invalid index",
-                        code="invalid_item_tombstone_index",
-                    )
-                folded_tombstone = tombstone.tombstone_id.casefold()
-                prior_tombstone = tombstone_aliases.get(folded_tombstone)
-                if prior_tombstone is not None:
-                    raise RepositoryError(
-                        "the lifecycle tombstone index contains duplicate identities",
-                        code="invalid_item_tombstone_index",
-                        details={
-                            "tombstone_ids": sorted(
-                                {prior_tombstone, tombstone.tombstone_id}
-                            )
-                        },
-                    )
-                tombstone_aliases[folded_tombstone] = (
-                    tombstone.tombstone_id
-                )
-                if tombstone.state == "deleted":
-                    folded_item = tombstone.item_id.casefold()
-                    prior_item = active_item_aliases.get(folded_item)
-                    if prior_item is not None:
-                        raise RepositoryError(
-                            "multiple active tombstones claim one item identity",
-                            code="invalid_item_tombstone_index",
-                            details={
-                                "item_ids": sorted(
-                                    {prior_item, tombstone.item_id}
-                                )
-                            },
-                        )
-                    active_item_aliases[folded_item] = tombstone.item_id
-            return tuple(
-                sorted(
-                    tombstones,
-                    key=lambda value: (
-                        value.tombstone_id.casefold(),
-                        value.tombstone_id,
-                    ),
-                )
+            return self._validated_tombstone_index(
+                self._repository.list_tombstones()
             )
         except EngineError:
             raise
@@ -659,14 +657,110 @@ class ItemLifecycleService:
     def active_deleted_item_ids(self) -> tuple[str, ...]:
         """Return item identities that sync must not recreate from entry trees."""
 
+        return self._deletion_index(
+            self.list_tombstones()
+        ).active_item_ids
+
+    @contextmanager
+    def deletion_index_guard(
+        self,
+    ) -> Iterator[ItemLifecycleDeletionIndex]:
+        """Hold lifecycle isolation while a bulk writer applies one policy.
+
+        This is the atomic coordination seam for cloud sync and other bulk
+        importers.  The returned index performs no repository reads, so its
+        :meth:`ItemLifecycleDeletionIndex.allows` callback is safe while the
+        repository's catalogue lock is already held.
+        """
+
+        stack = ExitStack()
+        try:
+            values = stack.enter_context(
+                self._repository.tombstone_read_guard()
+            )
+            tombstones = self._validated_tombstone_index(values)
+            index = self._deletion_index(tombstones)
+        except EngineError:
+            stack.close()
+            raise
+        except Exception as exc:
+            stack.close()
+            raise self._repository_failure(exc) from exc
+        try:
+            yield index
+        finally:
+            stack.close()
+
+    @staticmethod
+    def _deletion_index(
+        tombstones: tuple[ItemTombstoneSnapshot, ...],
+    ) -> ItemLifecycleDeletionIndex:
+        return ItemLifecycleDeletionIndex(
+            tuple(
+                tombstone.item_id
+                for tombstone in tombstones
+                if tombstone.state == "deleted"
+            )
+        )
+
+    @staticmethod
+    def _validated_tombstone_index(
+        values: Any,
+    ) -> tuple[ItemTombstoneSnapshot, ...]:
+        if isinstance(values, (str, bytes, Mapping)):
+            raise RepositoryError(
+                "the lifecycle repository returned an invalid index",
+                code="invalid_item_tombstone_index",
+            )
+        try:
+            tombstones = tuple(values)
+        except TypeError as exc:
+            raise RepositoryError(
+                "the lifecycle repository returned an invalid index",
+                code="invalid_item_tombstone_index",
+            ) from exc
+        tombstone_aliases: dict[str, str] = {}
+        active_item_aliases: dict[str, str] = {}
+        for tombstone in tombstones:
+            if not isinstance(tombstone, ItemTombstoneSnapshot):
+                raise RepositoryError(
+                    "the lifecycle repository returned an invalid index",
+                    code="invalid_item_tombstone_index",
+                )
+            folded_tombstone = tombstone.tombstone_id.casefold()
+            prior_tombstone = tombstone_aliases.get(folded_tombstone)
+            if prior_tombstone is not None:
+                raise RepositoryError(
+                    "the lifecycle tombstone index contains duplicate identities",
+                    code="invalid_item_tombstone_index",
+                    details={
+                        "tombstone_ids": sorted(
+                            {prior_tombstone, tombstone.tombstone_id}
+                        )
+                    },
+                )
+            tombstone_aliases[folded_tombstone] = tombstone.tombstone_id
+            if tombstone.state == "deleted":
+                folded_item = tombstone.item_id.casefold()
+                prior_item = active_item_aliases.get(folded_item)
+                if prior_item is not None:
+                    raise RepositoryError(
+                        "multiple active tombstones claim one item identity",
+                        code="invalid_item_tombstone_index",
+                        details={
+                            "item_ids": sorted(
+                                {prior_item, tombstone.item_id}
+                            )
+                        },
+                    )
+                active_item_aliases[folded_item] = tombstone.item_id
         return tuple(
             sorted(
-                (
-                    tombstone.item_id
-                    for tombstone in self.list_tombstones()
-                    if tombstone.state == "deleted"
+                tombstones,
+                key=lambda value: (
+                    value.tombstone_id.casefold(),
+                    value.tombstone_id,
                 ),
-                key=lambda value: (value.casefold(), value),
             )
         )
 
@@ -1201,6 +1295,7 @@ class ItemLifecycleService:
 __all__ = [
     "DeleteItemCommand",
     "ItemLifecycleAction",
+    "ItemLifecycleDeletionIndex",
     "ItemLifecycleReceipt",
     "ItemLifecycleRepositoryPort",
     "ItemLifecycleResult",

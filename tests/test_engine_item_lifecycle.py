@@ -17,6 +17,7 @@ from librarytool.engine.errors import (
 )
 from librarytool.engine.item_lifecycle import (
     DeleteItemCommand,
+    ItemLifecycleDeletionIndex,
     ItemLifecycleReceipt,
     ItemLifecycleResult,
     ItemLifecycleService,
@@ -170,6 +171,7 @@ class FakeLifecycleRepository:
         self.tombstone_value = _DEFAULT
         self.tombstone_list_reads = 0
         self.tombstone_list_value = _DEFAULT
+        self.tombstone_guard_depth = 0
         self.error: Exception | None = None
 
     def inspect(self, item_id: str):
@@ -203,6 +205,14 @@ class FakeLifecycleRepository:
         if self.tombstone_list_value is not _DEFAULT:
             return self.tombstone_list_value
         return () if self.unit.tombstone is None else (self.unit.tombstone,)
+
+    @contextmanager
+    def tombstone_read_guard(self):
+        self.tombstone_guard_depth += 1
+        try:
+            yield self.list_tombstones()
+        finally:
+            self.tombstone_guard_depth -= 1
 
     @contextmanager
     def unit_of_work(self, *, operation_id: str):
@@ -439,6 +449,47 @@ def test_list_tombstones_is_public_deterministic_and_tracks_active_ids() -> None
     assert service.active_deleted_item_ids() == ("Book-A", "book-b")
     assert repository.tombstone_list_reads == 2
     assert repository.operations == []
+
+
+def test_deletion_index_guard_is_lock_safe_and_denies_case_aliases() -> None:
+    deleted = _tombstone(item_id="Book-One")
+    restored = _restoration(
+        _tombstone(tombstone_id="deleted-two", item_id="book-two")
+    ).tombstone
+    repository = FakeLifecycleRepository()
+    repository.tombstone_list_value = (restored, deleted)
+    service = ItemLifecycleService(repository)
+
+    with service.deletion_index_guard() as index:
+        assert isinstance(index, ItemLifecycleDeletionIndex)
+        assert repository.tombstone_guard_depth == 1
+        assert index.active_item_ids == ("Book-One",)
+        assert index.allows("book-one") is False
+        assert index.allows("BOOK-ONE") is False
+        assert index.allows("book-two") is True
+        with pytest.raises(ValueError, match="portable identifier"):
+            index.allows("../book-one")
+
+    assert repository.tombstone_guard_depth == 0
+    assert repository.tombstone_list_reads == 1
+
+
+def test_deletion_index_guard_preserves_caller_failures_and_wraps_setup() -> None:
+    repository = FakeLifecycleRepository()
+    service = ItemLifecycleService(repository)
+
+    with pytest.raises(RuntimeError, match="sync failed"):
+        with service.deletion_index_guard():
+            raise RuntimeError("sync failed")
+    assert repository.tombstone_guard_depth == 0
+
+    repository.error = OSError("C:/private/tombstone index unavailable")
+    with pytest.raises(RepositoryError) as caught:
+        with service.deletion_index_guard():
+            pytest.fail("an unavailable index must not be yielded")
+    assert caught.value.code == "item_lifecycle_repository_unavailable"
+    assert caught.value.details == {"cause_type": "OSError"}
+    assert "private" not in str(caught.value.as_dict())
 
 
 @pytest.mark.parametrize(
