@@ -164,9 +164,15 @@ class HomeActivity : AppCompatActivity() {
         }
     }
 
-    /** Hand the APK URL to the browser rather than downloading it in-app: an
-     *  in-app installer would need REQUEST_INSTALL_PACKAGES, which this app has
-     *  no other reason to hold. */
+    /**
+     * Hand the APK URL to the browser rather than installing in-app.
+     *
+     * Not a stopgap — don't "upgrade" this later. These builds are not Play
+     * Store certified, so a self-install would land the user in the unknown-
+     * sources flow regardless, and the app would additionally have to hold
+     * REQUEST_INSTALL_PACKAGES for the privilege. The browser already handles
+     * that path, and handles it with the warnings the user should be seeing.
+     */
     private fun openDownload(update: Release) {
         val intent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(update.url))
         try {
