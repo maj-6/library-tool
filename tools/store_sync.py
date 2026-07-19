@@ -43,6 +43,7 @@ import os
 import shutil
 import sys
 import threading
+from collections.abc import Callable
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
@@ -503,32 +504,100 @@ def entries_plan(local: dict[str, dict], remote: dict[str, dict],
     return {"push": push, "pull": pull, "same": same}
 
 
-def sync_entry_files(r2cfg: dict, dry: bool = False) -> dict:
-    """Mirror output/entries/ against the bucket's entries/ prefix."""
+def _entry_item_id(rel: str) -> str:
+    """Return the exact item identity encoded by an entry-relative path."""
+    return str(rel).split("/", 1)[0]
+
+
+def sync_entry_files(
+        r2cfg: dict,
+        dry: bool = False,
+        allow_item: Callable[[str], bool] | None = None,
+) -> dict:
+    """Mirror output/entries/ against the bucket's entries/ prefix.
+
+    ``allow_item`` is an optional lifecycle policy over the exact first path
+    component (the item id).  Disallowed items are absent from both planning
+    inventories, and the policy is checked again immediately before each
+    transfer.  The second check closes the interval in which an item can be
+    tombstoned after planning but before a remote or local publication begins.
+
+    The callback is intentionally injected instead of reading a tombstone
+    store here: the lifecycle adapter owns that durable state and its locking.
+    """
     base = entries_dir()
-    local = local_entry_files(base)
+    if allow_item is not None and not callable(allow_item):
+        raise TypeError("allow_item must be callable")
+    policy = allow_item or (lambda _item_id: True)
+    report_suppressed = allow_item is not None
+    suppressed: set[str] = set()
+    planning_allowed: dict[str, bool] = {}
+
+    def policy_allows(item_id: str) -> bool:
+        decision = policy(item_id)
+        if not isinstance(decision, bool):
+            raise TypeError("allow_item must return a boolean")
+        return decision
+
+    def allowed_for_plan(rel: str) -> bool:
+        item_id = _entry_item_id(rel)
+        if item_id not in planning_allowed:
+            planning_allowed[item_id] = policy_allows(item_id)
+        return planning_allowed[item_id]
+
+    local = {}
+    for rel, meta in local_entry_files(base).items():
+        if allowed_for_plan(rel):
+            local[rel] = meta
+        else:
+            suppressed.add(rel)
+
     remote = {}
     for key, meta in r2.list_objects_meta(r2cfg, prefix=ENTRIES_PREFIX).items():
         rel = key[len(ENTRIES_PREFIX):]
-        if rel and _safe_rel(rel):
+        if not rel or not _safe_rel(rel):
+            continue
+        if allowed_for_plan(rel):
             remote[rel] = meta
+        else:
+            suppressed.add(rel)
     md5s = {rel: _md5(base / rel) for rel in set(local) & set(remote)}
     plan = entries_plan(local, remote, md5s)
     if dry:
-        return {"pushed": len(plan["push"]), "pulled": len(plan["pull"]),
-                "in_sync": len(plan["same"]), "dry": True}
+        result = {"pushed": len(plan["push"]), "pulled": len(plan["pull"]),
+                  "in_sync": len(plan["same"]), "dry": True}
+        if report_suppressed:
+            result["suppressed"] = len(suppressed)
+        return result
+
+    pushed = 0
     for rel in plan["push"]:
+        if not policy_allows(_entry_item_id(rel)):
+            suppressed.add(rel)
+            continue
         r2.put_file(r2cfg, ENTRIES_PREFIX + rel, base / rel,
                     content_type=content_type_for(rel))
+        pushed += 1
+
+    pulled = 0
     for rel in plan["pull"]:
+        # Check before even inspecting or creating a destination/backup path.
+        # A lifecycle policy change must leave no local publication footprint.
+        if not policy_allows(_entry_item_id(rel)):
+            suppressed.add(rel)
+            continue
         dest = base / rel
         if dest.exists():                # overwriting OCR work: keep one copy
             bak = lib.OUTPUT_DIR / "backups" / "entries" / rel
             bak.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(dest, bak)
         r2.get_file(r2cfg, ENTRIES_PREFIX + rel, dest)
-    return {"pushed": len(plan["push"]), "pulled": len(plan["pull"]),
-            "in_sync": len(plan["same"])}
+        pulled += 1
+    result = {"pushed": pushed, "pulled": pulled,
+              "in_sync": len(plan["same"])}
+    if report_suppressed:
+        result["suppressed"] = len(suppressed)
+    return result
 
 
 # --- CLI ---------------------------------------------------------------------------

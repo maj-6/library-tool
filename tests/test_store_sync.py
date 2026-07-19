@@ -289,6 +289,139 @@ def test_sync_entry_files_backs_up_before_a_pull_overwrite(monkeypatch):
     assert bak.read_text("utf-8") == "local work"
 
 
+def test_sync_entry_files_suppresses_remote_only_deleted_item(monkeypatch):
+    transfers = []
+    monkeypatch.setattr(ss.r2, "list_objects_meta",
+                        lambda cfg, prefix="", timeout=60.0: {
+                            "entries/deleted/ocr/compiled.txt": {
+                                "size": 7, "etag": "a" * 32, "modified": T1,
+                            },
+                            "entries/deleted-extra/ocr/compiled.txt": {
+                                "size": 4, "etag": "b" * 32, "modified": T1,
+                            },
+                        })
+
+    def fake_get(cfg, key, dest, **kw):
+        transfers.append(key)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("live", "utf-8")
+        return dest
+
+    monkeypatch.setattr(ss.r2, "get_file", fake_get)
+    result = ss.sync_entry_files(
+        {"account": "a", "bucket": "b", "key_id": "k", "secret": "s"},
+        allow_item=lambda item_id: item_id != "deleted",
+    )
+
+    assert result == {"pushed": 0, "pulled": 1, "in_sync": 0,
+                      "suppressed": 1}
+    assert transfers == ["entries/deleted-extra/ocr/compiled.txt"]
+    assert not (ss.entries_dir() / "deleted").exists()
+    assert (ss.entries_dir() / "deleted-extra" / "ocr" /
+            "compiled.txt").read_text("utf-8") == "live"
+
+
+def test_sync_entry_files_suppresses_local_only_deleted_item(monkeypatch):
+    source = ss.entries_dir() / "deleted" / "ocr" / "compiled.txt"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("local", "utf-8")
+    monkeypatch.setattr(ss.r2, "list_objects_meta",
+                        lambda cfg, prefix="", timeout=60.0: {})
+    transfers = []
+    monkeypatch.setattr(
+        ss.r2, "put_file",
+        lambda cfg, key, path, **kw: transfers.append((key, path)),
+    )
+
+    result = ss.sync_entry_files(
+        {"account": "a", "bucket": "b", "key_id": "k", "secret": "s"},
+        allow_item=lambda item_id: item_id != "deleted",
+    )
+
+    assert result == {"pushed": 0, "pulled": 0, "in_sync": 0,
+                      "suppressed": 1}
+    assert transfers == []
+    assert source.read_text("utf-8") == "local"
+
+
+def test_sync_entry_files_rechecks_policy_before_push(monkeypatch):
+    source = ss.entries_dir() / "book" / "ocr" / "compiled.txt"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("local", "utf-8")
+    monkeypatch.setattr(ss.r2, "list_objects_meta",
+                        lambda cfg, prefix="", timeout=60.0: {})
+    transfers = []
+    monkeypatch.setattr(
+        ss.r2, "put_file",
+        lambda cfg, key, path, **kw: transfers.append((key, path)),
+    )
+    checks = 0
+
+    def allow_item(item_id):
+        nonlocal checks
+        assert item_id == "book"
+        checks += 1
+        return checks == 1       # inventory allowed; pre-publication denied
+
+    result = ss.sync_entry_files(
+        {"account": "a", "bucket": "b", "key_id": "k", "secret": "s"},
+        allow_item=allow_item,
+    )
+
+    assert result == {"pushed": 0, "pulled": 0, "in_sync": 0,
+                      "suppressed": 1}
+    assert checks == 2
+    assert transfers == []
+    assert source.read_text("utf-8") == "local"
+
+
+def test_sync_entry_files_rechecks_policy_before_pull_footprint(monkeypatch):
+    monkeypatch.setattr(ss.r2, "list_objects_meta",
+                        lambda cfg, prefix="", timeout=60.0: {
+                            "entries/book/ocr/compiled.txt": {
+                                "size": 5, "etag": "c" * 32, "modified": T1,
+                            },
+                        })
+    transfers = []
+    monkeypatch.setattr(
+        ss.r2, "get_file",
+        lambda cfg, key, dest, **kw: transfers.append((key, dest)),
+    )
+    checks = 0
+
+    def allow_item(item_id):
+        nonlocal checks
+        assert item_id == "book"
+        checks += 1
+        return checks == 1       # inventory allowed; pre-publication denied
+
+    result = ss.sync_entry_files(
+        {"account": "a", "bucket": "b", "key_id": "k", "secret": "s"},
+        allow_item=allow_item,
+    )
+
+    assert result == {"pushed": 0, "pulled": 0, "in_sync": 0,
+                      "suppressed": 1}
+    assert checks == 2
+    assert transfers == []
+    assert not (ss.entries_dir() / "book").exists()
+    assert not (lib.OUTPUT_DIR / "backups" / "entries" / "book").exists()
+
+
+def test_sync_entry_files_fails_closed_for_invalid_lifecycle_policy(monkeypatch):
+    monkeypatch.setattr(ss.r2, "list_objects_meta",
+                        lambda cfg, prefix="", timeout=60.0: {
+                            "entries/book/ocr/compiled.txt": {
+                                "size": 5, "etag": "c" * 32, "modified": T1,
+                            },
+                        })
+
+    with pytest.raises(TypeError, match="allow_item must be callable"):
+        ss.sync_entry_files({}, allow_item=True)
+    with pytest.raises(TypeError, match="return a boolean"):
+        ss.sync_entry_files({}, allow_item=lambda _item_id: "yes")
+
+
 def test_entries_plan_multipart_etag_falls_back_to_size():
     remote = {"f.pdf": {"size": 10, "etag": "abc-2", "modified": T1}}
     p = ss.entries_plan({"f.pdf": {"size": 10, "mtime": 0.0}}, remote,
