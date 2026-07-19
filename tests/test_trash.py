@@ -471,6 +471,53 @@ def test_translation_delete_is_recoverable(data_root, client):
     assert (tdir / "fr.txt").read_text(encoding="utf-8") == "newer"
 
 
+def test_translation_restore_cannot_resurrect_a_deleted_item(data_root, client):
+    """An older payload tombstone is subordinate to aggregate lifecycle."""
+
+    bid = "trasht-guard"
+    server.lib.save_json(server.BUILDS_PATH, {
+        bid: {"id": bid, "title": "Gone translation", "status": "ready"},
+    })
+    tdir = server._entry_dir(bid) / "translations"
+    tdir.mkdir(parents=True, exist_ok=True)
+    (tdir / "fr.txt").write_text("bonjour", encoding="utf-8")
+    assert client.delete(
+        f"/api/builds/{bid}/translations/fr"
+    ).status_code == 200
+    rec = next(
+        item for item in client.get("/api/trash").get_json()["items"]
+        if item["kind"] == "translation"
+        and item["origin"].get("build_id") == bid
+    )
+
+    deleted = client.delete(f"/api/builds/{bid}")
+    assert deleted.status_code == 200, deleted.get_json()
+    restored = client.post("/api/trash/restore", json={"id": rec["id"]})
+
+    assert restored.status_code == 409
+    assert "no longer exists" in restored.get_json()["error"]
+    assert not server._entry_dir(bid).exists()
+
+
+def test_pdf_page_restore_cannot_modify_a_deleted_item(data_root, client):
+    """A legacy page tombstone cannot write after aggregate deletion wins."""
+
+    bid = "trashp-guard"
+    pdf = _seed(bid, data_root)
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+    tid = server._apply_page_deletion(bid, builds, pdf, [2])["trash_id"]
+    assert _page_count(pdf) == 2
+
+    deleted = client.delete(f"/api/builds/{bid}")
+    assert deleted.status_code == 200, deleted.get_json()
+    restored = client.post("/api/trash/restore", json={"id": tid})
+
+    assert restored.status_code == 409
+    assert "no longer exists" in restored.get_json()["error"]
+    assert _page_count(pdf) == 2
+    assert not server._entry_dir(bid).exists()
+
+
 def test_secondary_source_deletion_targets_that_source(data_root, client):
     """A deletion applied to a SECONDARY scan must record that scan, not the
     build's primary. Recording the primary made restore splice the secondary's

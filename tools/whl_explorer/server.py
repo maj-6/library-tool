@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import collections
 import contextlib
+import functools
 import hashlib
 import importlib.util
 import json
@@ -1059,6 +1060,53 @@ BUILDS_PATH = lib.OUTPUT_DIR / "whl_builds.json"
 # between. Locks here are threading.Lock — the sidecar is a single process,
 # so cross-process coordination is deliberately out of scope.
 _builds_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _live_item_write_scope(item_id: str):
+    """Serialize one legacy item write against aggregate lifecycle deletion.
+
+    Transitional request handlers still publish several entry sidecars
+    directly instead of through an engine repository.  They must therefore
+    join the engine's recoverable workspace lease themselves.  Catalogue
+    membership is re-read *inside* that lease; after the brief catalogue lock
+    is released, the lease stays held for the caller's complete mutation.
+    Aggregate deletion takes the same lease, so either this write finishes
+    first and deletion removes its result, or deletion wins and this scope
+    refuses to recreate the managed tree.
+    """
+
+    item_id = str(item_id or "").strip()
+    if not item_id:
+        abort(404)
+    with _ensure_engine_session().write_set.workspace_lease():
+        with _builds_lock:
+            builds = lib.load_json(BUILDS_PATH, {})
+            item = builds.get(item_id) if isinstance(builds, dict) else None
+        if not isinstance(item, dict):
+            abort(404)
+        yield item
+
+
+def _live_item_write_endpoint(fn):
+    """Apply :func:`_live_item_write_scope` to a path-scoped mutation.
+
+    Mixed GET/write endpoints retain their existing read path.  Flask passes
+    path parameters by keyword, and the two historical spellings are both
+    supported while those routes are migrated into engine modules.
+    """
+
+    @functools.wraps(fn)
+    def guarded(*args, **kwargs):
+        if request.method in ("GET", "HEAD", "OPTIONS"):
+            return fn(*args, **kwargs)
+        item_id = kwargs.get("build_id") or kwargs.get("bid")
+        if item_id is None and args:
+            item_id = args[0]
+        with _live_item_write_scope(str(item_id or "")):
+            return fn(*args, **kwargs)
+
+    return guarded
 
 
 def _build_updated_at(previous: str = "") -> str:
@@ -2844,6 +2892,7 @@ def api_build_text_artifact(build_id: str, kind: str, name: str):
 
 
 @app.route("/api/builds/<build_id>/folder", methods=["POST"])
+@_live_item_write_endpoint
 def api_build_folder_sync(build_id: str):
     """Create/refresh the entry folder: metadata, PDF preview, extracted OCR.
     Body: {pages: N, keep_original: bool}."""
@@ -3053,6 +3102,7 @@ def api_build_ocr_get(build_id: str, name: str):
 
 
 @app.route("/api/builds/<build_id>/ocr", methods=["POST"])
+@_live_item_write_endpoint
 def api_build_ocr_put(build_id: str):
     """Store an OCR text file on the entry folder. Body: {name, text, src?}
     — src ties the file to a secondary PDF source (default: primary)."""
@@ -6046,6 +6096,7 @@ def _pdf_layer_words(pdf, page: int) -> list:
 
 
 @app.route("/api/builds/<build_id>/ocr-templates", methods=["GET", "PUT", "DELETE"])
+@_live_item_write_endpoint
 def api_build_ocr_templates(build_id: str):
     """Layout templates — hand-press books are grid-stable, so one corrected
     exemplar page (a recto, a verso) becomes a reusable region grid.
@@ -6104,6 +6155,7 @@ def api_build_ocr_templates(build_id: str):
 
 
 @app.route("/api/builds/<build_id>/ocr-templates/apply", methods=["POST"])
+@_live_item_write_endpoint
 def api_build_ocr_templates_apply(build_id: str):
     """Stamp a template's region grid onto a page range. Body: {src?, name,
     pages: [ints], overwrite?: bool, clip?: bool (default true)}. Pages that
@@ -6481,6 +6533,7 @@ def _lib_apply_translations(build_id: str, trans_in: dict,
 
 @app.route("/api/builds/<build_id>/replica-style",
            methods=["GET", "PUT", "DELETE"])
+@_live_item_write_endpoint
 def api_build_replica_style(build_id: str):
     """The book-level role -> modern-type mapping the re-typeset preview and
     the .lib export use. GET returns the stored sheet (custom: true) or the
@@ -6514,6 +6567,7 @@ def api_build_replica_style(build_id: str):
 
 @app.route("/api/builds/<build_id>/replica-instructions",
            methods=["GET", "PUT"])
+@_live_item_write_endpoint
 def api_build_replica_instructions(build_id: str):
     """The per-book "instructions for editors / AI" text (docs/lib-format.md
     §2.2) — free guidance that every .lib export embeds in its manifest and
@@ -6798,13 +6852,40 @@ def api_build_rework_figure(build_id: str):
     out_name = f"rework-{name}.png"
     if len(out_name) > 120:
         return jsonify({"ok": False, "error": "figure name too long"}), 400
-    with _ocr_merge_lock:
-        lib.save_bytes(f.parent / out_name, out)
-        meta = lib.load_json(meta_path, {})
-        entry = {k: info.get(k) for k in ("page", "x", "y", "w", "h")}
-        entry.update({"src_key": src, "rework_of": name})
-        meta.setdefault("images", {})[out_name] = entry
-        lib.save_json(meta_path, meta)
+    # Never hold the workspace lease across the paid remote call.  Publication
+    # is a separate, short transaction: deletion may have won while the model
+    # ran, and another editor may have replaced either the crop or its layout
+    # metadata.  Re-read both under the merge lock before writing anything.
+    with _live_item_write_scope(build_id):
+        with _ocr_merge_lock:
+            meta = lib.load_json(meta_path, {})
+            current_info = (meta.get("images") or {}).get(name)
+            target_is_current = (
+                isinstance(current_info, dict)
+                and str(current_info.get("src_key") or "primary") == src
+                and not current_info.get("rework_of")
+                and not name.startswith("rework-")
+                and current_info == info
+            )
+            try:
+                image_is_current = f.is_file() and f.read_bytes() == raw
+            except OSError:
+                image_is_current = False
+            if not target_is_current or not image_is_current:
+                return jsonify({
+                    "ok": False,
+                    "error": (
+                        "the source figure changed while the model was running "
+                        "\u2014 review it and retry"
+                    ),
+                }), 409
+            lib.save_bytes(f.parent / out_name, out)
+            entry = {
+                k: current_info.get(k) for k in ("page", "x", "y", "w", "h")
+            }
+            entry.update({"src_key": src, "rework_of": name})
+            meta.setdefault("images", {})[out_name] = entry
+            lib.save_json(meta_path, meta)
     return jsonify({"ok": True, "name": out_name, "bytes": len(out)})
 
 
@@ -9428,6 +9509,18 @@ def api_trash_forget():
 
 
 def _trash_restore_pdf_pages(item: dict) -> tuple[dict, int]:
+    """Restore page payloads only while their aggregate item remains live."""
+
+    origin = item.get("origin") or {}
+    build_id = str(origin.get("build_id") or "")
+    builds = lib.load_json(BUILDS_PATH, {})
+    if build_id not in builds:
+        return {"ok": False, "error": "that entry no longer exists"}, 409
+    with _live_item_write_scope(build_id):
+        return _trash_restore_pdf_pages_guarded(item)
+
+
+def _trash_restore_pdf_pages_guarded(item: dict) -> tuple[dict, int]:
     """Put deleted pages back. Refuses rather than guesses: the recorded page
     numbers are only meaningful against the exact post-delete page count, and
     appending them to the end would not be a restore at all."""
@@ -9640,6 +9733,18 @@ def _trash_restore_record(item: dict) -> tuple[dict, int]:
 
 
 def _trash_restore_translation(item: dict) -> tuple[dict, int]:
+    """Restore translation payloads only while their item remains live."""
+
+    origin = item.get("origin") or {}
+    bid = str(origin.get("build_id") or "")
+    builds = lib.load_json(BUILDS_PATH, {})
+    if bid not in builds:
+        return {"ok": False, "error": "that entry no longer exists"}, 409
+    with _live_item_write_scope(bid):
+        return _trash_restore_translation_guarded(item)
+
+
+def _trash_restore_translation_guarded(item: dict) -> tuple[dict, int]:
     """Write a deleted translation (and its provenance sidecar) back, unless a
     newer one is already there."""
     origin = item.get("origin") or {}
@@ -10927,15 +11032,25 @@ def api_pdf_text():
     if bid and out.get("ok") and out.get("pages_with_text", 0) > 1:
         builds = lib.load_json(BUILDS_PATH, {})
         if bid in builds:
-            name = _ocr_name(request.args.get("save_name") or "extracted.txt")
-            f = _entry_dir(bid) / "ocr" / name
-            if not f.is_file():
-                f.parent.mkdir(parents=True, exist_ok=True)
-                f.write_text(out["text"], encoding="utf-8", errors="replace")
-                src_key = _valid_src_key(builds[bid], request.args.get("src"))
-                if src_key:
-                    _ocr_set_source(bid, name, src_key)
-                out = dict(out, saved=name)
+            # Extraction may be slow (and a remote URL may be involved), so
+            # take the lifecycle lease only for final publication.  Re-read
+            # membership inside the lease before creating the entry tree.
+            with _live_item_write_scope(bid) as live_build:
+                name = _ocr_name(
+                    request.args.get("save_name") or "extracted.txt"
+                )
+                f = _entry_dir(bid) / "ocr" / name
+                if not f.is_file():
+                    f.parent.mkdir(parents=True, exist_ok=True)
+                    f.write_text(
+                        out["text"], encoding="utf-8", errors="replace"
+                    )
+                    src_key = _valid_src_key(
+                        live_build, request.args.get("src")
+                    )
+                    if src_key:
+                        _ocr_set_source(bid, name, src_key)
+                    out = dict(out, saved=name)
     return jsonify(out)
 
 
@@ -13451,6 +13566,7 @@ def _translations_info(bid: str) -> list[dict]:
 
 
 @app.route("/api/builds/<bid>/about", methods=["GET", "PUT"])
+@_live_item_write_endpoint
 def api_build_about(bid: str):
     if request.method == "GET":
         return jsonify({"ok": True, "text": _read_entry_text(bid, "about.md")})
@@ -13470,6 +13586,7 @@ def api_build_summary(bid: str):
 
 
 @app.route("/api/builds/<bid>/annotations", methods=["GET", "PUT"])
+@_live_item_write_endpoint
 def api_build_annotations(bid: str):
     """GET the note list; PUT curation changes: {update: {id, status?, body?,
     kind?}} or {remove: id}. Wholesale replacement is deliberately absent —
@@ -15433,6 +15550,7 @@ def api_knowledge_segment():
 
 
 @app.route("/api/builds/<bid>/passages", methods=["GET", "PATCH"])
+@_live_item_write_endpoint
 def api_build_passages(bid: str):
     """GET: the artifact plus its state line. PATCH {exclude, include,
     split, merge}: curation — a manual edit, re-recorded as such so the
@@ -15973,6 +16091,7 @@ def _eval_summary_note(overall: dict) -> str:
 
 
 @app.route("/api/builds/<bid>/eval", methods=["GET", "PUT"])
+@_live_item_write_endpoint
 def api_build_eval(bid: str):
     """GET the evaluation set; PUT curation, one operation at a time (the
     annotations idiom): {add: {text, kind}}, {update: {id, text?, kind?}},
