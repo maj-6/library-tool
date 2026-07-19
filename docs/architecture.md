@@ -11,7 +11,9 @@ Per-component detail lives in each part's own README (map at the end).
   browser code reaches Replica operations through one `EngineClient`. The
   engine package does not resolve `DATA_ROOT`, create files, or import Flask at
   package import time. Installed modules and usable workbenches are discoverable
-  at `/api/v1/capabilities`.
+  at `/api/v1/capabilities`. Background processors share the engine's
+  `JobManager` lifecycle, cancellation, restart-recovery, typed views, and
+  cursor events while their provider-specific executors remain adapters.
 - **Desktop app** — the workbench: an Electron shell (`desktop/`) that
   spawns the Flask sidecar (`tools/whl_explorer/server.py`) on a loopback
   port. Paths split into two roots (`tools/libcommon.py`): **`APP_ROOT`**,

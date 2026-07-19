@@ -1,0 +1,282 @@
+"""Headless background-job lifecycle and persistence contracts."""
+
+from __future__ import annotations
+
+import json
+import threading
+from collections.abc import Mapping
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+from librarytool.adapters.filesystem import FilesystemJobHistoryRepository
+from librarytool.engine import (
+    ACTIVE_JOB_STATES,
+    ConflictError,
+    JobManager,
+    JobState,
+)
+
+
+class MemoryHistory:
+    def __init__(self, initial: Mapping[str, Mapping] | None = None) -> None:
+        self.value = {
+            str(job_id): dict(job) for job_id, job in (initial or {}).items()
+        }
+        self.saves: list[dict[str, dict]] = []
+
+    def load(self):
+        return {job_id: dict(job) for job_id, job in self.value.items()}
+
+    def save(self, jobs):
+        self.value = {str(job_id): dict(job) for job_id, job in jobs.items()}
+        self.saves.append(self.load())
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.value = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        self.ticks = 0.0
+
+    def now(self) -> datetime:
+        current = self.value
+        self.value += timedelta(seconds=1)
+        return current
+
+    def monotonic(self) -> float:
+        return self.ticks
+
+
+def manager(history=None, *, keep=50, clock=None) -> JobManager:
+    clock = clock or Clock()
+    counter = iter(range(1000))
+    return JobManager(
+        history,
+        keep=keep,
+        id_factory=lambda existing: f"job-{next(counter):04d}",
+        utcnow=clock.now,
+        monotonic=clock.monotonic,
+    )
+
+
+def test_track_transition_and_public_snapshot_are_transport_neutral():
+    history = MemoryHistory()
+    jobs = manager(history)
+    record = {
+        "build_id": "book-1",
+        "total": 4,
+        "secret": "must-never-persist",
+        "prompt": "also private",
+    }
+
+    event = jobs.track(record, "ocr", label="A Herbal")
+    assert not event.is_set()
+    assert record["id"] == "job-0000"
+    assert record["state"] == record["status"] == "running"
+    assert jobs.records[record["id"]] is record
+
+    record["done"] = 4
+    record["errors"] = 1
+    jobs.transition(record, "done (with errors)")
+
+    assert record["state"] == "done"
+    assert record["finished_at"]
+    public = jobs.get(record["id"])
+    assert public is not None
+    assert public["label"] == "A Herbal"
+    assert "secret" not in public and "prompt" not in public
+    assert "secret" not in history.value[record["id"]]
+
+
+def test_cancel_is_atomic_idempotent_and_observable_to_worker():
+    jobs = manager()
+    record = {"build_id": "book-1"}
+    event = jobs.track(record, "ocr")
+
+    first = jobs.request_cancel(record["id"])
+    assert first is not None and first["state"] == "cancelling"
+    assert event.is_set() and jobs.is_cancelled(record)
+    assert record["cancel_requested"] is True
+
+    jobs.transition(record, "cancelled", note="one page kept")
+    second = jobs.request_cancel(record["id"])
+    assert second is not None and second["state"] == "cancelled"
+    assert record["note"] == "one page kept"
+    assert jobs.request_cancel("missing") is None
+
+
+def test_cancel_finish_race_cannot_resurrect_terminal_job():
+    jobs = manager()
+    record = {"status": "running"}
+    real_event = jobs.track(record, "summarize")
+    go = threading.Event()
+    attempted = threading.Event()
+
+    class FinishWhileCancelling:
+        def set(self):
+            real_event.set()
+            go.set()
+            assert attempted.wait(timeout=2)
+
+        def is_set(self):
+            return real_event.is_set()
+
+    jobs.cancel_events[record["id"]] = FinishWhileCancelling()
+
+    def finish() -> None:
+        assert go.wait(timeout=2)
+        attempted.set()
+        jobs.transition(record, "done")
+
+    worker = threading.Thread(target=finish)
+    worker.start()
+    jobs.request_cancel(record["id"])
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert record["state"] == "done"
+    assert record["state"] not in ACTIVE_JOB_STATES
+
+
+def test_checkpoint_is_throttled_and_internal_clock_is_not_persisted():
+    history = MemoryHistory()
+    clock = Clock()
+    jobs = manager(history, clock=clock)
+    record = {"done": 0, "total": 100}
+    jobs.track(record, "segment")
+    baseline = len(history.saves)
+
+    record["done"] = 10
+    jobs.checkpoint(record)
+    assert len(history.saves) == baseline
+
+    clock.ticks = 2.0
+    jobs.checkpoint(record)
+    assert len(history.saves) == baseline + 1
+    assert history.value[record["id"]]["done"] == 10
+    assert "_checkpoint_at" not in history.value[record["id"]]
+
+
+def test_normalized_views_revisions_outputs_failures_and_event_cursor():
+    jobs = manager()
+    record = {
+        "status": "queued",
+        "build_id": "book-typed",
+        "src": "scan-a",
+        "page": 7,
+        "total": 1,
+        "input_revisions": {"regions": "rr-1"},
+    }
+    jobs.track(record, "replica.detect-regions")
+    created = jobs.view(record["id"])
+    assert created is not None
+    assert created.state is JobState.QUEUED
+    assert created.subject.item_id == "book-typed"
+    assert created.subject.source_id == "scan-a"
+    assert created.subject.page == 7
+    assert created.revision == 1
+
+    record["done"] = 1
+    jobs.transition(record, "error", outputs=[{
+        "kind": "replica.region-proposal", "ref": "book-typed/scan-a/7",
+        "partial": True,
+    }], failure={
+        "code": "provider_error", "message": "provider unavailable",
+        "retryable": True,
+    })
+    failed = jobs.view(record["id"])
+    assert failed is not None and failed.state is JobState.FAILED
+    assert failed.progress.completed == 1
+    assert failed.revision == 2
+    assert failed.error is not None and failed.error.code == "provider_error"
+    assert failed.outputs[0].partial is True
+    assert failed.cancellable is False
+
+    events = jobs.events_after(0)
+    assert [event.type for event in events] == ["created", "changed"]
+    assert [event.sequence for event in events] == [1, 2]
+    assert jobs.events_after(1)[0].job.revision == 2
+    assert jobs.event_sequence == 2
+
+
+def test_rehydrate_marks_only_active_work_interrupted():
+    history = MemoryHistory({
+        "translate-1": {
+            "id": "translate-1", "kind": "translate:fr", "state": "running",
+            "status": "running", "done": 2, "total": 5,
+        },
+        "publish-1": {
+            "id": "publish-1", "kind": "publish", "state": "queued",
+            "status": "queued",
+        },
+        "done-1": {
+            "id": "done-1", "kind": "ocr", "state": "done", "status": "done",
+        },
+    })
+    jobs = manager(history)
+
+    jobs.rehydrate()
+
+    translated = jobs.get("translate-1")
+    published = jobs.get("publish-1")
+    assert translated is not None and translated["state"] == "interrupted"
+    assert translated["done"] == 2
+    assert translated["note"] == \
+        "interrupted by restart — progressive output kept"
+    assert published is not None and published["note"] == \
+        "interrupted by restart — not applied"
+    assert jobs.get("done-1")["state"] == "done"
+
+
+def test_pruning_keeps_active_and_newest_finished_records():
+    jobs = manager(keep=2)
+    active = {"id": "active"}
+    jobs.track(active, "ocr")
+    finished = []
+    for index in range(4):
+        record = {"id": f"done-{index}"}
+        jobs.track(record, "segment")
+        jobs.transition(record, "done")
+        finished.append(record)
+
+    assert "active" in jobs.records
+    assert len([
+        row for row in jobs.list() if row.get("state") not in ACTIVE_JOB_STATES
+    ]) == 2
+    assert finished[-1]["id"] in jobs.records
+    assert finished[0]["id"] not in jobs.records
+
+
+def test_duplicate_live_id_is_rejected_without_replacing_worker_record():
+    jobs = manager()
+    first = {"id": "same-id"}
+    jobs.track(first, "ocr")
+    with pytest.raises(ConflictError) as caught:
+        jobs.track({"id": "same-id"}, "publish")
+    assert caught.value.code == "job_id_conflict"
+    assert jobs.records["same-id"] is first
+
+
+def test_filesystem_history_adapter_uses_injected_atomic_json_callbacks(tmp_path: Path):
+    path = tmp_path / "output" / "jobs.json"
+
+    def read_json(target: Path, default):
+        if not target.is_file():
+            return default
+        return json.loads(target.read_text(encoding="utf-8"))
+
+    def write_json(target: Path, value) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+
+    repository = FilesystemJobHistoryRepository(
+        path, read_json=read_json, write_json=write_json
+    )
+    jobs = manager(repository)
+    record = {"build_id": "book"}
+    jobs.track(record, "ocr")
+    jobs.transition(record, "done")
+
+    assert repository.path == path
+    assert repository.load()[record["id"]]["state"] == "done"

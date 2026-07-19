@@ -218,6 +218,7 @@ def test_http_discovery_exposes_resolved_installed_workbenches(client):
         (row["id"], row["version"]) for row in document["capabilities"]}
     assert ("replica.regions", 1) in capabilities
     assert ("replica.interchange", 2) in capabilities
+    assert ("library.jobs", 1) in capabilities
 
 
 def test_library_engine_exposes_the_same_framework_neutral_discovery():

@@ -200,6 +200,44 @@ def test_unified_cancel_endpoint_flags_ocr_job(client):
         _finish(job["id"])
 
 
+def test_versioned_job_transport_filters_and_cancels(client):
+    first = {"build_id": "v1jobs-book", "status": "running"}
+    second = {"build_id": "other-book", "status": "running"}
+    first_event = server._job_track(first, "ocr", label="V1 OCR")
+    server._job_track(second, "summarize", label="Other")
+    try:
+        listing = client.get(
+            "/api/v1/jobs?state=active&kind=ocr&item_id=v1jobs-book"
+        ).get_json()
+        assert listing["ok"] is True
+        assert [row["id"] for row in listing["jobs"]] == [first["id"]]
+        assert listing["active"] == 1
+
+        fetched = client.get(f"/api/v1/jobs/{first['id']}").get_json()
+        assert fetched["job"]["subject"]["item_id"] == "v1jobs-book"
+        assert fetched["job"]["progress"] == {
+            "completed": 0, "total": 0, "unit": "", "phase": ""}
+        assert client.get("/api/v1/jobs/no-such-job").status_code == 404
+
+        cancelled = client.post(
+            f"/api/v1/jobs/{first['id']}/cancel"
+        ).get_json()
+        assert cancelled["job"]["state"] == "cancelling"
+        assert first_event.is_set()
+        events = client.get("/api/v1/job-events?after=0&limit=500").get_json()
+        matching = [event for event in events["events"]
+                    if event["job"]["id"] == first["id"]]
+        assert [event["type"] for event in matching][-2:] == [
+            "created", "cancel-requested"]
+        assert events["cursor"] >= matching[-1]["sequence"]
+        assert client.post(
+            "/api/v1/jobs/no-such-job/cancel"
+        ).status_code == 404
+    finally:
+        _finish(first["id"])
+        _finish(second["id"])
+
+
 def test_cancel_race_cannot_overwrite_worker_terminal_state(client):
     """A worker finishing during Event.set must win after cancellation.
 

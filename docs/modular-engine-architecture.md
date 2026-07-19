@@ -45,6 +45,12 @@ workbench split described below remains the target architecture:
   controller has no direct `fetch()` calls or `/api/` route knowledge; it
   retains only navigation generations, drafts, cache invalidation, and DOM
   behavior.
+- `JobManager` is now the framework-neutral lifecycle boundary for OCR,
+  analysis, Smart Scan, and publishing work. It owns safe persisted history,
+  bounded retention, cooperative cancellation, restart interruption, typed
+  subjects/progress/outputs, monotonic revisions, and a cursor event contract.
+  Existing worker dictionaries and routes remain compatibility adapters while
+  `/api/v1/jobs` and `EngineClient.jobs` expose the new client contract.
 - A module/capability registry resolves required and optional dependencies and
   reports available, degraded, or blocked modules/workbenches through
   `/api/v1/capabilities`. This is the first executable foundation for a future
@@ -59,12 +65,12 @@ recto/verso layouts, reports confidence and exceptions, and does not modify the
 book. Region detection providers and a future UI review queue can consume this
 same contract without owning the grouping algorithm.
 
-The next extraction boundary is job orchestration: Replica detection still
-starts work through the shared OCR controller and polling state. After that,
-the `.lib` importer needs a staged multi-file write set and recovery journal;
-the current unit of work is deliberately claimed atomic only for one Replica
-workspace JSON file, not for an arbitrary collection of assets and
-translations.
+The next job consumer is Replica region detection: it still starts work through
+the shared OCR controller and waits on browser-local page markers instead of
+observing its returned engine job directly. After that, the `.lib` importer
+needs a staged multi-file write set and recovery journal; the current unit of
+work is deliberately claimed atomic only for one Replica workspace JSON file,
+not for an arbitrary collection of assets and translations.
 
 Companion documents:
 

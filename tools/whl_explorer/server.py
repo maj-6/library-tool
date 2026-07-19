@@ -66,6 +66,9 @@ import ol_client  # noqa: E402
 import scan_search  # noqa: E402
 import whl_client  # noqa: E402
 import whl_scrape  # noqa: E402
+from librarytool.adapters.filesystem.job_history import (  # noqa: E402
+    FilesystemJobHistoryRepository,
+)
 from librarytool.adapters.filesystem.replica_repository import (  # noqa: E402
     FilesystemReplicaRepository,
 )
@@ -89,6 +92,11 @@ from librarytool.engine.errors import (  # noqa: E402
     NotFoundError as EngineNotFoundError,
     PreconditionRequiredError as EnginePreconditionRequiredError,
     ValidationError as EngineValidationError,
+)
+from librarytool.engine.jobs import (  # noqa: E402
+    ACTIVE_JOB_STATES,
+    PUBLIC_JOB_FIELDS,
+    JobManager,
 )
 from librarytool.engine.replica import ReplicaApplicationService  # noqa: E402
 from librarytool.engine.runtime import LibraryEngine  # noqa: E402
@@ -937,6 +945,10 @@ _ENGINE_CAPABILITIES = CapabilityRegistry(
             provides=(CapabilityRef("library.items"),),
         ),
         ModuleManifest(
+            "jobs.core", "1.0.0",
+            provides=(CapabilityRef("library.jobs"),),
+        ),
+        ModuleManifest(
             "replica.core", "1.0.0",
             provides=(
                 CapabilityRef("replica.regions"),
@@ -972,6 +984,7 @@ _ENGINE_CAPABILITIES = CapabilityRegistry(
                 CapabilityRef("replica.interchange", 2),
                 CapabilityRef("replica.layout-families"),
                 CapabilityRef("translation.provenance"),
+                CapabilityRef("library.jobs"),
             ),
         ),
     ),
@@ -2932,6 +2945,7 @@ def _library_engine() -> LibraryEngine:
                     _EngineItemRepository(), repository, policies, text_layers)
                 _library_engine_instance = LibraryEngine(
                     capabilities=_ENGINE_CAPABILITIES,
+                    jobs=_job_manager,
                     replica=replica,
                     text_layers=text_layers,
                     translation_provenance=_translation_provenance,
@@ -5116,16 +5130,22 @@ def api_pdf_pageimg():
 
 JOBS_PATH = lib.OUTPUT_DIR / "jobs.json"
 _JOBS_KEEP = 50                       # newest finished/interrupted entries kept
-_JOB_ACTIVE = ("queued", "running", "cancelling")
-_JOB_FIELDS = ("id", "kind", "build_id", "label", "volume", "state", "status", "done",
-               "total", "errors", "error", "note", "created_at", "finished_at")
-_JOB_STATES = {"queued": "queued", "running": "running",
-               "cancelling": "cancelling", "cancelled": "cancelled",
-               "error": "failed", "done": "done", "done (with errors)": "done",
-               "interrupted": "interrupted"}
-_jobs: dict[str, dict] = {}
-_jobs_events: dict[str, threading.Event] = {}   # cancel flags; never serialized
-_jobs_lock = threading.Lock()
+_JOB_ACTIVE = ACTIVE_JOB_STATES
+_JOB_FIELDS = PUBLIC_JOB_FIELDS
+_job_manager = JobManager(
+    FilesystemJobHistoryRepository(
+        JOBS_PATH,
+        read_json=lambda path, default: lib.load_json(path, default),
+        write_json=lib.save_json,
+    ),
+    keep=_JOBS_KEEP,
+    id_factory=lambda existing: lib.gen_id(existing),
+)
+# Compatibility views for processors that still own mutable per-kind records.
+# New transports and services query the manager instead.
+_jobs = _job_manager.records
+_jobs_events = _job_manager.cancel_events
+_jobs_lock = _job_manager.lock
 
 
 class _JobCancelled(Exception):
@@ -5133,18 +5153,11 @@ class _JobCancelled(Exception):
 
 
 def _job_state_of(status) -> str:
-    return _JOB_STATES.get(str(status or ""), "running")
+    return _job_manager.state_of(status)
 
 
 def _job_public(job: dict) -> dict:
-    return {k: job.get(k) for k in _JOB_FIELDS if k in job}
-
-
-def _jobs_save_locked() -> None:
-    try:
-        lib.save_json(JOBS_PATH, {jid: _job_public(j) for jid, j in _jobs.items()})
-    except OSError:
-        log.warning("could not persist the job registry", exc_info=True)
+    return _job_manager.public(job)
 
 
 def _job_book_label(bid: str) -> str:
@@ -5152,75 +5165,27 @@ def _job_book_label(bid: str) -> str:
     return str(b.get("title") or "").strip() or str(bid or "")
 
 
-def _jobs_prune_locked() -> None:
-    """Drop the oldest finished/interrupted entries beyond the retention cap.
-    Active jobs are never pruned."""
-    done = sorted((j for j in _jobs.values()
-                   if j.get("state") not in _JOB_ACTIVE),
-                  key=lambda j: str(j.get("finished_at")
-                                    or j.get("created_at") or ""),
-                  reverse=True)
-    for old in done[_JOBS_KEEP:]:
-        _jobs.pop(str(old.get("id")), None)
-        _jobs_events.pop(str(old.get("id")), None)
-
-
 def _job_track(job: dict, kind: str, label: str = "") -> threading.Event:
     """Enter a per-kind job dict into the unified registry (shared dict) and
     return its cancellation event. Insertion prunes the oldest finished
     entries beyond _JOBS_KEEP and persists the snapshot."""
-    ev = threading.Event()
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    with _jobs_lock:
-        job.setdefault("id", lib.gen_id(set(_jobs)))
-        job.setdefault("kind", kind)
-        job.setdefault("build_id", "")
-        for k, v in (("done", 0), ("total", 0), ("errors", 0), ("note", "")):
-            job.setdefault(k, v)
-        job.setdefault("status", "running")
-        job["label"] = label or str(job.get("label") or "")
-        job["state"] = _job_state_of(job["status"])
-        job["created_at"] = now
-        job["finished_at"] = ""
-        _jobs[job["id"]] = job
-        _jobs_events[job["id"]] = ev
-        _jobs_prune_locked()
-        _jobs_save_locked()
-    return ev
+    return _job_manager.track(job, kind, label=label)
 
 
 def _job_transition_locked(job: dict, status: str, **fields) -> None:
     """The transition body for callers that already hold ``_jobs_lock``."""
-    job.update(fields)
-    job["status"] = status
-    job["state"] = _job_state_of(status)
-    if job["state"] not in _JOB_ACTIVE and not job.get("finished_at"):
-        job["finished_at"] = datetime.now(timezone.utc).isoformat(
-            timespec="seconds")
-    if _jobs.get(str(job.get("id") or "")) is job:
-        if job["state"] not in _JOB_ACTIVE:
-            _jobs_prune_locked()
-        _jobs_save_locked()
+    _job_manager.transition_locked(job, status, **fields)
 
 
 def _job_transition(job: dict, status: str, **fields) -> None:
     """Move a job to a lifecycle status (legacy string), stamp the canonical
     state, and persist. Safe on untracked dicts (tests build jobs directly)."""
-    with _jobs_lock:
-        _job_transition_locked(job, status, **fields)
+    _job_manager.transition(job, status, **fields)
 
 
 def _job_checkpoint(job: dict, force: bool = False) -> None:
     """Persist live progress at page/chunk boundaries, throttled to 1 Hz."""
-    now = time.monotonic()
-    with _jobs_lock:
-        if _jobs.get(str(job.get("id") or "")) is not job:
-            return
-        last = float(job.get("_checkpoint_at") or 0.0)
-        if not force and now - last < 1.0:
-            return
-        job["_checkpoint_at"] = now       # internal; _JOB_FIELDS omits it
-        _jobs_save_locked()
+    _job_manager.checkpoint(job, force=force)
 
 
 def _job_request_cancel(job_id: str, fallback: dict | None = None) -> dict | None:
@@ -5233,33 +5198,15 @@ def _job_request_cancel(job_id: str, fallback: dict | None = None) -> dict | Non
     ``fallback`` preserves the legacy OCR endpoint's unit-test/untracked-job
     behavior; production OCR jobs are always in the unified registry.
     """
-    with _jobs_lock:
-        job = _jobs.get(job_id) or fallback
-        if job is None:
-            return None
-        state = job.get("state") or _job_state_of(job.get("status"))
-        ev = _jobs_events.get(job_id)
-        if state in _JOB_ACTIVE:
-            if ev is not None:
-                ev.set()
-            if job.get("kind") == "ocr" or fallback is not None:
-                job["cancel_requested"] = True
-            _job_transition_locked(job, "cancelling")
-        return dict(job)
+    return _job_manager.request_cancel(job_id, fallback=fallback)
 
 
 def _job_cancelled(job: dict) -> bool:
-    ev = _jobs_events.get(str(job.get("id") or ""))
-    return ev is not None and ev.is_set()
+    return _job_manager.is_cancelled(job)
 
 
 def _job_interrupt_note(kind: str) -> str:
-    k = str(kind or "")
-    if k == "ocr" or k.startswith("translate") or k == "annotate":
-        return "interrupted by restart — progressive output kept"
-    if k == "publish":
-        return "interrupted by restart — not applied"
-    return "interrupted by restart — output not written"
+    return _job_manager.interruption_note(kind)
 
 
 def _jobs_load() -> None:
@@ -5267,29 +5214,76 @@ def _jobs_load() -> None:
     when the process died becomes `interrupted`, distinguishing resumable
     output (progressively-saved OCR/translation pages) from abandoned work.
     Live entries are never clobbered."""
-    try:
-        stored = lib.load_json(JOBS_PATH, {})
-    except (OSError, ValueError):
-        return
-    if not isinstance(stored, dict) or not stored:
-        return
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    with _jobs_lock:
-        for jid, raw in stored.items():
-            if not isinstance(raw, dict) or jid in _jobs:
-                continue
-            job = _job_public(raw)
-            job["id"] = str(jid)
-            if job.get("state") in _JOB_ACTIVE or not job.get("state"):
-                job["status"] = job["state"] = "interrupted"
-                job["note"] = _job_interrupt_note(job.get("kind"))
-                job["finished_at"] = job.get("finished_at") or now
-            _jobs[job["id"]] = job
-        _jobs_prune_locked()
-        _jobs_save_locked()
+    _job_manager.rehydrate()
 
 
 _jobs_load()
+
+
+def _jobs_engine() -> JobManager:
+    jobs = _library_engine().jobs
+    if jobs is None:
+        raise RuntimeError("the background-job engine module is unavailable")
+    return jobs
+
+
+def _csv_query_values(name: str) -> tuple[str, ...]:
+    values = []
+    for raw in request.args.getlist(name):
+        values.extend(part.strip() for part in str(raw).split(",") if part.strip())
+    return tuple(values)
+
+
+@app.route("/api/v1/jobs")
+def api_v1_jobs():
+    """Versioned, framework-neutral query over canonical engine jobs."""
+    states = _csv_query_values("state")
+    if states == ("active",):
+        states = _JOB_ACTIVE
+    views = _jobs_engine().list_views(
+        states=states,
+        kinds=_csv_query_values("kind"),
+        item_id=str(request.args.get("item_id") or ""),
+    )
+    rows = [view.as_dict() for view in views]
+    return jsonify({"ok": True, "jobs": rows,
+                    "active": sum(row["state"] in _JOB_ACTIVE for row in rows)})
+
+
+@app.route("/api/v1/jobs/<job_id>")
+def api_v1_job(job_id: str):
+    view = _jobs_engine().view(job_id)
+    if view is None:
+        abort(404)
+    return jsonify({"ok": True, "job": view.as_dict()})
+
+
+@app.route("/api/v1/jobs/<job_id>/cancel", methods=["POST"])
+def api_v1_job_cancel(job_id: str):
+    job = _jobs_engine().request_cancel(job_id)
+    if job is None:
+        abort(404)
+    return jsonify({"ok": True, "job": _jobs_engine().view_of(job).as_dict()})
+
+
+@app.route("/api/v1/job-events")
+def api_v1_job_events():
+    """Cursor polling over normalized lifecycle changes.
+
+    The event log is intentionally transport-neutral and bounded. A future SSE
+    or WebSocket adapter can stream the same values without changing workers.
+    """
+    try:
+        after = max(0, int(request.args.get("after") or 0))
+        limit = max(1, min(500, int(request.args.get("limit") or 200)))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "invalid job event cursor"}), 400
+    manager = _jobs_engine()
+    events = manager.events_after(after, limit=limit)
+    cursor = events[-1].sequence if events else manager.event_sequence
+    return jsonify({"ok": True,
+                    "events": [event.as_dict() for event in events],
+                    "cursor": cursor})
 
 
 @app.route("/api/jobs")

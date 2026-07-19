@@ -108,3 +108,13 @@ class TranslationRepositoryPort(Protocol):
         *,
         expected_revision: str,
     ) -> None: ...
+
+
+class JobHistoryRepositoryPort(Protocol):
+    """Credential-free persistence for observable background-job history."""
+
+    def load(self) -> Mapping[str, Mapping[str, Any]]:
+        """Return the last public snapshot, or an empty mapping."""
+
+    def save(self, jobs: Mapping[str, Mapping[str, Any]]) -> None:
+        """Atomically replace the public snapshot."""

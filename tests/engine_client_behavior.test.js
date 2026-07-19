@@ -36,6 +36,10 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
   const { client } = harness();
   assert.equal(typeof client.capabilities, "function");
   assert.equal(typeof client.ocr.layout, "function");
+  assert.equal(typeof client.jobs.list, "function");
+  assert.equal(typeof client.jobs.get, "function");
+  assert.equal(typeof client.jobs.cancel, "function");
+  assert.equal(typeof client.jobs.events, "function");
   const jsonMethods = [
     client.replica.templates.list,
     client.pdf.info,
@@ -85,6 +89,26 @@ test("shared OCR layout metadata also crosses the client boundary", async () => 
   await client.ocr.layout({ bookId: "book / one" });
   assert.equal(calls[0].url, "/api/builds/book%20%2F%20one/ocr-layout");
   assert.equal(calls[0].init.method, "GET");
+});
+
+test("background jobs use the versioned engine transport", async () => {
+  const { client, calls } = harness({ ok: true, jobs: [] });
+  await client.jobs.list({
+    state: ["running", "cancelling"], kind: "ocr", itemId: "book / one",
+  });
+  await client.jobs.get({ jobId: "job / one" });
+  await client.jobs.cancel({ jobId: "job / one" });
+  await client.jobs.events({ after: 12, limit: 50 });
+
+  assert.equal(calls[0].url,
+    "/api/v1/jobs?state=running%2Ccancelling&kind=ocr&item_id=book%20%2F%20one");
+  assert.equal(calls[0].init.method, "GET");
+  assert.equal(calls[1].url, "/api/v1/jobs/job%20%2F%20one");
+  assert.equal(calls[1].init.method, "GET");
+  assert.equal(calls[2].url, "/api/v1/jobs/job%20%2F%20one/cancel");
+  assert.equal(calls[2].init.method, "POST");
+  assert.equal(calls[3].url, "/api/v1/job-events?after=12&limit=50");
+  assert.equal(calls[3].init.method, "GET");
 });
 
 test("EngineClient encodes Replica path components and query values", async () => {

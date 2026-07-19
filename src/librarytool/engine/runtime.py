@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .capabilities import CapabilityRegistry
+from .jobs import JobManager
 from .replica import ReplicaApplicationService
 from .text_layers import TextLayerService
 from .translations import TranslationProvenanceService, TranslationService
@@ -21,6 +22,7 @@ class LibraryEngine:
     """
 
     capabilities: CapabilityRegistry
+    jobs: JobManager | None = None
     replica: ReplicaApplicationService | None = None
     text_layers: TextLayerService | None = None
     translations: TranslationService | None = None

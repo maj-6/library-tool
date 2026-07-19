@@ -99,6 +99,12 @@
       this.ocr = Object.freeze({
         layout: (args) => this._ocrLayout(args),
       });
+      this.jobs = Object.freeze({
+        list: (args) => this._jobsList(args),
+        get: (args) => this._jobGet(args),
+        cancel: (args) => this._jobCancel(args),
+        events: (args) => this._jobEvents(args),
+      });
       this.capabilities = (args) => this._capabilities(args);
 
       const pages = Object.freeze({
@@ -226,6 +232,33 @@
 
     _capabilities({ signal } = {}) {
       return this._requestJson("GET", "/v1/capabilities", { signal });
+    }
+
+    _jobsList({ state, kind, itemId, signal } = {}) {
+      return this._requestJson("GET", "/v1/jobs", {
+        query: {
+          state: Array.isArray(state) ? state.join(",") : state,
+          kind: Array.isArray(kind) ? kind.join(",") : kind,
+          item_id: itemId,
+        },
+        signal,
+      });
+    }
+
+    _jobGet({ jobId, signal } = {}) {
+      return this._requestJson(
+        "GET", `/v1/jobs/${encodePart(jobId)}`, { signal });
+    }
+
+    _jobCancel({ jobId, signal } = {}) {
+      return this._requestJson(
+        "POST", `/v1/jobs/${encodePart(jobId)}/cancel`, { signal });
+    }
+
+    _jobEvents({ after, limit, signal } = {}) {
+      return this._requestJson("GET", "/v1/job-events", {
+        query: { after, limit }, signal,
+      });
     }
 
     _pdfWords({ path, page, bookId, signal } = {}) {
