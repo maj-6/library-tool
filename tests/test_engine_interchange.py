@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import hashlib
 import copy
+import hashlib
 from contextlib import contextmanager
+from dataclasses import replace
 
 import pytest
 
@@ -50,7 +51,17 @@ class Planner:
             ),
             pages_skipped=(2,),
             pages_protected=(1,),
-            templates=(LibTemplateImport("recto", {"items": []}),),
+            templates=(
+                LibTemplateImport(
+                    "recto",
+                    {
+                        "doc": "compiled.txt",
+                        "dims": {},
+                        "from_page": 0,
+                        "items": [],
+                    },
+                ),
+            ),
             figures=(LibFigureImport("plate.png", b"png"),),
             translations=(LibTranslationImport("fr", 3, "Bonjour"),),
             compiled_pages=(
@@ -87,8 +98,8 @@ class Repository:
         self.calls = []
 
     @contextmanager
-    def unit_of_work(self, item_id, *, operation_id):
-        self.calls.append((item_id, operation_id))
+    def unit_of_work(self, item_id, *, source_id, operation_id):
+        self.calls.append((item_id, source_id, operation_id))
         yield self.unit
 
 
@@ -110,7 +121,7 @@ def test_import_plans_inside_uow_and_commits_one_stable_receipt():
     receipt = service.import_lib(command())
 
     digest = hashlib.sha256(b"portable-edition").hexdigest()
-    assert repository.calls == [("book-1", "import:one")]
+    assert repository.calls == [("book-1", "primary", "import:one")]
     assert planner.calls[0]["destination"].revision == "i-1"
     assert planner.calls[0]["archive_sha256"] == digest
     assert len(repository.unit.applied) == 1
@@ -306,6 +317,9 @@ def test_interchange_snapshots_and_plan_records_are_deeply_immutable():
             item_id="book", source_ids=("primary", "primary")
         ),
         lambda: ImportDestinationSnapshot(
+            item_id="book", source_ids=("primary", "PRIMARY")
+        ),
+        lambda: ImportDestinationSnapshot(
             item_id="book",
             source_ids=("primary",),
             region_ids={"unknown": {1: ("r-1",)}},
@@ -331,6 +345,22 @@ def test_interchange_snapshots_and_plan_records_are_deeply_immutable():
         lambda: ImportDestinationSnapshot(item_id="book", templates=(42,)),
         lambda: ImportDestinationSnapshot(
             item_id="book", figures=("Plate.png", "plate.png")
+        ),
+        lambda: ImportDestinationSnapshot(
+            item_id="book", translation_pages={"fr": (1, 1)}
+        ),
+        lambda: ImportDestinationSnapshot(
+            item_id="book", translation_pages={"fr": (1,), "FR": (2,)}
+        ),
+        lambda: ImportDestinationSnapshot(
+            item_id="book", translation_pages={"FR": (1,)}
+        ),
+        lambda: ImportDestinationSnapshot(
+            item_id="book",
+            document_sources={
+                "compiled.txt": "primary",
+                "Compiled.txt": "primary",
+            },
         ),
         lambda: ImportDestinationSnapshot(item_id="book", instructions=42),
     ],
@@ -438,8 +468,16 @@ def test_interchange_text_contracts_reject_non_strings(factory):
                 format_version="2.0",
                 translations=(
                     LibTranslationImport("fr", 1, "Bonjour"),
-                    LibTranslationImport("FR", 1, "Salut"),
+                    LibTranslationImport("fr", 1, "Salut"),
                 ),
+            ),
+        ),
+        (
+            "translation_language_invalid",
+            lambda digest: LibImportPlan(
+                archive_sha256=digest,
+                format_version="2.0",
+                translations=(LibTranslationImport("FR", 1, "Bonjour"),),
             ),
         ),
         (
@@ -482,7 +520,12 @@ def test_interchange_text_contracts_reject_non_strings(factory):
             lambda digest: LibImportPlan(
                 archive_sha256=digest,
                 format_version="2.0",
-                pages=(LibPageImport(4, {"items": []}),),
+                pages=(
+                    LibPageImport(
+                        4,
+                        {"doc": "first.txt", "items": [{"rid": "region-4"}]},
+                    ),
+                ),
                 compiled_pages=(
                     LibCompiledPageImport("first.txt", "primary", 4, "One"),
                     LibCompiledPageImport("second.txt", "primary", 4, "Two"),
@@ -519,6 +562,67 @@ def test_interchange_text_contracts_reject_non_strings(factory):
                 pages=(
                     LibPageImport(1, {"items": [{"rid": "shared"}]}),
                     LibPageImport(2, {"items": [{"rid": "shared"}]}),
+                ),
+            ),
+        ),
+        (
+            "compiled_page_missing",
+            lambda digest: LibImportPlan(
+                archive_sha256=digest,
+                format_version="2.0",
+                pages=(
+                    LibPageImport(
+                        1,
+                        {
+                            "doc": "compiled.txt",
+                            "items": [{"rid": "region-1"}],
+                        },
+                    ),
+                ),
+            ),
+        ),
+        (
+            "page_items_invalid",
+            lambda digest: LibImportPlan(
+                archive_sha256=digest,
+                format_version="2.0",
+                pages=(
+                    LibPageImport(1, {"doc": "compiled.txt", "items": []}),
+                ),
+                compiled_pages=(
+                    LibCompiledPageImport("compiled.txt", "primary", 1, "Text"),
+                ),
+            ),
+        ),
+        (
+            "page_items_invalid",
+            lambda digest: LibImportPlan(
+                archive_sha256=digest,
+                format_version="2.0",
+                pages=(
+                    LibPageImport(
+                        1,
+                        {"doc": "compiled.txt", "items": ["not-an-object"]},
+                    ),
+                ),
+                compiled_pages=(
+                    LibCompiledPageImport("compiled.txt", "primary", 1, "Text"),
+                ),
+            ),
+        ),
+        (
+            "region_identity_invalid",
+            lambda digest: LibImportPlan(
+                archive_sha256=digest,
+                format_version="2.0",
+                pages=(
+                    LibPageImport(
+                        1,
+                        {"doc": "compiled.txt", "items": [{"text": "No id"}]},
+                    ),
+                ),
+                compiled_pages=(
+                    LibCompiledPageImport("compiled.txt", "primary", 1, "Text"),
                 ),
             ),
         ),
@@ -594,6 +698,39 @@ def test_compiled_document_cannot_be_rebound_to_another_source():
     assert repository.unit.applied == []
 
 
+def test_template_document_cannot_be_rebound_to_another_source():
+    class TemplatePlanner:
+        def plan(self, archive, _destination, **_kwargs):
+            return LibImportPlan(
+                archive_sha256=hashlib.sha256(archive).hexdigest(),
+                format_version="2.0",
+                templates=(
+                    LibTemplateImport(
+                        "recto",
+                        {
+                            "doc": "shared.txt",
+                            "dims": {},
+                            "from_page": 0,
+                            "items": [],
+                        },
+                    ),
+                ),
+            )
+
+    repository = Repository()
+    repository.unit.destination = ImportDestinationSnapshot(
+        item_id="book-1",
+        source_ids=("primary", "scan-2"),
+        document_sources={"shared.txt": "scan-2"},
+    )
+
+    with pytest.raises(RepositoryError) as caught:
+        LibInterchangeService(TemplatePlanner(), repository).import_lib(command())
+
+    assert caught.value.details["reason"] == "document_source_conflict"
+    assert repository.unit.applied == []
+
+
 @pytest.mark.parametrize(
     ("destination", "plan", "reason"),
     [
@@ -649,6 +786,96 @@ def test_artifact_dispositions_respect_locked_destination_state(
         LibInterchangeService(StaticPlanner(), repository).import_lib(command())
 
     assert caught.value.details["reason"] == reason
+    assert repository.unit.applied == []
+
+
+@pytest.mark.parametrize(
+    ("destination", "plan", "field"),
+    [
+        (
+            ImportDestinationSnapshot(
+                item_id="book-1",
+                pages={3: {"doc": "compiled.txt", "items": []}},
+            ),
+            LibImportPlan(
+                archive_sha256="0" * 64,
+                format_version="2.0",
+                pages=(
+                    LibPageImport(3, {"doc": "compiled.txt", "items": []}),
+                ),
+                compiled_pages=(
+                    LibCompiledPageImport("compiled.txt", "primary", 3, "Text"),
+                ),
+            ),
+            "pages",
+        ),
+        (
+            ImportDestinationSnapshot(item_id="book-1", templates=("Recto",)),
+            LibImportPlan(
+                archive_sha256="0" * 64,
+                format_version="2.0",
+                templates=(
+                    LibTemplateImport(
+                        "recto",
+                        {
+                            "doc": "compiled.txt",
+                            "dims": {},
+                            "from_page": 0,
+                            "items": [],
+                        },
+                    ),
+                ),
+            ),
+            "templates",
+        ),
+        (
+            ImportDestinationSnapshot(item_id="book-1", figures=("Plate.png",)),
+            LibImportPlan(
+                archive_sha256="0" * 64,
+                format_version="2.0",
+                figures=(LibFigureImport("plate.png", b"png"),),
+            ),
+            "figures",
+        ),
+        (
+            ImportDestinationSnapshot(
+                item_id="book-1", translation_pages={"fr": (3,)}
+            ),
+            LibImportPlan(
+                archive_sha256="0" * 64,
+                format_version="2.0",
+                pages=(
+                    LibPageImport(3, {"doc": "compiled.txt", "items": []}),
+                ),
+                translations=(LibTranslationImport("fr", 3, "Bonjour"),),
+                compiled_pages=(
+                    LibCompiledPageImport("compiled.txt", "primary", 3, "Text"),
+                ),
+            ),
+            "translations",
+        ),
+    ],
+)
+def test_mergeable_plan_artifacts_require_explicit_overwrite(
+    destination, plan, field
+):
+    class StaticPlanner:
+        def plan(self, archive, _destination, **_kwargs):
+            return replace(
+                plan,
+                archive_sha256=hashlib.sha256(archive).hexdigest(),
+            )
+
+    repository = Repository()
+    repository.unit.destination = destination
+
+    with pytest.raises(RepositoryError) as caught:
+        LibInterchangeService(StaticPlanner(), repository).import_lib(command())
+
+    assert caught.value.details["reason"] == "overwrite_required"
+    assert caught.value.details["field"] == field
+    if field == "pages":
+        assert caught.value.details["pages"] == [3]
     assert repository.unit.applied == []
 
 

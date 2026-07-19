@@ -22,7 +22,9 @@ from .errors import ConflictError, RepositoryError, ValidationError
 
 _OPERATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_TRANSLATION_LANGUAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_TRANSLATION_LANGUAGE_RE = re.compile(
+    r"^[a-z]{2,8}(?:-[a-z0-9]{1,8})*$"
+)
 
 ImportDisposition: TypeAlias = Literal["none", "imported", "kept"]
 _IMPORT_DISPOSITIONS = frozenset({"none", "imported", "kept"})
@@ -217,8 +219,8 @@ class ImportDestinationSnapshot:
         source_ids = _string_tuple(self.source_ids, field_name="source_ids")
         for source_id in source_ids:
             _portable_identifier(source_id, field_name="source id")
-        if len(set(source_ids)) != len(source_ids):
-            raise ValueError("source_ids contains a duplicate source")
+        if len({source_id.casefold() for source_id in source_ids}) != len(source_ids):
+            raise ValueError("source_ids contains a duplicate source or alias")
         object.__setattr__(self, "source_ids", source_ids)
 
         if not isinstance(self.pages, Mapping):
@@ -275,15 +277,26 @@ class ImportDestinationSnapshot:
         if not isinstance(self.translation_pages, Mapping):
             raise TypeError("translation_pages must be an object")
         translations: dict[str, tuple[int, ...]] = {}
+        folded_languages: set[str] = set()
         for language, raw_pages in self.translation_pages.items():
             if not isinstance(language, str):
                 raise TypeError("translation_pages keys must be strings")
+            if not _TRANSLATION_LANGUAGE_RE.fullmatch(language):
+                raise ValueError(
+                    "translation_pages contains a non-canonical language"
+                )
+            folded_language = language.casefold()
+            if folded_language in folded_languages:
+                raise ValueError("translation_pages contains a language alias")
+            folded_languages.add(folded_language)
             pages_for_language = tuple(raw_pages)
             if any(
                 isinstance(page, bool) or not isinstance(page, int) or page < 1
                 for page in pages_for_language
             ):
                 raise ValueError("translation_pages contains an invalid page")
+            if len(pages_for_language) != len(set(pages_for_language)):
+                raise ValueError("translation_pages contains a duplicate page")
             translations[language] = pages_for_language
         object.__setattr__(self, "translation_pages", MappingProxyType(translations))
 
@@ -292,8 +305,13 @@ class ImportDestinationSnapshot:
         if not isinstance(self.document_sources, Mapping):
             raise TypeError("document_sources must be an object")
         document_sources: dict[str, str] = {}
+        folded_documents: set[str] = set()
         for document, source_id in self.document_sources.items():
             document_name = _document_name(document)
+            folded_document = document_name.casefold()
+            if folded_document in folded_documents:
+                raise ValueError("document_sources contains a document alias")
+            folded_documents.add(folded_document)
             if not isinstance(source_id, str):
                 raise TypeError("document source ids must be strings")
             if source_id not in source_ids:
@@ -751,6 +769,7 @@ class InterchangeRepositoryPort(Protocol):
         self,
         item_id: str,
         *,
+        source_id: str,
         operation_id: str,
     ) -> ContextManager[InterchangeUnitOfWorkPort]: ...
 
@@ -774,6 +793,20 @@ class LibInterchangeService:
             raise ValidationError("item id is required", code="item_id_required")
         if not source_id:
             raise ValidationError("source id is required", code="source_id_required")
+        try:
+            _portable_identifier(item_id, field_name="item id")
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                "item id is not a portable identifier",
+                code="invalid_item_id",
+            ) from exc
+        try:
+            _portable_identifier(source_id, field_name="source id")
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                "source id is not a portable identifier",
+                code="invalid_source_id",
+            ) from exc
         if not isinstance(command.overwrite, bool):
             raise ValidationError(
                 "overwrite must be a boolean",
@@ -796,7 +829,11 @@ class LibInterchangeService:
             overwrite=bool(command.overwrite),
             archive_sha256=archive_sha256,
         )
-        with self._repository.unit_of_work(item_id, operation_id=operation_id) as unit:
+        with self._repository.unit_of_work(
+            item_id,
+            source_id=source_id,
+            operation_id=operation_id,
+        ) as unit:
             prior = unit.receipt(operation_id)
             if prior is not None:
                 if not isinstance(prior, LibImportReceipt):
@@ -969,6 +1006,14 @@ class LibInterchangeService:
         overlap |= set(skipped) & set(protected)
         if overlap:
             invalid("page_dispositions_overlap", pages=sorted(overlap))
+        if not overwrite:
+            existing_pages = sorted(set(applied) & set(destination.pages))
+            if existing_pages:
+                invalid(
+                    "overwrite_required",
+                    field="pages",
+                    pages=existing_pages,
+                )
 
         def validate_names(name: str, values: tuple[str, ...]) -> None:
             folded: set[str] = set()
@@ -991,6 +1036,76 @@ class LibInterchangeService:
 
         validate_names("templates", tuple(value.name for value in plan.templates))
         validate_names("figures", tuple(value.name for value in plan.figures))
+        if not overwrite:
+            destination_templates = {
+                value.casefold(): value for value in destination.templates
+            }
+            template_collisions = sorted(
+                destination_templates[value.name.casefold()]
+                for value in plan.templates
+                if value.name.casefold() in destination_templates
+            )
+            if template_collisions:
+                invalid(
+                    "overwrite_required",
+                    field="templates",
+                    names=template_collisions,
+                )
+            destination_figures = {
+                value.casefold(): value for value in destination.figures
+            }
+            figure_collisions = sorted(
+                destination_figures[value.name.casefold()]
+                for value in plan.figures
+                if value.name.casefold() in destination_figures
+            )
+            if figure_collisions:
+                invalid(
+                    "overwrite_required",
+                    field="figures",
+                    names=figure_collisions,
+                )
+        for template in plan.templates:
+            record = template.record
+            document_value = record.get("doc")
+            try:
+                document = _document_name(document_value)
+            except (TypeError, ValueError):
+                invalid("template_document_invalid", template=template.name)
+            items = record.get("items")
+            if not isinstance(items, (list, tuple)) or any(
+                not isinstance(item, Mapping) for item in items
+            ):
+                invalid("template_items_invalid", template=template.name)
+            dims = record.get("dims")
+            if dims is not None and not isinstance(dims, Mapping):
+                invalid("template_dims_invalid", template=template.name)
+            from_page = record.get("from_page")
+            if (
+                from_page is not None
+                and (
+                    isinstance(from_page, bool)
+                    or not isinstance(from_page, int)
+                    or from_page < 0
+                )
+            ):
+                invalid("template_origin_page_invalid", template=template.name)
+            binding = next(
+                (
+                    (name, owner)
+                    for name, owner in destination.document_sources.items()
+                    if name.casefold() == document.casefold()
+                ),
+                None,
+            )
+            if binding is not None and binding[1] != source_id:
+                invalid(
+                    "document_source_conflict",
+                    document=binding[0],
+                    destination_source_id=binding[1],
+                    source_id=source_id,
+                    template=template.name,
+                )
 
         translation_keys: set[tuple[str, int]] = set()
         translation_pages: list[tuple[str, int]] = []
@@ -1016,6 +1131,25 @@ class LibInterchangeService:
                     "translation_page_not_applied",
                     language=language,
                     page=page,
+                )
+        if not overwrite:
+            destination_translations = {
+                language.casefold(): set(pages)
+                for language, pages in destination.translation_pages.items()
+            }
+            translation_collisions = sorted(
+                (language, page)
+                for language, page in translation_pages
+                if page in destination_translations.get(language.casefold(), set())
+            )
+            if translation_collisions:
+                invalid(
+                    "overwrite_required",
+                    field="translations",
+                    translations=[
+                        {"language": language, "page": page}
+                        for language, page in translation_collisions
+                    ],
                 )
 
         compiled_pages: set[int] = set()
@@ -1047,7 +1181,7 @@ class LibInterchangeService:
                     source_id=source_id,
                 )
             record_document = page_records[compiled.page].get("doc")
-            if record_document is not None and record_document != document:
+            if record_document != document:
                 invalid(
                     "compiled_document_mismatch",
                     page=compiled.page,
@@ -1057,22 +1191,26 @@ class LibInterchangeService:
         incoming_region_ids: dict[str, int] = {}
         for page_import in plan.pages:
             items = page_import.record.get("items")
-            if items is None:
-                continue
-            if not isinstance(items, (list, tuple)):
+            if not isinstance(items, (list, tuple)) or not items:
                 invalid("page_items_invalid", page=page_import.page)
-            for item in items:
+            for index, item in enumerate(items):
                 if not isinstance(item, Mapping):
-                    continue
+                    invalid(
+                        "page_items_invalid",
+                        page=page_import.page,
+                        index=index,
+                    )
                 region_id = item.get("rid")
-                if not region_id:
-                    continue
                 try:
                     normalized_id = _portable_identifier(
                         region_id, field_name="region id"
                     )
                 except (TypeError, ValueError):
-                    invalid("region_identity_invalid", page=page_import.page)
+                    invalid(
+                        "region_identity_invalid",
+                        page=page_import.page,
+                        index=index,
+                    )
                 if normalized_id in incoming_region_ids:
                     invalid(
                         "duplicate_region_identity",
@@ -1103,6 +1241,9 @@ class LibInterchangeService:
                     for region_id in collisions
                 },
             )
+        missing_compiled_pages = sorted(applied_set - compiled_pages)
+        if missing_compiled_pages:
+            invalid("compiled_page_missing", pages=missing_compiled_pages)
 
     @staticmethod
     def _receipt(

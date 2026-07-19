@@ -66,6 +66,13 @@ import ol_client  # noqa: E402
 import scan_search  # noqa: E402
 import whl_client  # noqa: E402
 import whl_scrape  # noqa: E402
+from librarytool.adapters.lib_archive import (  # noqa: E402
+    ExistingItemLibArchivePlanner,
+    LibArchiveLimits,
+)
+from librarytool.adapters.filesystem.interchange_repository import (  # noqa: E402
+    FilesystemInterchangeRepository,
+)
 from librarytool.adapters.filesystem.job_history import (  # noqa: E402
     FilesystemJobHistoryRepository,
 )
@@ -74,6 +81,9 @@ from librarytool.adapters.filesystem.item_repository import (  # noqa: E402
 )
 from librarytool.adapters.filesystem.replica_repository import (  # noqa: E402
     FilesystemReplicaRepository,
+)
+from librarytool.adapters.filesystem.recoverable_write_set import (  # noqa: E402
+    RecoverableWriteSet,
 )
 from librarytool.engine.capabilities import (  # noqa: E402
     CapabilityRef,
@@ -102,6 +112,10 @@ from librarytool.engine.jobs import (  # noqa: E402
     JobManager,
 )
 from librarytool.engine.items import ItemQueryService  # noqa: E402
+from librarytool.engine.interchange import (  # noqa: E402
+    ImportLibCommand,
+    LibInterchangeService,
+)
 from librarytool.engine.replica import ReplicaApplicationService  # noqa: E402
 from librarytool.engine.runtime import LibraryEngine  # noqa: E402
 from librarytool.engine.text_layers import TextLayerService  # noqa: E402
@@ -111,6 +125,12 @@ from librarytool.engine.translations import (  # noqa: E402
 from librarytool.engine.workbench_policies import (  # noqa: E402
     standard_workbench_policies,
 )
+
+# Recover interrupted multi-artifact publication while the module is still
+# single-threaded. No request handler or background worker can observe or write
+# the workspace until this import-time barrier has completed.
+_interchange_write_set = RecoverableWriteSet(lib.OUTPUT_DIR)
+_interchange_write_set.recover_all()
 
 # NYPL Catalog of Copyright Entries dataset (optional, for the copyright tag's
 # registration half): drop the parsed XML tree under <DATA_ROOT>/nypl_cce/.
@@ -3142,6 +3162,31 @@ _library_engine_guard = threading.Lock()
 _library_engine_instance = None
 
 
+def _interchange_source_ids(item_id: str) -> tuple[str, ...] | None:
+    build = lib.load_json(BUILDS_PATH, {}).get(item_id)
+    if not isinstance(build, dict):
+        return None
+    values = ["primary"]
+    values.extend(
+        str(source.get("id") or "")
+        for source in (build.get("pdf_sources") or [])
+        if isinstance(source, dict) and source.get("id")
+    )
+    return tuple(dict.fromkeys(values))
+
+
+@contextlib.contextmanager
+def _interchange_locks(_item_id: str):
+    """Bridge legacy writers into the workspace lease's lock order."""
+
+    with _page_structure_lock:
+        with _ocr_merge_lock:
+            with _an_write_lock:
+                with _manifest_lock:
+                    with _builds_lock:
+                        yield
+
+
 def _library_engine() -> LibraryEngine:
     """Compose the headless engine against today's file-backed adapters.
 
@@ -3171,9 +3216,45 @@ def _library_engine() -> LibraryEngine:
                     _EngineTextLayerRepository(), policies)
                 replica = ReplicaApplicationService(
                     _EngineItemRepository(), repository, policies, text_layers)
+                interchange_planner = ExistingItemLibArchivePlanner(
+                    parse_format=libformat.parse_format,
+                    supported_major=libformat.SUPPORTED_MAJOR,
+                    sanitize_items=libformat.sanitize_page_items,
+                    sanitize_dims=libformat.sanitize_dims,
+                    sanitize_document_name=_ocr_name,
+                    sanitize_styles=libformat.sanitize_styles,
+                    sanitize_ext=libformat.sanitize_ext,
+                    sanitize_figure=libformat.sanitize_figure,
+                    clean_region_id=libformat.clean_rid,
+                    is_template_name=lambda name: bool(_RW_TPL_RE.fullmatch(name)),
+                    is_protected=replica_service.is_protected,
+                    compose_text=layout_roles.compose_text,
+                    normalize_language=_lang_code,
+                    limits=LibArchiveLimits(
+                        max_archive_bytes=libformat.MAX_BYTES,
+                        max_inflated_bytes=libformat.MAX_INFLATED,
+                        max_json_bytes=libformat.MAX_JSON,
+                        max_figure_bytes=libformat.MAX_FIGURE,
+                        max_pages=libformat.MAX_PAGES,
+                        max_items_per_page=libformat.MAX_ITEMS,
+                    ),
+                )
+                interchange_repository = FilesystemInterchangeRepository(
+                    _interchange_write_set,
+                    entry_directory_for=_entry_dir,
+                    source_ids_for=_interchange_source_ids,
+                    clean_region_id=libformat.clean_rid,
+                    normalize_language=_lang_code,
+                    sanitize_document_name=_ocr_name,
+                    lock_context_for=_interchange_locks,
+                    recover=False,
+                )
                 _library_engine_instance = LibraryEngine(
                     capabilities=_ENGINE_CAPABILITIES,
                     items=items,
+                    interchange=LibInterchangeService(
+                        interchange_planner, interchange_repository
+                    ),
                     jobs=_job_manager,
                     replica=replica,
                     text_layers=text_layers,
@@ -3187,6 +3268,13 @@ def _replica_engine() -> ReplicaApplicationService:
     if replica is None:  # manifest/runtime mismatch is a server fault
         raise RuntimeError("the Replica engine module is unavailable")
     return replica
+
+
+def _interchange_engine() -> LibInterchangeService:
+    interchange = _library_engine().interchange
+    if interchange is None:
+        raise RuntimeError("the interchange engine module is unavailable")
+    return interchange
 
 
 def _region_view_response(view) -> dict:
@@ -3226,6 +3314,15 @@ def _engine_error_response(exc: EngineError, *, current=None):
         for key in ("duplicate_rids", "untracked"):
             if key in exc.details:
                 body[key] = exc.details[key]
+        if isinstance(exc.details.get("warnings"), list):
+            body["warnings"] = [
+                {
+                    "loc": str(warning.get("location") or ""),
+                    "msg": str(warning.get("message") or ""),
+                }
+                for warning in exc.details["warnings"]
+                if isinstance(warning, dict)
+            ]
     if isinstance(exc, (EngineConflictError,
                         EnginePreconditionRequiredError)):
         body["conflict"] = exc.code
@@ -4791,10 +4888,8 @@ def api_build_replica_import(build_id: str):
     """The other half of .lib interchange: unpack an exported archive into
     this build's working store. Multipart field "lib"; ?src= picks the scan
     the pages land under, ?overwrite=1 lets imported pages/templates replace
-    existing ones (default: skip, like template apply). The core lives in
-    _lib_import_archive; this route only validates the request shape.
-    The stylesheet imports only when the book has no custom sheet (or with
-    overwrite); figures only when the name is free."""
+    existing ones (default: skip, like template apply). Planning and durable
+    publication live behind the headless engine interchange boundary."""
     b = lib.load_json(BUILDS_PATH, {}).get(build_id)
     if b is None:
         abort(404)
@@ -4810,8 +4905,34 @@ def api_build_replica_import(build_id: str):
     raw = f.read(_LIB_MAX_BYTES + 1)
     if len(raw) > _LIB_MAX_BYTES:
         return jsonify({"ok": False, "error": "file too large"}), 400
-    payload, code = _lib_import_archive(build_id, src, raw, overwrite)
-    return jsonify(payload), code
+    operation_id = str(request.headers.get("Idempotency-Key") or "").strip()
+    if not operation_id:
+        operation_id = uuid.uuid4().hex
+    try:
+        receipt = _interchange_engine().import_lib(ImportLibCommand(
+            item_id=build_id,
+            source_id=src,
+            archive=raw,
+            overwrite=overwrite,
+            operation_id=operation_id,
+        ))
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    return jsonify({
+        "ok": True,
+        "format_version": receipt.format_version,
+        "pages_applied": list(receipt.pages_applied),
+        "pages_skipped": list(receipt.pages_skipped),
+        "pages_protected": list(receipt.pages_protected),
+        "templates_added": list(receipt.templates_added),
+        "figures_added": len(receipt.figures_added),
+        "stylesheet": receipt.stylesheet_disposition,
+        "translations_added": list(receipt.translations_added),
+        "warnings": [
+            {"loc": warning.location, "msg": warning.message}
+            for warning in receipt.warnings
+        ],
+    })
 
 
 @app.route("/api/lib/open", methods=["POST"])
