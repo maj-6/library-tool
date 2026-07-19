@@ -96,6 +96,7 @@ def test_delete_writes_a_restorable_item(data_root):
     assert rec["restore"]["pages"] == [2]
     assert rec["restore"]["pages_before"] == 3
     assert rec["restore"]["pages_after"] == 2
+    assert rec["restore"]["pdf_after_sha256"] == server._file_sha256(pdf)
     assert rec["restore"]["title_pages_before"] == "1,3"
     assert rec["bytes"] > 0
     assert "2 page" not in rec["label"] and "1 page" in rec["label"]
@@ -143,6 +144,48 @@ def test_restore_refuses_when_the_pdf_moved_on(data_root, client):
     # the payload is still downloadable so the pages are not lost
     d = client.get(f"/api/trash/{tid}/payload/pages.pdf")
     assert d.status_code == 200 and d.data[:4] == b"%PDF"
+
+
+def test_restore_refuses_an_unrelated_pdf_with_the_same_page_count(
+    data_root, client
+):
+    """Page count is not lineage: a replacement scan of the same length must
+    never receive held pages from the PDF that was originally edited."""
+
+    bid = "trash003b"
+    pdf = _seed(bid, data_root)
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+    tid = server._apply_page_deletion(bid, builds, pdf, [2])["trash_id"]
+
+    replacement = pdf.with_name("replacement.pdf")
+    _make_pdf(replacement, 2)
+    replacement.replace(pdf)
+    replacement_digest = server._file_sha256(pdf)
+
+    response = client.post("/api/trash/restore", json={"id": tid})
+
+    assert response.status_code == 409
+    assert "changed since" in response.get_json()["error"]
+    assert _page_count(pdf) == 2
+    assert server._file_sha256(pdf) == replacement_digest
+
+
+def test_restore_refuses_a_legacy_row_without_exact_pdf_lineage(
+    data_root, client
+):
+    bid = "trash003c"
+    pdf = _seed(bid, data_root)
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+    tid = server._apply_page_deletion(bid, builds, pdf, [2])["trash_id"]
+    index = server.lib.load_json(server.TRASH_PATH, {})
+    index["items"][tid]["restore"].pop("pdf_after_sha256")
+    server.lib.save_json(server.TRASH_PATH, index)
+
+    response = client.post("/api/trash/restore", json={"id": tid})
+
+    assert response.status_code == 409
+    assert "predates exact PDF lineage" in response.get_json()["error"]
+    assert _page_count(pdf) == 2
 
 
 def test_restore_keeps_a_file_edited_since_the_delete(data_root, client):

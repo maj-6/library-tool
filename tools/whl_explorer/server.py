@@ -9274,7 +9274,7 @@ def _trash_restore_pdf_pages(item: dict) -> tuple[dict, int]:
 
 def _trash_restore_pdf_pages_guarded(item: dict) -> tuple[dict, int]:
     """Put deleted pages back. Refuses rather than guesses: the recorded page
-    numbers are only meaningful against the exact post-delete page count, and
+    numbers are only meaningful against the exact post-delete PDF, and
     appending them to the end would not be a restore at all."""
     from pypdf import PdfReader, PdfWriter
     origin = item.get("origin") or {}
@@ -9303,6 +9303,21 @@ def _trash_restore_pdf_pages_guarded(item: dict) -> tuple[dict, int]:
         blockers = _page_job_blockers(build_id)
         if blockers:
             return {"ok": False, "error": "an OCR job is running for this book"}, 409
+        expected_digest = str(rest.get("pdf_after_sha256") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+            return {"ok": False, "error":
+                    "this recovery record predates exact PDF lineage checks — "
+                    "download the pages instead and re-insert them by hand"}, 409
+        try:
+            current_digest = _file_sha256(pdf)
+        except OSError:
+            return {"ok": False, "error":
+                    "the current PDF could not be verified — download the "
+                    "pages instead and re-insert them by hand"}, 409
+        if current_digest != expected_digest:
+            return {"ok": False, "error":
+                    "this PDF has changed since the delete — download the pages "
+                    "instead and re-insert them by hand"}, 409
         current = PdfReader(str(pdf))
         if len(current.pages) != int(rest.get("pages_after") or -1):
             return {"ok": False, "error":
@@ -10387,6 +10402,11 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
     tmp = pdf.with_suffix(".del.tmp")
     with open(tmp, "wb") as fh:
         writer.write(fh)
+    # Hash the exact successor bytes before replacing the live file. Restore
+    # must pin lineage, not merely page count: an unrelated PDF can have the
+    # same number of pages. A hashing failure here is still pre-commit and
+    # therefore leaves the source untouched.
+    post_delete_sha256 = _file_sha256(tmp)
     # Record the PDF that is actually being edited. "primary" is also
     # _src_key_for_path's catch-all for a resolve error or no match at all, so
     # verify rather than assume: pointing the row at pdf_file for a file that
@@ -10423,6 +10443,7 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
         tid, "pdf_pages", label,
         {"build_id": build_id, "pdf": src_path, "src_key": src_key},
         {"pages": pages, "pages_before": total, "pages_after": len(keep),
+         "pdf_after_sha256": post_delete_sha256,
          "title_pages_before": str(b.get("title_pages") or ""),
          "thumbnail_source_before": str(b.get("thumbnail_source") or "")},
         payload_kind, list(tfiles))
