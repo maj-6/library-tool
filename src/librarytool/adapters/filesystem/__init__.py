@@ -1,7 +1,9 @@
 """Filesystem-backed engine adapters."""
 
 from .canvas_preparation_repository import (
-    FilesystemCanvasCandidate,
+    FilesystemCanvasEvidence,
+    FilesystemCanvasInspection,
+    FilesystemCanvasObservation,
     FilesystemCanvasPreparationRepository,
 )
 from .canvas_query_repository import FilesystemCanvasQueryRepository
@@ -39,7 +41,9 @@ from .whl_catalogue_codec import WhlCatalogueItemCodec
 
 __all__ = [
     "EMPTY_MANAGED_TREE_REVISION",
-    "FilesystemCanvasCandidate",
+    "FilesystemCanvasEvidence",
+    "FilesystemCanvasInspection",
+    "FilesystemCanvasObservation",
     "FilesystemCanvasPreparationRepository",
     "FilesystemCanvasQueryRepository",
     "FilesystemItemCommandRepository",

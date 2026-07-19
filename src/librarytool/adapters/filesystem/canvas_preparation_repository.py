@@ -4,10 +4,13 @@ The public query index remains beneath the managed item tree at
 ``.librarytool/canvases.json``.  Its source members are private adapter data
 and are stripped by :mod:`canvas_query_repository`.  A second item-local file
 retains the monotonic source-correlation ledger, including retired identities,
-while operation receipts live in the write-set's private ``.engine`` tree.
+and a third binds those random correlations to exact asset bytes and private,
+versioned source evidence.  Operation receipts live in the write-set's private
+``.engine`` tree.  Evidence, paths, and positions are never identity: only a
+persisted random correlation may carry a canvas ID across preparations.
 
 Nothing is published while media is inspected or a preparation is staged.
-``commit`` places the index, ledger, and durable receipt in one
+``commit`` places the materialization, ledger, index, and durable receipt in one
 :class:`RecoverableWriteSet` transaction.  Units hold the workspace lease and
 the injected broad host lock for their entire lifetime, including receipt
 replay, live-state lookup, local inspection, and publication.
@@ -20,6 +23,7 @@ import json
 import math
 import os
 import re
+import secrets
 import stat
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -42,7 +46,12 @@ from ...engine.canvases import (
     CanvasSequenceView,
     CanvasView,
 )
-from ...engine.errors import EngineError, RepositoryError, ValidationError
+from ...engine.errors import (
+    ConflictError,
+    EngineError,
+    RepositoryError,
+    ValidationError,
+)
 from .canvas_query_repository import (
     CANVAS_INDEX_SCHEMA,
     CANVAS_INDEX_VERSION,
@@ -67,19 +76,79 @@ LockContextFactory: TypeAlias = Callable[[], ContextManager[Any]]
 CANVAS_IDENTITY_LEDGER_SCHEMA = "librarytool.canvas-identity-ledger"
 CANVAS_IDENTITY_LEDGER_VERSION = 1
 CANVAS_IDENTITY_LEDGER_RELATIVE = PurePosixPath(".librarytool/canvas-identities.json")
+CANVAS_SOURCE_MATERIALIZATION_SCHEMA = (
+    "librarytool.canvas-source-materializations"
+)
+CANVAS_SOURCE_MATERIALIZATION_VERSION = 1
+CANVAS_SOURCE_MATERIALIZATION_RELATIVE = PurePosixPath(
+    ".librarytool/canvas-source-materializations.json"
+)
 CANVAS_PREPARATION_RECEIPT_SCHEMA = "librarytool.canvas-preparation-receipt"
 CANVAS_PREPARATION_RECEIPT_VERSION = 1
 
 _RECEIPT_ROOT = PurePosixPath(".engine/receipts/canvas-preparations")
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _CORRELATION_RE = re.compile(r"^[0-9a-f]{64}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_FUZZY_HASH_RE = re.compile(r"^[0-9a-f]{16}$")
 _MAX_INDEX_BYTES = 16 * 1024 * 1024
 _MAX_LEDGER_BYTES = 16 * 1024 * 1024
+_MAX_MATERIALIZATION_BYTES = 64 * 1024 * 1024
 _MAX_RECEIPT_BYTES = 1024 * 1024
 _MAX_CANVASES = 100_000
+_CORRELATION_ALLOCATION_ATTEMPTS = 16
 _LEDGER_FIELDS = frozenset({"schema", "version", "item_id", "sequences"})
 _LEDGER_SEQUENCE_FIELDS = frozenset({"representation_id", "bindings"})
 _BINDING_FIELDS = frozenset({"canvas_id", "source_correlation", "active"})
+_MATERIALIZATION_FIELDS = frozenset(
+    {"schema", "version", "item_id", "sequences"}
+)
+_MATERIALIZATION_SEQUENCE_FIELDS = frozenset(
+    {
+        "representation_id",
+        "representation_revision",
+        "media_type",
+        "generation",
+        "asset",
+        "sources",
+    }
+)
+_MATERIALIZATION_ASSET_FIELDS = frozenset(
+    {"sha256", "size", "source_count"}
+)
+_MATERIALIZATION_SOURCE_FIELDS = frozenset(
+    {
+        "source_correlation",
+        "active",
+        "born_generation",
+        "last_active_generation",
+        "last_retired_generation",
+        "last_locator",
+        "disposition",
+        "evidence",
+    }
+)
+_MATERIALIZATION_LOCATOR_FIELDS = frozenset({"position", "path"})
+_MATERIALIZATION_EVIDENCE_FIELDS = frozenset(
+    {
+        "profile",
+        "width_mpt",
+        "height_mpt",
+        "rotation",
+        "strong_sha256",
+        "fuzzy_hash",
+    }
+)
+_MATERIALIZATION_DISPOSITIONS = frozenset(
+    {
+        "minted",
+        "unchanged-asset",
+        "explicit-map",
+        "retired",
+        "reactivated",
+        "reset",
+    }
+)
 _INDEX_FIELDS = frozenset({"schema", "version", "item_id", "sequences"})
 _INDEX_SEQUENCE_FIELDS = frozenset(
     {"representation_id", "representation_revision", "canvases"}
@@ -87,18 +156,29 @@ _INDEX_SEQUENCE_FIELDS = frozenset(
 
 
 @dataclass(frozen=True, slots=True)
-class FilesystemCanvasCandidate:
-    """One ordered, locally inspected source candidate.
+class FilesystemCanvasEvidence:
+    """Private, versioned matching evidence which is never source identity."""
 
-    Correlation, position, and path are private adapter inputs and are hidden
-    from ``repr``.  ``source_correlation`` is a stable opaque identity token,
-    not a content digest or a path.  The inspector's return order becomes the
-    public canvas order.
+    profile: str
+    width_mpt: int
+    height_mpt: int
+    rotation: int
+    strong_sha256: str = field(repr=False)
+    fuzzy_hash: str = field(default="", repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class FilesystemCanvasObservation:
+    """One ordered local source observation with no caller-provided identity.
+
+    The repository mints a random correlation on first materialization.  Page
+    fingerprints, positions, and paths are only reconciliation evidence and
+    may never be substituted for that persisted random value.
     """
 
-    source_correlation: bytes = field(repr=False)
     source_position: int = field(repr=False)
     source_path: str = field(repr=False)
+    evidence: FilesystemCanvasEvidence = field(repr=False)
     label: str = ""
     extent: CanvasExtent = field(default_factory=CanvasExtent)
     available: bool = True
@@ -106,16 +186,70 @@ class FilesystemCanvasCandidate:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class FilesystemCanvasInspection:
+    """One coherent media inspection bound to exact asset bytes."""
+
+    media_type: str
+    asset_sha256: str = field(repr=False)
+    asset_size: int
+    observations: tuple[FilesystemCanvasObservation, ...]
+
+
 MediaInspector: TypeAlias = Callable[
     [CanvasPreparationRepresentationSnapshot, Path],
-    Sequence[FilesystemCanvasCandidate],
+    FilesystemCanvasInspection,
 ]
+SourceCorrelationFactory: TypeAlias = Callable[[frozenset[bytes]], bytes]
 
 
 @dataclass(frozen=True, slots=True)
 class _LedgerSequence:
     representation_id: str
     bindings: tuple[CanvasSourceIdentityBinding, ...] = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _IndexedCanvas:
+    canvas_id: str
+    position: int
+    path: str = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _IndexedSequence:
+    representation_id: str
+    representation_revision: str
+    canvases: tuple[_IndexedCanvas, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _MaterializedSource:
+    source_correlation: bytes = field(repr=False)
+    active: bool
+    born_generation: int
+    last_active_generation: int
+    last_retired_generation: int | None
+    position: int = field(repr=False)
+    path: str = field(repr=False)
+    disposition: str
+    evidence: FilesystemCanvasEvidence = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _MaterializedSequence:
+    representation_id: str
+    representation_revision: str
+    media_type: str
+    generation: int
+    asset_sha256: str = field(repr=False)
+    asset_size: int
+    source_count: int
+    sources: tuple[_MaterializedSource, ...] = field(repr=False)
+
+
+def _random_source_correlation(_reserved: frozenset[bytes]) -> bytes:
+    return secrets.token_bytes(32)
 
 
 class _StaticCanvasRecordRepository:
@@ -185,6 +319,65 @@ def _identifier(
             item_id=item_id,
             representation_id=representation_id,
             field=field_name,
+        )
+    return value
+
+
+def _stored_revision(
+    value: Any,
+    *,
+    item_id: str,
+    representation_id: str,
+) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 512
+        or value != value.strip()
+        or '"' in value
+        or "\\" in value
+        or any(character.isspace() for character in value)
+        or any(
+            ord(character) == 127
+            or ord(character) < 32
+            or 0xD800 <= ord(character) <= 0xDFFF
+            for character in value
+        )
+    ):
+        raise _repository_error(
+            "a canvas source materialization revision is invalid",
+            code="invalid_canvas_source_materialization",
+            item_id=item_id,
+            representation_id=representation_id,
+        )
+    return value
+
+
+def _media_type(
+    value: Any,
+    *,
+    item_id: str,
+    representation_id: str,
+    code: str = "invalid_canvas_source_materialization",
+) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 255
+        or value != value.strip()
+        or "/" not in value
+        or any(
+            ord(character) < 33
+            or ord(character) == 127
+            or 0xD800 <= ord(character) <= 0xDFFF
+            for character in value
+        )
+    ):
+        raise _repository_error(
+            "a canvas media type is invalid",
+            code=code,
+            item_id=item_id,
+            representation_id=representation_id,
         )
     return value
 
@@ -341,6 +534,9 @@ class FilesystemCanvasPreparationRepository:
         inspect_media: MediaInspector,
         allocate_canvas_id: CanvasIdAllocator,
         lock_context_for: LockContextFactory,
+        source_correlation_factory: SourceCorrelationFactory = (
+            _random_source_correlation
+        ),
         recover: bool = True,
     ) -> None:
         if not isinstance(write_set, RecoverableWriteSet):
@@ -352,6 +548,7 @@ class FilesystemCanvasPreparationRepository:
             (inspect_media, "inspect_media"),
             (allocate_canvas_id, "allocate_canvas_id"),
             (lock_context_for, "lock_context_for"),
+            (source_correlation_factory, "source_correlation_factory"),
         ):
             if not callable(callback):
                 raise TypeError(f"{name} must be callable")
@@ -361,6 +558,7 @@ class FilesystemCanvasPreparationRepository:
         self._entry_directory_for = entry_directory_for
         self._inspect_media = inspect_media
         self._allocate_canvas_id = allocate_canvas_id
+        self._source_correlation_factory = source_correlation_factory
         self._lock_context_for = lock_context_for
         # Reuse the exact v1 index parser/projector without invoking its public
         # read path (which would acquire locks and live callbacks a second time).
@@ -400,6 +598,9 @@ class FilesystemCanvasPreparationRepository:
                         representation_snapshot_for=(self._representation_snapshot_for),
                         inspect_media=self._inspect_media,
                         allocate_canvas_id=self._allocate_canvas_id,
+                        source_correlation_factory=(
+                            self._source_correlation_factory
+                        ),
                         query_repository=self._query_repository,
                     )
                     try:
@@ -426,6 +627,7 @@ class FilesystemCanvasPreparationUnitOfWork:
         representation_snapshot_for: RepresentationSnapshotLookup,
         inspect_media: MediaInspector,
         allocate_canvas_id: CanvasIdAllocator,
+        source_correlation_factory: SourceCorrelationFactory,
         query_repository: FilesystemCanvasQueryRepository,
     ) -> None:
         self._write_set = write_set
@@ -434,6 +636,7 @@ class FilesystemCanvasPreparationUnitOfWork:
         self._representation_snapshot_for = representation_snapshot_for
         self._inspect_media = inspect_media
         self._allocate_canvas_id = allocate_canvas_id
+        self._source_correlation_factory = source_correlation_factory
         self._query_repository = query_repository
         self._closed = False
         self._committed = False
@@ -443,19 +646,24 @@ class FilesystemCanvasPreparationUnitOfWork:
         self._entry_directory: Path | None = None
         self._index_path: Path | None = None
         self._ledger_path: Path | None = None
+        self._materialization_path: Path | None = None
         self._base_index: dict[str, Any] | None = None
         self._base_ledger: dict[str, Any] | None = None
+        self._base_materialization: dict[str, Any] | None = None
         self._ledger_sequences: dict[str, _LedgerSequence] = {}
+        self._materialization_sequences: dict[str, _MaterializedSequence] = {}
         self._before_loaded = False
         self._before: CanvasPreparationSnapshot | None = None
         self._after: CanvasPreparationSnapshot | None = None
         self._staged_index: bytes | None = None
         self._staged_ledger: bytes | None = None
+        self._staged_materialization: bytes | None = None
 
     def close(self) -> None:
         self._closed = True
         self._staged_index = None
         self._staged_ledger = None
+        self._staged_materialization = None
 
     def receipt(self, operation_id: str) -> CanvasPreparationReceipt | None:
         self._ensure_open()
@@ -574,12 +782,18 @@ class FilesystemCanvasPreparationUnitOfWork:
             )
         if self._before_loaded:
             return self._before
-        entry_directory, index_path, ledger_path = self._artifact_paths(
+        (
+            entry_directory,
+            index_path,
+            ledger_path,
+            materialization_path,
+        ) = self._artifact_paths(
             representation.item_id
         )
         self._entry_directory = entry_directory
         self._index_path = index_path
         self._ledger_path = ledger_path
+        self._materialization_path = materialization_path
         index_exists = self._query_repository._index_exists(
             index_path,
             item_id=representation.item_id,
@@ -591,7 +805,21 @@ class FilesystemCanvasPreparationUnitOfWork:
             representation_id=representation.representation_id,
             allow_missing=True,
         )
-        if index_exists != ledger_exists:
+        materialization_exists = self._regular_file_exists(
+            materialization_path,
+            artifact="canvas_source_materialization",
+            item_id=representation.item_id,
+            representation_id=representation.representation_id,
+            allow_missing=True,
+        )
+        if index_exists and ledger_exists and not materialization_exists:
+            raise _repository_error(
+                "legacy canvas identities require an explicit migration",
+                code="canvas_source_materialization_required",
+                item_id=representation.item_id,
+                representation_id=representation.representation_id,
+            )
+        if len({index_exists, ledger_exists, materialization_exists}) != 1:
             raise _repository_error(
                 "the canvas preparation artifacts are incomplete",
                 code="canvas_preparation_artifact_mismatch",
@@ -601,6 +829,9 @@ class FilesystemCanvasPreparationUnitOfWork:
         if not index_exists:
             self._base_index = self._empty_index(representation.item_id)
             self._base_ledger = self._empty_ledger(representation.item_id)
+            self._base_materialization = self._empty_materialization(
+                representation.item_id
+            )
             self._before_loaded = True
             self._before = None
             return None
@@ -616,7 +847,14 @@ class FilesystemCanvasPreparationUnitOfWork:
             item_id=representation.item_id,
             representation_id=representation.representation_id,
         )
-        public, index_canvas_ids = self._validated_index(
+        raw_materialization = self._read_json(
+            materialization_path,
+            maximum_bytes=_MAX_MATERIALIZATION_BYTES,
+            artifact="canvas_source_materialization",
+            item_id=representation.item_id,
+            representation_id=representation.representation_id,
+        )
+        public, index_sequences = self._validated_index(
             raw_index,
             representation=representation,
             entry_directory=entry_directory,
@@ -625,16 +863,33 @@ class FilesystemCanvasPreparationUnitOfWork:
             raw_ledger,
             item_id=representation.item_id,
         )
-        self._validate_index_ledger_alignment(
-            index_canvas_ids,
+        materialization, materialization_sequences = (
+            self._validated_materialization(
+                raw_materialization,
+                item_id=representation.item_id,
+                entry_directory=entry_directory,
+            )
+        )
+        self._validate_artifact_alignment(
+            index_sequences,
             ledger_sequences,
+            materialization_sequences,
             item_id=representation.item_id,
         )
         self._base_index = raw_index
         self._base_ledger = ledger
+        self._base_materialization = materialization
         self._ledger_sequences = ledger_sequences
+        self._materialization_sequences = materialization_sequences
         target_ledger = ledger_sequences.get(representation.representation_id)
-        if (public is None) != (target_ledger is None):
+        target_materialization = materialization_sequences.get(
+            representation.representation_id
+        )
+        if not (
+            (public is None)
+            == (target_ledger is None)
+            == (target_materialization is None)
+        ):
             raise _repository_error(
                 "the canvas preparation artifacts disagree",
                 code="canvas_preparation_artifact_mismatch",
@@ -686,23 +941,39 @@ class FilesystemCanvasPreparationUnitOfWork:
                 representation_id=representation.representation_id,
                 cause_type=type(exc).__name__,
             ) from exc
-        candidates = self._candidates(
+        inspection, observations = self._inspection(
             inspected,
             item_id=representation.item_id,
             representation_id=representation.representation_id,
         )
+        materialized_sources, correlation_by_position, generation = (
+            self._materialized_sources(
+                inspection,
+                observations,
+                representation=representation,
+            )
+        )
+        correlations = tuple(
+            correlation_by_position[observation.source_position]
+            for observation in observations
+        )
         bindings, assigned = self._assign_identities(
-            candidates,
+            correlations,
             representation=representation,
         )
         canvas_records = [
             self._canvas_record(
-                candidate,
-                canvas_id=assigned[candidate.source_correlation],
+                observation,
+                correlation=correlation_by_position[
+                    observation.source_position
+                ],
+                canvas_id=assigned[
+                    correlation_by_position[observation.source_position]
+                ],
                 order=order,
                 representation=representation,
             )
-            for order, candidate in enumerate(candidates)
+            for order, observation in enumerate(observations)
         ]
         sequence_record = {
             "representation_id": representation.representation_id,
@@ -711,8 +982,14 @@ class FilesystemCanvasPreparationUnitOfWork:
         }
         index = self._updated_index(sequence_record, representation=representation)
         ledger = self._updated_ledger(bindings, representation=representation)
+        materialization = self._updated_materialization(
+            inspection,
+            materialized_sources,
+            generation=generation,
+            representation=representation,
+        )
 
-        public, index_canvas_ids = self._validated_index(
+        public, index_sequences = self._validated_index(
             index,
             representation=representation,
             entry_directory=self._entry_directory,
@@ -722,9 +999,17 @@ class FilesystemCanvasPreparationUnitOfWork:
             ledger,
             item_id=representation.item_id,
         )
-        self._validate_index_ledger_alignment(
-            index_canvas_ids,
+        validated_materialization, materialization_sequences = (
+            self._validated_materialization(
+                materialization,
+                item_id=representation.item_id,
+                entry_directory=self._entry_directory,
+            )
+        )
+        self._validate_artifact_alignment(
+            index_sequences,
             ledger_sequences,
+            materialization_sequences,
             item_id=representation.item_id,
         )
         target = ledger_sequences[representation.representation_id]
@@ -755,6 +1040,16 @@ class FilesystemCanvasPreparationUnitOfWork:
             item_id=representation.item_id,
             representation_id=representation.representation_id,
         )
+        self._staged_materialization = _bounded_payload(
+            _json_bytes(
+                validated_materialization,
+                artifact="canvas_source_materialization",
+            ),
+            maximum_bytes=_MAX_MATERIALIZATION_BYTES,
+            artifact="canvas_source_materialization",
+            item_id=representation.item_id,
+            representation_id=representation.representation_id,
+        )
         self._after = after
         return after
 
@@ -769,9 +1064,11 @@ class FilesystemCanvasPreparationUnitOfWork:
             self._after is None
             or self._staged_index is None
             or self._staged_ledger is None
+            or self._staged_materialization is None
             or self._representation is None
             or self._index_path is None
             or self._ledger_path is None
+            or self._materialization_path is None
         ):
             raise _repository_error(
                 "no canvas preparation has been staged",
@@ -826,15 +1123,21 @@ class FilesystemCanvasPreparationUnitOfWork:
     ) -> None:
         assert self._index_path is not None
         assert self._ledger_path is not None
+        assert self._materialization_path is not None
         assert self._staged_index is not None
         assert self._staged_ledger is not None
+        assert self._staged_materialization is not None
         transaction.stage_write(
-            self._relative(self._index_path),
-            self._staged_index,
+            self._relative(self._materialization_path),
+            self._staged_materialization,
         )
         transaction.stage_write(
             self._relative(self._ledger_path),
             self._staged_ledger,
+        )
+        transaction.stage_write(
+            self._relative(self._index_path),
+            self._staged_index,
         )
         transaction.stage_write(
             self._receipt_relative(self._operation_id),
@@ -847,7 +1150,7 @@ class FilesystemCanvasPreparationUnitOfWork:
         *,
         representation: CanvasPreparationRepresentationSnapshot,
         entry_directory: Path,
-    ) -> tuple[Mapping[str, Any] | None, dict[str, tuple[str, ...]]]:
+    ) -> tuple[Mapping[str, Any] | None, dict[str, _IndexedSequence]]:
         if (
             not isinstance(raw, dict)
             or set(raw) != _INDEX_FIELDS
@@ -880,14 +1183,23 @@ class FilesystemCanvasPreparationUnitOfWork:
             requested_revision=requested_revision,
             entry_directory=entry_directory,
         )
-        ids: dict[str, tuple[str, ...]] = {}
+        sequences: dict[str, _IndexedSequence] = {}
         for value in raw["sequences"]:
             assert isinstance(value, dict)
             representation_id = value["representation_id"]
-            ids[representation_id] = tuple(
-                canvas["canvas_id"] for canvas in value["canvases"]
+            sequences[representation_id] = _IndexedSequence(
+                representation_id=representation_id,
+                representation_revision=value["representation_revision"],
+                canvases=tuple(
+                    _IndexedCanvas(
+                        canvas_id=canvas["canvas_id"],
+                        position=canvas["source"]["position"],
+                        path=canvas["source"]["path"],
+                    )
+                    for canvas in value["canvases"]
+                ),
             )
-        return public, ids
+        return public, sequences
 
     def _validated_ledger(
         self,
@@ -1034,104 +1346,642 @@ class FilesystemCanvasPreparationUnitOfWork:
             sequences,
         )
 
+    def _validated_materialization(
+        self,
+        raw: Any,
+        *,
+        item_id: str,
+        entry_directory: Path,
+    ) -> tuple[dict[str, Any], dict[str, _MaterializedSequence]]:
+        if (
+            not isinstance(raw, dict)
+            or set(raw) != _MATERIALIZATION_FIELDS
+            or raw.get("schema") != CANVAS_SOURCE_MATERIALIZATION_SCHEMA
+            or type(raw.get("version")) is not int
+            or raw.get("version") != CANVAS_SOURCE_MATERIALIZATION_VERSION
+            or raw.get("item_id") != item_id
+            or not isinstance(raw.get("sequences"), list)
+        ):
+            raise _repository_error(
+                "the canvas source materialization is invalid",
+                code="invalid_canvas_source_materialization",
+                item_id=item_id,
+            )
+        sequences: dict[str, _MaterializedSequence] = {}
+        aliases: set[str] = set()
+        normalized_sequences: list[dict[str, Any]] = []
+        for raw_sequence in raw["sequences"]:
+            if (
+                not isinstance(raw_sequence, dict)
+                or set(raw_sequence) != _MATERIALIZATION_SEQUENCE_FIELDS
+                or not isinstance(raw_sequence.get("asset"), dict)
+                or set(raw_sequence["asset"]) != _MATERIALIZATION_ASSET_FIELDS
+                or not isinstance(raw_sequence.get("sources"), list)
+            ):
+                raise _repository_error(
+                    "a canvas source materialization sequence is invalid",
+                    code="invalid_canvas_source_materialization",
+                    item_id=item_id,
+                )
+            representation_id = _identifier(
+                raw_sequence.get("representation_id"),
+                field_name="representation_id",
+                item_id=item_id,
+            )
+            alias = representation_id.casefold()
+            if alias in aliases:
+                raise _repository_error(
+                    "the canvas source materialization aliases a representation",
+                    code="duplicate_canvas_representation_identity",
+                    item_id=item_id,
+                )
+            aliases.add(alias)
+            revision = _stored_revision(
+                raw_sequence.get("representation_revision"),
+                item_id=item_id,
+                representation_id=representation_id,
+            )
+            media_type = _media_type(
+                raw_sequence.get("media_type"),
+                item_id=item_id,
+                representation_id=representation_id,
+            )
+            generation = raw_sequence.get("generation")
+            asset = raw_sequence["asset"]
+            asset_sha256 = asset.get("sha256")
+            asset_size = asset.get("size")
+            source_count = asset.get("source_count")
+            if (
+                type(generation) is not int
+                or generation < 1
+                or not isinstance(asset_sha256, str)
+                or not _SHA256_RE.fullmatch(asset_sha256)
+                or type(asset_size) is not int
+                or asset_size < 0
+                or type(source_count) is not int
+                or source_count < 0
+                or source_count > _MAX_CANVASES
+            ):
+                raise _repository_error(
+                    "a canvas source materialization asset is invalid",
+                    code="invalid_canvas_source_materialization",
+                    item_id=item_id,
+                    representation_id=representation_id,
+                )
+            sources: list[_MaterializedSource] = []
+            normalized_sources: list[dict[str, Any]] = []
+            correlations: set[bytes] = set()
+            active_positions: set[int] = set()
+            for raw_source in raw_sequence["sources"]:
+                source, normalized_source = self._materialized_source(
+                    raw_source,
+                    generation=generation,
+                    item_id=item_id,
+                    representation_id=representation_id,
+                    entry_directory=entry_directory,
+                )
+                if source.source_correlation in correlations:
+                    raise _repository_error(
+                        "the canvas source materialization contains duplicates",
+                        code="invalid_canvas_source_materialization",
+                        item_id=item_id,
+                        representation_id=representation_id,
+                    )
+                correlations.add(source.source_correlation)
+                if source.active:
+                    if source.position in active_positions:
+                        raise _repository_error(
+                            "active canvas source positions are duplicated",
+                            code="invalid_canvas_source_materialization",
+                            item_id=item_id,
+                            representation_id=representation_id,
+                        )
+                    active_positions.add(source.position)
+                sources.append(source)
+                normalized_sources.append(normalized_source)
+            if source_count != len(active_positions):
+                raise _repository_error(
+                    "the materialized asset source count is inconsistent",
+                    code="invalid_canvas_source_materialization",
+                    item_id=item_id,
+                    representation_id=representation_id,
+                )
+            sequence = _MaterializedSequence(
+                representation_id=representation_id,
+                representation_revision=revision,
+                media_type=media_type,
+                generation=generation,
+                asset_sha256=asset_sha256,
+                asset_size=asset_size,
+                source_count=source_count,
+                sources=tuple(sources),
+            )
+            sequences[representation_id] = sequence
+            normalized_sources.sort(key=lambda value: value["source_correlation"])
+            normalized_sequences.append(
+                {
+                    "representation_id": representation_id,
+                    "representation_revision": revision,
+                    "media_type": media_type,
+                    "generation": generation,
+                    "asset": {
+                        "sha256": asset_sha256,
+                        "size": asset_size,
+                        "source_count": source_count,
+                    },
+                    "sources": normalized_sources,
+                }
+            )
+        normalized_sequences.sort(
+            key=lambda value: (
+                value["representation_id"].casefold(),
+                value["representation_id"],
+            )
+        )
+        return (
+            {
+                "schema": CANVAS_SOURCE_MATERIALIZATION_SCHEMA,
+                "version": CANVAS_SOURCE_MATERIALIZATION_VERSION,
+                "item_id": item_id,
+                "sequences": normalized_sequences,
+            },
+            sequences,
+        )
+
+    def _materialized_source(
+        self,
+        raw: Any,
+        *,
+        generation: int,
+        item_id: str,
+        representation_id: str,
+        entry_directory: Path,
+    ) -> tuple[_MaterializedSource, dict[str, Any]]:
+        if (
+            not isinstance(raw, dict)
+            or set(raw) != _MATERIALIZATION_SOURCE_FIELDS
+            or not isinstance(raw.get("last_locator"), dict)
+            or set(raw["last_locator"]) != _MATERIALIZATION_LOCATOR_FIELDS
+        ):
+            raise _repository_error(
+                "a materialized canvas source is invalid",
+                code="invalid_canvas_source_materialization",
+                item_id=item_id,
+                representation_id=representation_id,
+            )
+        correlation_hex = raw.get("source_correlation")
+        active = raw.get("active")
+        born = raw.get("born_generation")
+        last_active = raw.get("last_active_generation")
+        last_retired = raw.get("last_retired_generation")
+        disposition = raw.get("disposition")
+        locator = raw["last_locator"]
+        position = locator.get("position")
+        path = locator.get("path")
+        if (
+            not isinstance(correlation_hex, str)
+            or not _CORRELATION_RE.fullmatch(correlation_hex)
+            or not isinstance(active, bool)
+            or type(born) is not int
+            or born < 1
+            or born > generation
+            or type(last_active) is not int
+            or last_active < born
+            or last_active > generation
+            or (
+                last_retired is not None
+                and (
+                    type(last_retired) is not int
+                    or last_retired < born
+                    or last_retired > generation
+                )
+            )
+            or (active and last_retired is not None and last_retired >= last_active)
+            or (not active and last_retired is None)
+            or (not active and last_retired < last_active)
+            or disposition not in _MATERIALIZATION_DISPOSITIONS
+            or type(position) is not int
+            or position < 0
+        ):
+            raise _repository_error(
+                "a materialized canvas source is invalid",
+                code="invalid_canvas_source_materialization",
+                item_id=item_id,
+                representation_id=representation_id,
+            )
+        self._query_repository._validate_source_path(
+            path,
+            entry_directory=entry_directory,
+            item_id=item_id,
+            representation_id=representation_id,
+        )
+        evidence, normalized_evidence = self._evidence(
+            raw.get("evidence"),
+            item_id=item_id,
+            representation_id=representation_id,
+            code="invalid_canvas_source_materialization",
+        )
+        source = _MaterializedSource(
+            source_correlation=bytes.fromhex(correlation_hex),
+            active=active,
+            born_generation=born,
+            last_active_generation=last_active,
+            last_retired_generation=last_retired,
+            position=position,
+            path=path,
+            disposition=disposition,
+            evidence=evidence,
+        )
+        return source, {
+            "source_correlation": correlation_hex,
+            "active": active,
+            "born_generation": born,
+            "last_active_generation": last_active,
+            "last_retired_generation": last_retired,
+            "last_locator": {"position": position, "path": path},
+            "disposition": disposition,
+            "evidence": normalized_evidence,
+        }
+
     @staticmethod
-    def _validate_index_ledger_alignment(
-        index: Mapping[str, tuple[str, ...]],
+    def _evidence(
+        value: Any,
+        *,
+        item_id: str,
+        representation_id: str,
+        code: str,
+    ) -> tuple[FilesystemCanvasEvidence, dict[str, Any]]:
+        if isinstance(value, FilesystemCanvasEvidence):
+            raw = {
+                "profile": value.profile,
+                "width_mpt": value.width_mpt,
+                "height_mpt": value.height_mpt,
+                "rotation": value.rotation,
+                "strong_sha256": value.strong_sha256,
+                "fuzzy_hash": value.fuzzy_hash,
+            }
+        else:
+            raw = value
+        if not isinstance(raw, dict) or set(raw) != _MATERIALIZATION_EVIDENCE_FIELDS:
+            raise _repository_error(
+                "canvas source evidence is invalid",
+                code=code,
+                item_id=item_id,
+                representation_id=representation_id,
+            )
+        profile = raw.get("profile")
+        width_mpt = raw.get("width_mpt")
+        height_mpt = raw.get("height_mpt")
+        rotation = raw.get("rotation")
+        strong_sha256 = raw.get("strong_sha256")
+        fuzzy_hash = raw.get("fuzzy_hash")
+        if (
+            not isinstance(profile, str)
+            or not _IDENTIFIER_RE.fullmatch(profile)
+            or type(width_mpt) is not int
+            or width_mpt < 1
+            or type(height_mpt) is not int
+            or height_mpt < 1
+            or type(rotation) is not int
+            or rotation not in {0, 90, 180, 270}
+            or not isinstance(strong_sha256, str)
+            or not _SHA256_RE.fullmatch(strong_sha256)
+            or not isinstance(fuzzy_hash, str)
+            or (fuzzy_hash != "" and not _FUZZY_HASH_RE.fullmatch(fuzzy_hash))
+        ):
+            raise _repository_error(
+                "canvas source evidence is invalid",
+                code=code,
+                item_id=item_id,
+                representation_id=representation_id,
+            )
+        evidence = FilesystemCanvasEvidence(
+            profile=profile,
+            width_mpt=width_mpt,
+            height_mpt=height_mpt,
+            rotation=rotation,
+            strong_sha256=strong_sha256,
+            fuzzy_hash=fuzzy_hash,
+        )
+        return evidence, {
+            "profile": profile,
+            "width_mpt": width_mpt,
+            "height_mpt": height_mpt,
+            "rotation": rotation,
+            "strong_sha256": strong_sha256,
+            "fuzzy_hash": fuzzy_hash,
+        }
+
+    @staticmethod
+    def _validate_artifact_alignment(
+        index: Mapping[str, _IndexedSequence],
         ledger: Mapping[str, _LedgerSequence],
+        materialization: Mapping[str, _MaterializedSequence],
         *,
         item_id: str,
     ) -> None:
-        if set(index) != set(ledger):
+        if set(index) != set(ledger) or set(index) != set(materialization):
             raise _repository_error(
-                "the canvas index and identity ledger disagree",
+                "the canvas preparation artifacts disagree",
                 code="canvas_preparation_artifact_mismatch",
                 item_id=item_id,
             )
-        for representation_id, canvas_ids in index.items():
-            active_ids = {
-                binding.canvas_id
-                for binding in ledger[representation_id].bindings
-                if binding.active
+        for representation_id, indexed in index.items():
+            ledger_bindings = ledger[representation_id].bindings
+            materialized = materialization[representation_id]
+            index_by_id = {canvas.canvas_id: canvas for canvas in indexed.canvases}
+            ledger_by_source = {
+                binding.source_correlation: binding for binding in ledger_bindings
             }
-            if active_ids != set(canvas_ids) or len(active_ids) != len(canvas_ids):
+            source_by_correlation = {
+                source.source_correlation: source
+                for source in materialized.sources
+            }
+            active_ids = {
+                binding.canvas_id for binding in ledger_bindings if binding.active
+            }
+            if (
+                indexed.representation_revision
+                != materialized.representation_revision
+                or active_ids != set(index_by_id)
+                or len(active_ids) != len(index_by_id)
+                or set(ledger_by_source) != set(source_by_correlation)
+                or materialized.source_count != len(index_by_id)
+            ):
                 raise _repository_error(
-                    "the canvas index and identity ledger disagree",
+                    "the canvas preparation artifacts disagree",
                     code="canvas_preparation_artifact_mismatch",
                     item_id=item_id,
                     representation_id=representation_id,
                 )
+            for correlation, binding in ledger_by_source.items():
+                source = source_by_correlation[correlation]
+                if binding.active != source.active:
+                    raise _repository_error(
+                        "the canvas preparation artifacts disagree",
+                        code="canvas_preparation_artifact_mismatch",
+                        item_id=item_id,
+                        representation_id=representation_id,
+                    )
+                if not binding.active:
+                    continue
+                indexed_canvas = index_by_id.get(binding.canvas_id)
+                if (
+                    indexed_canvas is None
+                    or indexed_canvas.position != source.position
+                    or indexed_canvas.path != source.path
+                ):
+                    raise _repository_error(
+                        "the canvas preparation artifacts disagree",
+                        code="canvas_preparation_artifact_mismatch",
+                        item_id=item_id,
+                        representation_id=representation_id,
+                    )
 
-    def _candidates(
+    def _inspection(
         self,
         value: Any,
         *,
         item_id: str,
         representation_id: str,
-    ) -> tuple[FilesystemCanvasCandidate, ...]:
-        if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+    ) -> tuple[FilesystemCanvasInspection, tuple[FilesystemCanvasObservation, ...]]:
+        if not isinstance(value, FilesystemCanvasInspection):
             raise _repository_error(
-                "the local media inspector returned invalid candidates",
+                "the local media inspector returned an invalid inspection",
                 code="invalid_canvas_inspection_result",
                 item_id=item_id,
                 representation_id=representation_id,
             )
-        if len(value) > _MAX_CANVASES:
+        media_type = _media_type(
+            value.media_type,
+            item_id=item_id,
+            representation_id=representation_id,
+            code="invalid_canvas_inspection_result",
+        )
+        if (
+            not isinstance(value.asset_sha256, str)
+            or not _SHA256_RE.fullmatch(value.asset_sha256)
+            or type(value.asset_size) is not int
+            or value.asset_size < 0
+            or isinstance(value.observations, (str, bytes))
+            or not isinstance(value.observations, Sequence)
+        ):
             raise _repository_error(
-                "the local media inspector returned too many candidates",
+                "the local media inspector returned an invalid inspection",
+                code="invalid_canvas_inspection_result",
+                item_id=item_id,
+                representation_id=representation_id,
+            )
+        if len(value.observations) > _MAX_CANVASES:
+            raise _repository_error(
+                "the local media inspector returned too many observations",
                 code="canvas_candidate_limit_exceeded",
                 item_id=item_id,
                 representation_id=representation_id,
                 maximum=_MAX_CANVASES,
             )
-        candidates = tuple(value)
-        correlations: set[bytes] = set()
-        for candidate in candidates:
-            if not isinstance(candidate, FilesystemCanvasCandidate):
+        observations = tuple(value.observations)
+        positions: set[int] = set()
+        normalized: list[FilesystemCanvasObservation] = []
+        for observation in observations:
+            if not isinstance(observation, FilesystemCanvasObservation):
                 raise _repository_error(
-                    "the local media inspector returned invalid candidates",
+                    "the local media inspector returned invalid observations",
                     code="invalid_canvas_inspection_result",
                     item_id=item_id,
                     representation_id=representation_id,
                 )
-            correlation = candidate.source_correlation
-            if not isinstance(correlation, bytes) or len(correlation) != 32:
+            position = observation.source_position
+            if type(position) is not int or position < 0 or position in positions:
                 raise _repository_error(
-                    "a source correlation is invalid",
+                    "a canvas source position is invalid or duplicated",
                     code="invalid_canvas_inspection_result",
                     item_id=item_id,
                     representation_id=representation_id,
                 )
-            if correlation in correlations:
-                raise _repository_error(
-                    "the media inspection contains duplicate sources",
-                    code="duplicate_canvas_source_correlation",
-                    item_id=item_id,
-                    representation_id=representation_id,
-                )
-            correlations.add(correlation)
-            if (
-                isinstance(candidate.source_position, bool)
-                or not isinstance(candidate.source_position, int)
-                or candidate.source_position < 0
-            ):
-                raise _repository_error(
-                    "a canvas source position is invalid",
-                    code="invalid_canvas_inspection_result",
-                    item_id=item_id,
-                    representation_id=representation_id,
-                )
+            positions.add(position)
             assert self._entry_directory is not None
             self._query_repository._validate_source_path(
-                candidate.source_path,
+                observation.source_path,
                 entry_directory=self._entry_directory,
                 item_id=item_id,
                 representation_id=representation_id,
             )
-        return candidates
+            evidence, _normalized_evidence = self._evidence(
+                observation.evidence,
+                item_id=item_id,
+                representation_id=representation_id,
+                code="invalid_canvas_inspection_result",
+            )
+            normalized.append(
+                FilesystemCanvasObservation(
+                    source_position=position,
+                    source_path=observation.source_path,
+                    evidence=evidence,
+                    label=observation.label,
+                    extent=observation.extent,
+                    available=observation.available,
+                    resource_kinds=observation.resource_kinds,
+                    metadata=observation.metadata,
+                )
+            )
+        inspection = FilesystemCanvasInspection(
+            media_type=media_type,
+            asset_sha256=value.asset_sha256,
+            asset_size=value.asset_size,
+            observations=tuple(normalized),
+        )
+        return inspection, tuple(normalized)
+
+    def _materialized_sources(
+        self,
+        inspection: FilesystemCanvasInspection,
+        observations: tuple[FilesystemCanvasObservation, ...],
+        *,
+        representation: CanvasPreparationRepresentationSnapshot,
+    ) -> tuple[tuple[_MaterializedSource, ...], dict[int, bytes], int]:
+        prior = self._materialization_sequences.get(
+            representation.representation_id
+        )
+        if prior is None:
+            generation = 1
+            correlations: set[bytes] = set()
+            sources: list[_MaterializedSource] = []
+            by_position: dict[int, bytes] = {}
+            for observation in observations:
+                correlation = self._allocate_source_correlation(
+                    correlations,
+                    representation=representation,
+                )
+                correlations.add(correlation)
+                by_position[observation.source_position] = correlation
+                sources.append(
+                    _MaterializedSource(
+                        source_correlation=correlation,
+                        active=True,
+                        born_generation=generation,
+                        last_active_generation=generation,
+                        last_retired_generation=None,
+                        position=observation.source_position,
+                        path=observation.source_path,
+                        disposition="minted",
+                        evidence=observation.evidence,
+                    )
+                )
+            return tuple(sources), by_position, generation
+
+        if prior.asset_sha256 != inspection.asset_sha256:
+            if prior.representation_revision == representation.revision:
+                raise ConflictError(
+                    "the representation bytes changed without a new revision",
+                    code="canvas_source_revision_drift",
+                    details={
+                        "item_id": representation.item_id,
+                        "representation_id": representation.representation_id,
+                        "representation_revision": representation.revision,
+                    },
+                )
+            raise ConflictError(
+                "the changed representation requires canvas reconciliation",
+                code="canvas_source_reconciliation_required",
+                details={
+                    "item_id": representation.item_id,
+                    "representation_id": representation.representation_id,
+                    "indexed_revision": prior.representation_revision,
+                    "authoritative_revision": representation.revision,
+                    "before_count": prior.source_count,
+                    "current_count": len(observations),
+                },
+            )
+        if (
+            prior.media_type != inspection.media_type
+            or prior.asset_size != inspection.asset_size
+        ):
+            raise _repository_error(
+                "identical canvas asset evidence is inconsistent",
+                code="canvas_source_materialization_mismatch",
+                item_id=representation.item_id,
+                representation_id=representation.representation_id,
+            )
+        active_by_position = {
+            source.position: source for source in prior.sources if source.active
+        }
+        positions = {value.source_position for value in observations}
+        if (
+            prior.source_count != len(observations)
+            or len(active_by_position) != len(observations)
+            or set(active_by_position) != positions
+        ):
+            raise _repository_error(
+                "identical asset bytes produced a different canvas source set",
+                code="canvas_source_materialization_mismatch",
+                item_id=representation.item_id,
+                representation_id=representation.representation_id,
+            )
+        observation_by_position = {
+            value.source_position: value for value in observations
+        }
+        sources = []
+        by_position = {}
+        for source in prior.sources:
+            if not source.active:
+                sources.append(source)
+                continue
+            observation = observation_by_position[source.position]
+            by_position[source.position] = source.source_correlation
+            sources.append(
+                _MaterializedSource(
+                    source_correlation=source.source_correlation,
+                    active=True,
+                    born_generation=source.born_generation,
+                    last_active_generation=source.last_active_generation,
+                    last_retired_generation=source.last_retired_generation,
+                    position=observation.source_position,
+                    path=observation.source_path,
+                    disposition="unchanged-asset",
+                    evidence=observation.evidence,
+                )
+            )
+        return tuple(sources), by_position, prior.generation
+
+    def _allocate_source_correlation(
+        self,
+        reserved: set[bytes],
+        *,
+        representation: CanvasPreparationRepresentationSnapshot,
+    ) -> bytes:
+        for _attempt in range(_CORRELATION_ALLOCATION_ATTEMPTS):
+            try:
+                value = self._source_correlation_factory(frozenset(reserved))
+            except EngineError:
+                raise
+            except Exception as exc:
+                raise _repository_error(
+                    "a canvas source correlation could not be allocated",
+                    code="canvas_source_correlation_allocation_failed",
+                    item_id=representation.item_id,
+                    representation_id=representation.representation_id,
+                    cause_type=type(exc).__name__,
+                ) from exc
+            if not isinstance(value, bytes) or len(value) != 32:
+                raise _repository_error(
+                    "the canvas source correlation allocator returned invalid data",
+                    code="invalid_allocated_canvas_source_correlation",
+                    item_id=representation.item_id,
+                    representation_id=representation.representation_id,
+                )
+            if value not in reserved:
+                return value
+        raise _repository_error(
+            "a unique canvas source correlation could not be allocated",
+            code="canvas_source_correlation_collision",
+            item_id=representation.item_id,
+            representation_id=representation.representation_id,
+        )
 
     def _assign_identities(
         self,
-        candidates: tuple[FilesystemCanvasCandidate, ...],
+        correlations: tuple[bytes, ...],
         *,
         representation: CanvasPreparationRepresentationSnapshot,
     ) -> tuple[
@@ -1144,7 +1994,7 @@ class FilesystemCanvasPreparationUnitOfWork:
         reserved_ids = {binding.canvas_id for binding in previous}
         reserved_aliases = {value.casefold() for value in reserved_ids}
         assigned: dict[bytes, str] = {}
-        current_sources = {candidate.source_correlation for candidate in candidates}
+        current_sources = set(correlations)
         bindings: list[CanvasSourceIdentityBinding] = []
         for binding in previous:
             active = binding.source_correlation in current_sources
@@ -1157,8 +2007,7 @@ class FilesystemCanvasPreparationUnitOfWork:
             )
             if active:
                 assigned[binding.source_correlation] = binding.canvas_id
-        for candidate in candidates:
-            correlation = candidate.source_correlation
+        for correlation in correlations:
             if correlation in assigned:
                 continue
             if correlation in by_source:
@@ -1208,8 +2057,9 @@ class FilesystemCanvasPreparationUnitOfWork:
 
     def _canvas_record(
         self,
-        candidate: FilesystemCanvasCandidate,
+        observation: FilesystemCanvasObservation,
         *,
+        correlation: bytes,
         canvas_id: str,
         order: int,
         representation: CanvasPreparationRepresentationSnapshot,
@@ -1223,11 +2073,11 @@ class FilesystemCanvasPreparationUnitOfWork:
                 ),
                 revision="candidate-v1",
                 order=order,
-                label=candidate.label,
-                extent=candidate.extent,
-                available=candidate.available,
-                resource_kinds=candidate.resource_kinds,
-                metadata=candidate.metadata,
+                label=observation.label,
+                extent=observation.extent,
+                available=observation.available,
+                resource_kinds=observation.resource_kinds,
+                metadata=observation.metadata,
             )
             public = provisional.as_dict()
         except (TypeError, ValueError, ValidationError) as exc:
@@ -1249,9 +2099,9 @@ class FilesystemCanvasPreparationUnitOfWork:
         revision = _producer_revision(
             representation_revision=representation.revision,
             canvas_id=canvas_id,
-            correlation=candidate.source_correlation,
-            source_position=candidate.source_position,
-            source_path=candidate.source_path,
+            correlation=correlation,
+            source_position=observation.source_position,
+            source_path=observation.source_path,
             public=public_state,
         )
         return {
@@ -1259,8 +2109,8 @@ class FilesystemCanvasPreparationUnitOfWork:
             "revision": revision,
             **public_state,
             "source": {
-                "position": candidate.source_position,
-                "path": candidate.source_path,
+                "position": observation.source_position,
+                "path": observation.source_path,
             },
         }
 
@@ -1328,7 +2178,75 @@ class FilesystemCanvasPreparationUnitOfWork:
             "sequences": sequences,
         }
 
-    def _artifact_paths(self, item_id: str) -> tuple[Path, Path, Path]:
+    def _updated_materialization(
+        self,
+        inspection: FilesystemCanvasInspection,
+        sources: tuple[_MaterializedSource, ...],
+        *,
+        generation: int,
+        representation: CanvasPreparationRepresentationSnapshot,
+    ) -> dict[str, Any]:
+        assert self._base_materialization is not None
+        sequences = [
+            value
+            for value in self._base_materialization["sequences"]
+            if value["representation_id"] != representation.representation_id
+        ]
+        serialized_sources = []
+        for source in sources:
+            _evidence, evidence = self._evidence(
+                source.evidence,
+                item_id=representation.item_id,
+                representation_id=representation.representation_id,
+                code="invalid_canvas_inspection_result",
+            )
+            serialized_sources.append(
+                {
+                    "source_correlation": source.source_correlation.hex(),
+                    "active": source.active,
+                    "born_generation": source.born_generation,
+                    "last_active_generation": source.last_active_generation,
+                    "last_retired_generation": source.last_retired_generation,
+                    "last_locator": {
+                        "position": source.position,
+                        "path": source.path,
+                    },
+                    "disposition": source.disposition,
+                    "evidence": evidence,
+                }
+            )
+        serialized_sources.sort(key=lambda value: value["source_correlation"])
+        sequences.append(
+            {
+                "representation_id": representation.representation_id,
+                "representation_revision": representation.revision,
+                "media_type": inspection.media_type,
+                "generation": generation,
+                "asset": {
+                    "sha256": inspection.asset_sha256,
+                    "size": inspection.asset_size,
+                    "source_count": len(inspection.observations),
+                },
+                "sources": serialized_sources,
+            }
+        )
+        sequences.sort(
+            key=lambda value: (
+                value["representation_id"].casefold(),
+                value["representation_id"],
+            )
+        )
+        return {
+            "schema": CANVAS_SOURCE_MATERIALIZATION_SCHEMA,
+            "version": CANVAS_SOURCE_MATERIALIZATION_VERSION,
+            "item_id": representation.item_id,
+            "sequences": sequences,
+        }
+
+    def _artifact_paths(
+        self,
+        item_id: str,
+    ) -> tuple[Path, Path, Path, Path]:
         # The query adapter owns the canonical v1 index path grammar.
         entry_directory, index_path = self._query_repository._index_path(item_id)
         ledger_path = entry_directory.joinpath(*CANVAS_IDENTITY_LEDGER_RELATIVE.parts)
@@ -1344,7 +2262,25 @@ class FilesystemCanvasPreparationUnitOfWork:
                 code="unsafe_canvas_identity_ledger_path",
                 item_id=item_id,
             )
-        return entry_directory, index_path, ledger_path
+        materialization_path = entry_directory.joinpath(
+            *CANVAS_SOURCE_MATERIALIZATION_RELATIVE.parts
+        )
+        self._query_repository._assert_safe_components(
+            materialization_path,
+            item_id=item_id,
+            message="the canvas source materialization path is unsafe",
+            code="unsafe_canvas_source_materialization_path",
+        )
+        if (
+            materialization_path.parent.exists()
+            and not materialization_path.parent.is_dir()
+        ):
+            raise _repository_error(
+                "the canvas source materialization parent is not a directory",
+                code="unsafe_canvas_source_materialization_path",
+                item_id=item_id,
+            )
+        return entry_directory, index_path, ledger_path, materialization_path
 
     def _receipt_path(self, operation_id: str) -> Path:
         relative = self._receipt_relative(operation_id)
@@ -1533,6 +2469,15 @@ class FilesystemCanvasPreparationUnitOfWork:
             "sequences": [],
         }
 
+    @staticmethod
+    def _empty_materialization(item_id: str) -> dict[str, Any]:
+        return {
+            "schema": CANVAS_SOURCE_MATERIALIZATION_SCHEMA,
+            "version": CANVAS_SOURCE_MATERIALIZATION_VERSION,
+            "item_id": item_id,
+            "sequences": [],
+        }
+
     def _ensure_after_receipt(self) -> None:
         self._ensure_open()
         if not self._receipt_checked:
@@ -1555,6 +2500,11 @@ __all__ = [
     "CANVAS_IDENTITY_LEDGER_VERSION",
     "CANVAS_PREPARATION_RECEIPT_SCHEMA",
     "CANVAS_PREPARATION_RECEIPT_VERSION",
-    "FilesystemCanvasCandidate",
+    "CANVAS_SOURCE_MATERIALIZATION_RELATIVE",
+    "CANVAS_SOURCE_MATERIALIZATION_SCHEMA",
+    "CANVAS_SOURCE_MATERIALIZATION_VERSION",
+    "FilesystemCanvasEvidence",
+    "FilesystemCanvasInspection",
+    "FilesystemCanvasObservation",
     "FilesystemCanvasPreparationRepository",
 ]

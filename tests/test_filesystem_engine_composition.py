@@ -15,7 +15,9 @@ import pytest
 
 from librarytool.adapters.filesystem import (
     EMPTY_MANAGED_TREE_REVISION,
-    FilesystemCanvasCandidate,
+    FilesystemCanvasEvidence,
+    FilesystemCanvasInspection,
+    FilesystemCanvasObservation,
     RecoverableWriteSet,
     RecoveryRequiredError,
 )
@@ -170,8 +172,6 @@ def _advance_restored_record(item_id, raw):
 
 
 def _canvas_bindings() -> CanvasBindings:
-    correlation = hashlib.sha256(b"book-one:scan:leaf-1").digest()
-
     def item_snapshot_for(item_id):
         if item_id != "book-one":
             return None
@@ -187,15 +187,26 @@ def _canvas_bindings() -> CanvasBindings:
         )
 
     def inspect_media(_representation, _entry_directory):
-        return (
-            FilesystemCanvasCandidate(
-                source_correlation=correlation,
-                source_position=0,
-                source_path="sources/scan.pdf",
-                label="Page 1",
-                extent=CanvasExtent(1200, 1800, "px"),
-                resource_kinds=("image",),
-                metadata={"leaf": 1},
+        return FilesystemCanvasInspection(
+            media_type="application/pdf",
+            asset_sha256=hashlib.sha256(b"scan-asset").hexdigest(),
+            asset_size=1024,
+            observations=(
+                FilesystemCanvasObservation(
+                    source_position=0,
+                    source_path="sources/scan.pdf",
+                    evidence=FilesystemCanvasEvidence(
+                        profile="test-pdf-v1",
+                        width_mpt=1_200_000,
+                        height_mpt=1_800_000,
+                        rotation=0,
+                        strong_sha256=hashlib.sha256(b"page-1").hexdigest(),
+                    ),
+                    label="Page 1",
+                    extent=CanvasExtent(1200, 1800, "px"),
+                    resource_kinds=("image",),
+                    metadata={"leaf": 1},
+                ),
             ),
         )
 

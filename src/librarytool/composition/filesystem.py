@@ -22,7 +22,7 @@ from ._filesystem_paths import (
 )
 
 from ..adapters.filesystem import (
-    FilesystemCanvasCandidate,
+    FilesystemCanvasInspection,
     FilesystemCanvasPreparationRepository,
     FilesystemCanvasQueryRepository,
     FilesystemInterchangeRepository,
@@ -135,7 +135,7 @@ CanvasRepresentationSnapshotLoader = Callable[
 ]
 CanvasMediaInspector = Callable[
     [CanvasPreparationRepresentationSnapshot, Path],
-    Sequence[FilesystemCanvasCandidate],
+    FilesystemCanvasInspection,
 ]
 CanvasIdAllocator = Callable[[frozenset[str]], str]
 _ENTRY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
