@@ -512,7 +512,8 @@
         `/v1/items/${encodePart(id)}/translations/${encodePart(translationId)}` +
         `/pages/${encodePart(selector)}`, {
           headers: {
-            "If-Match": quoteRevision(documentRevision, "documentRevision"),
+            "If-Document-Match": quoteRevision(
+              documentRevision, "documentRevision"),
             "If-Source-Match": quoteRevision(sourceRevision, "sourceRevision"),
           },
           body: {

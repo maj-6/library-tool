@@ -4252,12 +4252,12 @@ def _translation_revision_token(payload: dict, header: str, field: str) -> str:
 
 def _translation_preconditions(payload: dict) -> tuple[str, str]:
     document_revision = _translation_revision_token(
-        payload, "If-Match", "expected_document_revision")
+        payload, "If-Document-Match", "expected_document_revision")
     source_revision = _translation_revision_token(
         payload, "If-Source-Match", "expected_source_revision")
     missing = []
     if not document_revision:
-        missing.append({"header": "If-Match",
+        missing.append({"header": "If-Document-Match",
                         "field": "expected_document_revision"})
     if not source_revision:
         missing.append({"header": "If-Source-Match",

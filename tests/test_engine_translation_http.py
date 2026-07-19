@@ -116,12 +116,13 @@ def test_translation_page_put_requires_both_revisions_and_writes_atomically(
     assert missing.status_code == 428
     assert missing.get_json()["code"] == "translation_preconditions_required"
     assert missing.get_json()["details"]["required"] == [
-        {"field": "expected_document_revision", "header": "If-Match"},
+        {"field": "expected_document_revision",
+         "header": "If-Document-Match"},
         {"field": "expected_source_revision", "header": "If-Source-Match"},
     ]
 
     saved = client.put(url, json={"text": "Nueva."}, headers={
-        "If-Match": f'"{current["document_revision"]}"',
+        "If-Document-Match": f'"{current["document_revision"]}"',
         "If-Source-Match": f'"{current["source"]["revision"]}"',
     })
     assert saved.status_code == 200
@@ -141,7 +142,7 @@ def test_translation_page_put_requires_both_revisions_and_writes_atomically(
     assert producer["source_revision"] == updated["source"]["revision"]
 
     conflict = client.put(url, json={"text": "Otra."}, headers={
-        "If-Match": f'"{current["document_revision"]}"',
+        "If-Document-Match": f'"{current["document_revision"]}"',
         "If-Source-Match": f'"{current["source"]["revision"]}"',
     })
     assert conflict.status_code == 409
@@ -167,7 +168,7 @@ def test_translation_page_put_detects_authoritative_source_race(
         f'/api/v1/items/book-one/translations/{summary["id"]}/pages/page:1',
         json={"text": "Nueva."},
         headers={
-            "If-Match": f'"{detail["document_revision"]}"',
+            "If-Document-Match": f'"{detail["document_revision"]}"',
             "If-Source-Match": f'"{detail["source"]["revision"]}"',
         },
     )
@@ -276,16 +277,17 @@ def test_translation_preconditions_reject_weak_or_malformed_headers(
     document = detail["document_revision"]
 
     weak = client.put(url, json={"text": "Nueva."}, headers={
-        "If-Match": f'W/"{document}"',
+        "If-Document-Match": f'W/"{document}"',
         "If-Source-Match": f'"{source}"',
     })
     malformed = client.put(url, json={"text": "Nueva."}, headers={
-        "If-Match": document,
+        "If-Document-Match": document,
         "If-Source-Match": f'"{source}"',
     })
     assert weak.status_code == malformed.status_code == 400
     assert weak.get_json()["code"] == "invalid_translation_page_update"
-    assert malformed.get_json()["details"]["header"] == "If-Match"
+    assert malformed.get_json()["details"]["header"] == (
+        "If-Document-Match")
 
     body_fallback = client.put(url, json={
         "text": "Nueva.",

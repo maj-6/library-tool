@@ -266,7 +266,8 @@ test("translations use versioned aggregate reads and dual-CAS page writes", asyn
     "/api/v1/items/book%20%2F%20one/translations/translation%20%2F%20one" +
     "/pages/page%3A7");
   assert.equal(calls[2].init.method, "PUT");
-  assert.equal(calls[2].init.headers["If-Match"], '"tr-current"');
+  assert.equal(
+    calls[2].init.headers["If-Document-Match"], '"tr-current"');
   assert.equal(calls[2].init.headers["If-Source-Match"], '"ts-current"');
   assert.deepEqual(JSON.parse(calls[2].init.body), {
     text: "Nueva.",
