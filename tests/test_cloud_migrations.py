@@ -31,6 +31,7 @@ TRIGGER_GRANTS = SQL["008_profile_secrets_trigger_grants"]
 TRIGGER_GRANTS_FLAT = " ".join(TRIGGER_GRANTS.split())
 COLLECTIONS_MIG = SQL["009_collections"]
 COLLECTIONS_FLAT = " ".join(COLLECTIONS_MIG.split())
+COLLECTIONS_IDENTITY = SQL["010_collections_authenticated_identity"]
 
 
 # --- the migration files themselves ----------------------------------------------
@@ -272,6 +273,20 @@ def test_collections_rls_is_shared_but_creator_attribution_is_not_forgeable():
     assert not re.search(
         r"create policy collections_\w+ on collections for delete", flat,
     )
+
+
+def test_collection_updates_require_a_signed_in_identity_but_stay_shared():
+    body = re.sub(r"--[^\n]*", "", COLLECTIONS_IDENTITY)
+    flat = " ".join(body.split())
+
+    assert ("drop policy if exists collections_update_authed on "
+            "public.collections;" in flat)
+    assert ("create policy collections_update_authed on public.collections "
+            "for update to authenticated using ((select auth.uid()) is not "
+            "null) with check ((select auth.uid()) is not null);" in flat)
+    assert "using (true)" not in flat
+    assert "with check (true)" not in flat
+    assert "created_by" not in flat
 
 
 def test_collection_merge_rpc_is_atomic_narrow_and_exactly_idempotent():

@@ -1,8 +1,8 @@
 # Collections on the desktop: two-way sync
 
-Status: **implemented in this worktree on 2026-07-19.** Migration 009 is
-committed as source but still needs to be applied to, and checked against, the
-target Supabase project.
+Status: **implemented and deployed on 2026-07-19.** Migrations 009 and 010 are
+applied to the `library-tool-store` Supabase project and verified against the
+live catalogue, grants, policies, function ACL, and both migration ledgers.
 
 ## Implementation outcome
 
@@ -31,6 +31,34 @@ adds `merged_into` and performs merges through `merge_collections(...)`, which
 locks both rows, validates their revisions, and atomically writes an
 authoritative loser-to-survivor marker. Both clients consume that marker and
 never treat an arbitrary deleted row as a merge.
+
+## Deployment verification
+
+The live rollout was database-first so neither client can encounter a missing
+`collections` table. Verification after applying migrations 009 and 010
+confirmed:
+
+- RLS is enabled, with authenticated select/insert/update policies and no anon
+  table access;
+- authenticated writes are column-scoped, so `id`, `created_by`, and
+  `merged_into` cannot be rewritten through ordinary table updates;
+- update access requires a non-null signed-in identity while remaining shared
+  across contributors;
+- all checks, foreign keys, and covering indexes are present;
+- `merge_collections(...)` has a pinned empty `search_path`, rejects callers
+  without an authenticated JWT role, and is executable only by
+  `authenticated` and `service_role` (not `anon` or `PUBLIC`);
+- the merge RPC completed an authenticated, rollback-only missing-row smoke
+  test; and
+- both `009_collections` and `010_collections_authenticated_identity` appear in
+  the project ledger as well as the Supabase migration history.
+
+The Supabase advisor intentionally reports the authenticated
+`SECURITY DEFINER` merge RPC: signed-in callers must be able to invoke that
+narrow transactional operation, while its pinned search path, JWT check,
+revision checks, deterministic row locks, and restricted ACL bound its
+authority. Newly created collection indexes are also reported as unused while
+the table is empty. Other advisor notices predate this feature.
 
 Book Capture 0.5.1-alpha.6 shipped phone-local collections (see
 `android/BookCapture/README.md` → "Collections and provenance"). This document
