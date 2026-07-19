@@ -61,12 +61,18 @@ class TextLayerWorkbenchPolicy:
 
     def contribute(self, context: WorkbenchContext) -> WorkbenchContribution:
         readiness = context.artifact_readiness(TEXT_KINDS)
-        commands = ("ocr.run",) if _visual_source_available(context) else ()
         return WorkbenchContribution(
             readiness={"text": readiness},
             issues=_artifact_issues("text", readiness, missing=True),
-            available_commands=commands,
         )
+
+
+class OcrWorkbenchPolicy:
+    policy_id = "ocr"
+
+    def contribute(self, context: WorkbenchContext) -> WorkbenchContribution:
+        commands = ("ocr.run",) if _visual_source_available(context) else ()
+        return WorkbenchContribution(available_commands=commands)
 
 
 class TranslationWorkbenchPolicy:
@@ -74,15 +80,23 @@ class TranslationWorkbenchPolicy:
 
     def contribute(self, context: WorkbenchContext) -> WorkbenchContribution:
         readiness = context.artifact_readiness(TRANSLATION_KINDS)
-        text = context.artifact_readiness(TEXT_KINDS)
-        commands = (
-            ("translation.generate",) if text not in {"missing", "unavailable"} else ()
-        )
         return WorkbenchContribution(
             readiness={"translation": readiness},
             issues=_artifact_issues("translation", readiness, missing=False),
-            available_commands=commands,
         )
+
+
+class TranslationGenerationWorkbenchPolicy:
+    policy_id = "translation-generation"
+
+    def contribute(self, context: WorkbenchContext) -> WorkbenchContribution:
+        text = context.artifact_readiness(TEXT_KINDS)
+        commands = (
+            ("translation.generate",)
+            if text not in {"missing", "unavailable"}
+            else ()
+        )
+        return WorkbenchContribution(available_commands=commands)
 
 
 class ResearchWorkbenchPolicy:
@@ -122,11 +136,18 @@ class PublishingWorkbenchPolicy:
 
 
 def standard_workbench_policies() -> tuple[WorkbenchPolicyPort, ...]:
-    """Policies for the bundled installation, composed outside item core."""
+    """Legacy all-feature policy set for tests and compatibility hosts.
+
+    Production composition binds each policy to its owning module and
+    capability. New hosts should do the same instead of assuming this full
+    feature set is installed.
+    """
 
     return (
         TextLayerWorkbenchPolicy(),
+        OcrWorkbenchPolicy(),
         TranslationWorkbenchPolicy(),
+        TranslationGenerationWorkbenchPolicy(),
         ResearchWorkbenchPolicy(),
         ReplicaWorkbenchPolicy(),
         PublishingWorkbenchPolicy(),
@@ -134,10 +155,12 @@ def standard_workbench_policies() -> tuple[WorkbenchPolicyPort, ...]:
 
 
 __all__ = [
+    "OcrWorkbenchPolicy",
     "PublishingWorkbenchPolicy",
     "ReplicaWorkbenchPolicy",
     "ResearchWorkbenchPolicy",
     "TextLayerWorkbenchPolicy",
     "TranslationWorkbenchPolicy",
+    "TranslationGenerationWorkbenchPolicy",
     "standard_workbench_policies",
 ]

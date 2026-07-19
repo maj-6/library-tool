@@ -93,6 +93,7 @@ from .runtime import (
     ServiceNotFoundError,
     ServiceRegistry,
     ServiceRegistryError,
+    WorkbenchPolicyBinding,
 )
 from .text_layers import TextLayerService
 from .translation_contracts import (
@@ -211,6 +212,7 @@ __all__ = [
     "WorkbenchContext",
     "WorkbenchContribution",
     "WorkbenchPolicyPort",
+    "WorkbenchPolicyBinding",
     "WorkbenchManifest",
     "CreateItemCommand",
     "DeleteItemCommand",

@@ -7,6 +7,7 @@ import re
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -197,6 +198,42 @@ def test_filesystem_unit_of_work_is_explicit_and_supports_multiple_commits(tmp_p
     snapshot = repository.snapshot("book")
     snapshot["outside"] = True
     assert "outside" not in repository.snapshot("book")
+
+
+def test_filesystem_repository_holds_workspace_lease_before_item_lock(tmp_path):
+    events = []
+
+    @contextmanager
+    def workspace(item_id):
+        events.append(("workspace-enter", item_id))
+        try:
+            yield
+        finally:
+            events.append(("workspace-exit", item_id))
+
+    @contextmanager
+    def item_lock(item_id):
+        events.append(("item-enter", item_id))
+        try:
+            yield
+        finally:
+            events.append(("item-exit", item_id))
+
+    repository = FilesystemReplicaRepository(
+        lambda item_id: tmp_path / item_id / "layout.json",
+        workspace_context_for=workspace,
+        lock_context_for=item_lock,
+    )
+    with repository.unit_of_work("book") as unit:
+        unit.workspace["saved"] = True
+        unit.commit()
+
+    assert events == [
+        ("workspace-enter", "book"),
+        ("item-enter", "book"),
+        ("item-exit", "book"),
+        ("workspace-exit", "book"),
+    ]
 
 
 def test_conditional_replace_enforces_page_and_cross_page_identity(tmp_path):

@@ -394,6 +394,25 @@ class ItemQueryService:
         if duplicate:
             raise TypeError(f"duplicate workbench policy ids: {', '.join(duplicate)}")
 
+    @property
+    def policies(self) -> tuple[WorkbenchPolicyPort, ...]:
+        """Return the immutable policy set selected by engine composition."""
+
+        return self._policies
+
+    def with_policies(
+        self,
+        policies: Iterable[WorkbenchPolicyPort],
+    ) -> ItemQueryService:
+        """Clone this query service over the same repository and new policies.
+
+        Module resolution happens after concrete services have been offered to
+        the runtime builder.  Cloning lets the builder attach policies owned by
+        active modules without mutating the seed service or its repository.
+        """
+
+        return ItemQueryService(self._repository, policies=policies)
+
     def list_items(self) -> tuple[ItemView, ...]:
         records = self._records(self._repository.list_records(), "items")
         views = [self._view(record) for record in records]

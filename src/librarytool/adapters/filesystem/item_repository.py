@@ -18,6 +18,7 @@ from ...engine.errors import RepositoryError
 JsonMapping = Mapping[str, Any]
 ItemsLoader = Callable[[], Mapping[str, JsonMapping] | Sequence[JsonMapping]]
 SummaryLoader = Callable[[str, JsonMapping], Sequence[JsonMapping]]
+ItemIdValidator = Callable[[str], Any]
 
 
 class FilesystemItemQueryRepository:
@@ -40,6 +41,7 @@ class FilesystemItemQueryRepository:
         *,
         load_representations: SummaryLoader | None = None,
         load_artifacts: SummaryLoader | None = None,
+        validate_item_id: ItemIdValidator | None = None,
     ) -> None:
         if not callable(load_items):
             raise TypeError("load_items must be callable")
@@ -47,15 +49,18 @@ class FilesystemItemQueryRepository:
             raise TypeError("load_representations must be callable")
         if load_artifacts is not None and not callable(load_artifacts):
             raise TypeError("load_artifacts must be callable")
+        if validate_item_id is not None and not callable(validate_item_id):
+            raise TypeError("validate_item_id must be callable")
         self._load_items = load_items
         self._load_representations = load_representations
         self._load_artifacts = load_artifacts
+        self._validate_item_id_callback = validate_item_id
 
     def list_records(self) -> tuple[dict[str, Any], ...]:
         return tuple(record for _item_id, record in self._snapshot_rows())
 
     def get_record(self, item_id: str) -> dict[str, Any] | None:
-        value = str(item_id or "").strip()
+        value = self._validated_item_id(str(item_id or "").strip())
         for candidate, record in self._snapshot_rows():
             if candidate == value:
                 return record
@@ -139,10 +144,20 @@ class FilesystemItemQueryRepository:
                         code="invalid_item_repository_snapshot",
                     )
                 record = self._detached_record(value, item_id=str(key))
-                key_id = str(key).strip()
-                embedded_id = str(
-                    record.get("item_id") or record.get("id") or ""
-                ).strip()
+                key_id = self._stored_item_id(key)
+                embedded_raw: Any = ""
+                for field_name in ("item_id", "id"):
+                    if (
+                        field_name in record
+                        and record[field_name] not in (None, "")
+                    ):
+                        embedded_raw = record[field_name]
+                        break
+                embedded_id = (
+                    self._stored_item_id(embedded_raw)
+                    if embedded_raw not in (None, "")
+                    else ""
+                )
                 if embedded_id and embedded_id != key_id:
                     raise RepositoryError(
                         "an item record conflicts with its repository key",
@@ -153,6 +168,7 @@ class FilesystemItemQueryRepository:
                         },
                     )
                 item_id = embedded_id or key_id
+                self._validated_item_id(item_id)
                 if not embedded_id:
                     record["id"] = item_id
                 rows.append((item_id, record))
@@ -169,9 +185,42 @@ class FilesystemItemQueryRepository:
                     code="invalid_item_repository_snapshot",
                 )
             record = self._detached_record(value)
-            item_id = str(record.get("item_id") or record.get("id") or "").strip()
+            embedded_raw: Any = ""
+            for field_name in ("item_id", "id"):
+                if (
+                    field_name in record
+                    and record[field_name] not in (None, "")
+                ):
+                    embedded_raw = record[field_name]
+                    break
+            item_id = self._stored_item_id(embedded_raw)
             rows.append((item_id, record))
         return tuple(rows)
+
+    def _stored_item_id(self, value: Any) -> str:
+        if self._validate_item_id_callback is None:
+            return str(value or "").strip()
+        return self._validated_item_id(value)
+
+    def _validated_item_id(self, item_id: Any) -> str:
+        if self._validate_item_id_callback is None:
+            return str(item_id or "").strip()
+        try:
+            self._validate_item_id_callback(item_id)
+        except RepositoryError:
+            raise
+        except Exception as exc:
+            raise RepositoryError(
+                "the item repository returned an unsupported identity",
+                code="invalid_item_repository_identity",
+                details={"cause_type": type(exc).__name__},
+            ) from exc
+        if not isinstance(item_id, str):
+            raise RepositoryError(
+                "the item repository returned a non-string identity",
+                code="invalid_item_repository_identity",
+            )
+        return item_id
 
     @staticmethod
     def _detached_record(

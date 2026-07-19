@@ -17,7 +17,7 @@ from .capabilities import (
 )
 from .interchange import LibInterchangeService
 from .item_commands import ItemCommandService
-from .items import ItemQueryService
+from .items import ItemQueryService, WorkbenchPolicyPort
 from .jobs import JobManager
 from .replica import ReplicaApplicationService
 from .text_layers import TextLayerService
@@ -276,6 +276,65 @@ def _materialize_workbenches(
     return tuple(sorted(result, key=lambda value: value.id))
 
 
+class WorkbenchPolicyBinding:
+    """Gate one item workbench policy on declared module capabilities."""
+
+    __slots__ = ("_policy", "_requires")
+
+    def __init__(
+        self,
+        policy: WorkbenchPolicyPort,
+        requires: Iterable[CapabilityRef],
+    ) -> None:
+        policy_id = str(getattr(policy, "policy_id", "") or "").strip()
+        if (
+            not re.fullmatch(r"[a-z][a-z0-9._-]{0,63}", policy_id)
+            or not callable(getattr(policy, "contribute", None))
+        ):
+            raise ServiceRegistryError(
+                "a workbench policy binding needs a valid policy"
+            )
+        requirements = _capability_tuple(
+            requires,
+            field_name=f"requirements for workbench policy {policy_id}",
+        )
+        object.__setattr__(self, "_policy", policy)
+        object.__setattr__(self, "_requires", requirements)
+
+    @property
+    def policy(self) -> WorkbenchPolicyPort:
+        return self._policy
+
+    @property
+    def requires(self) -> tuple[CapabilityRef, ...]:
+        return self._requires
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("WorkbenchPolicyBinding is immutable")
+
+
+def _materialize_policy_bindings(
+    values: Iterable[WorkbenchPolicyBinding],
+) -> tuple[WorkbenchPolicyBinding, ...]:
+    if isinstance(values, (str, bytes)):
+        raise ServiceRegistryError(
+            "item policies must contain WorkbenchPolicyBinding values"
+        )
+    try:
+        result = tuple(values)
+    except TypeError as exc:
+        raise ServiceRegistryError(
+            "item policies must be an iterable of WorkbenchPolicyBinding values"
+        ) from exc
+    if any(not isinstance(value, WorkbenchPolicyBinding) for value in result):
+        raise ServiceRegistryError(
+            "item policies must contain only WorkbenchPolicyBinding values"
+        )
+    return tuple(
+        sorted(result, key=lambda value: str(value.policy.policy_id))
+    )
+
+
 def _capability_tokens(values: Iterable[CapabilityRef]) -> str:
     return ", ".join(f"{value.id}@{value.version}" for value in sorted(values))
 
@@ -293,12 +352,16 @@ class ModuleContribution:
     manifest: ModuleManifest
     bindings: tuple[ServiceBinding[object], ...] = field(default_factory=tuple)
     workbenches: tuple[WorkbenchManifest, ...] = field(default_factory=tuple)
+    item_policies: tuple[WorkbenchPolicyBinding, ...] = field(
+        default_factory=tuple
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.manifest, ModuleManifest):
             raise ServiceRegistryError("manifest must be a ModuleManifest")
         bindings = _materialize_bindings(self.bindings)
         workbenches = _materialize_workbenches(self.workbenches)
+        item_policies = _materialize_policy_bindings(self.item_policies)
         keys = [binding.key for binding in bindings]
         if len(set(keys)) != len(keys):
             raise DuplicateServiceError(
@@ -309,6 +372,25 @@ class ModuleContribution:
             raise DuplicateManifestError(
                 f"module {self.manifest.id} contains a duplicate workbench id"
             )
+        policy_ids = [str(value.policy.policy_id) for value in item_policies]
+        if len(set(policy_ids)) != len(policy_ids):
+            raise ServiceRegistryError(
+                f"module {self.manifest.id} contains a duplicate item policy"
+            )
+
+        declared_dependencies = set(self.manifest.provides)
+        declared_dependencies.update(self.manifest.requires)
+        declared_dependencies.update(self.manifest.enhances)
+        for policy_binding in item_policies:
+            undeclared_requirements = (
+                set(policy_binding.requires) - declared_dependencies
+            )
+            if undeclared_requirements:
+                raise ServiceRegistryError(
+                    f"module {self.manifest.id} has an item policy with "
+                    "undeclared capability requirements: "
+                    f"{_capability_tokens(undeclared_requirements)}"
+                )
 
         declared = set(self.manifest.provides)
         implemented = {
@@ -330,6 +412,7 @@ class ModuleContribution:
             )
         object.__setattr__(self, "bindings", bindings)
         object.__setattr__(self, "workbenches", workbenches)
+        object.__setattr__(self, "item_policies", item_policies)
 
 
 ITEM_QUERY_SERVICE: ServiceKey[ItemQueryService] = ServiceKey(
@@ -472,12 +555,49 @@ class LibraryEngineBuilder:
         ).seal()
         resolution = capabilities.resolve()
         active = set(resolution.active_module_ids)
-        services = ServiceRegistry(
+        active_capabilities = set(resolution.capabilities)
+        item_policies = tuple(
+            policy_binding.policy
+            for contribution in contributions
+            if contribution.manifest.id in active
+            for policy_binding in contribution.item_policies
+            if set(policy_binding.requires) <= active_capabilities
+        )
+        active_bindings = [
             binding
             for contribution in contributions
             if contribution.manifest.id in active
             for binding in contribution.bindings
+        ]
+        item_binding = next(
+            (
+                binding
+                for binding in active_bindings
+                if binding.key == ITEM_QUERY_SERVICE
+            ),
+            None,
         )
+        if item_policies and item_binding is None:
+            raise ServiceRegistryError(
+                "active item policies require the item query service"
+            )
+        if item_binding is not None and item_policies:
+            if not isinstance(item_binding.service, ItemQueryService):
+                raise ServiceRegistryError(
+                    "item policies require an ItemQueryService binding"
+                )
+            configured_items = item_binding.service.with_policies(item_policies)
+            active_bindings = [
+                ServiceBinding(
+                    binding.key,
+                    configured_items,
+                    binding.capabilities,
+                )
+                if binding is item_binding
+                else binding
+                for binding in active_bindings
+            ]
+        services = ServiceRegistry(active_bindings)
         return LibraryEngine(capabilities=capabilities, services=services)
 
 
@@ -499,4 +619,5 @@ __all__ = [
     "TEXT_LAYER_SERVICE",
     "TRANSLATION_PROVENANCE_SERVICE",
     "TRANSLATION_SERVICE",
+    "WorkbenchPolicyBinding",
 ]

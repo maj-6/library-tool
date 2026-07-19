@@ -13,6 +13,7 @@ from librarytool.engine import (
     DuplicateServiceError,
     LibraryEngine,
     LibraryEngineBuilder,
+    ItemQueryService,
     ModuleContribution,
     ModuleManifest,
     SealedRegistryError,
@@ -22,6 +23,7 @@ from librarytool.engine import (
     ServiceRegistry,
     ServiceRegistryError,
     WorkbenchManifest,
+    WorkbenchPolicyBinding,
 )
 
 
@@ -38,6 +40,7 @@ def _contribution(
     requires: tuple[CapabilityRef, ...] = (),
     enhances: tuple[CapabilityRef, ...] = (),
     workbenches: tuple[WorkbenchManifest, ...] = (),
+    item_policies: tuple[WorkbenchPolicyBinding, ...] = (),
 ) -> ModuleContribution:
     return ModuleContribution(
         ModuleManifest(
@@ -49,6 +52,7 @@ def _contribution(
         ),
         bindings=bindings,
         workbenches=workbenches,
+        item_policies=item_policies,
     )
 
 
@@ -215,6 +219,107 @@ def test_missing_enhancement_degrades_without_withholding_service():
     assert engine.services.require(translation_key) is service
     assert row["status"] == "degraded"
     assert row["missing_optional"] == [GENERATION.as_dict()]
+
+
+def test_item_policies_follow_active_declared_capabilities():
+    class Policy:
+        policy_id = "translation-status"
+
+        def contribute(self, _context):
+            raise AssertionError("not evaluated while composing")
+
+    seed_items = ItemQueryService(object())
+    item_module = _contribution(
+        "library.core",
+        provides=(ITEMS,),
+        bindings=(_binding(ITEM_QUERY_SERVICE, seed_items, ITEMS),),
+    )
+    policy = Policy()
+    translation_module = _contribution(
+        "translation.core",
+        provides=(TRANSLATIONS,),
+        requires=(ITEMS,),
+        enhances=(GENERATION,),
+        bindings=(
+            _binding(
+                ServiceKey("translation.reader"),
+                object(),
+                TRANSLATIONS,
+            ),
+        ),
+        item_policies=(
+            WorkbenchPolicyBinding(policy, (TRANSLATIONS,)),
+        ),
+    )
+
+    engine = LibraryEngineBuilder(
+        (translation_module, item_module)
+    ).build()
+
+    assert engine.items is not seed_items
+    assert engine.items is not None
+    assert engine.items.policies == (policy,)
+    assert GENERATION not in engine.capabilities.resolve().capabilities
+
+
+def test_blocked_or_unmet_item_policies_are_withheld():
+    class Policy:
+        policy_id = "optional-generation"
+
+        def contribute(self, _context):
+            raise AssertionError("not evaluated while composing")
+
+    seed_items = ItemQueryService(object())
+    item_module = _contribution(
+        "library.core",
+        provides=(ITEMS,),
+        bindings=(_binding(ITEM_QUERY_SERVICE, seed_items, ITEMS),),
+    )
+    provider = _contribution(
+        "translation.core",
+        provides=(TRANSLATIONS,),
+        requires=(ITEMS,),
+        enhances=(GENERATION,),
+        bindings=(
+            _binding(
+                ServiceKey("translation.reader"),
+                object(),
+                TRANSLATIONS,
+            ),
+        ),
+        item_policies=(
+            WorkbenchPolicyBinding(Policy(), (GENERATION,)),
+        ),
+    )
+
+    engine = LibraryEngineBuilder((provider, item_module)).build()
+
+    assert engine.items is seed_items
+    assert engine.items.policies == ()
+
+
+def test_item_policy_requirements_must_be_declared_by_the_owner():
+    class Policy:
+        policy_id = "hidden-dependency"
+
+        def contribute(self, _context):
+            raise AssertionError("not evaluated while composing")
+
+    with pytest.raises(ServiceRegistryError, match="undeclared capability"):
+        _contribution(
+            "translation.core",
+            provides=(TRANSLATIONS,),
+            bindings=(
+                _binding(
+                    ServiceKey("translation.reader"),
+                    object(),
+                    TRANSLATIONS,
+                ),
+            ),
+            item_policies=(
+                WorkbenchPolicyBinding(Policy(), (GENERATION,)),
+            ),
+        )
 
 
 def test_duplicate_keys_fail_but_alternative_capability_providers_coexist():

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,7 +16,17 @@ from librarytool.engine.capabilities import (
     ModuleManifest,
     WorkbenchManifest,
 )
-from librarytool.engine.runtime import LibraryEngine
+from librarytool.engine.runtime import (
+    INTERCHANGE_SERVICE,
+    ITEM_COMMAND_SERVICE,
+    ITEM_QUERY_SERVICE,
+    JOB_SERVICE,
+    REPLICA_SERVICE,
+    TEXT_LAYER_SERVICE,
+    TRANSLATION_PROVENANCE_SERVICE,
+    TRANSLATION_SERVICE,
+    LibraryEngine,
+)
 
 
 ITEMS = CapabilityRef("items.read", 1)
@@ -232,6 +243,50 @@ def test_http_discovery_exposes_resolved_installed_workbenches(client):
     assert ("replica.regions", 1) in capabilities
     assert ("replica.interchange", 2) in capabilities
     assert ("library.jobs", 1) in capabilities
+
+
+def test_production_services_and_capabilities_are_one_sealed_graph(client):
+    import server
+
+    engine = server._library_engine()
+    assert engine.capabilities.sealed is True
+    assert engine.items is not None
+    assert {policy.policy_id for policy in engine.items.policies} == {
+        "replica",
+        "text-layers",
+        "translations",
+    }
+    context = SimpleNamespace(
+        title="A book",
+        representations=(
+            SimpleNamespace(
+                available=True,
+                media_type="application/pdf",
+            ),
+        ),
+        artifact_readiness=lambda _kinds: "current",
+    )
+    commands = {
+        command
+        for policy in engine.items.policies
+        for command in policy.contribute(context).available_commands
+    }
+    assert commands == {"replica.open"}
+    for key, service in (
+        (ITEM_QUERY_SERVICE, engine.items),
+        (ITEM_COMMAND_SERVICE, engine.item_commands),
+        (INTERCHANGE_SERVICE, engine.interchange),
+        (JOB_SERVICE, engine.jobs),
+        (REPLICA_SERVICE, engine.replica),
+        (TEXT_LAYER_SERVICE, engine.text_layers),
+        (TRANSLATION_SERVICE, engine.translations),
+        (
+            TRANSLATION_PROVENANCE_SERVICE,
+            engine.translation_provenance,
+        ),
+    ):
+        assert service is not None
+        assert engine.require_service(key) is service
 
 
 def test_library_engine_exposes_the_same_framework_neutral_discovery():

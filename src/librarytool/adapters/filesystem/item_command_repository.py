@@ -41,6 +41,7 @@ RecordEncoder = Callable[
     Mapping[str, Any],
 ]
 ItemIdAllocator = Callable[[frozenset[str]], str]
+ItemIdValidator = Callable[[str], Any]
 TombstoneIdAllocator = Callable[[frozenset[str]], str]
 LockContextFactory = Callable[[], ContextManager[None]]
 
@@ -209,6 +210,7 @@ class FilesystemItemCommandRepository:
         decode_record: RecordDecoder,
         encode_record: RecordEncoder,
         allocate_item_id: ItemIdAllocator,
+        validate_item_id: ItemIdValidator | None = None,
         lock_context_for: LockContextFactory | None = None,
         allocate_tombstone_id: TombstoneIdAllocator | None = None,
         recover: bool = True,
@@ -224,6 +226,8 @@ class FilesystemItemCommandRepository:
                 raise TypeError(f"{name} must be callable")
         if lock_context_for is not None and not callable(lock_context_for):
             raise TypeError("lock_context_for must be callable")
+        if validate_item_id is not None and not callable(validate_item_id):
+            raise TypeError("validate_item_id must be callable")
         if allocate_tombstone_id is not None and not callable(
             allocate_tombstone_id
         ):
@@ -233,6 +237,7 @@ class FilesystemItemCommandRepository:
         self._decode_record = decode_record
         self._encode_record = encode_record
         self._allocate_item_id = allocate_item_id
+        self._validate_item_id = validate_item_id
         self._allocate_tombstone_id = allocate_tombstone_id
         self._lock_context_for = lock_context_for or (lambda: nullcontext())
         self._catalogue_relative = self._catalogue_path(catalogue_path)
@@ -272,6 +277,7 @@ class FilesystemItemCommandRepository:
                         decode_record=self._decode_record,
                         encode_record=self._encode_record,
                         allocate_item_id=self._allocate_item_id,
+                        validate_item_id=self._validate_item_id,
                         allocate_tombstone_id=self._allocate_tombstone_id,
                     )
                     try:
@@ -388,6 +394,7 @@ class FilesystemItemCommandUnitOfWork:
         decode_record: RecordDecoder,
         encode_record: RecordEncoder,
         allocate_item_id: ItemIdAllocator,
+        validate_item_id: ItemIdValidator | None,
         allocate_tombstone_id: TombstoneIdAllocator | None,
     ) -> None:
         self._write_set = write_set
@@ -397,6 +404,7 @@ class FilesystemItemCommandUnitOfWork:
         self._decode_record_callback = decode_record
         self._encode_record_callback = encode_record
         self._allocate_item_id_callback = allocate_item_id
+        self._validate_item_id_callback = validate_item_id
         self._allocate_tombstone_id_callback = allocate_tombstone_id
         self._catalogue, self._snapshots = self._load_catalogue()
         self._allocated_item_id = ""
@@ -437,7 +445,7 @@ class FilesystemItemCommandUnitOfWork:
 
     def get(self, item_id: str) -> ItemRecordSnapshot | None:
         self._ensure_open()
-        self._identifier(item_id, field_name="item_id")
+        self._item_id(item_id, field_name="item_id")
         return self._snapshots.get(item_id)
 
     def allocate_item_id(self) -> str:
@@ -454,7 +462,7 @@ class FilesystemItemCommandUnitOfWork:
                 code="item_id_allocation_failed",
                 message="the item repository could not allocate an identity",
             ) from exc
-        item_id = self._identifier(value, field_name="allocated_item_id")
+        item_id = self._item_id(value, field_name="allocated_item_id")
         folded = {existing.casefold() for existing in self._catalogue}
         if item_id.casefold() in folded:
             raise RepositoryError(
@@ -472,7 +480,7 @@ class FilesystemItemCommandUnitOfWork:
         draft: ItemDraft,
     ) -> ItemRecordSnapshot:
         self._ensure_stageable()
-        self._identifier(item_id, field_name="item_id")
+        self._item_id(item_id, field_name="item_id")
         if not isinstance(draft, ItemDraft):
             raise RepositoryError(
                 "the item create draft is invalid",
@@ -659,7 +667,7 @@ class FilesystemItemCommandUnitOfWork:
         snapshots: dict[str, ItemRecordSnapshot] = {}
         aliases: dict[str, str] = {}
         for item_id, raw in value.items():
-            self._identifier(item_id, field_name="catalogue_item_id")
+            self._item_id(item_id, field_name="catalogue_item_id")
             alias = item_id.casefold()
             if alias in aliases:
                 raise RepositoryError(
@@ -879,6 +887,22 @@ class FilesystemItemCommandUnitOfWork:
                 details={"field": field_name},
             )
         return value
+
+    def _item_id(self, value: Any, *, field_name: str) -> str:
+        item_id = self._identifier(value, field_name=field_name)
+        if self._validate_item_id_callback is None:
+            return item_id
+        try:
+            self._validate_item_id_callback(item_id)
+        except RepositoryError:
+            raise
+        except Exception as exc:
+            raise RepositoryError(
+                f"{field_name} is unsupported by this filesystem layout",
+                code="invalid_item_repository_identity",
+                details={"field": field_name, "cause_type": type(exc).__name__},
+            ) from exc
+        return item_id
 
     @staticmethod
     def _file_identifier(value: Any, *, field_name: str) -> str:

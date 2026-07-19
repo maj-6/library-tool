@@ -72,30 +72,24 @@ from librarytool.adapters.lib_archive import (  # noqa: E402
     ExistingItemLibArchivePlanner,
     LibArchiveLimits,
 )
-from librarytool.adapters.filesystem.interchange_repository import (  # noqa: E402
-    FilesystemInterchangeRepository,
-)
-from librarytool.adapters.filesystem.item_command_repository import (  # noqa: E402
-    FilesystemItemCommandRepository,
-)
-from librarytool.adapters.filesystem.translation_repository import (  # noqa: E402
-    FilesystemTranslationRepository,
-)
 from librarytool.adapters.filesystem.job_history import (  # noqa: E402
     FilesystemJobHistoryRepository,
-)
-from librarytool.adapters.filesystem.item_repository import (  # noqa: E402
-    FilesystemItemQueryRepository,
-)
-from librarytool.adapters.filesystem.replica_repository import (  # noqa: E402
-    FilesystemReplicaRepository,
 )
 from librarytool.adapters.filesystem.recoverable_write_set import (  # noqa: E402
     RecoverableWriteSet,
 )
+from librarytool.composition.filesystem import (  # noqa: E402
+    CatalogueBindings,
+    FilesystemEnginePaths,
+    FilesystemEngineResources,
+    FilesystemServiceGraph,
+    InterchangeBindings,
+    ReplicaBindings,
+    TranslationBindings,
+    compose_filesystem_engine,
+)
 from librarytool.engine.capabilities import (  # noqa: E402
     CapabilityRef,
-    CapabilityRegistry,
     ModuleManifest,
     WorkbenchManifest,
 )
@@ -134,7 +128,20 @@ from librarytool.engine.interchange import (  # noqa: E402
     LibInterchangeService,
 )
 from librarytool.engine.replica import ReplicaApplicationService  # noqa: E402
-from librarytool.engine.runtime import LibraryEngine  # noqa: E402
+from librarytool.engine.runtime import (  # noqa: E402
+    INTERCHANGE_SERVICE,
+    ITEM_COMMAND_SERVICE,
+    ITEM_QUERY_SERVICE,
+    JOB_SERVICE,
+    REPLICA_SERVICE,
+    TEXT_LAYER_SERVICE,
+    TRANSLATION_PROVENANCE_SERVICE,
+    TRANSLATION_SERVICE,
+    LibraryEngine,
+    ModuleContribution,
+    ServiceBinding,
+    WorkbenchPolicyBinding,
+)
 from librarytool.engine.text_layers import TextLayerService  # noqa: E402
 from librarytool.engine.translation_contracts import (  # noqa: E402
     ReplaceTranslationPageCommand,
@@ -146,7 +153,9 @@ from librarytool.engine.translations import (  # noqa: E402
     TranslationService,
 )
 from librarytool.engine.workbench_policies import (  # noqa: E402
-    standard_workbench_policies,
+    ReplicaWorkbenchPolicy,
+    TextLayerWorkbenchPolicy,
+    TranslationWorkbenchPolicy,
 )
 
 # Recover interrupted multi-artifact publication while the module is still
@@ -988,84 +997,191 @@ def home():
     )
 
 
-_ENGINE_CAPABILITIES = CapabilityRegistry(
-    modules=(
-        ModuleManifest(
-            "library.core", "1.1.0",
-            provides=(
-                # ``library.items`` remains the compatibility capability while
-                # new clients can bind to the narrower read contracts.
-                CapabilityRef("library.items"),
-                CapabilityRef("library.items.read"),
-                CapabilityRef("library.representations"),
-                CapabilityRef("library.artifacts"),
-            ),
-        ),
-        ModuleManifest(
-            "jobs.core", "1.0.0",
-            provides=(CapabilityRef("library.jobs"),),
-        ),
-        ModuleManifest(
-            "library.catalogue.commands", "1.0.0",
-            provides=(
-                CapabilityRef("library.items.create"),
-                CapabilityRef("library.items.update"),
-            ),
-            requires=(CapabilityRef("library.items.read"),),
-        ),
-        ModuleManifest(
-            "replica.core", "1.0.0",
-            provides=(
-                CapabilityRef("replica.regions"),
-                CapabilityRef("replica.proposals"),
-                CapabilityRef("replica.text-layers"),
-                CapabilityRef("replica.layout-families"),
-            ),
-            requires=(CapabilityRef("library.items"),),
-        ),
-        ModuleManifest(
-            "translation.core", "2.0.0",
-            provides=(
-                CapabilityRef("translation.provenance"),
-                CapabilityRef("translation.layers.read"),
-                CapabilityRef("translation.layers.status"),
-                CapabilityRef("translation.layers.edit"),
-            ),
-            requires=(CapabilityRef("library.items"),),
-        ),
-        ModuleManifest(
-            "replica.lib", "2.0.0",
-            provides=(CapabilityRef("replica.interchange", 2),),
-            requires=(CapabilityRef("replica.regions"),),
+_ENGINE_MODULE_MANIFESTS = (
+    ModuleManifest(
+        "library.core", "1.1.0",
+        provides=(
+            # ``library.items`` remains the compatibility capability while
+            # new clients can bind to the narrower read contracts.
+            CapabilityRef("library.items"),
+            CapabilityRef("library.items.read"),
+            CapabilityRef("library.representations"),
+            CapabilityRef("library.artifacts"),
         ),
     ),
-    workbenches=(
-        WorkbenchManifest(
-            "catalog", "1.0.0",
-            requires=(CapabilityRef("library.items"),),
-            enhances=(
-                CapabilityRef("library.items.create"),
-                CapabilityRef("library.items.update"),
-            ),
+    ModuleManifest(
+        "jobs.core", "1.0.0",
+        provides=(CapabilityRef("library.jobs"),),
+    ),
+    ModuleManifest(
+        "library.catalogue.commands", "1.0.0",
+        provides=(
+            CapabilityRef("library.items.create"),
+            CapabilityRef("library.items.update"),
         ),
-        WorkbenchManifest(
-            "replica", "1.0.0",
-            requires=(
-                CapabilityRef("replica.regions"),
-                CapabilityRef("replica.text-layers"),
-            ),
-            enhances=(
-                CapabilityRef("replica.interchange", 2),
-                CapabilityRef("replica.layout-families"),
-                CapabilityRef("translation.provenance"),
-                CapabilityRef("translation.layers.read"),
-                CapabilityRef("translation.layers.status"),
-                CapabilityRef("translation.layers.edit"),
-                CapabilityRef("library.jobs"),
-            ),
+        requires=(CapabilityRef("library.items.read"),),
+    ),
+    ModuleManifest(
+        "replica.core", "1.0.0",
+        provides=(
+            CapabilityRef("replica.regions"),
+            CapabilityRef("replica.proposals"),
+            CapabilityRef("replica.text-layers"),
+            CapabilityRef("replica.layout-families"),
+        ),
+        requires=(CapabilityRef("library.items"),),
+    ),
+    ModuleManifest(
+        "translation.core", "2.0.0",
+        provides=(
+            CapabilityRef("translation.provenance"),
+            CapabilityRef("translation.layers.read"),
+            CapabilityRef("translation.layers.status"),
+            CapabilityRef("translation.layers.edit"),
+        ),
+        requires=(CapabilityRef("library.items"),),
+    ),
+    ModuleManifest(
+        "replica.lib", "2.0.0",
+        provides=(CapabilityRef("replica.interchange", 2),),
+        requires=(CapabilityRef("replica.regions"),),
+    ),
+)
+_ENGINE_WORKBENCH_MANIFESTS = (
+    WorkbenchManifest(
+        "catalog", "1.0.0",
+        requires=(CapabilityRef("library.items"),),
+        enhances=(
+            CapabilityRef("library.items.create"),
+            CapabilityRef("library.items.update"),
+        ),
+    ),
+    WorkbenchManifest(
+        "replica", "1.0.0",
+        requires=(
+            CapabilityRef("replica.regions"),
+            CapabilityRef("replica.text-layers"),
+        ),
+        enhances=(
+            CapabilityRef("replica.interchange", 2),
+            CapabilityRef("replica.layout-families"),
+            CapabilityRef("translation.provenance"),
+            CapabilityRef("translation.layers.read"),
+            CapabilityRef("translation.layers.status"),
+            CapabilityRef("translation.layers.edit"),
+            CapabilityRef("library.jobs"),
         ),
     ),
 )
+
+
+def _engine_module_contributions(
+    graph: FilesystemServiceGraph,
+) -> tuple[ModuleContribution, ...]:
+    """Bind installed first-party manifests to the concrete service graph."""
+
+    modules = {manifest.id: manifest for manifest in _ENGINE_MODULE_MANIFESTS}
+    workbenches = {
+        manifest.id: manifest for manifest in _ENGINE_WORKBENCH_MANIFESTS
+    }
+    return (
+        ModuleContribution(
+            modules["library.core"],
+            bindings=(
+                ServiceBinding(
+                    ITEM_QUERY_SERVICE,
+                    graph.items,
+                    modules["library.core"].provides,
+                ),
+            ),
+            workbenches=(workbenches["catalog"],),
+        ),
+        ModuleContribution(
+            modules["jobs.core"],
+            bindings=(
+                ServiceBinding(
+                    JOB_SERVICE,
+                    graph.jobs,
+                    modules["jobs.core"].provides,
+                ),
+            ),
+        ),
+        ModuleContribution(
+            modules["library.catalogue.commands"],
+            bindings=(
+                ServiceBinding(
+                    ITEM_COMMAND_SERVICE,
+                    graph.item_commands,
+                    modules["library.catalogue.commands"].provides,
+                ),
+            ),
+        ),
+        ModuleContribution(
+            modules["replica.core"],
+            bindings=(
+                ServiceBinding(
+                    REPLICA_SERVICE,
+                    graph.replica,
+                    tuple(
+                        capability
+                        for capability in modules["replica.core"].provides
+                        if capability.id != "replica.text-layers"
+                    ),
+                ),
+                ServiceBinding(
+                    TEXT_LAYER_SERVICE,
+                    graph.text_layers,
+                    (CapabilityRef("replica.text-layers"),),
+                ),
+            ),
+            workbenches=(workbenches["replica"],),
+            item_policies=(
+                WorkbenchPolicyBinding(
+                    ReplicaWorkbenchPolicy(),
+                    (CapabilityRef("replica.regions"),),
+                ),
+                WorkbenchPolicyBinding(
+                    TextLayerWorkbenchPolicy(),
+                    (CapabilityRef("replica.text-layers"),),
+                ),
+            ),
+        ),
+        ModuleContribution(
+            modules["translation.core"],
+            bindings=(
+                ServiceBinding(
+                    TRANSLATION_PROVENANCE_SERVICE,
+                    graph.translation_provenance,
+                    (CapabilityRef("translation.provenance"),),
+                ),
+                ServiceBinding(
+                    TRANSLATION_SERVICE,
+                    graph.translations,
+                    tuple(
+                        capability
+                        for capability in modules["translation.core"].provides
+                        if capability.id != "translation.provenance"
+                    ),
+                ),
+            ),
+            item_policies=(
+                WorkbenchPolicyBinding(
+                    TranslationWorkbenchPolicy(),
+                    (CapabilityRef("translation.layers.status"),),
+                ),
+            ),
+        ),
+        ModuleContribution(
+            modules["replica.lib"],
+            bindings=(
+                ServiceBinding(
+                    INTERCHANGE_SERVICE,
+                    graph.interchange,
+                    modules["replica.lib"].provides,
+                ),
+            ),
+        ),
+    )
 
 
 @app.route("/api/v1/capabilities")
@@ -3779,23 +3895,6 @@ def _library_engine() -> LibraryEngine:
         with _library_engine_guard:
             if _library_engine_instance is None:
                 policies = _EngineReplicaPolicies()
-                items = ItemQueryService(
-                    FilesystemItemQueryRepository(_engine_item_snapshot),
-                    policies=standard_workbench_policies(),
-                )
-                repository = FilesystemReplicaRepository(
-                    lambda item_id: _entry_dir(item_id) / "ocr" / "layout.json",
-                    read_json=lambda path: lib.load_json(path, {}),
-                    write_json=lib.save_json,
-                    # Unmigrated layout writers still use this RLock. Sharing
-                    # it prevents two independent locking domains during the
-                    # route-by-route transition.
-                    lock_context_for=lambda _item_id: _ocr_merge_lock,
-                )
-                text_layers = TextLayerService(
-                    _EngineTextLayerRepository(), policies)
-                replica = ReplicaApplicationService(
-                    _EngineItemRepository(), repository, policies, text_layers)
                 interchange_planner = ExistingItemLibArchivePlanner(
                     parse_format=libformat.parse_format,
                     supported_major=libformat.SUPPORTED_MAJOR,
@@ -3819,53 +3918,50 @@ def _library_engine() -> LibraryEngine:
                         max_items_per_page=libformat.MAX_ITEMS,
                     ),
                 )
-                interchange_repository = FilesystemInterchangeRepository(
-                    _engine_write_set,
-                    entry_directory_for=_entry_dir,
-                    source_ids_for=_interchange_source_ids,
-                    clean_region_id=libformat.clean_rid,
-                    normalize_language=_lang_code,
-                    sanitize_document_name=_ocr_name,
-                    lock_context_for=_engine_workspace_locks,
-                    recover=False,
-                )
-                translation_repository = FilesystemTranslationRepository(
-                    _engine_write_set,
-                    entry_directory_for=_entry_dir,
-                    item_exists_for=_translation_item_exists,
-                    source_snapshot_for=_translation_source_snapshot,
-                    source_reference_for=lambda source:
-                        _translation_document_name(source.layer_id),
-                    lock_context_for=_engine_workspace_locks,
-                    recover=False,
-                )
-                item_command_repository = FilesystemItemCommandRepository(
-                    _engine_write_set,
-                    catalogue_path=BUILDS_PATH,
-                    decode_record=_engine_item_command_decode,
-                    encode_record=_engine_item_command_encode,
-                    allocate_item_id=lambda existing:
-                        lib.gen_id(set(existing)),
-                    # The adapter acquires the cross-process workspace lease
-                    # before entering this legacy in-process catalogue lock.
-                    lock_context_for=lambda: _builds_lock,
-                    # Shared startup recovery ran before any request/worker.
-                    recover=False,
-                )
-                _library_engine_instance = LibraryEngine(
-                    capabilities=_ENGINE_CAPABILITIES,
-                    items=items,
-                    item_commands=ItemCommandService(
-                        item_command_repository),
-                    interchange=LibInterchangeService(
-                        interchange_planner, interchange_repository
+                descriptors = _EngineItemRepository()
+                _library_engine_instance = compose_filesystem_engine(
+                    paths=FilesystemEnginePaths(
+                        catalogue=BUILDS_PATH,
+                        entries=ENTRIES_DIR,
                     ),
-                    jobs=_job_manager,
-                    replica=replica,
-                    text_layers=text_layers,
-                    translations=TranslationService(
-                        _EngineItemRepository(), translation_repository),
-                    translation_provenance=_translation_provenance,
+                    resources=FilesystemEngineResources(
+                        write_set=_engine_write_set,
+                        jobs=_job_manager,
+                        provenance=_translation_provenance,
+                        workspace_lock_context_for=_engine_workspace_locks,
+                    ),
+                    catalogue=CatalogueBindings(
+                        load_snapshot=_engine_item_snapshot,
+                        descriptors=descriptors,
+                        decode_record=_engine_item_command_decode,
+                        encode_record=_engine_item_command_encode,
+                        allocate_item_id=lambda existing:
+                            lib.gen_id(set(existing)),
+                        lock_context_for=lambda: _builds_lock,
+                    ),
+                    replica=ReplicaBindings(
+                        policies=policies,
+                        text_repository=_EngineTextLayerRepository(),
+                        read_json=lambda path: lib.load_json(path, {}),
+                        write_json=lib.save_json,
+                        # All Replica writes now take the workspace lease
+                        # before this shared legacy OCR lock.
+                        lock_context_for=lambda _item_id: _ocr_merge_lock,
+                    ),
+                    interchange=InterchangeBindings(
+                        planner=interchange_planner,
+                        source_ids_for=_interchange_source_ids,
+                        clean_region_id=libformat.clean_rid,
+                        normalize_language=_lang_code,
+                        sanitize_document_name=_ocr_name,
+                    ),
+                    translation=TranslationBindings(
+                        item_exists_for=_translation_item_exists,
+                        source_snapshot_for=_translation_source_snapshot,
+                        source_reference_for=lambda source:
+                            _translation_document_name(source.layer_id),
+                    ),
+                    contribution_factory=_engine_module_contributions,
                 )
     return _library_engine_instance
 

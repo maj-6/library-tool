@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 from collections.abc import Callable, Mapping, MutableMapping
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, ContextManager
 
@@ -24,11 +25,11 @@ LockCallback = Callable[[str], ContextManager[Any]]
 class FilesystemReplicaRepository:
     """Store the Replica aggregate in a JSON file selected by a callback.
 
-    The path, JSON I/O, and lock context are all injectable.  The transitional
-    Flask adapter can therefore reuse its current entry-folder calculation,
-    strict atomic writer, and process lock without this package importing it.
-    Defaults provide a standalone, per-item locked, atomic JSON repository for
-    headless clients and tests.
+    The path, JSON I/O, item lock, and optional outer workspace lease are all
+    injectable. The outer lease is always entered before the item lock, so a
+    host can serialize Replica writes with recoverable multi-artifact imports
+    across processes. Defaults provide a standalone, per-item locked, atomic
+    JSON repository for headless clients and tests.
     """
 
     def __init__(
@@ -38,11 +39,13 @@ class FilesystemReplicaRepository:
         read_json: ReadJsonCallback | None = None,
         write_json: WriteJsonCallback | None = None,
         lock_context_for: LockCallback | None = None,
+        workspace_context_for: LockCallback | None = None,
     ) -> None:
         self._layout_path_for = layout_path_for
         self._read_json = read_json or self._default_read_json
         self._write_json = write_json or self._default_write_json
         self._external_lock_context_for = lock_context_for
+        self._workspace_context_for = workspace_context_for
         self._locks_guard = threading.Lock()
         self._locks: dict[str, threading.RLock] = {}
 
@@ -56,6 +59,8 @@ class FilesystemReplicaRepository:
     def _path(self, item_id: str) -> Path:
         try:
             return Path(self._layout_path_for(item_id))
+        except RepositoryError:
+            raise
         except Exception as exc:
             raise RepositoryError(
                 "could not resolve the Replica workspace path",
@@ -63,17 +68,43 @@ class FilesystemReplicaRepository:
                 details={"item_id": item_id, "cause": str(exc)},
             ) from exc
 
-    def _lock_context(self, item_id: str) -> ContextManager[Any]:
-        if self._external_lock_context_for is not None:
+    @contextmanager
+    def _lock_context(self, item_id: str):
+        """Acquire the cross-process lease before the legacy item lock."""
+
+        workspace = self._context(
+            self._workspace_context_for,
+            item_id,
+            purpose="workspace lease",
+        )
+        legacy = self._context(
+            self._external_lock_context_for,
+            item_id,
+            purpose="item lock",
+        )
+        with workspace:
+            with legacy:
+                yield
+
+    def _context(
+        self,
+        callback: LockCallback | None,
+        item_id: str,
+        *,
+        purpose: str,
+    ) -> ContextManager[Any]:
+        if callback is not None:
             try:
-                return self._external_lock_context_for(item_id)
+                return callback(item_id)
             except Exception as exc:
                 raise RepositoryError(
-                    "could not acquire a Replica workspace lock context",
+                    f"could not create the Replica {purpose} context",
                     code="replica_lock_failed",
-                    details={"item_id": item_id, "cause": str(exc)},
+                    details={"item_id": item_id, "cause_type": type(exc).__name__},
                     retryable=True,
                 ) from exc
+        if purpose == "workspace lease":
+            return nullcontext()
         with self._locks_guard:
             return self._locks.setdefault(item_id, threading.RLock())
 
