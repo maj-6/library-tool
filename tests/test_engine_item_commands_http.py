@@ -8,6 +8,9 @@ from pathlib import Path
 
 import pytest
 
+from librarytool.engine.errors import RepositoryError, ValidationError
+from librarytool.engine.item_commands import CreateItemCommand, ItemDraft
+
 
 def _bind_engine_session(monkeypatch, server, session) -> None:
     """Keep transitional server globals on one temporary engine session."""
@@ -194,6 +197,74 @@ def test_create_is_durable_replayable_and_conflict_safe(
         / f".engine/receipts/item-commands/{digest}.json"
     )
     assert receipt_path.is_file()
+
+
+def test_production_item_service_applies_book_profile_without_http(
+    command_catalog,
+):
+    server, builds_path, _original, _reopen_session = command_catalog
+    before = builds_path.read_bytes()
+    service = server._library_engine().item_commands
+
+    with pytest.raises(ValidationError) as caught:
+        service.create(
+            CreateItemCommand(
+                ItemDraft(metadata={"authors": ["not", "a", "string"]}),
+                "direct-profile-rejection",
+            )
+        )
+
+    assert caught.value.code == "invalid_item_metadata"
+    assert caught.value.details == {
+        "field": "authors",
+        "reason": "string_required",
+    }
+    assert builds_path.read_bytes() == before
+
+
+def test_production_taxonomy_failure_is_sanitized_but_replay_bypasses_it(
+    command_catalog,
+    monkeypatch,
+):
+    server, builds_path, _original, reopen_session = command_catalog
+    monkeypatch.setattr(
+        server.lib,
+        "load_taxonomy",
+        lambda: {"version": 1, "nodes": {"plants": {"name": "Plants"}}},
+    )
+    command = CreateItemCommand(
+        ItemDraft(
+            title="Categorized Herbal",
+            metadata={"category_ids": ["plants"]},
+        ),
+        "direct-taxonomy-replay",
+    )
+    original = server._library_engine().item_commands.create(command)
+    committed = builds_path.read_bytes()
+
+    def unavailable_taxonomy():
+        raise RuntimeError(r"C:\private\taxonomy.json is unavailable")
+
+    monkeypatch.setattr(server.lib, "load_taxonomy", unavailable_taxonomy)
+    service = reopen_session().engine.item_commands
+
+    replay = service.create(command)
+    assert replay.replayed is True
+    assert replay.receipt == original.receipt
+    assert builds_path.read_bytes() == committed
+
+    with pytest.raises(RepositoryError) as caught:
+        service.create(
+            CreateItemCommand(
+                command.draft,
+                "direct-taxonomy-unavailable",
+            )
+        )
+    assert caught.value.code == "category_repository_unavailable"
+    assert caught.value.retryable is True
+    assert caught.value.details == {"cause_type": "RuntimeError"}
+    assert "private" not in str(caught.value.as_dict()).lower()
+    assert builds_path.read_bytes() == committed
 
 
 def test_update_preserves_raw_managed_state_and_supports_cas_replay(

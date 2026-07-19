@@ -171,6 +171,7 @@ from librarytool.engine.translations import (  # noqa: E402
     TranslationProvenanceService,
     TranslationService,
 )
+from librarytool.profiles import WhlBookItemCommandPolicy  # noqa: E402
 # Importing the compatibility transport must not claim a workspace. The first
 # request, or the explicit __main__ startup barrier, opens one complete session
 # and publishes these aliases together for processors that have not crossed the
@@ -4625,6 +4626,28 @@ def _engine_recovery_locks():
         yield
 
 
+def _engine_item_category_ids() -> tuple[str, ...]:
+    """Adapt the legacy taxonomy document to the neutral profile port."""
+
+    try:
+        taxonomy = lib.load_taxonomy()
+    except Exception as exc:
+        raise EngineRepositoryError(
+            "the category catalogue is unavailable",
+            code="category_repository_unavailable",
+            details={"cause_type": type(exc).__name__},
+            retryable=True,
+        ) from exc
+    nodes = taxonomy.get("nodes") if isinstance(taxonomy, Mapping) else None
+    if not isinstance(nodes, Mapping):
+        raise EngineRepositoryError(
+            "the category catalogue is unavailable",
+            code="category_repository_unavailable",
+            retryable=True,
+        )
+    return tuple(nodes)
+
+
 def _engine_host_bindings() -> FilesystemHostBindings:
     """Return borrowed production callbacks for the neutral host opener."""
 
@@ -4668,6 +4691,9 @@ def _engine_host_bindings() -> FilesystemHostBindings:
             ),
             lifecycle=ItemLifecycleBindings(
                 advance_restored_record=_engine_advance_restored_record,
+            ),
+            item_command_policy=WhlBookItemCommandPolicy(
+                _engine_item_category_ids
             ),
         ),
         replica=ReplicaBindings(
