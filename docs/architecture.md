@@ -56,9 +56,13 @@ Per-component detail lives in each part's own README (map at the end).
   preview consumes it through `EngineClient.translations`. Existing-item
   `.lib` import likewise publishes layout, text, figures, styles,
   translations, provenance, and a durable receipt in one recoverable
-  multi-file unit of work. Representation attachment, provider-backed
-  translation generation, the new-item `/api/lib/open` composite, and legacy
-  item delete/restore are not yet migrated to these command boundaries.
+  multi-file unit of work. New-item `.lib` open is a separately gated service
+  requiring both catalogue creation and Replica interchange: allocation,
+  catalogue state, entry assets, component receipts, and the global replay
+  receipt publish through one recoverable transaction. The desktop local-path
+  route delegates to it, and portable clients use `/api/v1/lib-opens`.
+  Representation attachment, provider-backed translation generation, and
+  legacy item delete/restore are not yet migrated to these command boundaries.
 - **Desktop app** — the workbench: an Electron shell (`desktop/`) that
   spawns the Flask sidecar (`tools/whl_explorer/server.py`) on a loopback
   port. Paths split into two roots (`tools/libcommon.py`): **`APP_ROOT`**,

@@ -128,6 +128,8 @@ from librarytool.engine.items import ItemQueryService  # noqa: E402
 from librarytool.engine.interchange import (  # noqa: E402
     ImportLibCommand,
     LibInterchangeService,
+    OpenLibCommand,
+    OpenLibService,
 )
 from librarytool.engine.replica import ReplicaApplicationService  # noqa: E402
 from librarytool.engine.runtime import (  # noqa: E402
@@ -135,6 +137,7 @@ from librarytool.engine.runtime import (  # noqa: E402
     ITEM_COMMAND_SERVICE,
     ITEM_QUERY_SERVICE,
     JOB_SERVICE,
+    LIB_OPEN_SERVICE,
     REPLICA_SERVICE,
     TEXT_LAYER_SERVICE,
     TRANSLATION_PROVENANCE_SERVICE,
@@ -1061,6 +1064,14 @@ _ENGINE_MODULE_MANIFESTS = (
         provides=(CapabilityRef("replica.interchange", 2),),
         requires=(CapabilityRef("replica.regions"),),
     ),
+    ModuleManifest(
+        "replica.lib-open", "1.0.0",
+        provides=(CapabilityRef("replica.interchange.open"),),
+        requires=(
+            CapabilityRef("replica.interchange", 2),
+            CapabilityRef("library.items.create"),
+        ),
+    ),
 )
 _ENGINE_WORKBENCH_MANIFESTS = (
     WorkbenchManifest(
@@ -1079,6 +1090,7 @@ _ENGINE_WORKBENCH_MANIFESTS = (
         ),
         enhances=(
             CapabilityRef("replica.interchange", 2),
+            CapabilityRef("replica.interchange.open"),
             CapabilityRef("replica.layout-families"),
             CapabilityRef("translation.provenance"),
             CapabilityRef("translation.layers.read"),
@@ -1195,6 +1207,22 @@ def _engine_module_contributions(
                     modules["replica.lib"].provides,
                 ),
             ),
+        ),
+        *(
+            ()
+            if graph.lib_open is None
+            else (
+                ModuleContribution(
+                    modules["replica.lib-open"],
+                    bindings=(
+                        ServiceBinding(
+                            LIB_OPEN_SERVICE,
+                            graph.lib_open,
+                            modules["replica.lib-open"].provides,
+                        ),
+                    ),
+                ),
+            )
         ),
     )
 
@@ -3272,6 +3300,20 @@ def _engine_item_command_encode(
             "status": "draft",
             "created_at": now,
             "updated_at": now,
+            # Transitional readers still expect these server-owned fields to
+            # exist on a freshly created legacy build.  They are deliberately
+            # storage defaults rather than writable ItemDraft metadata.
+            "published_slug": "",
+            "pdf_file": "",
+            "pdf_sources": [],
+            "ocr_active": "",
+            "ocr_verified": "",
+            "ocr_quality": "",
+            "title_pages": "",
+            "thumbnail_source": "",
+            "images": [],
+            "extra": {},
+            "capture_id": "",
         }
     else:
         if not isinstance(previous, Mapping):
@@ -3300,6 +3342,49 @@ def _engine_item_command_encode(
         result["updated_at"] = _build_updated_at(previous.get("updated_at"))
     result.update(dict(draft.metadata))
     return result
+
+
+def _engine_open_lib_draft(metadata: Mapping) -> ItemDraft:
+    """Project hostile ``.lib`` metadata into one safe catalogue draft.
+
+    Archive decoding remains in the framework-neutral planner.  This injected
+    production policy owns the transitional catalogue's bibliographic field
+    vocabulary and its publication-rights default, so another host or module
+    can choose a different metadata model without changing the open service.
+    """
+
+    if not isinstance(metadata, Mapping):
+        raise TypeError("Replica manifest metadata must be an object")
+
+    def text(field: str) -> str:
+        return str(metadata.get(field) or "").strip()
+
+    # ``published_slug`` is intentionally omitted even though old exporters
+    # may include it: it is server-managed publication state, not descriptive
+    # metadata that a foreign package may assign to a new local item.
+    bibliographic = {
+        field: text(field)
+        for field in _LIB_META_FIELDS
+        if field not in {"title", "published_slug"}
+    }
+    # Preserve the complete transitional build shape without accepting any of
+    # these operational values from the archive.  The eventual neutral
+    # catalogue schema can drop this projection without changing OpenLibService.
+    bibliographic.update({
+        "group_id": "",
+        "categories": "",
+        "category_ids": [],
+        "description": "",
+        "pdf_source": "",
+        "bundle": _clean_bundle({}),
+        "notes": "",
+        "rights": "",
+        "attention": "",
+    })
+    return ItemDraft(
+        title=text("title"),
+        metadata=bibliographic,
+    )
 
 
 def _engine_representation_locator(item_id: str, source_id: str) -> str:
@@ -3956,6 +4041,7 @@ def _engine_host_bindings() -> FilesystemHostBindings:
             clean_region_id=libformat.clean_rid,
             normalize_language=_lang_code,
             sanitize_document_name=_ocr_name,
+            open_item_draft_for=_engine_open_lib_draft,
         ),
         translation=TranslationBindings(
             item_exists_for=_translation_item_exists,
@@ -4094,6 +4180,12 @@ def _interchange_engine() -> LibInterchangeService:
     if interchange is None:
         raise RuntimeError("the interchange engine module is unavailable")
     return interchange
+
+
+def _lib_open_engine() -> OpenLibService:
+    """Return the optional composite new-item Replica service."""
+
+    return _library_engine().require_service(LIB_OPEN_SERVICE)
 
 
 def _region_view_response(view) -> dict:
@@ -6248,13 +6340,12 @@ def api_v1_replica_lib_import(item_id: str):
 
 @app.route("/api/lib/open", methods=["POST"])
 def api_lib_open():
-    """Create a new book from a local .lib — the desktop shell's double-click
-    flow. Body {path}: an ABSOLUTE path on this machine (the server is
-    loopback-only and serves a single local user; local paths are already how
-    attached scans arrive). The manifest's meta seeds a fresh build through
-    the normal create path, then the archive imports into it under the
-    primary source. Returns {ok, build_id, receipt}; a refused import removes
-    the just-minted build again rather than stranding an empty shell."""
+    """Adapt the desktop shell's trusted local-path flow to ``open_lib``.
+
+    Filesystem access belongs to this loopback transport. Allocation, metadata
+    projection, import, durable replay, and rollback belong to one engine unit
+    of work, so no catalogue shell or partial entry can escape a failure.
+    """
     p = request.get_json(silent=True) or {}
     raw_path = str(p.get("path") or "")
     fp = Path(raw_path) if raw_path else None
@@ -6269,44 +6360,82 @@ def api_lib_open():
     except OSError as exc:
         return jsonify({"ok": False,
                         "error": f"could not read the file: {exc}"}), 400
-    # parse up front for the meta seed; import re-validates through the same
-    # module, so nothing minted here can outrun the format gate below
+    operation_id = str(
+        request.headers.get("Idempotency-Key") or uuid.uuid4().hex
+    ).strip()
     try:
-        doc = libformat.read_lib(raw)
-    except libformat.LibError as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 400
-    # seed the build from the bibliographic tuple the exporter writes — NOT the
-    # whole manifest meta. A foreign .lib must not pre-set operational fields
-    # (rights, status, pdf_sources, ocr_*): rights defaults to undecided and
-    # status to draft, and an unrecognized rights string can't fail the open.
-    build, err = _create_build({k: doc.meta.get(k) for k in _LIB_META_FIELDS})
-    if err:
-        return jsonify({"ok": False, "error": err}), 400
+        result = _lib_open_engine().open_lib(OpenLibCommand(
+            archive=raw,
+            operation_id=operation_id,
+            source_path=str(fp),
+        ))
+    except EngineError as exc:
+        return _engine_error_response(exc)
 
-    def _rollback():
-        with _builds_lock:
-            builds = lib.load_json(BUILDS_PATH, {})
-            builds.pop(build["id"], None)
-            lib.save_json(BUILDS_PATH, builds)
+    receipt = result.import_receipt
+    projected = {
+        "ok": True,
+        "format_version": receipt.format_version,
+        "pages_applied": list(receipt.pages_applied),
+        "pages_skipped": list(receipt.pages_skipped),
+        "pages_protected": list(receipt.pages_protected),
+        "templates_added": list(receipt.templates_added),
+        "figures_added": len(receipt.figures_added),
+        "stylesheet": receipt.stylesheet_disposition,
+        "translations_added": list(receipt.translations_added),
+        "warnings": [
+            {"loc": warning.location, "msg": warning.message}
+            for warning in receipt.warnings
+        ],
+    }
+    if not result.replayed:
+        activity("created", "draft entry", detail=result.item.title)
+    return jsonify({
+        "ok": True,
+        "build_id": result.item_id,
+        "receipt": projected,
+    })
 
-    # a crafted member can make the import RAISE (not just return != 200); the
-    # rollback must cover that too, or the minted build is stranded on a 500
+
+@app.route("/api/v1/lib-opens", methods=["POST"])
+def api_v1_lib_open():
+    """Create an item from an uploaded Replica package with safe replay."""
+
+    operation_id = str(request.headers.get("Idempotency-Key") or "").strip()
+    if not operation_id:
+        return _engine_error_response(EnginePreconditionRequiredError(
+            "an idempotency key is required",
+            code="idempotency_key_required",
+            details={"header": "Idempotency-Key"},
+        ))
+    upload = request.files.get("lib")
+    if upload is None:
+        return _engine_error_response(EngineValidationError(
+            "a Replica package is required",
+            code="lib_archive_required",
+            details={"field": "lib"},
+        ))
+    archive = upload.read(_LIB_MAX_BYTES + 1)
+    if len(archive) > _LIB_MAX_BYTES:
+        return _engine_error_response(EngineValidationError(
+            "the Replica package is too large",
+            code="lib_archive_too_large",
+            details={"maximum_bytes": _LIB_MAX_BYTES},
+        ))
     try:
-        receipt, code = _lib_import_archive(build["id"], "primary", raw,
-                                            overwrite=False)
-    except Exception as exc:
-        _rollback()
-        return jsonify({"ok": False, "error": f"import failed: {exc}"}), 500
-    if code != 200:
-        _rollback()
-        return jsonify(receipt), code
-    # persist the archive's book_id when well-formed, so an open + re-export
-    # round trip keeps the same identity the exporter minted (§2.4); a malformed
-    # or absent id keeps today's mint-on-first-export behavior
-    if re.fullmatch(r"b-[0-9a-f]{32}", doc.book_id):
-        _lib_id_path(build["id"]).parent.mkdir(parents=True, exist_ok=True)
-        lib.save_json(_lib_id_path(build["id"]), {"book_id": doc.book_id})
-    return jsonify({"ok": True, "build_id": build["id"], "receipt": receipt})
+        result = _lib_open_engine().open_lib(OpenLibCommand(
+            archive=archive,
+            operation_id=operation_id,
+        ))
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    response = jsonify({
+        "ok": True,
+        "schema": "librarytool.open-lib-receipt/1",
+        **result.as_dict(),
+    })
+    response.headers["X-Record-Revision"] = result.item.revision
+    return response, 200 if result.replayed else 201
 
 
 @app.route("/api/lib/validate", methods=["POST"])

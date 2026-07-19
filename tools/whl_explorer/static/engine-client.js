@@ -167,6 +167,7 @@
         imageUrl: (args) => this._replicaFigureImageUrl(args),
       });
       const packages = Object.freeze({
+        open: (args) => this._replicaPackageOpen(args),
         import: (args) => this._replicaPackageImport(args),
         exportUrl: (args) => this._replicaPackageExportUrl(args),
       });
@@ -542,6 +543,19 @@
           multipart: form,
           signal,
         });
+    }
+
+    _replicaPackageOpen({ file, idempotencyKey, signal } = {}) {
+      const form = this._formDataFactory();
+      form.append("lib", file);
+      return this._requestJson("POST", "/v1/lib-opens", {
+        headers: {
+          "Idempotency-Key": operationKey(
+            idempotencyKey, "idempotencyKey"),
+        },
+        multipart: form,
+        signal,
+      });
     }
 
     _replicaPackageExportUrl({ bookId, sourceId } = {}) {

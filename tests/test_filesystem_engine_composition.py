@@ -46,6 +46,7 @@ from librarytool.engine.runtime import (
     ITEM_COMMAND_SERVICE,
     ITEM_QUERY_SERVICE,
     JOB_SERVICE,
+    LIB_OPEN_SERVICE,
     REPLICA_SERVICE,
     TEXT_LAYER_SERVICE,
     TRANSLATION_PROVENANCE_SERVICE,
@@ -164,6 +165,9 @@ def _composition(
     unfinished: bool = False,
     allocate_item_id=lambda _existing: "new-book",
     load_snapshot=None,
+    open_item_draft_for=lambda metadata: ItemDraft(
+        title=str(metadata.get("title") or "")
+    ),
 ):
     write_set = _TrackingWriteSet(tmp_path / "workspace")
     if unfinished:
@@ -237,6 +241,7 @@ def _composition(
             clean_region_id=lambda value: str(value or ""),
             normalize_language=lambda value: str(value).lower(),
             sanitize_document_name=str,
+            open_item_draft_for=open_item_draft_for,
         ),
         translation=TranslationBindings(
             item_exists_for=lambda item_id: item_id == "book-one",
@@ -277,6 +282,7 @@ def test_composer_wires_the_complete_graph_without_recovery(tmp_path):
         (ITEM_QUERY_SERVICE, engine.items),
         (ITEM_COMMAND_SERVICE, engine.item_commands),
         (INTERCHANGE_SERVICE, engine.interchange),
+        (LIB_OPEN_SERVICE, engine.require_service(LIB_OPEN_SERVICE)),
         (JOB_SERVICE, engine.jobs),
         (REPLICA_SERVICE, engine.replica),
         (TEXT_LAYER_SERVICE, engine.text_layers),
@@ -290,6 +296,7 @@ def test_composer_wires_the_complete_graph_without_recovery(tmp_path):
 
     item_commands = engine.item_commands._repository
     interchange = engine.interchange._repository
+    lib_open = engine.require_service(LIB_OPEN_SERVICE)
     translations = engine.translations._repository
     replica = engine.replica._repository
 
@@ -297,6 +304,8 @@ def test_composer_wires_the_complete_graph_without_recovery(tmp_path):
     assert item_commands._lock_context_for is _catalogue_lock
     assert interchange._write_set is composed["write_set"]
     assert interchange._lock_context_for is _workspace_lock
+    assert lib_open._planner is composed["planner"]
+    assert lib_open._repository._write_set is composed["write_set"]
     assert translations._write_set is composed["write_set"]
     assert translations._lock_context_for is _workspace_lock
     assert replica._external_lock_context_for is _replica_lock
@@ -367,6 +376,30 @@ def test_composition_rejects_unsettled_or_escaping_workspaces(tmp_path):
             entries_path=tmp_path / "not-the-workspace",
         )
     assert outside.value.code == "unsafe_filesystem_engine_path"
+
+
+@pytest.mark.parametrize(
+    ("catalogue_path", "entries_path"),
+    (
+        (Path(".engine/catalogue.json"), None),
+        (Path(".ENGINE/catalogue.json"), None),
+        (None, Path(".engine/entries")),
+        (None, Path(".ENGINE/entries")),
+    ),
+)
+def test_composition_reserves_internal_engine_namespaces(
+    tmp_path,
+    catalogue_path,
+    entries_path,
+):
+    with pytest.raises(RepositoryError) as reserved:
+        _composition(
+            tmp_path,
+            catalogue_path=catalogue_path,
+            entries_path=entries_path,
+        )
+
+    assert reserved.value.code == "unsafe_filesystem_engine_path"
 
 
 @pytest.mark.parametrize(
@@ -481,6 +514,14 @@ def test_composition_requires_every_concrete_service_to_be_bound(tmp_path):
 
     with pytest.raises(ServiceRegistryError, match="not bound"):
         _composition(tmp_path, contribution_factory=incomplete)
+
+
+def test_composite_lib_open_service_is_absent_when_policy_is_not_installed(
+    tmp_path,
+):
+    composed = _composition(tmp_path, open_item_draft_for=None)
+
+    assert composed["engine"].get_service(LIB_OPEN_SERVICE) is None
 
 
 def test_replica_layout_rejects_a_redirecting_ocr_directory(tmp_path):

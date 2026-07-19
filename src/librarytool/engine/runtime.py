@@ -15,7 +15,7 @@ from .capabilities import (
     ModuleManifest,
     WorkbenchManifest,
 )
-from .interchange import LibInterchangeService
+from .interchange import LibInterchangeService, OpenLibService
 from .item_commands import ItemCommandService
 from .items import ItemQueryService, WorkbenchPolicyPort
 from .jobs import JobManager
@@ -424,6 +424,9 @@ ITEM_COMMAND_SERVICE: ServiceKey[ItemCommandService] = ServiceKey(
 INTERCHANGE_SERVICE: ServiceKey[LibInterchangeService] = ServiceKey(
     "replica.interchange"
 )
+LIB_OPEN_SERVICE: ServiceKey[OpenLibService] = ServiceKey(
+    "replica.interchange.open"
+)
 JOB_SERVICE: ServiceKey[JobManager] = ServiceKey("library.jobs")
 REPLICA_SERVICE: ServiceKey[ReplicaApplicationService] = ServiceKey(
     "replica.application"
@@ -604,6 +607,7 @@ class LibraryEngineBuilder:
 __all__ = [
     "DuplicateServiceError",
     "INTERCHANGE_SERVICE",
+    "LIB_OPEN_SERVICE",
     "ITEM_COMMAND_SERVICE",
     "ITEM_QUERY_SERVICE",
     "JOB_SERVICE",

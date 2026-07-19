@@ -108,10 +108,13 @@ larger workbench and packaging split described below remains the target:
   Replica imports now use this boundary: the archive is completely validated
   before staging, and layout, compiled text, figures, styles, translations,
   provenance, and the durable receipt publish as one recoverable transaction.
-  New-item `/api/lib/open` remains on the compatibility path: engine-owned
-  catalogue creation now exists, but opening a package still needs one
-  composite unit of work spanning item allocation, the catalogue, the entry
-  tree, and the import receipt.
+  New-item open is now a separate, capability-gated composite service. One
+  operation allocates and encodes the catalogue row, plans against a pristine
+  primary-source destination, stages the complete entry tree plus normal item
+  and import receipts, publishes a global replay receipt, and publishes the
+  catalogue last through one recoverable write set. The desktop's local-path
+  `/api/lib/open` route is only a compatibility adapter; framework-neutral
+  clients use the idempotent upload resource at `/api/v1/lib-opens`.
 - A provider-neutral Knowledge kernel now models revisioned text corpora,
   stable selectors, lossless deterministic passages, canonical curation
   overlays, lexical evidence retrieval, and revision-pinned evaluation. Its
@@ -153,13 +156,13 @@ credentials in the engine, returns a stable job identity, and preserves
 protected work as a proposal. The workbench observes that job directly and
 distinguishes completion, failure, cancellation, and restart interruption; it
 no longer infers completion from browser-local OCR page markers. The item query
-service is now composed into `/api/v1`, and existing-item `.lib` import now
-demonstrates a recoverable multi-artifact transaction. The remaining
-compatibility route is preserved, while `EngineClient` now imports through the
-stable, idempotent `/api/v1/items/{id}/replica/lib-imports` resource and
-receives the complete durable receipt. Translation reads and human page edits,
-plus catalogue-only item create/update, now demonstrate the same separation
-for two more workbench domains.
+service is now composed into `/api/v1`, and both existing-item import and
+new-item `.lib` open demonstrate recoverable multi-artifact transactions. The
+local-path compatibility route is preserved, while `EngineClient` imports or
+opens packages through stable idempotent resources and receives complete
+durable receipts. Translation reads and human page edits, plus catalogue-only
+item create/update, now demonstrate the same separation for two more
+workbench domains.
 
 ### Translation aggregate boundary
 
@@ -247,13 +250,12 @@ unsupported.
 
 With the lifecycle seam established, migrate these data boundaries in order:
 
-1. **Composite item lifecycle.** Coordinate catalogue-only create with source
-   attachment and new-item `.lib` import, then move delete and restore behind
-   the same recoverable command boundary. One operation must cover allocation,
-   catalogue publication, entry-directory assets, receipts/tombstones, and
-   rollback. Do not implement `/api/lib/open` by nesting today's independent
-   item and interchange transactions; existing-item import can continue using
-   its already-atomic unit of work meanwhile.
+1. **Complete the composite item lifecycle.** New-item `.lib` open now proves
+   allocation, catalogue publication, entry assets, nested receipts, replay,
+   rollback, and restart recovery in one transaction. Reuse those staging
+   seams for source attachment, then move item delete and restore behind the
+   same aggregate boundary with entry-tree tombstones. Do not regress to
+   nesting independently committing services.
 2. **Representation and canvas resources.** Replace attached filesystem paths
    and page-number assumptions with opaque representation, asset, ordered
    canvas, and structure identities. Add explicit attachment/detachment and
@@ -282,6 +284,7 @@ round-trip tests.
 Companion documents:
 
 - [Architecture: data ownership and trust boundaries](architecture.md)
+- [Post-engine desktop UI/UX redesign specification](ui-ux-redesign-spec.md)
 - [Facsimile pipeline and current Replica implementation](facsimile-workbench-plan.md)
 - [`.lib` interchange format](lib-format.md)
 

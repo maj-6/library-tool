@@ -223,6 +223,16 @@ class ExistingItemLibArchivePlanner:
             archive_sha256=archive_sha256,
             format_version=f"{fmt[0]}.{fmt[1]}",
             incoming_book_id=incoming_book_id,
+            # Keep catalogue seeding data as detached, untrusted manifest
+            # metadata.  Existing-item imports ignore it; the composite
+            # open-new-item service passes it through an injected policy that
+            # selects the fields its catalogue understands.  This avoids a
+            # second archive parse in Flask (or a future Qt/Godot host).
+            manifest_metadata=(
+                book.get("meta")
+                if isinstance(book.get("meta"), Mapping)
+                else {}
+            ),
             pages=tuple(applied),
             pages_skipped=tuple(pages["skipped"]),
             pages_protected=tuple(pages["protected"]),

@@ -47,6 +47,12 @@ from .interchange import (
     LibTemplateImport,
     LibTranslationImport,
     OpenLibCommand,
+    OpenLibDraftFactory,
+    OpenLibRepositoryPort,
+    OpenLibResult,
+    OpenLibReceipt,
+    OpenLibService,
+    OpenLibUnitOfWorkPort,
 )
 from .items import (
     ArtifactRef,
@@ -77,6 +83,7 @@ from .item_commands import (
 from .replica import ReplicaApplicationService
 from .runtime import (
     INTERCHANGE_SERVICE,
+    LIB_OPEN_SERVICE,
     ITEM_COMMAND_SERVICE,
     ITEM_QUERY_SERVICE,
     JOB_SERVICE,
@@ -123,6 +130,7 @@ __all__ = [
     "DuplicateManifestError",
     "DuplicateServiceError",
     "INTERCHANGE_SERVICE",
+    "LIB_OPEN_SERVICE",
     "ITEM_COMMAND_SERVICE",
     "ITEM_QUERY_SERVICE",
     "JOB_SERVICE",
@@ -186,6 +194,12 @@ __all__ = [
     "NotFoundError",
     "PreconditionRequiredError",
     "OpenLibCommand",
+    "OpenLibDraftFactory",
+    "OpenLibRepositoryPort",
+    "OpenLibResult",
+    "OpenLibReceipt",
+    "OpenLibService",
+    "OpenLibUnitOfWorkPort",
     "PUBLIC_JOB_FIELDS",
     "ReplicaApplicationService",
     "RepresentationDraft",

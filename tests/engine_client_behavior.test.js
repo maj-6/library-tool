@@ -68,6 +68,7 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
     client.replica.instructions.get,
     client.replica.instructions.save,
     client.replica.styles.reset,
+    client.replica.packages.open,
     client.replica.packages.import,
   ];
   const urlBuilders = [
@@ -77,7 +78,7 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
     client.replica.packages.exportUrl,
     client.replica.printUrl,
   ];
-  assert.equal(jsonMethods.length, 21);
+  assert.equal(jsonMethods.length, 22);
   assert.ok(jsonMethods.every((method) => typeof method === "function"));
   assert.equal(urlBuilders.length, 5);
   assert.ok(urlBuilders.every((method) => typeof method === "function"));
@@ -398,7 +399,34 @@ test("Replica import uses the versioned idempotent multipart contract", async ()
   assert.equal(init.headers.Accept, "application/json");
 });
 
-test("Replica import rejects a missing or unsafe idempotency key locally", () => {
+test("Replica open uses the composite new-item multipart contract", async () => {
+  class FakeFormData {
+    constructor() { this.entries = []; }
+    append(name, value) { this.entries.push([name, value]); }
+  }
+  const calls = [];
+  const client = new EngineClient({
+    transport: async (url, init) => {
+      calls.push({ url, init });
+      return response(201, { ok: true, replayed: false });
+    },
+    formDataFactory: () => new FakeFormData(),
+  });
+  const file = { name: "edition.lib" };
+
+  await client.replica.packages.open({
+    file, idempotencyKey: "open-command-1",
+  });
+
+  const { url, init } = calls[0];
+  assert.equal(url, "/api/v1/lib-opens");
+  assert.equal(init.method, "POST");
+  assert.deepEqual(init.body.entries, [["lib", file]]);
+  assert.equal(init.headers["Idempotency-Key"], "open-command-1");
+  assert.equal(init.headers["Content-Type"], undefined);
+});
+
+test("Replica package commands reject unsafe idempotency keys locally", () => {
   class FakeFormData {
     append() {}
   }
@@ -422,6 +450,10 @@ test("Replica import rejects a missing or unsafe idempotency key locally", () =>
       bookId: "book", sourceId: "primary", file: {},
       idempotencyKey: "unsafe/key",
     }),
+    (error) => error instanceof TypeError && /idempotencyKey/.test(error.message),
+  );
+  assert.throws(
+    () => client.replica.packages.open({ file: {} }),
     (error) => error instanceof TypeError && /idempotencyKey/.test(error.message),
   );
   assert.equal(calls, 0);

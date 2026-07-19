@@ -432,6 +432,16 @@ class CreateItemCommand:
             raise TypeError("operation_id must be a string")
 
 
+def create_item_command_sha256(draft: ItemDraft) -> str:
+    """Return the canonical identity used by every create-item boundary."""
+
+    if not isinstance(draft, ItemDraft):
+        raise TypeError("draft must be an ItemDraft")
+    return hashlib.sha256(
+        _canonical({"action": "create", "draft": draft.as_dict()})
+    ).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class UpdateItemCommand:
     item_id: str
@@ -767,9 +777,7 @@ class ItemCommandService:
                 code="invalid_item_command",
             )
         operation_id = self._operation_id(command.operation_id)
-        command_sha256 = self._command_hash(
-            {"action": "create", "draft": command.draft.as_dict()}
-        )
+        command_sha256 = create_item_command_sha256(command.draft)
         try:
             with self._repository.unit_of_work(
                 operation_id=operation_id
@@ -1160,4 +1168,5 @@ __all__ = [
     "ItemRecordSnapshot",
     "RepresentationDraft",
     "UpdateItemCommand",
+    "create_item_command_sha256",
 ]

@@ -25,6 +25,7 @@ from librarytool.engine.runtime import (
     ITEM_COMMAND_SERVICE,
     ITEM_QUERY_SERVICE,
     JOB_SERVICE,
+    LIB_OPEN_SERVICE,
     REPLICA_SERVICE,
     TEXT_LAYER_SERVICE,
     TRANSLATION_PROVENANCE_SERVICE,
@@ -246,6 +247,7 @@ def test_http_discovery_exposes_resolved_installed_workbenches(client):
         (row["id"], row["version"]) for row in document["capabilities"]}
     assert ("replica.regions", 1) in capabilities
     assert ("replica.interchange", 2) in capabilities
+    assert ("replica.interchange.open", 1) in capabilities
     assert ("library.jobs", 1) in capabilities
 
 
@@ -363,6 +365,7 @@ def test_production_services_and_capabilities_are_one_sealed_graph(client):
         (ITEM_QUERY_SERVICE, engine.items),
         (ITEM_COMMAND_SERVICE, engine.item_commands),
         (INTERCHANGE_SERVICE, engine.interchange),
+        (LIB_OPEN_SERVICE, engine.require_service(LIB_OPEN_SERVICE)),
         (JOB_SERVICE, engine.jobs),
         (REPLICA_SERVICE, engine.replica),
         (TEXT_LAYER_SERVICE, engine.text_layers),

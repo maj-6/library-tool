@@ -52,7 +52,7 @@ def resolve_workspace_path(
         ) from exc
     if (
         not relative.parts
-        or relative.parts[0].casefold() == ".transactions"
+        or relative.parts[0].casefold() in {".engine", ".transactions"}
         or any(part in {"", ".", ".."} for part in relative.parts)
     ):
         raise RepositoryError(

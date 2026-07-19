@@ -179,6 +179,9 @@ def _host_inputs(
             clean_region_id=lambda value: str(value or ""),
             normalize_language=lambda value: str(value).lower(),
             sanitize_document_name=str,
+            open_item_draft_for=lambda metadata: ItemDraft(
+                title=str(metadata.get("title") or "")
+            ),
         ),
         translation=TranslationBindings(
             item_exists_for=lambda item_id: item_id == "book-one",

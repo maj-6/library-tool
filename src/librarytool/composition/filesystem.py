@@ -25,12 +25,18 @@ from ..adapters.filesystem import (
     FilesystemInterchangeRepository,
     FilesystemItemCommandRepository,
     FilesystemItemQueryRepository,
+    FilesystemOpenLibRepository,
     FilesystemReplicaRepository,
     FilesystemTranslationRepository,
     RecoverableWriteSet,
 )
 from ..engine.errors import RepositoryError
-from ..engine.interchange import LibImportPlannerPort, LibInterchangeService
+from ..engine.interchange import (
+    LibImportPlannerPort,
+    LibInterchangeService,
+    OpenLibDraftFactory,
+    OpenLibService,
+)
 from ..engine.item_commands import (
     ItemCommandService,
     ItemDraft,
@@ -49,6 +55,7 @@ from ..engine.runtime import (
     ITEM_COMMAND_SERVICE,
     ITEM_QUERY_SERVICE,
     JOB_SERVICE,
+    LIB_OPEN_SERVICE,
     REPLICA_SERVICE,
     TEXT_LAYER_SERVICE,
     TRANSLATION_PROVENANCE_SERVICE,
@@ -214,6 +221,10 @@ class InterchangeBindings:
     clean_region_id: Callable[[Any], str]
     normalize_language: Callable[[str], str]
     sanitize_document_name: Callable[[str], str]
+    # Opening an archive as a *new* item is a composite of catalogue-create
+    # and Replica interchange.  Hosts that install only existing-item
+    # interchange omit this policy and the service/capability disappears.
+    open_item_draft_for: OpenLibDraftFactory | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +258,7 @@ class FilesystemServiceGraph:
     items: ItemQueryService
     item_commands: ItemCommandService
     interchange: LibInterchangeService
+    lib_open: OpenLibService | None
     jobs: JobManager
     replica: ReplicaApplicationService
     text_layers: TextLayerService
@@ -254,10 +266,11 @@ class FilesystemServiceGraph:
     translation_provenance: TranslationProvenanceService
 
     def keyed_services(self) -> tuple[tuple[ServiceKey[Any], Any], ...]:
-        return (
+        services = (
             (ITEM_QUERY_SERVICE, self.items),
             (ITEM_COMMAND_SERVICE, self.item_commands),
             (INTERCHANGE_SERVICE, self.interchange),
+            (LIB_OPEN_SERVICE, self.lib_open),
             (JOB_SERVICE, self.jobs),
             (REPLICA_SERVICE, self.replica),
             (TEXT_LAYER_SERVICE, self.text_layers),
@@ -266,6 +279,11 @@ class FilesystemServiceGraph:
                 TRANSLATION_PROVENANCE_SERVICE,
                 self.translation_provenance,
             ),
+        )
+        return tuple(
+            (key, service)
+            for key, service in services
+            if service is not None
         )
 
 
@@ -376,6 +394,27 @@ def compose_filesystem_engine(
         lock_context_for=catalogue.lock_context_for,
         recover=False,
     )
+    lib_open = None
+    if interchange.open_item_draft_for is not None:
+        lib_open_repository = FilesystemOpenLibRepository(
+            resources.write_set,
+            catalogue_path=catalogue_path,
+            entry_directory_for=entry_directory_for,
+            decode_record=catalogue.decode_record,
+            encode_record=catalogue.encode_record,
+            allocate_item_id=catalogue.allocate_item_id,
+            clean_region_id=interchange.clean_region_id,
+            normalize_language=interchange.normalize_language,
+            validate_item_id=entry_directory_for.validate_item_id,
+            sanitize_document_name=interchange.sanitize_document_name,
+            lock_context_for=lambda: resources.workspace_lock_context_for(""),
+            recover=False,
+        )
+        lib_open = OpenLibService(
+            interchange.planner,
+            lib_open_repository,
+            interchange.open_item_draft_for,
+        )
 
     graph = FilesystemServiceGraph(
         items=items,
@@ -384,6 +423,7 @@ def compose_filesystem_engine(
             interchange.planner,
             interchange_repository,
         ),
+        lib_open=lib_open,
         jobs=resources.jobs,
         replica=replica_service,
         text_layers=text_layers,

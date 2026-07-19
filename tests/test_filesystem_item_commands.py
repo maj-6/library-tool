@@ -532,6 +532,7 @@ def test_malformed_global_receipt_blocks_replay_without_mutation(
     "catalogue_path",
     [
         "../outside.json",
+        ".engine/catalogue.json",
         ".engine/receipts/item-commands/catalogue.json",
         ".ENGINE/RECEIPTS/ITEM-COMMANDS/catalogue.JSON",
         ".Engine/Tombstones/Items/catalogue.json",

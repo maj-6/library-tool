@@ -32,7 +32,11 @@ from ...engine.item_commands import (
     ItemMutationReceipt,
     ItemRecordSnapshot,
 )
-from .recoverable_write_set import RecoverableWriteSet, WriteSetError
+from .recoverable_write_set import (
+    RecoverableWriteSet,
+    RecoverableWriteTransaction,
+    WriteSetError,
+)
 
 
 RecordDecoder = Callable[[str, Mapping[str, Any]], ItemRecordSnapshot]
@@ -269,17 +273,7 @@ class FilesystemItemCommandRepository:
         try:
             with self._write_set.workspace_lease():
                 with self._lock_context_for():
-                    unit = FilesystemItemCommandUnitOfWork(
-                        self._write_set,
-                        operation_id=operation_id,
-                        catalogue_relative=self._catalogue_relative,
-                        safe_target=self._safe_target,
-                        decode_record=self._decode_record,
-                        encode_record=self._encode_record,
-                        allocate_item_id=self._allocate_item_id,
-                        validate_item_id=self._validate_item_id,
-                        allocate_tombstone_id=self._allocate_tombstone_id,
-                    )
+                    unit = self.open_locked_unit(operation_id=operation_id)
                     try:
                         yield unit
                     finally:
@@ -292,6 +286,42 @@ class FilesystemItemCommandRepository:
                 code=exc.code,
                 message="the item repository workspace is unavailable",
             ) from exc
+
+    def open_locked_unit(
+        self,
+        *,
+        operation_id: str,
+    ) -> "FilesystemItemCommandUnitOfWork":
+        """Build a unit while a composite caller already holds both locks.
+
+        This is an adapter-composition seam, not an alternative locking API.
+        The caller must hold this repository's workspace lease and the broad
+        catalogue lock until it closes the returned unit.
+        """
+
+        self._identifier(operation_id, field_name="operation_id")
+        return FilesystemItemCommandUnitOfWork(
+            self._write_set,
+            operation_id=operation_id,
+            catalogue_relative=self._catalogue_relative,
+            safe_target=self._safe_target,
+            decode_record=self._decode_record,
+            encode_record=self._encode_record,
+            allocate_item_id=self._allocate_item_id,
+            validate_item_id=self._validate_item_id,
+            allocate_tombstone_id=self._allocate_tombstone_id,
+        )
+
+    @property
+    def catalogue_relative(self) -> str:
+        """Return the normalized catalogue target for adapter composition."""
+
+        return self._catalogue_relative
+
+    def target_path(self, relative: str, *, artifact: str) -> Path:
+        """Resolve a transaction-relative target through shared hardening."""
+
+        return self._safe_target(relative, artifact=artifact)
 
     def _catalogue_path(self, value: str | Path) -> str:
         configured = Path(value)
@@ -333,7 +363,8 @@ class FilesystemItemCommandRepository:
         receipts = tuple(part.casefold() for part in _RECEIPT_ROOT.parts)
         tombstones = tuple(part.casefold() for part in _TOMBSTONE_ROOT.parts)
         return (
-            parts[: len(receipts)] == receipts
+            parts[0] == ".engine"
+            or parts[: len(receipts)] == receipts
             or parts[: len(tombstones)] == tombstones
         )
 
@@ -414,6 +445,7 @@ class FilesystemItemCommandUnitOfWork:
         self._staged_snapshot: ItemRecordSnapshot | None = None
         self._staged_deletion: ItemDeletionSnapshot | None = None
         self._deleted_raw: dict[str, Any] | None = None
+        self._publication_staged = False
         self._committed = False
         self._closed = False
 
@@ -579,6 +611,57 @@ class FilesystemItemCommandUnitOfWork:
                 "the item command unit is already committed",
                 code="item_command_unit_committed",
             )
+        try:
+            transaction = self._write_set.begin(
+                operation_id=self._operation_id,
+                scope="item-command",
+                metadata={
+                    "action": self._staged_action,
+                    "item_id": self._staged_item_id,
+                },
+            )
+            self.stage_publication(transaction, receipt)
+            transaction.commit(receipt=receipt.as_dict())
+        except WriteSetError as exc:
+            raise _safe_cause(
+                exc,
+                code=exc.code,
+                message="the item repository transaction failed",
+            ) from exc
+        self._committed = True
+
+    def stage_publication(
+        self,
+        transaction: RecoverableWriteTransaction,
+        receipt: ItemMutationReceipt,
+    ) -> None:
+        """Stage this mutation into a caller-owned workspace transaction.
+
+        This package-level composition seam lets a larger filesystem aggregate
+        publish an item mutation without nesting another recoverable write set.
+        Call it only while the repository's workspace and catalogue locks are
+        still held.  The catalogue write is deliberately appended last, so a
+        composite caller must stage every other artifact before invoking it.
+        """
+
+        self._ensure_open()
+        if self._committed:
+            raise RepositoryError(
+                "the item command unit is already committed",
+                code="item_command_unit_committed",
+            )
+        if self._publication_staged:
+            raise RepositoryError(
+                "the item mutation publication is already staged",
+                code="item_mutation_already_staged",
+            )
+        if not isinstance(transaction, RecoverableWriteTransaction) or (
+            transaction._owner is not self._write_set
+        ):
+            raise RepositoryError(
+                "the item mutation transaction belongs to another workspace",
+                code="item_repository_scope_mismatch",
+            )
         if not self._staged_action or self._staged_catalogue is None:
             raise RepositoryError(
                 "no item mutation has been staged",
@@ -591,60 +674,39 @@ class FilesystemItemCommandUnitOfWork:
                 code="item_command_receipt_exists",
             )
 
-        try:
-            transaction = self._write_set.begin(
-                operation_id=self._operation_id,
-                scope="item-command",
-                metadata={
-                    "action": self._staged_action,
-                    "item_id": self._staged_item_id,
-                },
-            )
-            if self._staged_action == "delete":
-                assert self._staged_deletion is not None
-                assert self._deleted_raw is not None
-                transaction.stage_write(
-                    self._tombstone_relative(
-                        self._staged_deletion.tombstone_id
-                    ),
-                    _json_bytes(
-                        {
-                            "schema": "librarytool.item-tombstone/1",
-                            "tombstone_id": (
-                                self._staged_deletion.tombstone_id
-                            ),
-                            "item_id": self._staged_item_id,
-                            "prior_revision": receipt.before_revision,
-                            "operation_id": self._operation_id,
-                            "command_sha256": receipt.command_sha256,
-                            "record": self._deleted_raw,
-                        },
-                        artifact="item_tombstone",
-                    ),
-                )
+        if self._staged_action == "delete":
+            assert self._staged_deletion is not None
+            assert self._deleted_raw is not None
             transaction.stage_write(
-                self._receipt_relative(self._operation_id),
+                self._tombstone_relative(self._staged_deletion.tombstone_id),
                 _json_bytes(
-                    receipt.as_dict(),
-                    artifact="item_command_receipt",
+                    {
+                        "schema": "librarytool.item-tombstone/1",
+                        "tombstone_id": self._staged_deletion.tombstone_id,
+                        "item_id": self._staged_item_id,
+                        "prior_revision": receipt.before_revision,
+                        "operation_id": self._operation_id,
+                        "command_sha256": receipt.command_sha256,
+                        "record": self._deleted_raw,
+                    },
+                    artifact="item_tombstone",
                 ),
             )
-            # The catalogue is deliberately last. Legacy readers that do not
-            # yet take the workspace lease cannot discover a new item before
-            # all of its transaction metadata exists; rollback removes it
-            # first.
-            transaction.stage_write(
-                self._catalogue_relative,
-                _json_bytes(self._staged_catalogue, artifact="catalogue"),
-            )
-            transaction.commit(receipt=receipt.as_dict())
-        except WriteSetError as exc:
-            raise _safe_cause(
-                exc,
-                code=exc.code,
-                message="the item repository transaction failed",
-            ) from exc
-        self._committed = True
+        transaction.stage_write(
+            self._receipt_relative(self._operation_id),
+            _json_bytes(
+                receipt.as_dict(),
+                artifact="item_command_receipt",
+            ),
+        )
+        # Legacy readers that do not yet take the workspace lease cannot
+        # discover a new item before all of its transaction metadata exists;
+        # rollback removes this last-published row first.
+        transaction.stage_write(
+            self._catalogue_relative,
+            _json_bytes(self._staged_catalogue, artifact="catalogue"),
+        )
+        self._publication_staged = True
 
     def close(self) -> None:
         """Invalidate this locked snapshot when its repository scope exits."""

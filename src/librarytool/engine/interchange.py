@@ -15,9 +15,15 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, ContextManager, Literal, Protocol, TypeAlias
+from typing import Any, Callable, ContextManager, Literal, Protocol, TypeAlias
 
-from .errors import ConflictError, RepositoryError, ValidationError
+from .errors import ConflictError, EngineError, RepositoryError, ValidationError
+from .item_commands import (
+    ItemDraft,
+    ItemMutationReceipt,
+    ItemRecordSnapshot,
+    create_item_command_sha256,
+)
 
 
 _OPERATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -154,6 +160,42 @@ def _normalize_disposition(
     return value
 
 
+def _semantic_sha256(value: Mapping[str, Any]) -> str:
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _lib_import_command_sha256(
+    *,
+    item_id: str,
+    source_id: str,
+    overwrite: bool,
+    archive_sha256: str,
+) -> str:
+    return _semantic_sha256(
+        {
+            "archive_sha256": archive_sha256,
+            "item_id": item_id,
+            "overwrite": overwrite,
+            "source_id": source_id,
+        }
+    )
+
+
+def _open_lib_command_sha256(archive_sha256: str) -> str:
+    return _semantic_sha256(
+        {
+            "action": "open-lib",
+            "archive_sha256": archive_sha256,
+            "source_id": "primary",
+        }
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ImportWarning:
     location: str
@@ -178,14 +220,11 @@ class ImportLibCommand:
 
 @dataclass(frozen=True, slots=True)
 class OpenLibCommand:
-    """Reserved create-new command.
+    """Open an archive as a newly allocated catalogue item.
 
-    Existing-item import is the first implemented transactional vertical.
-    Opening an archive as a new item also has to create the catalogue record
-    inside that same unit of work; it intentionally remains outside
-    :class:`LibInterchangeService` until that create-item repository contract
-    exists.  Keeping the transport DTO here prevents a Flask/local-path detail
-    from leaking into the eventual application service.
+    ``source_path`` is optional display/provenance context for callers.  It is
+    deliberately excluded from command identity: moving the same archive does
+    not turn a retry into a different semantic operation.
     """
 
     archive: bytes
@@ -418,6 +457,7 @@ class LibImportPlan:
     archive_sha256: str
     format_version: str
     incoming_book_id: str = ""
+    manifest_metadata: Mapping[str, Any] = field(default_factory=dict)
     pages: tuple[LibPageImport, ...] = ()
     pages_skipped: tuple[int, ...] = ()
     pages_protected: tuple[int, ...] = ()
@@ -434,6 +474,14 @@ class LibImportPlan:
     warnings: tuple[ImportWarning, ...] = ()
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "manifest_metadata",
+            _freeze_mapping(
+                self.manifest_metadata,
+                path="$.manifest_metadata",
+            ),
+        )
         object.__setattr__(
             self, "pages", _typed_tuple(self.pages, LibPageImport, field_name="pages")
         )
@@ -726,6 +774,161 @@ class LibImportReceipt:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class OpenLibReceipt:
+    """Durable outcome of creating an item from one ``.lib`` archive."""
+
+    operation_id: str
+    archive_sha256: str
+    command_sha256: str
+    item_id: str
+    item_receipt: ItemMutationReceipt
+    import_receipt: LibImportReceipt
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "operation_id",
+            "archive_sha256",
+            "command_sha256",
+            "item_id",
+        ):
+            if not isinstance(getattr(self, field_name), str):
+                raise TypeError(f"{field_name} must be a string")
+        if not _OPERATION_ID_RE.fullmatch(self.operation_id):
+            raise ValueError("operation_id is not a portable operation token")
+        if not _SHA256_RE.fullmatch(self.archive_sha256):
+            raise ValueError("archive_sha256 must be a lowercase SHA-256 digest")
+        if not _SHA256_RE.fullmatch(self.command_sha256):
+            raise ValueError("command_sha256 must be a lowercase SHA-256 digest")
+        _portable_identifier(self.item_id, field_name="item_id")
+        if not isinstance(self.item_receipt, ItemMutationReceipt):
+            raise TypeError("item_receipt must be an ItemMutationReceipt")
+        if not isinstance(self.import_receipt, LibImportReceipt):
+            raise TypeError("import_receipt must be a LibImportReceipt")
+
+        if self.command_sha256 != _open_lib_command_sha256(self.archive_sha256):
+            raise ValueError("command_sha256 does not identify this open operation")
+        if (
+            self.item_receipt.operation_id != self.operation_id
+            or self.import_receipt.operation_id != self.operation_id
+        ):
+            raise ValueError("nested receipt operation identity does not match")
+        if (
+            self.item_receipt.item_id != self.item_id
+            or self.import_receipt.item_id != self.item_id
+        ):
+            raise ValueError("nested receipt item identity does not match")
+        if self.item_receipt.action != "create":
+            raise ValueError("item_receipt must describe item creation")
+        if self.item_receipt.item is None:
+            raise ValueError("item_receipt must contain the created item")
+        expected_item_command = create_item_command_sha256(
+            self.item_receipt.item.as_draft()
+        )
+        if self.item_receipt.command_sha256 != expected_item_command:
+            raise ValueError("item_receipt command identity does not match")
+        if self.import_receipt.archive_sha256 != self.archive_sha256:
+            raise ValueError("import_receipt archive identity does not match")
+        if self.import_receipt.source_id != "primary":
+            raise ValueError("import_receipt must target the primary source")
+        if self.import_receipt.overwrite:
+            raise ValueError("import_receipt cannot overwrite a new item")
+        expected_import_command = _lib_import_command_sha256(
+            item_id=self.item_id,
+            source_id="primary",
+            overwrite=False,
+            archive_sha256=self.archive_sha256,
+        )
+        if self.import_receipt.command_sha256 != expected_import_command:
+            raise ValueError("import_receipt command identity does not match")
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "OpenLibReceipt":
+        """Rehydrate a strict composite receipt from persisted JSON data."""
+
+        if not isinstance(value, Mapping):
+            raise TypeError("an open .lib receipt must be an object")
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("open .lib receipt field names must be strings")
+        fields = {
+            "operation_id",
+            "archive_sha256",
+            "command_sha256",
+            "item_id",
+            "item_receipt",
+            "import_receipt",
+        }
+        supplied = set(value)
+        if supplied != fields:
+            missing = sorted(fields - supplied)
+            extra = sorted(supplied - fields)
+            raise ValueError(
+                "open .lib receipt fields do not match the schema; "
+                f"missing={missing}, extra={extra}"
+            )
+        return cls(
+            operation_id=value["operation_id"],
+            archive_sha256=value["archive_sha256"],
+            command_sha256=value["command_sha256"],
+            item_id=value["item_id"],
+            item_receipt=ItemMutationReceipt.from_dict(value["item_receipt"]),
+            import_receipt=LibImportReceipt.from_dict(value["import_receipt"]),
+        )
+
+    @property
+    def item(self) -> ItemRecordSnapshot:
+        item = self.item_receipt.item
+        assert item is not None
+        return item
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "operation_id": self.operation_id,
+            "archive_sha256": self.archive_sha256,
+            "command_sha256": self.command_sha256,
+            "item_id": self.item_id,
+            "item_receipt": self.item_receipt.as_dict(),
+            "import_receipt": self.import_receipt.as_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class OpenLibResult:
+    receipt: OpenLibReceipt
+    replayed: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.receipt, OpenLibReceipt):
+            raise TypeError("receipt must be an OpenLibReceipt")
+        if not isinstance(self.replayed, bool):
+            raise TypeError("replayed must be a boolean")
+
+    @property
+    def item_id(self) -> str:
+        return self.receipt.item_id
+
+    @property
+    def item(self) -> ItemRecordSnapshot:
+        return self.receipt.item
+
+    @property
+    def item_receipt(self) -> ItemMutationReceipt:
+        return self.receipt.item_receipt
+
+    @property
+    def import_receipt(self) -> LibImportReceipt:
+        return self.receipt.import_receipt
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "replayed": self.replayed,
+            "receipt": self.receipt.as_dict(),
+        }
+
+
+OpenLibDraftFactory: TypeAlias = Callable[[Mapping[str, Any]], ItemDraft]
+
+
 class LibImportPlannerPort(Protocol):
     """Decode and sanitize an archive against a locked destination view."""
 
@@ -772,6 +975,46 @@ class InterchangeRepositoryPort(Protocol):
         source_id: str,
         operation_id: str,
     ) -> ContextManager[InterchangeUnitOfWorkPort]: ...
+
+
+class OpenLibUnitOfWorkPort(Protocol):
+    """One atomic catalogue-create and archive-import transaction.
+
+    The repository holds a stable catalogue/workspace lock through context
+    exit.  Staging methods must not publish live state.  ``commit`` publishes
+    the catalogue record, imported entry artifacts, and composite receipt as
+    one recoverable outcome; context exit without a successful commit rolls
+    every staged or partially applied change back.
+    """
+
+    def receipt(self, operation_id: str) -> OpenLibReceipt | None: ...
+
+    def allocate_item_id(self) -> str: ...
+
+    def pristine_destination(
+        self,
+        item_id: str,
+    ) -> ImportDestinationSnapshot: ...
+
+    def stage_item_create(
+        self,
+        item_id: str,
+        draft: ItemDraft,
+    ) -> ItemRecordSnapshot: ...
+
+    def apply(self, plan: LibImportPlan) -> None: ...
+
+    def commit(self, receipt: OpenLibReceipt) -> None: ...
+
+
+class OpenLibRepositoryPort(Protocol):
+    """Open operation-scoped composite units of work."""
+
+    def unit_of_work(
+        self,
+        *,
+        operation_id: str,
+    ) -> ContextManager[OpenLibUnitOfWorkPort]: ...
 
 
 class LibInterchangeService:
@@ -823,7 +1066,7 @@ class LibInterchangeService:
                 code="archive_required",
             )
         archive_sha256 = hashlib.sha256(command.archive).hexdigest()
-        command_sha256 = self._command_hash(
+        command_sha256 = self.command_sha256(
             item_id=item_id,
             source_id=source_id,
             overwrite=bool(command.overwrite),
@@ -913,13 +1156,13 @@ class LibInterchangeService:
                         "incoming_book_id": plan.incoming_book_id,
                     },
                 )
-            self._validate_plan(
+            self.validate_plan(
                 plan,
                 destination=destination,
                 source_id=source_id,
                 overwrite=bool(command.overwrite),
             )
-            receipt = self._receipt(
+            receipt = self.receipt_for_plan(
                 operation_id,
                 destination.item_id,
                 source_id,
@@ -932,7 +1175,7 @@ class LibInterchangeService:
             return receipt
 
     @staticmethod
-    def _validate_plan(
+    def validate_plan(
         plan: LibImportPlan,
         *,
         destination: ImportDestinationSnapshot,
@@ -1246,7 +1489,7 @@ class LibInterchangeService:
             invalid("compiled_page_missing", pages=missing_compiled_pages)
 
     @staticmethod
-    def _receipt(
+    def receipt_for_plan(
         operation_id: str,
         item_id: str,
         source_id: str,
@@ -1284,24 +1527,264 @@ class LibInterchangeService:
         )
 
     @staticmethod
-    def _command_hash(
+    def command_sha256(
         *,
         item_id: str,
         source_id: str,
         overwrite: bool,
         archive_sha256: str,
     ) -> str:
-        payload = json.dumps(
-            {
-                "archive_sha256": archive_sha256,
-                "item_id": item_id,
-                "overwrite": overwrite,
-                "source_id": source_id,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        return hashlib.sha256(payload).hexdigest()
+        return _lib_import_command_sha256(
+            item_id=item_id,
+            source_id=source_id,
+            overwrite=overwrite,
+            archive_sha256=archive_sha256,
+        )
+
+
+class OpenLibService:
+    """Create a catalogue item and import its archive in one unit of work."""
+
+    SOURCE_ID = "primary"
+
+    def __init__(
+        self,
+        planner: LibImportPlannerPort,
+        repository: OpenLibRepositoryPort,
+        draft_factory: OpenLibDraftFactory,
+    ) -> None:
+        if not callable(draft_factory):
+            raise TypeError("draft_factory must be callable")
+        self._planner = planner
+        self._repository = repository
+        self._draft_factory = draft_factory
+
+    def open_lib(self, command: OpenLibCommand) -> OpenLibResult:
+        if not isinstance(command, OpenLibCommand):
+            raise ValidationError(
+                "open requires an OpenLibCommand",
+                code="invalid_open_lib_command",
+            )
+        if not isinstance(command.operation_id, str) or not _OPERATION_ID_RE.fullmatch(
+            command.operation_id
+        ):
+            raise ValidationError(
+                "operation id must be a portable non-empty token",
+                code="invalid_operation_id",
+            )
+        if not isinstance(command.archive, bytes) or not command.archive:
+            raise ValidationError(
+                "a non-empty .lib archive is required",
+                code="archive_required",
+            )
+        if not isinstance(command.source_path, str):
+            raise ValidationError(
+                "source path context must be a string",
+                code="invalid_source_path",
+            )
+
+        operation_id = command.operation_id
+        archive_sha256 = hashlib.sha256(command.archive).hexdigest()
+        command_sha256 = self.command_sha256(archive_sha256)
+        try:
+            with self._repository.unit_of_work(
+                operation_id=operation_id
+            ) as unit:
+                prior = unit.receipt(operation_id)
+                if prior is not None:
+                    if not isinstance(prior, OpenLibReceipt):
+                        raise RepositoryError(
+                            "open .lib repository returned an invalid receipt",
+                            code="invalid_open_lib_receipt",
+                        )
+                    if prior.operation_id != operation_id:
+                        raise RepositoryError(
+                            "open .lib repository returned another operation receipt",
+                            code="receipt_scope_mismatch",
+                        )
+                    if prior.command_sha256 != command_sha256:
+                        raise ConflictError(
+                            "operation id was already used for another open command",
+                            code="operation_id_conflict",
+                            details={"operation_id": operation_id},
+                        )
+                    return OpenLibResult(prior, replayed=True)
+
+                item_id = self._allocated_item_id(unit.allocate_item_id())
+                destination = unit.pristine_destination(item_id)
+                self._validate_pristine_destination(
+                    destination,
+                    item_id=item_id,
+                )
+                plan = self._planner.plan(
+                    command.archive,
+                    destination,
+                    source_id=self.SOURCE_ID,
+                    overwrite=False,
+                    archive_sha256=archive_sha256,
+                )
+                if not isinstance(plan, LibImportPlan):
+                    raise RepositoryError(
+                        "interchange planner returned an invalid plan",
+                        code="invalid_import_plan",
+                    )
+                if plan.archive_sha256 != archive_sha256:
+                    raise RepositoryError(
+                        "interchange planner returned the wrong archive identity",
+                        code="archive_identity_mismatch",
+                    )
+                LibInterchangeService.validate_plan(
+                    plan,
+                    destination=destination,
+                    source_id=self.SOURCE_ID,
+                    overwrite=False,
+                )
+
+                draft = self._draft_factory(plan.manifest_metadata)
+                if not isinstance(draft, ItemDraft):
+                    raise RepositoryError(
+                        "open .lib draft factory returned an invalid draft",
+                        code="invalid_open_lib_draft",
+                    )
+                staged = unit.stage_item_create(item_id, draft)
+                self._validate_staged_item(
+                    staged,
+                    item_id=item_id,
+                    draft=draft,
+                )
+                item_receipt = ItemMutationReceipt(
+                    action="create",
+                    operation_id=operation_id,
+                    command_sha256=create_item_command_sha256(draft),
+                    item_id=item_id,
+                    after_revision=staged.revision,
+                    item=staged,
+                )
+                import_command_sha256 = LibInterchangeService.command_sha256(
+                    item_id=item_id,
+                    source_id=self.SOURCE_ID,
+                    overwrite=False,
+                    archive_sha256=archive_sha256,
+                )
+                import_receipt = LibInterchangeService.receipt_for_plan(
+                    operation_id,
+                    item_id,
+                    self.SOURCE_ID,
+                    False,
+                    import_command_sha256,
+                    plan,
+                )
+                receipt = OpenLibReceipt(
+                    operation_id=operation_id,
+                    archive_sha256=archive_sha256,
+                    command_sha256=command_sha256,
+                    item_id=item_id,
+                    item_receipt=item_receipt,
+                    import_receipt=import_receipt,
+                )
+                unit.apply(plan)
+                unit.commit(receipt)
+                return OpenLibResult(receipt, replayed=False)
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise self._repository_failure(exc) from exc
+
+    @staticmethod
+    def command_sha256(archive_sha256: str) -> str:
+        if not isinstance(archive_sha256, str) or not _SHA256_RE.fullmatch(
+            archive_sha256
+        ):
+            raise ValueError("archive_sha256 must be a lowercase SHA-256 digest")
+        return _open_lib_command_sha256(archive_sha256)
+
+    @staticmethod
+    def _allocated_item_id(value: Any) -> str:
+        try:
+            return _portable_identifier(value, field_name="allocated item id")
+        except (TypeError, ValueError) as exc:
+            raise RepositoryError(
+                "open .lib repository allocated an invalid identity",
+                code="invalid_allocated_item_id",
+            ) from exc
+
+    @staticmethod
+    def _validate_pristine_destination(
+        destination: Any,
+        *,
+        item_id: str,
+    ) -> None:
+        if not isinstance(destination, ImportDestinationSnapshot):
+            raise RepositoryError(
+                "open .lib repository returned an invalid destination",
+                code="invalid_import_destination",
+            )
+        if destination.item_id != item_id:
+            raise RepositoryError(
+                "open .lib repository returned the wrong destination",
+                code="destination_mismatch",
+                details={
+                    "requested_item_id": item_id,
+                    "destination_item_id": destination.item_id,
+                },
+            )
+        pristine = (
+            not destination.revision
+            and not destination.book_id
+            and destination.source_ids == ("primary",)
+            and not destination.pages
+            and not any(destination.region_ids.values())
+            and not destination.templates
+            and not destination.figures
+            and not destination.translation_pages
+            and not destination.instructions
+            and not destination.document_sources
+            and not destination.has_stylesheet
+            and not destination.has_manifest_ext
+        )
+        if not pristine:
+            raise RepositoryError(
+                "open .lib repository returned a non-pristine destination",
+                code="non_pristine_open_lib_destination",
+                details={"item_id": item_id},
+            )
+
+    @staticmethod
+    def _validate_staged_item(
+        staged: Any,
+        *,
+        item_id: str,
+        draft: ItemDraft,
+    ) -> None:
+        if not isinstance(staged, ItemRecordSnapshot):
+            raise RepositoryError(
+                "open .lib repository returned an invalid item snapshot",
+                code="invalid_item_record_snapshot",
+            )
+        if staged.item_id != item_id:
+            raise RepositoryError(
+                "open .lib repository staged another item",
+                code="item_repository_scope_mismatch",
+                details={
+                    "requested_item_id": item_id,
+                    "returned_item_id": staged.item_id,
+                },
+            )
+        if staged.as_draft() != draft:
+            raise RepositoryError(
+                "open .lib repository changed canonical item content",
+                code="item_repository_content_mismatch",
+                details={"item_id": item_id},
+            )
+
+    @staticmethod
+    def _repository_failure(exc: Exception) -> RepositoryError:
+        return RepositoryError(
+            "the open .lib repository failed",
+            code="open_lib_repository_unavailable",
+            details={"cause_type": type(exc).__name__},
+            retryable=True,
+        )
 
 
 __all__ = [
@@ -1321,4 +1804,10 @@ __all__ = [
     "LibTemplateImport",
     "LibTranslationImport",
     "OpenLibCommand",
+    "OpenLibDraftFactory",
+    "OpenLibReceipt",
+    "OpenLibRepositoryPort",
+    "OpenLibResult",
+    "OpenLibService",
+    "OpenLibUnitOfWorkPort",
 ]

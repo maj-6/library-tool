@@ -575,9 +575,69 @@ def test_lib_open_creates_book_and_imports(client, data_root, tmp_path):
     b = lib.load_json(server.BUILDS_PATH, {})[r["build_id"]]
     assert b["title"] == "Fixture Herbal" and b["year"] == "1700"
     assert b["status"] == "draft"
+    assert set(server._BUILD_FIELDS) <= set(b)
+    assert b["category_ids"] == []
+    assert b["bundle"] == {
+        "about": False,
+        "annotations": False,
+        "pages_text": False,
+        "translations": [],
+    }
     got = client.get(
         f"/api/builds/{r['build_id']}/ocr-regions?page=1").get_json()
     assert got["found"] and got["items"][0]["text"] == "fixture text"
+    assert lib.load_json(server._lib_id_path(r["build_id"]), {}) == {
+        "book_id": libformat.read_lib(p).book_id,
+    }
+
+
+def test_versioned_lib_open_is_durably_replayable(client, data_root, tmp_path):
+    import libcommon as lib
+    import server
+
+    p = _fixture_lib(tmp_path, title="Replay Herbal")
+    archive = p.read_bytes()
+
+    missing = client.post(
+        "/api/v1/lib-opens",
+        data={"lib": (io.BytesIO(archive), "replay.lib")},
+    )
+    assert missing.status_code == 428
+    assert missing.get_json()["code"] == "idempotency_key_required"
+
+    first = client.post(
+        "/api/v1/lib-opens",
+        headers={"Idempotency-Key": "open-http-1"},
+        data={"lib": (io.BytesIO(archive), "replay.lib")},
+    )
+    assert first.status_code == 201
+    first_body = first.get_json()
+    assert first_body["schema"] == "librarytool.open-lib-receipt/1"
+    assert first_body["replayed"] is False
+    item_id = first_body["receipt"]["item_id"]
+    assert first.headers["X-Record-Revision"] == (
+        first_body["receipt"]["item_receipt"]["after_revision"]
+    )
+
+    replay = client.post(
+        "/api/v1/lib-opens",
+        headers={"Idempotency-Key": "open-http-1"},
+        data={"lib": (io.BytesIO(archive), "moved.lib")},
+    )
+    assert replay.status_code == 200
+    replay_body = replay.get_json()
+    assert replay_body["replayed"] is True
+    assert replay_body["receipt"] == first_body["receipt"]
+    assert item_id in lib.load_json(server.BUILDS_PATH, {})
+
+    changed = _fixture_lib(tmp_path, title="Different Herbal").read_bytes()
+    conflict = client.post(
+        "/api/v1/lib-opens",
+        headers={"Idempotency-Key": "open-http-1"},
+        data={"lib": (io.BytesIO(changed), "different.lib")},
+    )
+    assert conflict.status_code == 409
+    assert conflict.get_json()["code"] == "operation_id_conflict"
 
 
 def test_lib_open_refuses_bad_paths(client, data_root, tmp_path):

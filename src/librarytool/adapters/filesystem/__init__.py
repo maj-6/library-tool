@@ -4,6 +4,7 @@ from .job_history import FilesystemJobHistoryRepository
 from .item_command_repository import FilesystemItemCommandRepository
 from .item_repository import FilesystemItemQueryRepository
 from .interchange_repository import FilesystemInterchangeRepository
+from .lib_open_repository import FilesystemOpenLibRepository
 from .recoverable_write_set import (
     RecoverableWriteSet,
     RecoveryResult,
@@ -26,6 +27,7 @@ __all__ = [
     "FilesystemItemCommandRepository",
     "FilesystemItemQueryRepository",
     "FilesystemInterchangeRepository",
+    "FilesystemOpenLibRepository",
     "FilesystemJobHistoryRepository",
     "FilesystemReplicaRepository",
     "FilesystemTranslationRepository",
