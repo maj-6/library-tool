@@ -25,7 +25,8 @@ index builder, or a standalone CLI. Feature design notes live in
   Supabase tables (tombstoned deletes, last-write-wins, a shadow ledger, and
   a wipe guard so an emptier side never clobbers a fuller one); the entry
   files mirror to the R2 bucket's `entries/` prefix. Runs inside the app's
-  cloud-sync pass, and as a CLI (`status`, `sync --run`).
+  cloud-sync pass. Its standalone CLI is read-only (`status`); mutation runs
+  through Library Tool so item lifecycle deletion and restore stay isolated.
 - `capture_pipeline.py` — the photo → bibliography pipeline for
   phone-captured pages (Mistral OCR + parsing); the server imports it for
   the Catalogs tab's cloud-capture ingest.

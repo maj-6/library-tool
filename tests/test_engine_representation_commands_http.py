@@ -604,23 +604,14 @@ def test_legacy_create_and_patch_cannot_bypass_representation_commands(
     ]
     assert catalog["builds_path"].read_bytes() == before
 
-    restored = client.post("/api/builds/restore", json={"build": {
+    retired = client.post("/api/builds/restore", json={"build": {
         "id": "restored-book",
         "title": "Catalogue restore",
         "rights": "public-domain",
     }})
-    assert restored.status_code == 200
-    restored_row = restored.get_json()["build"]
-    assert restored_row["pdf_file"] == ""
-    assert restored_row["pdf_sources"] == []
-    assert restored_row["representation_manifest"] == {
-        "version": 1, "sources": {}, "detached": [],
-    }
-    duplicate = client.post("/api/builds/restore", json={"build": {
-        "id": "restored-book", "title": "Do not overwrite",
-    }})
-    assert duplicate.status_code == 409
-    assert duplicate.get_json()["code"] == "item_already_exists"
+    assert retired.status_code == 410
+    assert retired.get_json()["code"] == "legacy_item_restore_retired"
+    assert catalog["builds_path"].read_bytes() == before
 
 
 def test_external_file_drift_is_visible_and_requires_explicit_replacement(
@@ -722,12 +713,11 @@ def test_legacy_trash_restore_of_managed_source_never_hides_external_drift(
 
     deleted = client.delete("/api/builds/book-one")
     assert deleted.status_code == 200
-    trash = client.get("/api/trash").get_json()["items"]
-    tombstone = next(row for row in trash if row["kind"] == "build")
+    tombstone_id = deleted.get_json()["tombstone_id"]
 
     path.write_bytes(catalog["bytes"]["alternate"])
     restored = client.post(
-        "/api/trash/restore", json={"id": tombstone["id"]},
+        "/api/trash/restore", json={"id": tombstone_id},
     )
     assert restored.status_code == 200
     current = _representations(client)[0]

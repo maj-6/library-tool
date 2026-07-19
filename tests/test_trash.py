@@ -212,42 +212,219 @@ def test_prune_drops_old_items_but_never_the_fresh_one(data_root):
 # --- other adopters: records and translations --------------------------------
 
 def test_build_delete_is_recoverable(data_root, client):
-    """Deleting an entry trashes its record; restoring reinserts it verbatim,
-    replays exactly, and refuses if something has taken the id back."""
+    """The legacy routes delegate build recovery to aggregate lifecycle."""
     bid = "trashb01"
     server.BUILDS_PATH.parent.mkdir(parents=True, exist_ok=True)
     server.BUILDS_PATH.write_text(
         json.dumps({bid: {"id": bid, "title": "Doomed", "rights": "public-domain"}}),
         encoding="utf-8")
+    managed = server._entry_dir(bid) / "ocr" / "compiled.txt"
+    managed.parent.mkdir(parents=True, exist_ok=True)
+    managed.write_text("recover me", encoding="utf-8")
 
     deleted = client.delete(f"/api/builds/{bid}")
     assert deleted.status_code == 200
-    assert deleted.get_json()["trash_id"]
+    tombstone_id = deleted.get_json()["trash_id"]
+    assert tombstone_id == deleted.get_json()["tombstone_id"]
+    assert deleted.get_json()["receipt"]["action"] == "delete"
     assert bid not in server.lib.load_json(server.BUILDS_PATH, {})
+    assert not server._entry_dir(bid).exists()
 
+    # Aggregate tombstones are not disguised as rows in the older payload
+    # trash. The response handle remains accepted by its restore endpoint so
+    # an older renderer's short-lived undo stack keeps working.
     items = client.get("/api/trash").get_json()["items"]
-    rec = next(i for i in items
-               if i["kind"] == "build" and i["origin"].get("build_id") == bid)
-    assert "Doomed" in rec["label"]
+    assert not any(
+        i.get("kind") == "build"
+        and (i.get("origin") or {}).get("build_id") == bid
+        for i in items
+    )
+    tombstone = client.get(
+        f"/api/v1/item-tombstones/{tombstone_id}"
+    ).get_json()["tombstone"]
+    assert tombstone["state"] == "deleted"
 
-    r = client.post("/api/trash/restore", json={"id": rec["id"]})
+    r = client.post("/api/trash/restore", json={"id": tombstone_id})
     assert r.status_code == 200, r.get_json()
     assert r.get_json()["build"]["id"] == bid
     assert r.get_json()["replayed"] is False
     back = server.lib.load_json(server.BUILDS_PATH, {})[bid]
     assert back["title"] == "Doomed" and back["rights"] == "public-domain"
+    assert managed.read_text("utf-8") == "recover me"
 
-    # A response-lost retry is an exact replay, not a destructive overwrite.
-    again = client.post("/api/trash/restore", json={"id": rec["id"]})
+    # A response-lost compatibility retry is a read-only replay, not another
+    # restore or an overwrite.
+    again = client.post("/api/trash/restore", json={"id": tombstone_id})
     assert again.status_code == 200
     assert again.get_json()["replayed"] is True
 
     current = server.lib.load_json(server.BUILDS_PATH, {})
     current[bid]["title"] = "Edited after restore"
+    current[bid]["updated_at"] = "edited-after-restore"
     server.lib.save_json(server.BUILDS_PATH, current)
-    conflict = client.post("/api/trash/restore", json={"id": rec["id"]})
-    assert conflict.status_code == 409
-    assert "exists again" in conflict.get_json()["error"]
+    replay = client.post("/api/trash/restore", json={"id": tombstone_id})
+    assert replay.status_code == 409
+    assert replay.get_json()["code"] == "item_restore_replay_conflict"
+    assert server.lib.load_json(server.BUILDS_PATH, {})[bid]["title"] == (
+        "Edited after restore"
+    )
+
+
+def test_legacy_build_restore_delegates_by_item_id(data_root, client):
+    bid = "trashb02"
+    raw = {"id": bid, "title": "Delegated", "rights": "public-domain"}
+    server.BUILDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    server.lib.save_json(server.BUILDS_PATH, {bid: raw})
+
+    deleted = client.delete(f"/api/builds/{bid}")
+    assert deleted.status_code == 200
+    restored = client.post("/api/builds/restore", json={
+        "build": {"id": bid, "title": "untrusted replacement"},
+    })
+
+    assert restored.status_code == 200, restored.get_json()
+    assert restored.get_json()["build"]["title"] == "Delegated"
+    assert restored.get_json()["tombstone_id"] == (
+        deleted.get_json()["tombstone_id"]
+    )
+
+
+def test_legacy_build_delete_replays_when_given_modern_preconditions(
+    data_root, client,
+):
+    bid = "trashb03"
+    server.BUILDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    server.lib.save_json(server.BUILDS_PATH, {
+        bid: {"id": bid, "title": "Replayable", "updated_at": "record-1"},
+    })
+    state = client.get(f"/api/v1/items/{bid}/lifecycle").get_json()
+    headers = {
+        "Idempotency-Key": "legacy-delete-replay-1",
+        "If-Record-Match": f'"{state["item_revision"]}"',
+        "If-Managed-Tree-Match": f'"{state["managed_tree_revision"]}"',
+    }
+
+    first = client.delete(f"/api/builds/{bid}", headers=headers)
+    replay = client.delete(f"/api/builds/{bid}", headers=headers)
+
+    assert first.status_code == replay.status_code == 200
+    assert first.get_json()["replayed"] is False
+    assert replay.get_json()["replayed"] is True
+    assert replay.get_json()["tombstone_id"] == first.get_json()["tombstone_id"]
+
+
+def test_legacy_build_delete_rejects_partial_modern_command_headers(
+    data_root, client,
+):
+    bid = "trashb05"
+    server.BUILDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    server.lib.save_json(server.BUILDS_PATH, {
+        bid: {"id": bid, "title": "All or none", "updated_at": "record-1"},
+    })
+    state = client.get(f"/api/v1/items/{bid}/lifecycle").get_json()
+    record_match = f'"{state["item_revision"]}"'
+    tree_match = f'"{state["managed_tree_revision"]}"'
+
+    cases = (
+        ({"Idempotency-Key": "partial-delete-1"}, "item_revision_required"),
+        ({"If-Record-Match": record_match}, "managed_tree_revision_required"),
+        ({
+            "If-Record-Match": record_match,
+            "If-Managed-Tree-Match": tree_match,
+        }, "idempotency_key_required"),
+    )
+    for headers, code in cases:
+        refused = client.delete(f"/api/builds/{bid}", headers=headers)
+        assert refused.status_code == 428
+        assert refused.get_json()["code"] == code
+        assert bid in server.lib.load_json(server.BUILDS_PATH, {})
+
+
+def test_legacy_trash_restore_exact_headers_replay_engine_receipt(
+    data_root, client,
+):
+    bid = "trashb06"
+    server.BUILDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    server.lib.save_json(server.BUILDS_PATH, {
+        bid: {"id": bid, "title": "Restore replay", "updated_at": "record-1"},
+    })
+    deleted = client.delete(f"/api/builds/{bid}").get_json()
+    tombstone = deleted["receipt"]["tombstone"]
+    headers = {
+        "Idempotency-Key": "legacy-restore-replay-1",
+        "If-Tombstone-Match": f'"{tombstone["revision"]}"',
+    }
+
+    first = client.post(
+        "/api/trash/restore",
+        json={"id": tombstone["tombstone_id"]},
+        headers=headers,
+    )
+    replay = client.post(
+        "/api/trash/restore",
+        json={"id": tombstone["tombstone_id"]},
+        headers=headers,
+    )
+
+    assert first.status_code == replay.status_code == 200
+    assert first.get_json()["replayed"] is False
+    assert replay.get_json()["replayed"] is True
+    assert replay.get_json()["receipt"] == first.get_json()["receipt"]
+
+
+def test_legacy_trash_restore_rejects_partial_replay_headers(data_root, client):
+    bid = "trashb07"
+    server.BUILDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    server.lib.save_json(server.BUILDS_PATH, {
+        bid: {"id": bid, "title": "Restore all or none", "updated_at": "record-1"},
+    })
+    deleted = client.delete(f"/api/builds/{bid}").get_json()
+    tombstone = deleted["receipt"]["tombstone"]
+    url = "/api/trash/restore"
+    payload = {"id": tombstone["tombstone_id"]}
+
+    missing_match = client.post(
+        url, json=payload, headers={"Idempotency-Key": "partial-restore-1"},
+    )
+    missing_key = client.post(url, json=payload, headers={
+        "If-Tombstone-Match": f'"{tombstone["revision"]}"',
+    })
+
+    assert missing_match.status_code == 428
+    assert missing_match.get_json()["code"] == "tombstone_revision_required"
+    assert missing_key.status_code == 428
+    assert missing_key.get_json()["code"] == "idempotency_key_required"
+    current = client.get(
+        f'/api/v1/item-tombstones/{tombstone["tombstone_id"]}'
+    ).get_json()["tombstone"]
+    assert current["state"] == "deleted"
+
+
+def test_historical_build_trash_is_download_only(data_root, client):
+    bid = "trashb04"
+    record = {"id": bid, "title": "Pre-lifecycle recovery"}
+    tid = server._trash_put(
+        "build",
+        "Entry: Pre-lifecycle recovery",
+        {"build_id": bid},
+        {},
+        {"record.json": json.dumps(record)},
+    )
+
+    row = next(
+        item for item in client.get("/api/trash").get_json()["items"]
+        if item["id"] == tid
+    )
+    assert row["restorable"] is False
+    assert "legacy catalogue-only" in row["note"]
+    download = client.get(f"/api/trash/{tid}/payload/record.json")
+    assert download.status_code == 200
+    assert json.loads(download.data) == record
+
+    refused = client.post("/api/trash/restore", json={"id": tid})
+    assert refused.status_code == 410
+    assert refused.get_json()["code"] == "legacy_item_restore_retired"
+    assert bid not in server.lib.load_json(server.BUILDS_PATH, {})
 
 
 def test_manual_delete_is_recoverable(data_root, client):

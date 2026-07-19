@@ -1038,3 +1038,13 @@ def test_corrections_sync_survives_the_id_backfill(fake_cloud):
     assert f"add:{rid}" in fake_cloud.tables["corrections"]
     res = ss.sync_store({"url": "u", "key": "k"}, "corrections")
     assert res["pushed"] == 0 and res["in_sync"] == 2
+
+
+def test_standalone_cli_refuses_mutation_before_credentials_or_io(monkeypatch):
+    def unexpected_config_read():
+        pytest.fail("mutating CLI inspected credentials before refusing")
+
+    monkeypatch.setattr(ss, "_cli_cfg", unexpected_config_read)
+
+    with pytest.raises(SystemExit, match="item-lifecycle guard"):
+        ss.main(["sync", "--run"])

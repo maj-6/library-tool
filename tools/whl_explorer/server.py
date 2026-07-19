@@ -134,6 +134,7 @@ from librarytool.engine.item_commands import (  # noqa: E402
 )
 from librarytool.engine.item_lifecycle import (  # noqa: E402
     DeleteItemCommand as LifecycleDeleteItemCommand,
+    ItemLifecycleResult,
     ItemLifecycleService,
     RestoreItemCommand,
 )
@@ -1359,28 +1360,180 @@ def api_builds_update(build_id: str):
 
 @app.route("/api/builds/<build_id>", methods=["DELETE"])
 def api_builds_delete(build_id: str):
-    with _builds_lock:
-        builds = lib.load_json(BUILDS_PATH, {})
-        if build_id not in builds:
-            abort(404)
-        record = builds[build_id]
-        del builds[build_id]
-        lib.save_json(BUILDS_PATH, builds)
-    # a few KB of JSON, so this never troubles the byte cap. The client's undo
-    # covers the next few seconds; this is the backstop for the next few days.
-    trash_id = _trash_put(
-        "build",
-        f"Entry: {record.get('title') or build_id}",
-        {"build_id": build_id},
-        {},
-        {"record.json": json.dumps(record, ensure_ascii=False)},
+    """Compatibility facade over aggregate lifecycle deletion.
+
+    Older renderers know only this path and expect a ``trash_id``.  Keep that
+    response spelling, but make the value the engine-owned lifecycle tombstone
+    id; catalogue-only deletion is no longer an authority in this process.
+    Callers may opt into replay-safe semantics by carrying the modern CAS and
+    idempotency headers.  Headerless legacy callers receive a coherent
+    preflight followed by the same conditional engine command.
+    """
+
+    try:
+        lifecycle = _item_lifecycle_engine()
+        _item_lifecycle_require_empty_body()
+        modern_headers = (
+            request.headers.get("Idempotency-Key") is not None,
+            request.headers.get("If-Record-Match") is not None,
+            request.headers.get("If-Managed-Tree-Match") is not None,
+        )
+        if any(modern_headers):
+            # Exact replay is possible only with the complete original
+            # command identity. Never mix server-derived state or a fresh
+            # operation id with a caller-supplied subset.
+            item_revision = _item_lifecycle_match(
+                "If-Record-Match",
+                required_code="item_revision_required",
+                invalid_code="invalid_item_revision",
+                details={"item_id": build_id},
+            )
+            tree_revision = _item_lifecycle_match(
+                "If-Managed-Tree-Match",
+                required_code="managed_tree_revision_required",
+                invalid_code="invalid_managed_tree_revision",
+                details={"item_id": build_id},
+            )
+            operation_id = _item_command_operation_id(item_id=build_id)
+        else:
+            state = lifecycle.inspect(build_id)
+            item_revision = state.item.revision
+            tree_revision = state.managed_tree.revision
+            operation_id = f"legacy-item-delete-{uuid.uuid4().hex}"
+        result = lifecycle.delete(LifecycleDeleteItemCommand(
+            item_id=build_id,
+            expected_item_revision=item_revision,
+            expected_managed_tree_revision=tree_revision,
+            operation_id=operation_id,
+        ))
+    except EngineError as exc:
+        return _engine_error_response(exc)
+
+    receipt = result.receipt
+    tombstone = receipt.tombstone
+    response = jsonify({
+        "ok": True,
+        "schema": "librarytool.legacy-item-delete/1",
+        "deprecated": True,
+        "trash_id": tombstone.tombstone_id,
+        "tombstone_id": tombstone.tombstone_id,
+        **result.as_dict(),
+    })
+    response.cache_control.no_store = True
+    response.headers["Location"] = url_for(
+        "api_v1_item_tombstone", tombstone_id=tombstone.tombstone_id,
     )
-    return jsonify({"ok": True, "trash_id": trash_id})
+    response.headers["X-Record-Revision"] = receipt.deleted_item_revision
+    response.headers["X-Managed-Tree-Revision"] = (
+        receipt.managed_tree_revision
+    )
+    response.headers["X-Tombstone-Revision"] = tombstone.revision
+    return response
+
+
+def _legacy_active_item_tombstone(item_id: str):
+    """Return the one active aggregate tombstone for a legacy item id."""
+
+    return next((
+        tombstone
+        for tombstone in _item_lifecycle_engine().list_tombstones()
+        if tombstone.item_id == item_id and tombstone.state == "deleted"
+    ), None)
+
+
+def _legacy_restore_lifecycle_tombstone(
+    tombstone_id: str,
+) -> tuple[dict, ItemLifecycleResult | None]:
+    """Restore a server-owned tombstone for compatibility transports.
+
+    The old transport has no tombstone CAS field.  Reading the current public
+    snapshot and passing that revision into the engine preserves collision and
+    race safety; an optional Idempotency-Key still gives callers exact replay
+    when they also use the versioned resource for retry.
+    """
+
+    lifecycle = _item_lifecycle_engine()
+    tombstone = lifecycle.get_tombstone(tombstone_id)
+    result = None
+    modern_headers = (
+        request.headers.get("Idempotency-Key") is not None,
+        request.headers.get("If-Tombstone-Match") is not None,
+    )
+    if any(modern_headers):
+        # On response-loss retry the public tombstone may already say
+        # ``restored``. Send the caller's original command back through the
+        # service so its durable receipt—not this facade—decides replay versus
+        # operation-id or revision conflict. A partial command is rejected by
+        # the standard header readers below.
+        expected_revision = _item_lifecycle_match(
+            "If-Tombstone-Match",
+            required_code="tombstone_revision_required",
+            invalid_code="invalid_tombstone_revision",
+            details={"tombstone_id": tombstone_id},
+        )
+        operation_id = _item_command_operation_id()
+        result = lifecycle.restore(RestoreItemCommand(
+            tombstone_id=tombstone_id,
+            expected_tombstone_revision=expected_revision,
+            operation_id=operation_id,
+        ))
+        tombstone = result.receipt.tombstone
+    elif tombstone.state == "deleted":
+        result = lifecycle.restore(RestoreItemCommand(
+            tombstone_id=tombstone_id,
+            expected_tombstone_revision=tombstone.revision,
+            operation_id=f"legacy-item-restore-{uuid.uuid4().hex}",
+        ))
+        tombstone = result.receipt.tombstone
+
+    # The legacy response still embeds a build projection. Read it under the
+    # same aggregate isolation so a racing lifecycle delete cannot remove it
+    # between the committed restore and this compatibility projection.
+    with lifecycle.deletion_index_guard():
+        builds = lib.load_json(BUILDS_PATH, {})
+        build = (
+            builds.get(tombstone.item_id)
+            if isinstance(builds, dict) else None
+        )
+        live_revision = (
+            _engine_build_record_revision(tombstone.item_id, build)
+            if isinstance(build, Mapping) else ""
+        )
+    if not isinstance(build, dict):
+        raise EngineRepositoryError(
+            "the restored item is absent from the catalogue",
+            code="item_restore_publication_missing",
+            details={"item_id": tombstone.item_id},
+        )
+    if result is None and live_revision != tombstone.restored_item_revision:
+        raise EngineConflictError(
+            "the restored item changed after the lifecycle command",
+            code="item_restore_replay_conflict",
+            details={
+                "item_id": tombstone.item_id,
+                "expected_item_revision": tombstone.restored_item_revision,
+                "current_item_revision": live_revision,
+            },
+        )
+    body = {
+        "ok": True,
+        "schema": "librarytool.legacy-item-restore/1",
+        "deprecated": True,
+        "restored": ["record.json"],
+        "skipped": [],
+        "replayed": result is None or result.replayed,
+        "build": dict(build),
+        "tombstone_id": tombstone.tombstone_id,
+        "tombstone": tombstone.as_dict(),
+    }
+    if result is not None:
+        body["receipt"] = result.receipt.as_public_dict()
+    return body, result
 
 
 @app.route("/api/builds/restore", methods=["POST"])
 def api_builds_restore():
-    """Reinsert catalogue state only; sources use representation commands."""
+    """Compatibility restore that delegates only to an aggregate tombstone."""
     payload = request.get_json(silent=True) or {}
     raw = payload.get("build") or {}
     if not isinstance(raw, Mapping):
@@ -1396,39 +1549,45 @@ def api_builds_restore():
             "code": "representation_command_required",
             "fields": managed_sources,
         }), 409
-    build = dict(raw)
-    bid = str(build.get("id") or "")
+    bid = str(raw.get("id") or "")
     if not bid or not _BUILD_ID_RE.fullmatch(bid):
         abort(400)
-    build["images"] = _clean_images(build.get("images"))
-    build["extra"] = _clean_extra(build.get("extra"))
-    build["capture_id"] = _clean_capture_id(build.get("capture_id"))
-    build["pdf_file"] = ""
-    build["pdf_sources"] = []
-    build["representation_manifest"] = {
-        "version": 1, "sources": {}, "detached": [],
-    }
-    build["updated_at"] = _build_updated_at(build.get("updated_at"))
     try:
-        _engine_item_command_decode(bid, build)
-    except (TypeError, ValueError) as exc:
-        return jsonify({
-            "ok": False,
-            "error": "the catalogue restore record is invalid",
-            "code": "invalid_item_restore",
-            "details": {"cause_type": type(exc).__name__},
-        }), 400
-    with _builds_lock:
         builds = lib.load_json(BUILDS_PATH, {})
-        if bid in builds:
+        if isinstance(builds, dict) and bid in builds:
             return jsonify({
                 "ok": False,
                 "error": "the build already exists",
                 "code": "item_already_exists",
             }), 409
-        builds[bid] = build
-        lib.save_json(BUILDS_PATH, builds)
-    return jsonify({"ok": True, "build": build})
+        tombstone = _legacy_active_item_tombstone(bid)
+        if tombstone is None:
+            response = jsonify({
+                "ok": False,
+                "error": (
+                    "catalogue-only restore is retired; restore an engine "
+                    "item tombstone instead"
+                ),
+                "code": "legacy_item_restore_retired",
+                "replacement": "/api/v1/item-tombstones/<id>/restore",
+            })
+            response.cache_control.no_store = True
+            return response, 410
+        body, result = _legacy_restore_lifecycle_tombstone(
+            tombstone.tombstone_id
+        )
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    response = jsonify(body)
+    response.cache_control.no_store = True
+    if result is not None:
+        response.headers["X-Record-Revision"] = (
+            result.receipt.restored_item_revision
+        )
+        response.headers["X-Tombstone-Revision"] = (
+            result.receipt.tombstone.revision
+        )
+    return response
 
 
 # --- staged alternatives: Process-mode candidate field-sets ------------------------
@@ -9207,8 +9366,21 @@ def api_trash():
     tab footer shows. Plain read: save_json is atomic tmp+replace, so a reader
     never sees a torn document and needs no lock."""
     doc = lib.load_json(TRASH_PATH, {"version": 1, "items": {}})
-    items = sorted((doc.get("items") or {}).values(),
-                   key=lambda r: str(r.get("created") or ""), reverse=True)
+    items = []
+    for raw in (doc.get("items") or {}).values():
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        if item.get("kind") == "build" and not item.get("restored_at"):
+            # These rows predate aggregate lifecycle storage. Their raw record
+            # remains downloadable, but reinserting it would bypass the
+            # engine-owned item/tree tombstone and can resurrect stale state.
+            item["restorable"] = False
+            item["note"] = (
+                "legacy catalogue-only recovery; download the record"
+            )
+        items.append(item)
+    items.sort(key=lambda r: str(r.get("created") or ""), reverse=True)
     return jsonify({"ok": True, "items": items, "summary": {
         "count": len(items),
         "bytes": sum(int(r.get("bytes") or 0) for r in items),
@@ -9431,10 +9603,16 @@ def _trash_restore_record(item: dict) -> tuple[dict, int]:
     except (OSError, ValueError):
         return {"ok": False, "error": "the trashed record is unreadable"}, 410
     if kind == "build":
-        rid, path, lock = str(origin.get("build_id") or ""), BUILDS_PATH, _builds_lock
-    else:
-        rid, path, lock = (str(origin.get("entry_id") or ""),
-                           lib.MANUAL_ENTRIES_PATH, _manual_lock)
+        return {
+            "ok": False,
+            "error": (
+                "this legacy catalogue-only recovery cannot safely restore "
+                "an aggregate item; download its record instead"
+            ),
+            "code": "legacy_item_restore_retired",
+        }, 410
+    rid, path, lock = (str(origin.get("entry_id") or ""),
+                       lib.MANUAL_ENTRIES_PATH, _manual_lock)
     if not rid:
         return {"ok": False, "error": "the trashed record has no id"}, 410
 
@@ -9505,7 +9683,26 @@ def api_trash_restore():
     doc = lib.load_json(TRASH_PATH, {"version": 1, "items": {}})
     item = (doc.get("items") or {}).get(tid)
     if not item:
-        return jsonify({"ok": False, "error": "no such item"}), 404
+        # Since aggregate deletion was introduced, the compatibility DELETE
+        # route returns a lifecycle tombstone id as its old ``trash_id``.
+        # Preserve old undo clients by resolving that handle through the
+        # lifecycle service instead of recreating catalogue state here.
+        try:
+            body, result = _legacy_restore_lifecycle_tombstone(tid)
+        except EngineNotFoundError:
+            return jsonify({"ok": False, "error": "no such item"}), 404
+        except EngineError as exc:
+            return _engine_error_response(exc)
+        response = jsonify(body)
+        response.cache_control.no_store = True
+        if result is not None:
+            response.headers["X-Record-Revision"] = (
+                result.receipt.restored_item_revision
+            )
+            response.headers["X-Tombstone-Revision"] = (
+                result.receipt.tombstone.revision
+            )
+        return response
     if item.get("restorable") is False:
         return jsonify({"ok": False, "error": str(item.get("note") or "")
                         or "this item can no longer be restored"}), 409

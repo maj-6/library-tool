@@ -31,7 +31,11 @@ mtime against the object's upload time picks the direction.
 
 CLI (dry-run by default, like corpus_sync):
     python3 tools/store_sync.py status        what a sync would do
-    python3 tools/store_sync.py sync --run    do it
+
+Mutation runs through Library Tool's composed host, which supplies the item
+lifecycle guard shared with deletion and restore.  The standalone CLI remains
+available for read-only planning but refuses ``sync --run`` because it cannot
+safely acquire that host-owned policy boundary.
 """
 from __future__ import annotations
 
@@ -893,6 +897,12 @@ def _print_result(results: dict, entries: dict | None) -> None:
 
 
 def _run(dry: bool) -> None:
+    if not dry:
+        raise SystemExit(
+            "Mutating standalone sync is disabled because it cannot acquire "
+            "Library Tool's item-lifecycle guard. Run Sync from Library Tool; "
+            "the standalone `status` command remains available."
+        )
     cfg = _cli_cfg()
     results = sync_stores(cfg, dry=dry)
     r2cfg = _cli_r2cfg()
@@ -904,7 +914,7 @@ def _run(dry: bool) -> None:
             entries = {"error": f"{type(exc).__name__}: {exc}"}
     _print_result(results, entries)
     if dry:
-        print("\ndry run — `sync --run` applies it")
+        print("\ndry run — apply changes from Library Tool's Sync control")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -916,7 +926,7 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=lambda a: _run(dry=True))
     c = sub.add_parser("sync", help="merge with the cloud")
     c.add_argument("--run", action="store_true",
-                   help="actually sync (default: dry run)")
+                   help="request mutation (requires the Library Tool host)")
     c.set_defaults(fn=lambda a: _run(dry=not a.run))
     args = ap.parse_args(argv)
     args.fn(args)
