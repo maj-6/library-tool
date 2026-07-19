@@ -75,8 +75,12 @@ workbench split described below remains the target architecture:
   complete command and rejects malformed plugin plans before staging. A
   filesystem write-set primitive provides private before/after journals,
   cross-process locking, all-file publication or rollback, restart recovery,
-  path/junction containment, and terminal receipt retention. The legacy
-  importer has not yet been migrated onto this boundary.
+  path/junction containment, and terminal receipt retention. Existing-item
+  Replica imports now use this boundary: the archive is completely validated
+  before staging, and layout, compiled text, figures, styles, translations,
+  provenance, and the durable receipt publish as one recoverable transaction.
+  New-item `/api/lib/open` remains on the compatibility path until item
+  creation itself has an engine-owned unit of work.
 - A provider-neutral Knowledge kernel now models revisioned text corpora,
   stable selectors, lossless deterministic passages, canonical curation
   overlays, lexical evidence retrieval, and revision-pinned evaluation. Its
@@ -100,11 +104,41 @@ credentials in the engine, returns a stable job identity, and preserves
 protected work as a proposal. The workbench observes that job directly and
 distinguishes completion, failure, cancellation, and restart interruption; it
 no longer infers completion from browser-local OCR page markers. The item query
-service is now composed into `/api/v1`; the next integration step is to move
-the legacy `.lib` importer onto the new recoverable write set. Until that
-transaction migration lands, the current Replica unit of work is deliberately
-claimed atomic only for one workspace JSON file, not for an arbitrary
-collection of assets and translations.
+service is now composed into `/api/v1`, and existing-item `.lib` import now
+demonstrates a recoverable multi-artifact transaction. The remaining
+compatibility route is preserved, while `EngineClient` now imports through the
+stable, idempotent `/api/v1/items/{id}/replica/lib-imports` resource and
+receives the complete durable receipt. The next integration step is to reuse
+the same transaction foundation for translation aggregates and new-item
+creation.
+
+### Translation aggregate decision
+
+Translation generation must not be the next extraction boundary. The current
+generator selects source text, calls a provider, mutates page-marked text,
+updates provenance, and publishes job state from one Flask route. Moving only
+the provider call would leave alternate clients responsible for source
+selection and would preserve races between source edits, human translation
+edits, metadata writes, and generation.
+
+The first translation vertical is therefore a provider-neutral, revisioned
+aggregate with three operations: list translations, read one translation with
+authoritative status, and conditionally replace one page. The engine, not its
+caller, resolves the source layer and canvas text. A write must match both the
+translation document revision and the source snapshot revision; the filesystem
+adapter publishes text, page provenance, and artifact provenance through one
+recoverable write set. Status has one definition across clients: current,
+stale, untracked, missing, and orphaned selectors are derived from the same
+source snapshot and never accepted from a request.
+
+Provider-backed generation follows as a separate job/adapter slice. It will
+pin those two revisions, fingerprint its full recipe, preserve reviewed or
+untracked human work, avoid silent source truncation, and commit completed
+pages through the aggregate's conditional command. Capability discovery must
+advertise translation reading/editing independently of generation, and expose
+generation only when a compatible provider is actually installed and
+configured. This ordering gives the existing web client and future Qt, Godot,
+CLI, or automation clients identical translation integrity semantics.
 
 Companion documents:
 

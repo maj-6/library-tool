@@ -20,9 +20,12 @@ Per-component detail lives in each part's own README (map at the end).
   crosses `EngineClient.items`, while its existing edit routes remain a
   deliberate compatibility surface. Default item DTOs replace attached file
   paths with opaque representation identities; only the explicitly requested
-  `build-workbench` projection carries the old local build record. Recoverable
-  multi-file write sets and `.lib` import unit-of-work contracts are available
-  for the next legacy-import migration.
+  `build-workbench` projection carries the old local build record. Existing-
+  item `.lib` imports now cross a versioned `EngineClient` resource and publish
+  layout, text, figures, styles, translations, provenance, and a replayable
+  receipt through one recoverable multi-file unit of work. New-item creation
+  and the `/api/lib/open` compatibility flow remain the next catalogue command
+  boundary.
 - **Desktop app** — the workbench: an Electron shell (`desktop/`) that
   spawns the Flask sidecar (`tools/whl_explorer/server.py`) on a loopback
   port. Paths split into two roots (`tools/libcommon.py`): **`APP_ROOT`**,
