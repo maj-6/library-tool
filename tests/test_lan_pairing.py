@@ -1,6 +1,15 @@
 """Authenticated Android-to-desktop LAN pairing and capture receipts."""
 
 import io
+import inspect
+
+
+def test_lan_listener_log_never_reads_or_prints_the_pairing_token():
+    import server
+
+    source = inspect.getsource(server._apply_lan_state)
+    assert "_lan_token()" not in source
+    assert "token=" not in source
 
 
 def test_lan_pair_requires_token_and_echoes_fresh_nonce(monkeypatch, data_root):

@@ -16769,8 +16769,8 @@ def _apply_lan_state() -> None:
         t = threading.Thread(target=srv.serve_forever, daemon=True, name="lan-capture")
         t.start()
         _lan_server.update(srv=srv, thread=t, port=port)
-        log.info("LAN capture on 0.0.0.0:%d  token=%s  ips=%s",
-                 port, _lan_token(), ", ".join(_lan_ips()) or "?")
+        log.info("LAN capture on 0.0.0.0:%d  ips=%s",
+                 port, ", ".join(_lan_ips()) or "?")
 
 
 if __name__ == "__main__":
