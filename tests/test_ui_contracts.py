@@ -46,8 +46,10 @@ def test_verified_toggle_saves_the_whole_editor_form():
     assert "patchBuildRaw(b.id, { status:" not in handler
     body = APP.split("async function setVerified", 1)[1].split(
         "function renderLockNote", 1)[0]
-    assert "await saveBuildFields()" in body
-    assert "patchBuildRaw" not in body
+    assert "await saveBuildFields(null, {" in body
+    assert "forceMetadata: true" in body
+    assert "patchBuildVerificationCompatibility(" in body
+    assert "patchBuildRaw(" not in body
 
 
 def test_locked_phases_offer_the_verify_unlock_inline():
@@ -481,7 +483,7 @@ def test_remarks_actions_are_accessible_and_failure_safe():
 
     apply = APP.split("async function applyRemarkValue", 1)[1].split(
         "async function saveRemarkEditor", 1)[0]
-    assert "ok = await patchBuildRaw" in apply
+    assert "ok = await updateBuildPortableMetadata" in apply
     assert "ok = await setRowAttention" in apply
     assert "if (ok)" in apply
     assert "The mark was kept" in apply
