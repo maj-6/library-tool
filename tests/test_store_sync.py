@@ -459,6 +459,8 @@ def test_cloud_sync_pass_carries_the_stores(fake_cloud, monkeypatch):
     state["settings"] = dict(settings, supabaseUrl="https://x.supabase.co",
                              supabaseKey="k")
     lib.save_json(lib.CLIENT_STATE_PATH, state)
+    monkeypatch.setattr(server, "_refresh_collection_aliases",
+                        lambda _cfg, _token: [])
     monkeypatch.setattr(server.sbase, "list_pending_captures",
                         lambda cfg, limit=50: [])
     monkeypatch.setattr(server.sbase, "push_books", lambda cfg, rows: len(rows))

@@ -48,9 +48,27 @@ class CollectionsTest {
     }
 
     @Test
+    fun corruptLocalFirstStoreCannotBeOverwritten() {
+        val file = File(tempDir(), "collections.json")
+        val corrupt = "{\"collections\":"
+        file.writeText(corrupt)
+
+        val store = readCollectionStore(file)
+        assertFalse(store.valid)
+        assertTrue(store.collections.isEmpty())
+        assertFalse(
+            saveCollectionStore(
+                file,
+                store.copy(collections = listOf(collection("cloud", "Cloud row"))),
+            ),
+        )
+        assertEquals(corrupt, file.readText())
+    }
+
+    @Test
     fun entriesWithoutAnIdOrNameAreDropped() {
         val text = """
-            {"collections":[
+            {"version":1,"collections":[
               {"id":"a","name":"Keep","from":"Storage"},
               {"id":"","name":"No id"},
               {"id":"c","name":"   "},
@@ -59,6 +77,23 @@ class CollectionsTest {
         """.trimIndent()
         val parsed = collectionsFromJson(text)
         assertEquals(listOf(collection("a", "Keep", "Storage")), parsed)
+    }
+
+    @Test
+    fun unknownOrStructurallyInvalidStoreVersionsAreNotWritable() {
+        val invalid = listOf(
+            "{}",
+            """{"version":99,"collections":[]}""",
+            """{"version":"2","collections":[]}""",
+            """{"version":2.5,"collections":[]}""",
+            """{"version":2,"collections":{}}""",
+            """{"version":2,"collections":[],"sync_shadow":[]}""",
+            """{"version":2,"collections":[],"sync_dirty":{}}""",
+            """{"version":2,"collections":[],"sync_shadow":{"a":[]}}""",
+            """{"version":2,"collections":[],"sync_dirty":[42]}""",
+            """{"version":2,"collections":[],"sync_dirty":["missing"]}""",
+        )
+        invalid.forEach { assertFalse(collectionStoreFromJson(it).valid) }
     }
 
     // --- editing -------------------------------------------------------------
@@ -180,6 +215,7 @@ class CollectionsTest {
             JSONObject().put("title", "Herbarium"),
             CaptureProvenance("a", "Blue crate", "Storage"),
         )
+        assertEquals("a", meta.getString("scan_collection_id"))
         assertEquals("Blue crate", meta.getString("scan_collection"))
         assertEquals("Storage", meta.getString("scan_from"))
         assertEquals("Herbarium", meta.getString("title"))   // extraction survives
@@ -197,7 +233,9 @@ class CollectionsTest {
         val meta = applyProvenanceToPayload(
             JSONObject(), CaptureProvenance("a", "Blue crate", "Storage"))
         assertFalse(meta.has("collection"))
+        assertFalse(meta.has("collection_id"))
         assertFalse(meta.has("from"))
+        assertTrue(meta.has("scan_collection_id"))
         assertTrue(meta.has("scan_collection"))
         assertTrue(meta.has("scan_from"))
     }
@@ -209,6 +247,7 @@ class CollectionsTest {
                 .has("scan_from"),
         )
         val untouched = applyProvenanceToPayload(JSONObject().put("title", "x"), null)
+        assertFalse(untouched.has("scan_collection_id"))
         assertFalse(untouched.has("scan_collection"))
         assertFalse(untouched.has("scan_from"))
     }

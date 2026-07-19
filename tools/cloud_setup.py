@@ -40,7 +40,7 @@ BUCKETS = {"captures": False, "volumes": True}       # name -> public?
 # design (docs/search-design.md D6): anon reaches it through search_passages,
 # never a table read.
 ANON_CAN = ["volumes", "volume_pages", "releases", "index_versions"]
-ANON_CANNOT = ["profiles", "events", "captures", "passages"]
+ANON_CANNOT = ["profiles", "events", "captures", "passages", "collections"]
 
 
 def config() -> dict:

@@ -612,6 +612,566 @@ def api_auth_logout():
     return jsonify({"ok": True})
 
 
+# --- shared collections ---------------------------------------------------------
+# A collection row is current, editable state shared with Book Capture.  A
+# captured book's scan_collection / scan_from values are deliberately *not*
+# edited here: they are a snapshot stored on the entry (see ingest_capture).
+# Keeping the two paths separate is what makes a rename safe -- the row changes,
+# while books already scanned under the old name continue to say so.
+
+_COLLECTION_SELECT = ("id,name,from_place,created_by,updated_at,deleted,"
+                      "merged_into")
+_COLLECTION_FIELD_MAX = 80
+COLLECTION_ALIASES_PATH = lib.OUTPUT_DIR / "collection_aliases.json"
+_collection_alias_lock = threading.Lock()
+_COLLECTION_ALIAS_VERSION = 2
+_COLLECTION_PAGE_SIZE = 500
+
+
+def _collection_text(value, *, required: bool = False) -> str:
+    """Normalize the two phone-sized editable collection fields."""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()[:_COLLECTION_FIELD_MAX]
+    if required and not text:
+        raise ValueError("collection name is required")
+    return text
+
+
+def _collection_payload() -> dict:
+    """Return a JSON object for a mutation, rejecting scalar/array bodies."""
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return {}
+    if not isinstance(payload, dict):
+        raise ValueError("JSON body must be an object")
+    return payload
+
+
+def _collection_id(value) -> str:
+    """Return a canonical UUID, rejecting PostgREST-filter metacharacters."""
+    try:
+        return str(uuid.UUID(str(value or "").strip()))
+    except (ValueError, AttributeError, TypeError):
+        raise ValueError("invalid collection id") from None
+
+
+def _resolve_collection_alias_in(aliases: dict, collection_id: str) -> str:
+    current = collection_id
+    seen = set()
+    while current and current not in seen:
+        seen.add(current)
+        nxt = str(aliases.get(current) or "").strip()
+        if not nxt:
+            break
+        current = nxt
+    return current
+
+
+def _load_collection_aliases_unlocked() -> dict[str, str]:
+    """Read only durable-marker aliases written by this implementation.
+
+    The pre-``merged_into`` prototype wrote a bare ``{old: survivor}`` map.
+    Those aliases cannot be proven authoritative when a normal tombstone is
+    later resurrected by LWW, so deliberately ignore that legacy shape.
+    """
+    doc = lib.load_json(COLLECTION_ALIASES_PATH, {}) or {}
+    if not isinstance(doc, dict) or doc.get("version") != _COLLECTION_ALIAS_VERSION:
+        return {}
+    aliases = doc.get("aliases")
+    if not isinstance(aliases, dict):
+        return {}
+    return {str(key): str(value) for key, value in aliases.items()
+            if str(key).strip() and str(value).strip()}
+
+
+def _save_collection_aliases_unlocked(aliases: dict[str, str]) -> None:
+    lib.save_json(COLLECTION_ALIASES_PATH, {
+        "version": _COLLECTION_ALIAS_VERSION,
+        "aliases": aliases,
+    })
+
+
+def _resolve_collection_alias(collection_id: str) -> str:
+    """Follow the local old->survivor chain for late capture imports."""
+    with _collection_alias_lock:
+        aliases = _load_collection_aliases_unlocked()
+    return _resolve_collection_alias_in(aliases, collection_id)
+
+
+def _collection_alias_snapshot() -> dict[str, str]:
+    """Return a stable copy for API clients after an authoritative refresh."""
+    with _collection_alias_lock:
+        return dict(_load_collection_aliases_unlocked())
+
+
+def _remember_collection_alias(old_id: str, survivor_id: str) -> None:
+    """Cache one authoritative ``merged_into`` edge, flattened and durable."""
+    with _collection_alias_lock:
+        aliases = _load_collection_aliases_unlocked()
+        target = _resolve_collection_alias_in(aliases, survivor_id)
+        existing = _resolve_collection_alias_in(aliases, old_id)
+        if target == old_id:
+            raise ValueError("collection merge would create an alias cycle")
+        if existing != old_id and existing != target:
+            raise ValueError("collection is already merged into another identity")
+        aliases[old_id] = target
+        # If A->B existed and B just merged into C, flatten A directly to C.
+        for key in list(aliases):
+            aliases[key] = _resolve_collection_alias_in(aliases, str(aliases[key]))
+        _save_collection_aliases_unlocked(aliases)
+
+
+def _replace_collection_aliases(rows: list[dict]) -> dict[str, str]:
+    """Merge a full cloud marker snapshot into the irreversible alias cache."""
+    fetched: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("deleted"):
+            continue
+        old_id = str(row.get("id") or "").strip()
+        target = str(row.get("merged_into") or "").strip()
+        if old_id and target and old_id != target:
+            fetched[old_id] = target
+    with _collection_alias_lock:
+        # Fetch happens without holding this lock. A local RPC may commit and
+        # cache a new marker before this older snapshot is installed; unioning
+        # preserves it. Merge markers are irreversible, so every v2 cached edge
+        # remains authoritative. Fetched direct edges win before flattening.
+        aliases = _load_collection_aliases_unlocked()
+        aliases.update(fetched)
+        for key in list(aliases):
+            aliases[key] = _resolve_collection_alias_in(aliases, aliases[key])
+        _save_collection_aliases_unlocked(aliases)
+    return aliases
+
+
+def _refresh_collection_aliases(cfg: dict, token: str) -> list[dict]:
+    """Fetch every current/tombstoned row and refresh durable merge aliases."""
+    rows: list[dict] = []
+    cursor = ""
+    while True:
+        after = (f"&id=gt.{urllib.parse.quote(cursor, safe='')}"
+                 if cursor else "")
+        page = sauth.rest(
+            cfg, token, "GET",
+            f"collections?select={_COLLECTION_SELECT}&order=id.asc"
+            f"&limit={_COLLECTION_PAGE_SIZE}{after}",
+            timeout=8.0,
+        )
+        if not isinstance(page, list):
+            raise sauth.AuthError("collections pagination returned malformed data")
+        if not page:
+            break
+        page_ids = [str(row.get("id") or "") if isinstance(row, dict) else ""
+                    for row in page]
+        if (any(not value for value in page_ids)
+                or page_ids != sorted(page_ids)
+                or len(set(page_ids)) != len(page_ids)
+                or (cursor and page_ids[0] <= cursor)):
+            raise sauth.AuthError("collections pagination did not advance")
+        rows.extend(page)
+        next_cursor = page_ids[-1]
+        if cursor and next_cursor <= cursor:
+            raise sauth.AuthError("collections pagination did not advance")
+        cursor = next_cursor
+    aliases = _replace_collection_aliases(rows)
+    # A merge may have been performed from another desktop. Refresh is the
+    # convergence boundary for already-imported local rows as well as future
+    # captures; snapshot name/origin strings remain untouched.
+    _repoint_collection_aliases(aliases)
+    return rows
+
+
+def _canonicalize_collection_link(entry) -> bool:
+    """Heal one entry/book through merge aliases, changing only its link id."""
+    if not isinstance(entry, dict):
+        return False
+    extra = entry.get("extra")
+    if not isinstance(extra, dict):
+        return False
+    old_id = str(extra.get("scan_collection_id") or "").strip()
+    if not old_id:
+        return False
+    current = _resolve_collection_alias(old_id)
+    if not current or current == old_id:
+        return False
+    entry["extra"] = dict(extra, scan_collection_id=current)
+    return True
+
+
+def _collection_json(row: dict) -> dict:
+    """Map the SQL-safe from_place name to the API/phone's `from`."""
+    return {
+        "id": str(row.get("id") or ""),
+        "name": str(row.get("name") or ""),
+        "from": str(row.get("from_place") or ""),
+        "created_by": str(row.get("created_by") or ""),
+        "updated_at": str(row.get("updated_at") or ""),
+        "deleted": bool(row.get("deleted")),
+        "merged_into": str(row.get("merged_into") or ""),
+    }
+
+
+def _collection_auth() -> tuple[dict, dict] | None:
+    cfg = _auth_cfg()
+    ses = _auth_session() if cfg else None
+    if not cfg or not ses or not ses.get("access_token"):
+        return None
+    return cfg, ses
+
+
+def _collection_error(exc: sauth.AuthError):
+    # A protocol rejection is useful as-is; an offline/transport failure is a
+    # temporary service outage, not an authentication failure.
+    status = exc.status if exc.status and 400 <= exc.status < 500 else 503
+    return jsonify({"ok": False, "error": str(exc)}), status
+
+
+def _next_collection_timestamp(expected: str = "") -> str:
+    """A logical revision one microsecond newer than a matched predecessor.
+
+    The CAS baseline came from the database and is the only clock trusted here.
+    Using this workstation's possibly-future wall clock would poison LWW for
+    every other device. Creation and transactional merge use database time.
+    """
+    raw = str(expected or "").strip()
+    if raw:
+        try:
+            prior = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if prior.tzinfo is None:
+                prior = prior.replace(tzinfo=timezone.utc)
+            else:
+                prior = prior.astimezone(timezone.utc)
+            return (prior + timedelta(microseconds=1)).isoformat()
+        except (ValueError, OverflowError):
+            pass
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _collection_current(cfg: dict, token: str, cid: str) -> dict | None:
+    rows = sauth.rest(
+        cfg, token, "GET",
+        f"collections?id=eq.{urllib.parse.quote(cid, safe='')}"
+        f"&select={_COLLECTION_SELECT}&limit=1",
+        timeout=8.0,
+    ) or []
+    return rows[0] if isinstance(rows, list) and rows else None
+
+
+def _adopt_collection_marker(row: dict | None) -> dict[str, str]:
+    """Cache/heal a durable marker learned on an optimistic-write conflict."""
+    if not isinstance(row, dict) or not row.get("deleted"):
+        return {}
+    old_id = str(row.get("id") or "").strip()
+    target = str(row.get("merged_into") or "").strip()
+    if not old_id or not target:
+        return {}
+    _remember_collection_alias(old_id, target)
+    aliases = _collection_alias_snapshot()
+    _repoint_collection_aliases(aliases)
+    return aliases
+
+
+def _collection_miss(cfg: dict, token: str, cid: str):
+    """Distinguish a deleted/missing row from an optimistic-write conflict."""
+    try:
+        current = _collection_current(cfg, token, cid)
+    except sauth.AuthError as exc:
+        return _collection_error(exc)
+    if current:
+        body = {"ok": False, "error": "collection changed on another device",
+                "conflict": True, "current": _collection_json(current)}
+        if aliases := _adopt_collection_marker(current):
+            body["aliases"] = aliases
+        return jsonify(body), 409
+    return jsonify({"ok": False, "error": "collection not found"}), 404
+
+
+@app.route("/api/collections")
+def api_collections_list():
+    """Read active shared collection rows as the signed-in contributor.
+
+    Signed-out is a normal desktop mode, so GET returns an empty cloud list
+    rather than making the whole catalogue look broken.  Entry snapshots are
+    still available locally and the client surfaces them as unlinked records.
+    """
+    auth = _collection_auth()
+    if not auth:
+        return jsonify({"ok": True, "signed_in": False, "collections": [],
+                        "aliases": _collection_alias_snapshot()})
+    cfg, ses = auth
+    try:
+        # Fetch tombstones too: merged_into is the durable cross-desktop source
+        # for the offline alias cache. Only active rows are returned to the UI.
+        rows = _refresh_collection_aliases(cfg, ses["access_token"])
+    except sauth.AuthError as exc:
+        return _collection_error(exc)
+    return jsonify({"ok": True, "signed_in": True,
+                    "collections": [_collection_json(r) for r in rows
+                                    if not r.get("deleted")],
+                    "aliases": _collection_alias_snapshot()})
+
+
+@app.route("/api/collections", methods=["POST"])
+def api_collections_add():
+    """Create a desktop-originated collection with a device-generated UUID."""
+    auth = _collection_auth()
+    if not auth:
+        return jsonify({"ok": False, "error": "sign in to edit collections"}), 401
+    try:
+        payload = _collection_payload()
+        name = _collection_text(payload.get("name"), required=True)
+        from_place = _collection_text(payload.get("from"))
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    cfg, ses = auth
+    row = {"id": str(uuid.uuid4()), "name": name, "from_place": from_place,
+           "created_by": ses.get("user_id"), "deleted": False}
+    try:
+        saved = sauth.rest(
+            cfg, ses["access_token"], "POST", "collections", [row],
+            prefer="return=representation",
+        ) or []
+    except sauth.AuthError as exc:
+        return _collection_error(exc)
+    if not isinstance(saved, list) or not saved:
+        return jsonify({"ok": False,
+                        "error": "collection create returned no row"}), 502
+    actual = saved[0]
+    activity("created", "collection", detail=name)
+    return jsonify({"ok": True, "collection": _collection_json(actual)})
+
+
+@app.route("/api/collections/<collection_id>", methods=["PATCH"])
+def api_collections_update(collection_id: str):
+    """Rename/re-origin current collection state, never captured books."""
+    auth = _collection_auth()
+    if not auth:
+        return jsonify({"ok": False, "error": "sign in to edit collections"}), 401
+    try:
+        payload = _collection_payload()
+        cid = _collection_id(collection_id)
+        expected = str(payload.get("expected_updated_at") or "").strip()
+        if not expected:
+            raise ValueError("expected_updated_at is required")
+        changes = {}
+        if "name" in payload:
+            changes["name"] = _collection_text(payload.get("name"), required=True)
+        if "from" in payload:
+            changes["from_place"] = _collection_text(payload.get("from"))
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    if not changes:
+        return jsonify({"ok": False, "error": "name or from is required"}), 400
+    changes["updated_at"] = _next_collection_timestamp(expected)
+    cfg, ses = auth
+    try:
+        saved = sauth.rest(
+            cfg, ses["access_token"], "PATCH",
+            f"collections?id=eq.{urllib.parse.quote(cid, safe='')}"
+            f"&updated_at=eq.{urllib.parse.quote(expected, safe='')}"
+            "&deleted=eq.false",
+            changes, prefer="return=representation",
+        ) or []
+    except sauth.AuthError as exc:
+        return _collection_error(exc)
+    if not isinstance(saved, list) or not saved:
+        return _collection_miss(cfg, ses["access_token"], cid)
+    activity("updated", "collection", detail=str(saved[0].get("name") or ""))
+    return jsonify({"ok": True, "collection": _collection_json(saved[0])})
+
+
+@app.route("/api/collections/<collection_id>", methods=["DELETE"])
+def api_collections_delete(collection_id: str):
+    """Soft-delete a collection so entry references can never be orphaned."""
+    auth = _collection_auth()
+    if not auth:
+        return jsonify({"ok": False, "error": "sign in to edit collections"}), 401
+    try:
+        payload = _collection_payload()
+        cid = _collection_id(collection_id)
+        expected = str(payload.get("expected_updated_at") or "").strip()
+        if not expected:
+            raise ValueError("expected_updated_at is required")
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    changes = {"deleted": True,
+               "updated_at": _next_collection_timestamp(expected)}
+    cfg, ses = auth
+    try:
+        saved = sauth.rest(
+            cfg, ses["access_token"], "PATCH",
+            f"collections?id=eq.{urllib.parse.quote(cid, safe='')}"
+            f"&updated_at=eq.{urllib.parse.quote(expected, safe='')}"
+            "&deleted=eq.false",
+            changes, prefer="return=representation",
+        ) or []
+    except sauth.AuthError as exc:
+        return _collection_error(exc)
+    if not isinstance(saved, list) or not saved:
+        return _collection_miss(cfg, ses["access_token"], cid)
+    activity("deleted", "collection", detail=str(saved[0].get("name") or ""))
+    return jsonify({"ok": True, "collection": _collection_json(saved[0])})
+
+
+def _repoint_collection_aliases(aliases: dict[str, str]) -> int:
+    """Canonicalize all local identities in one pass over each JSON store."""
+    if not aliases:
+        return 0
+    changed = 0
+    with _manual_lock:
+        entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {}) or {}
+        dirty = False
+        for entry in entries.values():
+            extra = entry.get("extra") if isinstance(entry, dict) else None
+            old_id = (str(extra.get("scan_collection_id") or "")
+                      if isinstance(extra, dict) else "")
+            new_id = aliases.get(old_id, old_id)
+            if old_id and new_id != old_id:
+                entry["extra"] = dict(extra, scan_collection_id=new_id)
+                changed += 1
+                dirty = True
+        if dirty:
+            lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
+    with _client_state_lock:
+        state = lib.load_json(lib.CLIENT_STATE_PATH, {}) or {}
+        dirty = False
+        checked = state.get("checked")
+        if isinstance(checked, list):
+            for pair in checked:
+                value = pair[1] if isinstance(pair, list) and len(pair) == 2 else None
+                book = value.get("book") if isinstance(value, dict) else None
+                extra = book.get("extra") if isinstance(book, dict) else None
+                old_id = (str(extra.get("scan_collection_id") or "")
+                          if isinstance(extra, dict) else "")
+                new_id = aliases.get(old_id, old_id)
+                if old_id and new_id != old_id:
+                    book["extra"] = dict(extra, scan_collection_id=new_id)
+                    changed += 1
+                    dirty = True
+        if dirty:
+            state["updated_at"] = datetime.now(timezone.utc).isoformat()
+            lib.save_json(lib.CLIENT_STATE_PATH, state)
+    return changed
+
+
+def _repoint_collection_entries(old_id: str, new_id: str) -> int:
+    """Repoint one merged identity while preserving name/origin snapshots."""
+    return _repoint_collection_aliases({old_id: new_id})
+
+
+def _collection_merge_conflict(cfg: dict, token: str, survivor_id: str,
+                               duplicate_id: str, survivor_expected: str,
+                               duplicate_expected: str):
+    """Explain a transactional RPC miss using the now-current locked rows."""
+    try:
+        survivor = _collection_current(cfg, token, survivor_id)
+        duplicate = _collection_current(cfg, token, duplicate_id)
+    except sauth.AuthError as exc:
+        return _collection_error(exc)
+    if not survivor:
+        return jsonify({"ok": False,
+                        "error": "surviving collection not found"}), 404
+    if not duplicate:
+        return jsonify({"ok": False,
+                        "error": "duplicate collection not found"}), 404
+    if duplicate.get("deleted") and duplicate.get("merged_into"):
+        target = str(duplicate.get("merged_into") or "")
+        message = ("collection is already merged into the selected identity"
+                   if target == survivor_id else
+                   "collection is already merged into another identity")
+        return jsonify({"ok": False, "error": message, "conflict": True,
+                        "current": _collection_json(duplicate),
+                        "aliases": _adopt_collection_marker(duplicate)}), 409
+    if duplicate.get("deleted"):
+        return jsonify({"ok": False,
+                        "error": "duplicate collection was deleted, not merged",
+                        "conflict": True,
+                        "current": _collection_json(duplicate)}), 409
+    if survivor.get("deleted"):
+        return jsonify({"ok": False,
+                        "error": "surviving collection is no longer active",
+                        "conflict": True,
+                        "current": _collection_json(survivor)}), 409
+    if str(survivor.get("updated_at") or "") != survivor_expected:
+        return jsonify({"ok": False,
+                        "error": "surviving collection changed on another device",
+                        "conflict": True,
+                        "current": _collection_json(survivor)}), 409
+    if str(duplicate.get("updated_at") or "") != duplicate_expected:
+        return jsonify({"ok": False,
+                        "error": "duplicate collection changed on another device",
+                        "conflict": True,
+                        "current": _collection_json(duplicate)}), 409
+    return jsonify({"ok": False, "error": "collection merge was not applied",
+                    "conflict": True}), 409
+
+
+@app.route("/api/collections/merge", methods=["POST"])
+def api_collections_merge():
+    """Atomically merge identities through the revision-checking cloud RPC."""
+    auth = _collection_auth()
+    if not auth:
+        return jsonify({"ok": False, "error": "sign in to edit collections"}), 401
+    try:
+        payload = _collection_payload()
+        survivor_id = _collection_id(payload.get("survivor_id"))
+        duplicate_id = _collection_id(payload.get("duplicate_id"))
+        if survivor_id == duplicate_id:
+            raise ValueError("choose two different collections")
+        survivor_expected = str(payload.get("survivor_updated_at") or "").strip()
+        duplicate_expected = str(payload.get("duplicate_updated_at") or "").strip()
+        if not survivor_expected or not duplicate_expected:
+            raise ValueError("both collection revisions are required")
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    cfg, ses = auth
+    token = ses["access_token"]
+    try:
+        result = sauth.rest(cfg, token, "POST", "rpc/merge_collections", {
+            "p_survivor_id": survivor_id,
+            "p_duplicate_id": duplicate_id,
+            "p_survivor_updated_at": survivor_expected,
+            "p_duplicate_updated_at": duplicate_expected,
+        })
+    except sauth.AuthError as exc:
+        return _collection_error(exc)
+    if isinstance(result, list) and len(result) == 1 and isinstance(result[0], dict):
+        result = result[0]
+    if not isinstance(result, dict):
+        return _collection_merge_conflict(
+            cfg, token, survivor_id, duplicate_id,
+            survivor_expected, duplicate_expected)
+    survivor = result.get("survivor")
+    duplicate = result.get("duplicate")
+    if (not isinstance(survivor, dict) or not isinstance(duplicate, dict)
+            or str(survivor.get("id") or "") != survivor_id
+            or str(duplicate.get("id") or "") != duplicate_id
+            or not duplicate.get("deleted")
+            or str(duplicate.get("merged_into") or "") != survivor_id):
+        return jsonify({"ok": False,
+                        "error": "collection merge returned an invalid marker"}), 502
+
+    # The RPC locked and revision-checked both rows, then durably recorded the
+    # exact identity edge. Cache it for offline LAN imports before touching
+    # local entries. If the survivor was itself merged later, cache that marker
+    # first so all local links converge directly on the final identity.
+    if survivor.get("deleted") and survivor.get("merged_into"):
+        _remember_collection_alias(
+            survivor_id, str(survivor.get("merged_into")))
+    _remember_collection_alias(duplicate_id, survivor_id)
+    resolved_survivor = _resolve_collection_alias(duplicate_id)
+    repointed = _repoint_collection_entries(duplicate_id, resolved_survivor)
+    continued = bool(result.get("continued"))
+    if not continued:
+        activity("merged", "collection", detail=(
+            f"{duplicate.get('name') or duplicate_id} into "
+            f"{survivor.get('name') or survivor_id}"
+        ))
+    return jsonify({"ok": True, "survivor": _collection_json(survivor),
+                    "deleted": _collection_json(duplicate),
+                    "resolved_survivor_id": resolved_survivor,
+                    "repointed": repointed, "continued": continued})
+
+
 # --- the activity mirror: local jsonl -> cloud events table ----------------------
 # The local file is the source of truth; the cursor in auth_session.json marks
 # how much of it the cloud already has. Push failures leave the cursor alone,
@@ -8283,6 +8843,8 @@ def _trash_restore_record(item: dict) -> tuple[dict, int]:
     def apply(doc):
         if rid in doc:
             return False
+        if kind == "manual_entry":
+            _canonicalize_collection_link(record)
         doc[rid] = record
         return True
 
@@ -9652,6 +10214,13 @@ def api_client_state_put():
         # raise here — a bad request degrades, it does not 500.
         new_checked = payload.get("checked")
         if isinstance(new_checked, list):
+            # A stale tab/offline cache may predate a collection merge. Heal
+            # every incoming book at the whole-blob write boundary so a loser
+            # id cannot be reintroduced after the merge repoint completed.
+            for pair in new_checked:
+                value = pair[1] if isinstance(pair, list) and len(pair) == 2 else None
+                book = value.get("book") if isinstance(value, dict) else None
+                _canonicalize_collection_link(book)
             old = state.get("checked")
             old_n = len(old) if isinstance(old, list) else 0
             if len(new_checked) < old_n:
@@ -9745,6 +10314,22 @@ def _clean_extra(v) -> dict:
             if str(k).strip() and (cleaned := clean(value)) is not None}
 
 
+def _manual_extra_patch(value, existing=None) -> dict:
+    """Clean generic metadata without letting it edit capture provenance.
+
+    Phone ingest writes the snapshot once, and the private merge helper may
+    repoint only its id. Generic manual-entry create/PATCH callers can neither
+    forge nor remove Collection/From/id, even if they bypass the renderer.
+    """
+    cleaned = _clean_extra(value)
+    prior = existing if isinstance(existing, dict) else {}
+    for key in PHONE_PROVENANCE_KEYS:
+        cleaned.pop(key, None)
+        if key in prior:
+            cleaned[key] = prior[key]
+    return cleaned
+
+
 def _clean_images(v) -> list[str]:
     """Entry image paths: normalized DATA_ROOT-relative image paths only.
 
@@ -9780,7 +10365,7 @@ def api_manual_add():
     if not entry["title"]:
         return jsonify({"ok": False, "error": "TITLE IS REQUIRED"}), 400
     if payload.get("extra"):
-        entry["extra"] = _clean_extra(payload.get("extra"))
+        entry["extra"] = _manual_extra_patch(payload.get("extra"))
     if payload.get("images"):
         entry["images"] = _clean_images(payload.get("images"))
     if payload.get("category_ids"):
@@ -9817,7 +10402,7 @@ def api_manual_update(entry_id: str):
                 e[f] = str(payload[f] or "").strip()
         # non-column metadata: only replaced when explicitly sent (survives edits)
         if "extra" in payload:
-            e["extra"] = _clean_extra(payload.get("extra"))
+            e["extra"] = _manual_extra_patch(payload.get("extra"), e.get("extra"))
         if "images" in payload:
             e["images"] = _clean_images(payload.get("images"))
         if "category_ids" in payload:
@@ -9850,6 +10435,7 @@ def api_manual_restore():
     if not eid or not str(entry.get("title", "") or "").strip():
         abort(400)
     with _manual_lock:
+        _canonicalize_collection_link(entry)
         entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
         entries[eid] = entry
         lib.save_json(lib.MANUAL_ENTRIES_PATH, entries)
@@ -14833,7 +15419,9 @@ def _capture_note(cap: dict, errors: list[str]) -> str:
 # extracted, or a phone with no API key would skip the desktop's own OCR below
 # and file a blank entry. The `scan_` prefix also keeps it from colliding with a
 # model-extracted `collection`.
-PHONE_PROVENANCE_KEYS = frozenset({"scan_collection", "scan_from"})
+PHONE_PROVENANCE_KEYS = frozenset({
+    "scan_collection_id", "scan_collection", "scan_from",
+})
 
 
 def _capture_provenance(cap: dict) -> dict:
@@ -14852,8 +15440,8 @@ def _capture_provenance(cap: dict) -> dict:
             meta = None
     if not isinstance(meta, dict):
         return {}
-    return {key: meta[key] for key in PHONE_PROVENANCE_KEYS
-            if str(meta.get(key) or "").strip()}
+    return {key: value.strip() for key in PHONE_PROVENANCE_KEYS
+            if isinstance((value := meta.get(key)), str) and value.strip()}
 
 
 def _phone_result(cap: dict, raw_photos: list[bytes], photo_paths: list) -> dict | None:
@@ -14912,8 +15500,14 @@ def _phone_result(cap: dict, raw_photos: list[bytes], photo_paths: list) -> dict
     # reading older/newer extractors: preserve every unknown top-level key too,
     # so adding metadata on Android never silently loses it on desktop.
     extra = dict(meta.get("extra")) if isinstance(meta.get("extra"), dict) else {}
+    # Only the flat wire keys are authoritative capture provenance. A model or
+    # malformed client must not smuggle reserved scan_* values through nested
+    # generic metadata; ingest_capture merges the validated flat strings later.
+    for key in PHONE_PROVENANCE_KEYS:
+        extra.pop(key, None)
     for key, value in meta.items():
-        if key not in capture.FIELDS and key != "extra" and has_value(value):
+        if (key not in capture.FIELDS and key != "extra"
+                and key not in PHONE_PROVENANCE_KEYS and has_value(value)):
             extra.setdefault(key, value)
     return {"photos": photos, "ocr_text": "\n\n".join(parts),
             "fields": fields, "extra": extra, "errors": errors}
@@ -14959,12 +15553,26 @@ def ingest_capture(cap: dict, raw_photos: list[bytes], mistral_key: str,
     entry["notes"] = _capture_note(cap, result["errors"])
     # provenance last: it is the phone's own record of where the book came
     # from, so it outranks anything an extractor happened to call the same thing
-    entry["extra"] = _clean_extra({**result["extra"], **_capture_provenance(cap)})
+    provenance = _capture_provenance(cap)
+    if provenance.get("scan_collection_id"):
+        # A queued capture may arrive after its collection identity was merged.
+        # Resolve only the link; name/origin remain the capture-time snapshot.
+        provenance["scan_collection_id"] = _resolve_collection_alias(
+            provenance["scan_collection_id"])
+    entry["extra"] = _clean_extra({**result["extra"], **provenance})
     entry["images"] = images
     entry["capture_id"] = cap_id
     entry["created_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     entry["checks"] = _entry_checks(entry)
     with _manual_lock:
+        # Close the ingest/merge interleaving: a merge alias can be committed
+        # while photo processing is in flight, after the first resolution
+        # above but before this entry exists for the merge repoint walk.
+        extra = entry.get("extra")
+        if isinstance(extra, dict) and extra.get("scan_collection_id"):
+            entry["extra"] = dict(extra, scan_collection_id=
+                                  _resolve_collection_alias(
+                                      str(extra["scan_collection_id"])))
         entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
         entry["id"] = lib.gen_id(set(entries))
         entries[entry["id"]] = entry
@@ -15069,6 +15677,14 @@ def _cloud_sync_run() -> dict:
         s = _client_settings()
         mistral_key = str(s.get("mistralKey") or "").strip()
         delete_remote = s.get("cloudDeleteRemote") is not False
+        # A different desktop may have merged an identity since this process
+        # last opened the Collections window. Refresh durable merge markers
+        # before importing queued captures so their ids converge immediately.
+        # If this authoritative read fails, stop before filing captures with a
+        # potentially stale identity; the next sync can retry without loss.
+        collection_token = (str(capture_cfg.get("access_token") or "").strip()
+                            or str(capture_cfg.get("key") or "").strip())
+        _refresh_collection_aliases(capture_cfg, collection_token)
         for cap in sbase.list_pending_captures(capture_cfg):
             try:
                 if _import_capture(capture_cfg, cap, mistral_key, delete_remote) == "imported":
