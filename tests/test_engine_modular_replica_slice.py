@@ -25,14 +25,12 @@ from librarytool.engine.contracts import (
     RecompileRegionPagesCommand,
     ReplaceRegionPageCommand,
     ReviewRegionProposalCommand,
-    TranslationPageCommand,
 )
 from librarytool.engine.errors import ConflictError
 from librarytool.engine.replica import ReplicaApplicationService
 from librarytool.engine.text_layers import TextLayerService
 from librarytool.engine.translations import (
     TranslationProvenanceService,
-    TranslationService,
 )
 
 
@@ -151,30 +149,6 @@ class TextStore:
 
     def bind_document_source(self, item_id, document, source_id):
         self.bindings[(item_id, document)] = source_id
-
-
-class TranslationStore:
-    def __init__(self, policies):
-        self.policies = policies
-        self.documents = {}
-
-    def load(self, item_id, language):
-        return copy.deepcopy(self.documents.get((item_id, language), {}))
-
-    def compare_and_save(
-        self, item_id, language, document, *, expected_revision
-    ):
-        current = self.documents.get((item_id, language), {})
-        pages = current.get("pages") if isinstance(current, dict) else None
-        normalized = {"version": 1, "pages": copy.deepcopy(pages or {})}
-        actual = self.policies.content_revision(normalized, "tr")
-        if actual != expected_revision:
-            raise ConflictError(
-                "concurrent translation write",
-                code="stale_translation_revision",
-                details={"current_revision": actual},
-            )
-        self.documents[(item_id, language)] = copy.deepcopy(dict(document))
 
 
 def make_replica(tmp_path, *, fail_text=False):
@@ -411,47 +385,6 @@ def test_recompile_recovers_pending_and_uses_source_scoped_normalized_target(
     assert text.bindings[("book", "normalized-scan-b.txt")] == "scan-b"
     assert TextLayerService.distribute("a\n\nb\n\nc", [1, 1, 1]) == [
         "a", "b", "c"]
-
-
-def test_translation_service_tracks_source_revision_and_reports_status():
-    policies = Policies()
-    store = TranslationStore(policies)
-    service = TranslationService(
-        Items(),
-        store,
-        policies,
-        clock=lambda: datetime(2026, 7, 19, tzinfo=timezone.utc),
-    )
-    empty = service.get("book", "FR")
-    saved = service.replace_page(
-        TranslationPageCommand(
-            item_id="book",
-            language="FR",
-            page=1,
-            text="Bonjour",
-            expected_revision=empty.revision,
-            source_text="Hello",
-            source_layer="text",
-            model="translator-v1",
-        )
-    )
-    assert saved.language == "fr"
-    assert saved.pages["1"]["model"] == "translator-v1"
-    status = service.status(
-        "book", "fr", {1: "Hello", 2: "Next"}, source_layer="text"
-    )
-    assert status.stale == ()
-    assert status.missing == (2,)
-    changed = service.status("book", "fr", {1: "Changed"})
-    assert changed.stale == (1,)
-
-    with pytest.raises(ConflictError) as conflict:
-        service.replace_page(
-            TranslationPageCommand(
-                "book", "fr", 1, "Salut", empty.revision, "Hello"
-            )
-        )
-    assert conflict.value.code == "stale_translation_revision"
 
 
 def test_translation_provenance_preserves_paragraphs_and_classifies_pages():

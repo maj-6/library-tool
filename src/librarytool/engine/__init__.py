@@ -57,12 +57,32 @@ from .items import (
 from .replica import ReplicaApplicationService
 from .runtime import LibraryEngine
 from .text_layers import TextLayerService
-from .translations import TranslationProvenanceService, TranslationService
+from .translation_contracts import (
+    ReplaceTranslationPageCommand,
+    TranslationAggregate,
+    TranslationDocumentView,
+    TranslationPageOrigin,
+    TranslationPageRecord,
+    TranslationPageState,
+    TranslationPageView,
+    TranslationReviewState,
+    TranslationSourceCanvas,
+    TranslationSourceRef,
+    TranslationSourceSnapshot,
+    TranslationStatus,
+    TranslationSummaryView,
+)
+from .translations import (
+    CanonicalTranslationPolicy,
+    TranslationProvenanceService,
+    TranslationService,
+)
 from .workbench_policies import standard_workbench_policies
 
 __all__ = [
     "CapabilityRef",
     "CapabilityRegistry",
+    "CanonicalTranslationPolicy",
     "ConflictError",
     "EngineError",
     "ArtifactRef",
@@ -102,8 +122,21 @@ __all__ = [
     "RepositoryError",
     "RepresentationView",
     "TextLayerService",
+    "ReplaceTranslationPageCommand",
+    "TranslationAggregate",
+    "TranslationDocumentView",
+    "TranslationPageOrigin",
+    "TranslationPageRecord",
+    "TranslationPageState",
+    "TranslationPageView",
     "TranslationProvenanceService",
+    "TranslationReviewState",
     "TranslationService",
+    "TranslationSourceCanvas",
+    "TranslationSourceRef",
+    "TranslationSourceSnapshot",
+    "TranslationStatus",
+    "TranslationSummaryView",
     "ValidationError",
     "WorkbenchState",
     "WorkbenchContext",

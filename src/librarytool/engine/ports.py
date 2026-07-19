@@ -6,6 +6,10 @@ from collections.abc import Mapping, MutableMapping, Sequence
 from typing import Any, ContextManager, Protocol
 
 from .contracts import ItemDescriptor
+from .translation_contracts import (
+    TranslationAggregate,
+    TranslationSourceSnapshot,
+)
 
 
 class ItemRepositoryPort(Protocol):
@@ -97,17 +101,55 @@ class TextLayerRepositoryPort(Protocol):
     ) -> None: ...
 
 
-class TranslationRepositoryPort(Protocol):
-    def load(self, item_id: str, language: str) -> Mapping[str, Any]: ...
+class TranslationSourceSnapshotPort(Protocol):
+    """Read authoritative source text while a repository lease is held."""
+
+    def load_source(
+        self, item_id: str, layer_id: str
+    ) -> TranslationSourceSnapshot | None: ...
+
+
+class TranslationReadSessionPort(TranslationSourceSnapshotPort, Protocol):
+    """One coherent translation/source snapshot."""
+
+    def list(self, item_id: str) -> Sequence[TranslationAggregate]: ...
+
+    def load(
+        self, item_id: str, translation_id: str
+    ) -> TranslationAggregate | None: ...
+
+
+class TranslationUnitOfWorkPort(TranslationReadSessionPort, Protocol):
+    """Locked snapshot that can atomically compare and save an aggregate."""
 
     def compare_and_save(
         self,
-        item_id: str,
-        language: str,
-        document: Mapping[str, Any],
+        aggregate: TranslationAggregate,
         *,
-        expected_revision: str,
-    ) -> None: ...
+        expected_document_revision: str,
+        expected_source_revision: str,
+    ) -> None:
+        """Verify both revisions and save without releasing the lease."""
+
+
+class TranslationRepositoryPort(Protocol):
+    """Open coherent read and write sessions over translations and sources."""
+
+    def snapshot(
+        self, item_id: str
+    ) -> ContextManager[TranslationReadSessionPort]: ...
+
+    def unit_of_work(
+        self, item_id: str
+    ) -> ContextManager[TranslationUnitOfWorkPort]: ...
+
+
+class TranslationPolicyPort(Protocol):
+    """Small deterministic policy surface required by translation services."""
+
+    def normalize_language(self, value: str) -> str: ...
+
+    def revision(self, value: Any, prefix: str) -> str: ...
 
 
 class JobHistoryRepositoryPort(Protocol):

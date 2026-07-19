@@ -134,31 +134,3 @@ class ProposalReviewResult:
 class LayoutFamilyResult:
     capability: str
     proposal: JsonMap
-
-
-@dataclass(frozen=True, slots=True)
-class TranslationPageCommand:
-    item_id: str
-    language: str
-    page: int
-    text: str
-    expected_revision: str
-    source_text: str = ""
-    source_layer: str = ""
-    model: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class TranslationDocumentView:
-    item_id: str
-    language: str
-    revision: str
-    pages: JsonMap
-
-
-@dataclass(frozen=True, slots=True)
-class TranslationStatus:
-    stale: tuple[int, ...] = ()
-    untracked: tuple[int, ...] = ()
-    missing: tuple[int, ...] = ()
-    orphaned: tuple[int, ...] = ()
