@@ -14,6 +14,7 @@ import pytest
 
 import libcommon as lib
 import store_sync as ss
+from librarytool.engine.item_lifecycle import ItemLifecycleDeletionIndex
 
 T0 = "2026-07-01T00:00:00+00:00"
 T1 = "2026-07-02T00:00:00+00:00"
@@ -935,6 +936,38 @@ def test_sync_stores_isolates_a_failing_store(fake_cloud, monkeypatch):
                                  "deleted": 0, "in_sync": 0, "guard": ""}
 
 
+def test_server_cloud_sync_policy_guard_holds_casefold_index(monkeypatch):
+    import server
+
+    held = False
+    events = []
+
+    class Lifecycle:
+        @contextmanager
+        def deletion_index_guard(self):
+            nonlocal held
+            assert held is False
+            held = True
+            events.append("enter")
+            try:
+                yield ItemLifecycleDeletionIndex(("Deleted",))
+            finally:
+                held = False
+                events.append("exit")
+
+    monkeypatch.setattr(server, "_item_lifecycle_engine", Lifecycle)
+
+    with server._cloud_sync_item_policy_guard() as allows:
+        assert held is True
+        assert allows("Deleted") is False
+        assert allows("deleted") is False
+        assert allows("DELETED") is False
+        assert allows("deleted-extra") is True
+
+    assert held is False
+    assert events == ["enter", "exit"]
+
+
 def test_cloud_sync_pass_carries_the_stores(fake_cloud, monkeypatch):
     """The server's sync pass: stores merge inside it, results in the report."""
     import server
@@ -947,6 +980,39 @@ def test_cloud_sync_pass_carries_the_stores(fake_cloud, monkeypatch):
     monkeypatch.setattr(server.sbase, "list_pending_captures",
                         lambda cfg, limit=50: [])
     monkeypatch.setattr(server.sbase, "push_books", lambda cfg, rows: len(rows))
+    real_sync_stores = server.store_sync.sync_stores
+    calls = []
+
+    def observed_sync_stores(cfg, **kwargs):
+        calls.append(("stores", cfg, kwargs))
+        assert "builds" not in kwargs["locks"]
+        assert kwargs["item_policy_guard"] is (
+            server._cloud_sync_item_policy_guard
+        )
+        return real_sync_stores(cfg, **kwargs)
+
+    entry_result = {
+        "pushed": 0,
+        "pulled": 0,
+        "in_sync": 0,
+        "suppressed": 0,
+    }
+
+    def observed_sync_entry_files(cfg, **kwargs):
+        calls.append(("entries", cfg, kwargs))
+        assert kwargs["item_policy_guard"] is (
+            server._cloud_sync_item_policy_guard
+        )
+        return entry_result
+
+    monkeypatch.setattr(
+        server.store_sync, "sync_stores", observed_sync_stores
+    )
+    monkeypatch.setattr(
+        server.store_sync, "sync_entry_files", observed_sync_entry_files
+    )
+    monkeypatch.setattr(server, "_r2_cfg", lambda: {"bucket": "test"})
+    monkeypatch.setattr(server.r2, "configured", lambda _cfg: True)
     lib.save_json(ss.STORES["builds"]["path"](),
                   {"b1": {"id": "b1", "title": "One", "updated_at": T1}})
     try:
@@ -956,8 +1022,9 @@ def test_cloud_sync_pass_carries_the_stores(fake_cloud, monkeypatch):
         lib.save_json(lib.CLIENT_STATE_PATH, state)
     assert res["ok"] is True, res
     assert res["stores"]["builds"]["pushed"] == 1
-    assert res["entries"] == {"skipped": "R2 not configured"}
+    assert res["entries"] == entry_result
     assert fake_cloud.tables["builds"]["b1"]["data"]["title"] == "One"
+    assert [call[0] for call in calls] == ["stores", "entries"]
 
 
 def test_corrections_sync_survives_the_id_backfill(fake_cloud):

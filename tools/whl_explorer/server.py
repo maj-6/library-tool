@@ -16297,6 +16297,15 @@ def _books_mirror_rows() -> list[dict]:
     return rows
 
 
+@contextlib.contextmanager
+def _cloud_sync_item_policy_guard():
+    """Yield the tombstone policy while lifecycle isolation remains held."""
+
+    lifecycle = _item_lifecycle_engine()
+    with lifecycle.deletion_index_guard() as deletion_index:
+        yield deletion_index.allows
+
+
 def _cloud_sync_run() -> dict:
     """Import this user's pending phone captures, with optional owner work.
 
@@ -16342,10 +16351,15 @@ def _cloud_sync_run() -> dict:
                 errors.append(f"books mirror: {exc}")
             # the working stores that left git in 87a9bf2 (two-way, per record;
             # store_sync guards against an emptier side clobbering a fuller one)
-            stores = store_sync.sync_stores(owner_cfg, locks={
-                "builds": _builds_lock, "ia_catalog": _ia_catalog_lock,
-                "corrections": _corrections_lock,
-                "taxonomy": _categories_lock})
+            stores = store_sync.sync_stores(
+                owner_cfg,
+                locks={
+                    "ia_catalog": _ia_catalog_lock,
+                    "corrections": _corrections_lock,
+                    "taxonomy": _categories_lock,
+                },
+                item_policy_guard=_cloud_sync_item_policy_guard,
+            )
             for name, res in stores.items():
                 if res.get("error"):
                     errors.append(f"{name}: {res['error']}")
@@ -16354,7 +16368,10 @@ def _cloud_sync_run() -> dict:
             r2cfg = _r2_cfg()
             if r2.configured(r2cfg):
                 try:
-                    entries_res = store_sync.sync_entry_files(r2cfg)
+                    entries_res = store_sync.sync_entry_files(
+                        r2cfg,
+                        item_policy_guard=_cloud_sync_item_policy_guard,
+                    )
                 except Exception as exc:
                     errors.append(f"entry files: {exc}")
             else:
