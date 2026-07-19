@@ -23,6 +23,7 @@ import shutil
 import stat
 import sys
 import threading
+import time
 import uuid
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
@@ -1856,7 +1857,7 @@ def _atomic_bytes(path: Path, payload: bytes) -> None:
             stream.flush()
             temporary.chmod(0o600)
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        _replace_with_retry(temporary, path)
         _fsync_directory(path.parent)
     finally:
         try:
@@ -1879,13 +1880,33 @@ def _atomic_copy(source: Path, destination: Path, *, mode: int | None = None) ->
             if mode is not None:
                 temporary.chmod(mode)
             os.fsync(writer.fileno())
-        os.replace(temporary, destination)
+        _replace_with_retry(temporary, destination)
         _fsync_directory(destination.parent)
     finally:
         try:
             temporary.unlink()
         except OSError:
             pass
+
+
+def _replace_with_retry(source: Path, destination: Path) -> None:
+    """Publish one prepared file despite a short Windows sharing violation.
+
+    Antivirus and indexer readers can briefly open a just-written journal
+    without delete sharing.  A bounded retry preserves the atomic replace
+    guarantee while a persistent permission failure still reaches the caller.
+    """
+
+    last_error: PermissionError | None = None
+    for attempt in range(5):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            time.sleep(0.05 * (attempt + 1))
+    assert last_error is not None
+    raise last_error
 
 
 def _fsync_directory(path: Path) -> None:

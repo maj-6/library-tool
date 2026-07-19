@@ -89,6 +89,39 @@ def test_prepare_records_both_hashes_and_commit_publishes_the_set(tmp_path):
     assert (root / "layout.json").read_bytes() == b"new-layout"
 
 
+def test_journal_publication_retries_transient_permission_errors(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    transaction = RecoverableWriteSet(root).begin(operation_id="retry-journal")
+    transaction.stage_write("layout.json", b"new-layout")
+    transaction.prepare()
+
+    real_replace = write_set_module.os.replace
+    failures = {"remaining": 2}
+    sleeps: list[float] = []
+
+    def flaky_replace(source, destination):
+        if (
+            Path(destination) == transaction.journal_path
+            and failures["remaining"]
+        ):
+            failures["remaining"] -= 1
+            raise PermissionError("transient sharing violation")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(write_set_module.os, "replace", flaky_replace)
+    monkeypatch.setattr(write_set_module.time, "sleep", sleeps.append)
+
+    transaction.commit()
+
+    assert failures["remaining"] == 0
+    assert sleeps == [0.05, 0.10]
+    assert (root / "layout.json").read_bytes() == b"new-layout"
+    assert _journal(transaction)["state"] == "committed"
+
+
 def test_injected_late_failure_rolls_back_bytes_deletion_and_directories(tmp_path):
     root = tmp_path / "workspace"
     root.mkdir()
