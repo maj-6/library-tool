@@ -87,11 +87,14 @@ from librarytool.adapters.filesystem.recoverable_write_set import (  # noqa: E40
 from librarytool.composition.filesystem import (  # noqa: E402
     CatalogueBindings,
     FilesystemEnginePaths,
-    FilesystemServiceGraph,
     InterchangeBindings,
+    ItemLifecycleBindings,
     ReplicaBindings,
     RepresentationBindings,
     TranslationBindings,
+)
+from librarytool.composition.first_party import (  # noqa: E402
+    first_party_module_contributions,
 )
 from librarytool.composition.host import (  # noqa: E402
     FilesystemEngineConfig,
@@ -99,11 +102,6 @@ from librarytool.composition.host import (  # noqa: E402
     FilesystemHostBindings,
     JobHistoryBindings,
     open_filesystem_engine,
-)
-from librarytool.engine.capabilities import (  # noqa: E402
-    CapabilityRef,
-    ModuleManifest,
-    WorkbenchManifest,
 )
 from librarytool.engine.contracts import (  # noqa: E402
     ItemDescriptor,
@@ -156,21 +154,10 @@ from librarytool.engine.representation_commands import (  # noqa: E402
     RepresentationRecordSnapshot,
 )
 from librarytool.engine.runtime import (  # noqa: E402
-    INTERCHANGE_SERVICE,
-    ITEM_COMMAND_SERVICE,
     ITEM_LIFECYCLE_SERVICE,
-    ITEM_QUERY_SERVICE,
-    JOB_SERVICE,
     LIB_OPEN_SERVICE,
-    REPLICA_SERVICE,
     REPRESENTATION_COMMAND_SERVICE,
-    TEXT_LAYER_SERVICE,
-    TRANSLATION_PROVENANCE_SERVICE,
-    TRANSLATION_SERVICE,
     LibraryEngine,
-    ModuleContribution,
-    ServiceBinding,
-    WorkbenchPolicyBinding,
 )
 from librarytool.engine.text_layers import TextLayerService  # noqa: E402
 from librarytool.engine.translation_contracts import (  # noqa: E402
@@ -182,14 +169,6 @@ from librarytool.engine.translations import (  # noqa: E402
     TranslationProvenanceService,
     TranslationService,
 )
-from librarytool.engine.workbench_policies import (  # noqa: E402
-    CatalogueCommandWorkbenchPolicy,
-    ReplicaWorkbenchPolicy,
-    RepresentationCommandWorkbenchPolicy,
-    TextLayerWorkbenchPolicy,
-    TranslationWorkbenchPolicy,
-)
-
 # Importing the compatibility transport must not claim a workspace. The first
 # request, or the explicit __main__ startup barrier, opens one complete session
 # and publishes these aliases together for processors that have not crossed the
@@ -1039,257 +1018,6 @@ def home():
         engine_v=_asset_v("engine-client.js"),
         css_v=_asset_v("style.css"),
         app_version=_app_version(),
-    )
-
-
-_ENGINE_MODULE_MANIFESTS = (
-    ModuleManifest(
-        "library.core", "1.1.0",
-        provides=(
-            # ``library.items`` remains the compatibility capability while
-            # new clients can bind to the narrower read contracts.
-            CapabilityRef("library.items"),
-            CapabilityRef("library.items.read"),
-            CapabilityRef("library.representations"),
-            CapabilityRef("library.artifacts"),
-        ),
-    ),
-    ModuleManifest(
-        "jobs.core", "1.0.0",
-        provides=(CapabilityRef("library.jobs"),),
-    ),
-    ModuleManifest(
-        "library.catalogue.commands", "1.0.0",
-        provides=(
-            CapabilityRef("library.items.create"),
-            CapabilityRef("library.items.update"),
-        ),
-        requires=(CapabilityRef("library.items.read"),),
-    ),
-    ModuleManifest(
-        "library.representation.commands", "1.0.0",
-        provides=(
-            CapabilityRef("library.representations.attach"),
-            CapabilityRef("library.representations.replace"),
-            CapabilityRef("library.representations.detach"),
-        ),
-        requires=(
-            CapabilityRef("library.items.read"),
-            CapabilityRef("library.representations"),
-        ),
-    ),
-    ModuleManifest(
-        "replica.core", "1.0.0",
-        provides=(
-            CapabilityRef("replica.regions"),
-            CapabilityRef("replica.proposals"),
-            CapabilityRef("replica.text-layers"),
-            CapabilityRef("replica.layout-families"),
-        ),
-        requires=(CapabilityRef("library.items"),),
-    ),
-    ModuleManifest(
-        "translation.core", "2.0.0",
-        provides=(
-            CapabilityRef("translation.provenance"),
-            CapabilityRef("translation.layers.read"),
-            CapabilityRef("translation.layers.status"),
-            CapabilityRef("translation.layers.edit"),
-        ),
-        requires=(CapabilityRef("library.items"),),
-    ),
-    ModuleManifest(
-        "replica.lib", "2.0.0",
-        provides=(CapabilityRef("replica.interchange", 2),),
-        requires=(CapabilityRef("replica.regions"),),
-    ),
-    ModuleManifest(
-        "replica.lib-open", "1.0.0",
-        provides=(CapabilityRef("replica.interchange.open"),),
-        requires=(
-            CapabilityRef("replica.interchange", 2),
-            CapabilityRef("library.items.create"),
-        ),
-    ),
-)
-_ENGINE_WORKBENCH_MANIFESTS = (
-    WorkbenchManifest(
-        "catalog", "1.0.0",
-        requires=(CapabilityRef("library.items"),),
-        enhances=(
-            CapabilityRef("library.items.create"),
-            CapabilityRef("library.items.update"),
-            CapabilityRef("library.representations.attach"),
-            CapabilityRef("library.representations.replace"),
-            CapabilityRef("library.representations.detach"),
-        ),
-    ),
-    WorkbenchManifest(
-        "replica", "1.0.0",
-        requires=(
-            CapabilityRef("replica.regions"),
-            CapabilityRef("replica.text-layers"),
-        ),
-        enhances=(
-            CapabilityRef("replica.interchange", 2),
-            CapabilityRef("replica.interchange.open"),
-            CapabilityRef("replica.layout-families"),
-            CapabilityRef("translation.provenance"),
-            CapabilityRef("translation.layers.read"),
-            CapabilityRef("translation.layers.status"),
-            CapabilityRef("translation.layers.edit"),
-            CapabilityRef("library.jobs"),
-        ),
-    ),
-)
-
-
-def _engine_module_contributions(
-    graph: FilesystemServiceGraph,
-) -> tuple[ModuleContribution, ...]:
-    """Bind installed first-party manifests to the concrete service graph."""
-
-    modules = {manifest.id: manifest for manifest in _ENGINE_MODULE_MANIFESTS}
-    workbenches = {
-        manifest.id: manifest for manifest in _ENGINE_WORKBENCH_MANIFESTS
-    }
-    return (
-        ModuleContribution(
-            modules["library.core"],
-            bindings=(
-                ServiceBinding(
-                    ITEM_QUERY_SERVICE,
-                    graph.items,
-                    modules["library.core"].provides,
-                ),
-            ),
-            workbenches=(workbenches["catalog"],),
-        ),
-        ModuleContribution(
-            modules["jobs.core"],
-            bindings=(
-                ServiceBinding(
-                    JOB_SERVICE,
-                    graph.jobs,
-                    modules["jobs.core"].provides,
-                ),
-            ),
-        ),
-        ModuleContribution(
-            modules["library.catalogue.commands"],
-            bindings=(
-                ServiceBinding(
-                    ITEM_COMMAND_SERVICE,
-                    graph.item_commands,
-                    modules["library.catalogue.commands"].provides,
-                ),
-            ),
-            item_policies=(
-                WorkbenchPolicyBinding(
-                    CatalogueCommandWorkbenchPolicy(),
-                    (CapabilityRef("library.items.update"),),
-                ),
-            ),
-        ),
-        *((
-            ModuleContribution(
-                modules["library.representation.commands"],
-                bindings=(
-                    ServiceBinding(
-                        REPRESENTATION_COMMAND_SERVICE,
-                        graph.representation_commands,
-                        modules["library.representation.commands"].provides,
-                    ),
-                ),
-                item_policies=(
-                    WorkbenchPolicyBinding(
-                        RepresentationCommandWorkbenchPolicy(),
-                        (CapabilityRef("library.representations.attach"),),
-                    ),
-                ),
-            ),
-        ) if graph.representation_commands is not None else ()),
-        ModuleContribution(
-            modules["replica.core"],
-            bindings=(
-                ServiceBinding(
-                    REPLICA_SERVICE,
-                    graph.replica,
-                    tuple(
-                        capability
-                        for capability in modules["replica.core"].provides
-                        if capability.id != "replica.text-layers"
-                    ),
-                ),
-                ServiceBinding(
-                    TEXT_LAYER_SERVICE,
-                    graph.text_layers,
-                    (CapabilityRef("replica.text-layers"),),
-                ),
-            ),
-            workbenches=(workbenches["replica"],),
-            item_policies=(
-                WorkbenchPolicyBinding(
-                    ReplicaWorkbenchPolicy(),
-                    (CapabilityRef("replica.regions"),),
-                ),
-                WorkbenchPolicyBinding(
-                    TextLayerWorkbenchPolicy(),
-                    (CapabilityRef("replica.text-layers"),),
-                ),
-            ),
-        ),
-        ModuleContribution(
-            modules["translation.core"],
-            bindings=(
-                ServiceBinding(
-                    TRANSLATION_PROVENANCE_SERVICE,
-                    graph.translation_provenance,
-                    (CapabilityRef("translation.provenance"),),
-                ),
-                ServiceBinding(
-                    TRANSLATION_SERVICE,
-                    graph.translations,
-                    tuple(
-                        capability
-                        for capability in modules["translation.core"].provides
-                        if capability.id != "translation.provenance"
-                    ),
-                ),
-            ),
-            item_policies=(
-                WorkbenchPolicyBinding(
-                    TranslationWorkbenchPolicy(),
-                    (CapabilityRef("translation.layers.status"),),
-                ),
-            ),
-        ),
-        ModuleContribution(
-            modules["replica.lib"],
-            bindings=(
-                ServiceBinding(
-                    INTERCHANGE_SERVICE,
-                    graph.interchange,
-                    modules["replica.lib"].provides,
-                ),
-            ),
-        ),
-        *(
-            ()
-            if graph.lib_open is None
-            else (
-                ModuleContribution(
-                    modules["replica.lib-open"],
-                    bindings=(
-                        ServiceBinding(
-                            LIB_OPEN_SERVICE,
-                            graph.lib_open,
-                            modules["replica.lib-open"].provides,
-                        ),
-                    ),
-                ),
-            )
-        ),
     )
 
 
@@ -3638,6 +3366,65 @@ def _engine_item_command_encode(
     return result
 
 
+def _engine_advance_restored_record(
+    item_id: str,
+    raw: Mapping,
+) -> Mapping:
+    """Restore the exact raw build shape with one fresh catalogue revision."""
+
+    if not isinstance(raw, Mapping):
+        raise EngineRepositoryError(
+            "the deleted build record is not an object",
+            code="invalid_item_restore_record",
+        )
+    try:
+        _engine_validate_managed_build_fields(item_id, raw)
+        before = _engine_item_command_decode(item_id, raw)
+        restored = json.loads(json.dumps(
+            raw,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ))
+        if not isinstance(restored, dict) or restored != raw:
+            raise ValueError("the build record cannot be detached exactly")
+    except EngineError:
+        raise
+    except (RecursionError, TypeError, ValueError, UnicodeError) as exc:
+        raise EngineRepositoryError(
+            "the deleted build record failed its storage codec",
+            code="invalid_item_restore_record",
+            details={"cause_type": type(exc).__name__},
+        ) from exc
+
+    restored["id"] = item_id
+    for _attempt in range(2):
+        restored["updated_at"] = _build_updated_at(
+            str(restored.get("updated_at") or "")
+        )
+        try:
+            _engine_validate_managed_build_fields(item_id, restored)
+            after = _engine_item_command_decode(item_id, restored)
+        except EngineError:
+            raise
+        except (RecursionError, TypeError, ValueError, UnicodeError) as exc:
+            raise EngineRepositoryError(
+                "the restored build record failed its storage codec",
+                code="invalid_item_restore_record",
+                details={"cause_type": type(exc).__name__},
+            ) from exc
+        if (
+            after.revision != before.revision
+            and _engine_valid_record_revision(after.revision)
+            and after.revision == restored["updated_at"]
+        ):
+            return restored
+    raise EngineRepositoryError(
+        "the restored build record revision could not be advanced",
+        code="item_restore_revision_not_advanced",
+    )
+
+
 def _engine_open_lib_draft(metadata: Mapping) -> ItemDraft:
     """Project hostile ``.lib`` metadata into one safe catalogue draft.
 
@@ -4670,6 +4457,9 @@ def _engine_host_bindings() -> FilesystemHostBindings:
                 put_record=_engine_representation_put_record,
                 detach_record=_engine_representation_detach_record,
             ),
+            lifecycle=ItemLifecycleBindings(
+                advance_restored_record=_engine_advance_restored_record,
+            ),
         ),
         replica=ReplicaBindings(
             policies=policies,
@@ -4718,7 +4508,7 @@ def _open_engine_session(
             job_keep=_JOBS_KEEP,
         ),
         bindings=_engine_host_bindings(),
-        contribute_modules=_engine_module_contributions,
+        contribute_modules=first_party_module_contributions,
     )
 
 

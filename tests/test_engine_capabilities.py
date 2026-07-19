@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,9 +21,18 @@ from librarytool.engine.capabilities import (
     ModuleManifest,
     WorkbenchManifest,
 )
+from librarytool.engine.errors import ConflictError
+from librarytool.engine.item_commands import (
+    DeleteItemCommand as CatalogueDeleteItemCommand,
+)
+from librarytool.engine.item_lifecycle import (
+    DeleteItemCommand as LifecycleDeleteItemCommand,
+    RestoreItemCommand,
+)
 from librarytool.engine.runtime import (
     INTERCHANGE_SERVICE,
     ITEM_COMMAND_SERVICE,
+    ITEM_LIFECYCLE_SERVICE,
     ITEM_QUERY_SERVICE,
     JOB_SERVICE,
     LIB_OPEN_SERVICE,
@@ -341,8 +351,17 @@ def test_production_services_and_capabilities_are_one_sealed_graph(client):
     assert server._library_engine_instance is engine
     assert engine.capabilities.sealed is True
     assert engine.items is not None
+    assert engine.item_commands._allow_legacy_delete is False
+    assert {
+        "library.items.lifecycle.read",
+        "library.items.delete",
+        "library.items.restore",
+    } <= {
+        row["id"] for row in engine.discovery_document()["capabilities"]
+    }
     assert {policy.policy_id for policy in engine.items.policies} == {
         "catalogue-commands",
+        "item-lifecycle",
         "replica",
         "representation-commands",
         "text-layers",
@@ -364,6 +383,7 @@ def test_production_services_and_capabilities_are_one_sealed_graph(client):
         for command in policy.contribute(context).available_commands
     }
     assert commands == {
+        "item.delete",
         "item.metadata.edit",
         "replica.open",
         "representation.attach",
@@ -373,6 +393,10 @@ def test_production_services_and_capabilities_are_one_sealed_graph(client):
     for key, service in (
         (ITEM_QUERY_SERVICE, engine.items),
         (ITEM_COMMAND_SERVICE, engine.item_commands),
+        (
+            ITEM_LIFECYCLE_SERVICE,
+            engine.require_service(ITEM_LIFECYCLE_SERVICE),
+        ),
         (INTERCHANGE_SERVICE, engine.interchange),
         (LIB_OPEN_SERVICE, engine.require_service(LIB_OPEN_SERVICE)),
         (JOB_SERVICE, engine.jobs),
@@ -390,6 +414,124 @@ def test_production_services_and_capabilities_are_one_sealed_graph(client):
     ):
         assert service is not None
         assert engine.require_service(key) is service
+
+
+def test_production_lifecycle_restores_exact_raw_build_with_fresh_revision(
+    monkeypatch,
+    tmp_path,
+):
+    import server
+
+    root = tmp_path / "output"
+    builds_path = root / "whl_builds.json"
+    entries_dir = root / "entries"
+    root.mkdir(parents=True)
+    external = tmp_path / "private" / "source.pdf"
+    external.parent.mkdir()
+    external.write_bytes(b"%PDF-private")
+    source_stat = {
+        "size": 12,
+        "mtime_ns": 1,
+        "ctime_ns": 2,
+        "device": 3,
+        "inode": 4,
+    }
+    raw = {
+        "title": "The Exact Herbal",
+        "authors": "Ada Curator",
+        "rights": "public-domain",
+        "status": "draft",
+        "created_at": "2026-01-01T00:00:00.000000+00:00",
+        # A future token proves restoration advances the prior revision even
+        # when the wall clock cannot provide a later timestamp.
+        "updated_at": "2099-01-01T00:00:00.000000+00:00",
+        "pdf_file": str(external),
+        "pdf_sources": [],
+        "images": ["capture/cover.jpg"],
+        "extra": {"workspace_path": str(tmp_path / "private")},
+        "capture_id": "phone-1",
+        "relevance": {"score": 0.75},
+        "future.extension": {"nested": [1, True, None]},
+        "representation_manifest": {
+            "version": 1,
+            "sources": {
+                "primary": {
+                    "role": "primary",
+                    "media_type": "application/pdf",
+                    "label": "Private source",
+                    "acquisition": "reference",
+                    "content_sha256": "a" * 64,
+                    "size": 12,
+                    "source_stat": source_stat,
+                    "metadata": {"future": {"preserve": True}},
+                },
+            },
+            "detached": ["scan-two"],
+        },
+    }
+    server.lib.save_json(builds_path, {"book-one": raw})
+    entry = entries_dir / "book-one"
+    entry.mkdir(parents=True)
+    (entry / "owned.txt").write_bytes(b"managed bytes")
+    monkeypatch.setattr(server, "BUILDS_PATH", builds_path)
+    monkeypatch.setattr(server, "ENTRIES_DIR", entries_dir)
+
+    session = server._open_engine_session(root)
+    try:
+        engine = session.engine
+        lifecycle = engine.require_service(ITEM_LIFECYCLE_SERVICE)
+        module = next(
+            row
+            for row in engine.discovery_document()["modules"]
+            if row["id"] == "library.item-lifecycle.commands"
+        )
+        assert module["status"] == "available"
+        assert engine.item_commands._allow_legacy_delete is False
+
+        state = lifecycle.inspect("book-one")
+        assert state.item.revision == raw["updated_at"]
+        with pytest.raises(ConflictError) as legacy:
+            engine.item_commands.delete(CatalogueDeleteItemCommand(
+                item_id="book-one",
+                expected_revision=state.item.revision,
+                operation_id="legacy-delete-1",
+            ))
+        assert legacy.value.code == "item_lifecycle_command_required"
+
+        deleted = lifecycle.delete(LifecycleDeleteItemCommand(
+            item_id="book-one",
+            expected_item_revision=state.item.revision,
+            expected_managed_tree_revision=state.managed_tree.revision,
+            operation_id="lifecycle-delete-1",
+        ))
+        assert server.lib.load_json(builds_path, {}) == {}
+        assert not entry.exists()
+        assert external.read_bytes() == b"%PDF-private"
+
+        restored = lifecycle.restore(RestoreItemCommand(
+            tombstone_id=deleted.receipt.tombstone.tombstone_id,
+            expected_tombstone_revision=(
+                deleted.receipt.tombstone.revision
+            ),
+            operation_id="lifecycle-restore-1",
+        ))
+        restored_raw = server.lib.load_json(builds_path, {})["book-one"]
+        expected = deepcopy(raw)
+        expected["id"] = "book-one"
+        expected["updated_at"] = restored.receipt.restored_item_revision
+
+        assert restored_raw == expected
+        assert restored_raw["updated_at"] != raw["updated_at"]
+        assert restored_raw["updated_at"] == (
+            "2099-01-01T00:00:00.000001+00:00"
+        )
+        assert restored_raw["representation_manifest"] == (
+            raw["representation_manifest"]
+        )
+        assert (entry / "owned.txt").read_bytes() == b"managed bytes"
+        assert external.read_bytes() == b"%PDF-private"
+    finally:
+        session.close()
 
 
 def test_library_engine_exposes_the_same_framework_neutral_discovery():
