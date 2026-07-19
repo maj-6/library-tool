@@ -140,10 +140,14 @@ def test_cloud_cfg_still_requires_the_service_key(settings):
 def test_phone_sync_does_not_run_owner_pipelines(monkeypatch):
     public = {"url": "https://x.supabase.co", "key": "public-key",
               "access_token": "user-jwt"}
+    order = []
     monkeypatch.setattr(server, "_capture_cfg", lambda: public)
     monkeypatch.setattr(server, "_cloud_cfg", lambda: None)
+    monkeypatch.setattr(server, "_refresh_collection_aliases",
+                        lambda cfg, token: order.append(("collections", cfg, token)) or [])
     monkeypatch.setattr(server.sbase, "list_pending_captures",
-                        lambda cfg, limit=50: [] if cfg == public else 1 / 0)
+                        lambda cfg, limit=50: order.append(("captures", cfg)) or
+                        ([] if cfg == public else 1 / 0))
     monkeypatch.setattr(server.sbase, "push_books",
                         lambda *a, **k: pytest.fail("owner mirror must not run"))
     monkeypatch.setattr(server.store_sync, "sync_stores",
@@ -153,6 +157,10 @@ def test_phone_sync_does_not_run_owner_pipelines(monkeypatch):
     assert out["owner_sync"] is False
     assert out["imported"] == 0
     assert out["stores"] == {}
+    assert order == [
+        ("collections", public, "user-jwt"),
+        ("captures", public),
+    ]
 
 
 def test_auth_status_reports_cloud_without_any_settings(settings, client):

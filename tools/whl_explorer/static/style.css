@@ -3030,6 +3030,12 @@ form.orig-view .cad-input {
 .info-v a:hover { text-decoration: underline; }
 /* provenance under a record: where it came from, not the record itself */
 .info-row.info-sub .info-v, span.info-sub { color: var(--ink-mut); font-size: 10.5px; }
+.info-provenance-note {
+  color: var(--ink-mut);
+  font-size: 10.5px;
+  line-height: 1.35;
+  margin: 2px 0 4px;
+}
 .info-dot {
   display: inline-block; width: 7px; height: 7px; border-radius: 50%;
   margin-right: 5px; vertical-align: middle; background: var(--face-sh2);
@@ -5171,6 +5177,58 @@ body[data-theme] .drafting::-webkit-scrollbar {
   border-radius: var(--radius);
 }
 .cat-root-drop.drop-target { opacity: 1; box-shadow: inset 0 0 0 1px var(--cyan); }
+
+/* shared collections manager */
+#collections-window {
+  width: min(900px, 94vw);
+  max-height: 84vh;
+  overflow: hidden;
+}
+#collections-body {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  flex-direction: column;
+  padding: var(--dlg-pad-y) var(--dlg-pad-x) var(--dlg-pad-x);
+  gap: 7px;
+}
+#collections-add-form { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+#collections-new-name, #collections-new-from { flex: 1 1 180px; min-width: 110px; }
+#collections-list {
+  height: clamp(180px, 48vh, 380px);
+  min-height: 0;
+  overflow: auto;
+  border: var(--border-w, 1px) solid var(--canvas-line);
+}
+.collections-table { width: 100%; }
+.collections-table th:nth-child(1), .collections-table th:nth-child(2) { width: 19%; }
+.collections-table th:nth-child(3) { width: 52px; }
+.collections-table th:nth-child(4) { width: 24%; }
+.collections-table td { vertical-align: top; }
+.collections-table td > .cad-input { width: 100%; min-width: 90px; }
+.collection-books { text-align: right; font-variant-numeric: tabular-nums; }
+.collection-snapshots, .collection-id-note {
+  color: var(--ink-mut);
+  font-size: 10.5px;
+  white-space: normal;
+  word-break: break-word;
+}
+.collection-actions { white-space: normal; }
+.collection-actions > .cad-btn { margin: 0 3px 3px 0; }
+.collection-merge { display: flex; gap: 3px; align-items: center; margin-top: 2px; }
+.collection-merge select { min-width: 150px; max-width: 210px; }
+.collection-warning {
+  display: block;
+  color: var(--amber);
+  font-size: 9px;
+  letter-spacing: 0.4px;
+  margin-top: 2px;
+}
+.collection-snapshot-only { opacity: 0.8; }
+.collections-empty { padding: 12px; }
+
+/* These two catalogue columns are capture snapshots, never cell editors. */
+td.capture-snapshot:not(:empty) { color: var(--ink-mut); }
 
 /* --- Analyze tab --------------------------------------------------------------- */
 #an-split { display: flex; flex: 1; min-height: 0; }

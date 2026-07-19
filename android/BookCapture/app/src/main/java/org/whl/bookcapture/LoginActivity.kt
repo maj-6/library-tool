@@ -49,7 +49,12 @@ class LoginActivity : AppCompatActivity() {
 
     /** Lands on Home (the recent-scans list), not the camera. */
     private fun goToMain(signedIn: Boolean) {
-        if (signedIn) UploadWorker.enqueue(this)
+        if (signedIn) {
+            UploadWorker.enqueue(this)
+            // Local-mode collections keep their UUIDs and are claimed by this
+            // first sync; repeated sign-ins remain idempotent by that identity.
+            CollectionSyncWorker.enqueue(this)
+        }
         // reset the task to a single clean Home
         startActivity(Intent(this, HomeActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))

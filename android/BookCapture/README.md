@@ -42,10 +42,18 @@ screen up until it uploads; after that the cloud row is insert-only, so the
 field is locked rather than allowed to disagree with what the desktop
 already holds.
 
-Collections live on the phone (`filesDir/collections.json`). The
-collection's name and the book's From ride inside each capture's `meta`, so
-the desktop surfaces them in an entry's Extra section with no schema
-change — see `tests/test_phone_capture.py`.
+Collections always live on the phone (`filesDir/collections.json`), so adding,
+editing, deleting and scanning remain available while signed out or offline.
+When signed in, a background job reconciles them two-way with the shared cloud
+`collections` rows. Local edits and soft-delete tombstones sync on reconnect;
+the first sign-in pushes collections created in local mode without changing
+their UUIDs.
+
+Each capture sends `scan_collection_id` for durable identity alongside the
+frozen `scan_collection` name and `scan_from` snapshot. Renaming a shared
+collection therefore updates its current row without relabelling books already
+scanned into it. The `scan_` prefix also keeps these passthrough fields out of
+the desktop's fallback-OCR metadata test — see `tests/test_phone_capture.py`.
 
 ## Voice flow
 

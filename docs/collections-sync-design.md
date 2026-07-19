@@ -1,6 +1,36 @@
 # Collections on the desktop: two-way sync
 
-Status: **design, not implemented.** Written to be handed to another agent.
+Status: **implemented in this worktree on 2026-07-19.** Migration 009 is
+committed as source but still needs to be applied to, and checked against, the
+target Supabase project.
+
+## Implementation outcome
+
+All four suggested stages below are implemented together:
+
+- the phone sends `scan_collection_id` while preserving the frozen name and
+  origin snapshots;
+- migration 009 adds the shared collection rows, authenticated RLS/grants, and
+  a transactional merge RPC;
+- the Android store performs crash-safe, paginated two-way synchronization and
+  remains fully usable signed out;
+- the desktop displays read-only `Collection` and `From` snapshot columns,
+  filters by collection identity, and includes a collection manager with CRUD,
+  duplicate warnings, counts, and human-confirmed merges.
+
+The implementation keeps catalogue provenance derived from `entry.extra`; it
+does not widen the manual-entry schema. Desktop-created rows are pulled by an
+authenticated background worker, so no blocking spinner is added to the
+offline-first Collections screen. An archive state remains outside this
+change's scope.
+
+One refinement was required during adversarial review: an ordinary soft delete
+is still last-write-wins and can be superseded by a later edit, but a
+human-confirmed duplicate merge must be permanent. Migration 009 therefore
+adds `merged_into` and performs merges through `merge_collections(...)`, which
+locks both rows, validates their revisions, and atomically writes an
+authoritative loser-to-survivor marker. Both clients consume that marker and
+never treat an arbitrary deleted row as a merge.
 
 Book Capture 0.5.1-alpha.6 shipped phone-local collections (see
 `android/BookCapture/README.md` → "Collections and provenance"). This document
@@ -93,7 +123,8 @@ create table if not exists collections (
   from_place  text not null default '',
   created_by  uuid references auth.users(id),
   updated_at  timestamptz not null default now(),
-  deleted     boolean not null default false
+  deleted     boolean not null default false,
+  merged_into uuid references collections(id)
 );
 create index if not exists collections_updated_idx on collections (updated_at desc);
 ```
@@ -154,6 +185,9 @@ before inventing a second one). Concretely:
 - On sync, per id, the higher `updated_at` wins for the whole row.
 - `deleted = true` is a value like any other, so a delete propagates and a
   concurrent rename loses to a later delete.
+- `merged_into` is the deliberate exception: only the transactional merge RPC
+  may write it, and once present it authoritatively aliases the loser to the
+  survivor on every client.
 - Clock skew: the phone's clock is not trustworthy. Prefer the server's
   `now()` on write where possible and treat local stamps as a tiebreak only.
 
@@ -236,16 +270,12 @@ Each stage is shippable alone.
 4. **Two-way.** Desktop edits, conflict handling, the merge UI for duplicate
    names.
 
-## Open questions for the implementer
+## Resolved implementation questions
 
-- **First-class fields or derived from `extra`?** Columns can be rendered from
-  `extra` without touching `lib.MANUAL_ENTRY_FIELDS`. Promoting them is
-  cleaner to query and sort but widens the entry schema and touches the manual
-  entry editor. Stage 2 can start derived and promote later if sorting or
-  filtering proves awkward.
-- **Should a desktop-created collection be scannable before the phone syncs?**
-  Implies a pull on the phone's Collections tab, and a spinner in a flow that
-  is currently entirely offline. Probably yes, but it is the first place sync
-  becomes user-visible latency.
-- **Do collections need an archive state** distinct from delete, for a crate
-  that is fully catalogued but whose books should stay attributed?
+- **Field representation:** catalogue columns remain derived from `extra`,
+  preserving the existing manual-entry schema and immutable capture snapshot.
+- **Desktop-to-phone visibility:** authenticated background synchronization
+  pulls desktop-created collections without making local collection editing
+  wait on the network.
+- **Archive state:** not added. Soft delete and authoritative merge tombstones
+  cover this design; a separate archive lifecycle can be designed later.

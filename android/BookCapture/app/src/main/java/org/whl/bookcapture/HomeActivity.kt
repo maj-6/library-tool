@@ -85,6 +85,11 @@ class HomeActivity : AppCompatActivity() {
             WorkManager.getInstance(this)
                 .getWorkInfosForUniqueWorkLiveData(name)
                 .observe(this) { refreshHome() }
+        WorkManager.getInstance(this)
+            .getWorkInfosForUniqueWorkLiveData(CollectionSyncWorker.WORK_NAME)
+            .observe(this) {
+                if (showingCollections) refreshCollections() else refreshCollectionBar()
+            }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -103,6 +108,7 @@ class HomeActivity : AppCompatActivity() {
             UploadWorker.kick(this)
         }
         ProcessWorker.enqueue(this)
+        CollectionSyncWorker.enqueueCoalesced(this)
         showTab(showingCollections)
     }
 
