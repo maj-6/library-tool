@@ -5819,9 +5819,11 @@ def _trash_restore_pdf_pages(item: dict) -> tuple[dict, int]:
         held_i = cur_i = 0
         for n in range(1, int(rest.get("pages_before") or 0) + 1):
             if n in set(pages) and held_i < len(held.pages):
-                writer.add_page(held.pages[held_i]); held_i += 1
+                writer.add_page(held.pages[held_i])
+                held_i += 1
             elif cur_i < len(current.pages):
-                writer.add_page(current.pages[cur_i]); cur_i += 1
+                writer.add_page(current.pages[cur_i])
+                cur_i += 1
         tmp = pdf.with_suffix(".restore.tmp")
         with open(tmp, "wb") as fh:
             writer.write(fh)
@@ -5845,7 +5847,8 @@ def _trash_restore_pdf_pages(item: dict) -> tuple[dict, int]:
             src = _trash_payload_path(str(item.get("id") or ""), rel)
             live = _entry_dir(build_id) / rel
             if src is None:
-                skipped.append({"file": rel, "reason": "payload missing"}); continue
+                skipped.append({"file": rel, "reason": "payload missing"})
+                continue
             # `want` is [size, mtime] for a file the delete left in place, or
             # [] for one it removed outright (a deleted page's figure). The
             # empty list is a real signal, not a missing stamp: if something
@@ -5962,7 +5965,8 @@ def _trash_restore_translation(item: dict) -> tuple[dict, int]:
         for rel in (item.get("files") or []):
             src = _trash_payload_path(str(item.get("id") or ""), rel)
             if src is None:
-                skipped.append({"file": rel, "reason": "payload missing"}); continue
+                skipped.append({"file": rel, "reason": "payload missing"})
+                continue
             dest = dest_dir / Path(rel).name
             if dest.exists():
                 skipped.append({"file": rel, "reason": "a newer translation is there"})
