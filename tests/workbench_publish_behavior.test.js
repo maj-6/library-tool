@@ -157,11 +157,18 @@ test("publish guard text belongs only to the selected book", () => {
 });
 
 function patchHarness(fetchImpl, dirty = true) {
-  const calls = { upload: 0, list: 0, workbench: 0 };
+  const calls = { upload: 0, list: 0, workbench: 0, fetch: 0 };
   const state = { buildSel: "B", builds: { A: { id: "A" }, B: { id: "B" } } };
   const context = vm.createContext({
     state,
-    fetch: fetchImpl,
+    fetch: async (...args) => {
+      calls.fetch += 1;
+      return fetchImpl(...args);
+    },
+    BUILD_COMPATIBILITY_MUTATION_FIELDS: new Set([
+      "status", "ocr_active", "ocr_verified", "ocr_quality",
+      "title_pages", "thumbnail_source",
+    ]),
     buildIsDirty: () => dirty,
     renderUpload: () => { calls.upload += 1; },
     renderBuildsList: () => { calls.list += 1; },
@@ -177,17 +184,23 @@ this.api = { patchBuildRaw };`, context);
 
 test("network rejection returns false and a late A patch cannot repaint dirty B", async () => {
   const offline = patchHarness(async () => { throw new Error("offline"); });
-  assert.equal(await offline.api.patchBuildRaw("A", { title: "A" }), false);
+  assert.equal(await offline.api.patchBuildRaw("A", { ocr_active: "a.txt" }), false);
 
   const late = patchHarness(async () => ({
     ok: true,
     status: 200,
-    json: async () => ({ ok: true, build: { id: "A", title: "saved" } }),
+    json: async () => ({ ok: true, build: { id: "A", ocr_active: "saved.txt" } }),
   }));
-  assert.equal(await late.api.patchBuildRaw("A", { title: "saved" }), true);
+  assert.equal(await late.api.patchBuildRaw(
+    "A", { ocr_active: "saved.txt" }), true);
   assert.equal(late.calls.upload, 0);
   assert.equal(late.calls.list, 1);
   assert.equal(late.calls.workbench, 1);
+
+  assert.equal(await late.api.patchBuildRaw(
+    "A", { category_ids: ["botany"] }), false);
+  assert.equal(late.calls.fetch, 1,
+    "portable fields are refused before reaching the legacy transport");
 });
 
 test("an A save resolving after selecting B leaves B dirty and untouched", async () => {

@@ -1305,9 +1305,45 @@ test("the initial build load crosses the semantic item client boundary", () => {
   const loader = app.slice(start, end);
   assert.match(loader, /engineClient\.items\.list/);
   assert.match(loader, /includeBuildCompatibility:\s*true/);
-  // Existing mutation routes remain transitional; only the collection GET
-  // belongs to this slice.
-  assert.doesNotMatch(loader, /fetch\s*\(\s*["']\/api\/builds["']/);
+  assert.doesNotMatch(loader, /\bfetch\s*\(/);
+  assert.doesNotMatch(loader, /engineClient\.items\.update/);
+});
+
+test("the initial build load derives legacy volume grouping without writing", async () => {
+  const app = fs.readFileSync(appPath, "utf8");
+  const start = app.indexOf("async function loadBuilds()");
+  const end = app.indexOf("function allBuildsSorted", start);
+  assert.ok(start >= 0 && end > start);
+  const calls = { list: 0, update: 0, fetch: 0 };
+  const state = { builds: {} };
+  const context = vm.createContext({
+    state,
+    engineClient: { items: {
+      list: async () => {
+        calls.list += 1;
+        return { items: [{ id: "book", compatibility: { build: {
+          id: "book", title: "Herbal", volume: "II", group_id: "",
+          updated_at: "item-r1",
+        } } }] };
+      },
+      update: async () => { calls.update += 1; },
+    } },
+    engineBuildProjection: (item) => ({
+      ...item.compatibility.build,
+      _record_revision: item.compatibility.build.updated_at,
+    }),
+    volNum: (build) => build.volume,
+    buildGroupIdFor: (build) => `group:${build.volume}`,
+    fetch: async () => { calls.fetch += 1; },
+  });
+  vm.runInContext(`${app.slice(start, end)}
+this.loadBuilds = loadBuilds;`, context);
+
+  await context.loadBuilds();
+  assert.deepEqual(calls, { list: 1, update: 0, fetch: 0 });
+  assert.equal(state.builds.book.group_id, "group:II");
+  assert.equal(state.builds.book._record_revision, "item-r1",
+    "a display-only derivation cannot invent a committed item revision");
 });
 
 test("build projections retain item command eligibility", () => {
@@ -2215,7 +2251,8 @@ function metadataUiHarness(options = {}) {
   }
   const revisions = [...(options.revisions || ["item-r2"] )];
   const calls = { updates: [], legacy: [], refreshes: 0, operations: [],
-    statuses: [], errors: [], list: 0, workbench: 0, upload: 0 };
+    statuses: [], errors: [], list: 0, workbench: 0, upload: 0,
+    remarks: 0, home: 0 };
   const generations = new Map();
   let updateNumber = 0;
   let context;
@@ -2310,6 +2347,8 @@ function metadataUiHarness(options = {}) {
     renderBuildsList: () => { calls.list += 1; },
     renderWorkbench: () => { calls.workbench += 1; },
     renderUpload: () => { calls.upload += 1; },
+    renderRemarks: () => { calls.remarks += 1; },
+    renderHome: () => { calls.home += 1; },
     status: (message) => calls.statuses.push(message),
     statusErr: (message) => calls.errors.push(message),
   });
@@ -2318,7 +2357,7 @@ ${app.slice(metadataStart, metadataEnd)}
 ${app.slice(saveStart, saveEnd)}
 ${app.slice(verifyStart, verifyEnd)}
 this.api = { saveBuildFields, setVerified, runBuildMetadataUpdate,
-  patchBuildVerificationCompatibility,
+  updateBuildPortableMetadata, patchBuild, patchBuildVerificationCompatibility,
   pendingCount: () => pendingBuildMetadataUpdates.size };`, context);
   return { api: context.api, context, calls, elements, state, classNames };
 }
@@ -2371,6 +2410,120 @@ test("metadata Save uses only the durable portable item patch", async () => {
     _available_commands: h.state.builds.book._available_commands,
   }), managedBefore);
   assert.deepEqual(copyJson(h.state.builds.book.future_extension), { shelf: 3 });
+});
+
+test("portable Workbench metadata has no raw build PATCH call site", () => {
+  const app = fs.readFileSync(appPath, "utf8");
+  const rawCallLines = app.split(/\r?\n/).filter((line) =>
+    line.includes("patchBuildRaw(") &&
+    !line.includes("function patchBuildRaw("));
+  for (const line of rawCallLines) {
+    assert.doesNotMatch(line, /\b(attention|category_ids|bundle|group_id)\b/);
+  }
+
+  const compatibilityStart = app.indexOf(
+    "const BUILD_COMPATIBILITY_MUTATION_FIELDS");
+  const compatibilityEnd = app.indexOf(
+    "const pendingBuildMetadataUpdates", compatibilityStart);
+  assert.ok(compatibilityStart >= 0 && compatibilityEnd > compatibilityStart);
+  assert.doesNotMatch(app.slice(compatibilityStart, compatibilityEnd),
+    /\b(attention|category_ids|bundle|group_id)\b/);
+
+  const portableCallers = [
+    "applyRemarkValue", "attnTargetAtHover", "clearMark", "patchBuild",
+  ];
+  for (const name of portableCallers) {
+    const start = [
+      app.indexOf(`async function ${name}(`),
+      app.indexOf(`function ${name}(`),
+    ].find((index) => index >= 0);
+    const end = /^}\r?$/m.exec(app.slice(start));
+    assert.ok(start >= 0 && end, `${name} is present`);
+    assert.match(app.slice(start, start + end.index + end[0].length),
+      /updateBuildPortableMetadata/);
+  }
+  const analyzePicker = app.slice(
+    app.indexOf('makeCatPicker("an-cat-picker"'),
+    app.indexOf('el("an-list").addEventListener',
+      app.indexOf('makeCatPicker("an-cat-picker"')));
+  assert.match(analyzePicker, /updateBuildPortableMetadata/);
+});
+
+test("attention, categories, and publish bundle use receipt-chained item updates", async () => {
+  const oldBundle = {
+    about: false, annotations: false, pages_text: false, translations: [],
+  };
+  const newBundle = {
+    about: true, annotations: true, pages_text: false, translations: ["fr"],
+  };
+  const h = metadataUiHarness({
+    build: { attention: "Old note", bundle: oldBundle },
+    revisions: ["item-r2", "item-r3", "item-r4", "item-r5"],
+  });
+
+  assert.ok(await h.api.updateBuildPortableMetadata(
+    "book", { attention: "Check title page" }));
+  assert.equal(await h.api.patchBuild(
+    "book", { category_ids: ["history"] }, "assign category", "workbench"), true);
+  assert.equal(await h.api.patchBuild(
+    "book", { bundle: newBundle }, "edit publish bundle", "workbench"), true);
+
+  assert.equal(h.calls.legacy.length, 0);
+  assert.deepEqual(h.calls.updates.map((call) => call.recordRevision),
+    ["item-r1", "item-r2", "item-r3"]);
+  assert.equal(h.calls.updates[0].patch.metadata_set.attention,
+    "Check title page");
+  assert.deepEqual(copyJson(h.calls.updates[1].patch.metadata_set.category_ids),
+    ["history"]);
+  assert.deepEqual(copyJson(h.calls.updates[2].patch.metadata_set.bundle),
+    newBundle);
+  assert.equal(h.calls.operations.length, 2);
+  assert.equal(h.calls.remarks, 1);
+  assert.equal(h.calls.home, 1);
+
+  await h.calls.operations[1].undoFn();
+  assert.equal(h.calls.updates[3].recordRevision, "item-r4");
+  assert.deepEqual(copyJson(h.calls.updates[3].patch.metadata_set.bundle),
+    oldBundle);
+});
+
+test("portable one-click metadata retains retry identity and rejects stale undo", async () => {
+  let h;
+  h = metadataUiHarness({
+    revisions: ["item-r2", "item-r3"],
+    update: async (args, number, commit) => {
+      if (number <= 2) {
+        const error = new Error("response lost");
+        error.code = "network-error";
+        error.status = 0;
+        throw error;
+      }
+      if (number === 5) {
+        const error = new Error("changed elsewhere");
+        error.code = "item_revision_conflict";
+        error.status = 409;
+        throw error;
+      }
+      return commit(args);
+    },
+  });
+
+  assert.equal(await h.api.updateBuildPortableMetadata(
+    "book", { attention: "Check binding" }), null);
+  assert.equal(h.api.pendingCount(), 1);
+  assert.ok(await h.api.updateBuildPortableMetadata(
+    "book", { attention: "Check binding" }));
+  assert.equal(new Set(h.calls.updates.slice(0, 3).map(
+    (call) => call.idempotencyKey)).size, 1);
+  assert.equal(h.api.pendingCount(), 0);
+
+  assert.equal(await h.api.patchBuild(
+    "book", { category_ids: ["history"] }, "assign category", "workbench"), true);
+  const operation = h.calls.operations[0];
+  await assert.rejects(operation.undoFn, /Item changed elsewhere/);
+  assert.equal(h.calls.updates[4].recordRevision, "item-r3");
+  assert.equal(h.calls.updates.length, 5,
+    "a stale inverse is not rebased or resent");
 });
 
 test("metadata response loss replays one exact command", async () => {

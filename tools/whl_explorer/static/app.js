@@ -6713,7 +6713,7 @@ async function applyRemarkValue(item, value) {
       ok = setAttnKey(item.ref, value, { label: item.label, category: item.category });
       refreshRemarkTarget(item);
     } else if (item.kind === "build") {
-      ok = await patchBuildRaw(item.ref, { attention: value });
+      ok = await updateBuildPortableMetadata(item.ref, { attention: value });
     } else if (item.kind === "row") {
       // rowsById is render-owned and can be stale while Home is active; rebuild
       // its lookup before dispatching to the existing persistence path.
@@ -7210,9 +7210,11 @@ function attnTargetAtHover() {
     return {
       node, kind: "build", ref: String(bid), label: b.title || String(bid),
       current: String(b.attention || ""),
-      apply: (v) => patchBuildRaw(bid, { attention: v }).then((ok) => {
+      apply: (v) => updateBuildPortableMetadata(
+        bid, { attention: v }).then((ok) => {
         if (rerender) rerender();
-        status(v ? "Marked: needs attention" : "Attention mark cleared");
+        if (ok)
+          status(v ? "Marked: needs attention" : "Attention mark cleared");
         return ok;
       }),
     };
@@ -7658,7 +7660,8 @@ async function clearMark(kind, ref) {
     return;
   }
   if (kind === "build") {
-    if ((state.builds || {})[ref]) await patchBuildRaw(ref, { attention: "" });
+    if ((state.builds || {})[ref])
+      await updateBuildPortableMetadata(ref, { attention: "" });
     return;
   }
   if (kind !== "row") return;
@@ -14176,7 +14179,11 @@ function initAnalyze() {
   el("an-integrated-host").appendChild(el("an-main"));
   makeCatPicker("an-cat-picker", async (ids) => {
     const b = anSelected();
-    if (b && await patchBuildRaw(b.id, { category_ids: ids }, true)) {
+    const originTab = activeHistoryTab();
+    if (b && await updateBuildPortableMetadata(
+      b.id, { category_ids: ids }, {
+        label: "edit categories", originTab, quiet: true,
+      })) {
       status("CATEGORIES UPDATED");
     }
   });
@@ -16560,24 +16567,15 @@ async function loadBuilds() {
       const build = engineBuildProjection(item);
       if (build) state.builds[item.id] = build;
     }
-    // One-time migration for builds that already had a volume before explicit
-    // group metadata was introduced. Persist the association, then render from
-    // metadata on every subsequent load.
+    // Compatibility projection for builds created before explicit group
+    // metadata existed. Reads stay side-effect free: a durable back-end data
+    // migration must persist these inferred associations. Until then an
+    // explicit user Save may persist the displayed value through item.update.
     for (const b of Object.values(state.builds)) {
       if (!volNum(b) || String(b.group_id || "").trim()) continue;
       const groupId = buildGroupIdFor(b);
       if (!groupId) continue;
       b.group_id = groupId;
-      try {
-        const patch = await fetch(`/api/builds/${encodeURIComponent(b.id)}`, {
-          method: "PATCH", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ group_id: groupId }),
-        });
-        const data = await patch.json().catch(() => ({}));
-        if (patch.ok && data.ok) {
-          state.builds[b.id] = mergeBuildCompatibility(data.build, b);
-        }
-      } catch (e) { /* local display still uses the migrated association */ }
     }
   } catch (e) { state.builds = {}; }
 }
@@ -17709,6 +17707,19 @@ const ITEM_EDIT_METADATA_FIELDS = Object.freeze([
   "volume", "group_id", "language", "pages", "rights", "pdf_source",
   "source_url", "notes", "category_ids", "description",
 ]);
+// A few established compatibility extensions are still edited outside the
+// main Record form. They nevertheless belong to the durable item command
+// path while their eventual review/release modules are introduced.
+const ITEM_PORTABLE_METADATA_FIELDS = new Set([
+  ...ITEM_EDIT_METADATA_FIELDS, "attention", "bundle",
+]);
+// Raw build PATCH is a deliberately narrow compatibility seam. These fields
+// must move to text/canvas/workflow commands; accepting catalogue metadata
+// here would silently reopen the unconditional legacy write path.
+const BUILD_COMPATIBILITY_MUTATION_FIELDS = new Set([
+  "status", "ocr_active", "ocr_verified", "ocr_quality",
+  "title_pages", "thumbnail_source",
+]);
 const pendingBuildMetadataUpdates = new Map();
 let buildMetadataLastFailure = null;
 
@@ -17950,6 +17961,69 @@ function pushBuildMetadataOp(label, itemId, initialReceipt,
     undefined, originTab);
 }
 
+function portableBuildMetadataPatches(build, fields) {
+  if (!build || !fields || typeof fields !== "object" || Array.isArray(fields))
+    return null;
+  const keys = Object.keys(fields);
+  if (keys.some((key) => key !== "title" &&
+      !ITEM_PORTABLE_METADATA_FIELDS.has(key))) return null;
+
+  const metadataKeys = keys.filter((key) => key !== "title");
+  const beforePatch = buildMetadataPatchFromBuild(build, metadataKeys);
+  const after = { ...build };
+  for (const key of keys) {
+    if (fields[key] === undefined) delete after[key];
+    else after[key] = itemMetadataClone(fields[key]);
+  }
+  const afterPatch = buildMetadataPatchFromBuild(after, metadataKeys);
+  if (!String(afterPatch.title || "").trim()) return null;
+  return { beforePatch, afterPatch };
+}
+
+function renderPortableBuildMetadata(itemId, fields, quiet) {
+  if (!quiet) {
+    if (buildIsDirty()) {
+      renderBuildsList();
+      renderWorkbench();
+    } else renderUpload();
+  }
+  if (Object.prototype.hasOwnProperty.call(fields, "attention")) {
+    renderRemarks();
+    renderHome();
+  }
+}
+
+async function updateBuildPortableMetadata(itemId, fields, options = {}) {
+  const build = state.builds[itemId];
+  const patches = portableBuildMetadataPatches(build, fields);
+  const recordRevision = String((build && build._record_revision) || "");
+  if (!patches || !recordRevision) return null;
+  if (buildMetadataPatchesEqual(patches.beforePatch, patches.afterPatch)) {
+    return { ok: true, skipped: true, receipt: null,
+      adopted: true, projectionCurrent: true };
+  }
+
+  const outcome = await runBuildMetadataUpdate(
+    itemId, patches.afterPatch, recordRevision);
+  if (!outcome) {
+    // A known conflict is never rebased or resent. Refreshing only makes the
+    // competing value visible and lets a later deliberate action use its new
+    // revision. Ambiguous writes keep their exact pending command untouched.
+    if (buildPatchConflict) {
+      try { await refreshBuildEngineRecord(itemId); } catch (ignored) {}
+    }
+    return null;
+  }
+
+  if (options.label && outcome.receipt) {
+    pushBuildMetadataOp(options.label, itemId, outcome.receipt,
+      patches.beforePatch, patches.afterPatch,
+      options.originTab || activeHistoryTab());
+  }
+  renderPortableBuildMetadata(itemId, fields, !!options.quiet);
+  return { ok: true, skipped: false, ...outcome };
+}
+
 function verificationCompatibilityMatches(build, desired) {
   if (!build) return false;
   return Object.entries(desired).every(([key, value]) =>
@@ -18006,7 +18080,19 @@ async function patchBuildVerificationCompatibility(
   return { ok: false, skipped: false, recovered: false };
 }
 
+async function patchBuild(id, fields, label, originTab = activeHistoryTab()) {
+  const b = state.builds[id];
+  if (!b) return false;
+  return !!(await updateBuildPortableMetadata(id, fields, {
+    label: label || `edit build ${b.title || id}`,
+    originTab,
+  }));
+}
+
 async function patchBuildRaw(id, fields, quiet) {
+  if (!fields || typeof fields !== "object" || Array.isArray(fields) ||
+      !Object.keys(fields).length || Object.keys(fields).some(
+        (key) => !BUILD_COMPATIBILITY_MUTATION_FIELDS.has(key))) return false;
   buildPatchConflict = false;
   let res;
   try {
@@ -18038,10 +18124,6 @@ async function patchBuildRaw(id, fields, quiet) {
         renderUpload();
       }
     }
-    if (Object.prototype.hasOwnProperty.call(fields || {}, "attention")) {
-      renderRemarks();
-      renderHome();
-    }
     return true;
   }
   if (res.status === 409 && data.build) {
@@ -18060,23 +18142,6 @@ async function patchBuildRaw(id, fields, quiet) {
     } else {
       renderUpload();
     }
-    if (Object.prototype.hasOwnProperty.call(fields || {}, "attention"))
-      renderRemarks();
-  }
-  return false;
-}
-
-async function patchBuild(id, fields, label, originTab = activeHistoryTab()) {
-  const b = state.builds[id];
-  if (!b) return false;
-  const before = {};
-  for (const f of Object.keys(fields)) before[f] = b[f] || "";
-  if (await patchBuildRaw(id, fields)) {
-    pushOp(label || `edit build ${b.title || id}`,
-      () => patchBuildRaw(id, before),
-      () => patchBuildRaw(id, fields),
-      undefined, originTab);
-    return true;
   }
   return false;
 }
@@ -23770,10 +23835,35 @@ function initOcrTab() {
 // one surface now — but History entries from baked smart checks persist in the
 // action log, so their grouped revert must keep working.
 
+async function scRevertLegacyBuildFields(it) {
+  const before = it && it.before;
+  if (!before || typeof before !== "object" || Array.isArray(before))
+    return false;
+  const portable = {};
+  const compatibility = {};
+  for (const [key, value] of Object.entries(before)) {
+    if (key === "title" || ITEM_PORTABLE_METADATA_FIELDS.has(key))
+      portable[key] = value;
+    else if (BUILD_COMPATIBILITY_MUTATION_FIELDS.has(key))
+      compatibility[key] = value;
+    else return false;
+  }
+  // Old descriptors carry no shared transaction revision. Refuse a mixed
+  // cross-domain replay rather than commit one half and fail the other.
+  if (Object.keys(portable).length && Object.keys(compatibility).length)
+    return false;
+  if (Object.keys(portable).length) {
+    return !!(await updateBuildPortableMetadata(it.id, portable,
+      { quiet: true }));
+  }
+  return Object.keys(compatibility).length
+    ? !!(await patchBuildRaw(it.id, compatibility, true)) : false;
+}
+
 async function scRevertItem(it) {
   switch (it.kind) {
     case "whl": return !!(await whlApplySnaps(it.idx, it.beforeSnaps));
-    case "build-fields": return !!(await patchBuildRaw(it.id, it.before));
+    case "build-fields": return scRevertLegacyBuildFields(it);
     case "manual-fields": return !!(await patchManualFields(it.id, it.before));
     case "checked": restoreChecked(it.key, it.before); return true;
     default: return false;

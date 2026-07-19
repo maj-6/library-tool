@@ -143,20 +143,28 @@ test("an async Workbench mutation stays in its initiating tab after a tab switch
   h.context.state = {
     builds: { book1: { id: "book1", title: "The Herbal", status: "draft" } },
   };
-  h.context.patchBuildRaw = () => patchResponse;
+  const calls = [];
+  h.context.updateBuildPortableMetadata = async (id, fields, options) => {
+    calls.push({ id, fields, options });
+    const outcome = await patchResponse;
+    h.api.pushOp(options.label, async () => {}, async () => {}, undefined,
+      options.originTab);
+    return outcome;
+  };
   vm.runInContext(`${declaration("patchBuild")}
 this.patchBuild = patchBuild;`, h.context);
 
   h.setActive("workbench");
   const pending = h.context.patchBuild(
-    "book1", { status: "ready" }, "verify build");
+    "book1", { category_ids: ["botany"] }, "assign category");
   h.setActive("home");
-  finishPatch(true);
+  finishPatch({ ok: true });
   assert.equal(await pending, true);
 
+  assert.equal(calls[0].options.originTab, "workbench");
   assert.deepEqual(
     Array.from(h.api.historyForTab("workbench").stack, (op) => op.label),
-    ["verify build"],
+    ["assign category"],
   );
   assert.deepEqual(
     Array.from(h.api.historyForTab("home").stack, (op) => op.label),
