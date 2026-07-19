@@ -74,7 +74,11 @@ object Entries {
         val cloudStatus: String,        // "", "pending", "imported", "void"
         val processing: ProcessingState,
         val processingRecorded: Boolean,
+        val provenance: CaptureProvenance? = null,  // null for pre-collections captures
     ) {
+        val collectionName: String get() = provenance?.collectionName ?: ""
+        val from: String get() = provenance?.from ?: ""
+
         val title: String get() = meta?.optString("title")?.ifEmpty { null } ?: ""
         val author: String get() = meta?.optString("author") ?: ""
         val year: String get() = meta?.optString("year") ?: ""
@@ -290,6 +294,9 @@ object Entries {
             cloudStatus = manifest?.optString("cloud_status") ?: "",
             processing = processing,
             processingRecorded = recorded,
+            // The sidecar, not the manifest: it exists from the first photo, so
+            // an entry still being captured into already reports its collection.
+            provenance = readProvenance(dir),
         )
     }
 

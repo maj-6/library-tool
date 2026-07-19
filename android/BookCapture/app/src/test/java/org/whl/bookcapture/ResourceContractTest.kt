@@ -91,7 +91,12 @@ class ResourceContractTest {
     fun chromeTextActionsUseSemanticMaterialButtons() {
         val expected = mapOf(
             "src/main/res/layout/activity_home.xml" to
-                listOf("btnSelect", "btnSettings", "deleteSelected", "cancelSelection"),
+                listOf(
+                    "btnSelect", "btnSettings", "deleteSelected", "cancelSelection",
+                    "tabScans", "tabCollections",
+                ),
+            "src/main/res/layout/item_collection.xml" to
+                listOf("editCollection", "deleteCollection"),
             "src/main/res/layout/activity_main.xml" to
                 listOf("queueChip", "btnSettings"),
         )
@@ -106,6 +111,40 @@ class ResourceContractTest {
                 assertEquals("@style/WhlToolbarAction", action.getAttribute("style"))
             }
         }
+    }
+
+    /**
+     * A book scan must never begin without a collection behind it. There are two
+     * ways in — the Home button and the spoken word "start" — and gating only
+     * the first would leave provenance optional for anyone already standing on
+     * the camera screen.
+     */
+    @Test
+    fun everyRouteIntoCaptureRequiresACollection() {
+        val home = xml("src/main/res/layout/activity_home.xml")
+        assertNotNull(elementById(home, "collectionsList"))
+        assertNotNull(elementById(home, "collectionBar"))
+        assertNotNull(elementById(home, "newCollection"))
+
+        val homeSource = File("src/main/java/org/whl/bookcapture/HomeActivity.kt").readText()
+        val gate = homeSource.indexOf("if (!resuming && Collections.current(this) == null)")
+        val launch = homeSource.indexOf("Intent(this, MainActivity::class.java)")
+        assertTrue("Home must check for a collection", gate >= 0)
+        assertTrue("the check must precede the camera launch", gate < launch)
+        // ...but an already-open capture keeps its way back to the camera, or a
+        // half-photographed book could be neither sealed nor discarded.
+        val resuming = homeSource.indexOf("val resuming = Prefs.currentEntryId(this) != null")
+        assertTrue("the gate must exempt a capture already in progress", resuming in 0 until gate)
+
+        val capture = File("src/main/java/org/whl/bookcapture/MainActivity.kt").readText()
+        assertTrue(capture.contains("val collection = Collections.current(this)"))
+        assertTrue(capture.contains("session.start(collection)"))
+
+        // start() takes the collection rather than reading it back from Prefs,
+        // so the requirement is enforced by the type, not by remembering to ask.
+        val session = File("src/main/java/org/whl/bookcapture/CaptureSession.kt").readText()
+        assertTrue(session.contains("fun start(collection: BookCollection): String"))
+        assertFalse(session.contains("fun start(): String"))
     }
 
     @Test

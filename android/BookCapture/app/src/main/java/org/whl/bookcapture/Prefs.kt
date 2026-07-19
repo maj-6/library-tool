@@ -170,6 +170,14 @@ object Prefs {
     fun currentEntryId(ctx: Context): String? = str(ctx, "current_entry").ifEmpty { null }
     fun setCurrentEntryId(ctx: Context, id: String?) = put(ctx, "current_entry" to id)
 
+    /** The collection new books are scanned into. Only a pointer — the list
+     *  itself lives in [Collections], and a capture freezes its own copy of the
+     *  name and "from" at start(), so changing the selection later never
+     *  rewrites provenance on books already captured. */
+    fun currentCollectionId(ctx: Context): String? =
+        str(ctx, "current_collection").ifEmpty { null }
+    fun setCurrentCollectionId(ctx: Context, id: String?) = put(ctx, "current_collection" to id)
+
     /** A Done/Cancel accepted while CameraX owns a file must survive an
      * Activity replacement. Commit synchronously because this is a tiny state
      * transition whose durability is more important than avoiding a disk

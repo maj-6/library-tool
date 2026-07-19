@@ -722,10 +722,19 @@ class MainActivity : AppCompatActivity() {
         }
         when (word) {
             "start" -> {
-                if (session.active) cues.error("entry already open")
-                else {
-                    session.start()
-                    cues.started()
+                // Gated here rather than only on the Home button so the voice
+                // word cannot open a book with no collection behind it.
+                val collection = Collections.current(this)
+                when {
+                    session.active -> cues.error("entry already open")
+                    collection == null -> {
+                        cues.error("choose a collection first")
+                        setStatus(getString(R.string.collections_choose_first))
+                    }
+                    else -> {
+                        session.start(collection)
+                        cues.started()
+                    }
                 }
             }
             "photo" -> {

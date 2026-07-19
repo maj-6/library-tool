@@ -36,13 +36,33 @@ class HomeActivity : AppCompatActivity() {
     private var thumbJob: Job? = null
     private var selectionMode = false
     private val selectedIds = linkedSetOf<String>()
+    private var showingCollections = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityHomeBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        showingCollections = savedInstanceState?.getBoolean(STATE_TAB_COLLECTIONS) ?: false
 
+        binding.tabScans.setOnClickListener { showTab(collections = false) }
+        binding.tabCollections.setOnClickListener { showTab(collections = true) }
+        binding.collectionBar.setOnClickListener { showTab(collections = true) }
+        binding.newCollection.setOnClickListener { editCollection(null) }
         binding.newScan.setOnClickListener {
+            // A book has to belong to a batch, so the origin is never guessed
+            // later. With nothing chosen, send the user to pick rather than
+            // starting a capture that would have no provenance.
+            //
+            // An already-open capture is exempt: it chose its collection when it
+            // started, and this screen is the app's only route back to the
+            // camera — gating it would strand a half-photographed book with no
+            // way to seal or discard it.
+            val resuming = Prefs.currentEntryId(this) != null
+            if (!resuming && Collections.current(this) == null) {
+                Toast.makeText(this, R.string.collections_choose_first, Toast.LENGTH_LONG).show()
+                showTab(collections = true)
+                return@setOnClickListener
+            }
             startActivity(Intent(this, MainActivity::class.java))
         }
         binding.btnSettings.setOnClickListener {
@@ -69,6 +89,11 @@ class HomeActivity : AppCompatActivity() {
                 .observe(this) { refreshHome() }
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(STATE_TAB_COLLECTIONS, showingCollections)
+    }
+
     override fun onResume() {
         super.onResume()
         val signedIn = Auth.signedIn(this)
@@ -80,7 +105,145 @@ class HomeActivity : AppCompatActivity() {
             UploadWorker.kick(this)
         }
         ProcessWorker.enqueue(this)
-        refreshHome()
+        showTab(showingCollections)
+    }
+
+    // --- tabs ----------------------------------------------------------------
+
+    private fun showTab(collections: Boolean) {
+        showingCollections = collections
+        // Selecting scans to delete is a Scans-tab activity; leaving it behind
+        // on the Collections tab would strand the selection bar over a list it
+        // cannot act on.
+        if (collections && selectionMode) leaveSelectionMode()
+        binding.homeList.visibility = if (collections) View.GONE else View.VISIBLE
+        binding.collectionsList.visibility = if (collections) View.VISIBLE else View.GONE
+        binding.newScan.visibility = if (collections) View.GONE else View.VISIBLE
+        binding.newCollection.visibility = if (collections) View.VISIBLE else View.GONE
+        binding.collectionBar.visibility = if (collections) View.GONE else View.VISIBLE
+        binding.btnSelect.visibility =
+            if (collections || selectionMode) View.GONE else View.VISIBLE
+        emphasizeTab(binding.tabScans, !collections)
+        emphasizeTab(binding.tabCollections, collections)
+        if (collections) refreshCollections() else refreshHome()
+    }
+
+    private fun emphasizeTab(button: com.google.android.material.button.MaterialButton, on: Boolean) {
+        button.alpha = if (on) 1f else .5f
+        button.setTypeface(null, if (on) Typeface.BOLD else Typeface.NORMAL)
+    }
+
+    // --- collections ---------------------------------------------------------
+
+    private fun refreshCollectionBar() {
+        val current = Collections.current(this)
+        binding.collectionBar.text = when {
+            current == null -> getString(R.string.collections_none_selected)
+            current.from.isEmpty() -> getString(R.string.collections_current, current.name)
+            else -> getString(R.string.collections_current_from, current.name, current.from)
+        }
+        binding.collectionBar.setTextColor(
+            getColor(if (current == null) R.color.whl_amber else R.color.whl_ink_dim))
+    }
+
+    private fun refreshCollections() {
+        val list = binding.collectionsList
+        list.removeAllViews()
+        val collections = Collections.all(this)
+        val current = Collections.current(this)
+        refreshCollectionBar()
+        if (collections.isEmpty()) {
+            list.addView(emptyNotice(getString(R.string.collections_empty)))
+            return
+        }
+        val counts = Entries.recent(this)
+            .mapNotNull { it.provenance?.collectionId }
+            .groupingBy { it }.eachCount()
+        val inflater = LayoutInflater.from(this)
+        for (c in collections) {
+            val row = inflater.inflate(R.layout.item_collection, list, false)
+            row.findViewById<TextView>(R.id.name).text = c.name
+            val isCurrent = c.id == current?.id
+            row.findViewById<TextView>(R.id.sub).text = listOf(
+                if (c.from.isEmpty()) getString(R.string.collections_row_no_from)
+                else getString(R.string.collections_row_from, c.from),
+                resources.getQuantityString(
+                    R.plurals.collections_row_books, counts[c.id] ?: 0, counts[c.id] ?: 0),
+                if (isCurrent) getString(R.string.collections_row_current) else "",
+            ).filter { it.isNotEmpty() }.joinToString(" · ")
+            row.findViewById<View>(R.id.currentMarker).setBackgroundColor(
+                getColor(if (isCurrent) R.color.whl_cyan else R.color.whl_face_sh2))
+            row.findViewById<View>(R.id.editCollection).setOnClickListener { editCollection(c) }
+            row.findViewById<View>(R.id.deleteCollection).setOnClickListener {
+                confirmDeleteCollection(c)
+            }
+            row.setOnClickListener {
+                Prefs.setCurrentCollectionId(this, c.id)
+                Toast.makeText(
+                    this, getString(R.string.collections_current, c.name), Toast.LENGTH_SHORT
+                ).show()
+                refreshCollections()
+            }
+            list.addView(row)
+        }
+    }
+
+    private fun emptyNotice(text: String): TextView = TextView(this).apply {
+        typeface = Typeface.MONOSPACE
+        textSize = 13f
+        setTextColor(getColor(R.color.whl_ink_dim))
+        setPadding(28, 40, 28, 28)
+        this.text = text
+    }
+
+    /** Add ([existing] null) or edit one collection. */
+    private fun editCollection(existing: BookCollection?) {
+        val view = layoutInflater.inflate(R.layout.dialog_collection, null)
+        val nameField = view.findViewById<android.widget.EditText>(R.id.collectionName)
+        val fromField = view.findViewById<android.widget.EditText>(R.id.collectionFrom)
+        nameField.setText(existing?.name.orEmpty())
+        fromField.setText(existing?.from.orEmpty())
+        AlertDialog.Builder(this)
+            .setTitle(
+                if (existing == null) R.string.collections_add_title
+                else R.string.collections_edit_title)
+            .setView(view)
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(R.string.collections_save) { _, _ ->
+                val name = nameField.text.toString()
+                val from = fromField.text.toString()
+                val error = Collections.mutate(this) { current ->
+                    if (existing == null) addCollection(current, name, from)
+                    else updateCollection(current, existing.id, name, from)
+                }
+                if (error != null) {
+                    Toast.makeText(this, error, Toast.LENGTH_LONG).show()
+                    return@setPositiveButton
+                }
+                // A collection the user just created is almost certainly the one
+                // they are about to scan into; select it so the next tap works.
+                if (existing == null) {
+                    Collections.all(this).lastOrNull()
+                        ?.let { Prefs.setCurrentCollectionId(this, it.id) }
+                }
+                refreshCollections()
+            }
+            .show()
+    }
+
+    private fun confirmDeleteCollection(collection: BookCollection) {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.collections_delete_title)
+            .setMessage(getString(R.string.collections_delete_message, collection.name))
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(R.string.collections_delete) { _, _ ->
+                if (!Collections.delete(this, collection.id)) {
+                    Toast.makeText(this, R.string.collections_delete_failed, Toast.LENGTH_LONG)
+                        .show()
+                }
+                refreshCollections()
+            }
+            .show()
     }
 
     override fun onDestroy() {
@@ -95,14 +258,9 @@ class HomeActivity : AppCompatActivity() {
         val entries = Entries.recent(this)
         selectedIds.retainAll(entries.map { it.id }.toSet())
         updateSelectionUi()
+        refreshCollectionBar()
         if (entries.isEmpty()) {
-            val empty = TextView(this)
-            empty.typeface = Typeface.MONOSPACE
-            empty.textSize = 13f
-            empty.setTextColor(getColor(R.color.whl_ink_dim))
-            empty.setPadding(28, 40, 28, 28)
-            empty.text = getString(R.string.home_empty)
-            list.addView(empty)
+            list.addView(emptyNotice(getString(R.string.home_empty)))
             return
         }
         val inflater = LayoutInflater.from(this)
@@ -115,7 +273,9 @@ class HomeActivity : AppCompatActivity() {
                     e.author,
                     e.year,
                     resources.getQuantityString(
-                        R.plurals.capture_count, e.photoCount, e.photoCount))
+                        R.plurals.capture_count, e.photoCount, e.photoCount),
+                    // where the book came from, once it has provenance
+                    if (e.from.isEmpty()) "" else getString(R.string.collections_row_from, e.from))
                     .filter { it.isNotEmpty() }.joinToString(" · ")
             val state = Entries.statusLabel(this, e)
             row.findViewById<TextView>(R.id.state).text = state
@@ -158,7 +318,8 @@ class HomeActivity : AppCompatActivity() {
 
     private fun updateSelectionUi() {
         binding.selectionBar.visibility = if (selectionMode) View.VISIBLE else View.GONE
-        binding.btnSelect.visibility = if (selectionMode) View.GONE else View.VISIBLE
+        binding.btnSelect.visibility =
+            if (selectionMode || showingCollections) View.GONE else View.VISIBLE
         binding.newScan.isEnabled = !selectionMode
         binding.selectionCount.text = resources.getQuantityString(
             R.plurals.home_selected_count, selectedIds.size, selectedIds.size)
@@ -225,5 +386,9 @@ class HomeActivity : AppCompatActivity() {
         state.endsWith("uploaded") -> R.color.whl_blue
         state.endsWith("imported") -> R.color.whl_cyan
         else -> R.color.whl_face_sh2
+    }
+
+    private companion object {
+        const val STATE_TAB_COLLECTIONS = "tab_collections"
     }
 }

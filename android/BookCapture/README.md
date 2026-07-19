@@ -8,13 +8,44 @@ its photos attached.
 
 ## Screens
 
-The app opens on **Home** — the recent-scans list (page thumbnail,
-extracted title / author / year or "Processing…" until the OCR/extraction
-pipeline catches up, and status: pending upload / uploaded / imported),
-with multi-select delete. Home owns the sign-in gate; **New scan** opens
-the capture screen. Tapping a scan opens its **detail**: all photos, the
-OCR text, every extracted field, and re-running the extraction with
-per-book custom instructions.
+The app opens on **Home**, which has two tabs.
+
+**Scans** is the recent-scans list (page thumbnail, extracted title /
+author / year or "Processing…" until the OCR/extraction pipeline catches
+up, where the book came from, and status: pending upload / uploaded /
+imported), with multi-select delete. Home owns the sign-in gate; **New
+scan** opens the capture screen. Tapping a scan opens its **detail**: all
+photos, the OCR text, every extracted field, and re-running the extraction
+with per-book custom instructions.
+
+**Collections** is where books get their provenance. A collection is the
+batch a book was scanned into — a shelf, a crate, a room — and it carries a
+**From**: where that batch physically came from ("Storage", "Christopher
+Office"). Add, rename, re-origin and delete collections here; tapping one
+makes it the collection the next book lands in.
+
+## Collections and provenance
+
+**A collection must be chosen before a book scan can start.** Both routes
+in are gated — the Home button and the spoken word "start" — and
+`CaptureSession.start()` takes the collection as a parameter, so the
+requirement is enforced by the type rather than by remembering to ask. A
+single existing collection selects itself; with several, the choice is
+explicit.
+
+Provenance is frozen per book at `start()`, before the first photo, into
+`filesDir/queue/<entryId>/collection.json`. Re-selecting a different
+collection halfway down a shelf therefore never relabels books already
+captured, and a crash mid-book is recovered with the provenance it was
+started under. A single book's **From** can be overridden from its detail
+screen up until it uploads; after that the cloud row is insert-only, so the
+field is locked rather than allowed to disagree with what the desktop
+already holds.
+
+Collections live on the phone (`filesDir/collections.json`). The
+collection's name and the book's From ride inside each capture's `meta`, so
+the desktop surfaces them in an entry's Extra section with no schema
+change — see `tests/test_phone_capture.py`.
 
 ## Voice flow
 
@@ -45,6 +76,16 @@ photo count and a dropdown of recent scans.
    `docs/cloud_capture_setup.md`); set the Mistral / DeepSeek API keys once —
    they are stored in your cloud profile and shared with the desktop.
 
+The launcher icon is generated, not hand-placed: `icon.png` here is the
+1024 px master, and `python tools/make_android_icon.py` (from the repo root)
+rewrites the five `ic_launcher_fg.png` density buckets from it.
+`--check` verifies the committed bitmaps still match. It exists because
+adaptive-icon framing is easy to get wrong — the launcher's mask is
+inscribed in the centre 72 dp of the 108 dp canvas and can be a circle, so
+artwork has to fit that circle's *diameter*, not the square. The script
+documents the arithmetic; the 14.5 dp inset it works back from is asserted
+by `ResourceContractTest`.
+
 ## Transport
 
 Settings picks how sealed entries leave the phone: **Cloud** (Supabase,
@@ -58,6 +99,9 @@ and no signed-in account needed for that leg.
 ## Data path
 
 photo → `filesDir/queue/<entryId>/photo_N.jpg`
+  → provenance frozen at start → `collection.json` (its own sidecar: the
+    ownership sidecar `capture.json` is rewritten wholesale when a legacy
+    capture is repaired, which would erase provenance folded in beside it)
   → (background) standardized in place, OCR → `photo_N.jpg.txt`,
     fields → `meta.json`
   → (upload, as the signed-in user) Supabase storage

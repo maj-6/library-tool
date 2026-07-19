@@ -28,6 +28,53 @@
         <item quantity="other">%1$d page photos</item>
     </plurals>
 
+    <!-- Collections: the batch a book is scanned into, and where that batch
+         came from. A collection must be chosen before a book scan can start. -->
+    <string name="home_tab_scans">SCANS</string>
+    <string name="home_tab_collections">COLLECTIONS</string>
+    <string name="collections_new">New collection</string>
+    <string name="collections_edit">EDIT</string>
+    <string name="collections_delete">DELETE</string>
+    <string name="collections_empty">No collections yet.\nA collection is a batch of books — a shelf, a crate, a room — and where it came from.\nTap “New collection” to make the first one.</string>
+    <string name="collections_add_title">New collection</string>
+    <string name="collections_edit_title">Edit collection</string>
+    <string name="collections_field_name">Collection</string>
+    <string name="collections_field_from">From</string>
+    <string name="collections_hint_name">Blue crate</string>
+    <string name="collections_hint_from">Storage</string>
+    <string name="collections_from_help">Every book scanned into this collection records this as where it came from. A single book can be changed afterwards.</string>
+    <string name="collections_save">SAVE</string>
+    <string name="collections_error_name_required">Give the collection a name.</string>
+    <string name="collections_error_name_taken">There is already a collection with that name.</string>
+    <string name="collections_error_missing">That collection no longer exists.</string>
+    <string name="collections_error_save">The collection could not be saved. Free storage and try again.</string>
+    <string name="collections_delete_title">Delete this collection?</string>
+    <string name="collections_delete_message">Deletes “%1$s”. Books already scanned into it keep their recorded collection and origin — only the choice for future scans goes away.</string>
+    <string name="collections_delete_failed">The collection could not be deleted. Free storage and try again.</string>
+    <string name="collections_current">Scanning into %1$s</string>
+    <string name="collections_current_from">Scanning into %1$s · from %2$s</string>
+    <string name="collections_none_selected">No collection chosen — tap to pick where these books came from</string>
+    <string name="collections_choose_first">Choose a collection before scanning a book.</string>
+    <string name="collections_row_from">from %1$s</string>
+    <string name="collections_row_no_from">no origin recorded</string>
+    <string name="collections_row_current">CURRENT</string>
+    <!-- Deliberately "on this phone", not a total: the recent list prunes
+         uploaded scans, so a plain count would shrink as books are delivered. -->
+    <plurals name="collections_row_books">
+        <item quantity="one">%1$d on this phone</item>
+        <item quantity="other">%1$d on this phone</item>
+    </plurals>
+
+    <string name="detail_from">From</string>
+    <string name="detail_from_edit">CHANGE</string>
+    <string name="detail_from_description">From %1$s</string>
+    <string name="detail_from_title">Where did this book come from?</string>
+    <string name="detail_from_hint">Storage</string>
+    <string name="detail_from_help">Overrides the origin inherited from the collection, for this book only.</string>
+    <string name="detail_from_locked">This book has already been uploaded, so its origin is fixed.</string>
+    <string name="detail_from_failed">The origin could not be changed. Free storage and try again.</string>
+    <string name="detail_from_none">—</string>
+
     <string name="entry_idle">IDLE</string>
     <string name="entry_active">OPEN (%1$d)</string>
     <string name="recent_chip">%1$d ▾</string>

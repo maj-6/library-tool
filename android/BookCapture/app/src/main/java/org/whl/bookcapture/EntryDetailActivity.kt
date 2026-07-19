@@ -98,6 +98,7 @@ class EntryDetailActivity : AppCompatActivity() {
 
         // extracted fields, mono rows, only what exists
         binding.fields.removeAllViews()
+        renderProvenance(entry)
         entry.meta?.let { meta ->
             for (k in Pipeline.FIELDS) {
                 val v = meta.optString(k).trim()
@@ -346,6 +347,112 @@ class EntryDetailActivity : AppCompatActivity() {
     private enum class ReprocessRequestResult {
         QUEUED, UPLOADED, MISSING, LOCAL_WRITE_FAILED
     }
+
+    /**
+     * Where this book came from, above the extracted bibliography — it describes
+     * the scan, not the book. "From" is editable until the capture uploads:
+     * after that the cloud row is insert-only, so a local edit would disagree
+     * with what the desktop already holds.
+     */
+    private fun renderProvenance(entry: Entries.Entry) {
+        val provenance = entry.provenance ?: return
+        binding.fields.addView(
+            fieldRow(getString(R.string.collections_field_name), provenance.collectionName))
+        val fromRow = fieldRow(
+            getString(R.string.detail_from),
+            provenance.from.ifEmpty { getString(R.string.detail_from_none) })
+        if (entry.uploaded) {
+            fromRow.setOnClickListener {
+                Toast.makeText(this, R.string.detail_from_locked, Toast.LENGTH_LONG).show()
+            }
+            fromRow.alpha = .7f
+        } else {
+            // Nothing else in this list is tappable, so the row needs to say so
+            // — an unmarked one reads as another read-only field.
+            (fromRow as LinearLayout).addView(TextView(this).apply {
+                typeface = android.graphics.Typeface.MONOSPACE
+                textSize = 10f
+                setTextColor(getColor(R.color.whl_cyan))
+                setText(R.string.detail_from_edit)
+            })
+            fromRow.setOnClickListener { editFrom(entry) }
+        }
+        fromRow.contentDescription = getString(
+            R.string.detail_from_description,
+            provenance.from.ifEmpty { getString(R.string.detail_from_none) })
+        binding.fields.addView(fromRow)
+    }
+
+    private fun editFrom(entry: Entries.Entry) {
+        val field = android.widget.EditText(this).apply {
+            setText(entry.from)
+            setSingleLine()
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                android.text.InputType.TYPE_TEXT_FLAG_CAP_WORDS
+            setHint(R.string.detail_from_hint)
+            setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO)
+        }
+        val frame = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(56, 24, 56, 0)
+            addView(field)
+            addView(TextView(this@EntryDetailActivity).apply {
+                typeface = android.graphics.Typeface.MONOSPACE
+                textSize = 11f
+                setTextColor(getColor(R.color.whl_ink_dim))
+                setPadding(0, 16, 0, 0)
+                setText(R.string.detail_from_help)
+            })
+        }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.detail_from_title)
+            .setView(frame)
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(R.string.collections_save) { _, _ -> saveFrom(entry, field.text.toString()) }
+            .show()
+    }
+
+    /**
+     * Same discipline as [requestReprocess]: off the UI thread, under the
+     * entry's lock, re-reading the entry inside it. `entry.uploaded` in
+     * [renderProvenance] is a snapshot from render() time, which does not cover
+     * an upload that starts while the dialog is open — without the lock this
+     * can interleave with UploadWorker's read-modify-write of the same
+     * manifest, leaving the phone showing an origin the cloud never received.
+     */
+    private fun saveFrom(entry: Entries.Entry, from: String) {
+        lifecycleScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                EntryOperationLocks.withLock(entry.id) {
+                    val current = Entries.find(this@EntryDetailActivity, entry.id)
+                        ?: return@withLock FromSaveResult.MISSING
+                    if (current.uploaded) return@withLock FromSaveResult.UPLOADED
+                    if (overrideEntryFrom(current.dir, from)) FromSaveResult.SAVED
+                    else FromSaveResult.WRITE_FAILED
+                }
+            }
+            // Each outcome needs its own words. "Free storage and try again" is
+            // actively wrong advice for a book that uploaded while the dialog
+            // was open — retrying can never succeed. MISSING says nothing at
+            // all: render() finishes the Activity, and a Toast would outlive it.
+            when (result) {
+                FromSaveResult.SAVED, FromSaveResult.MISSING -> Unit
+                FromSaveResult.UPLOADED -> Toast.makeText(
+                    this@EntryDetailActivity,
+                    R.string.detail_from_locked,
+                    Toast.LENGTH_LONG,
+                ).show()
+                FromSaveResult.WRITE_FAILED -> Toast.makeText(
+                    this@EntryDetailActivity,
+                    R.string.detail_from_failed,
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+            render()
+        }
+    }
+
+    private enum class FromSaveResult { SAVED, UPLOADED, MISSING, WRITE_FAILED }
 
     private fun fieldRow(label: String, value: String): View {
         val row = LinearLayout(this)

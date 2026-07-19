@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- One collection on the Collections tab: the batch name, where that batch came
+     from, and how many books have been scanned into it. Tapping selects it as
+     the collection the next book lands in; EDIT changes its name or origin. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="horizontal"
+    android:gravity="center_vertical"
+    android:paddingStart="12dp"
+    android:paddingEnd="8dp"
+    android:paddingTop="9dp"
+    android:paddingBottom="9dp"
+    android:background="@drawable/whl_row">
+
+    <View
+        android:id="@+id/currentMarker"
+        android:layout_width="7dp"
+        android:layout_height="7dp"
+        android:layout_marginEnd="10dp"
+        android:background="@color/whl_face_sh2" />
+
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/name"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="@color/whl_ink"
+            android:textSize="14sp"
+            android:maxLines="1"
+            android:ellipsize="end" />
+
+        <TextView
+            android:id="@+id/sub"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="1dp"
+            android:fontFamily="monospace"
+            android:textColor="@color/whl_ink_dim"
+            android:textSize="11sp"
+            android:maxLines="1"
+            android:ellipsize="end" />
+    </LinearLayout>
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/editCollection"
+        style="@style/WhlToolbarAction"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:textSize="11sp"
+        android:text="@string/collections_edit" />
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/deleteCollection"
+        style="@style/WhlToolbarAction"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:textSize="11sp"
+        android:textColor="@color/whl_red"
+        android:text="@string/collections_delete" />
+</LinearLayout>

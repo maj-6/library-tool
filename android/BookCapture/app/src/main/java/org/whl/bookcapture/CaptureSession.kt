@@ -46,6 +46,8 @@ class CaptureSession(private val ctx: Context) {
         private set
     internal var creator: CaptureCreator? = null
         private set
+    internal var provenance: CaptureProvenance? = null
+        private set
 
     init { restore(); purgeTrash() }
 
@@ -70,10 +72,19 @@ class CaptureSession(private val ctx: Context) {
         deleteCaptureTemps(dir)
         entryId = id
         creator = creatorFor(dir)
+        provenance = readProvenance(dir)
         refreshPhotoCount()
     }
 
-    fun start(): String {
+    /**
+     * Begin a book. The [collection] is required rather than read from Prefs so
+     * a capture can never start without provenance — the compiler enforces what
+     * the Collections tab asks for. Its name and "from" are copied into the
+     * entry here, before the first photo, so re-selecting a different collection
+     * mid-shelf cannot retroactively relabel this book, and so orphan recovery
+     * can seal a crashed entry with the provenance it was started under.
+     */
+    fun start(collection: BookCollection): String {
         if (active && cancel() == null) {
             error("Could not discard the current capture")
         }
@@ -85,8 +96,14 @@ class CaptureSession(private val ctx: Context) {
             dir.deleteRecursively()
             error("Could not persist capture creator")
         }
+        val captureProvenance = CaptureProvenance(collection.id, collection.name, collection.from)
+        if (!writeProvenance(dir, captureProvenance)) {
+            dir.deleteRecursively()
+            error("Could not persist capture provenance")
+        }
         entryId = id
         creator = captureCreator
+        provenance = captureProvenance
         photoCount = 0
         Prefs.setCurrentEntryId(ctx, id)
         return id
@@ -162,6 +179,7 @@ class CaptureSession(private val ctx: Context) {
         if (photoCount == 0) {                    // an empty entry is just dropped
             entryId = null
             creator = null
+            provenance = null
             entryDir(id).deleteRecursively()
             Prefs.setCurrentEntryId(ctx, null)
             return null
@@ -169,10 +187,12 @@ class CaptureSession(private val ctx: Context) {
         val captureCreator = creator ?: creatorFor(entryDir(id))
         val ok = writeManifest(
             entryDir(id), (1..photoCount).map { "photo_$it.jpg" },
-            System.currentTimeMillis(), captureCreator)
+            System.currentTimeMillis(), captureCreator,
+            provenance ?: readProvenance(entryDir(id)))
         if (!ok) return null                      // keep collecting; user retries
         entryId = null
         creator = null
+        provenance = null
         photoCount = 0
         Prefs.setCurrentEntryId(ctx, null)
         return id
@@ -189,6 +209,7 @@ class CaptureSession(private val ctx: Context) {
         if (!moveToTrash(id)) return null
         entryId = null
         creator = null
+        provenance = null
         photoCount = 0
         Prefs.setCurrentEntryId(ctx, null)
         return id
@@ -227,6 +248,7 @@ class CaptureSession(private val ctx: Context) {
         File(dst, TRASH_STAMP).delete()
         entryId = id
         creator = creatorFor(dst)
+        provenance = readProvenance(dst)
         photoCount = dst.listFiles { f -> f.isFile && f.name.matches(PHOTO_NAME) }?.size ?: 0
         Prefs.setCurrentEntryId(ctx, id)
         return true
@@ -266,7 +288,7 @@ class CaptureSession(private val ctx: Context) {
             if (photos.isEmpty()) { dir.deleteRecursively(); continue }
             val newest = dir.listFiles()?.maxOfOrNull { it.lastModified() }
                 ?: System.currentTimeMillis()
-            if (writeManifest(dir, photos, newest, creatorFor(dir))) sealed++
+            if (writeManifest(dir, photos, newest, creatorFor(dir), readProvenance(dir))) sealed++
         }
         return sealed
     }
@@ -322,6 +344,7 @@ class CaptureSession(private val ctx: Context) {
         photos: List<String>,
         createdAt: Long,
         creator: CaptureCreator,
+        provenance: CaptureProvenance?,
     ): Boolean =
         try {
             val manifest = JSONObject()
@@ -333,12 +356,123 @@ class CaptureSession(private val ctx: Context) {
                 .put("creator", JSONObject()
                     .put("kind", creator.kind)
                     .put("id", creator.id))
+            applyProvenance(manifest, provenance)
             val tmp = File(dir, "manifest.json.tmp")
             tmp.writeText(manifest.toString())
             tmp.renameTo(File(dir, "manifest.json"))
         } catch (e: Exception) {
             false
         }
+}
+
+/** Where a book came from: the collection it was scanned into, plus the place
+ *  that collection was picked up from. Frozen per entry at start(). */
+data class CaptureProvenance(
+    val collectionId: String,
+    val collectionName: String,
+    val from: String,
+)
+
+internal const val CAPTURE_PROVENANCE_FILE = "collection.json"
+
+/**
+ * Deliberately its own sidecar rather than another key in capture.json: the
+ * ownership sidecar gets rewritten wholesale when a legacy capture is repaired
+ * ([CaptureSession.creatorFor]), which would silently erase provenance folded
+ * in beside it.
+ */
+internal fun readProvenance(dir: File): CaptureProvenance? = try {
+    val data = JSONObject(File(dir, CAPTURE_PROVENANCE_FILE).readText())
+    val id = data.optString("collection_id").trim()
+    val name = normalizeCollectionField(data.optString("collection_name"))
+    val from = normalizeCollectionField(data.optString("from"))
+    // A collection with no id or name is not provenance, it is noise.
+    if (id.isEmpty() || name.isEmpty()) null else CaptureProvenance(id, name, from)
+} catch (_: Exception) {
+    null
+}
+
+internal fun writeProvenance(dir: File, provenance: CaptureProvenance): Boolean = try {
+    Entries.atomicWrite(
+        File(dir, CAPTURE_PROVENANCE_FILE),
+        JSONObject()
+            .put("collection_id", provenance.collectionId)
+            .put("collection_name", provenance.collectionName)
+            .put("from", provenance.from)
+            .toString(),
+    )
+    true
+} catch (_: Exception) {
+    false
+}
+
+/**
+ * Add provenance to the on-device manifest, where the collection keeps its id
+ * so a later migration can match books back to a collection row.
+ *
+ * Absent provenance writes nothing at all, so a pre-collections capture stays
+ * byte-identical rather than gaining empty strings the desktop would render as
+ * blank fields.
+ */
+internal fun applyProvenance(target: JSONObject, provenance: CaptureProvenance?): JSONObject {
+    if (provenance == null) return target
+    target.put("collection", JSONObject()
+        .put("id", provenance.collectionId)
+        .put("name", provenance.collectionName))
+    if (provenance.from.isNotEmpty()) target.put("from", provenance.from)
+    return target
+}
+
+/**
+ * Add provenance to an outgoing capture payload's `meta` object.
+ *
+ * Deliberately flat where the manifest is nested: the desktop copies unknown
+ * `meta` keys into an entry's `extra` and renders each as a row, so a nested
+ * object would surface as a blob of JSON where a reader expects a place name.
+ * The collection travels as its name for the same reason — the id means nothing
+ * on the desktop until collections become shared rows.
+ *
+ * The `scan_` prefix is load-bearing on both ends. It keeps these from
+ * colliding with a model-extracted `collection`, and it lets the desktop tell
+ * passthrough provenance from real extraction output: `_phone_result` excludes
+ * exactly these keys when deciding whether the phone extracted anything, so a
+ * phone with no API key still falls through to the desktop's own OCR instead of
+ * filing a blank entry. Renaming them here means renaming
+ * `PHONE_PROVENANCE_KEYS` in tools/whl_explorer/server.py.
+ */
+internal fun applyProvenanceToPayload(
+    meta: JSONObject,
+    provenance: CaptureProvenance?,
+): JSONObject {
+    if (provenance == null) return meta
+    meta.put("scan_collection", provenance.collectionName)
+    if (provenance.from.isNotEmpty()) meta.put("scan_from", provenance.from)
+    return meta
+}
+
+/**
+ * Override where one book came from, after it was scanned. Rewrites the sidecar
+ * and, when the entry is already sealed, the manifest the uploader reads — both
+ * or neither, so a half-applied override can't ship one value to the cloud and
+ * show another on the phone.
+ */
+internal fun overrideEntryFrom(dir: File, from: String): Boolean {
+    val current = readProvenance(dir) ?: return false
+    val updated = current.copy(from = normalizeCollectionField(from))
+    if (!writeProvenance(dir, updated)) return false
+    val manifestFile = File(dir, "manifest.json")
+    if (!manifestFile.isFile) return true            // still open; done() will carry it
+    return try {
+        val manifest = JSONObject(manifestFile.readText())
+        manifest.remove("from")
+        Entries.atomicWrite(manifestFile, applyProvenance(manifest, updated).toString())
+        true
+    } catch (_: Exception) {
+        // The sidecar moved but the manifest did not. Put the sidecar back so
+        // the two agree; the user sees the edit fail rather than a split value.
+        writeProvenance(dir, current)
+        false
+    }
 }
 
 internal const val CAPTURE_METADATA_FILE = "capture.json"

@@ -43,7 +43,9 @@ class CaptureOwnershipTest {
         assertTrue(writeCreator >= 0)
         assertTrue(publishActive > writeCreator)
         assertTrue(session.contains("creator = creatorFor(dir)"))
-        assertTrue(session.contains("writeManifest(dir, photos, newest, creatorFor(dir))"))
+        assertTrue(
+            session.contains("writeManifest(dir, photos, newest, creatorFor(dir), readProvenance(dir))"),
+        )
         assertTrue(session.contains(".put(\"creator\", JSONObject()"))
         assertTrue(session.contains("Prefs.CREATOR_LOCAL"))
     }

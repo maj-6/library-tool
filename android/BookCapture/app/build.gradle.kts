@@ -90,6 +90,11 @@ dependencies {
 
     testImplementation("junit:junit:4.13.2")
 
+    // android.jar's org.json is a stub that throws "not mocked" off-device, so
+    // JVM tests over manifest/sidecar JSON need a real implementation on the
+    // test classpath. Test-only: the app keeps using the platform's.
+    testImplementation("org.json:json:20240303")
+
     // offline keyword spotting ("start" / "photo" / "done" / "cancel")
     implementation("com.alphacephei:vosk-android:0.3.47")
 }

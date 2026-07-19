@@ -12451,6 +12451,36 @@ def _capture_note(cap: dict, errors: list[str]) -> str:
     return note
 
 
+# Context Book Capture attaches to EVERY capture: which collection a book was
+# scanned into, and where that batch came from. It rides in `meta` to reach an
+# entry's `extra` without a schema change, but it is passthrough provenance, not
+# extraction output — so it must never make an un-extracted capture look
+# extracted, or a phone with no API key would skip the desktop's own OCR below
+# and file a blank entry. The `scan_` prefix also keeps it from colliding with a
+# model-extracted `collection`.
+PHONE_PROVENANCE_KEYS = frozenset({"scan_collection", "scan_from"})
+
+
+def _capture_provenance(cap: dict) -> dict:
+    """The phone's scan provenance, whichever import path ran.
+
+    It travels in `meta`, but only _phone_result reads `meta` — when the phone
+    sent no extraction and the desktop OCRs the capture itself, that result
+    carries none of it. So it is merged back in explicitly, or a capture from a
+    phone without an API key would arrive with no record of where it came from.
+    """
+    meta = cap.get("meta")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except json.JSONDecodeError:
+            meta = None
+    if not isinstance(meta, dict):
+        return {}
+    return {key: meta[key] for key in PHONE_PROVENANCE_KEYS
+            if str(meta.get(key) or "").strip()}
+
+
 def _phone_result(cap: dict, raw_photos: list[bytes], photo_paths: list) -> dict | None:
     """Reuse the OCR + fields the phone (BookCapture 2.0+) extracted in the
     background, so import doesn't pay for a second OCR pass. Returns a
@@ -12481,7 +12511,11 @@ def _phone_result(cap: dict, raw_photos: list[bytes], photo_paths: list) -> dict
             return bool(value)
         return bool(str(value or "").strip())
 
-    has_metadata = any(has_value(value) for value in meta.values())
+    has_metadata = any(
+        has_value(value)
+        for key, value in meta.items()
+        if key not in PHONE_PROVENANCE_KEYS
+    )
     if not (ocr or has_metadata):
         return None                       # phone had no keys / extracted nothing
 
@@ -12548,7 +12582,9 @@ def ingest_capture(cap: dict, raw_photos: list[bytes], mistral_key: str,
     if not entry["title"]:                        # never lose a capture
         entry["title"] = f"(untitled capture {cap_id[:8]})"
     entry["notes"] = _capture_note(cap, result["errors"])
-    entry["extra"] = _clean_extra(result["extra"])
+    # provenance last: it is the phone's own record of where the book came
+    # from, so it outranks anything an extractor happened to call the same thing
+    entry["extra"] = _clean_extra({**result["extra"], **_capture_provenance(cap)})
     entry["images"] = images
     entry["capture_id"] = cap_id
     entry["created_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")

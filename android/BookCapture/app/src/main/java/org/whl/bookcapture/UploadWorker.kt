@@ -605,9 +605,9 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         }
         val createdMs = manifest.optLong("created_at", 0L)
         val createdAt = if (createdMs > 0) Instant.ofEpochMilli(createdMs).toString() else ""
-        val meta = File(dir, "meta.json").takeIf { it.isFile }
+        val meta = withProvenance(File(dir, "meta.json").takeIf { it.isFile }
             ?.let { try { JSONObject(it.readText()) } catch (_: Exception) { null } }
-            ?: JSONObject()
+            ?: JSONObject(), dir)
         return deliverValidatedCapture(
             entryId = id,
             deviceFolder = deviceSafe,
@@ -748,13 +748,19 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         }
         val createdMs = manifest.optLong("created_at", 0L)
         val createdAt = if (createdMs > 0) Instant.ofEpochMilli(createdMs).toString() else ""
-        val meta = File(dir, "meta.json").takeIf { it.isFile }
+        val meta = withProvenance(File(dir, "meta.json").takeIf { it.isFile }
             ?.let { try { JSONObject(it.readText()) } catch (_: Exception) { null } }
-            ?: JSONObject()
+            ?: JSONObject(), dir)
         client.uploadCapture(id, device, manifest.optString("note", ""),
                              createdAt, ocr, meta, photos)
         return ConfirmedDelivery(id, photos.size, photos.map { it.first })
     }
+
+    /** Read the entry's frozen provenance and fold it into the outgoing meta —
+     *  from the sidecar, which an override keeps current, not from meta.json,
+     *  which reprocessing rewrites. */
+    private fun withProvenance(meta: JSONObject, dir: File): JSONObject =
+        applyProvenanceToPayload(meta, readProvenance(dir))
 
     /** queue/<id> -> sent/<id>, marked imported (LAN import is synchronous). */
     private fun markSentImported(

@@ -25,7 +25,10 @@ Per-component detail lives in each part's own README (map at the end).
   (`filesDir/queue/<entryId>/`), then leave as a `captures` row + photos
   in the private `captures` bucket, or as a direct LAN POST to a paired
   desktop. Either way the capture's destiny is a desktop entry; the phone
-  keeps only a pruned recent-scans history.
+  keeps only a pruned recent-scans history. Every book is scanned into a
+  phone-local **collection** carrying a **From** (where the batch came
+  from); the pair rides inside each capture's `meta` and lands in the
+  desktop entry's `extra`, so provenance needs no column of its own.
 - **Website** (`website/`, GitHub Pages) — stateless plain files, no build
   step. `assets/data.js` reads the cloud over PostgREST with the anon key
   from `assets/config.js` (gitignored); without that file it reads the
