@@ -15,7 +15,12 @@ Per-component detail lives in each part's own README (map at the end).
   `JobManager` lifecycle, cancellation, restart-recovery, typed views, and
   cursor events while their provider-specific executors remain adapters. The
   catalogue read spine exposes immutable item/representation/artifact
-  aggregates with module-contributed workbench eligibility; recoverable
+  aggregates with module-contributed workbench eligibility. Flask composes
+  that service at `/api/v1/items`; the browser's initial catalogue load now
+  crosses `EngineClient.items`, while its existing edit routes remain a
+  deliberate compatibility surface. Default item DTOs replace attached file
+  paths with opaque representation identities; only the explicitly requested
+  `build-workbench` projection carries the old local build record. Recoverable
   multi-file write sets and `.lib` import unit-of-work contracts are available
   for the next legacy-import migration.
 - **Desktop app** — the workbench: an Electron shell (`desktop/`) that

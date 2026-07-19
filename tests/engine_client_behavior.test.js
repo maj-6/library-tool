@@ -40,6 +40,11 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
   assert.equal(typeof client.jobs.get, "function");
   assert.equal(typeof client.jobs.cancel, "function");
   assert.equal(typeof client.jobs.events, "function");
+  assert.equal(typeof client.items.list, "function");
+  assert.equal(typeof client.items.get, "function");
+  assert.equal(typeof client.items.representations, "function");
+  assert.equal(typeof client.items.artifacts, "function");
+  assert.equal(typeof client.items.readiness, "function");
   const jsonMethods = [
     client.replica.templates.list,
     client.pdf.info,
@@ -110,6 +115,26 @@ test("background jobs use the versioned engine transport", async () => {
   assert.equal(calls[2].init.method, "POST");
   assert.equal(calls[3].url, "/api/v1/job-events?after=12&limit=50");
   assert.equal(calls[3].init.method, "GET");
+});
+
+test("item queries use versioned path-safe engine resources", async () => {
+  const { client, calls } = harness({ ok: true, items: [] });
+  await client.items.list({ includeBuildCompatibility: true });
+  await client.items.get({ itemId: "book / one" });
+  await client.items.representations({ itemId: "book / one" });
+  await client.items.artifacts({ itemId: "book / one" });
+  await client.items.readiness({ itemId: "book / one" });
+
+  assert.equal(calls[0].url,
+    "/api/v1/items?projection=build-workbench");
+  assert.equal(calls[1].url, "/api/v1/items/book%20%2F%20one");
+  assert.equal(calls[2].url,
+    "/api/v1/items/book%20%2F%20one/representations");
+  assert.equal(calls[3].url,
+    "/api/v1/items/book%20%2F%20one/artifacts");
+  assert.equal(calls[4].url,
+    "/api/v1/items/book%20%2F%20one/readiness");
+  assert.ok(calls.every(({ init }) => init.method === "GET"));
 });
 
 test("EngineClient encodes Replica path components and query values", async () => {
@@ -319,4 +344,17 @@ test("Replica workbench contains no direct transport or API route literals", () 
   const appScript = template.indexOf("filename='app.js'");
   assert.ok(clientScript >= 0 && clientScript < appScript,
     "engine-client.js loads before app.js");
+});
+
+test("the initial build load crosses the semantic item client boundary", () => {
+  const app = fs.readFileSync(appPath, "utf8");
+  const start = app.indexOf("async function loadBuilds()");
+  const end = app.indexOf("function allBuildsSorted", start);
+  assert.ok(start >= 0 && end > start);
+  const loader = app.slice(start, end);
+  assert.match(loader, /engineClient\.items\.list/);
+  assert.match(loader, /includeBuildCompatibility:\s*true/);
+  // Existing mutation routes remain transitional; only the collection GET
+  // belongs to this slice.
+  assert.doesNotMatch(loader, /fetch\s*\(\s*["']\/api\/builds["']/);
 });

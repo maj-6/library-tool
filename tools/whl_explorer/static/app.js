@@ -16475,8 +16475,20 @@ function buildIsDirty() {
 
 async function loadBuilds() {
   try {
-    const res = await fetch("/api/builds");
-    state.builds = res.ok ? (await res.json()).builds || {} : {};
+    const result = await engineClient.items.list({
+      includeBuildCompatibility: true,
+    });
+    state.builds = {};
+    for (const item of result.items || []) {
+      const legacy = item && item.compatibility && item.compatibility.build;
+      if (!legacy || typeof legacy !== "object" || Array.isArray(legacy)) continue;
+      state.builds[item.id] = {
+        ...legacy,
+        id: item.id,
+        title: item.title,
+        updated_at: legacy.updated_at || item.record_revision || "",
+      };
+    }
     // One-time migration for builds that already had a volume before explicit
     // group metadata was introduced. Persist the association, then render from
     // metadata on every subsequent load.

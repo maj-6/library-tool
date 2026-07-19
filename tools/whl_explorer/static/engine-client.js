@@ -105,6 +105,13 @@
         cancel: (args) => this._jobCancel(args),
         events: (args) => this._jobEvents(args),
       });
+      this.items = Object.freeze({
+        list: (args) => this._itemsList(args),
+        get: (args) => this._itemGet(args),
+        representations: (args) => this._itemRepresentations(args),
+        artifacts: (args) => this._itemArtifacts(args),
+        readiness: (args) => this._itemReadiness(args),
+      });
       this.capabilities = (args) => this._capabilities(args);
 
       const pages = Object.freeze({
@@ -236,6 +243,39 @@
 
     _capabilities({ signal } = {}) {
       return this._requestJson("GET", "/v1/capabilities", { signal });
+    }
+
+    _itemsList({ includeBuildCompatibility = false, signal } = {}) {
+      return this._requestJson("GET", "/v1/items", {
+        query: {
+          projection: includeBuildCompatibility ? "build-workbench" : undefined,
+        },
+        signal,
+      });
+    }
+
+    _itemGet({ itemId, includeBuildCompatibility = false, signal } = {}) {
+      return this._requestJson("GET", `/v1/items/${encodePart(itemId)}`, {
+        query: {
+          projection: includeBuildCompatibility ? "build-workbench" : undefined,
+        },
+        signal,
+      });
+    }
+
+    _itemRepresentations({ itemId, signal } = {}) {
+      return this._requestJson(
+        "GET", `/v1/items/${encodePart(itemId)}/representations`, { signal });
+    }
+
+    _itemArtifacts({ itemId, signal } = {}) {
+      return this._requestJson(
+        "GET", `/v1/items/${encodePart(itemId)}/artifacts`, { signal });
+    }
+
+    _itemReadiness({ itemId, signal } = {}) {
+      return this._requestJson(
+        "GET", `/v1/items/${encodePart(itemId)}/readiness`, { signal });
     }
 
     _jobsList({ state, kind, itemId, signal } = {}) {

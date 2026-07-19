@@ -69,6 +69,9 @@ import whl_scrape  # noqa: E402
 from librarytool.adapters.filesystem.job_history import (  # noqa: E402
     FilesystemJobHistoryRepository,
 )
+from librarytool.adapters.filesystem.item_repository import (  # noqa: E402
+    FilesystemItemQueryRepository,
+)
 from librarytool.adapters.filesystem.replica_repository import (  # noqa: E402
     FilesystemReplicaRepository,
 )
@@ -98,11 +101,15 @@ from librarytool.engine.jobs import (  # noqa: E402
     PUBLIC_JOB_FIELDS,
     JobManager,
 )
+from librarytool.engine.items import ItemQueryService  # noqa: E402
 from librarytool.engine.replica import ReplicaApplicationService  # noqa: E402
 from librarytool.engine.runtime import LibraryEngine  # noqa: E402
 from librarytool.engine.text_layers import TextLayerService  # noqa: E402
 from librarytool.engine.translations import (  # noqa: E402
     TranslationProvenanceService,
+)
+from librarytool.engine.workbench_policies import (  # noqa: E402
+    standard_workbench_policies,
 )
 
 # NYPL Catalog of Copyright Entries dataset (optional, for the copyright tag's
@@ -941,8 +948,15 @@ def home():
 _ENGINE_CAPABILITIES = CapabilityRegistry(
     modules=(
         ModuleManifest(
-            "library.core", "1.0.0",
-            provides=(CapabilityRef("library.items"),),
+            "library.core", "1.1.0",
+            provides=(
+                # ``library.items`` remains the compatibility capability while
+                # new clients can bind to the narrower read contracts.
+                CapabilityRef("library.items"),
+                CapabilityRef("library.items.read"),
+                CapabilityRef("library.representations"),
+                CapabilityRef("library.artifacts"),
+            ),
         ),
         ModuleManifest(
             "jobs.core", "1.0.0",
@@ -2843,6 +2857,216 @@ def api_build_ocr_layout(build_id: str):
                         if v}})
 
 
+_ENGINE_ITEM_LOCAL_FIELDS = frozenset({
+    # These values remain available through the explicitly requested legacy
+    # build projection, but are not part of the portable catalogue DTO.
+    "pdf_file", "pdf_sources", "images", "extra",
+})
+
+
+def _engine_representation_locator(item_id: str, source_id: str) -> str:
+    """Opaque engine resource identity; never serialize an attached path."""
+    item = urllib.parse.quote(str(item_id), safe="")
+    source = urllib.parse.quote(str(source_id), safe="")
+    return f"urn:librarytool:item:{item}:representation:{source}"
+
+
+def _engine_source_snapshot(item_id: str, source_id: str, raw: str,
+                            *, role: str, label: str) -> dict:
+    """Project one attached PDF into a stable, path-safe representation."""
+    path = _resolve_local(raw) if raw else None
+    stat = None
+    if path is not None:
+        try:
+            if path.is_file():
+                value = path.stat()
+                stat = {"size": value.st_size, "mtime_ns": value.st_mtime_ns}
+        except OSError:
+            stat = None
+    fingerprint = json.dumps(
+        {"path": raw, "stat": stat}, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "id": source_id,
+        "revision": "sr-" + hashlib.sha256(fingerprint).hexdigest()[:24],
+        "role": role,
+        "media_type": "application/pdf",
+        "locator": _engine_representation_locator(item_id, source_id),
+        "label": label,
+        # Bundled OCR/Replica executors require a readable local attachment.
+        # A remote catalogue URL remains metadata, not a usable source.
+        "available": bool(stat),
+    }
+
+
+def _engine_item_representations(item_id: str, build: dict) -> list[dict]:
+    rows = []
+    primary = str(build.get("pdf_file") or "").strip()
+    if not primary:
+        entry_pdf = _entry_primary_pdf(item_id)
+        if entry_pdf:
+            primary = str(_entry_dir(item_id) / entry_pdf)
+    if primary:
+        rows.append(_engine_source_snapshot(
+            item_id, "primary", primary, role="primary", label="Primary source",
+        ))
+    seen = {"primary"}
+    for source in build.get("pdf_sources") or []:
+        if not isinstance(source, dict):
+            continue
+        source_id = str(source.get("id") or "").strip()
+        raw = str(source.get("path") or "").strip()
+        if not source_id or source_id in seen or not raw:
+            continue
+        seen.add(source_id)
+        rows.append(_engine_source_snapshot(
+            item_id, source_id, raw, role="alternate",
+            label=str(source.get("label") or "Alternate source"),
+        ))
+    return rows
+
+
+def _engine_artifact_id(item_id: str, kind: str, name: str,
+                        layer: str = "", source_id: str = "") -> str:
+    identity = (
+        f"{item_id}\n{kind}\n{layer}\n{source_id}\n{name}"
+    ).encode("utf-8")
+    return "art-" + hashlib.sha256(identity).hexdigest()[:20]
+
+
+def _engine_artifact_row(item_id: str, build: dict, *, kind: str,
+                         name: str, row: dict, layer: str = "",
+                         source_id: str = "") -> dict:
+    stale = row.get("stale") if isinstance(row.get("stale"), bool) else None
+    provenance = row.get("produced_by")
+    if not isinstance(provenance, dict):
+        provenance = {}
+    artifact_identity = str(row.get("artifact") or name)
+    result = {
+        "id": _engine_artifact_id(
+            item_id, kind, artifact_identity, layer, source_id,
+        ),
+        "kind": kind,
+        "name": name,
+        "layer": layer,
+        "media_type": (
+            "text/markdown" if name.lower().endswith(".md") else
+            "text/plain" if name.lower().endswith(".txt") else
+            "application/pdf" if name.lower().endswith(".pdf") else
+            "application/octet-stream"
+        ),
+        "available": bool(row.get("exists", True)),
+        "stale": stale,
+        "size": row.get("size"),
+        "provenance": provenance,
+    }
+    if source_id:
+        result["source_representation_id"] = source_id
+        if stale is False:
+            raw = str(build.get("pdf_file") or "") if source_id == "primary" else next(
+                (str(source.get("path") or "")
+                 for source in build.get("pdf_sources") or []
+                 if isinstance(source, dict)
+                 and str(source.get("id") or "") == source_id),
+                "",
+            )
+            if raw:
+                result["source_revision"] = _engine_source_snapshot(
+                    item_id, source_id, raw,
+                    role="primary" if source_id == "primary" else "alternate",
+                    label="",
+                )["revision"]
+    metadata = {
+        key: row[key] for key in ("page", "pages") if row.get(key) is not None
+    }
+    if metadata:
+        result["metadata"] = metadata
+    return result
+
+
+def _engine_item_artifacts(item_id: str, build: dict) -> list[dict]:
+    """Flatten today's entry-folder summary into portable artifact refs."""
+    info = _entry_folder_info(item_id, build)
+    rows: list[dict] = []
+    for row in info.get("ocr") or []:
+        if not isinstance(row, dict) or not row.get("name"):
+            continue
+        source_id = str(row.get("src") or "primary")
+        rows.append(_engine_artifact_row(
+            item_id, build, kind="ocr", name=str(row["name"]), row=row,
+            source_id=source_id,
+        ))
+    for row in info.get("full_text") or []:
+        if isinstance(row, dict) and row.get("name"):
+            rows.append(_engine_artifact_row(
+                item_id, build, kind="full-text", name=str(row["name"]), row=row,
+            ))
+    for row in info.get("translations") or []:
+        if isinstance(row, dict) and row.get("name"):
+            rows.append(_engine_artifact_row(
+                item_id, build, kind="translation", name=str(row["name"]),
+                layer=str(row.get("lang") or ""), row=row,
+            ))
+    for row in info.get("analysis") or []:
+        if isinstance(row, dict) and row.get("name"):
+            rows.append(_engine_artifact_row(
+                item_id, build, kind="analysis", name=str(row["name"]), row=row,
+            ))
+    for kind in ("summary", "about"):
+        row = info.get(kind)
+        if isinstance(row, dict) and row.get("exists"):
+            rows.append(_engine_artifact_row(
+                item_id, build, kind=kind, name=f"{kind}.md", row=row,
+            ))
+    for row in info.get("images") or []:
+        if isinstance(row, dict) and row.get("name"):
+            rows.append(_engine_artifact_row(
+                item_id, build, kind="figure", name=str(row["name"]), row=row,
+            ))
+    processed = str(info.get("processed_pdf") or "")
+    if processed:
+        path = _entry_dir(item_id) / processed
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = None
+        rows.append(_engine_artifact_row(
+            item_id, build, kind="processed-source", name=processed,
+            row={"size": size},
+        ))
+    return rows
+
+
+def _engine_item_snapshot() -> dict[str, dict]:
+    """Read the transitional build store as portable engine item records."""
+    builds = lib.load_json(BUILDS_PATH, {})
+    if not isinstance(builds, dict):
+        raise ValueError("the build catalogue is not an object")
+    out = {}
+    for item_id, raw in builds.items():
+        if not isinstance(raw, dict):
+            # Let the repository boundary report the malformed record rather
+            # than allowing a partial catalogue to look authoritative.
+            out[str(item_id)] = raw
+            continue
+        build = dict(raw)
+        metadata = {
+            key: value for key, value in build.items()
+            if key not in _ENGINE_ITEM_LOCAL_FIELDS
+            and key not in {"id", "title", "updated_at"}
+        }
+        out[str(item_id)] = {
+            "id": str(item_id),
+            "kind": "book",
+            "title": str(build.get("title") or ""),
+            "updated_at": str(build.get("updated_at") or ""),
+            "metadata": metadata,
+            "representations": _engine_item_representations(str(item_id), build),
+            "artifacts": _engine_item_artifacts(str(item_id), build),
+        }
+    return out
+
+
 class _EngineItemRepository:
     """Current build catalogue exposed through the engine item port."""
 
@@ -2930,6 +3154,10 @@ def _library_engine() -> LibraryEngine:
         with _library_engine_guard:
             if _library_engine_instance is None:
                 policies = _EngineReplicaPolicies()
+                items = ItemQueryService(
+                    FilesystemItemQueryRepository(_engine_item_snapshot),
+                    policies=standard_workbench_policies(),
+                )
                 repository = FilesystemReplicaRepository(
                     lambda item_id: _entry_dir(item_id) / "ocr" / "layout.json",
                     read_json=lambda path: lib.load_json(path, {}),
@@ -2945,6 +3173,7 @@ def _library_engine() -> LibraryEngine:
                     _EngineItemRepository(), repository, policies, text_layers)
                 _library_engine_instance = LibraryEngine(
                     capabilities=_ENGINE_CAPABILITIES,
+                    items=items,
                     jobs=_job_manager,
                     replica=replica,
                     text_layers=text_layers,
@@ -3031,6 +3260,136 @@ def _json_with_etag(body: dict):
     response = jsonify(body)
     response.set_etag(body["revision"])
     return response
+
+
+def _item_engine() -> ItemQueryService:
+    items = _library_engine().items
+    if items is None:
+        raise EngineError(
+            "the item query module is unavailable",
+            code="item_query_unavailable", retryable=True,
+        )
+    return items
+
+
+def _item_projection() -> str:
+    projection = str(request.args.get("projection") or "").strip()
+    if projection not in {"", "build-workbench"}:
+        raise EngineValidationError(
+            "the requested item projection is not supported",
+            code="invalid_item_projection",
+            details={"projection": projection},
+        )
+    return projection
+
+
+def _item_response_revision(prefix: str, value) -> str:
+    canonical = json.dumps(
+        value, ensure_ascii=False, allow_nan=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return prefix + "-" + hashlib.sha256(canonical).hexdigest()[:24]
+
+
+def _item_json_response(body: dict, revision: str):
+    """Return a revalidatable engine snapshot with a strong aggregate ETag."""
+    response = jsonify({**body, "revision": revision})
+    response.set_etag(revision)
+    response.cache_control.no_cache = True
+    return response.make_conditional(request)
+
+
+def _project_build_compatibility(items: list[dict]) -> None:
+    """Attach the old build shape only for the transitional web workbench.
+
+    The default versioned API never includes local PDF/image paths. Existing
+    browser code can explicitly request this projection while it migrates one
+    feature at a time; alternate clients have no reason to depend on it.
+    """
+    builds = lib.load_json(BUILDS_PATH, {})
+    if not isinstance(builds, dict):
+        return
+    for item in items:
+        build = builds.get(item.get("id"))
+        if isinstance(build, dict):
+            item["compatibility"] = {
+                "schema": "librarytool.build-record/1",
+                "build": dict(build),
+            }
+
+
+@app.route("/api/v1/items")
+def api_v1_items():
+    """Portable catalogue snapshots for every installed client framework."""
+    try:
+        projection = _item_projection()
+        items = [view.as_dict() for view in _item_engine().list_items()]
+        if projection == "build-workbench":
+            _project_build_compatibility(items)
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    revision = _item_response_revision("ic", items)
+    return _item_json_response({
+        "ok": True, "schema": "librarytool.items/1", "items": items,
+    }, revision)
+
+
+@app.route("/api/v1/items/<item_id>")
+def api_v1_item(item_id: str):
+    try:
+        projection = _item_projection()
+        item = _item_engine().get_item(item_id).as_dict()
+        if projection == "build-workbench":
+            _project_build_compatibility([item])
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    revision = (
+        item["revision"] if not projection else
+        _item_response_revision("ip", item)
+    )
+    return _item_json_response({
+        "ok": True, "schema": "librarytool.item/1", "item": item,
+    }, revision)
+
+
+@app.route("/api/v1/items/<item_id>/representations")
+def api_v1_item_representations(item_id: str):
+    try:
+        rows = [value.as_dict() for value in
+                _item_engine().list_representations(item_id)]
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    revision = _item_response_revision("rc", rows)
+    return _item_json_response({
+        "ok": True, "schema": "librarytool.representations/1",
+        "item_id": item_id, "representations": rows,
+    }, revision)
+
+
+@app.route("/api/v1/items/<item_id>/artifacts")
+def api_v1_item_artifacts(item_id: str):
+    try:
+        rows = [value.as_dict() for value in
+                _item_engine().list_artifacts(item_id)]
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    revision = _item_response_revision("ac", rows)
+    return _item_json_response({
+        "ok": True, "schema": "librarytool.artifacts/1",
+        "item_id": item_id, "artifacts": rows,
+    }, revision)
+
+
+@app.route("/api/v1/items/<item_id>/readiness")
+def api_v1_item_readiness(item_id: str):
+    try:
+        state = _item_engine().readiness(item_id).as_dict()
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    return _item_json_response({
+        "ok": True, "schema": "librarytool.workbench-state/1",
+        "item_id": item_id, "state": state,
+    }, state["revision"])
 
 
 @app.route("/api/builds/<build_id>/ocr-regions")

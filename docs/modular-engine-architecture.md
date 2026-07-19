@@ -62,6 +62,14 @@ workbench split described below remains the target architecture:
   policies. Replica, translation, research, publishing, and text-layer
   eligibility are therefore contributed by modules rather than hardcoded into
   the item model.
+- Flask now composes that catalogue spine over the current build and entry-
+  folder stores. Versioned list/detail, representation, artifact, and
+  readiness resources provide structured errors and aggregate ETags;
+  `EngineClient.items` is their browser boundary. The old workbench's initial
+  build load uses an explicit compatibility projection, while default item
+  DTOs expose opaque representation resource identities instead of attached
+  filesystem paths. Existing create/edit/delete routes remain unchanged for a
+  later command-side slice.
 - `.lib` import now has immutable command, plan, receipt, planner, repository,
   and unit-of-work contracts. The application service binds idempotency to the
   complete command and rejects malformed plugin plans before staging. A
@@ -84,12 +92,12 @@ Its versioned, page-scoped command resolves the attached source and provider
 credentials in the engine, returns a stable job identity, and preserves
 protected work as a proposal. The workbench observes that job directly and
 distinguishes completion, failure, cancellation, and restart interruption; it
-no longer infers completion from browser-local OCR page markers. The next
-integration step is to compose the item query service into `/api/v1` and move
-the legacy `.lib` importer onto the new recoverable write set. Until that route
-migration lands, the current Replica unit of work is deliberately claimed
-atomic only for one workspace JSON file, not for an arbitrary collection of
-assets and translations.
+no longer infers completion from browser-local OCR page markers. The item query
+service is now composed into `/api/v1`; the next integration step is to move
+the legacy `.lib` importer onto the new recoverable write set. Until that
+transaction migration lands, the current Replica unit of work is deliberately
+claimed atomic only for one workspace JSON file, not for an arbitrary
+collection of assets and translations.
 
 Companion documents:
 
