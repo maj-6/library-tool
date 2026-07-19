@@ -44,7 +44,16 @@ from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from flask import Flask, Response, abort, jsonify, render_template, request, send_file
+from flask import (
+    Flask,
+    Response,
+    abort,
+    jsonify,
+    render_template,
+    request,
+    send_file,
+    url_for,
+)
 from werkzeug.exceptions import HTTPException
 
 # Make the installable engine package and transitional tools/ modules
@@ -125,6 +134,11 @@ from librarytool.engine.item_commands import (  # noqa: E402
     ItemRecordSnapshot,
     UpdateItemCommand,
 )
+from librarytool.engine.item_lifecycle import (  # noqa: E402
+    DeleteItemCommand as LifecycleDeleteItemCommand,
+    ItemLifecycleService,
+    RestoreItemCommand,
+)
 from librarytool.engine.items import ItemQueryService  # noqa: E402
 from librarytool.engine.interchange import (  # noqa: E402
     ImportLibCommand,
@@ -144,6 +158,7 @@ from librarytool.engine.representation_commands import (  # noqa: E402
 from librarytool.engine.runtime import (  # noqa: E402
     INTERCHANGE_SERVICE,
     ITEM_COMMAND_SERVICE,
+    ITEM_LIFECYCLE_SERVICE,
     ITEM_QUERY_SERVICE,
     JOB_SERVICE,
     LIB_OPEN_SERVICE,
@@ -4920,6 +4935,17 @@ def _item_command_engine() -> ItemCommandService:
     return commands
 
 
+def _item_lifecycle_engine() -> ItemLifecycleService:
+    lifecycle = _library_engine().get_service(ITEM_LIFECYCLE_SERVICE)
+    if lifecycle is None:
+        raise EngineError(
+            "the item lifecycle module is unavailable",
+            code="item_lifecycle_unavailable",
+            retryable=True,
+        )
+    return lifecycle
+
+
 def _representation_command_engine() -> RepresentationCommandService:
     commands = _library_engine().get_service(REPRESENTATION_COMMAND_SERVICE)
     if commands is None:
@@ -5358,6 +5384,111 @@ def _item_json_response(
     return response.make_conditional(request)
 
 
+def _item_lifecycle_revision_token(value: str) -> bool:
+    """Return whether *value* is safe as an opaque lifecycle validator."""
+
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 512
+        and value == value.strip()
+        and '"' not in value
+        and "\\" not in value
+        and all(
+            ord(character) > 32
+            and ord(character) != 127
+            and not 0xD800 <= ord(character) <= 0xDFFF
+            for character in value
+        )
+    )
+
+
+def _item_lifecycle_match(
+    header: str,
+    *,
+    required_code: str,
+    invalid_code: str,
+    details: Mapping,
+) -> str:
+    """Read exactly one strong, quoted lifecycle revision header."""
+
+    raw = request.headers.get(header)
+    error_details = {"header": header, **dict(details)}
+    if raw is None or raw == "":
+        raise EnginePreconditionRequiredError(
+            f"{header} is required",
+            code=required_code,
+            details=error_details,
+        )
+    value = raw.strip()
+    token = value[1:-1] if len(value) >= 2 else ""
+    if (
+        raw != value
+        or value.startswith("W/")
+        or len(value) < 3
+        or value[0] != '"'
+        or value[-1] != '"'
+        or not _item_lifecycle_revision_token(token)
+    ):
+        raise EngineValidationError(
+            f"{header} must contain one strong quoted revision",
+            code=invalid_code,
+            details=error_details,
+        )
+    return token
+
+
+def _item_lifecycle_require_empty_body() -> None:
+    """Lifecycle commands are header-only so their replay identity is exact."""
+
+    content_length = request.content_length
+    has_transfer_encoding = bool(request.headers.get("Transfer-Encoding"))
+    has_unframed_data = (
+        content_length in (None, 0)
+        and not has_transfer_encoding
+        and bool(request.get_data(cache=False))
+    )
+    if (
+        content_length not in (None, 0)
+        or has_transfer_encoding
+        or has_unframed_data
+    ):
+        raise EngineValidationError(
+            "item lifecycle commands do not accept a request body",
+            code="item_lifecycle_body_not_allowed",
+        )
+
+
+def _item_lifecycle_receipt_response(result):
+    receipt = result.receipt
+    response = jsonify({
+        "ok": True,
+        "schema": "librarytool.item-lifecycle-receipt/1",
+        **result.as_dict(),
+    })
+    response.cache_control.no_store = True
+    response.headers["X-Record-Revision"] = (
+        receipt.restored_item_revision
+        if receipt.action == "restore"
+        else receipt.deleted_item_revision
+    )
+    response.headers["X-Managed-Tree-Revision"] = (
+        receipt.managed_tree_revision
+    )
+    response.headers["X-Tombstone-Revision"] = receipt.tombstone.revision
+    if receipt.action == "restore":
+        response.headers["Location"] = url_for(
+            "api_v1_item", item_id=receipt.item_id
+        )
+        status = 200 if result.replayed else 201
+    else:
+        response.headers["Location"] = url_for(
+            "api_v1_item_tombstone",
+            tombstone_id=receipt.tombstone.tombstone_id,
+        )
+        status = 200
+    return response, status
+
+
 def _project_build_compatibility(items: list[dict]) -> None:
     """Attach the old build shape only for the transitional web workbench.
 
@@ -5426,6 +5557,33 @@ def api_v1_item(item_id: str):
     return response
 
 
+@app.route("/api/v1/items/<item_id>/lifecycle")
+def api_v1_item_lifecycle(item_id: str):
+    """Expose one coherent dual-CAS preflight for recoverable deletion."""
+
+    try:
+        state = _item_lifecycle_engine().inspect(item_id)
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    item_revision = state.item.revision
+    managed_tree_revision = state.managed_tree.revision
+    revision = _item_response_revision("il", state.as_dict())
+    response = jsonify({
+        "ok": True,
+        "schema": "librarytool.item-lifecycle-state/1",
+        "state": "live",
+        "item_id": state.item.item_id,
+        "item_revision": item_revision,
+        "managed_tree_revision": managed_tree_revision,
+        "revision": revision,
+    })
+    response.set_etag(revision)
+    response.headers["X-Record-Revision"] = item_revision
+    response.headers["X-Managed-Tree-Revision"] = managed_tree_revision
+    response.cache_control.no_cache = True
+    return response.make_conditional(request)
+
+
 @app.route("/api/v1/items/<item_id>", methods=["PATCH"])
 def api_v1_item_update(item_id: str):
     """Patch portable catalogue metadata under idempotency and item CAS."""
@@ -5442,6 +5600,121 @@ def api_v1_item_update(item_id: str):
     except EngineError as exc:
         return _engine_error_response(exc)
     return _item_command_response(result)
+
+
+@app.route("/api/v1/items/<item_id>", methods=["DELETE"])
+def api_v1_item_delete(item_id: str):
+    """Recoverably delete an item and its engine-managed tree under dual CAS."""
+
+    try:
+        lifecycle = _item_lifecycle_engine()
+        _item_lifecycle_require_empty_body()
+        operation_id = _item_command_operation_id(item_id=item_id)
+        item_revision = _item_lifecycle_match(
+            "If-Record-Match",
+            required_code="item_revision_required",
+            invalid_code="invalid_item_revision",
+            details={"item_id": item_id},
+        )
+        managed_tree_revision = _item_lifecycle_match(
+            "If-Managed-Tree-Match",
+            required_code="managed_tree_revision_required",
+            invalid_code="invalid_managed_tree_revision",
+            details={"item_id": item_id},
+        )
+        result = lifecycle.delete(LifecycleDeleteItemCommand(
+            item_id=item_id,
+            expected_item_revision=item_revision,
+            expected_managed_tree_revision=managed_tree_revision,
+            operation_id=operation_id,
+        ))
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    return _item_lifecycle_receipt_response(result)
+
+
+@app.route("/api/v1/item-tombstones")
+def api_v1_item_tombstones():
+    """List transport-safe lifecycle tombstones in engine order."""
+
+    try:
+        lifecycle = _item_lifecycle_engine()
+        state_values = request.args.getlist("state")
+        unknown_filters = sorted(set(request.args) - {"state"})
+        if (
+            len(state_values) > 1
+            or unknown_filters
+            or (state_values and state_values[0] not in {"deleted", "restored"})
+        ):
+            raise EngineValidationError(
+                "the item tombstone filter is invalid",
+                code="invalid_item_tombstone_filter",
+                details={
+                    "state": state_values,
+                    "unknown": unknown_filters,
+                },
+            )
+        wanted_state = state_values[0] if state_values else ""
+        tombstones = [
+            tombstone.as_dict()
+            for tombstone in lifecycle.list_tombstones()
+            if not wanted_state or tombstone.state == wanted_state
+        ]
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    response = jsonify({
+        "ok": True,
+        "schema": "librarytool.item-tombstone-list/1",
+        "tombstones": tombstones,
+    })
+    response.cache_control.no_cache = True
+    return response
+
+
+@app.route("/api/v1/item-tombstones/<tombstone_id>")
+def api_v1_item_tombstone(tombstone_id: str):
+    """Read one public tombstone without its private recovery envelope."""
+
+    try:
+        tombstone = _item_lifecycle_engine().get_tombstone(tombstone_id)
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    response = jsonify({
+        "ok": True,
+        "schema": "librarytool.item-tombstone/1",
+        "tombstone": tombstone.as_dict(),
+    })
+    response.set_etag(tombstone.revision)
+    response.headers["X-Tombstone-Revision"] = tombstone.revision
+    response.cache_control.no_cache = True
+    return response.make_conditional(request)
+
+
+@app.route(
+    "/api/v1/item-tombstones/<tombstone_id>/restore",
+    methods=["POST"],
+)
+def api_v1_item_tombstone_restore(tombstone_id: str):
+    """Restore a deleted aggregate under tombstone CAS and idempotency."""
+
+    try:
+        lifecycle = _item_lifecycle_engine()
+        _item_lifecycle_require_empty_body()
+        operation_id = _item_command_operation_id()
+        tombstone_revision = _item_lifecycle_match(
+            "If-Tombstone-Match",
+            required_code="tombstone_revision_required",
+            invalid_code="invalid_tombstone_revision",
+            details={"tombstone_id": tombstone_id},
+        )
+        result = lifecycle.restore(RestoreItemCommand(
+            tombstone_id=tombstone_id,
+            expected_tombstone_revision=tombstone_revision,
+            operation_id=operation_id,
+        ))
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    return _item_lifecycle_receipt_response(result)
 
 
 @app.route("/api/v1/items/<item_id>/representations")
