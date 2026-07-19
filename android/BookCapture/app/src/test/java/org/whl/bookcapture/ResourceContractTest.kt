@@ -92,7 +92,7 @@ class ResourceContractTest {
         val expected = mapOf(
             "src/main/res/layout/activity_home.xml" to
                 listOf(
-                    "btnSelect", "btnSettings", "deleteSelected", "cancelSelection",
+                    "btnSelect", "deleteSelected", "cancelSelection",
                     "tabScans", "tabCollections",
                 ),
             "src/main/res/layout/item_collection.xml" to
@@ -145,6 +145,32 @@ class ResourceContractTest {
         val session = File("src/main/java/org/whl/bookcapture/CaptureSession.kt").readText()
         assertTrue(session.contains("fun start(collection: BookCollection): String"))
         assertFalse(session.contains("fun start(): String"))
+    }
+
+    /**
+     * Home's chrome is the app mark plus the two tabs. Settings moved into a
+     * menu behind the mark, so Home must carry no gear of its own — the capture
+     * screen keeps its own, which is why this checks the file and not the app.
+     */
+    @Test
+    fun homeReachesSettingsThroughTheAppMarkNotAGear() {
+        val home = xml("src/main/res/layout/activity_home.xml")
+        assertNotNull(elementById(home, "appMenu"))
+        assertFalse(hasElementWithId(home, "btnSettings"))
+        assertFalse(
+            "the wordmark and the separate tab strip were folded into the toolbar",
+            hasElementWithId(home, "tabBar"),
+        )
+
+        val menu = xml("src/main/res/menu/home_app_menu.xml")
+        for (id in listOf("menuSettings", "menuAbout", "menuCheckUpdates")) {
+            assertNotNull("app menu is missing $id", elementById(menu, id))
+        }
+
+        val source = File("src/main/java/org/whl/bookcapture/HomeActivity.kt").readText()
+        assertTrue(source.contains("binding.appMenu.setOnClickListener { showAppMenu() }"))
+        assertTrue(source.contains("R.id.menuSettings ->"))
+        assertTrue(source.contains("SettingsActivity::class.java"))
     }
 
     @Test

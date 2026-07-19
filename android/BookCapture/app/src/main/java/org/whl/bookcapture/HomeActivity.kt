@@ -65,9 +65,7 @@ class HomeActivity : AppCompatActivity() {
             }
             startActivity(Intent(this, MainActivity::class.java))
         }
-        binding.btnSettings.setOnClickListener {
-            startActivity(Intent(this, SettingsActivity::class.java))
-        }
+        binding.appMenu.setOnClickListener { showAppMenu() }
         binding.configWarning.setOnClickListener {
             startActivity(Intent(this, LoginActivity::class.java))
         }
@@ -106,6 +104,76 @@ class HomeActivity : AppCompatActivity() {
         }
         ProcessWorker.enqueue(this)
         showTab(showingCollections)
+    }
+
+    // --- the app menu, hung off the mark in the toolbar ----------------------
+
+    private fun showAppMenu() {
+        val menu = androidx.appcompat.widget.PopupMenu(this, binding.appMenu)
+        menu.menuInflater.inflate(R.menu.home_app_menu, menu.menu)
+        menu.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                R.id.menuSettings -> {
+                    startActivity(Intent(this, SettingsActivity::class.java)); true
+                }
+                R.id.menuAbout -> { showAbout(); true }
+                R.id.menuCheckUpdates -> { checkForUpdates(); true }
+                else -> false
+            }
+        }
+        menu.show()
+    }
+
+    private fun showAbout() {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.about_title)
+            .setMessage(getString(R.string.about_body, BuildConfig.VERSION_NAME))
+            .setPositiveButton(R.string.about_close, null)
+            .show()
+    }
+
+    /**
+     * Reads the published releases and offers the newest build this one should
+     * see. Runs off the main thread; the result is discarded if the Activity has
+     * gone away, so a slow network can't resurrect a dialog on a dead window.
+     */
+    private fun checkForUpdates() {
+        Toast.makeText(this, R.string.update_checking, Toast.LENGTH_SHORT).show()
+        lifecycleScope.launch {
+            val outcome = withContext(Dispatchers.IO) {
+                runCatching { Updates.check(this@HomeActivity) }
+            }
+            fun say(message: String) =
+                Toast.makeText(this@HomeActivity, message, Toast.LENGTH_LONG).show()
+            when (val result = outcome.getOrNull()) {
+                null -> say(getString(R.string.update_failed))
+                Updates.Result.NotConfigured -> say(getString(R.string.update_not_configured))
+                Updates.Result.UpToDate ->
+                    say(getString(R.string.update_current, BuildConfig.VERSION_NAME))
+                is Updates.Result.Available -> AlertDialog.Builder(this@HomeActivity)
+                    .setTitle(R.string.update_available_title)
+                    .setMessage(getString(
+                        R.string.update_available_body,
+                        result.release.version, BuildConfig.VERSION_NAME))
+                    .setNegativeButton(android.R.string.cancel, null)
+                    .setPositiveButton(R.string.update_download) { _, _ ->
+                        openDownload(result.release)
+                    }
+                    .show()
+            }
+        }
+    }
+
+    /** Hand the APK URL to the browser rather than downloading it in-app: an
+     *  in-app installer would need REQUEST_INSTALL_PACKAGES, which this app has
+     *  no other reason to hold. */
+    private fun openDownload(update: Release) {
+        val intent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(update.url))
+        try {
+            startActivity(intent)
+        } catch (_: android.content.ActivityNotFoundException) {
+            Toast.makeText(this, R.string.update_no_browser, Toast.LENGTH_LONG).show()
+        }
     }
 
     // --- tabs ----------------------------------------------------------------

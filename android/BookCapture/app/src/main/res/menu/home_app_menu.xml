@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Hangs off the app mark at the head of the toolbar; there is no gear. -->
+<menu xmlns:android="http://schemas.android.com/apk/res/android">
+    <item
+        android:id="@+id/menuSettings"
+        android:title="@string/menu_settings" />
+    <item
+        android:id="@+id/menuAbout"
+        android:title="@string/menu_about" />
+    <item
+        android:id="@+id/menuCheckUpdates"
+        android:title="@string/menu_check_updates" />
+</menu>
