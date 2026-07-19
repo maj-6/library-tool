@@ -50,9 +50,10 @@ def _install_inline_worker(monkeypatch) -> list[dict]:
             )
         with server._ocr_jobs_lock:
             server._ocr_jobs[job["id"]] = job
-        server._job_track(
-            job, str(job.get("kind") or "ocr"),
-            label=server._job_book_label(job["build_id"]),
+        server._job_track_item_guarded(
+            job,
+            str(job.get("kind") or "ocr"),
+            job["build_id"],
         )
         server._ocr_job_run(job["id"])
         return True
@@ -300,9 +301,18 @@ def test_detection_job_honors_generic_cooperative_cancellation(
         _cleanup(started)
 
 
-def test_guarded_worker_registration_preserves_semantic_job_kind(monkeypatch):
+def test_guarded_worker_registration_preserves_semantic_job_kind(
+        tmp_path, monkeypatch):
     tracked: list[str] = []
     started: list[tuple] = []
+    builds_path = tmp_path / "builds.json"
+    builds_path.write_text(json.dumps({
+        "missing-label-is-fine": {
+            "id": "missing-label-is-fine",
+            "title": "Semantic detection",
+        },
+    }), encoding="utf-8")
+    monkeypatch.setattr(server, "BUILDS_PATH", builds_path)
     job = {
         "id": "semantic-kind",
         "kind": "replica.detect-regions",
@@ -325,6 +335,7 @@ def test_guarded_worker_registration_preserves_semantic_job_kind(monkeypatch):
     try:
         assert server._ocr_job_start_guarded(job, 0) is True
         assert tracked == ["replica.detect-regions"]
+        assert job["subject"]["item_id"] == "missing-label-is-fine"
         assert started and started[0][1] == ("semantic-kind",)
     finally:
         with server._ocr_jobs_lock:

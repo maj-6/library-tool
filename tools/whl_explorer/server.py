@@ -7866,16 +7866,59 @@ def _job_public(job: dict) -> dict:
     return _job_manager.public(job)
 
 
-def _job_book_label(bid: str) -> str:
-    b = lib.load_json(BUILDS_PATH, {}).get(str(bid or "")) or {}
-    return str(b.get("title") or "").strip() or str(bid or "")
+class _ItemJobStartRejected(Exception):
+    """The catalogue item disappeared before its worker was registered."""
 
 
 def _job_track(job: dict, kind: str, label: str = "") -> threading.Event:
     """Enter a per-kind job dict into the unified registry (shared dict) and
-    return its cancellation event. Insertion prunes the oldest finished
-    entries beyond _JOBS_KEEP and persists the snapshot."""
+    return its cancellation event. This is the low-level compatibility seam;
+    production item-scoped starts must use ``_job_track_item_guarded`` so item
+    deletion and worker registration share one outer gate. Insertion prunes
+    the oldest finished entries beyond _JOBS_KEEP and persists the snapshot."""
     return _job_manager.track(job, kind, label=label)
+
+
+def _job_track_item_guarded(
+        job: dict, kind: str, item_id: str,
+        label: str = "") -> threading.Event:
+    """Register one item worker atomically against lifecycle deletion.
+
+    The order is deliberately page/lifecycle gate -> catalogue -> JobManager.
+    Lifecycle deletion takes the same outer gate before reserving the item in
+    the JobManager, so either the worker becomes visible to its active-job
+    guard or deletion wins and this late start is refused.  The catalogue lock
+    stays held through registration as a compatibility backstop for the old
+    catalogue-only delete route, which does not yet take the outer gate.
+
+    Callers may already hold ``_page_structure_lock`` (it is reentrant), but
+    must not hold the non-reentrant ``_builds_lock``.
+    """
+    item_id = str(item_id or "").strip()
+    if not item_id:
+        raise _ItemJobStartRejected("an item-scoped job needs an item id")
+    with _page_structure_lock:
+        with _builds_lock:
+            builds = lib.load_json(BUILDS_PATH, {})
+            item = builds.get(item_id) if isinstance(builds, dict) else None
+            if not isinstance(item, dict):
+                raise _ItemJobStartRejected(
+                    "the item disappeared before the job could start"
+                )
+            job["build_id"] = item_id
+            raw_subject = job.get("subject")
+            subject = dict(raw_subject) if isinstance(raw_subject, Mapping) else {}
+            subject["item_id"] = item_id
+            job["subject"] = subject
+            resolved_label = (
+                str(label or "").strip()
+                or str(item.get("title") or "").strip()
+                or item_id
+            )
+            # Keep both locks until JobManager.track has made the active job
+            # observable. Releasing either one first recreates a delete/start
+            # time-of-check/time-of-use window.
+            return _job_track(job, kind, label=resolved_label)
 
 
 def _job_transition_locked(job: dict, status: str, **fields) -> None:
@@ -9503,11 +9546,21 @@ def _reserve_page_deletion(build_id: str, pdf: Path,
 
 def _ocr_job_start_guarded(job: dict, source_revision: int,
                            record_source: bool = False) -> bool:
-    """Register/start OCR atomically against page deletion."""
+    """Register/start OCR atomically against item and page deletion."""
     build_id = str(job.get("build_id") or "")
     with _page_structure_lock:
         if _page_structure_revision.get(build_id, 0) != source_revision:
             return False
+        # Region detection records its document/source binding before the
+        # unified registration below. Confirm the item under the catalogue
+        # lock first so a start that waited behind lifecycle deletion cannot
+        # recreate files for an item that is already gone. The final guarded
+        # registration rechecks the same fact after this collateral write.
+        with _builds_lock:
+            builds = lib.load_json(BUILDS_PATH, {})
+            if not isinstance(builds, dict) or not isinstance(
+                    builds.get(build_id), dict):
+                return False
         if record_source:
             _ocr_set_source(build_id, _ocr_name(job.get("target") or "compiled.txt"),
                             job.get("src_key") or "primary")
@@ -9517,10 +9570,14 @@ def _ocr_job_start_guarded(job: dict, source_revision: int,
         # ``replica.detect-regions``) while legacy OCR batches continue to
         # default to ``ocr``.  The generic jobs API and future workbenches must
         # not need to infer the producer from mutable OCR implementation data.
-        _job_track(
-            job, str(job.get("kind") or "ocr"),
-            label=_job_book_label(build_id),
-        )
+        try:
+            _job_track_item_guarded(
+                job, str(job.get("kind") or "ocr"), build_id,
+            )
+        except _ItemJobStartRejected:
+            with _ocr_jobs_lock:
+                _ocr_jobs.pop(job["id"], None)
+            return False
         threading.Thread(target=_ocr_job_run, args=(job["id"],),
                          daemon=True).start()
         return True
@@ -12643,7 +12700,8 @@ def _ss_selected_pdf(source: Path, pages: list[int]) -> Path:
 
 def _ss_request_spec(payload: dict) -> tuple[dict | None, tuple[dict, int] | None]:
     target = str(payload.get("target") or "").strip()
-    if not _ss_target_kind(target) or ":" not in target:
+    _target_kind, separator, target_id = target.partition(":")
+    if not _ss_target_kind(target) or not separator or not target_id:
         return None, ({"ok": False, "error": "bad target"}, 400)
     raw_pdf = str(payload.get("pdf") or "").strip()
     url = str(payload.get("url") or "").strip()
@@ -12662,12 +12720,27 @@ def _ss_request_spec(payload: dict) -> tuple[dict | None, tuple[dict, int] | Non
 
 
 def _ss_job_new(target: str, label: str, volume: str = "") -> dict:
+    target_kind, _, target_id = str(target or "").partition(":")
+    if target_kind == "build" and not target_id:
+        raise _ItemJobStartRejected("a build Smart Scan needs an item id")
+    build_id = target_id if target_kind == "build" else ""
     job = {"id": lib.gen_id(set(_ss_jobs) | set(_jobs)), "target": target,
            "kind": "smartscan", "done": 0, "total": 0, "errors": 0,
            "status": "running", "error": "", "note": "", "volume": volume}
+    if build_id:
+        job["build_id"] = build_id
+        job["subject"] = {"item_id": build_id}
     with _ss_jobs_lock:
         _ss_jobs[job["id"]] = job
-    _job_track(job, "smartscan", label=label)
+    try:
+        if build_id:
+            _job_track_item_guarded(job, "smartscan", build_id, label=label)
+        else:
+            _job_track(job, "smartscan", label=label)
+    except _ItemJobStartRejected:
+        with _ss_jobs_lock:
+            _ss_jobs.pop(job["id"], None)
+        raise
     return job
 
 
@@ -12874,8 +12947,12 @@ def api_process_smartscan_run():
                 if (j.get("kind") == "smartscan" and j.get("target") == target
                         and j.get("state") in _JOB_ACTIVE):
                     return jsonify({"ok": True, "already": True, "job": _job_public(j)})
-        job = _ss_job_start(target, label, spec["volume"],
-                            lambda jb: _ss_run(jb, spec))
+        try:
+            job = _ss_job_start(target, label, spec["volume"],
+                                lambda jb: _ss_run(jb, spec))
+        except _ItemJobStartRejected:
+            return jsonify({"ok": False, "error":
+                            "that entry changed before Smart Scan could start"}), 409
     return jsonify({"ok": True, "job": dict(job)})
 
 
@@ -13223,7 +13300,12 @@ def _an_job_new(bid: str, kind: str, total: int) -> dict:
            "status": "running", "error": "", "note": ""}
     with _an_jobs_lock:
         _an_jobs[job["id"]] = job
-    _job_track(job, kind, label=_job_book_label(bid))
+    try:
+        _job_track_item_guarded(job, kind, bid)
+    except _ItemJobStartRejected as exc:
+        with _an_jobs_lock:
+            _an_jobs.pop(job["id"], None)
+        raise _AnalyzeSourceChanged() from exc
     return job
 
 
@@ -13527,7 +13609,11 @@ def api_analyze_about():
         except Exception as exc:
             _an_finish(job, f"{type(exc).__name__}: {exc}")
 
-    job = _an_job_start(bid, "about", 1, run)
+    try:
+        job = _an_job_start(bid, "about", 1, run)
+    except _AnalyzeSourceChanged:
+        return jsonify({"ok": False, "error":
+                        "the item changed before analysis could start"}), 409
     return jsonify({"ok": True, "job": job["id"]})
 
 
@@ -14745,7 +14831,13 @@ def api_volumes_publish():
                         error="", url="", slug="", note="", job="")
     job = {"id": lib.gen_id(set(_jobs)), "build_id": bid, "kind": "publish",
            "status": "running"}
-    _job_track(job, "publish", label=_job_book_label(bid))
+    try:
+        _job_track_item_guarded(job, "publish", bid)
+    except _ItemJobStartRejected:
+        with _publish_lock:
+            _publish["running"] = False
+            _publish["error"] = "the item changed before publishing could start"
+        return jsonify({"ok": False, "error": _publish["error"]}), 409
     with _publish_lock:
         _publish["job"] = job["id"]
     threading.Thread(target=_publish_run, args=(bid, _actor(), job),
@@ -15790,7 +15882,11 @@ def api_knowledge_eval_run():
             log.error("eval run failed for %s", bid, exc_info=exc)
             _an_finish(job, f"{type(exc).__name__}: {exc}")
 
-    job = _an_job_start(bid, "eval-run", len(queries), run)
+    try:
+        job = _an_job_start(bid, "eval-run", len(queries), run)
+    except _AnalyzeSourceChanged:
+        return jsonify({"ok": False, "error":
+                        "the item changed before evaluation could start"}), 409
     return jsonify({"ok": True, "job": job["id"]})
 
 

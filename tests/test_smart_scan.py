@@ -115,8 +115,13 @@ def test_smart_scan_extracts_and_stages_an_alternative(client, data_root,
     assert job["status"] == "done" and job["state"] == "done"
     assert job["done"] == job["total"]
     assert job["volume"] == "IV"
+    assert job["build_id"] == bid
+    assert job["subject"]["item_id"] == bid
     unified = client.get("/api/jobs").get_json()["jobs"]
-    assert next(j for j in unified if j["id"] == job["id"])["volume"] == "IV"
+    unified_job = next(j for j in unified if j["id"] == job["id"])
+    assert unified_job["volume"] == "IV"
+    assert unified_job["build_id"] == bid
+    assert unified_job["subject"]["item_id"] == bid
 
     # early stop: once a title-page signal AND a copyright signal are in hand
     # (pages 2 and 3), pages 4-5 are never OCRed
@@ -456,12 +461,30 @@ def test_smart_scan_validation(client, data_root, monkeypatch):
     assert client.post("/api/process/smartscan/run", json={
         "target": "bogus:1", "pdf": pdf}).status_code == 400
     assert client.post("/api/process/smartscan/run", json={
+        "target": "build:", "pdf": pdf}).status_code == 400
+    assert client.post("/api/process/smartscan/run", json={
         "target": f"build:{bid}"}).status_code == 400            # no pdf/url
     assert client.post("/api/process/smartscan/run", json={
         "target": f"build:{bid}", "pdf": "missing.pdf"}).status_code == 404
     assert client.post("/api/process/smartscan/run", json={
         "target": f"build:{bid}", "url": "ftp://x/y.pdf"}).status_code == 400
     assert client.get("/api/process/smartscan/job/nope").status_code == 404
+
+
+def test_smart_scan_build_start_revalidates_the_catalogue(
+        client, data_root):
+    pdf = _dummy_pdf(data_root, "vanished-build.pdf")
+    before_unified = set(server._jobs)
+    before_specific = set(server._ss_jobs)
+
+    response = client.post("/api/process/smartscan/run", json={
+        "target": "build:vanished-build",
+        "pdf": pdf,
+    })
+
+    assert response.status_code == 409
+    assert set(server._jobs) == before_unified
+    assert set(server._ss_jobs) == before_specific
 
 
 def test_smart_scan_empty_extraction_fails_the_job(client, data_root,
