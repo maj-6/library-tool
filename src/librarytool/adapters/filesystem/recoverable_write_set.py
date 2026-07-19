@@ -655,6 +655,8 @@ class RecoverableWriteTransaction:
     def stage_write(self, target: str | Path, payload: bytes) -> None:
         """Stage the final bytes for one relative file target."""
         self._ensure_stageable()
+        if not isinstance(payload, (bytes, bytearray, memoryview)):
+            raise TypeError("write-set payload must be bytes-like")
         path = self._owner._target(target)
         relative = path.relative_to(self._owner.root).as_posix()
         self._operations[relative] = _StagedOperation(relative, bytes(payload))

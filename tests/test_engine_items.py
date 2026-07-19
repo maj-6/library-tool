@@ -583,3 +583,13 @@ def test_adapter_rejects_mapping_key_and_embedded_identity_conflicts():
         service.list_items()
 
     assert caught.value.code == "item_identity_conflict"
+
+
+def test_mapping_repository_key_supplies_an_explicitly_blank_record_id():
+    service = ItemQueryService(
+        FilesystemItemQueryRepository(
+            lambda: {"repository-id": {"id": "", "title": "Keyed"}}
+        )
+    )
+
+    assert service.list_items()[0].item_id == "repository-id"

@@ -88,6 +88,10 @@ class ImportWarning:
     location: str
     message: str
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.location, str) or not isinstance(self.message, str):
+            raise TypeError("import warning fields must be strings")
+
     def as_dict(self) -> dict[str, str]:
         return {"location": self.location, "message": self.message}
 
@@ -198,6 +202,8 @@ class LibTranslationImport:
     text: str
 
     def __post_init__(self) -> None:
+        if not isinstance(self.language, str) or not isinstance(self.text, str):
+            raise TypeError("translation language and text must be strings")
         if (
             isinstance(self.page, bool)
             or not isinstance(self.page, int)

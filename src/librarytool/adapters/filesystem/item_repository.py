@@ -153,7 +153,8 @@ class FilesystemItemQueryRepository:
                         },
                     )
                 item_id = embedded_id or key_id
-                record.setdefault("id", item_id)
+                if not embedded_id:
+                    record["id"] = item_id
                 rows.append((item_id, record))
             return tuple(rows)
         if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):

@@ -281,6 +281,19 @@ def test_interchange_records_reject_non_json_values(value):
 
 
 @pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: LibTranslationImport("fr", 1, 42),
+        lambda: LibTranslationImport(42, 1, "Bonjour"),
+        lambda: ImportWarning("book.json", {"not": "text"}),
+    ],
+)
+def test_interchange_text_contracts_reject_non_strings(factory):
+    with pytest.raises(TypeError):
+        factory()
+
+
+@pytest.mark.parametrize(
     ("reason", "factory"),
     [
         (

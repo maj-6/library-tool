@@ -418,3 +418,22 @@ def test_prepared_transaction_cannot_be_modified(tmp_path):
     with pytest.raises(WriteSetError) as raised:
         transaction.stage_write("two.txt", b"two")
     assert raised.value.code == "write_set_already_prepared"
+
+
+@pytest.mark.parametrize("payload", [10, True, "text", object()])
+def test_stage_write_rejects_non_bytes_coercions(tmp_path, payload):
+    transaction = RecoverableWriteSet(tmp_path).begin()
+
+    with pytest.raises(TypeError):
+        transaction.stage_write("payload.bin", payload)
+
+
+def test_stage_write_accepts_explicit_mutable_bytes_like_payloads(tmp_path):
+    transaction = RecoverableWriteSet(tmp_path).begin()
+    payload = bytearray(b"original")
+    transaction.stage_write("payload.bin", payload)
+    payload[:] = b"changed!"
+
+    transaction.commit()
+
+    assert (tmp_path / "payload.bin").read_bytes() == b"original"
