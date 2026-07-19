@@ -19,6 +19,19 @@ from .canvases import (
     CanvasSequenceView,
     CanvasView,
 )
+from .canvas_commands import (
+    CanvasPreparationItemSnapshot,
+    CanvasPreparationReceipt,
+    CanvasPreparationRepositoryPort,
+    CanvasPreparationRepresentationSnapshot,
+    CanvasPreparationResult,
+    CanvasPreparationSequenceSummary,
+    CanvasPreparationService,
+    CanvasPreparationSnapshot,
+    CanvasPreparationUnitOfWorkPort,
+    CanvasSourceIdentityBinding,
+    PrepareCanvasSequenceCommand,
+)
 from .errors import (
     ConflictError,
     EngineError,
@@ -124,6 +137,7 @@ from .representation_commands import (
     RepresentationRecordSnapshot,
 )
 from .runtime import (
+    CANVAS_PREPARATION_SERVICE,
     CANVAS_QUERY_SERVICE,
     INTERCHANGE_SERVICE,
     LIB_OPEN_SERVICE,
@@ -171,7 +185,18 @@ from .translations import (
 from .workbench_policies import standard_workbench_policies
 
 __all__ = [
+    "CANVAS_PREPARATION_SERVICE",
     "CANVAS_QUERY_SERVICE",
+    "CanvasPreparationItemSnapshot",
+    "CanvasPreparationReceipt",
+    "CanvasPreparationRepositoryPort",
+    "CanvasPreparationRepresentationSnapshot",
+    "CanvasPreparationResult",
+    "CanvasPreparationSequenceSummary",
+    "CanvasPreparationService",
+    "CanvasPreparationSnapshot",
+    "CanvasPreparationUnitOfWorkPort",
+    "CanvasSourceIdentityBinding",
     "CanvasExtent",
     "CanvasKey",
     "CanvasQueryRepositoryPort",
@@ -260,6 +285,7 @@ __all__ = [
     "ModuleManifest",
     "NotFoundError",
     "PreconditionRequiredError",
+    "PrepareCanvasSequenceCommand",
     "OpenLibCommand",
     "OpenLibDraftFactory",
     "OpenLibRepositoryPort",

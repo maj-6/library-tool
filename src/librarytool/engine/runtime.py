@@ -16,6 +16,7 @@ from .capabilities import (
     WorkbenchManifest,
 )
 from .canvases import CanvasQueryService
+from .canvas_commands import CanvasPreparationService
 from .interchange import LibInterchangeService, OpenLibService
 from .item_commands import ItemCommandService
 from .item_lifecycle import ItemLifecycleService
@@ -424,6 +425,9 @@ ITEM_QUERY_SERVICE: ServiceKey[ItemQueryService] = ServiceKey(
 CANVAS_QUERY_SERVICE: ServiceKey[CanvasQueryService] = ServiceKey(
     "library.canvases.query"
 )
+CANVAS_PREPARATION_SERVICE: ServiceKey[CanvasPreparationService] = ServiceKey(
+    "library.canvases.prepare"
+)
 ITEM_COMMAND_SERVICE: ServiceKey[ItemCommandService] = ServiceKey(
     "library.items.commands"
 )
@@ -617,6 +621,7 @@ class LibraryEngineBuilder:
 
 
 __all__ = [
+    "CANVAS_PREPARATION_SERVICE",
     "CANVAS_QUERY_SERVICE",
     "DuplicateServiceError",
     "INTERCHANGE_SERVICE",
