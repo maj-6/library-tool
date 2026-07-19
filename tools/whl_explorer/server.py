@@ -40,6 +40,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -73,6 +74,9 @@ from librarytool.adapters.lib_archive import (  # noqa: E402
 )
 from librarytool.adapters.filesystem.interchange_repository import (  # noqa: E402
     FilesystemInterchangeRepository,
+)
+from librarytool.adapters.filesystem.item_command_repository import (  # noqa: E402
+    FilesystemItemCommandRepository,
 )
 from librarytool.adapters.filesystem.translation_repository import (  # noqa: E402
     FilesystemTranslationRepository,
@@ -115,6 +119,14 @@ from librarytool.engine.jobs import (  # noqa: E402
     ACTIVE_JOB_STATES,
     PUBLIC_JOB_FIELDS,
     JobManager,
+)
+from librarytool.engine.item_commands import (  # noqa: E402
+    CreateItemCommand,
+    ItemCommandService,
+    ItemDraft,
+    ItemPatch,
+    ItemRecordSnapshot,
+    UpdateItemCommand,
 )
 from librarytool.engine.items import ItemQueryService  # noqa: E402
 from librarytool.engine.interchange import (  # noqa: E402
@@ -994,6 +1006,14 @@ _ENGINE_CAPABILITIES = CapabilityRegistry(
             provides=(CapabilityRef("library.jobs"),),
         ),
         ModuleManifest(
+            "library.catalogue.commands", "1.0.0",
+            provides=(
+                CapabilityRef("library.items.create"),
+                CapabilityRef("library.items.update"),
+            ),
+            requires=(CapabilityRef("library.items.read"),),
+        ),
+        ModuleManifest(
             "replica.core", "1.0.0",
             provides=(
                 CapabilityRef("replica.regions"),
@@ -1023,6 +1043,10 @@ _ENGINE_CAPABILITIES = CapabilityRegistry(
         WorkbenchManifest(
             "catalog", "1.0.0",
             requires=(CapabilityRef("library.items"),),
+            enhances=(
+                CapabilityRef("library.items.create"),
+                CapabilityRef("library.items.update"),
+            ),
         ),
         WorkbenchManifest(
             "replica", "1.0.0",
@@ -2902,6 +2926,250 @@ _ENGINE_ITEM_LOCAL_FIELDS = frozenset({
     "pdf_file", "pdf_sources", "images", "extra",
 })
 
+# The first command slice deliberately controls catalogue metadata only.
+# Attachments and job-owned state remain hidden in the transitional record and
+# are copied byte-for-byte by the codec; future representation commands will
+# receive their own aggregate and concurrency boundary.
+_ENGINE_ITEM_COMMAND_MANAGED_FIELDS = frozenset({
+    "id", "item_id", "kind", "title", "created_at", "updated_at",
+    "revision", "representations", "artifacts", "relevance", "capture_id",
+    "published_slug", "ocr_active", "ocr_verified", "ocr_quality",
+    "title_pages", "thumbnail_source", "status",
+}) | _ENGINE_ITEM_LOCAL_FIELDS
+_ENGINE_ITEM_COMMAND_MANAGED_STRING_FIELDS = frozenset({
+    "published_slug", "ocr_active", "ocr_verified", "ocr_quality",
+    "title_pages", "thumbnail_source",
+})
+_ENGINE_ITEM_COMMAND_STRING_FIELDS = (
+    frozenset(_BUILD_FIELDS)
+    - frozenset(_BUILD_STRUCTURED_FIELDS)
+    - _ENGINE_ITEM_COMMAND_MANAGED_FIELDS
+    - {"title"}
+)
+_ENGINE_ITEM_CATEGORY_ID = re.compile(r"^\w{1,12}$")
+_ENGINE_ITEM_CAPTURE_ID = re.compile(r"^[A-Za-z0-9-]{0,64}$")
+_ENGINE_ITEM_LANGUAGE_ID = re.compile(r"^[a-z-]{1,12}$")
+_ENGINE_ITEM_RECORD_REVISION = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,511}$")
+
+
+def _engine_valid_record_revision(value) -> bool:
+    return isinstance(value, str) and bool(
+        _ENGINE_ITEM_RECORD_REVISION.fullmatch(value))
+
+
+def _engine_build_record_revision(item_id: str, raw: Mapping) -> str:
+    """Return the command/read-model CAS token without entry-folder reads."""
+    updated_at = raw.get("updated_at")
+    if _engine_valid_record_revision(updated_at):
+        return updated_at
+    canonical = json.dumps(
+        {"item_id": item_id, "record": raw},
+        ensure_ascii=False, allow_nan=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "ir-" + hashlib.sha256(canonical).hexdigest()[:24]
+
+
+def _engine_validate_bundle(value) -> None:
+    if not isinstance(value, Mapping):
+        raise TypeError("bundle must be an object")
+    allowed = {"about", "annotations", "pages_text", "translations"}
+    if not set(value) <= allowed:
+        raise ValueError("bundle contains unknown fields")
+    for field in ("about", "annotations", "pages_text"):
+        if field in value and not isinstance(value[field], bool):
+            raise TypeError(f"bundle.{field} must be a boolean")
+    if "translations" in value:
+        translations = value["translations"]
+        if not isinstance(translations, (list, tuple)):
+            raise TypeError("bundle.translations must be an array")
+        if (
+            any(not isinstance(item, str)
+                or not _ENGINE_ITEM_LANGUAGE_ID.fullmatch(item)
+                for item in translations)
+            or len(translations) != len(set(translations))
+        ):
+            raise ValueError("bundle.translations is invalid")
+
+
+def _engine_validate_catalogue_metadata(
+        metadata: Mapping, *, strict_fields=frozenset()) -> None:
+    """Validate known legacy fields while retaining unknown JSON extensions."""
+    if not isinstance(metadata, Mapping):
+        raise TypeError("metadata must be an object")
+    for field in _ENGINE_ITEM_COMMAND_STRING_FIELDS:
+        if field in metadata and not isinstance(metadata[field], str):
+            raise TypeError(f"metadata.{field} must be a string")
+        if (field in metadata and field in strict_fields and metadata[field] !=
+                metadata[field].strip()):
+            raise ValueError(
+                f"metadata.{field} must not have outer whitespace")
+    if "status" in metadata and metadata["status"] not in _BUILD_STATUSES:
+        raise ValueError("metadata.status is invalid")
+    if "rights" in metadata and metadata["rights"] not in _BUILD_RIGHTS:
+        raise ValueError("metadata.rights is invalid")
+    if "category_ids" in metadata:
+        values = metadata["category_ids"]
+        if not isinstance(values, (list, tuple)):
+            raise TypeError("metadata.category_ids must be an array")
+        if (
+            any(not isinstance(value, str)
+                or not _ENGINE_ITEM_CATEGORY_ID.fullmatch(value)
+                for value in values)
+            or len(values) != len(set(values))
+        ):
+            raise ValueError("metadata.category_ids is invalid")
+        if "category_ids" in strict_fields:
+            try:
+                taxonomy = lib.load_taxonomy()
+            except Exception as exc:
+                raise EngineRepositoryError(
+                    "the category catalogue is unavailable",
+                    code="category_repository_unavailable",
+                    details={"cause_type": type(exc).__name__},
+                    retryable=True,
+                ) from exc
+            nodes = taxonomy.get("nodes") if isinstance(taxonomy, Mapping) else None
+            if not isinstance(nodes, Mapping):
+                raise EngineRepositoryError(
+                    "the category catalogue is unavailable",
+                    code="category_repository_unavailable",
+                    retryable=True,
+                )
+            if any(value not in nodes for value in values):
+                raise ValueError("metadata.category_ids contains unknown ids")
+    if "bundle" in metadata:
+        _engine_validate_bundle(metadata["bundle"])
+
+
+def _engine_validate_managed_build_fields(item_id: str, raw: Mapping) -> None:
+    embedded_id = raw.get("id")
+    if embedded_id is not None and (
+        not isinstance(embedded_id, str) or embedded_id != item_id
+    ):
+        raise ValueError("the embedded build id conflicts with its key")
+    if "item_id" in raw and raw["item_id"] != item_id:
+        raise ValueError("the embedded item id conflicts with its key")
+    if "kind" in raw and raw["kind"] != "book":
+        raise ValueError("the transitional catalogue supports only books")
+    if "status" in raw and raw["status"] not in _BUILD_STATUSES:
+        raise ValueError("build status is invalid")
+    if "title" in raw and not isinstance(raw["title"], str):
+        raise TypeError("build title must be a string")
+    if "created_at" in raw and not isinstance(raw["created_at"], str):
+        raise TypeError("build created_at must be a string")
+    if "updated_at" in raw and not isinstance(raw["updated_at"], str):
+        raise TypeError("build updated_at must be a string")
+    if "pdf_file" in raw and not isinstance(raw["pdf_file"], str):
+        raise TypeError("build pdf_file must be a string")
+    for field in _ENGINE_ITEM_COMMAND_MANAGED_STRING_FIELDS:
+        if field in raw and not isinstance(raw[field], str):
+            raise TypeError(f"build {field} must be a string")
+    if "pdf_sources" in raw:
+        sources = raw["pdf_sources"]
+        if not isinstance(sources, (list, tuple)):
+            raise TypeError("build pdf_sources must be an array")
+        for source in sources:
+            if not isinstance(source, Mapping):
+                raise TypeError("build pdf_sources must contain objects")
+            if (
+                not isinstance(source.get("id"), str)
+                or not isinstance(source.get("path"), str)
+            ):
+                raise TypeError("build PDF source ids and paths must be strings")
+    if "images" in raw and (
+        not isinstance(raw["images"], (list, tuple))
+        or any(not isinstance(value, str) for value in raw["images"])
+    ):
+        raise TypeError("build images must be an array of strings")
+    if "extra" in raw and not isinstance(raw["extra"], Mapping):
+        raise TypeError("build extra must be an object")
+    if "relevance" in raw and not isinstance(raw["relevance"], Mapping):
+        raise TypeError("build relevance must be an object")
+    if "capture_id" in raw and (
+        not isinstance(raw["capture_id"], str)
+        or not _ENGINE_ITEM_CAPTURE_ID.fullmatch(raw["capture_id"])
+    ):
+        raise ValueError("build capture_id is invalid")
+
+
+def _engine_item_command_decode(
+        item_id: str, raw: Mapping) -> ItemRecordSnapshot:
+    """Decode one legacy build into the catalogue-only command aggregate."""
+    if not isinstance(raw, Mapping):
+        raise TypeError("a build record must be an object")
+    _engine_validate_managed_build_fields(item_id, raw)
+    metadata = {
+        key: value for key, value in raw.items()
+        if key not in _ENGINE_ITEM_COMMAND_MANAGED_FIELDS
+    }
+    _engine_validate_catalogue_metadata(metadata)
+    return ItemRecordSnapshot(
+        item_id=item_id,
+        revision=_engine_build_record_revision(item_id, raw),
+        kind="book",
+        title=raw.get("title", ""),
+        metadata=metadata,
+        representations=(),
+    )
+
+
+def _engine_item_command_encode(
+        item_id: str, draft: ItemDraft,
+        previous: Mapping | None) -> Mapping:
+    """Encode a catalogue command while retaining server-managed raw state."""
+    if not isinstance(draft, ItemDraft):
+        raise TypeError("the item draft is invalid")
+    if draft.kind != "book" or draft.representations:
+        raise ValueError("only catalogue metadata for books is supported")
+    managed = sorted(set(draft.metadata) &
+                     _ENGINE_ITEM_COMMAND_MANAGED_FIELDS)
+    if managed:
+        raise ValueError("item metadata contains server-managed fields")
+    _engine_validate_catalogue_metadata(draft.metadata)
+
+    if previous is None:
+        if draft.title != draft.title.strip():
+            raise ValueError("item title must not have outer whitespace")
+        _engine_validate_catalogue_metadata(
+            draft.metadata, strict_fields=frozenset(draft.metadata))
+        now = _build_updated_at()
+        result = {
+            "id": item_id,
+            "title": draft.title,
+            "status": "draft",
+            "created_at": now,
+            "updated_at": now,
+        }
+    else:
+        if not isinstance(previous, Mapping):
+            raise TypeError("the previous build record is invalid")
+        _engine_validate_managed_build_fields(item_id, previous)
+        previous_metadata = {
+            key: value for key, value in previous.items()
+            if key not in _ENGINE_ITEM_COMMAND_MANAGED_FIELDS
+        }
+        if (draft.title != previous.get("title", "")
+                and draft.title != draft.title.strip()):
+            raise ValueError("item title must not have outer whitespace")
+        changed = frozenset(
+            key for key, value in draft.metadata.items()
+            if key not in previous_metadata
+            or previous_metadata[key] != value
+        )
+        _engine_validate_catalogue_metadata(
+            draft.metadata, strict_fields=changed)
+        result = dict(previous)
+        for key in tuple(result):
+            if key not in _ENGINE_ITEM_COMMAND_MANAGED_FIELDS:
+                del result[key]
+        result["id"] = item_id
+        result["title"] = draft.title
+        result["updated_at"] = _build_updated_at(previous.get("updated_at"))
+    result.update(dict(draft.metadata))
+    return result
+
 
 def _engine_representation_locator(item_id: str, source_id: str) -> str:
     """Opaque engine resource identity; never serialize an attached path."""
@@ -3091,13 +3359,13 @@ def _engine_item_snapshot() -> dict[str, dict]:
         build = dict(raw)
         metadata = {
             key: value for key, value in build.items()
-            if key not in _ENGINE_ITEM_LOCAL_FIELDS
-            and key not in {"id", "title", "updated_at"}
+            if key not in _ENGINE_ITEM_COMMAND_MANAGED_FIELDS
         }
         out[str(item_id)] = {
             "id": str(item_id),
             "kind": "book",
             "title": str(build.get("title") or ""),
+            "revision": _engine_build_record_revision(str(item_id), build),
             "updated_at": str(build.get("updated_at") or ""),
             "metadata": metadata,
             "representations": _engine_item_representations(str(item_id), build),
@@ -3571,9 +3839,24 @@ def _library_engine() -> LibraryEngine:
                     lock_context_for=_engine_workspace_locks,
                     recover=False,
                 )
+                item_command_repository = FilesystemItemCommandRepository(
+                    _engine_write_set,
+                    catalogue_path=BUILDS_PATH,
+                    decode_record=_engine_item_command_decode,
+                    encode_record=_engine_item_command_encode,
+                    allocate_item_id=lambda existing:
+                        lib.gen_id(set(existing)),
+                    # The adapter acquires the cross-process workspace lease
+                    # before entering this legacy in-process catalogue lock.
+                    lock_context_for=lambda: _builds_lock,
+                    # Shared startup recovery ran before any request/worker.
+                    recover=False,
+                )
                 _library_engine_instance = LibraryEngine(
                     capabilities=_ENGINE_CAPABILITIES,
                     items=items,
+                    item_commands=ItemCommandService(
+                        item_command_repository),
                     interchange=LibInterchangeService(
                         interchange_planner, interchange_repository
                     ),
@@ -3691,6 +3974,235 @@ def _item_engine() -> ItemQueryService:
             code="item_query_unavailable", retryable=True,
         )
     return items
+
+
+def _item_command_engine() -> ItemCommandService:
+    commands = _library_engine().item_commands
+    if commands is None:
+        raise EngineError(
+            "the item command module is unavailable",
+            code="item_command_unavailable", retryable=True,
+        )
+    return commands
+
+
+_ITEM_COMMAND_MAX_BYTES = 1024 * 1024
+
+
+def _item_command_json(envelope: str) -> Mapping:
+    """Read one bounded, duplicate-free canonical command envelope."""
+    length = request.content_length
+    if length is not None and length > _ITEM_COMMAND_MAX_BYTES:
+        raise EngineValidationError(
+            "the item mutation document is too large",
+            code="item_mutation_too_large",
+            details={"maximum_bytes": _ITEM_COMMAND_MAX_BYTES},
+        )
+    if request.mimetype != "application/json":
+        raise EngineValidationError(
+            "the item mutation must use application/json",
+            code="invalid_item_mutation_document",
+            details={"content_type": str(request.content_type or "")},
+        )
+    encoded = request.stream.read(_ITEM_COMMAND_MAX_BYTES + 1)
+    if len(encoded) > _ITEM_COMMAND_MAX_BYTES:
+        raise EngineValidationError(
+            "the item mutation document is too large",
+            code="item_mutation_too_large",
+            details={"maximum_bytes": _ITEM_COMMAND_MAX_BYTES},
+        )
+
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON object key")
+            value[key] = item
+        return value
+
+    try:
+        payload = json.loads(
+            encoded.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                ValueError("non-finite JSON number")),
+        )
+    except (RecursionError, UnicodeError, TypeError, ValueError) as exc:
+        raise EngineValidationError(
+            "the item mutation document is invalid JSON",
+            code="invalid_item_mutation_document",
+            details={"cause_type": type(exc).__name__},
+        ) from exc
+    if not isinstance(payload, Mapping) or set(payload) != {envelope}:
+        raise EngineValidationError(
+            f"the item mutation must contain exactly {envelope!r}",
+            code="invalid_item_mutation_envelope",
+            details={"field": envelope},
+        )
+    return payload[envelope]
+
+
+def _item_command_operation_id(*, item_id: str = "") -> str:
+    operation_id = request.headers.get("Idempotency-Key")
+    if operation_id is None or operation_id == "":
+        details = {"header": "Idempotency-Key"}
+        if item_id:
+            details["item_id"] = item_id
+        raise EnginePreconditionRequiredError(
+            "an idempotency key is required",
+            code="idempotency_key_required",
+            details=details,
+        )
+    return operation_id
+
+
+def _item_command_record_match(item_id: str) -> str:
+    raw = request.headers.get("If-Record-Match")
+    if raw is None or raw == "":
+        raise EnginePreconditionRequiredError(
+            "an item revision is required",
+            code="item_revision_required",
+            details={"header": "If-Record-Match", "item_id": item_id},
+        )
+    value = raw.strip()
+    if (
+        raw != value
+        or value.startswith("W/")
+        or len(value) < 3
+        or value[0] != '"'
+        or value[-1] != '"'
+        or "," in value
+        or not _engine_valid_record_revision(value[1:-1])
+    ):
+        raise EngineValidationError(
+            "If-Record-Match must contain one strong quoted item revision",
+            code="invalid_item_revision",
+            details={"header": "If-Record-Match", "item_id": item_id},
+        )
+    return value[1:-1]
+
+
+def _item_command_managed_fields(*values) -> None:
+    fields = sorted({
+        key for value in values for key in value
+        if key in _ENGINE_ITEM_COMMAND_MANAGED_FIELDS
+    })
+    if fields:
+        raise EngineValidationError(
+            "server-managed item fields cannot be changed here",
+            code="managed_item_fields_not_writable",
+            details={"fields": fields},
+        )
+
+
+def _item_command_draft() -> ItemDraft:
+    raw = _item_command_json("item")
+    if (
+        not isinstance(raw, Mapping)
+        or set(raw) != {"kind", "title", "metadata", "representations"}
+        or not isinstance(raw.get("kind"), str)
+        or not isinstance(raw.get("title"), str)
+        or not isinstance(raw.get("metadata"), Mapping)
+        or not isinstance(raw.get("representations"), list)
+    ):
+        raise EngineValidationError(
+            "the item draft does not match its canonical schema",
+            code="invalid_item_draft",
+        )
+    try:
+        draft = ItemDraft.from_dict(raw)
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise EngineValidationError(
+            "the item draft does not match its canonical schema",
+            code="invalid_item_draft",
+            details={"cause_type": type(exc).__name__},
+        ) from exc
+    if draft.kind != "book":
+        raise EngineValidationError(
+            "this catalogue supports book items only",
+            code="unsupported_item_kind",
+            details={"kind": draft.kind},
+        )
+    if draft.representations:
+        raise EngineValidationError(
+            "representation attachment is a separate operation",
+            code="representation_mutation_not_supported",
+        )
+    _item_command_managed_fields(draft.metadata)
+    try:
+        if draft.title != draft.title.strip():
+            raise ValueError("title has outer whitespace")
+        _engine_validate_catalogue_metadata(
+            draft.metadata, strict_fields=frozenset(draft.metadata))
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise EngineValidationError(
+            "the item metadata is invalid",
+            code="invalid_item_metadata",
+            details={"cause_type": type(exc).__name__},
+        ) from exc
+    return draft
+
+
+def _item_command_patch() -> ItemPatch:
+    raw = _item_command_json("patch")
+    fields = {"title", "metadata_set", "metadata_remove", "representations"}
+    if (
+        not isinstance(raw, Mapping)
+        or set(raw) != fields
+        or (raw.get("title") is not None
+            and not isinstance(raw.get("title"), str))
+        or not isinstance(raw.get("metadata_set"), Mapping)
+        or not isinstance(raw.get("metadata_remove"), list)
+    ):
+        raise EngineValidationError(
+            "the item patch does not match its canonical schema",
+            code="invalid_item_patch",
+        )
+    if raw.get("representations") is not None:
+        raise EngineValidationError(
+            "representation attachment is a separate operation",
+            code="representation_mutation_not_supported",
+        )
+    try:
+        patch = ItemPatch(
+            title=raw["title"],
+            metadata_set=raw["metadata_set"],
+            metadata_remove=tuple(raw["metadata_remove"]),
+            representations=None,
+        )
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise EngineValidationError(
+            "the item patch does not match its canonical schema",
+            code="invalid_item_patch",
+            details={"cause_type": type(exc).__name__},
+        ) from exc
+    _item_command_managed_fields(
+        patch.metadata_set, patch.metadata_remove)
+    try:
+        if patch.title is not None and patch.title != patch.title.strip():
+            raise ValueError("title has outer whitespace")
+        _engine_validate_catalogue_metadata(
+            patch.metadata_set,
+            strict_fields=frozenset(patch.metadata_set),
+        )
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise EngineValidationError(
+            "the item metadata patch is invalid",
+            code="invalid_item_metadata",
+            details={"cause_type": type(exc).__name__},
+        ) from exc
+    return patch
+
+
+def _item_command_response(result, *, created: bool = False):
+    response = jsonify({
+        "ok": True,
+        "schema": "librarytool.item-mutation-receipt/1",
+        **result.as_dict(),
+    })
+    response.headers["X-Record-Revision"] = result.receipt.after_revision
+    response.cache_control.no_store = True
+    return response, 201 if created and not result.replayed else 200
 
 
 def _translation_engine() -> TranslationService:
@@ -3835,6 +4347,19 @@ def api_v1_items():
     }, revision)
 
 
+@app.route("/api/v1/items", methods=["POST"])
+def api_v1_items_create():
+    """Create one catalogue-only book through the durable command engine."""
+    try:
+        operation_id = _item_command_operation_id()
+        draft = _item_command_draft()
+        result = _item_command_engine().create(
+            CreateItemCommand(draft=draft, operation_id=operation_id))
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    return _item_command_response(result, created=True)
+
+
 @app.route("/api/v1/items/<item_id>")
 def api_v1_item(item_id: str):
     try:
@@ -3848,9 +4373,29 @@ def api_v1_item(item_id: str):
         item["revision"] if not projection else
         _item_response_revision("ip", item)
     )
-    return _item_json_response({
+    response = _item_json_response({
         "ok": True, "schema": "librarytool.item/1", "item": item,
     }, revision)
+    response.headers["X-Record-Revision"] = item["record_revision"]
+    return response
+
+
+@app.route("/api/v1/items/<item_id>", methods=["PATCH"])
+def api_v1_item_update(item_id: str):
+    """Patch portable catalogue metadata under idempotency and item CAS."""
+    try:
+        operation_id = _item_command_operation_id(item_id=item_id)
+        expected_revision = _item_command_record_match(item_id)
+        patch = _item_command_patch()
+        result = _item_command_engine().update(UpdateItemCommand(
+            item_id=item_id,
+            expected_revision=expected_revision,
+            patch=patch,
+            operation_id=operation_id,
+        ))
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    return _item_command_response(result)
 
 
 @app.route("/api/v1/items/<item_id>/representations")

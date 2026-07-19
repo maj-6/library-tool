@@ -44,6 +44,14 @@
     return `"${revision}"`;
   }
 
+  function quoteRecordRevision(value, name) {
+    const revision = String(value || "");
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:+-]{0,511}$/.test(revision)) {
+      throw new TypeError(`${name} is not a valid record revision`);
+    }
+    return `"${revision}"`;
+  }
+
   function operationKey(value, name) {
     const key = String(value || "");
     if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(key)) {
@@ -117,6 +125,8 @@
       this.items = Object.freeze({
         list: (args) => this._itemsList(args),
         get: (args) => this._itemGet(args),
+        create: (args) => this._itemCreate(args),
+        update: (args) => this._itemUpdate(args),
         representations: (args) => this._itemRepresentations(args),
         artifacts: (args) => this._itemArtifacts(args),
         readiness: (args) => this._itemReadiness(args),
@@ -268,6 +278,30 @@
         query: {
           projection: includeBuildCompatibility ? "build-workbench" : undefined,
         },
+        signal,
+      });
+    }
+
+    _itemCreate({ item, idempotencyKey, signal } = {}) {
+      return this._requestJson("POST", "/v1/items", {
+        headers: {
+          "Idempotency-Key": operationKey(idempotencyKey, "idempotencyKey"),
+        },
+        body: { item },
+        signal,
+      });
+    }
+
+    _itemUpdate({ itemId, bookId, patch, recordRevision, idempotencyKey,
+      signal } = {}) {
+      const id = itemId != null ? itemId : bookId;
+      return this._requestJson("PATCH", `/v1/items/${encodePart(id)}`, {
+        headers: {
+          "Idempotency-Key": operationKey(idempotencyKey, "idempotencyKey"),
+          "If-Record-Match": quoteRecordRevision(
+            recordRevision, "recordRevision"),
+        },
+        body: { patch },
         signal,
       });
     }

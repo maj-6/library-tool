@@ -42,6 +42,8 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
   assert.equal(typeof client.jobs.events, "function");
   assert.equal(typeof client.items.list, "function");
   assert.equal(typeof client.items.get, "function");
+  assert.equal(typeof client.items.create, "function");
+  assert.equal(typeof client.items.update, "function");
   assert.equal(typeof client.items.representations, "function");
   assert.equal(typeof client.items.artifacts, "function");
   assert.equal(typeof client.items.readiness, "function");
@@ -136,6 +138,108 @@ test("item queries use versioned path-safe engine resources", async () => {
   assert.equal(calls[4].url,
     "/api/v1/items/book%20%2F%20one/readiness");
   assert.ok(calls.every(({ init }) => init.method === "GET"));
+});
+
+test("item commands use versioned idempotent JSON contracts", async () => {
+  const { client, calls } = harness({ ok: true, item: { id: "book-1" } });
+  const item = {
+    kind: "book",
+    title: "A Book",
+    metadata: {},
+    representations: [],
+  };
+  const patch = {
+    title: "A Revised Book",
+    metadata_set: { cataloguer: "Ada" },
+    metadata_remove: [],
+    representations: null,
+  };
+
+  await client.items.create({
+    item,
+    idempotencyKey: "item-create-1",
+  });
+  await client.items.update({
+    itemId: "book / one!*",
+    patch,
+    recordRevision: "ir-current",
+    idempotencyKey: "item-update-1",
+  });
+
+  assert.equal(calls[0].url, "/api/v1/items");
+  assert.equal(calls[0].init.method, "POST");
+  assert.deepEqual(calls[0].init.headers, {
+    Accept: "application/json",
+    "Idempotency-Key": "item-create-1",
+    "Content-Type": "application/json",
+  });
+  assert.deepEqual(JSON.parse(calls[0].init.body), { item });
+
+  assert.equal(calls[1].url, "/api/v1/items/book%20%2F%20one%21%2A");
+  assert.equal(calls[1].init.method, "PATCH");
+  assert.deepEqual(calls[1].init.headers, {
+    Accept: "application/json",
+    "Idempotency-Key": "item-update-1",
+    "If-Record-Match": '"ir-current"',
+    "Content-Type": "application/json",
+  });
+  assert.deepEqual(JSON.parse(calls[1].init.body), { patch });
+});
+
+test("item commands reject missing or unsafe preconditions locally", () => {
+  const { client, calls } = harness();
+  const item = {
+    kind: "book", title: "A Book", metadata: {}, representations: [],
+  };
+  const patch = {
+    title: "Revised", metadata_set: {}, metadata_remove: [],
+    representations: null,
+  };
+
+  assert.throws(
+    () => client.items.create({ item }),
+    (error) => error instanceof TypeError && /idempotencyKey/.test(error.message),
+  );
+  assert.throws(
+    () => client.items.create({ item, idempotencyKey: "unsafe/key" }),
+    (error) => error instanceof TypeError && /idempotencyKey/.test(error.message),
+  );
+  assert.throws(
+    () => client.items.update({
+      itemId: "book-1", patch, recordRevision: "ir-current",
+    }),
+    (error) => error instanceof TypeError && /idempotencyKey/.test(error.message),
+  );
+  assert.throws(
+    () => client.items.update({
+      itemId: "book-1", patch, recordRevision: "ir-current",
+      idempotencyKey: "unsafe/key",
+    }),
+    (error) => error instanceof TypeError && /idempotencyKey/.test(error.message),
+  );
+  assert.throws(
+    () => client.items.update({
+      itemId: "book-1", patch, idempotencyKey: "item-update-1",
+    }),
+    (error) => error instanceof TypeError && /recordRevision/.test(error.message),
+  );
+  assert.throws(
+    () => client.items.update({
+      itemId: "book-1", patch, recordRevision: 'W/"ir-current"',
+      idempotencyKey: "item-update-1",
+    }),
+    (error) => error instanceof TypeError && /recordRevision/.test(error.message),
+  );
+  for (const recordRevision of ["*", "ir current", "ir/current", `ir-${"x".repeat(512)}`]) {
+    assert.throws(
+      () => client.items.update({
+        itemId: "book-1", patch, recordRevision,
+        idempotencyKey: "item-update-1",
+      }),
+      (error) => error instanceof TypeError && /recordRevision/.test(error.message),
+    );
+  }
+  assert.equal(calls.length, 0);
 });
 
 test("translations use versioned aggregate reads and dual-CAS page writes", async () => {

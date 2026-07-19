@@ -54,6 +54,22 @@ from .items import (
     WorkbenchPolicyPort,
     WorkbenchState,
 )
+from .item_commands import (
+    CreateItemCommand,
+    DeleteItemCommand,
+    ItemCommandRepositoryPort,
+    ItemCommandResult,
+    ItemCommandService,
+    ItemCommandUnitOfWorkPort,
+    ItemDeletionSnapshot,
+    ItemDraft,
+    ItemMutationAction,
+    ItemMutationReceipt,
+    ItemPatch,
+    ItemRecordSnapshot,
+    RepresentationDraft,
+    UpdateItemCommand,
+)
 from .replica import ReplicaApplicationService
 from .runtime import LibraryEngine
 from .text_layers import TextLayerService
@@ -101,7 +117,17 @@ __all__ = [
     "ImportWarning",
     "InterchangeRepositoryPort",
     "InterchangeUnitOfWorkPort",
+    "ItemCommandRepositoryPort",
+    "ItemCommandResult",
+    "ItemCommandService",
+    "ItemCommandUnitOfWorkPort",
+    "ItemDeletionSnapshot",
+    "ItemDraft",
+    "ItemMutationAction",
+    "ItemMutationReceipt",
+    "ItemPatch",
     "ItemQueryService",
+    "ItemRecordSnapshot",
     "ItemView",
     "LibCompiledPageImport",
     "LibImportPlan",
@@ -119,6 +145,7 @@ __all__ = [
     "OpenLibCommand",
     "PUBLIC_JOB_FIELDS",
     "ReplicaApplicationService",
+    "RepresentationDraft",
     "RepositoryError",
     "RepresentationView",
     "TextLayerService",
@@ -143,5 +170,8 @@ __all__ = [
     "WorkbenchContribution",
     "WorkbenchPolicyPort",
     "WorkbenchManifest",
+    "CreateItemCommand",
+    "DeleteItemCommand",
+    "UpdateItemCommand",
     "standard_workbench_policies",
 ]

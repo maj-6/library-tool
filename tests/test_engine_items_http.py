@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from librarytool.adapters.filesystem import RecoverableWriteSet
+
 
 @pytest.fixture()
 def item_catalog(monkeypatch, tmp_path: Path):
@@ -15,6 +17,8 @@ def item_catalog(monkeypatch, tmp_path: Path):
     entries_dir = tmp_path / "entries"
     monkeypatch.setattr(server, "BUILDS_PATH", builds_path)
     monkeypatch.setattr(server, "ENTRIES_DIR", entries_dir)
+    monkeypatch.setattr(
+        server, "_engine_write_set", RecoverableWriteSet(tmp_path))
     monkeypatch.setattr(server, "_library_engine_instance", None)
 
     private = tmp_path / "private" / "scan.pdf"

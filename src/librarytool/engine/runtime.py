@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from .capabilities import CapabilityRegistry
 from .interchange import LibInterchangeService
+from .item_commands import ItemCommandService
 from .items import ItemQueryService
 from .jobs import JobManager
 from .replica import ReplicaApplicationService
@@ -25,6 +26,7 @@ class LibraryEngine:
 
     capabilities: CapabilityRegistry
     items: ItemQueryService | None = None
+    item_commands: ItemCommandService | None = None
     interchange: LibInterchangeService | None = None
     jobs: JobManager | None = None
     replica: ReplicaApplicationService | None = None
