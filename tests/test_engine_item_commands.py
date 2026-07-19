@@ -388,6 +388,65 @@ def test_delete_stages_a_server_tombstone_and_replays_without_live_record():
     assert repository.commits == repository.stages == 1
 
 
+def test_legacy_delete_authority_defaults_to_backward_compatible():
+    repository = _MemoryRepository((_snapshot(),))
+
+    result = ItemCommandService(repository).delete(
+        DeleteItemCommand("book-1", "rev-1", "delete-default")
+    )
+
+    assert result.receipt.action == "delete"
+    assert repository.commits == repository.stages == 1
+
+
+def test_disabled_legacy_delete_refuses_before_repository_or_receipt_replay():
+    repository = _MemoryRepository((_snapshot(),))
+    command = DeleteItemCommand("book-1", "rev-1", "delete-disabled")
+    legacy_result = ItemCommandService(repository).delete(command)
+    units_before = tuple(repository.units)
+
+    def fail_repository_access(**_kwargs):
+        pytest.fail("disabled legacy delete accessed its repository")
+
+    repository.unit_of_work = fail_repository_access
+    with pytest.raises(ConflictError) as caught:
+        ItemCommandService(
+            repository,
+            allow_legacy_delete=False,
+        ).delete(command)
+
+    assert caught.value.code == "item_lifecycle_command_required"
+    assert caught.value.retryable is False
+    assert tuple(repository.units) == units_before
+    assert repository.receipts[command.operation_id] == legacy_result.receipt
+    assert repository.commits == repository.stages == 1
+
+
+def test_disabled_legacy_delete_does_not_disable_create_or_update():
+    repository = _MemoryRepository()
+    service = ItemCommandService(repository, allow_legacy_delete=False)
+
+    created = service.create(CreateItemCommand(_draft(), "create-enabled"))
+    updated = service.update(
+        UpdateItemCommand(
+            created.receipt.item_id,
+            created.receipt.after_revision,
+            ItemPatch(title="Updated"),
+            "update-enabled",
+        )
+    )
+
+    assert created.receipt.action == "create"
+    assert updated.receipt.action == "update"
+    assert updated.receipt.item.title == "Updated"
+    assert repository.commits == repository.stages == 2
+
+
+def test_legacy_delete_authority_requires_an_explicit_boolean():
+    with pytest.raises(TypeError, match="allow_legacy_delete must be a boolean"):
+        ItemCommandService(_MemoryRepository(), allow_legacy_delete=0)
+
+
 def test_delete_requires_revision_and_current_item_before_staging():
     repository = _MemoryRepository((_snapshot(),))
     service = ItemCommandService(repository)

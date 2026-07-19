@@ -765,10 +765,25 @@ class ItemCommandRepositoryPort(Protocol):
 
 
 class ItemCommandService:
-    """Validate, conditionally stage, and idempotently commit item commands."""
+    """Validate, conditionally stage, and idempotently commit item commands.
 
-    def __init__(self, repository: ItemCommandRepositoryPort) -> None:
+    ``allow_legacy_delete`` is a migration authority seam.  It defaults to
+    ``True`` for compatibility with callers whose repositories still own an
+    atomic catalogue-only delete.  Production compositions that install the
+    aggregate item lifecycle service must set it to ``False`` so deletion
+    cannot bypass managed-tree and tombstone coordination.
+    """
+
+    def __init__(
+        self,
+        repository: ItemCommandRepositoryPort,
+        *,
+        allow_legacy_delete: bool = True,
+    ) -> None:
+        if not isinstance(allow_legacy_delete, bool):
+            raise TypeError("allow_legacy_delete must be a boolean")
         self._repository = repository
+        self._allow_legacy_delete = allow_legacy_delete
 
     def create(self, command: CreateItemCommand) -> ItemCommandResult:
         if not isinstance(command, CreateItemCommand):
@@ -902,6 +917,11 @@ class ItemCommandService:
             raise ValidationError(
                 "delete requires a DeleteItemCommand",
                 code="invalid_item_command",
+            )
+        if not self._allow_legacy_delete:
+            raise ConflictError(
+                "item deletion requires the aggregate lifecycle service",
+                code="item_lifecycle_command_required",
             )
         item_id = self._item_id(command.item_id)
         expected_revision = self._expected_revision(
