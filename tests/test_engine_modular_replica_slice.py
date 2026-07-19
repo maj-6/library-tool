@@ -22,7 +22,7 @@ from librarytool.engine.contracts import (
     ReplaceRegionPageCommand,
     ReviewRegionProposalCommand,
 )
-from librarytool.engine.errors import ConflictError
+from librarytool.engine.errors import ConflictError, NotFoundError
 from librarytool.engine.replica import ReplicaApplicationService
 from librarytool.engine.text_layers import TextLayerService
 from librarytool.engine.translations import (
@@ -152,19 +152,63 @@ class TextStore:
 
 def make_replica(tmp_path, *, fail_text=False):
     policies = Policies()
+    items = Items()
     repository = FilesystemReplicaRepository(
-        lambda item_id: tmp_path / item_id / "ocr" / "layout.json"
+        lambda item_id: tmp_path / item_id / "ocr" / "layout.json",
+        item_exists_for=lambda item_id: item_id in items.items,
     )
     text_store = TextStore(fail=fail_text)
     text_layers = TextLayerService(text_store, policies)
     service = ReplicaApplicationService(
-        Items(),
+        items,
         repository,
         policies,
         text_layers,
         clock=lambda: datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc),
     )
     return service, repository, policies, text_store
+
+
+def test_replica_revalidates_item_after_acquiring_workspace_lease(tmp_path):
+    items = Items()
+    policies = Policies()
+    lease_waiting = threading.Event()
+    deletion_committed = threading.Event()
+
+    @contextmanager
+    def workspace_lease(_item_id):
+        lease_waiting.set()
+        assert deletion_committed.wait(timeout=5)
+        yield
+
+    repository = FilesystemReplicaRepository(
+        lambda item_id: tmp_path / item_id / "ocr" / "layout.json",
+        workspace_context_for=workspace_lease,
+        item_exists_for=lambda item_id: item_id in items.items,
+    )
+    service = ReplicaApplicationService(
+        items,
+        repository,
+        policies,
+        TextLayerService(TextStore(), policies),
+    )
+    key = PageKey("book", "primary", 1)
+    command = ReplaceRegionPageCommand(
+        key=key,
+        expected_revision=policies.content_revision(None, "rr"),
+        items=[{"rid": "body-1", "text": "must not return"}],
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        mutation = pool.submit(service.replace_region_page, command)
+        assert lease_waiting.wait(timeout=5)
+        del items.items["book"]
+        deletion_committed.set()
+        with pytest.raises(NotFoundError) as missing:
+            mutation.result(timeout=5)
+
+    assert missing.value.code == "item_not_found"
+    assert not (tmp_path / "book").exists()
 
 
 def seed(repository, value):

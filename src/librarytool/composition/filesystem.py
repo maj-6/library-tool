@@ -398,6 +398,9 @@ def compose_filesystem_engine(
         workspace_context_for=lambda _item_id: (
             resources.write_set.workspace_lease()
         ),
+        item_exists_for=lambda item_id: (
+            catalogue.descriptors.get(item_id) is not None
+        ),
     )
     text_layers = TextLayerService(
         replica.text_repository,

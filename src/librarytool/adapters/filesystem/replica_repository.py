@@ -13,13 +13,14 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, ContextManager
 
-from ...engine.errors import RepositoryError
+from ...engine.errors import NotFoundError, RepositoryError
 
 
 LayoutPathCallback = Callable[[str], Path]
 ReadJsonCallback = Callable[[Path], Any]
 WriteJsonCallback = Callable[[Path, Mapping[str, Any]], None]
 LockCallback = Callable[[str], ContextManager[Any]]
+ItemExistsCallback = Callable[[str], bool]
 
 
 class FilesystemReplicaRepository:
@@ -40,12 +41,16 @@ class FilesystemReplicaRepository:
         write_json: WriteJsonCallback | None = None,
         lock_context_for: LockCallback | None = None,
         workspace_context_for: LockCallback | None = None,
+        item_exists_for: ItemExistsCallback | None = None,
     ) -> None:
         self._layout_path_for = layout_path_for
         self._read_json = read_json or self._default_read_json
         self._write_json = write_json or self._default_write_json
         self._external_lock_context_for = lock_context_for
         self._workspace_context_for = workspace_context_for
+        if item_exists_for is not None and not callable(item_exists_for):
+            raise TypeError("item_exists_for must be callable")
+        self._item_exists_for = item_exists_for
         self._locks_guard = threading.Lock()
         self._locks: dict[str, threading.RLock] = {}
 
@@ -84,7 +89,47 @@ class FilesystemReplicaRepository:
         )
         with workspace:
             with legacy:
+                # Preserve the repository's path-safety error for malformed
+                # identities before asking a catalogue whether they exist.
+                self._path(item_id)
+                self._require_live_item(item_id)
                 yield
+
+    def _require_live_item(self, item_id: str) -> None:
+        """Revalidate membership inside the transaction's isolation scope.
+
+        Replica services perform an early source check to return useful
+        validation errors.  That check cannot authorize a later write: item
+        lifecycle deletion may commit before this repository acquires the
+        workspace lease.  Hosts that own a catalogue therefore inject this
+        callback so the final check and every commit share one lease.
+        """
+
+        if self._item_exists_for is None:
+            return
+        try:
+            exists = self._item_exists_for(item_id)
+        except RepositoryError:
+            raise
+        except Exception as exc:
+            raise RepositoryError(
+                "the item repository could not be read",
+                code="replica_item_read_failed",
+                details={"item_id": item_id, "cause_type": type(exc).__name__},
+                retryable=True,
+            ) from exc
+        if not isinstance(exists, bool):
+            raise RepositoryError(
+                "the item repository returned an invalid existence result",
+                code="invalid_replica_item_identity",
+                details={"item_id": item_id},
+            )
+        if not exists:
+            raise NotFoundError(
+                "the item does not exist",
+                code="item_not_found",
+                details={"item_id": item_id},
+            )
 
     def _context(
         self,
