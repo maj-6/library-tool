@@ -4935,6 +4935,71 @@ def api_build_replica_import(build_id: str):
     })
 
 
+@app.route(
+    "/api/v1/items/<item_id>/replica/lib-imports", methods=["POST"]
+)
+def api_v1_replica_lib_import(item_id: str):
+    """Import a Replica package through the stable engine transport.
+
+    The operation key is mandatory on the versioned resource because a caller
+    may safely retry after losing the response.  The compatibility route above
+    still mints a key for older clients, but new workbenches receive the full
+    durable receipt rather than its historical UI projection.
+    """
+    operation_id = str(request.headers.get("Idempotency-Key") or "").strip()
+    if not operation_id:
+        return _engine_error_response(EnginePreconditionRequiredError(
+            "an idempotency key is required",
+            code="idempotency_key_required",
+            details={"header": "Idempotency-Key", "item_id": item_id},
+        ))
+
+    source_id = str(request.args.get("source_id") or "").strip()
+    raw_overwrite = request.args.get("overwrite")
+    overwrite_value = str(raw_overwrite or "").strip().lower()
+    if overwrite_value in ("", "0", "false"):
+        overwrite = False
+    elif overwrite_value in ("1", "true"):
+        overwrite = True
+    else:
+        return _engine_error_response(EngineValidationError(
+            "overwrite must be a boolean query value",
+            code="invalid_overwrite",
+            details={"overwrite": str(raw_overwrite)},
+        ))
+
+    upload = request.files.get("lib")
+    if upload is None:
+        return _engine_error_response(EngineValidationError(
+            "a Replica package is required",
+            code="lib_archive_required",
+            details={"field": "lib"},
+        ))
+    archive = upload.read(_LIB_MAX_BYTES + 1)
+    if len(archive) > _LIB_MAX_BYTES:
+        return _engine_error_response(EngineValidationError(
+            "the Replica package is too large",
+            code="lib_archive_too_large",
+            details={"maximum_bytes": _LIB_MAX_BYTES},
+        ))
+
+    try:
+        receipt = _interchange_engine().import_lib(ImportLibCommand(
+            item_id=item_id,
+            source_id=source_id,
+            archive=archive,
+            overwrite=overwrite,
+            operation_id=operation_id,
+        ))
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    return jsonify({
+        "ok": True,
+        "schema": "librarytool.lib-import-receipt/1",
+        "receipt": receipt.as_dict(),
+    })
+
+
 @app.route("/api/lib/open", methods=["POST"])
 def api_lib_open():
     """Create a new book from a local .lib — the desktop shell's double-click

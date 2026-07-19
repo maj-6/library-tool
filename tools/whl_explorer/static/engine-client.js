@@ -44,6 +44,14 @@
     return `"${revision}"`;
   }
 
+  function operationKey(value, name) {
+    const key = String(value || "");
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(key)) {
+      throw new TypeError(`${name} is required and must be a portable identifier`);
+    }
+    return key;
+  }
+
   function fallbackCode(status) {
     if (status === 409) return "conflict";
     if (status === 428) return "precondition-required";
@@ -460,12 +468,23 @@
         `translations/${encodePart(language)}`), { signal });
     }
 
-    _replicaPackageImport({ bookId, sourceId, file, signal } = {}) {
+    _replicaPackageImport({ bookId, sourceId, file, overwrite = false,
+      idempotencyKey, signal } = {}) {
       const form = this._formDataFactory();
       form.append("lib", file);
-      return this._requestJson("POST", this._buildPath(bookId, "replica-import"), {
-        query: { src: sourceId }, multipart: form, signal,
-      });
+      return this._requestJson("POST",
+        `/v1/items/${encodePart(bookId)}/replica/lib-imports`, {
+          headers: {
+            "Idempotency-Key": operationKey(
+              idempotencyKey, "idempotencyKey"),
+          },
+          query: {
+            source_id: sourceId,
+            overwrite: overwrite ? 1 : undefined,
+          },
+          multipart: form,
+          signal,
+        });
     }
 
     _replicaPackageExportUrl({ bookId, sourceId } = {}) {

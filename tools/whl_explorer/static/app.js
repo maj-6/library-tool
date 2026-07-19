@@ -22065,18 +22065,22 @@ function initReplica() {
     let r;
     try {
       r = await engineClient.replica.packages.import({
-        bookId: book, sourceId: src, file,
+        bookId: book, sourceId: src, file, idempotencyKey: rwNewRid(),
       });
     } catch (e) {
       status("IMPORT :: " + e.message);
       return;
     }
     if (seq !== rwState.seq || book !== rwState.book || src !== rwState.src) return;
-    status(`IMPORT :: ${r.pages_applied.length} page(s)` +
-           (r.pages_skipped.length ? ` · skipped ${r.pages_skipped.length}` : "") +
-           (r.templates_added.length ? ` · templates ${r.templates_added.join(", ")}` : "") +
-           (r.figures_added ? ` · ${r.figures_added} figure(s)` : "") +
-           ` · stylesheet ${r.stylesheet}`);
+    const receipt = r.receipt;
+    status(`IMPORT :: ${receipt.pages_applied.length} page(s)` +
+           (receipt.pages_skipped.length ?
+             ` · skipped ${receipt.pages_skipped.length}` : "") +
+           (receipt.templates_added.length ?
+             ` · templates ${receipt.templates_added.join(", ")}` : "") +
+           (receipt.figures_added.length ?
+             ` · ${receipt.figures_added.length} figure(s)` : "") +
+           ` · stylesheet ${receipt.stylesheet_disposition}`);
     // the sidecar changed under every cache
     ocrState.regionsCache.clear();
     delete ocrState.layoutMeta[book];

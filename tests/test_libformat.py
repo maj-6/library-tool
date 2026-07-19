@@ -264,6 +264,87 @@ def test_lib1_file_still_imports_and_upgrades(client, data_root):
     assert libformat.RID_RE.match(got["items"][0]["rid"])
 
 
+def test_v1_replica_import_returns_full_replayable_engine_receipt(
+        client, data_root):
+    bid = "e2b012340007-v1"
+    _seed_build(bid)
+    archive = _lib1().getvalue()
+    url = (
+        f"/api/v1/items/{bid}/replica/lib-imports?source_id=primary"
+    )
+    headers = {"Idempotency-Key": "import-command-1"}
+
+    first = client.post(
+        url,
+        headers=headers,
+        data={"lib": (io.BytesIO(archive), "old.lib")},
+        content_type="multipart/form-data",
+    )
+    assert first.status_code == 200
+    body = first.get_json()
+    assert body["schema"] == "librarytool.lib-import-receipt/1"
+    receipt = body["receipt"]
+    assert receipt["operation_id"] == "import-command-1"
+    assert receipt["item_id"] == bid
+    assert receipt["source_id"] == "primary"
+    assert receipt["pages_applied"] == [1]
+    assert receipt["compiled_pages"] == [1]
+    assert isinstance(receipt["figures_added"], list)
+    assert receipt["stylesheet_disposition"] == "none"
+
+    replay = client.post(
+        url,
+        headers=headers,
+        data={"lib": (io.BytesIO(archive), "renamed.lib")},
+        content_type="multipart/form-data",
+    )
+    assert replay.status_code == 200
+    assert replay.get_json() == body
+
+    conflict = client.post(
+        url + "&overwrite=1",
+        headers=headers,
+        data={"lib": (io.BytesIO(archive), "old.lib")},
+        content_type="multipart/form-data",
+    )
+    assert conflict.status_code == 409
+    assert conflict.get_json()["code"] == "operation_id_conflict"
+
+
+def test_v1_replica_import_requires_explicit_transport_preconditions(
+        client, data_root):
+    bid = "e2b012340007-preconditions"
+    _seed_build(bid)
+    archive = _lib1().getvalue()
+    base = f"/api/v1/items/{bid}/replica/lib-imports"
+
+    missing_key = client.post(
+        base + "?source_id=primary",
+        data={"lib": (io.BytesIO(archive), "old.lib")},
+        content_type="multipart/form-data",
+    )
+    assert missing_key.status_code == 428
+    assert missing_key.get_json()["code"] == "idempotency_key_required"
+
+    missing_source = client.post(
+        base,
+        headers={"Idempotency-Key": "missing-source"},
+        data={"lib": (io.BytesIO(archive), "old.lib")},
+        content_type="multipart/form-data",
+    )
+    assert missing_source.status_code == 400
+    assert missing_source.get_json()["code"] == "source_id_required"
+
+    invalid_overwrite = client.post(
+        base + "?source_id=primary&overwrite=yes",
+        headers={"Idempotency-Key": "invalid-overwrite"},
+        data={"lib": (io.BytesIO(archive), "old.lib")},
+        content_type="multipart/form-data",
+    )
+    assert invalid_overwrite.status_code == 400
+    assert invalid_overwrite.get_json()["code"] == "invalid_overwrite"
+
+
 def test_import_rejects_newer_major(client, data_root):
     bid = "e2b012340008"
     _seed_build(bid)

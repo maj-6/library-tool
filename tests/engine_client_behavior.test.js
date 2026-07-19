@@ -216,7 +216,7 @@ test("proposal decisions own both conditional revisions", async () => {
   });
 });
 
-test("Replica import constructs multipart data without forcing Content-Type", async () => {
+test("Replica import uses the versioned idempotent multipart contract", async () => {
   class FakeFormData {
     constructor() { this.entries = []; }
     append(name, value) { this.entries.push([name, value]); }
@@ -232,15 +232,47 @@ test("Replica import constructs multipart data without forcing Content-Type", as
   const file = { name: "edition.lib" };
   await client.replica.packages.import({
     bookId: "book one", sourceId: "scan & notes", file,
+    overwrite: true, idempotencyKey: "import-command-1",
   });
 
   const { url, init } = calls[0];
   assert.equal(url,
-    "/api/builds/book%20one/replica-import?src=scan%20%26%20notes");
+    "/api/v1/items/book%20one/replica/lib-imports" +
+    "?source_id=scan%20%26%20notes&overwrite=1");
   assert.equal(init.method, "POST");
   assert.deepEqual(init.body.entries, [["lib", file]]);
+  assert.equal(init.headers["Idempotency-Key"], "import-command-1");
   assert.equal(init.headers["Content-Type"], undefined);
   assert.equal(init.headers.Accept, "application/json");
+});
+
+test("Replica import rejects a missing or unsafe idempotency key locally", () => {
+  class FakeFormData {
+    append() {}
+  }
+  let calls = 0;
+  const client = new EngineClient({
+    transport: async () => {
+      calls += 1;
+      return response(200, { ok: true });
+    },
+    formDataFactory: () => new FakeFormData(),
+  });
+
+  assert.throws(
+    () => client.replica.packages.import({
+      bookId: "book", sourceId: "primary", file: {},
+    }),
+    (error) => error instanceof TypeError && /idempotencyKey/.test(error.message),
+  );
+  assert.throws(
+    () => client.replica.packages.import({
+      bookId: "book", sourceId: "primary", file: {},
+      idempotencyKey: "unsafe/key",
+    }),
+    (error) => error instanceof TypeError && /idempotencyKey/.test(error.message),
+  );
+  assert.equal(calls, 0);
 });
 
 test("EngineClientError preserves structured engine conflict details", async () => {
