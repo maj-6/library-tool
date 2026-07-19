@@ -20140,7 +20140,7 @@ const rwState = {
   doc: "",          // compiled file this page's regions belong to
   dims: null, ext: {}, items: [],
   sel: [],          // selected region ids; the LAST one is active
-  dirty: false, saving: false, editVersion: 0,
+  dirty: false, saving: false, importing: false, editVersion: 0,
   pageLoaded: false, loadError: "", revision: "",
   proposal: null, stale: null, compilePending: null,
   pageCount: 0, regionPages: [],
@@ -20727,7 +20727,7 @@ function rwSyncBar() {
   const nItems = rwState.items.length;
   const ready = !!(rwState.page && rwState.pageLoaded && !rwState.loadError);
   const pending = rwHasUnsaved() || rwState.saving || rwState.styleSaving ||
-                  rwState.instrSaving;
+                  rwState.instrSaving || rwState.importing;
   const detecting = !!(rwState.book && rwState.page &&
     rwDetectionActive(rwState.book, rwState.src, rwState.page));
   el("rw-status").textContent = rwState.page
@@ -22044,6 +22044,7 @@ function initReplica() {
   });
   el("rw-import").addEventListener("click", () => {
     if (rwState.book && !rwHasUnsaved() && !rwState.saving &&
+        !rwState.importing &&
         (!rwState.page || rwState.pageLoaded)) el("rw-import-file").click();
   });
   el("rw-print").addEventListener("click", () => {
@@ -22060,42 +22061,70 @@ function initReplica() {
     const file = input.files && input.files[0];
     input.value = "";
     if (!file || !rwState.book || rwHasUnsaved() || rwState.saving ||
+        rwState.importing ||
         (rwState.page && !rwState.pageLoaded)) return;
     const book = rwState.book, src = rwState.src, seq = rwState.seq;
-    let r;
-    try {
-      r = await engineClient.replica.packages.import({
-        bookId: book, sourceId: src, file, idempotencyKey: rwNewRid(),
-      });
-    } catch (e) {
-      status("IMPORT :: " + e.message);
-      return;
-    }
-    if (seq !== rwState.seq || book !== rwState.book || src !== rwState.src) return;
-    const receipt = r.receipt;
-    status(`IMPORT :: ${receipt.pages_applied.length} page(s)` +
-           (receipt.pages_skipped.length ?
-             ` · skipped ${receipt.pages_skipped.length}` : "") +
-           (receipt.templates_added.length ?
-             ` · templates ${receipt.templates_added.join(", ")}` : "") +
-           (receipt.figures_added.length ?
-             ` · ${receipt.figures_added.length} figure(s)` : "") +
-           ` · stylesheet ${receipt.stylesheet_disposition}`);
-    // the sidecar changed under every cache
-    ocrState.regionsCache.clear();
-    delete ocrState.layoutMeta[book];
-    const pagesSeq = ++rwState.pagesSeq;
-    ++rwState.pageSeq;
-    rwState.pageLoaded = false; rwState.loadError = "";
-    rwSetMode(rwState.mode);
-    await renderReplicaPages(seq, pagesSeq);
-    if (seq !== rwState.seq || pagesSeq !== rwState.pagesSeq) return;
-    await rwLoadTemplates(seq);
-    if (seq !== rwState.seq) return;
-    await rwLoadStyles(seq);
-    if (seq !== rwState.seq) return;
-    if (rwState.page) selectReplicaPage(rwState.page);
+    const operationId = rwNewRid();
+    let r, committed = false;
+    rwState.importing = true;
     rwSyncBar();
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          r = await engineClient.replica.packages.import({
+            bookId: book, sourceId: src, file,
+            idempotencyKey: operationId,
+          });
+          break;
+        } catch (e) {
+          if (attempt === 0 && e && e.retryable && e.code !== "aborted") continue;
+          throw e;
+        }
+      }
+      committed = true;
+      if (!r || r.schema !== "librarytool.lib-import-receipt/1" ||
+          !r.receipt || !Array.isArray(r.receipt.pages_applied) ||
+          !Array.isArray(r.receipt.pages_skipped) ||
+          !Array.isArray(r.receipt.templates_added) ||
+          !Array.isArray(r.receipt.figures_added)) {
+        throw new Error("the engine returned an incompatible import receipt");
+      }
+      if (seq !== rwState.seq || book !== rwState.book || src !== rwState.src) return;
+      const receipt = r.receipt;
+      status(`IMPORT :: ${receipt.pages_applied.length} page(s)` +
+             (receipt.pages_skipped.length ?
+               ` · skipped ${receipt.pages_skipped.length}` : "") +
+             (receipt.templates_added.length ?
+               ` · templates ${receipt.templates_added.join(", ")}` : "") +
+             (receipt.figures_added.length ?
+               ` · ${receipt.figures_added.length} figure(s)` : "") +
+             ` · stylesheet ${receipt.stylesheet_disposition}` +
+             (receipt.warnings && receipt.warnings.length ?
+               ` · ${receipt.warnings.length} warning(s)` : ""));
+      // the sidecar changed under every cache
+      ocrState.regionsCache.clear();
+      delete ocrState.layoutMeta[book];
+      const pagesSeq = ++rwState.pagesSeq;
+      ++rwState.pageSeq;
+      rwState.pageLoaded = false; rwState.loadError = "";
+      rwSetMode(rwState.mode);
+      await renderReplicaPages(seq, pagesSeq);
+      if (seq !== rwState.seq || pagesSeq !== rwState.pagesSeq) return;
+      await rwLoadTemplates(seq);
+      if (seq !== rwState.seq) return;
+      await rwLoadStyles(seq);
+      if (seq !== rwState.seq) return;
+      if (rwState.page) selectReplicaPage(rwState.page);
+    } catch (e) {
+      if (seq === rwState.seq && book === rwState.book && src === rwState.src) {
+        status(committed
+          ? "IMPORT :: committed · refresh failed — reload this book"
+          : "IMPORT :: " + e.message);
+      }
+    } finally {
+      rwState.importing = false;
+      rwSyncBar();
+    }
   });
   el("rw-layer-dipl").addEventListener("click", () => rwSetLayer("text"));
   el("rw-layer-norm").addEventListener("click", () => rwSetLayer("norm"));
