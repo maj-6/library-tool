@@ -60,6 +60,99 @@
     return key;
   }
 
+  const PORTABLE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+  function isPortableIdentifier(value) {
+    return typeof value === "string" && PORTABLE_IDENTIFIER.test(value);
+  }
+
+  function portableIdentifier(value, name) {
+    if (!isPortableIdentifier(value)) {
+      throw new TypeError(`${name} is required and must be a portable identifier`);
+    }
+    return value;
+  }
+
+  function isLifecycleRevision(value, optional = false) {
+    if (typeof value !== "string") return false;
+    if (!value) return optional;
+    return value.length <= 512 && value === value.trim() &&
+      !/[\u0000-\u0020\u007f"\\]/.test(value) &&
+      !/[\ud800-\udfff]/.test(value);
+  }
+
+  function quoteLifecycleRevision(value, name) {
+    if (!isLifecycleRevision(value)) {
+      throw new TypeError(`${name} is not a valid strong revision token`);
+    }
+    return `"${value}"`;
+  }
+
+  function isObject(value) {
+    return !!value && typeof value === "object" && !Array.isArray(value);
+  }
+
+  function isItemTombstone(value) {
+    if (!isObject(value) ||
+        !isPortableIdentifier(value.tombstone_id) ||
+        !isLifecycleRevision(value.revision) ||
+        !["deleted", "restored"].includes(value.state) ||
+        !isPortableIdentifier(value.item_id) ||
+        !isLifecycleRevision(value.deleted_item_revision) ||
+        !isLifecycleRevision(value.managed_tree_revision) ||
+        !isLifecycleRevision(value.restored_item_revision, true)) return false;
+    if (value.state === "deleted") return value.restored_item_revision === "";
+    return !!value.restored_item_revision &&
+      value.restored_item_revision !== value.deleted_item_revision;
+  }
+
+  function hasUniqueTombstoneIdentities(tombstones) {
+    const tombstoneIds = new Set();
+    const activelyDeletedItems = new Set();
+    for (const tombstone of tombstones) {
+      const tombstoneId = tombstone.tombstone_id.toLowerCase();
+      if (tombstoneIds.has(tombstoneId)) return false;
+      tombstoneIds.add(tombstoneId);
+      if (tombstone.state !== "deleted") continue;
+      const itemId = tombstone.item_id.toLowerCase();
+      if (activelyDeletedItems.has(itemId)) return false;
+      activelyDeletedItems.add(itemId);
+    }
+    return true;
+  }
+
+  function isLifecycleReceipt(receipt, action, expected) {
+    if (!isObject(receipt) || receipt.action !== action ||
+        Object.prototype.hasOwnProperty.call(receipt, "command_sha256") ||
+        !isPortableIdentifier(receipt.operation_id) ||
+        receipt.operation_id !== expected.operationId ||
+        !isPortableIdentifier(receipt.item_id) ||
+        !isLifecycleRevision(receipt.deleted_item_revision) ||
+        !isLifecycleRevision(receipt.restored_item_revision, true) ||
+        !isLifecycleRevision(receipt.managed_tree_revision) ||
+        !isLifecycleRevision(receipt.tombstone_before_revision, true) ||
+        !isItemTombstone(receipt.tombstone) ||
+        receipt.tombstone.item_id !== receipt.item_id ||
+        receipt.tombstone.deleted_item_revision !== receipt.deleted_item_revision ||
+        receipt.tombstone.managed_tree_revision !== receipt.managed_tree_revision) {
+      return false;
+    }
+    if (action === "delete") {
+      return receipt.item_id === expected.itemId &&
+        receipt.deleted_item_revision === expected.recordRevision &&
+        receipt.managed_tree_revision === expected.managedTreeRevision &&
+        receipt.restored_item_revision === "" &&
+        receipt.tombstone_before_revision === "" &&
+        receipt.tombstone.state === "deleted";
+    }
+    return receipt.tombstone.tombstone_id === expected.tombstoneId &&
+      receipt.tombstone_before_revision === expected.tombstoneRevision &&
+      receipt.tombstone_before_revision !== receipt.tombstone.revision &&
+      receipt.tombstone.state === "restored" &&
+      !!receipt.restored_item_revision &&
+      receipt.tombstone.restored_item_revision === receipt.restored_item_revision;
+  }
+
   function fallbackCode(status) {
     if (status === 409) return "conflict";
     if (status === 428) return "precondition-required";
@@ -127,12 +220,19 @@
         get: (args) => this._itemGet(args),
         create: (args) => this._itemCreate(args),
         update: (args) => this._itemUpdate(args),
+        lifecycle: (args) => this._itemLifecycle(args),
+        delete: (args) => this._itemDelete(args),
         representations: (args) => this._itemRepresentations(args),
         attachRepresentation: (args) => this._representationAttach(args),
         replaceRepresentation: (args) => this._representationReplace(args),
         detachRepresentation: (args) => this._representationDetach(args),
         artifacts: (args) => this._itemArtifacts(args),
         readiness: (args) => this._itemReadiness(args),
+      });
+      this.itemTombstones = Object.freeze({
+        list: (args) => this._itemTombstonesList(args),
+        get: (args) => this._itemTombstoneGet(args),
+        restore: (args) => this._itemTombstoneRestore(args),
       });
       this.capabilities = (args) => this._capabilities(args);
 
@@ -203,6 +303,7 @@
       const headers = { Accept: "application/json", ...(options.headers || {}) };
       const init = { method, headers };
       if (options.signal) init.signal = options.signal;
+      if (options.cache) init.cache = options.cache;
       if (options.multipart !== undefined) {
         init.body = options.multipart;
       } else if (options.body !== undefined) {
@@ -255,7 +356,7 @@
           method, url, body,
         });
       }
-      return body;
+      return options.includeStatus ? { body, status } : body;
     }
 
     _pdfInfo({ path, signal } = {}) {
@@ -308,6 +409,149 @@
         body: { patch },
         signal,
       });
+    }
+
+    _invalidLifecycleResponse(message, method, path, body, query, status = 200) {
+      throw new EngineClientError(message, {
+        status,
+        code: "invalid-response",
+        retryable: true,
+        method,
+        url: this._url(path, query),
+        body,
+      });
+    }
+
+    async _itemLifecycle({ itemId, signal } = {}) {
+      const id = portableIdentifier(itemId, "itemId");
+      const path = `/v1/items/${encodePart(id)}/lifecycle`;
+      const { body, status } = await this._requestJson("GET", path, {
+        signal, cache: "no-cache", includeStatus: true,
+      });
+      if (status !== 200 || !isObject(body) || body.ok !== true ||
+          body.schema !== "librarytool.item-lifecycle-state/1" ||
+          body.state !== "live" || body.item_id !== id ||
+          !isLifecycleRevision(body.item_revision) ||
+          !isLifecycleRevision(body.managed_tree_revision) ||
+          !isLifecycleRevision(body.revision)) {
+        this._invalidLifecycleResponse(
+          "Engine returned an invalid item lifecycle state",
+          "GET", path, body, undefined, status);
+      }
+      return body;
+    }
+
+    async _itemDelete({ itemId, recordRevision, managedTreeRevision,
+      idempotencyKey, signal } = {}) {
+      const id = portableIdentifier(itemId, "itemId");
+      const operationId = portableIdentifier(
+        idempotencyKey, "idempotencyKey");
+      if (typeof recordRevision !== "string") {
+        throw new TypeError("recordRevision is not a valid record revision");
+      }
+      const path = `/v1/items/${encodePart(id)}`;
+      const { body, status } = await this._requestJson("DELETE", path, {
+        headers: {
+          "Idempotency-Key": operationId,
+          "If-Record-Match": quoteRecordRevision(
+            recordRevision, "recordRevision"),
+          "If-Managed-Tree-Match": quoteLifecycleRevision(
+            managedTreeRevision, "managedTreeRevision"),
+        },
+        signal,
+        cache: "no-store",
+        includeStatus: true,
+      });
+      if (status !== 200 || !isObject(body) || body.ok !== true ||
+          body.schema !== "librarytool.item-lifecycle-receipt/1" ||
+          Object.prototype.hasOwnProperty.call(body, "command_sha256") ||
+          typeof body.replayed !== "boolean" ||
+          !isLifecycleReceipt(body.receipt, "delete", {
+            operationId,
+            itemId: id,
+            recordRevision,
+            managedTreeRevision,
+          })) {
+        this._invalidLifecycleResponse(
+          "Engine returned an invalid item deletion receipt",
+          "DELETE", path, body, undefined, status);
+      }
+      return body;
+    }
+
+    async _itemTombstonesList({ state, signal } = {}) {
+      const wantedState = state == null || state === "" ? "" : state;
+      if (typeof wantedState !== "string" ||
+          (wantedState && !["deleted", "restored"].includes(wantedState))) {
+        throw new TypeError("state must be deleted or restored");
+      }
+      const path = "/v1/item-tombstones";
+      const query = { state: wantedState || undefined };
+      const { body, status } = await this._requestJson("GET", path, {
+        query, signal, cache: "no-cache", includeStatus: true,
+      });
+      if (status !== 200 || !isObject(body) || body.ok !== true ||
+          body.schema !== "librarytool.item-tombstone-list/1" ||
+          !Array.isArray(body.tombstones) ||
+          !body.tombstones.every(isItemTombstone) ||
+          (wantedState && !body.tombstones.every(
+            (tombstone) => tombstone.state === wantedState)) ||
+          !hasUniqueTombstoneIdentities(body.tombstones)) {
+        this._invalidLifecycleResponse(
+          "Engine returned an invalid item tombstone list",
+          "GET", path, body, query, status);
+      }
+      return body;
+    }
+
+    async _itemTombstoneGet({ tombstoneId, signal } = {}) {
+      const id = portableIdentifier(tombstoneId, "tombstoneId");
+      const path = `/v1/item-tombstones/${encodePart(id)}`;
+      const { body, status } = await this._requestJson("GET", path, {
+        signal, cache: "no-cache", includeStatus: true,
+      });
+      if (status !== 200 || !isObject(body) || body.ok !== true ||
+          body.schema !== "librarytool.item-tombstone/1" ||
+          !isItemTombstone(body.tombstone) ||
+          body.tombstone.tombstone_id !== id) {
+        this._invalidLifecycleResponse(
+          "Engine returned an invalid item tombstone",
+          "GET", path, body, undefined, status);
+      }
+      return body;
+    }
+
+    async _itemTombstoneRestore({ tombstoneId, tombstoneRevision,
+      idempotencyKey, signal } = {}) {
+      const id = portableIdentifier(tombstoneId, "tombstoneId");
+      const operationId = portableIdentifier(
+        idempotencyKey, "idempotencyKey");
+      const path = `/v1/item-tombstones/${encodePart(id)}/restore`;
+      const { body, status } = await this._requestJson("POST", path, {
+        headers: {
+          "Idempotency-Key": operationId,
+          "If-Tombstone-Match": quoteLifecycleRevision(
+            tombstoneRevision, "tombstoneRevision"),
+        },
+        signal,
+        cache: "no-store",
+        includeStatus: true,
+      });
+      const expectedStatus = body && body.replayed === true ? 200 : 201;
+      if (status !== expectedStatus || !isObject(body) || body.ok !== true ||
+          body.schema !== "librarytool.item-lifecycle-receipt/1" ||
+          Object.prototype.hasOwnProperty.call(body, "command_sha256") ||
+          typeof body.replayed !== "boolean" ||
+          !isLifecycleReceipt(body.receipt, "restore", {
+            operationId,
+            tombstoneId: id,
+            tombstoneRevision,
+          })) {
+        this._invalidLifecycleResponse(
+          "Engine returned an invalid item restoration receipt",
+          "POST", path, body, undefined, status);
+      }
+      return body;
     }
 
     _itemRepresentations({ itemId, signal } = {}) {

@@ -32,6 +32,64 @@ function harness(body = { ok: true }) {
   return { client, calls };
 }
 
+function lifecycleState(overrides = {}) {
+  return {
+    ok: true,
+    schema: "librarytool.item-lifecycle-state/1",
+    state: "live",
+    item_id: "book:one",
+    item_revision: "item-r1",
+    managed_tree_revision: "tree-r1",
+    revision: "lifecycle-r1",
+    ...overrides,
+  };
+}
+
+function itemTombstone(overrides = {}) {
+  return {
+    tombstone_id: "deleted:one",
+    revision: "tomb-r1",
+    state: "deleted",
+    item_id: "book:one",
+    deleted_item_revision: "item-r1",
+    managed_tree_revision: "tree-r1",
+    restored_item_revision: "",
+    ...overrides,
+  };
+}
+
+function lifecycleResult(action, options = {}) {
+  const restore = action === "restore";
+  const tombstone = itemTombstone(restore ? {
+    revision: "tomb-r2",
+    state: "restored",
+    restored_item_revision: "item-r2",
+  } : {});
+  Object.assign(tombstone, options.tombstone || {});
+  const receipt = {
+    action,
+    operation_id: restore ? "restore:one" : "delete:one",
+    item_id: "book:one",
+    deleted_item_revision: "item-r1",
+    restored_item_revision: restore ? "item-r2" : "",
+    managed_tree_revision: "tree-r1",
+    tombstone_before_revision: restore ? "tomb-r1" : "",
+    tombstone,
+    ...(options.receipt || {}),
+  };
+  return {
+    ok: true,
+    schema: "librarytool.item-lifecycle-receipt/1",
+    replayed: false,
+    receipt,
+    ...(options.envelope || {}),
+  };
+}
+
+function copyJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
 test("EngineClient exposes the complete Replica compatibility surface", () => {
   const { client } = harness();
   assert.equal(typeof client.capabilities, "function");
@@ -44,12 +102,17 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
   assert.equal(typeof client.items.get, "function");
   assert.equal(typeof client.items.create, "function");
   assert.equal(typeof client.items.update, "function");
+  assert.equal(typeof client.items.lifecycle, "function");
+  assert.equal(typeof client.items.delete, "function");
   assert.equal(typeof client.items.representations, "function");
   assert.equal(typeof client.items.attachRepresentation, "function");
   assert.equal(typeof client.items.replaceRepresentation, "function");
   assert.equal(typeof client.items.detachRepresentation, "function");
   assert.equal(typeof client.items.artifacts, "function");
   assert.equal(typeof client.items.readiness, "function");
+  assert.equal(typeof client.itemTombstones.list, "function");
+  assert.equal(typeof client.itemTombstones.get, "function");
+  assert.equal(typeof client.itemTombstones.restore, "function");
   const jsonMethods = [
     client.replica.templates.list,
     client.pdf.info,
@@ -245,6 +308,557 @@ test("item commands reject missing or unsafe preconditions locally", () => {
   }
   assert.equal(calls.length, 0);
 });
+
+test("item lifecycle and tombstone reads use canonical cache-safe resources",
+  async () => {
+    const calls = [];
+    const bodies = [
+      lifecycleState({ future_state_metadata: { supported: true } }),
+      {
+        ok: true,
+        schema: "librarytool.item-tombstone-list/1",
+        tombstones: [itemTombstone()],
+        future_list_metadata: true,
+      },
+      {
+        ok: true,
+        schema: "librarytool.item-tombstone/1",
+        tombstone: itemTombstone(),
+        future_detail_metadata: true,
+      },
+      {
+        ok: true,
+        schema: "librarytool.item-tombstone-list/1",
+        tombstones: [],
+      },
+    ];
+    const client = new EngineClient({
+      transport: async (url, init) => {
+        calls.push({ url, init });
+        return response(200, bodies.shift());
+      },
+    });
+
+    const state = await client.items.lifecycle({ itemId: "book:one" });
+    const listed = await client.itemTombstones.list({ state: "deleted" });
+    const detail = await client.itemTombstones.get({
+      tombstoneId: "deleted:one",
+    });
+    await client.itemTombstones.list();
+
+    assert.equal(state.item_revision, "item-r1");
+    assert.equal(listed.tombstones[0].tombstone_id, "deleted:one");
+    assert.equal(detail.tombstone.item_id, "book:one");
+    assert.deepEqual(calls.map(({ url }) => url), [
+      "/api/v1/items/book%3Aone/lifecycle",
+      "/api/v1/item-tombstones?state=deleted",
+      "/api/v1/item-tombstones/deleted%3Aone",
+      "/api/v1/item-tombstones",
+    ]);
+    assert.ok(calls.every(({ init }) => init.method === "GET"));
+    assert.ok(calls.every(({ init }) => init.cache === "no-cache"));
+    assert.ok(calls.every(({ init }) => init.body === undefined));
+    assert.ok(calls.every(({ init }) =>
+      Object.keys(init.headers).length === 1 &&
+      init.headers.Accept === "application/json"));
+  });
+
+test("item delete and tombstone restore own exact conditional headers",
+  async () => {
+    const calls = [];
+    const bodies = [lifecycleResult("delete"), lifecycleResult("restore")];
+    const client = new EngineClient({
+      transport: async (url, init) => {
+        calls.push({ url, init });
+        return response(calls.length === 2 ? 201 : 200, bodies.shift());
+      },
+    });
+
+    const deletion = await client.items.delete({
+      itemId: "book:one",
+      recordRevision: "item-r1",
+      managedTreeRevision: "tree-r1",
+      idempotencyKey: "delete:one",
+    });
+    const restoration = await client.itemTombstones.restore({
+      tombstoneId: "deleted:one",
+      tombstoneRevision: "tomb-r1",
+      idempotencyKey: "restore:one",
+    });
+
+    assert.equal(deletion.receipt.action, "delete");
+    assert.equal(restoration.receipt.action, "restore");
+    assert.deepEqual(calls[0], {
+      url: "/api/v1/items/book%3Aone",
+      init: {
+        method: "DELETE",
+        headers: {
+          Accept: "application/json",
+          "Idempotency-Key": "delete:one",
+          "If-Record-Match": '"item-r1"',
+          "If-Managed-Tree-Match": '"tree-r1"',
+        },
+        cache: "no-store",
+      },
+    });
+    assert.deepEqual(calls[1], {
+      url: "/api/v1/item-tombstones/deleted%3Aone/restore",
+      init: {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Idempotency-Key": "restore:one",
+          "If-Tombstone-Match": '"tomb-r1"',
+        },
+        cache: "no-store",
+      },
+    });
+    assert.equal(calls[0].init.headers["Content-Type"], undefined);
+    assert.equal(calls[1].init.headers["Content-Type"], undefined);
+  });
+
+test("lifecycle commands reject unsafe identities and preconditions locally",
+  async () => {
+    const { client, calls } = harness();
+    const deletion = {
+      itemId: "book:one",
+      recordRevision: "item-r1",
+      managedTreeRevision: "tree-r1",
+      idempotencyKey: "delete:one",
+    };
+    const restoration = {
+      tombstoneId: "deleted:one",
+      tombstoneRevision: "tomb-r1",
+      idempotencyKey: "restore:one",
+    };
+    const badIdentifiers = [
+      undefined, null, 7, "", " bad", "../bad", "bad/id", "bad id",
+      `x${"y".repeat(128)}`,
+    ];
+
+    for (const itemId of badIdentifiers) {
+      await assert.rejects(client.items.lifecycle({ itemId }), /itemId/);
+      await assert.rejects(client.items.delete({ ...deletion, itemId }),
+        /itemId/);
+    }
+    for (const tombstoneId of badIdentifiers) {
+      await assert.rejects(client.itemTombstones.get({ tombstoneId }),
+        /tombstoneId/);
+      await assert.rejects(client.itemTombstones.restore({
+        ...restoration, tombstoneId,
+      }), /tombstoneId/);
+    }
+    for (const idempotencyKey of badIdentifiers) {
+      await assert.rejects(client.items.delete({
+        ...deletion, idempotencyKey,
+      }), /idempotencyKey/);
+      await assert.rejects(client.itemTombstones.restore({
+        ...restoration, idempotencyKey,
+      }), /idempotencyKey/);
+    }
+
+    const badRecordRevisions = [
+      undefined, null, 7, "", "*", "item revision", "item/revision",
+      'W/"item-r1"', `r${"x".repeat(512)}`,
+    ];
+    for (const recordRevision of badRecordRevisions) {
+      await assert.rejects(client.items.delete({
+        ...deletion, recordRevision,
+      }), /recordRevision/);
+    }
+
+    const badLifecycleRevisions = [
+      undefined, null, 7, "", " tree-r1", "tree-r1 ", 'W/"tree-r1"',
+      "tree\\revision", "tree\nrevision", "tree\ud800revision",
+      `r${"x".repeat(512)}`,
+    ];
+    for (const managedTreeRevision of badLifecycleRevisions) {
+      await assert.rejects(client.items.delete({
+        ...deletion, managedTreeRevision,
+      }), /managedTreeRevision/);
+    }
+    for (const tombstoneRevision of badLifecycleRevisions) {
+      await assert.rejects(client.itemTombstones.restore({
+        ...restoration, tombstoneRevision,
+      }), /tombstoneRevision/);
+    }
+    for (const state of ["live", "DELETED", 7, {}, []]) {
+      await assert.rejects(client.itemTombstones.list({ state }), /state/);
+    }
+    assert.equal(calls.length, 0);
+  });
+
+test("item lifecycle state validation fails closed on incoherent responses",
+  async () => {
+    const invalidBodies = [
+      {},
+      lifecycleState({ ok: "true" }),
+      lifecycleState({ schema: "librarytool.item-lifecycle-state/2" }),
+      lifecycleState({ state: "deleted" }),
+      lifecycleState({ item_id: "other-item" }),
+      lifecycleState({ item_revision: "" }),
+      lifecycleState({ managed_tree_revision: 7 }),
+      lifecycleState({ revision: 'W/"lifecycle-r1"' }),
+    ];
+
+    for (const body of invalidBodies) {
+      const { client } = harness(body);
+      await assert.rejects(
+        client.items.lifecycle({ itemId: "book:one" }),
+        (error) => {
+          assert.ok(error instanceof EngineClientError);
+          assert.equal(error.code, "invalid-response");
+          assert.equal(error.status, 200);
+          assert.equal(error.retryable, true);
+          assert.equal(error.method, "GET");
+          assert.equal(error.url, "/api/v1/items/book%3Aone/lifecycle");
+          assert.strictEqual(error.body, body);
+          return true;
+        },
+      );
+    }
+  });
+
+test("tombstone read validation rejects aliases, duplicates, and bad states",
+  async () => {
+    const invalidDetails = [
+      {
+        ok: true, schema: "librarytool.item-tombstone/2",
+        tombstone: itemTombstone(),
+      },
+      {
+        ok: true, schema: "librarytool.item-tombstone/1",
+        tombstone: itemTombstone({ tombstone_id: undefined }),
+      },
+      {
+        ok: true, schema: "librarytool.item-tombstone/1",
+        tombstone: itemTombstone({ tombstone_id: "DELETED:ONE" }),
+      },
+      {
+        ok: true, schema: "librarytool.item-tombstone/1",
+        tombstone: itemTombstone({ restored_item_revision: "item-r2" }),
+      },
+      {
+        ok: true, schema: "librarytool.item-tombstone/1",
+        tombstone: itemTombstone({
+          state: "restored", restored_item_revision: "item-r1",
+        }),
+      },
+    ];
+    for (const body of invalidDetails) {
+      const { client } = harness(body);
+      await assert.rejects(client.itemTombstones.get({
+        tombstoneId: "deleted:one",
+      }), (error) => {
+        assert.ok(error instanceof EngineClientError);
+        assert.equal(error.code, "invalid-response");
+        assert.equal(error.method, "GET");
+        assert.equal(error.url,
+          "/api/v1/item-tombstones/deleted%3Aone");
+        assert.strictEqual(error.body, body);
+        return true;
+      });
+    }
+
+    const invalidLists = [
+      { ok: true, schema: "librarytool.item-tombstone-list/1" },
+      {
+        ok: true, schema: "librarytool.item-tombstones/1", tombstones: [],
+      },
+      {
+        ok: true, schema: "librarytool.item-tombstone-list/1",
+        tombstones: [itemTombstone(), itemTombstone()],
+      },
+      {
+        ok: true, schema: "librarytool.item-tombstone-list/1",
+        tombstones: [itemTombstone(), itemTombstone({
+          tombstone_id: "DELETED:ONE", revision: "tomb-r2",
+          state: "restored", restored_item_revision: "item-r2",
+        })],
+      },
+      {
+        ok: true, schema: "librarytool.item-tombstone-list/1",
+        tombstones: [itemTombstone(), itemTombstone({
+          tombstone_id: "deleted:two", revision: "tomb-r2",
+        })],
+      },
+      {
+        ok: true, schema: "librarytool.item-tombstone-list/1",
+        tombstones: [itemTombstone({
+          state: "restored", revision: "tomb-r2",
+          restored_item_revision: "item-r2",
+        })],
+      },
+      {
+        ok: true, schema: "librarytool.item-tombstone-list/1",
+        tombstones: [itemTombstone({ item_id: undefined })],
+      },
+    ];
+    for (const body of invalidLists) {
+      const { client } = harness(body);
+      await assert.rejects(client.itemTombstones.list({ state: "deleted" }),
+        (error) => {
+          assert.ok(error instanceof EngineClientError);
+          assert.equal(error.code, "invalid-response");
+          assert.equal(error.url,
+            "/api/v1/item-tombstones?state=deleted");
+          assert.strictEqual(error.body, body);
+          return true;
+        });
+    }
+  });
+
+test("item deletion validates public receipts against the exact command",
+  async () => {
+    const missingReceipt = lifecycleResult("delete");
+    missingReceipt.receipt = null;
+    const invalidBodies = [
+      missingReceipt,
+      lifecycleResult("delete", { envelope: { ok: "true" } }),
+      lifecycleResult("delete", {
+        envelope: { schema: "librarytool.item-lifecycle-receipt/2" },
+      }),
+      lifecycleResult("delete", { envelope: { replayed: "false" } }),
+      lifecycleResult("delete", {
+        envelope: { command_sha256: "a".repeat(64) },
+      }),
+      lifecycleResult("delete", {
+        receipt: { command_sha256: "a".repeat(64) },
+      }),
+      lifecycleResult("delete", { receipt: { action: "restore" } }),
+      lifecycleResult("delete", { receipt: { operation_id: undefined } }),
+      lifecycleResult("delete", { receipt: { operation_id: "delete:other" } }),
+      lifecycleResult("delete", { receipt: { item_id: "book:other" } }),
+      lifecycleResult("delete", {
+        receipt: { deleted_item_revision: "item-r0" },
+      }),
+      lifecycleResult("delete", {
+        receipt: { managed_tree_revision: "tree-r0" },
+      }),
+      lifecycleResult("delete", {
+        receipt: { restored_item_revision: "item-r2" },
+      }),
+      lifecycleResult("delete", {
+        receipt: { tombstone_before_revision: "tomb-r0" },
+      }),
+      lifecycleResult("delete", {
+        tombstone: { item_id: "book:other" },
+      }),
+      lifecycleResult("delete", {
+        tombstone: { deleted_item_revision: "item-r0" },
+      }),
+      lifecycleResult("delete", {
+        tombstone: { managed_tree_revision: "tree-r0" },
+      }),
+      lifecycleResult("delete", {
+        tombstone: {
+          state: "restored", revision: "tomb-r2",
+          restored_item_revision: "item-r2",
+        },
+      }),
+    ];
+
+    for (const body of invalidBodies) {
+      const { client } = harness(body);
+      await assert.rejects(client.items.delete({
+        itemId: "book:one",
+        recordRevision: "item-r1",
+        managedTreeRevision: "tree-r1",
+        idempotencyKey: "delete:one",
+      }), (error) => {
+        assert.ok(error instanceof EngineClientError);
+        assert.equal(error.code, "invalid-response");
+        assert.equal(error.retryable, true);
+        assert.equal(error.method, "DELETE");
+        assert.equal(error.url, "/api/v1/items/book%3Aone");
+        assert.strictEqual(error.body, body);
+        return true;
+      });
+    }
+  });
+
+test("item restoration validates public receipts against the tombstone CAS",
+  async () => {
+    const invalidBodies = [
+      lifecycleResult("restore", { receipt: { action: "delete" } }),
+      lifecycleResult("restore", {
+        receipt: { operation_id: "restore:other" },
+      }),
+      lifecycleResult("restore", {
+        receipt: { tombstone_before_revision: "tomb-r0" },
+      }),
+      lifecycleResult("restore", {
+        receipt: { restored_item_revision: "" },
+      }),
+      lifecycleResult("restore", {
+        receipt: { restored_item_revision: "item-r1" },
+        tombstone: { restored_item_revision: "item-r1" },
+      }),
+      lifecycleResult("restore", {
+        tombstone: { tombstone_id: "deleted:other" },
+      }),
+      lifecycleResult("restore", {
+        tombstone: { revision: "tomb-r1" },
+      }),
+      lifecycleResult("restore", {
+        tombstone: { state: "deleted", restored_item_revision: "" },
+      }),
+      lifecycleResult("restore", {
+        tombstone: { restored_item_revision: "item-r3" },
+      }),
+      lifecycleResult("restore", {
+        receipt: { command_sha256: "b".repeat(64) },
+      }),
+    ];
+
+    for (const body of invalidBodies) {
+      const { client } = harness(body);
+      await assert.rejects(client.itemTombstones.restore({
+        tombstoneId: "deleted:one",
+        tombstoneRevision: "tomb-r1",
+        idempotencyKey: "restore:one",
+      }), (error) => {
+        assert.ok(error instanceof EngineClientError);
+        assert.equal(error.code, "invalid-response");
+        assert.equal(error.retryable, true);
+        assert.equal(error.method, "POST");
+        assert.equal(error.url,
+          "/api/v1/item-tombstones/deleted%3Aone/restore");
+        assert.strictEqual(error.body, body);
+        return true;
+      });
+    }
+  });
+
+test("ambiguous lifecycle failures preserve exact retry inputs", async () => {
+  const calls = [];
+  let attempt = 0;
+  const client = new EngineClient({
+    transport: async (url, init) => {
+      calls.push({ url, init });
+      attempt += 1;
+      if (attempt === 1) throw new Error("connection closed after send");
+      return response(200, lifecycleResult("delete", {
+        envelope: { replayed: true },
+      }));
+    },
+  });
+  const command = Object.freeze({
+    itemId: "book:one",
+    recordRevision: "item-r1",
+    managedTreeRevision: "tree-r1",
+    idempotencyKey: "delete:one",
+  });
+  const original = copyJson(command);
+
+  await assert.rejects(client.items.delete(command), (error) => {
+    assert.ok(error instanceof EngineClientError);
+    assert.equal(error.code, "network-error");
+    assert.equal(error.retryable, true);
+    assert.equal(error.method, "DELETE");
+    assert.equal(error.url, "/api/v1/items/book%3Aone");
+    return true;
+  });
+  const replay = await client.items.delete(command);
+
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(command, original);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1], calls[0]);
+  assert.equal(calls[0].init.body, undefined);
+});
+
+test("lifecycle resources reject unexpected successful HTTP statuses",
+  async () => {
+    const cases = [
+      [203, lifecycleState(), (client) => client.items.lifecycle({
+        itemId: "book:one",
+      })],
+      [201, lifecycleResult("delete"), (client) => client.items.delete({
+        itemId: "book:one",
+        recordRevision: "item-r1",
+        managedTreeRevision: "tree-r1",
+        idempotencyKey: "delete:one",
+      })],
+      [202, {
+        ok: true,
+        schema: "librarytool.item-tombstone-list/1",
+        tombstones: [],
+      }, (client) => client.itemTombstones.list()],
+      [204, {
+        ok: true,
+        schema: "librarytool.item-tombstone/1",
+        tombstone: itemTombstone(),
+      }, (client) => client.itemTombstones.get({
+        tombstoneId: "deleted:one",
+      })],
+      [200, lifecycleResult("restore"),
+        (client) => client.itemTombstones.restore({
+          tombstoneId: "deleted:one",
+          tombstoneRevision: "tomb-r1",
+          idempotencyKey: "restore:one",
+        })],
+      [201, lifecycleResult("restore", { envelope: { replayed: true } }),
+        (client) => client.itemTombstones.restore({
+          tombstoneId: "deleted:one",
+          tombstoneRevision: "tomb-r1",
+          idempotencyKey: "restore:one",
+        })],
+    ];
+
+    for (const [status, body, invoke] of cases) {
+      const client = new EngineClient({
+        transport: async () => response(status, body),
+      });
+      await assert.rejects(invoke(client), (error) => {
+        assert.ok(error instanceof EngineClientError);
+        assert.equal(error.code, "invalid-response");
+        assert.equal(error.status, status);
+        assert.equal(error.retryable, true);
+        return true;
+      });
+    }
+  });
+
+test("lifecycle engine errors preserve structured conflicts and sent CAS",
+  async () => {
+    const calls = [];
+    const body = {
+      ok: false,
+      error: "the managed tree changed",
+      code: "managed_tree_revision_conflict",
+      retryable: false,
+      conflict: { expected: "tree-r1", actual: "tree-r2" },
+      details: { resource: "managed-tree" },
+    };
+    const client = new EngineClient({
+      transport: async (url, init) => {
+        calls.push({ url, init });
+        return response(409, body);
+      },
+    });
+
+    await assert.rejects(client.items.delete({
+      itemId: "book:one",
+      recordRevision: "item-r1",
+      managedTreeRevision: "tree-r1",
+      idempotencyKey: "delete:one",
+    }), (error) => {
+      assert.ok(error instanceof EngineClientError);
+      assert.equal(error.status, 409);
+      assert.equal(error.code, "managed_tree_revision_conflict");
+      assert.equal(error.retryable, false);
+      assert.deepEqual(error.details, { resource: "managed-tree" });
+      assert.deepEqual(error.conflict,
+        { expected: "tree-r1", actual: "tree-r2" });
+      assert.strictEqual(error.body, body);
+      return true;
+    });
+    assert.equal(calls[0].init.headers["If-Record-Match"], '"item-r1"');
+    assert.equal(calls[0].init.headers["If-Managed-Tree-Match"],
+      '"tree-r1"');
+    assert.equal(calls[0].init.headers["Idempotency-Key"], "delete:one");
+  });
 
 test("representation commands use path-safe dual-CAS engine resources", async () => {
   const { client, calls } = harness({ ok: true, receipt: {} });
