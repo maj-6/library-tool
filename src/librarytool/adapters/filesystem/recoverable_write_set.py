@@ -150,6 +150,20 @@ class RecoverableWriteSet:
             self._assert_recovery_clear_locked()
             yield
 
+    @contextmanager
+    def recovery_lease(self) -> Iterator[None]:
+        """Hold the workspace lock while coordinating startup recovery.
+
+        Unlike :meth:`workspace_lease`, this deliberately does not reject an
+        unfinished journal: inspecting and repairing that journal is the only
+        valid purpose of this scope. Repository composition may acquire its
+        legacy lock inside this lease and then call :meth:`recover_all`, whose
+        process lock is reentrant.
+        """
+
+        with self._workspace_lock():
+            yield
+
     def begin(
         self,
         *,

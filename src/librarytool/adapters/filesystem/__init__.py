@@ -1,6 +1,7 @@
 """Filesystem-backed engine adapters."""
 
 from .job_history import FilesystemJobHistoryRepository
+from .item_command_repository import FilesystemItemCommandRepository
 from .item_repository import FilesystemItemQueryRepository
 from .interchange_repository import FilesystemInterchangeRepository
 from .recoverable_write_set import (
@@ -16,6 +17,7 @@ from .translation_repository import (
 )
 
 __all__ = [
+    "FilesystemItemCommandRepository",
     "FilesystemItemQueryRepository",
     "FilesystemInterchangeRepository",
     "FilesystemJobHistoryRepository",
