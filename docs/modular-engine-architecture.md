@@ -95,9 +95,11 @@ larger workbench and packaging split described below remains the target:
    expected size, but owned-asset materialization is still a later assets
    boundary. Legacy create, PATCH, and direct undo-restore reject representation
    fields. Entry-folder repointing and page rewrites refresh their integrity
-   manifest through the same command service. Item delete/restore is not yet a
-   composite engine lifecycle, and the catalogue metadata editor has not
-   adopted engine create/update yet.
+   manifest through the same command service. Item delete/restore now has a
+   framework-neutral composite lifecycle contract and a recoverable managed-
+   tree move primitive, but its filesystem repository and public transport are
+   not composed yet. The catalogue metadata editor has not adopted engine
+   create/update yet.
 - The revisioned translation aggregate is now composed over the legacy entry
   folders through `FilesystemTranslationRepository`. Versioned list/detail
   resources and conditional page replacement expose authoritative current,
@@ -224,6 +226,34 @@ The neutral contract admits `copy`, expected digest, and expected size, but the
 production adapter intentionally installs reference-only PDF acquisition until
 owned asset staging and provider traits are available.
 
+### Item lifecycle foundation
+
+Recoverable delete/restore is now modeled independently from any UI or Flask
+route. Delete requires both the catalogue record revision and the logical
+managed-tree revision. Restore requires the tombstone revision and refuses a
+recreated record or orphan tree. Exact operation retries replay a durable
+receipt; reuse of the operation ID for different preconditions conflicts. The
+public tombstone contains identities and revisions only, while the future
+filesystem adapter must keep the full raw record and storage details in a
+private envelope.
+
+The shared write set can now relocate a whole managed entry tree without
+copying its bytes. A version-2 journal fingerprints paths, empty directories,
+file bytes, and modes; rejects links, special files, overlap, collisions, and
+cross-device moves; and uses atomic no-replace renames on supported desktop
+platforms. Tree moves publish before staged file records, letting a lifecycle
+repository persist tombstone and receipt state before publishing the catalogue
+last. Rollback and restart recovery reverse that order. Version-1 file-only
+journals retain their original semantics, while older binaries reject the new
+version instead of silently ignoring a moved tree.
+
+`ManagedTreeSnapshot` describes the logical set of engine-owned assets, not an
+external referenced PDF. A live item with no entry directory receives a stable
+empty-tree revision and uses a no-op move; an orphan physical directory still
+counts as a restore collision. The remaining work is the filesystem lifecycle
+repository, active-job guard, capability/runtime composition, versioned
+delete/restore resources, and migration of the legacy Trash path.
+
 ### Translation aggregate boundary
 
 The scoped first provider-neutral translation vertical is in production. It
@@ -314,10 +344,11 @@ With the lifecycle seam established, migrate these data boundaries in order:
    allocation, catalogue publication, entry assets, nested receipts, replay,
    rollback, and restart recovery in one transaction. Source attachment now
    reuses the catalogue staging seam and publishes its receipt plus catalogue
-   update atomically. Next move item delete and restore behind the same
-   aggregate boundary with recoverable entry-tree tombstones. Do not expose
-   the older catalogue-only tombstone primitive or regress to nesting
-   independently committing services.
+   update atomically. The neutral delete/restore service and recoverable tree
+   transaction now exist. Next compose their filesystem repository, job guard,
+   capability, and versioned resources, then migrate the browser and retire the
+   older catalogue-only tombstone path. Do not regress to nesting independently
+   committing services.
 2. **Representation and canvas resources.** Replace attached filesystem paths
    and page-number assumptions with opaque representation, asset, ordered
    canvas, and structure identities. The first explicit representation

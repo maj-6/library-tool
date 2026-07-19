@@ -77,8 +77,12 @@ Per-component detail lives in each part's own README (map at the end).
   catalogue state, entry assets, component receipts, and the global replay
   receipt publish through one recoverable transaction. The desktop local-path
   route delegates to it, and portable clients use `/api/v1/lib-opens`.
-  Provider-backed OCR/region and translation generation, plus legacy item
-  delete/restore, are not yet fully migrated to these command boundaries.
+  Provider-backed OCR/region and translation generation are not yet fully
+  migrated to these command boundaries. Item delete/restore now has a neutral
+  dual-CAS, tombstone, receipt, and replay contract plus a recoverable no-copy
+  managed-tree move primitive; its filesystem repository, composition, and
+  versioned transport are the next integration slice, so the current routes
+  remain transitional.
 - **Desktop app** — the workbench: an Electron shell (`desktop/`) that
   spawns the Flask sidecar (`tools/whl_explorer/server.py`) on a loopback
   port. Paths split into two roots (`tools/libcommon.py`): **`APP_ROOT`**,
