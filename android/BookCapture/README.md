@@ -76,6 +76,37 @@ photo count and a dropdown of recent scans.
    `docs/cloud_capture_setup.md`); set the Mistral / DeepSeek API keys once —
    they are stored in your cloud profile and shared with the desktop.
 
+## Running it on an emulator
+
+`tools/emulator.ps1` starts a headless AVD, installs nothing itself, and exits
+either when the guest reports `sys.boot_completed` or when it gives up:
+
+```
+powershell -File tools/emulator.ps1 -Action start     # boots, waits, exits
+powershell -File tools/emulator.ps1 -Action status
+powershell -File tools/emulator.ps1 -Action stop
+./gradlew :app:assembleDebug
+adb install -r -t app/build/outputs/apk/debug/app-debug.apk
+```
+
+Create the AVD once (needs `cmdline-tools` in the SDK):
+
+```
+sdkmanager "system-images;android-34;default;x86_64"
+avdmanager create avd -n whl_test -k "system-images;android-34;default;x86_64" -d pixel_6
+```
+
+Three things about that script are deliberate, each from a failure:
+
+- **The emulator is launched detached.** It is a server and never exits, so
+  running it as a tracked child of a build/tool runner leaves that runner
+  waiting forever and holding file handles.
+- **The boot wait is bounded** and kills the emulator on timeout. A hung
+  emulator is otherwise indistinguishable from a slow one.
+- **It passes an explicit `-dns-server`.** With a VPN adapter up (NordLynx and
+  friends) the emulator otherwise re-enumerates the tunnel's addresses forever —
+  the log fills with `Ignore IPv6 address` and the guest never boots at all.
+
 The launcher icon is generated, not hand-placed: `icon.png` here is the
 1024 px master, and `python tools/make_android_icon.py` (from the repo root)
 rewrites the five `ic_launcher_fg.png` density buckets from it.

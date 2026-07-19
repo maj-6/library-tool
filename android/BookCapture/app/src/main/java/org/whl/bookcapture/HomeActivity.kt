@@ -164,12 +164,16 @@ class HomeActivity : AppCompatActivity() {
             val row = inflater.inflate(R.layout.item_collection, list, false)
             row.findViewById<TextView>(R.id.name).text = c.name
             val isCurrent = c.id == current?.id
+            // CURRENT leads: the subline is one ellipsized line, so the tail is
+            // what gets eaten on a narrow screen or a long origin. Losing the
+            // book count there is fine; losing "which collection am I scanning
+            // into" is not.
             row.findViewById<TextView>(R.id.sub).text = listOf(
+                if (isCurrent) getString(R.string.collections_row_current) else "",
                 if (c.from.isEmpty()) getString(R.string.collections_row_no_from)
                 else getString(R.string.collections_row_from, c.from),
                 resources.getQuantityString(
                     R.plurals.collections_row_books, counts[c.id] ?: 0, counts[c.id] ?: 0),
-                if (isCurrent) getString(R.string.collections_row_current) else "",
             ).filter { it.isNotEmpty() }.joinToString(" · ")
             row.findViewById<View>(R.id.currentMarker).setBackgroundColor(
                 getColor(if (isCurrent) R.color.whl_cyan else R.color.whl_face_sh2))
