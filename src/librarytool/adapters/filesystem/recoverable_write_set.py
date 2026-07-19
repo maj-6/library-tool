@@ -14,11 +14,14 @@ services should not depend on this module or learn the on-disk layout.
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
 import os
 import shutil
 import stat
+import sys
 import threading
 import uuid
 from collections.abc import Callable, Mapping
@@ -45,7 +48,11 @@ JournalState = Literal[
 ]
 PublishHook = Callable[[int, Path], None]
 
-_JOURNAL_VERSION = 1
+_LEGACY_JOURNAL_VERSION = 1
+_TREE_MOVE_JOURNAL_VERSION = 2
+_SUPPORTED_JOURNAL_VERSIONS = frozenset(
+    {_LEGACY_JOURNAL_VERSION, _TREE_MOVE_JOURNAL_VERSION}
+)
 _TRANSACTIONS_NAME = ".transactions"
 _JOURNAL_NAME = "journal.json"
 _KNOWN_JOURNAL_STATES = frozenset(
@@ -90,6 +97,12 @@ class RecoveryResult:
 class _StagedOperation:
     target: str
     payload: bytes | None
+
+
+@dataclass(frozen=True, slots=True)
+class _StagedTreeMove:
+    source: str
+    destination: str
 
 
 _process_locks_guard = threading.Lock()
@@ -302,6 +315,11 @@ class RecoverableWriteSet:
 
     def _rollback_locked(self, directory: Path, journal: dict[str, Any]) -> None:
         try:
+            # Version-2 publication applies every tree move first, followed by
+            # file entries in their staged order.  Undo the exact reverse so a
+            # catalogue or receipt can remain the final publication boundary.
+            # Version-1 journals contain no tree moves, preserving their
+            # original file-only rollback semantics.
             for entry in reversed(self._entries(journal)):
                 target = self._target(entry["target"])
                 before = entry["before"]
@@ -314,6 +332,8 @@ class RecoverableWriteSet:
                         directory, journal, target, before, after, current
                     )
                 self._publish_description(directory, target, before)
+            for move in reversed(self._tree_moves(journal)):
+                self._publish_tree_move(directory, journal, move, forward=False)
             self._remove_created_directories(journal)
             journal["state"] = "rolled_back"
             self._write_journal(directory, journal)
@@ -358,6 +378,160 @@ class RecoverableWriteSet:
                 "current_sha256": current.get("sha256"),
             },
         )
+
+    def _mark_tree_recovery_required(
+        self,
+        directory: Path,
+        journal: dict[str, Any],
+        move: Mapping[str, Any],
+        source_current: Mapping[str, Any],
+        destination_current: Mapping[str, Any],
+    ) -> None:
+        journal["state"] = "recovery_required"
+        journal["recovery_conflict"] = {
+            "source": move["source"],
+            "destination": move["destination"],
+            "expected_tree": dict(move["fingerprint"]),
+            "source_current": dict(source_current),
+            "destination_current": dict(destination_current),
+        }
+        self._write_journal(directory, journal)
+        raise RecoveryRequiredError(
+            "a moved tree is neither the transaction's before- nor after-state",
+            details={
+                "transaction_id": journal.get("transaction_id"),
+                "source": str(self.root / str(move["source"])),
+                "destination": str(self.root / str(move["destination"])),
+                "source_sha256": source_current.get("sha256"),
+                "destination_sha256": destination_current.get("sha256"),
+            },
+        )
+
+    def _publish_tree_move(
+        self,
+        directory: Path,
+        journal: dict[str, Any],
+        move: Mapping[str, Any],
+        *,
+        forward: bool,
+    ) -> None:
+        source = self._target(str(move["source"]), allow_directory=True)
+        destination = self._target(
+            str(move["destination"]), allow_directory=True
+        )
+        expected = move["fingerprint"]
+        source_current = self._snapshot_tree_description(source)
+        destination_current = self._snapshot_tree_description(destination)
+        missing = _missing_tree_description()
+
+        is_before = _same_tree_snapshot(source_current, expected) and _same_tree_snapshot(
+            destination_current, missing
+        )
+        is_after = _same_tree_snapshot(source_current, missing) and _same_tree_snapshot(
+            destination_current, expected
+        )
+        desired_state = is_after if forward else is_before
+        if desired_state:
+            return
+        current_state = is_before if forward else is_after
+        if not current_state:
+            self._mark_tree_recovery_required(
+                directory,
+                journal,
+                move,
+                source_current,
+                destination_current,
+            )
+
+        move_source, move_destination = (
+            (source, destination) if forward else (destination, source)
+        )
+        self._assert_same_tree_move_filesystem(move_source, move_destination)
+        move_destination.parent.mkdir(parents=True, exist_ok=True)
+        self._assert_no_symlink(move_destination)
+        # The final existence check improves diagnostics.  Publication still
+        # uses an atomic no-replace primitive below; a check followed by plain
+        # POSIX ``rename`` could silently replace a concurrently created empty
+        # destination directory.
+        if os.path.lexists(move_destination):
+            self._mark_tree_recovery_required(
+                directory,
+                journal,
+                move,
+                self._snapshot_tree_description(source),
+                self._snapshot_tree_description(destination),
+            )
+        try:
+            _rename_tree_no_replace(move_source, move_destination)
+        except OSError as exc:
+            # A platform call normally reports failure before changing either
+            # endpoint.  Inspect both paths anyway: wrappers, filesystems, and
+            # fault injection can report an error after the rename took
+            # effect.  Treat an exact after-state as published, an exact
+            # before-state as a retryable publication failure, and every other
+            # state as an unresolved collision that must not be overwritten.
+            failed_source = self._snapshot_tree_description(source)
+            failed_destination = self._snapshot_tree_description(destination)
+            failed_is_before = _same_tree_snapshot(
+                failed_source, expected
+            ) and _same_tree_snapshot(failed_destination, missing)
+            failed_is_after = _same_tree_snapshot(
+                failed_source, missing
+            ) and _same_tree_snapshot(failed_destination, expected)
+            failed_desired_state = failed_is_after if forward else failed_is_before
+            if not failed_desired_state:
+                failed_current_state = (
+                    failed_is_before if forward else failed_is_after
+                )
+                if not failed_current_state:
+                    self._mark_tree_recovery_required(
+                        directory,
+                        journal,
+                        move,
+                        failed_source,
+                        failed_destination,
+                    )
+                if exc.errno == errno.EXDEV:
+                    raise UnsafeTargetError(
+                        "a recoverable tree move crossed a filesystem boundary",
+                        code="cross_device_tree_move",
+                        details={
+                            "source": str(move_source),
+                            "destination": str(move_destination),
+                            "cause": str(exc),
+                        },
+                    ) from exc
+                raise WriteSetError(
+                    "the directory tree could not be moved atomically",
+                    code="write_set_tree_move_failed",
+                    details={
+                        "source": str(move_source),
+                        "destination": str(move_destination),
+                        "cause": str(exc),
+                    },
+                    retryable=True,
+                ) from exc
+        _fsync_directory(move_source.parent)
+        if move_destination.parent != move_source.parent:
+            _fsync_directory(move_destination.parent)
+
+        published_source = self._snapshot_tree_description(source)
+        published_destination = self._snapshot_tree_description(destination)
+        published = (
+            _same_tree_snapshot(published_source, missing)
+            and _same_tree_snapshot(published_destination, expected)
+            if forward
+            else _same_tree_snapshot(published_source, expected)
+            and _same_tree_snapshot(published_destination, missing)
+        )
+        if not published:
+            self._mark_tree_recovery_required(
+                directory,
+                journal,
+                move,
+                published_source,
+                published_destination,
+            )
 
     def _publish_description(
         self,
@@ -441,6 +615,63 @@ class RecoverableWriteSet:
             self._target(target)
             entries.append(value)
         return entries
+
+    def _tree_moves(self, journal: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Return validated tree moves from a version-2 journal.
+
+        Version-1 journals predate tree moves and omit ``tree_moves``.  Treating
+        that omission as an empty list preserves their recovery behavior; the
+        journal reader rejects a v1 document that contains the field.
+        """
+
+        raw = journal.get("tree_moves", [])
+        if not isinstance(raw, list):
+            raise RecoveryRequiredError(
+                "the transaction journal has an invalid tree-moves list",
+                details={"transaction_id": journal.get("transaction_id")},
+            )
+        moves: list[dict[str, Any]] = []
+        endpoints: list[str] = []
+        file_targets = [str(entry["target"]) for entry in self._entries(journal)]
+        for value in raw:
+            if not isinstance(value, dict):
+                raise RecoveryRequiredError(
+                    "the transaction journal contains an invalid tree move",
+                    details={"transaction_id": journal.get("transaction_id")},
+                )
+            source = value.get("source")
+            destination = value.get("destination")
+            fingerprint = value.get("fingerprint")
+            if (
+                not isinstance(source, str)
+                or not isinstance(destination, str)
+                or not _valid_tree_fingerprint(fingerprint)
+            ):
+                raise RecoveryRequiredError(
+                    "the transaction journal contains an invalid tree move",
+                    details={"transaction_id": journal.get("transaction_id")},
+                )
+            self._target(source, allow_directory=True)
+            self._target(destination, allow_directory=True)
+            if _paths_overlap(source, destination):
+                raise RecoveryRequiredError(
+                    "the transaction journal contains overlapping tree endpoints",
+                    details={"source": source, "destination": destination},
+                )
+            for endpoint in (source, destination):
+                if any(_paths_overlap(endpoint, other) for other in endpoints):
+                    raise RecoveryRequiredError(
+                        "the transaction journal contains overlapping tree moves",
+                        details={"target": endpoint},
+                    )
+                if any(_paths_overlap(endpoint, target) for target in file_targets):
+                    raise RecoveryRequiredError(
+                        "the transaction journal overlaps file and tree operations",
+                        details={"target": endpoint},
+                    )
+            endpoints.extend((source, destination))
+            moves.append(value)
+        return moves
 
     def _discard_terminal_payloads_locked(self, directory: Path) -> None:
         """Best-effort removal of content copies no longer needed for recovery."""
@@ -586,6 +817,77 @@ class RecoverableWriteSet:
             "mode": stat.S_IMODE(info.st_mode),
         }
 
+    def _snapshot_tree_description(self, target: Path) -> dict[str, Any]:
+        """Describe a directory tree without retaining a content copy."""
+
+        self._assert_no_symlink(target)
+        if not os.path.lexists(target):
+            return _missing_tree_description()
+        if _is_redirecting_path(target):
+            return {
+                "exists": True,
+                "kind": "redirect",
+                "sha256": None,
+            }
+        try:
+            info = os.stat(target, follow_symlinks=False)
+        except OSError as exc:
+            raise WriteSetError(
+                "a tree target could not be inspected",
+                code="write_set_tree_inspection_failed",
+                details={"target": str(target), "cause": str(exc)},
+                retryable=True,
+            ) from exc
+        if not stat.S_ISDIR(info.st_mode):
+            return {
+                "exists": True,
+                "kind": _filesystem_kind(info.st_mode),
+                "sha256": None,
+            }
+        return _fingerprint_tree(target)
+
+    def _assert_same_tree_move_filesystem(
+        self, source: Path, destination: Path
+    ) -> None:
+        ancestor = destination.parent
+        while not os.path.lexists(ancestor):
+            if ancestor == self.root:
+                break
+            ancestor = ancestor.parent
+        if _is_redirecting_path(ancestor):
+            raise UnsafeTargetError(
+                "a tree move destination crosses a redirecting link",
+                details={"destination": str(destination), "link": str(ancestor)},
+            )
+        try:
+            ancestor_info = os.stat(ancestor, follow_symlinks=False)
+            source_info = os.stat(source, follow_symlinks=False)
+        except OSError as exc:
+            raise UnsafeTargetError(
+                "a tree move endpoint could not be inspected",
+                code="unsafe_tree_move_endpoint",
+                details={
+                    "source": str(source),
+                    "destination": str(destination),
+                    "cause": str(exc),
+                },
+            ) from exc
+        if not stat.S_ISDIR(ancestor_info.st_mode):
+            raise UnsafeTargetError(
+                "a tree move destination parent is not a directory",
+                code="unsafe_tree_move_endpoint",
+                details={"destination": str(destination), "parent": str(ancestor)},
+            )
+        if source_info.st_dev != ancestor_info.st_dev:
+            raise UnsafeTargetError(
+                "a recoverable tree move must remain on one filesystem",
+                code="cross_device_tree_move",
+                details={
+                    "source": str(source),
+                    "destination": str(destination),
+                },
+            )
+
     def _transaction_directory(self, transaction_id: str) -> Path:
         value = str(transaction_id)
         if not value or not value.isalnum() or len(value) > 64:
@@ -611,9 +913,24 @@ class RecoverableWriteSet:
                 "the transaction journal cannot be read",
                 details={"path": str(directory / _JOURNAL_NAME)},
             ) from exc
-        if not isinstance(value, dict) or value.get("version") != _JOURNAL_VERSION:
+        version = value.get("version") if isinstance(value, dict) else None
+        if type(version) is not int or version not in _SUPPORTED_JOURNAL_VERSIONS:
             raise RecoveryRequiredError(
                 "the transaction journal version is unsupported",
+                details={"path": str(directory / _JOURNAL_NAME)},
+            )
+        has_tree_moves = "tree_moves" in value
+        if version == _LEGACY_JOURNAL_VERSION and has_tree_moves:
+            raise RecoveryRequiredError(
+                "a version-1 transaction journal may not contain tree moves",
+                details={"path": str(directory / _JOURNAL_NAME)},
+            )
+        if version == _TREE_MOVE_JOURNAL_VERSION and (
+            not isinstance(value.get("tree_moves"), list)
+            or not value["tree_moves"]
+        ):
+            raise RecoveryRequiredError(
+                "a version-2 transaction journal must contain tree moves",
                 details={"path": str(directory / _JOURNAL_NAME)},
             )
         if str(value.get("transaction_id") or "") != directory.name:
@@ -755,6 +1072,7 @@ class RecoverableWriteTransaction:
         self.scope = scope
         self.metadata = metadata
         self._operations: dict[str, _StagedOperation] = {}
+        self._tree_move_operations: list[_StagedTreeMove] = []
         self._prepared = False
         self._committed = False
 
@@ -769,6 +1087,7 @@ class RecoverableWriteTransaction:
             raise TypeError("write-set payload must be bytes-like")
         path = self._owner._target(target)
         relative = path.relative_to(self._owner.root).as_posix()
+        self._assert_file_target_does_not_overlap_tree_move(relative)
         self._operations[relative] = _StagedOperation(relative, bytes(payload))
 
     def stage_delete(self, target: str | Path) -> None:
@@ -776,14 +1095,85 @@ class RecoverableWriteTransaction:
         self._ensure_stageable()
         path = self._owner._target(target)
         relative = path.relative_to(self._owner.root).as_posix()
+        self._assert_file_target_does_not_overlap_tree_move(relative)
         self._operations[relative] = _StagedOperation(relative, None)
+
+    def stage_tree_move(
+        self, source: str | Path, destination: str | Path
+    ) -> None:
+        """Stage an atomic, same-filesystem rename of one directory tree.
+
+        Tree bytes are never copied into the journal.  Preparation records a
+        deterministic fingerprint and commit publishes the tree with one
+        directory rename.  This makes the primitive suitable for large item
+        tombstones while retaining deterministic restart recovery.
+        """
+
+        self._ensure_stageable()
+        source_path = self._owner._target(source, allow_directory=True)
+        destination_path = self._owner._target(destination, allow_directory=True)
+        source_relative = source_path.relative_to(self._owner.root).as_posix()
+        destination_relative = destination_path.relative_to(
+            self._owner.root
+        ).as_posix()
+        if _paths_overlap(source_relative, destination_relative):
+            raise WriteSetError(
+                "a tree move source and destination may not overlap",
+                code="overlapping_write_set_operations",
+                details={
+                    "source": source_relative,
+                    "destination": destination_relative,
+                },
+            )
+        for target in self._operations:
+            if _paths_overlap(source_relative, target) or _paths_overlap(
+                destination_relative, target
+            ):
+                raise WriteSetError(
+                    "file and tree operations may not overlap",
+                    code="overlapping_write_set_operations",
+                    details={"target": target},
+                )
+        for move in self._tree_move_operations:
+            for endpoint in (source_relative, destination_relative):
+                if _paths_overlap(endpoint, move.source) or _paths_overlap(
+                    endpoint, move.destination
+                ):
+                    raise WriteSetError(
+                        "staged tree moves may not overlap",
+                        code="overlapping_write_set_operations",
+                        details={"target": endpoint},
+                    )
+
+        source_snapshot = self._owner._snapshot_tree_description(source_path)
+        if not _is_tree_snapshot(source_snapshot):
+            raise UnsafeTargetError(
+                "a tree move source must be an existing regular directory tree",
+                code="unsafe_tree_move_source",
+                details={"source": source_relative},
+            )
+        destination_snapshot = self._owner._snapshot_tree_description(
+            destination_path
+        )
+        if bool(destination_snapshot.get("exists")):
+            raise WriteSetError(
+                "a tree move destination already exists",
+                code="write_set_tree_destination_exists",
+                details={"destination": destination_relative},
+            )
+        self._owner._assert_same_tree_move_filesystem(
+            source_path, destination_path
+        )
+        self._tree_move_operations.append(
+            _StagedTreeMove(source_relative, destination_relative)
+        )
 
     def prepare(self) -> None:
         """Persist preimages, postimages, hashes, and a ``prepared`` journal."""
         self._ensure_open()
         if self._prepared:
             return
-        if not self._operations:
+        if not self._operations and not self._tree_move_operations:
             raise WriteSetError(
                 "a write-set transaction has no operations",
                 code="empty_write_set",
@@ -823,6 +1213,20 @@ class RecoverableWriteTransaction:
                 journal["receipt"] = dict(receipt)
             self._owner._write_journal(directory, journal)
             try:
+                # Version 2 reserves the leading publication slots for tree
+                # moves.  File entries retain their staging order afterward,
+                # allowing a repository to stage its catalogue entry last.
+                tree_moves = self._owner._tree_moves(journal)
+                for index, move in enumerate(tree_moves):
+                    destination = self._owner._target(
+                        move["destination"], allow_directory=True
+                    )
+                    if self._owner._publish_hook is not None:
+                        self._owner._publish_hook(index, destination)
+                    self._owner._publish_tree_move(
+                        directory, journal, move, forward=True
+                    )
+                tree_move_count = len(tree_moves)
                 for index, entry in enumerate(self._owner._entries(journal)):
                     target = self._owner._target(entry["target"])
                     before = entry["before"]
@@ -835,7 +1239,7 @@ class RecoverableWriteTransaction:
                             directory, journal, target, before, after, current
                         )
                     if self._owner._publish_hook is not None:
-                        self._owner._publish_hook(index, target)
+                        self._owner._publish_hook(tree_move_count + index, target)
                     self._owner._publish_description(directory, target, after)
                     published = self._owner._snapshot_description(target)
                     if not _same_snapshot(published, after):
@@ -867,6 +1271,7 @@ class RecoverableWriteTransaction:
         (directory / "before").mkdir(mode=0o700)
         (directory / "after").mkdir(mode=0o700)
         entries: list[dict[str, Any]] = []
+        tree_moves: list[dict[str, Any]] = []
         created_directories: set[str] = set()
         try:
             for index, operation in enumerate(self._operations.values()):
@@ -917,8 +1322,59 @@ class RecoverableWriteTransaction:
                         "after": after,
                     }
                 )
+            for operation in self._tree_move_operations:
+                source = self._owner._target(
+                    operation.source, allow_directory=True
+                )
+                destination = self._owner._target(
+                    operation.destination, allow_directory=True
+                )
+                fingerprint = self._owner._snapshot_tree_description(source)
+                if not _is_tree_snapshot(fingerprint):
+                    raise UnsafeTargetError(
+                        "a tree move source must remain an existing regular tree",
+                        code="unsafe_tree_move_source",
+                        details={"source": operation.source},
+                    )
+                # A second full pass makes a concurrently changing tree fail
+                # preparation instead of producing a hybrid fingerprint.
+                confirmation = self._owner._snapshot_tree_description(source)
+                if not _same_tree_snapshot(fingerprint, confirmation):
+                    raise WriteSetError(
+                        "a tree changed while its fingerprint was captured",
+                        code="write_set_prepare_conflict",
+                        details={"source": operation.source},
+                        retryable=True,
+                    )
+                destination_snapshot = self._owner._snapshot_tree_description(
+                    destination
+                )
+                if bool(destination_snapshot.get("exists")):
+                    raise WriteSetError(
+                        "a tree move destination already exists",
+                        code="write_set_tree_destination_exists",
+                        details={"destination": operation.destination},
+                    )
+                self._owner._assert_same_tree_move_filesystem(source, destination)
+                parent = destination.parent
+                while parent != self._owner.root and not parent.exists():
+                    created_directories.add(
+                        parent.relative_to(self._owner.root).as_posix()
+                    )
+                    parent = parent.parent
+                tree_moves.append(
+                    {
+                        "source": operation.source,
+                        "destination": operation.destination,
+                        "fingerprint": fingerprint,
+                    }
+                )
             journal = {
-                "version": _JOURNAL_VERSION,
+                "version": (
+                    _TREE_MOVE_JOURNAL_VERSION
+                    if tree_moves
+                    else _LEGACY_JOURNAL_VERSION
+                ),
                 "transaction_id": self.transaction_id,
                 "operation_id": self.operation_id,
                 "scope": self.scope,
@@ -927,6 +1383,11 @@ class RecoverableWriteTransaction:
                 "created_directories": sorted(created_directories),
                 "entries": entries,
             }
+            if tree_moves:
+                # Version 2 is a feature boundary, not merely an additive
+                # field.  A pre-tree-move binary must reject this journal
+                # instead of silently ignoring a live directory rename.
+                journal["tree_moves"] = tree_moves
             self._owner._write_journal(directory, journal)
             _fsync_directory(directory)
             _fsync_directory(self._owner.transactions_dir)
@@ -953,6 +1414,381 @@ class RecoverableWriteTransaction:
                 code="write_set_already_prepared",
                 details={"transaction_id": self.transaction_id},
             )
+
+    def _assert_file_target_does_not_overlap_tree_move(self, target: str) -> None:
+        for move in self._tree_move_operations:
+            if _paths_overlap(target, move.source) or _paths_overlap(
+                target, move.destination
+            ):
+                raise WriteSetError(
+                    "file and tree operations may not overlap",
+                    code="overlapping_write_set_operations",
+                    details={"target": target},
+                )
+
+
+def _paths_overlap(left: str, right: str) -> bool:
+    """Compare journal paths conservatively across case-sensitive platforms."""
+
+    left_parts = tuple(part.casefold() for part in PurePath(left).parts)
+    right_parts = tuple(part.casefold() for part in PurePath(right).parts)
+    shorter = min(len(left_parts), len(right_parts))
+    return left_parts[:shorter] == right_parts[:shorter]
+
+
+def _missing_tree_description() -> dict[str, Any]:
+    return {
+        "exists": False,
+        "kind": "directory_tree",
+        "sha256": None,
+        "file_count": 0,
+        "directory_count": 0,
+    }
+
+
+def _is_tree_snapshot(value: Mapping[str, Any]) -> bool:
+    return (
+        bool(value.get("exists"))
+        and value.get("kind") == "directory_tree"
+        and isinstance(value.get("sha256"), str)
+    )
+
+
+def _valid_tree_fingerprint(value: object) -> bool:
+    if not isinstance(value, dict) or not _is_tree_snapshot(value):
+        return False
+    digest = value.get("sha256")
+    file_count = value.get("file_count")
+    directory_count = value.get("directory_count")
+    return (
+        isinstance(digest, str)
+        and len(digest) == 64
+        and all(character in "0123456789abcdef" for character in digest)
+        and isinstance(file_count, int)
+        and not isinstance(file_count, bool)
+        and file_count >= 0
+        and isinstance(directory_count, int)
+        and not isinstance(directory_count, bool)
+        and directory_count >= 1
+    )
+
+
+def _same_tree_snapshot(
+    left: Mapping[str, Any], right: Mapping[str, Any]
+) -> bool:
+    if bool(left.get("exists")) != bool(right.get("exists")):
+        return False
+    if not bool(right.get("exists")):
+        return True
+    return (
+        left.get("kind") == right.get("kind")
+        and left.get("sha256") == right.get("sha256")
+        and left.get("file_count") == right.get("file_count")
+        and left.get("directory_count") == right.get("directory_count")
+    )
+
+
+def _filesystem_kind(mode: int) -> str:
+    if stat.S_ISREG(mode):
+        return "file"
+    if stat.S_ISDIR(mode):
+        return "directory_tree"
+    if stat.S_ISLNK(mode):
+        return "redirect"
+    return "special"
+
+
+def _stable_stat_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(info.st_dev),
+        int(info.st_ino),
+        int(info.st_mode),
+        int(info.st_size),
+        int(getattr(info, "st_mtime_ns", int(info.st_mtime * 1_000_000_000))),
+        int(getattr(info, "st_ctime_ns", int(info.st_ctime * 1_000_000_000))),
+    )
+
+
+def _fingerprint_tree(root: Path) -> dict[str, Any]:
+    """Hash paths, empty directories, bytes, and modes in deterministic order."""
+
+    records: list[dict[str, Any]] = []
+    file_count = 0
+    directory_count = 0
+    tree_device: int | None = None
+
+    def inspect_file(path: Path, relative: str) -> None:
+        nonlocal file_count
+        if _is_redirecting_path(path):
+            raise UnsafeTargetError(
+                "recoverable tree moves may not contain redirecting links",
+                details={"path": str(path)},
+            )
+        flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+        flags |= int(getattr(os, "O_NOFOLLOW", 0))
+        # If an attacker swaps a previously inspected regular file for a FIFO
+        # or device, opening it must fail validation rather than block recovery.
+        flags |= int(getattr(os, "O_NONBLOCK", 0))
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise WriteSetError(
+                "a tree file could not be opened while fingerprinting",
+                code="write_set_tree_inspection_failed",
+                details={"path": str(path), "cause": str(exc)},
+                retryable=True,
+            ) from exc
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise UnsafeTargetError(
+                    "recoverable tree moves may contain only regular files",
+                    details={"path": str(path), "kind": _filesystem_kind(before.st_mode)},
+                )
+            if tree_device is None or before.st_dev != tree_device:
+                raise UnsafeTargetError(
+                    "recoverable tree moves may not cross filesystem boundaries",
+                    code="cross_device_tree_move",
+                    details={"path": str(path)},
+                )
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 1 << 20)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            path_after = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise WriteSetError(
+                "a tree file changed while it was fingerprinted",
+                code="write_set_prepare_conflict",
+                details={"path": str(path)},
+                retryable=True,
+            ) from exc
+        if (
+            _is_redirecting_path(path)
+            or _stable_stat_identity(before) != _stable_stat_identity(after)
+            or _stable_stat_identity(before) != _stable_stat_identity(path_after)
+        ):
+            raise WriteSetError(
+                "a tree file changed while it was fingerprinted",
+                code="write_set_prepare_conflict",
+                details={"path": str(path)},
+                retryable=True,
+            )
+        records.append(
+            {
+                "kind": "file",
+                "path": relative,
+                "mode": stat.S_IMODE(before.st_mode),
+                "size": int(before.st_size),
+                "sha256": digest.hexdigest(),
+            }
+        )
+        file_count += 1
+
+    def inspect_directory(path: Path, relative: str) -> None:
+        nonlocal directory_count, tree_device
+        if _is_redirecting_path(path):
+            raise UnsafeTargetError(
+                "recoverable tree moves may not contain redirecting links",
+                details={"path": str(path)},
+            )
+        try:
+            before = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise WriteSetError(
+                "a tree directory could not be inspected",
+                code="write_set_tree_inspection_failed",
+                details={"path": str(path), "cause": str(exc)},
+                retryable=True,
+            ) from exc
+        if not stat.S_ISDIR(before.st_mode):
+            raise UnsafeTargetError(
+                "recoverable tree moves may contain only regular directories",
+                details={"path": str(path), "kind": _filesystem_kind(before.st_mode)},
+            )
+        if tree_device is None:
+            tree_device = int(before.st_dev)
+        elif before.st_dev != tree_device:
+            raise UnsafeTargetError(
+                "recoverable tree moves may not cross filesystem boundaries",
+                code="cross_device_tree_move",
+                details={"path": str(path)},
+            )
+        records.append(
+            {
+                "kind": "directory",
+                "path": relative,
+                "mode": stat.S_IMODE(before.st_mode),
+            }
+        )
+        directory_count += 1
+        try:
+            with os.scandir(path) as iterator:
+                children = sorted(iterator, key=lambda entry: entry.name)
+        except OSError as exc:
+            raise WriteSetError(
+                "a tree directory could not be enumerated",
+                code="write_set_tree_inspection_failed",
+                details={"path": str(path), "cause": str(exc)},
+                retryable=True,
+            ) from exc
+        for child in children:
+            child_path = Path(child.path)
+            child_relative = (
+                child.name if not relative else f"{relative}/{child.name}"
+            )
+            if _is_redirecting_path(child_path):
+                raise UnsafeTargetError(
+                    "recoverable tree moves may not contain redirecting links",
+                    details={"path": str(child_path)},
+                )
+            try:
+                child_info = os.stat(child_path, follow_symlinks=False)
+            except OSError as exc:
+                raise WriteSetError(
+                    "a tree entry changed while it was fingerprinted",
+                    code="write_set_prepare_conflict",
+                    details={"path": str(child_path)},
+                    retryable=True,
+                ) from exc
+            if stat.S_ISDIR(child_info.st_mode):
+                inspect_directory(child_path, child_relative)
+            elif stat.S_ISREG(child_info.st_mode):
+                inspect_file(child_path, child_relative)
+            else:
+                raise UnsafeTargetError(
+                    "recoverable tree moves may not contain special files",
+                    details={
+                        "path": str(child_path),
+                        "kind": _filesystem_kind(child_info.st_mode),
+                    },
+                )
+        try:
+            after = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise WriteSetError(
+                "a tree directory changed while it was fingerprinted",
+                code="write_set_prepare_conflict",
+                details={"path": str(path)},
+                retryable=True,
+            ) from exc
+        if (
+            _is_redirecting_path(path)
+            or _stable_stat_identity(before) != _stable_stat_identity(after)
+        ):
+            raise WriteSetError(
+                "a tree directory changed while it was fingerprinted",
+                code="write_set_prepare_conflict",
+                details={"path": str(path)},
+                retryable=True,
+            )
+
+    inspect_directory(root, "")
+    digest = hashlib.sha256()
+    digest.update(b"librarytool-directory-tree-v1\0")
+    for record in sorted(records, key=lambda value: (str(value["path"]), str(value["kind"]))):
+        encoded = json.dumps(
+            record,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8", errors="surrogatepass")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return {
+        "exists": True,
+        "kind": "directory_tree",
+        "sha256": digest.hexdigest(),
+        "file_count": file_count,
+        "directory_count": directory_count,
+    }
+
+
+def _rename_tree_no_replace(source: Path, destination: Path) -> None:
+    """Rename one directory without ever replacing a destination entry.
+
+    Windows ``os.rename`` already has no-replace behavior.  Linux and macOS
+    expose the equivalent only through platform APIs that Python does not wrap.
+    Other POSIX platforms are refused explicitly: falling back to
+    ``os.rename`` would allow a concurrently created empty destination
+    directory to be silently removed.
+    """
+
+    if os.name == "nt":
+        os.rename(source, destination)
+        return
+
+    encoded_source = os.fsencode(source)
+    encoded_destination = os.fsencode(destination)
+    library = ctypes.CDLL(None, use_errno=True)
+    function: Any
+    arguments: tuple[Any, ...]
+    if sys.platform.startswith("linux"):
+        function = getattr(library, "renameat2", None)
+        if function is None:
+            raise WriteSetError(
+                "atomic no-replace directory moves are unavailable",
+                code="atomic_tree_move_unavailable",
+                details={"platform": sys.platform},
+            )
+        function.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        function.restype = ctypes.c_int
+        # Linux AT_FDCWD and RENAME_NOREPLACE.
+        arguments = (-100, encoded_source, -100, encoded_destination, 1)
+    elif sys.platform == "darwin":
+        function = getattr(library, "renamex_np", None)
+        if function is None:
+            raise WriteSetError(
+                "atomic no-replace directory moves are unavailable",
+                code="atomic_tree_move_unavailable",
+                details={"platform": sys.platform},
+            )
+        function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        function.restype = ctypes.c_int
+        # macOS RENAME_EXCL.
+        arguments = (encoded_source, encoded_destination, 0x00000004)
+    else:
+        raise WriteSetError(
+            "atomic no-replace directory moves are unavailable",
+            code="atomic_tree_move_unavailable",
+            details={"platform": sys.platform},
+        )
+
+    ctypes.set_errno(0)
+    if function(*arguments) == 0:
+        return
+    error_number = ctypes.get_errno()
+    unsupported_errors = {
+        errno.EINVAL,
+        errno.ENOSYS,
+        getattr(errno, "ENOTSUP", errno.EINVAL),
+        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+    }
+    if error_number in unsupported_errors:
+        raise WriteSetError(
+            "atomic no-replace directory moves are unavailable",
+            code="atomic_tree_move_unavailable",
+            details={
+                "platform": sys.platform,
+                "source": str(source),
+                "destination": str(destination),
+                "cause": os.strerror(error_number),
+            },
+        )
+    raise OSError(error_number, os.strerror(error_number), str(destination))
 
 
 def _is_redirecting_path(path: Path) -> bool:
