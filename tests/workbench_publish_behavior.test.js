@@ -204,29 +204,16 @@ test("an A save resolving after selecting B leaves B dirty and untouched", async
   };
   const context = vm.createContext({
     state,
-    BUILD_FIELDS: ["title"],
-    el: (id) => els[id],
-    catPickers: { "b-categories": { get: () => [] } },
-    buildDescMd: { get: () => "description" },
-    buildGroupIdFor: () => "",
-    currentBuild: () => state.builds[state.buildSel],
-    buildIsDirty: () => true,
-    activeHistoryTab: () => "workbench",
-    patchBuild: () => wait.promise,
-    status: () => {},
-    renderBuildEditor: () => {},
+    commitBuildMetadataFields: () => wait.promise,
   });
-  vm.runInContext(`let buildPatchConflict = false;
-let buildDirty = true;
-let buildEditGeneration = 4;
-const descState = { id: "A", val: "old" };
+  vm.runInContext(`let buildDirty = true;
 ${declaration("saveBuildFields")}
 this.api = { saveBuildFields, dirty: () => buildDirty };`, context);
 
   const saving = context.api.saveBuildFields();
   state.buildSel = "B";
   els["build-msg"].textContent = "B has unsaved edits";
-  wait.resolve(true);
+  wait.resolve({ ok: true, receipt: { after_revision: "item-r2" } });
   assert.equal(await saving, true);
   assert.equal(context.api.dirty(), true);
   assert.equal(els["build-msg"].textContent, "B has unsaved edits");
@@ -245,7 +232,9 @@ test("verification completion for A cannot repaint selected B", async () => {
     currentBuild: () => state.builds[state.buildSel],
     el: (id) => els[id],
     saveBuildFields: () => wait.promise,
+    patchBuildVerificationCompatibility: async () => ({ ok: true }),
     status: () => { calls.status += 1; },
+    statusErr: () => { calls.status += 1; },
     renderBuildsList: () => { calls.list += 1; },
     renderWorkbench: () => { calls.workbench += 1; },
   });
@@ -253,7 +242,7 @@ test("verification completion for A cannot repaint selected B", async () => {
 this.api = { setVerified };`, context);
   const saving = context.api.setVerified(true);
   state.buildSel = "B";
-  wait.resolve(true);
+  wait.resolve({ ok: true, receipt: { after_revision: "item-r2" } });
   assert.equal(await saving, true);
   assert.deepEqual(calls, { status: 0, list: 0, workbench: 0 });
 });

@@ -1387,7 +1387,7 @@ this.api = { refreshBuildEngineRecord, advanceBuildEngineRecordGeneration };`, c
 test("interactive PDF attachment crosses the representation command boundary", () => {
   const app = fs.readFileSync(appPath, "utf8");
   const start = app.indexOf("async function refreshBuildEngineRecord");
-  const end = app.indexOf("async function patchBuildRaw", start);
+  const end = app.indexOf("const ITEM_EDIT_METADATA_FIELDS", start);
   assert.ok(start >= 0 && end > start);
   const attachment = app.slice(start, end);
 
@@ -1403,10 +1403,15 @@ test("interactive PDF attachment crosses the representation command boundary", (
   assert.doesNotMatch(attachment, /["'`]\/api\/builds/);
   assert.doesNotMatch(attachment, /method:\s*["']HEAD["']/);
 
-  const saveStart = app.indexOf("async function saveBuildFields");
-  const saveEnd = app.indexOf("async function deleteBuild", saveStart);
+  const saveStart = app.indexOf("async function commitBuildMetadataFields");
+  const saveEnd = app.indexOf("const pendingBuildLifecycleDeletes", saveStart);
   const save = app.slice(saveStart, saveEnd);
-  assert.match(save, /if \(f === "pdf_file"\) continue/);
+  assert.match(save, /sourceDraftPending/);
+  const metadataStart = app.indexOf("function buildMetadataPatchFromEditor");
+  const metadataEnd = app.indexOf("function buildMetadataPatchFromBuild",
+    metadataStart);
+  assert.doesNotMatch(app.slice(metadataStart, metadataEnd),
+    /metadata\["pdf_file"\]/);
 
   const refreshStart = app.indexOf("async function refreshSourceTab");
   const refreshEnd = app.indexOf("async function syncBuildFolder", refreshStart);
@@ -2148,64 +2153,423 @@ test("secondary IDs are portable and attach intent never degrades into replace",
   assert.equal(replaceCalls, 0);
 });
 
-test("metadata Save does not claim or persist a PDF source draft", async () => {
+function stableJson(value) {
+  const normalize = (entry) => {
+    if (Array.isArray(entry)) return entry.map(normalize);
+    if (!entry || typeof entry !== "object") return entry;
+    return Object.fromEntries(Object.keys(entry).sort().map(
+      (key) => [key, normalize(entry[key])]));
+  };
+  return JSON.stringify(normalize(value));
+}
+
+function metadataUiHarness(options = {}) {
   const app = fs.readFileSync(appPath, "utf8");
-  const start = app.indexOf("async function saveBuildFields");
-  const end = app.indexOf("const pendingBuildLifecycleDeletes", start);
-  assert.ok(start >= 0 && end > start);
+  const metadataStart = app.indexOf("const ITEM_EDIT_METADATA_FIELDS");
+  const metadataEnd = app.indexOf("async function patchBuildRaw", metadataStart);
+  const saveStart = app.indexOf("async function commitBuildMetadataFields");
+  const saveEnd = app.indexOf("const pendingBuildLifecycleDeletes", saveStart);
+  const verifyStart = app.indexOf("async function setVerified");
+  const verifyEnd = app.indexOf("// a locked phase offers", verifyStart);
+  assert.ok(metadataStart >= 0 && metadataEnd > metadataStart);
+  assert.ok(saveStart >= 0 && saveEnd > saveStart);
+  assert.ok(verifyStart >= 0 && verifyEnd > verifyStart);
+
+  const classNames = new Set();
   const elements = {
-    "b-pdf_file": { value: "C:/scans/new.pdf" },
-    "b-title": { value: "Herbal" },
-    "b-ready": { classList: { contains: () => false } },
+    "b-title": { value: options.title || "Revised Herbal" },
+    "b-subtitle": { value: options.subtitle || "New subtitle" },
+    "b-year": { value: options.year || "1701" },
+    "b-pdf_file": { value: options.pdfDraft || "C:/scans/original.pdf" },
+    "b-ready": { classList: {
+      toggle: (name, on) => on ? classNames.add(name) : classNames.delete(name),
+      contains: (name) => classNames.has(name),
+    } },
+    "b-verified-tag": { hidden: true },
     "build-msg": { textContent: "" },
     "b-src-msg": { textContent: "" },
   };
-  const state = { buildSel: "book", builds: { book: {
-    id: "book", title: "Herbal", updated_at: "item-r1",
-    pdf_file: "C:/scans/old.pdf", status: "draft",
-  } } };
-  const patches = [];
-  const statuses = [];
-  const context = vm.createContext({
-    state,
-    BUILD_FIELDS: ["title", "pdf_file"],
-    el: (id) => elements[id] || null,
-    activeHistoryTab: () => "workbench",
-    buildIsDirty: () => context.metadataDirty,
-    metadataDirty: false,
-    catPickers: { "b-categories": { get: () => [] } },
-    buildDescMd: { get: () => "Description" },
-    currentBuild: () => state.builds[state.buildSel],
-    patchBuild: async (id, fields) => {
-      patches.push({ id, fields: { ...fields } });
-      return true;
-    },
-    buildEditGeneration: 0,
-    buildPatchConflict: false,
-    descState: {},
-    buildDirty: false,
-    renderBuildEditor: () => {},
-    status: (message) => statuses.push(message),
+  const initial = {
+    id: "book", title: "Old Herbal", subtitle: "Old subtitle", year: "1700",
+    category_ids: ["botany"], description: "Old description",
+    status: "ready", published_slug: "old-herbal", ocr_active: "active.md",
+    ocr_verified: "reviewed.md", ocr_quality: "good",
+    capture_id: "phone-1", extra: { collection: "one" },
+    images: ["capture/cover.jpg"], pdf_file: "C:/scans/original.pdf",
+    pdf_sources: [{ id: "alternate", path: "C:/scans/alternate.pdf" }],
+    future_extension: { shelf: 3 }, updated_at: "item-r1",
+    _record_revision: "item-r1",
+    _representations: [{ id: "primary", revision: "source-r1" }],
+    _available_commands: ["item.update", "representation.replace"],
+    ...(options.build || {}),
+  };
+  for (const key of options.absent || []) delete initial[key];
+  const state = { buildSel: "book", builds: { book: copyJson(initial) } };
+  let canonicalTitle = initial.title;
+  let canonicalMetadata = {};
+  for (const key of [
+    "subtitle", "year", "category_ids", "description", "future_extension",
+  ]) {
+    if (Object.prototype.hasOwnProperty.call(initial, key))
+      canonicalMetadata[key] = copyJson(initial[key]);
+  }
+  const revisions = [...(options.revisions || ["item-r2"] )];
+  const calls = { updates: [], legacy: [], refreshes: 0, operations: [],
+    statuses: [], errors: [], list: 0, workbench: 0, upload: 0 };
+  const generations = new Map();
+  let updateNumber = 0;
+  let context;
+
+  const defaultUpdate = async (args) => {
+    canonicalTitle = args.patch.title;
+    for (const key of args.patch.metadata_remove || []) delete canonicalMetadata[key];
+    Object.assign(canonicalMetadata, copyJson(args.patch.metadata_set || {}));
+    const after = revisions.shift() || `item-r${updateNumber + 2}`;
+    return {
+      ok: true,
+      schema: "librarytool.item-mutation-receipt/1",
+      replayed: updateNumber > 1,
+      receipt: {
+        action: "update",
+        operation_id: args.idempotencyKey,
+        command_sha256: "d".repeat(64),
+        item_id: args.itemId,
+        before_revision: args.recordRevision,
+        after_revision: after,
+        item: {
+          id: args.itemId, revision: after, kind: "book",
+          title: canonicalTitle, metadata: copyJson(canonicalMetadata),
+          representations: [],
+        },
+        deletion: null,
+      },
+    };
+  };
+  const update = async (args) => {
+    updateNumber += 1;
+    calls.updates.push(copyJson(args));
+    return options.update
+      ? options.update(args, updateNumber, defaultUpdate)
+      : defaultUpdate(args);
+  };
+  const refresh = async (id) => {
+    calls.refreshes += 1;
+    if (options.refresh) return options.refresh(id, calls.refreshes, state);
+    return state.builds[id] || null;
+  };
+  const legacyFetch = async (url, init) => {
+    calls.legacy.push({ url, init: copyJson(init) });
+    if (options.fetch) return options.fetch(url, init, state, calls);
+    throw new Error("unexpected legacy fetch");
+  };
+  const mergeCompatibility = (raw, prior) => ({
+    ...raw,
+    _record_revision: raw.updated_at || prior._record_revision || "",
+    _representations: prior._representations || [],
+    _available_commands: prior._available_commands,
   });
-  vm.runInContext(`${app.slice(start, end)}
-this.saveBuildFields = saveBuildFields;`, context);
+  context = vm.createContext({
+    state,
+    crypto: { randomUUID: () => `00000000-0000-4000-8000-${
+      String(calls.updates.length + 1).padStart(12, "0")}` },
+    engineClient: { items: { update } },
+    ITEM_CREATE_NON_METADATA_FIELDS: new Set([
+      "id", "item_id", "kind", "title", "created_at", "updated_at",
+      "revision", "representations", "artifacts", "capture_id",
+      "published_slug", "ocr_active", "ocr_verified", "ocr_quality",
+      "title_pages", "thumbnail_source", "status", "pdf_file",
+      "pdf_sources", "images", "extra", "representation_manifest",
+    ]),
+    itemCreatePendingKey: stableJson,
+    buildEngineRecordGeneration: (id) => generations.get(id) || 0,
+    advanceBuildEngineRecordGeneration: (id) => {
+      const next = (generations.get(id) || 0) + 1;
+      generations.set(id, next);
+      return next;
+    },
+    refreshBuildEngineRecord: refresh,
+    mergeBuildCompatibility: mergeCompatibility,
+    fetch: legacyFetch,
+    encodeURIComponent,
+    el: (id) => elements[id] || null,
+    catPickers: { "b-categories": { get: () => ["botany", "history"] } },
+    buildDescMd: { get: () => context.description },
+    description: options.description || "New description",
+    buildGroupIdFor: () => "",
+    buildIsDirty: () => context.metadataDirty,
+    metadataDirty: options.metadataDirty !== false,
+    activeHistoryTab: () => "workbench",
+    currentBuild: () => state.builds[state.buildSel] || null,
+    buildEditGeneration: 1,
+    buildDirty: true,
+    descState: { id: "book", val: "Old description" },
+    pushOp: (label, undoFn, redoFn) => {
+      calls.operations.push({ label, undoFn, redoFn });
+      return calls.operations.length;
+    },
+    renderBuildsList: () => { calls.list += 1; },
+    renderWorkbench: () => { calls.workbench += 1; },
+    renderUpload: () => { calls.upload += 1; },
+    status: (message) => calls.statuses.push(message),
+    statusErr: (message) => calls.errors.push(message),
+  });
+  vm.runInContext(`let buildPatchConflict = false;
+${app.slice(metadataStart, metadataEnd)}
+${app.slice(saveStart, saveEnd)}
+${app.slice(verifyStart, verifyEnd)}
+this.api = { saveBuildFields, setVerified, runBuildMetadataUpdate,
+  patchBuildVerificationCompatibility,
+  pendingCount: () => pendingBuildMetadataUpdates.size };`, context);
+  return { api: context.api, context, calls, elements, state, classNames };
+}
 
-  assert.equal(await context.saveBuildFields(), false);
-  assert.equal(patches.length, 0);
-  assert.equal(elements["build-msg"].textContent, "");
-  assert.equal(elements["b-src-msg"].textContent, "Not attached");
+test("metadata Save uses only the durable portable item patch", async () => {
+  const h = metadataUiHarness({
+    refresh: async () => { throw new Error("semantic read unavailable"); },
+  });
+  const managedBefore = copyJson({
+    status: h.state.builds.book.status,
+    published_slug: h.state.builds.book.published_slug,
+    ocr_active: h.state.builds.book.ocr_active,
+    ocr_verified: h.state.builds.book.ocr_verified,
+    ocr_quality: h.state.builds.book.ocr_quality,
+    capture_id: h.state.builds.book.capture_id,
+    extra: h.state.builds.book.extra,
+    images: h.state.builds.book.images,
+    pdf_file: h.state.builds.book.pdf_file,
+    pdf_sources: h.state.builds.book.pdf_sources,
+    _representations: h.state.builds.book._representations,
+    _available_commands: h.state.builds.book._available_commands,
+  });
 
-  context.metadataDirty = true;
-  assert.equal(await context.saveBuildFields(), true);
-  assert.equal("pdf_file" in patches[0].fields, false);
-  assert.equal(elements["build-msg"].textContent, "Metadata saved");
-  assert.equal(elements["b-src-msg"].textContent, "Not attached");
-  assert.match(statuses[0], /^METADATA SAVED/);
+  assert.equal(await h.api.saveBuildFields(), true);
+  assert.equal(h.calls.updates.length, 1);
+  const command = h.calls.updates[0];
+  assert.equal(command.recordRevision, "item-r1");
+  assert.deepEqual(command.patch.metadata_remove, []);
+  assert.equal(command.patch.representations, null);
+  assert.equal(command.patch.title, "Revised Herbal");
+  assert.equal("status" in command.patch.metadata_set, false);
+  assert.equal("ocr_verified" in command.patch.metadata_set, false);
+  assert.equal("pdf_file" in command.patch.metadata_set, false);
+  assert.equal("expect_updated_at" in command.patch, false);
+  assert.equal(h.calls.legacy.length, 0);
+  assert.equal(h.state.builds.book.title, "Revised Herbal");
+  assert.equal(h.state.builds.book._record_revision, "item-r2");
+  assert.deepEqual(copyJson({
+    status: h.state.builds.book.status,
+    published_slug: h.state.builds.book.published_slug,
+    ocr_active: h.state.builds.book.ocr_active,
+    ocr_verified: h.state.builds.book.ocr_verified,
+    ocr_quality: h.state.builds.book.ocr_quality,
+    capture_id: h.state.builds.book.capture_id,
+    extra: h.state.builds.book.extra,
+    images: h.state.builds.book.images,
+    pdf_file: h.state.builds.book.pdf_file,
+    pdf_sources: h.state.builds.book.pdf_sources,
+    _representations: h.state.builds.book._representations,
+    _available_commands: h.state.builds.book._available_commands,
+  }), managedBefore);
+  assert.deepEqual(copyJson(h.state.builds.book.future_extension), { shelf: 3 });
+});
 
+test("metadata response loss replays one exact command", async () => {
+  const h = metadataUiHarness({
+    update: async (args, number, commit) => {
+      if (number <= 2) {
+        const error = new Error("response lost");
+        error.code = "network-error";
+        error.status = 0;
+        throw error;
+      }
+      return commit(args);
+    },
+  });
+  assert.equal(await h.api.saveBuildFields(), false);
+  assert.equal(h.api.pendingCount(), 1);
+  assert.equal(h.elements["build-msg"].textContent,
+    "Save status unknown — retry to confirm");
+  assert.equal(await h.api.saveBuildFields(), true);
+  assert.equal(h.calls.updates.length, 3);
+  assert.equal(new Set(h.calls.updates.map((call) => call.idempotencyKey)).size, 1);
+  assert.equal(new Set(h.calls.updates.map((call) => stableJson(call.patch))).size, 1);
+  assert.equal(h.api.pendingCount(), 0);
+  assert.equal(h.calls.operations.length, 1);
+});
+
+test("stale metadata Save does not rebase or overwrite a newer draft", async () => {
+  let h;
+  h = metadataUiHarness({
+    update: async () => {
+      h.elements["b-title"].value = "Newest local draft";
+      h.context.buildEditGeneration += 1;
+      const error = new Error("changed elsewhere");
+      error.status = 409;
+      error.code = "item_revision_conflict";
+      throw error;
+    },
+  });
+  assert.equal(await h.api.saveBuildFields(), false);
+  assert.equal(h.calls.updates.length, 1);
+  assert.equal(h.calls.refreshes, 0);
+  assert.equal(h.state.builds.book.title, "Old Herbal");
+  assert.equal(h.elements["b-title"].value, "Newest local draft");
+  assert.equal(h.elements["build-msg"].textContent,
+    "changed elsewhere — your edits are still here");
+  assert.equal(h.calls.operations.length, 0);
+});
+
+test("metadata Save leaves a PDF source draft unattached", async () => {
+  const h = metadataUiHarness({
+    pdfDraft: "C:/scans/new.pdf", metadataDirty: false,
+  });
+  assert.equal(await h.api.saveBuildFields(), false);
+  assert.equal(h.calls.updates.length, 0);
+  assert.equal(h.elements["b-src-msg"].textContent, "Not attached");
+
+  h.context.metadataDirty = true;
+  assert.equal(await h.api.saveBuildFields(), true);
+  assert.equal("pdf_file" in h.calls.updates[0].patch.metadata_set, false);
+  assert.equal(h.state.builds.book.pdf_file, "C:/scans/original.pdf");
+  assert.equal(h.elements["b-pdf_file"].value, "C:/scans/new.pdf");
+  assert.equal(h.elements["b-src-msg"].textContent, "Not attached");
+
+  const app = fs.readFileSync(appPath, "utf8");
   const listenerStart = app.indexOf('el("build-form").addEventListener("input"');
   const listenerEnd = app.indexOf('el("build-save").addEventListener', listenerStart);
   assert.match(app.slice(listenerStart, listenerEnd),
     /ev\.target\.id === "b-pdf_file"\) return/);
+});
+
+test("metadata history retries exactly and chains receipt revisions", async () => {
+  const h = metadataUiHarness({
+    revisions: ["item-r2", "item-r3", "item-r4"],
+    update: async (args, number, commit) => {
+      if (number === 2 || number === 3) {
+        const error = new Error("response lost");
+        error.code = "network-error";
+        error.status = 0;
+        throw error;
+      }
+      return commit(args);
+    },
+  });
+  assert.equal(await h.api.saveBuildFields(), true);
+  const operation = h.calls.operations[0];
+  await assert.rejects(operation.undoFn, /Metadata update failed/);
+  await operation.undoFn();
+  await operation.redoFn();
+
+  assert.equal(h.calls.updates[1].recordRevision, "item-r2");
+  assert.equal(h.calls.updates[2].recordRevision, "item-r2");
+  assert.equal(h.calls.updates[3].recordRevision, "item-r2");
+  assert.equal(new Set(h.calls.updates.slice(1, 4).map(
+    (call) => call.idempotencyKey)).size, 1);
+  assert.equal(h.calls.updates[3].patch.title, "Old Herbal");
+  assert.equal(h.calls.updates[4].recordRevision, "item-r3");
+  assert.equal(h.calls.updates[4].patch.title, "Revised Herbal");
+});
+
+test("metadata history restores an originally absent field", async () => {
+  const h = metadataUiHarness({
+    absent: ["subtitle"], revisions: ["item-r2", "item-r3"],
+  });
+  assert.equal(await h.api.saveBuildFields(), true);
+  await h.calls.operations[0].undoFn();
+  assert.deepEqual(copyJson(h.calls.updates[1].patch.metadata_remove),
+    ["subtitle"]);
+  assert.equal("subtitle" in h.calls.updates[1].patch.metadata_set, false);
+  assert.equal(Object.prototype.hasOwnProperty.call(
+    h.state.builds.book, "subtitle"), false);
+});
+
+test("a committed receipt cannot clean a superseded local projection", async () => {
+  let h;
+  h = metadataUiHarness({
+    update: async (args, _number, commit) => {
+      h.context.advanceBuildEngineRecordGeneration("book");
+      h.state.builds.book = {
+        ...h.state.builds.book,
+        title: "Concurrent projection",
+        _record_revision: "item-concurrent",
+        updated_at: "item-concurrent",
+      };
+      return commit(args);
+    },
+  });
+  const outcome = await h.api.saveBuildFields(null, { returnOutcome: true });
+  assert.equal(outcome.ok, true, "the valid receipt remains the commit point");
+  assert.equal(outcome.adopted, false);
+  assert.equal(outcome.projectionCurrent, false);
+  assert.equal(h.context.buildDirty, true);
+  assert.equal(h.state.builds.book.title, "Concurrent projection");
+  assert.equal(h.elements["build-msg"].textContent,
+    "Earlier edits saved — newer edits are not saved");
+  assert.equal(h.calls.refreshes, 1);
+});
+
+test("verification saves metadata then patches only workflow compatibility", async () => {
+  const h = metadataUiHarness({
+    build: { status: "draft", ocr_active: "active.md", ocr_verified: "" },
+    fetch: async (_url, init, state) => {
+      const body = JSON.parse(init.body);
+      return response(200, { ok: true, build: {
+        ...copyJson(state.builds.book), ...body,
+        id: "book", updated_at: "item-r3",
+      } });
+    },
+  });
+  assert.equal(await h.api.setVerified(true), true);
+  assert.equal(h.calls.updates.length, 1);
+  assert.equal("status" in h.calls.updates[0].patch.metadata_set, false);
+  assert.equal("ocr_verified" in h.calls.updates[0].patch.metadata_set, false);
+  assert.equal(h.calls.legacy.length, 1);
+  assert.deepEqual(JSON.parse(h.calls.legacy[0].init.body), {
+    status: "ready", ocr_verified: "active.md",
+    expect_updated_at: "item-r2",
+  });
+  assert.equal(h.state.builds.book.status, "ready");
+  assert.equal(h.state.builds.book.ocr_verified, "active.md");
+});
+
+test("verification preserves uploaded state and reports partial success", async () => {
+  const uploaded = metadataUiHarness({
+    build: { status: "uploaded", ocr_active: "", ocr_verified: "" },
+  });
+  assert.equal(await uploaded.api.setVerified(false), true);
+  assert.equal(uploaded.calls.legacy.length, 0);
+  assert.equal(uploaded.state.builds.book.status, "uploaded");
+
+  const partial = metadataUiHarness({
+    build: { status: "draft", ocr_active: "", ocr_verified: "" },
+    fetch: async () => { throw new Error("workflow service offline"); },
+  });
+  assert.equal(await partial.api.setVerified(true), false);
+  assert.equal(partial.state.builds.book.title, "Revised Herbal");
+  assert.equal(partial.state.builds.book._record_revision, "item-r2");
+  assert.equal(partial.elements["build-msg"].textContent,
+    "Metadata saved; verification was not changed");
+  assert.match(partial.calls.errors.at(-1), /METADATA SAVED/);
+});
+
+test("verification recognizes a lost committed compatibility response", async () => {
+  const h = metadataUiHarness({
+    build: { status: "draft", ocr_active: "", ocr_verified: "" },
+    fetch: async () => { throw new Error("response lost"); },
+    refresh: async (id, number, state) => {
+      if (number === 2) {
+        state.builds[id] = {
+          ...state.builds[id], status: "ready", updated_at: "item-r3",
+          _record_revision: "item-r3",
+        };
+      }
+      return state.builds[id];
+    },
+  });
+  assert.equal(await h.api.setVerified(true), true);
+  assert.equal(h.calls.legacy.length, 1);
+  assert.equal(h.calls.refreshes, 2);
+  assert.equal(h.state.builds.book.status, "ready");
 });
 
 test("build creation strips legacy sources and attaches before history or selection", async () => {

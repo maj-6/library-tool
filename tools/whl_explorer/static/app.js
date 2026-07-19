@@ -12728,35 +12728,71 @@ function wbLockNote(phase) {
     (phase === "text" ? "text work." : "analysis.");
 }
 
-// Verification is a save action: it persists every field and the description,
-// not just the badge, and removing it relocks Text/Knowledge — both said out
-// loud in the status line, since the side effects were previously silent.
+// Verification crosses two explicit ownership boundaries: portable metadata
+// commits first, then only the legacy workflow flags receive a conditional
+// compatibility patch. A failed second step is reported as partial success.
 async function setVerified(on) {
   const b = currentBuild();
   if (!b) return false;
   const buildId = b.id;
   el("b-ready").classList.toggle("active", !!on);
   el("b-verified-tag").hidden = !on;
-  const saved = await saveBuildFields();
-  // A save can finish after the user selected another book. Never let the old
-  // verification request repaint or relock the new editor.
-  if (state.buildSel !== buildId) return saved;
-  if (saved) {
-    status(on ? "VERIFIED — RECORD SAVED"
-              : "VERIFICATION REMOVED — Text and Knowledge relock");
+  const metadata = await saveBuildFields(null, {
+    forceMetadata: true,
+    returnOutcome: true,
+  });
+  if (!metadata || !metadata.ok || !metadata.receipt) {
+    if (state.buildSel === buildId) {
+      const cur = currentBuild();
+      const verified = cur &&
+        (cur.status === "ready" || cur.status === "uploaded");
+      el("b-ready").classList.toggle("active", !!verified);
+      el("b-verified-tag").hidden = !verified;
+      statusErr("VERIFY :: " +
+        (el("build-msg").textContent || "metadata save failed"));
+    }
+    return false;
+  }
+
+  const current = state.builds[buildId] || b;
+  const desired = {};
+  // Publishing is a stronger workflow state than verification. Neither
+  // checking nor unchecking this control may demote an uploaded record.
+  const desiredStatus = current.status === "uploaded"
+    ? "uploaded" : on ? "ready" : "draft";
+  if (current.status !== desiredStatus) desired.status = desiredStatus;
+  if (on && current.ocr_active &&
+      current.ocr_verified !== current.ocr_active) {
+    desired.ocr_verified = current.ocr_active;
+  } else if (!on && current.ocr_verified) {
+    desired.ocr_verified = "";
+  }
+
+  const workflow = await patchBuildVerificationCompatibility(
+    buildId, desired, metadata.receipt.after_revision);
+  const completed = !!(workflow && workflow.ok);
+  // Completion can follow a selection change. Apply the requested mutation
+  // to its original book, but never repaint the newly selected editor.
+  if (state.buildSel !== buildId) return completed;
+
+  const finalBuild = currentBuild();
+  const verified = finalBuild &&
+    (finalBuild.status === "ready" || finalBuild.status === "uploaded");
+  el("b-ready").classList.toggle("active", !!verified);
+  el("b-verified-tag").hidden = !verified;
+  if (completed) {
+    status(finalBuild && finalBuild.status === "uploaded"
+      ? "PUBLISHED ENTRY — METADATA SAVED"
+      : on ? "VERIFIED — RECORD SAVED"
+           : "VERIFICATION REMOVED — Text and Knowledge relock");
   } else {
-    const cur = currentBuild();
-    const verified = cur && (cur.status === "ready" || cur.status === "uploaded");
-    el("b-ready").classList.toggle("active", !!verified);
-    el("b-verified-tag").hidden = !verified;
-    // saveBuildFields reports into build-msg in the head bar; when this ran
-    // from a locked phase's inline button that corner is far from the click
-    // (and #b-ready is in the hidden Publish phase), so say it out loud too
-    statusErr("VERIFY :: " + (el("build-msg").textContent || "save failed"));
+    el("build-msg").textContent =
+      "Metadata saved; verification was not changed";
+    statusErr("VERIFY :: METADATA SAVED; WORKFLOW UPDATE FAILED");
   }
   renderBuildsList();
   renderWorkbench();      // gates + chips follow the new status immediately
-  return saved;
+  return completed;
 }
 
 // a locked phase offers the unlock where the user hits the wall, instead of
@@ -17665,6 +17701,311 @@ function pushRepresentationOp(label, buildId, sourceId, initialReceipt,
     undefined, originTab);
 }
 
+// Portable catalogue fields are owned by the item engine. Workflow state,
+// local paths, capture provenance, and generated artifacts remain outside
+// this patch surface until their own module commands exist.
+const ITEM_EDIT_METADATA_FIELDS = Object.freeze([
+  "subtitle", "authors", "year", "publisher", "publisher_city", "edition",
+  "volume", "group_id", "language", "pages", "rights", "pdf_source",
+  "source_url", "notes", "category_ids", "description",
+]);
+const pendingBuildMetadataUpdates = new Map();
+let buildMetadataLastFailure = null;
+
+function itemMetadataOperationKey() {
+  const random = globalThis.crypto &&
+    typeof globalThis.crypto.randomUUID === "function"
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+  return `item-update-${random}`;
+}
+
+function itemMetadataMutationAmbiguous(error) {
+  if (!error || error.code === "aborted" || error.name === "AbortError")
+    return false;
+  return error.retryable === true || error.code === "network-error" ||
+    error.code === "invalid-response" || error.status === 0;
+}
+
+function itemMetadataClone(value) {
+  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
+function itemMetadataPatchKey(itemId, recordRevision, patch) {
+  return itemCreatePendingKey({ item_id: itemId,
+    record_revision: recordRevision, patch });
+}
+
+function itemMetadataMutationReceipt(result, command) {
+  const receipt = result && result.receipt;
+  const item = receipt && receipt.item;
+  const patch = command.patch;
+  if (!receipt || !item || result.ok !== true ||
+      result.schema !== "librarytool.item-mutation-receipt/1" ||
+      typeof result.replayed !== "boolean" ||
+      receipt.action !== "update" ||
+      receipt.operation_id !== command.idempotencyKey ||
+      receipt.item_id !== command.itemId ||
+      receipt.before_revision !== command.recordRevision ||
+      typeof receipt.command_sha256 !== "string" ||
+      !/^[0-9a-f]{64}$/.test(receipt.command_sha256) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:+-]{0,511}$/.test(
+        receipt.after_revision || "") ||
+      receipt.after_revision === receipt.before_revision ||
+      receipt.deletion !== null || item.id !== command.itemId ||
+      item.revision !== receipt.after_revision || item.kind !== "book" ||
+      typeof item.title !== "string" || !item.metadata ||
+      typeof item.metadata !== "object" || Array.isArray(item.metadata) ||
+      !Array.isArray(item.representations) ||
+      item.title !== patch.title) return null;
+  for (const [key, value] of Object.entries(patch.metadata_set || {})) {
+    if (!Object.prototype.hasOwnProperty.call(item.metadata, key) ||
+        itemCreatePendingKey(item.metadata[key]) !==
+          itemCreatePendingKey(value)) return null;
+  }
+  for (const key of patch.metadata_remove || []) {
+    if (Object.prototype.hasOwnProperty.call(item.metadata, key)) return null;
+  }
+  return receipt;
+}
+
+function itemMetadataManagedKey(key) {
+  return ITEM_CREATE_NON_METADATA_FIELDS.has(key) || key === "title" ||
+    key === "item_id" || key.startsWith("_");
+}
+
+function adoptItemMetadataReceipt(itemId, receipt, expectedGeneration,
+                                  patch) {
+  const prior = state.builds[itemId];
+  if (!prior || buildEngineRecordGeneration(itemId) !== expectedGeneration)
+    return false;
+  const revision = String(prior._record_revision || "");
+  if (revision !== receipt.before_revision &&
+      revision !== receipt.after_revision) return false;
+
+  const next = { ...prior };
+  for (const key of patch.metadata_remove || []) {
+    if (!itemMetadataManagedKey(key)) delete next[key];
+  }
+  for (const [key, value] of Object.entries(receipt.item.metadata)) {
+    if (!itemMetadataManagedKey(key)) next[key] = itemMetadataClone(value);
+  }
+  next.id = itemId;
+  next.title = receipt.item.title;
+  next.updated_at = receipt.after_revision;
+  next._record_revision = receipt.after_revision;
+  // Starting from the compatibility row and declining the receipt's portable
+  // representation drafts preserves richer source revisions, commands, and
+  // all workflow/capture fields owned by other modules.
+  state.builds[itemId] = next;
+  advanceBuildEngineRecordGeneration(itemId);
+  return true;
+}
+
+function buildProjectionIncludesMetadataReceipt(itemId, receipt, patch) {
+  const build = state.builds[itemId];
+  if (!build) return false;
+  const revision = String(build._record_revision || "");
+  if (!revision || revision === receipt.before_revision ||
+      String(build.title || "") !== receipt.item.title) return false;
+  for (const [key, value] of Object.entries(patch.metadata_set || {})) {
+    if (!Object.prototype.hasOwnProperty.call(build, key) ||
+        itemCreatePendingKey(build[key]) !== itemCreatePendingKey(value))
+      return false;
+  }
+  for (const key of patch.metadata_remove || []) {
+    if (Object.prototype.hasOwnProperty.call(build, key)) return false;
+  }
+  return true;
+}
+
+async function runBuildMetadataUpdate(itemId, patch, recordRevision) {
+  buildPatchConflict = false;
+  buildMetadataLastFailure = null;
+  const pendingKey = itemMetadataPatchKey(itemId, recordRevision, patch);
+  let pending = pendingBuildMetadataUpdates.get(pendingKey);
+  if (!pending) {
+    pending = {
+      args: {
+        itemId,
+        patch: itemMetadataClone(patch),
+        recordRevision,
+        idempotencyKey: itemMetadataOperationKey(),
+      },
+      generation: buildEngineRecordGeneration(itemId),
+    };
+    pendingBuildMetadataUpdates.set(pendingKey, pending);
+  }
+
+  let receipt = null;
+  let knownFailure = false;
+  for (let attempt = 0; attempt < 2 && !receipt; attempt += 1) {
+    try {
+      const result = await engineClient.items.update(pending.args);
+      receipt = itemMetadataMutationReceipt(result, pending.args);
+      if (!receipt) {
+        const invalid = new Error("Item update returned no valid receipt");
+        invalid.code = "invalid-response";
+        invalid.status = 200;
+        invalid.retryable = true;
+        throw invalid;
+      }
+    } catch (error) {
+      buildMetadataLastFailure = error || new Error("Item update failed");
+      if (!itemMetadataMutationAmbiguous(error)) {
+        knownFailure = true;
+        buildPatchConflict = !!error && error.status === 409;
+        break;
+      }
+    }
+  }
+  if (!receipt) {
+    // Ambiguous operations retain their exact command and key. A later click
+    // with the same draft and CAS replays the durable receipt; a changed draft
+    // has a different key and cannot accidentally adopt that older command.
+    if (knownFailure) pendingBuildMetadataUpdates.delete(pendingKey);
+    return null;
+  }
+
+  pendingBuildMetadataUpdates.delete(pendingKey);
+  buildMetadataLastFailure = null;
+  const adopted = adoptItemMetadataReceipt(
+    itemId, receipt, pending.generation, pending.args.patch);
+  // A receipt is the commit point. This read only enriches compatibility
+  // state, and its failure cannot turn the completed command into failure.
+  try { await refreshBuildEngineRecord(itemId); } catch (ignored) {}
+  const projectionCurrent = buildProjectionIncludesMetadataReceipt(
+    itemId, receipt, pending.args.patch);
+  return { receipt, adopted, projectionCurrent };
+}
+
+function buildMetadataPatchFromEditor(build) {
+  const titleInput = el("b-title");
+  const title = String(titleInput ? titleInput.value : build.title || "").trim();
+  if (!title) return null;
+  const metadata = {};
+  for (const field of ITEM_EDIT_METADATA_FIELDS) {
+    if (field === "category_ids" || field === "description") continue;
+    const input = el("b-" + field);
+    if (input) metadata[field] = String(input.value || "").trim();
+  }
+  if (metadata.volume && !metadata.group_id)
+    metadata.group_id = buildGroupIdFor({ title, ...metadata });
+  if (catPickers["b-categories"])
+    metadata.category_ids = itemMetadataClone(
+      catPickers["b-categories"].get() || []);
+  if (buildDescMd) metadata.description = buildDescMd.get();
+  return {
+    title,
+    metadata_set: metadata,
+    metadata_remove: [],
+    representations: null,
+  };
+}
+
+function buildMetadataPatchFromBuild(build, keys) {
+  const metadata = {};
+  const remove = [];
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(build, key)) {
+      remove.push(key);
+    } else if (key === "category_ids") {
+      metadata[key] = itemMetadataClone(build[key] || []);
+    } else {
+      metadata[key] = itemMetadataClone(build[key] == null ? "" : build[key]);
+    }
+  }
+  return {
+    title: String(build.title || ""),
+    metadata_set: metadata,
+    metadata_remove: remove,
+    representations: null,
+  };
+}
+
+function buildMetadataPatchesEqual(left, right) {
+  return itemCreatePendingKey(left) === itemCreatePendingKey(right);
+}
+
+function pushBuildMetadataOp(label, itemId, initialReceipt,
+                             beforePatch, afterPatch, originTab) {
+  if (buildMetadataPatchesEqual(beforePatch, afterPatch)) return null;
+  const transition = { receipt: initialReceipt };
+  const apply = async (target) => {
+    const outcome = await runBuildMetadataUpdate(
+      itemId, target, transition.receipt.after_revision);
+    if (!outcome) {
+      throw new Error(buildPatchConflict
+        ? "Item changed elsewhere" : "Metadata update failed");
+    }
+    transition.receipt = outcome.receipt;
+    if (state.buildSel === itemId && !buildIsDirty()) renderUpload();
+    else {
+      renderBuildsList();
+      renderWorkbench();
+    }
+    return outcome.receipt;
+  };
+  return pushOp(label, () => apply(beforePatch), () => apply(afterPatch),
+    undefined, originTab);
+}
+
+function verificationCompatibilityMatches(build, desired) {
+  if (!build) return false;
+  return Object.entries(desired).every(([key, value]) =>
+    String(build[key] || "") === String(value || ""));
+}
+
+function adoptVerificationCompatibilityBuild(itemId, raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw) ||
+      raw.id !== itemId || typeof raw.updated_at !== "string" ||
+      !raw.updated_at) return false;
+  const prior = state.builds[itemId];
+  if (!prior) return false;
+  advanceBuildEngineRecordGeneration(itemId);
+  state.builds[itemId] = mergeBuildCompatibility(raw, prior);
+  return true;
+}
+
+async function patchBuildVerificationCompatibility(
+    itemId, desiredFields, recordRevision) {
+  const desired = {};
+  for (const key of ["status", "ocr_verified"]) {
+    if (Object.prototype.hasOwnProperty.call(desiredFields || {}, key))
+      desired[key] = String(desiredFields[key] || "");
+  }
+  if (!Object.keys(desired).length)
+    return { ok: true, skipped: true, recovered: false };
+
+  let response = null;
+  let data = null;
+  try {
+    response = await fetch(`/api/builds/${encodeURIComponent(itemId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...desired, expect_updated_at: recordRevision }),
+    });
+    data = await response.json().catch(() => null);
+  } catch (ignored) { /* a committed response can be lost */ }
+
+  const adoptedResponse = !!(data && data.build &&
+    adoptVerificationCompatibilityBuild(itemId, data.build));
+  if (adoptedResponse &&
+      verificationCompatibilityMatches(state.builds[itemId], desired)) {
+    return { ok: true, skipped: false,
+      recovered: !(response && response.ok && data.ok) };
+  }
+  // Do not rebase and resend. A semantic read can prove that a response was
+  // lost after commit; otherwise this is an honest metadata-only partial
+  // success and the curator can decide whether to retry verification.
+  try {
+    await refreshBuildEngineRecord(itemId);
+    if (verificationCompatibilityMatches(state.builds[itemId], desired))
+      return { ok: true, skipped: false, recovered: true };
+  } catch (ignored) {}
+  return { ok: false, skipped: false, recovered: false };
+}
+
 async function patchBuildRaw(id, fields, quiet) {
   buildPatchConflict = false;
   let res;
@@ -17740,90 +18081,92 @@ async function patchBuild(id, fields, label, originTab = activeHistoryTab()) {
   return false;
 }
 
-async function saveBuildFields(ev) {
-  if (ev) ev.preventDefault();
+async function commitBuildMetadataFields(options = {}) {
   const originTab = activeHistoryTab();
   const id = state.buildSel;
-  if (!id) return false;
+  const prior = id && state.builds[id];
+  if (!prior) return { ok: false, receipt: null, reason: "no-item" };
+
   const sourceInput = el("b-pdf_file");
   const sourceDraftPath = sourceInput
     ? String(sourceInput.value || "").trim() : "";
   const sourceDraftPending = sourceDraftPath !==
-    String((state.builds[id] && state.builds[id].pdf_file) || "").trim();
+    String(prior.pdf_file || "").trim();
   const metadataDirty = buildIsDirty();
   // The source row has its own conditional command and Attach control. A
-  // metadata save must neither clear that draft nor claim it was persisted.
-  if (sourceDraftPending && !metadataDirty) {
+  // normal metadata save neither clears that draft nor claims it was saved.
+  // Verification forces a metadata CAS first but still leaves the draft alone.
+  if (sourceDraftPending && !metadataDirty && !options.forceMetadata) {
     el("build-msg").textContent = "";
     const sourceMessage = el("b-src-msg");
     if (sourceMessage) sourceMessage.textContent = "Not attached";
-    return false;
+    return { ok: false, receipt: null, reason: "source-draft" };
   }
-  const fields = {};
-  for (const f of BUILD_FIELDS) {
-    if (f === "pdf_file") continue;  // representation commands own sources
-    const input = el("b-" + f);
-    if (input) fields[f] = input.value.trim();
+
+  const patch = buildMetadataPatchFromEditor(prior);
+  if (!patch) {
+    el("build-msg").textContent = "Title is required";
+    return { ok: false, receipt: null, reason: "invalid-title" };
   }
-  fields.category_ids = catPickers["b-categories"].get();
-  fields.description = buildDescMd.get();
-  if (fields.volume && !fields.group_id) fields.group_id = buildGroupIdFor(fields);
-  // an uploaded entry keeps its status — saving a typo fix must not pull
-  // it back into the Pending queue
-  const cur0 = currentBuild();
-  fields.status = cur0 && cur0.status === "uploaded"
-    ? "uploaded"
-    : el("b-ready").classList.contains("active") ? "ready" : "draft";
-  // saving verifies the currently active OCR file for this book
-  const cur = currentBuild();
-  if (cur && cur.ocr_active) fields.ocr_verified = cur.ocr_active;
-  if (!fields.title) { el("build-msg").textContent = "Title is required"; return false; }
-  // optimistic concurrency: a save over a record another writer already
-  // bumped comes back 409 and reloads instead of clobbering it
-  fields.expect_updated_at = (state.builds[id] || {}).updated_at || "";
+  const beforePatch = buildMetadataPatchFromBuild(
+    prior, Object.keys(patch.metadata_set));
+  const recordRevision = String(prior._record_revision || "");
+  if (!recordRevision) {
+    el("build-msg").textContent = "Record revision unavailable";
+    return { ok: false, receipt: null, reason: "missing-revision" };
+  }
+
   const editGeneration = buildEditGeneration;
-  if (await patchBuild(id, fields, `edit build ${fields.title.slice(0, 30)}`,
-      originTab)) {
-    const stillOwnsEditor = state.buildSel === id &&
-      buildEditGeneration === editGeneration &&
-      (!buildDescMd || buildDescMd.get() === fields.description);
-    if (stillOwnsEditor) {
-      descState.id = id;
-      descState.val = fields.description;
-      buildDirty = false;
-      // a save that demotes ready->draft relocks Text/Knowledge — say so
-      // instead of a generic Saved (the toggle-off + Save path was silent)
-      el("build-msg").textContent =
-        cur0 && cur0.status === "ready" && fields.status === "draft"
-          ? `${sourceDraftPending ? "Metadata saved" : "Saved"} — ` +
-            "verification removed; Text and Knowledge relock"
-          : sourceDraftPending ? "Metadata saved" : "Saved";
-      const sourceStillPending = sourceDraftPending && sourceInput &&
-        sourceInput.value.trim() === sourceDraftPath &&
-        String((state.builds[id] && state.builds[id].pdf_file) || "").trim() !==
-          sourceDraftPath;
-      if (sourceStillPending) {
-        const sourceMessage = el("b-src-msg");
-        if (sourceMessage) sourceMessage.textContent = "Not attached";
-      }
-    }
-    status(`${sourceDraftPending ? "METADATA" : "BUILD"} SAVED :: ${fields.title}`);
-    return true;
-  } else {
+  const description = patch.metadata_set.description;
+  const outcome = await runBuildMetadataUpdate(id, patch, recordRevision);
+  if (!outcome) {
     if (state.buildSel === id) {
-      const canReload = buildPatchConflict &&
-        buildEditGeneration === editGeneration &&
-        (!buildDescMd || buildDescMd.get() === fields.description);
-      if (canReload) {
-        renderBuildEditor();
-      }
+      const uncertain = itemMetadataMutationAmbiguous(buildMetadataLastFailure);
       el("build-msg").textContent = buildPatchConflict
-        ? canReload ? "changed elsewhere — reloaded"
-                    : "changed elsewhere — your newer edits are still here; save again"
-        : "Save failed";
+        ? "changed elsewhere — your edits are still here"
+        : uncertain ? "Save status unknown — retry to confirm"
+                    : "Save failed";
     }
-    return false;
+    return { ok: false, receipt: null,
+      reason: buildPatchConflict ? "conflict" : "failed" };
   }
+
+  const stillOwnsEditor = outcome.projectionCurrent && state.buildSel === id &&
+    buildEditGeneration === editGeneration &&
+    (!buildDescMd || buildDescMd.get() === description);
+  if (stillOwnsEditor) {
+    descState.id = id;
+    descState.val = description;
+    buildDirty = false;
+    el("build-msg").textContent = sourceDraftPending
+      ? "Metadata saved" : "Saved";
+    const sourceStillPending = sourceDraftPending && sourceInput &&
+      sourceInput.value.trim() === sourceDraftPath &&
+      String((state.builds[id] && state.builds[id].pdf_file) || "").trim() !==
+        sourceDraftPath;
+    if (sourceStillPending) {
+      const sourceMessage = el("b-src-msg");
+      if (sourceMessage) sourceMessage.textContent = "Not attached";
+    }
+  } else if (state.buildSel === id) {
+    el("build-msg").textContent =
+      "Earlier edits saved — newer edits are not saved";
+  }
+
+  pushBuildMetadataOp(
+    `edit build ${patch.title.slice(0, 30)}`, id, outcome.receipt,
+    beforePatch, patch, originTab);
+  renderBuildsList();
+  renderWorkbench();
+  status(`${sourceDraftPending ? "METADATA" : "BUILD"} SAVED :: ${patch.title}`);
+  return { ok: true, receipt: outcome.receipt, adopted: outcome.adopted,
+    projectionCurrent: outcome.projectionCurrent, sourceDraftPending };
+}
+
+async function saveBuildFields(ev, options = {}) {
+  if (ev) ev.preventDefault();
+  const outcome = await commitBuildMetadataFields(options);
+  return options.returnOutcome ? outcome : outcome.ok;
 }
 
 const pendingBuildLifecycleDeletes = new Map();
