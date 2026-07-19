@@ -24,6 +24,7 @@ from .items import ItemQueryService, WorkbenchPolicyPort
 from .jobs import JobManager
 from .replica import ReplicaApplicationService
 from .representation_commands import RepresentationCommandService
+from .secret_store import SecretStoreService
 from .text_layers import TextLayerService
 from .translations import TranslationProvenanceService, TranslationService
 
@@ -428,6 +429,9 @@ CANVAS_QUERY_SERVICE: ServiceKey[CanvasQueryService] = ServiceKey(
 CANVAS_PREPARATION_SERVICE: ServiceKey[CanvasPreparationService] = ServiceKey(
     "library.canvases.prepare"
 )
+SECRET_STORE_SERVICE: ServiceKey[SecretStoreService] = ServiceKey(
+    "library.secrets"
+)
 ITEM_COMMAND_SERVICE: ServiceKey[ItemCommandService] = ServiceKey(
     "library.items.commands"
 )
@@ -635,6 +639,7 @@ __all__ = [
     "ModuleContribution",
     "REPLICA_SERVICE",
     "REPRESENTATION_COMMAND_SERVICE",
+    "SECRET_STORE_SERVICE",
     "ServiceBinding",
     "ServiceKey",
     "ServiceNotFoundError",

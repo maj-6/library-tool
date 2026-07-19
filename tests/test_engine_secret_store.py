@@ -8,6 +8,10 @@ from contextlib import contextmanager
 
 import pytest
 
+from librarytool.engine import (
+    SECRET_STORE_SERVICE,
+    SecretStoreService as ExportedSecretStoreService,
+)
 from librarytool.engine.errors import (
     ConflictError,
     NotFoundError,
@@ -220,6 +224,13 @@ def test_status_is_immutable_round_trips_and_uses_fixed_mask():
     tampered["masked_hint"] = "...last-four"
     with pytest.raises(ValueError, match="masked_hint"):
         SecretStatus.from_dict(tampered)
+
+
+def test_secret_contract_is_exported_under_an_unbound_runtime_key():
+    assert ExportedSecretStoreService is SecretStoreService
+    assert SECRET_STORE_SERVICE.id == "library.secrets"
+    assert SECRET_STORE_SERVICE.version == 1
+    assert SECRET_STORE_SERVICE.token == "library.secrets@1"
 
 
 @pytest.mark.parametrize("revision", ["secret\x00r1", "secret\x1fr1", "secret\x7fr1"])
