@@ -85,6 +85,9 @@ from librarytool.adapters.lib_archive import (  # noqa: E402
 from librarytool.adapters.filesystem.recoverable_write_set import (  # noqa: E402
     RecoverableWriteSet,
 )
+from librarytool.adapters.filesystem.whl_catalogue_codec import (  # noqa: E402
+    WhlCatalogueItemCodec,
+)
 from librarytool.composition.filesystem import (  # noqa: E402
     CatalogueBindings,
     FilesystemEnginePaths,
@@ -3222,183 +3225,36 @@ def api_build_ocr_layout(build_id: str):
                         if v}})
 
 
-_ENGINE_ITEM_LOCAL_FIELDS = frozenset({
-    # These values remain available through the explicitly requested legacy
-    # build projection, but are not part of the portable catalogue DTO.
-    "pdf_file", "pdf_sources", "images", "extra",
-})
-
-# The first command slice deliberately controls catalogue metadata only.
-# Attachments and job-owned state remain hidden in the transitional record and
-# are copied byte-for-byte by the codec; future representation commands will
-# receive their own aggregate and concurrency boundary.
-_ENGINE_ITEM_COMMAND_MANAGED_FIELDS = frozenset({
-    "id", "item_id", "kind", "title", "created_at", "updated_at",
-    "revision", "representations", "artifacts", "relevance", "capture_id",
-    "published_slug", "ocr_active", "ocr_verified", "ocr_quality",
-    "title_pages", "thumbnail_source", "status",
-    "representation_manifest",
-}) | _ENGINE_ITEM_LOCAL_FIELDS
-_ENGINE_ITEM_COMMAND_MANAGED_STRING_FIELDS = frozenset({
-    "published_slug", "ocr_active", "ocr_verified", "ocr_quality",
-    "title_pages", "thumbnail_source",
-})
-_ENGINE_ITEM_COMMAND_STRING_FIELDS = (
-    frozenset(_BUILD_FIELDS)
-    - frozenset(_BUILD_STRUCTURED_FIELDS)
-    - _ENGINE_ITEM_COMMAND_MANAGED_FIELDS
-    - {"title"}
-)
-_ENGINE_ITEM_CATEGORY_ID = re.compile(r"^\w{1,12}$")
-_ENGINE_ITEM_CAPTURE_ID = re.compile(r"^[A-Za-z0-9-]{0,64}$")
-_ENGINE_ITEM_LANGUAGE_ID = re.compile(r"^[a-z-]{1,12}$")
-_ENGINE_ITEM_RECORD_REVISION = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,511}$")
+# Transitional HTTP and representation adapters still use this vocabulary.
+# The reusable row codec is now its single owner.
+_ENGINE_ITEM_COMMAND_MANAGED_FIELDS = WhlCatalogueItemCodec.managed_fields
 _ENGINE_REPRESENTATION_ID = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 _ENGINE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _engine_valid_record_revision(value) -> bool:
-    return isinstance(value, str) and bool(
-        _ENGINE_ITEM_RECORD_REVISION.fullmatch(value))
+    return WhlCatalogueItemCodec.valid_record_revision(value)
 
 
 def _engine_build_record_revision(item_id: str, raw: Mapping) -> str:
-    """Return the command/read-model CAS token without entry-folder reads."""
-    updated_at = raw.get("updated_at")
-    if _engine_valid_record_revision(updated_at):
-        return updated_at
-    canonical = json.dumps(
-        {"item_id": item_id, "record": raw},
-        ensure_ascii=False, allow_nan=False, sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return "ir-" + hashlib.sha256(canonical).hexdigest()[:24]
+    return _ENGINE_ITEM_CODEC.record_revision(item_id, raw)
 
 
 def _engine_validate_bundle(value) -> None:
-    if not isinstance(value, Mapping):
-        raise TypeError("bundle must be an object")
-    allowed = {"about", "annotations", "pages_text", "translations"}
-    if not set(value) <= allowed:
-        raise ValueError("bundle contains unknown fields")
-    for field in ("about", "annotations", "pages_text"):
-        if field in value and not isinstance(value[field], bool):
-            raise TypeError(f"bundle.{field} must be a boolean")
-    if "translations" in value:
-        translations = value["translations"]
-        if not isinstance(translations, (list, tuple)):
-            raise TypeError("bundle.translations must be an array")
-        if (
-            any(not isinstance(item, str)
-                or not _ENGINE_ITEM_LANGUAGE_ID.fullmatch(item)
-                for item in translations)
-            or len(translations) != len(set(translations))
-        ):
-            raise ValueError("bundle.translations is invalid")
+    _ENGINE_ITEM_CODEC.validate_bundle(value)
 
 
 def _engine_validate_catalogue_metadata(
         metadata: Mapping, *, strict_fields=frozenset()) -> None:
-    """Validate known legacy fields while retaining unknown JSON extensions."""
-    if not isinstance(metadata, Mapping):
-        raise TypeError("metadata must be an object")
-    for field in _ENGINE_ITEM_COMMAND_STRING_FIELDS:
-        if field in metadata and not isinstance(metadata[field], str):
-            raise TypeError(f"metadata.{field} must be a string")
-        if (field in metadata and field in strict_fields and metadata[field] !=
-                metadata[field].strip()):
-            raise ValueError(
-                f"metadata.{field} must not have outer whitespace")
-    if "status" in metadata and metadata["status"] not in _BUILD_STATUSES:
-        raise ValueError("metadata.status is invalid")
-    if "rights" in metadata and metadata["rights"] not in _BUILD_RIGHTS:
-        raise ValueError("metadata.rights is invalid")
-    if "category_ids" in metadata:
-        values = metadata["category_ids"]
-        if not isinstance(values, (list, tuple)):
-            raise TypeError("metadata.category_ids must be an array")
-        if (
-            any(not isinstance(value, str)
-                or not _ENGINE_ITEM_CATEGORY_ID.fullmatch(value)
-                for value in values)
-            or len(values) != len(set(values))
-        ):
-            raise ValueError("metadata.category_ids is invalid")
-        if "category_ids" in strict_fields:
-            try:
-                taxonomy = lib.load_taxonomy()
-            except Exception as exc:
-                raise EngineRepositoryError(
-                    "the category catalogue is unavailable",
-                    code="category_repository_unavailable",
-                    details={"cause_type": type(exc).__name__},
-                    retryable=True,
-                ) from exc
-            nodes = taxonomy.get("nodes") if isinstance(taxonomy, Mapping) else None
-            if not isinstance(nodes, Mapping):
-                raise EngineRepositoryError(
-                    "the category catalogue is unavailable",
-                    code="category_repository_unavailable",
-                    retryable=True,
-                )
-            if any(value not in nodes for value in values):
-                raise ValueError("metadata.category_ids contains unknown ids")
-    if "bundle" in metadata:
-        _engine_validate_bundle(metadata["bundle"])
+    _ENGINE_ITEM_CODEC.validate_catalogue_metadata(
+        metadata,
+        strict_fields=strict_fields,
+    )
 
 
 def _engine_validate_managed_build_fields(item_id: str, raw: Mapping) -> None:
-    embedded_id = raw.get("id")
-    if embedded_id is not None and (
-        not isinstance(embedded_id, str) or embedded_id != item_id
-    ):
-        raise ValueError("the embedded build id conflicts with its key")
-    if "item_id" in raw and raw["item_id"] != item_id:
-        raise ValueError("the embedded item id conflicts with its key")
-    if "kind" in raw and raw["kind"] != "book":
-        raise ValueError("the transitional catalogue supports only books")
-    if "status" in raw and raw["status"] not in _BUILD_STATUSES:
-        raise ValueError("build status is invalid")
-    if "title" in raw and not isinstance(raw["title"], str):
-        raise TypeError("build title must be a string")
-    if "created_at" in raw and not isinstance(raw["created_at"], str):
-        raise TypeError("build created_at must be a string")
-    if "updated_at" in raw and not isinstance(raw["updated_at"], str):
-        raise TypeError("build updated_at must be a string")
-    if "pdf_file" in raw and not isinstance(raw["pdf_file"], str):
-        raise TypeError("build pdf_file must be a string")
-    for field in _ENGINE_ITEM_COMMAND_MANAGED_STRING_FIELDS:
-        if field in raw and not isinstance(raw[field], str):
-            raise TypeError(f"build {field} must be a string")
-    if "pdf_sources" in raw:
-        sources = raw["pdf_sources"]
-        if not isinstance(sources, (list, tuple)):
-            raise TypeError("build pdf_sources must be an array")
-        for source in sources:
-            if not isinstance(source, Mapping):
-                raise TypeError("build pdf_sources must contain objects")
-            if (
-                not isinstance(source.get("id"), str)
-                or not isinstance(source.get("path"), str)
-            ):
-                raise TypeError("build PDF source ids and paths must be strings")
-    if "images" in raw and (
-        not isinstance(raw["images"], (list, tuple))
-        or any(not isinstance(value, str) for value in raw["images"])
-    ):
-        raise TypeError("build images must be an array of strings")
-    if "extra" in raw and not isinstance(raw["extra"], Mapping):
-        raise TypeError("build extra must be an object")
-    if "relevance" in raw and not isinstance(raw["relevance"], Mapping):
-        raise TypeError("build relevance must be an object")
-    if "capture_id" in raw and (
-        not isinstance(raw["capture_id"], str)
-        or not _ENGINE_ITEM_CAPTURE_ID.fullmatch(raw["capture_id"])
-    ):
-        raise ValueError("build capture_id is invalid")
-    _engine_representation_manifest(raw)
+    _ENGINE_ITEM_CODEC.validate_managed_record(item_id, raw)
 
 
 def _engine_representation_manifest(raw: Mapping) -> dict:
@@ -3482,157 +3338,20 @@ def _engine_representation_manifest(raw: Mapping) -> dict:
 
 def _engine_item_command_decode(
         item_id: str, raw: Mapping) -> ItemRecordSnapshot:
-    """Decode one legacy build into the catalogue-only command aggregate."""
-    if not isinstance(raw, Mapping):
-        raise TypeError("a build record must be an object")
-    _engine_validate_managed_build_fields(item_id, raw)
-    metadata = {
-        key: value for key, value in raw.items()
-        if key not in _ENGINE_ITEM_COMMAND_MANAGED_FIELDS
-    }
-    _engine_validate_catalogue_metadata(metadata)
-    return ItemRecordSnapshot(
-        item_id=item_id,
-        revision=_engine_build_record_revision(item_id, raw),
-        kind="book",
-        title=raw.get("title", ""),
-        metadata=metadata,
-        representations=(),
-    )
+    return _ENGINE_ITEM_CODEC.decode(item_id, raw)
 
 
 def _engine_item_command_encode(
         item_id: str, draft: ItemDraft,
         previous: Mapping | None) -> Mapping:
-    """Encode a catalogue command while retaining server-managed raw state."""
-    if not isinstance(draft, ItemDraft):
-        raise TypeError("the item draft is invalid")
-    if draft.kind != "book" or draft.representations:
-        raise ValueError("only catalogue metadata for books is supported")
-    managed = sorted(set(draft.metadata) &
-                     _ENGINE_ITEM_COMMAND_MANAGED_FIELDS)
-    if managed:
-        raise ValueError("item metadata contains server-managed fields")
-    _engine_validate_catalogue_metadata(draft.metadata)
-
-    if previous is None:
-        if draft.title != draft.title.strip():
-            raise ValueError("item title must not have outer whitespace")
-        _engine_validate_catalogue_metadata(
-            draft.metadata, strict_fields=frozenset(draft.metadata))
-        now = _build_updated_at()
-        result = {
-            "id": item_id,
-            "title": draft.title,
-            "status": "draft",
-            "created_at": now,
-            "updated_at": now,
-            # Transitional readers still expect these server-owned fields to
-            # exist on a freshly created legacy build.  They are deliberately
-            # storage defaults rather than writable ItemDraft metadata.
-            "published_slug": "",
-            "pdf_file": "",
-            "pdf_sources": [],
-            "ocr_active": "",
-            "ocr_verified": "",
-            "ocr_quality": "",
-            "title_pages": "",
-            "thumbnail_source": "",
-            "images": [],
-            "extra": {},
-            "capture_id": "",
-            "representation_manifest": {
-                "version": 1,
-                "sources": {},
-                "detached": [],
-            },
-        }
-    else:
-        if not isinstance(previous, Mapping):
-            raise TypeError("the previous build record is invalid")
-        _engine_validate_managed_build_fields(item_id, previous)
-        previous_metadata = {
-            key: value for key, value in previous.items()
-            if key not in _ENGINE_ITEM_COMMAND_MANAGED_FIELDS
-        }
-        if (draft.title != previous.get("title", "")
-                and draft.title != draft.title.strip()):
-            raise ValueError("item title must not have outer whitespace")
-        changed = frozenset(
-            key for key, value in draft.metadata.items()
-            if key not in previous_metadata
-            or previous_metadata[key] != value
-        )
-        _engine_validate_catalogue_metadata(
-            draft.metadata, strict_fields=changed)
-        result = dict(previous)
-        for key in tuple(result):
-            if key not in _ENGINE_ITEM_COMMAND_MANAGED_FIELDS:
-                del result[key]
-        result["id"] = item_id
-        result["title"] = draft.title
-        result["updated_at"] = _build_updated_at(previous.get("updated_at"))
-    result.update(dict(draft.metadata))
-    return result
+    return _ENGINE_ITEM_CODEC.encode(item_id, draft, previous)
 
 
 def _engine_advance_restored_record(
     item_id: str,
     raw: Mapping,
 ) -> Mapping:
-    """Restore the exact raw build shape with one fresh catalogue revision."""
-
-    if not isinstance(raw, Mapping):
-        raise EngineRepositoryError(
-            "the deleted build record is not an object",
-            code="invalid_item_restore_record",
-        )
-    try:
-        _engine_validate_managed_build_fields(item_id, raw)
-        before = _engine_item_command_decode(item_id, raw)
-        restored = json.loads(json.dumps(
-            raw,
-            ensure_ascii=False,
-            allow_nan=False,
-            separators=(",", ":"),
-        ))
-        if not isinstance(restored, dict) or restored != raw:
-            raise ValueError("the build record cannot be detached exactly")
-    except EngineError:
-        raise
-    except (RecursionError, TypeError, ValueError, UnicodeError) as exc:
-        raise EngineRepositoryError(
-            "the deleted build record failed its storage codec",
-            code="invalid_item_restore_record",
-            details={"cause_type": type(exc).__name__},
-        ) from exc
-
-    restored["id"] = item_id
-    for _attempt in range(2):
-        restored["updated_at"] = _build_updated_at(
-            str(restored.get("updated_at") or "")
-        )
-        try:
-            _engine_validate_managed_build_fields(item_id, restored)
-            after = _engine_item_command_decode(item_id, restored)
-        except EngineError:
-            raise
-        except (RecursionError, TypeError, ValueError, UnicodeError) as exc:
-            raise EngineRepositoryError(
-                "the restored build record failed its storage codec",
-                code="invalid_item_restore_record",
-                details={"cause_type": type(exc).__name__},
-            ) from exc
-        if (
-            after.revision != before.revision
-            and _engine_valid_record_revision(after.revision)
-            and after.revision == restored["updated_at"]
-        ):
-            return restored
-    raise EngineRepositoryError(
-        "the restored build record revision could not be advanced",
-        code="item_restore_revision_not_advanced",
-    )
+    return _ENGINE_ITEM_CODEC.advance_restored_record(item_id, raw)
 
 
 def _engine_open_lib_draft(metadata: Mapping) -> ItemDraft:
@@ -4646,6 +4365,13 @@ def _engine_item_category_ids() -> tuple[str, ...]:
             retryable=True,
         )
     return tuple(nodes)
+
+
+_ENGINE_ITEM_CODEC = WhlCatalogueItemCodec(
+    advance_revision=_build_updated_at,
+    category_ids_for=_engine_item_category_ids,
+    validate_representation_manifest=_engine_representation_manifest,
+)
 
 
 def _engine_host_bindings() -> FilesystemHostBindings:

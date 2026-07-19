@@ -35,6 +35,7 @@ from .translation_repository import (
     FilesystemTranslationRepository,
     translation_id_for_language,
 )
+from .whl_catalogue_codec import WhlCatalogueItemCodec
 
 __all__ = [
     "EMPTY_MANAGED_TREE_REVISION",
@@ -59,5 +60,6 @@ __all__ = [
     "WorkspaceAlreadyOpenError",
     "WorkspaceSessionError",
     "WorkspaceSessionLease",
+    "WhlCatalogueItemCodec",
     "translation_id_for_language",
 ]
