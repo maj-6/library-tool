@@ -83,6 +83,8 @@ def _repository(
 
     def load_source(item_id, reference):
         assert item_id == ITEM_ID
+        if "references" in state:
+            state["references"].append(reference)
         if reference == "missing.txt":
             return None
         return state["source"]
@@ -206,6 +208,64 @@ def test_empty_source_reference_uses_default_but_missing_reference_does_not(
     missing = service.get(ITEM_ID, TRANSLATION_ID)
     assert missing.source.available is False
     assert missing.pages[0].state == "orphaned"
+
+
+def test_available_source_references_are_canonical_across_languages(tmp_path):
+    root = tmp_path / "output"
+    entry = root / "entries" / ITEM_ID
+    source = _source("Alpha")
+    _write_translation(
+        entry,
+        "--- page 1 ---\nUno.\n",
+        {"version": 2, "src": "", "model": "", "pages": {}},
+    )
+    directory = entry / "translations"
+    (directory / "fr.txt").write_text(
+        "--- page 1 ---\nUn.\n", encoding="utf-8"
+    )
+    (directory / "fr.meta.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "src": "compiled.txt",
+                "model": "",
+                "pages": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = {"source": source, "references": []}
+    repository, _ = _repository(root, state)
+
+    with repository.snapshot(ITEM_ID) as session:
+        aggregates = session.list(ITEM_ID)
+        assert {value.target_language for value in aggregates} == {"es", "fr"}
+        assert {value.source_layer_id for value in aggregates} == {"active-ocr"}
+        for aggregate in aggregates:
+            assert session.load_source(
+                ITEM_ID, aggregate.source_layer_id
+            ) == source
+
+    service = TranslationService(_Items(), repository)
+    before = service.get(ITEM_ID, TRANSLATION_ID)
+    service.replace_page(
+        ReplaceTranslationPageCommand(
+            item_id=ITEM_ID,
+            translation_id=TRANSLATION_ID,
+            selector="page:1",
+            text="Nueva.",
+            expected_document_revision=before.document_revision,
+            expected_source_revision=before.source.revision,
+        )
+    )
+
+    # The UOW reloads through the callback's canonical reference even though
+    # this translation's legacy top-level reference was empty.
+    assert state["references"][-1] == "compiled.txt"
+    metadata = json.loads(
+        (directory / "es.meta.json").read_text(encoding="utf-8")
+    )
+    assert metadata["src"] == "compiled.txt"
 
 
 def test_mismatched_legacy_hash_remains_stale(tmp_path):

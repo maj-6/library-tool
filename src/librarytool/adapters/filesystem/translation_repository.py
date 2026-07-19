@@ -614,7 +614,7 @@ class FilesystemTranslationSession:
             self._invalid_storage(
                 metadata_path or text_path, "metadata version is invalid"
             )
-        source_reference = _string_field(
+        raw_source_reference = _string_field(
             metadata.get("src", ""), "src", path=metadata_path or text_path
         )
         top_model = _string_field(
@@ -638,9 +638,16 @@ class FilesystemTranslationSession:
                 )
             raw_records[page] = record
 
-        source = self._read_source(source_reference)
+        source = self._read_source(raw_source_reference)
+        source_reference = (
+            self._source_reference(source)
+            if source is not None
+            else raw_source_reference
+        )
         layer_id = (
-            source.layer_id if source is not None else _fallback_layer_id(source_reference)
+            source.layer_id
+            if source is not None
+            else _fallback_layer_id(raw_source_reference)
         )
         self._remember_source(layer_id, source_reference, source)
         source_canvases = {
@@ -655,7 +662,7 @@ class FilesystemTranslationSession:
                 page=page,
                 text=text,
                 raw=raw,
-                top_source_reference=source_reference,
+                top_source_reference=raw_source_reference,
                 top_model=top_model,
                 source=source,
                 source_canvas=source_canvases.get(page),
