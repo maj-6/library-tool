@@ -30,7 +30,7 @@ from librarytool.composition.filesystem import (
 )
 from librarytool.engine.capabilities import CapabilityRef, ModuleManifest
 from librarytool.engine.contracts import ItemDescriptor
-from librarytool.engine.errors import ConflictError, RepositoryError
+from librarytool.engine.errors import ConflictError, RepositoryError, ValidationError
 from librarytool.engine.interchange import (
     LibImportPlan,
     LibImportPlannerPort,
@@ -102,6 +102,18 @@ class _CommandPolicy:
 
     def contribute(self, _context):
         return WorkbenchContribution(available_commands=("test.open",))
+
+
+class _RejectingItemCommandPolicy:
+    def __init__(self):
+        self.candidates = []
+
+    def validate_create(self, candidate):
+        self.candidates.append(candidate)
+        raise ValidationError("profile rejected create", code="profile_reject")
+
+    def validate_update(self, current, patch, candidate):
+        raise AssertionError("this test performs no update")
 
 
 def _decode_record(item_id, raw):
@@ -354,6 +366,7 @@ def _composition(
     ),
     representations: RepresentationBindings | None = None,
     lifecycle: ItemLifecycleBindings | None = None,
+    item_command_policy=None,
 ):
     write_set = _TrackingWriteSet(tmp_path / "workspace")
     if unfinished:
@@ -417,6 +430,7 @@ def _composition(
             lock_context_for=_catalogue_lock,
             representations=representations,
             lifecycle=lifecycle,
+            item_command_policy=item_command_policy,
         ),
         replica=ReplicaBindings(
             policies=policies,
@@ -515,6 +529,23 @@ def test_composer_wires_the_complete_graph_without_recovery(tmp_path):
     )
     assert interchange._entry_directory_for("book-one") == entries / "book-one"
     assert translations._entry_directory_for("book-one") == entries / "book-one"
+
+
+def test_composer_installs_optional_item_command_policy(tmp_path):
+    policy = _RejectingItemCommandPolicy()
+    engine = _composition(
+        tmp_path,
+        item_command_policy=policy,
+    )["engine"]
+    draft = ItemDraft(title="Profile controlled")
+
+    with pytest.raises(ValidationError) as caught:
+        engine.item_commands.create(
+            CreateItemCommand(draft, "profile-controlled-create")
+        )
+
+    assert caught.value.code == "profile_reject"
+    assert policy.candidates == [draft]
 
 
 def test_generic_host_omits_representation_mutations_without_bindings(

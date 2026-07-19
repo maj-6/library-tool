@@ -41,6 +41,7 @@ from ..engine.interchange import (
     OpenLibService,
 )
 from ..engine.item_commands import (
+    ItemCommandPolicyPort,
     ItemCommandService,
     ItemDraft,
     ItemRecordSnapshot,
@@ -240,6 +241,7 @@ class CatalogueBindings:
     lock_context_for: CatalogueLockFactory
     representations: RepresentationBindings | None = None
     lifecycle: ItemLifecycleBindings | None = None
+    item_command_policy: ItemCommandPolicyPort | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -505,6 +507,7 @@ def compose_filesystem_engine(
         items=items,
         item_commands=ItemCommandService(
             item_command_repository,
+            policy=catalogue.item_command_policy,
             allow_legacy_delete=item_lifecycle is None,
         ),
         item_lifecycle=item_lifecycle,

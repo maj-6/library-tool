@@ -89,6 +89,7 @@ from .items import (
 from .item_commands import (
     CreateItemCommand,
     DeleteItemCommand,
+    ItemCommandPolicyPort,
     ItemCommandRepositoryPort,
     ItemCommandResult,
     ItemCommandService,
@@ -268,6 +269,7 @@ __all__ = [
     "ImportWarning",
     "InterchangeRepositoryPort",
     "InterchangeUnitOfWorkPort",
+    "ItemCommandPolicyPort",
     "ItemCommandRepositoryPort",
     "ItemCommandResult",
     "ItemCommandService",
