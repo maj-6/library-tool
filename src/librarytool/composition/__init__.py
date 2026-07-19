@@ -1,6 +1,7 @@
 """Framework-neutral engine composition entry points."""
 
 from .filesystem import (
+    CanvasBindings,
     CatalogueBindings,
     FilesystemEnginePaths,
     FilesystemEngineResources,
@@ -29,6 +30,7 @@ from .host import (
 )
 
 __all__ = [
+    "CanvasBindings",
     "CatalogueBindings",
     "FIRST_PARTY_MODULE_MANIFESTS",
     "FIRST_PARTY_WORKBENCH_MANIFESTS",

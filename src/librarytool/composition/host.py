@@ -38,6 +38,7 @@ from ._filesystem_paths import (
     workspace_paths_overlap,
 )
 from .filesystem import (
+    CanvasBindings,
     CatalogueBindings,
     ContributionFactory,
     FilesystemEnginePaths,
@@ -146,6 +147,7 @@ class FilesystemHostBindings:
     workspace_lock_context_for: ItemLockFactory
     jobs: JobHistoryBindings = field(default_factory=JobHistoryBindings)
     recovery_lock_context: RecoveryLockFactory = _null_recovery_lock
+    canvases: CanvasBindings | None = None
 
     def __post_init__(self) -> None:
         for value, expected, name in (
@@ -157,6 +159,11 @@ class FilesystemHostBindings:
         ):
             if not isinstance(value, expected):
                 raise TypeError(f"{name} has an invalid binding bundle")
+        if self.canvases is not None and not isinstance(
+            self.canvases,
+            CanvasBindings,
+        ):
+            raise TypeError("canvases has an invalid binding bundle")
         for callback, name in (
             (
                 self.workspace_lock_context_for,
@@ -376,6 +383,7 @@ def open_filesystem_engine(
             interchange=bindings.interchange,
             translation=bindings.translation,
             contribution_factory=contribute_modules,
+            canvases=bindings.canvases,
         )
         # Composition must succeed before restart recovery mutates job history.
         # The session is still unpublished, so clients cannot observe a partial

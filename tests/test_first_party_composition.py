@@ -15,6 +15,8 @@ from librarytool.composition import (
 from librarytool.engine.capabilities import CapabilityRef
 from librarytool.engine.items import ItemQueryService
 from librarytool.engine.runtime import (
+    CANVAS_PREPARATION_SERVICE,
+    CANVAS_QUERY_SERVICE,
     INTERCHANGE_SERVICE,
     ITEM_COMMAND_SERVICE,
     ITEM_LIFECYCLE_SERVICE,
@@ -48,6 +50,7 @@ def _graph(
     representation: bool = True,
     lifecycle: bool = True,
     lib_open: bool = True,
+    canvases: bool = True,
 ) -> FilesystemServiceGraph:
     return FilesystemServiceGraph(
         items=ItemQueryService(_EmptyItemRepository()),
@@ -61,6 +64,8 @@ def _graph(
         text_layers=object(),
         translations=object(),
         translation_provenance=object(),
+        canvas_query=object() if canvases else None,
+        canvas_preparation=object() if canvases else None,
     )
 
 
@@ -84,6 +89,7 @@ def test_first_party_manifests_preserve_the_production_product_contract():
         "library.catalogue.commands": "1.0.0",
         "library.representation.commands": "1.0.0",
         "library.item-lifecycle.commands": "1.0.0",
+        "library.canvases": "1.0.0",
         "replica.core": "1.0.0",
         "translation.core": "2.0.0",
         "replica.lib": "2.0.0",
@@ -117,6 +123,15 @@ def test_first_party_manifests_preserve_the_production_product_contract():
     assert _capabilities(lifecycle.requires) == {
         ("library.items.read", 1),
         ("library.jobs", 1),
+    }
+    canvases = modules["library.canvases"]
+    assert _capabilities(canvases.provides) == {
+        ("library.canvases.read", 1),
+        ("library.canvases.prepare", 1),
+    }
+    assert _capabilities(canvases.requires) == {
+        ("library.items.read", 1),
+        ("library.representations", 1),
     }
     assert _capabilities(modules["replica.core"].provides) == {
         ("replica.regions", 1),
@@ -168,6 +183,8 @@ def test_first_party_manifests_preserve_the_production_product_contract():
         ("translation.layers.status", 1),
         ("translation.layers.edit", 1),
         ("library.jobs", 1),
+        ("library.canvases.read", 1),
+        ("library.canvases.prepare", 1),
     }
 
 
@@ -180,6 +197,7 @@ def test_full_first_party_graph_binds_every_service_and_policy():
         "library.catalogue.commands",
         "library.representation.commands",
         "library.item-lifecycle.commands",
+        "library.canvases",
         "replica.core",
         "translation.core",
         "replica.lib",
@@ -199,6 +217,10 @@ def test_full_first_party_graph_binds_every_service_and_policy():
             "library.representations.commands@1",
         ),
         "library.item-lifecycle.commands": ("library.items.lifecycle@1",),
+        "library.canvases": (
+            "library.canvases.prepare@1",
+            "library.canvases.query@1",
+        ),
         "replica.core": ("replica.application@1", "replica.text-layers@1"),
         "translation.core": (
             "translation.application@1",
@@ -243,6 +265,10 @@ def test_full_first_party_graph_binds_every_service_and_policy():
         row["status"] == "available" for row in document["workbenches"]
     )
     assert engine.require_service(ITEM_COMMAND_SERVICE) is graph.item_commands
+    assert engine.require_service(CANVAS_QUERY_SERVICE) is graph.canvas_query
+    assert engine.require_service(
+        CANVAS_PREPARATION_SERVICE
+    ) is graph.canvas_preparation
     assert engine.require_service(ITEM_LIFECYCLE_SERVICE) is graph.item_lifecycle
     assert engine.require_service(JOB_SERVICE) is graph.jobs
     assert engine.require_service(
@@ -267,18 +293,20 @@ def test_full_first_party_graph_binds_every_service_and_policy():
 
 
 @pytest.mark.parametrize(
-    ("representation", "lifecycle", "lib_open"),
-    tuple(product((False, True), repeat=3)),
+    ("representation", "lifecycle", "lib_open", "canvases"),
+    tuple(product((False, True), repeat=4)),
 )
 def test_optional_modules_are_independent_deterministic_and_withheld(
     representation,
     lifecycle,
     lib_open,
+    canvases,
 ):
     graph = _graph(
         representation=representation,
         lifecycle=lifecycle,
         lib_open=lib_open,
+        canvases=canvases,
     )
     contributions = first_party_module_contributions(graph)
     engine = LibraryEngineBuilder(contributions).build()
@@ -292,6 +320,7 @@ def test_optional_modules_are_independent_deterministic_and_withheld(
         "library.item-lifecycle.commands" in module_ids
     ) is lifecycle
     assert ("replica.lib-open" in module_ids) is lib_open
+    assert ("library.canvases" in module_ids) is canvases
     assert (
         engine.get_service(REPRESENTATION_COMMAND_SERVICE) is not None
     ) is representation
@@ -299,6 +328,8 @@ def test_optional_modules_are_independent_deterministic_and_withheld(
         engine.get_service(ITEM_LIFECYCLE_SERVICE) is not None
     ) is lifecycle
     assert (engine.get_service(LIB_OPEN_SERVICE) is not None) is lib_open
+    assert (engine.get_service(CANVAS_QUERY_SERVICE) is not None) is canvases
+    assert (engine.get_service(CANVAS_PREPARATION_SERVICE) is not None) is canvases
     assert ("representation-commands" in policies) is representation
     assert ("item-lifecycle" in policies) is lifecycle
 
@@ -317,6 +348,10 @@ def test_optional_modules_are_independent_deterministic_and_withheld(
     assert (
         "replica.interchange.open" in capability_ids
     ) is lib_open
+    assert (
+        bool({"library.canvases.read", "library.canvases.prepare"} & capability_ids)
+        is canvases
+    )
 
     workbenches = {row["id"]: row for row in document["workbenches"]}
     assert workbenches["catalog"]["visible"] is True
@@ -325,7 +360,7 @@ def test_optional_modules_are_independent_deterministic_and_withheld(
     )
     assert workbenches["replica"]["visible"] is True
     assert workbenches["replica"]["status"] == (
-        "available" if lib_open else "degraded"
+        "available" if lib_open and canvases else "degraded"
     )
     assert document == LibraryEngineBuilder(
         first_party_module_contributions(graph)
@@ -366,3 +401,52 @@ def test_absent_lifecycle_is_not_discoverable_or_bound():
         for contribution in contributions
         for capability in contribution.manifest.provides
     }
+
+
+def test_canvas_services_and_capabilities_are_withheld_as_one_vertical():
+    graph = _graph(canvases=False)
+    contributions = first_party_module_contributions(graph)
+    engine = LibraryEngineBuilder(contributions).build()
+    document = engine.discovery_document()
+
+    assert "library.canvases" not in {row["id"] for row in document["modules"]}
+    assert {
+        "library.canvases.read",
+        "library.canvases.prepare",
+    }.isdisjoint(_capability_ids(document))
+    assert engine.get_service(CANVAS_QUERY_SERVICE) is None
+    assert engine.get_service(CANVAS_PREPARATION_SERVICE) is None
+    replica = next(row for row in document["workbenches"] if row["id"] == "replica")
+    assert {(row["id"], row["version"]) for row in replica["missing_optional"]} >= {
+        ("library.canvases.read", 1),
+        ("library.canvases.prepare", 1),
+    }
+
+
+def test_service_graph_rejects_half_installed_canvas_vertical():
+    values = {
+        "items": ItemQueryService(_EmptyItemRepository()),
+        "item_commands": object(),
+        "item_lifecycle": None,
+        "representation_commands": None,
+        "interchange": object(),
+        "lib_open": None,
+        "jobs": object(),
+        "replica": object(),
+        "text_layers": object(),
+        "translations": object(),
+        "translation_provenance": object(),
+    }
+
+    with pytest.raises(ValueError, match="must be installed together"):
+        FilesystemServiceGraph(
+            **values,
+            canvas_query=object(),
+            canvas_preparation=None,
+        )
+    with pytest.raises(ValueError, match="must be installed together"):
+        FilesystemServiceGraph(
+            **values,
+            canvas_query=None,
+            canvas_preparation=object(),
+        )

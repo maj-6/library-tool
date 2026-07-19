@@ -263,6 +263,32 @@ def test_durable_replay_precedes_every_live_path_and_inspection_callback(tmp_pat
     assert replay.receipt == first.receipt
 
 
+def test_sanitized_engine_callback_error_keeps_code_and_retryability(tmp_path):
+    root = tmp_path / "library"
+    state = _State()
+    failure = RepositoryError(
+        "the authoritative catalogue is temporarily unavailable",
+        code="canvas_authority_temporarily_unavailable",
+        details={"item_id": ITEM_ID},
+        retryable=True,
+    )
+
+    def fail_item(_item_id):
+        raise failure
+
+    with pytest.raises(RepositoryError) as caught:
+        _prepare(
+            root,
+            state,
+            "prepare-authority-failure",
+            item_snapshot_for=fail_item,
+        )
+
+    assert caught.value is failure
+    assert caught.value.code == "canvas_authority_temporarily_unavailable"
+    assert caught.value.retryable is True
+
+
 def test_operation_reuse_conflict_is_decided_before_live_callbacks(tmp_path):
     root = tmp_path / "library"
     state = _State()

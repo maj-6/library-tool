@@ -16,6 +16,8 @@ from ..engine.capabilities import (
     WorkbenchManifest,
 )
 from ..engine.runtime import (
+    CANVAS_PREPARATION_SERVICE,
+    CANVAS_QUERY_SERVICE,
     INTERCHANGE_SERVICE,
     ITEM_COMMAND_SERVICE,
     ITEM_LIFECYCLE_SERVICE,
@@ -95,6 +97,18 @@ FIRST_PARTY_MODULE_MANIFESTS = (
         ),
     ),
     ModuleManifest(
+        "library.canvases",
+        "1.0.0",
+        provides=(
+            CapabilityRef("library.canvases.read"),
+            CapabilityRef("library.canvases.prepare"),
+        ),
+        requires=(
+            CapabilityRef("library.items.read"),
+            CapabilityRef("library.representations"),
+        ),
+    ),
+    ModuleManifest(
         "replica.core",
         "1.0.0",
         provides=(
@@ -166,6 +180,8 @@ FIRST_PARTY_WORKBENCH_MANIFESTS = (
             CapabilityRef("translation.layers.status"),
             CapabilityRef("translation.layers.edit"),
             CapabilityRef("library.jobs"),
+            CapabilityRef("library.canvases.read"),
+            CapabilityRef("library.canvases.prepare"),
         ),
     ),
 )
@@ -263,6 +279,26 @@ def first_party_module_contributions(
                     WorkbenchPolicyBinding(
                         ItemLifecycleWorkbenchPolicy(),
                         (CapabilityRef("library.items.delete"),),
+                    ),
+                ),
+            )
+        )
+
+    if graph.canvas_query is not None:
+        assert graph.canvas_preparation is not None
+        contributions.append(
+            ModuleContribution(
+                modules["library.canvases"],
+                bindings=(
+                    ServiceBinding(
+                        CANVAS_QUERY_SERVICE,
+                        graph.canvas_query,
+                        (CapabilityRef("library.canvases.read"),),
+                    ),
+                    ServiceBinding(
+                        CANVAS_PREPARATION_SERVICE,
+                        graph.canvas_preparation,
+                        (CapabilityRef("library.canvases.prepare"),),
                     ),
                 ),
             )

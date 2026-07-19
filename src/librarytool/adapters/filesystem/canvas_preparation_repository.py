@@ -42,7 +42,7 @@ from ...engine.canvases import (
     CanvasSequenceView,
     CanvasView,
 )
-from ...engine.errors import RepositoryError, ValidationError
+from ...engine.errors import EngineError, RepositoryError, ValidationError
 from .canvas_query_repository import (
     CANVAS_INDEX_SCHEMA,
     CANVAS_INDEX_VERSION,
@@ -512,6 +512,8 @@ class FilesystemCanvasPreparationUnitOfWork:
             return self._item
         try:
             value = self._item_snapshot_for(item_id)
+        except EngineError:
+            raise
         except Exception as exc:
             raise _repository_error(
                 "the live item state could not be queried",
@@ -538,6 +540,8 @@ class FilesystemCanvasPreparationUnitOfWork:
             return self._representation
         try:
             value = self._representation_snapshot_for(item_id, representation_id)
+        except EngineError:
+            raise
         except Exception as exc:
             raise _repository_error(
                 "the live representation state could not be queried",
@@ -672,6 +676,8 @@ class FilesystemCanvasPreparationUnitOfWork:
         assert self._entry_directory is not None
         try:
             inspected = self._inspect_media(representation, self._entry_directory)
+        except EngineError:
+            raise
         except Exception as exc:
             raise _repository_error(
                 "the local representation could not be inspected",
@@ -1161,6 +1167,8 @@ class FilesystemCanvasPreparationUnitOfWork:
                 continue
             try:
                 allocated = self._allocate_canvas_id(frozenset(reserved_ids))
+            except EngineError:
+                raise
             except Exception as exc:
                 raise _repository_error(
                     "a canvas identity could not be allocated",

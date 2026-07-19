@@ -22,6 +22,9 @@ from ._filesystem_paths import (
 )
 
 from ..adapters.filesystem import (
+    FilesystemCanvasCandidate,
+    FilesystemCanvasPreparationRepository,
+    FilesystemCanvasQueryRepository,
     FilesystemInterchangeRepository,
     FilesystemItemCommandRepository,
     FilesystemItemLifecycleRepository,
@@ -33,6 +36,12 @@ from ..adapters.filesystem import (
     FilesystemTranslationRepository,
     RecoverableWriteSet,
 )
+from ..engine.canvas_commands import (
+    CanvasPreparationItemSnapshot,
+    CanvasPreparationRepresentationSnapshot,
+    CanvasPreparationService,
+)
+from ..engine.canvases import CanvasQueryService
 from ..engine.errors import RepositoryError
 from ..engine.interchange import (
     LibImportPlannerPort,
@@ -61,6 +70,8 @@ from ..engine.ports import (
 )
 from ..engine.replica import ReplicaApplicationService
 from ..engine.runtime import (
+    CANVAS_PREPARATION_SERVICE,
+    CANVAS_QUERY_SERVICE,
     INTERCHANGE_SERVICE,
     ITEM_COMMAND_SERVICE,
     ITEM_LIFECYCLE_SERVICE,
@@ -118,6 +129,15 @@ RepresentationPutRecord = Callable[
 RepresentationDetachRecord = Callable[
     [str, Mapping[str, Any], str], Mapping[str, Any]
 ]
+CanvasItemSnapshotLoader = Callable[[str], CanvasPreparationItemSnapshot | None]
+CanvasRepresentationSnapshotLoader = Callable[
+    [str, str], CanvasPreparationRepresentationSnapshot | None
+]
+CanvasMediaInspector = Callable[
+    [CanvasPreparationRepresentationSnapshot, Path],
+    Sequence[FilesystemCanvasCandidate],
+]
+CanvasIdAllocator = Callable[[frozenset[str]], str]
 _ENTRY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _WINDOWS_DEVICE_NAMES = frozenset(
     {"con", "prn", "aux", "nul"}
@@ -280,6 +300,119 @@ class TranslationBindings:
 
 
 @dataclass(frozen=True, slots=True)
+class CanvasBindings:
+    """Complete local authority and inspection seams for canvas services.
+
+    The bundle is intentionally indivisible: query and preparation share the
+    exact same live snapshots, entry resolver, and broad host lock.  Media
+    inspection is local/provider-free and canvas identity allocation must
+    honor every active and retired identifier supplied by the repository.
+    """
+
+    item_snapshot_for: CanvasItemSnapshotLoader
+    representation_snapshot_for: CanvasRepresentationSnapshotLoader
+    inspect_media: CanvasMediaInspector
+    allocate_canvas_id: CanvasIdAllocator
+    lock_context_for: CatalogueLockFactory
+
+    def __post_init__(self) -> None:
+        for callback, name in (
+            (self.item_snapshot_for, "item_snapshot_for"),
+            (self.representation_snapshot_for, "representation_snapshot_for"),
+            (self.inspect_media, "inspect_media"),
+            (self.allocate_canvas_id, "allocate_canvas_id"),
+            (self.lock_context_for, "lock_context_for"),
+        ):
+            if not callable(callback):
+                raise TypeError(f"{name} must be callable")
+
+
+class _CanvasAuthority:
+    """Validate and sanitize one exact host canvas authority projection."""
+
+    def __init__(self, bindings: CanvasBindings) -> None:
+        self._bindings = bindings
+
+    def item_snapshot_for(
+        self,
+        item_id: str,
+    ) -> CanvasPreparationItemSnapshot | None:
+        try:
+            value = self._bindings.item_snapshot_for(item_id)
+        except Exception as exc:
+            raise RepositoryError(
+                "the canvas item authority is unavailable",
+                code="canvas_preparation_authority_unavailable",
+                details={
+                    "item_id": item_id,
+                    "cause_type": type(exc).__name__,
+                },
+                retryable=True,
+            ) from exc
+        if value is None:
+            return None
+        if (
+            not isinstance(value, CanvasPreparationItemSnapshot)
+            or value.item_id != item_id
+        ):
+            raise RepositoryError(
+                "the canvas item authority returned an invalid snapshot",
+                code="invalid_canvas_preparation_authority_snapshot",
+                details={"item_id": item_id},
+            )
+        return value
+
+    def representation_snapshot_for(
+        self,
+        item_id: str,
+        representation_id: str,
+    ) -> CanvasPreparationRepresentationSnapshot | None:
+        try:
+            value = self._bindings.representation_snapshot_for(
+                item_id,
+                representation_id,
+            )
+        except Exception as exc:
+            raise RepositoryError(
+                "the canvas representation authority is unavailable",
+                code="canvas_preparation_authority_unavailable",
+                details={
+                    "item_id": item_id,
+                    "representation_id": representation_id,
+                    "cause_type": type(exc).__name__,
+                },
+                retryable=True,
+            ) from exc
+        if value is None:
+            return None
+        if (
+            not isinstance(value, CanvasPreparationRepresentationSnapshot)
+            or value.item_id != item_id
+            or value.representation_id != representation_id
+        ):
+            raise RepositoryError(
+                "the canvas representation authority returned an invalid snapshot",
+                code="invalid_canvas_preparation_authority_snapshot",
+                details={
+                    "item_id": item_id,
+                    "representation_id": representation_id,
+                },
+            )
+        return value
+
+    def item_exists(self, item_id: str) -> bool:
+        return self.item_snapshot_for(item_id) is not None
+
+    def representation_revision_for(
+        self,
+        item_id: str,
+        representation_id: str,
+    ) -> str | None:
+        value = self.representation_snapshot_for(item_id, representation_id)
+        return None if value is None else value.revision
+
+
+@dataclass(frozen=True, slots=True)
 class FilesystemEngineResources:
     """Shared, already-initialized process resources.
 
@@ -309,10 +442,20 @@ class FilesystemServiceGraph:
     text_layers: TextLayerService
     translations: TranslationService
     translation_provenance: TranslationProvenanceService
+    canvas_query: CanvasQueryService | None = None
+    canvas_preparation: CanvasPreparationService | None = None
+
+    def __post_init__(self) -> None:
+        if (self.canvas_query is None) != (self.canvas_preparation is None):
+            raise ValueError(
+                "canvas query and preparation services must be installed together"
+            )
 
     def keyed_services(self) -> tuple[tuple[ServiceKey[Any], Any], ...]:
         services = (
             (ITEM_QUERY_SERVICE, self.items),
+            (CANVAS_QUERY_SERVICE, self.canvas_query),
+            (CANVAS_PREPARATION_SERVICE, self.canvas_preparation),
             (ITEM_COMMAND_SERVICE, self.item_commands),
             (ITEM_LIFECYCLE_SERVICE, self.item_lifecycle),
             (REPRESENTATION_COMMAND_SERVICE, self.representation_commands),
@@ -348,6 +491,7 @@ def compose_filesystem_engine(
     interchange: InterchangeBindings,
     translation: TranslationBindings,
     contribution_factory: ContributionFactory,
+    canvases: CanvasBindings | None = None,
 ) -> LibraryEngine:
     """Return one complete filesystem-backed service graph.
 
@@ -359,6 +503,8 @@ def compose_filesystem_engine(
 
     if not callable(contribution_factory):
         raise TypeError("contribution_factory must be callable")
+    if canvases is not None and not isinstance(canvases, CanvasBindings):
+        raise TypeError("canvases must be a CanvasBindings bundle or None")
     # Recovery remains host-owned, but composition refuses to expose any
     # service graph while an unfinished workspace transaction exists.
     with resources.write_set.workspace_lease():
@@ -386,6 +532,36 @@ def compose_filesystem_engine(
         resources.write_set.root,
         entries_path,
     )
+
+    canvas_query = None
+    canvas_preparation = None
+    if canvases is not None:
+        canvas_authority = _CanvasAuthority(canvases)
+        canvas_query = CanvasQueryService(
+            FilesystemCanvasQueryRepository(
+                resources.write_set,
+                item_exists=canvas_authority.item_exists,
+                representation_revision_for=(
+                    canvas_authority.representation_revision_for
+                ),
+                entry_directory_for=entry_directory_for,
+                lock_context_for=canvases.lock_context_for,
+            )
+        )
+        canvas_preparation = CanvasPreparationService(
+            FilesystemCanvasPreparationRepository(
+                resources.write_set,
+                item_snapshot_for=canvas_authority.item_snapshot_for,
+                representation_snapshot_for=(
+                    canvas_authority.representation_snapshot_for
+                ),
+                entry_directory_for=entry_directory_for,
+                inspect_media=canvases.inspect_media,
+                allocate_canvas_id=canvases.allocate_canvas_id,
+                lock_context_for=canvases.lock_context_for,
+                recover=False,
+            )
+        )
 
     items = ItemQueryService(
         FilesystemItemQueryRepository(
@@ -525,6 +701,8 @@ def compose_filesystem_engine(
             translation_repository,
         ),
         translation_provenance=resources.provenance,
+        canvas_query=canvas_query,
+        canvas_preparation=canvas_preparation,
     )
     try:
         contributions = tuple(contribution_factory(graph))
@@ -568,6 +746,7 @@ def compose_filesystem_engine(
 
 
 __all__ = [
+    "CanvasBindings",
     "CatalogueBindings",
     "FilesystemEnginePaths",
     "FilesystemEngineResources",

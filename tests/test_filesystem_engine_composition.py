@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -14,10 +15,12 @@ import pytest
 
 from librarytool.adapters.filesystem import (
     EMPTY_MANAGED_TREE_REVISION,
+    FilesystemCanvasCandidate,
     RecoverableWriteSet,
     RecoveryRequiredError,
 )
 from librarytool.composition.filesystem import (
+    CanvasBindings,
     CatalogueBindings,
     FilesystemEnginePaths,
     FilesystemEngineResources,
@@ -28,7 +31,14 @@ from librarytool.composition.filesystem import (
     TranslationBindings,
     compose_filesystem_engine,
 )
+from librarytool.composition.first_party import first_party_module_contributions
 from librarytool.engine.capabilities import CapabilityRef, ModuleManifest
+from librarytool.engine.canvas_commands import (
+    CanvasPreparationItemSnapshot,
+    CanvasPreparationRepresentationSnapshot,
+    PrepareCanvasSequenceCommand,
+)
+from librarytool.engine.canvases import CanvasExtent
 from librarytool.engine.contracts import ItemDescriptor
 from librarytool.engine.errors import ConflictError, RepositoryError, ValidationError
 from librarytool.engine.interchange import (
@@ -51,6 +61,8 @@ from librarytool.engine.ports import (
 )
 from librarytool.engine.translations import TranslationProvenanceService
 from librarytool.engine.runtime import (
+    CANVAS_PREPARATION_SERVICE,
+    CANVAS_QUERY_SERVICE,
     INTERCHANGE_SERVICE,
     ITEM_COMMAND_SERVICE,
     ITEM_LIFECYCLE_SERVICE,
@@ -155,6 +167,49 @@ def _advance_restored_record(item_id, raw):
     assert restored.get("id", item_id) == item_id
     restored["revision"] = "record-restored"
     return restored
+
+
+def _canvas_bindings() -> CanvasBindings:
+    correlation = hashlib.sha256(b"book-one:scan:leaf-1").digest()
+
+    def item_snapshot_for(item_id):
+        if item_id != "book-one":
+            return None
+        return CanvasPreparationItemSnapshot(item_id)
+
+    def representation_snapshot_for(item_id, representation_id):
+        if item_id != "book-one" or representation_id != "scan":
+            return None
+        return CanvasPreparationRepresentationSnapshot(
+            item_id,
+            representation_id,
+            "scan-r1",
+        )
+
+    def inspect_media(_representation, _entry_directory):
+        return (
+            FilesystemCanvasCandidate(
+                source_correlation=correlation,
+                source_position=0,
+                source_path="sources/scan.pdf",
+                label="Page 1",
+                extent=CanvasExtent(1200, 1800, "px"),
+                resource_kinds=("image",),
+                metadata={"leaf": 1},
+            ),
+        )
+
+    def allocate_canvas_id(reserved):
+        assert not {value.casefold() for value in reserved} & {"canvas-1"}
+        return "canvas-1"
+
+    return CanvasBindings(
+        item_snapshot_for=item_snapshot_for,
+        representation_snapshot_for=representation_snapshot_for,
+        inspect_media=inspect_media,
+        allocate_canvas_id=allocate_canvas_id,
+        lock_context_for=_catalogue_lock,
+    )
 
 
 _REPRESENTATION_CAPABILITIES = (
@@ -367,6 +422,7 @@ def _composition(
     representations: RepresentationBindings | None = None,
     lifecycle: ItemLifecycleBindings | None = None,
     item_command_policy=None,
+    canvases: CanvasBindings | None = None,
 ):
     write_set = _TrackingWriteSet(tmp_path / "workspace")
     if unfinished:
@@ -455,6 +511,7 @@ def _composition(
             source_reference_for=lambda source: source.layer_id,
         ),
         contribution_factory=contribution_factory,
+        canvases=canvases,
     )
     return {
         "engine": engine,
@@ -529,6 +586,133 @@ def test_composer_wires_the_complete_graph_without_recovery(tmp_path):
     )
     assert interchange._entry_directory_for("book-one") == entries / "book-one"
     assert translations._entry_directory_for("book-one") == entries / "book-one"
+
+
+def test_canvas_vertical_is_absent_by_default_and_never_half_advertised(tmp_path):
+    engine = _composition(tmp_path)["engine"]
+
+    assert engine.get_service(CANVAS_QUERY_SERVICE) is None
+    assert engine.get_service(CANVAS_PREPARATION_SERVICE) is None
+    assert not {
+        CANVAS_QUERY_SERVICE,
+        CANVAS_PREPARATION_SERVICE,
+    } & set(engine.services.keys)
+
+
+def test_complete_canvas_bindings_compose_query_and_preparation_together(tmp_path):
+    composed = _composition(
+        tmp_path,
+        canvases=_canvas_bindings(),
+        contribution_factory=first_party_module_contributions,
+    )
+    engine = composed["engine"]
+    query = engine.require_service(CANVAS_QUERY_SERVICE)
+    preparation = engine.require_service(CANVAS_PREPARATION_SERVICE)
+
+    assert query._repository._write_set is composed["write_set"]
+    assert preparation._repository._write_set is composed["write_set"]
+    assert query._repository._lock_context_for is _catalogue_lock
+    assert preparation._repository._lock_context_for is _catalogue_lock
+
+    result = preparation.prepare(
+        PrepareCanvasSequenceCommand(
+            "book-one",
+            "scan",
+            "scan-r1",
+            "compose-canvas-1",
+        )
+    )
+    sequence = query.list("book-one", "scan")
+
+    assert result.receipt.after.canvas_ids == ("canvas-1",)
+    assert sequence.representation_revision == "scan-r1"
+    assert sequence.canvases[0].key.canvas_id == "canvas-1"
+    assert sequence.canvases[0].label == "Page 1"
+    assert sequence.canvases[0].metadata["leaf"] == 1
+    document = engine.discovery_document()
+    assert "library.canvases" in {
+        row["id"] for row in document["modules"]
+    }
+    assert {
+        "library.canvases.read",
+        "library.canvases.prepare",
+    } <= {row["id"] for row in document["capabilities"]}
+
+
+def test_canvas_authority_error_is_sanitized_once_for_query_and_preparation(
+    tmp_path,
+):
+    private = "C:/private/catalogue/location.json"
+
+    def fail_item(_item_id):
+        raise RepositoryError(
+            private,
+            code="host_catalogue_failure",
+            details={"path": private},
+        )
+
+    valid = _canvas_bindings()
+    bindings = CanvasBindings(
+        item_snapshot_for=fail_item,
+        representation_snapshot_for=valid.representation_snapshot_for,
+        inspect_media=valid.inspect_media,
+        allocate_canvas_id=valid.allocate_canvas_id,
+        lock_context_for=valid.lock_context_for,
+    )
+    engine = _composition(tmp_path, canvases=bindings)["engine"]
+
+    with pytest.raises(RepositoryError) as query_error:
+        engine.require_service(CANVAS_QUERY_SERVICE).list("book-one", "scan")
+    with pytest.raises(RepositoryError) as preparation_error:
+        engine.require_service(CANVAS_PREPARATION_SERVICE).prepare(
+            PrepareCanvasSequenceCommand(
+                "book-one",
+                "scan",
+                "scan-r1",
+                "compose-canvas-authority-failure",
+            )
+        )
+
+    for error in (query_error.value, preparation_error.value):
+        assert error.code == "canvas_preparation_authority_unavailable"
+        assert error.retryable is True
+        assert error.details == {
+            "item_id": "book-one",
+            "cause_type": "RepositoryError",
+        }
+        assert private not in json.dumps(error.as_dict(), sort_keys=True)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    (
+        "item_snapshot_for",
+        "representation_snapshot_for",
+        "inspect_media",
+        "allocate_canvas_id",
+        "lock_context_for",
+    ),
+)
+def test_canvas_bindings_reject_incomplete_or_non_callable_seams(field_name):
+    valid = _canvas_bindings()
+    values = {
+        "item_snapshot_for": valid.item_snapshot_for,
+        "representation_snapshot_for": valid.representation_snapshot_for,
+        "inspect_media": valid.inspect_media,
+        "allocate_canvas_id": valid.allocate_canvas_id,
+        "lock_context_for": valid.lock_context_for,
+    }
+    values[field_name] = None
+
+    with pytest.raises(TypeError, match=field_name):
+        CanvasBindings(**values)
+
+
+def test_composer_rejects_a_non_bundle_canvas_value_before_graph_creation(
+    tmp_path,
+):
+    with pytest.raises(TypeError, match="CanvasBindings"):
+        _composition(tmp_path, canvases=cast(CanvasBindings, object()))
 
 
 def test_composer_installs_optional_item_command_policy(tmp_path):
