@@ -180,6 +180,42 @@ class FilesystemItemLifecycleRepository:
             finally:
                 unit.close()
 
+    def get_tombstone(
+        self, tombstone_id: str
+    ) -> ItemTombstoneSnapshot | None:
+        """Read one validated public tombstone under lifecycle isolation."""
+
+        if not isinstance(tombstone_id, str):
+            raise RepositoryError(
+                "tombstone_id must be a string",
+                code="invalid_item_lifecycle_identity",
+                details={"field": "tombstone_id"},
+            )
+        operation_id = "read-tombstone-" + hashlib.sha256(
+            tombstone_id.encode("utf-8")
+        ).hexdigest()[:32]
+        with self._locked_item_unit(operation_id=operation_id) as item_unit:
+            unit = self._new_unit(
+                operation_id=operation_id, item_unit=item_unit
+            )
+            try:
+                return unit.get_tombstone(tombstone_id)
+            finally:
+                unit.close()
+
+    def list_tombstones(self) -> tuple[ItemTombstoneSnapshot, ...]:
+        """Read all public tombstones under one lifecycle isolation scope."""
+
+        operation_id = "read-tombstone-index"
+        with self._locked_item_unit(operation_id=operation_id) as item_unit:
+            unit = self._new_unit(
+                operation_id=operation_id, item_unit=item_unit
+            )
+            try:
+                return unit.list_tombstones()
+            finally:
+                unit.close()
+
     @contextmanager
     def unit_of_work(
         self, *, operation_id: str
@@ -269,6 +305,7 @@ class FilesystemItemLifecycleUnitOfWork:
         self._loaded_items: dict[str, LifecycleItemSnapshot | None] = {}
         self._loaded_trees: dict[str, ManagedTreeSnapshot | None] = {}
         self._loaded_envelopes: dict[str, dict[str, Any]] = {}
+        self._envelope_ids: dict[str, str] | None = None
         self._staged_action = ""
         self._staged_item: LifecycleItemSnapshot | None = None
         self._staged_tree: ManagedTreeSnapshot | None = None
@@ -347,13 +384,44 @@ class FilesystemItemLifecycleUnitOfWork:
             return ItemTombstoneSnapshot.from_dict(
                 self._loaded_envelopes[tombstone_id]["tombstone"]
             )
-        path = self._envelope_path(tombstone_id)
-        if not path.exists():
+        stored_id = self._envelope_id_index().get(tombstone_id.casefold())
+        if stored_id is None:
             return None
+        if stored_id != tombstone_id:
+            raise RepositoryError(
+                "the tombstone identity aliases a stored envelope",
+                code="item_lifecycle_tombstone_alias",
+                details={"tombstone_id": tombstone_id},
+            )
+        path = self._envelope_path(stored_id)
         raw = _read_json(path, None, artifact="item_lifecycle_tombstone")
-        envelope = self._validate_envelope(raw, tombstone_id=tombstone_id)
-        self._loaded_envelopes[tombstone_id] = envelope
+        envelope = self._validate_envelope(raw, tombstone_id=stored_id)
+        self._loaded_envelopes[stored_id] = envelope
         return ItemTombstoneSnapshot.from_dict(envelope["tombstone"])
+
+    def list_tombstones(self) -> tuple[ItemTombstoneSnapshot, ...]:
+        """Return strict public snapshots in deterministic identity order."""
+
+        self._ensure_open()
+        snapshots: list[ItemTombstoneSnapshot] = []
+        for tombstone_id in self._envelope_id_index().values():
+            tombstone = self.get_tombstone(tombstone_id)
+            if tombstone is None:
+                raise RepositoryError(
+                    "a lifecycle envelope disappeared from the locked index",
+                    code="invalid_item_lifecycle_store",
+                    retryable=True,
+                )
+            snapshots.append(tombstone)
+        return tuple(
+            sorted(
+                snapshots,
+                key=lambda value: (
+                    value.tombstone_id.casefold(),
+                    value.tombstone_id,
+                ),
+            )
+        )
 
     def stage_delete(
         self,
@@ -826,72 +894,65 @@ class FilesystemItemLifecycleUnitOfWork:
                 return candidate
 
     def _stored_tombstone_ids(self) -> set[str]:
-        aliases: dict[str, str] = {}
-        for relative, directories in (
-            (_ENVELOPE_ROOT, False),
-            (_TREE_ROOT, True),
-        ):
-            root = self._safe_target(
-                relative.as_posix(), artifact="item_lifecycle_store"
-            )
-            if not root.exists():
-                continue
-            if not root.is_dir() or _is_redirecting_path(root):
-                raise RepositoryError(
-                    "the item lifecycle store is invalid",
-                    code="invalid_item_lifecycle_store",
-                )
-            for path in root.iterdir():
-                if _is_redirecting_path(path):
-                    raise RepositoryError(
-                        "the item lifecycle store contains a redirect",
-                        code="invalid_item_lifecycle_store",
-                    )
-                if directories:
-                    if not path.is_dir():
-                        raise RepositoryError(
-                            "the lifecycle tree store contains an invalid entry",
-                            code="invalid_item_lifecycle_store",
-                        )
-                    identity = path.name
-                else:
-                    if path.suffix.casefold() != ".json" or not path.is_file():
-                        raise RepositoryError(
-                            "the lifecycle envelope store contains an invalid entry",
-                            code="invalid_item_lifecycle_store",
-                        )
-                    identity = path.stem
-                self._file_identifier(identity, field="stored_tombstone_id")
-                folded = identity.casefold()
-                if folded in aliases and aliases[folded] != identity:
-                    raise RepositoryError(
-                        "the lifecycle store contains aliased identities",
-                        code="invalid_item_lifecycle_store",
-                    )
-                if folded in aliases:
-                    # An envelope and its matching tree intentionally share an
-                    # id; aliases within one store are already impossible.
-                    continue
-                aliases[folded] = identity
-        return set(aliases)
-
-    def _stored_tombstone_revisions(self) -> set[str]:
-        revisions: set[str] = set()
+        aliases = dict(self._envelope_id_index())
         root = self._safe_target(
-            _ENVELOPE_ROOT.as_posix(), artifact="item_lifecycle_store"
+            _TREE_ROOT.as_posix(), artifact="item_lifecycle_store"
         )
         if not root.exists():
-            return revisions
+            return set(aliases)
         if not root.is_dir() or _is_redirecting_path(root):
             raise RepositoryError(
                 "the item lifecycle store is invalid",
                 code="invalid_item_lifecycle_store",
             )
         for path in root.iterdir():
+            if _is_redirecting_path(path) or not path.is_dir():
+                raise RepositoryError(
+                    "the lifecycle tree store contains an invalid entry",
+                    code="invalid_item_lifecycle_store",
+                )
+            identity = self._file_identifier(
+                path.name, field="stored_tombstone_id"
+            )
+            folded = identity.casefold()
+            if folded in aliases and aliases[folded] != identity:
+                raise RepositoryError(
+                    "the lifecycle store contains aliased identities",
+                    code="invalid_item_lifecycle_store",
+                )
+            aliases[folded] = identity
+        return set(aliases)
+
+    def _stored_tombstone_revisions(self) -> set[str]:
+        revisions: set[str] = set()
+        for identity in self._envelope_id_index().values():
+            tombstone = self.get_tombstone(identity)
+            assert tombstone is not None
+            revisions.add(tombstone.revision)
+        return revisions
+
+    def _envelope_id_index(self) -> dict[str, str]:
+        """Return case-folded envelope identities or fail on any ambiguity."""
+
+        if self._envelope_ids is not None:
+            return dict(self._envelope_ids)
+        root = self._safe_target(
+            _ENVELOPE_ROOT.as_posix(), artifact="item_lifecycle_store"
+        )
+        if not root.exists():
+            self._envelope_ids = {}
+            return {}
+        if not root.is_dir() or _is_redirecting_path(root):
+            raise RepositoryError(
+                "the item lifecycle store is invalid",
+                code="invalid_item_lifecycle_store",
+            )
+        aliases: dict[str, str] = {}
+        for path in root.iterdir():
             if (
                 _is_redirecting_path(path)
-                or path.suffix.casefold() != ".json"
                 or not path.is_file()
+                or path.suffix != ".json"
             ):
                 raise RepositoryError(
                     "the lifecycle envelope store contains an invalid entry",
@@ -900,10 +961,20 @@ class FilesystemItemLifecycleUnitOfWork:
             identity = self._file_identifier(
                 path.stem, field="stored_tombstone_id"
             )
-            raw = _read_json(path, None, artifact="item_lifecycle_tombstone")
-            envelope = self._validate_envelope(raw, tombstone_id=identity)
-            revisions.add(str(envelope["tombstone"]["revision"]))
-        return revisions
+            if path.name != f"{identity}.json":
+                raise RepositoryError(
+                    "the lifecycle envelope name is not canonical",
+                    code="invalid_item_lifecycle_store",
+                )
+            folded = identity.casefold()
+            if folded in aliases:
+                raise RepositoryError(
+                    "the lifecycle envelope store contains aliased identities",
+                    code="invalid_item_lifecycle_store",
+                )
+            aliases[folded] = identity
+        self._envelope_ids = dict(aliases)
+        return aliases
 
     def _receipt_path(self, operation_id: str) -> Path:
         return self._safe_target(

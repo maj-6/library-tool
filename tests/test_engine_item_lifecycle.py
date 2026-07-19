@@ -166,6 +166,10 @@ class FakeLifecycleRepository:
         self.operations: list[str] = []
         self.inspections: list[str] = []
         self.inspect_value = _DEFAULT
+        self.tombstone_reads: list[str] = []
+        self.tombstone_value = _DEFAULT
+        self.tombstone_list_reads = 0
+        self.tombstone_list_value = _DEFAULT
         self.error: Exception | None = None
 
     def inspect(self, item_id: str):
@@ -180,6 +184,25 @@ class FakeLifecycleRepository:
             item=self.unit.item,
             managed_tree=self.unit.tree,
         )
+
+    def get_tombstone(self, tombstone_id: str):
+        self.tombstone_reads.append(tombstone_id)
+        if self.error is not None:
+            raise self.error
+        if self.tombstone_value is not _DEFAULT:
+            return self.tombstone_value
+        tombstone = self.unit.tombstone
+        if tombstone is not None and tombstone.tombstone_id == tombstone_id:
+            return tombstone
+        return None
+
+    def list_tombstones(self):
+        self.tombstone_list_reads += 1
+        if self.error is not None:
+            raise self.error
+        if self.tombstone_list_value is not _DEFAULT:
+            return self.tombstone_list_value
+        return () if self.unit.tombstone is None else (self.unit.tombstone,)
 
     @contextmanager
     def unit_of_work(self, *, operation_id: str):
@@ -333,6 +356,138 @@ def test_inspect_validates_input_and_wraps_unexpected_repository_failure() -> No
         service.inspect("book-1")
     assert unavailable.value.code == "item_lifecycle_repository_unavailable"
     assert unavailable.value.retryable is True
+
+
+def test_get_tombstone_returns_only_the_requested_public_snapshot() -> None:
+    tombstone = _tombstone()
+    repository = FakeLifecycleRepository(
+        FakeLifecycleUnit(tombstone=tombstone)
+    )
+
+    result = ItemLifecycleService(repository).get_tombstone("deleted-1")
+
+    assert result == tombstone
+    assert result.as_dict() == tombstone.as_dict()
+    assert repository.tombstone_reads == ["deleted-1"]
+    assert repository.operations == []
+
+
+def test_get_tombstone_validates_input_absence_and_repository_result() -> None:
+    repository = FakeLifecycleRepository(FakeLifecycleUnit(tombstone=None))
+    service = ItemLifecycleService(repository)
+
+    with pytest.raises(ValidationError) as invalid:
+        service.get_tombstone("../escape")
+    assert invalid.value.code == "invalid_tombstone_id"
+    assert repository.tombstone_reads == []
+
+    with pytest.raises(NotFoundError) as missing:
+        service.get_tombstone("deleted-1")
+    assert missing.value.code == "item_tombstone_not_found"
+
+    repository.tombstone_value = object()
+    with pytest.raises(RepositoryError) as malformed:
+        service.get_tombstone("deleted-1")
+    assert malformed.value.code == "invalid_item_tombstone"
+
+    repository.tombstone_value = _tombstone(tombstone_id="deleted-other")
+    with pytest.raises(RepositoryError) as wrong:
+        service.get_tombstone("deleted-1")
+    assert wrong.value.code == "invalid_item_tombstone"
+
+
+def test_get_tombstone_wraps_unexpected_repository_failure() -> None:
+    repository = FakeLifecycleRepository()
+    repository.error = OSError("C:/private/tombstones unavailable")
+
+    with pytest.raises(RepositoryError) as caught:
+        ItemLifecycleService(repository).get_tombstone("deleted-1")
+
+    assert caught.value.code == "item_lifecycle_repository_unavailable"
+    assert caught.value.retryable is True
+    assert caught.value.details == {"cause_type": "OSError"}
+    assert "private" not in str(caught.value.as_dict())
+
+
+def test_list_tombstones_is_public_deterministic_and_tracks_active_ids() -> None:
+    restored = _restoration(
+        _tombstone(
+            tombstone_id="deleted-z",
+            item_id="book-z",
+        ),
+        item_revision="item-z-r2",
+        tombstone_revision="tomb-z-r2",
+    ).tombstone
+    deleted_b = _tombstone(
+        tombstone_id="deleted-b",
+        item_id="book-b",
+        deleted_item_revision="item-b-r1",
+    )
+    deleted_a = _tombstone(
+        tombstone_id="deleted-a",
+        item_id="Book-A",
+        deleted_item_revision="item-a-r1",
+    )
+    repository = FakeLifecycleRepository()
+    repository.tombstone_list_value = (restored, deleted_b, deleted_a)
+    service = ItemLifecycleService(repository)
+
+    listed = service.list_tombstones()
+
+    assert listed == (deleted_a, deleted_b, restored)
+    assert all(isinstance(value, ItemTombstoneSnapshot) for value in listed)
+    assert service.active_deleted_item_ids() == ("Book-A", "book-b")
+    assert repository.tombstone_list_reads == 2
+    assert repository.operations == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "not-an-index",
+        (_tombstone(), object()),
+        (_tombstone(), _tombstone()),
+        (
+            _tombstone(tombstone_id="Deleted-1"),
+            _tombstone(tombstone_id="deleted-1"),
+        ),
+        (
+            _tombstone(tombstone_id="deleted-a", item_id="Book-1"),
+            _tombstone(tombstone_id="deleted-b", item_id="book-1"),
+        ),
+    ],
+)
+def test_list_tombstones_rejects_invalid_duplicates_and_active_aliases(
+    value,
+) -> None:
+    repository = FakeLifecycleRepository()
+    repository.tombstone_list_value = value
+
+    with pytest.raises(RepositoryError) as caught:
+        ItemLifecycleService(repository).list_tombstones()
+
+    assert caught.value.code == "invalid_item_tombstone_index"
+
+
+def test_list_tombstones_wraps_iteration_and_repository_failures() -> None:
+    repository = FakeLifecycleRepository()
+
+    def broken_index():
+        yield _tombstone()
+        raise OSError("C:/private/index")
+
+    repository.tombstone_list_value = broken_index()
+    with pytest.raises(RepositoryError) as iteration:
+        ItemLifecycleService(repository).list_tombstones()
+    assert iteration.value.code == "item_lifecycle_repository_unavailable"
+    assert "private" not in str(iteration.value.as_dict())
+
+    repository.tombstone_list_value = _DEFAULT
+    repository.error = OSError("offline")
+    with pytest.raises(RepositoryError) as unavailable:
+        ItemLifecycleService(repository).active_deleted_item_ids()
+    assert unavailable.value.code == "item_lifecycle_repository_unavailable"
 
 
 def test_tombstone_round_trip_and_state_invariants() -> None:

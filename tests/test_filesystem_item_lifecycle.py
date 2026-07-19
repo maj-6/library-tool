@@ -20,7 +20,7 @@ from librarytool.adapters.filesystem.item_lifecycle_repository import (
 from librarytool.adapters.filesystem.recoverable_write_set import (
     RecoverableWriteSet,
 )
-from librarytool.engine.errors import ConflictError, RepositoryError
+from librarytool.engine.errors import ConflictError, NotFoundError, RepositoryError
 from librarytool.engine.item_commands import ItemDraft, ItemRecordSnapshot
 from librarytool.engine.item_lifecycle import (
     DeleteItemCommand,
@@ -94,6 +94,7 @@ def _repository(
     hook=None,
     write_set: RecoverableWriteSet | None = None,
     deletion_guard_for=None,
+    lock_context_for=nullcontext,
     recover: bool = True,
 ):
     store = write_set or RecoverableWriteSet(root, publish_hook=hook)
@@ -110,7 +111,7 @@ def _repository(
         item_repository=items,
         entry_directory_for=lambda item_id: root / "entries" / item_id,
         advance_restored_record=_advance_restored_record,
-        lock_context_for=nullcontext,
+        lock_context_for=lock_context_for,
         deletion_guard_for=deletion_guard_for,
     )
     return store, lifecycle
@@ -367,6 +368,152 @@ def test_receipts_are_durable_private_and_exact_retries_replay_after_restart(
     with pytest.raises(ConflictError) as caught:
         ItemLifecycleService(restarted).delete(changed)
     assert caught.value.code == "operation_id_conflict"
+
+
+def test_tombstone_discovery_is_public_deterministic_and_restart_safe(
+    tmp_path,
+):
+    root = tmp_path / "tombstone-discovery"
+    _write_catalogue(root)
+    entry = root / "entries" / "book-1"
+    entry.mkdir(parents=True)
+    (entry / "owned.bin").write_bytes(b"owned")
+    _, repository = _repository(root)
+    service = ItemLifecycleService(repository)
+    first_delete = _delete(service, operation_id="first-delete")
+    first_restore = _restore(
+        service, first_delete, operation_id="first-restore"
+    )
+    second_delete = _delete(service, operation_id="second-delete")
+
+    _, restarted = _repository(root)
+    query = ItemLifecycleService(restarted)
+    listed = query.list_tombstones()
+    expected = tuple(
+        sorted(
+            (
+                first_restore.receipt.tombstone,
+                second_delete.receipt.tombstone,
+            ),
+            key=lambda value: (
+                value.tombstone_id.casefold(),
+                value.tombstone_id,
+            ),
+        )
+    )
+
+    assert listed == expected
+    assert query.get_tombstone(
+        first_delete.receipt.tombstone.tombstone_id
+    ) == first_restore.receipt.tombstone
+    assert query.get_tombstone(
+        second_delete.receipt.tombstone.tombstone_id
+    ) == second_delete.receipt.tombstone
+    assert query.active_deleted_item_ids() == ("book-1",)
+    assert all(
+        set(tombstone.as_dict())
+        == {
+            "tombstone_id",
+            "revision",
+            "state",
+            "item_id",
+            "deleted_item_revision",
+            "managed_tree_revision",
+            "restored_item_revision",
+        }
+        for tombstone in listed
+    )
+    assert all("record" not in tombstone.as_dict() for tombstone in listed)
+
+
+def test_empty_tombstone_discovery_and_missing_read_are_safe(tmp_path):
+    root = tmp_path / "no-tombstones"
+    _write_catalogue(root)
+    _, repository = _repository(root)
+    service = ItemLifecycleService(repository)
+
+    assert service.list_tombstones() == ()
+    assert service.active_deleted_item_ids() == ()
+    with pytest.raises(NotFoundError) as missing:
+        service.get_tombstone("missing-tombstone")
+    assert missing.value.code == "item_tombstone_not_found"
+
+
+def test_tombstone_reads_take_the_broad_lifecycle_isolation_scope(tmp_path):
+    root = tmp_path / "read-isolation"
+    _write_catalogue(root)
+    _, deleting_repository = _repository(root)
+    deletion = _delete(ItemLifecycleService(deleting_repository))
+    events: list[str] = []
+
+    @contextmanager
+    def tracked_lock():
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    _, repository = _repository(root, lock_context_for=tracked_lock)
+    service = ItemLifecycleService(repository)
+    service.get_tombstone(deletion.receipt.tombstone.tombstone_id)
+    service.list_tombstones()
+    service.active_deleted_item_ids()
+
+    assert events == ["enter", "exit"] * 3
+
+
+def test_tombstone_alias_lookup_and_noncanonical_envelope_fail_closed(
+    tmp_path,
+):
+    root = tmp_path / "alias-envelope"
+    _write_catalogue(root)
+    _, repository = _repository(root)
+    deletion = _delete(ItemLifecycleService(repository))
+    tombstone_id = deletion.receipt.tombstone.tombstone_id
+
+    _, restarted = _repository(root)
+    with pytest.raises(RepositoryError) as alias:
+        ItemLifecycleService(restarted).get_tombstone(tombstone_id.upper())
+    assert alias.value.code == "item_lifecycle_tombstone_alias"
+
+    original = _envelope_path(root, tombstone_id)
+    noncanonical = original.with_suffix(".JSON")
+    temporary = original.with_suffix(".moving")
+    original.rename(temporary)
+    temporary.rename(noncanonical)
+    _, corrupt_repository = _repository(root)
+    with pytest.raises(RepositoryError) as corrupt:
+        ItemLifecycleService(corrupt_repository).list_tombstones()
+    assert corrupt.value.code == "invalid_item_lifecycle_store"
+
+
+def test_duplicate_active_envelopes_fail_closed_for_sync_suppression(
+    tmp_path,
+):
+    root = tmp_path / "duplicate-active"
+    _write_catalogue(root)
+    _, repository = _repository(root)
+    deletion = _delete(ItemLifecycleService(repository))
+    original_id = deletion.receipt.tombstone.tombstone_id
+    original = json.loads(
+        _envelope_path(root, original_id).read_text("utf-8")
+    )
+    duplicate_id = "ilt-duplicate-active"
+    original["tombstone"]["tombstone_id"] = duplicate_id
+    original["tombstone"]["revision"] = "ltr-duplicate-active"
+    original["managed_tree"]["tombstone_relative"] = (
+        ".engine/lifecycle/item-tombstones-v1/trees/" + duplicate_id
+    )
+    duplicate_path = _envelope_path(root, duplicate_id)
+    duplicate_path.parent.mkdir(parents=True, exist_ok=True)
+    duplicate_path.write_text(json.dumps(original), encoding="utf-8")
+
+    _, restarted = _repository(root)
+    with pytest.raises(RepositoryError) as caught:
+        ItemLifecycleService(restarted).active_deleted_item_ids()
+
+    assert caught.value.code == "invalid_item_tombstone_index"
 
 
 def test_restore_exact_retry_replays_before_live_collision_checks(tmp_path):
