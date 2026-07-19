@@ -8,6 +8,7 @@ conftest provides — never against live data or a live project.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 
 import pytest
 
@@ -422,6 +423,71 @@ def test_sync_entry_files_fails_closed_for_invalid_lifecycle_policy(monkeypatch)
         ss.sync_entry_files({}, allow_item=lambda _item_id: "yes")
 
 
+def test_sync_entry_files_holds_policy_guard_through_transfer(monkeypatch):
+    source = ss.entries_dir() / "book" / "ocr" / "compiled.txt"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("local", "utf-8")
+    monkeypatch.setattr(
+        ss.r2, "list_objects_meta", lambda _cfg, prefix="": {}
+    )
+    held = False
+    events = []
+
+    @contextmanager
+    def policy_guard():
+        nonlocal held
+        assert held is False
+        held = True
+        events.append("enter")
+        try:
+            yield lambda item_id: item_id != "deleted"
+        finally:
+            held = False
+            events.append("exit")
+
+    def guarded_put(_cfg, key, path, **_kwargs):
+        assert held is True
+        assert key == "entries/book/ocr/compiled.txt"
+        assert path == source
+
+    monkeypatch.setattr(ss.r2, "put_file", guarded_put)
+    result = ss.sync_entry_files({}, item_policy_guard=policy_guard)
+
+    assert result == {
+        "pushed": 1,
+        "pulled": 0,
+        "in_sync": 0,
+        "suppressed": 0,
+    }
+    assert held is False
+    assert events == ["enter", "exit"] * 2
+
+
+def test_sync_entry_files_rejects_ambiguous_or_invalid_policy_guards(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        ss.r2, "list_objects_meta", lambda _cfg, prefix="": {}
+    )
+    with pytest.raises(TypeError, match="mutually exclusive"):
+        ss.sync_entry_files(
+            {},
+            allow_item=lambda _item_id: True,
+            item_policy_guard=lambda: None,
+        )
+    with pytest.raises(TypeError, match="must be callable"):
+        ss.sync_entry_files({}, item_policy_guard=True)
+    with pytest.raises(TypeError, match="context manager"):
+        ss.sync_entry_files({}, item_policy_guard=lambda: object())
+
+    @contextmanager
+    def invalid_policy():
+        yield True
+
+    with pytest.raises(TypeError, match="yield a callable"):
+        ss.sync_entry_files({}, item_policy_guard=invalid_policy)
+
+
 def test_entries_plan_multipart_etag_falls_back_to_size():
     remote = {"f.pdf": {"size": 10, "etag": "abc-2", "modified": T1}}
     p = ss.entries_plan({"f.pdf": {"size": 10, "mtime": 0.0}}, remote,
@@ -678,6 +744,99 @@ def test_sync_store_policy_requires_outer_gate_for_atomicity(fake_cloud, monkeyp
     assert result["pushed"] == 1
     assert fake_cloud.tables["builds"]["book"]["data"]["title"] == "Local"
     assert "lifecycle/workspace gate" in (ss.sync_store.__doc__ or "")
+
+
+def test_sync_store_policy_guard_holds_each_catalogue_publication_phase(
+    fake_cloud,
+    monkeypatch,
+):
+    path = ss.STORES["builds"]["path"]()
+    lib.save_json(path, {
+        "book": {"id": "book", "title": "Local", "updated_at": T1},
+    })
+    fake_cloud.tables["builds"] = {
+        "remote": {
+            "id": "remote",
+            "data": {"id": "remote", "title": "Cloud", "updated_at": T2},
+            "updated_at": T2,
+            "deleted": False,
+        },
+    }
+    held = False
+    events = []
+    upsert = fake_cloud.upsert_store_rows
+    save_json = ss.lib.save_json
+
+    @contextmanager
+    def policy_guard():
+        nonlocal held
+        assert held is False
+        held = True
+        events.append("enter")
+        try:
+            yield lambda item_id: item_id != "deleted"
+        finally:
+            held = False
+            events.append("exit")
+
+    def guarded_upsert(cfg, table, pk, rows, chunk=200):
+        assert held is True
+        return upsert(cfg, table, pk, rows, chunk=chunk)
+
+    def guarded_save(target, value):
+        assert held is True
+        return save_json(target, value)
+
+    monkeypatch.setattr(ss.sbase, "upsert_store_rows", guarded_upsert)
+    monkeypatch.setattr(ss.lib, "save_json", guarded_save)
+    result = ss.sync_store(
+        {"url": "u", "key": "k"},
+        "builds",
+        item_policy_guard=policy_guard,
+    )
+
+    assert result["pushed"] == result["pulled"] == 1
+    assert fake_cloud.tables["builds"]["book"]["data"]["title"] == "Local"
+    assert lib.load_json(path, {})["remote"]["title"] == "Cloud"
+    assert held is False
+    assert events == ["enter", "exit"] * 2
+
+
+def test_sync_stores_validates_policy_guard_before_any_store_io(
+    fake_cloud,
+    monkeypatch,
+):
+    reads = []
+
+    def observe_read(_cfg, table, _pk):
+        reads.append(table)
+        return []
+
+    monkeypatch.setattr(ss.sbase, "list_store_rows", observe_read)
+    with pytest.raises(TypeError, match="item_policy_guard must be callable"):
+        ss.sync_stores(
+            {"url": "u", "key": "k"}, item_policy_guard=True
+        )
+    with pytest.raises(TypeError, match="mutually exclusive"):
+        ss.sync_stores(
+            {"url": "u", "key": "k"},
+            allow_item=lambda _item_id: True,
+            item_policy_guard=lambda: None,
+        )
+    with pytest.raises(ValueError, match="second builds lock"):
+        ss.sync_stores(
+            {"url": "u", "key": "k"},
+            locks={"builds": object()},
+            item_policy_guard=lambda: None,
+        )
+    with pytest.raises(ValueError, match="second builds lock"):
+        ss.sync_store(
+            {"url": "u", "key": "k"},
+            "builds",
+            lock=object(),
+            item_policy_guard=lambda: None,
+        )
+    assert reads == []
 
 
 def test_sync_store_full_cycle(fake_cloud):
