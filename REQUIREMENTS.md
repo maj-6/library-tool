@@ -455,7 +455,8 @@ is decided by a tolerant composite rather than exact strings:
   placeholders until the user stands up the backend / hosts the files. The
   installer's "download databases" option is offered by the app on first run.
 - Home page rework: the wordmark is set in a bundled Roboto Slab (variable
-  woff2, latin subset, static/fonts/) with the version number after the title,
+  woff2, latin subset; one of the faces listed in static/fonts/fonts.json --
+  see docs/fonts.md) with the version number after the title,
   mirrored from the title bar's #tb-meta so it is stated once; the subtitle is
   gone. "Pending tasks" became an IN PROGRESS panel: three clickable stat
   tiles (entries in the editor with a draft/to-upload breakdown, PDF sources

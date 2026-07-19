@@ -306,7 +306,22 @@ const LEGACY_THEMES = {
   graphite: "linen",
 };
 
-// One shared font list for the per-theme typography controls.
+// --- BUNDLED FONTS (GENERATED from static/fonts/fonts.json) ----------------
+// Faces that ship with the app, so a pick here always renders.
+// Regenerate: python tools/fontman.py generate
+// BUNDLED_FONTS: chrome faces, offered in the Settings pickers.
+const BUNDLED_FONTS = [
+  { id: "roboto-slab", family: "Roboto Slab", kind: "serif",
+    stack: "\"Roboto Slab\", Georgia, \"Times New Roman\", serif" },
+];
+// TYPESET_FONTS: typesetting faces, Replica engine only.
+const TYPESET_FONTS = [
+];
+// --- END BUNDLED FONTS -----------------------------------------------------
+
+// Faces the machine may or may not have. Kept as a second group in every font
+// picker so a user who prefers an installed face can still pick one, but the
+// bundled list above is what renders everywhere by construction.
 const FONT_CHOICES = [
   ["", "Default"],
   ['"Segoe UI", Tahoma, sans-serif', "Segoe UI"],
@@ -4551,6 +4566,12 @@ function sanitizeOverrides(o) {
       const val = v.trim();
       if (!val || val.length > 200) continue;
       if (/[();]|url\(|@import|expression|javascript:/i.test(val)) continue;
+      // Font vars are the only tokens whose value is free-form text, and they
+      // land in an inline body style, so hold them to a family-list grammar
+      // too: letters, digits, spaces, quotes, commas, dots, hyphens. Every
+      // bundled stack and every FONT_CHOICES entry passes; a stack carrying
+      // anything else was not written by either picker.
+      if (THEME_FONT_VARS.has(k) && !/^[A-Za-z0-9 ,._'"-]+$/.test(val)) continue;
       out[k] = val;
     }
   }
@@ -4699,12 +4720,27 @@ function renderThemeEditor() {
         const def = document.createElement("option");
         def.value = ""; def.textContent = "Theme default";
         sel.appendChild(def);
+        // Bundled first: those faces ship with the app, so picking one renders
+        // the same on every machine. The system group below is offered second
+        // because it only renders if the reader happens to have it installed.
+        const addOpt = (parent, val, label) => {
+          const o = document.createElement("option");
+          o.value = val; o.textContent = label;
+          parent.appendChild(o);
+        };
+        if (BUNDLED_FONTS.length) {
+          const bg = document.createElement("optgroup");
+          bg.label = "Bundled";
+          for (const f of BUNDLED_FONTS) addOpt(bg, f.stack, f.family);
+          sel.appendChild(bg);
+        }
+        const sg = document.createElement("optgroup");
+        sg.label = "System fonts";
         for (const [val, name] of FONT_CHOICES) {
           if (!val) continue;                              // skip FONT_CHOICES' own "Default"
-          const o = document.createElement("option");
-          o.value = val; o.textContent = name;
-          sel.appendChild(o);
+          addOpt(sg, val, name);
         }
+        sel.appendChild(sg);
         const stored = ov[tok.v] || "";
         sel.value = stored;
         if (sel.value !== stored) {                        // an imported/custom stack: keep it
@@ -21011,10 +21047,23 @@ async function rwTplOutliers() {
 // figures in place — beside the original scan. Print export will be this
 // same renderer, paginated.
 
-const RW_FONT_SUGGESTIONS = [
+// Historical book faces, offered for the re-typeset preview. These render only
+// if the reader has them installed; a datalist has no optgroup, so the bundled
+// faces — the ones guaranteed to render — are prepended rather than grouped.
+const RW_FONT_SUGGESTIONS_SYSTEM = [
   "EB Garamond", "IM Fell English", "IM Fell DW Pica", "IM Fell Double Pica",
   "Junicode", "Georgia", "Palatino Linotype", "Book Antiqua",
   "Times New Roman"];
+// Typesetting faces first: those are bundled specifically to set a facsimile
+// page, and this is the only surface that may offer them. Then the chrome
+// faces (bundled, so they render) and finally the historical names above.
+// Built on demand rather than at load: a top-level const here would pin the
+// replica section to the generated font block being declared earlier.
+function rwFontSuggestions() {
+  const bundled = [...TYPESET_FONTS, ...BUNDLED_FONTS].map((f) => f.family);
+  return [...bundled,
+          ...RW_FONT_SUGGESTIONS_SYSTEM.filter((n) => !bundled.includes(n))];
+}
 
 function rwSetMode(mode) {
   rwState.mode = mode === "preview" ? "preview" : "edit";
@@ -21233,7 +21282,7 @@ function rwRenderStyleboard() {
   if (!document.getElementById("rw-fonts")) {
     const dl = document.createElement("datalist");
     dl.id = "rw-fonts";
-    dl.innerHTML = RW_FONT_SUGGESTIONS
+    dl.innerHTML = rwFontSuggestions()
       .map((f) => `<option value="${esc(f)}">`).join("");
     document.body.appendChild(dl);
   }

@@ -891,6 +891,7 @@ def home():
         "index.html",
         app_v=_asset_v("app.js"),
         css_v=_asset_v("style.css"),
+        fonts_v=_asset_v("fonts.css"),
         app_version=_app_version(),
     )
 

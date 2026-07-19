@@ -37,6 +37,12 @@ index builder, or a standalone CLI. Feature design notes live in
 - `cloud_setup.py` / `cloud_defaults.py` — set up + inspect the Supabase
   project; the baked-in public cloud identifiers (URL + anon key) so a
   fresh install needs zero configuration.
+- `fontman.py` — the bundled-font manager. `static/fonts/fonts.json` lists the
+  faces that ship with the app; this generates the `@font-face` sheet, the
+  `BUNDLED_FONTS` list the Settings font pickers read, and the licence
+  attribution README from it (`list`, `add`, `rm`, `generate`, `verify`).
+  Bundling is what keeps the pickers independent of what is installed on the
+  machine. See `docs/fonts.md`.
 - `convert_xlsx.py` — converts `ch_library.xlsx` to `output/ch_library.json`.
 - `catalog_checks.py` — offline copyright + WHL-catalogue checks (loaders,
   indexes, and the shared cross-database identity test).
