@@ -1302,6 +1302,15 @@
                     data-tip="Which text layer the preview flows: the diplomatic transcription, the normalized reading, or a page-aligned translation"></select>
             <span class="tool-count" id="rw-status"></span>
             <span class="bar-spacer"></span>
+            <button id="rw-detect" class="cad-btn tiny icon-btn" type="button" disabled
+                    data-icon="sparkle" aria-label="Detect regions"
+                    data-tip="Detect this page's regions (Shift+D)"></button>
+            <button id="rw-proposal-apply" class="cad-btn tiny icon-btn" type="button" hidden
+                    data-icon="check" aria-label="Apply detected regions"
+                    data-tip="Apply the detected-region proposal"></button>
+            <button id="rw-proposal-dismiss" class="cad-btn tiny icon-btn" type="button" hidden
+                    data-icon="close" aria-label="Dismiss detected regions"
+                    data-tip="Dismiss the detected-region proposal"></button>
             <button id="rw-save" class="cad-btn tiny icon-btn" type="button" disabled
                     data-icon="save" aria-label="Save regions"
                     data-tip="Save this page's regions (Ctrl+S)"></button>
@@ -2552,6 +2561,7 @@
     </div>
   </div>
 
+  <script src="{{ url_for('static', filename='engine-client.js') }}?v={{ engine_v }}"></script>
   <script src="{{ url_for('static', filename='app.js') }}?v={{ app_v }}"></script>
 </body>
 </html>

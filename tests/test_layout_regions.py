@@ -240,6 +240,7 @@ def _layout_path(server):
 
 def test_regions_sidecar_roundtrip_and_renumber(data_root):
     import server
+    _layout_path(server).unlink(missing_ok=True)
     items = [{"id": "r0", "role": "body", "order": 0,
               "box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}, "text": "hi"}]
     server._ocr_save_page_regions(BID, "primary", 3, items,
@@ -249,11 +250,22 @@ def test_regions_sidecar_roundtrip_and_renumber(data_root):
     rec = meta["regions"]["primary"]["3"]
     assert rec["doc"] == "compiled.txt" and rec["items"][0]["text"] == "hi"
 
+    # These are part of the same page-keyed Replica aggregate.  They must
+    # follow their canonical page rather than becoming attached to whatever
+    # physical page shifts into the old number.
+    meta.setdefault("region_proposals", {}).setdefault("primary", {})["3"] = {
+        "base_revision": "rr-test", "items": []}
+    meta.setdefault("region_compile_pending", {}).setdefault(
+        "primary", {})["3"] = {"doc": "compiled.txt", "text": "pending"}
+    _layout_path(server).write_text(json.dumps(meta), encoding="utf-8")
+
     # page 2 deleted -> page 3 becomes page 2
     server._renumber_layout_words(BID, "primary", [2])
     meta = json.loads(_layout_path(server).read_text(encoding="utf-8"))
     assert "2" in meta["regions"]["primary"]
     assert "3" not in meta["regions"]["primary"]
+    assert set(meta["region_proposals"]["primary"]) == {"2"}
+    assert set(meta["region_compile_pending"]["primary"]) == {"2"}
 
     # an empty save drops the page and the emptied maps
     server._ocr_save_page_regions(BID, "primary", 2, [], None)
@@ -310,7 +322,15 @@ def test_region_record_dropped_when_its_doc_is_reocred(data_root):
 
 
 def _put(client, bid, body):
-    return client.put(f"/api/builds/{bid}/ocr-regions", json=body).get_json()
+    payload = dict(body)
+    src = str(payload.get("src") or "primary")
+    page = payload.get("page", 0)
+    loaded = client.get(
+        f"/api/builds/{bid}/ocr-regions?src={src}&page={page}").get_json()
+    if loaded.get("revision"):
+        payload.setdefault("expect_revision", loaded["revision"])
+    return client.put(
+        f"/api/builds/{bid}/ocr-regions", json=payload).get_json()
 
 
 def test_regions_put_sanitizes_and_saves(client, data_root):
@@ -343,6 +363,8 @@ def test_regions_put_sanitizes_and_saves(client, data_root):
     assert r["ok"] and r["count"] == 0
     assert not client.get(f"/api/builds/{bid}/ocr-regions?page=2").get_json()["found"]
 
+    assert client.get(
+        f"/api/builds/{bid}/ocr-regions?page=0").status_code == 400
     assert _put(client, bid, {"page": 0, "items": []})["ok"] is False
     assert _put(client, bid, {"page": 1, "src": "nope", "items": []})["ok"] is False
 
@@ -369,7 +391,9 @@ def test_regions_put_survives_hostile_values(client, data_root):
              '"box": {"x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2}, "text": "a"},'
              ' {"role": "body", "order": 1, '
              '"box": {"x": 0.1, "y": 0.4, "w": 0.2, "h": 0.2}, "text": "b"}]}',
-        content_type="application/json")
+        content_type="application/json",
+        headers={"If-Match": client.get(
+            f"/api/builds/{bid}/ocr-regions?page=4").get_json()["revision"]})
     # mixed str/int order must not 500 the sort; Infinity dims degrade to none
     assert r.status_code == 200 and r.get_json()["count"] == 2
     got = client.get(f"/api/builds/{bid}/ocr-regions?page=4").get_json()
@@ -510,6 +534,20 @@ def test_templates_apply_and_outliers(client, data_root):
     assert r["ok"] and r["items"] == 2
     assert client.get(f"/api/builds/{bid}/ocr-templates").get_json()[
         "templates"] == [{"name": "recto", "items": 2, "from_page": 10}]
+
+    # Even an explicit bulk-overwrite request may not replace a page a human
+    # verified. Unlocking is a separate, revisioned human action.
+    protected_before = client.get(
+        f"/api/builds/{bid}/ocr-regions?page=10").get_json()
+    protected = client.post(f"/api/builds/{bid}/ocr-templates/apply", json={
+        "name": "recto", "pages": [10], "overwrite": True,
+    }).get_json()
+    assert protected["applied"] == []
+    assert protected["protected"] == [10]
+    protected_after = client.get(
+        f"/api/builds/{bid}/ocr-regions?page=10").get_json()
+    assert protected_after["revision"] == protected_before["revision"]
+    assert protected_after["items"] == protected_before["items"]
 
     server._ocr_save_page_words(bid, "primary", 11, [
         {"t": "Lib", "l": 0, "x": 0.06, "y": 0.30, "w": 0.03, "h": 0.01},
@@ -706,9 +744,10 @@ def test_replica_import_roundtrip(client, data_root):
     import io
     import libcommon as lib
     import server
-    src_bid, dst_bid = "a11112345678", "b22212345678"
+    src_bid, dst_bid, clean_bid = (
+        "a11112345678", "b22212345678", "c33312345678")
     builds = lib.load_json(server.BUILDS_PATH, {})
-    for bid in (src_bid, dst_bid):
+    for bid in (src_bid, dst_bid, clean_bid):
         builds[bid] = {"id": bid, "title": "T " + bid}
     lib.save_json(server.BUILDS_PATH, builds)
 
@@ -734,7 +773,9 @@ def test_replica_import_roundtrip(client, data_root):
     lib.save_json(mp, meta)
     exported = client.get(f"/api/builds/{src_bid}/replica-export").data
 
-    # destination already has page 7 -> skipped; page 7 verified stays theirs
+    # The destination already has human-authored page 7. It is protected even
+    # from an explicit import overwrite; the foreign archive cannot use the
+    # coarse overwrite flag as an unlock operation.
     _put(client, dst_bid, {"page": 7, "items": [
         {"role": "body", "order": 0,
          "box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}, "text": "mine"}]})
@@ -742,24 +783,41 @@ def test_replica_import_roundtrip(client, data_root):
                     data={"lib": (io.BytesIO(exported), "book.lib")},
                     content_type="multipart/form-data").get_json()
     assert r["ok"]
-    assert r["pages_applied"] == [] and r["pages_skipped"] == [7]
+    assert r["pages_applied"] == [] and r["pages_protected"] == [7]
+    assert r["pages_skipped"] == []
     assert r["templates_added"] == ["recto"]
-    assert r["figures_added"] == 1
     assert r["stylesheet"] == "imported"   # dst had no custom sheet
     mine = client.get(f"/api/builds/{dst_bid}/ocr-regions?page=7").get_json()
     assert mine["items"][0]["text"] == "mine"
 
-    # with overwrite the page lands, layers and state intact
+    # overwrite still cannot replace a protected human page
     r = client.post(f"/api/builds/{dst_bid}/replica-import?overwrite=1",
                     data={"lib": (io.BytesIO(exported), "book.lib")},
                     content_type="multipart/form-data").get_json()
-    assert r["ok"] and r["pages_applied"] == [7]
+    assert r["ok"] and r["pages_applied"] == []
+    assert r["pages_protected"] == [7]
     got = client.get(f"/api/builds/{dst_bid}/ocr-regions?page=7").get_json()
-    assert got["state"] == "verified"
+    assert got["items"][0]["text"] == "mine"
+
+    # A clean destination accepts the page and its two text layers, but an
+    # external `verified` flag is advisory provenance rather than a local
+    # human attestation.
+    r = client.post(f"/api/builds/{clean_bid}/replica-import",
+                    data={"lib": (io.BytesIO(exported), "book.lib")},
+                    content_type="multipart/form-data").get_json()
+    assert r["ok"] and r["pages_applied"] == [7]
+    assert any("verified state imported as advisory" in w["msg"]
+               for w in r["warnings"])
+    got = client.get(f"/api/builds/{clean_bid}/ocr-regions?page=7").get_json()
+    assert got["state"] == ""
     roles = {i["role"]: i for i in got["items"]}
     assert roles["body"]["norm"] == "normalized"
     assert roles["body"]["src_type"] == "import"
-    assert (server._entry_dir(dst_bid) / "ocr" / "images" /
+    stored = lib.load_json(
+        server._entry_dir(clean_bid) / "ocr" / "layout.json", {})[
+            "regions"]["primary"]["7"]
+    assert stored["imported_state"] == "verified"
+    assert (server._entry_dir(clean_bid) / "ocr" / "images" /
             "p7-fig.jpeg").is_file()
 
     # garbage refuses cleanly

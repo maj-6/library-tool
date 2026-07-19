@@ -26,6 +26,9 @@ test("rwDistribute splits by weight at paragraph bounds and survives edges", () 
   const out = rwDistribute("aaa\n\nbbb\n\nc", [2, 1]);
   assert.equal(out.length, 2);
   assert.equal(out.join("\n\n"), "aaa\n\nbbb\n\nc");   // nothing lost
+  // Recompute the boundary after every advance: a cached first threshold
+  // used to skip directly to the final region here.
+  assert.deepEqual(rwDistribute("a\n\nb\n\nc", [1, 1, 1]), ["a", "b", "c"]);
   // one paragraph, many regions: everything lands somewhere, none undefined
   const one = rwDistribute("only", [1, 1, 1]);
   assert.equal(one.filter((s) => s === "only").length, 1);

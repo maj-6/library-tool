@@ -18509,16 +18509,22 @@ async function ocrLayoutMeta(bid) {
   if (!bid) return { images: {}, wordPages: {} };
   if (!ocrState.layoutMeta[bid]) {
     try {
-      const r = await (await fetch(
-        `/api/builds/${encodeURIComponent(bid)}/ocr-layout`)).json();
+      const r = await engineClient.ocr.layout({ bookId: bid });
       ocrState.layoutMeta[bid] = r.ok
         ? { images: r.images || {}, wordPages: r.word_pages || {},
             wordDocs: r.word_docs || {}, regionPages: r.region_pages || {},
-            regionStates: r.region_states || {} }
-        : { images: {}, wordPages: {}, wordDocs: {}, regionPages: {}, regionStates: {} };
+            regionStates: r.region_states || {},
+            regionProposalPages: r.region_proposal_pages || {},
+            regionStalePages: r.region_stale_pages || {},
+            regionCompilePendingPages: r.region_compile_pending_pages || {} }
+        : { images: {}, wordPages: {}, wordDocs: {}, regionPages: {},
+            regionStates: {}, regionProposalPages: {}, regionStalePages: {},
+            regionCompilePendingPages: {} };
     } catch (e) {
       ocrState.layoutMeta[bid] = { images: {}, wordPages: {}, wordDocs: {},
-                                   regionPages: {}, regionStates: {} };
+                                   regionPages: {}, regionStates: {},
+                                   regionProposalPages: {}, regionStalePages: {},
+                                   regionCompilePendingPages: {} };
     }
   }
   return ocrState.layoutMeta[bid];
@@ -20119,10 +20125,16 @@ const rwState = {
   book: "", src: "primary", page: 0,
   pdf: "",          // the source PDF (rasters + word clip)
   doc: "",          // compiled file this page's regions belong to
-  dims: null, items: [],
+  dims: null, ext: {}, items: [],
   sel: [],          // selected region ids; the LAST one is active
-  dirty: false, pageCount: 0, regionPages: [],
+  dirty: false, saving: false, editVersion: 0,
+  pageLoaded: false, loadError: "", revision: "",
+  proposal: null, stale: null, compilePending: null,
+  pageCount: 0, regionPages: [],
   regionStates: {}, // page -> review flag ("verified"), for the strip chips
+  regionProposalPages: [],
+  regionStalePages: [],
+  regionCompilePendingPages: [],
   outliers: [],     // pages flagged by the last template-outlier run
   templates: [],    // this source's template names
   layer: "text",    // which text layer the panel edits: "text" | "norm"
@@ -20131,20 +20143,88 @@ const rwState = {
   ratio: "",        // the page's aspect ratio, shared by canvas + preview
   styles: null,     // role -> type mapping (replica-style endpoint)
   stylesCustom: false,
+  styleDirty: false, styleSaving: false, styleVersion: 0,
   previewLang: "",  // "" diplomatic | "norm" | a translation lang code
   transLangs: [],   // this book's page-aligned translation languages
   transCache: {},   // lang -> parsed page sections
   drag: null,       // {kind: move|resize|draw, id, corner, start, box0, moved}
   lastPos: null,    // pointer in page fractions — the split guide
-  seq: 0, idSeq: 0,
+  seq: 0, pagesSeq: 0, pageSeq: 0, idSeq: 0, ridSeq: 0,
   instrLoaded: false, // did the per-book instructions GET succeed this book?
   instrDirty: false,  // unsaved edits in the instructions field
+  instrSaving: false, instrVersion: 0,
 };
 
 function rwActiveId() { return rwState.sel[rwState.sel.length - 1] || ""; }
 function rwActive() { return rwState.items.find((x) => x.id === rwActiveId()) || null; }
 function rwItem(id) { return rwState.items.find((x) => x.id === id) || null; }
 function rwNewId() { return "n" + (++rwState.idSeq); }
+
+// Region identity belongs to the data, not the current render. Mint it before
+// a region can be edited so repeat saves never ask the server for a new RID.
+function rwNewRid() {
+  const cryptoApi = globalThis.crypto;
+  if (cryptoApi && typeof cryptoApi.randomUUID === "function") {
+    try { return cryptoApi.randomUUID().replace(/-/g, ""); } catch (e) { /* fallback */ }
+  }
+  if (cryptoApi && typeof cryptoApi.getRandomValues === "function") {
+    try {
+      const bytes = cryptoApi.getRandomValues(new Uint8Array(16));
+      return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+    } catch (e) { /* fallback */ }
+  }
+  const tick = (++rwState.ridSeq).toString(16).padStart(8, "0");
+  const time = Date.now().toString(16).padStart(12, "0");
+  const rand = () => Math.floor(Math.random() * 0x100000000)
+    .toString(16).padStart(8, "0");
+  return (time + tick + rand() + rand()).slice(0, 64);
+}
+
+function rwRecordItems(raw, previous) {
+  const byRid = new Map((previous || []).filter((it) => it.rid)
+    .map((it) => [it.rid, it]));
+  const used = new Set();
+  return (Array.isArray(raw) ? raw : []).map((it, i) => {
+    const candidate = String(it && it.rid || "");
+    const indexed = previous && previous[i] && String(previous[i].rid || "");
+    let rid = /^[A-Za-z0-9_-]{1,64}$/.test(candidate) && !used.has(candidate)
+      ? candidate
+      : (/^[A-Za-z0-9_-]{1,64}$/.test(indexed) && !used.has(indexed)
+          ? indexed : rwNewRid());
+    while (used.has(rid)) rid = rwNewRid();
+    used.add(rid);
+    const prior = byRid.get(rid);
+    return {
+      id: prior ? prior.id : rwNewId(), rid,
+      ext: it && it.ext && typeof it.ext === "object" ? it.ext : undefined,
+      role: it && it.role || "body",
+      order: it && it.order != null ? +it.order : i,
+      box: { x: +((it && it.box || {}).x) || 0,
+             y: +((it && it.box || {}).y) || 0,
+             w: +((it && it.box || {}).w) || 0,
+             h: +((it && it.box || {}).h) || 0 },
+      text: String(it && it.text || ""),
+      norm: String(it && it.norm || ""),
+    };
+  });
+}
+
+function rwIsStale(value) {
+  return value === true || !!(value && typeof value === "object" &&
+                              Object.keys(value).length);
+}
+
+function rwHasUnsaved() {
+  return rwState.dirty || rwState.instrDirty || rwState.styleDirty;
+}
+
+function rwResetEmptyMessage(error) {
+  const empty = el("rw-empty");
+  if (!empty.dataset.defaultText) empty.dataset.defaultText = empty.textContent;
+  empty.textContent = error ? "Page regions unavailable." : empty.dataset.defaultText;
+  if (error) empty.dataset.tip = error;
+  else delete empty.dataset.tip;
+}
 
 function rwPdfForSrc(bid, src) {
   if (!src || src === "primary") return ocrBookPdf(bid);
@@ -20182,24 +20262,53 @@ function renderReplicaBooks() {
 function rwConfirmDiscard(detail) {
   return confirmDialog({
     title: "Discard edits", danger: true, confirmLabel: "Discard",
-    message: "This page has unsaved region edits.", detail });
+    message: "The Replica workbench has unsaved edits.", detail });
 }
 
 async function selectReplicaBook(bid) {
+  if (rwState.saving || rwState.styleSaving || rwState.instrSaving) {
+    status("REPLICA :: save in progress");
+    return;
+  }
   // instructions edits are per-book and only reloaded on a book switch, so the
   // discard gate must cover them too — page/source switches don't reload them
-  if ((rwState.dirty || rwState.instrDirty) &&
+  if (rwHasUnsaved() &&
       !(await rwConfirmDiscard("Switching books discards them."))) return;
-  // one shared sequence for book, source, AND page context: any in-flight
-  // fetch from before this click resolves into a dead sequence number and
-  // must not install its data (two quick book clicks used to interleave —
-  // book A's page strip and PDF under book B's regions)
+  // Book/source, page-strip, and page-record requests have separate
+  // generations. A late response can update only the context that launched it.
   const seq = ++rwState.seq;
+  ++rwState.pagesSeq;
+  ++rwState.pageSeq;
   rwState.book = bid; rwState.page = 0; rwState.items = [];
-  rwState.sel = []; rwState.dirty = false; rwState.instrDirty = false;
+  rwState.drag = null; rwState.lastPos = null;
+  rwState.sel = []; rwState.dirty = false; rwState.saving = false;
+  rwState.pageLoaded = false; rwState.loadError = ""; rwState.revision = "";
+  rwState.doc = ""; rwState.dims = null; rwState.ext = {};
+  rwState.proposal = null; rwState.stale = null; rwState.compilePending = null;
+  rwState.pageCount = 0; rwState.regionPages = []; rwState.regionStates = {};
+  rwState.regionProposalPages = []; rwState.regionStalePages = [];
+  rwState.regionCompilePendingPages = [];
+  rwState.templates = [];
+  rwState.styles = null; rwState.stylesCustom = false;
+  rwState.styleDirty = false; rwState.styleSaving = false; rwState.styleVersion = 0;
+  rwState.transLangs = []; rwState.transCache = {}; rwState.previewLang = "";
+  rwState.instrLoaded = false; rwState.instrDirty = false;
+  rwState.instrSaving = false; rwState.instrVersion = 0;
   rwState.outliers = [];   // the last scan flagged ANOTHER book's pages
+  el("rw-instr").value = "";
+  el("rw-instr").disabled = true;
+  el("rw-instr-state").textContent = "";
+  el("rw-styleboard").innerHTML = "";
+  el("rw-style-state").textContent = "";
+  el("rw-preview-lang").innerHTML = '<option value="">diplomatic</option>';
+  el("rw-pages").innerHTML = "";
+  el("rw-page-count").textContent = "";
+  el("rw-tpl").innerHTML = '<option value="">tpl…</option>';
+  rwResetEmptyMessage("");
   el("rw-canvas").hidden = true;
+  el("rw-preview-row").hidden = true;
   el("rw-empty").hidden = false;
+  rwSyncBar();
   renderReplicaBooks();
   // fresh meta on every visit: jobs and edits move the sidecar under us
   delete ocrState.layoutMeta[bid];
@@ -20210,15 +20319,10 @@ async function selectReplicaBook(bid) {
   sel.hidden = srcs.length < 2;
   rwState.src = srcs.includes(rwState.src) ? rwState.src : "primary";
   sel.value = rwState.src;
-  await renderReplicaPages(seq);
-  if (seq !== rwState.seq) return;
-  await rwLoadTemplates(seq);
-  if (seq !== rwState.seq) return;
-  await rwLoadStyles(seq);
-  if (seq !== rwState.seq) return;
-  await rwLoadTranslations(seq);
-  if (seq !== rwState.seq) return;
-  await rwLoadInstructions(seq);
+  await Promise.all([
+    renderReplicaPages(seq), rwLoadTemplates(seq), rwLoadStyles(seq),
+    rwLoadTranslations(seq), rwLoadInstructions(seq),
+  ]);
   if (seq !== rwState.seq) return;
   rwSyncBar();
 }
@@ -20237,23 +20341,52 @@ async function selectReplicaSource(source) {
     if (select) select.value = source;
     return true;
   }
+  if (rwState.saving || rwState.styleSaving || rwState.instrSaving) {
+    if (select) select.value = rwState.src;
+    status("REPLICA :: save in progress");
+    return false;
+  }
   if (rwState.dirty &&
       !(await rwConfirmDiscard("Switching sources discards them."))) {
     if (select) select.value = rwState.src;
     return false;
   }
   const seq = ++rwState.seq; // kill any in-flight fetch of the old source
+  ++rwState.pagesSeq;
+  ++rwState.pageSeq;
   rwState.src = source;
   if (select) select.value = source;
   rwState.page = 0; rwState.items = []; rwState.sel = [];
-  rwState.dirty = false;
+  rwState.drag = null; rwState.lastPos = null;
+  rwState.dirty = false; rwState.saving = false;
+  rwState.pageLoaded = false; rwState.loadError = ""; rwState.revision = "";
+  rwState.doc = ""; rwState.dims = null; rwState.ext = {};
+  rwState.proposal = null; rwState.stale = null; rwState.compilePending = null;
+  rwState.pageCount = 0; rwState.regionPages = []; rwState.regionStates = {};
+  rwState.regionProposalPages = []; rwState.regionStalePages = [];
+  rwState.regionCompilePendingPages = [];
+  rwState.templates = [];
   rwState.outliers = []; // scores belong to the old source's grid
+  rwResetEmptyMessage("");
+  el("rw-pages").innerHTML = "";
+  el("rw-page-count").textContent = "";
+  el("rw-tpl").innerHTML = '<option value="">tpl…</option>';
   el("rw-canvas").hidden = true;
+  el("rw-preview-row").hidden = true;
   el("rw-empty").hidden = false;
+  rwSyncBar();
   await renderReplicaPages(seq);
   if (seq !== rwState.seq) return false;
   // Templates are per source too: source A's names must not stamp source B.
   await rwLoadTemplates(seq);
+  if (seq !== rwState.seq) return false;
+  // A source switch invalidates source-scoped requests. If the initial
+  // book-scoped loads were still in flight, re-arm only the missing stores.
+  const repairs = [];
+  if (!rwState.styles && !rwState.styleDirty) repairs.push(rwLoadStyles(seq));
+  if (!rwState.instrLoaded && !rwState.instrDirty) repairs.push(rwLoadInstructions(seq));
+  if (!rwState.transLangs.length) repairs.push(rwLoadTranslations(seq));
+  if (repairs.length) await Promise.all(repairs);
   if (seq !== rwState.seq) return false;
   rwSyncBar();
   return true;
@@ -20262,9 +20395,9 @@ async function selectReplicaSource(source) {
 async function rwLoadTemplates(seq) {
   let names = [];
   try {
-    const r = await (await fetch(
-      `/api/builds/${encodeURIComponent(rwState.book)}/ocr-templates` +
-      `?src=${encodeURIComponent(rwState.src)}`)).json();
+    const r = await engineClient.replica.templates.list({
+      bookId: rwState.book, sourceId: rwState.src,
+    });
     if (r.ok) names = (r.templates || []).map((t) => t.name);
   } catch (e) { /* no templates yet */ }
   if (seq !== rwState.seq) return;
@@ -20274,9 +20407,15 @@ async function rwLoadTemplates(seq) {
     ...names.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`)].join("");
 }
 
-// the page strip chip: an outlier flag beats the review check beats the
-// plain has-regions dot
+// One compact chip carries the page's highest-priority review signal.
 function rwPageChip(n) {
+  const proposed = rwState.regionProposalPages.includes(n);
+  const stale = rwState.regionStalePages.includes(n);
+  const pending = rwState.regionCompilePendingPages.includes(n);
+  if (proposed) return `<span class="rw-warn" title="Automatic proposal${
+    stale ? "; regions stale" : ""}">✦</span>`;
+  if (pending) return '<span class="rw-warn" title="Text rebuild pending">↻</span>';
+  if (stale) return '<span class="rw-warn" title="Regions stale">↻</span>';
   if (rwState.outliers.includes(n)) return '<span class="rw-warn">!</span>';
   if ((rwState.regionStates || {})[String(n)] === "verified") {
     return '<span class="rw-check">✓</span>';
@@ -20290,10 +20429,16 @@ function syncReplicaPageAttention(button, page) {
   const value = key ? (state.attn || {})[key] : "";
   const marked = !!attnValue(value);
   const why = attnReason(value);
+  const proposed = rwState.regionProposalPages.includes(page);
+  const stale = rwState.regionStalePages.includes(page);
+  const pending = rwState.regionCompilePendingPages.includes(page);
   button.classList.toggle("attention", marked);
-  button.setAttribute("aria-label", marked
-    ? `Page ${page}, needs attention${why ? `: ${why}` : ""}`
-    : `Page ${page}`);
+  const labels = [`Page ${page}`];
+  if (marked) labels.push(`needs attention${why ? `: ${why}` : ""}`);
+  if (proposed) labels.push("automatic proposal available");
+  if (stale) labels.push("regions stale");
+  if (pending) labels.push("text rebuild pending");
+  button.setAttribute("aria-label", labels.join(", "));
   if (why) button.dataset.tip = "Needs attention: " + why;
   else delete button.dataset.tip;
 }
@@ -20305,29 +20450,32 @@ function renderReplicaAttentionMarks() {
     syncReplicaPageAttention(button, +button.dataset.page);
 }
 
-async function renderReplicaPages(seq) {
+async function renderReplicaPages(seq, pagesSeq = rwState.pagesSeq) {
   const bid = rwState.book;
   const src = rwState.src;
   const pdf = rwPdfForSrc(bid, src);
   const meta = await ocrLayoutMeta(bid);
-  if (seq !== rwState.seq) return;
+  if (seq !== rwState.seq || pagesSeq !== rwState.pagesSeq) return;
   const regionPages = ((meta.regionPages || {})[src] || []).slice();
   let count = 0;
   if (pdf) {
     let info = ocrState.pdfInfo[pdf];
     if (!info) {
       try {
-        const data = await (await fetch(
-          "/api/pdf/info?path=" + encodeURIComponent(pdf))).json();
+        const data = await engineClient.pdf.info({ path: pdf });
         if (data.ok) { info = data; ocrState.pdfInfo[pdf] = data; }
       } catch (e) { /* the strip still lists the region pages */ }
-      if (seq !== rwState.seq) return;
+      if (seq !== rwState.seq || pagesSeq !== rwState.pagesSeq) return;
     }
     if (info) count = info.pages || (info.dims || []).length || 0;
   }
   rwState.pdf = pdf;
   rwState.regionPages = regionPages;
   rwState.regionStates = (meta.regionStates || {})[src] || {};
+  rwState.regionProposalPages = ((meta.regionProposalPages || {})[src] || []).slice();
+  rwState.regionStalePages = ((meta.regionStalePages || {})[src] || []).slice();
+  rwState.regionCompilePendingPages = (
+    (meta.regionCompilePendingPages || {})[src] || []).slice();
   rwState.pageCount = Math.max(count, ...regionPages, 0);
   const box = el("rw-pages");
   box.innerHTML = "";
@@ -20346,43 +20494,87 @@ async function renderReplicaPages(seq) {
 }
 
 async function selectReplicaPage(n) {
+  if (rwState.saving) {
+    status("REGIONS :: save in progress");
+    return;
+  }
   if (rwState.dirty &&
       !(await rwConfirmDiscard("Switching pages discards them."))) return;
-  rwState.page = n; rwState.sel = []; rwState.dirty = false;
-  const seq = ++rwState.seq;
+  const book = rwState.book, src = rwState.src, pdf = rwState.pdf;
+  const seq = rwState.seq, pageSeq = ++rwState.pageSeq;
+  const previous = rwState.page === n ? rwState.items : [];
+  rwState.page = n; rwState.sel = []; rwState.items = [];
+  rwState.drag = null; rwState.lastPos = null;
+  rwState.dirty = false; rwState.saving = false; rwState.editVersion = 0;
+  rwState.pageLoaded = false; rwState.loadError = ""; rwState.revision = "";
+  rwState.doc = ""; rwState.dims = null; rwState.ext = {};
+  rwState.pageState = ""; rwState.proposal = null; rwState.stale = null;
+  rwState.compilePending = null;
+  rwResetEmptyMessage("");
   for (const b of el("rw-pages").querySelectorAll(".rw-pagebtn")) {
     b.classList.toggle("active", +b.dataset.page === n);
   }
-  el("rw-page-img").src = `/api/pdf/pageimg?path=${encodeURIComponent(rwState.pdf)}&page=${n}&w=1100`;
+  el("rw-page-img").src = engineClient.replica.pages.imageUrl({
+    pdfPath: pdf, page: n, width: 1100,
+  });
   // only edit mode reveals the canvas here — in preview, showing it now
   // would flash the previous page's overlay under the new page's image
   // until the region fetch lands (rwSetMode below re-syncs everything)
-  el("rw-canvas").hidden = rwState.mode !== "edit";
-  el("rw-empty").hidden = true;
+  el("rw-canvas").hidden = true;
+  el("rw-preview-row").hidden = true;
+  el("rw-empty").hidden = false;
+  rwSyncBar();
   // always fetched fresh — this is the editor, never a cached copy
-  let rec = { found: false };
+  let rec;
   try {
-    rec = await (await fetch(
-      `/api/builds/${encodeURIComponent(rwState.book)}/ocr-regions` +
-      `?src=${encodeURIComponent(rwState.src)}&page=${n}`)).json();
-  } catch (e) { /* a bare page: draw from scratch */ }
-  if (seq !== rwState.seq) return;
-  rwState.items = (rec.found ? rec.items || [] : []).map((it, i) => ({
-    id: "r" + i,
-    // carry the stable region id and any third-party ext through the workbench
-    // round-trip: a nudge-and-save must not re-mint rids or erase imported
-    // region ext (the server sanitizer preserves a valid incoming rid)
-    rid: it.rid, ext: it.ext,
-    role: it.role || "body",
-    order: it.order != null ? +it.order : i,
-    box: { x: +((it.box || {}).x) || 0, y: +((it.box || {}).y) || 0,
-           w: +((it.box || {}).w) || 0, h: +((it.box || {}).h) || 0 },
-    text: String(it.text || ""),
-    norm: String(it.norm || ""),
-  }));
-  rwState.doc = (rec.found && rec.doc) || "compiled.txt";
+    rec = await engineClient.replica.pages.get({
+      bookId: book, sourceId: src, page: n,
+    });
+    if (!rec || !rec.ok || typeof rec.revision !== "string" || !rec.revision)
+      throw new Error("load returned no revision");
+  } catch (e) {
+    if (seq !== rwState.seq || pageSeq !== rwState.pageSeq ||
+        book !== rwState.book || src !== rwState.src) return;
+    rwState.pageLoaded = false;
+    rwState.loadError = e && e.message || "load failed";
+    rwResetEmptyMessage(rwState.loadError);
+    rwSyncBar();
+    status("REGIONS :: page load failed");
+    return;
+  }
+  if (seq !== rwState.seq || pageSeq !== rwState.pageSeq ||
+      book !== rwState.book || src !== rwState.src) return;
+  rwState.items = rwRecordItems(rec.found ? rec.items : [], previous);
+  const meta = ocrState.layoutMeta[book] || {};
+  const sourceDocs = (meta.wordDocs || {})[src] || {};
+  rwState.doc = (rec.found && rec.doc) || sourceDocs[String(n)] ||
+                srcCompiledName(src);
   rwState.dims = rec.found ? rec.dims : null;
+  rwState.ext = rec.found && rec.ext && typeof rec.ext === "object" ? rec.ext : {};
   rwState.pageState = (rec.found && rec.state) || "";
+  rwState.revision = rec.revision;
+  rwState.proposal = rec.proposal && typeof rec.proposal === "object"
+    ? rec.proposal : null;
+  rwState.stale = rec.found ? rec.stale || null : null;
+  rwState.compilePending = rec.compile_pending &&
+    typeof rec.compile_pending === "object" ? rec.compile_pending : null;
+  rwState.pageLoaded = true; rwState.loadError = "";
+  for (const [key, present] of [
+    ["regionProposalPages", !!rwState.proposal],
+    ["regionStalePages", rwIsStale(rwState.stale)],
+    ["regionCompilePendingPages", !!rwState.compilePending],
+  ]) {
+    const pages = rwState[key];
+    const has = pages.includes(n);
+    if (present && !has) pages.push(n);
+    else if (!present && has) rwState[key] = pages.filter((p) => p !== n);
+  }
+  const pageButton = el("rw-pages").querySelector(`[data-page="${n}"]`);
+  if (pageButton) {
+    pageButton.innerHTML = `${n}` + rwPageChip(n);
+    syncReplicaPageAttention(pageButton, n);
+  }
+  rwResetEmptyMessage("");
   rwSetLayer("text");
   let ratio = "";
   if (rwState.dims && rwState.dims.w > 0) {
@@ -20472,33 +20664,73 @@ function rwNormalize(text) {
 
 function rwSyncBar() {
   const nItems = rwState.items.length;
+  const ready = !!(rwState.page && rwState.pageLoaded && !rwState.loadError);
+  const pending = rwHasUnsaved() || rwState.saving || rwState.styleSaving ||
+                  rwState.instrSaving;
+  const detecting = !!(rwState.book && rwState.page &&
+    ocrState.pageRunning.has(`${rwState.book}:${rwState.src}:${rwState.page}`));
   el("rw-status").textContent = rwState.page
-    ? `p ${rwState.page} · ${nItems} region${nItems === 1 ? "" : "s"}` +
+    ? `p ${rwState.page}` +
+      (ready ? ` · ${nItems} region${nItems === 1 ? "" : "s"}` : " · ⚠") +
       (rwState.pageState === "verified" ? " · ✓" : "") +
+      (rwState.proposal ? " · ✦" : "") +
+      (rwIsStale(rwState.stale) ? " · ↻" : "") +
+      (rwState.compilePending ? " · ↻" : "") +
       (rwState.dirty ? " · unsaved" : "")
     : "";
-  el("rw-save").disabled = !rwState.dirty || !rwState.page;
-  el("rw-recompile").disabled = !rwState.book || !rwState.regionPages.length || rwState.dirty;
-  el("rw-export").disabled = !rwState.book || !rwState.regionPages.length;
-  el("rw-import").disabled = !rwState.book;
-  el("rw-print").disabled = !rwState.book || !rwState.regionPages.length;
-  el("rw-tpl-save").disabled = !rwState.page || rwState.dirty;
-  el("rw-tpl-apply").disabled = !el("rw-tpl").value;
-  el("rw-tpl-outliers").disabled = !el("rw-tpl").value;
+  el("rw-detect").disabled = !ready || rwState.dirty || rwState.saving || detecting;
+  for (const id of ["rw-proposal-apply", "rw-proposal-dismiss"]) {
+    const button = el(id);
+    button.hidden = !rwState.proposal;
+    button.disabled = !ready || rwState.dirty || rwState.saving;
+  }
+  el("rw-save").disabled = !rwState.dirty || !ready || rwState.saving;
+  el("rw-recompile").disabled = !rwState.book || !rwState.regionPages.length ||
+                                pending || (rwState.page && !ready);
+  el("rw-export").disabled = !rwState.book || !rwState.regionPages.length ||
+                             pending || (rwState.page && !ready);
+  el("rw-import").disabled = !rwState.book || pending ||
+                             (rwState.page && !ready);
+  el("rw-print").disabled = !rwState.book || !rwState.regionPages.length ||
+                            pending || (rwState.page && !ready);
+  el("rw-tpl-save").disabled = !ready || rwState.dirty || rwState.saving;
+  el("rw-tpl-apply").disabled = !el("rw-tpl").value || rwState.dirty ||
+                                rwState.saving;
+  el("rw-tpl-outliers").disabled = !el("rw-tpl").value || rwState.dirty ||
+                                   rwState.saving;
+  el("rw-mode-edit").disabled = !!rwState.page && !ready;
+  el("rw-mode-preview").disabled = !!rwState.page && !ready;
+  el("rw-style-save").disabled = !rwState.styles || !rwState.styleDirty ||
+                                  rwState.styleSaving;
+  el("rw-style-reset").disabled = !rwState.book || rwState.styleSaving;
+  el("rw-instr-save").disabled = !rwState.book || !rwState.instrLoaded ||
+                                  !rwState.instrDirty || rwState.instrSaving;
   const a = rwActive();
   el("rw-region-info").textContent = a ? `${a.role} · order ${a.order}` : "";
   const ta = el("rw-text");
-  ta.disabled = !a;
-  if (document.activeElement !== ta) {
+  ta.disabled = !a || !ready;
+  const bufferId = a ? a.id : "";
+  const sameBuffer = ta.dataset.itemId === bufferId &&
+                     ta.dataset.layer === rwState.layer;
+  if (document.activeElement !== ta || !sameBuffer) {
     ta.value = a ? (rwState.layer === "norm" ? a.norm || "" : a.text) : "";
   }
-  el("rw-clip").disabled = !a;
-  el("rw-normalize").disabled = !a;
+  ta.dataset.itemId = bufferId;
+  ta.dataset.layer = rwState.layer;
+  el("rw-clip").disabled = !a || !ready;
+  el("rw-normalize").disabled = !a || !ready;
   el("rw-rework").hidden = !(a && a.role === "figure" &&
                              /!\[[^\]\n]*\]\([\w.\- ]+\)/.test(a.text || ""));
 }
 
-function rwDirty() { rwState.dirty = true; rwSyncBar(); }
+function rwDirty(preserveReview = false) {
+  rwState.dirty = true;
+  ++rwState.editVersion;
+  if (!preserveReview && rwState.pageState === "verified") {
+    rwState.pageState = "";
+  }
+  rwSyncBar();
+}
 
 function rwPos(ev) {
   const r = el("rw-overlay").getBoundingClientRect();
@@ -20508,8 +20740,13 @@ function rwPos(ev) {
 }
 
 function rwMouseDown(ev) {
-  if (!rwState.page || ev.button !== 0) return;
+  if (!rwState.page || !rwState.pageLoaded || rwState.loadError || ev.button !== 0) return;
   ev.preventDefault();
+  // The textarea stays focused when preventDefault keeps the pointer on the
+  // overlay. Blur it before changing selection so its old buffer cannot be
+  // written into the newly-active region on the next keystroke.
+  const textInput = el("rw-text");
+  if (document.activeElement === textInput) textInput.blur();
   const pos = rwPos(ev);
   const handle = ev.target.closest(".rw-handle");
   const regEl = ev.target.closest(".rw-region");
@@ -20576,11 +20813,11 @@ function rwMouseMove(ev) {
     rwPaintRegion(it);
   } else if (d.kind === "draw") {
     if (!d.id && (Math.abs(dx) > 0.004 || Math.abs(dy) > 0.004)) {
-      const it = { id: rwNewId(), role: "body",
+      const it = { id: rwNewId(), rid: rwNewRid(), role: "body",
                    order: rwState.items.length
                      ? Math.max(...rwState.items.map((x) => x.order)) + 1 : 0,
                    box: { x: d.start.x, y: d.start.y, w: 0.004, h: 0.004 },
-                   text: "" };
+                   text: "", norm: "" };
       rwState.items.push(it);
       d.id = it.id;
       rwState.sel = [it.id];
@@ -20619,8 +20856,8 @@ function rwSplit(it, axis) {
   }
   f = Math.min(0.95, Math.max(0.05, f));
   for (const x of rwState.items) if (x.order > it.order) x.order += 1;
-  const twin = { id: rwNewId(), role: it.role, order: it.order + 1,
-                 box: { ...it.box }, text: "" };
+  const twin = { id: rwNewId(), rid: rwNewRid(), role: it.role,
+                 order: it.order + 1, box: { ...it.box }, text: "", norm: "" };
   if (axis === "h") {
     const cut = it.box.h * f;
     twin.box.y = it.box.y + cut;
@@ -20694,8 +20931,12 @@ function rwKeyDown(ev) {
   // every command below is a BARE key: Ctrl+V is a paste reflex, not a
   // request to flip the review flag, and Ctrl+digit belongs to the shell
   if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+  if (ev.shiftKey && ev.key.toLowerCase() === "d") {
+    ev.preventDefault(); rwDetectPage(); return;
+  }
   // the preview is read-only: region commands belong to edit mode
   if (rwState.mode === "preview") return;
+  if (!rwState.pageLoaded || rwState.loadError) return;
   const a = rwActive();
   if (/^[0-9]$/.test(ev.key) && rwState.sel.length) {
     const role = RW_ROLES[(parseInt(ev.key, 10) + 9) % 10];
@@ -20724,7 +20965,7 @@ function rwKeyDown(ev) {
       return;
     }
     rwState.pageState = rwState.pageState === "verified" ? "" : "verified";
-    rwDirty();
+    rwDirty(true);
   } else if ((ev.key === "m" || ev.key === "M") && rwState.sel.length >= 2) {
     rwMerge();
   } else if (ev.key === "Tab" && rwState.items.length) {
@@ -20741,17 +20982,18 @@ function rwKeyDown(ev) {
 
 async function rwClipWords() {
   const a = rwActive();
-  if (!a || !rwState.pdf) return;
-  const seq = rwState.seq;
+  if (!a || !rwState.pdf || !rwState.pageLoaded || rwState.loadError) return;
+  const seq = rwState.seq, pageSeq = rwState.pageSeq;
   let res = null;
   try {
-    res = await (await fetch(
-      `/api/pdf/words?path=${encodeURIComponent(rwState.pdf)}` +
-      `&page=${rwState.page}&build_id=${encodeURIComponent(rwState.book)}`)).json();
+    res = await engineClient.pdf.words({
+      path: rwState.pdf, page: rwState.page, bookId: rwState.book,
+    });
   } catch (e) { /* handled below */ }
   // the page (or the region itself) may be gone by now: applying the clip
   // would write onto an orphan and dirty a page the user never touched
-  if (seq !== rwState.seq || !rwState.items.includes(a)) return;
+  if (seq !== rwState.seq || pageSeq !== rwState.pageSeq ||
+      !rwState.items.includes(a)) return;
   if (!res || !res.ok || !res.found) {
     status("CLIP :: no word boxes on this page — run Tesseract, or no text layer");
     return;
@@ -20784,93 +21026,232 @@ async function rwReworkFigure() {
   // generation can run minutes and the UI stays live: everything after the
   // await must speak about THIS book, not wherever the user wandered
   const book = rwState.book, src = rwState.src, seq = rwState.seq;
+  const pageSeq = rwState.pageSeq;
   status("REWORK :: generating…");
   let r;
   try {
-    r = await (await fetch(
-      `/api/builds/${encodeURIComponent(book)}/rework-figure`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ src, figure: m[1], prompt: extra.trim() }),
-      })).json();
-    if (!r.ok) throw new Error(r.error || "rework failed");
+    r = await engineClient.replica.figures.rework({
+      bookId: book, sourceId: src, figure: m[1], prompt: extra.trim(),
+    });
   } catch (e) {
     status("REWORK :: " + e.message);
     return;
   }
   delete ocrState.layoutMeta[book];   // the new asset must be seen
   status(`REWORK :: ${r.name} — the preview now prefers it`);
-  if (seq === rwState.seq && rwState.mode === "preview") rwRenderPreview();
+  if (seq === rwState.seq && pageSeq === rwState.pageSeq &&
+      rwState.mode === "preview") rwRenderPreview();
+}
+
+async function rwRefreshSavedPage(book, src, page, seq) {
+  if (seq !== rwState.seq || book !== rwState.book || src !== rwState.src) return;
+  delete ocrState.layoutMeta[book];
+  ocrState.regionsCache.clear();
+  const pagesSeq = ++rwState.pagesSeq;
+  ++rwState.pageSeq;
+  rwState.pageLoaded = false; rwState.loadError = "";
+  rwSetMode(rwState.mode);
+  await renderReplicaPages(seq, pagesSeq);
+  if (seq !== rwState.seq || pagesSeq !== rwState.pagesSeq ||
+      book !== rwState.book || src !== rwState.src) return;
+  await selectReplicaPage(page);
+}
+
+async function rwProposalAction(action) {
+  if (!rwState.proposal || !rwState.pageLoaded || rwState.dirty || rwState.saving) return;
+  const book = rwState.book, src = rwState.src, page = rwState.page;
+  const seq = rwState.seq, pageSeq = rwState.pageSeq;
+  const revision = rwState.revision;
+  const proposalRevision = String(rwState.proposal.revision || "");
+  if (!proposalRevision) {
+    status("PROPOSAL :: reload this page");
+    return;
+  }
+  if (action === "apply" && !(await confirmDialog({
+    title: "Apply detected regions", confirmLabel: "Apply",
+    message: "Replace this page with the detected proposal?",
+    detail: "The current saved regions remain unchanged unless you confirm."
+  }))) return;
+  if (seq !== rwState.seq || pageSeq !== rwState.pageSeq ||
+      book !== rwState.book || src !== rwState.src || page !== rwState.page) return;
+  rwState.saving = true;
+  rwSyncBar();
+  let result, failure = null;
+  try {
+    result = await engineClient.replica.proposals.decide({
+      bookId: book, sourceId: src, page, action, revision, proposalRevision,
+    });
+  } catch (e) { failure = e; }
+  const current = seq === rwState.seq && pageSeq === rwState.pageSeq &&
+                  book === rwState.book && src === rwState.src &&
+                  page === rwState.page;
+  if (!current) return;
+  rwState.saving = false;
+  if (failure) {
+    status(failure.status === 409 || failure.status === 428
+      ? "PROPOSAL :: changed elsewhere — reload"
+      : "PROPOSAL :: " + failure.message);
+    rwSyncBar();
+    return;
+  }
+  status(action === "apply"
+    ? (result.compiled ? "PROPOSAL APPLIED" : "PROPOSAL APPLIED · text pending")
+    : "PROPOSAL DISMISSED");
+  await rwRefreshSavedPage(book, src, page, seq);
+}
+
+async function rwDetectPage() {
+  if (!rwState.pageLoaded || rwState.loadError || rwState.dirty || rwState.saving) return;
+  const book = rwState.book, src = rwState.src, page = rwState.page;
+  const seq = rwState.seq, pageSeq = rwState.pageSeq;
+  const queued = await ocrQueuePages(book, src, [{ page, service: "mistral" }]);
+  if (seq !== rwState.seq || pageSeq !== rwState.pageSeq ||
+      book !== rwState.book || src !== rwState.src || page !== rwState.page) return;
+  if (!queued) {
+    status("DETECT :: could not queue Mistral OCR");
+    return;
+  }
+  status("DETECT :: queued");
+  rwSyncBar();
+  const key = `${book}:${src}:${page}`;
+  let checks = 0;
+  const timer = setInterval(async () => {
+    if (seq !== rwState.seq || book !== rwState.book || src !== rwState.src ||
+        ++checks > 1200) {
+      clearInterval(timer);
+      return;
+    }
+    if (ocrState.pageRunning.has(key)) return;
+    clearInterval(timer);
+    await rwRefreshSavedPage(book, src, page, seq);
+    if (seq === rwState.seq && book === rwState.book && src === rwState.src) {
+      status("DETECT :: finished");
+      rwSyncBar();
+    }
+  }, 1000);
 }
 
 async function rwSave() {
-  if (!rwState.dirty || !rwState.page) return;
+  if (!rwState.dirty || !rwState.page || !rwState.pageLoaded ||
+      rwState.loadError || rwState.saving) return;
   // everything after the await must use THIS context, not whatever page or
   // book the user navigated to while the PUT was in flight — the old code
   // wiped the NEW page's dirty flag and dotted the wrong page button
   const book = rwState.book, src = rwState.src, page = rwState.page;
-  const seq = rwState.seq;
+  const seq = rwState.seq, pageSeq = rwState.pageSeq;
+  const version = rwState.editVersion, revision = rwState.revision;
   const pageState = rwState.pageState;
+  const doc = rwState.doc, dims = rwState.dims, pageExt = rwState.ext || {};
   const items = [...rwState.items].sort((a, b) => a.order - b.order)
-    // rid + ext ride through so a save preserves the region's stable id and any
-    // imported third-party namespace (JSON.stringify drops the undefined keys
-    // of a legacy region, and the server mints a rid only for those)
     .map((it, i) => ({ rid: it.rid, ext: it.ext, role: it.role, order: i,
-                       box: it.box, text: it.text, norm: it.norm || "" }));
+                       box: { ...it.box }, text: it.text, norm: it.norm || "" }));
+  rwState.saving = true;
+  rwSyncBar();
+  let r, failure = null;
   try {
-    const r = await (await fetch(
-      `/api/builds/${encodeURIComponent(book)}/ocr-regions`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ src, page, doc: rwState.doc,
-                               dims: rwState.dims, state: pageState, items }),
-      })).json();
-    if (!r.ok) throw new Error(r.error || "save failed");
+    r = await engineClient.replica.pages.save({
+      bookId: book, sourceId: src, page, revision,
+      record: { doc, dims, ext: pageExt, state: pageState, items },
+    });
   } catch (e) {
-    status("REGIONS :: " + e.message);
+    failure = e;
+  }
+  const current = seq === rwState.seq && pageSeq === rwState.pageSeq &&
+                  book === rwState.book && src === rwState.src &&
+                  page === rwState.page;
+  if (current) rwState.saving = false;
+  if (failure) {
+    if (current) {
+      if (failure.status === 409 || failure.status === 428) {
+        status("REGIONS :: changed elsewhere — reload before saving");
+      } else {
+        status("REGIONS :: " + failure.message);
+      }
+      rwSyncBar();
+    }
     return;
   }
   // the facsimile caches now describe the old record
   ocrState.regionsCache.clear();
   delete ocrState.layoutMeta[book];
   if (book === rwState.book && src === rwState.src) {
+    const savedItems = r.found ? r.items || [] : [];
     const has = rwState.regionPages.includes(page);
-    if (items.length && !has) rwState.regionPages.push(page);
-    if (!items.length && has) {
+    if (savedItems.length && !has) rwState.regionPages.push(page);
+    if (!savedItems.length && has) {
       rwState.regionPages = rwState.regionPages.filter((p) => p !== page);
     }
-    if (items.length && pageState) rwState.regionStates[String(page)] = pageState;
+    const savedState = r.found ? r.state || "" : "";
+    if (savedItems.length && savedState) rwState.regionStates[String(page)] = savedState;
     else delete rwState.regionStates[String(page)];
+    const proposal = r.proposal && typeof r.proposal === "object";
+    const stale = rwIsStale(r.stale);
+    const compilePending = r.compile_pending &&
+      typeof r.compile_pending === "object";
+    for (const [key, present] of [
+      ["regionProposalPages", proposal], ["regionStalePages", stale],
+      ["regionCompilePendingPages", compilePending],
+    ]) {
+      const pages = rwState[key];
+      const hasPage = pages.includes(page);
+      if (present && !hasPage) pages.push(page);
+      else if (!present && hasPage) rwState[key] = pages.filter((p) => p !== page);
+    }
     const btn = el("rw-pages").querySelector(`[data-page="${page}"]`);
-    if (btn) btn.innerHTML = `${page}` + rwPageChip(page);
+    if (btn) {
+      btn.innerHTML = `${page}` + rwPageChip(page);
+      syncReplicaPageAttention(btn, page);
+    }
   }
-  if (seq === rwState.seq) {
-    rwState.dirty = false;
-    // an empty save dropped the record server-side — and any flag with it
-    if (!items.length) rwState.pageState = "";
+  if (current) {
+    rwState.revision = r.revision;
+    rwState.ext = r.found && r.ext && typeof r.ext === "object" ? r.ext : {};
+    rwState.proposal = r.proposal && typeof r.proposal === "object"
+      ? r.proposal : null;
+    rwState.stale = r.found ? r.stale || null : null;
+    rwState.compilePending = r.compile_pending &&
+      typeof r.compile_pending === "object" ? r.compile_pending : null;
+    // Edits made while the request was in flight stay on screen and remain
+    // dirty. They are now based on the revision just committed by this save.
+    if (rwState.editVersion === version) {
+      rwState.items = rwRecordItems(r.found ? r.items : [], rwState.items);
+      rwState.sel = rwState.sel.filter((id) => rwState.items.some((it) => it.id === id));
+      rwState.doc = r.found ? r.doc || doc : doc;
+      rwState.dims = r.found ? r.dims || null : null;
+      rwState.pageState = r.found ? r.state || "" : "";
+      rwState.dirty = false;
+      rwRenderOverlay();
+    }
   }
-  status(`REGIONS SAVED :: p ${page} · ${items.length}`);
-  rwSyncBar();
+  if (current) {
+    status(`REGIONS SAVED :: p ${page} · ${(r.items || []).length}`);
+    rwSyncBar();
+  }
 }
 
 async function rwRecompile() {
   if (!rwState.book) return;
-  if (rwState.dirty) { status("RECOMPILE :: save the page first"); return; }
+  if (rwHasUnsaved() || rwState.saving) {
+    status("RECOMPILE :: save edits first");
+    return;
+  }
+  if (rwState.page && !rwState.pageLoaded) return;
+  const book = rwState.book, src = rwState.src, page = rwState.page;
+  const seq = rwState.seq;
   // the toggled text layer is the layer that compiles: diplomatic body into
   // each record's own doc, the normalized reading into normalized.txt
-  const body = { src: rwState.src };
-  if (rwState.layer === "norm") body.layer = "norm";
   try {
-    const r = await (await fetch(
-      `/api/builds/${encodeURIComponent(rwState.book)}/ocr-regions/recompile`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      })).json();
-    if (!r.ok) throw new Error(r.error || "recompile failed");
+    const r = await engineClient.replica.pages.recompile({
+      bookId: book, sourceId: src,
+      layer: rwState.layer === "norm" ? "norm" : "text",
+    });
+    if (seq !== rwState.seq || book !== rwState.book || src !== rwState.src) return;
     status(`RECOMPILED :: ${r.pages} page(s) -> ${(r.docs || []).join(", ")}`);
+    if (page) await rwRefreshSavedPage(book, src, page, seq);
   } catch (e) {
-    status("RECOMPILE :: " + e.message);
+    if (seq === rwState.seq && book === rwState.book && src === rwState.src) {
+      status("RECOMPILE :: " + e.message);
+    }
   }
 }
 
@@ -20909,26 +21290,26 @@ function rwPrompt(message, dflt) {
 }
 
 async function rwTplSave() {
-  if (!rwState.page) return;
+  if (!rwState.page || !rwState.pageLoaded || rwState.loadError) return;
   if (rwState.dirty) { status("TEMPLATE :: save the page first"); return; }
+  const book = rwState.book, src = rwState.src, page = rwState.page;
+  const seq = rwState.seq, pageSeq = rwState.pageSeq;
   const name = ((await rwPrompt("Template name (e.g. recto, verso):",
                                 el("rw-tpl").value || "recto")) || "").trim();
-  if (!name) return;
+  if (!name || seq !== rwState.seq || pageSeq !== rwState.pageSeq ||
+      book !== rwState.book || src !== rwState.src) return;
   try {
-    const r = await (await fetch(
-      `/api/builds/${encodeURIComponent(rwState.book)}/ocr-templates`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ src: rwState.src, name,
-                               from_page: rwState.page }),
-      })).json();
-    if (!r.ok) throw new Error(r.error || "template save failed");
-    status(`TEMPLATE :: "${name}" · ${r.items} regions (from p ${rwState.page})`);
+    const r = await engineClient.replica.templates.saveFromPage({
+      bookId: book, sourceId: src, name, page,
+    });
+    status(`TEMPLATE :: "${name}" · ${r.items} regions (from p ${page})`);
   } catch (e) {
     status("TEMPLATE :: " + e.message);
     return;
   }
-  await rwLoadTemplates(rwState.seq);
+  if (seq !== rwState.seq || book !== rwState.book || src !== rwState.src) return;
+  await rwLoadTemplates(seq);
+  if (seq !== rwState.seq || book !== rwState.book || src !== rwState.src) return;
   el("rw-tpl").value = name;
   rwSyncBar();
 }
@@ -20950,21 +21331,19 @@ function rwParsePages(spec) {
 async function rwTplApply() {
   const name = el("rw-tpl").value;
   if (!name || !rwState.book) return;
+  const book = rwState.book, src = rwState.src, seq = rwState.seq;
   const spec = await rwPrompt(
     `Apply "${name}" to pages (e.g. 121-140, 150).\n` +
     "Pages that already have regions are skipped. Each stamped region " +
     "pre-fills its text from the word boxes inside it, when the page has any.",
     "");
   const pages = rwParsePages(spec);
-  if (!pages.length) return;
+  if (!pages.length || seq !== rwState.seq || book !== rwState.book ||
+      src !== rwState.src) return;
   try {
-    const r = await (await fetch(
-      `/api/builds/${encodeURIComponent(rwState.book)}/ocr-templates/apply`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ src: rwState.src, name, pages }),
-      })).json();
-    if (!r.ok) throw new Error(r.error || "apply failed");
+    const r = await engineClient.replica.templates.apply({
+      bookId: book, sourceId: src, name, pages,
+    });
     status(`TEMPLATE :: applied to ${r.applied.length}` +
            (r.skipped.length ? ` · skipped ${r.skipped.length} (have regions)` : "") +
            (r.clipped.length ? ` · text clipped on ${r.clipped.length}` : ""));
@@ -20972,11 +21351,15 @@ async function rwTplApply() {
     status("TEMPLATE :: " + e.message);
     return;
   }
-  const seq = ++rwState.seq;   // strip + meta changed server-side
-  delete ocrState.layoutMeta[rwState.book];
+  if (seq !== rwState.seq || book !== rwState.book || src !== rwState.src) return;
+  const pagesSeq = ++rwState.pagesSeq; // strip + meta changed server-side
+  ++rwState.pageSeq;
+  rwState.pageLoaded = false; rwState.loadError = "";
+  rwSetMode(rwState.mode);
+  delete ocrState.layoutMeta[book];
   ocrState.regionsCache.clear();
-  await renderReplicaPages(seq);
-  if (seq !== rwState.seq) return;
+  await renderReplicaPages(seq, pagesSeq);
+  if (seq !== rwState.seq || pagesSeq !== rwState.pagesSeq) return;
   if (rwState.page) selectReplicaPage(rwState.page);
   rwSyncBar();
 }
@@ -20984,14 +21367,12 @@ async function rwTplApply() {
 async function rwTplOutliers() {
   const name = el("rw-tpl").value;
   if (!name || !rwState.book) return;
+  const book = rwState.book, src = rwState.src, seq = rwState.seq;
   try {
-    const r = await (await fetch(
-      `/api/builds/${encodeURIComponent(rwState.book)}/ocr-templates/outliers`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ src: rwState.src, name }),
-      })).json();
-    if (!r.ok) throw new Error(r.error || "outlier scan failed");
+    const r = await engineClient.replica.templates.outliers({
+      bookId: book, sourceId: src, name,
+    });
+    if (seq !== rwState.seq || book !== rwState.book || src !== rwState.src) return;
     rwState.outliers = r.outliers || [];
     for (const btn of el("rw-pages").querySelectorAll(".rw-pagebtn")) {
       const n = +btn.dataset.page;
@@ -21019,17 +21400,18 @@ const RW_FONT_SUGGESTIONS = [
 function rwSetMode(mode) {
   rwState.mode = mode === "preview" ? "preview" : "edit";
   const pv = rwState.mode === "preview";
+  const ready = !!(rwState.page && rwState.pageLoaded && !rwState.loadError);
   el("rw-mode-edit").classList.toggle("active", !pv);
   el("rw-mode-preview").classList.toggle("active", pv);
   el("rw-mode-edit").setAttribute("aria-pressed", String(!pv));
   el("rw-mode-preview").setAttribute("aria-pressed", String(pv));
-  el("rw-canvas").hidden = pv || !rwState.page;
-  el("rw-preview-row").hidden = !pv || !rwState.page;
-  el("rw-empty").hidden = !!rwState.page;
+  el("rw-canvas").hidden = pv || !ready;
+  el("rw-preview-row").hidden = !pv || !ready;
+  el("rw-empty").hidden = ready;
   el("rw-preview-lang").hidden = !pv;
   el("rw-edit-panel").hidden = pv;
   el("rw-style-panel").hidden = !pv;
-  if (pv) {
+  if (pv && ready) {
     rwRenderStyleboard();
     rwRenderPreview();
   }
@@ -21038,8 +21420,7 @@ function rwSetMode(mode) {
 async function rwLoadStyles(seq) {
   let styles = null, custom = false;
   try {
-    const r = await (await fetch(
-      `/api/builds/${encodeURIComponent(rwState.book)}/replica-style`)).json();
+    const r = await engineClient.replica.styles.get({ bookId: rwState.book });
     if (r.ok) { styles = r.styles; custom = !!r.custom; }
   } catch (e) { /* handled below: null disables the board */ }
   if (seq !== rwState.seq) return;
@@ -21048,13 +21429,14 @@ async function rwLoadStyles(seq) {
   // silently dropping every seed role. null keeps the board read-only.
   rwState.styles = styles;
   rwState.stylesCustom = custom;
+  rwState.styleDirty = false;
+  rwState.styleSaving = false;
 }
 
 async function rwLoadTranslations(seq) {
   let langs = [];
   try {
-    const r = await (await fetch(
-      `/api/builds/${encodeURIComponent(rwState.book)}/translations`)).json();
+    const r = await engineClient.translations.list({ bookId: rwState.book });
     if (r.ok) langs = (r.translations || []).map((t) => t.lang);
   } catch (e) { /* no translations */ }
   if (seq !== rwState.seq) return;
@@ -21081,8 +21463,12 @@ function rwDistribute(text, weights) {
   for (const p of paras) {
     out[Math.min(wi, out.length - 1)].push(p);
     acc += p.length;
-    const filled = weights.slice(0, wi + 1).reduce((a, b) => a + b, 0) / total;
-    while (wi < weights.length - 1 && acc / totalChars >= filled) wi++;
+    while (wi < weights.length - 1) {
+      const filled = weights.slice(0, wi + 1)
+        .reduce((a, b) => a + b, 0) / total;
+      if (acc / totalChars < filled) break;
+      wi++;
+    }
   }
   return out.map((a) => a.join("\n\n"));
 }
@@ -21090,6 +21476,7 @@ function rwDistribute(text, weights) {
 async function rwPreviewTexts(items) {
   const map = new Map();
   const lang = rwState.previewLang;
+  const book = rwState.book, page = rwState.page, seq = rwState.seq;
   if (lang === "norm") {
     items.forEach((i) => map.set(i.id, i.norm || i.text));
     return map;
@@ -21102,9 +21489,9 @@ async function rwPreviewTexts(items) {
   if (sec === undefined) {
     let ok = false;
     try {
-      const r = await (await fetch(
-        `/api/builds/${encodeURIComponent(rwState.book)}` +
-        `/translations/${encodeURIComponent(lang)}`)).json();
+      const r = await engineClient.translations.get({
+        bookId: book, language: lang,
+      });
       if (r.ok) {
         // a marker-less translation is a one-page doc, like _an_pages
         sec = ocrPageSections(r.text || "") ||
@@ -21112,10 +21499,12 @@ async function rwPreviewTexts(items) {
         ok = true;
       }
     } catch (e) { /* transient — retry on the next render */ }
-    if (ok) rwState.transCache[lang] = sec;   // failures are never cached
+    if (ok && seq === rwState.seq && book === rwState.book) {
+      rwState.transCache[lang] = sec;   // failures are never cached
+    }
     else sec = null;
   }
-  const t = sec && sec.map ? sec.map.get(rwState.page) || "" : "";
+  const t = sec && sec.map ? sec.map.get(page) || "" : "";
   const bodies = items.filter((i) => i.role === "body");
   const dist = rwDistribute(t, bodies.map((b) => Math.max(1, b.text.length)));
   bodies.forEach((b, i) => map.set(b.id, dist[i]));
@@ -21127,22 +21516,24 @@ async function rwPreviewTexts(items) {
 let rwRenderSeq = 0;
 
 async function rwRenderPreview() {
-  if (rwState.mode !== "preview" || !rwState.page) return;
-  const seq = rwState.seq;
-  // the context seq only moves on book/src/page switches; layer flips and
-  // styleboard keystrokes race through it — an uncached translation fetch
-  // resolving late must not paint over a newer render
+  if (rwState.mode !== "preview" || !rwState.page || !rwState.pageLoaded ||
+      rwState.loadError) return;
+  const seq = rwState.seq, pageSeq = rwState.pageSeq;
+  const book = rwState.book, page = rwState.page, pdf = rwState.pdf;
+  // Context and page generations guard navigation; renderSeq also guards
+  // layer flips and styleboard keystrokes within the same page.
   const render = ++rwRenderSeq;
   el("rw-preview-orig").style.aspectRatio = rwState.ratio;
   el("rw-preview").style.aspectRatio = rwState.ratio;
-  el("rw-preview-orig-img").src =
-    `/api/pdf/pageimg?path=${encodeURIComponent(rwState.pdf)}` +
-    `&page=${rwState.page}&w=1100`;
+  el("rw-preview-orig-img").src = engineClient.pdf.pageImageUrl({
+    path: pdf, page, width: 1100,
+  });
   const items = [...rwState.items].sort((a, b) => a.order - b.order);
   const texts = await rwPreviewTexts(items);
-  const meta = rwState.book ? await ocrLayoutMeta(rwState.book)
+  const meta = book ? await ocrLayoutMeta(book)
                             : { images: {} };
-  if (seq !== rwState.seq || render !== rwRenderSeq ||
+  if (seq !== rwState.seq || pageSeq !== rwState.pageSeq ||
+      book !== rwState.book || page !== rwState.page || render !== rwRenderSeq ||
       rwState.mode !== "preview") return;
   // reworked art shadows its original in the modern edition
   const rework = {};
@@ -21181,8 +21572,9 @@ async function rwRenderPreview() {
       const img = document.createElement("img");
       img.loading = "lazy";
       img.alt = fig[1];
-      img.src = `/api/builds/${encodeURIComponent(rwState.book)}` +
-        `/ocr/images/${encodeURIComponent(rework[fig[1]] || fig[1])}`;
+      img.src = engineClient.replica.figures.imageUrl({
+        bookId: book, name: rework[fig[1]] || fig[1],
+      });
       e.appendChild(img);
     } else {
       const st = styles[it.role] || styles.body || {};
@@ -21312,25 +21704,37 @@ function rwStyleRowChanged(row, target) {
   if (bgIn && (st.bg || role === "page" || target === bgIn)) {
     st.bg = bgIn.value;
   }
+  rwState.styleDirty = true;
+  ++rwState.styleVersion;
   rwRenderPreview();
+  rwSyncBar();
 }
 
 async function rwStyleSave() {
-  if (!rwState.book || !rwState.styles) return;
+  if (!rwState.book || !rwState.styles || !rwState.styleDirty ||
+      rwState.styleSaving) return;
+  const book = rwState.book, seq = rwState.seq;
+  const version = rwState.styleVersion;
+  const styles = JSON.parse(JSON.stringify(rwState.styles));
+  rwState.styleSaving = true;
+  rwSyncBar();
+  let failure = null, r = null;
   try {
-    const r = await (await fetch(
-      `/api/builds/${encodeURIComponent(rwState.book)}/replica-style`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ styles: rwState.styles }),
-      })).json();
-    if (!r.ok) throw new Error(r.error || "save failed");
+    r = await engineClient.replica.styles.save({ bookId: book, styles });
+  } catch (e) {
+    failure = e;
+  }
+  if (seq !== rwState.seq || book !== rwState.book) return;
+  rwState.styleSaving = false;
+  if (failure) {
+    status("TYPE STYLES :: " + failure.message);
+  } else {
     rwState.stylesCustom = true;
+    if (rwState.styleVersion === version) rwState.styleDirty = false;
     el("rw-style-state").textContent = "custom";
     status(`TYPE STYLES SAVED :: ${r.count} role(s)`);
-  } catch (e) {
-    status("TYPE STYLES :: " + e.message);
   }
+  rwSyncBar();
 }
 
 // the per-book "instructions for editors / AI" note (ocr/lib-instructions.md):
@@ -21340,13 +21744,15 @@ async function rwLoadInstructions(seq) {
   // then persists as a wipe. On failure the field is disabled and Save refuses.
   let text = "", loaded = false;
   try {
-    const r = await (await fetch(
-      `/api/builds/${encodeURIComponent(rwState.book)}/replica-instructions`)).json();
+    const r = await engineClient.replica.instructions.get({
+      bookId: rwState.book,
+    });
     if (r.ok) { text = r.text || ""; loaded = true; }
   } catch (e) { /* load failed — leave the field disabled, don't arm Save */ }
   if (seq !== rwState.seq) return;
   rwState.instrLoaded = loaded;
   rwState.instrDirty = false;
+  rwState.instrSaving = false;
   el("rw-instr").value = text;
   el("rw-instr").disabled = !loaded;
   el("rw-instr-state").textContent =
@@ -21354,43 +21760,55 @@ async function rwLoadInstructions(seq) {
 }
 
 async function rwInstrSave() {
-  if (!rwState.book) return;
+  if (!rwState.book || rwState.instrSaving || !rwState.instrDirty) return;
   // a load that failed leaves the field empty and unknown — refuse to save,
   // or an empty PUT would delete the book's real stored instructions
   if (!rwState.instrLoaded) {
     status("BOOK INSTRUCTIONS :: not loaded — reselect the book");
     return;
   }
+  const book = rwState.book, seq = rwState.seq;
+  const version = rwState.instrVersion;
   const text = el("rw-instr").value;
+  rwState.instrSaving = true;
+  rwSyncBar();
+  let failure = null, r = null;
   try {
-    const r = await (await fetch(
-      `/api/builds/${encodeURIComponent(rwState.book)}/replica-instructions`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
-      })).json();
-    if (!r.ok) throw new Error(r.error || "save failed");
-    rwState.instrDirty = false;
-    el("rw-instr-state").textContent = text.trim() ? "set" : "";
+    r = await engineClient.replica.instructions.save({ bookId: book, text });
+  } catch (e) {
+    failure = e;
+  }
+  if (seq !== rwState.seq || book !== rwState.book) return;
+  rwState.instrSaving = false;
+  if (failure) {
+    status("BOOK INSTRUCTIONS :: " + failure.message);
+  } else {
+    if (rwState.instrVersion === version) {
+      rwState.instrDirty = false;
+      el("rw-instr-state").textContent = text.trim() ? "set" : "";
+    } else {
+      el("rw-instr-state").textContent = "edited";
+    }
     status(text.trim() ? `BOOK INSTRUCTIONS SAVED :: ${r.chars} chars`
                        : "BOOK INSTRUCTIONS CLEARED");
-  } catch (e) {
-    status("BOOK INSTRUCTIONS :: " + e.message);
   }
+  rwSyncBar();
 }
 
 async function rwStyleReset() {
-  if (!rwState.book) return;
+  if (!rwState.book || rwState.styleSaving) return;
+  const book = rwState.book, seq = rwState.seq;
   let ok = false;
   try {
-    const res = await fetch(
-      `/api/builds/${encodeURIComponent(rwState.book)}/replica-style`,
-      { method: "DELETE" });
-    ok = res.ok;
+    await engineClient.replica.styles.reset({ bookId: book });
+    ok = true;
   } catch (e) { /* reload below shows the truth either way */ }
-  await rwLoadStyles(rwState.seq);
+  if (seq !== rwState.seq || book !== rwState.book) return;
+  await rwLoadStyles(seq);
+  if (seq !== rwState.seq || book !== rwState.book) return;
   rwRenderStyleboard();
   rwRenderPreview();
+  rwSyncBar();
   status(ok ? "TYPE STYLES :: reset to default"
             : "TYPE STYLES :: reset failed — showing the stored sheet");
 }
@@ -21442,57 +21860,63 @@ function initReplica() {
   document.addEventListener("mouseup", rwMouseUp);
   document.addEventListener("keydown", rwKeyDown);
   el("rw-text").addEventListener("input", () => {
-    const a = rwActive();
+    const ta = el("rw-text");
+    const a = rwItem(ta.dataset.itemId);
     if (!a) return;
-    if (rwState.layer === "norm") a.norm = el("rw-text").value;
-    else a.text = el("rw-text").value;
+    if (ta.dataset.layer === "norm") a.norm = ta.value;
+    else a.text = ta.value;
     rwDirty();
   });
   el("rw-clip").addEventListener("click", rwClipWords);
   el("rw-rework").addEventListener("click", rwReworkFigure);
+  el("rw-detect").addEventListener("click", rwDetectPage);
+  el("rw-proposal-apply").addEventListener("click", () => rwProposalAction("apply"));
+  el("rw-proposal-dismiss").addEventListener("click", () => rwProposalAction("dismiss"));
   el("rw-save").addEventListener("click", rwSave);
   el("rw-recompile").addEventListener("click", rwRecompile);
   el("rw-export").addEventListener("click", () => {
-    if (!rwState.book || !rwState.regionPages.length) return;
+    if (!rwState.book || !rwState.regionPages.length || rwHasUnsaved() ||
+        rwState.saving || (rwState.page && !rwState.pageLoaded)) return;
     // server-generated zip; Content-Disposition names the file
     const a = document.createElement("a");
-    a.href = `/api/builds/${encodeURIComponent(rwState.book)}` +
-             `/replica-export?src=${encodeURIComponent(rwState.src)}`;
+    a.href = engineClient.replica.packages.exportUrl({
+      bookId: rwState.book, sourceId: rwState.src,
+    });
     a.download = "";
     document.body.appendChild(a);
     a.click();
     a.remove();
   });
   el("rw-import").addEventListener("click", () => {
-    if (rwState.book) el("rw-import-file").click();
+    if (rwState.book && !rwHasUnsaved() && !rwState.saving &&
+        (!rwState.page || rwState.pageLoaded)) el("rw-import-file").click();
   });
   el("rw-print").addEventListener("click", () => {
-    if (!rwState.book || !rwState.regionPages.length) return;
+    if (!rwState.book || !rwState.regionPages.length || rwHasUnsaved() ||
+        rwState.saving || (rwState.page && !rwState.pageLoaded)) return;
     // the preview's layer selector decides which text prints
     const layer = rwState.previewLang;
-    window.open(
-      `/api/builds/${encodeURIComponent(rwState.book)}/replica-print` +
-      `?src=${encodeURIComponent(rwState.src)}` +
-      (layer ? `&layer=${encodeURIComponent(layer)}` : ""), "_blank");
+    window.open(engineClient.replica.printUrl({
+      bookId: rwState.book, sourceId: rwState.src, layer,
+    }), "_blank");
   });
   el("rw-import-file").addEventListener("change", async () => {
     const input = el("rw-import-file");
     const file = input.files && input.files[0];
     input.value = "";
-    if (!file || !rwState.book) return;
-    const fd = new FormData();
-    fd.append("lib", file);
+    if (!file || !rwState.book || rwHasUnsaved() || rwState.saving ||
+        (rwState.page && !rwState.pageLoaded)) return;
+    const book = rwState.book, src = rwState.src, seq = rwState.seq;
     let r;
     try {
-      r = await (await fetch(
-        `/api/builds/${encodeURIComponent(rwState.book)}` +
-        `/replica-import?src=${encodeURIComponent(rwState.src)}`,
-        { method: "POST", body: fd })).json();
-      if (!r.ok) throw new Error(r.error || "import failed");
+      r = await engineClient.replica.packages.import({
+        bookId: book, sourceId: src, file,
+      });
     } catch (e) {
       status("IMPORT :: " + e.message);
       return;
     }
+    if (seq !== rwState.seq || book !== rwState.book || src !== rwState.src) return;
     status(`IMPORT :: ${r.pages_applied.length} page(s)` +
            (r.pages_skipped.length ? ` · skipped ${r.pages_skipped.length}` : "") +
            (r.templates_added.length ? ` · templates ${r.templates_added.join(", ")}` : "") +
@@ -21500,10 +21924,13 @@ function initReplica() {
            ` · stylesheet ${r.stylesheet}`);
     // the sidecar changed under every cache
     ocrState.regionsCache.clear();
-    delete ocrState.layoutMeta[rwState.book];
-    const seq = ++rwState.seq;
-    await renderReplicaPages(seq);
-    if (seq !== rwState.seq) return;
+    delete ocrState.layoutMeta[book];
+    const pagesSeq = ++rwState.pagesSeq;
+    ++rwState.pageSeq;
+    rwState.pageLoaded = false; rwState.loadError = "";
+    rwSetMode(rwState.mode);
+    await renderReplicaPages(seq, pagesSeq);
+    if (seq !== rwState.seq || pagesSeq !== rwState.pagesSeq) return;
     await rwLoadTemplates(seq);
     if (seq !== rwState.seq) return;
     await rwLoadStyles(seq);
@@ -21548,7 +21975,13 @@ function initReplica() {
     if (clear) {
       const row = clear.closest(".rw-stylerow");
       const st = rwState.styles && rwState.styles[row.dataset.role];
-      if (st) { delete st.bg; rwRenderPreview(); }
+      if (st) {
+        delete st.bg;
+        rwState.styleDirty = true;
+        ++rwState.styleVersion;
+        rwRenderPreview();
+        rwSyncBar();
+      }
       return;
     }
     const btn = ev.target.closest(".rw-st-italic, .rw-st-sc");
@@ -21562,7 +21995,9 @@ function initReplica() {
   el("rw-instr-save").addEventListener("click", rwInstrSave);
   el("rw-instr").addEventListener("input", () => {
     rwState.instrDirty = true;
+    ++rwState.instrVersion;
     el("rw-instr-state").textContent = "edited";
+    rwSyncBar();
   });
   el("rw-legend").innerHTML = RW_ROLES.map((r, i) =>
     `<span class="rw-key role-${esc(r)}" data-tip="${esc(r)}">${(i + 1) % 10}</span>`).join("");

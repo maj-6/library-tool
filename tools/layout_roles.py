@@ -275,8 +275,11 @@ def distribute_text(text: str, weights: list) -> list:
     for p in paras:
         out[min(wi, len(out) - 1)].append(p)
         acc += len(p)
-        filled = sum(weights[:wi + 1]) / total
-        while wi < len(weights) - 1 and acc / total_chars >= filled:
+        # Recompute the target after every advance.  Keeping the first target
+        # for the whole loop lets a paragraph exactly at the first boundary
+        # skip all remaining regions (equal [1,1,1] became [a, "", b+c]).
+        while (wi < len(weights) - 1
+               and acc / total_chars >= sum(weights[:wi + 1]) / total):
             wi += 1
     return ["\n\n".join(chunk) for chunk in out]
 

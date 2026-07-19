@@ -1,12 +1,9 @@
 # Packaging + tool configuration for the world-herb-library tools.
 #
-# Transitional layout: the Python code still lives as flat modules under
-# tools/ (importable via script-directory semantics and the pytest
-# `pythonpath` setting below), so installing this project adds no modules —
-# `pip install -e .` exists to declare and pull the dependencies and the
-# feature/dev extras from one canonical place. The physical move to an
-# importable package (src/whl/...) is planned alongside the shared-core
-# extraction, once the test suite protects it.
+# Transitional layout: new framework-neutral engine code lives in the
+# installable ``src/librarytool`` package while compatibility entry points and
+# adapters still live under ``tools/``. The latter remain importable through
+# script-directory semantics until each vertical has moved behind the engine.
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -41,16 +38,15 @@ capture = ["opencv-python-headless", "numpy"]
 # zero code changes; bump the caps deliberately.
 dev = ["pytest>=8,<10", "ruff>=0.15,<0.16"]
 
-[tool.setuptools]
-# No importable modules are installed yet — see the header comment.
-py-modules = []
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # Flat-module layout: make tools/ (and the explorer's directory) importable
 # the same way running the scripts by path does. tests/conftest.py sets
 # WHL_DATA_ROOT to a throwaway directory BEFORE any of these are imported.
-pythonpath = ["tools", "tools/whl_explorer"]
+pythonpath = ["src", "tools", "tools/whl_explorer"]
 
 [tool.ruff]
 # Default rule set (E4/E7/E9/F). The `# noqa: E402` markers on the entry

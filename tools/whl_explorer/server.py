@@ -45,13 +45,17 @@ from pathlib import Path
 from flask import Flask, Response, abort, jsonify, render_template, request, send_file
 from werkzeug.exceptions import HTTPException
 
-# Make tools/ importable for the shared helpers.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# Make the installable engine package and transitional tools/ modules
+# importable when this file is launched directly from a source checkout.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+sys.path.insert(0, str(_REPO_ROOT / "tools"))
 import capture_pipeline as capture  # noqa: E402
 import catalog_checks as checks  # noqa: E402
 import cloud_defaults  # noqa: E402
 import layout_roles  # noqa: E402
 import libformat  # noqa: E402
+import replica_service  # noqa: E402
 import copyright_registration as copyreg  # noqa: E402
 import libcommon as lib  # noqa: E402
 import r2_store as r2  # noqa: E402
@@ -62,6 +66,36 @@ import ol_client  # noqa: E402
 import scan_search  # noqa: E402
 import whl_client  # noqa: E402
 import whl_scrape  # noqa: E402
+from librarytool.adapters.filesystem.replica_repository import (  # noqa: E402
+    FilesystemReplicaRepository,
+)
+from librarytool.engine.capabilities import (  # noqa: E402
+    CapabilityRef,
+    CapabilityRegistry,
+    ModuleManifest,
+    WorkbenchManifest,
+)
+from librarytool.engine.contracts import (  # noqa: E402
+    ItemDescriptor,
+    LayoutFamilyQuery,
+    PageKey,
+    RecompileRegionPagesCommand,
+    ReplaceRegionPageCommand,
+    ReviewRegionProposalCommand,
+)
+from librarytool.engine.errors import (  # noqa: E402
+    ConflictError as EngineConflictError,
+    EngineError,
+    NotFoundError as EngineNotFoundError,
+    PreconditionRequiredError as EnginePreconditionRequiredError,
+    ValidationError as EngineValidationError,
+)
+from librarytool.engine.replica import ReplicaApplicationService  # noqa: E402
+from librarytool.engine.runtime import LibraryEngine  # noqa: E402
+from librarytool.engine.text_layers import TextLayerService  # noqa: E402
+from librarytool.engine.translations import (  # noqa: E402
+    TranslationProvenanceService,
+)
 
 # NYPL Catalog of Copyright Entries dataset (optional, for the copyright tag's
 # registration half): drop the parsed XML tree under <DATA_ROOT>/nypl_cce/.
@@ -890,9 +924,65 @@ def home():
     return render_template(
         "index.html",
         app_v=_asset_v("app.js"),
+        engine_v=_asset_v("engine-client.js"),
         css_v=_asset_v("style.css"),
         app_version=_app_version(),
     )
+
+
+_ENGINE_CAPABILITIES = CapabilityRegistry(
+    modules=(
+        ModuleManifest(
+            "library.core", "1.0.0",
+            provides=(CapabilityRef("library.items"),),
+        ),
+        ModuleManifest(
+            "replica.core", "1.0.0",
+            provides=(
+                CapabilityRef("replica.regions"),
+                CapabilityRef("replica.proposals"),
+                CapabilityRef("replica.text-layers"),
+                CapabilityRef("replica.layout-families"),
+            ),
+            requires=(CapabilityRef("library.items"),),
+        ),
+        ModuleManifest(
+            "translation.core", "1.0.0",
+            provides=(CapabilityRef("translation.provenance"),),
+            requires=(CapabilityRef("library.items"),),
+        ),
+        ModuleManifest(
+            "replica.lib", "2.0.0",
+            provides=(CapabilityRef("replica.interchange", 2),),
+            requires=(CapabilityRef("replica.regions"),),
+        ),
+    ),
+    workbenches=(
+        WorkbenchManifest(
+            "catalog", "1.0.0",
+            requires=(CapabilityRef("library.items"),),
+        ),
+        WorkbenchManifest(
+            "replica", "1.0.0",
+            requires=(
+                CapabilityRef("replica.regions"),
+                CapabilityRef("replica.text-layers"),
+            ),
+            enhances=(
+                CapabilityRef("replica.interchange", 2),
+                CapabilityRef("replica.layout-families"),
+                CapabilityRef("translation.provenance"),
+            ),
+        ),
+    ),
+)
+
+
+@app.route("/api/v1/capabilities")
+def api_engine_capabilities():
+    """Installed module/workbench discovery for current and future clients."""
+    return jsonify({"ok": True,
+                    **_library_engine().discovery_document()})
 
 
 @app.route("/api/changelog")
@@ -2642,8 +2732,7 @@ def api_build_ocr_put(build_id: str):
             import shutil
             verbatim.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(target, verbatim)
-    target.write_text(str(p.get("text") or ""),
-                      encoding="utf-8", errors="replace")
+    lib.save_text(target, str(p.get("text") or ""), errors="replace")
     if "src" in p:
         src_key = _valid_src_key(builds[build_id], p.get("src"))
         if src_key:
@@ -2711,11 +2800,223 @@ def api_build_ocr_layout(build_id: str):
               if isinstance(rec, dict) and rec.get("state")}
         for src, pages in (meta.get("regions") or {}).items()
         if isinstance(pages, dict)}
+    region_proposal_pages = {
+        src: sorted(int(k) for k, rec in pages.items()
+                    if str(k).isdigit() and isinstance(rec, dict))
+        for src, pages in (meta.get("region_proposals") or {}).items()
+        if isinstance(pages, dict)}
+    region_stale_pages = {
+        src: sorted(int(k) for k, rec in pages.items()
+                    if str(k).isdigit() and isinstance(rec, dict)
+                    and isinstance(rec.get("stale"), dict))
+        for src, pages in (meta.get("regions") or {}).items()
+        if isinstance(pages, dict)}
+    region_compile_pending_pages = {
+        src: sorted(int(k) for k, rec in pages.items()
+                    if str(k).isdigit() and isinstance(rec, dict))
+        for src, pages in (meta.get("region_compile_pending") or {}).items()
+        if isinstance(pages, dict)}
     return jsonify({"ok": True, "images": meta.get("images") or {},
                     "word_pages": word_pages,
                     "word_docs": meta.get("words_doc") or {},
                     "region_pages": region_pages,
-                    "region_states": {k: v for k, v in region_states.items() if v}})
+                    "region_states": {k: v for k, v in region_states.items() if v},
+                    "region_proposal_pages": {
+                        k: v for k, v in region_proposal_pages.items() if v},
+                    "region_stale_pages": {
+                        k: v for k, v in region_stale_pages.items() if v},
+                    "region_compile_pending_pages": {
+                        k: v for k, v in region_compile_pending_pages.items()
+                        if v}})
+
+
+class _EngineItemRepository:
+    """Current build catalogue exposed through the engine item port."""
+
+    def get(self, item_id: str):
+        build = lib.load_json(BUILDS_PATH, {}).get(item_id)
+        if not isinstance(build, dict):
+            return None
+        sources = tuple(
+            str(source.get("id")) for source in (build.get("pdf_sources") or [])
+            if isinstance(source, dict) and source.get("id")
+        )
+        return ItemDescriptor(item_id=item_id, sources=sources,
+                              metadata=dict(build))
+
+
+class _EngineReplicaPolicies:
+    """Compatibility adapter for pure policies not yet moved under src/."""
+
+    content_revision = staticmethod(replica_service.content_revision)
+    proposal_revision = staticmethod(replica_service.proposal_revision)
+    duplicate_rids = staticmethod(replica_service.duplicate_rids)
+    clean_rid = staticmethod(libformat.clean_rid)
+
+    @staticmethod
+    def sanitize_region_items(items, *, source_type: str):
+        return libformat.sanitize_page_items(
+            list(items or []), src_type=source_type)
+
+    @staticmethod
+    def sanitize_dims(dims):
+        return libformat.sanitize_dims(dims) or {}
+
+    @staticmethod
+    def sanitize_ext(ext):
+        return libformat.sanitize_ext(ext)
+
+    @staticmethod
+    def sanitize_document_name(value: str) -> str:
+        return _ocr_name(value)
+
+    @staticmethod
+    def normalize_language(value: str) -> str:
+        return _lang_code(value)
+
+    accept_region_proposal = staticmethod(
+        replica_service.accept_region_proposal)
+    dismiss_region_proposal = staticmethod(
+        replica_service.dismiss_region_proposal)
+
+    @staticmethod
+    def compose_text(items, *, layer: str = "text") -> str:
+        return layout_roles.compose_text(list(items or []), layer=layer)
+
+    @staticmethod
+    def propose_layout_families(pages, **options):
+        return replica_service.propose_layout_families(pages, **options)
+
+
+class _EngineTextLayerRepository:
+    """Derived text adapter; the engine owns when it may be invoked."""
+
+    @staticmethod
+    def merge_page(item_id: str, document: str, page: int, text: str) -> None:
+        _ocr_merge_page(item_id, document, page, text)
+
+    @staticmethod
+    def bind_document_source(item_id: str, document: str,
+                             source_id: str) -> None:
+        _ocr_set_source(item_id, document, source_id)
+
+
+_library_engine_guard = threading.Lock()
+_library_engine_instance = None
+
+
+def _library_engine() -> LibraryEngine:
+    """Compose the headless engine against today's file-backed adapters.
+
+    Construction is lazy because the compatibility callbacks are defined
+    throughout this transitional module. By request time the module is fully
+    loaded, while package imports remain side-effect free.
+    """
+    global _library_engine_instance
+    if _library_engine_instance is None:
+        with _library_engine_guard:
+            if _library_engine_instance is None:
+                policies = _EngineReplicaPolicies()
+                repository = FilesystemReplicaRepository(
+                    lambda item_id: _entry_dir(item_id) / "ocr" / "layout.json",
+                    read_json=lambda path: lib.load_json(path, {}),
+                    write_json=lib.save_json,
+                    # Unmigrated layout writers still use this RLock. Sharing
+                    # it prevents two independent locking domains during the
+                    # route-by-route transition.
+                    lock_context_for=lambda _item_id: _ocr_merge_lock,
+                )
+                text_layers = TextLayerService(
+                    _EngineTextLayerRepository(), policies)
+                replica = ReplicaApplicationService(
+                    _EngineItemRepository(), repository, policies, text_layers)
+                _library_engine_instance = LibraryEngine(
+                    capabilities=_ENGINE_CAPABILITIES,
+                    replica=replica,
+                    text_layers=text_layers,
+                    translation_provenance=_translation_provenance,
+                )
+    return _library_engine_instance
+
+
+def _replica_engine() -> ReplicaApplicationService:
+    replica = _library_engine().replica
+    if replica is None:  # manifest/runtime mismatch is a server fault
+        raise RuntimeError("the Replica engine module is unavailable")
+    return replica
+
+
+def _region_view_response(view) -> dict:
+    out = {"ok": True, "found": bool(view.found),
+           "revision": view.revision}
+    if view.found:
+        out.update({"doc": view.doc, "dims": dict(view.dims),
+                    "state": view.state, "stale": dict(view.stale),
+                    "ext": dict(view.ext),
+                    "items": [dict(item) for item in view.items]})
+    if view.proposal is not None:
+        out["proposal"] = dict(view.proposal)
+    if view.compile_pending is not None:
+        out["compile_pending"] = dict(view.compile_pending)
+    return out
+
+
+def _engine_error_status(exc: EngineError) -> int:
+    if isinstance(exc, EngineNotFoundError):
+        return 404
+    if isinstance(exc, EnginePreconditionRequiredError):
+        return 428
+    if isinstance(exc, EngineConflictError):
+        return 409
+    if isinstance(exc, EngineValidationError):
+        return 400
+    return 500
+
+
+def _engine_error_response(exc: EngineError, *, current=None):
+    body = {"ok": False, "error": exc.message, "code": exc.code,
+            "retryable": exc.retryable}
+    if exc.details:
+        body["details"] = dict(exc.details)
+        # Compatibility fields used by the existing workbench and import
+        # tests stay top-level while structured clients use details.
+        for key in ("duplicate_rids", "untracked"):
+            if key in exc.details:
+                body[key] = exc.details[key]
+    if isinstance(exc, (EngineConflictError,
+                        EnginePreconditionRequiredError)):
+        body["conflict"] = exc.code
+    if current is not None:
+        canonical = _region_view_response(current)
+        canonical.update(body)
+        body = canonical
+        if current.proposal is not None:
+            body["proposal_revision"] = replica_service.proposal_revision(
+                current.proposal)
+    response = jsonify(body)
+    if current is not None:
+        response.set_etag(current.revision)
+    return response, _engine_error_status(exc)
+
+
+def _region_record(meta: dict, src: str, page: int) -> dict | None:
+    rec = ((meta.get("regions") or {}).get(src) or {}).get(str(page))
+    return rec if isinstance(rec, dict) else None
+
+
+def _region_match_token(payload: dict) -> str:
+    """If-Match wins; the JSON token keeps non-HTTP clients convenient."""
+    raw = str(request.headers.get("If-Match") or
+              payload.get("expect_revision") or "").strip()
+    if raw.startswith("W/"):
+        raw = raw[2:].strip()
+    return raw.strip('"')
+
+
+def _json_with_etag(body: dict):
+    response = jsonify(body)
+    response.set_etag(body["revision"])
+    return response
 
 
 @app.route("/api/builds/<build_id>/ocr-regions")
@@ -2723,21 +3024,17 @@ def api_build_ocr_regions(build_id: str):
     """One page's typed regions — the Phase 1 substrate the region facsimile
     and the Replica workbench read: {ok, found, doc, dims, items: [{id, role,
     box, order, text}]}. ?src= and ?page= select the record."""
-    if build_id not in lib.load_json(BUILDS_PATH, {}):
-        abort(404)
     src = request.args.get("src") or "primary"
     try:
         page = int(request.args.get("page") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         page = 0
-    meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
-    rec = ((meta.get("regions") or {}).get(src) or {}).get(str(page))
-    if not isinstance(rec, dict):
-        return jsonify({"ok": True, "found": False})
-    return jsonify({"ok": True, "found": True, "doc": rec.get("doc") or "",
-                    "dims": rec.get("dims") or {},
-                    "state": rec.get("state") or "",
-                    "items": rec.get("items") or []})
+    try:
+        view = _replica_engine().get_region_page(
+            PageKey(build_id, src, page))
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    return _json_with_etag(_region_view_response(view))
 
 
 # The sanitizers live in tools/libformat.py now — the single implementation
@@ -2758,31 +3055,89 @@ def api_build_ocr_regions_put(build_id: str):
     page, text capped), re-ordered, and re-idd; an empty list drops the
     page's record. src_type becomes "human" — the set is human-curated from
     here on."""
-    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
-    if b is None:
-        abort(404)
     p = request.get_json(silent=True) or {}
-    src = _valid_src_key(b, p.get("src"))
-    if not src:
-        return jsonify({"ok": False, "error": "unknown source"}), 400
+    src = str(p.get("src") or "primary")
     try:
         # OverflowError: json.loads accepts the non-standard Infinity
         # literal, and int(inf) raises it rather than ValueError
         page = int(p.get("page") or 0)
     except (TypeError, ValueError, OverflowError):
         page = 0
-    if page < 1:
-        return jsonify({"ok": False, "error": "bad page"}), 400
+    expected = _region_match_token(p)
     raw = p.get("items")
     if not isinstance(raw, list) or len(raw) > _RW_MAX_ITEMS:
         return jsonify({"ok": False, "error": "bad items"}), 400
-    items = _rw_sanitize_items(raw, src_type="human")
-    dims = _rw_sanitize_dims(p.get("dims"))
-    state = "verified" if p.get("state") == "verified" else ""
-    _ocr_save_page_regions(build_id, src, page, items, dims,
-                           doc=_ocr_name(str(p.get("doc") or "compiled.txt")),
-                           state=state)
-    return jsonify({"ok": True, "count": len(items)})
+    command = ReplaceRegionPageCommand(
+        key=PageKey(build_id, src, page),
+        expected_revision=expected,
+        items=raw,
+        doc=str(p.get("doc") or "compiled.txt"),
+        dims=p.get("dims") if isinstance(p.get("dims"), dict) else {},
+        state="verified" if p.get("state") == "verified" else "",
+        preserve_ext="ext" not in p,
+        ext=p.get("ext") if isinstance(p.get("ext"), dict) else {},
+    )
+    try:
+        view = _replica_engine().replace_region_page(command)
+    except EngineError as exc:
+        current = None
+        if isinstance(exc, EngineConflictError):
+            try:
+                current = _replica_engine().get_region_page(command.key)
+            except EngineError:
+                pass
+        return _engine_error_response(exc, current=current)
+    body = _region_view_response(view)
+    body["count"] = len(view.items)
+    return _json_with_etag(body)
+
+
+def _proposal_match_token(payload: dict) -> str:
+    raw = str(request.headers.get("If-Proposal-Match") or
+              payload.get("expect_proposal_revision") or "").strip()
+    if raw.startswith("W/"):
+        raw = raw[2:].strip()
+    return raw.strip('"')
+
+
+@app.route("/api/builds/<build_id>/ocr-region-proposals", methods=["POST"])
+def api_build_ocr_region_proposals(build_id: str):
+    """Apply or dismiss one machine proposal with two-resource CAS."""
+    p = request.get_json(silent=True) or {}
+    src = str(p.get("src") or "primary")
+    try:
+        page = int(p.get("page") or 0)
+    except (TypeError, ValueError, OverflowError):
+        page = 0
+    action = str(p.get("action") or "").strip().lower()
+    expected = _region_match_token(p)
+    expected_proposal = _proposal_match_token(p)
+    command = ReviewRegionProposalCommand(
+        key=PageKey(build_id, src, page),
+        action=action,
+        expected_region_revision=expected,
+        expected_proposal_revision=expected_proposal,
+    )
+    try:
+        result = _replica_engine().review_region_proposal(command)
+    except EngineError as exc:
+        current = None
+        if isinstance(exc, EngineConflictError):
+            try:
+                current = _replica_engine().get_region_page(command.key)
+            except EngineError:
+                pass
+        return _engine_error_response(exc, current=current)
+    body = _region_view_response(result.page)
+    body.update({"action": ("applied" if result.action.value == "apply"
+                             else "dismissed"),
+                 "compiled": result.compiled})
+    if result.derived_failure is not None:
+        body["warning"] = (
+            "compiled text rebuild pending: " +
+            result.derived_failure.message)
+    response = _json_with_etag(body)
+    return (response, 202) if not result.compiled else response
 
 
 @app.route("/api/builds/<build_id>/ocr-regions/recompile", methods=["POST"])
@@ -2790,15 +3145,10 @@ def api_build_ocr_regions_recompile(build_id: str):
     """Rewrite compiled body text from the saved regions. Every region page
     of the source (or just ?page) recomposes — furniture (marginalia, heads,
     catchwords) stays out of the flow, figure refs stay in — and merges into
-    the compiled file its record names. The merge is per page, so pages
-    without regions keep their existing text."""
-    b = lib.load_json(BUILDS_PATH, {}).get(build_id)
-    if b is None:
-        abort(404)
+    the compiled file its record names. A pending accepted text-only proposal
+    can also rebuild a page whose old region layer was explicitly removed."""
     p = request.get_json(silent=True) or {}
-    src = _valid_src_key(b, p.get("src"))
-    if not src:
-        return jsonify({"ok": False, "error": "unknown source"}), 400
+    src = str(p.get("src") or "primary")
     # an absent page means "every region page"; a PRESENT but garbage page
     # must refuse — mapping it to the no-filter case would rewrite the whole
     # compiled file when the caller asked to touch exactly one page
@@ -2808,8 +3158,6 @@ def api_build_ocr_regions_recompile(build_id: str):
             only = int(p["page"])
         except (TypeError, ValueError, OverflowError):
             only = 0
-        if only < 1:
-            return jsonify({"ok": False, "error": "bad page"}), 400
     # layer "norm" composes the normalized reading into one explicit target —
     # the modern-edition text; the default layer writes each page's
     # diplomatic body into the file its record names. The default target is
@@ -2818,30 +3166,19 @@ def api_build_ocr_regions_recompile(build_id: str):
     # silently interleave two different books' pages into a chimera.
     layer = "norm" if str(p.get("layer") or "") in ("norm", "normalized") \
         else "text"
-    target = ""
-    if layer == "norm":
-        default_norm = "normalized.txt" if src == "primary" \
-            else f"normalized-{src}.txt"
-        target = _ocr_name(str(p.get("target") or default_norm))
-    meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
-    pages = (meta.get("regions") or {}).get(src) or {}
-    done, docs = 0, set()
-    for k in sorted((k for k in pages if str(k).isdigit()), key=int):
-        rec = pages[k]
-        n = int(k)
-        if not isinstance(rec, dict) or (only is not None and n != only):
-            continue
-        doc = target or _ocr_name(str(rec.get("doc") or "compiled.txt"))
-        _ocr_merge_page(build_id, doc, n,
-                        layout_roles.compose_text(rec.get("items") or [],
-                                                  layer=layer))
-        docs.add(doc)
-        done += 1
-    # a secondary source's normalized file must map back to its scan, like
-    # every other per-source OCR doc, or the UI pairs it with the wrong PDF
-    if layer == "norm" and done and src != "primary":
-        _ocr_set_source(build_id, target, src)
-    return jsonify({"ok": True, "pages": done, "docs": sorted(docs)})
+    try:
+        result = _replica_engine().recompile_region_pages(
+            RecompileRegionPagesCommand(
+                item_id=build_id,
+                source_id=src,
+                layer=layer,
+                page=only,
+                target=str(p.get("target") or ""),
+            ))
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    return jsonify({"ok": True, "pages": result.pages,
+                    "docs": list(result.documents)})
 
 
 # --- layout templates: recto/verso grids applied across a book -------------------
@@ -3004,24 +3341,31 @@ def api_build_ocr_templates_apply(build_id: str):
             items.append({"id": f"r{i}", "role": t.get("role") or "body",
                           "src_type": "template", "order": i,
                           "box": box, "text": text})
+        items = libformat.ensure_rids(items)
         if any(it["text"] for it in items):
             clipped.append(n)
         prepared[n] = items
-    applied, skipped = [], list(pre_skipped)
+    applied, skipped, protected = [], list(pre_skipped), []
     with _ocr_merge_lock:
         cur = lib.load_json(meta_path, {})
         pmap = cur.setdefault("regions", {}).setdefault(src, {})
         for n, items in prepared.items():
-            if not overwrite and str(n) in pmap:
+            existing = pmap.get(str(n))
+            if replica_service.is_protected(existing):
+                protected.append(n)
+                continue
+            if not overwrite and existing is not None:
                 skipped.append(n)
                 continue
             pmap[str(n)] = {"doc": doc, "dims": tpl.get("dims") or {},
-                            "items": items}
+                            "items": items, "origin": "template"}
             applied.append(n)
         lib.save_json(meta_path, cur)
     clipped = [n for n in clipped if n in applied]
     return jsonify({"ok": True, "applied": sorted(applied),
-                    "skipped": sorted(skipped), "clipped": sorted(clipped)})
+                    "skipped": sorted(skipped),
+                    "protected": sorted(protected),
+                    "clipped": sorted(clipped)})
 
 
 @app.route("/api/builds/<build_id>/ocr-templates/outliers", methods=["POST"])
@@ -3057,6 +3401,31 @@ def api_build_ocr_templates_outliers(build_id: str):
         if s < threshold:
             outliers.append(int(k))
     return jsonify({"ok": True, "scores": scores, "outliers": outliers})
+
+
+@app.route("/api/builds/<build_id>/ocr-layout-families/propose",
+           methods=["POST"])
+def api_build_ocr_layout_families_propose(build_id: str):
+    """Propose recurring page-layout families without changing the book.
+
+    This thin transport adapter intentionally delegates all geometry and
+    grouping policy to the framework-neutral Replica service. The result is a
+    review proposal; applying family/template changes remains a separate
+    revisioned command.
+    """
+    p = request.get_json(silent=True) or {}
+    src = str(p.get("src") or "primary")
+    options = {key: p[key] for key in (
+        "similarity_threshold", "min_family_size",
+        "low_confidence_threshold", "max_families",
+        "max_regions_per_page") if key in p}
+    try:
+        result = _replica_engine().propose_layout_families(
+            LayoutFamilyQuery(build_id, src, options))
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    return jsonify({"ok": True, "capability": result.capability,
+                    "proposal": dict(result.proposal)})
 
 
 # --- .lib export: the Replica working store, sealed ------------------------------
@@ -3121,17 +3490,23 @@ def _lib_id_path(build_id: str):
 
 def _lib_book_id(build_id: str) -> str:
     """The book's stable UUID (docs/lib-format.md §2.4), minted on first
-    export and persisted. Written under the merge lock the other ocr/ sidecars
-    share, so a concurrent export mints exactly one id."""
-    with _ocr_merge_lock:
-        doc = lib.load_json(_lib_id_path(build_id), None)
-        if isinstance(doc, dict) and re.fullmatch(
-                r"b-[0-9a-f]{32}", str(doc.get("book_id") or "")):
-            return str(doc["book_id"])
-        book_id = "b-" + uuid.uuid4().hex
-        _lib_id_path(build_id).parent.mkdir(parents=True, exist_ok=True)
-        lib.save_json(_lib_id_path(build_id), {"book_id": book_id})
-        return book_id
+    export. Imported identities are persisted; older local builds use a
+    deterministic fallback so a read-only export never mutates the store."""
+    doc = lib.load_json(_lib_id_path(build_id), None)
+    if isinstance(doc, dict) and re.fullmatch(
+            r"b-[0-9a-f]{32}", str(doc.get("book_id") or "")):
+        return str(doc["book_id"])
+    return "b-" + uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"https://librarytool.local/items/{build_id}").hex
+
+
+def _lib_store_book_id(build_id: str, book_id: str) -> None:
+    """Persist an imported identity; callers hold ``_ocr_merge_lock``."""
+    if not re.fullmatch(r"b-[0-9a-f]{32}", str(book_id or "")):
+        return
+    _lib_id_path(build_id).parent.mkdir(parents=True, exist_ok=True)
+    lib.save_json(_lib_id_path(build_id), {"book_id": book_id})
 
 
 def _lib_book_instructions(build_id: str) -> str:
@@ -3244,16 +3619,29 @@ def _lib_apply_translations(build_id: str, trans_in: dict,
     for lang, pmap in trans_in.items():
         rel = f"translations/{lang}.txt"
         touched = False
+        touched_pages = []
         with _an_write_lock:
             cur = _an_pages(_read_entry_text(build_id, rel))
             for pn, text in pmap.items():
                 if overwrite or not cur.get(pn, "").strip():
                     cur[pn] = text
                     touched = True
+                    touched_pages.append(pn)
             if touched:
                 doc = "\n\n".join(f"--- page {k} ---\n{cur[k]}"
                                   for k in sorted(cur))
                 _write_entry_text(build_id, rel, doc + "\n")
+                # .lib translation members do not carry this store's source
+                # hash/model contract. Never let imported text inherit stale
+                # local provenance and appear falsely current.
+                meta_path = _translation_meta_path(build_id, lang)
+                tm = _load_translation_meta(build_id, lang)
+                for pn in touched_pages:
+                    tm["pages"].pop(str(pn), None)
+                if tm["pages"]:
+                    lib.save_json(meta_path, tm)
+                else:
+                    meta_path.unlink(missing_ok=True)
         if touched:
             added.append(lang)
     return added
@@ -3309,8 +3697,7 @@ def api_build_replica_instructions(build_id: str):
     dest = _entry_dir(build_id) / "ocr" / "lib-instructions.md"
     with _ocr_merge_lock:
         if text.strip():
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(text, encoding="utf-8")
+            lib.save_text(dest, text)
         else:
             dest.unlink(missing_ok=True)
     return jsonify({"ok": True, "chars": len(text) if text.strip() else 0})
@@ -3335,76 +3722,73 @@ def api_build_replica_export(build_id: str):
     src = _valid_src_key(b, request.args.get("src"))
     if not src:
         return jsonify({"ok": False, "error": "unknown source"}), 400
-    meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
-    pages = (meta.get("regions") or {}).get(src) or {}
-    page_nums = sorted(int(k) for k in pages
-                       if str(k).isdigit() and isinstance(pages[k], dict))
+    layout_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    img_dir = _entry_dir(build_id) / "ocr" / "images"
+    # Capture one immutable export snapshot. The archive is assembled after
+    # releasing the locks, but every component below belongs to this revision.
+    with _ocr_merge_lock:
+        meta = lib.load_json(layout_path, {})
+        stored_pages = (meta.get("regions") or {}).get(src) or {}
+        page_nums = sorted(int(k) for k in stored_pages
+                           if str(k).isdigit() and
+                           isinstance(stored_pages[k], dict))
+        used_rids: set[str] = set()
+        pages = {}
+        for n in page_nums:
+            rec = dict(stored_pages[str(n)])
+            rec["items"] = replica_service.stable_export_items(
+                rec.get("items") or [], f"{build_id}:{src}:{n}", used_rids)
+            pages[str(n)] = rec
+        per_book = _lib_book_instructions(build_id)
+        snapshot_styles = _replica_styles(build_id)[0]
+        snapshot_templates = (meta.get("templates") or {}).get(src) or {}
+        snapshot_ext = _lib_manifest_ext(build_id)
+        snapshot_book_id = _lib_book_id(build_id)
+        figures = {}
+        figure_assets = {}
+        for name, info in (meta.get("images") or {}).items():
+            if not isinstance(info, dict):
+                continue
+            if str(info.get("src_key") or "primary") != src:
+                continue
+            safe = re.sub(r"[^\w.\-]", "_", str(name))
+            if not safe or safe != str(name):
+                continue
+            figure = {k: info.get(k) for k in
+                      ("page", "x", "y", "w", "h")}
+            if info.get("rework_of"):
+                figure["rework_of"] = str(info["rework_of"])
+            fext = libformat.sanitize_ext(info.get("ext"))
+            if fext:
+                figure["ext"] = fext
+            f = img_dir / safe
+            if f.is_file():
+                figures[safe] = figure
+                figure_assets[safe] = f.read_bytes()
+        with _an_write_lock:
+            translations = _lib_translation_members(build_id, page_nums)
     if not page_nums:
         return jsonify({"ok": False, "error":
                         "no region pages to export — seed or draw some in"
                         " the Replica tab first"}), 400
-    # persist minted rids on first export, mirroring _lib_book_id's mint-and-
-    # persist: a legacy book's rid-less regions get their rids stamped into
-    # layout.json now, so a second export of the same unchanged book carries
-    # identical rids and external rid-keyed annotations line up across round-
-    # trips. Read-modify-write under the sidecar lock every other write shares.
-    layout_path = _entry_dir(build_id) / "ocr" / "layout.json"
-    with _ocr_merge_lock:
-        meta = lib.load_json(layout_path, {})
-        pages = (meta.get("regions") or {}).get(src) or {}
-        changed = False
-        for n in page_nums:
-            rec = pages.get(str(n))
-            if not isinstance(rec, dict):
-                continue
-            ensured = libformat.ensure_rids(rec.get("items") or [])
-            if ensured != (rec.get("items") or []):
-                rec["items"] = ensured
-                changed = True
-        if changed:
-            lib.save_json(layout_path, meta)
     import io
     import zipfile
-    figures = {}
-    img_dir = _entry_dir(build_id) / "ocr" / "images"
-    for name, info in (meta.get("images") or {}).items():
-        if not isinstance(info, dict):
-            continue
-        if str(info.get("src_key") or "primary") != src:
-            continue
-        # the writer sanitizes names, but the sidecar is a hand-editable
-        # file: re-sanitize like the serving route, or a crafted key walks
-        # out of ocr/images/ on read AND plants a zip-slip member name
-        safe = re.sub(r"[^\w.\-]", "_", str(name))
-        if not safe or safe != str(name):
-            continue
-        figures[safe] = {k: info.get(k) for k in ("page", "x", "y", "w", "h")}
-        # rework linkage must survive the round trip, or an imported book's
-        # modern edition silently loses its re-drawn art
-        if info.get("rework_of"):
-            figures[safe]["rework_of"] = str(info["rework_of"])
-        # a figure may carry its own third-party ext namespace
-        fext = libformat.sanitize_ext(info.get("ext"))
-        if fext:
-            figures[safe]["ext"] = fext
-    per_book = _lib_book_instructions(build_id)
     book = {
         "format_version": libformat.FORMAT_VERSION,
         "generator": f"library-tool/{_app_version()}",
-        "book_id": _lib_book_id(build_id),
+        "book_id": snapshot_book_id,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "source": src,
         "meta": {k: b.get(k) for k in _LIB_META_FIELDS if b.get(k)},
         "capabilities": list(libformat.CAPABILITIES),
         "roles": libformat.ROLE_VOCAB,          # the vocabulary AS DATA
         "instructions": {"general_ref": "INSTRUCTIONS.md", "book": per_book},
-        "stylesheet": _replica_styles(build_id)[0],
-        "templates": (meta.get("templates") or {}).get(src) or {},
+        "stylesheet": snapshot_styles,
+        "templates": snapshot_templates,
         "figures": figures,
         "pages": page_nums,
-        "ext": _lib_manifest_ext(build_id),
+        "ext": snapshot_ext,
     }
-    translations = _lib_translation_members(build_id, page_nums)
     buf = io.BytesIO()
     try:
         # allow_nan=False: a hand-edited sidecar smuggling NaN/Infinity
@@ -3428,9 +3812,9 @@ def api_build_replica_export(build_id: str):
                     "doc": rec.get("doc") or "",
                     "dims": rec.get("dims") or {},
                     "state": rec.get("state") or "",
-                    # rids were persisted into layout.json above, so emit the
-                    # stored items directly — a second export of the same book
-                    # carries the same rids external tools annotate against
+                    # New records already carry stable RIDs. Legacy gaps were
+                    # filled deterministically in this immutable snapshot,
+                    # without turning a download GET into a store mutation.
                     "items": rec.get("items") or [],
                 }
                 pext = libformat.sanitize_ext(rec.get("ext"))
@@ -3442,9 +3826,7 @@ def api_build_replica_export(build_id: str):
                 z.writestr(f"translations/{lang}.json", json.dumps(
                     member, ensure_ascii=False, allow_nan=False))
             for name in figures:
-                f = img_dir / name
-                if f.is_file():
-                    z.writestr(f"assets/img/{name}", f.read_bytes())
+                z.writestr(f"assets/img/{name}", figure_assets[name])
     except ValueError:
         return jsonify({"ok": False, "error":
                         "the layout sidecar contains non-finite numbers — "
@@ -3585,7 +3967,7 @@ def api_build_rework_figure(build_id: str):
     if len(out_name) > 120:
         return jsonify({"ok": False, "error": "figure name too long"}), 400
     with _ocr_merge_lock:
-        (f.parent / out_name).write_bytes(out)
+        lib.save_bytes(f.parent / out_name, out)
         meta = lib.load_json(meta_path, {})
         entry = {k: info.get(k) for k in ("page", "x", "y", "w", "h")}
         entry.update({"src_key": src, "rework_of": name})
@@ -3676,7 +4058,7 @@ def api_build_replica_print(build_id: str):
         texts = {}
         if trans_pages is not None:
             bodies = [it for it in items if it.get("role") == "body"]
-            dist = layout_roles.distribute_text(
+            dist = TextLayerService.distribute(
                 trans_pages.get(n) or "",
                 [max(1, len(str(it.get("text") or ""))) for it in bodies])
             for it, t in zip(bodies, dist):
@@ -3801,6 +4183,17 @@ def _lib_import_archive(build_id: str, src: str, raw: bytes,
         return {"ok": False, "error":
                 f"this .lib needs a newer Library Tool "
                 f"(format {fmt[0]}.{fmt[1]})"}, 400
+    incoming_book_id = str(book.get("book_id") or "")
+    if fmt[0] >= 2 and not re.fullmatch(r"b-[0-9a-f]{32}", incoming_book_id):
+        return {"ok": False, "error": "the .lib has no valid stable book_id"}, 400
+    local_id_doc = lib.load_json(_lib_id_path(build_id), None)
+    local_book_id = str(local_id_doc.get("book_id") or "") \
+        if isinstance(local_id_doc, dict) else ""
+    if (incoming_book_id and local_book_id and
+            incoming_book_id != local_book_id):
+        return {"ok": False, "error":
+                "this .lib belongs to a different book",
+                "conflict": "book_identity_mismatch"}, 409
 
     # Nothing is dropped silently: every coercion and skip below is named in
     # the receipt's warnings[] with its location and reason (§2.6).
@@ -3811,6 +4204,7 @@ def _lib_import_archive(build_id: str, src: str, raw: bytes,
 
     # pages: every well-formed pages/N.json, sanitized like a live PUT
     incoming: dict[int, dict] = {}
+    incoming_rids: dict[str, str] = {}
     budget = _LIB_MAX_INFLATED
     for name in z.namelist():
         m = re.fullmatch(r"pages/(\d{1,5})\.json", name)
@@ -3840,6 +4234,18 @@ def _lib_import_archive(build_id: str, src: str, raw: bytes,
         if len(raw_items) > _RW_MAX_ITEMS:
             warn(name, f"page had more than {_RW_MAX_ITEMS} regions; "
                        "the surplus was dropped")
+        for index, item in enumerate(raw_items[:_RW_MAX_ITEMS]):
+            rid = libformat.clean_rid(
+                item.get("rid") if isinstance(item, dict) else "")
+            if not rid:
+                continue
+            if rid in incoming_rids:
+                return {"ok": False, "error":
+                        f"duplicate region identity {rid!r}",
+                        "warnings": warnings + [{"loc": f"{name}[{index}]",
+                        "msg": "the same rid is already used at " +
+                               incoming_rids[rid]}]}, 400
+            incoming_rids[rid] = f"{name}[{index}]"
         items = _rw_sanitize_items(raw_items[:_RW_MAX_ITEMS],
                                    src_type="import", warn=warn, loc=name)
         if not items:
@@ -3855,7 +4261,8 @@ def _lib_import_archive(build_id: str, src: str, raw: bytes,
             incoming[n]["ext"] = pext
         st = rec.get("state")
         if st == "verified":
-            incoming[n]["state"] = "verified"
+            incoming[n]["imported_state"] = "verified"
+            warn(name, "verified state imported as advisory; local review is required")
         elif st:
             warn(name, f"state {st!r} dropped: only 'verified' is recognized")
     if not incoming:
@@ -3902,13 +4309,19 @@ def _lib_import_archive(build_id: str, src: str, raw: bytes,
     trans_in = _lib_read_translation_members(z, warn)
 
     meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
-    applied, skipped, tpls_added = [], [], []
+    applied, skipped, protected, tpls_added = [], [], [], []
     sheet = "none"
     with _ocr_merge_lock:
         meta = lib.load_json(meta_path, {})
         pmap = meta.setdefault("regions", {}).setdefault(src, {})
         for n, rec in sorted(incoming.items()):
-            if not overwrite and str(n) in pmap:
+            existing = pmap.get(str(n))
+            if replica_service.is_protected(existing):
+                protected.append(n)
+                warn(f"pages/{n}.json", "page skipped: the destination is "
+                     "human-edited or verified")
+                continue
+            if not overwrite and existing is not None:
                 skipped.append(n)
                 warn(f"pages/{n}.json", "page skipped: the destination "
                      "already has this page (import with overwrite to replace)")
@@ -3959,7 +4372,7 @@ def _lib_import_archive(build_id: str, src: str, raw: bytes,
                      "figure skipped: image exceeds the size cap")
                 continue
             img_dir.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(z.read(name))
+            lib.save_bytes(dest, z.read(name))
             imap[safe] = entry
             figures_added += 1
         lib.save_json(meta_path, meta)
@@ -3980,13 +4393,21 @@ def _lib_import_archive(build_id: str, src: str, raw: bytes,
             else:
                 warn("book.json/ext", "ext kept: destination already has one "
                      "(import with overwrite to replace)")
+        if incoming_book_id and not local_book_id:
+            _lib_store_book_id(build_id, incoming_book_id)
 
     # translations write under their own lock (the analyze store), so they
     # land after the region commit rather than nesting the two locks
-    trans_added = _lib_apply_translations(build_id, trans_in, overwrite)
+    applied_set = set(applied)
+    trans_apply = {lang: {pn: text for pn, text in pmap.items()
+                          if pn in applied_set}
+                   for lang, pmap in trans_in.items()}
+    trans_apply = {lang: pmap for lang, pmap in trans_apply.items() if pmap}
+    trans_added = _lib_apply_translations(build_id, trans_apply, overwrite)
 
     return {"ok": True, "format_version": "%d.%d" % fmt,
             "pages_applied": applied, "pages_skipped": skipped,
+            "pages_protected": protected,
             "templates_added": tpls_added,
             "figures_added": figures_added, "stylesheet": sheet,
             "translations_added": trans_added, "warnings": warnings}, 200
@@ -4938,7 +5359,7 @@ _ocr_jobs: dict[str, dict] = {}
 _ocr_jobs_lock = threading.Lock()
 # serializes every compiled-file merge: concurrent jobs (one POST per digit
 # shortcut) must not lose each other's pages in the read-modify-write
-_ocr_merge_lock = threading.Lock()
+_ocr_merge_lock = threading.RLock()
 
 _TESSERACT_DEFAULT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
@@ -5173,7 +5594,7 @@ def _ocr_merge_page(build_id: str, target: str, page: int, text: str) -> None:
         sections[page] = text.strip("\n")
         parts = ([pre] if pre else []) + [
             f"--- page {n} ---\n{sections[n]}" for n in sorted(sections)]
-        f.write_text("\n\n".join(parts), encoding="utf-8", errors="replace")
+        lib.save_text(f, "\n\n".join(parts), errors="replace")
 
 
 def _ocr_save_page_images(build_id: str, page: int, images: list[dict],
@@ -5200,7 +5621,7 @@ def _ocr_save_page_images(build_id: str, page: int, images: list[dict],
             if "." not in safe:
                 safe += ".jpeg"
             name = f"p{page}-{safe}"
-            (d / name).write_bytes(im["data"])
+            lib.save_bytes(d / name, im["data"])
             meta["images"][name] = dict(
                 im["bbox"] or {}, page=page, src_key=src_key or "primary")
             # every ![id](id) in this page's markdown points at the saved file
@@ -5259,63 +5680,100 @@ def _ocr_save_page_words(build_id: str, src_key: str, page: int, words: list,
 
 def _ocr_save_page_regions(build_id: str, src_key: str, page: int,
                            regions: list, dims: dict | None,
-                           doc: str = "", state: str = "") -> None:
+                           doc: str = "", state: str = "",
+                           *, protect_existing: bool = False,
+                           provider: str = "",
+                           proposed_text: str = "") -> str:
     """Persist one page's typed regions (ocr/layout.json, {regions: {"<src>":
     {"<page>": {doc, dims, items: [{id, role, box, order, text}]}}}}), boxes
-    0..1 like the word sidecar. Unlike word boxes, regions CARRY their run's
-    text, so a re-OCR through the region-producing path replaces them and an
-    empty list drops the page — stale region text must not outlive its
-    transcription. `doc` names the compiled file that run's text landed in;
-    `dims` is the API-reported raster size/dpi (not physical page size);
-    `state` is the review flag ("verified" once a human signed the page off —
-    a machine re-seed writes none, so re-OCR naturally un-verifies)."""
+    0..1 like the word sidecar. Machine output may replace an untouched
+    machine draft; human/imported/verified work receives a proposal instead.
+    `doc` names the compiled file, `dims` describes the provider raster, and
+    `state` is the local review flag."""
     src_key = src_key or "primary"
     meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
     with _ocr_merge_lock:
         meta_path.parent.mkdir(parents=True, exist_ok=True)
         meta = lib.load_json(meta_path, {})
+        current = _region_record(meta, src_key, page)
+        if protect_existing and replica_service.is_protected(current):
+            current["stale"] = replica_service.stale_marker(provider)
+            proposal = replica_service.make_proposal(
+                doc=doc, dims=dims or {}, items=regions or [],
+                provider=provider,
+                base_revision=replica_service.content_revision(current),
+                text=proposed_text)
+            meta.setdefault("region_proposals", {}).setdefault(
+                src_key, {})[str(int(page))] = proposal
+            lib.save_json(meta_path, meta)
+            return "proposed"
+
+        regions = libformat.ensure_rids(regions)
         rmap = meta.setdefault("regions", {})
         pages = rmap.setdefault(src_key, {})
         if regions:
-            rec = {"doc": doc, "dims": dims or {}, "items": regions}
+            rec = {"doc": doc, "dims": dims or {}, "items": regions,
+                   "origin": "machine" if protect_existing else "internal"}
             if state:
                 rec["state"] = state
             pages[str(int(page))] = rec
+            action = "saved"
         else:
             pages.pop(str(int(page)), None)
             if not pages:
                 rmap.pop(src_key, None)
+            action = "dropped"
         if not rmap:
             meta.pop("regions", None)
+        proposals = meta.get("region_proposals") or {}
+        proposal_pages = proposals.get(src_key) or {}
+        proposal_pages.pop(str(int(page)), None)
+        if not proposal_pages:
+            proposals.pop(src_key, None)
+        if not proposals:
+            meta.pop("region_proposals", None)
         lib.save_json(meta_path, meta)
+        return action
 
 
 def _ocr_drop_page_regions_for_doc(build_id: str, src_key: str, page: int,
-                                   doc: str) -> None:
+                                   doc: str, *, provider: str = "",
+                                   proposed_text: str = "") -> str:
     """Drop a page's region record IF it claims to carry `doc`'s text.
 
-    A run without region output (Tesseract/Textract/Claude) that rewrites a
-    compiled page supersedes the text of any region record pointing at that
-    same file — serving the old transcription tagged with the current doc
-    would defeat the staleness contract. A run into a DIFFERENT target
-    leaves the record alone: the doc it describes is unchanged."""
+    A run without region output supersedes an untouched machine record. For
+    protected work it stores the new text as a proposal and leaves canonical
+    regions and compiled text alone. A different target leaves it unchanged."""
     src_key = src_key or "primary"
     meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
     with _ocr_merge_lock:
         meta = lib.load_json(meta_path, {})
         rmap = meta.get("regions")
         if not isinstance(rmap, dict):
-            return
+            return "unchanged"
         pages = rmap.get(src_key)
         rec = pages.get(str(int(page))) if isinstance(pages, dict) else None
         if not (isinstance(rec, dict) and rec.get("doc") == doc):
-            return
+            return "unchanged"
+        if replica_service.is_protected(rec):
+            rec["stale"] = replica_service.stale_marker(provider)
+            proposal = replica_service.make_proposal(
+                doc=doc, dims=rec.get("dims") or {}, items=[],
+                provider=provider,
+                base_revision=replica_service.content_revision(rec),
+                reason="source-text-changed-without-layout",
+                text=proposed_text)
+            meta.setdefault("region_proposals", {}).setdefault(
+                src_key, {})[str(int(page))] = proposal
+            lib.save_json(meta_path, meta)
+            return "proposed"
         pages.pop(str(int(page)), None)
         if not pages:
             rmap.pop(src_key, None)
         if not rmap:
             meta.pop("regions", None)
         lib.save_json(meta_path, meta)
+        return "dropped"
 
 
 def _ocr_job_run(job_id: str) -> None:
@@ -5345,6 +5803,7 @@ def _ocr_job_run(job_id: str) -> None:
             # a runner may return a dict instead of a string: {text, images}
             # (Mistral figures) and/or {text, words} (Tesseract/Textract boxes)
             src_key = job.get("src_key") or "primary"
+            region_action = "unchanged"
             if isinstance(result, dict):
                 text = str(result.get("text") or "")
                 if result.get("images"):
@@ -5367,18 +5826,28 @@ def _ocr_job_run(job_id: str) -> None:
                 # target's text: unlike word geometry, region text is
                 # superseded by the new transcription.
                 if "regions" in result:
-                    _ocr_save_page_regions(job["build_id"], src_key, n,
-                                           result.get("regions") or [],
-                                           result.get("dims"),
-                                           doc=_ocr_name(job["target"]))
+                    region_action = _ocr_save_page_regions(
+                        job["build_id"], src_key, n,
+                        result.get("regions") or [], result.get("dims"),
+                        doc=_ocr_name(job["target"]), protect_existing=True,
+                        provider=svc, proposed_text=text)
                 else:
-                    _ocr_drop_page_regions_for_doc(job["build_id"], src_key,
-                                                   n, _ocr_name(job["target"]))
+                    region_action = _ocr_drop_page_regions_for_doc(
+                        job["build_id"], src_key, n,
+                        _ocr_name(job["target"]), provider=svc,
+                        proposed_text=text)
             else:
-                text = result
-                _ocr_drop_page_regions_for_doc(job["build_id"], src_key,
-                                               n, _ocr_name(job["target"]))
-            _ocr_merge_page(job["build_id"], job["target"], n, text)
+                text = str(result or "")
+                region_action = _ocr_drop_page_regions_for_doc(
+                    job["build_id"], src_key, n,
+                    _ocr_name(job["target"]), provider=svc,
+                    proposed_text=text)
+            # A proposal is deliberately non-destructive: accepting it is the
+            # command that may replace canonical regions and derived text.
+            if region_action == "proposed":
+                item["proposal"] = True
+            else:
+                _ocr_merge_page(job["build_id"], job["target"], n, text)
             item["status"] = "ok"
         except Exception as exc:
             detail = f"{type(exc).__name__}: {exc}"
@@ -6167,8 +6636,11 @@ def _renumber_layout_words(build_id: str, src_key: str, removed: list[int],
     with _ocr_merge_lock:
         meta = lib.load_json(meta_path, {})
         dirty = False
-        # words, words_doc, and regions share the src/page keying; shift all
-        for key in ("words", "words_doc", "regions"):
+        # Every source/page map in the Replica aggregate moves together.  A
+        # proposal or pending compile left on its old number would otherwise
+        # be offered/applied to a different physical page after deletion.
+        for key in ("words", "words_doc", "regions",
+                    "region_proposals", "region_compile_pending"):
             wmap = meta.get(key)
             if not isinstance(wmap, dict):
                 continue
@@ -9530,8 +10002,7 @@ def _read_entry_text(bid: str, rel: str) -> str:
 
 def _write_entry_text(bid: str, rel: str, text: str) -> None:
     p = _entry_dir(bid) / rel
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(text, encoding="utf-8")
+    lib.save_text(p, text)
 
 
 def _save_analyze_summary(bid: str, text: str) -> None:
@@ -9608,9 +10079,17 @@ def _lang_code(raw: str) -> str:
     return re.sub(r"[^a-z\-]", "", str(raw or "").lower())[:12]
 
 
+_translation_provenance = TranslationProvenanceService()
+
+
 def _page_sha(text: str) -> str:
-    return hashlib.sha1(
-        re.sub(r"\s+", " ", text.strip()).encode("utf-8")).hexdigest()
+    """Legacy SHA-1 used by version-1 translation metadata."""
+    return _translation_provenance.legacy_source_hash(text)
+
+
+def _page_source_hash(text: str) -> str:
+    """Version-2 source hash: normalize wrapping, preserve paragraphs."""
+    return _translation_provenance.source_hash(text)
 
 
 def _translation_meta_path(bid: str, lang: str):
@@ -9624,19 +10103,10 @@ def _load_translation_meta(bid: str, lang: str) -> dict:
     return doc
 
 
-def _stale_translation_pages(meta: dict, src_pages: dict[int, str]) -> list[int]:
-    """Pages whose recorded source hash no longer matches the OCR text. Pages
-    translated before hashes were recorded can't be judged — never "stale"."""
-    out = []
-    for key, rec in meta.get("pages", {}).items():
-        try:
-            n = int(key)
-        except (TypeError, ValueError):
-            continue
-        if (n in src_pages and isinstance(rec, dict) and rec.get("sha1")
-                and rec["sha1"] != _page_sha(src_pages[n])):
-            out.append(n)
-    return sorted(out)
+def _stale_translation_pages(meta: dict, src_pages: dict[int, str],
+                             src: str = "") -> list[int]:
+    """Tracked pages whose source layer or content revision changed."""
+    return list(_translation_provenance.stale_pages(meta, src_pages, src))
 
 
 def _translations_info(bid: str) -> list[dict]:
@@ -9644,15 +10114,26 @@ def _translations_info(bid: str) -> list[dict]:
     out = []
     if d.is_dir():
         b = lib.load_json(BUILDS_PATH, {}).get(bid) or {}
-        src_pages = _an_pages(_analyze_doc(bid, b)[1])
+        src_name, src_text = _analyze_doc(bid, b)
+        src_pages = _an_pages(src_text)
         for f in sorted(d.glob("*.txt")):
             pages = _an_pages(f.read_text(encoding="utf-8", errors="replace"))
             meta = _load_translation_meta(bid, f.stem)
-            out.append({"lang": f.stem, "pages": len(pages),
-                        "size": f.stat().st_size,
-                        "stale": len(_stale_translation_pages(meta, src_pages)),
-                        "untracked": sum(1 for n in pages
-                                         if str(n) not in meta["pages"])})
+            translation_status = _translation_provenance.status(
+                meta, src_pages, pages, source_layer=src_name)
+            info = {"lang": f.stem, "pages": len(pages),
+                    "size": f.stat().st_size,
+                    "stale": len(translation_status.stale),
+                    "untracked": len(translation_status.untracked)}
+            missing = len(translation_status.missing)
+            orphaned = len(translation_status.orphaned)
+            if missing:
+                info["missing"] = missing
+            if orphaned:
+                info["orphaned"] = orphaned
+            if meta.get("src") and meta.get("src") != src_name:
+                info["source_mismatch"] = True
+            out.append(info)
     return out
 
 
@@ -10163,10 +10644,20 @@ def api_analyze_translate():
     elif p.get("mode") == "stale":
         # bring the translation current: pages whose source text changed since
         # they were translated, plus pages never translated at all
-        stale = _stale_translation_pages(_load_translation_meta(bid, lang), pages)
+        tm = _load_translation_meta(bid, lang)
+        stale = _stale_translation_pages(tm, pages, name)
+        tracked = {int(k) for k, rec in tm["pages"].items()
+                   if str(k).isdigit() and isinstance(rec, dict) and
+                   (rec.get("source_hash") or rec.get("sha1"))}
+        untracked = sorted(n for n in done_pages if n not in tracked)
         todo = sorted(set(stale) | {n for n in pages if pages[n].strip()
                                     and not done_pages.get(n, "").strip()})
         if not todo:
+            if untracked:
+                return jsonify({"ok": False, "error":
+                                "the translation has untracked human/imported "
+                                "pages; choose pages explicitly to replace them",
+                                "untracked": untracked}), 409
             return jsonify({"ok": False, "error":
                             "no outdated or missing pages — the translation "
                             "is current"}), 400
@@ -10224,11 +10715,15 @@ def api_analyze_translate():
                     # model each page was translated from — staleness is a
                     # hash comparison later
                     tm = _load_translation_meta(bid, lang)
+                    tm["version"] = 2
                     tm["src"], tm["model"] = name, cfg["model"]
-                    tm["pages"][str(n)] = {
-                        "sha1": _page_sha(pages[n]),
-                        "at": datetime.now(timezone.utc).isoformat(
-                            timespec="seconds")}
+                    tm["pages"][str(n)] = _translation_provenance.page_record(
+                        pages[n],
+                        source_layer=name,
+                        model=cfg["model"],
+                        at=datetime.now(timezone.utc).isoformat(
+                            timespec="seconds"),
+                    )
                     lib.save_json(_translation_meta_path(bid, lang), tm)
             record()
             activity("translated", "book", n=len(todo) - job["errors"],

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import uuid
 import zipfile
@@ -115,8 +116,8 @@ class Issue:
 # --- ids -------------------------------------------------------------------
 
 def new_rid() -> str:
-    """A short random region id."""
-    return uuid.uuid4().hex[:8]
+    """A globally credible random region id (128 bits, UUID hex)."""
+    return uuid.uuid4().hex
 
 
 def clean_rid(raw) -> str:
@@ -135,12 +136,18 @@ def ensure_rids(items: list) -> list:
     sanitize, which rewrites src_type/order): used at export to guarantee a
     stable id on every region, even ones saved before rids existed."""
     out = []
+    used: set[str] = set()
     for it in items or []:
         if not isinstance(it, dict):
             continue
         rec = dict(it)
-        if not clean_rid(rec.get("rid")):
-            rec["rid"] = new_rid()
+        rid = clean_rid(rec.get("rid"))
+        if not rid or rid in used:
+            rid = new_rid()
+            while rid in used:
+                rid = new_rid()
+            rec["rid"] = rid
+        used.add(rid)
         out.append(rec)
     return out
 
@@ -190,6 +197,7 @@ def sanitize_page_items(raw: list, src_type: str = "human",
             and not isinstance(o, bool) else 0.0
 
     items = []
+    used_rids: set[str] = set()
     for idx, it in enumerate(
             sorted((x for x in raw if isinstance(x, dict)), key=order_of)):
         here = f"{loc}[{idx}]"
@@ -221,7 +229,14 @@ def sanitize_page_items(raw: list, src_type: str = "human",
         text = str(it.get("text") or "")
         if warn and len(text) > 20000:
             warn(here, "text truncated to 20000 chars")
-        rid = clean_rid(it.get("rid")) or new_rid()
+        rid = clean_rid(it.get("rid"))
+        if not rid or rid in used_rids:
+            if rid and warn:
+                warn(here, f"duplicate rid {rid!r} replaced with a new id")
+            rid = new_rid()
+            while rid in used_rids:
+                rid = new_rid()
+        used_rids.add(rid)
         rec = {"id": f"r{len(items)}", "rid": rid, "role": role,
                "src_type": src_type, "order": len(items),
                "box": {"x": round(x, 5), "y": round(y, 5),
@@ -523,37 +538,77 @@ def write_lib(doc: LibDocument, path, *, generator: str = "library-tool/dev",
     this build cannot write."""
     if doc.format and doc.format[0] > SUPPORTED_MAJOR:
         raise LibError(f"cannot write format {doc.format[0]}.{doc.format[1]}")
+
+    # A rid identifies one logical region in the whole book, not merely within
+    # a page.  The page sanitizer can safely repair a duplicate *on the same
+    # page*, but silently changing one side of a cross-page collision would
+    # make references to that region ambiguous.  Refuse before opening the
+    # destination so callers never receive a partially written archive.
+    seen_rids: dict[str, tuple[int, int]] = {}
+    for page_index, page in enumerate(doc.pages):
+        for item in page.items:
+            if not isinstance(item, dict):
+                continue
+            rid = clean_rid(item.get("rid"))
+            previous = seen_rids.get(rid) if rid else None
+            if previous is not None and previous[0] != page_index:
+                raise LibError(
+                    f"duplicate rid {rid!r} on pages "
+                    f"{previous[1]} and {page.page}")
+            if rid and previous is None:
+                seen_rids[rid] = (page_index, page.page)
+
+    # Sanitize once for this seal operation.  On success the canonical items
+    # (including any newly minted rids) are written back to the in-memory
+    # document, so sealing the same object again preserves region identity.
+    sealed_pages = [
+        (page, sanitize_page_items(page.items, src_type="import")[:MAX_ITEMS])
+        for page in sorted(doc.pages, key=lambda page: page.page)
+    ]
     bid = book_id or doc.book_id or ("b-" + uuid.uuid4().hex)
     manifest = _book_manifest(doc, book_id=bid, generator=generator,
                               instructions_book=instructions_book)
-    with zipfile.ZipFile(Path(path), "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("book.json", json.dumps(manifest, indent=1,
-                                           ensure_ascii=False, allow_nan=False))
-        z.writestr("INSTRUCTIONS.md",
-                   render_instructions(manifest["meta"],
-                                       per_book=instructions_book))
-        z.writestr("schema.json", json.dumps(SCHEMA, indent=1))
-        for p in sorted(doc.pages, key=lambda p: p.page):
-            # cap to MAX_ITEMS so a sealed page can't come out a shape the
-            # import (and schema.json's maxItems) then truncates
-            items = sanitize_page_items(p.items, src_type="import")[:MAX_ITEMS]
-            body = {"page": p.page, "doc": p.doc, "dims": p.dims or {},
-                    "state": "verified" if p.state == "verified" else "",
-                    "items": items}
-            ext = sanitize_ext(p.ext, f"pages/{p.page}.json.ext")
-            if ext:
-                body["ext"] = ext
-            z.writestr(f"pages/{p.page}.json",
-                       json.dumps(body, indent=1, ensure_ascii=False,
-                                  allow_nan=False))
-        for lang, td in doc.translations.items():
-            if RID_RE.fullmatch(lang) and isinstance(td, dict):
-                z.writestr(f"translations/{lang}.json",
-                           json.dumps(td, ensure_ascii=False, allow_nan=False))
-        for name in manifest["figures"]:
-            blob = doc.assets.get(name)
-            if isinstance(blob, (bytes, bytearray)):
-                z.writestr(f"assets/img/{name}", bytes(blob))
+    destination = Path(path)
+    temporary = destination.with_name(
+        destination.name + f".tmp-{os.getpid()}-{uuid.uuid4().hex}")
+    try:
+        # Seal beside the destination and publish with one replace. A late
+        # serialization/ZIP failure therefore preserves an existing archive.
+        with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("book.json", json.dumps(
+                manifest, indent=1, ensure_ascii=False, allow_nan=False))
+            z.writestr("INSTRUCTIONS.md",
+                       render_instructions(manifest["meta"],
+                                           per_book=instructions_book))
+            z.writestr("schema.json", json.dumps(SCHEMA, indent=1))
+            for p, items in sealed_pages:
+                # Items were capped before opening the destination so a sealed
+                # page cannot come out a shape schema/import then truncates.
+                body = {"page": p.page, "doc": p.doc, "dims": p.dims or {},
+                        "state": "verified" if p.state == "verified" else "",
+                        "items": items}
+                ext = sanitize_ext(p.ext, f"pages/{p.page}.json.ext")
+                if ext:
+                    body["ext"] = ext
+                z.writestr(f"pages/{p.page}.json", json.dumps(
+                    body, indent=1, ensure_ascii=False, allow_nan=False))
+            for lang, td in doc.translations.items():
+                if RID_RE.fullmatch(lang) and isinstance(td, dict):
+                    z.writestr(f"translations/{lang}.json", json.dumps(
+                        td, ensure_ascii=False, allow_nan=False))
+            for name in manifest["figures"]:
+                blob = doc.assets.get(name)
+                if isinstance(blob, (bytes, bytearray)):
+                    z.writestr(f"assets/img/{name}", bytes(blob))
+        os.replace(temporary, destination)
+    finally:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+
+    for page, items in sealed_pages:
+        page.items = items
 
 
 # --- the linter ------------------------------------------------------------
@@ -612,7 +667,8 @@ def validate(doc: LibDocument) -> list:
                 continue
             rid = clean_rid(it.get("rid"))
             if rid and rid in seen_rids:
-                warn(loc, f"duplicate rid {rid!r} (also on {seen_rids[rid]})")
+                add("error", loc,
+                    f"duplicate rid {rid!r} (also on {seen_rids[rid]})")
             elif rid:
                 seen_rids[rid] = loc
 

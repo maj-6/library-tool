@@ -125,6 +125,9 @@ def test_replica_toolbar_groups_secondary_actions_and_labels_primary_controls():
     for button_id, label in (
         ("rw-mode-edit", "Edit regions"),
         ("rw-mode-preview", "Preview"),
+        ("rw-detect", "Detect regions"),
+        ("rw-proposal-apply", "Apply detected regions"),
+        ("rw-proposal-dismiss", "Dismiss detected regions"),
         ("rw-save", "Save regions"),
     ):
         assert re.search(
@@ -136,6 +139,8 @@ def test_replica_toolbar_groups_secondary_actions_and_labels_primary_controls():
         r'id="rw-preview-lang"[^>]*aria-label="Preview text layer"', toolbar
     )
     assert re.search(r'id="rw-src"[^>]*aria-label="Replica source"', TEMPLATE)
+    for control_id in ("rw-detect", "rw-proposal-apply", "rw-proposal-dismiss"):
+        assert toolbar.count(f'id="{control_id}"') == 1
 
     assert ">Templates</summary>" in templates
     assert '<label class="toolbar-popover-field" for="rw-tpl">' in templates
@@ -167,11 +172,14 @@ def test_replica_role_legend_is_in_wrapping_footer_not_the_page_toolbar():
 def test_replica_dirty_page_disables_actions_that_require_saved_regions():
     sync = _function("rwSyncBar()", "function rwDirty")
 
-    assert (
-        'el("rw-recompile").disabled = !rwState.book || '
-        "!rwState.regionPages.length || rwState.dirty;"
-    ) in sync
-    assert 'el("rw-tpl-save").disabled = !rwState.page || rwState.dirty;' in sync
+    # Every action consuming saved state shares the stronger workbench-level
+    # pending guard (regions, instructions, styles, or an in-flight save).
+    assert "const pending = rwHasUnsaved() || rwState.saving" in sync
+    assert 'el("rw-recompile").disabled = !rwState.book' in sync
+    assert 'el("rw-export").disabled = !rwState.book' in sync
+    assert 'el("rw-print").disabled = !rwState.book' in sync
+    assert "pending || (rwState.page && !ready)" in sync
+    assert 'el("rw-tpl-save").disabled = !ready || rwState.dirty || rwState.saving;' in sync
 
 
 def test_replica_book_rows_are_keyboard_operable_and_expose_selection():

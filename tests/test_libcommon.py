@@ -255,12 +255,9 @@ def test_save_json_retries_replace_then_succeeds(tmp_path, monkeypatch):
     assert list(tmp_path.glob("*.tmp*")) == []
 
 
-def test_save_json_falls_back_to_inplace_write_when_replace_never_succeeds(
+def test_save_json_preserves_old_file_when_replace_never_succeeds(
     tmp_path, monkeypatch
 ):
-    # The documented non-atomic degradation: after 5 failed os.replace
-    # attempts, save_json rewrites the target in place rather than dropping
-    # the data. It returns None and never raises for PermissionError.
     target = tmp_path / "out.json"
     lib.save_json(target, {"old": True})
 
@@ -274,11 +271,21 @@ def test_save_json_falls_back_to_inplace_write_when_replace_never_succeeds(
     monkeypatch.setattr(os, "replace", always_fail)
     monkeypatch.setattr(time, "sleep", sleeps.append)
 
-    assert lib.save_json(target, {"fallback": True}) is None
+    with pytest.raises(PermissionError, match="sharing violation"):
+        lib.save_json(target, {"replacement": True})
 
     assert calls["n"] == 5  # exactly 5 attempts
     assert sleeps == pytest.approx([0.05, 0.10, 0.15, 0.20, 0.25])
-    # New data landed via the plain open(path, "w") fallback...
-    assert json.loads(target.read_text(encoding="utf-8")) == {"fallback": True}
-    # ...and the tmp sidecar was unlinked in the finally block.
+    assert json.loads(target.read_text(encoding="utf-8")) == {"old": True}
+    assert list(tmp_path.glob("*.tmp*")) == []
+
+
+def test_save_json_serialization_failure_preserves_old_file(tmp_path):
+    target = tmp_path / "out.json"
+    lib.save_json(target, {"old": True})
+
+    with pytest.raises(TypeError):
+        lib.save_json(target, {"not-json": object()})
+
+    assert lib.load_json(target, None) == {"old": True}
     assert list(tmp_path.glob("*.tmp*")) == []

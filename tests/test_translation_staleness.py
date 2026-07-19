@@ -155,6 +155,50 @@ def test_legacy_translation_without_meta_is_untracked_not_stale(client):
     assert info[0]["stale"] == 0
     assert info[0]["untracked"] == 1
 
+    refresh = client.post("/api/analyze/translate", json={
+        "build_id": build["id"], "lang": "es", "mode": "stale"})
+    assert refresh.status_code == 409
+    assert refresh.get_json()["untracked"] == [1]
+
+
+def test_translation_hash_preserves_paragraph_semantics():
+    wrapped = server._page_source_hash("alpha\nline\n\nbeta")
+    assert wrapped == server._page_source_hash("alpha line\n\nbeta")
+    assert wrapped != server._page_source_hash("alpha line beta")
+
+
+def test_source_layer_change_marks_every_tracked_page_stale():
+    text = "same words"
+    meta = {"src": "compiled.txt", "pages": {"1": {
+        "source_hash": server._page_source_hash(text)}}}
+
+    assert server._stale_translation_pages(
+        meta, {1: text}, "normalized.txt") == [1]
+
+
+def test_imported_translation_drops_inherited_local_provenance(client):
+    build = _ready_build(client, "Imported translation provenance")
+    _write_compiled(build["id"], {1: "Alpha original.", 2: "Beta original."})
+    d = server._entry_dir(build["id"]) / "translations"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "es.txt").write_text(
+        "--- page 1 ---\nUno.\n\n--- page 2 ---\nDos.\n", encoding="utf-8")
+    server.lib.save_json(server._translation_meta_path(build["id"], "es"), {
+        "version": 2, "src": "compiled.txt", "model": "local-model",
+        "pages": {
+            "1": {"source_hash": server._page_source_hash("Alpha original.")},
+            "2": {"source_hash": server._page_source_hash("Beta original.")},
+        }})
+
+    assert server._lib_apply_translations(
+        build["id"], {"es": {1: "Importado."}}, overwrite=True) == ["es"]
+    meta = server._load_translation_meta(build["id"], "es")
+    assert "1" not in meta["pages"]
+    assert "2" in meta["pages"]
+    info = client.get(
+        f"/api/builds/{build['id']}/translations").get_json()["translations"][0]
+    assert info["untracked"] == 1
+
 
 def test_deleting_a_translation_removes_its_meta(client, monkeypatch):
     build = _ready_build(client, "Delete meta")

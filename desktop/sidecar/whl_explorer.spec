@@ -21,6 +21,7 @@ SPEC_DIR = os.path.abspath(SPECPATH)
 REPO = os.path.abspath(os.path.join(SPEC_DIR, "..", ".."))
 TOOLS = os.path.join(REPO, "tools")
 APP = os.path.join(TOOLS, "whl_explorer")
+SRC = os.path.join(REPO, "src")
 
 # (source, dest-in-bundle). Flask's templates/static are pointed here by a
 # frozen-aware app init in server.py; the rest mirror the APP_ROOT layout.
@@ -46,7 +47,7 @@ hiddenimports = (
 
 a = Analysis(
     [os.path.join(APP, "server.py")],
-    pathex=[TOOLS, APP],
+    pathex=[SRC, TOOLS, APP],
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,

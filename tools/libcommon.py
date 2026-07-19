@@ -224,26 +224,50 @@ def save_json(path: Path, data) -> None:
     read these files while request handlers rewrite them.
 
     Windows can refuse the replace while another handle has the target open
-    (sharing violation); those read windows are milliseconds, so retry briefly
-    and fall back to an in-place write rather than dropping the data."""
+    (sharing violation); those read windows are milliseconds, so replacement
+    is retried briefly. A persistent failure raises and preserves the old file:
+    canonical state must never degrade to a torn in-place rewrite."""
+    payload = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+    _strict_atomic_replace(Path(path), payload)
+
+
+def _strict_atomic_replace(path: Path, payload: bytes) -> None:
+    """Durably replace ``path`` or fail without touching the old file.
+
+    Canonical/derived Replica artifacts must never fall back to an in-place
+    partial write. JSON, text, and binary helpers all use this primitive so a
+    persistent replacement failure preserves the previous artifact.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # pid + thread id: concurrent writers (threads or processes) can never
-    # share a temp name, so one writer's replace can't consume another's file
-    tmp = path.with_name(path.name + f".tmp{os.getpid()}-{threading.get_ident()}")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2, ensure_ascii=False)
-    for attempt in range(5):
-        try:
-            os.replace(tmp, path)
-            return
-        except PermissionError:
-            time.sleep(0.05 * (attempt + 1))
+    tmp = path.with_name(
+        path.name + f".tmp{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex}")
     try:
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, ensure_ascii=False)
+        with open(tmp, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        last_error = None
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError as exc:
+                last_error = exc
+                time.sleep(0.05 * (attempt + 1))
+        raise last_error or PermissionError(f"could not replace {path}")
     finally:
         try:
-            os.unlink(tmp)
+            tmp.unlink()
         except OSError:
             pass
+
+
+def save_text(path: Path, text: str, *, errors: str = "strict") -> None:
+    """Strict atomic UTF-8 text write."""
+    _strict_atomic_replace(Path(path), str(text).encode("utf-8", errors=errors))
+
+
+def save_bytes(path: Path, data: bytes) -> None:
+    """Strict atomic binary write."""
+    _strict_atomic_replace(Path(path), bytes(data))

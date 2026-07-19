@@ -15,8 +15,18 @@ import zipfile
 import libformat
 
 
+TEST_BOOK_ID = "b-" + "1" * 32
+
+
 def _put(client, bid, body):
-    return client.put(f"/api/builds/{bid}/ocr-regions", json=body).get_json()
+    payload = dict(body)
+    src = str(payload.get("src") or "primary")
+    page = payload.get("page", 0)
+    loaded = client.get(
+        f"/api/builds/{bid}/ocr-regions?src={src}&page={page}").get_json()
+    payload.setdefault("expect_revision", loaded["revision"])
+    return client.put(
+        f"/api/builds/{bid}/ocr-regions", json=payload).get_json()
 
 
 def _seed_build(bid, **extra):
@@ -64,8 +74,11 @@ def test_sanitize_page_items_parity_and_rid():
     b = items[0]["box"]
     assert b["x"] + b["w"] <= 1.0 and b["y"] + b["h"] <= 1.0
     assert items[0]["norm"] == "N"
-    # every kept region carries an 8-hex rid; the dropped one minted none
+    # Every newly minted identity carries the full 128 bits of UUID entropy;
+    # the dropped region minted none.
     assert all(libformat.RID_RE.match(i["rid"]) for i in items)
+    assert all(len(i["rid"]) == 32 and
+               set(i["rid"]) <= set("0123456789abcdef") for i in items)
     assert len({i["rid"] for i in items}) == 2
 
     # text over the cap truncates
@@ -281,6 +294,7 @@ def test_receipt_warns_on_coerced_role_and_skipped_figure(client, data_root):
     with zipfile.ZipFile(buf, "w") as z:
         z.writestr("book.json", json.dumps({
             "format_version": "2.0",
+            "book_id": TEST_BOOK_ID,
             "figures": {"fig.jpeg": {"page": 1}}}))
         z.writestr("pages/1.json", json.dumps({"page": 1, "items": [
             {"role": "INVALID ROLE", "order": 0,
@@ -307,7 +321,8 @@ def _fig_lib(rework_of=None, body=b"\x89PNGnew"):
         fig["rework_of"] = rework_of
     with zipfile.ZipFile(buf, "w") as z:
         z.writestr("book.json", json.dumps({
-            "format_version": "2.0", "figures": {"fig.png": fig}}))
+            "format_version": "2.0", "book_id": TEST_BOOK_ID,
+            "figures": {"fig.png": fig}}))
         z.writestr("pages/1.json", json.dumps({"page": 1, "items": [
             {"role": "body", "order": 0,
              "box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}, "text": "t"}]}))
@@ -518,7 +533,8 @@ def test_lib_open_failed_import_leaves_no_shell_build(client, data_root,
     buf = tmp_path / "empty.lib"
     with zipfile.ZipFile(buf, "w") as z:
         z.writestr("book.json", json.dumps({
-            "format_version": "2.0", "meta": {"title": "Shell"}}))
+            "format_version": "2.0", "book_id": TEST_BOOK_ID,
+            "meta": {"title": "Shell"}}))
     before = set(lib.load_json(server.BUILDS_PATH, {}))
     r = client.post("/api/lib/open", json={"path": str(buf)})
     assert r.status_code == 400
@@ -619,15 +635,15 @@ def test_regions_put_preserves_incoming_rid_and_ext(client, data_root):
     assert got["items"][0]["ext"] == {"vendor": {"tag": "A"}}
 
 
-def test_export_persists_rids_for_legacy_regions(client, data_root):
+def test_export_derives_stable_rids_without_mutating_legacy_regions(
+        client, data_root):
     import libcommon as lib
     import server
     bid = "e2b012340022"
     _seed_build(bid)
-    # a region record predating rids, written straight to the sidecar (NOT
-    # through the rid-minting PUT): the first export must mint AND PERSIST a rid,
-    # so a second export of the unchanged book carries the identical rid that an
-    # external tool would have annotated against
+    # A region record predating rids, written straight to the sidecar (NOT
+    # through the rid-minting PUT). Export is a read: it derives a deterministic
+    # compatibility RID for the archive without stamping the working store.
     mp = server._entry_dir(bid) / "ocr" / "layout.json"
     mp.parent.mkdir(parents=True, exist_ok=True)
     lib.save_json(mp, {"regions": {"primary": {"4": {
@@ -637,15 +653,23 @@ def test_export_persists_rids_for_legacy_regions(client, data_root):
                    "text": "t"}]}}}})
     assert "rid" not in lib.load_json(
         mp, {})["regions"]["primary"]["4"]["items"][0]
+    before = mp.read_bytes()
+    id_path = server._lib_id_path(bid)
+    assert not id_path.exists()
 
     z1 = zipfile.ZipFile(io.BytesIO(
         client.get(f"/api/builds/{bid}/replica-export").data))
     rid1 = json.loads(z1.read("pages/4.json"))["items"][0]["rid"]
-    # the mint was written back into layout.json on the first export
-    stored = lib.load_json(mp, {})["regions"]["primary"]["4"]["items"][0]["rid"]
-    assert stored == rid1
+    assert rid1.startswith("legacy-") and len(rid1) == len("legacy-") + 32
+    assert mp.read_bytes() == before
+    assert "rid" not in lib.load_json(
+        mp, {})["regions"]["primary"]["4"]["items"][0]
+    assert not id_path.exists()
 
     z2 = zipfile.ZipFile(io.BytesIO(
         client.get(f"/api/builds/{bid}/replica-export").data))
     rid2 = json.loads(z2.read("pages/4.json"))["items"][0]["rid"]
     assert rid1 == rid2
+    assert json.loads(z1.read("book.json"))["book_id"] == \
+        json.loads(z2.read("book.json"))["book_id"]
+    assert mp.read_bytes() == before and not id_path.exists()

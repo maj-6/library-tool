@@ -5,6 +5,13 @@ Per-component detail lives in each part's own README (map at the end).
 
 ## Components and their sources of truth
 
+- **Library Engine** (`src/librarytool/`) — framework-neutral application
+  services, contracts, capability manifests, and storage ports. The current
+  Flask sidecar is its first composition root and compatibility transport;
+  browser code reaches Replica operations through one `EngineClient`. The
+  engine package does not resolve `DATA_ROOT`, create files, or import Flask at
+  package import time. Installed modules and usable workbenches are discoverable
+  at `/api/v1/capabilities`.
 - **Desktop app** — the workbench: an Electron shell (`desktop/`) that
   spawns the Flask sidecar (`tools/whl_explorer/server.py`) on a loopback
   port. Paths split into two roots (`tools/libcommon.py`): **`APP_ROOT`**,
@@ -157,6 +164,9 @@ writes down); invite-only contributor enforcement is TODO (#98).
 ## Where the docs live
 
 - `README.md` — the parts, the workflow, running from source.
+- `docs/modular-engine-architecture.md` — the proposed headless engine,
+  KiCad-style workbenches, capability modules, generalized cultural-heritage
+  model, and migration plan.
 - `tools/README.md` — the whole explorer: every tab, data layout,
   index builders, checks, standalone CLIs.
 - `desktop/README.md` — the Electron shell, installer, auto-update,
