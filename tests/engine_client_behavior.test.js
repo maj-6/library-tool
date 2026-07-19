@@ -61,6 +61,7 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
     client.replica.styles.get,
     client.translations.list,
     client.translations.get,
+    client.translations.replacePage,
     client.replica.styles.save,
     client.replica.instructions.get,
     client.replica.instructions.save,
@@ -74,7 +75,7 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
     client.replica.packages.exportUrl,
     client.replica.printUrl,
   ];
-  assert.equal(jsonMethods.length, 20);
+  assert.equal(jsonMethods.length, 21);
   assert.ok(jsonMethods.every((method) => typeof method === "function"));
   assert.equal(urlBuilders.length, 5);
   assert.ok(urlBuilders.every((method) => typeof method === "function"));
@@ -135,6 +136,52 @@ test("item queries use versioned path-safe engine resources", async () => {
   assert.equal(calls[4].url,
     "/api/v1/items/book%20%2F%20one/readiness");
   assert.ok(calls.every(({ init }) => init.method === "GET"));
+});
+
+test("translations use versioned aggregate reads and dual-CAS page writes", async () => {
+  const { client, calls } = harness({
+    ok: true, translation: { id: "translation-1" },
+  });
+  await client.translations.list({ itemId: "book / one" });
+  await client.translations.get({
+    itemId: "book / one", translationId: "translation / one",
+  });
+  await client.translations.replacePage({
+    itemId: "book / one", translationId: "translation / one",
+    selector: "page:7", text: "Nueva.",
+    documentRevision: "tr-current", sourceRevision: "ts-current",
+  });
+
+  assert.equal(calls[0].url,
+    "/api/v1/items/book%20%2F%20one/translations");
+  assert.equal(calls[0].init.method, "GET");
+  assert.equal(calls[1].url,
+    "/api/v1/items/book%20%2F%20one/translations/translation%20%2F%20one");
+  assert.equal(calls[1].init.method, "GET");
+  assert.equal(calls[2].url,
+    "/api/v1/items/book%20%2F%20one/translations/translation%20%2F%20one" +
+    "/pages/page%3A7");
+  assert.equal(calls[2].init.method, "PUT");
+  assert.equal(calls[2].init.headers["If-Match"], '"tr-current"');
+  assert.equal(calls[2].init.headers["If-Source-Match"], '"ts-current"');
+  assert.deepEqual(JSON.parse(calls[2].init.body), {
+    text: "Nueva.",
+    expected_document_revision: "tr-current",
+    expected_source_revision: "ts-current",
+  });
+});
+
+test("translation page writes reject missing revision tokens locally", () => {
+  const { client, calls } = harness();
+  assert.throws(() => client.translations.replacePage({
+    itemId: "book", translationId: "translation-1",
+    selector: "page:1", text: "Nueva.", sourceRevision: "ts-current",
+  }), /documentRevision/);
+  assert.throws(() => client.translations.replacePage({
+    itemId: "book", translationId: "translation-1",
+    selector: "page:1", text: "Nueva.", documentRevision: "tr-current",
+  }), /sourceRevision/);
+  assert.equal(calls.length, 0);
 });
 
 test("EngineClient encodes Replica path components and query values", async () => {
@@ -376,6 +423,26 @@ test("Replica workbench contains no direct transport or API route literals", () 
   const appScript = template.indexOf("filename='app.js'");
   assert.ok(clientScript >= 0 && clientScript < appScript,
     "engine-client.js loads before app.js");
+});
+
+test("Replica translation preview consumes aggregate summaries and selectors", () => {
+  const app = fs.readFileSync(appPath, "utf8");
+  const start = app.indexOf("async function rwLoadTranslations");
+  const end = app.indexOf("let rwRenderSeq", start);
+  assert.ok(start >= 0 && end > start);
+  const preview = app.slice(start, end);
+  assert.match(preview, /translations\.list\(\{\s*itemId:/);
+  assert.match(preview, /t\.id\s*&&\s*t\.target_language/);
+  assert.match(preview, /translations\.get\(\{[\s\S]*translationId:\s*layer/);
+  assert.match(preview, /translationPage\.selector/);
+  assert.match(preview, /sec\.get\(`page:\$\{page\}`\)/);
+  assert.doesNotMatch(preview, /ocrPageSections\(r\.text/);
+
+  const printStart = app.indexOf('el("rw-print").addEventListener');
+  const printEnd = app.indexOf('el("rw-import-file").addEventListener', printStart);
+  const print = app.slice(printStart, printEnd);
+  assert.match(print, /transSummaries\.find/);
+  assert.match(print, /summary\s*\?\s*summary\.target_language/);
 });
 
 test("the initial build load crosses the semantic item client boundary", () => {

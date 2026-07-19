@@ -103,6 +103,7 @@
       this.translations = Object.freeze({
         list: (args) => this._translationList(args),
         get: (args) => this._translationGet(args),
+        replacePage: (args) => this._translationReplacePage(args),
       });
       this.ocr = Object.freeze({
         layout: (args) => this._ocrLayout(args),
@@ -457,15 +458,36 @@
         });
     }
 
-    _translationList({ bookId, signal } = {}) {
-      return this._requestJson("GET", this._buildPath(bookId, "translations"), {
-        signal,
-      });
+    _translationList({ itemId, bookId, signal } = {}) {
+      const id = itemId != null ? itemId : bookId;
+      return this._requestJson("GET",
+        `/v1/items/${encodePart(id)}/translations`, { signal });
     }
 
-    _translationGet({ bookId, language, signal } = {}) {
-      return this._requestJson("GET", this._buildPath(bookId,
-        `translations/${encodePart(language)}`), { signal });
+    _translationGet({ itemId, bookId, translationId, signal } = {}) {
+      const id = itemId != null ? itemId : bookId;
+      return this._requestJson("GET",
+        `/v1/items/${encodePart(id)}/translations/${encodePart(translationId)}`,
+        { signal });
+    }
+
+    _translationReplacePage({ itemId, bookId, translationId, selector, text,
+      documentRevision, sourceRevision, signal } = {}) {
+      const id = itemId != null ? itemId : bookId;
+      return this._requestJson("PUT",
+        `/v1/items/${encodePart(id)}/translations/${encodePart(translationId)}` +
+        `/pages/${encodePart(selector)}`, {
+          headers: {
+            "If-Match": quoteRevision(documentRevision, "documentRevision"),
+            "If-Source-Match": quoteRevision(sourceRevision, "sourceRevision"),
+          },
+          body: {
+            text,
+            expected_document_revision: documentRevision,
+            expected_source_revision: sourceRevision,
+          },
+          signal,
+        });
     }
 
     _replicaPackageImport({ bookId, sourceId, file, overwrite = false,

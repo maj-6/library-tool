@@ -20,6 +20,7 @@ then open http://127.0.0.1:5001
 """
 from __future__ import annotations
 
+import base64
 import collections
 import contextlib
 import hashlib
@@ -73,6 +74,9 @@ from librarytool.adapters.lib_archive import (  # noqa: E402
 from librarytool.adapters.filesystem.interchange_repository import (  # noqa: E402
     FilesystemInterchangeRepository,
 )
+from librarytool.adapters.filesystem.translation_repository import (  # noqa: E402
+    FilesystemTranslationRepository,
+)
 from librarytool.adapters.filesystem.job_history import (  # noqa: E402
     FilesystemJobHistoryRepository,
 )
@@ -104,6 +108,7 @@ from librarytool.engine.errors import (  # noqa: E402
     EngineError,
     NotFoundError as EngineNotFoundError,
     PreconditionRequiredError as EnginePreconditionRequiredError,
+    RepositoryError as EngineRepositoryError,
     ValidationError as EngineValidationError,
 )
 from librarytool.engine.jobs import (  # noqa: E402
@@ -119,8 +124,14 @@ from librarytool.engine.interchange import (  # noqa: E402
 from librarytool.engine.replica import ReplicaApplicationService  # noqa: E402
 from librarytool.engine.runtime import LibraryEngine  # noqa: E402
 from librarytool.engine.text_layers import TextLayerService  # noqa: E402
+from librarytool.engine.translation_contracts import (  # noqa: E402
+    ReplaceTranslationPageCommand,
+    TranslationSourceCanvas,
+    TranslationSourceSnapshot,
+)
 from librarytool.engine.translations import (  # noqa: E402
     TranslationProvenanceService,
+    TranslationService,
 )
 from librarytool.engine.workbench_policies import (  # noqa: E402
     standard_workbench_policies,
@@ -129,8 +140,8 @@ from librarytool.engine.workbench_policies import (  # noqa: E402
 # Recover interrupted multi-artifact publication while the module is still
 # single-threaded. No request handler or background worker can observe or write
 # the workspace until this import-time barrier has completed.
-_interchange_write_set = RecoverableWriteSet(lib.OUTPUT_DIR)
-_interchange_write_set.recover_all()
+_engine_write_set = RecoverableWriteSet(lib.OUTPUT_DIR)
+_engine_write_set.recover_all()
 
 # NYPL Catalog of Copyright Entries dataset (optional, for the copyright tag's
 # registration half): drop the parsed XML tree under <DATA_ROOT>/nypl_cce/.
@@ -993,8 +1004,13 @@ _ENGINE_CAPABILITIES = CapabilityRegistry(
             requires=(CapabilityRef("library.items"),),
         ),
         ModuleManifest(
-            "translation.core", "1.0.0",
-            provides=(CapabilityRef("translation.provenance"),),
+            "translation.core", "2.0.0",
+            provides=(
+                CapabilityRef("translation.provenance"),
+                CapabilityRef("translation.layers.read"),
+                CapabilityRef("translation.layers.status"),
+                CapabilityRef("translation.layers.edit"),
+            ),
             requires=(CapabilityRef("library.items"),),
         ),
         ModuleManifest(
@@ -1018,6 +1034,9 @@ _ENGINE_CAPABILITIES = CapabilityRegistry(
                 CapabilityRef("replica.interchange", 2),
                 CapabilityRef("replica.layout-families"),
                 CapabilityRef("translation.provenance"),
+                CapabilityRef("translation.layers.read"),
+                CapabilityRef("translation.layers.status"),
+                CapabilityRef("translation.layers.edit"),
                 CapabilityRef("library.jobs"),
             ),
         ),
@@ -3175,8 +3194,301 @@ def _interchange_source_ids(item_id: str) -> tuple[str, ...] | None:
     return tuple(dict.fromkeys(values))
 
 
+_TRANSLATION_LAYER_PREFIX = "ocr."
+_TRANSLATION_SOURCE_PAGE = re.compile(
+    r"^--- page ([0-9]+) ---\r?$", re.MULTILINE)
+_TRANSLATION_PORTABLE_ID = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+def _translation_layer_id(document: str) -> str:
+    """Encode an OCR filename as a reversible, portable engine layer ID."""
+    if (not isinstance(document, str) or not document
+            or _ocr_name(document) != document
+            or "/" in document or "\\" in document):
+        raise EngineRepositoryError(
+            "the authoritative OCR document name is invalid",
+            code="invalid_translation_source_identity",
+            details={"document": str(document or "")},
+        )
+    try:
+        encoded = base64.urlsafe_b64encode(
+            document.encode("utf-8")).decode("ascii").rstrip("=")
+    except (UnicodeError, ValueError) as exc:
+        raise EngineRepositoryError(
+            "the authoritative OCR document name cannot be encoded",
+            code="invalid_translation_source_identity",
+        ) from exc
+    layer_id = _TRANSLATION_LAYER_PREFIX + encoded
+    if not _TRANSLATION_PORTABLE_ID.fullmatch(layer_id):
+        raise EngineRepositoryError(
+            "the authoritative OCR document name is too long",
+            code="invalid_translation_source_identity",
+            details={"document": document},
+        )
+    return layer_id
+
+
+def _translation_document_name(layer_id: str) -> str:
+    """Decode the exact legacy OCR filename represented by ``layer_id``."""
+    if (not isinstance(layer_id, str)
+            or not layer_id.startswith(_TRANSLATION_LAYER_PREFIX)):
+        raise EngineRepositoryError(
+            "the translation source layer is not an OCR document",
+            code="invalid_translation_source_identity",
+            details={"layer_id": str(layer_id or "")},
+        )
+    encoded = layer_id[len(_TRANSLATION_LAYER_PREFIX):]
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        raw = base64.b64decode(
+            encoded + padding, altchars=b"-_", validate=True)
+        document = raw.decode("utf-8")
+    except (ValueError, UnicodeError) as exc:
+        raise EngineRepositoryError(
+            "the translation source layer cannot be decoded",
+            code="invalid_translation_source_identity",
+            details={"layer_id": layer_id},
+        ) from exc
+    if _translation_layer_id(document) != layer_id:
+        raise EngineRepositoryError(
+            "the translation source layer is not canonical",
+            code="invalid_translation_source_identity",
+            details={"layer_id": layer_id},
+        )
+    return document
+
+
+def _translation_unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key {key!r}")
+        value[key] = item
+    return value
+
+
+def _translation_source_map(item_id: str) -> dict[str, str]:
+    """Read the OCR-to-PDF binding without permissive JSON fallbacks."""
+    path = _entry_dir(item_id) / "ocr" / "sources.json"
+    if not os.path.lexists(path):
+        return {}
+    lexical = Path(os.path.abspath(path))
+    try:
+        resolved = lexical.resolve()
+    except OSError as exc:
+        raise EngineRepositoryError(
+            "the OCR source map path cannot be resolved",
+            code="invalid_translation_source_snapshot",
+            details={"item_id": item_id, "artifact": "ocr/sources.json"},
+        ) from exc
+    if lexical != resolved or lexical.is_symlink():
+        raise EngineRepositoryError(
+            "the OCR source map path is unsafe",
+            code="invalid_translation_source_snapshot",
+            details={"item_id": item_id, "artifact": "ocr/sources.json"},
+        )
+    if not resolved.is_file():
+        raise EngineRepositoryError(
+            "the OCR source map is not a regular file",
+            code="invalid_translation_source_snapshot",
+            details={"item_id": item_id, "artifact": "ocr/sources.json"},
+        )
+    try:
+        value = json.loads(
+            resolved.read_bytes().decode("utf-8"),
+            object_pairs_hook=_translation_unique_object,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON number {token}")),
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise EngineRepositoryError(
+            "the OCR source map is malformed",
+            code="invalid_translation_source_snapshot",
+            details={"item_id": item_id, "artifact": "ocr/sources.json"},
+        ) from exc
+    if not isinstance(value, dict):
+        raise EngineRepositoryError(
+            "the OCR source map is not an object",
+            code="invalid_translation_source_snapshot",
+            details={"item_id": item_id, "artifact": "ocr/sources.json"},
+        )
+    result = {}
+    owners = {}
+    for document, source_id in value.items():
+        if (not isinstance(document, str) or _ocr_name(document) != document
+                or not isinstance(source_id, str)
+                or not _TRANSLATION_PORTABLE_ID.fullmatch(source_id)):
+            raise EngineRepositoryError(
+                "the OCR source map contains an invalid binding",
+                code="invalid_translation_source_snapshot",
+                details={"item_id": item_id,
+                         "artifact": "ocr/sources.json"},
+            )
+        folded = document.casefold()
+        if folded in owners and owners[folded] != document:
+            raise EngineRepositoryError(
+                "the OCR source map contains aliased document names",
+                code="invalid_translation_source_snapshot",
+                details={"item_id": item_id,
+                         "artifact": "ocr/sources.json",
+                         "documents": [owners[folded], document]},
+            )
+        owners[folded] = document
+        result[document] = source_id
+    return result
+
+
+def _translation_source_pages(item_id: str, document: str,
+                              payload: bytes) -> tuple[TranslationSourceCanvas, ...]:
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeError as exc:
+        raise EngineRepositoryError(
+            "the authoritative OCR document is not UTF-8",
+            code="invalid_translation_source_snapshot",
+            details={"item_id": item_id, "document": document},
+        ) from exc
+    markers = list(_TRANSLATION_SOURCE_PAGE.finditer(text))
+    if not markers:
+        stripped = text.strip()
+        pages = {1: stripped} if stripped else {}
+    else:
+        # ``_ocr_merge_page`` intentionally preserves arbitrary legacy
+        # preamble.  It has never belonged to a numbered page, so match
+        # ``_an_pages`` and ignore it while validating every actual marker.
+        pages = {}
+        for index, marker in enumerate(markers):
+            raw_page = marker.group(1)
+            if len(raw_page) > 123 or raw_page.startswith("0"):
+                raise EngineRepositoryError(
+                    "the authoritative OCR document has ambiguous page markers",
+                    code="invalid_translation_source_snapshot",
+                    details={"item_id": item_id, "document": document,
+                             "page": raw_page[:128]},
+                )
+            page = int(raw_page)
+            if page < 1 or str(page) != raw_page or page in pages:
+                raise EngineRepositoryError(
+                    "the authoritative OCR document has ambiguous page markers",
+                    code="invalid_translation_source_snapshot",
+                    details={"item_id": item_id, "document": document,
+                             "page": raw_page},
+                )
+            end = (markers[index + 1].start()
+                   if index + 1 < len(markers) else len(text))
+            pages[page] = text[marker.end():end].strip()
+    return tuple(
+        TranslationSourceCanvas(
+            selector=f"page:{page}", order=order,
+            label=str(page), text=page_text,
+        )
+        for order, (page, page_text) in enumerate(sorted(pages.items()))
+    )
+
+
+def _translation_source_snapshot(
+        item_id: str, reference: str) -> TranslationSourceSnapshot | None:
+    """Return one strict, authoritative OCR snapshot for the engine adapter."""
+    builds = lib.load_json(BUILDS_PATH, {})
+    build = builds.get(item_id) if isinstance(builds, dict) else None
+    if not isinstance(build, dict):
+        return None
+
+    document = str(reference or "")
+    if not document:
+        ocr_dir = _entry_dir(item_id) / "ocr"
+        for candidate in (build.get("ocr_verified"), build.get("ocr_active"),
+                          "compiled.txt", "extracted.txt"):
+            candidate = _ocr_name(candidate) if candidate else ""
+            if candidate and os.path.lexists(ocr_dir / candidate):
+                document = candidate
+                break
+    if not document:
+        return None
+    layer_id = _translation_layer_id(document)
+
+    ocr_root = Path(os.path.abspath(_entry_dir(item_id) / "ocr"))
+    candidate = Path(os.path.abspath(ocr_root / document))
+    if not os.path.lexists(candidate):
+        return None
+    try:
+        resolved_root = ocr_root.resolve()
+        resolved = candidate.resolve()
+    except OSError as exc:
+        raise EngineRepositoryError(
+            "the authoritative OCR document path cannot be resolved",
+            code="translation_source_read_failed",
+            details={"item_id": item_id, "document": document},
+        ) from exc
+    if (candidate != resolved or resolved.parent != resolved_root
+            or candidate.is_symlink()):
+        raise EngineRepositoryError(
+            "the authoritative OCR document path is unsafe",
+            code="invalid_translation_source_snapshot",
+            details={"item_id": item_id, "document": document},
+        )
+    if not resolved.is_file():
+        raise EngineRepositoryError(
+            "the authoritative OCR document is not a regular file",
+            code="invalid_translation_source_snapshot",
+            details={"item_id": item_id, "document": document},
+        )
+
+    sources = _translation_source_map(item_id)
+    if document not in sources:
+        alias = next(
+            (name for name in sources if name.casefold() == document.casefold()),
+            "",
+        )
+        if alias:
+            raise EngineRepositoryError(
+                "the OCR source map aliases the selected document name",
+                code="invalid_translation_source_snapshot",
+                details={"item_id": item_id, "document": document,
+                         "mapped_document": alias},
+            )
+    source_id = sources.get(document, "primary")
+    live_sources = set(_interchange_source_ids(item_id) or ())
+    if (not _TRANSLATION_PORTABLE_ID.fullmatch(source_id)
+            or source_id not in live_sources):
+        raise EngineRepositoryError(
+            "the OCR document names an unavailable representation",
+            code="invalid_translation_source_snapshot",
+            details={"item_id": item_id, "document": document,
+                     "representation_id": source_id},
+        )
+    try:
+        payload = resolved.read_bytes()
+    except OSError as exc:
+        raise EngineRepositoryError(
+            "the authoritative OCR document cannot be read",
+            code="translation_source_read_failed",
+            details={"item_id": item_id, "document": document},
+            retryable=True,
+        ) from exc
+    try:
+        return TranslationSourceSnapshot(
+            item_id=item_id,
+            layer_id=layer_id,
+            representation_id=source_id,
+            canvases=_translation_source_pages(item_id, document, payload),
+        )
+    except (TypeError, ValueError) as exc:
+        raise EngineRepositoryError(
+            "the authoritative OCR document cannot be represented safely",
+            code="invalid_translation_source_snapshot",
+            details={"item_id": item_id, "document": document},
+        ) from exc
+
+
+def _translation_item_exists(item_id: str) -> bool:
+    builds = lib.load_json(BUILDS_PATH, {})
+    return isinstance(builds, dict) and isinstance(builds.get(item_id), dict)
+
+
 @contextlib.contextmanager
-def _interchange_locks(_item_id: str):
+def _engine_workspace_locks(_item_id: str):
     """Bridge legacy writers into the workspace lease's lock order."""
 
     with _page_structure_lock:
@@ -3240,13 +3552,23 @@ def _library_engine() -> LibraryEngine:
                     ),
                 )
                 interchange_repository = FilesystemInterchangeRepository(
-                    _interchange_write_set,
+                    _engine_write_set,
                     entry_directory_for=_entry_dir,
                     source_ids_for=_interchange_source_ids,
                     clean_region_id=libformat.clean_rid,
                     normalize_language=_lang_code,
                     sanitize_document_name=_ocr_name,
-                    lock_context_for=_interchange_locks,
+                    lock_context_for=_engine_workspace_locks,
+                    recover=False,
+                )
+                translation_repository = FilesystemTranslationRepository(
+                    _engine_write_set,
+                    entry_directory_for=_entry_dir,
+                    item_exists_for=_translation_item_exists,
+                    source_snapshot_for=_translation_source_snapshot,
+                    source_reference_for=lambda source:
+                        _translation_document_name(source.layer_id),
+                    lock_context_for=_engine_workspace_locks,
                     recover=False,
                 )
                 _library_engine_instance = LibraryEngine(
@@ -3258,6 +3580,8 @@ def _library_engine() -> LibraryEngine:
                     jobs=_job_manager,
                     replica=replica,
                     text_layers=text_layers,
+                    translations=TranslationService(
+                        _EngineItemRepository(), translation_repository),
                     translation_provenance=_translation_provenance,
                 )
     return _library_engine_instance
@@ -3367,6 +3691,86 @@ def _item_engine() -> ItemQueryService:
             code="item_query_unavailable", retryable=True,
         )
     return items
+
+
+def _translation_engine() -> TranslationService:
+    translations = _library_engine().translations
+    if translations is None:
+        raise EngineError(
+            "the translation module is unavailable",
+            code="translation_module_unavailable", retryable=True,
+        )
+    return translations
+
+
+def _translation_revision_token(payload: dict, header: str, field: str) -> str:
+    """Read one strong header validator or portable JSON revision field."""
+    if header in request.headers:
+        raw = request.headers.get(header)
+        value = raw.strip() if isinstance(raw, str) else ""
+        if value.startswith("W/") or not (
+                len(value) >= 2 and value[0] == '"' and value[-1] == '"'
+                and '"' not in value[1:-1]
+                and "\\" not in value[1:-1]):
+            raise EngineValidationError(
+                f"{header} must contain one strong quoted revision",
+                code="invalid_translation_page_update",
+                details={"header": header, "field": field},
+            )
+        value = value[1:-1]
+    else:
+        raw = payload.get(field)
+        if raw is None or raw == "":
+            return ""
+        if not isinstance(raw, str):
+            raise EngineValidationError(
+                f"{field} must be a portable revision",
+                code="invalid_translation_page_update",
+                details={"header": header, "field": field},
+            )
+        value = raw
+    if not _TRANSLATION_PORTABLE_ID.fullmatch(value):
+        raise EngineValidationError(
+            f"{field} must be a portable revision",
+            code="invalid_translation_page_update",
+            details={"header": header, "field": field},
+        )
+    return value
+
+
+def _translation_preconditions(payload: dict) -> tuple[str, str]:
+    document_revision = _translation_revision_token(
+        payload, "If-Match", "expected_document_revision")
+    source_revision = _translation_revision_token(
+        payload, "If-Source-Match", "expected_source_revision")
+    missing = []
+    if not document_revision:
+        missing.append({"header": "If-Match",
+                        "field": "expected_document_revision"})
+    if not source_revision:
+        missing.append({"header": "If-Source-Match",
+                        "field": "expected_source_revision"})
+    if missing:
+        raise EnginePreconditionRequiredError(
+            "translation document and source preconditions are required",
+            code="translation_preconditions_required",
+            details={"required": missing},
+        )
+    return document_revision, source_revision
+
+
+def _translation_json_response(body: dict, *, view_revision: str,
+                               document_revision: str = "",
+                               source_revision: str = "",
+                               conditional: bool = False):
+    response = jsonify(body)
+    response.set_etag(view_revision)
+    response.cache_control.no_cache = True
+    if document_revision:
+        response.headers["X-Document-Revision"] = document_revision
+    if source_revision:
+        response.headers["X-Source-Revision"] = source_revision
+    return response.make_conditional(request) if conditional else response
 
 
 def _item_projection() -> str:
@@ -3487,6 +3891,91 @@ def api_v1_item_readiness(item_id: str):
         "ok": True, "schema": "librarytool.workbench-state/1",
         "item_id": item_id, "state": state,
     }, state["revision"])
+
+
+@app.route("/api/v1/items/<item_id>/translations")
+def api_v1_item_translations(item_id: str):
+    """List provider-neutral translation summaries for one item."""
+    try:
+        rows = [value.as_dict()
+                for value in _translation_engine().list(item_id)]
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    revision = _item_response_revision("tlc", rows)
+    return _translation_json_response({
+        "ok": True,
+        "schema": "librarytool.translation-summaries/1",
+        "item_id": item_id,
+        "translations": rows,
+        "revision": revision,
+    }, view_revision=revision, conditional=True)
+
+
+@app.route("/api/v1/items/<item_id>/translations/<translation_id>")
+def api_v1_item_translation(item_id: str, translation_id: str):
+    """Read a coherent translation document and authoritative source view."""
+    try:
+        view = _translation_engine().get(item_id, translation_id)
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    return _translation_json_response({
+        "ok": True,
+        "schema": "librarytool.translation/1",
+        "translation": view.as_dict(),
+    }, view_revision=view.view_revision,
+        document_revision=view.document_revision,
+        source_revision=view.source.revision,
+        conditional=True)
+
+
+@app.route(
+    "/api/v1/items/<item_id>/translations/<translation_id>/pages/<selector>",
+    methods=["PUT"],
+)
+def api_v1_item_translation_page(
+        item_id: str, translation_id: str, selector: str):
+    """Replace one human translation page under document and source CAS."""
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return _engine_error_response(EngineValidationError(
+            "a translation page update must be a JSON object",
+            code="invalid_translation_page_update",
+        ))
+    if "text" not in payload or not isinstance(payload.get("text"), str):
+        return _engine_error_response(EngineValidationError(
+            "translation page text must be a string",
+            code="invalid_translation_page_text",
+            details={"field": "text"},
+        ))
+    try:
+        document_revision, source_revision = _translation_preconditions(payload)
+        try:
+            command = ReplaceTranslationPageCommand(
+                item_id=item_id,
+                translation_id=translation_id,
+                selector=selector,
+                text=payload["text"],
+                expected_document_revision=document_revision,
+                expected_source_revision=source_revision,
+            )
+        except (TypeError, ValueError) as exc:
+            raise EngineValidationError(
+                "the translation page update is invalid",
+                code="invalid_translation_page_update",
+                details={"item_id": item_id,
+                         "translation_id": translation_id,
+                         "selector": selector},
+            ) from exc
+        view = _translation_engine().replace_page(command)
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    return _translation_json_response({
+        "ok": True,
+        "schema": "librarytool.translation/1",
+        "translation": view.as_dict(),
+    }, view_revision=view.view_revision,
+        document_revision=view.document_revision,
+        source_revision=view.source.revision)
 
 
 @app.route("/api/builds/<build_id>/ocr-regions")

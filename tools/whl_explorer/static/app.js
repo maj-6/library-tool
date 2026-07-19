@@ -20157,9 +20157,9 @@ const rwState = {
   styles: null,     // role -> type mapping (replica-style endpoint)
   stylesCustom: false,
   styleDirty: false, styleSaving: false, styleVersion: 0,
-  previewLang: "",  // "" diplomatic | "norm" | a translation lang code
-  transLangs: [],   // this book's page-aligned translation languages
-  transCache: {},   // lang -> parsed page sections
+  previewLang: "",  // "" diplomatic | "norm" | a translation aggregate ID
+  transSummaries: [], // provider-neutral page-aligned translation summaries
+  transCache: {},   // translation ID -> selector/text map
   drag: null,       // {kind: move|resize|draw, id, corner, start, box0, moved}
   lastPos: null,    // pointer in page fractions — the split guide
   seq: 0, pagesSeq: 0, pageSeq: 0, idSeq: 0, ridSeq: 0,
@@ -20352,7 +20352,7 @@ async function selectReplicaBook(bid) {
   rwState.templates = [];
   rwState.styles = null; rwState.stylesCustom = false;
   rwState.styleDirty = false; rwState.styleSaving = false; rwState.styleVersion = 0;
-  rwState.transLangs = []; rwState.transCache = {}; rwState.previewLang = "";
+  rwState.transSummaries = []; rwState.transCache = {}; rwState.previewLang = "";
   rwState.instrLoaded = false; rwState.instrDirty = false;
   rwState.instrSaving = false; rwState.instrVersion = 0;
   rwState.outliers = [];   // the last scan flagged ANOTHER book's pages
@@ -20446,7 +20446,7 @@ async function selectReplicaSource(source) {
   const repairs = [];
   if (!rwState.styles && !rwState.styleDirty) repairs.push(rwLoadStyles(seq));
   if (!rwState.instrLoaded && !rwState.instrDirty) repairs.push(rwLoadInstructions(seq));
-  if (!rwState.transLangs.length) repairs.push(rwLoadTranslations(seq));
+  if (!rwState.transSummaries.length) repairs.push(rwLoadTranslations(seq));
   if (repairs.length) await Promise.all(repairs);
   if (seq !== rwState.seq) return false;
   rwSyncBar();
@@ -21589,19 +21589,21 @@ async function rwLoadStyles(seq) {
 }
 
 async function rwLoadTranslations(seq) {
-  let langs = [];
+  let translations = [];
   try {
-    const r = await engineClient.translations.list({ bookId: rwState.book });
-    if (r.ok) langs = (r.translations || []).map((t) => t.lang);
+    const r = await engineClient.translations.list({ itemId: rwState.book });
+    if (r.ok) translations = (r.translations || []).filter((t) =>
+      t && t.id && t.target_language);
   } catch (e) { /* no translations */ }
   if (seq !== rwState.seq) return;
-  rwState.transLangs = langs;
+  rwState.transSummaries = translations;
   rwState.transCache = {};
   rwState.previewLang = "";
   el("rw-preview-lang").innerHTML =
     ['<option value="">diplomatic</option>',
      '<option value="norm">normalized</option>',
-     ...langs.map((l) => `<option value="${esc(l)}">${esc(l)}</option>`)].join("");
+     ...translations.map((t) =>
+       `<option value="${esc(t.id)}">${esc(t.target_language)}</option>`)].join("");
 }
 
 // split translated text across the page's body regions, weighted by their
@@ -21630,36 +21632,35 @@ function rwDistribute(text, weights) {
 
 async function rwPreviewTexts(items) {
   const map = new Map();
-  const lang = rwState.previewLang;
+  const layer = rwState.previewLang;
   const book = rwState.book, page = rwState.page, seq = rwState.seq;
-  if (lang === "norm") {
+  if (layer === "norm") {
     items.forEach((i) => map.set(i.id, i.norm || i.text));
     return map;
   }
-  if (!lang) {
+  if (!layer) {
     items.forEach((i) => map.set(i.id, i.text));
     return map;
   }
-  let sec = rwState.transCache[lang];
+  let sec = rwState.transCache[layer];
   if (sec === undefined) {
     let ok = false;
     try {
       const r = await engineClient.translations.get({
-        bookId: book, language: lang,
+        itemId: book, translationId: layer,
       });
-      if (r.ok) {
-        // a marker-less translation is a one-page doc, like _an_pages
-        sec = ocrPageSections(r.text || "") ||
-              { pre: "", map: new Map(r.text ? [[1, r.text]] : []) };
+      if (r.ok && r.translation) {
+        sec = new Map((r.translation.pages || []).map((translationPage) =>
+          [translationPage.selector, translationPage.text || ""]));
         ok = true;
       }
     } catch (e) { /* transient — retry on the next render */ }
     if (ok && seq === rwState.seq && book === rwState.book) {
-      rwState.transCache[lang] = sec;   // failures are never cached
+      rwState.transCache[layer] = sec;   // failures are never cached
     }
     else sec = null;
   }
-  const t = sec && sec.map ? sec.map.get(page) || "" : "";
+  const t = sec instanceof Map ? sec.get(`page:${page}`) || "" : "";
   const bodies = items.filter((i) => i.role === "body");
   const dist = rwDistribute(t, bodies.map((b) => Math.max(1, b.text.length)));
   bodies.forEach((b, i) => map.set(b.id, dist[i]));
@@ -22050,8 +22051,11 @@ function initReplica() {
   el("rw-print").addEventListener("click", () => {
     if (!rwState.book || !rwState.regionPages.length || rwHasUnsaved() ||
         rwState.saving || (rwState.page && !rwState.pageLoaded)) return;
-    // the preview's layer selector decides which text prints
-    const layer = rwState.previewLang;
+    // The engine preview selects a storage-neutral aggregate ID; the legacy
+    // print renderer still addresses a translation by its language filename.
+    const summary = rwState.transSummaries.find(
+      (translation) => translation.id === rwState.previewLang);
+    const layer = summary ? summary.target_language : rwState.previewLang;
     window.open(engineClient.replica.printUrl({
       bookId: rwState.book, sourceId: rwState.src, layer,
     }), "_blank");
