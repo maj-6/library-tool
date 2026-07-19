@@ -25,10 +25,9 @@ function functionSource(name) {
   const asyncStart = source.indexOf(`async function ${name}(`);
   const at = start >= 0 ? start : asyncStart;
   assert.ok(at >= 0, name + " is present in app.js");
-  const tail = source.slice(at);
-  const closing = tail.match(/\r?\n}\r?\n/);
-  assert.ok(closing && closing.index > 0, name + " has a closing brace");
-  return tail.slice(0, closing.index + closing[0].indexOf("}") + 1);
+  const end = source.indexOf("\n}\n", at);
+  assert.ok(end > at, name + " has a closing brace");
+  return source.slice(at, end + 2);
 }
 
 test("rwDistribute splits by weight at paragraph bounds and survives edges", () => {
