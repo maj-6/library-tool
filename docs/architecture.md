@@ -9,12 +9,20 @@ Per-component detail lives in each part's own README (map at the end).
   services, contracts, capability manifests, and storage ports. It imports
   neither Flask nor the transitional `tools` modules, and it does not resolve
   `DATA_ROOT` or create files at package-import time. `LibraryEngine` carries
-  the assembled optional service graph, but the only production assembly code
-  still lives in `tools/whl_explorer/server.py`; extracting that wiring into a
-  headless composition root is required before a CLI, Qt, Godot, or another
-  transport can bootstrap the same graph without importing Flask. The Flask
-  sidecar is currently both that composition host and a compatibility
-  transport, while browser workbenches cross one semantic `EngineClient`.
+  an immutable, versioned service registry assembled from installed module
+  contributions. The filesystem production graph is now composed by
+  `src/librarytool/composition/filesystem.py`, which selects adapters from
+  injected paths, codecs, locks, jobs, policies, and provider ports without
+  importing Flask or performing import-time I/O. The Flask sidecar delegates
+  to that composition root and remains the lifecycle/recovery host plus a
+  compatibility transport. A CLI, Qt, Godot, or another host can therefore
+  compose the same graph without importing Flask, although a reusable host
+  bootstrap for recovery, job-history startup, configuration, and shutdown is
+  still needed before those clients are turnkey. Module-owned item policies
+  are selected by the same capability resolution as services, so absent OCR,
+  translation-generation, research, or publishing components do not leak
+  commands into item views. Browser workbenches cross one semantic
+  `EngineClient`.
   Installed capabilities and available/degraded/blocked workbenches are
   discoverable at `/api/v1/capabilities`. Background processors share the
   engine's `JobManager` lifecycle, cancellation, restart recovery, typed views,

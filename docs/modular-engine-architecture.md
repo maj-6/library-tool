@@ -56,9 +56,12 @@ larger workbench and packaging split described below remains the target:
   reports available, degraded, or blocked modules/workbenches through
   `/api/v1/capabilities`. This is the first executable foundation for a future
   launcher hiding tools whose required components are absent. Modules are
-  independently composable in the service graph today, but they are still
-  shipped together; separately installable packages and signed bundles remain
-  a packaging milestone, not a current product claim.
+  independently composable in a validated, immutable service registry today.
+  Module-owned item readiness and command policies follow the same resolution:
+  a blocked owner or missing required capability withholds its policies as well
+  as its services and workbenches. Modules are still shipped together;
+  separately installable packages and signed bundles remain a packaging
+  milestone, not a current product claim.
 - The catalogue spine now has framework-neutral, immutable item,
   representation, artifact, and workbench-state queries. Item responses carry
   separate record and aggregate revisions, derive artifact freshness from
@@ -119,12 +122,17 @@ larger workbench and packaging split described below remains the target:
 - Source execution, editable package installation, tests, and the PyInstaller
   sidecar now all include `src/`, so this boundary is part of the shipped
   runtime rather than a test-only package.
-- `LibraryEngine` is a transport-neutral service container, but production
-  adapter selection, legacy codecs, path resolution, lock injection, recovery,
-  and capability registration are still assembled inside
-  `tools/whl_explorer/server.py`. A reusable headless composition root has not
-  yet been extracted; alternate frontends cannot bootstrap the production
-  engine without importing the Flask application today.
+- `LibraryEngine` is now built from versioned `ServiceKey` bindings and sealed
+  module contributions. The reusable filesystem composition root selects and
+  validates the production query, command, Replica, text-layer, translation,
+  interchange, provenance, and job services without Flask imports or hidden
+  global path discovery. It rejects unfinished recovery state, unsafe or
+  overlapping storage paths, redirecting entry trees, incomplete bindings,
+  and item identities that another service in the graph could not address.
+  Production `server.py` delegates its service construction to this root while
+  retaining startup recovery, singleton lifetime, legacy codecs, and callback
+  bindings. Alternate hosts can compose the graph directly; sharing the full
+  production lifecycle still requires the next host-bootstrap extraction.
 
 The automatic family detector is deliberately a proposal query. It clusters
 geometry and semantic roles, identifies medoid exemplars, separates recurring
@@ -196,12 +204,22 @@ the same scopes even if it does not use HTTP header syntax.
 
 ### Production composition and ranked next boundaries
 
-The next architectural extraction is a reusable headless composition root.
-It should accept runtime configuration and installed-module descriptors,
-select adapters and provider ports, run workspace recovery, and return one
-`LibraryEngine` without importing Flask. Flask should receive that object just
-like a CLI daemon, Qt manager, Godot facsimile editor, or test harness. This is
-the practical test that `server.py` is a transport rather than the application.
+The reusable, Flask-free filesystem graph composer now accepts explicit paths,
+shared resources, compatibility callbacks, provider ports, and installed
+module contributions and returns one validated `LibraryEngine`. Production
+Flask receives that object, and headless tests compose independent engines
+without importing the server. Composition deliberately does not perform
+recovery, create global resources, start workers, or own shutdown; it verifies
+that the host has settled recovery before exposing services.
+
+The next architectural extraction is therefore a small transport-neutral host
+bootstrap above this composer. It should accept runtime configuration, open
+the recoverable workspace and persisted job history, perform startup recovery,
+select installed module/provider descriptors, compose one engine, and close
+its resources deterministically. Flask, a CLI daemon, Qt manager, Godot
+facsimile editor, or a test harness should differ only in the transport and
+lifecycle policy they place around that host. Legacy codecs can remain
+injected compatibility adapters while their data verticals migrate.
 
 After that composition seam, migrate these data boundaries in order:
 
@@ -908,8 +926,9 @@ These phases describe dependency order, not a list of wholly unstarted work.
 The implementation baseline above records the partial completion of Phases
 0–3: the engine package, several filesystem adapters and services, capability
 and job contracts, selected `/api/v1` resources, and `EngineClient` exist.
-Headless production bootstrap, complete vertical migration, a reference CLI,
-the launcher/workbench split, and physical module bundles remain outstanding.
+Framework-neutral production graph composition now exists. A reusable
+lifecycle bootstrap, complete vertical migration, a reference CLI, the
+launcher/workbench split, and physical module bundles remain outstanding.
 
 ### Phase 0: record behavior and contracts
 
