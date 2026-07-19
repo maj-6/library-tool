@@ -25,6 +25,7 @@ from ..adapters.filesystem import (
     FilesystemInterchangeRepository,
     FilesystemItemCommandRepository,
     FilesystemItemLifecycleRepository,
+    FilesystemItemLifecycleReservationRepository,
     FilesystemItemQueryRepository,
     FilesystemOpenLibRepository,
     FilesystemReplicaRepository,
@@ -431,6 +432,14 @@ def compose_filesystem_engine(
         lock_context_for=resources.workspace_lock_context_for,
         recover=False,
     )
+    # Lifecycle commands are optional, but their namespaced persistent state
+    # remains authoritative if the module is later disabled or uninstalled.
+    # The narrow reader is empty on a workspace that has never used lifecycle
+    # commands and requires no lifecycle service dependency or host lock.
+    identity_reservations = FilesystemItemLifecycleReservationRepository(
+        resources.write_set
+    )
+    load_identity_reservations = identity_reservations.load
     item_command_repository = FilesystemItemCommandRepository(
         resources.write_set,
         catalogue_path=catalogue_path,
@@ -438,6 +447,7 @@ def compose_filesystem_engine(
         encode_record=catalogue.encode_record,
         allocate_item_id=catalogue.allocate_item_id,
         validate_item_id=entry_directory_for.validate_item_id,
+        load_identity_reservations=load_identity_reservations,
         lock_context_for=catalogue.lock_context_for,
         recover=False,
     )
@@ -480,6 +490,7 @@ def compose_filesystem_engine(
             clean_region_id=interchange.clean_region_id,
             normalize_language=interchange.normalize_language,
             validate_item_id=entry_directory_for.validate_item_id,
+            load_identity_reservations=load_identity_reservations,
             sanitize_document_name=interchange.sanitize_document_name,
             lock_context_for=lambda: resources.workspace_lock_context_for(""),
             recover=False,

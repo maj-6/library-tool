@@ -28,6 +28,7 @@ from .item_command_repository import (
     FilesystemItemCommandRepository,
     FilesystemItemCommandUnitOfWork,
     ItemIdAllocator,
+    ItemIdentityReservationLoader,
     ItemIdValidator,
     RecordDecoder,
     RecordEncoder,
@@ -59,6 +60,7 @@ class FilesystemOpenLibRepository:
         clean_region_id: Callable[[Any], str],
         normalize_language: Callable[[str], str],
         validate_item_id: ItemIdValidator | None = None,
+        load_identity_reservations: ItemIdentityReservationLoader | None = None,
         sanitize_document_name: Callable[[str], str] | None = None,
         lock_context_for: LockContextFactory | None = None,
         recover: bool = True,
@@ -79,6 +81,10 @@ class FilesystemOpenLibRepository:
             sanitize_document_name
         ):
             raise TypeError("sanitize_document_name must be callable")
+        if load_identity_reservations is not None and not callable(
+            load_identity_reservations
+        ):
+            raise TypeError("load_identity_reservations must be callable")
         if lock_context_for is not None and not callable(lock_context_for):
             raise TypeError("lock_context_for must be callable")
 
@@ -98,6 +104,7 @@ class FilesystemOpenLibRepository:
             encode_record=encode_record,
             allocate_item_id=allocate_item_id,
             validate_item_id=validate_item_id,
+            load_identity_reservations=load_identity_reservations,
             recover=False,
         )
         self._catalogue_relative = self._items.catalogue_relative

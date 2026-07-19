@@ -31,7 +31,11 @@ from librarytool.composition.filesystem import (
 from librarytool.engine.capabilities import CapabilityRef, ModuleManifest
 from librarytool.engine.contracts import ItemDescriptor
 from librarytool.engine.errors import ConflictError, RepositoryError
-from librarytool.engine.interchange import LibImportPlannerPort
+from librarytool.engine.interchange import (
+    LibImportPlan,
+    LibImportPlannerPort,
+    OpenLibCommand,
+)
 from librarytool.engine.item_commands import (
     CreateItemCommand,
     DeleteItemCommand as CatalogueDeleteItemCommand,
@@ -344,6 +348,7 @@ def _composition(
     unfinished: bool = False,
     allocate_item_id=lambda _existing: "new-book",
     load_snapshot=None,
+    lib_planner=None,
     open_item_draft_for=lambda metadata: ItemDraft(
         title=str(metadata.get("title") or "")
     ),
@@ -379,7 +384,11 @@ def _composition(
     descriptors = _Descriptors()
     policies = cast(ReplicaPolicyPort, object())
     text_repository = cast(TextLayerRepositoryPort, object())
-    planner = cast(LibImportPlannerPort, object())
+    planner = (
+        cast(LibImportPlannerPort, object())
+        if lib_planner is None
+        else lib_planner
+    )
 
     engine = compose_filesystem_engine(
         paths=paths,
@@ -606,6 +615,78 @@ def test_generic_host_omits_item_lifecycle_without_explicit_bindings(tmp_path):
         engine.items.get_item("book-one").workbench_state.available_commands
     )
 
+    created = engine.item_commands.create(
+        CreateItemCommand(ItemDraft(title="No lifecycle"), "create-plain")
+    )
+    assert created.receipt.item_id == "new-book"
+
+
+def test_lifecycle_absent_composition_preserves_existing_identity_reservations(
+    tmp_path,
+):
+    first = _composition(
+        tmp_path,
+        lifecycle=ItemLifecycleBindings(
+            advance_restored_record=_advance_restored_record
+        ),
+        contribution_factory=_optional_lifecycle_contributions,
+    )
+    catalogue_path = first["paths"].catalogue
+    catalogue_path.parent.mkdir(parents=True, exist_ok=True)
+    catalogue_path.write_text(
+        json.dumps(
+            {
+                "book-one": {
+                    "id": "book-one",
+                    "revision": "record-1",
+                    "title": "Herbal",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    lifecycle = first["engine"].require_service(ITEM_LIFECYCLE_SERVICE)
+    state = lifecycle.inspect("book-one")
+    deletion = lifecycle.delete(
+        DeleteItemCommand(
+            "book-one",
+            state.item.revision,
+            state.managed_tree.revision,
+            "delete-before-plain-host",
+        )
+    )
+    tombstone_id = deletion.receipt.tombstone.tombstone_id
+    envelope_path = (
+        first["write_set"].root
+        / ".engine"
+        / "lifecycle"
+        / "item-tombstones-v1"
+        / "envelopes"
+        / f"{tombstone_id}.json"
+    )
+    preserved_envelope = envelope_path.read_bytes()
+    allocations: list[frozenset[str]] = []
+
+    def allocate(existing: frozenset[str]) -> str:
+        allocations.append(existing)
+        aliases = {item_id.casefold() for item_id in existing}
+        return "BOOK-ONE" if "book-one" not in aliases else "plain-new"
+
+    plain = _composition(
+        tmp_path,
+        allocate_item_id=allocate,
+        lifecycle=None,
+    )["engine"]
+    created = plain.item_commands.create(
+        CreateItemCommand(ItemDraft(title="Plain host"), "plain-create")
+    )
+
+    assert plain.get_service(ITEM_LIFECYCLE_SERVICE) is None
+    assert created.receipt.item_id == "plain-new"
+    assert allocations == [frozenset({"book-one"})]
+    assert set(json.loads(catalogue_path.read_text("utf-8"))) == {"plain-new"}
+    assert envelope_path.read_bytes() == preserved_envelope
+
 
 def test_lifecycle_service_authority_and_policy_require_declaration(tmp_path):
     bindings = ItemLifecycleBindings(
@@ -713,6 +794,102 @@ def test_composed_lifecycle_preflight_and_job_guard_are_authoritative(tmp_path):
             )
         )
     assert legacy.value.code == "item_lifecycle_command_required"
+
+
+def test_composed_create_retries_past_active_lifecycle_identity(tmp_path):
+    allocations: list[frozenset[str]] = []
+
+    class Planner:
+        calls = 0
+
+        def plan(
+            self,
+            _archive,
+            _destination,
+            *,
+            source_id,
+            overwrite,
+            archive_sha256,
+        ):
+            self.calls += 1
+            assert source_id == "primary"
+            assert overwrite is False
+            return LibImportPlan(
+                archive_sha256=archive_sha256,
+                format_version="2.0",
+                manifest_metadata={"title": "Opened archive"},
+            )
+
+    planner = Planner()
+
+    def allocate(existing: frozenset[str]) -> str:
+        allocations.append(existing)
+        aliases = {item_id.casefold() for item_id in existing}
+        for candidate in ("BOOK-ONE", "new-book", "opened-book"):
+            if candidate.casefold() not in aliases:
+                return candidate
+        raise AssertionError("test allocator exhausted")
+
+    composed = _composition(
+        tmp_path,
+        allocate_item_id=allocate,
+        lifecycle=ItemLifecycleBindings(
+            advance_restored_record=_advance_restored_record
+        ),
+        lib_planner=planner,
+        contribution_factory=_optional_lifecycle_contributions,
+    )
+    catalogue_path = composed["paths"].catalogue
+    catalogue_path.parent.mkdir(parents=True, exist_ok=True)
+    catalogue_path.write_text(
+        json.dumps(
+            {
+                "book-one": {
+                    "id": "book-one",
+                    "revision": "record-1",
+                    "title": "Herbal",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    engine = composed["engine"]
+    lifecycle = engine.require_service(ITEM_LIFECYCLE_SERVICE)
+    state = lifecycle.inspect("book-one")
+    lifecycle.delete(
+        DeleteItemCommand(
+            "book-one",
+            state.item.revision,
+            state.managed_tree.revision,
+            "delete-before-create",
+        )
+    )
+
+    created = engine.item_commands.create(
+        CreateItemCommand(
+            ItemDraft(title="Replacement identity"),
+            "create-after-delete",
+        )
+    )
+
+    assert created.receipt.item_id == "new-book"
+    assert allocations == [frozenset({"book-one"})]
+    assert set(json.loads(catalogue_path.read_text("utf-8"))) == {"new-book"}
+
+    opened = engine.require_service(LIB_OPEN_SERVICE).open_lib(
+        OpenLibCommand(b"archive", "open-after-delete")
+    )
+
+    assert opened.item_id == "opened-book"
+    assert allocations == [
+        frozenset({"book-one"}),
+        frozenset({"book-one", "new-book"}),
+    ]
+    assert planner.calls == 1
+    assert set(json.loads(catalogue_path.read_text("utf-8"))) == {
+        "new-book",
+        "opened-book",
+    }
 
 
 def test_composed_engine_queries_without_a_transport_context(tmp_path):

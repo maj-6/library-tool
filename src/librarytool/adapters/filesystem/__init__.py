@@ -5,6 +5,7 @@ from .item_command_repository import FilesystemItemCommandRepository
 from .item_lifecycle_repository import (
     EMPTY_MANAGED_TREE_REVISION,
     FilesystemItemLifecycleRepository,
+    FilesystemItemLifecycleReservationRepository,
 )
 from .item_repository import FilesystemItemQueryRepository
 from .interchange_repository import FilesystemInterchangeRepository
@@ -34,6 +35,7 @@ __all__ = [
     "EMPTY_MANAGED_TREE_REVISION",
     "FilesystemItemCommandRepository",
     "FilesystemItemLifecycleRepository",
+    "FilesystemItemLifecycleReservationRepository",
     "FilesystemItemQueryRepository",
     "FilesystemInterchangeRepository",
     "FilesystemOpenLibRepository",

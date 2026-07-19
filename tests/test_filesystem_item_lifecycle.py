@@ -16,6 +16,7 @@ from librarytool.adapters.filesystem.item_command_repository import (
 from librarytool.adapters.filesystem.item_lifecycle_repository import (
     EMPTY_MANAGED_TREE_REVISION,
     FilesystemItemLifecycleRepository,
+    FilesystemItemLifecycleReservationRepository,
 )
 from librarytool.adapters.filesystem.recoverable_write_set import (
     RecoverableWriteSet,
@@ -503,6 +504,32 @@ def test_deletion_index_guard_retains_isolation_and_preserves_body_errors(
     assert events == ["enter", "exit"] * 2
 
 
+def test_create_reservation_reader_tracks_deleted_and_restored_tombstones(
+    tmp_path,
+):
+    root = tmp_path / "create-reservations"
+    _write_catalogue(root)
+    store, repository = _repository(root)
+    service = ItemLifecycleService(repository)
+    reservations = FilesystemItemLifecycleReservationRepository(store)
+
+    with store.workspace_lease():
+        assert reservations.load().active_item_ids == ()
+
+    deletion = _delete(service)
+    with store.workspace_lease():
+        deleted = reservations.load()
+    assert deleted.active_item_ids == ("book-1",)
+    assert deleted.allows("book-1") is False
+    assert deleted.allows("BOOK-1") is False
+
+    _restore(service, deletion)
+    with store.workspace_lease():
+        restored = reservations.load()
+    assert restored.active_item_ids == ()
+    assert restored.allows("book-1") is True
+
+
 def test_tombstone_alias_lookup_and_noncanonical_envelope_fail_closed(
     tmp_path,
 ):
@@ -533,7 +560,7 @@ def test_duplicate_active_envelopes_fail_closed_for_sync_suppression(
 ):
     root = tmp_path / "duplicate-active"
     _write_catalogue(root)
-    _, repository = _repository(root)
+    store, repository = _repository(root)
     deletion = _delete(ItemLifecycleService(repository))
     original_id = deletion.receipt.tombstone.tombstone_id
     original = json.loads(
@@ -554,6 +581,10 @@ def test_duplicate_active_envelopes_fail_closed_for_sync_suppression(
         ItemLifecycleService(restarted).active_deleted_item_ids()
 
     assert caught.value.code == "invalid_item_tombstone_index"
+    with store.workspace_lease():
+        with pytest.raises(RepositoryError) as reservation_conflict:
+            FilesystemItemLifecycleReservationRepository(store).load()
+    assert reservation_conflict.value.code == "invalid_item_lifecycle_store"
 
 
 def test_restore_exact_retry_replays_before_live_collision_checks(tmp_path):

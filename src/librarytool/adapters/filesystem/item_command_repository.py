@@ -32,6 +32,7 @@ from ...engine.item_commands import (
     ItemMutationReceipt,
     ItemRecordSnapshot,
 )
+from ...engine.item_lifecycle import ItemLifecycleDeletionIndex
 from .recoverable_write_set import (
     RecoverableWriteSet,
     RecoverableWriteTransaction,
@@ -46,6 +47,7 @@ RecordEncoder = Callable[
 ]
 ItemIdAllocator = Callable[[frozenset[str]], str]
 ItemIdValidator = Callable[[str], Any]
+ItemIdentityReservationLoader = Callable[[], ItemLifecycleDeletionIndex]
 TombstoneIdAllocator = Callable[[frozenset[str]], str]
 LockContextFactory = Callable[[], ContextManager[None]]
 
@@ -203,7 +205,13 @@ class FilesystemItemCommandRepository:
     lets transitional codecs retain storage-only fields without exposing them
     to the engine DTO. ``decode_record`` must return the exact canonical state
     represented by a raw row. ``allocate_item_id`` runs under both locks and
-    receives the complete frozen set of current item identifiers.
+    receives the complete frozen set of current and reserved item identifiers.
+
+    ``load_identity_reservations`` is an optional composition seam for an
+    installed aggregate lifecycle repository.  It is deliberately evaluated
+    by the unit of work, after durable receipt lookup and while the workspace
+    lease is held.  The callback must only read within that lease; it must not
+    acquire a host lock that the unit already holds.
     """
 
     def __init__(
@@ -215,6 +223,7 @@ class FilesystemItemCommandRepository:
         encode_record: RecordEncoder,
         allocate_item_id: ItemIdAllocator,
         validate_item_id: ItemIdValidator | None = None,
+        load_identity_reservations: ItemIdentityReservationLoader | None = None,
         lock_context_for: LockContextFactory | None = None,
         allocate_tombstone_id: TombstoneIdAllocator | None = None,
         recover: bool = True,
@@ -232,6 +241,10 @@ class FilesystemItemCommandRepository:
             raise TypeError("lock_context_for must be callable")
         if validate_item_id is not None and not callable(validate_item_id):
             raise TypeError("validate_item_id must be callable")
+        if load_identity_reservations is not None and not callable(
+            load_identity_reservations
+        ):
+            raise TypeError("load_identity_reservations must be callable")
         if allocate_tombstone_id is not None and not callable(
             allocate_tombstone_id
         ):
@@ -242,6 +255,7 @@ class FilesystemItemCommandRepository:
         self._encode_record = encode_record
         self._allocate_item_id = allocate_item_id
         self._validate_item_id = validate_item_id
+        self._load_identity_reservations = load_identity_reservations
         self._allocate_tombstone_id = allocate_tombstone_id
         self._lock_context_for = lock_context_for or (lambda: nullcontext())
         self._catalogue_relative = self._catalogue_path(catalogue_path)
@@ -309,6 +323,7 @@ class FilesystemItemCommandRepository:
             encode_record=self._encode_record,
             allocate_item_id=self._allocate_item_id,
             validate_item_id=self._validate_item_id,
+            load_identity_reservations=self._load_identity_reservations,
             allocate_tombstone_id=self._allocate_tombstone_id,
         )
 
@@ -426,6 +441,7 @@ class FilesystemItemCommandUnitOfWork:
         encode_record: RecordEncoder,
         allocate_item_id: ItemIdAllocator,
         validate_item_id: ItemIdValidator | None,
+        load_identity_reservations: ItemIdentityReservationLoader | None,
         allocate_tombstone_id: TombstoneIdAllocator | None,
     ) -> None:
         self._write_set = write_set
@@ -436,8 +452,14 @@ class FilesystemItemCommandUnitOfWork:
         self._encode_record_callback = encode_record
         self._allocate_item_id_callback = allocate_item_id
         self._validate_item_id_callback = validate_item_id
+        self._load_identity_reservations_callback = (
+            load_identity_reservations
+        )
         self._allocate_tombstone_id_callback = allocate_tombstone_id
         self._catalogue, self._snapshots = self._load_catalogue()
+        self._identity_reservations_cache: (
+            ItemLifecycleDeletionIndex | None
+        ) = None
         self._allocated_item_id = ""
         self._staged_action = ""
         self._staged_item_id = ""
@@ -499,10 +521,12 @@ class FilesystemItemCommandUnitOfWork:
         self._ensure_stageable()
         if self._allocated_item_id:
             return self._allocated_item_id
+        reservations = self._identity_reservations()
+        unavailable = frozenset(
+            (*self._catalogue, *reservations.active_item_ids)
+        )
         try:
-            value = self._allocate_item_id_callback(
-                frozenset(self._catalogue)
-            )
+            value = self._allocate_item_id_callback(unavailable)
         except Exception as exc:
             raise _safe_cause(
                 exc,
@@ -518,8 +542,55 @@ class FilesystemItemCommandUnitOfWork:
                 details={"item_id": item_id},
                 retryable=True,
             )
+        if not reservations.allows(item_id):
+            raise RepositoryError(
+                "the item repository allocated a lifecycle-reserved identity",
+                code="allocated_item_id_reserved",
+                details={"item_id": item_id},
+                retryable=True,
+            )
         self._allocated_item_id = item_id
         return item_id
+
+    def _identity_reservations(self) -> ItemLifecycleDeletionIndex:
+        cached = self._identity_reservations_cache
+        if cached is not None:
+            return cached
+        callback = self._load_identity_reservations_callback
+        if callback is None:
+            reservations = ItemLifecycleDeletionIndex(())
+        else:
+            try:
+                reservations = callback()
+            except RepositoryError:
+                raise
+            except Exception as exc:
+                raise _safe_cause(
+                    exc,
+                    code="item_identity_reservation_failed",
+                    message="the item identity reservations could not be read",
+                ) from exc
+        if not isinstance(reservations, ItemLifecycleDeletionIndex):
+            raise RepositoryError(
+                "the item identity reservation callback returned an invalid index",
+                code="invalid_item_identity_reservations",
+            )
+        live_aliases = {
+            existing.casefold(): existing for existing in self._catalogue
+        }
+        overlap = tuple(
+            item_id
+            for item_id in reservations.active_item_ids
+            if item_id.casefold() in live_aliases
+        )
+        if overlap:
+            raise RepositoryError(
+                "an active lifecycle reservation overlaps a live item",
+                code="invalid_item_identity_reservations",
+                details={"item_ids": sorted(overlap)},
+            )
+        self._identity_reservations_cache = reservations
+        return reservations
 
     def stage_create(
         self,
@@ -532,6 +603,12 @@ class FilesystemItemCommandUnitOfWork:
             raise RepositoryError(
                 "the item create draft is invalid",
                 code="invalid_item_repository_command",
+            )
+        if not self._identity_reservations().allows(item_id):
+            raise RepositoryError(
+                "the item create identity is reserved by its lifecycle tombstone",
+                code="item_identity_reserved",
+                details={"item_id": item_id},
             )
         if item_id.casefold() in {
             existing.casefold() for existing in self._catalogue

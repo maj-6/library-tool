@@ -29,6 +29,7 @@ from librarytool.engine.item_commands import (
     ItemRecordSnapshot,
     RepresentationDraft,
 )
+from librarytool.engine.item_lifecycle import ItemLifecycleDeletionIndex
 
 
 def _draft(metadata) -> ItemDraft:
@@ -140,6 +141,7 @@ def _repository(
     store: RecoverableWriteSet | None = None,
     hook=None,
     allocations: list[frozenset[str]] | None = None,
+    load_identity_reservations=None,
     recover: bool = True,
 ):
     write_set = store or RecoverableWriteSet(root, publish_hook=hook)
@@ -162,6 +164,7 @@ def _repository(
         decode_record=_decode,
         encode_record=_encode,
         allocate_item_id=allocate,
+        load_identity_reservations=load_identity_reservations,
         clean_region_id=lambda value: str(value or ""),
         normalize_language=lambda value: value.lower(),
         sanitize_document_name=_document_name,
@@ -229,7 +232,14 @@ def test_open_publishes_both_aggregates_and_all_receipts_in_one_transaction(
     ).as_posix() in targets
 
     # Durable replay occurs before allocation and planning.
-    _, restarted = _repository(root, allocations=allocations)
+    def must_not_load_reservations():
+        raise AssertionError("durable replay must precede reservation lookup")
+
+    _, restarted = _repository(
+        root,
+        allocations=allocations,
+        load_identity_reservations=must_not_load_reservations,
+    )
     replayed = OpenLibService(planner, restarted, _draft).open_lib(command)
     assert replayed.replayed is True
     assert replayed.receipt == result.receipt
@@ -242,6 +252,29 @@ def test_open_publishes_both_aggregates_and_all_receipts_in_one_transaction(
         )
     assert conflict.value.code == "operation_id_conflict"
     assert allocations == [frozenset()]
+
+
+def test_open_lib_cannot_allocate_a_lifecycle_reserved_case_alias(tmp_path):
+    root = tmp_path / "reserved-open"
+    allocations: list[frozenset[str]] = []
+    _, repository = _repository(
+        root,
+        allocations=allocations,
+        load_identity_reservations=lambda: ItemLifecycleDeletionIndex(
+            ("ITEM-CREATED",)
+        ),
+    )
+    planner = _Planner()
+
+    with pytest.raises(RepositoryError) as caught:
+        OpenLibService(planner, repository, _draft).open_lib(
+            OpenLibCommand(b"archive", "open-reserved")
+        )
+
+    assert caught.value.code == "allocated_item_id_reserved"
+    assert allocations == [frozenset({"ITEM-CREATED"})]
+    assert planner.calls == 0
+    assert _live_tree(root) == {}
 
 
 def test_late_publication_failure_rolls_back_catalogue_entry_and_receipts(

@@ -27,6 +27,7 @@ from librarytool.engine.item_commands import (
     RepresentationDraft,
     UpdateItemCommand,
 )
+from librarytool.engine.item_lifecycle import ItemLifecycleDeletionIndex
 
 
 def _draft(title: str = "A Herbal", **metadata: object) -> ItemDraft:
@@ -127,6 +128,7 @@ def _repository(
     encode_record=_encode_record,
     allocate_item_id=_allocate_item_id,
     allocate_tombstone_id=_allocate_tombstone_id,
+    load_identity_reservations=None,
     lock_context_for=None,
     recover: bool = True,
 ):
@@ -138,6 +140,7 @@ def _repository(
         encode_record=encode_record,
         allocate_item_id=allocate_item_id,
         allocate_tombstone_id=allocate_tombstone_id,
+        load_identity_reservations=load_identity_reservations,
         lock_context_for=lock_context_for,
         recover=recover,
     )
@@ -264,6 +267,175 @@ def test_staging_does_not_publish_without_commit(tmp_path):
         assert not _receipt_path(root, "stage-only").exists()
 
     assert _live_tree(root) == {}
+
+
+def test_create_allocation_includes_lifecycle_reservations_and_case_aliases(
+    tmp_path,
+):
+    root = tmp_path / "reserved-allocation"
+    seen: list[frozenset[str]] = []
+
+    def allocate(existing: frozenset[str]) -> str:
+        seen.append(existing)
+        return _allocate_item_id(existing)
+
+    _, repository = _repository(
+        root,
+        allocate_item_id=allocate,
+        load_identity_reservations=lambda: ItemLifecycleDeletionIndex(
+            ("ITEM-CREATED",)
+        ),
+    )
+
+    created = ItemCommandService(repository).create(
+        CreateItemCommand(_draft(), "create-after-reservation")
+    )
+
+    assert created.receipt.item_id == "item-created-2"
+    assert seen == [frozenset({"ITEM-CREATED"})]
+    assert set(_catalogue(root)) == {"item-created-2"}
+
+
+def test_allocator_cannot_ignore_a_case_aliased_lifecycle_reservation(
+    tmp_path,
+):
+    root = tmp_path / "reserved-collision"
+    _, repository = _repository(
+        root,
+        allocate_item_id=lambda _existing: "Item-Created",
+        load_identity_reservations=lambda: ItemLifecycleDeletionIndex(
+            ("item-created",)
+        ),
+    )
+
+    with pytest.raises(RepositoryError) as caught:
+        ItemCommandService(repository).create(
+            CreateItemCommand(_draft(), "reserved-collision")
+        )
+
+    assert caught.value.code == "allocated_item_id_reserved"
+    assert caught.value.retryable is True
+    assert _live_tree(root) == {}
+
+
+def test_stage_create_cannot_bypass_cached_identity_reservations(tmp_path):
+    root = tmp_path / "reserved-stage"
+    calls = 0
+
+    def reservations() -> ItemLifecycleDeletionIndex:
+        nonlocal calls
+        calls += 1
+        return ItemLifecycleDeletionIndex(("reserved",))
+
+    _, repository = _repository(
+        root,
+        allocate_item_id=lambda _existing: "available",
+        load_identity_reservations=reservations,
+    )
+
+    with repository.unit_of_work(operation_id="stage-reserved") as unit:
+        assert unit.allocate_item_id() == "available"
+        with pytest.raises(RepositoryError) as caught:
+            unit.stage_create("RESERVED", _draft())
+
+    assert caught.value.code == "item_identity_reserved"
+    assert calls == 1
+    assert _live_tree(root) == {}
+
+
+@pytest.mark.parametrize(
+    "invalid_index",
+    [None, (), {"active_item_ids": ()}, "item-created"],
+)
+def test_create_rejects_corrupt_identity_reservation_callback(
+    tmp_path,
+    invalid_index,
+):
+    root = tmp_path / "corrupt-reservations"
+    _, repository = _repository(
+        root,
+        load_identity_reservations=lambda: invalid_index,
+    )
+
+    with pytest.raises(RepositoryError) as caught:
+        ItemCommandService(repository).create(
+            CreateItemCommand(_draft(), "corrupt-reservations")
+        )
+
+    assert caught.value.code == "invalid_item_identity_reservations"
+    assert _live_tree(root) == {}
+
+
+def test_active_reservation_cannot_overlap_a_live_catalogue_alias(tmp_path):
+    root = tmp_path / "overlapping-reservation"
+    _write_catalogue(root, {"Book": _raw_record()})
+    allocator_called = False
+
+    def allocate(_existing: frozenset[str]) -> str:
+        nonlocal allocator_called
+        allocator_called = True
+        return "available"
+
+    _, repository = _repository(
+        root,
+        allocate_item_id=allocate,
+        load_identity_reservations=lambda: ItemLifecycleDeletionIndex(
+            ("book",)
+        ),
+    )
+
+    with pytest.raises(RepositoryError) as caught:
+        ItemCommandService(repository).create(
+            CreateItemCommand(_draft(), "overlapping-reservation")
+        )
+
+    assert caught.value.code == "invalid_item_identity_reservations"
+    assert caught.value.details == {"item_ids": ["book"]}
+    assert allocator_called is False
+    assert set(_catalogue(root)) == {"Book"}
+
+
+def test_create_sanitizes_identity_reservation_callback_failure(tmp_path):
+    root = tmp_path / "failed-reservations"
+
+    def fail():
+        raise RuntimeError("C:\\private\\lifecycle-store")
+
+    _, repository = _repository(
+        root,
+        load_identity_reservations=fail,
+    )
+
+    with pytest.raises(RepositoryError) as caught:
+        ItemCommandService(repository).create(
+            CreateItemCommand(_draft(), "failed-reservations")
+        )
+
+    assert caught.value.code == "item_identity_reservation_failed"
+    assert caught.value.retryable is True
+    assert caught.value.details == {"cause_type": "RuntimeError"}
+    assert "private" not in str(caught.value.as_dict())
+    assert _live_tree(root) == {}
+
+
+def test_durable_create_replay_precedes_identity_reservation_lookup(tmp_path):
+    root = tmp_path / "reservation-replay"
+    command = CreateItemCommand(_draft(), "reservation-replay")
+    _, repository = _repository(root)
+    created = ItemCommandService(repository).create(command)
+
+    def must_not_run():
+        raise AssertionError("durable replay must not reload reservations")
+
+    _, restarted = _repository(
+        root,
+        load_identity_reservations=must_not_run,
+    )
+    replayed = ItemCommandService(restarted).create(command)
+
+    assert replayed.replayed is True
+    assert replayed.receipt == created.receipt
+    assert set(_catalogue(root)) == {"item-created"}
 
 
 def test_composing_adapter_can_stage_managed_record_and_publish_catalogue_last(
@@ -516,6 +688,77 @@ def test_workspace_lease_precedes_injected_legacy_lock(tmp_path):
         "legacy-enter",
         "body",
         "legacy-exit",
+        "lease-exit",
+    ]
+
+
+def test_identity_reservations_load_inside_existing_create_locks(tmp_path):
+    events: list[str] = []
+    lease_held = False
+    host_lock_held = False
+
+    class TrackingWriteSet(RecoverableWriteSet):
+        @contextmanager
+        def workspace_lease(self):
+            nonlocal lease_held
+            assert lease_held is False
+            lease_held = True
+            events.append("lease-enter")
+            try:
+                with super().workspace_lease():
+                    yield
+            finally:
+                events.append("lease-exit")
+                lease_held = False
+
+    @contextmanager
+    def host_lock():
+        nonlocal host_lock_held
+        assert lease_held is True
+        assert host_lock_held is False
+        host_lock_held = True
+        events.append("host-enter")
+        try:
+            yield
+        finally:
+            events.append("host-exit")
+            host_lock_held = False
+
+    def reservations() -> ItemLifecycleDeletionIndex:
+        assert lease_held is True
+        assert host_lock_held is True
+        events.append("reservations")
+        return ItemLifecycleDeletionIndex(("reserved",))
+
+    def allocate(existing: frozenset[str]) -> str:
+        assert lease_held is True
+        assert host_lock_held is True
+        assert existing == frozenset({"reserved"})
+        events.append("allocate")
+        return "available"
+
+    root = tmp_path / "reservation-locks"
+    store = TrackingWriteSet(root)
+    _, repository = _repository(
+        root,
+        write_set=store,
+        allocate_item_id=allocate,
+        load_identity_reservations=reservations,
+        lock_context_for=host_lock,
+        recover=False,
+    )
+
+    with repository.unit_of_work(operation_id="reservation-locks") as unit:
+        assert unit.allocate_item_id() == "available"
+        events.append("body")
+
+    assert events == [
+        "lease-enter",
+        "host-enter",
+        "reservations",
+        "allocate",
+        "body",
+        "host-exit",
         "lease-exit",
     ]
 

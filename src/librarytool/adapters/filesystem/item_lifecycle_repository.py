@@ -23,6 +23,7 @@ from typing import Any, ContextManager, TypeAlias
 
 from ...engine.errors import EngineError, RepositoryError
 from ...engine.item_lifecycle import (
+    ItemLifecycleDeletionIndex,
     ItemLifecycleReceipt,
     ItemLifecycleState,
     ItemTombstoneSnapshot,
@@ -71,6 +72,217 @@ EMPTY_MANAGED_TREE_REVISION = (
     "managed-tree-empty-v1-"
     + hashlib.sha256(b"librarytool-managed-empty-tree-v1").hexdigest()
 )
+
+
+def _lifecycle_file_identifier(value: Any, *, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not _FILE_IDENTIFIER_RE.fullmatch(value)
+        or value.endswith(".")
+        or value.split(".", 1)[0].casefold() in _WINDOWS_DEVICE_NAMES
+    ):
+        raise RepositoryError(
+            f"{field} is not a portable filesystem identifier",
+            code="invalid_item_lifecycle_identity",
+            details={"field": field},
+        )
+    return value
+
+
+def _validate_envelope_base(
+    value: Any,
+    *,
+    tombstone_id: str,
+) -> tuple[dict[str, Any], ItemTombstoneSnapshot]:
+    """Validate every reservation-relevant lifecycle envelope invariant."""
+
+    try:
+        envelope = _strict_plain(value)
+    except (TypeError, ValueError) as exc:
+        raise RepositoryError(
+            "an item lifecycle tombstone is invalid",
+            code="invalid_item_lifecycle_tombstone",
+        ) from exc
+    fields = {
+        "schema",
+        "tombstone",
+        "delete_operation_id",
+        "restore_operation_id",
+        "record",
+        "managed_tree",
+    }
+    if not isinstance(envelope, dict) or set(envelope) != fields:
+        raise RepositoryError(
+            "an item lifecycle tombstone has the wrong schema",
+            code="invalid_item_lifecycle_tombstone",
+        )
+    try:
+        tombstone = ItemTombstoneSnapshot.from_dict(envelope["tombstone"])
+    except (TypeError, ValueError) as exc:
+        raise RepositoryError(
+            "an item lifecycle tombstone is invalid",
+            code="invalid_item_lifecycle_tombstone",
+        ) from exc
+
+    tree = envelope["managed_tree"]
+    tree_fields = {
+        "present",
+        "revision",
+        "live_relative",
+        "tombstone_relative",
+    }
+    delete_operation = envelope["delete_operation_id"]
+    restore_operation = envelope["restore_operation_id"]
+    valid_operations = (
+        isinstance(delete_operation, str)
+        and bool(_IDENTIFIER_RE.fullmatch(delete_operation))
+        and isinstance(restore_operation, str)
+        and (
+            not restore_operation
+            or bool(_IDENTIFIER_RE.fullmatch(restore_operation))
+        )
+    )
+    valid_tree = (
+        isinstance(tree, dict)
+        and set(tree) == tree_fields
+        and isinstance(tree.get("present"), bool)
+        and isinstance(tree.get("live_relative"), str)
+        and tree.get("revision") == tombstone.managed_tree_revision
+        and tree.get("tombstone_relative")
+        == (_TREE_ROOT / tombstone_id).as_posix()
+        and (
+            (
+                tree.get("present") is True
+                and tombstone.managed_tree_revision.startswith(
+                    _PHYSICAL_TREE_PREFIX
+                )
+            )
+            or (
+                tree.get("present") is False
+                and tombstone.managed_tree_revision
+                == EMPTY_MANAGED_TREE_REVISION
+            )
+        )
+    )
+    valid_state = (
+        (tombstone.state == "deleted" and not restore_operation)
+        or (tombstone.state == "restored" and bool(restore_operation))
+    )
+    if (
+        envelope["schema"] != _ENVELOPE_SCHEMA
+        or tombstone.tombstone_id != tombstone_id
+        or not isinstance(envelope["record"], dict)
+        or not valid_operations
+        or not valid_tree
+        or not valid_state
+    ):
+        raise RepositoryError(
+            "an item lifecycle tombstone is inconsistent",
+            code="invalid_item_lifecycle_tombstone",
+        )
+    return envelope, tombstone
+
+
+class FilesystemItemLifecycleReservationRepository:
+    """Read the narrow identity index used by catalogue creation.
+
+    This reader deliberately acquires no lock.  A composing create repository
+    calls :meth:`load` only after it owns the shared workspace lease, so a
+    lifecycle delete or restore cannot change the envelopes between allocation
+    and catalogue commit.  Keeping this adapter independent of lifecycle and
+    item services avoids a circular service graph and avoids re-entering a
+    host's potentially non-reentrant mutation lock.
+    """
+
+    def __init__(self, write_set: RecoverableWriteSet) -> None:
+        if not isinstance(write_set, RecoverableWriteSet):
+            raise TypeError("write_set must be a RecoverableWriteSet")
+        self._write_set = write_set
+
+    def load(self) -> ItemLifecycleDeletionIndex:
+        root = self._target(_ENVELOPE_ROOT)
+        if not root.exists():
+            return ItemLifecycleDeletionIndex(())
+        if not root.is_dir() or _is_redirecting_path(root):
+            raise RepositoryError(
+                "the item lifecycle store is invalid",
+                code="invalid_item_lifecycle_store",
+            )
+
+        aliases: dict[str, str] = {}
+        active_item_ids: list[str] = []
+        try:
+            paths = tuple(root.iterdir())
+        except OSError as exc:
+            raise _safe_cause(
+                exc,
+                code="item_identity_reservation_failed",
+                message="the lifecycle reservation store could not be read",
+            ) from exc
+        for path in paths:
+            if (
+                _is_redirecting_path(path)
+                or not path.is_file()
+                or path.suffix != ".json"
+            ):
+                raise RepositoryError(
+                    "the lifecycle envelope store contains an invalid entry",
+                    code="invalid_item_lifecycle_store",
+                )
+            identity = _lifecycle_file_identifier(
+                path.stem,
+                field="stored_tombstone_id",
+            )
+            if path.name != f"{identity}.json":
+                raise RepositoryError(
+                    "the lifecycle envelope name is not canonical",
+                    code="invalid_item_lifecycle_store",
+                )
+            folded = identity.casefold()
+            if folded in aliases:
+                raise RepositoryError(
+                    "the lifecycle envelope store contains aliased identities",
+                    code="invalid_item_lifecycle_store",
+                )
+            aliases[folded] = identity
+            raw = _read_json(
+                path,
+                None,
+                artifact="item_lifecycle_tombstone",
+            )
+            _envelope, tombstone = _validate_envelope_base(
+                raw,
+                tombstone_id=identity,
+            )
+            if tombstone.state == "deleted":
+                active_item_ids.append(tombstone.item_id)
+        try:
+            return ItemLifecycleDeletionIndex(tuple(active_item_ids))
+        except (TypeError, ValueError) as exc:
+            raise RepositoryError(
+                "the lifecycle store has conflicting item reservations",
+                code="invalid_item_lifecycle_store",
+            ) from exc
+
+    def _target(self, relative: PurePosixPath) -> Path:
+        current = self._write_set.root
+        for index, part in enumerate(relative.parts):
+            current = current / part
+            if _is_redirecting_path(current):
+                raise RepositoryError(
+                    "the item lifecycle store crosses a redirecting path",
+                    code="invalid_item_lifecycle_store",
+                )
+            if (
+                index < len(relative.parts) - 1
+                and current.exists()
+                and not current.is_dir()
+            ):
+                raise RepositoryError(
+                    "the item lifecycle store has an invalid parent",
+                    code="invalid_item_lifecycle_store",
+                )
+        return current
 
 
 class FilesystemItemLifecycleRepository:
@@ -767,88 +979,13 @@ class FilesystemItemLifecycleUnitOfWork:
     def _validate_envelope(
         self, value: Any, *, tombstone_id: str
     ) -> dict[str, Any]:
-        try:
-            envelope = _strict_plain(value)
-        except (TypeError, ValueError) as exc:
-            raise RepositoryError(
-                "an item lifecycle tombstone is invalid",
-                code="invalid_item_lifecycle_tombstone",
-            ) from exc
-        fields = {
-            "schema",
-            "tombstone",
-            "delete_operation_id",
-            "restore_operation_id",
-            "record",
-            "managed_tree",
-        }
-        if not isinstance(envelope, dict) or set(envelope) != fields:
-            raise RepositoryError(
-                "an item lifecycle tombstone has the wrong schema",
-                code="invalid_item_lifecycle_tombstone",
-            )
-        try:
-            tombstone = ItemTombstoneSnapshot.from_dict(
-                envelope["tombstone"]
-            )
-        except (TypeError, ValueError) as exc:
-            raise RepositoryError(
-                "an item lifecycle tombstone is invalid",
-                code="invalid_item_lifecycle_tombstone",
-            ) from exc
+        envelope, tombstone = _validate_envelope_base(
+            value,
+            tombstone_id=tombstone_id,
+        )
         tree = envelope["managed_tree"]
-        tree_fields = {
-            "present",
-            "revision",
-            "live_relative",
-            "tombstone_relative",
-        }
         expected_live = self._entry_relative(tombstone.item_id)
-        expected_tree = self._tombstone_tree_relative(tombstone_id)
-        delete_operation = envelope["delete_operation_id"]
-        restore_operation = envelope["restore_operation_id"]
-        valid_operations = (
-            isinstance(delete_operation, str)
-            and bool(_IDENTIFIER_RE.fullmatch(delete_operation))
-            and isinstance(restore_operation, str)
-            and (
-                not restore_operation
-                or bool(_IDENTIFIER_RE.fullmatch(restore_operation))
-            )
-        )
-        valid_tree = (
-            isinstance(tree, dict)
-            and set(tree) == tree_fields
-            and isinstance(tree.get("present"), bool)
-            and tree.get("revision") == tombstone.managed_tree_revision
-            and tree.get("live_relative") == expected_live
-            and tree.get("tombstone_relative") == expected_tree
-            and (
-                (
-                    tree.get("present") is True
-                    and tombstone.managed_tree_revision.startswith(
-                        _PHYSICAL_TREE_PREFIX
-                    )
-                )
-                or (
-                    tree.get("present") is False
-                    and tombstone.managed_tree_revision
-                    == EMPTY_MANAGED_TREE_REVISION
-                )
-            )
-        )
-        valid_state = (
-            (tombstone.state == "deleted" and not restore_operation)
-            or (tombstone.state == "restored" and bool(restore_operation))
-        )
-        if (
-            envelope["schema"] != _ENVELOPE_SCHEMA
-            or tombstone.tombstone_id != tombstone_id
-            or not isinstance(envelope["record"], dict)
-            or not valid_operations
-            or not valid_tree
-            or not valid_state
-        ):
+        if tree["live_relative"] != expected_live:
             raise RepositoryError(
                 "an item lifecycle tombstone is inconsistent",
                 code="invalid_item_lifecycle_tombstone",
@@ -1030,18 +1167,7 @@ class FilesystemItemLifecycleUnitOfWork:
 
     @staticmethod
     def _file_identifier(value: Any, *, field: str) -> str:
-        if (
-            not isinstance(value, str)
-            or not _FILE_IDENTIFIER_RE.fullmatch(value)
-            or value.endswith(".")
-            or value.split(".", 1)[0].casefold() in _WINDOWS_DEVICE_NAMES
-        ):
-            raise RepositoryError(
-                f"{field} is not a portable filesystem identifier",
-                code="invalid_item_lifecycle_identity",
-                details={"field": field},
-            )
-        return value
+        return _lifecycle_file_identifier(value, field=field)
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -1075,6 +1201,7 @@ __all__ = [
     "EMPTY_MANAGED_TREE_REVISION",
     "EntryDirectoryResolver",
     "FilesystemItemLifecycleRepository",
+    "FilesystemItemLifecycleReservationRepository",
     "ItemDeletionGuardFactory",
     "LifecycleLockFactory",
     "RestoredRecordAdvancer",
