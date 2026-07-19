@@ -26,6 +26,20 @@ os.environ["WHL_DATA_ROOT"] = str(_TMP)
 import pytest  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _initialize_imported_server_engine():
+    """Give direct server-internal tests the runtime startup they expect.
+
+    Import itself remains side-effect free. Test modules that import ``server``
+    during collection receive a session immediately before their test runs;
+    request-based tests also cross the production ``before_request`` barrier.
+    """
+
+    server = sys.modules.get("server")
+    if server is not None:
+        server._ensure_engine_session()
+
+
 @pytest.fixture(scope="session")
 def data_root() -> Path:
     """The throwaway DATA_ROOT every tools module resolved at import."""
@@ -41,6 +55,7 @@ def client():
     """
     import server
 
+    server._ensure_engine_session()
     server.app.config["TESTING"] = True
     with server.app.test_client() as c:
         yield c

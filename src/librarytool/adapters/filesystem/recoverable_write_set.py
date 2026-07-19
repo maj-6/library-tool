@@ -25,9 +25,15 @@ from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePath
-from typing import Any, BinaryIO, Iterator, Literal
+from typing import Any, Iterator, Literal
 
 from ...engine.errors import RepositoryError
+from ._file_lock import (
+    UnsafeLockFileError,
+    lock_stream,
+    open_lock_file,
+    unlock_stream,
+)
 
 
 JournalState = Literal[
@@ -131,6 +137,7 @@ class RecoverableWriteSet:
                 details={"path": str(self.transactions_dir)},
             )
         self.lock_path = self.transactions_dir / "workspace.lock"
+        self._owner_pid = os.getpid()
         self._thread_lock = _process_lock(self.lock_path)
         self._lock_state = threading.local()
         self._publish_hook = publish_hook
@@ -647,6 +654,12 @@ class RecoverableWriteSet:
 
     @contextmanager
     def _workspace_lock(self) -> Iterator[None]:
+        if os.getpid() != self._owner_pid:
+            raise WriteSetError(
+                "a recoverable write set cannot be reused after process fork",
+                code="write_set_process_changed",
+                details={"root": str(self.root)},
+            )
         with self._thread_lock:
             depth = int(getattr(self._lock_state, "depth", 0))
             if depth:
@@ -657,14 +670,71 @@ class RecoverableWriteSet:
                     self._lock_state.depth = depth
                 return
             self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.lock_path.open("a+b") as stream:
-                _lock_stream(stream)
+            try:
+                stream = open_lock_file(self.lock_path)
+            except UnsafeLockFileError as exc:
+                raise UnsafeTargetError(
+                    "the workspace lock is not a private regular file",
+                    details={"path": str(self.lock_path)},
+                ) from exc
+            except OSError as exc:
+                raise WriteSetError(
+                    "the workspace lock could not be opened",
+                    details={"path": str(self.lock_path)},
+                    retryable=True,
+                ) from exc
+            operation_failed = False
+            lock_acquired = False
+            try:
+                try:
+                    lock_stream(
+                        stream,
+                        blocking=True,
+                        path=self.lock_path,
+                    )
+                    lock_acquired = True
+                except UnsafeLockFileError as exc:
+                    operation_failed = True
+                    raise UnsafeTargetError(
+                        "the workspace lock identity changed during acquisition",
+                        details={"path": str(self.lock_path)},
+                    ) from exc
+                except OSError as exc:
+                    operation_failed = True
+                    raise WriteSetError(
+                        "the workspace lock could not be acquired",
+                        details={"path": str(self.lock_path)},
+                        retryable=True,
+                    ) from exc
                 self._lock_state.depth = 1
+                body_failed = False
                 try:
                     yield
+                except BaseException:
+                    operation_failed = body_failed = True
+                    raise
                 finally:
                     self._lock_state.depth = 0
-                    _unlock_stream(stream)
+                    if lock_acquired:
+                        try:
+                            unlock_stream(stream)
+                        except OSError as exc:
+                            if not body_failed:
+                                operation_failed = True
+                                raise WriteSetError(
+                                    "the workspace lock could not be released",
+                                    details={"path": str(self.lock_path)},
+                                ) from exc
+            finally:
+                try:
+                    stream.close()
+                except OSError as exc:
+                    if not operation_failed:
+                        operation_failed = True
+                        raise WriteSetError(
+                            "the workspace lock file could not be closed",
+                            details={"path": str(self.lock_path)},
+                        ) from exc
 
 
 class RecoverableWriteTransaction:
@@ -996,35 +1066,6 @@ def _fsync_directory(path: Path) -> None:
         pass
     finally:
         os.close(descriptor)
-
-
-def _lock_stream(stream: BinaryIO) -> None:
-    stream.seek(0, os.SEEK_END)
-    if stream.tell() == 0:
-        stream.write(b"\0")
-        stream.flush()
-        os.fsync(stream.fileno())
-    stream.seek(0)
-    if os.name == "nt":
-        import msvcrt
-
-        msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
-    else:
-        import fcntl
-
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-
-
-def _unlock_stream(stream: BinaryIO) -> None:
-    stream.seek(0)
-    if os.name == "nt":
-        import msvcrt
-
-        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
-    else:
-        import fcntl
-
-        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 __all__ = [

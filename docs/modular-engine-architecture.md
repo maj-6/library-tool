@@ -129,10 +129,17 @@ larger workbench and packaging split described below remains the target:
   global path discovery. It rejects unfinished recovery state, unsafe or
   overlapping storage paths, redirecting entry trees, incomplete bindings,
   and item identities that another service in the graph could not address.
-  Production `server.py` delegates its service construction to this root while
-  retaining startup recovery, singleton lifetime, legacy codecs, and callback
-  bindings. Alternate hosts can compose the graph directly; sharing the full
-  production lifecycle still requires the next host-bootstrap extraction.
+  `composition.host.open_filesystem_engine` now supplies the reusable lifecycle
+  above that root: it takes immutable configuration and borrowed bindings,
+  acquires a non-blocking process-lifetime workspace lease, recovers one owned
+  write set under the transitional storage locks, composes the sealed graph,
+  rehydrates one owned job manager, and returns an explicitly closable session.
+  It has native strict/atomic job-history JSON I/O and imports neither Flask nor
+  `tools`. Importing production `server.py` does not claim a workspace. Its
+  executable startup opens the host after legacy callbacks are defined and
+  before migrations or background threads; an embedded Flask host opens it at
+  the first trusted request. Compatibility globals are aliases of the
+  session-owned objects, not a second resource graph.
 
 The automatic family detector is deliberately a proposal query. It clusters
 geometry and semantic roles, identifies medoid exemplars, separates recurring
@@ -207,21 +214,38 @@ the same scopes even if it does not use HTTP header syntax.
 The reusable, Flask-free filesystem graph composer now accepts explicit paths,
 shared resources, compatibility callbacks, provider ports, and installed
 module contributions and returns one validated `LibraryEngine`. Production
-Flask receives that object, and headless tests compose independent engines
-without importing the server. Composition deliberately does not perform
-recovery, create global resources, start workers, or own shutdown; it verifies
-that the host has settled recovery before exposing services.
+Flask and headless tests receive that object without putting transport behavior
+in composition. Composition deliberately does not recover storage, create
+global resources, start workers, or own shutdown; it verifies that its host has
+settled recovery before exposing services.
 
-The next architectural extraction is therefore a small transport-neutral host
-bootstrap above this composer. It should accept runtime configuration, open
-the recoverable workspace and persisted job history, perform startup recovery,
-select installed module/provider descriptors, compose one engine, and close
-its resources deterministically. Flask, a CLI daemon, Qt manager, Godot
-facsimile editor, or a test harness should differ only in the transport and
-lifecycle policy they place around that host. Legacy codecs can remain
-injected compatibility adapters while their data verticals migrate.
+The transport-neutral lifecycle host above it is now implemented. Importing or
+constructing its configuration performs no I/O. Opening a session creates the
+workspace resources, rejects concurrent conforming hosts on the same root,
+recovers interrupted writes before composition, rehydrates jobs only after a
+valid graph exists, and exposes recovery diagnostics. Closing is explicit,
+thread-safe, and idempotent. A Python CLI or Qt process can own the session
+directly; a Godot workbench can use the same host in a local sidecar. No host
+starts implicit workers. Engine, job-manager, provenance, and write-set objects
+obtained from a session are borrowed for that session lifetime and must not be
+used after close; Python references cannot themselves be revoked.
 
-After that composition seam, migrate these data boundaries in order:
+This is not yet a claim of coordinated application shutdown. Legacy background
+workers and provider executors are still launched by `server.py` and have no
+single supervisor that can cancel and join them. The session therefore releases
+only resources it truly owns. Its lifetime lease also coordinates only clients
+using this host; remaining legacy scripts that write the same workspace must be
+migrated before multi-client access is safe. First-party callback bundles and
+module selection still live in the transitional server and should move into a
+framework-neutral production package as their underlying data verticals move.
+The embedded Flask transport is deliberately single-process. A pre-fork or
+multi-worker WSGI deployment would create competing workspace owners; other
+processes and workbenches must connect to the one sidecar instead. Controlled
+embedders may stop their workers, explicitly close/unpublish the transport
+session, and then dispose or reload the module. Reloading a live transport is
+unsupported.
+
+With the lifecycle seam established, migrate these data boundaries in order:
 
 1. **Composite item lifecycle.** Coordinate catalogue-only create with source
    attachment and new-item `.lib` import, then move delete and restore behind
@@ -927,8 +951,9 @@ The implementation baseline above records the partial completion of Phases
 0–3: the engine package, several filesystem adapters and services, capability
 and job contracts, selected `/api/v1` resources, and `EngineClient` exist.
 Framework-neutral production graph composition now exists. A reusable
-lifecycle bootstrap, complete vertical migration, a reference CLI, the
-launcher/workbench split, and physical module bundles remain outstanding.
+lifecycle bootstrap also exists. Coordinated worker shutdown, complete
+vertical migration, a reference CLI, the launcher/workbench split, and
+physical module bundles remain outstanding.
 
 ### Phase 0: record behavior and contracts
 

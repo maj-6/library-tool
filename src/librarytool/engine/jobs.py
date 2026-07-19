@@ -457,16 +457,25 @@ class JobManager:
         event = self._cancel_events.get(str(job.get("id") or ""))
         return event is not None and event.is_set()
 
-    def rehydrate(self) -> None:
+    def rehydrate(self, *, strict: bool = False) -> None:
         """Load history and mark work interrupted by the previous shutdown."""
         if self._repository is None:
             return
         try:
             stored = self._repository.load()
         except (OSError, ValueError):
+            if strict:
+                raise
             return
         if not isinstance(stored, Mapping) or not stored:
+            if strict and not isinstance(stored, Mapping):
+                raise ValueError("job history must be a mapping")
             return
+        if strict and any(
+            not str(raw_id or "") or not isinstance(raw, Mapping)
+            for raw_id, raw in stored.items()
+        ):
+            raise ValueError("job history contains an invalid record")
         now = self._timestamp()
         with self._lock:
             for raw_id, raw in stored.items():
@@ -492,7 +501,7 @@ class JobManager:
                 self._records[job_id] = job
                 self._emit_locked("recovered", job)
             self._prune_locked()
-            self._save_locked()
+            self._save_locked(strict=strict)
 
     def _timestamp(self) -> str:
         value = self._utcnow()
@@ -643,7 +652,7 @@ class JobManager:
             self._records.pop(job_id, None)
             self._cancel_events.pop(job_id, None)
 
-    def _save_locked(self) -> None:
+    def _save_locked(self, *, strict: bool = False) -> None:
         if self._repository is None:
             return
         snapshot = {
@@ -652,6 +661,8 @@ class JobManager:
         try:
             self._repository.save(snapshot)
         except OSError:
+            if strict:
+                raise
             log.warning("could not persist the job registry", exc_info=True)
 
 

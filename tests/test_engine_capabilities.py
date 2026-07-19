@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -245,10 +249,93 @@ def test_http_discovery_exposes_resolved_installed_workbenches(client):
     assert ("library.jobs", 1) in capabilities
 
 
+def test_import_does_not_claim_or_open_the_engine_workspace(tmp_path):
+    root = Path(__file__).parents[1]
+    env = os.environ.copy()
+    env["WHL_DATA_ROOT"] = str(tmp_path)
+    env["PYTHONPATH"] = os.pathsep.join((
+        str(root / "src"),
+        str(root / "tools"),
+        str(root / "tools" / "whl_explorer"),
+    ))
+    script = "\n".join((
+        "from concurrent.futures import ThreadPoolExecutor",
+        "import importlib",
+        "from pathlib import Path",
+        "import server",
+        "assert server._engine_session is None",
+        "lock = (server.lib.OUTPUT_DIR / '.transactions' / "
+        "'engine-session.lock')",
+        "assert not Path(lock).exists(), lock",
+        "client = server.app.test_client()",
+        "rejected = client.get('/api/v1/capabilities', "
+        "headers={'Host': 'attacker.example'})",
+        "assert rejected.status_code == 403",
+        "assert server._engine_session is None",
+        "assert not Path(lock).exists(), lock",
+        "real_open = server._open_engine_session",
+        "opens = []",
+        "def tracked_open():",
+        "    opens.append(1)",
+        "    return real_open()",
+        "server._open_engine_session = tracked_open",
+        "def request_capabilities(_index):",
+        "    response = server.app.test_client().get('/api/v1/capabilities')",
+        "    return response.status_code",
+        "with ThreadPoolExecutor(max_workers=8) as pool:",
+        "    statuses = list(pool.map(request_capabilities, range(16)))",
+        "assert statuses == [200] * 16, statuses",
+        "assert len(opens) == 1, opens",
+        "session = server._engine_session",
+        "assert session is not None and not session.closed",
+        "assert server._library_engine_instance is session.engine",
+        "assert server._engine_write_set is session.write_set",
+        "assert server._job_manager is session.jobs",
+        "assert server._translation_provenance is session.provenance",
+        "server._close_engine_session()",
+        "assert server._engine_session is None",
+        "assert server._library_engine_instance is None",
+        "reopened = server._ensure_engine_session()",
+        "assert reopened is not session and not reopened.closed",
+        "assert len(opens) == 2, opens",
+        "server._close_engine_session()",
+        "server = importlib.reload(server)",
+        "assert server._engine_session is None",
+        "third = server._ensure_engine_session()",
+        "assert not third.closed",
+        "server._close_engine_session()",
+    ))
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_production_services_and_capabilities_are_one_sealed_graph(client):
     import server
 
     engine = server._library_engine()
+    assert server._ensure_engine_session() is server._engine_session
+    assert server._engine_session.closed is False
+    assert engine is server._engine_session.engine
+    assert server._engine_write_set is server._engine_session.write_set
+    assert server._job_manager is server._engine_session.jobs
+    assert (
+        server._translation_provenance
+        is server._engine_session.provenance
+    )
+    assert server._jobs is server._engine_session.jobs.records
+    assert server._jobs_events is server._engine_session.jobs.cancel_events
+    assert server._jobs_lock is server._engine_session.jobs.lock
+    assert server._library_engine_instance is engine
     assert engine.capabilities.sealed is True
     assert engine.items is not None
     assert {policy.policy_id for policy in engine.items.policies} == {

@@ -10,6 +10,16 @@ from .filesystem import (
     TranslationBindings,
     compose_filesystem_engine,
 )
+from .host import (
+    EngineSessionClosedError,
+    EngineSessionError,
+    EngineSessionForkedError,
+    FilesystemEngineConfig,
+    FilesystemEngineSession,
+    FilesystemHostBindings,
+    JobHistoryBindings,
+    open_filesystem_engine,
+)
 
 __all__ = [
     "CatalogueBindings",
@@ -17,7 +27,15 @@ __all__ = [
     "FilesystemEngineResources",
     "FilesystemServiceGraph",
     "InterchangeBindings",
+    "EngineSessionClosedError",
+    "EngineSessionError",
+    "EngineSessionForkedError",
+    "FilesystemEngineConfig",
+    "FilesystemEngineSession",
+    "FilesystemHostBindings",
+    "JobHistoryBindings",
     "ReplicaBindings",
     "TranslationBindings",
     "compose_filesystem_engine",
+    "open_filesystem_engine",
 ]

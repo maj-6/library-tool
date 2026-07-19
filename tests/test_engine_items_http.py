@@ -6,7 +6,22 @@ from pathlib import Path
 
 import pytest
 
-from librarytool.adapters.filesystem import RecoverableWriteSet
+
+def _bind_engine_session(monkeypatch, server, session) -> None:
+    """Keep transitional server globals on one temporary engine session."""
+
+    aliases = {
+        "_engine_session": session,
+        "_engine_write_set": session.write_set,
+        "_job_manager": session.jobs,
+        "_translation_provenance": session.provenance,
+        "_jobs": session.jobs.records,
+        "_jobs_events": session.jobs.cancel_events,
+        "_jobs_lock": session.jobs.lock,
+        "_library_engine_instance": session.engine,
+    }
+    for name, value in aliases.items():
+        monkeypatch.setattr(server, name, value)
 
 
 @pytest.fixture()
@@ -17,9 +32,6 @@ def item_catalog(monkeypatch, tmp_path: Path):
     entries_dir = tmp_path / "entries"
     monkeypatch.setattr(server, "BUILDS_PATH", builds_path)
     monkeypatch.setattr(server, "ENTRIES_DIR", entries_dir)
-    monkeypatch.setattr(
-        server, "_engine_write_set", RecoverableWriteSet(tmp_path))
-    monkeypatch.setattr(server, "_library_engine_instance", None)
 
     private = tmp_path / "private" / "scan.pdf"
     alternate = tmp_path / "private" / "alternate.pdf"
@@ -58,8 +70,12 @@ def item_catalog(monkeypatch, tmp_path: Path):
     (entry / "analysis" / "notes.md").write_text("notes", encoding="utf-8")
     (entry / "summary.md").write_text("summary", encoding="utf-8")
 
-    yield server, builds, private
-    server._library_engine_instance = None
+    session = server._open_engine_session(tmp_path)
+    _bind_engine_session(monkeypatch, server, session)
+    try:
+        yield server, builds, private
+    finally:
+        session.close()
 
 
 def test_default_item_collection_is_portable_revisioned_and_revalidatable(

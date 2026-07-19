@@ -14,11 +14,23 @@ Per-component detail lives in each part's own README (map at the end).
   `src/librarytool/composition/filesystem.py`, which selects adapters from
   injected paths, codecs, locks, jobs, policies, and provider ports without
   importing Flask or performing import-time I/O. The Flask sidecar delegates
-  to that composition root and remains the lifecycle/recovery host plus a
-  compatibility transport. A CLI, Qt, Godot, or another host can therefore
-  compose the same graph without importing Flask, although a reusable host
-  bootstrap for recovery, job-history startup, configuration, and shutdown is
-  still needed before those clients are turnkey. Module-owned item policies
+  to that composition root through the transport-neutral lifecycle host in
+  `src/librarytool/composition/host.py`. That host owns one recoverable write
+  set, persisted job manager, provenance service, sealed engine graph, startup
+  recovery report, and non-blocking process-lifetime workspace lease. It uses
+  explicit immutable configuration, has native strict/atomic job-history I/O,
+  imports no Flask or transitional `tools` module, and can be owned directly by
+  a CLI or Qt process or by a Godot sidecar. Importing the production transport
+  does not claim the workspace; executable startup opens it before migrations
+  or workers, while an embedded Flask host opens it on its first trusted
+  request. The remaining lifecycle gap is coordinated worker/provider shutdown:
+  those executors are still borrowed from `server.py`, so session close does
+  not pretend to cancel or join them. Session resources are borrowed and become
+  invalid when their owning session closes. The Flask transport is a
+  single-process workspace owner; additional clients connect to that sidecar
+  rather than starting pre-fork/multi-worker owners. A controlled embedder may
+  reload only after stopping its workers and explicitly closing/unpublishing
+  the transport session. Module-owned item policies
   are selected by the same capability resolution as services, so absent OCR,
   translation-generation, research, or publishing components do not leak
   commands into item views. Browser workbenches cross one semantic

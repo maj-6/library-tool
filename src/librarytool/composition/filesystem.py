@@ -10,13 +10,16 @@ same service graph without introducing a second locking or recovery domain.
 
 from __future__ import annotations
 
-import os
 import re
-import stat
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ContextManager
+
+from ._filesystem_paths import (
+    resolve_workspace_path,
+    workspace_paths_overlap,
+)
 
 from ..adapters.filesystem import (
     FilesystemInterchangeRepository,
@@ -92,93 +95,6 @@ _WINDOWS_DEVICE_NAMES = frozenset(
 )
 
 
-def _is_redirecting_path(path: Path) -> bool:
-    if path.is_symlink():
-        return True
-    is_junction = getattr(path, "is_junction", None)
-    if callable(is_junction) and is_junction():
-        return True
-    if os.name == "nt" and os.path.lexists(path):
-        try:
-            attributes = int(getattr(path.lstat(), "st_file_attributes", 0))
-        except OSError:
-            return False
-        reparse = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
-        return bool(reparse and attributes & reparse)
-    return False
-
-
-def _workspace_path(
-    root: Path,
-    configured: Path,
-    *,
-    artifact: str,
-    directory: bool,
-) -> Path:
-    """Resolve one host path inside the workspace without following aliases."""
-
-    if any(part in {".", ".."} for part in configured.parts):
-        raise RepositoryError(
-            "a filesystem engine path is ambiguous",
-            code="unsafe_filesystem_engine_path",
-            details={"artifact": artifact},
-        )
-    candidate = configured if configured.is_absolute() else root / configured
-    lexical = Path(os.path.abspath(candidate))
-    try:
-        relative = lexical.relative_to(root)
-    except ValueError as exc:
-        raise RepositoryError(
-            "a filesystem engine path escapes the workspace",
-            code="unsafe_filesystem_engine_path",
-            details={"artifact": artifact},
-        ) from exc
-    if (
-        not relative.parts
-        or relative.parts[0].casefold() == ".transactions"
-        or any(part in {"", ".", ".."} for part in relative.parts)
-    ):
-        raise RepositoryError(
-            "a filesystem engine path is reserved or ambiguous",
-            code="unsafe_filesystem_engine_path",
-            details={"artifact": artifact},
-        )
-    current = root
-    for part in relative.parts:
-        current /= part
-        if _is_redirecting_path(current):
-            raise RepositoryError(
-                "a filesystem engine path crosses a redirect",
-                code="unsafe_filesystem_engine_path",
-                details={"artifact": artifact},
-            )
-    try:
-        resolved = lexical.resolve(strict=False)
-        resolved.relative_to(root)
-    except (OSError, ValueError) as exc:
-        raise RepositoryError(
-            "a filesystem engine path cannot be resolved safely",
-            code="unsafe_filesystem_engine_path",
-            details={"artifact": artifact},
-        ) from exc
-    if directory and lexical.exists() and not lexical.is_dir():
-        raise RepositoryError(
-            "a filesystem engine directory is not a directory",
-            code="unsafe_filesystem_engine_path",
-            details={"artifact": artifact},
-        )
-    if not directory and (
-        lexical.suffix.casefold() != ".json"
-        or (lexical.exists() and not lexical.is_file())
-    ):
-        raise RepositoryError(
-            "a filesystem engine JSON path is invalid",
-            code="unsafe_filesystem_engine_path",
-            details={"artifact": artifact},
-        )
-    return lexical
-
-
 class _EntryDirectoryResolver:
     """Resolve only exact, portable direct children of the entries root."""
 
@@ -188,13 +104,13 @@ class _EntryDirectoryResolver:
 
     def __call__(self, item_id: str) -> Path:
         self.validate_item_id(item_id)
-        entries = _workspace_path(
+        entries = resolve_workspace_path(
             self._root,
             self._entries,
             artifact="entries",
             directory=True,
         )
-        candidate = _workspace_path(
+        candidate = resolve_workspace_path(
             self._root,
             entries / item_id,
             artifact="item_entry",
@@ -235,13 +151,13 @@ class _EntryDirectoryResolver:
 
     def layout_path(self, item_id: str) -> Path:
         entry = self(item_id)
-        ocr = _workspace_path(
+        ocr = resolve_workspace_path(
             self._root,
             entry / "ocr",
             artifact="item_ocr",
             directory=True,
         )
-        return _workspace_path(
+        return resolve_workspace_path(
             self._root,
             ocr / "layout.json",
             artifact="replica_layout",
@@ -383,31 +299,19 @@ def compose_filesystem_engine(
     with resources.write_set.workspace_lease():
         pass
 
-    catalogue_path = _workspace_path(
+    catalogue_path = resolve_workspace_path(
         resources.write_set.root,
         paths.catalogue,
         artifact="catalogue",
         directory=False,
     )
-    entries_path = _workspace_path(
+    entries_path = resolve_workspace_path(
         resources.write_set.root,
         paths.entries,
         artifact="entries",
         directory=True,
     )
-    catalogue_below_entries = False
-    entries_below_catalogue = False
-    try:
-        catalogue_path.relative_to(entries_path)
-        catalogue_below_entries = True
-    except ValueError:
-        pass
-    try:
-        entries_path.relative_to(catalogue_path)
-        entries_below_catalogue = True
-    except ValueError:
-        pass
-    if catalogue_below_entries or entries_below_catalogue:
+    if workspace_paths_overlap(catalogue_path, entries_path):
         raise RepositoryError(
             "the catalogue and entries locations cannot overlap",
             code="unsafe_filesystem_engine_path",

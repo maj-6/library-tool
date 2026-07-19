@@ -72,21 +72,23 @@ from librarytool.adapters.lib_archive import (  # noqa: E402
     ExistingItemLibArchivePlanner,
     LibArchiveLimits,
 )
-from librarytool.adapters.filesystem.job_history import (  # noqa: E402
-    FilesystemJobHistoryRepository,
-)
 from librarytool.adapters.filesystem.recoverable_write_set import (  # noqa: E402
     RecoverableWriteSet,
 )
 from librarytool.composition.filesystem import (  # noqa: E402
     CatalogueBindings,
     FilesystemEnginePaths,
-    FilesystemEngineResources,
     FilesystemServiceGraph,
     InterchangeBindings,
     ReplicaBindings,
     TranslationBindings,
-    compose_filesystem_engine,
+)
+from librarytool.composition.host import (  # noqa: E402
+    FilesystemEngineConfig,
+    FilesystemEngineSession,
+    FilesystemHostBindings,
+    JobHistoryBindings,
+    open_filesystem_engine,
 )
 from librarytool.engine.capabilities import (  # noqa: E402
     CapabilityRef,
@@ -158,11 +160,17 @@ from librarytool.engine.workbench_policies import (  # noqa: E402
     TranslationWorkbenchPolicy,
 )
 
-# Recover interrupted multi-artifact publication while the module is still
-# single-threaded. No request handler or background worker can observe or write
-# the workspace until this import-time barrier has completed.
-_engine_write_set = RecoverableWriteSet(lib.OUTPUT_DIR)
-_engine_write_set.recover_all()
+# Importing the compatibility transport must not claim a workspace. The first
+# request, or the explicit __main__ startup barrier, opens one complete session
+# and publishes these aliases together for processors that have not crossed the
+# engine boundary yet.
+_engine_session: FilesystemEngineSession | None = None
+_engine_write_set: RecoverableWriteSet | None = None
+_job_manager: JobManager | None = None
+_translation_provenance: TranslationProvenanceService | None = None
+_jobs: dict | None = None
+_jobs_events: dict | None = None
+_jobs_lock: threading.Lock | None = None
 
 # NYPL Catalog of Copyright Entries dataset (optional, for the copyright tag's
 # registration half): drop the parsed XML tree under <DATA_ROOT>/nypl_cce/.
@@ -205,6 +213,13 @@ def _reject_untrusted_host():
     host = (request.host or "").partition(":")[0].lower().rstrip(".")
     if host not in _TRUSTED_LOOPBACK_HOSTS:
         abort(403)
+
+
+@app.before_request
+def _ensure_engine_before_request():
+    """Settle recovery and composition before dispatching any local API."""
+
+    _ensure_engine_session()
 
 
 @app.after_request
@@ -3883,87 +3898,188 @@ def _engine_workspace_locks(_item_id: str):
                         yield
 
 
-def _library_engine() -> LibraryEngine:
-    """Compose the headless engine against today's file-backed adapters.
+@contextlib.contextmanager
+def _engine_recovery_locks():
+    """Take every transitional storage lock inside the recovery lease."""
 
-    Construction is lazy because the compatibility callbacks are defined
-    throughout this transitional module. By request time the module is fully
-    loaded, while package imports remain side-effect free.
-    """
+    with _engine_workspace_locks(""):
+        yield
+
+
+def _engine_host_bindings() -> FilesystemHostBindings:
+    """Return borrowed production callbacks for the neutral host opener."""
+
+    policies = _EngineReplicaPolicies()
+    interchange_planner = ExistingItemLibArchivePlanner(
+        parse_format=libformat.parse_format,
+        supported_major=libformat.SUPPORTED_MAJOR,
+        sanitize_items=libformat.sanitize_page_items,
+        sanitize_dims=libformat.sanitize_dims,
+        sanitize_document_name=_ocr_name,
+        sanitize_styles=libformat.sanitize_styles,
+        sanitize_ext=libformat.sanitize_ext,
+        sanitize_figure=libformat.sanitize_figure,
+        clean_region_id=libformat.clean_rid,
+        is_template_name=lambda name: bool(_RW_TPL_RE.fullmatch(name)),
+        is_protected=replica_service.is_protected,
+        compose_text=layout_roles.compose_text,
+        normalize_language=_lang_code,
+        limits=LibArchiveLimits(
+            max_archive_bytes=libformat.MAX_BYTES,
+            max_inflated_bytes=libformat.MAX_INFLATED,
+            max_json_bytes=libformat.MAX_JSON,
+            max_figure_bytes=libformat.MAX_FIGURE,
+            max_pages=libformat.MAX_PAGES,
+            max_items_per_page=libformat.MAX_ITEMS,
+        ),
+    )
+    descriptors = _EngineItemRepository()
+    return FilesystemHostBindings(
+        catalogue=CatalogueBindings(
+            load_snapshot=_engine_item_snapshot,
+            descriptors=descriptors,
+            decode_record=_engine_item_command_decode,
+            encode_record=_engine_item_command_encode,
+            allocate_item_id=lambda existing: lib.gen_id(set(existing)),
+            lock_context_for=lambda: _builds_lock,
+        ),
+        replica=ReplicaBindings(
+            policies=policies,
+            text_repository=_EngineTextLayerRepository(),
+            read_json=lambda path: lib.load_json(path, {}),
+            write_json=lib.save_json,
+            lock_context_for=lambda _item_id: _ocr_merge_lock,
+        ),
+        interchange=InterchangeBindings(
+            planner=interchange_planner,
+            source_ids_for=_interchange_source_ids,
+            clean_region_id=libformat.clean_rid,
+            normalize_language=_lang_code,
+            sanitize_document_name=_ocr_name,
+        ),
+        translation=TranslationBindings(
+            item_exists_for=_translation_item_exists,
+            source_snapshot_for=_translation_source_snapshot,
+            source_reference_for=lambda source: _translation_document_name(
+                source.layer_id
+            ),
+        ),
+        workspace_lock_context_for=_engine_workspace_locks,
+        recovery_lock_context=_engine_recovery_locks,
+        jobs=JobHistoryBindings(
+            id_factory=lambda existing: lib.gen_id(existing),
+        ),
+    )
+
+
+def _open_engine_session(
+    workspace_root: Path | None = None,
+) -> FilesystemEngineSession:
+    """Open production resources after all compatibility seams exist."""
+
+    root = Path(workspace_root or lib.OUTPUT_DIR)
+    return open_filesystem_engine(
+        config=FilesystemEngineConfig(
+            workspace_root=root,
+            paths=FilesystemEnginePaths(
+                catalogue=BUILDS_PATH,
+                entries=ENTRIES_DIR,
+            ),
+            job_history=Path("jobs.json"),
+            job_keep=_JOBS_KEEP,
+        ),
+        bindings=_engine_host_bindings(),
+        contribute_modules=_engine_module_contributions,
+    )
+
+
+def _ensure_engine_session() -> FilesystemEngineSession:
+    """Atomically open and publish the process-lifetime engine session."""
+
+    global _engine_session
+    global _engine_write_set
+    global _job_manager
+    global _translation_provenance
+    global _jobs
+    global _jobs_events
+    global _jobs_lock
     global _library_engine_instance
-    if _library_engine_instance is None:
-        with _library_engine_guard:
-            if _library_engine_instance is None:
-                policies = _EngineReplicaPolicies()
-                interchange_planner = ExistingItemLibArchivePlanner(
-                    parse_format=libformat.parse_format,
-                    supported_major=libformat.SUPPORTED_MAJOR,
-                    sanitize_items=libformat.sanitize_page_items,
-                    sanitize_dims=libformat.sanitize_dims,
-                    sanitize_document_name=_ocr_name,
-                    sanitize_styles=libformat.sanitize_styles,
-                    sanitize_ext=libformat.sanitize_ext,
-                    sanitize_figure=libformat.sanitize_figure,
-                    clean_region_id=libformat.clean_rid,
-                    is_template_name=lambda name: bool(_RW_TPL_RE.fullmatch(name)),
-                    is_protected=replica_service.is_protected,
-                    compose_text=layout_roles.compose_text,
-                    normalize_language=_lang_code,
-                    limits=LibArchiveLimits(
-                        max_archive_bytes=libformat.MAX_BYTES,
-                        max_inflated_bytes=libformat.MAX_INFLATED,
-                        max_json_bytes=libformat.MAX_JSON,
-                        max_figure_bytes=libformat.MAX_FIGURE,
-                        max_pages=libformat.MAX_PAGES,
-                        max_items_per_page=libformat.MAX_ITEMS,
-                    ),
-                )
-                descriptors = _EngineItemRepository()
-                _library_engine_instance = compose_filesystem_engine(
-                    paths=FilesystemEnginePaths(
-                        catalogue=BUILDS_PATH,
-                        entries=ENTRIES_DIR,
-                    ),
-                    resources=FilesystemEngineResources(
-                        write_set=_engine_write_set,
-                        jobs=_job_manager,
-                        provenance=_translation_provenance,
-                        workspace_lock_context_for=_engine_workspace_locks,
-                    ),
-                    catalogue=CatalogueBindings(
-                        load_snapshot=_engine_item_snapshot,
-                        descriptors=descriptors,
-                        decode_record=_engine_item_command_decode,
-                        encode_record=_engine_item_command_encode,
-                        allocate_item_id=lambda existing:
-                            lib.gen_id(set(existing)),
-                        lock_context_for=lambda: _builds_lock,
-                    ),
-                    replica=ReplicaBindings(
-                        policies=policies,
-                        text_repository=_EngineTextLayerRepository(),
-                        read_json=lambda path: lib.load_json(path, {}),
-                        write_json=lib.save_json,
-                        # All Replica writes now take the workspace lease
-                        # before this shared legacy OCR lock.
-                        lock_context_for=lambda _item_id: _ocr_merge_lock,
-                    ),
-                    interchange=InterchangeBindings(
-                        planner=interchange_planner,
-                        source_ids_for=_interchange_source_ids,
-                        clean_region_id=libformat.clean_rid,
-                        normalize_language=_lang_code,
-                        sanitize_document_name=_ocr_name,
-                    ),
-                    translation=TranslationBindings(
-                        item_exists_for=_translation_item_exists,
-                        source_snapshot_for=_translation_source_snapshot,
-                        source_reference_for=lambda source:
-                            _translation_document_name(source.layer_id),
-                    ),
-                    contribution_factory=_engine_module_contributions,
-                )
-    return _library_engine_instance
+
+    session = _engine_session
+    if session is not None and not session.closed:
+        return session
+    with _library_engine_guard:
+        session = _engine_session
+        if session is None or session.closed:
+            opened = _open_engine_session()
+            # Resolve every property before publishing the session. If an
+            # opener ever returns an invalid/closed object, no partial set of
+            # compatibility aliases becomes visible.
+            try:
+                engine = opened.engine
+                write_set = opened.write_set
+                jobs = opened.jobs
+                provenance = opened.provenance
+                records = jobs.records
+                events = jobs.cancel_events
+                lock = jobs.lock
+            except BaseException:
+                try:
+                    opened.close()
+                except Exception:
+                    pass
+                raise
+
+            _engine_write_set = write_set
+            _job_manager = jobs
+            _translation_provenance = provenance
+            _jobs = records
+            _jobs_events = events
+            _jobs_lock = lock
+            _library_engine_instance = engine
+            _engine_session = opened
+            session = opened
+    return session
+
+
+def _close_engine_session() -> None:
+    """Unpublish and close the transport session after workers have stopped.
+
+    The current executable has no worker supervisor and therefore does not call
+    this automatically. Embedders that control every borrowed worker must call
+    it before in-process app disposal or ``importlib.reload(server)``.
+    """
+
+    global _engine_session
+    global _engine_write_set
+    global _job_manager
+    global _translation_provenance
+    global _jobs
+    global _jobs_events
+    global _jobs_lock
+    global _library_engine_instance
+
+    with _library_engine_guard:
+        session = _engine_session
+        if session is None:
+            return
+        try:
+            session.close()
+        finally:
+            _engine_session = None
+            _engine_write_set = None
+            _job_manager = None
+            _translation_provenance = None
+            _jobs = None
+            _jobs_events = None
+            _jobs_lock = None
+            _library_engine_instance = None
+
+
+def _library_engine() -> LibraryEngine:
+    """Return the engine owned by the process-lifetime filesystem session."""
+
+    return _ensure_engine_session().engine
 
 
 def _replica_engine() -> ReplicaApplicationService:
@@ -6807,22 +6923,6 @@ JOBS_PATH = lib.OUTPUT_DIR / "jobs.json"
 _JOBS_KEEP = 50                       # newest finished/interrupted entries kept
 _JOB_ACTIVE = ACTIVE_JOB_STATES
 _JOB_FIELDS = PUBLIC_JOB_FIELDS
-_job_manager = JobManager(
-    FilesystemJobHistoryRepository(
-        JOBS_PATH,
-        read_json=lambda path, default: lib.load_json(path, default),
-        write_json=lib.save_json,
-    ),
-    keep=_JOBS_KEEP,
-    id_factory=lambda existing: lib.gen_id(existing),
-)
-# Compatibility views for processors that still own mutable per-kind records.
-# New transports and services query the manager instead.
-_jobs = _job_manager.records
-_jobs_events = _job_manager.cancel_events
-_jobs_lock = _job_manager.lock
-
-
 class _JobCancelled(Exception):
     """Raised inside a worker at a stage boundary after a cancel request."""
 
@@ -6890,9 +6990,6 @@ def _jobs_load() -> None:
     output (progressively-saved OCR/translation pages) from abandoned work.
     Live entries are never clobbered."""
     _job_manager.rehydrate()
-
-
-_jobs_load()
 
 
 def _jobs_engine() -> JobManager:
@@ -11959,9 +12056,6 @@ def _lang_code(raw: str) -> str:
     return re.sub(r"[^a-z\-]", "", str(raw or "").lower())[:12]
 
 
-_translation_provenance = TranslationProvenanceService()
-
-
 def _page_sha(text: str) -> str:
     """Legacy SHA-1 used by version-1 translation metadata."""
     return _translation_provenance.legacy_source_hash(text)
@@ -15413,6 +15507,9 @@ def _apply_lan_state() -> None:
 
 
 if __name__ == "__main__":
+    # Explicit startup keeps recovery ahead of migrations and every worker.
+    # Imported WSGI/test hosts instead cross the same barrier on first request.
+    _ensure_engine_session()
     # Make existing user data portable (absolute -> data-root-relative paths).
     _migrate_stored_paths()
     # Warm the offline check indexes (the renewals CSV is ~40 MB) so the first

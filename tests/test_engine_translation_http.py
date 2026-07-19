@@ -7,8 +7,6 @@ from pathlib import Path
 
 import pytest
 
-from librarytool.adapters.filesystem import RecoverableWriteSet
-
 
 @pytest.fixture()
 def translation_workspace(monkeypatch, tmp_path: Path):
@@ -49,10 +47,19 @@ def translation_workspace(monkeypatch, tmp_path: Path):
 
     monkeypatch.setattr(server, "BUILDS_PATH", builds_path)
     monkeypatch.setattr(server, "ENTRIES_DIR", entries_dir)
-    monkeypatch.setattr(server, "_engine_write_set", RecoverableWriteSet(root))
-    monkeypatch.setattr(server, "_library_engine_instance", None)
-    yield server, entry
-    server._library_engine_instance = None
+    session = server._open_engine_session(root)
+    monkeypatch.setattr(server, "_engine_session", session)
+    monkeypatch.setattr(server, "_engine_write_set", session.write_set)
+    monkeypatch.setattr(server, "_job_manager", session.jobs)
+    monkeypatch.setattr(server, "_translation_provenance", session.provenance)
+    monkeypatch.setattr(server, "_jobs", session.jobs.records)
+    monkeypatch.setattr(server, "_jobs_events", session.jobs.cancel_events)
+    monkeypatch.setattr(server, "_jobs_lock", session.jobs.lock)
+    monkeypatch.setattr(server, "_library_engine_instance", session.engine)
+    try:
+        yield server, entry
+    finally:
+        session.close()
 
 
 def test_translation_reads_are_versioned_coherent_and_revalidatable(
