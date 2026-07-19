@@ -1,5 +1,6 @@
 """Filesystem-backed engine adapters."""
 
+from .canvas_query_repository import FilesystemCanvasQueryRepository
 from .job_history import FilesystemJobHistoryRepository
 from .item_command_repository import FilesystemItemCommandRepository
 from .item_lifecycle_repository import (
@@ -33,6 +34,7 @@ from .translation_repository import (
 
 __all__ = [
     "EMPTY_MANAGED_TREE_REVISION",
+    "FilesystemCanvasQueryRepository",
     "FilesystemItemCommandRepository",
     "FilesystemItemLifecycleRepository",
     "FilesystemItemLifecycleReservationRepository",
