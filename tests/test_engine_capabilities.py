@@ -27,6 +27,7 @@ from librarytool.engine.runtime import (
     JOB_SERVICE,
     LIB_OPEN_SERVICE,
     REPLICA_SERVICE,
+    REPRESENTATION_COMMAND_SERVICE,
     TEXT_LAYER_SERVICE,
     TRANSLATION_PROVENANCE_SERVICE,
     TRANSLATION_SERVICE,
@@ -341,7 +342,9 @@ def test_production_services_and_capabilities_are_one_sealed_graph(client):
     assert engine.capabilities.sealed is True
     assert engine.items is not None
     assert {policy.policy_id for policy in engine.items.policies} == {
+        "catalogue-commands",
         "replica",
+        "representation-commands",
         "text-layers",
         "translations",
     }
@@ -360,7 +363,13 @@ def test_production_services_and_capabilities_are_one_sealed_graph(client):
         for policy in engine.items.policies
         for command in policy.contribute(context).available_commands
     }
-    assert commands == {"replica.open"}
+    assert commands == {
+        "item.metadata.edit",
+        "replica.open",
+        "representation.attach",
+        "representation.detach",
+        "representation.replace",
+    }
     for key, service in (
         (ITEM_QUERY_SERVICE, engine.items),
         (ITEM_COMMAND_SERVICE, engine.item_commands),
@@ -368,6 +377,10 @@ def test_production_services_and_capabilities_are_one_sealed_graph(client):
         (LIB_OPEN_SERVICE, engine.require_service(LIB_OPEN_SERVICE)),
         (JOB_SERVICE, engine.jobs),
         (REPLICA_SERVICE, engine.replica),
+        (
+            REPRESENTATION_COMMAND_SERVICE,
+            engine.require_service(REPRESENTATION_COMMAND_SERVICE),
+        ),
         (TEXT_LAYER_SERVICE, engine.text_layers),
         (TRANSLATION_SERVICE, engine.translations),
         (

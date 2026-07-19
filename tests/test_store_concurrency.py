@@ -119,17 +119,32 @@ def test_background_build_apply_always_bumps_editor_revision(client):
 
 def test_folder_sync_returns_revision_from_legacy_preview_rename(
         client, data_root, monkeypatch):
+    from pypdf import PdfWriter
+
     b = _create(client, "Legacy preview")
     entry = server._entry_dir(b["id"])
     entry.mkdir(parents=True, exist_ok=True)
     legacy = entry / "preview.pdf"
     legacy.write_bytes(b"%PDF-legacy")
     rel = legacy.resolve().relative_to(data_root.resolve()).as_posix()
-    before = server._builds_apply(b["id"], {"pdf_file": rel})
+    builds = lib.load_json(server.BUILDS_PATH, {})
+    builds[b["id"]]["pdf_file"] = rel
+    before = server._build_updated_at(builds[b["id"]].get("updated_at"))
+    builds[b["id"]]["updated_at"] = before
+    lib.save_json(server.BUILDS_PATH, builds)
 
     generated = data_root / "generated-preview.pdf"
-    generated.write_bytes(b"%PDF-primary")
-    monkeypatch.setattr(server, "_preview_pdf", lambda _src, _pages: generated)
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    with generated.open("wb") as stream:
+        writer.write(stream)
+    preview_calls = []
+
+    def preview(source, pages):
+        preview_calls.append((source.resolve(), pages))
+        return generated
+
+    monkeypatch.setattr(server, "_preview_pdf", preview)
     monkeypatch.setattr(
         server, "_pdf_extract_text", lambda _src: (1, 1, "page text", 1))
 
@@ -143,6 +158,19 @@ def test_folder_sync_returns_revision_from_legacy_preview_rename(
     assert returned["updated_at"] == saved["updated_at"]
     assert returned["updated_at"] != before
     assert not legacy.exists()
+
+    first_representation = client.get(
+        f"/api/v1/items/{b['id']}/representations"
+    ).get_json()["representations"][0]
+    assert first_representation["content_state"] == "unchanged"
+    second = client.post(
+        f"/api/builds/{b['id']}/folder", json={"keep_original": True})
+    assert second.status_code == 200
+    second_representation = client.get(
+        f"/api/v1/items/{b['id']}/representations"
+    ).get_json()["representations"][0]
+    assert len(preview_calls) == 1
+    assert second_representation == first_representation
 
 
 def test_save_json_concurrent_same_path_never_corrupts(data_root):

@@ -266,6 +266,75 @@ def test_staging_does_not_publish_without_commit(tmp_path):
     assert _live_tree(root) == {}
 
 
+def test_composing_adapter_can_stage_managed_record_and_publish_catalogue_last(
+    tmp_path,
+):
+    root = tmp_path / "managed-composition"
+    _write_catalogue(root, {"book": _raw_record()})
+    store, repository = _repository(root)
+
+    with repository.unit_of_work(operation_id="managed-one") as unit:
+        raw = unit.raw_record("book")
+        assert raw is not None
+        raw["storage_only"] = "representation-attached"
+        raw["revision"] = "rev-2"
+
+        staged = unit.stage_managed_record("book", raw)
+        assert staged.revision == "rev-2"
+        # The returned raw value is detached from the locked snapshot.
+        raw["storage_only"] = "mutated-after-staging"
+        assert unit.raw_record("book")["storage_only"] == "legacy-field"
+
+        transaction = store.begin(
+            operation_id="managed-one",
+            scope="test-managed-composition",
+        )
+        transaction.stage_write("aggregate-receipt.json", b"{}")
+        unit.stage_catalogue_publication(transaction)
+        transaction.commit()
+
+    assert _catalogue(root)["book"]["storage_only"] == (
+        "representation-attached"
+    )
+    journal = json.loads(
+        next(store.transactions_dir.glob("*/journal.json")).read_text("utf-8")
+    )
+    assert [entry["target"] for entry in journal["entries"]] == [
+        "aggregate-receipt.json",
+        "catalogue.json",
+    ]
+
+
+def test_managed_record_composition_rejects_invalid_scope_and_double_publish(
+    tmp_path,
+):
+    root = tmp_path / "managed-invalid"
+    _write_catalogue(root, {"book": _raw_record()})
+    store, repository = _repository(root)
+
+    with repository.unit_of_work(operation_id="managed-invalid") as unit:
+        assert unit.raw_record("missing") is None
+        with pytest.raises(RepositoryError) as missing:
+            unit.stage_managed_record("missing", {})
+        assert missing.value.code == "item_not_found"
+        with pytest.raises(RepositoryError) as invalid:
+            unit.stage_managed_record("book", {"not": "a record"})
+        assert invalid.value.code == "item_record_codec_failed"
+
+        raw = unit.raw_record("book")
+        assert raw is not None
+        raw["revision"] = "rev-2"
+        unit.stage_managed_record("book", raw)
+        transaction = store.begin(
+            operation_id="managed-invalid",
+            scope="test-managed-composition",
+        )
+        unit.stage_catalogue_publication(transaction)
+        with pytest.raises(RepositoryError) as repeated:
+            unit.stage_catalogue_publication(transaction)
+        assert repeated.value.code == "item_mutation_already_staged"
+
+
 def test_commit_rejects_a_receipt_for_another_replaced_revision(tmp_path):
     root = tmp_path / "receipt-scope"
     _write_catalogue(root, {"book": _raw_record()})

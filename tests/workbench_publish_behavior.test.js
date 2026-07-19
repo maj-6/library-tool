@@ -210,6 +210,7 @@ test("an A save resolving after selecting B leaves B dirty and untouched", async
     buildDescMd: { get: () => "description" },
     buildGroupIdFor: () => "",
     currentBuild: () => state.builds[state.buildSel],
+    buildIsDirty: () => true,
     activeHistoryTab: () => "workbench",
     patchBuild: () => wait.promise,
     status: () => {},

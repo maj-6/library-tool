@@ -123,14 +123,16 @@ def test_legacy_build_projection_is_explicit_and_preserves_current_ui_shape(
     _server, builds, private = item_catalog
 
     default = client.get("/api/v1/items/book-one").get_json()["item"]
-    projected = client.get(
+    projected_response = client.get(
         "/api/v1/items/book-one?projection=build-workbench"
-    ).get_json()["item"]
+    )
+    projected = projected_response.get_json()["item"]
 
     assert "compatibility" not in default
     assert projected["compatibility"]["schema"] == "librarytool.build-record/1"
     assert projected["compatibility"]["build"] == builds["book-one"]
     assert projected["compatibility"]["build"]["pdf_file"] == str(private)
+    assert projected_response.headers["Cache-Control"] == "no-store"
 
 
 def test_item_child_resources_and_readiness_have_machine_contracts(

@@ -45,6 +45,9 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
   assert.equal(typeof client.items.create, "function");
   assert.equal(typeof client.items.update, "function");
   assert.equal(typeof client.items.representations, "function");
+  assert.equal(typeof client.items.attachRepresentation, "function");
+  assert.equal(typeof client.items.replaceRepresentation, "function");
+  assert.equal(typeof client.items.detachRepresentation, "function");
   assert.equal(typeof client.items.artifacts, "function");
   assert.equal(typeof client.items.readiness, "function");
   const jsonMethods = [
@@ -240,6 +243,77 @@ test("item commands reject missing or unsafe preconditions locally", () => {
       (error) => error instanceof TypeError && /recordRevision/.test(error.message),
     );
   }
+  assert.equal(calls.length, 0);
+});
+
+test("representation commands use path-safe dual-CAS engine resources", async () => {
+  const { client, calls } = harness({ ok: true, receipt: {} });
+  const representation = {
+    source_token: "C:\\Scans\\herbal.pdf",
+    acquisition: "reference",
+    expected_content_sha256: "",
+    expected_size: null,
+    role: "alternate",
+    media_type: "application/pdf",
+    label: "Alternate scan",
+    metadata: { shelf: "A-2" },
+  };
+
+  await client.items.attachRepresentation({
+    itemId: "book / one",
+    representationId: "scan !*",
+    representation,
+    recordRevision: "item-r1",
+    idempotencyKey: "attach-1",
+  });
+  await client.items.replaceRepresentation({
+    itemId: "book / one",
+    representationId: "scan !*",
+    representation,
+    recordRevision: "item-r2",
+    representationRevision: "source-r1",
+    idempotencyKey: "replace-1",
+  });
+  await client.items.detachRepresentation({
+    itemId: "book / one",
+    representationId: "scan !*",
+    recordRevision: "item-r3",
+    representationRevision: "source-r2",
+    idempotencyKey: "detach-1",
+  });
+
+  const url = "/api/v1/items/book%20%2F%20one/representations/scan%20%21%2A";
+  assert.deepEqual(calls.map((call) => [call.url, call.init.method]), [
+    [url, "PUT"], [url, "PUT"], [url, "DELETE"],
+  ]);
+  assert.equal(calls[0].init.headers["If-Representation-Match"], undefined);
+  assert.equal(calls[0].init.headers["If-Record-Match"], '"item-r1"');
+  assert.equal(calls[1].init.headers["If-Representation-Match"],
+    '"source-r1"');
+  assert.deepEqual(JSON.parse(calls[0].init.body), { representation });
+  assert.equal(calls[2].init.headers["If-Representation-Match"],
+    '"source-r2"');
+  assert.equal(calls[2].init.body, undefined);
+});
+
+test("representation commands reject ambiguous or missing preconditions locally", () => {
+  const { client, calls } = harness();
+  const base = {
+    itemId: "book", representationId: "scan", representation: {},
+    recordRevision: "item-r1", idempotencyKey: "representation-1",
+  };
+  assert.throws(
+    () => client.items.attachRepresentation({
+      ...base, representationRevision: "source-r1",
+    }), /does not accept representationRevision/);
+  assert.throws(
+    () => client.items.replaceRepresentation(base),
+    /representationRevision/);
+  assert.throws(
+    () => client.items.detachRepresentation({
+      itemId: "book", representationId: "scan",
+      recordRevision: "item-r1", idempotencyKey: "detach-1",
+    }), /representationRevision/);
   assert.equal(calls.length, 0);
 });
 
@@ -593,4 +667,698 @@ test("the initial build load crosses the semantic item client boundary", () => {
   // Existing mutation routes remain transitional; only the collection GET
   // belongs to this slice.
   assert.doesNotMatch(loader, /fetch\s*\(\s*["']\/api\/builds["']/);
+});
+
+test("build projections retain item command eligibility", () => {
+  const app = fs.readFileSync(appPath, "utf8");
+  const start = app.indexOf("function engineBuildProjection");
+  const end = app.indexOf("async function loadBuilds", start);
+  assert.ok(start >= 0 && end > start);
+  const context = vm.createContext({});
+  vm.runInContext(`${app.slice(start, end)}
+this.project = engineBuildProjection;`, context);
+  const item = {
+    id: "book", title: "Herbal", record_revision: "item-r1",
+    compatibility: { build: { id: "legacy", title: "Old" } },
+    representations: [],
+    workbench_state: { available_commands: [
+      "representation.attach", "representation.attach", "replica.open",
+    ] },
+  };
+
+  const build = context.project(item);
+  assert.deepEqual(Array.from(build._available_commands), [
+    "representation.attach", "replica.open",
+  ]);
+  item.workbench_state.available_commands.push("representation.detach");
+  assert.equal(build._available_commands.includes("representation.detach"), false);
+});
+
+test("late semantic item reads cannot replace a newer incarnation", async () => {
+  const app = fs.readFileSync(appPath, "utf8");
+  const refreshStart = app.indexOf("async function refreshBuildEngineRecord");
+  const refreshEnd = app.indexOf("function representationOperationKey", refreshStart);
+  const generationStart = app.indexOf("const buildEngineRecordGenerations");
+  const generationEnd = app.indexOf("let secondaryRepresentationSequence", generationStart);
+  assert.ok(refreshStart >= 0 && refreshEnd > refreshStart);
+  assert.ok(generationStart >= 0 && generationEnd > generationStart);
+
+  const pendingReads = [];
+  const state = { builds: {
+    book: { id: "book", _record_revision: "item-r1", marker: "initial" },
+  } };
+  const context = vm.createContext({
+    state,
+    engineClient: { items: { get: () => new Promise((resolve) => {
+      pendingReads.push(resolve);
+    }) } },
+    engineBuildProjection: (item) => item.build,
+  });
+  vm.runInContext(`${app.slice(generationStart, generationEnd)}
+${app.slice(refreshStart, refreshEnd)}
+this.api = { refreshBuildEngineRecord, advanceBuildEngineRecordGeneration };`, context);
+
+  const staleAfterReceipt = context.api.refreshBuildEngineRecord("book");
+  context.api.advanceBuildEngineRecordGeneration("book");
+  state.builds.book = {
+    id: "book", _record_revision: "item-r2", marker: "receipt",
+  };
+  pendingReads.shift()({
+    item: { build: {
+      id: "book", _record_revision: "item-r1", marker: "stale-read",
+    } },
+  });
+  await staleAfterReceipt;
+  assert.equal(state.builds.book.marker, "receipt");
+
+  const staleAfterDelete = context.api.refreshBuildEngineRecord("book");
+  context.api.advanceBuildEngineRecordGeneration("book");
+  delete state.builds.book;
+  pendingReads.shift()({
+    item: { build: {
+      id: "book", _record_revision: "item-r2", marker: "deleted-read",
+    } },
+  });
+  await staleAfterDelete;
+  assert.equal("book" in state.builds, false);
+});
+
+test("interactive PDF attachment crosses the representation command boundary", () => {
+  const app = fs.readFileSync(appPath, "utf8");
+  const start = app.indexOf("async function refreshBuildEngineRecord");
+  const end = app.indexOf("async function patchBuildRaw", start);
+  assert.ok(start >= 0 && end > start);
+  const attachment = app.slice(start, end);
+
+  assert.match(attachment, /engineClient\.items\.get\(/);
+  assert.match(attachment, /engineClient\.items\.attachRepresentation\(/);
+  assert.match(attachment, /engineClient\.items\.replaceRepresentation\(/);
+  assert.match(attachment, /engineClient\.items\.detachRepresentation\(/);
+  assert.match(attachment, /pendingRepresentationMutations/);
+  assert.match(attachment, /return receipt/);
+  assert.match(attachment, /recordRevision:\s*transition\.receipt\.after_item_revision/);
+  assert.match(attachment, /representationRevision:\s*current\s*&&\s*current\.revision/);
+  assert.doesNotMatch(attachment, /\bfetch\s*\(/);
+  assert.doesNotMatch(attachment, /["'`]\/api\/builds/);
+  assert.doesNotMatch(attachment, /method:\s*["']HEAD["']/);
+
+  const saveStart = app.indexOf("async function saveBuildFields");
+  const saveEnd = app.indexOf("async function deleteBuild", saveStart);
+  const save = app.slice(saveStart, saveEnd);
+  assert.match(save, /if \(f === "pdf_file"\) continue/);
+
+  const refreshStart = app.indexOf("async function refreshSourceTab");
+  const refreshEnd = app.indexOf("async function syncBuildFolder", refreshStart);
+  const refresh = app.slice(refreshStart, refreshEnd);
+  assert.match(refresh,
+    /const receipt = await setBuildRepresentation\([\s\S]*if \(receipt\)/);
+  assert.match(refresh, /representationFailureMessage/);
+});
+
+function representationSnapshot(id, revision) {
+  return {
+    id,
+    revision,
+    role: id === "primary" ? "primary" : "alternate",
+    media_type: "application/pdf",
+    locator: `urn:test:${id}`,
+    label: id === "primary" ? "Primary source" : "Alternate source",
+    available: true,
+    disposition: "referenced",
+    content_sha256: "a".repeat(64),
+    size: 42,
+    metadata: { fixture: true },
+  };
+}
+
+function representationResult(action, {
+  itemId = "book", representationId = "primary",
+  beforeItem = "item-r1", afterItem = "item-r2",
+  before = null, after = representationSnapshot(representationId, "source-r1"),
+} = {}) {
+  return {
+    ok: true,
+    replayed: false,
+    receipt: {
+      action,
+      operation_id: `${action}-operation`,
+      command_sha256: "b".repeat(64),
+      item_id: itemId,
+      representation_id: representationId,
+      before_item_revision: beforeItem,
+      after_item_revision: afterItem,
+      before,
+      after,
+    },
+  };
+}
+
+function representationUiHarness({ build, attach, replace, detach, refresh } = {}) {
+  const app = fs.readFileSync(appPath, "utf8");
+  const start = app.indexOf("function representationOperationKey");
+  const end = app.indexOf("async function patchBuildRaw", start);
+  assert.ok(start >= 0 && end > start);
+  const operations = [];
+  const initialBuild = build || {
+    id: "book", title: "Herbal", _record_revision: "item-r1",
+    _representations: [], pdf_file: "", pdf_sources: [],
+  };
+  if (!Object.prototype.hasOwnProperty.call(initialBuild, "_available_commands")) {
+    initialBuild._available_commands = [
+      "representation.attach", "representation.replace", "representation.detach",
+    ];
+  }
+  const state = { builds: { book: initialBuild } };
+  const context = vm.createContext({
+    state,
+    crypto: { randomUUID: () => "12345678-1234-4234-8234-123456789abc" },
+    engineClient: { items: {
+      attachRepresentation: attach || (async () => {
+        throw new Error("unexpected attach");
+      }),
+      replaceRepresentation: replace || (async () => {
+        throw new Error("unexpected replace");
+      }),
+      detachRepresentation: detach || (async () => {
+        throw new Error("unexpected detach");
+      }),
+    } },
+    refreshBuildEngineRecord: refresh || (async (id) => state.builds[id]),
+    pushOp: (label, undoFn, redoFn, revert, originTab) => {
+      operations.push({ label, undoFn, redoFn, revert, originTab });
+      return operations.length;
+    },
+  });
+  vm.runInContext(`${app.slice(start, end)}
+this.api = { setBuildRepresentation, pushRepresentationOp,
+  secondaryRepresentationId, representationFailureMessage,
+  representationCommandAvailable, updateRepresentationMutationControls,
+  clearPendingRepresentationMutationsForItem,
+  invalidateRepresentationItemIncarnation,
+  generation: buildEngineRecordGeneration,
+  pendingCount: () => pendingRepresentationMutations.size };`, context);
+  return { api: context.api, context, state, operations };
+}
+
+test("representation controls follow advertised workbench commands", () => {
+  const build = {
+    id: "book", _record_revision: "item-r1", _representations: [],
+    _available_commands: [], pdf_file: "", pdf_sources: [],
+  };
+  const h = representationUiHarness({ build });
+  const elements = {
+    "b-pdf_file": { value: "", disabled: false },
+    "b-pdf-attach": { disabled: false },
+    "b-pdf-browse": { disabled: false },
+    "b-pdf2-add": { disabled: false },
+    "b-src-msg": { textContent: "" },
+    "b-pdf-sources": {
+      querySelectorAll: () => [{ disabled: false }],
+    },
+  };
+  h.context.el = (id) => elements[id] || null;
+
+  h.api.updateRepresentationMutationControls(build);
+  assert.equal(elements["b-pdf_file"].disabled, true);
+  assert.equal(elements["b-pdf-attach"].disabled, true);
+  assert.equal(elements["b-pdf-browse"].disabled, true);
+  assert.equal(elements["b-pdf2-add"].disabled, true);
+  assert.equal(elements["b-src-msg"].textContent, "Source tools unavailable");
+
+  build._available_commands = ["representation.attach"];
+  elements["b-src-msg"].textContent = "";
+  h.api.updateRepresentationMutationControls(build);
+  assert.equal(elements["b-pdf_file"].disabled, false);
+  assert.equal(elements["b-pdf-attach"].disabled, true);
+  assert.equal(elements["b-pdf-browse"].disabled, false);
+  assert.equal(elements["b-pdf2-add"].disabled, false);
+  assert.equal(elements["b-src-msg"].textContent, "");
+
+  elements["b-pdf_file"].value = "C:/scans/herbal.pdf";
+  h.api.updateRepresentationMutationControls(build);
+  assert.equal(elements["b-pdf-attach"].disabled, false);
+});
+
+test("unknown representation capability state fails closed", async () => {
+  let attachCalls = 0;
+  const build = {
+    id: "book", _record_revision: "item-r1", _representations: [],
+    pdf_file: "", pdf_sources: [],
+  };
+  const h = representationUiHarness({
+    build,
+    attach: async () => { attachCalls += 1; },
+  });
+  delete build._available_commands;
+  const elements = {
+    "b-pdf_file": { value: "C:/scans/herbal.pdf", disabled: false },
+    "b-pdf-attach": { disabled: false },
+    "b-pdf-browse": { disabled: false },
+    "b-pdf2-add": { disabled: false },
+    "b-src-msg": { textContent: "" },
+    "b-pdf-sources": { querySelectorAll: () => [] },
+  };
+  h.context.el = (id) => elements[id] || null;
+
+  h.api.updateRepresentationMutationControls(build);
+  assert.equal(elements["b-pdf_file"].disabled, true);
+  assert.equal(elements["b-pdf-attach"].disabled, true);
+  assert.equal(elements["b-pdf-browse"].disabled, true);
+  assert.equal(elements["b-pdf2-add"].disabled, true);
+  assert.equal(elements["b-src-msg"].textContent, "Source tools unavailable");
+
+  const receipt = await h.api.setBuildRepresentation(
+    "book", "primary", "C:/scans/herbal.pdf",
+    { intent: "attach", recordRevision: "item-r1" });
+  assert.equal(receipt, null);
+  assert.equal(attachCalls, 0);
+});
+
+test("representation failures keep unavailable, invalid PDF, and CAS states distinct", async () => {
+  async function failureMessage(error, build) {
+    const h = representationUiHarness({
+      build: build || {
+        id: "book", _record_revision: "item-r1", _representations: [],
+        _available_commands: ["representation.attach"],
+        pdf_file: "", pdf_sources: [],
+      },
+      attach: async () => { throw error; },
+      replace: async () => { throw error; },
+    });
+    const current = h.state.builds.book._representations[0] || null;
+    await h.api.setBuildRepresentation(
+      "book", "primary", "C:/scans/herbal.pdf", {
+        intent: current ? "replace" : "attach",
+        recordRevision: "item-r1",
+        representationRevision: current && current.revision,
+      });
+    return h.api.representationFailureMessage("book", "primary");
+  }
+
+  assert.equal(await failureMessage(Object.assign(new Error("module absent"), {
+    code: "representation_command_unavailable", status: 503, retryable: true,
+  })), "Source tools unavailable");
+  assert.equal(await failureMessage(Object.assign(new Error("not a PDF"), {
+    code: "invalid_representation_source", status: 400,
+  })), "Invalid or changed PDF");
+  const current = representationSnapshot("primary", "source-r1");
+  assert.equal(await failureMessage(Object.assign(new Error("stale"), {
+    code: "representation_revision_conflict", status: 409,
+  }), {
+    id: "book", _record_revision: "item-r1", _representations: [current],
+    _available_commands: ["representation.replace"],
+    pdf_file: "C:/scans/old.pdf", pdf_sources: [],
+  }), "Source changed elsewhere");
+});
+
+test("deleting an item incarnation drops uncertain representation commands", async () => {
+  const error = Object.assign(new Error("response lost"), {
+    code: "network-error", status: 0, retryable: true,
+  });
+  const h = representationUiHarness({ attach: async () => { throw error; } });
+  await h.api.setBuildRepresentation(
+    "book", "primary", "C:/scans/herbal.pdf",
+    { intent: "attach", recordRevision: "item-r1" });
+  assert.equal(h.api.pendingCount(), 1);
+
+  h.api.invalidateRepresentationItemIncarnation("book");
+  assert.equal(h.api.pendingCount(), 0);
+  assert.equal(h.api.generation("book"), 1);
+
+  const app = fs.readFileSync(appPath, "utf8");
+  const restoreStart = app.indexOf("async function restoreDeletedBuildFromTrash");
+  const deleteStart = app.indexOf("async function deleteBuild", restoreStart);
+  const restore = app.slice(restoreStart, deleteStart);
+  assert.match(restore, /invalidateRepresentationItemIncarnation/);
+  assert.match(restore, /fetch\("\/api\/trash\/restore"/);
+  assert.doesNotMatch(restore, /\/api\/builds\/restore/);
+  const deletion = app.slice(deleteStart, app.indexOf("function exportBuilds", deleteStart));
+  assert.match(deletion, /deleteBuildToTrash/);
+});
+
+test("build history restores trusted Trash records and advances recovery handles", async () => {
+  const app = fs.readFileSync(appPath, "utf8");
+  const start = app.indexOf("async function deleteBuildToTrash");
+  const end = app.indexOf("function exportBuilds", start);
+  assert.ok(start >= 0 && end > start);
+  const state = { builds: {
+    book: {
+      id: "book", title: "Herbal", updated_at: "item-r1",
+      _record_revision: "item-r1", _representations: [],
+      _available_commands: ["representation.attach"],
+      pdf_file: "", pdf_sources: [],
+    },
+  }, buildSel: "book" };
+  const operations = [];
+  const restoreIds = [];
+  const invalidated = [];
+  let deleteCount = 0;
+  let missingHandle = false;
+  const context = vm.createContext({
+    state,
+    fetch: async (url, init = {}) => {
+      if (init.method === "DELETE") {
+        deleteCount += 1;
+        return response(200, missingHandle
+          ? { ok: true }
+          : { ok: true, trash_id: `trash-${deleteCount}` });
+      }
+      assert.equal(url, "/api/trash/restore");
+      const body = JSON.parse(init.body);
+      restoreIds.push(body.id);
+      return response(200, { ok: true, replayed: false, build: {
+        id: "book", title: "Herbal", updated_at: `item-restored-${deleteCount}`,
+        pdf_file: "", pdf_sources: [],
+      } });
+    },
+    invalidateRepresentationItemIncarnation: (id) => invalidated.push(id),
+    refreshBuildEngineRecord: async (id) => {
+      state.builds[id]._available_commands = ["representation.attach"];
+      return state.builds[id];
+    },
+    pushOp: (label, undoFn, redoFn) => {
+      operations.push({ label, undoFn, redoFn });
+    },
+    renderUpload: () => {},
+    status: () => {},
+    statusCrit: () => {},
+  });
+  vm.runInContext(`${app.slice(start, end)}
+this.api = { deleteBuild, deleteBuildToTrash };`, context);
+
+  await context.api.deleteBuild("workbench");
+  assert.equal("book" in state.builds, false);
+  assert.equal(operations.length, 1);
+
+  await operations[0].undoFn();
+  assert.equal(state.builds.book.id, "book");
+  await operations[0].redoFn();
+  assert.equal("book" in state.builds, false);
+  await operations[0].undoFn();
+  assert.deepEqual(restoreIds, ["trash-1", "trash-2"]);
+  assert.equal(invalidated.length, 4,
+    "delete, restore, delete, and restore transitions invalidate incarnations");
+
+  state.builds.other = { id: "other" };
+  missingHandle = true;
+  await assert.rejects(context.api.deleteBuildToTrash("other"),
+    /recovery handle/);
+  assert.equal(state.builds.other.id, "other");
+  assert.doesNotMatch(app.slice(start, end), /\/api\/builds\/restore/);
+});
+
+test("representation mutation retries and later recovery reuse one operation key", async () => {
+  const keys = [];
+  let attempts = 0;
+  const confirmed = representationResult("attach");
+  const h = representationUiHarness({
+    attach: async (args) => {
+      keys.push(args.idempotencyKey);
+      attempts += 1;
+      if (attempts <= 2) {
+        const error = new Error("connection dropped");
+        error.code = "network-error";
+        error.status = 0;
+        throw error;
+      }
+      return confirmed;
+    },
+    refresh: async () => { throw new Error("still offline"); },
+  });
+
+  const first = await h.api.setBuildRepresentation(
+    "book", "primary", "C:/scans/herbal.pdf",
+    { intent: "attach", recordRevision: "item-r1" });
+  assert.equal(first, null);
+  assert.equal(h.api.pendingCount(), 1);
+
+  const recovered = await h.api.setBuildRepresentation(
+    "book", "primary", "C:/scans/herbal.pdf",
+    { intent: "replace", recordRevision: "item-newer" });
+  assert.equal(recovered, confirmed.receipt);
+  assert.equal(new Set(keys).size, 1,
+    "the uncertain attach is replayed even if refreshed state suggests replace");
+  assert.equal(h.api.pendingCount(), 0);
+});
+
+test("a receipt-confirmed mutation succeeds when its follow-up refresh fails", async () => {
+  const calls = [];
+  const confirmed = representationResult("attach");
+  const h = representationUiHarness({
+    attach: async (args) => {
+      calls.push(args);
+      if (calls.length === 1) {
+        const error = new Error("response lost after send");
+        error.code = "network-error";
+        error.status = 0;
+        throw error;
+      }
+      return confirmed;
+    },
+    refresh: async () => { throw new Error("refresh unavailable"); },
+  });
+
+  const receipt = await h.api.setBuildRepresentation(
+    "book", "primary", "C:/scans/herbal.pdf",
+    { intent: "attach", recordRevision: "item-r1" });
+
+  assert.equal(receipt, confirmed.receipt);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].idempotencyKey, calls[1].idempotencyKey);
+  assert.equal(h.state.builds.book._record_revision, "item-r2");
+  assert.equal(h.state.builds.book.pdf_file, "C:/scans/herbal.pdf");
+  assert.equal(h.state.builds.book._representations[0].revision, "source-r1");
+  assert.equal(h.api.generation("book"), 1);
+});
+
+test("representation history chains exact receipt revisions through undo and redo", async () => {
+  const firstSource = representationSnapshot("primary", "source-r1");
+  const redoSource = representationSnapshot("primary", "source-r2");
+  const initial = representationResult("attach", { after: firstSource }).receipt;
+  const detachCalls = [];
+  const attachCalls = [];
+  const h = representationUiHarness({
+    build: {
+      id: "book", title: "Herbal", _record_revision: "item-r2",
+      _representations: [firstSource], pdf_file: "C:/scans/herbal.pdf",
+      pdf_sources: [],
+    },
+    detach: async (args) => {
+      detachCalls.push(args);
+      if (detachCalls.length > 1) {
+        const error = new Error("changed elsewhere");
+        error.code = "representation_revision_conflict";
+        error.status = 409;
+        throw error;
+      }
+      return representationResult("detach", {
+        beforeItem: "item-r2", afterItem: "item-r3",
+        before: firstSource, after: null,
+      });
+    },
+    attach: async (args) => {
+      attachCalls.push(args);
+      return representationResult("attach", {
+        beforeItem: "item-r3", afterItem: "item-r4", after: redoSource,
+      });
+    },
+    refresh: async () => { throw new Error("refresh unavailable"); },
+  });
+
+  h.api.pushRepresentationOp(
+    "attach source", "book", "primary", initial,
+    "", "C:/scans/herbal.pdf", "workbench");
+  const operation = h.operations[0];
+  await operation.undoFn();
+  assert.equal(detachCalls[0].recordRevision, "item-r2");
+  assert.equal(detachCalls[0].representationRevision, "source-r1");
+
+  await operation.redoFn();
+  assert.equal(attachCalls[0].recordRevision, "item-r3");
+  assert.equal("representationRevision" in attachCalls[0], false);
+  assert.equal(attachCalls[0].representation.expected_content_sha256,
+    firstSource.content_sha256);
+
+  h.state.builds.book._record_revision = "item-concurrent";
+  h.state.builds.book._representations[0].revision = "source-concurrent";
+  await assert.rejects(operation.undoFn, /changed elsewhere/i);
+  assert.equal(detachCalls[1].recordRevision, "item-r4");
+  assert.equal(detachCalls[1].representationRevision, "source-r2");
+});
+
+test("secondary IDs are portable and attach intent never degrades into replace", async () => {
+  const collided = representationSnapshot("collision", "source-r1");
+  let attachCalls = 0;
+  let replaceCalls = 0;
+  const h = representationUiHarness({
+    build: {
+      id: "book", _record_revision: "item-r1",
+      _representations: [collided], pdf_sources: [
+        { id: "collision", path: "C:/old.pdf" },
+      ],
+    },
+    attach: async () => {
+      attachCalls += 1;
+      const error = new Error("already exists");
+      error.code = "representation_already_exists";
+      error.status = 409;
+      throw error;
+    },
+    replace: async () => { replaceCalls += 1; },
+  });
+
+  const id = h.api.secondaryRepresentationId(h.state.builds.book);
+  assert.match(id, /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/);
+  assert.notEqual(id.toLowerCase(), "collision");
+  const result = await h.api.setBuildRepresentation(
+    "book", "collision", "C:/new.pdf",
+    { intent: "attach", recordRevision: "item-r1" });
+  assert.equal(result, null);
+  assert.equal(attachCalls, 1);
+  assert.equal(replaceCalls, 0);
+});
+
+test("metadata Save does not claim or persist a PDF source draft", async () => {
+  const app = fs.readFileSync(appPath, "utf8");
+  const start = app.indexOf("async function saveBuildFields");
+  const end = app.indexOf("async function deleteBuildToTrash", start);
+  assert.ok(start >= 0 && end > start);
+  const elements = {
+    "b-pdf_file": { value: "C:/scans/new.pdf" },
+    "b-title": { value: "Herbal" },
+    "b-ready": { classList: { contains: () => false } },
+    "build-msg": { textContent: "" },
+    "b-src-msg": { textContent: "" },
+  };
+  const state = { buildSel: "book", builds: { book: {
+    id: "book", title: "Herbal", updated_at: "item-r1",
+    pdf_file: "C:/scans/old.pdf", status: "draft",
+  } } };
+  const patches = [];
+  const statuses = [];
+  const context = vm.createContext({
+    state,
+    BUILD_FIELDS: ["title", "pdf_file"],
+    el: (id) => elements[id] || null,
+    activeHistoryTab: () => "workbench",
+    buildIsDirty: () => context.metadataDirty,
+    metadataDirty: false,
+    catPickers: { "b-categories": { get: () => [] } },
+    buildDescMd: { get: () => "Description" },
+    currentBuild: () => state.builds[state.buildSel],
+    patchBuild: async (id, fields) => {
+      patches.push({ id, fields: { ...fields } });
+      return true;
+    },
+    buildEditGeneration: 0,
+    buildPatchConflict: false,
+    descState: {},
+    buildDirty: false,
+    renderBuildEditor: () => {},
+    status: (message) => statuses.push(message),
+  });
+  vm.runInContext(`${app.slice(start, end)}
+this.saveBuildFields = saveBuildFields;`, context);
+
+  assert.equal(await context.saveBuildFields(), false);
+  assert.equal(patches.length, 0);
+  assert.equal(elements["build-msg"].textContent, "");
+  assert.equal(elements["b-src-msg"].textContent, "Not attached");
+
+  context.metadataDirty = true;
+  assert.equal(await context.saveBuildFields(), true);
+  assert.equal("pdf_file" in patches[0].fields, false);
+  assert.equal(elements["build-msg"].textContent, "Metadata saved");
+  assert.equal(elements["b-src-msg"].textContent, "Not attached");
+  assert.match(statuses[0], /^METADATA SAVED/);
+
+  const listenerStart = app.indexOf('el("build-form").addEventListener("input"');
+  const listenerEnd = app.indexOf('el("build-save").addEventListener', listenerStart);
+  assert.match(app.slice(listenerStart, listenerEnd),
+    /ev\.target\.id === "b-pdf_file"\) return/);
+});
+
+test("build creation strips legacy sources and attaches before history or selection", async () => {
+  const app = fs.readFileSync(appPath, "utf8");
+  const start = app.indexOf("async function createBuild(");
+  const end = app.indexOf("function buildSeedFromSource", start);
+  assert.ok(start >= 0 && end > start);
+  const events = [];
+  const messages = { "b-src-msg": { textContent: "" } };
+  const state = { builds: {} };
+  const created = {
+    id: "new-book", title: "Seeded Herbal", updated_at: "item-r1",
+    pdf_file: "", pdf_sources: [],
+  };
+  const context = vm.createContext({
+    state,
+    fetch: async (url, init) => {
+      events.push({ type: "post", url, body: JSON.parse(init.body) });
+      return { ok: true, json: async () => ({ ok: true, build: created }) };
+    },
+    setBuildRepresentation: async (itemId, sourceId, sourcePath, options) => {
+      events.push({ type: "representation", itemId, sourceId, sourcePath,
+        options: { ...options } });
+      if (sourceId !== "primary") return null;
+      const after = representationSnapshot("primary", "source-r1");
+      state.builds[itemId].pdf_file = sourcePath;
+      state.builds[itemId]._representations = [after];
+      state.builds[itemId]._record_revision = "item-r2";
+      return representationResult("attach", {
+        itemId, beforeItem: "item-r1", afterItem: "item-r2", after,
+      }).receipt;
+    },
+    invalidateRepresentationItemIncarnation: (itemId) => {
+      events.push({ type: "incarnation", itemId });
+    },
+    refreshBuildEngineRecord: async (itemId) => {
+      events.push({ type: "semantic", itemId });
+      state.builds[itemId]._available_commands = [
+        "representation.attach", "representation.replace", "representation.detach",
+      ];
+      return state.builds[itemId];
+    },
+    secondaryRepresentationId: () => "s1-secondary",
+    representationFailureMessage: () => "Source update rejected",
+    pushOp: () => {
+      events.push({ type: "history", snapshot: {
+        ...state.builds["new-book"],
+      } });
+    },
+    selectBuild: (id) => events.push({ type: "select", id }),
+    renderUpload: () => events.push({ type: "render" }),
+    statusCrit: (message) => events.push({ type: "critical", message }),
+    el: (id) => messages[id] || null,
+  });
+  vm.runInContext(`${app.slice(start, end)}
+this.createBuild = createBuild;`, context);
+
+  const result = await context.createBuild({
+    title: "Seeded Herbal",
+    pdf_file: "C:/scans/primary.pdf",
+    pdf_sources: [{ id: "scan", path: "C:/scans/alternate.pdf" }],
+  }, "seeded", "workbench");
+
+  const post = events.find((event) => event.type === "post");
+  assert.equal("pdf_file" in post.body.build, false);
+  assert.equal("pdf_sources" in post.body.build, false);
+  const mutationEvents = events.filter((event) =>
+    event.type === "representation");
+  assert.equal(mutationEvents.length, 2);
+  assert.equal(mutationEvents[0].options.intent, "attach");
+  assert.equal(mutationEvents[0].options.recordRevision, "item-r1");
+  assert.equal(mutationEvents[1].options.recordRevision, "item-r2");
+  assert.ok(events.findIndex((event) => event.type === "semantic") <
+    events.findIndex((event) => event.type === "representation"));
+  assert.ok(events.findIndex((event) => event.type === "representation") <
+    events.findIndex((event) => event.type === "history"));
+  assert.ok(events.findIndex((event) => event.type === "history") <
+    events.findIndex((event) => event.type === "select"));
+  assert.equal(result.pdf_file, "C:/scans/primary.pdf");
+  assert.equal(messages["b-src-msg"].textContent,
+    "Source update rejected");
+  assert.ok(events.some((event) => event.type === "critical" &&
+    /ATTACH FAILED/.test(event.message)));
+  assert.equal(events.some((event) =>
+    /ATTACHED|SOURCE ADDED/.test(event.message || "")), false);
 });

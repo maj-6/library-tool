@@ -480,6 +480,21 @@ class FilesystemItemCommandUnitOfWork:
         self._item_id(item_id, field_name="item_id")
         return self._snapshots.get(item_id)
 
+    def raw_record(self, item_id: str) -> Mapping[str, Any] | None:
+        """Return one detached storage record to a composing adapter.
+
+        This is deliberately not part of the framework-neutral item command
+        port.  A separately installed aggregate (for example representation
+        attachment) may own transitional storage fields that the catalogue
+        item DTO intentionally hides.  Such an adapter can share this locked
+        snapshot without learning how the catalogue document is stored.
+        """
+
+        self._ensure_open()
+        self._item_id(item_id, field_name="item_id")
+        raw = self._catalogue.get(item_id)
+        return None if raw is None else _strict_plain(raw)
+
     def allocate_item_id(self) -> str:
         self._ensure_stageable()
         if self._allocated_item_id:
@@ -565,6 +580,53 @@ class FilesystemItemCommandUnitOfWork:
         self._stage(
             action="update",
             item_id=current.item_id,
+            catalogue=catalogue,
+            snapshot=snapshot,
+        )
+        return snapshot
+
+    def stage_managed_record(
+        self,
+        item_id: str,
+        raw_record: Mapping[str, Any],
+    ) -> ItemRecordSnapshot:
+        """Stage a storage-managed record for a composing aggregate.
+
+        The caller owns validation of its managed fields.  This unit still
+        enforces catalogue identity, strict JSON detachment, and the shared
+        record decoder before allowing the record into the publication set.
+        The caller must stage its own receipt and then call
+        :meth:`stage_catalogue_publication` in the same recoverable write set.
+        """
+
+        self._ensure_stageable()
+        self._item_id(item_id, field_name="item_id")
+        if item_id not in self._snapshots:
+            raise RepositoryError(
+                "the managed item does not exist",
+                code="item_not_found",
+                details={"item_id": item_id},
+            )
+        try:
+            raw = _strict_plain(raw_record)
+        except (TypeError, ValueError) as exc:
+            raise RepositoryError(
+                "the managed item record is invalid",
+                code="invalid_item_repository_artifact",
+                details={"artifact": "managed_record"},
+            ) from exc
+        if not isinstance(raw, dict):
+            raise RepositoryError(
+                "the managed item record is not an object",
+                code="invalid_item_repository_artifact",
+                details={"artifact": "managed_record"},
+            )
+        snapshot = self._decode_record(item_id, raw)
+        catalogue = _strict_plain(self._catalogue)
+        catalogue[item_id] = raw
+        self._stage(
+            action="managed",
+            item_id=item_id,
             catalogue=catalogue,
             snapshot=snapshot,
         )
@@ -699,8 +761,44 @@ class FilesystemItemCommandUnitOfWork:
                 artifact="item_command_receipt",
             ),
         )
+        self.stage_catalogue_publication(transaction)
+
+    def stage_catalogue_publication(
+        self,
+        transaction: RecoverableWriteTransaction,
+    ) -> None:
+        """Append only the staged catalogue write to a composite transaction.
+
+        Composing adapters stage their aggregate artifacts and durable receipt
+        first, then call this method so legacy readers cannot observe the new
+        catalogue state before its supporting transaction data is live.
+        """
+
+        self._ensure_open()
+        if self._committed:
+            raise RepositoryError(
+                "the item command unit is already committed",
+                code="item_command_unit_committed",
+            )
+        if self._publication_staged:
+            raise RepositoryError(
+                "the item mutation publication is already staged",
+                code="item_mutation_already_staged",
+            )
+        if not isinstance(transaction, RecoverableWriteTransaction) or (
+            transaction._owner is not self._write_set
+        ):
+            raise RepositoryError(
+                "the item mutation transaction belongs to another workspace",
+                code="item_repository_scope_mismatch",
+            )
+        if not self._staged_action or self._staged_catalogue is None:
+            raise RepositoryError(
+                "no item mutation has been staged",
+                code="item_mutation_not_staged",
+            )
         # Legacy readers that do not yet take the workspace lease cannot
-        # discover a new item before all of its transaction metadata exists;
+        # discover a new state before all transaction metadata exists;
         # rollback removes this last-published row first.
         transaction.stage_write(
             self._catalogue_relative,

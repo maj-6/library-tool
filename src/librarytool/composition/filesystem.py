@@ -27,6 +27,7 @@ from ..adapters.filesystem import (
     FilesystemItemQueryRepository,
     FilesystemOpenLibRepository,
     FilesystemReplicaRepository,
+    FilesystemRepresentationCommandRepository,
     FilesystemTranslationRepository,
     RecoverableWriteSet,
 )
@@ -41,6 +42,11 @@ from ..engine.item_commands import (
     ItemCommandService,
     ItemDraft,
     ItemRecordSnapshot,
+)
+from ..engine.representation_commands import (
+    RepresentationAggregateSnapshot,
+    RepresentationAttachmentDraft,
+    RepresentationCommandService,
 )
 from ..engine.items import ItemQueryService
 from ..engine.jobs import JobManager
@@ -57,6 +63,7 @@ from ..engine.runtime import (
     JOB_SERVICE,
     LIB_OPEN_SERVICE,
     REPLICA_SERVICE,
+    REPRESENTATION_COMMAND_SERVICE,
     TEXT_LAYER_SERVICE,
     TRANSLATION_PROVENANCE_SERVICE,
     TRANSLATION_SERVICE,
@@ -94,6 +101,15 @@ TranslationSourceLoader = Callable[
     [str, str], TranslationSourceSnapshot | None
 ]
 TranslationSourceReference = Callable[[TranslationSourceSnapshot], str]
+RepresentationAggregateDecoder = Callable[
+    [str, Mapping[str, Any]], RepresentationAggregateSnapshot
+]
+RepresentationPutRecord = Callable[
+    [str, Mapping[str, Any], RepresentationAttachmentDraft], Mapping[str, Any]
+]
+RepresentationDetachRecord = Callable[
+    [str, Mapping[str, Any], str], Mapping[str, Any]
+]
 _ENTRY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _WINDOWS_DEVICE_NAMES = frozenset(
     {"con", "prn", "aux", "nul"}
@@ -190,6 +206,15 @@ class FilesystemEnginePaths:
 
 
 @dataclass(frozen=True, slots=True)
+class RepresentationBindings:
+    """Transitional catalogue codecs for representation mutations."""
+
+    decode_aggregate: RepresentationAggregateDecoder
+    put_record: RepresentationPutRecord
+    detach_record: RepresentationDetachRecord
+
+
+@dataclass(frozen=True, slots=True)
 class CatalogueBindings:
     """Legacy catalogue projection, identity, codec, and locking seams."""
 
@@ -199,6 +224,7 @@ class CatalogueBindings:
     encode_record: ItemRecordEncoder
     allocate_item_id: ItemIdAllocator
     lock_context_for: CatalogueLockFactory
+    representations: RepresentationBindings | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,6 +283,7 @@ class FilesystemServiceGraph:
 
     items: ItemQueryService
     item_commands: ItemCommandService
+    representation_commands: RepresentationCommandService | None
     interchange: LibInterchangeService
     lib_open: OpenLibService | None
     jobs: JobManager
@@ -269,6 +296,7 @@ class FilesystemServiceGraph:
         services = (
             (ITEM_QUERY_SERVICE, self.items),
             (ITEM_COMMAND_SERVICE, self.item_commands),
+            (REPRESENTATION_COMMAND_SERVICE, self.representation_commands),
             (INTERCHANGE_SERVICE, self.interchange),
             (LIB_OPEN_SERVICE, self.lib_open),
             (JOB_SERVICE, self.jobs),
@@ -394,6 +422,18 @@ def compose_filesystem_engine(
         lock_context_for=catalogue.lock_context_for,
         recover=False,
     )
+    representation_commands = None
+    if catalogue.representations is not None:
+        representation_repository = FilesystemRepresentationCommandRepository(
+            resources.write_set,
+            item_repository=item_command_repository,
+            decode_aggregate=catalogue.representations.decode_aggregate,
+            put_record=catalogue.representations.put_record,
+            detach_record=catalogue.representations.detach_record,
+        )
+        representation_commands = RepresentationCommandService(
+            representation_repository
+        )
     lib_open = None
     if interchange.open_item_draft_for is not None:
         lib_open_repository = FilesystemOpenLibRepository(
@@ -419,6 +459,7 @@ def compose_filesystem_engine(
     graph = FilesystemServiceGraph(
         items=items,
         item_commands=ItemCommandService(item_command_repository),
+        representation_commands=representation_commands,
         interchange=LibInterchangeService(
             interchange.planner,
             interchange_repository,
@@ -481,6 +522,7 @@ __all__ = [
     "FilesystemServiceGraph",
     "InterchangeBindings",
     "ReplicaBindings",
+    "RepresentationBindings",
     "TranslationBindings",
     "compose_filesystem_engine",
 ]

@@ -213,14 +213,16 @@ def test_prune_drops_old_items_but_never_the_fresh_one(data_root):
 
 def test_build_delete_is_recoverable(data_root, client):
     """Deleting an entry trashes its record; restoring reinserts it verbatim,
-    and refuses if something has taken the id back."""
+    replays exactly, and refuses if something has taken the id back."""
     bid = "trashb01"
     server.BUILDS_PATH.parent.mkdir(parents=True, exist_ok=True)
     server.BUILDS_PATH.write_text(
         json.dumps({bid: {"id": bid, "title": "Doomed", "rights": "public-domain"}}),
         encoding="utf-8")
 
-    assert client.delete(f"/api/builds/{bid}").status_code == 200
+    deleted = client.delete(f"/api/builds/{bid}")
+    assert deleted.status_code == 200
+    assert deleted.get_json()["trash_id"]
     assert bid not in server.lib.load_json(server.BUILDS_PATH, {})
 
     items = client.get("/api/trash").get_json()["items"]
@@ -230,13 +232,22 @@ def test_build_delete_is_recoverable(data_root, client):
 
     r = client.post("/api/trash/restore", json={"id": rec["id"]})
     assert r.status_code == 200, r.get_json()
+    assert r.get_json()["build"]["id"] == bid
+    assert r.get_json()["replayed"] is False
     back = server.lib.load_json(server.BUILDS_PATH, {})[bid]
     assert back["title"] == "Doomed" and back["rights"] == "public-domain"
 
-    # a second restore must not overwrite the entry now living at that id
+    # A response-lost retry is an exact replay, not a destructive overwrite.
     again = client.post("/api/trash/restore", json={"id": rec["id"]})
-    assert again.status_code == 409
-    assert "exists again" in again.get_json()["error"]
+    assert again.status_code == 200
+    assert again.get_json()["replayed"] is True
+
+    current = server.lib.load_json(server.BUILDS_PATH, {})
+    current[bid]["title"] = "Edited after restore"
+    server.lib.save_json(server.BUILDS_PATH, current)
+    conflict = client.post("/api/trash/restore", json={"id": rec["id"]})
+    assert conflict.status_code == 409
+    assert "exists again" in conflict.get_json()["error"]
 
 
 def test_manual_delete_is_recoverable(data_root, client):

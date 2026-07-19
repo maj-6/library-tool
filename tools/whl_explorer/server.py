@@ -81,6 +81,7 @@ from librarytool.composition.filesystem import (  # noqa: E402
     FilesystemServiceGraph,
     InterchangeBindings,
     ReplicaBindings,
+    RepresentationBindings,
     TranslationBindings,
 )
 from librarytool.composition.host import (  # noqa: E402
@@ -132,6 +133,14 @@ from librarytool.engine.interchange import (  # noqa: E402
     OpenLibService,
 )
 from librarytool.engine.replica import ReplicaApplicationService  # noqa: E402
+from librarytool.engine.representation_commands import (  # noqa: E402
+    AttachRepresentationCommand,
+    DetachRepresentationCommand,
+    RepresentationAggregateSnapshot,
+    RepresentationAttachmentDraft,
+    RepresentationCommandService,
+    RepresentationRecordSnapshot,
+)
 from librarytool.engine.runtime import (  # noqa: E402
     INTERCHANGE_SERVICE,
     ITEM_COMMAND_SERVICE,
@@ -139,6 +148,7 @@ from librarytool.engine.runtime import (  # noqa: E402
     JOB_SERVICE,
     LIB_OPEN_SERVICE,
     REPLICA_SERVICE,
+    REPRESENTATION_COMMAND_SERVICE,
     TEXT_LAYER_SERVICE,
     TRANSLATION_PROVENANCE_SERVICE,
     TRANSLATION_SERVICE,
@@ -158,7 +168,9 @@ from librarytool.engine.translations import (  # noqa: E402
     TranslationService,
 )
 from librarytool.engine.workbench_policies import (  # noqa: E402
+    CatalogueCommandWorkbenchPolicy,
     ReplicaWorkbenchPolicy,
+    RepresentationCommandWorkbenchPolicy,
     TextLayerWorkbenchPolicy,
     TranslationWorkbenchPolicy,
 )
@@ -1040,6 +1052,18 @@ _ENGINE_MODULE_MANIFESTS = (
         requires=(CapabilityRef("library.items.read"),),
     ),
     ModuleManifest(
+        "library.representation.commands", "1.0.0",
+        provides=(
+            CapabilityRef("library.representations.attach"),
+            CapabilityRef("library.representations.replace"),
+            CapabilityRef("library.representations.detach"),
+        ),
+        requires=(
+            CapabilityRef("library.items.read"),
+            CapabilityRef("library.representations"),
+        ),
+    ),
+    ModuleManifest(
         "replica.core", "1.0.0",
         provides=(
             CapabilityRef("replica.regions"),
@@ -1080,6 +1104,9 @@ _ENGINE_WORKBENCH_MANIFESTS = (
         enhances=(
             CapabilityRef("library.items.create"),
             CapabilityRef("library.items.update"),
+            CapabilityRef("library.representations.attach"),
+            CapabilityRef("library.representations.replace"),
+            CapabilityRef("library.representations.detach"),
         ),
     ),
     WorkbenchManifest(
@@ -1142,7 +1169,31 @@ def _engine_module_contributions(
                     modules["library.catalogue.commands"].provides,
                 ),
             ),
+            item_policies=(
+                WorkbenchPolicyBinding(
+                    CatalogueCommandWorkbenchPolicy(),
+                    (CapabilityRef("library.items.update"),),
+                ),
+            ),
         ),
+        *((
+            ModuleContribution(
+                modules["library.representation.commands"],
+                bindings=(
+                    ServiceBinding(
+                        REPRESENTATION_COMMAND_SERVICE,
+                        graph.representation_commands,
+                        modules["library.representation.commands"].provides,
+                    ),
+                ),
+                item_policies=(
+                    WorkbenchPolicyBinding(
+                        RepresentationCommandWorkbenchPolicy(),
+                        (CapabilityRef("library.representations.attach"),),
+                    ),
+                ),
+            ),
+        ) if graph.representation_commands is not None else ()),
         ModuleContribution(
             modules["replica.core"],
             bindings=(
@@ -1302,14 +1353,36 @@ def _mutate_json(path, lock, default, fn):
         return out
 
 
-def _builds_apply(bid: str, fields: dict) -> str:
+def _builds_apply(
+        bid: str, fields: dict, *, expected_revision: str | None = None) -> str:
     """Fold field changes into one build against a FRESH read of the store —
     for slow work (folder sync, page deletion) whose snapshot may be minutes
     old: only this build's fields are ours to change (the _publish_run
     precedent)."""
+    overlap = sorted(set(fields) & _BUILD_REPRESENTATION_FIELDS)
+    if overlap:
+        raise ValueError(
+            "representation fields require the representation command service: "
+            + ", ".join(overlap)
+        )
+
     def apply(builds):
         if bid in builds:
             row = builds[bid]
+            current_revision = _engine_build_record_revision(bid, row)
+            if (
+                expected_revision is not None
+                and current_revision != expected_revision
+            ):
+                raise EngineConflictError(
+                    "the item changed while background work was running",
+                    code="item_revision_conflict",
+                    details={
+                        "item_id": bid,
+                        "expected_revision": expected_revision,
+                        "current_revision": current_revision,
+                    },
+                )
             row.update(fields)
             row["updated_at"] = _build_updated_at(row.get("updated_at"))
             return row["updated_at"]
@@ -1334,6 +1407,11 @@ _BUILD_FIELDS = ("published_slug",
                  "ocr_active", "ocr_verified", "ocr_quality",
                  "title_pages", "thumbnail_source", "attention",
                  "images", "extra", "capture_id")
+
+_BUILD_REPRESENTATION_FIELDS = frozenset({
+    "pdf_file", "pdf_sources", "representation_manifest",
+})
+_BUILD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 # The structured exceptions to the str() coercion below. `categories` (flat
 # text) is deprecated in favour of category_ids — kept as display fallback.
@@ -1365,6 +1443,7 @@ def _clean_pdf_sources(raw) -> list:
     build is a flat string; this one field is structured, so it gets its
     own sanitizer instead of the str() coercion."""
     out = []
+    aliases = {"primary"}
     if isinstance(raw, list):
         for it in raw:
             if not isinstance(it, dict):
@@ -1372,9 +1451,14 @@ def _clean_pdf_sources(raw) -> list:
             path = str(it.get("path") or "").strip()
             if not path:
                 continue
-            sid = re.sub(r"[^\w]", "", str(it.get("id") or ""))[:12]
-            if not sid or sid == "primary":   # "primary" is a reserved key
-                sid = lib.gen_id()
+            sid = re.sub(
+                r"[^A-Za-z0-9_-]", "", str(it.get("id") or "")
+            )[:31]
+            alias = sid.casefold()
+            if not sid or alias in aliases:
+                sid = lib.gen_id(set(aliases))
+                alias = sid.casefold()
+            aliases.add(alias)
             out.append({"id": sid, "path": path})
     return out
 
@@ -1405,7 +1489,11 @@ _RIGHTS_PUBLIC = {"public-domain": "Public domain", "cleared": "Cleared",
 
 @app.route("/api/builds")
 def api_builds():
-    return jsonify({"builds": lib.load_json(BUILDS_PATH, {})})
+    # This transitional projection contains local source paths. It remains for
+    # legacy callers only and must never enter a browser or intermediary cache.
+    response = jsonify({"builds": lib.load_json(BUILDS_PATH, {})})
+    response.cache_control.no_store = True
+    return response
 
 
 def _create_build(seed: dict) -> tuple[dict | None, str]:
@@ -1417,7 +1505,11 @@ def _create_build(seed: dict) -> tuple[dict | None, str]:
         builds = lib.load_json(BUILDS_PATH, {})
         build = {f: str(seed.get(f, "") or "").strip() for f in _BUILD_FIELDS
                  if f not in _BUILD_STRUCTURED_FIELDS}
-        build["pdf_sources"] = _clean_pdf_sources(seed.get("pdf_sources"))
+        # Source attachment is a separate versioned aggregate. The browser
+        # creates catalogue state first, then attaches any seed source through
+        # the representation command service under dual CAS preconditions.
+        build["pdf_file"] = ""
+        build["pdf_sources"] = []
         build["category_ids"] = _clean_category_ids(seed.get("category_ids"),
                                                     lib.load_taxonomy()["nodes"])
         build["bundle"] = _clean_bundle(seed.get("bundle"))
@@ -1431,6 +1523,11 @@ def _create_build(seed: dict) -> tuple[dict | None, str]:
         build["id"] = lib.gen_id(set(builds))
         build["created_at"] = _build_updated_at()
         build["updated_at"] = build["created_at"]
+        build["representation_manifest"] = {
+            "version": 1,
+            "sources": {},
+            "detached": [],
+        }
         builds[build["id"]] = build
         lib.save_json(BUILDS_PATH, builds)
     activity("created", "draft entry", detail=build.get("title", ""))
@@ -1440,7 +1537,21 @@ def _create_build(seed: dict) -> tuple[dict | None, str]:
 @app.route("/api/builds", methods=["POST"])
 def api_builds_create():
     payload = request.get_json(silent=True) or {}
-    build, err = _create_build(payload.get("build") or {})
+    seed = payload.get("build") or {}
+    managed_sources = sorted(
+        set(seed) & _BUILD_REPRESENTATION_FIELDS
+    ) if isinstance(seed, Mapping) else []
+    if managed_sources:
+        return jsonify({
+            "ok": False,
+            "error": (
+                "Create catalogue state first, then attach PDF sources "
+                "through the representation command resource"
+            ),
+            "code": "representation_command_required",
+            "fields": managed_sources,
+        }), 409
+    build, err = _create_build(seed)
     if err:
         return jsonify({"ok": False, "error": err}), 400
     return jsonify({"ok": True, "build": build})
@@ -1453,6 +1564,17 @@ def api_builds_update(build_id: str):
         if build_id not in builds:
             abort(404)
         payload = request.get_json(silent=True) or {}
+        managed_sources = sorted(set(payload) & _BUILD_REPRESENTATION_FIELDS)
+        if managed_sources:
+            return jsonify({
+                "ok": False,
+                "error": (
+                    "PDF sources must be changed through the representation "
+                    "command resource"
+                ),
+                "code": "representation_command_required",
+                "fields": managed_sources,
+            }), 409
         if str(payload.get("rights") or "").strip() not in _BUILD_RIGHTS:
             return jsonify({"ok": False,
                             "error": f"unknown rights value {payload['rights']!r}"}), 400
@@ -1503,28 +1625,66 @@ def api_builds_delete(build_id: str):
         lib.save_json(BUILDS_PATH, builds)
     # a few KB of JSON, so this never troubles the byte cap. The client's undo
     # covers the next few seconds; this is the backstop for the next few days.
-    _trash_put("build", f"Entry: {record.get('title') or build_id}",
-               {"build_id": build_id}, {},
-               {"record.json": json.dumps(record, ensure_ascii=False)})
-    return jsonify({"ok": True})
+    trash_id = _trash_put(
+        "build",
+        f"Entry: {record.get('title') or build_id}",
+        {"build_id": build_id},
+        {},
+        {"record.json": json.dumps(record, ensure_ascii=False)},
+    )
+    return jsonify({"ok": True, "trash_id": trash_id})
 
 
 @app.route("/api/builds/restore", methods=["POST"])
 def api_builds_restore():
-    """Reinsert a deleted build verbatim (undo support)."""
+    """Reinsert catalogue state only; sources use representation commands."""
     payload = request.get_json(silent=True) or {}
-    build = payload.get("build") or {}
+    raw = payload.get("build") or {}
+    if not isinstance(raw, Mapping):
+        return jsonify({"ok": False, "error": "build must be an object"}), 400
+    managed_sources = sorted(set(raw) & _BUILD_REPRESENTATION_FIELDS)
+    if managed_sources:
+        return jsonify({
+            "ok": False,
+            "error": (
+                "Restore catalogue state first, then attach PDF sources "
+                "through the representation command resource"
+            ),
+            "code": "representation_command_required",
+            "fields": managed_sources,
+        }), 409
+    build = dict(raw)
     bid = str(build.get("id") or "")
-    if not bid:
+    if not bid or not _BUILD_ID_RE.fullmatch(bid):
         abort(400)
     build["images"] = _clean_images(build.get("images"))
     build["extra"] = _clean_extra(build.get("extra"))
     build["capture_id"] = _clean_capture_id(build.get("capture_id"))
-
-    def reinsert(builds):
-        build["updated_at"] = _build_updated_at(build.get("updated_at"))
+    build["pdf_file"] = ""
+    build["pdf_sources"] = []
+    build["representation_manifest"] = {
+        "version": 1, "sources": {}, "detached": [],
+    }
+    build["updated_at"] = _build_updated_at(build.get("updated_at"))
+    try:
+        _engine_item_command_decode(bid, build)
+    except (TypeError, ValueError) as exc:
+        return jsonify({
+            "ok": False,
+            "error": "the catalogue restore record is invalid",
+            "code": "invalid_item_restore",
+            "details": {"cause_type": type(exc).__name__},
+        }), 400
+    with _builds_lock:
+        builds = lib.load_json(BUILDS_PATH, {})
+        if bid in builds:
+            return jsonify({
+                "ok": False,
+                "error": "the build already exists",
+                "code": "item_already_exists",
+            }), 409
         builds[bid] = build
-    _mutate_json(BUILDS_PATH, _builds_lock, {}, reinsert)
+        lib.save_json(BUILDS_PATH, builds)
     return jsonify({"ok": True, "build": build})
 
 
@@ -2850,10 +3010,18 @@ def api_build_folder_sync(build_id: str):
                 notes.append(f"blank-page trim failed: {exc}")
     if src is not None:
         try:
-            prev = _preview_pdf(src, pages)
-            import shutil
-            shutil.copyfile(prev, d / "primary.pdf")
-            preview_ok = True
+            primary = d / "primary.pdf"
+            try:
+                primary_is_source = (
+                    primary.is_file() and src.resolve() == primary.resolve()
+                )
+            except OSError:
+                primary_is_source = False
+            if not primary_is_source:
+                prev = _preview_pdf(src, pages)
+                import shutil
+                shutil.copyfile(prev, primary)
+                preview_ok = True
             # migrate away from the legacy name: anything pointing at the
             # old preview.pdf (a keep_original repoint from an earlier run)
             # moves to primary.pdf BEFORE the stale file goes
@@ -2862,13 +3030,22 @@ def api_build_folder_sync(build_id: str):
                 old_rel = legacy.resolve().relative_to(
                     lib.DATA_ROOT.resolve()).as_posix()
                 if (b.get("pdf_file") or "").replace("\\", "/") == old_rel:
-                    b["pdf_file"] = (d / "primary.pdf").resolve().relative_to(
-                        lib.DATA_ROOT.resolve()).as_posix()
-                    # this function's snapshot is stale by now (preview render,
-                    # extraction): fold in only this build's change
-                    b["updated_at"] = _builds_apply(
-                        build_id, {"pdf_file": b["pdf_file"]})
-                    src = d / "primary.pdf"
+                    primary_rel = (
+                        primary.resolve()
+                        .relative_to(lib.DATA_ROOT.resolve()).as_posix()
+                    )
+                    _engine_refresh_representation_reference(
+                        build_id,
+                        "primary",
+                        primary_rel,
+                        operation_scope="folder-preview-repoint",
+                        expected_item_revision=(
+                            _engine_build_record_revision(build_id, b)
+                        ),
+                    )
+                    b = lib.load_json(BUILDS_PATH, {}).get(build_id, b)
+                    lib.save_json(d / "metadata.json", b)
+                    src = primary
                 legacy.unlink()
                 notes.append("renamed preview.pdf to primary.pdf")
         except Exception as exc:
@@ -2891,6 +3068,24 @@ def api_build_folder_sync(build_id: str):
             try:
                 srcr = src.resolve()
                 if srcr.is_relative_to(lib.IA_DOWNLOADS_DIR.resolve()):
+                    primary_rel = (
+                        (d / "primary.pdf").resolve()
+                        .relative_to(lib.DATA_ROOT.resolve()).as_posix()
+                    )
+                    # Publish the usable replacement before removing the
+                    # temporary original. If dual CAS or validation refuses,
+                    # the original remains attached and intact.
+                    _engine_refresh_representation_reference(
+                        build_id,
+                        "primary",
+                        primary_rel,
+                        operation_scope="folder-temporary-repoint",
+                        expected_item_revision=(
+                            _engine_build_record_revision(build_id, b)
+                        ),
+                    )
+                    b = lib.load_json(BUILDS_PATH, {}).get(build_id, b)
+                    lib.save_json(d / "metadata.json", b)
                     src.unlink()
                     # a trim in this same sync trashed the pages it removed,
                     # and the row points at the file just deleted. The pages
@@ -2903,11 +3098,6 @@ def api_build_folder_sync(build_id: str):
                     # nothing may keep pointing at the deleted file: the
                     # entry folder's own PDF becomes the build's PDF, and
                     # the IA download catalog entry is retired
-                    b["pdf_file"] = (d / "primary.pdf").resolve().relative_to(
-                        lib.DATA_ROOT.resolve()).as_posix()
-                    b["updated_at"] = _builds_apply(
-                        build_id, {"pdf_file": b["pdf_file"]})
-
                     def _drop_stale(catalog):
                         for k in [k for k, v in catalog.items()
                                   if (lib.DATA_ROOT / str(v.get("saved_as") or "?")).resolve()
@@ -3094,6 +3284,7 @@ _ENGINE_ITEM_COMMAND_MANAGED_FIELDS = frozenset({
     "revision", "representations", "artifacts", "relevance", "capture_id",
     "published_slug", "ocr_active", "ocr_verified", "ocr_quality",
     "title_pages", "thumbnail_source", "status",
+    "representation_manifest",
 }) | _ENGINE_ITEM_LOCAL_FIELDS
 _ENGINE_ITEM_COMMAND_MANAGED_STRING_FIELDS = frozenset({
     "published_slug", "ocr_active", "ocr_verified", "ocr_quality",
@@ -3110,6 +3301,9 @@ _ENGINE_ITEM_CAPTURE_ID = re.compile(r"^[A-Za-z0-9-]{0,64}$")
 _ENGINE_ITEM_LANGUAGE_ID = re.compile(r"^[a-z-]{1,12}$")
 _ENGINE_ITEM_RECORD_REVISION = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,511}$")
+_ENGINE_REPRESENTATION_ID = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
+_ENGINE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _engine_valid_record_revision(value) -> bool:
@@ -3251,6 +3445,86 @@ def _engine_validate_managed_build_fields(item_id: str, raw: Mapping) -> None:
         or not _ENGINE_ITEM_CAPTURE_ID.fullmatch(raw["capture_id"])
     ):
         raise ValueError("build capture_id is invalid")
+    _engine_representation_manifest(raw)
+
+
+def _engine_representation_manifest(raw: Mapping) -> dict:
+    """Return one strict detached attachment manifest from a build row."""
+    value = raw.get("representation_manifest")
+    if value is None:
+        return {"version": 1, "sources": {}, "detached": []}
+    if not isinstance(value, Mapping) or set(value) != {
+        "version", "sources", "detached",
+    }:
+        raise TypeError("build representation_manifest is invalid")
+    if value.get("version") != 1 or not isinstance(value.get("sources"), Mapping):
+        raise ValueError("build representation_manifest version is invalid")
+    detached = value.get("detached")
+    if not isinstance(detached, (list, tuple)) or any(
+        not isinstance(source_id, str)
+        or not _ENGINE_REPRESENTATION_ID.fullmatch(source_id)
+        or (source_id.casefold() == "primary" and source_id != "primary")
+        for source_id in detached
+    ):
+        raise TypeError("build detached representation ids are invalid")
+    folded_detached = [source_id.casefold() for source_id in detached]
+    if len(folded_detached) != len(set(folded_detached)):
+        raise ValueError("build detached representation ids are duplicated")
+    sources = {}
+    aliases = set()
+    fields = {
+        "role", "media_type", "label", "acquisition",
+        "content_sha256", "size", "source_stat", "metadata",
+    }
+    for source_id, record in value["sources"].items():
+        if (
+            not isinstance(source_id, str)
+            or not _ENGINE_REPRESENTATION_ID.fullmatch(source_id)
+            or (source_id.casefold() == "primary" and source_id != "primary")
+            or source_id.casefold() in aliases
+        ):
+            raise ValueError("build representation manifest ids are invalid")
+        aliases.add(source_id.casefold())
+        if not isinstance(record, Mapping) or set(record) != fields:
+            raise TypeError("build representation manifest source is invalid")
+        if (
+            not isinstance(record["role"], str)
+            or not isinstance(record["media_type"], str)
+            or not isinstance(record["label"], str)
+            or record["acquisition"] not in {"reference", "copy"}
+            or not isinstance(record["content_sha256"], str)
+            or not _ENGINE_SHA256.fullmatch(record["content_sha256"])
+            or isinstance(record["size"], bool)
+            or not isinstance(record["size"], int)
+            or record["size"] < 0
+            or not isinstance(record["source_stat"], Mapping)
+            or set(record["source_stat"]) != {
+                "size", "mtime_ns", "ctime_ns", "device", "inode",
+            }
+            or any(
+                isinstance(record["source_stat"].get(field), bool)
+                or not isinstance(record["source_stat"].get(field), int)
+                for field in (
+                    "size", "mtime_ns", "ctime_ns", "device", "inode",
+                )
+            )
+            or record["source_stat"].get("size") < 0
+            or record["source_stat"].get("size") != record["size"]
+            or not isinstance(record["metadata"], Mapping)
+        ):
+            raise ValueError("build representation manifest source is invalid")
+        # JSON round-trip detaches legacy mutable containers and rejects data
+        # that cannot survive the catalogue's storage contract.
+        sources[source_id] = json.loads(json.dumps(
+            record, ensure_ascii=False, allow_nan=False,
+        ))
+    if aliases & set(folded_detached):
+        raise ValueError("a representation cannot be attached and detached")
+    return {
+        "version": 1,
+        "sources": sources,
+        "detached": list(detached),
+    }
 
 
 def _engine_item_command_decode(
@@ -3314,6 +3588,11 @@ def _engine_item_command_encode(
             "images": [],
             "extra": {},
             "capture_id": "",
+            "representation_manifest": {
+                "version": 1,
+                "sources": {},
+                "detached": [],
+            },
         }
     else:
         if not isinstance(previous, Mapping):
@@ -3394,44 +3673,93 @@ def _engine_representation_locator(item_id: str, source_id: str) -> str:
     return f"urn:librarytool:item:{item}:representation:{source}"
 
 
+def _engine_file_stat(value) -> dict:
+    """Portable identity/change fingerprint for one attached local file."""
+    return {
+        "size": int(value.st_size),
+        "mtime_ns": int(value.st_mtime_ns),
+        "ctime_ns": int(value.st_ctime_ns),
+        "device": int(value.st_dev),
+        "inode": int(value.st_ino),
+    }
+
+
 def _engine_source_snapshot(item_id: str, source_id: str, raw: str,
-                            *, role: str, label: str) -> dict:
+                            *, role: str, label: str,
+                            manifest: Mapping | None = None) -> dict:
     """Project one attached PDF into a stable, path-safe representation."""
+    manifest = manifest if isinstance(manifest, Mapping) else {}
     path = _resolve_local(raw) if raw else None
     stat = None
     if path is not None:
         try:
             if path.is_file():
                 value = path.stat()
-                stat = {"size": value.st_size, "mtime_ns": value.st_mtime_ns}
+                stat = _engine_file_stat(value)
         except OSError:
             stat = None
     fingerprint = json.dumps(
-        {"path": raw, "stat": stat}, sort_keys=True, separators=(",", ":"),
+        {"path": raw, "stat": stat, "manifest": manifest},
+        sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")
+    acquisition = str(manifest.get("acquisition") or "reference")
+    content_sha256 = str(manifest.get("content_sha256") or "")
+    stored_size = manifest.get("size")
+    size = (stored_size if isinstance(stored_size, int)
+            and not isinstance(stored_size, bool) and stored_size >= 0
+            else stat.get("size") if stat else None)
+    metadata = manifest.get("metadata")
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+    attached_stat = manifest.get("source_stat")
+    tracked = bool(manifest.get("content_sha256"))
+    unchanged = (
+        isinstance(attached_stat, Mapping)
+        and stat is not None
+        and all(attached_stat.get(field) == stat[field] for field in stat)
+    )
+    content_state = (
+        "missing" if stat is None else
+        "unchanged" if tracked and unchanged else
+        "drifted" if tracked else
+        "untracked"
+    )
     return {
         "id": source_id,
         "revision": "sr-" + hashlib.sha256(fingerprint).hexdigest()[:24],
-        "role": role,
-        "media_type": "application/pdf",
+        "role": str(manifest.get("role") or role),
+        "media_type": str(manifest.get("media_type") or "application/pdf"),
         "locator": _engine_representation_locator(item_id, source_id),
-        "label": label,
+        "label": str(manifest.get("label") or label),
         # Bundled OCR/Replica executors require a readable local attachment.
         # A remote catalogue URL remains metadata, not a usable source.
-        "available": bool(stat),
+        # A referenced file whose stat no longer matches the bytes hashed at
+        # attachment is not advertised as a usable source. Its stored digest
+        # still identifies the attached pre-image; replacing the reference
+        # explicitly refreshes both digest and stat fingerprint.
+        "available": bool(stat) and content_state != "drifted",
+        "disposition": "copied" if acquisition == "copy" else "referenced",
+        "content_state": content_state,
+        "content_sha256": content_sha256,
+        "size": size,
+        "metadata": dict(metadata),
     }
 
 
 def _engine_item_representations(item_id: str, build: dict) -> list[dict]:
     rows = []
+    manifest = _engine_representation_manifest(build)
+    source_manifest = manifest["sources"]
+    detached = {value.casefold() for value in manifest["detached"]}
     primary = str(build.get("pdf_file") or "").strip()
-    if not primary:
+    if not primary and "primary" not in detached:
         entry_pdf = _entry_primary_pdf(item_id)
         if entry_pdf:
             primary = str(_entry_dir(item_id) / entry_pdf)
     if primary:
         rows.append(_engine_source_snapshot(
             item_id, "primary", primary, role="primary", label="Primary source",
+            manifest=source_manifest.get("primary"),
         ))
     seen = {"primary"}
     for source in build.get("pdf_sources") or []:
@@ -3445,8 +3773,303 @@ def _engine_item_representations(item_id: str, build: dict) -> list[dict]:
         rows.append(_engine_source_snapshot(
             item_id, source_id, raw, role="alternate",
             label=str(source.get("label") or "Alternate source"),
+            manifest=source_manifest.get(source_id),
         ))
     return rows
+
+
+def _engine_representation_aggregate(
+        item_id: str, build: Mapping) -> RepresentationAggregateSnapshot:
+    """Decode one transitional row into the safe mutation aggregate."""
+    _engine_validate_managed_build_fields(item_id, build)
+    source_ids = [
+        str(source.get("id") or "")
+        for source in build.get("pdf_sources") or []
+        if isinstance(source, Mapping)
+    ]
+    aliases = [value.casefold() for value in source_ids]
+    if (
+        any(not _ENGINE_REPRESENTATION_ID.fullmatch(value)
+            or value.casefold() == "primary" for value in source_ids)
+        or len(aliases) != len(set(aliases))
+    ):
+        raise ValueError("build PDF source ids are invalid or duplicated")
+    snapshots = []
+    for row in _engine_item_representations(item_id, dict(build)):
+        snapshots.append(RepresentationRecordSnapshot(
+            representation_id=row["id"],
+            revision=row["revision"],
+            role=row["role"],
+            media_type=row["media_type"],
+            locator=row["locator"],
+            label=row["label"],
+            available=row["available"],
+            disposition=row["disposition"],
+            content_state=row["content_state"],
+            content_sha256=row["content_sha256"],
+            size=row["size"],
+            metadata=row["metadata"],
+        ))
+    return RepresentationAggregateSnapshot(
+        item_id=item_id,
+        item_revision=_engine_build_record_revision(item_id, build),
+        representations=tuple(snapshots),
+    )
+
+
+def _engine_representation_source_path(source_token: str) -> Path:
+    path = _resolve_local(source_token)
+    if path is None or not path.is_file():
+        raise EngineValidationError(
+            "the representation source is not a readable local file",
+            code="representation_source_not_found",
+        )
+    if path.suffix.casefold() != ".pdf":
+        raise EngineValidationError(
+            "this adapter currently accepts PDF representations only",
+            code="unsupported_representation_media_type",
+            details={"media_type": "application/pdf"},
+        )
+    return path
+
+
+def _engine_representation_manifest_record(
+        draft: RepresentationAttachmentDraft, path: Path) -> dict:
+    from pypdf import PdfReader
+
+    try:
+        with path.open("rb") as stream:
+            before = _engine_file_stat(os.fstat(stream.fileno()))
+            if stream.read(5) != b"%PDF-":
+                raise EngineValidationError(
+                    "the representation source is not a PDF",
+                    code="invalid_representation_source",
+                )
+            stream.seek(0)
+            try:
+                reader = PdfReader(stream, strict=False)
+                if reader.is_encrypted or len(reader.pages) < 1:
+                    raise ValueError("the PDF has no readable pages")
+            except Exception as exc:
+                raise EngineValidationError(
+                    "the representation source is not a readable PDF",
+                    code="invalid_representation_source",
+                ) from exc
+            stream.seek(0)
+            digest_state = hashlib.sha256()
+            while chunk := stream.read(1024 * 1024):
+                digest_state.update(chunk)
+            digest = digest_state.hexdigest()
+            after = _engine_file_stat(os.fstat(stream.fileno()))
+        path_after = _engine_file_stat(path.stat())
+    except EngineError:
+        raise
+    except OSError as exc:
+        raise EngineValidationError(
+            "the representation source changed while it was being attached",
+            code="representation_source_changed",
+            retryable=True,
+        ) from exc
+    if before != after or after != path_after:
+        raise EngineConflictError(
+            "the representation source changed while it was being attached",
+            code="representation_source_changed",
+            retryable=True,
+        )
+    if (
+        draft.expected_content_sha256
+        and digest != draft.expected_content_sha256
+    ):
+        raise EngineConflictError(
+            "the representation source digest does not match",
+            code="representation_source_digest_mismatch",
+            details={"expected_sha256": draft.expected_content_sha256},
+        )
+    if draft.expected_size is not None and after["size"] != draft.expected_size:
+        raise EngineConflictError(
+            "the representation source size does not match",
+            code="representation_source_size_mismatch",
+            details={"expected_size": draft.expected_size},
+        )
+    return {
+        "role": draft.role,
+        "media_type": draft.media_type,
+        "label": draft.label,
+        "acquisition": draft.acquisition,
+        "content_sha256": digest,
+        "size": after["size"],
+        "source_stat": after,
+        "metadata": json.loads(json.dumps(
+            draft.as_dict()["metadata"], ensure_ascii=False, allow_nan=False,
+        )),
+    }
+
+
+def _engine_representation_paths(build: Mapping) -> dict[str, Path]:
+    rows = {"primary": str(build.get("pdf_file") or "").strip()}
+    for source in build.get("pdf_sources") or []:
+        if isinstance(source, Mapping):
+            rows[str(source.get("id") or "")] = str(
+                source.get("path") or "").strip()
+    resolved = {}
+    for source_id, raw in rows.items():
+        path = _resolve_local(raw) if raw else None
+        if source_id and path is not None:
+            try:
+                resolved[source_id] = path.resolve(strict=False)
+            except OSError:
+                continue
+    return resolved
+
+
+def _engine_representation_put_record(
+        item_id: str, build: Mapping,
+        draft: RepresentationAttachmentDraft) -> Mapping:
+    """Attach one local reference while retaining its path server-side."""
+    _engine_validate_managed_build_fields(item_id, build)
+    if draft.media_type != "application/pdf":
+        raise EngineValidationError(
+            "this adapter currently accepts PDF representations only",
+            code="unsupported_representation_media_type",
+            details={"media_type": draft.media_type},
+        )
+    if draft.acquisition != "reference":
+        raise EngineValidationError(
+            "managed asset copying is not installed",
+            code="unsupported_representation_acquisition",
+            details={"acquisition": draft.acquisition},
+        )
+    source_id = draft.representation_id
+    if (
+        not _ENGINE_REPRESENTATION_ID.fullmatch(source_id)
+        or (source_id.casefold() == "primary" and source_id != "primary")
+    ):
+        raise EngineValidationError(
+            "the representation id is incompatible with this catalogue",
+            code="invalid_representation_id",
+        )
+    if (
+        source_id == "primary" and draft.role != "primary"
+    ) or (
+        source_id != "primary" and draft.role == "primary"
+    ):
+        raise EngineValidationError(
+            "the representation role conflicts with its identity",
+            code="invalid_representation_role",
+        )
+    path = _engine_representation_source_path(draft.source_token)
+    resolved = path.resolve(strict=True)
+    for existing_id, existing_path in _engine_representation_paths(build).items():
+        if existing_id != source_id and os.path.normcase(existing_path) == os.path.normcase(resolved):
+            raise EngineConflictError(
+                "the source is already attached to this item",
+                code="representation_source_already_attached",
+                details={"item_id": item_id, "representation_id": existing_id},
+            )
+
+    result = dict(build)
+    if source_id == "primary":
+        result["pdf_file"] = draft.source_token
+    else:
+        sources = [
+            dict(source) for source in result.get("pdf_sources") or []
+            if isinstance(source, Mapping) and source.get("id") != source_id
+        ]
+        sources.append({"id": source_id, "path": draft.source_token})
+        result["pdf_sources"] = sources
+
+    manifest = _engine_representation_manifest(build)
+    manifest["sources"][source_id] = _engine_representation_manifest_record(
+        draft, path
+    )
+    manifest["detached"] = [
+        value for value in manifest["detached"] if value != source_id
+    ]
+    result["representation_manifest"] = manifest
+    result["updated_at"] = _build_updated_at(build.get("updated_at"))
+    return result
+
+
+def _engine_representation_detach_record(
+        item_id: str, build: Mapping, source_id: str) -> Mapping:
+    """Detach catalogue state without deleting an external source file."""
+    _engine_validate_managed_build_fields(item_id, build)
+    result = dict(build)
+    if source_id == "primary":
+        result["pdf_file"] = ""
+    else:
+        result["pdf_sources"] = [
+            dict(source) for source in result.get("pdf_sources") or []
+            if isinstance(source, Mapping) and source.get("id") != source_id
+        ]
+    manifest = _engine_representation_manifest(build)
+    manifest["sources"].pop(source_id, None)
+    if source_id not in manifest["detached"]:
+        manifest["detached"].append(source_id)
+    result["representation_manifest"] = manifest
+    result["updated_at"] = _build_updated_at(build.get("updated_at"))
+    return result
+
+
+def _engine_refresh_representation_reference(
+        item_id: str, source_id: str, source_token: str,
+        *, operation_scope: str, expected_item_revision: str):
+    """Attach or replace one internal reference through the same authority.
+
+    Transitional workflows such as folder repointing and page rewrite/restore
+    still operate on legacy local files. Once their file operation succeeds,
+    this helper refreshes the authoritative checksum/stat manifest under the
+    representation service's normal dual-CAS and recoverable receipt boundary.
+    """
+    item = _item_engine().get_item(item_id)
+    if item.record_revision != expected_item_revision:
+        raise EngineConflictError(
+            "the item changed while source work was running",
+            code="item_revision_conflict",
+            details={
+                "item_id": item_id,
+                "expected_revision": expected_item_revision,
+                "current_revision": item.record_revision,
+            },
+        )
+    current = next(
+        (
+            value for value in item.representations
+            if value.representation_id == source_id
+        ),
+        None,
+    )
+    role = "primary" if source_id == "primary" else (
+        current.role if current is not None else "alternate"
+    )
+    label = (
+        current.label if current is not None and current.label else
+        "Primary source" if source_id == "primary" else "Alternate source"
+    )
+    draft = RepresentationAttachmentDraft(
+        representation_id=source_id,
+        source_token=str(source_token).strip(),
+        acquisition="reference",
+        expected_content_sha256="",
+        expected_size=None,
+        role=role,
+        media_type="application/pdf",
+        label=label,
+        metadata=(current.metadata if current is not None else {}),
+    )
+    return _representation_command_engine().attach(
+        AttachRepresentationCommand(
+            item_id=item_id,
+            expected_item_revision=expected_item_revision,
+            expected_representation_revision=(
+                current.revision if current is not None else None
+            ),
+            draft=draft,
+            operation_id=(
+                f"{operation_scope[:64]}-{uuid.uuid4().hex}"
+            ),
+        )
+    )
 
 
 def _engine_artifact_id(item_id: str, kind: str, name: str,
@@ -4027,6 +4650,11 @@ def _engine_host_bindings() -> FilesystemHostBindings:
             encode_record=_engine_item_command_encode,
             allocate_item_id=lambda existing: lib.gen_id(set(existing)),
             lock_context_for=lambda: _builds_lock,
+            representations=RepresentationBindings(
+                decode_aggregate=_engine_representation_aggregate,
+                put_record=_engine_representation_put_record,
+                detach_record=_engine_representation_detach_record,
+            ),
         ),
         replica=ReplicaBindings(
             policies=policies,
@@ -4212,6 +4840,8 @@ def _engine_error_status(exc: EngineError) -> int:
         return 409
     if isinstance(exc, EngineValidationError):
         return 400
+    if exc.retryable and exc.code.endswith("_unavailable"):
+        return 503
     return 500
 
 
@@ -4286,6 +4916,16 @@ def _item_command_engine() -> ItemCommandService:
         raise EngineError(
             "the item command module is unavailable",
             code="item_command_unavailable", retryable=True,
+        )
+    return commands
+
+
+def _representation_command_engine() -> RepresentationCommandService:
+    commands = _library_engine().get_service(REPRESENTATION_COMMAND_SERVICE)
+    if commands is None:
+        raise EngineError(
+            "the representation command module is unavailable",
+            code="representation_command_unavailable", retryable=True,
         )
     return commands
 
@@ -4384,6 +5024,102 @@ def _item_command_record_match(item_id: str) -> str:
             details={"header": "If-Record-Match", "item_id": item_id},
         )
     return value[1:-1]
+
+
+def _representation_command_match(
+        item_id: str, representation_id: str, *, required: bool) -> str | None:
+    raw = request.headers.get("If-Representation-Match")
+    if raw is None:
+        if required:
+            raise EnginePreconditionRequiredError(
+                "a representation revision is required",
+                code="representation_revision_required",
+                details={
+                    "header": "If-Representation-Match",
+                    "item_id": item_id,
+                    "representation_id": representation_id,
+                },
+            )
+        return None
+    value = raw.strip()
+    if (
+        raw != value
+        or value.startswith("W/")
+        or len(value) < 3
+        or value[0] != '"'
+        or value[-1] != '"'
+        or "," in value
+        or not _engine_valid_record_revision(value[1:-1])
+    ):
+        raise EngineValidationError(
+            "If-Representation-Match must contain one strong quoted revision",
+            code="invalid_representation_revision",
+            details={
+                "header": "If-Representation-Match",
+                "item_id": item_id,
+                "representation_id": representation_id,
+            },
+        )
+    return value[1:-1]
+
+
+def _representation_command_draft(
+        representation_id: str) -> RepresentationAttachmentDraft:
+    raw = _item_command_json("representation")
+    fields = {
+        "source_token", "acquisition", "role", "media_type", "label",
+        "metadata", "expected_content_sha256", "expected_size",
+    }
+    if (
+        not isinstance(raw, Mapping)
+        or set(raw) != fields
+        or any(not isinstance(raw.get(field), str) for field in fields - {
+            "metadata", "expected_size",
+        })
+        or not isinstance(raw.get("metadata"), Mapping)
+        or (raw.get("expected_size") is not None
+            and (isinstance(raw.get("expected_size"), bool)
+                 or not isinstance(raw.get("expected_size"), int)))
+    ):
+        raise EngineValidationError(
+            "the representation attachment does not match its schema",
+            code="invalid_representation_attachment",
+        )
+    try:
+        return RepresentationAttachmentDraft(
+            representation_id=representation_id,
+            source_token=raw["source_token"],
+            acquisition=raw["acquisition"],
+            expected_content_sha256=raw["expected_content_sha256"],
+            expected_size=raw["expected_size"],
+            role=raw["role"],
+            media_type=raw["media_type"],
+            label=raw["label"],
+            metadata=raw["metadata"],
+        )
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise EngineValidationError(
+            "the representation attachment is invalid",
+            code="invalid_representation_attachment",
+            details={"cause_type": type(exc).__name__},
+        ) from exc
+
+
+def _representation_command_response(result, *, created: bool = False):
+    response = jsonify({
+        "ok": True,
+        "schema": "librarytool.representation-mutation-receipt/1",
+        **result.as_dict(),
+    })
+    response.headers["X-Record-Revision"] = (
+        result.receipt.after_item_revision
+    )
+    if result.receipt.after is not None:
+        response.headers["X-Representation-Revision"] = (
+            result.receipt.after.revision
+        )
+    response.cache_control.no_store = True
+    return response, 201 if created and not result.replayed else 200
 
 
 def _item_command_managed_fields(*values) -> None:
@@ -4608,10 +5344,16 @@ def _item_response_revision(prefix: str, value) -> str:
     return prefix + "-" + hashlib.sha256(canonical).hexdigest()[:24]
 
 
-def _item_json_response(body: dict, revision: str):
+def _item_json_response(
+        body: dict, revision: str, *, contains_compatibility: bool = False):
     """Return a revalidatable engine snapshot with a strong aggregate ETag."""
     response = jsonify({**body, "revision": revision})
     response.set_etag(revision)
+    if contains_compatibility:
+        # The explicit transitional projection can contain local filesystem
+        # paths and must never enter a browser or intermediary cache.
+        response.cache_control.no_store = True
+        return response
     response.cache_control.no_cache = True
     return response.make_conditional(request)
 
@@ -4648,7 +5390,7 @@ def api_v1_items():
     revision = _item_response_revision("ic", items)
     return _item_json_response({
         "ok": True, "schema": "librarytool.items/1", "items": items,
-    }, revision)
+    }, revision, contains_compatibility=(projection == "build-workbench"))
 
 
 @app.route("/api/v1/items", methods=["POST"])
@@ -4679,7 +5421,7 @@ def api_v1_item(item_id: str):
     )
     response = _item_json_response({
         "ok": True, "schema": "librarytool.item/1", "item": item,
-    }, revision)
+    }, revision, contains_compatibility=(projection == "build-workbench"))
     response.headers["X-Record-Revision"] = item["record_revision"]
     return response
 
@@ -4714,6 +5456,66 @@ def api_v1_item_representations(item_id: str):
         "ok": True, "schema": "librarytool.representations/1",
         "item_id": item_id, "representations": rows,
     }, revision)
+
+
+@app.route(
+    "/api/v1/items/<item_id>/representations/<representation_id>",
+    methods=["PUT"],
+)
+def api_v1_item_representation_put(item_id: str, representation_id: str):
+    """Attach a new source, or replace one under dual CAS preconditions."""
+    try:
+        operation_id = _item_command_operation_id(item_id=item_id)
+        expected_item_revision = _item_command_record_match(item_id)
+        expected_representation_revision = _representation_command_match(
+            item_id, representation_id, required=False,
+        )
+        draft = _representation_command_draft(representation_id)
+        result = _representation_command_engine().attach(
+            AttachRepresentationCommand(
+                item_id=item_id,
+                expected_item_revision=expected_item_revision,
+                expected_representation_revision=(
+                    expected_representation_revision
+                ),
+                draft=draft,
+                operation_id=operation_id,
+            )
+        )
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    return _representation_command_response(
+        result, created=expected_representation_revision is None,
+    )
+
+
+@app.route(
+    "/api/v1/items/<item_id>/representations/<representation_id>",
+    methods=["DELETE"],
+)
+def api_v1_item_representation_delete(item_id: str, representation_id: str):
+    """Detach one representation without deleting an external source file."""
+    try:
+        operation_id = _item_command_operation_id(item_id=item_id)
+        expected_item_revision = _item_command_record_match(item_id)
+        expected_representation_revision = _representation_command_match(
+            item_id, representation_id, required=True,
+        )
+        assert expected_representation_revision is not None
+        result = _representation_command_engine().detach(
+            DetachRepresentationCommand(
+                item_id=item_id,
+                representation_id=representation_id,
+                expected_item_revision=expected_item_revision,
+                expected_representation_revision=(
+                    expected_representation_revision
+                ),
+                operation_id=operation_id,
+            )
+        )
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    return _representation_command_response(result)
 
 
 @app.route("/api/v1/items/<item_id>/artifacts")
@@ -8358,6 +9160,9 @@ def _trash_restore_pdf_pages(item: dict) -> tuple[dict, int]:
     builds = lib.load_json(BUILDS_PATH, {})
     if build_id not in builds:
         return {"ok": False, "error": "that entry no longer exists"}, 409
+    refresh_expected_revision = _engine_build_record_revision(
+        build_id, builds[build_id]
+    )
     pdf = _resolve_local(str(origin.get("pdf") or ""))
     if pdf is None or not pdf.is_file() or pdf.suffix.lower() != ".pdf":
         return {"ok": False, "error": "the original PDF is no longer there"}, 409
@@ -8476,10 +9281,31 @@ def _trash_restore_pdf_pages(item: dict) -> tuple[dict, int]:
         # different physical page with no conflict raised. The delete path
         # carries the same invariant via `if changed or build_persisted`.
         try:
-            _builds_apply(build_id, changed)
-        except OSError:
+            refresh_expected_revision = _builds_apply(
+                build_id,
+                changed,
+                expected_revision=refresh_expected_revision,
+            )
+        except (EngineError, OSError):
             skipped.append({"file": "entry record",
                             "reason": "could not be written back"})
+    try:
+        _engine_refresh_representation_reference(
+            build_id,
+            str(origin.get("src_key") or "primary"),
+            str(origin.get("pdf") or pdf),
+            operation_scope="page-restore-source-refresh",
+            expected_item_revision=refresh_expected_revision,
+        )
+    except EngineError as exc:
+        log.warning(
+            "could not refresh representation after page restore: %s",
+            exc.code,
+        )
+        skipped.append({
+            "file": "source integrity metadata",
+            "reason": "could not be refreshed",
+        })
 
     # the caller (api_trash_restore) owns marking the row restored
     return {"ok": True, "restored": restored, "skipped": skipped,
@@ -8508,15 +9334,25 @@ def _trash_restore_record(item: dict) -> tuple[dict, int]:
 
     def apply(doc):
         if rid in doc:
-            return False
+            # Retrying a restore after its response was lost is a replay, not
+            # an overwrite. Any intervening edit still conflicts.
+            return "replayed" if doc[rid] == record else "conflict"
         doc[rid] = record
-        return True
+        return "restored"
 
-    if not _mutate_json(path, lock, {}, apply):
+    outcome = _mutate_json(path, lock, {}, apply)
+    if outcome == "conflict":
         return {"ok": False,
                 "error": "something with that id exists again — restoring would "
                          "overwrite it"}, 409
-    return {"ok": True, "restored": ["record.json"], "skipped": []}, 200
+    body = {
+        "ok": True,
+        "restored": ["record.json"],
+        "skipped": [],
+        "replayed": outcome == "replayed",
+    }
+    body["build" if kind == "build" else "entry"] = record
+    return body, 200
 
 
 def _trash_restore_translation(item: dict) -> tuple[dict, int]:
@@ -9277,9 +10113,35 @@ def _apply_page_deletion(build_id: str, builds: dict, pdf: Path,
                 build_id, pdf, expected_revision)
         if _page_job_blockers(build_id):
             raise ValueError("a page-processing job is running for this book")
-        return _apply_page_deletion_locked(
+        result = _apply_page_deletion_locked(
             build_id, builds, pdf, pages,
             expected_revision=expected_revision)
+    refresh = result.pop("_representation_refresh", None)
+    if refresh is not None:
+        source_id, source_token, expected_item_revision = refresh
+        try:
+            _engine_refresh_representation_reference(
+                build_id,
+                source_id,
+                source_token,
+                operation_scope="page-delete-source-refresh",
+                expected_item_revision=expected_item_revision,
+            )
+            current = lib.load_json(BUILDS_PATH, {}).get(build_id)
+            if isinstance(current, dict):
+                builds[build_id] = current
+                result["build"] = current
+        except EngineError as exc:
+            log.warning(
+                "could not refresh representation after page deletion: %s",
+                exc.code,
+            )
+            warnings = result.setdefault("warnings", [])
+            warnings.append(
+                "source integrity metadata could not be refreshed"
+            )
+            result["partial"] = True
+    return result
 
 
 def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
@@ -9319,6 +10181,7 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
             build_id, pdf, expected_revision)
         builds[build_id] = b
         build_persisted = True
+    reserved_item_revision = _engine_build_record_revision(build_id, b)
     actual_pages = [page for page in pages if page <= total]
     srcmap = _ocr_sources(build_id)
     ocr_dir = _entry_dir(build_id) / "ocr"
@@ -9522,7 +10385,11 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
         b.update(changed)
         if changed or build_persisted:
             try:
-                revision = _builds_apply(build_id, changed)
+                revision = _builds_apply(
+                    build_id,
+                    changed,
+                    expected_revision=reserved_item_revision,
+                )
                 if revision:
                     b["updated_at"] = revision
                 else:
@@ -9562,6 +10429,12 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
               "trash_id": tid,
               "page_remap": {"source": src_key, "deleted": actual_pages},
               "build": b}
+    if build_persisted:
+        result["_representation_refresh"] = (
+            src_key,
+            src_path,
+            _engine_build_record_revision(build_id, b),
+        )
     if warnings:
         result["partial"] = True
         result["warnings"] = warnings

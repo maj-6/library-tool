@@ -46,9 +46,25 @@ Per-component detail lives in each part's own README (map at the end).
   `If-Record-Match`. Catalogue-only create and update commands now run through
   a recoverable filesystem repository and require replay-safe
   `Idempotency-Key` values. Their `EngineClient` methods are ready, but the
-  transitional catalogue editor still uses legacy mutation routes. Default
-  DTOs replace attached paths with opaque representation identities; only the
-  explicit `build-workbench` projection carries the old local build record.
+  transitional catalogue metadata editor still uses legacy mutation routes.
+  Interactive PDF attachment, replacement, and detachment now use a separate
+  representation command service with item-level and representation-level
+  compare-and-swap, durable replay receipts, and atomic catalogue publication.
+  The browser reaches it through `EngineClient.items`; command and query
+  responses contain opaque representation identities, checksums, sizes, and
+  `unchanged`/`drifted`/`missing`/`untracked` content state, never the adapter's
+  local source token or private replay fingerprint. Attachment structurally
+  validates and hashes one stable PDF handle, then records its filesystem
+  identity; later stat/identity drift makes a referenced source unavailable
+  until explicit replacement revalidates it. Legacy create, update, and direct
+  undo-restore routes cannot write source fields, and compatibility projections
+  containing local paths are `no-store`. Folder and page-rewrite compatibility
+  workflows refresh source integrity through the same command service. The
+  production adapter currently references local PDFs and retains their paths
+  only in the transitional raw build record. The neutral command contract also
+  models copied acquisition, but an owned-asset copier and transactional asset
+  staging are not installed yet. Only the explicit `build-workbench` projection
+  carries the old local build record.
   The translation aggregate now supplies
   versioned list/detail/page-replacement resources, authoritative
   current/stale/untracked/missing/orphaned status, dual document/source
@@ -61,8 +77,8 @@ Per-component detail lives in each part's own README (map at the end).
   catalogue state, entry assets, component receipts, and the global replay
   receipt publish through one recoverable transaction. The desktop local-path
   route delegates to it, and portable clients use `/api/v1/lib-opens`.
-  Representation attachment, provider-backed translation generation, and
-  legacy item delete/restore are not yet migrated to these command boundaries.
+  Provider-backed OCR/region and translation generation, plus legacy item
+  delete/restore, are not yet fully migrated to these command boundaries.
 - **Desktop app** — the workbench: an Electron shell (`desktop/`) that
   spawns the Flask sidecar (`tools/whl_explorer/server.py`) on a loopback
   port. Paths split into two roots (`tools/libcommon.py`): **`APP_ROOT`**,

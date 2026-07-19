@@ -12,6 +12,9 @@ from .recoverable_write_set import (
     UnsafeTargetError,
     WriteSetError,
 )
+from .representation_command_repository import (
+    FilesystemRepresentationCommandRepository,
+)
 from .replica_repository import FilesystemReplicaRepository
 from .session_lease import (
     WorkspaceAlreadyOpenError,
@@ -30,6 +33,7 @@ __all__ = [
     "FilesystemOpenLibRepository",
     "FilesystemJobHistoryRepository",
     "FilesystemReplicaRepository",
+    "FilesystemRepresentationCommandRepository",
     "FilesystemTranslationRepository",
     "RecoverableWriteSet",
     "RecoveryResult",

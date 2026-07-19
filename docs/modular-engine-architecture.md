@@ -83,11 +83,21 @@ larger workbench and packaging split described below remains the target:
   and restart recovery. Production `POST /api/v1/items` and
   `PATCH /api/v1/items/{id}` require a portable `Idempotency-Key`; update also
   requires strong record-level `If-Record-Match`. `EngineClient.items` owns
-  the same contract. The production routes intentionally accept catalogue
-  metadata only: representation attachment and item delete/restore are not
-  migrated, even though the engine kernel and repository include a delete
-  primitive. The transitional catalogue editor has not adopted create/update
-  yet and still uses its legacy mutation routes.
+  the same contract. Those routes intentionally accept catalogue metadata
+  only. Representation attachment is now a distinct optional engine service:
+  attach, replace, and detach use dual item/representation preconditions,
+  replay-safe operation IDs, safe receipts, and one recoverable transaction
+  that publishes the catalogue last. Versioned HTTP resources and
+  `EngineClient.items` expose that boundary, and the browser's interactive
+   primary/secondary PDF controls now use it instead of HEAD plus generic build
+   PATCH. The current production adapter supports referenced local PDFs; the
+   neutral contract also carries copied acquisition, expected SHA-256, and
+   expected size, but owned-asset materialization is still a later assets
+   boundary. Legacy create, PATCH, and direct undo-restore reject representation
+   fields. Entry-folder repointing and page rewrites refresh their integrity
+   manifest through the same command service. Item delete/restore is not yet a
+   composite engine lifecycle, and the catalogue metadata editor has not
+   adopted engine create/update yet.
 - The revisioned translation aggregate is now composed over the legacy entry
   folders through `FilesystemTranslationRepository`. Versioned list/detail
   resources and conditional page replacement expose authoritative current,
@@ -150,19 +160,69 @@ recto/verso layouts, reports confidence and exceptions, and does not modify the
 book. Region detection providers and a future UI review queue can consume this
 same contract without owning the grouping algorithm.
 
-Replica region detection is now the first real consumer of that job contract.
-Its versioned, page-scoped command resolves the attached source and provider
-credentials in the engine, returns a stable job identity, and preserves
-protected work as a proposal. The workbench observes that job directly and
-distinguishes completion, failure, cancellation, and restart interruption; it
-no longer infers completion from browser-local OCR page markers. The item query
-service is now composed into `/api/v1`, and both existing-item import and
+Replica region detection is the first real consumer of that job contract, but
+the vertical is only partially extracted. The engine owns stable job identity,
+history, cancellation state, events, and protected-work proposal semantics.
+The compatibility Flask handler still loads the build and settings, resolves
+the local source and provider credentials, and launches the OCR/layout
+provider. Alternate clients therefore cannot yet submit provider-neutral
+detection through the engine alone. The workbench does observe the shared job
+directly and distinguishes completion, failure, cancellation, and restart
+interruption instead of inferring completion from browser-local OCR markers.
+The item query service is composed into `/api/v1`; existing-item import and
 new-item `.lib` open demonstrate recoverable multi-artifact transactions. The
 local-path compatibility route is preserved, while `EngineClient` imports or
 opens packages through stable idempotent resources and receives complete
-durable receipts. Translation reads and human page edits, plus catalogue-only
-item create/update, now demonstrate the same separation for two more
-workbench domains.
+durable receipts. Translation reads and human page edits, catalogue-only item
+create/update, and representation attachment now demonstrate the same
+separation for additional workbench domains. Provider-backed region and
+translation generation remain compatibility paths.
+
+### Representation attachment boundary
+
+The source-attachment slice establishes a frontend-independent command model:
+
+- `source_token` is an adapter-only acquisition input. It is absent from query
+  DTOs, public mutation receipts, logs, and opaque representation locators. The
+  durable command fingerprint remains private because it binds that token.
+- Attach requires item CAS and absence of the representation; replace and
+  detach require both the item and representation revisions. A durable receipt
+  records exact before/after snapshots and is published before the catalogue in
+  the same recoverable write set.
+- The browser retains an operation ID across ambiguous transport failures,
+  treats a valid receipt as committed even if refresh fails, and chains undo and
+  redo from the receipt's exact revisions. A concurrent change therefore
+  conflicts instead of being silently overwritten.
+- The production reference adapter structurally parses and hashes a PDF from
+  one stable handle, verifies the path still resolves to that same identity,
+  and stores its digest, size, and stat fingerprint. Queries expose
+  `content_state`: `unchanged`, `drifted`, `missing`, or `untracked`. A drifted
+  or missing source is unavailable until explicit replacement succeeds.
+- `unchanged` means the recorded identity/stat fingerprint has not changed
+  since the attachment hash was taken; it is not a fresh whole-file hash on
+  every query. Managed immutable copies and an explicit deep-verify command are
+  later asset-service work.
+- Transitional `build-workbench` projections still contain paths because the
+  current browser has path-based PDF consumers. They are explicit and
+  `Cache-Control: no-store`; portable clients consume the default opaque DTOs.
+
+Legacy create, PATCH, and arbitrary JSON restore cannot write representation
+fields. Folder repointing and page delete/restore refresh the manifest through
+the command boundary after their file operation. Those file rewrites are not
+yet part of the same asset transaction; a crash between the byte rewrite and
+manifest refresh is surfaced as `drifted` rather than accepted as current.
+The existing Trash workflow remains a trusted, server-owned lifecycle adapter:
+it cannot inject caller-supplied source state, and a restored reference whose
+file changed while deleted returns as drifted and unavailable. Browser history
+restores deleted catalogue records through that server-owned tombstone instead
+of reconstructing sources from client JSON; an exact response-lost restore is
+replayable, while an intervening edit conflicts. Atomic item, managed-tree,
+tombstone, and receipt publication belongs to the item lifecycle boundary
+described below.
+
+The neutral contract admits `copy`, expected digest, and expected size, but the
+production adapter intentionally installs reference-only PDF acquisition until
+owned asset staging and provider traits are available.
 
 ### Translation aggregate boundary
 
@@ -252,14 +312,18 @@ With the lifecycle seam established, migrate these data boundaries in order:
 
 1. **Complete the composite item lifecycle.** New-item `.lib` open now proves
    allocation, catalogue publication, entry assets, nested receipts, replay,
-   rollback, and restart recovery in one transaction. Reuse those staging
-   seams for source attachment, then move item delete and restore behind the
-   same aggregate boundary with entry-tree tombstones. Do not regress to
-   nesting independently committing services.
+   rollback, and restart recovery in one transaction. Source attachment now
+   reuses the catalogue staging seam and publishes its receipt plus catalogue
+   update atomically. Next move item delete and restore behind the same
+   aggregate boundary with recoverable entry-tree tombstones. Do not expose
+   the older catalogue-only tombstone primitive or regress to nesting
+   independently committing services.
 2. **Representation and canvas resources.** Replace attached filesystem paths
    and page-number assumptions with opaque representation, asset, ordered
-   canvas, and structure identities. Add explicit attachment/detachment and
-   raster/text addressing commands before a new Replica UI or generalized
+   canvas, and structure identities. The first explicit representation
+   attachment/detachment boundary is complete for referenced PDFs. Add owned
+   asset copying, immutable asset manifests, ordered canvas/structure records,
+   and raster/text addressing commands before a new Replica UI or generalized
    manuscript/audio workbench depends on them.
 3. **Text-layer aggregate.** Promote the current text-layer services and OCR
    files into a persisted, revisioned aggregate with stable selectors,

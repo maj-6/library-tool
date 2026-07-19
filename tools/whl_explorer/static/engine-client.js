@@ -128,6 +128,9 @@
         create: (args) => this._itemCreate(args),
         update: (args) => this._itemUpdate(args),
         representations: (args) => this._itemRepresentations(args),
+        attachRepresentation: (args) => this._representationAttach(args),
+        replaceRepresentation: (args) => this._representationReplace(args),
+        detachRepresentation: (args) => this._representationDetach(args),
         artifacts: (args) => this._itemArtifacts(args),
         readiness: (args) => this._itemReadiness(args),
       });
@@ -310,6 +313,57 @@
     _itemRepresentations({ itemId, signal } = {}) {
       return this._requestJson(
         "GET", `/v1/items/${encodePart(itemId)}/representations`, { signal });
+    }
+
+    _representationPut({ itemId, representationId, representation,
+      recordRevision, representationRevision, idempotencyKey, signal } = {}) {
+      const headers = {
+        "Idempotency-Key": operationKey(idempotencyKey, "idempotencyKey"),
+        "If-Record-Match": quoteRecordRevision(
+          recordRevision, "recordRevision"),
+      };
+      if (representationRevision != null) {
+        headers["If-Representation-Match"] = quoteRecordRevision(
+          representationRevision, "representationRevision");
+      }
+      return this._requestJson(
+        "PUT",
+        `/v1/items/${encodePart(itemId)}/representations/` +
+          encodePart(representationId),
+        { headers, body: { representation }, signal });
+    }
+
+    _representationAttach(args = {}) {
+      if (args.representationRevision != null) {
+        throw new TypeError(
+          "attachRepresentation does not accept representationRevision");
+      }
+      return this._representationPut(args);
+    }
+
+    _representationReplace(args = {}) {
+      if (!args.representationRevision) {
+        throw new TypeError("representationRevision is required");
+      }
+      return this._representationPut(args);
+    }
+
+    _representationDetach({ itemId, representationId, recordRevision,
+      representationRevision, idempotencyKey, signal } = {}) {
+      return this._requestJson(
+        "DELETE",
+        `/v1/items/${encodePart(itemId)}/representations/` +
+          encodePart(representationId),
+        {
+          headers: {
+            "Idempotency-Key": operationKey(idempotencyKey, "idempotencyKey"),
+            "If-Record-Match": quoteRecordRevision(
+              recordRevision, "recordRevision"),
+            "If-Representation-Match": quoteRecordRevision(
+              representationRevision, "representationRevision"),
+          },
+          signal,
+        });
     }
 
     _itemArtifacts({ itemId, signal } = {}) {

@@ -17,6 +17,7 @@ from .capabilities import (
 )
 from .interchange import LibInterchangeService, OpenLibService
 from .item_commands import ItemCommandService
+from .representation_commands import RepresentationCommandService
 from .items import ItemQueryService, WorkbenchPolicyPort
 from .jobs import JobManager
 from .replica import ReplicaApplicationService
@@ -421,6 +422,9 @@ ITEM_QUERY_SERVICE: ServiceKey[ItemQueryService] = ServiceKey(
 ITEM_COMMAND_SERVICE: ServiceKey[ItemCommandService] = ServiceKey(
     "library.items.commands"
 )
+REPRESENTATION_COMMAND_SERVICE: ServiceKey[RepresentationCommandService] = (
+    ServiceKey("library.representations.commands")
+)
 INTERCHANGE_SERVICE: ServiceKey[LibInterchangeService] = ServiceKey(
     "replica.interchange"
 )
@@ -615,6 +619,7 @@ __all__ = [
     "LibraryEngineBuilder",
     "ModuleContribution",
     "REPLICA_SERVICE",
+    "REPRESENTATION_COMMAND_SERVICE",
     "ServiceBinding",
     "ServiceKey",
     "ServiceNotFoundError",

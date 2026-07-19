@@ -1619,7 +1619,10 @@ async function undo() {
   historyBusy = true;
   const op = history.stack[--history.ptr];
   try { await op.undoFn(); status(`UNDO :: ${op.label}`); }
-  catch (e) { statusErr(`UNDO FAILED :: ${op.label}`); }
+  catch (e) {
+    history.ptr += 1;  // the inverse did not commit; it is still undoable
+    statusErr(`UNDO FAILED :: ${op.label}`);
+  }
   historyBusy = false;
   updateHistoryButtons();
 }
@@ -1633,7 +1636,10 @@ async function redo() {
   historyBusy = true;
   const op = history.stack[history.ptr++];
   try { await op.redoFn(); status(`REDO :: ${op.label}`); }
-  catch (e) { statusErr(`REDO FAILED :: ${op.label}`); }
+  catch (e) {
+    history.ptr -= 1;  // the forward mutation did not commit; keep it redoable
+    statusErr(`REDO FAILED :: ${op.label}`);
+  }
   historyBusy = false;
   updateHistoryButtons();
 }
@@ -16473,6 +16479,41 @@ function buildIsDirty() {
      buildDescMd.get() !== descState.val);
 }
 
+function engineBuildProjection(item) {
+  const legacy = item && item.compatibility && item.compatibility.build;
+  if (!item || !legacy || typeof legacy !== "object" || Array.isArray(legacy))
+    return null;
+  const workbench = item.workbench_state;
+  const availableCommands = workbench &&
+    Array.isArray(workbench.available_commands)
+    ? [...new Set(workbench.available_commands.filter((command) =>
+        typeof command === "string" && command))]
+    : [];
+  return {
+    ...legacy,
+    id: item.id,
+    title: item.title,
+    updated_at: legacy.updated_at || item.record_revision || "",
+    _record_revision: item.record_revision || legacy.updated_at || "",
+    _representations: Array.isArray(item.representations)
+      ? item.representations : [],
+    _available_commands: availableCommands,
+  };
+}
+
+function mergeBuildCompatibility(raw, prior) {
+  const previous = prior && typeof prior === "object" ? prior : {};
+  return {
+    ...(raw || {}),
+    _record_revision: (raw && raw.updated_at) ||
+      previous._record_revision || "",
+    _representations: Array.isArray(previous._representations)
+      ? previous._representations : [],
+    _available_commands: Array.isArray(previous._available_commands)
+      ? previous._available_commands : undefined,
+  };
+}
+
 async function loadBuilds() {
   try {
     const result = await engineClient.items.list({
@@ -16480,14 +16521,8 @@ async function loadBuilds() {
     });
     state.builds = {};
     for (const item of result.items || []) {
-      const legacy = item && item.compatibility && item.compatibility.build;
-      if (!legacy || typeof legacy !== "object" || Array.isArray(legacy)) continue;
-      state.builds[item.id] = {
-        ...legacy,
-        id: item.id,
-        title: item.title,
-        updated_at: legacy.updated_at || item.record_revision || "",
-      };
+      const build = engineBuildProjection(item);
+      if (build) state.builds[item.id] = build;
     }
     // One-time migration for builds that already had a volume before explicit
     // group metadata was introduced. Persist the association, then render from
@@ -16503,7 +16538,9 @@ async function loadBuilds() {
           body: JSON.stringify({ group_id: groupId }),
         });
         const data = await patch.json().catch(() => ({}));
-        if (patch.ok && data.ok) state.builds[b.id] = data.build;
+        if (patch.ok && data.ok) {
+          state.builds[b.id] = mergeBuildCompatibility(data.build, b);
+        }
       } catch (e) { /* local display still uses the migrated association */ }
     }
   } catch (e) { state.builds = {}; }
@@ -16806,6 +16843,7 @@ function renderBuildEditor() {
   el("b-src-open").href = src;
   el("build-msg").textContent = "";
   buildDirty = false;   // a freshly loaded form is clean
+  updateRepresentationMutationControls(b);
   if (wbActivePhase() === "source" && activeBuildTab() === "btab-source") {
     refreshSourceTab();
   }
@@ -16817,39 +16855,96 @@ function selectBuild(id) {
 }
 
 async function createBuild(seed, label, originTab = activeHistoryTab()) {
+  const requested = seed && typeof seed === "object" && !Array.isArray(seed)
+    ? { ...seed } : {};
+  const primarySource = String(requested.pdf_file || "").trim();
+  const secondarySources = Array.isArray(requested.pdf_sources)
+    ? requested.pdf_sources.map((row) => ({
+        id: String((row && row.id) || "").trim(),
+        path: String((row && row.path) || "").trim(),
+      })).filter((row) => row.path)
+    : [];
+  // Source ownership has moved to representation commands. The transitional
+  // catalogue create route receives metadata only, even for legacy seed data.
+  delete requested.pdf_file;
+  delete requested.pdf_sources;
   const res = await fetch("/api/builds", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ build: seed || {} }),
+    body: JSON.stringify({ build: requested }),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || !data.ok) { statusCrit("BUILD CREATE FAILED"); return null; }
-  state.builds[data.build.id] = data.build;
-  const snap = JSON.parse(JSON.stringify(data.build));
+  invalidateRepresentationItemIncarnation(data.build.id);
+  state.builds[data.build.id] = {
+    ...data.build,
+    _record_revision: data.build.updated_at || "",
+    _representations: [],
+  };
+  // The compatibility create response has no module eligibility. Resolve the
+  // semantic projection before seed attachments or controls can use it.
+  try { await refreshBuildEngineRecord(data.build.id); } catch (ignored) {}
+  let sourceAttachFailed = false;
+  let sourceAttachMessage = "";
+  if (primarySource) {
+    const receipt = await setBuildRepresentation(
+      data.build.id, "primary", primarySource, {
+        intent: "attach",
+        recordRevision: state.builds[data.build.id]._record_revision,
+      });
+    sourceAttachFailed = !receipt;
+    if (!receipt) sourceAttachMessage = representationFailureMessage(
+      data.build.id, "primary");
+  }
+  for (const source of secondarySources) {
+    const build = state.builds[data.build.id] || data.build;
+    const used = new Set([
+      "primary",
+      ...((build.pdf_sources || []).map((row) =>
+        String((row && row.id) || "").toLowerCase())),
+    ]);
+    const requestedId = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/.test(source.id) &&
+      !used.has(source.id.toLowerCase()) ? source.id : "";
+    const sourceId = requestedId || secondaryRepresentationId(build);
+    const receipt = await setBuildRepresentation(
+      data.build.id, sourceId, source.path, {
+        intent: "attach",
+        recordRevision: build._record_revision,
+      });
+    if (!receipt) {
+      sourceAttachFailed = true;
+      sourceAttachMessage = representationFailureMessage(
+        data.build.id, sourceId);
+    }
+  }
+
+  const built = state.builds[data.build.id] || data.build;
+  const snap = JSON.parse(JSON.stringify(built));
+  const lifecycle = { trashId: "" };
   pushOp(`create build ${label || snap.title || snap.id}`,
     async () => {
-      await fetch(`/api/builds/${snap.id}`, { method: "DELETE" });
-      delete state.builds[snap.id];
+      lifecycle.trashId = await deleteBuildToTrash(snap.id);
       if (state.buildSel === snap.id) state.buildSel = null;
       renderUpload();
     },
     async () => {
-      await fetch("/api/builds/restore", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ build: snap }),
-      });
-      state.builds[snap.id] = snap;
+      await restoreDeletedBuildFromTrash(lifecycle.trashId, snap.id);
       renderUpload();
     }, undefined, originTab);
   selectBuild(data.build.id);
   renderUpload();
-  return data.build;
+  if (sourceAttachFailed) {
+    const message = el("b-src-msg");
+    if (message) message.textContent = sourceAttachMessage ||
+      "Source update rejected";
+    statusCrit("BUILD CREATED :: PDF ATTACH FAILED");
+  }
+  return built;
 }
 
 function buildSeedFromSource(s) {
-  // pdf_source records where the scan lives online; pdf_file is filled with
-  // the already-downloaded local copy when one exists. Locally attached
+  // pdf_source records where the scan lives online; pdf_file is a client-side
+  // attachment seed removed by createBuild before its catalogue POST. Locally attached
   // scans have no online source — the local file IS the source.
   let pdfUrl = "", pdfFile = "";
   if (s.local_pdf) {
@@ -16875,6 +16970,425 @@ function buildSeedFromSource(s) {
 
 let buildPatchConflict = false;  // last patch came back 409 (record reloaded)
 
+async function refreshBuildEngineRecord(id) {
+  const expectedGeneration = buildEngineRecordGeneration(id);
+  const before = state.builds[id];
+  if (!before) return null;
+  const expectedRevision = before._record_revision || "";
+  const result = await engineClient.items.get({
+    itemId: id, includeBuildCompatibility: true,
+  });
+  const item = result && result.item;
+  const build = engineBuildProjection(item);
+  if (!build) return null;
+  const current = state.builds[id];
+  if (!current || buildEngineRecordGeneration(id) !== expectedGeneration ||
+      (current._record_revision || "") !== expectedRevision) {
+    return current || null;
+  }
+  state.builds[id] = build;
+  return state.builds[id];
+}
+
+function representationOperationKey(action) {
+  const random = globalThis.crypto && typeof globalThis.crypto.randomUUID === "function"
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+  return `${action}-${random}`;
+}
+
+const pendingRepresentationMutations = new Map();
+// Semantic item reads can finish after a newer command, deletion, or restore.
+// Keep an incarnation epoch separate from the engine's record revision so an
+// old response can never repopulate a deleted row or replace receipt-adopted
+// state. Ambiguous command retries deliberately stay within the same epoch.
+const buildEngineRecordGenerations = new Map();
+
+function buildEngineRecordGeneration(id) {
+  return buildEngineRecordGenerations.get(String(id || "")) || 0;
+}
+
+function advanceBuildEngineRecordGeneration(id) {
+  const key = String(id || "");
+  const next = buildEngineRecordGeneration(key) + 1;
+  buildEngineRecordGenerations.set(key, next);
+  return next;
+}
+
+let secondaryRepresentationSequence = 0;
+
+function secondaryRepresentationId(build) {
+  const used = new Set([
+    "primary",
+    ...(((build && build._representations) || []).map((row) =>
+      String((row && row.id) || "").toLowerCase())),
+    ...(((build && build.pdf_sources) || []).map((row) =>
+      String((row && row.id) || "").toLowerCase())),
+  ]);
+  // UUID entropy makes collisions vanishingly unlikely; the monotonic prefix
+  // also keeps the fallback collision-free within this renderer process.
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    secondaryRepresentationSequence += 1;
+    const random = globalThis.crypto &&
+      typeof globalThis.crypto.randomUUID === "function"
+      ? globalThis.crypto.randomUUID().replace(/-/g, "")
+      : `${Date.now().toString(36)}${Math.random().toString(16).slice(2)}`;
+    const id = (`s${secondaryRepresentationSequence.toString(36)}-` + random)
+      .slice(0, 32);
+    if (!used.has(id.toLowerCase())) return id;
+  }
+  return (`s${secondaryRepresentationSequence.toString(36)}-` +
+    Date.now().toString(36)).slice(0, 32);
+}
+
+function attachedRepresentation(build, sourceId) {
+  return ((build && build._representations) || []).find(
+    (row) => row && row.id === sourceId) || null;
+}
+
+const REPRESENTATION_COMMAND_NAMES = Object.freeze([
+  "representation.attach", "representation.replace", "representation.detach",
+]);
+const representationMutationFailures = new Map();
+
+function clearPendingRepresentationMutationsForItem(itemId) {
+  const target = String(itemId || "");
+  for (const [key, pending] of pendingRepresentationMutations) {
+    if (String(pending && pending.args && pending.args.itemId || "") === target)
+      pendingRepresentationMutations.delete(key);
+  }
+  for (const key of representationMutationFailures.keys()) {
+    try {
+      if (JSON.parse(key)[0] === target) representationMutationFailures.delete(key);
+    } catch (ignored) { /* only keys made by representationFailureKey live here */ }
+  }
+}
+
+function invalidateRepresentationItemIncarnation(itemId) {
+  clearPendingRepresentationMutationsForItem(itemId);
+  return advanceBuildEngineRecordGeneration(itemId);
+}
+
+function representationFailureKey(buildId, sourceId) {
+  return JSON.stringify([String(buildId || ""), String(sourceId || "")]);
+}
+
+function representationCommandAvailable(build, action) {
+  const commands = build && build._available_commands;
+  // Unknown capability state fails closed. Transitional catalogue responses
+  // are semantically refreshed before their controls are exposed.
+  return Array.isArray(commands) &&
+    commands.includes(`representation.${action}`);
+}
+
+function updateReceiptCommandAvailability(build) {
+  if (!build || !Array.isArray(build._available_commands)) return;
+  const hadRepresentationModule = build._available_commands.some((command) =>
+    REPRESENTATION_COMMAND_NAMES.includes(command));
+  if (!hadRepresentationModule) return;
+  const other = build._available_commands.filter((command) =>
+    !REPRESENTATION_COMMAND_NAMES.includes(command));
+  other.push("representation.attach");
+  if ((build._representations || []).length) {
+    other.push("representation.replace", "representation.detach");
+  }
+  build._available_commands = [...new Set(other)];
+}
+
+function rememberRepresentationFailure(buildId, sourceId, error) {
+  const failure = error && typeof error === "object" ? {
+    code: String(error.code || "request-failed"),
+    status: Number(error.status) || 0,
+    retryable: !!error.retryable,
+  } : { code: "request-failed", status: 0, retryable: false };
+  representationMutationFailures.set(
+    representationFailureKey(buildId, sourceId), failure);
+  return failure;
+}
+
+function representationFailureMessage(buildId, sourceId, fallback = "invalid") {
+  const failure = representationMutationFailures.get(
+    representationFailureKey(buildId, sourceId));
+  const code = failure ? failure.code : "";
+  if (code === "representation_command_unavailable")
+    return "Source tools unavailable";
+  if (code === "representation_source_already_attached")
+    return "Already attached";
+  if (new Set([
+    "representation_source_not_found", "unsupported_representation_media_type",
+    "invalid_representation_source", "representation_source_changed",
+    "representation_source_digest_mismatch",
+    "representation_source_size_mismatch",
+  ]).has(code)) return "Invalid or changed PDF";
+  if (new Set([
+    "item_revision_conflict", "representation_revision_conflict",
+    "representation_already_exists", "representation_not_found",
+    "operation_id_conflict",
+  ]).has(code)) return "Source changed elsewhere";
+  if (code === "network-error" || code === "invalid-response" ||
+      code.endsWith("_unavailable") || (failure && failure.retryable))
+    return "Source service unavailable";
+  if (code) return "Source update rejected";
+  return fallback === "conflict"
+    ? "Source changed elsewhere" : "Invalid or changed PDF";
+}
+
+function updateRepresentationMutationControls(build = currentBuild()) {
+  const input = el("b-pdf_file");
+  const attach = el("b-pdf-attach");
+  const browse = el("b-pdf-browse");
+  const addSecondary = el("b-pdf2-add");
+  const primary = attachedRepresentation(build, "primary");
+  const desiredPath = input ? String(input.value || "").trim() :
+    String((build && build.pdf_file) || "").trim();
+  const primaryAction = desiredPath
+    ? (primary ? "replace" : "attach")
+    : (primary ? "detach" : "");
+  const anyPrimary = ["attach", "replace", "detach"].some((action) =>
+    representationCommandAvailable(build, action));
+  if (input) input.disabled = !anyPrimary;
+  if (attach) attach.disabled = !build || !primaryAction ||
+    !representationCommandAvailable(build, primaryAction);
+  if (browse) browse.disabled = !build ||
+    !representationCommandAvailable(build, primary ? "replace" : "attach");
+  if (addSecondary) addSecondary.disabled = !build ||
+    !representationCommandAvailable(build, "attach");
+  const wrap = el("b-pdf-sources");
+  if (wrap) {
+    for (const button of wrap.querySelectorAll("button.src2-del")) {
+      button.disabled = !build ||
+        !representationCommandAvailable(build, "detach");
+    }
+  }
+  const knownCommands = build && Array.isArray(build._available_commands);
+  const moduleAvailable = knownCommands && build._available_commands.some(
+    (command) => REPRESENTATION_COMMAND_NAMES.includes(command));
+  if (build && !moduleAvailable) {
+    const message = el("b-src-msg");
+    if (message) message.textContent = "Source tools unavailable";
+  }
+}
+
+function representationMutationAmbiguous(error) {
+  if (!error) return false;
+  return error.code === "network-error" || error.code === "invalid-response" ||
+    (error.status === 0 && error.code !== "aborted");
+}
+
+function representationMutationReceipt(result, action, buildId, sourceId) {
+  const receipt = result && result.receipt;
+  if (!receipt || receipt.action !== action || receipt.item_id !== buildId ||
+      receipt.representation_id !== sourceId ||
+      typeof receipt.after_item_revision !== "string" ||
+      (action === "detach" ? receipt.after !== null : !receipt.after)) return null;
+  return receipt;
+}
+
+function adoptRepresentationReceipt(buildId, sourceId, path, receipt,
+                                    expectedGeneration) {
+  const build = state.builds[buildId];
+  if (!build || buildEngineRecordGeneration(buildId) !== expectedGeneration)
+    return false;
+  const currentRevision = String(build._record_revision || "");
+  if (currentRevision !== receipt.before_item_revision &&
+      currentRevision !== receipt.after_item_revision) return false;
+  advanceBuildEngineRecordGeneration(buildId);
+  const rows = Array.isArray(build._representations)
+    ? build._representations.filter((row) => row && row.id !== sourceId) : [];
+  if (receipt.after) rows.push(JSON.parse(JSON.stringify(receipt.after)));
+  build._representations = rows;
+  build._record_revision = receipt.after_item_revision;
+  updateReceiptCommandAvailability(build);
+  if (sourceId === "primary") {
+    build.pdf_file = receipt.after ? path : "";
+    return true;
+  }
+  const sources = Array.isArray(build.pdf_sources)
+    ? build.pdf_sources.filter((row) => row && row.id !== sourceId) : [];
+  if (receipt.after) sources.push({ id: sourceId, path });
+  build.pdf_sources = sources;
+  return true;
+}
+
+async function setBuildRepresentation(buildId, sourceId, path, options = {}) {
+  const desiredPath = String(path || "").trim();
+  const intent = options.intent || (desiredPath ? "auto" : "detach");
+  const failureKey = representationFailureKey(buildId, sourceId);
+  representationMutationFailures.delete(failureKey);
+  // Desired state, not the currently inferred action, identifies an uncertain
+  // operation: a refresh may reveal an attach as present before its replay.
+  const pendingKey = JSON.stringify([buildId, sourceId, desiredPath]);
+  let pending = pendingRepresentationMutations.get(pendingKey);
+  if (pending && pending.generation !== buildEngineRecordGeneration(buildId)) {
+    pendingRepresentationMutations.delete(pendingKey);
+    pending = null;
+  }
+
+  if (!pending) {
+    let build = state.builds[buildId] || null;
+    const exactRecordRevision = typeof options.recordRevision === "string" &&
+      options.recordRevision;
+    if (!exactRecordRevision) {
+      try {
+        build = await refreshBuildEngineRecord(buildId);
+      } catch (e) {
+        rememberRepresentationFailure(buildId, sourceId, e);
+        return null;
+      }
+    }
+    if (!build) {
+      rememberRepresentationFailure(buildId, sourceId, {
+        code: "item_not_found", status: 404,
+      });
+      return null;
+    }
+    const current = attachedRepresentation(build, sourceId);
+    let action;
+    if (!desiredPath || intent === "detach") action = "detach";
+    else if (intent === "attach" || intent === "replace") action = intent;
+    else action = current ? "replace" : "attach";
+
+    if (!representationCommandAvailable(build, action)) {
+      rememberRepresentationFailure(buildId, sourceId, {
+        code: "representation_command_unavailable", status: 503,
+        retryable: true,
+      });
+      return null;
+    }
+
+    const recordRevision = exactRecordRevision || build._record_revision;
+    const representationRevision = options.representationRevision !== undefined
+      ? options.representationRevision : current && current.revision;
+    if (!recordRevision || (action !== "attach" && !representationRevision) ||
+        (action === "attach" && !desiredPath)) {
+      rememberRepresentationFailure(buildId, sourceId, {
+        code: action === "attach" ? "invalid_representation_command" :
+          "representation_revision_conflict",
+        status: action === "attach" ? 400 : 409,
+      });
+      return null;
+    }
+
+    const target = options.targetRepresentation &&
+      typeof options.targetRepresentation === "object"
+      ? options.targetRepresentation : null;
+    const attributes = target || current || {};
+    const args = {
+      itemId: buildId,
+      representationId: sourceId,
+      recordRevision,
+      idempotencyKey: options.idempotencyKey ||
+        representationOperationKey(`${action}-representation`),
+    };
+    if (action !== "detach") {
+      args.representation = {
+        source_token: desiredPath,
+        acquisition: "reference",
+        expected_content_sha256: target && target.content_sha256 || "",
+        expected_size: target && Number.isInteger(target.size)
+          ? target.size : null,
+        role: attributes.role ||
+          (sourceId === "primary" ? "primary" : "alternate"),
+        media_type: attributes.media_type || "application/pdf",
+        label: attributes.label ||
+          (sourceId === "primary" ? "Primary source" : "Alternate source"),
+        metadata: attributes.metadata && typeof attributes.metadata === "object"
+          ? attributes.metadata : {},
+      };
+    }
+    if (action !== "attach") args.representationRevision = representationRevision;
+    pending = {
+      action, args, desiredPath,
+      generation: buildEngineRecordGeneration(buildId),
+    };
+    pendingRepresentationMutations.set(pendingKey, pending);
+  }
+
+  let receipt = null;
+  let knownFailure = false;
+  for (let attempt = 0; attempt < 2 && !receipt; attempt += 1) {
+    try {
+      let result;
+      if (pending.action === "attach") {
+        result = await engineClient.items.attachRepresentation(pending.args);
+      } else if (pending.action === "replace") {
+        result = await engineClient.items.replaceRepresentation(pending.args);
+      } else {
+        result = await engineClient.items.detachRepresentation(pending.args);
+      }
+      receipt = representationMutationReceipt(
+        result, pending.action, buildId, sourceId);
+      if (!receipt) {
+        const invalid = new Error("Representation mutation returned no receipt");
+        invalid.code = "invalid-response";
+        invalid.status = 200;
+        throw invalid;
+      }
+    } catch (error) {
+      rememberRepresentationFailure(buildId, sourceId, error);
+      if (!representationMutationAmbiguous(error)) {
+        knownFailure = true;
+        break;
+      }
+    }
+  }
+
+  if (!receipt) {
+    // A transport failure can happen after commit. Retain this exact command
+    // and idempotency key so the next identical user action asks the engine to
+    // replay its durable receipt instead of issuing a different mutation.
+    if (knownFailure) pendingRepresentationMutations.delete(pendingKey);
+    try { await refreshBuildEngineRecord(buildId); } catch (ignored) {}
+    return null;
+  }
+
+  pendingRepresentationMutations.delete(pendingKey);
+  representationMutationFailures.delete(failureKey);
+  if (!adoptRepresentationReceipt(
+      buildId, sourceId, pending.desiredPath, receipt, pending.generation)) {
+    rememberRepresentationFailure(buildId, sourceId, {
+      code: "item_revision_conflict", status: 409,
+    });
+    return null;
+  }
+  // Refresh enriches compatibility fields, but it is not part of the commit.
+  // A failed GET must never turn a receipt-confirmed mutation into failure.
+  try { await refreshBuildEngineRecord(buildId); } catch (ignored) {}
+  return receipt;
+}
+
+function pushRepresentationOp(label, buildId, sourceId, initialReceipt,
+                              beforePath, afterPath, originTab) {
+  const transition = { receipt: initialReceipt };
+  const before = {
+    path: String(beforePath || "").trim(),
+    representation: initialReceipt.before,
+  };
+  const after = {
+    path: String(afterPath || "").trim(),
+    representation: initialReceipt.after,
+  };
+  const apply = async (target) => {
+    const current = transition.receipt.after;
+    const intent = target.path ? (current ? "replace" : "attach") : "detach";
+    if (intent === "detach" && !current)
+      throw new Error("Representation is already detached");
+    const receipt = await setBuildRepresentation(
+      buildId, sourceId, target.path, {
+        intent,
+        recordRevision: transition.receipt.after_item_revision,
+        representationRevision: current && current.revision,
+        targetRepresentation: target.representation,
+      });
+    if (!receipt) throw new Error(
+      representationFailureMessage(buildId, sourceId, "conflict"));
+    transition.receipt = receipt;
+    return receipt;
+  };
+  return pushOp(label, () => apply(before), () => apply(after),
+    undefined, originTab);
+}
+
 async function patchBuildRaw(id, fields, quiet) {
   buildPatchConflict = false;
   let res;
@@ -16889,7 +17403,13 @@ async function patchBuildRaw(id, fields, quiet) {
   }
   const data = await res.json().catch(() => ({}));
   if (res.ok && data.ok) {
-    state.builds[id] = data.build;
+    const prior = state.builds[id] || {};
+    state.builds[id] = {
+      ...data.build,
+      _record_revision: data.build.updated_at || prior._record_revision || "",
+      _representations: prior._representations || [],
+      _available_commands: prior._available_commands,
+    };
     // quiet: background patches (auto-attach) must not re-render the form
     // and wipe unsaved field edits. The same rule applies when a PATCH for A
     // resolves after the user started editing A or B.
@@ -16910,7 +17430,13 @@ async function patchBuildRaw(id, fields, quiet) {
   if (res.status === 409 && data.build) {
     // another writer (analysis, sync) got there first: adopt its record
     buildPatchConflict = true;
-    state.builds[id] = data.build;
+    const prior = state.builds[id] || {};
+    state.builds[id] = {
+      ...data.build,
+      _record_revision: data.build.updated_at || prior._record_revision || "",
+      _representations: prior._representations || [],
+      _available_commands: prior._available_commands,
+    };
     if (buildIsDirty()) {
       renderBuildsList();
       renderWorkbench();
@@ -16943,8 +17469,23 @@ async function saveBuildFields(ev) {
   const originTab = activeHistoryTab();
   const id = state.buildSel;
   if (!id) return false;
+  const sourceInput = el("b-pdf_file");
+  const sourceDraftPath = sourceInput
+    ? String(sourceInput.value || "").trim() : "";
+  const sourceDraftPending = sourceDraftPath !==
+    String((state.builds[id] && state.builds[id].pdf_file) || "").trim();
+  const metadataDirty = buildIsDirty();
+  // The source row has its own conditional command and Attach control. A
+  // metadata save must neither clear that draft nor claim it was persisted.
+  if (sourceDraftPending && !metadataDirty) {
+    el("build-msg").textContent = "";
+    const sourceMessage = el("b-src-msg");
+    if (sourceMessage) sourceMessage.textContent = "Not attached";
+    return false;
+  }
   const fields = {};
   for (const f of BUILD_FIELDS) {
+    if (f === "pdf_file") continue;  // representation commands own sources
     const input = el("b-" + f);
     if (input) fields[f] = input.value.trim();
   }
@@ -16978,10 +17519,19 @@ async function saveBuildFields(ev) {
       // instead of a generic Saved (the toggle-off + Save path was silent)
       el("build-msg").textContent =
         cur0 && cur0.status === "ready" && fields.status === "draft"
-          ? "Saved — verification removed; Text and Knowledge relock"
-          : "Saved";
+          ? `${sourceDraftPending ? "Metadata saved" : "Saved"} — ` +
+            "verification removed; Text and Knowledge relock"
+          : sourceDraftPending ? "Metadata saved" : "Saved";
+      const sourceStillPending = sourceDraftPending && sourceInput &&
+        sourceInput.value.trim() === sourceDraftPath &&
+        String((state.builds[id] && state.builds[id].pdf_file) || "").trim() !==
+          sourceDraftPath;
+      if (sourceStillPending) {
+        const sourceMessage = el("b-src-msg");
+        if (sourceMessage) sourceMessage.textContent = "Not attached";
+      }
     }
-    status(`BUILD SAVED :: ${fields.title}`);
+    status(`${sourceDraftPending ? "METADATA" : "BUILD"} SAVED :: ${fields.title}`);
     return true;
   } else {
     if (state.buildSel === id) {
@@ -17000,35 +17550,78 @@ async function saveBuildFields(ev) {
   }
 }
 
+async function deleteBuildToTrash(id) {
+  const res = await fetch(`/api/builds/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok)
+    throw new Error(data.error || "Build delete failed");
+  const trashId = String(data.trash_id || "").trim();
+  if (!trashId) throw new Error("Build delete returned no recovery handle");
+  invalidateRepresentationItemIncarnation(id);
+  delete state.builds[id];
+  return trashId;
+}
+
+async function restoreDeletedBuildFromTrash(trashId, expectedId) {
+  const recoveryId = String(trashId || "").trim();
+  const itemId = String(expectedId || "").trim();
+  if (!recoveryId) throw new Error("Build recovery handle is missing");
+  if (!itemId) throw new Error("Build recovery target is missing");
+  // Invalidate the deleted incarnation before a replayable restore begins.
+  invalidateRepresentationItemIncarnation(itemId);
+  const res = await fetch("/api/trash/restore", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: recoveryId }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok)
+    throw new Error(data.error || "Build restore failed");
+  const build = data.build;
+  if (!build || typeof build !== "object" || Array.isArray(build) ||
+      String(build.id || "") !== itemId) {
+    throw new Error("Build restore returned the wrong item");
+  }
+  state.builds[itemId] = {
+    ...build,
+    _record_revision: build.updated_at || "",
+    _representations: [],
+  };
+  // A failed read leaves capability state unknown (and therefore disabled),
+  // but does not turn a confirmed Trash restore into a failed history action.
+  try { await refreshBuildEngineRecord(itemId); } catch (ignored) {}
+  return state.builds[itemId];
+}
+
 async function deleteBuild(originTab = activeHistoryTab()) {
   // no confirmation: deletion is undoable
   const id = state.buildSel;
   const b = state.builds[id];
   if (!b) return;
   const snap = JSON.parse(JSON.stringify(b));
-  const res = await fetch(`/api/builds/${encodeURIComponent(id)}`, { method: "DELETE" });
-  if (res.ok) {
-    delete state.builds[id];
+  let trashId = "";
+  try {
+    trashId = await deleteBuildToTrash(id);
+  } catch (error) {
+    statusCrit("BUILD DELETE FAILED");
+    return;
+  }
+  if (trashId) {
     state.buildSel = null;
+    const lifecycle = { trashId };
     pushOp(`delete build ${snap.title || id}`,
       async () => {
-        await fetch("/api/builds/restore", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ build: snap }),
-        });
-        state.builds[snap.id] = snap;
+        await restoreDeletedBuildFromTrash(lifecycle.trashId, snap.id);
         renderUpload();
       },
       async () => {
-        await fetch(`/api/builds/${snap.id}`, { method: "DELETE" });
-        delete state.builds[snap.id];
+        lifecycle.trashId = await deleteBuildToTrash(snap.id);
         renderUpload();
       }, undefined, originTab);
     renderUpload();
     status(`BUILD DELETED :: ${snap.title || id}`);
-  } else {
-    statusCrit("BUILD DELETE FAILED");
   }
 }
 
@@ -17245,37 +17838,50 @@ function renderPdfSources(b) {
     noneEl.className = "tool-label";
     noneEl.textContent = "none";
     wrap.appendChild(noneEl);
+    updateRepresentationMutationControls(b);
     return;
   }
   for (const s of list) {
+    const canDetach = representationCommandAvailable(b, "detach");
     const chip = document.createElement("span");
     chip.className = "ocr-chip src2-chip";
     chip.dataset.tip = `${s.path}\nOCR files of this scan sit under it in the OCR tab`;
     chip.innerHTML = `${esc((s.path || "").replace(/\\/g, "/").split("/").pop())}
       <button class="src2-del" type="button" data-sid="${esc(s.id)}"
-              data-tip="Remove this secondary source (its OCR files stay)">&times;</button>`;
+              data-tip="Remove this secondary source (its OCR files stay)"
+              ${canDetach ? "" : "disabled aria-disabled=\"true\""}>&times;</button>`;
     wrap.appendChild(chip);
   }
+  updateRepresentationMutationControls(b);
 }
 
 async function addSecondaryPdf(path) {
   const originTab = activeHistoryTab();
   const b = currentBuild();
   if (!b || !path) return;
+  if (!representationCommandAvailable(b, "attach")) {
+    el("b-src-msg").textContent = "Source tools unavailable";
+    return;
+  }
   const p = path.trim();
-  let ok = false;
-  try { ok = (await fetch(pdfLocalSrc(p), { method: "HEAD" })).ok; } catch (e) {}
-  if (!ok) { el("b-src-msg").textContent = "File not found (or not a PDF)"; return; }
   const cur = b.pdf_sources || [];
   if ((b.pdf_file || "").trim() === p || cur.some((s) => s.path === p)) {
     el("b-src-msg").textContent = "Already attached";
     return;
   }
-  const id = Math.random().toString(16).slice(2, 10);
-  if (await patchBuild(b.id, { pdf_sources: [...cur, { id, path: p }] },
-      `add secondary PDF to ${b.title || b.id}`, originTab)) {
+  const id = secondaryRepresentationId(b);
+  const receipt = await setBuildRepresentation(
+    b.id, id, p, {
+      intent: "attach",
+      recordRevision: b._record_revision,
+    });
+  if (receipt) {
+    pushRepresentationOp(`add secondary PDF to ${b.title || b.id}`,
+      b.id, id, receipt, "", p, originTab);
     el("b-src-msg").textContent = "Secondary source added";
     refreshSourceTab();
+  } else {
+    el("b-src-msg").textContent = representationFailureMessage(b.id, id);
   }
 }
 
@@ -17283,13 +17889,30 @@ async function removeSecondaryPdf(sid) {
   const originTab = activeHistoryTab();
   const b = currentBuild();
   if (!b) return;
+  if (!representationCommandAvailable(b, "detach")) {
+    el("b-src-msg").textContent = "Source tools unavailable";
+    return;
+  }
   const cur = b.pdf_sources || [];
+  const removed = cur.find((s) => s.id === sid);
   const next = cur.filter((s) => s.id !== sid);
   if (next.length === cur.length) return;
-  if (await patchBuild(b.id, { pdf_sources: next },
-      `remove secondary PDF from ${b.title || b.id}`, originTab)) {
+  const current = attachedRepresentation(b, sid);
+  if (!current) return;
+  const receipt = await setBuildRepresentation(
+    b.id, sid, "", {
+      intent: "detach",
+      recordRevision: b._record_revision,
+      representationRevision: current.revision,
+    });
+  if (receipt) {
+    pushRepresentationOp(`remove secondary PDF from ${b.title || b.id}`,
+      b.id, sid, receipt, removed.path, "", originTab);
     el("b-src-msg").textContent = "Secondary source removed";
     refreshSourceTab();
+  } else {
+    el("b-src-msg").textContent =
+      representationFailureMessage(b.id, sid, "conflict");
   }
 }
 
@@ -17371,20 +17994,37 @@ async function refreshResourcesTab() {
 }
 
 async function refreshSourceTab() {
-  const b = currentBuild();
+  let b = currentBuild();
   if (!b) return;
   // the awaits below can outlive a build switch — never render stale data
-  const stale = () => state.buildSel !== b.id;
+  const buildId = b.id;
+  const stale = () => state.buildSel !== buildId;
   let localPath = (b.pdf_file || "").trim();
   // auto-populate: a PDF that was auto-sourced from a URL and already
   // downloaded gets its local path attached without asking
   if (!localPath) {
     const ident = iaIdentFromBuild(b);
-    if (ident && state.downloadedIds.has(ident)) {
-      localPath = `downloads/ia/${ident}.pdf`;
-      await patchBuildRaw(b.id, { pdf_file: localPath }, true);
+    const current = attachedRepresentation(b, "primary");
+    const action = current ? "replace" : "attach";
+    if (ident && state.downloadedIds.has(ident) &&
+        representationCommandAvailable(b, action)) {
+      const candidate = `downloads/ia/${ident}.pdf`;
+      const receipt = await setBuildRepresentation(
+        buildId, "primary", candidate, {
+          intent: action,
+          recordRevision: b._record_revision,
+          representationRevision: current && current.revision,
+        });
       if (stale()) return;
-      el("b-src-msg").textContent = "Local PDF attached automatically";
+      if (receipt) {
+        b = currentBuild() || b;
+        localPath = (b.pdf_file || candidate).trim();
+        el("b-src-msg").textContent = "Local PDF attached automatically";
+      } else {
+        localPath = "";
+        el("b-src-msg").textContent = representationFailureMessage(
+          buildId, "primary");
+      }
     }
   }
   el("b-pdf_file").value = localPath;
@@ -17452,7 +18092,15 @@ async function syncBuildFolder() {
       state.buildFolder = data;
       // the sync may have retired the IA original and repointed pdf_file
       // at the folder's preview.pdf
-      if (data.build) state.builds[b.id] = data.build;
+      if (data.build) {
+        const prior = state.builds[b.id] || {};
+        state.builds[b.id] = {
+          ...data.build,
+          _record_revision: data.build.updated_at || prior._record_revision || "",
+          _representations: prior._representations || [],
+          _available_commands: prior._available_commands,
+        };
+      }
       if (data.page_remap && Array.isArray(data.page_remap.deleted)) {
         remapPageRemarkKeys(b.id, data.page_remap.source,
           data.page_remap.deleted);
@@ -17520,24 +18168,36 @@ async function attachPdfFile(path) {
   const originTab = activeHistoryTab();
   const b = currentBuild();
   if (!b) return;
+  const prior = (b.pdf_file || "").trim() ||
+    (attachedRepresentation(b, "primary") ? ocrBookPdf(b.id) : "");
+  const current = attachedRepresentation(b, "primary");
   const p = (path != null ? path : el("b-pdf_file").value).trim();
-  el("b-pdf_file").value = p;
-  if (p) {
-    // confirm the file is actually readable before saving the path
-    let ok = false;
-    try { ok = (await fetch(pdfLocalSrc(p), { method: "HEAD" })).ok; } catch (e) {}
-    if (!ok) {
-      el("b-src-msg").textContent = "File not found (or not a PDF)";
-      return;
-    }
+  if (!p && !current) {
+    updateRepresentationMutationControls(b);
+    return;
   }
-  if (await patchBuild(b.id, { pdf_file: p },
-      p ? `attach PDF to ${b.title || b.id}` : `detach PDF from ${b.title || b.id}`,
-      originTab)) {
+  const action = p ? (current ? "replace" : "attach") : "detach";
+  el("b-pdf_file").value = p;
+  if (!representationCommandAvailable(b, action)) {
+    el("b-src-msg").textContent = "Source tools unavailable";
+    updateRepresentationMutationControls(b);
+    return;
+  }
+  const receipt = await setBuildRepresentation(
+    b.id, "primary", p, {
+      intent: action,
+      recordRevision: b._record_revision,
+      representationRevision: current && current.revision,
+    });
+  if (receipt) {
+    pushRepresentationOp(p ? `attach PDF to ${b.title || b.id}` :
+      `detach PDF from ${b.title || b.id}`,
+      b.id, "primary", receipt, prior, p, originTab);
     el("b-src-msg").textContent = p ? "Attached" : "Detached";
     refreshSourceTab();
   } else {
-    el("b-src-msg").textContent = "Save failed";
+    el("b-src-msg").textContent = representationFailureMessage(
+      b.id, "primary", p ? "invalid" : "conflict");
   }
 }
 
@@ -19975,7 +20635,15 @@ async function deleteSelectedPages() {
     ? data.warnings.map((warning) => String(warning || "").trim()).filter(Boolean)
     : [];
   try {
-    if (data.build) state.builds[bid] = data.build;
+    if (data.build) {
+      const prior = state.builds[bid] || {};
+      state.builds[bid] = {
+        ...data.build,
+        _record_revision: data.build.updated_at || prior._record_revision || "",
+        _representations: prior._representations || [],
+        _available_commands: prior._available_commands,
+      };
+    }
     if (data.page_remap && Array.isArray(data.page_remap.deleted)) {
       remapPageRemarkKeys(bid, data.page_remap.source,
         data.page_remap.deleted);
@@ -23430,7 +24098,10 @@ function init() {
     setThumbnailSource(b.id, card.dataset.source);
   });
   el("build-form").addEventListener("submit", saveBuildFields);
-  el("build-form").addEventListener("input", markBuildDirty);
+  el("build-form").addEventListener("input", (ev) => {
+    if (ev.target && ev.target.id === "b-pdf_file") return;
+    markBuildDirty();
+  });
   el("build-save").addEventListener("click", saveBuildFields);
   el("build-delete").addEventListener("click", deleteBuild);
   // Ctrl/Cmd+S saves the open entry on the editor-derived phases, and the
@@ -23497,6 +24168,8 @@ function init() {
   boot("replica", initReplica);
   loadTaxonomy();   // async; pickers and cells refresh when the vocab lands
   el("b-pdf-attach").addEventListener("click", () => attachPdfFile());
+  el("b-pdf_file").addEventListener("input", () =>
+    updateRepresentationMutationControls(currentBuild()));
   el("b-pdf_file").addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") { ev.preventDefault(); attachPdfFile(); }
   });
