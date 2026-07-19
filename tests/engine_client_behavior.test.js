@@ -1600,86 +1600,348 @@ test("deleting an item incarnation drops uncertain representation commands", asy
   assert.equal(h.api.generation("book"), 1);
 
   const app = fs.readFileSync(appPath, "utf8");
-  const restoreStart = app.indexOf("async function restoreDeletedBuildFromTrash");
-  const deleteStart = app.indexOf("async function deleteBuild", restoreStart);
-  const restore = app.slice(restoreStart, deleteStart);
-  assert.match(restore, /invalidateRepresentationItemIncarnation/);
-  assert.match(restore, /fetch\("\/api\/trash\/restore"/);
-  assert.doesNotMatch(restore, /\/api\/builds\/restore/);
-  const deletion = app.slice(deleteStart, app.indexOf("function exportBuilds", deleteStart));
-  assert.match(deletion, /deleteBuildToTrash/);
+  const start = app.indexOf("const pendingBuildLifecycleDeletes");
+  const end = app.indexOf("function exportBuilds", start);
+  const lifecycle = app.slice(start, end);
+  assert.match(lifecycle, /invalidateRepresentationItemIncarnation/);
+  assert.match(lifecycle, /engineClient\.items\.lifecycle/);
+  assert.match(lifecycle, /engineClient\.items\.delete/);
+  assert.match(lifecycle, /engineClient\.itemTombstones\.restore/);
+  assert.doesNotMatch(lifecycle, /\bfetch\s*\(/);
+  assert.doesNotMatch(lifecycle, /["'`]\/api\/(?:builds|trash)/);
 });
 
-test("build history restores trusted Trash records and advances recovery handles", async () => {
+function buildLifecycleUiHarness({
+  build, preflight, deleteItem, restoreItem, refresh,
+} = {}) {
   const app = fs.readFileSync(appPath, "utf8");
-  const start = app.indexOf("async function deleteBuildToTrash");
-  const end = app.indexOf("function exportBuilds", start);
-  assert.ok(start >= 0 && end > start);
+  const eligibilityStart = app.indexOf("function itemDeleteAvailable");
+  const eligibilityEnd = app.indexOf("// legacy name", eligibilityStart);
+  const lifecycleStart = app.indexOf("const pendingBuildLifecycleDeletes");
+  const lifecycleEnd = app.indexOf("function exportBuilds", lifecycleStart);
+  assert.ok(eligibilityStart >= 0 && eligibilityEnd > eligibilityStart);
+  assert.ok(lifecycleStart >= 0 && lifecycleEnd > lifecycleStart);
   const state = { builds: {
-    book: {
+    book: build || {
       id: "book", title: "Herbal", updated_at: "item-r1",
       _record_revision: "item-r1", _representations: [],
-      _available_commands: ["representation.attach"],
+      _available_commands: ["item.delete", "representation.attach"],
       pdf_file: "", pdf_sources: [],
     },
   }, buildSel: "book" };
   const operations = [];
-  const restoreIds = [];
   const invalidated = [];
+  const statuses = [];
+  const calls = { preflight: [], delete: [], restore: [], refresh: [] };
+  const tombstones = new Map();
   let deleteCount = 0;
-  let missingHandle = false;
+  let restoreCount = 0;
+  let uuid = 0;
+  const defaultPreflight = async ({ itemId }) => ({
+    item_id: itemId,
+    item_revision: state.builds[itemId]._record_revision,
+    managed_tree_revision: `tree-r${deleteCount + 1}`,
+  });
+  const defaultDelete = async (args) => {
+    deleteCount += 1;
+    const tombstone = {
+      tombstone_id: `tomb-${deleteCount}`,
+      revision: `tomb-r${deleteCount}`,
+      state: "deleted",
+      item_id: args.itemId,
+      deleted_item_revision: args.recordRevision,
+      managed_tree_revision: args.managedTreeRevision,
+      restored_item_revision: "",
+    };
+    tombstones.set(tombstone.tombstone_id, tombstone);
+    return { ok: true, replayed: false, receipt: {
+      action: "delete",
+      operation_id: args.idempotencyKey,
+      item_id: args.itemId,
+      deleted_item_revision: args.recordRevision,
+      restored_item_revision: "",
+      managed_tree_revision: args.managedTreeRevision,
+      tombstone_before_revision: "",
+      tombstone,
+    } };
+  };
+  const defaultRestore = async (args) => {
+    restoreCount += 1;
+    const before = tombstones.get(args.tombstoneId);
+    const restoredRevision = `item-restored-${restoreCount}`;
+    const tombstone = {
+      ...before,
+      revision: `tomb-restored-${restoreCount}`,
+      state: "restored",
+      restored_item_revision: restoredRevision,
+    };
+    return { ok: true, replayed: false, receipt: {
+      action: "restore",
+      operation_id: args.idempotencyKey,
+      item_id: before.item_id,
+      deleted_item_revision: before.deleted_item_revision,
+      restored_item_revision: restoredRevision,
+      managed_tree_revision: before.managed_tree_revision,
+      tombstone_before_revision: args.tombstoneRevision,
+      tombstone,
+    } };
+  };
   const context = vm.createContext({
     state,
-    fetch: async (url, init = {}) => {
-      if (init.method === "DELETE") {
-        deleteCount += 1;
-        return response(200, missingHandle
-          ? { ok: true }
-          : { ok: true, trash_id: `trash-${deleteCount}` });
-      }
-      assert.equal(url, "/api/trash/restore");
-      const body = JSON.parse(init.body);
-      restoreIds.push(body.id);
-      return response(200, { ok: true, replayed: false, build: {
-        id: "book", title: "Herbal", updated_at: `item-restored-${deleteCount}`,
-        pdf_file: "", pdf_sources: [],
-      } });
+    crypto: { randomUUID: () => `00000000-0000-4000-8000-${
+      String(++uuid).padStart(12, "0")}` },
+    engineClient: {
+      items: {
+        lifecycle: async (args) => {
+          calls.preflight.push({ ...args });
+          return (preflight || defaultPreflight)(args, defaultPreflight);
+        },
+        delete: async (args) => {
+          calls.delete.push({ ...args });
+          return (deleteItem || defaultDelete)(args, defaultDelete);
+        },
+      },
+      itemTombstones: {
+        restore: async (args) => {
+          calls.restore.push({ ...args });
+          return (restoreItem || defaultRestore)(args, defaultRestore);
+        },
+      },
     },
     invalidateRepresentationItemIncarnation: (id) => invalidated.push(id),
     refreshBuildEngineRecord: async (id) => {
-      state.builds[id]._available_commands = ["representation.attach"];
-      return state.builds[id];
+      calls.refresh.push(id);
+      if (refresh) return refresh(id, state);
+      throw new Error("projection refresh unavailable");
     },
     pushOp: (label, undoFn, redoFn) => {
       operations.push({ label, undoFn, redoFn });
     },
+    activeHistoryTab: () => "workbench",
     renderUpload: () => {},
     status: () => {},
-    statusCrit: () => {},
+    statusCrit: (message) => statuses.push(message),
+    currentBuild: () => state.builds[state.buildSel] || null,
+    el: () => null,
   });
-  vm.runInContext(`${app.slice(start, end)}
-this.api = { deleteBuild, deleteBuildToTrash };`, context);
+  vm.runInContext(`${app.slice(eligibilityStart, eligibilityEnd)}
+${app.slice(lifecycleStart, lifecycleEnd)}
+this.api = { deleteBuild, deleteBuildToTombstone,
+  restoreDeletedBuildFromTombstone, itemDeleteAvailable,
+  updateItemLifecycleControls,
+  pendingCount: () => pendingBuildLifecycleDeletes.size };`, context);
+  return { api: context.api, context, state, operations, invalidated,
+    statuses, calls };
+}
 
-  await context.api.deleteBuild("workbench");
-  assert.equal("book" in state.builds, false);
-  assert.equal(operations.length, 1);
+test("build lifecycle history restores and re-deletes with new tombstones",
+  async () => {
+    const h = buildLifecycleUiHarness();
 
-  await operations[0].undoFn();
-  assert.equal(state.builds.book.id, "book");
-  await operations[0].redoFn();
-  assert.equal("book" in state.builds, false);
-  await operations[0].undoFn();
-  assert.deepEqual(restoreIds, ["trash-1", "trash-2"]);
-  assert.equal(invalidated.length, 4,
-    "delete, restore, delete, and restore transitions invalidate incarnations");
+    await h.api.deleteBuild("workbench");
+    assert.equal("book" in h.state.builds, false);
+    assert.equal(h.operations.length, 1);
+    assert.deepEqual(h.calls.preflight[0], { itemId: "book" });
+    assert.equal(h.calls.delete[0].recordRevision, "item-r1");
+    assert.equal(h.calls.delete[0].managedTreeRevision, "tree-r1");
+    const firstDeleteKey = h.calls.delete[0].idempotencyKey;
 
-  state.builds.other = { id: "other" };
-  missingHandle = true;
-  await assert.rejects(context.api.deleteBuildToTrash("other"),
-    /recovery handle/);
-  assert.equal(state.builds.other.id, "other");
-  assert.doesNotMatch(app.slice(start, end), /\/api\/builds\/restore/);
-});
+    await h.operations[0].undoFn();
+    assert.equal(h.state.builds.book._record_revision, "item-restored-1");
+    assert.deepEqual(h.calls.restore[0], {
+      tombstoneId: "tomb-1",
+      tombstoneRevision: "tomb-r1",
+      idempotencyKey: h.calls.restore[0].idempotencyKey,
+    });
+    const firstRestoreKey = h.calls.restore[0].idempotencyKey;
+
+    await h.operations[0].redoFn();
+    assert.equal("book" in h.state.builds, false);
+    assert.equal(h.calls.preflight.length, 2,
+      "redo obtains a new coherent lifecycle preflight");
+    assert.equal(h.calls.delete[1].recordRevision, "item-restored-1");
+    assert.equal(h.calls.delete[1].managedTreeRevision, "tree-r2");
+    assert.notEqual(h.calls.delete[1].idempotencyKey, firstDeleteKey,
+      "redo is a new delete command, not an idempotency replay");
+
+    await h.operations[0].undoFn();
+    assert.equal(h.state.builds.book._record_revision, "item-restored-2");
+    assert.equal(h.calls.restore[1].tombstoneId, "tomb-2");
+    assert.equal(h.calls.restore[1].tombstoneRevision, "tomb-r2");
+    assert.notEqual(h.calls.restore[1].idempotencyKey, firstRestoreKey);
+    assert.deepEqual(h.invalidated, ["book", "book", "book", "book"]);
+    assert.deepEqual(h.calls.refresh, ["book", "book"],
+      "a failed follow-up projection does not roll back valid receipts");
+  });
+
+test("ambiguous lifecycle commands retain exact operation and CAS inputs",
+  async () => {
+    let deleteAttempts = 0;
+    let restoreAttempts = 0;
+    const ambiguous = () => Object.assign(new Error("response lost"), {
+      code: "network-error", status: 0, retryable: true,
+    });
+    const h = buildLifecycleUiHarness({
+      deleteItem: async (args, confirmed) => {
+        deleteAttempts += 1;
+        if (deleteAttempts === 1) throw ambiguous();
+        return confirmed(args);
+      },
+      restoreItem: async (args, confirmed) => {
+        restoreAttempts += 1;
+        if (restoreAttempts === 1) throw ambiguous();
+        return confirmed(args);
+      },
+    });
+
+    await h.api.deleteBuild("workbench");
+    assert.equal(h.state.builds.book.id, "book");
+    assert.equal(h.operations.length, 0);
+    assert.equal(h.api.pendingCount(), 1);
+    await h.api.deleteBuild("workbench");
+    assert.equal(h.calls.preflight.length, 1);
+    assert.deepEqual(h.calls.delete[1], h.calls.delete[0]);
+    assert.equal(h.api.pendingCount(), 0);
+    assert.equal(h.operations.length, 1);
+
+    await assert.rejects(h.operations[0].undoFn, /response lost/);
+    assert.equal("book" in h.state.builds, false);
+    await h.operations[0].undoFn();
+    assert.deepEqual(h.calls.restore[1], h.calls.restore[0]);
+    assert.equal(h.state.builds.book._record_revision, "item-restored-1");
+  });
+
+test("retryable 5xx lifecycle failures retain exact delete and restore commands",
+  async () => {
+    let deleteAttempts = 0;
+    let restoreAttempts = 0;
+    const unavailable = () => Object.assign(new Error("engine unavailable"), {
+      code: "http-503", status: 503, retryable: true,
+    });
+    const h = buildLifecycleUiHarness({
+      deleteItem: async (args, confirmed) => {
+        deleteAttempts += 1;
+        if (deleteAttempts === 1) throw unavailable();
+        return confirmed(args);
+      },
+      restoreItem: async (args, confirmed) => {
+        restoreAttempts += 1;
+        if (restoreAttempts === 1) throw unavailable();
+        return confirmed(args);
+      },
+    });
+
+    await h.api.deleteBuild("workbench");
+    assert.equal(h.api.pendingCount(), 1);
+    assert.equal(h.calls.preflight.length, 1);
+    await h.api.deleteBuild("workbench");
+    assert.equal(h.calls.preflight.length, 1,
+      "retrying a 5xx delete does not obtain new CAS inputs");
+    assert.deepEqual(h.calls.delete[1], h.calls.delete[0]);
+    assert.equal(h.operations.length, 1);
+
+    await assert.rejects(h.operations[0].undoFn, /engine unavailable/);
+    await h.operations[0].undoFn();
+    assert.deepEqual(h.calls.restore[1], h.calls.restore[0],
+      "retrying a 5xx restore reuses tombstone CAS and operation key");
+    assert.equal(h.state.builds.book._record_revision, "item-restored-1");
+  });
+
+test("lifecycle delete and restore surface concurrent state conflicts",
+  async () => {
+    let deleteCalls = 0;
+    const stale = buildLifecycleUiHarness({
+      preflight: async () => ({
+        item_id: "book", item_revision: "item-r2",
+        managed_tree_revision: "tree-r1",
+      }),
+      deleteItem: async () => { deleteCalls += 1; },
+    });
+    await stale.api.deleteBuild("workbench");
+    assert.equal(deleteCalls, 0);
+    assert.equal(stale.state.builds.book.id, "book");
+    assert.equal(stale.operations.length, 0);
+    assert.match(stale.statuses[0], /CONFLICT/);
+
+    const collision = buildLifecycleUiHarness();
+    await collision.api.deleteBuild("workbench");
+    collision.state.builds.book = {
+      id: "book", _record_revision: "other-r1",
+      _available_commands: ["item.delete"],
+    };
+    await assert.rejects(collision.operations[0].undoFn, /recreated/);
+    assert.equal(collision.calls.restore.length, 0);
+    assert.equal(collision.state.builds.book._record_revision, "other-r1");
+  });
+
+test("definitive lifecycle CAS failures do not commit or reuse operation keys",
+  async () => {
+    const conflict = (code) => Object.assign(new Error("changed elsewhere"), {
+      code, status: 409, retryable: false,
+    });
+    let deleteAttempts = 0;
+    const deletion = buildLifecycleUiHarness({
+      deleteItem: async (args, confirmed) => {
+        deleteAttempts += 1;
+        if (deleteAttempts === 1)
+          throw conflict("managed_tree_revision_conflict");
+        return confirmed(args);
+      },
+    });
+    await deletion.api.deleteBuild("workbench");
+    assert.equal(deletion.state.builds.book.id, "book");
+    assert.equal(deletion.operations.length, 0);
+    assert.equal(deletion.api.pendingCount(), 0);
+    const rejectedDeleteKey = deletion.calls.delete[0].idempotencyKey;
+    await deletion.api.deleteBuild("workbench");
+    assert.equal("book" in deletion.state.builds, false);
+    assert.equal(deletion.calls.preflight.length, 2);
+    assert.notEqual(deletion.calls.delete[1].idempotencyKey,
+      rejectedDeleteKey);
+
+    const restoration = buildLifecycleUiHarness({
+      restoreItem: async () => {
+        throw conflict("tombstone_revision_conflict");
+      },
+    });
+    await restoration.api.deleteBuild("workbench");
+    await assert.rejects(restoration.operations[0].undoFn,
+      (error) => error.status === 409);
+    await assert.rejects(restoration.operations[0].undoFn,
+      (error) => error.status === 409);
+    assert.equal("book" in restoration.state.builds, false);
+    assert.equal(restoration.calls.restore[1].tombstoneId,
+      restoration.calls.restore[0].tombstoneId);
+    assert.equal(restoration.calls.restore[1].tombstoneRevision,
+      restoration.calls.restore[0].tombstoneRevision);
+    assert.notEqual(restoration.calls.restore[1].idempotencyKey,
+      restoration.calls.restore[0].idempotencyKey);
+  });
+
+test("item deletion eligibility follows advertised commands and fails closed",
+  async () => {
+    const unknown = buildLifecycleUiHarness({ build: {
+      id: "book", title: "Herbal", _record_revision: "item-r1",
+      _representations: [],
+    } });
+    const button = { disabled: false };
+    unknown.context.el = (id) => id === "build-delete" ? button : null;
+    unknown.api.updateItemLifecycleControls(unknown.state.builds.book);
+    assert.equal(button.disabled, true);
+    assert.equal(unknown.api.itemDeleteAvailable(unknown.state.builds.book),
+      false);
+    await unknown.api.deleteBuild("workbench");
+    assert.equal(unknown.calls.preflight.length, 0);
+    assert.equal(unknown.calls.delete.length, 0);
+    assert.equal(unknown.operations.length, 0);
+    assert.match(unknown.statuses[0], /UNAVAILABLE/);
+
+    unknown.state.builds.book._available_commands = ["item.delete"];
+    unknown.api.updateItemLifecycleControls(unknown.state.builds.book);
+    assert.equal(button.disabled, false);
+    assert.equal(unknown.api.itemDeleteAvailable(unknown.state.builds.book),
+      true);
+  });
 
 test("representation mutation retries and later recovery reuse one operation key", async () => {
   const keys = [];
@@ -1835,7 +2097,7 @@ test("secondary IDs are portable and attach intent never degrades into replace",
 test("metadata Save does not claim or persist a PDF source draft", async () => {
   const app = fs.readFileSync(appPath, "utf8");
   const start = app.indexOf("async function saveBuildFields");
-  const end = app.indexOf("async function deleteBuildToTrash", start);
+  const end = app.indexOf("const pendingBuildLifecycleDeletes", start);
   assert.ok(start >= 0 && end > start);
   const elements = {
     "b-pdf_file": { value: "C:/scans/new.pdf" },
@@ -1968,6 +2230,10 @@ this.createBuild = createBuild;`, context);
     events.findIndex((event) => event.type === "history"));
   assert.ok(events.findIndex((event) => event.type === "history") <
     events.findIndex((event) => event.type === "select"));
+  const creation = app.slice(start, end);
+  assert.match(creation, /deleteBuildToTombstone/);
+  assert.match(creation, /restoreDeletedBuildFromTombstone/);
+  assert.doesNotMatch(creation, /deleteBuildToTrash|\/api\/trash/);
   assert.equal(result.pdf_file, "C:/scans/primary.pdf");
   assert.equal(messages["b-src-msg"].textContent,
     "Source update rejected");

@@ -16558,6 +16558,18 @@ function currentBuild() {
   return state.buildSel ? state.builds[state.buildSel] || null : null;
 }
 
+function itemDeleteAvailable(build) {
+  const commands = build && build._available_commands;
+  // A compatibility response without semantic workbench state is unknown,
+  // not permission to fall back to the old catalogue-only delete.
+  return Array.isArray(commands) && commands.includes("item.delete");
+}
+
+function updateItemLifecycleControls(build = currentBuild()) {
+  const button = el("build-delete");
+  if (button) button.disabled = !itemDeleteAvailable(build);
+}
+
 // legacy name — the Editor sidebar became the unified Workbench book list
 function renderBuildsList() {
   renderOcrBooks();
@@ -16819,6 +16831,7 @@ function renderBuildEditor() {
   el("build-empty").hidden = !!b;
   if (!b) {
     el("build-msg").textContent = "";
+    updateItemLifecycleControls(null);
     return;
   }
   for (const f of BUILD_FIELDS) {
@@ -16843,6 +16856,7 @@ function renderBuildEditor() {
   el("b-src-open").href = src;
   el("build-msg").textContent = "";
   buildDirty = false;   // a freshly loaded form is clean
+  updateItemLifecycleControls(b);
   updateRepresentationMutationControls(b);
   if (wbActivePhase() === "source" && activeBuildTab() === "btab-source") {
     refreshSourceTab();
@@ -16920,15 +16934,17 @@ async function createBuild(seed, label, originTab = activeHistoryTab()) {
 
   const built = state.builds[data.build.id] || data.build;
   const snap = JSON.parse(JSON.stringify(built));
-  const lifecycle = { trashId: "" };
+  const lifecycle = {
+    tombstone: null, deleteCommand: null, restoreCommand: null,
+  };
   pushOp(`create build ${label || snap.title || snap.id}`,
     async () => {
-      lifecycle.trashId = await deleteBuildToTrash(snap.id);
+      await deleteBuildToTombstone(snap.id, lifecycle);
       if (state.buildSel === snap.id) state.buildSel = null;
       renderUpload();
     },
     async () => {
-      await restoreDeletedBuildFromTrash(lifecycle.trashId, snap.id);
+      await restoreDeletedBuildFromTombstone(lifecycle, snap.id, snap);
       renderUpload();
     }, undefined, originTab);
   selectBuild(data.build.id);
@@ -17550,47 +17566,160 @@ async function saveBuildFields(ev) {
   }
 }
 
-async function deleteBuildToTrash(id) {
-  const res = await fetch(`/api/builds/${encodeURIComponent(id)}`, {
-    method: "DELETE",
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || !data.ok)
-    throw new Error(data.error || "Build delete failed");
-  const trashId = String(data.trash_id || "").trim();
-  if (!trashId) throw new Error("Build delete returned no recovery handle");
-  invalidateRepresentationItemIncarnation(id);
-  delete state.builds[id];
-  return trashId;
+const pendingBuildLifecycleDeletes = new Map();
+
+function lifecycleOperationKey(action) {
+  const random = globalThis.crypto &&
+    typeof globalThis.crypto.randomUUID === "function"
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+  return `${action}-${random}`;
 }
 
-async function restoreDeletedBuildFromTrash(trashId, expectedId) {
-  const recoveryId = String(trashId || "").trim();
-  const itemId = String(expectedId || "").trim();
-  if (!recoveryId) throw new Error("Build recovery handle is missing");
-  if (!itemId) throw new Error("Build recovery target is missing");
-  // Invalidate the deleted incarnation before a replayable restore begins.
-  invalidateRepresentationItemIncarnation(itemId);
-  const res = await fetch("/api/trash/restore", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ id: recoveryId }),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || !data.ok)
-    throw new Error(data.error || "Build restore failed");
-  const build = data.build;
-  if (!build || typeof build !== "object" || Array.isArray(build) ||
-      String(build.id || "") !== itemId) {
-    throw new Error("Build restore returned the wrong item");
+function itemLifecycleMutationAmbiguous(error) {
+  if (!error) return false;
+  if (error.code === "aborted" || error.name === "AbortError") return false;
+  return error.retryable === true || error.code === "network-error" ||
+    error.code === "invalid-response" || error.status === 0;
+}
+
+function itemLifecycleConflict(message, code = "item_revision_conflict") {
+  const error = new Error(message);
+  error.code = code;
+  error.status = 409;
+  error.retryable = false;
+  return error;
+}
+
+async function deleteBuildToTombstone(id, lifecycle = {}) {
+  const itemId = String(id || "").trim();
+  const build = state.builds[itemId];
+  if (!itemId || !build) throw new Error("Build delete target is missing");
+  if (!itemDeleteAvailable(build)) {
+    const error = new Error("Build deletion is unavailable");
+    error.code = "item_lifecycle_command_unavailable";
+    error.status = 503;
+    error.retryable = true;
+    throw error;
   }
-  state.builds[itemId] = {
-    ...build,
-    _record_revision: build.updated_at || "",
-    _representations: [],
-  };
-  // A failed read leaves capability state unknown (and therefore disabled),
-  // but does not turn a confirmed Trash restore into a failed history action.
+  const recordRevision = String(build._record_revision || "").trim();
+  if (!recordRevision) throw new Error("Build revision is unavailable");
+
+  let command = lifecycle.deleteCommand ||
+    pendingBuildLifecycleDeletes.get(itemId) || null;
+  if (command && command.recordRevision !== recordRevision) {
+    if (pendingBuildLifecycleDeletes.get(itemId) === command)
+      pendingBuildLifecycleDeletes.delete(itemId);
+    lifecycle.deleteCommand = null;
+    command = null;
+  }
+  if (!command) {
+    const before = await engineClient.items.lifecycle({ itemId });
+    if (before.item_revision !== recordRevision) {
+      throw itemLifecycleConflict("Build changed elsewhere");
+    }
+    command = Object.freeze({
+      itemId,
+      recordRevision: before.item_revision,
+      managedTreeRevision: before.managed_tree_revision,
+      idempotencyKey: lifecycleOperationKey("item-delete"),
+    });
+    lifecycle.deleteCommand = command;
+    pendingBuildLifecycleDeletes.set(itemId, command);
+  } else {
+    lifecycle.deleteCommand = command;
+  }
+
+  let result;
+  try {
+    result = await engineClient.items.delete(command);
+  } catch (error) {
+    if (!itemLifecycleMutationAmbiguous(error)) {
+      if (pendingBuildLifecycleDeletes.get(itemId) === command)
+        pendingBuildLifecycleDeletes.delete(itemId);
+      lifecycle.deleteCommand = null;
+    }
+    throw error;
+  }
+  const receipt = result && result.receipt;
+  const tombstone = receipt && receipt.tombstone;
+  if (!receipt || receipt.action !== "delete" || receipt.item_id !== itemId ||
+      !tombstone || tombstone.item_id !== itemId ||
+      tombstone.state !== "deleted") {
+    const error = new Error("Build delete returned an invalid receipt");
+    error.code = "invalid-response";
+    error.status = 200;
+    error.retryable = true;
+    throw error;
+  }
+  pendingBuildLifecycleDeletes.delete(itemId);
+  lifecycle.deleteCommand = null;
+  lifecycle.restoreCommand = null;
+  lifecycle.tombstone = JSON.parse(JSON.stringify(tombstone));
+  invalidateRepresentationItemIncarnation(itemId);
+  delete state.builds[itemId];
+  return lifecycle.tombstone;
+}
+
+async function restoreDeletedBuildFromTombstone(
+    lifecycle, expectedId, fallbackSnapshot) {
+  const itemId = String(expectedId || "").trim();
+  const tombstone = lifecycle && lifecycle.tombstone;
+  if (!itemId) throw new Error("Build recovery target is missing");
+  if (!tombstone || tombstone.state !== "deleted" ||
+      tombstone.item_id !== itemId || !tombstone.tombstone_id ||
+      !tombstone.revision) {
+    throw new Error("Build recovery tombstone is missing");
+  }
+  if (!lifecycle.restoreCommand && state.builds[itemId]) {
+    throw itemLifecycleConflict(
+      "Build was recreated before it could be restored",
+      "item_restore_collision");
+  }
+  let command = lifecycle.restoreCommand;
+  if (!command) {
+    command = Object.freeze({
+      tombstoneId: tombstone.tombstone_id,
+      tombstoneRevision: tombstone.revision,
+      idempotencyKey: lifecycleOperationKey("item-restore"),
+    });
+    lifecycle.restoreCommand = command;
+  }
+
+  let result;
+  try {
+    result = await engineClient.itemTombstones.restore(command);
+  } catch (error) {
+    if (!itemLifecycleMutationAmbiguous(error)) lifecycle.restoreCommand = null;
+    throw error;
+  }
+  const receipt = result && result.receipt;
+  const restoredTombstone = receipt && receipt.tombstone;
+  if (!receipt || receipt.action !== "restore" || receipt.item_id !== itemId ||
+      !restoredTombstone ||
+      restoredTombstone.tombstone_id !== tombstone.tombstone_id ||
+      restoredTombstone.state !== "restored") {
+    const error = new Error("Build restore returned an invalid receipt");
+    error.code = "invalid-response";
+    error.status = 200;
+    error.retryable = true;
+    throw error;
+  }
+  lifecycle.restoreCommand = null;
+  lifecycle.deleteCommand = null;
+  lifecycle.tombstone = JSON.parse(JSON.stringify(restoredTombstone));
+  invalidateRepresentationItemIncarnation(itemId);
+  const restored = JSON.parse(JSON.stringify(fallbackSnapshot || {}));
+  restored.id = itemId;
+  restored.updated_at = receipt.restored_item_revision;
+  restored._record_revision = receipt.restored_item_revision;
+  restored._representations = Array.isArray(restored._representations)
+    ? restored._representations : [];
+  if (!Array.isArray(restored._available_commands))
+    delete restored._available_commands;
+  state.builds[itemId] = restored;
+  // The receipt is the commit point. A failed projection refresh leaves the
+  // restored snapshot usable without turning a completed undo into failure.
   try { await refreshBuildEngineRecord(itemId); } catch (ignored) {}
   return state.builds[itemId];
 }
@@ -17600,24 +17729,31 @@ async function deleteBuild(originTab = activeHistoryTab()) {
   const id = state.buildSel;
   const b = state.builds[id];
   if (!b) return;
-  const snap = JSON.parse(JSON.stringify(b));
-  let trashId = "";
-  try {
-    trashId = await deleteBuildToTrash(id);
-  } catch (error) {
-    statusCrit("BUILD DELETE FAILED");
+  if (!itemDeleteAvailable(b)) {
+    statusCrit("BUILD DELETE UNAVAILABLE");
     return;
   }
-  if (trashId) {
+  const snap = JSON.parse(JSON.stringify(b));
+  const lifecycle = {
+    tombstone: null, deleteCommand: null, restoreCommand: null,
+  };
+  try {
+    await deleteBuildToTombstone(id, lifecycle);
+  } catch (error) {
+    statusCrit(error && error.status === 409
+      ? "BUILD DELETE CONFLICT :: CHANGED ELSEWHERE"
+      : "BUILD DELETE FAILED");
+    return;
+  }
+  if (lifecycle.tombstone) {
     state.buildSel = null;
-    const lifecycle = { trashId };
     pushOp(`delete build ${snap.title || id}`,
       async () => {
-        await restoreDeletedBuildFromTrash(lifecycle.trashId, snap.id);
+        await restoreDeletedBuildFromTombstone(lifecycle, snap.id, snap);
         renderUpload();
       },
       async () => {
-        lifecycle.trashId = await deleteBuildToTrash(snap.id);
+        await deleteBuildToTombstone(snap.id, lifecycle);
         renderUpload();
       }, undefined, originTab);
     renderUpload();
