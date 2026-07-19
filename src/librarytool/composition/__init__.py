@@ -12,6 +12,11 @@ from .filesystem import (
     TranslationBindings,
     compose_filesystem_engine,
 )
+from .first_party import (
+    FIRST_PARTY_MODULE_MANIFESTS,
+    FIRST_PARTY_WORKBENCH_MANIFESTS,
+    first_party_module_contributions,
+)
 from .host import (
     EngineSessionClosedError,
     EngineSessionError,
@@ -25,6 +30,8 @@ from .host import (
 
 __all__ = [
     "CatalogueBindings",
+    "FIRST_PARTY_MODULE_MANIFESTS",
+    "FIRST_PARTY_WORKBENCH_MANIFESTS",
     "FilesystemEnginePaths",
     "FilesystemEngineResources",
     "FilesystemServiceGraph",
@@ -41,5 +48,6 @@ __all__ = [
     "RepresentationBindings",
     "TranslationBindings",
     "compose_filesystem_engine",
+    "first_party_module_contributions",
     "open_filesystem_engine",
 ]
