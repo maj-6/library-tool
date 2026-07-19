@@ -118,6 +118,9 @@
       const proposals = Object.freeze({
         decide: (args) => this._replicaProposalDecide(args),
       });
+      const detection = Object.freeze({
+        start: (args) => this._replicaDetectionStart(args),
+      });
       const templates = Object.freeze({
         list: (args) => this._replicaTemplatesList(args),
         saveFromPage: (args) => this._replicaTemplateSaveFromPage(args),
@@ -142,7 +145,8 @@
         exportUrl: (args) => this._replicaPackageExportUrl(args),
       });
       this.replica = Object.freeze({
-        pages, proposals, templates, styles, instructions, figures, packages,
+        pages, proposals, detection, templates, styles, instructions, figures,
+        packages,
         printUrl: (args) => this._replicaPrintUrl(args),
       });
     }
@@ -333,6 +337,20 @@
       return this._requestJson("PUT", this._buildPath(bookId, "ocr-templates"), {
         body: { src: sourceId, name, from_page: page }, signal,
       });
+    }
+
+    _replicaDetectionStart({ bookId, sourceId, page, revision,
+      provider = "automatic", idempotencyKey, signal } = {}) {
+      return this._requestJson("POST",
+        `/v1/items/${encodePart(bookId)}/replica/region-detection-jobs`, {
+          headers: { "If-Match": quoteRevision(revision, "revision") },
+          body: {
+            source_id: sourceId, page, provider,
+            expect_revision: revision,
+            idempotency_key: idempotencyKey,
+          },
+          signal,
+        });
     }
 
     _replicaTemplateApply({ bookId, sourceId, name, pages, signal } = {}) {

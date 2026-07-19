@@ -18,6 +18,17 @@ function fn(name) {
 const rwNormalize = fn("rwNormalize");
 const rwParsePages = fn("rwParsePages");
 const rwDistribute = fn("rwDistribute");
+const rwDetectionOutcome = fn("rwDetectionOutcome");
+
+function functionSource(name) {
+  const start = source.indexOf(`function ${name}(`);
+  const asyncStart = source.indexOf(`async function ${name}(`);
+  const at = start >= 0 ? start : asyncStart;
+  assert.ok(at >= 0, name + " is present in app.js");
+  const end = source.indexOf("\n}\n", at);
+  assert.ok(end > at, name + " has a closing brace");
+  return source.slice(at, end + 2);
+}
 
 test("rwDistribute splits by weight at paragraph bounds and survives edges", () => {
   // a body-less page (title, plate) used to crash the translation preview
@@ -54,4 +65,32 @@ test("rwParsePages parses ranges, dedupes, sorts, and caps at 500", () => {
   assert.deepEqual(rwParsePages("abc, 0, -3"), []);
   // the server rejects >500 pages outright; the parser must cap, not leak 501
   assert.equal(rwParsePages("1-600").length, 500);
+});
+
+test("Replica detection presents every terminal job outcome distinctly", () => {
+  assert.deepEqual(rwDetectionOutcome({
+    state: "done", outputs: [{ kind: "replica.region-proposal" }],
+  }), {
+    terminal: true, state: "done", error: false,
+    message: "DETECT :: proposal ready",
+  });
+  assert.equal(rwDetectionOutcome({ state: "done", outputs: [] }).message,
+    "DETECT :: regions updated");
+  assert.equal(rwDetectionOutcome({ state: "cancelled" }).message,
+    "DETECT :: cancelled");
+  assert.equal(rwDetectionOutcome({ state: "interrupted" }).message,
+    "DETECT :: interrupted — retry");
+  assert.equal(rwDetectionOutcome({
+    state: "failed", error: { message: "provider unavailable" },
+  }).message, "DETECT :: failed — provider unavailable");
+  assert.equal(rwDetectionOutcome({ state: "running" }).terminal, false);
+});
+
+test("Replica Detect observes its returned engine job instead of OCR page markers", () => {
+  const start = functionSource("rwDetectPage");
+  const watch = functionSource("rwWatchDetection");
+  assert.match(start, /engineClient\.replica\.detection\.start/);
+  assert.match(start, /rwWatchDetection/);
+  assert.match(watch, /engineClient\.jobs\.get/);
+  assert.doesNotMatch(start + watch, /ocrQueuePages|ocrState\.pageRunning|setInterval/);
 });

@@ -65,12 +65,16 @@ recto/verso layouts, reports confidence and exceptions, and does not modify the
 book. Region detection providers and a future UI review queue can consume this
 same contract without owning the grouping algorithm.
 
-The next job consumer is Replica region detection: it still starts work through
-the shared OCR controller and waits on browser-local page markers instead of
-observing its returned engine job directly. After that, the `.lib` importer
-needs a staged multi-file write set and recovery journal; the current unit of
-work is deliberately claimed atomic only for one Replica workspace JSON file,
-not for an arbitrary collection of assets and translations.
+Replica region detection is now the first real consumer of that job contract.
+Its versioned, page-scoped command resolves the attached source and provider
+credentials in the engine, returns a stable job identity, and preserves
+protected work as a proposal. The workbench observes that job directly and
+distinguishes completion, failure, cancellation, and restart interruption; it
+no longer infers completion from browser-local OCR page markers. Next, the
+`.lib` importer needs a staged multi-file write set and recovery journal; the
+current unit of work is deliberately claimed atomic only for one Replica
+workspace JSON file, not for an arbitrary collection of assets and
+translations.
 
 Companion documents:
 

@@ -44,6 +44,7 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
     client.replica.templates.list,
     client.pdf.info,
     client.replica.pages.get,
+    client.replica.detection.start,
     client.pdf.words,
     client.replica.figures.rework,
     client.replica.proposals.decide,
@@ -68,7 +69,7 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
     client.replica.packages.exportUrl,
     client.replica.printUrl,
   ];
-  assert.equal(jsonMethods.length, 19);
+  assert.equal(jsonMethods.length, 20);
   assert.ok(jsonMethods.every((method) => typeof method === "function"));
   assert.equal(urlBuilders.length, 5);
   assert.ok(urlBuilders.every((method) => typeof method === "function"));
@@ -146,6 +147,29 @@ test("page save owns JSON encoding and the If-Match contract", async () => {
     src: "primary", page: 4, doc: "compiled.txt",
     dims: { w: 100, h: 200 }, ext: { keep: true },
     state: "verified", items, expect_revision: "rr-old",
+  });
+});
+
+test("Replica region detection starts a versioned page-scoped job", async () => {
+  const { client, calls } = harness({
+    ok: true,
+    provider: "mistral",
+    job: { id: "job-1", state: "running" },
+  });
+  const result = await client.replica.detection.start({
+    bookId: "book / one", sourceId: "scan 2", page: 17,
+    revision: "rr-current", provider: "automatic",
+    idempotencyKey: "detect-command-1",
+  });
+
+  assert.equal(result.job.id, "job-1");
+  assert.equal(calls[0].url,
+    "/api/v1/items/book%20%2F%20one/replica/region-detection-jobs");
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(calls[0].init.headers["If-Match"], '"rr-current"');
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    source_id: "scan 2", page: 17, provider: "automatic",
+    expect_revision: "rr-current", idempotency_key: "detect-command-1",
   });
 });
 

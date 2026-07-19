@@ -18839,6 +18839,7 @@ const jobsState = { rows: [], active: 0 };
 
 function jobTypeLabel(kind) {
   if (kind === "ocr") return "OCR";
+  if (kind === "replica.detect-regions") return "Replica";
   if (kind === "publish") return "Publish";
   if (kind === "download") return "Download";
   if (kind === "cloudsync") return "Cloud sync";
@@ -20153,6 +20154,11 @@ const rwState = {
   instrLoaded: false, // did the per-book instructions GET succeed this book?
   instrDirty: false,  // unsaved edits in the instructions field
   instrSaving: false, instrVersion: 0,
+  // Page-scoped engine jobs, keyed independently of the current selection.
+  // A detection keeps running when the user opens another page or workbench;
+  // returning to its page still shows the correct busy state.
+  detectionJobs: new Map(),
+  detectionWatchers: new Set(),
 };
 
 function rwActiveId() { return rwState.sel[rwState.sel.length - 1] || ""; }
@@ -20216,6 +20222,49 @@ function rwIsStale(value) {
 
 function rwHasUnsaved() {
   return rwState.dirty || rwState.instrDirty || rwState.styleDirty;
+}
+
+function rwDetectionKey(book, src, page) {
+  return JSON.stringify([String(book || ""), String(src || "primary"), +page || 0]);
+}
+
+function rwDetectionOutcome(job) {
+  const state = String(job && job.state || "");
+  if (["queued", "running", "cancelling"].includes(state)) {
+    return { terminal: false, state,
+             message: state === "cancelling" ? "DETECT :: cancelling…"
+               : "DETECT :: running" };
+  }
+  if (state === "done") {
+    const proposal = (job.outputs || []).some((output) =>
+      output && output.kind === "replica.region-proposal");
+    return { terminal: true, state, error: false,
+             message: proposal ? "DETECT :: proposal ready"
+               : "DETECT :: regions updated" };
+  }
+  if (state === "cancelled") {
+    return { terminal: true, state, error: false,
+             message: "DETECT :: cancelled" };
+  }
+  if (state === "interrupted") {
+    return { terminal: true, state, error: true,
+             message: "DETECT :: interrupted — retry" };
+  }
+  if (state === "failed") {
+    const failure = job && job.error;
+    const detail = failure && typeof failure === "object"
+      ? failure.message : failure;
+    return { terminal: true, state, error: true,
+             message: `DETECT :: failed${detail ? ` — ${detail}` : ""}` };
+  }
+  return { terminal: false, state: state || "unknown", error: false,
+           message: "DETECT :: waiting for engine" };
+}
+
+function rwDetectionActive(book, src, page) {
+  const record = rwState.detectionJobs.get(rwDetectionKey(book, src, page));
+  return !!record && (["submitting", "queued", "running", "cancelling"]
+    .includes(String(record.state || "")));
 }
 
 function rwResetEmptyMessage(error) {
@@ -20668,7 +20717,7 @@ function rwSyncBar() {
   const pending = rwHasUnsaved() || rwState.saving || rwState.styleSaving ||
                   rwState.instrSaving;
   const detecting = !!(rwState.book && rwState.page &&
-    ocrState.pageRunning.has(`${rwState.book}:${rwState.src}:${rwState.page}`));
+    rwDetectionActive(rwState.book, rwState.src, rwState.page));
   el("rw-status").textContent = rwState.page
     ? `p ${rwState.page}` +
       (ready ? ` · ${nItems} region${nItems === 1 ? "" : "s"}` : " · ⚠") +
@@ -21100,35 +21149,129 @@ async function rwProposalAction(action) {
   await rwRefreshSavedPage(book, src, page, seq);
 }
 
+async function rwFinishDetection(book, src, page, job) {
+  const key = rwDetectionKey(book, src, page);
+  const current = rwState.detectionJobs.get(key);
+  if (current && current.id === job.id) rwState.detectionJobs.delete(key);
+
+  // A completed or interrupted worker may have written a canonical page or a
+  // proposal immediately before its terminal transition. Invalidate shared
+  // caches even when this workbench has since navigated elsewhere.
+  delete ocrState.layoutMeta[book];
+  ocrState.regionsCache.clear();
+  ocrState.wordsCache.clear();
+
+  const outcome = rwDetectionOutcome(job);
+  const showing = book === rwState.book && src === rwState.src && page === rwState.page;
+  if (showing) {
+    const mayHaveOutput = outcome.state !== "failed" || (job.outputs || []).length;
+    let refreshError = null;
+    if (mayHaveOutput && rwState.pageLoaded && !rwState.dirty && !rwState.saving) {
+      try {
+        await rwRefreshSavedPage(book, src, page, rwState.seq);
+      } catch (error) {
+        refreshError = error;
+      }
+    }
+    if (refreshError) {
+      const detail = refreshError.message || refreshError;
+      statusErr(`${outcome.message} · reload failed — ${detail}`);
+    } else if (outcome.error) statusErr(outcome.message);
+    else status(outcome.message);
+    rwSyncBar();
+  }
+}
+
+async function rwWatchDetection(book, src, page, initialJob) {
+  const key = rwDetectionKey(book, src, page);
+  const jobId = String(initialJob && initialJob.id || "");
+  if (!jobId || rwState.detectionWatchers.has(jobId)) return;
+  rwState.detectionWatchers.add(jobId);
+  let job = initialJob;
+  let failures = 0;
+  try {
+    while (true) {
+      const tracked = rwState.detectionJobs.get(key);
+      if (!tracked || tracked.id !== jobId) return;
+      const outcome = rwDetectionOutcome(job);
+      tracked.state = outcome.state;
+      tracked.job = job;
+      if (book === rwState.book && src === rwState.src && page === rwState.page) {
+        rwSyncBar();
+      }
+      if (outcome.terminal) {
+        await rwFinishDetection(book, src, page, job);
+        return;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve,
+        Math.min(5000, 1000 + failures * 500)));
+      try {
+        const result = await engineClient.jobs.get({ jobId });
+        if (!result || !result.job) throw new Error("job response is incomplete");
+        job = result.job;
+        failures = 0;
+      } catch (error) {
+        if (error && error.status === 404) {
+          // The bounded history can prune an old terminal record while this
+          // renderer is disconnected. Treat that as an interrupted observer,
+          // never an eternal busy button.
+          job = { id: jobId, state: "interrupted", outputs: [] };
+          continue;
+        }
+        failures += 1;
+        if (book === rwState.book && src === rwState.src && page === rwState.page &&
+            failures === 1) status("DETECT :: reconnecting to job…");
+      }
+    }
+  } finally {
+    rwState.detectionWatchers.delete(jobId);
+  }
+}
+
 async function rwDetectPage() {
   if (!rwState.pageLoaded || rwState.loadError || rwState.dirty || rwState.saving) return;
   const book = rwState.book, src = rwState.src, page = rwState.page;
-  const seq = rwState.seq, pageSeq = rwState.pageSeq;
-  const queued = await ocrQueuePages(book, src, [{ page, service: "mistral" }]);
-  if (seq !== rwState.seq || pageSeq !== rwState.pageSeq ||
-      book !== rwState.book || src !== rwState.src || page !== rwState.page) return;
-  if (!queued) {
-    status("DETECT :: could not queue Mistral OCR");
+  const key = rwDetectionKey(book, src, page);
+  const existing = rwState.detectionJobs.get(key);
+  if (existing && rwDetectionActive(book, src, page)) {
+    status("DETECT :: already running");
+    if (existing.job) rwWatchDetection(book, src, page, existing.job);
     return;
   }
-  status("DETECT :: queued");
+
+  const placeholder = { id: "", state: "submitting", job: null };
+  rwState.detectionJobs.set(key, placeholder);
+  status("DETECT :: starting…");
   rwSyncBar();
-  const key = `${book}:${src}:${page}`;
-  let checks = 0;
-  const timer = setInterval(async () => {
-    if (seq !== rwState.seq || book !== rwState.book || src !== rwState.src ||
-        ++checks > 1200) {
-      clearInterval(timer);
-      return;
+  let result;
+  try {
+    result = await engineClient.replica.detection.start({
+      bookId: book, sourceId: src, page, revision: rwState.revision,
+      provider: "automatic", idempotencyKey: rwNewRid(),
+    });
+    if (!result || !result.job || !result.job.id) {
+      throw new Error("engine returned no job identity");
     }
-    if (ocrState.pageRunning.has(key)) return;
-    clearInterval(timer);
-    await rwRefreshSavedPage(book, src, page, seq);
-    if (seq === rwState.seq && book === rwState.book && src === rwState.src) {
-      status("DETECT :: finished");
-      rwSyncBar();
+  } catch (error) {
+    if (rwState.detectionJobs.get(key) === placeholder) {
+      rwState.detectionJobs.delete(key);
     }
-  }, 1000);
+    const changed = error && (error.status === 409 || error.status === 428);
+    statusErr(changed ? "DETECT :: page changed — reload and retry"
+      : `DETECT :: ${error && error.message || "could not start"}`);
+    rwSyncBar();
+    return;
+  }
+
+  const record = { id: String(result.job.id), state: result.job.state,
+                   job: result.job };
+  rwState.detectionJobs.set(key, record);
+  if (book === rwState.book && src === rwState.src && page === rwState.page) {
+    status(result.already ? "DETECT :: joined running job" : "DETECT :: queued");
+    rwSyncBar();
+  }
+  rwWatchDetection(book, src, page, result.job);
 }
 
 async function rwSave() {

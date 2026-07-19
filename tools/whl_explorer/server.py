@@ -5351,6 +5351,11 @@ def api_jobs_cancel(job_id: str):
 
 _ocr_jobs: dict[str, dict] = {}
 _ocr_jobs_lock = threading.Lock()
+# Serializes the page-scoped deduplication check with registration of a new
+# Replica detection job.  General OCR batches remain intentionally independent;
+# this lock only prevents two clients from paying for the same region proposal
+# on the same page at the same time.
+_replica_detection_start_lock = threading.Lock()
 # serializes every compiled-file merge: concurrent jobs (one POST per digit
 # shortcut) must not lose each other's pages in the read-modify-write
 _ocr_merge_lock = threading.RLock()
@@ -5774,6 +5779,7 @@ def _ocr_job_run(job_id: str) -> None:
     job = _ocr_jobs[job_id]
     cfg = job["cfg"]
     pdf = Path(job["pdf"])
+    replica_detection = job.get("kind") == "replica.detect-regions"
     for index, item in enumerate(job["pages"]):
         # OCR engines are synchronous calls, so cancellation takes effect at
         # the page boundary. A page already inside Tesseract/API processing is
@@ -5842,11 +5848,28 @@ def _ocr_job_run(job_id: str) -> None:
                 item["proposal"] = True
             else:
                 _ocr_merge_page(job["build_id"], job["target"], n, text)
+            if replica_detection:
+                output_kind = ("replica.region-proposal"
+                               if region_action == "proposed"
+                               else "replica.region-page")
+                quoted_item = urllib.parse.quote(str(job["build_id"]), safe="")
+                quoted_source = urllib.parse.quote(str(src_key), safe="")
+                ref = (f"librarytool://item/{quoted_item}/replica/"
+                       f"{quoted_source}/pages/{int(n)}")
+                if region_action == "proposed":
+                    ref += "/proposal"
+                job["outputs"] = [
+                    {"kind": output_kind, "ref": ref, "partial": False}
+                ]
+                job["note"] = ("proposal ready" if region_action == "proposed"
+                               else "regions updated")
             item["status"] = "ok"
         except Exception as exc:
             detail = f"{type(exc).__name__}: {exc}"
             item["status"] = f"error: {detail}"
             job["errors"] += 1
+            if replica_detection:
+                job["error"] = detail
             # Background failures otherwise exist only in the transient job
             # object. Emit them to the ring consumed by the Info tab, with
             # enough context to diagnose the executable, dependency, PDF, or
@@ -5854,6 +5877,11 @@ def _ocr_job_run(job_id: str) -> None:
             log.error("OCR failed: book=%s page=%s service=%s: %s",
                       job["build_id"], n, svc, detail, exc_info=True)
         job["done"] += 1
+        if replica_detection:
+            job["progress"] = {
+                "completed": job["done"], "total": job["total"],
+                "unit": "page", "phase": "detecting-regions",
+            }
         _job_checkpoint(job)
     # provenance at job completion (cancelled-partial included): the compiled
     # doc and its layout sidecar came from THIS source PDF via these engines
@@ -5880,6 +5908,12 @@ def _ocr_job_run(job_id: str) -> None:
                              f"{job['cancelled']} skipped")
         log.info("OCR cancelled: book=%s completed=%s skipped=%s",
                  job["build_id"], job["done"], job["cancelled"])
+    elif replica_detection and job["errors"]:
+        detail = str(job.get("error") or "region detection failed")
+        _job_transition(
+            job, "error", error=detail,
+            failure={"code": "region_detection_failed", "message": detail,
+                     "retryable": True})
     else:
         _job_transition(job, "done" if not job["errors"]
                         else "done (with errors)")
@@ -5945,6 +5979,176 @@ def _ocr_request_cfg(payload: dict) -> dict:
     ):
         cfg[request_key] = local.get(setting_key) or cfg.get(request_key)
     return cfg
+
+
+def _replica_detection_pdf(build: dict, source_id: str) -> Path | None:
+    """Resolve one attached source without trusting a renderer-supplied path."""
+    raw = str(build.get("pdf_file") or "") if source_id == "primary" else next(
+        (str(source.get("path") or "")
+         for source in (build.get("pdf_sources") or [])
+         if isinstance(source, dict) and source.get("id") == source_id), "")
+    pdf = _resolve_local(raw)
+    return pdf if pdf is not None and pdf.is_file() else None
+
+
+def _replica_detection_active(build_id: str, source_id: str,
+                              page: int) -> dict | None:
+    """The live detection for this exact page, copied under the registry lock."""
+    with _jobs_lock:
+        for job in _jobs.values():
+            subject = job.get("subject") or {}
+            if (job.get("kind") == "replica.detect-regions"
+                    and job.get("state") in _JOB_ACTIVE
+                    and str(subject.get("item_id") or job.get("build_id") or "")
+                    == build_id
+                    and str(subject.get("source_id") or "primary") == source_id
+                    and str(subject.get("page") or "") == str(page)):
+                return dict(job)
+    return None
+
+
+@app.route("/api/v1/items/<build_id>/replica/region-detection-jobs",
+           methods=["POST"])
+def api_v1_replica_region_detection_job(build_id: str):
+    """Start or join non-destructive automatic region detection for one page.
+
+    The browser identifies the item/source/page and its current region
+    revision; the engine resolves the attached PDF, provider credentials, OCR
+    target, raster width, and page-structure revision.  This deliberately
+    reuses the proven OCR worker while exposing a Replica-specific job identity
+    that any current or future workbench can observe through ``/api/v1/jobs``.
+    """
+    payload = request.get_json(silent=True) or {}
+    raw_page = payload.get("page")
+    try:
+        page = int(raw_page)
+    except (TypeError, ValueError, OverflowError):
+        page = 0
+    if isinstance(raw_page, bool) or page < 1:
+        return _engine_error_response(EngineValidationError(
+            "page must be a positive integer", code="invalid_page",
+            details={"item_id": build_id, "page": raw_page}))
+
+    source_id = str(payload.get("source_id") or "primary")
+    provider = str(payload.get("provider") or "automatic").strip().lower()
+    if provider not in ("automatic", "mistral"):
+        return _engine_error_response(EngineValidationError(
+            "the requested region-detection provider is unavailable",
+            code="region_detection_provider_unavailable",
+            details={"provider": provider}))
+    provider = "mistral"  # the only installed provider that returns blocks
+
+    try:
+        current = _replica_engine().get_region_page(
+            PageKey(build_id, source_id, page))
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    expected = _region_match_token(payload)
+    if not expected:
+        return _engine_error_response(EnginePreconditionRequiredError(
+            "a region revision is required",
+            code="region_revision_required",
+            details={"item_id": build_id, "source_id": source_id,
+                     "page": page}), current=current)
+    if expected != current.revision:
+        return _engine_error_response(EngineConflictError(
+            "the region page changed before detection could start",
+            code="region_revision_conflict",
+            details={"item_id": build_id, "source_id": source_id,
+                     "page": page, "expected_revision": expected,
+                     "current_revision": current.revision}), current=current)
+
+    build = lib.load_json(BUILDS_PATH, {}).get(build_id)
+    # get_region_page already checks item/source identity; retain the explicit
+    # dictionary guard because the attached-path resolver needs build metadata.
+    if not isinstance(build, dict):
+        return _engine_error_response(EngineNotFoundError(
+            "the item does not exist", code="item_not_found",
+            details={"item_id": build_id}))
+    source_id = _valid_src_key(build, source_id)
+    pdf = _replica_detection_pdf(build, source_id) if source_id else None
+    if pdf is None:
+        return _engine_error_response(EngineValidationError(
+            "the selected source has no attached local PDF",
+            code="replica_source_pdf_unavailable",
+            details={"item_id": build_id, "source_id": source_id or ""}))
+
+    cfg = _ocr_request_cfg({})
+    if not str(cfg.get("mistral_key") or "").strip():
+        return _engine_error_response(EngineValidationError(
+            "Mistral OCR is not configured",
+            code="region_detection_provider_not_configured",
+            details={"provider": provider}))
+    try:
+        width = max(600, min(3000, int(
+            _client_settings().get("ocrImageWidth") or 1400)))
+    except (TypeError, ValueError, OverflowError):
+        width = 1400
+
+    with _page_structure_lock:
+        source_revision = _page_structure_revision.get(build_id, 0)
+    input_revisions = {
+        "region": expected,
+        "page_structure": source_revision,
+    }
+    idempotency_key = str(payload.get("idempotency_key") or "").strip()[:128]
+
+    with _replica_detection_start_lock:
+        existing = _replica_detection_active(build_id, source_id, page)
+        if existing is not None:
+            existing_region = str(
+                (existing.get("input_revisions") or {}).get("region") or "")
+            if existing_region and existing_region != expected:
+                return _engine_error_response(EngineConflictError(
+                    "region detection is already running from another revision",
+                    code="region_detection_already_running",
+                    details={"item_id": build_id, "source_id": source_id,
+                             "page": page,
+                             "running_revision": existing_region,
+                             "expected_revision": expected}), current=current)
+            view = _jobs_engine().view(str(existing.get("id") or ""))
+            if view is not None:
+                return jsonify({"ok": True, "already": True,
+                                "provider": provider,
+                                "job": view.as_dict()})
+
+        job_id = lib.gen_id(set(_ocr_jobs) | set(_jobs))
+        target = ("compiled.txt" if source_id == "primary"
+                  else f"compiled-{source_id}.txt")
+        job = {
+            "id": job_id,
+            "kind": "replica.detect-regions",
+            "build_id": build_id,
+            "pdf": str(pdf),
+            "target": target,
+            "src_key": source_id,
+            "pages": [{"page": page, "service": provider,
+                       "status": "queued"}],
+            "done": 0, "total": 1, "errors": 0, "cancelled": 0,
+            "cancel_requested": False, "width": width,
+            "status": "running", "cfg": cfg,
+            "subject": {"item_id": build_id, "source_id": source_id,
+                        "page": page},
+            "progress": {"completed": 0, "total": 1,
+                         "unit": "page", "phase": "detecting-regions"},
+            "input_revisions": input_revisions,
+            "outputs": [], "provider": provider,
+            # Runtime-only retry correlation. It is intentionally outside the
+            # JobManager public allowlist and never reaches jobs.json.
+            "idempotency_key": idempotency_key,
+        }
+        if not _ocr_job_start_guarded(job, source_revision, record_source=True):
+            return _engine_error_response(EngineConflictError(
+                "page numbering changed before detection could start",
+                code="page_structure_conflict",
+                details={"item_id": build_id, "source_id": source_id,
+                         "page": page}), current=current)
+
+    view = _jobs_engine().view(job_id)
+    if view is None:  # registration and view publication are one start step
+        raise RuntimeError("region-detection job was not registered")
+    return jsonify({"ok": True, "already": False, "provider": provider,
+                    "job": view.as_dict()})
 
 
 def _ocr_job_state(job: dict) -> dict:
@@ -6572,7 +6776,14 @@ def _ocr_job_start_guarded(job: dict, source_revision: int,
                             job.get("src_key") or "primary")
         with _ocr_jobs_lock:
             _ocr_jobs[job["id"]] = job
-        _job_track(job, "ocr", label=_job_book_label(build_id))
+        # Preserve a semantic consumer kind (for example
+        # ``replica.detect-regions``) while legacy OCR batches continue to
+        # default to ``ocr``.  The generic jobs API and future workbenches must
+        # not need to infer the producer from mutable OCR implementation data.
+        _job_track(
+            job, str(job.get("kind") or "ocr"),
+            label=_job_book_label(build_id),
+        )
         threading.Thread(target=_ocr_job_run, args=(job["id"],),
                          daemon=True).start()
         return True
