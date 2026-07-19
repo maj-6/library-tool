@@ -15,12 +15,17 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, ContextManager, Protocol
+from typing import Any, ContextManager, Literal, Protocol, TypeAlias
 
 from .errors import ConflictError, RepositoryError, ValidationError
 
 
 _OPERATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_TRANSLATION_LANGUAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+ImportDisposition: TypeAlias = Literal["none", "imported", "kept"]
+_IMPORT_DISPOSITIONS = frozenset({"none", "imported", "kept"})
 
 
 def _freeze_json(value: Any, *, path: str = "$", active: set[int] | None = None) -> Any:
@@ -83,6 +88,70 @@ def _typed_tuple(values: Any, expected: type, *, field_name: str) -> tuple[Any, 
     return result
 
 
+def _string_tuple(values: Any, *, field_name: str) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)):
+        raise TypeError(f"{field_name} must be an iterable")
+    try:
+        result = tuple(values)
+    except TypeError as exc:
+        raise TypeError(f"{field_name} must be an iterable") from exc
+    if any(not isinstance(value, str) for value in result):
+        raise TypeError(f"{field_name} contains a non-string value")
+    return result
+
+
+def _positive_int_tuple(values: Any, *, field_name: str) -> tuple[int, ...]:
+    if isinstance(values, (str, bytes)):
+        raise TypeError(f"{field_name} must be an iterable")
+    try:
+        result = tuple(values)
+    except TypeError as exc:
+        raise TypeError(f"{field_name} must be an iterable") from exc
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 1
+        for value in result
+    ):
+        raise ValueError(f"{field_name} contains an invalid page number")
+    return result
+
+
+def _portable_identifier(value: Any, *, field_name: str, maximum: int = 128) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be a string")
+    if (
+        not value
+        or value != value.strip()
+        or len(value) > maximum
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        or "/" in value
+        or "\\" in value
+    ):
+        raise ValueError(f"{field_name} is not a portable identifier")
+    return value
+
+
+def _document_name(value: Any, *, field_name: str = "document") -> str:
+    result = _portable_identifier(value, field_name=field_name, maximum=255)
+    if result in {".", ".."}:
+        raise ValueError(f"{field_name} is not a portable document name")
+    return result
+
+
+def _normalize_disposition(
+    value: ImportDisposition | None,
+    *,
+    payload_present: bool,
+    field_name: str,
+) -> ImportDisposition:
+    # ``None`` is the compatibility input for plans created before explicit
+    # disposition fields existed. The stored plan is always normalized.
+    if value is None:
+        return "imported" if payload_present else "none"
+    if not isinstance(value, str) or value not in _IMPORT_DISPOSITIONS:
+        raise ValueError(f"{field_name} is not a valid import disposition")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class ImportWarning:
     location: str
@@ -107,6 +176,16 @@ class ImportLibCommand:
 
 @dataclass(frozen=True, slots=True)
 class OpenLibCommand:
+    """Reserved create-new command.
+
+    Existing-item import is the first implemented transactional vertical.
+    Opening an archive as a new item also has to create the catalogue record
+    inside that same unit of work; it intentionally remains outside
+    :class:`LibInterchangeService` until that create-item repository contract
+    exists.  Keeping the transport DTO here prevents a Flask/local-path detail
+    from leaking into the eventual application service.
+    """
+
     archive: bytes
     operation_id: str
     source_path: str = ""
@@ -117,14 +196,31 @@ class ImportDestinationSnapshot:
     item_id: str
     revision: str = ""
     book_id: str = ""
+    source_ids: tuple[str, ...] = ("primary",)
     pages: Mapping[int, Mapping[str, Any]] = field(default_factory=dict)
+    region_ids: Mapping[str, Mapping[int, tuple[str, ...]]] = field(
+        default_factory=dict
+    )
     templates: tuple[str, ...] = ()
     figures: tuple[str, ...] = ()
     translation_pages: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
+    instructions: str = ""
+    document_sources: Mapping[str, str] = field(default_factory=dict)
     has_stylesheet: bool = False
     has_manifest_ext: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.item_id, str) or not self.item_id.strip():
+            raise ValueError("item_id must be a non-empty string")
+        if not isinstance(self.revision, str) or not isinstance(self.book_id, str):
+            raise TypeError("revision and book_id must be strings")
+        source_ids = _string_tuple(self.source_ids, field_name="source_ids")
+        for source_id in source_ids:
+            _portable_identifier(source_id, field_name="source id")
+        if len(set(source_ids)) != len(source_ids):
+            raise ValueError("source_ids contains a duplicate source")
+        object.__setattr__(self, "source_ids", source_ids)
+
         if not isinstance(self.pages, Mapping):
             raise TypeError("pages must be an object keyed by page number")
         pages: dict[int, Mapping[str, Any]] = {}
@@ -133,8 +229,49 @@ class ImportDestinationSnapshot:
                 raise ValueError("pages contains an invalid page number")
             pages[page] = _freeze_mapping(record, path=f"$.pages[{page}]")
         object.__setattr__(self, "pages", MappingProxyType(pages))
-        object.__setattr__(self, "templates", tuple(str(v) for v in self.templates))
-        object.__setattr__(self, "figures", tuple(str(v) for v in self.figures))
+
+        if not isinstance(self.region_ids, Mapping):
+            raise TypeError("region_ids must be an object keyed by source id")
+        owned_region_ids: set[str] = set()
+        regions: dict[str, Mapping[int, tuple[str, ...]]] = {}
+        for source_id, raw_pages in self.region_ids.items():
+            if not isinstance(source_id, str):
+                raise TypeError("region_ids source keys must be strings")
+            if source_id not in source_ids:
+                raise ValueError("region_ids names an unknown source")
+            if not isinstance(raw_pages, Mapping):
+                raise TypeError("region_ids source values must be page objects")
+            source_pages: dict[int, tuple[str, ...]] = {}
+            for page, raw_ids in raw_pages.items():
+                if isinstance(page, bool) or not isinstance(page, int) or page < 1:
+                    raise ValueError("region_ids contains an invalid page number")
+                region_ids = _string_tuple(
+                    raw_ids,
+                    field_name=f"region_ids[{source_id!r}][{page}]",
+                )
+                for region_id in region_ids:
+                    _portable_identifier(region_id, field_name="region id")
+                    if region_id in owned_region_ids:
+                        raise ValueError(
+                            "a region identity is owned by more than one location"
+                        )
+                    owned_region_ids.add(region_id)
+                source_pages[page] = region_ids
+            regions[source_id] = MappingProxyType(source_pages)
+        object.__setattr__(self, "region_ids", MappingProxyType(regions))
+
+        templates = _string_tuple(self.templates, field_name="templates")
+        figures = _string_tuple(self.figures, field_name="figures")
+        for field_name, values in (("templates", templates), ("figures", figures)):
+            folded: set[str] = set()
+            for value in values:
+                _document_name(value, field_name=field_name)
+                normalized = value.casefold()
+                if normalized in folded:
+                    raise ValueError(f"{field_name} contains a duplicate name")
+                folded.add(normalized)
+        object.__setattr__(self, "templates", templates)
+        object.__setattr__(self, "figures", figures)
         if not isinstance(self.translation_pages, Mapping):
             raise TypeError("translation_pages must be an object")
         translations: dict[str, tuple[int, ...]] = {}
@@ -149,6 +286,30 @@ class ImportDestinationSnapshot:
                 raise ValueError("translation_pages contains an invalid page")
             translations[language] = pages_for_language
         object.__setattr__(self, "translation_pages", MappingProxyType(translations))
+
+        if not isinstance(self.instructions, str):
+            raise TypeError("instructions must be a string")
+        if not isinstance(self.document_sources, Mapping):
+            raise TypeError("document_sources must be an object")
+        document_sources: dict[str, str] = {}
+        for document, source_id in self.document_sources.items():
+            document_name = _document_name(document)
+            if not isinstance(source_id, str):
+                raise TypeError("document source ids must be strings")
+            if source_id not in source_ids:
+                raise ValueError("document_sources names an unknown source")
+            document_sources[document_name] = source_id
+        object.__setattr__(
+            self, "document_sources", MappingProxyType(document_sources)
+        )
+        if not isinstance(self.has_stylesheet, bool) or not isinstance(
+            self.has_manifest_ext, bool
+        ):
+            raise TypeError("destination presence flags must be booleans")
+
+    @property
+    def has_instructions(self) -> bool:
+        return bool(self.instructions)
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +374,28 @@ class LibTranslationImport:
 
 
 @dataclass(frozen=True, slots=True)
+class LibCompiledPageImport:
+    """One deterministic page update to a destination compiled document."""
+
+    document: str
+    source_id: str
+    page: int
+    text: str
+
+    def __post_init__(self) -> None:
+        _document_name(self.document)
+        _portable_identifier(self.source_id, field_name="compiled source id")
+        if not isinstance(self.text, str):
+            raise TypeError("compiled page text must be a string")
+        if (
+            isinstance(self.page, bool)
+            or not isinstance(self.page, int)
+            or self.page < 1
+        ):
+            raise ValueError("compiled page must be a positive integer")
+
+
+@dataclass(frozen=True, slots=True)
 class LibImportPlan:
     archive_sha256: str
     format_version: str
@@ -223,9 +406,13 @@ class LibImportPlan:
     templates: tuple[LibTemplateImport, ...] = ()
     figures: tuple[LibFigureImport, ...] = ()
     translations: tuple[LibTranslationImport, ...] = ()
+    compiled_pages: tuple[LibCompiledPageImport, ...] = ()
     stylesheet: Mapping[str, Any] | None = None
     manifest_ext: Mapping[str, Any] | None = None
     instructions: str = ""
+    stylesheet_disposition: ImportDisposition | None = None
+    manifest_ext_disposition: ImportDisposition | None = None
+    instructions_disposition: ImportDisposition | None = None
     warnings: tuple[ImportWarning, ...] = ()
 
     def __post_init__(self) -> None:
@@ -253,6 +440,15 @@ class LibImportPlan:
                 field_name="translations",
             ),
         )
+        object.__setattr__(
+            self,
+            "compiled_pages",
+            _typed_tuple(
+                self.compiled_pages,
+                LibCompiledPageImport,
+                field_name="compiled_pages",
+            ),
+        )
         if self.stylesheet is not None:
             object.__setattr__(
                 self,
@@ -265,6 +461,33 @@ class LibImportPlan:
                 "manifest_ext",
                 _freeze_mapping(self.manifest_ext, path="$.manifest_ext"),
             )
+        object.__setattr__(
+            self,
+            "stylesheet_disposition",
+            _normalize_disposition(
+                self.stylesheet_disposition,
+                payload_present=self.stylesheet is not None,
+                field_name="stylesheet_disposition",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "manifest_ext_disposition",
+            _normalize_disposition(
+                self.manifest_ext_disposition,
+                payload_present=self.manifest_ext is not None,
+                field_name="manifest_ext_disposition",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "instructions_disposition",
+            _normalize_disposition(
+                self.instructions_disposition,
+                payload_present=bool(self.instructions),
+                field_name="instructions_disposition",
+            ),
+        )
         object.__setattr__(
             self,
             "warnings",
@@ -287,22 +510,178 @@ class LibImportReceipt:
     templates_added: tuple[str, ...] = ()
     figures_added: tuple[str, ...] = ()
     translations_added: tuple[str, ...] = ()
+    compiled_pages: tuple[int, ...] = ()
+    documents_updated: tuple[str, ...] = ()
+    stylesheet_disposition: ImportDisposition = "none"
+    manifest_ext_disposition: ImportDisposition = "none"
+    instructions_disposition: ImportDisposition = "none"
     warnings: tuple[ImportWarning, ...] = ()
 
     def __post_init__(self) -> None:
         for field_name in (
+            "operation_id",
+            "archive_sha256",
+            "command_sha256",
+            "item_id",
+            "source_id",
+            "format_version",
+        ):
+            if not isinstance(getattr(self, field_name), str):
+                raise TypeError(f"{field_name} must be a string")
+        if not _OPERATION_ID_RE.fullmatch(self.operation_id):
+            raise ValueError("operation_id is not a portable operation token")
+        if not _SHA256_RE.fullmatch(self.archive_sha256):
+            raise ValueError("archive_sha256 must be a lowercase SHA-256 digest")
+        if not _SHA256_RE.fullmatch(self.command_sha256):
+            raise ValueError("command_sha256 must be a lowercase SHA-256 digest")
+        if not self.item_id or not self.source_id or not self.format_version:
+            raise ValueError("receipt identity and format fields must not be empty")
+        _portable_identifier(self.item_id, field_name="item_id")
+        _portable_identifier(self.source_id, field_name="source_id")
+        if self.format_version != self.format_version.strip():
+            raise ValueError("format_version must not contain surrounding whitespace")
+        if not isinstance(self.overwrite, bool):
+            raise TypeError("overwrite must be a boolean")
+
+        for field_name in (
+            "pages_applied",
+            "pages_skipped",
+            "pages_protected",
+            "compiled_pages",
+        ):
+            values = _positive_int_tuple(
+                getattr(self, field_name), field_name=field_name
+            )
+            if len(set(values)) != len(values):
+                raise ValueError(f"{field_name} contains a duplicate page")
+            object.__setattr__(self, field_name, values)
+        for field_name in (
+            "templates_added",
+            "figures_added",
+            "translations_added",
+            "documents_updated",
+        ):
+            values = _string_tuple(getattr(self, field_name), field_name=field_name)
+            if len(set(values)) != len(values):
+                raise ValueError(f"{field_name} contains a duplicate value")
+            object.__setattr__(self, field_name, values)
+
+        page_groups = (
+            set(self.pages_applied),
+            set(self.pages_skipped),
+            set(self.pages_protected),
+        )
+        if (
+            page_groups[0] & page_groups[1]
+            or page_groups[0] & page_groups[2]
+            or page_groups[1] & page_groups[2]
+        ):
+            raise ValueError("receipt page dispositions overlap")
+        if not set(self.compiled_pages).issubset(page_groups[0]):
+            raise ValueError("compiled_pages must be a subset of pages_applied")
+
+        for field_name in ("templates_added", "figures_added"):
+            for value in getattr(self, field_name):
+                _document_name(value, field_name=field_name)
+        for value in self.documents_updated:
+            _document_name(value, field_name="documents_updated")
+        for value in self.translations_added:
+            if not _TRANSLATION_LANGUAGE_RE.fullmatch(value):
+                raise ValueError("translations_added contains an invalid language")
+        for field_name in (
+            "stylesheet_disposition",
+            "manifest_ext_disposition",
+            "instructions_disposition",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or value not in _IMPORT_DISPOSITIONS:
+                raise ValueError(f"{field_name} is not a valid disposition")
+        object.__setattr__(
+            self,
+            "warnings",
+            _typed_tuple(self.warnings, ImportWarning, field_name="warnings"),
+        )
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "LibImportReceipt":
+        """Rehydrate one persisted receipt without coercing untrusted data."""
+
+        if not isinstance(value, Mapping):
+            raise TypeError("an import receipt must be an object")
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("import receipt field names must be strings")
+        fields = {
+            "operation_id",
+            "archive_sha256",
+            "command_sha256",
+            "item_id",
+            "source_id",
+            "overwrite",
+            "format_version",
             "pages_applied",
             "pages_skipped",
             "pages_protected",
             "templates_added",
             "figures_added",
             "translations_added",
-        ):
-            object.__setattr__(self, field_name, tuple(getattr(self, field_name)))
-        object.__setattr__(
-            self,
+            "compiled_pages",
+            "documents_updated",
+            "stylesheet_disposition",
+            "manifest_ext_disposition",
+            "instructions_disposition",
             "warnings",
-            _typed_tuple(self.warnings, ImportWarning, field_name="warnings"),
+        }
+        supplied = set(value)
+        if supplied != fields:
+            missing = sorted(fields - supplied)
+            extra = sorted(supplied - fields)
+            raise ValueError(
+                f"import receipt fields do not match the schema; "
+                f"missing={missing}, extra={extra}"
+            )
+        array_fields = (
+            "pages_applied",
+            "pages_skipped",
+            "pages_protected",
+            "templates_added",
+            "figures_added",
+            "translations_added",
+            "compiled_pages",
+            "documents_updated",
+            "warnings",
+        )
+        for field_name in array_fields:
+            if not isinstance(value[field_name], list):
+                raise TypeError(f"{field_name} must be a JSON array")
+        warning_values: list[ImportWarning] = []
+        for warning in value["warnings"]:
+            if not isinstance(warning, Mapping):
+                raise TypeError("warnings must contain objects")
+            if set(warning) != {"location", "message"}:
+                raise ValueError("an import warning has invalid fields")
+            warning_values.append(
+                ImportWarning(warning["location"], warning["message"])
+            )
+        return cls(
+            operation_id=value["operation_id"],
+            archive_sha256=value["archive_sha256"],
+            command_sha256=value["command_sha256"],
+            item_id=value["item_id"],
+            source_id=value["source_id"],
+            overwrite=value["overwrite"],
+            format_version=value["format_version"],
+            pages_applied=tuple(value["pages_applied"]),
+            pages_skipped=tuple(value["pages_skipped"]),
+            pages_protected=tuple(value["pages_protected"]),
+            templates_added=tuple(value["templates_added"]),
+            figures_added=tuple(value["figures_added"]),
+            translations_added=tuple(value["translations_added"]),
+            compiled_pages=tuple(value["compiled_pages"]),
+            documents_updated=tuple(value["documents_updated"]),
+            stylesheet_disposition=value["stylesheet_disposition"],
+            manifest_ext_disposition=value["manifest_ext_disposition"],
+            instructions_disposition=value["instructions_disposition"],
+            warnings=tuple(warning_values),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -320,6 +699,11 @@ class LibImportReceipt:
             "templates_added": list(self.templates_added),
             "figures_added": list(self.figures_added),
             "translations_added": list(self.translations_added),
+            "compiled_pages": list(self.compiled_pages),
+            "documents_updated": list(self.documents_updated),
+            "stylesheet_disposition": self.stylesheet_disposition,
+            "manifest_ext_disposition": self.manifest_ext_disposition,
+            "instructions_disposition": self.instructions_disposition,
             "warnings": [warning.as_dict() for warning in self.warnings],
         }
 
@@ -455,6 +839,12 @@ class LibInterchangeService:
                         "destination_item_id": destination.item_id,
                     },
                 )
+            if source_id not in destination.source_ids:
+                raise ValidationError(
+                    "the destination item has no such source",
+                    code="unknown_source_id",
+                    details={"item_id": item_id, "source_id": source_id},
+                )
             plan = self._planner.plan(
                 command.archive,
                 destination,
@@ -472,7 +862,26 @@ class LibInterchangeService:
                     "interchange planner returned the wrong archive identity",
                     code="archive_identity_mismatch",
                 )
-            self._validate_plan(plan)
+            if (
+                destination.book_id
+                and plan.incoming_book_id
+                and destination.book_id != plan.incoming_book_id
+            ):
+                raise ConflictError(
+                    "the .lib archive belongs to a different item",
+                    code="book_identity_mismatch",
+                    details={
+                        "item_id": item_id,
+                        "destination_book_id": destination.book_id,
+                        "incoming_book_id": plan.incoming_book_id,
+                    },
+                )
+            self._validate_plan(
+                plan,
+                destination=destination,
+                source_id=source_id,
+                overwrite=bool(command.overwrite),
+            )
             receipt = self._receipt(
                 operation_id,
                 destination.item_id,
@@ -486,7 +895,13 @@ class LibInterchangeService:
             return receipt
 
     @staticmethod
-    def _validate_plan(plan: LibImportPlan) -> None:
+    def _validate_plan(
+        plan: LibImportPlan,
+        *,
+        destination: ImportDestinationSnapshot,
+        source_id: str,
+        overwrite: bool,
+    ) -> None:
         """Reject malformed plugin output before any adapter can stage it."""
 
         def invalid(reason: str, **details: Any) -> None:
@@ -502,6 +917,38 @@ class LibInterchangeService:
             invalid("incoming_book_id_invalid")
         if not isinstance(plan.instructions, str):
             invalid("instructions_invalid")
+
+        dispositions = (
+            (
+                "stylesheet",
+                plan.stylesheet_disposition,
+                plan.stylesheet is not None,
+                destination.has_stylesheet,
+            ),
+            (
+                "manifest_ext",
+                plan.manifest_ext_disposition,
+                plan.manifest_ext is not None,
+                destination.has_manifest_ext,
+            ),
+            (
+                "instructions",
+                plan.instructions_disposition,
+                bool(plan.instructions),
+                destination.has_instructions,
+            ),
+        )
+        for name, disposition, payload_present, destination_present in dispositions:
+            if disposition not in _IMPORT_DISPOSITIONS:
+                invalid("invalid_disposition", field=name)
+            if disposition == "imported" and not payload_present:
+                invalid("missing_disposition_payload", field=name)
+            if disposition != "imported" and payload_present:
+                invalid("unexpected_disposition_payload", field=name)
+            if disposition == "kept" and not destination_present:
+                invalid("kept_artifact_missing", field=name)
+            if disposition == "imported" and destination_present and not overwrite:
+                invalid("overwrite_required", field=name)
 
         applied = tuple(value.page for value in plan.pages)
         skipped = tuple(plan.pages_skipped)
@@ -546,10 +993,11 @@ class LibInterchangeService:
         validate_names("figures", tuple(value.name for value in plan.figures))
 
         translation_keys: set[tuple[str, int]] = set()
+        translation_pages: list[tuple[str, int]] = []
         for translation in plan.translations:
             language = translation.language
-            if not isinstance(language, str) or not re.fullmatch(
-                r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", language
+            if not isinstance(language, str) or not _TRANSLATION_LANGUAGE_RE.fullmatch(
+                language
             ):
                 invalid("translation_language_invalid")
             key = (language.casefold(), translation.page)
@@ -560,6 +1008,101 @@ class LibInterchangeService:
                     page=translation.page,
                 )
             translation_keys.add(key)
+            translation_pages.append((language, translation.page))
+        applied_set = set(applied)
+        for language, page in translation_pages:
+            if page not in applied_set:
+                invalid(
+                    "translation_page_not_applied",
+                    language=language,
+                    page=page,
+                )
+
+        compiled_pages: set[int] = set()
+        page_records = {value.page: value.record for value in plan.pages}
+        for compiled in plan.compiled_pages:
+            if compiled.page not in set(applied):
+                invalid("compiled_page_not_applied", page=compiled.page)
+            if compiled.page in compiled_pages:
+                invalid("duplicate_compiled_page", page=compiled.page)
+            compiled_pages.add(compiled.page)
+            if compiled.source_id != source_id:
+                invalid(
+                    "compiled_source_mismatch",
+                    page=compiled.page,
+                    source_id=compiled.source_id,
+                )
+            if compiled.source_id not in destination.source_ids:
+                invalid("compiled_source_unknown", source_id=compiled.source_id)
+            try:
+                document = _document_name(compiled.document)
+            except (TypeError, ValueError):
+                invalid("compiled_document_invalid", page=compiled.page)
+            bound_source = destination.document_sources.get(document)
+            if bound_source is not None and bound_source != source_id:
+                invalid(
+                    "document_source_conflict",
+                    document=document,
+                    destination_source_id=bound_source,
+                    source_id=source_id,
+                )
+            record_document = page_records[compiled.page].get("doc")
+            if record_document is not None and record_document != document:
+                invalid(
+                    "compiled_document_mismatch",
+                    page=compiled.page,
+                    document=document,
+                    record_document=record_document,
+                )
+        incoming_region_ids: dict[str, int] = {}
+        for page_import in plan.pages:
+            items = page_import.record.get("items")
+            if items is None:
+                continue
+            if not isinstance(items, (list, tuple)):
+                invalid("page_items_invalid", page=page_import.page)
+            for item in items:
+                if not isinstance(item, Mapping):
+                    continue
+                region_id = item.get("rid")
+                if not region_id:
+                    continue
+                try:
+                    normalized_id = _portable_identifier(
+                        region_id, field_name="region id"
+                    )
+                except (TypeError, ValueError):
+                    invalid("region_identity_invalid", page=page_import.page)
+                if normalized_id in incoming_region_ids:
+                    invalid(
+                        "duplicate_region_identity",
+                        region_id=normalized_id,
+                        pages=sorted(
+                            {incoming_region_ids[normalized_id], page_import.page}
+                        ),
+                    )
+                incoming_region_ids[normalized_id] = page_import.page
+
+        surviving_region_ids: dict[str, tuple[str, int]] = {}
+        for owner_source, source_pages in destination.region_ids.items():
+            for owner_page, region_ids in source_pages.items():
+                if owner_source == source_id and owner_page in applied_set:
+                    continue
+                for region_id in region_ids:
+                    surviving_region_ids[region_id] = (owner_source, owner_page)
+        collisions = sorted(set(incoming_region_ids) & set(surviving_region_ids))
+        if collisions:
+            invalid(
+                "region_identity_conflict",
+                region_ids=collisions,
+                owners={
+                    region_id: {
+                        "source_id": surviving_region_ids[region_id][0],
+                        "page": surviving_region_ids[region_id][1],
+                    }
+                    for region_id in collisions
+                },
+            )
 
     @staticmethod
     def _receipt(
@@ -570,7 +1113,9 @@ class LibInterchangeService:
         command_sha256: str,
         plan: LibImportPlan,
     ) -> LibImportReceipt:
-        languages = tuple(sorted({value.language for value in plan.translations}))
+        languages = tuple(
+            sorted({value.language.lower() for value in plan.translations})
+        )
         return LibImportReceipt(
             operation_id=operation_id,
             archive_sha256=plan.archive_sha256,
@@ -585,6 +1130,15 @@ class LibInterchangeService:
             templates_added=tuple(sorted({value.name for value in plan.templates})),
             figures_added=tuple(sorted({value.name for value in plan.figures})),
             translations_added=languages,
+            compiled_pages=tuple(
+                sorted({value.page for value in plan.compiled_pages})
+            ),
+            documents_updated=tuple(
+                sorted({value.document for value in plan.compiled_pages})
+            ),
+            stylesheet_disposition=plan.stylesheet_disposition,
+            manifest_ext_disposition=plan.manifest_ext_disposition,
+            instructions_disposition=plan.instructions_disposition,
             warnings=tuple(plan.warnings),
         )
 
@@ -610,11 +1164,13 @@ class LibInterchangeService:
 
 
 __all__ = [
+    "ImportDisposition",
     "ImportDestinationSnapshot",
     "ImportLibCommand",
     "ImportWarning",
     "InterchangeRepositoryPort",
     "InterchangeUnitOfWorkPort",
+    "LibCompiledPageImport",
     "LibFigureImport",
     "LibImportPlan",
     "LibImportPlannerPort",

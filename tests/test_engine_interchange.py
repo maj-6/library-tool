@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 from contextlib import contextmanager
 
 import pytest
@@ -12,6 +13,7 @@ from librarytool.engine.interchange import (
     ImportDestinationSnapshot,
     ImportLibCommand,
     ImportWarning,
+    LibCompiledPageImport,
     LibFigureImport,
     LibImportPlan,
     LibImportReceipt,
@@ -40,15 +42,23 @@ class Planner:
             archive_sha256=archive_sha256,
             format_version="2.0",
             incoming_book_id="b-" + "a" * 32,
-            pages=(LibPageImport(3, {"items": [{"rid": "r-1"}]}),),
+            pages=(
+                LibPageImport(
+                    3,
+                    {"doc": "compiled.txt", "items": [{"rid": "r-1"}]},
+                ),
+            ),
             pages_skipped=(2,),
             pages_protected=(1,),
             templates=(LibTemplateImport("recto", {"items": []}),),
             figures=(LibFigureImport("plate.png", b"png"),),
-            translations=(
-                LibTranslationImport("fr", 3, "Bonjour"),
-                LibTranslationImport("fr", 4, "Monde"),
+            translations=(LibTranslationImport("fr", 3, "Bonjour"),),
+            compiled_pages=(
+                LibCompiledPageImport("compiled.txt", "primary", 3, "Text"),
             ),
+            stylesheet={"body": {"family": "serif"}},
+            manifest_ext={"example": {"edition": 1}},
+            instructions="Preserve the Latin plant names.",
             warnings=(ImportWarning("pages/1.json", "protected"),),
         )
 
@@ -114,6 +124,11 @@ def test_import_plans_inside_uow_and_commits_one_stable_receipt():
     assert receipt.templates_added == ("recto",)
     assert receipt.figures_added == ("plate.png",)
     assert receipt.translations_added == ("fr",)
+    assert receipt.compiled_pages == (3,)
+    assert receipt.documents_updated == ("compiled.txt",)
+    assert receipt.stylesheet_disposition == "imported"
+    assert receipt.manifest_ext_disposition == "imported"
+    assert receipt.instructions_disposition == "imported"
     assert receipt.as_dict()["warnings"] == [
         {"location": "pages/1.json", "message": "protected"}
     ]
@@ -239,10 +254,17 @@ def test_repository_destination_and_planner_hash_mismatches_fail_before_apply():
 
 def test_interchange_snapshots_and_plan_records_are_deeply_immutable():
     pages = {1: {"items": [{"rid": "r-1"}]}}
+    sources = ["primary", "scan-2"]
+    region_ids = {"primary": {1: ["r-1"]}, "scan-2": {4: ["r-4"]}}
+    document_sources = {"compiled.txt": "primary"}
     snapshot = ImportDestinationSnapshot(
         item_id="book-1",
+        source_ids=sources,
         pages=pages,
+        region_ids=region_ids,
         translation_pages={"fr": [1, 2]},
+        instructions="Keep names in Latin.",
+        document_sources=document_sources,
     )
     record = {"items": [{"rid": "r-2"}]}
     stylesheet = {"body": {"font": "serif"}}
@@ -254,10 +276,18 @@ def test_interchange_snapshots_and_plan_records_are_deeply_immutable():
     )
 
     pages[1]["items"][0]["rid"] = "changed"
+    sources.append("later")
+    region_ids["primary"][1][0] = "changed"
+    document_sources["compiled.txt"] = "scan-2"
     record["items"][0]["rid"] = "changed"
     stylesheet["body"]["font"] = "sans"
 
     assert snapshot.pages[1]["items"][0]["rid"] == "r-1"
+    assert snapshot.source_ids == ("primary", "scan-2")
+    assert snapshot.region_ids["primary"][1] == ("r-1",)
+    assert snapshot.document_sources["compiled.txt"] == "primary"
+    assert snapshot.instructions == "Keep names in Latin."
+    assert snapshot.has_instructions is True
     assert snapshot.translation_pages["fr"] == (1, 2)
     assert plan.pages[0].record["items"][0]["rid"] == "r-2"
     assert plan.stylesheet["body"]["font"] == "serif"
@@ -265,6 +295,82 @@ def test_interchange_snapshots_and_plan_records_are_deeply_immutable():
         snapshot.pages[1]["new"] = True
     with pytest.raises(TypeError):
         plan.stylesheet["body"]["font"] = "mono"
+    with pytest.raises(TypeError):
+        snapshot.region_ids["primary"][1] = ("new",)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: ImportDestinationSnapshot(
+            item_id="book", source_ids=("primary", "primary")
+        ),
+        lambda: ImportDestinationSnapshot(
+            item_id="book",
+            source_ids=("primary",),
+            region_ids={"unknown": {1: ("r-1",)}},
+        ),
+        lambda: ImportDestinationSnapshot(
+            item_id="book",
+            source_ids=("primary", "scan-2"),
+            region_ids={
+                "primary": {1: ("shared",)},
+                "scan-2": {2: ("shared",)},
+            },
+        ),
+        lambda: ImportDestinationSnapshot(
+            item_id="book",
+            source_ids=("primary",),
+            document_sources={"compiled.txt": "unknown"},
+        ),
+        lambda: ImportDestinationSnapshot(
+            item_id="book",
+            source_ids=("primary",),
+            document_sources={"../compiled.txt": "primary"},
+        ),
+        lambda: ImportDestinationSnapshot(item_id="book", templates=(42,)),
+        lambda: ImportDestinationSnapshot(
+            item_id="book", figures=("Plate.png", "plate.png")
+        ),
+        lambda: ImportDestinationSnapshot(item_id="book", instructions=42),
+    ],
+)
+def test_destination_ownership_contract_rejects_ambiguous_state(factory):
+    with pytest.raises((TypeError, ValueError)):
+        factory()
+
+
+def test_unknown_destination_source_is_rejected_before_planning():
+    planner = Planner()
+    repository = Repository()
+    service = LibInterchangeService(planner, repository)
+
+    with pytest.raises(ValidationError) as caught:
+        service.import_lib(
+            ImportLibCommand(
+                "book-1",
+                "scan-2",
+                b"portable-edition",
+                operation_id="import:unknown-source",
+            )
+        )
+
+    assert caught.value.code == "unknown_source_id"
+    assert planner.calls == []
+    assert repository.unit.applied == []
+
+
+def test_archive_book_identity_mismatch_is_a_conflict_before_staging():
+    repository = Repository()
+    repository.unit.destination = ImportDestinationSnapshot(
+        item_id="book-1", book_id="b-" + "b" * 32
+    )
+
+    with pytest.raises(ConflictError) as caught:
+        LibInterchangeService(Planner(), repository).import_lib(command())
+
+    assert caught.value.code == "book_identity_mismatch"
+    assert repository.unit.applied == []
 
 
 @pytest.mark.parametrize(
@@ -336,6 +442,86 @@ def test_interchange_text_contracts_reject_non_strings(factory):
                 ),
             ),
         ),
+        (
+            "translation_page_not_applied",
+            lambda digest: LibImportPlan(
+                archive_sha256=digest,
+                format_version="2.0",
+                translations=(LibTranslationImport("fr", 7, "Bonjour"),),
+            ),
+        ),
+        (
+            "missing_disposition_payload",
+            lambda digest: LibImportPlan(
+                archive_sha256=digest,
+                format_version="2.0",
+                stylesheet_disposition="imported",
+            ),
+        ),
+        (
+            "unexpected_disposition_payload",
+            lambda digest: LibImportPlan(
+                archive_sha256=digest,
+                format_version="2.0",
+                stylesheet={"body": {"family": "serif"}},
+                stylesheet_disposition="kept",
+            ),
+        ),
+        (
+            "compiled_page_not_applied",
+            lambda digest: LibImportPlan(
+                archive_sha256=digest,
+                format_version="2.0",
+                compiled_pages=(
+                    LibCompiledPageImport("compiled.txt", "primary", 4, "Text"),
+                ),
+            ),
+        ),
+        (
+            "duplicate_compiled_page",
+            lambda digest: LibImportPlan(
+                archive_sha256=digest,
+                format_version="2.0",
+                pages=(LibPageImport(4, {"items": []}),),
+                compiled_pages=(
+                    LibCompiledPageImport("first.txt", "primary", 4, "One"),
+                    LibCompiledPageImport("second.txt", "primary", 4, "Two"),
+                ),
+            ),
+        ),
+        (
+            "compiled_source_mismatch",
+            lambda digest: LibImportPlan(
+                archive_sha256=digest,
+                format_version="2.0",
+                pages=(LibPageImport(4, {"items": []}),),
+                compiled_pages=(
+                    LibCompiledPageImport("compiled.txt", "scan-2", 4, "Text"),
+                ),
+            ),
+        ),
+        (
+            "compiled_document_mismatch",
+            lambda digest: LibImportPlan(
+                archive_sha256=digest,
+                format_version="2.0",
+                pages=(LibPageImport(4, {"doc": "expected.txt", "items": []}),),
+                compiled_pages=(
+                    LibCompiledPageImport("other.txt", "primary", 4, "Text"),
+                ),
+            ),
+        ),
+        (
+            "duplicate_region_identity",
+            lambda digest: LibImportPlan(
+                archive_sha256=digest,
+                format_version="2.0",
+                pages=(
+                    LibPageImport(1, {"items": [{"rid": "shared"}]}),
+                    LibPageImport(2, {"items": [{"rid": "shared"}]}),
+                ),
+            ),
+        ),
     ],
 )
 def test_malformed_planner_results_fail_before_staging(reason, factory):
@@ -351,3 +537,147 @@ def test_malformed_planner_results_fail_before_staging(reason, factory):
     assert caught.value.code == "invalid_import_plan"
     assert caught.value.details["reason"] == reason
     assert repository.unit.applied == []
+
+
+def test_plan_cannot_reuse_a_region_identity_owned_by_another_source():
+    class CollisionPlanner:
+        def plan(self, archive, _destination, **_kwargs):
+            return LibImportPlan(
+                archive_sha256=hashlib.sha256(archive).hexdigest(),
+                format_version="2.0",
+                pages=(LibPageImport(3, {"items": [{"rid": "shared-rid"}]}),),
+            )
+
+    repository = Repository()
+    repository.unit.destination = ImportDestinationSnapshot(
+        item_id="book-1",
+        source_ids=("primary", "scan-2"),
+        region_ids={"scan-2": {8: ("shared-rid",)}},
+    )
+
+    with pytest.raises(RepositoryError) as caught:
+        LibInterchangeService(CollisionPlanner(), repository).import_lib(command())
+
+    assert caught.value.details["reason"] == "region_identity_conflict"
+    assert caught.value.details["owners"]["shared-rid"] == {
+        "source_id": "scan-2",
+        "page": 8,
+    }
+    assert repository.unit.applied == []
+
+
+def test_replacing_a_page_may_preserve_the_region_id_that_page_owned():
+    repository = Repository()
+    repository.unit.destination = ImportDestinationSnapshot(
+        item_id="book-1",
+        region_ids={"primary": {3: ("r-1",)}},
+    )
+
+    receipt = LibInterchangeService(Planner(), repository).import_lib(command())
+
+    assert receipt.pages_applied == (3,)
+    assert len(repository.unit.applied) == 1
+
+
+def test_compiled_document_cannot_be_rebound_to_another_source():
+    repository = Repository()
+    repository.unit.destination = ImportDestinationSnapshot(
+        item_id="book-1",
+        source_ids=("primary", "scan-2"),
+        document_sources={"compiled.txt": "scan-2"},
+    )
+
+    with pytest.raises(RepositoryError) as caught:
+        LibInterchangeService(Planner(), repository).import_lib(command())
+
+    assert caught.value.details["reason"] == "document_source_conflict"
+    assert repository.unit.applied == []
+
+
+@pytest.mark.parametrize(
+    ("destination", "plan", "reason"),
+    [
+        (
+            ImportDestinationSnapshot(item_id="book-1"),
+            LibImportPlan(
+                archive_sha256="0" * 64,
+                format_version="2.0",
+                stylesheet_disposition="kept",
+            ),
+            "kept_artifact_missing",
+        ),
+        (
+            ImportDestinationSnapshot(item_id="book-1", has_stylesheet=True),
+            LibImportPlan(
+                archive_sha256="0" * 64,
+                format_version="2.0",
+                stylesheet={"body": {"family": "serif"}},
+            ),
+            "overwrite_required",
+        ),
+        (
+            ImportDestinationSnapshot(
+                item_id="book-1", instructions="Existing guidance"
+            ),
+            LibImportPlan(
+                archive_sha256="0" * 64,
+                format_version="2.0",
+                instructions="Incoming guidance",
+            ),
+            "overwrite_required",
+        ),
+    ],
+)
+def test_artifact_dispositions_respect_locked_destination_state(
+    destination, plan, reason
+):
+    class StaticPlanner:
+        def plan(self, archive, _destination, **_kwargs):
+            return LibImportPlan(
+                archive_sha256=hashlib.sha256(archive).hexdigest(),
+                format_version=plan.format_version,
+                stylesheet=plan.stylesheet,
+                instructions=plan.instructions,
+                stylesheet_disposition=plan.stylesheet_disposition,
+                instructions_disposition=plan.instructions_disposition,
+            )
+
+    repository = Repository()
+    repository.unit.destination = destination
+
+    with pytest.raises(RepositoryError) as caught:
+        LibInterchangeService(StaticPlanner(), repository).import_lib(command())
+
+    assert caught.value.details["reason"] == reason
+    assert repository.unit.applied == []
+
+
+def test_receipt_strict_persistence_round_trip_and_schema_rejection():
+    receipt = LibInterchangeService(Planner(), Repository()).import_lib(command())
+    payload = receipt.as_dict()
+
+    assert LibImportReceipt.from_dict(payload) == receipt
+
+    invalid_payloads = []
+    extra = copy.deepcopy(payload)
+    extra["unexpected"] = True
+    invalid_payloads.append(extra)
+    missing = copy.deepcopy(payload)
+    missing.pop("command_sha256")
+    invalid_payloads.append(missing)
+    coerced_boolean = copy.deepcopy(payload)
+    coerced_boolean["overwrite"] = 0
+    invalid_payloads.append(coerced_boolean)
+    bad_page = copy.deepcopy(payload)
+    bad_page["compiled_pages"] = ["3"]
+    invalid_payloads.append(bad_page)
+    bad_disposition = copy.deepcopy(payload)
+    bad_disposition["stylesheet_disposition"] = "replaced"
+    invalid_payloads.append(bad_disposition)
+    bad_warning = copy.deepcopy(payload)
+    bad_warning["warnings"][0]["extra"] = "not allowed"
+    invalid_payloads.append(bad_warning)
+
+    for invalid in invalid_payloads:
+        with pytest.raises((TypeError, ValueError)):
+            LibImportReceipt.from_dict(invalid)
