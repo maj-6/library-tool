@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping, MutableMapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -327,6 +328,58 @@ class JobManager:
 
     def active(self) -> list[dict[str, Any]]:
         return self.list(states=ACTIVE_JOB_STATES)
+
+    @contextmanager
+    def item_deletion_guard(self, item_id: str):
+        """Reserve an idle item against concurrent job registration.
+
+        The caller must enter this guard only after acquiring the shared
+        item/workspace mutation gate, and must retain both through lifecycle
+        commit. Job starts must acquire that same outer gate, revalidate the
+        live item, and then call :meth:`track`. This lock ordering makes the
+        active-job check and registration mutually exclusive without teaching
+        the lifecycle service about provider-specific job kinds.
+
+        No other ``JobManager`` method may be called by the guarded thread
+        while the context is active because the manager lock is deliberately
+        non-reentrant.
+        """
+
+        item_id = str(item_id or "").strip()
+        if not item_id:
+            raise ValidationError(
+                "item id is required",
+                code="item_id_required",
+            )
+        self._lock.acquire()
+        try:
+            blockers = []
+            for job in self._records.values():
+                state = str(job.get("state") or self.state_of(job.get("status")))
+                if state not in ACTIVE_JOB_STATES:
+                    continue
+                subject = self._subject(job)
+                if subject.item_id != item_id:
+                    continue
+                blockers.append(
+                    {
+                        "job_id": str(job.get("id") or ""),
+                        "kind": str(job.get("kind") or ""),
+                        "state": state,
+                    }
+                )
+            if blockers:
+                blockers.sort(
+                    key=lambda row: (row["kind"], row["job_id"])
+                )
+                raise ConflictError(
+                    "active jobs prevent item deletion",
+                    code="item_jobs_active",
+                    details={"item_id": item_id, "jobs": blockers},
+                )
+            yield
+        finally:
+            self._lock.release()
 
     def events_after(self, sequence: int, *, limit: int = 200) -> tuple[JobEvent, ...]:
         """Return bounded in-process lifecycle events after a client cursor."""

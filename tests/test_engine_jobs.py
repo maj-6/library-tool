@@ -292,6 +292,69 @@ def test_duplicate_live_id_is_rejected_without_replacing_worker_record():
     assert jobs.records["same-id"] is first
 
 
+def test_item_deletion_guard_blocks_every_active_job_for_the_item():
+    jobs = manager()
+    jobs.track(
+        {
+            "id": "analysis",
+            "subject": {"item_id": "book", "source_id": "primary"},
+        },
+        "summarize",
+    )
+    jobs.track({"id": "other", "build_id": "other-book"}, "publish")
+
+    with pytest.raises(ConflictError) as caught:
+        with jobs.item_deletion_guard("book"):
+            raise AssertionError("an active job must prevent entry")
+
+    assert caught.value.code == "item_jobs_active"
+    assert caught.value.details == {
+        "item_id": "book",
+        "jobs": [
+            {"job_id": "analysis", "kind": "summarize", "state": "running"}
+        ],
+    }
+
+
+def test_item_deletion_guard_ignores_finished_and_other_item_jobs():
+    jobs = manager()
+    finished = {"id": "finished", "build_id": "book"}
+    jobs.track(finished, "ocr")
+    jobs.transition(finished, "done")
+    jobs.track({"id": "other", "build_id": "other-book"}, "publish")
+
+    with jobs.item_deletion_guard("book"):
+        pass
+
+
+def test_item_deletion_guard_serializes_concurrent_job_registration():
+    jobs = manager()
+    started = threading.Event()
+    finished = threading.Event()
+    failures: list[BaseException] = []
+
+    def register() -> None:
+        started.set()
+        try:
+            jobs.track({"id": "later", "build_id": "book"}, "ocr")
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+        finally:
+            finished.set()
+
+    with jobs.item_deletion_guard("book"):
+        worker = threading.Thread(target=register)
+        worker.start()
+        assert started.wait(1)
+        assert not finished.wait(0.05)
+
+    assert finished.wait(1)
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert failures == []
+    assert jobs.get("later") is not None
+
+
 def test_filesystem_history_adapter_uses_injected_atomic_json_callbacks(tmp_path: Path):
     path = tmp_path / "output" / "jobs.json"
 

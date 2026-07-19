@@ -178,6 +178,42 @@ class ManagedTreeSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class ItemLifecycleState:
+    """Consistent preflight state for one live lifecycle aggregate.
+
+    The repository reads both snapshots under the same isolation scope used
+    by lifecycle commands.  Clients can therefore carry these two revisions
+    into a conditional delete without a transport reaching around the engine
+    to inspect filesystem state.
+    """
+
+    item: LifecycleItemSnapshot
+    managed_tree: ManagedTreeSnapshot
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.item, LifecycleItemSnapshot):
+            raise TypeError("item must be a LifecycleItemSnapshot")
+        if not isinstance(self.managed_tree, ManagedTreeSnapshot):
+            raise TypeError("managed_tree must be a ManagedTreeSnapshot")
+        if self.item.item_id != self.managed_tree.item_id:
+            raise ValueError("lifecycle state identities do not match")
+
+    @classmethod
+    def from_dict(cls, value: Any) -> ItemLifecycleState:
+        value = _fields(value, {"item", "managed_tree"}, "lifecycle state")
+        return cls(
+            item=LifecycleItemSnapshot.from_dict(value["item"]),
+            managed_tree=ManagedTreeSnapshot.from_dict(value["managed_tree"]),
+        )
+
+    def as_dict(self) -> dict[str, dict[str, str]]:
+        return {
+            "item": self.item.as_dict(),
+            "managed_tree": self.managed_tree.as_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ItemTombstoneSnapshot:
     """Durable lifecycle state for one deleted item and its managed tree."""
 
@@ -474,6 +510,10 @@ class ItemLifecycleUnitOfWorkPort(Protocol):
 class ItemLifecycleRepositoryPort(Protocol):
     """Open one operation-scoped, isolated lifecycle unit of work."""
 
+    def inspect(self, item_id: str) -> ItemLifecycleState | None:
+        """Read coherent live item/tree state under lifecycle isolation."""
+        ...
+
     def unit_of_work(
         self, *, operation_id: str
     ) -> ContextManager[ItemLifecycleUnitOfWorkPort]: ...
@@ -484,6 +524,34 @@ class ItemLifecycleService:
 
     def __init__(self, repository: ItemLifecycleRepositoryPort) -> None:
         self._repository = repository
+
+    def inspect(self, item_id: str) -> ItemLifecycleState:
+        """Return the two revision tokens required for a conditional delete."""
+
+        item_id = self._item_id(item_id)
+        try:
+            state = self._repository.inspect(item_id)
+            if state is None:
+                raise NotFoundError(
+                    "item not found",
+                    code="item_not_found",
+                    details={"item_id": item_id},
+                )
+            if not isinstance(state, ItemLifecycleState):
+                raise RepositoryError(
+                    "the lifecycle repository returned an invalid state",
+                    code="invalid_item_lifecycle_state",
+                )
+            if state.item.item_id != item_id:
+                raise RepositoryError(
+                    "the lifecycle repository returned the wrong item state",
+                    code="invalid_item_lifecycle_state",
+                )
+            return state
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise self._repository_failure(exc) from exc
 
     def delete(self, command: DeleteItemCommand) -> ItemLifecycleResult:
         if not isinstance(command, DeleteItemCommand):
@@ -1020,6 +1088,7 @@ __all__ = [
     "ItemLifecycleRepositoryPort",
     "ItemLifecycleResult",
     "ItemLifecycleService",
+    "ItemLifecycleState",
     "ItemLifecycleUnitOfWorkPort",
     "ItemTombstoneSnapshot",
     "LifecycleItemSnapshot",

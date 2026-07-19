@@ -20,6 +20,7 @@ from librarytool.engine.item_lifecycle import (
     ItemLifecycleReceipt,
     ItemLifecycleResult,
     ItemLifecycleService,
+    ItemLifecycleState,
     ItemTombstoneSnapshot,
     LifecycleItemSnapshot,
     ManagedTreeSnapshot,
@@ -163,7 +164,22 @@ class FakeLifecycleRepository:
     def __init__(self, unit: FakeLifecycleUnit | None = None) -> None:
         self.unit = unit or FakeLifecycleUnit()
         self.operations: list[str] = []
+        self.inspections: list[str] = []
+        self.inspect_value = _DEFAULT
         self.error: Exception | None = None
+
+    def inspect(self, item_id: str):
+        self.inspections.append(item_id)
+        if self.error is not None:
+            raise self.error
+        if self.inspect_value is not _DEFAULT:
+            return self.inspect_value
+        if self.unit.item is None:
+            return None
+        return ItemLifecycleState(
+            item=self.unit.item,
+            managed_tree=self.unit.tree,
+        )
 
     @contextmanager
     def unit_of_work(self, *, operation_id: str):
@@ -258,6 +274,65 @@ def test_item_and_managed_tree_snapshots_round_trip(snapshot_factory) -> None:
         snapshot_factory(item_id="../escape")
     with pytest.raises(ValueError, match="revision"):
         snapshot_factory(revision="bad revision")
+
+
+def test_lifecycle_state_round_trips_and_requires_one_identity() -> None:
+    state = ItemLifecycleState(item=_item(), managed_tree=_tree())
+
+    assert ItemLifecycleState.from_dict(state.as_dict()) == state
+    with pytest.raises(ValueError, match="fields"):
+        ItemLifecycleState.from_dict({**state.as_dict(), "extra": True})
+    with pytest.raises(ValueError, match="identities"):
+        ItemLifecycleState(item=_item(), managed_tree=_tree("other"))
+
+
+def test_inspect_returns_coherent_delete_preconditions() -> None:
+    repository = FakeLifecycleRepository()
+    service = ItemLifecycleService(repository)
+
+    state = service.inspect("book-1")
+
+    assert state == ItemLifecycleState(item=_item(), managed_tree=_tree())
+    assert repository.inspections == ["book-1"]
+    assert repository.operations == []
+
+
+def test_inspect_validates_identity_absence_and_repository_outcome() -> None:
+    repository = FakeLifecycleRepository(FakeLifecycleUnit(item=None, tree=None))
+    service = ItemLifecycleService(repository)
+
+    with pytest.raises(NotFoundError) as missing:
+        service.inspect("book-1")
+    assert missing.value.code == "item_not_found"
+
+    repository.inspect_value = object()
+    with pytest.raises(RepositoryError) as malformed:
+        service.inspect("book-1")
+    assert malformed.value.code == "invalid_item_lifecycle_state"
+
+    repository.inspect_value = ItemLifecycleState(
+        item=_item("other"),
+        managed_tree=_tree("other"),
+    )
+    with pytest.raises(RepositoryError) as wrong_item:
+        service.inspect("book-1")
+    assert wrong_item.value.code == "invalid_item_lifecycle_state"
+
+
+def test_inspect_validates_input_and_wraps_unexpected_repository_failure() -> None:
+    repository = FakeLifecycleRepository()
+    service = ItemLifecycleService(repository)
+
+    with pytest.raises(ValidationError) as invalid:
+        service.inspect("../escape")
+    assert invalid.value.code == "invalid_item_id"
+    assert repository.inspections == []
+
+    repository.error = OSError("offline")
+    with pytest.raises(RepositoryError) as unavailable:
+        service.inspect("book-1")
+    assert unavailable.value.code == "item_lifecycle_repository_unavailable"
+    assert unavailable.value.retryable is True
 
 
 def test_tombstone_round_trip_and_state_invariants() -> None:
