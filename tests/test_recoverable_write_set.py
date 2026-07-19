@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import stat
+import threading
 from pathlib import Path
 
 import pytest
@@ -437,3 +438,34 @@ def test_stage_write_accepts_explicit_mutable_bytes_like_payloads(tmp_path):
     transaction.commit()
 
     assert (tmp_path / "payload.bin").read_bytes() == b"original"
+
+
+def test_workspace_lease_spans_snapshot_through_reentrant_commit(tmp_path):
+    store = RecoverableWriteSet(tmp_path)
+
+    with store.workspace_lease():
+        transaction = store.begin(operation_id="leased-import")
+        transaction.stage_write("item/layout.json", b"complete")
+        transaction.commit(receipt={"ok": True})
+
+    assert (tmp_path / "item" / "layout.json").read_bytes() == b"complete"
+
+
+def test_workspace_lease_blocks_competing_threads_until_planning_finishes(tmp_path):
+    store = RecoverableWriteSet(tmp_path)
+    attempted = threading.Event()
+    completed = threading.Event()
+
+    def compete():
+        attempted.set()
+        store.begin(operation_id="competing")
+        completed.set()
+
+    with store.workspace_lease():
+        worker = threading.Thread(target=compete)
+        worker.start()
+        assert attempted.wait(1)
+        assert not completed.wait(0.05)
+
+    worker.join(timeout=1)
+    assert completed.is_set()

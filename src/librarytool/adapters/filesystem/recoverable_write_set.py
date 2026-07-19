@@ -132,7 +132,23 @@ class RecoverableWriteSet:
             )
         self.lock_path = self.transactions_dir / "workspace.lock"
         self._thread_lock = _process_lock(self.lock_path)
+        self._lock_state = threading.local()
         self._publish_hook = publish_hook
+
+    @contextmanager
+    def workspace_lease(self) -> Iterator[None]:
+        """Hold the cross-process write lease across snapshot and commit.
+
+        Repository adapters use this when merge decisions depend on a live
+        destination snapshot. Calls to ``begin``, ``prepare``, and ``commit``
+        on this same instance are reentrant inside the lease, so no competing
+        process can change write-set-managed state between planning and
+        publication.
+        """
+
+        with self._workspace_lock():
+            self._assert_recovery_clear_locked()
+            yield
 
     def begin(
         self,
@@ -618,12 +634,22 @@ class RecoverableWriteSet:
     @contextmanager
     def _workspace_lock(self) -> Iterator[None]:
         with self._thread_lock:
-            self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.lock_path.open("a+b") as stream:
-                _lock_stream(stream)
+            depth = int(getattr(self._lock_state, "depth", 0))
+            if depth:
+                self._lock_state.depth = depth + 1
                 try:
                     yield
                 finally:
+                    self._lock_state.depth = depth
+                return
+            self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.lock_path.open("a+b") as stream:
+                _lock_stream(stream)
+                self._lock_state.depth = 1
+                try:
+                    yield
+                finally:
+                    self._lock_state.depth = 0
                     _unlock_stream(stream)
 
 
