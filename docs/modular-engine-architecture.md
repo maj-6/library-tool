@@ -2,12 +2,13 @@
 
 Status: **accepted direction; incremental implementation underway**
 (updated 2026-07-19). The target workbench split is not complete, but the
-engine/client boundary described here now has a working first vertical.
+engine/client boundary described here now has several production verticals.
 
 ## Implementation baseline (2026-07-19)
 
-The first Replica integrity/service slice now exists, while the larger
-workbench split described below remains the target architecture:
+Replica, catalogue query/command, translation, jobs, capabilities, and
+existing-item interchange now cross engine boundaries in production. The
+larger workbench and packaging split described below remains the target:
 
 - `tools/replica_service.py` is framework-neutral and owns content revisions,
   protected-page policy, proposal envelopes/apply policy, deterministic legacy
@@ -33,10 +34,10 @@ workbench split described below remains the target architecture:
   safer to replace, but it is still the transitional client—not the proposed
   manager plus independent workbench architecture.
 - `src/librarytool` is now an installable, framework-neutral package with
-  structured commands/results/errors, item and repository ports, an explicit
-  Replica unit of work, text-layer and translation services, and a callback-
-  configured atomic filesystem adapter. It imports neither Flask nor the
-  transitional `tools` modules.
+  structured commands/results/errors, item and repository ports, explicit
+  Replica, interchange, translation, and item-command units of work, text-
+  layer services, and callback-configured filesystem adapters. It imports
+  neither Flask nor the transitional `tools` modules.
 - Region CRUD, proposal review, layout-family proposals, and region
   recompilation run through `ReplicaApplicationService`. Flask retains the
   existing URLs as a compatibility transport and maps structured engine
@@ -54,7 +55,10 @@ workbench split described below remains the target architecture:
 - A module/capability registry resolves required and optional dependencies and
   reports available, degraded, or blocked modules/workbenches through
   `/api/v1/capabilities`. This is the first executable foundation for a future
-  launcher hiding tools whose required components are absent.
+  launcher hiding tools whose required components are absent. Modules are
+  independently composable in the service graph today, but they are still
+  shipped together; separately installable packages and signed bundles remain
+  a packaging milestone, not a current product claim.
 - The catalogue spine now has framework-neutral, immutable item,
   representation, artifact, and workbench-state queries. Item responses carry
   separate record and aggregate revisions, derive artifact freshness from
@@ -68,8 +72,30 @@ workbench split described below remains the target architecture:
   `EngineClient.items` is their browser boundary. The old workbench's initial
   build load uses an explicit compatibility projection, while default item
   DTOs expose opaque representation resource identities instead of attached
-  filesystem paths. Existing create/edit/delete routes remain unchanged for a
-  later command-side slice.
+  filesystem paths.
+- Catalogue-only create and update now also cross the engine. Immutable
+  `ItemDraft`, `ItemPatch`, command, snapshot, and receipt contracts are backed
+  by a recoverable filesystem repository with durable replay receipts,
+  cross-process serialization, allocation checks, tombstone support, rollback,
+  and restart recovery. Production `POST /api/v1/items` and
+  `PATCH /api/v1/items/{id}` require a portable `Idempotency-Key`; update also
+  requires strong record-level `If-Record-Match`. `EngineClient.items` owns
+  the same contract. The production routes intentionally accept catalogue
+  metadata only: representation attachment and item delete/restore are not
+  migrated, even though the engine kernel and repository include a delete
+  primitive. The transitional catalogue editor has not adopted create/update
+  yet and still uses its legacy mutation routes.
+- The revisioned translation aggregate is now composed over the legacy entry
+  folders through `FilesystemTranslationRepository`. Versioned list/detail
+  resources and conditional page replacement expose authoritative current,
+  stale, untracked, missing, and orphaned selector status. A replacement must
+  match both the translation document and its resolved OCR source snapshot;
+  text, per-page provenance, and artifact provenance publish through one
+  recoverable write set. `EngineClient.translations` is the browser boundary,
+  and the current Replica preview reads aggregate summaries and stable page
+  selectors instead of parsing translation files itself. Provider-backed
+  generation remains on the legacy path and is not advertised as an engine
+  generation capability.
 - `.lib` import now has immutable command, plan, receipt, planner, repository,
   and unit-of-work contracts. The application service binds idempotency to the
   complete command and rejects malformed plugin plans before staging. A
@@ -79,8 +105,10 @@ workbench split described below remains the target architecture:
   Replica imports now use this boundary: the archive is completely validated
   before staging, and layout, compiled text, figures, styles, translations,
   provenance, and the durable receipt publish as one recoverable transaction.
-  New-item `/api/lib/open` remains on the compatibility path until item
-  creation itself has an engine-owned unit of work.
+  New-item `/api/lib/open` remains on the compatibility path: engine-owned
+  catalogue creation now exists, but opening a package still needs one
+  composite unit of work spanning item allocation, the catalogue, the entry
+  tree, and the import receipt.
 - A provider-neutral Knowledge kernel now models revisioned text corpora,
   stable selectors, lossless deterministic passages, canonical curation
   overlays, lexical evidence retrieval, and revision-pinned evaluation. Its
@@ -91,6 +119,12 @@ workbench split described below remains the target architecture:
 - Source execution, editable package installation, tests, and the PyInstaller
   sidecar now all include `src/`, so this boundary is part of the shipped
   runtime rather than a test-only package.
+- `LibraryEngine` is a transport-neutral service container, but production
+  adapter selection, legacy codecs, path resolution, lock injection, recovery,
+  and capability registration are still assembled inside
+  `tools/whl_explorer/server.py`. A reusable headless composition root has not
+  yet been extracted; alternate frontends cannot bootstrap the production
+  engine without importing the Flask application today.
 
 The automatic family detector is deliberately a proposal query. It clusters
 geometry and semantic roles, identifies medoid exemplars, separates recurring
@@ -108,37 +142,100 @@ service is now composed into `/api/v1`, and existing-item `.lib` import now
 demonstrates a recoverable multi-artifact transaction. The remaining
 compatibility route is preserved, while `EngineClient` now imports through the
 stable, idempotent `/api/v1/items/{id}/replica/lib-imports` resource and
-receives the complete durable receipt. The next integration step is to reuse
-the same transaction foundation for translation aggregates and new-item
-creation.
+receives the complete durable receipt. Translation reads and human page edits,
+plus catalogue-only item create/update, now demonstrate the same separation
+for two more workbench domains.
 
-### Translation aggregate decision
+### Translation aggregate boundary
 
-Translation generation must not be the next extraction boundary. The current
-generator selects source text, calls a provider, mutates page-marked text,
-updates provenance, and publishes job state from one Flask route. Moving only
-the provider call would leave alternate clients responsible for source
-selection and would preserve races between source edits, human translation
-edits, metadata writes, and generation.
+The scoped first provider-neutral translation vertical is in production. It
+lists translations, reads one coherent translation with authoritative status,
+and conditionally replaces one page. The engine, not its caller, resolves the OCR
+source layer and canvas text. The filesystem adapter retains compatible legacy
+documents and provenance while supplying stable aggregate identities,
+recoverable writes, strict storage validation, and one status definition
+across clients. Current, stale, untracked, missing, and orphaned selectors are
+derived from the source snapshot and are never accepted from a request.
 
-The first translation vertical is therefore a provider-neutral, revisioned
-aggregate with three operations: list translations, read one translation with
-authoritative status, and conditionally replace one page. The engine, not its
-caller, resolves the source layer and canvas text. A write must match both the
-translation document revision and the source snapshot revision; the filesystem
-adapter publishes text, page provenance, and artifact provenance through one
-recoverable write set. Status has one definition across clients: current,
-stale, untracked, missing, and orphaned selectors are derived from the same
-source snapshot and never accepted from a request.
-
-Provider-backed generation follows as a separate job/adapter slice. It will
-pin those two revisions, fingerprint its full recipe, preserve reviewed or
+Provider-backed generation is deliberately still separate and unfinished.
+The current generator selects source text, invokes a provider, mutates page-
+marked text, updates provenance, and publishes job state through legacy Flask
+logic. Moving only that provider call would make alternate clients reproduce
+source-selection policy and retain races between source edits, human edits,
+metadata, and generation. Its eventual engine job must pin the document and
+source revisions, fingerprint the complete recipe, preserve reviewed or
 untracked human work, avoid silent source truncation, and commit completed
-pages through the aggregate's conditional command. Capability discovery must
-advertise translation reading/editing independently of generation, and expose
-generation only when a compatible provider is actually installed and
-configured. This ordering gives the existing web client and future Qt, Godot,
-CLI, or automation clients identical translation integrity semantics.
+pages through the aggregate command. Capability discovery should advertise
+reading/editing independently and expose generation only for an installed,
+configured, healthy provider.
+
+### Revision and precondition semantics
+
+ETags and mutation preconditions name different scopes and must not be treated
+as interchangeable:
+
+- Collection, item, representation, artifact, readiness, and translation
+  responses use strong **aggregate ETags** for HTTP cache revalidation. The
+  value identifies the exact returned view, so it can change when a derived
+  status, projection, source layer, or child artifact changes even if the
+  catalogue record did not.
+- Item detail exposes its narrower canonical `record_revision` in the body and
+  as `X-Record-Revision`. Catalogue update uses that value in one strong
+  `If-Record-Match` header. Create and update also require
+  `Idempotency-Key`, whose replay identity is bound to the complete command.
+  An aggregate item ETag must never be sent as the record precondition.
+- Translation detail has a view ETag plus explicit `X-Document-Revision` and
+  `X-Source-Revision` headers. Page replacement requires both named resources:
+  strong `If-Document-Match` for the translation document and strong
+  `If-Source-Match` for the source snapshot. This prevents an edit based on
+  either stale translation text or stale OCR from silently winning.
+
+Named subresource validators are part of the semantic client contract, not a
+Flask convention. A future local IPC, Qt, Godot, or CLI transport must preserve
+the same scopes even if it does not use HTTP header syntax.
+
+### Production composition and ranked next boundaries
+
+The next architectural extraction is a reusable headless composition root.
+It should accept runtime configuration and installed-module descriptors,
+select adapters and provider ports, run workspace recovery, and return one
+`LibraryEngine` without importing Flask. Flask should receive that object just
+like a CLI daemon, Qt manager, Godot facsimile editor, or test harness. This is
+the practical test that `server.py` is a transport rather than the application.
+
+After that composition seam, migrate these data boundaries in order:
+
+1. **Composite item lifecycle.** Coordinate catalogue-only create with source
+   attachment and new-item `.lib` import, then move delete and restore behind
+   the same recoverable command boundary. One operation must cover allocation,
+   catalogue publication, entry-directory assets, receipts/tombstones, and
+   rollback. Do not implement `/api/lib/open` by nesting today's independent
+   item and interchange transactions; existing-item import can continue using
+   its already-atomic unit of work meanwhile.
+2. **Representation and canvas resources.** Replace attached filesystem paths
+   and page-number assumptions with opaque representation, asset, ordered
+   canvas, and structure identities. Add explicit attachment/detachment and
+   raster/text addressing commands before a new Replica UI or generalized
+   manuscript/audio workbench depends on them.
+3. **Text-layer aggregate.** Promote the current text-layer services and OCR
+   files into a persisted, revisioned aggregate with stable selectors,
+   provenance, conditional corrections, and derived-layer freshness. Replica,
+   translation, Knowledge/RAG, search, and export should consume this one
+   boundary rather than rediscovering compiled files independently.
+4. **Provider discovery and secrets.** Add provider descriptors, traits,
+   configuration/health probes, selection policy, and a masked/write-only
+   secret-store port. Only then migrate translation generation and remaining
+   OCR/AI jobs, advertising each optional command when its capability is truly
+   available rather than when a UI happens to contain a button.
+
+Capability modules remain the unit of dependency and discovery throughout
+this sequence. A module contributes services, commands, readiness policies,
+schemas/migrations, and capability declarations; workbenches depend on those
+versioned capabilities and degrade cleanly when optional ones are absent. The
+current single distribution can validate that graph before first-party modules
+become independently installable bundles. Physical package splitting must not
+precede workspace migration, signing/update policy, and unknown-extension
+round-trip tests.
 
 Companion documents:
 
@@ -367,7 +464,10 @@ pages; uncertainty is concentrated into the review queue.
 ### Translation access and semantics
 
 Translation is a first-class derived text layer, not a replacement for OCR or
-diplomatic transcription. Every generated layer records:
+diplomatic transcription. The production aggregate already centralizes
+source-relative status, coherent reads, and human page replacement; provider
+generation remains a legacy path. In the target contract, every generated
+layer records:
 
 - source layer and source content hashes;
 - scope, source and target languages, and user instructions;
@@ -803,6 +903,13 @@ time-boxed Qt or Godot client can be evaluated against the same acceptance
 fixture without risking the working store.
 
 ## Migration plan
+
+These phases describe dependency order, not a list of wholly unstarted work.
+The implementation baseline above records the partial completion of Phases
+0–3: the engine package, several filesystem adapters and services, capability
+and job contracts, selected `/api/v1` resources, and `EngineClient` exist.
+Headless production bootstrap, complete vertical migration, a reference CLI,
+the launcher/workbench split, and physical module bundles remain outstanding.
 
 ### Phase 0: record behavior and contracts
 

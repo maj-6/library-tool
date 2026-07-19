@@ -6,26 +6,39 @@ Per-component detail lives in each part's own README (map at the end).
 ## Components and their sources of truth
 
 - **Library Engine** (`src/librarytool/`) — framework-neutral application
-  services, contracts, capability manifests, and storage ports. The current
-  Flask sidecar is its first composition root and compatibility transport;
-  browser code reaches Replica operations through one `EngineClient`. The
-  engine package does not resolve `DATA_ROOT`, create files, or import Flask at
-  package import time. Installed modules and usable workbenches are discoverable
-  at `/api/v1/capabilities`. Background processors share the engine's
-  `JobManager` lifecycle, cancellation, restart-recovery, typed views, and
-  cursor events while their provider-specific executors remain adapters. The
-  catalogue read spine exposes immutable item/representation/artifact
-  aggregates with module-contributed workbench eligibility. Flask composes
-  that service at `/api/v1/items`; the browser's initial catalogue load now
-  crosses `EngineClient.items`, while its existing edit routes remain a
-  deliberate compatibility surface. Default item DTOs replace attached file
-  paths with opaque representation identities; only the explicitly requested
-  `build-workbench` projection carries the old local build record. Existing-
-  item `.lib` imports now cross a versioned `EngineClient` resource and publish
-  layout, text, figures, styles, translations, provenance, and a replayable
-  receipt through one recoverable multi-file unit of work. New-item creation
-  and the `/api/lib/open` compatibility flow remain the next catalogue command
-  boundary.
+  services, contracts, capability manifests, and storage ports. It imports
+  neither Flask nor the transitional `tools` modules, and it does not resolve
+  `DATA_ROOT` or create files at package-import time. `LibraryEngine` carries
+  the assembled optional service graph, but the only production assembly code
+  still lives in `tools/whl_explorer/server.py`; extracting that wiring into a
+  headless composition root is required before a CLI, Qt, Godot, or another
+  transport can bootstrap the same graph without importing Flask. The Flask
+  sidecar is currently both that composition host and a compatibility
+  transport, while browser workbenches cross one semantic `EngineClient`.
+  Installed capabilities and available/degraded/blocked workbenches are
+  discoverable at `/api/v1/capabilities`. Background processors share the
+  engine's `JobManager` lifecycle, cancellation, restart recovery, typed views,
+  and cursor events while provider execution remains behind adapters. The
+  catalogue query spine exposes immutable item, representation, artifact, and
+  readiness views. Its collection/detail ETags identify complete response
+  snapshots; item detail separately exposes `X-Record-Revision`, which
+  versioned catalogue updates must supply through strong
+  `If-Record-Match`. Catalogue-only create and update commands now run through
+  a recoverable filesystem repository and require replay-safe
+  `Idempotency-Key` values. Their `EngineClient` methods are ready, but the
+  transitional catalogue editor still uses legacy mutation routes. Default
+  DTOs replace attached paths with opaque representation identities; only the
+  explicit `build-workbench` projection carries the old local build record.
+  The translation aggregate now supplies
+  versioned list/detail/page-replacement resources, authoritative
+  current/stale/untracked/missing/orphaned status, dual document/source
+  preconditions, and recoverable text-plus-provenance publication; Replica's
+  preview consumes it through `EngineClient.translations`. Existing-item
+  `.lib` import likewise publishes layout, text, figures, styles,
+  translations, provenance, and a durable receipt in one recoverable
+  multi-file unit of work. Representation attachment, provider-backed
+  translation generation, the new-item `/api/lib/open` composite, and legacy
+  item delete/restore are not yet migrated to these command boundaries.
 - **Desktop app** — the workbench: an Electron shell (`desktop/`) that
   spawns the Flask sidecar (`tools/whl_explorer/server.py`) on a loopback
   port. Paths split into two roots (`tools/libcommon.py`): **`APP_ROOT`**,
