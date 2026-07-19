@@ -31,6 +31,10 @@ class DuplicateManifestError(ManifestValidationError):
     """Two registered manifests claim the same stable identifier."""
 
 
+class SealedRegistryError(ManifestValidationError):
+    """A resolved capability registry cannot be changed."""
+
+
 def _validate_id(value: str, field_name: str) -> None:
     if not isinstance(value, str) or not _ID_RE.fullmatch(value):
         raise ManifestValidationError(
@@ -133,6 +137,7 @@ class WorkbenchManifest:
     version: str
     requires: tuple[CapabilityRef, ...] = field(default_factory=tuple)
     enhances: tuple[CapabilityRef, ...] = field(default_factory=tuple)
+    owner_module: str = ""
 
     def __post_init__(self) -> None:
         _validate_id(self.id, "workbench id")
@@ -147,6 +152,41 @@ class WorkbenchManifest:
             )
         object.__setattr__(self, "requires", requires)
         object.__setattr__(self, "enhances", enhances)
+        if self.owner_module:
+            _validate_id(self.owner_module, "workbench owner module id")
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityResolution:
+    """Immutable result of resolving one installed module graph."""
+
+    active_module_ids: tuple[str, ...]
+    capabilities: tuple[CapabilityRef, ...]
+
+    def __post_init__(self) -> None:
+        try:
+            active = tuple(self.active_module_ids)
+        except TypeError as exc:
+            raise ManifestValidationError(
+                "active_module_ids must be an iterable"
+            ) from exc
+        for module_id in active:
+            _validate_id(module_id, "active module id")
+        if len(set(active)) != len(active):
+            raise ManifestValidationError(
+                "active_module_ids contains a duplicate module"
+            )
+        capabilities = _capability_tuple(
+            self.capabilities, "resolved capabilities"
+        )
+        object.__setattr__(self, "active_module_ids", tuple(sorted(active)))
+        object.__setattr__(self, "capabilities", capabilities)
+
+    def is_active(self, module_id: str) -> bool:
+        return module_id in self.active_module_ids
+
+    def provides(self, capability: CapabilityRef) -> bool:
+        return capability in self.capabilities
 
 
 def _capability_token(value: CapabilityRef) -> str:
@@ -169,12 +209,14 @@ class CapabilityRegistry:
     ) -> None:
         self._modules: dict[str, ModuleManifest] = {}
         self._workbenches: dict[str, WorkbenchManifest] = {}
+        self._sealed = False
         for manifest in modules:
             self.register_module(manifest)
         for manifest in workbenches:
             self.register_workbench(manifest)
 
     def register_module(self, manifest: ModuleManifest) -> None:
+        self._require_mutable()
         if not isinstance(manifest, ModuleManifest):
             raise ManifestValidationError("module must be a ModuleManifest")
         if manifest.id in self._modules:
@@ -182,6 +224,7 @@ class CapabilityRegistry:
         self._modules[manifest.id] = manifest
 
     def register_workbench(self, manifest: WorkbenchManifest) -> None:
+        self._require_mutable()
         if not isinstance(manifest, WorkbenchManifest):
             raise ManifestValidationError(
                 "workbench must be a WorkbenchManifest"
@@ -192,38 +235,33 @@ class CapabilityRegistry:
             )
         self._workbenches[manifest.id] = manifest
 
-    def discovery_document(self) -> dict[str, object]:
-        """Return ordinary JSON-shaped data in a stable, canonical order."""
-        active, capabilities = self._resolve_modules()
+    @property
+    def sealed(self) -> bool:
+        return self._sealed
 
-        providers: dict[CapabilityRef, list[str]] = {}
-        for module_id in sorted(active):
-            for capability in self._modules[module_id].provides:
-                providers.setdefault(capability, []).append(module_id)
+    def seal(self) -> CapabilityRegistry:
+        """Prevent later registrations and return this registry.
 
-        capability_rows = [
-            {
-                **capability.as_dict(),
-                "providers": sorted(providers[capability]),
-            }
-            for capability in sorted(providers)
-        ]
-        module_rows = [
-            self._module_row(self._modules[module_id], active, capabilities)
-            for module_id in sorted(self._modules)
-        ]
-        workbench_rows = [
-            self._workbench_row(self._workbenches[workbench_id], capabilities)
-            for workbench_id in sorted(self._workbenches)
-        ]
-        return {
-            "schema": self.SCHEMA,
-            "capabilities": capability_rows,
-            "modules": module_rows,
-            "workbenches": workbench_rows,
-        }
+        Mutable registration remains available for compatibility while a
+        composition root is being assembled. Runtime engines should expose a
+        sealed registry so their service graph and discovery document cannot
+        drift apart after construction.
+        """
 
-    def _resolve_modules(self) -> tuple[set[str], set[CapabilityRef]]:
+        self._sealed = True
+        return self
+
+    def sealed_copy(self) -> CapabilityRegistry:
+        """Return an independent immutable registry with the same manifests."""
+
+        return CapabilityRegistry(
+            modules=self._modules.values(),
+            workbenches=self._workbenches.values(),
+        ).seal()
+
+    def resolve(self) -> CapabilityResolution:
+        """Resolve installed modules into a stable immutable result."""
+
         active: set[str] = set()
         capabilities: set[CapabilityRef] = set()
         pending = set(self._modules)
@@ -243,7 +281,55 @@ class CapabilityRegistry:
             pending.difference_update(ready)
             for module_id in ready:
                 capabilities.update(self._modules[module_id].provides)
-        return active, capabilities
+        return CapabilityResolution(
+            active_module_ids=tuple(sorted(active)),
+            capabilities=tuple(sorted(capabilities)),
+        )
+
+    def _require_mutable(self) -> None:
+        if self._sealed:
+            raise SealedRegistryError("capability registry is sealed")
+
+    def discovery_document(self) -> dict[str, object]:
+        """Return ordinary JSON-shaped data in a stable, canonical order."""
+        resolution = self.resolve()
+        active = set(resolution.active_module_ids)
+        capabilities = set(resolution.capabilities)
+
+        providers: dict[CapabilityRef, list[str]] = {}
+        for module_id in sorted(active):
+            for capability in self._modules[module_id].provides:
+                providers.setdefault(capability, []).append(module_id)
+
+        capability_rows = [
+            {
+                **capability.as_dict(),
+                "providers": sorted(providers[capability]),
+            }
+            for capability in sorted(providers)
+        ]
+        module_rows = [
+            self._module_row(self._modules[module_id], active, capabilities)
+            for module_id in sorted(self._modules)
+        ]
+        workbench_rows = [
+            self._workbench_row(
+                self._workbenches[workbench_id], capabilities, active
+            )
+            for workbench_id in sorted(self._workbenches)
+        ]
+        return {
+            "schema": self.SCHEMA,
+            "capabilities": capability_rows,
+            "modules": module_rows,
+            "workbenches": workbench_rows,
+        }
+
+    def _resolve_modules(self) -> tuple[set[str], set[CapabilityRef]]:
+        """Compatibility wrapper for callers of the former private resolver."""
+
+        resolution = self.resolve()
+        return set(resolution.active_module_ids), set(resolution.capabilities)
 
     @staticmethod
     def _module_row(
@@ -283,6 +369,7 @@ class CapabilityRegistry:
     def _workbench_row(
         manifest: WorkbenchManifest,
         capabilities: set[CapabilityRef],
+        active_modules: set[str],
     ) -> dict[str, object]:
         missing_required = tuple(
             requirement
@@ -294,7 +381,11 @@ class CapabilityRegistry:
             for enhancement in manifest.enhances
             if enhancement not in capabilities
         )
-        if missing_required:
+        owner_available = (
+            not manifest.owner_module
+            or manifest.owner_module in active_modules
+        )
+        if not owner_available or missing_required:
             status = "blocked"
         elif missing_optional:
             status = "degraded"
@@ -304,7 +395,9 @@ class CapabilityRegistry:
             "id": manifest.id,
             "version": manifest.version,
             "status": status,
-            "visible": not missing_required,
+            "visible": owner_available and not missing_required,
+            "owner_module": manifest.owner_module,
+            "owner_available": owner_available,
             "requires": _refs_as_dicts(manifest.requires),
             "enhances": _refs_as_dicts(manifest.enhances),
             "missing_required": _refs_as_dicts(missing_required),
@@ -314,9 +407,11 @@ class CapabilityRegistry:
 
 __all__ = [
     "CapabilityRef",
+    "CapabilityResolution",
     "CapabilityRegistry",
     "DuplicateManifestError",
     "ManifestValidationError",
     "ModuleManifest",
+    "SealedRegistryError",
     "WorkbenchManifest",
 ]

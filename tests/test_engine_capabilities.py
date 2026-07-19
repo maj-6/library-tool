@@ -8,6 +8,7 @@ import pytest
 
 from librarytool.engine.capabilities import (
     CapabilityRef,
+    CapabilityResolution,
     CapabilityRegistry,
     DuplicateManifestError,
     ManifestValidationError,
@@ -70,6 +71,18 @@ def test_manifest_dependencies_are_immutable_unique_and_unambiguous():
             requires=(ITEMS,),
             enhances=(ITEMS,),
         )
+
+
+def test_public_resolution_normalizes_and_freezes_its_values():
+    resolution = CapabilityResolution(
+        ["z.module", "a.module"],
+        [REGIONS, ITEMS],
+    )
+    assert resolution.active_module_ids == ("a.module", "z.module")
+    assert resolution.capabilities == (ITEMS, REGIONS)
+
+    with pytest.raises(ManifestValidationError, match="duplicate module"):
+        CapabilityResolution(["a.module", "a.module"], [ITEMS])
 
 
 def test_duplicate_provider_id_is_rejected_but_alternatives_are_supported():

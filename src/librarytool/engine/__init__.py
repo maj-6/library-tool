@@ -2,8 +2,12 @@
 
 from .capabilities import (
     CapabilityRef,
+    CapabilityResolution,
     CapabilityRegistry,
+    DuplicateManifestError,
+    ManifestValidationError,
     ModuleManifest,
+    SealedRegistryError,
     WorkbenchManifest,
 )
 from .errors import (
@@ -71,7 +75,25 @@ from .item_commands import (
     UpdateItemCommand,
 )
 from .replica import ReplicaApplicationService
-from .runtime import LibraryEngine
+from .runtime import (
+    INTERCHANGE_SERVICE,
+    ITEM_COMMAND_SERVICE,
+    ITEM_QUERY_SERVICE,
+    JOB_SERVICE,
+    REPLICA_SERVICE,
+    TEXT_LAYER_SERVICE,
+    TRANSLATION_PROVENANCE_SERVICE,
+    TRANSLATION_SERVICE,
+    DuplicateServiceError,
+    LibraryEngine,
+    LibraryEngineBuilder,
+    ModuleContribution,
+    ServiceBinding,
+    ServiceKey,
+    ServiceNotFoundError,
+    ServiceRegistry,
+    ServiceRegistryError,
+)
 from .text_layers import TextLayerService
 from .translation_contracts import (
     ReplaceTranslationPageCommand,
@@ -96,6 +118,26 @@ from .translations import (
 from .workbench_policies import standard_workbench_policies
 
 __all__ = [
+    "CapabilityResolution",
+    "DuplicateManifestError",
+    "DuplicateServiceError",
+    "INTERCHANGE_SERVICE",
+    "ITEM_COMMAND_SERVICE",
+    "ITEM_QUERY_SERVICE",
+    "JOB_SERVICE",
+    "LibraryEngineBuilder",
+    "ManifestValidationError",
+    "ModuleContribution",
+    "REPLICA_SERVICE",
+    "SealedRegistryError",
+    "ServiceBinding",
+    "ServiceKey",
+    "ServiceNotFoundError",
+    "ServiceRegistry",
+    "ServiceRegistryError",
+    "TEXT_LAYER_SERVICE",
+    "TRANSLATION_PROVENANCE_SERVICE",
+    "TRANSLATION_SERVICE",
     "CapabilityRef",
     "CapabilityRegistry",
     "CanonicalTranslationPolicy",
