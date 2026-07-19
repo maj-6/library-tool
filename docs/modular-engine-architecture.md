@@ -77,6 +77,13 @@ workbench split described below remains the target architecture:
   cross-process locking, all-file publication or rollback, restart recovery,
   path/junction containment, and terminal receipt retention. The legacy
   importer has not yet been migrated onto this boundary.
+- A provider-neutral Knowledge kernel now models revisioned text corpora,
+  stable selectors, lossless deterministic passages, canonical curation
+  overlays, lexical evidence retrieval, and revision-pinned evaluation. Its
+  historical-text normalizer is versioned against the Unicode database, and
+  retrieval returns verbatim source-addressable evidence. Persistence,
+  versioned routes, cloud indexes, embeddings, and answer generation remain
+  deliberately outside this first local foundation.
 - Source execution, editable package installation, tests, and the PyInstaller
   sidecar now all include `src/`, so this boundary is part of the shipped
   runtime rather than a test-only package.
@@ -339,6 +346,42 @@ last valid choice and normally keeps that decision out of the way. A stale
 translation gets a small warning state and a one-action refresh. The preview
 switch can compare original, normalized, and translated layers without
 redistributing text in frontend-only code.
+
+## Research/RAG engine boundary
+
+The next non-Replica extraction should begin with deterministic passage
+generation, lexical retrieval, and evaluation. Cloud indexes, embeddings, and
+answer generation should remain adapters until the local corpus contract is
+sound. The current implementation has several integrity hazards that must not
+be copied into the engine:
+
+- a new `stable` cloud version becomes searchable before all passage batches
+  finish, so readers can observe an empty or partial index;
+- `passages.json` mixes rebuildable segmentation with human split, merge, and
+  exclusion decisions, allowing regeneration to destroy canonical curation;
+- passage IDs include their ordinal, so inserting earlier content invalidates
+  otherwise unchanged judgments and citations;
+- index freshness ignores recipe and curation revisions, while segmentation,
+  evaluation, and promotion do not recheck all pinned inputs at commit;
+- old evaluation metrics can be attached to a different corpus/index, and the
+  candidate being promoted is not actually the index that was evaluated;
+- answer routes can consume stale or excluded evidence and do not validate
+  returned citations against the evidence supplied to the model.
+
+The engine model should instead accept an explicit revisioned text corpus made
+of stable canvas/segment selectors. Derived base passages and canonical
+curation overlays are stored separately; materialization reports any curation
+that can no longer be reconciled. Passage identity is derived from stable
+selectors plus content, never list position. Evaluation runs pin the corpus,
+evaluation-set, normalization, and retriever revisions and become stale when
+any changes.
+
+An index backend is a candidate lifecycle rather than a collection of raw
+table writes: begin, batch, validate, search/evaluate the candidate, atomically
+promote it against the expected current version, or discard it. Only a
+completed promoted pointer is publicly selected. This contract works for a
+local index, Supabase, or an institutional service without putting cloud
+policy into the Knowledge workbench.
 
 ## The engine boundary
 
