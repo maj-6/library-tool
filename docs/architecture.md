@@ -13,7 +13,11 @@ Per-component detail lives in each part's own README (map at the end).
   package import time. Installed modules and usable workbenches are discoverable
   at `/api/v1/capabilities`. Background processors share the engine's
   `JobManager` lifecycle, cancellation, restart-recovery, typed views, and
-  cursor events while their provider-specific executors remain adapters.
+  cursor events while their provider-specific executors remain adapters. The
+  catalogue read spine exposes immutable item/representation/artifact
+  aggregates with module-contributed workbench eligibility; recoverable
+  multi-file write sets and `.lib` import unit-of-work contracts are available
+  for the next legacy-import migration.
 - **Desktop app** — the workbench: an Electron shell (`desktop/`) that
   spawns the Flask sidecar (`tools/whl_explorer/server.py`) on a loopback
   port. Paths split into two roots (`tools/libcommon.py`): **`APP_ROOT`**,

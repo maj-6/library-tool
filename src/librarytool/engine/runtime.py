@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .capabilities import CapabilityRegistry
+from .interchange import LibInterchangeService
+from .items import ItemQueryService
 from .jobs import JobManager
 from .replica import ReplicaApplicationService
 from .text_layers import TextLayerService
@@ -22,6 +24,8 @@ class LibraryEngine:
     """
 
     capabilities: CapabilityRegistry
+    items: ItemQueryService | None = None
+    interchange: LibInterchangeService | None = None
     jobs: JobManager | None = None
     replica: ReplicaApplicationService | None = None
     text_layers: TextLayerService | None = None

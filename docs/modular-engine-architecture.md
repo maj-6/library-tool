@@ -55,6 +55,20 @@ workbench split described below remains the target architecture:
   reports available, degraded, or blocked modules/workbenches through
   `/api/v1/capabilities`. This is the first executable foundation for a future
   launcher hiding tools whose required components are absent.
+- The catalogue spine now has framework-neutral, immutable item,
+  representation, artifact, and workbench-state queries. Item responses carry
+  separate record and aggregate revisions, derive artifact freshness from
+  source provenance, and accept independently installed readiness/command
+  policies. Replica, translation, research, publishing, and text-layer
+  eligibility are therefore contributed by modules rather than hardcoded into
+  the item model.
+- `.lib` import now has immutable command, plan, receipt, planner, repository,
+  and unit-of-work contracts. The application service binds idempotency to the
+  complete command and rejects malformed plugin plans before staging. A
+  filesystem write-set primitive provides private before/after journals,
+  cross-process locking, all-file publication or rollback, restart recovery,
+  path/junction containment, and terminal receipt retention. The legacy
+  importer has not yet been migrated onto this boundary.
 - Source execution, editable package installation, tests, and the PyInstaller
   sidecar now all include `src/`, so this boundary is part of the shipped
   runtime rather than a test-only package.
@@ -70,11 +84,12 @@ Its versioned, page-scoped command resolves the attached source and provider
 credentials in the engine, returns a stable job identity, and preserves
 protected work as a proposal. The workbench observes that job directly and
 distinguishes completion, failure, cancellation, and restart interruption; it
-no longer infers completion from browser-local OCR page markers. Next, the
-`.lib` importer needs a staged multi-file write set and recovery journal; the
-current unit of work is deliberately claimed atomic only for one Replica
-workspace JSON file, not for an arbitrary collection of assets and
-translations.
+no longer infers completion from browser-local OCR page markers. The next
+integration step is to compose the item query service into `/api/v1` and move
+the legacy `.lib` importer onto the new recoverable write set. Until that route
+migration lands, the current Replica unit of work is deliberately claimed
+atomic only for one workspace JSON file, not for an arbitrary collection of
+assets and translations.
 
 Companion documents:
 
