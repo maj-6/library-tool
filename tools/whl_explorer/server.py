@@ -6508,12 +6508,13 @@ def _unremap_page_attention_references(build_id: str, source_id: str,
                     values = {}
                     if name == "attention":
                         client["attention"] = values
-                    elif isinstance(settings, dict):
-                        settings["remarksMeta"] = values
                     else:
-                        warnings.append(
-                            "personal attention marks could not be put back")
-                        continue
+                        # `settings` can be missing outright, not just missing
+                        # its remarksMeta — materialize both rather than
+                        # leaving the same hole open for the other bucket
+                        if not isinstance(settings, dict):
+                            settings = client.setdefault("settings", {})
+                        settings["remarksMeta"] = values
                 moves = []
                 for key, value in list(values.items()):
                     parts = _page_remark_ref_parts(key)
@@ -6532,10 +6533,23 @@ def _unremap_page_attention_references(build_id: str, source_id: str,
                 # would delete a mark while reporting success. (Reachable when
                 # a stale client flushes a pre-delete attention map, since the
                 # PUT replaces the whole blob.) Leave both alone and say so.
+                # Blocking CASCADES: dropping a move leaves that mark at its
+                # old key, which turns the key into an occupied one, which can
+                # in turn block the mark shifting into it. Iterate to a
+                # fixpoint — stopping after one pass still destroyed a mark,
+                # while reporting that a different one had been preserved.
                 staying = set(values) - {old for old, _, _ in moves}
-                blocked = [m for m in moves if m[1] in staying]
+                blocked = []
+                spreading = True
+                while spreading:
+                    spreading = False
+                    for m in list(moves):
+                        if m[1] in staying:
+                            moves.remove(m)
+                            blocked.append(m)
+                            staying.add(m[0])
+                            spreading = True
                 if blocked:
-                    moves = [m for m in moves if m[1] not in staying]
                     warnings.append(
                         f"{len(blocked)} attention mark(s) kept their current "
                         "page — something else already sits where they belong")

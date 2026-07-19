@@ -651,3 +651,48 @@ def test_restore_recreates_a_vanished_attention_map(data_root, client):
     assert client.post("/api/trash/restore", json={"id": tid}).get_json()["ok"]
     att = server.lib.load_json(server.lib.CLIENT_STATE_PATH, {}).get("attention")
     assert att and att[_ref(bid, 2)]["label"] == "doomed"
+
+
+def test_blocked_marks_cascade_instead_of_toppling(data_root, client):
+    """Blocking cascades: dropping a move leaves that mark at its old key, so
+    the key becomes occupied and blocks the mark shifting into IT. Stopping
+    after one pass still destroyed a mark while reporting that a different one
+    had been preserved."""
+    bid = "trash023"
+    pdf = _seed(bid, data_root, n_pages=4)
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+    tid = server._apply_page_deletion(bid, builds, pdf, [1])["trash_id"]
+
+    # a stale client flushes a pre-delete map: 2->3 and 3->4 both want to move,
+    # and 4 is above the post-delete count so it cannot move at all
+    server.lib.save_json(server.lib.CLIENT_STATE_PATH, {"attention": {
+        _ref(bid, 2): {"label": "at2"},
+        _ref(bid, 3): {"label": "at3"},
+        _ref(bid, 4): {"label": "at4-above-count"},
+    }})
+
+    body = client.post("/api/trash/restore", json={"id": tid}).get_json()
+    assert body["ok"]
+    att = server.lib.load_json(server.lib.CLIENT_STATE_PATH, {})["attention"]
+    # every mark survives — none is overwritten by the one behind it
+    assert sorted(v["label"] for v in att.values()) == \
+        ["at2", "at3", "at4-above-count"]
+
+
+def test_restore_recreates_a_vanished_settings_blob(data_root, client):
+    """`settings` can be missing outright, not just missing its remarksMeta —
+    the materialization has to cover that too or the payload is discarded for
+    the meta bucket exactly as it was for attention."""
+    bid = "trash024"
+    pdf = _seed(bid, data_root)
+    server.lib.save_json(server.lib.CLIENT_STATE_PATH, {
+        "settings": {"remarksMeta": {_ref(bid, 2): {"label": "doomed meta"}}}})
+    builds = server.lib.load_json(server.BUILDS_PATH, {})
+    tid = server._apply_page_deletion(bid, builds, pdf, [2])["trash_id"]
+
+    server.lib.save_json(server.lib.CLIENT_STATE_PATH, {})   # settings vanish
+
+    assert client.post("/api/trash/restore", json={"id": tid}).get_json()["ok"]
+    meta = server.lib.load_json(
+        server.lib.CLIENT_STATE_PATH, {}).get("settings", {}).get("remarksMeta")
+    assert meta and meta[_ref(bid, 2)]["label"] == "doomed meta"
