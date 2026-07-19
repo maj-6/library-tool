@@ -24,6 +24,7 @@ from ._filesystem_paths import (
 from ..adapters.filesystem import (
     FilesystemInterchangeRepository,
     FilesystemItemCommandRepository,
+    FilesystemItemLifecycleRepository,
     FilesystemItemQueryRepository,
     FilesystemOpenLibRepository,
     FilesystemReplicaRepository,
@@ -43,6 +44,7 @@ from ..engine.item_commands import (
     ItemDraft,
     ItemRecordSnapshot,
 )
+from ..engine.item_lifecycle import ItemLifecycleService
 from ..engine.representation_commands import (
     RepresentationAggregateSnapshot,
     RepresentationAttachmentDraft,
@@ -59,6 +61,7 @@ from ..engine.replica import ReplicaApplicationService
 from ..engine.runtime import (
     INTERCHANGE_SERVICE,
     ITEM_COMMAND_SERVICE,
+    ITEM_LIFECYCLE_SERVICE,
     ITEM_QUERY_SERVICE,
     JOB_SERVICE,
     LIB_OPEN_SERVICE,
@@ -91,6 +94,9 @@ ItemRecordEncoder = Callable[
     [str, ItemDraft, Mapping[str, Any] | None], Mapping[str, Any]
 ]
 ItemIdAllocator = Callable[[frozenset[str]], str]
+AdvanceRestoredItemRecord = Callable[
+    [str, Mapping[str, Any]], Mapping[str, Any]
+]
 CatalogueLockFactory = Callable[[], ContextManager[Any]]
 ItemLockFactory = Callable[[str], ContextManager[Any]]
 ReadJson = Callable[[Path], Any]
@@ -215,6 +221,13 @@ class RepresentationBindings:
 
 
 @dataclass(frozen=True, slots=True)
+class ItemLifecycleBindings:
+    """Host codec needed to recreate an exact deleted catalogue record."""
+
+    advance_restored_record: AdvanceRestoredItemRecord
+
+
+@dataclass(frozen=True, slots=True)
 class CatalogueBindings:
     """Legacy catalogue projection, identity, codec, and locking seams."""
 
@@ -225,6 +238,7 @@ class CatalogueBindings:
     allocate_item_id: ItemIdAllocator
     lock_context_for: CatalogueLockFactory
     representations: RepresentationBindings | None = None
+    lifecycle: ItemLifecycleBindings | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,6 +297,7 @@ class FilesystemServiceGraph:
 
     items: ItemQueryService
     item_commands: ItemCommandService
+    item_lifecycle: ItemLifecycleService | None
     representation_commands: RepresentationCommandService | None
     interchange: LibInterchangeService
     lib_open: OpenLibService | None
@@ -296,6 +311,7 @@ class FilesystemServiceGraph:
         services = (
             (ITEM_QUERY_SERVICE, self.items),
             (ITEM_COMMAND_SERVICE, self.item_commands),
+            (ITEM_LIFECYCLE_SERVICE, self.item_lifecycle),
             (REPRESENTATION_COMMAND_SERVICE, self.representation_commands),
             (INTERCHANGE_SERVICE, self.interchange),
             (LIB_OPEN_SERVICE, self.lib_open),
@@ -422,6 +438,21 @@ def compose_filesystem_engine(
         lock_context_for=catalogue.lock_context_for,
         recover=False,
     )
+    item_lifecycle = None
+    if catalogue.lifecycle is not None:
+        lifecycle_repository = FilesystemItemLifecycleRepository(
+            resources.write_set,
+            item_repository=item_command_repository,
+            entry_directory_for=entry_directory_for,
+            advance_restored_record=(
+                catalogue.lifecycle.advance_restored_record
+            ),
+            lock_context_for=lambda: (
+                resources.workspace_lock_context_for("")
+            ),
+            deletion_guard_for=resources.jobs.item_deletion_guard,
+        )
+        item_lifecycle = ItemLifecycleService(lifecycle_repository)
     representation_commands = None
     if catalogue.representations is not None:
         representation_repository = FilesystemRepresentationCommandRepository(
@@ -458,7 +489,11 @@ def compose_filesystem_engine(
 
     graph = FilesystemServiceGraph(
         items=items,
-        item_commands=ItemCommandService(item_command_repository),
+        item_commands=ItemCommandService(
+            item_command_repository,
+            allow_legacy_delete=item_lifecycle is None,
+        ),
+        item_lifecycle=item_lifecycle,
         representation_commands=representation_commands,
         interchange=LibInterchangeService(
             interchange.planner,
@@ -521,6 +556,7 @@ __all__ = [
     "FilesystemEngineResources",
     "FilesystemServiceGraph",
     "InterchangeBindings",
+    "ItemLifecycleBindings",
     "ReplicaBindings",
     "RepresentationBindings",
     "TranslationBindings",

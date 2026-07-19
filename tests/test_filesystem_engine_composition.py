@@ -13,6 +13,7 @@ from typing import cast
 import pytest
 
 from librarytool.adapters.filesystem import (
+    EMPTY_MANAGED_TREE_REVISION,
     RecoverableWriteSet,
     RecoveryRequiredError,
 )
@@ -21,6 +22,7 @@ from librarytool.composition.filesystem import (
     FilesystemEnginePaths,
     FilesystemEngineResources,
     InterchangeBindings,
+    ItemLifecycleBindings,
     ReplicaBindings,
     RepresentationBindings,
     TranslationBindings,
@@ -28,13 +30,15 @@ from librarytool.composition.filesystem import (
 )
 from librarytool.engine.capabilities import CapabilityRef, ModuleManifest
 from librarytool.engine.contracts import ItemDescriptor
-from librarytool.engine.errors import RepositoryError
+from librarytool.engine.errors import ConflictError, RepositoryError
 from librarytool.engine.interchange import LibImportPlannerPort
 from librarytool.engine.item_commands import (
     CreateItemCommand,
+    DeleteItemCommand as CatalogueDeleteItemCommand,
     ItemDraft,
     ItemRecordSnapshot,
 )
+from librarytool.engine.item_lifecycle import DeleteItemCommand
 from librarytool.engine.items import WorkbenchContribution
 from librarytool.engine.jobs import JobManager
 from librarytool.engine.ports import (
@@ -45,6 +49,7 @@ from librarytool.engine.translations import TranslationProvenanceService
 from librarytool.engine.runtime import (
     INTERCHANGE_SERVICE,
     ITEM_COMMAND_SERVICE,
+    ITEM_LIFECYCLE_SERVICE,
     ITEM_QUERY_SERVICE,
     JOB_SERVICE,
     LIB_OPEN_SERVICE,
@@ -62,6 +67,7 @@ from librarytool.engine.representation_commands import (
     RepresentationAggregateSnapshot,
 )
 from librarytool.engine.workbench_policies import (
+    ItemLifecycleWorkbenchPolicy,
     RepresentationCommandWorkbenchPolicy,
 )
 
@@ -128,6 +134,13 @@ def _detach_representation_record(_item_id, raw, _representation_id):
     return dict(raw)
 
 
+def _advance_restored_record(item_id, raw):
+    restored = dict(raw)
+    assert restored.get("id", item_id) == item_id
+    restored["revision"] = "record-restored"
+    return restored
+
+
 _REPRESENTATION_CAPABILITIES = (
     CapabilityRef("library.representations.attach"),
     CapabilityRef("library.representations.replace"),
@@ -138,6 +151,11 @@ _REPRESENTATION_COMMANDS = {
     "representation.replace",
     "representation.detach",
 }
+_LIFECYCLE_CAPABILITIES = (
+    CapabilityRef("library.items.lifecycle.read"),
+    CapabilityRef("library.items.delete"),
+    CapabilityRef("library.items.restore"),
+)
 
 
 @contextmanager
@@ -254,6 +272,69 @@ def _optional_representation_contributions(graph, *, declare_policy=True):
     )
 
 
+def _non_lifecycle_contributions(graph):
+    services = tuple(
+        (key, service)
+        for key, service in graph.keyed_services()
+        if key != ITEM_LIFECYCLE_SERVICE
+    )
+    capabilities = tuple(
+        CapabilityRef(f"test.non-lifecycle-{index}")
+        for index, _value in enumerate(services, start=1)
+    )
+    return (
+        ModuleContribution(
+            ModuleManifest(
+                "test.non-lifecycle",
+                "1.0.0",
+                provides=capabilities,
+            ),
+            bindings=tuple(
+                ServiceBinding(key, service, (capability,))
+                for (key, service), capability in zip(
+                    services, capabilities, strict=True
+                )
+            ),
+            item_policies=(
+                WorkbenchPolicyBinding(_CommandPolicy(), (capabilities[0],)),
+            ),
+        ),
+    )
+
+
+def _optional_lifecycle_contributions(graph, *, declare_policy=True):
+    contributions = _non_lifecycle_contributions(graph)
+    if graph.item_lifecycle is None:
+        return contributions
+    return (
+        *contributions,
+        ModuleContribution(
+            ModuleManifest(
+                "test.item-lifecycle",
+                "1.0.0",
+                provides=_LIFECYCLE_CAPABILITIES,
+            ),
+            bindings=(
+                ServiceBinding(
+                    ITEM_LIFECYCLE_SERVICE,
+                    graph.item_lifecycle,
+                    _LIFECYCLE_CAPABILITIES,
+                ),
+            ),
+            item_policies=(
+                (
+                    WorkbenchPolicyBinding(
+                        ItemLifecycleWorkbenchPolicy(),
+                        (_LIFECYCLE_CAPABILITIES[1],),
+                    ),
+                )
+                if declare_policy
+                else ()
+            ),
+        ),
+    )
+
+
 def _composition(
     tmp_path: Path,
     *,
@@ -267,6 +348,7 @@ def _composition(
         title=str(metadata.get("title") or "")
     ),
     representations: RepresentationBindings | None = None,
+    lifecycle: ItemLifecycleBindings | None = None,
 ):
     write_set = _TrackingWriteSet(tmp_path / "workspace")
     if unfinished:
@@ -325,6 +407,7 @@ def _composition(
             allocate_item_id=allocate_item_id,
             lock_context_for=_catalogue_lock,
             representations=representations,
+            lifecycle=lifecycle,
         ),
         replica=ReplicaBindings(
             policies=policies,
@@ -509,6 +592,127 @@ def test_representation_service_and_policy_require_explicit_declarations(
     )
     assert "representation.attach" in commands
     assert not {"representation.replace", "representation.detach"} & commands
+
+
+def test_generic_host_omits_item_lifecycle_without_explicit_bindings(tmp_path):
+    engine = _composition(
+        tmp_path,
+        contribution_factory=_optional_lifecycle_contributions,
+    )["engine"]
+
+    assert engine.get_service(ITEM_LIFECYCLE_SERVICE) is None
+    assert engine.item_commands._allow_legacy_delete is True
+    assert "item.delete" not in (
+        engine.items.get_item("book-one").workbench_state.available_commands
+    )
+
+
+def test_lifecycle_service_authority_and_policy_require_declaration(tmp_path):
+    bindings = ItemLifecycleBindings(
+        advance_restored_record=_advance_restored_record
+    )
+
+    with pytest.raises(
+        ServiceRegistryError,
+        match=ITEM_LIFECYCLE_SERVICE.token,
+    ):
+        _composition(
+            tmp_path / "undeclared",
+            lifecycle=bindings,
+            contribution_factory=_non_lifecycle_contributions,
+        )
+
+    service_only = _composition(
+        tmp_path / "service-only",
+        lifecycle=bindings,
+        contribution_factory=lambda graph: _optional_lifecycle_contributions(
+            graph, declare_policy=False
+        ),
+    )["engine"]
+    assert service_only.get_service(ITEM_LIFECYCLE_SERVICE) is not None
+    assert service_only.item_commands._allow_legacy_delete is False
+    assert "item-lifecycle" not in {
+        policy.policy_id for policy in service_only.items.policies
+    }
+    assert "item.delete" not in (
+        service_only.items.get_item(
+            "book-one"
+        ).workbench_state.available_commands
+    )
+
+    composed = _composition(
+        tmp_path / "declared",
+        lifecycle=bindings,
+        contribution_factory=_optional_lifecycle_contributions,
+    )
+    engine = composed["engine"]
+    lifecycle = engine.require_service(ITEM_LIFECYCLE_SERVICE)
+    assert lifecycle._repository._advance_restored_record is (
+        _advance_restored_record
+    )
+    assert lifecycle._repository._deletion_guard_for.__self__ is engine.jobs
+    assert engine.item_commands._allow_legacy_delete is False
+    assert "item-lifecycle" in {
+        policy.policy_id for policy in engine.items.policies
+    }
+    commands = set(
+        engine.items.get_item("book-one").workbench_state.available_commands
+    )
+    assert "item.delete" in commands
+    assert "item.restore" not in commands
+
+
+def test_composed_lifecycle_preflight_and_job_guard_are_authoritative(tmp_path):
+    composed = _composition(
+        tmp_path,
+        lifecycle=ItemLifecycleBindings(
+            advance_restored_record=_advance_restored_record
+        ),
+        contribution_factory=_optional_lifecycle_contributions,
+    )
+    engine = composed["engine"]
+    catalogue_path = composed["paths"].catalogue
+    catalogue_path.parent.mkdir(parents=True, exist_ok=True)
+    catalogue_path.write_text(
+        json.dumps(
+            {
+                "book-one": {
+                    "id": "book-one",
+                    "revision": "record-1",
+                    "title": "Herbal",
+                    "storage_only": "preserve-me",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    lifecycle = engine.require_service(ITEM_LIFECYCLE_SERVICE)
+
+    state = lifecycle.inspect("book-one")
+    assert state.item.revision == "record-1"
+    assert state.managed_tree.revision == EMPTY_MANAGED_TREE_REVISION
+    assert not composed["paths"].entries.exists()
+
+    engine.jobs.track({"id": "active", "build_id": "book-one"}, "future-job")
+    with pytest.raises(ConflictError) as busy:
+        lifecycle.delete(
+            DeleteItemCommand(
+                "book-one",
+                state.item.revision,
+                state.managed_tree.revision,
+                "delete-busy",
+            )
+        )
+    assert busy.value.code == "item_jobs_active"
+    assert "book-one" in json.loads(catalogue_path.read_text("utf-8"))
+
+    with pytest.raises(ConflictError) as legacy:
+        engine.item_commands.delete(
+            CatalogueDeleteItemCommand(
+                "book-one", "record-1", "legacy-delete"
+            )
+        )
+    assert legacy.value.code == "item_lifecycle_command_required"
 
 
 def test_composed_engine_queries_without_a_transport_context(tmp_path):

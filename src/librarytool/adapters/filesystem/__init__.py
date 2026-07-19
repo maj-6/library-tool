@@ -2,6 +2,10 @@
 
 from .job_history import FilesystemJobHistoryRepository
 from .item_command_repository import FilesystemItemCommandRepository
+from .item_lifecycle_repository import (
+    EMPTY_MANAGED_TREE_REVISION,
+    FilesystemItemLifecycleRepository,
+)
 from .item_repository import FilesystemItemQueryRepository
 from .interchange_repository import FilesystemInterchangeRepository
 from .lib_open_repository import FilesystemOpenLibRepository
@@ -27,7 +31,9 @@ from .translation_repository import (
 )
 
 __all__ = [
+    "EMPTY_MANAGED_TREE_REVISION",
     "FilesystemItemCommandRepository",
+    "FilesystemItemLifecycleRepository",
     "FilesystemItemQueryRepository",
     "FilesystemInterchangeRepository",
     "FilesystemOpenLibRepository",
