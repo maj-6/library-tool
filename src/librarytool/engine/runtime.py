@@ -15,6 +15,7 @@ from .capabilities import (
     ModuleManifest,
     WorkbenchManifest,
 )
+from .canvases import CanvasQueryService
 from .interchange import LibInterchangeService, OpenLibService
 from .item_commands import ItemCommandService
 from .item_lifecycle import ItemLifecycleService
@@ -420,6 +421,9 @@ class ModuleContribution:
 ITEM_QUERY_SERVICE: ServiceKey[ItemQueryService] = ServiceKey(
     "library.items.query"
 )
+CANVAS_QUERY_SERVICE: ServiceKey[CanvasQueryService] = ServiceKey(
+    "library.canvases.query"
+)
 ITEM_COMMAND_SERVICE: ServiceKey[ItemCommandService] = ServiceKey(
     "library.items.commands"
 )
@@ -613,6 +617,7 @@ class LibraryEngineBuilder:
 
 
 __all__ = [
+    "CANVAS_QUERY_SERVICE",
     "DuplicateServiceError",
     "INTERCHANGE_SERVICE",
     "LIB_OPEN_SERVICE",

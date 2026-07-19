@@ -10,6 +10,15 @@ from .capabilities import (
     SealedRegistryError,
     WorkbenchManifest,
 )
+from .canvases import (
+    CanvasExtent,
+    CanvasKey,
+    CanvasQueryRepositoryPort,
+    CanvasQueryService,
+    CanvasSequenceUnavailableError,
+    CanvasSequenceView,
+    CanvasView,
+)
 from .errors import (
     ConflictError,
     EngineError,
@@ -115,6 +124,7 @@ from .representation_commands import (
     RepresentationRecordSnapshot,
 )
 from .runtime import (
+    CANVAS_QUERY_SERVICE,
     INTERCHANGE_SERVICE,
     LIB_OPEN_SERVICE,
     ITEM_COMMAND_SERVICE,
@@ -161,6 +171,14 @@ from .translations import (
 from .workbench_policies import standard_workbench_policies
 
 __all__ = [
+    "CANVAS_QUERY_SERVICE",
+    "CanvasExtent",
+    "CanvasKey",
+    "CanvasQueryRepositoryPort",
+    "CanvasQueryService",
+    "CanvasSequenceUnavailableError",
+    "CanvasSequenceView",
+    "CanvasView",
     "CapabilityResolution",
     "DuplicateManifestError",
     "DuplicateServiceError",
