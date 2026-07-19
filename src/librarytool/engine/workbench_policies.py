@@ -54,6 +54,20 @@ class CatalogueCommandWorkbenchPolicy:
         )
 
 
+class ItemLifecycleWorkbenchPolicy:
+    """Advertise deletion for live items when the lifecycle module is active.
+
+    Restore belongs to a tombstone/global view and is intentionally absent
+    from an individual live item's command state.
+    """
+
+    policy_id = "item-lifecycle"
+
+    def contribute(self, context: WorkbenchContext) -> WorkbenchContribution:
+        del context
+        return WorkbenchContribution(available_commands=("item.delete",))
+
+
 class RepresentationCommandWorkbenchPolicy:
     policy_id = "representation-commands"
 
@@ -180,6 +194,7 @@ def standard_workbench_policies() -> tuple[WorkbenchPolicyPort, ...]:
 
 __all__ = [
     "CatalogueCommandWorkbenchPolicy",
+    "ItemLifecycleWorkbenchPolicy",
     "OcrWorkbenchPolicy",
     "PublishingWorkbenchPolicy",
     "ReplicaWorkbenchPolicy",

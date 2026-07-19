@@ -7,12 +7,15 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from librarytool.engine import (
+    ITEM_LIFECYCLE_SERVICE,
     ITEM_QUERY_SERVICE,
     CapabilityRef,
     CapabilityRegistry,
     DuplicateServiceError,
+    DeleteItemCommand,
     LibraryEngine,
     LibraryEngineBuilder,
+    LifecycleDeleteItemCommand,
     ItemQueryService,
     ModuleContribution,
     ModuleManifest,
@@ -30,6 +33,14 @@ from librarytool.engine import (
 ITEMS = CapabilityRef("library.items.read")
 TRANSLATIONS = CapabilityRef("translation.layers.read")
 GENERATION = CapabilityRef("translation.layers.generate")
+ITEM_DELETE = CapabilityRef("library.items.delete")
+ITEM_RESTORE = CapabilityRef("library.items.restore")
+
+
+def test_root_exports_keep_catalogue_and_lifecycle_delete_commands_distinct():
+    assert DeleteItemCommand is not LifecycleDeleteItemCommand
+    assert DeleteItemCommand.__module__.endswith("item_commands")
+    assert LifecycleDeleteItemCommand.__module__.endswith("item_lifecycle")
 
 
 def _contribution(
@@ -124,6 +135,27 @@ def test_builder_populates_legacy_fields_from_well_known_keys():
         engine.capabilities.register_module(
             ModuleManifest("late.module", "1.0.0")
         )
+
+
+def test_optional_item_lifecycle_uses_generic_registry_without_legacy_field():
+    lifecycle = object()
+    contribution = _contribution(
+        "library.item-lifecycle.commands",
+        provides=(ITEM_DELETE, ITEM_RESTORE),
+        bindings=(
+            _binding(
+                ITEM_LIFECYCLE_SERVICE,
+                lifecycle,
+                ITEM_DELETE,
+                ITEM_RESTORE,
+            ),
+        ),
+    )
+
+    engine = LibraryEngineBuilder((contribution,)).build()
+
+    assert engine.require_service(ITEM_LIFECYCLE_SERVICE) is lifecycle
+    assert not hasattr(engine, "item_lifecycle")
 
 
 def test_direct_library_engine_construction_remains_compatible():

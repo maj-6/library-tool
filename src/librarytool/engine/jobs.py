@@ -296,7 +296,10 @@ class JobManager:
                 for job in self._records.values()
                 if (not state_filter or str(job.get("state") or "") in state_filter)
                 and (not kind_filter or str(job.get("kind") or "") in kind_filter)
-                and (not item_filter or str(job.get("build_id") or "") == item_filter)
+                and (
+                    not item_filter
+                    or self._subject(job).item_id == item_filter
+                )
             ]
         rows.sort(key=lambda row: (
             str(row.get("created_at") or ""), str(row.get("id") or "")

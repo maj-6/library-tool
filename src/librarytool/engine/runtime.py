@@ -17,10 +17,11 @@ from .capabilities import (
 )
 from .interchange import LibInterchangeService, OpenLibService
 from .item_commands import ItemCommandService
-from .representation_commands import RepresentationCommandService
+from .item_lifecycle import ItemLifecycleService
 from .items import ItemQueryService, WorkbenchPolicyPort
 from .jobs import JobManager
 from .replica import ReplicaApplicationService
+from .representation_commands import RepresentationCommandService
 from .text_layers import TextLayerService
 from .translations import TranslationProvenanceService, TranslationService
 
@@ -422,6 +423,9 @@ ITEM_QUERY_SERVICE: ServiceKey[ItemQueryService] = ServiceKey(
 ITEM_COMMAND_SERVICE: ServiceKey[ItemCommandService] = ServiceKey(
     "library.items.commands"
 )
+ITEM_LIFECYCLE_SERVICE: ServiceKey[ItemLifecycleService] = ServiceKey(
+    "library.items.lifecycle"
+)
 REPRESENTATION_COMMAND_SERVICE: ServiceKey[RepresentationCommandService] = (
     ServiceKey("library.representations.commands")
 )
@@ -613,6 +617,7 @@ __all__ = [
     "INTERCHANGE_SERVICE",
     "LIB_OPEN_SERVICE",
     "ITEM_COMMAND_SERVICE",
+    "ITEM_LIFECYCLE_SERVICE",
     "ITEM_QUERY_SERVICE",
     "JOB_SERVICE",
     "LibraryEngine",

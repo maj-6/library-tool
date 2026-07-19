@@ -327,6 +327,24 @@ def test_item_deletion_guard_ignores_finished_and_other_item_jobs():
         pass
 
 
+def test_item_filter_uses_normalized_subject_identity():
+    jobs = manager()
+    jobs.track(
+        {
+            "id": "semantic-subject",
+            "build_id": "legacy-other",
+            "subject": {"item_id": "book"},
+        },
+        "segment",
+    )
+    jobs.track({"id": "legacy-subject", "build_id": "book"}, "ocr")
+
+    assert {row["id"] for row in jobs.list(item_id="book")} == {
+        "semantic-subject",
+        "legacy-subject",
+    }
+
+
 def test_item_deletion_guard_serializes_concurrent_job_registration():
     jobs = manager()
     started = threading.Event()
