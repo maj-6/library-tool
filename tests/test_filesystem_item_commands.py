@@ -305,6 +305,59 @@ def test_composing_adapter_can_stage_managed_record_and_publish_catalogue_last(
     ]
 
 
+def test_composing_lifecycle_can_restore_raw_record_and_publish_catalogue_last(
+    tmp_path,
+):
+    root = tmp_path / "restored-composition"
+    store, repository = _repository(root)
+    raw = _raw_record(
+        item=_draft("Restored"),
+        revision="rev-7",
+        storage_only="kept-from-private-tombstone",
+    )
+
+    with repository.unit_of_work(operation_id="restore-one") as unit:
+        staged = unit.stage_restored_record("book", raw)
+        assert staged.revision == "rev-7"
+        raw["storage_only"] = "mutated-after-staging"
+
+        transaction = store.begin(
+            operation_id="restore-one",
+            scope="test-lifecycle-composition",
+        )
+        transaction.stage_write("lifecycle-receipt.json", b"{}")
+        unit.stage_catalogue_publication(transaction)
+        transaction.commit()
+
+    assert _catalogue(root)["book"]["storage_only"] == (
+        "kept-from-private-tombstone"
+    )
+    journal = json.loads(
+        next(store.transactions_dir.glob("*/journal.json")).read_text("utf-8")
+    )
+    assert [entry["target"] for entry in journal["entries"]] == [
+        "lifecycle-receipt.json",
+        "catalogue.json",
+    ]
+
+
+def test_restored_record_seam_rejects_collision_and_invalid_raw_state(tmp_path):
+    root = tmp_path / "restored-invalid"
+    _write_catalogue(root, {"Book": _raw_record()})
+    _, repository = _repository(root)
+
+    with repository.unit_of_work(operation_id="restore-invalid") as unit:
+        with pytest.raises(RepositoryError) as collision:
+            unit.stage_restored_record("book", _raw_record(revision="rev-2"))
+        assert collision.value.code == "item_restore_collision"
+
+        with pytest.raises(RepositoryError) as malformed:
+            unit.stage_restored_record("other", ["not", "an", "object"])
+        assert malformed.value.code == "invalid_item_repository_artifact"
+
+    assert set(_catalogue(root)) == {"Book"}
+
+
 def test_managed_record_composition_rejects_invalid_scope_and_double_publish(
     tmp_path,
 ):

@@ -632,6 +632,56 @@ class FilesystemItemCommandUnitOfWork:
         )
         return snapshot
 
+    def stage_restored_record(
+        self,
+        item_id: str,
+        raw_record: Mapping[str, Any],
+    ) -> ItemRecordSnapshot:
+        """Stage an exact raw record at an identity that is currently absent.
+
+        This is the catalogue half of a composing lifecycle restore, not a
+        public create shortcut. The lifecycle adapter owns the private
+        tombstone envelope, advances the stored revision, validates restore
+        collisions, stages its receipt, and finally calls
+        :meth:`stage_catalogue_publication`. This seam preserves storage-only
+        fields without exposing the catalogue document or codec internals.
+        """
+
+        self._ensure_stageable()
+        self._item_id(item_id, field_name="item_id")
+        if item_id.casefold() in {
+            existing.casefold() for existing in self._catalogue
+        }:
+            raise RepositoryError(
+                "an item already occupies the restore identity",
+                code="item_restore_collision",
+                details={"item_id": item_id},
+            )
+        try:
+            raw = _strict_plain(raw_record)
+        except (TypeError, ValueError) as exc:
+            raise RepositoryError(
+                "the restored item record is invalid",
+                code="invalid_item_repository_artifact",
+                details={"artifact": "restored_record"},
+            ) from exc
+        if not isinstance(raw, dict):
+            raise RepositoryError(
+                "the restored item record is not an object",
+                code="invalid_item_repository_artifact",
+                details={"artifact": "restored_record"},
+            )
+        snapshot = self._decode_record(item_id, raw)
+        catalogue = _strict_plain(self._catalogue)
+        catalogue[item_id] = raw
+        self._stage(
+            action="restore",
+            item_id=item_id,
+            catalogue=catalogue,
+            snapshot=snapshot,
+        )
+        return snapshot
+
     def stage_delete(
         self,
         current: ItemRecordSnapshot,
