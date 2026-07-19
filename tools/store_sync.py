@@ -343,16 +343,76 @@ def _backup(path: Path) -> None:
 
 # --- executing one store -----------------------------------------------------------
 
-def sync_store(cfg: dict, name: str, lock=None, dry: bool = False) -> dict:
-    """One store's full pass: fetch, merge, apply locally, push. Local reads
-    and writes happen under `lock` (the server passes its own); network calls
-    happen outside it."""
+_ITEM_CATALOGUE_STORE = "builds"
+
+
+def _checked_item_policy(
+        allow_item: Callable[[str], bool] | None,
+) -> Callable[[str], bool] | None:
+    if allow_item is not None and not callable(allow_item):
+        raise TypeError("allow_item must be callable")
+    return allow_item
+
+
+def _policy_allows_item(
+        policy: Callable[[str], bool], item_id: str,
+) -> bool:
+    """Evaluate a lifecycle policy without weakening its exact identity.
+
+    Store keys are already normalized to strings by the existing transport and
+    decomposition paths.  Deliberately do not strip or case-fold here: engine
+    item identities are exact, and silently accepting an alias could bypass a
+    durable tombstone.
+    """
+    decision = policy(item_id)
+    if not isinstance(decision, bool):
+        raise TypeError("allow_item must return a boolean")
+    return decision
+
+
+def sync_store(
+        cfg: dict,
+        name: str,
+        lock=None,
+        dry: bool = False,
+        allow_item: Callable[[str], bool] | None = None,
+) -> dict:
+    """One store's full pass: fetch, merge, apply locally, push.
+
+    Local reads and writes happen under ``lock`` (the server passes its own);
+    network calls happen outside it.  For the item catalogue (``builds``), an
+    optional ``allow_item`` policy filters exact local, cloud, and shadow keys
+    before the merge and is evaluated again before either local or cloud
+    publication.  Invalid policy values fail closed before the affected write.
+
+    Those checks narrow, but cannot eliminate, the final TOCTOU interval: the
+    lifecycle state can change after a callback returns and before publication
+    begins.  A caller requiring deletion atomicity must hold the shared outer
+    lifecycle/workspace gate across this whole call and supply a callback that
+    is safe to invoke while the catalogue lock is held.
+    """
+    allow_item = _checked_item_policy(allow_item)
+    item_policy = allow_item if name == _ITEM_CATALOGUE_STORE else None
+    planning_allowed: dict[str, bool] = {}
+
+    def allowed_for_plan(item_id: str) -> bool:
+        assert item_policy is not None
+        if item_id not in planning_allowed:
+            planning_allowed[item_id] = _policy_allows_item(
+                item_policy, item_id,
+            )
+        return planning_allowed[item_id]
+
+    def allowed_for_write(item_id: str) -> bool:
+        assert item_policy is not None
+        return _policy_allows_item(item_policy, item_id)
+
     spec = STORES[name]
     rows = sbase.list_store_rows(cfg, spec["table"], spec["pk"])
     cloud: dict[str, dict] = {}
     for r in rows:
         k = str(r.get(spec["pk"]) or "")
-        if k:
+        if k and (item_policy is None or allowed_for_plan(k)):
             cloud[k] = {"data": r.get("data") if isinstance(r.get("data"), dict) else {},
                         "updated_at": str(r.get("updated_at") or ""),
                         "deleted": bool(r.get("deleted"))}
@@ -363,6 +423,11 @@ def sync_store(cfg: dict, name: str, lock=None, dry: bool = False) -> dict:
         records, ids_assigned = spec["decompose"](doc)
         scrubbed = {k: spec["scrub"](rec) for k, rec in records.items()}
         shadow = _load_shadow().get(name, {})
+        if item_policy is not None:
+            scrubbed = {k: rec for k, rec in scrubbed.items()
+                        if allowed_for_plan(k)}
+            shadow = {k: entry for k, entry in shadow.items()
+                      if allowed_for_plan(k)}
         plan = merge(scrubbed, cloud, shadow, _now(), spec)
 
         if dry:
@@ -371,6 +436,26 @@ def sync_store(cfg: dict, name: str, lock=None, dry: bool = False) -> dict:
                     "deleted": len(plan["delete_local"]),
                     "in_sync": plan["in_sync"], "guard": plan["guard"],
                     "dry": True}
+
+        if item_policy is not None:
+            # Evaluate every candidate before mutating either the catalogue or
+            # its shadow.  A false/invalid decision cannot leave a partial
+            # local publication footprint.
+            plan["pull"] = {
+                k: row for k, row in plan["pull"].items()
+                if allowed_for_write(k)
+            }
+            plan["delete_local"] = [
+                (k, cts) for k, cts in plan["delete_local"]
+                if allowed_for_write(k)
+            ]
+            plan["refresh"] = {
+                k: entry for k, entry in plan["refresh"].items()
+                if allowed_for_write(k)
+            }
+            plan["shadow_drop"] = [
+                k for k in plan["shadow_drop"] if allowed_for_write(k)
+            ]
 
         updates: dict[str, dict | None] = {}
         if plan["pull"] or plan["delete_local"] or ids_assigned:
@@ -390,6 +475,14 @@ def sync_store(cfg: dict, name: str, lock=None, dry: bool = False) -> dict:
             updates[k] = None
         if updates:
             _update_shadow(name, updates)
+
+    if item_policy is not None:
+        # The local lock is deliberately released around the network call.
+        # Recheck immediately before constructing that publication batch.
+        plan["push"] = [p for p in plan["push"]
+                        if allowed_for_write(p["key"])]
+        plan["tombstone"] = [t for t in plan["tombstone"]
+                             if allowed_for_write(t["key"])]
 
     outgoing = ([{spec["pk"]: p["key"], "data": p["data"],
                   "updated_at": p["ts"], "deleted": False}
@@ -413,14 +506,33 @@ def sync_store(cfg: dict, name: str, lock=None, dry: bool = False) -> dict:
             "in_sync": plan["in_sync"], "guard": plan["guard"]}
 
 
-def sync_stores(cfg: dict, locks: dict | None = None, dry: bool = False) -> dict:
-    """All three JSON stores; one store's failure never stops the others."""
+def sync_stores(
+        cfg: dict,
+        locks: dict | None = None,
+        dry: bool = False,
+        allow_item: Callable[[str], bool] | None = None,
+) -> dict:
+    """Sync every JSON store; one store's failure never stops the others.
+
+    ``allow_item`` applies only to the ``builds`` catalogue because IA source,
+    correction, and taxonomy keys are not item identities.  Callers needing an
+    atomic lifecycle guarantee must hold the outer gate described by
+    :func:`sync_store`; the callback alone only narrows the TOCTOU window.
+    """
+    allow_item = _checked_item_policy(allow_item)
     locks = dict(locks or {})
     locks.setdefault("corrections", _corrections_lock)
     out = {}
     for name in STORES:
         try:
-            out[name] = sync_store(cfg, name, lock=locks.get(name), dry=dry)
+            out[name] = sync_store(
+                cfg,
+                name,
+                lock=locks.get(name),
+                dry=dry,
+                allow_item=(allow_item
+                            if name == _ITEM_CATALOGUE_STORE else None),
+            )
         except Exception as exc:
             out[name] = {"error": f"{type(exc).__name__}: {exc}"}
     return out

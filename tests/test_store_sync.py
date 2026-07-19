@@ -487,6 +487,199 @@ def clean_store_files():
     wipe()
 
 
+def test_sync_store_policy_suppresses_remote_only_deleted_catalogue_row(fake_cloud):
+    fake_cloud.tables["builds"] = {
+        "deleted": {
+            "id": "deleted",
+            "data": {"id": "deleted", "title": "Remote", "updated_at": T1},
+            "updated_at": T1,
+            "deleted": False,
+        },
+    }
+
+    result = ss.sync_store(
+        {"url": "u", "key": "k"},
+        "builds",
+        allow_item=lambda item_id: item_id != "deleted",
+    )
+
+    assert result == {"pushed": 0, "pulled": 0, "tombstoned": 0,
+                      "deleted": 0, "in_sync": 0, "guard": ""}
+    assert not ss.STORES["builds"]["path"]().exists()
+    assert fake_cloud.tables["builds"]["deleted"]["deleted"] is False
+
+
+def test_sync_store_policy_suppresses_local_only_deleted_catalogue_row(fake_cloud):
+    path = ss.STORES["builds"]["path"]()
+    record = {"id": "deleted", "title": "Local", "updated_at": T1}
+    lib.save_json(path, {"deleted": record})
+
+    result = ss.sync_store(
+        {"url": "u", "key": "k"},
+        "builds",
+        allow_item=lambda item_id: item_id != "deleted",
+    )
+
+    assert result == {"pushed": 0, "pulled": 0, "tombstoned": 0,
+                      "deleted": 0, "in_sync": 0, "guard": ""}
+    assert fake_cloud.tables.get("builds", {}) == {}
+    assert lib.load_json(path, {}) == {"deleted": record}
+
+
+def test_sync_store_policy_uses_exact_case_sensitive_catalogue_identity(fake_cloud):
+    path = ss.STORES["builds"]["path"]()
+    lib.save_json(path, {
+        "Book": {"id": "Book", "title": "Exact", "updated_at": T1},
+    })
+    seen = []
+
+    def allow_item(item_id):
+        seen.append(item_id)
+        return item_id != "Book"
+
+    result = ss.sync_store(
+        {"url": "u", "key": "k"},
+        "builds",
+        allow_item=allow_item,
+    )
+
+    assert result["pushed"] == 0
+    assert seen == ["Book"]
+    assert fake_cloud.tables.get("builds", {}) == {}
+
+
+def test_sync_store_rechecks_policy_before_local_catalogue_write(fake_cloud):
+    fake_cloud.tables["builds"] = {
+        "book": {
+            "id": "book",
+            "data": {"id": "book", "title": "Remote", "updated_at": T1},
+            "updated_at": T1,
+            "deleted": False,
+        },
+    }
+    checks = 0
+
+    def allow_item(item_id):
+        nonlocal checks
+        assert item_id == "book"
+        checks += 1
+        return checks == 1       # planning allowed; pre-publication denied
+
+    result = ss.sync_store(
+        {"url": "u", "key": "k"}, "builds", allow_item=allow_item,
+    )
+
+    assert result["pulled"] == 0
+    assert checks == 2
+    assert not ss.STORES["builds"]["path"]().exists()
+
+
+def test_sync_store_rechecks_policy_before_cloud_catalogue_write(fake_cloud):
+    path = ss.STORES["builds"]["path"]()
+    lib.save_json(path, {
+        "book": {"id": "book", "title": "Local", "updated_at": T1},
+    })
+    checks = 0
+
+    def allow_item(item_id):
+        nonlocal checks
+        assert item_id == "book"
+        checks += 1
+        return checks == 1       # planning allowed; pre-publication denied
+
+    result = ss.sync_store(
+        {"url": "u", "key": "k"}, "builds", allow_item=allow_item,
+    )
+
+    assert result["pushed"] == 0
+    assert checks == 2
+    assert fake_cloud.tables.get("builds", {}) == {}
+
+
+def test_sync_store_policy_fails_closed_for_invalid_values(fake_cloud):
+    path = ss.STORES["builds"]["path"]()
+    record = {"id": "book", "title": "Local", "updated_at": T1}
+    lib.save_json(path, {"book": record})
+
+    with pytest.raises(TypeError, match="allow_item must be callable"):
+        ss.sync_store({"url": "u", "key": "k"}, "builds", allow_item=True)
+    with pytest.raises(TypeError, match="return a boolean"):
+        ss.sync_store(
+            {"url": "u", "key": "k"},
+            "builds",
+            allow_item=lambda _item_id: "yes",
+        )
+
+    assert fake_cloud.tables.get("builds", {}) == {}
+    assert lib.load_json(path, {}) == {"book": record}
+
+
+def test_sync_stores_validates_policy_before_any_store_io(fake_cloud, monkeypatch):
+    reads = []
+
+    def observe_read(cfg, table, pk):
+        reads.append(table)
+        return []
+
+    monkeypatch.setattr(ss.sbase, "list_store_rows", observe_read)
+    with pytest.raises(TypeError, match="allow_item must be callable"):
+        ss.sync_stores({"url": "u", "key": "k"}, allow_item={"book"})
+    assert reads == []
+
+
+def test_sync_stores_applies_item_policy_only_to_build_catalogue(fake_cloud):
+    lib.save_json(ss.STORES["builds"]["path"](), {
+        "deleted": {"id": "deleted", "title": "Build", "updated_at": T1},
+    })
+    lib.save_json(ss.STORES["ia_catalog"]["path"](), {
+        "source": {"identifier": "source", "title": "IA",
+                   "downloaded_at": T1},
+    })
+    seen = []
+
+    def allow_item(item_id):
+        seen.append(item_id)
+        return item_id != "deleted"
+
+    result = ss.sync_stores(
+        {"url": "u", "key": "k"}, allow_item=allow_item,
+    )
+
+    assert result["builds"]["pushed"] == 0
+    assert result["ia_catalog"]["pushed"] == 1
+    assert seen == ["deleted"]
+    assert fake_cloud.tables.get("builds", {}) == {}
+    assert fake_cloud.tables["ia_catalog"]["source"]["data"]["title"] == "IA"
+
+
+def test_sync_store_policy_requires_outer_gate_for_atomicity(fake_cloud, monkeypatch):
+    """A callback cannot close the interval after its final allowed result."""
+    path = ss.STORES["builds"]["path"]()
+    lib.save_json(path, {
+        "book": {"id": "book", "title": "Local", "updated_at": T1},
+    })
+    live = True
+    upsert = fake_cloud.upsert_store_rows
+
+    def race_after_final_check(cfg, table, pk, rows, chunk=200):
+        nonlocal live
+        live = False
+        return upsert(cfg, table, pk, rows, chunk=chunk)
+
+    monkeypatch.setattr(ss.sbase, "upsert_store_rows", race_after_final_check)
+    result = ss.sync_store(
+        {"url": "u", "key": "k"},
+        "builds",
+        allow_item=lambda _item_id: live,
+    )
+
+    # The lifecycle change happened after the final callback result.  Server
+    # integration must prevent this race with the shared outer workspace gate.
+    assert result["pushed"] == 1
+    assert fake_cloud.tables["builds"]["book"]["data"]["title"] == "Local"
+    assert "lifecycle/workspace gate" in (ss.sync_store.__doc__ or "")
+
+
 def test_sync_store_full_cycle(fake_cloud):
     path = ss.STORES["builds"]["path"]()
 
