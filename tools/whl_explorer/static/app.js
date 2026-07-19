@@ -16868,6 +16868,222 @@ function selectBuild(id) {
   selectWorkbenchBook(id);
 }
 
+// The item command accepts portable catalogue metadata only. Keep unknown
+// metadata extensions, but never copy storage, lifecycle, job, or source
+// ownership fields into the canonical draft.
+const ITEM_CREATE_NON_METADATA_FIELDS = Object.freeze(new Set([
+  "id", "item_id", "kind", "title", "created_at", "updated_at", "revision",
+  "representations", "artifacts", "relevance", "capture_id",
+  "published_slug", "ocr_active", "ocr_verified", "ocr_quality",
+  "title_pages", "thumbnail_source", "status", "pdf_file", "pdf_sources",
+  "images", "extra", "representation_manifest",
+]));
+const ITEM_CREATE_STRING_METADATA_FIELDS = Object.freeze(new Set([
+  "subtitle", "authors", "year", "publisher", "publisher_city", "edition",
+  "volume", "group_id", "language", "pages", "categories", "description",
+  "pdf_source", "source_url", "notes", "rights", "attention",
+]));
+const pendingBuildCreates = new Map();
+
+function itemCreateDraft(seed) {
+  const requested = seed && typeof seed === "object" && !Array.isArray(seed)
+    ? seed : {};
+  const metadata = {};
+  for (const [key, value] of Object.entries(requested)) {
+    if (ITEM_CREATE_NON_METADATA_FIELDS.has(key) || value === undefined) continue;
+    metadata[key] = ITEM_CREATE_STRING_METADATA_FIELDS.has(key)
+      ? String(value || "").trim()
+      : JSON.parse(JSON.stringify(value));
+  }
+  return {
+    kind: "book",
+    title: String(requested.title || "").trim(),
+    metadata,
+    representations: [],
+  };
+}
+
+function itemCreateCleanExtraValue(value) {
+  if (Array.isArray(value)) {
+    const cleaned = [];
+    for (const entry of value) {
+      const child = itemCreateCleanExtraValue(entry);
+      if (child !== null) cleaned.push(child);
+    }
+    return cleaned;
+  }
+  if (value && typeof value === "object") {
+    const cleaned = {};
+    for (const [rawKey, entry] of Object.entries(value)) {
+      const key = String(rawKey).trim();
+      const child = itemCreateCleanExtraValue(entry);
+      if (key && child !== null) cleaned[key] = child;
+    }
+    return cleaned;
+  }
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") return value.trim() || null;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  return String(value).trim() || null;
+}
+
+function itemCreateCompatibilitySeed(seed) {
+  const requested = seed && typeof seed === "object" && !Array.isArray(seed)
+    ? seed : {};
+  const compatibility = {};
+  if (Object.prototype.hasOwnProperty.call(requested, "extra")) {
+    compatibility.extra = requested.extra &&
+      typeof requested.extra === "object" && !Array.isArray(requested.extra)
+      ? itemCreateCleanExtraValue(requested.extra) : {};
+  }
+  if (Object.prototype.hasOwnProperty.call(requested, "images")) {
+    const images = [];
+    for (const raw of Array.isArray(requested.images)
+      ? requested.images.slice(0, 200) : []) {
+      const path = String(raw || "").replace(/\\/g, "/").trim();
+      const parts = path.split("/");
+      if (!path || path.length > 500 || path.startsWith("/") ||
+          parts.some((part) => !part || part === "." || part === "..") ||
+          (parts[0] || "").includes(":")) continue;
+      const extension = path.toLowerCase().split(".").pop();
+      if (!["jpg", "jpeg", "png", "webp"].includes(extension) ||
+          images.includes(path)) continue;
+      images.push(path);
+    }
+    compatibility.images = images;
+  }
+  if (Object.prototype.hasOwnProperty.call(requested, "capture_id")) {
+    compatibility.capture_id = String(requested.capture_id || "")
+      .replace(/[^A-Za-z0-9-]/g, "").slice(0, 64);
+  }
+  return compatibility;
+}
+
+function itemCreateOperationKey() {
+  const random = globalThis.crypto &&
+    typeof globalThis.crypto.randomUUID === "function"
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+  return `item-create-${random}`;
+}
+
+function itemCreatePendingKey(item) {
+  const normalize = (value) => {
+    if (Array.isArray(value)) return value.map(normalize);
+    if (!value || typeof value !== "object") return value;
+    const normalized = {};
+    for (const key of Object.keys(value).sort()) {
+      if (value[key] !== undefined) normalized[key] = normalize(value[key]);
+    }
+    return normalized;
+  };
+  return JSON.stringify(normalize(item));
+}
+
+function itemCreateMutationAmbiguous(error) {
+  if (!error || error.code === "aborted" || error.name === "AbortError")
+    return false;
+  return error.retryable === true || error.code === "network-error" ||
+    error.code === "invalid-response" || error.status === 0;
+}
+
+function itemCreateMutationReceipt(result, command) {
+  const receipt = result && result.receipt;
+  const item = receipt && receipt.item;
+  if (!receipt || !item || result.ok !== true ||
+      result.schema !== "librarytool.item-mutation-receipt/1" ||
+      typeof result.replayed !== "boolean" ||
+      receipt.action !== "create" ||
+      receipt.operation_id !== command.idempotencyKey ||
+      typeof receipt.command_sha256 !== "string" ||
+      !/^[0-9a-f]{64}$/.test(receipt.command_sha256) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(receipt.item_id || "") ||
+      receipt.before_revision !== "" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:+-]{0,511}$/.test(
+        receipt.after_revision || "") ||
+      receipt.deletion !== null || item.id !== receipt.item_id ||
+      item.revision !== receipt.after_revision || item.kind !== "book" ||
+      typeof item.title !== "string" || !item.metadata ||
+      typeof item.metadata !== "object" || Array.isArray(item.metadata) ||
+      !Array.isArray(item.representations) || item.representations.length ||
+      itemCreatePendingKey({
+        kind: item.kind,
+        title: item.title,
+        metadata: item.metadata,
+        representations: item.representations,
+      }) !== itemCreatePendingKey(command.item)) {
+    return null;
+  }
+  return receipt;
+}
+
+function buildFromItemCreateReceipt(receipt) {
+  const item = receipt.item;
+  return {
+    ...JSON.parse(JSON.stringify(item.metadata)),
+    id: receipt.item_id,
+    title: item.title,
+    status: "draft",
+    pdf_file: "",
+    pdf_sources: [],
+    updated_at: receipt.after_revision,
+    _record_revision: receipt.after_revision,
+    _representations: [],
+  };
+}
+
+function itemCreateCompatibilityMatches(build, compatibility) {
+  if (!build || typeof build !== "object") return false;
+  const actual = {};
+  for (const key of Object.keys(compatibility)) actual[key] = build[key];
+  return itemCreatePendingKey(actual) ===
+    itemCreatePendingKey(compatibility);
+}
+
+function adoptItemCreateCompatibility(itemId, raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw) ||
+      raw.id !== itemId ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:+-]{0,511}$/.test(
+        raw.updated_at || "")) return false;
+  const prior = state.builds[itemId] || {};
+  state.builds[itemId] = mergeBuildCompatibility(raw, prior);
+  return true;
+}
+
+async function seedItemCreateCompatibility(
+    itemId, compatibility, recordRevision) {
+  if (!Object.keys(compatibility).length) return true;
+  let expectedRevision = recordRevision;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const result = await engineClient.items.seedCompatibility({
+        itemId,
+        compatibility,
+        recordRevision: expectedRevision,
+      });
+      if (adoptItemCreateCompatibility(itemId, result && result.build) &&
+          itemCreateCompatibilityMatches(
+            state.builds[itemId], compatibility)) return true;
+    } catch (error) {
+      const current = error && error.status === 409 && error.body &&
+        error.body.build;
+      if (current) {
+        if (!adoptItemCreateCompatibility(itemId, current)) return false;
+        if (itemCreateCompatibilityMatches(
+            state.builds[itemId], compatibility)) return true;
+        // Only these three acquisition fields are written, so rebasing on a
+        // trusted current record cannot overwrite an unrelated concurrent
+        // catalogue edit. A later network ambiguity keeps this exact CAS.
+        expectedRevision = current.updated_at;
+        continue;
+      }
+      if (!itemCreateMutationAmbiguous(error)) return false;
+    }
+  }
+  return false;
+}
+
 async function createBuild(seed, label, originTab = activeHistoryTab()) {
   const requested = seed && typeof seed === "object" && !Array.isArray(seed)
     ? { ...seed } : {};
@@ -16878,40 +17094,84 @@ async function createBuild(seed, label, originTab = activeHistoryTab()) {
         path: String((row && row.path) || "").trim(),
       })).filter((row) => row.path)
     : [];
-  // Source ownership has moved to representation commands. The transitional
-  // catalogue create route receives metadata only, even for legacy seed data.
-  delete requested.pdf_file;
-  delete requested.pdf_sources;
-  const res = await fetch("/api/builds", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ build: requested }),
+  const item = itemCreateDraft(requested);
+  const compatibility = itemCreateCompatibilitySeed(requested);
+  // Allocation replay identity covers the whole user intent, even though the
+  // portable item command deliberately does not own local acquisition state.
+  // Two copies with identical metadata but different scans must remain two
+  // distinct creates after an ambiguous response.
+  const pendingKey = itemCreatePendingKey({
+    item,
+    primary_source: primarySource,
+    secondary_sources: secondarySources,
+    compatibility,
   });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || !data.ok) { statusCrit("BUILD CREATE FAILED"); return null; }
-  invalidateRepresentationItemIncarnation(data.build.id);
-  state.builds[data.build.id] = {
-    ...data.build,
-    _record_revision: data.build.updated_at || "",
-    _representations: [],
-  };
-  // The compatibility create response has no module eligibility. Resolve the
-  // semantic projection before seed attachments or controls can use it.
-  try { await refreshBuildEngineRecord(data.build.id); } catch (ignored) {}
+  let command = pendingBuildCreates.get(pendingKey);
+  if (!command) {
+    command = Object.freeze({
+      item,
+      idempotencyKey: itemCreateOperationKey(),
+    });
+    pendingBuildCreates.set(pendingKey, command);
+  }
+
+  let receipt = null;
+  let knownFailure = false;
+  for (let attempt = 0; attempt < 2 && !receipt; attempt += 1) {
+    try {
+      const result = await engineClient.items.create(command);
+      receipt = itemCreateMutationReceipt(result, command);
+      if (!receipt) {
+        const invalid = new Error("Item create returned no valid receipt");
+        invalid.code = "invalid-response";
+        invalid.status = 200;
+        invalid.retryable = true;
+        throw invalid;
+      }
+    } catch (error) {
+      if (!itemCreateMutationAmbiguous(error)) {
+        knownFailure = true;
+        break;
+      }
+    }
+  }
+  if (!receipt) {
+    // Keep an ambiguous command so an identical retry asks for its durable
+    // receipt instead of allocating a second item after a lost response.
+    if (knownFailure) pendingBuildCreates.delete(pendingKey);
+    statusCrit("BUILD CREATE FAILED");
+    return null;
+  }
+
+  const itemId = receipt.item_id;
+  invalidateRepresentationItemIncarnation(itemId);
+  state.builds[itemId] = buildFromItemCreateReceipt(receipt);
+  if (!await seedItemCreateCompatibility(
+      itemId, compatibility, receipt.after_revision)) {
+    // The item may already exist, so retain its create operation for an exact
+    // replay on the next identical attempt instead of allocating a duplicate.
+    statusCrit("BUILD CREATED :: PROVENANCE SAVE FAILED");
+    return null;
+  }
+  pendingBuildCreates.delete(pendingKey);
+  // The receipt is the commit point. This compatibility refresh enriches the
+  // local projection and discovers optional representation commands, but a
+  // failed GET cannot turn a completed create into failure.
+  try { await refreshBuildEngineRecord(itemId); } catch (ignored) {}
   let sourceAttachFailed = false;
   let sourceAttachMessage = "";
   if (primarySource) {
     const receipt = await setBuildRepresentation(
-      data.build.id, "primary", primarySource, {
+      itemId, "primary", primarySource, {
         intent: "attach",
-        recordRevision: state.builds[data.build.id]._record_revision,
+        recordRevision: state.builds[itemId]._record_revision,
       });
     sourceAttachFailed = !receipt;
     if (!receipt) sourceAttachMessage = representationFailureMessage(
-      data.build.id, "primary");
+      itemId, "primary");
   }
   for (const source of secondarySources) {
-    const build = state.builds[data.build.id] || data.build;
+    const build = state.builds[itemId] || buildFromItemCreateReceipt(receipt);
     const used = new Set([
       "primary",
       ...((build.pdf_sources || []).map((row) =>
@@ -16921,18 +17181,18 @@ async function createBuild(seed, label, originTab = activeHistoryTab()) {
       !used.has(source.id.toLowerCase()) ? source.id : "";
     const sourceId = requestedId || secondaryRepresentationId(build);
     const receipt = await setBuildRepresentation(
-      data.build.id, sourceId, source.path, {
+      itemId, sourceId, source.path, {
         intent: "attach",
         recordRevision: build._record_revision,
       });
     if (!receipt) {
       sourceAttachFailed = true;
       sourceAttachMessage = representationFailureMessage(
-        data.build.id, sourceId);
+        itemId, sourceId);
     }
   }
 
-  const built = state.builds[data.build.id] || data.build;
+  const built = state.builds[itemId] || buildFromItemCreateReceipt(receipt);
   const snap = JSON.parse(JSON.stringify(built));
   const lifecycle = {
     tombstone: null, deleteCommand: null, restoreCommand: null,
@@ -16947,7 +17207,7 @@ async function createBuild(seed, label, originTab = activeHistoryTab()) {
       await restoreDeletedBuildFromTombstone(lifecycle, snap.id, snap);
       renderUpload();
     }, undefined, originTab);
-  selectBuild(data.build.id);
+  selectBuild(itemId);
   renderUpload();
   if (sourceAttachFailed) {
     const message = el("b-src-msg");

@@ -102,6 +102,7 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
   assert.equal(typeof client.items.get, "function");
   assert.equal(typeof client.items.create, "function");
   assert.equal(typeof client.items.update, "function");
+  assert.equal(typeof client.items.seedCompatibility, "function");
   assert.equal(typeof client.items.lifecycle, "function");
   assert.equal(typeof client.items.delete, "function");
   assert.equal(typeof client.items.representations, "function");
@@ -251,6 +252,32 @@ test("item commands use versioned idempotent JSON contracts", async () => {
     "Content-Type": "application/json",
   });
   assert.deepEqual(JSON.parse(calls[1].init.body), { patch });
+});
+
+test("compatibility acquisition seeding is isolated behind conditional transport", async () => {
+  const { client, calls } = harness({ ok: true, build: { id: "book-1" } });
+  const compatibility = {
+    extra: { scan_collection_id: "collection-1" },
+    images: ["capture/cover.jpg"],
+    capture_id: "phone-1",
+  };
+
+  await client.items.seedCompatibility({
+    itemId: "book / one!*",
+    compatibility,
+    recordRevision: "ir-current",
+  });
+
+  assert.equal(calls[0].url, "/api/builds/book%20%2F%20one%21%2A");
+  assert.equal(calls[0].init.method, "PATCH");
+  assert.deepEqual(calls[0].init.headers, {
+    Accept: "application/json",
+    "Content-Type": "application/json",
+  });
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    ...compatibility,
+    expect_updated_at: "ir-current",
+  });
 });
 
 test("item commands reject missing or unsafe preconditions locally", () => {
@@ -1427,6 +1454,33 @@ function representationResult(action, {
   };
 }
 
+function itemCreateResult(args, {
+  itemId = "new-book", revision = "item-r1", replayed = false,
+} = {}) {
+  return {
+    ok: true,
+    schema: "librarytool.item-mutation-receipt/1",
+    replayed,
+    receipt: {
+      action: "create",
+      operation_id: args.idempotencyKey,
+      command_sha256: "c".repeat(64),
+      item_id: itemId,
+      before_revision: "",
+      after_revision: revision,
+      item: {
+        id: itemId,
+        revision,
+        kind: args.item.kind,
+        title: args.item.title,
+        metadata: JSON.parse(JSON.stringify(args.item.metadata)),
+        representations: [],
+      },
+      deletion: null,
+    },
+  };
+}
+
 function representationUiHarness({ build, attach, replace, detach, refresh } = {}) {
   const app = fs.readFileSync(appPath, "utf8");
   const start = app.indexOf("function representationOperationKey");
@@ -2156,22 +2210,59 @@ this.saveBuildFields = saveBuildFields;`, context);
 
 test("build creation strips legacy sources and attaches before history or selection", async () => {
   const app = fs.readFileSync(appPath, "utf8");
-  const start = app.indexOf("async function createBuild(");
+  const start = app.indexOf("const ITEM_CREATE_NON_METADATA_FIELDS");
   const end = app.indexOf("function buildSeedFromSource", start);
   assert.ok(start >= 0 && end > start);
   const events = [];
   const messages = { "b-src-msg": { textContent: "" } };
   const state = { builds: {} };
-  const created = {
-    id: "new-book", title: "Seeded Herbal", updated_at: "item-r1",
+  const compatibilityBuild = {
+    id: "new-book", title: "Seeded Herbal", status: "draft",
+    subtitle: "A field guide", category_ids: ["plants"],
+    future_extension: { shelf: 3 },
+    bundle: { about: true, annotations: false, pages_text: false,
+      translations: [] },
+    notes: "concurrent catalogue edit",
     pdf_file: "", pdf_sources: [],
+    extra: { scan_collection_id: "collection-1", shelf: "A" },
+    images: ["capture/cover.jpg"], capture_id: "phone-1",
+    updated_at: "item-r1c",
   };
+  const concurrentBuild = {
+    ...copyJson(compatibilityBuild),
+    extra: {}, images: [], capture_id: "", updated_at: "item-r1u",
+  };
+  let compatibilityAttempts = 0;
   const context = vm.createContext({
     state,
-    fetch: async (url, init) => {
-      events.push({ type: "post", url, body: JSON.parse(init.body) });
-      return { ok: true, json: async () => ({ ok: true, build: created }) };
-    },
+    crypto: { randomUUID: () => "create-uuid" },
+    engineClient: { items: {
+      create: async (args) => {
+        events.push({ type: "command", args: JSON.parse(JSON.stringify(args)) });
+        return itemCreateResult(args);
+      },
+      seedCompatibility: async (args) => {
+        compatibilityAttempts += 1;
+        events.push({ type: "compatibility", args: copyJson(args) });
+        if (compatibilityAttempts === 1) {
+          const conflict = new Error("concurrent catalogue edit");
+          conflict.status = 409;
+          conflict.body = { build: copyJson(concurrentBuild) };
+          throw conflict;
+        }
+        if (compatibilityAttempts === 2) {
+          const error = new Error("response lost after compatibility commit");
+          error.code = "network-error";
+          error.status = 0;
+          error.retryable = true;
+          throw error;
+        }
+        const conflict = new Error("revision changed");
+        conflict.status = 409;
+        conflict.body = { build: copyJson(compatibilityBuild) };
+        throw conflict;
+      },
+    } },
     setBuildRepresentation: async (itemId, sourceId, sourcePath, options) => {
       events.push({ type: "representation", itemId, sourceId, sourcePath,
         options: { ...options } });
@@ -2187,6 +2278,12 @@ test("build creation strips legacy sources and attaches before history or select
     invalidateRepresentationItemIncarnation: (itemId) => {
       events.push({ type: "incarnation", itemId });
     },
+    mergeBuildCompatibility: (raw, prior) => ({
+      ...raw,
+      _record_revision: raw.updated_at || prior._record_revision || "",
+      _representations: prior._representations || [],
+      _available_commands: prior._available_commands,
+    }),
     refreshBuildEngineRecord: async (itemId) => {
       events.push({ type: "semantic", itemId });
       state.builds[itemId]._available_commands = [
@@ -2210,20 +2307,47 @@ test("build creation strips legacy sources and attaches before history or select
 this.createBuild = createBuild;`, context);
 
   const result = await context.createBuild({
-    title: "Seeded Herbal",
+    title: "  Seeded Herbal  ",
+    subtitle: "  A field guide  ",
+    category_ids: ["plants"],
+    future_extension: { shelf: 3 },
+    bundle: { about: true, annotations: false, pages_text: false,
+      translations: [] },
     pdf_file: "C:/scans/primary.pdf",
     pdf_sources: [{ id: "scan", path: "C:/scans/alternate.pdf" }],
+    status: "ready",
+    images: ["capture/cover.jpg"],
+    extra: { scan_collection_id: "collection-1", shelf: " A " },
+    capture_id: "phone-1",
   }, "seeded", "workbench");
 
-  const post = events.find((event) => event.type === "post");
-  assert.equal("pdf_file" in post.body.build, false);
-  assert.equal("pdf_sources" in post.body.build, false);
+  const command = events.find((event) => event.type === "command").args;
+  assert.equal(command.idempotencyKey, "item-create-create-uuid");
+  assert.deepEqual(command.item, {
+    kind: "book",
+    title: "Seeded Herbal",
+    metadata: {
+      subtitle: "A field guide",
+      category_ids: ["plants"],
+      future_extension: { shelf: 3 },
+      bundle: { about: true, annotations: false, pages_text: false,
+        translations: [] },
+    },
+    representations: [],
+  });
+  for (const managed of [
+    "pdf_file", "pdf_sources", "status", "images", "extra", "capture_id",
+  ]) assert.equal(managed in command.item.metadata, false);
   const mutationEvents = events.filter((event) =>
     event.type === "representation");
   assert.equal(mutationEvents.length, 2);
   assert.equal(mutationEvents[0].options.intent, "attach");
-  assert.equal(mutationEvents[0].options.recordRevision, "item-r1");
+  assert.equal(mutationEvents[0].options.recordRevision, "item-r1c");
   assert.equal(mutationEvents[1].options.recordRevision, "item-r2");
+  assert.ok(events.findIndex((event) => event.type === "command") <
+    events.findIndex((event) => event.type === "compatibility"));
+  assert.ok(events.findIndex((event) => event.type === "compatibility") <
+    events.findIndex((event) => event.type === "semantic"));
   assert.ok(events.findIndex((event) => event.type === "semantic") <
     events.findIndex((event) => event.type === "representation"));
   assert.ok(events.findIndex((event) => event.type === "representation") <
@@ -2234,11 +2358,135 @@ this.createBuild = createBuild;`, context);
   assert.match(creation, /deleteBuildToTombstone/);
   assert.match(creation, /restoreDeletedBuildFromTombstone/);
   assert.doesNotMatch(creation, /deleteBuildToTrash|\/api\/trash/);
+  assert.doesNotMatch(creation, /fetch\(["']\/api\/builds/);
+  assert.match(creation, /engineClient\.items\.create/);
+  assert.match(creation, /engineClient\.items\.seedCompatibility/);
   assert.equal(result.pdf_file, "C:/scans/primary.pdf");
+  assert.deepEqual(result.extra,
+    { scan_collection_id: "collection-1", shelf: "A" });
+  assert.deepEqual(result.images, ["capture/cover.jpg"]);
+  assert.equal(result.capture_id, "phone-1");
+  assert.equal(result.status, "draft");
+  assert.equal(result.notes, "concurrent catalogue edit");
+  assert.deepEqual(copyJson(result.bundle), {
+    about: true, annotations: false, pages_text: false, translations: [],
+  });
+  assert.equal(compatibilityAttempts, 3);
+  assert.deepEqual(events.filter((event) => event.type === "compatibility")
+    .map((event) => event.args.recordRevision),
+  ["item-r1", "item-r1u", "item-r1u"]);
   assert.equal(messages["b-src-msg"].textContent,
     "Source update rejected");
   assert.ok(events.some((event) => event.type === "critical" &&
     /ATTACH FAILED/.test(event.message)));
   assert.equal(events.some((event) =>
     /ATTACHED|SOURCE ADDED/.test(event.message || "")), false);
+});
+
+test("build creation retains one durable command across ambiguous retries", async () => {
+  const app = fs.readFileSync(appPath, "utf8");
+  const start = app.indexOf("const ITEM_CREATE_NON_METADATA_FIELDS");
+  const end = app.indexOf("function buildSeedFromSource", start);
+  assert.ok(start >= 0 && end > start);
+  const state = { builds: {} };
+  const calls = [];
+  const statuses = [];
+  let confirm = false;
+  const context = vm.createContext({
+    state,
+    crypto: { randomUUID: () => "lost-response" },
+    engineClient: { items: { create: async (args) => {
+      calls.push(args);
+      if (!confirm) {
+        const error = new Error("connection closed after commit");
+        error.code = "network-error";
+        error.status = 0;
+        error.retryable = true;
+        throw error;
+      }
+      return itemCreateResult(args, { replayed: true });
+    } } },
+    invalidateRepresentationItemIncarnation: () => {},
+    refreshBuildEngineRecord: async () => {
+      throw new Error("compatibility projection unavailable");
+    },
+    setBuildRepresentation: async () => {
+      throw new Error("no source attachment expected");
+    },
+    secondaryRepresentationId: () => "secondary",
+    representationFailureMessage: () => "failed",
+    pushOp: () => {},
+    selectBuild: () => {},
+    renderUpload: () => {},
+    statusCrit: (message) => statuses.push(message),
+    el: () => null,
+  });
+  vm.runInContext(`${app.slice(start, end)}
+this.createBuild = createBuild;`, context);
+
+  const seed = { title: "Recovered Create", notes: "same command" };
+  assert.equal(await context.createBuild(seed, "lost", "workbench"), null);
+  assert.equal(calls.length, 2);
+  confirm = true;
+  const created = await context.createBuild({
+    notes: "same command", title: "Recovered Create",
+  }, "lost", "workbench");
+
+  assert.equal(calls.length, 3);
+  assert.equal(new Set(calls.map((args) => args.idempotencyKey)).size, 1);
+  assert.equal(calls[0].idempotencyKey, "item-create-lost-response");
+  assert.equal(created.id, "new-book");
+  assert.equal(created._record_revision, "item-r1");
+  assert.equal(created.notes, "same command");
+  assert.equal(Object.keys(state.builds).length, 1);
+  assert.deepEqual(statuses, ["BUILD CREATE FAILED"]);
+});
+
+test("pending create identity includes sources and acquisition provenance", async () => {
+  const app = fs.readFileSync(appPath, "utf8");
+  const start = app.indexOf("const ITEM_CREATE_NON_METADATA_FIELDS");
+  const end = app.indexOf("function buildSeedFromSource", start);
+  assert.ok(start >= 0 && end > start);
+  const calls = [];
+  let sequence = 0;
+  const context = vm.createContext({
+    state: { builds: {} },
+    crypto: { randomUUID: () => `intent-${++sequence}` },
+    engineClient: { items: { create: async (args) => {
+      calls.push(args);
+      const error = new Error("ambiguous create");
+      error.code = "network-error";
+      error.status = 0;
+      error.retryable = true;
+      throw error;
+    } } },
+    statusCrit: () => {},
+  });
+  vm.runInContext(`${app.slice(start, end)}
+this.createBuild = createBuild;`, context);
+
+  const metadata = { title: "Same Catalogue Record", authors: "A. Author" };
+  await context.createBuild({
+    ...metadata, pdf_file: "scans/copy-a.pdf",
+    extra: { scan_collection_id: "collection-a" },
+  }, "copy a", "workbench");
+  await context.createBuild({
+    ...metadata, pdf_file: "scans/copy-b.pdf",
+    extra: { scan_collection_id: "collection-a" },
+  }, "copy b", "workbench");
+  await context.createBuild({
+    ...metadata, pdf_file: "scans/copy-b.pdf",
+    extra: { scan_collection_id: "collection-b" },
+  }, "copy b provenance", "workbench");
+
+  assert.equal(calls.length, 6);
+  const keys = calls.map((args) => args.idempotencyKey);
+  assert.deepEqual(keys, [
+    "item-create-intent-1", "item-create-intent-1",
+    "item-create-intent-2", "item-create-intent-2",
+    "item-create-intent-3", "item-create-intent-3",
+  ]);
+  assert.ok(calls.every((args) =>
+    !Object.hasOwn(args.item.metadata, "extra") &&
+    !Object.hasOwn(args.item.metadata, "pdf_file")));
 });

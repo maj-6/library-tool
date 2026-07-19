@@ -220,6 +220,7 @@
         get: (args) => this._itemGet(args),
         create: (args) => this._itemCreate(args),
         update: (args) => this._itemUpdate(args),
+        seedCompatibility: (args) => this._itemSeedCompatibility(args),
         lifecycle: (args) => this._itemLifecycle(args),
         delete: (args) => this._itemDelete(args),
         representations: (args) => this._itemRepresentations(args),
@@ -395,6 +396,35 @@
         body: { item },
         signal,
       });
+    }
+
+    // Transitional storage-only acquisition fields are not part of the
+    // portable ItemDraft. Keep their legacy route and CAS spelling contained
+    // here so workbench code still depends on a semantic transport method.
+    _itemSeedCompatibility({ itemId, compatibility, recordRevision,
+      signal } = {}) {
+      const revision = String(recordRevision || "");
+      if (!/^[A-Za-z0-9][A-Za-z0-9._:+-]{0,511}$/.test(revision)) {
+        throw new TypeError("recordRevision is not a valid record revision");
+      }
+      if (!isObject(compatibility) ||
+          Object.keys(compatibility).some((key) =>
+            !["extra", "images", "capture_id"].includes(key)) ||
+          (Object.prototype.hasOwnProperty.call(compatibility, "extra") &&
+            !isObject(compatibility.extra)) ||
+          (Object.prototype.hasOwnProperty.call(compatibility, "images") &&
+            (!Array.isArray(compatibility.images) ||
+              compatibility.images.some((value) =>
+                typeof value !== "string"))) ||
+          (Object.prototype.hasOwnProperty.call(compatibility, "capture_id") &&
+            typeof compatibility.capture_id !== "string")) {
+        throw new TypeError("compatibility must contain only acquisition fields");
+      }
+      return this._requestJson(
+        "PATCH", `/builds/${encodePart(itemId)}`, {
+          body: { ...compatibility, expect_updated_at: revision },
+          signal,
+        });
     }
 
     _itemUpdate({ itemId, bookId, patch, recordRevision, idempotencyKey,
