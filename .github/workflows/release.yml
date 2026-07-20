@@ -46,6 +46,9 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       android_release: ${{ steps.scope.outputs.android_release }}
+      android_version: ${{ steps.scope.outputs.android_version }}
+      desktop_version: ${{ steps.version.outputs.desktop_version }}
+      release_channel: ${{ steps.version.outputs.release_channel }}
     steps:
       - name: Check out
         uses: actions/checkout@v4
@@ -62,7 +65,8 @@ jobs:
       # release when they disagree: a partial release would otherwise hide the
       # failure while installed desktop clients never see a newer version.
       - name: Verify tag matches the desktop version
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        id: version
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: |
           version="$(node -p 'require("./desktop/package.json").version')"
@@ -70,45 +74,47 @@ jobs:
             echo "::error::Tag $GITHUB_REF_NAME does not match desktop/package.json v$version"
             exit 1
           fi
-          case "$version" in
-            *-alpha.*|*-beta.*|*-rc.*) ;;
-            *-*)
-              echo "::error::Unsupported public prerelease suffix in $version. Use alpha, beta, or rc; workflow-dispatch artifacts are the only debug builds."
-              exit 1
-              ;;
-          esac
+          python3 .github/scripts/release_preflight.py classify-version \
+            --version "$version" --github-output "$GITHUB_OUTPUT"
+          echo "desktop_version=$version" >> "$GITHUB_OUTPUT"
 
       # Desktop and Book Capture version independently. A desktop tag must not
       # rebuild changed Android sources under the same Android version identity:
       # that produces two different APKs with one versionCode/versionName.
-      # Dispatch remains a full dry run; tag builds include Android only after
-      # its explicit version identity changes from the nearest prior v* tag.
+      # Dispatch remains a full dry run. A tag build includes Android only when
+      # both identity fields advance beyond the newest previously published,
+      # non-draft release that actually contains a usable BookCapture APK.
       - name: Determine app release scope
         id: scope
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "$GITHUB_EVENT_NAME" != "push" ] || [[ "$GITHUB_REF" != refs/tags/* ]]; then
-            echo "android_release=true" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" != "push" ] || [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            empty_releases="$RUNNER_TEMP/empty-release-pages.json"
+            printf '[]\n' > "$empty_releases"
+            python3 .github/scripts/release_preflight.py android-scope \
+              --releases-json "$empty_releases" \
+              --repository "$GITHUB_WORKSPACE" \
+              --version-file android/BookCapture/app/build.gradle.kts \
+              --github-output "$GITHUB_OUTPUT"
             exit 0
           fi
-          previous_tag=$(git describe --tags --abbrev=0 "$GITHUB_SHA^" --match 'v*' 2>/dev/null || true)
-          if [ -z "$previous_tag" ]; then
-            echo "android_release=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          version_file=android/BookCapture/app/build.gradle.kts
-          current_identity=$(sed -n '/versionCode =/p;/versionName =/p' "$version_file" | sed 's/^[[:space:]]*//')
-          previous_identity=$(git show "$previous_tag:$version_file" 2>/dev/null | sed -n '/versionCode =/p;/versionName =/p' | sed 's/^[[:space:]]*//' || true)
-          if [ -z "$current_identity" ]; then
-            echo "::error::Could not read the current Android version identity."
+          releases_json="$RUNNER_TEMP/github-releases.json"
+          if ! gh api --paginate --slurp \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$releases_json"
+          then
+            echo "::error::Could not list published GitHub releases; refusing to guess the Android release scope."
             exit 1
           fi
-          if [ "$current_identity" = "$previous_identity" ]; then
-            echo "android_release=false" >> "$GITHUB_OUTPUT"
-            echo "Android version is unchanged from $previous_tag; this is a desktop-only release."
-          else
-            echo "android_release=true" >> "$GITHUB_OUTPUT"
-          fi
+          python3 .github/scripts/release_preflight.py android-scope \
+            --releases-json "$releases_json" \
+            --repository "$GITHUB_WORKSPACE" \
+            --version-file android/BookCapture/app/build.gradle.kts \
+            --exclude-tag "$GITHUB_REF_NAME" \
+            --github-output "$GITHUB_OUTPUT"
 
   android:
     needs: preflight
@@ -136,7 +142,7 @@ jobs:
           KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
           KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          IS_RELEASE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+          IS_RELEASE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
         run: |
           if [ -n "$KS_B64" ]; then
             # strip any CR/LF/space first: a secret uploaded from a Windows
@@ -387,7 +393,7 @@ jobs:
   # each publish step below is guarded on its artifact being present.
   publish:
     if: |
-      always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') &&
+      !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') &&
       needs.preflight.result == 'success' &&
       (needs.desktop.result == 'success' || needs.android.result == 'success')
     needs: [preflight, android, desktop]
@@ -398,11 +404,19 @@ jobs:
       - name: Check out
         uses: actions/checkout@v4
 
-      - name: Collect the builds
+      - name: Collect the desktop build
+        if: needs.desktop.result == 'success'
         uses: actions/download-artifact@v4
         with:
+          name: desktop
           path: dist
-          merge-multiple: true
+
+      - name: Collect the Android build
+        if: needs.android.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: android
+          path: dist
 
       # The android job verifies the signer against the tracked production
       # fingerprint before upload, so anything reaching a tagged publish has the
@@ -418,35 +432,172 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           APK_V: ${{ needs.android.outputs.version }}
           EXE_V: ${{ needs.desktop.outputs.version }}
+          ANDROID_VERSION: ${{ needs.preflight.outputs.android_version }}
+          DESKTOP_VERSION: ${{ needs.preflight.outputs.desktop_version }}
+          ANDROID_REQUESTED: ${{ needs.preflight.outputs.android_release }}
+          ANDROID_RESULT: ${{ needs.android.result }}
+          RELEASE_CHANNEL: ${{ needs.preflight.outputs.release_channel }}
         run: |
-          # Derive the public title and preamble from the files actually
-          # collected. The jobs intentionally release independently, so a
-          # one-sided release must never look like both apps shipped.
-          desktop_asset=$(find dist -maxdepth 1 -type f -name 'LibraryTool-Setup-*.exe' -print -quit)
-          android_asset=$(find dist -maxdepth 1 -type f -name 'BookCapture-*.apk' -print -quit)
-          if [ -z "$desktop_asset" ] && [ -z "$android_asset" ]; then
+          # Build an explicit upload allowlist. Named artifact downloads keep
+          # unrelated future diagnostics out of dist, while these exact checks
+          # keep unexpected files out of the public GitHub Release.
+          mapfile -t desktop_assets < <(find dist -maxdepth 1 -type f -name 'LibraryTool-Setup-*.exe' -print)
+          mapfile -t android_assets < <(find dist -maxdepth 1 -type f -name 'BookCapture-*.apk' -print)
+          if [ "${#desktop_assets[@]}" -gt 1 ] || [ "${#android_assets[@]}" -gt 1 ]; then
+            echo "::error::Expected at most one installer and one APK in the release inputs."
+            exit 1
+          fi
+          desktop_asset="${desktop_assets[0]:-}"
+          android_asset="${android_assets[0]:-}"
+          upload_assets=()
+          if [ -n "$desktop_asset" ]; then
+            if [ "$desktop_asset" != "dist/LibraryTool-Setup-$DESKTOP_VERSION.exe" ]; then
+              echo "::error::Unexpected desktop installer name: $desktop_asset"
+              exit 1
+            fi
+            for asset in "$desktop_asset" "$desktop_asset.blockmap" dist/latest.yml; do
+              if [ ! -s "$asset" ]; then
+                echo "::error::Missing or empty allowlisted desktop release asset: $asset"
+                exit 1
+              fi
+              upload_assets+=("$asset")
+            done
+          fi
+          if [ -n "$android_asset" ]; then
+            if [ "$android_asset" != "dist/BookCapture-$ANDROID_VERSION.apk" ] \
+              || [[ "${android_asset,,}" == *donotpublish* ]] \
+              || [ ! -s "$android_asset" ]
+            then
+              echo "::error::Refusing a non-publishable or empty Android release asset."
+              exit 1
+            fi
+            upload_assets+=("$android_asset")
+          fi
+          if [ "${#upload_assets[@]}" -eq 0 ]; then
             echo "::error::No releasable desktop or Android artifact was collected."
             exit 1
           fi
+
+          # Preserve coherent metadata on reruns. Existing allowed assets count
+          # toward full/partial status even when this attempt did not rebuild
+          # them. Query the complete Releases API so draft releases left by an
+          # interrupted first upload are discoverable and recoverable too.
+          release_exists=false
+          release_is_draft=false
+          existing_assets="$RUNNER_TEMP/existing-release-assets.txt"
+          current_releases_json="$RUNNER_TEMP/current-github-releases.json"
+          if ! gh api --paginate --slurp \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$current_releases_json"
+          then
+            echo "::error::Could not inspect existing GitHub releases before publishing."
+            exit 1
+          fi
+          if ! release_state=$(python3 .github/scripts/release_preflight.py inspect-release \
+            --releases-json "$current_releases_json" \
+            --tag "$GITHUB_REF_NAME" \
+            --assets-output "$existing_assets")
+          then
+            echo "::error::Could not interpret the current GitHub Release state."
+            exit 1
+          fi
+          case "$release_state" in
+            absent) ;;
+            draft) release_exists=true; release_is_draft=true ;;
+            published) release_exists=true ;;
+            *) echo "::error::Release inspection returned invalid state '$release_state'."; exit 1 ;;
+          esac
+          expected_existing_android="BookCapture-$ANDROID_VERSION.apk"
+          existing_desktop_asset="LibraryTool-Setup-$DESKTOP_VERSION.exe"
+          while IFS= read -r existing_asset; do
+            case "$existing_asset" in
+              "$expected_existing_android"|"$existing_desktop_asset"|"$existing_desktop_asset.blockmap"|latest.yml) ;;
+              *)
+                echo "::error::Existing release contains an asset outside the public allowlist: $existing_asset"
+                exit 1
+                ;;
+            esac
+          done < "$existing_assets"
+          existing_android_asset=$(grep -Fx -- "$expected_existing_android" \
+            "$existing_assets" | head -1 || true)
+          existing_desktop=false
+          existing_desktop_parts=0
+          for existing_part in \
+            "$existing_desktop_asset" \
+            "$existing_desktop_asset.blockmap" \
+            latest.yml
+          do
+            if grep -Fqx -- "$existing_part" "$existing_assets"; then
+              existing_desktop_parts=$((existing_desktop_parts + 1))
+            fi
+          done
+          case "$existing_desktop_parts" in
+            0) ;;
+            3) existing_desktop=true ;;
+            *)
+              if [ -z "$desktop_asset" ]; then
+                echo "::error::Existing release has an incomplete desktop updater asset set and this run cannot repair it."
+                exit 1
+              fi
+              ;;
+          esac
+          has_desktop=false
+          has_android=false
+          if [ -n "$desktop_asset" ] || [ "$existing_desktop" = true ]; then
+            has_desktop=true
+          fi
+          if [ -n "$android_asset" ] || [ -n "$existing_android_asset" ]; then
+            has_android=true
+          fi
+
+          # A draft may contain an asset uploaded by an earlier attempt whose
+          # corresponding build failed on this rerun. Recover that exact,
+          # allowlisted file locally so the post-publication website step can
+          # register every asset on the now-complete release.
+          if [ -z "$desktop_asset" ] && [ "$existing_desktop" = true ]; then
+            gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --pattern "$existing_desktop_asset" --dir dist
+            if [ ! -s "dist/$existing_desktop_asset" ]; then
+              echo "::error::Could not recover the existing desktop installer for registration."
+              exit 1
+            fi
+          fi
+          if [ -z "$android_asset" ] && [ -n "$existing_android_asset" ]; then
+            gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --pattern "$existing_android_asset" --dir dist
+            if [ ! -s "dist/$existing_android_asset" ]; then
+              echo "::error::Could not recover the existing Android APK for registration."
+              exit 1
+            fi
+          fi
+
+          case "$RELEASE_CHANNEL" in
+            stable) release_metadata_args=(--prerelease=false --latest) ;;
+            alpha|beta|rc) release_metadata_args=(--prerelease --latest=false) ;;
+            *)
+              echo "::error::Preflight returned unsupported release channel '$RELEASE_CHANNEL'."
+              exit 1
+              ;;
+          esac
           notes=""
           partial_message=""
-          if [ -n "$desktop_asset" ] && [ -n "$android_asset" ]; then
+          if [ "$has_desktop" = true ] && [ "$has_android" = true ]; then
             release_title="Library Tool $GITHUB_REF_NAME"
-            notes="Desktop $EXE_V · Android BookCapture $APK_V"
-          elif [ -n "$desktop_asset" ]; then
+            notes="Desktop ${EXE_V:-$DESKTOP_VERSION} · Android BookCapture ${APK_V:-$ANDROID_VERSION}"
+          elif [ "$has_desktop" = true ]; then
             release_title="Library Tool $GITHUB_REF_NAME (desktop only)"
-            notes="Desktop $EXE_V"
-            partial_message="Only Library Tool Desktop \`$EXE_V\` (\`$(basename "$desktop_asset")\`) is attached. Android Book Capture did not build successfully, so this release contains no Android APK."
+            notes="Desktop ${EXE_V:-$DESKTOP_VERSION}"
+            if [ "$ANDROID_REQUESTED" = false ] && [ "$ANDROID_RESULT" = skipped ]; then
+              partial_message="Only Library Tool Desktop is attached. Android Book Capture \`$ANDROID_VERSION\` matches the newest previously published APK and was deliberately not rebuilt."
+            else
+              partial_message="Only Library Tool Desktop is attached. Android Book Capture did not build successfully, so this release contains no Android APK."
+            fi
           else
-            release_title="Android Book Capture $APK_V ($GITHUB_REF_NAME; Android only)"
-            notes="Android BookCapture $APK_V"
-            partial_message="Only Android Book Capture \`$APK_V\` (\`$(basename "$android_asset")\`) is attached. Library Tool Desktop did not build successfully, so this release contains no Windows installer or updater files."
+            release_title="Android Book Capture ${APK_V:-$ANDROID_VERSION} ($GITHUB_REF_NAME; Android only)"
+            notes="Android BookCapture ${APK_V:-$ANDROID_VERSION}"
+            partial_message="Only Android Book Capture is attached. Library Tool Desktop did not build successfully, so this release contains no Windows installer or updater files."
           fi
-          # A prerelease tag (v0.8.0-alpha.1 / -beta / -rc) is flagged prerelease
-          # on GitHub. Stable installs remain on the stable channel; installed
-          # prereleases follow the prerelease line, and stable installs can opt in.
-          pre_args=()
-          case "$GITHUB_REF_NAME" in *-alpha*|*-beta*|*-rc*) pre_args=(--prerelease) ;; esac
           notes_file="docs/releases/$GITHUB_REF_NAME.md"
           effective_notes="$RUNNER_TEMP/release-notes.md"
           : > "$effective_notes"
@@ -461,14 +612,29 @@ jobs:
             printf '%s\n' "$notes" >> "$effective_notes"
           fi
           notes_args=(--notes-file "$effective_notes")
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if [ "$release_exists" = true ]; then
+            # Upload before editing a published release, and repair a draft left
+            # by an interrupted first attempt before making it public.
+            if [ "$release_is_draft" = true ]; then
+              echo "Recovering the existing draft release for $GITHUB_REF_NAME."
+            fi
+            gh release upload "$GITHUB_REF_NAME" "${upload_assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" --clobber
             gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-              --title "$release_title" "${notes_args[@]}" "${pre_args[@]}"
+              --draft=false --title "$release_title" "${notes_args[@]}" \
+              "${release_metadata_args[@]}"
           else
+            # Keep new release metadata private until every explicit upload
+            # succeeds. An interrupted upload remains a recoverable draft for
+            # the next run; channel/latest state is applied only at publication.
             gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
-              "${pre_args[@]}" --title "$release_title" "${notes_args[@]}"
+              --draft --title "$release_title" "${notes_args[@]}"
+            gh release upload "$GITHUB_REF_NAME" "${upload_assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --draft=false --title "$release_title" "${notes_args[@]}" \
+              "${release_metadata_args[@]}"
           fi
-          gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
 
       # The step the website actually sees. release_publish.py gets the local
       # file (for sha256/bytes) plus --url, so the row points at the GitHub
@@ -477,6 +643,9 @@ jobs:
         env:
           SUPABASE_URL: ${{ vars.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RELEASE_CHANNEL: ${{ needs.preflight.outputs.release_channel }}
+          DESKTOP_VERSION: ${{ needs.preflight.outputs.desktop_version }}
+          ANDROID_VERSION: ${{ needs.preflight.outputs.android_version }}
         run: |
           if [ -z "$SUPABASE_KEY" ]; then
             echo "::warning::SUPABASE_SERVICE_ROLE_KEY is not set, so the \
@@ -486,24 +655,21 @@ jobs:
             exit 0
           fi
           BASE="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME"
-          # A prerelease tag registers on its own channel so the row lands in the
-          # Downloads page's "Other downloads" section instead of replacing the
-          # stable card (the table's unique key is platform+version+channel).
-          CH=stable
-          case "$GITHUB_REF_NAME" in
-            *-alpha*) CH=alpha ;;
-            *-beta*)  CH=beta ;;
-            *-rc*)    CH=rc ;;
+          case "$RELEASE_CHANNEL" in
+            stable|alpha|beta|rc) ;;
+            *) echo "::error::Unsupported release channel '$RELEASE_CHANNEL'."; exit 1 ;;
           esac
           # register only the app(s) whose artifact is present, so one build's
           # failure never blocks the other from reaching the Downloads page
-          EXE=$(ls dist/LibraryTool-Setup-*.exe 2>/dev/null | head -1 || true)
-          APK=$(ls dist/BookCapture-*.apk 2>/dev/null | head -1 || true)
+          EXE="dist/LibraryTool-Setup-$DESKTOP_VERSION.exe"
+          APK="dist/BookCapture-$ANDROID_VERSION.apk"
+          [ -s "$EXE" ] || EXE=""
+          [ -s "$APK" ] || APK=""
           if [ -n "$EXE" ]; then
             python3 tools/release_publish.py "$EXE" --url "$BASE/$(basename "$EXE")" \
-              --platform windows --version "${{ needs.desktop.outputs.version }}" --channel "$CH"
+              --platform windows --version "$DESKTOP_VERSION" --channel "$RELEASE_CHANNEL"
           fi
           if [ -n "$APK" ]; then
             python3 tools/release_publish.py "$APK" --url "$BASE/$(basename "$APK")" \
-              --platform android --version "${{ needs.android.outputs.version }}" --channel "$CH"
+              --platform android --version "$ANDROID_VERSION" --channel "$RELEASE_CHANNEL"
           fi

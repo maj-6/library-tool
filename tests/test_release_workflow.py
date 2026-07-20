@@ -4,15 +4,13 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKFLOW = (ROOT / ".github" / "workflows" / "release.yml").read_text(
-    encoding="utf-8"
-)
-CI_WORKFLOW = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
-    encoding="utf-8"
-)
+WORKFLOW = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+CI_WORKFLOW = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 ANDROID_CERT_SHA256 = (
-    ROOT / "android" / "BookCapture" / "release-signing-cert.sha256"
-).read_text(encoding="utf-8").strip()
+    (ROOT / "android" / "BookCapture" / "release-signing-cert.sha256")
+    .read_text(encoding="utf-8")
+    .strip()
+)
 
 
 def _job(name: str, next_name: str) -> str:
@@ -42,20 +40,44 @@ def test_android_is_released_only_after_its_version_identity_changes():
 
     assert "fetch-depth: 0" in preflight
     assert "android_release: ${{ steps.scope.outputs.android_release }}" in preflight
-    assert 'git describe --tags --abbrev=0 "$GITHUB_SHA^"' in preflight
-    assert "/versionCode =/p;/versionName =/p" in preflight
-    assert 'if [ "$current_identity" = "$previous_identity" ]; then' in preflight
-    assert "android_release=false" in preflight
-    assert "this is a desktop-only release" in preflight
+    assert "android_version: ${{ steps.scope.outputs.android_version }}" in preflight
+    assert "desktop_version: ${{ steps.version.outputs.desktop_version }}" in preflight
+    assert "gh api --paginate --slurp" in preflight
+    assert '"repos/$GITHUB_REPOSITORY/releases?per_page=100"' in preflight
+    assert "if ! gh api" in preflight
+    assert "refusing to guess the Android release scope" in preflight
+    assert ".github/scripts/release_preflight.py android-scope" in preflight
+    assert '--exclude-tag "$GITHUB_REF_NAME"' in preflight
+    assert "git describe" not in preflight
     assert "if: needs.preflight.outputs.android_release == 'true'" in android
 
 
 def test_public_tags_reject_unknown_prerelease_channels():
     preflight = _job("preflight", "android")
+    publish = WORKFLOW[WORKFLOW.index("  publish:\n") :]
 
-    assert "*-alpha.*|*-beta.*|*-rc.*" in preflight
-    assert "Unsupported public prerelease suffix" in preflight
-    assert "workflow-dispatch artifacts are the only debug builds" in preflight
+    assert "release_channel: ${{ steps.version.outputs.release_channel }}" in preflight
+    assert ".github/scripts/release_preflight.py classify-version" in preflight
+    assert "*-alpha.*|*-beta.*|*-rc.*" not in preflight
+    assert "RELEASE_CHANNEL: ${{ needs.preflight.outputs.release_channel }}" in publish
+    assert 'case "$GITHUB_REF_NAME"' not in publish
+    assert '--channel "$RELEASE_CHANNEL"' in publish
+    assert "--prerelease=false --latest" in publish
+    assert "--prerelease --latest=false" in publish
+    assert '"${release_metadata_args[@]}"' in publish
+
+
+def test_publish_runs_after_failures_or_skips_but_never_after_cancellation():
+    publish = WORKFLOW[WORKFLOW.index("  publish:\n") :]
+
+    condition = publish[: publish.index("    needs:")]
+    assert "!cancelled()" in condition
+    assert "always()" not in condition
+    assert "needs.preflight.result == 'success'" in condition
+    assert (
+        "needs.desktop.result == 'success' || needs.android.result == 'success'"
+        in condition
+    )
 
 
 def test_release_token_is_write_scoped_only_to_publish_job():
@@ -74,7 +96,7 @@ def test_release_requires_persistent_android_signing_identity():
     # A tagged build with no keystore must FAIL the android job rather than
     # silently fall back to the runner's debug key (issue #119).
     release_event = (
-        "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')"
+        "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
     )
     assert f"IS_RELEASE: ${{{{ {release_event} }}}}" in android
     assert 'elif [ "$IS_RELEASE" = "true" ]; then' in android
@@ -124,16 +146,77 @@ def test_partial_release_metadata_comes_from_collected_artifacts():
 
     # Preserve independent app releases, but title and qualify a one-sided
     # GitHub Release from the files that were actually downloaded.
-    assert "needs.desktop.result == 'success' || needs.android.result == 'success'" in publish
-    assert "desktop_asset=$(find dist" in publish
-    assert "android_asset=$(find dist" in publish
+    assert (
+        "needs.desktop.result == 'success' || needs.android.result == 'success'"
+        in publish
+    )
+    assert "mapfile -t desktop_assets" in publish
+    assert "mapfile -t android_assets" in publish
     assert "(desktop only)" in publish
     assert "Android only" in publish
     assert "**Partial release:**" in publish
+    assert "was deliberately not rebuilt" in publish
     assert 'notes_args=(--notes-file "$effective_notes")' in publish
     # A retry must replace a stale partial/full title and notes, not merely
     # clobber the binary assets on an existing GitHub Release.
     assert 'gh release edit "$GITHUB_REF_NAME"' in publish
+
+    # Reruns include allowed assets already attached to this tag when deriving
+    # full/partial metadata, but only freshly collected allowlisted files upload.
+    assert ".github/scripts/release_preflight.py inspect-release" in publish
+    assert "draft) release_exists=true; release_is_draft=true" in publish
+    assert "existing_android_asset=" in publish
+    assert "existing_desktop_asset=" in publish
+    assert 'gh release download "$GITHUB_REF_NAME"' in publish
+    assert '--pattern "$existing_android_asset" --dir dist' in publish
+    assert '--pattern "$existing_desktop_asset" --dir dist' in publish
+    assert 'if [ "$has_desktop" = true ] && [ "$has_android" = true ]; then' in publish
+
+
+def test_publish_downloads_and_uploads_only_named_release_artifacts():
+    publish = WORKFLOW[WORKFLOW.index("  publish:\n") :]
+
+    assert "name: desktop" in publish
+    assert "name: android" in publish
+    assert "merge-multiple: true" not in publish
+    assert 'upload_assets+=("$asset")' in publish
+    assert 'upload_assets+=("$android_asset")' in publish
+    assert '"dist/LibraryTool-Setup-$DESKTOP_VERSION.exe"' in publish
+    assert '"dist/BookCapture-$ANDROID_VERSION.apk"' in publish
+    assert '"${upload_assets[@]}"' in publish
+    assert "asset outside the public allowlist" in publish
+    assert "dist/*" not in publish
+
+
+def test_publication_is_atomic_and_registration_follows_publication():
+    publish = WORKFLOW[WORKFLOW.index("  publish:\n") :]
+    github_step = publish[publish.index("      - name: GitHub Release") :]
+    github_step = github_step[
+        : github_step.index("      - name: Register on the Downloads page")
+    ]
+
+    # Existing releases receive complete assets before metadata is edited. A
+    # recovered draft is explicitly published only after that upload succeeds.
+    assert github_step.index("gh release upload") < github_step.index("gh release edit")
+    assert "--draft=false" in github_step
+    # New releases explicitly follow create-draft -> allowlisted upload ->
+    # publish. Channel/latest metadata is absent from draft creation and applied
+    # only by the final edit.
+    new_release = github_step[github_step.index("# Keep new release metadata") :]
+    create_at = new_release.index("gh release create")
+    upload_at = new_release.index("gh release upload")
+    publish_at = new_release.index("gh release edit")
+    assert create_at < upload_at < publish_at
+    create_command = new_release[create_at:upload_at]
+    assert "--draft --title" in create_command
+    assert '"${release_metadata_args[@]}"' not in create_command
+    assert '"${upload_assets[@]}"' in new_release[upload_at:publish_at]
+    assert "--draft=false" in new_release[publish_at:]
+    assert '"${release_metadata_args[@]}"' in new_release[publish_at:]
+
+    assert publish.index("      - name: GitHub Release") < publish.index(
+        "      - name: Register on the Downloads page"
+    )
 
 
 def test_desktop_job_requires_the_complete_updater_artifact_set():
@@ -167,7 +250,9 @@ def test_release_docs_use_raw_windows_base64_not_certutil_pem():
 
 
 def test_release_source_versions_are_internally_consistent():
-    package = json.loads((ROOT / "desktop" / "package.json").read_text(encoding="utf-8"))
+    package = json.loads(
+        (ROOT / "desktop" / "package.json").read_text(encoding="utf-8")
+    )
     lock = json.loads(
         (ROOT / "desktop" / "package-lock.json").read_text(encoding="utf-8")
     )

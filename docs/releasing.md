@@ -57,6 +57,10 @@ that actually meet the bar above.
 `debug` is not a public update channel. Use `workflow_dispatch` for a private,
 inspectable debug artifact; public prerelease tags accept only `alpha`, `beta`,
 or `rc`, so an experimental suffix can never fall through to the stable list.
+The public-version grammar is exact: `X.Y.Z` for stable or
+`X.Y.Z-(alpha|beta|rc).N` for a prerelease, using canonical non-negative integer
+components. Mixed or trailing suffixes such as `-debug-alpha.1` and
+`-alpha.1-debug` fail preflight instead of being classified by substring.
 
 Two ways a row gets there:
 
@@ -65,14 +69,21 @@ Two ways a row gets there:
 `.github/workflows/release.yml` runs on the public repo when a `v*` tag is
 pushed:
 
-1. **android**, when its `versionCode`/`versionName` changed since the preceding
-   desktop tag, builds `android/BookCapture` (`assembleRelease`) and names the APK
-   after its gradle `versionName`. An unchanged Android version is skipped so a
-   desktop-only release cannot publish different APK bytes under an old Android
-   identity. A tag push that includes Android **requires** the release keystore
-   secret: without it the android job fails before the APK is uploaded, because a
-   debug-signed build can't update an existing install. The desktop release is
-   independent and still ships. The job then verifies the APK's signer (via
+1. **android** compares its `versionCode` and `versionName` with the newest
+   previous, non-draft GitHub Release that actually contains a non-empty,
+   uploaded `BookCapture-*.apk`. Releases where Android failed are not a
+   baseline, so a partial desktop release cannot make the next run skip an APK
+   that never shipped. The release query is fail-closed: an API, JSON, tag, or
+   Gradle-version parsing error stops preflight instead of guessing. If no APK
+   has ever shipped, Android is included as a first release. If both values are
+   unchanged, Android is deliberately skipped. Otherwise, `versionCode` must
+   increase and `versionName` must also change; a name-only, code-only, equal-code,
+   or decreasing-code change is rejected. The job then builds
+   `android/BookCapture` (`assembleRelease`) and names the APK after its Gradle
+   `versionName`. A tag push that includes Android **requires** the release
+   keystore secret: without it the android job fails before the APK is uploaded,
+   because a debug-signed build can't update an existing install. The desktop
+   release is independent and still ships. The job then verifies the APK's signer (via
    `apksigner`) and requires its normalized certificate SHA-256 to match
    `android/BookCapture/release-signing-cert.sha256`. This also protects a
    release-signed `workflow_dispatch` build. A dispatch without the secret still
@@ -93,10 +104,26 @@ pushed:
    job runs when either build succeeded and registers only the artifact(s)
    present, so a broken Android build never blocks a desktop release (or vice
    versa). When only one app builds, the GitHub Release title and a prominent
-   notes preamble identify the release as partial and name the missing artifact.
+   notes preamble identify the release as partial and distinguish a deliberate
+   unchanged-version Android skip from a build failure. Reruns also account for
+   allowed assets already attached to the same release so they do not rewrite a
+   full release as partial. Only the named `desktop` and `android` workflow
+   artifacts are downloaded, and an explicit installer/manifest/blockmap/APK
+   allowlist is uploaded. A new GitHub Release stays draft until every
+   allowlisted asset uploads successfully; a rerun repairs an interrupted draft
+   before publishing it. Existing public releases receive replacement assets
+   before their title, notes, and channel metadata are edited. If a rerun reuses
+   an already-uploaded allowlisted asset, it downloads that exact file for the
+   subsequent Downloads-page registration step as well.
    The Downloads page shows the rows immediately, and existing
    installs with auto-update on (the Settings > Updates default) pick the
    update up on their next launch.
+
+The Downloads page fails closed on release rows: unknown or whitespace-only
+channels, non-HTTP(S) or malformed URLs, and names containing `DONOTPUBLISH`
+are filtered before choosing the newest build for each platform and channel.
+That lets an older valid release remain visible if a newer invalid row is ever
+inserted manually.
 
 So cutting a release is:
 
