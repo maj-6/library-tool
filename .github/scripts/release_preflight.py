@@ -244,10 +244,14 @@ def _validated_repo_path(raw_path: str) -> str:
 def read_file_at_tag(repository: Path, tag: str, relative_path: str) -> str:
     """Read a tracked file from a release tag without accepting option injection."""
 
-    if not tag.startswith("v"):
+    if tag.startswith("android-v"):
+        version = tag.removeprefix("android-v")
+    elif tag.startswith("v"):
+        version = tag.removeprefix("v")
+    else:
         raise PreflightError(f"Published Android release has an unsafe tag {tag!r}.")
     try:
-        classify_public_version(tag[1:])
+        classify_public_version(version)
     except PreflightError as exc:
         raise PreflightError(
             f"Published Android release has an unsupported tag {tag!r}; "

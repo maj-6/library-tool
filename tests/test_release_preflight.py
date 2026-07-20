@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -298,6 +299,35 @@ def test_scope_treats_no_published_apk_as_first_android_release(tmp_path):
     assert scope.baseline_tag is None
 
 
+@pytest.mark.parametrize("tag", ["v0.5.1-alpha.7", "android-v0.5.1-alpha.7"])
+def test_git_baseline_reader_accepts_public_desktop_and_android_tags(
+    tmp_path, monkeypatch, tag
+):
+    version_file = Path("android/BookCapture/app/build.gradle.kts")
+    contents = 'versionCode = 26\nversionName = "0.5.1-alpha.7"\n'
+    seen = []
+
+    def git_show(args, **kwargs):
+        seen.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0, stdout=contents)
+
+    monkeypatch.setattr(preflight.subprocess, "run", git_show)
+
+    assert preflight.read_file_at_tag(tmp_path, tag, version_file.as_posix()) == contents
+    assert seen == [
+        (
+            ["git", "show", f"refs/tags/{tag}:{version_file.as_posix()}"],
+            {
+                "cwd": tmp_path,
+                "check": True,
+                "capture_output": True,
+                "text": True,
+                "encoding": "utf-8",
+            },
+        )
+    ]
+
+
 @pytest.mark.parametrize(
     "tag",
     [
@@ -306,6 +336,10 @@ def test_scope_treats_no_published_apk_as_first_android_release(tmp_path):
         "v0.5.1/other",
         "v0.5.1-alpha.1-debug",
         "v0.5.1 debug",
+        "android-v0.5.1:refs/heads/main",
+        "android-v0.5.1/other",
+        "android-v0.5.1-alpha.1-debug",
+        "android-v0.5.1 debug",
     ],
 )
 def test_git_baseline_reader_rejects_tags_outside_public_tag_grammar(tmp_path, tag):
