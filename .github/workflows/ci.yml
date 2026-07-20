@@ -54,6 +54,7 @@ jobs:
           node --experimental-default-type=module --check website/assets/browse.js
           node --experimental-default-type=module --check website/assets/author.js
           node --experimental-default-type=module --check website/assets/releases.js
+          node --experimental-default-type=module --check website/assets/release-policy.js
           node --experimental-default-type=module --check website/assets/textsearch.js
           node --experimental-default-type=module --check website/assets/read.js
           node --test tests/*.test.js
