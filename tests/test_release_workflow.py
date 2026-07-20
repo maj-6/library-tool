@@ -33,6 +33,20 @@ def test_release_tag_version_preflight_gates_every_publish_path():
     assert "needs: [preflight, android, desktop]" in publish
 
 
+def test_android_is_released_only_after_its_version_identity_changes():
+    preflight = _job("preflight", "android")
+    android = _job("android", "desktop")
+
+    assert "fetch-depth: 0" in preflight
+    assert "android_release: ${{ steps.scope.outputs.android_release }}" in preflight
+    assert 'git describe --tags --abbrev=0 "$GITHUB_SHA^"' in preflight
+    assert "/versionCode =/p;/versionName =/p" in preflight
+    assert 'if [ "$current_identity" = "$previous_identity" ]; then' in preflight
+    assert "android_release=false" in preflight
+    assert "this is a desktop-only release" in preflight
+    assert "if: needs.preflight.outputs.android_release == 'true'" in android
+
+
 def test_public_tags_reject_unknown_prerelease_channels():
     preflight = _job("preflight", "android")
 

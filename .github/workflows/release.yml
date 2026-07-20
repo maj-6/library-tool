@@ -44,9 +44,13 @@ concurrency:
 jobs:
   preflight:
     runs-on: ubuntu-latest
+    outputs:
+      android_release: ${{ steps.scope.outputs.android_release }}
     steps:
       - name: Check out
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -74,8 +78,41 @@ jobs:
               ;;
           esac
 
+      # Desktop and Book Capture version independently. A desktop tag must not
+      # rebuild changed Android sources under the same Android version identity:
+      # that produces two different APKs with one versionCode/versionName.
+      # Dispatch remains a full dry run; tag builds include Android only after
+      # its explicit version identity changes from the nearest prior v* tag.
+      - name: Determine app release scope
+        id: scope
+        shell: bash
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != "push" ] || [[ "$GITHUB_REF" != refs/tags/* ]]; then
+            echo "android_release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          previous_tag=$(git describe --tags --abbrev=0 "$GITHUB_SHA^" --match 'v*' 2>/dev/null || true)
+          if [ -z "$previous_tag" ]; then
+            echo "android_release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          version_file=android/BookCapture/app/build.gradle.kts
+          current_identity=$(sed -n '/versionCode =/p;/versionName =/p' "$version_file" | sed 's/^[[:space:]]*//')
+          previous_identity=$(git show "$previous_tag:$version_file" 2>/dev/null | sed -n '/versionCode =/p;/versionName =/p' | sed 's/^[[:space:]]*//' || true)
+          if [ -z "$current_identity" ]; then
+            echo "::error::Could not read the current Android version identity."
+            exit 1
+          fi
+          if [ "$current_identity" = "$previous_identity" ]; then
+            echo "android_release=false" >> "$GITHUB_OUTPUT"
+            echo "Android version is unchanged from $previous_tag; this is a desktop-only release."
+          else
+            echo "android_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
   android:
     needs: preflight
+    if: needs.preflight.outputs.android_release == 'true'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}

@@ -65,8 +65,11 @@ Two ways a row gets there:
 `.github/workflows/release.yml` runs on the public repo when a `v*` tag is
 pushed:
 
-1. **android** builds `android/BookCapture` (`assembleRelease`) and names the APK
-   after its gradle `versionName`. A tag push **requires** the release keystore
+1. **android**, when its `versionCode`/`versionName` changed since the preceding
+   desktop tag, builds `android/BookCapture` (`assembleRelease`) and names the APK
+   after its gradle `versionName`. An unchanged Android version is skipped so a
+   desktop-only release cannot publish different APK bytes under an old Android
+   identity. A tag push that includes Android **requires** the release keystore
    secret: without it the android job fails before the APK is uploaded, because a
    debug-signed build can't update an existing install. The desktop release is
    independent and still ships. The job then verifies the APK's signer (via
