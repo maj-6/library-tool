@@ -22414,6 +22414,10 @@ const rwState = {
   // A detection keeps running when the user opens another page or workbench;
   // returning to its page still shows the correct busy state.
   detectionJobs: new Map(),
+  // A submission whose response is lost must be retried with the exact same
+  // command identity. Keys include the region revision, so an intentional new
+  // attempt after a refresh cannot alias the older paid operation.
+  detectionCommands: new Map(),
   detectionWatchers: new Set(),
 };
 
@@ -22482,6 +22486,17 @@ function rwHasUnsaved() {
 
 function rwDetectionKey(book, src, page) {
   return JSON.stringify([String(book || ""), String(src || "primary"), +page || 0]);
+}
+
+function rwDetectionCommandKey(book, src, page, revision) {
+  return JSON.stringify([String(book || ""), String(src || "primary"),
+                         +page || 0, String(revision || "")]);
+}
+
+function rwDetectionDefinitiveFailure(error) {
+  const statusCode = Number(error && error.status || 0);
+  return statusCode >= 400 && statusCode < 500 &&
+    ![408, 425, 429].includes(statusCode);
 }
 
 function rwDetectionOutcome(job) {
@@ -23408,7 +23423,10 @@ async function rwProposalAction(action) {
 async function rwFinishDetection(book, src, page, job) {
   const key = rwDetectionKey(book, src, page);
   const current = rwState.detectionJobs.get(key);
-  if (current && current.id === job.id) rwState.detectionJobs.delete(key);
+  if (current && current.id === job.id) {
+    rwState.detectionJobs.delete(key);
+    if (current.commandKey) rwState.detectionCommands.delete(current.commandKey);
+  }
 
   // A completed or interrupted worker may have written a canonical page or a
   // proposal immediately before its terminal transition. Invalidate shared
@@ -23496,15 +23514,23 @@ async function rwDetectPage() {
     return;
   }
 
-  const placeholder = { id: "", state: "submitting", job: null };
+  const revision = rwState.revision;
+  const commandKey = rwDetectionCommandKey(book, src, page, revision);
+  let operationId = rwState.detectionCommands.get(commandKey);
+  if (!operationId) {
+    operationId = rwNewRid();
+    rwState.detectionCommands.set(commandKey, operationId);
+  }
+  const placeholder = { id: "", state: "submitting", job: null,
+                        commandKey, operationId };
   rwState.detectionJobs.set(key, placeholder);
   status("DETECT :: starting…");
   rwSyncBar();
   let result;
   try {
     result = await engineClient.replica.detection.start({
-      bookId: book, sourceId: src, page, revision: rwState.revision,
-      provider: "automatic", idempotencyKey: rwNewRid(),
+      bookId: book, sourceId: src, page, revision,
+      provider: "automatic", idempotencyKey: operationId,
     });
     if (!result || !result.job || !result.job.id) {
       throw new Error("engine returned no job identity");
@@ -23512,6 +23538,9 @@ async function rwDetectPage() {
   } catch (error) {
     if (rwState.detectionJobs.get(key) === placeholder) {
       rwState.detectionJobs.delete(key);
+    }
+    if (rwDetectionDefinitiveFailure(error)) {
+      rwState.detectionCommands.delete(commandKey);
     }
     const changed = error && (error.status === 409 || error.status === 428);
     statusErr(changed ? "DETECT :: page changed — reload and retry"
@@ -23521,7 +23550,7 @@ async function rwDetectPage() {
   }
 
   const record = { id: String(result.job.id), state: result.job.state,
-                   job: result.job };
+                   job: result.job, commandKey, operationId };
   rwState.detectionJobs.set(key, record);
   if (book === rwState.book && src === rwState.src && page === rwState.page) {
     status(result.already ? "DETECT :: joined running job" : "DETECT :: queued");

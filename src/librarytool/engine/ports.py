@@ -29,6 +29,11 @@ class ReplicaUnitOfWorkPort(Protocol):
         on this to journal pending derived work before attempting that work.
         """
 
+    def validate_staged_figures(
+        self, figures: Mapping[str, Mapping[str, Any]]
+    ) -> None:
+        """Verify immutable proposal assets inside the transaction scope."""
+
 
 class ReplicaRepositoryPort(Protocol):
     def snapshot(self, item_id: str) -> Mapping[str, Any]:
@@ -153,10 +158,10 @@ class TranslationPolicyPort(Protocol):
 
 
 class JobHistoryRepositoryPort(Protocol):
-    """Credential-free persistence for observable background-job history."""
+    """Credential-free persistence for jobs and idempotency receipts."""
 
     def load(self) -> Mapping[str, Mapping[str, Any]]:
-        """Return the last public snapshot, or an empty mapping."""
+        """Return the last persistence snapshot, or an empty mapping."""
 
     def save(self, jobs: Mapping[str, Mapping[str, Any]]) -> None:
-        """Atomically replace the public snapshot."""
+        """Atomically replace the credential-free persistence snapshot."""

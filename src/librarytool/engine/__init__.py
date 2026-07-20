@@ -43,6 +43,7 @@ from .errors import (
 from .jobs import (
     ACTIVE_JOB_STATES,
     PUBLIC_JOB_FIELDS,
+    JobCommandReceipt,
     JobEvent,
     JobFailure,
     JobManager,
@@ -326,6 +327,7 @@ __all__ = [
     "ArtifactRef",
     "ACTIVE_JOB_STATES",
     "JobManager",
+    "JobCommandReceipt",
     "JobEvent",
     "JobFailure",
     "JobOutput",

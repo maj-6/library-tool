@@ -99,7 +99,8 @@ def stable_export_items(items, seed: str, used: set[str] | None = None) -> list:
 
 def make_proposal(*, doc: str, dims: dict, items: list, provider: str,
                   base_revision: str, reason: str = "protected-page",
-                  text: str = "") -> dict:
+                  text: str = "", proposal_id: str = "",
+                  staged_figures: dict | None = None) -> dict:
     """Create the provider-neutral proposal envelope stored beside regions."""
     proposal = {
         "doc": doc,
@@ -112,6 +113,14 @@ def make_proposal(*, doc: str, dims: dict, items: list, provider: str,
     }
     if text:
         proposal["text"] = str(text)
+    if proposal_id:
+        proposal["proposal_id"] = str(proposal_id)
+    if staged_figures:
+        proposal["staged_figures"] = {
+            str(name): dict(info)
+            for name, info in staged_figures.items()
+            if isinstance(info, dict)
+        }
     proposal["revision"] = content_revision(proposal, "rp")
     return proposal
 

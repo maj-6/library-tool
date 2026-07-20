@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
+import re
+import stat
 import sys
 import tempfile
 import threading
@@ -198,6 +201,54 @@ class FilesystemReplicaRepository:
                 retryable=True,
             ) from exc
 
+    def _validate_staged_figures(
+        self,
+        item_id: str,
+        figures: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        directory = self._path(item_id).parent / "images"
+        for raw_name, raw_info in figures.items():
+            name = str(raw_name or "")
+            info = raw_info if isinstance(raw_info, Mapping) else {}
+            expected = str(info.get("sha256") or "")
+            if (
+                not name
+                or name in (".", "..")
+                or re.fullmatch(r"[\w.\-]+", name) is None
+                or re.fullmatch(r"[0-9a-f]{64}", expected) is None
+            ):
+                raise RepositoryError(
+                    "a staged Replica figure manifest is invalid",
+                    code="invalid_staged_replica_figure",
+                    details={"item_id": item_id, "figure": name},
+                )
+            path = directory / name
+            try:
+                named = path.lstat()
+                if (
+                    path.is_symlink()
+                    or not stat.S_ISREG(named.st_mode)
+                    or named.st_size < 1
+                ):
+                    raise OSError("not a non-empty regular file")
+                digest = hashlib.sha256()
+                with path.open("rb") as stream:
+                    for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(block)
+            except (FileNotFoundError, OSError) as exc:
+                raise RepositoryError(
+                    "a staged Replica figure is unavailable",
+                    code="staged_replica_figure_unavailable",
+                    details={"item_id": item_id, "figure": name},
+                    retryable=True,
+                ) from exc
+            if digest.hexdigest() != expected:
+                raise RepositoryError(
+                    "a staged Replica figure failed its integrity check",
+                    code="staged_replica_figure_mismatch",
+                    details={"item_id": item_id, "figure": name},
+                )
+
     @staticmethod
     def _default_read_json(path: Path) -> Any:
         if not path.is_file():
@@ -290,6 +341,17 @@ class FilesystemReplicaUnitOfWork:
             )
         self._repository._save(self._item_id, self._workspace)
         self.commit_count += 1
+
+    def validate_staged_figures(
+        self, figures: Mapping[str, Mapping[str, Any]]
+    ) -> None:
+        if not self._active:
+            raise RepositoryError(
+                "the Replica unit of work is not active",
+                code="inactive_replica_unit_of_work",
+                details={"item_id": self._item_id},
+            )
+        self._repository._validate_staged_figures(self._item_id, figures)
 
     def __exit__(self, exc_type, exc, traceback) -> bool:
         try:

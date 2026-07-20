@@ -19,6 +19,7 @@ from librarytool.engine import (
     ConflictError,
     JobManager,
     JobState,
+    ValidationError,
 )
 
 
@@ -90,6 +91,72 @@ def test_track_transition_and_public_snapshot_are_transport_neutral():
     assert public["label"] == "A Herbal"
     assert "secret" not in public and "prompt" not in public
     assert "secret" not in history.value[record["id"]]
+
+
+def test_command_receipt_replays_terminal_outcome_after_prune_and_restart():
+    history = MemoryHistory()
+    jobs = manager(history, keep=0)
+    digest = "a" * 64
+    record = {
+        "operation_id": "detect:book:primary:1",
+        "command_sha256": digest,
+        "subject": {"item_id": "book", "source_id": "primary", "page": 1},
+    }
+    jobs.track(record, "replica.detect-regions")
+    jobs.transition(record, "done", outputs=[{
+        "kind": "replica.region-page", "ref": "book/primary/1",
+    }])
+
+    assert jobs.get(record["id"]) is None
+    receipt = jobs.command_receipt(
+        record["operation_id"], digest, kind="replica.detect-regions")
+    assert receipt is not None
+    assert receipt.job.state is JobState.DONE
+    assert receipt.job.outputs[0].ref == "book/primary/1"
+    assert "$operation_receipts" in history.value
+
+    reopened = manager(history, keep=0)
+    reopened.rehydrate(strict=True)
+    replay = reopened.command_receipt(
+        record["operation_id"], digest, kind="replica.detect-regions")
+    assert replay is not None
+    assert replay.job.job_id == record["id"]
+    assert replay.job.state is JobState.DONE
+    with pytest.raises(ConflictError) as mismatch:
+        reopened.command_receipt(
+            record["operation_id"], "b" * 64,
+            kind="replica.detect-regions")
+    assert mismatch.value.code == "operation_id_conflict"
+
+
+def test_command_receipts_are_bounded_and_reserved_envelope_cannot_be_a_job():
+    history = MemoryHistory()
+    clock = Clock()
+    identifiers = iter(range(10))
+    jobs = JobManager(
+        history,
+        keep=1,
+        receipt_keep=2,
+        id_factory=lambda existing: f"job-{next(identifiers)}",
+        utcnow=clock.now,
+        monotonic=clock.monotonic,
+    )
+    for index in range(3):
+        record = {
+            "operation_id": f"operation:{index}",
+            "command_sha256": f"{index + 1:064x}",
+        }
+        jobs.track(record, "replica.detect-regions")
+        jobs.transition(record, "done")
+
+    receipts = history.value["$operation_receipts"]
+    assert set(receipts) == {"operation:1", "operation:2"}
+    assert jobs.command_receipt(
+        "operation:0", f"{1:064x}", kind="replica.detect-regions") is None
+
+    with pytest.raises(ValidationError) as reserved:
+        jobs.track({"id": "$operation_receipts"}, "ocr")
+    assert reserved.value.code == "reserved_job_id"
 
 
 def test_cancel_is_atomic_idempotent_and_observable_to_worker():

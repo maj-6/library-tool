@@ -1374,13 +1374,15 @@
 
     _replicaDetectionStart({ bookId, sourceId, page, revision,
       provider = "automatic", idempotencyKey, signal } = {}) {
+      const operationId = portableIdentifier(
+        idempotencyKey, "idempotencyKey");
       return this._requestJson("POST",
         `/v1/items/${encodePart(bookId)}/replica/region-detection-jobs`, {
           headers: { "If-Match": quoteRevision(revision, "revision") },
           body: {
             source_id: sourceId, page, provider,
             expect_revision: revision,
-            idempotency_key: idempotencyKey,
+            idempotency_key: operationId,
           },
           signal,
         });

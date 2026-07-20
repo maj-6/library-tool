@@ -16,7 +16,7 @@ WriteJson = Callable[[Path, Any], None]
 
 
 class FilesystemJobHistoryRepository:
-    """Persist the manager's allowlisted snapshot through strict JSON I/O.
+    """Persist allowlisted jobs and command receipts through strict JSON I/O.
 
     Optional callbacks preserve a transitional compatibility seam.  The native
     implementation validates opened file identity and publishes a complete,

@@ -25,6 +25,7 @@ from .errors import (
     EngineError,
     NotFoundError,
     PreconditionRequiredError,
+    RepositoryError,
     ValidationError,
 )
 from .ports import ItemRepositoryPort, ReplicaPolicyPort, ReplicaRepositoryPort
@@ -253,6 +254,7 @@ class ReplicaApplicationService:
                 )
 
             record = self._policies.accept_region_proposal(current, proposal)
+            self._publish_proposal_figures(uow, workspace, key, proposal)
             self._set_region(workspace, key, record)
             self._set_proposal(workspace, key, None)
             doc = self._policies.sanitize_document_name(
@@ -551,6 +553,103 @@ class ReplicaApplicationService:
         record: Mapping[str, Any] | None,
     ) -> None:
         self._set_record(workspace, "region_compile_pending", key, record)
+
+    @staticmethod
+    def _portable_figure_name(value: object) -> str:
+        name = str(value or "")
+        if (
+            not name
+            or len(name) > 255
+            or name in (".", "..")
+            or any(
+                not (character.isalnum() or character in "._-")
+                for character in name
+            )
+        ):
+            return ""
+        return name
+
+    def _publish_proposal_figures(
+        self,
+        uow: Any,
+        workspace: MutableMapping[str, Any],
+        key: PageKey,
+        proposal: Mapping[str, Any],
+    ) -> None:
+        """Publish staged crop metadata with the proposal's CAS commit.
+
+        Crop bytes are written under immutable, proposal-qualified names before
+        a proposal becomes visible.  The workspace manifest is the visibility
+        boundary: this method moves the metadata into the canonical ``images``
+        map in the same atomic JSON replacement that clears the proposal.
+        """
+
+        raw_figures = proposal.get("staged_figures")
+        if raw_figures in (None, {}):
+            return
+        proposal_id = str(proposal.get("proposal_id") or "")
+        if not proposal_id or not isinstance(raw_figures, Mapping):
+            raise ValidationError(
+                "the proposal figure manifest is invalid",
+                code="invalid_proposal_figures",
+                details=self._key_details(key),
+            )
+
+        publish: dict[str, dict[str, Any]] = {}
+        for raw_name, raw_info in raw_figures.items():
+            name = self._portable_figure_name(raw_name)
+            if not name or not isinstance(raw_info, Mapping):
+                raise ValidationError(
+                    "the proposal figure manifest is invalid",
+                    code="invalid_proposal_figures",
+                    details=self._key_details(key),
+                )
+            info = copy.deepcopy(dict(raw_info))
+            try:
+                figure_page = int(info.get("page"))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValidationError(
+                    "the proposal figure manifest is invalid",
+                    code="invalid_proposal_figures",
+                    details=self._key_details(key),
+                ) from exc
+            if (
+                figure_page != key.page
+                or str(info.get("src_key") or "primary") != key.source_id
+                or str(info.get("proposal_id") or "") != proposal_id
+            ):
+                raise ValidationError(
+                    "the proposal figure identity does not match its page",
+                    code="invalid_proposal_figures",
+                    details={**self._key_details(key), "figure": name},
+                )
+            info.pop("proposal_id", None)
+            publish[name] = info
+
+        validate = getattr(uow, "validate_staged_figures", None)
+        if not callable(validate):
+            raise RepositoryError(
+                "the Replica repository cannot verify staged figures",
+                code="staged_replica_figure_validation_unavailable",
+                details=self._key_details(key),
+            )
+        validate(publish)
+
+        current_images = workspace.get("images")
+        if isinstance(current_images, MutableMapping):
+            images = current_images
+        else:
+            images = {}
+            workspace["images"] = images
+        for name, info in publish.items():
+            existing = images.get(name)
+            if existing is not None and existing != info:
+                raise ConflictError(
+                    "a proposal figure name already belongs to another asset",
+                    code="proposal_figure_conflict",
+                    details={**self._key_details(key), "figure": name},
+                )
+            images[name] = info
 
     def _other_region_rids(
         self, workspace: Mapping[str, Any], key: PageKey

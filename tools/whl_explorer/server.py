@@ -5198,6 +5198,7 @@ def _ensure_engine_session() -> FilesystemEngineSession:
     global _library_engine_instance
 
     session = _engine_session
+    opened_here = False
     if session is not None and not session.closed:
         return session
     with _library_engine_guard:
@@ -5236,6 +5237,18 @@ def _ensure_engine_session() -> FilesystemEngineSession:
             _library_engine_instance = engine
             _engine_session = opened
             session = opened
+            opened_here = True
+    cleanup = globals().get("_ocr_cleanup_staged_figure_orphans")
+    if opened_here and callable(cleanup):
+        builds = lib.load_json(BUILDS_PATH, {})
+        for item_id in builds if isinstance(builds, dict) else ():
+            try:
+                cleanup(str(item_id))
+            except Exception:
+                log.warning(
+                    "Could not clean staged Replica figures: book=%s",
+                    item_id,
+                )
     return session
 
 
@@ -6469,6 +6482,13 @@ def api_build_ocr_region_proposals(build_id: str):
         expected_region_revision=expected,
         expected_proposal_revision=expected_proposal,
     )
+    staged_figures: set[str] = set()
+    if action == "dismiss":
+        try:
+            before = _replica_engine().get_region_page(command.key)
+            staged_figures = _ocr_staged_figure_names(before.proposal)
+        except EngineError:
+            pass
     try:
         result = _replica_engine().review_region_proposal(command)
     except EngineError as exc:
@@ -6479,6 +6499,12 @@ def api_build_ocr_region_proposals(build_id: str):
             except EngineError:
                 pass
         return _engine_error_response(exc, current=current)
+    if action == "dismiss":
+        # The atomic manifest commit above makes the crops unreachable. The
+        # physical unlink is idempotent; startup GC finishes it after a crash
+        # between these two operations.
+        _ocr_remove_staged_figures(build_id, staged_figures)
+    _ocr_cleanup_staged_figure_orphans(build_id)
     body = _region_view_response(result.page)
     body.update({"action": ("applied" if result.action.value == "apply"
                              else "dismissed"),
@@ -9124,6 +9150,173 @@ def _ocr_merge_page(build_id: str, target: str, page: int, text: str) -> None:
         lib.save_text(f, "\n\n".join(parts), errors="replace")
 
 
+_OCR_PROPOSAL_IMAGE_PREFIX = "proposal-"
+
+
+def _ocr_figure_source_token(src_key: str) -> str:
+    source = str(src_key or "primary")
+    safe = re.sub(r"[^\w.-]", "_", source).strip("._-") or "source"
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:10]
+    return f"{safe[:32]}-{digest}"
+
+
+def _ocr_figure_leaf(raw: object) -> str:
+    safe = re.sub(r"[^\w.\-]", "_", str(raw or "")) or "img"
+    if "." not in safe:
+        safe += ".jpeg"
+    suffix = Path(safe).suffix[:16]
+    stem = safe[:-len(suffix)] if suffix else safe
+    return f"{stem[:96]}{suffix}"
+
+
+def _ocr_proposal_identity(*, src_key: str, page: int, provider: str,
+                           base_revision: str, doc: str, text: str,
+                           dims: Mapping | None, regions: list,
+                           images: list[dict]) -> str:
+    image_rows = []
+    for image in images or []:
+        if not isinstance(image, Mapping):
+            continue
+        raw = image.get("data")
+        payload = bytes(raw) if isinstance(raw, (bytes, bytearray)) else b""
+        image_rows.append({
+            "id": str(image.get("id") or ""),
+            "bbox": image.get("bbox") if isinstance(
+                image.get("bbox"), Mapping) else {},
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        })
+    command = {
+        "source_id": str(src_key or "primary"),
+        "page": int(page),
+        "provider": str(provider or "unknown"),
+        "base_revision": str(base_revision or ""),
+        "doc": str(doc or ""),
+        "text": str(text or ""),
+        "dims": dict(dims) if isinstance(dims, Mapping) else {},
+        "regions": regions or [],
+        "images": image_rows,
+    }
+    canonical = json.dumps(
+        command, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False, default=str,
+    ).encode("utf-8")
+    return "rdp-" + hashlib.sha256(canonical).hexdigest()[:32]
+
+
+def _ocr_write_page_images(build_id: str, page: int, images: list[dict],
+                           text: str, src_key: str,
+                           regions: list | None = None,
+                           *, proposal_id: str = "") -> tuple[
+                               str, dict[str, dict], set[str]]:
+    """Write immutable crops and return their unpublished manifest.
+
+    The caller owns ``_ocr_merge_lock`` and decides whether the returned
+    manifest belongs in canonical ``images`` or in a protected-page proposal.
+    Newly-created paths are returned so a failed manifest commit can clean up
+    without deleting an asset that belonged to an earlier identical retry.
+    """
+    if not images:
+        return text, {}, set()
+    directory = _entry_dir(build_id) / "ocr" / "images"
+    directory.mkdir(parents=True, exist_ok=True)
+    source = str(src_key or "primary")
+    source_token = _ocr_figure_source_token(source)
+    created: set[str] = set()
+    manifest: dict[str, dict] = {}
+    used: set[str] = set()
+    for index, image in enumerate(images):
+        if not isinstance(image, Mapping):
+            continue
+        raw = image.get("data")
+        if not isinstance(raw, (bytes, bytearray)) or not raw:
+            continue
+        leaf = _ocr_figure_leaf(image.get("id"))
+        if proposal_id:
+            name = (f"{_OCR_PROPOSAL_IMAGE_PREFIX}{source_token}-p{int(page)}-"
+                    f"{proposal_id[4:]}-{leaf}")
+        else:
+            source_prefix = "" if source == "primary" else f"s-{source_token}-"
+            name = f"{source_prefix}p{int(page)}-{leaf}"
+        if name in used:
+            suffix = Path(name).suffix
+            stem = name[:-len(suffix)] if suffix else name
+            name = f"{stem}-{index + 1}{suffix}"
+        used.add(name)
+        path = directory / name
+        existed = path.is_file()
+        lib.save_bytes(path, bytes(raw))
+        if not existed:
+            created.add(name)
+        info = dict(image.get("bbox") or {}) if isinstance(
+            image.get("bbox"), Mapping) else {}
+        info.update({
+            "page": int(page),
+            "src_key": source,
+            "sha256": hashlib.sha256(bytes(raw)).hexdigest(),
+        })
+        if proposal_id:
+            info["proposal_id"] = proposal_id
+        manifest[name] = info
+        image_id = str(image.get("id") or "")
+        if image_id:
+            pattern = re.compile(
+                r"(!\[[^\]]*\]\()" + re.escape(image_id) + r"(\))")
+            text = pattern.sub(r"\g<1>" + name + r"\g<2>", text)
+            for region in regions or []:
+                if isinstance(region, dict) and region.get("text"):
+                    region["text"] = pattern.sub(
+                        r"\g<1>" + name + r"\g<2>", str(region["text"]))
+    return text, manifest, created
+
+
+def _ocr_staged_figure_names(proposal: Mapping | None) -> set[str]:
+    figures = proposal.get("staged_figures") if isinstance(
+        proposal, Mapping) else None
+    if not isinstance(figures, Mapping):
+        return set()
+    return {
+        str(name) for name in figures
+        if str(name).startswith(_OCR_PROPOSAL_IMAGE_PREFIX)
+        and re.sub(r"[^\w.\-]", "_", str(name)) == str(name)
+    }
+
+
+def _ocr_remove_staged_figures(build_id: str, names: set[str]) -> None:
+    directory = _entry_dir(build_id) / "ocr" / "images"
+    for name in names:
+        if not name.startswith(_OCR_PROPOSAL_IMAGE_PREFIX):
+            continue
+        try:
+            (directory / name).unlink(missing_ok=True)
+        except OSError:
+            log.warning("Could not remove staged Replica figure: book=%s name=%s",
+                        build_id, name)
+
+
+def _ocr_cleanup_staged_figure_orphans(build_id: str) -> None:
+    """Remove proposal crops that no manifest can make visible after restart."""
+    directory = _entry_dir(build_id) / "ocr" / "images"
+    if not directory.is_dir():
+        return
+    with _ocr_merge_lock:
+        meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
+        referenced = {
+            str(name) for name in (meta.get("images") or {})
+            if str(name).startswith(_OCR_PROPOSAL_IMAGE_PREFIX)
+        }
+        for pages in (meta.get("region_proposals") or {}).values():
+            if not isinstance(pages, Mapping):
+                continue
+            for proposal in pages.values():
+                referenced.update(_ocr_staged_figure_names(proposal))
+        orphans = {
+            path.name for path in directory.glob(
+                f"{_OCR_PROPOSAL_IMAGE_PREFIX}*")
+            if path.is_file() and path.name not in referenced
+        }
+    _ocr_remove_staged_figures(build_id, orphans)
+
+
 def _ocr_save_page_images(build_id: str, page: int, images: list[dict],
                           text: str, src_key: str = "primary",
                           regions: list | None = None) -> str:
@@ -9137,28 +9330,17 @@ def _ocr_save_page_images(build_id: str, page: int, images: list[dict],
     figures the compiled doc calls something else is a record that lies."""
     if not images:
         return text
-    d = _entry_dir(build_id) / "ocr" / "images"
-    d.mkdir(parents=True, exist_ok=True)
     meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
     with _ocr_merge_lock:
         meta = lib.load_json(meta_path, {})
-        meta.setdefault("images", {})
-        for im in images:
-            safe = re.sub(r"[^\w.\-]", "_", im["id"]) or "img"
-            if "." not in safe:
-                safe += ".jpeg"
-            name = f"p{page}-{safe}"
-            lib.save_bytes(d / name, im["data"])
-            meta["images"][name] = dict(
-                im["bbox"] or {}, page=page, src_key=src_key or "primary")
-            # every ![id](id) in this page's markdown points at the saved file
-            pat = re.compile(r"(!\[[^\]]*\]\()" + re.escape(im["id"]) + r"(\))")
-            text = pat.sub(r"\g<1>" + name + r"\g<2>", text)
-            for reg in regions or []:
-                if reg.get("text"):
-                    reg["text"] = pat.sub(r"\g<1>" + name + r"\g<2>",
-                                          reg["text"])
-        lib.save_json(meta_path, meta)
+        text, figures, created = _ocr_write_page_images(
+            build_id, page, images, text, src_key, regions)
+        try:
+            meta.setdefault("images", {}).update(figures)
+            lib.save_json(meta_path, meta)
+        except Exception:
+            _ocr_remove_staged_figures(build_id, created)
+            raise
     return text
 
 
@@ -9263,6 +9445,105 @@ def _ocr_save_page_regions(build_id: str, src_key: str, page: int,
         return action
 
 
+def _ocr_save_page_detection(build_id: str, src_key: str, page: int,
+                             *, images: list[dict], text: str,
+                             regions: list, dims: Mapping | None,
+                             doc: str, provider: str) -> tuple[str, str]:
+    """Commit one region-producing OCR result without touching protected work.
+
+    Figure bytes are first written under a deterministic proposal identity.
+    Their metadata remains inside the proposal until the engine applies it;
+    canonical ``images`` and the protected page therefore cannot change merely
+    because detection ran.  Unprotected pages retain the existing immediate
+    save behavior, with secondary-source names now source-qualified.
+    """
+    source = str(src_key or "primary")
+    page_number = int(page)
+    document = _ocr_name(doc)
+    proposed_regions = [dict(region) for region in (regions or [])
+                        if isinstance(region, Mapping)]
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    previous_staged: set[str] = set()
+    current_staged: set[str] = set()
+    created: set[str] = set()
+    with _ocr_merge_lock:
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta = lib.load_json(meta_path, {})
+        current = _region_record(meta, source, page_number)
+        proposals = meta.get("region_proposals") or {}
+        proposal_pages = proposals.get(source) or {}
+        old_proposal = proposal_pages.get(str(page_number)) if isinstance(
+            proposal_pages, Mapping) else None
+        previous_staged = _ocr_staged_figure_names(old_proposal)
+        protected = replica_service.is_protected(current)
+        proposal_id = ""
+        if protected:
+            current["stale"] = replica_service.stale_marker(provider)
+            base_revision = replica_service.content_revision(current)
+            proposal_id = _ocr_proposal_identity(
+                src_key=source, page=page_number, provider=provider,
+                base_revision=base_revision,
+                doc=document, text=text, dims=dims,
+                regions=proposed_regions, images=images,
+            )
+        try:
+            rewritten, figures, created = _ocr_write_page_images(
+                build_id, page_number, images or [], str(text or ""), source,
+                proposed_regions, proposal_id=proposal_id)
+            if protected:
+                proposal = replica_service.make_proposal(
+                    doc=document,
+                    dims=dict(dims) if isinstance(dims, Mapping) else {},
+                    items=proposed_regions,
+                    provider=provider,
+                    base_revision=base_revision,
+                    text=rewritten,
+                    proposal_id=proposal_id,
+                    staged_figures=figures,
+                )
+                meta.setdefault("region_proposals", {}).setdefault(
+                    source, {})[str(page_number)] = proposal
+                current_staged = set(figures)
+                action = "proposed"
+            else:
+                if figures:
+                    meta.setdefault("images", {}).update(figures)
+                clean_regions = libformat.ensure_rids(proposed_regions)
+                region_map = meta.setdefault("regions", {})
+                pages = region_map.setdefault(source, {})
+                if clean_regions:
+                    pages[str(page_number)] = {
+                        "doc": document,
+                        "dims": (dict(dims) if isinstance(dims, Mapping)
+                                 else {}),
+                        "items": clean_regions,
+                        "origin": "machine",
+                    }
+                    action = "saved"
+                else:
+                    pages.pop(str(page_number), None)
+                    if not pages:
+                        region_map.pop(source, None)
+                    if not region_map:
+                        meta.pop("regions", None)
+                    action = "dropped"
+                proposal_map = meta.get("region_proposals") or {}
+                pending = proposal_map.get(source) or {}
+                if isinstance(pending, dict):
+                    pending.pop(str(page_number), None)
+                    if not pending:
+                        proposal_map.pop(source, None)
+                if not proposal_map:
+                    meta.pop("region_proposals", None)
+            lib.save_json(meta_path, meta)
+        except Exception:
+            _ocr_remove_staged_figures(build_id, created)
+            raise
+    _ocr_remove_staged_figures(
+        build_id, previous_staged - current_staged)
+    return rewritten, action
+
+
 def _ocr_drop_page_regions_for_doc(build_id: str, src_key: str, page: int,
                                    doc: str, *, provider: str = "",
                                    proposed_text: str = "") -> str:
@@ -9338,7 +9619,18 @@ def _ocr_job_run(job_id: str) -> None:
             region_action = "unchanged"
             if isinstance(result, dict):
                 text = str(result.get("text") or "")
-                if result.get("images"):
+                # Region-producing results are committed as one page-level
+                # decision. This is what keeps figure crops and their metadata
+                # inside a protected-page proposal instead of publishing them
+                # before the protection check runs.
+                if "regions" in result:
+                    text, region_action = _ocr_save_page_detection(
+                        job["build_id"], src_key, n,
+                        images=result.get("images") or [], text=text,
+                        regions=result.get("regions") or [],
+                        dims=result.get("dims"),
+                        doc=_ocr_name(job["target"]), provider=svc)
+                elif result.get("images"):
                     text = _ocr_save_page_images(
                         job["build_id"], n, result["images"], text,
                         src_key, regions=result.get("regions"))
@@ -9357,13 +9649,7 @@ def _ocr_job_run(job_id: str) -> None:
                 # Region-silent engines instead DROP a record claiming this
                 # target's text: unlike word geometry, region text is
                 # superseded by the new transcription.
-                if "regions" in result:
-                    region_action = _ocr_save_page_regions(
-                        job["build_id"], src_key, n,
-                        result.get("regions") or [], result.get("dims"),
-                        doc=_ocr_name(job["target"]), protect_existing=True,
-                        provider=svc, proposed_text=text)
-                else:
+                if "regions" not in result:
                     region_action = _ocr_drop_page_regions_for_doc(
                         job["build_id"], src_key, n,
                         _ocr_name(job["target"]), provider=svc,
@@ -9559,6 +9845,33 @@ def _replica_detection_active(build_id: str, source_id: str,
     return None
 
 
+def _replica_detection_command_sha256(*, build_id: str, source_id: str,
+                                      page: int, provider: str,
+                                      expected_revision: str) -> str:
+    command = {
+        "capability": "replica.region-detection.start@1",
+        "item_id": str(build_id),
+        "source_id": str(source_id),
+        "page": int(page),
+        "provider": str(provider),
+        "expected_region_revision": str(expected_revision),
+    }
+    canonical = json.dumps(
+        command, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _replica_detection_replay_response(receipt, provider: str):
+    return jsonify({
+        "ok": True,
+        "already": True,
+        "provider": provider,
+        "job": receipt.job.as_dict(),
+        "receipt": receipt.as_public_dict(),
+    })
+
+
 @app.route("/api/v1/items/<build_id>/replica/region-detection-jobs",
            methods=["POST"])
 def api_v1_replica_region_detection_job(build_id: str):
@@ -9602,6 +9915,34 @@ def api_v1_replica_region_detection_job(build_id: str):
             code="region_revision_required",
             details={"item_id": build_id, "source_id": source_id,
                      "page": page}), current=current)
+    raw_idempotency_key = payload.get("idempotency_key")
+    if not isinstance(raw_idempotency_key, str) or not raw_idempotency_key:
+        return _engine_error_response(EnginePreconditionRequiredError(
+            "an idempotency key is required",
+            code="idempotency_key_required",
+            details={"item_id": build_id, "source_id": source_id,
+                     "page": page}), current=current)
+    try:
+        idempotency_key = _jobs_engine().validate_operation_id(
+            raw_idempotency_key)
+    except EngineError as exc:
+        return _engine_error_response(exc, current=current)
+    source_id = current.key.source_id
+    command_sha256 = _replica_detection_command_sha256(
+        build_id=build_id, source_id=source_id, page=page,
+        provider=provider, expected_revision=expected)
+    try:
+        receipt = _jobs_engine().command_receipt(
+            idempotency_key, command_sha256,
+            kind="replica.detect-regions")
+    except EngineError as exc:
+        return _engine_error_response(exc, current=current)
+    # Replay precedes the live CAS check. An exact retry after a successful
+    # unprotected run necessarily carries the old page revision, but it must
+    # still return the paid-for terminal job instead of starting or billing it
+    # again.
+    if receipt is not None:
+        return _replica_detection_replay_response(receipt, provider)
     if expected != current.revision:
         return _engine_error_response(EngineConflictError(
             "the region page changed before detection could start",
@@ -9643,9 +9984,15 @@ def api_v1_replica_region_detection_job(build_id: str):
         "region": expected,
         "page_structure": source_revision,
     }
-    idempotency_key = str(payload.get("idempotency_key") or "").strip()[:128]
-
     with _replica_detection_start_lock:
+        try:
+            receipt = _jobs_engine().command_receipt(
+                idempotency_key, command_sha256,
+                kind="replica.detect-regions")
+        except EngineError as exc:
+            return _engine_error_response(exc, current=current)
+        if receipt is not None:
+            return _replica_detection_replay_response(receipt, provider)
         existing = _replica_detection_active(build_id, source_id, page)
         if existing is not None:
             existing_region = str(
@@ -9660,6 +10007,10 @@ def api_v1_replica_region_detection_job(build_id: str):
                              "expected_revision": expected}), current=current)
             view = _jobs_engine().view(str(existing.get("id") or ""))
             if view is not None:
+                # A second observer may carry its own command identity. It
+                # does not acquire a receipt for work it did not start, but it
+                # can still join the identical live job instead of presenting
+                # an unexplained page-level conflict.
                 return jsonify({"ok": True, "already": True,
                                 "provider": provider,
                                 "job": view.as_dict()})
@@ -9685,9 +10036,8 @@ def api_v1_replica_region_detection_job(build_id: str):
                          "unit": "page", "phase": "detecting-regions"},
             "input_revisions": input_revisions,
             "outputs": [], "provider": provider,
-            # Runtime-only retry correlation. It is intentionally outside the
-            # JobManager public allowlist and never reaches jobs.json.
-            "idempotency_key": idempotency_key,
+            "operation_id": idempotency_key,
+            "command_sha256": command_sha256,
         }
         if not _ocr_job_start_guarded(job, source_revision, record_source=True):
             return _engine_error_response(EngineConflictError(
@@ -9699,8 +10049,13 @@ def api_v1_replica_region_detection_job(build_id: str):
     view = _jobs_engine().view(job_id)
     if view is None:  # registration and view publication are one start step
         raise RuntimeError("region-detection job was not registered")
+    receipt = _jobs_engine().command_receipt(
+        idempotency_key, command_sha256, kind="replica.detect-regions")
+    if receipt is None:
+        raise RuntimeError("region-detection command receipt was not persisted")
     return jsonify({"ok": True, "already": False, "provider": provider,
-                    "job": view.as_dict()})
+                    "job": view.as_dict(),
+                    "receipt": receipt.as_public_dict()})
 
 
 def _ocr_job_state(job: dict) -> dict:

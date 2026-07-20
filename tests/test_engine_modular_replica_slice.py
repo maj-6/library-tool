@@ -25,7 +25,7 @@ from librarytool.engine.contracts import (
     ReplaceRegionPageCommand,
     ReviewRegionProposalCommand,
 )
-from librarytool.engine.errors import ConflictError, NotFoundError
+from librarytool.engine.errors import ConflictError, NotFoundError, RepositoryError
 from librarytool.engine.replica import ReplicaApplicationService
 from librarytool.engine.text_layers import TextLayerService
 from librarytool.engine.translations import (
@@ -419,6 +419,68 @@ def test_proposal_apply_clears_journal_after_success(tmp_path):
     assert result.page.compile_pending is None
     assert "region_compile_pending" not in repository.snapshot("book")
     assert text.pages[("book", "compiled.txt", 7)] == "Accepted"
+
+
+@pytest.mark.parametrize(
+    ("damage", "code"),
+    (
+        ("missing", "staged_replica_figure_unavailable"),
+        ("tampered", "staged_replica_figure_mismatch"),
+    ),
+)
+def test_proposal_apply_preserves_page_when_staged_figure_fails_integrity(
+    tmp_path, damage, code,
+):
+    service, repository, policies, _text = make_replica(tmp_path)
+    key = PageKey("book", "primary", 8)
+    current = {
+        "doc": "compiled.txt",
+        "items": [{"rid": "old", "text": "Human"}],
+        "origin": "human",
+    }
+    region_revision = policies.content_revision(current, "rr")
+    proposal_id = "rdp-" + "a" * 32
+    name = f"proposal-primary-deadbeef00-p8-{'a' * 32}-figure.jpeg"
+    payload = b"original-figure"
+    proposal = {
+        "doc": "compiled.txt",
+        "items": [{"rid": "new", "text": f"![figure]({name})"}],
+        "base_revision": region_revision,
+        "provider": "detector",
+        "proposal_id": proposal_id,
+        "staged_figures": {
+            name: {
+                "page": 8,
+                "src_key": "primary",
+                "proposal_id": proposal_id,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            },
+        },
+    }
+    proposal["revision"] = policies.content_revision(proposal, "rp")
+    seed(repository, {
+        "regions": {"primary": {"8": current}},
+        "region_proposals": {"primary": {"8": proposal}},
+    })
+    figure = tmp_path / "book" / "ocr" / "images" / name
+    figure.parent.mkdir(parents=True, exist_ok=True)
+    figure.write_bytes(payload)
+    if damage == "missing":
+        figure.unlink()
+    else:
+        figure.write_bytes(b"tampered")
+    before = repository.snapshot("book")
+
+    with pytest.raises(RepositoryError) as failure:
+        service.review_region_proposal(ReviewRegionProposalCommand(
+            key,
+            ProposalAction.APPLY,
+            region_revision,
+            proposal["revision"],
+        ))
+
+    assert failure.value.code == code
+    assert repository.snapshot("book") == before
 
 
 def test_layout_family_query_is_read_only_even_if_policy_mutates_input(tmp_path):
