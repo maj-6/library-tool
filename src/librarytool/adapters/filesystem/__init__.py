@@ -44,6 +44,9 @@ from .translation_repository import (
     FilesystemTranslationRepository,
     translation_id_for_language,
 )
+from .text_layer_aggregate_repository import (
+    FilesystemTextLayerAggregateRepository,
+)
 from .whl_catalogue_codec import WhlCatalogueItemCodec
 
 __all__ = [
@@ -68,6 +71,7 @@ __all__ = [
     "FilesystemReplicaRepository",
     "FilesystemRepresentationCommandRepository",
     "FilesystemTranslationRepository",
+    "FilesystemTextLayerAggregateRepository",
     "RecoverableWriteSet",
     "RecoveryResult",
     "RecoveryRequiredError",
