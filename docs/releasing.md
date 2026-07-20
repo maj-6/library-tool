@@ -54,6 +54,10 @@ A plain `vX.Y.Z` tag (no suffix) is the stable path — GitHub "Latest", the
 stable auto-update channel, and the main Downloads list. Reserve it for builds
 that actually meet the bar above.
 
+`debug` is not a public update channel. Use `workflow_dispatch` for a private,
+inspectable debug artifact; public prerelease tags accept only `alpha`, `beta`,
+or `rc`, so an experimental suffix can never fall through to the stable list.
+
 Two ways a row gets there:
 
 ## The pipeline (the normal way)

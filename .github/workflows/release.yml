@@ -35,7 +35,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # create the release and upload its assets
+  contents: read
 
 concurrency:
   group: release
@@ -66,6 +66,13 @@ jobs:
             echo "::error::Tag $GITHUB_REF_NAME does not match desktop/package.json v$version"
             exit 1
           fi
+          case "$version" in
+            *-alpha.*|*-beta.*|*-rc.*) ;;
+            *-*)
+              echo "::error::Unsupported public prerelease suffix in $version. Use alpha, beta, or rc; workflow-dispatch artifacts are the only debug builds."
+              exit 1
+              ;;
+          esac
 
   android:
     needs: preflight
@@ -348,6 +355,8 @@ jobs:
       (needs.desktop.result == 'success' || needs.android.result == 'success')
     needs: [preflight, android, desktop]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload its assets
     steps:
       - name: Check out
         uses: actions/checkout@v4

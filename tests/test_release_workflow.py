@@ -33,6 +33,23 @@ def test_release_tag_version_preflight_gates_every_publish_path():
     assert "needs: [preflight, android, desktop]" in publish
 
 
+def test_public_tags_reject_unknown_prerelease_channels():
+    preflight = _job("preflight", "android")
+
+    assert "*-alpha.*|*-beta.*|*-rc.*" in preflight
+    assert "Unsupported public prerelease suffix" in preflight
+    assert "workflow-dispatch artifacts are the only debug builds" in preflight
+
+
+def test_release_token_is_write_scoped_only_to_publish_job():
+    pre_publish = WORKFLOW[: WORKFLOW.index("  publish:\n")]
+    publish = WORKFLOW[WORKFLOW.index("  publish:\n") :]
+
+    assert "permissions:\n  contents: read" in pre_publish
+    assert "contents: write" not in pre_publish
+    assert "permissions:\n      contents: write" in publish
+
+
 def test_release_requires_persistent_android_signing_identity():
     android = _job("android", "desktop")
     publish = WORKFLOW[WORKFLOW.index("  publish:\n") :]
