@@ -17,23 +17,24 @@ paid OCR call).
 
 Usage:
   python tools/ocr_blocks_probe.py --pdf downloads/ia/foo.pdf \
-      --pages 1,30,55-58 --out probe-out [--raster-only] [--key ...]
+      --pages 1,30,55-58 --out probe-out [--raster-only]
 
-The key falls back to settings.mistralKey in DATA_ROOT/output/
-client_state.json (override the root with --data-root or WHL_DATA_ROOT).
+Set MISTRAL_API_KEY in the environment for API calls. The key is not accepted
+on the command line, where it could be retained in shell history or exposed in
+the process list. --raster-only needs no credential.
 """
 from __future__ import annotations
 
 import argparse
 import io
 import json
-import os
 import sys
 import urllib.error
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import capture_pipeline as capture  # noqa: E402
+import cli_credentials  # noqa: E402
 
 # One color per OCR-4 block type; unknown types get FALLBACK. Figures from
 # `images[]` are drawn too (they are the only geometry OCR<=3 returns).
@@ -83,20 +84,8 @@ def page_png(pdf: Path, page: int, width: int) -> bytes:
         doc.close()
 
 
-def find_key(args) -> str:
-    if args.key:
-        return args.key.strip()
-    root = Path(args.data_root or os.environ.get("WHL_DATA_ROOT") or
-                Path(__file__).resolve().parents[1])
-    state = root / "output" / "client_state.json"
-    try:
-        settings = json.loads(state.read_text(encoding="utf-8")).get("settings") or {}
-        key = str(settings.get("mistralKey") or "").strip()
-    except (OSError, ValueError):
-        key = ""
-    if not key:
-        sys.exit(f"no Mistral key: pass --key or set settings.mistralKey in {state}")
-    return key
+def find_key() -> str:
+    return cli_credentials.mistral_api_key()
 
 
 def draw_overlay(png: bytes, page_dict: dict, out_path: Path) -> None:
@@ -137,8 +126,6 @@ def main() -> None:
     ap.add_argument("--pages", required=True, help="e.g. 1,30,55-58")
     ap.add_argument("--width", type=int, default=1400)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--key")
-    ap.add_argument("--data-root")
     ap.add_argument("--raster-only", action="store_true",
                     help="rasterize pages, no API calls (page picking)")
     ap.add_argument("--limit", type=int, default=30,
@@ -163,7 +150,7 @@ def main() -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     stem = pdf.stem[:40]
-    key = "" if args.raster_only else find_key(args)
+    key = "" if args.raster_only else find_key()
 
     # summary.json is written in `finally`: a mid-run failure must not throw
     # away the pages that were already paid for and inspected

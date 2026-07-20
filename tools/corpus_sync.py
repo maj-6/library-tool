@@ -12,8 +12,10 @@ never edited in place; a re-shot photo gets a new filename. Like
 cloud_setup.py, mutating commands are dry-run by default: `status` shows the
 plan, `push --run` / `pull --run` execute it.
 
-The settings→cfg mapping mirrors cloud_setup.cmd_r2 (the shared config
-module that consolidates these is planned with the Stage-1 core extraction).
+Set R2_ACCOUNT_ID, R2_BUCKET, R2_ACCESS_KEY_ID, and R2_SECRET_ACCESS_KEY in
+the environment. R2_PUBLIC_BASE_URL is additionally required for upload runs;
+read-only comparison and downloads do not need it. Standalone sync never reads
+desktop UI state.
 """
 from __future__ import annotations
 
@@ -22,6 +24,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cli_credentials  # noqa: E402
 import libcommon as lib  # noqa: E402
 import r2_store as r2  # noqa: E402
 
@@ -78,26 +81,19 @@ def plan(local: dict[str, int], remote: dict[str, int]) -> dict:
     return {"push": push, "pull": pull, "same": same}
 
 
-def _cfg() -> dict:
-    s = lib.load_json(lib.CLIENT_STATE_PATH, {}).get("settings", {})
-    cfg = {"account": str(s.get("r2Account") or "").strip(),
-           "bucket": str(s.get("r2Bucket") or "").strip(),
-           "key_id": str(s.get("r2KeyId") or "").strip(),
-           "secret": str(s.get("r2Secret") or "").strip(),
-           "public_base": str(s.get("r2PublicBase") or "").strip()}
-    if not r2.configured(cfg):
-        raise SystemExit("R2 is not configured (Settings > Cloud in the explorer "
-                         "writes r2Account/r2Bucket/r2KeyId/r2Secret).")
-    return cfg
+def _cfg(*, require_public_base: bool = False) -> dict:
+    return cli_credentials.r2_config(
+        require_public_base=require_public_base
+    )
 
 
 def _mb(n: int) -> str:
     return f"{n / 1e6:,.1f} MB"
 
 
-def _plan_now() -> tuple[dict, dict[str, int], dict[str, int]]:
+def _plan_now(cfg: dict | None = None) -> tuple[dict, dict[str, int], dict[str, int]]:
     local = local_files()
-    remote = remote_files(_cfg())
+    remote = remote_files(cfg or _cfg())
     return plan(local, remote), local, remote
 
 
@@ -118,7 +114,8 @@ def cmd_status(args) -> None:
 
 
 def cmd_push(args) -> None:
-    p, local, _ = _plan_now()
+    cfg = _cfg(require_public_base=bool(args.run))
+    p, local, _ = _plan_now(cfg)
     if not p["push"]:
         print("nothing to push — remote corpus is current")
         return
@@ -129,7 +126,6 @@ def cmd_push(args) -> None:
             print(f"  would push {rel} ({_mb(local[rel])})")
         print("dry run — pass --run to upload")
         return
-    cfg = _cfg()
     done = 0
     for i, rel in enumerate(p["push"], 1):
         r2.put_file(cfg, PREFIX + rel, lib.ROOT / rel,

@@ -162,6 +162,10 @@ from librarytool.engine.interchange import (  # noqa: E402
     OpenLibService,
 )
 from librarytool.engine.replica import ReplicaApplicationService  # noqa: E402
+from librarytool.engine.secret_ids import (  # noqa: E402
+    LEGACY_SECRET_IDS,
+    LEGACY_SECRET_KEYS,
+)
 from librarytool.engine.secret_store import (  # noqa: E402
     ClearSecretCommand,
     ReplaceSecretCommand,
@@ -12573,22 +12577,8 @@ def api_ia_downloads():
 # public engine service below exposes only fixed-length masked status and
 # conditional mutation receipts.  Plaintext access is a separate, sidecar-
 # private lease held only around a provider invocation.
-_SECRET_IDS = {
-    "aiKey": "provider:ai:api-key",
-    "embedKey": "provider:embedding:api-key",
-    "imgGenKey": "provider:image-generation:api-key",
-    "mistralKey": "provider:mistral:api-key",
-    "ocrClaudeKey": "provider:anthropic:api-key",
-    "ocrAzureKey": "provider:azure-ocr:api-key",
-    "ocrAwsKey": "provider:aws-ocr:access-key-id",
-    "ocrAwsSecret": "provider:aws-ocr:secret-access-key",
-    "supabaseKey": "cloud:supabase:service-role-key",
-    "supabaseAnonKey": "cloud:supabase:anon-key",
-    "r2KeyId": "storage:r2:access-key-id",
-    "r2Secret": "storage:r2:secret-access-key",
-    "gsKeyFile": "provider:google-sheets:service-account-file",
-}
-_SECRET_KEYS = frozenset(_SECRET_IDS)
+_SECRET_IDS = LEGACY_SECRET_IDS
+_SECRET_KEYS = LEGACY_SECRET_KEYS
 _SECRET_INITIAL_REVISIONS = {
     secret_id: f"absent-v1-{legacy_key.lower()}"
     for legacy_key, secret_id in _SECRET_IDS.items()

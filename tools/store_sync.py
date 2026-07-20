@@ -32,6 +32,10 @@ mtime against the object's upload time picks the direction.
 CLI (dry-run by default, like corpus_sync):
     python3 tools/store_sync.py status        what a sync would do
 
+The standalone status command takes SUPABASE_KEY (and optional SUPABASE_URL)
+from the environment. Optional entry-file status uses R2_ACCOUNT_ID,
+R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, and R2_PUBLIC_BASE_URL.
+
 Mutation runs through Library Tool's composed host, which supplies the item
 lifecycle guard shared with deletion and restore.  The standalone CLI remains
 available for read-only planning but refuses ``sync --run`` because it cannot
@@ -43,7 +47,6 @@ import argparse
 import hashlib
 import json
 import math
-import os
 import shutil
 import sys
 import threading
@@ -54,6 +57,7 @@ from pathlib import Path
 from typing import ContextManager
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cli_credentials  # noqa: E402
 import libcommon as lib  # noqa: E402
 import r2_store as r2  # noqa: E402
 import supabase_sync as sbase  # noqa: E402
@@ -854,26 +858,13 @@ def sync_entry_files(
 
 def _cli_cfg() -> dict:
     import cloud_defaults
-    url = os.environ.get("SUPABASE_URL", "")
-    key = os.environ.get("SUPABASE_KEY", "")
-    if not (url and key):
-        s = lib.load_json(lib.CLIENT_STATE_PATH, {}).get("settings", {})
-        url = url or str(s.get("supabaseUrl") or "")
-        key = key or str(s.get("supabaseKey") or "")
-    url = url or cloud_defaults.SUPABASE_URL   # the key is a secret; the URL isn't
-    if not key:
-        raise SystemExit("No Supabase service key. Set it in Settings > Sync, or "
-                         "export SUPABASE_URL and SUPABASE_KEY.")
-    return {"url": url.rstrip("/"), "key": key}
+    return cli_credentials.supabase_service_config(
+        default_url=cloud_defaults.SUPABASE_URL
+    )
 
 
 def _cli_r2cfg() -> dict:
-    s = lib.load_json(lib.CLIENT_STATE_PATH, {}).get("settings", {})
-    return {"account": str(s.get("r2Account") or "").strip(),
-            "bucket": str(s.get("r2Bucket") or "").strip(),
-            "key_id": str(s.get("r2KeyId") or "").strip(),
-            "secret": str(s.get("r2Secret") or "").strip(),
-            "public_base": str(s.get("r2PublicBase") or "").strip()}
+    return cli_credentials.r2_config(required=False)
 
 
 def _print_result(results: dict, entries: dict | None) -> None:

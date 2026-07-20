@@ -67,6 +67,29 @@ index builder, or a standalone CLI. Feature design notes live in
 - `worktree.py` — git worktrees with their own port + `DATA_ROOT` per tree,
   so several sessions can run at once (see `docs/worktrees.md`).
 
+## Standalone credentials
+
+The desktop leases credentials from its protected engine store. Standalone
+maintenance scripts deliberately do not read that store, `client_state.json`,
+or the retired `secrets.json`; provide only the variables needed for the
+current process. Do not put provider credentials in command-line arguments.
+
+| Variable | Standalone use |
+| --- | --- |
+| `SUPABASE_KEY` | Service-role credential for owner setup, publishing, maintenance, and store status |
+| `SUPABASE_URL` | Project override; required by `release_publish.py`, optional where the built-in project is appropriate |
+| `SUPABASE_ANON_KEY` | Optional anon-role smoke tests for a custom project |
+| `R2_ACCOUNT_ID` | Cloudflare account identifier |
+| `R2_BUCKET` | R2 bucket name |
+| `R2_ACCESS_KEY_ID` | R2 access-key identifier |
+| `R2_SECRET_ACCESS_KEY` | R2 secret access key |
+| `R2_PUBLIC_BASE_URL` | Public bucket/custom-domain base; required for `cloud_setup.py r2` and `corpus_sync.py push --run` |
+| `MISTRAL_API_KEY` | Standalone capture pipeline and OCR block probe |
+
+The four core `R2_*` values are a unit: a partial set is treated as no R2
+configuration. Read-only R2 comparison and downloads do not require the public
+base URL.
+
 ## Setup
 
 Use the `python3` interpreter (Python 3.13).
@@ -117,8 +140,9 @@ portable; scans attached from elsewhere on disk keep their absolute paths.
 Checked books, UI settings, and attention marks are cached in the browser
 (localStorage) but written through to the server (`output/client_state.json`,
 `/api/client_state`), which is authoritative on load — so they survive a
-port change and are ready to sync. (`client_state.json` is gitignored: it
-is device-local and holds any configured API keys.)
+port change and are ready to sync. (`client_state.json` is gitignored and
+device-local; registered credential fields are stripped into the protected
+engine secret store.)
 
 For the **checked books** the load-time sync is **adopt-by-merge**, not
 replace: the server copy is unioned with the local cache (keeping whichever

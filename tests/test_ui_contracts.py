@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from librarytool.engine.secret_ids import LEGACY_SECRET_IDS, LEGACY_SECRET_KEYS
+
 
 APP = (Path(__file__).parents[1] / "tools" / "whl_explorer" / "static" /
        "app.js").read_text(encoding="utf-8")
@@ -282,13 +284,13 @@ def test_display_settings_have_one_theme_font_owner_and_no_fake_engine_choice():
 def test_client_and_server_agree_on_local_only_secret_keys():
     client = APP.split("const SECRET_IDS = Object.freeze({", 1)[1].split(
         "});", 1)[0]
-    server = SERVER.split("_SECRET_IDS = {", 1)[1].split(
-        "}\n_SECRET_KEYS", 1)[0]
-    key_pattern = r'^\s*"?([A-Za-z0-9_]+)"?\s*:'
-    client_keys = set(re.findall(key_pattern, client, re.MULTILINE))
-    server_keys = set(re.findall(key_pattern, server, re.MULTILINE))
-    assert client_keys == server_keys
-    assert {"embedKey", "imgGenKey", "ocrAzureKey"} <= client_keys
+    pair_pattern = (
+        r'^\s*"?([A-Za-z0-9_]+)"?\s*:\s*"([^"]+)"\s*,?\s*$'
+    )
+    client_ids = dict(re.findall(pair_pattern, client, re.MULTILINE))
+    assert client_ids == dict(LEGACY_SECRET_IDS)
+    assert set(client_ids) == LEGACY_SECRET_KEYS
+    assert {"embedKey", "imgGenKey", "ocrAzureKey"} <= client_ids.keys()
 
 
 def test_page_deletion_surfaces_reference_remap_warnings():

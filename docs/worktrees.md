@@ -36,8 +36,10 @@ The databases — the 40 MB renewals CSV, the Open Library indexes, and
 for the WHL catalogue the checkout's own CSV is the usual fallback.
 
 `--seed` copies the main checkout's books and settings into the new
-`DATA_ROOT`. It is a copy: the main checkout is never touched. Note that
-`client_state.json` carries your API keys.
+`DATA_ROOT`. It is a copy: the main checkout is never touched. The copied
+`client_state.json` keeps nonsecret preferences and work state but strips every
+registered legacy credential field. Protected and retired secret-store files
+are never seeded.
 
 **A port.** `server.py` binds 5001 unless `WHL_PORT` says otherwise, and it
 never reads `PORT`, so `autoPort` cannot help. Each worktree is assigned 5101,

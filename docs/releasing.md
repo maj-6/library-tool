@@ -212,9 +212,9 @@ So treat it as unrecoverable-if-lost and back it up accordingly:
 
 ## By hand (no CI)
 
-`tools/release_publish.py` does the registration half on its own, with the
-desktop's Supabase credentials (Settings → Sync) or `SUPABASE_URL` /
-`SUPABASE_KEY` in the environment:
+`tools/release_publish.py` does the registration half on its own. Set
+`SUPABASE_URL` and the service-role `SUPABASE_KEY` in the environment; the
+standalone publisher never reads desktop UI state or its protected secrets:
 
 ```
 # upload a local file to the public `releases` bucket and register it

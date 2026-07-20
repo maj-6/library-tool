@@ -43,7 +43,7 @@ const VIEW_STATE_KEYS = new Set([
 // Credentials are never persisted client-side. They live in the engine's
 // protected secret store; Mistral additionally syncs through
 // the signed-in user's private cloud profile so Book Capture can share it.
-// Must mirror server.py's _SECRET_KEYS. embedKey/imgGenKey were missing here
+// Must mirror the engine's LEGACY_SECRET_IDS registry. embedKey/imgGenKey were missing here
 // while the server accepted them, so persistSecrets filtered them out of a
 // save and partitionSettings let imgGenKey leak into localStorage/client_state.
 const SECRET_IDS = Object.freeze({

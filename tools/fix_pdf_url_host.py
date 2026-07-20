@@ -9,9 +9,10 @@ fix is to serve the same R2 objects from a *custom domain* carrying a CORS polic
 (see docs/cloud/r2_cors_setup.md), then repoint the stored URLs. Object keys are
 identical across hosts, so this only swaps scheme+host and keeps the path.
 
-Config is loaded exactly like tools/cloud_setup.py: SUPABASE_URL / SUPABASE_KEY
-env vars, else Settings > Sync (client_state). Listing needs only read access;
---apply writes and therefore requires the service_role key.
+Config is loaded exactly like tools/cloud_setup.py: SUPABASE_KEY comes from the
+environment, while SUPABASE_URL may override the built-in project. Listing
+needs only read access; --apply writes and therefore requires the service_role
+key.
 
     # dry run -- show what would change (safe, read-only, anon key is enough)
     python3 tools/fix_pdf_url_host.py --to https://files.worldherblibrary.org
@@ -79,7 +80,8 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = cloud_setup.config()
     if args.apply and cloud_setup.key_role(cfg["key"]) != "service_role":
-        sys.exit("--apply needs the service_role key (Settings > Sync), not the anon key.")
+        sys.exit("--apply needs a service_role credential in SUPABASE_KEY, "
+                 "not an anon key.")
 
     rows = sb._rest(cfg, "GET", "volumes?select=slug,pdf_url&order=slug")
     changes = plan(rows if isinstance(rows, list) else [], args.to, args.from_host)
