@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from http.client import HTTPConnection
 import json
 import os
 from pathlib import Path
@@ -14,8 +15,6 @@ import sys
 import tempfile
 import time
 from typing import Callable
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 
 CAPABILITY_HEADER = "X-WHL-Desktop-Capability"
@@ -38,16 +37,16 @@ def _free_loopback_port() -> int:
 
 def _http_request(port: int, path: str, capability: str | None = None) -> tuple[int, bytes]:
     headers = {CAPABILITY_HEADER: capability} if capability is not None else {}
-    request = Request(f"http://127.0.0.1:{port}{path}", headers=headers)
+    connection = HTTPConnection("127.0.0.1", port, timeout=2)
     try:
-        response = urlopen(request, timeout=2)  # noqa: S310 - fixed loopback origin
-    except HTTPError as error:
-        response = error
-    with response:
+        connection.request("GET", path, headers=headers)
+        response = connection.getresponse()
         body = response.read(MAX_RESPONSE_BYTES + 1)
         if len(body) > MAX_RESPONSE_BYTES:
             raise SmokeFailure(f"{path} exceeded the smoke response limit")
         return int(response.status), body
+    finally:
+        connection.close()
 
 
 def _decode_json(body: bytes, path: str) -> dict:
@@ -78,7 +77,7 @@ def _wait_until_ready(
             if status == 200 and _decode_json(body, "/healthz") == {"ok": True}:
                 return
             last_error = SmokeFailure(f"/healthz returned HTTP {status}")
-        except (OSError, URLError, SmokeFailure) as error:
+        except (OSError, SmokeFailure) as error:
             last_error = error
         time.sleep(delay)
         delay = min(delay * 1.5, 0.5)
