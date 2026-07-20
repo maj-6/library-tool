@@ -40,17 +40,29 @@ const VIEW_STATE_KEYS = new Set([
   "remarksSidebarCollapsed", "remarksFilters",
   "collapsed", "wbSideCollapsed",
 ]);
-// Credentials are never persisted client-side. They live in the server's
-// Host-guarded secrets store (/api/secrets); Mistral additionally syncs through
+// Credentials are never persisted client-side. They live in the engine's
+// protected secret store; Mistral additionally syncs through
 // the signed-in user's private cloud profile so Book Capture can share it.
 // Must mirror server.py's _SECRET_KEYS. embedKey/imgGenKey were missing here
 // while the server accepted them, so persistSecrets filtered them out of a
 // save and partitionSettings let imgGenKey leak into localStorage/client_state.
-const SECRET_KEYS = new Set([
-  "aiKey", "embedKey", "mistralKey", "ocrClaudeKey", "ocrAzureKey",
-  "ocrAwsKey", "ocrAwsSecret", "supabaseKey", "supabaseAnonKey", "r2KeyId",
-  "r2Secret", "gsKeyFile", "imgGenKey",
-]);
+const SECRET_IDS = Object.freeze({
+  aiKey: "provider:ai:api-key",
+  embedKey: "provider:embedding:api-key",
+  imgGenKey: "provider:image-generation:api-key",
+  mistralKey: "provider:mistral:api-key",
+  ocrClaudeKey: "provider:anthropic:api-key",
+  ocrAzureKey: "provider:azure-ocr:api-key",
+  ocrAwsKey: "provider:aws-ocr:access-key-id",
+  ocrAwsSecret: "provider:aws-ocr:secret-access-key",
+  supabaseKey: "cloud:supabase:service-role-key",
+  supabaseAnonKey: "cloud:supabase:anon-key",
+  r2KeyId: "storage:r2:access-key-id",
+  r2Secret: "storage:r2:secret-access-key",
+  gsKeyFile: "provider:google-sheets:service-account-file",
+});
+const SECRET_KEYS = new Set(Object.keys(SECRET_IDS));
+let secretStatuses = Object.create(null);
 function partitionSettings(s) {
   const prefs = {}, view = {};
   for (const k of Object.keys(s)) {
@@ -60,41 +72,70 @@ function partitionSettings(s) {
   return { prefs, view };
 }
 
-// Hydrate the renderer's ephemeral credential cache. Mistral may arrive from
-// the signed-in user's private cloud profile; partitionSettings keeps every
-// value here out of localStorage and client_state.
+// Hydrate the renderer's status-only credential view. Plaintext never returns
+// from the engine or enters state.settings, localStorage, or client_state.
 // Returns null when the store could not be READ — distinct from "read fine,
 // nothing stored" ({}). Callers that paint fields must not treat a failed read
 // as a set of empty keys, or a sidecar restart blanks every credential field.
+function secretConfigured(key) {
+  return !!(secretStatuses[key] && secretStatuses[key].configured);
+}
+
+function secretMaskedValue(key) {
+  const status = secretStatuses[key];
+  return status && status.configured ? status.masked_hint : "";
+}
+
+function secretOperationId(prefix = "secret") {
+  const suffix = globalThis.crypto && typeof globalThis.crypto.randomUUID === "function"
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return `${prefix}-${suffix}`;
+}
+
 async function hydrateSecrets() {
   try {
-    const res = await fetch("/api/secrets");
-    if (!res.ok) return null;
-    const secrets = await res.json();
-    for (const k of SECRET_KEYS) state.settings[k] = secrets[k] || "";
-    return secrets;
+    const document = await engineClient.secrets.list();
+    const byId = new Map(document.secrets.map((status) => [status.id, status]));
+    const next = Object.create(null);
+    for (const [key, id] of Object.entries(SECRET_IDS)) {
+      if (byId.has(id)) next[key] = byId.get(id);
+    }
+    secretStatuses = next;
+    return document;
   } catch (e) {
     return null;
   }
 }
 
-// Persist personal service credentials through the same loopback-only endpoint
-// used by Settings. Normal settings deliberately exclude SECRET_KEYS, so a
-// wizard must never rely on saveSettings() for these values.
+// Mutate personal service credentials through the versioned protected-store
+// API. Normal settings deliberately exclude SECRET_KEYS, so a wizard must
+// never rely on saveSettings() for these values.
 async function persistSecrets(updates) {
-  const clean = {};
-  for (const [k, value] of Object.entries(updates || {})) {
-    if (!SECRET_KEYS.has(k)) continue;
-    clean[k] = String(value || "").trim();
+  if (!Object.keys(secretStatuses).length) await hydrateSecrets();
+  for (const [key, raw] of Object.entries(updates || {})) {
+    if (!SECRET_KEYS.has(key)) continue;
+    const status = secretStatuses[key];
+    if (!status) throw new Error("protected credential storage is unavailable");
+    const value = String(raw || "").trim();
+    if (status.configured && value === status.masked_hint) continue;
+    let result;
+    if (value) {
+      result = await engineClient.secrets.replace({
+        secretId: SECRET_IDS[key], revision: status.revision,
+        credential: value,
+        idempotencyKey: secretOperationId("secret-replace"),
+      });
+    } else {
+      if (!status.configured) continue;
+      result = await engineClient.secrets.clear({
+        secretId: SECRET_IDS[key], revision: status.revision,
+        idempotencyKey: secretOperationId("secret-clear"),
+      });
+    }
+    secretStatuses[key] = result.receipt.after;
   }
-  if (!Object.keys(clean).length) return;
-  const res = await fetch("/api/secrets", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ updates: clean }),
-  });
-  if (!res.ok) throw new Error(`credential save failed (HTTP ${res.status})`);
-  for (const [k, value] of Object.entries(clean)) state.settings[k] = value;
+  return secretStatuses;
 }
 
 // `categories` left this list with the taxonomy overhaul: assignments are
@@ -239,23 +280,22 @@ const state = {
     whlMode: "search", checkedMode: "search",
     // "" is the retired Classic CAD id; applyTheme() migrates it to DEFAULT_THEME
     paneWidth: null, theme: "",
-    aiBase: "", aiModel: "", aiKey: "", aiInstructions: "",
+    aiBase: "", aiModel: "", aiInstructions: "",
     smartScanInstructions: "", smartScanManualPages: false,
     // embeddings provider for search-index publishing (#140); blank = lexical-only
-    embedBase: "", embedModel: "", embedKey: "",
+    embedBase: "", embedModel: "",
     // OCR services (Settings > OCR). Tesseract runs locally; Mistral, Claude,
     // and Textract use credentials from Settings > Credentials.
     // Cloud capture (phone -> Supabase -> manual entries) + Mistral key,
     // shared by the capture pipeline and the Mistral OCR service
-    supabaseUrl: "", supabaseKey: "", supabaseAnonKey: "", mistralKey: "",
+    supabaseUrl: "",
     authPromptDismissed: false,   // "Work locally" said: don't ask at startup
     wizardDone: false,            // first-run setup guide finished or skipped
     // Cloudflare R2 for published PDFs (Supabase storage is 1 GB on free)
-    r2Account: "", r2Bucket: "", r2KeyId: "", r2Secret: "", r2PublicBase: "",
+    r2Account: "", r2Bucket: "", r2PublicBase: "",
     cloudSyncMinutes: 0, cloudDeleteRemote: true,
     ocrService: "tesseract",
-    ocrTesseract: "", ocrClaudeKey: "", ocrClaudeModel: "",
-    ocrAwsKey: "", ocrAwsSecret: "", ocrAwsRegion: "",
+    ocrTesseract: "", ocrClaudeModel: "", ocrAwsRegion: "",
     ocrImageWidth: 1400,
     ocrLayout: true,    // page view: place words where they sit on the page
     ocrPaperColor: false,   // tint facsimile paper from sampled PDF margins
@@ -268,7 +308,7 @@ const state = {
     // page-view digit shortcuts: press N over a page to queue it
     ocrKeyMap: { 1: "tesseract", 2: "mistral", 3: "claude", 4: "textract" },
     // master list -> Google Sheets publishing (Settings > Integrations)
-    gsSpreadsheetId: "", gsKeyFile: "", gsSheetName: "Master list",
+    gsSpreadsheetId: "", gsSheetName: "Master list",
     // cloud search + downloadable databases (Settings > Integrations)
     cloudSearchUrl: "",         // remote instance of this app; used when no local index
     dbUrls: {},                 // per-database download URLs (name -> url)
@@ -2439,7 +2479,7 @@ function closeWizard(markDone) {
 }
 
 // Values are committed when leaving a step, so Back/Next/Finish all keep work.
-// Credentials use /api/secrets; saveSettings intentionally strips them.
+// Credentials use the protected engine service; saveSettings strips them.
 async function wizCommit() {
   const step = WIZ_STEPS[wizStep][0];
   if (step === "account") {
@@ -2452,7 +2492,7 @@ async function wizCommit() {
     const updates = {};
     for (const [id, key] of fields) {
       const value = el(id).value.trim();
-      if (value !== String(state.settings[key] || "")) updates[key] = value;
+      if (value !== secretMaskedValue(key)) updates[key] = value;
     }
     if (!Object.keys(updates).length) return true;
     const msg = el("wiz-keys-msg");
@@ -2494,17 +2534,17 @@ function wizRender() {
     for (const [id, key] of fields) {
       const input = el(id);
       delete input.dataset.edited;
-      input.value = state.settings[key] || "";
+      input.value = secretMaskedValue(key);
     }
     el("wiz-keys-msg").textContent = "";
     // A slow profile refresh must not overwrite a key the user has started
     // typing. The input listener in initWizard marks touched fields.
-    (wizSecretsLoad || hydrateSecrets()).then((secrets) => {
+    (wizSecretsLoad || hydrateSecrets()).then((document) => {
       if (WIZ_STEPS[wizStep][0] !== "services") return;
-      if (!secrets) return;   // failed READ: leave the fields as the user left them
+      if (!document) return;   // failed READ: leave the fields as the user left them
       for (const [id, key] of fields) {
         const input = el(id);
-        if (!input.dataset.edited) input.value = secrets[key] || "";
+        if (!input.dataset.edited) input.value = secretMaskedValue(key);
       }
     });
     wizCheckTesseract();
@@ -4288,8 +4328,8 @@ function renderSettings() {
       saveSettings();
     };
   }
-  // Credentials load from and save to the server's Host-guarded secrets API.
-  // Mistral is cached there and synchronized with the private cloud profile;
+  // Credentials load from and save to the protected engine service. Mistral
+  // is synchronized with the private cloud profile;
   // the others remain device-local.
   (async () => {
     const SECRET_FIELDS = [
@@ -4316,17 +4356,18 @@ function renderSettings() {
       const n = el(id);
       if (!n) continue;
       if (secrets) {
-        n.value = secrets[k] || "";
-        state.settings[k] = secrets[k] || "";   // in-memory only (e.g. master sync)
+        n.value = secretMaskedValue(k);
+        n.disabled = !secrets.health.writable;
         n.classList.remove("cred-bad");         // a fresh read supersedes an old failure
       }
       n.onchange = async () => {
         const val = n.value.trim();
         // was fire-and-forget: a 500 or a restarting sidecar silently discarded
         // a pasted key on a field where nothing is visible to contradict it.
-        // persistSecrets sets state.settings[k] only on success.
+        // The renderer retains only the returned masked status on success.
         try {
           await persistSecrets({ [k]: val });
+          n.value = secretMaskedValue(k);
           n.classList.remove("cred-bad");
           // the note is shared, so only retract it once nothing is still failing
           if (!document.querySelector(".cad-input.cred-bad")) setNote("");
@@ -4346,6 +4387,9 @@ function renderSettings() {
       setNote("Could not read stored credentials — the local service may still be " +
         "starting. The fields below may be out of date; saving still works.");
       statusErr("CREDENTIALS :: could not be read");
+    } else if (!secrets.health.available || !secrets.health.writable) {
+      setNote("Protected credential storage is unavailable on this system.");
+      statusErr("CREDENTIALS :: protected storage unavailable");
     } else if (!document.querySelector(".cad-input.cred-bad")) {
       setNote("");
     }
@@ -13358,8 +13402,8 @@ async function updateAnProvider() {
   const provider = base ? base.replace(/^https?:\/\//, "").split("/")[0] : "DeepSeek";
   let hasKey = false;
   try {
-    const sec = await (await fetch("/api/secrets")).json();
-    hasKey = !!String(sec.aiKey || "").trim();
+    await hydrateSecrets();
+    hasKey = secretConfigured("aiKey");
   } catch (e) { /* leave as no-key */ }
   host.classList.toggle("an-warn", !hasKey);
   host.textContent = hasKey
@@ -14203,8 +14247,8 @@ async function renderAnAsk(b) {
     el("an-ask-draft").hidden = true;
   }
   try {
-    const sec = await (await fetch("/api/secrets")).json();
-    anAskHasKey = !!String(sec.aiKey || "").trim();
+    await hydrateSecrets();
+    anAskHasKey = secretConfigured("aiKey");
   } catch (e) { anAskHasKey = false; }
   if (anAsk && anAsk.results.length) el("an-ask-draft").hidden = !anAskHasKey;
 }
@@ -19201,7 +19245,7 @@ async function generateAiSummary() {
   // so main's "model must be set" guard would block a request that works. The
   // message names the provider instead of pointing at a model setting.
   const provider = descriptionProviderLabel(s);
-  if (!(s.aiKey || "").trim()) {
+  if (!secretConfigured("aiKey")) {
     msg.textContent = provider === "DeepSeek"
       ? "Add your DeepSeek API key (Settings > Credentials)"
       : `Add an API key for ${provider} (Settings > Credentials)`;
@@ -19230,7 +19274,6 @@ async function generateAiSummary() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         base_url: baseUrl,
-        api_key: s.aiKey || "",
         model,
         instructions: s.aiInstructions || "",
         text: ocr.text,
@@ -21386,18 +21429,18 @@ const OCR_SERVICE_LABELS = {
 };
 
 function ocrServiceReady(svc) {
-  const s = state.settings;
   if (svc === "tesseract") return true;   // server falls back to the default install
-  if (svc === "mistral") return !!s.mistralKey;   // shared with the capture pipeline
-  if (svc === "claude") return !!s.ocrClaudeKey;
-  if (svc === "textract") return !!(s.ocrAwsKey && s.ocrAwsSecret);
+  if (svc === "mistral") return secretConfigured("mistralKey");
+  if (svc === "claude") return secretConfigured("ocrClaudeKey");
+  if (svc === "textract") return secretConfigured("ocrAwsKey") &&
+    secretConfigured("ocrAwsSecret");
   return false;
 }
 
 const TEXT_ANALYSIS_LABELS = { configured: "Configured AI provider" };
 
 function analysisServiceReady() {
-  return !!String(state.settings.aiKey || "").trim();
+  return secretConfigured("aiKey");
 }
 
 // renderOcrQueue runs this on every 1.5s job-poll tick, so it follows the
@@ -21584,10 +21627,8 @@ async function ocrQueuePages(bid, srcKey, pages) {
         build_id: bid, pdf, pages, target, src: srcKey,
         width: s.ocrImageWidth || 1400,
         tesseract: s.ocrTesseract || "",
-        claude_key: s.ocrClaudeKey || "", claude_model: s.ocrClaudeModel || "",
-        aws_key: s.ocrAwsKey || "", aws_secret: s.ocrAwsSecret || "",
+        claude_model: s.ocrClaudeModel || "",
         aws_region: s.ocrAwsRegion || "",
-        mistral_key: s.mistralKey || "",
       }),
     });
     const data = await res.json().catch(() => ({}));
@@ -24620,7 +24661,6 @@ async function syncMasterList() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         spreadsheet_id: state.settings.gsSpreadsheetId || "",
-        service_account_file: state.settings.gsKeyFile || "",
         sheet_name: state.settings.gsSheetName || "Master list",
       }),
     });

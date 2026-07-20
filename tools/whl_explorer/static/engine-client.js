@@ -336,6 +336,39 @@
       containsCommandFingerprint(value[key], seen));
   }
 
+  function containsCredentialField(value, seen = new Set()) {
+    if (!value || typeof value !== "object") return false;
+    if (seen.has(value)) return true;
+    seen.add(value);
+    if (Object.prototype.hasOwnProperty.call(value, "credential")) return true;
+    return Object.keys(value).some((key) =>
+      containsCredentialField(value[key], seen));
+  }
+
+  function isSecretStatus(value, secretId = null) {
+    return hasExactKeys(value, ["id", "configured", "masked_hint", "revision"]) &&
+      isPortableIdentifier(value.id) &&
+      (secretId === null || value.id === secretId) &&
+      typeof value.configured === "boolean" &&
+      typeof value.masked_hint === "string" &&
+      value.masked_hint === (value.configured ? "••••" : "") &&
+      isLifecycleRevision(value.revision);
+  }
+
+  function isSecretReceipt(value, action, expected) {
+    return hasExactKeys(value, [
+      "action", "operation_id", "secret_id", "before", "after",
+    ]) && value.action === action &&
+      value.operation_id === expected.operationId &&
+      value.secret_id === expected.secretId &&
+      isSecretStatus(value.before, expected.secretId) &&
+      isSecretStatus(value.after, expected.secretId) &&
+      value.before.revision === expected.revision &&
+      value.after.revision !== value.before.revision &&
+      value.after.configured === (action === "replace") &&
+      !containsCredentialField(value);
+  }
+
   function isTextLayerSourceView(value) {
     if (!hasExactKeys(value, [
       "representation_id", "pinned_revision", "current_revision",
@@ -670,6 +703,12 @@
         get: (args) => this._itemTombstoneGet(args),
         restore: (args) => this._itemTombstoneRestore(args),
       });
+      this.secrets = Object.freeze({
+        list: (args) => this._secretsList(args),
+        get: (args) => this._secretGet(args),
+        replace: (args) => this._secretReplace(args),
+        clear: (args) => this._secretClear(args),
+      });
       this.capabilities = (args) => this._capabilities(args);
       this.providers = Object.freeze({
         discover: (args) => this._providersDiscover(args),
@@ -821,6 +860,93 @@
         }
         return body;
       });
+    }
+
+    async _secretsList({ signal } = {}) {
+      const path = "/v1/secrets";
+      const { body, status } = await this._requestJson("GET", path, {
+        signal, cache: "no-store", includeStatus: true,
+      });
+      const health = body && body.health;
+      if (status !== 200 || !hasExactKeys(body, [
+        "ok", "schema", "health", "secrets",
+      ]) || body.ok !== true ||
+          body.schema !== "librarytool.secret-status-list/1" ||
+          !hasExactKeys(health, ["available", "state", "writable"]) ||
+          typeof health.available !== "boolean" ||
+          typeof health.state !== "string" ||
+          typeof health.writable !== "boolean" ||
+          !Array.isArray(body.secrets) ||
+          !body.secrets.every((item) => isSecretStatus(item)) ||
+          new Set(body.secrets.map((item) => item.id)).size !==
+            body.secrets.length || containsCredentialField(body)) {
+        this._invalidResponse(
+          "Engine returned an invalid secret status list",
+          "GET", path, null, undefined, status);
+      }
+      return body;
+    }
+
+    async _secretGet({ secretId, signal } = {}) {
+      const id = portableIdentifier(secretId, "secretId");
+      const path = `/v1/secrets/${encodePart(id)}`;
+      const { body, status } = await this._requestJson("GET", path, {
+        signal, cache: "no-store", includeStatus: true,
+      });
+      if (status !== 200 || !hasExactKeys(body, ["ok", "schema", "status"]) ||
+          body.ok !== true || body.schema !== "librarytool.secret-status/1" ||
+          !isSecretStatus(body.status, id) || containsCredentialField(body)) {
+        this._invalidResponse(
+          "Engine returned an invalid secret status",
+          "GET", path, null, undefined, status);
+      }
+      return body;
+    }
+
+    async _secretReplace({ secretId, revision, credential,
+      idempotencyKey, signal } = {}) {
+      if (typeof credential !== "string" || !credential) {
+        throw new TypeError("credential is required");
+      }
+      return this._secretMutation({
+        action: "replace", secretId, revision, credential,
+        idempotencyKey, signal,
+      });
+    }
+
+    _secretClear({ secretId, revision, idempotencyKey, signal } = {}) {
+      return this._secretMutation({
+        action: "clear", secretId, revision, idempotencyKey, signal,
+      });
+    }
+
+    async _secretMutation({ action, secretId, revision, credential,
+      idempotencyKey, signal }) {
+      const id = portableIdentifier(secretId, "secretId");
+      const operationId = operationKey(idempotencyKey, "idempotencyKey");
+      const path = `/v1/secrets/${encodePart(id)}`;
+      const method = action === "replace" ? "PUT" : "DELETE";
+      const { body, status } = await this._requestJson(method, path, {
+        headers: {
+          "Idempotency-Key": operationId,
+          "If-Match": quoteLifecycleRevision(revision, "revision"),
+        },
+        body: action === "replace" ? { credential } : undefined,
+        signal, cache: "no-store", includeStatus: true,
+      });
+      if (status !== 200 || !hasExactKeys(body, [
+        "ok", "schema", "replayed", "receipt",
+      ]) || body.ok !== true ||
+          body.schema !== "librarytool.secret-mutation-receipt/1" ||
+          typeof body.replayed !== "boolean" ||
+          !isSecretReceipt(body.receipt, action, {
+            operationId, secretId: id, revision,
+          }) || containsCredentialField(body)) {
+        this._invalidResponse(
+          "Engine returned an invalid secret mutation receipt",
+          method, path, null, undefined, status);
+      }
+      return body;
     }
 
     _itemsList({ includeBuildCompatibility = false, signal } = {}) {

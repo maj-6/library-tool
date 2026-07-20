@@ -280,12 +280,15 @@ def test_display_settings_have_one_theme_font_owner_and_no_fake_engine_choice():
 
 
 def test_client_and_server_agree_on_local_only_secret_keys():
-    client = APP.split("const SECRET_KEYS = new Set([", 1)[1].split("]);", 1)[0]
-    server = SERVER.split("_SECRET_KEYS = frozenset({", 1)[1].split("})", 1)[0]
-    assert set(re.findall(r'"([A-Za-z0-9_]+)"', client)) == set(
-        re.findall(r'"([A-Za-z0-9_]+)"', server))
-    assert {"embedKey", "imgGenKey", "ocrAzureKey"} <= set(re.findall(
-        r'"([A-Za-z0-9_]+)"', client))
+    client = APP.split("const SECRET_IDS = Object.freeze({", 1)[1].split(
+        "});", 1)[0]
+    server = SERVER.split("_SECRET_IDS = {", 1)[1].split(
+        "}\n_SECRET_KEYS", 1)[0]
+    key_pattern = r'^\s*"?([A-Za-z0-9_]+)"?\s*:'
+    client_keys = set(re.findall(key_pattern, client, re.MULTILINE))
+    server_keys = set(re.findall(key_pattern, server, re.MULTILINE))
+    assert client_keys == server_keys
+    assert {"embedKey", "imgGenKey", "ocrAzureKey"} <= client_keys
 
 
 def test_page_deletion_surfaces_reference_remap_warnings():

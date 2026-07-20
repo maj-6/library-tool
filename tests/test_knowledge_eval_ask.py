@@ -474,8 +474,9 @@ def test_ask_requires_question_and_passages(client, monkeypatch):
 def test_ask_answer_without_a_key_is_a_clean_409(client, monkeypatch):
     bid = _segmented_build(client, monkeypatch, "No key", _PAGES)
     monkeypatch.setattr(server, "_ai_cfg", lambda: {
-        "base": "https://ai.test", "model": "m", "key": "",
+        "base": "https://ai.test", "model": "m",
         "instructions": "", "temperature": None, "timeout": None})
+    monkeypatch.setattr(server, "_secret_is_configured", lambda _key: False)
     r = client.post("/api/knowledge/ask/answer", json={
         "build_id": bid, "question": "q", "passage_ids": ["x"]})
     assert r.status_code == 409
@@ -494,8 +495,10 @@ def test_ask_answer_prompt_carries_the_grounding_contract(client, monkeypatch):
         seen.append(messages)
         return "This 1652 edition states rosemary comforts the head [p2]."
     monkeypatch.setattr(server, "_ai_cfg", lambda: {
-        "base": "https://ai.test", "model": "m", "key": "k",
+        "base": "https://ai.test", "model": "m",
         "instructions": "", "temperature": None, "timeout": None})
+    monkeypatch.setattr(server, "_secret_is_configured",
+                        lambda key: key == "aiKey")
     monkeypatch.setattr(server, "_ai_chat", fake_chat)
 
     r = client.post("/api/knowledge/ask/answer", json={
@@ -529,8 +532,10 @@ def test_ask_answer_abstention_is_flagged_not_an_error(client, monkeypatch):
     bid = _segmented_build(client, monkeypatch, "Abstains", _PAGES)
     doc = client.get(f"/api/builds/{bid}/passages").get_json()["doc"]
     monkeypatch.setattr(server, "_ai_cfg", lambda: {
-        "base": "https://ai.test", "model": "m", "key": "k",
+        "base": "https://ai.test", "model": "m",
         "instructions": "", "temperature": None, "timeout": None})
+    monkeypatch.setattr(server, "_secret_is_configured",
+                        lambda key: key == "aiKey")
     monkeypatch.setattr(
         server, "_ai_chat",
         lambda cfg, messages, **kw: server._ASK_ABSTAIN + "\n")
@@ -545,8 +550,10 @@ def test_ask_answer_abstention_is_flagged_not_an_error(client, monkeypatch):
 def test_ask_answer_with_no_known_passages_refuses(client, monkeypatch):
     bid = _segmented_build(client, monkeypatch, "Nothing to cite", _PAGES)
     monkeypatch.setattr(server, "_ai_cfg", lambda: {
-        "base": "https://ai.test", "model": "m", "key": "k",
+        "base": "https://ai.test", "model": "m",
         "instructions": "", "temperature": None, "timeout": None})
+    monkeypatch.setattr(server, "_secret_is_configured",
+                        lambda key: key == "aiKey")
     r = client.post("/api/knowledge/ask/answer", json={
         "build_id": bid, "question": "q", "passage_ids": ["ghost"]})
     assert r.status_code == 400

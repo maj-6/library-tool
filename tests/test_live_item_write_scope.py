@@ -195,8 +195,10 @@ def test_figure_rework_revalidates_after_remote_generation(
     errors: list[BaseException] = []
 
     monkeypatch.setattr(server, "_img_gen_cfg", lambda: {
-        "provider": "openai", "model": "fake", "key": "test-key",
+        "provider": "openai", "model": "fake",
     })
+    monkeypatch.setattr(server, "_secret_is_configured",
+                        lambda key: key == "imgGenKey")
 
     def fake_generate(_cfg, _raw, _mime, _prompt):
         model_entered.set()

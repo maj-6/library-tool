@@ -4,8 +4,25 @@ from __future__ import annotations
 
 import json
 import threading
+from contextlib import contextmanager
 
 import server
+
+
+def _install_mistral_secret(monkeypatch, value="configured"):
+    monkeypatch.setattr(
+        server, "_secret_is_configured",
+        lambda key: key == "mistralKey" and bool(value),
+    )
+
+    @contextmanager
+    def lease(key):
+        assert key == "mistralKey"
+        if not value:
+            raise RuntimeError("not configured")
+        yield value
+
+    monkeypatch.setattr(server, "_lease_secret", lease)
 
 
 def _seed_build(data_root, bid: str) -> None:
@@ -91,10 +108,9 @@ def test_detection_job_resolves_provider_server_side_and_publishes_output(
     bid = "detect-job-success"
     _seed_build(data_root, bid)
     started = _install_inline_worker(monkeypatch)
-    monkeypatch.setattr(server, "_client_settings", lambda: {
-        "mistralKey": "server-only-secret",
-        "ocrImageWidth": 1777,
-    })
+    _install_mistral_secret(monkeypatch, "server-only-secret")
+    monkeypatch.setattr(
+        server, "_client_settings", lambda: {"ocrImageWidth": 1777})
     seen: dict = {}
 
     def detect(_png: bytes, cfg: dict) -> dict:
@@ -153,9 +169,7 @@ def test_detection_on_human_page_creates_proposal_without_replacing_it(
         json={"src": "primary", "page": 1, "items": [_region("Human text")]},
     ).get_json()
     started = _install_inline_worker(monkeypatch)
-    monkeypatch.setattr(
-        server, "_client_settings", lambda: {"mistralKey": "configured"}
-    )
+    _install_mistral_secret(monkeypatch)
     monkeypatch.setitem(server._OCR_SERVICES, "mistral", lambda *_args: {
         "text": "New machine text",
         "regions": [_region("New machine text")],
@@ -183,9 +197,7 @@ def test_detection_job_reports_provider_failure_as_failed(
     bid = "detect-job-failure"
     _seed_build(data_root, bid)
     started = _install_inline_worker(monkeypatch)
-    monkeypatch.setattr(
-        server, "_client_settings", lambda: {"mistralKey": "configured"}
-    )
+    _install_mistral_secret(monkeypatch)
 
     def fail(*_args):
         raise RuntimeError("provider offline")
@@ -221,7 +233,7 @@ def test_detection_start_requires_current_revision_and_configured_provider(
     assert stale.status_code == 409
     assert stale.get_json()["code"] == "region_revision_conflict"
 
-    monkeypatch.setattr(server, "_client_settings", lambda: {})
+    _install_mistral_secret(monkeypatch, "")
     unconfigured = _start(client, bid, _revision(client, bid))
     assert unconfigured.status_code == 400
     assert unconfigured.get_json()["code"] == \
@@ -233,9 +245,7 @@ def test_duplicate_detection_joins_the_active_page_job(
 ):
     bid = "detect-job-dedupe"
     _seed_build(data_root, bid)
-    monkeypatch.setattr(
-        server, "_client_settings", lambda: {"mistralKey": "configured"}
-    )
+    _install_mistral_secret(monkeypatch)
     started: list[dict] = []
 
     def defer(job: dict, _source_revision: int,
@@ -267,9 +277,7 @@ def test_detection_job_honors_generic_cooperative_cancellation(
 ):
     bid = "detect-job-cancel"
     _seed_build(data_root, bid)
-    monkeypatch.setattr(
-        server, "_client_settings", lambda: {"mistralKey": "configured"}
-    )
+    _install_mistral_secret(monkeypatch)
     started: list[dict] = []
 
     def defer(job: dict, _source_revision: int,

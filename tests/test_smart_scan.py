@@ -10,6 +10,7 @@ wand-overlay smart-check suite; the engine and its coverage carry over.)
 """
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
 
@@ -38,11 +39,20 @@ def _fake_pipeline(monkeypatch, texts, ai_reply, scan_pages=(1, 2, 3, 4, 5)):
         calls["ocr"].append(page)
         return texts.get(page, "")
     monkeypatch.setattr(server, "_sc_ocr_page", ocr)
-    monkeypatch.setattr(server, "_client_settings", lambda: {"mistralKey": "mk"})
+    monkeypatch.setattr(
+        server, "_secret_is_configured",
+        lambda key: key == "mistralKey" or
+        (key == "aiKey" and ai_reply is not None),
+    )
+    monkeypatch.setattr(
+        server, "_lease_secret",
+        lambda key: contextlib.nullcontext(
+            "mk" if key == "mistralKey" else "dk"),
+    )
     if ai_reply is not None:
         monkeypatch.setattr(server, "_ai_cfg", lambda: {
             "base": "https://api.deepseek.com", "model": "deepseek-chat",
-            "key": "dk", "instructions": "", "temperature": "", "timeout": ""})
+            "instructions": "", "temperature": "", "timeout": ""})
 
         def ai_json(cfg, messages, temperature=0.2):
             calls["prompts"].append(messages[0]["content"])
@@ -419,8 +429,10 @@ def test_smart_scan_selected_pdf_ocrs_every_marked_page(client, data_root,
 
 def test_smart_scan_deepseek_uses_dedicated_settings_instructions(monkeypatch):
     monkeypatch.setattr(server, "_client_settings", lambda: {
-        "aiKey": "dk", "aiModel": "deepseek-chat",
+        "aiModel": "deepseek-chat",
         "smartScanInstructions": "Prefer the printed imprint over cover text."})
+    monkeypatch.setattr(server, "_secret_is_configured",
+                        lambda key: key == "aiKey")
     cfg = server._ai_cfg()
     assert cfg["smart_scan_instructions"] == (
         "Prefer the printed imprint over cover text.")

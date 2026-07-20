@@ -1,5 +1,6 @@
 """Authenticated Android-to-desktop LAN pairing and capture receipts."""
 
+import contextlib
 import io
 import inspect
 
@@ -49,6 +50,9 @@ def test_lan_capture_returns_branded_matching_receipt(monkeypatch, data_root):
 
     monkeypatch.setattr(server, "_lan_token", lambda: "paired-secret")
     monkeypatch.setattr(server, "_client_settings", lambda: {})
+    monkeypatch.setattr(server, "_lease_secret", lambda key:
+                        contextlib.nullcontext("leased-mistral")
+                        if key == "mistralKey" else None)
     monkeypatch.setattr(
         server,
         "ingest_capture",

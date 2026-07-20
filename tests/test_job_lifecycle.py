@@ -411,7 +411,9 @@ def test_cancel_translate_between_pages_keeps_saved_pages(client, monkeypatch):
         return "TRANSLATED PAGE ONE"
 
     monkeypatch.setattr(server, "_ai_cfg", lambda: {
-        "base": "https://example.test/v1", "key": "k", "model": "m"})
+        "base": "https://example.test/v1", "model": "m"})
+    monkeypatch.setattr(server, "_secret_is_configured",
+                        lambda key: key == "aiKey")
     monkeypatch.setattr(server, "_ai_chat", fake_ai_chat)
     monkeypatch.setattr(server, "_an_job_start", run_inline)
 

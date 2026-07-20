@@ -857,7 +857,9 @@ def test_rework_figure_endpoint(client, data_root, monkeypatch):
 
     monkeypatch.setattr(server, "_img_gen", fake_gen)
     monkeypatch.setattr(server, "_img_gen_cfg", lambda: {
-        "provider": "openai", "model": "gpt-image-1", "key": "k"})
+        "provider": "openai", "model": "gpt-image-1"})
+    monkeypatch.setattr(server, "_secret_is_configured",
+                        lambda key: key == "imgGenKey")
     r = client.post(f"/api/builds/{bid}/rework-figure",
                     json={"figure": "p3-fig.jpeg",
                           "prompt": "keep the caption lettering"}).get_json()

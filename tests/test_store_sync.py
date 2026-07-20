@@ -974,8 +974,7 @@ def test_cloud_sync_pass_carries_the_stores(fake_cloud, monkeypatch):
 
     state = lib.load_json(lib.CLIENT_STATE_PATH, {})
     settings = dict(state.get("settings") or {})
-    state["settings"] = dict(settings, supabaseUrl="https://x.supabase.co",
-                             supabaseKey="k")
+    state["settings"] = dict(settings, supabaseUrl="https://x.supabase.co")
     lib.save_json(lib.CLIENT_STATE_PATH, state)
     monkeypatch.setattr(server, "_refresh_collection_aliases",
                         lambda _cfg, _token: [])
@@ -1013,7 +1012,17 @@ def test_cloud_sync_pass_carries_the_stores(fake_cloud, monkeypatch):
     monkeypatch.setattr(
         server.store_sync, "sync_entry_files", observed_sync_entry_files
     )
-    monkeypatch.setattr(server, "_r2_cfg", lambda: {"bucket": "test"})
+    @contextmanager
+    def cloud_lease():
+        yield {"url": "https://x.supabase.co", "key": "leased-owner"}
+
+    @contextmanager
+    def r2_lease():
+        yield {"bucket": "test", "key_id": "leased-id",
+               "secret": "leased-secret"}
+
+    monkeypatch.setattr(server, "_lease_cloud_cfg", cloud_lease)
+    monkeypatch.setattr(server, "_lease_r2_cfg", r2_lease)
     monkeypatch.setattr(server.r2, "configured", lambda _cfg: True)
     lib.save_json(ss.STORES["builds"]["path"](),
                   {"b1": {"id": "b1", "title": "One", "updated_at": T1}})

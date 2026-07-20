@@ -45,6 +45,44 @@ function lifecycleState(overrides = {}) {
   };
 }
 
+function secretStatus(overrides = {}) {
+  const configured = overrides.configured === true;
+  return {
+    id: "provider:ai:api-key",
+    configured,
+    masked_hint: configured ? "••••" : "",
+    revision: "secret-r1",
+    ...overrides,
+  };
+}
+
+function secretMutationResult(action, overrides = {}) {
+  const replace = action === "replace";
+  const before = secretStatus({
+    configured: !replace,
+    masked_hint: replace ? "" : "••••",
+    revision: replace ? "secret-r1" : "secret-r2",
+  });
+  const after = secretStatus({
+    configured: replace,
+    masked_hint: replace ? "••••" : "",
+    revision: replace ? "secret-r2" : "secret-r3",
+  });
+  return {
+    ok: true,
+    schema: "librarytool.secret-mutation-receipt/1",
+    replayed: false,
+    receipt: {
+      action,
+      operation_id: `${action}-ai-1`,
+      secret_id: before.id,
+      before,
+      after,
+    },
+    ...overrides,
+  };
+}
+
 function itemTombstone(overrides = {}) {
   return {
     tombstone_id: "deleted:one",
@@ -114,6 +152,10 @@ test("EngineClient exposes the complete Replica compatibility surface", () => {
   assert.equal(typeof client.itemTombstones.list, "function");
   assert.equal(typeof client.itemTombstones.get, "function");
   assert.equal(typeof client.itemTombstones.restore, "function");
+  assert.equal(typeof client.secrets.list, "function");
+  assert.equal(typeof client.secrets.get, "function");
+  assert.equal(typeof client.secrets.replace, "function");
+  assert.equal(typeof client.secrets.clear, "function");
   const jsonMethods = [
     client.replica.templates.list,
     client.pdf.info,
@@ -159,6 +201,150 @@ test("EngineClient exposes versioned capability discovery", async () => {
   assert.equal(result.schema, "librarytool.capabilities/1");
   assert.equal(calls[0].url, "/api/v1/capabilities");
   assert.equal(calls[0].init.method, "GET");
+});
+
+test("secret reads expose only versioned masked status", async () => {
+  const calls = [];
+  const bodies = [
+    {
+      ok: true,
+      schema: "librarytool.secret-status-list/1",
+      health: { available: true, state: "ready", writable: true },
+      secrets: [secretStatus()],
+    },
+    {
+      ok: true,
+      schema: "librarytool.secret-status/1",
+      status: secretStatus({
+        configured: true,
+        masked_hint: "••••",
+        revision: "secret-r2",
+      }),
+    },
+  ];
+  const client = new EngineClient({
+    transport: async (url, init) => {
+      calls.push({ url, init });
+      return response(200, bodies.shift());
+    },
+  });
+
+  const listed = await client.secrets.list();
+  const detail = await client.secrets.get({
+    secretId: "provider:ai:api-key",
+  });
+
+  assert.equal(listed.secrets[0].configured, false);
+  assert.equal(detail.status.masked_hint, "••••");
+  assert.deepEqual(calls.map(({ url }) => url), [
+    "/api/v1/secrets",
+    "/api/v1/secrets/provider%3Aai%3Aapi-key",
+  ]);
+  assert.ok(calls.every(({ init }) => init.method === "GET"));
+  assert.ok(calls.every(({ init }) => init.cache === "no-store"));
+  assert.ok(calls.every(({ init }) => init.body === undefined));
+});
+
+test("secret mutations own exact CAS and idempotency transport", async () => {
+  const calls = [];
+  const bodies = [
+    secretMutationResult("replace"),
+    secretMutationResult("clear"),
+  ];
+  const client = new EngineClient({
+    transport: async (url, init) => {
+      calls.push({ url, init });
+      return response(200, bodies.shift());
+    },
+  });
+
+  const replacement = await client.secrets.replace({
+    secretId: "provider:ai:api-key",
+    revision: "secret-r1",
+    credential: "transport-only-value",
+    idempotencyKey: "replace-ai-1",
+  });
+  const cleared = await client.secrets.clear({
+    secretId: "provider:ai:api-key",
+    revision: "secret-r2",
+    idempotencyKey: "clear-ai-1",
+  });
+
+  assert.equal(replacement.receipt.after.configured, true);
+  assert.equal(cleared.receipt.after.configured, false);
+  assert.deepEqual(calls[0], {
+    url: "/api/v1/secrets/provider%3Aai%3Aapi-key",
+    init: {
+      method: "PUT",
+      headers: {
+        Accept: "application/json",
+        "Idempotency-Key": "replace-ai-1",
+        "If-Match": '"secret-r1"',
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ credential: "transport-only-value" }),
+      cache: "no-store",
+    },
+  });
+  assert.deepEqual(calls[1], {
+    url: "/api/v1/secrets/provider%3Aai%3Aapi-key",
+    init: {
+      method: "DELETE",
+      headers: {
+        Accept: "application/json",
+        "Idempotency-Key": "clear-ai-1",
+        "If-Match": '"secret-r2"',
+      },
+      cache: "no-store",
+    },
+  });
+  assert.equal(JSON.stringify(replacement).includes("transport-only-value"), false);
+});
+
+test("secret client rejects disclosure-shaped responses without retaining them",
+  async () => {
+    const leaked = {
+      ok: true,
+      schema: "librarytool.secret-status-list/1",
+      health: { available: true, state: "ready", writable: true },
+      secrets: [secretStatus()],
+      credential: "must-not-survive-validation",
+    };
+    const { client } = harness(leaked);
+
+    await assert.rejects(
+      client.secrets.list(),
+      (error) => error instanceof EngineClientError &&
+        error.code === "invalid-response" && error.body === null &&
+        !JSON.stringify(error).includes("must-not-survive-validation"),
+    );
+  });
+
+test("secret mutations reject unsafe commands before transport", async () => {
+  const { client, calls } = harness();
+  await assert.rejects(client.secrets.replace({
+    secretId: "provider:ai:api-key",
+    revision: "secret-r1",
+    credential: "",
+    idempotencyKey: "replace-ai-1",
+  }), /credential/);
+  await assert.rejects(client.secrets.replace({
+    secretId: "provider/ai/key",
+    revision: "secret-r1",
+    credential: "value",
+    idempotencyKey: "replace-ai-1",
+  }), /secretId/);
+  await assert.rejects(client.secrets.clear({
+    secretId: "provider:ai:api-key",
+    revision: 'W/"secret-r1"',
+    idempotencyKey: "clear-ai-1",
+  }), /revision/);
+  await assert.rejects(client.secrets.clear({
+    secretId: "provider:ai:api-key",
+    revision: "secret-r2",
+    idempotencyKey: "unsafe/key",
+  }), /idempotencyKey/);
+  assert.equal(calls.length, 0);
 });
 
 test("shared OCR layout metadata also crosses the client boundary", async () => {

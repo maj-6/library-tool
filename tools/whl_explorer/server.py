@@ -89,6 +89,12 @@ from librarytool.adapters.filesystem.recoverable_write_set import (  # noqa: E40
 from librarytool.adapters.filesystem.whl_catalogue_codec import (  # noqa: E402
     WhlCatalogueItemCodec,
 )
+from librarytool.adapters.windows.secret_store import (  # noqa: E402
+    SecretCredentialNotConfiguredError,
+    SecretIdRegistry,
+    SecretStoreHealth,
+    WindowsDpapiSecretStoreRepository,
+)
 from librarytool_http import (  # noqa: E402
     create_provider_discovery_blueprint,
     create_text_layer_blueprint,
@@ -100,6 +106,7 @@ from librarytool.composition.filesystem import (  # noqa: E402
     ItemLifecycleBindings,
     ReplicaBindings,
     RepresentationBindings,
+    SecretStoreBindings,
     TranslationBindings,
 )
 from librarytool.composition.first_party import (  # noqa: E402
@@ -155,6 +162,11 @@ from librarytool.engine.interchange import (  # noqa: E402
     OpenLibService,
 )
 from librarytool.engine.replica import ReplicaApplicationService  # noqa: E402
+from librarytool.engine.secret_store import (  # noqa: E402
+    ClearSecretCommand,
+    ReplaceSecretCommand,
+    SecretStoreService,
+)
 from librarytool.engine.representation_commands import (  # noqa: E402
     AttachRepresentationCommand,
     DetachRepresentationCommand,
@@ -167,6 +179,7 @@ from librarytool.engine.runtime import (  # noqa: E402
     ITEM_LIFECYCLE_SERVICE,
     LIB_OPEN_SERVICE,
     REPRESENTATION_COMMAND_SERVICE,
+    SECRET_STORE_SERVICE,
     LibraryEngine,
 )
 from librarytool.engine.text_layers import TextLayerService  # noqa: E402
@@ -546,20 +559,53 @@ def _auth_doc() -> dict:
 
 
 def _auth_cfg() -> dict | None:
-    """GoTrue wants a public project API key in ``apikey``.
+    """Return configured public auth identity without leasing a custom key.
 
     Nothing configured is NOT unconfigured: the app ships knowing its own
     cloud (cloud_defaults), so accounts work on a fresh install with no keys
     entered. Settings override; a custom project URL with no key of its own
     stays unconfigured rather than pairing with the default key. The owner
     service credential is deliberately ignored here: normal account and phone
-    capture traffic must never depend on it."""
+    capture traffic must never depend on it.
+
+    The bundled anon key is a public application identifier and may remain in
+    this value. A custom key is represented only by configured status; its
+    plaintext is added by :func:`_auth_execution_cfg` while provider calls run.
+    """
     s = _client_settings()
     url = str(s.get("supabaseUrl") or "").strip() or cloud_defaults.SUPABASE_URL
-    key = str(s.get("supabaseAnonKey") or "").strip()
-    if not key and url == cloud_defaults.SUPABASE_URL:
-        key = cloud_defaults.SUPABASE_ANON_KEY
-    return {"url": url, "key": key} if url and key else None
+    if not url:
+        return None
+    if url == cloud_defaults.SUPABASE_URL:
+        return {"url": url, "key": cloud_defaults.SUPABASE_ANON_KEY}
+    if _secret_is_configured("supabaseAnonKey"):
+        return {"url": url}
+    return None
+
+
+@contextlib.contextmanager
+def _auth_execution_cfg():
+    """Lease a custom project key for one Supabase request family."""
+
+    public = _auth_cfg()
+    if not public:
+        yield None
+        return
+    if "key" in public:
+        cfg = dict(public)
+        try:
+            yield cfg
+        finally:
+            # The bundled value is public, but clearing the execution copy
+            # keeps the same lifecycle as a custom protected value.
+            cfg.pop("key", None)
+        return
+    with _lease_secret("supabaseAnonKey") as key:
+        cfg = {**public, "key": key}
+        try:
+            yield cfg
+        finally:
+            cfg.pop("key", None)
 
 
 def _email_confirm_redirect() -> str:
@@ -575,8 +621,7 @@ def _auth_session() -> dict | None:
     """A live session, refreshed when stale. Refresh tokens rotate, so the
     refreshed session is persisted before anything uses it, under the lock —
     two concurrent refreshes with one token can revoke the whole family."""
-    cfg = _auth_cfg()
-    if not cfg:
+    if not _auth_cfg():
         return None
     with _auth_lock:
         doc = _auth_doc()
@@ -586,7 +631,13 @@ def _auth_session() -> dict | None:
         if time.time() < float(ses.get("expires_at") or 0) - 90:
             return ses
         try:
-            fresh = sauth.refresh(cfg, ses["refresh_token"])
+            with _auth_execution_cfg() as cfg:
+                if not cfg:
+                    return None
+                fresh = sauth.refresh(cfg, ses["refresh_token"])
+        except RuntimeError:
+            log.warning("session refresh unavailable â€” protected auth key unavailable")
+            return None
         except sauth.AuthError as exc:
             # Only a definitive rejection kills the session. A transport
             # failure (offline, DNS, captive portal) says nothing about the
@@ -657,8 +708,7 @@ def api_auth_status():
 
 @app.route("/api/auth/login", methods=["POST"])
 def api_auth_login():
-    cfg = _auth_cfg()
-    if not cfg:
+    if not _auth_cfg():
         return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Integrations)"}), 400
     p = request.get_json(silent=True) or {}
     email = str(p.get("email") or "").strip()
@@ -666,10 +716,16 @@ def api_auth_login():
     if not email or not password:
         return jsonify({"ok": False, "error": "email and password are both required"}), 400
     try:
-        ses = sauth.sign_in(cfg, email, password)
+        with _auth_execution_cfg() as cfg:
+            if not cfg:
+                raise RuntimeError("protected auth configuration unavailable")
+            ses = sauth.sign_in(cfg, email, password)
+            ses = _adopt_profile(cfg, ses)
+    except RuntimeError:
+        return jsonify({"ok": False,
+                        "error": "Protected credential storage is unavailable"}), 503
     except sauth.AuthError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 401
-    ses = _adopt_profile(cfg, ses)
     _store_session(ses)
     _sync_profile_mistral_key()
     activity("signed in to", "the cloud", actor=ses["display_name"] or email)
@@ -679,8 +735,7 @@ def api_auth_login():
 
 @app.route("/api/auth/signup", methods=["POST"])
 def api_auth_signup():
-    cfg = _auth_cfg()
-    if not cfg:
+    if not _auth_cfg():
         return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Integrations)"}), 400
     p = request.get_json(silent=True) or {}
     email = str(p.get("email") or "").strip()
@@ -691,13 +746,20 @@ def api_auth_signup():
     if len(password) < 6:
         return jsonify({"ok": False, "error": "password must be at least 6 characters"}), 400
     try:
-        ses = sauth.sign_up(cfg, email, password, name,
-                            redirect_to=_email_confirm_redirect())
+        with _auth_execution_cfg() as cfg:
+            if not cfg:
+                raise RuntimeError("protected auth configuration unavailable")
+            ses = sauth.sign_up(cfg, email, password, name,
+                                redirect_to=_email_confirm_redirect())
+            if ses is not None:
+                ses = _adopt_profile(cfg, ses)
+    except RuntimeError:
+        return jsonify({"ok": False,
+                        "error": "Protected credential storage is unavailable"}), 503
     except sauth.AuthError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     if ses is None:     # project requires email confirmation (the default)
         return jsonify({"ok": True, "confirm": True})
-    ses = _adopt_profile(cfg, ses)
     _store_session(ses)
     _sync_profile_mistral_key()
     activity("signed in to", "the cloud", actor=ses["display_name"] or email)
@@ -707,14 +769,19 @@ def api_auth_signup():
 
 @app.route("/api/auth/logout", methods=["POST"])
 def api_auth_logout():
-    cfg = _auth_cfg()
+    configured = bool(_auth_cfg())
     with _auth_lock:
         doc = _auth_doc()
         ses = doc.pop("session", None)
         # push_cursor stays: signing back in resumes the mirror, no re-push
         lib.save_json(AUTH_SESSION_PATH, doc)
-    if cfg and ses and ses.get("access_token"):
-        sauth.sign_out(cfg, ses["access_token"])
+    if configured and ses and ses.get("access_token"):
+        try:
+            with _auth_execution_cfg() as cfg:
+                if cfg:
+                    sauth.sign_out(cfg, ses["access_token"])
+        except RuntimeError:
+            log.warning("remote sign-out skipped â€” protected auth key unavailable")
     return jsonify({"ok": True})
 
 
@@ -1285,9 +1352,8 @@ def api_collections_merge():
 # activity() and by sign-in, with a slow heartbeat for retries.
 
 def _push_events_once() -> None:
-    cfg = _auth_cfg()
-    ses = _auth_session() if cfg else None
-    if not cfg or not ses:
+    ses = _auth_session() if _auth_cfg() else None
+    if not ses:
         return
     with _auth_lock:
         cursor = int(_auth_doc().get("push_cursor") or 0)
@@ -1322,8 +1388,11 @@ def _push_events_once() -> None:
         batch.append(ev)
     if batch:
         try:
-            sauth.rest(cfg, ses["access_token"], "POST", "events", batch,
-                       prefer="return=minimal")
+            with _auth_execution_cfg() as cfg:
+                if not cfg:
+                    return
+                sauth.rest(cfg, ses["access_token"], "POST", "events", batch,
+                           prefer="return=minimal")
         except sauth.AuthError as exc:
             if exc.status == 400:
                 # the DATA was rejected (e.g. a hand-mangled timestamp);
@@ -1359,9 +1428,8 @@ _cloud_feed_cache: dict = {"at": 0.0, "rows": [], "fail_at": 0.0}
 
 def _cloud_events(limit: int) -> list[dict] | None:
     """The shared feed, or None when signed out / offline (caller falls back)."""
-    cfg = _auth_cfg()
-    ses = _auth_session() if cfg else None
-    if not cfg or not ses:
+    ses = _auth_session() if _auth_cfg() else None
+    if not ses:
         return None
     now = time.time()
     if now - _cloud_feed_cache["at"] < 15:
@@ -1369,10 +1437,14 @@ def _cloud_events(limit: int) -> list[dict] | None:
     if now - _cloud_feed_cache["fail_at"] < 30:
         return None
     try:
-        rows = sauth.rest(cfg, ses["access_token"], "GET",
-                          "events?select=at,actor,verb,subject,n,detail"
-                          f"&order=at.desc&limit={int(limit)}", timeout=8.0) or []
-    except sauth.AuthError as exc:
+        with _auth_execution_cfg() as cfg:
+            if not cfg:
+                return None
+            rows = sauth.rest(
+                cfg, ses["access_token"], "GET",
+                "events?select=at,actor,verb,subject,n,detail"
+                f"&order=at.desc&limit={int(limit)}", timeout=8.0) or []
+    except (RuntimeError, sauth.AuthError) as exc:
         log.warning("cloud feed unavailable: %s", exc)
         _cloud_feed_cache["fail_at"] = now
         return None
@@ -1392,9 +1464,8 @@ _profile_cache: dict = {}   # display_name -> {"at": float, "data": dict | None}
 
 
 def _cloud_profile(name: str) -> dict | None:
-    cfg = _auth_cfg()
-    ses = _auth_session() if cfg else None
-    if not cfg or not ses:
+    ses = _auth_session() if _auth_cfg() else None
+    if not ses:
         return None
     now = time.time()
     hit = _profile_cache.get(name)
@@ -1407,23 +1478,25 @@ def _cloud_profile(name: str) -> dict | None:
     data = {"display_name": name, "found": False,
             "member_since": None, "last_active": None}
     try:
-        # display_name is not unique; the earliest-created row is the canonical
-        # account (a later namesake can't backdate someone's "member since").
-        prof = sauth.rest(cfg, tok, "GET",
-                          f"profiles?display_name=eq.{q}"
-                          "&select=display_name,created_at"
-                          "&order=created_at.asc&limit=1", timeout=8.0) or []
-        if prof:
-            data["found"] = True
-            data["member_since"] = prof[0].get("created_at")
-        # last activity is one indexed row (no full scan, no count). first-seen
-        # is deliberately not fetched: cloud events only exist for a signed-in
-        # account, which always has a profiles row, so member_since covers it.
-        last = sauth.rest(cfg, tok, "GET",
-            f"events?actor=eq.{q}&select=at&order=at.desc&limit=1", timeout=8.0) or []
-        if last:
-            data["last_active"] = last[0].get("at")
-    except sauth.AuthError as exc:
+        with _auth_execution_cfg() as cfg:
+            if not cfg:
+                return None
+            # display_name is not unique; the earliest-created row is the
+            # canonical account (a namesake cannot backdate membership).
+            prof = sauth.rest(
+                cfg, tok, "GET", f"profiles?display_name=eq.{q}"
+                "&select=display_name,created_at"
+                "&order=created_at.asc&limit=1", timeout=8.0) or []
+            if prof:
+                data["found"] = True
+                data["member_since"] = prof[0].get("created_at")
+            last = sauth.rest(
+                cfg, tok, "GET",
+                f"events?actor=eq.{q}&select=at&order=at.desc&limit=1",
+                timeout=8.0) or []
+            if last:
+                data["last_active"] = last[0].get("at")
+    except (RuntimeError, sauth.AuthError) as exc:
         log.warning("profile lookup unavailable: %s", exc)
         _profile_cache[name] = {"at": now, "data": None}   # back off on failure
         return None
@@ -3028,14 +3101,13 @@ def api_pdf():
 def api_ai_summarize():
     """Proxy a summarization request to an OpenAI-compatible chat API.
     The browser cannot call those APIs directly (no CORS), so the client
-    sends its configured endpoint/model/key here."""
+    sends its configured endpoint/model here. The key is leased server-side."""
     p = request.get_json(silent=True) or {}
     base = (p.get("base_url") or "https://api.openai.com/v1").rstrip("/")
-    key = (p.get("api_key") or "").strip()
     model = (p.get("model") or "").strip()
     instructions = (p.get("instructions") or "").strip()
     text = (p.get("text") or "").strip()
-    if not key or not model:
+    if not _secret_is_configured("aiKey") or not model:
         return jsonify({"ok": False,
                         "error": "AI model not configured (Settings > AI); API key (Settings > Credentials)"})
     if not text:
@@ -3051,24 +3123,20 @@ def api_ai_summarize():
                                         + text[:60000]},
         ],
     }).encode("utf-8")
-    req = urllib.request.Request(
-        base + "/chat/completions", data=body, method="POST",
-        headers={"Content-Type": "application/json",
-                 "Authorization": "Bearer " + key})
     try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        with _lease_secret("aiKey") as key:
+            req = urllib.request.Request(
+                base + "/chat/completions", data=body, method="POST",
+                headers={"Content-Type": "application/json",
+                         "Authorization": "Bearer " + key})
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
         summary = data["choices"][0]["message"]["content"]
         return jsonify({"ok": True, "summary": summary})
     except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            detail = exc.read().decode("utf-8", "replace")[:300]
-        except Exception:
-            pass
-        return jsonify({"ok": False, "error": f"HTTP {exc.code}: {detail}"})
-    except Exception as exc:
-        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        return jsonify({"ok": False, "error": f"provider returned HTTP {exc.code}"})
+    except Exception:
+        return jsonify({"ok": False, "error": "AI provider unavailable"})
 
 
 # --- entry folders: one directory per pending entry -------------------------------
@@ -5092,6 +5160,7 @@ def _engine_host_bindings() -> FilesystemHostBindings:
         jobs=JobHistoryBindings(
             id_factory=lambda existing: lib.gen_id(existing),
         ),
+        secrets=_secret_store_bindings(),
     )
 
 
@@ -5134,6 +5203,11 @@ def _ensure_engine_session() -> FilesystemEngineSession:
     with _library_engine_guard:
         session = _engine_session
         if session is None or session.closed:
+            # Credentials are cut over before the engine graph is composed or
+            # any process-lifetime alias can become visible.  A failed legacy
+            # migration therefore cannot leave request handlers or workers
+            # running against plaintext fallback state.
+            _prepare_protected_secret_store()
             opened = _open_engine_session()
             # Resolve every property before publishing the session. If an
             # opener ever returns an invalid/closed object, no partial set of
@@ -7139,12 +7213,11 @@ def _img_gen_cfg() -> dict:
         provider = "openai"
     model = str(s.get("imgGenModel") or "").strip() or (
         "gpt-image-1" if provider == "openai" else "gemini-2.5-flash-image")
-    return {"provider": provider, "model": model,
-            "key": str(s.get("imgGenKey") or "").strip()}
+    return {"provider": provider, "model": model}
 
 
-def _img_gen(cfg: dict, image: bytes, mime: str, prompt: str,
-             timeout: float = 180.0) -> bytes:
+def _img_gen_with_key(cfg: dict, image: bytes, mime: str, prompt: str,
+                      timeout: float = 180.0) -> bytes:
     """One image in, one generated image out, or RuntimeError. NOTE: written
     to the providers' documented shapes but not yet exercised against live
     keys — same standing as the cloud OCR processor before its key existed."""
@@ -7194,6 +7267,17 @@ def _img_gen(cfg: dict, image: bytes, mime: str, prompt: str,
     raise RuntimeError("the model returned no image")
 
 
+def _img_gen(cfg: dict, image: bytes, mime: str, prompt: str,
+             timeout: float = 180.0) -> bytes:
+    with _lease_secret("imgGenKey") as key:
+        execution_cfg = {**cfg, "key": key}
+        try:
+            return _img_gen_with_key(
+                execution_cfg, image, mime, prompt, timeout=timeout)
+        finally:
+            execution_cfg.pop("key", None)
+
+
 @app.route("/api/builds/<build_id>/rework-figure", methods=["POST"])
 def api_build_rework_figure(build_id: str):
     """Rework one extracted figure through the configured image model:
@@ -7226,7 +7310,7 @@ def api_build_rework_figure(build_id: str):
     if not f.is_file():
         return jsonify({"ok": False, "error": "figure file missing"}), 400
     cfg = _img_gen_cfg()
-    if not cfg["key"]:
+    if not _secret_is_configured("imgGenKey"):
         return jsonify({"ok": False, "error":
                         "no image-generation key configured "
                         "(image model key: Settings > Credentials)"}), 400
@@ -9243,7 +9327,11 @@ def _ocr_job_run(job_id: str) -> None:
             runner = _OCR_SERVICES.get(svc)
             if runner is None:
                 raise RuntimeError(f"unsupported service: {svc}")
-            result = runner(png, cfg)
+            # Long-lived job dictionaries contain only nonsecret provider
+            # settings. Lease exactly the credential(s) required by this one
+            # page invocation and drop the temporary config immediately.
+            with _ocr_execution_cfg(svc, cfg) as execution_cfg:
+                result = runner(png, execution_cfg)
             # a runner may return a dict instead of a string: {text, images}
             # (Mistral figures) and/or {text, words} (Tesseract/Textract boxes)
             src_key = job.get("src_key") or "primary"
@@ -9409,20 +9497,40 @@ def api_ocr_run():
 
 
 def _ocr_request_cfg(payload: dict) -> dict:
-    """Build an OCR worker config from the authoritative local secret store."""
-    local = _client_settings()
-    cfg = {k: payload.get(k) for k in (
-        "tesseract", "claude_key", "claude_model", "aws_key", "aws_secret",
-        "aws_region", "mistral_key",
-    )}
-    for request_key, setting_key in (
-        ("mistral_key", "mistralKey"),
-        ("claude_key", "ocrClaudeKey"),
-        ("aws_key", "ocrAwsKey"),
-        ("aws_secret", "ocrAwsSecret"),
-    ):
-        cfg[request_key] = local.get(setting_key) or cfg.get(request_key)
-    return cfg
+    """Build a credential-free OCR job config.
+
+    Credential-shaped renderer fields are deliberately ignored; only the
+    protected provider lease can authorize execution.
+    """
+    settings = _client_settings()
+    return {
+        "tesseract": payload.get("tesseract") or settings.get("ocrTesseract"),
+        "claude_model": payload.get("claude_model")
+        or settings.get("ocrClaudeModel"),
+        "aws_region": payload.get("aws_region") or settings.get("ocrAwsRegion"),
+    }
+
+
+@contextlib.contextmanager
+def _ocr_execution_cfg(service: str, base_cfg: Mapping):
+    cfg = dict(base_cfg)
+    with contextlib.ExitStack() as stack:
+        if service == "mistral":
+            cfg["mistral_key"] = stack.enter_context(
+                _lease_secret("mistralKey"))
+        elif service == "claude":
+            cfg["claude_key"] = stack.enter_context(
+                _lease_secret("ocrClaudeKey"))
+        elif service == "textract":
+            cfg["aws_key"] = stack.enter_context(
+                _lease_secret("ocrAwsKey"))
+            cfg["aws_secret"] = stack.enter_context(
+                _lease_secret("ocrAwsSecret"))
+        try:
+            yield cfg
+        finally:
+            for key in ("mistral_key", "claude_key", "aws_key", "aws_secret"):
+                cfg.pop(key, None)
 
 
 def _replica_detection_pdf(build: dict, source_id: str) -> Path | None:
@@ -9518,7 +9626,7 @@ def api_v1_replica_region_detection_job(build_id: str):
             details={"item_id": build_id, "source_id": source_id or ""}))
 
     cfg = _ocr_request_cfg({})
-    if not str(cfg.get("mistral_key") or "").strip():
+    if not _secret_is_configured("mistralKey"):
         return _engine_error_response(EngineValidationError(
             "Mistral OCR is not configured",
             code="region_detection_provider_not_configured",
@@ -11342,21 +11450,16 @@ def first_content_page(pdf: Path, ink_threshold: float = 0.003,
 @app.route("/api/master/sync", methods=["POST"])
 def api_master_sync():
     """Publish the master list (plus manual entries) to a Google Sheet.
-    Body: {spreadsheet_id, service_account_file, sheet_name?}. Requires a
+    Body: {spreadsheet_id, sheet_name?}. Requires a
     Google service-account JSON key — TODO: verify once the user has one."""
     p = request.get_json(silent=True) or {}
     sheet_id = str(p.get("spreadsheet_id") or "").strip()
-    keyfile = (str(p.get("service_account_file") or "").strip()
-               or str(_client_settings().get("gsKeyFile") or "").strip())
     sheet_name = str(p.get("sheet_name") or "Master list").strip()
-    if not sheet_id or not keyfile:
+    if not sheet_id or not _secret_is_configured("gsKeyFile"):
         return jsonify({"ok": False,
                         "error": "Spreadsheet ID and service-account key file "
                                  "are required (Settings > Integrations; key "
                                  "file under Credentials)"})
-    kf = _resolve_local(keyfile)
-    if kf is None or not kf.is_file():
-        return jsonify({"ok": False, "error": f"key file not found: {keyfile}"})
     try:
         from google.oauth2 import service_account
         from googleapiclient.discovery import build as gbuild
@@ -11383,15 +11486,20 @@ def api_master_sync():
                      e.get("publisher", ""), e.get("city", ""),
                      cats, e.get("notes", ""), "manual"])
     try:
-        creds = service_account.Credentials.from_service_account_file(
-            str(kf), scopes=["https://www.googleapis.com/auth/spreadsheets"])
-        svc = gbuild("sheets", "v4", credentials=creds)
-        svc.spreadsheets().values().update(
-            spreadsheetId=sheet_id, range=f"{sheet_name}!A1",
-            valueInputOption="RAW", body={"values": rows}).execute()
+        with _lease_secret("gsKeyFile") as keyfile:
+            kf = _resolve_local(keyfile)
+            if kf is None or not kf.is_file():
+                return jsonify({"ok": False,
+                                "error": "service-account key file not found"})
+            creds = service_account.Credentials.from_service_account_file(
+                str(kf), scopes=["https://www.googleapis.com/auth/spreadsheets"])
+            svc = gbuild("sheets", "v4", credentials=creds)
+            svc.spreadsheets().values().update(
+                spreadsheetId=sheet_id, range=f"{sheet_name}!A1",
+                valueInputOption="RAW", body={"values": rows}).execute()
         return jsonify({"ok": True, "rows": len(rows) - 1})
-    except Exception as exc:
-        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+    except Exception:
+        return jsonify({"ok": False, "error": "Google Sheets sync failed"})
 
 
 _PDF_TEXT_CACHE: dict = {}
@@ -12105,100 +12213,473 @@ def api_ia_downloads():
 
 # --- Open Library indexes (constrained search + realtime + autocomplete) --------
 
-# Cloud config lives in the client settings blob (synced via /api/client_state),
-# so a per-user remote URL and DB source URLs need no separate config file.
-# --- credentials: a LOCAL-ONLY secrets store, kept out of the synced (and
-# rebinding-reachable) client_state. The dialog reads/writes it through
-# /api/secrets (Host-guarded); every server-side credential read goes through
-# _client_settings, which overlays these on top of the synced preferences. ------
-_SECRET_KEYS = frozenset({
-    "aiKey", "embedKey", "imgGenKey", "mistralKey", "ocrClaudeKey",
-    # Azure OCR is retired, but an older client may still have its key in the
-    # synced settings blob. Keep classifying it as sensitive so GET/PUT and the
-    # startup migration cannot expose it merely because its UI was removed.
-    "ocrAzureKey", "ocrAwsKey", "ocrAwsSecret", "supabaseKey",
-    "supabaseAnonKey", "r2KeyId", "r2Secret", "gsKeyFile",
-})
-_SECRETS_PATH = lib.DATA_ROOT / "output" / "secrets.json"
+# Cloud config lives in client_state, but credential material does not.  The
+# public engine service below exposes only fixed-length masked status and
+# conditional mutation receipts.  Plaintext access is a separate, sidecar-
+# private lease held only around a provider invocation.
+_SECRET_IDS = {
+    "aiKey": "provider:ai:api-key",
+    "embedKey": "provider:embedding:api-key",
+    "imgGenKey": "provider:image-generation:api-key",
+    "mistralKey": "provider:mistral:api-key",
+    "ocrClaudeKey": "provider:anthropic:api-key",
+    "ocrAzureKey": "provider:azure-ocr:api-key",
+    "ocrAwsKey": "provider:aws-ocr:access-key-id",
+    "ocrAwsSecret": "provider:aws-ocr:secret-access-key",
+    "supabaseKey": "cloud:supabase:service-role-key",
+    "supabaseAnonKey": "cloud:supabase:anon-key",
+    "r2KeyId": "storage:r2:access-key-id",
+    "r2Secret": "storage:r2:secret-access-key",
+    "gsKeyFile": "provider:google-sheets:service-account-file",
+}
+_SECRET_KEYS = frozenset(_SECRET_IDS)
+_SECRET_INITIAL_REVISIONS = {
+    secret_id: f"absent-v1-{legacy_key.lower()}"
+    for legacy_key, secret_id in _SECRET_IDS.items()
+}
+_SECRET_REGISTRY = SecretIdRegistry(_SECRET_INITIAL_REVISIONS)
+_SECRET_STORE_ID = "librarytool.desktop.current-user.v1"
+_PROTECTED_SECRETS_PATH = lib.OUTPUT_DIR / "secrets.dpapi"
+
+# Read-only legacy inputs.  This file is never written again.
+_SECRETS_PATH = lib.OUTPUT_DIR / "secrets.json"
 _MISTRAL_PENDING = "_mistralCloudPending"
-# The one lock for every secrets.json read-modify-write (settings dialog,
-# profile reconciliation, the client_state migration). Single process.
-_secrets_lock = threading.Lock()
+_SECRET_SYNC_STATE_PATH = lib.OUTPUT_DIR / "secret_sync_state.json"
+_secrets_lock = threading.RLock()
+_secret_cutover_lock = threading.RLock()
+_secret_repository: WindowsDpapiSecretStoreRepository | None = None
+_secret_cutover_complete = False
 
 
-def _load_secrets() -> dict:
-    d = lib.load_json(_SECRETS_PATH, {})
-    return d if isinstance(d, dict) else {}
+class ProtectedSecretCutoverError(RuntimeError):
+    """Sanitized startup failure; never includes a path or credential."""
 
 
-def _save_secrets(d: dict) -> None:
-    lib.save_json(_SECRETS_PATH, d)
+def _new_secret_repository() -> WindowsDpapiSecretStoreRepository:
+    return WindowsDpapiSecretStoreRepository(
+        _PROTECTED_SECRETS_PATH,
+        registry=_SECRET_REGISTRY,
+        store_id=_SECRET_STORE_ID,
+    )
+
+
+def _secret_store_bindings() -> SecretStoreBindings:
+    global _secret_repository
+    if _secret_repository is None:
+        _secret_repository = _new_secret_repository()
+    return SecretStoreBindings(_secret_repository)
+
+
+def _legacy_secret_document() -> dict:
+    value = lib.load_json(_SECRETS_PATH, {})
+    return value if isinstance(value, dict) else {}
+
+
+def _secret_sync_state() -> dict:
+    value = lib.load_json(_SECRET_SYNC_STATE_PATH, {})
+    return value if isinstance(value, dict) else {}
+
+
+def _set_mistral_pending(pending: bool) -> None:
+    with _secrets_lock:
+        state = _secret_sync_state()
+        if pending:
+            state["mistral_pending"] = True
+        else:
+            state.pop("mistral_pending", None)
+        if state:
+            lib.save_json(_SECRET_SYNC_STATE_PATH, state)
+        else:
+            _SECRET_SYNC_STATE_PATH.unlink(missing_ok=True)
 
 
 def _client_settings():
-    s = dict((lib.load_json(lib.CLIENT_STATE_PATH, {}) or {}).get("settings") or {})
-    for k, v in _load_secrets().items():
-        if v:
-            s[k] = v                     # secrets override; they never persist here
-    return s
+    """Return nonsecret preferences only.
 
-
-def _local_only() -> bool:
-    """Block DNS-rebinding: only requests whose Host is the loopback origin the
-    app itself is served from may touch the secrets store."""
-    host = (request.host or "").split(":")[0].lower()
-    return host in ("127.0.0.1", "localhost")
-
-
-@app.route("/api/secrets", methods=["GET"])
-def api_secrets_get():
-    if not _local_only():
-        return jsonify({"error": "forbidden"}), 403
-    # Mistral belongs to the signed-in user's private cloud data. Refresh its
-    # local cache when the settings dialog opens; offline falls back cleanly.
-    _sync_profile_mistral_key()
-    secrets = _load_secrets()
-    return jsonify({k: secrets.get(k, "") for k in _SECRET_KEYS})
-
-
-@app.route("/api/secrets", methods=["PUT"])
-def api_secrets_put():
-    if not _local_only():
-        return jsonify({"error": "forbidden"}), 403
-    updates = (request.get_json(silent=True) or {}).get("updates") or {}
-    with _secrets_lock:
-        secrets = _load_secrets()
-        for k, v in updates.items():
-            if k not in _SECRET_KEYS:
-                continue
-            v = str(v or "").strip()
-            if v:
-                secrets[k] = v
-            else:
-                secrets.pop(k, None)
-            if k == "mistralKey":
-                secrets[_MISTRAL_PENDING] = True
-        _save_secrets(secrets)
-    if "mistralKey" in updates:
-        _sync_profile_mistral_key()
-    return jsonify({"ok": True})
-
-
-def _sync_profile_mistral_key() -> str | None:
-    """Reconcile the local Mistral cache with this user's profile_secrets row.
-
-    A locally edited value is marked pending until its cloud upsert succeeds;
-    otherwise the cloud value wins so Android edits reach the desktop. Returns
-    the reconciled key, or None when signed out/offline.
+    The filter is defense in depth for an old or malicious renderer.  Normal
+    client-state PUT already strips these fields before publication.
     """
-    cfg = _auth_cfg()
-    ses = _auth_session() if cfg else None
-    if not cfg or not ses:
-        return None
-    secrets = _load_secrets()
-    local = str(secrets.get("mistralKey") or "").strip()
-    pending = bool(secrets.get(_MISTRAL_PENDING))
+    raw = (lib.load_json(lib.CLIENT_STATE_PATH, {}) or {}).get("settings") or {}
+    if not isinstance(raw, Mapping):
+        return {}
+    return {key: value for key, value in raw.items() if key not in _SECRET_KEYS}
+
+
+def _legacy_secret_snapshot() -> tuple[dict[str, str], bool, dict, dict]:
+    """Collect legacy values under both source locks with old precedence."""
+
+    with _client_state_lock:
+        with _secrets_lock:
+            state = lib.load_json(lib.CLIENT_STATE_PATH, {})
+            if not isinstance(state, dict):
+                state = {}
+            settings = state.get("settings")
+            settings = settings if isinstance(settings, dict) else {}
+            legacy = _legacy_secret_document()
+            values: dict[str, str] = {}
+            for key in _SECRET_KEYS:
+                raw = legacy.get(key, settings.get(key, ""))
+                value = str(raw or "").strip()
+                if value:
+                    values[key] = value
+            return values, bool(legacy.get(_MISTRAL_PENDING)), state, legacy
+
+
+def _verify_migrated_secret(
+        repository: WindowsDpapiSecretStoreRepository,
+        legacy_key: str, expected: str) -> None:
+    secret_id = _SECRET_IDS[legacy_key]
     try:
+        with repository.credential_leases.lease(secret_id) as leased:
+            if leased.reveal() != expected:
+                raise ProtectedSecretCutoverError(
+                    "protected secret verification did not match legacy state")
+    except ProtectedSecretCutoverError:
+        raise
+    except Exception:
+        raise ProtectedSecretCutoverError(
+            "protected secret verification failed") from None
+
+
+def _sanitize_legacy_secret_sources(
+        state: dict, *, mistral_pending: bool) -> None:
+    """Remove plaintext only after every protected value was reopened."""
+
+    # Persist nonsecret sync intent before removing its old marker.  Repeating
+    # this after a crash is harmless.
+    _set_mistral_pending(mistral_pending)
+    with _client_state_lock:
+        fresh = lib.load_json(lib.CLIENT_STATE_PATH, {})
+        if not isinstance(fresh, dict):
+            fresh = state
+        settings = fresh.get("settings")
+        removed = False
+        if isinstance(settings, dict):
+            for key in _SECRET_KEYS:
+                removed = settings.pop(key, None) is not None or removed
+        if removed:
+            lib.save_json(lib.CLIENT_STATE_PATH, fresh)
+    with _secrets_lock:
+        fresh_legacy = _legacy_secret_document()
+        for key in (*_SECRET_KEYS, _MISTRAL_PENDING):
+            fresh_legacy.pop(key, None)
+        if fresh_legacy:
+            # Preserve unknown nonsecret compatibility metadata, but never a
+            # registered credential.  Normal installations remove the file.
+            lib.save_json(_SECRETS_PATH, fresh_legacy)
+        else:
+            _SECRETS_PATH.unlink(missing_ok=True)
+
+
+def _migrate_legacy_plaintext_secrets(
+        repository: WindowsDpapiSecretStoreRepository,
+        *, reopen_repository=None,
+) -> WindowsDpapiSecretStoreRepository:
+    values, pending, state, legacy = _legacy_secret_snapshot()
+    settings = state.get("settings")
+    settings = settings if isinstance(settings, Mapping) else {}
+    has_legacy_fields = any(
+        key in legacy or key in settings
+        for key in _SECRET_KEYS
+    ) or _MISTRAL_PENDING in legacy
+    if not has_legacy_fields:
+        return repository
+    if values:
+        health = repository.health.get_health()
+        if health.state != "ready" or not health.writable:
+            raise ProtectedSecretCutoverError(
+                "protected secret storage is unavailable for legacy migration")
+        service = SecretStoreService(repository)
+        for legacy_key, credential in sorted(values.items()):
+            secret_id = _SECRET_IDS[legacy_key]
+            status = service.get_status(secret_id)
+            if status.configured:
+                # This is either a restart after a committed migration or an
+                # independently newer protected value.  Never overwrite it.
+                _verify_migrated_secret(repository, legacy_key, credential)
+                continue
+            service.replace(ReplaceSecretCommand(
+                secret_id=secret_id,
+                expected_revision=status.revision,
+                credential=credential,
+                operation_id=f"legacy-cutover-v1-{legacy_key.lower()}",
+            ))
+
+        # Reconstruct the complete adapter and decrypt each migrated value.
+        # Adapter commit verification covers bytes; this covers reopen/user
+        # scope and exact credential semantics before plaintext is sanitized.
+        try:
+            reopened = (reopen_repository or _new_secret_repository)()
+            reopened_health = reopened.health.get_health()
+        except Exception:
+            raise ProtectedSecretCutoverError(
+                "protected secret storage could not be reopened") from None
+        if reopened_health.state != "ready":
+            raise ProtectedSecretCutoverError(
+                "protected secret storage could not be reopened")
+        for legacy_key, credential in sorted(values.items()):
+            _verify_migrated_secret(reopened, legacy_key, credential)
+        repository = reopened
+
+    _sanitize_legacy_secret_sources(state, mistral_pending=pending)
+    return repository
+
+
+def _prepare_protected_secret_store() -> None:
+    """Complete the one-time cutover before engine/session publication."""
+
+    global _secret_repository
+    global _secret_cutover_complete
+    if _secret_cutover_complete:
+        return
+    with _secret_cutover_lock:
+        if _secret_cutover_complete:
+            return
+        repository = _secret_repository or _new_secret_repository()
+        repository = _migrate_legacy_plaintext_secrets(repository)
+        _secret_repository = repository
+        _secret_cutover_complete = True
+
+
+def _secret_service() -> SecretStoreService:
+    service = _library_engine().get_service(SECRET_STORE_SERVICE)
+    if not isinstance(service, SecretStoreService):
+        raise EngineRepositoryError(
+            "protected secret storage is unavailable",
+            code="secret_repository_unavailable", retryable=True)
+    return service
+
+
+def _secret_health() -> SecretStoreHealth:
+    repository = _secret_repository
+    if repository is None:
+        return SecretStoreHealth("unavailable", has_vault=None, writable=False)
+    return repository.health.get_health()
+
+
+@contextlib.contextmanager
+def _lease_secret(legacy_key: str):
+    """Lease one registered credential for the duration of provider work."""
+
+    secret_id = _SECRET_IDS[legacy_key]
+    repository = _secret_repository
+    if repository is None:
+        raise RuntimeError("protected credential storage is unavailable")
+    try:
+        with repository.credential_leases.lease(secret_id) as leased:
+            yield leased.reveal()
+    except SecretCredentialNotConfiguredError:
+        raise RuntimeError("the required provider credential is not configured") from None
+    except RuntimeError:
+        raise
+    except Exception:
+        raise RuntimeError("protected credential storage is unavailable") from None
+
+
+def _secret_is_configured(legacy_key: str) -> bool:
+    try:
+        return _secret_service().get_status(_SECRET_IDS[legacy_key]).configured
+    except EngineError:
+        return False
+
+
+def _secret_health_document() -> dict:
+    health = _secret_health()
+    return {
+        "available": health.state == "ready",
+        "state": health.state,
+        "writable": health.writable,
+    }
+
+
+def _secret_match(secret_id: str) -> str:
+    raw = request.headers.get("If-Match")
+    if raw is None or raw == "":
+        raise EnginePreconditionRequiredError(
+            "a secret status revision is required",
+            code="secret_revision_required",
+            details={"header": "If-Match", "secret_id": secret_id})
+    value = raw.strip()
+    if (raw != value or value.startswith("W/") or len(value) < 3
+            or value[0] != '"' or value[-1] != '"' or "," in value):
+        raise EngineValidationError(
+            "If-Match must contain one strong quoted secret revision",
+            code="invalid_secret_revision",
+            details={"header": "If-Match", "secret_id": secret_id})
+    return value[1:-1]
+
+
+def _secret_operation_id() -> str:
+    operation_id = request.headers.get("Idempotency-Key")
+    if operation_id is None or operation_id == "":
+        raise EnginePreconditionRequiredError(
+            "an idempotency key is required",
+            code="operation_id_required",
+            details={"header": "Idempotency-Key"})
+    return operation_id
+
+
+_SECRET_MUTATION_MAX_BYTES = 512 * 1024
+
+
+def _secret_replacement_credential() -> str:
+    """Read one bounded, duplicate-free credential replacement document."""
+
+    length = request.content_length
+    if length is not None and length > _SECRET_MUTATION_MAX_BYTES:
+        raise EngineValidationError(
+            "the secret replacement document is too large",
+            code="secret_mutation_too_large",
+            details={"maximum_bytes": _SECRET_MUTATION_MAX_BYTES},
+        )
+    if request.mimetype != "application/json":
+        raise EngineValidationError(
+            "the secret replacement must use application/json",
+            code="invalid_secret_mutation_document",
+        )
+    encoded = request.stream.read(_SECRET_MUTATION_MAX_BYTES + 1)
+    if len(encoded) > _SECRET_MUTATION_MAX_BYTES:
+        raise EngineValidationError(
+            "the secret replacement document is too large",
+            code="secret_mutation_too_large",
+            details={"maximum_bytes": _SECRET_MUTATION_MAX_BYTES},
+        )
+
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON object key")
+            value[key] = item
+        return value
+
+    try:
+        payload = json.loads(
+            encoded.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                ValueError("non-finite JSON number")),
+        )
+    except (RecursionError, UnicodeError, TypeError, ValueError) as exc:
+        raise EngineValidationError(
+            "the secret replacement document is invalid",
+            code="invalid_secret_mutation_document",
+            details={"cause_type": type(exc).__name__},
+        ) from exc
+    if not isinstance(payload, Mapping) or set(payload) != {"credential"}:
+        raise EngineValidationError(
+            "the secret replacement document is invalid",
+            code="invalid_secret_mutation_document",
+        )
+    return payload["credential"]
+
+
+@app.route("/api/secrets", methods=["GET", "PUT", "POST", "PATCH", "DELETE"])
+def api_secrets_retired():
+    return jsonify({
+        "ok": False,
+        "code": "plaintext_secret_api_retired",
+        "replacement": "/api/v1/secrets",
+    }), 410
+
+
+@app.get("/api/v1/secrets")
+def api_v1_secret_statuses():
+    health = _secret_health_document()
+    statuses = []
+    if health["available"]:
+        try:
+            statuses = [
+                _secret_service().get_status(secret_id).as_dict()
+                for secret_id in sorted(_SECRET_REGISTRY.ids)
+            ]
+        except EngineError as exc:
+            return _engine_error_response(exc)
+    return jsonify({
+        "ok": True,
+        "schema": "librarytool.secret-status-list/1",
+        "health": health,
+        "secrets": statuses,
+    })
+
+
+@app.get("/api/v1/secrets/<path:secret_id>")
+def api_v1_secret_status(secret_id: str):
+    if not _secret_health_document()["available"]:
+        return _engine_error_response(EngineRepositoryError(
+            "protected secret storage is unavailable",
+            code="secret_repository_unavailable", retryable=True))
+    try:
+        status = _secret_service().get_status(secret_id)
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    response = jsonify({
+        "ok": True,
+        "schema": "librarytool.secret-status/1",
+        "status": status.as_dict(),
+    })
+    response.set_etag(status.revision)
+    return response
+
+
+@app.put("/api/v1/secrets/<path:secret_id>")
+def api_v1_secret_replace(secret_id: str):
+    try:
+        expected = _secret_match(secret_id)
+        operation_id = _secret_operation_id()
+        credential = _secret_replacement_credential()
+        result = _secret_service().replace(ReplaceSecretCommand(
+            secret_id=secret_id,
+            expected_revision=expected,
+            credential=credential,
+            operation_id=operation_id,
+        ))
+    except (TypeError, ValueError) as exc:
+        return _engine_error_response(EngineValidationError(
+            "the secret replacement document is invalid",
+            code="invalid_secret_mutation_document",
+            details={"cause_type": type(exc).__name__}))
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    if secret_id == _SECRET_IDS["mistralKey"]:
+        _set_mistral_pending(True)
+    return jsonify({
+        "ok": True,
+        "schema": "librarytool.secret-mutation-receipt/1",
+        **result.as_dict(),
+    })
+
+
+@app.delete("/api/v1/secrets/<path:secret_id>")
+def api_v1_secret_clear(secret_id: str):
+    try:
+        result = _secret_service().clear(ClearSecretCommand(
+            secret_id=secret_id,
+            expected_revision=_secret_match(secret_id),
+            operation_id=_secret_operation_id(),
+        ))
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    if secret_id == _SECRET_IDS["mistralKey"]:
+        _set_mistral_pending(True)
+    return jsonify({
+        "ok": True,
+        "schema": "librarytool.secret-mutation-receipt/1",
+        **result.as_dict(),
+    })
+
+
+def _sync_profile_mistral_key_with_cfg(cfg: dict, ses: dict) -> str | None:
+    """Reconcile Mistral inside an active auth execution-config lease."""
+    secret_id = _SECRET_IDS["mistralKey"]
+    try:
+        before = _secret_service().get_status(secret_id)
+        if before.configured:
+            with _lease_secret("mistralKey") as credential:
+                local = credential
+        else:
+            local = ""
+        pending = bool(_secret_sync_state().get("mistral_pending"))
         adopt = None
         for _attempt in range(4):
             rows = sauth.rest(
@@ -12238,54 +12719,57 @@ def _sync_profile_mistral_key() -> str | None:
                 break
         else:
             raise sauth.AuthError("profile changed on another device; retrying")
-        # the REST round-trips above took time: apply the outcome to a fresh
-        # read under the lock, not to the pre-network snapshot
-        with _secrets_lock:
-            secrets = _load_secrets()
-            fresh_local = str(secrets.get("mistralKey") or "").strip()
-            fresh_pending = bool(secrets.get(_MISTRAL_PENDING))
-            if adopt is None:
-                # Clear only the edit that was actually written. A Settings
-                # save may have produced a newer pending value while the REST
-                # request was in flight.
-                if not fresh_pending or fresh_local == local:
-                    secrets.pop(_MISTRAL_PENDING, None)
-            elif not fresh_pending:
+        # Apply an outcome only while the local CAS token still matches the
+        # value observed before the network round trip. A newer Settings edit
+        # remains pending and wins on the next pass.
+        fresh = _secret_service().get_status(secret_id)
+        fresh_pending = bool(_secret_sync_state().get("mistral_pending"))
+        if fresh.revision == before.revision:
+            if adopt is not None and not fresh_pending:
+                operation_id = "mistral-profile-adopt-" + uuid.uuid4().hex
                 if adopt:
-                    secrets["mistralKey"] = adopt
-                else:
-                    secrets.pop("mistralKey", None)
-            _save_secrets(secrets)
+                    _secret_service().replace(ReplaceSecretCommand(
+                        secret_id=secret_id,
+                        expected_revision=fresh.revision,
+                        credential=adopt,
+                        operation_id=operation_id,
+                    ))
+                elif fresh.configured:
+                    _secret_service().clear(ClearSecretCommand(
+                        secret_id=secret_id,
+                        expected_revision=fresh.revision,
+                        operation_id=operation_id,
+                    ))
+            elif adopt is None and fresh_pending:
+                _set_mistral_pending(False)
         return local
-    except sauth.AuthError as exc:
+    except (EngineError, RuntimeError, sauth.AuthError) as exc:
         log.warning("Mistral profile sync deferred: %s", exc)
         return None
 
 
+def _sync_profile_mistral_key() -> str | None:
+    """Reconcile Mistral without retaining either protected provider key."""
+
+    ses = _auth_session() if _auth_cfg() else None
+    if not ses:
+        return None
+    try:
+        with _auth_execution_cfg() as cfg:
+            if not cfg:
+                return None
+            return _sync_profile_mistral_key_with_cfg(cfg, ses)
+    except RuntimeError:
+        log.warning("Mistral profile sync deferred: protected auth unavailable")
+        return None
+
+
 def _migrate_secrets_from_client_state() -> None:
-    """One-time lift of secret keys out of the synced client_state settings into
-    the local-only secrets store, so they stop riding in a rebinding-reachable,
-    cloud-synced blob. Idempotent."""
-    with _client_state_lock:
-        state = lib.load_json(lib.CLIENT_STATE_PATH, {})
-        s = state.get("settings")
-        if not isinstance(s, dict):
-            return
-        moved, removed = {}, False
-        for k in list(s):
-            if k in _SECRET_KEYS:
-                v = s.pop(k)
-                removed = True
-                if v:
-                    moved[k] = v
-        if moved:
-            with _secrets_lock:
-                secrets = _load_secrets()
-                for k, v in moved.items():
-                    secrets.setdefault(k, v)   # never clobber a secrets.json value
-                _save_secrets(secrets)
-        if removed:
-            lib.save_json(lib.CLIENT_STATE_PATH, state)
+    """Compatibility entry point for explicit migration tests/embedders."""
+    global _secret_repository
+    with _secret_cutover_lock:
+        repository = _secret_repository or _new_secret_repository()
+        _secret_repository = _migrate_legacy_plaintext_secrets(repository)
 
 
 def _cloud_base():
@@ -13109,32 +13593,75 @@ _cloudsync = {"running": False, "last_run": "", "last_error": "", "last_result":
 _autosync_last = 0.0
 
 
-def _cloud_cfg() -> dict | None:
-    """Service-role config for privileged owner publishing and maintenance.
-
-    Phone capture intentionally does not use this path; see ``_capture_cfg``.
-    The URL defaults to the shipped project, but this secret never does.
-    """
+def _cloud_public_cfg() -> dict:
+    """Nonsecret owner-cloud settings; never includes the service role key."""
     s = _client_settings()
     url = str(s.get("supabaseUrl") or "").strip() or cloud_defaults.SUPABASE_URL
-    key = str(s.get("supabaseKey") or "").strip()
-    return {"url": url, "key": key} if url and key else None
+    return {"url": url}
 
 
-def _capture_cfg() -> dict | None:
-    """Public project identity plus the signed-in user's current JWT.
+def _cloud_cfg() -> dict | None:
+    """Status-only owner-cloud configuration and provider test seam.
 
-    This is the complete phone-sync credential. Supabase uses ``key`` only to
-    identify the public app component and ``access_token`` to enforce the
-    user's capture/storage RLS policies. A fresh install therefore needs a
-    login, never a pasted Supabase key.
+    Production values never contain ``key``.  Tests may inject a complete
+    short-lived provider config by replacing this function; the lease wrapper
+    still confines that copy to one execution.
     """
-    cfg = _auth_cfg()
-    ses = _auth_session() if cfg else None
+    cfg = _cloud_public_cfg()
+    return cfg if cfg["url"] and _secret_is_configured("supabaseKey") else None
+
+
+def _cloud_configured() -> bool:
+    return bool(_cloud_cfg())
+
+
+@contextlib.contextmanager
+def _lease_cloud_cfg():
+    public = _cloud_cfg()
+    if not public:
+        yield None
+        return
+    if "key" in public:  # explicitly injected complete provider config
+        cfg = dict(public)
+        try:
+            yield cfg
+        finally:
+            cfg.pop("key", None)
+        return
+    with _lease_secret("supabaseKey") as key:
+        cfg = {**public, "key": key}
+        try:
+            yield cfg
+        finally:
+            cfg.pop("key", None)
+
+
+def _capture_configured() -> bool:
+    """Whether phone sync has auth identity and a persisted user session."""
+
+    session = (_auth_doc().get("session") or {}) if _auth_cfg() else {}
+    return bool(session.get("refresh_token"))
+
+
+@contextlib.contextmanager
+def _lease_capture_cfg():
+    """Hold auth-key and user-token copies only for one capture sync run."""
+
+    ses = _auth_session() if _auth_cfg() else None
     token = str((ses or {}).get("access_token") or "").strip()
-    if not cfg or not token:
-        return None
-    return dict(cfg, access_token=token)
+    if not token:
+        yield None
+        return
+    with _auth_execution_cfg() as auth_cfg:
+        if not auth_cfg:
+            yield None
+            return
+        cfg = {**auth_cfg, "access_token": token}
+        try:
+            yield cfg
+        finally:
+            cfg.pop("key", None)
+            cfg.pop("access_token", None)
 
 
 
@@ -13159,7 +13686,6 @@ def _ai_cfg() -> dict:
     s = _client_settings()
     return {"base": str(s.get("aiBase") or "").strip() or _AI_DEFAULT_BASE,
             "model": str(s.get("aiModel") or "").strip() or _AI_DEFAULT_MODEL,
-            "key": str(s.get("aiKey") or "").strip(),
             "instructions": str(s.get("aiInstructions") or "").strip(),
             "smart_scan_instructions":
                 str(s.get("smartScanInstructions") or "").strip(),
@@ -13173,7 +13699,7 @@ def _ai_chat(cfg: dict, messages: list, json_mode: bool = False,
     """One chat-completions call; returns the assistant text. Raises
     RuntimeError with the HTTP body truncated to 300 chars, the same error
     convention every other integration here uses."""
-    if not cfg["key"]:
+    if not _secret_is_configured("aiKey"):
         raise RuntimeError("no AI key — set one in Settings > Credentials "
                            "(DeepSeek is the default provider)")
     # a set temperature/timeout in Settings > AI overrides the per-call defaults
@@ -13193,20 +13719,20 @@ def _ai_chat(cfg: dict, messages: list, json_mode: bool = False,
             "temperature": temperature}
     if json_mode:
         body["response_format"] = {"type": "json_object"}
-    req = urllib.request.Request(
-        cfg["base"].rstrip("/") + "/chat/completions",
-        data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {cfg['key']}"},
-        method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:300]
-        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
-    except OSError as exc:
-        raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
+    with _lease_secret("aiKey") as key:
+        req = urllib.request.Request(
+            cfg["base"].rstrip("/") + "/chat/completions",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {key}"},
+            method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"provider returned HTTP {exc.code}") from None
+        except OSError:
+            raise RuntimeError("the AI provider is unavailable") from None
     try:
         return data["choices"][0]["message"]["content"] or ""
     except (KeyError, IndexError) as exc:
@@ -13246,7 +13772,7 @@ def api_process_deepseek():
     if not isinstance(fields, dict):
         abort(400)
     cfg = _ai_cfg()
-    if not cfg["key"]:
+    if not _secret_is_configured("aiKey"):
         return jsonify({"ok": False, "error": "No AI key — set one in Settings > Credentials"}), 400
     cur = {k: str(v)[:600] for k, v in fields.items()
            if isinstance(k, str) and k in _PROC_FIELD_KEYS
@@ -13557,8 +14083,7 @@ def _ss_run(job: dict, spec: dict) -> None:
     pdf = None
     owned_pdf = False
     try:
-        mkey = str(_client_settings().get("mistralKey") or "").strip()
-        if not mkey:
+        if not _secret_is_configured("mistralKey"):
             raise RuntimeError("Mistral API key not configured (Settings > Credentials)")
         pdf = spec.get("pdf_path")
         if pdf is None:
@@ -13586,7 +14111,8 @@ def _ss_run(job: dict, spec: dict) -> None:
             if _an_cancel_check(job, "cancelled — nothing was written"):
                 return
             try:
-                text = _sc_ocr_page(pdf, n, mkey)
+                with _lease_secret("mistralKey") as mkey:
+                    text = _sc_ocr_page(pdf, n, mkey)
             except Exception as exc:
                 text = ""
                 with _ss_jobs_lock:
@@ -14881,7 +15407,7 @@ def _sc_extract(ocr_text: str, instructions: str | None = None) -> tuple[dict, s
     DeepSeek (Settings > AI) when a key is set — mirroring the phone app's
     'DeepSeek by default' — else Mistral's own extraction."""
     cfg = _ai_cfg()
-    if cfg["key"]:
+    if _secret_is_configured("aiKey"):
         prompt = _SC_PROMPT
         custom = str(instructions if instructions is not None else
                      cfg.get("smart_scan_instructions") or "").strip()
@@ -14892,11 +15418,12 @@ def _sc_extract(ocr_text: str, instructions: str | None = None) -> tuple[dict, s
                               "content": prompt + "\n\n" + ocr_text[:12000]}],
                        temperature=0.0)
         return capture.normalize_bibliography(obj), cfg["model"]
-    mkey = str(_client_settings().get("mistralKey") or "").strip()
-    if not mkey:
+    if not _secret_is_configured("mistralKey"):
         raise RuntimeError("no AI key and no Mistral key — set one in "
                            "Settings > Credentials")
-    return capture.extract_bibliography(ocr_text, mkey), capture.EXTRACT_MODEL
+    with _lease_secret("mistralKey") as mkey:
+        extracted = capture.extract_bibliography(ocr_text, mkey)
+    return extracted, capture.EXTRACT_MODEL
 
 
 def _sc_map_fields(kind: str, fields: dict) -> dict:
@@ -14928,13 +15455,37 @@ _publish: dict = {"running": False, "build": "", "stage": "idle", "sent": 0,
                   "job": ""}
 
 
-def _r2_cfg() -> dict:
+def _r2_public_cfg() -> dict:
     s = _client_settings()
     return {"account": str(s.get("r2Account") or "").strip(),
             "bucket": str(s.get("r2Bucket") or "").strip(),
-            "key_id": str(s.get("r2KeyId") or "").strip(),
-            "secret": str(s.get("r2Secret") or "").strip(),
             "public_base": str(s.get("r2PublicBase") or "").strip()}
+
+
+def _r2_configured() -> bool:
+    cfg = _r2_public_cfg()
+    return bool(cfg["account"] and cfg["bucket"] and
+                _secret_is_configured("r2KeyId") and
+                _secret_is_configured("r2Secret"))
+
+
+@contextlib.contextmanager
+def _lease_r2_cfg():
+    public = _r2_public_cfg()
+    if not _r2_configured():
+        yield {**public, "key_id": "", "secret": ""}
+        return
+    with contextlib.ExitStack() as stack:
+        cfg = {
+            **public,
+            "key_id": stack.enter_context(_lease_secret("r2KeyId")),
+            "secret": stack.enter_context(_lease_secret("r2Secret")),
+        }
+        try:
+            yield cfg
+        finally:
+            cfg.pop("key_id", None)
+            cfg.pop("secret", None)
 
 
 def _volume_row(b: dict, slug: str, url: str, path: str, size: int, actor: str,
@@ -15139,11 +15690,13 @@ def api_publish_catalog():
     warning = ""
     cloud_rows = []
     cloud_ok = False
-    cfg = _auth_cfg()
-    if cfg:
+    if _auth_cfg():
         try:
-            cloud_rows = [_public_preview_urls(cfg, row)
-                          for row in _public_volume_rows(cfg)]
+            with _auth_execution_cfg() as cfg:
+                if not cfg:
+                    raise RuntimeError("protected auth configuration unavailable")
+                cloud_rows = [_public_preview_urls(cfg, row)
+                              for row in _public_volume_rows(cfg)]
             cloud_ok = True
             if cloud_rows and any("group_id" not in row or "volume" not in row
                                   for row in cloud_rows):
@@ -15183,17 +15736,19 @@ def api_publish_preview(slug: str):
                   and str(b.get("published_slug") or "") == slug), None)
     about, notes, warning, source = "", [], "", "local"
     cloud_ok = False
-    cfg = _auth_cfg()
-    if cfg and slug:
+    if _auth_cfg() and slug:
         q = urllib.parse.quote(slug, safe="")
         try:
-            texts = sbase._rest(
-                cfg, "GET", f"volume_texts?slug=eq.{q}&kind=eq.about"
-                "&select=body,lang&order=lang.asc&limit=1") or []
-            remote_notes = sbase._rest(
-                cfg, "GET", f"volume_notes?slug=eq.{q}"
-                "&select=note_id,page,quote,kind,body"
-                "&order=page.asc,note_id.asc") or []
+            with _auth_execution_cfg() as cfg:
+                if not cfg:
+                    raise RuntimeError("protected auth configuration unavailable")
+                texts = sbase._rest(
+                    cfg, "GET", f"volume_texts?slug=eq.{q}&kind=eq.about"
+                    "&select=body,lang&order=lang.asc&limit=1") or []
+                remote_notes = sbase._rest(
+                    cfg, "GET", f"volume_notes?slug=eq.{q}"
+                    "&select=note_id,page,quote,kind,body"
+                    "&order=page.asc,note_id.asc") or []
             if not isinstance(texts, list) or not isinstance(remote_notes, list):
                 raise RuntimeError("online preview returned an invalid response")
             if texts:
@@ -15392,7 +15947,8 @@ def _publish_slug(cloud: dict, b: dict) -> str:
     return slug
 
 
-def _unpublish_object(cloud: dict, slug: str, path: str, r2_name: str = "") -> None:
+def _unpublish_object(cloud: dict, r2cfg: dict, slug: str, path: str,
+                      r2_name: str = "") -> None:
     """Best-effort removal of an object whose catalogue row never landed.
     r2_name overrides the default "<slug>.pdf" R2 key -- needed for anything
     that isn't the primary PDF (a secondary scan, a thumbnail)."""
@@ -15400,13 +15956,14 @@ def _unpublish_object(cloud: dict, slug: str, path: str, r2_name: str = "") -> N
         if path:
             sbase.delete_objects(cloud, "volumes", [path])
         else:
-            r2.delete(_r2_cfg(), f"volumes/{r2_name or slug + '.pdf'}")
+            r2.delete(r2cfg, f"volumes/{r2_name or slug + '.pdf'}")
         log.warning("rolled back orphaned object for %s", slug)
     except Exception as exc:
         log.error("could not roll back orphaned object for %s: %s", slug, exc)
 
 
-def _publish_run(bid: str, actor: str, job: dict | None = None) -> None:
+def _publish_run_with_configs(bid: str, actor: str, cloud: dict, r2cfg: dict,
+                              job: dict | None = None) -> None:
     def stage(name, cancellable=True, **kw):
         # cancellation is checked at stage boundaries only: past "recording"
         # the volumes row is public, so aborting would not be a clean cancel
@@ -15423,10 +15980,6 @@ def _publish_run(bid: str, actor: str, job: dict | None = None) -> None:
         pdf = _resolve_local(b.get("pdf_file") or "")
         if pdf is None or not pdf.is_file():
             raise RuntimeError("this entry has no local PDF attached")
-        cloud = _cloud_cfg()
-        if not cloud:
-            raise RuntimeError("Supabase is not configured (Settings > Credentials)")
-
         size = pdf.stat().st_size
         slug = _publish_slug(cloud, b)
         name = f"{slug}.pdf"
@@ -15439,7 +15992,6 @@ def _publish_run(bid: str, actor: str, job: dict | None = None) -> None:
                 job["done"], job["total"] = int(sent), int(total)
                 _job_checkpoint(job)
 
-        r2cfg = _r2_cfg()
         if r2.configured(r2cfg):
             # an R2 bucket may also hold installers, so namespace the volumes
             url = r2.put_file(r2cfg, f"volumes/{name}", pdf, "application/pdf",
@@ -15542,11 +16094,11 @@ def _publish_run(bid: str, actor: str, job: dict | None = None) -> None:
                 log.warning("optional volumes metadata is missing on the cloud "
                             "project — apply the pending docs/cloud/migrations")
         except Exception:
-            _unpublish_object(cloud, slug, path)
+            _unpublish_object(cloud, r2cfg, slug, path)
             for name_i, path_i in extras:
-                _unpublish_object(cloud, name_i[:-4], path_i)
+                _unpublish_object(cloud, r2cfg, name_i[:-4], path_i)
             if thumb_url or thumb_path:
-                _unpublish_object(cloud, f"{slug}-thumb", thumb_path,
+                _unpublish_object(cloud, r2cfg, f"{slug}-thumb", thumb_path,
                                   r2_name=f"{slug}-thumb.jpg")
             raise
 
@@ -15601,6 +16153,25 @@ def _publish_run(bid: str, actor: str, job: dict | None = None) -> None:
             _publish["running"] = False
 
 
+def _publish_run(bid: str, actor: str, job: dict | None = None) -> None:
+    """Lease publishing credentials inside the worker, never its job record."""
+    try:
+        with _lease_cloud_cfg() as cloud:
+            if not cloud:
+                raise RuntimeError(
+                    "Supabase is not configured (Settings > Credentials)")
+            with _lease_r2_cfg() as r2cfg:
+                _publish_run_with_configs(bid, actor, cloud, r2cfg, job)
+    except Exception as exc:
+        log.error("publish credential setup failed for build %s", bid,
+                  exc_info=exc)
+        with _publish_lock:
+            _publish.update(stage="error", running=False,
+                            error=f"{type(exc).__name__}: {exc}")
+        if job is not None:
+            _job_transition(job, "error", error=str(exc), note="")
+
+
 @app.route("/api/volumes/publish", methods=["POST"])
 def api_volumes_publish():
     p = request.get_json(silent=True) or {}
@@ -15613,7 +16184,7 @@ def api_volumes_publish():
     if builds[bid].get("rights") not in _BUILD_RIGHTS[1:]:
         return jsonify({"ok": False, "error": "no rights decision — set Rights in "
                         "the Editor before publishing"}), 400
-    if not _cloud_cfg():
+    if not _cloud_configured():
         return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Credentials)"}), 400
     with _publish_lock:
         if _publish["running"]:
@@ -15639,7 +16210,8 @@ def api_volumes_publish():
 @app.route("/api/volumes/publish/status")
 def api_volumes_publish_status():
     with _publish_lock:
-        return jsonify(dict(_publish, store="r2" if r2.configured(_r2_cfg()) else "supabase"))
+        return jsonify(dict(_publish,
+                            store="r2" if _r2_configured() else "supabase"))
 
 
 # --- Knowledge passages: segmentation, curation, and the search index (#140) -----
@@ -16000,28 +16572,29 @@ def _embed_cfg() -> dict:
     with model '' (docs/search-design.md D7)."""
     s = _client_settings()
     return {"base": str(s.get("embedBase") or "").strip(),
-            "model": str(s.get("embedModel") or "").strip(),
-            "key": str(s.get("embedKey") or "").strip()}
+            "model": str(s.get("embedModel") or "").strip()}
 
 
 def _embed_texts(cfg: dict, texts: list[str]) -> list[list[float]]:
     """One /embeddings call for a batch; returns vectors in input order.
     Same error convention as _ai_chat: RuntimeError with the body truncated."""
-    headers = {"Content-Type": "application/json"}
-    if cfg["key"]:
-        headers["Authorization"] = f"Bearer {cfg['key']}"
-    req = urllib.request.Request(
-        cfg["base"].rstrip("/") + "/embeddings",
-        data=json.dumps({"model": cfg["model"], "input": texts}).encode("utf-8"),
-        headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=120.0) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:300]
-        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
-    except OSError as exc:
-        raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
+    lease = (_lease_secret("embedKey") if _secret_is_configured("embedKey")
+             else contextlib.nullcontext(""))
+    with lease as key:
+        headers = {"Content-Type": "application/json"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        req = urllib.request.Request(
+            cfg["base"].rstrip("/") + "/embeddings",
+            data=json.dumps({"model": cfg["model"], "input": texts}).encode("utf-8"),
+            headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=120.0) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"provider returned HTTP {exc.code}") from None
+        except OSError:
+            raise RuntimeError("the embedding provider is unavailable") from None
     rows = data.get("data")
     if not isinstance(rows, list) or len(rows) != len(texts):
         raise RuntimeError("malformed embeddings response")
@@ -16086,8 +16659,7 @@ def api_knowledge_index_publish():
                "the rights decision “No public text” blocks a "
                "search index (docs/rights.md)")
         return jsonify({"ok": False, "error": msg}), 400
-    cloud = _cloud_cfg()
-    if not cloud:
+    if not _cloud_configured():
         return jsonify({"ok": False, "error":
                         "Supabase is not configured (Settings > Credentials)"}), 400
     doc_name, text, source_revision = _analyze_doc_snapshot(bid, b)
@@ -16100,7 +16672,7 @@ def api_knowledge_index_publish():
     src_input = _manifest_input(bid, f"ocr/{doc_name}")   # hashed at job start
     src_sha = str(src_input.get("sha256") or "")
 
-    def run(job):
+    def run_with_cloud(job, cloud):
         version_id = ""
         try:
             if _an_cancel_check(job, "cancelled — nothing published"):
@@ -16212,6 +16784,12 @@ def api_knowledge_index_publish():
             log.error("index publish failed for %s", bid, exc_info=exc)
             _an_finish(job, f"{type(exc).__name__}: {exc}")
 
+    def run(job):
+        with _lease_cloud_cfg() as cloud:
+            if not cloud:
+                raise RuntimeError("protected cloud credential is unavailable")
+            return run_with_cloud(job, cloud)
+
     try:
         job = _an_job_start_guarded(bid, source_revision, "index-publish",
                                     1, run)
@@ -16236,21 +16814,23 @@ def api_knowledge_index_rollback():
     if not slug:
         return jsonify({"ok": False, "error":
                         "this entry has never published"}), 400
-    cloud = _cloud_cfg()
-    if not cloud:
+    if not _cloud_configured():
         return jsonify({"ok": False, "error":
                         "Supabase is not configured (Settings > Credentials)"}), 400
     q = urllib.parse.quote(slug, safe="")
     try:
-        rows = sbase._rest(
-            cloud, "GET", f"index_versions?slug=eq.{q}"
-            "&select=id,built_at&order=built_at.desc,id.desc&limit=2") or []
-        if not rows:
-            return jsonify({"ok": False, "error":
-                            "no index versions to roll back"}), 400
-        newest = str(rows[0].get("id") or "")
-        sbase.delete_rows(cloud, "index_versions",
-                          "id=eq." + urllib.parse.quote(newest))
+        with _lease_cloud_cfg() as cloud:
+            if not cloud:
+                raise RuntimeError("protected cloud credential is unavailable")
+            rows = sbase._rest(
+                cloud, "GET", f"index_versions?slug=eq.{q}"
+                "&select=id,built_at&order=built_at.desc,id.desc&limit=2") or []
+            if not rows:
+                return jsonify({"ok": False, "error":
+                                "no index versions to roll back"}), 400
+            newest = str(rows[0].get("id") or "")
+            sbase.delete_rows(cloud, "index_versions",
+                              "id=eq." + urllib.parse.quote(newest))
     except sbase.SyncError as exc:
         return jsonify({"ok": False, "error": _index_sync_error(exc)}), 502
     activity("rolled back search index", "book", detail=b.get("title", ""))
@@ -16271,14 +16851,15 @@ def api_knowledge_index_status():
     # Passive status must not nag about cloud config: only publishing needs the
     # owner service key, and the publish action reports that itself. Here we just
     # list any already-published versions, warning only if that lookup fails.
-    cloud = _cloud_cfg()
-    if slug and cloud:
+    if slug and _cloud_configured():
         q = urllib.parse.quote(slug, safe="")
         try:
-            versions = [v for v in (sbase._rest(
-                cloud, "GET", f"index_versions?slug=eq.{q}"
-                "&select=id,channel,config,stats,source_hash,built_at"
-                "&order=built_at.desc,id.desc") or []) if isinstance(v, dict)]
+            with _lease_cloud_cfg() as cloud:
+                versions = [v for v in (sbase._rest(
+                    cloud, "GET", f"index_versions?slug=eq.{q}"
+                    "&select=id,channel,config,stats,source_hash,built_at"
+                    "&order=built_at.desc,id.desc") or [])
+                    if isinstance(v, dict)] if cloud else []
         except sbase.SyncError as exc:
             warning = _index_sync_error(exc)
     return jsonify({"ok": True, "state": _passages_state(bid, b),
@@ -16617,11 +17198,10 @@ def api_knowledge_eval_run():
                         "no passages yet — generate them first"}), 400
     passages = doc.get("passages") or []
     excluded = doc.get("excluded") or []
-    cloud = _cloud_cfg()
     slug = str(b.get("published_slug") or "").strip()
     psg_input = _manifest_input(bid, "passages.json")   # hashed at job start
 
-    def run(job):
+    def run_with_cloud(job, cloud):
         try:
             local_q: dict = {}
             pub_q: dict = {}
@@ -16674,6 +17254,10 @@ def api_knowledge_eval_run():
         except Exception as exc:
             log.error("eval run failed for %s", bid, exc_info=exc)
             _an_finish(job, f"{type(exc).__name__}: {exc}")
+
+    def run(job):
+        with _lease_cloud_cfg() as cloud:
+            return run_with_cloud(job, cloud)
 
     try:
         job = _an_job_start(bid, "eval-run", len(queries), run)
@@ -16734,14 +17318,15 @@ def api_knowledge_ask():
            "floor": _EVAL_UNANSWERABLE_FLOOR, "published": None,
            "warning": ""}
     if p.get("published"):
-        cloud = _cloud_cfg()
         slug = str(b.get("published_slug") or "").strip()
-        if cloud and slug:
+        if _cloud_configured() and slug:
             try:
-                out["published"] = {
-                    "version": _index_version_count(cloud, slug),
-                    "results": _rpc_search_passages(cloud, slug, question,
-                                                    _ASK_K)}
+                with _lease_cloud_cfg() as cloud:
+                    if cloud:
+                        out["published"] = {
+                            "version": _index_version_count(cloud, slug),
+                            "results": _rpc_search_passages(
+                                cloud, slug, question, _ASK_K)}
             except sbase.SyncError as exc:
                 out["warning"] = _index_sync_error(exc)
     return jsonify(out)
@@ -16763,7 +17348,7 @@ def api_knowledge_ask_answer():
     if not question:
         return jsonify({"ok": False, "error": "ask a question first"}), 400
     cfg = _ai_cfg()
-    if not cfg["key"]:
+    if not _secret_is_configured("aiKey"):
         # the _ai_chat no-key message, surfaced before any work happens
         return jsonify({"ok": False, "error":
                         "no AI key — set one in Settings > Credentials "
@@ -17058,7 +17643,8 @@ def _cloud_sync_item_policy_guard():
         yield deletion_index.allows
 
 
-def _cloud_sync_run() -> dict:
+def _cloud_sync_run_with_configs(owner_cfg: dict | None,
+                                 capture_cfg: dict | None) -> dict:
     """Import this user's pending phone captures, with optional owner work.
 
     Capture ingest runs with the signed-in user's JWT and RLS. If an owner has
@@ -17068,8 +17654,6 @@ def _cloud_sync_run() -> dict:
     Everything after the flag is claimed runs inside try/finally, and ANY
     exception lands in `result` — the flag can never stay stuck on, and a
     failed pass can't masquerade as the previous run's outcome."""
-    owner_cfg = _cloud_cfg()
-    capture_cfg = _capture_cfg() or owner_cfg  # legacy owner-only installs
     if not capture_cfg:
         return {"ok": False,
                 "error": "Sign in to your Library Tool account to sync phone captures"}
@@ -17083,7 +17667,6 @@ def _cloud_sync_run() -> dict:
     log.info("cloud sync started")
     try:
         s = _client_settings()
-        mistral_key = str(s.get("mistralKey") or "").strip()
         delete_remote = s.get("cloudDeleteRemote") is not False
         # A different desktop may have merged an identity since this process
         # last opened the Collections window. Refresh durable merge markers
@@ -17095,7 +17678,13 @@ def _cloud_sync_run() -> dict:
         _refresh_collection_aliases(capture_cfg, collection_token)
         for cap in sbase.list_pending_captures(capture_cfg):
             try:
-                if _import_capture(capture_cfg, cap, mistral_key, delete_remote) == "imported":
+                lease = (_lease_secret("mistralKey")
+                         if _secret_is_configured("mistralKey")
+                         else contextlib.nullcontext(""))
+                with lease as mistral_key:
+                    outcome = _import_capture(
+                        capture_cfg, cap, mistral_key, delete_remote)
+                if outcome == "imported":
                     imported += 1
                 else:
                     skipped += 1
@@ -17125,17 +17714,17 @@ def _cloud_sync_run() -> dict:
                     errors.append(f"{name}: {res['error']}")
                 if res.get("guard"):      # a wipe was caught: worth surfacing
                     errors.append(f"{name}: {res['guard']}")
-            r2cfg = _r2_cfg()
-            if r2.configured(r2cfg):
-                try:
-                    entries_res = store_sync.sync_entry_files(
-                        r2cfg,
-                        item_policy_guard=_cloud_sync_item_policy_guard,
-                    )
-                except Exception as exc:
-                    errors.append(f"entry files: {exc}")
-            else:
-                entries_res = {"skipped": "R2 not configured"}
+            with _lease_r2_cfg() as r2cfg:
+                if r2.configured(r2cfg):
+                    try:
+                        entries_res = store_sync.sync_entry_files(
+                            r2cfg,
+                            item_policy_guard=_cloud_sync_item_policy_guard,
+                        )
+                    except Exception as exc:
+                        errors.append(f"entry files: {exc}")
+                else:
+                    entries_res = {"skipped": "R2 not configured"}
         else:
             entries_res = {"skipped": "owner sync not configured"}
         result = {"ok": not errors, "imported": imported, "skipped": skipped,
@@ -17172,6 +17761,15 @@ def _cloud_sync_run() -> dict:
     return result
 
 
+def _cloud_sync_run() -> dict:
+    """Acquire owner credentials inside the sync execution, never a job."""
+    with contextlib.ExitStack() as stack:
+        capture_cfg = stack.enter_context(_lease_capture_cfg())
+        owner_cfg = stack.enter_context(_lease_cloud_cfg())
+        return _cloud_sync_run_with_configs(
+            owner_cfg, capture_cfg or owner_cfg)
+
+
 def _cloud_autosync_loop() -> None:
     """Background interval sync; the interval is re-read every tick so a
     settings change applies without a restart (0 = off)."""
@@ -17182,7 +17780,7 @@ def _cloud_autosync_loop() -> None:
         # must never kill this thread — it would silently stop syncing forever
         try:
             minutes = int(_client_settings().get("cloudSyncMinutes") or 0)
-            if minutes <= 0 or not (_capture_cfg() or _cloud_cfg()):
+            if minutes <= 0 or not (_capture_configured() or _cloud_configured()):
                 continue
             if time.time() - _autosync_last >= minutes * 60:
                 _autosync_last = time.time()
@@ -17195,7 +17793,7 @@ def _cloud_autosync_loop() -> None:
 def api_cloudsync_run():
     """Manual sync trigger (the Catalogs-tab button). Runs in the background;
     poll /api/cloudsync/status for the outcome."""
-    if not (_capture_cfg() or _cloud_cfg()):
+    if not (_capture_configured() or _cloud_configured()):
         return jsonify({"ok": False,
                         "error": "Sign in to your Library Tool account to sync phone captures"})
     with _cloudsync_lock:
@@ -17209,17 +17807,26 @@ def api_cloudsync_run():
 def api_cloudsync_status():
     with _cloudsync_lock:
         out = dict(_cloudsync)
-    out["configured"] = bool(_capture_cfg() or _cloud_cfg())
+    out["configured"] = bool(_capture_configured() or _cloud_configured())
     return jsonify(out)
 
 
 @app.route("/api/cloudsync/test")
 def api_cloudsync_test():
-    cfg = _capture_cfg() or _cloud_cfg()
-    if not cfg:
+    if _capture_configured():
+        with _lease_capture_cfg() as capture_cfg:
+            if capture_cfg:
+                return jsonify(sbase.test_connection(capture_cfg))
+            return jsonify({"ok": False,
+                            "error": "protected auth credential is unavailable"})
+    if not _cloud_configured():
         return jsonify({"ok": False,
                         "error": "Sign in to your Library Tool account to test phone sync"})
-    return jsonify(sbase.test_connection(cfg))
+    with _lease_cloud_cfg() as owner_cfg:
+        if not owner_cfg:
+            return jsonify({"ok": False,
+                            "error": "protected cloud credential is unavailable"})
+        return jsonify(sbase.test_connection(owner_cfg))
 
 
 @app.route("/api/capture/image")
@@ -17380,10 +17987,10 @@ def _lan_capture():
     photos = [p for p in (f.read() for f in files) if p]
     if not photos:
         abort(400)
-    mistral_key = str(_client_settings().get("mistralKey") or "").strip()
     try:
         # pass the filenames so _phone_result can key the phone's OCR by name
-        entry_id, _errors = ingest_capture(cap, photos, mistral_key, names)
+        with _lease_secret("mistralKey") as mistral_key:
+            entry_id, _errors = ingest_capture(cap, photos, mistral_key, names)
     except Exception as exc:                       # noqa: BLE001 — report, don't 500-crash
         log.exception("LAN capture ingest failed")
         return jsonify(error=str(exc)[:200]), 500
@@ -17445,8 +18052,8 @@ def _apply_lan_state() -> None:
 
 
 if __name__ == "__main__":
-    # Explicit startup keeps recovery ahead of migrations and every worker.
-    # Imported WSGI/test hosts instead cross the same barrier on first request.
+    # Explicit startup completes protected migration before recovery and every
+    # worker. Imported WSGI/test hosts cross the same barrier on first request.
     _ensure_engine_session()
     # Make existing user data portable (absolute -> data-root-relative paths).
     _migrate_stored_paths()
@@ -17471,8 +18078,10 @@ if __name__ == "__main__":
     # WHL_PORT lets a second instance run on another port (a distinct origin,
     # so its localStorage/client-state can't collide with the main one) — used
     # to test against a throwaway WHL_DATA_ROOT without touching live state.
-    _migrate_secrets_from_client_state()   # lift any secrets off the synced blob
-    _sync_profile_mistral_key()            # user cloud data; cached for offline use
+    # Protected migration completed inside _ensure_engine_session, before any
+    # worker above was allowed to start. Profile reconciliation now operates
+    # directly on that protected store.
+    _sync_profile_mistral_key()
     port = int(os.environ.get("WHL_PORT") or 5001)
     log.info("Library Tool on 127.0.0.1:%d - DATA_ROOT=%s", port, lib.DATA_ROOT)
     app.run(host="127.0.0.1", port=port, debug=False)

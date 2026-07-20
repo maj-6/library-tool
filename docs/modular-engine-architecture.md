@@ -163,19 +163,20 @@ larger workbench and packaging split described below remains the target:
   responses rather than truncating or publishing. Migration from legacy
   `ocr/*.txt` and production activation still remain before existing
   workbenches may depend on the native aggregate.
-- The secret-store contract, current-user DPAPI repository, and optional
-  first-party `library.secrets` composition now form a complete but unbound
-  backend slice. Only the public masked-status/CAS service enters the registry;
-  the repository and provider credential lease remain private. No production
-  activation, plaintext migration, or renderer mutation route is implied.
+- The secret-store contract, current-user DPAPI repository, and first-party
+  `library.secrets` composition are now production-bound on Windows. Only the
+  public masked-status/CAS service enters the registry; the repository and
+  provider credential lease remain private. Startup performs verified,
+  idempotent plaintext migration before engine publication, and unsupported
+  platforms degrade explicitly without fallback.
 - Electron now authenticates its loopback sidecar with a 256-bit per-launch
   capability retained only by the main process and the sidecar digest. Exact
   Host and supplied-Origin checks, request-provenance and redirect-chain
   tainting, authenticated-response `no-store`, sandbox/navigation/permission
   policy, strict resource-window grants, bounded PDF streaming, and retirement
   of the same-origin remote HTML proxy establish the transport prerequisite for
-  secret migration. The compatibility `/api/secrets` route still exposes
-  plaintext to the trusted main renderer, so the secret cutover remains open.
+  secret migration. The renderer now uses versioned status/CAS resources only,
+  and the compatibility `/api/secrets` route is retired with `410`.
 - `.lib` import now has immutable command, plan, receipt, planner, repository,
   and unit-of-work contracts. The application service binds idempotency to the
   complete command and rejects malformed plugin plans before staging. A
@@ -216,10 +217,10 @@ larger workbench and packaging split described below remains the target:
   rehydrates one owned job manager, and returns an explicitly closable session.
   It has native strict/atomic job-history JSON I/O and imports neither Flask nor
   `tools`. Importing production `server.py` does not claim a workspace. Its
-  executable startup opens the host after legacy callbacks are defined and
-  before migrations or background threads; an embedded Flask host opens it at
-  the first trusted request. Compatibility globals are aliases of the
-  session-owned objects, not a second resource graph.
+  executable startup completes protected-secret migration, opens the host,
+  then runs other migrations and background threads; an embedded Flask host
+  crosses the same barrier at the first trusted request. Compatibility globals
+  are aliases of the session-owned objects, not a second resource graph.
 
 The automatic family detector is deliberately a proposal query. It clusters
 geometry and semantic roles, identifies medoid exemplars, separates recurring
@@ -604,87 +605,56 @@ With the lifecycle seam established, migrate these data boundaries in order:
    contract now exposes fixed masked status plus CAS replace/clear, keeps
    exact-replay authentication behind the backend, scrubs repository failures,
    and separates an engine-only credential lease from the public service. It
-   now has a Windows adapter and optional first-party composition, but remains
-   unbound in production: current-user DPAPI protects
-   one closed, versioned atomic envelope with ciphertext-only temporary/target
-   files, write-through replacement, exact post-publication verification,
-   random status revisions, and authenticated replay. Add production
-   binding plus status/CAS transport and migrate the plaintext compatibility
-   endpoint. The provider descriptor/trait registry, configuration and cached
-   health projection, explicit selection policy, optional composition module,
-   versioned read-only resource, and strict `EngineClient` boundary are now in
-   place, but deliberately unbound in production. Next, implement individual
-   provider adapters and privately leased credentials, then migrate translation
-   generation and remaining OCR/AI jobs one capability at a time. Advertise
-   each optional command only when its selected provider is installed,
-   configured, compatible, and healthy rather than when a UI happens to
-   contain a button.
+   is production-bound on Windows: current-user DPAPI protects one closed,
+   versioned atomic envelope, legacy plaintext is verified before sanitization,
+   the renderer sees only versioned status/CAS resources, and provider paths
+   lease credentials only during execution. The provider descriptor/trait
+   registry, cached health projection, explicit selection policy, optional
+   composition module, versioned read-only resource, and strict
+   `EngineClient` boundary are also in place, but deliberately unbound in
+   production. Next, implement individual provider execution adapters and
+   migrate translation generation and remaining OCR/AI jobs one capability at
+   a time. Compound-credential mutation remains a separate secret-store
+   extension. Advertise an optional command only when its selected provider
+   and its engine executor are both installed, configured, compatible, and
+   healthy—not merely because a UI contains a button.
 
-The provider/secret slice remains a parallel security priority. The current
-host-guarded `/api/secrets` endpoint still returns plaintext credentials to the
-browser renderer, and some compatibility requests send those values back to
-the sidecar. Loopback origin checks reduce exposure but do not satisfy the
-target trust boundary. Public provider state should expose only installed,
-configured, health, reasons, models/traits, and masked secret status; secret
-values are write/replace/clear operations and are readable only by an
-engine-side provider lease. The engine contract now enforces that semantic
-split. The DPAPI adapter implements secure persistence for an application-
-controlled Windows vault directory. Optional composition exposes only the
-public service and keeps the repository and credential lease out of discovery;
-production binding and migration are intentionally not installed yet.
+### Protected-secret cutover status
 
-The selected first backend now matches the actual Windows-only desktop
-distribution: current-user DPAPI protects one versioned atomic envelope that
-contains every registered credential, random status revision, durable receipt,
-replay HMAC key, and replay authenticator. This is intentionally not a
-`RecoverableWriteSet` transaction or a collection of Credential Manager
-entries: one ciphertext replacement is the atomic boundary, and no plaintext
-journal, backup, or temporary file is permitted. Registered-but-empty secrets
-have fixed initial revisions without creating a vault on GET. A corrupt,
-wrong-user, locked, or newer-schema vault remains untouched and reports a
-sanitized unhealthy state. Future provider readiness policy must use that state
-to disable only credential-dependent capabilities.
+The production Windows host now binds `library.secrets` to the current-user
+DPAPI repository. One versioned atomic ciphertext envelope owns every
+registered provider credential, random status revision, durable receipt, and
+authenticated replay record. Registered-but-empty reads do not create a vault;
+corrupt, wrong-user, locked, newer-schema, and non-Windows states remain
+untouched and report sanitized degraded health without plaintext fallback.
 
-The cutover audit found that secure persistence could not be exposed behind the
-old unauthenticated renderer boundary. That transport prerequisite is now
-implemented. Electron creates a random 256-bit capability, sends it only in the
-child environment, retains it only in the main process, and allows the sidecar
-to retain only its digest after earliest-import consumption. Exact desktop Host
-and supplied-Origin checks, request-provenance and redirect-chain tainting,
-main-frame-only IPC, narrow PDF/print/capture resource grants, sandbox and
-navigation policy, least-privilege clipboard permission, CSP, and API
-`no-store` prevent remote or untrusted frames from acquiring authenticated API
-access. `/api/webview` is retired with `410`; remote HTML opens outside the app.
-Renderer PDF fetches are bounded and cancellable, with an authenticated child
-window fallback for large or unknown-size resources.
+Before the engine session, listeners, or workers are published, startup reads
+legacy values from `client_state.json` and `secrets.json`, commits them, rebuilds
+the repository, and exactly decrypts/verifies each value. Only then does it
+sanitize both sources. A failure preserves the plaintext inputs for an
+idempotent restart; it never creates a plaintext journal, backup, or temporary
+archive.
 
-The trust-boundary migration itself is still required. `/api/secrets` returns
-every plaintext value to the trusted main renderer; renderer state retains
-them; and OCR and other jobs copy credentials into long-lived configuration
-dictionaries. Public services must expose status and CAS mutation only, while
-credential leases remain private to provider execution. A packaged Electron
-smoke should verify Chromium PDF Range behavior and native clipboard behavior,
-which pure policy tests cannot prove.
+The renderer now receives only fixed masked status and revisions through
+versioned GET plus idempotent CAS PUT/DELETE. `/api/secrets` returns `410`, and
+`EngineClient` rejects malformed or disclosure-shaped success documents.
+Repository and lease capabilities remain private. OCR, AI/image generation,
+embeddings, Google Sheets, Supabase auth/profile/owner sync, R2, and capture
+code lease credentials inside provider execution and remove temporary config
+fields afterward; long-lived job records contain nonsecret settings only.
+Custom Supabase projects use the same context-managed path, so the protected
+anon key remains supported without returning to `client_state.json`.
 
-Compound credentials such as AWS and R2 must be leased/replaced atomically (or
-stored as one opaque bundle), and the Google service-account JSON itself—not
-merely its path—needs a secure ownership decision. The registered secret-ID set
-is append-only for vault compatibility. Receipt retention also needs an
-explicit compaction/versioning policy before claiming indefinite write
-availability.
+Remaining secret-store work is narrower: atomic mutation semantics for compound
+AWS/R2 credentials, secure ownership of the Google service-account JSON rather
+than only its path, receipt compaction/versioning, provider descriptors and
+health policy, and native backends for macOS/Linux. A packaged Electron smoke
+must still verify Chromium PDF Range and clipboard behavior.
 
-The cutover must run before workers and listeners: read legacy values into
-memory, commit and reopen/verify the protected vault, then sanitize
-`client_state.json` and remove `secrets.json` without making a plaintext
-archive. Versioned per-secret GET/PUT/DELETE resources expose status, fixed
-mask, CAS, and idempotent receipts only; the old plaintext endpoint becomes
-`410`. The renderer stores status rather than values, and provider workers
-lease only their own credential inside the provider call. The per-launch
-Electron-to-sidecar capability and Host/Origin/navigation/CSP controls are now
-installed; they authorize this migration but do not substitute for it. macOS
-Keychain and Linux Secret Service can later
-protect a random master key for one AEAD envelope; an unavailable native vault
-disables provider features and never selects a plaintext fallback.
+Signed-in access/refresh tokens in `output/auth_session.json` and the LAN
+pairing token in `DATA_ROOT/lan_token.txt` are deliberately separate future
+security boundaries, not provider API keys. This cutover does not claim to
+protect or migrate them.
 
 Capability modules remain the unit of dependency and discovery throughout
 this sequence. A module contributes services, commands, readiness policies,

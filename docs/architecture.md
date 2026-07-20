@@ -296,42 +296,32 @@ RLS is what protects the project.
 
 **PER-USER SECRET**:
 
-- Desktop API keys and credentials (AI, OCR, Supabase service key, R2
-  key/secret, the Google service-account key path) live in
-  `DATA_ROOT/output/secrets.json` — local-only, gitignored, never synced,
-  and currently served through the Host-guarded `/api/secrets` (loopback
-  origin, anti-DNS-rebinding). This is safer than synced settings but remains
-  a transitional boundary: the renderer can read the plaintext values. The
-  provider/secret-store slice must replace it with presence, a fixed mask,
-  replace, and clear operations; provider-specific bounded validation and
-  health probes remain part of provider discovery. Only the engine-side
-  provider adapter may lease a secret value. The framework-neutral
-  status/CAS/lease contract now exists, including authenticated replay seams.
-  Secure persistence
-  is implemented but deliberately unbound: the Windows current-user DPAPI
-  adapter uses one closed, versioned vault envelope containing values, random
-  status revisions, receipts, and keyed replay evidence. Only ciphertext may
-  reach its target or temporary files; Windows publication is write-through and
-  verified byte-for-byte before success is acknowledged. Corruption, a wrong
-  user, or a newer schema preserves the vault and fails closed, never falling
-  back to plaintext. An optional `library.secrets` module now composes only the
-  public status/CAS mutation service when an explicit repository is supplied;
-  the credential lease and repository remain private and undiscoverable. The
-  production host deliberately does not bind it, and endpoint migration does
-  not yet exist. Migration must commit and reopen that vault before removing
-  legacy values. The Electron sidecar transport prerequisite is now complete:
-  a per-launch capability, exact desktop Host, supplied-Origin validation,
-  provenance-aware header injection, hardened windows, and retirement of
-  `/api/webview` isolate authenticated APIs from remote and untrusted frames.
-  This does not complete the secret cutover—the trusted main renderer can still
-  read plaintext through `/api/secrets` until the status/CAS resources and
-  provider-only credential leases replace that compatibility path. The credentials
-  were migrated *out* of `client_state.json` so the synced settings blob
-  carries no secrets.
-  The signed-in session token sits in `output/auth_session.json`
-  (gitignored); the LAN pairing token in `DATA_ROOT/lan_token.txt`. Those are
-  separate future security boundaries rather than provider API keys. The LAN
-  token is no longer written to the application log.
+- Desktop provider credentials (AI/OCR keys, Supabase owner/custom-project
+  keys, R2 credentials, and the Google service-account path) are production-
+  bound to the Windows current-user DPAPI repository in
+  `DATA_ROOT/output/secrets.dpapi`. Its one closed, versioned atomic envelope
+  contains ciphertext, random status revisions, receipts, and authenticated
+  replay evidence; corruption, the wrong Windows user, or an unsupported
+  platform reports explicit degraded health and never selects plaintext
+  fallback.
+- Startup completes the legacy cutover before the engine session, listeners,
+  or workers become visible. Values from `client_state.json` and the retired
+  `secrets.json` are committed, the repository is reconstructed, and every
+  value is exactly leased and verified before either plaintext source is
+  sanitized. A failed commit/reopen/verification preserves the legacy sources
+  for an idempotent retry; no plaintext backup is created.
+- `library.secrets` publishes only fixed masked status and idempotent CAS
+  replace/clear. The renderer uses `/api/v1/secrets` through `EngineClient` and
+  retains status, masks, and revisions only; the former plaintext
+  `/api/secrets` resource returns `410`. The repository and credential lease
+  remain sidecar-private. OCR, AI/image generation, embeddings, Google Sheets,
+  Supabase auth/owner sync, R2, profile sync, and capture paths acquire only
+  the required credential inside their provider execution and scrub temporary
+  configs afterward.
+- The signed-in session/refresh tokens in `output/auth_session.json` and the
+  LAN pairing token in `DATA_ROOT/lan_token.txt` remain separate future
+  security boundaries, not provider API keys. The LAN token is not written to
+  the application log.
 - Bring-your-own Mistral/DeepSeek keys shared between phone and desktop
   live in the `profile_secrets` table — a separate table, not a
   `profiles` column, readable and writable by exactly one user
