@@ -22,6 +22,7 @@ from .item_commands import ItemCommandService
 from .item_lifecycle import ItemLifecycleService
 from .items import ItemQueryService, WorkbenchPolicyPort
 from .jobs import JobManager
+from .providers import ProviderDiscoveryService
 from .replica import ReplicaApplicationService
 from .representation_commands import RepresentationCommandService
 from .secret_store import SecretStoreService
@@ -449,6 +450,9 @@ LIB_OPEN_SERVICE: ServiceKey[OpenLibService] = ServiceKey(
     "replica.interchange.open"
 )
 JOB_SERVICE: ServiceKey[JobManager] = ServiceKey("library.jobs")
+PROVIDER_DISCOVERY_SERVICE: ServiceKey[ProviderDiscoveryService] = ServiceKey(
+    "library.providers.discovery"
+)
 REPLICA_SERVICE: ServiceKey[ReplicaApplicationService] = ServiceKey(
     "replica.application"
 )
@@ -641,6 +645,7 @@ __all__ = [
     "LibraryEngine",
     "LibraryEngineBuilder",
     "ModuleContribution",
+    "PROVIDER_DISCOVERY_SERVICE",
     "REPLICA_SERVICE",
     "REPRESENTATION_COMMAND_SERVICE",
     "SECRET_STORE_SERVICE",

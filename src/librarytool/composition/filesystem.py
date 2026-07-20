@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from inspect import getattr_static
 from pathlib import Path
 from typing import Any, ContextManager
@@ -72,6 +72,13 @@ from ..engine.ports import (
     ReplicaPolicyPort,
     TextLayerRepositoryPort,
 )
+from ..engine.providers import (
+    ProviderDiscoveryService,
+    ProviderHealthProbe,
+    ProviderRegistry,
+    ProviderSelectionPolicy,
+    SecretStatusProbe,
+)
 from ..engine.replica import ReplicaApplicationService
 from ..engine.secret_store import (
     SecretStoreRepositoryPort,
@@ -86,6 +93,7 @@ from ..engine.runtime import (
     ITEM_QUERY_SERVICE,
     JOB_SERVICE,
     LIB_OPEN_SERVICE,
+    PROVIDER_DISCOVERY_SERVICE,
     REPLICA_SERVICE,
     REPRESENTATION_COMMAND_SERVICE,
     SECRET_STORE_SERVICE,
@@ -434,6 +442,37 @@ class SecretStoreBindings:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderDiscoveryBindings:
+    """Provider descriptors, explicit selections, and cached status ports.
+
+    The service copies the mapping and validates probe structure without
+    invoking any probe. Provider SDKs and live health checks remain owned by a
+    host or background monitor; engine composition and discovery only read
+    sanitized snapshots.
+    """
+
+    registry: ProviderRegistry
+    policy: ProviderSelectionPolicy
+    health_probes: Mapping[str, ProviderHealthProbe] = field(
+        default_factory=dict
+    )
+    secret_status_probe: SecretStatusProbe | None = None
+    service: ProviderDiscoveryService = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "service",
+            ProviderDiscoveryService(
+                self.registry,
+                self.policy,
+                health_probes=self.health_probes,
+                secret_status_probe=self.secret_status_probe,
+            ),
+        )
+
+
 class _CanvasAuthority:
     """Validate and sanitize one exact host canvas authority projection."""
 
@@ -553,6 +592,7 @@ class FilesystemServiceGraph:
     canvas_preparation: CanvasPreparationService | None = None
     text_layer_aggregate: TextLayerAggregateService | None = None
     secret_store: SecretStoreService | None = None
+    provider_discovery: ProviderDiscoveryService | None = None
 
     def __post_init__(self) -> None:
         if (self.canvas_query is None) != (self.canvas_preparation is None):
@@ -564,6 +604,13 @@ class FilesystemServiceGraph:
             SecretStoreService,
         ):
             raise TypeError("secret_store must be a SecretStoreService or None")
+        if self.provider_discovery is not None and not isinstance(
+            self.provider_discovery,
+            ProviderDiscoveryService,
+        ):
+            raise TypeError(
+                "provider_discovery must be a ProviderDiscoveryService or None"
+            )
 
     def keyed_services(self) -> tuple[tuple[ServiceKey[Any], Any], ...]:
         services = (
@@ -580,6 +627,7 @@ class FilesystemServiceGraph:
             (TEXT_LAYER_SERVICE, self.text_layers),
             (TEXT_LAYER_AGGREGATE_SERVICE, self.text_layer_aggregate),
             (SECRET_STORE_SERVICE, self.secret_store),
+            (PROVIDER_DISCOVERY_SERVICE, self.provider_discovery),
             (TRANSLATION_SERVICE, self.translations),
             (
                 TRANSLATION_PROVENANCE_SERVICE,
@@ -610,6 +658,7 @@ def compose_filesystem_engine(
     canvases: CanvasBindings | None = None,
     text_layer_aggregate: TextLayerAggregateBindings | None = None,
     secrets: SecretStoreBindings | None = None,
+    providers: ProviderDiscoveryBindings | None = None,
 ) -> LibraryEngine:
     """Return one complete filesystem-backed service graph.
 
@@ -633,6 +682,13 @@ def compose_filesystem_engine(
         )
     if secrets is not None and not isinstance(secrets, SecretStoreBindings):
         raise TypeError("secrets must be a SecretStoreBindings bundle or None")
+    if providers is not None and not isinstance(
+        providers,
+        ProviderDiscoveryBindings,
+    ):
+        raise TypeError(
+            "providers must be a ProviderDiscoveryBindings bundle or None"
+        )
     # Recovery remains host-owned, but composition refuses to expose any
     # service graph while an unfinished workspace transaction exists.
     with resources.write_set.workspace_lease():
@@ -859,6 +915,7 @@ def compose_filesystem_engine(
         canvas_preparation=canvas_preparation,
         text_layer_aggregate=native_text_layers,
         secret_store=secret_store,
+        provider_discovery=(None if providers is None else providers.service),
     )
     try:
         contributions = tuple(contribution_factory(graph))
@@ -911,6 +968,7 @@ __all__ = [
     "ItemLifecycleBindings",
     "ReplicaBindings",
     "RepresentationBindings",
+    "ProviderDiscoveryBindings",
     "SecretStoreBindings",
     "TranslationBindings",
     "TextLayerAggregateBindings",

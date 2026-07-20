@@ -116,6 +116,215 @@
       expected.every((key) => Object.prototype.hasOwnProperty.call(value, key));
   }
 
+  const PROVIDER_ID = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
+  const PROVIDER_SECRET_ID = /^[a-z0-9][a-z0-9._-]{0,62}(?::[a-z0-9][a-z0-9._-]{0,62})+$/;
+  const PROVIDER_SEMVER = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+  const PROVIDER_LANGUAGE = /^(?:\*|[a-z]{2,8}(?:-[a-z0-9]{1,8})*)$/;
+  const PROVIDER_REASON_MESSAGES = Object.freeze({
+    "disabled": "The provider is disabled.",
+    "health-unknown": "Provider health could not be determined.",
+    "network-unavailable": "Required network access is unavailable.",
+    "no-selection": "No provider has been selected.",
+    "not-configured": "Required provider configuration is missing.",
+    "probe-failed": "Provider health could not be determined.",
+    "provider-degraded": "The provider reports degraded service.",
+    "provider-incompatible": "The selected provider is incompatible.",
+    "provider-not-installed": "The selected provider is not installed.",
+    "provider-unavailable": "The selected provider is unavailable.",
+    "remote-unreachable": "The remote provider could not be reached.",
+    "runtime-unavailable": "The provider runtime is unavailable.",
+    "secret-status-unknown": "Required credential status is unavailable.",
+    "secret-unavailable": "A required credential is not configured.",
+  });
+
+  function isProviderId(value, optional = false) {
+    return typeof value === "string" && (optional && value === "" ||
+      PROVIDER_ID.test(value));
+  }
+
+  function isProviderSecretId(value) {
+    return typeof value === "string" && value.length <= 255 &&
+      PROVIDER_SECRET_ID.test(value);
+  }
+
+  function isSortedUnique(values, token = (value) => value) {
+    if (!Array.isArray(values)) return false;
+    let previous = null;
+    for (const value of values) {
+      const current = token(value);
+      if (typeof current !== "string" ||
+          previous !== null && current <= previous) return false;
+      previous = current;
+    }
+    return true;
+  }
+
+  function isProviderCapability(value) {
+    return hasExactKeys(value, ["id", "version"]) &&
+      isProviderId(value.id) && Number.isSafeInteger(value.version) &&
+      value.version >= 1;
+  }
+
+  function providerCapabilityToken(value) {
+    return isProviderCapability(value) ?
+      `${value.id}@${String(value.version).padStart(16, "0")}` : "";
+  }
+
+  function isProviderReason(value, optional = false) {
+    if (value === null) return optional;
+    return hasExactKeys(value, ["code", "message"]) &&
+      Object.prototype.hasOwnProperty.call(PROVIDER_REASON_MESSAGES, value.code) &&
+      value.message === PROVIDER_REASON_MESSAGES[value.code];
+  }
+
+  function isPositiveLimit(value) {
+    return value === null || Number.isSafeInteger(value) && value >= 1;
+  }
+
+  function isProviderLimits(value) {
+    return hasExactKeys(value, [
+      "max_input_bytes", "max_output_bytes", "max_batch_items",
+      "max_context_tokens", "max_output_tokens",
+    ]) && Object.values(value).every(isPositiveLimit);
+  }
+
+  function isProviderStringList(values, { nonempty = false,
+    language = false } = {}) {
+    if (!Array.isArray(values) || nonempty && values.length === 0 ||
+        !isSortedUnique(values)) return false;
+    const valid = language ? (value) => typeof value === "string" &&
+      PROVIDER_LANGUAGE.test(value) : isProviderId;
+    if (!values.every(valid)) return false;
+    return !language || !values.includes("*") || values.length === 1;
+  }
+
+  function isProviderTraits(value) {
+    if (!hasExactKeys(value, [
+      "execution", "network", "modes", "input_media", "output_media",
+      "input_languages", "output_languages", "limits",
+    ]) || !["local", "remote"].includes(value.execution) ||
+        !["offline", "required"].includes(value.network) ||
+        value.execution === "remote" && value.network !== "required" ||
+        !isProviderStringList(value.modes, { nonempty: true }) ||
+        !value.modes.every((mode) => ["batch", "streaming"].includes(mode)) ||
+        !isProviderStringList(value.input_media, { nonempty: true }) ||
+        !isProviderStringList(value.output_media, { nonempty: true }) ||
+        !isProviderStringList(value.input_languages, { language: true }) ||
+        !isProviderStringList(value.output_languages, { language: true }) ||
+        !isProviderLimits(value.limits)) return false;
+    return true;
+  }
+
+  function isProviderRow(value) {
+    if (!hasExactKeys(value, [
+      "id", "version", "capabilities", "traits",
+      "required_secret_status_ids", "secret_statuses", "configured",
+      "health", "available",
+    ]) || !isProviderId(value.id) || !PROVIDER_SEMVER.test(value.version) ||
+        !isSortedUnique(value.capabilities, providerCapabilityToken) ||
+        value.capabilities.length === 0 ||
+        !value.capabilities.every(isProviderCapability) ||
+        !isProviderTraits(value.traits) ||
+        !Array.isArray(value.required_secret_status_ids) ||
+        !isSortedUnique(value.required_secret_status_ids) ||
+        !value.required_secret_status_ids.every(isProviderSecretId) ||
+        !Array.isArray(value.secret_statuses) ||
+        value.secret_statuses.length !== value.required_secret_status_ids.length ||
+        typeof value.configured !== "boolean" ||
+        typeof value.available !== "boolean" ||
+        !hasExactKeys(value.health, ["state", "reason"]) ||
+        !["healthy", "degraded", "unavailable"].includes(value.health.state) ||
+        !isProviderReason(value.health.reason, value.health.state === "healthy")) {
+      return false;
+    }
+    for (let index = 0; index < value.secret_statuses.length; index += 1) {
+      const status = value.secret_statuses[index];
+      if (!hasExactKeys(status, ["id", "configured"]) ||
+          status.id !== value.required_secret_status_ids[index] ||
+          status.configured !== null && typeof status.configured !== "boolean") {
+        return false;
+      }
+    }
+    if (value.health.state === "healthy" && value.health.reason !== null) return false;
+    if (value.health.state !== "healthy" && value.health.reason === null) return false;
+    if (!value.configured && value.health.state !== "unavailable") return false;
+    const available = value.configured &&
+      ["healthy", "degraded"].includes(value.health.state);
+    if (value.available !== available) return false;
+    if (value.secret_statuses.some((status) => status.configured !== true) &&
+        value.configured) return false;
+    return true;
+  }
+
+  function isProviderSelectionRow(value, providers) {
+    if (!hasExactKeys(value, [
+      "capability", "user_provider_id", "default_provider_id",
+      "selected_provider_id", "source", "command_available", "reason",
+    ]) || !isProviderCapability(value.capability) ||
+        !isProviderId(value.user_provider_id, true) ||
+        !isProviderId(value.default_provider_id, true) ||
+        !isProviderId(value.selected_provider_id, true) ||
+        !["user", "default", "none"].includes(value.source) ||
+        typeof value.command_available !== "boolean" ||
+        !isProviderReason(value.reason, value.command_available)) return false;
+    const selected = value.user_provider_id || value.default_provider_id;
+    const source = value.user_provider_id ? "user" :
+      value.default_provider_id ? "default" : "none";
+    if (value.selected_provider_id !== selected || value.source !== source) return false;
+    const provider = providers.get(selected);
+    const token = providerCapabilityToken(value.capability);
+    const compatible = !!provider && provider.capabilities.some((item) =>
+      providerCapabilityToken(item) === token);
+    let expectedReason = null;
+    if (!selected) expectedReason = "no-selection";
+    else if (!provider) expectedReason = "provider-not-installed";
+    else if (!compatible) expectedReason = "provider-incompatible";
+    else if (!provider.available) {
+      expectedReason = provider.health.reason ?
+        provider.health.reason.code : "provider-unavailable";
+    }
+    const expectedAvailable = expectedReason === null;
+    return value.command_available === expectedAvailable &&
+      (expectedAvailable ? value.reason === null :
+        value.reason !== null && value.reason.code === expectedReason);
+  }
+
+  function isProviderDiscovery(value) {
+    if (!hasExactKeys(value, [
+      "ok", "schema", "providers", "selections", "available_commands",
+    ]) || value.ok !== true || value.schema !== "librarytool.providers/1" ||
+        !Array.isArray(value.providers) ||
+        !isSortedUnique(value.providers, (provider) =>
+          isProviderRow(provider) ? provider.id : "") ||
+        !value.providers.every(isProviderRow)) return false;
+    const providers = new Map(value.providers.map((provider) => [provider.id, provider]));
+    if (!Array.isArray(value.selections) ||
+        !isSortedUnique(value.selections, (selection) =>
+          isObject(selection) ? providerCapabilityToken(selection.capability) : "") ||
+        !value.selections.every((selection) =>
+          isProviderSelectionRow(selection, providers))) return false;
+    const declaredCapabilities = new Set();
+    for (const provider of value.providers) {
+      for (const capability of provider.capabilities) {
+        declaredCapabilities.add(providerCapabilityToken(capability));
+      }
+    }
+    const selectedCapabilities = value.selections.map((selection) =>
+      providerCapabilityToken(selection.capability));
+    if (declaredCapabilities.size > selectedCapabilities.length ||
+        ![...declaredCapabilities].every((token) =>
+          selectedCapabilities.includes(token))) return false;
+    if (!Array.isArray(value.available_commands) ||
+        !isSortedUnique(value.available_commands, providerCapabilityToken) ||
+        !value.available_commands.every(isProviderCapability)) return false;
+    const expected = value.selections.filter((selection) =>
+      selection.command_available).map((selection) =>
+      providerCapabilityToken(selection.capability));
+    const actual = value.available_commands.map(providerCapabilityToken);
+    return expected.length === actual.length &&
+      expected.every((token, index) => token === actual[index]);
+  }
+
   function containsCommandFingerprint(value, seen = new Set()) {
     if (!value || typeof value !== "object") return false;
     if (seen.has(value)) return true;
@@ -462,6 +671,9 @@
         restore: (args) => this._itemTombstoneRestore(args),
       });
       this.capabilities = (args) => this._capabilities(args);
+      this.providers = Object.freeze({
+        discover: (args) => this._providersDiscover(args),
+      });
 
       const pages = Object.freeze({
         get: (args) => this._replicaPageGet(args),
@@ -594,6 +806,21 @@
 
     _capabilities({ signal } = {}) {
       return this._requestJson("GET", "/v1/capabilities", { signal });
+    }
+
+    _providersDiscover({ signal } = {}) {
+      const path = "/v1/providers";
+      return this._requestJson("GET", path, {
+        signal, cache: "no-cache", includeStatus: true,
+      }).then(({ body, status }) => {
+        if (status !== 200 || !isProviderDiscovery(body) ||
+            containsCommandFingerprint(body)) {
+          this._invalidResponse(
+            "Engine returned invalid provider discovery",
+            "GET", path, body, undefined, status);
+        }
+        return body;
+      });
     }
 
     _itemsList({ includeBuildCompatibility = false, signal } = {}) {

@@ -31,6 +31,7 @@ from librarytool.composition.filesystem import (
     FilesystemEngineResources,
     InterchangeBindings,
     ItemLifecycleBindings,
+    ProviderDiscoveryBindings,
     ReplicaBindings,
     RepresentationBindings,
     SecretStoreBindings,
@@ -66,6 +67,16 @@ from librarytool.engine.ports import (
     ReplicaPolicyPort,
     TextLayerRepositoryPort,
 )
+from librarytool.engine.providers import (
+    ProviderDescriptor,
+    ProviderHealthSnapshot,
+    ProviderHealthState,
+    ProviderRegistry,
+    ProviderSelection,
+    ProviderSelectionPolicy,
+    ProviderTraits,
+    StaticProviderHealthProbe,
+)
 from librarytool.engine.translations import TranslationProvenanceService
 from librarytool.engine.runtime import (
     CANVAS_PREPARATION_SERVICE,
@@ -76,6 +87,7 @@ from librarytool.engine.runtime import (
     ITEM_QUERY_SERVICE,
     JOB_SERVICE,
     LIB_OPEN_SERVICE,
+    PROVIDER_DISCOVERY_SERVICE,
     REPLICA_SERVICE,
     REPRESENTATION_COMMAND_SERVICE,
     SECRET_STORE_SERVICE,
@@ -630,6 +642,7 @@ def _composition(
     canvases: CanvasBindings | None = None,
     text_layer_aggregate: TextLayerAggregateBindings | None = None,
     secrets: SecretStoreBindings | None = None,
+    providers: ProviderDiscoveryBindings | None = None,
     workspace_lock_context_for=_workspace_lock,
 ):
     write_set = _TrackingWriteSet(tmp_path / "workspace")
@@ -722,6 +735,7 @@ def _composition(
         canvases=canvases,
         text_layer_aggregate=text_layer_aggregate,
         secrets=secrets,
+        providers=providers,
     )
     return {
         "engine": engine,
@@ -734,6 +748,52 @@ def _composition(
         "text_repository": text_repository,
         "planner": planner,
     }
+
+
+def test_provider_discovery_composes_only_from_explicit_bindings(tmp_path):
+    without = _composition(tmp_path / "without")["engine"]
+    assert without.get_service(PROVIDER_DISCOVERY_SERVICE) is None
+    assert "library.providers.discover" not in {
+        row["id"] for row in without.discovery_document()["capabilities"]
+    }
+
+    capability = CapabilityRef("replica.layout.generate")
+    provider = ProviderDescriptor(
+        "provider.local",
+        "1.0.0",
+        capabilities=(capability,),
+        traits=ProviderTraits(
+            execution="local",
+            network="offline",
+            modes=("batch",),
+            input_media=("document",),
+            output_media=("layout",),
+        ),
+    )
+    bindings = ProviderDiscoveryBindings(
+        ProviderRegistry((provider,)),
+        ProviderSelectionPolicy((ProviderSelection(
+            capability,
+            default_provider_id=provider.id,
+        ),)),
+        health_probes={
+            provider.id: StaticProviderHealthProbe(ProviderHealthSnapshot(
+                True,
+                ProviderHealthState.HEALTHY,
+            )),
+        },
+    )
+    with_provider = _composition(
+        tmp_path / "with-provider",
+        providers=bindings,
+    )["engine"]
+
+    assert with_provider.require_service(
+        PROVIDER_DISCOVERY_SERVICE
+    ) is bindings.service
+    assert bindings.service.discovery_document()["available_commands"] == [
+        capability.as_dict()
+    ]
 
 
 def test_composer_wires_the_complete_graph_without_recovery(tmp_path):

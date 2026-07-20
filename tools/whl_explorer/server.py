@@ -90,6 +90,7 @@ from librarytool.adapters.filesystem.whl_catalogue_codec import (  # noqa: E402
     WhlCatalogueItemCodec,
 )
 from librarytool_http import (  # noqa: E402
+    create_provider_discovery_blueprint,
     create_text_layer_blueprint,
 )
 from librarytool.composition.filesystem import (  # noqa: E402
@@ -216,6 +217,9 @@ def _flask_app():
 
 
 app = _flask_app()
+app.register_blueprint(
+    create_provider_discovery_blueprint(lambda: _library_engine())
+)
 app.register_blueprint(create_text_layer_blueprint(lambda: _library_engine()))
 # Jinja compiles index.html once and caches it when debug is off, while static/
 # is read from disk on every request. Editing the template therefore served a NEW

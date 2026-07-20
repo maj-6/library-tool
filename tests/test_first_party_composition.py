@@ -114,6 +114,7 @@ def test_first_party_manifests_preserve_the_production_product_contract():
         "library.canvases": "1.0.0",
         "library.text-layers": "1.0.0",
         "library.secrets": "1.0.0",
+        "library.providers": "1.0.0",
         "replica.core": "1.0.0",
         "translation.core": "2.0.0",
         "replica.lib": "2.0.0",
@@ -171,6 +172,10 @@ def test_first_party_manifests_preserve_the_production_product_contract():
         ("library.secrets.mutate", 1),
     }
     assert modules["library.secrets"].requires == ()
+    assert _capabilities(modules["library.providers"].provides) == {
+        ("library.providers.discover", 1),
+    }
+    assert modules["library.providers"].requires == ()
     assert _capabilities(modules["replica.core"].provides) == {
         ("replica.regions", 1),
         ("replica.proposals", 1),

@@ -24,6 +24,7 @@ from ..engine.runtime import (
     ITEM_QUERY_SERVICE,
     JOB_SERVICE,
     LIB_OPEN_SERVICE,
+    PROVIDER_DISCOVERY_SERVICE,
     REPLICA_SERVICE,
     REPRESENTATION_COMMAND_SERVICE,
     SECRET_STORE_SERVICE,
@@ -129,6 +130,11 @@ FIRST_PARTY_MODULE_MANIFESTS = (
             CapabilityRef("library.secrets.status"),
             CapabilityRef("library.secrets.mutate"),
         ),
+    ),
+    ModuleManifest(
+        "library.providers",
+        "1.0.0",
+        provides=(CapabilityRef("library.providers.discover"),),
     ),
     ModuleManifest(
         "replica.core",
@@ -349,6 +355,20 @@ def first_party_module_contributions(
                         SECRET_STORE_SERVICE,
                         graph.secret_store,
                         modules["library.secrets"].provides,
+                    ),
+                ),
+            )
+        )
+
+    if graph.provider_discovery is not None:
+        contributions.append(
+            ModuleContribution(
+                modules["library.providers"],
+                bindings=(
+                    ServiceBinding(
+                        PROVIDER_DISCOVERY_SERVICE,
+                        graph.provider_discovery,
+                        modules["library.providers"].provides,
                     ),
                 ),
             )

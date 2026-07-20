@@ -118,7 +118,18 @@ Per-component detail lives in each part's own README (map at the end).
   receipt publish through one recoverable transaction. The desktop local-path
   route delegates to it, and portable clients use `/api/v1/lib-opens`.
   Provider-backed OCR/region and translation generation are not yet fully
-  migrated to these command boundaries. Item delete/restore now has a neutral
+  migrated to these command boundaries. A separate immutable provider registry
+  can now describe future layout, OCR, translation, image, embedding, and
+  answer generators without importing a UI or provider runtime. Its public
+  projection contains stable IDs/versions, exact capability refs, portable
+  execution/media/language/limit traits, secret-presence status IDs, cached
+  sanitized health, and explicit user/default selection. Command availability
+  fails closed and never silently replaces an unhealthy user selection with a
+  default. The optional `library.providers` module and versioned
+  `/api/v1/providers` resource are composed only when a host injects that
+  complete registry and its side-effect-free cached probes. Production injects
+  none, so legacy generation is neither registered nor advertised as an engine
+  capability. Item delete/restore now has a neutral
   dual-CAS, tombstone, receipt, replay, and coherent preflight contract plus a
   recoverable no-copy managed-tree move primitive. Its filesystem repository
   persists private raw-record envelopes, moves owned trees before publishing

@@ -484,6 +484,30 @@ the inspection half from a caller-owned exact-asset authority. Production still
 supplies no bundle until that authority, hostile-parser isolation, transport,
 and reconciliation policies are installed.
 
+The same composition root now accepts an optional complete
+`ProviderDiscoveryBindings` bundle. Its immutable registry describes stable
+provider IDs and semantic versions, exact capability contract revisions,
+local/remote and offline/network execution, batch/streaming support, media and
+language ranges, declared limits, and required secret-*status* IDs using the
+secret store's canonical colon-delimited namespace grammar. It carries
+no SDK objects, provider configuration, paths, or credential values. Hosts
+inject cached, side-effect-free health and secret-presence snapshots; neither
+composition nor discovery contacts a provider. Selection is explicit: a user
+choice takes precedence over a declared default, and an unhealthy user choice
+never silently falls back. Missing selection, provider, capability,
+configuration, health, or secret status fails the corresponding command
+closed with one fixed public reason.
+
+When that bundle is present, the optional `library.providers` module exposes
+read-only `library.providers.discover` and `/api/v1/providers`; the strict
+browser client rejects unknown fields, inconsistent availability, private
+command fingerprints, secret values, and noncanonical failure text. Production
+does not yet bind the bundle. Consequently the route reports the optional
+service as unavailable, capability discovery advertises no provider-discovery
+module, and no legacy Replica, OCR, translation, image, embedding, or answer
+generator is represented as a production engine command. This is a truthful
+extension seam, not an adapter over the old UI-owned generation paths.
+
 The transport-neutral lifecycle host above it is now implemented. Importing or
 constructing its configuration performs no I/O. Opening a session creates the
 workspace resources, rejects concurrent conforming hosts on the same root,
@@ -586,10 +610,14 @@ With the lifecycle seam established, migrate these data boundaries in order:
    files, write-through replacement, exact post-publication verification,
    random status revisions, and authenticated replay. Add production
    binding plus status/CAS transport and migrate the plaintext compatibility
-   endpoint, then add provider descriptors, traits, configuration/health
-   probes, and selection policy. Only after that migrate translation
-   generation and remaining OCR/AI jobs, advertising each optional command
-   when its capability is truly available rather than when a UI happens to
+   endpoint. The provider descriptor/trait registry, configuration and cached
+   health projection, explicit selection policy, optional composition module,
+   versioned read-only resource, and strict `EngineClient` boundary are now in
+   place, but deliberately unbound in production. Next, implement individual
+   provider adapters and privately leased credentials, then migrate translation
+   generation and remaining OCR/AI jobs one capability at a time. Advertise
+   each optional command only when its selected provider is installed,
+   configured, compatible, and healthy rather than when a UI happens to
    contain a button.
 
 The provider/secret slice remains a parallel security priority. The current
