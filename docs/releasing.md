@@ -9,9 +9,11 @@ redeploys for a release.
 
 The project is pre-1.0: it versions on a `0.x` line while it is still taking
 shape (`0.x` signals that anything may still change). The two apps version
-independently — the desktop from `desktop/package.json`, Book Capture from its
-gradle `versionName` — and the `v*` tag names the GitHub Release after the
-desktop version. Bump the patch for fixes and the minor (`0.4` → `0.5`) for
+independently — the desktop from `desktop/package.json`, Library Tool Capture from its
+Gradle `versionName`. A `v*` tag publishes the desktop version (and normally
+the current Android build alongside it); an `android-v*` tag publishes only
+Library Tool Capture and must match its Gradle version. Bump the patch for fixes and
+the minor (`0.4` → `0.5`) for
 features; save `1.0.0` for the first release meant to be stable. Do not renumber
 back into `3.x` — those tags are kept only as archived history from before the
 reset. One consequence of the reset: a desktop release numbered below an
@@ -59,10 +61,12 @@ Two ways a row gets there:
 ## The pipeline (the normal way)
 
 `.github/workflows/release.yml` runs on the public repo when a `v*` tag is
-pushed:
+pushed. An `android-v*` tag follows the same signed Android path but skips the
+desktop job, which lets the two applications ship on independent schedules:
 
-1. **android** builds `android/BookCapture` (`assembleRelease`) and names the APK
-   after its gradle `versionName`. A tag push **requires** the release keystore
+1. **android** runs its unit tests and release lint, builds
+   `android/BookCapture` (`assembleRelease`), and names the APK after its
+   gradle `versionName`. A tag push **requires** the release keystore
    secret: without it the android job fails before the APK is uploaded, because a
    debug-signed build can't update an existing install. The desktop release is
    independent and still ships. The job then verifies the APK's signer (via
@@ -93,12 +97,24 @@ pushed:
 So cutting a release is:
 
 ```
+# with SUPABASE_URL / SUPABASE_KEY set to the production service-role project:
+python tools/cloud_setup.py check   # must report "Everything is in place"
+
 # draft docs/releases/v0.4.0.md before tagging
 # bump versions first if warranted:
 #   android/BookCapture/app/build.gradle.kts   versionCode + versionName
 #   desktop/package.json                       version
 git tag v0.4.0
 git push <public> main --follow-tags           # or push the tag with the next mirror publish
+```
+
+For an Android-only prerelease, keep the desktop version unchanged, update the
+Android `versionCode` / `versionName`, write
+`docs/releases/android-v<android-version>.md`, then push the matching tag:
+
+```
+git tag android-v0.5.1-alpha.7
+git push <public> android-v0.5.1-alpha.7
 ```
 
 A `workflow_dispatch` run of the same workflow is a dry run: both apps build
@@ -108,9 +124,9 @@ and the artifacts are inspectable, nothing is published.
 
 | name | kind | purpose |
 |---|---|---|
-| `SUPABASE_URL` | variable | already set for the pages workflow |
-| `SUPABASE_ANON_KEY` | variable | baked into the APK at build time so first run needs no typing; blank falls back to the in-app Settings project |
-| `SUPABASE_SERVICE_ROLE_KEY` | secret | writes to `releases` (anon is read-only by RLS). Without it the GitHub Release still happens; the register step warns and skips. |
+| `SUPABASE_URL` | variable | baked into the APK; **required for tagged Android builds** because the app has no in-app project fallback |
+| `SUPABASE_ANON_KEY` | variable | public anon key baked into the APK; **required for tagged Android builds** |
+| `SUPABASE_SERVICE_ROLE_KEY` | secret | writes to `releases` (anon is read-only by RLS). Without it the GitHub Release still publishes; register the row through a trusted administrative path. |
 | `ANDROID_KEYSTORE_B64` | secret | **required to publish Android on a tag.** base64 of the signing keystore. Local copy: `~/.whl-release/bookcapture.jks(.b64)`, password in `bookcapture-keystore-info.txt` next to it. |
 | `ANDROID_KEYSTORE_PASSWORD` | secret | its password |
 | `ANDROID_KEY_ALIAS` | secret | `bookcapture` |

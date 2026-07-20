@@ -12,5 +12,8 @@ class VoiceCommandPolicyTest {
         assertEquals("photo", VoiceController.commandFromPartial("photo"))
         assertNull(VoiceController.commandFromPartial("done"))
         assertNull(VoiceController.commandFromPartial("cancel"))
+        assertNull(VoiceController.commandFromPartial("restart"))
+        assertNull(VoiceController.commandFromPartial("undo"))
+        assertNull(VoiceController.commandFromPartial("notes"))
     }
 }

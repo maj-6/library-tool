@@ -4,13 +4,12 @@ import android.Manifest
 import android.animation.LayoutTransition
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.BitmapFactory
+import android.content.res.ColorStateList
 import android.graphics.RenderEffect
 import android.graphics.RuntimeShader
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
-import android.transition.TransitionManager
 import android.util.Log
 import android.util.Size
 import android.view.LayoutInflater
@@ -39,12 +38,15 @@ import androidx.lifecycle.lifecycleScope
 import androidx.work.WorkManager
 import com.google.android.material.snackbar.Snackbar
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import org.whl.bookcapture.databinding.ActivityMainBinding
+import java.io.File
+import java.util.UUID
 
 // A 3x3 unsharp/Laplacian kernel: center*3 - 0.5*(4 neighbours). Flat regions
 // keep their value (3 - 0.5*4 = 1), edges get boosted. Coords are in pixels.
@@ -75,10 +77,9 @@ private val TORCH_DIAGNOSTICS = Regex("torch requested=[^;]+")
  *   say "cancel" — void the entry            (✕)
  *
  * The camera preview fills the screen under a thin CAD-style chrome: the
- * entry state ("OPEN (3)") and a recent-scans dropdown live in the top bar,
- * captured pages run as a thumbnail strip above the controls. Photos are
- * OCR'd in the background as they land, so a book often has its title in the
- * list before its folder finishes uploading.
+ * entry state ("OPEN (3)") lives in the top bar, captured pages run as a
+ * thumbnail strip, and the last submitted book remains above the controls
+ * until the next book is sealed for processing.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -92,13 +93,24 @@ class MainActivity : AppCompatActivity() {
     private var cameraBindingInFlight: CameraBindingSnapshot? = null
     private var initialized = false
     private var voicePermissionRequestedForEnablement = false
-    private var discardDialog: AlertDialog? = null
+    private var extraFieldsDialog: AlertDialog? = null
+    private var lastBookPreviewJob: Job? = null
     private val captureQueue = ShallowCaptureQueue()
     private val acceptedShots = mutableMapOf<Long, AcceptedShot>()
-    private var pendingCommand: String? = null   // "done"/"cancel" said mid-shot
+    private var pendingCommand: String? = null   // terminal voice command accepted mid-shot
+    private var pendingUndoTargetPage: Int? = null
     private var deferredCaptureSubmission = false
     private var finishAfterAcceptedCaptures = false
     private var waitingForPriorCaptureWrites = false
+    private var notePermissionRequested = false
+    private var voiceNoteDraft: StructuredNote? = null
+    private var voiceNoteId: String? = null
+    private var voiceNoteStartedAt = 0L
+    private var voiceNoteFinalizing = false
+    private var voiceNoteDiscardPending = false
+    private var voiceNoteTranscriber: MistralRealtimeTranscriber? = null
+    private var voiceNoteGeneration = 0L
+    private var captureMutationInFlight = false
 
     private data class AcceptedShot(
         var reservation: CaptureSession.PhotoReservation,
@@ -116,6 +128,13 @@ class MainActivity : AppCompatActivity() {
         val camera: Camera,
         val capture: ImageCapture,
     )
+
+    private sealed interface CaptureUndoOutcome {
+        data object NoteDiscarded : CaptureUndoOutcome
+        data class Photo(val result: LastCommittedPhotoUndoResult) : CaptureUndoOutcome
+        data object Empty : CaptureUndoOutcome
+        data object Failed : CaptureUndoOutcome
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -135,6 +154,7 @@ class MainActivity : AppCompatActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         session = CaptureSession(this)
         pendingCommand = Prefs.pendingCaptureCommand(this, session.entryId)
+        pendingUndoTargetPage = Prefs.pendingCaptureTargetPage(this, session.entryId)
         cues = AudioCues(this)
         binding.thumbs.layoutTransition = LayoutTransition()   // pages land, not pop
 
@@ -142,20 +162,18 @@ class MainActivity : AppCompatActivity() {
         binding.btnPhoto.setOnClickListener { command("photo") }
         binding.btnDone.setOnClickListener { command("done") }
         binding.btnCancel.setOnClickListener { command("cancel") }
+        binding.btnNote.setOnClickListener {
+            if (voiceNoteDraft == null) requestStartVoiceNote()
+            else finishVoiceNote(save = !voiceNoteDiscardPending)
+        }
         binding.btnSettings.setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
         binding.configWarning.setOnClickListener {
             startActivity(Intent(this, LoginActivity::class.java))
         }
-        binding.queueChip.setOnClickListener {
-            TransitionManager.beginDelayedTransition(binding.root)
-            binding.recentPanel.visibility =
-                if (binding.recentPanel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
-            if (binding.recentPanel.visibility == View.VISIBLE) refreshRecent()
-        }
-
-        // background work landing (OCR done, upload done) refreshes the list
+        // Background work landing (OCR done, upload done) refreshes the
+        // persistent previous-book preview in place.
         for (name in listOf(
             ProcessWorker.UNIQUE_WORK_NAME,
             ProcessWorker.BACKLOG_WORK_NAME,
@@ -192,16 +210,28 @@ class MainActivity : AppCompatActivity() {
      *  entry but the thumbnail strip (view state) is gone — repaint it from the
      *  photos on disk so "OPEN (3)" still shows three pages. */
     private fun restoreThumbnailsIfNeeded() {
-        val id = session.entryId ?: return
         session.refreshPhotoCount()
         if (binding.thumbs.childCount >= session.photoCount) return
+        renderCurrentThumbnails()
+    }
+
+    private fun renderCurrentThumbnails() {
+        val id = session.entryId
         binding.thumbs.removeAllViews()
+        if (id == null) return
+        session.refreshPhotoCount()
         session.entryDir(id).listFiles { f -> f.isFile && f.name.matches(PHOTO_NAME) }
             ?.sortedBy { photoNumber(it.name) }
             ?.forEach { addThumbnail(it.absolutePath) }
     }
 
     override fun onPause() {
+        if (voiceNoteDraft != null) {
+            finishVoiceNote(
+                save = true,
+                successMessage = getString(R.string.capture_note_interrupted),
+            )
+        }
         super.onPause()
         voice?.setPaused(true)
     }
@@ -218,16 +248,46 @@ class MainActivity : AppCompatActivity() {
         // Never delete an output still owned by a CameraX callback. Back is
         // deferred until the queue drains; Activity recreation is covered by
         // CaptureSession's process-local temporary-file ownership registry.
+        abortUnsubmittedDeferredCapture()
         if (!captureQueue.busy) discardAllCaptureRequests()
-        discardDialog?.dismiss()
-        discardDialog = null
+        extraFieldsDialog?.dismiss()
+        extraFieldsDialog = null
         boundCamera = null
         boundCameraConfig = null
         cameraBindingInFlight = null
         if (!captureQueue.busy) deferredCaptureSubmission = false
+        // Home, Back, and configuration changes can destroy this Activity
+        // before Mistral releases its target-delay buffer. Keep only that
+        // bounded (two-second) drain alive; its callback persists the note but
+        // skips dead-Activity UI work. Every non-draining transcriber is still
+        // stopped immediately below.
+        if (!voiceNoteFinalizing || voiceNoteTranscriber == null) {
+            voiceNoteGeneration += 1
+            voiceNoteTranscriber?.stop()
+            voiceNoteTranscriber = null
+            voiceNoteDraft = null
+            voiceNoteId = null
+            voiceNoteFinalizing = false
+            voiceNoteDiscardPending = false
+        }
         super.onDestroy()
         voice?.stop()
         cues.shutdown()
+    }
+
+    /** A queued ticket promoted while the Activity is stopped may deliberately
+     * remain unsubmitted. Unlike a CameraX-owned output, that reservation is
+     * safe to abort on recreation; leaving it in the process registry would
+     * make the replacement Activity wait forever for a callback that cannot
+     * occur. The durable terminal command is preserved and reconciles next. */
+    private fun abortUnsubmittedDeferredCapture() {
+        if (!deferredCaptureSubmission) return
+        captureQueue.cancelAll().forEach { ticket ->
+            acceptedShots.remove(ticket.id)?.let { session.abortPhoto(it.reservation) }
+        }
+        acceptedShots.values.forEach { session.abortPhoto(it.reservation) }
+        acceptedShots.clear()
+        deferredCaptureSubmission = false
     }
 
     override fun onRequestPermissionsResult(
@@ -239,9 +299,16 @@ class MainActivity : AppCompatActivity() {
                 else setStatus(getString(R.string.need_permissions))
             }
             VOICE_PERMISSION_REQUEST -> {
+                val requestedForNote = notePermissionRequested
+                val requestedForVoice = voicePermissionRequestedForEnablement
+                notePermissionRequested = false
                 voicePermissionRequestedForEnablement = false
-                if (voicePermissionGranted() && Prefs.voiceEnabled(this)) startVoice()
-                else {
+                if (voicePermissionGranted()) {
+                    if (requestedForVoice && Prefs.voiceEnabled(this)) startVoice()
+                    if (requestedForNote) startVoiceNote()
+                } else if (requestedForNote) {
+                    setStatus(getString(R.string.capture_note_permission_denied))
+                } else if (requestedForVoice) {
                     Prefs.setVoiceEnabled(this, false)
                     setStatus(getString(R.string.voice_permission_denied))
                 }
@@ -302,11 +369,7 @@ class MainActivity : AppCompatActivity() {
         if (!voicePermissionGranted()) {
             if (!voicePermissionRequestedForEnablement) {
                 voicePermissionRequestedForEnablement = true
-                ActivityCompat.requestPermissions(
-                    this,
-                    arrayOf(Manifest.permission.RECORD_AUDIO),
-                    VOICE_PERMISSION_REQUEST,
-                )
+                if (!notePermissionRequested) requestMicrophonePermission()
             }
             return
         }
@@ -335,6 +398,344 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+    }
+
+    private fun requestStartVoiceNote() {
+        if (voiceNoteDraft != null) return
+        when {
+            !session.active -> {
+                cues.error("no entry open")
+                setStatus(getString(R.string.capture_note_requires_entry))
+            }
+            captureQueue.busy || captureMutationInFlight || pendingCommand != null -> {
+                cues.error("capture is busy")
+                setStatus(getString(R.string.capture_note_wait_for_capture))
+            }
+            Prefs.mistralKey(this).isBlank() -> {
+                cues.error("Mistral key required")
+                setStatus(getString(R.string.capture_note_requires_key))
+            }
+            !voicePermissionGranted() -> {
+                notePermissionRequested = true
+                if (!voicePermissionRequestedForEnablement) requestMicrophonePermission()
+            }
+            else -> startVoiceNote()
+        }
+        updateUi()
+    }
+
+    /** Mistral and Vosk cannot own Android's microphone at the same time. The
+     * offline command listener is paused for the duration of the cloud note;
+     * trailing note commands are recognized from Mistral's settled deltas. */
+    private fun startVoiceNote() {
+        if (voiceNoteDraft != null || !session.active || !voicePermissionGranted() ||
+            captureQueue.busy || captureMutationInFlight || pendingCommand != null
+        ) return
+        val apiKey = Prefs.mistralKey(this)
+        if (apiKey.isBlank()) {
+            setStatus(getString(R.string.capture_note_requires_key))
+            return
+        }
+
+        voice?.setPaused(true)
+        val generation = ++voiceNoteGeneration
+        voiceNoteId = UUID.randomUUID().toString()
+        voiceNoteStartedAt = System.currentTimeMillis()
+        voiceNoteFinalizing = false
+        voiceNoteDiscardPending = false
+        voiceNoteDraft = StructuredNote.inProgress()
+        binding.noteStatus.setText(R.string.capture_note_connecting)
+        renderVoiceNote()
+
+        val transcriber = MistralRealtimeTranscriber(
+            context = applicationContext,
+            apiKey = apiKey,
+            listener = object : MistralRealtimeTranscriber.Listener {
+                override fun onConnected() = runOnUiThread {
+                    if (generation != voiceNoteGeneration || voiceNoteDraft == null ||
+                        voiceNoteFinalizing
+                    ) return@runOnUiThread
+                    binding.noteStatus.setText(R.string.capture_note_listening)
+                }
+
+                override fun onTranscript(text: String, final: Boolean) = runOnUiThread {
+                    if (generation != voiceNoteGeneration || voiceNoteDraft == null) return@runOnUiThread
+                    handleVoiceNoteTranscript(text)
+                }
+
+                override fun onError(message: String) = runOnUiThread {
+                    if (generation != voiceNoteGeneration || voiceNoteDraft == null) return@runOnUiThread
+                    val hasTranscript = voiceNoteDraft?.transcript?.isNotBlank() == true
+                    finishVoiceNote(
+                        save = hasTranscript,
+                        successMessage = message,
+                        drain = false,
+                    )
+                }
+            },
+        )
+        voiceNoteTranscriber = transcriber
+        if (!transcriber.start()) {
+            voiceNoteGeneration += 1
+            voiceNoteTranscriber = null
+            voiceNoteDraft = null
+            voiceNoteId = null
+            voiceNoteStartedAt = 0L
+            voiceNoteFinalizing = false
+            voiceNoteDiscardPending = false
+            renderVoiceNote()
+            resumeOfflineVoiceAfterNote()
+            setStatus(getString(R.string.capture_note_start_failed))
+        }
+        updateUi()
+    }
+
+    private fun handleVoiceNoteTranscript(transcript: String) {
+        val draft = voiceNoteDraft ?: return
+        if (voiceNoteFinalizing) {
+            voiceNoteDraft = draft.updateTranscript(transcript)
+            checkpointVoiceNote(checkNotNull(voiceNoteDraft))
+            renderVoiceNote()
+            return
+        }
+        val policy = StateAwareVoiceCommandPolicy.evaluate(
+            transcript = transcript,
+            state = VoiceCommandState.NOTE_ACTIVE,
+            // Realtime text deltas are append-only settled text. Treating them
+            // as final lets a trailing "end notes" stop the same stream that is
+            // currently using the microphone.
+            stability = VoiceRecognitionStability.FINAL,
+        )
+        when (policy?.command) {
+            PolicyVoiceCommand.END_NOTES -> finishVoiceNote(
+                save = true,
+                transcriptOverride = policy.transcriptBeforeCommand,
+                drain = false,
+            )
+            PolicyVoiceCommand.UNDO -> finishVoiceNote(
+                save = false,
+                transcriptOverride = policy.transcriptBeforeCommand,
+                successMessage = getString(R.string.capture_note_discarded),
+            )
+            PolicyVoiceCommand.RESTART -> {
+                finishVoiceNote(
+                    save = false,
+                    transcriptOverride = policy.transcriptBeforeCommand,
+                    successMessage = null,
+                )
+                command("restart")
+            }
+            else -> {
+                voiceNoteDraft = draft.updateTranscript(transcript)
+                checkpointVoiceNote(checkNotNull(voiceNoteDraft))
+                renderVoiceNote()
+            }
+        }
+    }
+
+    /** Stop microphone ownership before publishing the note. Button and
+     * lifecycle stops drain Mistral's target-delay buffer; settled voice
+     * commands and errors can finalize their supplied transcript directly. */
+    private fun finishVoiceNote(
+        save: Boolean,
+        transcriptOverride: String? = null,
+        successMessage: String? = null,
+        drain: Boolean = true,
+    ) {
+        val draft = voiceNoteDraft ?: return
+        val transcriber = voiceNoteTranscriber
+        // Once a user has requested discard, no lifecycle or button path may
+        // reinterpret that draft as accepted metadata. A failed removal stays
+        // in retry-discard mode until its exact checkpoint is gone.
+        val shouldSave = save && !voiceNoteDiscardPending
+        if (shouldSave && drain && transcriptOverride == null && transcriber != null) {
+            if (voiceNoteFinalizing) return
+            voiceNoteFinalizing = true
+            checkpointVoiceNote(draft)
+            binding.noteStatus.setText(R.string.capture_note_finalizing)
+            updateUi()
+            val generation = voiceNoteGeneration
+            transcriber.finish { finalTranscript ->
+                runOnUiThread {
+                    if (generation != voiceNoteGeneration || voiceNoteDraft == null) {
+                        return@runOnUiThread
+                    }
+                    val refined = finalTranscript.takeIf { it.isNotBlank() }
+                        ?: voiceNoteDraft?.transcript.orEmpty()
+                    voiceNoteDraft = voiceNoteDraft?.updateTranscript(refined)
+                    completeVoiceNoteNow(save = true, successMessage = successMessage)
+                }
+            }
+            return
+        }
+        completeVoiceNoteNow(shouldSave, transcriptOverride, successMessage)
+    }
+
+    private fun checkpointVoiceNote(note: StructuredNote) {
+        if (note.transcript.isBlank() || note.isCompleted) return
+        val noteId = voiceNoteId
+        val entryId = session.entryId
+        if (noteId == null || entryId == null) return
+        runCatching {
+            CaptureNotes.save(
+                dir = session.entryDir(entryId),
+                noteId = noteId,
+                note = note,
+                startedAtMs = voiceNoteStartedAt,
+                updatedAtMs = System.currentTimeMillis(),
+                provider = "mistral",
+                model = MISTRAL_REALTIME_TRANSCRIPTION_MODEL,
+            )
+        }.onFailure { error ->
+            Log.w(CAMERA_LOG_TAG, "Could not checkpoint voice note", error)
+        }
+    }
+
+    /** Complete exactly once. Advancing the generation before closing means a
+     * WebSocket callback already queued on the main looper cannot rewrite an
+     * accepted snapshot. A failed disk write keeps the draft visible for retry. */
+    private fun completeVoiceNoteNow(
+        save: Boolean,
+        transcriptOverride: String? = null,
+        successMessage: String? = null,
+    ) {
+        val draft = voiceNoteDraft ?: return
+        val noteId = voiceNoteId
+        val entryId = session.entryId
+        voiceNoteGeneration += 1
+        voiceNoteTranscriber?.stop()
+        voiceNoteTranscriber = null
+        voiceNoteFinalizing = false
+
+        val completed = draft.complete(transcriptOverride ?: draft.transcript)
+        var saved = false
+        var saveFailed = false
+        var discardFailed = false
+        if (save && completed.transcript.isNotBlank()) {
+            if (noteId == null || entryId == null) {
+                saveFailed = true
+            } else {
+                saved = runCatching {
+                    CaptureNotes.save(
+                        dir = session.entryDir(entryId),
+                        noteId = noteId,
+                        note = completed,
+                        startedAtMs = voiceNoteStartedAt,
+                        updatedAtMs = System.currentTimeMillis(),
+                        provider = "mistral",
+                        model = MISTRAL_REALTIME_TRANSCRIPTION_MODEL,
+                    )
+                }.isSuccess
+                saveFailed = !saved
+            }
+        }
+
+        if (!save && noteId != null && entryId != null) {
+            runCatching {
+                CaptureNotes.remove(session.entryDir(entryId), noteId)
+            }.onFailure { error ->
+                discardFailed = true
+                Log.w(CAMERA_LOG_TAG, "Could not remove discarded note checkpoint", error)
+            }
+        }
+
+        if (saveFailed || discardFailed) {
+            voiceNoteDraft = completed
+            voiceNoteDiscardPending = discardFailed
+            if (!isDestroyed) {
+                renderVoiceNote()
+                setStatus(
+                    getString(
+                        if (saveFailed) R.string.capture_note_save_failed
+                        else R.string.capture_note_discard_failed,
+                    ),
+                )
+                if (discardFailed) resumeOfflineVoiceAfterNote()
+                updateUi()
+            }
+            return
+        }
+
+        voiceNoteDraft = null
+        voiceNoteId = null
+        voiceNoteStartedAt = 0L
+        voiceNoteDiscardPending = false
+        if (!isDestroyed) {
+            renderVoiceNote()
+            resumeOfflineVoiceAfterNote()
+            when {
+                successMessage != null -> setStatus(successMessage)
+                saved -> setStatus(getString(R.string.capture_note_saved))
+                save -> setStatus(getString(R.string.capture_note_empty))
+                else -> setStatus(getString(R.string.capture_note_discarded))
+            }
+            updateUi()
+        }
+    }
+
+    private fun resumeOfflineVoiceAfterNote() {
+        if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) ||
+            !Prefs.voiceEnabled(this) || !voicePermissionGranted()
+        ) return
+        if (voice == null) startVoice() else voice?.setPaused(false)
+    }
+
+    private fun renderVoiceNote() {
+        val note = voiceNoteDraft
+        val active = note != null
+        binding.noteOverlay.visibility = if (active) View.VISIBLE else View.GONE
+        binding.btnNote.isActivated = active
+        binding.btnNote.isSelected = active
+        binding.btnNote.contentDescription = getString(
+            when {
+                voiceNoteDiscardPending -> R.string.capture_note_retry_discard
+                active -> R.string.capture_note_end
+                else -> R.string.capture_note_start
+            },
+        )
+        binding.btnNote.backgroundTintList = ColorStateList.valueOf(
+            getColor(if (active) R.color.whl_red else R.color.whl_green),
+        )
+        binding.noteRows.removeAllViews()
+        if (note == null) {
+            binding.noteUnclassified.visibility = View.GONE
+            binding.noteUnclassified.text = ""
+            return
+        }
+
+        binding.noteUnclassified.visibility =
+            if (note.unclassifiedText.isBlank()) View.GONE else View.VISIBLE
+        binding.noteUnclassified.text = getString(
+            R.string.capture_note_unclassified,
+            note.unclassifiedText,
+        )
+        note.rows.forEach { noteRow ->
+            val row = LayoutInflater.from(this)
+                .inflate(R.layout.item_capture_note_row, binding.noteRows, false)
+            val field = row.findViewById<TextView>(R.id.noteField)
+            val value = row.findViewById<TextView>(R.id.noteValue)
+            field.setText(noteFieldLabel(noteRow.field))
+            field.backgroundTintList = ColorStateList.valueOf(getColor(noteFieldColor(noteRow.field)))
+            value.text = noteRow.value.ifBlank { getString(R.string.capture_note_value_pending) }
+            row.contentDescription = "${field.text}: ${value.text}"
+            binding.noteRows.addView(row)
+        }
+    }
+
+    private fun noteFieldLabel(field: StructuredNoteField): Int = when (field) {
+        StructuredNoteField.PRICE -> R.string.capture_note_price
+        StructuredNoteField.PAGES -> R.string.capture_note_pages
+        StructuredNoteField.CONDITION -> R.string.capture_note_condition
+        StructuredNoteField.ILLUSTRATIONS -> R.string.capture_note_illustrations
+        StructuredNoteField.REMARK -> R.string.capture_note_remark
+    }
+
+    private fun noteFieldColor(field: StructuredNoteField): Int = when (field) {
+        StructuredNoteField.PRICE -> R.color.whl_green
+        StructuredNoteField.PAGES -> R.color.whl_cyan
+        StructuredNoteField.CONDITION -> R.color.whl_amber
+        StructuredNoteField.ILLUSTRATIONS -> R.color.whl_blue2
+        StructuredNoteField.REMARK -> R.color.whl_red
     }
 
     private fun desiredCameraBindingSnapshot(): CameraBindingSnapshot = CameraBindingSnapshot(
@@ -700,27 +1101,47 @@ class MainActivity : AppCompatActivity() {
 
     // --- the command state machine --------------------------------------------
 
-    private fun command(word: String, discardConfirmed: Boolean = false) {
-        if (word == "cancel" && session.active && !discardConfirmed) {
-            showDiscardConfirmation()
+    private fun command(word: String) {
+        if (captureMutationInFlight) {
+            cues.error("capture is being updated")
             return
         }
         // Sealing while an accepted shot is being exposed/written would lose
-        // it. Done waits for the active and queued shots. Cancel drops the
-        // not-yet-submitted shot, then deletes the entry after the active
-        // callback releases its file.
-        if (captureQueue.busy && (word == "done" || word == "cancel")) {
+        // it. Done waits for both accepted shots. Cancel/restart drop the
+        // queued shot. Undo drops the queued shot immediately, or waits for the
+        // active shot and then removes that newly committed final page.
+        val waitsForCapture = word in setOf("done", "cancel", "restart", "undo")
+        if ((captureQueue.busy || session.hasActiveCaptureWrites()) && waitsForCapture) {
+            if (word == "undo" && captureQueue.queued != null) {
+                cancelQueuedCapture()
+                setStatus(getString(R.string.capture_undo_photo))
+                updateUi()
+                return
+            }
             pendingCommand = word
-            Prefs.setPendingCaptureCommand(this, session.entryId, word)
-            if (word == "cancel") cancelQueuedCapture()
+            pendingUndoTargetPage = if (word == "undo") {
+                captureQueue.active?.pageNumber ?: (session.photoCount + 1)
+            } else null
+            Prefs.setPendingCaptureCommand(
+                this,
+                session.entryId,
+                word,
+                targetPage = pendingUndoTargetPage,
+            )
+            if (word != "done") cancelQueuedCapture()
             setStatus(
-                if (word == "done") "Finishing accepted captures…"
-                else "Cancelling after active capture…",
+                when (word) {
+                    "done" -> getString(R.string.capture_waiting_done)
+                    "cancel" -> getString(R.string.capture_waiting_cancel)
+                    "restart" -> getString(R.string.capture_waiting_restart)
+                    else -> getString(R.string.capture_waiting_undo)
+                },
             )
             updateUi()
             return
         }
         when (word) {
+            "notes" -> requestStartVoiceNote()
             "start" -> {
                 // Gated here rather than only on the Home button so the voice
                 // word cannot open a book with no collection behind it.
@@ -745,6 +1166,9 @@ class MainActivity : AppCompatActivity() {
                 if (!session.active) cues.error("nothing to save")
                 else {
                     val photos = session.photoCount
+                    val hasNotes = session.entryId?.let { id ->
+                        CaptureNotes.read(session.entryDir(id)).notes.isNotEmpty()
+                    } == true
                     val id = session.done()
                     when {
                         id != null -> {
@@ -754,6 +1178,10 @@ class MainActivity : AppCompatActivity() {
                         }
                         // null + still active = the manifest write failed
                         // (disk full); the pages are kept and "done" can retry
+                        session.active && photos == 0 && hasNotes -> {
+                            cues.error("take a page photo before finishing")
+                            setStatus(getString(R.string.capture_note_needs_photo))
+                        }
                         session.active -> cues.error("could not save, still open")
                         else -> cues.error("no captures, entry dropped")
                     }
@@ -770,27 +1198,198 @@ class MainActivity : AppCompatActivity() {
                     cues.error("nothing to discard")
                 }
             }
+            "restart" -> restartCapture()
+            "undo" -> undoLastCaptureOrNote()
         }
         updateUi()
     }
 
-    private fun showDiscardConfirmation() {
-        if (discardDialog?.isShowing == true) return
-        val dialog = MaterialAlertDialogBuilder(this)
-            .setTitle(R.string.capture_discard_title)
-            .setMessage(R.string.capture_discard_message)
-            .setNegativeButton(android.R.string.cancel, null)
-            .setPositiveButton(R.string.capture_discard_confirm) { _, _ ->
-                command("cancel", discardConfirmed = true)
-            }
-            .create()
-        discardDialog = dialog
-        dialog.setOnShowListener {
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE)
-                .setTextColor(getColor(R.color.whl_red))
+    private fun restartCapture() {
+        val collection = Collections.current(this) ?: session.provenance?.let { provenance ->
+            BookCollection(
+                id = provenance.collectionId,
+                name = provenance.collectionName,
+                from = provenance.from,
+            )
         }
-        dialog.setOnDismissListener { if (discardDialog === dialog) discardDialog = null }
-        dialog.show()
+        if (collection == null) {
+            cues.error("choose a collection first")
+            setStatus(getString(R.string.collections_choose_first))
+            return
+        }
+
+        captureMutationInFlight = true
+        val discarded = if (session.active) session.cancel() else null
+        if (session.active) {
+            captureMutationInFlight = false
+            cues.error("could not discard current capture")
+            setStatus(getString(R.string.capture_restart_failed, "could not discard current capture"))
+            return
+        }
+        val result = runCatching { session.start(collection) }
+        if (result.isSuccess) {
+            binding.thumbs.removeAllViews()
+            cues.started()
+            setStatus(getString(R.string.capture_restart_complete))
+        } else {
+            discarded?.let(session::restoreFromTrash)
+            cues.error("could not restart capture")
+            setStatus(getString(
+                R.string.capture_restart_failed,
+                result.exceptionOrNull()?.message ?: "storage unavailable",
+            ))
+        }
+        captureMutationInFlight = false
+    }
+
+    private fun undoLastCaptureOrNote(
+        forcePhoto: Boolean = false,
+        durableEntryId: String? = null,
+        targetPage: Int? = null,
+    ) {
+        if (!forcePhoto && voiceNoteDraft != null) {
+            finishVoiceNote(save = false)
+            return
+        }
+        val entryId = session.entryId
+        if (entryId == null || durableEntryId != null && durableEntryId != entryId) {
+            cues.error("nothing to undo")
+            setStatus(getString(R.string.capture_undo_empty))
+            durableEntryId?.let { Prefs.clearPendingCaptureCommand(this, it) }
+            return
+        }
+
+        captureMutationInFlight = true
+        updateUi()
+        lifecycleScope.launch {
+            var terminal = false
+            var retryCaptureWrite = false
+            try {
+                val outcome = withContext(Dispatchers.IO) {
+                    try {
+                        val dir = session.entryDir(entryId)
+                        if (forcePhoto) {
+                            val page = targetPage
+                            if (page == null || !File(dir, "photo_$page.jpg").isFile ||
+                                session.refreshPhotoCount() != page
+                            ) {
+                                CaptureUndoOutcome.Empty
+                            } else {
+                                CaptureUndoOutcome.Photo(session.discardLastCommittedPhoto())
+                            }
+                        } else {
+                            val lastNote = CaptureNotes.read(dir).notes.lastOrNull()
+                            val lastPhoto = PhotoAssetStore.descriptors(dir)
+                                .maxByOrNull { it.captureOrder }
+                            // Processing may atomically replace photo_N and
+                            // advance its mtime. The preserved camera original
+                            // remains immutable and reflects the user action.
+                            val lastPhotoCapturedAt = lastPhoto?.rawFile?.lastModified()
+                                ?.takeIf { it > 0L }
+                                ?: lastPhoto?.captureFile?.lastModified()?.coerceAtLeast(0L)
+                                ?: 0L
+                            if (lastNote != null &&
+                                (lastPhoto == null || lastNote.updatedAtMs >= lastPhotoCapturedAt)
+                            ) {
+                                if (CaptureNotes.removeLast(dir) != null) {
+                                    CaptureUndoOutcome.NoteDiscarded
+                                } else CaptureUndoOutcome.Empty
+                            } else if (lastPhoto != null) {
+                                CaptureUndoOutcome.Photo(session.discardLastCommittedPhoto())
+                            } else {
+                                CaptureUndoOutcome.Empty
+                            }
+                        }
+                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        Log.e(CAMERA_LOG_TAG, "Could not undo capture action", error)
+                        CaptureUndoOutcome.Failed
+                    }
+                }
+                if (session.entryId != entryId) {
+                    terminal = true
+                    return@launch
+                }
+                when (outcome) {
+                    CaptureUndoOutcome.NoteDiscarded -> {
+                        terminal = true
+                        setStatus(getString(R.string.capture_undo_note))
+                    }
+                    is CaptureUndoOutcome.Photo -> when (val result = outcome.result) {
+                        is LastCommittedPhotoUndoResult.Discarded -> {
+                            terminal = true
+                            renderCurrentThumbnails()
+                            if (!result.cleanupComplete) {
+                                Log.w(
+                                    CAMERA_LOG_TAG,
+                                    "Undo detached page ${result.pageNumber}; staged cleanup remains",
+                                )
+                            }
+                            if (result.remainingPhotoCount > 0) {
+                                ProcessWorker.enqueue(this@MainActivity)
+                            }
+                            setStatus(getString(R.string.capture_undo_photo))
+                        }
+                        LastCommittedPhotoUndoResult.CaptureWriteInProgress -> {
+                            if (durableEntryId != null && targetPage != null) {
+                                retryCaptureWrite = true
+                                setStatus(getString(R.string.capture_waiting_undo))
+                            } else {
+                                terminal = true
+                                setStatus(getString(R.string.capture_undo_failed))
+                            }
+                        }
+                        LastCommittedPhotoUndoResult.NoActiveCapture,
+                        LastCommittedPhotoUndoResult.NoCommittedPhoto -> {
+                            terminal = true
+                            setStatus(getString(
+                                if (forcePhoto) R.string.capture_undo_photo
+                                else R.string.capture_undo_empty,
+                            ))
+                        }
+                        LastCommittedPhotoUndoResult.CaptureChanged,
+                        LastCommittedPhotoUndoResult.InvalidPhotoSequence,
+                        LastCommittedPhotoUndoResult.InvalidPhotoContract,
+                        LastCommittedPhotoUndoResult.StorageFailure -> {
+                            terminal = true
+                            cues.error("could not undo last capture")
+                            setStatus(getString(R.string.capture_undo_failed))
+                        }
+                    }
+                    CaptureUndoOutcome.Empty -> {
+                        terminal = true
+                        setStatus(getString(
+                            if (forcePhoto) R.string.capture_undo_photo
+                            else R.string.capture_undo_empty,
+                        ))
+                    }
+                    CaptureUndoOutcome.Failed -> {
+                        terminal = true
+                        cues.error("could not undo last capture")
+                        setStatus(getString(R.string.capture_undo_failed))
+                    }
+                }
+            } finally {
+                captureMutationInFlight = false
+                if (terminal && durableEntryId != null) {
+                    Prefs.clearPendingCaptureCommand(this@MainActivity, durableEntryId)
+                    pendingUndoTargetPage = null
+                }
+                if (retryCaptureWrite && durableEntryId != null && targetPage != null) {
+                    pendingCommand = "undo"
+                    pendingUndoTargetPage = targetPage
+                    Prefs.setPendingCaptureCommand(
+                        this@MainActivity,
+                        durableEntryId,
+                        "undo",
+                        targetPage,
+                    )
+                    startCameraAfterPriorWrites()
+                }
+                if (!isDestroyed) updateUi()
+            }
+        }
     }
 
     private fun takePhoto() {
@@ -1040,8 +1639,9 @@ class MainActivity : AppCompatActivity() {
         }
         acceptedShots.values.forEach { session.abortPhoto(it.reservation) }
         acceptedShots.clear()
-        pendingCommand = null
-        Prefs.clearPendingCaptureCommand(this, session.entryId)
+        // Pending terminal commands are durable. Activity destruction must not
+        // erase an accepted Done/Cancel/Restart/Undo before its replacement can
+        // reconcile the target entry.
         deferredCaptureSubmission = false
     }
 
@@ -1053,9 +1653,55 @@ class MainActivity : AppCompatActivity() {
     private fun runPending() {
         if (captureQueue.busy || session.hasActiveCaptureWrites() || isDestroyed) return
         val cmd = pendingCommand ?: return
-        val pendingEntry = session.entryId
+        val pendingEntry = session.entryId ?: run {
+            pendingCommand = null
+            pendingUndoTargetPage = null
+            Prefs.setPendingCaptureCommand(this, null, null)
+            return
+        }
+        if (cmd == "undo") {
+            val targetPage = pendingUndoTargetPage
+                ?: Prefs.pendingCaptureTargetPage(this, pendingEntry)
+            pendingCommand = null
+            if (targetPage == null) {
+                pendingUndoTargetPage = null
+                Prefs.clearPendingCaptureCommand(this, pendingEntry)
+                setStatus(getString(R.string.capture_undo_failed))
+                updateUi()
+                return
+            }
+            session.refreshPhotoCount()
+            val targetExists = File(session.entryDir(pendingEntry), "photo_$targetPage.jpg").isFile
+            when (deferredUndoDisposition(targetPage, session.photoCount, targetExists)) {
+                DeferredUndoDisposition.ALREADY_UNDONE -> {
+                // The accepted shot failed or its temporary was reclaimed
+                // after process death. That is already the requested Undo;
+                // never fall through to an older committed action.
+                    pendingUndoTargetPage = null
+                    Prefs.clearPendingCaptureCommand(this, pendingEntry)
+                    setStatus(getString(R.string.capture_undo_photo))
+                    updateUi()
+                    return
+                }
+                DeferredUndoDisposition.INVALID -> {
+                    pendingUndoTargetPage = null
+                    Prefs.clearPendingCaptureCommand(this, pendingEntry)
+                    setStatus(getString(R.string.capture_undo_failed))
+                    updateUi()
+                    return
+                }
+                DeferredUndoDisposition.REMOVE_TARGET -> Unit
+            }
+            undoLastCaptureOrNote(
+                forcePhoto = true,
+                durableEntryId = pendingEntry,
+                targetPage = targetPage,
+            )
+            return
+        }
         pendingCommand = null
-        command(cmd, discardConfirmed = cmd == "cancel")
+        pendingUndoTargetPage = null
+        command(cmd)
         Prefs.clearPendingCaptureCommand(this, pendingEntry)
     }
 
@@ -1102,8 +1748,7 @@ class MainActivity : AppCompatActivity() {
         iv.scaleType = ImageView.ScaleType.CENTER_CROP
         binding.thumbs.addView(iv)
         lifecycleScope.launch(Dispatchers.IO) {
-            val opts = BitmapFactory.Options().apply { inSampleSize = 8 }
-            val bmp = BitmapFactory.decodeFile(path, opts)
+            val bmp = decodeSampledOriented(File(path), maxWidth = 640, maxHeight = 640)
             withContext(Dispatchers.Main) {
                 if (bmp == null) { binding.thumbs.removeView(iv); return@withContext }
                 val w = h * bmp.width / bmp.height.coerceAtLeast(1)
@@ -1119,17 +1764,21 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateUi() {
         val active = session.active
+        val noteActive = voiceNoteDraft != null
+        val captureAvailable = !captureMutationInFlight && pendingCommand == null
         binding.entryState.text =
             if (active) getString(R.string.entry_active, session.photoCount)
             else getString(R.string.entry_idle)
         binding.entryState.setTextColor(
             getColor(if (active) R.color.whl_green else R.color.whl_ink_dim))
-        binding.btnStart.isEnabled = !active
-        binding.btnPhoto.isEnabled = active && !captureQueue.full && pendingCommand == null
-        binding.btnDone.isEnabled = active
-        binding.btnCancel.isEnabled = active
-        binding.btnSettings.isEnabled = !captureQueue.busy
-        binding.configWarning.isEnabled = !captureQueue.busy
+        binding.btnStart.isEnabled = !active && captureAvailable && !noteActive
+        binding.btnPhoto.isEnabled = active && captureAvailable && !noteActive && !captureQueue.full
+        binding.btnDone.isEnabled = active && captureAvailable && !noteActive
+        binding.btnCancel.isEnabled = active && captureAvailable && !noteActive
+        binding.btnNote.isEnabled = active &&
+            !voiceNoteFinalizing && (noteActive || captureAvailable && !captureQueue.busy)
+        binding.btnSettings.isEnabled = !captureQueue.busy && !captureMutationInFlight && !noteActive
+        binding.configWarning.isEnabled = !captureQueue.busy && !captureMutationInFlight && !noteActive
         if (!active) binding.thumbs.removeAllViews()
 
         val signedIn = Auth.signedIn(this)
@@ -1137,68 +1786,130 @@ class MainActivity : AppCompatActivity() {
         val pending = session.pendingUploads().size
         binding.configWarning.visibility = if (signedIn) View.GONE else View.VISIBLE
         binding.configWarning.text = getString(R.string.not_signed_in)
-        binding.queueChip.text =
-            if (pending > 0) getString(R.string.recent_chip, pending)
-            else getString(R.string.recent_chip_empty)
-        binding.queueChip.setTextColor(
-            getColor(when {
-                err != null -> R.color.whl_red
-                pending > 0 -> R.color.whl_amber
-                else -> R.color.whl_ink_dim
-            }))
         if (err != null && pending > 0)
             setStatus(resources.getQuantityString(
                 R.plurals.uploads_stuck, pending, pending, err))
-        if (binding.recentPanel.visibility == View.VISIBLE) refreshRecent()
+        refreshLastCapturedBook()
     }
 
-    /** Rebuild the dropdown: newest first, "Processing…" until the pipeline
-     *  turns a folder of photos into a book record. */
-    private fun refreshRecent() {
-        val list = binding.recentList
-        list.removeAllViews()
-        val entries = Entries.recent(this)
-        if (entries.isEmpty()) {
-            val empty = TextView(this)
-            empty.typeface = android.graphics.Typeface.MONOSPACE
-            empty.textSize = 12f
-            empty.setTextColor(getColor(R.color.whl_ink_dim))
-            empty.setPadding(24, 18, 24, 18)
-            empty.text = getString(R.string.recent_none)
-            list.addView(empty)
+    /** An open capture is intentionally excluded. The prior submitted book
+     * remains useful while the operator photographs the next one, and Done
+     * replaces it immediately because sealing precedes ProcessWorker enqueue. */
+    private fun refreshLastCapturedBook() {
+        lastBookPreviewJob?.cancel()
+        lastBookPreviewJob = lifecycleScope.launch {
+            val entry = withContext(Dispatchers.IO) {
+                selectLastSubmittedEntry(Entries.recent(this@MainActivity))
+            }
+            renderLastCapturedBook(entry)
+        }
+    }
+
+    private fun requestMicrophonePermission() {
+        ActivityCompat.requestPermissions(
+            this,
+            arrayOf(Manifest.permission.RECORD_AUDIO),
+            VOICE_PERMISSION_REQUEST,
+        )
+    }
+
+    private fun renderLastCapturedBook(entry: Entries.Entry?) {
+        if (entry == null) {
+            binding.lastBookTitle.setText(R.string.capture_last_book_empty)
+            binding.lastBookAuthor.setText(R.string.capture_last_book_author_empty)
+            binding.lastBookYear.setText(R.string.capture_last_book_year_empty)
+            binding.lastBookExtrasGroup.visibility = View.GONE
+            binding.lastBookPreview.alpha = 0.72f
+            binding.lastBookPrimary.contentDescription = getString(R.string.capture_last_book_empty)
+            binding.lastBookPrimary.isEnabled = false
+            binding.lastBookPrimary.isClickable = false
+            binding.lastBookPrimary.isFocusable = false
+            binding.lastBookPrimary.setOnClickListener(null)
+            binding.lastBookExtras.setOnClickListener(null)
             return
         }
-        val inflater = LayoutInflater.from(this)
-        for (e in entries) {
-            val row = inflater.inflate(R.layout.item_recent, list, false)
-            row.findViewById<TextView>(R.id.title).text = Entries.titleLabel(this, e)
-            row.findViewById<TextView>(R.id.sub).text =
-                listOf(
-                    e.author,
-                    e.year,
-                    resources.getQuantityString(
-                        R.plurals.capture_count, e.photoCount, e.photoCount))
-                    .filter { it.isNotEmpty() }.joinToString(" · ")
-            val state = Entries.statusLabel(this, e)
-            row.findViewById<TextView>(R.id.state).text = state
-            row.findViewById<View>(R.id.marker).setBackgroundColor(getColor(markerColor(state)))
-            row.setOnClickListener {
+
+        // Entries.titleLabel is valuable while extraction is pending, but its
+        // populated-metadata fallback may use a secondary/extra field. Once
+        // metadata exists, keep this compact card strictly primary-only.
+        val title = when {
+            entry.title.isNotEmpty() -> entry.title
+            entry.meta == null -> Entries.titleLabel(this, entry)
+            else -> getString(R.string.capture_last_book_title_missing)
+        }
+        binding.lastBookTitle.text = title
+        binding.lastBookAuthor.text = if (entry.author.isNotEmpty())
+            getString(R.string.capture_last_book_author, entry.author)
+        else getString(R.string.capture_last_book_author_empty)
+        binding.lastBookYear.text = if (entry.year.isNotEmpty())
+            getString(R.string.capture_last_book_year, entry.year)
+        else getString(R.string.capture_last_book_year_empty)
+
+        val available = !captureQueue.busy
+        binding.lastBookPreview.alpha = 1f
+        binding.lastBookPrimary.isEnabled = available
+        binding.lastBookPrimary.isClickable = available
+        binding.lastBookPrimary.isFocusable = available
+        binding.lastBookPrimary.contentDescription =
+            getString(
+                R.string.capture_last_book_description,
+                title,
+                entry.author.ifEmpty { getString(R.string.capture_last_book_field_missing) },
+                entry.year.ifEmpty { getString(R.string.capture_last_book_field_missing) },
+            )
+        binding.lastBookPrimary.setOnClickListener {
+            if (!captureQueue.busy) {
                 startActivity(Intent(this, EntryDetailActivity::class.java)
-                    .putExtra(EntryDetailActivity.EXTRA_ID, e.id))
+                    .putExtra(EntryDetailActivity.EXTRA_ID, entry.id))
             }
-            list.addView(row)
+        }
+
+        val extras = captureExtraFields(entry.meta)
+        binding.lastBookExtrasGroup.visibility =
+            if (extras.isEmpty()) View.GONE else View.VISIBLE
+        if (extras.isNotEmpty()) {
+            binding.lastBookExtraCount.text =
+                getString(R.string.capture_extra_fields_count, extras.size)
+            binding.lastBookExtras.contentDescription = resources.getQuantityString(
+                R.plurals.capture_extra_fields_description,
+                extras.size,
+                extras.size,
+            )
+            binding.lastBookExtras.isEnabled = available
+            binding.lastBookExtras.setOnClickListener { showCaptureExtras(entry.id) }
+        } else {
+            binding.lastBookExtras.setOnClickListener(null)
         }
     }
 
-    private fun markerColor(state: String): Int = when {
-        state.startsWith("capturing") -> R.color.whl_green
-        state == "failed" -> R.color.whl_red
-        state == "waiting" || state == "processing" || state == "partial" ||
-            state.endsWith("pending upload") || state.endsWith("pending delivery") ||
-            state.endsWith("claim for cloud") -> R.color.whl_amber
-        state.endsWith("different account") -> R.color.whl_red
-        state.endsWith("uploaded") -> R.color.whl_blue
-        state.endsWith("imported") -> R.color.whl_cyan
-        else -> R.color.whl_face_sh2
+    /** Re-read by id so a processing callback cannot leave a stale extra-field
+     * snapshot in a dialog opened at the same moment. */
+    private fun showCaptureExtras(entryId: String) {
+        val fields = captureExtraFields(Entries.find(this, entryId)?.meta)
+        if (fields.isEmpty()) {
+            refreshLastCapturedBook()
+            return
+        }
+        extraFieldsDialog?.dismiss()
+        val content = LayoutInflater.from(this).inflate(R.layout.dialog_capture_extras, null)
+        val list = content.findViewById<LinearLayout>(R.id.captureExtrasList)
+        for (field in fields) {
+            val row = LayoutInflater.from(this).inflate(R.layout.item_capture_extra, list, false)
+            row.findViewById<TextView>(R.id.extraLabel).text = field.label
+            row.findViewById<TextView>(R.id.extraValue).text = field.value
+            row.contentDescription =
+                getString(R.string.capture_extra_field_description, field.label, field.value)
+            list.addView(row)
+        }
+        val dialog = MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.capture_extra_fields_title)
+            .setView(content)
+            .setPositiveButton(R.string.close, null)
+            .create()
+        extraFieldsDialog = dialog
+        dialog.setOnDismissListener {
+            if (extraFieldsDialog === dialog) extraFieldsDialog = null
+        }
+        dialog.show()
     }
 }

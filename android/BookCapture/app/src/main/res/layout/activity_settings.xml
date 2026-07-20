@@ -86,6 +86,199 @@
                 android:importantForAutofill="no" />
         </LinearLayout>
 
+        <!-- Home-list presentation is device-local and takes effect immediately. -->
+        <LinearLayout style="@style/WhlPanelSection"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+            <TextView
+                style="@style/WhlLabel"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/set_display" />
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/compactScanList"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:minHeight="48dp"
+                android:text="@string/set_compact_scan_list"
+                android:textColor="@color/whl_ink" />
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:fontFamily="monospace"
+                android:textSize="11sp"
+                android:textColor="@color/whl_ink_dim"
+                android:text="@string/set_compact_scan_list_note" />
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/showOcrRegions"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:minHeight="48dp"
+                android:text="@string/set_show_ocr_regions"
+                android:textColor="@color/whl_ink" />
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:fontFamily="monospace"
+                android:text="@string/set_show_ocr_regions_note"
+                android:textColor="@color/whl_ink_dim"
+                android:textSize="11sp" />
+            <LinearLayout
+                android:id="@+id/ocrRegionOptions"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical">
+                <TextView
+                    android:id="@+id/ocrRegionOpacityLabel"
+                    style="@style/WhlLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:textAllCaps="false" />
+                <SeekBar
+                    android:id="@+id/ocrRegionOpacity"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:min="10"
+                    android:max="90"
+                    android:progress="55" />
+                <com.google.android.material.materialswitch.MaterialSwitch
+                    android:id="@+id/showOcrRegionLabels"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:minHeight="48dp"
+                    android:text="@string/set_show_ocr_region_labels"
+                    android:textColor="@color/whl_ink" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- Requested cleanup for generated display derivatives. The immutable
+             camera original is never modified by these controls. -->
+        <LinearLayout
+            android:id="@+id/postProcessingSection"
+            style="@style/WhlPanelSection"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:fontFamily="@font/roboto_slab"
+                android:text="@string/set_post_processing"
+                android:textAllCaps="false"
+                android:textColor="@color/whl_ink"
+                android:textSize="16sp"
+                android:textStyle="bold" />
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:fontFamily="@font/roboto_slab"
+                android:text="@string/set_post_processing_note"
+                android:textColor="@color/whl_ink_dim"
+                android:textSize="12sp" />
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:fontFamily="@font/roboto_slab"
+                android:labelFor="@id/postProcessingPresetGroup"
+                android:text="@string/set_post_processing_preset"
+                android:textAllCaps="false"
+                android:textColor="@color/whl_ink"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+            <RadioGroup
+                android:id="@+id/postProcessingPresetGroup"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical">
+                <RadioButton
+                    android:id="@+id/postProcessingPresetAutomatic"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:fontFamily="@font/roboto_slab"
+                    android:minHeight="48dp"
+                    android:text="@string/set_post_processing_automatic"
+                    android:textAllCaps="false"
+                    android:textColor="@color/whl_ink" />
+                <RadioButton
+                    android:id="@+id/postProcessingPresetModern"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:fontFamily="@font/roboto_slab"
+                    android:minHeight="48dp"
+                    android:text="@string/set_post_processing_modern"
+                    android:textAllCaps="false"
+                    android:textColor="@color/whl_ink" />
+                <RadioButton
+                    android:id="@+id/postProcessingPresetOlder"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:fontFamily="@font/roboto_slab"
+                    android:minHeight="48dp"
+                    android:text="@string/set_post_processing_older"
+                    android:textAllCaps="false"
+                    android:textColor="@color/whl_ink" />
+                <RadioButton
+                    android:id="@+id/postProcessingPresetEarly"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:fontFamily="@font/roboto_slab"
+                    android:minHeight="48dp"
+                    android:text="@string/set_post_processing_early"
+                    android:textAllCaps="false"
+                    android:textColor="@color/whl_ink" />
+            </RadioGroup>
+            <TextView
+                android:id="@+id/postProcessingPresetSummary"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="4dp"
+                android:fontFamily="@font/roboto_slab"
+                android:accessibilityLiveRegion="polite"
+                android:textColor="@color/whl_ink_dim"
+                android:textSize="12sp" />
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/postProcessingDewarp"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:fontFamily="@font/roboto_slab"
+                android:minHeight="48dp"
+                android:text="@string/set_post_processing_dewarp"
+                android:textAllCaps="false"
+                android:textColor="@color/whl_ink" />
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/postProcessingMarginCrop"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:fontFamily="@font/roboto_slab"
+                android:minHeight="48dp"
+                android:text="@string/set_post_processing_margin_crop"
+                android:textAllCaps="false"
+                android:textColor="@color/whl_ink" />
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/postProcessingContrast"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:fontFamily="@font/roboto_slab"
+                android:minHeight="48dp"
+                android:text="@string/set_post_processing_contrast"
+                android:textAllCaps="false"
+                android:textColor="@color/whl_ink" />
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/postProcessingSpineCrop"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:fontFamily="@font/roboto_slab"
+                android:minHeight="48dp"
+                android:text="@string/set_post_processing_spine_crop"
+                android:textAllCaps="false"
+                android:textColor="@color/whl_ink" />
+        </LinearLayout>
+
         <!-- camera -->
         <LinearLayout style="@style/WhlPanelSection"
             android:layout_width="match_parent" android:layout_height="wrap_content"
@@ -295,6 +488,25 @@
                 android:layout_marginTop="3dp"
                 android:inputType="textPassword"
                 android:importantForAutofill="no" />
+            <TextView
+                style="@style/WhlLabel"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="@string/set_extraction_instructions"
+                android:textAllCaps="false" />
+            <EditText
+                android:id="@+id/extractionInstructions"
+                style="@style/WhlInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="3dp"
+                android:gravity="top|start"
+                android:importantForAutofill="no"
+                android:inputType="textCapSentences|textMultiLine"
+                android:maxLength="4000"
+                android:minLines="3"
+                android:hint="@string/set_extraction_instructions_hint" />
         </LinearLayout>
 
         <LinearLayout

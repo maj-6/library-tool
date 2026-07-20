@@ -24,13 +24,25 @@ def test_release_tag_version_preflight_gates_every_publish_path():
     desktop = _job("desktop", "publish")
     publish = WORKFLOW[WORKFLOW.index("  publish:\n") :]
 
-    assert "Verify tag matches the desktop version" in preflight
+    assert "Verify tag matches its product version" in preflight
     assert 'require("./desktop/package.json").version' in preflight
-    assert '"v$version" != "$GITHUB_REF_NAME"' in preflight
+    assert "android/BookCapture/app/build.gradle.kts" in preflight
+    assert 'expected="android-v$version"' in preflight
+    assert 'if [ "$expected" != "$GITHUB_REF_NAME" ]; then' in preflight
     assert "needs: preflight" in android
     assert "needs: preflight" in desktop
     assert "needs.preflight.result == 'success'" in publish
     assert "needs: [preflight, android, desktop]" in publish
+
+
+def test_android_only_tag_skips_desktop_and_is_not_reported_as_a_failed_partial():
+    desktop = _job("desktop", "publish")
+    publish = WORKFLOW[WORKFLOW.index("  publish:\n") :]
+
+    assert 'tags: ["v*", "android-v*"]' in WORKFLOW
+    assert "if: ${{ !startsWith(github.ref_name, 'android-v') }}" in desktop
+    assert 'if [[ "$GITHUB_REF_NAME" != android-v* ]]; then' in publish
+    assert 'notes_file="docs/releases/$GITHUB_REF_NAME.md"' in publish
 
 
 def test_release_requires_persistent_android_signing_identity():
@@ -83,6 +95,28 @@ def test_android_release_certificate_fingerprint_is_pinned():
         "a28f22745810390f46faaee576c8c3272cb4ca72782ea38879392ae3b27a4fbf"
     )
     assert re.fullmatch(r"[0-9a-f]{64}", ANDROID_CERT_SHA256)
+
+
+def test_tagged_android_release_requires_public_cloud_config():
+    android = _job("android", "desktop")
+
+    assert "WHL_SUPABASE_URL: ${{ vars.SUPABASE_URL }}" in android
+    assert "WHL_SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY }}" in android
+    assert (
+        "Tagged Android release requires non-empty SUPABASE_URL and "
+        "SUPABASE_ANON_KEY"
+    ) in android
+    assert "SUPABASE_URL must be an https URL" in android
+    assert "./gradlew --no-daemon testDebugUnitTest lintRelease assembleRelease" in android
+
+
+def test_release_token_is_write_scoped_only_to_publish_job():
+    pre_publish = WORKFLOW[: WORKFLOW.index("  publish:\n")]
+    publish = WORKFLOW[WORKFLOW.index("  publish:\n") :]
+
+    assert "permissions:\n  contents: read" in pre_publish
+    assert "contents: write" not in pre_publish
+    assert "permissions:\n      contents: write" in publish
 
 
 def test_partial_release_metadata_comes_from_collected_artifacts():

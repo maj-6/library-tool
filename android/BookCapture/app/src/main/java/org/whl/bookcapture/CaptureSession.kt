@@ -12,6 +12,36 @@ private const val TRASH_STAMP = ".trashed_at"
 private const val TRASH_TTL_MS = 7L * 24 * 60 * 60 * 1000   // ~7 days
 
 /**
+ * Process-wide publication gate for queue directories and the persisted live
+ * capture pointer. WorkManager uses this process too, so orphan recovery sees
+ * either the state before publication or the complete state after it.
+ */
+internal object CaptureQueueLifecycle {
+    private val monitor = Any()
+
+    fun <T> exclusive(block: () -> T): T = synchronized(monitor) { block() }
+}
+
+/** Storage-side outcome for "undo last capture". CameraX queue ownership is
+ * intentionally represented rather than hidden so MainActivity can wait for
+ * accepted callbacks before retrying the committed-photo operation. */
+internal sealed interface LastCommittedPhotoUndoResult {
+    data class Discarded(
+        val pageNumber: Int,
+        val remainingPhotoCount: Int,
+        val cleanupComplete: Boolean,
+    ) : LastCommittedPhotoUndoResult
+
+    data object NoActiveCapture : LastCommittedPhotoUndoResult
+    data object CaptureChanged : LastCommittedPhotoUndoResult
+    data object CaptureWriteInProgress : LastCommittedPhotoUndoResult
+    data object NoCommittedPhoto : LastCommittedPhotoUndoResult
+    data object InvalidPhotoSequence : LastCommittedPhotoUndoResult
+    data object InvalidPhotoContract : LastCommittedPhotoUndoResult
+    data object StorageFailure : LastCommittedPhotoUndoResult
+}
+
+/**
  * The voice-driven entry state machine.
  *
  *   "start"  -> a new entry (UUID) begins collecting photos
@@ -84,7 +114,7 @@ class CaptureSession(private val ctx: Context) {
      * mid-shelf cannot retroactively relabel this book, and so orphan recovery
      * can seal a crashed entry with the provenance it was started under.
      */
-    fun start(collection: BookCollection): String {
+    fun start(collection: BookCollection): String = CaptureQueueLifecycle.exclusive {
         if (active && cancel() == null) {
             error("Could not discard the current capture")
         }
@@ -106,7 +136,7 @@ class CaptureSession(private val ctx: Context) {
         provenance = captureProvenance
         photoCount = 0
         Prefs.setCurrentEntryId(ctx, id)
-        return id
+        id
     }
 
     /** Reserve a unique temporary and final path before CameraX submission. */
@@ -142,6 +172,17 @@ class CaptureSession(private val ctx: Context) {
             abortPhoto(reservation)
             return false
         }
+        // Freeze an independently named source before background processing
+        // may replace photo_N.jpg with a standardized display derivative. The
+        // contract is additive: failure leaves a valid legacy capture, and the
+        // worker makes one more preservation attempt before any rewrite.
+        runCatching {
+            PhotoAssetStore.registerCapturedPhoto(
+                entryDir(reservation.entryId),
+                reservation.finalFile,
+                reservation.pageNumber,
+            )
+        }
         ActiveCaptureWrites.unregister(reservation.tempFile)
         photoCount += 1
         return true
@@ -169,6 +210,66 @@ class CaptureSession(private val ctx: Context) {
     fun hasActiveCaptureWrites(): Boolean =
         entryId?.let { ActiveCaptureWrites.hasAny(entryDir(it)) } == true
 
+    /**
+     * Discard only the last fully committed page of the active entry.
+     *
+     * ProcessWorker and UploadWorker use [EntryOperationLocks] too, so the
+     * final JPEG cannot disappear while it is being standardized, OCR'd, or
+     * prepared for transport. CameraX callbacks do not take that coroutine
+     * lock: callers must first drain [ShallowCaptureQueue] and should treat
+     * [LastCommittedPhotoUndoResult.CaptureWriteInProgress] as a request to
+     * retry after the accepted callback releases its temporary file.
+     */
+    internal suspend fun discardLastCommittedPhoto(): LastCommittedPhotoUndoResult {
+        val lockedEntryId = entryId
+            ?: return LastCommittedPhotoUndoResult.NoActiveCapture
+        return EntryOperationLocks.withLock(lockedEntryId) {
+            if (entryId != lockedEntryId) {
+                return@withLock LastCommittedPhotoUndoResult.CaptureChanged
+            }
+            val dir = entryDir(lockedEntryId)
+            if (!dir.isDirectory || File(dir, "manifest.json").exists()) {
+                return@withLock LastCommittedPhotoUndoResult.CaptureChanged
+            }
+            if (ActiveCaptureWrites.hasAny(dir)) {
+                return@withLock LastCommittedPhotoUndoResult.CaptureWriteInProgress
+            }
+            val committed = dir.listFiles { file ->
+                file.isFile && file.name.matches(PHOTO_NAME)
+            }?.size ?: 0
+            if (committed == 0) {
+                photoCount = 0
+                return@withLock LastCommittedPhotoUndoResult.NoCommittedPhoto
+            }
+            when (val removed = PhotoAssetStore.removeFinalCommittedPhoto(dir, committed)) {
+                is FinalCommittedPhotoRemoval.Removed -> {
+                    photoCount = removed.remainingPhotoCount
+                    LastCommittedPhotoUndoResult.Discarded(
+                        removed.pageNumber,
+                        removed.remainingPhotoCount,
+                        removed.cleanupComplete,
+                    )
+                }
+                FinalCommittedPhotoRemoval.NoPhotos -> {
+                    photoCount = 0
+                    LastCommittedPhotoUndoResult.NoCommittedPhoto
+                }
+                FinalCommittedPhotoRemoval.NotFinalDensePage -> {
+                    refreshPhotoCount()
+                    LastCommittedPhotoUndoResult.InvalidPhotoSequence
+                }
+                FinalCommittedPhotoRemoval.InvalidContract -> {
+                    refreshPhotoCount()
+                    LastCommittedPhotoUndoResult.InvalidPhotoContract
+                }
+                FinalCommittedPhotoRemoval.StorageFailure -> {
+                    refreshPhotoCount()
+                    LastCommittedPhotoUndoResult.StorageFailure
+                }
+            }
+        }
+    }
+
     /** Seal the current entry for upload; returns its id, or null if empty.
      *  A failed manifest write (disk full) also returns null but leaves the
      *  entry OPEN — check [active] to tell "dropped, empty" from "try again". */
@@ -176,7 +277,12 @@ class CaptureSession(private val ctx: Context) {
         val id = entryId ?: return null
         if (ActiveCaptureWrites.hasAny(entryDir(id))) return null
         refreshPhotoCount()
-        if (photoCount == 0) {                    // an empty entry is just dropped
+        if (photoCount == 0 && CaptureNotes.read(entryDir(id)).notes.isNotEmpty()) {
+            // A note belongs to a photographed book. Keep the entry open so a
+            // premature Done cannot silently delete already accepted dictation.
+            return null
+        }
+        if (photoCount == 0) {                    // a truly empty entry is just dropped
             entryId = null
             creator = null
             provenance = null
@@ -237,21 +343,21 @@ class CaptureSession(private val ctx: Context) {
 
     /** Undo a [cancel]: bring a trashed entry back as the live open entry.
      *  No-op (false) if another entry is already open or the trash copy is gone. */
-    fun restoreFromTrash(id: String): Boolean {
-        if (active) return false
+    fun restoreFromTrash(id: String): Boolean = CaptureQueueLifecycle.exclusive {
+        if (active) return@exclusive false
         val src = File(trashRoot(), id)
-        if (!src.isDirectory) return false
+        if (!src.isDirectory) return@exclusive false
         val dst = entryDir(id)
         // Never destroy a same-id queue folder to satisfy Undo. If a folder is
         // already there, keep the trash copy recoverable for a later attempt.
-        if (dst.exists() || !moveDirectoryWithoutCopy(src, dst)) return false
+        if (dst.exists() || !moveDirectoryWithoutCopy(src, dst)) return@exclusive false
         File(dst, TRASH_STAMP).delete()
         entryId = id
         creator = creatorFor(dst)
         provenance = readProvenance(dst)
         photoCount = dst.listFiles { f -> f.isFile && f.name.matches(PHOTO_NAME) }?.size ?: 0
         Prefs.setCurrentEntryId(ctx, id)
-        return true
+        true
     }
 
     /** Delete trashed entries past the retention window; runs at construction so
@@ -275,7 +381,7 @@ class CaptureSession(private val ctx: Context) {
      *  see [restore]), so this NEVER touches an entry that is being captured
      *  into — no matter how long the user has paused mid-book. Runs off the UI
      *  thread (UploadWorker). Returns how many entries were rescued. */
-    fun recoverOrphans(): Int {
+    fun recoverOrphans(): Int = CaptureQueueLifecycle.exclusive {
         val live = Prefs.currentEntryId(ctx)
         var sealed = 0
         for (dir in queueRoot().listFiles { f -> f.isDirectory } ?: emptyArray()) {
@@ -290,7 +396,7 @@ class CaptureSession(private val ctx: Context) {
                 ?: System.currentTimeMillis()
             if (writeManifest(dir, photos, newest, creatorFor(dir), readProvenance(dir))) sealed++
         }
-        return sealed
+        sealed
     }
 
     /** A sidecar freezes ownership before the first photo. Missing/corrupt
@@ -352,7 +458,9 @@ class CaptureSession(private val ctx: Context) {
                 .put("device", Prefs.deviceName(ctx))
                 .put("created_at", createdAt)
                 .put("photos", JSONArray(photos))
-                .put("note", "")
+                .put(PHOTO_ASSETS_MANIFEST_KEY, PhotoAssetStore.payload(dir))
+                .put(CAPTURE_NOTES_MANIFEST_KEY, CaptureNotes.payload(dir))
+                .put("note", CaptureNotes.humanReadableSummary(dir))
                 .put("creator", JSONObject()
                     .put("kind", creator.kind)
                     .put("id", creator.id))

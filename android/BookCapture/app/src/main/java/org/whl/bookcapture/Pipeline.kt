@@ -39,7 +39,7 @@ object Pipeline {
     private const val DEEPSEEK_EXTRACT_MODEL = "deepseek-chat"
 
     val FIELDS = listOf("title", "subtitle", "author", "volume", "edition",
-                        "publisher", "year", "city", "language")
+                        "publisher", "year", "city", "language", "spine_title")
 
     /** A 4xx from an API: retrying won't fix it (bad key, bad request). */
     class PermanentError(message: String) : IOException(message)
@@ -52,6 +52,16 @@ object Pipeline {
         val metadata: JSONObject,
         val complete: Boolean,
         val warning: String? = null,
+        val provider: String = "",
+        val providerResponse: String? = null,
+    )
+
+    internal data class OcrResult(
+        val markdown: String,
+        val geometry: OcrGeometryDraft? = null,
+        /** Exact successful Mistral response, retained for diagnostics and
+         * forward-compatible interpretation of fields this version ignores. */
+        val providerResponse: String = "",
     )
 
     // --- 1. standardize -----------------------------------------------------------
@@ -113,20 +123,74 @@ object Pipeline {
 
     // --- 2. OCR -----------------------------------------------------------------
 
-    /** OCR one photo via Mistral; returns the page markdown, "" for a blank
-     *  page. Throws PermanentError on a 4xx (bad key), IOException otherwise. */
-    fun ocr(file: File, mistralKey: String): String {
+    /** OCR one photo via Mistral. OCR-4 responses may include typed blocks;
+     * older aliases/responses remain valid and simply return no geometry. */
+    internal fun ocrResult(file: File, mistralKey: String): OcrResult {
         val b64 = Base64.getEncoder().encodeToString(file.readBytes())
         val payload = JSONObject()
             .put("model", OCR_MODEL)
+            .put("include_blocks", true)
             .put("document", JSONObject()
                 .put("type", "image_url")
                 .put("image_url", "data:image/jpeg;base64,$b64"))
         val data = post(MISTRAL_OCR_URL, payload, mistralKey, 90_000)
-        val pages = data.optJSONArray("pages") ?: return ""
-        return (0 until pages.length())
-            .joinToString("\n\n") { pages.getJSONObject(it).optString("markdown") }
+        return parseOcrResponse(data)
+    }
+
+    fun ocr(file: File, mistralKey: String): String = ocrResult(file, mistralKey).markdown
+
+    internal fun parseOcrResponse(data: JSONObject): OcrResult {
+        val response = data.toString()
+        val pages = data.optJSONArray("pages") ?: return OcrResult("", providerResponse = response)
+        val markdown = (0 until pages.length())
+            .joinToString("\n\n") { pages.optJSONObject(it)?.optString("markdown").orEmpty() }
             .trim()
+        var geometry: OcrGeometryDraft? = null
+        for (pageIndex in 0 until pages.length()) {
+            val page = pages.optJSONObject(pageIndex) ?: continue
+            val dimensions = page.optJSONObject("dimensions") ?: continue
+            val width = dimensions.optInt("width", 0)
+            val height = dimensions.optInt("height", 0)
+            val blocks = page.optJSONArray("blocks") ?: continue
+            if (width <= 0 || height <= 0 || blocks.length() == 0) continue
+            val regions = (0 until blocks.length()).mapNotNull { index ->
+                val block = blocks.optJSONObject(index) ?: return@mapNotNull null
+                val x0 = block.finiteNumber("top_left_x") ?: return@mapNotNull null
+                val y0 = block.finiteNumber("top_left_y") ?: return@mapNotNull null
+                val x1 = block.finiteNumber("bottom_right_x") ?: return@mapNotNull null
+                val y1 = block.finiteNumber("bottom_right_y") ?: return@mapNotNull null
+                if (x1 <= x0 || y1 <= y0) return@mapNotNull null
+                val polygon = listOf(
+                    NormalizedPoint(x0 / width, y0 / height),
+                    NormalizedPoint(x1 / width, y0 / height),
+                    NormalizedPoint(x1 / width, y1 / height),
+                    NormalizedPoint(x0 / width, y1 / height),
+                )
+                if (polygon.any { point ->
+                        !point.x.isFinite() || !point.y.isFinite() ||
+                            point.x !in 0.0..1.0 || point.y !in 0.0..1.0
+                    }) return@mapNotNull null
+                PhotoOcrRegion(
+                    id = block.optString("id").trim().ifEmpty { "p$pageIndex-r$index" },
+                    regionType = block.optString("type", "text").trim().ifEmpty { "text" },
+                    polygon = polygon,
+                    text = block.optString("content"),
+                    confidence = block.finiteNumber("confidence")?.coerceIn(0.0, 1.0),
+                )
+            }
+            if (regions.isNotEmpty()) {
+                geometry = OcrGeometryDraft(
+                    width = width,
+                    height = height,
+                    engine = "mistral",
+                    model = data.optString("model").trim().ifEmpty { OCR_MODEL },
+                    engineVersion = "ocr-4-blocks",
+                    regions = regions,
+                )
+                break
+            }
+        }
+        return OcrResult(markdown, geometry, response)
     }
 
     // --- 3. field extraction --------------------------------------------------------
@@ -148,6 +212,8 @@ Return a single JSON object with exactly these keys (string values; "" when abse
   "year"       - the publication year as a 4-digit Arabic number (convert Roman numerals)
   "city"       - the place of publication (first city if several)
   "language"   - the language of the book as a lowercase English word ("english")
+  "spine_title" - the title printed on the spine only when it differs materially
+                  from the published title; "" when it is absent or equivalent
   "extra"      - an object of any OTHER bibliographic facts found, using short
                  snake_case keys, e.g. printer, series, translator, illustrator,
                  copyright_year, copyright_holder, printing_number, dedication.
@@ -162,8 +228,9 @@ OCR TEXT:
      *  Mistral (whose extraction the desktop has verified live). */
     fun extract(ocrText: String, deepseekKey: String, mistralKey: String,
                 customInstructions: String = ""): ExtractionResult {
+        val useDeepSeek = deepseekKey.isNotEmpty()
         val (url, model, key) =
-            if (deepseekKey.isNotEmpty()) Triple(DEEPSEEK_CHAT_URL, DEEPSEEK_EXTRACT_MODEL, deepseekKey)
+            if (useDeepSeek) Triple(DEEPSEEK_CHAT_URL, DEEPSEEK_EXTRACT_MODEL, deepseekKey)
             else Triple(MISTRAL_CHAT_URL, MISTRAL_EXTRACT_MODEL, mistralKey)
         val custom = customInstructions.trim().take(4_000)
         val prompt = buildString {
@@ -186,7 +253,10 @@ OCR TEXT:
         val data = post(url, payload, key, 60_000)
         val raw = data.optJSONArray("choices")?.optJSONObject(0)
             ?.optJSONObject("message")?.optString("content") ?: ""
-        return parseExtraction(raw)
+        return parseExtraction(raw).copy(
+            provider = if (useDeepSeek) "deepseek" else "mistral",
+            providerResponse = data.toString(),
+        )
     }
 
     /** Validate and normalize a model response without silently turning bad JSON
@@ -317,4 +387,10 @@ OCR TEXT:
         if (code !in 200..299) throw IOException("HTTP $code: ${body.take(160)}")
         return JSONObject(body)
     }
+
+    private fun JSONObject.finiteNumber(key: String): Double? = when (val value = opt(key)) {
+        is Number -> value.toDouble()
+        is String -> value.toDoubleOrNull()
+        else -> null
+    }?.takeIf { it.isFinite() }
 }

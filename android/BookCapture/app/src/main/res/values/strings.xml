@@ -1,27 +1,27 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Book Capture</string>
+    <string name="app_name">Library Tool Capture</string>
     <string name="app_wordmark">LIBRARY TOOL</string>
-    <string name="settings_title">Book Capture settings</string>
+    <string name="settings_title">Library Tool Capture settings</string>
     <string name="navigate_up">Navigate up</string>
 
     <string name="home_new_scan">New book scan</string>
 
     <!-- The app mark at the head of the toolbar is the menu; there is no gear. -->
-    <string name="app_menu">Book Capture menu</string>
+    <string name="app_menu">Library Tool Capture menu</string>
     <string name="menu_settings">Settings</string>
     <string name="menu_about">About</string>
     <string name="menu_check_updates">Check for updates</string>
-    <string name="about_title">Book Capture</string>
+    <string name="about_title">Library Tool Capture</string>
     <string name="about_body">Version %1$s\n\nThe phone half of Library Tool: photograph the pages of a book, and the desktop files it as a catalogued entry with its photos attached.</string>
     <string name="about_close">CLOSE</string>
     <string name="update_checking">Checking for updates…</string>
-    <string name="update_current">Book Capture %1$s is the newest build.</string>
+    <string name="update_current">Library Tool Capture %1$s is the newest build.</string>
     <string name="update_available_title">Update available</string>
-    <string name="update_available_body">Book Capture %1$s is available. You have %2$s.</string>
+    <string name="update_available_body">Library Tool Capture %1$s is available. You have %2$s.</string>
     <string name="update_download">DOWNLOAD</string>
     <string name="update_failed">Could not check for updates. Check your connection and try again.</string>
-    <string name="update_not_configured">No cloud project is set, so there is nothing to check against. Add one in Settings.</string>
+    <string name="update_not_configured">This build has no cloud project configured, so update checks are unavailable.</string>
     <string name="update_no_browser">No app available to open the download link.</string>
     <string name="home_empty">No books scanned yet.\nTap “New book scan” to photograph a book.</string>
     <string name="home_select">SELECT</string>
@@ -51,6 +51,10 @@
     <string name="collections_new">New collection</string>
     <string name="collections_edit">EDIT</string>
     <string name="collections_delete">DELETE</string>
+    <string name="collections_edit_description">Edit %1$s</string>
+    <string name="collections_delete_description">Delete %1$s</string>
+    <string name="collections_cancel_edit_description">Cancel collection changes</string>
+    <string name="collections_save_edit_description">Save collection</string>
     <string name="collections_empty">No collections yet.\nA collection is a batch of books — a shelf, a crate, a room — and where it came from.\nTap “New collection” to make the first one.</string>
     <string name="collections_add_title">New collection</string>
     <string name="collections_edit_title">Edit collection</string>
@@ -68,18 +72,25 @@
     <string name="collections_delete_message">Deletes “%1$s”. Books already scanned into it keep their recorded collection and origin — only the choice for future scans goes away.</string>
     <string name="collections_delete_failed">The collection could not be deleted. Free storage and try again.</string>
     <string name="collections_current">Scanning into %1$s</string>
+    <string name="collections_current_state">Current collection</string>
     <string name="collections_current_from">Scanning into %1$s · from %2$s</string>
     <string name="collections_none_selected">No collection chosen — tap to pick where these books came from</string>
     <string name="collections_choose_first">Choose a collection before scanning a book.</string>
     <string name="collections_row_from">from %1$s</string>
     <string name="collections_row_no_from">no origin recorded</string>
-    <string name="collections_row_current">CURRENT</string>
     <!-- Deliberately "on this phone", not a total: the recent list prunes
          uploaded scans, so a plain count would shrink as books are delivered. -->
     <plurals name="collections_row_books">
         <item quantity="one">%1$d on this phone</item>
         <item quantity="other">%1$d on this phone</item>
     </plurals>
+    <string name="home_group_unfiled">No collection</string>
+    <plurals name="home_group_scan_count">
+        <item quantity="one">%1$d scan</item>
+        <item quantity="other">%1$d scans</item>
+    </plurals>
+    <string name="home_group_expand">%1$s, %2$s. Expand group</string>
+    <string name="home_group_collapse">%1$s, %2$s. Collapse group</string>
 
     <string name="detail_from">From</string>
     <string name="detail_from_edit">CHANGE</string>
@@ -93,9 +104,24 @@
 
     <string name="entry_idle">IDLE</string>
     <string name="entry_active">OPEN (%1$d)</string>
-    <string name="recent_chip">%1$d ▾</string>
-    <string name="recent_chip_empty">— ▾</string>
-    <string name="recent_none">No books scanned yet</string>
+    <string name="capture_last_book_label">Last captured book</string>
+    <string name="capture_last_book_empty">No book sent for processing yet</string>
+    <string name="capture_last_book_title_missing">Title not detected</string>
+    <string name="capture_last_book_field_missing">Not detected</string>
+    <string name="capture_last_book_author">Author: %1$s</string>
+    <string name="capture_last_book_author_empty">Author: —</string>
+    <string name="capture_last_book_year">Year: %1$s</string>
+    <string name="capture_last_book_year_empty">Year: —</string>
+    <string name="capture_last_book_description">Open last captured book. Title: %1$s. Author: %2$s. Year: %3$s.</string>
+    <string name="capture_extra_fields_title">Extra fields</string>
+    <string name="capture_extra_field_description">%1$s: %2$s</string>
+    <string name="capture_extra_fields_count">(%1$d)</string>
+    <string name="capture_extra_fields_count_placeholder">(0)</string>
+    <string name="capture_extra_fields_description_placeholder">Show extra fields</string>
+    <plurals name="capture_extra_fields_description">
+        <item quantity="one">Show %1$d extra field</item>
+        <item quantity="other">Show %1$d extra fields</item>
+    </plurals>
     <plurals name="uploads_stuck">
         <item quantity="one">%1$d book scan needs attention — %2$s — check settings (⚙)</item>
         <item quantity="other">%1$d book scans need attention — %2$s — check settings (⚙)</item>
@@ -103,6 +129,7 @@
     <string name="not_signed_in">Local mode — books stay on this phone; paired LAN delivery still works. Tap to sign in for cloud sync.</string>
     <string name="need_permissions">Camera permission is required to photograph pages.</string>
     <string name="voice_permission_denied">Voice control is off because microphone access was not granted. Camera buttons still work.</string>
+    <string name="capture_note_permission_denied">A microphone is required to dictate notes. Page capture still works.</string>
     <string name="model_download_failed">Voice model download failed: %1$s (buttons still work)</string>
 
     <!-- Capture controls; the words live in the content descriptions. -->
@@ -110,6 +137,40 @@
     <string name="cmd_photo">Take page photo</string>
     <string name="cmd_done">Finish book scan</string>
     <string name="cmd_cancel">Discard book scan</string>
+    <string name="capture_note_start">Start a voice note</string>
+    <string name="capture_note_end">End and save voice note</string>
+    <string name="capture_note_retry_discard">Retry discarding voice note</string>
+    <string name="capture_note_connecting">Note · connecting to Mistral…</string>
+    <string name="capture_note_listening">Note · listening · say “end notes” to save</string>
+    <string name="capture_note_finalizing">Note · finishing transcription…</string>
+    <string name="capture_note_requires_entry">Start a book capture before adding a note.</string>
+    <string name="capture_note_requires_key">Add a Mistral API key in Settings before dictating notes.</string>
+    <string name="capture_note_wait_for_capture">Wait for the current page capture to finish before starting a note.</string>
+    <string name="capture_note_start_failed">Could not start Mistral transcription.</string>
+    <string name="capture_note_saved">Voice note saved.</string>
+    <string name="capture_note_save_failed">The voice note could not be saved. The capture remains open.</string>
+    <string name="capture_note_needs_photo">The note is saved. Take at least one page photo before finishing the capture.</string>
+    <string name="capture_note_empty">No speech was transcribed; the note was not saved.</string>
+    <string name="capture_note_discarded">Voice note discarded.</string>
+    <string name="capture_note_discard_failed">The voice note could not be discarded from storage. Say undo to try again before finishing this capture.</string>
+    <string name="capture_note_interrupted">Voice note saved before leaving the camera.</string>
+    <string name="capture_note_value_pending">Listening…</string>
+    <string name="capture_note_unclassified">Transcript: %1$s</string>
+    <string name="capture_note_price">Price</string>
+    <string name="capture_note_pages">Pages</string>
+    <string name="capture_note_condition">Condition</string>
+    <string name="capture_note_illustrations">Illustrations</string>
+    <string name="capture_note_remark">Remark</string>
+    <string name="capture_restart_complete">Started a new capture.</string>
+    <string name="capture_restart_failed">Could not restart the capture: %1$s</string>
+    <string name="capture_undo_photo">Last page photo discarded.</string>
+    <string name="capture_undo_note">Last voice note discarded.</string>
+    <string name="capture_undo_empty">There is no page photo or note to undo.</string>
+    <string name="capture_undo_failed">The last capture could not be discarded safely.</string>
+    <string name="capture_waiting_done">Finishing accepted captures…</string>
+    <string name="capture_waiting_cancel">Cancelling after the active capture…</string>
+    <string name="capture_waiting_restart">Restarting after the active capture…</string>
+    <string name="capture_waiting_undo">Undoing after the active capture…</string>
     <string name="capture_discard_title">Discard this book scan?</string>
     <string name="capture_discard_message">This removes the current local scan and its page photos from the capture queue. You can undo immediately after discarding.</string>
     <string name="capture_discard_confirm">DISCARD</string>
@@ -117,7 +178,6 @@
     <string name="undo">UNDO</string>
     <string name="undo_unavailable">Too late to undo — the discard was already cleared.</string>
     <string name="open_settings">Open settings</string>
-    <string name="open_recent">Show recent book scans</string>
     <string name="gear">⚙</string>
 
     <string name="login_sub">sign in for cloud sync, or continue locally</string>
@@ -135,7 +195,28 @@
     <string name="set_sign_in">SIGN IN</string>
     <string name="set_local_mode">Not signed in · local and paired-LAN mode</string>
     <string name="device_name">Device name (shown on imported books)</string>
-    <string name="set_capture">Capture</string>
+    <string name="set_display">Display</string>
+    <string name="set_compact_scan_list">Compact scan list</string>
+    <string name="set_compact_scan_list_note">Uses smaller thumbnails and tighter spacing on the Scans tab.</string>
+    <string name="set_show_ocr_regions">Show detected text regions</string>
+    <string name="set_show_ocr_regions_note">Displays Mistral OCR block geometry over title-page and expanded photos when the provider returned it.</string>
+    <string name="set_ocr_region_opacity_value">Region opacity: %1$d%%</string>
+    <string name="set_show_ocr_region_labels">Show region labels</string>
+    <string name="set_post_processing">Post-processing</string>
+    <string name="set_post_processing_note">Creates cleaned display copies after capture. Camera originals remain unchanged.</string>
+    <string name="set_post_processing_preset">Cleanup preset</string>
+    <string name="set_post_processing_automatic">Automatic by publication date</string>
+    <string name="set_post_processing_modern">Modern books (1950 and later)</string>
+    <string name="set_post_processing_older">Older books (1850-1949)</string>
+    <string name="set_post_processing_early">Early books (before 1850)</string>
+    <string name="set_post_processing_summary_automatic">Uses the catalog year. Older material keeps more margin and paper tone; an unknown year uses conservative settings.</string>
+    <string name="set_post_processing_summary_modern">Moderate page flattening, close margin crop, and stronger contrast for visual consistency.</string>
+    <string name="set_post_processing_summary_older">Stronger curvature correction with a conservative crop and paper-tone-preserving contrast.</string>
+    <string name="set_post_processing_summary_early">Strong curvature correction, the widest margin allowance, and gentle contrast that preserves aged paper.</string>
+    <string name="set_post_processing_dewarp">Correct perspective and page curvature</string>
+    <string name="set_post_processing_margin_crop">Crop to detected page margins</string>
+    <string name="set_post_processing_contrast">Improve page and text contrast</string>
+    <string name="set_post_processing_spine_crop">Detect and crop book spines</string>
     <string name="set_camera">Camera</string>
     <string name="set_capture_profile">Capture profile</string>
     <string name="set_camera_fast">Fast — lower latency, about 1600 x 1200</string>
@@ -148,7 +229,7 @@
     <string name="set_camera_diagnostics_unavailable">Available after the camera starts.</string>
     <string name="set_voice">Voice control</string>
     <string name="set_voice_enable">Enable hands-free commands</string>
-    <string name="set_voice_note">Optional. Say “start / photo / done / cancel” instead of tapping. Enabling requests microphone access and downloads an offline voice model of about 40 MB; “done” and “cancel” require a completed recognition result.</string>
+    <string name="set_voice_note">Optional. Say “start”, “photo”, “done”, “cancel”, “notes”, “restart”, or “undo”. Say “end notes” while dictating to save a note. Enabling requests microphone access and downloads an offline voice model of about 40 MB; destructive commands require a completed recognition result.</string>
     <string name="set_transport">Transport</string>
     <string name="transport_cloud">Cloud</string>
     <string name="transport_lan">LAN</string>
@@ -165,6 +246,8 @@
     <string name="set_api_keys_note_local">Saved only on this phone in local mode. Sign in to synchronize later.</string>
     <string name="set_mistral">Mistral API key</string>
     <string name="set_deepseek">DeepSeek API key</string>
+    <string name="set_extraction_instructions">Custom extraction instructions</string>
+    <string name="set_extraction_instructions_hint">Optional cataloging guidance applied to new and retried scans</string>
     <string name="save">SAVE</string>
     <string name="test_connection">TEST</string>
     <string name="testing">Testing…</string>
@@ -179,8 +262,22 @@
 
     <string name="detail_photos">Page photos</string>
     <string name="detail_title">Book details</string>
+    <string name="detail_overview">Overview</string>
+    <string name="detail_capture_source">Capture source</string>
+    <string name="detail_other_details">Other details</string>
+    <string name="detail_title_page">Title page</string>
+    <string name="detail_other_photos">Other photos</string>
+    <string name="detail_open_title_page">Open title-page photo</string>
+    <string name="detail_volume_description">Book volume</string>
+    <string name="detail_page_number">Page %1$d</string>
+    <string name="detail_suggested_role">Suggested %1$s</string>
     <string name="detail_photo_description">Page photo %1$d</string>
     <string name="detail_ocr">OCR text</string>
+    <string name="detail_expand_ocr">Expand OCR text</string>
+    <string name="detail_collapse_ocr">Collapse OCR text</string>
+    <string name="detail_original">Original</string>
+    <string name="detail_processed">Processed</string>
+    <string name="detail_compare_description">Compare processed photo with the camera original</string>
     <string name="detail_discard">DISCARD BOOK</string>
     <string name="detail_discard_title">Discard this book scan?</string>
     <string name="detail_discard_message">This permanently deletes the local book scan and its page photos.</string>
@@ -197,19 +294,21 @@
     <string name="detail_claim_confirm">CLAIM &amp; UPLOAD</string>
     <string name="detail_claim_queued">Book claimed. Cloud upload is queued.</string>
     <string name="detail_no_ocr">(no OCR text yet)</string>
-    <string name="detail_deepseek_instructions">DeepSeek instructions</string>
-    <string name="detail_deepseek_action">DEEPSEEK</string>
-    <string name="detail_deepseek_action_description">Open DeepSeek instructions</string>
-    <string name="detail_deepseek_help">Add optional corrections or guidance for this book, then save to reprocess its OCR text with DeepSeek.</string>
-    <string name="detail_deepseek_hint">Optional corrections or guidance for this book</string>
-    <string name="detail_resubmit">SAVE &amp; REPROCESS</string>
-    <string name="detail_resubmit_description">Save instructions and reprocess with DeepSeek</string>
+    <string name="detail_diagnostics">Book data</string>
+    <string name="detail_expand_diagnostics">Expand book data</string>
+    <string name="detail_collapse_diagnostics">Collapse book data</string>
+    <string name="detail_diagnostics_json_tab">JSON</string>
+    <string name="detail_diagnostics_mistral_tab">Mistral</string>
+    <string name="detail_diagnostics_tabs_description">Book data views</string>
+    <string name="detail_diagnostics_json_tab_description">Show the complete persisted book JSON</string>
+    <string name="detail_diagnostics_mistral_tab_description">Show human-readable persisted Mistral responses</string>
+    <string name="detail_no_book_json">No book JSON has been persisted for this book yet.</string>
+    <string name="detail_no_persisted_mistral">No complete Mistral response was retained for this book. This is expected for captures made by older app versions.</string>
+    <string name="detail_loading_book_data">Loading persisted book data…</string>
+    <string name="detail_invalid_mistral_json">The retained response is not valid JSON. Its exact stored text follows.</string>
+    <string name="detail_mistral_capture_heading">OCR response · capture %1$d</string>
+    <string name="detail_mistral_extraction_heading">Bibliographic extraction response</string>
+    <string name="expanded">Expanded</string>
+    <string name="collapsed">Collapsed</string>
     <string name="close">CLOSE</string>
-    <string name="detail_reprocessing">Reprocessing with DeepSeek…</string>
-    <string name="detail_reprocess_error">Last attempt failed: %1$s</string>
-    <string name="detail_need_deepseek">Add a DeepSeek API key in Settings first.</string>
-    <string name="detail_need_ocr">OCR text is required before reprocessing.</string>
-    <string name="detail_reprocess_queued">DeepSeek reprocessing queued.</string>
-    <string name="detail_reprocess_local_write_failed">Could not save the reprocessing request. The book was not queued; free device storage and try again.</string>
-    <string name="detail_reprocess_desktop">This book has already been sent. Make further corrections in the desktop Library Tool.</string>
 </resources>

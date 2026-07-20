@@ -15,9 +15,25 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.io.File
+import java.io.IOException
 import java.io.RandomAccessFile
 import java.util.concurrent.TimeUnit
+
+internal const val MAX_AUTOMATIC_PROCESS_RETRIES = 3
+
+/**
+ * Automatic captures share one serial WorkManager chain. A permanently partial
+ * or invalid response must eventually release that chain so later books can
+ * run. Explicit reprocess work is isolated per entry and may keep retrying.
+ */
+internal fun shouldRetryProcessingWork(
+    retryRequested: Boolean,
+    forceReprocess: Boolean,
+    runAttemptCount: Int,
+): Boolean = retryRequested &&
+    (forceReprocess || runAttemptCount < MAX_AUTOMATIC_PROCESS_RETRIES)
 
 /**
  * Background processing, kicked after every photo and every seal: standardize
@@ -156,7 +172,11 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
         // freshly processed entries may be ready to ship
         UploadWorker.kick(ctx)
         when {
-            transient -> Result.retry()
+            shouldRetryProcessingWork(
+                transient,
+                forceReprocess,
+                runAttemptCount,
+            ) -> Result.retry()
             // A terminal failure belongs to this capture, not the serial
             // backlog chain. Marking an automatic unit failed would prevent
             // every dependent book from running. An explicit user-requested
@@ -200,19 +220,45 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
                 waitingForJpeg = true
                 continue
             }
+            // Never destructively standardize the only copy. New captures
+            // normally registered a hard-linked original in the camera
+            // callback; legacy/recovered captures get one last IO-worker
+            // preservation attempt here.
+            val originalPreserved = PhotoAssetStore.prepareForProcessing(dir, photo)
             try {
-                Pipeline.standardizeInPlace(photo)
+                if (originalPreserved) Pipeline.standardizeInPlace(photo)
             } catch (_: Exception) {
                 // The original remains usable for OCR/upload.
             }
+            PhotoAssetStore.recordDisplayVersion(
+                dir,
+                photo,
+                recipe = "android-standardize",
+                recipeVersion = "1",
+            )
             if (mistral.isEmpty()) continue
 
             Entries.markProcessing(dir, Entries.ProcessingStage.OCR)
             try {
-                val text = Pipeline.ocr(photo, mistral)
-                // Preserve a completed API call even if a newer shutter enqueue
-                // canceled this worker while the blocking request was in flight.
-                Entries.atomicWrite(sidecar, text)
+                val result = Pipeline.ocrResult(photo, mistral)
+                // Geometry lands before the Markdown sidecar, which is the
+                // per-photo commit marker checked at the top of this loop. A
+                // process death can therefore cause a harmless repeated OCR,
+                // but can never leave text permanently suppressing geometry.
+                val geometryStored = PhotoAssetStore.mergeGeometry(dir, photo, result.geometry)
+                if (result.geometry != null && !geometryStored) {
+                    throw IOException("OCR geometry could not be persisted")
+                }
+                // Retain the exact successful provider result before the
+                // Markdown commit marker. A crash can repeat OCR, but cannot
+                // leave a completed-looking photo without its diagnostics.
+                if (result.providerResponse.isNotBlank()) {
+                    Entries.atomicWrite(
+                        File(dir, photo.name + Entries.MISTRAL_RESPONSE_SUFFIX),
+                        result.providerResponse,
+                    )
+                }
+                Entries.atomicWrite(sidecar, result.markdown)
                 currentCoroutineContext().ensureActive()
             } catch (e: CancellationException) {
                 throw e
@@ -274,7 +320,18 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
 
         Entries.markProcessing(dir, Entries.ProcessingStage.EXTRACTION)
         return try {
-            val extraction = Pipeline.extract(text, deepseek, mistral, entry.customInstructions())
+            val instructions = entry.customInstructions().ifEmpty {
+                Prefs.extractionInstructions(applicationContext)
+            }
+            val extraction = Pipeline.extract(text, deepseek, mistral, instructions)
+            val mistralExtraction = File(dir, Entries.MISTRAL_EXTRACTION_RESPONSE)
+            if (extraction.provider == "mistral" && !extraction.providerResponse.isNullOrBlank()) {
+                Entries.atomicWrite(mistralExtraction, extraction.providerResponse)
+            } else {
+                // Do not present an obsolete Mistral extraction as the source of
+                // metadata that a later successful DeepSeek run superseded.
+                mistralExtraction.delete()
+            }
             val merged = Pipeline.mergeExtraction(
                 existing = entry.meta,
                 incoming = extraction.metadata,
@@ -287,6 +344,8 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
             // an optional field.
             if (forced && !extraction.complete) Entries.holdForProcessing(dir)
             Entries.atomicWrite(File(dir, "meta.json"), merged.toString())
+            PhotoAssetStore.applyBibliographicSuggestions(dir, merged)
+            requestPostProcessing(ctx, dir, merged)
             if (extraction.complete) {
                 Entries.markComplete(dir)
                 entry.finishReprocess()
@@ -310,6 +369,24 @@ class ProcessWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ct
             Entries.markFailed(dir, Entries.ProcessingStage.EXTRACTION, message, retryable = true)
             DirectoryOutcome(retry = true, lastError = message)
         }
+    }
+
+    /** Freeze post-processing preferences only after extraction supplied the
+     * catalog year and role heuristics have run. This records intent; it does
+     * not enqueue a nonexistent service or alter processing completion. */
+    private fun requestPostProcessing(ctx: Context, dir: File, metadata: JSONObject) {
+        val publicationYear = metadata.optString("year").trim().toIntOrNull()
+            ?.takeIf { it in 1..9999 }
+        val profile = Prefs.postProcessingProfile(ctx, publicationYear)
+        PhotoAssetStore.read(dir).orderedAssets()
+            .filter { asset -> isPostProcessingRole(asset.role.effectiveRole) }
+            .forEach { asset ->
+                if (!PhotoAssetStore.requestProcessing(dir, asset.assetId, profile)) {
+                    throw IOException(
+                        "Post-processing request could not be persisted for ${asset.captureFile}",
+                    )
+                }
+            }
     }
 
     private fun failureMessage(stage: String, error: Exception): String {

@@ -155,6 +155,15 @@ class CollectionsTest {
         assertEquals(existing, removeCollection(existing, "missing"))
     }
 
+    @Test
+    fun aNewCollectionKeepsItsOwnIdentityWhenSyncChangesListOrder() {
+        val home = File("src/main/java/org/whl/bookcapture/HomeActivity.kt").readText()
+        assertTrue(home.contains("val collectionId = existing?.id ?: UUID.randomUUID().toString()"))
+        assertTrue(home.contains("addCollection(current, name, from, id = collectionId)"))
+        assertTrue(home.contains("Prefs.setCurrentCollectionId(this, collectionId)"))
+        assertFalse(home.contains("Collections.all(this).lastOrNull()"))
+    }
+
     // --- which collection a new book lands in --------------------------------
 
     @Test

@@ -3,6 +3,7 @@ package org.whl.bookcapture
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import android.widget.SeekBar
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
@@ -37,8 +38,62 @@ class SettingsActivity : AppCompatActivity() {
             else R.string.set_api_keys_note_local)
         binding.displayName.setText(Prefs.displayName(this))
         binding.device.setText(Prefs.deviceName(this))
+        binding.compactScanList.isChecked = Prefs.compactScanList(this)
+        binding.compactScanList.setOnCheckedChangeListener { _, compact ->
+            Prefs.setCompactScanList(this, compact)
+        }
+        renderOcrOverlaySettings()
+        binding.showOcrRegions.setOnCheckedChangeListener { _, show ->
+            Prefs.setShowOcrRegions(this, show)
+            renderOcrOverlaySettings()
+        }
+        binding.ocrRegionOpacity.setOnSeekBarChangeListener(
+            object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    if (fromUser) {
+                        Prefs.setOcrRegionOpacityPercent(this@SettingsActivity, progress)
+                        binding.ocrRegionOpacityLabel.text = getString(
+                            R.string.set_ocr_region_opacity_value,
+                            Prefs.ocrRegionOpacityPercent(this@SettingsActivity),
+                        )
+                    }
+                }
+                override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+                override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
+            },
+        )
+        binding.showOcrRegionLabels.setOnCheckedChangeListener { _, show ->
+            Prefs.setShowOcrRegionLabels(this, show)
+        }
+        renderPostProcessingSettings()
+        binding.postProcessingPresetGroup.setOnCheckedChangeListener { _, checkedId ->
+            val preset = when (checkedId) {
+                R.id.postProcessingPresetModern ->
+                    PostProcessingPreset.MODERN_1950_AND_LATER
+                R.id.postProcessingPresetOlder ->
+                    PostProcessingPreset.OLDER_1850_TO_1949
+                R.id.postProcessingPresetEarly ->
+                    PostProcessingPreset.EARLY_BEFORE_1850
+                else -> PostProcessingPreset.AUTOMATIC_BY_DATE
+            }
+            Prefs.setPostProcessingPreset(this, preset)
+            renderPostProcessingSummary(preset)
+        }
+        binding.postProcessingDewarp.setOnCheckedChangeListener { _, enabled ->
+            Prefs.setPostProcessingDewarp(this, enabled)
+        }
+        binding.postProcessingMarginCrop.setOnCheckedChangeListener { _, enabled ->
+            Prefs.setPostProcessingMarginCrop(this, enabled)
+        }
+        binding.postProcessingContrast.setOnCheckedChangeListener { _, enabled ->
+            Prefs.setPostProcessingContrast(this, enabled)
+        }
+        binding.postProcessingSpineCrop.setOnCheckedChangeListener { _, enabled ->
+            Prefs.setPostProcessingSpineCrop(this, enabled)
+        }
         binding.mistralKey.setText(Prefs.mistralKey(this))
         binding.deepseekKey.setText(Prefs.deepseekKey(this))
+        binding.extractionInstructions.setText(Prefs.extractionInstructions(this))
         rememberProfileBaseline()
 
         // viewfinder sharpen is a GPU shader on the preview — Android 13+ only
@@ -76,6 +131,7 @@ class SettingsActivity : AppCompatActivity() {
         binding.lanToken.setText(Prefs.lanToken(this))
         binding.lanTest.setOnClickListener {
             Prefs.setLan(this, binding.lanHost.text.toString(), binding.lanToken.text.toString())
+            Prefs.setExtractionInstructions(this, binding.extractionInstructions.text.toString())
             binding.msg.text = getString(R.string.testing)
             lifecycleScope.launch {
                 val ok = withContext(Dispatchers.IO) {
@@ -210,6 +266,52 @@ class SettingsActivity : AppCompatActivity() {
         binding.cameraDiagnostics.text = Prefs.cameraDiagnostics(this).ifEmpty {
             getString(R.string.set_camera_diagnostics_unavailable)
         }
+    }
+
+    private fun renderOcrOverlaySettings() {
+        val show = Prefs.showOcrRegions(this)
+        binding.showOcrRegions.isChecked = show
+        binding.ocrRegionOptions.alpha = if (show) 1f else .5f
+        binding.ocrRegionOpacity.isEnabled = show
+        binding.showOcrRegionLabels.isEnabled = show
+        binding.ocrRegionOpacity.progress = Prefs.ocrRegionOpacityPercent(this)
+        binding.ocrRegionOpacityLabel.text = getString(
+            R.string.set_ocr_region_opacity_value,
+            Prefs.ocrRegionOpacityPercent(this),
+        )
+        binding.showOcrRegionLabels.isChecked = Prefs.showOcrRegionLabels(this)
+    }
+
+    private fun renderPostProcessingSettings() {
+        val preset = Prefs.postProcessingPreset(this)
+        binding.postProcessingPresetGroup.check(when (preset) {
+            PostProcessingPreset.AUTOMATIC_BY_DATE -> R.id.postProcessingPresetAutomatic
+            PostProcessingPreset.MODERN_1950_AND_LATER -> R.id.postProcessingPresetModern
+            PostProcessingPreset.OLDER_1850_TO_1949 -> R.id.postProcessingPresetOlder
+            PostProcessingPreset.EARLY_BEFORE_1850 -> R.id.postProcessingPresetEarly
+        })
+        val features = Prefs.postProcessingFeatures(this)
+        binding.postProcessingDewarp.isChecked =
+            features.dewarpPerspectiveAndPageCurvature
+        binding.postProcessingMarginCrop.isChecked =
+            features.cropToDetectedPageMargins
+        binding.postProcessingContrast.isChecked =
+            features.normalizePageAndTextContrast
+        binding.postProcessingSpineCrop.isChecked = features.detectAndCropSpine
+        renderPostProcessingSummary(preset)
+    }
+
+    private fun renderPostProcessingSummary(preset: PostProcessingPreset) {
+        binding.postProcessingPresetSummary.setText(when (preset) {
+            PostProcessingPreset.AUTOMATIC_BY_DATE ->
+                R.string.set_post_processing_summary_automatic
+            PostProcessingPreset.MODERN_1950_AND_LATER ->
+                R.string.set_post_processing_summary_modern
+            PostProcessingPreset.OLDER_1850_TO_1949 ->
+                R.string.set_post_processing_summary_older
+            PostProcessingPreset.EARLY_BEFORE_1850 ->
+                R.string.set_post_processing_summary_early
+        })
     }
 
     private fun rememberProfileBaseline() {

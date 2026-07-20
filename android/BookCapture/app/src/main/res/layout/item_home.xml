@@ -29,6 +29,7 @@
         android:layout_marginEnd="11dp"
         android:scaleType="centerCrop"
         android:background="@color/whl_face_sh"
+        android:foreground="@drawable/whl_thumbnail_frame"
         android:contentDescription="@string/detail_photos" />
 
     <LinearLayout

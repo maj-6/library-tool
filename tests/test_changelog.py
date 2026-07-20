@@ -6,18 +6,19 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[1]
-CHANGELOG = (ROOT / "website" / "changelog.md").read_text(encoding="utf-8")
+DESKTOP_CHANGELOG = (ROOT / "website" / "changelog.md").read_text(encoding="utf-8")
+ANDROID_CHANGELOG = (ROOT / "website" / "android-changelog.md").read_text(encoding="utf-8")
 CATEGORY_ORDER = ("Additions", "Other Changes", "Bugfixes")
 
 
-def test_changelog_uses_public_release_categories_in_a_fixed_order():
+def validate_changelog(changelog: str) -> list[str]:
     versions: list[str] = []
     categories: dict[str, list[str]] = {}
     bullet_counts: dict[tuple[str, str], int] = {}
     current_version = ""
     current_category = ""
 
-    for raw in CHANGELOG.splitlines():
+    for raw in changelog.splitlines():
         if match := re.match(r"^##\s+(.+?)\s+—\s+\d{4}-\d{2}-\d{2}$", raw):
             current_version = match.group(1)
             current_category = ""
@@ -44,9 +45,23 @@ def test_changelog_uses_public_release_categories_in_a_fixed_order():
         assert names == sorted(names, key=CATEGORY_ORDER.index)
         assert all(bullet_counts.get((version, name), 0) for name in names)
 
+    assert "<!--more-->" not in changelog
+    return versions
+
+
+def test_changelogs_use_public_release_categories_in_a_fixed_order():
+    desktop_versions = validate_changelog(DESKTOP_CHANGELOG)
+    android_versions = validate_changelog(ANDROID_CHANGELOG)
+
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert versions[0] == project["project"]["version"]
-    assert "<!--more-->" not in CHANGELOG
+    assert desktop_versions[0] == project["project"]["version"]
+
+    android_build = (ROOT / "android" / "BookCapture" / "app" / "build.gradle.kts").read_text(
+        encoding="utf-8"
+    )
+    android_version = re.search(r'versionName\s*=\s*"([^"]+)"', android_build)
+    assert android_version
+    assert android_versions[0] == android_version.group(1)
 
 
 def test_changelog_avoids_internal_release_note_terms():
@@ -59,4 +74,5 @@ def test_changelog_avoids_internal_release_note_terms():
         "Supabase",
         "CPRS",
     ):
-        assert term not in CHANGELOG
+        assert term not in DESKTOP_CHANGELOG
+        assert term not in ANDROID_CHANGELOG

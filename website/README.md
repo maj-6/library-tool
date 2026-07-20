@@ -134,10 +134,11 @@ plus the `schema_migrations` ledger, and nothing else.
 `downloads.html` shows the newest build per platform *and channel* from the
 `releases` table. Rows on a non-stable channel (alpha/beta/rc) drop into a
 separate "Pre-release builds" section, badged with their channel and never
-tinted as the primary download. `releases.html` is the full history: it
-fetches `changelog.md` from the site root — the same file the desktop app
-bundles — and parses it client-side (`parseChangelog` in `assets/data.js`),
-grouped by major version.
+tinted as the primary download. `releases.html` is the full history, separated
+into Desktop and Android views. The desktop view fetches `changelog.md` — its
+historical filename is retained because the desktop app bundles it — while
+Android fetches `android-changelog.md`. Both are parsed client-side
+(`parseChangelog` in `assets/data.js`).
 
 ## Publishing
 

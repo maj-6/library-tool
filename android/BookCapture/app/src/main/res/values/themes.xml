@@ -21,6 +21,9 @@
     <color name="whl_blue">#55503F</color>
     <color name="whl_blue2">#6F6853</color>
     <color name="whl_row_checked">#DDE7D5</color>
+    <color name="whl_current_blue">#DCEEF4</color>
+    <color name="whl_current_blue_pressed">#C9E2EB</color>
+    <color name="whl_thumbnail_border">#616661</color>
     <color name="whl_button_text">#FBF9F2</color>
     <color name="ic_launcher_bg">#FBF7EE</color>
 
@@ -63,6 +66,17 @@
         <item name="android:minHeight">52dp</item>
         <item name="android:minWidth">0dp</item>
         <item name="android:padding">13dp</item>
+        <item name="android:stateListAnimator">@null</item>
+    </style>
+
+    <!-- Quiet icon action used inside a row. It keeps a full touch target and
+         ripple without giving every edit/delete glyph a second bordered tile. -->
+    <style name="WhlInlineIconButton" parent="Widget.AppCompat.ImageButton">
+        <item name="android:background">@android:color/transparent</item>
+        <item name="android:foreground">?attr/selectableItemBackgroundBorderless</item>
+        <item name="android:minHeight">48dp</item>
+        <item name="android:minWidth">48dp</item>
+        <item name="android:padding">12dp</item>
         <item name="android:stateListAnimator">@null</item>
     </style>
 

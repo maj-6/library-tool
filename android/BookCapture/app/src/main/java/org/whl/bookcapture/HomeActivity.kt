@@ -1,17 +1,18 @@
 package org.whl.bookcapture
 
 import android.content.Intent
-import android.graphics.BitmapFactory
 import android.graphics.Typeface
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
+import android.view.ViewGroup
 import android.widget.CheckBox
 import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.ViewCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.work.WorkManager
 import kotlinx.coroutines.Dispatchers
@@ -19,6 +20,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.whl.bookcapture.databinding.ActivityHomeBinding
+import java.util.UUID
+import kotlin.math.roundToInt
 
 /**
  * The landing screen. Launching the app opens HERE, not the camera: a list of
@@ -37,12 +40,20 @@ class HomeActivity : AppCompatActivity() {
     private var selectionMode = false
     private val selectedIds = linkedSetOf<String>()
     private var showingCollections = false
+    private val expandedScanGroups = linkedSetOf<String>()
+    private var scanGroupsInitialized = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityHomeBinding.inflate(layoutInflater)
         setContentView(binding.root)
         showingCollections = savedInstanceState?.getBoolean(STATE_TAB_COLLECTIONS) ?: false
+        selectionMode = savedInstanceState?.getBoolean(STATE_SELECTION_MODE) ?: false
+        savedInstanceState?.getStringArrayList(STATE_SELECTED_IDS)?.let(selectedIds::addAll)
+        scanGroupsInitialized =
+            savedInstanceState?.getBoolean(STATE_SCAN_GROUPS_INITIALIZED) ?: false
+        savedInstanceState?.getStringArrayList(STATE_EXPANDED_SCAN_GROUPS)
+            ?.let(expandedScanGroups::addAll)
 
         binding.tabScans.setOnClickListener { showTab(collections = false) }
         binding.tabCollections.setOnClickListener { showTab(collections = true) }
@@ -95,6 +106,13 @@ class HomeActivity : AppCompatActivity() {
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         outState.putBoolean(STATE_TAB_COLLECTIONS, showingCollections)
+        outState.putBoolean(STATE_SELECTION_MODE, selectionMode)
+        outState.putStringArrayList(STATE_SELECTED_IDS, ArrayList(selectedIds))
+        outState.putBoolean(STATE_SCAN_GROUPS_INITIALIZED, scanGroupsInitialized)
+        outState.putStringArrayList(
+            STATE_EXPANDED_SCAN_GROUPS,
+            ArrayList(expandedScanGroups),
+        )
     }
 
     override fun onResume() {
@@ -242,27 +260,34 @@ class HomeActivity : AppCompatActivity() {
         val inflater = LayoutInflater.from(this)
         for (c in collections) {
             val row = inflater.inflate(R.layout.item_collection, list, false)
-            row.findViewById<TextView>(R.id.name).text = c.name
             val isCurrent = c.id == current?.id
-            // CURRENT leads: the subline is one ellipsized line, so the tail is
-            // what gets eaten on a narrow screen or a long origin. Losing the
-            // book count there is fine; losing "which collection am I scanning
-            // into" is not.
+            row.isSelected = isCurrent
+            ViewCompat.setStateDescription(
+                row,
+                getString(R.string.collections_current_state).takeIf { isCurrent },
+            )
+            val name = row.findViewById<TextView>(R.id.name)
+            name.text = c.name
+            name.setTypeface(name.typeface, if (isCurrent) Typeface.BOLD else Typeface.NORMAL)
+            row.setBackgroundResource(
+                if (isCurrent) R.drawable.whl_collection_current else R.drawable.whl_row)
             row.findViewById<TextView>(R.id.sub).text = listOf(
-                if (isCurrent) getString(R.string.collections_row_current) else "",
                 if (c.from.isEmpty()) getString(R.string.collections_row_no_from)
                 else getString(R.string.collections_row_from, c.from),
                 resources.getQuantityString(
                     R.plurals.collections_row_books, counts[c.id] ?: 0, counts[c.id] ?: 0),
             ).filter { it.isNotEmpty() }.joinToString(" · ")
-            row.findViewById<View>(R.id.currentMarker).setBackgroundColor(
-                getColor(if (isCurrent) R.color.whl_cyan else R.color.whl_face_sh2))
-            row.findViewById<View>(R.id.editCollection).setOnClickListener { editCollection(c) }
-            row.findViewById<View>(R.id.deleteCollection).setOnClickListener {
+            val edit = row.findViewById<View>(R.id.editCollection)
+            edit.contentDescription = getString(R.string.collections_edit_description, c.name)
+            edit.setOnClickListener { editCollection(c) }
+            val delete = row.findViewById<View>(R.id.deleteCollection)
+            delete.contentDescription = getString(R.string.collections_delete_description, c.name)
+            delete.setOnClickListener {
                 confirmDeleteCollection(c)
             }
             row.setOnClickListener {
                 Prefs.setCurrentCollectionId(this, c.id)
+                expandedScanGroups.add(c.id)
                 Toast.makeText(
                     this, getString(R.string.collections_current, c.name), Toast.LENGTH_SHORT
                 ).show()
@@ -282,37 +307,53 @@ class HomeActivity : AppCompatActivity() {
 
     /** Add ([existing] null) or edit one collection. */
     private fun editCollection(existing: BookCollection?) {
+        // Keep the identity chosen by this edit. Sync can append cloud rows as
+        // soon as mutate() returns, so selecting the list's last row would race
+        // that pull and could choose a different collection.
+        val collectionId = existing?.id ?: UUID.randomUUID().toString()
         val view = layoutInflater.inflate(R.layout.dialog_collection, null)
         val nameField = view.findViewById<android.widget.EditText>(R.id.collectionName)
         val fromField = view.findViewById<android.widget.EditText>(R.id.collectionFrom)
+        // Existing values are editable content. The layout's examples remain
+        // generic hints and never duplicate a saved collection as placeholder text.
         nameField.setText(existing?.name.orEmpty())
         fromField.setText(existing?.from.orEmpty())
-        AlertDialog.Builder(this)
+        if (existing != null) {
+            // Edit mode already contains the saved values; showing the new-item
+            // examples again after a field is cleared reads like prefilled data.
+            nameField.hint = null
+            fromField.hint = null
+        }
+        val dialog = AlertDialog.Builder(this)
             .setTitle(
                 if (existing == null) R.string.collections_add_title
                 else R.string.collections_edit_title)
             .setView(view)
-            .setNegativeButton(android.R.string.cancel, null)
-            .setPositiveButton(R.string.collections_save) { _, _ ->
-                val name = nameField.text.toString()
-                val from = fromField.text.toString()
-                val error = Collections.mutate(this) { current ->
-                    if (existing == null) addCollection(current, name, from)
-                    else updateCollection(current, existing.id, name, from)
-                }
-                if (error != null) {
-                    Toast.makeText(this, error, Toast.LENGTH_LONG).show()
-                    return@setPositiveButton
-                }
-                // A collection the user just created is almost certainly the one
-                // they are about to scan into; select it so the next tap works.
-                if (existing == null) {
-                    Collections.all(this).lastOrNull()
-                        ?.let { Prefs.setCurrentCollectionId(this, it.id) }
-                }
-                refreshCollections()
+            .create()
+        view.findViewById<View>(R.id.cancelCollectionEdit).setOnClickListener {
+            dialog.dismiss()
+        }
+        view.findViewById<View>(R.id.saveCollectionEdit).setOnClickListener {
+            val name = nameField.text.toString()
+            val from = fromField.text.toString()
+            val error = Collections.mutate(this) { current ->
+                if (existing == null) addCollection(current, name, from, id = collectionId)
+                else updateCollection(current, existing.id, name, from)
             }
-            .show()
+            if (error != null) {
+                Toast.makeText(this, error, Toast.LENGTH_LONG).show()
+                return@setOnClickListener
+            }
+            // A collection the user just created is almost certainly the one
+            // they are about to scan into; select it so the next tap works.
+            if (existing == null) {
+                Prefs.setCurrentCollectionId(this, collectionId)
+                expandedScanGroups.add(collectionId)
+            }
+            dialog.dismiss()
+            refreshCollections()
+        }
+        dialog.show()
     }
 
     private fun confirmDeleteCollection(collection: BookCollection) {
@@ -349,50 +390,116 @@ class HomeActivity : AppCompatActivity() {
         }
         val inflater = LayoutInflater.from(this)
         val thumbs = ArrayList<Pair<ImageView, java.io.File>>()
-        for (e in entries) {
-            val row = inflater.inflate(R.layout.item_home, list, false)
-            row.findViewById<TextView>(R.id.title).text = Entries.titleLabel(this, e)
-            row.findViewById<TextView>(R.id.sub).text =
-                listOf(
-                    e.author,
-                    e.year,
-                    resources.getQuantityString(
-                        R.plurals.capture_count, e.photoCount, e.photoCount),
-                    // where the book came from, once it has provenance
-                    if (e.from.isEmpty()) "" else getString(R.string.collections_row_from, e.from))
-                    .filter { it.isNotEmpty() }.joinToString(" · ")
-            val state = Entries.statusLabel(this, e)
-            row.findViewById<TextView>(R.id.state).text = state
-            row.findViewById<View>(R.id.marker).setBackgroundColor(getColor(markerColor(state)))
-            val thumb = row.findViewById<ImageView>(R.id.thumb)
-            val selected = row.findViewById<CheckBox>(R.id.selected)
-            selected.visibility = if (selectionMode) View.VISIBLE else View.GONE
-            selected.isChecked = e.id in selectedIds
-            selected.setOnClickListener { toggleSelection(e.id) }
-            e.photos().firstOrNull()?.let { thumbs.add(thumb to it) }
-            row.setOnClickListener {
-                if (selectionMode) toggleSelection(e.id)
-                else startActivity(Intent(this, EntryDetailActivity::class.java)
+        val knownCollectionNames = Collections.all(this).associate { it.id to it.name }
+        val currentCollectionId = Collections.current(this)?.id
+        val groups = groupScansByCollection(
+            items = entries,
+            currentCollectionId = currentCollectionId,
+            collectionId = { it.provenance?.collectionId },
+            collectionLabel = { entry ->
+                entry.provenance?.collectionId?.let(knownCollectionNames::get)
+                    .orEmpty().ifEmpty { entry.collectionName }
+            },
+            unfiledLabel = getString(R.string.home_group_unfiled),
+        )
+        if (!scanGroupsInitialized) {
+            initiallyExpandedScanGroup(groups, currentCollectionId)?.let(expandedScanGroups::add)
+            scanGroupsInitialized = true
+        }
+        val compact = Prefs.compactScanList(this)
+        for (group in groups) {
+            val expanded = group.key in expandedScanGroups
+            val header = inflater.inflate(R.layout.item_scan_group, list, false)
+            val groupName = header.findViewById<TextView>(R.id.groupName)
+            groupName.text = group.label
+            groupName.setTypeface(
+                groupName.typeface,
+                if (group.key == currentCollectionId) Typeface.BOLD else Typeface.NORMAL,
+            )
+            val count = resources.getQuantityString(
+                R.plurals.home_group_scan_count,
+                group.items.size,
+                group.items.size,
+            )
+            header.findViewById<TextView>(R.id.groupCount).text = count
+            header.findViewById<ImageView>(R.id.groupChevron).setImageResource(
+                if (expanded) R.drawable.ic_expand_more else R.drawable.ic_chevron_right)
+            header.contentDescription = getString(
+                if (expanded) R.string.home_group_collapse else R.string.home_group_expand,
+                group.label,
+                count,
+            )
+            header.setOnClickListener {
+                if (!expandedScanGroups.add(group.key)) expandedScanGroups.remove(group.key)
+                refreshHome()
+            }
+            list.addView(header)
+            if (!expanded) continue
+
+            for (e in group.items) {
+                val row = inflater.inflate(R.layout.item_home, list, false)
+                row.findViewById<TextView>(R.id.title).text = Entries.titleLabel(this, e)
+                row.findViewById<TextView>(R.id.sub).text =
+                    listOf(
+                        e.author,
+                        e.year,
+                        resources.getQuantityString(
+                            R.plurals.capture_count, e.photoCount, e.photoCount),
+                        if (e.from.isEmpty()) ""
+                        else getString(R.string.collections_row_from, e.from),
+                    ).filter { it.isNotEmpty() }.joinToString(" · ")
+                val state = Entries.statusLabel(this, e)
+                row.findViewById<TextView>(R.id.state).text = state
+                row.findViewById<View>(R.id.marker)
+                    .setBackgroundColor(getColor(markerColor(state)))
+                val thumb = row.findViewById<ImageView>(R.id.thumb)
+                applyScanListLayout(row, thumb, compact)
+                val selected = row.findViewById<CheckBox>(R.id.selected)
+                selected.visibility = if (selectionMode) View.VISIBLE else View.GONE
+                selected.isChecked = e.id in selectedIds
+                selected.setOnClickListener { toggleSelection(e.id) }
+                e.thumbnailPhoto()?.let { thumbs.add(thumb to it) }
+                row.setOnClickListener {
+                    if (selectionMode) toggleSelection(e.id)
+                    else startActivity(Intent(this, EntryDetailActivity::class.java)
                         .putExtra(EntryDetailActivity.EXTRA_ID, e.id))
+                }
+                row.setOnLongClickListener {
+                    if (!selectionMode) selectionMode = true
+                    toggleSelection(e.id)
+                    true
+                }
+                list.addView(row)
             }
-            row.setOnLongClickListener {
-                if (!selectionMode) selectionMode = true
-                toggleSelection(e.id)
-                true
-            }
-            list.addView(row)
         }
         // decode the page thumbnails off the UI thread, in list order
         thumbJob = lifecycleScope.launch {
             for ((iv, file) in thumbs) {
                 val bmp = withContext(Dispatchers.IO) {
-                    BitmapFactory.decodeFile(file.absolutePath,
-                        BitmapFactory.Options().apply { inSampleSize = 8 })
+                    decodeSampledOriented(file, maxWidth = 512, maxHeight = 512)
                 } ?: continue
                 iv.setImageBitmap(bmp)
             }
         }
     }
+
+    private fun applyScanListLayout(row: View, thumb: ImageView, compact: Boolean) {
+        val metrics = scanListLayoutMetrics(compact)
+        row.setPaddingRelative(
+            row.paddingStart,
+            dp(metrics.rowVerticalPaddingDp),
+            row.paddingEnd,
+            dp(metrics.rowVerticalPaddingDp),
+        )
+        val params = thumb.layoutParams as ViewGroup.MarginLayoutParams
+        params.width = dp(metrics.thumbnailWidthDp)
+        params.height = dp(metrics.thumbnailHeightDp)
+        params.marginEnd = dp(metrics.thumbnailEndMarginDp)
+        thumb.layoutParams = params
+    }
+
+    private fun dp(value: Int): Int =
+        (value * resources.displayMetrics.density).roundToInt()
 
     private fun toggleSelection(id: String) {
         if (id in selectedIds) selectedIds.remove(id) else selectedIds.add(id)
@@ -474,5 +581,9 @@ class HomeActivity : AppCompatActivity() {
 
     private companion object {
         const val STATE_TAB_COLLECTIONS = "tab_collections"
+        const val STATE_SELECTION_MODE = "selection_mode"
+        const val STATE_SELECTED_IDS = "selected_ids"
+        const val STATE_SCAN_GROUPS_INITIALIZED = "scan_groups_initialized"
+        const val STATE_EXPANDED_SCAN_GROUPS = "expanded_scan_groups"
     }
 }

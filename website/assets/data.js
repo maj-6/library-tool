@@ -418,12 +418,19 @@ export async function latestReleases() {
   return rest("releases?select=*&order=published_at.desc");
 }
 
-/** The shared release notes: changelog.md at the site root, the same file the
- *  desktop app bundles. Returns [{version, date, categories, items}] newest-first,
- *  or [] on any failure so the pages degrade to no changelog rather than an error. */
-export async function fetchChangelog() {
+const CHANGELOG_FILES = Object.freeze({
+  desktop: "changelog.md",
+  android: "android-changelog.md",
+});
+
+/** Platform-specific release notes. The desktop file retains its historical
+ *  changelog.md name because installed desktop builds also bundle it. Returns
+ *  [{version, date, categories, items}] newest-first, or [] on any failure so
+ *  the page degrades to no changelog rather than an error. */
+export async function fetchChangelog(platform = "desktop") {
   try {
-    const r = await fetch("changelog.md");
+    const file = CHANGELOG_FILES[platform] || CHANGELOG_FILES.desktop;
+    const r = await fetch(file);
     if (!r.ok) return [];
     return parseChangelog(await r.text());
   } catch {
