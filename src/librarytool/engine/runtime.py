@@ -628,6 +628,38 @@ class LibraryEngineBuilder:
                 else binding
                 for binding in active_bindings
             ]
+        provider_binding = next(
+            (
+                binding
+                for binding in active_bindings
+                if binding.key == PROVIDER_DISCOVERY_SERVICE
+            ),
+            None,
+        )
+        if provider_binding is not None:
+            if not isinstance(
+                provider_binding.service,
+                ProviderDiscoveryService,
+            ):
+                raise ServiceRegistryError(
+                    "provider discovery requires a ProviderDiscoveryService "
+                    "binding"
+                )
+            configured_providers = (
+                provider_binding.service.with_executable_capabilities(
+                    active_capabilities
+                )
+            )
+            active_bindings = [
+                ServiceBinding(
+                    binding.key,
+                    configured_providers,
+                    binding.capabilities,
+                )
+                if binding is provider_binding
+                else binding
+                for binding in active_bindings
+            ]
         services = ServiceRegistry(active_bindings)
         return LibraryEngine(capabilities=capabilities, services=services)
 

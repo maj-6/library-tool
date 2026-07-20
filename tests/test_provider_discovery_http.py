@@ -26,6 +26,7 @@ from librarytool.engine.runtime import (
     LibraryEngineBuilder,
     ModuleContribution,
     ServiceBinding,
+    ServiceKey,
 )
 from librarytool_http import create_provider_discovery_blueprint
 
@@ -63,14 +64,23 @@ def _engine(service: ProviderDiscoveryService | None) -> LibraryEngine:
     if service is None:
         return LibraryEngine(CapabilityRegistry().seal())
     capability = CapabilityRef("library.providers.discover")
-    return LibraryEngineBuilder((ModuleContribution(
+    provider_module = ModuleContribution(
         ModuleManifest("test.providers", "1.0.0", provides=(capability,)),
         bindings=(ServiceBinding(
             PROVIDER_DISCOVERY_SERVICE,
             service,
             (capability,),
         ),),
-    ),)).build()
+    )
+    command_module = ModuleContribution(
+        ModuleManifest("test.layout", "1.0.0", provides=(LAYOUT,)),
+        bindings=(ServiceBinding(
+            ServiceKey("test.layout.generator"),
+            object(),
+            (LAYOUT,),
+        ),),
+    )
+    return LibraryEngineBuilder((provider_module, command_module)).build()
 
 
 def _app(engine: LibraryEngine) -> Flask:
@@ -124,6 +134,7 @@ def test_provider_discovery_is_versioned_read_only_and_conditional():
             "command_available": True,
             "reason": None,
         }],
+        "executable_commands": [LAYOUT.as_dict()],
         "available_commands": [LAYOUT.as_dict()],
     }
 

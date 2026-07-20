@@ -124,12 +124,16 @@ Per-component detail lives in each part's own README (map at the end).
   projection contains stable IDs/versions, exact capability refs, portable
   execution/media/language/limit traits, secret-presence status IDs, cached
   sanitized health, and explicit user/default selection. Command availability
-  fails closed and never silently replaces an unhealthy user selection with a
-  default. The optional `library.providers` module and versioned
-  `/api/v1/providers` resource are composed only when a host injects that
-  complete registry and its side-effect-free cached probes. Production injects
-  none, so legacy generation is neither registered nor advertised as an engine
-  capability. Item delete/restore now has a neutral
+  fails closed, validates health reasons in context, and never silently replaces
+  an unhealthy user selection with a default. Engine assembly derives an
+  immutable discovery service against exact active module capabilities, so a
+  selected healthy provider still reports `command-not-installed` until a
+  concrete module binds that command. The optional `library.providers` module
+  and versioned `/api/v1/providers` resource are composed only when a host
+  injects that complete registry and its side-effect-free cached probes;
+  process-lifetime host bindings carry the same optional seam. Production
+  injects none, so legacy generation is neither registered nor advertised as
+  an engine capability. Item delete/restore now has a neutral
   dual-CAS, tombstone, receipt, replay, and coherent preflight contract plus a
   recoverable no-copy managed-tree move primitive. Its filesystem repository
   persists private raw-record envelopes, moves owned trees before publishing

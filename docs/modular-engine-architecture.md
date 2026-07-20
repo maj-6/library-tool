@@ -496,14 +496,24 @@ inject cached, side-effect-free health and secret-presence snapshots; neither
 composition nor discovery contacts a provider. Selection is explicit: a user
 choice takes precedence over a declared default, and an unhealthy user choice
 never silently falls back. Missing selection, provider, capability,
-configuration, health, or secret status fails the corresponding command
-closed with one fixed public reason.
+configuration, health, secret status, or executable engine command fails the
+corresponding command closed with one fixed public reason. Health reason codes
+are valid only in their declared context: degraded means usable with the
+canonical degraded reason, while disabled, unreachable, and unavailable states
+cannot be mislabeled as degraded.
 
 When that bundle is present, the optional `library.providers` module exposes
 read-only `library.providers.discover` and `/api/v1/providers`; the strict
 browser client rejects unknown fields, inconsistent availability, private
-command fingerprints, secret values, and noncanonical failure text. Production
-does not yet bind the bundle. Consequently the route reports the optional
+command fingerprints, secret values, and noncanonical failure text. The
+process-lifetime filesystem host carries the optional bundle through the same
+startup and module-composition path as other services. During engine assembly,
+the immutable discovery service is derived against the exact capabilities of
+active modules; its default executable set is empty, and a provider can never
+advertise a command merely because it is selected and healthy. Capability
+versions are bounded to JSON's exact interoperable integer range at the shared
+contract root. Production does not yet bind the bundle. Consequently the route
+reports the optional
 service as unavailable, capability discovery advertises no provider-discovery
 module, and no legacy Replica, OCR, translation, image, embedding, or answer
 generator is represented as a production engine command. This is a truthful
@@ -615,9 +625,10 @@ With the lifecycle seam established, migrate these data boundaries in order:
    production. Next, implement individual provider execution adapters and
    migrate translation generation and remaining OCR/AI jobs one capability at
    a time. Compound-credential mutation remains a separate secret-store
-   extension. Advertise an optional command only when its selected provider
-   and its engine executor are both installed, configured, compatible, and
-   healthy—not merely because a UI contains a button.
+   extension. Advertise an optional command only when an active module binds
+   its exact executable capability and its selected provider is installed,
+   configured, compatible, and healthy—not merely because a UI contains a
+   button.
 
 ### Protected-secret cutover status
 

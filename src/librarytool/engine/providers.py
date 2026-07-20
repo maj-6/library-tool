@@ -5,6 +5,8 @@ this module.  A host contributes immutable public descriptors plus cached,
 side-effect-free status probes.  Clients can then discover which generation
 contracts are installed and whether a command is safe to offer without ever
 receiving credential material, filesystem paths, or raw provider failures.
+Executable command capability is supplied separately by the sealed engine
+module graph and defaults to empty.
 """
 
 from __future__ import annotations
@@ -163,6 +165,34 @@ def _capabilities(values: Iterable[CapabilityRef]) -> tuple[CapabilityRef, ...]:
         )
     if len(set(result)) != len(result):
         raise ProviderValidationError("capabilities contains a duplicate")
+    return tuple(sorted(result))
+
+
+def _executable_capabilities(
+    values: Iterable[CapabilityRef],
+) -> tuple[CapabilityRef, ...]:
+    if isinstance(values, (str, bytes)):
+        raise ProviderValidationError(
+            "executable_capabilities must contain CapabilityRef values"
+        )
+    try:
+        result = tuple(values)
+    except TypeError as exc:
+        raise ProviderValidationError(
+            "executable_capabilities must contain CapabilityRef values"
+        ) from exc
+    if any(not isinstance(value, CapabilityRef) for value in result):
+        raise ProviderValidationError(
+            "executable_capabilities must contain CapabilityRef values"
+        )
+    if any(value.version > _MAX_JSON_SAFE_INTEGER for value in result):
+        raise ProviderValidationError(
+            "executable capability versions must be JSON-safe positive integers"
+        )
+    if len(set(result)) != len(result):
+        raise ProviderValidationError(
+            "executable_capabilities contains a duplicate"
+        )
     return tuple(sorted(result))
 
 
@@ -329,6 +359,7 @@ class ProviderHealthState(StrEnum):
 
 
 _PUBLIC_REASON_MESSAGES = MappingProxyType({
+    "command-not-installed": "The command implementation is not installed.",
     "disabled": "The provider is disabled.",
     "health-unknown": "Provider health could not be determined.",
     "network-unavailable": "Required network access is unavailable.",
@@ -343,6 +374,22 @@ _PUBLIC_REASON_MESSAGES = MappingProxyType({
     "runtime-unavailable": "The provider runtime is unavailable.",
     "secret-status-unknown": "Required credential status is unavailable.",
     "secret-unavailable": "A required credential is not configured.",
+})
+
+_DEGRADED_HEALTH_REASONS = frozenset({"provider-degraded"})
+_CONFIGURED_UNAVAILABLE_HEALTH_REASONS = frozenset({
+    "disabled",
+    "health-unknown",
+    "network-unavailable",
+    "probe-failed",
+    "provider-unavailable",
+    "remote-unreachable",
+    "runtime-unavailable",
+})
+_UNCONFIGURED_HEALTH_REASONS = frozenset({
+    "health-unknown",
+    "not-configured",
+    "probe-failed",
 })
 
 
@@ -393,6 +440,24 @@ class ProviderHealthSnapshot:
             raise ProviderValidationError(
                 "a degraded or unavailable provider needs a public reason"
             )
+        reason_code = None if self.reason is None else self.reason.code
+        if (
+            self.state == ProviderHealthState.DEGRADED
+            and reason_code not in _DEGRADED_HEALTH_REASONS
+        ):
+            raise ProviderValidationError(
+                "a degraded provider needs a degraded health reason"
+            )
+        if self.state == ProviderHealthState.UNAVAILABLE:
+            allowed = (
+                _CONFIGURED_UNAVAILABLE_HEALTH_REASONS
+                if self.configured
+                else _UNCONFIGURED_HEALTH_REASONS
+            )
+            if reason_code not in allowed:
+                raise ProviderValidationError(
+                    "an unavailable provider has an incompatible health reason"
+                )
 
 
 class ProviderHealthProbe(Protocol):
@@ -576,10 +641,18 @@ class ProviderDiscoveryService:
     Construction validates structure without invoking a probe.  Querying calls
     only the injected cached snapshot ports and converts every exception or
     malformed result to a closed public reason.  It never calls a provider SDK.
+    A newly constructed service advertises no executable commands; engine
+    assembly derives an immutable copy from its exact active capabilities.
     """
 
     SCHEMA = "librarytool.providers/1"
-    __slots__ = ("_health_probes", "_policy", "_registry", "_secret_probe")
+    __slots__ = (
+        "_executable_capabilities",
+        "_health_probes",
+        "_policy",
+        "_registry",
+        "_secret_probe",
+    )
 
     def __init__(
         self,
@@ -588,6 +661,7 @@ class ProviderDiscoveryService:
         *,
         health_probes: Mapping[str, ProviderHealthProbe] | None = None,
         secret_status_probe: SecretStatusProbe | None = None,
+        executable_capabilities: Iterable[CapabilityRef] = (),
     ) -> None:
         if not isinstance(registry, ProviderRegistry):
             raise ProviderValidationError("registry must be ProviderRegistry")
@@ -617,9 +691,32 @@ class ProviderDiscoveryService:
         object.__setattr__(self, "_policy", policy)
         object.__setattr__(self, "_health_probes", MappingProxyType(copied))
         object.__setattr__(self, "_secret_probe", secret_status_probe)
+        object.__setattr__(
+            self,
+            "_executable_capabilities",
+            _executable_capabilities(executable_capabilities),
+        )
 
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError("ProviderDiscoveryService is immutable")
+
+    @property
+    def executable_capabilities(self) -> tuple[CapabilityRef, ...]:
+        return self._executable_capabilities
+
+    def with_executable_capabilities(
+        self,
+        capabilities: Iterable[CapabilityRef],
+    ) -> ProviderDiscoveryService:
+        """Return a derived service reconciled to executable engine commands."""
+
+        return ProviderDiscoveryService(
+            self._registry,
+            self._policy,
+            health_probes=self._health_probes,
+            secret_status_probe=self._secret_probe,
+            executable_capabilities=capabilities,
+        )
 
     def _health_for(self, provider_id: str) -> ProviderHealthSnapshot:
         probe = self._health_probes.get(provider_id)
@@ -733,6 +830,11 @@ class ProviderDiscoveryService:
         capabilities.update(
             selection.capability for selection in self._policy.selections
         )
+        executable = frozenset(self._executable_capabilities)
+        executable_commands = [
+            capability.as_dict()
+            for capability in sorted(capabilities & executable)
+        ]
         selection_rows: list[dict[str, object]] = []
         available_commands: list[dict[str, object]] = []
         for capability in sorted(capabilities):
@@ -754,6 +856,8 @@ class ProviderDiscoveryService:
                     reason = ProviderStatusReason("provider-not-installed")
                 elif capability not in descriptor.capabilities:
                     reason = ProviderStatusReason("provider-incompatible")
+                elif capability not in executable:
+                    reason = ProviderStatusReason("command-not-installed")
                 elif provider_row["available"] is not True:
                     health = provider_row["health"]
                     assert isinstance(health, Mapping)
@@ -774,6 +878,7 @@ class ProviderDiscoveryService:
             "schema": self.SCHEMA,
             "providers": provider_rows,
             "selections": selection_rows,
+            "executable_commands": executable_commands,
             "available_commands": available_commands,
         }
 

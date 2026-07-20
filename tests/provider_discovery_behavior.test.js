@@ -60,6 +60,7 @@ function providerDocument() {
       command_available: true,
       reason: null,
     }],
+    executable_commands: [copy(capability)],
     available_commands: [copy(capability)],
   };
 }
@@ -85,6 +86,20 @@ test("EngineClient exposes strict read-only provider discovery", async () => {
   assert.equal(calls[0].url, "/api/v1/providers");
   assert.equal(calls[0].init.method, "GET");
   assert.equal(calls[0].init.cache, "no-cache");
+});
+
+test("EngineClient keeps healthy providers closed without an installed command", async () => {
+  const body = providerDocument();
+  body.executable_commands = [];
+  body.available_commands = [];
+  body.selections[0].command_available = false;
+  body.selections[0].reason = {
+    code: "command-not-installed",
+    message: "The command implementation is not installed.",
+  };
+  const { client } = harness(body);
+
+  assert.equal(await client.providers.discover(), body);
 });
 
 const malformedCases = {
@@ -113,6 +128,20 @@ const malformedCases = {
       id: "provider:local:api-key", configured: true, value: "secret",
     }];
   },
+  "secret failure without a missing secret": (body) => {
+    body.providers[0].configured = false;
+    body.providers[0].available = false;
+    body.providers[0].health = {
+      state: "unavailable",
+      reason: {
+        code: "secret-unavailable",
+        message: "A required credential is not configured.",
+      },
+    };
+    body.selections[0].command_available = false;
+    body.selections[0].reason = copy(body.providers[0].health.reason);
+    body.available_commands = [];
+  },
   "implicit provider fallback": (body) => {
     body.selections[0].user_provider_id = "provider.missing";
   },
@@ -125,6 +154,15 @@ const malformedCases = {
       message: "The selected provider is unavailable.",
     };
     body.available_commands = [];
+  },
+  "degraded provider with an unavailable reason": (body) => {
+    body.providers[0].health = {
+      state: "degraded",
+      reason: {
+        code: "disabled",
+        message: "The provider is disabled.",
+      },
+    };
   },
   "inconsistent selection reasons": (body) => {
     body.selections[0].default_provider_id = "";
@@ -146,6 +184,19 @@ const malformedCases = {
   },
   "inconsistent available commands": (body) => {
     body.available_commands = [];
+  },
+  "unselected executable commands": (body) => {
+    body.executable_commands.push({
+      id: "translation.layer.generate", version: 1,
+    });
+  },
+  "available but nonexecutable commands": (body) => {
+    body.executable_commands = [];
+    body.selections[0].command_available = false;
+    body.selections[0].reason = {
+      code: "command-not-installed",
+      message: "The command implementation is not installed.",
+    };
   },
   "command fingerprints": (body) => {
     body.providers[0].traits.command_sha256 = "private-command-hash";

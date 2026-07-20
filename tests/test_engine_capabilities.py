@@ -75,6 +75,19 @@ def test_manifest_ids_are_portable_and_versions_are_semantic(bad_id):
         CapabilityRef("items.read", 0)
 
 
+def test_capability_versions_are_exact_across_the_json_boundary():
+    maximum = 9_007_199_254_740_991
+    capability = CapabilityRef("items.read", maximum)
+    document = CapabilityRegistry(modules=(
+        _module("provider.items", provides=(capability,)),
+    )).discovery_document()
+
+    encoded = json.dumps(document)
+    assert json.loads(encoded)["capabilities"][0]["version"] == maximum
+    with pytest.raises(ManifestValidationError, match="JSON-safe"):
+        CapabilityRef("items.read", maximum + 1)
+
+
 def test_manifest_dependencies_are_immutable_unique_and_unambiguous():
     original = [ITEMS, REGIONS]
     manifest = ModuleManifest(

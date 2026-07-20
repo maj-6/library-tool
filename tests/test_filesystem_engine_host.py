@@ -28,6 +28,7 @@ from librarytool.composition import (
     FilesystemHostBindings,
     InterchangeBindings,
     JobHistoryBindings,
+    ProviderDiscoveryBindings,
     ReplicaBindings,
     SecretStoreBindings,
     TextLayerAggregateBindings,
@@ -40,7 +41,18 @@ from librarytool.engine.errors import RepositoryError
 from librarytool.engine.interchange import LibImportPlannerPort
 from librarytool.engine.item_commands import ItemDraft, ItemRecordSnapshot
 from librarytool.engine.ports import ReplicaPolicyPort, TextLayerRepositoryPort
+from librarytool.engine.providers import (
+    ProviderDescriptor,
+    ProviderHealthSnapshot,
+    ProviderHealthState,
+    ProviderRegistry,
+    ProviderSelection,
+    ProviderSelectionPolicy,
+    ProviderTraits,
+    StaticProviderHealthProbe,
+)
 from librarytool.engine.runtime import (
+    PROVIDER_DISCOVERY_SERVICE,
     SECRET_STORE_SERVICE,
     TEXT_LAYER_AGGREGATE_SERVICE,
     ModuleContribution,
@@ -143,6 +155,7 @@ def _host_inputs(
     entries: Path = Path("entries"),
     read_jobs=None,
     secrets: SecretStoreBindings | None = None,
+    providers: ProviderDiscoveryBindings | None = None,
 ):
     descriptors = _Descriptors()
     policies = cast(ReplicaPolicyPort, object())
@@ -220,6 +233,7 @@ def _host_inputs(
         jobs=JobHistoryBindings(read_json=read_jobs),
         recovery_lock_context=recovery_lock,
         secrets=secrets,
+        providers=providers,
     )
     return config, bindings, factory
 
@@ -383,6 +397,59 @@ def test_host_rejects_a_mismatched_secret_binding(tmp_path):
 
     with pytest.raises(TypeError, match="secrets"):
         replace(bindings, secrets=object())
+
+
+def test_host_forwards_optional_provider_discovery_fail_closed(tmp_path):
+    capability = CapabilityRef("replica.layout.generate")
+    provider = ProviderDescriptor(
+        "provider.local",
+        "1.0.0",
+        capabilities=(capability,),
+        traits=ProviderTraits(
+            execution="local",
+            network="offline",
+            modes=("batch",),
+            input_media=("document",),
+            output_media=("layout",),
+        ),
+    )
+    providers = ProviderDiscoveryBindings(
+        ProviderRegistry((provider,)),
+        ProviderSelectionPolicy((ProviderSelection(
+            capability,
+            default_provider_id=provider.id,
+        ),)),
+        health_probes={
+            provider.id: StaticProviderHealthProbe(ProviderHealthSnapshot(
+                True,
+                ProviderHealthState.HEALTHY,
+            )),
+        },
+    )
+    config, bindings, modules = _host_inputs(
+        tmp_path / "workspace",
+        providers=providers,
+    )
+
+    with open_filesystem_engine(
+        config=config,
+        bindings=bindings,
+        contribute_modules=modules,
+    ) as session:
+        service = session.engine.require_service(PROVIDER_DISCOVERY_SERVICE)
+        assert service is not providers.service
+        discovery = service.discovery_document()
+        assert discovery["available_commands"] == []
+        assert discovery["selections"][0]["reason"]["code"] == (
+            "command-not-installed"
+        )
+
+
+def test_host_rejects_a_mismatched_provider_binding(tmp_path):
+    _config, bindings, _modules = _host_inputs(tmp_path / "workspace")
+
+    with pytest.raises(TypeError, match="providers"):
+        replace(bindings, providers=object())
 
 
 def test_same_workspace_is_exclusive_but_different_roots_are_independent(

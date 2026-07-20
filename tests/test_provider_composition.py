@@ -12,7 +12,7 @@ from librarytool.composition.first_party import (
     FIRST_PARTY_MODULE_MANIFESTS,
     first_party_module_contributions,
 )
-from librarytool.engine.capabilities import CapabilityRef
+from librarytool.engine.capabilities import CapabilityRef, ModuleManifest
 from librarytool.engine.providers import (
     ProviderDescriptor,
     ProviderHealthSnapshot,
@@ -22,14 +22,38 @@ from librarytool.engine.providers import (
     ProviderSelectionPolicy,
     ProviderTraits,
     ProviderValidationError,
+    StaticProviderHealthProbe,
 )
 from librarytool.engine.runtime import (
     PROVIDER_DISCOVERY_SERVICE,
     LibraryEngineBuilder,
+    ModuleContribution,
+    ServiceBinding,
+    ServiceKey,
+    ServiceRegistryError,
 )
 
 
 LAYOUT = CapabilityRef("replica.layout.generate")
+
+
+def _layout_command_contribution(
+    *,
+    requires: tuple[CapabilityRef, ...] = (),
+) -> ModuleContribution:
+    return ModuleContribution(
+        ModuleManifest(
+            "provider.layout-command",
+            "1.0.0",
+            provides=(LAYOUT,),
+            requires=requires,
+        ),
+        bindings=(ServiceBinding(
+            ServiceKey("replica.layout.generator"),
+            object(),
+            (LAYOUT,),
+        ),),
+    )
 
 
 def _provider() -> ProviderDescriptor:
@@ -92,7 +116,12 @@ def test_provider_module_is_withheld_until_service_is_explicitly_injected():
     assert contribution.bindings[0].service is bindings.service
 
     engine = LibraryEngineBuilder((contribution,)).build()
-    assert engine.get_service(PROVIDER_DISCOVERY_SERVICE) is bindings.service
+    service = engine.require_service(PROVIDER_DISCOVERY_SERVICE)
+    assert service is not bindings.service
+    assert service.executable_capabilities == (
+        CapabilityRef("library.providers.discover"),
+    )
+    assert service.discovery_document()["executable_commands"] == []
     module = engine.discovery_document()["modules"][0]
     assert module["id"] == "library.providers"
     assert module["available"] is True
@@ -121,13 +150,55 @@ def test_provider_binding_and_engine_composition_do_not_run_health_probes():
         for value in first_party_module_contributions(_graph(bindings.service))
         if value.manifest.id == "library.providers"
     )
-    engine = LibraryEngineBuilder((contribution,)).build()
+    engine = LibraryEngineBuilder((
+        contribution,
+        _layout_command_contribution(),
+    )).build()
     assert calls == []
     discovery = engine.require_service(
         PROVIDER_DISCOVERY_SERVICE
     ).discovery_document()
     assert calls == ["snapshot"]
+    assert discovery["executable_commands"] == [LAYOUT.as_dict()]
     assert discovery["available_commands"] == [LAYOUT.as_dict()]
+
+
+def test_provider_commands_follow_resolved_active_capabilities_exactly():
+    provider = _provider()
+    bindings = ProviderDiscoveryBindings(
+        ProviderRegistry((provider,)),
+        ProviderSelectionPolicy((ProviderSelection(
+            LAYOUT, default_provider_id=provider.id
+        ),)),
+        health_probes={
+            provider.id: StaticProviderHealthProbe(ProviderHealthSnapshot(
+                True,
+                ProviderHealthState.HEALTHY,
+            ))
+        },
+    )
+    provider_contribution = next(
+        value
+        for value in first_party_module_contributions(_graph(bindings.service))
+        if value.manifest.id == "library.providers"
+    )
+    blocked_command = _layout_command_contribution(
+        requires=(CapabilityRef("runtime.layout"),),
+    )
+
+    engine = LibraryEngineBuilder((
+        provider_contribution,
+        blocked_command,
+    )).build()
+    service = engine.require_service(PROVIDER_DISCOVERY_SERVICE)
+    document = service.discovery_document()
+
+    assert bindings.service.executable_capabilities == ()
+    assert LAYOUT not in service.executable_capabilities
+    assert document["executable_commands"] == []
+    assert document["selections"][0]["reason"]["code"] == (
+        "command-not-installed"
+    )
 
 
 def test_first_party_production_manifests_advertise_no_generation_provider():
@@ -157,3 +228,21 @@ def test_provider_bindings_reject_invalid_contracts_without_probe_access():
             object(),
             ProviderSelectionPolicy(),
         )
+
+
+def test_engine_builder_rejects_an_untyped_provider_discovery_binding():
+    discovery = CapabilityRef("library.providers.discover")
+    invalid_module = ModuleContribution(
+        ModuleManifest(
+            "test.invalid-provider-service",
+            "1.0.0",
+            provides=(discovery,),
+        ),
+        bindings=(ServiceBinding(
+            PROVIDER_DISCOVERY_SERVICE,
+            object(),
+            (discovery,),
+        ),),
+    )
+    with pytest.raises(ServiceRegistryError, match="ProviderDiscoveryService"):
+        LibraryEngineBuilder((invalid_module,)).build()

@@ -148,12 +148,6 @@ def test_descriptor_models_generation_contracts_without_provider_imports():
             max_context_tokens=9_007_199_254_740_992
         ), "JSON-safe"),
         (lambda: _provider(
-            "provider.unsafe-version",
-            capabilities=(CapabilityRef(
-                "replica.layout.generate", 9_007_199_254_740_992
-            ),),
-        ), "JSON-safe"),
-        (lambda: _provider(
             "provider.bad-secret", secrets=("provider.not-namespaced",)
         ), "namespaced"),
         (lambda: ProviderStatusReason("raw-exception"), "not public"),
@@ -211,6 +205,7 @@ def test_user_selection_never_silently_falls_back_to_default():
             ),
             fallback.id: _health(),
         },
+        executable_capabilities=(LAYOUT,),
     )
 
     document = service.discovery_document()
@@ -233,6 +228,7 @@ def test_user_selection_never_silently_falls_back_to_default():
             default_provider_id=fallback.id,
         ),)),
         health_probes={preferred.id: _health(), fallback.id: _health()},
+        executable_capabilities=(LAYOUT,),
     )
     chosen = default_service.discovery_document()["selections"][0]
     assert chosen["source"] == "default"
@@ -266,6 +262,37 @@ def test_no_selection_and_missing_provider_fail_closed():
     assert missing["available_commands"] == []
 
 
+def test_commands_default_closed_until_engine_capabilities_are_reconciled():
+    provider = _provider("provider.installed")
+    service = ProviderDiscoveryService(
+        ProviderRegistry((provider,)),
+        ProviderSelectionPolicy((ProviderSelection(
+            LAYOUT, default_provider_id=provider.id
+        ),)),
+        health_probes={provider.id: _health()},
+    )
+
+    closed = service.discovery_document()
+    assert service.executable_capabilities == ()
+    assert closed["executable_commands"] == []
+    assert closed["available_commands"] == []
+    assert closed["selections"][0]["reason"] == (
+        ProviderStatusReason("command-not-installed").as_dict()
+    )
+
+    reconciled = service.with_executable_capabilities((LAYOUT,))
+    opened = reconciled.discovery_document()
+    assert reconciled is not service
+    assert service.executable_capabilities == ()
+    assert reconciled.executable_capabilities == (LAYOUT,)
+    assert opened["executable_commands"] == [LAYOUT.as_dict()]
+    assert opened["available_commands"] == [LAYOUT.as_dict()]
+    assert opened["selections"][0]["command_available"] is True
+
+    with pytest.raises(ProviderValidationError, match="duplicate"):
+        service.with_executable_capabilities((LAYOUT, LAYOUT))
+
+
 @pytest.mark.parametrize(
     ("secret_status", "reason"),
     ((False, "secret-unavailable"), (None, "secret-status-unknown")),
@@ -288,6 +315,7 @@ def test_required_secret_presence_is_status_only_and_fails_closed(
         secret_status_probe=MappingSecretStatusProbe({
             SECRET_ID: secret_status,
         }),
+        executable_capabilities=(LAYOUT,),
     )
 
     document = service.discovery_document()
@@ -315,6 +343,7 @@ def test_degraded_provider_remains_explicitly_usable():
             ProviderHealthState.DEGRADED,
             reason="provider-degraded",
         )},
+        executable_capabilities=(LAYOUT,),
     )
     document = service.discovery_document()
     assert document["providers"][0]["health"] == {
@@ -349,6 +378,7 @@ def test_probe_failures_are_sanitized_and_never_open_commands(probe):
             LAYOUT, default_provider_id=provider.id
         ),)),
         health_probes={provider.id: probe},
+        executable_capabilities=(LAYOUT,),
     )
     document = service.discovery_document()
     assert document["providers"][0]["health"]["reason"]["code"] == (
@@ -367,6 +397,7 @@ def test_secret_probe_failures_are_sanitized():
         ),)),
         health_probes={provider.id: _health()},
         secret_status_probe=_ExplodingSecretProbe(),
+        executable_capabilities=(LAYOUT,),
     )
     document = service.discovery_document()
     assert document["providers"][0]["secret_statuses"] == [{
@@ -413,6 +444,40 @@ def test_health_snapshot_contract_rejects_ambiguous_states():
             ProviderHealthState.HEALTHY,
             ProviderStatusReason("provider-degraded"),
         )
+
+    with pytest.raises(ProviderValidationError, match="degraded health reason"):
+        ProviderHealthSnapshot(
+            True,
+            ProviderHealthState.DEGRADED,
+            ProviderStatusReason("disabled"),
+        )
+    for configured, reason in (
+        (False, "disabled"),
+        (True, "not-configured"),
+        (True, "provider-degraded"),
+        (True, "secret-unavailable"),
+        (True, "command-not-installed"),
+    ):
+        with pytest.raises(
+            ProviderValidationError,
+            match="incompatible health reason",
+        ):
+            ProviderHealthSnapshot(
+                configured,
+                ProviderHealthState.UNAVAILABLE,
+                ProviderStatusReason(reason),
+            )
+
+    assert ProviderHealthSnapshot(
+        False,
+        ProviderHealthState.UNAVAILABLE,
+        ProviderStatusReason("not-configured"),
+    ).configured is False
+    assert ProviderHealthSnapshot(
+        True,
+        ProviderHealthState.UNAVAILABLE,
+        ProviderStatusReason("disabled"),
+    ).configured is True
 
 
 def test_constructor_validates_probe_structure_without_invoking_it():

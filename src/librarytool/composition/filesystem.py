@@ -449,7 +449,8 @@ class ProviderDiscoveryBindings:
     The service copies the mapping and validates probe structure without
     invoking any probe. Provider SDKs and live health checks remain owned by a
     host or background monitor; engine composition and discovery only read
-    sanitized snapshots.
+    sanitized snapshots. Its base executable set is empty; the sealed engine
+    builder derives the bound service from exact active module capabilities.
     """
 
     registry: ProviderRegistry
@@ -946,7 +947,10 @@ def compose_filesystem_engine(
         for key, service in graph.keyed_services()
         if (
             engine.get_service(key) is None
-            if key == ITEM_QUERY_SERVICE
+            if key in {
+                ITEM_QUERY_SERVICE,
+                PROVIDER_DISCOVERY_SERVICE,
+            }
             else engine.get_service(key) is not service
         )
     ]

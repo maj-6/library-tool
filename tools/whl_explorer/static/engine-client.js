@@ -121,6 +121,7 @@
   const PROVIDER_SEMVER = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
   const PROVIDER_LANGUAGE = /^(?:\*|[a-z]{2,8}(?:-[a-z0-9]{1,8})*)$/;
   const PROVIDER_REASON_MESSAGES = Object.freeze({
+    "command-not-installed": "The command implementation is not installed.",
     "disabled": "The provider is disabled.",
     "health-unknown": "Provider health could not be determined.",
     "network-unavailable": "Required network access is unavailable.",
@@ -136,6 +137,14 @@
     "secret-status-unknown": "Required credential status is unavailable.",
     "secret-unavailable": "A required credential is not configured.",
   });
+  const PROVIDER_CONFIGURED_UNAVAILABLE_REASONS = new Set([
+    "disabled", "health-unknown", "network-unavailable", "probe-failed",
+    "provider-unavailable", "remote-unreachable", "runtime-unavailable",
+  ]);
+  const PROVIDER_UNCONFIGURED_UNAVAILABLE_REASONS = new Set([
+    "health-unknown", "not-configured", "probe-failed",
+    "secret-status-unknown", "secret-unavailable",
+  ]);
 
   function isProviderId(value, optional = false) {
     return typeof value === "string" && (optional && value === "" ||
@@ -248,6 +257,23 @@
     if (value.health.state === "healthy" && value.health.reason !== null) return false;
     if (value.health.state !== "healthy" && value.health.reason === null) return false;
     if (!value.configured && value.health.state !== "unavailable") return false;
+    const reasonCode = value.health.reason && value.health.reason.code;
+    if (value.health.state === "degraded" &&
+        reasonCode !== "provider-degraded") return false;
+    if (value.health.state === "unavailable" &&
+        !(value.configured ? PROVIDER_CONFIGURED_UNAVAILABLE_REASONS :
+          PROVIDER_UNCONFIGURED_UNAVAILABLE_REASONS).has(reasonCode)) return false;
+    const unknownSecret = value.secret_statuses.some((status) =>
+      status.configured === null);
+    const missingSecret = value.secret_statuses.some((status) =>
+      status.configured === false);
+    if (unknownSecret && reasonCode !== "secret-status-unknown") return false;
+    if (!unknownSecret && missingSecret &&
+        reasonCode !== "secret-unavailable") return false;
+    if (!unknownSecret && !missingSecret &&
+        ["secret-status-unknown", "secret-unavailable"].includes(reasonCode)) {
+      return false;
+    }
     const available = value.configured &&
       ["healthy", "degraded"].includes(value.health.state);
     if (value.available !== available) return false;
@@ -256,7 +282,7 @@
     return true;
   }
 
-  function isProviderSelectionRow(value, providers) {
+  function isProviderSelectionRow(value, providers, executableCommands) {
     if (!hasExactKeys(value, [
       "capability", "user_provider_id", "default_provider_id",
       "selected_provider_id", "source", "command_available", "reason",
@@ -279,6 +305,9 @@
     if (!selected) expectedReason = "no-selection";
     else if (!provider) expectedReason = "provider-not-installed";
     else if (!compatible) expectedReason = "provider-incompatible";
+    else if (!executableCommands.has(token)) {
+      expectedReason = "command-not-installed";
+    }
     else if (!provider.available) {
       expectedReason = provider.health.reason ?
         provider.health.reason.code : "provider-unavailable";
@@ -291,18 +320,25 @@
 
   function isProviderDiscovery(value) {
     if (!hasExactKeys(value, [
-      "ok", "schema", "providers", "selections", "available_commands",
+      "ok", "schema", "providers", "selections", "executable_commands",
+      "available_commands",
     ]) || value.ok !== true || value.schema !== "librarytool.providers/1" ||
         !Array.isArray(value.providers) ||
         !isSortedUnique(value.providers, (provider) =>
           isProviderRow(provider) ? provider.id : "") ||
         !value.providers.every(isProviderRow)) return false;
     const providers = new Map(value.providers.map((provider) => [provider.id, provider]));
+    if (!Array.isArray(value.executable_commands) ||
+        !isSortedUnique(value.executable_commands, providerCapabilityToken) ||
+        !value.executable_commands.every(isProviderCapability)) return false;
+    const executableCommands = new Set(
+      value.executable_commands.map(providerCapabilityToken));
     if (!Array.isArray(value.selections) ||
         !isSortedUnique(value.selections, (selection) =>
           isObject(selection) ? providerCapabilityToken(selection.capability) : "") ||
         !value.selections.every((selection) =>
-          isProviderSelectionRow(selection, providers))) return false;
+          isProviderSelectionRow(
+            selection, providers, executableCommands))) return false;
     const declaredCapabilities = new Set();
     for (const provider of value.providers) {
       for (const capability of provider.capabilities) {
@@ -314,6 +350,8 @@
     if (declaredCapabilities.size > selectedCapabilities.length ||
         ![...declaredCapabilities].every((token) =>
           selectedCapabilities.includes(token))) return false;
+    if (![...executableCommands].every((token) =>
+      selectedCapabilities.includes(token))) return false;
     if (!Array.isArray(value.available_commands) ||
         !isSortedUnique(value.available_commands, providerCapabilityToken) ||
         !value.available_commands.every(isProviderCapability)) return false;

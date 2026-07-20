@@ -788,12 +788,15 @@ def test_provider_discovery_composes_only_from_explicit_bindings(tmp_path):
         providers=bindings,
     )["engine"]
 
-    assert with_provider.require_service(
-        PROVIDER_DISCOVERY_SERVICE
-    ) is bindings.service
-    assert bindings.service.discovery_document()["available_commands"] == [
-        capability.as_dict()
-    ]
+    service = with_provider.require_service(PROVIDER_DISCOVERY_SERVICE)
+    assert service is not bindings.service
+    assert capability not in service.executable_capabilities
+    discovery = service.discovery_document()
+    assert discovery["executable_commands"] == []
+    assert discovery["available_commands"] == []
+    assert discovery["selections"][0]["reason"]["code"] == (
+        "command-not-installed"
+    )
 
 
 def test_composer_wires_the_complete_graph_without_recovery(tmp_path):
