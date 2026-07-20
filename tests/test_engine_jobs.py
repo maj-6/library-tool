@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import threading
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
@@ -10,12 +12,14 @@ from pathlib import Path
 
 import pytest
 
+import librarytool.adapters.filesystem.job_history as job_history_adapter
 from librarytool.adapters.filesystem import FilesystemJobHistoryRepository
 from librarytool.engine import (
     ACTIVE_JOB_STATES,
     ConflictError,
     JobManager,
     JobState,
+    ValidationError,
 )
 
 
@@ -87,6 +91,72 @@ def test_track_transition_and_public_snapshot_are_transport_neutral():
     assert public["label"] == "A Herbal"
     assert "secret" not in public and "prompt" not in public
     assert "secret" not in history.value[record["id"]]
+
+
+def test_command_receipt_replays_terminal_outcome_after_prune_and_restart():
+    history = MemoryHistory()
+    jobs = manager(history, keep=0)
+    digest = "a" * 64
+    record = {
+        "operation_id": "detect:book:primary:1",
+        "command_sha256": digest,
+        "subject": {"item_id": "book", "source_id": "primary", "page": 1},
+    }
+    jobs.track(record, "replica.detect-regions")
+    jobs.transition(record, "done", outputs=[{
+        "kind": "replica.region-page", "ref": "book/primary/1",
+    }])
+
+    assert jobs.get(record["id"]) is None
+    receipt = jobs.command_receipt(
+        record["operation_id"], digest, kind="replica.detect-regions")
+    assert receipt is not None
+    assert receipt.job.state is JobState.DONE
+    assert receipt.job.outputs[0].ref == "book/primary/1"
+    assert "$operation_receipts" in history.value
+
+    reopened = manager(history, keep=0)
+    reopened.rehydrate(strict=True)
+    replay = reopened.command_receipt(
+        record["operation_id"], digest, kind="replica.detect-regions")
+    assert replay is not None
+    assert replay.job.job_id == record["id"]
+    assert replay.job.state is JobState.DONE
+    with pytest.raises(ConflictError) as mismatch:
+        reopened.command_receipt(
+            record["operation_id"], "b" * 64,
+            kind="replica.detect-regions")
+    assert mismatch.value.code == "operation_id_conflict"
+
+
+def test_command_receipts_are_bounded_and_reserved_envelope_cannot_be_a_job():
+    history = MemoryHistory()
+    clock = Clock()
+    identifiers = iter(range(10))
+    jobs = JobManager(
+        history,
+        keep=1,
+        receipt_keep=2,
+        id_factory=lambda existing: f"job-{next(identifiers)}",
+        utcnow=clock.now,
+        monotonic=clock.monotonic,
+    )
+    for index in range(3):
+        record = {
+            "operation_id": f"operation:{index}",
+            "command_sha256": f"{index + 1:064x}",
+        }
+        jobs.track(record, "replica.detect-regions")
+        jobs.transition(record, "done")
+
+    receipts = history.value["$operation_receipts"]
+    assert set(receipts) == {"operation:1", "operation:2"}
+    assert jobs.command_receipt(
+        "operation:0", f"{1:064x}", kind="replica.detect-regions") is None
+
+    with pytest.raises(ValidationError) as reserved:
+        jobs.track({"id": "$operation_receipts"}, "ocr")
+    assert reserved.value.code == "reserved_job_id"
 
 
 def test_cancel_is_atomic_idempotent_and_observable_to_worker():
@@ -229,6 +299,37 @@ def test_rehydrate_marks_only_active_work_interrupted():
     assert jobs.get("done-1")["state"] == "done"
 
 
+@pytest.mark.parametrize("failure", (OSError("unreadable"), ValueError("bad")))
+def test_strict_rehydrate_propagates_history_integrity_failures(failure):
+    class BrokenHistory:
+        def load(self):
+            raise failure
+
+        def save(self, _jobs):
+            raise AssertionError("save must not follow a failed load")
+
+    jobs = manager(BrokenHistory())
+
+    with pytest.raises(type(failure), match=str(failure)):
+        jobs.rehydrate(strict=True)
+
+    # Legacy callers can still elect the historical best-effort behavior.
+    jobs.rehydrate()
+
+
+def test_strict_rehydrate_propagates_interruption_save_failure():
+    class UnwritableHistory(MemoryHistory):
+        def save(self, _jobs):
+            raise OSError("history is read-only")
+
+    jobs = manager(UnwritableHistory({
+        "active": {"id": "active", "kind": "ocr", "state": "running"}
+    }))
+
+    with pytest.raises(OSError, match="read-only"):
+        jobs.rehydrate(strict=True)
+
+
 def test_pruning_keeps_active_and_newest_finished_records():
     jobs = manager(keep=2)
     active = {"id": "active"}
@@ -258,6 +359,87 @@ def test_duplicate_live_id_is_rejected_without_replacing_worker_record():
     assert jobs.records["same-id"] is first
 
 
+def test_item_deletion_guard_blocks_every_active_job_for_the_item():
+    jobs = manager()
+    jobs.track(
+        {
+            "id": "analysis",
+            "subject": {"item_id": "book", "source_id": "primary"},
+        },
+        "summarize",
+    )
+    jobs.track({"id": "other", "build_id": "other-book"}, "publish")
+
+    with pytest.raises(ConflictError) as caught:
+        with jobs.item_deletion_guard("book"):
+            raise AssertionError("an active job must prevent entry")
+
+    assert caught.value.code == "item_jobs_active"
+    assert caught.value.details == {
+        "item_id": "book",
+        "jobs": [
+            {"job_id": "analysis", "kind": "summarize", "state": "running"}
+        ],
+    }
+
+
+def test_item_deletion_guard_ignores_finished_and_other_item_jobs():
+    jobs = manager()
+    finished = {"id": "finished", "build_id": "book"}
+    jobs.track(finished, "ocr")
+    jobs.transition(finished, "done")
+    jobs.track({"id": "other", "build_id": "other-book"}, "publish")
+
+    with jobs.item_deletion_guard("book"):
+        pass
+
+
+def test_item_filter_uses_normalized_subject_identity():
+    jobs = manager()
+    jobs.track(
+        {
+            "id": "semantic-subject",
+            "build_id": "legacy-other",
+            "subject": {"item_id": "book"},
+        },
+        "segment",
+    )
+    jobs.track({"id": "legacy-subject", "build_id": "book"}, "ocr")
+
+    assert {row["id"] for row in jobs.list(item_id="book")} == {
+        "semantic-subject",
+        "legacy-subject",
+    }
+
+
+def test_item_deletion_guard_serializes_concurrent_job_registration():
+    jobs = manager()
+    started = threading.Event()
+    finished = threading.Event()
+    failures: list[BaseException] = []
+
+    def register() -> None:
+        started.set()
+        try:
+            jobs.track({"id": "later", "build_id": "book"}, "ocr")
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+        finally:
+            finished.set()
+
+    with jobs.item_deletion_guard("book"):
+        worker = threading.Thread(target=register)
+        worker.start()
+        assert started.wait(1)
+        assert not finished.wait(0.05)
+
+    assert finished.wait(1)
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert failures == []
+    assert jobs.get("later") is not None
+
+
 def test_filesystem_history_adapter_uses_injected_atomic_json_callbacks(tmp_path: Path):
     path = tmp_path / "output" / "jobs.json"
 
@@ -280,3 +462,216 @@ def test_filesystem_history_adapter_uses_injected_atomic_json_callbacks(tmp_path
 
     assert repository.path == path
     assert repository.load()[record["id"]]["state"] == "done"
+
+
+def test_filesystem_history_native_json_round_trips_without_callbacks(
+    tmp_path: Path,
+):
+    path = tmp_path / "output" / "jobs.json"
+    repository = FilesystemJobHistoryRepository(path)
+
+    assert repository.load() == {}
+
+    repository.save({
+        7: {
+            "kind": "ocr",
+            "label": "Flore française",
+            "state": "done",
+        }
+    })
+
+    assert repository.load() == {
+        "7": {
+            "kind": "ocr",
+            "label": "Flore française",
+            "state": "done",
+        }
+    }
+    assert path.read_bytes().endswith(b"\n")
+    assert not tuple(path.parent.glob(f".{path.name}.*.tmp"))
+
+
+def test_filesystem_history_native_writer_replaces_a_complete_snapshot(
+    tmp_path: Path,
+    monkeypatch,
+):
+    path = tmp_path / "jobs.json"
+    repository = FilesystemJobHistoryRepository(path)
+    repository.save({"old": {"state": "done"}})
+    original_bytes = path.read_bytes()
+    real_replace = job_history_adapter.os.replace
+    observed: dict[str, object] = {}
+
+    def inspect_replace(source: Path, destination: Path) -> None:
+        observed["destination"] = destination
+        observed["old"] = destination.read_bytes()
+        observed["new"] = json.loads(source.read_text(encoding="utf-8"))
+        observed["temporary"] = source
+        real_replace(source, destination)
+
+    monkeypatch.setattr(job_history_adapter.os, "replace", inspect_replace)
+    replacement = {"new": {"label": "Herbal", "state": "running"}}
+
+    repository.save(replacement)
+
+    assert observed["destination"] == path
+    assert observed["old"] == original_bytes
+    assert observed["new"] == replacement
+    assert repository.load() == replacement
+    assert not Path(observed["temporary"]).exists()
+
+
+def test_filesystem_history_failed_replace_preserves_the_previous_snapshot(
+    tmp_path: Path,
+    monkeypatch,
+):
+    path = tmp_path / "jobs.json"
+    repository = FilesystemJobHistoryRepository(path)
+    previous = {"old": {"state": "done"}}
+    repository.save(previous)
+    temporary: list[Path] = []
+
+    def fail_replace(source: Path, _destination: Path) -> None:
+        temporary.append(source)
+        raise OSError("replacement unavailable")
+
+    monkeypatch.setattr(job_history_adapter.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replacement unavailable"):
+        repository.save({"new": {"state": "running"}})
+
+    assert repository.load() == previous
+    assert temporary and not temporary[0].exists()
+    assert not tuple(path.parent.glob(f".{path.name}.*.tmp"))
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    (
+        ("{", None),
+        (
+            '{"job":{"state":"done","state":"running"}}',
+            "duplicate JSON key: state",
+        ),
+        ('{"job":{"progress":NaN}}', "non-finite JSON number: NaN"),
+        ('{"job":{"progress":Infinity}}', "non-finite JSON number: Infinity"),
+        (
+            '{"job":{"progress":-Infinity}}',
+            "non-finite JSON number: -Infinity",
+        ),
+    ),
+)
+def test_filesystem_history_native_reader_rejects_invalid_json(
+    tmp_path: Path,
+    payload: str,
+    message: str | None,
+):
+    path = tmp_path / "jobs.json"
+    path.write_text(payload, encoding="utf-8")
+    repository = FilesystemJobHistoryRepository(path)
+
+    context = pytest.raises(ValueError, match=message) if message else (
+        pytest.raises(ValueError)
+    )
+    with context:
+        repository.load()
+
+
+def test_filesystem_history_native_writer_rejects_non_finite_values(
+    tmp_path: Path,
+):
+    path = tmp_path / "jobs.json"
+    repository = FilesystemJobHistoryRepository(path)
+    previous = {"old": {"state": "done"}}
+    repository.save(previous)
+
+    with pytest.raises(ValueError, match="Out of range float values"):
+        repository.save({"job": {"progress": float("nan")}})
+
+    assert repository.load() == previous
+    assert not tuple(path.parent.glob(f".{path.name}.*.tmp"))
+
+
+def test_filesystem_history_native_io_rejects_a_symbolic_link(tmp_path: Path):
+    target = tmp_path / "target.json"
+    target.write_text('{"old":{"state":"done"}}', encoding="utf-8")
+    link = tmp_path / "jobs.json"
+    try:
+        link.symlink_to(target)
+    except (NotImplementedError, OSError):
+        pytest.skip("file symlinks are unavailable on this platform")
+    repository = FilesystemJobHistoryRepository(link)
+
+    with pytest.raises(OSError, match="not a regular file"):
+        repository.load()
+    with pytest.raises(OSError, match="may not be a symbolic link"):
+        repository.save({"new": {"state": "running"}})
+
+    assert json.loads(target.read_text(encoding="utf-8")) == {
+        "old": {"state": "done"}
+    }
+
+
+def test_filesystem_history_native_io_rejects_a_hardlink_without_mutation(
+    tmp_path: Path,
+):
+    external = tmp_path / "external.json"
+    external.write_bytes(b'{"old":{"state":"done"}}\n')
+    external.chmod(0o640)
+    path = tmp_path / "jobs.json"
+    try:
+        os.link(external, path)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"hardlinks are unavailable: {exc}")
+    repository = FilesystemJobHistoryRepository(path)
+    before = (
+        external.read_bytes(),
+        stat.S_IMODE(external.stat().st_mode),
+        external.stat().st_nlink,
+    )
+
+    with pytest.raises(OSError, match="not a regular file"):
+        repository.load()
+    with pytest.raises(OSError, match="not one private regular file"):
+        repository.save({"new": {"state": "running"}})
+
+    assert path.samefile(external)
+    assert path.read_bytes() == before[0]
+    assert (
+        external.read_bytes(),
+        stat.S_IMODE(external.stat().st_mode),
+        external.stat().st_nlink,
+    ) == before
+    assert not tuple(tmp_path.glob(f".{path.name}.*.tmp"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="directory fsync is not portable")
+def test_filesystem_history_native_writer_fsyncs_the_parent_directory(
+    tmp_path: Path,
+    monkeypatch,
+):
+    path = tmp_path / "output" / "jobs.json"
+    repository = FilesystemJobHistoryRepository(path)
+    real_open = job_history_adapter.os.open
+    real_fsync = job_history_adapter.os.fsync
+    directory_descriptors: set[int] = set()
+    directory_fsyncs: list[int] = []
+
+    def track_open(target, flags, *args, **kwargs):
+        descriptor = real_open(target, flags, *args, **kwargs)
+        if Path(target) == path.parent:
+            directory_descriptors.add(descriptor)
+        return descriptor
+
+    def track_fsync(descriptor: int) -> None:
+        if descriptor in directory_descriptors:
+            directory_fsyncs.append(descriptor)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(job_history_adapter.os, "open", track_open)
+    monkeypatch.setattr(job_history_adapter.os, "fsync", track_fsync)
+
+    repository.save({"job": {"state": "done"}})
+
+    assert directory_fsyncs
+    assert repository.load() == {"job": {"state": "done"}}

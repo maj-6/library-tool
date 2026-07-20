@@ -41,7 +41,9 @@ def _install_inline_ai(monkeypatch) -> list:
         return job
 
     monkeypatch.setattr(server, "_ai_cfg", lambda: {
-        "base": "https://example.test/v1", "key": "k", "model": "test-model"})
+        "base": "https://example.test/v1", "model": "test-model"})
+    monkeypatch.setattr(server, "_secret_is_configured",
+                        lambda key: key == "aiKey")
     monkeypatch.setattr(server, "_ai_chat", fake_ai_chat)
     monkeypatch.setattr(server, "_an_job_start", run_inline)
     return calls

@@ -1,9 +1,10 @@
 # Packaging + tool configuration for the world-herb-library tools.
 #
-# Transitional layout: new framework-neutral engine code lives in the
-# installable ``src/librarytool`` package while compatibility entry points and
-# adapters still live under ``tools/``. The latter remain importable through
-# script-directory semantics until each vertical has moved behind the engine.
+# Transitional layout: framework-neutral engine code lives in the installable
+# ``src/librarytool`` package. Framework-specific transports are separate,
+# opt-in sibling packages such as ``src/librarytool_http``; compatibility entry
+# points and remaining adapters still live under ``tools/`` until each vertical
+# moves behind an engine boundary.
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -18,7 +19,9 @@ dependencies = [
     "openpyxl>=3.1",
     "Pillow>=10.0",
     "Flask>=3.0",
-    "pypdf>=5.0",
+    # Canvas evidence profiles are pinned to the pypdf 6 parsing API. A new
+    # major requires an explicit evidence-profile compatibility decision.
+    "pypdf>=6.0,<7",
     "PyMuPDF>=1.24",
     # The desktop's default OCR engine imports this at job runtime. Keeping it
     # optional made the frozen sidecar pass its executable check, then fail as

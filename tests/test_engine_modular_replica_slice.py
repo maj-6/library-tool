@@ -3,7 +3,10 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
+import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -22,7 +25,7 @@ from librarytool.engine.contracts import (
     ReplaceRegionPageCommand,
     ReviewRegionProposalCommand,
 )
-from librarytool.engine.errors import ConflictError
+from librarytool.engine.errors import ConflictError, NotFoundError, RepositoryError
 from librarytool.engine.replica import ReplicaApplicationService
 from librarytool.engine.text_layers import TextLayerService
 from librarytool.engine.translations import (
@@ -152,19 +155,63 @@ class TextStore:
 
 def make_replica(tmp_path, *, fail_text=False):
     policies = Policies()
+    items = Items()
     repository = FilesystemReplicaRepository(
-        lambda item_id: tmp_path / item_id / "ocr" / "layout.json"
+        lambda item_id: tmp_path / item_id / "ocr" / "layout.json",
+        item_exists_for=lambda item_id: item_id in items.items,
     )
     text_store = TextStore(fail=fail_text)
     text_layers = TextLayerService(text_store, policies)
     service = ReplicaApplicationService(
-        Items(),
+        items,
         repository,
         policies,
         text_layers,
         clock=lambda: datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc),
     )
     return service, repository, policies, text_store
+
+
+def test_replica_revalidates_item_after_acquiring_workspace_lease(tmp_path):
+    items = Items()
+    policies = Policies()
+    lease_waiting = threading.Event()
+    deletion_committed = threading.Event()
+
+    @contextmanager
+    def workspace_lease(_item_id):
+        lease_waiting.set()
+        assert deletion_committed.wait(timeout=5)
+        yield
+
+    repository = FilesystemReplicaRepository(
+        lambda item_id: tmp_path / item_id / "ocr" / "layout.json",
+        workspace_context_for=workspace_lease,
+        item_exists_for=lambda item_id: item_id in items.items,
+    )
+    service = ReplicaApplicationService(
+        items,
+        repository,
+        policies,
+        TextLayerService(TextStore(), policies),
+    )
+    key = PageKey("book", "primary", 1)
+    command = ReplaceRegionPageCommand(
+        key=key,
+        expected_revision=policies.content_revision(None, "rr"),
+        items=[{"rid": "body-1", "text": "must not return"}],
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        mutation = pool.submit(service.replace_region_page, command)
+        assert lease_waiting.wait(timeout=5)
+        del items.items["book"]
+        deletion_committed.set()
+        with pytest.raises(NotFoundError) as missing:
+            mutation.result(timeout=5)
+
+    assert missing.value.code == "item_not_found"
+    assert not (tmp_path / "book").exists()
 
 
 def seed(repository, value):
@@ -374,6 +421,68 @@ def test_proposal_apply_clears_journal_after_success(tmp_path):
     assert text.pages[("book", "compiled.txt", 7)] == "Accepted"
 
 
+@pytest.mark.parametrize(
+    ("damage", "code"),
+    (
+        ("missing", "staged_replica_figure_unavailable"),
+        ("tampered", "staged_replica_figure_mismatch"),
+    ),
+)
+def test_proposal_apply_preserves_page_when_staged_figure_fails_integrity(
+    tmp_path, damage, code,
+):
+    service, repository, policies, _text = make_replica(tmp_path)
+    key = PageKey("book", "primary", 8)
+    current = {
+        "doc": "compiled.txt",
+        "items": [{"rid": "old", "text": "Human"}],
+        "origin": "human",
+    }
+    region_revision = policies.content_revision(current, "rr")
+    proposal_id = "rdp-" + "a" * 32
+    name = f"proposal-primary-deadbeef00-p8-{'a' * 32}-figure.jpeg"
+    payload = b"original-figure"
+    proposal = {
+        "doc": "compiled.txt",
+        "items": [{"rid": "new", "text": f"![figure]({name})"}],
+        "base_revision": region_revision,
+        "provider": "detector",
+        "proposal_id": proposal_id,
+        "staged_figures": {
+            name: {
+                "page": 8,
+                "src_key": "primary",
+                "proposal_id": proposal_id,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            },
+        },
+    }
+    proposal["revision"] = policies.content_revision(proposal, "rp")
+    seed(repository, {
+        "regions": {"primary": {"8": current}},
+        "region_proposals": {"primary": {"8": proposal}},
+    })
+    figure = tmp_path / "book" / "ocr" / "images" / name
+    figure.parent.mkdir(parents=True, exist_ok=True)
+    figure.write_bytes(payload)
+    if damage == "missing":
+        figure.unlink()
+    else:
+        figure.write_bytes(b"tampered")
+    before = repository.snapshot("book")
+
+    with pytest.raises(RepositoryError) as failure:
+        service.review_region_proposal(ReviewRegionProposalCommand(
+            key,
+            ProposalAction.APPLY,
+            region_revision,
+            proposal["revision"],
+        ))
+
+    assert failure.value.code == code
+    assert repository.snapshot("book") == before
+
+
 def test_layout_family_query_is_read_only_even_if_policy_mutates_input(tmp_path):
     service, repository, policies, _text = make_replica(tmp_path)
     seed(repository, {"regions": {"primary": {"1": {"items": []}}}})
@@ -451,3 +560,23 @@ def test_engine_package_has_no_transport_or_transitional_tool_imports():
         source = path.read_text(encoding="utf-8")
         for name in forbidden:
             assert not re.search(rf"^(?:from|import)\s+{name}\b", source, re.M), path
+
+
+def test_flask_text_layer_transport_is_a_sibling_opt_in_package():
+    environment = os.environ.copy()
+    inherited = environment.get("PYTHONPATH", "")
+    environment["PYTHONPATH"] = str(SRC) + (
+        os.pathsep + inherited if inherited else ""
+    )
+    script = (
+        "import sys; import librarytool; import librarytool.engine; "
+        "import librarytool.composition; assert 'flask' not in sys.modules; "
+        "import librarytool_http; assert 'flask' in sys.modules"
+    )
+    subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )

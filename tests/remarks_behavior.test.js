@@ -1014,7 +1014,7 @@ function applyHarness({ keyResult = true, buildResult = true, rowResult = true,
     combinedRows: () => rows,
     setAttnKey: (...args) => { calls.key.push(plain(args)); return keyResult; },
     refreshRemarkTarget: (item) => calls.refresh.push(plain(item)),
-    patchBuildRaw: async (...args) => {
+    updateBuildPortableMetadata: async (...args) => {
       calls.build.push(plain(args));
       if (buildThrows) throw new Error("offline");
       return buildResult;

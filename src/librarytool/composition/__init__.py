@@ -1,23 +1,61 @@
 """Framework-neutral engine composition entry points."""
 
 from .filesystem import (
+    CanvasBindings,
     CatalogueBindings,
     FilesystemEnginePaths,
     FilesystemEngineResources,
     FilesystemServiceGraph,
     InterchangeBindings,
+    ItemLifecycleBindings,
+    ProviderDiscoveryBindings,
     ReplicaBindings,
+    RepresentationBindings,
+    SecretStoreBindings,
     TranslationBindings,
+    TextLayerAggregateBindings,
     compose_filesystem_engine,
+)
+from .first_party import (
+    FIRST_PARTY_MODULE_MANIFESTS,
+    FIRST_PARTY_WORKBENCH_MANIFESTS,
+    first_party_module_contributions,
+)
+from .host import (
+    EngineSessionClosedError,
+    EngineSessionError,
+    EngineSessionForkedError,
+    FilesystemEngineConfig,
+    FilesystemEngineSession,
+    FilesystemHostBindings,
+    JobHistoryBindings,
+    open_filesystem_engine,
 )
 
 __all__ = [
+    "CanvasBindings",
     "CatalogueBindings",
+    "FIRST_PARTY_MODULE_MANIFESTS",
+    "FIRST_PARTY_WORKBENCH_MANIFESTS",
     "FilesystemEnginePaths",
     "FilesystemEngineResources",
     "FilesystemServiceGraph",
     "InterchangeBindings",
+    "ItemLifecycleBindings",
+    "EngineSessionClosedError",
+    "EngineSessionError",
+    "EngineSessionForkedError",
+    "FilesystemEngineConfig",
+    "FilesystemEngineSession",
+    "FilesystemHostBindings",
+    "JobHistoryBindings",
+    "ProviderDiscoveryBindings",
     "ReplicaBindings",
+    "RepresentationBindings",
+    "SecretStoreBindings",
     "TranslationBindings",
+    "TextLayerAggregateBindings",
     "compose_filesystem_engine",
+    "first_party_module_contributions",
+    "open_filesystem_engine",
 ]

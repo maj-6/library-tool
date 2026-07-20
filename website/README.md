@@ -140,6 +140,10 @@ historical filename is retained because the desktop app bundles it — while
 Android fetches `android-changelog.md`. Both are parsed client-side
 (`parseChangelog` in `assets/data.js`).
 
+Only `stable`, `alpha`, `beta`, and `rc` are public download channels. The
+client also suppresses any artifact URL labelled `DONOTPUBLISH`, so a dry-run
+or manually inserted internal build cannot become a public download card.
+
 ## Publishing
 
 Any static host. The site is plain files; `browse.html?q=…&from=…&to=…` keeps

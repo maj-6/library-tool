@@ -10,6 +10,7 @@ wand-overlay smart-check suite; the engine and its coverage carry over.)
 """
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
 
@@ -38,11 +39,20 @@ def _fake_pipeline(monkeypatch, texts, ai_reply, scan_pages=(1, 2, 3, 4, 5)):
         calls["ocr"].append(page)
         return texts.get(page, "")
     monkeypatch.setattr(server, "_sc_ocr_page", ocr)
-    monkeypatch.setattr(server, "_client_settings", lambda: {"mistralKey": "mk"})
+    monkeypatch.setattr(
+        server, "_secret_is_configured",
+        lambda key: key == "mistralKey" or
+        (key == "aiKey" and ai_reply is not None),
+    )
+    monkeypatch.setattr(
+        server, "_lease_secret",
+        lambda key: contextlib.nullcontext(
+            "mk" if key == "mistralKey" else "dk"),
+    )
     if ai_reply is not None:
         monkeypatch.setattr(server, "_ai_cfg", lambda: {
             "base": "https://api.deepseek.com", "model": "deepseek-chat",
-            "key": "dk", "instructions": "", "temperature": "", "timeout": ""})
+            "instructions": "", "temperature": "", "timeout": ""})
 
         def ai_json(cfg, messages, temperature=0.2):
             calls["prompts"].append(messages[0]["content"])
@@ -115,8 +125,13 @@ def test_smart_scan_extracts_and_stages_an_alternative(client, data_root,
     assert job["status"] == "done" and job["state"] == "done"
     assert job["done"] == job["total"]
     assert job["volume"] == "IV"
+    assert job["build_id"] == bid
+    assert job["subject"]["item_id"] == bid
     unified = client.get("/api/jobs").get_json()["jobs"]
-    assert next(j for j in unified if j["id"] == job["id"])["volume"] == "IV"
+    unified_job = next(j for j in unified if j["id"] == job["id"])
+    assert unified_job["volume"] == "IV"
+    assert unified_job["build_id"] == bid
+    assert unified_job["subject"]["item_id"] == bid
 
     # early stop: once a title-page signal AND a copyright signal are in hand
     # (pages 2 and 3), pages 4-5 are never OCRed
@@ -414,8 +429,10 @@ def test_smart_scan_selected_pdf_ocrs_every_marked_page(client, data_root,
 
 def test_smart_scan_deepseek_uses_dedicated_settings_instructions(monkeypatch):
     monkeypatch.setattr(server, "_client_settings", lambda: {
-        "aiKey": "dk", "aiModel": "deepseek-chat",
+        "aiModel": "deepseek-chat",
         "smartScanInstructions": "Prefer the printed imprint over cover text."})
+    monkeypatch.setattr(server, "_secret_is_configured",
+                        lambda key: key == "aiKey")
     cfg = server._ai_cfg()
     assert cfg["smart_scan_instructions"] == (
         "Prefer the printed imprint over cover text.")
@@ -456,12 +473,30 @@ def test_smart_scan_validation(client, data_root, monkeypatch):
     assert client.post("/api/process/smartscan/run", json={
         "target": "bogus:1", "pdf": pdf}).status_code == 400
     assert client.post("/api/process/smartscan/run", json={
+        "target": "build:", "pdf": pdf}).status_code == 400
+    assert client.post("/api/process/smartscan/run", json={
         "target": f"build:{bid}"}).status_code == 400            # no pdf/url
     assert client.post("/api/process/smartscan/run", json={
         "target": f"build:{bid}", "pdf": "missing.pdf"}).status_code == 404
     assert client.post("/api/process/smartscan/run", json={
         "target": f"build:{bid}", "url": "ftp://x/y.pdf"}).status_code == 400
     assert client.get("/api/process/smartscan/job/nope").status_code == 404
+
+
+def test_smart_scan_build_start_revalidates_the_catalogue(
+        client, data_root):
+    pdf = _dummy_pdf(data_root, "vanished-build.pdf")
+    before_unified = set(server._jobs)
+    before_specific = set(server._ss_jobs)
+
+    response = client.post("/api/process/smartscan/run", json={
+        "target": "build:vanished-build",
+        "pdf": pdf,
+    })
+
+    assert response.status_code == 409
+    assert set(server._jobs) == before_unified
+    assert set(server._ss_jobs) == before_specific
 
 
 def test_smart_scan_empty_extraction_fails_the_job(client, data_root,

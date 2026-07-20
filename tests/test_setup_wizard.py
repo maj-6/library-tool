@@ -61,9 +61,11 @@ def test_setup_guide_persists_keys_through_the_secret_store():
     assert "await persistSecrets(updates)" in commit
 
     persist = _function("persistSecrets", "bookParseChanged")
-    assert 'fetch("/api/secrets"' in persist
-    assert 'method: "PUT"' in persist
-    assert "SECRET_KEYS.has(k)" in persist
+    assert "engineClient.secrets.replace" in persist
+    assert "engineClient.secrets.clear" in persist
+    assert "status.revision" in persist
+    assert "SECRET_KEYS.has(key)" in persist
+    assert "state.settings[k]" not in persist
 
 
 def test_setup_guide_preserves_skip_local_and_durable_completion_paths():

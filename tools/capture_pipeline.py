@@ -18,6 +18,9 @@ book record on the desktop side:
 Every step is independently callable; process_capture() runs the whole chain.
 cv2 is imported lazily so the module (and server) still load without it — the
 perspective step then just passes photos through.
+
+The standalone wrapper reads MISTRAL_API_KEY from the environment. Without it,
+the wrapper still performs image processing and skips OCR.
 """
 from __future__ import annotations
 
@@ -344,18 +347,20 @@ def process_capture(photo_bytes_list: list[bytes], api_key: str) -> dict:
 
 if __name__ == "__main__":
     import argparse
+    import cli_credentials
+
     ap = argparse.ArgumentParser(description="Run the capture pipeline on an image")
     ap.add_argument("image")
-    ap.add_argument("--key", default="", help="Mistral API key (omit to skip OCR)")
     ap.add_argument("--out", default="", help="write the processed JPEG here")
     a = ap.parse_args()
+    api_key = cli_credentials.mistral_api_key(required=False)
     raw = open(a.image, "rb").read()
     quad = find_page_quad(raw)
     print("page quad:", "found" if quad is not None else "not found (using original)")
-    result = process_capture([raw], a.key)
+    result = process_capture([raw], api_key)
     if a.out:
         open(a.out, "wb").write(result["photos"][0])
         print("processed ->", a.out, f"({len(result['photos'][0])//1024} KB)")
-    if a.key:
+    if api_key:
         print(json.dumps({"fields": result["fields"], "extra": result["extra"],
                           "errors": result["errors"]}, indent=2))

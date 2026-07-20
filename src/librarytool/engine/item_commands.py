@@ -432,6 +432,16 @@ class CreateItemCommand:
             raise TypeError("operation_id must be a string")
 
 
+def create_item_command_sha256(draft: ItemDraft) -> str:
+    """Return the canonical identity used by every create-item boundary."""
+
+    if not isinstance(draft, ItemDraft):
+        raise TypeError("draft must be an ItemDraft")
+    return hashlib.sha256(
+        _canonical({"action": "create", "draft": draft.as_dict()})
+    ).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class UpdateItemCommand:
     item_id: str
@@ -754,11 +764,53 @@ class ItemCommandRepositoryPort(Protocol):
     ) -> ContextManager[ItemCommandUnitOfWorkPort]: ...
 
 
-class ItemCommandService:
-    """Validate, conditionally stage, and idempotently commit item commands."""
+class ItemCommandPolicyPort(Protocol):
+    """Validate complete item candidates without changing their content.
 
-    def __init__(self, repository: ItemCommandRepositoryPort) -> None:
+    Product profiles use this port for vocabulary and workflow-independent
+    catalogue rules that do not belong in a storage codec or transport.  The
+    values passed here are deeply immutable.  Implementations must either
+    return ``None`` or raise an :class:`EngineError`; they cannot normalize or
+    replace the candidate that the repository will stage.
+    """
+
+    def validate_create(self, candidate: ItemDraft) -> None: ...
+
+    def validate_update(
+        self,
+        current: ItemRecordSnapshot,
+        patch: ItemPatch,
+        candidate: ItemDraft,
+    ) -> None: ...
+
+
+class ItemCommandService:
+    """Validate, conditionally stage, and idempotently commit item commands.
+
+    ``allow_legacy_delete`` is a migration authority seam.  It defaults to
+    ``True`` for compatibility with callers whose repositories still own an
+    atomic catalogue-only delete.  Production compositions that install the
+    aggregate item lifecycle service must set it to ``False`` so deletion
+    cannot bypass managed-tree and tombstone coordination.
+    """
+
+    def __init__(
+        self,
+        repository: ItemCommandRepositoryPort,
+        *,
+        policy: ItemCommandPolicyPort | None = None,
+        allow_legacy_delete: bool = True,
+    ) -> None:
+        if policy is not None and (
+            not callable(getattr(policy, "validate_create", None))
+            or not callable(getattr(policy, "validate_update", None))
+        ):
+            raise TypeError("policy must implement ItemCommandPolicyPort")
+        if not isinstance(allow_legacy_delete, bool):
+            raise TypeError("allow_legacy_delete must be a boolean")
         self._repository = repository
+        self._policy = policy
+        self._allow_legacy_delete = allow_legacy_delete
 
     def create(self, command: CreateItemCommand) -> ItemCommandResult:
         if not isinstance(command, CreateItemCommand):
@@ -767,9 +819,7 @@ class ItemCommandService:
                 code="invalid_item_command",
             )
         operation_id = self._operation_id(command.operation_id)
-        command_sha256 = self._command_hash(
-            {"action": "create", "draft": command.draft.as_dict()}
-        )
+        command_sha256 = create_item_command_sha256(command.draft)
         try:
             with self._repository.unit_of_work(
                 operation_id=operation_id
@@ -782,6 +832,7 @@ class ItemCommandService:
                 )
                 if replay is not None:
                     return replay
+                self._validate_create_policy(command.draft)
                 item_id = self._repository_item_id(unit.allocate_item_id())
                 if self._repository_snapshot(unit.get(item_id)) is not None:
                     raise RepositoryError(
@@ -857,6 +908,7 @@ class ItemCommandService:
                 current = self._require_current(unit, item_id)
                 self._match_revision(current, expected_revision)
                 draft = command.patch.apply(current)
+                self._validate_update_policy(current, command.patch, draft)
                 staged = self._repository_snapshot(
                     unit.stage_replace(current, draft),
                     required=True,
@@ -894,6 +946,11 @@ class ItemCommandService:
             raise ValidationError(
                 "delete requires a DeleteItemCommand",
                 code="invalid_item_command",
+            )
+        if not self._allow_legacy_delete:
+            raise ConflictError(
+                "item deletion requires the aggregate lifecycle service",
+                code="item_lifecycle_command_required",
             )
         item_id = self._item_id(command.item_id)
         expected_revision = self._expected_revision(
@@ -1093,6 +1150,48 @@ class ItemCommandService:
                 details={"item_id": item_id},
             )
 
+    def _validate_create_policy(self, candidate: ItemDraft) -> None:
+        if self._policy is None:
+            return
+        self._invoke_policy(
+            self._policy.validate_create,
+            candidate,
+        )
+
+    def _validate_update_policy(
+        self,
+        current: ItemRecordSnapshot,
+        patch: ItemPatch,
+        candidate: ItemDraft,
+    ) -> None:
+        if self._policy is None:
+            return
+        self._invoke_policy(
+            self._policy.validate_update,
+            current,
+            patch,
+            candidate,
+        )
+
+    @staticmethod
+    def _invoke_policy(callback: Any, *args: Any) -> None:
+        try:
+            result = callback(*args)
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise RepositoryError(
+                "the item command policy failed",
+                code="item_command_policy_unavailable",
+                details={"cause_type": type(exc).__name__},
+                retryable=True,
+            ) from exc
+        if result is not None:
+            raise RepositoryError(
+                "the item command policy returned an invalid result",
+                code="invalid_item_command_policy",
+            )
+
     @staticmethod
     def _replay(
         unit: ItemCommandUnitOfWorkPort,
@@ -1148,6 +1247,7 @@ class ItemCommandService:
 __all__ = [
     "CreateItemCommand",
     "DeleteItemCommand",
+    "ItemCommandPolicyPort",
     "ItemCommandRepositoryPort",
     "ItemCommandResult",
     "ItemCommandService",
@@ -1160,4 +1260,5 @@ __all__ = [
     "ItemRecordSnapshot",
     "RepresentationDraft",
     "UpdateItemCommand",
+    "create_item_command_sha256",
 ]

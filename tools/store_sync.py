@@ -31,7 +31,15 @@ mtime against the object's upload time picks the direction.
 
 CLI (dry-run by default, like corpus_sync):
     python3 tools/store_sync.py status        what a sync would do
-    python3 tools/store_sync.py sync --run    do it
+
+The standalone status command takes SUPABASE_KEY (and optional SUPABASE_URL)
+from the environment. Optional entry-file status uses R2_ACCOUNT_ID,
+R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, and R2_PUBLIC_BASE_URL.
+
+Mutation runs through Library Tool's composed host, which supplies the item
+lifecycle guard shared with deletion and restore.  The standalone CLI remains
+available for read-only planning but refuses ``sync --run`` because it cannot
+safely acquire that host-owned policy boundary.
 """
 from __future__ import annotations
 
@@ -39,15 +47,17 @@ import argparse
 import hashlib
 import json
 import math
-import os
 import shutil
 import sys
 import threading
-from contextlib import nullcontext
+from collections.abc import Callable
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import ContextManager
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cli_credentials  # noqa: E402
 import libcommon as lib  # noqa: E402
 import r2_store as r2  # noqa: E402
 import supabase_sync as sbase  # noqa: E402
@@ -342,69 +352,259 @@ def _backup(path: Path) -> None:
 
 # --- executing one store -----------------------------------------------------------
 
-def sync_store(cfg: dict, name: str, lock=None, dry: bool = False) -> dict:
-    """One store's full pass: fetch, merge, apply locally, push. Local reads
-    and writes happen under `lock` (the server passes its own); network calls
-    happen outside it."""
+_ITEM_CATALOGUE_STORE = "builds"
+ItemPolicy = Callable[[str], bool]
+ItemPolicyGuard = Callable[[], ContextManager[ItemPolicy]]
+
+
+def _checked_item_policy(
+        allow_item: ItemPolicy | None,
+) -> ItemPolicy | None:
+    if allow_item is not None and not callable(allow_item):
+        raise TypeError("allow_item must be callable")
+    return allow_item
+
+
+def _checked_item_policy_guard(
+        allow_item: ItemPolicy | None,
+        item_policy_guard: ItemPolicyGuard | None,
+) -> tuple[ItemPolicy | None, ItemPolicyGuard | None]:
+    allow_item = _checked_item_policy(allow_item)
+    if item_policy_guard is not None and not callable(item_policy_guard):
+        raise TypeError("item_policy_guard must be callable")
+    if allow_item is not None and item_policy_guard is not None:
+        raise TypeError(
+            "allow_item and item_policy_guard are mutually exclusive"
+        )
+    return allow_item, item_policy_guard
+
+
+@contextmanager
+def _item_policy_scope(
+        allow_item: ItemPolicy | None,
+        item_policy_guard: ItemPolicyGuard | None,
+):
+    if item_policy_guard is None:
+        yield allow_item
+        return
+    context = item_policy_guard()
+    if not hasattr(context, "__enter__") or not hasattr(context, "__exit__"):
+        raise TypeError("item_policy_guard must return a context manager")
+    with context as policy:
+        if not callable(policy):
+            raise TypeError(
+                "item_policy_guard must yield a callable item policy"
+            )
+        yield policy
+
+
+def _policy_allows_item(
+        policy: ItemPolicy, item_id: str,
+) -> bool:
+    """Evaluate a lifecycle policy without weakening its exact identity.
+
+    Store keys are already normalized to strings by the existing transport and
+    decomposition paths.  Deliberately do not strip or case-fold here: engine
+    item identities are exact, and silently accepting an alias could bypass a
+    durable tombstone.
+    """
+    decision = policy(item_id)
+    if not isinstance(decision, bool):
+        raise TypeError("allow_item must return a boolean")
+    return decision
+
+
+def sync_store(
+        cfg: dict,
+        name: str,
+        lock=None,
+        dry: bool = False,
+        allow_item: ItemPolicy | None = None,
+        item_policy_guard: ItemPolicyGuard | None = None,
+) -> dict:
+    """One store's full pass: fetch, merge, apply locally, push.
+
+    Local reads and writes happen under ``lock`` (the server passes its own);
+    network calls happen outside it.  For the item catalogue (``builds``), an
+    optional ``allow_item`` policy filters exact local, cloud, and shadow keys
+    before the merge and is evaluated again before either local or cloud
+    publication.  Invalid policy values fail closed before the affected write.
+
+    A plain callback narrows, but cannot eliminate, the final TOCTOU interval.
+    ``item_policy_guard`` closes it by yielding a lock-safe policy while the
+    caller's lifecycle/workspace gate stays held across each local or cloud
+    publication phase. It is mutually exclusive with ``allow_item``.
+    """
+    allow_item, item_policy_guard = _checked_item_policy_guard(
+        allow_item, item_policy_guard
+    )
+    if (
+        name == _ITEM_CATALOGUE_STORE
+        and item_policy_guard is not None
+        and lock is not None
+    ):
+        raise ValueError(
+            "the guarded item policy owns the catalogue lock; "
+            "a second builds lock is not allowed"
+        )
+    item_policy = allow_item if name == _ITEM_CATALOGUE_STORE else None
+    policy_guard = (
+        item_policy_guard if name == _ITEM_CATALOGUE_STORE else None
+    )
+
     spec = STORES[name]
     rows = sbase.list_store_rows(cfg, spec["table"], spec["pk"])
-    cloud: dict[str, dict] = {}
+    raw_cloud: dict[str, dict] = {}
     for r in rows:
         k = str(r.get(spec["pk"]) or "")
         if k:
-            cloud[k] = {"data": r.get("data") if isinstance(r.get("data"), dict) else {},
-                        "updated_at": str(r.get("updated_at") or ""),
-                        "deleted": bool(r.get("deleted"))}
+            raw_cloud[k] = {
+                "data": (
+                    r.get("data") if isinstance(r.get("data"), dict) else {}
+                ),
+                "updated_at": str(r.get("updated_at") or ""),
+                "deleted": bool(r.get("deleted")),
+            }
 
     path = spec["path"]()
-    with (lock or nullcontext()):
-        doc = lib.load_json(path, spec["default"])
-        records, ids_assigned = spec["decompose"](doc)
-        scrubbed = {k: spec["scrub"](rec) for k, rec in records.items()}
-        shadow = _load_shadow().get(name, {})
-        plan = merge(scrubbed, cloud, shadow, _now(), spec)
+    with _item_policy_scope(item_policy, policy_guard) as scoped_policy:
+        planning_allowed: dict[str, bool] = {}
 
-        if dry:
-            return {"pushed": len(plan["push"]), "pulled": len(plan["pull"]),
+        def allowed_for_plan(item_id: str) -> bool:
+            assert scoped_policy is not None
+            if item_id not in planning_allowed:
+                planning_allowed[item_id] = _policy_allows_item(
+                    scoped_policy, item_id,
+                )
+            return planning_allowed[item_id]
+
+        cloud = {
+            k: row for k, row in raw_cloud.items()
+            if scoped_policy is None or allowed_for_plan(k)
+        }
+        with (lock or nullcontext()):
+            doc = lib.load_json(path, spec["default"])
+            records, ids_assigned = spec["decompose"](doc)
+            scrubbed = {
+                k: spec["scrub"](rec) for k, rec in records.items()
+            }
+            shadow = _load_shadow().get(name, {})
+            if scoped_policy is not None:
+                scrubbed = {
+                    k: rec for k, rec in scrubbed.items()
+                    if allowed_for_plan(k)
+                }
+                shadow = {
+                    k: entry for k, entry in shadow.items()
+                    if allowed_for_plan(k)
+                }
+            plan = merge(scrubbed, cloud, shadow, _now(), spec)
+
+            if dry:
+                return {
+                    "pushed": len(plan["push"]),
+                    "pulled": len(plan["pull"]),
                     "tombstoned": len(plan["tombstone"]),
                     "deleted": len(plan["delete_local"]),
-                    "in_sync": plan["in_sync"], "guard": plan["guard"],
-                    "dry": True}
+                    "in_sync": plan["in_sync"],
+                    "guard": plan["guard"],
+                    "dry": True,
+                }
 
-        updates: dict[str, dict | None] = {}
-        if plan["pull"] or plan["delete_local"] or ids_assigned:
-            for k, row in plan["pull"].items():
-                records[k] = spec["adopt"](records.get(k), row.get("data") or {})
-                updates[k] = {"h": _hash(row.get("data") or {}),
-                              "ts": row.get("updated_at") or "", "dead": False}
-            for k, cts in plan["delete_local"]:
-                records.pop(k, None)
-                updates[k] = {"h": None, "ts": cts, "dead": True}
-            if plan["pull"] or plan["delete_local"]:
-                _backup(path)
-            lib.save_json(path, spec["recompose"](doc, records))
-        for k, entry in plan["refresh"].items():
-            updates[k] = entry
-        for k in plan["shadow_drop"]:
-            updates[k] = None
-        if updates:
-            _update_shadow(name, updates)
+            if scoped_policy is not None:
+                plan["pull"] = {
+                    k: row for k, row in plan["pull"].items()
+                    if _policy_allows_item(scoped_policy, k)
+                }
+                plan["delete_local"] = [
+                    (k, cts) for k, cts in plan["delete_local"]
+                    if _policy_allows_item(scoped_policy, k)
+                ]
+                plan["refresh"] = {
+                    k: entry for k, entry in plan["refresh"].items()
+                    if _policy_allows_item(scoped_policy, k)
+                }
+                plan["shadow_drop"] = [
+                    k for k in plan["shadow_drop"]
+                    if _policy_allows_item(scoped_policy, k)
+                ]
 
-    outgoing = ([{spec["pk"]: p["key"], "data": p["data"],
-                  "updated_at": p["ts"], "deleted": False}
-                 for p in plan["push"]]
-                + [{spec["pk"]: t["key"], "data": t["data"],
-                    "updated_at": t["ts"], "deleted": True}
-                   for t in plan["tombstone"]])
-    if outgoing:
-        sbase.upsert_store_rows(cfg, spec["table"], spec["pk"], outgoing)
-        # only after the upsert succeeded: a failed push must retry next pass
-        _update_shadow(name, {
-            **{p["key"]: {"h": _hash(p["data"]), "ts": p["ts"], "dead": False}
-               for p in plan["push"]},
-            **{t["key"]: {"h": None, "ts": t["ts"], "dead": True}
-               for t in plan["tombstone"]},
-        })
+            updates: dict[str, dict | None] = {}
+            if plan["pull"] or plan["delete_local"] or ids_assigned:
+                for k, row in plan["pull"].items():
+                    incoming = row.get("data") or {}
+                    records[k] = spec["adopt"](records.get(k), incoming)
+                    updates[k] = {
+                        "h": _hash(incoming),
+                        "ts": row.get("updated_at") or "",
+                        "dead": False,
+                    }
+                for k, cts in plan["delete_local"]:
+                    records.pop(k, None)
+                    updates[k] = {"h": None, "ts": cts, "dead": True}
+                if plan["pull"] or plan["delete_local"]:
+                    _backup(path)
+                lib.save_json(path, spec["recompose"](doc, records))
+            for k, entry in plan["refresh"].items():
+                updates[k] = entry
+            for k in plan["shadow_drop"]:
+                updates[k] = None
+            if updates:
+                _update_shadow(name, updates)
+
+    with _item_policy_scope(item_policy, policy_guard) as scoped_policy:
+        if scoped_policy is not None:
+            plan["push"] = [
+                value for value in plan["push"]
+                if _policy_allows_item(scoped_policy, value["key"])
+            ]
+            plan["tombstone"] = [
+                value for value in plan["tombstone"]
+                if _policy_allows_item(scoped_policy, value["key"])
+            ]
+
+        outgoing = (
+            [
+                {
+                    spec["pk"]: value["key"],
+                    "data": value["data"],
+                    "updated_at": value["ts"],
+                    "deleted": False,
+                }
+                for value in plan["push"]
+            ]
+            + [
+                {
+                    spec["pk"]: value["key"],
+                    "data": value["data"],
+                    "updated_at": value["ts"],
+                    "deleted": True,
+                }
+                for value in plan["tombstone"]
+            ]
+        )
+        if outgoing:
+            sbase.upsert_store_rows(
+                cfg, spec["table"], spec["pk"], outgoing
+            )
+            _update_shadow(name, {
+                **{
+                    value["key"]: {
+                        "h": _hash(value["data"]),
+                        "ts": value["ts"],
+                        "dead": False,
+                    }
+                    for value in plan["push"]
+                },
+                **{
+                    value["key"]: {
+                        "h": None,
+                        "ts": value["ts"],
+                        "dead": True,
+                    }
+                    for value in plan["tombstone"]
+                },
+            })
 
     return {"pushed": len(plan["push"]), "pulled": len(plan["pull"]),
             "tombstoned": len(plan["tombstone"]),
@@ -412,14 +612,45 @@ def sync_store(cfg: dict, name: str, lock=None, dry: bool = False) -> dict:
             "in_sync": plan["in_sync"], "guard": plan["guard"]}
 
 
-def sync_stores(cfg: dict, locks: dict | None = None, dry: bool = False) -> dict:
-    """All three JSON stores; one store's failure never stops the others."""
+def sync_stores(
+        cfg: dict,
+        locks: dict | None = None,
+        dry: bool = False,
+        allow_item: ItemPolicy | None = None,
+        item_policy_guard: ItemPolicyGuard | None = None,
+) -> dict:
+    """Sync every JSON store; one store's failure never stops the others.
+
+    The item policy options apply only to the ``builds`` catalogue because IA
+    source, correction, and taxonomy keys are not item identities. Use the
+    guarded form for the atomic lifecycle guarantee described by
+    :func:`sync_store`.
+    """
+    allow_item, item_policy_guard = _checked_item_policy_guard(
+        allow_item, item_policy_guard
+    )
     locks = dict(locks or {})
+    if item_policy_guard is not None and locks.get("builds") is not None:
+        raise ValueError(
+            "the guarded item policy owns the catalogue lock; "
+            "a second builds lock is not allowed"
+        )
     locks.setdefault("corrections", _corrections_lock)
     out = {}
     for name in STORES:
         try:
-            out[name] = sync_store(cfg, name, lock=locks.get(name), dry=dry)
+            out[name] = sync_store(
+                cfg,
+                name,
+                lock=locks.get(name),
+                dry=dry,
+                allow_item=(allow_item
+                            if name == _ITEM_CATALOGUE_STORE else None),
+                item_policy_guard=(
+                    item_policy_guard
+                    if name == _ITEM_CATALOGUE_STORE else None
+                ),
+            )
         except Exception as exc:
             out[name] = {"error": f"{type(exc).__name__}: {exc}"}
     return out
@@ -503,58 +734,137 @@ def entries_plan(local: dict[str, dict], remote: dict[str, dict],
     return {"push": push, "pull": pull, "same": same}
 
 
-def sync_entry_files(r2cfg: dict, dry: bool = False) -> dict:
-    """Mirror output/entries/ against the bucket's entries/ prefix."""
+def _entry_item_id(rel: str) -> str:
+    """Return the exact item identity encoded by an entry-relative path."""
+    return str(rel).split("/", 1)[0]
+
+
+def sync_entry_files(
+        r2cfg: dict,
+        dry: bool = False,
+        allow_item: ItemPolicy | None = None,
+        item_policy_guard: ItemPolicyGuard | None = None,
+) -> dict:
+    """Mirror output/entries/ against the bucket's entries/ prefix.
+
+    ``allow_item`` is an optional lifecycle policy over the exact first path
+    component (the item id). ``item_policy_guard`` is its atomic alternative:
+    it yields a policy while the lifecycle isolation scope is held. Disallowed
+    items are absent from planning, and the guarded policy stays held across
+    each remote or local transfer so deletion cannot enter after the check.
+
+    These seams are injected instead of reading a tombstone store here: the
+    lifecycle adapter owns durable state and lock ordering.
+    """
     base = entries_dir()
-    local = local_entry_files(base)
-    remote = {}
-    for key, meta in r2.list_objects_meta(r2cfg, prefix=ENTRIES_PREFIX).items():
+    allow_item, item_policy_guard = _checked_item_policy_guard(
+        allow_item, item_policy_guard
+    )
+    report_suppressed = (
+        allow_item is not None or item_policy_guard is not None
+    )
+    suppressed: set[str] = set()
+    planning_allowed: dict[str, bool] = {}
+
+    local_inventory = local_entry_files(base)
+    remote_inventory = {}
+    for key, meta in r2.list_objects_meta(
+        r2cfg, prefix=ENTRIES_PREFIX
+    ).items():
         rel = key[len(ENTRIES_PREFIX):]
-        if rel and _safe_rel(rel):
-            remote[rel] = meta
+        if not rel or not _safe_rel(rel):
+            continue
+        remote_inventory[rel] = meta
+
+    with _item_policy_scope(
+        allow_item, item_policy_guard
+    ) as planning_policy:
+        def allowed_for_plan(rel: str) -> bool:
+            if planning_policy is None:
+                return True
+            item_id = _entry_item_id(rel)
+            if item_id not in planning_allowed:
+                planning_allowed[item_id] = _policy_allows_item(
+                    planning_policy, item_id
+                )
+            return planning_allowed[item_id]
+
+        local = {}
+        for rel, meta in local_inventory.items():
+            if allowed_for_plan(rel):
+                local[rel] = meta
+            else:
+                suppressed.add(rel)
+        remote = {}
+        for rel, meta in remote_inventory.items():
+            if allowed_for_plan(rel):
+                remote[rel] = meta
+            else:
+                suppressed.add(rel)
     md5s = {rel: _md5(base / rel) for rel in set(local) & set(remote)}
     plan = entries_plan(local, remote, md5s)
     if dry:
-        return {"pushed": len(plan["push"]), "pulled": len(plan["pull"]),
-                "in_sync": len(plan["same"]), "dry": True}
+        result = {"pushed": len(plan["push"]), "pulled": len(plan["pull"]),
+                  "in_sync": len(plan["same"]), "dry": True}
+        if report_suppressed:
+            result["suppressed"] = len(suppressed)
+        return result
+
+    pushed = 0
     for rel in plan["push"]:
-        r2.put_file(r2cfg, ENTRIES_PREFIX + rel, base / rel,
-                    content_type=content_type_for(rel))
+        with _item_policy_scope(
+            allow_item, item_policy_guard
+        ) as transfer_policy:
+            if transfer_policy is not None and not _policy_allows_item(
+                transfer_policy, _entry_item_id(rel)
+            ):
+                suppressed.add(rel)
+                continue
+            r2.put_file(
+                r2cfg,
+                ENTRIES_PREFIX + rel,
+                base / rel,
+                content_type=content_type_for(rel),
+            )
+            pushed += 1
+
+    pulled = 0
     for rel in plan["pull"]:
-        dest = base / rel
-        if dest.exists():                # overwriting OCR work: keep one copy
-            bak = lib.OUTPUT_DIR / "backups" / "entries" / rel
-            bak.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(dest, bak)
-        r2.get_file(r2cfg, ENTRIES_PREFIX + rel, dest)
-    return {"pushed": len(plan["push"]), "pulled": len(plan["pull"]),
-            "in_sync": len(plan["same"])}
+        # Check before even inspecting or creating a destination/backup path.
+        # A lifecycle policy change must leave no local publication footprint.
+        with _item_policy_scope(
+            allow_item, item_policy_guard
+        ) as transfer_policy:
+            if transfer_policy is not None and not _policy_allows_item(
+                transfer_policy, _entry_item_id(rel)
+            ):
+                suppressed.add(rel)
+                continue
+            dest = base / rel
+            if dest.exists():            # overwriting OCR work: keep one copy
+                bak = lib.OUTPUT_DIR / "backups" / "entries" / rel
+                bak.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(dest, bak)
+            r2.get_file(r2cfg, ENTRIES_PREFIX + rel, dest)
+            pulled += 1
+    result = {"pushed": pushed, "pulled": pulled,
+              "in_sync": len(plan["same"])}
+    if report_suppressed:
+        result["suppressed"] = len(suppressed)
+    return result
 
 
 # --- CLI ---------------------------------------------------------------------------
 
 def _cli_cfg() -> dict:
     import cloud_defaults
-    url = os.environ.get("SUPABASE_URL", "")
-    key = os.environ.get("SUPABASE_KEY", "")
-    if not (url and key):
-        s = lib.load_json(lib.CLIENT_STATE_PATH, {}).get("settings", {})
-        url = url or str(s.get("supabaseUrl") or "")
-        key = key or str(s.get("supabaseKey") or "")
-    url = url or cloud_defaults.SUPABASE_URL   # the key is a secret; the URL isn't
-    if not key:
-        raise SystemExit("No Supabase service key. Set it in Settings > Sync, or "
-                         "export SUPABASE_URL and SUPABASE_KEY.")
-    return {"url": url.rstrip("/"), "key": key}
+    return cli_credentials.supabase_service_config(
+        default_url=cloud_defaults.SUPABASE_URL
+    )
 
 
 def _cli_r2cfg() -> dict:
-    s = lib.load_json(lib.CLIENT_STATE_PATH, {}).get("settings", {})
-    return {"account": str(s.get("r2Account") or "").strip(),
-            "bucket": str(s.get("r2Bucket") or "").strip(),
-            "key_id": str(s.get("r2KeyId") or "").strip(),
-            "secret": str(s.get("r2Secret") or "").strip(),
-            "public_base": str(s.get("r2PublicBase") or "").strip()}
+    return cli_credentials.r2_config(required=False)
 
 
 def _print_result(results: dict, entries: dict | None) -> None:
@@ -578,6 +888,12 @@ def _print_result(results: dict, entries: dict | None) -> None:
 
 
 def _run(dry: bool) -> None:
+    if not dry:
+        raise SystemExit(
+            "Mutating standalone sync is disabled because it cannot acquire "
+            "Library Tool's item-lifecycle guard. Run Sync from Library Tool; "
+            "the standalone `status` command remains available."
+        )
     cfg = _cli_cfg()
     results = sync_stores(cfg, dry=dry)
     r2cfg = _cli_r2cfg()
@@ -589,7 +905,7 @@ def _run(dry: bool) -> None:
             entries = {"error": f"{type(exc).__name__}: {exc}"}
     _print_result(results, entries)
     if dry:
-        print("\ndry run — `sync --run` applies it")
+        print("\ndry run — apply changes from Library Tool's Sync control")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -601,7 +917,7 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=lambda a: _run(dry=True))
     c = sub.add_parser("sync", help="merge with the cloud")
     c.add_argument("--run", action="store_true",
-                   help="actually sync (default: dry run)")
+                   help="request mutation (requires the Library Tool host)")
     c.set_defaults(fn=lambda a: _run(dry=not a.run))
     args = ap.parse_args(argv)
     args.fn(args)

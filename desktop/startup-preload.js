@@ -2,7 +2,7 @@
 // by the main process so this preload remains compatible with sandboxing.
 const { contextBridge, ipcRenderer } = require("electron");
 
-contextBridge.exposeInMainWorld("whlStartup", {
+if (process.isMainFrame) contextBridge.exposeInMainWorld("whlStartup", {
   onAssets: (cb) => ipcRenderer.on("startup:assets", (_event, value) => cb(value)),
   onStatus: (cb) => ipcRenderer.on("startup:status", (_event, value) => cb(String(value))),
   onTheme: (cb) => ipcRenderer.on("startup:theme", (_event, value) => cb(String(value))),

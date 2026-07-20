@@ -68,6 +68,98 @@ def test_track_transition_and_snapshot():
         _finish(job["id"])
 
 
+def test_item_job_registration_holds_lifecycle_gate_and_normalizes_subject(
+        tmp_path, monkeypatch):
+    """Deletion cannot enter its outer gate before registration is visible."""
+    builds_path = tmp_path / "builds.json"
+    builds_path.write_text(json.dumps({
+        "gate-book": {"id": "gate-book", "title": "Gate Herbal"},
+    }), encoding="utf-8")
+    monkeypatch.setattr(server, "BUILDS_PATH", builds_path)
+
+    entered_track = threading.Event()
+    release_track = threading.Event()
+    contender_attempted = threading.Event()
+    contender_acquired = threading.Event()
+    worker_errors: list[BaseException] = []
+    seen: dict = {}
+
+    def blocking_track(job, kind, label=""):
+        seen.update(job=job, kind=kind, label=label)
+        entered_track.set()
+        assert release_track.wait(timeout=2)
+        return threading.Event()
+
+    monkeypatch.setattr(server, "_job_track", blocking_track)
+    job = {"id": "gate-job", "subject": {"source_id": "primary"}}
+
+    def register():
+        try:
+            server._job_track_item_guarded(job, "ocr", "gate-book")
+        except BaseException as exc:  # surfaced on the test thread below
+            worker_errors.append(exc)
+
+    def contend_for_lifecycle_gate():
+        contender_attempted.set()
+        with server._page_structure_lock:
+            contender_acquired.set()
+
+    worker = threading.Thread(target=register)
+    worker.start()
+    assert entered_track.wait(timeout=2)
+    contender = threading.Thread(target=contend_for_lifecycle_gate)
+    contender.start()
+    assert contender_attempted.wait(timeout=2)
+    assert not contender_acquired.wait(timeout=0.1)
+
+    release_track.set()
+    worker.join(timeout=2)
+    contender.join(timeout=2)
+
+    assert not worker.is_alive() and not contender.is_alive()
+    assert worker_errors == []
+    assert contender_acquired.is_set()
+    assert job["build_id"] == "gate-book"
+    assert job["subject"] == {
+        "item_id": "gate-book", "source_id": "primary",
+    }
+    assert seen["kind"] == "ocr"
+    assert seen["label"] == "Gate Herbal"
+
+
+def test_item_job_waiting_behind_lifecycle_delete_is_not_registered(
+        tmp_path, monkeypatch):
+    """A start queued behind deletion must re-read the catalogue and fail."""
+    builds_path = tmp_path / "builds.json"
+    builds_path.write_text(json.dumps({
+        "deleted-book": {"id": "deleted-book", "title": "Gone"},
+    }), encoding="utf-8")
+    monkeypatch.setattr(server, "BUILDS_PATH", builds_path)
+    attempted = threading.Event()
+    caught: list[BaseException] = []
+    job = {"id": "late-job"}
+
+    def late_start():
+        attempted.set()
+        try:
+            server._job_track_item_guarded(job, "ocr", "deleted-book")
+        except BaseException as exc:
+            caught.append(exc)
+
+    with server._page_structure_lock:
+        worker = threading.Thread(target=late_start)
+        worker.start()
+        assert attempted.wait(timeout=2)
+        with server._builds_lock:
+            server.lib.save_json(builds_path, {})
+
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert len(caught) == 1
+    assert isinstance(caught[0], server._ItemJobStartRejected)
+    assert "late-job" not in server._jobs
+
+
 def test_error_status_maps_to_failed_state():
     job = {"build_id": "lifecycb0002"}
     server._job_track(job, "about")
@@ -319,7 +411,9 @@ def test_cancel_translate_between_pages_keeps_saved_pages(client, monkeypatch):
         return "TRANSLATED PAGE ONE"
 
     monkeypatch.setattr(server, "_ai_cfg", lambda: {
-        "base": "https://example.test/v1", "key": "k", "model": "m"})
+        "base": "https://example.test/v1", "model": "m"})
+    monkeypatch.setattr(server, "_secret_is_configured",
+                        lambda key: key == "aiKey")
     monkeypatch.setattr(server, "_ai_chat", fake_ai_chat)
     monkeypatch.setattr(server, "_an_job_start", run_inline)
 
@@ -341,6 +435,26 @@ def test_cancel_translate_between_pages_keeps_saved_pages(client, monkeypatch):
     unified = client.get("/api/jobs").get_json()["jobs"]
     row = next(r for r in unified if r.get("id") == data["job"])
     assert row["state"] == "cancelled"
+
+
+def test_analyze_job_registration_uses_canonical_item_gate(
+        tmp_path, monkeypatch):
+    builds_path = tmp_path / "builds.json"
+    builds_path.write_text(json.dumps({
+        "analyze-gate": {"id": "analyze-gate", "title": "Analyze Herbal"},
+    }), encoding="utf-8")
+    monkeypatch.setattr(server, "BUILDS_PATH", builds_path)
+
+    job = server._an_job_new("analyze-gate", "summarize", 3)
+    try:
+        assert job["build_id"] == "analyze-gate"
+        assert job["subject"]["item_id"] == "analyze-gate"
+        assert server._jobs[job["id"]] is job
+        assert server._jobs[job["id"]]["label"] == "Analyze Herbal"
+    finally:
+        with server._an_jobs_lock:
+            server._an_jobs.pop(job["id"], None)
+        _finish(job["id"])
 
 
 # --- restart: persisted jobs come back as interrupted -----------------------------
@@ -388,6 +502,50 @@ def test_restart_marks_active_jobs_interrupted(client):
 
 
 # --- publish: stage-boundary cancellation with rollback ---------------------------
+
+def test_publish_job_registration_uses_canonical_item_gate(
+        client, tmp_path, monkeypatch):
+    builds_path = tmp_path / "builds.json"
+    builds_path.write_text(json.dumps({
+        "publish-gate": {
+            "id": "publish-gate",
+            "title": "Publish Herbal",
+            "status": "ready",
+            "rights": "public-domain",
+        },
+    }), encoding="utf-8")
+    monkeypatch.setattr(server, "BUILDS_PATH", builds_path)
+    monkeypatch.setattr(server, "_cloud_cfg", lambda: {"configured": True})
+
+    started: list[tuple] = []
+
+    class DeferredThread:
+        def __init__(self, *, target, args, daemon):
+            started.append((target, args, daemon))
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(server.threading, "Thread", DeferredThread)
+    with server._publish_lock:
+        server._publish["running"] = False
+
+    response = client.post(
+        "/api/volumes/publish", json={"build_id": "publish-gate"},
+    )
+    assert response.status_code == 200
+    job_id = response.get_json()["job"]
+    try:
+        job = server._jobs[job_id]
+        assert job["build_id"] == "publish-gate"
+        assert job["subject"]["item_id"] == "publish-gate"
+        assert job["label"] == "Publish Herbal"
+        assert started and started[0][1][0] == "publish-gate"
+    finally:
+        _finish(job_id)
+        with server._publish_lock:
+            server._publish["running"] = False
+            server._publish["job"] = ""
 
 def test_publish_cancel_rolls_back_uploaded_objects(tmp_path, monkeypatch):
     pdf = tmp_path / "volume.pdf"

@@ -15,7 +15,10 @@ from librarytool.engine.items import (
     ItemQueryService,
     WorkbenchContribution,
 )
-from librarytool.engine.workbench_policies import standard_workbench_policies
+from librarytool.engine.workbench_policies import (
+    ItemLifecycleWorkbenchPolicy,
+    standard_workbench_policies,
+)
 
 
 def _service(items, *, representations=None, artifacts=None):
@@ -33,6 +36,13 @@ def _service(items, *, representations=None, artifacts=None):
         load_artifacts=load_artifacts if artifacts is not None else None,
     )
     return ItemQueryService(repository, policies=standard_workbench_policies())
+
+
+def test_item_lifecycle_policy_advertises_only_live_item_delete() -> None:
+    commands = ItemLifecycleWorkbenchPolicy().contribute(object()).available_commands
+
+    assert commands == ("item.delete",)
+    assert "item.restore" not in commands
 
 
 def test_list_and_get_project_build_mappings_without_framework_state():

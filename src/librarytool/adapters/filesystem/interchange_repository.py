@@ -238,7 +238,16 @@ class FilesystemInterchangeUnitOfWork:
         clean_region_id: Callable[[Any], str],
         normalize_language: Callable[[str], str],
         sanitize_document_name: Callable[[str], str],
+        transaction: RecoverableWriteTransaction | None = None,
     ) -> None:
+        if transaction is not None and (
+            not isinstance(transaction, RecoverableWriteTransaction)
+            or transaction._owner is not write_set
+        ):
+            raise RepositoryError(
+                "the import transaction belongs to another workspace",
+                code="interchange_scope_mismatch",
+            )
         self._write_set = write_set
         self._item_id = item_id
         self._source_id = source_id
@@ -280,10 +289,18 @@ class FilesystemInterchangeUnitOfWork:
             folded_sources
         ) != len(set(folded_sources)):
             self._invalid_destination("source identifiers are ambiguous")
-        self._transaction: RecoverableWriteTransaction | None = None
+        self._transaction = transaction
+        self._staged_plan: LibImportPlan | None = None
         self._applied = False
+        self._receipt_staged = False
         self._committed = False
         self.destination = self._snapshot()
+
+    @property
+    def transaction(self) -> RecoverableWriteTransaction | None:
+        """Return the transaction used by a composite filesystem aggregate."""
+
+        return self._transaction
 
     def receipt(self, operation_id: str) -> LibImportReceipt | None:
         path = self._receipt_path(operation_id)
@@ -310,15 +327,17 @@ class FilesystemInterchangeUnitOfWork:
                 "the import unit is already committed",
                 code="import_unit_committed",
             )
-        transaction = self._write_set.begin(
-            operation_id=self._operation_id,
-            scope=f"interchange:{self._item_id}",
-            metadata={
-                "item_id": self._item_id,
-                "source_id": self._source_id,
-                "archive_sha256": plan.archive_sha256,
-            },
-        )
+        transaction = self._transaction
+        if transaction is None:
+            transaction = self._write_set.begin(
+                operation_id=self._operation_id,
+                scope=f"interchange:{self._item_id}",
+                metadata={
+                    "item_id": self._item_id,
+                    "source_id": self._source_id,
+                    "archive_sha256": plan.archive_sha256,
+                },
+            )
         postimages: dict[str, bytes] = {}
         deletions: set[str] = set()
         entry_prefix = self._entry_relative.as_posix() + "/"
@@ -479,6 +498,7 @@ class FilesystemInterchangeUnitOfWork:
             plan=plan,
         )
         self._transaction = transaction
+        self._staged_plan = plan
         self._applied = True
 
     def _stage_manifest(
@@ -554,12 +574,52 @@ class FilesystemInterchangeUnitOfWork:
                 "the import unit is already committed",
                 code="import_unit_committed",
             )
+        self.stage_receipt(receipt)
+        self._transaction.commit(receipt=receipt.as_dict())
+        self._committed = True
+
+    def stage_receipt(self, receipt: LibImportReceipt) -> None:
+        """Append the durable import receipt without committing a shared unit."""
+
+        if not self._applied or self._transaction is None:
+            raise RepositoryError(
+                "no import plan has been staged",
+                code="import_plan_not_staged",
+            )
+        if self._committed:
+            raise RepositoryError(
+                "the import unit is already committed",
+                code="import_unit_committed",
+            )
+        if self._receipt_staged:
+            raise RepositoryError(
+                "the import receipt is already staged",
+                code="import_receipt_already_staged",
+            )
+        self._validate_receipt(receipt)
         self._transaction.stage_write(
             self._receipt_relative(receipt.operation_id),
             _json_bytes(receipt.as_dict()),
         )
-        self._transaction.commit(receipt=receipt.as_dict())
-        self._committed = True
+        self._receipt_staged = True
+
+    def _validate_receipt(self, receipt: LibImportReceipt) -> None:
+        if not isinstance(receipt, LibImportReceipt):
+            raise RepositoryError(
+                "the import receipt is invalid",
+                code="invalid_import_receipt",
+            )
+        assert self._staged_plan is not None
+        if (
+            receipt.operation_id != self._operation_id
+            or receipt.item_id != self._item_id
+            or receipt.source_id != self._source_id
+            or receipt.archive_sha256 != self._staged_plan.archive_sha256
+        ):
+            raise RepositoryError(
+                "the import receipt is outside the staged import",
+                code="interchange_scope_mismatch",
+            )
 
     def _snapshot(self) -> ImportDestinationSnapshot:
         regions = self._layout.get("regions")

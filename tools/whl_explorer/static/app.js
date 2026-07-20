@@ -40,17 +40,36 @@ const VIEW_STATE_KEYS = new Set([
   "remarksSidebarCollapsed", "remarksFilters",
   "collapsed", "wbSideCollapsed",
 ]);
-// Credentials are never persisted client-side. They live in the server's
-// Host-guarded secrets store (/api/secrets); Mistral additionally syncs through
+// Credentials are never persisted client-side. They live in the engine's
+// protected secret store; Mistral additionally syncs through
 // the signed-in user's private cloud profile so Book Capture can share it.
-// Must mirror server.py's _SECRET_KEYS. embedKey/imgGenKey were missing here
+// Must mirror the engine's LEGACY_SECRET_IDS registry. embedKey/imgGenKey were missing here
 // while the server accepted them, so persistSecrets filtered them out of a
 // save and partitionSettings let imgGenKey leak into localStorage/client_state.
-const SECRET_KEYS = new Set([
-  "aiKey", "embedKey", "mistralKey", "ocrClaudeKey", "ocrAzureKey",
-  "ocrAwsKey", "ocrAwsSecret", "supabaseKey", "supabaseAnonKey", "r2KeyId",
-  "r2Secret", "gsKeyFile", "imgGenKey",
-]);
+const SECRET_IDS = Object.freeze({
+  aiKey: "provider:ai:api-key",
+  embedKey: "provider:embedding:api-key",
+  imgGenKey: "provider:image-generation:api-key",
+  mistralKey: "provider:mistral:api-key",
+  ocrClaudeKey: "provider:anthropic:api-key",
+  ocrAzureKey: "provider:azure-ocr:api-key",
+  ocrAwsKey: "provider:aws-ocr:access-key-id",
+  ocrAwsSecret: "provider:aws-ocr:secret-access-key",
+  supabaseKey: "cloud:supabase:service-role-key",
+  supabaseAnonKey: "cloud:supabase:anon-key",
+  r2KeyId: "storage:r2:access-key-id",
+  r2Secret: "storage:r2:secret-access-key",
+  gsKeyFile: "provider:google-sheets:service-account-file",
+});
+const SECRET_KEYS = new Set(Object.keys(SECRET_IDS));
+let secretStatuses = Object.create(null);
+// Upgrade-only plaintext staging. Older builds wrote credentials into this
+// origin's settings cache. They are removed from state.settings immediately so
+// no client-state request can carry them, but remain in localStorage until the
+// protected engine store confirms each import. A crash or unavailable sidecar
+// therefore retries without either disclosure or credential loss.
+let legacyRendererSecrets = Object.create(null);
+let legacyRendererCacheDirty = false;
 function partitionSettings(s) {
   const prefs = {}, view = {};
   for (const k of Object.keys(s)) {
@@ -60,41 +79,166 @@ function partitionSettings(s) {
   return { prefs, view };
 }
 
-// Hydrate the renderer's ephemeral credential cache. Mistral may arrive from
-// the signed-in user's private cloud profile; partitionSettings keeps every
-// value here out of localStorage and client_state.
+function captureLegacyRendererSecrets(source) {
+  if (!source || typeof source !== "object" || Array.isArray(source)) return source;
+  for (const key of SECRET_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(source, key)) continue;
+    legacyRendererCacheDirty = true;
+    const value = String(source[key] || "").trim();
+    if (value && !Object.prototype.hasOwnProperty.call(legacyRendererSecrets, key)) {
+      legacyRendererSecrets[key] = value;
+    }
+    delete source[key];
+  }
+  return source;
+}
+
+function persistSettingsCache(prefs, view) {
+  const cachedPrefs = { ...(prefs || {}) };
+  const cachedView = { ...(view || {}) };
+  for (const key of SECRET_KEYS) {
+    delete cachedPrefs[key];
+    delete cachedView[key];
+  }
+  // Keep only not-yet-confirmed upgrade values durable. These never enter the
+  // in-memory settings object or the server-bound preference document.
+  Object.assign(cachedPrefs, legacyRendererSecrets);
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(cachedPrefs));
+  localStorage.setItem(VIEWSTATE_KEY, JSON.stringify(cachedView));
+}
+
+// Hydrate the renderer's status-only credential view. Plaintext never returns
+// from the engine or enters state.settings, localStorage, or client_state.
 // Returns null when the store could not be READ — distinct from "read fine,
 // nothing stored" ({}). Callers that paint fields must not treat a failed read
 // as a set of empty keys, or a sidecar restart blanks every credential field.
+function secretConfigured(key) {
+  return !!(secretStatuses[key] && secretStatuses[key].configured);
+}
+
+function secretMaskedValue(key) {
+  const status = secretStatuses[key];
+  return status && status.configured ? status.masked_hint : "";
+}
+
+function secretOperationId(prefix = "secret") {
+  const suffix = globalThis.crypto && typeof globalThis.crypto.randomUUID === "function"
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return `${prefix}-${suffix}`;
+}
+
 async function hydrateSecrets() {
   try {
-    const res = await fetch("/api/secrets");
-    if (!res.ok) return null;
-    const secrets = await res.json();
-    for (const k of SECRET_KEYS) state.settings[k] = secrets[k] || "";
-    return secrets;
+    const document = await engineClient.secrets.list();
+    const byId = new Map(document.secrets.map((status) => [status.id, status]));
+    const next = Object.create(null);
+    for (const [key, id] of Object.entries(SECRET_IDS)) {
+      if (byId.has(id)) next[key] = byId.get(id);
+    }
+    secretStatuses = next;
+    return document;
   } catch (e) {
     return null;
   }
 }
 
-// Persist personal service credentials through the same loopback-only endpoint
-// used by Settings. Normal settings deliberately exclude SECRET_KEYS, so a
-// wizard must never rely on saveSettings() for these values.
-async function persistSecrets(updates) {
-  const clean = {};
-  for (const [k, value] of Object.entries(updates || {})) {
-    if (!SECRET_KEYS.has(k)) continue;
-    clean[k] = String(value || "").trim();
+// Mutate personal service credentials through the versioned protected-store
+// API. Normal settings deliberately exclude SECRET_KEYS, so a wizard must
+// never rely on saveSettings() for these values.
+async function persistSecrets(updates, options) {
+  const legacyLocalImport = !!(options && options.legacyLocalImport);
+  if (!Object.keys(secretStatuses).length) await hydrateSecrets();
+  for (const [key, raw] of Object.entries(updates || {})) {
+    if (!SECRET_KEYS.has(key)) continue;
+    const status = secretStatuses[key];
+    if (!status) throw new Error("protected credential storage is unavailable");
+    const value = String(raw || "").trim();
+    if (status.configured && value === status.masked_hint) continue;
+    let result;
+    if (value) {
+      result = await engineClient.secrets.replace({
+        secretId: SECRET_IDS[key], revision: status.revision,
+        credential: value,
+        idempotencyKey: secretOperationId("secret-replace"),
+        legacyLocalImport,
+      });
+    } else {
+      if (!status.configured) continue;
+      result = await engineClient.secrets.clear({
+        secretId: SECRET_IDS[key], revision: status.revision,
+        idempotencyKey: secretOperationId("secret-clear"),
+      });
+    }
+    secretStatuses[key] = result.receipt.after;
   }
-  if (!Object.keys(clean).length) return;
-  const res = await fetch("/api/secrets", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ updates: clean }),
-  });
-  if (!res.ok) throw new Error(`credential save failed (HTTP ${res.status})`);
-  for (const [k, value] of Object.entries(clean)) state.settings[k] = value;
+  return secretStatuses;
+}
+
+async function migrateLegacyRendererSecrets() {
+  const keys = Object.keys(legacyRendererSecrets);
+  const document = await hydrateSecrets();
+  if (!keys.length) {
+    if (document && legacyRendererCacheDirty) {
+      try {
+        const { prefs, view } = partitionSettings(state.settings);
+        persistSettingsCache(prefs, view);
+        legacyRendererCacheDirty = false;
+      } catch (e) {
+        return false;
+      }
+    }
+    return document !== null;
+  }
+  if (!document || !document.health.writable) return false;
+  for (const key of keys) {
+    const value = legacyRendererSecrets[key];
+    const current = secretStatuses[key];
+    if (!value || !current) continue;
+    try {
+      // A configured protected value is authoritative; no plaintext compare is
+      // possible or desirable. Otherwise the explicit import marker keeps an
+      // old Mistral cache protected-but-unowned and prevents cloud upload.
+      if (!current.configured) {
+        await persistSecrets(
+          { [key]: value },
+          { legacyLocalImport: true },
+        );
+      }
+      delete legacyRendererSecrets[key];
+      const { prefs, view } = partitionSettings(state.settings);
+      persistSettingsCache(prefs, view);
+    } catch (e) {
+      // A hidden Mistral status can mean a different account already owns the
+      // one protected cache slot. That protected value is authoritative; do
+      // not retain or overwrite a stale origin cache. For an ambiguous failure
+      // on another key, a fresh configured status likewise confirms the write.
+      let protectedElsewhere = key === "mistralKey" &&
+        e && e.code === "mistral_credential_owned";
+      if (!protectedElsewhere) {
+        const refreshed = await hydrateSecrets();
+        protectedElsewhere = !!(refreshed && secretStatuses[key] &&
+          secretStatuses[key].configured);
+      }
+      if (protectedElsewhere) {
+        delete legacyRendererSecrets[key];
+        try {
+          const { prefs, view } = partitionSettings(state.settings);
+          persistSettingsCache(prefs, view);
+        } catch (cacheError) {
+          legacyRendererSecrets[key] = value;
+        }
+      }
+      // Otherwise keep the original cache value for a later startup. Never
+      // include the credential in status, errors, logs, or response-shaped data.
+    }
+  }
+  // Re-read account-scoped status after imports. In particular, an unowned
+  // Mistral value imported while signed in must remain hidden/unavailable.
+  await hydrateSecrets();
+  const complete = Object.keys(legacyRendererSecrets).length === 0;
+  if (complete) legacyRendererCacheDirty = false;
+  return complete;
 }
 
 // `categories` left this list with the taxonomy overhaul: assignments are
@@ -239,23 +383,22 @@ const state = {
     whlMode: "search", checkedMode: "search",
     // "" is the retired Classic CAD id; applyTheme() migrates it to DEFAULT_THEME
     paneWidth: null, theme: "",
-    aiBase: "", aiModel: "", aiKey: "", aiInstructions: "",
+    aiBase: "", aiModel: "", aiInstructions: "",
     smartScanInstructions: "", smartScanManualPages: false,
     // embeddings provider for search-index publishing (#140); blank = lexical-only
-    embedBase: "", embedModel: "", embedKey: "",
+    embedBase: "", embedModel: "",
     // OCR services (Settings > OCR). Tesseract runs locally; Mistral, Claude,
     // and Textract use credentials from Settings > Credentials.
     // Cloud capture (phone -> Supabase -> manual entries) + Mistral key,
     // shared by the capture pipeline and the Mistral OCR service
-    supabaseUrl: "", supabaseKey: "", supabaseAnonKey: "", mistralKey: "",
+    supabaseUrl: "",
     authPromptDismissed: false,   // "Work locally" said: don't ask at startup
     wizardDone: false,            // first-run setup guide finished or skipped
     // Cloudflare R2 for published PDFs (Supabase storage is 1 GB on free)
-    r2Account: "", r2Bucket: "", r2KeyId: "", r2Secret: "", r2PublicBase: "",
+    r2Account: "", r2Bucket: "", r2PublicBase: "",
     cloudSyncMinutes: 0, cloudDeleteRemote: true,
     ocrService: "tesseract",
-    ocrTesseract: "", ocrClaudeKey: "", ocrClaudeModel: "",
-    ocrAwsKey: "", ocrAwsSecret: "", ocrAwsRegion: "",
+    ocrTesseract: "", ocrClaudeModel: "", ocrAwsRegion: "",
     ocrImageWidth: 1400,
     ocrLayout: true,    // page view: place words where they sit on the page
     ocrPaperColor: false,   // tint facsimile paper from sampled PDF margins
@@ -268,7 +411,7 @@ const state = {
     // page-view digit shortcuts: press N over a page to queue it
     ocrKeyMap: { 1: "tesseract", 2: "mistral", 3: "claude", 4: "textract" },
     // master list -> Google Sheets publishing (Settings > Integrations)
-    gsSpreadsheetId: "", gsKeyFile: "", gsSheetName: "Master list",
+    gsSpreadsheetId: "", gsSheetName: "Master list",
     // cloud search + downloadable databases (Settings > Integrations)
     cloudSearchUrl: "",         // remote instance of this app; used when no local index
     dbUrls: {},                 // per-database download URLs (name -> url)
@@ -1669,7 +1812,10 @@ async function undo() {
   historyBusy = true;
   const op = history.stack[--history.ptr];
   try { await op.undoFn(); status(`UNDO :: ${op.label}`); }
-  catch (e) { statusErr(`UNDO FAILED :: ${op.label}`); }
+  catch (e) {
+    history.ptr += 1;  // the inverse did not commit; it is still undoable
+    statusErr(`UNDO FAILED :: ${op.label}`);
+  }
   historyBusy = false;
   updateHistoryButtons();
 }
@@ -1683,7 +1829,10 @@ async function redo() {
   historyBusy = true;
   const op = history.stack[history.ptr++];
   try { await op.redoFn(); status(`REDO :: ${op.label}`); }
-  catch (e) { statusErr(`REDO FAILED :: ${op.label}`); }
+  catch (e) {
+    history.ptr -= 1;  // the forward mutation did not commit; keep it redoable
+    statusErr(`REDO FAILED :: ${op.label}`);
+  }
   historyBusy = false;
   updateHistoryButtons();
 }
@@ -1809,8 +1958,7 @@ function saveSettings() {
   // own local key, never pushed. state.settings stays whole in memory.
   const { prefs, view } = partitionSettings(state.settings);
   try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(prefs));
-    localStorage.setItem(VIEWSTATE_KEY, JSON.stringify(view));
+    persistSettingsCache(prefs, view);
   } catch (e) {}
   pushClientState("settings");
 }
@@ -1859,6 +2007,8 @@ function loadSettings() {
   try {
     const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
     const v = JSON.parse(localStorage.getItem(VIEWSTATE_KEY) || "{}");
+    captureLegacyRendererSecrets(s);
+    captureLegacyRendererSecrets(v);
     // legacy caches kept view state inside SETTINGS_KEY; apply it, then let the
     // dedicated view-state store win. The next saveSettings re-partitions both.
     state.settings = Object.assign(state.settings, s, v);
@@ -2183,8 +2333,7 @@ async function syncClientStateOnLoad() {
       syncSearchConsCheckboxes();
       try {
         const { prefs, view } = partitionSettings(state.settings);
-        localStorage.setItem(SETTINGS_KEY, JSON.stringify(prefs));
-        localStorage.setItem(VIEWSTATE_KEY, JSON.stringify(view));
+        persistSettingsCache(prefs, view);
       } catch (e) {}
     }
     let healAttention = attentionDirty;
@@ -2433,7 +2582,7 @@ function closeWizard(markDone) {
 }
 
 // Values are committed when leaving a step, so Back/Next/Finish all keep work.
-// Credentials use /api/secrets; saveSettings intentionally strips them.
+// Credentials use the protected engine service; saveSettings strips them.
 async function wizCommit() {
   const step = WIZ_STEPS[wizStep][0];
   if (step === "account") {
@@ -2446,7 +2595,7 @@ async function wizCommit() {
     const updates = {};
     for (const [id, key] of fields) {
       const value = el(id).value.trim();
-      if (value !== String(state.settings[key] || "")) updates[key] = value;
+      if (value !== secretMaskedValue(key)) updates[key] = value;
     }
     if (!Object.keys(updates).length) return true;
     const msg = el("wiz-keys-msg");
@@ -2488,17 +2637,17 @@ function wizRender() {
     for (const [id, key] of fields) {
       const input = el(id);
       delete input.dataset.edited;
-      input.value = state.settings[key] || "";
+      input.value = secretMaskedValue(key);
     }
     el("wiz-keys-msg").textContent = "";
     // A slow profile refresh must not overwrite a key the user has started
     // typing. The input listener in initWizard marks touched fields.
-    (wizSecretsLoad || hydrateSecrets()).then((secrets) => {
+    (wizSecretsLoad || hydrateSecrets()).then((document) => {
       if (WIZ_STEPS[wizStep][0] !== "services") return;
-      if (!secrets) return;   // failed READ: leave the fields as the user left them
+      if (!document) return;   // failed READ: leave the fields as the user left them
       for (const [id, key] of fields) {
         const input = el(id);
-        if (!input.dataset.edited) input.value = secrets[key] || "";
+        if (!input.dataset.edited) input.value = secretMaskedValue(key);
       }
     });
     wizCheckTesseract();
@@ -4282,8 +4431,8 @@ function renderSettings() {
       saveSettings();
     };
   }
-  // Credentials load from and save to the server's Host-guarded secrets API.
-  // Mistral is cached there and synchronized with the private cloud profile;
+  // Credentials load from and save to the protected engine service. Mistral
+  // is synchronized with the private cloud profile;
   // the others remain device-local.
   (async () => {
     const SECRET_FIELDS = [
@@ -4310,17 +4459,18 @@ function renderSettings() {
       const n = el(id);
       if (!n) continue;
       if (secrets) {
-        n.value = secrets[k] || "";
-        state.settings[k] = secrets[k] || "";   // in-memory only (e.g. master sync)
+        n.value = secretMaskedValue(k);
+        n.disabled = !secrets.health.writable;
         n.classList.remove("cred-bad");         // a fresh read supersedes an old failure
       }
       n.onchange = async () => {
         const val = n.value.trim();
         // was fire-and-forget: a 500 or a restarting sidecar silently discarded
         // a pasted key on a field where nothing is visible to contradict it.
-        // persistSecrets sets state.settings[k] only on success.
+        // The renderer retains only the returned masked status on success.
         try {
           await persistSecrets({ [k]: val });
+          n.value = secretMaskedValue(k);
           n.classList.remove("cred-bad");
           // the note is shared, so only retract it once nothing is still failing
           if (!document.querySelector(".cad-input.cred-bad")) setNote("");
@@ -4340,6 +4490,9 @@ function renderSettings() {
       setNote("Could not read stored credentials — the local service may still be " +
         "starting. The fields below may be out of date; saving still works.");
       statusErr("CREDENTIALS :: could not be read");
+    } else if (!secrets.health.available || !secrets.health.writable) {
+      setNote("Protected credential storage is unavailable on this system.");
+      statusErr("CREDENTIALS :: protected storage unavailable");
     } else if (!document.querySelector(".cad-input.cred-bad")) {
       setNote("");
     }
@@ -6815,7 +6968,7 @@ async function applyRemarkValue(item, value) {
       ok = setAttnKey(item.ref, value, { label: item.label, category: item.category });
       refreshRemarkTarget(item);
     } else if (item.kind === "build") {
-      ok = await patchBuildRaw(item.ref, { attention: value });
+      ok = await updateBuildPortableMetadata(item.ref, { attention: value });
     } else if (item.kind === "row") {
       // rowsById is render-owned and can be stale while Home is active; rebuild
       // its lookup before dispatching to the existing persistence path.
@@ -7312,9 +7465,11 @@ function attnTargetAtHover() {
     return {
       node, kind: "build", ref: String(bid), label: b.title || String(bid),
       current: String(b.attention || ""),
-      apply: (v) => patchBuildRaw(bid, { attention: v }).then((ok) => {
+      apply: (v) => updateBuildPortableMetadata(
+        bid, { attention: v }).then((ok) => {
         if (rerender) rerender();
-        status(v ? "Marked: needs attention" : "Attention mark cleared");
+        if (ok)
+          status(v ? "Marked: needs attention" : "Attention mark cleared");
         return ok;
       }),
     };
@@ -7760,7 +7915,8 @@ async function clearMark(kind, ref) {
     return;
   }
   if (kind === "build") {
-    if ((state.builds || {})[ref]) await patchBuildRaw(ref, { attention: "" });
+    if ((state.builds || {})[ref])
+      await updateBuildPortableMetadata(ref, { attention: "" });
     return;
   }
   if (kind !== "row") return;
@@ -11836,6 +11992,91 @@ function pdfOcrMode(wanted, requested, hasText) {
   return { wanted: nextWanted, on: nextWanted && !!hasText };
 }
 
+const DESKTOP_PDF_EMBED_MAX_BYTES = 32 * 1024 * 1024;
+
+function pdfResponseLength(response) {
+  const raw = response && response.headers && response.headers.get("content-length");
+  if (!raw || !/^\d+$/.test(raw)) return null;
+  const length = Number(raw);
+  return Number.isSafeInteger(length) && length > 0 ? length : null;
+}
+
+function pdfEmbedFallback(message, bytes = 0) {
+  const error = new Error(message);
+  error.code = "PDF_EMBED_FALLBACK";
+  error.bytes = bytes;
+  return error;
+}
+
+async function cancelResponseBody(response) {
+  try {
+    if (response && response.body && typeof response.body.cancel === "function") {
+      await response.body.cancel();
+    }
+  } catch (e) { /* cancellation is best-effort */ }
+}
+
+async function readBoundedPdfBody(response, maxBytes) {
+  if (!response.body || typeof response.body.getReader !== "function") {
+    await cancelResponseBody(response);
+    throw pdfEmbedFallback("PDF stream cannot be bounded");
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let bytes = 0;
+  while (true) {
+    const part = await reader.read();
+    if (part.done) break;
+    const chunk = part.value instanceof Uint8Array
+      ? part.value : new Uint8Array(part.value || 0);
+    if (bytes + chunk.byteLength > maxBytes) {
+      try { await reader.cancel(); } catch (e) { /* already closed */ }
+      throw pdfEmbedFallback("PDF is too large to embed", bytes + chunk.byteLength);
+    }
+    chunks.push(chunk);
+    bytes += chunk.byteLength;
+  }
+  const contentType = response.headers.get("content-type") || "application/pdf";
+  return { blob: new Blob(chunks, { type: contentType }), bytes };
+}
+
+async function fetchBoundedPdfBlob(url, opts = {}) {
+  const fetchImpl = opts.fetchImpl || fetch;
+  const maxBytes = opts.maxBytes || DESKTOP_PDF_EMBED_MAX_BYTES;
+  const request = opts.signal ? { signal: opts.signal } : {};
+  const head = await fetchImpl(url, { ...request, method: "HEAD" });
+  if (!head.ok) throw new Error(`PDF request failed (${head.status})`);
+  const expected = pdfResponseLength(head);
+  if (expected == null) throw pdfEmbedFallback("PDF size is unavailable");
+  if (expected > maxBytes) throw pdfEmbedFallback("PDF is too large to embed", expected);
+
+  const response = await fetchImpl(url, request);
+  if (!response.ok) throw new Error(`PDF request failed (${response.status})`);
+  const responseLength = pdfResponseLength(response);
+  if (responseLength != null && responseLength > maxBytes) {
+    await cancelResponseBody(response);
+    throw pdfEmbedFallback("PDF is too large to embed", responseLength);
+  }
+  const result = await readBoundedPdfBody(response, maxBytes);
+  return { blob: result.blob, bytes: result.bytes || responseLength || expected };
+}
+
+function replaceObjectUrl(previous, blob) {
+  if (previous) URL.revokeObjectURL(previous);
+  return blob ? URL.createObjectURL(blob) : "";
+}
+
+function requestDesktopResource(url) {
+  const desktop = window.whlDesktop;
+  if (!desktop || !desktop.isDesktop || typeof desktop.openResource !== "function") return false;
+  desktop.openResource(url);
+  return true;
+}
+
+function openLocalResource(url) {
+  if (!requestDesktopResource(url)) window.open(url, "_blank", "noopener");
+}
+
 function createPdfViewer() {
   const root = document.createElement("div");
   root.className = "pdf-viewer";
@@ -11873,6 +12114,8 @@ function createPdfViewer() {
   const pagesSave = root.querySelector(".pdf-pagesave");
   const pagesBox = root.querySelector(".pdf-pagesbox");
   let sizeSeq = 0;
+  let frameObjectUrl = "";
+  let frameFetchController = null;
   let textSrc = "";
   // A PDF with OCR opens in the useful comparison view. Each viewer still
   // remembers an explicit toggle for the rest of the session, and callers may
@@ -11891,6 +12134,17 @@ function createPdfViewer() {
   let pagesWhole = false;   // marker-less file: one whole-text box, verbatim
   let pagesDirty = false;   // unsaved page-view edits
   let pagesSeq = 0;
+
+  function revokeFrameObjectUrl() {
+    frameObjectUrl = replaceObjectUrl(frameObjectUrl, null);
+  }
+
+  open.addEventListener("click", (event) => {
+    const href = open.getAttribute("href") || "";
+    if (href.startsWith("/api/") && requestDesktopResource(href)) {
+      event.preventDefault();
+    }
+  });
 
   // side-by-side page view: one row per page (image | that page's OCR
   // text), scrolling together — the same idiom as the OCR tab
@@ -12149,17 +12403,54 @@ function createPdfViewer() {
     el: root,
     setOcr,
     show(src, label, opts = {}) {
+      if (frameFetchController) frameFetchController.abort();
+      frameFetchController = null;
+      const seq = ++sizeSeq;
       // undecorated: suppress the browser PDF viewer's toolbar/side panes
       // (scrollbar=0 for viewers that honor it; the frame is also
       // oversized so remaining scrollbars are clipped away)
       const framed = src.startsWith("/api/pdf")
         ? src + "#toolbar=0&navpanes=0&scrollbar=0" : src;
-      if (frame.getAttribute("src") !== framed) frame.src = framed;
+      const authenticatedBlob = !!(window.whlDesktop && window.whlDesktop.isDesktop &&
+        src.startsWith("/api/pdf"));
+      if (authenticatedBlob) {
+        const controller = new AbortController();
+        frameFetchController = controller;
+        frame.removeAttribute("src");
+        revokeFrameObjectUrl();
+        open.hidden = true;
+        fetchBoundedPdfBlob(src, { signal: controller.signal }).then((result) => {
+          if (seq !== sizeSeq) return;
+          frameObjectUrl = replaceObjectUrl(frameObjectUrl, result.blob);
+          frame.src = frameObjectUrl + "#toolbar=0&navpanes=0&scrollbar=0";
+          // The open action always asks the trusted main frame to stream the
+          // original route in a hardened resource window. A blob popup would
+          // reintroduce an opener callback with no source-frame identity.
+          open.href = src;
+          open.hidden = false;
+          if (result.bytes) size.textContent = fmtBytes(result.bytes);
+        }).catch((error) => {
+          if (seq !== sizeSeq) return;
+          if (error && error.name === "AbortError") return;
+          open.href = src;
+          open.hidden = false;
+          if (error && error.bytes) size.textContent = fmtBytes(error.bytes);
+          note.textContent = error && error.code === "PDF_EMBED_FALLBACK"
+            ? "Open PDF in a separate window" : "Could not load PDF";
+          note.hidden = false;
+          frameWrap.hidden = true;
+        }).finally(() => {
+          if (frameFetchController === controller) frameFetchController = null;
+        });
+      } else {
+        revokeFrameObjectUrl();
+        if (frame.getAttribute("src") !== framed) frame.src = framed;
+        open.href = src;
+        open.hidden = false;
+      }
       note.hidden = true;
       path.textContent = label || src;
       path.dataset.tip = src;
-      open.href = src;
-      open.hidden = false;
       size.textContent = "";
       textSrc = opts.textSrc || "";
       ocrBtn.hidden = !textSrc;
@@ -12180,8 +12471,7 @@ function createPdfViewer() {
       setPages(pagesOn && !!pagesPdf);
       frameWrap.hidden = pagesOn;
       setOcr(opts.ocr != null ? opts.ocr : ocrWanted);
-      const seq = ++sizeSeq;
-      if (src.startsWith("/api/pdf")) {
+      if (src.startsWith("/api/pdf") && !authenticatedBlob) {
         fetch(src, { method: "HEAD" }).then((r) => {
           if (seq !== sizeSeq || !r.ok) return;
           const n = parseInt(r.headers.get("content-length") || "", 10);
@@ -12190,8 +12480,11 @@ function createPdfViewer() {
       }
     },
     clear(msg) {
+      if (frameFetchController) frameFetchController.abort();
+      frameFetchController = null;
       sizeSeq++;
       frame.removeAttribute("src");
+      revokeFrameObjectUrl();
       frameWrap.hidden = true;
       note.textContent = msg || "No PDF";
       note.hidden = false;
@@ -12849,35 +13142,71 @@ function wbLockNote(phase) {
     (phase === "text" ? "text work." : "analysis.");
 }
 
-// Verification is a save action: it persists every field and the description,
-// not just the badge, and removing it relocks Text/Knowledge — both said out
-// loud in the status line, since the side effects were previously silent.
+// Verification crosses two explicit ownership boundaries: portable metadata
+// commits first, then only the legacy workflow flags receive a conditional
+// compatibility patch. A failed second step is reported as partial success.
 async function setVerified(on) {
   const b = currentBuild();
   if (!b) return false;
   const buildId = b.id;
   el("b-ready").classList.toggle("active", !!on);
   el("b-verified-tag").hidden = !on;
-  const saved = await saveBuildFields();
-  // A save can finish after the user selected another book. Never let the old
-  // verification request repaint or relock the new editor.
-  if (state.buildSel !== buildId) return saved;
-  if (saved) {
-    status(on ? "VERIFIED — RECORD SAVED"
-              : "VERIFICATION REMOVED — Text and Knowledge relock");
+  const metadata = await saveBuildFields(null, {
+    forceMetadata: true,
+    returnOutcome: true,
+  });
+  if (!metadata || !metadata.ok || !metadata.receipt) {
+    if (state.buildSel === buildId) {
+      const cur = currentBuild();
+      const verified = cur &&
+        (cur.status === "ready" || cur.status === "uploaded");
+      el("b-ready").classList.toggle("active", !!verified);
+      el("b-verified-tag").hidden = !verified;
+      statusErr("VERIFY :: " +
+        (el("build-msg").textContent || "metadata save failed"));
+    }
+    return false;
+  }
+
+  const current = state.builds[buildId] || b;
+  const desired = {};
+  // Publishing is a stronger workflow state than verification. Neither
+  // checking nor unchecking this control may demote an uploaded record.
+  const desiredStatus = current.status === "uploaded"
+    ? "uploaded" : on ? "ready" : "draft";
+  if (current.status !== desiredStatus) desired.status = desiredStatus;
+  if (on && current.ocr_active &&
+      current.ocr_verified !== current.ocr_active) {
+    desired.ocr_verified = current.ocr_active;
+  } else if (!on && current.ocr_verified) {
+    desired.ocr_verified = "";
+  }
+
+  const workflow = await patchBuildVerificationCompatibility(
+    buildId, desired, metadata.receipt.after_revision);
+  const completed = !!(workflow && workflow.ok);
+  // Completion can follow a selection change. Apply the requested mutation
+  // to its original book, but never repaint the newly selected editor.
+  if (state.buildSel !== buildId) return completed;
+
+  const finalBuild = currentBuild();
+  const verified = finalBuild &&
+    (finalBuild.status === "ready" || finalBuild.status === "uploaded");
+  el("b-ready").classList.toggle("active", !!verified);
+  el("b-verified-tag").hidden = !verified;
+  if (completed) {
+    status(finalBuild && finalBuild.status === "uploaded"
+      ? "PUBLISHED ENTRY — METADATA SAVED"
+      : on ? "VERIFIED — RECORD SAVED"
+           : "VERIFICATION REMOVED — Text and Knowledge relock");
   } else {
-    const cur = currentBuild();
-    const verified = cur && (cur.status === "ready" || cur.status === "uploaded");
-    el("b-ready").classList.toggle("active", !!verified);
-    el("b-verified-tag").hidden = !verified;
-    // saveBuildFields reports into build-msg in the head bar; when this ran
-    // from a locked phase's inline button that corner is far from the click
-    // (and #b-ready is in the hidden Publish phase), so say it out loud too
-    statusErr("VERIFY :: " + (el("build-msg").textContent || "save failed"));
+    el("build-msg").textContent =
+      "Metadata saved; verification was not changed";
+    statusErr("VERIFY :: METADATA SAVED; WORKFLOW UPDATE FAILED");
   }
   renderBuildsList();
   renderWorkbench();      // gates + chips follow the new status immediately
-  return saved;
+  return completed;
 }
 
 // a locked phase offers the unlock where the user hits the wall, instead of
@@ -13176,8 +13505,8 @@ async function updateAnProvider() {
   const provider = base ? base.replace(/^https?:\/\//, "").split("/")[0] : "DeepSeek";
   let hasKey = false;
   try {
-    const sec = await (await fetch("/api/secrets")).json();
-    hasKey = !!String(sec.aiKey || "").trim();
+    await hydrateSecrets();
+    hasKey = secretConfigured("aiKey");
   } catch (e) { /* leave as no-key */ }
   host.classList.toggle("an-warn", !hasKey);
   host.textContent = hasKey
@@ -14021,8 +14350,8 @@ async function renderAnAsk(b) {
     el("an-ask-draft").hidden = true;
   }
   try {
-    const sec = await (await fetch("/api/secrets")).json();
-    anAskHasKey = !!String(sec.aiKey || "").trim();
+    await hydrateSecrets();
+    anAskHasKey = secretConfigured("aiKey");
   } catch (e) { anAskHasKey = false; }
   if (anAsk && anAsk.results.length) el("an-ask-draft").hidden = !anAskHasKey;
 }
@@ -14261,7 +14590,11 @@ function initAnalyze() {
   el("an-integrated-host").appendChild(el("an-main"));
   makeCatPicker("an-cat-picker", async (ids) => {
     const b = anSelected();
-    if (b && await patchBuildRaw(b.id, { category_ids: ids }, true)) {
+    const originTab = activeHistoryTab();
+    if (b && await updateBuildPortableMetadata(
+      b.id, { category_ids: ids }, {
+        label: "edit categories", originTab, quiet: true,
+      })) {
       status("CATEGORIES UPDATED");
     }
   });
@@ -17067,6 +17400,41 @@ function buildIsDirty() {
      buildDescMd.get() !== descState.val);
 }
 
+function engineBuildProjection(item) {
+  const legacy = item && item.compatibility && item.compatibility.build;
+  if (!item || !legacy || typeof legacy !== "object" || Array.isArray(legacy))
+    return null;
+  const workbench = item.workbench_state;
+  const availableCommands = workbench &&
+    Array.isArray(workbench.available_commands)
+    ? [...new Set(workbench.available_commands.filter((command) =>
+        typeof command === "string" && command))]
+    : [];
+  return {
+    ...legacy,
+    id: item.id,
+    title: item.title,
+    updated_at: legacy.updated_at || item.record_revision || "",
+    _record_revision: item.record_revision || legacy.updated_at || "",
+    _representations: Array.isArray(item.representations)
+      ? item.representations : [],
+    _available_commands: availableCommands,
+  };
+}
+
+function mergeBuildCompatibility(raw, prior) {
+  const previous = prior && typeof prior === "object" ? prior : {};
+  return {
+    ...(raw || {}),
+    _record_revision: (raw && raw.updated_at) ||
+      previous._record_revision || "",
+    _representations: Array.isArray(previous._representations)
+      ? previous._representations : [],
+    _available_commands: Array.isArray(previous._available_commands)
+      ? previous._available_commands : undefined,
+  };
+}
+
 async function loadBuilds() {
   try {
     const result = await engineClient.items.list({
@@ -17074,31 +17442,18 @@ async function loadBuilds() {
     });
     state.builds = {};
     for (const item of result.items || []) {
-      const legacy = item && item.compatibility && item.compatibility.build;
-      if (!legacy || typeof legacy !== "object" || Array.isArray(legacy)) continue;
-      state.builds[item.id] = {
-        ...legacy,
-        id: item.id,
-        title: item.title,
-        updated_at: legacy.updated_at || item.record_revision || "",
-      };
+      const build = engineBuildProjection(item);
+      if (build) state.builds[item.id] = build;
     }
-    // One-time migration for builds that already had a volume before explicit
-    // group metadata was introduced. Persist the association, then render from
-    // metadata on every subsequent load.
+    // Compatibility projection for builds created before explicit group
+    // metadata existed. Reads stay side-effect free: a durable back-end data
+    // migration must persist these inferred associations. Until then an
+    // explicit user Save may persist the displayed value through item.update.
     for (const b of Object.values(state.builds)) {
       if (!volNum(b) || String(b.group_id || "").trim()) continue;
       const groupId = buildGroupIdFor(b);
       if (!groupId) continue;
       b.group_id = groupId;
-      try {
-        const patch = await fetch(`/api/builds/${encodeURIComponent(b.id)}`, {
-          method: "PATCH", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ group_id: groupId }),
-        });
-        const data = await patch.json().catch(() => ({}));
-        if (patch.ok && data.ok) state.builds[b.id] = data.build;
-      } catch (e) { /* local display still uses the migrated association */ }
     }
   } catch (e) { state.builds = {}; }
 }
@@ -17113,6 +17468,18 @@ function allBuildsSorted() {
 
 function currentBuild() {
   return state.buildSel ? state.builds[state.buildSel] || null : null;
+}
+
+function itemDeleteAvailable(build) {
+  const commands = build && build._available_commands;
+  // A compatibility response without semantic workbench state is unknown,
+  // not permission to fall back to the old catalogue-only delete.
+  return Array.isArray(commands) && commands.includes("item.delete");
+}
+
+function updateItemLifecycleControls(build = currentBuild()) {
+  const button = el("build-delete");
+  if (button) button.disabled = !itemDeleteAvailable(build);
 }
 
 // legacy name — the Editor sidebar became the unified Workbench book list
@@ -17376,6 +17743,7 @@ function renderBuildEditor() {
   el("build-empty").hidden = !!b;
   if (!b) {
     el("build-msg").textContent = "";
+    updateItemLifecycleControls(null);
     return;
   }
   for (const f of BUILD_FIELDS) {
@@ -17400,6 +17768,8 @@ function renderBuildEditor() {
   el("b-src-open").href = src;
   el("build-msg").textContent = "";
   buildDirty = false;   // a freshly loaded form is clean
+  updateItemLifecycleControls(b);
+  updateRepresentationMutationControls(b);
   if (wbActivePhase() === "source" && activeBuildTab() === "btab-source") {
     refreshSourceTab();
   }
@@ -17410,40 +17780,359 @@ function selectBuild(id) {
   selectWorkbenchBook(id);
 }
 
+// The item command accepts portable catalogue metadata only. Keep unknown
+// metadata extensions, but never copy storage, lifecycle, job, or source
+// ownership fields into the canonical draft.
+const ITEM_CREATE_NON_METADATA_FIELDS = Object.freeze(new Set([
+  "id", "item_id", "kind", "title", "created_at", "updated_at", "revision",
+  "representations", "artifacts", "relevance", "capture_id",
+  "published_slug", "ocr_active", "ocr_verified", "ocr_quality",
+  "title_pages", "thumbnail_source", "status", "pdf_file", "pdf_sources",
+  "images", "extra", "representation_manifest",
+]));
+const ITEM_CREATE_STRING_METADATA_FIELDS = Object.freeze(new Set([
+  "subtitle", "authors", "year", "publisher", "publisher_city", "edition",
+  "volume", "group_id", "language", "pages", "categories", "description",
+  "pdf_source", "source_url", "notes", "rights", "attention",
+]));
+const pendingBuildCreates = new Map();
+
+function itemCreateDraft(seed) {
+  const requested = seed && typeof seed === "object" && !Array.isArray(seed)
+    ? seed : {};
+  const metadata = {};
+  for (const [key, value] of Object.entries(requested)) {
+    if (ITEM_CREATE_NON_METADATA_FIELDS.has(key) || value === undefined) continue;
+    metadata[key] = ITEM_CREATE_STRING_METADATA_FIELDS.has(key)
+      ? String(value || "").trim()
+      : JSON.parse(JSON.stringify(value));
+  }
+  return {
+    kind: "book",
+    title: String(requested.title || "").trim(),
+    metadata,
+    representations: [],
+  };
+}
+
+function itemCreateCleanExtraValue(value) {
+  if (Array.isArray(value)) {
+    const cleaned = [];
+    for (const entry of value) {
+      const child = itemCreateCleanExtraValue(entry);
+      if (child !== null) cleaned.push(child);
+    }
+    return cleaned;
+  }
+  if (value && typeof value === "object") {
+    const cleaned = {};
+    for (const [rawKey, entry] of Object.entries(value)) {
+      const key = String(rawKey).trim();
+      const child = itemCreateCleanExtraValue(entry);
+      if (key && child !== null) cleaned[key] = child;
+    }
+    return cleaned;
+  }
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") return value.trim() || null;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  return String(value).trim() || null;
+}
+
+function itemCreateCompatibilitySeed(seed) {
+  const requested = seed && typeof seed === "object" && !Array.isArray(seed)
+    ? seed : {};
+  const compatibility = {};
+  if (Object.prototype.hasOwnProperty.call(requested, "extra")) {
+    compatibility.extra = requested.extra &&
+      typeof requested.extra === "object" && !Array.isArray(requested.extra)
+      ? itemCreateCleanExtraValue(requested.extra) : {};
+  }
+  if (Object.prototype.hasOwnProperty.call(requested, "images")) {
+    const images = [];
+    for (const raw of Array.isArray(requested.images)
+      ? requested.images.slice(0, 200) : []) {
+      const path = String(raw || "").replace(/\\/g, "/").trim();
+      const parts = path.split("/");
+      if (!path || path.length > 500 || path.startsWith("/") ||
+          parts.some((part) => !part || part === "." || part === "..") ||
+          (parts[0] || "").includes(":")) continue;
+      const extension = path.toLowerCase().split(".").pop();
+      if (!["jpg", "jpeg", "png", "webp"].includes(extension) ||
+          images.includes(path)) continue;
+      images.push(path);
+    }
+    compatibility.images = images;
+  }
+  if (Object.prototype.hasOwnProperty.call(requested, "capture_id")) {
+    compatibility.capture_id = String(requested.capture_id || "")
+      .replace(/[^A-Za-z0-9-]/g, "").slice(0, 64);
+  }
+  return compatibility;
+}
+
+function itemCreateOperationKey() {
+  const random = globalThis.crypto &&
+    typeof globalThis.crypto.randomUUID === "function"
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+  return `item-create-${random}`;
+}
+
+function itemCreatePendingKey(item) {
+  const normalize = (value) => {
+    if (Array.isArray(value)) return value.map(normalize);
+    if (!value || typeof value !== "object") return value;
+    const normalized = {};
+    for (const key of Object.keys(value).sort()) {
+      if (value[key] !== undefined) normalized[key] = normalize(value[key]);
+    }
+    return normalized;
+  };
+  return JSON.stringify(normalize(item));
+}
+
+function itemCreateMutationAmbiguous(error) {
+  if (!error || error.code === "aborted" || error.name === "AbortError")
+    return false;
+  return error.retryable === true || error.code === "network-error" ||
+    error.code === "invalid-response" || error.status === 0;
+}
+
+function itemCreateMutationReceipt(result, command) {
+  const receipt = result && result.receipt;
+  const item = receipt && receipt.item;
+  if (!receipt || !item || result.ok !== true ||
+      result.schema !== "librarytool.item-mutation-receipt/1" ||
+      typeof result.replayed !== "boolean" ||
+      receipt.action !== "create" ||
+      receipt.operation_id !== command.idempotencyKey ||
+      typeof receipt.command_sha256 !== "string" ||
+      !/^[0-9a-f]{64}$/.test(receipt.command_sha256) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(receipt.item_id || "") ||
+      receipt.before_revision !== "" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:+-]{0,511}$/.test(
+        receipt.after_revision || "") ||
+      receipt.deletion !== null || item.id !== receipt.item_id ||
+      item.revision !== receipt.after_revision || item.kind !== "book" ||
+      typeof item.title !== "string" || !item.metadata ||
+      typeof item.metadata !== "object" || Array.isArray(item.metadata) ||
+      !Array.isArray(item.representations) || item.representations.length ||
+      itemCreatePendingKey({
+        kind: item.kind,
+        title: item.title,
+        metadata: item.metadata,
+        representations: item.representations,
+      }) !== itemCreatePendingKey(command.item)) {
+    return null;
+  }
+  return receipt;
+}
+
+function buildFromItemCreateReceipt(receipt) {
+  const item = receipt.item;
+  return {
+    ...JSON.parse(JSON.stringify(item.metadata)),
+    id: receipt.item_id,
+    title: item.title,
+    status: "draft",
+    pdf_file: "",
+    pdf_sources: [],
+    updated_at: receipt.after_revision,
+    _record_revision: receipt.after_revision,
+    _representations: [],
+  };
+}
+
+function itemCreateCompatibilityMatches(build, compatibility) {
+  if (!build || typeof build !== "object") return false;
+  const actual = {};
+  for (const key of Object.keys(compatibility)) actual[key] = build[key];
+  return itemCreatePendingKey(actual) ===
+    itemCreatePendingKey(compatibility);
+}
+
+function adoptItemCreateCompatibility(itemId, raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw) ||
+      raw.id !== itemId ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:+-]{0,511}$/.test(
+        raw.updated_at || "")) return false;
+  const prior = state.builds[itemId] || {};
+  state.builds[itemId] = mergeBuildCompatibility(raw, prior);
+  return true;
+}
+
+async function seedItemCreateCompatibility(
+    itemId, compatibility, recordRevision) {
+  if (!Object.keys(compatibility).length) return true;
+  let expectedRevision = recordRevision;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const result = await engineClient.items.seedCompatibility({
+        itemId,
+        compatibility,
+        recordRevision: expectedRevision,
+      });
+      if (adoptItemCreateCompatibility(itemId, result && result.build) &&
+          itemCreateCompatibilityMatches(
+            state.builds[itemId], compatibility)) return true;
+    } catch (error) {
+      const current = error && error.status === 409 && error.body &&
+        error.body.build;
+      if (current) {
+        if (!adoptItemCreateCompatibility(itemId, current)) return false;
+        if (itemCreateCompatibilityMatches(
+            state.builds[itemId], compatibility)) return true;
+        // Only these three acquisition fields are written, so rebasing on a
+        // trusted current record cannot overwrite an unrelated concurrent
+        // catalogue edit. A later network ambiguity keeps this exact CAS.
+        expectedRevision = current.updated_at;
+        continue;
+      }
+      if (!itemCreateMutationAmbiguous(error)) return false;
+    }
+  }
+  return false;
+}
+
 async function createBuild(seed, label, originTab = activeHistoryTab()) {
-  const res = await fetch("/api/builds", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ build: seed || {} }),
+  const requested = seed && typeof seed === "object" && !Array.isArray(seed)
+    ? { ...seed } : {};
+  const primarySource = String(requested.pdf_file || "").trim();
+  const secondarySources = Array.isArray(requested.pdf_sources)
+    ? requested.pdf_sources.map((row) => ({
+        id: String((row && row.id) || "").trim(),
+        path: String((row && row.path) || "").trim(),
+      })).filter((row) => row.path)
+    : [];
+  const item = itemCreateDraft(requested);
+  const compatibility = itemCreateCompatibilitySeed(requested);
+  // Allocation replay identity covers the whole user intent, even though the
+  // portable item command deliberately does not own local acquisition state.
+  // Two copies with identical metadata but different scans must remain two
+  // distinct creates after an ambiguous response.
+  const pendingKey = itemCreatePendingKey({
+    item,
+    primary_source: primarySource,
+    secondary_sources: secondarySources,
+    compatibility,
   });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || !data.ok) { statusCrit("BUILD CREATE FAILED"); return null; }
-  state.builds[data.build.id] = data.build;
-  const snap = JSON.parse(JSON.stringify(data.build));
+  let command = pendingBuildCreates.get(pendingKey);
+  if (!command) {
+    command = Object.freeze({
+      item,
+      idempotencyKey: itemCreateOperationKey(),
+    });
+    pendingBuildCreates.set(pendingKey, command);
+  }
+
+  let receipt = null;
+  let knownFailure = false;
+  for (let attempt = 0; attempt < 2 && !receipt; attempt += 1) {
+    try {
+      const result = await engineClient.items.create(command);
+      receipt = itemCreateMutationReceipt(result, command);
+      if (!receipt) {
+        const invalid = new Error("Item create returned no valid receipt");
+        invalid.code = "invalid-response";
+        invalid.status = 200;
+        invalid.retryable = true;
+        throw invalid;
+      }
+    } catch (error) {
+      if (!itemCreateMutationAmbiguous(error)) {
+        knownFailure = true;
+        break;
+      }
+    }
+  }
+  if (!receipt) {
+    // Keep an ambiguous command so an identical retry asks for its durable
+    // receipt instead of allocating a second item after a lost response.
+    if (knownFailure) pendingBuildCreates.delete(pendingKey);
+    statusCrit("BUILD CREATE FAILED");
+    return null;
+  }
+
+  const itemId = receipt.item_id;
+  invalidateRepresentationItemIncarnation(itemId);
+  state.builds[itemId] = buildFromItemCreateReceipt(receipt);
+  if (!await seedItemCreateCompatibility(
+      itemId, compatibility, receipt.after_revision)) {
+    // The item may already exist, so retain its create operation for an exact
+    // replay on the next identical attempt instead of allocating a duplicate.
+    statusCrit("BUILD CREATED :: PROVENANCE SAVE FAILED");
+    return null;
+  }
+  pendingBuildCreates.delete(pendingKey);
+  // The receipt is the commit point. This compatibility refresh enriches the
+  // local projection and discovers optional representation commands, but a
+  // failed GET cannot turn a completed create into failure.
+  try { await refreshBuildEngineRecord(itemId); } catch (ignored) {}
+  let sourceAttachFailed = false;
+  let sourceAttachMessage = "";
+  if (primarySource) {
+    const receipt = await setBuildRepresentation(
+      itemId, "primary", primarySource, {
+        intent: "attach",
+        recordRevision: state.builds[itemId]._record_revision,
+      });
+    sourceAttachFailed = !receipt;
+    if (!receipt) sourceAttachMessage = representationFailureMessage(
+      itemId, "primary");
+  }
+  for (const source of secondarySources) {
+    const build = state.builds[itemId] || buildFromItemCreateReceipt(receipt);
+    const used = new Set([
+      "primary",
+      ...((build.pdf_sources || []).map((row) =>
+        String((row && row.id) || "").toLowerCase())),
+    ]);
+    const requestedId = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/.test(source.id) &&
+      !used.has(source.id.toLowerCase()) ? source.id : "";
+    const sourceId = requestedId || secondaryRepresentationId(build);
+    const receipt = await setBuildRepresentation(
+      itemId, sourceId, source.path, {
+        intent: "attach",
+        recordRevision: build._record_revision,
+      });
+    if (!receipt) {
+      sourceAttachFailed = true;
+      sourceAttachMessage = representationFailureMessage(
+        itemId, sourceId);
+    }
+  }
+
+  const built = state.builds[itemId] || buildFromItemCreateReceipt(receipt);
+  const snap = JSON.parse(JSON.stringify(built));
+  const lifecycle = {
+    tombstone: null, deleteCommand: null, restoreCommand: null,
+  };
   pushOp(`create build ${label || snap.title || snap.id}`,
     async () => {
-      await fetch(`/api/builds/${snap.id}`, { method: "DELETE" });
-      delete state.builds[snap.id];
+      await deleteBuildToTombstone(snap.id, lifecycle);
       if (state.buildSel === snap.id) state.buildSel = null;
       renderUpload();
     },
     async () => {
-      await fetch("/api/builds/restore", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ build: snap }),
-      });
-      state.builds[snap.id] = snap;
+      await restoreDeletedBuildFromTombstone(lifecycle, snap.id, snap);
       renderUpload();
     }, undefined, originTab);
-  selectBuild(data.build.id);
+  selectBuild(itemId);
   renderUpload();
-  return data.build;
+  if (sourceAttachFailed) {
+    const message = el("b-src-msg");
+    if (message) message.textContent = sourceAttachMessage ||
+      "Source update rejected";
+    statusCrit("BUILD CREATED :: PDF ATTACH FAILED");
+  }
+  return built;
 }
 
 function buildSeedFromSource(s) {
-  // pdf_source records where the scan lives online; pdf_file is filled with
-  // the already-downloaded local copy when one exists. Locally attached
+  // pdf_source records where the scan lives online; pdf_file is a client-side
+  // attachment seed removed by createBuild before its catalogue POST. Locally attached
   // scans have no online source — the local file IS the source.
   let pdfUrl = "", pdfFile = "";
   if (s.local_pdf) {
@@ -17469,7 +18158,819 @@ function buildSeedFromSource(s) {
 
 let buildPatchConflict = false;  // last patch came back 409 (record reloaded)
 
+async function refreshBuildEngineRecord(id) {
+  const expectedGeneration = buildEngineRecordGeneration(id);
+  const before = state.builds[id];
+  if (!before) return null;
+  const expectedRevision = before._record_revision || "";
+  const result = await engineClient.items.get({
+    itemId: id, includeBuildCompatibility: true,
+  });
+  const item = result && result.item;
+  const build = engineBuildProjection(item);
+  if (!build) return null;
+  const current = state.builds[id];
+  if (!current || buildEngineRecordGeneration(id) !== expectedGeneration ||
+      (current._record_revision || "") !== expectedRevision) {
+    return current || null;
+  }
+  state.builds[id] = build;
+  return state.builds[id];
+}
+
+function representationOperationKey(action) {
+  const random = globalThis.crypto && typeof globalThis.crypto.randomUUID === "function"
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+  return `${action}-${random}`;
+}
+
+const pendingRepresentationMutations = new Map();
+// Semantic item reads can finish after a newer command, deletion, or restore.
+// Keep an incarnation epoch separate from the engine's record revision so an
+// old response can never repopulate a deleted row or replace receipt-adopted
+// state. Ambiguous command retries deliberately stay within the same epoch.
+const buildEngineRecordGenerations = new Map();
+
+function buildEngineRecordGeneration(id) {
+  return buildEngineRecordGenerations.get(String(id || "")) || 0;
+}
+
+function advanceBuildEngineRecordGeneration(id) {
+  const key = String(id || "");
+  const next = buildEngineRecordGeneration(key) + 1;
+  buildEngineRecordGenerations.set(key, next);
+  return next;
+}
+
+let secondaryRepresentationSequence = 0;
+
+function secondaryRepresentationId(build) {
+  const used = new Set([
+    "primary",
+    ...(((build && build._representations) || []).map((row) =>
+      String((row && row.id) || "").toLowerCase())),
+    ...(((build && build.pdf_sources) || []).map((row) =>
+      String((row && row.id) || "").toLowerCase())),
+  ]);
+  // UUID entropy makes collisions vanishingly unlikely; the monotonic prefix
+  // also keeps the fallback collision-free within this renderer process.
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    secondaryRepresentationSequence += 1;
+    const random = globalThis.crypto &&
+      typeof globalThis.crypto.randomUUID === "function"
+      ? globalThis.crypto.randomUUID().replace(/-/g, "")
+      : `${Date.now().toString(36)}${Math.random().toString(16).slice(2)}`;
+    const id = (`s${secondaryRepresentationSequence.toString(36)}-` + random)
+      .slice(0, 32);
+    if (!used.has(id.toLowerCase())) return id;
+  }
+  return (`s${secondaryRepresentationSequence.toString(36)}-` +
+    Date.now().toString(36)).slice(0, 32);
+}
+
+function attachedRepresentation(build, sourceId) {
+  return ((build && build._representations) || []).find(
+    (row) => row && row.id === sourceId) || null;
+}
+
+const REPRESENTATION_COMMAND_NAMES = Object.freeze([
+  "representation.attach", "representation.replace", "representation.detach",
+]);
+const representationMutationFailures = new Map();
+
+function clearPendingRepresentationMutationsForItem(itemId) {
+  const target = String(itemId || "");
+  for (const [key, pending] of pendingRepresentationMutations) {
+    if (String(pending && pending.args && pending.args.itemId || "") === target)
+      pendingRepresentationMutations.delete(key);
+  }
+  for (const key of representationMutationFailures.keys()) {
+    try {
+      if (JSON.parse(key)[0] === target) representationMutationFailures.delete(key);
+    } catch (ignored) { /* only keys made by representationFailureKey live here */ }
+  }
+}
+
+function invalidateRepresentationItemIncarnation(itemId) {
+  clearPendingRepresentationMutationsForItem(itemId);
+  return advanceBuildEngineRecordGeneration(itemId);
+}
+
+function representationFailureKey(buildId, sourceId) {
+  return JSON.stringify([String(buildId || ""), String(sourceId || "")]);
+}
+
+function representationCommandAvailable(build, action) {
+  const commands = build && build._available_commands;
+  // Unknown capability state fails closed. Transitional catalogue responses
+  // are semantically refreshed before their controls are exposed.
+  return Array.isArray(commands) &&
+    commands.includes(`representation.${action}`);
+}
+
+function updateReceiptCommandAvailability(build) {
+  if (!build || !Array.isArray(build._available_commands)) return;
+  const hadRepresentationModule = build._available_commands.some((command) =>
+    REPRESENTATION_COMMAND_NAMES.includes(command));
+  if (!hadRepresentationModule) return;
+  const other = build._available_commands.filter((command) =>
+    !REPRESENTATION_COMMAND_NAMES.includes(command));
+  other.push("representation.attach");
+  if ((build._representations || []).length) {
+    other.push("representation.replace", "representation.detach");
+  }
+  build._available_commands = [...new Set(other)];
+}
+
+function rememberRepresentationFailure(buildId, sourceId, error) {
+  const failure = error && typeof error === "object" ? {
+    code: String(error.code || "request-failed"),
+    status: Number(error.status) || 0,
+    retryable: !!error.retryable,
+  } : { code: "request-failed", status: 0, retryable: false };
+  representationMutationFailures.set(
+    representationFailureKey(buildId, sourceId), failure);
+  return failure;
+}
+
+function representationFailureMessage(buildId, sourceId, fallback = "invalid") {
+  const failure = representationMutationFailures.get(
+    representationFailureKey(buildId, sourceId));
+  const code = failure ? failure.code : "";
+  if (code === "representation_command_unavailable")
+    return "Source tools unavailable";
+  if (code === "representation_source_already_attached")
+    return "Already attached";
+  if (new Set([
+    "representation_source_not_found", "unsupported_representation_media_type",
+    "invalid_representation_source", "representation_source_changed",
+    "representation_source_digest_mismatch",
+    "representation_source_size_mismatch",
+  ]).has(code)) return "Invalid or changed PDF";
+  if (new Set([
+    "item_revision_conflict", "representation_revision_conflict",
+    "representation_already_exists", "representation_not_found",
+    "operation_id_conflict",
+  ]).has(code)) return "Source changed elsewhere";
+  if (code === "network-error" || code === "invalid-response" ||
+      code.endsWith("_unavailable") || (failure && failure.retryable))
+    return "Source service unavailable";
+  if (code) return "Source update rejected";
+  return fallback === "conflict"
+    ? "Source changed elsewhere" : "Invalid or changed PDF";
+}
+
+function updateRepresentationMutationControls(build = currentBuild()) {
+  const input = el("b-pdf_file");
+  const attach = el("b-pdf-attach");
+  const browse = el("b-pdf-browse");
+  const addSecondary = el("b-pdf2-add");
+  const primary = attachedRepresentation(build, "primary");
+  const desiredPath = input ? String(input.value || "").trim() :
+    String((build && build.pdf_file) || "").trim();
+  const primaryAction = desiredPath
+    ? (primary ? "replace" : "attach")
+    : (primary ? "detach" : "");
+  const anyPrimary = ["attach", "replace", "detach"].some((action) =>
+    representationCommandAvailable(build, action));
+  if (input) input.disabled = !anyPrimary;
+  if (attach) attach.disabled = !build || !primaryAction ||
+    !representationCommandAvailable(build, primaryAction);
+  if (browse) browse.disabled = !build ||
+    !representationCommandAvailable(build, primary ? "replace" : "attach");
+  if (addSecondary) addSecondary.disabled = !build ||
+    !representationCommandAvailable(build, "attach");
+  const wrap = el("b-pdf-sources");
+  if (wrap) {
+    for (const button of wrap.querySelectorAll("button.src2-del")) {
+      button.disabled = !build ||
+        !representationCommandAvailable(build, "detach");
+    }
+  }
+  const knownCommands = build && Array.isArray(build._available_commands);
+  const moduleAvailable = knownCommands && build._available_commands.some(
+    (command) => REPRESENTATION_COMMAND_NAMES.includes(command));
+  if (build && !moduleAvailable) {
+    const message = el("b-src-msg");
+    if (message) message.textContent = "Source tools unavailable";
+  }
+}
+
+function representationMutationAmbiguous(error) {
+  if (!error) return false;
+  return error.code === "network-error" || error.code === "invalid-response" ||
+    (error.status === 0 && error.code !== "aborted");
+}
+
+function representationMutationReceipt(result, action, buildId, sourceId) {
+  const receipt = result && result.receipt;
+  if (!receipt || receipt.action !== action || receipt.item_id !== buildId ||
+      receipt.representation_id !== sourceId ||
+      typeof receipt.after_item_revision !== "string" ||
+      (action === "detach" ? receipt.after !== null : !receipt.after)) return null;
+  return receipt;
+}
+
+function adoptRepresentationReceipt(buildId, sourceId, path, receipt,
+                                    expectedGeneration) {
+  const build = state.builds[buildId];
+  if (!build || buildEngineRecordGeneration(buildId) !== expectedGeneration)
+    return false;
+  const currentRevision = String(build._record_revision || "");
+  if (currentRevision !== receipt.before_item_revision &&
+      currentRevision !== receipt.after_item_revision) return false;
+  advanceBuildEngineRecordGeneration(buildId);
+  const rows = Array.isArray(build._representations)
+    ? build._representations.filter((row) => row && row.id !== sourceId) : [];
+  if (receipt.after) rows.push(JSON.parse(JSON.stringify(receipt.after)));
+  build._representations = rows;
+  build._record_revision = receipt.after_item_revision;
+  updateReceiptCommandAvailability(build);
+  if (sourceId === "primary") {
+    build.pdf_file = receipt.after ? path : "";
+    return true;
+  }
+  const sources = Array.isArray(build.pdf_sources)
+    ? build.pdf_sources.filter((row) => row && row.id !== sourceId) : [];
+  if (receipt.after) sources.push({ id: sourceId, path });
+  build.pdf_sources = sources;
+  return true;
+}
+
+async function setBuildRepresentation(buildId, sourceId, path, options = {}) {
+  const desiredPath = String(path || "").trim();
+  const intent = options.intent || (desiredPath ? "auto" : "detach");
+  const failureKey = representationFailureKey(buildId, sourceId);
+  representationMutationFailures.delete(failureKey);
+  // Desired state, not the currently inferred action, identifies an uncertain
+  // operation: a refresh may reveal an attach as present before its replay.
+  const pendingKey = JSON.stringify([buildId, sourceId, desiredPath]);
+  let pending = pendingRepresentationMutations.get(pendingKey);
+  if (pending && pending.generation !== buildEngineRecordGeneration(buildId)) {
+    pendingRepresentationMutations.delete(pendingKey);
+    pending = null;
+  }
+
+  if (!pending) {
+    let build = state.builds[buildId] || null;
+    const exactRecordRevision = typeof options.recordRevision === "string" &&
+      options.recordRevision;
+    if (!exactRecordRevision) {
+      try {
+        build = await refreshBuildEngineRecord(buildId);
+      } catch (e) {
+        rememberRepresentationFailure(buildId, sourceId, e);
+        return null;
+      }
+    }
+    if (!build) {
+      rememberRepresentationFailure(buildId, sourceId, {
+        code: "item_not_found", status: 404,
+      });
+      return null;
+    }
+    const current = attachedRepresentation(build, sourceId);
+    let action;
+    if (!desiredPath || intent === "detach") action = "detach";
+    else if (intent === "attach" || intent === "replace") action = intent;
+    else action = current ? "replace" : "attach";
+
+    if (!representationCommandAvailable(build, action)) {
+      rememberRepresentationFailure(buildId, sourceId, {
+        code: "representation_command_unavailable", status: 503,
+        retryable: true,
+      });
+      return null;
+    }
+
+    const recordRevision = exactRecordRevision || build._record_revision;
+    const representationRevision = options.representationRevision !== undefined
+      ? options.representationRevision : current && current.revision;
+    if (!recordRevision || (action !== "attach" && !representationRevision) ||
+        (action === "attach" && !desiredPath)) {
+      rememberRepresentationFailure(buildId, sourceId, {
+        code: action === "attach" ? "invalid_representation_command" :
+          "representation_revision_conflict",
+        status: action === "attach" ? 400 : 409,
+      });
+      return null;
+    }
+
+    const target = options.targetRepresentation &&
+      typeof options.targetRepresentation === "object"
+      ? options.targetRepresentation : null;
+    const attributes = target || current || {};
+    const args = {
+      itemId: buildId,
+      representationId: sourceId,
+      recordRevision,
+      idempotencyKey: options.idempotencyKey ||
+        representationOperationKey(`${action}-representation`),
+    };
+    if (action !== "detach") {
+      args.representation = {
+        source_token: desiredPath,
+        acquisition: "reference",
+        expected_content_sha256: target && target.content_sha256 || "",
+        expected_size: target && Number.isInteger(target.size)
+          ? target.size : null,
+        role: attributes.role ||
+          (sourceId === "primary" ? "primary" : "alternate"),
+        media_type: attributes.media_type || "application/pdf",
+        label: attributes.label ||
+          (sourceId === "primary" ? "Primary source" : "Alternate source"),
+        metadata: attributes.metadata && typeof attributes.metadata === "object"
+          ? attributes.metadata : {},
+      };
+    }
+    if (action !== "attach") args.representationRevision = representationRevision;
+    pending = {
+      action, args, desiredPath,
+      generation: buildEngineRecordGeneration(buildId),
+    };
+    pendingRepresentationMutations.set(pendingKey, pending);
+  }
+
+  let receipt = null;
+  let knownFailure = false;
+  for (let attempt = 0; attempt < 2 && !receipt; attempt += 1) {
+    try {
+      let result;
+      if (pending.action === "attach") {
+        result = await engineClient.items.attachRepresentation(pending.args);
+      } else if (pending.action === "replace") {
+        result = await engineClient.items.replaceRepresentation(pending.args);
+      } else {
+        result = await engineClient.items.detachRepresentation(pending.args);
+      }
+      receipt = representationMutationReceipt(
+        result, pending.action, buildId, sourceId);
+      if (!receipt) {
+        const invalid = new Error("Representation mutation returned no receipt");
+        invalid.code = "invalid-response";
+        invalid.status = 200;
+        throw invalid;
+      }
+    } catch (error) {
+      rememberRepresentationFailure(buildId, sourceId, error);
+      if (!representationMutationAmbiguous(error)) {
+        knownFailure = true;
+        break;
+      }
+    }
+  }
+
+  if (!receipt) {
+    // A transport failure can happen after commit. Retain this exact command
+    // and idempotency key so the next identical user action asks the engine to
+    // replay its durable receipt instead of issuing a different mutation.
+    if (knownFailure) pendingRepresentationMutations.delete(pendingKey);
+    try { await refreshBuildEngineRecord(buildId); } catch (ignored) {}
+    return null;
+  }
+
+  pendingRepresentationMutations.delete(pendingKey);
+  representationMutationFailures.delete(failureKey);
+  if (!adoptRepresentationReceipt(
+      buildId, sourceId, pending.desiredPath, receipt, pending.generation)) {
+    rememberRepresentationFailure(buildId, sourceId, {
+      code: "item_revision_conflict", status: 409,
+    });
+    return null;
+  }
+  // Refresh enriches compatibility fields, but it is not part of the commit.
+  // A failed GET must never turn a receipt-confirmed mutation into failure.
+  try { await refreshBuildEngineRecord(buildId); } catch (ignored) {}
+  return receipt;
+}
+
+function pushRepresentationOp(label, buildId, sourceId, initialReceipt,
+                              beforePath, afterPath, originTab) {
+  const transition = { receipt: initialReceipt };
+  const before = {
+    path: String(beforePath || "").trim(),
+    representation: initialReceipt.before,
+  };
+  const after = {
+    path: String(afterPath || "").trim(),
+    representation: initialReceipt.after,
+  };
+  const apply = async (target) => {
+    const current = transition.receipt.after;
+    const intent = target.path ? (current ? "replace" : "attach") : "detach";
+    if (intent === "detach" && !current)
+      throw new Error("Representation is already detached");
+    const receipt = await setBuildRepresentation(
+      buildId, sourceId, target.path, {
+        intent,
+        recordRevision: transition.receipt.after_item_revision,
+        representationRevision: current && current.revision,
+        targetRepresentation: target.representation,
+      });
+    if (!receipt) throw new Error(
+      representationFailureMessage(buildId, sourceId, "conflict"));
+    transition.receipt = receipt;
+    return receipt;
+  };
+  return pushOp(label, () => apply(before), () => apply(after),
+    undefined, originTab);
+}
+
+// Portable catalogue fields are owned by the item engine. Workflow state,
+// local paths, capture provenance, and generated artifacts remain outside
+// this patch surface until their own module commands exist.
+const ITEM_EDIT_METADATA_FIELDS = Object.freeze([
+  "subtitle", "authors", "year", "publisher", "publisher_city", "edition",
+  "volume", "group_id", "language", "pages", "rights", "pdf_source",
+  "source_url", "notes", "category_ids", "description",
+]);
+// A few established compatibility extensions are still edited outside the
+// main Record form. They nevertheless belong to the durable item command
+// path while their eventual review/release modules are introduced.
+const ITEM_PORTABLE_METADATA_FIELDS = new Set([
+  ...ITEM_EDIT_METADATA_FIELDS, "attention", "bundle",
+]);
+// Raw build PATCH is a deliberately narrow compatibility seam. These fields
+// must move to text/canvas/workflow commands; accepting catalogue metadata
+// here would silently reopen the unconditional legacy write path.
+const BUILD_COMPATIBILITY_MUTATION_FIELDS = new Set([
+  "status", "ocr_active", "ocr_verified", "ocr_quality",
+  "title_pages", "thumbnail_source",
+]);
+const pendingBuildMetadataUpdates = new Map();
+let buildMetadataLastFailure = null;
+
+function itemMetadataOperationKey() {
+  const random = globalThis.crypto &&
+    typeof globalThis.crypto.randomUUID === "function"
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+  return `item-update-${random}`;
+}
+
+function itemMetadataMutationAmbiguous(error) {
+  if (!error || error.code === "aborted" || error.name === "AbortError")
+    return false;
+  return error.retryable === true || error.code === "network-error" ||
+    error.code === "invalid-response" || error.status === 0;
+}
+
+function itemMetadataClone(value) {
+  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
+function itemMetadataPatchKey(itemId, recordRevision, patch) {
+  return itemCreatePendingKey({ item_id: itemId,
+    record_revision: recordRevision, patch });
+}
+
+function itemMetadataMutationReceipt(result, command) {
+  const receipt = result && result.receipt;
+  const item = receipt && receipt.item;
+  const patch = command.patch;
+  if (!receipt || !item || result.ok !== true ||
+      result.schema !== "librarytool.item-mutation-receipt/1" ||
+      typeof result.replayed !== "boolean" ||
+      receipt.action !== "update" ||
+      receipt.operation_id !== command.idempotencyKey ||
+      receipt.item_id !== command.itemId ||
+      receipt.before_revision !== command.recordRevision ||
+      typeof receipt.command_sha256 !== "string" ||
+      !/^[0-9a-f]{64}$/.test(receipt.command_sha256) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:+-]{0,511}$/.test(
+        receipt.after_revision || "") ||
+      receipt.after_revision === receipt.before_revision ||
+      receipt.deletion !== null || item.id !== command.itemId ||
+      item.revision !== receipt.after_revision || item.kind !== "book" ||
+      typeof item.title !== "string" || !item.metadata ||
+      typeof item.metadata !== "object" || Array.isArray(item.metadata) ||
+      !Array.isArray(item.representations) ||
+      item.title !== patch.title) return null;
+  for (const [key, value] of Object.entries(patch.metadata_set || {})) {
+    if (!Object.prototype.hasOwnProperty.call(item.metadata, key) ||
+        itemCreatePendingKey(item.metadata[key]) !==
+          itemCreatePendingKey(value)) return null;
+  }
+  for (const key of patch.metadata_remove || []) {
+    if (Object.prototype.hasOwnProperty.call(item.metadata, key)) return null;
+  }
+  return receipt;
+}
+
+function itemMetadataManagedKey(key) {
+  return ITEM_CREATE_NON_METADATA_FIELDS.has(key) || key === "title" ||
+    key === "item_id" || key.startsWith("_");
+}
+
+function adoptItemMetadataReceipt(itemId, receipt, expectedGeneration,
+                                  patch) {
+  const prior = state.builds[itemId];
+  if (!prior || buildEngineRecordGeneration(itemId) !== expectedGeneration)
+    return false;
+  const revision = String(prior._record_revision || "");
+  if (revision !== receipt.before_revision &&
+      revision !== receipt.after_revision) return false;
+
+  const next = { ...prior };
+  for (const key of patch.metadata_remove || []) {
+    if (!itemMetadataManagedKey(key)) delete next[key];
+  }
+  for (const [key, value] of Object.entries(receipt.item.metadata)) {
+    if (!itemMetadataManagedKey(key)) next[key] = itemMetadataClone(value);
+  }
+  next.id = itemId;
+  next.title = receipt.item.title;
+  next.updated_at = receipt.after_revision;
+  next._record_revision = receipt.after_revision;
+  // Starting from the compatibility row and declining the receipt's portable
+  // representation drafts preserves richer source revisions, commands, and
+  // all workflow/capture fields owned by other modules.
+  state.builds[itemId] = next;
+  advanceBuildEngineRecordGeneration(itemId);
+  return true;
+}
+
+function buildProjectionIncludesMetadataReceipt(itemId, receipt, patch) {
+  const build = state.builds[itemId];
+  if (!build) return false;
+  const revision = String(build._record_revision || "");
+  if (!revision || revision === receipt.before_revision ||
+      String(build.title || "") !== receipt.item.title) return false;
+  for (const [key, value] of Object.entries(patch.metadata_set || {})) {
+    if (!Object.prototype.hasOwnProperty.call(build, key) ||
+        itemCreatePendingKey(build[key]) !== itemCreatePendingKey(value))
+      return false;
+  }
+  for (const key of patch.metadata_remove || []) {
+    if (Object.prototype.hasOwnProperty.call(build, key)) return false;
+  }
+  return true;
+}
+
+async function runBuildMetadataUpdate(itemId, patch, recordRevision) {
+  buildPatchConflict = false;
+  buildMetadataLastFailure = null;
+  const pendingKey = itemMetadataPatchKey(itemId, recordRevision, patch);
+  let pending = pendingBuildMetadataUpdates.get(pendingKey);
+  if (!pending) {
+    pending = {
+      args: {
+        itemId,
+        patch: itemMetadataClone(patch),
+        recordRevision,
+        idempotencyKey: itemMetadataOperationKey(),
+      },
+      generation: buildEngineRecordGeneration(itemId),
+    };
+    pendingBuildMetadataUpdates.set(pendingKey, pending);
+  }
+
+  let receipt = null;
+  let knownFailure = false;
+  for (let attempt = 0; attempt < 2 && !receipt; attempt += 1) {
+    try {
+      const result = await engineClient.items.update(pending.args);
+      receipt = itemMetadataMutationReceipt(result, pending.args);
+      if (!receipt) {
+        const invalid = new Error("Item update returned no valid receipt");
+        invalid.code = "invalid-response";
+        invalid.status = 200;
+        invalid.retryable = true;
+        throw invalid;
+      }
+    } catch (error) {
+      buildMetadataLastFailure = error || new Error("Item update failed");
+      if (!itemMetadataMutationAmbiguous(error)) {
+        knownFailure = true;
+        buildPatchConflict = !!error && error.status === 409;
+        break;
+      }
+    }
+  }
+  if (!receipt) {
+    // Ambiguous operations retain their exact command and key. A later click
+    // with the same draft and CAS replays the durable receipt; a changed draft
+    // has a different key and cannot accidentally adopt that older command.
+    if (knownFailure) pendingBuildMetadataUpdates.delete(pendingKey);
+    return null;
+  }
+
+  pendingBuildMetadataUpdates.delete(pendingKey);
+  buildMetadataLastFailure = null;
+  const adopted = adoptItemMetadataReceipt(
+    itemId, receipt, pending.generation, pending.args.patch);
+  // A receipt is the commit point. This read only enriches compatibility
+  // state, and its failure cannot turn the completed command into failure.
+  try { await refreshBuildEngineRecord(itemId); } catch (ignored) {}
+  const projectionCurrent = buildProjectionIncludesMetadataReceipt(
+    itemId, receipt, pending.args.patch);
+  return { receipt, adopted, projectionCurrent };
+}
+
+function buildMetadataPatchFromEditor(build) {
+  const titleInput = el("b-title");
+  const title = String(titleInput ? titleInput.value : build.title || "").trim();
+  if (!title) return null;
+  const metadata = {};
+  for (const field of ITEM_EDIT_METADATA_FIELDS) {
+    if (field === "category_ids" || field === "description") continue;
+    const input = el("b-" + field);
+    if (input) metadata[field] = String(input.value || "").trim();
+  }
+  if (metadata.volume && !metadata.group_id)
+    metadata.group_id = buildGroupIdFor({ title, ...metadata });
+  if (catPickers["b-categories"])
+    metadata.category_ids = itemMetadataClone(
+      catPickers["b-categories"].get() || []);
+  if (buildDescMd) metadata.description = buildDescMd.get();
+  return {
+    title,
+    metadata_set: metadata,
+    metadata_remove: [],
+    representations: null,
+  };
+}
+
+function buildMetadataPatchFromBuild(build, keys) {
+  const metadata = {};
+  const remove = [];
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(build, key)) {
+      remove.push(key);
+    } else if (key === "category_ids") {
+      metadata[key] = itemMetadataClone(build[key] || []);
+    } else {
+      metadata[key] = itemMetadataClone(build[key] == null ? "" : build[key]);
+    }
+  }
+  return {
+    title: String(build.title || ""),
+    metadata_set: metadata,
+    metadata_remove: remove,
+    representations: null,
+  };
+}
+
+function buildMetadataPatchesEqual(left, right) {
+  return itemCreatePendingKey(left) === itemCreatePendingKey(right);
+}
+
+function pushBuildMetadataOp(label, itemId, initialReceipt,
+                             beforePatch, afterPatch, originTab) {
+  if (buildMetadataPatchesEqual(beforePatch, afterPatch)) return null;
+  const transition = { receipt: initialReceipt };
+  const apply = async (target) => {
+    const outcome = await runBuildMetadataUpdate(
+      itemId, target, transition.receipt.after_revision);
+    if (!outcome) {
+      throw new Error(buildPatchConflict
+        ? "Item changed elsewhere" : "Metadata update failed");
+    }
+    transition.receipt = outcome.receipt;
+    if (state.buildSel === itemId && !buildIsDirty()) renderUpload();
+    else {
+      renderBuildsList();
+      renderWorkbench();
+    }
+    return outcome.receipt;
+  };
+  return pushOp(label, () => apply(beforePatch), () => apply(afterPatch),
+    undefined, originTab);
+}
+
+function portableBuildMetadataPatches(build, fields) {
+  if (!build || !fields || typeof fields !== "object" || Array.isArray(fields))
+    return null;
+  const keys = Object.keys(fields);
+  if (keys.some((key) => key !== "title" &&
+      !ITEM_PORTABLE_METADATA_FIELDS.has(key))) return null;
+
+  const metadataKeys = keys.filter((key) => key !== "title");
+  const beforePatch = buildMetadataPatchFromBuild(build, metadataKeys);
+  const after = { ...build };
+  for (const key of keys) {
+    if (fields[key] === undefined) delete after[key];
+    else after[key] = itemMetadataClone(fields[key]);
+  }
+  const afterPatch = buildMetadataPatchFromBuild(after, metadataKeys);
+  if (!String(afterPatch.title || "").trim()) return null;
+  return { beforePatch, afterPatch };
+}
+
+function renderPortableBuildMetadata(itemId, fields, quiet) {
+  if (!quiet) {
+    if (buildIsDirty()) {
+      renderBuildsList();
+      renderWorkbench();
+    } else renderUpload();
+  }
+  if (Object.prototype.hasOwnProperty.call(fields, "attention")) {
+    renderRemarks();
+    renderHome();
+  }
+}
+
+async function updateBuildPortableMetadata(itemId, fields, options = {}) {
+  const build = state.builds[itemId];
+  const patches = portableBuildMetadataPatches(build, fields);
+  const recordRevision = String((build && build._record_revision) || "");
+  if (!patches || !recordRevision) return null;
+  if (buildMetadataPatchesEqual(patches.beforePatch, patches.afterPatch)) {
+    return { ok: true, skipped: true, receipt: null,
+      adopted: true, projectionCurrent: true };
+  }
+
+  const outcome = await runBuildMetadataUpdate(
+    itemId, patches.afterPatch, recordRevision);
+  if (!outcome) {
+    // A known conflict is never rebased or resent. Refreshing only makes the
+    // competing value visible and lets a later deliberate action use its new
+    // revision. Ambiguous writes keep their exact pending command untouched.
+    if (buildPatchConflict) {
+      try { await refreshBuildEngineRecord(itemId); } catch (ignored) {}
+    }
+    return null;
+  }
+
+  if (options.label && outcome.receipt) {
+    pushBuildMetadataOp(options.label, itemId, outcome.receipt,
+      patches.beforePatch, patches.afterPatch,
+      options.originTab || activeHistoryTab());
+  }
+  renderPortableBuildMetadata(itemId, fields, !!options.quiet);
+  return { ok: true, skipped: false, ...outcome };
+}
+
+function verificationCompatibilityMatches(build, desired) {
+  if (!build) return false;
+  return Object.entries(desired).every(([key, value]) =>
+    String(build[key] || "") === String(value || ""));
+}
+
+function adoptVerificationCompatibilityBuild(itemId, raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw) ||
+      raw.id !== itemId || typeof raw.updated_at !== "string" ||
+      !raw.updated_at) return false;
+  const prior = state.builds[itemId];
+  if (!prior) return false;
+  advanceBuildEngineRecordGeneration(itemId);
+  state.builds[itemId] = mergeBuildCompatibility(raw, prior);
+  return true;
+}
+
+async function patchBuildVerificationCompatibility(
+    itemId, desiredFields, recordRevision) {
+  const desired = {};
+  for (const key of ["status", "ocr_verified"]) {
+    if (Object.prototype.hasOwnProperty.call(desiredFields || {}, key))
+      desired[key] = String(desiredFields[key] || "");
+  }
+  if (!Object.keys(desired).length)
+    return { ok: true, skipped: true, recovered: false };
+
+  let response = null;
+  let data = null;
+  try {
+    response = await fetch(`/api/builds/${encodeURIComponent(itemId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...desired, expect_updated_at: recordRevision }),
+    });
+    data = await response.json().catch(() => null);
+  } catch (ignored) { /* a committed response can be lost */ }
+
+  const adoptedResponse = !!(data && data.build &&
+    adoptVerificationCompatibilityBuild(itemId, data.build));
+  if (adoptedResponse &&
+      verificationCompatibilityMatches(state.builds[itemId], desired)) {
+    return { ok: true, skipped: false,
+      recovered: !(response && response.ok && data.ok) };
+  }
+  // Do not rebase and resend. A semantic read can prove that a response was
+  // lost after commit; otherwise this is an honest metadata-only partial
+  // success and the curator can decide whether to retry verification.
+  try {
+    await refreshBuildEngineRecord(itemId);
+    if (verificationCompatibilityMatches(state.builds[itemId], desired))
+      return { ok: true, skipped: false, recovered: true };
+  } catch (ignored) {}
+  return { ok: false, skipped: false, recovered: false };
+}
+
+async function patchBuild(id, fields, label, originTab = activeHistoryTab()) {
+  const b = state.builds[id];
+  if (!b) return false;
+  return !!(await updateBuildPortableMetadata(id, fields, {
+    label: label || `edit build ${b.title || id}`,
+    originTab,
+  }));
+}
+
 async function patchBuildRaw(id, fields, quiet) {
+  if (!fields || typeof fields !== "object" || Array.isArray(fields) ||
+      !Object.keys(fields).length || Object.keys(fields).some(
+        (key) => !BUILD_COMPATIBILITY_MUTATION_FIELDS.has(key))) return false;
   buildPatchConflict = false;
   let res;
   try {
@@ -17483,7 +18984,13 @@ async function patchBuildRaw(id, fields, quiet) {
   }
   const data = await res.json().catch(() => ({}));
   if (res.ok && data.ok) {
-    state.builds[id] = data.build;
+    const prior = state.builds[id] || {};
+    state.builds[id] = {
+      ...data.build,
+      _record_revision: data.build.updated_at || prior._record_revision || "",
+      _representations: prior._representations || [],
+      _available_commands: prior._available_commands,
+    };
     // quiet: background patches (auto-attach) must not re-render the form
     // and wipe unsaved field edits. The same rule applies when a PATCH for A
     // resolves after the user started editing A or B.
@@ -17495,103 +19002,272 @@ async function patchBuildRaw(id, fields, quiet) {
         renderUpload();
       }
     }
-    if (Object.prototype.hasOwnProperty.call(fields || {}, "attention")) {
-      renderRemarks();
-      renderHome();
-    }
     return true;
   }
   if (res.status === 409 && data.build) {
     // another writer (analysis, sync) got there first: adopt its record
     buildPatchConflict = true;
-    state.builds[id] = data.build;
+    const prior = state.builds[id] || {};
+    state.builds[id] = {
+      ...data.build,
+      _record_revision: data.build.updated_at || prior._record_revision || "",
+      _representations: prior._representations || [],
+      _available_commands: prior._available_commands,
+    };
     if (buildIsDirty()) {
       renderBuildsList();
       renderWorkbench();
     } else {
       renderUpload();
     }
-    if (Object.prototype.hasOwnProperty.call(fields || {}, "attention"))
-      renderRemarks();
   }
   return false;
 }
 
-async function patchBuild(id, fields, label, originTab = activeHistoryTab()) {
-  const b = state.builds[id];
-  if (!b) return false;
-  const before = {};
-  for (const f of Object.keys(fields)) before[f] = b[f] || "";
-  if (await patchBuildRaw(id, fields)) {
-    pushOp(label || `edit build ${b.title || id}`,
-      () => patchBuildRaw(id, before),
-      () => patchBuildRaw(id, fields),
-      undefined, originTab);
-    return true;
-  }
-  return false;
-}
-
-async function saveBuildFields(ev) {
-  if (ev) ev.preventDefault();
+async function commitBuildMetadataFields(options = {}) {
   const originTab = activeHistoryTab();
   const id = state.buildSel;
-  if (!id) return false;
-  const fields = {};
-  for (const f of BUILD_FIELDS) {
-    const input = el("b-" + f);
-    if (input) fields[f] = input.value.trim();
+  const prior = id && state.builds[id];
+  if (!prior) return { ok: false, receipt: null, reason: "no-item" };
+
+  const sourceInput = el("b-pdf_file");
+  const sourceDraftPath = sourceInput
+    ? String(sourceInput.value || "").trim() : "";
+  const sourceDraftPending = sourceDraftPath !==
+    String(prior.pdf_file || "").trim();
+  const metadataDirty = buildIsDirty();
+  // The source row has its own conditional command and Attach control. A
+  // normal metadata save neither clears that draft nor claims it was saved.
+  // Verification forces a metadata CAS first but still leaves the draft alone.
+  if (sourceDraftPending && !metadataDirty && !options.forceMetadata) {
+    el("build-msg").textContent = "";
+    const sourceMessage = el("b-src-msg");
+    if (sourceMessage) sourceMessage.textContent = "Not attached";
+    return { ok: false, receipt: null, reason: "source-draft" };
   }
-  fields.category_ids = catPickers["b-categories"].get();
-  fields.description = buildDescMd.get();
-  if (fields.volume && !fields.group_id) fields.group_id = buildGroupIdFor(fields);
-  // an uploaded entry keeps its status — saving a typo fix must not pull
-  // it back into the Pending queue
-  const cur0 = currentBuild();
-  fields.status = cur0 && cur0.status === "uploaded"
-    ? "uploaded"
-    : el("b-ready").classList.contains("active") ? "ready" : "draft";
-  // saving verifies the currently active OCR file for this book
-  const cur = currentBuild();
-  if (cur && cur.ocr_active) fields.ocr_verified = cur.ocr_active;
-  if (!fields.title) { el("build-msg").textContent = "Title is required"; return false; }
-  // optimistic concurrency: a save over a record another writer already
-  // bumped comes back 409 and reloads instead of clobbering it
-  fields.expect_updated_at = (state.builds[id] || {}).updated_at || "";
+
+  const patch = buildMetadataPatchFromEditor(prior);
+  if (!patch) {
+    el("build-msg").textContent = "Title is required";
+    return { ok: false, receipt: null, reason: "invalid-title" };
+  }
+  const beforePatch = buildMetadataPatchFromBuild(
+    prior, Object.keys(patch.metadata_set));
+  const recordRevision = String(prior._record_revision || "");
+  if (!recordRevision) {
+    el("build-msg").textContent = "Record revision unavailable";
+    return { ok: false, receipt: null, reason: "missing-revision" };
+  }
+
   const editGeneration = buildEditGeneration;
-  if (await patchBuild(id, fields, `edit build ${fields.title.slice(0, 30)}`,
-      originTab)) {
-    const stillOwnsEditor = state.buildSel === id &&
-      buildEditGeneration === editGeneration &&
-      (!buildDescMd || buildDescMd.get() === fields.description);
-    if (stillOwnsEditor) {
-      descState.id = id;
-      descState.val = fields.description;
-      buildDirty = false;
-      // a save that demotes ready->draft relocks Text/Knowledge — say so
-      // instead of a generic Saved (the toggle-off + Save path was silent)
-      el("build-msg").textContent =
-        cur0 && cur0.status === "ready" && fields.status === "draft"
-          ? "Saved — verification removed; Text and Knowledge relock"
-          : "Saved";
-    }
-    status(`BUILD SAVED :: ${fields.title}`);
-    return true;
-  } else {
+  const description = patch.metadata_set.description;
+  const outcome = await runBuildMetadataUpdate(id, patch, recordRevision);
+  if (!outcome) {
     if (state.buildSel === id) {
-      const canReload = buildPatchConflict &&
-        buildEditGeneration === editGeneration &&
-        (!buildDescMd || buildDescMd.get() === fields.description);
-      if (canReload) {
-        renderBuildEditor();
-      }
+      const uncertain = itemMetadataMutationAmbiguous(buildMetadataLastFailure);
       el("build-msg").textContent = buildPatchConflict
-        ? canReload ? "changed elsewhere — reloaded"
-                    : "changed elsewhere — your newer edits are still here; save again"
-        : "Save failed";
+        ? "changed elsewhere — your edits are still here"
+        : uncertain ? "Save status unknown — retry to confirm"
+                    : "Save failed";
     }
-    return false;
+    return { ok: false, receipt: null,
+      reason: buildPatchConflict ? "conflict" : "failed" };
   }
+
+  const stillOwnsEditor = outcome.projectionCurrent && state.buildSel === id &&
+    buildEditGeneration === editGeneration &&
+    (!buildDescMd || buildDescMd.get() === description);
+  if (stillOwnsEditor) {
+    descState.id = id;
+    descState.val = description;
+    buildDirty = false;
+    el("build-msg").textContent = sourceDraftPending
+      ? "Metadata saved" : "Saved";
+    const sourceStillPending = sourceDraftPending && sourceInput &&
+      sourceInput.value.trim() === sourceDraftPath &&
+      String((state.builds[id] && state.builds[id].pdf_file) || "").trim() !==
+        sourceDraftPath;
+    if (sourceStillPending) {
+      const sourceMessage = el("b-src-msg");
+      if (sourceMessage) sourceMessage.textContent = "Not attached";
+    }
+  } else if (state.buildSel === id) {
+    el("build-msg").textContent =
+      "Earlier edits saved — newer edits are not saved";
+  }
+
+  pushBuildMetadataOp(
+    `edit build ${patch.title.slice(0, 30)}`, id, outcome.receipt,
+    beforePatch, patch, originTab);
+  renderBuildsList();
+  renderWorkbench();
+  status(`${sourceDraftPending ? "METADATA" : "BUILD"} SAVED :: ${patch.title}`);
+  return { ok: true, receipt: outcome.receipt, adopted: outcome.adopted,
+    projectionCurrent: outcome.projectionCurrent, sourceDraftPending };
+}
+
+async function saveBuildFields(ev, options = {}) {
+  if (ev) ev.preventDefault();
+  const outcome = await commitBuildMetadataFields(options);
+  return options.returnOutcome ? outcome : outcome.ok;
+}
+
+const pendingBuildLifecycleDeletes = new Map();
+
+function lifecycleOperationKey(action) {
+  const random = globalThis.crypto &&
+    typeof globalThis.crypto.randomUUID === "function"
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+  return `${action}-${random}`;
+}
+
+function itemLifecycleMutationAmbiguous(error) {
+  if (!error) return false;
+  if (error.code === "aborted" || error.name === "AbortError") return false;
+  return error.retryable === true || error.code === "network-error" ||
+    error.code === "invalid-response" || error.status === 0;
+}
+
+function itemLifecycleConflict(message, code = "item_revision_conflict") {
+  const error = new Error(message);
+  error.code = code;
+  error.status = 409;
+  error.retryable = false;
+  return error;
+}
+
+async function deleteBuildToTombstone(id, lifecycle = {}) {
+  const itemId = String(id || "").trim();
+  const build = state.builds[itemId];
+  if (!itemId || !build) throw new Error("Build delete target is missing");
+  if (!itemDeleteAvailable(build)) {
+    const error = new Error("Build deletion is unavailable");
+    error.code = "item_lifecycle_command_unavailable";
+    error.status = 503;
+    error.retryable = true;
+    throw error;
+  }
+  const recordRevision = String(build._record_revision || "").trim();
+  if (!recordRevision) throw new Error("Build revision is unavailable");
+
+  let command = lifecycle.deleteCommand ||
+    pendingBuildLifecycleDeletes.get(itemId) || null;
+  if (command && command.recordRevision !== recordRevision) {
+    if (pendingBuildLifecycleDeletes.get(itemId) === command)
+      pendingBuildLifecycleDeletes.delete(itemId);
+    lifecycle.deleteCommand = null;
+    command = null;
+  }
+  if (!command) {
+    const before = await engineClient.items.lifecycle({ itemId });
+    if (before.item_revision !== recordRevision) {
+      throw itemLifecycleConflict("Build changed elsewhere");
+    }
+    command = Object.freeze({
+      itemId,
+      recordRevision: before.item_revision,
+      managedTreeRevision: before.managed_tree_revision,
+      idempotencyKey: lifecycleOperationKey("item-delete"),
+    });
+    lifecycle.deleteCommand = command;
+    pendingBuildLifecycleDeletes.set(itemId, command);
+  } else {
+    lifecycle.deleteCommand = command;
+  }
+
+  let result;
+  try {
+    result = await engineClient.items.delete(command);
+  } catch (error) {
+    if (!itemLifecycleMutationAmbiguous(error)) {
+      if (pendingBuildLifecycleDeletes.get(itemId) === command)
+        pendingBuildLifecycleDeletes.delete(itemId);
+      lifecycle.deleteCommand = null;
+    }
+    throw error;
+  }
+  const receipt = result && result.receipt;
+  const tombstone = receipt && receipt.tombstone;
+  if (!receipt || receipt.action !== "delete" || receipt.item_id !== itemId ||
+      !tombstone || tombstone.item_id !== itemId ||
+      tombstone.state !== "deleted") {
+    const error = new Error("Build delete returned an invalid receipt");
+    error.code = "invalid-response";
+    error.status = 200;
+    error.retryable = true;
+    throw error;
+  }
+  pendingBuildLifecycleDeletes.delete(itemId);
+  lifecycle.deleteCommand = null;
+  lifecycle.restoreCommand = null;
+  lifecycle.tombstone = JSON.parse(JSON.stringify(tombstone));
+  invalidateRepresentationItemIncarnation(itemId);
+  delete state.builds[itemId];
+  return lifecycle.tombstone;
+}
+
+async function restoreDeletedBuildFromTombstone(
+    lifecycle, expectedId, fallbackSnapshot) {
+  const itemId = String(expectedId || "").trim();
+  const tombstone = lifecycle && lifecycle.tombstone;
+  if (!itemId) throw new Error("Build recovery target is missing");
+  if (!tombstone || tombstone.state !== "deleted" ||
+      tombstone.item_id !== itemId || !tombstone.tombstone_id ||
+      !tombstone.revision) {
+    throw new Error("Build recovery tombstone is missing");
+  }
+  if (!lifecycle.restoreCommand && state.builds[itemId]) {
+    throw itemLifecycleConflict(
+      "Build was recreated before it could be restored",
+      "item_restore_collision");
+  }
+  let command = lifecycle.restoreCommand;
+  if (!command) {
+    command = Object.freeze({
+      tombstoneId: tombstone.tombstone_id,
+      tombstoneRevision: tombstone.revision,
+      idempotencyKey: lifecycleOperationKey("item-restore"),
+    });
+    lifecycle.restoreCommand = command;
+  }
+
+  let result;
+  try {
+    result = await engineClient.itemTombstones.restore(command);
+  } catch (error) {
+    if (!itemLifecycleMutationAmbiguous(error)) lifecycle.restoreCommand = null;
+    throw error;
+  }
+  const receipt = result && result.receipt;
+  const restoredTombstone = receipt && receipt.tombstone;
+  if (!receipt || receipt.action !== "restore" || receipt.item_id !== itemId ||
+      !restoredTombstone ||
+      restoredTombstone.tombstone_id !== tombstone.tombstone_id ||
+      restoredTombstone.state !== "restored") {
+    const error = new Error("Build restore returned an invalid receipt");
+    error.code = "invalid-response";
+    error.status = 200;
+    error.retryable = true;
+    throw error;
+  }
+  lifecycle.restoreCommand = null;
+  lifecycle.deleteCommand = null;
+  lifecycle.tombstone = JSON.parse(JSON.stringify(restoredTombstone));
+  invalidateRepresentationItemIncarnation(itemId);
+  const restored = JSON.parse(JSON.stringify(fallbackSnapshot || {}));
+  restored.id = itemId;
+  restored.updated_at = receipt.restored_item_revision;
+  restored._record_revision = receipt.restored_item_revision;
+  restored._representations = Array.isArray(restored._representations)
+    ? restored._representations : [];
+  if (!Array.isArray(restored._available_commands))
+    delete restored._available_commands;
+  state.builds[itemId] = restored;
+  // The receipt is the commit point. A failed projection refresh leaves the
+  // restored snapshot usable without turning a completed undo into failure.
+  try { await refreshBuildEngineRecord(itemId); } catch (ignored) {}
+  return state.builds[itemId];
 }
 
 async function deleteBuild(originTab = activeHistoryTab()) {
@@ -17599,30 +19275,35 @@ async function deleteBuild(originTab = activeHistoryTab()) {
   const id = state.buildSel;
   const b = state.builds[id];
   if (!b) return;
+  if (!itemDeleteAvailable(b)) {
+    statusCrit("BUILD DELETE UNAVAILABLE");
+    return;
+  }
   const snap = JSON.parse(JSON.stringify(b));
-  const res = await fetch(`/api/builds/${encodeURIComponent(id)}`, { method: "DELETE" });
-  if (res.ok) {
-    delete state.builds[id];
+  const lifecycle = {
+    tombstone: null, deleteCommand: null, restoreCommand: null,
+  };
+  try {
+    await deleteBuildToTombstone(id, lifecycle);
+  } catch (error) {
+    statusCrit(error && error.status === 409
+      ? "BUILD DELETE CONFLICT :: CHANGED ELSEWHERE"
+      : "BUILD DELETE FAILED");
+    return;
+  }
+  if (lifecycle.tombstone) {
     state.buildSel = null;
     pushOp(`delete build ${snap.title || id}`,
       async () => {
-        await fetch("/api/builds/restore", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ build: snap }),
-        });
-        state.builds[snap.id] = snap;
+        await restoreDeletedBuildFromTombstone(lifecycle, snap.id, snap);
         renderUpload();
       },
       async () => {
-        await fetch(`/api/builds/${snap.id}`, { method: "DELETE" });
-        delete state.builds[snap.id];
+        await deleteBuildToTombstone(snap.id, lifecycle);
         renderUpload();
       }, undefined, originTab);
     renderUpload();
     status(`BUILD DELETED :: ${snap.title || id}`);
-  } else {
-    statusCrit("BUILD DELETE FAILED");
   }
 }
 
@@ -17667,7 +19348,7 @@ async function generateAiSummary() {
   // so main's "model must be set" guard would block a request that works. The
   // message names the provider instead of pointing at a model setting.
   const provider = descriptionProviderLabel(s);
-  if (!(s.aiKey || "").trim()) {
+  if (!secretConfigured("aiKey")) {
     msg.textContent = provider === "DeepSeek"
       ? "Add your DeepSeek API key (Settings > Credentials)"
       : `Add an API key for ${provider} (Settings > Credentials)`;
@@ -17696,7 +19377,6 @@ async function generateAiSummary() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         base_url: baseUrl,
-        api_key: s.aiKey || "",
         model,
         instructions: s.aiInstructions || "",
         text: ocr.text,
@@ -17839,37 +19519,50 @@ function renderPdfSources(b) {
     noneEl.className = "tool-label";
     noneEl.textContent = "none";
     wrap.appendChild(noneEl);
+    updateRepresentationMutationControls(b);
     return;
   }
   for (const s of list) {
+    const canDetach = representationCommandAvailable(b, "detach");
     const chip = document.createElement("span");
     chip.className = "ocr-chip src2-chip";
     chip.dataset.tip = `${s.path}\nOCR files of this scan sit under it in the OCR tab`;
     chip.innerHTML = `${esc((s.path || "").replace(/\\/g, "/").split("/").pop())}
       <button class="src2-del" type="button" data-sid="${esc(s.id)}"
-              data-tip="Remove this secondary source (its OCR files stay)">&times;</button>`;
+              data-tip="Remove this secondary source (its OCR files stay)"
+              ${canDetach ? "" : "disabled aria-disabled=\"true\""}>&times;</button>`;
     wrap.appendChild(chip);
   }
+  updateRepresentationMutationControls(b);
 }
 
 async function addSecondaryPdf(path) {
   const originTab = activeHistoryTab();
   const b = currentBuild();
   if (!b || !path) return;
+  if (!representationCommandAvailable(b, "attach")) {
+    el("b-src-msg").textContent = "Source tools unavailable";
+    return;
+  }
   const p = path.trim();
-  let ok = false;
-  try { ok = (await fetch(pdfLocalSrc(p), { method: "HEAD" })).ok; } catch (e) {}
-  if (!ok) { el("b-src-msg").textContent = "File not found (or not a PDF)"; return; }
   const cur = b.pdf_sources || [];
   if ((b.pdf_file || "").trim() === p || cur.some((s) => s.path === p)) {
     el("b-src-msg").textContent = "Already attached";
     return;
   }
-  const id = Math.random().toString(16).slice(2, 10);
-  if (await patchBuild(b.id, { pdf_sources: [...cur, { id, path: p }] },
-      `add secondary PDF to ${b.title || b.id}`, originTab)) {
+  const id = secondaryRepresentationId(b);
+  const receipt = await setBuildRepresentation(
+    b.id, id, p, {
+      intent: "attach",
+      recordRevision: b._record_revision,
+    });
+  if (receipt) {
+    pushRepresentationOp(`add secondary PDF to ${b.title || b.id}`,
+      b.id, id, receipt, "", p, originTab);
     el("b-src-msg").textContent = "Secondary source added";
     refreshSourceTab();
+  } else {
+    el("b-src-msg").textContent = representationFailureMessage(b.id, id);
   }
 }
 
@@ -17877,13 +19570,30 @@ async function removeSecondaryPdf(sid) {
   const originTab = activeHistoryTab();
   const b = currentBuild();
   if (!b) return;
+  if (!representationCommandAvailable(b, "detach")) {
+    el("b-src-msg").textContent = "Source tools unavailable";
+    return;
+  }
   const cur = b.pdf_sources || [];
+  const removed = cur.find((s) => s.id === sid);
   const next = cur.filter((s) => s.id !== sid);
   if (next.length === cur.length) return;
-  if (await patchBuild(b.id, { pdf_sources: next },
-      `remove secondary PDF from ${b.title || b.id}`, originTab)) {
+  const current = attachedRepresentation(b, sid);
+  if (!current) return;
+  const receipt = await setBuildRepresentation(
+    b.id, sid, "", {
+      intent: "detach",
+      recordRevision: b._record_revision,
+      representationRevision: current.revision,
+    });
+  if (receipt) {
+    pushRepresentationOp(`remove secondary PDF from ${b.title || b.id}`,
+      b.id, sid, receipt, removed.path, "", originTab);
     el("b-src-msg").textContent = "Secondary source removed";
     refreshSourceTab();
+  } else {
+    el("b-src-msg").textContent =
+      representationFailureMessage(b.id, sid, "conflict");
   }
 }
 
@@ -17965,20 +19675,37 @@ async function refreshResourcesTab() {
 }
 
 async function refreshSourceTab() {
-  const b = currentBuild();
+  let b = currentBuild();
   if (!b) return;
   // the awaits below can outlive a build switch — never render stale data
-  const stale = () => state.buildSel !== b.id;
+  const buildId = b.id;
+  const stale = () => state.buildSel !== buildId;
   let localPath = (b.pdf_file || "").trim();
   // auto-populate: a PDF that was auto-sourced from a URL and already
   // downloaded gets its local path attached without asking
   if (!localPath) {
     const ident = iaIdentFromBuild(b);
-    if (ident && state.downloadedIds.has(ident)) {
-      localPath = `downloads/ia/${ident}.pdf`;
-      await patchBuildRaw(b.id, { pdf_file: localPath }, true);
+    const current = attachedRepresentation(b, "primary");
+    const action = current ? "replace" : "attach";
+    if (ident && state.downloadedIds.has(ident) &&
+        representationCommandAvailable(b, action)) {
+      const candidate = `downloads/ia/${ident}.pdf`;
+      const receipt = await setBuildRepresentation(
+        buildId, "primary", candidate, {
+          intent: action,
+          recordRevision: b._record_revision,
+          representationRevision: current && current.revision,
+        });
       if (stale()) return;
-      el("b-src-msg").textContent = "Local PDF attached automatically";
+      if (receipt) {
+        b = currentBuild() || b;
+        localPath = (b.pdf_file || candidate).trim();
+        el("b-src-msg").textContent = "Local PDF attached automatically";
+      } else {
+        localPath = "";
+        el("b-src-msg").textContent = representationFailureMessage(
+          buildId, "primary");
+      }
     }
   }
   el("b-pdf_file").value = localPath;
@@ -18046,7 +19773,15 @@ async function syncBuildFolder() {
       state.buildFolder = data;
       // the sync may have retired the IA original and repointed pdf_file
       // at the folder's preview.pdf
-      if (data.build) state.builds[b.id] = data.build;
+      if (data.build) {
+        const prior = state.builds[b.id] || {};
+        state.builds[b.id] = {
+          ...data.build,
+          _record_revision: data.build.updated_at || prior._record_revision || "",
+          _representations: prior._representations || [],
+          _available_commands: prior._available_commands,
+        };
+      }
       if (data.page_remap && Array.isArray(data.page_remap.deleted)) {
         remapPageRemarkKeys(b.id, data.page_remap.source,
           data.page_remap.deleted);
@@ -18114,24 +19849,36 @@ async function attachPdfFile(path) {
   const originTab = activeHistoryTab();
   const b = currentBuild();
   if (!b) return;
+  const prior = (b.pdf_file || "").trim() ||
+    (attachedRepresentation(b, "primary") ? ocrBookPdf(b.id) : "");
+  const current = attachedRepresentation(b, "primary");
   const p = (path != null ? path : el("b-pdf_file").value).trim();
-  el("b-pdf_file").value = p;
-  if (p) {
-    // confirm the file is actually readable before saving the path
-    let ok = false;
-    try { ok = (await fetch(pdfLocalSrc(p), { method: "HEAD" })).ok; } catch (e) {}
-    if (!ok) {
-      el("b-src-msg").textContent = "File not found (or not a PDF)";
-      return;
-    }
+  if (!p && !current) {
+    updateRepresentationMutationControls(b);
+    return;
   }
-  if (await patchBuild(b.id, { pdf_file: p },
-      p ? `attach PDF to ${b.title || b.id}` : `detach PDF from ${b.title || b.id}`,
-      originTab)) {
+  const action = p ? (current ? "replace" : "attach") : "detach";
+  el("b-pdf_file").value = p;
+  if (!representationCommandAvailable(b, action)) {
+    el("b-src-msg").textContent = "Source tools unavailable";
+    updateRepresentationMutationControls(b);
+    return;
+  }
+  const receipt = await setBuildRepresentation(
+    b.id, "primary", p, {
+      intent: action,
+      recordRevision: b._record_revision,
+      representationRevision: current && current.revision,
+    });
+  if (receipt) {
+    pushRepresentationOp(p ? `attach PDF to ${b.title || b.id}` :
+      `detach PDF from ${b.title || b.id}`,
+      b.id, "primary", receipt, prior, p, originTab);
     el("b-src-msg").textContent = p ? "Attached" : "Detached";
     refreshSourceTab();
   } else {
-    el("b-src-msg").textContent = "Save failed";
+    el("b-src-msg").textContent = representationFailureMessage(
+      b.id, "primary", p ? "invalid" : "conflict");
   }
 }
 
@@ -19785,18 +21532,18 @@ const OCR_SERVICE_LABELS = {
 };
 
 function ocrServiceReady(svc) {
-  const s = state.settings;
   if (svc === "tesseract") return true;   // server falls back to the default install
-  if (svc === "mistral") return !!s.mistralKey;   // shared with the capture pipeline
-  if (svc === "claude") return !!s.ocrClaudeKey;
-  if (svc === "textract") return !!(s.ocrAwsKey && s.ocrAwsSecret);
+  if (svc === "mistral") return secretConfigured("mistralKey");
+  if (svc === "claude") return secretConfigured("ocrClaudeKey");
+  if (svc === "textract") return secretConfigured("ocrAwsKey") &&
+    secretConfigured("ocrAwsSecret");
   return false;
 }
 
 const TEXT_ANALYSIS_LABELS = { configured: "Configured AI provider" };
 
 function analysisServiceReady() {
-  return !!String(state.settings.aiKey || "").trim();
+  return secretConfigured("aiKey");
 }
 
 // renderOcrQueue runs this on every 1.5s job-poll tick, so it follows the
@@ -19983,10 +21730,8 @@ async function ocrQueuePages(bid, srcKey, pages) {
         build_id: bid, pdf, pages, target, src: srcKey,
         width: s.ocrImageWidth || 1400,
         tesseract: s.ocrTesseract || "",
-        claude_key: s.ocrClaudeKey || "", claude_model: s.ocrClaudeModel || "",
-        aws_key: s.ocrAwsKey || "", aws_secret: s.ocrAwsSecret || "",
+        claude_model: s.ocrClaudeModel || "",
         aws_region: s.ocrAwsRegion || "",
-        mistral_key: s.mistralKey || "",
       }),
     });
     const data = await res.json().catch(() => ({}));
@@ -20569,7 +22314,15 @@ async function deleteSelectedPages() {
     ? data.warnings.map((warning) => String(warning || "").trim()).filter(Boolean)
     : [];
   try {
-    if (data.build) state.builds[bid] = data.build;
+    if (data.build) {
+      const prior = state.builds[bid] || {};
+      state.builds[bid] = {
+        ...data.build,
+        _record_revision: data.build.updated_at || prior._record_revision || "",
+        _representations: prior._representations || [],
+        _available_commands: prior._available_commands,
+      };
+    }
     if (data.page_remap && Array.isArray(data.page_remap.deleted)) {
       remapPageRemarkKeys(bid, data.page_remap.source,
         data.page_remap.deleted);
@@ -20764,6 +22517,10 @@ const rwState = {
   // A detection keeps running when the user opens another page or workbench;
   // returning to its page still shows the correct busy state.
   detectionJobs: new Map(),
+  // A submission whose response is lost must be retried with the exact same
+  // command identity. Keys include the region revision, so an intentional new
+  // attempt after a refresh cannot alias the older paid operation.
+  detectionCommands: new Map(),
   detectionWatchers: new Set(),
 };
 
@@ -20832,6 +22589,17 @@ function rwHasUnsaved() {
 
 function rwDetectionKey(book, src, page) {
   return JSON.stringify([String(book || ""), String(src || "primary"), +page || 0]);
+}
+
+function rwDetectionCommandKey(book, src, page, revision) {
+  return JSON.stringify([String(book || ""), String(src || "primary"),
+                         +page || 0, String(revision || "")]);
+}
+
+function rwDetectionDefinitiveFailure(error) {
+  const statusCode = Number(error && error.status || 0);
+  return statusCode >= 400 && statusCode < 500 &&
+    ![408, 425, 429].includes(statusCode);
 }
 
 function rwDetectionOutcome(job) {
@@ -21758,7 +23526,10 @@ async function rwProposalAction(action) {
 async function rwFinishDetection(book, src, page, job) {
   const key = rwDetectionKey(book, src, page);
   const current = rwState.detectionJobs.get(key);
-  if (current && current.id === job.id) rwState.detectionJobs.delete(key);
+  if (current && current.id === job.id) {
+    rwState.detectionJobs.delete(key);
+    if (current.commandKey) rwState.detectionCommands.delete(current.commandKey);
+  }
 
   // A completed or interrupted worker may have written a canonical page or a
   // proposal immediately before its terminal transition. Invalidate shared
@@ -21846,15 +23617,23 @@ async function rwDetectPage() {
     return;
   }
 
-  const placeholder = { id: "", state: "submitting", job: null };
+  const revision = rwState.revision;
+  const commandKey = rwDetectionCommandKey(book, src, page, revision);
+  let operationId = rwState.detectionCommands.get(commandKey);
+  if (!operationId) {
+    operationId = rwNewRid();
+    rwState.detectionCommands.set(commandKey, operationId);
+  }
+  const placeholder = { id: "", state: "submitting", job: null,
+                        commandKey, operationId };
   rwState.detectionJobs.set(key, placeholder);
   status("DETECT :: starting…");
   rwSyncBar();
   let result;
   try {
     result = await engineClient.replica.detection.start({
-      bookId: book, sourceId: src, page, revision: rwState.revision,
-      provider: "automatic", idempotencyKey: rwNewRid(),
+      bookId: book, sourceId: src, page, revision,
+      provider: "automatic", idempotencyKey: operationId,
     });
     if (!result || !result.job || !result.job.id) {
       throw new Error("engine returned no job identity");
@@ -21862,6 +23641,9 @@ async function rwDetectPage() {
   } catch (error) {
     if (rwState.detectionJobs.get(key) === placeholder) {
       rwState.detectionJobs.delete(key);
+    }
+    if (rwDetectionDefinitiveFailure(error)) {
+      rwState.detectionCommands.delete(commandKey);
     }
     const changed = error && (error.status === 409 || error.status === 428);
     statusErr(changed ? "DETECT :: page changed — reload and retry"
@@ -21871,7 +23653,7 @@ async function rwDetectPage() {
   }
 
   const record = { id: String(result.job.id), state: result.job.state,
-                   job: result.job };
+                   job: result.job, commandKey, operationId };
   rwState.detectionJobs.set(key, record);
   if (book === rwState.book && src === rwState.src && page === rwState.page) {
     status(result.already ? "DETECT :: joined running job" : "DETECT :: queued");
@@ -22650,9 +24432,9 @@ function initReplica() {
     const summary = rwState.transSummaries.find(
       (translation) => translation.id === rwState.previewLang);
     const layer = summary ? summary.target_language : rwState.previewLang;
-    window.open(engineClient.replica.printUrl({
+    openLocalResource(engineClient.replica.printUrl({
       bookId: rwState.book, sourceId: rwState.src, layer,
-    }), "_blank");
+    }));
   });
   el("rw-import-file").addEventListener("change", async () => {
     const input = el("rw-import-file");
@@ -22821,7 +24603,7 @@ function initOcrTab() {
     const ex = ev.target.closest("button.src-extract");
     if (ex) { ocrExtractSource(ex.dataset.src); return; }
     const pdf = ev.target.closest("button.artifact-open-pdf");
-    if (pdf) { window.open(pdfApiUrl(pdf.dataset.pdf), "_blank"); return; }
+    if (pdf) { openLocalResource(pdfLocalSrc(pdf.dataset.pdf)); return; }
     const artifact = ev.target.closest("li.artifact-text");
     if (artifact) {
       openTextArtifact(artifact.dataset.artifactKind, artifact.dataset.artifactName);
@@ -22830,15 +24612,15 @@ function initOcrTab() {
     const captureRow = ev.target.closest("li.capture-img-row");
     if (captureRow) {
       if (captureRow.dataset.captureAvailable)
-        window.open("/api/capture/image?path=" +
-          encodeURIComponent(captureRow.dataset.capturePath), "_blank");
+        openLocalResource("/api/capture/image?path=" +
+          encodeURIComponent(captureRow.dataset.capturePath));
       return;
     }
     // an extracted-image row isn't a document to select — open it full size
     const imgRow = ev.target.closest("li.ocr-img-row");
     if (imgRow) {
-      window.open(`/api/builds/${encodeURIComponent(ocrState.book)}/ocr/images/` +
-        encodeURIComponent(imgRow.dataset.imgName), "_blank");
+      openLocalResource(`/api/builds/${encodeURIComponent(ocrState.book)}/ocr/images/` +
+        encodeURIComponent(imgRow.dataset.imgName));
       return;
     }
     const srcLi = ev.target.closest("li.ocr-src");
@@ -22957,10 +24739,35 @@ function initOcrTab() {
 // one surface now — but History entries from baked smart checks persist in the
 // action log, so their grouped revert must keep working.
 
+async function scRevertLegacyBuildFields(it) {
+  const before = it && it.before;
+  if (!before || typeof before !== "object" || Array.isArray(before))
+    return false;
+  const portable = {};
+  const compatibility = {};
+  for (const [key, value] of Object.entries(before)) {
+    if (key === "title" || ITEM_PORTABLE_METADATA_FIELDS.has(key))
+      portable[key] = value;
+    else if (BUILD_COMPATIBILITY_MUTATION_FIELDS.has(key))
+      compatibility[key] = value;
+    else return false;
+  }
+  // Old descriptors carry no shared transaction revision. Refuse a mixed
+  // cross-domain replay rather than commit one half and fail the other.
+  if (Object.keys(portable).length && Object.keys(compatibility).length)
+    return false;
+  if (Object.keys(portable).length) {
+    return !!(await updateBuildPortableMetadata(it.id, portable,
+      { quiet: true }));
+  }
+  return Object.keys(compatibility).length
+    ? !!(await patchBuildRaw(it.id, compatibility, true)) : false;
+}
+
 async function scRevertItem(it) {
   switch (it.kind) {
     case "whl": return !!(await whlApplySnaps(it.idx, it.beforeSnaps));
-    case "build-fields": return !!(await patchBuildRaw(it.id, it.before));
+    case "build-fields": return scRevertLegacyBuildFields(it);
     case "manual-fields": return !!(await patchManualFields(it.id, it.before));
     case "checked": restoreChecked(it.key, it.before); return true;
     default: return false;
@@ -22986,7 +24793,6 @@ async function syncMasterList() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         spreadsheet_id: state.settings.gsSpreadsheetId || "",
-        service_account_file: state.settings.gsKeyFile || "",
         sheet_name: state.settings.gsSheetName || "Master list",
       }),
     });
@@ -23139,11 +24945,8 @@ function initMenubar() {
 
 // --- wire up ---------------------------------------------------------------
 
-// --- embedded web view -------------------------------------------------------
-// Links that would open a new browser tab open here instead: a proxied,
-// SANDBOXED iframe. /api/webview strips the X-Frame-Options that block framing;
-// the sandbox has no allow-same-origin, so the proxied page's scripts run
-// isolated and cannot reach the app. Ctrl/Cmd+click still opens a real tab.
+// --- external web links ------------------------------------------------------
+// Remote HTML always opens outside the application's authenticated origin.
 function openWebView(url) {
   if (!/^https?:\/\//i.test(url)) return false;
   // In the desktop shell a plain web link belongs in the real browser, not an
@@ -23152,10 +24955,7 @@ function openWebView(url) {
   // with local preview + downloads) and stays in-app on desktop.
   const d = window.whlDesktop;
   if (d && d.isDesktop && d.openExternal) { d.openExternal(url); return true; }
-  el("webview-url").textContent = url;
-  el("webview-url").dataset.url = url;
-  el("webview-frame").src = "/api/webview?url=" + encodeURIComponent(url);
-  el("webview-overlay").hidden = false;
+  window.open(url, "_blank", "noopener");
   return true;
 }
 function closeWebView() {
@@ -23164,12 +24964,26 @@ function closeWebView() {
 }
 function reloadWebView() {
   const u = el("webview-url").dataset.url;
-  if (u) el("webview-frame").src = "/api/webview?url=" + encodeURIComponent(u);
+  if (u) openWebView(u);
 }
 
 // --- Internet Archive viewer (PDF preview + metadata + downloads) ------------
 // --- IA preview page viewer (local compressed copy, arrow-key paging) --------
-const iaViewer = { pages: 0, page: 1 };
+const iaViewer = { pages: 0, page: 1, objectUrl: "", seq: 0, controller: null };
+
+function revokeIaObjectUrl() {
+  iaViewer.objectUrl = replaceObjectUrl(iaViewer.objectUrl, null);
+}
+
+function abortIaRequest() {
+  if (iaViewer.controller) iaViewer.controller.abort();
+  iaViewer.controller = null;
+}
+
+function iaRequestIsCurrent(seq, controller) {
+  return seq === iaViewer.seq && iaViewer.controller === controller &&
+    !controller.signal.aborted;
+}
 
 function renderIaPages(previewPath, pages) {
   const box = el("ia-pages");
@@ -23214,49 +25028,95 @@ function onIaViewerKey(ev) {
   }
 }
 
-// choose the framed local preview if we have one; else the proxied iframe
-async function showIaPreview(ident, data) {
+// Choose the local preview if available; a remote PDF is fetched into a blob.
+async function showIaPreview(ident, data, seq, controller) {
+  if (!iaRequestIsCurrent(seq, controller)) return;
   el("ia-pages").hidden = true;
-  el("ia-frame").hidden = false;
+  el("ia-frame").hidden = true;
+  el("ia-frame").src = "about:blank";
+  revokeIaObjectUrl();
   let pv = null;
-  try { pv = await (await fetch("/api/ia/preview/" + encodeURIComponent(ident))).json(); }
-  catch (e) { pv = null; }
+  try {
+    const response = await fetch("/api/ia/preview/" + encodeURIComponent(ident), {
+      signal: controller.signal,
+    });
+    if (!iaRequestIsCurrent(seq, controller)) return;
+    pv = await response.json();
+  } catch (e) {
+    if (!iaRequestIsCurrent(seq, controller)) return;
+    pv = null;
+  }
+  if (!iaRequestIsCurrent(seq, controller)) return;
   if (pv && pv.ok && pv.pages) {
     renderIaPages(pv.preview, pv.pages);
     el("ia-pages").hidden = false;
-    el("ia-frame").hidden = true;
-    el("ia-frame").src = "about:blank";
     return;
   }
-  el("ia-frame").src = (data && data.pdf)
-    ? "/api/pdf?url=" + encodeURIComponent(data.pdf) + "&preview=1"
-    : "/api/webview?url=" + encodeURIComponent(
-        (data && data.details) || ("https://archive.org/details/" + ident));
+  if (data && data.pdf) {
+    try {
+      const result = await fetchBoundedPdfBlob(
+        "/api/pdf?url=" + encodeURIComponent(data.pdf) + "&preview=1", {
+          signal: controller.signal,
+        });
+      if (!iaRequestIsCurrent(seq, controller)) return;
+      iaViewer.objectUrl = replaceObjectUrl(iaViewer.objectUrl, result.blob);
+      el("ia-frame").src = iaViewer.objectUrl;
+      el("ia-frame").hidden = false;
+    } catch (e) {
+      if (!iaRequestIsCurrent(seq, controller)) return;
+      el("ia-pages").innerHTML = "<div class='empty'>Preview unavailable. Open in browser to view.</div>";
+      el("ia-pages").hidden = false;
+    }
+  } else {
+    el("ia-pages").innerHTML = "<div class='empty'>Preview unavailable. Open in browser to view.</div>";
+    el("ia-pages").hidden = false;
+  }
   // no local copy yet — queue a background download (shares the cap/accounting)
   // so the framed preview (and its compressed 10-page copy) is ready next time
-  if (state.settings.autoIaDownload) enqueueAutoDl(ident, {});
+  if (iaRequestIsCurrent(seq, controller) && state.settings.autoIaDownload) {
+    enqueueAutoDl(ident, {});
+  }
 }
 
 async function openIaViewer(ident) {
   if (!ident) return;
+  abortIaRequest();
+  const seq = ++iaViewer.seq;
+  const controller = new AbortController();
+  iaViewer.controller = controller;
   const meta = el("ia-meta"), dls = el("ia-downloads");
   el("ia-title").textContent = "Internet Archive :: " + ident;
+  el("ia-pages").hidden = true;
+  el("ia-pages").innerHTML = "";
+  el("ia-frame").hidden = true;
   el("ia-frame").src = "about:blank";
+  revokeIaObjectUrl();
   meta.innerHTML = "<tr><td>Loading …</td></tr>";
   dls.innerHTML = "";
   el("ia-external").onclick = () =>
     window.open("https://archive.org/details/" + ident, "_blank", "noopener");
   el("ia-overlay").hidden = false;
   let data;
-  try { data = await (await fetch("/api/ia/meta?id=" + encodeURIComponent(ident))).json(); }
-  catch (e) { meta.innerHTML = "<tr><td>Could not load Internet Archive metadata</td></tr>"; return; }
+  try {
+    const response = await fetch("/api/ia/meta?id=" + encodeURIComponent(ident), {
+      signal: controller.signal,
+    });
+    if (!iaRequestIsCurrent(seq, controller)) return;
+    data = await response.json();
+  } catch (e) {
+    if (!iaRequestIsCurrent(seq, controller)) return;
+    meta.innerHTML = "<tr><td>Could not load Internet Archive metadata</td></tr>";
+    iaViewer.controller = null;
+    return;
+  }
+  if (!iaRequestIsCurrent(seq, controller)) return;
   const md = data.metadata || {};
   const arr = (v) => Array.isArray(v) ? v.join("; ") : (v == null ? "" : String(v));
   el("ia-title").textContent = arr(md.title) || ident;
   el("ia-external").onclick = () => window.open(data.details, "_blank", "noopener");
-  // Prefer the locally-downloaded compressed preview (page frames + arrow keys);
-  // otherwise fall back to the proxied remote preview iframe.
-  await showIaPreview(ident, data);
+  // Prefer the locally-downloaded compressed preview (page frames + arrow keys).
+  await showIaPreview(ident, data, seq, controller);
+  if (!iaRequestIsCurrent(seq, controller)) return;
   const rows = [["Title", "title"], ["Author", "creator"], ["Year", "year"], ["Date", "date"],
     ["Publisher", "publisher"], ["Language", "language"], ["Pages", "imagecount"],
     ["Subjects", "subject"], ["Collection", "collection"]];
@@ -23272,12 +25132,16 @@ async function openIaViewer(ident) {
   dls.querySelectorAll(".ia-dl").forEach((btn) => {
     btn.onclick = () => window.open(data.downloads[+btn.dataset.i].url, "_blank", "noopener");
   });
+  if (iaViewer.controller === controller) iaViewer.controller = null;
 }
 function closeIaViewer() {
+  iaViewer.seq++;
+  abortIaRequest();
   el("ia-overlay").hidden = true;
   el("ia-frame").src = "about:blank";
   el("ia-pages").innerHTML = "";
   el("ia-pages").hidden = true;
+  revokeIaObjectUrl();
   iaViewer.pages = 0;
   iaViewer.page = 1;
 }
@@ -24024,7 +25888,10 @@ function init() {
     setThumbnailSource(b.id, card.dataset.source);
   });
   el("build-form").addEventListener("submit", saveBuildFields);
-  el("build-form").addEventListener("input", markBuildDirty);
+  el("build-form").addEventListener("input", (ev) => {
+    if (ev.target && ev.target.id === "b-pdf_file") return;
+    markBuildDirty();
+  });
   el("build-save").addEventListener("click", saveBuildFields);
   el("build-delete").addEventListener("click", deleteBuild);
   // Ctrl/Cmd+S saves the open entry on the editor-derived phases, and the
@@ -24092,6 +25959,8 @@ function init() {
   boot("replica", initReplica);
   loadTaxonomy();   // async; pickers and cells refresh when the vocab lands
   el("b-pdf-attach").addEventListener("click", () => attachPdfFile());
+  el("b-pdf_file").addEventListener("input", () =>
+    updateRepresentationMutationControls(currentBuild()));
   el("b-pdf_file").addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") { ev.preventDefault(); attachPdfFile(); }
   });
@@ -24191,8 +26060,14 @@ function init() {
   // Adopt the authoritative server copy of checked / settings / attention
   // (or seed it from localStorage on first run), THEN re-render so the views
   // reflect whatever the server holds (the merge may differ from the cache).
-  syncClientStateOnLoad().then((adopted) => {
-    hydrateSecrets();      // warm credentials without delaying the initial UI
+  syncClientStateOnLoad().then(async (adopted) => {
+    // Import and scrub any credential cache left by pre-protected-store builds.
+    // This is intentionally after client-state reconciliation (which sees only
+    // the already-clean state.settings object) and before credential controls
+    // can be opened.
+    if (!(await migrateLegacyRendererSecrets())) {
+      await hydrateSecrets();
+    }
     // adopted server settings can carry a different set of custom themes, so
     // rebuild the pickers/menu before re-applying (else the menubar Theme
     // submenu keeps the pre-sync list); applyExpSharpen re-applies the

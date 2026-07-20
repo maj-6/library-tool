@@ -8,11 +8,13 @@ conftest provides — never against live data or a live project.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 
 import pytest
 
 import libcommon as lib
 import store_sync as ss
+from librarytool.engine.item_lifecycle import ItemLifecycleDeletionIndex
 
 T0 = "2026-07-01T00:00:00+00:00"
 T1 = "2026-07-02T00:00:00+00:00"
@@ -289,6 +291,204 @@ def test_sync_entry_files_backs_up_before_a_pull_overwrite(monkeypatch):
     assert bak.read_text("utf-8") == "local work"
 
 
+def test_sync_entry_files_suppresses_remote_only_deleted_item(monkeypatch):
+    transfers = []
+    monkeypatch.setattr(ss.r2, "list_objects_meta",
+                        lambda cfg, prefix="", timeout=60.0: {
+                            "entries/deleted/ocr/compiled.txt": {
+                                "size": 7, "etag": "a" * 32, "modified": T1,
+                            },
+                            "entries/deleted-extra/ocr/compiled.txt": {
+                                "size": 4, "etag": "b" * 32, "modified": T1,
+                            },
+                        })
+
+    def fake_get(cfg, key, dest, **kw):
+        transfers.append(key)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("live", "utf-8")
+        return dest
+
+    monkeypatch.setattr(ss.r2, "get_file", fake_get)
+    result = ss.sync_entry_files(
+        {"account": "a", "bucket": "b", "key_id": "k", "secret": "s"},
+        allow_item=lambda item_id: item_id != "deleted",
+    )
+
+    assert result == {"pushed": 0, "pulled": 1, "in_sync": 0,
+                      "suppressed": 1}
+    assert transfers == ["entries/deleted-extra/ocr/compiled.txt"]
+    assert not (ss.entries_dir() / "deleted").exists()
+    assert (ss.entries_dir() / "deleted-extra" / "ocr" /
+            "compiled.txt").read_text("utf-8") == "live"
+
+
+def test_sync_entry_files_suppresses_local_only_deleted_item(monkeypatch):
+    source = ss.entries_dir() / "deleted" / "ocr" / "compiled.txt"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("local", "utf-8")
+    monkeypatch.setattr(ss.r2, "list_objects_meta",
+                        lambda cfg, prefix="", timeout=60.0: {})
+    transfers = []
+    monkeypatch.setattr(
+        ss.r2, "put_file",
+        lambda cfg, key, path, **kw: transfers.append((key, path)),
+    )
+
+    result = ss.sync_entry_files(
+        {"account": "a", "bucket": "b", "key_id": "k", "secret": "s"},
+        allow_item=lambda item_id: item_id != "deleted",
+    )
+
+    assert result == {"pushed": 0, "pulled": 0, "in_sync": 0,
+                      "suppressed": 1}
+    assert transfers == []
+    assert source.read_text("utf-8") == "local"
+
+
+def test_sync_entry_files_rechecks_policy_before_push(monkeypatch):
+    source = ss.entries_dir() / "book" / "ocr" / "compiled.txt"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("local", "utf-8")
+    monkeypatch.setattr(ss.r2, "list_objects_meta",
+                        lambda cfg, prefix="", timeout=60.0: {})
+    transfers = []
+    monkeypatch.setattr(
+        ss.r2, "put_file",
+        lambda cfg, key, path, **kw: transfers.append((key, path)),
+    )
+    checks = 0
+
+    def allow_item(item_id):
+        nonlocal checks
+        assert item_id == "book"
+        checks += 1
+        return checks == 1       # inventory allowed; pre-publication denied
+
+    result = ss.sync_entry_files(
+        {"account": "a", "bucket": "b", "key_id": "k", "secret": "s"},
+        allow_item=allow_item,
+    )
+
+    assert result == {"pushed": 0, "pulled": 0, "in_sync": 0,
+                      "suppressed": 1}
+    assert checks == 2
+    assert transfers == []
+    assert source.read_text("utf-8") == "local"
+
+
+def test_sync_entry_files_rechecks_policy_before_pull_footprint(monkeypatch):
+    monkeypatch.setattr(ss.r2, "list_objects_meta",
+                        lambda cfg, prefix="", timeout=60.0: {
+                            "entries/book/ocr/compiled.txt": {
+                                "size": 5, "etag": "c" * 32, "modified": T1,
+                            },
+                        })
+    transfers = []
+    monkeypatch.setattr(
+        ss.r2, "get_file",
+        lambda cfg, key, dest, **kw: transfers.append((key, dest)),
+    )
+    checks = 0
+
+    def allow_item(item_id):
+        nonlocal checks
+        assert item_id == "book"
+        checks += 1
+        return checks == 1       # inventory allowed; pre-publication denied
+
+    result = ss.sync_entry_files(
+        {"account": "a", "bucket": "b", "key_id": "k", "secret": "s"},
+        allow_item=allow_item,
+    )
+
+    assert result == {"pushed": 0, "pulled": 0, "in_sync": 0,
+                      "suppressed": 1}
+    assert checks == 2
+    assert transfers == []
+    assert not (ss.entries_dir() / "book").exists()
+    assert not (lib.OUTPUT_DIR / "backups" / "entries" / "book").exists()
+
+
+def test_sync_entry_files_fails_closed_for_invalid_lifecycle_policy(monkeypatch):
+    monkeypatch.setattr(ss.r2, "list_objects_meta",
+                        lambda cfg, prefix="", timeout=60.0: {
+                            "entries/book/ocr/compiled.txt": {
+                                "size": 5, "etag": "c" * 32, "modified": T1,
+                            },
+                        })
+
+    with pytest.raises(TypeError, match="allow_item must be callable"):
+        ss.sync_entry_files({}, allow_item=True)
+    with pytest.raises(TypeError, match="return a boolean"):
+        ss.sync_entry_files({}, allow_item=lambda _item_id: "yes")
+
+
+def test_sync_entry_files_holds_policy_guard_through_transfer(monkeypatch):
+    source = ss.entries_dir() / "book" / "ocr" / "compiled.txt"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("local", "utf-8")
+    monkeypatch.setattr(
+        ss.r2, "list_objects_meta", lambda _cfg, prefix="": {}
+    )
+    held = False
+    events = []
+
+    @contextmanager
+    def policy_guard():
+        nonlocal held
+        assert held is False
+        held = True
+        events.append("enter")
+        try:
+            yield lambda item_id: item_id != "deleted"
+        finally:
+            held = False
+            events.append("exit")
+
+    def guarded_put(_cfg, key, path, **_kwargs):
+        assert held is True
+        assert key == "entries/book/ocr/compiled.txt"
+        assert path == source
+
+    monkeypatch.setattr(ss.r2, "put_file", guarded_put)
+    result = ss.sync_entry_files({}, item_policy_guard=policy_guard)
+
+    assert result == {
+        "pushed": 1,
+        "pulled": 0,
+        "in_sync": 0,
+        "suppressed": 0,
+    }
+    assert held is False
+    assert events == ["enter", "exit"] * 2
+
+
+def test_sync_entry_files_rejects_ambiguous_or_invalid_policy_guards(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        ss.r2, "list_objects_meta", lambda _cfg, prefix="": {}
+    )
+    with pytest.raises(TypeError, match="mutually exclusive"):
+        ss.sync_entry_files(
+            {},
+            allow_item=lambda _item_id: True,
+            item_policy_guard=lambda: None,
+        )
+    with pytest.raises(TypeError, match="must be callable"):
+        ss.sync_entry_files({}, item_policy_guard=True)
+    with pytest.raises(TypeError, match="context manager"):
+        ss.sync_entry_files({}, item_policy_guard=lambda: object())
+
+    @contextmanager
+    def invalid_policy():
+        yield True
+
+    with pytest.raises(TypeError, match="yield a callable"):
+        ss.sync_entry_files({}, item_policy_guard=invalid_policy)
+
+
 def test_entries_plan_multipart_etag_falls_back_to_size():
     remote = {"f.pdf": {"size": 10, "etag": "abc-2", "modified": T1}}
     p = ss.entries_plan({"f.pdf": {"size": 10, "mtime": 0.0}}, remote,
@@ -352,6 +552,292 @@ def clean_store_files():
     wipe()
     yield
     wipe()
+
+
+def test_sync_store_policy_suppresses_remote_only_deleted_catalogue_row(fake_cloud):
+    fake_cloud.tables["builds"] = {
+        "deleted": {
+            "id": "deleted",
+            "data": {"id": "deleted", "title": "Remote", "updated_at": T1},
+            "updated_at": T1,
+            "deleted": False,
+        },
+    }
+
+    result = ss.sync_store(
+        {"url": "u", "key": "k"},
+        "builds",
+        allow_item=lambda item_id: item_id != "deleted",
+    )
+
+    assert result == {"pushed": 0, "pulled": 0, "tombstoned": 0,
+                      "deleted": 0, "in_sync": 0, "guard": ""}
+    assert not ss.STORES["builds"]["path"]().exists()
+    assert fake_cloud.tables["builds"]["deleted"]["deleted"] is False
+
+
+def test_sync_store_policy_suppresses_local_only_deleted_catalogue_row(fake_cloud):
+    path = ss.STORES["builds"]["path"]()
+    record = {"id": "deleted", "title": "Local", "updated_at": T1}
+    lib.save_json(path, {"deleted": record})
+
+    result = ss.sync_store(
+        {"url": "u", "key": "k"},
+        "builds",
+        allow_item=lambda item_id: item_id != "deleted",
+    )
+
+    assert result == {"pushed": 0, "pulled": 0, "tombstoned": 0,
+                      "deleted": 0, "in_sync": 0, "guard": ""}
+    assert fake_cloud.tables.get("builds", {}) == {}
+    assert lib.load_json(path, {}) == {"deleted": record}
+
+
+def test_sync_store_policy_uses_exact_case_sensitive_catalogue_identity(fake_cloud):
+    path = ss.STORES["builds"]["path"]()
+    lib.save_json(path, {
+        "Book": {"id": "Book", "title": "Exact", "updated_at": T1},
+    })
+    seen = []
+
+    def allow_item(item_id):
+        seen.append(item_id)
+        return item_id != "Book"
+
+    result = ss.sync_store(
+        {"url": "u", "key": "k"},
+        "builds",
+        allow_item=allow_item,
+    )
+
+    assert result["pushed"] == 0
+    assert seen == ["Book"]
+    assert fake_cloud.tables.get("builds", {}) == {}
+
+
+def test_sync_store_rechecks_policy_before_local_catalogue_write(fake_cloud):
+    fake_cloud.tables["builds"] = {
+        "book": {
+            "id": "book",
+            "data": {"id": "book", "title": "Remote", "updated_at": T1},
+            "updated_at": T1,
+            "deleted": False,
+        },
+    }
+    checks = 0
+
+    def allow_item(item_id):
+        nonlocal checks
+        assert item_id == "book"
+        checks += 1
+        return checks == 1       # planning allowed; pre-publication denied
+
+    result = ss.sync_store(
+        {"url": "u", "key": "k"}, "builds", allow_item=allow_item,
+    )
+
+    assert result["pulled"] == 0
+    assert checks == 2
+    assert not ss.STORES["builds"]["path"]().exists()
+
+
+def test_sync_store_rechecks_policy_before_cloud_catalogue_write(fake_cloud):
+    path = ss.STORES["builds"]["path"]()
+    lib.save_json(path, {
+        "book": {"id": "book", "title": "Local", "updated_at": T1},
+    })
+    checks = 0
+
+    def allow_item(item_id):
+        nonlocal checks
+        assert item_id == "book"
+        checks += 1
+        return checks == 1       # planning allowed; pre-publication denied
+
+    result = ss.sync_store(
+        {"url": "u", "key": "k"}, "builds", allow_item=allow_item,
+    )
+
+    assert result["pushed"] == 0
+    assert checks == 2
+    assert fake_cloud.tables.get("builds", {}) == {}
+
+
+def test_sync_store_policy_fails_closed_for_invalid_values(fake_cloud):
+    path = ss.STORES["builds"]["path"]()
+    record = {"id": "book", "title": "Local", "updated_at": T1}
+    lib.save_json(path, {"book": record})
+
+    with pytest.raises(TypeError, match="allow_item must be callable"):
+        ss.sync_store({"url": "u", "key": "k"}, "builds", allow_item=True)
+    with pytest.raises(TypeError, match="return a boolean"):
+        ss.sync_store(
+            {"url": "u", "key": "k"},
+            "builds",
+            allow_item=lambda _item_id: "yes",
+        )
+
+    assert fake_cloud.tables.get("builds", {}) == {}
+    assert lib.load_json(path, {}) == {"book": record}
+
+
+def test_sync_stores_validates_policy_before_any_store_io(fake_cloud, monkeypatch):
+    reads = []
+
+    def observe_read(cfg, table, pk):
+        reads.append(table)
+        return []
+
+    monkeypatch.setattr(ss.sbase, "list_store_rows", observe_read)
+    with pytest.raises(TypeError, match="allow_item must be callable"):
+        ss.sync_stores({"url": "u", "key": "k"}, allow_item={"book"})
+    assert reads == []
+
+
+def test_sync_stores_applies_item_policy_only_to_build_catalogue(fake_cloud):
+    lib.save_json(ss.STORES["builds"]["path"](), {
+        "deleted": {"id": "deleted", "title": "Build", "updated_at": T1},
+    })
+    lib.save_json(ss.STORES["ia_catalog"]["path"](), {
+        "source": {"identifier": "source", "title": "IA",
+                   "downloaded_at": T1},
+    })
+    seen = []
+
+    def allow_item(item_id):
+        seen.append(item_id)
+        return item_id != "deleted"
+
+    result = ss.sync_stores(
+        {"url": "u", "key": "k"}, allow_item=allow_item,
+    )
+
+    assert result["builds"]["pushed"] == 0
+    assert result["ia_catalog"]["pushed"] == 1
+    assert seen == ["deleted"]
+    assert fake_cloud.tables.get("builds", {}) == {}
+    assert fake_cloud.tables["ia_catalog"]["source"]["data"]["title"] == "IA"
+
+
+def test_sync_store_policy_requires_outer_gate_for_atomicity(fake_cloud, monkeypatch):
+    """A callback cannot close the interval after its final allowed result."""
+    path = ss.STORES["builds"]["path"]()
+    lib.save_json(path, {
+        "book": {"id": "book", "title": "Local", "updated_at": T1},
+    })
+    live = True
+    upsert = fake_cloud.upsert_store_rows
+
+    def race_after_final_check(cfg, table, pk, rows, chunk=200):
+        nonlocal live
+        live = False
+        return upsert(cfg, table, pk, rows, chunk=chunk)
+
+    monkeypatch.setattr(ss.sbase, "upsert_store_rows", race_after_final_check)
+    result = ss.sync_store(
+        {"url": "u", "key": "k"},
+        "builds",
+        allow_item=lambda _item_id: live,
+    )
+
+    # The lifecycle change happened after the final callback result.  Server
+    # integration must prevent this race with the shared outer workspace gate.
+    assert result["pushed"] == 1
+    assert fake_cloud.tables["builds"]["book"]["data"]["title"] == "Local"
+    assert "lifecycle/workspace gate" in (ss.sync_store.__doc__ or "")
+
+
+def test_sync_store_policy_guard_holds_each_catalogue_publication_phase(
+    fake_cloud,
+    monkeypatch,
+):
+    path = ss.STORES["builds"]["path"]()
+    lib.save_json(path, {
+        "book": {"id": "book", "title": "Local", "updated_at": T1},
+    })
+    fake_cloud.tables["builds"] = {
+        "remote": {
+            "id": "remote",
+            "data": {"id": "remote", "title": "Cloud", "updated_at": T2},
+            "updated_at": T2,
+            "deleted": False,
+        },
+    }
+    held = False
+    events = []
+    upsert = fake_cloud.upsert_store_rows
+    save_json = ss.lib.save_json
+
+    @contextmanager
+    def policy_guard():
+        nonlocal held
+        assert held is False
+        held = True
+        events.append("enter")
+        try:
+            yield lambda item_id: item_id != "deleted"
+        finally:
+            held = False
+            events.append("exit")
+
+    def guarded_upsert(cfg, table, pk, rows, chunk=200):
+        assert held is True
+        return upsert(cfg, table, pk, rows, chunk=chunk)
+
+    def guarded_save(target, value):
+        assert held is True
+        return save_json(target, value)
+
+    monkeypatch.setattr(ss.sbase, "upsert_store_rows", guarded_upsert)
+    monkeypatch.setattr(ss.lib, "save_json", guarded_save)
+    result = ss.sync_store(
+        {"url": "u", "key": "k"},
+        "builds",
+        item_policy_guard=policy_guard,
+    )
+
+    assert result["pushed"] == result["pulled"] == 1
+    assert fake_cloud.tables["builds"]["book"]["data"]["title"] == "Local"
+    assert lib.load_json(path, {})["remote"]["title"] == "Cloud"
+    assert held is False
+    assert events == ["enter", "exit"] * 2
+
+
+def test_sync_stores_validates_policy_guard_before_any_store_io(
+    fake_cloud,
+    monkeypatch,
+):
+    reads = []
+
+    def observe_read(_cfg, table, _pk):
+        reads.append(table)
+        return []
+
+    monkeypatch.setattr(ss.sbase, "list_store_rows", observe_read)
+    with pytest.raises(TypeError, match="item_policy_guard must be callable"):
+        ss.sync_stores(
+            {"url": "u", "key": "k"}, item_policy_guard=True
+        )
+    with pytest.raises(TypeError, match="mutually exclusive"):
+        ss.sync_stores(
+            {"url": "u", "key": "k"},
+            allow_item=lambda _item_id: True,
+            item_policy_guard=lambda: None,
+        )
+    with pytest.raises(ValueError, match="second builds lock"):
+        ss.sync_stores(
+            {"url": "u", "key": "k"},
+            locks={"builds": object()},
+            item_policy_guard=lambda: None,
+        )
+    with pytest.raises(ValueError, match="second builds lock"):
+        ss.sync_store(
+            {"url": "u", "key": "k"},
+            "builds",
+            lock=object(),
+            item_policy_guard=lambda: None,
+        )
+    assert reads == []
 
 
 def test_sync_store_full_cycle(fake_cloud):
@@ -450,20 +936,94 @@ def test_sync_stores_isolates_a_failing_store(fake_cloud, monkeypatch):
                                  "deleted": 0, "in_sync": 0, "guard": ""}
 
 
+def test_server_cloud_sync_policy_guard_holds_casefold_index(monkeypatch):
+    import server
+
+    held = False
+    events = []
+
+    class Lifecycle:
+        @contextmanager
+        def deletion_index_guard(self):
+            nonlocal held
+            assert held is False
+            held = True
+            events.append("enter")
+            try:
+                yield ItemLifecycleDeletionIndex(("Deleted",))
+            finally:
+                held = False
+                events.append("exit")
+
+    monkeypatch.setattr(server, "_item_lifecycle_engine", Lifecycle)
+
+    with server._cloud_sync_item_policy_guard() as allows:
+        assert held is True
+        assert allows("Deleted") is False
+        assert allows("deleted") is False
+        assert allows("DELETED") is False
+        assert allows("deleted-extra") is True
+
+    assert held is False
+    assert events == ["enter", "exit"]
+
+
 def test_cloud_sync_pass_carries_the_stores(fake_cloud, monkeypatch):
     """The server's sync pass: stores merge inside it, results in the report."""
     import server
 
     state = lib.load_json(lib.CLIENT_STATE_PATH, {})
     settings = dict(state.get("settings") or {})
-    state["settings"] = dict(settings, supabaseUrl="https://x.supabase.co",
-                             supabaseKey="k")
+    state["settings"] = dict(settings, supabaseUrl="https://x.supabase.co")
     lib.save_json(lib.CLIENT_STATE_PATH, state)
     monkeypatch.setattr(server, "_refresh_collection_aliases",
                         lambda _cfg, _token: [])
     monkeypatch.setattr(server.sbase, "list_pending_captures",
                         lambda cfg, limit=50: [])
     monkeypatch.setattr(server.sbase, "push_books", lambda cfg, rows: len(rows))
+    real_sync_stores = server.store_sync.sync_stores
+    calls = []
+
+    def observed_sync_stores(cfg, **kwargs):
+        calls.append(("stores", cfg, kwargs))
+        assert "builds" not in kwargs["locks"]
+        assert kwargs["item_policy_guard"] is (
+            server._cloud_sync_item_policy_guard
+        )
+        return real_sync_stores(cfg, **kwargs)
+
+    entry_result = {
+        "pushed": 0,
+        "pulled": 0,
+        "in_sync": 0,
+        "suppressed": 0,
+    }
+
+    def observed_sync_entry_files(cfg, **kwargs):
+        calls.append(("entries", cfg, kwargs))
+        assert kwargs["item_policy_guard"] is (
+            server._cloud_sync_item_policy_guard
+        )
+        return entry_result
+
+    monkeypatch.setattr(
+        server.store_sync, "sync_stores", observed_sync_stores
+    )
+    monkeypatch.setattr(
+        server.store_sync, "sync_entry_files", observed_sync_entry_files
+    )
+    @contextmanager
+    def cloud_lease():
+        yield {"url": "https://x.supabase.co", "key": "leased-owner"}
+
+    @contextmanager
+    def r2_lease():
+        yield {"bucket": "test", "key_id": "leased-id",
+               "secret": "leased-secret"}
+
+    monkeypatch.setattr(server, "_lease_cloud_cfg", cloud_lease)
+    monkeypatch.setattr(server, "_lease_r2_cfg", r2_lease)
+    monkeypatch.setattr(server.r2, "configured", lambda _cfg: True)
     lib.save_json(ss.STORES["builds"]["path"](),
                   {"b1": {"id": "b1", "title": "One", "updated_at": T1}})
     try:
@@ -473,8 +1033,9 @@ def test_cloud_sync_pass_carries_the_stores(fake_cloud, monkeypatch):
         lib.save_json(lib.CLIENT_STATE_PATH, state)
     assert res["ok"] is True, res
     assert res["stores"]["builds"]["pushed"] == 1
-    assert res["entries"] == {"skipped": "R2 not configured"}
+    assert res["entries"] == entry_result
     assert fake_cloud.tables["builds"]["b1"]["data"]["title"] == "One"
+    assert [call[0] for call in calls] == ["stores", "entries"]
 
 
 def test_corrections_sync_survives_the_id_backfill(fake_cloud):
@@ -488,3 +1049,13 @@ def test_corrections_sync_survives_the_id_backfill(fake_cloud):
     assert f"add:{rid}" in fake_cloud.tables["corrections"]
     res = ss.sync_store({"url": "u", "key": "k"}, "corrections")
     assert res["pushed"] == 0 and res["in_sync"] == 2
+
+
+def test_standalone_cli_refuses_mutation_before_credentials_or_io(monkeypatch):
+    def unexpected_config_read():
+        pytest.fail("mutating CLI inspected credentials before refusing")
+
+    monkeypatch.setattr(ss, "_cli_cfg", unexpected_config_read)
+
+    with pytest.raises(SystemExit, match="item-lifecycle guard"):
+        ss.main(["sync", "--run"])

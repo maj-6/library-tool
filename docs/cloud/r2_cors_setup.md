@@ -61,15 +61,14 @@ All steps except #4 are one-time.
    ```bash
    # dry run first — read-only, the anon key is enough
    python3 tools/fix_pdf_url_host.py --to https://files.<yourdomain>
-   # then write (service_role key required: Settings > Credentials >
-   # Owner publishing & storage > Owner service key, or SUPABASE_KEY env)
+   # then write (service_role key required in SUPABASE_KEY)
    python3 tools/fix_pdf_url_host.py --to https://files.<yourdomain> --apply
    ```
 
    `--from <host>` restricts the rewrite to rows still on that old host. The
-   script refuses `--apply` unless the configured key actually decodes to
-   `service_role`, and warns when `--to` is an r2.dev host — which can never
-   serve CORS.
+   standalone script reads `SUPABASE_KEY` only from the environment, refuses
+   `--apply` unless it decodes to `service_role`, and warns when `--to` is an
+   r2.dev host — which can never serve CORS.
 
 5. **Verify.** The CORS header should now be present, and the reader should load:
 

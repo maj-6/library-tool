@@ -1,4 +1,5 @@
 import { latestReleases, usingCloud, safeHttpUrl } from "./data.js";
+import { isPublicRelease, isStableRelease, releaseChannel } from "./release-policy.js";
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -46,7 +47,7 @@ function card(r, opts = {}) {
   const href = safeHttpUrl(r.url);
   const meta = [p.note, r.version && `v${esc(r.version)}`, bytes(r.bytes), day(r.published_at)]
     .filter(Boolean).join(" · ");
-  const chan = (r.channel || "").trim();
+  const chan = releaseChannel(r) || "";
   const isPre = opts.channel && chan && chan !== "stable";
   const tag = isPre
     ? ` <span class="dl-tag is-pre">${esc(chan)}</span>`
@@ -71,7 +72,7 @@ function card(r, opts = {}) {
 function newest(rows) {
   const best = new Map();
   for (const r of rows) {
-    const k = `${r.platform}/${r.channel}`;
+    const k = `${r.platform}/${releaseChannel(r)}`;
     if (!best.has(k)) best.set(k, r);            // already ordered newest-first
   }
   return [...best.values()];
@@ -89,14 +90,16 @@ function ordered(rows) {
 // A row is stable unless it carries a non-stable channel (alpha/beta/rc). The
 // releases query returns every channel, so the main list MUST filter to stable —
 // otherwise a published testing build would leak in as an unlabelled duplicate.
-const isStable = (r) => !(r.channel || "").trim() || (r.channel || "").trim() === "stable";
-
 const box = document.getElementById("releases");
 const preBox = document.getElementById("prereleases");
 try {
-  const all = usingCloud ? ordered(newest(await latestReleases())) : [];
-  const stable = all.filter(isStable);
-  const pre = all.filter((r) => !isStable(r));
+  // Fail closed on manually inserted/internal channels and artifacts explicitly
+  // labelled DONOTPUBLISH. Filtering before newest() lets an older valid row
+  // remain visible when a bad row was inserted later.
+  const rows = usingCloud ? (await latestReleases()).filter(isPublicRelease) : [];
+  const all = ordered(newest(rows));
+  const stable = all.filter(isStableRelease);
+  const pre = all.filter((r) => !isStableRelease(r));
 
   box.innerHTML = stable.length
     ? `<div class="dl-list">${stable.map((r) => card(r)).join("")}</div>`

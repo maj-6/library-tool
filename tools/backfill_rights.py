@@ -12,18 +12,19 @@ never invents one; decide in the desktop Editor (Rights) and re-run.
     python3 tools/backfill_rights.py            # dry run
     python3 tools/backfill_rights.py --apply
 
-Credentials come from the desktop's settings (output/client_state.json), or
-from SUPABASE_URL / SUPABASE_KEY in the environment. They are never printed.
+Set SUPABASE_KEY in the environment. SUPABASE_URL is optional for the built-in
+project and required when targeting another one. Credentials are never read
+from desktop state or printed.
 """
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cli_credentials          # noqa: E402
 import cloud_defaults            # noqa: E402
 import libcommon as lib          # noqa: E402
 import supabase_sync as sb       # noqa: E402
@@ -105,17 +106,9 @@ def apply_rights(cfg: dict, slug: str, rights: str) -> None:
 
 
 def config() -> dict:
-    url = os.environ.get("SUPABASE_URL", "")
-    key = os.environ.get("SUPABASE_KEY", "")
-    if not (url and key):
-        state = lib.load_json(lib.CLIENT_STATE_PATH, {}).get("settings", {})
-        url = url or str(state.get("supabaseUrl") or "")
-        key = key or str(state.get("supabaseKey") or "")
-    url = url or cloud_defaults.SUPABASE_URL   # the key is a secret; the URL isn't
-    if not key:
-        sys.exit("No Supabase service key. Set it in Settings > Sync, or export "
-                 "SUPABASE_URL and SUPABASE_KEY.")
-    return {"url": url.rstrip("/"), "key": key}
+    return cli_credentials.supabase_service_config(
+        default_url=cloud_defaults.SUPABASE_URL
+    )
 
 
 def main() -> None:

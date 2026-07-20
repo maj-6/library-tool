@@ -183,6 +183,10 @@ class RepresentationView:
     label: str = ""
     canvas_count: int | None = None
     available: bool = True
+    disposition: str = "referenced"
+    content_state: str = "untracked"
+    content_sha256: str = ""
+    size: int | None = None
     metadata: JsonMapping = field(default_factory=lambda: _EMPTY_MAPPING)
 
     def as_dict(self) -> dict[str, Any]:
@@ -194,6 +198,10 @@ class RepresentationView:
             "locator": self.locator,
             "label": self.label,
             "available": self.available,
+            "disposition": self.disposition,
+            "content_state": self.content_state,
+            "content_sha256": self.content_sha256,
+            "size": self.size,
             "metadata": _thaw(self.metadata),
         }
         if self.canvas_count is not None:
@@ -601,6 +609,9 @@ class ItemQueryService:
         known = {
             "available",
             "canvas_count",
+            "content_sha256",
+            "content_state",
+            "disposition",
             "id",
             "label",
             "locator",
@@ -613,6 +624,7 @@ class ItemQueryService:
             "revision",
             "role",
             "source_id",
+            "size",
             "updated_at",
             "uri",
         }
@@ -627,6 +639,10 @@ class ItemQueryService:
                 raw.get("canvas_count") if "canvas_count" in raw else raw.get("pages")
             ),
             available=available,
+            disposition=str(raw.get("disposition") or "referenced"),
+            content_state=str(raw.get("content_state") or "untracked"),
+            content_sha256=str(raw.get("content_sha256") or ""),
+            size=_positive_int(raw.get("size")),
             metadata=_metadata(raw, known),
         )
 
@@ -763,7 +779,10 @@ class ItemQueryService:
             issues.append("representation.missing")
         elif readiness["source"] == "unavailable":
             issues.append("representation.unavailable")
-        commands = {"item.metadata.edit", "representation.attach"}
+        # Mutation eligibility belongs to the installed command modules.  Core
+        # query facts advertise only inspections that are possible from the
+        # returned state; optional command policies contribute edit actions.
+        commands: set[str] = set()
         if artifacts:
             commands.add("artifact.inspect")
         if representations:

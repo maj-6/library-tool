@@ -15,11 +15,18 @@ from .capabilities import (
     ModuleManifest,
     WorkbenchManifest,
 )
-from .interchange import LibInterchangeService
+from .canvases import CanvasQueryService
+from .canvas_commands import CanvasPreparationService
+from .interchange import LibInterchangeService, OpenLibService
 from .item_commands import ItemCommandService
+from .item_lifecycle import ItemLifecycleService
 from .items import ItemQueryService, WorkbenchPolicyPort
 from .jobs import JobManager
+from .providers import ProviderDiscoveryService
 from .replica import ReplicaApplicationService
+from .representation_commands import RepresentationCommandService
+from .secret_store import SecretStoreService
+from .text_layer_aggregate import TextLayerAggregateService
 from .text_layers import TextLayerService
 from .translations import TranslationProvenanceService, TranslationService
 
@@ -418,18 +425,42 @@ class ModuleContribution:
 ITEM_QUERY_SERVICE: ServiceKey[ItemQueryService] = ServiceKey(
     "library.items.query"
 )
+CANVAS_QUERY_SERVICE: ServiceKey[CanvasQueryService] = ServiceKey(
+    "library.canvases.query"
+)
+CANVAS_PREPARATION_SERVICE: ServiceKey[CanvasPreparationService] = ServiceKey(
+    "library.canvases.prepare"
+)
+SECRET_STORE_SERVICE: ServiceKey[SecretStoreService] = ServiceKey(
+    "library.secrets"
+)
 ITEM_COMMAND_SERVICE: ServiceKey[ItemCommandService] = ServiceKey(
     "library.items.commands"
+)
+ITEM_LIFECYCLE_SERVICE: ServiceKey[ItemLifecycleService] = ServiceKey(
+    "library.items.lifecycle"
+)
+REPRESENTATION_COMMAND_SERVICE: ServiceKey[RepresentationCommandService] = (
+    ServiceKey("library.representations.commands")
 )
 INTERCHANGE_SERVICE: ServiceKey[LibInterchangeService] = ServiceKey(
     "replica.interchange"
 )
+LIB_OPEN_SERVICE: ServiceKey[OpenLibService] = ServiceKey(
+    "replica.interchange.open"
+)
 JOB_SERVICE: ServiceKey[JobManager] = ServiceKey("library.jobs")
+PROVIDER_DISCOVERY_SERVICE: ServiceKey[ProviderDiscoveryService] = ServiceKey(
+    "library.providers.discovery"
+)
 REPLICA_SERVICE: ServiceKey[ReplicaApplicationService] = ServiceKey(
     "replica.application"
 )
 TEXT_LAYER_SERVICE: ServiceKey[TextLayerService] = ServiceKey(
     "replica.text-layers"
+)
+TEXT_LAYER_AGGREGATE_SERVICE: ServiceKey[TextLayerAggregateService] = (
+    ServiceKey("library.text-layers.aggregate")
 )
 TRANSLATION_SERVICE: ServiceKey[TranslationService] = ServiceKey(
     "translation.application"
@@ -597,26 +628,66 @@ class LibraryEngineBuilder:
                 else binding
                 for binding in active_bindings
             ]
+        provider_binding = next(
+            (
+                binding
+                for binding in active_bindings
+                if binding.key == PROVIDER_DISCOVERY_SERVICE
+            ),
+            None,
+        )
+        if provider_binding is not None:
+            if not isinstance(
+                provider_binding.service,
+                ProviderDiscoveryService,
+            ):
+                raise ServiceRegistryError(
+                    "provider discovery requires a ProviderDiscoveryService "
+                    "binding"
+                )
+            configured_providers = (
+                provider_binding.service.with_executable_capabilities(
+                    active_capabilities
+                )
+            )
+            active_bindings = [
+                ServiceBinding(
+                    binding.key,
+                    configured_providers,
+                    binding.capabilities,
+                )
+                if binding is provider_binding
+                else binding
+                for binding in active_bindings
+            ]
         services = ServiceRegistry(active_bindings)
         return LibraryEngine(capabilities=capabilities, services=services)
 
 
 __all__ = [
+    "CANVAS_PREPARATION_SERVICE",
+    "CANVAS_QUERY_SERVICE",
     "DuplicateServiceError",
     "INTERCHANGE_SERVICE",
+    "LIB_OPEN_SERVICE",
     "ITEM_COMMAND_SERVICE",
+    "ITEM_LIFECYCLE_SERVICE",
     "ITEM_QUERY_SERVICE",
     "JOB_SERVICE",
     "LibraryEngine",
     "LibraryEngineBuilder",
     "ModuleContribution",
+    "PROVIDER_DISCOVERY_SERVICE",
     "REPLICA_SERVICE",
+    "REPRESENTATION_COMMAND_SERVICE",
+    "SECRET_STORE_SERVICE",
     "ServiceBinding",
     "ServiceKey",
     "ServiceNotFoundError",
     "ServiceRegistry",
     "ServiceRegistryError",
     "TEXT_LAYER_SERVICE",
+    "TEXT_LAYER_AGGREGATE_SERVICE",
     "TRANSLATION_PROVENANCE_SERVICE",
     "TRANSLATION_SERVICE",
     "WorkbenchPolicyBinding",

@@ -44,6 +44,42 @@ def _visual_source_available(context: WorkbenchContext) -> bool:
     )
 
 
+class CatalogueCommandWorkbenchPolicy:
+    policy_id = "catalogue-commands"
+
+    def contribute(self, context: WorkbenchContext) -> WorkbenchContribution:
+        del context
+        return WorkbenchContribution(
+            available_commands=("item.metadata.edit",),
+        )
+
+
+class ItemLifecycleWorkbenchPolicy:
+    """Advertise deletion for live items when the lifecycle module is active.
+
+    Restore belongs to a tombstone/global view and is intentionally absent
+    from an individual live item's command state.
+    """
+
+    policy_id = "item-lifecycle"
+
+    def contribute(self, context: WorkbenchContext) -> WorkbenchContribution:
+        del context
+        return WorkbenchContribution(available_commands=("item.delete",))
+
+
+class RepresentationCommandWorkbenchPolicy:
+    policy_id = "representation-commands"
+
+    def contribute(self, context: WorkbenchContext) -> WorkbenchContribution:
+        commands = ["representation.attach"]
+        if context.representations:
+            commands.extend(("representation.replace", "representation.detach"))
+        return WorkbenchContribution(
+            available_commands=tuple(commands),
+        )
+
+
 def _artifact_issues(section: str, readiness: str, *, missing: bool) -> tuple[str, ...]:
     if readiness == "stale":
         return (f"{section}.stale",)
@@ -144,6 +180,8 @@ def standard_workbench_policies() -> tuple[WorkbenchPolicyPort, ...]:
     """
 
     return (
+        CatalogueCommandWorkbenchPolicy(),
+        RepresentationCommandWorkbenchPolicy(),
         TextLayerWorkbenchPolicy(),
         OcrWorkbenchPolicy(),
         TranslationWorkbenchPolicy(),
@@ -155,9 +193,12 @@ def standard_workbench_policies() -> tuple[WorkbenchPolicyPort, ...]:
 
 
 __all__ = [
+    "CatalogueCommandWorkbenchPolicy",
+    "ItemLifecycleWorkbenchPolicy",
     "OcrWorkbenchPolicy",
     "PublishingWorkbenchPolicy",
     "ReplicaWorkbenchPolicy",
+    "RepresentationCommandWorkbenchPolicy",
     "ResearchWorkbenchPolicy",
     "TextLayerWorkbenchPolicy",
     "TranslationWorkbenchPolicy",

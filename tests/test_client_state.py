@@ -119,27 +119,6 @@ def test_legacy_azure_key_never_leaves_client_state_api(client, data_root):
     assert stored["settings"] == {"theme": "light"}
 
 
-def test_legacy_azure_key_migrates_to_local_secret_store(data_root):
-    import server
-
-    _reset(data_root)
-    server._SECRETS_PATH.unlink(missing_ok=True)
-    path = _state_path(data_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({
-        "settings": {"theme": "dark", "ocrAzureKey": "legacy-secret"},
-    }), encoding="utf-8")
-
-    server._migrate_secrets_from_client_state()
-
-    assert json.loads(path.read_text(encoding="utf-8"))["settings"] == {
-        "theme": "dark",
-    }
-    assert json.loads(server._SECRETS_PATH.read_text(encoding="utf-8"))[
-        "ocrAzureKey"] == "legacy-secret"
-    server._SECRETS_PATH.unlink(missing_ok=True)
-
-
 def test_partial_put_replaces_only_the_sent_top_level_key(client, data_root):
     _reset(data_root)
     client.put(

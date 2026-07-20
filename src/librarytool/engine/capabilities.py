@@ -21,6 +21,7 @@ _SEMVER_RE = re.compile(
     r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
 )
+_MAX_JSON_SAFE_INTEGER = 9_007_199_254_740_991
 
 
 class ManifestValidationError(ValueError):
@@ -63,10 +64,14 @@ class CapabilityRef:
 
     def __post_init__(self) -> None:
         _validate_id(self.id, "capability id")
-        if (not isinstance(self.version, int) or isinstance(self.version, bool)
-                or self.version < 1):
+        if (
+            not isinstance(self.version, int)
+            or isinstance(self.version, bool)
+            or self.version < 1
+            or self.version > _MAX_JSON_SAFE_INTEGER
+        ):
             raise ManifestValidationError(
-                "capability version must be a positive integer"
+                "capability version must be a JSON-safe positive integer"
             )
 
     def as_dict(self) -> dict[str, object]:

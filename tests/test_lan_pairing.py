@@ -1,6 +1,16 @@
 """Authenticated Android-to-desktop LAN pairing and capture receipts."""
 
+import contextlib
 import io
+import inspect
+
+
+def test_lan_listener_log_never_reads_or_prints_the_pairing_token():
+    import server
+
+    source = inspect.getsource(server._apply_lan_state)
+    assert "_lan_token()" not in source
+    assert "token=" not in source
 
 
 def test_lan_pair_requires_token_and_echoes_fresh_nonce(monkeypatch, data_root):
@@ -40,6 +50,9 @@ def test_lan_capture_returns_branded_matching_receipt(monkeypatch, data_root):
 
     monkeypatch.setattr(server, "_lan_token", lambda: "paired-secret")
     monkeypatch.setattr(server, "_client_settings", lambda: {})
+    monkeypatch.setattr(server, "_lease_secret", lambda key:
+                        contextlib.nullcontext("leased-mistral")
+                        if key == "mistralKey" else None)
     monkeypatch.setattr(
         server,
         "ingest_capture",

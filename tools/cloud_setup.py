@@ -11,8 +11,9 @@ docs/cloud/migrations/ into the Supabase SQL Editor, in order; `check` names
 the pending ones. Everything else this script does directly, because the
 Storage and REST APIs both accept the service_role key.
 
-Credentials come from the desktop's settings (output/client_state.json), or from
-SUPABASE_URL / SUPABASE_KEY in the environment. They are never printed.
+Set SUPABASE_KEY in the environment for owner operations. SUPABASE_URL is
+optional for the built-in project and required when targeting another one.
+Credentials are never read from desktop state or printed.
 """
 from __future__ import annotations
 
@@ -24,6 +25,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cli_credentials          # noqa: E402
 import cloud_defaults            # noqa: E402
 import libcommon as lib          # noqa: E402
 import supabase_sync as sb       # noqa: E402
@@ -44,17 +46,9 @@ ANON_CANNOT = ["profiles", "events", "captures", "passages", "collections"]
 
 
 def config() -> dict:
-    url = os.environ.get("SUPABASE_URL", "")
-    key = os.environ.get("SUPABASE_KEY", "")
-    if not (url and key):
-        state = lib.load_json(lib.CLIENT_STATE_PATH, {}).get("settings", {})
-        url = url or str(state.get("supabaseUrl") or "")
-        key = key or str(state.get("supabaseKey") or "")
-    url = url or cloud_defaults.SUPABASE_URL   # the key is a secret; the URL isn't
-    if not key:
-        sys.exit("No Supabase service key. Set it in Settings > Sync, or export "
-                 "SUPABASE_URL and SUPABASE_KEY.")
-    return {"url": url.rstrip("/"), "key": key}
+    return cli_credentials.supabase_service_config(
+        default_url=cloud_defaults.SUPABASE_URL
+    )
 
 
 def key_role(key: str) -> str:
@@ -153,10 +147,7 @@ def anon_selects(cfg: dict, table: str) -> bool:
 
 def anon_config(cfg: dict) -> dict | None:
     """The anon-key twin of config(), for the role smoke tests."""
-    key = os.environ.get("SUPABASE_ANON_KEY", "")
-    if not key:
-        state = lib.load_json(lib.CLIENT_STATE_PATH, {}).get("settings", {})
-        key = str(state.get("supabaseAnonKey") or "")
+    key = str(os.environ.get("SUPABASE_ANON_KEY") or "").strip()
     if not key and cfg["url"] == cloud_defaults.SUPABASE_URL:
         key = cloud_defaults.SUPABASE_ANON_KEY
     return {"url": cfg["url"], "key": key} if key else None
@@ -244,7 +235,7 @@ def cmd_check(args) -> None:
     print("\nanon role")
     anon = anon_config(cfg)
     if anon is None:
-        print("  skipped — no anon key (set SUPABASE_ANON_KEY, or Settings > Sync)")
+        print("  skipped — no anon key (set SUPABASE_ANON_KEY)")
     else:
         for t in ANON_CAN:
             ok = anon_selects(anon, t)
@@ -410,13 +401,7 @@ def cmd_r2(args) -> None:
     import urllib.request
     import urllib.error
 
-    s = lib.load_json(lib.CLIENT_STATE_PATH, {}).get("settings", {})
-    cfg = {"account": str(s.get("r2Account") or ""), "bucket": str(s.get("r2Bucket") or ""),
-           "key_id": str(s.get("r2KeyId") or ""), "secret": str(s.get("r2Secret") or ""),
-           "public_base": str(s.get("r2PublicBase") or "")}
-    if not r2.configured(cfg):
-        sys.exit("R2 is not configured (Settings > Sync). Published PDFs would go "
-                 "to Supabase storage instead.")
+    cfg = cli_credentials.r2_config(require_public_base=True)
 
     print("buckets:", r2.list_buckets(cfg))
     if cfg["bucket"] not in r2.list_buckets(cfg):

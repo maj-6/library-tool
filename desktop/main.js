@@ -17,6 +17,7 @@ const path = require("path");
 const http = require("http");
 const net = require("net");
 const fs = require("fs");
+const crypto = require("crypto");
 
 let sidecar = null;
 let mainWindow = null;
@@ -24,9 +25,205 @@ let startupWin = null;        // immediate launch feedback while the sidecar/UI 
 let startupClosing = false;
 let updaterWin = null;        // frameless update splash, shown only while updating
 let sidecarPort = null;
+let sidecarCapability = null;
 let mainReady = false;        // gates window-all-closed: don't quit mid-startup
 
+const DESKTOP_CAPABILITY_HEADER = "X-WHL-Desktop-Capability";
+const DESKTOP_CAPABILITY_RE = /^[A-Za-z0-9_-]{43}$/;
+const authenticatedResourceLoads = new Map();
+const resourceWindows = new Set();
+
 const isDev = !app.isPackaged;
+
+// --- Testable desktop transport policy ----------------------------------------
+function createDesktopCapability(randomBytes = crypto.randomBytes) {
+  const capability = randomBytes(32).toString("base64url");
+  if (!DESKTOP_CAPABILITY_RE.test(capability)) {
+    throw new Error("could not create desktop transport capability");
+  }
+  return capability;
+}
+
+function parseUrl(value) {
+  try { return new URL(value); } catch (e) { return null; }
+}
+
+function isTrustedAppDocumentUrl(value, origin) {
+  const url = parseUrl(value);
+  return !!url && url.origin === origin && url.pathname === "/" &&
+    !url.search && !url.username && !url.password;
+}
+
+function isSidecarApiUrl(value, origin) {
+  const url = parseUrl(value);
+  return !!url && url.origin === origin && url.pathname.startsWith("/api/") &&
+    !url.username && !url.password;
+}
+
+function classifyAuthenticatedResource(value, origin) {
+  let target;
+  try { target = new URL(value, origin + "/"); } catch (e) { return null; }
+  if (target.origin !== origin || target.username || target.password) return null;
+  target.hash = "";
+  const keys = Array.from(target.searchParams.keys());
+  const hasOnly = (...allowed) => keys.every((key) => allowed.includes(key)) &&
+    keys.every((key) => target.searchParams.getAll(key).length === 1);
+
+  if (target.pathname === "/api/pdf") {
+    if (!hasOnly("path", "url", "preview", "pages")) return null;
+    const pathValue = target.searchParams.get("path");
+    const urlValue = target.searchParams.get("url");
+    if (!!pathValue === !!urlValue) return null;
+    const preview = target.searchParams.get("preview");
+    if (target.searchParams.has("preview") && preview !== "1") return null;
+    if (target.searchParams.has("pages")) {
+      const pages = target.searchParams.get("pages");
+      if (preview !== "1" || !/^(?:[1-9]|[1-9][0-9]|[1-4][0-9]{2}|500)$/.test(pages)) {
+        return null;
+      }
+    }
+    return { url: target.href, mode: "exact-pdf" };
+  }
+  if (/^\/api\/builds\/[^/]+\/replica-print$/.test(target.pathname)) {
+    if (!hasOnly("src", "layer")) return null;
+    return { url: target.href, mode: "one-shot" };
+  }
+  if (/^\/api\/builds\/[^/]+\/ocr\/images\/[^/]+$/.test(target.pathname)) {
+    if (keys.length) return null;
+    return { url: target.href, mode: "one-shot" };
+  }
+  if (target.pathname === "/api/capture/image") {
+    if (!hasOnly("path") || !target.searchParams.get("path")) return null;
+    return { url: target.href, mode: "one-shot" };
+  }
+  return null;
+}
+
+const TRUSTED_APP_PERMISSIONS = new Set([
+  "clipboard-read",
+  "clipboard-sanitized-write",
+]);
+
+function shouldGrantTrustedAppPermission(permission, webContents, details, trust) {
+  return !!trust && TRUSTED_APP_PERMISSIONS.has(permission) &&
+    webContents === trust.webContents && !!details && details.isMainFrame === true &&
+    isTrustedAppDocumentUrl(details.requestingUrl, trust.origin);
+}
+
+function shouldAuthorizeApiRequest(details, trust) {
+  if (!details || !trust || !isSidecarApiUrl(details.url, trust.origin)) return false;
+  if (details.webContentsId !== trust.webContentsId) return false;
+  if (trust.exactResourceUrl) {
+    // Chromium's PDF viewer performs follow-up Range requests from an internal
+    // frame. The child webContents is the boundary: permit only GETs for the
+    // byte-for-byte identical PDF URL and nothing else for its lifetime.
+    return details.method === "GET" && details.url === trust.exactResourceUrl;
+  }
+  if (details.frame !== trust.mainFrame) return false;
+  if (trust.oneShotUrl) {
+    if (details.method !== "GET") return false;
+    if (details.resourceType === "mainFrame") return details.url === trust.oneShotUrl;
+    const grant = parseUrl(trust.oneShotUrl);
+    const requested = parseUrl(details.url);
+    const grantBuild = grant && grant.pathname.match(
+      /^\/api\/builds\/([^/]+)\/replica-print$/);
+    const requestedBuild = requested && requested.pathname.match(
+      /^\/api\/builds\/([^/]+)\/ocr\/images\/[^/]+$/);
+    return details.resourceType === "image" && details.frame.url === trust.oneShotUrl &&
+      !!grantBuild && !!requestedBuild && grantBuild[1] === requestedBuild[1];
+  }
+  return isTrustedAppDocumentUrl(details.frame && details.frame.url, trust.origin);
+}
+
+function capabilityHeaders(requestHeaders, capability, authorize) {
+  const headers = Object.assign({}, requestHeaders || {});
+  for (const name of Object.keys(headers)) {
+    if (name.toLowerCase() === DESKTOP_CAPABILITY_HEADER.toLowerCase()) delete headers[name];
+  }
+  if (authorize) headers[DESKTOP_CAPABILITY_HEADER] = capability;
+  return headers;
+}
+
+function createRequestChainTracker(maxEntries = 4096) {
+  if (!Number.isInteger(maxEntries) || maxEntries < 1) {
+    throw new Error("request-chain capacity must be a positive integer");
+  }
+  const chains = new Map();
+  const validId = (details) => details && Number.isInteger(details.id) && details.id >= 0;
+  const timestamp = (details) => Number.isFinite(details.timestamp) ? details.timestamp : 0;
+
+  return {
+    observe(details) {
+      if (!validId(details) || typeof details.url !== "string") return false;
+      const existing = chains.get(details.id);
+      if (existing) {
+        // onBeforeRequest is called again for a redirect. Treat any duplicate
+        // observation as tainted too: an unexpected re-entrant lifecycle must
+        // fail closed, never be mistaken for a fresh authorized request.
+        existing.redirected = true;
+        existing.currentUrl = details.url;
+        existing.lastTimestamp = timestamp(details);
+        return false;
+      }
+      if (chains.size >= maxEntries) return false;
+      chains.set(details.id, {
+        initialUrl: details.url,
+        currentUrl: details.url,
+        webContentsId: details.webContentsId,
+        frame: details.frame,
+        redirected: false,
+        lastTimestamp: timestamp(details),
+      });
+      return true;
+    },
+
+    redirect(details) {
+      if (!validId(details)) return false;
+      const chain = chains.get(details.id);
+      if (!chain) return false;
+      chain.redirected = true;
+      chain.currentUrl = typeof details.redirectURL === "string"
+        ? details.redirectURL : String(details.url || "");
+      chain.lastTimestamp = timestamp(details);
+      return true;
+    },
+
+    hasAuthorizedOrigin(details, origin) {
+      if (!validId(details) || typeof details.url !== "string") return false;
+      const chain = chains.get(details.id);
+      return !!chain && !chain.redirected && chain.initialUrl === details.url &&
+        chain.currentUrl === details.url &&
+        chain.webContentsId === details.webContentsId && chain.frame === details.frame &&
+        isSidecarApiUrl(chain.initialUrl, origin);
+    },
+
+    finish(details) {
+      if (!validId(details)) return false;
+      const chain = chains.get(details.id);
+      if (!chain) return false;
+      // A late completion from a reused request id must not erase its successor.
+      if (timestamp(details) < chain.lastTimestamp) {
+        return false;
+      }
+      chains.delete(details.id);
+      return true;
+    },
+
+    size() { return chains.size; },
+  };
+}
+// --- End testable desktop transport policy ------------------------------------
+
+function sidecarOrigin() {
+  return `http://127.0.0.1:${sidecarPort}`;
+}
+
+function isTrustedMainSender(event) {
+  return !!mainWindow && !mainWindow.isDestroyed() && event &&
+    event.sender === mainWindow.webContents &&
+    event.senderFrame === mainWindow.webContents.mainFrame &&
+    isTrustedAppDocumentUrl(event.senderFrame.url, sidecarOrigin());
+}
 
 // --- .lib open flow ------------------------------------------------------------
 // A double-clicked .lib (the NSIS file association) arrives as an argv entry on
@@ -64,6 +261,7 @@ function sendLibOpen(p) {
 }
 
 ipcMain.on("lib:ready", (event) => {
+  if (!isTrustedMainSender(event)) return;
   libReadySender = event.sender;   // re-set on reload, so delivery stays live
   // a webContents survives navigation/reload, so isDestroyed() alone can't tell
   // that the listener's isolated world is gone. Drop the sender when it starts
@@ -109,23 +307,30 @@ if (!gotSingleInstanceLock) {
 }
 
 // custom title-bar controls (the window is frameless) driven from the renderer
-ipcMain.on("win:minimize", () => mainWindow && mainWindow.minimize());
-ipcMain.on("win:toggle-maximize", () => {
+ipcMain.on("win:minimize", (event) => {
+  if (isTrustedMainSender(event)) mainWindow.minimize();
+});
+ipcMain.on("win:toggle-maximize", (event) => {
+  if (!isTrustedMainSender(event)) return;
   if (!mainWindow) return;
   if (mainWindow.isMaximized()) mainWindow.unmaximize();
   else mainWindow.maximize();
 });
-ipcMain.on("win:close", () => mainWindow && mainWindow.close());
+ipcMain.on("win:close", (event) => {
+  if (isTrustedMainSender(event)) mainWindow.close();
+});
 
 // Splash renderers signal only after their embedded icon and font have loaded,
 // preventing a visible fallback-font or blank-icon frame.
 ipcMain.on("startup:ready", (event) => {
-  if (startupWin && !startupWin.isDestroyed() && startupWin.webContents === event.sender) {
+  if (startupWin && !startupWin.isDestroyed() && startupWin.webContents === event.sender &&
+      startupWin.webContents.mainFrame === event.senderFrame) {
     startupWin.show();
   }
 });
 ipcMain.on("updater:ready", (event) => {
-  if (updaterWin && !updaterWin.isDestroyed() && updaterWin.webContents === event.sender) {
+  if (updaterWin && !updaterWin.isDestroyed() && updaterWin.webContents === event.sender &&
+      updaterWin.webContents.mainFrame === event.senderFrame) {
     updaterWin.show();
     closeStartupWindow();
   }
@@ -134,8 +339,21 @@ ipcMain.on("updater:ready", (event) => {
 // open a web link in the OS browser (the renderer routes external links here so
 // they don't get trapped in the app). Re-validate the scheme: shell.openExternal
 // will happily launch file:, smb:, mailto: handlers, so only http(s) passes.
-ipcMain.on("win:open-external", (_e, url) => {
-  if (typeof url === "string" && /^https?:\/\//i.test(url)) shell.openExternal(url);
+ipcMain.on("win:open-external", (event, url) => {
+  if (!isTrustedMainSender(event)) return;
+  const target = typeof url === "string" ? parseUrl(url) : null;
+  if (target && (target.protocol === "http:" || target.protocol === "https:") &&
+      !target.username && !target.password && target.origin !== sidecarOrigin()) {
+    shell.openExternal(target.href);
+  }
+});
+
+// Opening an authenticated top-level resource is privileged. The preload is
+// main-frame-only and this handler independently verifies the sender and a
+// deliberately small GET-only route allowlist before minting a window grant.
+ipcMain.on("resource:open", (event, url) => {
+  if (!isTrustedMainSender(event) || typeof url !== "string") return;
+  createAuthenticatedResourceWindow(url);
 });
 
 // a free loopback port so multiple installs / a running dev server never clash
@@ -195,11 +413,16 @@ async function choosePort() {
   return p;
 }
 
-function sidecarCommand(port, dataRoot) {
+function sidecarCommand(port, dataRoot, capability) {
+  if (!DESKTOP_CAPABILITY_RE.test(capability || "")) {
+    throw new Error("desktop transport capability is required");
+  }
   const env = Object.assign({}, process.env, {
     WHL_PORT: String(port),
     WHL_DATA_ROOT: dataRoot,
     WHL_APP_VERSION: app.getVersion(),   // so the UI shows the real shell version
+    WHL_DESKTOP_MODE: isDev ? "development" : "packaged",
+    WHL_DESKTOP_CAPABILITY: capability,
   });
   if (isDev) {
     // dev: run the Python source straight from the repo (../tools/...)
@@ -207,14 +430,14 @@ function sidecarCommand(port, dataRoot) {
     return {
       cmd: process.env.WHL_PYTHON || (process.platform === "win32" ? "python" : "python3"),
       args: [path.join(repo, "tools", "whl_explorer", "server.py")],
-      opts: { cwd: repo, env },
+      opts: { cwd: repo, env, windowsHide: true },
     };
   }
   // packaged: the frozen onedir sidecar lives in resources/sidecar/
   const exeName = process.platform === "win32"
     ? "whl-explorer-sidecar.exe" : "whl-explorer-sidecar";
   const exe = path.join(process.resourcesPath, "sidecar", exeName);
-  return { cmd: exe, args: [], opts: { env } };
+  return { cmd: exe, args: [], opts: { env, windowsHide: true } };
 }
 
 // --- Testable process/window lifecycle guards ---------------------------------
@@ -269,9 +492,14 @@ function superviseChildProcess(child, readiness, onUnexpectedEnd) {
 // tiny loopback JSON helpers for the quit guard (no fetch dep in main)
 function sidecarJson(method, apiPath, timeoutMs) {
   return new Promise((resolve, reject) => {
+    if (!DESKTOP_CAPABILITY_RE.test(sidecarCapability || "")) {
+      reject(new Error("desktop transport is unavailable"));
+      return;
+    }
     const req = http.request({
       host: "127.0.0.1", port: sidecarPort, path: apiPath, method,
       timeout: timeoutMs || 1500,
+      headers: { [DESKTOP_CAPABILITY_HEADER]: sidecarCapability },
     }, (res) => {
       let body = "";
       res.on("data", (d) => { body += d; });
@@ -331,14 +559,16 @@ async function confirmCloseWithJobs() {
   return true;                           // Quit anyway / after cancelling
 }
 
-// poll the sidecar's "/" until it answers (or we give up)
+// poll the sidecar's public readiness endpoint until it answers (or we give up)
 function waitForServer(port, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   return new Promise((resolve, reject) => {
     const tick = () => {
-      const req = http.get({ host: "127.0.0.1", port, path: "/", timeout: 1500 }, (res) => {
+      const req = http.get({ host: "127.0.0.1", port, path: "/healthz", timeout: 1500 }, (res) => {
         res.resume();
-        resolve();
+        if (res.statusCode === 200) resolve();
+        else if (Date.now() > deadline) reject(new Error("backend readiness was rejected"));
+        else setTimeout(tick, 300);
       });
       req.on("error", () => {
         if (Date.now() > deadline) reject(new Error("backend did not start in time"));
@@ -354,7 +584,8 @@ async function startSidecar() {
   const dataRoot = app.getPath("userData");   // %APPDATA%\Library Tool
   fs.mkdirSync(dataRoot, { recursive: true });
   sidecarPort = await choosePort();
-  const { cmd, args, opts } = sidecarCommand(sidecarPort, dataRoot);
+  sidecarCapability = createDesktopCapability();
+  const { cmd, args, opts } = sidecarCommand(sidecarPort, dataRoot, sidecarCapability);
   sidecar = spawn(cmd, args, opts);
   // The update gate may commit to installing while we were awaiting the port:
   // before-quit has already run (nothing to kill then), so reap the child here.
@@ -410,8 +641,17 @@ function createStartupWindow(theme) {
       preload: path.join(__dirname, "startup-preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      webviewTag: false,
+      devTools: isDev,
     },
   });
+  denyUnrequestedPermissions(startupWin.webContents.session);
+  denyRendererNavigation(startupWin);
+  startupWin.webContents.on("will-attach-webview", (event) => event.preventDefault());
+  startupWin.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   startupWin.webContents.on("did-finish-load", () => {
     if (!startupWin || startupWin.isDestroyed()) return;
     startupWin.webContents.send("startup:assets", readSplashAssets());
@@ -436,6 +676,147 @@ function closeStartupWindow() {
   startupWin = null;
 }
 
+const hardenedSessions = new WeakSet();
+
+function denyUnrequestedPermissions(electronSession) {
+  if (hardenedSessions.has(electronSession)) return;
+  hardenedSessions.add(electronSession);
+  const trust = () => mainWindow && !mainWindow.isDestroyed() ? {
+    origin: sidecarOrigin(),
+    webContents: mainWindow.webContents,
+  } : null;
+  electronSession.setPermissionCheckHandler((webContents, permission, _origin, details) =>
+    shouldGrantTrustedAppPermission(permission, webContents, details, trust()));
+  electronSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+    callback(shouldGrantTrustedAppPermission(
+      permission, webContents, details, trust()));
+  });
+}
+
+function denyRendererNavigation(win) {
+  win.webContents.on("will-navigate", (details) => details.preventDefault());
+  win.webContents.on("will-redirect", (details) => details.preventDefault());
+  win.webContents.on("will-frame-navigate", (details) => details.preventDefault());
+}
+
+function installApiCapabilityTransport(win) {
+  const origin = sidecarOrigin();
+  const electronSession = win.webContents.session;
+  const allRequests = { urls: ["<all_urls>"] };
+  const requestChains = createRequestChainTracker();
+  electronSession.webRequest.onBeforeRequest(allRequests, (details, callback) => {
+    requestChains.observe(details);
+    callback({});
+  });
+  electronSession.webRequest.onBeforeRedirect(allRequests, (details) => {
+    requestChains.redirect(details);
+  });
+  electronSession.webRequest.onCompleted(allRequests, (details) => {
+    requestChains.finish(details);
+  });
+  electronSession.webRequest.onErrorOccurred(allRequests, (details) => {
+    requestChains.finish(details);
+  });
+  electronSession.webRequest.onBeforeSendHeaders(
+    // Match every request so a renderer-supplied spoof of our private header is
+    // stripped even when its destination is not the sidecar.
+    allRequests,
+    (details, callback) => {
+      const originalApiRequest = requestChains.hasAuthorizedOrigin(details, origin);
+      let authorize = false;
+      if (originalApiRequest && mainWindow && !mainWindow.isDestroyed()) {
+        authorize = shouldAuthorizeApiRequest(details, {
+          origin,
+          webContentsId: mainWindow.webContents.id,
+          mainFrame: mainWindow.webContents.mainFrame,
+        });
+      }
+      if (!authorize && originalApiRequest) {
+        const resource = authenticatedResourceLoads.get(details.webContentsId);
+        if (resource) {
+          authorize = shouldAuthorizeApiRequest(details, {
+            origin,
+            webContentsId: details.webContentsId,
+            mainFrame: resource.mainFrame,
+            oneShotUrl: resource.mode === "one-shot" ? resource.url : null,
+            exactResourceUrl: resource.mode === "exact-pdf" ? resource.url : null,
+          });
+        }
+      }
+      callback({
+        requestHeaders: capabilityHeaders(
+          details.requestHeaders, sidecarCapability, authorize),
+      });
+    },
+  );
+}
+
+function openExternalUrl(value) {
+  const target = parseUrl(value);
+  if (!target || !["http:", "https:"].includes(target.protocol) ||
+      target.username || target.password || target.origin === sidecarOrigin()) return false;
+  shell.openExternal(target.href);
+  return true;
+}
+
+function createAuthenticatedResourceWindow(value) {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  const resource = classifyAuthenticatedResource(value, sidecarOrigin());
+  if (!resource) return false;
+  const networkUrl = resource.url;
+  const grantMode = resource.mode;
+  const child = new BrowserWindow({
+    parent: mainWindow,
+    width: 1000,
+    height: 800,
+    title: "Library Tool",
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      webviewTag: false,
+      devTools: isDev,
+    },
+  });
+  resourceWindows.add(child);
+  denyUnrequestedPermissions(child.webContents.session);
+  authenticatedResourceLoads.set(child.webContents.id, {
+    url: networkUrl,
+    mainFrame: child.webContents.mainFrame,
+    mode: grantMode,
+  });
+  const clearGrant = () => authenticatedResourceLoads.delete(child.webContents.id);
+  if (grantMode === "one-shot") {
+    child.webContents.once("did-finish-load", clearGrant);
+    child.webContents.once("did-fail-load", clearGrant);
+  }
+  child.webContents.on("will-navigate", (event, url) => {
+    if (url !== networkUrl) {
+      event.preventDefault();
+      openExternalUrl(url);
+    }
+  });
+  child.webContents.on("will-redirect", (event, url) => {
+    if (url !== networkUrl) {
+      event.preventDefault();
+      openExternalUrl(url);
+    }
+  });
+  child.webContents.on("will-attach-webview", (event) => event.preventDefault());
+  child.webContents.setWindowOpenHandler(({ url }) => {
+    openExternalUrl(url);
+    return { action: "deny" };
+  });
+  child.on("closed", () => {
+    clearGrant();
+    resourceWindows.delete(child);
+  });
+  child.loadURL(networkUrl);
+  return true;
+}
+
 function createWindow() {
   sendStartupStatus("Opening library");
   mainWindow = new BrowserWindow({
@@ -452,8 +833,15 @@ function createWindow() {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      webviewTag: false,
+      devTools: isDev,
     },
   });
+  denyUnrequestedPermissions(mainWindow.webContents.session);
+  installApiCapabilityTransport(mainWindow);
   Menu.setApplicationMenu(null);   // the web UI has its own menu bar
   // keep the renderer's maximize/restore icon in sync with the real state
   mainWindow.on("maximize", () => mainWindow.webContents.send("win:maximized", true));
@@ -464,7 +852,7 @@ function createWindow() {
   mainWindow.webContents.on("did-finish-load", () => {
     if (mainWindow) mainWindow.webContents.send("win:maximized", mainWindow.isMaximized());
   });
-  mainWindow.loadURL(`http://127.0.0.1:${sidecarPort}/`);
+  mainWindow.loadURL(`${sidecarOrigin()}/`);
   // Start maximized. Maximizing while the constructor bounds are set records
   // 1200×800 as the restore target, so the restore button returns there.
   mainWindow.once("ready-to-show", () => {
@@ -473,9 +861,34 @@ function createWindow() {
     mainWindow.show();
     closeStartupWindow();
   });
-  // open target=_blank / external links in the system browser, not a new window
+  mainWindow.webContents.on("will-navigate", (event, url) => {
+    if (!isTrustedAppDocumentUrl(url, sidecarOrigin())) {
+      event.preventDefault();
+      openExternalUrl(url);
+    }
+  });
+  mainWindow.webContents.on("will-redirect", (event, url) => {
+    if (!isTrustedAppDocumentUrl(url, sidecarOrigin())) {
+      event.preventDefault();
+      openExternalUrl(url);
+    }
+  });
+  // No application credential is ever propagated into a subframe. Local PDF
+  // frames use blob URLs created by an authenticated top-frame fetch.
+  mainWindow.webContents.on("will-frame-navigate", (details) => {
+    if (details.isMainFrame) return;
+    const target = parseUrl(details.url);
+    if (details.url === "about:blank" ||
+        (target && target.protocol === "blob:" && target.origin === sidecarOrigin())) return;
+    details.preventDefault();
+  });
+  mainWindow.webContents.on("will-attach-webview", (event) => event.preventDefault());
+  // New-window callbacks do not identify the initiating WebFrameMain. They may
+  // open ordinary external links, but can never mint a sidecar API grant; the
+  // main-frame-only resource:open IPC above is the sole entry point for that.
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (/^https?:/i.test(url)) shell.openExternal(url);
+    if (isSidecarApiUrl(url, sidecarOrigin())) return { action: "deny" };
+    if (openExternalUrl(url)) return { action: "deny" };
     return { action: "deny" };
   });
   // The 'close' event is synchronous, so hold it, ask the sidecar about
@@ -570,8 +983,17 @@ function createUpdaterWindow(theme) {
       preload: path.join(__dirname, "updater-preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      webviewTag: false,
+      devTools: isDev,
     },
   });
+  denyUnrequestedPermissions(updaterWin.webContents.session);
+  denyRendererNavigation(updaterWin);
+  updaterWin.webContents.on("will-attach-webview", (event) => event.preventDefault());
+  updaterWin.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   // replay theme + the CURRENT status once the renderer has run its script
   // (listeners registered); show once it has painted — avoids a lost IPC and a
   // white flash.
@@ -725,4 +1147,6 @@ app.on("window-all-closed", () => { if (mainReady) app.quit(); });
 app.on("before-quit", () => {
   app.isQuitting = true;
   if (sidecar) { try { sidecar.kill(); } catch (e) { /* already gone */ } }
+  authenticatedResourceLoads.clear();
+  sidecarCapability = null;
 });

@@ -43,6 +43,9 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
+from librarytool.engine.secret_ids import LEGACY_SECRET_KEYS  # noqa: E402
+
 # Outside the repo on purpose: a worktree inside it would show up as an
 # untracked directory in every `git status` of the parent.
 WORKTREES = Path(os.environ.get("WHL_WORKTREES") or REPO.parent / "whl-worktrees")
@@ -50,8 +53,9 @@ WORKTREES = Path(os.environ.get("WHL_WORKTREES") or REPO.parent / "whl-worktrees
 PORT_BASE = 5101          # 5001 belongs to the main checkout
 HEAVY = ["/photo/", "/books/"]
 
-# Copied into a new worktree's DATA_ROOT by --seed. client_state.json carries
-# API keys, so seeding is opt-in and never leaves this machine.
+# Copied into a new worktree's DATA_ROOT by --seed. Registered legacy secret
+# fields are removed from the copied client state; protected secret stores are
+# deliberately never copied.
 SEED_FILES = [
     "output/client_state.json",
     "output/manual_entries.json",
@@ -59,6 +63,7 @@ SEED_FILES = [
     "output/whl_corrections.json",
     "downloads/ia/catalog.json",
 ]
+_CLIENT_STATE_SEED = "output/client_state.json"
 
 SERVE_PY = '''\
 """Launcher for this worktree: its own port, its own DATA_ROOT.
@@ -83,6 +88,32 @@ def git(*args: str, cwd: Path | None = None, check: bool = True) -> str:
     if check and r.returncode != 0:
         sys.exit(f"git {' '.join(args)}\n{r.stderr.strip()}")
     return r.stdout.strip()
+
+
+def copy_seed_file(src: Path, dst: Path, rel: str) -> None:
+    """Copy one seed file without propagating legacy plaintext credentials."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if rel != _CLIENT_STATE_SEED:
+        shutil.copy2(src, dst)
+        return
+    try:
+        state = json.loads(src.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit("Cannot safely seed invalid client_state.json.") from exc
+    if not isinstance(state, dict):
+        raise SystemExit("Cannot safely seed invalid client_state.json.")
+    settings = state.get("settings")
+    if settings is not None and not isinstance(settings, dict):
+        raise SystemExit("Cannot safely seed invalid client_state.json settings.")
+    if isinstance(settings, dict):
+        state["settings"] = {
+            key: value for key, value in settings.items()
+            if key not in LEGACY_SECRET_KEYS
+        }
+    dst.write_text(
+        json.dumps(state, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
 
 
 def worktrees() -> list[dict]:
@@ -217,9 +248,8 @@ def cmd_add(args) -> None:
             if not src.is_file():
                 continue
             dst = wt / "data" / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
-        print("seeded DATA_ROOT from the main checkout (includes API keys)")
+            copy_seed_file(src, dst, rel)
+        print("seeded nonsecret DATA_ROOT state from the main checkout")
 
     size = sum(f.stat().st_size for f in path.rglob("*")
                if f.is_file() and ".git" not in f.parts) / 1e6

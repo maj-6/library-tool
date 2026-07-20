@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import collections
 import contextlib
+import functools
 import hashlib
 import importlib.util
 import json
@@ -31,6 +32,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import sys
 import threading
 import time
@@ -44,7 +46,17 @@ from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from flask import Flask, Response, abort, jsonify, render_template, request, send_file
+import desktop_transport
+from flask import (
+    Flask,
+    Response,
+    abort,
+    jsonify,
+    render_template,
+    request,
+    send_file,
+    url_for,
+)
 from werkzeug.exceptions import HTTPException
 
 # Make the installable engine package and transitional tools/ modules
@@ -72,26 +84,41 @@ from librarytool.adapters.lib_archive import (  # noqa: E402
     ExistingItemLibArchivePlanner,
     LibArchiveLimits,
 )
-from librarytool.adapters.filesystem.job_history import (  # noqa: E402
-    FilesystemJobHistoryRepository,
-)
 from librarytool.adapters.filesystem.recoverable_write_set import (  # noqa: E402
     RecoverableWriteSet,
+)
+from librarytool.adapters.filesystem.whl_catalogue_codec import (  # noqa: E402
+    WhlCatalogueItemCodec,
+)
+from librarytool.adapters.windows.secret_store import (  # noqa: E402
+    SecretCredentialNotConfiguredError,
+    SecretIdRegistry,
+    SecretStoreHealth,
+    WindowsDpapiSecretStoreRepository,
+)
+from librarytool_http import (  # noqa: E402
+    create_provider_discovery_blueprint,
+    create_text_layer_blueprint,
 )
 from librarytool.composition.filesystem import (  # noqa: E402
     CatalogueBindings,
     FilesystemEnginePaths,
-    FilesystemEngineResources,
-    FilesystemServiceGraph,
     InterchangeBindings,
+    ItemLifecycleBindings,
     ReplicaBindings,
+    RepresentationBindings,
+    SecretStoreBindings,
     TranslationBindings,
-    compose_filesystem_engine,
 )
-from librarytool.engine.capabilities import (  # noqa: E402
-    CapabilityRef,
-    ModuleManifest,
-    WorkbenchManifest,
+from librarytool.composition.first_party import (  # noqa: E402
+    first_party_module_contributions,
+)
+from librarytool.composition.host import (  # noqa: E402
+    FilesystemEngineConfig,
+    FilesystemEngineSession,
+    FilesystemHostBindings,
+    JobHistoryBindings,
+    open_filesystem_engine,
 )
 from librarytool.engine.contracts import (  # noqa: E402
     ItemDescriptor,
@@ -122,25 +149,44 @@ from librarytool.engine.item_commands import (  # noqa: E402
     ItemRecordSnapshot,
     UpdateItemCommand,
 )
+from librarytool.engine.item_lifecycle import (  # noqa: E402
+    DeleteItemCommand as LifecycleDeleteItemCommand,
+    ItemLifecycleResult,
+    ItemLifecycleService,
+    RestoreItemCommand,
+)
 from librarytool.engine.items import ItemQueryService  # noqa: E402
 from librarytool.engine.interchange import (  # noqa: E402
     ImportLibCommand,
     LibInterchangeService,
+    OpenLibCommand,
+    OpenLibService,
 )
 from librarytool.engine.replica import ReplicaApplicationService  # noqa: E402
+from librarytool.engine.secret_ids import (  # noqa: E402
+    LEGACY_SECRET_IDS,
+    LEGACY_SECRET_KEYS,
+)
+from librarytool.engine.secret_store import (  # noqa: E402
+    ClearSecretCommand,
+    ReplaceSecretCommand,
+    SecretStatus,
+    SecretStoreService,
+)
+from librarytool.engine.representation_commands import (  # noqa: E402
+    AttachRepresentationCommand,
+    DetachRepresentationCommand,
+    RepresentationAggregateSnapshot,
+    RepresentationAttachmentDraft,
+    RepresentationCommandService,
+    RepresentationRecordSnapshot,
+)
 from librarytool.engine.runtime import (  # noqa: E402
-    INTERCHANGE_SERVICE,
-    ITEM_COMMAND_SERVICE,
-    ITEM_QUERY_SERVICE,
-    JOB_SERVICE,
-    REPLICA_SERVICE,
-    TEXT_LAYER_SERVICE,
-    TRANSLATION_PROVENANCE_SERVICE,
-    TRANSLATION_SERVICE,
+    ITEM_LIFECYCLE_SERVICE,
+    LIB_OPEN_SERVICE,
+    REPRESENTATION_COMMAND_SERVICE,
+    SECRET_STORE_SERVICE,
     LibraryEngine,
-    ModuleContribution,
-    ServiceBinding,
-    WorkbenchPolicyBinding,
 )
 from librarytool.engine.text_layers import TextLayerService  # noqa: E402
 from librarytool.engine.translation_contracts import (  # noqa: E402
@@ -152,17 +198,26 @@ from librarytool.engine.translations import (  # noqa: E402
     TranslationProvenanceService,
     TranslationService,
 )
-from librarytool.engine.workbench_policies import (  # noqa: E402
-    ReplicaWorkbenchPolicy,
-    TextLayerWorkbenchPolicy,
-    TranslationWorkbenchPolicy,
-)
+from librarytool.profiles import WhlBookItemCommandPolicy  # noqa: E402
 
-# Recover interrupted multi-artifact publication while the module is still
-# single-threaded. No request handler or background worker can observe or write
-# the workspace until this import-time barrier has completed.
-_engine_write_set = RecoverableWriteSet(lib.OUTPUT_DIR)
-_engine_write_set.recover_all()
+_DESKTOP_CAPABILITY_HEADER = desktop_transport.CAPABILITY_HEADER
+_DESKTOP_MODE = desktop_transport.CONFIG.mode
+_DESKTOP_CAPABILITY_DIGEST = desktop_transport.CONFIG.capability_digest
+_DESKTOP_PORT = desktop_transport.CONFIG.port
+_DESKTOP_EXPECTED_HOST = desktop_transport.CONFIG.expected_host
+_DESKTOP_EXPECTED_ORIGIN = desktop_transport.CONFIG.expected_origin
+
+# Importing the compatibility transport must not claim a workspace. The first
+# request, or the explicit __main__ startup barrier, opens one complete session
+# and publishes these aliases together for processors that have not crossed the
+# engine boundary yet.
+_engine_session: FilesystemEngineSession | None = None
+_engine_write_set: RecoverableWriteSet | None = None
+_job_manager: JobManager | None = None
+_translation_provenance: TranslationProvenanceService | None = None
+_jobs: dict | None = None
+_jobs_events: dict | None = None
+_jobs_lock: threading.Lock | None = None
 
 # NYPL Catalog of Copyright Entries dataset (optional, for the copyright tag's
 # registration half): drop the parsed XML tree under <DATA_ROOT>/nypl_cce/.
@@ -181,6 +236,10 @@ def _flask_app():
 
 
 app = _flask_app()
+app.register_blueprint(
+    create_provider_discovery_blueprint(lambda: _library_engine())
+)
+app.register_blueprint(create_text_layer_blueprint(lambda: _library_engine()))
 # Jinja compiles index.html once and caches it when debug is off, while static/
 # is read from disk on every request. Editing the template therefore served a NEW
 # app.js against an OLD DOM until someone restarted the server -- and one missing
@@ -192,6 +251,26 @@ app.jinja_env.auto_reload = True
 
 
 _TRUSTED_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
+_DESKTOP_CSP = "; ".join((
+    "default-src 'self'",
+    "base-uri 'none'",
+    "object-src 'none'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "font-src 'self' data:",
+    "img-src 'self' data: blob: https:",
+    "connect-src 'self'",
+    "frame-src 'self' blob:",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+))
+_RESOURCE_CSP = "; ".join((
+    "default-src 'none'",
+    "base-uri 'none'",
+    "style-src 'unsafe-inline'",
+    "img-src 'self' data:",
+    "frame-ancestors 'none'",
+))
 
 
 @app.before_request
@@ -202,9 +281,38 @@ def _reject_untrusted_host():
     only credential routes is insufficient because other endpoints expose
     client state, local PDFs, and a fetch proxy.
     """
-    host = (request.host or "").partition(":")[0].lower().rstrip(".")
+    request_host = (request.host or "").lower()
+    if _DESKTOP_EXPECTED_HOST is not None:
+        if request_host != _DESKTOP_EXPECTED_HOST:
+            abort(403)
+        return
+    host = request_host.partition(":")[0].rstrip(".")
     if host not in _TRUSTED_LOOPBACK_HOSTS:
         abort(403)
+
+
+@app.before_request
+def _enforce_api_origin_and_desktop_capability():
+    """Authenticate desktop API traffic before any engine or route executes."""
+    if not request.path.startswith("/api/"):
+        return
+    origin = request.headers.get("Origin")
+    if origin:
+        expected = _DESKTOP_EXPECTED_ORIGIN or f"http://{request.host}"
+        if not desktop_transport.origin_matches(origin, expected):
+            abort(403)
+    if (_DESKTOP_CAPABILITY_DIGEST is not None and
+            not desktop_transport.capability_matches(
+                request.headers.get(_DESKTOP_CAPABILITY_HEADER),
+                _DESKTOP_CAPABILITY_DIGEST)):
+        abort(401)
+
+
+@app.before_request
+def _ensure_engine_before_request():
+    """Settle recovery and composition before dispatching any local API."""
+
+    _ensure_engine_session()
 
 
 @app.after_request
@@ -221,9 +329,26 @@ def _static_cache_headers(resp):
     a freshly installed app.js) must not become a year-long cached error for a
     URL whose ?v= token won't change on retry.
     """
-    if resp.status_code not in (200, 304):
-        return resp
-    if request.path.startswith("/static/"):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+    resp.headers.setdefault(
+        "Permissions-Policy",
+        "camera=(), microphone=(), geolocation=(), display-capture=(), "
+        "usb=(), serial=(), bluetooth=()",
+    )
+    if _DESKTOP_CAPABILITY_DIGEST is not None and request.path.startswith("/api/"):
+        # A custom request header does not participate in ordinary cache keys.
+        # Never let a response authenticated for the app frame be reused by an
+        # unauthenticated same-origin frame without contacting this guard again.
+        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["Pragma"] = "no-cache"
+    if resp.mimetype == "text/html":
+        resp.headers.setdefault("X-Frame-Options", "DENY")
+        resp.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+        csp = _DESKTOP_CSP if request.path == "/" else _RESOURCE_CSP
+        resp.headers.setdefault("Content-Security-Policy", csp)
+    if resp.status_code in (200, 304) and request.path.startswith("/static/"):
         if request.args.get("v"):
             resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
         else:
@@ -440,20 +565,53 @@ def _auth_doc() -> dict:
 
 
 def _auth_cfg() -> dict | None:
-    """GoTrue wants a public project API key in ``apikey``.
+    """Return configured public auth identity without leasing a custom key.
 
     Nothing configured is NOT unconfigured: the app ships knowing its own
     cloud (cloud_defaults), so accounts work on a fresh install with no keys
     entered. Settings override; a custom project URL with no key of its own
     stays unconfigured rather than pairing with the default key. The owner
     service credential is deliberately ignored here: normal account and phone
-    capture traffic must never depend on it."""
+    capture traffic must never depend on it.
+
+    The bundled anon key is a public application identifier and may remain in
+    this value. A custom key is represented only by configured status; its
+    plaintext is added by :func:`_auth_execution_cfg` while provider calls run.
+    """
     s = _client_settings()
     url = str(s.get("supabaseUrl") or "").strip() or cloud_defaults.SUPABASE_URL
-    key = str(s.get("supabaseAnonKey") or "").strip()
-    if not key and url == cloud_defaults.SUPABASE_URL:
-        key = cloud_defaults.SUPABASE_ANON_KEY
-    return {"url": url, "key": key} if url and key else None
+    if not url:
+        return None
+    if url == cloud_defaults.SUPABASE_URL:
+        return {"url": url, "key": cloud_defaults.SUPABASE_ANON_KEY}
+    if _secret_is_configured("supabaseAnonKey"):
+        return {"url": url}
+    return None
+
+
+@contextlib.contextmanager
+def _auth_execution_cfg():
+    """Lease a custom project key for one Supabase request family."""
+
+    public = _auth_cfg()
+    if not public:
+        yield None
+        return
+    if "key" in public:
+        cfg = dict(public)
+        try:
+            yield cfg
+        finally:
+            # The bundled value is public, but clearing the execution copy
+            # keeps the same lifecycle as a custom protected value.
+            cfg.pop("key", None)
+        return
+    with _lease_secret("supabaseAnonKey") as key:
+        cfg = {**public, "key": key}
+        try:
+            yield cfg
+        finally:
+            cfg.pop("key", None)
 
 
 def _email_confirm_redirect() -> str:
@@ -469,8 +627,7 @@ def _auth_session() -> dict | None:
     """A live session, refreshed when stale. Refresh tokens rotate, so the
     refreshed session is persisted before anything uses it, under the lock —
     two concurrent refreshes with one token can revoke the whole family."""
-    cfg = _auth_cfg()
-    if not cfg:
+    if not _auth_cfg():
         return None
     with _auth_lock:
         doc = _auth_doc()
@@ -480,7 +637,13 @@ def _auth_session() -> dict | None:
         if time.time() < float(ses.get("expires_at") or 0) - 90:
             return ses
         try:
-            fresh = sauth.refresh(cfg, ses["refresh_token"])
+            with _auth_execution_cfg() as cfg:
+                if not cfg:
+                    return None
+                fresh = sauth.refresh(cfg, ses["refresh_token"])
+        except RuntimeError:
+            log.warning("session refresh unavailable â€” protected auth key unavailable")
+            return None
         except sauth.AuthError as exc:
             # Only a definitive rejection kills the session. A transport
             # failure (offline, DNS, captive portal) says nothing about the
@@ -551,8 +714,7 @@ def api_auth_status():
 
 @app.route("/api/auth/login", methods=["POST"])
 def api_auth_login():
-    cfg = _auth_cfg()
-    if not cfg:
+    if not _auth_cfg():
         return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Integrations)"}), 400
     p = request.get_json(silent=True) or {}
     email = str(p.get("email") or "").strip()
@@ -560,10 +722,16 @@ def api_auth_login():
     if not email or not password:
         return jsonify({"ok": False, "error": "email and password are both required"}), 400
     try:
-        ses = sauth.sign_in(cfg, email, password)
+        with _auth_execution_cfg() as cfg:
+            if not cfg:
+                raise RuntimeError("protected auth configuration unavailable")
+            ses = sauth.sign_in(cfg, email, password)
+            ses = _adopt_profile(cfg, ses)
+    except RuntimeError:
+        return jsonify({"ok": False,
+                        "error": "Protected credential storage is unavailable"}), 503
     except sauth.AuthError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 401
-    ses = _adopt_profile(cfg, ses)
     _store_session(ses)
     _sync_profile_mistral_key()
     activity("signed in to", "the cloud", actor=ses["display_name"] or email)
@@ -573,8 +741,7 @@ def api_auth_login():
 
 @app.route("/api/auth/signup", methods=["POST"])
 def api_auth_signup():
-    cfg = _auth_cfg()
-    if not cfg:
+    if not _auth_cfg():
         return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Integrations)"}), 400
     p = request.get_json(silent=True) or {}
     email = str(p.get("email") or "").strip()
@@ -585,13 +752,20 @@ def api_auth_signup():
     if len(password) < 6:
         return jsonify({"ok": False, "error": "password must be at least 6 characters"}), 400
     try:
-        ses = sauth.sign_up(cfg, email, password, name,
-                            redirect_to=_email_confirm_redirect())
+        with _auth_execution_cfg() as cfg:
+            if not cfg:
+                raise RuntimeError("protected auth configuration unavailable")
+            ses = sauth.sign_up(cfg, email, password, name,
+                                redirect_to=_email_confirm_redirect())
+            if ses is not None:
+                ses = _adopt_profile(cfg, ses)
+    except RuntimeError:
+        return jsonify({"ok": False,
+                        "error": "Protected credential storage is unavailable"}), 503
     except sauth.AuthError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     if ses is None:     # project requires email confirmation (the default)
         return jsonify({"ok": True, "confirm": True})
-    ses = _adopt_profile(cfg, ses)
     _store_session(ses)
     _sync_profile_mistral_key()
     activity("signed in to", "the cloud", actor=ses["display_name"] or email)
@@ -601,14 +775,19 @@ def api_auth_signup():
 
 @app.route("/api/auth/logout", methods=["POST"])
 def api_auth_logout():
-    cfg = _auth_cfg()
+    configured = bool(_auth_cfg())
     with _auth_lock:
         doc = _auth_doc()
         ses = doc.pop("session", None)
         # push_cursor stays: signing back in resumes the mirror, no re-push
         lib.save_json(AUTH_SESSION_PATH, doc)
-    if cfg and ses and ses.get("access_token"):
-        sauth.sign_out(cfg, ses["access_token"])
+    if configured and ses and ses.get("access_token"):
+        try:
+            with _auth_execution_cfg() as cfg:
+                if cfg:
+                    sauth.sign_out(cfg, ses["access_token"])
+        except RuntimeError:
+            log.warning("remote sign-out skipped â€” protected auth key unavailable")
     return jsonify({"ok": True})
 
 
@@ -1179,9 +1358,8 @@ def api_collections_merge():
 # activity() and by sign-in, with a slow heartbeat for retries.
 
 def _push_events_once() -> None:
-    cfg = _auth_cfg()
-    ses = _auth_session() if cfg else None
-    if not cfg or not ses:
+    ses = _auth_session() if _auth_cfg() else None
+    if not ses:
         return
     with _auth_lock:
         cursor = int(_auth_doc().get("push_cursor") or 0)
@@ -1216,8 +1394,11 @@ def _push_events_once() -> None:
         batch.append(ev)
     if batch:
         try:
-            sauth.rest(cfg, ses["access_token"], "POST", "events", batch,
-                       prefer="return=minimal")
+            with _auth_execution_cfg() as cfg:
+                if not cfg:
+                    return
+                sauth.rest(cfg, ses["access_token"], "POST", "events", batch,
+                           prefer="return=minimal")
         except sauth.AuthError as exc:
             if exc.status == 400:
                 # the DATA was rejected (e.g. a hand-mangled timestamp);
@@ -1253,9 +1434,8 @@ _cloud_feed_cache: dict = {"at": 0.0, "rows": [], "fail_at": 0.0}
 
 def _cloud_events(limit: int) -> list[dict] | None:
     """The shared feed, or None when signed out / offline (caller falls back)."""
-    cfg = _auth_cfg()
-    ses = _auth_session() if cfg else None
-    if not cfg or not ses:
+    ses = _auth_session() if _auth_cfg() else None
+    if not ses:
         return None
     now = time.time()
     if now - _cloud_feed_cache["at"] < 15:
@@ -1263,10 +1443,14 @@ def _cloud_events(limit: int) -> list[dict] | None:
     if now - _cloud_feed_cache["fail_at"] < 30:
         return None
     try:
-        rows = sauth.rest(cfg, ses["access_token"], "GET",
-                          "events?select=at,actor,verb,subject,n,detail"
-                          f"&order=at.desc&limit={int(limit)}", timeout=8.0) or []
-    except sauth.AuthError as exc:
+        with _auth_execution_cfg() as cfg:
+            if not cfg:
+                return None
+            rows = sauth.rest(
+                cfg, ses["access_token"], "GET",
+                "events?select=at,actor,verb,subject,n,detail"
+                f"&order=at.desc&limit={int(limit)}", timeout=8.0) or []
+    except (RuntimeError, sauth.AuthError) as exc:
         log.warning("cloud feed unavailable: %s", exc)
         _cloud_feed_cache["fail_at"] = now
         return None
@@ -1286,9 +1470,8 @@ _profile_cache: dict = {}   # display_name -> {"at": float, "data": dict | None}
 
 
 def _cloud_profile(name: str) -> dict | None:
-    cfg = _auth_cfg()
-    ses = _auth_session() if cfg else None
-    if not cfg or not ses:
+    ses = _auth_session() if _auth_cfg() else None
+    if not ses:
         return None
     now = time.time()
     hit = _profile_cache.get(name)
@@ -1301,23 +1484,25 @@ def _cloud_profile(name: str) -> dict | None:
     data = {"display_name": name, "found": False,
             "member_since": None, "last_active": None}
     try:
-        # display_name is not unique; the earliest-created row is the canonical
-        # account (a later namesake can't backdate someone's "member since").
-        prof = sauth.rest(cfg, tok, "GET",
-                          f"profiles?display_name=eq.{q}"
-                          "&select=display_name,created_at"
-                          "&order=created_at.asc&limit=1", timeout=8.0) or []
-        if prof:
-            data["found"] = True
-            data["member_since"] = prof[0].get("created_at")
-        # last activity is one indexed row (no full scan, no count). first-seen
-        # is deliberately not fetched: cloud events only exist for a signed-in
-        # account, which always has a profiles row, so member_since covers it.
-        last = sauth.rest(cfg, tok, "GET",
-            f"events?actor=eq.{q}&select=at&order=at.desc&limit=1", timeout=8.0) or []
-        if last:
-            data["last_active"] = last[0].get("at")
-    except sauth.AuthError as exc:
+        with _auth_execution_cfg() as cfg:
+            if not cfg:
+                return None
+            # display_name is not unique; the earliest-created row is the
+            # canonical account (a namesake cannot backdate membership).
+            prof = sauth.rest(
+                cfg, tok, "GET", f"profiles?display_name=eq.{q}"
+                "&select=display_name,created_at"
+                "&order=created_at.asc&limit=1", timeout=8.0) or []
+            if prof:
+                data["found"] = True
+                data["member_since"] = prof[0].get("created_at")
+            last = sauth.rest(
+                cfg, tok, "GET",
+                f"events?actor=eq.{q}&select=at&order=at.desc&limit=1",
+                timeout=8.0) or []
+            if last:
+                data["last_active"] = last[0].get("at")
+    except (RuntimeError, sauth.AuthError) as exc:
         log.warning("profile lookup unavailable: %s", exc)
         _profile_cache[name] = {"at": now, "data": None}   # back off on failure
         return None
@@ -1520,6 +1705,13 @@ def _ch_row(idx: int, row: dict) -> dict:
 
 # --- routes ----------------------------------------------------------------
 
+
+@app.get("/healthz")
+def healthz():
+    """Uncredentialed loopback readiness probe; contains no application data."""
+    return jsonify({"ok": True})
+
+
 def _asset_v(filename):
     """Cache-busting token = the static file's mtime, so a changed asset always
     forces a fresh fetch (a plain /static/app.js otherwise serves stale)."""
@@ -1554,193 +1746,6 @@ def home():
         engine_v=_asset_v("engine-client.js"),
         css_v=_asset_v("style.css"),
         app_version=_app_version(),
-    )
-
-
-_ENGINE_MODULE_MANIFESTS = (
-    ModuleManifest(
-        "library.core", "1.1.0",
-        provides=(
-            # ``library.items`` remains the compatibility capability while
-            # new clients can bind to the narrower read contracts.
-            CapabilityRef("library.items"),
-            CapabilityRef("library.items.read"),
-            CapabilityRef("library.representations"),
-            CapabilityRef("library.artifacts"),
-        ),
-    ),
-    ModuleManifest(
-        "jobs.core", "1.0.0",
-        provides=(CapabilityRef("library.jobs"),),
-    ),
-    ModuleManifest(
-        "library.catalogue.commands", "1.0.0",
-        provides=(
-            CapabilityRef("library.items.create"),
-            CapabilityRef("library.items.update"),
-        ),
-        requires=(CapabilityRef("library.items.read"),),
-    ),
-    ModuleManifest(
-        "replica.core", "1.0.0",
-        provides=(
-            CapabilityRef("replica.regions"),
-            CapabilityRef("replica.proposals"),
-            CapabilityRef("replica.text-layers"),
-            CapabilityRef("replica.layout-families"),
-        ),
-        requires=(CapabilityRef("library.items"),),
-    ),
-    ModuleManifest(
-        "translation.core", "2.0.0",
-        provides=(
-            CapabilityRef("translation.provenance"),
-            CapabilityRef("translation.layers.read"),
-            CapabilityRef("translation.layers.status"),
-            CapabilityRef("translation.layers.edit"),
-        ),
-        requires=(CapabilityRef("library.items"),),
-    ),
-    ModuleManifest(
-        "replica.lib", "2.0.0",
-        provides=(CapabilityRef("replica.interchange", 2),),
-        requires=(CapabilityRef("replica.regions"),),
-    ),
-)
-_ENGINE_WORKBENCH_MANIFESTS = (
-    WorkbenchManifest(
-        "catalog", "1.0.0",
-        requires=(CapabilityRef("library.items"),),
-        enhances=(
-            CapabilityRef("library.items.create"),
-            CapabilityRef("library.items.update"),
-        ),
-    ),
-    WorkbenchManifest(
-        "replica", "1.0.0",
-        requires=(
-            CapabilityRef("replica.regions"),
-            CapabilityRef("replica.text-layers"),
-        ),
-        enhances=(
-            CapabilityRef("replica.interchange", 2),
-            CapabilityRef("replica.layout-families"),
-            CapabilityRef("translation.provenance"),
-            CapabilityRef("translation.layers.read"),
-            CapabilityRef("translation.layers.status"),
-            CapabilityRef("translation.layers.edit"),
-            CapabilityRef("library.jobs"),
-        ),
-    ),
-)
-
-
-def _engine_module_contributions(
-    graph: FilesystemServiceGraph,
-) -> tuple[ModuleContribution, ...]:
-    """Bind installed first-party manifests to the concrete service graph."""
-
-    modules = {manifest.id: manifest for manifest in _ENGINE_MODULE_MANIFESTS}
-    workbenches = {
-        manifest.id: manifest for manifest in _ENGINE_WORKBENCH_MANIFESTS
-    }
-    return (
-        ModuleContribution(
-            modules["library.core"],
-            bindings=(
-                ServiceBinding(
-                    ITEM_QUERY_SERVICE,
-                    graph.items,
-                    modules["library.core"].provides,
-                ),
-            ),
-            workbenches=(workbenches["catalog"],),
-        ),
-        ModuleContribution(
-            modules["jobs.core"],
-            bindings=(
-                ServiceBinding(
-                    JOB_SERVICE,
-                    graph.jobs,
-                    modules["jobs.core"].provides,
-                ),
-            ),
-        ),
-        ModuleContribution(
-            modules["library.catalogue.commands"],
-            bindings=(
-                ServiceBinding(
-                    ITEM_COMMAND_SERVICE,
-                    graph.item_commands,
-                    modules["library.catalogue.commands"].provides,
-                ),
-            ),
-        ),
-        ModuleContribution(
-            modules["replica.core"],
-            bindings=(
-                ServiceBinding(
-                    REPLICA_SERVICE,
-                    graph.replica,
-                    tuple(
-                        capability
-                        for capability in modules["replica.core"].provides
-                        if capability.id != "replica.text-layers"
-                    ),
-                ),
-                ServiceBinding(
-                    TEXT_LAYER_SERVICE,
-                    graph.text_layers,
-                    (CapabilityRef("replica.text-layers"),),
-                ),
-            ),
-            workbenches=(workbenches["replica"],),
-            item_policies=(
-                WorkbenchPolicyBinding(
-                    ReplicaWorkbenchPolicy(),
-                    (CapabilityRef("replica.regions"),),
-                ),
-                WorkbenchPolicyBinding(
-                    TextLayerWorkbenchPolicy(),
-                    (CapabilityRef("replica.text-layers"),),
-                ),
-            ),
-        ),
-        ModuleContribution(
-            modules["translation.core"],
-            bindings=(
-                ServiceBinding(
-                    TRANSLATION_PROVENANCE_SERVICE,
-                    graph.translation_provenance,
-                    (CapabilityRef("translation.provenance"),),
-                ),
-                ServiceBinding(
-                    TRANSLATION_SERVICE,
-                    graph.translations,
-                    tuple(
-                        capability
-                        for capability in modules["translation.core"].provides
-                        if capability.id != "translation.provenance"
-                    ),
-                ),
-            ),
-            item_policies=(
-                WorkbenchPolicyBinding(
-                    TranslationWorkbenchPolicy(),
-                    (CapabilityRef("translation.layers.status"),),
-                ),
-            ),
-        ),
-        ModuleContribution(
-            modules["replica.lib"],
-            bindings=(
-                ServiceBinding(
-                    INTERCHANGE_SERVICE,
-                    graph.interchange,
-                    modules["replica.lib"].provides,
-                ),
-            ),
-        ),
     )
 
 
@@ -1783,6 +1788,53 @@ BUILDS_PATH = lib.OUTPUT_DIR / "whl_builds.json"
 _builds_lock = threading.Lock()
 
 
+@contextlib.contextmanager
+def _live_item_write_scope(item_id: str):
+    """Serialize one legacy item write against aggregate lifecycle deletion.
+
+    Transitional request handlers still publish several entry sidecars
+    directly instead of through an engine repository.  They must therefore
+    join the engine's recoverable workspace lease themselves.  Catalogue
+    membership is re-read *inside* that lease; after the brief catalogue lock
+    is released, the lease stays held for the caller's complete mutation.
+    Aggregate deletion takes the same lease, so either this write finishes
+    first and deletion removes its result, or deletion wins and this scope
+    refuses to recreate the managed tree.
+    """
+
+    item_id = str(item_id or "").strip()
+    if not item_id:
+        abort(404)
+    with _ensure_engine_session().write_set.workspace_lease():
+        with _builds_lock:
+            builds = lib.load_json(BUILDS_PATH, {})
+            item = builds.get(item_id) if isinstance(builds, dict) else None
+        if not isinstance(item, dict):
+            abort(404)
+        yield item
+
+
+def _live_item_write_endpoint(fn):
+    """Apply :func:`_live_item_write_scope` to a path-scoped mutation.
+
+    Mixed GET/write endpoints retain their existing read path.  Flask passes
+    path parameters by keyword, and the two historical spellings are both
+    supported while those routes are migrated into engine modules.
+    """
+
+    @functools.wraps(fn)
+    def guarded(*args, **kwargs):
+        if request.method in ("GET", "HEAD", "OPTIONS"):
+            return fn(*args, **kwargs)
+        item_id = kwargs.get("build_id") or kwargs.get("bid")
+        if item_id is None and args:
+            item_id = args[0]
+        with _live_item_write_scope(str(item_id or "")):
+            return fn(*args, **kwargs)
+
+    return guarded
+
+
 def _build_updated_at(previous: str = "") -> str:
     """Return a build revision token strictly newer than ``previous``.
 
@@ -1819,14 +1871,36 @@ def _mutate_json(path, lock, default, fn):
         return out
 
 
-def _builds_apply(bid: str, fields: dict) -> str:
+def _builds_apply(
+        bid: str, fields: dict, *, expected_revision: str | None = None) -> str:
     """Fold field changes into one build against a FRESH read of the store —
     for slow work (folder sync, page deletion) whose snapshot may be minutes
     old: only this build's fields are ours to change (the _publish_run
     precedent)."""
+    overlap = sorted(set(fields) & _BUILD_REPRESENTATION_FIELDS)
+    if overlap:
+        raise ValueError(
+            "representation fields require the representation command service: "
+            + ", ".join(overlap)
+        )
+
     def apply(builds):
         if bid in builds:
             row = builds[bid]
+            current_revision = _engine_build_record_revision(bid, row)
+            if (
+                expected_revision is not None
+                and current_revision != expected_revision
+            ):
+                raise EngineConflictError(
+                    "the item changed while background work was running",
+                    code="item_revision_conflict",
+                    details={
+                        "item_id": bid,
+                        "expected_revision": expected_revision,
+                        "current_revision": current_revision,
+                    },
+                )
             row.update(fields)
             row["updated_at"] = _build_updated_at(row.get("updated_at"))
             return row["updated_at"]
@@ -1851,6 +1925,11 @@ _BUILD_FIELDS = ("published_slug",
                  "ocr_active", "ocr_verified", "ocr_quality",
                  "title_pages", "thumbnail_source", "attention",
                  "images", "extra", "capture_id")
+
+_BUILD_REPRESENTATION_FIELDS = frozenset({
+    "pdf_file", "pdf_sources", "representation_manifest",
+})
+_BUILD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 # The structured exceptions to the str() coercion below. `categories` (flat
 # text) is deprecated in favour of category_ids — kept as display fallback.
@@ -1882,6 +1961,7 @@ def _clean_pdf_sources(raw) -> list:
     build is a flat string; this one field is structured, so it gets its
     own sanitizer instead of the str() coercion."""
     out = []
+    aliases = {"primary"}
     if isinstance(raw, list):
         for it in raw:
             if not isinstance(it, dict):
@@ -1889,9 +1969,14 @@ def _clean_pdf_sources(raw) -> list:
             path = str(it.get("path") or "").strip()
             if not path:
                 continue
-            sid = re.sub(r"[^\w]", "", str(it.get("id") or ""))[:12]
-            if not sid or sid == "primary":   # "primary" is a reserved key
-                sid = lib.gen_id()
+            sid = re.sub(
+                r"[^A-Za-z0-9_-]", "", str(it.get("id") or "")
+            )[:31]
+            alias = sid.casefold()
+            if not sid or alias in aliases:
+                sid = lib.gen_id(set(aliases))
+                alias = sid.casefold()
+            aliases.add(alias)
             out.append({"id": sid, "path": path})
     return out
 
@@ -1922,7 +2007,11 @@ _RIGHTS_PUBLIC = {"public-domain": "Public domain", "cleared": "Cleared",
 
 @app.route("/api/builds")
 def api_builds():
-    return jsonify({"builds": lib.load_json(BUILDS_PATH, {})})
+    # This transitional projection contains local source paths. It remains for
+    # legacy callers only and must never enter a browser or intermediary cache.
+    response = jsonify({"builds": lib.load_json(BUILDS_PATH, {})})
+    response.cache_control.no_store = True
+    return response
 
 
 def _create_build(seed: dict) -> tuple[dict | None, str]:
@@ -1934,7 +2023,11 @@ def _create_build(seed: dict) -> tuple[dict | None, str]:
         builds = lib.load_json(BUILDS_PATH, {})
         build = {f: str(seed.get(f, "") or "").strip() for f in _BUILD_FIELDS
                  if f not in _BUILD_STRUCTURED_FIELDS}
-        build["pdf_sources"] = _clean_pdf_sources(seed.get("pdf_sources"))
+        # Source attachment is a separate versioned aggregate. The browser
+        # creates catalogue state first, then attaches any seed source through
+        # the representation command service under dual CAS preconditions.
+        build["pdf_file"] = ""
+        build["pdf_sources"] = []
         build["category_ids"] = _clean_category_ids(seed.get("category_ids"),
                                                     lib.load_taxonomy()["nodes"])
         build["bundle"] = _clean_bundle(seed.get("bundle"))
@@ -1948,6 +2041,11 @@ def _create_build(seed: dict) -> tuple[dict | None, str]:
         build["id"] = lib.gen_id(set(builds))
         build["created_at"] = _build_updated_at()
         build["updated_at"] = build["created_at"]
+        build["representation_manifest"] = {
+            "version": 1,
+            "sources": {},
+            "detached": [],
+        }
         builds[build["id"]] = build
         lib.save_json(BUILDS_PATH, builds)
     activity("created", "draft entry", detail=build.get("title", ""))
@@ -1957,7 +2055,21 @@ def _create_build(seed: dict) -> tuple[dict | None, str]:
 @app.route("/api/builds", methods=["POST"])
 def api_builds_create():
     payload = request.get_json(silent=True) or {}
-    build, err = _create_build(payload.get("build") or {})
+    seed = payload.get("build") or {}
+    managed_sources = sorted(
+        set(seed) & _BUILD_REPRESENTATION_FIELDS
+    ) if isinstance(seed, Mapping) else []
+    if managed_sources:
+        return jsonify({
+            "ok": False,
+            "error": (
+                "Create catalogue state first, then attach PDF sources "
+                "through the representation command resource"
+            ),
+            "code": "representation_command_required",
+            "fields": managed_sources,
+        }), 409
+    build, err = _create_build(seed)
     if err:
         return jsonify({"ok": False, "error": err}), 400
     return jsonify({"ok": True, "build": build})
@@ -1970,6 +2082,17 @@ def api_builds_update(build_id: str):
         if build_id not in builds:
             abort(404)
         payload = request.get_json(silent=True) or {}
+        managed_sources = sorted(set(payload) & _BUILD_REPRESENTATION_FIELDS)
+        if managed_sources:
+            return jsonify({
+                "ok": False,
+                "error": (
+                    "PDF sources must be changed through the representation "
+                    "command resource"
+                ),
+                "code": "representation_command_required",
+                "fields": managed_sources,
+            }), 409
         if str(payload.get("rights") or "").strip() not in _BUILD_RIGHTS:
             return jsonify({"ok": False,
                             "error": f"unknown rights value {payload['rights']!r}"}), 400
@@ -2011,38 +2134,234 @@ def api_builds_update(build_id: str):
 
 @app.route("/api/builds/<build_id>", methods=["DELETE"])
 def api_builds_delete(build_id: str):
-    with _builds_lock:
+    """Compatibility facade over aggregate lifecycle deletion.
+
+    Older renderers know only this path and expect a ``trash_id``.  Keep that
+    response spelling, but make the value the engine-owned lifecycle tombstone
+    id; catalogue-only deletion is no longer an authority in this process.
+    Callers may opt into replay-safe semantics by carrying the modern CAS and
+    idempotency headers.  Headerless legacy callers receive a coherent
+    preflight followed by the same conditional engine command.
+    """
+
+    try:
+        lifecycle = _item_lifecycle_engine()
+        _item_lifecycle_require_empty_body()
+        modern_headers = (
+            request.headers.get("Idempotency-Key") is not None,
+            request.headers.get("If-Record-Match") is not None,
+            request.headers.get("If-Managed-Tree-Match") is not None,
+        )
+        if any(modern_headers):
+            # Exact replay is possible only with the complete original
+            # command identity. Never mix server-derived state or a fresh
+            # operation id with a caller-supplied subset.
+            item_revision = _item_lifecycle_match(
+                "If-Record-Match",
+                required_code="item_revision_required",
+                invalid_code="invalid_item_revision",
+                details={"item_id": build_id},
+            )
+            tree_revision = _item_lifecycle_match(
+                "If-Managed-Tree-Match",
+                required_code="managed_tree_revision_required",
+                invalid_code="invalid_managed_tree_revision",
+                details={"item_id": build_id},
+            )
+            operation_id = _item_command_operation_id(item_id=build_id)
+        else:
+            state = lifecycle.inspect(build_id)
+            item_revision = state.item.revision
+            tree_revision = state.managed_tree.revision
+            operation_id = f"legacy-item-delete-{uuid.uuid4().hex}"
+        result = lifecycle.delete(LifecycleDeleteItemCommand(
+            item_id=build_id,
+            expected_item_revision=item_revision,
+            expected_managed_tree_revision=tree_revision,
+            operation_id=operation_id,
+        ))
+    except EngineError as exc:
+        return _engine_error_response(exc)
+
+    receipt = result.receipt
+    tombstone = receipt.tombstone
+    response = jsonify({
+        "ok": True,
+        "schema": "librarytool.legacy-item-delete/1",
+        "deprecated": True,
+        "trash_id": tombstone.tombstone_id,
+        "tombstone_id": tombstone.tombstone_id,
+        **result.as_dict(),
+    })
+    response.cache_control.no_store = True
+    response.headers["Location"] = url_for(
+        "api_v1_item_tombstone", tombstone_id=tombstone.tombstone_id,
+    )
+    response.headers["X-Record-Revision"] = receipt.deleted_item_revision
+    response.headers["X-Managed-Tree-Revision"] = (
+        receipt.managed_tree_revision
+    )
+    response.headers["X-Tombstone-Revision"] = tombstone.revision
+    return response
+
+
+def _legacy_active_item_tombstone(item_id: str):
+    """Return the one active aggregate tombstone for a legacy item id."""
+
+    return next((
+        tombstone
+        for tombstone in _item_lifecycle_engine().list_tombstones()
+        if tombstone.item_id == item_id and tombstone.state == "deleted"
+    ), None)
+
+
+def _legacy_restore_lifecycle_tombstone(
+    tombstone_id: str,
+) -> tuple[dict, ItemLifecycleResult | None]:
+    """Restore a server-owned tombstone for compatibility transports.
+
+    The old transport has no tombstone CAS field.  Reading the current public
+    snapshot and passing that revision into the engine preserves collision and
+    race safety; an optional Idempotency-Key still gives callers exact replay
+    when they also use the versioned resource for retry.
+    """
+
+    lifecycle = _item_lifecycle_engine()
+    tombstone = lifecycle.get_tombstone(tombstone_id)
+    result = None
+    modern_headers = (
+        request.headers.get("Idempotency-Key") is not None,
+        request.headers.get("If-Tombstone-Match") is not None,
+    )
+    if any(modern_headers):
+        # On response-loss retry the public tombstone may already say
+        # ``restored``. Send the caller's original command back through the
+        # service so its durable receipt—not this facade—decides replay versus
+        # operation-id or revision conflict. A partial command is rejected by
+        # the standard header readers below.
+        expected_revision = _item_lifecycle_match(
+            "If-Tombstone-Match",
+            required_code="tombstone_revision_required",
+            invalid_code="invalid_tombstone_revision",
+            details={"tombstone_id": tombstone_id},
+        )
+        operation_id = _item_command_operation_id()
+        result = lifecycle.restore(RestoreItemCommand(
+            tombstone_id=tombstone_id,
+            expected_tombstone_revision=expected_revision,
+            operation_id=operation_id,
+        ))
+        tombstone = result.receipt.tombstone
+    elif tombstone.state == "deleted":
+        result = lifecycle.restore(RestoreItemCommand(
+            tombstone_id=tombstone_id,
+            expected_tombstone_revision=tombstone.revision,
+            operation_id=f"legacy-item-restore-{uuid.uuid4().hex}",
+        ))
+        tombstone = result.receipt.tombstone
+
+    # The legacy response still embeds a build projection. Read it under the
+    # same aggregate isolation so a racing lifecycle delete cannot remove it
+    # between the committed restore and this compatibility projection.
+    with lifecycle.deletion_index_guard():
         builds = lib.load_json(BUILDS_PATH, {})
-        if build_id not in builds:
-            abort(404)
-        record = builds[build_id]
-        del builds[build_id]
-        lib.save_json(BUILDS_PATH, builds)
-    # a few KB of JSON, so this never troubles the byte cap. The client's undo
-    # covers the next few seconds; this is the backstop for the next few days.
-    _trash_put("build", f"Entry: {record.get('title') or build_id}",
-               {"build_id": build_id}, {},
-               {"record.json": json.dumps(record, ensure_ascii=False)})
-    return jsonify({"ok": True})
+        build = (
+            builds.get(tombstone.item_id)
+            if isinstance(builds, dict) else None
+        )
+        live_revision = (
+            _engine_build_record_revision(tombstone.item_id, build)
+            if isinstance(build, Mapping) else ""
+        )
+    if not isinstance(build, dict):
+        raise EngineRepositoryError(
+            "the restored item is absent from the catalogue",
+            code="item_restore_publication_missing",
+            details={"item_id": tombstone.item_id},
+        )
+    if result is None and live_revision != tombstone.restored_item_revision:
+        raise EngineConflictError(
+            "the restored item changed after the lifecycle command",
+            code="item_restore_replay_conflict",
+            details={
+                "item_id": tombstone.item_id,
+                "expected_item_revision": tombstone.restored_item_revision,
+                "current_item_revision": live_revision,
+            },
+        )
+    body = {
+        "ok": True,
+        "schema": "librarytool.legacy-item-restore/1",
+        "deprecated": True,
+        "restored": ["record.json"],
+        "skipped": [],
+        "replayed": result is None or result.replayed,
+        "build": dict(build),
+        "tombstone_id": tombstone.tombstone_id,
+        "tombstone": tombstone.as_dict(),
+    }
+    if result is not None:
+        body["receipt"] = result.receipt.as_public_dict()
+    return body, result
 
 
 @app.route("/api/builds/restore", methods=["POST"])
 def api_builds_restore():
-    """Reinsert a deleted build verbatim (undo support)."""
+    """Compatibility restore that delegates only to an aggregate tombstone."""
     payload = request.get_json(silent=True) or {}
-    build = payload.get("build") or {}
-    bid = str(build.get("id") or "")
-    if not bid:
+    raw = payload.get("build") or {}
+    if not isinstance(raw, Mapping):
+        return jsonify({"ok": False, "error": "build must be an object"}), 400
+    managed_sources = sorted(set(raw) & _BUILD_REPRESENTATION_FIELDS)
+    if managed_sources:
+        return jsonify({
+            "ok": False,
+            "error": (
+                "Restore catalogue state first, then attach PDF sources "
+                "through the representation command resource"
+            ),
+            "code": "representation_command_required",
+            "fields": managed_sources,
+        }), 409
+    bid = str(raw.get("id") or "")
+    if not bid or not _BUILD_ID_RE.fullmatch(bid):
         abort(400)
-    build["images"] = _clean_images(build.get("images"))
-    build["extra"] = _clean_extra(build.get("extra"))
-    build["capture_id"] = _clean_capture_id(build.get("capture_id"))
-
-    def reinsert(builds):
-        build["updated_at"] = _build_updated_at(build.get("updated_at"))
-        builds[bid] = build
-    _mutate_json(BUILDS_PATH, _builds_lock, {}, reinsert)
-    return jsonify({"ok": True, "build": build})
+    try:
+        builds = lib.load_json(BUILDS_PATH, {})
+        if isinstance(builds, dict) and bid in builds:
+            return jsonify({
+                "ok": False,
+                "error": "the build already exists",
+                "code": "item_already_exists",
+            }), 409
+        tombstone = _legacy_active_item_tombstone(bid)
+        if tombstone is None:
+            response = jsonify({
+                "ok": False,
+                "error": (
+                    "catalogue-only restore is retired; restore an engine "
+                    "item tombstone instead"
+                ),
+                "code": "legacy_item_restore_retired",
+                "replacement": "/api/v1/item-tombstones/<id>/restore",
+            })
+            response.cache_control.no_store = True
+            return response, 410
+        body, result = _legacy_restore_lifecycle_tombstone(
+            tombstone.tombstone_id
+        )
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    response = jsonify(body)
+    response.cache_control.no_store = True
+    if result is not None:
+        response.headers["X-Record-Revision"] = (
+            result.receipt.restored_item_revision
+        )
+        response.headers["X-Tombstone-Revision"] = (
+            result.receipt.tombstone.revision
+        )
+    return response
 
 
 # --- staged alternatives: Process-mode candidate field-sets ------------------------
@@ -2788,14 +3107,13 @@ def api_pdf():
 def api_ai_summarize():
     """Proxy a summarization request to an OpenAI-compatible chat API.
     The browser cannot call those APIs directly (no CORS), so the client
-    sends its configured endpoint/model/key here."""
+    sends its configured endpoint/model here. The key is leased server-side."""
     p = request.get_json(silent=True) or {}
     base = (p.get("base_url") or "https://api.openai.com/v1").rstrip("/")
-    key = (p.get("api_key") or "").strip()
     model = (p.get("model") or "").strip()
     instructions = (p.get("instructions") or "").strip()
     text = (p.get("text") or "").strip()
-    if not key or not model:
+    if not _secret_is_configured("aiKey") or not model:
         return jsonify({"ok": False,
                         "error": "AI model not configured (Settings > AI); API key (Settings > Credentials)"})
     if not text:
@@ -2811,24 +3129,20 @@ def api_ai_summarize():
                                         + text[:60000]},
         ],
     }).encode("utf-8")
-    req = urllib.request.Request(
-        base + "/chat/completions", data=body, method="POST",
-        headers={"Content-Type": "application/json",
-                 "Authorization": "Bearer " + key})
     try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        with _lease_secret("aiKey") as key:
+            req = urllib.request.Request(
+                base + "/chat/completions", data=body, method="POST",
+                headers={"Content-Type": "application/json",
+                         "Authorization": "Bearer " + key})
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
         summary = data["choices"][0]["message"]["content"]
         return jsonify({"ok": True, "summary": summary})
     except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            detail = exc.read().decode("utf-8", "replace")[:300]
-        except Exception:
-            pass
-        return jsonify({"ok": False, "error": f"HTTP {exc.code}: {detail}"})
-    except Exception as exc:
-        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        return jsonify({"ok": False, "error": f"provider returned HTTP {exc.code}"})
+    except Exception:
+        return jsonify({"ok": False, "error": "AI provider unavailable"})
 
 
 # --- entry folders: one directory per pending entry -------------------------------
@@ -3299,6 +3613,7 @@ def api_build_text_artifact(build_id: str, kind: str, name: str):
 
 
 @app.route("/api/builds/<build_id>/folder", methods=["POST"])
+@_live_item_write_endpoint
 def api_build_folder_sync(build_id: str):
     """Create/refresh the entry folder: metadata, PDF preview, extracted OCR.
     Body: {pages: N, keep_original: bool}."""
@@ -3367,10 +3682,18 @@ def api_build_folder_sync(build_id: str):
                 notes.append(f"blank-page trim failed: {exc}")
     if src is not None:
         try:
-            prev = _preview_pdf(src, pages)
-            import shutil
-            shutil.copyfile(prev, d / "primary.pdf")
-            preview_ok = True
+            primary = d / "primary.pdf"
+            try:
+                primary_is_source = (
+                    primary.is_file() and src.resolve() == primary.resolve()
+                )
+            except OSError:
+                primary_is_source = False
+            if not primary_is_source:
+                prev = _preview_pdf(src, pages)
+                import shutil
+                shutil.copyfile(prev, primary)
+                preview_ok = True
             # migrate away from the legacy name: anything pointing at the
             # old preview.pdf (a keep_original repoint from an earlier run)
             # moves to primary.pdf BEFORE the stale file goes
@@ -3379,13 +3702,22 @@ def api_build_folder_sync(build_id: str):
                 old_rel = legacy.resolve().relative_to(
                     lib.DATA_ROOT.resolve()).as_posix()
                 if (b.get("pdf_file") or "").replace("\\", "/") == old_rel:
-                    b["pdf_file"] = (d / "primary.pdf").resolve().relative_to(
-                        lib.DATA_ROOT.resolve()).as_posix()
-                    # this function's snapshot is stale by now (preview render,
-                    # extraction): fold in only this build's change
-                    b["updated_at"] = _builds_apply(
-                        build_id, {"pdf_file": b["pdf_file"]})
-                    src = d / "primary.pdf"
+                    primary_rel = (
+                        primary.resolve()
+                        .relative_to(lib.DATA_ROOT.resolve()).as_posix()
+                    )
+                    _engine_refresh_representation_reference(
+                        build_id,
+                        "primary",
+                        primary_rel,
+                        operation_scope="folder-preview-repoint",
+                        expected_item_revision=(
+                            _engine_build_record_revision(build_id, b)
+                        ),
+                    )
+                    b = lib.load_json(BUILDS_PATH, {}).get(build_id, b)
+                    lib.save_json(d / "metadata.json", b)
+                    src = primary
                 legacy.unlink()
                 notes.append("renamed preview.pdf to primary.pdf")
         except Exception as exc:
@@ -3408,6 +3740,24 @@ def api_build_folder_sync(build_id: str):
             try:
                 srcr = src.resolve()
                 if srcr.is_relative_to(lib.IA_DOWNLOADS_DIR.resolve()):
+                    primary_rel = (
+                        (d / "primary.pdf").resolve()
+                        .relative_to(lib.DATA_ROOT.resolve()).as_posix()
+                    )
+                    # Publish the usable replacement before removing the
+                    # temporary original. If dual CAS or validation refuses,
+                    # the original remains attached and intact.
+                    _engine_refresh_representation_reference(
+                        build_id,
+                        "primary",
+                        primary_rel,
+                        operation_scope="folder-temporary-repoint",
+                        expected_item_revision=(
+                            _engine_build_record_revision(build_id, b)
+                        ),
+                    )
+                    b = lib.load_json(BUILDS_PATH, {}).get(build_id, b)
+                    lib.save_json(d / "metadata.json", b)
                     src.unlink()
                     # a trim in this same sync trashed the pages it removed,
                     # and the row points at the file just deleted. The pages
@@ -3420,11 +3770,6 @@ def api_build_folder_sync(build_id: str):
                     # nothing may keep pointing at the deleted file: the
                     # entry folder's own PDF becomes the build's PDF, and
                     # the IA download catalog entry is retired
-                    b["pdf_file"] = (d / "primary.pdf").resolve().relative_to(
-                        lib.DATA_ROOT.resolve()).as_posix()
-                    b["updated_at"] = _builds_apply(
-                        build_id, {"pdf_file": b["pdf_file"]})
-
                     def _drop_stale(catalog):
                         for k in [k for k, v in catalog.items()
                                   if (lib.DATA_ROOT / str(v.get("saved_as") or "?")).resolve()
@@ -3478,6 +3823,7 @@ def api_build_ocr_get(build_id: str, name: str):
 
 
 @app.route("/api/builds/<build_id>/ocr", methods=["POST"])
+@_live_item_write_endpoint
 def api_build_ocr_put(build_id: str):
     """Store an OCR text file on the entry folder. Body: {name, text, src?}
     — src ties the file to a secondary PDF source (default: primary)."""
@@ -3596,255 +3942,176 @@ def api_build_ocr_layout(build_id: str):
                         if v}})
 
 
-_ENGINE_ITEM_LOCAL_FIELDS = frozenset({
-    # These values remain available through the explicitly requested legacy
-    # build projection, but are not part of the portable catalogue DTO.
-    "pdf_file", "pdf_sources", "images", "extra",
-})
-
-# The first command slice deliberately controls catalogue metadata only.
-# Attachments and job-owned state remain hidden in the transitional record and
-# are copied byte-for-byte by the codec; future representation commands will
-# receive their own aggregate and concurrency boundary.
-_ENGINE_ITEM_COMMAND_MANAGED_FIELDS = frozenset({
-    "id", "item_id", "kind", "title", "created_at", "updated_at",
-    "revision", "representations", "artifacts", "relevance", "capture_id",
-    "published_slug", "ocr_active", "ocr_verified", "ocr_quality",
-    "title_pages", "thumbnail_source", "status",
-}) | _ENGINE_ITEM_LOCAL_FIELDS
-_ENGINE_ITEM_COMMAND_MANAGED_STRING_FIELDS = frozenset({
-    "published_slug", "ocr_active", "ocr_verified", "ocr_quality",
-    "title_pages", "thumbnail_source",
-})
-_ENGINE_ITEM_COMMAND_STRING_FIELDS = (
-    frozenset(_BUILD_FIELDS)
-    - frozenset(_BUILD_STRUCTURED_FIELDS)
-    - _ENGINE_ITEM_COMMAND_MANAGED_FIELDS
-    - {"title"}
-)
-_ENGINE_ITEM_CATEGORY_ID = re.compile(r"^\w{1,12}$")
-_ENGINE_ITEM_CAPTURE_ID = re.compile(r"^[A-Za-z0-9-]{0,64}$")
-_ENGINE_ITEM_LANGUAGE_ID = re.compile(r"^[a-z-]{1,12}$")
-_ENGINE_ITEM_RECORD_REVISION = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,511}$")
+# Transitional HTTP and representation adapters still use this vocabulary.
+# The reusable row codec is now its single owner.
+_ENGINE_ITEM_COMMAND_MANAGED_FIELDS = WhlCatalogueItemCodec.managed_fields
+_ENGINE_REPRESENTATION_ID = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
+_ENGINE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _engine_valid_record_revision(value) -> bool:
-    return isinstance(value, str) and bool(
-        _ENGINE_ITEM_RECORD_REVISION.fullmatch(value))
+    return WhlCatalogueItemCodec.valid_record_revision(value)
 
 
 def _engine_build_record_revision(item_id: str, raw: Mapping) -> str:
-    """Return the command/read-model CAS token without entry-folder reads."""
-    updated_at = raw.get("updated_at")
-    if _engine_valid_record_revision(updated_at):
-        return updated_at
-    canonical = json.dumps(
-        {"item_id": item_id, "record": raw},
-        ensure_ascii=False, allow_nan=False, sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return "ir-" + hashlib.sha256(canonical).hexdigest()[:24]
+    return _ENGINE_ITEM_CODEC.record_revision(item_id, raw)
 
 
 def _engine_validate_bundle(value) -> None:
-    if not isinstance(value, Mapping):
-        raise TypeError("bundle must be an object")
-    allowed = {"about", "annotations", "pages_text", "translations"}
-    if not set(value) <= allowed:
-        raise ValueError("bundle contains unknown fields")
-    for field in ("about", "annotations", "pages_text"):
-        if field in value and not isinstance(value[field], bool):
-            raise TypeError(f"bundle.{field} must be a boolean")
-    if "translations" in value:
-        translations = value["translations"]
-        if not isinstance(translations, (list, tuple)):
-            raise TypeError("bundle.translations must be an array")
-        if (
-            any(not isinstance(item, str)
-                or not _ENGINE_ITEM_LANGUAGE_ID.fullmatch(item)
-                for item in translations)
-            or len(translations) != len(set(translations))
-        ):
-            raise ValueError("bundle.translations is invalid")
+    _ENGINE_ITEM_CODEC.validate_bundle(value)
 
 
 def _engine_validate_catalogue_metadata(
         metadata: Mapping, *, strict_fields=frozenset()) -> None:
-    """Validate known legacy fields while retaining unknown JSON extensions."""
-    if not isinstance(metadata, Mapping):
-        raise TypeError("metadata must be an object")
-    for field in _ENGINE_ITEM_COMMAND_STRING_FIELDS:
-        if field in metadata and not isinstance(metadata[field], str):
-            raise TypeError(f"metadata.{field} must be a string")
-        if (field in metadata and field in strict_fields and metadata[field] !=
-                metadata[field].strip()):
-            raise ValueError(
-                f"metadata.{field} must not have outer whitespace")
-    if "status" in metadata and metadata["status"] not in _BUILD_STATUSES:
-        raise ValueError("metadata.status is invalid")
-    if "rights" in metadata and metadata["rights"] not in _BUILD_RIGHTS:
-        raise ValueError("metadata.rights is invalid")
-    if "category_ids" in metadata:
-        values = metadata["category_ids"]
-        if not isinstance(values, (list, tuple)):
-            raise TypeError("metadata.category_ids must be an array")
-        if (
-            any(not isinstance(value, str)
-                or not _ENGINE_ITEM_CATEGORY_ID.fullmatch(value)
-                for value in values)
-            or len(values) != len(set(values))
-        ):
-            raise ValueError("metadata.category_ids is invalid")
-        if "category_ids" in strict_fields:
-            try:
-                taxonomy = lib.load_taxonomy()
-            except Exception as exc:
-                raise EngineRepositoryError(
-                    "the category catalogue is unavailable",
-                    code="category_repository_unavailable",
-                    details={"cause_type": type(exc).__name__},
-                    retryable=True,
-                ) from exc
-            nodes = taxonomy.get("nodes") if isinstance(taxonomy, Mapping) else None
-            if not isinstance(nodes, Mapping):
-                raise EngineRepositoryError(
-                    "the category catalogue is unavailable",
-                    code="category_repository_unavailable",
-                    retryable=True,
-                )
-            if any(value not in nodes for value in values):
-                raise ValueError("metadata.category_ids contains unknown ids")
-    if "bundle" in metadata:
-        _engine_validate_bundle(metadata["bundle"])
+    _ENGINE_ITEM_CODEC.validate_catalogue_metadata(
+        metadata,
+        strict_fields=strict_fields,
+    )
 
 
 def _engine_validate_managed_build_fields(item_id: str, raw: Mapping) -> None:
-    embedded_id = raw.get("id")
-    if embedded_id is not None and (
-        not isinstance(embedded_id, str) or embedded_id != item_id
+    _ENGINE_ITEM_CODEC.validate_managed_record(item_id, raw)
+
+
+def _engine_representation_manifest(raw: Mapping) -> dict:
+    """Return one strict detached attachment manifest from a build row."""
+    value = raw.get("representation_manifest")
+    if value is None:
+        return {"version": 1, "sources": {}, "detached": []}
+    if not isinstance(value, Mapping) or set(value) != {
+        "version", "sources", "detached",
+    }:
+        raise TypeError("build representation_manifest is invalid")
+    if value.get("version") != 1 or not isinstance(value.get("sources"), Mapping):
+        raise ValueError("build representation_manifest version is invalid")
+    detached = value.get("detached")
+    if not isinstance(detached, (list, tuple)) or any(
+        not isinstance(source_id, str)
+        or not _ENGINE_REPRESENTATION_ID.fullmatch(source_id)
+        or (source_id.casefold() == "primary" and source_id != "primary")
+        for source_id in detached
     ):
-        raise ValueError("the embedded build id conflicts with its key")
-    if "item_id" in raw and raw["item_id"] != item_id:
-        raise ValueError("the embedded item id conflicts with its key")
-    if "kind" in raw and raw["kind"] != "book":
-        raise ValueError("the transitional catalogue supports only books")
-    if "status" in raw and raw["status"] not in _BUILD_STATUSES:
-        raise ValueError("build status is invalid")
-    if "title" in raw and not isinstance(raw["title"], str):
-        raise TypeError("build title must be a string")
-    if "created_at" in raw and not isinstance(raw["created_at"], str):
-        raise TypeError("build created_at must be a string")
-    if "updated_at" in raw and not isinstance(raw["updated_at"], str):
-        raise TypeError("build updated_at must be a string")
-    if "pdf_file" in raw and not isinstance(raw["pdf_file"], str):
-        raise TypeError("build pdf_file must be a string")
-    for field in _ENGINE_ITEM_COMMAND_MANAGED_STRING_FIELDS:
-        if field in raw and not isinstance(raw[field], str):
-            raise TypeError(f"build {field} must be a string")
-    if "pdf_sources" in raw:
-        sources = raw["pdf_sources"]
-        if not isinstance(sources, (list, tuple)):
-            raise TypeError("build pdf_sources must be an array")
-        for source in sources:
-            if not isinstance(source, Mapping):
-                raise TypeError("build pdf_sources must contain objects")
-            if (
-                not isinstance(source.get("id"), str)
-                or not isinstance(source.get("path"), str)
-            ):
-                raise TypeError("build PDF source ids and paths must be strings")
-    if "images" in raw and (
-        not isinstance(raw["images"], (list, tuple))
-        or any(not isinstance(value, str) for value in raw["images"])
-    ):
-        raise TypeError("build images must be an array of strings")
-    if "extra" in raw and not isinstance(raw["extra"], Mapping):
-        raise TypeError("build extra must be an object")
-    if "relevance" in raw and not isinstance(raw["relevance"], Mapping):
-        raise TypeError("build relevance must be an object")
-    if "capture_id" in raw and (
-        not isinstance(raw["capture_id"], str)
-        or not _ENGINE_ITEM_CAPTURE_ID.fullmatch(raw["capture_id"])
-    ):
-        raise ValueError("build capture_id is invalid")
+        raise TypeError("build detached representation ids are invalid")
+    folded_detached = [source_id.casefold() for source_id in detached]
+    if len(folded_detached) != len(set(folded_detached)):
+        raise ValueError("build detached representation ids are duplicated")
+    sources = {}
+    aliases = set()
+    fields = {
+        "role", "media_type", "label", "acquisition",
+        "content_sha256", "size", "source_stat", "metadata",
+    }
+    for source_id, record in value["sources"].items():
+        if (
+            not isinstance(source_id, str)
+            or not _ENGINE_REPRESENTATION_ID.fullmatch(source_id)
+            or (source_id.casefold() == "primary" and source_id != "primary")
+            or source_id.casefold() in aliases
+        ):
+            raise ValueError("build representation manifest ids are invalid")
+        aliases.add(source_id.casefold())
+        if not isinstance(record, Mapping) or set(record) != fields:
+            raise TypeError("build representation manifest source is invalid")
+        if (
+            not isinstance(record["role"], str)
+            or not isinstance(record["media_type"], str)
+            or not isinstance(record["label"], str)
+            or record["acquisition"] not in {"reference", "copy"}
+            or not isinstance(record["content_sha256"], str)
+            or not _ENGINE_SHA256.fullmatch(record["content_sha256"])
+            or isinstance(record["size"], bool)
+            or not isinstance(record["size"], int)
+            or record["size"] < 0
+            or not isinstance(record["source_stat"], Mapping)
+            or set(record["source_stat"]) != {
+                "size", "mtime_ns", "ctime_ns", "device", "inode",
+            }
+            or any(
+                isinstance(record["source_stat"].get(field), bool)
+                or not isinstance(record["source_stat"].get(field), int)
+                for field in (
+                    "size", "mtime_ns", "ctime_ns", "device", "inode",
+                )
+            )
+            or record["source_stat"].get("size") < 0
+            or record["source_stat"].get("size") != record["size"]
+            or not isinstance(record["metadata"], Mapping)
+        ):
+            raise ValueError("build representation manifest source is invalid")
+        # JSON round-trip detaches legacy mutable containers and rejects data
+        # that cannot survive the catalogue's storage contract.
+        sources[source_id] = json.loads(json.dumps(
+            record, ensure_ascii=False, allow_nan=False,
+        ))
+    if aliases & set(folded_detached):
+        raise ValueError("a representation cannot be attached and detached")
+    return {
+        "version": 1,
+        "sources": sources,
+        "detached": list(detached),
+    }
 
 
 def _engine_item_command_decode(
         item_id: str, raw: Mapping) -> ItemRecordSnapshot:
-    """Decode one legacy build into the catalogue-only command aggregate."""
-    if not isinstance(raw, Mapping):
-        raise TypeError("a build record must be an object")
-    _engine_validate_managed_build_fields(item_id, raw)
-    metadata = {
-        key: value for key, value in raw.items()
-        if key not in _ENGINE_ITEM_COMMAND_MANAGED_FIELDS
-    }
-    _engine_validate_catalogue_metadata(metadata)
-    return ItemRecordSnapshot(
-        item_id=item_id,
-        revision=_engine_build_record_revision(item_id, raw),
-        kind="book",
-        title=raw.get("title", ""),
-        metadata=metadata,
-        representations=(),
-    )
+    return _ENGINE_ITEM_CODEC.decode(item_id, raw)
 
 
 def _engine_item_command_encode(
         item_id: str, draft: ItemDraft,
         previous: Mapping | None) -> Mapping:
-    """Encode a catalogue command while retaining server-managed raw state."""
-    if not isinstance(draft, ItemDraft):
-        raise TypeError("the item draft is invalid")
-    if draft.kind != "book" or draft.representations:
-        raise ValueError("only catalogue metadata for books is supported")
-    managed = sorted(set(draft.metadata) &
-                     _ENGINE_ITEM_COMMAND_MANAGED_FIELDS)
-    if managed:
-        raise ValueError("item metadata contains server-managed fields")
-    _engine_validate_catalogue_metadata(draft.metadata)
+    return _ENGINE_ITEM_CODEC.encode(item_id, draft, previous)
 
-    if previous is None:
-        if draft.title != draft.title.strip():
-            raise ValueError("item title must not have outer whitespace")
-        _engine_validate_catalogue_metadata(
-            draft.metadata, strict_fields=frozenset(draft.metadata))
-        now = _build_updated_at()
-        result = {
-            "id": item_id,
-            "title": draft.title,
-            "status": "draft",
-            "created_at": now,
-            "updated_at": now,
-        }
-    else:
-        if not isinstance(previous, Mapping):
-            raise TypeError("the previous build record is invalid")
-        _engine_validate_managed_build_fields(item_id, previous)
-        previous_metadata = {
-            key: value for key, value in previous.items()
-            if key not in _ENGINE_ITEM_COMMAND_MANAGED_FIELDS
-        }
-        if (draft.title != previous.get("title", "")
-                and draft.title != draft.title.strip()):
-            raise ValueError("item title must not have outer whitespace")
-        changed = frozenset(
-            key for key, value in draft.metadata.items()
-            if key not in previous_metadata
-            or previous_metadata[key] != value
-        )
-        _engine_validate_catalogue_metadata(
-            draft.metadata, strict_fields=changed)
-        result = dict(previous)
-        for key in tuple(result):
-            if key not in _ENGINE_ITEM_COMMAND_MANAGED_FIELDS:
-                del result[key]
-        result["id"] = item_id
-        result["title"] = draft.title
-        result["updated_at"] = _build_updated_at(previous.get("updated_at"))
-    result.update(dict(draft.metadata))
-    return result
+
+def _engine_advance_restored_record(
+    item_id: str,
+    raw: Mapping,
+) -> Mapping:
+    return _ENGINE_ITEM_CODEC.advance_restored_record(item_id, raw)
+
+
+def _engine_open_lib_draft(metadata: Mapping) -> ItemDraft:
+    """Project hostile ``.lib`` metadata into one safe catalogue draft.
+
+    Archive decoding remains in the framework-neutral planner.  This injected
+    production policy owns the transitional catalogue's bibliographic field
+    vocabulary and its publication-rights default, so another host or module
+    can choose a different metadata model without changing the open service.
+    """
+
+    if not isinstance(metadata, Mapping):
+        raise TypeError("Replica manifest metadata must be an object")
+
+    def text(field: str) -> str:
+        return str(metadata.get(field) or "").strip()
+
+    # ``published_slug`` is intentionally omitted even though old exporters
+    # may include it: it is server-managed publication state, not descriptive
+    # metadata that a foreign package may assign to a new local item.
+    bibliographic = {
+        field: text(field)
+        for field in _LIB_META_FIELDS
+        if field not in {"title", "published_slug"}
+    }
+    # Preserve the complete transitional build shape without accepting any of
+    # these operational values from the archive.  The eventual neutral
+    # catalogue schema can drop this projection without changing OpenLibService.
+    bibliographic.update({
+        "group_id": "",
+        "categories": "",
+        "category_ids": [],
+        "description": "",
+        "pdf_source": "",
+        "bundle": _clean_bundle({}),
+        "notes": "",
+        "rights": "",
+        "attention": "",
+    })
+    return ItemDraft(
+        title=text("title"),
+        metadata=bibliographic,
+    )
 
 
 def _engine_representation_locator(item_id: str, source_id: str) -> str:
@@ -3854,44 +4121,103 @@ def _engine_representation_locator(item_id: str, source_id: str) -> str:
     return f"urn:librarytool:item:{item}:representation:{source}"
 
 
+def _engine_file_stat(value) -> dict:
+    """Portable identity/change fingerprint for one attached local file."""
+    return {
+        "size": int(value.st_size),
+        "mtime_ns": int(value.st_mtime_ns),
+        "ctime_ns": int(value.st_ctime_ns),
+        "device": int(value.st_dev),
+        "inode": int(value.st_ino),
+    }
+
+
+def _engine_cross_interface_file_metadata(value) -> tuple[int, int, int]:
+    """Metadata safe to compare between path-stat and descriptor-stat."""
+
+    return (
+        int(value.st_mode),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+    )
+
+
 def _engine_source_snapshot(item_id: str, source_id: str, raw: str,
-                            *, role: str, label: str) -> dict:
+                            *, role: str, label: str,
+                            manifest: Mapping | None = None) -> dict:
     """Project one attached PDF into a stable, path-safe representation."""
+    manifest = manifest if isinstance(manifest, Mapping) else {}
     path = _resolve_local(raw) if raw else None
     stat = None
     if path is not None:
         try:
             if path.is_file():
                 value = path.stat()
-                stat = {"size": value.st_size, "mtime_ns": value.st_mtime_ns}
+                stat = _engine_file_stat(value)
         except OSError:
             stat = None
     fingerprint = json.dumps(
-        {"path": raw, "stat": stat}, sort_keys=True, separators=(",", ":"),
+        {"path": raw, "stat": stat, "manifest": manifest},
+        sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")
+    acquisition = str(manifest.get("acquisition") or "reference")
+    content_sha256 = str(manifest.get("content_sha256") or "")
+    stored_size = manifest.get("size")
+    size = (stored_size if isinstance(stored_size, int)
+            and not isinstance(stored_size, bool) and stored_size >= 0
+            else stat.get("size") if stat else None)
+    metadata = manifest.get("metadata")
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+    attached_stat = manifest.get("source_stat")
+    tracked = bool(manifest.get("content_sha256"))
+    unchanged = (
+        isinstance(attached_stat, Mapping)
+        and stat is not None
+        and all(attached_stat.get(field) == stat[field] for field in stat)
+    )
+    content_state = (
+        "missing" if stat is None else
+        "unchanged" if tracked and unchanged else
+        "drifted" if tracked else
+        "untracked"
+    )
     return {
         "id": source_id,
         "revision": "sr-" + hashlib.sha256(fingerprint).hexdigest()[:24],
-        "role": role,
-        "media_type": "application/pdf",
+        "role": str(manifest.get("role") or role),
+        "media_type": str(manifest.get("media_type") or "application/pdf"),
         "locator": _engine_representation_locator(item_id, source_id),
-        "label": label,
+        "label": str(manifest.get("label") or label),
         # Bundled OCR/Replica executors require a readable local attachment.
         # A remote catalogue URL remains metadata, not a usable source.
-        "available": bool(stat),
+        # A referenced file whose stat no longer matches the bytes hashed at
+        # attachment is not advertised as a usable source. Its stored digest
+        # still identifies the attached pre-image; replacing the reference
+        # explicitly refreshes both digest and stat fingerprint.
+        "available": bool(stat) and content_state != "drifted",
+        "disposition": "copied" if acquisition == "copy" else "referenced",
+        "content_state": content_state,
+        "content_sha256": content_sha256,
+        "size": size,
+        "metadata": dict(metadata),
     }
 
 
 def _engine_item_representations(item_id: str, build: dict) -> list[dict]:
     rows = []
+    manifest = _engine_representation_manifest(build)
+    source_manifest = manifest["sources"]
+    detached = {value.casefold() for value in manifest["detached"]}
     primary = str(build.get("pdf_file") or "").strip()
-    if not primary:
+    if not primary and "primary" not in detached:
         entry_pdf = _entry_primary_pdf(item_id)
         if entry_pdf:
             primary = str(_entry_dir(item_id) / entry_pdf)
     if primary:
         rows.append(_engine_source_snapshot(
             item_id, "primary", primary, role="primary", label="Primary source",
+            manifest=source_manifest.get("primary"),
         ))
     seen = {"primary"}
     for source in build.get("pdf_sources") or []:
@@ -3905,8 +4231,333 @@ def _engine_item_representations(item_id: str, build: dict) -> list[dict]:
         rows.append(_engine_source_snapshot(
             item_id, source_id, raw, role="alternate",
             label=str(source.get("label") or "Alternate source"),
+            manifest=source_manifest.get(source_id),
         ))
     return rows
+
+
+def _engine_representation_aggregate(
+        item_id: str, build: Mapping) -> RepresentationAggregateSnapshot:
+    """Decode one transitional row into the safe mutation aggregate."""
+    _engine_validate_managed_build_fields(item_id, build)
+    source_ids = [
+        str(source.get("id") or "")
+        for source in build.get("pdf_sources") or []
+        if isinstance(source, Mapping)
+    ]
+    aliases = [value.casefold() for value in source_ids]
+    if (
+        any(not _ENGINE_REPRESENTATION_ID.fullmatch(value)
+            or value.casefold() == "primary" for value in source_ids)
+        or len(aliases) != len(set(aliases))
+    ):
+        raise ValueError("build PDF source ids are invalid or duplicated")
+    snapshots = []
+    for row in _engine_item_representations(item_id, dict(build)):
+        snapshots.append(RepresentationRecordSnapshot(
+            representation_id=row["id"],
+            revision=row["revision"],
+            role=row["role"],
+            media_type=row["media_type"],
+            locator=row["locator"],
+            label=row["label"],
+            available=row["available"],
+            disposition=row["disposition"],
+            content_state=row["content_state"],
+            content_sha256=row["content_sha256"],
+            size=row["size"],
+            metadata=row["metadata"],
+        ))
+    return RepresentationAggregateSnapshot(
+        item_id=item_id,
+        item_revision=_engine_build_record_revision(item_id, build),
+        representations=tuple(snapshots),
+    )
+
+
+def _engine_representation_source_path(source_token: str) -> Path:
+    path = _resolve_local(source_token)
+    if path is None or not path.is_file():
+        raise EngineValidationError(
+            "the representation source is not a readable local file",
+            code="representation_source_not_found",
+        )
+    if path.suffix.casefold() != ".pdf":
+        raise EngineValidationError(
+            "this adapter currently accepts PDF representations only",
+            code="unsupported_representation_media_type",
+            details={"media_type": "application/pdf"},
+        )
+    return path
+
+
+def _engine_representation_manifest_record(
+        draft: RepresentationAttachmentDraft, path: Path) -> dict:
+    from pypdf import PdfReader
+
+    try:
+        named_before = path.stat()
+        with path.open("rb") as stream:
+            opened_before = os.fstat(stream.fileno())
+            before = _engine_file_stat(opened_before)
+            if (
+                not stat.S_ISREG(named_before.st_mode)
+                or not stat.S_ISREG(opened_before.st_mode)
+                or not os.path.samestat(opened_before, named_before)
+                or _engine_cross_interface_file_metadata(opened_before)
+                != _engine_cross_interface_file_metadata(named_before)
+            ):
+                raise EngineConflictError(
+                    "the representation source changed while it was being attached",
+                    code="representation_source_changed",
+                    retryable=True,
+                )
+            if stream.read(5) != b"%PDF-":
+                raise EngineValidationError(
+                    "the representation source is not a PDF",
+                    code="invalid_representation_source",
+                )
+            stream.seek(0)
+            try:
+                reader = PdfReader(stream, strict=False)
+                if reader.is_encrypted or len(reader.pages) < 1:
+                    raise ValueError("the PDF has no readable pages")
+            except Exception as exc:
+                raise EngineValidationError(
+                    "the representation source is not a readable PDF",
+                    code="invalid_representation_source",
+                ) from exc
+            stream.seek(0)
+            digest_state = hashlib.sha256()
+            while chunk := stream.read(1024 * 1024):
+                digest_state.update(chunk)
+            digest = digest_state.hexdigest()
+            opened_after = os.fstat(stream.fileno())
+            after = _engine_file_stat(opened_after)
+            named_after = path.stat()
+            path_after = _engine_file_stat(named_after)
+    except EngineError:
+        raise
+    except OSError as exc:
+        raise EngineValidationError(
+            "the representation source changed while it was being attached",
+            code="representation_source_changed",
+            retryable=True,
+        ) from exc
+    if (
+        before != after
+        or _engine_file_stat(named_before) != path_after
+        or not stat.S_ISREG(opened_after.st_mode)
+        or not stat.S_ISREG(named_after.st_mode)
+        or not os.path.samestat(opened_after, named_after)
+        or _engine_cross_interface_file_metadata(opened_after)
+        != _engine_cross_interface_file_metadata(named_after)
+    ):
+        raise EngineConflictError(
+            "the representation source changed while it was being attached",
+            code="representation_source_changed",
+            retryable=True,
+        )
+    if (
+        draft.expected_content_sha256
+        and digest != draft.expected_content_sha256
+    ):
+        raise EngineConflictError(
+            "the representation source digest does not match",
+            code="representation_source_digest_mismatch",
+            details={"expected_sha256": draft.expected_content_sha256},
+        )
+    if (
+        draft.expected_size is not None
+        and path_after["size"] != draft.expected_size
+    ):
+        raise EngineConflictError(
+            "the representation source size does not match",
+            code="representation_source_size_mismatch",
+            details={"expected_size": draft.expected_size},
+        )
+    return {
+        "role": draft.role,
+        "media_type": draft.media_type,
+        "label": draft.label,
+        "acquisition": draft.acquisition,
+        "content_sha256": digest,
+        "size": path_after["size"],
+        # Drift checks later compare path-stat to path-stat.  Persist the final
+        # named observation, never descriptor-only metadata such as Windows'
+        # cross-interface ctime value.
+        "source_stat": path_after,
+        "metadata": json.loads(json.dumps(
+            draft.as_dict()["metadata"], ensure_ascii=False, allow_nan=False,
+        )),
+    }
+
+
+def _engine_representation_paths(build: Mapping) -> dict[str, Path]:
+    rows = {"primary": str(build.get("pdf_file") or "").strip()}
+    for source in build.get("pdf_sources") or []:
+        if isinstance(source, Mapping):
+            rows[str(source.get("id") or "")] = str(
+                source.get("path") or "").strip()
+    resolved = {}
+    for source_id, raw in rows.items():
+        path = _resolve_local(raw) if raw else None
+        if source_id and path is not None:
+            try:
+                resolved[source_id] = path.resolve(strict=False)
+            except OSError:
+                continue
+    return resolved
+
+
+def _engine_representation_put_record(
+        item_id: str, build: Mapping,
+        draft: RepresentationAttachmentDraft) -> Mapping:
+    """Attach one local reference while retaining its path server-side."""
+    _engine_validate_managed_build_fields(item_id, build)
+    if draft.media_type != "application/pdf":
+        raise EngineValidationError(
+            "this adapter currently accepts PDF representations only",
+            code="unsupported_representation_media_type",
+            details={"media_type": draft.media_type},
+        )
+    if draft.acquisition != "reference":
+        raise EngineValidationError(
+            "managed asset copying is not installed",
+            code="unsupported_representation_acquisition",
+            details={"acquisition": draft.acquisition},
+        )
+    source_id = draft.representation_id
+    if (
+        not _ENGINE_REPRESENTATION_ID.fullmatch(source_id)
+        or (source_id.casefold() == "primary" and source_id != "primary")
+    ):
+        raise EngineValidationError(
+            "the representation id is incompatible with this catalogue",
+            code="invalid_representation_id",
+        )
+    if (
+        source_id == "primary" and draft.role != "primary"
+    ) or (
+        source_id != "primary" and draft.role == "primary"
+    ):
+        raise EngineValidationError(
+            "the representation role conflicts with its identity",
+            code="invalid_representation_role",
+        )
+    path = _engine_representation_source_path(draft.source_token)
+    resolved = path.resolve(strict=True)
+    for existing_id, existing_path in _engine_representation_paths(build).items():
+        if existing_id != source_id and os.path.normcase(existing_path) == os.path.normcase(resolved):
+            raise EngineConflictError(
+                "the source is already attached to this item",
+                code="representation_source_already_attached",
+                details={"item_id": item_id, "representation_id": existing_id},
+            )
+
+    result = dict(build)
+    if source_id == "primary":
+        result["pdf_file"] = draft.source_token
+    else:
+        sources = [
+            dict(source) for source in result.get("pdf_sources") or []
+            if isinstance(source, Mapping) and source.get("id") != source_id
+        ]
+        sources.append({"id": source_id, "path": draft.source_token})
+        result["pdf_sources"] = sources
+
+    manifest = _engine_representation_manifest(build)
+    manifest["sources"][source_id] = _engine_representation_manifest_record(
+        draft, path
+    )
+    manifest["detached"] = [
+        value for value in manifest["detached"] if value != source_id
+    ]
+    result["representation_manifest"] = manifest
+    result["updated_at"] = _build_updated_at(build.get("updated_at"))
+    return result
+
+
+def _engine_representation_detach_record(
+        item_id: str, build: Mapping, source_id: str) -> Mapping:
+    """Detach catalogue state without deleting an external source file."""
+    _engine_validate_managed_build_fields(item_id, build)
+    result = dict(build)
+    if source_id == "primary":
+        result["pdf_file"] = ""
+    else:
+        result["pdf_sources"] = [
+            dict(source) for source in result.get("pdf_sources") or []
+            if isinstance(source, Mapping) and source.get("id") != source_id
+        ]
+    manifest = _engine_representation_manifest(build)
+    manifest["sources"].pop(source_id, None)
+    if source_id not in manifest["detached"]:
+        manifest["detached"].append(source_id)
+    result["representation_manifest"] = manifest
+    result["updated_at"] = _build_updated_at(build.get("updated_at"))
+    return result
+
+
+def _engine_refresh_representation_reference(
+        item_id: str, source_id: str, source_token: str,
+        *, operation_scope: str, expected_item_revision: str):
+    """Attach or replace one internal reference through the same authority.
+
+    Transitional workflows such as folder repointing and page rewrite/restore
+    still operate on legacy local files. Once their file operation succeeds,
+    this helper refreshes the authoritative checksum/stat manifest under the
+    representation service's normal dual-CAS and recoverable receipt boundary.
+    """
+    item = _item_engine().get_item(item_id)
+    if item.record_revision != expected_item_revision:
+        raise EngineConflictError(
+            "the item changed while source work was running",
+            code="item_revision_conflict",
+            details={
+                "item_id": item_id,
+                "expected_revision": expected_item_revision,
+                "current_revision": item.record_revision,
+            },
+        )
+    current = next(
+        (
+            value for value in item.representations
+            if value.representation_id == source_id
+        ),
+        None,
+    )
+    role = "primary" if source_id == "primary" else (
+        current.role if current is not None else "alternate"
+    )
+    label = (
+        current.label if current is not None and current.label else
+        "Primary source" if source_id == "primary" else "Alternate source"
+    )
+    draft = RepresentationAttachmentDraft(
+        representation_id=source_id,
+        source_token=str(source_token).strip(),
+        acquisition="reference",
+        expected_content_sha256="",
+        expected_size=None,
+        role=role,
+        media_type="application/pdf",
+        label=label,
+        metadata=(current.metadata if current is not None else {}),
+    )
+    return _representation_command_engine().attach(
+        AttachRepresentationCommand(
+            item_id=item_id,
+            expected_item_revision=expected_item_revision,
+            expected_representation_revision=(
+                current.revision if current is not None else None
+            ),
+            draft=draft,
+            operation_id=(
+                f"{operation_scope[:64]}-{uuid.uuid4().hex}"
+            ),
+        )
+    )
 
 
 def _engine_artifact_id(item_id: str, kind: str, name: str,
@@ -4443,87 +5094,248 @@ def _engine_workspace_locks(_item_id: str):
                         yield
 
 
-def _library_engine() -> LibraryEngine:
-    """Compose the headless engine against today's file-backed adapters.
+@contextlib.contextmanager
+def _engine_recovery_locks():
+    """Take every transitional storage lock inside the recovery lease."""
 
-    Construction is lazy because the compatibility callbacks are defined
-    throughout this transitional module. By request time the module is fully
-    loaded, while package imports remain side-effect free.
-    """
+    with _engine_workspace_locks(""):
+        yield
+
+
+def _engine_item_category_ids() -> tuple[str, ...]:
+    """Adapt the legacy taxonomy document to the neutral profile port."""
+
+    try:
+        taxonomy = lib.load_taxonomy()
+    except Exception as exc:
+        raise EngineRepositoryError(
+            "the category catalogue is unavailable",
+            code="category_repository_unavailable",
+            details={"cause_type": type(exc).__name__},
+            retryable=True,
+        ) from exc
+    nodes = taxonomy.get("nodes") if isinstance(taxonomy, Mapping) else None
+    if not isinstance(nodes, Mapping):
+        raise EngineRepositoryError(
+            "the category catalogue is unavailable",
+            code="category_repository_unavailable",
+            retryable=True,
+        )
+    return tuple(nodes)
+
+
+_ENGINE_ITEM_CODEC = WhlCatalogueItemCodec(
+    advance_revision=_build_updated_at,
+    category_ids_for=_engine_item_category_ids,
+    validate_representation_manifest=_engine_representation_manifest,
+)
+
+
+def _engine_host_bindings() -> FilesystemHostBindings:
+    """Return borrowed production callbacks for the neutral host opener."""
+
+    policies = _EngineReplicaPolicies()
+    interchange_planner = ExistingItemLibArchivePlanner(
+        parse_format=libformat.parse_format,
+        supported_major=libformat.SUPPORTED_MAJOR,
+        sanitize_items=libformat.sanitize_page_items,
+        sanitize_dims=libformat.sanitize_dims,
+        sanitize_document_name=_ocr_name,
+        sanitize_styles=libformat.sanitize_styles,
+        sanitize_ext=libformat.sanitize_ext,
+        sanitize_figure=libformat.sanitize_figure,
+        clean_region_id=libformat.clean_rid,
+        is_template_name=lambda name: bool(_RW_TPL_RE.fullmatch(name)),
+        is_protected=replica_service.is_protected,
+        compose_text=layout_roles.compose_text,
+        normalize_language=_lang_code,
+        limits=LibArchiveLimits(
+            max_archive_bytes=libformat.MAX_BYTES,
+            max_inflated_bytes=libformat.MAX_INFLATED,
+            max_json_bytes=libformat.MAX_JSON,
+            max_figure_bytes=libformat.MAX_FIGURE,
+            max_pages=libformat.MAX_PAGES,
+            max_items_per_page=libformat.MAX_ITEMS,
+        ),
+    )
+    descriptors = _EngineItemRepository()
+    return FilesystemHostBindings(
+        catalogue=CatalogueBindings(
+            load_snapshot=_engine_item_snapshot,
+            descriptors=descriptors,
+            decode_record=_engine_item_command_decode,
+            encode_record=_engine_item_command_encode,
+            allocate_item_id=lambda existing: lib.gen_id(set(existing)),
+            lock_context_for=lambda: _builds_lock,
+            representations=RepresentationBindings(
+                decode_aggregate=_engine_representation_aggregate,
+                put_record=_engine_representation_put_record,
+                detach_record=_engine_representation_detach_record,
+            ),
+            lifecycle=ItemLifecycleBindings(
+                advance_restored_record=_engine_advance_restored_record,
+            ),
+            item_command_policy=WhlBookItemCommandPolicy(
+                _engine_item_category_ids
+            ),
+        ),
+        replica=ReplicaBindings(
+            policies=policies,
+            text_repository=_EngineTextLayerRepository(),
+            read_json=lambda path: lib.load_json(path, {}),
+            write_json=lib.save_json,
+            lock_context_for=lambda _item_id: _ocr_merge_lock,
+        ),
+        interchange=InterchangeBindings(
+            planner=interchange_planner,
+            source_ids_for=_interchange_source_ids,
+            clean_region_id=libformat.clean_rid,
+            normalize_language=_lang_code,
+            sanitize_document_name=_ocr_name,
+            open_item_draft_for=_engine_open_lib_draft,
+        ),
+        translation=TranslationBindings(
+            item_exists_for=_translation_item_exists,
+            source_snapshot_for=_translation_source_snapshot,
+            source_reference_for=lambda source: _translation_document_name(
+                source.layer_id
+            ),
+        ),
+        workspace_lock_context_for=_engine_workspace_locks,
+        recovery_lock_context=_engine_recovery_locks,
+        jobs=JobHistoryBindings(
+            id_factory=lambda existing: lib.gen_id(existing),
+        ),
+        secrets=_secret_store_bindings(),
+    )
+
+
+def _open_engine_session(
+    workspace_root: Path | None = None,
+) -> FilesystemEngineSession:
+    """Open production resources after all compatibility seams exist."""
+
+    root = Path(workspace_root or lib.OUTPUT_DIR)
+    return open_filesystem_engine(
+        config=FilesystemEngineConfig(
+            workspace_root=root,
+            paths=FilesystemEnginePaths(
+                catalogue=BUILDS_PATH,
+                entries=ENTRIES_DIR,
+            ),
+            job_history=Path("jobs.json"),
+            job_keep=_JOBS_KEEP,
+        ),
+        bindings=_engine_host_bindings(),
+        contribute_modules=first_party_module_contributions,
+    )
+
+
+def _ensure_engine_session() -> FilesystemEngineSession:
+    """Atomically open and publish the process-lifetime engine session."""
+
+    global _engine_session
+    global _engine_write_set
+    global _job_manager
+    global _translation_provenance
+    global _jobs
+    global _jobs_events
+    global _jobs_lock
     global _library_engine_instance
-    if _library_engine_instance is None:
-        with _library_engine_guard:
-            if _library_engine_instance is None:
-                policies = _EngineReplicaPolicies()
-                interchange_planner = ExistingItemLibArchivePlanner(
-                    parse_format=libformat.parse_format,
-                    supported_major=libformat.SUPPORTED_MAJOR,
-                    sanitize_items=libformat.sanitize_page_items,
-                    sanitize_dims=libformat.sanitize_dims,
-                    sanitize_document_name=_ocr_name,
-                    sanitize_styles=libformat.sanitize_styles,
-                    sanitize_ext=libformat.sanitize_ext,
-                    sanitize_figure=libformat.sanitize_figure,
-                    clean_region_id=libformat.clean_rid,
-                    is_template_name=lambda name: bool(_RW_TPL_RE.fullmatch(name)),
-                    is_protected=replica_service.is_protected,
-                    compose_text=layout_roles.compose_text,
-                    normalize_language=_lang_code,
-                    limits=LibArchiveLimits(
-                        max_archive_bytes=libformat.MAX_BYTES,
-                        max_inflated_bytes=libformat.MAX_INFLATED,
-                        max_json_bytes=libformat.MAX_JSON,
-                        max_figure_bytes=libformat.MAX_FIGURE,
-                        max_pages=libformat.MAX_PAGES,
-                        max_items_per_page=libformat.MAX_ITEMS,
-                    ),
+
+    session = _engine_session
+    opened_here = False
+    if session is not None and not session.closed:
+        return session
+    with _library_engine_guard:
+        session = _engine_session
+        if session is None or session.closed:
+            # Credentials are cut over before the engine graph is composed or
+            # any process-lifetime alias can become visible.  A failed legacy
+            # migration therefore cannot leave request handlers or workers
+            # running against plaintext fallback state.
+            _prepare_protected_secret_store()
+            opened = _open_engine_session()
+            # Resolve every property before publishing the session. If an
+            # opener ever returns an invalid/closed object, no partial set of
+            # compatibility aliases becomes visible.
+            try:
+                engine = opened.engine
+                write_set = opened.write_set
+                jobs = opened.jobs
+                provenance = opened.provenance
+                records = jobs.records
+                events = jobs.cancel_events
+                lock = jobs.lock
+            except BaseException:
+                try:
+                    opened.close()
+                except Exception:
+                    pass
+                raise
+
+            _engine_write_set = write_set
+            _job_manager = jobs
+            _translation_provenance = provenance
+            _jobs = records
+            _jobs_events = events
+            _jobs_lock = lock
+            _library_engine_instance = engine
+            _engine_session = opened
+            session = opened
+            opened_here = True
+    cleanup = globals().get("_ocr_cleanup_staged_figure_orphans")
+    if opened_here and callable(cleanup):
+        builds = lib.load_json(BUILDS_PATH, {})
+        for item_id in builds if isinstance(builds, dict) else ():
+            try:
+                cleanup(str(item_id))
+            except Exception:
+                log.warning(
+                    "Could not clean staged Replica figures: book=%s",
+                    item_id,
                 )
-                descriptors = _EngineItemRepository()
-                _library_engine_instance = compose_filesystem_engine(
-                    paths=FilesystemEnginePaths(
-                        catalogue=BUILDS_PATH,
-                        entries=ENTRIES_DIR,
-                    ),
-                    resources=FilesystemEngineResources(
-                        write_set=_engine_write_set,
-                        jobs=_job_manager,
-                        provenance=_translation_provenance,
-                        workspace_lock_context_for=_engine_workspace_locks,
-                    ),
-                    catalogue=CatalogueBindings(
-                        load_snapshot=_engine_item_snapshot,
-                        descriptors=descriptors,
-                        decode_record=_engine_item_command_decode,
-                        encode_record=_engine_item_command_encode,
-                        allocate_item_id=lambda existing:
-                            lib.gen_id(set(existing)),
-                        lock_context_for=lambda: _builds_lock,
-                    ),
-                    replica=ReplicaBindings(
-                        policies=policies,
-                        text_repository=_EngineTextLayerRepository(),
-                        read_json=lambda path: lib.load_json(path, {}),
-                        write_json=lib.save_json,
-                        # All Replica writes now take the workspace lease
-                        # before this shared legacy OCR lock.
-                        lock_context_for=lambda _item_id: _ocr_merge_lock,
-                    ),
-                    interchange=InterchangeBindings(
-                        planner=interchange_planner,
-                        source_ids_for=_interchange_source_ids,
-                        clean_region_id=libformat.clean_rid,
-                        normalize_language=_lang_code,
-                        sanitize_document_name=_ocr_name,
-                    ),
-                    translation=TranslationBindings(
-                        item_exists_for=_translation_item_exists,
-                        source_snapshot_for=_translation_source_snapshot,
-                        source_reference_for=lambda source:
-                            _translation_document_name(source.layer_id),
-                    ),
-                    contribution_factory=_engine_module_contributions,
-                )
-    return _library_engine_instance
+    return session
+
+
+def _close_engine_session() -> None:
+    """Unpublish and close the transport session after workers have stopped.
+
+    The current executable has no worker supervisor and therefore does not call
+    this automatically. Embedders that control every borrowed worker must call
+    it before in-process app disposal or ``importlib.reload(server)``.
+    """
+
+    global _engine_session
+    global _engine_write_set
+    global _job_manager
+    global _translation_provenance
+    global _jobs
+    global _jobs_events
+    global _jobs_lock
+    global _library_engine_instance
+
+    with _library_engine_guard:
+        session = _engine_session
+        if session is None:
+            return
+        try:
+            session.close()
+        finally:
+            _engine_session = None
+            _engine_write_set = None
+            _job_manager = None
+            _translation_provenance = None
+            _jobs = None
+            _jobs_events = None
+            _jobs_lock = None
+            _library_engine_instance = None
+
+
+def _library_engine() -> LibraryEngine:
+    """Return the engine owned by the process-lifetime filesystem session."""
+
+    return _ensure_engine_session().engine
 
 
 def _replica_engine() -> ReplicaApplicationService:
@@ -4538,6 +5350,12 @@ def _interchange_engine() -> LibInterchangeService:
     if interchange is None:
         raise RuntimeError("the interchange engine module is unavailable")
     return interchange
+
+
+def _lib_open_engine() -> OpenLibService:
+    """Return the optional composite new-item Replica service."""
+
+    return _library_engine().require_service(LIB_OPEN_SERVICE)
 
 
 def _region_view_response(view) -> dict:
@@ -4564,6 +5382,8 @@ def _engine_error_status(exc: EngineError) -> int:
         return 409
     if isinstance(exc, EngineValidationError):
         return 400
+    if exc.retryable and exc.code.endswith("_unavailable"):
+        return 503
     return 500
 
 
@@ -4638,6 +5458,27 @@ def _item_command_engine() -> ItemCommandService:
         raise EngineError(
             "the item command module is unavailable",
             code="item_command_unavailable", retryable=True,
+        )
+    return commands
+
+
+def _item_lifecycle_engine() -> ItemLifecycleService:
+    lifecycle = _library_engine().get_service(ITEM_LIFECYCLE_SERVICE)
+    if lifecycle is None:
+        raise EngineError(
+            "the item lifecycle module is unavailable",
+            code="item_lifecycle_unavailable",
+            retryable=True,
+        )
+    return lifecycle
+
+
+def _representation_command_engine() -> RepresentationCommandService:
+    commands = _library_engine().get_service(REPRESENTATION_COMMAND_SERVICE)
+    if commands is None:
+        raise EngineError(
+            "the representation command module is unavailable",
+            code="representation_command_unavailable", retryable=True,
         )
     return commands
 
@@ -4736,6 +5577,102 @@ def _item_command_record_match(item_id: str) -> str:
             details={"header": "If-Record-Match", "item_id": item_id},
         )
     return value[1:-1]
+
+
+def _representation_command_match(
+        item_id: str, representation_id: str, *, required: bool) -> str | None:
+    raw = request.headers.get("If-Representation-Match")
+    if raw is None:
+        if required:
+            raise EnginePreconditionRequiredError(
+                "a representation revision is required",
+                code="representation_revision_required",
+                details={
+                    "header": "If-Representation-Match",
+                    "item_id": item_id,
+                    "representation_id": representation_id,
+                },
+            )
+        return None
+    value = raw.strip()
+    if (
+        raw != value
+        or value.startswith("W/")
+        or len(value) < 3
+        or value[0] != '"'
+        or value[-1] != '"'
+        or "," in value
+        or not _engine_valid_record_revision(value[1:-1])
+    ):
+        raise EngineValidationError(
+            "If-Representation-Match must contain one strong quoted revision",
+            code="invalid_representation_revision",
+            details={
+                "header": "If-Representation-Match",
+                "item_id": item_id,
+                "representation_id": representation_id,
+            },
+        )
+    return value[1:-1]
+
+
+def _representation_command_draft(
+        representation_id: str) -> RepresentationAttachmentDraft:
+    raw = _item_command_json("representation")
+    fields = {
+        "source_token", "acquisition", "role", "media_type", "label",
+        "metadata", "expected_content_sha256", "expected_size",
+    }
+    if (
+        not isinstance(raw, Mapping)
+        or set(raw) != fields
+        or any(not isinstance(raw.get(field), str) for field in fields - {
+            "metadata", "expected_size",
+        })
+        or not isinstance(raw.get("metadata"), Mapping)
+        or (raw.get("expected_size") is not None
+            and (isinstance(raw.get("expected_size"), bool)
+                 or not isinstance(raw.get("expected_size"), int)))
+    ):
+        raise EngineValidationError(
+            "the representation attachment does not match its schema",
+            code="invalid_representation_attachment",
+        )
+    try:
+        return RepresentationAttachmentDraft(
+            representation_id=representation_id,
+            source_token=raw["source_token"],
+            acquisition=raw["acquisition"],
+            expected_content_sha256=raw["expected_content_sha256"],
+            expected_size=raw["expected_size"],
+            role=raw["role"],
+            media_type=raw["media_type"],
+            label=raw["label"],
+            metadata=raw["metadata"],
+        )
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise EngineValidationError(
+            "the representation attachment is invalid",
+            code="invalid_representation_attachment",
+            details={"cause_type": type(exc).__name__},
+        ) from exc
+
+
+def _representation_command_response(result, *, created: bool = False):
+    response = jsonify({
+        "ok": True,
+        "schema": "librarytool.representation-mutation-receipt/1",
+        **result.as_dict(),
+    })
+    response.headers["X-Record-Revision"] = (
+        result.receipt.after_item_revision
+    )
+    if result.receipt.after is not None:
+        response.headers["X-Representation-Revision"] = (
+            result.receipt.after.revision
+        )
+    response.cache_control.no_store = True
+    return response, 201 if created and not result.replayed else 200
 
 
 def _item_command_managed_fields(*values) -> None:
@@ -4960,12 +5897,123 @@ def _item_response_revision(prefix: str, value) -> str:
     return prefix + "-" + hashlib.sha256(canonical).hexdigest()[:24]
 
 
-def _item_json_response(body: dict, revision: str):
+def _item_json_response(
+        body: dict, revision: str, *, contains_compatibility: bool = False):
     """Return a revalidatable engine snapshot with a strong aggregate ETag."""
     response = jsonify({**body, "revision": revision})
     response.set_etag(revision)
+    if contains_compatibility:
+        # The explicit transitional projection can contain local filesystem
+        # paths and must never enter a browser or intermediary cache.
+        response.cache_control.no_store = True
+        return response
     response.cache_control.no_cache = True
     return response.make_conditional(request)
+
+
+def _item_lifecycle_revision_token(value: str) -> bool:
+    """Return whether *value* is safe as an opaque lifecycle validator."""
+
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 512
+        and value == value.strip()
+        and '"' not in value
+        and "\\" not in value
+        and all(
+            ord(character) > 32
+            and ord(character) != 127
+            and not 0xD800 <= ord(character) <= 0xDFFF
+            for character in value
+        )
+    )
+
+
+def _item_lifecycle_match(
+    header: str,
+    *,
+    required_code: str,
+    invalid_code: str,
+    details: Mapping,
+) -> str:
+    """Read exactly one strong, quoted lifecycle revision header."""
+
+    raw = request.headers.get(header)
+    error_details = {"header": header, **dict(details)}
+    if raw is None or raw == "":
+        raise EnginePreconditionRequiredError(
+            f"{header} is required",
+            code=required_code,
+            details=error_details,
+        )
+    value = raw.strip()
+    token = value[1:-1] if len(value) >= 2 else ""
+    if (
+        raw != value
+        or value.startswith("W/")
+        or len(value) < 3
+        or value[0] != '"'
+        or value[-1] != '"'
+        or not _item_lifecycle_revision_token(token)
+    ):
+        raise EngineValidationError(
+            f"{header} must contain one strong quoted revision",
+            code=invalid_code,
+            details=error_details,
+        )
+    return token
+
+
+def _item_lifecycle_require_empty_body() -> None:
+    """Lifecycle commands are header-only so their replay identity is exact."""
+
+    content_length = request.content_length
+    has_transfer_encoding = bool(request.headers.get("Transfer-Encoding"))
+    has_unframed_data = (
+        content_length in (None, 0)
+        and not has_transfer_encoding
+        and bool(request.get_data(cache=False))
+    )
+    if (
+        content_length not in (None, 0)
+        or has_transfer_encoding
+        or has_unframed_data
+    ):
+        raise EngineValidationError(
+            "item lifecycle commands do not accept a request body",
+            code="item_lifecycle_body_not_allowed",
+        )
+
+
+def _item_lifecycle_receipt_response(result):
+    receipt = result.receipt
+    response = jsonify({
+        "ok": True,
+        "schema": "librarytool.item-lifecycle-receipt/1",
+        **result.as_dict(),
+    })
+    response.cache_control.no_store = True
+    response.headers["X-Record-Revision"] = (
+        receipt.restored_item_revision
+        if receipt.action == "restore"
+        else receipt.deleted_item_revision
+    )
+    response.headers["X-Managed-Tree-Revision"] = (
+        receipt.managed_tree_revision
+    )
+    response.headers["X-Tombstone-Revision"] = receipt.tombstone.revision
+    if receipt.action == "restore":
+        response.headers["Location"] = url_for(
+            "api_v1_item", item_id=receipt.item_id
+        )
+        status = 200 if result.replayed else 201
+    else:
+        response.headers["Location"] = url_for(
+            "api_v1_item_tombstone",
+            tombstone_id=receipt.tombstone.tombstone_id,
+        )
+        status = 200
+    return response, status
 
 
 def _project_build_compatibility(items: list[dict]) -> None:
@@ -5000,7 +6048,7 @@ def api_v1_items():
     revision = _item_response_revision("ic", items)
     return _item_json_response({
         "ok": True, "schema": "librarytool.items/1", "items": items,
-    }, revision)
+    }, revision, contains_compatibility=(projection == "build-workbench"))
 
 
 @app.route("/api/v1/items", methods=["POST"])
@@ -5031,9 +6079,36 @@ def api_v1_item(item_id: str):
     )
     response = _item_json_response({
         "ok": True, "schema": "librarytool.item/1", "item": item,
-    }, revision)
+    }, revision, contains_compatibility=(projection == "build-workbench"))
     response.headers["X-Record-Revision"] = item["record_revision"]
     return response
+
+
+@app.route("/api/v1/items/<item_id>/lifecycle")
+def api_v1_item_lifecycle(item_id: str):
+    """Expose one coherent dual-CAS preflight for recoverable deletion."""
+
+    try:
+        state = _item_lifecycle_engine().inspect(item_id)
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    item_revision = state.item.revision
+    managed_tree_revision = state.managed_tree.revision
+    revision = _item_response_revision("il", state.as_dict())
+    response = jsonify({
+        "ok": True,
+        "schema": "librarytool.item-lifecycle-state/1",
+        "state": "live",
+        "item_id": state.item.item_id,
+        "item_revision": item_revision,
+        "managed_tree_revision": managed_tree_revision,
+        "revision": revision,
+    })
+    response.set_etag(revision)
+    response.headers["X-Record-Revision"] = item_revision
+    response.headers["X-Managed-Tree-Revision"] = managed_tree_revision
+    response.cache_control.no_cache = True
+    return response.make_conditional(request)
 
 
 @app.route("/api/v1/items/<item_id>", methods=["PATCH"])
@@ -5054,6 +6129,121 @@ def api_v1_item_update(item_id: str):
     return _item_command_response(result)
 
 
+@app.route("/api/v1/items/<item_id>", methods=["DELETE"])
+def api_v1_item_delete(item_id: str):
+    """Recoverably delete an item and its engine-managed tree under dual CAS."""
+
+    try:
+        lifecycle = _item_lifecycle_engine()
+        _item_lifecycle_require_empty_body()
+        operation_id = _item_command_operation_id(item_id=item_id)
+        item_revision = _item_lifecycle_match(
+            "If-Record-Match",
+            required_code="item_revision_required",
+            invalid_code="invalid_item_revision",
+            details={"item_id": item_id},
+        )
+        managed_tree_revision = _item_lifecycle_match(
+            "If-Managed-Tree-Match",
+            required_code="managed_tree_revision_required",
+            invalid_code="invalid_managed_tree_revision",
+            details={"item_id": item_id},
+        )
+        result = lifecycle.delete(LifecycleDeleteItemCommand(
+            item_id=item_id,
+            expected_item_revision=item_revision,
+            expected_managed_tree_revision=managed_tree_revision,
+            operation_id=operation_id,
+        ))
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    return _item_lifecycle_receipt_response(result)
+
+
+@app.route("/api/v1/item-tombstones")
+def api_v1_item_tombstones():
+    """List transport-safe lifecycle tombstones in engine order."""
+
+    try:
+        lifecycle = _item_lifecycle_engine()
+        state_values = request.args.getlist("state")
+        unknown_filters = sorted(set(request.args) - {"state"})
+        if (
+            len(state_values) > 1
+            or unknown_filters
+            or (state_values and state_values[0] not in {"deleted", "restored"})
+        ):
+            raise EngineValidationError(
+                "the item tombstone filter is invalid",
+                code="invalid_item_tombstone_filter",
+                details={
+                    "state": state_values,
+                    "unknown": unknown_filters,
+                },
+            )
+        wanted_state = state_values[0] if state_values else ""
+        tombstones = [
+            tombstone.as_dict()
+            for tombstone in lifecycle.list_tombstones()
+            if not wanted_state or tombstone.state == wanted_state
+        ]
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    response = jsonify({
+        "ok": True,
+        "schema": "librarytool.item-tombstone-list/1",
+        "tombstones": tombstones,
+    })
+    response.cache_control.no_cache = True
+    return response
+
+
+@app.route("/api/v1/item-tombstones/<tombstone_id>")
+def api_v1_item_tombstone(tombstone_id: str):
+    """Read one public tombstone without its private recovery envelope."""
+
+    try:
+        tombstone = _item_lifecycle_engine().get_tombstone(tombstone_id)
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    response = jsonify({
+        "ok": True,
+        "schema": "librarytool.item-tombstone/1",
+        "tombstone": tombstone.as_dict(),
+    })
+    response.set_etag(tombstone.revision)
+    response.headers["X-Tombstone-Revision"] = tombstone.revision
+    response.cache_control.no_cache = True
+    return response.make_conditional(request)
+
+
+@app.route(
+    "/api/v1/item-tombstones/<tombstone_id>/restore",
+    methods=["POST"],
+)
+def api_v1_item_tombstone_restore(tombstone_id: str):
+    """Restore a deleted aggregate under tombstone CAS and idempotency."""
+
+    try:
+        lifecycle = _item_lifecycle_engine()
+        _item_lifecycle_require_empty_body()
+        operation_id = _item_command_operation_id()
+        tombstone_revision = _item_lifecycle_match(
+            "If-Tombstone-Match",
+            required_code="tombstone_revision_required",
+            invalid_code="invalid_tombstone_revision",
+            details={"tombstone_id": tombstone_id},
+        )
+        result = lifecycle.restore(RestoreItemCommand(
+            tombstone_id=tombstone_id,
+            expected_tombstone_revision=tombstone_revision,
+            operation_id=operation_id,
+        ))
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    return _item_lifecycle_receipt_response(result)
+
+
 @app.route("/api/v1/items/<item_id>/representations")
 def api_v1_item_representations(item_id: str):
     try:
@@ -5066,6 +6256,66 @@ def api_v1_item_representations(item_id: str):
         "ok": True, "schema": "librarytool.representations/1",
         "item_id": item_id, "representations": rows,
     }, revision)
+
+
+@app.route(
+    "/api/v1/items/<item_id>/representations/<representation_id>",
+    methods=["PUT"],
+)
+def api_v1_item_representation_put(item_id: str, representation_id: str):
+    """Attach a new source, or replace one under dual CAS preconditions."""
+    try:
+        operation_id = _item_command_operation_id(item_id=item_id)
+        expected_item_revision = _item_command_record_match(item_id)
+        expected_representation_revision = _representation_command_match(
+            item_id, representation_id, required=False,
+        )
+        draft = _representation_command_draft(representation_id)
+        result = _representation_command_engine().attach(
+            AttachRepresentationCommand(
+                item_id=item_id,
+                expected_item_revision=expected_item_revision,
+                expected_representation_revision=(
+                    expected_representation_revision
+                ),
+                draft=draft,
+                operation_id=operation_id,
+            )
+        )
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    return _representation_command_response(
+        result, created=expected_representation_revision is None,
+    )
+
+
+@app.route(
+    "/api/v1/items/<item_id>/representations/<representation_id>",
+    methods=["DELETE"],
+)
+def api_v1_item_representation_delete(item_id: str, representation_id: str):
+    """Detach one representation without deleting an external source file."""
+    try:
+        operation_id = _item_command_operation_id(item_id=item_id)
+        expected_item_revision = _item_command_record_match(item_id)
+        expected_representation_revision = _representation_command_match(
+            item_id, representation_id, required=True,
+        )
+        assert expected_representation_revision is not None
+        result = _representation_command_engine().detach(
+            DetachRepresentationCommand(
+                item_id=item_id,
+                representation_id=representation_id,
+                expected_item_revision=expected_item_revision,
+                expected_representation_revision=(
+                    expected_representation_revision
+                ),
+                operation_id=operation_id,
+            )
+        )
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    return _representation_command_response(result)
 
 
 @app.route("/api/v1/items/<item_id>/artifacts")
@@ -5278,6 +6528,13 @@ def api_build_ocr_region_proposals(build_id: str):
         expected_region_revision=expected,
         expected_proposal_revision=expected_proposal,
     )
+    staged_figures: set[str] = set()
+    if action == "dismiss":
+        try:
+            before = _replica_engine().get_region_page(command.key)
+            staged_figures = _ocr_staged_figure_names(before.proposal)
+        except EngineError:
+            pass
     try:
         result = _replica_engine().review_region_proposal(command)
     except EngineError as exc:
@@ -5288,6 +6545,12 @@ def api_build_ocr_region_proposals(build_id: str):
             except EngineError:
                 pass
         return _engine_error_response(exc, current=current)
+    if action == "dismiss":
+        # The atomic manifest commit above makes the crops unreachable. The
+        # physical unlink is idempotent; startup GC finishes it after a crash
+        # between these two operations.
+        _ocr_remove_staged_figures(build_id, staged_figures)
+    _ocr_cleanup_staged_figure_orphans(build_id)
     body = _region_view_response(result.page)
     body.update({"action": ("applied" if result.action.value == "apply"
                              else "dismissed"),
@@ -5374,6 +6637,7 @@ def _pdf_layer_words(pdf, page: int) -> list:
 
 
 @app.route("/api/builds/<build_id>/ocr-templates", methods=["GET", "PUT", "DELETE"])
+@_live_item_write_endpoint
 def api_build_ocr_templates(build_id: str):
     """Layout templates — hand-press books are grid-stable, so one corrected
     exemplar page (a recto, a verso) becomes a reusable region grid.
@@ -5432,6 +6696,7 @@ def api_build_ocr_templates(build_id: str):
 
 
 @app.route("/api/builds/<build_id>/ocr-templates/apply", methods=["POST"])
+@_live_item_write_endpoint
 def api_build_ocr_templates_apply(build_id: str):
     """Stamp a template's region grid onto a page range. Body: {src?, name,
     pages: [ints], overwrite?: bool, clip?: bool (default true)}. Pages that
@@ -5809,6 +7074,7 @@ def _lib_apply_translations(build_id: str, trans_in: dict,
 
 @app.route("/api/builds/<build_id>/replica-style",
            methods=["GET", "PUT", "DELETE"])
+@_live_item_write_endpoint
 def api_build_replica_style(build_id: str):
     """The book-level role -> modern-type mapping the re-typeset preview and
     the .lib export use. GET returns the stored sheet (custom: true) or the
@@ -5842,6 +7108,7 @@ def api_build_replica_style(build_id: str):
 
 @app.route("/api/builds/<build_id>/replica-instructions",
            methods=["GET", "PUT"])
+@_live_item_write_endpoint
 def api_build_replica_instructions(build_id: str):
     """The per-book "instructions for editors / AI" text (docs/lib-format.md
     §2.2) — free guidance that every .lib export embeds in its manifest and
@@ -6018,12 +7285,11 @@ def _img_gen_cfg() -> dict:
         provider = "openai"
     model = str(s.get("imgGenModel") or "").strip() or (
         "gpt-image-1" if provider == "openai" else "gemini-2.5-flash-image")
-    return {"provider": provider, "model": model,
-            "key": str(s.get("imgGenKey") or "").strip()}
+    return {"provider": provider, "model": model}
 
 
-def _img_gen(cfg: dict, image: bytes, mime: str, prompt: str,
-             timeout: float = 180.0) -> bytes:
+def _img_gen_with_key(cfg: dict, image: bytes, mime: str, prompt: str,
+                      timeout: float = 180.0) -> bytes:
     """One image in, one generated image out, or RuntimeError. NOTE: written
     to the providers' documented shapes but not yet exercised against live
     keys — same standing as the cloud OCR processor before its key existed."""
@@ -6073,6 +7339,17 @@ def _img_gen(cfg: dict, image: bytes, mime: str, prompt: str,
     raise RuntimeError("the model returned no image")
 
 
+def _img_gen(cfg: dict, image: bytes, mime: str, prompt: str,
+             timeout: float = 180.0) -> bytes:
+    with _lease_secret("imgGenKey") as key:
+        execution_cfg = {**cfg, "key": key}
+        try:
+            return _img_gen_with_key(
+                execution_cfg, image, mime, prompt, timeout=timeout)
+        finally:
+            execution_cfg.pop("key", None)
+
+
 @app.route("/api/builds/<build_id>/rework-figure", methods=["POST"])
 def api_build_rework_figure(build_id: str):
     """Rework one extracted figure through the configured image model:
@@ -6105,7 +7382,7 @@ def api_build_rework_figure(build_id: str):
     if not f.is_file():
         return jsonify({"ok": False, "error": "figure file missing"}), 400
     cfg = _img_gen_cfg()
-    if not cfg["key"]:
+    if not _secret_is_configured("imgGenKey"):
         return jsonify({"ok": False, "error":
                         "no image-generation key configured "
                         "(image model key: Settings > Credentials)"}), 400
@@ -6126,13 +7403,40 @@ def api_build_rework_figure(build_id: str):
     out_name = f"rework-{name}.png"
     if len(out_name) > 120:
         return jsonify({"ok": False, "error": "figure name too long"}), 400
-    with _ocr_merge_lock:
-        lib.save_bytes(f.parent / out_name, out)
-        meta = lib.load_json(meta_path, {})
-        entry = {k: info.get(k) for k in ("page", "x", "y", "w", "h")}
-        entry.update({"src_key": src, "rework_of": name})
-        meta.setdefault("images", {})[out_name] = entry
-        lib.save_json(meta_path, meta)
+    # Never hold the workspace lease across the paid remote call.  Publication
+    # is a separate, short transaction: deletion may have won while the model
+    # ran, and another editor may have replaced either the crop or its layout
+    # metadata.  Re-read both under the merge lock before writing anything.
+    with _live_item_write_scope(build_id):
+        with _ocr_merge_lock:
+            meta = lib.load_json(meta_path, {})
+            current_info = (meta.get("images") or {}).get(name)
+            target_is_current = (
+                isinstance(current_info, dict)
+                and str(current_info.get("src_key") or "primary") == src
+                and not current_info.get("rework_of")
+                and not name.startswith("rework-")
+                and current_info == info
+            )
+            try:
+                image_is_current = f.is_file() and f.read_bytes() == raw
+            except OSError:
+                image_is_current = False
+            if not target_is_current or not image_is_current:
+                return jsonify({
+                    "ok": False,
+                    "error": (
+                        "the source figure changed while the model was running "
+                        "\u2014 review it and retry"
+                    ),
+                }), 409
+            lib.save_bytes(f.parent / out_name, out)
+            entry = {
+                k: current_info.get(k) for k in ("page", "x", "y", "w", "h")
+            }
+            entry.update({"src_key": src, "rework_of": name})
+            meta.setdefault("images", {})[out_name] = entry
+            lib.save_json(meta_path, meta)
     return jsonify({"ok": True, "name": out_name, "bytes": len(out)})
 
 
@@ -6692,13 +7996,12 @@ def api_v1_replica_lib_import(item_id: str):
 
 @app.route("/api/lib/open", methods=["POST"])
 def api_lib_open():
-    """Create a new book from a local .lib — the desktop shell's double-click
-    flow. Body {path}: an ABSOLUTE path on this machine (the server is
-    loopback-only and serves a single local user; local paths are already how
-    attached scans arrive). The manifest's meta seeds a fresh build through
-    the normal create path, then the archive imports into it under the
-    primary source. Returns {ok, build_id, receipt}; a refused import removes
-    the just-minted build again rather than stranding an empty shell."""
+    """Adapt the desktop shell's trusted local-path flow to ``open_lib``.
+
+    Filesystem access belongs to this loopback transport. Allocation, metadata
+    projection, import, durable replay, and rollback belong to one engine unit
+    of work, so no catalogue shell or partial entry can escape a failure.
+    """
     p = request.get_json(silent=True) or {}
     raw_path = str(p.get("path") or "")
     fp = Path(raw_path) if raw_path else None
@@ -6713,44 +8016,82 @@ def api_lib_open():
     except OSError as exc:
         return jsonify({"ok": False,
                         "error": f"could not read the file: {exc}"}), 400
-    # parse up front for the meta seed; import re-validates through the same
-    # module, so nothing minted here can outrun the format gate below
+    operation_id = str(
+        request.headers.get("Idempotency-Key") or uuid.uuid4().hex
+    ).strip()
     try:
-        doc = libformat.read_lib(raw)
-    except libformat.LibError as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 400
-    # seed the build from the bibliographic tuple the exporter writes — NOT the
-    # whole manifest meta. A foreign .lib must not pre-set operational fields
-    # (rights, status, pdf_sources, ocr_*): rights defaults to undecided and
-    # status to draft, and an unrecognized rights string can't fail the open.
-    build, err = _create_build({k: doc.meta.get(k) for k in _LIB_META_FIELDS})
-    if err:
-        return jsonify({"ok": False, "error": err}), 400
+        result = _lib_open_engine().open_lib(OpenLibCommand(
+            archive=raw,
+            operation_id=operation_id,
+            source_path=str(fp),
+        ))
+    except EngineError as exc:
+        return _engine_error_response(exc)
 
-    def _rollback():
-        with _builds_lock:
-            builds = lib.load_json(BUILDS_PATH, {})
-            builds.pop(build["id"], None)
-            lib.save_json(BUILDS_PATH, builds)
+    receipt = result.import_receipt
+    projected = {
+        "ok": True,
+        "format_version": receipt.format_version,
+        "pages_applied": list(receipt.pages_applied),
+        "pages_skipped": list(receipt.pages_skipped),
+        "pages_protected": list(receipt.pages_protected),
+        "templates_added": list(receipt.templates_added),
+        "figures_added": len(receipt.figures_added),
+        "stylesheet": receipt.stylesheet_disposition,
+        "translations_added": list(receipt.translations_added),
+        "warnings": [
+            {"loc": warning.location, "msg": warning.message}
+            for warning in receipt.warnings
+        ],
+    }
+    if not result.replayed:
+        activity("created", "draft entry", detail=result.item.title)
+    return jsonify({
+        "ok": True,
+        "build_id": result.item_id,
+        "receipt": projected,
+    })
 
-    # a crafted member can make the import RAISE (not just return != 200); the
-    # rollback must cover that too, or the minted build is stranded on a 500
+
+@app.route("/api/v1/lib-opens", methods=["POST"])
+def api_v1_lib_open():
+    """Create an item from an uploaded Replica package with safe replay."""
+
+    operation_id = str(request.headers.get("Idempotency-Key") or "").strip()
+    if not operation_id:
+        return _engine_error_response(EnginePreconditionRequiredError(
+            "an idempotency key is required",
+            code="idempotency_key_required",
+            details={"header": "Idempotency-Key"},
+        ))
+    upload = request.files.get("lib")
+    if upload is None:
+        return _engine_error_response(EngineValidationError(
+            "a Replica package is required",
+            code="lib_archive_required",
+            details={"field": "lib"},
+        ))
+    archive = upload.read(_LIB_MAX_BYTES + 1)
+    if len(archive) > _LIB_MAX_BYTES:
+        return _engine_error_response(EngineValidationError(
+            "the Replica package is too large",
+            code="lib_archive_too_large",
+            details={"maximum_bytes": _LIB_MAX_BYTES},
+        ))
     try:
-        receipt, code = _lib_import_archive(build["id"], "primary", raw,
-                                            overwrite=False)
-    except Exception as exc:
-        _rollback()
-        return jsonify({"ok": False, "error": f"import failed: {exc}"}), 500
-    if code != 200:
-        _rollback()
-        return jsonify(receipt), code
-    # persist the archive's book_id when well-formed, so an open + re-export
-    # round trip keeps the same identity the exporter minted (§2.4); a malformed
-    # or absent id keeps today's mint-on-first-export behavior
-    if re.fullmatch(r"b-[0-9a-f]{32}", doc.book_id):
-        _lib_id_path(build["id"]).parent.mkdir(parents=True, exist_ok=True)
-        lib.save_json(_lib_id_path(build["id"]), {"book_id": doc.book_id})
-    return jsonify({"ok": True, "build_id": build["id"], "receipt": receipt})
+        result = _lib_open_engine().open_lib(OpenLibCommand(
+            archive=archive,
+            operation_id=operation_id,
+        ))
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    response = jsonify({
+        "ok": True,
+        "schema": "librarytool.open-lib-receipt/1",
+        **result.as_dict(),
+    })
+    response.headers["X-Record-Revision"] = result.item.revision
+    return response, 200 if result.replayed else 201
 
 
 @app.route("/api/lib/validate", methods=["POST"])
@@ -7367,22 +8708,6 @@ JOBS_PATH = lib.OUTPUT_DIR / "jobs.json"
 _JOBS_KEEP = 50                       # newest finished/interrupted entries kept
 _JOB_ACTIVE = ACTIVE_JOB_STATES
 _JOB_FIELDS = PUBLIC_JOB_FIELDS
-_job_manager = JobManager(
-    FilesystemJobHistoryRepository(
-        JOBS_PATH,
-        read_json=lambda path, default: lib.load_json(path, default),
-        write_json=lib.save_json,
-    ),
-    keep=_JOBS_KEEP,
-    id_factory=lambda existing: lib.gen_id(existing),
-)
-# Compatibility views for processors that still own mutable per-kind records.
-# New transports and services query the manager instead.
-_jobs = _job_manager.records
-_jobs_events = _job_manager.cancel_events
-_jobs_lock = _job_manager.lock
-
-
 class _JobCancelled(Exception):
     """Raised inside a worker at a stage boundary after a cancel request."""
 
@@ -7395,16 +8720,59 @@ def _job_public(job: dict) -> dict:
     return _job_manager.public(job)
 
 
-def _job_book_label(bid: str) -> str:
-    b = lib.load_json(BUILDS_PATH, {}).get(str(bid or "")) or {}
-    return str(b.get("title") or "").strip() or str(bid or "")
+class _ItemJobStartRejected(Exception):
+    """The catalogue item disappeared before its worker was registered."""
 
 
 def _job_track(job: dict, kind: str, label: str = "") -> threading.Event:
     """Enter a per-kind job dict into the unified registry (shared dict) and
-    return its cancellation event. Insertion prunes the oldest finished
-    entries beyond _JOBS_KEEP and persists the snapshot."""
+    return its cancellation event. This is the low-level compatibility seam;
+    production item-scoped starts must use ``_job_track_item_guarded`` so item
+    deletion and worker registration share one outer gate. Insertion prunes
+    the oldest finished entries beyond _JOBS_KEEP and persists the snapshot."""
     return _job_manager.track(job, kind, label=label)
+
+
+def _job_track_item_guarded(
+        job: dict, kind: str, item_id: str,
+        label: str = "") -> threading.Event:
+    """Register one item worker atomically against lifecycle deletion.
+
+    The order is deliberately page/lifecycle gate -> catalogue -> JobManager.
+    Lifecycle deletion takes the same outer gate before reserving the item in
+    the JobManager, so either the worker becomes visible to its active-job
+    guard or deletion wins and this late start is refused.  The catalogue lock
+    stays held through registration as a compatibility backstop for the old
+    catalogue-only delete route, which does not yet take the outer gate.
+
+    Callers may already hold ``_page_structure_lock`` (it is reentrant), but
+    must not hold the non-reentrant ``_builds_lock``.
+    """
+    item_id = str(item_id or "").strip()
+    if not item_id:
+        raise _ItemJobStartRejected("an item-scoped job needs an item id")
+    with _page_structure_lock:
+        with _builds_lock:
+            builds = lib.load_json(BUILDS_PATH, {})
+            item = builds.get(item_id) if isinstance(builds, dict) else None
+            if not isinstance(item, dict):
+                raise _ItemJobStartRejected(
+                    "the item disappeared before the job could start"
+                )
+            job["build_id"] = item_id
+            raw_subject = job.get("subject")
+            subject = dict(raw_subject) if isinstance(raw_subject, Mapping) else {}
+            subject["item_id"] = item_id
+            job["subject"] = subject
+            resolved_label = (
+                str(label or "").strip()
+                or str(item.get("title") or "").strip()
+                or item_id
+            )
+            # Keep both locks until JobManager.track has made the active job
+            # observable. Releasing either one first recreates a delete/start
+            # time-of-check/time-of-use window.
+            return _job_track(job, kind, label=resolved_label)
 
 
 def _job_transition_locked(job: dict, status: str, **fields) -> None:
@@ -7450,9 +8818,6 @@ def _jobs_load() -> None:
     output (progressively-saved OCR/translation pages) from abandoned work.
     Live entries are never clobbered."""
     _job_manager.rehydrate()
-
-
-_jobs_load()
 
 
 def _jobs_engine() -> JobManager:
@@ -7831,6 +9196,173 @@ def _ocr_merge_page(build_id: str, target: str, page: int, text: str) -> None:
         lib.save_text(f, "\n\n".join(parts), errors="replace")
 
 
+_OCR_PROPOSAL_IMAGE_PREFIX = "proposal-"
+
+
+def _ocr_figure_source_token(src_key: str) -> str:
+    source = str(src_key or "primary")
+    safe = re.sub(r"[^\w.-]", "_", source).strip("._-") or "source"
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:10]
+    return f"{safe[:32]}-{digest}"
+
+
+def _ocr_figure_leaf(raw: object) -> str:
+    safe = re.sub(r"[^\w.\-]", "_", str(raw or "")) or "img"
+    if "." not in safe:
+        safe += ".jpeg"
+    suffix = Path(safe).suffix[:16]
+    stem = safe[:-len(suffix)] if suffix else safe
+    return f"{stem[:96]}{suffix}"
+
+
+def _ocr_proposal_identity(*, src_key: str, page: int, provider: str,
+                           base_revision: str, doc: str, text: str,
+                           dims: Mapping | None, regions: list,
+                           images: list[dict]) -> str:
+    image_rows = []
+    for image in images or []:
+        if not isinstance(image, Mapping):
+            continue
+        raw = image.get("data")
+        payload = bytes(raw) if isinstance(raw, (bytes, bytearray)) else b""
+        image_rows.append({
+            "id": str(image.get("id") or ""),
+            "bbox": image.get("bbox") if isinstance(
+                image.get("bbox"), Mapping) else {},
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        })
+    command = {
+        "source_id": str(src_key or "primary"),
+        "page": int(page),
+        "provider": str(provider or "unknown"),
+        "base_revision": str(base_revision or ""),
+        "doc": str(doc or ""),
+        "text": str(text or ""),
+        "dims": dict(dims) if isinstance(dims, Mapping) else {},
+        "regions": regions or [],
+        "images": image_rows,
+    }
+    canonical = json.dumps(
+        command, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False, default=str,
+    ).encode("utf-8")
+    return "rdp-" + hashlib.sha256(canonical).hexdigest()[:32]
+
+
+def _ocr_write_page_images(build_id: str, page: int, images: list[dict],
+                           text: str, src_key: str,
+                           regions: list | None = None,
+                           *, proposal_id: str = "") -> tuple[
+                               str, dict[str, dict], set[str]]:
+    """Write immutable crops and return their unpublished manifest.
+
+    The caller owns ``_ocr_merge_lock`` and decides whether the returned
+    manifest belongs in canonical ``images`` or in a protected-page proposal.
+    Newly-created paths are returned so a failed manifest commit can clean up
+    without deleting an asset that belonged to an earlier identical retry.
+    """
+    if not images:
+        return text, {}, set()
+    directory = _entry_dir(build_id) / "ocr" / "images"
+    directory.mkdir(parents=True, exist_ok=True)
+    source = str(src_key or "primary")
+    source_token = _ocr_figure_source_token(source)
+    created: set[str] = set()
+    manifest: dict[str, dict] = {}
+    used: set[str] = set()
+    for index, image in enumerate(images):
+        if not isinstance(image, Mapping):
+            continue
+        raw = image.get("data")
+        if not isinstance(raw, (bytes, bytearray)) or not raw:
+            continue
+        leaf = _ocr_figure_leaf(image.get("id"))
+        if proposal_id:
+            name = (f"{_OCR_PROPOSAL_IMAGE_PREFIX}{source_token}-p{int(page)}-"
+                    f"{proposal_id[4:]}-{leaf}")
+        else:
+            source_prefix = "" if source == "primary" else f"s-{source_token}-"
+            name = f"{source_prefix}p{int(page)}-{leaf}"
+        if name in used:
+            suffix = Path(name).suffix
+            stem = name[:-len(suffix)] if suffix else name
+            name = f"{stem}-{index + 1}{suffix}"
+        used.add(name)
+        path = directory / name
+        existed = path.is_file()
+        lib.save_bytes(path, bytes(raw))
+        if not existed:
+            created.add(name)
+        info = dict(image.get("bbox") or {}) if isinstance(
+            image.get("bbox"), Mapping) else {}
+        info.update({
+            "page": int(page),
+            "src_key": source,
+            "sha256": hashlib.sha256(bytes(raw)).hexdigest(),
+        })
+        if proposal_id:
+            info["proposal_id"] = proposal_id
+        manifest[name] = info
+        image_id = str(image.get("id") or "")
+        if image_id:
+            pattern = re.compile(
+                r"(!\[[^\]]*\]\()" + re.escape(image_id) + r"(\))")
+            text = pattern.sub(r"\g<1>" + name + r"\g<2>", text)
+            for region in regions or []:
+                if isinstance(region, dict) and region.get("text"):
+                    region["text"] = pattern.sub(
+                        r"\g<1>" + name + r"\g<2>", str(region["text"]))
+    return text, manifest, created
+
+
+def _ocr_staged_figure_names(proposal: Mapping | None) -> set[str]:
+    figures = proposal.get("staged_figures") if isinstance(
+        proposal, Mapping) else None
+    if not isinstance(figures, Mapping):
+        return set()
+    return {
+        str(name) for name in figures
+        if str(name).startswith(_OCR_PROPOSAL_IMAGE_PREFIX)
+        and re.sub(r"[^\w.\-]", "_", str(name)) == str(name)
+    }
+
+
+def _ocr_remove_staged_figures(build_id: str, names: set[str]) -> None:
+    directory = _entry_dir(build_id) / "ocr" / "images"
+    for name in names:
+        if not name.startswith(_OCR_PROPOSAL_IMAGE_PREFIX):
+            continue
+        try:
+            (directory / name).unlink(missing_ok=True)
+        except OSError:
+            log.warning("Could not remove staged Replica figure: book=%s name=%s",
+                        build_id, name)
+
+
+def _ocr_cleanup_staged_figure_orphans(build_id: str) -> None:
+    """Remove proposal crops that no manifest can make visible after restart."""
+    directory = _entry_dir(build_id) / "ocr" / "images"
+    if not directory.is_dir():
+        return
+    with _ocr_merge_lock:
+        meta = lib.load_json(_entry_dir(build_id) / "ocr" / "layout.json", {})
+        referenced = {
+            str(name) for name in (meta.get("images") or {})
+            if str(name).startswith(_OCR_PROPOSAL_IMAGE_PREFIX)
+        }
+        for pages in (meta.get("region_proposals") or {}).values():
+            if not isinstance(pages, Mapping):
+                continue
+            for proposal in pages.values():
+                referenced.update(_ocr_staged_figure_names(proposal))
+        orphans = {
+            path.name for path in directory.glob(
+                f"{_OCR_PROPOSAL_IMAGE_PREFIX}*")
+            if path.is_file() and path.name not in referenced
+        }
+    _ocr_remove_staged_figures(build_id, orphans)
+
+
 def _ocr_save_page_images(build_id: str, page: int, images: list[dict],
                           text: str, src_key: str = "primary",
                           regions: list | None = None) -> str:
@@ -7844,28 +9376,17 @@ def _ocr_save_page_images(build_id: str, page: int, images: list[dict],
     figures the compiled doc calls something else is a record that lies."""
     if not images:
         return text
-    d = _entry_dir(build_id) / "ocr" / "images"
-    d.mkdir(parents=True, exist_ok=True)
     meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
     with _ocr_merge_lock:
         meta = lib.load_json(meta_path, {})
-        meta.setdefault("images", {})
-        for im in images:
-            safe = re.sub(r"[^\w.\-]", "_", im["id"]) or "img"
-            if "." not in safe:
-                safe += ".jpeg"
-            name = f"p{page}-{safe}"
-            lib.save_bytes(d / name, im["data"])
-            meta["images"][name] = dict(
-                im["bbox"] or {}, page=page, src_key=src_key or "primary")
-            # every ![id](id) in this page's markdown points at the saved file
-            pat = re.compile(r"(!\[[^\]]*\]\()" + re.escape(im["id"]) + r"(\))")
-            text = pat.sub(r"\g<1>" + name + r"\g<2>", text)
-            for reg in regions or []:
-                if reg.get("text"):
-                    reg["text"] = pat.sub(r"\g<1>" + name + r"\g<2>",
-                                          reg["text"])
-        lib.save_json(meta_path, meta)
+        text, figures, created = _ocr_write_page_images(
+            build_id, page, images, text, src_key, regions)
+        try:
+            meta.setdefault("images", {}).update(figures)
+            lib.save_json(meta_path, meta)
+        except Exception:
+            _ocr_remove_staged_figures(build_id, created)
+            raise
     return text
 
 
@@ -7970,6 +9491,105 @@ def _ocr_save_page_regions(build_id: str, src_key: str, page: int,
         return action
 
 
+def _ocr_save_page_detection(build_id: str, src_key: str, page: int,
+                             *, images: list[dict], text: str,
+                             regions: list, dims: Mapping | None,
+                             doc: str, provider: str) -> tuple[str, str]:
+    """Commit one region-producing OCR result without touching protected work.
+
+    Figure bytes are first written under a deterministic proposal identity.
+    Their metadata remains inside the proposal until the engine applies it;
+    canonical ``images`` and the protected page therefore cannot change merely
+    because detection ran.  Unprotected pages retain the existing immediate
+    save behavior, with secondary-source names now source-qualified.
+    """
+    source = str(src_key or "primary")
+    page_number = int(page)
+    document = _ocr_name(doc)
+    proposed_regions = [dict(region) for region in (regions or [])
+                        if isinstance(region, Mapping)]
+    meta_path = _entry_dir(build_id) / "ocr" / "layout.json"
+    previous_staged: set[str] = set()
+    current_staged: set[str] = set()
+    created: set[str] = set()
+    with _ocr_merge_lock:
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta = lib.load_json(meta_path, {})
+        current = _region_record(meta, source, page_number)
+        proposals = meta.get("region_proposals") or {}
+        proposal_pages = proposals.get(source) or {}
+        old_proposal = proposal_pages.get(str(page_number)) if isinstance(
+            proposal_pages, Mapping) else None
+        previous_staged = _ocr_staged_figure_names(old_proposal)
+        protected = replica_service.is_protected(current)
+        proposal_id = ""
+        if protected:
+            current["stale"] = replica_service.stale_marker(provider)
+            base_revision = replica_service.content_revision(current)
+            proposal_id = _ocr_proposal_identity(
+                src_key=source, page=page_number, provider=provider,
+                base_revision=base_revision,
+                doc=document, text=text, dims=dims,
+                regions=proposed_regions, images=images,
+            )
+        try:
+            rewritten, figures, created = _ocr_write_page_images(
+                build_id, page_number, images or [], str(text or ""), source,
+                proposed_regions, proposal_id=proposal_id)
+            if protected:
+                proposal = replica_service.make_proposal(
+                    doc=document,
+                    dims=dict(dims) if isinstance(dims, Mapping) else {},
+                    items=proposed_regions,
+                    provider=provider,
+                    base_revision=base_revision,
+                    text=rewritten,
+                    proposal_id=proposal_id,
+                    staged_figures=figures,
+                )
+                meta.setdefault("region_proposals", {}).setdefault(
+                    source, {})[str(page_number)] = proposal
+                current_staged = set(figures)
+                action = "proposed"
+            else:
+                if figures:
+                    meta.setdefault("images", {}).update(figures)
+                clean_regions = libformat.ensure_rids(proposed_regions)
+                region_map = meta.setdefault("regions", {})
+                pages = region_map.setdefault(source, {})
+                if clean_regions:
+                    pages[str(page_number)] = {
+                        "doc": document,
+                        "dims": (dict(dims) if isinstance(dims, Mapping)
+                                 else {}),
+                        "items": clean_regions,
+                        "origin": "machine",
+                    }
+                    action = "saved"
+                else:
+                    pages.pop(str(page_number), None)
+                    if not pages:
+                        region_map.pop(source, None)
+                    if not region_map:
+                        meta.pop("regions", None)
+                    action = "dropped"
+                proposal_map = meta.get("region_proposals") or {}
+                pending = proposal_map.get(source) or {}
+                if isinstance(pending, dict):
+                    pending.pop(str(page_number), None)
+                    if not pending:
+                        proposal_map.pop(source, None)
+                if not proposal_map:
+                    meta.pop("region_proposals", None)
+            lib.save_json(meta_path, meta)
+        except Exception:
+            _ocr_remove_staged_figures(build_id, created)
+            raise
+    _ocr_remove_staged_figures(
+        build_id, previous_staged - current_staged)
+    return rewritten, action
+
+
 def _ocr_drop_page_regions_for_doc(build_id: str, src_key: str, page: int,
                                    doc: str, *, provider: str = "",
                                    proposed_text: str = "") -> str:
@@ -8034,14 +9654,29 @@ def _ocr_job_run(job_id: str) -> None:
             runner = _OCR_SERVICES.get(svc)
             if runner is None:
                 raise RuntimeError(f"unsupported service: {svc}")
-            result = runner(png, cfg)
+            # Long-lived job dictionaries contain only nonsecret provider
+            # settings. Lease exactly the credential(s) required by this one
+            # page invocation and drop the temporary config immediately.
+            with _ocr_execution_cfg(svc, cfg) as execution_cfg:
+                result = runner(png, execution_cfg)
             # a runner may return a dict instead of a string: {text, images}
             # (Mistral figures) and/or {text, words} (Tesseract/Textract boxes)
             src_key = job.get("src_key") or "primary"
             region_action = "unchanged"
             if isinstance(result, dict):
                 text = str(result.get("text") or "")
-                if result.get("images"):
+                # Region-producing results are committed as one page-level
+                # decision. This is what keeps figure crops and their metadata
+                # inside a protected-page proposal instead of publishing them
+                # before the protection check runs.
+                if "regions" in result:
+                    text, region_action = _ocr_save_page_detection(
+                        job["build_id"], src_key, n,
+                        images=result.get("images") or [], text=text,
+                        regions=result.get("regions") or [],
+                        dims=result.get("dims"),
+                        doc=_ocr_name(job["target"]), provider=svc)
+                elif result.get("images"):
                     text = _ocr_save_page_images(
                         job["build_id"], n, result["images"], text,
                         src_key, regions=result.get("regions"))
@@ -8060,13 +9695,7 @@ def _ocr_job_run(job_id: str) -> None:
                 # Region-silent engines instead DROP a record claiming this
                 # target's text: unlike word geometry, region text is
                 # superseded by the new transcription.
-                if "regions" in result:
-                    region_action = _ocr_save_page_regions(
-                        job["build_id"], src_key, n,
-                        result.get("regions") or [], result.get("dims"),
-                        doc=_ocr_name(job["target"]), protect_existing=True,
-                        provider=svc, proposed_text=text)
-                else:
+                if "regions" not in result:
                     region_action = _ocr_drop_page_regions_for_doc(
                         job["build_id"], src_key, n,
                         _ocr_name(job["target"]), provider=svc,
@@ -8200,20 +9829,40 @@ def api_ocr_run():
 
 
 def _ocr_request_cfg(payload: dict) -> dict:
-    """Build an OCR worker config from the authoritative local secret store."""
-    local = _client_settings()
-    cfg = {k: payload.get(k) for k in (
-        "tesseract", "claude_key", "claude_model", "aws_key", "aws_secret",
-        "aws_region", "mistral_key",
-    )}
-    for request_key, setting_key in (
-        ("mistral_key", "mistralKey"),
-        ("claude_key", "ocrClaudeKey"),
-        ("aws_key", "ocrAwsKey"),
-        ("aws_secret", "ocrAwsSecret"),
-    ):
-        cfg[request_key] = local.get(setting_key) or cfg.get(request_key)
-    return cfg
+    """Build a credential-free OCR job config.
+
+    Credential-shaped renderer fields are deliberately ignored; only the
+    protected provider lease can authorize execution.
+    """
+    settings = _client_settings()
+    return {
+        "tesseract": payload.get("tesseract") or settings.get("ocrTesseract"),
+        "claude_model": payload.get("claude_model")
+        or settings.get("ocrClaudeModel"),
+        "aws_region": payload.get("aws_region") or settings.get("ocrAwsRegion"),
+    }
+
+
+@contextlib.contextmanager
+def _ocr_execution_cfg(service: str, base_cfg: Mapping):
+    cfg = dict(base_cfg)
+    with contextlib.ExitStack() as stack:
+        if service == "mistral":
+            cfg["mistral_key"] = stack.enter_context(
+                _lease_secret("mistralKey"))
+        elif service == "claude":
+            cfg["claude_key"] = stack.enter_context(
+                _lease_secret("ocrClaudeKey"))
+        elif service == "textract":
+            cfg["aws_key"] = stack.enter_context(
+                _lease_secret("ocrAwsKey"))
+            cfg["aws_secret"] = stack.enter_context(
+                _lease_secret("ocrAwsSecret"))
+        try:
+            yield cfg
+        finally:
+            for key in ("mistral_key", "claude_key", "aws_key", "aws_secret"):
+                cfg.pop(key, None)
 
 
 def _replica_detection_pdf(build: dict, source_id: str) -> Path | None:
@@ -8240,6 +9889,33 @@ def _replica_detection_active(build_id: str, source_id: str,
                     and str(subject.get("page") or "") == str(page)):
                 return dict(job)
     return None
+
+
+def _replica_detection_command_sha256(*, build_id: str, source_id: str,
+                                      page: int, provider: str,
+                                      expected_revision: str) -> str:
+    command = {
+        "capability": "replica.region-detection.start@1",
+        "item_id": str(build_id),
+        "source_id": str(source_id),
+        "page": int(page),
+        "provider": str(provider),
+        "expected_region_revision": str(expected_revision),
+    }
+    canonical = json.dumps(
+        command, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _replica_detection_replay_response(receipt, provider: str):
+    return jsonify({
+        "ok": True,
+        "already": True,
+        "provider": provider,
+        "job": receipt.job.as_dict(),
+        "receipt": receipt.as_public_dict(),
+    })
 
 
 @app.route("/api/v1/items/<build_id>/replica/region-detection-jobs",
@@ -8285,6 +9961,34 @@ def api_v1_replica_region_detection_job(build_id: str):
             code="region_revision_required",
             details={"item_id": build_id, "source_id": source_id,
                      "page": page}), current=current)
+    raw_idempotency_key = payload.get("idempotency_key")
+    if not isinstance(raw_idempotency_key, str) or not raw_idempotency_key:
+        return _engine_error_response(EnginePreconditionRequiredError(
+            "an idempotency key is required",
+            code="idempotency_key_required",
+            details={"item_id": build_id, "source_id": source_id,
+                     "page": page}), current=current)
+    try:
+        idempotency_key = _jobs_engine().validate_operation_id(
+            raw_idempotency_key)
+    except EngineError as exc:
+        return _engine_error_response(exc, current=current)
+    source_id = current.key.source_id
+    command_sha256 = _replica_detection_command_sha256(
+        build_id=build_id, source_id=source_id, page=page,
+        provider=provider, expected_revision=expected)
+    try:
+        receipt = _jobs_engine().command_receipt(
+            idempotency_key, command_sha256,
+            kind="replica.detect-regions")
+    except EngineError as exc:
+        return _engine_error_response(exc, current=current)
+    # Replay precedes the live CAS check. An exact retry after a successful
+    # unprotected run necessarily carries the old page revision, but it must
+    # still return the paid-for terminal job instead of starting or billing it
+    # again.
+    if receipt is not None:
+        return _replica_detection_replay_response(receipt, provider)
     if expected != current.revision:
         return _engine_error_response(EngineConflictError(
             "the region page changed before detection could start",
@@ -8309,7 +10013,7 @@ def api_v1_replica_region_detection_job(build_id: str):
             details={"item_id": build_id, "source_id": source_id or ""}))
 
     cfg = _ocr_request_cfg({})
-    if not str(cfg.get("mistral_key") or "").strip():
+    if not _secret_is_configured("mistralKey"):
         return _engine_error_response(EngineValidationError(
             "Mistral OCR is not configured",
             code="region_detection_provider_not_configured",
@@ -8326,9 +10030,15 @@ def api_v1_replica_region_detection_job(build_id: str):
         "region": expected,
         "page_structure": source_revision,
     }
-    idempotency_key = str(payload.get("idempotency_key") or "").strip()[:128]
-
     with _replica_detection_start_lock:
+        try:
+            receipt = _jobs_engine().command_receipt(
+                idempotency_key, command_sha256,
+                kind="replica.detect-regions")
+        except EngineError as exc:
+            return _engine_error_response(exc, current=current)
+        if receipt is not None:
+            return _replica_detection_replay_response(receipt, provider)
         existing = _replica_detection_active(build_id, source_id, page)
         if existing is not None:
             existing_region = str(
@@ -8343,6 +10053,10 @@ def api_v1_replica_region_detection_job(build_id: str):
                              "expected_revision": expected}), current=current)
             view = _jobs_engine().view(str(existing.get("id") or ""))
             if view is not None:
+                # A second observer may carry its own command identity. It
+                # does not acquire a receipt for work it did not start, but it
+                # can still join the identical live job instead of presenting
+                # an unexplained page-level conflict.
                 return jsonify({"ok": True, "already": True,
                                 "provider": provider,
                                 "job": view.as_dict()})
@@ -8368,9 +10082,8 @@ def api_v1_replica_region_detection_job(build_id: str):
                          "unit": "page", "phase": "detecting-regions"},
             "input_revisions": input_revisions,
             "outputs": [], "provider": provider,
-            # Runtime-only retry correlation. It is intentionally outside the
-            # JobManager public allowlist and never reaches jobs.json.
-            "idempotency_key": idempotency_key,
+            "operation_id": idempotency_key,
+            "command_sha256": command_sha256,
         }
         if not _ocr_job_start_guarded(job, source_revision, record_source=True):
             return _engine_error_response(EngineConflictError(
@@ -8382,8 +10095,13 @@ def api_v1_replica_region_detection_job(build_id: str):
     view = _jobs_engine().view(job_id)
     if view is None:  # registration and view publication are one start step
         raise RuntimeError("region-detection job was not registered")
+    receipt = _jobs_engine().command_receipt(
+        idempotency_key, command_sha256, kind="replica.detect-regions")
+    if receipt is None:
+        raise RuntimeError("region-detection command receipt was not persisted")
     return jsonify({"ok": True, "already": False, "provider": provider,
-                    "job": view.as_dict()})
+                    "job": view.as_dict(),
+                    "receipt": receipt.as_public_dict()})
 
 
 def _ocr_job_state(job: dict) -> dict:
@@ -8633,8 +10351,21 @@ def api_trash():
     tab footer shows. Plain read: save_json is atomic tmp+replace, so a reader
     never sees a torn document and needs no lock."""
     doc = lib.load_json(TRASH_PATH, {"version": 1, "items": {}})
-    items = sorted((doc.get("items") or {}).values(),
-                   key=lambda r: str(r.get("created") or ""), reverse=True)
+    items = []
+    for raw in (doc.get("items") or {}).values():
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        if item.get("kind") == "build" and not item.get("restored_at"):
+            # These rows predate aggregate lifecycle storage. Their raw record
+            # remains downloadable, but reinserting it would bypass the
+            # engine-owned item/tree tombstone and can resurrect stale state.
+            item["restorable"] = False
+            item["note"] = (
+                "legacy catalogue-only recovery; download the record"
+            )
+        items.append(item)
+    items.sort(key=lambda r: str(r.get("created") or ""), reverse=True)
     return jsonify({"ok": True, "items": items, "summary": {
         "count": len(items),
         "bytes": sum(int(r.get("bytes") or 0) for r in items),
@@ -8682,8 +10413,20 @@ def api_trash_forget():
 
 
 def _trash_restore_pdf_pages(item: dict) -> tuple[dict, int]:
+    """Restore page payloads only while their aggregate item remains live."""
+
+    origin = item.get("origin") or {}
+    build_id = str(origin.get("build_id") or "")
+    builds = lib.load_json(BUILDS_PATH, {})
+    if build_id not in builds:
+        return {"ok": False, "error": "that entry no longer exists"}, 409
+    with _live_item_write_scope(build_id):
+        return _trash_restore_pdf_pages_guarded(item)
+
+
+def _trash_restore_pdf_pages_guarded(item: dict) -> tuple[dict, int]:
     """Put deleted pages back. Refuses rather than guesses: the recorded page
-    numbers are only meaningful against the exact post-delete page count, and
+    numbers are only meaningful against the exact post-delete PDF, and
     appending them to the end would not be a restore at all."""
     from pypdf import PdfReader, PdfWriter
     origin = item.get("origin") or {}
@@ -8692,6 +10435,9 @@ def _trash_restore_pdf_pages(item: dict) -> tuple[dict, int]:
     builds = lib.load_json(BUILDS_PATH, {})
     if build_id not in builds:
         return {"ok": False, "error": "that entry no longer exists"}, 409
+    refresh_expected_revision = _engine_build_record_revision(
+        build_id, builds[build_id]
+    )
     pdf = _resolve_local(str(origin.get("pdf") or ""))
     if pdf is None or not pdf.is_file() or pdf.suffix.lower() != ".pdf":
         return {"ok": False, "error": "the original PDF is no longer there"}, 409
@@ -8709,6 +10455,21 @@ def _trash_restore_pdf_pages(item: dict) -> tuple[dict, int]:
         blockers = _page_job_blockers(build_id)
         if blockers:
             return {"ok": False, "error": "an OCR job is running for this book"}, 409
+        expected_digest = str(rest.get("pdf_after_sha256") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+            return {"ok": False, "error":
+                    "this recovery record predates exact PDF lineage checks — "
+                    "download the pages instead and re-insert them by hand"}, 409
+        try:
+            current_digest = _file_sha256(pdf)
+        except OSError:
+            return {"ok": False, "error":
+                    "the current PDF could not be verified — download the "
+                    "pages instead and re-insert them by hand"}, 409
+        if current_digest != expected_digest:
+            return {"ok": False, "error":
+                    "this PDF has changed since the delete — download the pages "
+                    "instead and re-insert them by hand"}, 409
         current = PdfReader(str(pdf))
         if len(current.pages) != int(rest.get("pages_after") or -1):
             return {"ok": False, "error":
@@ -8810,10 +10571,31 @@ def _trash_restore_pdf_pages(item: dict) -> tuple[dict, int]:
         # different physical page with no conflict raised. The delete path
         # carries the same invariant via `if changed or build_persisted`.
         try:
-            _builds_apply(build_id, changed)
-        except OSError:
+            refresh_expected_revision = _builds_apply(
+                build_id,
+                changed,
+                expected_revision=refresh_expected_revision,
+            )
+        except (EngineError, OSError):
             skipped.append({"file": "entry record",
                             "reason": "could not be written back"})
+    try:
+        _engine_refresh_representation_reference(
+            build_id,
+            str(origin.get("src_key") or "primary"),
+            str(origin.get("pdf") or pdf),
+            operation_scope="page-restore-source-refresh",
+            expected_item_revision=refresh_expected_revision,
+        )
+    except EngineError as exc:
+        log.warning(
+            "could not refresh representation after page restore: %s",
+            exc.code,
+        )
+        skipped.append({
+            "file": "source integrity metadata",
+            "reason": "could not be refreshed",
+        })
 
     # the caller (api_trash_restore) owns marking the row restored
     return {"ok": True, "restored": restored, "skipped": skipped,
@@ -8833,29 +10615,57 @@ def _trash_restore_record(item: dict) -> tuple[dict, int]:
     except (OSError, ValueError):
         return {"ok": False, "error": "the trashed record is unreadable"}, 410
     if kind == "build":
-        rid, path, lock = str(origin.get("build_id") or ""), BUILDS_PATH, _builds_lock
-    else:
-        rid, path, lock = (str(origin.get("entry_id") or ""),
-                           lib.MANUAL_ENTRIES_PATH, _manual_lock)
+        return {
+            "ok": False,
+            "error": (
+                "this legacy catalogue-only recovery cannot safely restore "
+                "an aggregate item; download its record instead"
+            ),
+            "code": "legacy_item_restore_retired",
+        }, 410
+    rid, path, lock = (str(origin.get("entry_id") or ""),
+                       lib.MANUAL_ENTRIES_PATH, _manual_lock)
     if not rid:
         return {"ok": False, "error": "the trashed record has no id"}, 410
 
     def apply(doc):
         if rid in doc:
-            return False
+            # Retrying a restore after its response was lost is a replay, not
+            # an overwrite. Any intervening edit still conflicts.
+            return "replayed" if doc[rid] == record else "conflict"
         if kind == "manual_entry":
             _canonicalize_collection_link(record)
         doc[rid] = record
-        return True
+        return "restored"
 
-    if not _mutate_json(path, lock, {}, apply):
+    outcome = _mutate_json(path, lock, {}, apply)
+    if outcome == "conflict":
         return {"ok": False,
                 "error": "something with that id exists again — restoring would "
                          "overwrite it"}, 409
-    return {"ok": True, "restored": ["record.json"], "skipped": []}, 200
+    body = {
+        "ok": True,
+        "restored": ["record.json"],
+        "skipped": [],
+        "replayed": outcome == "replayed",
+    }
+    body["build" if kind == "build" else "entry"] = record
+    return body, 200
 
 
 def _trash_restore_translation(item: dict) -> tuple[dict, int]:
+    """Restore translation payloads only while their item remains live."""
+
+    origin = item.get("origin") or {}
+    bid = str(origin.get("build_id") or "")
+    builds = lib.load_json(BUILDS_PATH, {})
+    if bid not in builds:
+        return {"ok": False, "error": "that entry no longer exists"}, 409
+    with _live_item_write_scope(bid):
+        return _trash_restore_translation_guarded(item)
+
+
+def _trash_restore_translation_guarded(item: dict) -> tuple[dict, int]:
     """Write a deleted translation (and its provenance sidecar) back, unless a
     newer one is already there."""
     origin = item.get("origin") or {}
@@ -8899,7 +10709,26 @@ def api_trash_restore():
     doc = lib.load_json(TRASH_PATH, {"version": 1, "items": {}})
     item = (doc.get("items") or {}).get(tid)
     if not item:
-        return jsonify({"ok": False, "error": "no such item"}), 404
+        # Since aggregate deletion was introduced, the compatibility DELETE
+        # route returns a lifecycle tombstone id as its old ``trash_id``.
+        # Preserve old undo clients by resolving that handle through the
+        # lifecycle service instead of recreating catalogue state here.
+        try:
+            body, result = _legacy_restore_lifecycle_tombstone(tid)
+        except EngineNotFoundError:
+            return jsonify({"ok": False, "error": "no such item"}), 404
+        except EngineError as exc:
+            return _engine_error_response(exc)
+        response = jsonify(body)
+        response.cache_control.no_store = True
+        if result is not None:
+            response.headers["X-Record-Revision"] = (
+                result.receipt.restored_item_revision
+            )
+            response.headers["X-Tombstone-Revision"] = (
+                result.receipt.tombstone.revision
+            )
+        return response
     if item.get("restorable") is False:
         return jsonify({"ok": False, "error": str(item.get("note") or "")
                         or "this item can no longer be restored"}), 409
@@ -9003,11 +10832,21 @@ def _reserve_page_deletion(build_id: str, pdf: Path,
 
 def _ocr_job_start_guarded(job: dict, source_revision: int,
                            record_source: bool = False) -> bool:
-    """Register/start OCR atomically against page deletion."""
+    """Register/start OCR atomically against item and page deletion."""
     build_id = str(job.get("build_id") or "")
     with _page_structure_lock:
         if _page_structure_revision.get(build_id, 0) != source_revision:
             return False
+        # Region detection records its document/source binding before the
+        # unified registration below. Confirm the item under the catalogue
+        # lock first so a start that waited behind lifecycle deletion cannot
+        # recreate files for an item that is already gone. The final guarded
+        # registration rechecks the same fact after this collateral write.
+        with _builds_lock:
+            builds = lib.load_json(BUILDS_PATH, {})
+            if not isinstance(builds, dict) or not isinstance(
+                    builds.get(build_id), dict):
+                return False
         if record_source:
             _ocr_set_source(build_id, _ocr_name(job.get("target") or "compiled.txt"),
                             job.get("src_key") or "primary")
@@ -9017,10 +10856,14 @@ def _ocr_job_start_guarded(job: dict, source_revision: int,
         # ``replica.detect-regions``) while legacy OCR batches continue to
         # default to ``ocr``.  The generic jobs API and future workbenches must
         # not need to infer the producer from mutable OCR implementation data.
-        _job_track(
-            job, str(job.get("kind") or "ocr"),
-            label=_job_book_label(build_id),
-        )
+        try:
+            _job_track_item_guarded(
+                job, str(job.get("kind") or "ocr"), build_id,
+            )
+        except _ItemJobStartRejected:
+            with _ocr_jobs_lock:
+                _ocr_jobs.pop(job["id"], None)
+            return False
         threading.Thread(target=_ocr_job_run, args=(job["id"],),
                          daemon=True).start()
         return True
@@ -9613,9 +11456,35 @@ def _apply_page_deletion(build_id: str, builds: dict, pdf: Path,
                 build_id, pdf, expected_revision)
         if _page_job_blockers(build_id):
             raise ValueError("a page-processing job is running for this book")
-        return _apply_page_deletion_locked(
+        result = _apply_page_deletion_locked(
             build_id, builds, pdf, pages,
             expected_revision=expected_revision)
+    refresh = result.pop("_representation_refresh", None)
+    if refresh is not None:
+        source_id, source_token, expected_item_revision = refresh
+        try:
+            _engine_refresh_representation_reference(
+                build_id,
+                source_id,
+                source_token,
+                operation_scope="page-delete-source-refresh",
+                expected_item_revision=expected_item_revision,
+            )
+            current = lib.load_json(BUILDS_PATH, {}).get(build_id)
+            if isinstance(current, dict):
+                builds[build_id] = current
+                result["build"] = current
+        except EngineError as exc:
+            log.warning(
+                "could not refresh representation after page deletion: %s",
+                exc.code,
+            )
+            warnings = result.setdefault("warnings", [])
+            warnings.append(
+                "source integrity metadata could not be refreshed"
+            )
+            result["partial"] = True
+    return result
 
 
 def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
@@ -9655,6 +11524,7 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
             build_id, pdf, expected_revision)
         builds[build_id] = b
         build_persisted = True
+    reserved_item_revision = _engine_build_record_revision(build_id, b)
     actual_pages = [page for page in pages if page <= total]
     srcmap = _ocr_sources(build_id)
     ocr_dir = _entry_dir(build_id) / "ocr"
@@ -9686,6 +11556,11 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
     tmp = pdf.with_suffix(".del.tmp")
     with open(tmp, "wb") as fh:
         writer.write(fh)
+    # Hash the exact successor bytes before replacing the live file. Restore
+    # must pin lineage, not merely page count: an unrelated PDF can have the
+    # same number of pages. A hashing failure here is still pre-commit and
+    # therefore leaves the source untouched.
+    post_delete_sha256 = _file_sha256(tmp)
     # Record the PDF that is actually being edited. "primary" is also
     # _src_key_for_path's catch-all for a resolve error or no match at all, so
     # verify rather than assume: pointing the row at pdf_file for a file that
@@ -9722,6 +11597,7 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
         tid, "pdf_pages", label,
         {"build_id": build_id, "pdf": src_path, "src_key": src_key},
         {"pages": pages, "pages_before": total, "pages_after": len(keep),
+         "pdf_after_sha256": post_delete_sha256,
          "title_pages_before": str(b.get("title_pages") or ""),
          "thumbnail_source_before": str(b.get("thumbnail_source") or "")},
         payload_kind, list(tfiles))
@@ -9858,7 +11734,11 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
         b.update(changed)
         if changed or build_persisted:
             try:
-                revision = _builds_apply(build_id, changed)
+                revision = _builds_apply(
+                    build_id,
+                    changed,
+                    expected_revision=reserved_item_revision,
+                )
                 if revision:
                     b["updated_at"] = revision
                 else:
@@ -9898,6 +11778,12 @@ def _apply_page_deletion_locked(build_id: str, builds: dict, pdf: Path,
               "trash_id": tid,
               "page_remap": {"source": src_key, "deleted": actual_pages},
               "build": b}
+    if build_persisted:
+        result["_representation_refresh"] = (
+            src_key,
+            src_path,
+            _engine_build_record_revision(build_id, b),
+        )
     if warnings:
         result["partial"] = True
         result["warnings"] = warnings
@@ -9965,21 +11851,16 @@ def first_content_page(pdf: Path, ink_threshold: float = 0.003,
 @app.route("/api/master/sync", methods=["POST"])
 def api_master_sync():
     """Publish the master list (plus manual entries) to a Google Sheet.
-    Body: {spreadsheet_id, service_account_file, sheet_name?}. Requires a
+    Body: {spreadsheet_id, sheet_name?}. Requires a
     Google service-account JSON key — TODO: verify once the user has one."""
     p = request.get_json(silent=True) or {}
     sheet_id = str(p.get("spreadsheet_id") or "").strip()
-    keyfile = (str(p.get("service_account_file") or "").strip()
-               or str(_client_settings().get("gsKeyFile") or "").strip())
     sheet_name = str(p.get("sheet_name") or "Master list").strip()
-    if not sheet_id or not keyfile:
+    if not sheet_id or not _secret_is_configured("gsKeyFile"):
         return jsonify({"ok": False,
                         "error": "Spreadsheet ID and service-account key file "
                                  "are required (Settings > Integrations; key "
                                  "file under Credentials)"})
-    kf = _resolve_local(keyfile)
-    if kf is None or not kf.is_file():
-        return jsonify({"ok": False, "error": f"key file not found: {keyfile}"})
     try:
         from google.oauth2 import service_account
         from googleapiclient.discovery import build as gbuild
@@ -10006,15 +11887,20 @@ def api_master_sync():
                      e.get("publisher", ""), e.get("city", ""),
                      cats, e.get("notes", ""), "manual"])
     try:
-        creds = service_account.Credentials.from_service_account_file(
-            str(kf), scopes=["https://www.googleapis.com/auth/spreadsheets"])
-        svc = gbuild("sheets", "v4", credentials=creds)
-        svc.spreadsheets().values().update(
-            spreadsheetId=sheet_id, range=f"{sheet_name}!A1",
-            valueInputOption="RAW", body={"values": rows}).execute()
+        with _lease_secret("gsKeyFile") as keyfile:
+            kf = _resolve_local(keyfile)
+            if kf is None or not kf.is_file():
+                return jsonify({"ok": False,
+                                "error": "service-account key file not found"})
+            creds = service_account.Credentials.from_service_account_file(
+                str(kf), scopes=["https://www.googleapis.com/auth/spreadsheets"])
+            svc = gbuild("sheets", "v4", credentials=creds)
+            svc.spreadsheets().values().update(
+                spreadsheetId=sheet_id, range=f"{sheet_name}!A1",
+                valueInputOption="RAW", body={"values": rows}).execute()
         return jsonify({"ok": True, "rows": len(rows) - 1})
-    except Exception as exc:
-        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+    except Exception:
+        return jsonify({"ok": False, "error": "Google Sheets sync failed"})
 
 
 _PDF_TEXT_CACHE: dict = {}
@@ -10073,15 +11959,25 @@ def api_pdf_text():
     if bid and out.get("ok") and out.get("pages_with_text", 0) > 1:
         builds = lib.load_json(BUILDS_PATH, {})
         if bid in builds:
-            name = _ocr_name(request.args.get("save_name") or "extracted.txt")
-            f = _entry_dir(bid) / "ocr" / name
-            if not f.is_file():
-                f.parent.mkdir(parents=True, exist_ok=True)
-                f.write_text(out["text"], encoding="utf-8", errors="replace")
-                src_key = _valid_src_key(builds[bid], request.args.get("src"))
-                if src_key:
-                    _ocr_set_source(bid, name, src_key)
-                out = dict(out, saved=name)
+            # Extraction may be slow (and a remote URL may be involved), so
+            # take the lifecycle lease only for final publication.  Re-read
+            # membership inside the lease before creating the entry tree.
+            with _live_item_write_scope(bid) as live_build:
+                name = _ocr_name(
+                    request.args.get("save_name") or "extracted.txt"
+                )
+                f = _entry_dir(bid) / "ocr" / name
+                if not f.is_file():
+                    f.parent.mkdir(parents=True, exist_ok=True)
+                    f.write_text(
+                        out["text"], encoding="utf-8", errors="replace"
+                    )
+                    src_key = _valid_src_key(
+                        live_build, request.args.get("src")
+                    )
+                    if src_key:
+                        _ocr_set_source(bid, name, src_key)
+                    out = dict(out, saved=name)
     return jsonify(out)
 
 
@@ -10718,187 +12614,1135 @@ def api_ia_downloads():
 
 # --- Open Library indexes (constrained search + realtime + autocomplete) --------
 
-# Cloud config lives in the client settings blob (synced via /api/client_state),
-# so a per-user remote URL and DB source URLs need no separate config file.
-# --- credentials: a LOCAL-ONLY secrets store, kept out of the synced (and
-# rebinding-reachable) client_state. The dialog reads/writes it through
-# /api/secrets (Host-guarded); every server-side credential read goes through
-# _client_settings, which overlays these on top of the synced preferences. ------
-_SECRET_KEYS = frozenset({
-    "aiKey", "embedKey", "imgGenKey", "mistralKey", "ocrClaudeKey",
-    # Azure OCR is retired, but an older client may still have its key in the
-    # synced settings blob. Keep classifying it as sensitive so GET/PUT and the
-    # startup migration cannot expose it merely because its UI was removed.
-    "ocrAzureKey", "ocrAwsKey", "ocrAwsSecret", "supabaseKey",
-    "supabaseAnonKey", "r2KeyId", "r2Secret", "gsKeyFile",
-})
-_SECRETS_PATH = lib.DATA_ROOT / "output" / "secrets.json"
+# Cloud config lives in client_state, but credential material does not.  The
+# public engine service below exposes only fixed-length masked status and
+# conditional mutation receipts.  Plaintext access is a separate, sidecar-
+# private lease held only around a provider invocation.
+_SECRET_IDS = LEGACY_SECRET_IDS
+_SECRET_KEYS = LEGACY_SECRET_KEYS
+_SECRET_INITIAL_REVISIONS = {
+    secret_id: f"absent-v1-{legacy_key.lower()}"
+    for legacy_key, secret_id in _SECRET_IDS.items()
+}
+_SECRET_REGISTRY = SecretIdRegistry(_SECRET_INITIAL_REVISIONS)
+_SECRET_STORE_ID = "librarytool.desktop.current-user.v1"
+_PROTECTED_SECRETS_PATH = lib.OUTPUT_DIR / "secrets.dpapi"
+
+# Read-only legacy inputs.  This file is never written again.
+_SECRETS_PATH = lib.OUTPUT_DIR / "secrets.json"
 _MISTRAL_PENDING = "_mistralCloudPending"
-# The one lock for every secrets.json read-modify-write (settings dialog,
-# profile reconciliation, the client_state migration). Single process.
-_secrets_lock = threading.Lock()
+_SECRET_SYNC_STATE_PATH = lib.OUTPUT_DIR / "secret_sync_state.json"
+_MISTRAL_SYNC_SCHEMA = "librarytool.mistral-profile-sync/2"
+_MISTRAL_SYNC_KEY = "mistral"
+_MISTRAL_STABLE_PHASES = frozenset({"synced", "pending", "unowned", "blocked"})
+_MISTRAL_OWNED_PHASES = frozenset({"synced", "pending"})
+_LEGACY_RENDERER_SECRET_HEADER = "X-WHL-Secret-Source"
+_LEGACY_RENDERER_SECRET_SOURCE = "legacy-renderer-local-storage-v1"
+_secrets_lock = threading.RLock()
+_secret_cutover_lock = threading.RLock()
+_mistral_sync_lock = threading.RLock()
+_secret_repository: WindowsDpapiSecretStoreRepository | None = None
+_secret_cutover_complete = False
 
 
-def _load_secrets() -> dict:
-    d = lib.load_json(_SECRETS_PATH, {})
-    return d if isinstance(d, dict) else {}
+class ProtectedSecretCutoverError(RuntimeError):
+    """Sanitized startup failure; never includes a path or credential."""
 
 
-def _save_secrets(d: dict) -> None:
-    lib.save_json(_SECRETS_PATH, d)
+def _new_secret_repository() -> WindowsDpapiSecretStoreRepository:
+    return WindowsDpapiSecretStoreRepository(
+        _PROTECTED_SECRETS_PATH,
+        registry=_SECRET_REGISTRY,
+        store_id=_SECRET_STORE_ID,
+    )
+
+
+def _secret_store_bindings() -> SecretStoreBindings:
+    global _secret_repository
+    if _secret_repository is None:
+        _secret_repository = _new_secret_repository()
+    return SecretStoreBindings(_secret_repository)
+
+
+def _legacy_secret_document() -> dict:
+    value = lib.load_json(_SECRETS_PATH, {})
+    return value if isinstance(value, dict) else {}
+
+
+def _secret_sync_state() -> dict:
+    value = lib.load_json(_SECRET_SYNC_STATE_PATH, {})
+    return value if isinstance(value, dict) else {}
+
+
+def _mistral_account_id(value) -> str | None:
+    """Return one safe opaque Supabase user id, or no account identity."""
+
+    if not isinstance(value, str):
+        return None
+    account_id = value.strip()
+    if (
+        not account_id
+        or len(account_id) > 255
+        or any(ord(character) < 32 or ord(character) == 127
+               for character in account_id)
+    ):
+        return None
+    return account_id
+
+
+def _active_mistral_account_id() -> str | None:
+    """Read the stored account identity without refreshing or using a token."""
+
+    session = _auth_doc().get("session")
+    if not isinstance(session, Mapping) or not session.get("refresh_token"):
+        return None
+    return _mistral_account_id(session.get("user_id"))
+
+
+def _mistral_stable_record(
+        phase: str, revision: str, *, owner_user_id: str | None = None) -> dict:
+    record = {"phase": phase, "revision": revision}
+    if owner_user_id is not None:
+        record["owner_user_id"] = owner_user_id
+    return record
+
+
+def _valid_mistral_stable_record(value) -> dict | None:
+    if not isinstance(value, Mapping):
+        return None
+    phase = value.get("phase")
+    revision = value.get("revision")
+    if phase not in _MISTRAL_STABLE_PHASES or not isinstance(revision, str) \
+            or not revision:
+        return None
+    owner = _mistral_account_id(value.get("owner_user_id"))
+    if phase in _MISTRAL_OWNED_PHASES:
+        if owner is None or set(value) != {"phase", "revision", "owner_user_id"}:
+            return None
+        return _mistral_stable_record(
+            phase, revision, owner_user_id=owner)
+    if phase == "unowned":
+        if set(value) != {"phase", "revision"}:
+            return None
+        return _mistral_stable_record(phase, revision)
+    # A blocked record may retain the last known owner for diagnostics and a
+    # deliberate replacement, but it never authorizes a lease or an upload.
+    if set(value) not in (
+        {"phase", "revision"},
+        {"phase", "revision", "owner_user_id"},
+    ):
+        return None
+    return _mistral_stable_record(
+        phase, revision, owner_user_id=owner) if owner else \
+        _mistral_stable_record(phase, revision)
+
+
+def _save_mistral_sync_record(record: dict | None) -> None:
+    """Atomically persist redacted Mistral ownership/sync metadata."""
+
+    state = _secret_sync_state()
+    state.pop("mistral_pending", None)  # v1 marker had no safe account owner
+    state.pop(_MISTRAL_PENDING, None)
+    if record is None:
+        state.pop(_MISTRAL_SYNC_KEY, None)
+        state.pop("schema", None)
+    else:
+        state["schema"] = _MISTRAL_SYNC_SCHEMA
+        state[_MISTRAL_SYNC_KEY] = record
+    if state:
+        lib.save_json(_SECRET_SYNC_STATE_PATH, state)
+    else:
+        _SECRET_SYNC_STATE_PATH.unlink(missing_ok=True)
+
+
+def _mistral_record_from_document() -> dict | None:
+    state = _secret_sync_state()
+    if state.get("schema") != _MISTRAL_SYNC_SCHEMA:
+        return None
+    record = state.get(_MISTRAL_SYNC_KEY)
+    if isinstance(record, Mapping):
+        return dict(record)
+    return None
+
+
+def _mistral_prepared_record(
+        *, action: str, operation_id: str, before_revision: str,
+        target_phase: str, target_owner_user_id: str | None,
+        previous: dict | None) -> dict:
+    return {
+        "phase": "prepared",
+        "action": action,
+        "operation_id": operation_id,
+        "before_revision": before_revision,
+        "target_phase": target_phase,
+        "target_owner_user_id": target_owner_user_id,
+        "previous": previous,
+    }
+
+
+def _recover_mistral_sync_record(status: SecretStatus) -> dict | None:
+    """Resolve a v2 write-ahead record against the protected CAS revision.
+
+    The journal is written before a vault mutation.  On restart, an unchanged
+    revision proves the mutation did not commit and restores the prior stable
+    record.  A changed revision plus the expected configured/cleared shape
+    proves the protected mutation crossed its commit boundary, so it remains
+    pending for the recorded owner.  Anything ambiguous is blocked and can
+    neither be leased nor uploaded.
+    """
+
+    raw_state = _secret_sync_state()
+    raw = _mistral_record_from_document()
+    if isinstance(raw, Mapping) and raw.get("phase") == "prepared":
+        before_revision = raw.get("before_revision")
+        action = raw.get("action")
+        operation_id = raw.get("operation_id")
+        target_phase = raw.get("target_phase")
+        target_owner = _mistral_account_id(raw.get("target_owner_user_id"))
+        previous = _valid_mistral_stable_record(raw.get("previous"))
+        valid = (
+            isinstance(before_revision, str) and bool(before_revision)
+            and action in ("replace", "clear")
+            and isinstance(operation_id, str) and bool(operation_id)
+            and target_phase in ("pending", "synced", "unowned")
+            and (target_phase == "unowned") == (target_owner is None)
+        )
+        if valid and status.revision == before_revision:
+            record = previous
+        elif valid and status.configured == (action == "replace"):
+            record = _mistral_stable_record(
+                target_phase,
+                status.revision,
+                owner_user_id=target_owner,
+            )
+        else:
+            record = _mistral_stable_record(
+                "blocked", status.revision, owner_user_id=target_owner)
+        _save_mistral_sync_record(record)
+        return record
+
+    record = _valid_mistral_stable_record(raw)
+    if record is not None:
+        if record["revision"] == status.revision:
+            if record["phase"] != "unowned" or status.configured:
+                return record
+            _save_mistral_sync_record(None)
+            return None
+        # A vault revision changed outside the write-ahead protocol. Do not
+        # guess which account owns the resulting credential.
+        blocked = _mistral_stable_record("blocked", status.revision)
+        _save_mistral_sync_record(blocked)
+        return blocked
+
+    # v1 had only a global pending bit; a configured value therefore has no
+    # trustworthy account owner. Preserve it as protected-but-unowned and
+    # never upload it automatically. Empty legacy state can be discarded.
+    legacy_state = bool(raw_state.get("mistral_pending")
+                        or raw_state.get(_MISTRAL_PENDING))
+    if status.configured:
+        unowned = _mistral_stable_record("unowned", status.revision)
+        _save_mistral_sync_record(unowned)
+        return unowned
+    if legacy_state or raw_state:
+        _save_mistral_sync_record(None)
+    return None
 
 
 def _client_settings():
-    s = dict((lib.load_json(lib.CLIENT_STATE_PATH, {}) or {}).get("settings") or {})
-    for k, v in _load_secrets().items():
-        if v:
-            s[k] = v                     # secrets override; they never persist here
-    return s
+    """Return nonsecret preferences only.
 
-
-def _local_only() -> bool:
-    """Block DNS-rebinding: only requests whose Host is the loopback origin the
-    app itself is served from may touch the secrets store."""
-    host = (request.host or "").split(":")[0].lower()
-    return host in ("127.0.0.1", "localhost")
-
-
-@app.route("/api/secrets", methods=["GET"])
-def api_secrets_get():
-    if not _local_only():
-        return jsonify({"error": "forbidden"}), 403
-    # Mistral belongs to the signed-in user's private cloud data. Refresh its
-    # local cache when the settings dialog opens; offline falls back cleanly.
-    _sync_profile_mistral_key()
-    secrets = _load_secrets()
-    return jsonify({k: secrets.get(k, "") for k in _SECRET_KEYS})
-
-
-@app.route("/api/secrets", methods=["PUT"])
-def api_secrets_put():
-    if not _local_only():
-        return jsonify({"error": "forbidden"}), 403
-    updates = (request.get_json(silent=True) or {}).get("updates") or {}
-    with _secrets_lock:
-        secrets = _load_secrets()
-        for k, v in updates.items():
-            if k not in _SECRET_KEYS:
-                continue
-            v = str(v or "").strip()
-            if v:
-                secrets[k] = v
-            else:
-                secrets.pop(k, None)
-            if k == "mistralKey":
-                secrets[_MISTRAL_PENDING] = True
-        _save_secrets(secrets)
-    if "mistralKey" in updates:
-        _sync_profile_mistral_key()
-    return jsonify({"ok": True})
-
-
-def _sync_profile_mistral_key() -> str | None:
-    """Reconcile the local Mistral cache with this user's profile_secrets row.
-
-    A locally edited value is marked pending until its cloud upsert succeeds;
-    otherwise the cloud value wins so Android edits reach the desktop. Returns
-    the reconciled key, or None when signed out/offline.
+    The filter is defense in depth for an old or malicious renderer.  Normal
+    client-state PUT already strips these fields before publication.
     """
-    cfg = _auth_cfg()
-    ses = _auth_session() if cfg else None
-    if not cfg or not ses:
-        return None
-    secrets = _load_secrets()
-    local = str(secrets.get("mistralKey") or "").strip()
-    pending = bool(secrets.get(_MISTRAL_PENDING))
-    try:
-        adopt = None
-        for _attempt in range(4):
-            rows = sauth.rest(
-                cfg, ses["access_token"], "GET",
-                f"profile_secrets?id=eq.{ses['user_id']}"
-                "&select=api_keys,updated_at",
-            ) or []
-            keys = dict(rows[0].get("api_keys") or {}) if rows else {}
-            if not pending and "mistral" in keys:
-                local = adopt = str(keys.get("mistral") or "").strip()
-                break
+    raw = (lib.load_json(lib.CLIENT_STATE_PATH, {}) or {}).get("settings") or {}
+    if not isinstance(raw, Mapping):
+        return {}
+    return {key: value for key, value in raw.items() if key not in _SECRET_KEYS}
 
-            # Every writer updates the same revision token. If Android wins
-            # between this GET and PATCH, the empty response forces a re-read
-            # and re-merge so its DeepSeek/Mistral edits are not erased.
-            keys["mistral"] = local
-            written_at = datetime.now(timezone.utc).isoformat()
-            if rows:
-                previous = str(rows[0].get("updated_at") or "").strip()
-                revision = ("updated_at=eq." + urllib.parse.quote(previous, safe="")
-                            if previous else "updated_at=is.null")
-                wrote = sauth.rest(
-                    cfg, ses["access_token"], "PATCH",
-                    f"profile_secrets?id=eq.{ses['user_id']}&{revision}",
-                    {"api_keys": keys, "updated_at": written_at},
-                    prefer="return=representation",
-                ) or []
-            else:
-                wrote = sauth.rest(
-                    cfg, ses["access_token"], "POST",
-                    "profile_secrets?on_conflict=id",
-                    [{"id": ses["user_id"], "api_keys": keys,
-                      "updated_at": written_at}],
-                    prefer="resolution=ignore-duplicates,return=representation",
-                ) or []
-            if wrote:
-                break
-        else:
-            raise sauth.AuthError("profile changed on another device; retrying")
-        # the REST round-trips above took time: apply the outcome to a fresh
-        # read under the lock, not to the pre-network snapshot
+
+def _legacy_secret_snapshot() -> tuple[dict[str, str], bool, dict, dict]:
+    """Collect legacy values under both source locks with old precedence."""
+
+    with _client_state_lock:
         with _secrets_lock:
-            secrets = _load_secrets()
-            fresh_local = str(secrets.get("mistralKey") or "").strip()
-            fresh_pending = bool(secrets.get(_MISTRAL_PENDING))
-            if adopt is None:
-                # Clear only the edit that was actually written. A Settings
-                # save may have produced a newer pending value while the REST
-                # request was in flight.
-                if not fresh_pending or fresh_local == local:
-                    secrets.pop(_MISTRAL_PENDING, None)
-            elif not fresh_pending:
-                if adopt:
-                    secrets["mistralKey"] = adopt
+            state = lib.load_json(lib.CLIENT_STATE_PATH, {})
+            if not isinstance(state, dict):
+                state = {}
+            settings = state.get("settings")
+            settings = settings if isinstance(settings, dict) else {}
+            legacy = _legacy_secret_document()
+            values: dict[str, str] = {}
+            for key in _SECRET_KEYS:
+                # The retired runtime overlaid only a usable secrets.json
+                # value.  A present null/false/blank legacy field must not
+                # suppress a valid client_state credential before both sources
+                # are sanitized.
+                legacy_value = str(legacy.get(key) or "").strip()
+                settings_value = str(settings.get(key) or "").strip()
+                value = legacy_value or settings_value
+                if value:
+                    values[key] = value
+            return values, bool(legacy.get(_MISTRAL_PENDING)), state, legacy
+
+
+def _verify_migrated_secret(
+        repository: WindowsDpapiSecretStoreRepository,
+        legacy_key: str, expected: str) -> None:
+    secret_id = _SECRET_IDS[legacy_key]
+    try:
+        with repository.credential_leases.lease(secret_id) as leased:
+            if leased.reveal() != expected:
+                raise ProtectedSecretCutoverError(
+                    "protected secret verification did not match legacy state")
+    except ProtectedSecretCutoverError:
+        raise
+    except Exception:
+        raise ProtectedSecretCutoverError(
+            "protected secret verification failed") from None
+
+
+def _sanitize_legacy_secret_sources(
+        state: dict, *, repository: WindowsDpapiSecretStoreRepository,
+        had_legacy_mistral_state: bool) -> None:
+    """Remove plaintext only after every protected value was reopened."""
+
+    # A legacy key/pending bit had no account ownership. Protect the value, but
+    # never reinterpret that global marker as permission to upload it to the
+    # next account that happens to sign in.
+    if had_legacy_mistral_state:
+        status = SecretStoreService(repository).get_status(
+            _SECRET_IDS["mistralKey"])
+        with _secrets_lock:
+            existing = _valid_mistral_stable_record(
+                _mistral_record_from_document())
+            if existing is None and status.configured:
+                _save_mistral_sync_record(
+                    _mistral_stable_record("unowned", status.revision))
+            elif existing is None:
+                _save_mistral_sync_record(None)
+    with _client_state_lock:
+        fresh = lib.load_json(lib.CLIENT_STATE_PATH, {})
+        if not isinstance(fresh, dict):
+            fresh = state
+        settings = fresh.get("settings")
+        removed = False
+        if isinstance(settings, dict):
+            for key in _SECRET_KEYS:
+                # Presence, not truthiness, decides whether the sanitized
+                # document must be persisted.  JSON null and blank legacy
+                # fields are still plaintext-secret schema and must disappear
+                # physically from disk.
+                if key in settings:
+                    del settings[key]
+                    removed = True
+        if removed:
+            lib.save_json(lib.CLIENT_STATE_PATH, fresh)
+    with _secrets_lock:
+        fresh_legacy = _legacy_secret_document()
+        for key in (*_SECRET_KEYS, _MISTRAL_PENDING):
+            fresh_legacy.pop(key, None)
+        if fresh_legacy:
+            # Preserve unknown nonsecret compatibility metadata, but never a
+            # registered credential.  Normal installations remove the file.
+            lib.save_json(_SECRETS_PATH, fresh_legacy)
+        else:
+            _SECRETS_PATH.unlink(missing_ok=True)
+
+
+def _migrate_legacy_plaintext_secrets(
+        repository: WindowsDpapiSecretStoreRepository,
+        *, reopen_repository=None,
+) -> WindowsDpapiSecretStoreRepository:
+    values, pending, state, legacy = _legacy_secret_snapshot()
+    settings = state.get("settings")
+    settings = settings if isinstance(settings, Mapping) else {}
+    has_legacy_fields = any(
+        key in legacy or key in settings
+        for key in _SECRET_KEYS
+    ) or _MISTRAL_PENDING in legacy
+    if not has_legacy_fields:
+        return repository
+    if values:
+        health = repository.health.get_health()
+        if health.state != "ready" or not health.writable:
+            raise ProtectedSecretCutoverError(
+                "protected secret storage is unavailable for legacy migration")
+        service = SecretStoreService(repository)
+        for legacy_key, credential in sorted(values.items()):
+            secret_id = _SECRET_IDS[legacy_key]
+            status = service.get_status(secret_id)
+            if status.configured:
+                # This is either a restart after a committed migration or an
+                # independently newer protected value.  Never overwrite it.
+                _verify_migrated_secret(repository, legacy_key, credential)
+                continue
+            service.replace(ReplaceSecretCommand(
+                secret_id=secret_id,
+                expected_revision=status.revision,
+                credential=credential,
+                operation_id=f"legacy-cutover-v1-{legacy_key.lower()}",
+            ))
+
+        # Reconstruct the complete adapter and decrypt each migrated value.
+        # Adapter commit verification covers bytes; this covers reopen/user
+        # scope and exact credential semantics before plaintext is sanitized.
+        try:
+            reopened = (reopen_repository or _new_secret_repository)()
+            reopened_health = reopened.health.get_health()
+        except Exception:
+            raise ProtectedSecretCutoverError(
+                "protected secret storage could not be reopened") from None
+        if reopened_health.state != "ready":
+            raise ProtectedSecretCutoverError(
+                "protected secret storage could not be reopened")
+        for legacy_key, credential in sorted(values.items()):
+            _verify_migrated_secret(reopened, legacy_key, credential)
+        repository = reopened
+
+    _sanitize_legacy_secret_sources(
+        state,
+        repository=repository,
+        had_legacy_mistral_state=(
+            pending
+            or "mistralKey" in legacy
+            or "mistralKey" in settings
+        ),
+    )
+    return repository
+
+
+def _prepare_protected_secret_store() -> None:
+    """Complete the one-time cutover before engine/session publication."""
+
+    global _secret_repository
+    global _secret_cutover_complete
+    if _secret_cutover_complete:
+        return
+    with _secret_cutover_lock:
+        if _secret_cutover_complete:
+            return
+        repository = _secret_repository or _new_secret_repository()
+        repository = _migrate_legacy_plaintext_secrets(repository)
+        _secret_repository = repository
+        _secret_cutover_complete = True
+
+
+def _secret_service() -> SecretStoreService:
+    service = _library_engine().get_service(SECRET_STORE_SERVICE)
+    if not isinstance(service, SecretStoreService):
+        raise EngineRepositoryError(
+            "protected secret storage is unavailable",
+            code="secret_repository_unavailable", retryable=True)
+    return service
+
+
+def _secret_health() -> SecretStoreHealth:
+    repository = _secret_repository
+    if repository is None:
+        return SecretStoreHealth("unavailable", has_vault=None, writable=False)
+    return repository.health.get_health()
+
+
+@contextlib.contextmanager
+def _lease_secret(legacy_key: str):
+    """Lease one registered credential for the duration of provider work."""
+
+    secret_id = _SECRET_IDS[legacy_key]
+    repository = _secret_repository
+    if repository is None:
+        raise RuntimeError("protected credential storage is unavailable")
+    try:
+        if legacy_key == "mistralKey":
+            # Mistral is account data, not a machine-global provider key. Take
+            # one credential snapshot only while ownership, active session,
+            # metadata revision, and protected revision all agree. Do not hold
+            # the metadata lock across the provider's network operation.
+            with _secrets_lock:
+                status = _secret_service().get_status(secret_id)
+                record = _recover_mistral_sync_record(status)
+                account_id = _active_mistral_account_id()
+                owned_access = bool(
+                    account_id is not None
+                    and record
+                    and record.get("phase") in _MISTRAL_OWNED_PHASES
+                    and record.get("owner_user_id") == account_id
+                )
+                local_unowned_access = bool(
+                    account_id is None
+                    and record
+                    and record.get("phase") == "unowned"
+                )
+                if (
+                    not (owned_access or local_unowned_access)
+                    or record.get("revision") != status.revision
+                ):
+                    raise RuntimeError(
+                        "the required provider credential is not configured")
+                with repository.credential_leases.lease(secret_id) as leased:
+                    if leased.revision != status.revision:
+                        raise RuntimeError(
+                            "protected credential storage is unavailable")
+                    credential = leased.reveal()
+            try:
+                yield credential
+            finally:
+                credential = ""
+            return
+        with repository.credential_leases.lease(secret_id) as leased:
+            yield leased.reveal()
+    except SecretCredentialNotConfiguredError:
+        raise RuntimeError("the required provider credential is not configured") from None
+    except RuntimeError:
+        raise
+    except Exception:
+        raise RuntimeError("protected credential storage is unavailable") from None
+
+
+def _secret_is_configured(legacy_key: str) -> bool:
+    try:
+        status = _secret_service().get_status(_SECRET_IDS[legacy_key])
+        if legacy_key != "mistralKey" or not status.configured:
+            return status.configured
+        with _secrets_lock:
+            record = _recover_mistral_sync_record(status)
+            account_id = _active_mistral_account_id()
+            return bool(
+                record
+                and record.get("revision") == status.revision
+                and (
+                    record.get("phase") in _MISTRAL_OWNED_PHASES
+                    and record.get("owner_user_id") == account_id
+                    and account_id is not None
+                    or record.get("phase") == "unowned"
+                    and account_id is None
+                )
+            )
+    except EngineError:
+        return False
+
+
+def _public_secret_status(status: SecretStatus) -> SecretStatus:
+    """Hide another account's Mistral presence from the active renderer."""
+
+    if status.secret_id != _SECRET_IDS["mistralKey"] or not status.configured:
+        return status
+    with _secrets_lock:
+        record = _recover_mistral_sync_record(status)
+        account_id = _active_mistral_account_id()
+        if (
+            record
+            and record.get("revision") == status.revision
+            and (
+                record.get("phase") in _MISTRAL_OWNED_PHASES
+                and record.get("owner_user_id") == account_id
+                and account_id is not None
+                or record.get("phase") == "unowned"
+                and account_id is None
+            )
+        ):
+            return status
+    return SecretStatus(status.secret_id, False, status.revision)
+
+
+def _secret_health_document() -> dict:
+    health = _secret_health()
+    return {
+        "available": health.state == "ready",
+        "state": health.state,
+        "writable": health.writable,
+    }
+
+
+def _secret_match(secret_id: str) -> str:
+    raw = request.headers.get("If-Match")
+    if raw is None or raw == "":
+        raise EnginePreconditionRequiredError(
+            "a secret status revision is required",
+            code="secret_revision_required",
+            details={"header": "If-Match", "secret_id": secret_id})
+    value = raw.strip()
+    if (raw != value or value.startswith("W/") or len(value) < 3
+            or value[0] != '"' or value[-1] != '"' or "," in value):
+        raise EngineValidationError(
+            "If-Match must contain one strong quoted secret revision",
+            code="invalid_secret_revision",
+            details={"header": "If-Match", "secret_id": secret_id})
+    return value[1:-1]
+
+
+def _secret_operation_id() -> str:
+    operation_id = request.headers.get("Idempotency-Key")
+    if operation_id is None or operation_id == "":
+        raise EnginePreconditionRequiredError(
+            "an idempotency key is required",
+            code="operation_id_required",
+            details={"header": "Idempotency-Key"})
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", operation_id):
+        raise EngineValidationError(
+            "the idempotency key is invalid",
+            code="invalid_operation_id",
+            details={"header": "Idempotency-Key"})
+    return operation_id
+
+
+def _legacy_renderer_secret_import() -> bool:
+    source = request.headers.get(_LEGACY_RENDERER_SECRET_HEADER)
+    if source is None:
+        return False
+    if source != _LEGACY_RENDERER_SECRET_SOURCE:
+        raise EngineValidationError(
+            "the secret mutation source is invalid",
+            code="invalid_secret_mutation_source",
+            details={"header": _LEGACY_RENDERER_SECRET_HEADER})
+    return True
+
+
+_SECRET_MUTATION_MAX_BYTES = 512 * 1024
+
+
+def _secret_replacement_credential() -> str:
+    """Read one bounded, duplicate-free credential replacement document."""
+
+    length = request.content_length
+    if length is not None and length > _SECRET_MUTATION_MAX_BYTES:
+        raise EngineValidationError(
+            "the secret replacement document is too large",
+            code="secret_mutation_too_large",
+            details={"maximum_bytes": _SECRET_MUTATION_MAX_BYTES},
+        )
+    if request.mimetype != "application/json":
+        raise EngineValidationError(
+            "the secret replacement must use application/json",
+            code="invalid_secret_mutation_document",
+        )
+    encoded = request.stream.read(_SECRET_MUTATION_MAX_BYTES + 1)
+    if len(encoded) > _SECRET_MUTATION_MAX_BYTES:
+        raise EngineValidationError(
+            "the secret replacement document is too large",
+            code="secret_mutation_too_large",
+            details={"maximum_bytes": _SECRET_MUTATION_MAX_BYTES},
+        )
+
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON object key")
+            value[key] = item
+        return value
+
+    try:
+        payload = json.loads(
+            encoded.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                ValueError("non-finite JSON number")),
+        )
+    except (RecursionError, UnicodeError, TypeError, ValueError) as exc:
+        raise EngineValidationError(
+            "the secret replacement document is invalid",
+            code="invalid_secret_mutation_document",
+            details={"cause_type": type(exc).__name__},
+        ) from exc
+    if not isinstance(payload, Mapping) or set(payload) != {"credential"}:
+        raise EngineValidationError(
+            "the secret replacement document is invalid",
+            code="invalid_secret_mutation_document",
+        )
+    return payload["credential"]
+
+
+@app.route("/api/secrets", methods=["GET", "PUT", "POST", "PATCH", "DELETE"])
+def api_secrets_retired():
+    return jsonify({
+        "ok": False,
+        "code": "plaintext_secret_api_retired",
+        "replacement": "/api/v1/secrets",
+    }), 410
+
+
+@app.get("/api/v1/secrets")
+def api_v1_secret_statuses():
+    health = _secret_health_document()
+    statuses = []
+    if health["available"]:
+        try:
+            statuses = [
+                _public_secret_status(
+                    _secret_service().get_status(secret_id)).as_dict()
+                for secret_id in sorted(_SECRET_REGISTRY.ids)
+            ]
+        except EngineError as exc:
+            return _engine_error_response(exc)
+    return jsonify({
+        "ok": True,
+        "schema": "librarytool.secret-status-list/1",
+        "health": health,
+        "secrets": statuses,
+    })
+
+
+@app.get("/api/v1/secrets/<path:secret_id>")
+def api_v1_secret_status(secret_id: str):
+    if not _secret_health_document()["available"]:
+        return _engine_error_response(EngineRepositoryError(
+            "protected secret storage is unavailable",
+            code="secret_repository_unavailable", retryable=True))
+    try:
+        status = _public_secret_status(
+            _secret_service().get_status(secret_id))
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    response = jsonify({
+        "ok": True,
+        "schema": "librarytool.secret-status/1",
+        "status": status.as_dict(),
+    })
+    response.set_etag(status.revision)
+    return response
+
+
+def _mistral_mutation_authorized(
+        record: dict | None, status: SecretStatus, *, action: str,
+        owner_user_id: str | None, legacy_renderer_import: bool) -> tuple[str, str | None]:
+    """Authorize one local mutation and return its durable target ownership."""
+
+    if legacy_renderer_import:
+        if action != "replace":
+            raise EngineValidationError(
+                "legacy credential import requires replacement",
+                code="invalid_secret_mutation_source")
+        if record and record.get("phase") != "unowned":
+            raise EngineConflictError(
+                "an account-owned protected credential already exists",
+                code="mistral_credential_owned")
+        return "unowned", None
+
+    phase = record.get("phase") if record else None
+    prior_owner = record.get("owner_user_id") if record else None
+    if owner_user_id is None:
+        if phase == "pending" or phase == "synced" and status.configured:
+            raise EngineConflictError(
+                "the protected Mistral credential belongs to a signed-out account",
+                code="mistral_credential_owned")
+        if phase == "blocked":
+            raise EngineConflictError(
+                "protected Mistral ownership is unresolved",
+                code="mistral_credential_owned")
+        # Signed-out Library Tool remains fully useful: a user may configure a
+        # device-local Mistral key. It is explicitly unowned, can be leased only
+        # while no account is active, and is never profile-synchronized.
+        return "unowned", None
+    if phase == "pending" and prior_owner != owner_user_id:
+        raise EngineConflictError(
+            "another account has a pending Mistral credential change",
+            code="mistral_pending_for_another_account")
+    if action == "clear" and phase == "unowned":
+        # The account-scoped status intentionally hides this device-local
+        # legacy value.  Treating its clear as an account mutation would then
+        # upload an empty value and erase an unrelated remote credential.
+        raise EngineConflictError(
+            "the protected Mistral credential is not owned by this account",
+            code="mistral_credential_unowned")
+    if (
+        action == "clear"
+        and phase in _MISTRAL_OWNED_PHASES
+        and prior_owner != owner_user_id
+    ):
+        raise EngineConflictError(
+            "the protected Mistral credential belongs to another account",
+            code="mistral_credential_owned")
+    return "pending", owner_user_id
+
+
+def _commit_mistral_mutation(
+        command: ReplaceSecretCommand | ClearSecretCommand, *, action: str,
+        target_phase: str, target_owner_user_id: str | None):
+    """Commit one vault mutation behind a recoverable write-ahead record.
+
+    Caller-visible CAS/idempotency remain the engine service's responsibility.
+    The sidecar journal adds only account ownership and remote-sync intent.
+    """
+
+    with _secrets_lock:
+        service = _secret_service()
+        before = service.get_status(command.secret_id)
+        previous = _recover_mistral_sync_record(before)
+        prepared = _mistral_prepared_record(
+            action=action,
+            operation_id=command.operation_id,
+            before_revision=before.revision,
+            target_phase=target_phase,
+            target_owner_user_id=target_owner_user_id,
+            previous=previous,
+        )
+        _save_mistral_sync_record(prepared)
+        try:
+            if action == "replace":
+                assert isinstance(command, ReplaceSecretCommand)
+                result = service.replace(command)
+            else:
+                assert isinstance(command, ClearSecretCommand)
+                result = service.clear(command)
+        except Exception:
+            # Settle a definite pre-commit failure immediately. If even status
+            # recovery is unavailable, preserve the prepared journal so the
+            # next process can resolve it without guessing.
+            try:
+                fresh = service.get_status(command.secret_id)
+                _recover_mistral_sync_record(fresh)
+            except Exception:
+                pass
+            raise
+        if result.replayed:
+            # Exact replay proves this call did not mutate the current vault.
+            # Never transfer ownership using a historical receipt, especially
+            # when a different account presents an old operation id.
+            _save_mistral_sync_record(previous)
+            return result
+        _save_mistral_sync_record(_mistral_stable_record(
+            target_phase,
+            result.receipt.after.revision,
+            owner_user_id=target_owner_user_id,
+        ))
+        return result
+
+
+def _mistral_sync_pending_for_active_account() -> bool:
+    with _secrets_lock:
+        status = _secret_service().get_status(_SECRET_IDS["mistralKey"])
+        record = _recover_mistral_sync_record(status)
+        account_id = _active_mistral_account_id()
+        return bool(
+            account_id
+            and record
+            and record.get("phase") == "pending"
+            and record.get("owner_user_id") == account_id
+            and record.get("revision") == status.revision
+        )
+
+
+def _mutate_mistral_from_request(
+        command: ReplaceSecretCommand | ClearSecretCommand, *, action: str,
+        legacy_renderer_import: bool = False):
+    with _secrets_lock:
+        status = _secret_service().get_status(command.secret_id)
+        record = _recover_mistral_sync_record(status)
+        target_phase, target_owner = _mistral_mutation_authorized(
+            record,
+            status,
+            action=action,
+            owner_user_id=_active_mistral_account_id(),
+            legacy_renderer_import=legacy_renderer_import,
+        )
+        return _commit_mistral_mutation(
+            command,
+            action=action,
+            target_phase=target_phase,
+            target_owner_user_id=target_owner,
+        )
+
+
+@app.put("/api/v1/secrets/<path:secret_id>")
+def api_v1_secret_replace(secret_id: str):
+    try:
+        expected = _secret_match(secret_id)
+        operation_id = _secret_operation_id()
+        legacy_renderer_import = _legacy_renderer_secret_import()
+        credential = _secret_replacement_credential()
+        command = ReplaceSecretCommand(
+            secret_id=secret_id,
+            expected_revision=expected,
+            credential=credential,
+            operation_id=operation_id,
+        )
+        if secret_id == _SECRET_IDS["mistralKey"]:
+            result = _mutate_mistral_from_request(
+                command,
+                action="replace",
+                legacy_renderer_import=legacy_renderer_import,
+            )
+        else:
+            if legacy_renderer_import:
+                # The marker changes account semantics only for Mistral. It is
+                # accepted for other legacy renderer credentials so one client
+                # migration path can handle the complete registry.
+                pass
+            result = _secret_service().replace(command)
+    except (TypeError, ValueError) as exc:
+        return _engine_error_response(EngineValidationError(
+            "the secret replacement document is invalid",
+            code="invalid_secret_mutation_document",
+            details={"cause_type": type(exc).__name__}))
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    if (
+        secret_id == _SECRET_IDS["mistralKey"]
+        and not legacy_renderer_import
+        and (not result.replayed or _mistral_sync_pending_for_active_account())
+    ):
+        # Local commit succeeded. Remote failure is deliberately non-fatal: the
+        # protected write-ahead state remains pending and startup/login retries.
+        _sync_profile_mistral_key()
+    return jsonify({
+        "ok": True,
+        "schema": "librarytool.secret-mutation-receipt/1",
+        **result.as_dict(),
+    })
+
+
+@app.delete("/api/v1/secrets/<path:secret_id>")
+def api_v1_secret_clear(secret_id: str):
+    try:
+        if _legacy_renderer_secret_import():
+            raise EngineValidationError(
+                "legacy credential import requires replacement",
+                code="invalid_secret_mutation_source")
+        command = ClearSecretCommand(
+            secret_id=secret_id,
+            expected_revision=_secret_match(secret_id),
+            operation_id=_secret_operation_id(),
+        )
+        if secret_id == _SECRET_IDS["mistralKey"]:
+            result = _mutate_mistral_from_request(command, action="clear")
+        else:
+            result = _secret_service().clear(command)
+    except EngineError as exc:
+        return _engine_error_response(exc)
+    if (
+        secret_id == _SECRET_IDS["mistralKey"]
+        and (not result.replayed or _mistral_sync_pending_for_active_account())
+    ):
+        _sync_profile_mistral_key()
+    return jsonify({
+        "ok": True,
+        "schema": "librarytool.secret-mutation-receipt/1",
+        **result.as_dict(),
+    })
+
+
+def _profile_secret_rows(value) -> list:
+    if not isinstance(value, list) or any(
+            not isinstance(row, Mapping) for row in value):
+        raise sauth.AuthError("profile secret response was invalid")
+    return value
+
+
+def _profile_secret_keys(rows: list) -> dict:
+    if not rows:
+        return {}
+    raw = rows[0].get("api_keys")
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise sauth.AuthError("profile secret response was invalid")
+    return dict(raw)
+
+
+def _mistral_credential_snapshot(
+        status: SecretStatus, record: dict, owner_user_id: str) -> str:
+    repository = _secret_repository
+    if repository is None:
+        raise RuntimeError("protected credential storage is unavailable")
+    if (
+        record.get("owner_user_id") != owner_user_id
+        or record.get("phase") not in _MISTRAL_OWNED_PHASES
+        or record.get("revision") != status.revision
+    ):
+        raise RuntimeError("the required provider credential is not configured")
+    if not status.configured:
+        return ""
+    with repository.credential_leases.lease(status.secret_id) as leased:
+        if leased.revision != status.revision:
+            raise RuntimeError("protected credential storage is unavailable")
+        return leased.reveal()
+
+
+def _write_profile_mistral(
+        cfg: dict, ses: dict, local: str) -> None:
+    """CAS-merge one pending local value without erasing other providers."""
+
+    owner_user_id = _mistral_account_id(ses.get("user_id"))
+    if owner_user_id is None:
+        raise sauth.AuthError("profile account identity was invalid")
+    encoded_owner = urllib.parse.quote(owner_user_id, safe="")
+    for _attempt in range(4):
+        rows = _profile_secret_rows(sauth.rest(
+            cfg, ses["access_token"], "GET",
+            f"profile_secrets?id=eq.{encoded_owner}"
+            "&select=api_keys,updated_at",
+        ) or [])
+        keys = _profile_secret_keys(rows)
+        keys["mistral"] = local
+        written_at = datetime.now(timezone.utc).isoformat()
+        if rows:
+            previous = str(rows[0].get("updated_at") or "").strip()
+            revision = ("updated_at=eq." + urllib.parse.quote(previous, safe="")
+                        if previous else "updated_at=is.null")
+            wrote = sauth.rest(
+                cfg, ses["access_token"], "PATCH",
+                f"profile_secrets?id=eq.{encoded_owner}&{revision}",
+                {"api_keys": keys, "updated_at": written_at},
+                prefer="return=representation",
+            ) or []
+        else:
+            wrote = sauth.rest(
+                cfg, ses["access_token"], "POST",
+                "profile_secrets?on_conflict=id",
+                [{"id": owner_user_id, "api_keys": keys,
+                  "updated_at": written_at}],
+                prefer="resolution=ignore-duplicates,return=representation",
+            ) or []
+        if wrote:
+            return
+    raise sauth.AuthError("profile changed on another device; retrying")
+
+
+def _adopt_profile_mistral_locked(
+        *, owner_user_id: str, remote: str, status: SecretStatus,
+        local: str | None) -> None:
+    """Apply a cloud snapshot after the caller revalidated local ownership."""
+
+    secret_id = _SECRET_IDS["mistralKey"]
+    if local is not None and remote == local:
+        _save_mistral_sync_record(_mistral_stable_record(
+            "synced", status.revision, owner_user_id=owner_user_id))
+        return
+    operation_id = "mistral-profile-adopt-" + uuid.uuid4().hex
+    if remote:
+        command = ReplaceSecretCommand(
+            secret_id=secret_id,
+            expected_revision=status.revision,
+            credential=remote,
+            operation_id=operation_id,
+        )
+        _commit_mistral_mutation(
+            command,
+            action="replace",
+            target_phase="synced",
+            target_owner_user_id=owner_user_id,
+        )
+    elif status.configured:
+        command = ClearSecretCommand(
+            secret_id=secret_id,
+            expected_revision=status.revision,
+            operation_id=operation_id,
+        )
+        _commit_mistral_mutation(
+            command,
+            action="clear",
+            target_phase="synced",
+            target_owner_user_id=owner_user_id,
+        )
+    else:
+        _save_mistral_sync_record(_mistral_stable_record(
+            "synced", status.revision, owner_user_id=owner_user_id))
+
+
+def _sync_profile_mistral_key_with_cfg(cfg: dict, ses: dict) -> str | None:
+    """Reconcile only the active account's owned protected Mistral value."""
+
+    secret_id = _SECRET_IDS["mistralKey"]
+    owner_user_id = _mistral_account_id(ses.get("user_id"))
+    if owner_user_id is None or not ses.get("access_token"):
+        return None
+    try:
+        # Serialize full remote reconciliations. A second login waits for an
+        # older account's in-flight upload, then re-evaluates current session
+        # and ownership instead of racing it.
+        with _mistral_sync_lock:
+            if _active_mistral_account_id() != owner_user_id:
+                return None
+            with _secrets_lock:
+                before = _secret_service().get_status(secret_id)
+                record = _recover_mistral_sync_record(before)
+                phase = record.get("phase") if record else None
+                record_owner = record.get("owner_user_id") if record else None
+                if phase in ("unowned", "blocked"):
+                    # An ownerless legacy cache must be explicitly re-entered;
+                    # never upload it to whichever user logs in next.
+                    return None
+                if phase == "pending" and record_owner != owner_user_id:
+                    return None
+                pending = phase == "pending"
+                if record_owner == owner_user_id:
+                    local = _mistral_credential_snapshot(
+                        before, record, owner_user_id)
                 else:
-                    secrets.pop("mistralKey", None)
-            _save_secrets(secrets)
-        return local
-    except sauth.AuthError as exc:
+                    # Switching from a fully synced prior owner is safe, but
+                    # their credential must never leave the protected store.
+                    local = None
+                snapshot_record = dict(record) if record else None
+
+            if pending:
+                assert local is not None
+                _write_profile_mistral(cfg, ses, local)
+                with _secrets_lock:
+                    fresh = _secret_service().get_status(secret_id)
+                    fresh_record = _recover_mistral_sync_record(fresh)
+                    if (
+                        fresh.revision == before.revision
+                        and fresh_record == snapshot_record
+                    ):
+                        _save_mistral_sync_record(_mistral_stable_record(
+                            "synced", fresh.revision,
+                            owner_user_id=owner_user_id))
+                return local
+
+            rows = _profile_secret_rows(sauth.rest(
+                cfg, ses["access_token"], "GET",
+                "profile_secrets?id=eq."
+                f"{urllib.parse.quote(owner_user_id, safe='')}"
+                "&select=api_keys,updated_at",
+            ) or [])
+            keys = _profile_secret_keys(rows)
+            raw_remote = keys.get("mistral") if "mistral" in keys else ""
+            if not isinstance(raw_remote, str):
+                raise sauth.AuthError("profile secret response was invalid")
+            remote = raw_remote.strip()
+            with _secrets_lock:
+                fresh = _secret_service().get_status(secret_id)
+                fresh_record = _recover_mistral_sync_record(fresh)
+                if (
+                    _active_mistral_account_id() != owner_user_id
+                    or fresh.revision != before.revision
+                    or fresh_record != snapshot_record
+                ):
+                    return None
+                _adopt_profile_mistral_locked(
+                    owner_user_id=owner_user_id,
+                    remote=remote,
+                    status=fresh,
+                    local=local,
+                )
+            return remote
+    except (EngineError, OSError, RuntimeError, sauth.AuthError) as exc:
         log.warning("Mistral profile sync deferred: %s", exc)
         return None
 
 
+def _sync_profile_mistral_key() -> str | None:
+    """Reconcile Mistral without retaining either protected provider key."""
+
+    ses = _auth_session() if _auth_cfg() else None
+    if not ses:
+        return None
+    try:
+        with _auth_execution_cfg() as cfg:
+            if not cfg:
+                return None
+            return _sync_profile_mistral_key_with_cfg(cfg, ses)
+    except RuntimeError:
+        log.warning("Mistral profile sync deferred: protected auth unavailable")
+        return None
+
+
 def _migrate_secrets_from_client_state() -> None:
-    """One-time lift of secret keys out of the synced client_state settings into
-    the local-only secrets store, so they stop riding in a rebinding-reachable,
-    cloud-synced blob. Idempotent."""
-    with _client_state_lock:
-        state = lib.load_json(lib.CLIENT_STATE_PATH, {})
-        s = state.get("settings")
-        if not isinstance(s, dict):
-            return
-        moved, removed = {}, False
-        for k in list(s):
-            if k in _SECRET_KEYS:
-                v = s.pop(k)
-                removed = True
-                if v:
-                    moved[k] = v
-        if moved:
-            with _secrets_lock:
-                secrets = _load_secrets()
-                for k, v in moved.items():
-                    secrets.setdefault(k, v)   # never clobber a secrets.json value
-                _save_secrets(secrets)
-        if removed:
-            lib.save_json(lib.CLIENT_STATE_PATH, state)
+    """Compatibility entry point for explicit migration tests/embedders."""
+    global _secret_repository
+    with _secret_cutover_lock:
+        repository = _secret_repository or _new_secret_repository()
+        _secret_repository = _migrate_legacy_plaintext_secrets(repository)
 
 
 def _cloud_base():
@@ -11291,36 +14135,8 @@ def api_db_download():
 
 @app.route("/api/webview")
 def api_webview():
-    """Proxy a remote URL for the in-app web view: fetch it and re-serve it from
-    this origin WITHOUT the X-Frame-Options / frame-ancestors headers that would
-    block embedding. HTML gets a <base> so its relative assets resolve to the
-    original site; PDFs stream through. The client frames this in a SANDBOXED
-    iframe (no allow-same-origin) so the proxied page's scripts run isolated and
-    cannot reach the app. (Local/loopback only — never expose publicly: it is an
-    open fetch proxy.)"""
-    url = (request.args.get("url") or "").strip()
-    if not url.lower().startswith(("http://", "https://")):
-        abort(400)
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": whl_client.USER_AGENT})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            ctype = (resp.headers.get("Content-Type") or "").lower()
-            body = resp.read(25 * 1024 * 1024)   # cap: don't proxy huge pages
-            charset = resp.headers.get_content_charset() or "utf-8"
-    except Exception:
-        abort(502)
-    if "pdf" in ctype or url.lower().split("?")[0].endswith(".pdf"):
-        return Response(body, content_type="application/pdf")
-    if "html" in ctype or not ctype:
-        html = body.decode(charset, "replace")
-        base = '<base href="' + url.replace('"', "%22") + '">'
-        if re.search(r"<head[^>]*>", html, re.I):
-            html = re.sub(r"(<head[^>]*>)", lambda m: m.group(1) + base, html,
-                          count=1, flags=re.I)
-        else:
-            html = base + html
-        return Response(html, content_type="text/html; charset=utf-8")
-    return Response(body, content_type=ctype or "application/octet-stream")
+    """Refuse the retired same-origin remote-content proxy in every run mode."""
+    return jsonify({"ok": False, "error": "embedded_remote_content_disabled"}), 410
 
 
 @app.route("/api/ia/meta")
@@ -11750,32 +14566,75 @@ _cloudsync = {"running": False, "last_run": "", "last_error": "", "last_result":
 _autosync_last = 0.0
 
 
-def _cloud_cfg() -> dict | None:
-    """Service-role config for privileged owner publishing and maintenance.
-
-    Phone capture intentionally does not use this path; see ``_capture_cfg``.
-    The URL defaults to the shipped project, but this secret never does.
-    """
+def _cloud_public_cfg() -> dict:
+    """Nonsecret owner-cloud settings; never includes the service role key."""
     s = _client_settings()
     url = str(s.get("supabaseUrl") or "").strip() or cloud_defaults.SUPABASE_URL
-    key = str(s.get("supabaseKey") or "").strip()
-    return {"url": url, "key": key} if url and key else None
+    return {"url": url}
 
 
-def _capture_cfg() -> dict | None:
-    """Public project identity plus the signed-in user's current JWT.
+def _cloud_cfg() -> dict | None:
+    """Status-only owner-cloud configuration and provider test seam.
 
-    This is the complete phone-sync credential. Supabase uses ``key`` only to
-    identify the public app component and ``access_token`` to enforce the
-    user's capture/storage RLS policies. A fresh install therefore needs a
-    login, never a pasted Supabase key.
+    Production values never contain ``key``.  Tests may inject a complete
+    short-lived provider config by replacing this function; the lease wrapper
+    still confines that copy to one execution.
     """
-    cfg = _auth_cfg()
-    ses = _auth_session() if cfg else None
+    cfg = _cloud_public_cfg()
+    return cfg if cfg["url"] and _secret_is_configured("supabaseKey") else None
+
+
+def _cloud_configured() -> bool:
+    return bool(_cloud_cfg())
+
+
+@contextlib.contextmanager
+def _lease_cloud_cfg():
+    public = _cloud_cfg()
+    if not public:
+        yield None
+        return
+    if "key" in public:  # explicitly injected complete provider config
+        cfg = dict(public)
+        try:
+            yield cfg
+        finally:
+            cfg.pop("key", None)
+        return
+    with _lease_secret("supabaseKey") as key:
+        cfg = {**public, "key": key}
+        try:
+            yield cfg
+        finally:
+            cfg.pop("key", None)
+
+
+def _capture_configured() -> bool:
+    """Whether phone sync has auth identity and a persisted user session."""
+
+    session = (_auth_doc().get("session") or {}) if _auth_cfg() else {}
+    return bool(session.get("refresh_token"))
+
+
+@contextlib.contextmanager
+def _lease_capture_cfg():
+    """Hold auth-key and user-token copies only for one capture sync run."""
+
+    ses = _auth_session() if _auth_cfg() else None
     token = str((ses or {}).get("access_token") or "").strip()
-    if not cfg or not token:
-        return None
-    return dict(cfg, access_token=token)
+    if not token:
+        yield None
+        return
+    with _auth_execution_cfg() as auth_cfg:
+        if not auth_cfg:
+            yield None
+            return
+        cfg = {**auth_cfg, "access_token": token}
+        try:
+            yield cfg
+        finally:
+            cfg.pop("key", None)
+            cfg.pop("access_token", None)
 
 
 
@@ -11800,7 +14659,6 @@ def _ai_cfg() -> dict:
     s = _client_settings()
     return {"base": str(s.get("aiBase") or "").strip() or _AI_DEFAULT_BASE,
             "model": str(s.get("aiModel") or "").strip() or _AI_DEFAULT_MODEL,
-            "key": str(s.get("aiKey") or "").strip(),
             "instructions": str(s.get("aiInstructions") or "").strip(),
             "smart_scan_instructions":
                 str(s.get("smartScanInstructions") or "").strip(),
@@ -11814,7 +14672,7 @@ def _ai_chat(cfg: dict, messages: list, json_mode: bool = False,
     """One chat-completions call; returns the assistant text. Raises
     RuntimeError with the HTTP body truncated to 300 chars, the same error
     convention every other integration here uses."""
-    if not cfg["key"]:
+    if not _secret_is_configured("aiKey"):
         raise RuntimeError("no AI key — set one in Settings > Credentials "
                            "(DeepSeek is the default provider)")
     # a set temperature/timeout in Settings > AI overrides the per-call defaults
@@ -11834,20 +14692,20 @@ def _ai_chat(cfg: dict, messages: list, json_mode: bool = False,
             "temperature": temperature}
     if json_mode:
         body["response_format"] = {"type": "json_object"}
-    req = urllib.request.Request(
-        cfg["base"].rstrip("/") + "/chat/completions",
-        data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {cfg['key']}"},
-        method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:300]
-        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
-    except OSError as exc:
-        raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
+    with _lease_secret("aiKey") as key:
+        req = urllib.request.Request(
+            cfg["base"].rstrip("/") + "/chat/completions",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {key}"},
+            method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"provider returned HTTP {exc.code}") from None
+        except OSError:
+            raise RuntimeError("the AI provider is unavailable") from None
     try:
         return data["choices"][0]["message"]["content"] or ""
     except (KeyError, IndexError) as exc:
@@ -11887,7 +14745,7 @@ def api_process_deepseek():
     if not isinstance(fields, dict):
         abort(400)
     cfg = _ai_cfg()
-    if not cfg["key"]:
+    if not _secret_is_configured("aiKey"):
         return jsonify({"ok": False, "error": "No AI key — set one in Settings > Credentials"}), 400
     cur = {k: str(v)[:600] for k, v in fields.items()
            if isinstance(k, str) and k in _PROC_FIELD_KEYS
@@ -12130,7 +14988,8 @@ def _ss_selected_pdf(source: Path, pages: list[int]) -> Path:
 
 def _ss_request_spec(payload: dict) -> tuple[dict | None, tuple[dict, int] | None]:
     target = str(payload.get("target") or "").strip()
-    if not _ss_target_kind(target) or ":" not in target:
+    _target_kind, separator, target_id = target.partition(":")
+    if not _ss_target_kind(target) or not separator or not target_id:
         return None, ({"ok": False, "error": "bad target"}, 400)
     raw_pdf = str(payload.get("pdf") or "").strip()
     url = str(payload.get("url") or "").strip()
@@ -12149,12 +15008,27 @@ def _ss_request_spec(payload: dict) -> tuple[dict | None, tuple[dict, int] | Non
 
 
 def _ss_job_new(target: str, label: str, volume: str = "") -> dict:
+    target_kind, _, target_id = str(target or "").partition(":")
+    if target_kind == "build" and not target_id:
+        raise _ItemJobStartRejected("a build Smart Scan needs an item id")
+    build_id = target_id if target_kind == "build" else ""
     job = {"id": lib.gen_id(set(_ss_jobs) | set(_jobs)), "target": target,
            "kind": "smartscan", "done": 0, "total": 0, "errors": 0,
            "status": "running", "error": "", "note": "", "volume": volume}
+    if build_id:
+        job["build_id"] = build_id
+        job["subject"] = {"item_id": build_id}
     with _ss_jobs_lock:
         _ss_jobs[job["id"]] = job
-    _job_track(job, "smartscan", label=label)
+    try:
+        if build_id:
+            _job_track_item_guarded(job, "smartscan", build_id, label=label)
+        else:
+            _job_track(job, "smartscan", label=label)
+    except _ItemJobStartRejected:
+        with _ss_jobs_lock:
+            _ss_jobs.pop(job["id"], None)
+        raise
     return job
 
 
@@ -12182,8 +15056,7 @@ def _ss_run(job: dict, spec: dict) -> None:
     pdf = None
     owned_pdf = False
     try:
-        mkey = str(_client_settings().get("mistralKey") or "").strip()
-        if not mkey:
+        if not _secret_is_configured("mistralKey"):
             raise RuntimeError("Mistral API key not configured (Settings > Credentials)")
         pdf = spec.get("pdf_path")
         if pdf is None:
@@ -12211,7 +15084,8 @@ def _ss_run(job: dict, spec: dict) -> None:
             if _an_cancel_check(job, "cancelled — nothing was written"):
                 return
             try:
-                text = _sc_ocr_page(pdf, n, mkey)
+                with _lease_secret("mistralKey") as mkey:
+                    text = _sc_ocr_page(pdf, n, mkey)
             except Exception as exc:
                 text = ""
                 with _ss_jobs_lock:
@@ -12361,8 +15235,12 @@ def api_process_smartscan_run():
                 if (j.get("kind") == "smartscan" and j.get("target") == target
                         and j.get("state") in _JOB_ACTIVE):
                     return jsonify({"ok": True, "already": True, "job": _job_public(j)})
-        job = _ss_job_start(target, label, spec["volume"],
-                            lambda jb: _ss_run(jb, spec))
+        try:
+            job = _ss_job_start(target, label, spec["volume"],
+                                lambda jb: _ss_run(jb, spec))
+        except _ItemJobStartRejected:
+            return jsonify({"ok": False, "error":
+                            "that entry changed before Smart Scan could start"}), 409
     return jsonify({"ok": True, "job": dict(job)})
 
 
@@ -12545,9 +15423,6 @@ def _lang_code(raw: str) -> str:
     return re.sub(r"[^a-z\-]", "", str(raw or "").lower())[:12]
 
 
-_translation_provenance = TranslationProvenanceService()
-
-
 def _page_sha(text: str) -> str:
     """Legacy SHA-1 used by version-1 translation metadata."""
     return _translation_provenance.legacy_source_hash(text)
@@ -12604,6 +15479,7 @@ def _translations_info(bid: str) -> list[dict]:
 
 
 @app.route("/api/builds/<bid>/about", methods=["GET", "PUT"])
+@_live_item_write_endpoint
 def api_build_about(bid: str):
     if request.method == "GET":
         return jsonify({"ok": True, "text": _read_entry_text(bid, "about.md")})
@@ -12623,6 +15499,7 @@ def api_build_summary(bid: str):
 
 
 @app.route("/api/builds/<bid>/annotations", methods=["GET", "PUT"])
+@_live_item_write_endpoint
 def api_build_annotations(bid: str):
     """GET the note list; PUT curation changes: {update: {id, status?, body?,
     kind?}} or {remove: id}. Wholesale replacement is deliberately absent —
@@ -12713,7 +15590,12 @@ def _an_job_new(bid: str, kind: str, total: int) -> dict:
            "status": "running", "error": "", "note": ""}
     with _an_jobs_lock:
         _an_jobs[job["id"]] = job
-    _job_track(job, kind, label=_job_book_label(bid))
+    try:
+        _job_track_item_guarded(job, kind, bid)
+    except _ItemJobStartRejected as exc:
+        with _an_jobs_lock:
+            _an_jobs.pop(job["id"], None)
+        raise _AnalyzeSourceChanged() from exc
     return job
 
 
@@ -13017,7 +15899,11 @@ def api_analyze_about():
         except Exception as exc:
             _an_finish(job, f"{type(exc).__name__}: {exc}")
 
-    job = _an_job_start(bid, "about", 1, run)
+    try:
+        job = _an_job_start(bid, "about", 1, run)
+    except _AnalyzeSourceChanged:
+        return jsonify({"ok": False, "error":
+                        "the item changed before analysis could start"}), 409
     return jsonify({"ok": True, "job": job["id"]})
 
 
@@ -13494,7 +16380,7 @@ def _sc_extract(ocr_text: str, instructions: str | None = None) -> tuple[dict, s
     DeepSeek (Settings > AI) when a key is set — mirroring the phone app's
     'DeepSeek by default' — else Mistral's own extraction."""
     cfg = _ai_cfg()
-    if cfg["key"]:
+    if _secret_is_configured("aiKey"):
         prompt = _SC_PROMPT
         custom = str(instructions if instructions is not None else
                      cfg.get("smart_scan_instructions") or "").strip()
@@ -13505,11 +16391,12 @@ def _sc_extract(ocr_text: str, instructions: str | None = None) -> tuple[dict, s
                               "content": prompt + "\n\n" + ocr_text[:12000]}],
                        temperature=0.0)
         return capture.normalize_bibliography(obj), cfg["model"]
-    mkey = str(_client_settings().get("mistralKey") or "").strip()
-    if not mkey:
+    if not _secret_is_configured("mistralKey"):
         raise RuntimeError("no AI key and no Mistral key — set one in "
                            "Settings > Credentials")
-    return capture.extract_bibliography(ocr_text, mkey), capture.EXTRACT_MODEL
+    with _lease_secret("mistralKey") as mkey:
+        extracted = capture.extract_bibliography(ocr_text, mkey)
+    return extracted, capture.EXTRACT_MODEL
 
 
 def _sc_map_fields(kind: str, fields: dict) -> dict:
@@ -13541,13 +16428,37 @@ _publish: dict = {"running": False, "build": "", "stage": "idle", "sent": 0,
                   "job": ""}
 
 
-def _r2_cfg() -> dict:
+def _r2_public_cfg() -> dict:
     s = _client_settings()
     return {"account": str(s.get("r2Account") or "").strip(),
             "bucket": str(s.get("r2Bucket") or "").strip(),
-            "key_id": str(s.get("r2KeyId") or "").strip(),
-            "secret": str(s.get("r2Secret") or "").strip(),
             "public_base": str(s.get("r2PublicBase") or "").strip()}
+
+
+def _r2_configured() -> bool:
+    cfg = _r2_public_cfg()
+    return bool(cfg["account"] and cfg["bucket"] and
+                _secret_is_configured("r2KeyId") and
+                _secret_is_configured("r2Secret"))
+
+
+@contextlib.contextmanager
+def _lease_r2_cfg():
+    public = _r2_public_cfg()
+    if not _r2_configured():
+        yield {**public, "key_id": "", "secret": ""}
+        return
+    with contextlib.ExitStack() as stack:
+        cfg = {
+            **public,
+            "key_id": stack.enter_context(_lease_secret("r2KeyId")),
+            "secret": stack.enter_context(_lease_secret("r2Secret")),
+        }
+        try:
+            yield cfg
+        finally:
+            cfg.pop("key_id", None)
+            cfg.pop("secret", None)
 
 
 def _volume_row(b: dict, slug: str, url: str, path: str, size: int, actor: str,
@@ -13752,11 +16663,13 @@ def api_publish_catalog():
     warning = ""
     cloud_rows = []
     cloud_ok = False
-    cfg = _auth_cfg()
-    if cfg:
+    if _auth_cfg():
         try:
-            cloud_rows = [_public_preview_urls(cfg, row)
-                          for row in _public_volume_rows(cfg)]
+            with _auth_execution_cfg() as cfg:
+                if not cfg:
+                    raise RuntimeError("protected auth configuration unavailable")
+                cloud_rows = [_public_preview_urls(cfg, row)
+                              for row in _public_volume_rows(cfg)]
             cloud_ok = True
             if cloud_rows and any("group_id" not in row or "volume" not in row
                                   for row in cloud_rows):
@@ -13796,17 +16709,19 @@ def api_publish_preview(slug: str):
                   and str(b.get("published_slug") or "") == slug), None)
     about, notes, warning, source = "", [], "", "local"
     cloud_ok = False
-    cfg = _auth_cfg()
-    if cfg and slug:
+    if _auth_cfg() and slug:
         q = urllib.parse.quote(slug, safe="")
         try:
-            texts = sbase._rest(
-                cfg, "GET", f"volume_texts?slug=eq.{q}&kind=eq.about"
-                "&select=body,lang&order=lang.asc&limit=1") or []
-            remote_notes = sbase._rest(
-                cfg, "GET", f"volume_notes?slug=eq.{q}"
-                "&select=note_id,page,quote,kind,body"
-                "&order=page.asc,note_id.asc") or []
+            with _auth_execution_cfg() as cfg:
+                if not cfg:
+                    raise RuntimeError("protected auth configuration unavailable")
+                texts = sbase._rest(
+                    cfg, "GET", f"volume_texts?slug=eq.{q}&kind=eq.about"
+                    "&select=body,lang&order=lang.asc&limit=1") or []
+                remote_notes = sbase._rest(
+                    cfg, "GET", f"volume_notes?slug=eq.{q}"
+                    "&select=note_id,page,quote,kind,body"
+                    "&order=page.asc,note_id.asc") or []
             if not isinstance(texts, list) or not isinstance(remote_notes, list):
                 raise RuntimeError("online preview returned an invalid response")
             if texts:
@@ -14005,7 +16920,8 @@ def _publish_slug(cloud: dict, b: dict) -> str:
     return slug
 
 
-def _unpublish_object(cloud: dict, slug: str, path: str, r2_name: str = "") -> None:
+def _unpublish_object(cloud: dict, r2cfg: dict, slug: str, path: str,
+                      r2_name: str = "") -> None:
     """Best-effort removal of an object whose catalogue row never landed.
     r2_name overrides the default "<slug>.pdf" R2 key -- needed for anything
     that isn't the primary PDF (a secondary scan, a thumbnail)."""
@@ -14013,13 +16929,14 @@ def _unpublish_object(cloud: dict, slug: str, path: str, r2_name: str = "") -> N
         if path:
             sbase.delete_objects(cloud, "volumes", [path])
         else:
-            r2.delete(_r2_cfg(), f"volumes/{r2_name or slug + '.pdf'}")
+            r2.delete(r2cfg, f"volumes/{r2_name or slug + '.pdf'}")
         log.warning("rolled back orphaned object for %s", slug)
     except Exception as exc:
         log.error("could not roll back orphaned object for %s: %s", slug, exc)
 
 
-def _publish_run(bid: str, actor: str, job: dict | None = None) -> None:
+def _publish_run_with_configs(bid: str, actor: str, cloud: dict, r2cfg: dict,
+                              job: dict | None = None) -> None:
     def stage(name, cancellable=True, **kw):
         # cancellation is checked at stage boundaries only: past "recording"
         # the volumes row is public, so aborting would not be a clean cancel
@@ -14036,10 +16953,6 @@ def _publish_run(bid: str, actor: str, job: dict | None = None) -> None:
         pdf = _resolve_local(b.get("pdf_file") or "")
         if pdf is None or not pdf.is_file():
             raise RuntimeError("this entry has no local PDF attached")
-        cloud = _cloud_cfg()
-        if not cloud:
-            raise RuntimeError("Supabase is not configured (Settings > Credentials)")
-
         size = pdf.stat().st_size
         slug = _publish_slug(cloud, b)
         name = f"{slug}.pdf"
@@ -14052,7 +16965,6 @@ def _publish_run(bid: str, actor: str, job: dict | None = None) -> None:
                 job["done"], job["total"] = int(sent), int(total)
                 _job_checkpoint(job)
 
-        r2cfg = _r2_cfg()
         if r2.configured(r2cfg):
             # an R2 bucket may also hold installers, so namespace the volumes
             url = r2.put_file(r2cfg, f"volumes/{name}", pdf, "application/pdf",
@@ -14155,11 +17067,11 @@ def _publish_run(bid: str, actor: str, job: dict | None = None) -> None:
                 log.warning("optional volumes metadata is missing on the cloud "
                             "project — apply the pending docs/cloud/migrations")
         except Exception:
-            _unpublish_object(cloud, slug, path)
+            _unpublish_object(cloud, r2cfg, slug, path)
             for name_i, path_i in extras:
-                _unpublish_object(cloud, name_i[:-4], path_i)
+                _unpublish_object(cloud, r2cfg, name_i[:-4], path_i)
             if thumb_url or thumb_path:
-                _unpublish_object(cloud, f"{slug}-thumb", thumb_path,
+                _unpublish_object(cloud, r2cfg, f"{slug}-thumb", thumb_path,
                                   r2_name=f"{slug}-thumb.jpg")
             raise
 
@@ -14214,6 +17126,25 @@ def _publish_run(bid: str, actor: str, job: dict | None = None) -> None:
             _publish["running"] = False
 
 
+def _publish_run(bid: str, actor: str, job: dict | None = None) -> None:
+    """Lease publishing credentials inside the worker, never its job record."""
+    try:
+        with _lease_cloud_cfg() as cloud:
+            if not cloud:
+                raise RuntimeError(
+                    "Supabase is not configured (Settings > Credentials)")
+            with _lease_r2_cfg() as r2cfg:
+                _publish_run_with_configs(bid, actor, cloud, r2cfg, job)
+    except Exception as exc:
+        log.error("publish credential setup failed for build %s", bid,
+                  exc_info=exc)
+        with _publish_lock:
+            _publish.update(stage="error", running=False,
+                            error=f"{type(exc).__name__}: {exc}")
+        if job is not None:
+            _job_transition(job, "error", error=str(exc), note="")
+
+
 @app.route("/api/volumes/publish", methods=["POST"])
 def api_volumes_publish():
     p = request.get_json(silent=True) or {}
@@ -14226,7 +17157,7 @@ def api_volumes_publish():
     if builds[bid].get("rights") not in _BUILD_RIGHTS[1:]:
         return jsonify({"ok": False, "error": "no rights decision — set Rights in "
                         "the Editor before publishing"}), 400
-    if not _cloud_cfg():
+    if not _cloud_configured():
         return jsonify({"ok": False, "error": "Supabase is not configured (Settings > Credentials)"}), 400
     with _publish_lock:
         if _publish["running"]:
@@ -14235,7 +17166,13 @@ def api_volumes_publish():
                         error="", url="", slug="", note="", job="")
     job = {"id": lib.gen_id(set(_jobs)), "build_id": bid, "kind": "publish",
            "status": "running"}
-    _job_track(job, "publish", label=_job_book_label(bid))
+    try:
+        _job_track_item_guarded(job, "publish", bid)
+    except _ItemJobStartRejected:
+        with _publish_lock:
+            _publish["running"] = False
+            _publish["error"] = "the item changed before publishing could start"
+        return jsonify({"ok": False, "error": _publish["error"]}), 409
     with _publish_lock:
         _publish["job"] = job["id"]
     threading.Thread(target=_publish_run, args=(bid, _actor(), job),
@@ -14246,7 +17183,8 @@ def api_volumes_publish():
 @app.route("/api/volumes/publish/status")
 def api_volumes_publish_status():
     with _publish_lock:
-        return jsonify(dict(_publish, store="r2" if r2.configured(_r2_cfg()) else "supabase"))
+        return jsonify(dict(_publish,
+                            store="r2" if _r2_configured() else "supabase"))
 
 
 # --- Knowledge passages: segmentation, curation, and the search index (#140) -----
@@ -14571,6 +17509,7 @@ def api_knowledge_segment():
 
 
 @app.route("/api/builds/<bid>/passages", methods=["GET", "PATCH"])
+@_live_item_write_endpoint
 def api_build_passages(bid: str):
     """GET: the artifact plus its state line. PATCH {exclude, include,
     split, merge}: curation — a manual edit, re-recorded as such so the
@@ -14606,28 +17545,29 @@ def _embed_cfg() -> dict:
     with model '' (docs/search-design.md D7)."""
     s = _client_settings()
     return {"base": str(s.get("embedBase") or "").strip(),
-            "model": str(s.get("embedModel") or "").strip(),
-            "key": str(s.get("embedKey") or "").strip()}
+            "model": str(s.get("embedModel") or "").strip()}
 
 
 def _embed_texts(cfg: dict, texts: list[str]) -> list[list[float]]:
     """One /embeddings call for a batch; returns vectors in input order.
     Same error convention as _ai_chat: RuntimeError with the body truncated."""
-    headers = {"Content-Type": "application/json"}
-    if cfg["key"]:
-        headers["Authorization"] = f"Bearer {cfg['key']}"
-    req = urllib.request.Request(
-        cfg["base"].rstrip("/") + "/embeddings",
-        data=json.dumps({"model": cfg["model"], "input": texts}).encode("utf-8"),
-        headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=120.0) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:300]
-        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
-    except OSError as exc:
-        raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
+    lease = (_lease_secret("embedKey") if _secret_is_configured("embedKey")
+             else contextlib.nullcontext(""))
+    with lease as key:
+        headers = {"Content-Type": "application/json"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        req = urllib.request.Request(
+            cfg["base"].rstrip("/") + "/embeddings",
+            data=json.dumps({"model": cfg["model"], "input": texts}).encode("utf-8"),
+            headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=120.0) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"provider returned HTTP {exc.code}") from None
+        except OSError:
+            raise RuntimeError("the embedding provider is unavailable") from None
     rows = data.get("data")
     if not isinstance(rows, list) or len(rows) != len(texts):
         raise RuntimeError("malformed embeddings response")
@@ -14692,8 +17632,7 @@ def api_knowledge_index_publish():
                "the rights decision “No public text” blocks a "
                "search index (docs/rights.md)")
         return jsonify({"ok": False, "error": msg}), 400
-    cloud = _cloud_cfg()
-    if not cloud:
+    if not _cloud_configured():
         return jsonify({"ok": False, "error":
                         "Supabase is not configured (Settings > Credentials)"}), 400
     doc_name, text, source_revision = _analyze_doc_snapshot(bid, b)
@@ -14706,7 +17645,7 @@ def api_knowledge_index_publish():
     src_input = _manifest_input(bid, f"ocr/{doc_name}")   # hashed at job start
     src_sha = str(src_input.get("sha256") or "")
 
-    def run(job):
+    def run_with_cloud(job, cloud):
         version_id = ""
         try:
             if _an_cancel_check(job, "cancelled — nothing published"):
@@ -14818,6 +17757,12 @@ def api_knowledge_index_publish():
             log.error("index publish failed for %s", bid, exc_info=exc)
             _an_finish(job, f"{type(exc).__name__}: {exc}")
 
+    def run(job):
+        with _lease_cloud_cfg() as cloud:
+            if not cloud:
+                raise RuntimeError("protected cloud credential is unavailable")
+            return run_with_cloud(job, cloud)
+
     try:
         job = _an_job_start_guarded(bid, source_revision, "index-publish",
                                     1, run)
@@ -14842,21 +17787,23 @@ def api_knowledge_index_rollback():
     if not slug:
         return jsonify({"ok": False, "error":
                         "this entry has never published"}), 400
-    cloud = _cloud_cfg()
-    if not cloud:
+    if not _cloud_configured():
         return jsonify({"ok": False, "error":
                         "Supabase is not configured (Settings > Credentials)"}), 400
     q = urllib.parse.quote(slug, safe="")
     try:
-        rows = sbase._rest(
-            cloud, "GET", f"index_versions?slug=eq.{q}"
-            "&select=id,built_at&order=built_at.desc,id.desc&limit=2") or []
-        if not rows:
-            return jsonify({"ok": False, "error":
-                            "no index versions to roll back"}), 400
-        newest = str(rows[0].get("id") or "")
-        sbase.delete_rows(cloud, "index_versions",
-                          "id=eq." + urllib.parse.quote(newest))
+        with _lease_cloud_cfg() as cloud:
+            if not cloud:
+                raise RuntimeError("protected cloud credential is unavailable")
+            rows = sbase._rest(
+                cloud, "GET", f"index_versions?slug=eq.{q}"
+                "&select=id,built_at&order=built_at.desc,id.desc&limit=2") or []
+            if not rows:
+                return jsonify({"ok": False, "error":
+                                "no index versions to roll back"}), 400
+            newest = str(rows[0].get("id") or "")
+            sbase.delete_rows(cloud, "index_versions",
+                              "id=eq." + urllib.parse.quote(newest))
     except sbase.SyncError as exc:
         return jsonify({"ok": False, "error": _index_sync_error(exc)}), 502
     activity("rolled back search index", "book", detail=b.get("title", ""))
@@ -14877,14 +17824,15 @@ def api_knowledge_index_status():
     # Passive status must not nag about cloud config: only publishing needs the
     # owner service key, and the publish action reports that itself. Here we just
     # list any already-published versions, warning only if that lookup fails.
-    cloud = _cloud_cfg()
-    if slug and cloud:
+    if slug and _cloud_configured():
         q = urllib.parse.quote(slug, safe="")
         try:
-            versions = [v for v in (sbase._rest(
-                cloud, "GET", f"index_versions?slug=eq.{q}"
-                "&select=id,channel,config,stats,source_hash,built_at"
-                "&order=built_at.desc,id.desc") or []) if isinstance(v, dict)]
+            with _lease_cloud_cfg() as cloud:
+                versions = [v for v in (sbase._rest(
+                    cloud, "GET", f"index_versions?slug=eq.{q}"
+                    "&select=id,channel,config,stats,source_hash,built_at"
+                    "&order=built_at.desc,id.desc") or [])
+                    if isinstance(v, dict)] if cloud else []
         except sbase.SyncError as exc:
             warning = _index_sync_error(exc)
     return jsonify({"ok": True, "state": _passages_state(bid, b),
@@ -15111,6 +18059,7 @@ def _eval_summary_note(overall: dict) -> str:
 
 
 @app.route("/api/builds/<bid>/eval", methods=["GET", "PUT"])
+@_live_item_write_endpoint
 def api_build_eval(bid: str):
     """GET the evaluation set; PUT curation, one operation at a time (the
     annotations idiom): {add: {text, kind}}, {update: {id, text?, kind?}},
@@ -15222,11 +18171,10 @@ def api_knowledge_eval_run():
                         "no passages yet — generate them first"}), 400
     passages = doc.get("passages") or []
     excluded = doc.get("excluded") or []
-    cloud = _cloud_cfg()
     slug = str(b.get("published_slug") or "").strip()
     psg_input = _manifest_input(bid, "passages.json")   # hashed at job start
 
-    def run(job):
+    def run_with_cloud(job, cloud):
         try:
             local_q: dict = {}
             pub_q: dict = {}
@@ -15280,7 +18228,15 @@ def api_knowledge_eval_run():
             log.error("eval run failed for %s", bid, exc_info=exc)
             _an_finish(job, f"{type(exc).__name__}: {exc}")
 
-    job = _an_job_start(bid, "eval-run", len(queries), run)
+    def run(job):
+        with _lease_cloud_cfg() as cloud:
+            return run_with_cloud(job, cloud)
+
+    try:
+        job = _an_job_start(bid, "eval-run", len(queries), run)
+    except _AnalyzeSourceChanged:
+        return jsonify({"ok": False, "error":
+                        "the item changed before evaluation could start"}), 409
     return jsonify({"ok": True, "job": job["id"]})
 
 
@@ -15335,14 +18291,15 @@ def api_knowledge_ask():
            "floor": _EVAL_UNANSWERABLE_FLOOR, "published": None,
            "warning": ""}
     if p.get("published"):
-        cloud = _cloud_cfg()
         slug = str(b.get("published_slug") or "").strip()
-        if cloud and slug:
+        if _cloud_configured() and slug:
             try:
-                out["published"] = {
-                    "version": _index_version_count(cloud, slug),
-                    "results": _rpc_search_passages(cloud, slug, question,
-                                                    _ASK_K)}
+                with _lease_cloud_cfg() as cloud:
+                    if cloud:
+                        out["published"] = {
+                            "version": _index_version_count(cloud, slug),
+                            "results": _rpc_search_passages(
+                                cloud, slug, question, _ASK_K)}
             except sbase.SyncError as exc:
                 out["warning"] = _index_sync_error(exc)
     return jsonify(out)
@@ -15364,7 +18321,7 @@ def api_knowledge_ask_answer():
     if not question:
         return jsonify({"ok": False, "error": "ask a question first"}), 400
     cfg = _ai_cfg()
-    if not cfg["key"]:
+    if not _secret_is_configured("aiKey"):
         # the _ai_chat no-key message, surfaced before any work happens
         return jsonify({"ok": False, "error":
                         "no AI key — set one in Settings > Credentials "
@@ -15650,7 +18607,17 @@ def _books_mirror_rows() -> list[dict]:
     return rows
 
 
-def _cloud_sync_run() -> dict:
+@contextlib.contextmanager
+def _cloud_sync_item_policy_guard():
+    """Yield the tombstone policy while lifecycle isolation remains held."""
+
+    lifecycle = _item_lifecycle_engine()
+    with lifecycle.deletion_index_guard() as deletion_index:
+        yield deletion_index.allows
+
+
+def _cloud_sync_run_with_configs(owner_cfg: dict | None,
+                                 capture_cfg: dict | None) -> dict:
     """Import this user's pending phone captures, with optional owner work.
 
     Capture ingest runs with the signed-in user's JWT and RLS. If an owner has
@@ -15660,8 +18627,6 @@ def _cloud_sync_run() -> dict:
     Everything after the flag is claimed runs inside try/finally, and ANY
     exception lands in `result` — the flag can never stay stuck on, and a
     failed pass can't masquerade as the previous run's outcome."""
-    owner_cfg = _cloud_cfg()
-    capture_cfg = _capture_cfg() or owner_cfg  # legacy owner-only installs
     if not capture_cfg:
         return {"ok": False,
                 "error": "Sign in to your Library Tool account to sync phone captures"}
@@ -15675,7 +18640,6 @@ def _cloud_sync_run() -> dict:
     log.info("cloud sync started")
     try:
         s = _client_settings()
-        mistral_key = str(s.get("mistralKey") or "").strip()
         delete_remote = s.get("cloudDeleteRemote") is not False
         # A different desktop may have merged an identity since this process
         # last opened the Collections window. Refresh durable merge markers
@@ -15687,7 +18651,13 @@ def _cloud_sync_run() -> dict:
         _refresh_collection_aliases(capture_cfg, collection_token)
         for cap in sbase.list_pending_captures(capture_cfg):
             try:
-                if _import_capture(capture_cfg, cap, mistral_key, delete_remote) == "imported":
+                lease = (_lease_secret("mistralKey")
+                         if _secret_is_configured("mistralKey")
+                         else contextlib.nullcontext(""))
+                with lease as mistral_key:
+                    outcome = _import_capture(
+                        capture_cfg, cap, mistral_key, delete_remote)
+                if outcome == "imported":
                     imported += 1
                 else:
                     skipped += 1
@@ -15703,23 +18673,31 @@ def _cloud_sync_run() -> dict:
                 errors.append(f"books mirror: {exc}")
             # the working stores that left git in 87a9bf2 (two-way, per record;
             # store_sync guards against an emptier side clobbering a fuller one)
-            stores = store_sync.sync_stores(owner_cfg, locks={
-                "builds": _builds_lock, "ia_catalog": _ia_catalog_lock,
-                "corrections": _corrections_lock,
-                "taxonomy": _categories_lock})
+            stores = store_sync.sync_stores(
+                owner_cfg,
+                locks={
+                    "ia_catalog": _ia_catalog_lock,
+                    "corrections": _corrections_lock,
+                    "taxonomy": _categories_lock,
+                },
+                item_policy_guard=_cloud_sync_item_policy_guard,
+            )
             for name, res in stores.items():
                 if res.get("error"):
                     errors.append(f"{name}: {res['error']}")
                 if res.get("guard"):      # a wipe was caught: worth surfacing
                     errors.append(f"{name}: {res['guard']}")
-            r2cfg = _r2_cfg()
-            if r2.configured(r2cfg):
-                try:
-                    entries_res = store_sync.sync_entry_files(r2cfg)
-                except Exception as exc:
-                    errors.append(f"entry files: {exc}")
-            else:
-                entries_res = {"skipped": "R2 not configured"}
+            with _lease_r2_cfg() as r2cfg:
+                if r2.configured(r2cfg):
+                    try:
+                        entries_res = store_sync.sync_entry_files(
+                            r2cfg,
+                            item_policy_guard=_cloud_sync_item_policy_guard,
+                        )
+                    except Exception as exc:
+                        errors.append(f"entry files: {exc}")
+                else:
+                    entries_res = {"skipped": "R2 not configured"}
         else:
             entries_res = {"skipped": "owner sync not configured"}
         result = {"ok": not errors, "imported": imported, "skipped": skipped,
@@ -15756,6 +18734,15 @@ def _cloud_sync_run() -> dict:
     return result
 
 
+def _cloud_sync_run() -> dict:
+    """Acquire owner credentials inside the sync execution, never a job."""
+    with contextlib.ExitStack() as stack:
+        capture_cfg = stack.enter_context(_lease_capture_cfg())
+        owner_cfg = stack.enter_context(_lease_cloud_cfg())
+        return _cloud_sync_run_with_configs(
+            owner_cfg, capture_cfg or owner_cfg)
+
+
 def _cloud_autosync_loop() -> None:
     """Background interval sync; the interval is re-read every tick so a
     settings change applies without a restart (0 = off)."""
@@ -15766,7 +18753,7 @@ def _cloud_autosync_loop() -> None:
         # must never kill this thread — it would silently stop syncing forever
         try:
             minutes = int(_client_settings().get("cloudSyncMinutes") or 0)
-            if minutes <= 0 or not (_capture_cfg() or _cloud_cfg()):
+            if minutes <= 0 or not (_capture_configured() or _cloud_configured()):
                 continue
             if time.time() - _autosync_last >= minutes * 60:
                 _autosync_last = time.time()
@@ -15779,7 +18766,7 @@ def _cloud_autosync_loop() -> None:
 def api_cloudsync_run():
     """Manual sync trigger (the Catalogs-tab button). Runs in the background;
     poll /api/cloudsync/status for the outcome."""
-    if not (_capture_cfg() or _cloud_cfg()):
+    if not (_capture_configured() or _cloud_configured()):
         return jsonify({"ok": False,
                         "error": "Sign in to your Library Tool account to sync phone captures"})
     with _cloudsync_lock:
@@ -15793,17 +18780,26 @@ def api_cloudsync_run():
 def api_cloudsync_status():
     with _cloudsync_lock:
         out = dict(_cloudsync)
-    out["configured"] = bool(_capture_cfg() or _cloud_cfg())
+    out["configured"] = bool(_capture_configured() or _cloud_configured())
     return jsonify(out)
 
 
 @app.route("/api/cloudsync/test")
 def api_cloudsync_test():
-    cfg = _capture_cfg() or _cloud_cfg()
-    if not cfg:
+    if _capture_configured():
+        with _lease_capture_cfg() as capture_cfg:
+            if capture_cfg:
+                return jsonify(sbase.test_connection(capture_cfg))
+            return jsonify({"ok": False,
+                            "error": "protected auth credential is unavailable"})
+    if not _cloud_configured():
         return jsonify({"ok": False,
                         "error": "Sign in to your Library Tool account to test phone sync"})
-    return jsonify(sbase.test_connection(cfg))
+    with _lease_cloud_cfg() as owner_cfg:
+        if not owner_cfg:
+            return jsonify({"ok": False,
+                            "error": "protected cloud credential is unavailable"})
+        return jsonify(sbase.test_connection(owner_cfg))
 
 
 @app.route("/api/capture/image")
@@ -15964,10 +18960,10 @@ def _lan_capture():
     photos = [p for p in (f.read() for f in files) if p]
     if not photos:
         abort(400)
-    mistral_key = str(_client_settings().get("mistralKey") or "").strip()
     try:
         # pass the filenames so _phone_result can key the phone's OCR by name
-        entry_id, _errors = ingest_capture(cap, photos, mistral_key, names)
+        with _lease_secret("mistralKey") as mistral_key:
+            entry_id, _errors = ingest_capture(cap, photos, mistral_key, names)
     except Exception as exc:                       # noqa: BLE001 — report, don't 500-crash
         log.exception("LAN capture ingest failed")
         return jsonify(error=str(exc)[:200]), 500
@@ -16024,11 +19020,14 @@ def _apply_lan_state() -> None:
         t = threading.Thread(target=srv.serve_forever, daemon=True, name="lan-capture")
         t.start()
         _lan_server.update(srv=srv, thread=t, port=port)
-        log.info("LAN capture on 0.0.0.0:%d  token=%s  ips=%s",
-                 port, _lan_token(), ", ".join(_lan_ips()) or "?")
+        log.info("LAN capture on 0.0.0.0:%d  ips=%s",
+                 port, ", ".join(_lan_ips()) or "?")
 
 
 if __name__ == "__main__":
+    # Explicit startup completes protected migration before recovery and every
+    # worker. Imported WSGI/test hosts cross the same barrier on first request.
+    _ensure_engine_session()
     # Make existing user data portable (absolute -> data-root-relative paths).
     _migrate_stored_paths()
     # Warm the offline check indexes (the renewals CSV is ~40 MB) so the first
@@ -16052,8 +19051,10 @@ if __name__ == "__main__":
     # WHL_PORT lets a second instance run on another port (a distinct origin,
     # so its localStorage/client-state can't collide with the main one) — used
     # to test against a throwaway WHL_DATA_ROOT without touching live state.
-    _migrate_secrets_from_client_state()   # lift any secrets off the synced blob
-    _sync_profile_mistral_key()            # user cloud data; cached for offline use
+    # Protected migration completed inside _ensure_engine_session, before any
+    # worker above was allowed to start. Profile reconciliation now operates
+    # directly on that protected store.
+    _sync_profile_mistral_key()
     port = int(os.environ.get("WHL_PORT") or 5001)
     log.info("Library Tool on 127.0.0.1:%d - DATA_ROOT=%s", port, lib.DATA_ROOT)
     app.run(host="127.0.0.1", port=port, debug=False)

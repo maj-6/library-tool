@@ -84,6 +84,7 @@ class _MemoryRepository:
         self.commits = 0
         self.allocations = 0
         self.stages = 0
+        self.events = []
 
     @contextmanager
     def unit_of_work(self, *, operation_id):
@@ -99,18 +100,21 @@ class _MemoryUnit:
         self.pending = None
 
     def receipt(self, operation_id):
+        self.repository.events.append("receipt")
         override = self.repository.receipt_override
         if override is not _DEFAULT:
             return override
         return self.repository.receipts.get(operation_id)
 
     def get(self, item_id):
+        self.repository.events.append("get")
         override = self.repository.get_override
         if override is not _DEFAULT:
             return override
         return self.repository.records.get(item_id)
 
     def allocate_item_id(self):
+        self.repository.events.append("allocate")
         self.repository.allocations += 1
         return self.repository.next_item_id
 
@@ -119,6 +123,7 @@ class _MemoryUnit:
         return f"rev-{self.repository.revision_number}"
 
     def stage_create(self, item_id, draft):
+        self.repository.events.append("stage:create")
         self.repository.stages += 1
         override = self.repository.stage_snapshot
         if override is not _DEFAULT:
@@ -128,6 +133,7 @@ class _MemoryUnit:
         return record
 
     def stage_replace(self, current, draft):
+        self.repository.events.append("stage:update")
         self.repository.stages += 1
         override = self.repository.stage_snapshot
         if override is not _DEFAULT:
@@ -137,6 +143,7 @@ class _MemoryUnit:
         return record
 
     def stage_delete(self, current):
+        self.repository.events.append("stage:delete")
         self.repository.stages += 1
         override = self.repository.stage_deletion
         if override is not _DEFAULT:
@@ -150,6 +157,7 @@ class _MemoryUnit:
         return deletion
 
     def commit(self, receipt):
+        self.repository.events.append("commit")
         if self.repository.fail_commit is not None:
             raise self.repository.fail_commit
         action, value = self.pending
@@ -159,6 +167,29 @@ class _MemoryUnit:
             self.repository.records.pop(value.item_id, None)
         self.repository.receipts[receipt.operation_id] = receipt
         self.repository.commits += 1
+
+
+class _RecordingPolicy:
+    def __init__(self, events=None):
+        self.events = events if events is not None else []
+        self.create_candidates = []
+        self.update_candidates = []
+        self.failure = None
+        self.result = None
+
+    def validate_create(self, candidate):
+        self.events.append("policy:create")
+        self.create_candidates.append(candidate)
+        if self.failure is not None:
+            raise self.failure
+        return self.result
+
+    def validate_update(self, current, patch, candidate):
+        self.events.append("policy:update")
+        self.update_candidates.append((current, patch, candidate))
+        if self.failure is not None:
+            raise self.failure
+        return self.result
 
 
 def test_item_dtos_detach_freeze_sort_and_round_trip_strict_json():
@@ -279,6 +310,80 @@ def test_create_replays_without_allocating_and_rejects_key_reuse():
     assert repository.commits == 1
 
 
+def test_create_policy_runs_after_replay_lookup_and_before_allocation():
+    repository = _MemoryRepository()
+    policy = _RecordingPolicy(repository.events)
+    draft = _draft()
+
+    ItemCommandService(repository, policy=policy).create(
+        CreateItemCommand(draft, "create-policy-order")
+    )
+
+    assert repository.events == [
+        "receipt",
+        "policy:create",
+        "allocate",
+        "get",
+        "stage:create",
+        "commit",
+    ]
+    assert policy.create_candidates == [draft]
+
+
+def test_exact_create_replay_bypasses_policy_validation():
+    repository = _MemoryRepository()
+    policy = _RecordingPolicy(repository.events)
+    service = ItemCommandService(repository, policy=policy)
+    command = CreateItemCommand(_draft(), "create-policy-replay")
+    original = service.create(command)
+    policy.failure = ValidationError("policy now rejects", code="policy_reject")
+    repository.events.clear()
+
+    replay = service.create(command)
+
+    assert replay.replayed is True
+    assert replay.receipt == original.receipt
+    assert repository.events == ["receipt"]
+    assert len(policy.create_candidates) == 1
+
+
+def test_policy_rejection_does_not_allocate_stage_commit_or_change_records():
+    rejection = ValidationError("profile rejected item", code="profile_reject")
+    create_repository = _MemoryRepository()
+    create_policy = _RecordingPolicy(create_repository.events)
+    create_policy.failure = rejection
+
+    with pytest.raises(ValidationError) as create_error:
+        ItemCommandService(create_repository, policy=create_policy).create(
+            CreateItemCommand(_draft(), "create-policy-reject")
+        )
+
+    assert create_error.value is rejection
+    assert create_repository.records == {}
+    assert create_repository.allocations == 0
+    assert create_repository.stages == create_repository.commits == 0
+
+    current = _snapshot()
+    update_repository = _MemoryRepository((current,))
+    update_policy = _RecordingPolicy(update_repository.events)
+    update_policy.failure = ValidationError(
+        "profile rejected update",
+        code="profile_reject",
+    )
+    with pytest.raises(ValidationError):
+        ItemCommandService(update_repository, policy=update_policy).update(
+            UpdateItemCommand(
+                current.item_id,
+                current.revision,
+                ItemPatch(title="Changed"),
+                "update-policy-reject",
+            )
+        )
+
+    assert update_repository.records == {current.item_id: current}
+    assert update_repository.stages == update_repository.commits == 0
+
+
 def test_update_applies_explicit_patch_and_replays_after_revision_changes():
     current = _snapshot(
         draft=ItemDraft(
@@ -311,6 +416,62 @@ def test_update_applies_explicit_patch_and_replays_after_revision_changes():
     assert result.receipt.after_revision != "rev-1"
     assert service.update(command).replayed is True
     assert repository.commits == 1
+
+
+def test_update_policy_receives_fully_applied_candidate_before_staging():
+    current = _snapshot(
+        draft=ItemDraft(
+            title="Old",
+            metadata={"keep": 1, "remove": 2},
+            representations=(_representation(),),
+        )
+    )
+    repository = _MemoryRepository((current,))
+    policy = _RecordingPolicy(repository.events)
+    patch = ItemPatch(
+        title="New",
+        metadata_set={"added": None},
+        metadata_remove=("remove",),
+    )
+
+    result = ItemCommandService(repository, policy=policy).update(
+        UpdateItemCommand(
+            current.item_id,
+            current.revision,
+            patch,
+            "update-policy-candidate",
+        )
+    )
+
+    assert repository.events == [
+        "receipt",
+        "get",
+        "policy:update",
+        "stage:update",
+        "commit",
+    ]
+    policy_current, policy_patch, candidate = policy.update_candidates[0]
+    assert policy_current == current
+    assert policy_patch == patch
+    assert candidate.title == "New"
+    assert dict(candidate.metadata) == {"keep": 1, "added": None}
+    assert candidate.representations == current.representations
+    assert result.receipt.item.as_draft() == candidate
+
+    policy.failure = ValidationError("policy now rejects", code="policy_reject")
+    repository.events.clear()
+    replay = ItemCommandService(repository, policy=policy).update(
+        UpdateItemCommand(
+            current.item_id,
+            current.revision,
+            patch,
+            "update-policy-candidate",
+        )
+    )
+    assert replay.replayed is True
+    assert replay.receipt == result.receipt
+    assert repository.events == ["receipt"]
+    assert len(policy.update_candidates) == 1
 
 
 def test_update_requires_a_match_and_never_stages_missing_or_stale_items():
@@ -386,6 +547,65 @@ def test_delete_stages_a_server_tombstone_and_replays_without_live_record():
     assert "book-1" not in repository.records
     assert service.delete(command).replayed is True
     assert repository.commits == repository.stages == 1
+
+
+def test_legacy_delete_authority_defaults_to_backward_compatible():
+    repository = _MemoryRepository((_snapshot(),))
+
+    result = ItemCommandService(repository).delete(
+        DeleteItemCommand("book-1", "rev-1", "delete-default")
+    )
+
+    assert result.receipt.action == "delete"
+    assert repository.commits == repository.stages == 1
+
+
+def test_disabled_legacy_delete_refuses_before_repository_or_receipt_replay():
+    repository = _MemoryRepository((_snapshot(),))
+    command = DeleteItemCommand("book-1", "rev-1", "delete-disabled")
+    legacy_result = ItemCommandService(repository).delete(command)
+    units_before = tuple(repository.units)
+
+    def fail_repository_access(**_kwargs):
+        pytest.fail("disabled legacy delete accessed its repository")
+
+    repository.unit_of_work = fail_repository_access
+    with pytest.raises(ConflictError) as caught:
+        ItemCommandService(
+            repository,
+            allow_legacy_delete=False,
+        ).delete(command)
+
+    assert caught.value.code == "item_lifecycle_command_required"
+    assert caught.value.retryable is False
+    assert tuple(repository.units) == units_before
+    assert repository.receipts[command.operation_id] == legacy_result.receipt
+    assert repository.commits == repository.stages == 1
+
+
+def test_disabled_legacy_delete_does_not_disable_create_or_update():
+    repository = _MemoryRepository()
+    service = ItemCommandService(repository, allow_legacy_delete=False)
+
+    created = service.create(CreateItemCommand(_draft(), "create-enabled"))
+    updated = service.update(
+        UpdateItemCommand(
+            created.receipt.item_id,
+            created.receipt.after_revision,
+            ItemPatch(title="Updated"),
+            "update-enabled",
+        )
+    )
+
+    assert created.receipt.action == "create"
+    assert updated.receipt.action == "update"
+    assert updated.receipt.item.title == "Updated"
+    assert repository.commits == repository.stages == 2
+
+
+def test_legacy_delete_authority_requires_an_explicit_boolean():
+    with pytest.raises(TypeError, match="allow_legacy_delete must be a boolean"):
+        ItemCommandService(_MemoryRepository(), allow_legacy_delete=0)
 
 
 def test_delete_requires_revision_and_current_item_before_staging():

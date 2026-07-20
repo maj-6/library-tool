@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from librarytool.engine.secret_ids import LEGACY_SECRET_IDS, LEGACY_SECRET_KEYS
+
 
 APP = (Path(__file__).parents[1] / "tools" / "whl_explorer" / "static" /
        "app.js").read_text(encoding="utf-8")
@@ -46,8 +48,10 @@ def test_verified_toggle_saves_the_whole_editor_form():
     assert "patchBuildRaw(b.id, { status:" not in handler
     body = APP.split("async function setVerified", 1)[1].split(
         "function renderLockNote", 1)[0]
-    assert "await saveBuildFields()" in body
-    assert "patchBuildRaw" not in body
+    assert "await saveBuildFields(null, {" in body
+    assert "forceMetadata: true" in body
+    assert "patchBuildVerificationCompatibility(" in body
+    assert "patchBuildRaw(" not in body
 
 
 def test_locked_phases_offer_the_verify_unlock_inline():
@@ -278,12 +282,15 @@ def test_display_settings_have_one_theme_font_owner_and_no_fake_engine_choice():
 
 
 def test_client_and_server_agree_on_local_only_secret_keys():
-    client = APP.split("const SECRET_KEYS = new Set([", 1)[1].split("]);", 1)[0]
-    server = SERVER.split("_SECRET_KEYS = frozenset({", 1)[1].split("})", 1)[0]
-    assert set(re.findall(r'"([A-Za-z0-9_]+)"', client)) == set(
-        re.findall(r'"([A-Za-z0-9_]+)"', server))
-    assert {"embedKey", "imgGenKey", "ocrAzureKey"} <= set(re.findall(
-        r'"([A-Za-z0-9_]+)"', client))
+    client = APP.split("const SECRET_IDS = Object.freeze({", 1)[1].split(
+        "});", 1)[0]
+    pair_pattern = (
+        r'^\s*"?([A-Za-z0-9_]+)"?\s*:\s*"([^"]+)"\s*,?\s*$'
+    )
+    client_ids = dict(re.findall(pair_pattern, client, re.MULTILINE))
+    assert client_ids == dict(LEGACY_SECRET_IDS)
+    assert set(client_ids) == LEGACY_SECRET_KEYS
+    assert {"embedKey", "imgGenKey", "ocrAzureKey"} <= client_ids.keys()
 
 
 def test_page_deletion_surfaces_reference_remap_warnings():
@@ -481,7 +488,7 @@ def test_remarks_actions_are_accessible_and_failure_safe():
 
     apply = APP.split("async function applyRemarkValue", 1)[1].split(
         "async function saveRemarkEditor", 1)[0]
-    assert "ok = await patchBuildRaw" in apply
+    assert "ok = await updateBuildPortableMetadata" in apply
     assert "ok = await setRowAttention" in apply
     assert "if (ok)" in apply
     assert "The mark was kept" in apply

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
+import re
+import stat
 import sys
 import tempfile
 import threading
@@ -13,13 +16,14 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, ContextManager
 
-from ...engine.errors import RepositoryError
+from ...engine.errors import NotFoundError, RepositoryError
 
 
 LayoutPathCallback = Callable[[str], Path]
 ReadJsonCallback = Callable[[Path], Any]
 WriteJsonCallback = Callable[[Path, Mapping[str, Any]], None]
 LockCallback = Callable[[str], ContextManager[Any]]
+ItemExistsCallback = Callable[[str], bool]
 
 
 class FilesystemReplicaRepository:
@@ -40,12 +44,16 @@ class FilesystemReplicaRepository:
         write_json: WriteJsonCallback | None = None,
         lock_context_for: LockCallback | None = None,
         workspace_context_for: LockCallback | None = None,
+        item_exists_for: ItemExistsCallback | None = None,
     ) -> None:
         self._layout_path_for = layout_path_for
         self._read_json = read_json or self._default_read_json
         self._write_json = write_json or self._default_write_json
         self._external_lock_context_for = lock_context_for
         self._workspace_context_for = workspace_context_for
+        if item_exists_for is not None and not callable(item_exists_for):
+            raise TypeError("item_exists_for must be callable")
+        self._item_exists_for = item_exists_for
         self._locks_guard = threading.Lock()
         self._locks: dict[str, threading.RLock] = {}
 
@@ -84,7 +92,47 @@ class FilesystemReplicaRepository:
         )
         with workspace:
             with legacy:
+                # Preserve the repository's path-safety error for malformed
+                # identities before asking a catalogue whether they exist.
+                self._path(item_id)
+                self._require_live_item(item_id)
                 yield
+
+    def _require_live_item(self, item_id: str) -> None:
+        """Revalidate membership inside the transaction's isolation scope.
+
+        Replica services perform an early source check to return useful
+        validation errors.  That check cannot authorize a later write: item
+        lifecycle deletion may commit before this repository acquires the
+        workspace lease.  Hosts that own a catalogue therefore inject this
+        callback so the final check and every commit share one lease.
+        """
+
+        if self._item_exists_for is None:
+            return
+        try:
+            exists = self._item_exists_for(item_id)
+        except RepositoryError:
+            raise
+        except Exception as exc:
+            raise RepositoryError(
+                "the item repository could not be read",
+                code="replica_item_read_failed",
+                details={"item_id": item_id, "cause_type": type(exc).__name__},
+                retryable=True,
+            ) from exc
+        if not isinstance(exists, bool):
+            raise RepositoryError(
+                "the item repository returned an invalid existence result",
+                code="invalid_replica_item_identity",
+                details={"item_id": item_id},
+            )
+        if not exists:
+            raise NotFoundError(
+                "the item does not exist",
+                code="item_not_found",
+                details={"item_id": item_id},
+            )
 
     def _context(
         self,
@@ -152,6 +200,54 @@ class FilesystemReplicaRepository:
                 },
                 retryable=True,
             ) from exc
+
+    def _validate_staged_figures(
+        self,
+        item_id: str,
+        figures: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        directory = self._path(item_id).parent / "images"
+        for raw_name, raw_info in figures.items():
+            name = str(raw_name or "")
+            info = raw_info if isinstance(raw_info, Mapping) else {}
+            expected = str(info.get("sha256") or "")
+            if (
+                not name
+                or name in (".", "..")
+                or re.fullmatch(r"[\w.\-]+", name) is None
+                or re.fullmatch(r"[0-9a-f]{64}", expected) is None
+            ):
+                raise RepositoryError(
+                    "a staged Replica figure manifest is invalid",
+                    code="invalid_staged_replica_figure",
+                    details={"item_id": item_id, "figure": name},
+                )
+            path = directory / name
+            try:
+                named = path.lstat()
+                if (
+                    path.is_symlink()
+                    or not stat.S_ISREG(named.st_mode)
+                    or named.st_size < 1
+                ):
+                    raise OSError("not a non-empty regular file")
+                digest = hashlib.sha256()
+                with path.open("rb") as stream:
+                    for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(block)
+            except (FileNotFoundError, OSError) as exc:
+                raise RepositoryError(
+                    "a staged Replica figure is unavailable",
+                    code="staged_replica_figure_unavailable",
+                    details={"item_id": item_id, "figure": name},
+                    retryable=True,
+                ) from exc
+            if digest.hexdigest() != expected:
+                raise RepositoryError(
+                    "a staged Replica figure failed its integrity check",
+                    code="staged_replica_figure_mismatch",
+                    details={"item_id": item_id, "figure": name},
+                )
 
     @staticmethod
     def _default_read_json(path: Path) -> Any:
@@ -245,6 +341,17 @@ class FilesystemReplicaUnitOfWork:
             )
         self._repository._save(self._item_id, self._workspace)
         self.commit_count += 1
+
+    def validate_staged_figures(
+        self, figures: Mapping[str, Mapping[str, Any]]
+    ) -> None:
+        if not self._active:
+            raise RepositoryError(
+                "the Replica unit of work is not active",
+                code="inactive_replica_unit_of_work",
+                details={"item_id": self._item_id},
+            )
+        self._repository._validate_staged_figures(self._item_id, figures)
 
     def __exit__(self, exc_type, exc, traceback) -> bool:
         try:

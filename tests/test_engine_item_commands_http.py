@@ -8,7 +8,25 @@ from pathlib import Path
 
 import pytest
 
-from librarytool.adapters.filesystem import RecoverableWriteSet
+from librarytool.engine.errors import RepositoryError, ValidationError
+from librarytool.engine.item_commands import CreateItemCommand, ItemDraft
+
+
+def _bind_engine_session(monkeypatch, server, session) -> None:
+    """Keep transitional server globals on one temporary engine session."""
+
+    aliases = {
+        "_engine_session": session,
+        "_engine_write_set": session.write_set,
+        "_job_manager": session.jobs,
+        "_translation_provenance": session.provenance,
+        "_jobs": session.jobs.records,
+        "_jobs_events": session.jobs.cancel_events,
+        "_jobs_lock": session.jobs.lock,
+        "_library_engine_instance": session.engine,
+    }
+    for name, value in aliases.items():
+        monkeypatch.setattr(server, name, value)
 
 
 def _item(
@@ -87,19 +105,29 @@ def command_catalog(monkeypatch, tmp_path: Path):
             "created_at": "2025-12-01T00:00:00+00:00",
         },
     }
-    server.lib.save_json(builds_path, original)
     monkeypatch.setattr(server, "BUILDS_PATH", builds_path)
     monkeypatch.setattr(server, "ENTRIES_DIR", entries_dir)
-    monkeypatch.setattr(server, "_engine_write_set", RecoverableWriteSet(root))
-    monkeypatch.setattr(server, "_library_engine_instance", None)
-    yield server, builds_path, deepcopy(original)
-    server._library_engine_instance = None
+    server.lib.save_json(builds_path, original)
+
+    current_session = [server._open_engine_session(root)]
+    _bind_engine_session(monkeypatch, server, current_session[0])
+
+    def reopen_session():
+        current_session[0].close()
+        current_session[0] = server._open_engine_session(root)
+        _bind_engine_session(monkeypatch, server, current_session[0])
+        return current_session[0]
+
+    try:
+        yield server, builds_path, deepcopy(original), reopen_session
+    finally:
+        current_session[0].close()
 
 
 def test_create_is_durable_replayable_and_conflict_safe(
     client, command_catalog
 ):
-    server, builds_path, original = command_catalog
+    server, builds_path, original, reopen_session = command_catalog
     document = {"item": _item(metadata={
         "authors": "Ada Curator",
         "rights": "public-domain",
@@ -137,7 +165,7 @@ def test_create_is_durable_replayable_and_conflict_safe(
 
     # Recomposition proves that replay comes from the durable receipt rather
     # than an in-memory request cache.
-    server._library_engine_instance = None
+    reopen_session()
     replay = client.post(
         "/api/v1/items", json=document,
         headers={"Idempotency-Key": "create-http-1"},
@@ -171,10 +199,78 @@ def test_create_is_durable_replayable_and_conflict_safe(
     assert receipt_path.is_file()
 
 
+def test_production_item_service_applies_book_profile_without_http(
+    command_catalog,
+):
+    server, builds_path, _original, _reopen_session = command_catalog
+    before = builds_path.read_bytes()
+    service = server._library_engine().item_commands
+
+    with pytest.raises(ValidationError) as caught:
+        service.create(
+            CreateItemCommand(
+                ItemDraft(metadata={"authors": ["not", "a", "string"]}),
+                "direct-profile-rejection",
+            )
+        )
+
+    assert caught.value.code == "invalid_item_metadata"
+    assert caught.value.details == {
+        "field": "authors",
+        "reason": "string_required",
+    }
+    assert builds_path.read_bytes() == before
+
+
+def test_production_taxonomy_failure_is_sanitized_but_replay_bypasses_it(
+    command_catalog,
+    monkeypatch,
+):
+    server, builds_path, _original, reopen_session = command_catalog
+    monkeypatch.setattr(
+        server.lib,
+        "load_taxonomy",
+        lambda: {"version": 1, "nodes": {"plants": {"name": "Plants"}}},
+    )
+    command = CreateItemCommand(
+        ItemDraft(
+            title="Categorized Herbal",
+            metadata={"category_ids": ["plants"]},
+        ),
+        "direct-taxonomy-replay",
+    )
+    original = server._library_engine().item_commands.create(command)
+    committed = builds_path.read_bytes()
+
+    def unavailable_taxonomy():
+        raise RuntimeError(r"C:\private\taxonomy.json is unavailable")
+
+    monkeypatch.setattr(server.lib, "load_taxonomy", unavailable_taxonomy)
+    service = reopen_session().engine.item_commands
+
+    replay = service.create(command)
+    assert replay.replayed is True
+    assert replay.receipt == original.receipt
+    assert builds_path.read_bytes() == committed
+
+    with pytest.raises(RepositoryError) as caught:
+        service.create(
+            CreateItemCommand(
+                command.draft,
+                "direct-taxonomy-unavailable",
+            )
+        )
+    assert caught.value.code == "category_repository_unavailable"
+    assert caught.value.retryable is True
+    assert caught.value.details == {"cause_type": "RuntimeError"}
+    assert "private" not in str(caught.value.as_dict()).lower()
+    assert builds_path.read_bytes() == committed
+
+
 def test_update_preserves_raw_managed_state_and_supports_cas_replay(
     client, command_catalog
 ):
-    server, builds_path, original = command_catalog
+    server, builds_path, original, reopen_session = command_catalog
     detail = client.get("/api/v1/items/book-one")
     before_revision = detail.get_json()["item"]["record_revision"]
     assert detail.headers["ETag"] != f'"{before_revision}"'
@@ -228,7 +324,7 @@ def test_update_preserves_raw_managed_state_and_supports_cas_replay(
     assert queried.headers["X-Record-Revision"] == receipt["after_revision"]
     committed = builds_path.read_bytes()
 
-    server._library_engine_instance = None
+    reopen_session()
     replay = client.patch(
         "/api/v1/items/book-one", json={"patch": patch}, headers=headers)
     assert replay.status_code == 200
@@ -261,7 +357,7 @@ def test_update_preserves_raw_managed_state_and_supports_cas_replay(
 def test_legacy_fallback_revision_is_shared_by_query_and_command_codec(
     client, command_catalog
 ):
-    server, builds_path, original = command_catalog
+    server, builds_path, original, _reopen_session = command_catalog
     detail = client.get("/api/v1/items/legacy-no-revision")
     revision = detail.get_json()["item"]["record_revision"]
     assert revision.startswith("ir-")
@@ -289,7 +385,7 @@ def test_legacy_fallback_revision_is_shared_by_query_and_command_codec(
 def test_strict_documents_managed_fields_and_preconditions_never_publish(
     client, command_catalog
 ):
-    _server, builds_path, _original = command_catalog
+    _server, builds_path, _original, _reopen_session = command_catalog
     before = builds_path.read_bytes()
     create_headers = {"Idempotency-Key": "invalid-create"}
     update_headers = {
@@ -381,7 +477,7 @@ def test_strict_documents_managed_fields_and_preconditions_never_publish(
 def test_codec_failures_are_sanitized_and_capabilities_match_composition(
     client, command_catalog, monkeypatch
 ):
-    server, builds_path, _original = command_catalog
+    server, builds_path, _original, reopen_session = command_catalog
     document = client.get("/api/v1/capabilities").get_json()
     capabilities = {
         (row["id"], row["version"]) for row in document["capabilities"]
@@ -396,7 +492,7 @@ def test_codec_failures_are_sanitized_and_capabilities_match_composition(
         raise RuntimeError(r"C:\private\catalogue-secret")
 
     monkeypatch.setattr(server, "_engine_item_command_encode", fail_codec)
-    server._library_engine_instance = None
+    reopen_session()
     before = builds_path.read_bytes()
     response = client.post(
         "/api/v1/items", json={"item": _item()},

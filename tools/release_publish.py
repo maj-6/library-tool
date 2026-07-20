@@ -19,10 +19,10 @@ Where the file itself lives is a separate question, hence two modes:
   size are computed; otherwise pass --sha256/--bytes or the row goes up without
   them (the page shows blanks, nothing breaks).
 
-Credentials: SUPABASE_URL / SUPABASE_KEY in the environment, else the desktop
-settings (client_state.json). Writing `releases` needs the service_role key —
-RLS leaves anon read-only — and the role is read out of the JWT up front so a
-wrong key fails with a sentence instead of a PostgREST 401.
+Credentials: set SUPABASE_URL / SUPABASE_KEY in the environment. Writing
+`releases` needs the service_role key — RLS leaves anon read-only — and the
+role is read out of the JWT up front so a wrong key fails with a sentence
+instead of a PostgREST 401.
 """
 from __future__ import annotations
 
@@ -31,11 +31,11 @@ import base64
 import hashlib
 import json
 import mimetypes
-import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cli_credentials          # noqa: E402
 import supabase_sync as sb       # noqa: E402
 
 BUCKET = "releases"
@@ -49,19 +49,7 @@ CONTENT_TYPES = {
 
 
 def config() -> dict:
-    url = os.environ.get("SUPABASE_URL", "")
-    key = os.environ.get("SUPABASE_KEY", "")
-    if not (url and key):
-        # Lazy import: libcommon resolves DATA_ROOT on import, which CI neither
-        # has nor needs — env vars are the only path it takes.
-        import libcommon as lib
-        state = lib.load_json(lib.CLIENT_STATE_PATH, {}).get("settings", {})
-        url = url or str(state.get("supabaseUrl") or "")
-        key = key or str(state.get("supabaseKey") or "")
-    if not (url and key):
-        sys.exit("No Supabase URL/key. Set SUPABASE_URL and SUPABASE_KEY, or "
-                 "configure Settings > Sync in the desktop app.")
-    return {"url": url.rstrip("/"), "key": key}
+    return cli_credentials.supabase_service_config()
 
 
 def key_role(key: str) -> str:

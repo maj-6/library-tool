@@ -7,12 +7,18 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from librarytool.engine import (
+    ITEM_LIFECYCLE_SERVICE,
     ITEM_QUERY_SERVICE,
+    SECRET_STORE_SERVICE,
+    TEXT_LAYER_AGGREGATE_SERVICE,
+    TEXT_LAYER_SERVICE,
     CapabilityRef,
     CapabilityRegistry,
     DuplicateServiceError,
+    DeleteItemCommand,
     LibraryEngine,
     LibraryEngineBuilder,
+    LifecycleDeleteItemCommand,
     ItemQueryService,
     ModuleContribution,
     ModuleManifest,
@@ -30,6 +36,14 @@ from librarytool.engine import (
 ITEMS = CapabilityRef("library.items.read")
 TRANSLATIONS = CapabilityRef("translation.layers.read")
 GENERATION = CapabilityRef("translation.layers.generate")
+ITEM_DELETE = CapabilityRef("library.items.delete")
+ITEM_RESTORE = CapabilityRef("library.items.restore")
+
+
+def test_root_exports_keep_catalogue_and_lifecycle_delete_commands_distinct():
+    assert DeleteItemCommand is not LifecycleDeleteItemCommand
+    assert DeleteItemCommand.__module__.endswith("item_commands")
+    assert LifecycleDeleteItemCommand.__module__.endswith("item_lifecycle")
 
 
 def _contribution(
@@ -124,6 +138,70 @@ def test_builder_populates_legacy_fields_from_well_known_keys():
         engine.capabilities.register_module(
             ModuleManifest("late.module", "1.0.0")
         )
+
+
+def test_optional_item_lifecycle_uses_generic_registry_without_legacy_field():
+    lifecycle = object()
+    contribution = _contribution(
+        "library.item-lifecycle.commands",
+        provides=(ITEM_DELETE, ITEM_RESTORE),
+        bindings=(
+            _binding(
+                ITEM_LIFECYCLE_SERVICE,
+                lifecycle,
+                ITEM_DELETE,
+                ITEM_RESTORE,
+            ),
+        ),
+    )
+
+    engine = LibraryEngineBuilder((contribution,)).build()
+
+    assert engine.require_service(ITEM_LIFECYCLE_SERVICE) is lifecycle
+    assert not hasattr(engine, "item_lifecycle")
+
+
+def test_native_text_layer_aggregate_is_a_distinct_registry_only_service():
+    read = CapabilityRef("library.text-layers.read")
+    edit = CapabilityRef("library.text-layers.edit")
+    service = object()
+    contribution = _contribution(
+        "library.text-layers",
+        provides=(read, edit),
+        bindings=(
+            _binding(TEXT_LAYER_AGGREGATE_SERVICE, service, read, edit),
+        ),
+    )
+
+    engine = LibraryEngineBuilder((contribution,)).build()
+
+    assert TEXT_LAYER_AGGREGATE_SERVICE != TEXT_LAYER_SERVICE
+    assert TEXT_LAYER_AGGREGATE_SERVICE.token == (
+        "library.text-layers.aggregate@1"
+    )
+    assert engine.require_service(TEXT_LAYER_AGGREGATE_SERVICE) is service
+    assert engine.text_layers is None
+    assert not hasattr(engine, "text_layer_aggregate")
+
+
+def test_secret_store_is_registry_only_and_has_no_legacy_engine_field():
+    status = CapabilityRef("library.secrets.status")
+    mutate = CapabilityRef("library.secrets.mutate")
+    service = object()
+    contribution = _contribution(
+        "library.secrets",
+        provides=(status, mutate),
+        bindings=(
+            _binding(SECRET_STORE_SERVICE, service, status, mutate),
+        ),
+    )
+
+    engine = LibraryEngineBuilder((contribution,)).build()
+
+    assert SECRET_STORE_SERVICE.token == "library.secrets@1"
+    assert engine.require_service(SECRET_STORE_SERVICE) is service
+    assert not hasattr(engine, "secrets")
+    assert not hasattr(engine, "secret_store")
 
 
 def test_direct_library_engine_construction_remains_compatible():

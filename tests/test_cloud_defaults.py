@@ -8,6 +8,7 @@ cloud_defaults, the role check here goes red.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 from pathlib import Path
 
@@ -84,10 +85,23 @@ def test_auth_cfg_works_with_nothing_configured(settings):
                    "key": cloud_defaults.SUPABASE_ANON_KEY}
 
 
-def test_auth_cfg_settings_override_the_defaults(settings):
+def test_custom_auth_cfg_leases_key_without_plaintext_settings_fallback(
+        settings, monkeypatch):
     settings(supabaseUrl="https://own.supabase.co", supabaseAnonKey="own-anon")
-    assert server._auth_cfg() == {"url": "https://own.supabase.co",
-                                  "key": "own-anon"}
+    monkeypatch.setattr(server, "_secret_is_configured", lambda key:
+                        key == "supabaseAnonKey")
+
+    @contextlib.contextmanager
+    def lease(key):
+        assert key == "supabaseAnonKey"
+        yield "protected-own-anon"
+
+    monkeypatch.setattr(server, "_lease_secret", lease)
+    assert server._auth_cfg() == {"url": "https://own.supabase.co"}
+    with server._auth_execution_cfg() as cfg:
+        assert cfg == {"url": "https://own.supabase.co",
+                       "key": "protected-own-anon"}
+    assert "key" not in cfg
 
 
 def test_auth_cfg_never_pairs_the_default_key_with_a_custom_url(settings):
@@ -107,17 +121,20 @@ def test_capture_cfg_uses_public_key_plus_user_session(settings, monkeypatch):
     settings(supabaseUrl="", supabaseAnonKey="", supabaseKey="")
     monkeypatch.setattr(server, "_auth_session",
                         lambda: {"access_token": "user-jwt", "user_id": "u1"})
-    assert server._capture_cfg() == {
-        "url": cloud_defaults.SUPABASE_URL,
-        "key": cloud_defaults.SUPABASE_ANON_KEY,
-        "access_token": "user-jwt",
-    }
+    with server._lease_capture_cfg() as cfg:
+        assert cfg == {
+            "url": cloud_defaults.SUPABASE_URL,
+            "key": cloud_defaults.SUPABASE_ANON_KEY,
+            "access_token": "user-jwt",
+        }
+    assert "key" not in cfg and "access_token" not in cfg
 
 
 def test_capture_cfg_requires_a_signed_in_user(settings, monkeypatch):
     settings(supabaseUrl="", supabaseAnonKey="", supabaseKey="")
     monkeypatch.setattr(server, "_auth_session", lambda: None)
-    assert server._capture_cfg() is None
+    with server._lease_capture_cfg() as cfg:
+        assert cfg is None
 
 
 def test_capture_rest_headers_separate_public_key_and_user_jwt():
@@ -129,19 +146,22 @@ def test_capture_rest_headers_separate_public_key_and_user_jwt():
                        "Authorization": "Bearer user-jwt"}
 
 
-def test_cloud_cfg_still_requires_the_service_key(settings):
+def test_cloud_cfg_still_requires_protected_service_key_status(
+        settings, monkeypatch):
     settings(supabaseUrl="", supabaseAnonKey="", supabaseKey="")
+    monkeypatch.setattr(server, "_secret_is_configured", lambda _key: False)
     assert server._cloud_cfg() is None          # anon must never drive sync
-    settings(supabaseKey="service-secret")
-    assert server._cloud_cfg() == {"url": cloud_defaults.SUPABASE_URL,
-                                   "key": "service-secret"}
+    monkeypatch.setattr(server, "_secret_is_configured", lambda key:
+                        key == "supabaseKey")
+    assert server._cloud_cfg() == {"url": cloud_defaults.SUPABASE_URL}
 
 
 def test_phone_sync_does_not_run_owner_pipelines(monkeypatch):
     public = {"url": "https://x.supabase.co", "key": "public-key",
               "access_token": "user-jwt"}
     order = []
-    monkeypatch.setattr(server, "_capture_cfg", lambda: public)
+    monkeypatch.setattr(server, "_lease_capture_cfg",
+                        lambda: contextlib.nullcontext(public))
     monkeypatch.setattr(server, "_cloud_cfg", lambda: None)
     monkeypatch.setattr(server, "_refresh_collection_aliases",
                         lambda cfg, token: order.append(("collections", cfg, token)) or [])
