@@ -3,7 +3,7 @@
 // from main (theme + status + download progress) and never sends anything back.
 const { contextBridge, ipcRenderer } = require("electron");
 
-contextBridge.exposeInMainWorld("whlUpdater", {
+if (process.isMainFrame) contextBridge.exposeInMainWorld("whlUpdater", {
   onAssets: (cb) => ipcRenderer.on("updater:assets", (_e, assets) => cb(assets)),
   // main pushes the persisted theme name once, up front, so the splash can
   // paint itself in the same palette the app will open with.

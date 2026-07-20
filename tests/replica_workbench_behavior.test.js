@@ -7,7 +7,8 @@ const path = require("node:path");
 const test = require("node:test");
 
 const source = fs.readFileSync(path.join(
-  __dirname, "..", "tools", "whl_explorer", "static", "app.js"), "utf8");
+  __dirname, "..", "tools", "whl_explorer", "static", "app.js"), "utf8")
+  .replace(/\r\n?/g, "\n");
 
 function fn(name) {
   const m = source.match(new RegExp("function " + name + "\\([\\s\\S]*?\\n}"));
