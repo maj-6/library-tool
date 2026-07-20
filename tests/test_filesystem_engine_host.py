@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -28,6 +29,7 @@ from librarytool.composition import (
     InterchangeBindings,
     JobHistoryBindings,
     ReplicaBindings,
+    TextLayerAggregateBindings,
     TranslationBindings,
     open_filesystem_engine,
 )
@@ -38,10 +40,12 @@ from librarytool.engine.interchange import LibImportPlannerPort
 from librarytool.engine.item_commands import ItemDraft, ItemRecordSnapshot
 from librarytool.engine.ports import ReplicaPolicyPort, TextLayerRepositoryPort
 from librarytool.engine.runtime import (
+    TEXT_LAYER_AGGREGATE_SERVICE,
     ModuleContribution,
     ServiceBinding,
     ServiceRegistryError,
 )
+from librarytool.engine.text_layer_aggregate import TextLayerSourceSnapshot
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -275,6 +279,55 @@ def test_open_composes_one_headless_graph_and_close_is_explicit(tmp_path):
         contribute_modules=modules,
     )
     reopened.close()
+
+
+def test_native_text_layer_vertical_uses_only_host_owned_recovery(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "workspace"
+    config, base_bindings, modules = _host_inputs(root)
+    native_bindings = TextLayerAggregateBindings(
+        item_exists_for=lambda item_id: item_id == "book-one",
+        source_snapshot_for=lambda item_id, representation_id: (
+            TextLayerSourceSnapshot(item_id, representation_id, "scan-r1")
+            if (item_id, representation_id) == ("book-one", "scan")
+            else None
+        ),
+        layer_id_factory=lambda: "native-layer-1",
+    )
+    bindings = replace(
+        base_bindings,
+        text_layer_aggregate=native_bindings,
+    )
+    original_recover_all = RecoverableWriteSet.recover_all
+    recovery_roots = []
+
+    def tracked_recover_all(write_set):
+        recovery_roots.append(write_set.root)
+        return original_recover_all(write_set)
+
+    monkeypatch.setattr(RecoverableWriteSet, "recover_all", tracked_recover_all)
+
+    with open_filesystem_engine(
+        config=config,
+        bindings=bindings,
+        contribute_modules=modules,
+    ) as session:
+        service = session.engine.require_service(
+            TEXT_LAYER_AGGREGATE_SERVICE
+        )
+        assert service.list("book-one") == ()
+        assert session.engine.text_layers is not service
+
+    assert recovery_roots == [root.resolve()]
+
+
+def test_host_rejects_a_mismatched_native_text_layer_binding(tmp_path):
+    _config, bindings, _modules = _host_inputs(tmp_path / "workspace")
+
+    with pytest.raises(TypeError, match="text_layer_aggregate"):
+        replace(bindings, text_layer_aggregate=object())
 
 
 def test_same_workspace_is_exclusive_but_different_roots_are_independent(

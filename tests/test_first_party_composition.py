@@ -24,6 +24,7 @@ from librarytool.engine.runtime import (
     LIB_OPEN_SERVICE,
     REPLICA_SERVICE,
     REPRESENTATION_COMMAND_SERVICE,
+    TEXT_LAYER_AGGREGATE_SERVICE,
     TEXT_LAYER_SERVICE,
     TRANSLATION_PROVENANCE_SERVICE,
     TRANSLATION_SERVICE,
@@ -51,6 +52,7 @@ def _graph(
     lifecycle: bool = True,
     lib_open: bool = True,
     canvases: bool = True,
+    text_layer_aggregate: bool = True,
 ) -> FilesystemServiceGraph:
     return FilesystemServiceGraph(
         items=ItemQueryService(_EmptyItemRepository()),
@@ -66,6 +68,7 @@ def _graph(
         translation_provenance=object(),
         canvas_query=object() if canvases else None,
         canvas_preparation=object() if canvases else None,
+        text_layer_aggregate=(object() if text_layer_aggregate else None),
     )
 
 
@@ -90,6 +93,7 @@ def test_first_party_manifests_preserve_the_production_product_contract():
         "library.representation.commands": "1.0.0",
         "library.item-lifecycle.commands": "1.0.0",
         "library.canvases": "1.0.0",
+        "library.text-layers": "1.0.0",
         "replica.core": "1.0.0",
         "translation.core": "2.0.0",
         "replica.lib": "2.0.0",
@@ -130,6 +134,15 @@ def test_first_party_manifests_preserve_the_production_product_contract():
         ("library.canvases.prepare", 1),
     }
     assert _capabilities(canvases.requires) == {
+        ("library.items.read", 1),
+        ("library.representations", 1),
+    }
+    native_text_layers = modules["library.text-layers"]
+    assert _capabilities(native_text_layers.provides) == {
+        ("library.text-layers.read", 1),
+        ("library.text-layers.edit", 1),
+    }
+    assert _capabilities(native_text_layers.requires) == {
         ("library.items.read", 1),
         ("library.representations", 1),
     }
@@ -198,6 +211,7 @@ def test_full_first_party_graph_binds_every_service_and_policy():
         "library.representation.commands",
         "library.item-lifecycle.commands",
         "library.canvases",
+        "library.text-layers",
         "replica.core",
         "translation.core",
         "replica.lib",
@@ -221,6 +235,7 @@ def test_full_first_party_graph_binds_every_service_and_policy():
             "library.canvases.prepare@1",
             "library.canvases.query@1",
         ),
+        "library.text-layers": ("library.text-layers.aggregate@1",),
         "replica.core": ("replica.application@1", "replica.text-layers@1"),
         "translation.core": (
             "translation.application@1",
@@ -278,6 +293,10 @@ def test_full_first_party_graph_binds_every_service_and_policy():
     assert engine.require_service(LIB_OPEN_SERVICE) is graph.lib_open
     assert engine.require_service(REPLICA_SERVICE) is graph.replica
     assert engine.require_service(TEXT_LAYER_SERVICE) is graph.text_layers
+    assert engine.require_service(
+        TEXT_LAYER_AGGREGATE_SERVICE
+    ) is graph.text_layer_aggregate
+    assert engine.text_layers is graph.text_layers
     assert engine.require_service(TRANSLATION_SERVICE) is graph.translations
     assert engine.require_service(
         TRANSLATION_PROVENANCE_SERVICE
@@ -293,20 +312,28 @@ def test_full_first_party_graph_binds_every_service_and_policy():
 
 
 @pytest.mark.parametrize(
-    ("representation", "lifecycle", "lib_open", "canvases"),
-    tuple(product((False, True), repeat=4)),
+    (
+        "representation",
+        "lifecycle",
+        "lib_open",
+        "canvases",
+        "text_layer_aggregate",
+    ),
+    tuple(product((False, True), repeat=5)),
 )
 def test_optional_modules_are_independent_deterministic_and_withheld(
     representation,
     lifecycle,
     lib_open,
     canvases,
+    text_layer_aggregate,
 ):
     graph = _graph(
         representation=representation,
         lifecycle=lifecycle,
         lib_open=lib_open,
         canvases=canvases,
+        text_layer_aggregate=text_layer_aggregate,
     )
     contributions = first_party_module_contributions(graph)
     engine = LibraryEngineBuilder(contributions).build()
@@ -321,6 +348,7 @@ def test_optional_modules_are_independent_deterministic_and_withheld(
     ) is lifecycle
     assert ("replica.lib-open" in module_ids) is lib_open
     assert ("library.canvases" in module_ids) is canvases
+    assert ("library.text-layers" in module_ids) is text_layer_aggregate
     assert (
         engine.get_service(REPRESENTATION_COMMAND_SERVICE) is not None
     ) is representation
@@ -330,6 +358,9 @@ def test_optional_modules_are_independent_deterministic_and_withheld(
     assert (engine.get_service(LIB_OPEN_SERVICE) is not None) is lib_open
     assert (engine.get_service(CANVAS_QUERY_SERVICE) is not None) is canvases
     assert (engine.get_service(CANVAS_PREPARATION_SERVICE) is not None) is canvases
+    assert (
+        engine.get_service(TEXT_LAYER_AGGREGATE_SERVICE) is not None
+    ) is text_layer_aggregate
     assert ("representation-commands" in policies) is representation
     assert ("item-lifecycle" in policies) is lifecycle
 
@@ -351,6 +382,13 @@ def test_optional_modules_are_independent_deterministic_and_withheld(
     assert (
         bool({"library.canvases.read", "library.canvases.prepare"} & capability_ids)
         is canvases
+    )
+    assert (
+        bool(
+            {"library.text-layers.read", "library.text-layers.edit"}
+            & capability_ids
+        )
+        is text_layer_aggregate
     )
 
     workbenches = {row["id"]: row for row in document["workbenches"]}
@@ -421,6 +459,23 @@ def test_canvas_services_and_capabilities_are_withheld_as_one_vertical():
         ("library.canvases.read", 1),
         ("library.canvases.prepare", 1),
     }
+
+
+def test_native_text_layer_service_and_capabilities_are_withheld_together():
+    graph = _graph(text_layer_aggregate=False)
+    contributions = first_party_module_contributions(graph)
+    engine = LibraryEngineBuilder(contributions).build()
+    document = engine.discovery_document()
+
+    assert "library.text-layers" not in {
+        row["id"] for row in document["modules"]
+    }
+    assert {
+        "library.text-layers.read",
+        "library.text-layers.edit",
+    }.isdisjoint(_capability_ids(document))
+    assert engine.get_service(TEXT_LAYER_AGGREGATE_SERVICE) is None
+    assert engine.text_layers is graph.text_layers
 
 
 def test_service_graph_rejects_half_installed_canvas_vertical():

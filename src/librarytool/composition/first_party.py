@@ -26,6 +26,7 @@ from ..engine.runtime import (
     LIB_OPEN_SERVICE,
     REPLICA_SERVICE,
     REPRESENTATION_COMMAND_SERVICE,
+    TEXT_LAYER_AGGREGATE_SERVICE,
     TEXT_LAYER_SERVICE,
     TRANSLATION_PROVENANCE_SERVICE,
     TRANSLATION_SERVICE,
@@ -102,6 +103,18 @@ FIRST_PARTY_MODULE_MANIFESTS = (
         provides=(
             CapabilityRef("library.canvases.read"),
             CapabilityRef("library.canvases.prepare"),
+        ),
+        requires=(
+            CapabilityRef("library.items.read"),
+            CapabilityRef("library.representations"),
+        ),
+    ),
+    ModuleManifest(
+        "library.text-layers",
+        "1.0.0",
+        provides=(
+            CapabilityRef("library.text-layers.read"),
+            CapabilityRef("library.text-layers.edit"),
         ),
         requires=(
             CapabilityRef("library.items.read"),
@@ -299,6 +312,20 @@ def first_party_module_contributions(
                         CANVAS_PREPARATION_SERVICE,
                         graph.canvas_preparation,
                         (CapabilityRef("library.canvases.prepare"),),
+                    ),
+                ),
+            )
+        )
+
+    if graph.text_layer_aggregate is not None:
+        contributions.append(
+            ModuleContribution(
+                modules["library.text-layers"],
+                bindings=(
+                    ServiceBinding(
+                        TEXT_LAYER_AGGREGATE_SERVICE,
+                        graph.text_layer_aggregate,
+                        modules["library.text-layers"].provides,
                     ),
                 ),
             )

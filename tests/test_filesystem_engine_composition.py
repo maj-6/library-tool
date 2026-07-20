@@ -32,6 +32,7 @@ from librarytool.composition.filesystem import (
     ItemLifecycleBindings,
     ReplicaBindings,
     RepresentationBindings,
+    TextLayerAggregateBindings,
     TranslationBindings,
     compose_filesystem_engine,
 )
@@ -75,6 +76,7 @@ from librarytool.engine.runtime import (
     LIB_OPEN_SERVICE,
     REPLICA_SERVICE,
     REPRESENTATION_COMMAND_SERVICE,
+    TEXT_LAYER_AGGREGATE_SERVICE,
     TEXT_LAYER_SERVICE,
     TRANSLATION_PROVENANCE_SERVICE,
     TRANSLATION_SERVICE,
@@ -82,6 +84,15 @@ from librarytool.engine.runtime import (
     ServiceBinding,
     ServiceRegistryError,
     WorkbenchPolicyBinding,
+)
+from librarytool.engine.text_layer_aggregate import (
+    CreateTextLayerCommand,
+    ReplaceTextLayerUnitCommand,
+    TextLayerDraft,
+    TextLayerSourcePin,
+    TextLayerSourceSnapshot,
+    TextLayerUnitDraft,
+    TextLayerUnitReplacement,
 )
 from librarytool.engine.representation_commands import (
     RepresentationAggregateSnapshot,
@@ -222,6 +233,51 @@ def _canvas_bindings() -> CanvasBindings:
         inspect_media=inspect_media,
         allocate_canvas_id=allocate_canvas_id,
         lock_context_for=_catalogue_lock,
+    )
+
+
+def _native_text_layer_bindings(
+    *,
+    state=None,
+    layer_id_factory=None,
+) -> TextLayerAggregateBindings:
+    authority = (
+        {
+            "item_exists": True,
+            "source_revision": "scan-r1",
+            "item_calls": 0,
+            "source_calls": 0,
+        }
+        if state is None
+        else state
+    )
+
+    def item_exists_for(item_id):
+        authority["item_calls"] += 1
+        return item_id == "book-one" and authority["item_exists"]
+
+    def source_snapshot_for(item_id, representation_id):
+        authority["source_calls"] += 1
+        if (
+            item_id != "book-one"
+            or representation_id != "scan"
+            or authority["source_revision"] is None
+        ):
+            return None
+        return TextLayerSourceSnapshot(
+            item_id,
+            representation_id,
+            authority["source_revision"],
+        )
+
+    if layer_id_factory is None:
+        def layer_id_factory():
+            return "native-layer-1"
+
+    return TextLayerAggregateBindings(
+        item_exists_for=item_exists_for,
+        source_snapshot_for=source_snapshot_for,
+        layer_id_factory=layer_id_factory,
     )
 
 
@@ -436,6 +492,8 @@ def _composition(
     lifecycle: ItemLifecycleBindings | None = None,
     item_command_policy=None,
     canvases: CanvasBindings | None = None,
+    text_layer_aggregate: TextLayerAggregateBindings | None = None,
+    workspace_lock_context_for=_workspace_lock,
 ):
     write_set = _TrackingWriteSet(tmp_path / "workspace")
     if unfinished:
@@ -478,7 +536,7 @@ def _composition(
             write_set=write_set,
             jobs=jobs,
             provenance=provenance,
-            workspace_lock_context_for=_workspace_lock,
+            workspace_lock_context_for=workspace_lock_context_for,
         ),
         catalogue=CatalogueBindings(
             load_snapshot=(
@@ -525,6 +583,7 @@ def _composition(
         ),
         contribution_factory=contribution_factory,
         canvases=canvases,
+        text_layer_aggregate=text_layer_aggregate,
     )
     return {
         "engine": engine,
@@ -610,6 +669,210 @@ def test_canvas_vertical_is_absent_by_default_and_never_half_advertised(tmp_path
         CANVAS_QUERY_SERVICE,
         CANVAS_PREPARATION_SERVICE,
     } & set(engine.services.keys)
+
+
+def test_native_text_layer_vertical_is_absent_without_complete_bindings(
+    tmp_path,
+):
+    engine = _composition(
+        tmp_path,
+        contribution_factory=first_party_module_contributions,
+    )["engine"]
+
+    assert engine.get_service(TEXT_LAYER_AGGREGATE_SERVICE) is None
+    assert engine.text_layers is not None
+    assert "library.text-layers" not in {
+        row["id"] for row in engine.discovery_document()["modules"]
+    }
+    assert {
+        "library.text-layers.read",
+        "library.text-layers.edit",
+    }.isdisjoint(
+        row["id"] for row in engine.discovery_document()["capabilities"]
+    )
+
+
+def test_native_text_layer_vertical_composes_query_command_and_replay(
+    tmp_path,
+):
+    state = {
+        "item_exists": True,
+        "source_revision": "scan-r1",
+        "item_calls": 0,
+        "source_calls": 0,
+    }
+
+    def layer_id_factory():
+        return "native-layer-1"
+
+    lock_events = []
+
+    @contextmanager
+    def shared_workspace_lock(item_id):
+        lock_events.append(("enter", item_id))
+        try:
+            yield
+        finally:
+            lock_events.append(("exit", item_id))
+
+    bindings = _native_text_layer_bindings(
+        state=state,
+        layer_id_factory=layer_id_factory,
+    )
+    composed = _composition(
+        tmp_path,
+        text_layer_aggregate=bindings,
+        contribution_factory=first_party_module_contributions,
+        workspace_lock_context_for=shared_workspace_lock,
+    )
+    engine = composed["engine"]
+    service = engine.require_service(TEXT_LAYER_AGGREGATE_SERVICE)
+    repository = service._repository
+
+    assert service is not engine.text_layers
+    assert engine.text_layers._repository is composed["text_repository"]
+    assert repository._write_set is composed["write_set"]
+    assert repository._item_exists_for is bindings.item_exists_for
+    assert repository._entry_directory_for("book-one") == (
+        composed["paths"].entries / "book-one"
+    )
+    assert repository._source_snapshot_for is bindings.source_snapshot_for
+    assert repository._layer_id_factory is layer_id_factory
+    assert composed["write_set"].recovery_calls == 0
+
+    command = CreateTextLayerCommand(
+        "book-one",
+        TextLayerDraft(
+            source=TextLayerSourcePin("scan", "scan-r1"),
+            units=(TextLayerUnitDraft("page-1", 0, "First text"),),
+            label="Diplomatic",
+            language="en",
+        ),
+        "native-create-1",
+    )
+    created = service.create(command)
+    assert created.replayed is False
+    assert created.receipt.layer_id == "native-layer-1"
+    assert lock_events[-2:] == [("enter", ""), ("exit", "")]
+
+    # Durable replay is resolved before mutable item/source authority.  This
+    # is what makes an ambiguous client retry safe after surrounding state
+    # changes or temporarily disappears.
+    authority_calls = (state["item_calls"], state["source_calls"])
+    state["item_exists"] = False
+    replayed = service.create(command)
+    assert replayed.replayed is True
+    assert replayed.receipt == created.receipt
+    assert (state["item_calls"], state["source_calls"]) == authority_calls
+    state["item_exists"] = True
+
+    summaries = service.list("book-one")
+    assert [value.layer_id for value in summaries] == ["native-layer-1"]
+    before = service.get("book-one", "native-layer-1")
+    unit = before.document.units[0]
+    replaced = service.replace_unit(
+        ReplaceTextLayerUnitCommand(
+            item_id="book-one",
+            layer_id="native-layer-1",
+            replacement=TextLayerUnitReplacement(
+                selector="page-1",
+                text="Corrected text",
+            ),
+            expected_unit_revision=unit.unit_revision,
+            expected_source_revision="scan-r1",
+            operation_id="native-replace-1",
+        )
+    )
+    after = service.get("book-one", "native-layer-1")
+
+    assert replaced.replayed is False
+    assert after.document.units[0].text == "Corrected text"
+    assert after.document.document_revision == (
+        replaced.receipt.after_document_revision
+    )
+    document = engine.discovery_document()
+    assert "library.text-layers" in {
+        row["id"] for row in document["modules"]
+    }
+    assert {
+        "library.text-layers.read",
+        "library.text-layers.edit",
+    } <= {row["id"] for row in document["capabilities"]}
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    (
+        "item_exists_for",
+        "source_snapshot_for",
+        "layer_id_factory",
+    ),
+)
+def test_native_text_layer_bindings_reject_incomplete_seams(field_name):
+    valid = _native_text_layer_bindings()
+    values = {
+        "item_exists_for": valid.item_exists_for,
+        "source_snapshot_for": valid.source_snapshot_for,
+        "layer_id_factory": valid.layer_id_factory,
+    }
+    values[field_name] = None
+
+    with pytest.raises(TypeError, match=field_name):
+        TextLayerAggregateBindings(**values)
+
+
+def test_native_text_layer_binding_and_contribution_mismatches_fail_composition(
+    tmp_path,
+):
+    with pytest.raises(TypeError, match="TextLayerAggregateBindings"):
+        _composition(
+            tmp_path / "wrong-bundle",
+            text_layer_aggregate=cast(TextLayerAggregateBindings, object()),
+        )
+
+    def omit_native_module(graph):
+        return tuple(
+            contribution
+            for contribution in first_party_module_contributions(graph)
+            if contribution.manifest.id != "library.text-layers"
+        )
+
+    with pytest.raises(
+        ServiceRegistryError,
+        match=TEXT_LAYER_AGGREGATE_SERVICE.token,
+    ):
+        _composition(
+            tmp_path / "missing-contribution",
+            text_layer_aggregate=_native_text_layer_bindings(),
+            contribution_factory=omit_native_module,
+        )
+
+    def bind_mismatched_native_service(graph):
+        return tuple(
+            ModuleContribution(
+                contribution.manifest,
+                bindings=(
+                    ServiceBinding(
+                        TEXT_LAYER_AGGREGATE_SERVICE,
+                        object(),
+                        contribution.manifest.provides,
+                    ),
+                ),
+            )
+            if contribution.manifest.id == "library.text-layers"
+            else contribution
+            for contribution in first_party_module_contributions(graph)
+        )
+
+    with pytest.raises(
+        ServiceRegistryError,
+        match=TEXT_LAYER_AGGREGATE_SERVICE.token,
+    ):
+        _composition(
+            tmp_path / "wrong-service",
+            text_layer_aggregate=_native_text_layer_bindings(),
+            contribution_factory=bind_mismatched_native_service,
+        )
 
 
 def test_complete_canvas_bindings_compose_query_and_preparation_together(tmp_path):

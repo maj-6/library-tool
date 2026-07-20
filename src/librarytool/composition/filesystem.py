@@ -35,6 +35,7 @@ from ..adapters.filesystem import (
     FilesystemOpenLibRepository,
     FilesystemReplicaRepository,
     FilesystemRepresentationCommandRepository,
+    FilesystemTextLayerAggregateRepository,
     FilesystemTranslationRepository,
     RecoverableWriteSet,
 )
@@ -82,6 +83,7 @@ from ..engine.runtime import (
     LIB_OPEN_SERVICE,
     REPLICA_SERVICE,
     REPRESENTATION_COMMAND_SERVICE,
+    TEXT_LAYER_AGGREGATE_SERVICE,
     TEXT_LAYER_SERVICE,
     TRANSLATION_PROVENANCE_SERVICE,
     TRANSLATION_SERVICE,
@@ -90,6 +92,10 @@ from ..engine.runtime import (
     ModuleContribution,
     ServiceKey,
     ServiceRegistryError,
+)
+from ..engine.text_layer_aggregate import (
+    TextLayerAggregateService,
+    TextLayerSourceSnapshot,
 )
 from ..engine.text_layers import TextLayerService
 from ..engine.translation_contracts import TranslationSourceSnapshot
@@ -140,6 +146,11 @@ CanvasMediaInspector = Callable[
     FilesystemCanvasInspection,
 ]
 CanvasIdAllocator = Callable[[frozenset[str]], str]
+TextLayerItemMembership = Callable[[str], bool]
+TextLayerSourceSnapshotLoader = Callable[
+    [str, str], TextLayerSourceSnapshot | None
+]
+TextLayerIdFactory = Callable[[], str]
 _ENTRY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _WINDOWS_DEVICE_NAMES = frozenset(
     {"con", "prn", "aux", "nul"}
@@ -354,6 +365,32 @@ class CanvasBindings:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class TextLayerAggregateBindings:
+    """Complete authority and persistence seams for native text layers.
+
+    This bundle is separate from :class:`ReplicaBindings`: installing the
+    revisioned aggregate must neither replace nor silently alias the legacy
+    ``replica.text-layers`` compatibility service.  Entry resolution and the
+    broad mutation lock deliberately come from the common filesystem config
+    and resources, so an optional module cannot introduce a second path or
+    locking domain.
+    """
+
+    item_exists_for: TextLayerItemMembership
+    source_snapshot_for: TextLayerSourceSnapshotLoader
+    layer_id_factory: TextLayerIdFactory
+
+    def __post_init__(self) -> None:
+        for callback, name in (
+            (self.item_exists_for, "item_exists_for"),
+            (self.source_snapshot_for, "source_snapshot_for"),
+            (self.layer_id_factory, "layer_id_factory"),
+        ):
+            if not callable(callback):
+                raise TypeError(f"{name} must be callable")
+
+
 class _CanvasAuthority:
     """Validate and sanitize one exact host canvas authority projection."""
 
@@ -471,6 +508,7 @@ class FilesystemServiceGraph:
     translation_provenance: TranslationProvenanceService
     canvas_query: CanvasQueryService | None = None
     canvas_preparation: CanvasPreparationService | None = None
+    text_layer_aggregate: TextLayerAggregateService | None = None
 
     def __post_init__(self) -> None:
         if (self.canvas_query is None) != (self.canvas_preparation is None):
@@ -491,6 +529,7 @@ class FilesystemServiceGraph:
             (JOB_SERVICE, self.jobs),
             (REPLICA_SERVICE, self.replica),
             (TEXT_LAYER_SERVICE, self.text_layers),
+            (TEXT_LAYER_AGGREGATE_SERVICE, self.text_layer_aggregate),
             (TRANSLATION_SERVICE, self.translations),
             (
                 TRANSLATION_PROVENANCE_SERVICE,
@@ -519,6 +558,7 @@ def compose_filesystem_engine(
     translation: TranslationBindings,
     contribution_factory: ContributionFactory,
     canvases: CanvasBindings | None = None,
+    text_layer_aggregate: TextLayerAggregateBindings | None = None,
 ) -> LibraryEngine:
     """Return one complete filesystem-backed service graph.
 
@@ -532,6 +572,14 @@ def compose_filesystem_engine(
         raise TypeError("contribution_factory must be callable")
     if canvases is not None and not isinstance(canvases, CanvasBindings):
         raise TypeError("canvases must be a CanvasBindings bundle or None")
+    if text_layer_aggregate is not None and not isinstance(
+        text_layer_aggregate,
+        TextLayerAggregateBindings,
+    ):
+        raise TypeError(
+            "text_layer_aggregate must be a TextLayerAggregateBindings "
+            "bundle or None"
+        )
     # Recovery remains host-owned, but composition refuses to expose any
     # service graph while an unfinished workspace transaction exists.
     with resources.write_set.workspace_lease():
@@ -586,6 +634,26 @@ def compose_filesystem_engine(
                 inspect_media=canvases.inspect_media,
                 allocate_canvas_id=canvases.allocate_canvas_id,
                 lock_context_for=canvases.lock_context_for,
+                recover=False,
+            )
+        )
+
+    native_text_layers = None
+    if text_layer_aggregate is not None:
+        native_text_layers = TextLayerAggregateService(
+            FilesystemTextLayerAggregateRepository(
+                resources.write_set,
+                item_exists_for=text_layer_aggregate.item_exists_for,
+                entry_directory_for=entry_directory_for,
+                source_snapshot_for=(
+                    text_layer_aggregate.source_snapshot_for
+                ),
+                layer_id_factory=text_layer_aggregate.layer_id_factory,
+                lock_context_for=lambda: (
+                    resources.workspace_lock_context_for("")
+                ),
+                # Startup recovery is owned by the process host.  Repeating
+                # it here would introduce a second, narrower lock domain.
                 recover=False,
             )
         )
@@ -730,6 +798,7 @@ def compose_filesystem_engine(
         translation_provenance=resources.provenance,
         canvas_query=canvas_query,
         canvas_preparation=canvas_preparation,
+        text_layer_aggregate=native_text_layers,
     )
     try:
         contributions = tuple(contribution_factory(graph))
@@ -783,5 +852,6 @@ __all__ = [
     "ReplicaBindings",
     "RepresentationBindings",
     "TranslationBindings",
+    "TextLayerAggregateBindings",
     "compose_filesystem_engine",
 ]

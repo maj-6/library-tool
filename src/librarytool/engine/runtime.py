@@ -25,6 +25,7 @@ from .jobs import JobManager
 from .replica import ReplicaApplicationService
 from .representation_commands import RepresentationCommandService
 from .secret_store import SecretStoreService
+from .text_layer_aggregate import TextLayerAggregateService
 from .text_layers import TextLayerService
 from .translations import TranslationProvenanceService, TranslationService
 
@@ -454,6 +455,9 @@ REPLICA_SERVICE: ServiceKey[ReplicaApplicationService] = ServiceKey(
 TEXT_LAYER_SERVICE: ServiceKey[TextLayerService] = ServiceKey(
     "replica.text-layers"
 )
+TEXT_LAYER_AGGREGATE_SERVICE: ServiceKey[TextLayerAggregateService] = (
+    ServiceKey("library.text-layers.aggregate")
+)
 TRANSLATION_SERVICE: ServiceKey[TranslationService] = ServiceKey(
     "translation.application"
 )
@@ -646,6 +650,7 @@ __all__ = [
     "ServiceRegistry",
     "ServiceRegistryError",
     "TEXT_LAYER_SERVICE",
+    "TEXT_LAYER_AGGREGATE_SERVICE",
     "TRANSLATION_PROVENANCE_SERVICE",
     "TRANSLATION_SERVICE",
     "WorkbenchPolicyBinding",

@@ -9,6 +9,8 @@ import pytest
 from librarytool.engine import (
     ITEM_LIFECYCLE_SERVICE,
     ITEM_QUERY_SERVICE,
+    TEXT_LAYER_AGGREGATE_SERVICE,
+    TEXT_LAYER_SERVICE,
     CapabilityRef,
     CapabilityRegistry,
     DuplicateServiceError,
@@ -156,6 +158,29 @@ def test_optional_item_lifecycle_uses_generic_registry_without_legacy_field():
 
     assert engine.require_service(ITEM_LIFECYCLE_SERVICE) is lifecycle
     assert not hasattr(engine, "item_lifecycle")
+
+
+def test_native_text_layer_aggregate_is_a_distinct_registry_only_service():
+    read = CapabilityRef("library.text-layers.read")
+    edit = CapabilityRef("library.text-layers.edit")
+    service = object()
+    contribution = _contribution(
+        "library.text-layers",
+        provides=(read, edit),
+        bindings=(
+            _binding(TEXT_LAYER_AGGREGATE_SERVICE, service, read, edit),
+        ),
+    )
+
+    engine = LibraryEngineBuilder((contribution,)).build()
+
+    assert TEXT_LAYER_AGGREGATE_SERVICE != TEXT_LAYER_SERVICE
+    assert TEXT_LAYER_AGGREGATE_SERVICE.token == (
+        "library.text-layers.aggregate@1"
+    )
+    assert engine.require_service(TEXT_LAYER_AGGREGATE_SERVICE) is service
+    assert engine.text_layers is None
+    assert not hasattr(engine, "text_layer_aggregate")
 
 
 def test_direct_library_engine_construction_remains_compatible():

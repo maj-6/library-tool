@@ -11,6 +11,7 @@ from .filesystem import (
     ReplicaBindings,
     RepresentationBindings,
     TranslationBindings,
+    TextLayerAggregateBindings,
     compose_filesystem_engine,
 )
 from .first_party import (
@@ -49,6 +50,7 @@ __all__ = [
     "ReplicaBindings",
     "RepresentationBindings",
     "TranslationBindings",
+    "TextLayerAggregateBindings",
     "compose_filesystem_engine",
     "first_party_module_contributions",
     "open_filesystem_engine",
