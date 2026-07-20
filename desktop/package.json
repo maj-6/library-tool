@@ -6,6 +6,9 @@
   "author": "Andrew James Miller",
   "license": "UNLICENSED",
   "private": true,
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "main": "main.js",
   "scripts": {
     "start": "electron .",
@@ -18,8 +21,8 @@
     "electron-updater": "^6.3.9"
   },
   "devDependencies": {
-    "electron": "^31.7.7",
-    "electron-builder": "^24.13.3"
+    "electron": "43.1.1",
+    "electron-builder": "26.15.3"
   },
   "build": {
     "appId": "org.worldherblibrary.librarytool",
@@ -67,8 +70,10 @@
       ],
       "icon": "build/icon.ico",
       "artifactName": "LibraryTool-Setup-${version}.${ext}",
-      "signingHashAlgorithms": ["sha256"],
-      "rfc3161TimeStampServer": "http://timestamp.digicert.com"
+      "signtoolOptions": {
+        "signingHashAlgorithms": ["sha256"],
+        "rfc3161TimeStampServer": "http://timestamp.digicert.com"
+      }
     },
     "nsis": {
       "oneClick": false,

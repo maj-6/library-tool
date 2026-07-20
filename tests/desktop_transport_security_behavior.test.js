@@ -525,7 +525,15 @@ test("installed session handlers preserve trusted clipboard and deny everything 
 
 test("the pinned Electron contract exposes WebFrameMain request identity", () => {
   const version = desktopPackage.devDependencies.electron;
-  assert.match(version, /^\^31\./);
+  assert.equal(version, "43.1.1");
+  assert.equal(desktopPackage.devDependencies["electron-builder"], "26.15.3");
+  assert.equal(desktopPackage.engines.node, ">=22.12.0");
+  assert.deepEqual(desktopPackage.build.win.signtoolOptions.signingHashAlgorithms,
+    ["sha256"]);
+  assert.equal(desktopPackage.build.win.signtoolOptions.rfc3161TimeStampServer,
+    "http://timestamp.digicert.com");
+  assert.equal(desktopPackage.build.win.signingHashAlgorithms, undefined);
+  assert.equal(desktopPackage.build.win.rfc3161TimeStampServer, undefined);
   assert.match(mainSource, /details\.webContentsId/);
   assert.match(mainSource, /details\.frame !== trust\.mainFrame/);
 });

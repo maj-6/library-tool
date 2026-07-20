@@ -58,7 +58,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22.12"
 
       # The tag drives the GitHub Release and updater channel, while the
       # installer filename/version comes from package.json. Refuse the entire
@@ -297,7 +297,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22.12"
           cache: npm
           cache-dependency-path: desktop/package-lock.json
 

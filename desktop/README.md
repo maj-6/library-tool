@@ -37,8 +37,13 @@ npm start           # spawns the Python source; needs Python on PATH (or set WHL
 ## Build the Windows installer (NSIS)
 
 Prerequisites on the build machine: Python 3 with the app's requirements
-installed, `pip install pyinstaller`, Node 18+. electron-builder downloads the
-NSIS tooling itself. A *signed* build additionally needs a code-signing cert.
+installed, `pip install pyinstaller`, Node 22.12+. Electron 43's npm package
+requires that Node baseline; electron-builder downloads the NSIS tooling
+itself. A *signed* build additionally needs a code-signing cert.
+
+The Windows signing options live under `build.win.signtoolOptions`, as required
+by electron-builder 26. Keep certificate material in the `CSC_LINK` and
+`CSC_KEY_PASSWORD` environment variables; do not put it in package metadata.
 
 ```
 cd desktop

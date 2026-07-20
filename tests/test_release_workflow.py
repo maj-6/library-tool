@@ -274,7 +274,17 @@ def test_tagged_release_uses_its_committed_release_notes_when_present():
 
 
 def test_ci_uses_cross_platform_node_test_discovery():
-    # Shell glob expansion differs between bash and PowerShell, while Node 20
+    # Shell glob expansion differs between bash and PowerShell, while Node 22
     # discovers the repository's *.test.js files itself when no path is given.
     assert "node --test\n" in CI_WORKFLOW
     assert "node --test tests" not in CI_WORKFLOW
+
+
+def test_all_javascript_workflow_steps_use_electron_43_node_baseline():
+    preflight = _job("preflight", "android")
+    desktop = _job("desktop", "publish")
+
+    assert 'node-version: "22.12"' in CI_WORKFLOW
+    assert 'node-version: "22.12"' in preflight
+    assert 'node-version: "22.12"' in desktop
+    assert 'node-version: "20"' not in WORKFLOW
