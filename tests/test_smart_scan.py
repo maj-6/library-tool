@@ -552,6 +552,7 @@ def test_normalize_bibliography_contract():
                                   "deep": {"a": 1}}})
     assert out["title"] == "T"
     assert out["author"] == ""
+    assert out["spine_title"] == ""
     assert out["extra"] == {"printer": "P", "n": "3", "deep": '{"a": 1}'}
     assert capture.normalize_bibliography("nonsense")["extra"] == {}
 

@@ -574,6 +574,104 @@ class PhotoAssetsTest {
     }
 
     @Test
+    fun correctedDerivativeHomographyCarriesOcrGeometryForward() {
+        val localAsset = asset(
+            "asset-1",
+            1,
+            revision = 2,
+            geometries = listOf(geometry("asset-1", 2)),
+        )
+        val local = CapturePhotoAssets("capture-1", listOf(localAsset))
+        val correctedDisplay = asset(
+            "asset-1",
+            1,
+            revision = 3,
+            derivativeHash = "c".repeat(64),
+        ).display.copy(
+            width = 1200,
+            height = 1800,
+            sourceToDisplayHomography = listOf(
+                0.8, 0.0, 0.1,
+                0.0, 0.8, 0.05,
+                0.0, 0.0, 1.0,
+            ),
+        )
+        val incomingAsset = asset(
+            "asset-1",
+            1,
+            revision = 3,
+            derivativeHash = "c".repeat(64),
+        ).copy(display = correctedDisplay, geometries = emptyList())
+        val incoming = CapturePhotoAssets("capture-1", listOf(incomingAsset))
+
+        val once = mergePhotoAssetContracts(local, incoming)
+        val twice = mergePhotoAssetContracts(once, incoming)
+        val migrated = once.assets.single().geometries.single { it.displayRevision == 3 }
+
+        assertEquals(1200, migrated.width)
+        assertEquals(1800, migrated.height)
+        val expected = listOf(
+            NormalizedPoint(0.18, 0.21),
+            NormalizedPoint(0.82, 0.21),
+            NormalizedPoint(0.82, 0.29),
+            NormalizedPoint(0.18, 0.29),
+        )
+        expected.zip(migrated.regions.single().polygon).forEach { (wanted, actual) ->
+            assertEquals(wanted.x, actual.x, 1e-9)
+            assertEquals(wanted.y, actual.y, 1e-9)
+        }
+        assertEquals(once, twice)
+    }
+
+    @Test
+    fun transformedGeometryIsClippedToCorrectedPhotoBounds() {
+        val source = asset(
+            "asset-1",
+            1,
+            revision = 2,
+            geometries = listOf(geometry("asset-1", 2)),
+        )
+        val target = source.display.copy(
+            revision = 3,
+            sha256 = "c".repeat(64),
+            sourceToDisplayHomography = listOf(
+                1.4, 0.0, -0.2,
+                0.0, 1.0, 0.0,
+                0.0, 0.0, 1.0,
+            ),
+        )
+
+        val transformed = transformGeometryForDisplay(
+            source.geometries.single(),
+            source.original,
+            source.display,
+            target,
+        )
+
+        assertNotNull(transformed)
+        assertTrue(transformed!!.regions.single().polygon.all { point ->
+            point.x in 0.0..1.0 && point.y in 0.0..1.0
+        })
+        assertTrue(transformed.regions.single().polygon.any { it.x == 0.0 })
+        assertTrue(transformed.regions.single().polygon.any { it.x == 1.0 })
+    }
+
+    @Test
+    fun cleanupRequestIsPendingOnlyForItsExactVisiblePixels() {
+        val source = asset("title", 1, role = PhotoRole.TITLE_PAGE)
+        val pending = source.copy(processingRequest = processingRequest(source))
+        val disabled = source.copy(processingRequest = processingRequest(source, operations = emptyList()))
+        val corrected = pending.copy(display = pending.display.copy(
+            revision = pending.display.revision + 1,
+            sha256 = "c".repeat(64),
+        ))
+
+        assertTrue(photoPostProcessingPending(pending))
+        assertFalse(photoPostProcessingPending(disabled))
+        assertFalse(photoPostProcessingPending(corrected))
+    }
+
+    @Test
     fun sameRevisionReOcrReplacesGeometryFromTheSameProvider() {
         val oldGeometry = geometry("asset-1", 2)
         val newGeometry = oldGeometry.copy(regions = oldGeometry.regions.map {

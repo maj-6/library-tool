@@ -50,7 +50,28 @@ class ResourceContractTest {
         val source = File("src/main/java/org/whl/bookcapture/EntryDetailActivity.kt").readText()
         assertTrue(source.contains("BookDetailPresenter.from"))
         assertTrue(source.contains("entry.detailHeroPhoto()"))
+        assertTrue(source.contains("getString(R.string.detail_untitled)"))
+        assertFalse(source.contains("details.title.ifEmpty { Entries.titleLabel"))
         assertFalse(source.contains("Deepseek", ignoreCase = true))
+
+        val layoutSource = File("src/main/res/layout/activity_entry_detail.xml").readText()
+        val overview = layoutSource.indexOf("@+id/overviewSection")
+        val titlePage = layoutSource.indexOf("@+id/photoSection")
+        val otherDetails = layoutSource.indexOf("@+id/otherSection")
+        assertTrue("the title-page hero belongs directly below the overview", overview < titlePage)
+        assertTrue("the title-page hero must precede the compact details table", titlePage < otherDetails)
+    }
+
+    @Test
+    fun detailPhotosExposePendingCleanupOverlaysAndOriginalComparison() {
+        val source = File("src/main/java/org/whl/bookcapture/EntryDetailActivity.kt").readText()
+
+        assertTrue(source.contains("descriptor.postProcessingPending"))
+        assertTrue(source.contains("softenedThumbnail(decoded)"))
+        assertTrue(source.contains("val image = ZoomablePhotoView(this)"))
+        assertTrue(source.contains("applyOverlay(image, descriptor)"))
+        assertTrue(source.contains("photo.onOriginalHoldChanged"))
+        assertTrue(source.contains("descriptor.rawFile else descriptor.displayFile"))
     }
 
     @Test
@@ -71,14 +92,22 @@ class ResourceContractTest {
     }
 
     @Test
-    fun singleEntryDiscardRequiresExplicitConfirmation() {
+    fun bookDetailsDoNotExposeDiscardOrCaptureSourceActions() {
+        val detail = xml("src/main/res/layout/activity_entry_detail.xml")
         val source = File("src/main/java/org/whl/bookcapture/EntryDetailActivity.kt").readText()
 
-        assertTrue(source.contains("binding.discard.setOnClickListener { showDiscardConfirmation(entry) }"))
-        assertTrue(source.contains("MaterialAlertDialogBuilder(this)"))
-        assertTrue(source.contains("setNegativeButton(android.R.string.cancel, null)"))
-        assertTrue(source.contains("setPositiveButton(R.string.detail_discard_confirm)"))
-        assertTrue(source.contains("setTextColor(getColor(R.color.whl_red))"))
+        assertFalse(hasElementWithId(detail, "discard"))
+        assertFalse(hasElementWithId(detail, "provenanceSection"))
+        assertFalse(source.contains("showDiscardConfirmation"))
+        assertFalse(source.contains("renderProvenance"))
+
+        val overview = elementById(detail, "overviewSection")
+        val panel = overview.parentNode as Element
+        assertEquals("@style/WhlPanelSection", panel.getAttribute("style"))
+        assertTrue(
+            File("src/main/res/layout/activity_entry_detail.xml").readText()
+                .contains("@drawable/whl_detail_dotted_divider"),
+        )
     }
 
     @Test
@@ -108,11 +137,8 @@ class ResourceContractTest {
         val expected = mapOf(
             "src/main/res/layout/activity_home.xml" to
                 listOf(
-                    "btnSelect", "deleteSelected", "cancelSelection",
-                    "tabScans", "tabCollections",
+                    "deleteSelected", "cancelSelection", "tabScans", "tabCollections",
                 ),
-            "src/main/res/layout/activity_main.xml" to
-                listOf("btnSettings"),
         )
         for ((path, ids) in expected) {
             val layout = xml(path)
@@ -213,6 +239,7 @@ class ResourceContractTest {
     fun homeReachesSettingsThroughTheAppMarkNotAGear() {
         val home = xml("src/main/res/layout/activity_home.xml")
         assertNotNull(elementById(home, "appMenu"))
+        assertFalse(hasElementWithId(home, "btnSelect"))
         assertFalse(hasElementWithId(home, "btnSettings"))
         assertFalse(
             "the wordmark and the separate tab strip were folded into the toolbar",
@@ -290,7 +317,7 @@ class ResourceContractTest {
         assertEquals("inset", safeLayer.tagName)
         assertEquals("@drawable/ic_launcher_fg", safeLayer.getAttributeNS(androidNs, "drawable"))
         for (edge in listOf("insetLeft", "insetTop", "insetRight", "insetBottom")) {
-            assertEquals("14.5dp", safeLayer.getAttributeNS(androidNs, edge))
+            assertEquals("13.5dp", safeLayer.getAttributeNS(androidNs, edge))
         }
 
         val adaptive = xml("src/main/res/mipmap-anydpi-v26/ic_launcher.xml").documentElement
@@ -298,6 +325,14 @@ class ResourceContractTest {
         val monochrome = adaptive.getElementsByTagName("monochrome").item(0) as Element
         assertEquals("@drawable/ic_launcher_safe_fg", foreground.getAttributeNS(androidNs, "drawable"))
         assertEquals("@drawable/ic_launcher_safe_fg", monochrome.getAttributeNS(androidNs, "drawable"))
+        val background = adaptive.getElementsByTagName("background").item(0) as Element
+        assertEquals("@color/ic_launcher_bg", background.getAttributeNS(androidNs, "drawable"))
+
+        val theme = xml("src/main/res/values/themes.xml")
+        val launcherColor = (0 until theme.getElementsByTagName("color").length)
+            .map { theme.getElementsByTagName("color").item(it) as Element }
+            .first { it.getAttribute("name") == "ic_launcher_bg" }
+        assertEquals("#4A743A", launcherColor.textContent.trim())
 
         val legacy = xml("src/main/res/mipmap-anydpi/ic_launcher.xml")
         val legacyItems = legacy.getElementsByTagName("item")

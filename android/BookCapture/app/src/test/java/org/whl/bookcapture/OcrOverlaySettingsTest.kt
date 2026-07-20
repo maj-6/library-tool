@@ -1,10 +1,18 @@
 package org.whl.bookcapture
 
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertEquals
 import org.junit.Test
 import java.io.File
 
 class OcrOverlaySettingsTest {
+
+    @Test
+    fun overlayOutlineIsAtLeastTwoPhysicalPixels() {
+        assertEquals(2f, minimumOverlayStrokeWidthPx(.75f), 0f)
+        assertEquals(2f, minimumOverlayStrokeWidthPx(1f), 0f)
+        assertEquals(6f, minimumOverlayStrokeWidthPx(3f), 0f)
+    }
 
     @Test
     fun displaySettingsExposeGeometryVisibilityOpacityAndLabels() {

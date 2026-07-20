@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "revision": 3,
+  "strings": {
+    "app_name": "Library Tool Capture",
+    "home_new_scan": "New scan",
+    "home_tab_scans": "Scans",
+    "home_tab_collections": "Collections"
+  },
+  "icons": {
+    "appMenu": "../app/src/main/res/drawable-nodpi/ic_app_mark.png"
+  }
+}

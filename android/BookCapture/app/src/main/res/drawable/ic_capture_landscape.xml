@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="26dp"
+    android:height="26dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="@color/whl_button_text"
+        android:strokeWidth="1.8"
+        android:pathData="M3.5,7H20.5V17H3.5Z" />
+    <path
+        android:fillColor="@color/whl_button_text"
+        android:pathData="M18,5V2.8L19.4,4.2L20.8,2.8L18,0L15.2,2.8L16.6,4.2L18,2.8V5M6,19V21.2L4.6,19.8L3.2,21.2L6,24L8.8,21.2L7.4,19.8L6,21.2V19Z" />
+</vector>

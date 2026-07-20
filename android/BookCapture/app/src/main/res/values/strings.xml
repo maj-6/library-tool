@@ -1,37 +1,42 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Library Tool Capture</string>
-    <string name="app_wordmark">LIBRARY TOOL</string>
+    <string name="app_wordmark">Library Tool</string>
     <string name="settings_title">Library Tool Capture settings</string>
     <string name="navigate_up">Navigate up</string>
 
-    <string name="home_new_scan">New book scan</string>
+    <string name="home_new_scan">New scan</string>
 
     <!-- The app mark at the head of the toolbar is the menu; there is no gear. -->
     <string name="app_menu">Library Tool Capture menu</string>
     <string name="menu_settings">Settings</string>
     <string name="menu_about">About</string>
     <string name="menu_check_updates">Check for updates</string>
+    <string name="menu_sign_out">Sign out</string>
     <string name="about_title">Library Tool Capture</string>
-    <string name="about_body">Version %1$s\n\nThe phone half of Library Tool: photograph the pages of a book, and the desktop files it as a catalogued entry with its photos attached.</string>
-    <string name="about_close">CLOSE</string>
-    <string name="update_checking">Checking for updates…</string>
-    <string name="update_current">Library Tool Capture %1$s is the newest build.</string>
-    <string name="update_available_title">Update available</string>
-    <string name="update_available_body">Library Tool Capture %1$s is available. You have %2$s.</string>
-    <string name="update_download">DOWNLOAD</string>
-    <string name="update_failed">Could not check for updates. Check your connection and try again.</string>
-    <string name="update_not_configured">This build has no cloud project configured, so update checks are unavailable.</string>
-    <string name="update_no_browser">No app available to open the download link.</string>
-    <string name="home_empty">No books scanned yet.\nTap “New book scan” to photograph a book.</string>
-    <string name="home_select">SELECT</string>
+    <string name="about_version">Version %1$s</string>
+    <string name="about_icon_description">Library Tool Capture icon</string>
+    <string name="about_description_html">The phone companion for Library Tool: photograph a book, extract its catalog details, and send the capture to your library workflow. Read the &lt;a href="https://maj-6.github.io/library-tool/docs.html#capture"&gt;Android documentation&lt;/a&gt; on the Library Tool website.</string>
+    <string name="about_changelog_title">Changelog</string>
+    <string name="about_changelog_not_included">Changelog not included for this version</string>
+    <string name="about_close">Close</string>
+    <string name="update_checking">Syncing icons and interface text…</string>
+    <string name="update_resources_current">Icons and interface text are up to date.</string>
+    <string name="update_resources_updated">Icons and interface text updated.</string>
+    <string name="update_failed">Could not refresh icons and interface text. Check your connection and try again.</string>
+    <string name="update_not_configured">This build has no cloud project configured, so remote interface sync is unavailable.</string>
+    <string name="home_empty">No scans</string>
     <string name="home_select_scan">Select book scan</string>
+    <string name="home_open_details">Open book details</string>
     <plurals name="home_selected_count">
         <item quantity="one">%1$d selected</item>
         <item quantity="other">%1$d selected</item>
     </plurals>
-    <string name="home_delete_selected">DELETE</string>
-    <string name="home_cancel_select">CANCEL</string>
+    <string name="home_delete_selected">Delete</string>
+    <string name="home_cancel_select">Cancel</string>
+    <string name="home_status_waiting">Waiting</string>
+    <string name="home_status_uploaded">Uploaded</string>
+    <string name="home_status_imported">Imported</string>
     <string name="home_delete_title">Delete selected book scans?</string>
     <string name="home_delete_active_skipped">The active book scan was kept. Discard it from the camera screen.</string>
     <string name="home_delete_failed">Some book scans could not be deleted and remain on this device. Free storage and try again.</string>
@@ -46,26 +51,30 @@
 
     <!-- Collections: the batch a book is scanned into, and where that batch
          came from. A collection must be chosen before a book scan can start. -->
-    <string name="home_tab_scans">SCANS</string>
-    <string name="home_tab_collections">COLLECTIONS</string>
+    <string name="home_tab_scans">Scans</string>
+    <string name="home_tab_collections">Collections</string>
     <string name="collections_new">New collection</string>
-    <string name="collections_edit">EDIT</string>
-    <string name="collections_delete">DELETE</string>
+    <string name="collections_edit">Edit</string>
+    <string name="collections_delete">Delete</string>
     <string name="collections_edit_description">Edit %1$s</string>
     <string name="collections_delete_description">Delete %1$s</string>
     <string name="collections_cancel_edit_description">Cancel collection changes</string>
     <string name="collections_save_edit_description">Save collection</string>
-    <string name="collections_empty">No collections yet.\nA collection is a batch of books — a shelf, a crate, a room — and where it came from.\nTap “New collection” to make the first one.</string>
+    <string name="collections_empty">No collections</string>
     <string name="collections_add_title">New collection</string>
     <string name="collections_edit_title">Edit collection</string>
     <string name="collections_field_name">Collection</string>
+    <string name="collections_field_parent">Parent</string>
+    <string name="collections_parent_none">No parent</string>
+    <string name="collections_parent_unavailable">Unavailable parent</string>
     <string name="collections_field_from">From</string>
     <string name="collections_hint_name">Blue crate</string>
     <string name="collections_hint_from">Storage</string>
     <string name="collections_from_help">Every book scanned into this collection records this as where it came from. A single book can be changed afterwards.</string>
-    <string name="collections_save">SAVE</string>
+    <string name="collections_save">Save</string>
     <string name="collections_error_name_required">Give the collection a name.</string>
     <string name="collections_error_name_taken">There is already a collection with that name.</string>
+    <string name="collections_error_parent_invalid">Choose a valid parent collection.</string>
     <string name="collections_error_missing">That collection no longer exists.</string>
     <string name="collections_error_save">The collection could not be saved. Free storage and try again.</string>
     <string name="collections_delete_title">Delete this collection?</string>
@@ -74,7 +83,7 @@
     <string name="collections_current">Scanning into %1$s</string>
     <string name="collections_current_state">Current collection</string>
     <string name="collections_current_from">Scanning into %1$s · from %2$s</string>
-    <string name="collections_none_selected">No collection chosen — tap to pick where these books came from</string>
+    <string name="collections_none_selected">No collection selected</string>
     <string name="collections_choose_first">Choose a collection before scanning a book.</string>
     <string name="collections_row_from">from %1$s</string>
     <string name="collections_row_no_from">no origin recorded</string>
@@ -93,7 +102,7 @@
     <string name="home_group_collapse">%1$s, %2$s. Collapse group</string>
 
     <string name="detail_from">From</string>
-    <string name="detail_from_edit">CHANGE</string>
+    <string name="detail_from_edit">Change</string>
     <string name="detail_from_description">From %1$s</string>
     <string name="detail_from_title">Where did this book come from?</string>
     <string name="detail_from_hint">Storage</string>
@@ -102,10 +111,10 @@
     <string name="detail_from_failed">The origin could not be changed. Free storage and try again.</string>
     <string name="detail_from_none">—</string>
 
-    <string name="entry_idle">IDLE</string>
-    <string name="entry_active">OPEN (%1$d)</string>
+    <string name="entry_idle">Idle</string>
+    <string name="entry_active">Open (%1$d)</string>
     <string name="capture_last_book_label">Last captured book</string>
-    <string name="capture_last_book_empty">No book sent for processing yet</string>
+    <string name="capture_last_book_empty">No recent scan</string>
     <string name="capture_last_book_title_missing">Title not detected</string>
     <string name="capture_last_book_field_missing">Not detected</string>
     <string name="capture_last_book_author">Author: %1$s</string>
@@ -113,6 +122,7 @@
     <string name="capture_last_book_year">Year: %1$s</string>
     <string name="capture_last_book_year_empty">Year: —</string>
     <string name="capture_last_book_description">Open last captured book. Title: %1$s. Author: %2$s. Year: %3$s.</string>
+    <string name="capture_last_book_thumbnail_description">Thumbnail for %1$s</string>
     <string name="capture_extra_fields_title">Extra fields</string>
     <string name="capture_extra_field_description">%1$s: %2$s</string>
     <string name="capture_extra_fields_count">(%1$d)</string>
@@ -126,14 +136,14 @@
         <item quantity="one">%1$d book scan needs attention — %2$s — check settings (⚙)</item>
         <item quantity="other">%1$d book scans need attention — %2$s — check settings (⚙)</item>
     </plurals>
-    <string name="not_signed_in">Local mode — books stay on this phone; paired LAN delivery still works. Tap to sign in for cloud sync.</string>
+    <string name="not_signed_in">Local mode</string>
     <string name="need_permissions">Camera permission is required to photograph pages.</string>
     <string name="voice_permission_denied">Voice control is off because microphone access was not granted. Camera buttons still work.</string>
     <string name="capture_note_permission_denied">A microphone is required to dictate notes. Page capture still works.</string>
     <string name="model_download_failed">Voice model download failed: %1$s (buttons still work)</string>
 
     <!-- Capture controls; the words live in the content descriptions. -->
-    <string name="cmd_start">Start new book scan</string>
+    <string name="cmd_start">Start new scan</string>
     <string name="cmd_photo">Take page photo</string>
     <string name="cmd_done">Finish book scan</string>
     <string name="cmd_cancel">Discard book scan</string>
@@ -173,28 +183,57 @@
     <string name="capture_waiting_undo">Undoing after the active capture…</string>
     <string name="capture_discard_title">Discard this book scan?</string>
     <string name="capture_discard_message">This removes the current local scan and its page photos from the capture queue. You can undo immediately after discarding.</string>
-    <string name="capture_discard_confirm">DISCARD</string>
+    <string name="capture_discard_confirm">Discard</string>
     <string name="discarded">Book scan discarded</string>
-    <string name="undo">UNDO</string>
+    <string name="undo">Undo</string>
     <string name="undo_unavailable">Too late to undo — the discard was already cleared.</string>
     <string name="open_settings">Open settings</string>
     <string name="gear">⚙</string>
+    <string name="camera_settings_open">Open camera and scan settings</string>
+    <string name="camera_settings_title">Camera and scan settings</string>
+    <string name="camera_settings_starting">Camera controls will be available when the preview is ready.</string>
+    <string name="camera_settings_focus_heading">Focus</string>
+    <string name="camera_settings_focus_lock">Lock focus</string>
+    <string name="camera_settings_focus_hint">Tap the camera preview to choose a focus point.</string>
+    <string name="camera_settings_focus_unavailable">Unavailable</string>
+    <string name="camera_settings_focus_locked">Locked</string>
+    <string name="camera_settings_focus_auto">Automatic</string>
+    <string name="camera_focus_locked_status">Focus locked.</string>
+    <string name="camera_focus_set_status">Focus set.</string>
+    <string name="camera_focus_failed_status">This camera could not focus at that point.</string>
+    <string name="camera_settings_zoom">Zoom</string>
+    <string name="camera_settings_zoom_value">Zoom: %1$.1fx</string>
+    <string name="camera_settings_zoom_default">Zoom: 1.0x</string>
+    <string name="camera_settings_zoom_unavailable">Zoom: fixed</string>
+    <string name="camera_settings_exposure">Exposure compensation</string>
+    <string name="camera_settings_exposure_value">Exposure: %1$+.1f EV</string>
+    <string name="camera_settings_exposure_default">Exposure: +0.0 EV</string>
+    <string name="camera_settings_exposure_unavailable">Exposure: unavailable</string>
+    <string name="camera_settings_continuous_light">Continuous light</string>
+    <string name="camera_settings_light_unavailable">Continuous light unavailable</string>
+    <string name="camera_settings_scan_heading">Scan quality</string>
+    <string name="camera_settings_scope_note">These controls affect only the camera and new page scans. General app settings remain in the app menu.</string>
+    <string name="camera_settings_reset">Reset</string>
+    <string name="camera_orientation_portrait">Capture portrait pages; switch to landscape</string>
+    <string name="camera_orientation_landscape">Capture landscape pages; switch to portrait</string>
+    <string name="camera_orientation_portrait_status">Portrait page framing</string>
+    <string name="camera_orientation_landscape_status">Landscape page framing</string>
 
     <string name="login_sub">sign in for cloud sync, or continue locally</string>
     <string name="login_email">Email</string>
     <string name="login_password">Password</string>
-    <string name="login_sign_in">SIGN IN</string>
-    <string name="login_continue_local">CONTINUE WITHOUT AN ACCOUNT</string>
+    <string name="login_sign_in">Sign in</string>
+    <string name="login_continue_local">Continue without an account</string>
     <string name="login_missing">email and password, both</string>
     <string name="login_working">Signing in…</string>
     <string name="login_failed">sign-in failed</string>
 
     <string name="set_account">Account</string>
-    <string name="set_display_name">Display name (contributor credit)</string>
-    <string name="set_sign_out">SIGN OUT</string>
-    <string name="set_sign_in">SIGN IN</string>
+    <string name="set_display_name">Display name</string>
+    <string name="set_sign_out">Sign out</string>
+    <string name="set_sign_in">Sign in</string>
     <string name="set_local_mode">Not signed in · local and paired-LAN mode</string>
-    <string name="device_name">Device name (shown on imported books)</string>
+    <string name="device_name">Device name</string>
     <string name="set_display">Display</string>
     <string name="set_compact_scan_list">Compact scan list</string>
     <string name="set_compact_scan_list_note">Uses smaller thumbnails and tighter spacing on the Scans tab.</string>
@@ -219,12 +258,13 @@
     <string name="set_post_processing_spine_crop">Detect and crop book spines</string>
     <string name="set_camera">Camera</string>
     <string name="set_capture_profile">Capture profile</string>
-    <string name="set_camera_fast">Fast — lower latency, about 1600 x 1200</string>
-    <string name="set_camera_detail">More detail — about 2048 x 1536</string>
+    <string name="set_camera_low">Low resolution</string>
+    <string name="set_camera_fast">Fast</string>
+    <string name="set_camera_detail">More detail</string>
     <string name="set_continuous_light">Continuous light</string>
-    <string name="set_sharpen">Preview sharpening — display only</string>
+    <string name="set_sharpen">Preview sharpening</string>
     <string name="set_sharpen_note">Changes only the live preview, not saved photos or OCR. Android 13+ only.</string>
-    <string name="set_camera_reset">RESET CAMERA DEFAULTS</string>
+    <string name="set_camera_reset">Reset camera defaults</string>
     <string name="set_camera_diagnostics">Camera diagnostics</string>
     <string name="set_camera_diagnostics_unavailable">Available after the camera starts.</string>
     <string name="set_voice">Voice control</string>
@@ -237,7 +277,7 @@
     <string name="lan_host">Desktop address</string>
     <string name="lan_host_hint">192.168.1.5:8899</string>
     <string name="lan_token">Pairing token</string>
-    <string name="lan_test">TEST LAN</string>
+    <string name="lan_test">Test LAN</string>
     <string name="lan_note">LAN sends captures straight to a paired desktop over the local network — works offline (e.g. a hotspot). Find the address and token in the desktop app.</string>
     <string name="lan_ok">OK — paired desktop authorized</string>
     <string name="lan_unreachable">No desktop at that address</string>
@@ -248,8 +288,8 @@
     <string name="set_deepseek">DeepSeek API key</string>
     <string name="set_extraction_instructions">Custom extraction instructions</string>
     <string name="set_extraction_instructions_hint">Optional cataloging guidance applied to new and retried scans</string>
-    <string name="save">SAVE</string>
-    <string name="test_connection">TEST</string>
+    <string name="save">Save</string>
+    <string name="test_connection">Test</string>
     <string name="testing">Testing…</string>
     <string name="connection_ok">OK — signed in, captures reachable</string>
     <string name="connection_requires_sign_in">Cloud connection testing requires sign-in. Local capture and paired LAN remain available.</string>
@@ -262,6 +302,7 @@
 
     <string name="detail_photos">Page photos</string>
     <string name="detail_title">Book details</string>
+    <string name="detail_untitled">Untitled book</string>
     <string name="detail_overview">Overview</string>
     <string name="detail_capture_source">Capture source</string>
     <string name="detail_other_details">Other details</string>
@@ -272,26 +313,28 @@
     <string name="detail_page_number">Page %1$d</string>
     <string name="detail_suggested_role">Suggested %1$s</string>
     <string name="detail_photo_description">Page photo %1$d</string>
+    <string name="detail_photo_pending_description">Page photo %1$d. Display cleanup is pending.</string>
+    <string name="detail_cleanup_pending">%1$s · cleanup pending</string>
     <string name="detail_ocr">OCR text</string>
     <string name="detail_expand_ocr">Expand OCR text</string>
     <string name="detail_collapse_ocr">Collapse OCR text</string>
     <string name="detail_original">Original</string>
     <string name="detail_processed">Processed</string>
     <string name="detail_compare_description">Compare processed photo with the camera original</string>
-    <string name="detail_discard">DISCARD BOOK</string>
+    <string name="detail_discard">Discard book</string>
     <string name="detail_discard_title">Discard this book scan?</string>
     <string name="detail_discard_message">This permanently deletes the local book scan and its page photos.</string>
-    <string name="detail_discard_confirm">DISCARD</string>
+    <string name="detail_discard_confirm">Discard</string>
     <string name="detail_discard_active">Return to the camera to discard the active book scan.</string>
     <string name="detail_discard_uploaded">This book finished uploading while the dialog was open. Its cloud copy was preserved.</string>
     <string name="detail_delete_failed">Could not delete this book scan. It remains on this device; free storage and try again.</string>
-    <string name="detail_claim_cloud">CLAIM FOR CLOUD</string>
+    <string name="detail_claim_cloud">Claim for cloud</string>
     <string name="detail_local_claim_available">This local book can use paired LAN now, or be explicitly claimed by your signed-in account for cloud upload.</string>
     <string name="detail_local_sign_in_to_claim">This local book can use paired LAN. Sign in before claiming it for cloud upload.</string>
     <string name="detail_different_account">This book belongs to a different account and will remain on this phone.</string>
     <string name="detail_claim_title">Claim this local book?</string>
     <string name="detail_claim_message">Cloud upload will permanently associate this book scan with %1$s.</string>
-    <string name="detail_claim_confirm">CLAIM &amp; UPLOAD</string>
+    <string name="detail_claim_confirm">Claim and upload</string>
     <string name="detail_claim_queued">Book claimed. Cloud upload is queued.</string>
     <string name="detail_no_ocr">(no OCR text yet)</string>
     <string name="detail_diagnostics">Book data</string>
@@ -310,5 +353,5 @@
     <string name="detail_mistral_extraction_heading">Bibliographic extraction response</string>
     <string name="expanded">Expanded</string>
     <string name="collapsed">Collapsed</string>
-    <string name="close">CLOSE</string>
+    <string name="close">Close</string>
 </resources>

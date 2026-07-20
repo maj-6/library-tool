@@ -49,6 +49,81 @@ class HomeListPresentationTest {
     }
 
     @Test
+    fun collectionLabelsIncludeLiteralAndNestedParentLocations() {
+        val paths = collectionDisplayPaths(
+            listOf(
+                BookCollection("building", "Building", "Campus"),
+                BookCollection("office", "Office", "Annex", parentId = "building"),
+                BookCollection("periodicals", "Periodicals", "Storage", parentId = "office"),
+                BookCollection("drawer", "Loose leaves", "Archive > Drawer 4"),
+            ),
+        )
+
+        assertEquals("Campus > Building", paths["building"])
+        assertEquals("Campus > Building > Office", paths["office"])
+        assertEquals("Campus > Building > Office > Periodicals", paths["periodicals"])
+        assertEquals("Archive > Drawer 4 > Loose leaves", paths["drawer"])
+        assertEquals(
+            "Office > Periodicals",
+            collectionDisplayLabel("Office", "Periodicals"),
+        )
+    }
+
+    @Test
+    fun missingParentsAndCyclesProduceFiniteUsefulPaths() {
+        val paths = collectionDisplayPaths(
+            listOf(
+                BookCollection("a", "Alpha", "", parentId = "b"),
+                BookCollection("b", "Beta", "", parentId = "a"),
+                BookCollection("self", "Self", "Offsite", parentId = "self"),
+                BookCollection("missing", "Pamphlets", "Offsite", parentId = "gone"),
+                BookCollection("deleted", "Archive", "", deleted = true),
+                BookCollection("child", "Maps", "Offsite", parentId = "deleted"),
+            ),
+        )
+
+        assertEquals("Beta > Alpha", paths["a"])
+        assertEquals("Alpha > Beta", paths["b"])
+        assertEquals("Self", paths["self"])
+        assertEquals("Pamphlets", paths["missing"])
+        assertEquals("Maps", paths["child"])
+        assertEquals("Archive", paths["deleted"])
+    }
+
+    @Test
+    fun physicalLocationIsNeverInferredAsAParentIdentity() {
+        val paths = collectionDisplayPaths(
+            listOf(
+                BookCollection("building", "Building", ""),
+                BookCollection("office", "Office", "", parentId = "building"),
+                BookCollection("periodicals", "Periodicals", "Office"),
+            ),
+        )
+
+        assertEquals("Building > Office", paths["office"])
+        assertEquals("Office > Periodicals", paths["periodicals"])
+    }
+
+    @Test
+    fun mergedParentIdentityFollowsItsLiveSurvivor() {
+        val paths = collectionDisplayPaths(
+            listOf(
+                BookCollection("office", "Office", ""),
+                BookCollection(
+                    "old-office",
+                    "Old office",
+                    "",
+                    deleted = true,
+                    mergedInto = "office",
+                ),
+                BookCollection("periodicals", "Periodicals", "", parentId = "old-office"),
+            ),
+        )
+
+        assertEquals("Office > Periodicals", paths["periodicals"])
+    }
+
+    @Test
     fun initialExpansionPrefersCurrentThenNewestAvailableGroup() {
         val grouped = groups(
             listOf(Scan("a", "a", "A"), Scan("b", "b", "B")),
@@ -71,5 +146,70 @@ class HomeListPresentationTest {
         assertTrue(compact.thumbnailWidthDp.toDouble() / standard.thumbnailWidthDp in 0.84..0.86)
         assertTrue(compact.thumbnailHeightDp.toDouble() / standard.thumbnailHeightDp in 0.84..0.86)
         assertTrue(compact.rowVerticalPaddingDp.toDouble() / standard.rowVerticalPaddingDp in 0.75..0.82)
+    }
+
+    @Test
+    fun regularTapReplacesAnyExistingSelectionWithOneScan() {
+        val selected = linkedSetOf("one", "two")
+
+        assertEquals(linkedSetOf("three"), replaceScanSelection(selected, "three"))
+        assertEquals(linkedSetOf("one", "two"), selected)
+    }
+
+    @Test
+    fun longPressTogglesOneScanWithoutClearingOtherSelections() {
+        assertEquals(
+            linkedSetOf("one", "two", "three"),
+            toggleScanSelectionAdditively(linkedSetOf("one", "two"), "three"),
+        )
+        assertEquals(
+            linkedSetOf("two"),
+            toggleScanSelectionAdditively(linkedSetOf("one", "two"), "one"),
+        )
+    }
+
+    @Test
+    fun completeTextIsSuppressedAndDeliveryUsesACloudIcon() {
+        assertEquals(HomeStatusPresentation(), homeStatusPresentation("complete"))
+        assertEquals(
+            HomeStatusAdornment.UPLOADED,
+            homeStatusPresentation("complete · uploaded").adornment,
+        )
+        assertEquals("", homeStatusPresentation("complete · uploaded").text)
+        assertEquals(
+            HomeStatusAdornment.UPLOADED,
+            homeStatusPresentation("imported").adornment,
+        )
+    }
+
+    @Test
+    fun pendingWorkUsesTheAnimatedWaitingAdornmentWithoutPendingText() {
+        for (status in listOf(
+            "waiting",
+            "processing",
+            "complete · pending upload",
+            "complete · pending delivery",
+            "complete · claim for cloud",
+        )) {
+            val presentation = homeStatusPresentation(status)
+            assertEquals(status, HomeStatusAdornment.WAITING, presentation.adornment)
+            assertEquals(status, "", presentation.text)
+        }
+        assertEquals(
+            "different account",
+            homeStatusPresentation("complete · different account").text,
+        )
+    }
+
+    @Test
+    fun aboutChangelogMarkdownIsCompactAndReadable() {
+        val rendered = formatChangelogForAbout(
+            "# Android Changelog\n\n## 0.5.1\n\n### Fixes\n\n- One\n- Two",
+        )
+
+        assertEquals(
+            "Android Changelog\n\n0.5.1\n\nFixes\n\n• One\n• Two",
+            rendered,
+        )
     }
 }

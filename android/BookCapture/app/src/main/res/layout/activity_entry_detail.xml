@@ -121,80 +121,38 @@
                     android:textAllCaps="false"
                     android:textSize="12sp"
                     android:visibility="gone" />
-            </LinearLayout>
-
-            <LinearLayout
-                android:id="@+id/overviewSection"
-                style="@style/WhlPanelSection"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="vertical"
-                android:visibility="gone">
-
-                <TextView
-                    style="@style/WhlLabel"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="@string/detail_overview"
-                    android:textAllCaps="false" />
-
-                <TextView
-                    android:id="@+id/overviewText"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="7dp"
-                    android:lineSpacingExtra="3dp"
-                    android:textColor="@color/whl_ink"
-                    android:textIsSelectable="true"
-                    android:textSize="14sp" />
-            </LinearLayout>
-
-            <LinearLayout
-                android:id="@+id/provenanceSection"
-                style="@style/WhlPanelSection"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="vertical"
-                android:visibility="gone">
-
-                <TextView
-                    style="@style/WhlLabel"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="@string/detail_capture_source"
-                    android:textAllCaps="false" />
 
                 <LinearLayout
-                    android:id="@+id/provenanceFields"
+                    android:id="@+id/overviewSection"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="5dp"
-                    android:orientation="vertical" />
-            </LinearLayout>
-
-            <LinearLayout
-                android:id="@+id/otherSection"
-                style="@style/WhlPanelSection"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="vertical"
-                android:visibility="gone">
-
-                <TextView
-                    style="@style/WhlLabel"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="@string/detail_other_details"
-                    android:textAllCaps="false" />
-
-                <LinearLayout
-                    android:id="@+id/otherFields"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="5dp"
-                    android:divider="@drawable/whl_table_divider"
+                    android:layout_marginTop="12dp"
                     android:orientation="vertical"
-                    android:showDividers="middle" />
+                    android:visibility="gone">
+
+                    <View
+                        android:layout_width="match_parent"
+                        android:layout_height="1dp"
+                        android:layout_marginBottom="12dp"
+                        android:background="@drawable/whl_detail_dotted_divider" />
+
+                    <TextView
+                        style="@style/WhlLabel"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="@string/detail_overview"
+                        android:textAllCaps="false" />
+
+                    <TextView
+                        android:id="@+id/overviewText"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="7dp"
+                        android:lineSpacingExtra="3dp"
+                        android:textColor="@color/whl_ink"
+                        android:textIsSelectable="true"
+                        android:textSize="14sp" />
+                </LinearLayout>
             </LinearLayout>
 
             <LinearLayout
@@ -269,6 +227,31 @@
             </LinearLayout>
 
             <LinearLayout
+                android:id="@+id/otherSection"
+                style="@style/WhlPanelSection"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:visibility="gone">
+
+                <TextView
+                    style="@style/WhlLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/detail_other_details"
+                    android:textAllCaps="false" />
+
+                <LinearLayout
+                    android:id="@+id/otherFields"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="5dp"
+                    android:divider="@drawable/whl_table_divider"
+                    android:orientation="vertical"
+                    android:showDividers="middle" />
+            </LinearLayout>
+
+            <LinearLayout
                 style="@style/WhlPanelSection"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -297,21 +280,6 @@
                     android:textSize="11sp"
                     android:visibility="gone" />
             </LinearLayout>
-
-            <Button
-                android:id="@+id/discard"
-                style="@style/WhlButton"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_gravity="end"
-                android:layout_marginTop="12dp"
-                android:paddingStart="14dp"
-                android:paddingEnd="14dp"
-                android:text="@string/detail_discard"
-                android:textAllCaps="false"
-                android:textColor="@color/whl_button_text"
-                android:textSize="12sp"
-                android:visibility="gone" />
 
             <LinearLayout
                 style="@style/WhlPanelSection"

@@ -9,6 +9,71 @@ internal data class ScanCollectionGroup<T>(
 
 internal const val UNFILED_SCAN_GROUP = "__unfiled__"
 
+private const val COLLECTION_PATH_SEPARATOR = " > "
+
+/**
+ * Render legacy frozen provenance that has no durable parent id. The physical
+ * source is only a root prefix; it is never resolved as collection identity.
+ */
+internal fun collectionDisplayLabel(parentLocation: String, collectionName: String): String {
+    val name = collectionName.trim()
+    if (name.isEmpty()) return ""
+    val parent = parentLocation.trim()
+    return if (parent.isEmpty() || parent.equals(name, ignoreCase = true)) name
+    else "$parent$COLLECTION_PATH_SEPARATOR$name"
+}
+
+/**
+ * Build root-to-leaf labels from durable [BookCollection.parentId] edges. A
+ * root collection may prefix its physical [BookCollection.from] location, but
+ * a nested collection's physical provenance is not part of its identity path.
+ *
+ * Missing or ordinarily deleted parents stop the path. A merged parent follows
+ * its durable survivor marker. Self-references and cycles stop at the first
+ * repeated id, so malformed synced data can never hang the Home screen.
+ */
+internal fun collectionDisplayPaths(
+    collections: List<BookCollection>,
+): Map<String, String> {
+    val byId = collections.associateBy { it.id }
+    val displayable = collections.filter { it.mergedInto == null }
+    return displayable.associate { collection ->
+        val ancestors = mutableListOf(collection.name.trim())
+        val visited = mutableSetOf(collection.id)
+        var cursor = collection
+        var reachedRoot = false
+        while (true) {
+            var nextId = cursor.parentId?.trim()?.ifEmpty { null }
+            if (nextId == null) {
+                reachedRoot = true
+                break
+            }
+            var parent: BookCollection? = null
+            while (nextId != null) {
+                if (!visited.add(nextId)) break
+                val candidate = byId[nextId] ?: break
+                if (!candidate.deleted && candidate.mergedInto == null) {
+                    parent = candidate
+                    break
+                }
+                nextId = candidate.mergedInto?.trim()?.ifEmpty { null }
+            }
+            if (parent == null) break
+            ancestors += parent.name.trim()
+            cursor = parent
+        }
+        if (reachedRoot) {
+            val rootLocation = cursor.from.trim()
+            if (rootLocation.isNotEmpty() &&
+                !rootLocation.equals(ancestors.last(), ignoreCase = true)
+            ) {
+                ancestors += rootLocation
+            }
+        }
+        collection.id to ancestors.asReversed().joinToString(COLLECTION_PATH_SEPARATOR)
+    }
+}
+
 /**
  * Group scans by their frozen collection provenance. The current collection is
  * placed first without disturbing the newest-first ordering of any other group.
@@ -67,3 +132,85 @@ private val COMPACT_SCAN_LIST_METRICS = ScanListLayoutMetrics(39, 51, 7, 9)
 
 internal fun scanListLayoutMetrics(compact: Boolean): ScanListLayoutMetrics =
     if (compact) COMPACT_SCAN_LIST_METRICS else STANDARD_SCAN_LIST_METRICS
+
+/** A regular row tap always replaces the selection with that one scan. */
+internal fun replaceScanSelection(
+    current: Collection<String>,
+    id: String,
+): LinkedHashSet<String> = LinkedHashSet(current).apply {
+    clear()
+    add(id)
+}
+
+/** A long press changes one member without clearing the rest of the selection. */
+internal fun toggleScanSelectionAdditively(
+    current: Collection<String>,
+    id: String,
+): LinkedHashSet<String> = LinkedHashSet(current).apply {
+    if (!add(id)) remove(id)
+}
+
+internal enum class HomeStatusAdornment { NONE, WAITING, UPLOADED }
+
+/**
+ * The colored marker carries the successful/complete state. Keep row chrome
+ * quiet by reserving text for actionable exceptions, a spinner for work that
+ * has not settled, and a cloud-check glyph for delivered books.
+ */
+internal data class HomeStatusPresentation(
+    val text: String = "",
+    val adornment: HomeStatusAdornment = HomeStatusAdornment.NONE,
+    val accessibilityLabel: String = "",
+)
+
+internal fun homeStatusPresentation(rawStatus: String): HomeStatusPresentation {
+    val status = rawStatus.trim().lowercase()
+    val withoutComplete = status.removePrefix("complete · ").trim()
+    return when {
+        withoutComplete == "uploaded" || withoutComplete == "imported" ->
+            HomeStatusPresentation(
+                adornment = HomeStatusAdornment.UPLOADED,
+                accessibilityLabel = withoutComplete,
+            )
+        withoutComplete == "waiting" || withoutComplete == "processing" ||
+            withoutComplete.startsWith("pending ") ||
+            withoutComplete == "claim for cloud" ->
+            HomeStatusPresentation(
+                adornment = HomeStatusAdornment.WAITING,
+                accessibilityLabel = "waiting",
+            )
+        withoutComplete == "pending" ->
+            HomeStatusPresentation(
+                adornment = HomeStatusAdornment.WAITING,
+                accessibilityLabel = "waiting",
+            )
+        withoutComplete.startsWith("capturing · waiting") ||
+            withoutComplete.startsWith("capturing · processing") ->
+            HomeStatusPresentation(
+                text = "capturing",
+                adornment = HomeStatusAdornment.WAITING,
+                accessibilityLabel = withoutComplete,
+            )
+        status == "complete" -> HomeStatusPresentation()
+        else -> HomeStatusPresentation(
+            text = withoutComplete,
+            accessibilityLabel = withoutComplete,
+        )
+    }
+}
+
+/** A small, dependency-free Markdown projection for the About dialog. */
+internal fun formatChangelogForAbout(markdown: String): String = markdown
+    .lineSequence()
+    .map { line ->
+        when {
+            line.startsWith("### ") -> line.removePrefix("### ")
+            line.startsWith("## ") -> line.removePrefix("## ")
+            line.startsWith("# ") -> line.removePrefix("# ")
+            line.startsWith("- ") -> "\u2022 ${line.removePrefix("- ")}"
+            else -> line
+        }
+    }
+    .joinToString("\n")
+    .replace(Regex("\n{3,}"), "\n\n")
+    .trim()

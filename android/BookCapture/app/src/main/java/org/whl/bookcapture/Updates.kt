@@ -1,9 +1,7 @@
 package org.whl.bookcapture
 
 import android.content.Context
-import org.json.JSONArray
-import java.net.HttpURLConnection
-import java.net.URL
+import java.io.IOException
 
 /** A published build of the app, as the cloud `releases` table records it. */
 data class Release(val version: String, val channel: String, val url: String, val notes: String)
@@ -86,63 +84,30 @@ internal fun pickUpdate(currentVersion: String, releases: List<Release>): Releas
  * is the last thing that should require an account.
  */
 object Updates {
-    private const val LIMIT = 30
-
     /**
-     * Outcome of a check. [NotConfigured] is a distinct case on purpose: a
-     * from-source APK ships blank Supabase defaults, and reporting that as
-     * "you have the newest build" would be a confident lie about a check that
-     * never ran.
+     * "Check for updates" is intentionally overloaded as a remote interface
+     * resource sync while APK distribution is not certified. The semantic
+     * release helpers above remain for the eventual installer, but this path
+     * must not offer or install an APK yet.
      */
     sealed interface Result {
-        data class Available(val release: Release) : Result
-        object UpToDate : Result
+        object UiUpdated : Result
+        object UiCurrent : Result
         object NotConfigured : Result
     }
 
+    internal fun resultFor(refresh: RemoteUiCatalog.Refresh): Result = when (refresh) {
+        RemoteUiCatalog.Refresh.CHANGED -> Result.UiUpdated
+        RemoteUiCatalog.Refresh.UNCHANGED -> Result.UiCurrent
+        RemoteUiCatalog.Refresh.EMPTY ->
+            throw IOException("the remote interface catalog is empty")
+    }
+
     /** Network call — must not run on the main thread. Throws on failure. */
-    fun check(ctx: Context, currentVersion: String = BuildConfig.VERSION_NAME): Result {
+    fun check(ctx: Context): Result {
         val base = Prefs.supabaseUrl(ctx)
         val key = Prefs.anonKey(ctx)
         if (base.isEmpty() || key.isEmpty()) return Result.NotConfigured
-        val found = latest(ctx, currentVersion, base, key)
-        return if (found == null) Result.UpToDate else Result.Available(found)
-    }
-
-    private fun latest(
-        ctx: Context,
-        currentVersion: String,
-        base: String,
-        key: String,
-    ): Release? {
-        val url = "$base/rest/v1/releases?platform=eq.android" +
-            "&select=version,channel,url,notes&order=published_at.desc&limit=$LIMIT"
-        val conn = URL(url).openConnection() as HttpURLConnection
-        conn.requestMethod = "GET"
-        conn.connectTimeout = 15_000
-        conn.readTimeout = 20_000
-        conn.setRequestProperty("apikey", key)
-        conn.setRequestProperty("Authorization", "Bearer $key")
-        val body = try {
-            val code = conn.responseCode
-            // A refusal is a failed check, not an absence of updates — let it
-            // surface as an error rather than a reassuring "you're current".
-            if (code !in 200..299) throw java.io.IOException("releases: HTTP $code")
-            conn.inputStream.use { it.readBytes().decodeToString() }
-        } finally {
-            conn.disconnect()
-        }
-        val array = JSONArray(body)
-        val releases = (0 until array.length()).mapNotNull { i ->
-            val row = array.optJSONObject(i) ?: return@mapNotNull null
-            val version = row.optString("version").trim()
-            if (version.isEmpty()) null else Release(
-                version = version,
-                channel = row.optString("channel").trim().ifEmpty { "stable" },
-                url = row.optString("url").trim(),
-                notes = row.optString("notes").trim(),
-            )
-        }
-        return pickUpdate(currentVersion, releases)
+        return resultFor(RemoteUiCatalog.refresh(ctx, base, key))
     }
 }

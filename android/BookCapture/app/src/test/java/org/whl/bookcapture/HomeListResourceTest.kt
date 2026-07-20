@@ -47,13 +47,11 @@ class HomeListResourceTest {
     fun collectionEditorUsesContentForValuesAndIconActions() {
         val dialog = xml("src/main/res/layout/dialog_collection.xml")
         assertEquals(
-            "@string/collections_hint_name",
-            elementById(dialog, "collectionName").getAttributeNS(androidNs, "hint"),
+            "androidx.appcompat.widget.AppCompatSpinner",
+            elementById(dialog, "collectionParent").tagName,
         )
-        assertEquals(
-            "@string/collections_hint_from",
-            elementById(dialog, "collectionFrom").getAttributeNS(androidNs, "hint"),
-        )
+        assertFalse(elementById(dialog, "collectionName").hasAttributeNS(androidNs, "hint"))
+        assertFalse(elementById(dialog, "collectionFrom").hasAttributeNS(androidNs, "hint"))
         for ((id, icon) in listOf(
             "cancelCollectionEdit" to "@drawable/ic_cancel",
             "saveCollectionEdit" to "@drawable/ic_done",
@@ -66,6 +64,10 @@ class HomeListResourceTest {
         val source = source("HomeActivity")
         assertTrue(source.contains("nameField.setText(existing?.name.orEmpty())"))
         assertTrue(source.contains("fromField.setText(existing?.from.orEmpty())"))
+        assertFalse(source.contains("nameField.hint ="))
+        assertFalse(source.contains("fromField.hint ="))
+        assertTrue(source.contains("collectionParentCandidates(collections, collectionId)"))
+        assertTrue(source.contains("parentId = parentId"))
         assertTrue(source.contains("R.id.cancelCollectionEdit"))
         assertTrue(source.contains("R.id.saveCollectionEdit"))
     }
@@ -103,7 +105,111 @@ class HomeListResourceTest {
         assertTrue(home.contains("initiallyExpandedScanGroup("))
         assertTrue(home.contains("Prefs.compactScanList(this)"))
         assertTrue(home.contains("e.thumbnailPhoto()?.let"))
+        assertTrue(home.contains("e.photoDescriptor(photo)?.postProcessingPending"))
+        assertTrue(home.contains("softenPendingThumbnail(decoded)"))
         assertFalse(home.contains("e.photos().firstOrNull()?.let"))
+    }
+
+    @Test
+    fun homeToolbarContainsOnlyIconTabsAndScanRowsUseLiteralSelectionGestures() {
+        val home = xml("src/main/res/layout/activity_home.xml")
+        assertFalse(hasElementWithId(home, "btnSelect"))
+        val appMenu = elementById(home, "appMenu")
+        assertEquals("56dp", appMenu.getAttributeNS(androidNs, "layout_width"))
+        assertEquals("56dp", appMenu.getAttributeNS(androidNs, "layout_height"))
+        assertEquals("@drawable/ic_app_mark", appMenu.getAttributeNS(androidNs, "src"))
+        for ((id, icon) in listOf(
+            "tabScans" to "@drawable/ic_scans",
+            "tabCollections" to "@drawable/ic_collections",
+        )) {
+            val tab = elementById(home, id)
+            assertEquals(icon, tab.getAttributeNS(appNs, "icon"))
+            assertEquals("false", tab.getAttributeNS(androidNs, "textAllCaps"))
+            assertEquals("@font/roboto_slab", tab.getAttributeNS(androidNs, "fontFamily"))
+        }
+        val source = source("HomeActivity")
+        assertTrue(source.contains("row.setOnClickListener { selectSingle(e.id) }"))
+        assertTrue(source.contains("row.setOnLongClickListener"))
+        assertTrue(source.contains("toggleAdditiveSelection(e.id)"))
+        assertTrue(source.contains("openEntryDetails(e.id)"))
+        assertTrue(source.contains("outState.putBoolean(STATE_SELECTION_MODE, selectionMode)"))
+        assertTrue(source.contains("outState.putStringArrayList(STATE_SELECTED_IDS"))
+
+        val scanRow = xml("src/main/res/layout/item_home.xml")
+        val details = elementById(scanRow, "openDetails")
+        assertEquals("androidx.appcompat.widget.AppCompatImageButton", details.tagName)
+        assertEquals("@drawable/ic_chevron_right", details.getAttributeNS(appNs, "srcCompat"))
+        assertEquals("@string/home_open_details", details.getAttributeNS(androidNs, "contentDescription"))
+
+        val plate = xml("src/main/res/drawable/whl_icon_plate.xml")
+        assertEquals(0, plate.getElementsByTagName("stroke").length)
+        val solids = plate.getElementsByTagName("solid")
+        assertTrue((0 until solids.length)
+            .map { solids.item(it) as Element }
+            .any { it.getAttributeNS(androidNs, "color") == "@color/whl_green" })
+
+        val strings = File("src/main/res/values/strings.xml").readText()
+        assertTrue(strings.contains("<string name=\"app_name\">Library Tool Capture</string>"))
+        assertTrue(strings.contains("<string name=\"home_new_scan\">New scan</string>"))
+        val newScan = elementById(home, "newScan")
+        assertEquals("com.google.android.material.button.MaterialButton", newScan.tagName)
+        assertEquals("@drawable/ic_camera_new", newScan.getAttributeNS(appNs, "icon"))
+        assertEquals("textStart", newScan.getAttributeNS(appNs, "iconGravity"))
+    }
+
+    @Test
+    fun aboutDialogHasFullHeightGreenIconDocumentationAndScrollableChangelog() {
+        val dialog = xml("src/main/res/layout/dialog_about.xml")
+        val icon = elementById(dialog, "aboutIcon")
+        assertEquals("64dp", icon.getAttributeNS(androidNs, "layout_width"))
+        assertEquals("64dp", icon.getAttributeNS(androidNs, "layout_height"))
+        assertEquals("@drawable/whl_icon_plate", icon.getAttributeNS(androidNs, "background"))
+        assertEquals("@drawable/ic_app_mark", icon.getAttributeNS(androidNs, "src"))
+        assertNotNull(elementById(dialog, "aboutTitle"))
+        assertNotNull(elementById(dialog, "aboutVersion"))
+        assertNotNull(elementById(dialog, "aboutDescription"))
+        assertEquals(
+            "184dp",
+            elementById(dialog, "aboutChangelogScroll")
+                .getAttributeNS(androidNs, "layout_height"),
+        )
+        assertTrue(File("src/release/res/raw/android_changelog.md").isFile)
+
+        val strings = File("src/main/res/values/strings.xml").readText()
+        assertTrue(strings.contains("https://maj-6.github.io/library-tool/docs.html#capture"))
+        assertTrue(strings.contains("Changelog not included for this version"))
+        val source = source("HomeActivity")
+        assertTrue(source.contains("if (BuildConfig.DEBUG)"))
+        assertTrue(source.contains("LinkMovementMethod.getInstance()"))
+    }
+
+    @Test
+    fun menuProvidesSignOutAndKeepsAboutLastBehindAGroupSeparator() {
+        val menu = xml("src/main/res/menu/home_app_menu.xml")
+        assertNotNull(elementById(menu, "menuSignOut"))
+        val itemIds = (0 until menu.getElementsByTagName("item").length)
+            .map { menu.getElementsByTagName("item").item(it) as Element }
+            .map { it.getAttributeNS(androidNs, "id") }
+        assertEquals("@+id/menuAbout", itemIds.last())
+        val source = source("HomeActivity")
+        assertTrue(source.contains("MenuCompat.setGroupDividerEnabled(menu.menu, true)"))
+        assertTrue(source.contains("Auth.signOut(this@HomeActivity)"))
+    }
+
+    @Test
+    fun pendingAndUploadedStatusesUseCompactVisualIndicators() {
+        val item = xml("src/main/res/layout/item_home.xml")
+        val waiting = elementById(item, "waitingIndicator")
+        assertEquals("true", waiting.getAttributeNS(androidNs, "indeterminate"))
+        assertEquals("gone", waiting.getAttributeNS(androidNs, "visibility"))
+        assertEquals(
+            "@drawable/ic_cloud_done",
+            elementById(item, "stateIcon").getAttributeNS(androidNs, "src"),
+        )
+        assertEquals(
+            "false",
+            elementById(item, "state").getAttributeNS(androidNs, "textAllCaps"),
+        )
     }
 
     private fun source(name: String): String =

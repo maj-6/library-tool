@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- One recent-scan card on the Home page: a page thumbnail, the extracted
-     book record (or progress), and the upload/import status. Tapping opens the
-     full detail (all photos, OCR text, every field). -->
+<!-- One scan row. Tapping selects it; the trailing disclosure action opens
+     the full detail (all photos, OCR text, every field). -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:orientation="horizontal"
@@ -71,8 +71,34 @@
         android:id="@+id/state"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:fontFamily="monospace"
+        android:fontFamily="@font/roboto_slab"
         android:textSize="10sp"
-        android:textAllCaps="true"
+        android:textAllCaps="false"
         android:textColor="@color/whl_ink_dim" />
+
+    <ProgressBar
+        android:id="@+id/waitingIndicator"
+        style="?android:attr/progressBarStyleSmall"
+        android:layout_width="20dp"
+        android:layout_height="20dp"
+        android:indeterminate="true"
+        android:indeterminateTint="@color/whl_amber"
+        android:visibility="gone"
+        android:contentDescription="@string/home_status_waiting" />
+
+    <ImageView
+        android:id="@+id/stateIcon"
+        android:layout_width="22dp"
+        android:layout_height="22dp"
+        android:src="@drawable/ic_cloud_done"
+        android:visibility="gone"
+        android:contentDescription="@string/home_status_uploaded" />
+
+    <androidx.appcompat.widget.AppCompatImageButton
+        android:id="@+id/openDetails"
+        style="@style/WhlInlineIconButton"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:contentDescription="@string/home_open_details"
+        app:srcCompat="@drawable/ic_chevron_right" />
 </LinearLayout>

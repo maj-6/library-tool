@@ -23,6 +23,9 @@ data class PhotoOverlayRegion(
     val label: String = "",
 )
 
+internal fun minimumOverlayStrokeWidthPx(density: Float): Float =
+    maxOf(2f, 2f * density)
+
 /**
  * A lifecycle-light photo surface: fit-center by default, optional pinch/pan,
  * and normalized polygon overlays drawn through the same image matrix. This
@@ -175,7 +178,10 @@ class ZoomablePhotoView @JvmOverloads constructor(
 
         val scale = matrixScale(imageMatrix).coerceAtLeast(.0001f)
         overlayPaint.alpha = (overlayAlpha * 255).toInt()
-        overlayPaint.strokeWidth = 2f / scale
+        // Canvas is scaled below, so divide by the image scale to keep the
+        // visible outline at least two physical pixels (and two dp on denser
+        // displays) regardless of zoom.
+        overlayPaint.strokeWidth = minimumOverlayStrokeWidthPx(resources.displayMetrics.density) / scale
         labelPaint.alpha = (overlayAlpha * 255).toInt()
         labelPaint.textSize = 13f / scale
         canvas.save()

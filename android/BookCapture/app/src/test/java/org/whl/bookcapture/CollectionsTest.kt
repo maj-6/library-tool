@@ -12,8 +12,12 @@ import java.nio.file.Files
 /** Collection bookkeeping and the provenance a book carries away from it. */
 class CollectionsTest {
 
-    private fun collection(id: String, name: String, from: String = "") =
-        BookCollection(id, name, from)
+    private fun collection(
+        id: String,
+        name: String,
+        from: String = "",
+        parentId: String? = null,
+    ) = BookCollection(id, name, from, parentId = parentId)
 
     // --- field hygiene -------------------------------------------------------
 
@@ -35,9 +39,11 @@ class CollectionsTest {
     fun collectionsSurviveARoundTrip() {
         val original = listOf(
             collection("a", "Blue crate", "Storage"),
-            collection("b", "Shelf 3"),
+            collection("b", "Shelf 3", parentId = "a"),
         )
-        assertEquals(original, collectionsFromJson(collectionsToJson(original)))
+        val encoded = collectionsToJson(original)
+        assertEquals(3, JSONObject(encoded).getInt("version"))
+        assertEquals(original, collectionsFromJson(encoded))
     }
 
     @Test
@@ -77,6 +83,28 @@ class CollectionsTest {
         """.trimIndent()
         val parsed = collectionsFromJson(text)
         assertEquals(listOf(collection("a", "Keep", "Storage")), parsed)
+    }
+
+    @Test
+    fun versionTwoStoresUpgradeWithoutInventingParents() {
+        val parsed = collectionStoreFromJson(
+            """{"version":2,"collections":[{"id":"a","name":"Keep","from":"Office"}]}""",
+        )
+
+        assertTrue(parsed.valid)
+        assertNull(parsed.collections.single().parentId)
+    }
+
+    @Test
+    fun malformedParentIdsDropOnlyTheirRows() {
+        val parsed = collectionsFromJson(
+            """{"version":3,"collections":[
+                {"id":"a","name":"Keep","parent_id":" parent "},
+                {"id":"b","name":"Drop","parent_id":42}
+            ]}""",
+        )
+
+        assertEquals(listOf(collection("a", "Keep", parentId = "parent")), parsed)
     }
 
     @Test
@@ -156,10 +184,64 @@ class CollectionsTest {
     }
 
     @Test
+    fun parentsAreDurableIdsAndSelfOrDescendantCyclesAreRejected() {
+        val root = collection("root", "Office")
+        val child = collection("child", "Periodicals", from = "Donation", parentId = "root")
+        val grandchild = collection("grandchild", "Journals", parentId = "child")
+        val existing = listOf(root, child, grandchild)
+
+        assertEquals(
+            R.string.collections_error_parent_invalid,
+            updateCollection(existing, "root", "Office", "", "root").error,
+        )
+        assertEquals(
+            R.string.collections_error_parent_invalid,
+            updateCollection(existing, "root", "Office", "", "grandchild").error,
+        )
+        assertEquals(
+            R.string.collections_error_parent_invalid,
+            addCollection(existing, "Maps", "", id = "maps", parentId = "missing").error,
+        )
+
+        val updated = updateCollection(existing, "child", "Periodicals", "Archive", null)
+        assertNull(updated.error)
+        val updatedChild = requireNotNull(updated.collections).first { it.id == "child" }
+        assertNull(updatedChild.parentId)
+        assertEquals("Archive", updatedChild.from)
+    }
+
+    @Test
+    fun editorCandidatesExcludeSelfDescendantsAndCyclicBranches() {
+        val collections = listOf(
+            collection("root", "Office"),
+            collection("child", "Periodicals", parentId = "root"),
+            collection("grandchild", "Journals", parentId = "child"),
+            collection("other", "Storage"),
+            collection("cycle-a", "Cycle A", parentId = "cycle-b"),
+            collection("cycle-b", "Cycle B", parentId = "cycle-a"),
+        )
+
+        assertEquals(
+            listOf("other"),
+            collectionParentCandidates(collections, "root").map { it.id },
+        )
+    }
+
+    @Test
+    fun anUnchangedMissingParentSurvivesAnUnrelatedEdit() {
+        val child = collection("child", "Periodicals", parentId = "missing")
+        val edited = updateCollection(listOf(child), "child", "Periodicals A", "", "missing")
+
+        assertNull(edited.error)
+        assertEquals("missing", edited.collections?.single()?.parentId)
+    }
+
+    @Test
     fun aNewCollectionKeepsItsOwnIdentityWhenSyncChangesListOrder() {
         val home = File("src/main/java/org/whl/bookcapture/HomeActivity.kt").readText()
         assertTrue(home.contains("val collectionId = existing?.id ?: UUID.randomUUID().toString()"))
-        assertTrue(home.contains("addCollection(current, name, from, id = collectionId)"))
+        assertTrue(home.contains("id = collectionId"))
+        assertTrue(home.contains("parentId = parentId"))
         assertTrue(home.contains("Prefs.setCurrentCollectionId(this, collectionId)"))
         assertFalse(home.contains("Collections.all(this).lastOrNull()"))
     }

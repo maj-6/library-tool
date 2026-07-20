@@ -15,9 +15,11 @@ import java.util.UUID
  * A collection is the batch a book was scanned into — a shelf, a crate, a room.
  *
  * [from] is where that batch physically came from ("Storage", "Christopher
- * Office"). [updatedAt] and [deleted] are synchronization state. Tombstones are
- * retained on disk but hidden from [Collections.all], so a signed-out delete
- * cannot be resurrected by the next cloud pull.
+ * Office"). [parentId] is a durable collection-to-collection hierarchy edge;
+ * physical provenance is never used as identity. [updatedAt] and [deleted] are
+ * synchronization state. Tombstones are retained on disk but hidden from
+ * [Collections.all], so a signed-out delete cannot be resurrected by the next
+ * cloud pull.
  */
 data class BookCollection(
     val id: String,
@@ -27,6 +29,7 @@ data class BookCollection(
     val deleted: Boolean = false,
     /** Non-null only for an irreversible, human-confirmed identity merge. */
     val mergedInto: String? = null,
+    val parentId: String? = null,
 )
 
 private fun BookCollection.isLive(): Boolean = !deleted && mergedInto == null
@@ -79,6 +82,7 @@ private fun collectionToJson(collection: BookCollection): JSONObject =
             if (collection.updatedAt.isNotEmpty()) put("updated_at", collection.updatedAt)
             if (collection.deleted) put("deleted", true)
             collection.mergedInto?.let { put("merged_into", it) }
+            collection.parentId?.let { put("parent_id", it) }
         }
 
 internal fun collectionStoreToJson(store: CollectionStore): String {
@@ -96,7 +100,7 @@ internal fun collectionStoreToJson(store: CollectionStore): String {
     val dirty = JSONArray()
     store.dirty.toSortedSet().forEach { dirty.put(it) }
     return JSONObject()
-        .put("version", 2)
+        .put("version", 3)
         .put("collections", array)
         .put("sync_shadow", shadow)
         .put("sync_dirty", dirty)
@@ -118,13 +122,13 @@ internal fun collectionStoreFromJson(text: String): CollectionStore = try {
         it.isFinite() && it % 1.0 == 0.0
     }) { "version must be an integer" }
     val version = rawVersion.toInt()
-    require(version == 1 || version == 2) { "unsupported collections version" }
+    require(version in 1..3) { "unsupported collections version" }
     val array = root.optJSONArray("collections")
         ?: throw IllegalArgumentException("collections must be an array")
-    if (version == 2 && root.has("sync_shadow") && root.optJSONObject("sync_shadow") == null) {
+    if (version >= 2 && root.has("sync_shadow") && root.optJSONObject("sync_shadow") == null) {
         throw IllegalArgumentException("sync_shadow must be an object")
     }
-    if (version == 2 && root.has("sync_dirty") && root.optJSONArray("sync_dirty") == null) {
+    if (version >= 2 && root.has("sync_dirty") && root.optJSONArray("sync_dirty") == null) {
         throw IllegalArgumentException("sync_dirty must be an array")
     }
     val seen = mutableSetOf<String>()
@@ -136,6 +140,11 @@ internal fun collectionStoreFromJson(text: String): CollectionStore = try {
         if (id.isEmpty() || name.isEmpty() || !seen.add(id)) continue
         val mergedInto = if (item.isNull("merged_into")) null
         else item.optString("merged_into").trim().ifEmpty { null }
+        val parentId = when (val rawParent = item.opt("parent_id")) {
+            null, JSONObject.NULL -> null
+            is String -> rawParent.trim().ifEmpty { null }
+            else -> continue
+        }
         out += BookCollection(
             id = id,
             name = name,
@@ -143,6 +152,7 @@ internal fun collectionStoreFromJson(text: String): CollectionStore = try {
             updatedAt = item.optString("updated_at").trim(),
             deleted = item.optBoolean("deleted", false),
             mergedInto = mergedInto,
+            parentId = parentId,
         )
     }
     val shadowObject = root.optJSONObject("sync_shadow") ?: JSONObject()
@@ -191,6 +201,44 @@ internal fun collectionNameTaken(
         it.name.equals(normalizeCollectionField(name), ignoreCase = true)
 }
 
+private fun normalizeCollectionParentId(value: String?): String? =
+    value?.trim()?.ifEmpty { null }
+
+/**
+ * True when [parentId] is not a live collection, points to this collection, or
+ * reaches this collection (or any pre-existing cycle) through parent links.
+ * An unchanged dangling parent can be allowed so an unrelated edit never
+ * silently destroys hierarchy received before its parent was deleted locally.
+ */
+internal fun collectionParentIsInvalid(
+    collections: List<BookCollection>,
+    collectionId: String,
+    parentId: String?,
+    allowedMissingParentId: String? = null,
+): Boolean {
+    val cleanParentId = normalizeCollectionParentId(parentId) ?: return false
+    if (cleanParentId == collectionId) return true
+    val liveById = collections.filter { it.isLive() }.associateBy { it.id }
+    var cursor = liveById[cleanParentId]
+        ?: return cleanParentId != normalizeCollectionParentId(allowedMissingParentId)
+    val visited = mutableSetOf(collectionId)
+    while (true) {
+        if (!visited.add(cursor.id)) return true
+        val nextId = normalizeCollectionParentId(cursor.parentId) ?: return false
+        cursor = liveById[nextId] ?: return false
+    }
+}
+
+/** Valid live choices for the collection editor, excluding self, descendants,
+ * and branches that are already cyclic. */
+internal fun collectionParentCandidates(
+    collections: List<BookCollection>,
+    collectionId: String,
+): List<BookCollection> = collections.filter {
+    it.isLive() &&
+        !collectionParentIsInvalid(collections, collectionId, it.id)
+}
+
 /** Result of an edit: [collections] is the list to persist, [error] is a string
  * resource to show instead when the edit was rejected. */
 internal data class CollectionEdit(val collections: List<BookCollection>?, val error: Int?)
@@ -200,13 +248,26 @@ internal fun addCollection(
     name: String,
     from: String,
     id: String = UUID.randomUUID().toString(),
+    parentId: String? = null,
 ): CollectionEdit {
     val clean = normalizeCollectionField(name)
     if (clean.isEmpty()) return CollectionEdit(null, R.string.collections_error_name_required)
     if (collectionNameTaken(collections, clean)) {
         return CollectionEdit(null, R.string.collections_error_name_taken)
     }
-    return CollectionEdit(collections + BookCollection(id, clean, normalizeCollectionField(from)), null)
+    val cleanParentId = normalizeCollectionParentId(parentId)
+    if (collectionParentIsInvalid(collections, id, cleanParentId)) {
+        return CollectionEdit(null, R.string.collections_error_parent_invalid)
+    }
+    return CollectionEdit(
+        collections + BookCollection(
+            id = id,
+            name = clean,
+            from = normalizeCollectionField(from),
+            parentId = cleanParentId,
+        ),
+        null,
+    )
 }
 
 internal fun updateCollection(
@@ -214,18 +275,29 @@ internal fun updateCollection(
     id: String,
     name: String,
     from: String,
+    parentId: String? = null,
 ): CollectionEdit {
     val clean = normalizeCollectionField(name)
     if (clean.isEmpty()) return CollectionEdit(null, R.string.collections_error_name_required)
     if (collectionNameTaken(collections, clean, exceptId = id)) {
         return CollectionEdit(null, R.string.collections_error_name_taken)
     }
-    if (collections.none { it.id == id && !it.deleted }) {
+    val existing = collections.firstOrNull { it.id == id && it.isLive() }
+    if (existing == null) {
         return CollectionEdit(null, R.string.collections_error_missing)
+    }
+    val cleanParentId = normalizeCollectionParentId(parentId)
+    val allowedMissing = existing.parentId?.takeIf { it == cleanParentId }
+    if (collectionParentIsInvalid(collections, id, cleanParentId, allowedMissing)) {
+        return CollectionEdit(null, R.string.collections_error_parent_invalid)
     }
     return CollectionEdit(
         collections.map {
-            if (it.id == id) it.copy(name = clean, from = normalizeCollectionField(from)) else it
+            if (it.id == id) it.copy(
+                name = clean,
+                from = normalizeCollectionField(from),
+                parentId = cleanParentId,
+            ) else it
         },
         null,
     )
@@ -280,13 +352,17 @@ private fun compareCollectionTimestamps(left: String, right: String): Int =
 
 /** Stable semantic identity; timestamps are revision metadata, not content. */
 internal fun collectionContentHash(collection: BookCollection): String {
-    val canonical = listOf(
+    val fields = mutableListOf(
         collection.id,
         collection.name,
         collection.from,
         collection.deleted.toString(),
         collection.mergedInto.orEmpty(),
-    ).joinToString("\u0000")
+    )
+    // Preserve every v2 hash when no parent exists, so upgrading does not make
+    // all clean rows look locally edited against their stored sync shadow.
+    collection.parentId?.let { fields += "parent:$it" }
+    val canonical = fields.joinToString("\u0000")
     val digest = MessageDigest.getInstance("SHA-256").digest(canonical.toByteArray())
     return buildString(digest.size * 2) {
         digest.forEach { byte ->
@@ -518,7 +594,9 @@ object Collections {
                     )
                     nextDirty += old.id
                 } else {
-                    val changed = replacement.name != old.name || replacement.from != old.from
+                    val changed = replacement.name != old.name ||
+                        replacement.from != old.from ||
+                        replacement.parentId != old.parentId
                     nextRecords += replacement.copy(
                         updatedAt = if (changed) nextCollectionTimestamp(old.updatedAt, now)
                         else old.updatedAt,

@@ -18379,6 +18379,22 @@ def _capture_note(cap: dict, errors: list[str]) -> str:
 PHONE_PROVENANCE_KEYS = frozenset({
     "scan_collection_id", "scan_collection", "scan_from",
 })
+PHONE_PHOTO_ASSETS_KEY = "_capture_photo_assets"
+PHONE_CAPTURE_NOTES_KEY = "_capture_notes"
+PHONE_INTERNAL_META_KEYS = frozenset({
+    PHONE_PHOTO_ASSETS_KEY, PHONE_CAPTURE_NOTES_KEY,
+})
+PHONE_PHOTO_ASSETS_SCHEMA = "org.whl.bookcapture.photo-assets"
+PHONE_CAPTURE_NOTES_SCHEMA = "org.whl.bookcapture.capture-notes"
+PHONE_CAPTURE_NOTE_FIELDS = frozenset({
+    "price", "pages", "condition", "illustrations", "remark",
+})
+_PHONE_ASSET_TOKEN = re.compile(r"^[A-Za-z0-9._-]+$")
+_PHONE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _phone_asset_token(value: str) -> bool:
+    return value not in {".", ".."} and bool(_PHONE_ASSET_TOKEN.fullmatch(value))
 
 
 def _capture_provenance(cap: dict) -> dict:
@@ -18399,6 +18415,224 @@ def _capture_provenance(cap: dict) -> dict:
         return {}
     return {key: value.strip() for key in PHONE_PROVENANCE_KEYS
             if isinstance((value := meta.get(key)), str) and value.strip()}
+
+
+def _capture_photo_assets(cap: dict) -> dict:
+    """Return the versioned Android photo contract without catalog pollution.
+
+    LAN sends the contract at the capture envelope's top level. The existing
+    cloud table has no dedicated column yet, so Android mirrors it through one
+    reserved metadata key. Neither representation is bibliographic metadata.
+    Validate the current v1 identity/lineage fields strictly while preserving
+    optional v1 fields verbatim. A future version must be explicitly supported
+    before it can replace this evidence on disk.
+    """
+    supplied = "photo_assets" in cap
+    payload = cap.get("photo_assets")
+    meta = cap.get("meta")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except json.JSONDecodeError:
+            meta = None
+    if not isinstance(payload, dict) and isinstance(meta, dict) and \
+            PHONE_PHOTO_ASSETS_KEY in meta:
+        supplied = True
+        payload = meta.get(PHONE_PHOTO_ASSETS_KEY)
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            raise ValueError("advertised photo asset contract is not valid JSON")
+    if not supplied:
+        return {}
+    if not isinstance(payload, dict):
+        raise ValueError("advertised photo asset contract is not an object")
+
+    def invalid(reason: str):
+        raise ValueError(f"invalid photo asset contract: {reason}")
+
+    version = payload.get("version")
+    assets = payload.get("assets")
+    capture_id = str(payload.get("capture_id") or "")
+    if (payload.get("schema") != PHONE_PHOTO_ASSETS_SCHEMA or
+            isinstance(version, bool) or version != 1 or
+            capture_id != str(cap.get("id") or "") or
+            not _phone_asset_token(capture_id) or
+            not isinstance(assets, list) or not assets):
+        invalid("schema, version, capture id, or asset list")
+    clean_assets = []
+    ids, orders, capture_files = set(), set(), set()
+    for asset in assets:
+        if not isinstance(asset, dict):
+            invalid("asset is not an object")
+        asset_id = str(asset.get("asset_id") or "")
+        order = asset.get("capture_order")
+        capture_file = str(asset.get("capture_file") or "")
+        original = asset.get("original")
+        display = asset.get("display")
+        if (not _phone_asset_token(asset_id) or
+                isinstance(order, bool) or not isinstance(order, int) or order < 1 or
+                not re.fullmatch(r"photo_\d+\.jpg", capture_file) or
+                not isinstance(original, dict) or not isinstance(display, dict)):
+            invalid("asset identity, order, filename, or lineage")
+        original_ref = str(original.get("reference") or "")
+        display_ref = str(display.get("reference") or "")
+        original_sha = str(original.get("sha256") or "").lower()
+        display_sha = str(display.get("sha256") or "").lower()
+        if (not _phone_asset_token(original_ref) or
+                not _phone_asset_token(display_ref) or
+                not _PHONE_SHA256.fullmatch(original_sha) or
+                not _PHONE_SHA256.fullmatch(display_sha) or
+                asset_id in ids or order in orders or capture_file in capture_files):
+            invalid("asset reference, checksum, or uniqueness")
+        ids.add(asset_id)
+        orders.add(order)
+        capture_files.add(capture_file)
+        clean_assets.append(asset)
+    if orders != set(range(1, len(clean_assets) + 1)):
+        invalid("capture order is not dense")
+    transport = payload.get("transport")
+    if (not isinstance(transport, dict) or
+            transport.get("representation") != "original" or
+            transport.get("version") != 1):
+        invalid("original transport marker is missing or unsupported")
+    preserved = dict(payload)
+    preserved["assets"] = clean_assets
+    return preserved
+
+
+def _capture_notes(cap: dict) -> dict:
+    """Validate Android notes without making their transport bibliographic."""
+    meta = cap.get("meta")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except json.JSONDecodeError:
+            meta = None
+    payload = meta.get(PHONE_CAPTURE_NOTES_KEY) if isinstance(meta, dict) else None
+    if payload is None:
+        payload = cap.get("capture_notes")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            return {}
+    if not isinstance(payload, dict):
+        return {}
+    version = payload.get("version")
+    capture_id = str(payload.get("capture_id") or "")
+    if (payload.get("schema") != PHONE_CAPTURE_NOTES_SCHEMA or
+            isinstance(version, bool) or not isinstance(version, int) or version != 1 or
+            capture_id != str(cap.get("id") or "") or
+            not _phone_asset_token(capture_id) or
+            not isinstance(payload.get("notes"), list)):
+        return {}
+
+    clean_notes = []
+    ids = set()
+    for note in payload["notes"]:
+        if not isinstance(note, dict):
+            return {}
+        note_id = str(note.get("id") or "")
+        status = str(note.get("status") or "")
+        provider = str(note.get("provider") or "").strip()
+        model = str(note.get("model") or "").strip()
+        transcript = note.get("transcript")
+        unclassified = note.get("unclassified_text")
+        started = note.get("started_at_ms")
+        updated = note.get("updated_at_ms")
+        completed = note.get("completed_at_ms")
+        rows = note.get("rows")
+        valid_completion = (
+            status == "completed" and
+            isinstance(completed, int) and not isinstance(completed, bool) and
+            isinstance(started, int) and not isinstance(started, bool) and
+            isinstance(updated, int) and not isinstance(updated, bool) and
+            started <= completed <= updated
+        ) or (status == "in_progress" and completed is None)
+        if (not _phone_asset_token(note_id) or note_id in ids or
+                status not in {"in_progress", "completed"} or
+                not provider or not model or
+                not isinstance(transcript, str) or
+                not isinstance(unclassified, str) or
+                isinstance(started, bool) or not isinstance(started, int) or started < 0 or
+                isinstance(updated, bool) or not isinstance(updated, int) or updated < started or
+                not isinstance(rows, list) or not valid_completion):
+            return {}
+        clean_rows = []
+        for row in rows:
+            if not isinstance(row, dict):
+                return {}
+            field = str(row.get("field") or "").strip().lower()
+            value = row.get("value")
+            if not _phone_asset_token(field) or not isinstance(value, str):
+                return {}
+            clean_row = dict(row)
+            clean_row["field"] = field
+            clean_row["value"] = value
+            clean_rows.append(clean_row)
+        ids.add(note_id)
+        clean_note = dict(note)
+        clean_note.update({
+            "id": note_id,
+            "status": status,
+            "provider": provider,
+            "model": model,
+            "rows": clean_rows,
+        })
+        clean_notes.append(clean_note)
+    preserved = dict(payload)
+    preserved["notes"] = clean_notes
+    return preserved
+
+
+def _capture_note_extra(notes: dict) -> dict:
+    """Latest non-blank spoken value for each recognized catalogue fact."""
+    extra = {}
+    for note in notes.get("notes") or []:
+        for row in note.get("rows") or []:
+            field = str(row.get("field") or "").strip().lower()
+            value = str(row.get("value") or "").strip()
+            if field in PHONE_CAPTURE_NOTE_FIELDS and value:
+                extra[field] = value
+    return extra
+
+
+def _transported_original_assets(photo_contract: dict, raw_photos: list[bytes],
+                                 photo_paths: list) -> list[dict]:
+    """Bind each transport part to its declared immutable Android source."""
+    assets = list(photo_contract.get("assets") or [])
+    if len(assets) != len(raw_photos):
+        raise ValueError("photo asset count does not match transported originals")
+    by_name = {str(asset["capture_file"]): asset for asset in assets}
+    if photo_paths:
+        names = [str(path).replace("\\", "/").rsplit("/", 1)[-1]
+                 for path in photo_paths]
+        if len(names) != len(raw_photos) or len(set(names)) != len(names):
+            raise ValueError("transported original names are incomplete or duplicated")
+        try:
+            ordered = [by_name[name] for name in names]
+        except KeyError as exc:
+            raise ValueError(
+                "transported original name is absent from photo contract"
+            ) from exc
+    else:
+        ordered = sorted(assets, key=lambda asset: asset["capture_order"])
+    for asset, raw in zip(ordered, raw_photos):
+        actual = hashlib.sha256(raw).hexdigest()
+        expected = str(asset["original"]["sha256"]).lower()
+        if actual != expected:
+            display_hash = str(asset["display"].get("sha256") or "").lower()
+            if actual == display_hash:
+                raise ValueError(
+                    "transported bytes are a display derivative, not the camera "
+                    f"original, for {asset['capture_file']}"
+                )
+            raise ValueError(
+                f"transported original checksum mismatch for {asset['capture_file']}"
+            )
+    return ordered
 
 
 def _phone_result(cap: dict, raw_photos: list[bytes], photo_paths: list) -> dict | None:
@@ -18434,7 +18668,7 @@ def _phone_result(cap: dict, raw_photos: list[bytes], photo_paths: list) -> dict
     has_metadata = any(
         has_value(value)
         for key, value in meta.items()
-        if key not in PHONE_PROVENANCE_KEYS
+        if key not in PHONE_PROVENANCE_KEYS and key not in PHONE_INTERNAL_META_KEYS
     )
     if not (ocr or has_metadata):
         return None                       # phone had no keys / extracted nothing
@@ -18460,12 +18694,18 @@ def _phone_result(cap: dict, raw_photos: list[bytes], photo_paths: list) -> dict
     # Only the flat wire keys are authoritative capture provenance. A model or
     # malformed client must not smuggle reserved scan_* values through nested
     # generic metadata; ingest_capture merges the validated flat strings later.
-    for key in PHONE_PROVENANCE_KEYS:
+    for key in PHONE_PROVENANCE_KEYS | PHONE_INTERNAL_META_KEYS:
         extra.pop(key, None)
     for key, value in meta.items():
         if (key not in capture.FIELDS and key != "extra"
-                and key not in PHONE_PROVENANCE_KEYS and has_value(value)):
+                and key not in PHONE_PROVENANCE_KEYS
+                and key not in PHONE_INTERNAL_META_KEYS and has_value(value)):
             extra.setdefault(key, value)
+    # The current manual catalogue has no dedicated spine-title column. Keep
+    # the extraction in extensible metadata at the phone-result boundary.
+    spine_title = fields.get("spine_title", "")
+    if spine_title:
+        extra.setdefault("spine_title", spine_title)
     return {"photos": photos, "ocr_text": "\n\n".join(parts),
             "fields": fields, "extra": extra, "errors": errors}
 
@@ -18484,19 +18724,58 @@ def ingest_capture(cap: dict, raw_photos: list[bytes], mistral_key: str,
         entries = lib.load_json(lib.MANUAL_ENTRIES_PATH, {})
         if any(e.get("capture_id") == cap_id for e in entries.values()):
             return None, None                     # already here: idempotent
+    photo_contract = _capture_photo_assets(cap)
+    transported_assets = (_transported_original_assets(
+        photo_contract, raw_photos, photo_paths or []) if photo_contract else [])
     # prefer the phone's OCR/fields (BookCapture 2.0+) to skip a second OCR pass;
     # fall back to the full desktop pipeline when the phone sent nothing
     result = _phone_result(cap, raw_photos, photo_paths or []) \
         or capture.process_capture(raw_photos, mistral_key)
+    # Notes are parsed only after OCR source selection so their reserved
+    # transport key cannot make an otherwise unprocessed capture look extracted.
+    capture_notes = _capture_notes(cap)
 
     cdir = CAPTURES_DIR / cap_id
     cdir.mkdir(parents=True, exist_ok=True)
+    if capture_notes:
+        (cdir / "capture_notes.json").write_text(
+            json.dumps(capture_notes, indent=2, ensure_ascii=False) + "\n",
+            "utf-8",
+        )
     images = []
     for i, jpg in enumerate(result["photos"], 1):
         (cdir / f"photo_{i}.jpg").write_bytes(jpg)
         images.append(f"captures/{cap_id}/photo_{i}.jpg")
     for i, raw in enumerate(raw_photos, 1):       # originals: re-OCR stays possible
         (cdir / f"orig_{i}.jpg").write_bytes(raw)
+    if photo_contract:
+        import_assets = []
+        for index, raw in enumerate(raw_photos, 1):
+            derivative = result["photos"][index - 1]
+            source_asset = transported_assets[index - 1]
+            import_assets.append({
+                "order": index - 1,
+                "asset_id": source_asset["asset_id"],
+                "raw_ref": f"orig_{index}.jpg",
+                "display_ref": f"photo_{index}.jpg",
+                "source_checksum": hashlib.sha256(raw).hexdigest(),
+                "derivative_checksum": hashlib.sha256(derivative).hexdigest(),
+                "transport_representation": "original",
+                "recipe": "desktop_perspective_standardize_v1",
+                "lifecycle": "failed" if any(
+                    error.startswith(f"photo {index}:") for error in result["errors"]
+                ) else "completed",
+            })
+        photo_contract = dict(photo_contract)
+        photo_contract["desktop_import"] = {
+            "version": 1,
+            "imported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "assets": import_assets,
+        }
+        (cdir / "photo_assets.json").write_text(
+            json.dumps(photo_contract, indent=2, ensure_ascii=False) + "\n",
+            "utf-8",
+        )
     if result["ocr_text"]:
         (cdir / "ocr.txt").write_text(result["ocr_text"], "utf-8", errors="replace")
 
@@ -18508,6 +18787,13 @@ def ingest_capture(cap: dict, raw_photos: list[bytes], mistral_key: str,
     if not entry["title"]:                        # never lose a capture
         entry["title"] = f"(untitled capture {cap_id[:8]})"
     entry["notes"] = _capture_note(cap, result["errors"])
+    capture_extra = dict(result["extra"])
+    spine_title = str(fields.get("spine_title") or "").strip()
+    if spine_title:
+        capture_extra.setdefault("spine_title", spine_title)
+    # Explicit spoken fields outrank OCR guesses. The full transcript remains
+    # a capture sidecar rather than being copied into catalogue metadata.
+    capture_extra.update(_capture_note_extra(capture_notes))
     # provenance last: it is the phone's own record of where the book came
     # from, so it outranks anything an extractor happened to call the same thing
     provenance = _capture_provenance(cap)
@@ -18516,7 +18802,7 @@ def ingest_capture(cap: dict, raw_photos: list[bytes], mistral_key: str,
         # Resolve only the link; name/origin remain the capture-time snapshot.
         provenance["scan_collection_id"] = _resolve_collection_alias(
             provenance["scan_collection_id"])
-    entry["extra"] = _clean_extra({**result["extra"], **provenance})
+    entry["extra"] = _clean_extra({**capture_extra, **provenance})
     entry["images"] = images
     entry["capture_id"] = cap_id
     entry["created_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")

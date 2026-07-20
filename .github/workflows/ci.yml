@@ -76,7 +76,41 @@ jobs:
           cache: gradle
           cache-dependency-path: |
             android/BookCapture/*.gradle.kts
+            android/BookCapture/app/build.gradle.kts
             android/BookCapture/gradle/wrapper/gradle-wrapper.properties
 
       - name: Unit tests, lint, and debug build
         run: ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug
+
+  image-processor:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/image_processor
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            services/image_processor/requirements.txt
+            services/image_processor/requirements-dev.txt
+            services/image_processor/requirements.lock
+
+      - name: Install processor and test tools
+        run: |
+          python -m pip install -r requirements-dev.txt
+          python -m pip install --no-deps page-dewarp==0.3.4
+          python -m pip install --no-deps -e .
+
+      - name: Processor tests and lint
+        run: |
+          python -m pytest
+          python -m ruff check whl_image_processor tests
+
+      - name: Build deployable container
+        run: docker build -t whl-image-processor:ci .

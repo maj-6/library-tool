@@ -74,10 +74,12 @@ object Prefs {
     fun setSharpenPreview(ctx: Context, on: Boolean) =
         sp(ctx).edit().putBoolean("sharpen_preview", on).apply()
 
+    const val CAMERA_PROFILE_LOW = "low"
     const val CAMERA_PROFILE_FAST = "fast"
     const val CAMERA_PROFILE_DETAIL = "detail"
 
     internal fun validatedCameraProfile(value: String?): String = when (value?.trim()) {
+        CAMERA_PROFILE_LOW -> CAMERA_PROFILE_LOW
         CAMERA_PROFILE_DETAIL -> CAMERA_PROFILE_DETAIL
         else -> CAMERA_PROFILE_FAST
     }
@@ -92,6 +94,51 @@ object Prefs {
     fun setTorchEnabled(ctx: Context, on: Boolean) =
         sp(ctx).edit().putBoolean("camera_torch", on).apply()
 
+    /** Camera controls are stored as requests, then clamped against the active
+     * lens's advertised range every time CameraX binds. */
+    fun cameraZoomRatio(ctx: Context): Float =
+        sp(ctx).getFloat("camera_zoom_ratio", 1f).takeIf { it.isFinite() && it > 0f } ?: 1f
+
+    fun setCameraZoomRatio(ctx: Context, ratio: Float) =
+        sp(ctx).edit().putFloat(
+            "camera_zoom_ratio",
+            ratio.takeIf { it.isFinite() && it > 0f } ?: 1f,
+        ).apply()
+
+    fun cameraExposureIndex(ctx: Context): Int =
+        sp(ctx).getInt("camera_exposure_index", 0)
+
+    fun setCameraExposureIndex(ctx: Context, index: Int) =
+        sp(ctx).edit().putInt("camera_exposure_index", index).apply()
+
+    fun cameraFocusLocked(ctx: Context): Boolean =
+        sp(ctx).getBoolean("camera_focus_locked", false)
+
+    fun setCameraFocusLocked(ctx: Context, locked: Boolean) =
+        sp(ctx).edit().putBoolean("camera_focus_locked", locked).apply()
+
+    fun cameraFocusPointX(ctx: Context): Float =
+        sp(ctx).getFloat("camera_focus_x", 0.5f)
+            .takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0.5f
+
+    fun cameraFocusPointY(ctx: Context): Float =
+        sp(ctx).getFloat("camera_focus_y", 0.5f)
+            .takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0.5f
+
+    fun setCameraFocusPoint(ctx: Context, x: Float, y: Float) =
+        sp(ctx).edit()
+            .putFloat("camera_focus_x", x.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0.5f)
+            .putFloat("camera_focus_y", y.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0.5f)
+            .apply()
+
+    fun cameraCaptureOrientation(ctx: Context): String =
+        cameraCaptureOrientation(
+            sp(ctx).getString("camera_capture_orientation", null),
+        ).storedValue
+
+    internal fun setCameraCaptureOrientation(ctx: Context, orientation: CameraCaptureOrientation) =
+        put(ctx, "camera_capture_orientation" to orientation.storedValue)
+
     fun cameraDiagnostics(ctx: Context): String = str(ctx, "camera_diagnostics")
     fun setCameraDiagnostics(ctx: Context, value: String) =
         put(ctx, "camera_diagnostics" to value.trim())
@@ -101,6 +148,12 @@ object Prefs {
             .remove("camera_profile")
             .remove("camera_torch")
             .remove("sharpen_preview")
+            .remove("camera_zoom_ratio")
+            .remove("camera_exposure_index")
+            .remove("camera_focus_locked")
+            .remove("camera_focus_x")
+            .remove("camera_focus_y")
+            .remove("camera_capture_orientation")
             .apply()
     }
 
