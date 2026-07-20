@@ -88,8 +88,171 @@
     return `"${value}"`;
   }
 
+  const TEXT_LAYER_FORBIDDEN_REVISION =
+    /["\\]|\p{White_Space}|\p{Cc}|\p{Cf}|\p{Cs}/u;
+
+  function isTextLayerRevision(value, optional = false) {
+    if (typeof value !== "string") return false;
+    if (!value) return optional;
+    return Array.from(value).length <= 512 &&
+      !TEXT_LAYER_FORBIDDEN_REVISION.test(value);
+  }
+
+  function quoteTextLayerRevision(value, name) {
+    if (!isTextLayerRevision(value)) {
+      throw new TypeError(`${name} is not a valid text-layer revision`);
+    }
+    return `"${value}"`;
+  }
+
   function isObject(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
+  }
+
+  function hasExactKeys(value, expected) {
+    if (!isObject(value)) return false;
+    const keys = Object.keys(value);
+    return keys.length === expected.length &&
+      expected.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+  }
+
+  function containsCommandFingerprint(value, seen = new Set()) {
+    if (!value || typeof value !== "object") return false;
+    if (seen.has(value)) return true;
+    seen.add(value);
+    if (Object.prototype.hasOwnProperty.call(value, "command_sha256")) {
+      return true;
+    }
+    return Object.keys(value).some((key) =>
+      containsCommandFingerprint(value[key], seen));
+  }
+
+  function isTextLayerSourceView(value) {
+    if (!hasExactKeys(value, [
+      "representation_id", "pinned_revision", "current_revision",
+      "available", "status",
+    ]) || !isPortableIdentifier(value.representation_id) ||
+        !isTextLayerRevision(value.pinned_revision) ||
+        !isTextLayerRevision(value.current_revision, true) ||
+        typeof value.available !== "boolean" ||
+        value.available !== !!value.current_revision) return false;
+    const status = !value.available ? "unavailable" :
+      value.current_revision === value.pinned_revision ? "current" : "stale";
+    return value.status === status;
+  }
+
+  function isTextLayerProvenance(value) {
+    return hasExactKeys(value, [
+      "origin", "review_state", "provider_id", "model", "recipe_revision",
+      "updated_at", "metadata",
+    ]) && ["unknown", "machine", "human", "import", "derived"].includes(
+      value.origin) &&
+      ["unreviewed", "reviewed", "approved", "rejected"].includes(
+        value.review_state) &&
+      (value.provider_id === "" || isPortableIdentifier(value.provider_id)) &&
+      typeof value.model === "string" &&
+      isTextLayerRevision(value.recipe_revision, true) &&
+      typeof value.updated_at === "string" && isObject(value.metadata);
+  }
+
+  function isTextLayerUnit(value) {
+    return hasExactKeys(value, [
+      "selector", "order", "label", "text", "provenance",
+      "content_revision", "unit_revision",
+    ]) && isPortableIdentifier(value.selector) &&
+      Number.isSafeInteger(value.order) && value.order >= 0 &&
+      typeof value.label === "string" && typeof value.text === "string" &&
+      isTextLayerProvenance(value.provenance) &&
+      isTextLayerRevision(value.content_revision) &&
+      isTextLayerRevision(value.unit_revision);
+  }
+
+  function isTextLayerSourcePin(value) {
+    return hasExactKeys(value, ["representation_id", "revision"]) &&
+      isPortableIdentifier(value.representation_id) &&
+      isTextLayerRevision(value.revision);
+  }
+
+  function isTextLayerSummary(value, itemId) {
+    return hasExactKeys(value, [
+      "item_id", "layer_id", "label", "kind", "language",
+      "document_revision", "content_revision", "view_revision", "source",
+      "unit_count",
+    ]) && value.item_id === itemId && isPortableIdentifier(value.item_id) &&
+      isPortableIdentifier(value.layer_id) && typeof value.label === "string" &&
+      isPortableIdentifier(value.kind) && typeof value.language === "string" &&
+      isTextLayerRevision(value.document_revision) &&
+      isTextLayerRevision(value.content_revision) &&
+      isTextLayerRevision(value.view_revision) &&
+      isTextLayerSourceView(value.source) &&
+      Number.isSafeInteger(value.unit_count) && value.unit_count >= 0;
+  }
+
+  function isTextLayerDocument(value, itemId, layerId) {
+    if (!hasExactKeys(value, [
+      "item_id", "layer_id", "label", "kind", "language", "source",
+      "preamble", "units", "document_revision", "content_revision",
+    ]) || value.item_id !== itemId || value.layer_id !== layerId ||
+        !isPortableIdentifier(value.item_id) ||
+        !isPortableIdentifier(value.layer_id) ||
+        typeof value.label !== "string" || !isPortableIdentifier(value.kind) ||
+        typeof value.language !== "string" ||
+        !isTextLayerSourcePin(value.source) ||
+        typeof value.preamble !== "string" || !Array.isArray(value.units) ||
+        !value.units.every(isTextLayerUnit) ||
+        !isTextLayerRevision(value.document_revision) ||
+        !isTextLayerRevision(value.content_revision)) return false;
+    const selectors = new Set(value.units.map((unit) => unit.selector));
+    const orders = new Set(value.units.map((unit) => unit.order));
+    return selectors.size === value.units.length && orders.size === value.units.length;
+  }
+
+  function isTextLayerView(value, itemId, layerId) {
+    return hasExactKeys(value, ["document", "source", "view_revision"]) &&
+      isTextLayerDocument(value.document, itemId, layerId) &&
+      isTextLayerSourceView(value.source) &&
+      value.document.source.representation_id ===
+        value.source.representation_id &&
+      value.document.source.revision === value.source.pinned_revision &&
+      isTextLayerRevision(value.view_revision);
+  }
+
+  function isTextLayerUnitReceipt(value, selector, expectedUnitRevision) {
+    return hasExactKeys(value, [
+      "selector", "before_unit_revision", "after_unit_revision",
+      "before_content_revision", "after_content_revision",
+    ]) && value.selector === selector && isPortableIdentifier(value.selector) &&
+      isTextLayerRevision(value.before_unit_revision) &&
+      value.before_unit_revision === expectedUnitRevision &&
+      isTextLayerRevision(value.after_unit_revision) &&
+      value.before_unit_revision !== value.after_unit_revision &&
+      isTextLayerRevision(value.before_content_revision) &&
+      isTextLayerRevision(value.after_content_revision);
+  }
+
+  function isTextLayerReplaceReceipt(value, expected) {
+    return hasExactKeys(value, [
+      "action", "operation_id", "item_id", "layer_id", "source_revision",
+      "before_document_revision", "after_document_revision",
+      "before_content_revision", "after_content_revision", "units",
+    ]) && value.action === "replace-unit" &&
+      value.operation_id === expected.operationId &&
+      value.item_id === expected.itemId && value.layer_id === expected.layerId &&
+      value.source_revision === expected.sourceRevision &&
+      isPortableIdentifier(value.operation_id) &&
+      isPortableIdentifier(value.item_id) && isPortableIdentifier(value.layer_id) &&
+      isTextLayerRevision(value.source_revision) &&
+      isTextLayerRevision(value.before_document_revision) &&
+      isTextLayerRevision(value.after_document_revision) &&
+      value.before_document_revision !== value.after_document_revision &&
+      isTextLayerRevision(value.before_content_revision) &&
+      isTextLayerRevision(value.after_content_revision) &&
+      Array.isArray(value.units) && value.units.length === 1 &&
+      isTextLayerUnitReceipt(
+        value.units[0], expected.selector, expected.unitRevision) &&
+      (value.before_content_revision !== value.after_content_revision) ===
+        (value.units[0].before_content_revision !==
+          value.units[0].after_content_revision);
   }
 
   function isItemTombstone(value) {
@@ -205,6 +368,11 @@
         list: (args) => this._translationList(args),
         get: (args) => this._translationGet(args),
         replacePage: (args) => this._translationReplacePage(args),
+      });
+      this.textLayers = Object.freeze({
+        list: (args) => this._textLayerList(args),
+        get: (args) => this._textLayerGet(args),
+        replaceUnit: (args) => this._textLayerReplaceUnit(args),
       });
       this.ocr = Object.freeze({
         layout: (args) => this._ocrLayout(args),
@@ -441,7 +609,7 @@
       });
     }
 
-    _invalidLifecycleResponse(message, method, path, body, query, status = 200) {
+    _invalidResponse(message, method, path, body, query, status = 200) {
       throw new EngineClientError(message, {
         status,
         code: "invalid-response",
@@ -450,6 +618,10 @@
         url: this._url(path, query),
         body,
       });
+    }
+
+    _invalidLifecycleResponse(message, method, path, body, query, status = 200) {
+      this._invalidResponse(message, method, path, body, query, status);
     }
 
     async _itemLifecycle({ itemId, signal } = {}) {
@@ -852,6 +1024,100 @@
           },
           signal,
         });
+    }
+
+    _textLayerList({ itemId, signal } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      const path = `/v1/items/${encodePart(item)}/text-layers`;
+      return this._requestJson("GET", path, {
+        signal, cache: "no-cache", includeStatus: true,
+      }).then(({ body, status }) => {
+        const valid = status === 200 && hasExactKeys(body, [
+          "ok", "schema", "item_id", "text_layers", "revision",
+        ]) && body.ok === true &&
+          body.schema === "librarytool.text-layer-summaries/1" &&
+          body.item_id === item && Array.isArray(body.text_layers) &&
+          body.text_layers.every((value) => isTextLayerSummary(value, item)) &&
+          new Set(body.text_layers.map((value) => value.layer_id)).size ===
+            body.text_layers.length && isTextLayerRevision(body.revision) &&
+          !containsCommandFingerprint(body);
+        if (!valid) {
+          this._invalidResponse(
+            "Engine returned an invalid text-layer collection",
+            "GET", path, body, undefined, status);
+        }
+        return body;
+      });
+    }
+
+    _textLayerGet({ itemId, layerId, signal } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      const layer = portableIdentifier(layerId, "layerId");
+      const path =
+        `/v1/items/${encodePart(item)}/text-layers/${encodePart(layer)}`;
+      return this._requestJson("GET", path, {
+        signal, cache: "no-cache", includeStatus: true,
+      }).then(({ body, status }) => {
+        if (status !== 200 || !hasExactKeys(body, [
+          "ok", "schema", "text_layer",
+        ]) || body.ok !== true ||
+            body.schema !== "librarytool.text-layer/1" ||
+            !isTextLayerView(body.text_layer, item, layer) ||
+            containsCommandFingerprint(body)) {
+          this._invalidResponse(
+            "Engine returned an invalid text-layer detail",
+            "GET", path, body, undefined, status);
+        }
+        return body;
+      });
+    }
+
+    _textLayerReplaceUnit({ itemId, layerId, selector, text, provenance,
+      unitRevision, sourceRevision, idempotencyKey, signal } = {}) {
+      const item = portableIdentifier(itemId, "itemId");
+      const layer = portableIdentifier(layerId, "layerId");
+      const unit = portableIdentifier(selector, "selector");
+      if (typeof text !== "string") throw new TypeError("text must be a string");
+      if (!isTextLayerProvenance(provenance)) {
+        throw new TypeError("provenance must be a complete object");
+      }
+      const operationId = operationKey(idempotencyKey, "idempotencyKey");
+      const source = quoteTextLayerRevision(
+        sourceRevision, "sourceRevision");
+      const path =
+        `/v1/items/${encodePart(item)}/text-layers/${encodePart(layer)}` +
+        `/units/${encodePart(unit)}`;
+      return this._requestJson("PUT", path, {
+          headers: {
+            "Idempotency-Key": operationId,
+            "If-Unit-Match": quoteTextLayerRevision(
+              unitRevision, "unitRevision"),
+            "If-Source-Match": source,
+          },
+          body: { replacement: { text, provenance } },
+          cache: "no-store",
+          signal,
+          includeStatus: true,
+        }).then(({ body, status }) => {
+        if (status !== 200 || !hasExactKeys(body, [
+          "ok", "schema", "replayed", "receipt",
+        ]) || body.ok !== true ||
+            body.schema !== "librarytool.text-layer-mutation-receipt/1" ||
+            typeof body.replayed !== "boolean" ||
+            !isTextLayerReplaceReceipt(body.receipt, {
+              operationId,
+              itemId: item,
+              layerId: layer,
+              sourceRevision,
+              selector: unit,
+              unitRevision,
+            }) || containsCommandFingerprint(body)) {
+          this._invalidResponse(
+            "Engine returned an invalid text-layer mutation receipt",
+            "PUT", path, body, undefined, status);
+        }
+        return body;
+      });
     }
 
     _replicaPackageImport({ bookId, sourceId, file, overwrite = false,

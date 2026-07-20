@@ -89,6 +89,9 @@ from librarytool.adapters.filesystem.recoverable_write_set import (  # noqa: E40
 from librarytool.adapters.filesystem.whl_catalogue_codec import (  # noqa: E402
     WhlCatalogueItemCodec,
 )
+from librarytool_http import (  # noqa: E402
+    create_text_layer_blueprint,
+)
 from librarytool.composition.filesystem import (  # noqa: E402
     CatalogueBindings,
     FilesystemEnginePaths,
@@ -213,6 +216,7 @@ def _flask_app():
 
 
 app = _flask_app()
+app.register_blueprint(create_text_layer_blueprint(lambda: _library_engine()))
 # Jinja compiles index.html once and caches it when debug is off, while static/
 # is read from disk on every request. Editing the template therefore served a NEW
 # app.js against an OLD DOM until someone restarted the server -- and one missing

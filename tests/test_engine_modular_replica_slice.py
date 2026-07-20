@@ -3,7 +3,10 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
+import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -495,3 +498,23 @@ def test_engine_package_has_no_transport_or_transitional_tool_imports():
         source = path.read_text(encoding="utf-8")
         for name in forbidden:
             assert not re.search(rf"^(?:from|import)\s+{name}\b", source, re.M), path
+
+
+def test_flask_text_layer_transport_is_a_sibling_opt_in_package():
+    environment = os.environ.copy()
+    inherited = environment.get("PYTHONPATH", "")
+    environment["PYTHONPATH"] = str(SRC) + (
+        os.pathsep + inherited if inherited else ""
+    )
+    script = (
+        "import sys; import librarytool; import librarytool.engine; "
+        "import librarytool.composition; assert 'flask' not in sys.modules; "
+        "import librarytool_http; assert 'flask' in sys.modules"
+    )
+    subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )

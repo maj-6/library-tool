@@ -149,8 +149,14 @@ larger workbench and packaging split described below remains the target:
   The optional first-party `library.text-layers` module now composes the
   aggregate behind a distinct registry service and contributes read/edit
   capabilities only when explicitly bound. It remains off in the production
-  host; HTTP/client resources and migration from legacy `ocr/*.txt` still
-  remain before existing workbenches may depend on it.
+  host. An opt-in Flask adapter plus `EngineClient.textLayers` now exposes
+  versioned list, detail, and single-unit replacement, resolving only that
+  registry service. Reads are strongly revalidatable; writes require exact
+  idempotency, unit/source CAS, and complete provenance. A 1 MiB mutation cap
+  and exact 16 MiB full-detail cap fail with structured `413` responses rather
+  than truncating or publishing. Migration from legacy `ocr/*.txt`, production
+  activation, and a paged read resource for larger layers still remain before
+  existing workbenches may depend on it.
 - The secret-store contract, current-user DPAPI repository, and optional
   first-party `library.secrets` composition now form a complete but unbound
   backend slice. Only the public masked-status/CAS service enters the registry;
@@ -552,9 +558,11 @@ With the lifecycle seam established, migrate these data boundaries in order:
    global replay envelope, with receipt-first replay surviving live-item
    deletion. Optional first-party composition now registers the aggregate and
    its read/edit capabilities only when explicitly supplied; the production
-   graph remains unbound. The next step is a versioned transport/client surface;
-   only then should a deliberate compatibility importer map legacy
-   `ocr/*.txt` pages to already-persisted canvas selectors. Replica, translation,
+   graph remains unbound. The versioned transport/client surface now covers
+   list, coherent detail, and conditional single-unit correction without
+   activating storage. Next, add paged unit reads for documents above the
+   bounded full-detail projection, then let a deliberate compatibility importer
+   map legacy `ocr/*.txt` pages to already-persisted canvas selectors. Replica, translation,
    Knowledge/RAG, search, and export should consume this one boundary rather
    than rediscovering compiled files independently. A future summary index and
    shared-read mechanism should replace full-document parsing under the current

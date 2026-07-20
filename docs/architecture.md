@@ -154,9 +154,16 @@ Per-component detail lives in each part's own README (map at the end).
   commit, and performs no lazy read writes. An optional first-party
   `library.text-layers` module now composes that repository as a distinct
   aggregate service and advertises read/edit capabilities only when explicitly
-  bound. It remains absent from the production host: versioned HTTP/client
-  resources and a deliberate migration from legacy page-marked `ocr/*.txt`
-  remain before Replica, translation, or RAG can depend on it.
+  bound. A separately imported Flask adapter and `EngineClient.textLayers` now
+  provide versioned list, detail, and conditional single-unit replacement
+  resources whenever that service is present. Reads have strong validators;
+  commands require exact idempotency, unit, source, and complete-provenance
+  inputs. The transport caps mutation bodies at 1 MiB and complete detail
+  projections at 16 MiB, returning a structured error rather than truncating;
+  larger layers need a future paged unit-read resource. The service remains
+  absent from the production host, so no native file is created and no legacy
+  OCR path changes. A deliberate migration from page-marked `ocr/*.txt` still
+  remains before Replica, translation, or RAG can depend on it.
 - **Desktop app** — the workbench: an Electron shell (`desktop/`) that
   spawns the Flask sidecar (`tools/whl_explorer/server.py`) on a loopback
   port. Each desktop launch now creates a 256-bit capability that is passed
