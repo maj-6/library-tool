@@ -29,6 +29,7 @@ from librarytool.composition import (
     InterchangeBindings,
     JobHistoryBindings,
     ReplicaBindings,
+    SecretStoreBindings,
     TextLayerAggregateBindings,
     TranslationBindings,
     open_filesystem_engine,
@@ -40,6 +41,7 @@ from librarytool.engine.interchange import LibImportPlannerPort
 from librarytool.engine.item_commands import ItemDraft, ItemRecordSnapshot
 from librarytool.engine.ports import ReplicaPolicyPort, TextLayerRepositoryPort
 from librarytool.engine.runtime import (
+    SECRET_STORE_SERVICE,
     TEXT_LAYER_AGGREGATE_SERVICE,
     ModuleContribution,
     ServiceBinding,
@@ -57,6 +59,27 @@ class _Descriptors:
         if item_id != "book-one":
             return None
         return ItemDescriptor("book-one", ("primary",), {"title": "Herbal"})
+
+
+class _NeverCalledSecretRepository:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def status(self, _secret_id):
+        self.calls += 1
+        raise AssertionError("host startup must not read secret status")
+
+    def unit_of_work(self, *, operation_id):
+        self.calls += 1
+        raise AssertionError(
+            f"host startup must not begin secret operation {operation_id}"
+        )
+
+    def credential_leases(self):
+        raise AssertionError("provider composition owns credential leases")
+
+    def health(self):
+        raise AssertionError("host composition owns private vault health")
 
 
 def _decode_record(item_id, raw):
@@ -119,6 +142,7 @@ def _host_inputs(
     catalogue: Path = Path("catalogue.json"),
     entries: Path = Path("entries"),
     read_jobs=None,
+    secrets: SecretStoreBindings | None = None,
 ):
     descriptors = _Descriptors()
     policies = cast(ReplicaPolicyPort, object())
@@ -195,6 +219,7 @@ def _host_inputs(
         workspace_lock_context_for=_item_lock,
         jobs=JobHistoryBindings(read_json=read_jobs),
         recovery_lock_context=recovery_lock,
+        secrets=secrets,
     )
     return config, bindings, factory
 
@@ -263,6 +288,7 @@ def test_open_composes_one_headless_graph_and_close_is_explicit(tmp_path):
     assert engine.translation_provenance is session.provenance
     assert engine.items is not None
     assert engine.items.get_item("book-one").title == "Herbal"
+    assert engine.get_service(SECRET_STORE_SERVICE) is None
     assert session.write_set.root == config.workspace_root.resolve()
     assert session.closed is False
     assert not session.recovery_results
@@ -328,6 +354,35 @@ def test_host_rejects_a_mismatched_native_text_layer_binding(tmp_path):
 
     with pytest.raises(TypeError, match="text_layer_aggregate"):
         replace(bindings, text_layer_aggregate=object())
+
+
+def test_host_passes_through_only_the_public_secret_repository(tmp_path):
+    repository = _NeverCalledSecretRepository()
+    config, bindings, modules = _host_inputs(
+        tmp_path / "workspace",
+        secrets=SecretStoreBindings(repository),
+    )
+
+    with open_filesystem_engine(
+        config=config,
+        bindings=bindings,
+        contribute_modules=modules,
+    ) as session:
+        service = session.engine.require_service(SECRET_STORE_SERVICE)
+        assert service._repository is repository
+        assert repository.calls == 0
+        assert not hasattr(session.engine, "secrets")
+        assert not hasattr(session.engine, "secret_store")
+        assert not hasattr(service, "lease")
+        assert not hasattr(service, "credential_leases")
+        assert not hasattr(service, "health")
+
+
+def test_host_rejects_a_mismatched_secret_binding(tmp_path):
+    _config, bindings, _modules = _host_inputs(tmp_path / "workspace")
+
+    with pytest.raises(TypeError, match="secrets"):
+        replace(bindings, secrets=object())
 
 
 def test_same_workspace_is_exclusive_but_different_roots_are_independent(

@@ -26,6 +26,7 @@ from ..engine.runtime import (
     LIB_OPEN_SERVICE,
     REPLICA_SERVICE,
     REPRESENTATION_COMMAND_SERVICE,
+    SECRET_STORE_SERVICE,
     TEXT_LAYER_AGGREGATE_SERVICE,
     TEXT_LAYER_SERVICE,
     TRANSLATION_PROVENANCE_SERVICE,
@@ -119,6 +120,14 @@ FIRST_PARTY_MODULE_MANIFESTS = (
         requires=(
             CapabilityRef("library.items.read"),
             CapabilityRef("library.representations"),
+        ),
+    ),
+    ModuleManifest(
+        "library.secrets",
+        "1.0.0",
+        provides=(
+            CapabilityRef("library.secrets.status"),
+            CapabilityRef("library.secrets.mutate"),
         ),
     ),
     ModuleManifest(
@@ -326,6 +335,20 @@ def first_party_module_contributions(
                         TEXT_LAYER_AGGREGATE_SERVICE,
                         graph.text_layer_aggregate,
                         modules["library.text-layers"].provides,
+                    ),
+                ),
+            )
+        )
+
+    if graph.secret_store is not None:
+        contributions.append(
+            ModuleContribution(
+                modules["library.secrets"],
+                bindings=(
+                    ServiceBinding(
+                        SECRET_STORE_SERVICE,
+                        graph.secret_store,
+                        modules["library.secrets"].provides,
                     ),
                 ),
             )

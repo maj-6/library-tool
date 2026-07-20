@@ -9,6 +9,7 @@ import pytest
 from librarytool.engine import (
     ITEM_LIFECYCLE_SERVICE,
     ITEM_QUERY_SERVICE,
+    SECRET_STORE_SERVICE,
     TEXT_LAYER_AGGREGATE_SERVICE,
     TEXT_LAYER_SERVICE,
     CapabilityRef,
@@ -181,6 +182,26 @@ def test_native_text_layer_aggregate_is_a_distinct_registry_only_service():
     assert engine.require_service(TEXT_LAYER_AGGREGATE_SERVICE) is service
     assert engine.text_layers is None
     assert not hasattr(engine, "text_layer_aggregate")
+
+
+def test_secret_store_is_registry_only_and_has_no_legacy_engine_field():
+    status = CapabilityRef("library.secrets.status")
+    mutate = CapabilityRef("library.secrets.mutate")
+    service = object()
+    contribution = _contribution(
+        "library.secrets",
+        provides=(status, mutate),
+        bindings=(
+            _binding(SECRET_STORE_SERVICE, service, status, mutate),
+        ),
+    )
+
+    engine = LibraryEngineBuilder((contribution,)).build()
+
+    assert SECRET_STORE_SERVICE.token == "library.secrets@1"
+    assert engine.require_service(SECRET_STORE_SERVICE) is service
+    assert not hasattr(engine, "secrets")
+    assert not hasattr(engine, "secret_store")
 
 
 def test_direct_library_engine_construction_remains_compatible():

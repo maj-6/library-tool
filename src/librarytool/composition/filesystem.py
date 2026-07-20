@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from inspect import getattr_static
 from pathlib import Path
 from typing import Any, ContextManager
 
@@ -72,6 +73,10 @@ from ..engine.ports import (
     TextLayerRepositoryPort,
 )
 from ..engine.replica import ReplicaApplicationService
+from ..engine.secret_store import (
+    SecretStoreRepositoryPort,
+    SecretStoreService,
+)
 from ..engine.runtime import (
     CANVAS_PREPARATION_SERVICE,
     CANVAS_QUERY_SERVICE,
@@ -83,6 +88,7 @@ from ..engine.runtime import (
     LIB_OPEN_SERVICE,
     REPLICA_SERVICE,
     REPRESENTATION_COMMAND_SERVICE,
+    SECRET_STORE_SERVICE,
     TEXT_LAYER_AGGREGATE_SERVICE,
     TEXT_LAYER_SERVICE,
     TRANSLATION_PROVENANCE_SERVICE,
@@ -391,6 +397,43 @@ class TextLayerAggregateBindings:
                 raise TypeError(f"{name} must be callable")
 
 
+@dataclass(frozen=True, slots=True)
+class SecretStoreBindings:
+    """Complete public secret-store persistence supplied by a host.
+
+    The repository is already constructed and remains owned by the caller.
+    Composition uses only its public status/mutation port; credential leases
+    and adapter health ports are intentionally not part of this bundle.
+    Static inspection avoids invoking repository methods or descriptors while
+    validating the required structural contract.
+    """
+
+    repository: SecretStoreRepositoryPort
+
+    def __post_init__(self) -> None:
+        repository = self.repository
+        if repository is None or isinstance(repository, type):
+            raise TypeError(
+                "repository must be a constructed SecretStoreRepositoryPort"
+            )
+        missing = []
+        for name in ("status", "unit_of_work"):
+            try:
+                member = getattr_static(repository, name)
+            except AttributeError:
+                missing.append(name)
+                continue
+            if isinstance(member, (classmethod, staticmethod)):
+                member = member.__func__
+            if not callable(member):
+                missing.append(name)
+        if missing:
+            raise TypeError(
+                "repository must expose callable methods: "
+                + ", ".join(missing)
+            )
+
+
 class _CanvasAuthority:
     """Validate and sanitize one exact host canvas authority projection."""
 
@@ -509,12 +552,18 @@ class FilesystemServiceGraph:
     canvas_query: CanvasQueryService | None = None
     canvas_preparation: CanvasPreparationService | None = None
     text_layer_aggregate: TextLayerAggregateService | None = None
+    secret_store: SecretStoreService | None = None
 
     def __post_init__(self) -> None:
         if (self.canvas_query is None) != (self.canvas_preparation is None):
             raise ValueError(
                 "canvas query and preparation services must be installed together"
             )
+        if self.secret_store is not None and not isinstance(
+            self.secret_store,
+            SecretStoreService,
+        ):
+            raise TypeError("secret_store must be a SecretStoreService or None")
 
     def keyed_services(self) -> tuple[tuple[ServiceKey[Any], Any], ...]:
         services = (
@@ -530,6 +579,7 @@ class FilesystemServiceGraph:
             (REPLICA_SERVICE, self.replica),
             (TEXT_LAYER_SERVICE, self.text_layers),
             (TEXT_LAYER_AGGREGATE_SERVICE, self.text_layer_aggregate),
+            (SECRET_STORE_SERVICE, self.secret_store),
             (TRANSLATION_SERVICE, self.translations),
             (
                 TRANSLATION_PROVENANCE_SERVICE,
@@ -559,6 +609,7 @@ def compose_filesystem_engine(
     contribution_factory: ContributionFactory,
     canvases: CanvasBindings | None = None,
     text_layer_aggregate: TextLayerAggregateBindings | None = None,
+    secrets: SecretStoreBindings | None = None,
 ) -> LibraryEngine:
     """Return one complete filesystem-backed service graph.
 
@@ -580,6 +631,8 @@ def compose_filesystem_engine(
             "text_layer_aggregate must be a TextLayerAggregateBindings "
             "bundle or None"
         )
+    if secrets is not None and not isinstance(secrets, SecretStoreBindings):
+        raise TypeError("secrets must be a SecretStoreBindings bundle or None")
     # Recovery remains host-owned, but composition refuses to expose any
     # service graph while an unfinished workspace transaction exists.
     with resources.write_set.workspace_lease():
@@ -657,6 +710,12 @@ def compose_filesystem_engine(
                 recover=False,
             )
         )
+
+    secret_store = (
+        None
+        if secrets is None
+        else SecretStoreService(secrets.repository)
+    )
 
     items = ItemQueryService(
         FilesystemItemQueryRepository(
@@ -799,6 +858,7 @@ def compose_filesystem_engine(
         canvas_query=canvas_query,
         canvas_preparation=canvas_preparation,
         text_layer_aggregate=native_text_layers,
+        secret_store=secret_store,
     )
     try:
         contributions = tuple(contribution_factory(graph))
@@ -851,6 +911,7 @@ __all__ = [
     "ItemLifecycleBindings",
     "ReplicaBindings",
     "RepresentationBindings",
+    "SecretStoreBindings",
     "TranslationBindings",
     "TextLayerAggregateBindings",
     "compose_filesystem_engine",

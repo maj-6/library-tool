@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from itertools import product
 
 import pytest
@@ -24,12 +25,14 @@ from librarytool.engine.runtime import (
     LIB_OPEN_SERVICE,
     REPLICA_SERVICE,
     REPRESENTATION_COMMAND_SERVICE,
+    SECRET_STORE_SERVICE,
     TEXT_LAYER_AGGREGATE_SERVICE,
     TEXT_LAYER_SERVICE,
     TRANSLATION_PROVENANCE_SERVICE,
     TRANSLATION_SERVICE,
     LibraryEngineBuilder,
 )
+from librarytool.engine.secret_store import SecretStoreService
 
 
 class _EmptyItemRepository:
@@ -46,6 +49,16 @@ class _EmptyItemRepository:
         return ()
 
 
+class _NeverCalledSecretRepository:
+    def status(self, _secret_id):
+        raise AssertionError("composition must not read the secret repository")
+
+    def unit_of_work(self, *, operation_id):
+        raise AssertionError(
+            f"composition must not start secret operation {operation_id}"
+        )
+
+
 def _graph(
     *,
     representation: bool = True,
@@ -53,6 +66,7 @@ def _graph(
     lib_open: bool = True,
     canvases: bool = True,
     text_layer_aggregate: bool = True,
+    secrets: bool = True,
 ) -> FilesystemServiceGraph:
     return FilesystemServiceGraph(
         items=ItemQueryService(_EmptyItemRepository()),
@@ -69,6 +83,11 @@ def _graph(
         canvas_query=object() if canvases else None,
         canvas_preparation=object() if canvases else None,
         text_layer_aggregate=(object() if text_layer_aggregate else None),
+        secret_store=(
+            SecretStoreService(_NeverCalledSecretRepository())
+            if secrets
+            else None
+        ),
     )
 
 
@@ -94,6 +113,7 @@ def test_first_party_manifests_preserve_the_production_product_contract():
         "library.item-lifecycle.commands": "1.0.0",
         "library.canvases": "1.0.0",
         "library.text-layers": "1.0.0",
+        "library.secrets": "1.0.0",
         "replica.core": "1.0.0",
         "translation.core": "2.0.0",
         "replica.lib": "2.0.0",
@@ -146,6 +166,11 @@ def test_first_party_manifests_preserve_the_production_product_contract():
         ("library.items.read", 1),
         ("library.representations", 1),
     }
+    assert _capabilities(modules["library.secrets"].provides) == {
+        ("library.secrets.status", 1),
+        ("library.secrets.mutate", 1),
+    }
+    assert modules["library.secrets"].requires == ()
     assert _capabilities(modules["replica.core"].provides) == {
         ("replica.regions", 1),
         ("replica.proposals", 1),
@@ -212,6 +237,7 @@ def test_full_first_party_graph_binds_every_service_and_policy():
         "library.item-lifecycle.commands",
         "library.canvases",
         "library.text-layers",
+        "library.secrets",
         "replica.core",
         "translation.core",
         "replica.lib",
@@ -236,6 +262,7 @@ def test_full_first_party_graph_binds_every_service_and_policy():
             "library.canvases.query@1",
         ),
         "library.text-layers": ("library.text-layers.aggregate@1",),
+        "library.secrets": ("library.secrets@1",),
         "replica.core": ("replica.application@1", "replica.text-layers@1"),
         "translation.core": (
             "translation.application@1",
@@ -296,6 +323,9 @@ def test_full_first_party_graph_binds_every_service_and_policy():
     assert engine.require_service(
         TEXT_LAYER_AGGREGATE_SERVICE
     ) is graph.text_layer_aggregate
+    assert engine.require_service(SECRET_STORE_SERVICE) is graph.secret_store
+    assert not hasattr(engine, "secrets")
+    assert not hasattr(engine, "secret_store")
     assert engine.text_layers is graph.text_layers
     assert engine.require_service(TRANSLATION_SERVICE) is graph.translations
     assert engine.require_service(
@@ -318,8 +348,9 @@ def test_full_first_party_graph_binds_every_service_and_policy():
         "lib_open",
         "canvases",
         "text_layer_aggregate",
+        "secrets",
     ),
-    tuple(product((False, True), repeat=5)),
+    tuple(product((False, True), repeat=6)),
 )
 def test_optional_modules_are_independent_deterministic_and_withheld(
     representation,
@@ -327,6 +358,7 @@ def test_optional_modules_are_independent_deterministic_and_withheld(
     lib_open,
     canvases,
     text_layer_aggregate,
+    secrets,
 ):
     graph = _graph(
         representation=representation,
@@ -334,6 +366,7 @@ def test_optional_modules_are_independent_deterministic_and_withheld(
         lib_open=lib_open,
         canvases=canvases,
         text_layer_aggregate=text_layer_aggregate,
+        secrets=secrets,
     )
     contributions = first_party_module_contributions(graph)
     engine = LibraryEngineBuilder(contributions).build()
@@ -349,6 +382,7 @@ def test_optional_modules_are_independent_deterministic_and_withheld(
     assert ("replica.lib-open" in module_ids) is lib_open
     assert ("library.canvases" in module_ids) is canvases
     assert ("library.text-layers" in module_ids) is text_layer_aggregate
+    assert ("library.secrets" in module_ids) is secrets
     assert (
         engine.get_service(REPRESENTATION_COMMAND_SERVICE) is not None
     ) is representation
@@ -361,6 +395,7 @@ def test_optional_modules_are_independent_deterministic_and_withheld(
     assert (
         engine.get_service(TEXT_LAYER_AGGREGATE_SERVICE) is not None
     ) is text_layer_aggregate
+    assert (engine.get_service(SECRET_STORE_SERVICE) is not None) is secrets
     assert ("representation-commands" in policies) is representation
     assert ("item-lifecycle" in policies) is lifecycle
 
@@ -389,6 +424,13 @@ def test_optional_modules_are_independent_deterministic_and_withheld(
             & capability_ids
         )
         is text_layer_aggregate
+    )
+    assert (
+        bool(
+            {"library.secrets.status", "library.secrets.mutate"}
+            & capability_ids
+        )
+        is secrets
     )
 
     workbenches = {row["id"]: row for row in document["workbenches"]}
@@ -476,6 +518,29 @@ def test_native_text_layer_service_and_capabilities_are_withheld_together():
     }.isdisjoint(_capability_ids(document))
     assert engine.get_service(TEXT_LAYER_AGGREGATE_SERVICE) is None
     assert engine.text_layers is graph.text_layers
+
+
+def test_secret_service_and_capabilities_are_withheld_together():
+    graph = _graph(secrets=False)
+    contributions = first_party_module_contributions(graph)
+    engine = LibraryEngineBuilder(contributions).build()
+    document = engine.discovery_document()
+
+    assert "library.secrets" not in {
+        row["id"] for row in document["modules"]
+    }
+    assert {
+        "library.secrets.status",
+        "library.secrets.mutate",
+    }.isdisjoint(_capability_ids(document))
+    assert engine.get_service(SECRET_STORE_SERVICE) is None
+
+
+def test_service_graph_rejects_non_service_secret_binding():
+    graph = _graph(secrets=False)
+
+    with pytest.raises(TypeError, match="SecretStoreService"):
+        replace(graph, secret_store=object())
 
 
 def test_service_graph_rejects_half_installed_canvas_vertical():

@@ -46,6 +46,7 @@ from .filesystem import (
     InterchangeBindings,
     ItemLockFactory,
     ReplicaBindings,
+    SecretStoreBindings,
     TranslationBindings,
     TextLayerAggregateBindings,
     compose_filesystem_engine,
@@ -150,6 +151,7 @@ class FilesystemHostBindings:
     recovery_lock_context: RecoveryLockFactory = _null_recovery_lock
     canvases: CanvasBindings | None = None
     text_layer_aggregate: TextLayerAggregateBindings | None = None
+    secrets: SecretStoreBindings | None = None
 
     def __post_init__(self) -> None:
         for value, expected, name in (
@@ -171,6 +173,11 @@ class FilesystemHostBindings:
             TextLayerAggregateBindings,
         ):
             raise TypeError("text_layer_aggregate has an invalid binding bundle")
+        if self.secrets is not None and not isinstance(
+            self.secrets,
+            SecretStoreBindings,
+        ):
+            raise TypeError("secrets has an invalid binding bundle")
         for callback, name in (
             (
                 self.workspace_lock_context_for,
@@ -392,6 +399,7 @@ def open_filesystem_engine(
             contribution_factory=contribute_modules,
             canvases=bindings.canvases,
             text_layer_aggregate=bindings.text_layer_aggregate,
+            secrets=bindings.secrets,
         )
         # Composition must succeed before restart recovery mutates job history.
         # The session is still unpublished, so clients cannot observe a partial

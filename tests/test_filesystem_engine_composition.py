@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import subprocess
@@ -32,6 +33,7 @@ from librarytool.composition.filesystem import (
     ItemLifecycleBindings,
     ReplicaBindings,
     RepresentationBindings,
+    SecretStoreBindings,
     TextLayerAggregateBindings,
     TranslationBindings,
     compose_filesystem_engine,
@@ -76,6 +78,7 @@ from librarytool.engine.runtime import (
     LIB_OPEN_SERVICE,
     REPLICA_SERVICE,
     REPRESENTATION_COMMAND_SERVICE,
+    SECRET_STORE_SERVICE,
     TEXT_LAYER_AGGREGATE_SERVICE,
     TEXT_LAYER_SERVICE,
     TRANSLATION_PROVENANCE_SERVICE,
@@ -93,6 +96,14 @@ from librarytool.engine.text_layer_aggregate import (
     TextLayerSourceSnapshot,
     TextLayerUnitDraft,
     TextLayerUnitReplacement,
+)
+from librarytool.engine.secret_store import (
+    ClearSecretCommand,
+    ReplaceSecretCommand,
+    SecretMutationReceipt,
+    SecretReplayDecision,
+    SecretReplayProbe,
+    SecretStatus,
 )
 from librarytool.engine.representation_commands import (
     RepresentationAggregateSnapshot,
@@ -122,6 +133,131 @@ class _Descriptors:
         if item_id != "book-one":
             return None
         return ItemDescriptor("book-one", ("primary",), {"title": "Herbal"})
+
+
+class _MemorySecretRepository:
+    """Non-persistent public repository fake with keyed replay evidence."""
+
+    secret_id = "provider:test:api-key"
+
+    def __init__(self) -> None:
+        self.current = SecretStatus(self.secret_id, False, "secret-r1")
+        self.operations: dict[
+            str,
+            tuple[
+                tuple[str, str, str, bytes | None],
+                SecretMutationReceipt,
+            ],
+        ] = {}
+        self.revision = 1
+        self.status_calls = 0
+        self.unit_calls = 0
+        self.private_calls = 0
+
+    @staticmethod
+    def _signature(
+        probe: SecretReplayProbe,
+    ) -> tuple[str, str, str, bytes | None]:
+        fingerprint = None
+        if probe.credential is not None:
+            fingerprint = hmac.digest(
+                b"composition-test-replay-key",
+                probe.credential.reveal().encode("utf-8"),
+                "sha256",
+            )
+        return (
+            probe.action,
+            probe.secret_id,
+            probe.expected_revision,
+            fingerprint,
+        )
+
+    def status(self, secret_id):
+        self.status_calls += 1
+        return self.current if secret_id == self.secret_id else None
+
+    @contextmanager
+    def unit_of_work(self, *, operation_id):
+        self.unit_calls += 1
+        yield _MemorySecretUnit(self, operation_id)
+
+    def credential_leases(self):
+        self.private_calls += 1
+        raise AssertionError("credential leases stay in provider composition")
+
+    def health(self):
+        self.private_calls += 1
+        raise AssertionError("vault health stays in host composition")
+
+
+class _MemorySecretUnit:
+    def __init__(
+        self,
+        repository: _MemorySecretRepository,
+        operation_id: str,
+    ) -> None:
+        self.repository = repository
+        self.operation_id = operation_id
+        self.pending: SecretStatus | None = None
+
+    def replay(self, probe):
+        prior = self.repository.operations.get(self.operation_id)
+        if prior is None:
+            return SecretReplayDecision("absent")
+        signature, receipt = prior
+        candidate = self.repository._signature(probe)
+        prior_fingerprint = signature[3]
+        candidate_fingerprint = candidate[3]
+        fingerprints_match = (
+            prior_fingerprint is None and candidate_fingerprint is None
+        ) or (
+            prior_fingerprint is not None
+            and candidate_fingerprint is not None
+            and hmac.compare_digest(
+                prior_fingerprint,
+                candidate_fingerprint,
+            )
+        )
+        exact = signature[:3] == candidate[:3] and fingerprints_match
+        return SecretReplayDecision(
+            "exact" if exact else "conflict",
+            receipt if exact else None,
+        )
+
+    def status(self, secret_id):
+        return (
+            self.repository.current
+            if secret_id == self.repository.secret_id
+            else None
+        )
+
+    def _next(self, configured: bool) -> SecretStatus:
+        self.repository.revision += 1
+        self.pending = SecretStatus(
+            self.repository.secret_id,
+            configured,
+            f"secret-r{self.repository.revision}",
+        )
+        return self.pending
+
+    def stage_replace(self, current, credential):
+        assert current is self.repository.current
+        assert credential.reveal()
+        return self._next(True)
+
+    def stage_clear(self, current):
+        assert current is self.repository.current
+        return self._next(False)
+
+    def commit(self, receipt, *, replay):
+        assert self.pending is not None
+        assert receipt.after is self.pending
+        assert replay.operation_id == self.operation_id
+        self.repository.current = self.pending
+        self.repository.operations[self.operation_id] = (
+            self.repository._signature(replay),
+            receipt,
+        )
 
 
 class _CommandPolicy:
@@ -493,6 +629,7 @@ def _composition(
     item_command_policy=None,
     canvases: CanvasBindings | None = None,
     text_layer_aggregate: TextLayerAggregateBindings | None = None,
+    secrets: SecretStoreBindings | None = None,
     workspace_lock_context_for=_workspace_lock,
 ):
     write_set = _TrackingWriteSet(tmp_path / "workspace")
@@ -584,6 +721,7 @@ def _composition(
         contribution_factory=contribution_factory,
         canvases=canvases,
         text_layer_aggregate=text_layer_aggregate,
+        secrets=secrets,
     )
     return {
         "engine": engine,
@@ -690,6 +828,113 @@ def test_native_text_layer_vertical_is_absent_without_complete_bindings(
     }.isdisjoint(
         row["id"] for row in engine.discovery_document()["capabilities"]
     )
+
+
+def test_secret_store_is_absent_without_an_explicit_repository_binding(
+    tmp_path,
+):
+    engine = _composition(
+        tmp_path,
+        contribution_factory=first_party_module_contributions,
+    )["engine"]
+    document = engine.discovery_document()
+
+    assert engine.get_service(SECRET_STORE_SERVICE) is None
+    assert "library.secrets" not in {
+        row["id"] for row in document["modules"]
+    }
+    assert {
+        "library.secrets.status",
+        "library.secrets.mutate",
+    }.isdisjoint(row["id"] for row in document["capabilities"])
+
+
+def test_secret_binding_validates_structure_without_touching_repository(
+    tmp_path,
+):
+    class IncompleteRepository:
+        def status(self, _secret_id):
+            raise AssertionError("validation must not call status")
+
+    class DescriptorRepository:
+        @property
+        def status(self):
+            raise AssertionError("validation must not resolve descriptors")
+
+        def unit_of_work(self, *, operation_id):
+            raise AssertionError(operation_id)
+
+    with pytest.raises(TypeError, match="unit_of_work"):
+        SecretStoreBindings(IncompleteRepository())
+    with pytest.raises(TypeError, match="status"):
+        SecretStoreBindings(DescriptorRepository())
+    with pytest.raises(TypeError, match="constructed"):
+        SecretStoreBindings(IncompleteRepository)
+    with pytest.raises(TypeError, match="secrets"):
+        _composition(
+            tmp_path,
+            secrets=cast(SecretStoreBindings, object()),
+        )
+
+    repository = _MemorySecretRepository()
+    binding = SecretStoreBindings(repository)
+    assert binding.repository is repository
+    assert repository.status_calls == repository.unit_calls == 0
+
+
+def test_secret_store_composes_public_mutation_and_replay_only(tmp_path):
+    repository = _MemorySecretRepository()
+    composed = _composition(
+        tmp_path,
+        secrets=SecretStoreBindings(repository),
+        contribution_factory=first_party_module_contributions,
+    )
+    engine = composed["engine"]
+    service = engine.require_service(SECRET_STORE_SERVICE)
+    document = engine.discovery_document()
+
+    assert service._repository is repository
+    assert repository.status_calls == repository.unit_calls == 0
+    assert {
+        "library.secrets.status",
+        "library.secrets.mutate",
+    } <= {row["id"] for row in document["capabilities"]}
+    assert next(
+        row for row in document["modules"] if row["id"] == "library.secrets"
+    )["status"] == "available"
+    assert repository not in {
+        binding.service for binding in engine.services.bindings
+    }
+    assert not hasattr(engine, "secrets")
+    assert not hasattr(engine, "secret_store")
+    assert not hasattr(service, "lease")
+    assert not hasattr(service, "credential_leases")
+    assert not hasattr(service, "health")
+
+    initial = service.get_status(repository.secret_id)
+    assert initial == SecretStatus(repository.secret_id, False, "secret-r1")
+    command = ReplaceSecretCommand(
+        repository.secret_id,
+        initial.revision,
+        "test-credential-that-is-never-persisted",
+        "secret-op-1",
+    )
+    first = service.replace(command)
+    replay = service.replace(command)
+    assert first.replayed is False
+    assert replay.receipt == first.receipt
+    assert replay.replayed is True
+
+    cleared = service.clear(
+        ClearSecretCommand(
+            repository.secret_id,
+            first.receipt.after.revision,
+            "secret-op-2",
+        )
+    )
+    assert cleared.receipt.after.configured is False
+    assert service.get_status(repository.secret_id) == cleared.receipt.after
+    assert repository.private_calls == 0
 
 
 def test_native_text_layer_vertical_composes_query_command_and_replay(
