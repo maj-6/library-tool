@@ -117,7 +117,11 @@
   }
 
   const PROVIDER_ID = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
-  const PROVIDER_SECRET_ID = /^[a-z0-9][a-z0-9._-]{0,62}(?::[a-z0-9][a-z0-9._-]{0,62})+$/;
+  // JavaScript's `$` also matches immediately before a terminal line break.
+  // The negative lookahead is an exact end-of-input assertion, so newline and
+  // Unicode line-separator suffixes cannot turn an invalid segment into one.
+  const SECRET_NAMESPACE_SEGMENT =
+    /^[a-z0-9][a-z0-9._-]{0,62}(?![\s\S])/;
   const PROVIDER_SEMVER = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
   const PROVIDER_LANGUAGE = /^(?:\*|[a-z]{2,8}(?:-[a-z0-9]{1,8})*)$/;
   const PROVIDER_REASON_MESSAGES = Object.freeze({
@@ -152,8 +156,18 @@
   }
 
   function isProviderSecretId(value) {
-    return typeof value === "string" && value.length <= 255 &&
-      PROVIDER_SECRET_ID.test(value);
+    if (typeof value !== "string" || value.length > 255) return false;
+    const segments = value.split(":");
+    return segments.length >= 2 &&
+      segments.every((segment) => SECRET_NAMESPACE_SEGMENT.test(segment));
+  }
+
+  function secretIdentifier(value, name) {
+    if (!isProviderSecretId(value)) {
+      throw new TypeError(
+        `${name} is required and must be a canonical namespaced secret identifier`);
+    }
+    return value;
   }
 
   function isSortedUnique(values, token = (value) => value) {
@@ -385,7 +399,7 @@
 
   function isSecretStatus(value, secretId = null) {
     return hasExactKeys(value, ["id", "configured", "masked_hint", "revision"]) &&
-      isPortableIdentifier(value.id) &&
+      isProviderSecretId(value.id) &&
       (secretId === null || value.id === secretId) &&
       typeof value.configured === "boolean" &&
       typeof value.masked_hint === "string" &&
@@ -926,7 +940,7 @@
     }
 
     async _secretGet({ secretId, signal } = {}) {
-      const id = portableIdentifier(secretId, "secretId");
+      const id = secretIdentifier(secretId, "secretId");
       const path = `/v1/secrets/${encodePart(id)}`;
       const { body, status } = await this._requestJson("GET", path, {
         signal, cache: "no-store", includeStatus: true,
@@ -942,13 +956,16 @@
     }
 
     async _secretReplace({ secretId, revision, credential,
-      idempotencyKey, signal } = {}) {
+      idempotencyKey, legacyLocalImport = false, signal } = {}) {
       if (typeof credential !== "string" || !credential) {
         throw new TypeError("credential is required");
       }
+      if (typeof legacyLocalImport !== "boolean") {
+        throw new TypeError("legacyLocalImport must be a boolean");
+      }
       return this._secretMutation({
         action: "replace", secretId, revision, credential,
-        idempotencyKey, signal,
+        idempotencyKey, legacyLocalImport, signal,
       });
     }
 
@@ -959,16 +976,20 @@
     }
 
     async _secretMutation({ action, secretId, revision, credential,
-      idempotencyKey, signal }) {
-      const id = portableIdentifier(secretId, "secretId");
+      idempotencyKey, legacyLocalImport = false, signal }) {
+      const id = secretIdentifier(secretId, "secretId");
       const operationId = operationKey(idempotencyKey, "idempotencyKey");
       const path = `/v1/secrets/${encodePart(id)}`;
       const method = action === "replace" ? "PUT" : "DELETE";
+      const headers = {
+        "Idempotency-Key": operationId,
+        "If-Match": quoteLifecycleRevision(revision, "revision"),
+      };
+      if (legacyLocalImport) {
+        headers["X-WHL-Secret-Source"] = "legacy-renderer-local-storage-v1";
+      }
       const { body, status } = await this._requestJson(method, path, {
-        headers: {
-          "Idempotency-Key": operationId,
-          "If-Match": quoteLifecycleRevision(revision, "revision"),
-        },
+        headers,
         body: action === "replace" ? { credential } : undefined,
         signal, cache: "no-store", includeStatus: true,
       });

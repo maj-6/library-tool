@@ -165,6 +165,7 @@ from librarytool.engine.replica import ReplicaApplicationService  # noqa: E402
 from librarytool.engine.secret_store import (  # noqa: E402
     ClearSecretCommand,
     ReplaceSecretCommand,
+    SecretStatus,
     SecretStoreService,
 )
 from librarytool.engine.representation_commands import (  # noqa: E402
@@ -12600,8 +12601,15 @@ _PROTECTED_SECRETS_PATH = lib.OUTPUT_DIR / "secrets.dpapi"
 _SECRETS_PATH = lib.OUTPUT_DIR / "secrets.json"
 _MISTRAL_PENDING = "_mistralCloudPending"
 _SECRET_SYNC_STATE_PATH = lib.OUTPUT_DIR / "secret_sync_state.json"
+_MISTRAL_SYNC_SCHEMA = "librarytool.mistral-profile-sync/2"
+_MISTRAL_SYNC_KEY = "mistral"
+_MISTRAL_STABLE_PHASES = frozenset({"synced", "pending", "unowned", "blocked"})
+_MISTRAL_OWNED_PHASES = frozenset({"synced", "pending"})
+_LEGACY_RENDERER_SECRET_HEADER = "X-WHL-Secret-Source"
+_LEGACY_RENDERER_SECRET_SOURCE = "legacy-renderer-local-storage-v1"
 _secrets_lock = threading.RLock()
 _secret_cutover_lock = threading.RLock()
+_mistral_sync_lock = threading.RLock()
 _secret_repository: WindowsDpapiSecretStoreRepository | None = None
 _secret_cutover_complete = False
 
@@ -12635,17 +12643,178 @@ def _secret_sync_state() -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _set_mistral_pending(pending: bool) -> None:
-    with _secrets_lock:
-        state = _secret_sync_state()
-        if pending:
-            state["mistral_pending"] = True
+def _mistral_account_id(value) -> str | None:
+    """Return one safe opaque Supabase user id, or no account identity."""
+
+    if not isinstance(value, str):
+        return None
+    account_id = value.strip()
+    if (
+        not account_id
+        or len(account_id) > 255
+        or any(ord(character) < 32 or ord(character) == 127
+               for character in account_id)
+    ):
+        return None
+    return account_id
+
+
+def _active_mistral_account_id() -> str | None:
+    """Read the stored account identity without refreshing or using a token."""
+
+    session = _auth_doc().get("session")
+    if not isinstance(session, Mapping) or not session.get("refresh_token"):
+        return None
+    return _mistral_account_id(session.get("user_id"))
+
+
+def _mistral_stable_record(
+        phase: str, revision: str, *, owner_user_id: str | None = None) -> dict:
+    record = {"phase": phase, "revision": revision}
+    if owner_user_id is not None:
+        record["owner_user_id"] = owner_user_id
+    return record
+
+
+def _valid_mistral_stable_record(value) -> dict | None:
+    if not isinstance(value, Mapping):
+        return None
+    phase = value.get("phase")
+    revision = value.get("revision")
+    if phase not in _MISTRAL_STABLE_PHASES or not isinstance(revision, str) \
+            or not revision:
+        return None
+    owner = _mistral_account_id(value.get("owner_user_id"))
+    if phase in _MISTRAL_OWNED_PHASES:
+        if owner is None or set(value) != {"phase", "revision", "owner_user_id"}:
+            return None
+        return _mistral_stable_record(
+            phase, revision, owner_user_id=owner)
+    if phase == "unowned":
+        if set(value) != {"phase", "revision"}:
+            return None
+        return _mistral_stable_record(phase, revision)
+    # A blocked record may retain the last known owner for diagnostics and a
+    # deliberate replacement, but it never authorizes a lease or an upload.
+    if set(value) not in (
+        {"phase", "revision"},
+        {"phase", "revision", "owner_user_id"},
+    ):
+        return None
+    return _mistral_stable_record(
+        phase, revision, owner_user_id=owner) if owner else \
+        _mistral_stable_record(phase, revision)
+
+
+def _save_mistral_sync_record(record: dict | None) -> None:
+    """Atomically persist redacted Mistral ownership/sync metadata."""
+
+    state = _secret_sync_state()
+    state.pop("mistral_pending", None)  # v1 marker had no safe account owner
+    state.pop(_MISTRAL_PENDING, None)
+    if record is None:
+        state.pop(_MISTRAL_SYNC_KEY, None)
+        state.pop("schema", None)
+    else:
+        state["schema"] = _MISTRAL_SYNC_SCHEMA
+        state[_MISTRAL_SYNC_KEY] = record
+    if state:
+        lib.save_json(_SECRET_SYNC_STATE_PATH, state)
+    else:
+        _SECRET_SYNC_STATE_PATH.unlink(missing_ok=True)
+
+
+def _mistral_record_from_document() -> dict | None:
+    state = _secret_sync_state()
+    if state.get("schema") != _MISTRAL_SYNC_SCHEMA:
+        return None
+    record = state.get(_MISTRAL_SYNC_KEY)
+    if isinstance(record, Mapping):
+        return dict(record)
+    return None
+
+
+def _mistral_prepared_record(
+        *, action: str, operation_id: str, before_revision: str,
+        target_phase: str, target_owner_user_id: str | None,
+        previous: dict | None) -> dict:
+    return {
+        "phase": "prepared",
+        "action": action,
+        "operation_id": operation_id,
+        "before_revision": before_revision,
+        "target_phase": target_phase,
+        "target_owner_user_id": target_owner_user_id,
+        "previous": previous,
+    }
+
+
+def _recover_mistral_sync_record(status: SecretStatus) -> dict | None:
+    """Resolve a v2 write-ahead record against the protected CAS revision.
+
+    The journal is written before a vault mutation.  On restart, an unchanged
+    revision proves the mutation did not commit and restores the prior stable
+    record.  A changed revision plus the expected configured/cleared shape
+    proves the protected mutation crossed its commit boundary, so it remains
+    pending for the recorded owner.  Anything ambiguous is blocked and can
+    neither be leased nor uploaded.
+    """
+
+    raw_state = _secret_sync_state()
+    raw = _mistral_record_from_document()
+    if isinstance(raw, Mapping) and raw.get("phase") == "prepared":
+        before_revision = raw.get("before_revision")
+        action = raw.get("action")
+        operation_id = raw.get("operation_id")
+        target_phase = raw.get("target_phase")
+        target_owner = _mistral_account_id(raw.get("target_owner_user_id"))
+        previous = _valid_mistral_stable_record(raw.get("previous"))
+        valid = (
+            isinstance(before_revision, str) and bool(before_revision)
+            and action in ("replace", "clear")
+            and isinstance(operation_id, str) and bool(operation_id)
+            and target_phase in ("pending", "synced", "unowned")
+            and (target_phase == "unowned") == (target_owner is None)
+        )
+        if valid and status.revision == before_revision:
+            record = previous
+        elif valid and status.configured == (action == "replace"):
+            record = _mistral_stable_record(
+                target_phase,
+                status.revision,
+                owner_user_id=target_owner,
+            )
         else:
-            state.pop("mistral_pending", None)
-        if state:
-            lib.save_json(_SECRET_SYNC_STATE_PATH, state)
-        else:
-            _SECRET_SYNC_STATE_PATH.unlink(missing_ok=True)
+            record = _mistral_stable_record(
+                "blocked", status.revision, owner_user_id=target_owner)
+        _save_mistral_sync_record(record)
+        return record
+
+    record = _valid_mistral_stable_record(raw)
+    if record is not None:
+        if record["revision"] == status.revision:
+            if record["phase"] != "unowned" or status.configured:
+                return record
+            _save_mistral_sync_record(None)
+            return None
+        # A vault revision changed outside the write-ahead protocol. Do not
+        # guess which account owns the resulting credential.
+        blocked = _mistral_stable_record("blocked", status.revision)
+        _save_mistral_sync_record(blocked)
+        return blocked
+
+    # v1 had only a global pending bit; a configured value therefore has no
+    # trustworthy account owner. Preserve it as protected-but-unowned and
+    # never upload it automatically. Empty legacy state can be discarded.
+    legacy_state = bool(raw_state.get("mistral_pending")
+                        or raw_state.get(_MISTRAL_PENDING))
+    if status.configured:
+        unowned = _mistral_stable_record("unowned", status.revision)
+        _save_mistral_sync_record(unowned)
+        return unowned
+    if legacy_state or raw_state:
+        _save_mistral_sync_record(None)
+    return None
 
 
 def _client_settings():
@@ -12673,8 +12842,13 @@ def _legacy_secret_snapshot() -> tuple[dict[str, str], bool, dict, dict]:
             legacy = _legacy_secret_document()
             values: dict[str, str] = {}
             for key in _SECRET_KEYS:
-                raw = legacy.get(key, settings.get(key, ""))
-                value = str(raw or "").strip()
+                # The retired runtime overlaid only a usable secrets.json
+                # value.  A present null/false/blank legacy field must not
+                # suppress a valid client_state credential before both sources
+                # are sanitized.
+                legacy_value = str(legacy.get(key) or "").strip()
+                settings_value = str(settings.get(key) or "").strip()
+                value = legacy_value or settings_value
                 if value:
                     values[key] = value
             return values, bool(legacy.get(_MISTRAL_PENDING)), state, legacy
@@ -12697,12 +12871,24 @@ def _verify_migrated_secret(
 
 
 def _sanitize_legacy_secret_sources(
-        state: dict, *, mistral_pending: bool) -> None:
+        state: dict, *, repository: WindowsDpapiSecretStoreRepository,
+        had_legacy_mistral_state: bool) -> None:
     """Remove plaintext only after every protected value was reopened."""
 
-    # Persist nonsecret sync intent before removing its old marker.  Repeating
-    # this after a crash is harmless.
-    _set_mistral_pending(mistral_pending)
+    # A legacy key/pending bit had no account ownership. Protect the value, but
+    # never reinterpret that global marker as permission to upload it to the
+    # next account that happens to sign in.
+    if had_legacy_mistral_state:
+        status = SecretStoreService(repository).get_status(
+            _SECRET_IDS["mistralKey"])
+        with _secrets_lock:
+            existing = _valid_mistral_stable_record(
+                _mistral_record_from_document())
+            if existing is None and status.configured:
+                _save_mistral_sync_record(
+                    _mistral_stable_record("unowned", status.revision))
+            elif existing is None:
+                _save_mistral_sync_record(None)
     with _client_state_lock:
         fresh = lib.load_json(lib.CLIENT_STATE_PATH, {})
         if not isinstance(fresh, dict):
@@ -12711,7 +12897,13 @@ def _sanitize_legacy_secret_sources(
         removed = False
         if isinstance(settings, dict):
             for key in _SECRET_KEYS:
-                removed = settings.pop(key, None) is not None or removed
+                # Presence, not truthiness, decides whether the sanitized
+                # document must be persisted.  JSON null and blank legacy
+                # fields are still plaintext-secret schema and must disappear
+                # physically from disk.
+                if key in settings:
+                    del settings[key]
+                    removed = True
         if removed:
             lib.save_json(lib.CLIENT_STATE_PATH, fresh)
     with _secrets_lock:
@@ -12776,7 +12968,15 @@ def _migrate_legacy_plaintext_secrets(
             _verify_migrated_secret(reopened, legacy_key, credential)
         repository = reopened
 
-    _sanitize_legacy_secret_sources(state, mistral_pending=pending)
+    _sanitize_legacy_secret_sources(
+        state,
+        repository=repository,
+        had_legacy_mistral_state=(
+            pending
+            or "mistralKey" in legacy
+            or "mistralKey" in settings
+        ),
+    )
     return repository
 
 
@@ -12821,6 +13021,42 @@ def _lease_secret(legacy_key: str):
     if repository is None:
         raise RuntimeError("protected credential storage is unavailable")
     try:
+        if legacy_key == "mistralKey":
+            # Mistral is account data, not a machine-global provider key. Take
+            # one credential snapshot only while ownership, active session,
+            # metadata revision, and protected revision all agree. Do not hold
+            # the metadata lock across the provider's network operation.
+            with _secrets_lock:
+                status = _secret_service().get_status(secret_id)
+                record = _recover_mistral_sync_record(status)
+                account_id = _active_mistral_account_id()
+                owned_access = bool(
+                    account_id is not None
+                    and record
+                    and record.get("phase") in _MISTRAL_OWNED_PHASES
+                    and record.get("owner_user_id") == account_id
+                )
+                local_unowned_access = bool(
+                    account_id is None
+                    and record
+                    and record.get("phase") == "unowned"
+                )
+                if (
+                    not (owned_access or local_unowned_access)
+                    or record.get("revision") != status.revision
+                ):
+                    raise RuntimeError(
+                        "the required provider credential is not configured")
+                with repository.credential_leases.lease(secret_id) as leased:
+                    if leased.revision != status.revision:
+                        raise RuntimeError(
+                            "protected credential storage is unavailable")
+                    credential = leased.reveal()
+            try:
+                yield credential
+            finally:
+                credential = ""
+            return
         with repository.credential_leases.lease(secret_id) as leased:
             yield leased.reveal()
     except SecretCredentialNotConfiguredError:
@@ -12833,9 +13069,48 @@ def _lease_secret(legacy_key: str):
 
 def _secret_is_configured(legacy_key: str) -> bool:
     try:
-        return _secret_service().get_status(_SECRET_IDS[legacy_key]).configured
+        status = _secret_service().get_status(_SECRET_IDS[legacy_key])
+        if legacy_key != "mistralKey" or not status.configured:
+            return status.configured
+        with _secrets_lock:
+            record = _recover_mistral_sync_record(status)
+            account_id = _active_mistral_account_id()
+            return bool(
+                record
+                and record.get("revision") == status.revision
+                and (
+                    record.get("phase") in _MISTRAL_OWNED_PHASES
+                    and record.get("owner_user_id") == account_id
+                    and account_id is not None
+                    or record.get("phase") == "unowned"
+                    and account_id is None
+                )
+            )
     except EngineError:
         return False
+
+
+def _public_secret_status(status: SecretStatus) -> SecretStatus:
+    """Hide another account's Mistral presence from the active renderer."""
+
+    if status.secret_id != _SECRET_IDS["mistralKey"] or not status.configured:
+        return status
+    with _secrets_lock:
+        record = _recover_mistral_sync_record(status)
+        account_id = _active_mistral_account_id()
+        if (
+            record
+            and record.get("revision") == status.revision
+            and (
+                record.get("phase") in _MISTRAL_OWNED_PHASES
+                and record.get("owner_user_id") == account_id
+                and account_id is not None
+                or record.get("phase") == "unowned"
+                and account_id is None
+            )
+        ):
+            return status
+    return SecretStatus(status.secret_id, False, status.revision)
 
 
 def _secret_health_document() -> dict:
@@ -12871,7 +13146,24 @@ def _secret_operation_id() -> str:
             "an idempotency key is required",
             code="operation_id_required",
             details={"header": "Idempotency-Key"})
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", operation_id):
+        raise EngineValidationError(
+            "the idempotency key is invalid",
+            code="invalid_operation_id",
+            details={"header": "Idempotency-Key"})
     return operation_id
+
+
+def _legacy_renderer_secret_import() -> bool:
+    source = request.headers.get(_LEGACY_RENDERER_SECRET_HEADER)
+    if source is None:
+        return False
+    if source != _LEGACY_RENDERER_SECRET_SOURCE:
+        raise EngineValidationError(
+            "the secret mutation source is invalid",
+            code="invalid_secret_mutation_source",
+            details={"header": _LEGACY_RENDERER_SECRET_HEADER})
+    return True
 
 
 _SECRET_MUTATION_MAX_BYTES = 512 * 1024
@@ -12945,7 +13237,8 @@ def api_v1_secret_statuses():
     if health["available"]:
         try:
             statuses = [
-                _secret_service().get_status(secret_id).as_dict()
+                _public_secret_status(
+                    _secret_service().get_status(secret_id)).as_dict()
                 for secret_id in sorted(_SECRET_REGISTRY.ids)
             ]
         except EngineError as exc:
@@ -12965,7 +13258,8 @@ def api_v1_secret_status(secret_id: str):
             "protected secret storage is unavailable",
             code="secret_repository_unavailable", retryable=True))
     try:
-        status = _secret_service().get_status(secret_id)
+        status = _public_secret_status(
+            _secret_service().get_status(secret_id))
     except EngineError as exc:
         return _engine_error_response(exc)
     response = jsonify({
@@ -12977,18 +13271,173 @@ def api_v1_secret_status(secret_id: str):
     return response
 
 
+def _mistral_mutation_authorized(
+        record: dict | None, status: SecretStatus, *, action: str,
+        owner_user_id: str | None, legacy_renderer_import: bool) -> tuple[str, str | None]:
+    """Authorize one local mutation and return its durable target ownership."""
+
+    if legacy_renderer_import:
+        if action != "replace":
+            raise EngineValidationError(
+                "legacy credential import requires replacement",
+                code="invalid_secret_mutation_source")
+        if record and record.get("phase") != "unowned":
+            raise EngineConflictError(
+                "an account-owned protected credential already exists",
+                code="mistral_credential_owned")
+        return "unowned", None
+
+    phase = record.get("phase") if record else None
+    prior_owner = record.get("owner_user_id") if record else None
+    if owner_user_id is None:
+        if phase == "pending" or phase == "synced" and status.configured:
+            raise EngineConflictError(
+                "the protected Mistral credential belongs to a signed-out account",
+                code="mistral_credential_owned")
+        if phase == "blocked":
+            raise EngineConflictError(
+                "protected Mistral ownership is unresolved",
+                code="mistral_credential_owned")
+        # Signed-out Library Tool remains fully useful: a user may configure a
+        # device-local Mistral key. It is explicitly unowned, can be leased only
+        # while no account is active, and is never profile-synchronized.
+        return "unowned", None
+    if phase == "pending" and prior_owner != owner_user_id:
+        raise EngineConflictError(
+            "another account has a pending Mistral credential change",
+            code="mistral_pending_for_another_account")
+    if action == "clear" and phase == "unowned":
+        # The account-scoped status intentionally hides this device-local
+        # legacy value.  Treating its clear as an account mutation would then
+        # upload an empty value and erase an unrelated remote credential.
+        raise EngineConflictError(
+            "the protected Mistral credential is not owned by this account",
+            code="mistral_credential_unowned")
+    if (
+        action == "clear"
+        and phase in _MISTRAL_OWNED_PHASES
+        and prior_owner != owner_user_id
+    ):
+        raise EngineConflictError(
+            "the protected Mistral credential belongs to another account",
+            code="mistral_credential_owned")
+    return "pending", owner_user_id
+
+
+def _commit_mistral_mutation(
+        command: ReplaceSecretCommand | ClearSecretCommand, *, action: str,
+        target_phase: str, target_owner_user_id: str | None):
+    """Commit one vault mutation behind a recoverable write-ahead record.
+
+    Caller-visible CAS/idempotency remain the engine service's responsibility.
+    The sidecar journal adds only account ownership and remote-sync intent.
+    """
+
+    with _secrets_lock:
+        service = _secret_service()
+        before = service.get_status(command.secret_id)
+        previous = _recover_mistral_sync_record(before)
+        prepared = _mistral_prepared_record(
+            action=action,
+            operation_id=command.operation_id,
+            before_revision=before.revision,
+            target_phase=target_phase,
+            target_owner_user_id=target_owner_user_id,
+            previous=previous,
+        )
+        _save_mistral_sync_record(prepared)
+        try:
+            if action == "replace":
+                assert isinstance(command, ReplaceSecretCommand)
+                result = service.replace(command)
+            else:
+                assert isinstance(command, ClearSecretCommand)
+                result = service.clear(command)
+        except Exception:
+            # Settle a definite pre-commit failure immediately. If even status
+            # recovery is unavailable, preserve the prepared journal so the
+            # next process can resolve it without guessing.
+            try:
+                fresh = service.get_status(command.secret_id)
+                _recover_mistral_sync_record(fresh)
+            except Exception:
+                pass
+            raise
+        if result.replayed:
+            # Exact replay proves this call did not mutate the current vault.
+            # Never transfer ownership using a historical receipt, especially
+            # when a different account presents an old operation id.
+            _save_mistral_sync_record(previous)
+            return result
+        _save_mistral_sync_record(_mistral_stable_record(
+            target_phase,
+            result.receipt.after.revision,
+            owner_user_id=target_owner_user_id,
+        ))
+        return result
+
+
+def _mistral_sync_pending_for_active_account() -> bool:
+    with _secrets_lock:
+        status = _secret_service().get_status(_SECRET_IDS["mistralKey"])
+        record = _recover_mistral_sync_record(status)
+        account_id = _active_mistral_account_id()
+        return bool(
+            account_id
+            and record
+            and record.get("phase") == "pending"
+            and record.get("owner_user_id") == account_id
+            and record.get("revision") == status.revision
+        )
+
+
+def _mutate_mistral_from_request(
+        command: ReplaceSecretCommand | ClearSecretCommand, *, action: str,
+        legacy_renderer_import: bool = False):
+    with _secrets_lock:
+        status = _secret_service().get_status(command.secret_id)
+        record = _recover_mistral_sync_record(status)
+        target_phase, target_owner = _mistral_mutation_authorized(
+            record,
+            status,
+            action=action,
+            owner_user_id=_active_mistral_account_id(),
+            legacy_renderer_import=legacy_renderer_import,
+        )
+        return _commit_mistral_mutation(
+            command,
+            action=action,
+            target_phase=target_phase,
+            target_owner_user_id=target_owner,
+        )
+
+
 @app.put("/api/v1/secrets/<path:secret_id>")
 def api_v1_secret_replace(secret_id: str):
     try:
         expected = _secret_match(secret_id)
         operation_id = _secret_operation_id()
+        legacy_renderer_import = _legacy_renderer_secret_import()
         credential = _secret_replacement_credential()
-        result = _secret_service().replace(ReplaceSecretCommand(
+        command = ReplaceSecretCommand(
             secret_id=secret_id,
             expected_revision=expected,
             credential=credential,
             operation_id=operation_id,
-        ))
+        )
+        if secret_id == _SECRET_IDS["mistralKey"]:
+            result = _mutate_mistral_from_request(
+                command,
+                action="replace",
+                legacy_renderer_import=legacy_renderer_import,
+            )
+        else:
+            if legacy_renderer_import:
+                # The marker changes account semantics only for Mistral. It is
+                # accepted for other legacy renderer credentials so one client
+                # migration path can handle the complete registry.
+                pass
+            result = _secret_service().replace(command)
     except (TypeError, ValueError) as exc:
         return _engine_error_response(EngineValidationError(
             "the secret replacement document is invalid",
@@ -12996,8 +13445,14 @@ def api_v1_secret_replace(secret_id: str):
             details={"cause_type": type(exc).__name__}))
     except EngineError as exc:
         return _engine_error_response(exc)
-    if secret_id == _SECRET_IDS["mistralKey"]:
-        _set_mistral_pending(True)
+    if (
+        secret_id == _SECRET_IDS["mistralKey"]
+        and not legacy_renderer_import
+        and (not result.replayed or _mistral_sync_pending_for_active_account())
+    ):
+        # Local commit succeeded. Remote failure is deliberately non-fatal: the
+        # protected write-ahead state remains pending and startup/login retries.
+        _sync_profile_mistral_key()
     return jsonify({
         "ok": True,
         "schema": "librarytool.secret-mutation-receipt/1",
@@ -13008,15 +13463,26 @@ def api_v1_secret_replace(secret_id: str):
 @app.delete("/api/v1/secrets/<path:secret_id>")
 def api_v1_secret_clear(secret_id: str):
     try:
-        result = _secret_service().clear(ClearSecretCommand(
+        if _legacy_renderer_secret_import():
+            raise EngineValidationError(
+                "legacy credential import requires replacement",
+                code="invalid_secret_mutation_source")
+        command = ClearSecretCommand(
             secret_id=secret_id,
             expected_revision=_secret_match(secret_id),
             operation_id=_secret_operation_id(),
-        ))
+        )
+        if secret_id == _SECRET_IDS["mistralKey"]:
+            result = _mutate_mistral_from_request(command, action="clear")
+        else:
+            result = _secret_service().clear(command)
     except EngineError as exc:
         return _engine_error_response(exc)
-    if secret_id == _SECRET_IDS["mistralKey"]:
-        _set_mistral_pending(True)
+    if (
+        secret_id == _SECRET_IDS["mistralKey"]
+        and (not result.replayed or _mistral_sync_pending_for_active_account())
+    ):
+        _sync_profile_mistral_key()
     return jsonify({
         "ok": True,
         "schema": "librarytool.secret-mutation-receipt/1",
@@ -13024,81 +13490,202 @@ def api_v1_secret_clear(secret_id: str):
     })
 
 
-def _sync_profile_mistral_key_with_cfg(cfg: dict, ses: dict) -> str | None:
-    """Reconcile Mistral inside an active auth execution-config lease."""
-    secret_id = _SECRET_IDS["mistralKey"]
-    try:
-        before = _secret_service().get_status(secret_id)
-        if before.configured:
-            with _lease_secret("mistralKey") as credential:
-                local = credential
-        else:
-            local = ""
-        pending = bool(_secret_sync_state().get("mistral_pending"))
-        adopt = None
-        for _attempt in range(4):
-            rows = sauth.rest(
-                cfg, ses["access_token"], "GET",
-                f"profile_secrets?id=eq.{ses['user_id']}"
-                "&select=api_keys,updated_at",
-            ) or []
-            keys = dict(rows[0].get("api_keys") or {}) if rows else {}
-            if not pending and "mistral" in keys:
-                local = adopt = str(keys.get("mistral") or "").strip()
-                break
+def _profile_secret_rows(value) -> list:
+    if not isinstance(value, list) or any(
+            not isinstance(row, Mapping) for row in value):
+        raise sauth.AuthError("profile secret response was invalid")
+    return value
 
-            # Every writer updates the same revision token. If Android wins
-            # between this GET and PATCH, the empty response forces a re-read
-            # and re-merge so its DeepSeek/Mistral edits are not erased.
-            keys["mistral"] = local
-            written_at = datetime.now(timezone.utc).isoformat()
-            if rows:
-                previous = str(rows[0].get("updated_at") or "").strip()
-                revision = ("updated_at=eq." + urllib.parse.quote(previous, safe="")
-                            if previous else "updated_at=is.null")
-                wrote = sauth.rest(
-                    cfg, ses["access_token"], "PATCH",
-                    f"profile_secrets?id=eq.{ses['user_id']}&{revision}",
-                    {"api_keys": keys, "updated_at": written_at},
-                    prefer="return=representation",
-                ) or []
-            else:
-                wrote = sauth.rest(
-                    cfg, ses["access_token"], "POST",
-                    "profile_secrets?on_conflict=id",
-                    [{"id": ses["user_id"], "api_keys": keys,
-                      "updated_at": written_at}],
-                    prefer="resolution=ignore-duplicates,return=representation",
-                ) or []
-            if wrote:
-                break
+
+def _profile_secret_keys(rows: list) -> dict:
+    if not rows:
+        return {}
+    raw = rows[0].get("api_keys")
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise sauth.AuthError("profile secret response was invalid")
+    return dict(raw)
+
+
+def _mistral_credential_snapshot(
+        status: SecretStatus, record: dict, owner_user_id: str) -> str:
+    repository = _secret_repository
+    if repository is None:
+        raise RuntimeError("protected credential storage is unavailable")
+    if (
+        record.get("owner_user_id") != owner_user_id
+        or record.get("phase") not in _MISTRAL_OWNED_PHASES
+        or record.get("revision") != status.revision
+    ):
+        raise RuntimeError("the required provider credential is not configured")
+    if not status.configured:
+        return ""
+    with repository.credential_leases.lease(status.secret_id) as leased:
+        if leased.revision != status.revision:
+            raise RuntimeError("protected credential storage is unavailable")
+        return leased.reveal()
+
+
+def _write_profile_mistral(
+        cfg: dict, ses: dict, local: str) -> None:
+    """CAS-merge one pending local value without erasing other providers."""
+
+    owner_user_id = _mistral_account_id(ses.get("user_id"))
+    if owner_user_id is None:
+        raise sauth.AuthError("profile account identity was invalid")
+    encoded_owner = urllib.parse.quote(owner_user_id, safe="")
+    for _attempt in range(4):
+        rows = _profile_secret_rows(sauth.rest(
+            cfg, ses["access_token"], "GET",
+            f"profile_secrets?id=eq.{encoded_owner}"
+            "&select=api_keys,updated_at",
+        ) or [])
+        keys = _profile_secret_keys(rows)
+        keys["mistral"] = local
+        written_at = datetime.now(timezone.utc).isoformat()
+        if rows:
+            previous = str(rows[0].get("updated_at") or "").strip()
+            revision = ("updated_at=eq." + urllib.parse.quote(previous, safe="")
+                        if previous else "updated_at=is.null")
+            wrote = sauth.rest(
+                cfg, ses["access_token"], "PATCH",
+                f"profile_secrets?id=eq.{encoded_owner}&{revision}",
+                {"api_keys": keys, "updated_at": written_at},
+                prefer="return=representation",
+            ) or []
         else:
-            raise sauth.AuthError("profile changed on another device; retrying")
-        # Apply an outcome only while the local CAS token still matches the
-        # value observed before the network round trip. A newer Settings edit
-        # remains pending and wins on the next pass.
-        fresh = _secret_service().get_status(secret_id)
-        fresh_pending = bool(_secret_sync_state().get("mistral_pending"))
-        if fresh.revision == before.revision:
-            if adopt is not None and not fresh_pending:
-                operation_id = "mistral-profile-adopt-" + uuid.uuid4().hex
-                if adopt:
-                    _secret_service().replace(ReplaceSecretCommand(
-                        secret_id=secret_id,
-                        expected_revision=fresh.revision,
-                        credential=adopt,
-                        operation_id=operation_id,
-                    ))
-                elif fresh.configured:
-                    _secret_service().clear(ClearSecretCommand(
-                        secret_id=secret_id,
-                        expected_revision=fresh.revision,
-                        operation_id=operation_id,
-                    ))
-            elif adopt is None and fresh_pending:
-                _set_mistral_pending(False)
-        return local
-    except (EngineError, RuntimeError, sauth.AuthError) as exc:
+            wrote = sauth.rest(
+                cfg, ses["access_token"], "POST",
+                "profile_secrets?on_conflict=id",
+                [{"id": owner_user_id, "api_keys": keys,
+                  "updated_at": written_at}],
+                prefer="resolution=ignore-duplicates,return=representation",
+            ) or []
+        if wrote:
+            return
+    raise sauth.AuthError("profile changed on another device; retrying")
+
+
+def _adopt_profile_mistral_locked(
+        *, owner_user_id: str, remote: str, status: SecretStatus,
+        local: str | None) -> None:
+    """Apply a cloud snapshot after the caller revalidated local ownership."""
+
+    secret_id = _SECRET_IDS["mistralKey"]
+    if local is not None and remote == local:
+        _save_mistral_sync_record(_mistral_stable_record(
+            "synced", status.revision, owner_user_id=owner_user_id))
+        return
+    operation_id = "mistral-profile-adopt-" + uuid.uuid4().hex
+    if remote:
+        command = ReplaceSecretCommand(
+            secret_id=secret_id,
+            expected_revision=status.revision,
+            credential=remote,
+            operation_id=operation_id,
+        )
+        _commit_mistral_mutation(
+            command,
+            action="replace",
+            target_phase="synced",
+            target_owner_user_id=owner_user_id,
+        )
+    elif status.configured:
+        command = ClearSecretCommand(
+            secret_id=secret_id,
+            expected_revision=status.revision,
+            operation_id=operation_id,
+        )
+        _commit_mistral_mutation(
+            command,
+            action="clear",
+            target_phase="synced",
+            target_owner_user_id=owner_user_id,
+        )
+    else:
+        _save_mistral_sync_record(_mistral_stable_record(
+            "synced", status.revision, owner_user_id=owner_user_id))
+
+
+def _sync_profile_mistral_key_with_cfg(cfg: dict, ses: dict) -> str | None:
+    """Reconcile only the active account's owned protected Mistral value."""
+
+    secret_id = _SECRET_IDS["mistralKey"]
+    owner_user_id = _mistral_account_id(ses.get("user_id"))
+    if owner_user_id is None or not ses.get("access_token"):
+        return None
+    try:
+        # Serialize full remote reconciliations. A second login waits for an
+        # older account's in-flight upload, then re-evaluates current session
+        # and ownership instead of racing it.
+        with _mistral_sync_lock:
+            if _active_mistral_account_id() != owner_user_id:
+                return None
+            with _secrets_lock:
+                before = _secret_service().get_status(secret_id)
+                record = _recover_mistral_sync_record(before)
+                phase = record.get("phase") if record else None
+                record_owner = record.get("owner_user_id") if record else None
+                if phase in ("unowned", "blocked"):
+                    # An ownerless legacy cache must be explicitly re-entered;
+                    # never upload it to whichever user logs in next.
+                    return None
+                if phase == "pending" and record_owner != owner_user_id:
+                    return None
+                pending = phase == "pending"
+                if record_owner == owner_user_id:
+                    local = _mistral_credential_snapshot(
+                        before, record, owner_user_id)
+                else:
+                    # Switching from a fully synced prior owner is safe, but
+                    # their credential must never leave the protected store.
+                    local = None
+                snapshot_record = dict(record) if record else None
+
+            if pending:
+                assert local is not None
+                _write_profile_mistral(cfg, ses, local)
+                with _secrets_lock:
+                    fresh = _secret_service().get_status(secret_id)
+                    fresh_record = _recover_mistral_sync_record(fresh)
+                    if (
+                        fresh.revision == before.revision
+                        and fresh_record == snapshot_record
+                    ):
+                        _save_mistral_sync_record(_mistral_stable_record(
+                            "synced", fresh.revision,
+                            owner_user_id=owner_user_id))
+                return local
+
+            rows = _profile_secret_rows(sauth.rest(
+                cfg, ses["access_token"], "GET",
+                "profile_secrets?id=eq."
+                f"{urllib.parse.quote(owner_user_id, safe='')}"
+                "&select=api_keys,updated_at",
+            ) or [])
+            keys = _profile_secret_keys(rows)
+            raw_remote = keys.get("mistral") if "mistral" in keys else ""
+            if not isinstance(raw_remote, str):
+                raise sauth.AuthError("profile secret response was invalid")
+            remote = raw_remote.strip()
+            with _secrets_lock:
+                fresh = _secret_service().get_status(secret_id)
+                fresh_record = _recover_mistral_sync_record(fresh)
+                if (
+                    _active_mistral_account_id() != owner_user_id
+                    or fresh.revision != before.revision
+                    or fresh_record != snapshot_record
+                ):
+                    return None
+                _adopt_profile_mistral_locked(
+                    owner_user_id=owner_user_id,
+                    remote=remote,
+                    status=fresh,
+                    local=local,
+                )
+            return remote
+    except (EngineError, OSError, RuntimeError, sauth.AuthError) as exc:
         log.warning("Mistral profile sync deferred: %s", exc)
         return None
 

@@ -313,7 +313,12 @@ RLS is what protects the project.
   `secrets.json` are committed, the repository is reconstructed, and every
   value is exactly leased and verified before either plaintext source is
   sanitized. A failed commit/reopen/verification preserves the legacy sources
-  for an idempotent retry; no plaintext backup is created.
+  for an idempotent retry; no plaintext backup is created. The renderer also
+  isolates credentials left in a pre-cutover `localStorage` cache before any
+  settings synchronization, imports each through the protected CAS API, and
+  scrubs it only after a confirmed protected write. A failed or ambiguous
+  import remains locally retryable and never enters `state.settings` or client
+  state.
 - `library.secrets` publishes only fixed masked status and idempotent CAS
   replace/clear. The renderer uses `/api/v1/secrets` through `EngineClient` and
   retains status, masks, and revisions only; the former plaintext
@@ -329,7 +334,15 @@ RLS is what protects the project.
 - Bring-your-own Mistral/DeepSeek keys shared between phone and desktop
   live in the `profile_secrets` table — a separate table, not a
   `profiles` column, readable and writable by exactly one user
-  (`id = auth.uid()`). The desktop reconciles its local copy with it.
+  (`id = auth.uid()`). The desktop's Mistral cache carries explicit account
+  ownership and a redacted write-ahead sync record next to the DPAPI vault.
+  Vault revision recovery makes local mutation plus pending-cloud intent
+  crash-safe; exact replays cannot transfer ownership. Logout and account
+  changes hide and deny another account's cache, and a prior owner's unsynced
+  change blocks takeover until it is reconciled. A key entered while signed
+  out (or migrated without trustworthy ownership) remains an unowned
+  local-only key: usable only while signed out and never uploaded
+  automatically.
 
 **OWNER-ONLY** (never on a client, never in the repo):
 

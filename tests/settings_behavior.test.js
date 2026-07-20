@@ -89,6 +89,204 @@ test("settings partition keeps current and retired keys out of storage", () => {
   assert.deepEqual(result.view, { topTable: "whl" });
 });
 
+test("legacy credential cache is isolated from renderer settings before sync", () => {
+  const stored = {
+    settings: JSON.stringify({
+      theme: "sage",
+      aiKey: "legacy-ai",
+      mistralKey: "legacy-mistral",
+    }),
+    view: JSON.stringify({ topTable: "whl", r2Secret: "legacy-r2" }),
+  };
+  const context = vm.createContext({
+    SETTINGS_KEY: "settings",
+    VIEWSTATE_KEY: "view",
+    state: { settings: { theme: "default" } },
+    localStorage: {
+      getItem: (key) => stored[key] || null,
+      setItem: (key, value) => { stored[key] = value; },
+    },
+    normalizeSettings: () => false,
+    saveSettings: () => assert.fail("normalization should not save"),
+  });
+  vm.runInContext([
+    block("const VIEW_STATE_KEYS", "// Hydrate the renderer"),
+    declaration("loadSettings"),
+    "this.api = { loadSettings, partitionSettings, persistSettingsCache,",
+    "  pending: () => ({ ...legacyRendererSecrets }) };",
+  ].join("\n"), context);
+
+  context.api.loadSettings();
+  assert.deepEqual(plain(context.state.settings), {
+    theme: "sage", topTable: "whl",
+  });
+  assert.deepEqual(plain(context.api.pending()), {
+    aiKey: "legacy-ai",
+    mistralKey: "legacy-mistral",
+    r2Secret: "legacy-r2",
+  });
+  const outbound = plain(context.api.partitionSettings(context.state.settings));
+  assert.deepEqual(outbound.prefs, { theme: "sage" });
+  assert.deepEqual(outbound.view, { topTable: "whl" });
+
+  context.api.persistSettingsCache(outbound.prefs, outbound.view);
+  assert.deepEqual(JSON.parse(stored.settings), {
+    theme: "sage",
+    aiKey: "legacy-ai",
+    mistralKey: "legacy-mistral",
+    r2Secret: "legacy-r2",
+  });
+  assert.deepEqual(JSON.parse(stored.view), { topTable: "whl" });
+});
+
+test("legacy credential cache imports through protected API then scrubs", async () => {
+  const stored = {};
+  const calls = [];
+  const settings = { theme: "sage", aiKey: "legacy-ai",
+    mistralKey: "legacy-m", ocrAzureKey: "" };
+  const context = vm.createContext({
+    SETTINGS_KEY: "settings",
+    VIEWSTATE_KEY: "view",
+    state: { settings },
+    localStorage: {
+      setItem: (key, value) => { stored[key] = value; },
+    },
+    crypto: { randomUUID: () => `op-${calls.length + 1}` },
+    engineClient: { secrets: {
+      list: async () => ({
+        health: { available: true, state: "ready", writable: true },
+        secrets: [
+          { id: "provider:ai:api-key", configured: false,
+            masked_hint: "", revision: "ai-r1" },
+          { id: "provider:mistral:api-key", configured: false,
+            masked_hint: "", revision: "m-r1" },
+        ],
+      }),
+      replace: async (command) => {
+        calls.push(command);
+        return { receipt: { after: {
+          id: command.secretId, configured: true,
+          masked_hint: "â€¢â€¢â€¢â€¢", revision: `${command.revision}-next`,
+        } } };
+      },
+      clear: async () => assert.fail("migration never clears"),
+    } },
+  });
+  vm.runInContext([
+    block("const VIEW_STATE_KEYS", "// Hydrate the renderer"),
+    declaration("secretConfigured"),
+    declaration("secretMaskedValue"),
+    declaration("secretOperationId"),
+    declaration("hydrateSecrets"),
+    declaration("persistSecrets"),
+    declaration("migrateLegacyRendererSecrets"),
+    "captureLegacyRendererSecrets(state.settings);",
+    "this.api = { migrateLegacyRendererSecrets, partitionSettings,",
+    "  pending: () => ({ ...legacyRendererSecrets }) };",
+  ].join("\n"), context);
+
+  assert.equal(await context.api.migrateLegacyRendererSecrets(), true);
+  assert.equal(calls.length, 2);
+  assert.ok(calls.every((call) => call.legacyLocalImport === true));
+  assert.deepEqual(calls.map((call) => call.credential), ["legacy-ai", "legacy-m"]);
+  assert.deepEqual(plain(context.api.pending()), {});
+  assert.deepEqual(plain(settings), { theme: "sage" });
+  assert.deepEqual(JSON.parse(stored.settings), { theme: "sage" });
+  assert.deepEqual(JSON.parse(stored.view), {});
+});
+
+test("failed protected import leaves retry source but never server settings", async () => {
+  const stored = {};
+  const settings = { theme: "sage", aiKey: "retry-secret" };
+  const context = vm.createContext({
+    SETTINGS_KEY: "settings",
+    VIEWSTATE_KEY: "view",
+    state: { settings },
+    localStorage: {
+      setItem: (key, value) => { stored[key] = value; },
+    },
+    crypto: { randomUUID: () => "retry-op" },
+    engineClient: { secrets: {
+      list: async () => ({
+        health: { available: true, state: "ready", writable: true },
+        secrets: [{ id: "provider:ai:api-key", configured: false,
+          masked_hint: "", revision: "ai-r1" }],
+      }),
+      replace: async () => { throw new Error("sidecar unavailable"); },
+      clear: async () => assert.fail("migration never clears"),
+    } },
+  });
+  vm.runInContext([
+    block("const VIEW_STATE_KEYS", "// Hydrate the renderer"),
+    declaration("secretConfigured"),
+    declaration("secretMaskedValue"),
+    declaration("secretOperationId"),
+    declaration("hydrateSecrets"),
+    declaration("persistSecrets"),
+    declaration("migrateLegacyRendererSecrets"),
+    "captureLegacyRendererSecrets(state.settings);",
+    "persistSettingsCache(partitionSettings(state.settings).prefs, {});",
+    "this.api = { migrateLegacyRendererSecrets, partitionSettings,",
+    "  pending: () => ({ ...legacyRendererSecrets }) };",
+  ].join("\n"), context);
+
+  assert.equal(await context.api.migrateLegacyRendererSecrets(), false);
+  assert.deepEqual(plain(context.api.pending()), { aiKey: "retry-secret" });
+  assert.deepEqual(plain(settings), { theme: "sage" });
+  assert.deepEqual(JSON.parse(stored.settings), {
+    theme: "sage", aiKey: "retry-secret",
+  });
+  assert.deepEqual(plain(context.api.partitionSettings(settings).prefs), {
+    theme: "sage",
+  });
+});
+
+test("account-owned Mistral cache wins over stale renderer plaintext", async () => {
+  const stored = {};
+  const settings = { theme: "sage", mistralKey: "stale-other-account-value" };
+  const context = vm.createContext({
+    SETTINGS_KEY: "settings",
+    VIEWSTATE_KEY: "view",
+    state: { settings },
+    localStorage: {
+      setItem: (key, value) => { stored[key] = value; },
+    },
+    crypto: { randomUUID: () => "owned-conflict-op" },
+    engineClient: { secrets: {
+      list: async () => ({
+        health: { available: true, state: "ready", writable: true },
+        // Account-scoped server status hides the other owner's configured bit.
+        secrets: [{ id: "provider:mistral:api-key", configured: false,
+          masked_hint: "", revision: "m-r1" }],
+      }),
+      replace: async () => {
+        const error = new Error("owned");
+        error.code = "mistral_credential_owned";
+        throw error;
+      },
+      clear: async () => assert.fail("migration never clears"),
+    } },
+  });
+  vm.runInContext([
+    block("const VIEW_STATE_KEYS", "// Hydrate the renderer"),
+    declaration("secretConfigured"),
+    declaration("secretMaskedValue"),
+    declaration("secretOperationId"),
+    declaration("hydrateSecrets"),
+    declaration("persistSecrets"),
+    declaration("migrateLegacyRendererSecrets"),
+    "captureLegacyRendererSecrets(state.settings);",
+    "persistSettingsCache(partitionSettings(state.settings).prefs, {});",
+    "this.api = { migrateLegacyRendererSecrets,",
+    "  pending: () => ({ ...legacyRendererSecrets }) };",
+  ].join("\n"), context);
+
+  assert.equal(await context.api.migrateLegacyRendererSecrets(), true);
+  assert.deepEqual(plain(context.api.pending()), {});
+  assert.deepEqual(plain(settings), { theme: "sage" });
+  assert.deepEqual(JSON.parse(stored.settings), { theme: "sage" });
+});
+
 test("normalization migrates legacy settings and removes unsupported OCR choices", () => {
   const settings = {
     theme: "sage",

@@ -347,6 +347,54 @@ test("secret mutations reject unsafe commands before transport", async () => {
   assert.equal(calls.length, 0);
 });
 
+test("secret ids follow the exact engine namespace contract", async () => {
+  const valid = ["a".repeat(51), "b".repeat(50), "c".repeat(50),
+    "d".repeat(50), "e".repeat(50)].join(":");
+  assert.equal(valid.length, 255);
+  assert.equal(valid.split(":").length, 5);
+  const { client, calls } = harness({
+    ok: true,
+    schema: "librarytool.secret-status/1",
+    status: secretStatus({ id: valid }),
+  });
+  await client.secrets.get({ secretId: valid });
+  assert.equal(calls.length, 1);
+
+  const invalid = ["a".repeat(52), "b".repeat(50), "c".repeat(50),
+    "d".repeat(50), "e".repeat(50)].join(":");
+  assert.equal(invalid.length, 256);
+  for (const secretId of [
+    invalid,
+    "Provider:ai:api-key",
+    `${"a".repeat(64)}:key`,
+    "provider",
+    "provider::key",
+    "provider:key\n",
+    "provider:key\u2028",
+  ]) {
+    await assert.rejects(client.secrets.get({ secretId }), /secretId/);
+  }
+  assert.equal(calls.length, 1);
+});
+
+test("legacy renderer import is explicit and credential-safe on the wire",
+  async () => {
+    const { client, calls } = harness(secretMutationResult("replace"));
+    const result = await client.secrets.replace({
+      secretId: "provider:ai:api-key",
+      revision: "secret-r1",
+      credential: "legacy-cache-value",
+      idempotencyKey: "replace-ai-1",
+      legacyLocalImport: true,
+    });
+
+    assert.equal(calls[0].init.headers["X-WHL-Secret-Source"],
+      "legacy-renderer-local-storage-v1");
+    assert.equal(calls[0].init.body,
+      JSON.stringify({ credential: "legacy-cache-value" }));
+    assert.equal(JSON.stringify(result).includes("legacy-cache-value"), false);
+  });
+
 test("shared OCR layout metadata also crosses the client boundary", async () => {
   const { client, calls } = harness({ ok: true, region_pages: {} });
   await client.ocr.layout({ bookId: "book / one" });

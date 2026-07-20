@@ -63,6 +63,13 @@ const SECRET_IDS = Object.freeze({
 });
 const SECRET_KEYS = new Set(Object.keys(SECRET_IDS));
 let secretStatuses = Object.create(null);
+// Upgrade-only plaintext staging. Older builds wrote credentials into this
+// origin's settings cache. They are removed from state.settings immediately so
+// no client-state request can carry them, but remain in localStorage until the
+// protected engine store confirms each import. A crash or unavailable sidecar
+// therefore retries without either disclosure or credential loss.
+let legacyRendererSecrets = Object.create(null);
+let legacyRendererCacheDirty = false;
 function partitionSettings(s) {
   const prefs = {}, view = {};
   for (const k of Object.keys(s)) {
@@ -70,6 +77,34 @@ function partitionSettings(s) {
     (VIEW_STATE_KEYS.has(k) ? view : prefs)[k] = s[k];
   }
   return { prefs, view };
+}
+
+function captureLegacyRendererSecrets(source) {
+  if (!source || typeof source !== "object" || Array.isArray(source)) return source;
+  for (const key of SECRET_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(source, key)) continue;
+    legacyRendererCacheDirty = true;
+    const value = String(source[key] || "").trim();
+    if (value && !Object.prototype.hasOwnProperty.call(legacyRendererSecrets, key)) {
+      legacyRendererSecrets[key] = value;
+    }
+    delete source[key];
+  }
+  return source;
+}
+
+function persistSettingsCache(prefs, view) {
+  const cachedPrefs = { ...(prefs || {}) };
+  const cachedView = { ...(view || {}) };
+  for (const key of SECRET_KEYS) {
+    delete cachedPrefs[key];
+    delete cachedView[key];
+  }
+  // Keep only not-yet-confirmed upgrade values durable. These never enter the
+  // in-memory settings object or the server-bound preference document.
+  Object.assign(cachedPrefs, legacyRendererSecrets);
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(cachedPrefs));
+  localStorage.setItem(VIEWSTATE_KEY, JSON.stringify(cachedView));
 }
 
 // Hydrate the renderer's status-only credential view. Plaintext never returns
@@ -111,7 +146,8 @@ async function hydrateSecrets() {
 // Mutate personal service credentials through the versioned protected-store
 // API. Normal settings deliberately exclude SECRET_KEYS, so a wizard must
 // never rely on saveSettings() for these values.
-async function persistSecrets(updates) {
+async function persistSecrets(updates, options) {
+  const legacyLocalImport = !!(options && options.legacyLocalImport);
   if (!Object.keys(secretStatuses).length) await hydrateSecrets();
   for (const [key, raw] of Object.entries(updates || {})) {
     if (!SECRET_KEYS.has(key)) continue;
@@ -125,6 +161,7 @@ async function persistSecrets(updates) {
         secretId: SECRET_IDS[key], revision: status.revision,
         credential: value,
         idempotencyKey: secretOperationId("secret-replace"),
+        legacyLocalImport,
       });
     } else {
       if (!status.configured) continue;
@@ -136,6 +173,72 @@ async function persistSecrets(updates) {
     secretStatuses[key] = result.receipt.after;
   }
   return secretStatuses;
+}
+
+async function migrateLegacyRendererSecrets() {
+  const keys = Object.keys(legacyRendererSecrets);
+  const document = await hydrateSecrets();
+  if (!keys.length) {
+    if (document && legacyRendererCacheDirty) {
+      try {
+        const { prefs, view } = partitionSettings(state.settings);
+        persistSettingsCache(prefs, view);
+        legacyRendererCacheDirty = false;
+      } catch (e) {
+        return false;
+      }
+    }
+    return document !== null;
+  }
+  if (!document || !document.health.writable) return false;
+  for (const key of keys) {
+    const value = legacyRendererSecrets[key];
+    const current = secretStatuses[key];
+    if (!value || !current) continue;
+    try {
+      // A configured protected value is authoritative; no plaintext compare is
+      // possible or desirable. Otherwise the explicit import marker keeps an
+      // old Mistral cache protected-but-unowned and prevents cloud upload.
+      if (!current.configured) {
+        await persistSecrets(
+          { [key]: value },
+          { legacyLocalImport: true },
+        );
+      }
+      delete legacyRendererSecrets[key];
+      const { prefs, view } = partitionSettings(state.settings);
+      persistSettingsCache(prefs, view);
+    } catch (e) {
+      // A hidden Mistral status can mean a different account already owns the
+      // one protected cache slot. That protected value is authoritative; do
+      // not retain or overwrite a stale origin cache. For an ambiguous failure
+      // on another key, a fresh configured status likewise confirms the write.
+      let protectedElsewhere = key === "mistralKey" &&
+        e && e.code === "mistral_credential_owned";
+      if (!protectedElsewhere) {
+        const refreshed = await hydrateSecrets();
+        protectedElsewhere = !!(refreshed && secretStatuses[key] &&
+          secretStatuses[key].configured);
+      }
+      if (protectedElsewhere) {
+        delete legacyRendererSecrets[key];
+        try {
+          const { prefs, view } = partitionSettings(state.settings);
+          persistSettingsCache(prefs, view);
+        } catch (cacheError) {
+          legacyRendererSecrets[key] = value;
+        }
+      }
+      // Otherwise keep the original cache value for a later startup. Never
+      // include the credential in status, errors, logs, or response-shaped data.
+    }
+  }
+  // Re-read account-scoped status after imports. In particular, an unowned
+  // Mistral value imported while signed in must remain hidden/unavailable.
+  await hydrateSecrets();
+  const complete = Object.keys(legacyRendererSecrets).length === 0;
+  if (complete) legacyRendererCacheDirty = false;
+  return complete;
 }
 
 // `categories` left this list with the taxonomy overhaul: assignments are
@@ -1855,8 +1958,7 @@ function saveSettings() {
   // own local key, never pushed. state.settings stays whole in memory.
   const { prefs, view } = partitionSettings(state.settings);
   try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(prefs));
-    localStorage.setItem(VIEWSTATE_KEY, JSON.stringify(view));
+    persistSettingsCache(prefs, view);
   } catch (e) {}
   pushClientState("settings");
 }
@@ -1905,6 +2007,8 @@ function loadSettings() {
   try {
     const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
     const v = JSON.parse(localStorage.getItem(VIEWSTATE_KEY) || "{}");
+    captureLegacyRendererSecrets(s);
+    captureLegacyRendererSecrets(v);
     // legacy caches kept view state inside SETTINGS_KEY; apply it, then let the
     // dedicated view-state store win. The next saveSettings re-partitions both.
     state.settings = Object.assign(state.settings, s, v);
@@ -2229,8 +2333,7 @@ async function syncClientStateOnLoad() {
       syncSearchConsCheckboxes();
       try {
         const { prefs, view } = partitionSettings(state.settings);
-        localStorage.setItem(SETTINGS_KEY, JSON.stringify(prefs));
-        localStorage.setItem(VIEWSTATE_KEY, JSON.stringify(view));
+        persistSettingsCache(prefs, view);
       } catch (e) {}
     }
     let healAttention = attentionDirty;
@@ -25957,8 +26060,14 @@ function init() {
   // Adopt the authoritative server copy of checked / settings / attention
   // (or seed it from localStorage on first run), THEN re-render so the views
   // reflect whatever the server holds (the merge may differ from the cache).
-  syncClientStateOnLoad().then((adopted) => {
-    hydrateSecrets();      // warm credentials without delaying the initial UI
+  syncClientStateOnLoad().then(async (adopted) => {
+    // Import and scrub any credential cache left by pre-protected-store builds.
+    // This is intentionally after client-state reconciliation (which sees only
+    // the already-clean state.settings object) and before credential controls
+    // can be opened.
+    if (!(await migrateLegacyRendererSecrets())) {
+      await hydrateSecrets();
+    }
     // adopted server settings can carry a different set of custom themes, so
     // rebuild the pickers/menu before re-applying (else the menubar Theme
     // submenu keeps the pre-sync list); applyExpSharpen re-applies the

@@ -93,10 +93,64 @@ def test_cutover_commits_reopens_verifies_then_sanitizes_both_sources():
         "settings": {"theme": "dark"},
     }
     assert not server._SECRETS_PATH.exists()
-    assert server.lib.load_json(server._SECRET_SYNC_STATE_PATH, {}) == {
-        "mistral_pending": True,
+    sync_state = server.lib.load_json(server._SECRET_SYNC_STATE_PATH, {})
+    assert sync_state["schema"] == server._MISTRAL_SYNC_SCHEMA
+    assert sync_state["mistral"] == {
+        "phase": "unowned",
+        "revision": reopened.status(
+            server._SECRET_IDS["mistralKey"]).revision,
     }
     assert b"legacy-file-wins" not in storage.blob
+    _reset_legacy_sources()
+
+
+@pytest.mark.parametrize("legacy_value", [None, False, "", "   \t"])
+def test_cutover_blank_legacy_field_falls_back_to_client_state(legacy_value):
+    _reset_legacy_sources()
+    server.lib.save_json(server.lib.CLIENT_STATE_PATH, {
+        "settings": {"aiKey": "client-value-survives"},
+    })
+    server.lib.save_json(server._SECRETS_PATH, {"aiKey": legacy_value})
+    storage = _MemoryStore()
+
+    reopened = server._migrate_legacy_plaintext_secrets(
+        _repository(storage),
+        reopen_repository=lambda: _repository(storage),
+    )
+
+    with reopened.credential_leases.lease(
+            server._SECRET_IDS["aiKey"]) as leased:
+        assert leased.reveal() == "client-value-survives"
+    assert not server._SECRETS_PATH.exists()
+    assert server.lib.load_json(server.lib.CLIENT_STATE_PATH, {}) == {
+        "settings": {},
+    }
+    _reset_legacy_sources()
+
+
+def test_cutover_physically_scrubs_null_and_blank_secret_fields():
+    _reset_legacy_sources()
+    server.lib.save_json(server.lib.CLIENT_STATE_PATH, {
+        "settings": {
+            "theme": "dark",
+            "aiKey": None,
+            "mistralKey": "   ",
+        },
+    })
+    server.lib.save_json(server._SECRETS_PATH, {
+        "imgGenKey": None,
+        "r2Secret": "",
+        "compatibility": {"version": 1},
+    })
+
+    server._migrate_legacy_plaintext_secrets(_repository())
+
+    assert server.lib.load_json(server.lib.CLIENT_STATE_PATH, {}) == {
+        "settings": {"theme": "dark"},
+    }
+    assert server.lib.load_json(server._SECRETS_PATH, {}) == {
+        "compatibility": {"version": 1},
+    }
     _reset_legacy_sources()
 
 
