@@ -24,6 +24,8 @@ output/auth_session.json
 output/secrets.json
 # device-local record of what the cloud already has (working-store sync shadow)
 output/cloud_shadow.json
+# durable local cache of irreversible collection-merge identity aliases
+output/collection_aliases.json
 
 # downloaded scans (large binaries)
 downloads/ia/*.pdf

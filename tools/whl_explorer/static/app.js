@@ -33,7 +33,7 @@ const VIEWSTATE_KEY = "whl_cad_viewstate_v1";
 // still syncs. (state.settings stays the single in-memory object; only the
 // persistence layer partitions it.)
 const VIEW_STATE_KEYS = new Set([
-  "markFilter", "srcFilter", "dlFilter", "yearFrom", "yearTo",
+  "markFilter", "srcFilter", "dlFilter", "collectionFilter", "yearFrom", "yearTo",
   "topTable", "bottomActive", "whlMode", "checkedMode", "showCatalog",
   "paneWidth", "uploadSplitH", "publishSidebarCollapsed", "workbenchPhase",
   "jobsDrawerOpen", "authPromptDismissed",
@@ -109,7 +109,7 @@ const MANUAL_FIELDS = [
 const BOOK_COLS = [
   "title", "subtitle", "author", "year", "edition", "volume", "publisher",
   "city", "language", "pages", "condition", "illustrations", "price",
-  "acquired", "categories", "notes",
+  "acquired", "collection", "from", "categories", "notes",
 ];
 
 const CHECKED_COLS = [
@@ -118,10 +118,54 @@ const CHECKED_COLS = [
   ["edition", "Edition"], ["volume", "Volume"], ["publisher", "Publisher"],
   ["city", "City"], ["language", "Language"], ["pages", "Pages"],
   ["condition", "Condition"], ["illustrations", "Illustrations"],
-  ["price", "Price"], ["acquired", "Acquired"], ["categories", "Categories"],
-  ["notes", "Notes"], ["img", "Img"], ["copyright", "Copyright"],
+  ["price", "Price"], ["acquired", "Acquired"], ["collection", "Collection"],
+  ["from", "From"], ["categories", "Categories"], ["notes", "Notes"],
+  ["img", "Img"], ["copyright", "Copyright"],
   ["whl", "WHL"], ["ia", "IA"], ["ht", "HT"], ["mark", "Mark"],
 ];
+
+// Capture provenance lives in extra under deliberately namespaced wire keys.
+// Never fall back to a model-extracted top-level `collection`: the scan_ prefix
+// is what distinguishes a book's recorded physical batch from bibliography.
+const PHONE_PROVENANCE_EXTRA_KEYS = new Set([
+  "scan_collection_id", "scan_collection", "scan_from",
+]);
+const READ_ONLY_BOOK_FIELDS = new Set(["collection", "from"]);
+
+function scanExtraText(extra, key) {
+  if (!extra || typeof extra !== "object" || Array.isArray(extra)) return "";
+  const value = extra[key];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function scanProvenance(extra) {
+  return {
+    id: scanExtraText(extra, "scan_collection_id"),
+    collection: scanExtraText(extra, "scan_collection"),
+    from: scanExtraText(extra, "scan_from"),
+  };
+}
+
+function applyScanProvenance(book) {
+  const p = scanProvenance(book && book.extra);
+  // Always assign, including blanks, so an extractor's unrelated top-level
+  // `collection` can never leak into these provenance-only display columns.
+  book.collection = p.collection;
+  book.from = p.from;
+  return book;
+}
+
+function collectionFilterKey(book) {
+  const p = scanProvenance(book && book.extra);
+  return p.id ? `id:${p.id}` : p.collection ? `name:${p.collection}` : "";
+}
+
+function collectionFilterMatch(book, selected) {
+  const choice = selected || "ALL";
+  if (choice === "ALL") return true;
+  const key = collectionFilterKey(book);
+  return choice === "NONE" ? !key : key === choice;
+}
 
 const WHL_ROW_FIELDS = ["title", "subtitle", "authors", "year", "publisher",
   "pages", "language", "subject", "categories", "description"];
@@ -134,6 +178,12 @@ const state = {
   // key `${source}:${idx}` -> { book, checks, scans, verify, manual_urls }
   checked: new Map(),
   manual: [],
+  collections: [],            // active shared collection rows (current state)
+  collectionsSignedIn: false,
+  collectionsLoaded: false,
+  collectionsLoading: false,
+  collectionsWritable: false,
+  collectionsError: "",
   rowsById: new Map(),        // combined-table row lookup (per render)
   checkedFilter: "",
   chBooks: null,              // CH catalogue rows (lazy)
@@ -179,7 +229,7 @@ const state = {
   procActionBusy: false,      // a Process action (job) is running
   settings: {
     showCatalog: true,
-    markFilter: "ALL", srcFilter: "ALL", dlFilter: "ALL",
+    markFilter: "ALL", srcFilter: "ALL", dlFilter: "ALL", collectionFilter: "ALL",
     yearFrom: null, yearTo: null,   // inclusive year-range filter (both tables)
     // Open Library search constraints (title=verbatim; also toggled by Ctrl+click
     // a column header). Persistent; extra fields (publisher/city/…) via Ctrl+click.
@@ -1901,6 +1951,7 @@ function normalizeSettings() {
   }
   state.settings.srcFilter = state.settings.srcFilter || "ALL";
   state.settings.dlFilter = state.settings.dlFilter || "ALL";
+  state.settings.collectionFilter = state.settings.collectionFilter || "ALL";
   // Typography used to be a global Appearance preference. Preserve the
   // current look by moving those values onto the active theme, then remove the
   // hidden globals so Theme editor is the only font owner from now on.
@@ -2216,6 +2267,11 @@ async function refreshAuthStatus() {
     authState.signedIn = !!r.signed_in;
     authState.email = r.email || "";
     authState.displayName = r.display_name || "";
+    if (!authState.signedIn) {
+      state.collectionsSignedIn = false;
+      state.collectionsWritable = false;
+      if (!el("collections-overlay").hidden) renderCollections();
+    }
   } catch (e) { /* server unreachable; keep whatever we knew */ }
   renderAccountState();
 }
@@ -2290,6 +2346,7 @@ async function submitAuth() {
     }
     hideAuthOverlay();
     await refreshAuthStatus();
+    await loadCollections();
     status(`SIGNED IN :: ${j.display_name || j.email}`);
     loadActivity();          // the feed switches to the shared cloud view
   } catch (e) {
@@ -2318,6 +2375,7 @@ function initAuth() {
     if (authState.signedIn) {
       try { await fetch("/api/auth/logout", { method: "POST" }); } catch (e) {}
       await refreshAuthStatus();
+      await loadCollections();
       status("SIGNED OUT");
       loadActivity();        // back to the local feed
     } else {
@@ -3792,9 +3850,55 @@ const FILTER_GROUPS = [
     ["NOT", "Not downloaded"], ["FAILED", "Download failed"]]],
 ];
 
+function collectionFilterOptions(rows = combinedRows()) {
+  const current = new Map((state.collections || []).map((c) => [String(c.id || ""), c]));
+  const linked = new Map(), unlinked = new Map();
+  let none = 0;
+  for (const row of rows) {
+    const p = scanProvenance(row.book && row.book.extra);
+    if (p.id) {
+      if (!linked.has(p.id)) linked.set(p.id, { count: 0, snapshots: new Set() });
+      const item = linked.get(p.id);
+      item.count += 1;
+      if (p.collection) item.snapshots.add(p.collection);
+    } else if (p.collection) {
+      if (!unlinked.has(p.collection)) unlinked.set(p.collection, 0);
+      unlinked.set(p.collection, unlinked.get(p.collection) + 1);
+    } else {
+      none += 1;
+    }
+  }
+  const records = [...linked].map(([id, item]) => {
+    const row = current.get(id);
+    const snapshot = [...item.snapshots][0] || "";
+    return { value: `id:${id}`, id, count: item.count,
+      base: (row && row.name) || snapshot || `Collection ${id.slice(0, 8)}`,
+      missing: !row };
+  });
+  const nameCounts = new Map();
+  for (const r of records) {
+    const key = r.base.toLocaleLowerCase();
+    nameCounts.set(key, (nameCounts.get(key) || 0) + 1);
+  }
+  const opts = [["ALL", "All"]];
+  records.sort((a, b) => a.base.localeCompare(b.base, undefined, { sensitivity: "base" }))
+    .forEach((r) => {
+      let label = r.base;
+      if (nameCounts.get(r.base.toLocaleLowerCase()) > 1) label += ` · ${r.id.slice(0, 8)}`;
+      if (r.missing) label += state.collectionsSignedIn && !state.collectionsError
+        ? " — deleted/missing" : " — snapshot";
+      opts.push([r.value, `${label} (${r.count})`]);
+    });
+  [...unlinked].sort((a, b) => a[0].localeCompare(b[0], undefined, { sensitivity: "base" }))
+    .forEach(([name, count]) => opts.push([`name:${name}`, `${name} — unlinked (${count})`]));
+  if (none) opts.push(["NONE", `No collection (${none})`]);
+  return opts;
+}
+
 function filtersActive() {
   const checkedActive = state.settings.topTable === "checked" &&
-    FILTER_GROUPS.some(([k]) => (state.settings[k] || "ALL") !== "ALL");
+    (FILTER_GROUPS.some(([k]) => (state.settings[k] || "ALL") !== "ALL") ||
+     (state.settings.collectionFilter || "ALL") !== "ALL");
   return checkedActive ||
     state.settings.yearFrom != null || state.settings.yearTo != null;
 }
@@ -3808,11 +3912,13 @@ function syncFilterBtn() {
 function openFilterMenu(anchor) {
   // Mark/source/download filters apply to the checked-books table. The year
   // range applies to either top table, so it remains available in WHL mode.
-  const groups = state.settings.topTable === "checked" ? FILTER_GROUPS.map(([k, head, opts]) =>
-    `<div class="pm-head">${head}</div>` +
+  const groups = state.settings.topTable === "checked" ? FILTER_GROUPS.concat([
+    ["collectionFilter", "Collection", collectionFilterOptions()],
+  ]).map(([k, head, opts]) =>
+    `<div class="pm-head">${esc(head)}</div>` +
     opts.map(([v, label]) => `
-      <label class="pm-item"><input type="radio" name="pm-${k}" value="${v}"
-        ${(state.settings[k] || "ALL") === v ? "checked" : ""} /> ${label}</label>`).join("")
+      <label class="pm-item"><input type="radio" name="pm-${esc(k)}" value="${esc(v)}"
+        ${(state.settings[k] || "ALL") === v ? "checked" : ""} /> ${esc(label)}</label>`).join("")
   ).join("") : "";
   const from = state.settings.yearFrom == null ? "" : String(state.settings.yearFrom);
   const to = state.settings.yearTo == null ? "" : String(state.settings.yearTo);
@@ -5783,7 +5889,7 @@ function manualToBook(e) {
   if (e.extra && Object.keys(e.extra).length) book.extra = e.extra;
   if (e.images && e.images.length) book.images = e.images;
   if (e.capture_id) book.capture_id = e.capture_id;
-  return book;
+  return applyScanProvenance(book);
 }
 
 function migrateVerify(v) {
@@ -5810,11 +5916,13 @@ function combinedRows() {
     });
   }
   for (const [k, v] of state.checked.entries()) {
+    const book = applyScanProvenance(Object.assign(
+      { subtitle: "", volume: "", language: "" }, v.book));
     rows.push({
       kind: "catalog", id: k, source: k.split(":")[0],
       captured: false,
       edited: !!v.edited,
-      book: Object.assign({ subtitle: "", volume: "", language: "" }, v.book),
+      book,
       checks: v.checks || null, scans: v.scans || null,
       verify: migrateVerify(v) || {},
       manualUrls: v.manual_urls || {},
@@ -7965,6 +8073,7 @@ const TIP_FIELDS = [
   ["edition", "Edition"], ["volume", "Volume"], ["language", "Language"],
   ["pages", "Pages"], ["subject", "Subject"], ["condition", "Condition"],
   ["price", "Price"], ["illustrations", "Illustrations"],
+  ["collection", "Collection"], ["from", "From"],
   ["categories", "Categories"], ["notes", "Notes"], ["status", "Status"],
   ["acquired", "Acquired"], ["url", "URL"],
 ];
@@ -8026,6 +8135,8 @@ function filteredCheckedRows(prebuilt) {
   if (df === "DONE") rows = rows.filter((r) => dlState(r) === "done");
   else if (df === "FAILED") rows = rows.filter((r) => dlState(r) === "failed");
   else if (df === "NOT") rows = rows.filter((r) => dlState(r) !== "done");
+  const cf = state.settings.collectionFilter || "ALL";
+  if (cf !== "ALL") rows = rows.filter((r) => collectionFilterMatch(r.book, cf));
   return rows;
 }
 
@@ -8052,8 +8163,15 @@ function checkedRowTr(row, cmode, opts) {
     const val = f === "title" && hideTitle ? ""
       : f === "categories" ? bookCatsText(b) : b[f];
     const classes = [], attrs = [];
+    const snapshotField = READ_ONLY_BOOK_FIELDS.has(f);
+    if (snapshotField) {
+      classes.push("capture-snapshot");
+      if (String(val || "").trim())
+        attrs.push('data-tip="Recorded at capture · read-only snapshot"');
+    }
     // editable only in Edit mode (Process mode is review-only, like the WHL table)
-    if (cmode === "edit" && !(row.kind === "manual" && f === "acquired")) {
+    if (cmode === "edit" && !snapshotField &&
+        !(row.kind === "manual" && f === "acquired")) {
       classes.push("editable");
       attrs.push(`data-edit="${f}"`);
     }
@@ -8617,6 +8735,10 @@ async function pasteIntoCell(td, field, text, originTab = activeHistoryTab()) {
     statusErr("WHL PASTE FAILED");
     return false;
   }
+  if (READ_ONLY_BOOK_FIELDS.has(field)) {
+    statusErr("PASTE: capture provenance is read-only");
+    return false;
+  }
   if (field === "categories") { statusErr("PASTE: categories edit through the picker"); return false; }
   const row = state.rowsById.get(String(tr.dataset.rowId));
   if (!row) return false;
@@ -8661,6 +8783,7 @@ function startEdit(td) {
   const row = state.rowsById.get(String(tr.dataset.rowId));
   if (!row) return;
   const field = td.dataset.edit;
+  if (READ_ONLY_BOOK_FIELDS.has(field)) return;
   // categories are structured now — they edit through the chip picker
   if (field === "categories") return startEditCategories(td, row);
   const original = String(row.book[field] || "");
@@ -8689,6 +8812,10 @@ function startEdit(td) {
 // Apply a one-or-more-field patch to a checked/manual book, tracked for undo.
 async function applyEditPatch(row, patch, originTab = activeHistoryTab()) {
   const fields = Object.keys(patch);
+  if (fields.some((field) => READ_ONLY_BOOK_FIELDS.has(field))) {
+    statusErr("CAPTURE PROVENANCE IS READ-ONLY");
+    return false;
+  }
   const label = `edit ${fields.join("+")} of ${String(row.book.title || "").slice(0, 32)}`;
   const tag = fields.join(", ").toUpperCase();
   if (row.kind === "manual") {
@@ -14805,6 +14932,457 @@ async function applyCategoryEdit(row, before, after, originTab = activeHistoryTa
 
 // --- the taxonomy manager window (Tools > Categories…) ---------------------------
 
+// Collection rows are current shared state. Entries carry capture-time
+// snapshots in extra, and the manager counts/repoints only by the stable id.
+let collectionsLoadSeq = 0;
+let collectionsMutationBusy = false;
+let collectionsFocusReturn = null;
+const collectionEditDrafts = new Map();
+const COLLECTION_DRAFT_GUARD = "Save or revert unsaved collection edits before refreshing.";
+
+function collectionIdShort(value) {
+  return String(value || "").slice(0, 8) || "no-id";
+}
+
+function collectionIdentityLabel(collection) {
+  const row = collection || {};
+  return `"${String(row.name || "(unnamed)")}" [${collectionIdShort(row.id)}]`;
+}
+
+function collectionBookCount(usage, collectionId) {
+  const item = usage && usage.linked && usage.linked.get(String(collectionId || ""));
+  return item ? Number(item.count || 0) : 0;
+}
+
+function collectionMergePrompt(duplicate, survivor, usage) {
+  const duplicateCount = collectionBookCount(usage, duplicate && duplicate.id);
+  const survivorCount = collectionBookCount(usage, survivor && survivor.id);
+  const origin = (row) => String((row && row.from) || "").trim() || "not recorded";
+  return {
+    message: `Retire duplicate ${collectionIdentityLabel(duplicate)} and keep ` +
+      `${collectionIdentityLabel(survivor)} as the survivor?`,
+    detail: `Duplicate: ${duplicateCount} book${duplicateCount === 1 ? "" : "s"}, ` +
+      `From ${origin(duplicate)}. Survivor: ${survivorCount} ` +
+      `book${survivorCount === 1 ? "" : "s"}, From ${origin(survivor)}. ` +
+      "This merge is permanent. Book links move to the survivor; recorded " +
+      "Collection and From snapshots do not change.",
+  };
+}
+
+function collectionsCanMutate() {
+  return !!(state.collectionsLoaded && state.collectionsSignedIn &&
+    state.collectionsWritable && !state.collectionsLoading &&
+    !collectionsMutationBusy);
+}
+
+function collectionDraftValues(collection) {
+  const row = collection || {};
+  return collectionEditDrafts.get(String(row.id || "")) || {
+    name: String(row.name || ""), from: String(row.from || ""),
+  };
+}
+
+function collectionRecordDraft(rowEl) {
+  if (!rowEl) return;
+  const id = String(rowEl.dataset.collectionId || "");
+  const current = state.collections.find((item) => String(item.id || "") === id);
+  const nameInput = rowEl.querySelector('[data-collection-field="name"]');
+  const fromInput = rowEl.querySelector('[data-collection-field="from"]');
+  if (!current || !nameInput || !fromInput) return;
+  const draft = { name: nameInput.value, from: fromInput.value };
+  if (draft.name === String(current.name || "") &&
+      draft.from === String(current.from || "")) {
+    collectionEditDrafts.delete(id);
+  } else {
+    collectionEditDrafts.set(id, draft);
+  }
+  if (!collectionEditDrafts.size && state.collectionsError === COLLECTION_DRAFT_GUARD)
+    state.collectionsError = "";
+  el("collections-revert").hidden = collectionEditDrafts.size === 0;
+}
+
+function invalidateCollectionsLoad() {
+  collectionsLoadSeq += 1;
+  state.collectionsLoading = false;
+}
+
+function collectionUsage(rows = combinedRows()) {
+  const linked = new Map(), unlinked = new Map();
+  for (const row of rows) {
+    const p = scanProvenance(row.book && row.book.extra);
+    if (p.id) {
+      if (!linked.has(p.id)) linked.set(p.id, { count: 0, snapshots: new Set() });
+      const item = linked.get(p.id);
+      item.count += 1;
+      item.snapshots.add(`${p.collection || "(unnamed)"}${p.from ? ` · from ${p.from}` : ""}`);
+    } else if (p.collection) {
+      const key = JSON.stringify([p.collection, p.from]);
+      if (!unlinked.has(key)) unlinked.set(key, {
+        count: 0, collection: p.collection, from: p.from,
+      });
+      unlinked.get(key).count += 1;
+    }
+  }
+  return { linked, unlinked };
+}
+
+async function loadCollections({ force = false } = {}) {
+  if (collectionsMutationBusy) return state.collections;
+  if (!force && collectionEditDrafts.size) {
+    state.collectionsError = COLLECTION_DRAFT_GUARD;
+    if (!el("collections-overlay").hidden) {
+      el("collections-msg").textContent = state.collectionsError;
+      el("collections-revert").hidden = false;
+    }
+    return state.collections;
+  }
+  const mine = ++collectionsLoadSeq;
+  state.collectionsLoading = true;
+  state.collectionsError = "";
+  if (!el("collections-overlay").hidden) renderCollections();
+  try {
+    const res = await fetch("/api/collections");
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      const error = new Error(data.error || `HTTP ${res.status}`);
+      error.status = res.status;
+      throw error;
+    }
+    if (mine !== collectionsLoadSeq) return state.collections;
+    state.collections = Array.isArray(data.collections) ? data.collections : [];
+    state.collectionsSignedIn = !!data.signed_in;
+    state.collectionsWritable = !!data.signed_in;
+    state.collectionsLoaded = true;
+    state.collectionsError = "";
+    if (repointCollectionAliases(data.aliases || {})) renderChecked();
+  } catch (e) {
+    if (mine !== collectionsLoadSeq) return state.collections;
+    state.collectionsLoaded = true;
+    state.collectionsWritable = false;
+    if (e && e.status === 401) state.collectionsSignedIn = false;
+    state.collectionsError = `Collections unavailable: ${e.message || e}`;
+  } finally {
+    if (mine === collectionsLoadSeq) {
+      state.collectionsLoading = false;
+      if (!el("collections-overlay").hidden) renderCollections();
+    }
+  }
+  return state.collections;
+}
+
+function collectionReplaceCurrent(current) {
+  if (!current || !current.id) return;
+  const i = state.collections.findIndex((c) => c.id === current.id);
+  if (current.deleted) {
+    if (i >= 0) state.collections.splice(i, 1);
+  } else if (i >= 0) {
+    state.collections[i] = current;
+  } else {
+    state.collections.push(current);
+  }
+}
+
+async function collectionApi(method, path, body) {
+  if (collectionsMutationBusy) return null;
+  if (!collectionsCanMutate()) {
+    state.collectionsError = state.collectionsSignedIn
+      ? "Collections are not writable while they are loading or unavailable."
+      : "Sign in to edit shared collections.";
+    renderCollections();
+    return null;
+  }
+  invalidateCollectionsLoad();
+  collectionsMutationBusy = true;
+  state.collectionsError = "";
+  renderCollections();
+  try {
+    const res = await fetch(path, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.ok) return data;
+    if (data.current) collectionReplaceCurrent(data.current);
+    if (data.aliases && repointCollectionAliases(data.aliases)) renderChecked();
+    if (res.status === 401) {
+      state.collectionsSignedIn = false;
+      state.collectionsWritable = false;
+    } else if (res.status === 403 || res.status >= 500) {
+      state.collectionsWritable = false;
+    }
+    state.collectionsError = data.error || `request failed (HTTP ${res.status})`;
+  } catch (e) {
+    state.collectionsWritable = false;
+    state.collectionsError = `request failed: ${e.message || e}`;
+  } finally {
+    collectionsMutationBusy = false;
+    renderCollections();
+  }
+  return null;
+}
+
+function renderCollections() {
+  const host = el("collections-list");
+  const rows = (state.collections || []).filter((c) => !c.deleted)
+    .slice().sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""),
+      undefined, { sensitivity: "base" }) || String(a.id).localeCompare(String(b.id)));
+  const use = collectionUsage();
+  const liveIds = new Set(rows.map((c) => String(c.id || "")));
+  const folded = new Map();
+  for (const c of rows) {
+    const key = String(c.name || "").trim().toLocaleLowerCase();
+    if (!folded.has(key)) folded.set(key, []);
+    folded.get(key).push(c);
+  }
+  const orphanLinked = [...use.linked].filter(([id]) => !liveIds.has(id));
+  const snapshots = orphanLinked.length + use.unlinked.size;
+  const canMutate = collectionsCanMutate();
+  const controlDisabled = canMutate ? "" : " disabled";
+  el("collections-count").textContent = `${rows.length} current` +
+    (snapshots ? ` · ${snapshots} snapshot-only` : "");
+  el("collections-window").setAttribute("aria-busy",
+    String(state.collectionsLoading || collectionsMutationBusy));
+  host.setAttribute("aria-busy", String(state.collectionsLoading));
+  el("collections-add").disabled = !canMutate;
+  el("collections-new-name").disabled = !canMutate;
+  el("collections-new-from").disabled = !canMutate;
+  el("collections-revert").hidden = collectionEditDrafts.size === 0;
+  el("collections-revert").disabled = state.collectionsLoading || collectionsMutationBusy;
+  const msg = state.collectionsError || (state.collectionsLoading ? "Loading collections…" :
+    collectionsMutationBusy ? "Saving collection changes…" :
+    !state.collectionsLoaded ? "Loading collections…" :
+    !state.collectionsSignedIn ? "Sign in to create or edit shared collections" :
+    !state.collectionsWritable ? "Collections are currently read-only" :
+    collectionEditDrafts.size ? "Unsaved collection edits" : "");
+  el("collections-msg").textContent = msg;
+
+  if (!rows.length && !snapshots) {
+    host.innerHTML = `<p class="pane-note collections-empty">${state.collectionsLoaded
+      ? "No collections yet." : "Loading collections…"}</p>`;
+    return;
+  }
+  let html = `<table class="grid collections-table"><thead><tr>` +
+    `<th>Collection</th><th>From</th><th>Books</th><th>Captured as</th><th>Actions</th>` +
+    `</tr></thead><tbody>`;
+  for (const c of rows) {
+    const item = use.linked.get(String(c.id || "")) || { count: 0, snapshots: new Set() };
+    const dupes = folded.get(String(c.name || "").trim().toLocaleLowerCase()) || [];
+    const duplicate = dupes.length > 1;
+    const captured = [...item.snapshots].sort().join("; ");
+    const mergeTargets = dupes.filter((target) => target.id !== c.id);
+    const draft = collectionDraftValues(c);
+    const identity = collectionIdentityLabel(c);
+    html += `<tr data-collection-id="${esc(c.id)}"${duplicate ? ' class="collection-duplicate"' : ""}>` +
+      `<td><input class="cad-input" data-collection-field="name" maxlength="80" ` +
+        `value="${esc(draft.name)}" aria-label="${esc(`Name for collection ${identity}`)}"${controlDisabled} />` +
+        (duplicate ? `<span class="collection-warning" ` +
+          `data-tip="Two collection identities have the same name; rename one or merge them">duplicate name</span>` : "") +
+      `</td>` +
+      `<td><input class="cad-input" data-collection-field="from" maxlength="80" ` +
+        `value="${esc(draft.from)}" aria-label="${esc(`Origin for collection ${identity}`)}"${controlDisabled} /></td>` +
+      `<td class="collection-books">${item.count}</td>` +
+      `<td class="collection-snapshots">${esc(captured || "—")}</td>` +
+      `<td class="collection-actions"><button class="cad-btn tiny" type="button" ` +
+        `data-collection-act="save" aria-label="${esc(`Save collection ${identity}`)}"${controlDisabled}>Save</button>` +
+      `<button class="cad-btn tiny danger" type="button" ` +
+        `data-collection-act="delete" aria-label="${esc(`Delete collection ${identity}`)}"${controlDisabled}>Delete</button>` +
+        (mergeTargets.length ? `<span class="collection-merge"><select class="cad-input tiny" ` +
+          `data-collection-merge-target aria-label="${esc(`Select survivor for duplicate ${identity}`)}"${controlDisabled}>` +
+          mergeTargets.map((target) => `<option value="${esc(target.id)}">` +
+            `${esc(`merge into ${target.name} · ${String(target.id).slice(0, 8)}`)}</option>`).join("") +
+          `</select><button class="cad-btn tiny" type="button" ` +
+          `data-collection-act="merge" aria-label="${esc(`Merge duplicate ${identity} into selected survivor`)}"` +
+          `${controlDisabled}>Merge</button></span>` : "") +
+      `</td></tr>`;
+  }
+  for (const [id, item] of orphanLinked) {
+    html += `<tr class="collection-snapshot-only"><td>${esc([...item.snapshots][0] || "(unnamed)")}` +
+      `<span class="collection-warning">${state.collectionsSignedIn && !state.collectionsError
+        ? "deleted/missing row" : "current row unavailable"}</span></td><td>—</td>` +
+      `<td class="collection-books">${item.count}</td>` +
+      `<td class="collection-snapshots">${esc([...item.snapshots].join("; "))}</td>` +
+      `<td class="collection-id-note">${esc(id)}</td></tr>`;
+  }
+  for (const item of use.unlinked.values()) {
+    html += `<tr class="collection-snapshot-only"><td>${esc(item.collection)}` +
+      `<span class="collection-warning">unlinked snapshot</span></td>` +
+      `<td>${esc(item.from || "—")}</td><td class="collection-books">${item.count}</td>` +
+      `<td class="collection-snapshots">Imported before collection IDs</td><td>—</td></tr>`;
+  }
+  host.innerHTML = html + `</tbody></table>`;
+}
+
+function openCollections() {
+  const active = document.activeElement;
+  const menu = active && active.closest && active.closest(".menu");
+  collectionsFocusReturn = (menu && menu.querySelector(".menu-btn")) || active || null;
+  state.collectionsError = "";
+  el("collections-overlay").hidden = false;
+  loadCollections();
+  requestAnimationFrame(() => el("collections-close").focus());
+}
+
+function closeCollections() {
+  el("collections-overlay").hidden = true;
+  const restore = collectionsFocusReturn;
+  collectionsFocusReturn = null;
+  if (restore && typeof restore.focus === "function" && restore.isConnected !== false)
+    requestAnimationFrame(() => restore.focus());
+}
+
+function revertCollectionDrafts() {
+  if (state.collectionsLoading || collectionsMutationBusy) return;
+  collectionEditDrafts.clear();
+  state.collectionsError = "";
+  renderCollections();
+  loadCollections({ force: true });
+}
+
+async function addCollection(ev) {
+  ev.preventDefault();
+  const name = el("collections-new-name").value.trim();
+  const from = el("collections-new-from").value.trim();
+  if (!name) { state.collectionsError = "Collection name is required"; renderCollections(); return; }
+  const data = await collectionApi("POST", "/api/collections", { name, from });
+  if (!data) return;
+  collectionReplaceCurrent(data.collection);
+  el("collections-new-name").value = "";
+  el("collections-new-from").value = "";
+  state.collectionsError = "";
+  renderCollections();
+}
+
+async function saveCollectionRow(rowEl) {
+  const c = state.collections.find((item) => item.id === rowEl.dataset.collectionId);
+  if (!c) return;
+  collectionRecordDraft(rowEl);
+  const name = rowEl.querySelector('[data-collection-field="name"]').value.trim();
+  const from = rowEl.querySelector('[data-collection-field="from"]').value.trim();
+  if (!name) {
+    state.collectionsError = "Collection name is required";
+    renderCollections();
+    return;
+  }
+  const data = await collectionApi("PATCH", `/api/collections/${encodeURIComponent(c.id)}`, {
+    name, from, expected_updated_at: c.updated_at,
+  });
+  if (!data) return;
+  collectionEditDrafts.delete(String(c.id));
+  collectionReplaceCurrent(data.collection);
+  state.collectionsError = "";
+  renderCollections();
+}
+
+async function deleteCollectionRow(rowEl) {
+  const c = state.collections.find((item) => item.id === rowEl.dataset.collectionId);
+  if (!c) return;
+  if (!(await confirmDialog({ title: "Delete collection?", danger: true,
+      confirmLabel: "Delete", message: `Delete “${c.name}”?`,
+      detail: "The shared row will be soft-deleted. Books keep their recorded Collection and From snapshots." }))) return;
+  const data = await collectionApi("DELETE", `/api/collections/${encodeURIComponent(c.id)}`, {
+    expected_updated_at: c.updated_at,
+  });
+  if (!data) return;
+  collectionEditDrafts.delete(String(c.id));
+  collectionReplaceCurrent(data.collection);
+  state.collectionsError = "";
+  renderCollections();
+}
+
+function repointCollectionAliases(rawAliases) {
+  const aliases = new Map(Object.entries(rawAliases || {})
+    .filter(([oldId, newId]) => typeof oldId === "string" && oldId &&
+      typeof newId === "string" && newId));
+  let changed = false, checkedChanged = false;
+  const repoint = (entry) => {
+    const extra = entry && entry.extra;
+    if (!extra || typeof extra !== "object") return false;
+    const oldId = extra.scan_collection_id;
+    const newId = aliases.get(oldId);
+    if (!newId || newId === oldId) return false;
+    entry.extra = Object.assign({}, extra, { scan_collection_id: newId });
+    changed = true;
+    return true;
+  };
+  for (const entry of state.manual) repoint(entry);
+  for (const [, value] of state.checked)
+    if (repoint(value && value.book)) checkedChanged = true;
+  // The server already persisted client_state during the merge. Refresh the
+  // renderer's offline cache too, or a close/reopen before the next server
+  // adoption would resurrect loser ids and show deleted/missing counts.
+  if (checkedChanged) {
+    try { localStorage.setItem(LS_KEY, JSON.stringify(checkedArray())); } catch (e) {}
+  }
+  const filter = String((state.settings && state.settings.collectionFilter) || "ALL");
+  if (filter.startsWith("id:")) {
+    const target = aliases.get(filter.slice(3));
+    if (target && target !== filter.slice(3)) {
+      state.settings.collectionFilter = `id:${target}`;
+      saveSettings();
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function repointCollectionState(oldId, newId) {
+  return repointCollectionAliases({ [oldId]: newId });
+}
+
+async function mergeCollectionRow(rowEl) {
+  const duplicate = state.collections.find((item) => item.id === rowEl.dataset.collectionId);
+  const select = rowEl.querySelector("[data-collection-merge-target]");
+  const survivor = select && state.collections.find((item) => item.id === select.value);
+  if (!duplicate || !survivor) return;
+  const prompt = collectionMergePrompt(duplicate, survivor, collectionUsage());
+  if (!(await confirmDialog({ title: "Merge collections?", danger: true,
+      confirmLabel: "Merge", message: prompt.message, detail: prompt.detail }))) return;
+  const data = await collectionApi("POST", "/api/collections/merge", {
+    survivor_id: survivor.id, duplicate_id: duplicate.id,
+    survivor_updated_at: survivor.updated_at,
+    duplicate_updated_at: duplicate.updated_at,
+  });
+  if (!data) return;
+  collectionEditDrafts.delete(String(duplicate.id));
+  collectionEditDrafts.delete(String(survivor.id));
+  repointCollectionState(duplicate.id, data.resolved_survivor_id || survivor.id);
+  collectionReplaceCurrent(data.survivor);
+  collectionReplaceCurrent(data.deleted);
+  state.collectionsError = "";
+  await loadCollections();
+  renderCollections();
+  renderChecked();
+}
+
+function initCollections() {
+  MENU_CMDS["collections"] = openCollections;
+  el("collections-close").addEventListener("click", closeCollections);
+  el("collections-overlay").addEventListener("mousedown", (ev) => {
+    if (ev.target === el("collections-overlay")) closeCollections();
+  });
+  el("collections-add-form").addEventListener("submit", addCollection);
+  el("collections-revert").addEventListener("click", revertCollectionDrafts);
+  el("collections-list").addEventListener("input", (ev) => {
+    const input = ev.target.closest("[data-collection-field]");
+    const row = input && input.closest("[data-collection-id]");
+    if (!row) return;
+    collectionRecordDraft(row);
+    if (!state.collectionsError) {
+      el("collections-msg").textContent = collectionEditDrafts.size
+        ? "Unsaved collection edits" : "";
+    }
+  });
+  el("collections-list").addEventListener("click", (ev) => {
+    const btn = ev.target.closest("[data-collection-act]");
+    const row = btn && btn.closest("[data-collection-id]");
+    if (!btn || !row) return;
+    if (btn.dataset.collectionAct === "save") saveCollectionRow(row);
+    else if (btn.dataset.collectionAct === "delete") deleteCollectionRow(row);
+    else if (btn.dataset.collectionAct === "merge") mergeCollectionRow(row);
+  });
+}
+
 let catMergeFrom = null;   // node id armed for a merge, or null
 let catAdoptPreview = null; // adopt runs dry first; the second click applies
 
@@ -16065,11 +16643,26 @@ function renderInfoPane() {
     if (v) h += infoRow(label, k === "title" ? bookTitleHtml(b, "") : esc(v));
   }
   h += `</div>`;
-  // non-column metadata captured with the entry (phone captures etc.)
+  // The book's Collection / From are frozen capture-time facts.  State the
+  // boundary beside them: the similarly named rows in the Collections manager
+  // are current/editable state and may legitimately have been renamed since.
   const extra = b.extra || {};
-  if (Object.keys(extra).length) {
+  const captureProv = scanProvenance(extra);
+  if (captureProv.id || captureProv.collection || captureProv.from) {
+    h += `<div class="info-sec"><div class="info-sec-h">Capture provenance</div>`;
+    h += `<div class="info-provenance-note">Collection and From were recorded when ` +
+      `this book was captured. They are read-only; editing the current collection ` +
+      `does not relabel this book.</div>`;
+    if (captureProv.id) h += infoRow("Collection id", esc(captureProv.id));
+    h += `</div>`;
+  }
+  // Other non-column metadata captured with the entry (phone captures etc.).
+  // Provenance has real columns above, so do not repeat it as generic Extra.
+  const extraKeys = Object.keys(extra)
+    .filter((key) => !PHONE_PROVENANCE_EXTRA_KEYS.has(key));
+  if (extraKeys.length) {
     h += `<div class="info-sec"><div class="info-sec-h">Extra</div>`;
-    for (const k of Object.keys(extra).sort())
+    for (const k of extraKeys.sort())
       h += infoRow(k.replace(/_/g, " "), esc(infoExtraValue(extra[k])));
     h += `</div>`;
   }
@@ -16328,6 +16921,7 @@ async function runCloudSync() {
     btn.disabled = false;
     const r = st.last_result || {};
     if (r.imported) await loadManual();        // new entries -> refresh the table
+    await loadCollections();                   // current names/origins may have changed
     // stores that pulled records changed local files -> refresh their views
     const stores = r.stores || {};
     const sum = (k) => Object.values(stores).reduce((n, s) => n + (s[k] || 0), 0);
@@ -25187,6 +25781,7 @@ function init() {
   boot("attention popover", initAttnPop);
   boot("review queue", initReviewWin);
   boot("categories", initCategories);
+  boot("collections", initCollections);
   boot("analyze", initAnalyze);
   boot("workbench", initWorkbench);
   boot("replica", initReplica);
@@ -25262,6 +25857,7 @@ function init() {
     else if (!el("msrc-overlay").hidden) closeManualSource();
     else if (!el("review-overlay").hidden) closeReviewWin();
     else if (!el("cat-overlay").hidden) closeCategories();
+    else if (!el("collections-overlay").hidden) closeCollections();
     else if (!el("changelog-overlay").hidden) closeChangelog();
     else if (!el("settings-overlay").hidden) closeSettings();
     else if (!el("engine-overlay").hidden) closeDefaultEngines();
@@ -25305,6 +25901,7 @@ function init() {
     // Home's pending tasks are derived from these, so it re-renders once the
     // data it counts has actually arrived
     loadManual().then(migrateParsedEntries).then(() => {
+      loadCollections();
       renderHome();
       renderRemarks();
     });

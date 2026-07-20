@@ -31,6 +31,7 @@
           <button class="menu-item" data-cmd="redo" type="button">Redo<span class="menu-key">Ctrl+Y</span></button>
           <div class="menu-sep"></div>
           <button class="menu-item" data-cmd="categories" type="button">Categories&hellip;</button>
+          <button class="menu-item" data-cmd="collections" type="button">Collections&hellip;</button>
           <div class="menu-sep"></div>
           <button class="menu-item" data-cmd="settings" type="button">Settings&hellip;<span class="menu-key">Ctrl+,</span></button>
         </div>
@@ -577,6 +578,10 @@
                   <th data-col="illustrations">Illus</th>
                   <th data-col="price">Price</th>
                   <th data-col="acquired">Acq</th>
+                  <th data-col="collection"
+                      data-tip="Collection recorded when the book was captured; read-only snapshot">Collection</th>
+                  <th data-col="from"
+                      data-tip="Origin recorded when the book was captured; read-only snapshot">From</th>
                   <th data-col="categories">Categories</th>
                   <th data-col="notes">Notes</th>
                   <th class="col-whl" data-col="img" data-tip="Photos associated with the entry (click the icon to view in Info)">Img</th>
@@ -1728,6 +1733,35 @@
         <div id="cat-tree" class="drafting"></div>
         <p class="pane-note">Click a name to rename &middot; drag onto a category to move it
           &middot; assignments follow merges and deletions.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- SHARED COLLECTIONS WINDOW: current rows; book provenance stays read-only -->
+  <div id="collections-overlay" class="overlay" hidden>
+    <div id="collections-window" class="win" role="dialog" aria-modal="true"
+         aria-labelledby="collections-title" aria-describedby="collections-note">
+      <div class="win-titlebar">
+        <span id="collections-title">Collections</span>
+        <button id="collections-close" class="win-close" type="button"
+                aria-label="Close" data-icon="close"></button>
+      </div>
+      <div id="collections-body">
+        <form id="collections-add-form" class="pane-bar" autocomplete="off">
+          <input id="collections-new-name" class="cad-input" maxlength="80"
+                 aria-label="New collection name" placeholder="Collection name" />
+          <input id="collections-new-from" class="cad-input" maxlength="80"
+                 aria-label="New collection origin" placeholder="From (optional)" />
+          <button id="collections-add" class="cad-btn tiny" type="submit">Add</button>
+          <button id="collections-revert" class="cad-btn tiny" type="button" hidden>Revert edits</button>
+          <span class="tool-label" id="collections-msg" role="status" aria-live="polite"></span>
+          <span class="bar-spacer"></span>
+          <span class="tool-label" id="collections-count"></span>
+        </form>
+        <div id="collections-list" class="drafting"></div>
+        <p class="pane-note" id="collections-note">Collection rows are current shared state. A book's Collection and
+          From values are capture-time snapshots: they are read-only and do not change when a
+          collection is renamed, re-originated, merged, or deleted.</p>
       </div>
     </div>
   </div>

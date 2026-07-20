@@ -429,8 +429,9 @@ internal fun applyProvenance(target: JSONObject, provenance: CaptureProvenance?)
  * Deliberately flat where the manifest is nested: the desktop copies unknown
  * `meta` keys into an entry's `extra` and renders each as a row, so a nested
  * object would surface as a blob of JSON where a reader expects a place name.
- * The collection travels as its name for the same reason — the id means nothing
- * on the desktop until collections become shared rows.
+ * The name remains a capture-time snapshot while the id links the entry to the
+ * collection's current shared row. A later rename must not rewrite what was
+ * true when this book was scanned.
  *
  * The `scan_` prefix is load-bearing on both ends. It keeps these from
  * colliding with a model-extracted `collection`, and it lets the desktop tell
@@ -445,6 +446,7 @@ internal fun applyProvenanceToPayload(
     provenance: CaptureProvenance?,
 ): JSONObject {
     if (provenance == null) return meta
+    meta.put("scan_collection_id", provenance.collectionId)
     meta.put("scan_collection", provenance.collectionName)
     if (provenance.from.isNotEmpty()) meta.put("scan_from", provenance.from)
     return meta

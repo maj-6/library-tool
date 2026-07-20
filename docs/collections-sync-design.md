@@ -1,6 +1,64 @@
 # Collections on the desktop: two-way sync
 
-Status: **design, not implemented.** Written to be handed to another agent.
+Status: **implemented and deployed on 2026-07-19.** Migrations 009 and 010 are
+applied to the `library-tool-store` Supabase project and verified against the
+live catalogue, grants, policies, function ACL, and both migration ledgers.
+
+## Implementation outcome
+
+All four suggested stages below are implemented together:
+
+- the phone sends `scan_collection_id` while preserving the frozen name and
+  origin snapshots;
+- migration 009 adds the shared collection rows, authenticated RLS/grants, and
+  a transactional merge RPC;
+- the Android store performs crash-safe, paginated two-way synchronization and
+  remains fully usable signed out;
+- the desktop displays read-only `Collection` and `From` snapshot columns,
+  filters by collection identity, and includes a collection manager with CRUD,
+  duplicate warnings, counts, and human-confirmed merges.
+
+The implementation keeps catalogue provenance derived from `entry.extra`; it
+does not widen the manual-entry schema. Desktop-created rows are pulled by an
+authenticated background worker, so no blocking spinner is added to the
+offline-first Collections screen. An archive state remains outside this
+change's scope.
+
+One refinement was required during adversarial review: an ordinary soft delete
+is still last-write-wins and can be superseded by a later edit, but a
+human-confirmed duplicate merge must be permanent. Migration 009 therefore
+adds `merged_into` and performs merges through `merge_collections(...)`, which
+locks both rows, validates their revisions, and atomically writes an
+authoritative loser-to-survivor marker. Both clients consume that marker and
+never treat an arbitrary deleted row as a merge.
+
+## Deployment verification
+
+The live rollout was database-first so neither client can encounter a missing
+`collections` table. Verification after applying migrations 009 and 010
+confirmed:
+
+- RLS is enabled, with authenticated select/insert/update policies and no anon
+  table access;
+- authenticated writes are column-scoped, so `id`, `created_by`, and
+  `merged_into` cannot be rewritten through ordinary table updates;
+- update access requires a non-null signed-in identity while remaining shared
+  across contributors;
+- all checks, foreign keys, and covering indexes are present;
+- `merge_collections(...)` has a pinned empty `search_path`, rejects callers
+  without an authenticated JWT role, and is executable only by
+  `authenticated` and `service_role` (not `anon` or `PUBLIC`);
+- the merge RPC completed an authenticated, rollback-only missing-row smoke
+  test; and
+- both `009_collections` and `010_collections_authenticated_identity` appear in
+  the project ledger as well as the Supabase migration history.
+
+The Supabase advisor intentionally reports the authenticated
+`SECURITY DEFINER` merge RPC: signed-in callers must be able to invoke that
+narrow transactional operation, while its pinned search path, JWT check,
+revision checks, deterministic row locks, and restricted ACL bound its
+authority. Newly created collection indexes are also reported as unused while
+the table is empty. Other advisor notices predate this feature.
 
 Book Capture 0.5.1-alpha.6 shipped phone-local collections (see
 `android/BookCapture/README.md` → "Collections and provenance"). This document
@@ -93,7 +151,8 @@ create table if not exists collections (
   from_place  text not null default '',
   created_by  uuid references auth.users(id),
   updated_at  timestamptz not null default now(),
-  deleted     boolean not null default false
+  deleted     boolean not null default false,
+  merged_into uuid references collections(id)
 );
 create index if not exists collections_updated_idx on collections (updated_at desc);
 ```
@@ -154,6 +213,9 @@ before inventing a second one). Concretely:
 - On sync, per id, the higher `updated_at` wins for the whole row.
 - `deleted = true` is a value like any other, so a delete propagates and a
   concurrent rename loses to a later delete.
+- `merged_into` is the deliberate exception: only the transactional merge RPC
+  may write it, and once present it authoritatively aliases the loser to the
+  survivor on every client.
 - Clock skew: the phone's clock is not trustworthy. Prefer the server's
   `now()` on write where possible and treat local stamps as a tiebreak only.
 
@@ -236,16 +298,12 @@ Each stage is shippable alone.
 4. **Two-way.** Desktop edits, conflict handling, the merge UI for duplicate
    names.
 
-## Open questions for the implementer
+## Resolved implementation questions
 
-- **First-class fields or derived from `extra`?** Columns can be rendered from
-  `extra` without touching `lib.MANUAL_ENTRY_FIELDS`. Promoting them is
-  cleaner to query and sort but widens the entry schema and touches the manual
-  entry editor. Stage 2 can start derived and promote later if sorting or
-  filtering proves awkward.
-- **Should a desktop-created collection be scannable before the phone syncs?**
-  Implies a pull on the phone's Collections tab, and a spinner in a flow that
-  is currently entirely offline. Probably yes, but it is the first place sync
-  becomes user-visible latency.
-- **Do collections need an archive state** distinct from delete, for a crate
-  that is fully catalogued but whose books should stay attributed?
+- **Field representation:** catalogue columns remain derived from `extra`,
+  preserving the existing manual-entry schema and immutable capture snapshot.
+- **Desktop-to-phone visibility:** authenticated background synchronization
+  pulls desktop-created collections without making local collection editing
+  wait on the network.
+- **Archive state:** not added. Soft delete and authoritative merge tombstones
+  cover this design; a separate archive lifecycle can be designed later.

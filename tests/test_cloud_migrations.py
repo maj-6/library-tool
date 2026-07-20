@@ -29,6 +29,9 @@ MEMBER_HOLDBACK = SQL["007_unreleased_member_gate_holdback"]
 MEMBER_HOLDBACK_FLAT = " ".join(MEMBER_HOLDBACK.split())
 TRIGGER_GRANTS = SQL["008_profile_secrets_trigger_grants"]
 TRIGGER_GRANTS_FLAT = " ".join(TRIGGER_GRANTS.split())
+COLLECTIONS_MIG = SQL["009_collections"]
+COLLECTIONS_FLAT = " ".join(COLLECTIONS_MIG.split())
+COLLECTIONS_IDENTITY = SQL["010_collections_authenticated_identity"]
 
 
 # --- the migration files themselves ----------------------------------------------
@@ -172,6 +175,143 @@ def test_migrations_lint_clean():
         assert no_str.count("(") == no_str.count(")"), f"{mid}: unbalanced parens"
         assert sql.count("$$") % 2 == 0, f"{mid}: unbalanced dollar quoting"
         assert sql.rstrip().endswith(";"), f"{mid}: missing final semicolon"
+
+
+# --- 009: shared collections ------------------------------------------------------
+
+def test_collections_migration_declares_offline_identity_and_tombstones():
+    schema = cloud_setup.expected_schema(COLLECTIONS_MIG)
+    assert schema["collections"] == {
+        "id", "name", "from_place", "created_by", "updated_at", "deleted",
+        "merged_into",
+    }
+    assert "id uuid primary key," in COLLECTIONS_FLAT
+    assert "id uuid primary key default" not in COLLECTIONS_FLAT
+    assert ("create index if not exists collections_updated_idx on collections "
+            "(updated_at desc);" in COLLECTIONS_FLAT)
+    assert ("created_by uuid references auth.users(id) on delete set null,"
+            in COLLECTIONS_FLAT)
+    assert ("create index if not exists collections_created_by_idx on "
+            "collections (created_by) where created_by is not null;"
+            in COLLECTIONS_FLAT)
+    assert ("create index if not exists collections_merged_into_idx on "
+            "collections (merged_into) where merged_into is not null;"
+            in COLLECTIONS_FLAT)
+    assert ("check (merged_into is null or (deleted and merged_into <> id))"
+            in COLLECTIONS_FLAT)
+    assert ("check (char_length(name) between 1 and 80 and name = btrim(name))"
+            in COLLECTIONS_FLAT)
+    assert ("check (char_length(from_place) <= 80 and "
+            "from_place = btrim(from_place))" in COLLECTIONS_FLAT)
+    assert "alter table collections enable row level security;" in COLLECTIONS_FLAT
+
+
+def test_collections_migration_is_rerun_safe():
+    body = re.sub(r"--[^\n]*", "", COLLECTIONS_MIG)
+    assert "create table if not exists collections" in body
+    assert "create index if not exists collections_updated_idx" in body
+    assert "create index if not exists collections_created_by_idx" in body
+    assert "create index if not exists collections_merged_into_idx" in body
+    assert "add column if not exists merged_into uuid" in body
+    assert "conname = 'collections_name_check'" in body
+    assert "conname = 'collections_from_place_check'" in body
+    assert "create or replace function public.merge_collections" in body
+    assert not re.search(r"create table (?!if not exists)", body)
+    assert not re.search(r"create index (?!if not exists)", body)
+    assert body.count("drop policy if exists collections_") == 3
+    assert body.count("create policy collections_") == 3
+
+
+def test_collections_grants_are_authenticated_and_column_scoped():
+    body = re.sub(r"--[^\n]*", "", COLLECTIONS_MIG)
+    flat = " ".join(body.split())
+
+    # Collections are contributor working data, never part of the public
+    # website.  A revoke must precede the narrow authenticated grants.
+    revoke = "revoke all on public.collections from anon, authenticated;"
+    select_grant = "grant select on public.collections to authenticated;"
+    assert revoke in flat
+    assert select_grant in flat
+    assert flat.index(revoke) < flat.index(select_grant)
+    assert not re.search(
+        r"grant\s+[^;]+\s+on\s+public\.collections\s+to\s+[^;]*\banon\b",
+        flat,
+    )
+
+    # Every client-writable field is enumerated.  Identity and attribution
+    # are accepted on INSERT, then explicitly immutable; hard DELETE is not an
+    # authenticated privilege because deletion syncs as a tombstone.
+    assert ("grant insert (id, name, from_place, created_by, updated_at, "
+            "deleted) on public.collections to authenticated;" in flat)
+    assert ("grant update (name, from_place, updated_at, deleted) on "
+            "public.collections to authenticated;" in flat)
+    assert ("revoke update (id, created_by, merged_into) on "
+            "public.collections from authenticated;" in flat)
+    assert not re.search(
+        r"grant\s+(?:insert|update)\s*\([^)]*merged_into[^)]*\)\s+on\s+"
+        r"public\.collections\s+to\s+authenticated",
+        flat,
+    )
+    assert "grant delete on public.collections to authenticated" not in flat
+    assert ("grant select, insert, update, delete on public.collections to "
+            "authenticated" not in flat)
+    assert ("grant select, insert, update, delete on public.collections to "
+            "service_role;" in flat)
+    assert "collections" in cloud_setup.ANON_CANNOT
+
+
+def test_collections_rls_is_shared_but_creator_attribution_is_not_forgeable():
+    body = re.sub(r"--[^\n]*", "", COLLECTIONS_MIG)
+    flat = " ".join(body.split())
+    assert ("create policy collections_select_authed on collections for select "
+            "to authenticated using (true);" in flat)
+    assert ("create policy collections_insert_authed on collections for insert "
+            "to authenticated with check (created_by = (select auth.uid()));"
+            in flat)
+    assert ("create policy collections_update_authed on collections for update "
+            "to authenticated using (true) with check (true);" in flat)
+    assert not re.search(
+        r"create policy collections_\w+ on collections for delete", flat,
+    )
+
+
+def test_collection_updates_require_a_signed_in_identity_but_stay_shared():
+    body = re.sub(r"--[^\n]*", "", COLLECTIONS_IDENTITY)
+    flat = " ".join(body.split())
+
+    assert ("drop policy if exists collections_update_authed on "
+            "public.collections;" in flat)
+    assert ("create policy collections_update_authed on public.collections "
+            "for update to authenticated using ((select auth.uid()) is not "
+            "null) with check ((select auth.uid()) is not null);" in flat)
+    assert "using (true)" not in flat
+    assert "with check (true)" not in flat
+    assert "created_by" not in flat
+
+
+def test_collection_merge_rpc_is_atomic_narrow_and_exactly_idempotent():
+    fn = COLLECTIONS_MIG.split(
+        "create or replace function public.merge_collections", 1)[1]
+    flat = " ".join(fn.split())
+
+    assert "security definer" in flat.lower()
+    assert "set search_path = ''" in flat
+    assert ("coalesce(auth.jwt() ->> 'role', '') not in "
+            "('authenticated', 'service_role')" in flat)
+    assert "p_survivor_id = p_duplicate_id" in flat
+    assert "order by c.id for update" in flat
+    assert "v_survivor.deleted or v_duplicate.deleted" in flat
+    assert ("v_survivor.updated_at is distinct from p_survivor_updated_at"
+            in flat)
+    assert ("v_duplicate.updated_at is distinct from p_duplicate_updated_at"
+            in flat)
+    assert ("v_duplicate.deleted and v_duplicate.merged_into = p_survivor_id"
+            in flat)
+    assert "set deleted = true, merged_into = p_survivor_id" in flat
+    assert "greatest( clock_timestamp()," in flat
+    assert "v_duplicate.updated_at + interval '1 microsecond'" in flat
+    assert ("from public, anon, authenticated, service_role;" in flat)
+    assert ("to authenticated, service_role;" in flat)
 
 
 # --- 004: passages + index versions (issue #140) ----------------------------------
