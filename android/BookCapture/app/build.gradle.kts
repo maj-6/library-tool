@@ -13,9 +13,9 @@ val releaseKeystore: String? =
 
 // The Supabase project the app signs into. The anon key is public by design
 // (the website ships it to every visitor); it is the LOGIN that authorizes
-// anything. CI injects these from the repo variables; a blank fallback just
-// means Settings must point at a project before first use. Escaped so a stray
-// quote/backslash in a var can't break the generated BuildConfig string.
+// anything. CI injects these from repository variables and rejects blanks for
+// tagged builds. Blank values remain useful only for local/dry-run builds.
+// Escaped so a stray quote/backslash in a var cannot break BuildConfig.
 fun env(name: String) = (System.getenv(name)?.trim() ?: "")
     .replace("\\", "\\\\").replace("\"", "\\\"")
 
@@ -29,8 +29,8 @@ android {
         applicationId = "org.whl.bookcapture"
         minSdk = 26
         targetSdk = 34
-        versionCode = 25
-        versionName = "0.5.1-alpha.6"
+        versionCode = 26
+        versionName = "0.5.1-alpha.7"
         buildConfigField("String", "SUPABASE_URL", "\"${env("WHL_SUPABASE_URL")}\"")
         buildConfigField("String", "SUPABASE_ANON_KEY", "\"${env("WHL_SUPABASE_ANON_KEY")}\"")
     }
@@ -88,6 +88,9 @@ dependencies {
 
     implementation("androidx.work:work-runtime-ktx:2.9.1")
 
+    // Native WebSocket transport for Mistral Voxtral realtime transcription.
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
     testImplementation("junit:junit:4.13.2")
 
     // android.jar's org.json is a stub that throws "not mocked" off-device, so
@@ -95,6 +98,6 @@ dependencies {
     // test classpath. Test-only: the app keeps using the platform's.
     testImplementation("org.json:json:20240303")
 
-    // offline keyword spotting ("start" / "photo" / "done" / "cancel")
+    // Offline camera commands; Mistral temporarily owns the mic during notes.
     implementation("com.alphacephei:vosk-android:0.3.47")
 }

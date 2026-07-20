@@ -114,3 +114,15 @@ test("website release notes render as a flat version list", () => {
   assert.ok(!websiteReleases.includes("groupByMajor"));
   assert.ok(!websiteReleases.includes("cl-major"));
 });
+
+test("website release notes keep independent desktop and Android feeds", () => {
+  const releasesPage = fs.readFileSync(
+    path.join(root, "website", "releases.html"), "utf8");
+
+  assert.ok(websiteData.includes('desktop: "changelog.md"'));
+  assert.ok(websiteData.includes('android: "android-changelog.md"'));
+  assert.ok(websiteData.includes('fetchChangelog(platform = "desktop")'));
+  assert.ok(releasesPage.includes('data-platform="desktop"'));
+  assert.ok(releasesPage.includes('data-platform="android"'));
+  assert.ok(websiteReleases.includes("fetchChangelog(selected)"));
+});

@@ -29,7 +29,43 @@ function release(v) {
 }
 
 const box = document.getElementById("changelog");
-const versions = await fetchChangelog();
-box.innerHTML = versions.length
-  ? versions.map(release).join("")
-  : `<div class="note">No release notes yet.</div>`;
+const platformLinks = [...document.querySelectorAll("[data-platform]")];
+let requestId = 0;
+
+async function showPlatform(platform, updateUrl = false) {
+  const selected = platform === "android" ? "android" : "desktop";
+  const currentRequest = ++requestId;
+
+  for (const link of platformLinks) {
+    const active = link.dataset.platform === selected;
+    link.classList.toggle("is-active", active);
+    if (active) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+  }
+
+  box.setAttribute("aria-busy", "true");
+  box.innerHTML = `<p class="muted">Loading…</p>`;
+  const versions = await fetchChangelog(selected);
+  if (currentRequest !== requestId) return;
+
+  box.innerHTML = versions.length
+    ? versions.map(release).join("")
+    : `<div class="note">No release notes yet.</div>`;
+  box.removeAttribute("aria-busy");
+
+  if (updateUrl) {
+    const url = new URL(window.location.href);
+    url.searchParams.set("platform", selected);
+    window.history.replaceState(null, "", url);
+  }
+}
+
+for (const link of platformLinks) {
+  link.addEventListener("click", (event) => {
+    event.preventDefault();
+    showPlatform(link.dataset.platform, true);
+  });
+}
+
+const initialPlatform = new URLSearchParams(window.location.search).get("platform");
+showPlatform(initialPlatform);

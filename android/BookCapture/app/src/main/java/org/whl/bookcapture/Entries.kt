@@ -27,6 +27,8 @@ object Entries {
     const val KEEP_SENT = 15    // uploaded entries kept for the recent list
     const val REPROCESS_PENDING = "reprocess.pending"
     const val PROCESSING_STATE = "processing.json"
+    const val MISTRAL_RESPONSE_SUFFIX = ".mistral.json"
+    const val MISTRAL_EXTRACTION_RESPONSE = "mistral_extraction.json"
     private const val INSTRUCTIONS = "instructions.txt"
     private const val REPROCESS_ERROR = "reprocess.error"
 
@@ -63,6 +65,19 @@ object Entries {
         val bestStatus: ProcessingStatus? = null,
     )
 
+    enum class MistralResponseKind {
+        OCR,
+        EXTRACTION,
+    }
+
+    /** Raw successful provider response retained locally. Keeping the exact JSON
+     * allows newer app versions to render fields older versions did not know. */
+    data class MistralResponse(
+        val kind: MistralResponseKind,
+        val captureOrder: Int? = null,
+        val rawJson: String,
+    )
+
     class Entry(
         val id: String,
         val dir: File,
@@ -87,10 +102,54 @@ object Entries {
             dir.listFiles { f -> f.isFile && f.name.matches(PHOTO_NAME) }
                 ?.sortedBy { photoNumber(it.name) } ?: emptyList()
 
+        /** Versioned photo descriptors when present, deterministic legacy
+         * descriptors otherwise. Callers should display [displayFile], while
+         * [rawFile] is the immutable source when it was preserved separately. */
+        internal fun photoDescriptors(): List<EntryPhotoDescriptor> =
+            PhotoAssetStore.descriptors(dir)
+
+        internal fun photoDescriptor(photo: File): EntryPhotoDescriptor? =
+            PhotoAssetStore.descriptor(dir, photo)
+
+        /** Details and list thumbnails deliberately resolve independently. */
+        fun detailHeroPhoto(): File? = PhotoAssetStore.detailHero(dir)?.displayFile
+
+        fun thumbnailPhoto(): File? = PhotoAssetStore.thumbnail(dir)?.displayFile
+
         fun ocrText(): String = photos().mapIndexedNotNull { i, p ->
             val t = File(dir, p.name + ".txt").takeIf { it.isFile }?.readText()?.trim()
             if (t.isNullOrEmpty()) null else "--- Capture ${i + 1} ---\n$t"
         }.joinToString("\n\n")
+
+        /** Exact persisted book JSON for the diagnostics tab. Do not rebuild it
+         * from the parsed model: unknown future fields must remain visible. */
+        fun bookJsonText(): String? = runCatching {
+            File(dir, "meta.json").takeIf { it.isFile }?.readText()?.trim()
+        }.getOrNull()?.takeIf { it.isNotEmpty() }
+
+        fun mistralResponses(): List<MistralResponse> {
+            val ocr = photos().mapIndexedNotNull { index, photo ->
+                val raw = runCatching {
+                    File(dir, photo.name + MISTRAL_RESPONSE_SUFFIX)
+                        .takeIf { it.isFile }
+                        ?.readText()
+                        ?.trim()
+                }.getOrNull().orEmpty()
+                raw.takeIf { it.isNotEmpty() }?.let {
+                    MistralResponse(MistralResponseKind.OCR, index + 1, it)
+                }
+            }
+            val extractionRaw = runCatching {
+                File(dir, MISTRAL_EXTRACTION_RESPONSE)
+                    .takeIf { it.isFile }
+                    ?.readText()
+                    ?.trim()
+            }.getOrNull().orEmpty()
+            return if (extractionRaw.isEmpty()) ocr else ocr + MistralResponse(
+                MistralResponseKind.EXTRACTION,
+                rawJson = extractionRaw,
+            )
+        }
 
         fun customInstructions(): String =
             File(dir, INSTRUCTIONS).takeIf { it.isFile }?.readText()?.trim() ?: ""

@@ -35,23 +35,39 @@ class ResourceContractTest {
     }
 
     @Test
-    fun deepseekEditorLivesInScrollableDialogOpenedBySparkleButton() {
+    fun detailUsesCatalogHierarchyAndCollapsedOcrWithoutDeepseekAction() {
         val detail = xml("src/main/res/layout/activity_entry_detail.xml")
-        val trigger = elementById(detail, "deepseekInstructions")
-        assertEquals("@drawable/ic_sparkles", trigger.getAttributeNS(androidNs, "drawableStart"))
-        assertEquals("@string/detail_deepseek_action", trigger.getAttributeNS(androidNs, "text"))
-        assertTrue(trigger.getAttributeNS(androidNs, "contentDescription").isNotBlank())
-        assertFalse(hasElementWithId(detail, "customInstructions"))
-
-        val dialog = xml("src/main/res/layout/dialog_deepseek_instructions.xml")
-        assertEquals("ScrollView", dialog.documentElement.tagName)
-        assertNotNull(elementById(dialog, "customInstructions"))
-        assertNotNull(elementById(dialog, "reprocessState"))
-        assertNotNull(elementById(dialog, "resubmit"))
+        for (id in listOf(
+            "title", "author", "year", "volumeTag", "secondaryDetails",
+            "overviewText", "otherFields", "heroPhoto", "photos", "ocrToggle",
+        )) assertNotNull(elementById(detail, id))
+        assertFalse(hasElementWithId(detail, "deepseekInstructions"))
+        assertEquals(
+            "gone",
+            elementById(detail, "ocrText").getAttributeNS(androidNs, "visibility"),
+        )
 
         val source = File("src/main/java/org/whl/bookcapture/EntryDetailActivity.kt").readText()
-        assertTrue(source.contains("binding.deepseekInstructions.setOnClickListener"))
-        assertTrue(source.contains("setNegativeButton(R.string.close"))
+        assertTrue(source.contains("BookDetailPresenter.from"))
+        assertTrue(source.contains("entry.detailHeroPhoto()"))
+        assertFalse(source.contains("Deepseek", ignoreCase = true))
+    }
+
+    @Test
+    fun detailNestedScrollViewsUseTheirSafeConstructorDefault() {
+        val detail = xml("src/main/res/layout/activity_entry_detail.xml")
+        val nestedScrollViews = detail.getElementsByTagName(
+            "androidx.core.widget.NestedScrollView",
+        )
+        assertTrue(nestedScrollViews.length >= 2)
+        for (index in 0 until nestedScrollViews.length) {
+            val view = nestedScrollViews.item(index) as Element
+            assertFalse(
+                "Setting nestedScrollingEnabled from XML dispatches before " +
+                    "NestedScrollView initializes its child helper on API 34",
+                view.hasAttributeNS(androidNs, "nestedScrollingEnabled"),
+            )
+        }
     }
 
     @Test
@@ -95,10 +111,8 @@ class ResourceContractTest {
                     "btnSelect", "deleteSelected", "cancelSelection",
                     "tabScans", "tabCollections",
                 ),
-            "src/main/res/layout/item_collection.xml" to
-                listOf("editCollection", "deleteCollection"),
             "src/main/res/layout/activity_main.xml" to
-                listOf("queueChip", "btnSettings"),
+                listOf("btnSettings"),
         )
         for ((path, ids) in expected) {
             val layout = xml(path)
@@ -111,6 +125,49 @@ class ResourceContractTest {
                 assertEquals("@style/WhlToolbarAction", action.getAttribute("style"))
             }
         }
+    }
+
+    @Test
+    fun captureKeepsOneSubmittedBookPreviewInsteadOfARecentDropdown() {
+        val capture = xml("src/main/res/layout/activity_main.xml")
+        assertFalse(hasElementWithId(capture, "queueChip"))
+        assertFalse(hasElementWithId(capture, "recentPanel"))
+        assertFalse(hasElementWithId(capture, "recentList"))
+        assertFalse(File("src/main/res/layout/item_recent.xml").exists())
+
+        val preview = elementById(capture, "lastBookPreview")
+        val primary = elementById(capture, "lastBookPrimary")
+        assertEquals("true", primary.getAttributeNS(androidNs, "clickable"))
+        assertNotNull(elementById(capture, "lastBookTitle"))
+        assertNotNull(elementById(capture, "lastBookAuthor"))
+        assertNotNull(elementById(capture, "lastBookYear"))
+
+        val thumbs = elementById(capture, "thumbs_scroll")
+        assertEquals(
+            "@id/lastBookPreview",
+            thumbs.getAttributeNS(appNs, "layout_constraintBottom_toTopOf"),
+        )
+        assertEquals(
+            "@id/buttons",
+            preview.getAttributeNS(appNs, "layout_constraintBottom_toTopOf"),
+        )
+
+        val extras = elementById(capture, "lastBookExtras")
+        assertEquals("@drawable/ic_extra_fields", extras.getAttributeNS(appNs, "srcCompat"))
+        assertTrue(extras.getAttributeNS(androidNs, "contentDescription").isNotBlank())
+        assertNotNull(elementById(capture, "lastBookExtraCount"))
+
+        val dialog = xml("src/main/res/layout/dialog_capture_extras.xml")
+        assertNotNull(elementById(dialog, "captureExtrasList"))
+        assertFalse(hasElementWithId(dialog, "lastBookTitle"))
+        assertFalse(hasElementWithId(dialog, "lastBookAuthor"))
+        assertFalse(hasElementWithId(dialog, "lastBookYear"))
+
+        val source = File("src/main/java/org/whl/bookcapture/MainActivity.kt").readText()
+        assertTrue(source.contains("selectLastSubmittedEntry(Entries.recent("))
+        assertTrue(source.contains("withContext(Dispatchers.IO)"))
+        assertTrue(source.contains("captureExtraFields(Entries.find(this, entryId)?.meta)"))
+        assertFalse(source.contains("refreshRecent"))
     }
 
     /**
@@ -174,7 +231,7 @@ class ResourceContractTest {
     }
 
     @Test
-    fun voiceIsOptionalAndDiscardRequiresConfirmation() {
+    fun voiceIsOptionalAndDiscardIsImmediate() {
         val manifest = xml("src/main/AndroidManifest.xml")
         val features = manifest.getElementsByTagName("uses-feature")
         val microphone = (0 until features.length)
@@ -188,8 +245,9 @@ class ResourceContractTest {
         val source = File("src/main/java/org/whl/bookcapture/MainActivity.kt").readText()
         assertTrue(source.contains("arrayOf(Manifest.permission.CAMERA)"))
         assertTrue(source.contains("arrayOf(Manifest.permission.RECORD_AUDIO)"))
-        assertTrue(source.contains("if (word == \"cancel\" && session.active && !discardConfirmed)"))
-        assertTrue(source.contains("MaterialAlertDialogBuilder(this)"))
+        assertTrue(source.contains("\"cancel\" -> {"))
+        assertFalse(source.contains("discardConfirmed"))
+        assertFalse(source.contains("showDiscardConfirmation"))
     }
 
     @Test

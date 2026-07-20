@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- One collection on the Collections tab: the batch name, where that batch came
      from, and how many books have been scanned into it. Tapping selects it as
-     the collection the next book lands in; EDIT changes its name or origin. -->
+     the collection the next book lands in; the trailing icons edit/delete it. -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:orientation="horizontal"
@@ -12,13 +13,6 @@
     android:paddingTop="9dp"
     android:paddingBottom="9dp"
     android:background="@drawable/whl_row">
-
-    <View
-        android:id="@+id/currentMarker"
-        android:layout_width="7dp"
-        android:layout_height="7dp"
-        android:layout_marginEnd="10dp"
-        android:background="@color/whl_face_sh2" />
 
     <LinearLayout
         android:layout_width="0dp"
@@ -47,20 +41,21 @@
             android:ellipsize="end" />
     </LinearLayout>
 
-    <com.google.android.material.button.MaterialButton
+    <androidx.appcompat.widget.AppCompatImageButton
         android:id="@+id/editCollection"
-        style="@style/WhlToolbarAction"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:textSize="11sp"
-        android:text="@string/collections_edit" />
+        style="@style/WhlInlineIconButton"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:contentDescription="@string/collections_edit"
+        app:srcCompat="@drawable/ic_edit"
+        app:tint="@color/whl_ink" />
 
-    <com.google.android.material.button.MaterialButton
+    <androidx.appcompat.widget.AppCompatImageButton
         android:id="@+id/deleteCollection"
-        style="@style/WhlToolbarAction"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:textSize="11sp"
-        android:textColor="@color/whl_red"
-        android:text="@string/collections_delete" />
+        style="@style/WhlInlineIconButton"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:contentDescription="@string/collections_delete"
+        app:srcCompat="@drawable/ic_delete"
+        app:tint="@color/whl_red" />
 </LinearLayout>
