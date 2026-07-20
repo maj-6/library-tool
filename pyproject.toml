@@ -18,7 +18,9 @@ dependencies = [
     "openpyxl>=3.1",
     "Pillow>=10.0",
     "Flask>=3.0",
-    "pypdf>=5.0",
+    # Canvas evidence profiles are pinned to the pypdf 6 parsing API. A new
+    # major requires an explicit evidence-profile compatibility decision.
+    "pypdf>=6.0,<7",
     "PyMuPDF>=1.24",
     # The desktop's default OCR engine imports this at job runtime. Keeping it
     # optional made the frozen sidecar pass its executable check, then fail as

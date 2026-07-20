@@ -12,9 +12,11 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from pypdf import PdfWriter
 
 from librarytool.adapters.filesystem import (
     EMPTY_MANAGED_TREE_REVISION,
+    FilesystemAttachedPdfAssetSnapshot,
     FilesystemCanvasEvidence,
     FilesystemCanvasInspection,
     FilesystemCanvasObservation,
@@ -648,6 +650,78 @@ def test_complete_canvas_bindings_compose_query_and_preparation_together(tmp_pat
         "library.canvases.read",
         "library.canvases.prepare",
     } <= {row["id"] for row in document["capabilities"]}
+
+
+def test_attached_pdf_canvas_factory_composes_only_digest_pinned_pages(tmp_path):
+    pdf = tmp_path / "attached.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    writer.add_blank_page(width=400, height=600).rotate(90)
+    with pdf.open("wb") as stream:
+        writer.write(stream)
+    data = pdf.read_bytes()
+    asset_calls = []
+
+    def item_snapshot_for(item_id):
+        return (
+            CanvasPreparationItemSnapshot(item_id)
+            if item_id == "book-one"
+            else None
+        )
+
+    def representation_snapshot_for(item_id, representation_id):
+        if (item_id, representation_id) != ("book-one", "scan"):
+            return None
+        return CanvasPreparationRepresentationSnapshot(
+            item_id,
+            representation_id,
+            "scan-r1",
+        )
+
+    def asset_snapshot_for(item_id, representation_id, revision):
+        asset_calls.append((item_id, representation_id, revision))
+        return FilesystemAttachedPdfAssetSnapshot(
+            item_id,
+            representation_id,
+            revision,
+            pdf,
+            hashlib.sha256(data).hexdigest(),
+            len(data),
+        )
+
+    bindings = CanvasBindings.for_attached_pdfs(
+        item_snapshot_for=item_snapshot_for,
+        representation_snapshot_for=representation_snapshot_for,
+        asset_snapshot_for=asset_snapshot_for,
+        allocate_canvas_id=lambda reserved: f"page-{len(reserved) + 1}",
+        lock_context_for=_catalogue_lock,
+    )
+    engine = _composition(
+        tmp_path,
+        canvases=bindings,
+        contribution_factory=first_party_module_contributions,
+    )["engine"]
+
+    result = engine.require_service(CANVAS_PREPARATION_SERVICE).prepare(
+        PrepareCanvasSequenceCommand(
+            "book-one",
+            "scan",
+            "scan-r1",
+            "compose-attached-pdf",
+        )
+    )
+    sequence = engine.require_service(CANVAS_QUERY_SERVICE).list(
+        "book-one",
+        "scan",
+    )
+
+    assert result.receipt.after.canvas_ids == ("page-1", "page-2")
+    assert asset_calls == [("book-one", "scan", "scan-r1")]
+    assert [canvas.label for canvas in sequence.canvases] == ["Page 1", "Page 2"]
+    assert [
+        (canvas.extent.width, canvas.extent.height, canvas.extent.unit)
+        for canvas in sequence.canvases
+    ] == [(612_000, 792_000, "mpt"), (600_000, 400_000, "mpt")]
 
 
 def test_canvas_authority_error_is_sanitized_once_for_query_and_preparation(

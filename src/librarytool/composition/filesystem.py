@@ -22,6 +22,8 @@ from ._filesystem_paths import (
 )
 
 from ..adapters.filesystem import (
+    AttachedPdfAssetLookup,
+    FilesystemAttachedPdfInspector,
     FilesystemCanvasInspection,
     FilesystemCanvasPreparationRepository,
     FilesystemCanvasQueryRepository,
@@ -325,6 +327,31 @@ class CanvasBindings:
         ):
             if not callable(callback):
                 raise TypeError(f"{name} must be callable")
+
+    @classmethod
+    def for_attached_pdfs(
+        cls,
+        *,
+        item_snapshot_for: CanvasItemSnapshotLoader,
+        representation_snapshot_for: CanvasRepresentationSnapshotLoader,
+        asset_snapshot_for: AttachedPdfAssetLookup,
+        allocate_canvas_id: CanvasIdAllocator,
+        lock_context_for: CatalogueLockFactory,
+    ) -> "CanvasBindings":
+        """Bind the exact tracked-PDF inspector without a host path seam.
+
+        The attachment lookup is called under the same broad lock as the live
+        representation lookup.  It must project the same authority and return
+        the digest-pinned asset for the requested representation revision.
+        """
+
+        return cls(
+            item_snapshot_for=item_snapshot_for,
+            representation_snapshot_for=representation_snapshot_for,
+            inspect_media=FilesystemAttachedPdfInspector(asset_snapshot_for),
+            allocate_canvas_id=allocate_canvas_id,
+            lock_context_for=lock_context_for,
+        )
 
 
 class _CanvasAuthority:

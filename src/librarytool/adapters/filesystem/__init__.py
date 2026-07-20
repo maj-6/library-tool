@@ -1,5 +1,12 @@
 """Filesystem-backed engine adapters."""
 
+from .attached_pdf_inspector import (
+    ATTACHED_PDF_PARSER_ISOLATION,
+    ATTACHED_PDF_SNAPSHOT_EVIDENCE_PROFILE,
+    AttachedPdfAssetLookup,
+    FilesystemAttachedPdfAssetSnapshot,
+    FilesystemAttachedPdfInspector,
+)
 from .canvas_preparation_repository import (
     FilesystemCanvasEvidence,
     FilesystemCanvasInspection,
@@ -40,7 +47,12 @@ from .translation_repository import (
 from .whl_catalogue_codec import WhlCatalogueItemCodec
 
 __all__ = [
+    "ATTACHED_PDF_PARSER_ISOLATION",
+    "ATTACHED_PDF_SNAPSHOT_EVIDENCE_PROFILE",
+    "AttachedPdfAssetLookup",
     "EMPTY_MANAGED_TREE_REVISION",
+    "FilesystemAttachedPdfAssetSnapshot",
+    "FilesystemAttachedPdfInspector",
     "FilesystemCanvasEvidence",
     "FilesystemCanvasInspection",
     "FilesystemCanvasObservation",
