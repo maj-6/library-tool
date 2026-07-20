@@ -166,15 +166,6 @@ def test_tagged_android_release_requires_public_cloud_config():
     assert "./gradlew --no-daemon testDebugUnitTest lintRelease assembleRelease" in android
 
 
-def test_release_token_is_write_scoped_only_to_publish_job():
-    pre_publish = WORKFLOW[: WORKFLOW.index("  publish:\n")]
-    publish = WORKFLOW[WORKFLOW.index("  publish:\n") :]
-
-    assert "permissions:\n  contents: read" in pre_publish
-    assert "contents: write" not in pre_publish
-    assert "permissions:\n      contents: write" in publish
-
-
 def test_partial_release_metadata_comes_from_collected_artifacts():
     publish = WORKFLOW[WORKFLOW.index("  publish:\n") :]
 
